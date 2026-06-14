@@ -17,8 +17,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use gigapdf_core::{
-    Annotation, ContentElement, Document, ElementKind, FieldKind, FormField, Link, LinkTarget,
-    OcrWord, OutlineItem, SearchMatch, TextLine, TextRun,
+    Annotation, ContentElement, Document, ElementKind, FieldKind, FormField, Layer, Link,
+    LinkTarget, OcrWord, OutlineItem, SearchMatch, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -1170,6 +1170,52 @@ pub extern "C" fn gp_set_outline(
     edit(handle, |doc| doc.set_outline(&items))
 }
 
+// ─── optional content (layers / OCG) ─────────────────────────────────────────
+
+/// The document's optional-content layers as JSON
+/// `[{id,name,visible,locked,order}]`. Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_layers_json(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => layers_json(&doc.layers()),
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Create a new optional-content layer (visible, unlocked). Returns the layer's
+/// object number (pass to the visibility/lock/remove calls), or 0 on error.
+#[no_mangle]
+pub extern "C" fn gp_add_layer(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> u32 {
+    let Some(doc) = (unsafe { handle.as_mut() }) else {
+        return 0;
+    };
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    doc.add_layer(name).unwrap_or(0)
+}
+
+/// Show (`visible != 0`) or hide a layer by id. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_set_layer_visibility(handle: *mut Document, layer_id: u32, visible: i32) -> i32 {
+    edit(handle, |doc| doc.set_layer_visibility(layer_id, visible != 0))
+}
+
+/// Lock (`locked != 0`) or unlock a layer by id. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_set_layer_locked(handle: *mut Document, layer_id: u32, locked: i32) -> i32 {
+    edit(handle, |doc| doc.set_layer_locked(layer_id, locked != 0))
+}
+
+/// Remove a layer from the optional-content configuration. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_remove_layer(handle: *mut Document, layer_id: u32) -> i32 {
+    edit(handle, |doc| doc.remove_layer(layer_id))
+}
+
 // ─── minimal JSON (zero-dep) ─────────────────────────────────────────────────
 
 fn json_escape(text: &str, out: &mut String) {
@@ -1386,6 +1432,23 @@ fn outline_json(items: &[OutlineItem]) -> String {
             out.push_str(&format!(",\"page\":{page}"));
         }
         out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+fn layers_json(layers: &[Layer]) -> String {
+    let mut out = String::from("[");
+    for (i, layer) in layers.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{{\"id\":{},\"name\":", layer.id));
+        json_escape(&layer.name, &mut out);
+        out.push_str(&format!(
+            ",\"visible\":{},\"locked\":{},\"order\":{}}}",
+            layer.visible, layer.locked, layer.order
+        ));
     }
     out.push(']');
     out

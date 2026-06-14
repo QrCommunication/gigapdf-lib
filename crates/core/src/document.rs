@@ -18,6 +18,7 @@ use crate::filters::decode_stream;
 use crate::lexer::{Lexer, Token};
 use crate::link::{Link, LinkTarget};
 use crate::object::{Dictionary, Object, ObjectId, Stream, StringKind};
+use crate::ocg::Layer;
 use crate::outline::OutlineItem;
 use crate::parser::Parser;
 
@@ -2459,6 +2460,262 @@ impl Document {
         Ok(())
     }
 
+    // ─── optional content (layers / OCG) ─────────────────────────────────────
+
+    /// The document's optional-content layers (PDF OCGs), ordered as in the
+    /// default configuration's `/Order` (then discovery order).
+    pub fn layers(&self) -> Vec<Layer> {
+        let Some(ocp) = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"OCProperties"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        else {
+            return Vec::new();
+        };
+        let Some(ocgs) = ocp.get(b"OCGs").map(|o| self.resolve(o)).and_then(Object::as_array) else {
+            return Vec::new();
+        };
+        let cfg = ocp.get(b"D").map(|o| self.resolve(o)).and_then(Object::as_dict);
+        let off = self.oc_ref_ids(cfg.and_then(|c| c.get(b"OFF")));
+        let locked = self.oc_ref_ids(cfg.and_then(|c| c.get(b"Locked")));
+        let mut order = Vec::new();
+        self.oc_order_ids(cfg.and_then(|c| c.get(b"Order")), &mut order);
+
+        let mut out = Vec::new();
+        for obj in ocgs {
+            let Some(oid) = obj.as_reference() else { continue };
+            let name = self
+                .objects
+                .get(&oid)
+                .and_then(Object::as_dict)
+                .and_then(|d| d.get(b"Name"))
+                .map(|o| self.string_value(o))
+                .unwrap_or_default();
+            out.push(Layer {
+                id: oid.0,
+                name,
+                visible: !off.contains(&oid.0),
+                locked: locked.contains(&oid.0),
+                order: order.iter().position(|&x| x == oid.0).unwrap_or(usize::MAX),
+            });
+        }
+        // /Order entries first (ascending), then any remaining in discovery order.
+        for (i, layer) in out.iter_mut().enumerate() {
+            if layer.order == usize::MAX {
+                layer.order = order.len() + i;
+            }
+        }
+        out.sort_by_key(|l| l.order);
+        out
+    }
+
+    /// Create a new (initially visible, unlocked) optional-content layer.
+    /// Returns the OCG's object number — the id for the toggle/remove calls.
+    pub fn add_layer(&mut self, name: &str) -> Result<u32> {
+        let ocg_id = (self.next_object_number(), 0u16);
+        let mut ocg = Dictionary::new();
+        ocg.set(b"Type".to_vec(), annot::name(b"OCG"));
+        ocg.set(
+            b"Name".to_vec(),
+            Object::String(crate::font::encode_pdf_text(name), StringKind::Literal),
+        );
+        self.objects.insert(ocg_id, Object::Dictionary(ocg));
+
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?
+            .clone();
+        let mut ocp = catalog
+            .get(b"OCProperties")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(Dictionary::new);
+        let mut ocgs = ocp
+            .get(b"OCGs")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        ocgs.push(Object::Reference(ocg_id));
+        ocp.set(b"OCGs".to_vec(), Object::Array(ocgs));
+
+        let mut cfg = ocp
+            .get(b"D")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(Dictionary::new);
+        if cfg.get(b"Name").is_none() {
+            cfg.set(b"Name".to_vec(), Object::String(b"Default".to_vec(), StringKind::Literal));
+        }
+        let mut order = cfg
+            .get(b"Order")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        order.push(Object::Reference(ocg_id));
+        cfg.set(b"Order".to_vec(), Object::Array(order));
+        ocp.set(b"D".to_vec(), Object::Dictionary(cfg));
+
+        catalog.set(b"OCProperties".to_vec(), Object::Dictionary(ocp));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(ocg_id.0)
+    }
+
+    /// Show or hide a layer (membership of `/D /OFF`).
+    pub fn set_layer_visibility(&mut self, layer_id: u32, visible: bool) -> Result<()> {
+        let oid = self
+            .oc_object_id(layer_id)
+            .ok_or_else(|| EngineError::Missing("optional content group".into()))?;
+        self.with_oc_default_config(|cfg| Self::set_oc_membership(cfg, b"OFF", oid, !visible))
+    }
+
+    /// Lock or unlock a layer (membership of `/D /Locked`).
+    pub fn set_layer_locked(&mut self, layer_id: u32, locked: bool) -> Result<()> {
+        let oid = self
+            .oc_object_id(layer_id)
+            .ok_or_else(|| EngineError::Missing("optional content group".into()))?;
+        self.with_oc_default_config(|cfg| Self::set_oc_membership(cfg, b"Locked", oid, locked))
+    }
+
+    /// Remove a layer from the optional-content configuration. Content still
+    /// tagged with the OCG renders unconditionally afterwards (spec-compliant).
+    pub fn remove_layer(&mut self, layer_id: u32) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?
+            .clone();
+        let Some(mut ocp) = catalog
+            .get(b"OCProperties")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if let Some(mut ocgs) = ocp.get(b"OCGs").and_then(Object::as_array).map(<[Object]>::to_vec) {
+            ocgs.retain(|o| o.as_reference().map(|r| r.0) != Some(layer_id));
+            ocp.set(b"OCGs".to_vec(), Object::Array(ocgs));
+        }
+        if let Some(mut cfg) = ocp.get(b"D").map(|o| self.resolve(o)).and_then(Object::as_dict).cloned()
+        {
+            for key in [b"OFF".as_ref(), b"ON", b"Locked", b"Order"] {
+                if let Some(mut arr) = cfg.get(key).and_then(Object::as_array).map(<[Object]>::to_vec) {
+                    Self::remove_oc_ref_deep(&mut arr, layer_id);
+                    if arr.is_empty() {
+                        cfg.remove(key);
+                    } else {
+                        cfg.set(key.to_vec(), Object::Array(arr));
+                    }
+                }
+            }
+            ocp.set(b"D".to_vec(), Object::Dictionary(cfg));
+        }
+        catalog.set(b"OCProperties".to_vec(), Object::Dictionary(ocp));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Resolve a layer's object number to its full `ObjectId` (preserving the
+    /// generation) by locating it in `/OCProperties /OCGs`.
+    fn oc_object_id(&self, layer_id: u32) -> Option<ObjectId> {
+        self.catalog()
+            .ok()
+            .and_then(|c| c.get(b"OCProperties"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|ocp| ocp.get(b"OCGs"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .and_then(|arr| arr.iter().filter_map(|o| o.as_reference()).find(|r| r.0 == layer_id))
+    }
+
+    /// Object numbers of the top-level references in an `/OFF`-style array.
+    fn oc_ref_ids(&self, obj: Option<&Object>) -> Vec<u32> {
+        obj.map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|arr| arr.iter().filter_map(|o| o.as_reference().map(|r| r.0)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Flatten the (possibly nested) `/Order` array into layer object numbers.
+    fn oc_order_ids(&self, obj: Option<&Object>, out: &mut Vec<u32>) {
+        if let Some(arr) = obj.map(|o| self.resolve(o)).and_then(Object::as_array) {
+            for item in arr {
+                match item {
+                    Object::Reference(r) => out.push(r.0),
+                    Object::Array(_) => self.oc_order_ids(Some(item), out),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Get-or-create the default OC configuration (`/OCProperties /D`), apply
+    /// `f`, and write it back through the catalog.
+    fn with_oc_default_config<F: FnOnce(&mut Dictionary)>(&mut self, f: F) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?
+            .clone();
+        let mut ocp = catalog
+            .get(b"OCProperties")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(Dictionary::new);
+        let mut cfg = ocp
+            .get(b"D")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(Dictionary::new);
+        f(&mut cfg);
+        ocp.set(b"D".to_vec(), Object::Dictionary(cfg));
+        catalog.set(b"OCProperties".to_vec(), Object::Dictionary(ocp));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Ensure `oid` is present in (or absent from) `cfg[key]`, dropping the key
+    /// when the resulting array is empty.
+    fn set_oc_membership(cfg: &mut Dictionary, key: &[u8], oid: ObjectId, present: bool) {
+        let mut arr: Vec<Object> = cfg.get(key).and_then(Object::as_array).map(<[Object]>::to_vec).unwrap_or_default();
+        arr.retain(|o| o.as_reference().map(|r| r.0) != Some(oid.0));
+        if present {
+            arr.push(Object::Reference(oid));
+        }
+        if arr.is_empty() {
+            cfg.remove(key);
+        } else {
+            cfg.set(key.to_vec(), Object::Array(arr));
+        }
+    }
+
+    /// Remove every reference to `layer_id` from an array, recursing into nested
+    /// `/Order` sub-arrays.
+    fn remove_oc_ref_deep(arr: &mut Vec<Object>, layer_id: u32) {
+        arr.retain(|o| o.as_reference().map(|r| r.0) != Some(layer_id));
+        for o in arr.iter_mut() {
+            if let Object::Array(inner) = o {
+                Self::remove_oc_ref_deep(inner, layer_id);
+            }
+        }
+    }
+
     // ─── interactive forms (AcroForm) ────────────────────────────────────────
 
     fn string_value(&self, object: &Object) -> String {
@@ -3225,6 +3482,39 @@ mod tests {
 
     fn has_op(content: &[u8], op: &[u8]) -> bool {
         content.windows(op.len()).any(|w| w == op)
+    }
+
+    #[test]
+    fn layers_create_toggle_remove_roundtrip() {
+        let pdf = crate::convert::reverse::txt_to_pdf("layer test");
+        let mut doc = Document::open(&pdf).unwrap();
+        assert!(doc.layers().is_empty());
+
+        // Create → visible, unlocked.
+        let id = doc.add_layer("Watermark").unwrap();
+        assert!(id > 0);
+        let layers = doc.layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].name, "Watermark");
+        assert!(layers[0].visible && !layers[0].locked);
+
+        // Hide + lock.
+        doc.set_layer_visibility(id, false).unwrap();
+        doc.set_layer_locked(id, true).unwrap();
+        let layers = doc.layers();
+        assert!(!layers[0].visible && layers[0].locked);
+
+        // Survives a save/open round-trip.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let layers = reopened.layers();
+        assert_eq!(layers.len(), 1);
+        assert!(!layers[0].visible && layers[0].locked);
+
+        // Show again, then remove.
+        doc.set_layer_visibility(id, true).unwrap();
+        assert!(doc.layers()[0].visible);
+        doc.remove_layer(id).unwrap();
+        assert!(doc.layers().is_empty());
     }
 
     #[test]

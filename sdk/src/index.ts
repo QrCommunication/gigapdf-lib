@@ -275,6 +275,14 @@ export interface OutlineEntry {
   title: string;
   page?: number;
 }
+/** An optional-content layer (calque): toggle `visible`/`locked` to persist in the PDF. */
+export interface LayerInfo {
+  id: number;
+  name: string;
+  visible: boolean;
+  locked: boolean;
+  order: number;
+}
 
 const RGB = (rgb: number) => rgb & 0xffffff;
 
@@ -618,6 +626,24 @@ export class GigaPdfDoc {
     targetPage: number
   ): boolean {
     return this.ex().gp_add_goto_link(this.h, page, x0, y0, x1, y1, targetPage) === 0;
+  }
+
+  // optional-content layers (calques): list + show/hide + lock/unlock + remove
+  layers(): LayerInfo[] {
+    return this.g._json((o) => this.ex().gp_layers_json(this.h, o));
+  }
+  /** Create a new (visible, unlocked) layer; returns its id (0 on error). */
+  addLayer(name: string): number {
+    return this.g._withStr(name, (p, l) => this.ex().gp_add_layer(this.h, p, l));
+  }
+  setLayerVisibility(id: number, visible: boolean): boolean {
+    return this.ex().gp_set_layer_visibility(this.h, id, visible ? 1 : 0) === 0;
+  }
+  setLayerLocked(id: number, locked: boolean): boolean {
+    return this.ex().gp_set_layer_locked(this.h, id, locked ? 1 : 0) === 0;
+  }
+  removeLayer(id: number): boolean {
+    return this.ex().gp_remove_layer(this.h, id) === 0;
   }
 
   // outline (bookmarks)

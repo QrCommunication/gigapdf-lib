@@ -56,4 +56,18 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(docx[1]).toBe(0x4b); // 'K'
     doc.close();
   });
+
+  it("manages optional-content layers (calques)", () => {
+    const doc = giga.open(giga.txtToPdf("Layers"));
+    expect(doc.layers()).toHaveLength(0);
+    const id = doc.addLayer("Watermark");
+    expect(id).toBeGreaterThan(0);
+    expect(doc.layers()[0]).toMatchObject({ name: "Watermark", visible: true, locked: false });
+    expect(doc.setLayerVisibility(id, false)).toBe(true);
+    expect(doc.setLayerLocked(id, true)).toBe(true);
+    expect(doc.layers()[0]).toMatchObject({ visible: false, locked: true });
+    expect(doc.removeLayer(id)).toBe(true);
+    expect(doc.layers()).toHaveLength(0);
+    doc.close();
+  });
 });
