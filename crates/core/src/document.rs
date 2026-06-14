@@ -2716,6 +2716,163 @@ impl Document {
         }
     }
 
+    // ─── page structure (resize / insert / duplicate) ────────────────────────
+
+    /// Set a page's `/MediaBox` to `[0 0 width height]` (points).
+    pub fn resize_page(&mut self, page_no: u32, width: f64, height: f64) -> Result<()> {
+        let id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+        page.set(b"MediaBox".to_vec(), Self::media_box_array(width, height));
+        self.objects.insert(id, Object::Dictionary(page));
+        Ok(())
+    }
+
+    /// Insert a blank page of `width`×`height` points immediately after the
+    /// 1-based `after` page (`after == 0` prepends). Returns its object number.
+    pub fn add_page(&mut self, width: f64, height: f64, after: u32) -> Result<u32> {
+        let content_id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(content_id, Object::Stream(Stream::new(Dictionary::new(), Vec::new())));
+        let page_id = (self.next_object_number(), 0u16);
+        let mut page = Dictionary::new();
+        page.set(b"Type".to_vec(), annot::name(b"Page"));
+        page.set(b"MediaBox".to_vec(), Self::media_box_array(width, height));
+        page.set(b"Contents".to_vec(), Object::Reference(content_id));
+        page.set(b"Resources".to_vec(), Object::Dictionary(Dictionary::new()));
+        self.objects.insert(page_id, Object::Dictionary(page));
+        self.insert_page_after(page_id, after)?;
+        Ok(page_id.0)
+    }
+
+    /// Duplicate the 1-based `page_no`, inserting the copy right after it. The
+    /// content streams are cloned (independent edits); resources are shared.
+    /// Returns the new page's object number.
+    pub fn copy_page(&mut self, page_no: u32) -> Result<u32> {
+        let src_id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&src_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+        let new_contents = self.clone_page_contents(&page);
+        page.set(b"Contents".to_vec(), new_contents);
+        let new_page_id = (self.next_object_number(), 0u16);
+        self.objects.insert(new_page_id, Object::Dictionary(page));
+        self.insert_page_after(new_page_id, page_no)?;
+        Ok(new_page_id.0)
+    }
+
+    fn media_box_array(width: f64, height: f64) -> Object {
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Real(width),
+            Object::Real(height),
+        ])
+    }
+
+    /// Clone a page's content stream object(s) into fresh objects and return the
+    /// new `/Contents` value (a single reference, or an array of them).
+    fn clone_page_contents(&mut self, page: &Dictionary) -> Object {
+        let Some(contents) = page.get(b"Contents").cloned() else {
+            return Object::Null;
+        };
+        let stream_ids: Vec<ObjectId> = match &contents {
+            Object::Reference(r) => match self.objects.get(r) {
+                Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_reference).collect(),
+                Some(_) => vec![*r],
+                None => Vec::new(),
+            },
+            Object::Array(arr) => arr.iter().filter_map(Object::as_reference).collect(),
+            _ => Vec::new(),
+        };
+        let mut new_refs = Vec::new();
+        for sid in stream_ids {
+            if let Some(obj) = self.objects.get(&sid).cloned() {
+                let nid = (self.next_object_number(), 0u16);
+                self.objects.insert(nid, obj);
+                new_refs.push(Object::Reference(nid));
+            }
+        }
+        match new_refs.len() {
+            0 => Object::Null,
+            1 => new_refs.into_iter().next().unwrap(),
+            _ => Object::Array(new_refs),
+        }
+    }
+
+    /// Insert `new_page_id` into the page tree just after the 1-based `after`
+    /// page (`0` = front). Sets the new page's `/Parent` and bumps `/Count` up
+    /// the ancestor chain.
+    fn insert_page_after(&mut self, new_page_id: ObjectId, after: u32) -> Result<()> {
+        let ids = self.page_ids()?;
+        if ids.is_empty() {
+            return Err(EngineError::Missing("document has no pages".into()));
+        }
+        let ref_idx = (after.max(1) as usize - 1).min(ids.len() - 1);
+        let ref_page_id = ids[ref_idx];
+        let parent_id = self
+            .objects
+            .get(&ref_page_id)
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"Parent"))
+            .and_then(Object::as_reference)
+            .ok_or_else(|| EngineError::Missing("page /Parent".into()))?;
+
+        let mut parent = self
+            .objects
+            .get(&parent_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("pages tree node".into()))?;
+        let mut kids = parent
+            .get(b"Kids")
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        let pos = if after == 0 {
+            0
+        } else {
+            kids.iter()
+                .position(|o| o.as_reference() == Some(ref_page_id))
+                .map(|p| p + 1)
+                .unwrap_or(kids.len())
+        };
+        kids.insert(pos, Object::Reference(new_page_id));
+        parent.set(b"Kids".to_vec(), Object::Array(kids));
+        self.objects.insert(parent_id, Object::Dictionary(parent));
+
+        if let Some(mut page) = self.objects.get(&new_page_id).and_then(Object::as_dict).cloned() {
+            page.set(b"Parent".to_vec(), Object::Reference(parent_id));
+            self.objects.insert(new_page_id, Object::Dictionary(page));
+        }
+
+        // Increment /Count on the parent and every ancestor Pages node.
+        let mut node = Some(parent_id);
+        let mut guard = 0;
+        while let Some(nid) = node {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(mut d) = self.objects.get(&nid).and_then(Object::as_dict).cloned() else {
+                break;
+            };
+            let count = d.get(b"Count").and_then(Object::as_i64).unwrap_or(0);
+            d.set(b"Count".to_vec(), Object::Integer(count + 1));
+            let up = d.get(b"Parent").and_then(Object::as_reference);
+            self.objects.insert(nid, Object::Dictionary(d));
+            node = up;
+        }
+        Ok(())
+    }
+
     // ─── interactive forms (AcroForm) ────────────────────────────────────────
 
     fn string_value(&self, object: &Object) -> String {
@@ -3515,6 +3672,29 @@ mod tests {
         assert!(doc.layers()[0].visible);
         doc.remove_layer(id).unwrap();
         assert!(doc.layers().is_empty());
+    }
+
+    #[test]
+    fn page_resize_add_copy_roundtrip() {
+        let pdf = crate::convert::reverse::txt_to_pdf("page ops");
+        let mut doc = Document::open(&pdf).unwrap();
+        assert_eq!(doc.page_ids().unwrap().len(), 1);
+
+        doc.resize_page(1, 200.0, 300.0).unwrap();
+        let (w, h) = {
+            let mb = doc.page_dict(1).unwrap().get(b"MediaBox").and_then(Object::as_array).unwrap();
+            (mb[2].as_f64(), mb[3].as_f64())
+        };
+        assert_eq!((w, h), (Some(200.0), Some(300.0)));
+
+        assert!(doc.add_page(400.0, 500.0, 1).unwrap() > 0);
+        assert_eq!(doc.page_ids().unwrap().len(), 2);
+
+        assert!(doc.copy_page(1).unwrap() > 0);
+        assert_eq!(doc.page_ids().unwrap().len(), 3);
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert_eq!(reopened.page_ids().unwrap().len(), 3);
     }
 
     #[test]

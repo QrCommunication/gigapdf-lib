@@ -413,6 +413,18 @@ export class GigaPdfDoc {
       this.g._buffer((o) => this.ex().gp_extract_pages(this.h, p, c, o))
     );
   }
+  /** Resize a page's MediaBox to `width`×`height` points. */
+  resizePage(page: number, width: number, height: number): boolean {
+    return this.ex().gp_resize_page(this.h, page, width, height) === 0;
+  }
+  /** Insert a blank page after the 1-based `after` page (0 = front); returns its id. */
+  addPage(width: number, height: number, after = 0): number {
+    return this.ex().gp_add_page(this.h, width, height, after);
+  }
+  /** Duplicate a page, inserting the copy right after it; returns the new page's id. */
+  copyPage(page: number): number {
+    return this.ex().gp_copy_page(this.h, page);
+  }
 
   // render
   renderPage(page: number, scale = 1): Uint8Array {

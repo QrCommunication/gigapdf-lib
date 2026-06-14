@@ -70,4 +70,18 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(doc.layers()).toHaveLength(0);
     doc.close();
   });
+
+  it("page ops: resize, add blank, copy", () => {
+    const doc = giga.open(giga.txtToPdf("Page ops"));
+    expect(doc.pageCount()).toBe(1);
+    expect(doc.resizePage(1, 200, 300)).toBe(true);
+    expect(doc.addPage(400, 500, 1)).toBeGreaterThan(0);
+    expect(doc.pageCount()).toBe(2);
+    expect(doc.copyPage(1)).toBeGreaterThan(0);
+    expect(doc.pageCount()).toBe(3);
+    const reopened = giga.open(doc.save());
+    expect(reopened.pageCount()).toBe(3);
+    reopened.close();
+    doc.close();
+  });
 });

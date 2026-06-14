@@ -560,6 +560,32 @@ pub extern "C" fn gp_append_pages(
     }
 }
 
+/// Resize a page's `/MediaBox` to `width`×`height` points. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_resize_page(handle: *mut Document, page: u32, width: f64, height: f64) -> i32 {
+    edit(handle, |doc| doc.resize_page(page, width, height))
+}
+
+/// Insert a blank `width`×`height` page after the 1-based `after` page
+/// (`after == 0` prepends). Returns the new page's object number, 0 on error.
+#[no_mangle]
+pub extern "C" fn gp_add_page(handle: *mut Document, width: f64, height: f64, after: u32) -> u32 {
+    match unsafe { handle.as_mut() } {
+        Some(doc) => doc.add_page(width, height, after).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Duplicate the 1-based `page`, inserting the copy right after it. Returns the
+/// new page's object number, 0 on error.
+#[no_mangle]
+pub extern "C" fn gp_copy_page(handle: *mut Document, page: u32) -> u32 {
+    match unsafe { handle.as_mut() } {
+        Some(doc) => doc.copy_page(page).unwrap_or(0),
+        None => 0,
+    }
+}
+
 /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using the
 /// built-in zero-dependency renderer. Buffer-returning (host frees); null on
 /// error.
