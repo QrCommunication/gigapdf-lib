@@ -1,0 +1,12 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# Local references / scratch (not built, not committed)
+/reference
+
+# WASM build output
+/pkg
+/crates/wasm/pkg
+
+.DS_Store

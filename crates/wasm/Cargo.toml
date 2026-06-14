@@ -1,0 +1,15 @@
+[package]
+name = "gigapdf-wasm"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Browser (WebAssembly) bindings for gigapdf-core."
+
+[lib]
+crate-type = ["cdylib"]
+
+# Only our own engine — still no third-party dependencies.
+[dependencies]
+gigapdf-core = { path = "../core" }

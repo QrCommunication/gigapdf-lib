@@ -1,0 +1,50 @@
+# gigapdf-engine
+
+> A zero-dependency PDF engine written from scratch in Rust and compiled to
+> WebAssembly. It reads, edits, renders, secures and **converts** PDFs (to/from
+> TXT, HTML, RTF, DOCX, PPTX, ODT, XLSX, ODS, plus PDF/A) with no third-party
+> crates and no native libraries (no MuPDF, no LibreOffice, no fontkit). The
+> WASM build is ~575 KB. Licensed PolyForm Noncommercial 1.0.0, © 2025 Rony
+> Licha / QR Communication.
+
+It edits the **real PDF content stream** (not a Fabric-style overlay + cosmetic
+mask), so a complex background is preserved by construction and original glyphs
+never leak. Everything is pure `std`: lexer, parser, xref/object streams,
+FlateDecode inflate **and** deflate, content editor, serializer, crypto
+(MD5/RC4/AES/SHA/RSA/X.509/CMS), a rasterizer (TrueType + CFF glyphs → PNG), a
+ZIP reader/writer, OOXML/ODF builders, and a from-scratch PDF page builder. The
+WASM sandbox has no network or entropy — the host supplies random bytes (crypto)
+and performs Google-Fonts downloads (the engine provides the catalog, URLs and
+font embedding).
+
+## Documentation
+- [README](README.md): overview, feature matrix, honest scope, quickstart, build
+- [API reference](docs/API.md): every Rust `Document` method ↔ WASM `gp_*` export, data types
+- [Usage guide](docs/USAGE.md): WASM linear-memory buffer ABI + a worked example per feature
+- [Install & build](docs/INSTALL.md): toolchain, native + wasm32 build, host integration, data regeneration
+- [License](LICENSE): PolyForm Noncommercial 1.0.0 (required notice: © 2025 Rony Licha / QR Communication)
+
+## Core source (crates/core/src)
+- [document.rs](crates/core/src/document.rs): the `Document` façade — open/edit/convert/sign/save
+- [object.rs](crates/core/src/object.rs), [parser.rs](crates/core/src/parser.rs), [serialize.rs](crates/core/src/serialize.rs): object model + (de)serialization
+- [filters/](crates/core/src/filters): zlib inflate + deflate (RFC 1950/1951), from scratch
+- [content/](crates/core/src/content): content-stream interpreter, elements, text runs (font + colour capture)
+- [font/](crates/core/src/font): WinAnsi, CMap/ToUnicode, TrueType, CFF, catalog (1951 families), google, embed (Type0/CIDFontType2)
+- [crypto/](crates/core/src/crypto): md5, rc4, aes, sha256, sha512, bignum (Montgomery), rsa
+- [security/](crates/core/src/security): Standard Security Handler (encrypt/decrypt RC4/AES)
+- [sign/](crates/core/src/sign): ASN.1 DER, self-signed X.509, CMS/PKCS#7 SignedData
+- [raster/](crates/core/src/raster): canvas (AA scanline fill), png encoder, content renderer
+- [convert/](crates/core/src/convert): zip, office (DOCX/PPTX/ODT/XLSX/ODS), table reconstruction, style, web (HTML), build (PdfBuilder), reverse (→PDF), pdfa, srgb_icc
+
+## WASM ABI
+- [crates/wasm/src/lib.rs](crates/wasm/src/lib.rs): 67 `extern "C"` `gp_*` exports (handle + buffer-returning ABI, host frees results)
+
+## Conventions
+- WASM ABI: handle from `gp_open*`; buffer-returning fns take `out_len: *mut usize` and the host `gp_free`s the result; byte/string args as `(ptr, len)`; `rgb` packed `0xRRGGBB`; mutating ops return 0 on success.
+- Forward conversions reconstruct **real editable objects** (positioned text boxes, re-embedded images, table cells), not a page raster. Reverse conversions are text-faithful (content, reading order, pagination) via the standard-14 fonts.
+- Zero third-party dependencies is a hard constraint; built clean-room from ISO 32000 (no AGPL code such as MuPDF was read or copied).
+
+## Optional
+- [test/wasm-smoke.mjs](test/wasm-smoke.mjs): dependency-free Node harness exercising every feature end-to-end (93 checks)
+- [tools/](tools): generators for the font catalog (Google Fonts metadata) and the embedded sRGB ICC profile
+- [fixtures/](fixtures): real PDFs used by the native test suite

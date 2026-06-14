@@ -1,0 +1,69 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  engine:
+    name: Engine (Rust)
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test core
+        run: cargo test -p gigapdf-core --release
+
+      - name: Build WASM
+        run: cargo build -p gigapdf-wasm --target wasm32-unknown-unknown --release
+
+  sdk:
+    name: SDK (TypeScript)
+    needs: engine
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build WASM
+        run: bash sdk/scripts/build-wasm.sh
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: sdk/pnpm-lock.yaml
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: sdk
+        run: pnpm typecheck
+
+      - name: Test SDK
+        working-directory: sdk
+        run: pnpm test

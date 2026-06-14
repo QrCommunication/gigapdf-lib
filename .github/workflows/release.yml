@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Test engine (core)
+        run: cargo test -p gigapdf-core --release
+
+      - name: Build WASM
+        run: bash sdk/scripts/build-wasm.sh
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: sdk/pnpm-lock.yaml
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: sdk
+        run: pnpm typecheck
+
+      - name: Test SDK
+        working-directory: sdk
+        run: pnpm test
+
+      - name: Build SDK
+        working-directory: sdk
+        run: pnpm build
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing (no NPM_TOKEN)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build WASM
+        run: bash sdk/scripts/build-wasm.sh
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24" # npm 11+ required for OIDC trusted publishing
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: sdk/pnpm-lock.yaml
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: pnpm install --frozen-lockfile
+
+      - name: Build SDK
+        working-directory: sdk
+        run: pnpm build
+
+      - name: Publish to npm (OIDC)
+        working-directory: sdk
+        run: npm publish --access public --provenance=false
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: version
+        env:
+          GH_REF: ${{ github.ref }}
+        run: |
+          VERSION="${GH_REF#refs/tags/v}"
+          TAG="${GH_REF#refs/tags/}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG
+        id: changelog
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          NOTES=$(awk "/^## \[$RELEASE_VERSION\]/{flag=1; next} /^## \[/{flag=0} flag" sdk/CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release $RELEASE_VERSION"
+          fi
+          echo "$NOTES" > release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: gigapdf-lib v${{ steps.version.outputs.version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.tag, '-') }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

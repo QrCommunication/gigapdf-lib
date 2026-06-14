@@ -1,0 +1,103 @@
+//! Document conversion: PDF → editable Office formats and text/HTML.
+//!
+//! The exporters reconstruct **real, editable content** — positioned text
+//! boxes, re-embedded images and shape outlines — not a rasterized page image.
+//! This mirrors how an office suite imports a PDF: each show-text run becomes a
+//! placed text frame, each image XObject a placed picture. The container half
+//! (ZIP) lives in [`zip`]; the per-format XML in [`office`].
+//!
+//! Coordinates in the data model below are **top-down, origin top-left, in PDF
+//! points** (1 pt = 1/72"). The PDF→top-down Y flip is done once during
+//! extraction (see `Document::convert_pages`), so every exporter consumes the
+//! same already-normalized geometry.
+
+pub mod build;
+pub mod office;
+pub mod pdfa;
+pub mod reverse;
+pub mod srgb_icc;
+pub mod style;
+pub mod table;
+pub mod web;
+pub mod zip;
+
+pub use style::{Generic, TextStyle};
+
+/// A text run placed on a page (top-left origin, points).
+#[derive(Debug, Clone)]
+pub struct PlacedText {
+    /// Decoded, font-aware text of the run.
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    /// Recovered font family / weight / style / colour.
+    pub style: TextStyle,
+}
+
+/// A real image XObject from the PDF, re-encoded to PNG and placed on a page.
+#[derive(Debug, Clone)]
+pub struct PlacedImage {
+    /// PNG-encoded bytes of the actual embedded image (not a page render).
+    pub png: Vec<u8>,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// A vector path element, reduced to its bounding rectangle (a structural hint
+/// — frames, table rules, separators).
+#[derive(Debug, Clone)]
+pub struct PlacedShape {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One page's editable content in top-down points.
+#[derive(Debug, Clone, Default)]
+pub struct ConvPage {
+    pub width: f64,
+    pub height: f64,
+    pub texts: Vec<PlacedText>,
+    pub images: Vec<PlacedImage>,
+    pub shapes: Vec<PlacedShape>,
+}
+
+/// Standard Base64 (RFC 4648) of `data` — for embedding images as `data:` URIs
+/// in the HTML export. Zero-dependency.
+pub(crate) fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64;
+
+    #[test]
+    fn base64_matches_rfc_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+}

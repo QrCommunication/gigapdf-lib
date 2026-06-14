@@ -1,0 +1,69 @@
+{
+  "name": "@qrcommunication/gigapdf-lib",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for gigapdf-lib — a zero-dependency Rust→WASM PDF engine: read/edit/render, OCR, full-text search, forms, annotations, signing, encryption, and PDF↔Office/HTML/RTF conversions. Self-contained .wasm, no third-party runtime deps.",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "author": "Rony Licha / QR Communication",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./gigapdf.wasm": "./gigapdf.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "gigapdf.wasm",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist gigapdf.wasm"
+  },
+  "keywords": [
+    "pdf",
+    "wasm",
+    "ocr",
+    "pdf-editor",
+    "pdf-to-docx",
+    "office-to-pdf",
+    "pdf-forms",
+    "pdf-redaction",
+    "zero-dependency"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qrcommunication/gigapdf-lib.git",
+    "directory": "sdk"
+  },
+  "homepage": "https://github.com/qrcommunication/gigapdf-lib#readme",
+  "bugs": {
+    "url": "https://github.com/qrcommunication/gigapdf-lib/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@10.0.0",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "gigapdf-core"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "PDF editing engine — pure std, no dependencies."
+
+# No dependencies: lexer, object model, xref, FlateDecode, content editing and
+# serialization are all pure `std`.
+[dependencies]
+
+[dev-dependencies]
+# Tests run against ../../fixtures via CARGO_MANIFEST_DIR — still zero deps.
