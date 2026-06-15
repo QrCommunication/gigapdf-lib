@@ -31,7 +31,8 @@
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "clean": "rm -rf dist gigapdf.wasm"
+    "clean": "rm -rf dist gigapdf.wasm",
+    "prepublishOnly": "pnpm run build:wasm && pnpm run build"
   },
   "keywords": [
     "pdf",

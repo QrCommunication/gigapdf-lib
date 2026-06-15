@@ -599,6 +599,18 @@ impl Document {
         [0.0, 0.0, 612.0, 792.0]
     }
 
+    /// A page's `(width, height, rotation)`: dimensions from `/MediaBox`, and
+    /// `/Rotate` normalized to 0/90/180/270 (the orientation a viewer applies).
+    pub fn page_info(&self, page_no: u32) -> Result<(f64, f64, i32)> {
+        let page = self.page_dict(page_no)?;
+        let mb = self.read_media_box(page);
+        let width = (mb[2] - mb[0]).abs();
+        let height = (mb[3] - mb[1]).abs();
+        let rotate = page.get(b"Rotate").and_then(Object::as_i64).unwrap_or(0);
+        let rotation = (((rotate % 360) + 360) % 360) as i32;
+        Ok((width, height, rotation))
+    }
+
     /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using
     /// the built-in zero-dependency renderer (vector graphics; text glyphs and
     /// images are added by later renderer slices).

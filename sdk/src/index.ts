@@ -283,6 +283,12 @@ export interface LayerInfo {
   locked: boolean;
   order: number;
 }
+/** A page's geometry: size in points and `/Rotate` (0/90/180/270). */
+export interface PageInfo {
+  width: number;
+  height: number;
+  rotation: number;
+}
 
 const RGB = (rgb: number) => rgb & 0xffffff;
 
@@ -424,6 +430,10 @@ export class GigaPdfDoc {
   /** Duplicate a page, inserting the copy right after it; returns the new page's id. */
   copyPage(page: number): number {
     return this.ex().gp_copy_page(this.h, page);
+  }
+  /** A page's size (points) and `/Rotate` (0/90/180/270). */
+  pageInfo(page: number): PageInfo {
+    return this.g._json((o) => this.ex().gp_page_info_json(this.h, page, o));
   }
 
   // render

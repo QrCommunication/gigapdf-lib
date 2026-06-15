@@ -586,6 +586,24 @@ pub extern "C" fn gp_copy_page(handle: *mut Document, page: u32) -> u32 {
     }
 }
 
+/// A page's geometry as JSON `{"width":w,"height":h,"rotation":r}` (points,
+/// `/Rotate` normalized). Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_page_info_json(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => match doc.page_info(page) {
+            Ok((w, h, r)) => format!("{{\"width\":{w},\"height\":{h},\"rotation\":{r}}}"),
+            Err(_) => "{\"width\":0,\"height\":0,\"rotation\":0}".to_string(),
+        },
+        None => "{\"width\":0,\"height\":0,\"rotation\":0}".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using the
 /// built-in zero-dependency renderer. Buffer-returning (host frees); null on
 /// error.
