@@ -19,7 +19,7 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `Document::open_with_password(&[u8],&[u8])` | `gp_open_encrypted(ptr,len,pw,pwlen)` | decrypts |
 | `doc.save() -> Vec<u8>` | `gp_save(handle,outlen)` | renumbering serializer |
 | `doc.save_compressed()` | `gp_save_compressed(handle,outlen)` | Flate uncompressed streams |
-| `doc.save_encrypted(pw,id0,perms)` | `gp_save_encrypted(handle,pw,pwlen,id,idlen,perms,outlen)` | RC4 128 |
+| `doc.save_encrypted(pw,owner,id0,key,algo,perms)` | `gp_save_encrypted(handle,pw,pwlen,owner,ownerlen,id,idlen,key,keylen,algo,perms,outlen)` | algo 0=RC4-128, 1=AES-128, 2=AES-256; `key`=secret host randomness (AES-256) |
 | — | `gp_close(handle)` | free the document |
 | — | `gp_alloc(len)` / `gp_free(ptr,len)` | linear-memory management |
 | `doc.page_count() -> usize` | `gp_page_count(handle)` | |

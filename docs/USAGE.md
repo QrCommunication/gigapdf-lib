@@ -270,10 +270,14 @@ freeArg(txt2);
 ## 9. Security: encrypt, sign, PDF/A
 
 ```js
-// Encrypt (host supplies the file-id randomness)
-const pw = strArg("s3cret"), id = strArg("16-byte-file-id!");
-const enc = callBuffer((lp) => ex.gp_save_encrypted(handle, pw.ptr, pw.len, id.ptr, id.len, -44, lp));
-freeArg(pw); freeArg(id);
+// Encrypt with AES-256 (algo 2). The host supplies the file id AND a secret
+// 32-byte file key (the engine has no RNG); algo 0=RC4-128, 1=AES-128.
+const pw = strArg("s3cret"), owner = strArg("owner-pw"), id = strArg("16-byte-file-id!");
+const key = new Uint8Array(32); crypto.getRandomValues(key);
+const kPtr = toWasm(key);
+const enc = callBuffer((lp) =>
+  ex.gp_save_encrypted(handle, pw.ptr, pw.len, owner.ptr, owner.len, id.ptr, id.len, kPtr, key.length, 2, -44, lp));
+freeArg(pw); freeArg(owner); freeArg(id); ex.gp_free(kPtr, key.length);
 
 // Self-signed digital signature — host supplies random bytes for key generation
 const fields = strArg("Signer\tReason\tD:20260614120000Z\t260614000000Z\t360614000000Z");

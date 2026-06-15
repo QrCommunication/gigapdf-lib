@@ -82,6 +82,40 @@ fn object_key(file_key: &[u8], num: u32, gen: u16, aes: bool) -> Vec<u8> {
     hash[..n].to_vec()
 }
 
+/// `/O` string for the RC4/AESV2 handlers (Algorithm 3), R3+ (50× MD5 + 20 RC4
+/// passes). An empty `owner_password` falls back to the user password, per spec.
+fn compute_legacy_o(owner_password: &[u8], user_password: &[u8], key_len: usize) -> Vec<u8> {
+    let owner = if owner_password.is_empty() {
+        user_password
+    } else {
+        owner_password
+    };
+    let mut okey = md5(&pad_password(owner)).to_vec();
+    for _ in 0..50 {
+        okey = md5(&okey[..key_len]).to_vec();
+    }
+    okey.truncate(key_len);
+    let mut o = rc4(&okey, &pad_password(user_password));
+    for i in 1..=19u8 {
+        let xkey: Vec<u8> = okey.iter().map(|&b| b ^ i).collect();
+        o = rc4(&xkey, &o);
+    }
+    o
+}
+
+/// `/U` string for the RC4/AESV2 handlers, revision 3+ (Algorithm 5): RC4 of
+/// `md5(PAD || ID)` with 19 extra key-xor passes, padded to 32 bytes.
+fn compute_legacy_u(file_key: &[u8], id0: &[u8]) -> Vec<u8> {
+    let mut u = md5(&[PAD.as_slice(), id0].concat()).to_vec();
+    u = rc4(file_key, &u);
+    for i in 1..=19u8 {
+        let xkey: Vec<u8> = file_key.iter().map(|&b| b ^ i).collect();
+        u = rc4(&xkey, &u);
+    }
+    u.resize(32, 0); // pad to 32 bytes with arbitrary data
+    u
+}
+
 /// The R6 password hash (Algorithm 2.B); R5 is a single SHA-256.
 fn hash_r6(password: &[u8], salt: &[u8], udata: &[u8], r: i32) -> [u8; 32] {
     let mut k = sha256(&[password, salt, udata].concat()).to_vec();
@@ -160,12 +194,20 @@ impl Security {
                 if u.len() < 48 {
                     return None;
                 }
-                let check = hash_r6(password, &u[32..40], &[], r);
-                if check != u[..32] {
-                    return None; // wrong password
+                // Algorithm 2.A: try the user password, then the owner password.
+                if hash_r6(password, &u[32..40], &[], r) == u[..32] {
+                    let ik = hash_r6(password, &u[40..48], &[], r);
+                    aes_cbc_decrypt(&ik, &[0u8; 16], &ue)
+                } else {
+                    let o = str_bytes(encrypt, b"O");
+                    let oe = str_bytes(encrypt, b"OE");
+                    // The owner hash is salted with the 48-byte /U string.
+                    if o.len() < 48 || hash_r6(password, &o[32..40], &u, r) != o[..32] {
+                        return None; // wrong password
+                    }
+                    let ik = hash_r6(password, &o[40..48], &u, r);
+                    aes_cbc_decrypt(&ik, &[0u8; 16], &oe)
                 }
-                let ik = hash_r6(password, &u[40..48], &[], r);
-                aes_cbc_decrypt(&ik, &[0u8; 16], &ue)
             }
             _ => {
                 let key_len = if v == 1 { 5 } else { length / 8 };
@@ -219,32 +261,18 @@ impl Security {
 
     /// Build an RC4 (V2/R3, 128-bit) security context plus its `/Encrypt`
     /// dictionary, given a user password and the document's first `/ID`.
-    pub fn new_rc4(user_password: &[u8], id0: &[u8], permissions: i32) -> (Security, Dictionary) {
+    pub fn new_rc4(
+        user_password: &[u8],
+        owner_password: &[u8],
+        id0: &[u8],
+        permissions: i32,
+    ) -> (Security, Dictionary) {
         let key_len = 16usize;
         let r = 3i32;
 
-        // /O (Algorithm 3): owner == user here (single password).
-        let mut okey = md5(&pad_password(user_password)).to_vec();
-        for _ in 0..50 {
-            okey = md5(&okey[..key_len]).to_vec();
-        }
-        okey.truncate(key_len);
-        let mut o = rc4(&okey, &pad_password(user_password));
-        for i in 1..=19u8 {
-            let xkey: Vec<u8> = okey.iter().map(|&b| b ^ i).collect();
-            o = rc4(&xkey, &o);
-        }
-
+        let o = compute_legacy_o(owner_password, user_password, key_len);
         let key = legacy_file_key(&o, permissions, id0, key_len, r, true, user_password);
-
-        // /U (Algorithm 5): RC4 of md5(PAD || ID) with 19 extra rounds.
-        let mut u = md5(&[PAD.as_slice(), id0].concat()).to_vec();
-        u = rc4(&key, &u);
-        for i in 1..=19u8 {
-            let xkey: Vec<u8> = key.iter().map(|&b| b ^ i).collect();
-            u = rc4(&xkey, &u);
-        }
-        u.resize(32, 0); // pad to 32 bytes with arbitrary data
+        let u = compute_legacy_u(&key, id0);
 
         let mut dict = Dictionary::new();
         dict.set(b"Filter".to_vec(), Object::Name(b"Standard".to_vec()));
@@ -265,6 +293,151 @@ impl Security {
             Security {
                 method: Method::Rc4,
                 key,
+            },
+            dict,
+        )
+    }
+
+    /// Build an AESV2 (V4/R4, 128-bit AES-CBC) security context plus its
+    /// `/Encrypt` dictionary. `user_password` opens the document; the (optional)
+    /// `owner_password` governs permission changes. Round-trips through
+    /// [`Security::open`].
+    pub fn new_aes_v2(
+        user_password: &[u8],
+        owner_password: &[u8],
+        id0: &[u8],
+        permissions: i32,
+    ) -> (Security, Dictionary) {
+        let key_len = 16usize;
+        let r = 4i32;
+
+        let o = compute_legacy_o(owner_password, user_password, key_len);
+        let key = legacy_file_key(&o, permissions, id0, key_len, r, true, user_password);
+        let u = compute_legacy_u(&key, id0);
+
+        // /CF << /StdCF << /CFM /AESV2 /Length 16 /AuthEvent /DocOpen >> >>
+        let mut std_cf = Dictionary::new();
+        std_cf.set(b"CFM".to_vec(), Object::Name(b"AESV2".to_vec()));
+        std_cf.set(b"Length".to_vec(), Object::Integer(16));
+        std_cf.set(b"AuthEvent".to_vec(), Object::Name(b"DocOpen".to_vec()));
+        let mut cf = Dictionary::new();
+        cf.set(b"StdCF".to_vec(), Object::Dictionary(std_cf));
+
+        let mut dict = Dictionary::new();
+        dict.set(b"Filter".to_vec(), Object::Name(b"Standard".to_vec()));
+        dict.set(b"V".to_vec(), Object::Integer(4));
+        dict.set(b"R".to_vec(), Object::Integer(r as i64));
+        dict.set(b"Length".to_vec(), Object::Integer((key_len * 8) as i64));
+        dict.set(b"CF".to_vec(), Object::Dictionary(cf));
+        dict.set(b"StmF".to_vec(), Object::Name(b"StdCF".to_vec()));
+        dict.set(b"StrF".to_vec(), Object::Name(b"StdCF".to_vec()));
+        dict.set(b"P".to_vec(), Object::Integer(permissions as i64));
+        dict.set(
+            b"O".to_vec(),
+            Object::String(o, crate::object::StringKind::Literal),
+        );
+        dict.set(
+            b"U".to_vec(),
+            Object::String(u, crate::object::StringKind::Literal),
+        );
+
+        (
+            Security {
+                method: Method::AesV2,
+                key,
+            },
+            dict,
+        )
+    }
+
+    /// Build an AESV3 (V5/R6, 256-bit AES-CBC) security context plus its
+    /// `/Encrypt` dictionary (ISO 32000-2 Algorithms 8–10). `file_key` is the
+    /// 32-byte file encryption key — it MUST be secret host randomness (the WASM
+    /// engine has no RNG); any other length is hashed to 32 bytes. The salts are
+    /// derived from this secret key, so they are unique and unpredictable per
+    /// document. An empty `owner_password` falls back to the user password.
+    pub fn new_aes_v3(
+        user_password: &[u8],
+        owner_password: &[u8],
+        file_key: &[u8],
+        permissions: i32,
+        encrypt_metadata: bool,
+    ) -> (Security, Dictionary) {
+        let r = 6i32;
+        let fek = if file_key.len() == 32 {
+            file_key.to_vec()
+        } else {
+            sha256(file_key).to_vec()
+        };
+        let owner = if owner_password.is_empty() {
+            user_password
+        } else {
+            owner_password
+        };
+
+        // Salts derived from the secret file key (unique + unpredictable per doc).
+        let salt =
+            |label: &[u8]| -> Vec<u8> { sha256(&[fek.as_slice(), label].concat())[..8].to_vec() };
+        let uvs = salt(b"uvs");
+        let uks = salt(b"uks");
+        let ovs = salt(b"ovs");
+        let oks = salt(b"oks");
+
+        // Algorithm 8 — /U (48 bytes) and /UE (32 bytes).
+        let mut u = hash_r6(user_password, &uvs, &[], r).to_vec();
+        u.extend_from_slice(&uvs);
+        u.extend_from_slice(&uks);
+        let iuk = hash_r6(user_password, &uks, &[], r);
+        let ue = aes_cbc_encrypt(&iuk, &[0u8; 16], &fek);
+
+        // Algorithm 9 — /O (48 bytes, salted with /U) and /OE (32 bytes).
+        let mut o = hash_r6(owner, &ovs, &u, r).to_vec();
+        o.extend_from_slice(&ovs);
+        o.extend_from_slice(&oks);
+        let iok = hash_r6(owner, &oks, &u, r);
+        let oe = aes_cbc_encrypt(&iok, &[0u8; 16], &fek);
+
+        // Algorithm 10 — /Perms (16 bytes, AES-256 ECB of the perms block).
+        let mut perms_block = [0u8; 16];
+        perms_block[..4].copy_from_slice(&(permissions as u32).to_le_bytes());
+        perms_block[4..8].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        perms_block[8] = if encrypt_metadata { b'T' } else { b'F' };
+        perms_block[9..12].copy_from_slice(b"adb");
+        perms_block[12..16].copy_from_slice(&sha256(&[fek.as_slice(), b"perms"].concat())[..4]);
+        let perms = aes_cbc_encrypt(&fek, &[0u8; 16], &perms_block); // single block = ECB
+
+        let lit = |b: Vec<u8>| Object::String(b, crate::object::StringKind::Literal);
+
+        // /CF << /StdCF << /CFM /AESV3 /Length 32 /AuthEvent /DocOpen >> >>
+        let mut std_cf = Dictionary::new();
+        std_cf.set(b"CFM".to_vec(), Object::Name(b"AESV3".to_vec()));
+        std_cf.set(b"Length".to_vec(), Object::Integer(32));
+        std_cf.set(b"AuthEvent".to_vec(), Object::Name(b"DocOpen".to_vec()));
+        let mut cf = Dictionary::new();
+        cf.set(b"StdCF".to_vec(), Object::Dictionary(std_cf));
+
+        let mut dict = Dictionary::new();
+        dict.set(b"Filter".to_vec(), Object::Name(b"Standard".to_vec()));
+        dict.set(b"V".to_vec(), Object::Integer(5));
+        dict.set(b"R".to_vec(), Object::Integer(r as i64));
+        dict.set(b"Length".to_vec(), Object::Integer(256));
+        dict.set(b"CF".to_vec(), Object::Dictionary(cf));
+        dict.set(b"StmF".to_vec(), Object::Name(b"StdCF".to_vec()));
+        dict.set(b"StrF".to_vec(), Object::Name(b"StdCF".to_vec()));
+        dict.set(b"P".to_vec(), Object::Integer(permissions as i64));
+        dict.set(b"O".to_vec(), lit(o));
+        dict.set(b"U".to_vec(), lit(u));
+        dict.set(b"OE".to_vec(), lit(oe));
+        dict.set(b"UE".to_vec(), lit(ue));
+        dict.set(b"Perms".to_vec(), lit(perms));
+        if !encrypt_metadata {
+            dict.set(b"EncryptMetadata".to_vec(), Object::Boolean(false));
+        }
+
+        (
+            Security {
+                method: Method::AesV3,
+                key: fek,
             },
             dict,
         )
@@ -367,7 +540,7 @@ mod tests {
 
     #[test]
     fn builds_rc4_encrypt_dictionary() {
-        let (sec, dict) = Security::new_rc4(b"hunter2", b"file-id-0000", -44);
+        let (sec, dict) = Security::new_rc4(b"hunter2", b"owner-pw", b"file-id-0000", -44);
         assert_eq!(
             dict.get(b"Filter").and_then(Object::as_name),
             Some(b"Standard".as_slice())
@@ -376,5 +549,53 @@ mod tests {
         // The derived key actually decrypts what it encrypts.
         let enc = sec.encrypt(5, 0, b"hello");
         assert_eq!(sec.decrypt(5, 0, &enc), b"hello");
+    }
+
+    #[test]
+    fn builds_aesv2_encrypt_dictionary_round_trip() {
+        let id0 = b"file-id-0123456789ab";
+        let (sec, dict) = Security::new_aes_v2(b"user-pw", b"owner-pw", id0, -44);
+        assert_eq!(dict.get(b"V").and_then(Object::as_i64), Some(4));
+        assert_eq!(dict.get(b"R").and_then(Object::as_i64), Some(4));
+
+        // The handler decrypts what it encrypts (AES-CBC per object).
+        let enc = sec.encrypt(5, 0, b"secret content, not a block multiple");
+        assert_eq!(
+            sec.decrypt(5, 0, &enc),
+            b"secret content, not a block multiple"
+        );
+
+        // The /Encrypt dict re-opens with the USER password (Algorithm 6 via /U)
+        // and the reopened context round-trips too.
+        let reopened = Security::open(&dict, id0, b"user-pw").expect("user password opens");
+        let enc2 = reopened.encrypt(9, 0, b"abc");
+        assert_eq!(reopened.decrypt(9, 0, &enc2), b"abc");
+
+        // A wrong password is rejected.
+        assert!(Security::open(&dict, id0, b"wrong").is_none());
+    }
+
+    #[test]
+    fn builds_aesv3_encrypt_dictionary_round_trip() {
+        let fek = [0x5Au8; 32]; // stands in for secret host randomness
+        let (sec, dict) = Security::new_aes_v3(b"user-pw", b"owner-pw", &fek, -44, true);
+        assert_eq!(dict.get(b"V").and_then(Object::as_i64), Some(5));
+        assert_eq!(dict.get(b"R").and_then(Object::as_i64), Some(6));
+
+        let msg = b"top secret payload, not block aligned";
+        let enc = sec.encrypt(7, 0, msg);
+        assert_eq!(sec.decrypt(7, 0, &enc), msg);
+
+        // AESV3 keys are independent of the file ID, so `id0` is irrelevant here.
+        // Re-open with the USER password (Algorithm 2.A) recovers the file key.
+        let by_user = Security::open(&dict, b"", b"user-pw").expect("user opens");
+        assert_eq!(by_user.decrypt(7, 0, &enc), msg);
+
+        // Re-open with the OWNER password also recovers it.
+        let by_owner = Security::open(&dict, b"", b"owner-pw").expect("owner opens");
+        assert_eq!(by_owner.decrypt(7, 0, &enc), msg);
+
+        // A wrong password is rejected.
+        assert!(Security::open(&dict, b"", b"nope").is_none());
     }
 }

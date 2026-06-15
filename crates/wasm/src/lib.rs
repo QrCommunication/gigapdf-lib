@@ -99,21 +99,31 @@ pub extern "C" fn gp_open_encrypted(
     }
 }
 
-/// Serialize the document encrypted (RC4 128-bit) with the given password and
-/// file id. Buffer-returning (host frees); null on error.
+/// Serialize the document encrypted with the Standard Security Handler.
+/// `algorithm`: `0` = RC4-128 (R3), `1` = AES-128 (R4), `2` = AES-256 (R6).
+/// `owner` is the owner password (empty → owner = user). `key` is **secret
+/// host randomness** (≥32 bytes) used only by AES-256 (the engine has no RNG).
+/// Buffer-returning (host frees); null on error.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn gp_save_encrypted(
     handle: *const Document,
     pw_ptr: *const u8,
     pw_len: usize,
+    owner_ptr: *const u8,
+    owner_len: usize,
     id_ptr: *const u8,
     id_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+    algorithm: i32,
     permissions: i32,
     out_len: *mut usize,
 ) -> *mut u8 {
     match unsafe { handle.as_ref() } {
         Some(doc) => {
             let password = unsafe { str_arg(pw_ptr, pw_len) };
+            let owner = unsafe { str_arg(owner_ptr, owner_len) };
             let id = unsafe {
                 if id_ptr.is_null() {
                     &[][..]
@@ -121,7 +131,21 @@ pub extern "C" fn gp_save_encrypted(
                     std::slice::from_raw_parts(id_ptr, id_len)
                 }
             };
-            let pdf = doc.save_encrypted(password.as_bytes(), id, permissions);
+            let key = unsafe {
+                if key_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(key_ptr, key_len)
+                }
+            };
+            let pdf = doc.save_encrypted(
+                password.as_bytes(),
+                owner.as_bytes(),
+                id,
+                key,
+                algorithm,
+                permissions,
+            );
             unsafe { bytes_into_host(pdf, out_len) }
         }
         None => std::ptr::null_mut(),

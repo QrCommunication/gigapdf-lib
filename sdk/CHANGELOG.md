@@ -4,6 +4,27 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-06-16
+
+### Added
+
+- **AES PDF encryption** (`doc.saveEncrypted`). The Standard Security Handler can
+  now *write* **AES-128 (V4/R4)** and **AES-256 (V5/R6)** in addition to RC4, with
+  **separate user and owner passwords**:
+  - `saveEncrypted(password, fileId, { algorithm: "aes256" | "aes128" | "rc4",
+    ownerPassword, permissions, keySeed })` — defaults to **AES-256**.
+  - AES-256 needs a **secret 32-byte file key** (the engine has no RNG): the SDK
+    generates it with Web Crypto, or you pass `keySeed`. The decryption side
+    already read AESV2/AESV3; `openEncrypted` now also accepts the **owner**
+    password for R6 (Algorithm 2.A).
+  - ABI `gp_save_encrypted` gains `owner`, `key` and an `algorithm` selector.
+
+### Changed
+
+- **Breaking (SDK):** `saveEncrypted(password, fileId, permissions?)` →
+  `saveEncrypted(password, fileId, opts?)`. Pass `{ permissions }` (and
+  `{ algorithm: "rc4" }` to keep the previous RC4 behaviour).
+
 ## [0.7.0] - 2026-06-15
 
 ### Added

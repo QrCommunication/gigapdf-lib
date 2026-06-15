@@ -924,11 +924,60 @@ export class GigaPdfDoc {
   }
 
   // security
-  saveEncrypted(password: string, fileId: string, permissions = -44): Uint8Array {
+  /**
+   * Serialize the document encrypted with the PDF Standard Security Handler.
+   * Defaults to **AES-256 (R6)**. `fileId` is the document `/ID` (any stable
+   * hex/string). For AES-256 a **secret 32-byte key** is required — it is taken
+   * from `opts.keySeed` or generated with Web Crypto; RC4/AES-128 derive their
+   * key from the password and ignore it.
+   */
+  saveEncrypted(
+    password: string,
+    fileId: string,
+    opts: {
+      ownerPassword?: string;
+      algorithm?: "rc4" | "aes128" | "aes256";
+      permissions?: number;
+      keySeed?: Uint8Array;
+    } = {}
+  ): Uint8Array {
+    const algo = opts.algorithm ?? "aes256";
+    const algoCode = algo === "rc4" ? 0 : algo === "aes128" ? 1 : 2;
+    const permissions = opts.permissions ?? -44;
+    let key = opts.keySeed ?? new Uint8Array(0);
+    if (algoCode === 2 && key.length < 32) {
+      const c = (globalThis as { crypto?: Crypto }).crypto;
+      if (!c?.getRandomValues) {
+        throw new Error(
+          "AES-256 encryption needs Web Crypto (globalThis.crypto.getRandomValues) or an explicit opts.keySeed"
+        );
+      }
+      // `getRandomValues` requires an ArrayBuffer-backed view (not ArrayBufferLike).
+      const fresh = new Uint8Array(32);
+      c.getRandomValues(fresh);
+      key = fresh;
+    }
     return this.g._withStr(password, (pwP, pwL) =>
-      this.g._withStr(fileId, (idP, idL) =>
-        this.g._buffer((o) =>
-          this.ex().gp_save_encrypted(this.h, pwP, pwL, idP, idL, permissions, o)
+      this.g._withOptStr(opts.ownerPassword, (oP, oL) =>
+        this.g._withStr(fileId, (idP, idL) =>
+          this.g._withBytes(key, (kP, kL) =>
+            this.g._buffer((o) =>
+              this.ex().gp_save_encrypted(
+                this.h,
+                pwP,
+                pwL,
+                oP,
+                oL,
+                idP,
+                idL,
+                kP,
+                kL,
+                algoCode,
+                permissions,
+                o
+              )
+            )
+          )
         )
       )
     );

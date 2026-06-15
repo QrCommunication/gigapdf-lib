@@ -321,24 +321,32 @@ check(
   `gp_render_page → valid PNG (${png.length} bytes)`,
 );
 
-// encrypt the document, then reopen it with the password
+// encrypt with AES-256 (R6) + owner password, then reopen with each password
 {
   const pw = argStr("s3cret");
+  const owner = argStr("owner-secret");
   const id = argStr("file-id-bytes-01");
+  const fek = new Uint8Array(32).fill(0x5a); // stands in for secret host randomness
+  const fekPtr = toWasm(fek);
   const enc = readBufferReturning((lp) =>
-    ex.gp_save_encrypted(mh, pw.ptr, pw.len, id.ptr, id.len, -44, lp),
+    ex.gp_save_encrypted(mh, pw.ptr, pw.len, owner.ptr, owner.len, id.ptr, id.len, fekPtr, fek.length, 2, -44, lp),
   );
-  check(enc.length > 0 && dec.decode(enc.slice(0, 5)) === "%PDF-", "gp_save_encrypted → PDF");
+  check(enc.length > 0 && dec.decode(enc.slice(0, 5)) === "%PDF-", "gp_save_encrypted AES-256 → PDF");
   const ePtr = toWasm(enc);
   const okHandle = ex.gp_open_encrypted(ePtr, enc.length, pw.ptr, pw.len);
-  check(okHandle !== 0 && ex.gp_page_count(okHandle) === pageCount, "reopened encrypted with password");
+  check(okHandle !== 0 && ex.gp_page_count(okHandle) === pageCount, "AES-256 reopened with user password");
   if (okHandle !== 0) ex.gp_close(okHandle);
-  // Wrong (empty) password is rejected by the /U check → null handle.
+  // The owner password opens it too (Algorithm 2.A).
+  const ownerHandle = ex.gp_open_encrypted(ePtr, enc.length, owner.ptr, owner.len);
+  check(ownerHandle !== 0, "AES-256 reopened with owner password");
+  if (ownerHandle !== 0) ex.gp_close(ownerHandle);
+  // Wrong (empty) password is rejected → null handle.
   const badHandle = ex.gp_open_encrypted(ePtr, enc.length, 0, 0);
   check(badHandle === 0, "wrong password rejected");
   if (badHandle !== 0) ex.gp_close(badHandle);
   ex.gp_free(ePtr, enc.length);
-  freeArg(pw); freeArg(id);
+  ex.gp_free(fekPtr, fek.length);
+  freeArg(pw); freeArg(owner); freeArg(id);
 }
 
 // digitally sign with a freshly generated self-signed digital ID

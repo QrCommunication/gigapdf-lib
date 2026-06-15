@@ -310,12 +310,25 @@ impl Document {
         Ok(bytes)
     }
 
-    /// Serialize the document encrypted with the Standard Security Handler
-    /// (RC4 128-bit). `id0` is the file identifier (host-provided randomness);
-    /// `permissions` is the `/P` flags value.
-    pub fn save_encrypted(&self, user_password: &[u8], id0: &[u8], permissions: i32) -> Vec<u8> {
-        let (security, encrypt_dict) =
-            crate::security::Security::new_rc4(user_password, id0, permissions);
+    /// Serialize the document encrypted with the Standard Security Handler.
+    /// `algorithm`: `0` = RC4-128 (R3), `1` = AES-128 (R4), `2` = AES-256 (R6).
+    /// `id0` is the file identifier; `file_key` is **secret host randomness**
+    /// used only by AES-256 (the engine has no RNG). `permissions` is `/P`.
+    pub fn save_encrypted(
+        &self,
+        user_password: &[u8],
+        owner_password: &[u8],
+        id0: &[u8],
+        file_key: &[u8],
+        algorithm: i32,
+        permissions: i32,
+    ) -> Vec<u8> {
+        use crate::security::Security;
+        let (security, encrypt_dict) = match algorithm {
+            1 => Security::new_aes_v2(user_password, owner_password, id0, permissions),
+            2 => Security::new_aes_v3(user_password, owner_password, file_key, permissions, true),
+            _ => Security::new_rc4(user_password, owner_password, id0, permissions),
+        };
         crate::serialize::to_pdf_encrypted(
             &self.objects,
             &self.trailer,
@@ -5506,7 +5519,7 @@ mod tests {
             .collect();
         assert!(!want.is_empty());
 
-        let encrypted = original.save_encrypted(b"s3cret", b"file-id-bytes-01", -44);
+        let encrypted = original.save_encrypted(b"s3cret", b"", b"file-id-bytes-01", b"", 0, -44);
 
         // Opening with the right password recovers the exact text.
         let opened = Document::open_with_password(&encrypted, b"s3cret").unwrap();
