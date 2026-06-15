@@ -7,11 +7,13 @@ only a Rust toolchain; the WebAssembly target is the standard `wasm32` (no
 ## Prerequisites
 
 - Rust (stable) — the repo pins it via `rust-toolchain.toml`.
-- The wasm target:
+- The wasm target (added once):
 
   ```bash
   rustup target add wasm32-unknown-unknown
   ```
+
+  You only ever type that triple here; builds use the `cargo wasm` alias below.
 
 - (Optional) Node.js — to run the end-to-end smoke test.
 
@@ -27,7 +29,7 @@ Use this for server-side conversion/rendering directly from Rust.
 ## Build the WebAssembly module
 
 ```bash
-cargo build -p gigapdf-wasm --target wasm32-unknown-unknown --release
+cargo wasm   # alias for the release target build (see .cargo/config.toml)
 # → target/wasm32-unknown-unknown/release/gigapdf_wasm.wasm  (~540 KB)
 ```
 

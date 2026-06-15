@@ -36,7 +36,7 @@ doc.redact(1, 72, 700, 180, 14); // physically remove content in a region
 doc.addHighlight(1, 72, 690, 252, 704, 0xffff00);
 
 // Convert
-const docx = doc.toDocx(); // also: toPptx/toOdt/toXlsx/toOds/toHtml/toText/toRtf/toPdfA
+const docx = doc.toDocx(); // also: toPptx/toOdp/toOdt/toXlsx/toOds/toHtml/toText/toRtf/toPdfA
 const png = doc.renderPage(1, 2); // rasterize a page
 
 // Save
@@ -50,6 +50,27 @@ doc.close();
 const fromDocx = giga.officeToPdf(officeBytes); // docx/xlsx/pptx/odt/ods/odp auto-detected
 const fromHtml = giga.htmlToPdf("<h1>Hello</h1>");
 const fromRtf = giga.rtfToPdf(rtfString);
+```
+
+### Build an interactive form (no `pdf-lib`)
+
+```ts
+// Coordinates are PDF user space (origin bottom-left): [x0, y0, x1, y1].
+doc.addTextField(1, "fullname", [50, 700, 300, 720], "", { maxLen: 60 });
+doc.addCheckbox(1, "subscribe", [50, 670, 64, 684], true, { export: "Yes" });
+doc.addRadioGroup(1, "plan", [
+  { export: "Basic", rect: [50, 640, 64, 654] },
+  { export: "Pro", rect: [80, 640, 94, 654] },
+], { selected: "Pro" });
+doc.addComboBox(1, "country", [50, 610, 200, 626], ["FR", "US", "DE"], { selected: "FR" });
+doc.addListBox(1, "langs", [50, 540, 200, 600], ["en", "fr", "de"], { multi: true });
+
+// Optional per-field styling.
+doc.addTextField(1, "vat", [50, 510, 200, 528], "", {
+  style: { fontSize: 11, color: 0x102030, border: 0x888888, background: 0xf5f5f5 },
+});
+
+const filled = doc.fields(); // read them straight back: kind + value + options
 ```
 
 ### Fonts (host performs the network fetch)
@@ -84,16 +105,43 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   `txtToPdf`/`htmlToPdf`/`rtfToPdf`/`officeToPdf`, `fontCatalog`/`fontRequestUrl`/`parseCssFontUrl`.
 - **`GigaPdfDoc`** — text intelligence (`textRuns`, `structuredText`, `search`,
   `ocr`, `ocrText`, `elements`, `elementAt`), editing (`replaceText`,
-  `removeElement`, `moveElement`, `duplicateElement`, `addRectangle`, `redact`),
-  pages (`rotatePage`, `deletePage`, `movePage`, `appendPages`, `extractPages`),
+  `removeElement`, `moveElement`, `duplicateElement`, `redact`), vector drawing
+  (`addRectangle`, `drawLine`, `addEllipse`, `addPolygon`, `addPath` (SVG path),
+  `addImage` (PNG/JPEG, alpha + opacity)), pages (`rotatePage`, `deletePage`,
+  `movePage`, `appendPages`, `extractPages`, `resizePage`, `addPage`, `copyPage`,
+  `pageInfo`),
   `renderPage`, fonts (`embedFont`, `addText`, `neededFonts`), conversions
-  (`toText/Html/Docx/Pptx/Odt/Xlsx/Ods/Rtf/PdfA`), security (`saveEncrypted`,
+  (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`), security (`saveEncrypted`,
   `sign`), metadata (`getMetadata`, `setMetadata`), annotations (`addSquare`,
   `addHighlight`, `addLineAnnotation`, `addFreeText`, `addUnderline`,
   `addStrikeOut`, `addInk`, `addStamp`, `annotations`, `removeAnnotation`,
   `flattenAnnotations`), links (`links`, `addUriLink`, `addGotoLink`), outline
-  (`outline`, `setOutline`), and forms (`fields`, `setTextField`, `setCheckbox`,
-  `setRadio`, `setChoice`).
+  (`outline`, `setOutline`), forms — read/fill (`fields`, `setTextField`,
+  `setCheckbox`, `setRadio`, `setChoice`) **and create**
+  (`addTextField`, `addCheckbox`, `addRadioGroup`, `addComboBox`, `addListBox`,
+  each with an optional `FieldStyle`), and optional-content layers (`layers`,
+  `addLayer`, `setLayerVisibility`, `setLayerLocked`, `removeLayer`).
+- **HTML rendering engine** (on `GigaPdfEngine`) — `htmlNeededFonts(html)`
+  returns the Google fonts to download (phase 1); `htmlRender(html, fonts,
+  pageW?, pageH?, margin?)` renders HTML + CSS to PDF with those fonts embedded
+  (phase 2). **No headless browser.** Block / inline / table / **flex**
+  (`flex-direction`, `justify-content`, `flex-grow`) / **grid**
+  (`grid-template-columns`) layout, selector cascade, pagination, and forced page
+  breaks via CSS `page-break-before|after: always` / `break-*: page` or a
+  `<pagebreak>` tag. **See the exhaustive list of supported HTML elements, CSS
+  properties, units, colours and selectors in
+  [`docs/HTML-CSS.md`](https://github.com/QrCommunication/gigapdf-lib/blob/main/docs/HTML-CSS.md).**
+- **JavaScript** — a document's inline `<script>`s run **before layout** through
+  a built-in zero-dependency JS engine (no Chromium/Playwright), so script-driven
+  content is rendered. It covers classes + `super`, closures, destructuring,
+  `RegExp`, `Map`/`Set`, `Symbol`, `eval`/`Function`, and DOM bindings
+  (`document.getElementById`, `querySelector(All)` with `>`/`+`/`~`/`[attr]`,
+  `textContent`, `innerHTML`, `createElement`/`appendChild`, `classList`,
+  `style`). `function*`/`async` bodies compile to a **suspendable bytecode VM**,
+  so generators are **truly lazy** (infinite generators, bidirectional
+  `.next(v)`, `yield*`) and `await` **yields** with spec microtask ordering. This
+  happens automatically inside `htmlRender`/`htmlNeededFonts` — no extra call
+  needed.
 
 Every method is fully typed. Always `close()` a document when done to free the
 WASM handle.

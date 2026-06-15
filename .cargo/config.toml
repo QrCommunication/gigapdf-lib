@@ -1,0 +1,11 @@
+# Cargo aliases so contributors never have to type the bare target triple.
+#
+#   cargo wasm        → release build of the WASM engine
+#   cargo wasm-dev    → debug build (faster compile, larger artifact)
+#
+# The artifact lands at target/wasm32-unknown-unknown/release/gigapdf_wasm.wasm;
+# `sdk/scripts/build-wasm.sh` (run via `pnpm --filter @qrcommunication/gigapdf-lib
+# build:wasm`) copies it next to the SDK as the friendly `gigapdf.wasm`.
+[alias]
+wasm = "build -p gigapdf-wasm --target wasm32-unknown-unknown --release"
+wasm-dev = "build -p gigapdf-wasm --target wasm32-unknown-unknown"

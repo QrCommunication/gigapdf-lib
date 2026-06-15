@@ -84,4 +84,46 @@ describe("@qrcommunication/gigapdf-lib", () => {
     reopened.close();
     doc.close();
   });
+
+  it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
+    const doc = giga.open(giga.txtToPdf("Shapes"));
+    expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);
+    // Translucent ellipse exercises the /ExtGState opacity path.
+    expect(doc.addEllipse(1, 150, 150, 40, 25, 0x00ff00, 0xffeeaa, 1, 0.5)).toBe(true);
+    expect(doc.addPolygon(1, [200, 200, 260, 200, 230, 260], true, 0x000000, 0xff0000)).toBe(true);
+    expect(doc.addPath(1, "M 0 0 L 50 0 L 25 40 Z", 300, 400, 0x123456, null, 1.5)).toBe(true);
+    // Embed a real PNG: render the page to PNG, then place it back as an image.
+    const png = doc.renderPage(1, 1);
+    expect(png[0]).toBe(0x89); // PNG magic
+    expect(doc.addImage(1, png, 50, 500, 120, 80, 0.8)).toBe(true);
+    const reopened = giga.open(doc.save());
+    expect(reopened.pageCount()).toBe(1);
+    reopened.close();
+    doc.close();
+  });
+
+  it("converts PDF ↔ ODP (presentation) both ways", () => {
+    const doc = giga.open(giga.txtToPdf("Slide one"));
+    const odp = doc.toOdp();
+    // ODP is a zip (PK magic) carrying the OpenDocument presentation mimetype.
+    expect(odp[0]).toBe(0x50);
+    expect(odp[1]).toBe(0x4b);
+    // Reverse: ODP → PDF, format auto-detected by officeToPdf.
+    const pdf = giga.officeToPdf(odp);
+    expect(new TextDecoder().decode(pdf.slice(0, 5))).toBe("%PDF-");
+    doc.close();
+  });
+
+  it("renders HTML→PDF with the native engine and lists needed Google fonts", () => {
+    const html = `<style>body{font-family:Roboto;color:#333}</style>
+      <body><h1>Invoice</h1><p>Hello <b>world</b> — rendered natively, no browser.</p>
+      <table><tr><td>A</td><td>B</td></tr></table></body>`;
+    // Phase 1: which Google fonts to fetch.
+    const fonts = giga.htmlNeededFonts(html);
+    expect(fonts.some((f) => /roboto/i.test(f.family) && f.url.length > 0)).toBe(true);
+    // Phase 2: render (no font bytes supplied → layout/backgrounds still produce a valid PDF).
+    const pdf = giga.htmlRender(html, [], 612, 792, 36);
+    expect(new TextDecoder().decode(pdf.slice(0, 5))).toBe("%PDF-");
+    expect(pdf.length).toBeGreaterThan(200);
+  });
 });

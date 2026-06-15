@@ -1,6 +1,6 @@
 /**
- * @giga-pdf/wasm-engine — TypeScript SDK for the zero-dependency Rust→WASM PDF
- * engine (gigapdf-engine). Wraps the flat `extern "C"` `gp_*` ABI behind a typed,
+ * @qrcommunication/gigapdf-lib — TypeScript SDK for the zero-dependency Rust→WASM
+ * PDF engine (gigapdf-lib). Wraps the flat `extern "C"` `gp_*` ABI behind a typed,
  * ergonomic class. No third-party runtime deps; the `.wasm` is self-contained.
  *
  * Usage:
@@ -109,6 +109,10 @@ export class GigaPdfEngine {
       this._free(ptr, b.length);
     }
   }
+  /** Pass an optional string; an absent/empty value runs `fn(0, 0)` (no alloc). */
+  _withOptStr<T>(s: string | undefined, fn: (ptr: number, len: number) => T): T {
+    return s ? this._withStr(s, fn) : fn(0, 0);
+  }
   /** Pass a bytes argument; runs `fn(ptr, len)` then frees. */
   _withBytes<T>(bytes: Uint8Array, fn: (ptr: number, len: number) => T): T {
     const ptr = this._toWasm(bytes);
@@ -191,6 +195,234 @@ export class GigaPdfEngine {
   parseCssFontUrl(css: string): string {
     return this._withStr(css, (p, l) => this._str((o) => this.ex.gp_parse_css_font_url(p, l, o)));
   }
+
+  // ── JavaScript engine (no headless browser) ────────────────────────────────
+  /**
+   * Evaluate a JavaScript snippet with the built-in engine and return the
+   * result value as a string (or `Uncaught …` / `SyntaxError: …`).
+   */
+  evalJs(src: string): string {
+    return this._withStr(src, (p, l) => this._str((o) => this.ex.gp_js_eval(p, l, o)));
+  }
+  /**
+   * Run a document's inline `<script>`s and return the resulting HTML. The
+   * `htmlRender`/`htmlNeededFonts` paths already do this automatically; use this
+   * only when you want the post-script HTML on its own.
+   */
+  runInlineScripts(html: string): string {
+    return this._withStr(html, (p, l) =>
+      this._str((o) => this.ex.gp_run_inline_scripts(p, l, o))
+    );
+  }
+
+  // ── HTML rendering engine (replaces a headless browser for HTML→PDF) ───────
+  /**
+   * Phase 1 — the Google fonts the document references. Download each `url`
+   * (→ TTF) and pass the bytes back to {@link htmlRender} for an identical render.
+   */
+  htmlNeededFonts(html: string): HtmlFontRequest[] {
+    return this._withStr(html, (p, l) =>
+      this._json((o) => this.ex.gp_html_needed_fonts(p, l, o))
+    ) as HtmlFontRequest[];
+  }
+
+  /**
+   * Phase 2 — render HTML + CSS to PDF, with the supplied fonts embedded (real
+   * Google fonts, real metrics → identical or nearest match). Block, inline and
+   * table layout with pagination. Page size and margin are in points
+   * (US-Letter portrait, 0.5in margins by default). JavaScript is not executed.
+   */
+  htmlRender(
+    html: string,
+    fonts: HtmlFont[] = [],
+    pageWidth = 612,
+    pageHeight = 792,
+    margin = 36
+  ): Uint8Array {
+    const blob = packHtmlFonts(fonts);
+    return this._withStr(html, (hp, hl) =>
+      this._withBytes(blob, (fp, fl) =>
+        this._buffer((o) => this.ex.gp_html_render(hp, hl, fp, fl, pageWidth, pageHeight, margin, o))
+      )
+    );
+  }
+
+  /**
+   * Resolve a named paper size — `"A4"`, `"a3-landscape"`, `"letter"`, `"legal"`,
+   * `"tabloid"`, `"b5"`, … — to `{ w, h }` in points (portrait unless the name
+   * has a `-landscape` suffix). Returns `null` for an unknown name.
+   */
+  pageSize(name: string): { w: number; h: number } | null {
+    const outPtr = this.ex.gp_alloc(16);
+    try {
+      const ok = this._withStr(name, (p, l) =>
+        this.ex.gp_page_size(p, l, outPtr, outPtr + 8)
+      );
+      if (!ok) return null;
+      const dv = this.dv();
+      return { w: dv.getFloat64(outPtr, true), h: dv.getFloat64(outPtr + 8, true) };
+    } finally {
+      this._free(outPtr, 16);
+    }
+  }
+
+  /**
+   * Phase 1 variant that also scans the running `header`/`footer` HTML, so the
+   * Google fonts they reference are requested alongside the body's.
+   */
+  htmlNeededFontsWith(html: string, header?: string, footer?: string): HtmlFontRequest[] {
+    return this._withStr(html, (hp, hl) =>
+      this._withOptStr(header, (hdp, hdl) =>
+        this._withOptStr(footer, (ftp, ftl) =>
+          this._json((o) => this.ex.gp_html_needed_fonts_ex(hp, hl, hdp, hdl, ftp, ftl, o))
+        )
+      )
+    ) as HtmlFontRequest[];
+  }
+
+  /**
+   * Phase 2 with full page control: named/explicit size, per-side margins, and a
+   * running header/footer painted in the page margins. `{{page}}` and `{{pages}}`
+   * in the header/footer are replaced with the current / total page number.
+   *
+   * ```ts
+   * const fonts = await fetchFonts(giga.htmlNeededFontsWith(html, header, footer));
+   * const pdf = giga.htmlRenderWith(html, fonts, {
+   *   pageSize: "A4",
+   *   margin: { top: 72, bottom: 72, left: 54, right: 54 },
+   *   header: `<div style="text-align:center">My Report</div>`,
+   *   footer: `<div style="text-align:center">Page {{page}} / {{pages}}</div>`,
+   * });
+   * ```
+   */
+  htmlRenderWith(
+    html: string,
+    fonts: HtmlFont[] = [],
+    options: HtmlRenderOptions = {}
+  ): Uint8Array {
+    let pw = options.pageWidth ?? 612;
+    let ph = options.pageHeight ?? 792;
+    if (options.pageSize) {
+      const sz = this.pageSize(options.pageSize);
+      if (!sz) throw new Error(`gigapdf: unknown page size "${options.pageSize}"`);
+      pw = sz.w;
+      ph = sz.h;
+    }
+    const m = options.margin ?? 36;
+    const mg =
+      typeof m === "number"
+        ? { top: m, right: m, bottom: m, left: m }
+        : { top: m.top ?? 36, right: m.right ?? 36, bottom: m.bottom ?? 36, left: m.left ?? 36 };
+    const headerOffset = options.headerOffset ?? 18;
+    const footerOffset = options.footerOffset ?? 18;
+    const start = options.startPageNumber ?? 1;
+    const blob = packHtmlFonts(fonts);
+
+    return this._withStr(html, (hp, hl) =>
+      this._withBytes(blob, (fp, fl) =>
+        this._withOptStr(options.header, (hdp, hdl) =>
+          this._withOptStr(options.footer, (ftp, ftl) =>
+            this._buffer((o) =>
+              this.ex.gp_html_render_opts(
+                hp,
+                hl,
+                fp,
+                fl,
+                pw,
+                ph,
+                mg.top,
+                mg.right,
+                mg.bottom,
+                mg.left,
+                hdp,
+                hdl,
+                ftp,
+                ftl,
+                headerOffset,
+                footerOffset,
+                start,
+                o
+              )
+            )
+          )
+        )
+      )
+    );
+  }
+}
+
+/** Pack `HtmlFont[]` into the little-endian blob `gp_html_render` expects. */
+function packHtmlFonts(fonts: HtmlFont[]): Uint8Array {
+  let size = 4;
+  for (const f of fonts) size += 4 + enc.encode(f.family).length + 2 + 1 + 4 + f.ttf.length;
+  const buf = new Uint8Array(size);
+  const dv = new DataView(buf.buffer);
+  let o = 0;
+  dv.setUint32(o, fonts.length, true);
+  o += 4;
+  for (const f of fonts) {
+    const fam = enc.encode(f.family);
+    dv.setUint32(o, fam.length, true);
+    o += 4;
+    buf.set(fam, o);
+    o += fam.length;
+    dv.setUint16(o, f.weight, true);
+    o += 2;
+    buf[o] = f.italic ? 1 : 0;
+    o += 1;
+    dv.setUint32(o, f.ttf.length, true);
+    o += 4;
+    buf.set(f.ttf, o);
+    o += f.ttf.length;
+  }
+  return buf;
+}
+
+/** A Google font the HTML engine needs (resolved from the catalogue). */
+export interface HtmlFontRequest {
+  family: string;
+  weight: number;
+  italic: boolean;
+  /** Google Fonts CSS URL — the host fetches it to obtain the TTF. */
+  url: string;
+}
+
+/** A downloaded font handed to {@link GigaPdfEngine.htmlRender}. */
+export interface HtmlFont {
+  family: string;
+  weight: number;
+  italic: boolean;
+  ttf: Uint8Array;
+}
+
+/** Per-side page margins in points; omitted sides default to 36pt. */
+export interface HtmlMargins {
+  top?: number;
+  right?: number;
+  bottom?: number;
+  left?: number;
+}
+
+/** Page setup for {@link GigaPdfEngine.htmlRenderWith}. */
+export interface HtmlRenderOptions {
+  /** Named paper size (`"A4"`, `"a3-landscape"`, `"letter"`, …) — wins over width/height. */
+  pageSize?: string;
+  /** Explicit page width in points (default 612 = US Letter). Ignored if `pageSize` is set. */
+  pageWidth?: number;
+  /** Explicit page height in points (default 792). Ignored if `pageSize` is set. */
+  pageHeight?: number;
+  /** Uniform margin (points) or per-side margins. Default 36pt (0.5in). */
+  margin?: number | HtmlMargins;
+  /** Running header HTML painted in the top margin (`{{page}}` / `{{pages}}` tokens). */
+  header?: string;
+  /** Running footer HTML painted in the bottom margin (same tokens). */
+  footer?: string;
+  /** Distance from the top edge to the header block, in points (default 18). */
+  headerOffset?: number;
+  /** Distance from the bottom edge to the footer block, in points (default 18). */
+  footerOffset?: number;
+  /** Number assigned to the first page for `{{page}}` (default 1). */
+  startPageNumber?: number;
 }
 
 export interface FontInfo {
@@ -292,6 +524,45 @@ export interface PageInfo {
 
 const RGB = (rgb: number) => rgb & 0xffffff;
 
+/** Visual styling for a newly-created form field. */
+export interface FieldStyle {
+  /** Text size in points; `0` (default) auto-sizes to the field box. */
+  fontSize?: number;
+  /** Text / mark colour `0xRRGGBB` (default black). */
+  color?: number;
+  /** Border colour `0xRRGGBB`, or `null` for no border (default black). */
+  border?: number | null;
+  /** Background fill `0xRRGGBB`, or `null` for transparent (default none). */
+  background?: number | null;
+  /** Border width in points (default `1`). */
+  borderWidth?: number;
+}
+
+/** One option of a radio group: its export value and on-page rectangle. */
+export interface RadioOption {
+  /** The export value stored in the field when this button is selected. */
+  export: string;
+  /** `[x0, y0, x1, y1]` in PDF user space. */
+  rect: [number, number, number, number];
+}
+
+/** Expand a {@link FieldStyle} into the 7 packed ABI arguments. */
+function styleArgs(s: FieldStyle = {}): [number, number, number, number, number, number, number] {
+  const hasBorder = s.border === null ? 0 : 1;
+  const borderRgb = s.border == null ? 0x000000 : s.border;
+  const hasBg = s.background == null ? 0 : 1;
+  const bgRgb = s.background == null ? 0 : s.background;
+  return [
+    s.fontSize ?? 0,
+    RGB(s.color ?? 0x000000),
+    RGB(borderRgb),
+    hasBorder,
+    RGB(bgRgb),
+    hasBg,
+    s.borderWidth ?? 1,
+  ];
+}
+
 /** A live document handle. Call {@link close} when done. */
 export class GigaPdfDoc {
   constructor(
@@ -369,7 +640,8 @@ export class GigaPdfDoc {
     h: number,
     stroke: number | null = null,
     fill: number | null = 0,
-    lineWidth = 1
+    lineWidth = 1,
+    opacity = 1
   ): boolean {
     return (
       this.ex().gp_add_rectangle(
@@ -383,8 +655,156 @@ export class GigaPdfDoc {
         stroke === null ? 0 : 1,
         RGB(fill ?? 0),
         fill === null ? 0 : 1,
-        lineWidth
+        lineWidth,
+        opacity
       ) === 0
+    );
+  }
+
+  /** Draw a straight line from `(x1,y1)` to `(x2,y2)`. `stroke` is `0xRRGGBB`. */
+  drawLine(
+    page: number,
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    stroke = 0,
+    lineWidth = 1,
+    opacity = 1
+  ): boolean {
+    return (
+      this.ex().gp_draw_line(this.h, page, x1, y1, x2, y2, RGB(stroke), lineWidth, opacity) === 0
+    );
+  }
+
+  /**
+   * Draw an ellipse (circle when `rx === ry`) centred at `(cx,cy)`. Pass an
+   * `0xRRGGBB` colour for `stroke`/`fill`, or `null` to omit that paint.
+   */
+  addEllipse(
+    page: number,
+    cx: number,
+    cy: number,
+    rx: number,
+    ry: number,
+    stroke: number | null = null,
+    fill: number | null = 0,
+    lineWidth = 1,
+    opacity = 1
+  ): boolean {
+    return (
+      this.ex().gp_add_ellipse(
+        this.h,
+        page,
+        cx,
+        cy,
+        rx,
+        ry,
+        RGB(stroke ?? 0),
+        stroke === null ? 0 : 1,
+        RGB(fill ?? 0),
+        fill === null ? 0 : 1,
+        lineWidth,
+        opacity
+      ) === 0
+    );
+  }
+
+  /**
+   * Draw a polyline/polygon through flat `[x0,y0,x1,y1,…]` points. `close` joins
+   * the last vertex back to the first. `0xRRGGBB` colours, or `null` to omit.
+   */
+  addPolygon(
+    page: number,
+    points: number[],
+    close = true,
+    stroke: number | null = null,
+    fill: number | null = 0,
+    lineWidth = 1,
+    opacity = 1
+  ): boolean {
+    return (
+      this.g._withF64(points, (p, c) =>
+        this.ex().gp_add_polygon(
+          this.h,
+          page,
+          p,
+          c,
+          close ? 1 : 0,
+          RGB(stroke ?? 0),
+          stroke === null ? 0 : 1,
+          RGB(fill ?? 0),
+          fill === null ? 0 : 1,
+          lineWidth,
+          opacity
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Draw an SVG path (`M`/`L`/`C`/`Q`/`Z`…) anchored so the SVG origin maps to
+   * `(ox,oy)` with the Y axis flipped — same convention as `pdf-lib`'s
+   * `drawSvgPath`. Covers freeform/polygon/triangle shapes.
+   */
+  addPath(
+    page: number,
+    svgPath: string,
+    ox: number,
+    oy: number,
+    stroke: number | null = null,
+    fill: number | null = 0,
+    lineWidth = 1,
+    opacity = 1
+  ): boolean {
+    return (
+      this.g._withStr(svgPath, (p, l) =>
+        this.ex().gp_add_path(
+          this.h,
+          page,
+          p,
+          l,
+          ox,
+          oy,
+          RGB(stroke ?? 0),
+          stroke === null ? 0 : 1,
+          RGB(fill ?? 0),
+          fill === null ? 0 : 1,
+          lineWidth,
+          opacity
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Embed a raster image (PNG or JPEG bytes) at `(x,y)` sized `(w,h)` in PDF
+   * user space. PNG alpha is honoured; `opacity` (0..1) sets an overall alpha.
+   */
+  addImage(
+    page: number,
+    data: Uint8Array,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    opacity = 1
+  ): boolean {
+    return (
+      this.g._withBytes(data, (p, l) =>
+        this.ex().gp_add_image(this.h, page, p, l, x, y, w, h, opacity)
+      ) === 0
+    );
+  }
+  /**
+   * Draw SVG markup on a page as **native vector paths** (crisp at any zoom, not
+   * rasterized), fitting its `viewBox` into the box `(x, y, w, h)` in PDF points
+   * (origin bottom-left). Supports shapes, `<path>`, groups, transforms and
+   * fill/stroke/opacity. Returns `false` if the SVG can't be parsed.
+   */
+  addSvg(page: number, svg: string, x: number, y: number, w: number, h: number): boolean {
+    return (
+      this.g._withStr(svg, (p, l) => this.ex().gp_add_svg(this.h, page, p, l, x, y, w, h)) === 0
     );
   }
   /** True redaction: delete content intersecting the region (no opaque cover by default). */
@@ -482,6 +902,10 @@ export class GigaPdfDoc {
   }
   toPptx(): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_to_pptx(this.h, o));
+  }
+  /** Convert to an editable OpenDocument Presentation (`.odp`). */
+  toOdp(): Uint8Array {
+    return this.g._buffer((o) => this.ex().gp_to_odp(this.h, o));
   }
   toOdt(): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_to_odt(this.h, o));
@@ -706,6 +1130,125 @@ export class GigaPdfDoc {
     return (
       this.g._withStr(name, (nP, nL) =>
         this.g._withStr(values.join("\n"), (vP, vL) => this.ex().gp_set_choice(this.h, nP, nL, vP, vL))
+      ) === 0
+    );
+  }
+
+  // ── form field creation ──────────────────────────────────────────────────
+
+  /**
+   * Create a text field on `page` covering `rect` = `[x0, y0, x1, y1]` (PDF
+   * user space). Options: `maxLen` character cap, `multiline`, `password`,
+   * and visual `style`.
+   */
+  addTextField(
+    page: number,
+    name: string,
+    rect: [number, number, number, number],
+    value = "",
+    opts: { maxLen?: number; multiline?: boolean; password?: boolean; style?: FieldStyle } = {}
+  ): boolean {
+    const st = styleArgs(opts.style);
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.g._withStr(value, (vP, vL) =>
+          this.ex().gp_add_text_field(
+            this.h, page, nP, nL, rect[0], rect[1], rect[2], rect[3], vP, vL,
+            opts.maxLen ?? -1, opts.multiline ? 1 : 0, opts.password ? 1 : 0, ...st
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /** Create a checkbox. `export` is the on-state name (default `On`). */
+  addCheckbox(
+    page: number,
+    name: string,
+    rect: [number, number, number, number],
+    checked = false,
+    opts: { export?: string; style?: FieldStyle } = {}
+  ): boolean {
+    const st = styleArgs(opts.style);
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.g._withStr(opts.export ?? "On", (eP, eL) =>
+          this.ex().gp_add_checkbox(
+            this.h, page, nP, nL, rect[0], rect[1], rect[2], rect[3], checked ? 1 : 0, eP, eL, ...st
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Create a radio-button group: one logical field whose `options` are the
+   * individual buttons. `selected` is the initially-chosen export value.
+   */
+  addRadioGroup(
+    page: number,
+    name: string,
+    options: RadioOption[],
+    opts: { selected?: string; style?: FieldStyle } = {}
+  ): boolean {
+    const st = styleArgs(opts.style);
+    const exports = options.map((o) => o.export).join("\n");
+    const rects = options.flatMap((o) => o.rect).join(",");
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.g._withStr(exports, (eP, eL) =>
+          this.g._withStr(rects, (rP, rL) =>
+            this.g._withStr(opts.selected ?? "", (sP, sL) =>
+              this.ex().gp_add_radio_group(this.h, page, nP, nL, eP, eL, rP, rL, sP, sL, ...st)
+            )
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /** Create a drop-down combo box. `editable` permits values outside `options`. */
+  addComboBox(
+    page: number,
+    name: string,
+    rect: [number, number, number, number],
+    options: string[],
+    opts: { selected?: string; editable?: boolean; style?: FieldStyle } = {}
+  ): boolean {
+    const st = styleArgs(opts.style);
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.g._withStr(options.join("\n"), (oP, oL) =>
+          this.g._withStr(opts.selected ?? "", (sP, sL) =>
+            this.ex().gp_add_combo_box(
+              this.h, page, nP, nL, rect[0], rect[1], rect[2], rect[3], oP, oL, sP, sL,
+              opts.editable ? 1 : 0, ...st
+            )
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /** Create a scrolling list box. `multi` allows selecting several options. */
+  addListBox(
+    page: number,
+    name: string,
+    rect: [number, number, number, number],
+    options: string[],
+    opts: { selected?: string; multi?: boolean; style?: FieldStyle } = {}
+  ): boolean {
+    const st = styleArgs(opts.style);
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.g._withStr(options.join("\n"), (oP, oL) =>
+          this.g._withStr(opts.selected ?? "", (sP, sL) =>
+            this.ex().gp_add_list_box(
+              this.h, page, nP, nL, rect[0], rect[1], rect[2], rect[3], oP, oL, sP, sL,
+              opts.multi ? 1 : 0, ...st
+            )
+          )
+        )
       ) === 0
     );
   }

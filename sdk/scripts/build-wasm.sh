@@ -13,7 +13,8 @@ if [ ! -d "$ENGINE_DIR/crates/wasm" ]; then
 fi
 
 echo "→ building gigapdf-wasm (release) in $ENGINE_DIR"
-( cd "$ENGINE_DIR" && cargo build -p gigapdf-wasm --target wasm32-unknown-unknown --release )
+# `cargo wasm` is a repo alias (.cargo/config.toml) for the full target build.
+( cd "$ENGINE_DIR" && cargo wasm )
 
 SRC="$ENGINE_DIR/target/wasm32-unknown-unknown/release/gigapdf_wasm.wasm"
 test -f "$SRC" || { echo "❌ wasm not produced: $SRC" >&2; exit 1; }

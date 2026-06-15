@@ -35,8 +35,13 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `remove_text_run(page,i)` / `remove_element(page,i)` | `gp_remove_element(handle,page,i)` |
 | `move_element(page,i,dx,dy)` | `gp_move_element(handle,page,i,dx,dy)` |
 | `duplicate_element(page,i)` | `gp_duplicate_element(handle,page,i)` |
-| `add_rectangle(page,x,y,w,h,stroke,fill,lw)` | `gp_add_rectangle(...)` |
-| `add_line(page,x1,y1,x2,y2,rgb,lw)` | `gp_add_line(...)` |
+| `add_rectangle(page,x,y,w,h,stroke,fill,lw,opacity)` | `gp_add_rectangle(...)` |
+| `add_line(page,x1,y1,x2,y2,stroke,lw,opacity)` | `gp_draw_line(...)` |
+| `add_ellipse(page,cx,cy,rx,ry,stroke,fill,lw,opacity)` | `gp_add_ellipse(...)` |
+| `add_polygon(page,&pts,close,stroke,fill,lw,opacity)` | `gp_add_polygon(...)` |
+| `add_path(page,svg,ox,oy,stroke,fill,lw,opacity)` (SVG path, Y-flipped) | `gp_add_path(...)` |
+| `add_image(page,&data,x,y,w,h,opacity)` (PNG/JPEG, alpha) | `gp_add_image(...)` |
+| `add_svg(page,src,x,y,w,h)` (full SVG → **native vector**, fits viewBox to the box) | `gp_add_svg(...)` · SDK `addSvg` |
 
 ## Fonts & real text
 
@@ -66,6 +71,19 @@ content-stream text in that font.
 | `flatten_annotations(page) -> usize` | `gp_flatten_annotations(handle,page)` |
 | `form_fields() -> Vec<FormField>` | `gp_fields_json(handle,outlen)` |
 | `set_text_field/set_checkbox/set_radio/set_choice_field` | `gp_set_text_field / _checkbox / _radio / _choice` |
+| `add_text_field(page,name,rect,value,max_len,multiline,password,&style)` | `gp_add_text_field(handle,page,name*,rect…,value*,max_len,multiline,password,style…)` |
+| `add_checkbox(page,name,rect,checked,export,&style)` | `gp_add_checkbox(handle,page,name*,rect…,checked,export*,style…)` |
+| `add_radio_group(page,name,&[(export,rect)],selected,&style)` | `gp_add_radio_group(handle,page,name*,exports*,rects*,selected*,style…)` |
+| `add_combo_box(page,name,rect,&options,selected,editable,&style)` | `gp_add_combo_box(handle,page,name*,rect…,options*,selected*,editable,style…)` |
+| `add_list_box(page,name,rect,&options,selected,multi,&style)` | `gp_add_list_box(handle,page,name*,rect…,options*,selected*,multi,style…)` |
+
+`FieldStyle { font_size, color, border, background, border_width }` controls the
+new field's appearance. In the WASM ABI it is passed as the 7 trailing scalars
+`style… = font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg,
+border_width`; `exports`/`options` are newline-separated, `rects` is a
+comma-separated flat list of `4 × N` numbers (one rect per radio option). Every
+created widget gets a real `/AP` appearance stream and the form is flagged
+`NeedAppearances` so values display immediately and survive later edits.
 
 ## Pages, links, outline, metadata
 
@@ -120,6 +138,7 @@ that already carry a text layer, `structured_text` / `search` are exact and fast
 | `to_html() -> String` | `gp_to_html(handle,outlen)` | positioned HTML + inline images |
 | `to_docx() -> Vec<u8>` | `gp_to_docx(handle,outlen)` | editable Word |
 | `to_pptx() -> Vec<u8>` | `gp_to_pptx(handle,outlen)` | one slide/page |
+| `to_odp() -> Vec<u8>` | `gp_to_odp(handle,outlen)` | OpenDocument Presentation |
 | `to_odt() -> Vec<u8>` | `gp_to_odt(handle,outlen)` | OpenDocument Text |
 | `to_xlsx() -> Vec<u8>` | `gp_to_xlsx(handle,outlen)` | tables → cells, prose → text |
 | `to_ods() -> Vec<u8>` | `gp_to_ods(handle,outlen)` | OpenDocument Spreadsheet |
@@ -133,8 +152,8 @@ that already carry a text layer, `structured_text` / `search` are exact and fast
 | `txt_to_pdf(&str)` | `gp_txt_to_pdf(ptr,len,outlen)` |
 | `html_to_pdf(&str)` | `gp_html_to_pdf(ptr,len,outlen)` |
 | `rtf_to_pdf(&str)` | `gp_rtf_to_pdf(ptr,len,outlen)` |
-| `office_to_pdf(&[u8]) -> Option<Vec<u8>>` | `gp_office_to_pdf(ptr,len,outlen)` (auto-detect docx/odt/pptx/xlsx/ods) |
-| `docx_to_pdf / odt_to_pdf / pptx_to_pdf / xlsx_to_pdf / ods_to_pdf` | via `gp_office_to_pdf` |
+| `office_to_pdf(&[u8]) -> Option<Vec<u8>>` | `gp_office_to_pdf(ptr,len,outlen)` (auto-detect docx/odt/odp/pptx/xlsx/ods) |
+| `docx_to_pdf / odt_to_pdf / odp_to_pdf / pptx_to_pdf / xlsx_to_pdf / ods_to_pdf` | via `gp_office_to_pdf` |
 
 ### Building blocks (Rust)
 
@@ -144,6 +163,50 @@ that already carry a text layer, `structured_text` / `search` are exact and fast
 - `convert::table::reconstruct(&[PlacedText])` — heuristic row/column grid.
 - `convert::style::parse_base_font(&str)` — recover family/weight/style.
 - `filters::deflate::{deflate, flate_encode}` — DEFLATE/zlib encoder.
+
+## HTML / CSS → PDF (with JavaScript)
+
+A native renderer (no headless browser). Text is set in **host-downloaded
+Google fonts**, so the host fetches fonts in two phases.
+
+| Rust (`html`) | ABI / SDK | Notes |
+|------|------|------|
+| `needed_fonts(html) -> Vec<FontRequest>` | `gp_html_needed_fonts` · `htmlNeededFonts` | phase 1: fonts to download (after running `<script>`s) |
+| `needed_fonts_with(html, header, footer)` | `gp_html_needed_fonts_ex` · `htmlNeededFontsWith` | phase 1 incl. the header/footer fonts |
+| `render(html, &[ProvidedFont], page_w, page_h, margin) -> Vec<u8>` | `gp_html_render` · `htmlRender` | phase 2: HTML+CSS → PDF (uniform margin) |
+| `render_with(html, &[ProvidedFont], &RenderOptions) -> Vec<u8>` | `gp_html_render_opts` · `htmlRenderWith` | phase 2 with size, per-side margins, header/footer, numbering |
+| `page_size(name) -> Option<(f64,f64)>` | `gp_page_size` · `pageSize` | resolve `"A4"`/`"a3-landscape"`/`"letter"`… → points |
+
+- **Page setup** (`render_with` / `RenderOptions`): named or explicit size,
+  per-side margins, and a **running header/footer** painted in the page margins
+  with `{{page}}` / `{{pages}}` substitution and `start_page_number`. See
+  [`HTML-CSS.md` §1](HTML-CSS.md#1-page-setup).
+- **Layout**: block / inline / table / **flex** (`flex-direction`,
+  `justify-content`, `flex-grow`) / **grid** (`grid-template-columns`), selector
+  cascade (`tag`/`.class`/`#id`/`*`, descendant), pagination.
+- **Page breaks**: CSS `page-break-before|after: always`, `break-before|after:
+  page`, or a `<pagebreak>` element / `class="page-break"` — forces the next
+  content onto a new page.
+- **Exhaustive reference**: every supported HTML element, CSS property, length
+  unit, colour and selector is listed in [`HTML-CSS.md`](HTML-CSS.md).
+- **JavaScript** (`js` module): inline `<script>`s execute **before layout** via
+  a zero-dependency engine; `js::run_inline_scripts(html) -> String` does it
+  standalone (the renderer calls it automatically). `js::Interp::eval_source(src)
+  -> Result<Value, String>` evaluates a snippet.
+  - Language: classes + `super`, closures, destructuring, spread, optional
+    chaining, template literals, `RegExp`, `Map`/`Set`, `Symbol`, `eval`/
+    `Function`. `function*`/`async` bodies compile to a **suspendable bytecode
+    VM**: lazy/infinite generators, bidirectional `.next(v)`, `yield*`,
+    spec-ordered `async`/`await`, and full control flow across a suspension
+    (`try/catch/finally`, `for…of`/`for…in`, `switch`, labels, destructuring,
+    spread).
+  - Built-ins: `Object`/`Array`/`String`/`Number`/`Boolean`/`Math`/`JSON`/
+    `console`/`Map`/`Set`/`RegExp` (+ a backtracking regex engine)/`Error`,
+    `parseInt`/`parseFloat`/`setTimeout`/`queueMicrotask`.
+  - DOM: `document.getElementById`/`getElementsByTagName`/`querySelector(All)`
+    (combinators `>`/`+`/`~`, attribute selectors), `createElement`/
+    `createTextNode`, and on elements `textContent`/`innerHTML`/`getAttribute`/
+    `setAttribute`/`appendChild`/`removeChild`/`classList`/`style`/`children`.
 
 ## Data types
 

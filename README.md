@@ -44,24 +44,30 @@ performs Google-Fonts downloads). Everything else is in the engine.
 |------|--------------|
 | **Read** | PDF 1.7, xref + object streams, FlateDecode, encrypted (RC4/AESV2/AESV3) |
 | **Write** | Renumbering serializer, `save`, `save_compressed` (Flate streams) |
-| **Edit content** | Text edit/remove, elements (text/image/shape) list/remove/move/duplicate/add; add text/rect/line; hit-test |
+| **Edit content** | Text edit/remove, elements (text/image/shape) list/remove/move/duplicate/add; draw text/rect/line/ellipse/polygon/SVG-path/image (opacity + PNG alpha); hit-test |
 | **Text extraction** | Font-aware, zero-tofu via WinAnsi + `/ToUnicode` CMap (CID/Type0) |
 | **Annotations** | Highlight, underline, strike-out, free-text, square, line, ink, stamp, link; **flatten** |
-| **Forms (AcroForm)** | Text/checkbox/radio/combo/list/signature fields — fill, create, flatten |
+| **Forms (AcroForm)** | Text/checkbox/radio/combo/list/signature fields — **read · fill · create** (build widgets from scratch with appearance streams + `NeedAppearances`) |
 | **Pages** | Rotate, delete, move, extract, merge; bookmarks/outline; metadata |
 | **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **true redaction** (delete from stream, no opaque cover) |
 | **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images) |
 | **Text intelligence** | Font-aware extraction, **structured text** (reading-order lines + boxes), **full-text search** with highlight boxes |
 | **OCR** | Built-in recognizer — Otsu → connected components → line/word segmentation → MLP trained on **EMNIST handwriting + synthetic font glyphs** (Latin + accents). No Tesseract, no model download at runtime |
-| **Convert →** | PDF → **TXT, HTML, DOCX, PPTX, ODT, XLSX, ODS, RTF** (real editable elements, not a page image) |
-| **Convert ←** | **TXT, HTML, RTF, DOCX, ODT, PPTX, XLSX, ODS** → PDF |
+| **Convert →** | PDF → **TXT, HTML, DOCX, PPTX, ODP, ODT, XLSX, ODS, RTF** (real editable elements, not a page image) |
+| **Convert ←** | **TXT, HTML, RTF, DOCX, ODT, ODP, PPTX, XLSX, ODS** → PDF (ODF `.odt`/`.ods`/`.odp` are fully bidirectional) |
+| **HTML rendering** | Native **HTML + CSS → PDF** engine (parser, selector cascade, block / inline / table / **flex** (direction · justify-content · grow) / **grid** layout, pagination, **`page-break-*` + `<pagebreak>`**) — no headless browser. Text set in **embedded Google fonts** (real glyphs + metrics, identical or nearest match) |
+| **JavaScript** | Built-in zero-dependency **JS engine** that runs a document's inline `<script>`s before layout — **no Chromium/Playwright**. Lexer → parser → tree-walking interpreter with **classes + `super`**, closures, destructuring, generators (`function*`/`yield`), **`async`/`await` + `Promise`** (microtask queue + `setTimeout`), and built-ins: `Object`/`Array`/`String`/`Number`/`Math`/`JSON`/`console`/`Map`/`Set`/**`RegExp`** + a backtracking regex engine. **DOM bindings**: `getElementById`, `querySelector(All)` (`#id`/`.class`/`tag`/`>`/`+`/`~`/`[attr]`), `textContent`, `innerHTML`, `createElement`/`appendChild`, `classList`, `style`, … |
 | **Archival** | **PDF/A-2b** metadata (XMP + sRGB OutputIntent + ID) |
 | **Fonts** | **1951-family catalog**, Google-Fonts URL builder, **TrueType embedding** (Type0/CIDFontType2 + ToUnicode), needed-font detection |
 
-All of it is exercised by `cargo test` (**141 tests**), a Node WASM smoke test
-(end-to-end, all green), and **validated externally**: generated Office files open
-and round-trip in LibreOffice; embedded fonts verify as `emb=yes` under poppler's
-`pdffonts`.
+All of it is exercised by `cargo test` (**284 tests**, incl. a 100-test pure-Rust
+JavaScript engine: lexer, parser, interpreter, built-ins, regex, DOM, and a
+suspendable bytecode VM with lazy generators, spec-ordered async, and full
+control-flow — `try`/`catch`/`finally`, `switch`, labels, destructuring,
+spread), a Node WASM smoke test
+(end-to-end, all green), and **validated externally**: generated Office files
+(DOCX/PPTX/XLSX **and ODT/ODS/ODP**) open and round-trip in LibreOffice; embedded
+fonts verify as `emb=yes` under poppler's `pdffonts`.
 
 ## Honest scope
 
@@ -72,6 +78,25 @@ rendered page image. Office→PDF is **text-faithful** (all content, reading ord
 pagination) using the standard-14 fonts; pixel-perfect re-layout of an arbitrary,
 richly-styled document stays the job of a full layout engine. Full PDF/A
 conformance additionally requires every font embedded (the engine can do that).
+
+The **JavaScript engine** targets the language used by templating/report scripts:
+classes/`super`, closures, destructuring/spread, `RegExp`, `Map`/`Set`, `Symbol`
+(real, with the iterator protocol), `eval`/`Function`, tagged templates, and
+`import`/`export` (parsed transparently). `function*`/`async` bodies compile to a
+**suspendable bytecode VM**, so generators are **truly lazy** (infinite
+`while (true) { yield … }` works, `.next(v)` is bidirectional, `yield*` delegates
+lazily) and `await` **yields to the event loop** with spec microtask ordering.
+The VM covers the full statement/expression language used by templates —
+`try`/`catch`/`finally`, `for…of`/`for…in`, `switch`, labelled `break`/
+`continue`, destructuring, compound assignment, and `...spread` — all able to
+span a `yield`/`await`. A handful of corner cases (a `return`/`break` *through* a
+`finally`, a logical `&&=`/`||=`/`??=` with an awaited right-hand side, sparse
+array holes) transparently fall back to the eager generator / synchronous-await
+model — same results, just not lazy.
+By design the sandbox has **no network and no real timers** (`setTimeout`
+resolves on the microtask queue). CSS **flex** supports `flex-direction`,
+`justify-content` and `flex-grow`; **grid** lays out `grid-template-columns`;
+**float** maps to inline-block.
 
 ## OCR & text intelligence
 
@@ -134,15 +159,21 @@ ex.gp_close(handle);
 ```
 
 See [`docs/USAGE.md`](docs/USAGE.md) for the full buffer ABI and an example for
-every feature, and [`docs/API.md`](docs/API.md) for the complete reference.
+every feature, [`docs/API.md`](docs/API.md) for the complete reference, and
+[`docs/HTML-CSS.md`](docs/HTML-CSS.md) for the **exhaustive list of supported
+HTML elements, CSS properties, units, colours and selectors** in the HTML→PDF
+renderer.
 
 ## Build
 
 ```bash
-cargo test -p gigapdf-core                                    # native tests (real fixtures)
-cargo build -p gigapdf-wasm --target wasm32-unknown-unknown --release
-node test/wasm-smoke.mjs                                       # end-to-end WASM smoke test
+cargo test -p gigapdf-core   # native tests (real fixtures)
+cargo wasm                   # build the WASM engine (alias, see .cargo/config.toml)
+node test/wasm-smoke.mjs     # end-to-end WASM smoke test
 ```
+
+`cargo wasm` is a repo alias for the full target build, so you never type the
+target triple by hand (`cargo wasm-dev` for a debug build).
 
 The release `.wasm` is ~540 KB — **zero dependencies**, versus ~14 MB for MuPDF.
 

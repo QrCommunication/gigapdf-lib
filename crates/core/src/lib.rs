@@ -33,6 +33,8 @@ pub mod error;
 pub mod filters;
 pub mod font;
 pub mod form;
+pub mod html;
+pub mod js;
 pub mod lexer;
 pub mod link;
 pub mod object;
@@ -43,6 +45,7 @@ pub mod raster;
 pub mod security;
 pub mod serialize;
 pub mod sign;
+pub mod svg;
 
 pub use annot::Annotation;
 pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, TextRun};

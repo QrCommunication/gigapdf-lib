@@ -406,12 +406,155 @@ pub extern "C" fn gp_add_rectangle(
     fill_rgb: u32,
     has_fill: i32,
     line_width: f64,
+    opacity: f64,
 ) -> i32 {
     let stroke = (has_stroke != 0).then(|| unpack_rgb(stroke_rgb));
     let fill = (has_fill != 0).then(|| unpack_rgb(fill_rgb));
     edit(handle, |doc| {
-        doc.add_rectangle(page, x, y, width, height, stroke, fill, line_width)
+        doc.add_rectangle(page, x, y, width, height, stroke, fill, line_width, opacity)
     })
+}
+
+/// Draw a straight line on a page's content. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_draw_line(
+    handle: *mut Document,
+    page: u32,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    stroke_rgb: u32,
+    line_width: f64,
+    opacity: f64,
+) -> i32 {
+    let stroke = unpack_rgb(stroke_rgb);
+    edit(handle, |doc| {
+        doc.add_line(page, x1, y1, x2, y2, stroke, line_width, opacity)
+    })
+}
+
+/// Draw an ellipse (circle when `rx == ry`) centred at `(cx, cy)`. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_ellipse(
+    handle: *mut Document,
+    page: u32,
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+    stroke_rgb: u32,
+    has_stroke: i32,
+    fill_rgb: u32,
+    has_fill: i32,
+    line_width: f64,
+    opacity: f64,
+) -> i32 {
+    let stroke = (has_stroke != 0).then(|| unpack_rgb(stroke_rgb));
+    let fill = (has_fill != 0).then(|| unpack_rgb(fill_rgb));
+    edit(handle, |doc| {
+        doc.add_ellipse(page, cx, cy, rx, ry, stroke, fill, line_width, opacity)
+    })
+}
+
+/// Draw a polyline/polygon through flat `[x0,y0,x1,y1,…]` points (`points_ptr`,
+/// `points_len` f64 values). `close != 0` joins back to the start. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_polygon(
+    handle: *mut Document,
+    page: u32,
+    points_ptr: *const f64,
+    points_len: usize,
+    close: i32,
+    stroke_rgb: u32,
+    has_stroke: i32,
+    fill_rgb: u32,
+    has_fill: i32,
+    line_width: f64,
+    opacity: f64,
+) -> i32 {
+    let points: &[f64] = if points_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(points_ptr, points_len) }
+    };
+    let stroke = (has_stroke != 0).then(|| unpack_rgb(stroke_rgb));
+    let fill = (has_fill != 0).then(|| unpack_rgb(fill_rgb));
+    edit(handle, |doc| {
+        doc.add_polygon(page, points, close != 0, stroke, fill, line_width, opacity)
+    })
+}
+
+/// Draw an SVG path (`path_ptr`, `path_len` UTF-8) anchored at `(ox, oy)` with
+/// the Y axis flipped (like `pdf-lib drawSvgPath`). 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_path(
+    handle: *mut Document,
+    page: u32,
+    path_ptr: *const u8,
+    path_len: usize,
+    ox: f64,
+    oy: f64,
+    stroke_rgb: u32,
+    has_stroke: i32,
+    fill_rgb: u32,
+    has_fill: i32,
+    line_width: f64,
+    opacity: f64,
+) -> i32 {
+    let svg = unsafe { str_arg(path_ptr, path_len) };
+    let stroke = (has_stroke != 0).then(|| unpack_rgb(stroke_rgb));
+    let fill = (has_fill != 0).then(|| unpack_rgb(fill_rgb));
+    edit(handle, |doc| {
+        doc.add_path(page, svg, ox, oy, stroke, fill, line_width, opacity)
+    })
+}
+
+/// Embed a raster image (PNG or JPEG bytes at `data_ptr`, `data_len`) on a page
+/// at `(x, y)` sized `(width, height)`, with `opacity` in `0..=1`. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_image(
+    handle: *mut Document,
+    page: u32,
+    data_ptr: *const u8,
+    data_len: usize,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    opacity: f64,
+) -> i32 {
+    if data_ptr.is_null() {
+        return -2;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    edit(handle, |doc| {
+        doc.add_image(page, data, x, y, width, height, opacity)
+    })
+}
+
+/// Draw SVG markup (`src_ptr`, `src_len` UTF-8) on a page, fitting its viewBox
+/// into the box `(x, y, width, height)` as **native vector paths** (not
+/// rasterized). 0 on success; non-zero if the SVG can't be parsed.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_svg(
+    handle: *mut Document,
+    page: u32,
+    src_ptr: *const u8,
+    src_len: usize,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> i32 {
+    let src = unsafe { str_arg(src_ptr, src_len) };
+    edit(handle, |doc| doc.add_svg(page, src, x, y, width, height))
 }
 
 fn edit<F>(handle: *mut Document, op: F) -> i32
@@ -508,6 +651,221 @@ pub extern "C" fn gp_set_choice(
         joined.split('\n').collect()
     };
     edit(handle, |doc| doc.set_choice_field(name, &values))
+}
+
+// ─── form field *creation* ────────────────────────────────────────────────────
+
+/// Build a [`FieldStyle`](gigapdf_core::form::FieldStyle) from packed args.
+/// Colours are `0xRRGGBB`; `has_border`/`has_bg` toggle the optional colours.
+fn make_field_style(
+    font_size: f64,
+    color_rgb: u32,
+    border_rgb: u32,
+    has_border: i32,
+    bg_rgb: u32,
+    has_bg: i32,
+    border_width: f64,
+) -> gigapdf_core::form::FieldStyle {
+    gigapdf_core::form::FieldStyle {
+        font_size,
+        color: unpack_rgb(color_rgb),
+        border: (has_border != 0).then(|| unpack_rgb(border_rgb)),
+        background: (has_bg != 0).then(|| unpack_rgb(bg_rgb)),
+        border_width,
+    }
+}
+
+/// Create a text field on `page` covering `[x0,y0,x1,y1]`. `max_len < 0` means
+/// no limit. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_text_field(
+    handle: *mut Document,
+    page: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    value_ptr: *const u8,
+    value_len: usize,
+    max_len: i32,
+    multiline: i32,
+    password: i32,
+    font_size: f64,
+    color_rgb: u32,
+    border_rgb: u32,
+    has_border: i32,
+    bg_rgb: u32,
+    has_bg: i32,
+    border_width: f64,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let value = unsafe { str_arg(value_ptr, value_len) };
+    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    let ml = (max_len >= 0).then_some(max_len as u32);
+    edit(handle, |doc| {
+        doc.add_text_field(page, name, [x0, y0, x1, y1], value, ml, multiline != 0, password != 0, &style)
+    })
+}
+
+/// Create a checkbox on `page`. `export` is the on-state name (empty → `On`).
+/// 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_checkbox(
+    handle: *mut Document,
+    page: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    checked: i32,
+    export_ptr: *const u8,
+    export_len: usize,
+    font_size: f64,
+    color_rgb: u32,
+    border_rgb: u32,
+    has_border: i32,
+    bg_rgb: u32,
+    has_bg: i32,
+    border_width: f64,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let export = unsafe { str_arg(export_ptr, export_len) };
+    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    edit(handle, |doc| {
+        doc.add_checkbox(page, name, [x0, y0, x1, y1], checked != 0, export, &style)
+    })
+}
+
+/// Create a radio-button group. `exports` is newline-separated export names;
+/// `rects` is a comma-separated flat list of `4 × N` numbers (one rect per
+/// option, in the same order). `selected` (empty → none) is the chosen export.
+/// 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_radio_group(
+    handle: *mut Document,
+    page: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    exports_ptr: *const u8,
+    exports_len: usize,
+    rects_ptr: *const u8,
+    rects_len: usize,
+    selected_ptr: *const u8,
+    selected_len: usize,
+    font_size: f64,
+    color_rgb: u32,
+    border_rgb: u32,
+    has_border: i32,
+    bg_rgb: u32,
+    has_bg: i32,
+    border_width: f64,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let exports = unsafe { str_arg(exports_ptr, exports_len) };
+    let rects = unsafe { str_arg(rects_ptr, rects_len) };
+    let selected = unsafe { str_arg(selected_ptr, selected_len) };
+    let nums: Vec<f64> = rects.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let mut options: Vec<(String, [f64; 4])> = Vec::new();
+    for (i, ex) in exports.split('\n').filter(|s| !s.is_empty()).enumerate() {
+        let b = i * 4;
+        if b + 4 <= nums.len() {
+            options.push((ex.to_string(), [nums[b], nums[b + 1], nums[b + 2], nums[b + 3]]));
+        }
+    }
+    let sel = (!selected.is_empty()).then_some(selected);
+    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    edit(handle, |doc| doc.add_radio_group(page, name, &options, sel, &style))
+}
+
+/// Create a drop-down combo box. `options` is newline-separated; `selected`
+/// (empty → none) is the initial value; `editable != 0` allows free text.
+/// 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_combo_box(
+    handle: *mut Document,
+    page: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    options_ptr: *const u8,
+    options_len: usize,
+    selected_ptr: *const u8,
+    selected_len: usize,
+    editable: i32,
+    font_size: f64,
+    color_rgb: u32,
+    border_rgb: u32,
+    has_border: i32,
+    bg_rgb: u32,
+    has_bg: i32,
+    border_width: f64,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let opts = unsafe { str_arg(options_ptr, options_len) };
+    let selected = unsafe { str_arg(selected_ptr, selected_len) };
+    let options: Vec<String> = if opts.is_empty() {
+        Vec::new()
+    } else {
+        opts.split('\n').map(str::to_string).collect()
+    };
+    let sel = (!selected.is_empty()).then_some(selected);
+    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    edit(handle, |doc| {
+        doc.add_combo_box(page, name, [x0, y0, x1, y1], &options, sel, editable != 0, &style)
+    })
+}
+
+/// Create a scrolling list box. `options` is newline-separated; `selected`
+/// (empty → none) is the initial value; `multi != 0` allows multi-select.
+/// 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_list_box(
+    handle: *mut Document,
+    page: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    options_ptr: *const u8,
+    options_len: usize,
+    selected_ptr: *const u8,
+    selected_len: usize,
+    multi: i32,
+    font_size: f64,
+    color_rgb: u32,
+    border_rgb: u32,
+    has_border: i32,
+    bg_rgb: u32,
+    has_bg: i32,
+    border_width: f64,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let opts = unsafe { str_arg(options_ptr, options_len) };
+    let selected = unsafe { str_arg(selected_ptr, selected_len) };
+    let options: Vec<String> = if opts.is_empty() {
+        Vec::new()
+    } else {
+        opts.split('\n').map(str::to_string).collect()
+    };
+    let sel = (!selected.is_empty()).then_some(selected);
+    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    edit(handle, |doc| {
+        doc.add_list_box(page, name, [x0, y0, x1, y1], &options, sel, multi != 0, &style)
+    })
 }
 
 fn unpack_rgb(packed: u32) -> [f64; 3] {
@@ -682,6 +1040,15 @@ pub extern "C" fn gp_to_pptx(handle: *const Document, out_len: *mut usize) -> *m
     }
 }
 
+/// Convert to an editable OpenDocument Presentation (`.odp`).
+#[no_mangle]
+pub extern "C" fn gp_to_odp(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => unsafe { bytes_into_host(doc.to_odp(), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Convert to an Excel workbook (`.xlsx`): tables → cells, prose → text rows.
 #[no_mangle]
 pub extern "C" fn gp_to_xlsx(handle: *const Document, out_len: *mut usize) -> *mut u8 {
@@ -727,11 +1094,237 @@ pub extern "C" fn gp_txt_to_pdf(text_ptr: *const u8, text_len: usize, out_len: *
     unsafe { bytes_into_host(gigapdf_core::convert::reverse::txt_to_pdf(text), out_len) }
 }
 
-/// HTML → PDF (text-faithful). Buffer-returning.
+/// HTML → PDF (text-faithful, fast path). Buffer-returning.
 #[no_mangle]
 pub extern "C" fn gp_html_to_pdf(html_ptr: *const u8, html_len: usize, out_len: *mut usize) -> *mut u8 {
     let html = unsafe { str_arg(html_ptr, html_len) };
     unsafe { bytes_into_host(gigapdf_core::convert::reverse::html_to_pdf(html), out_len) }
+}
+
+/// Evaluate a JavaScript snippet with the built-in engine and return the result
+/// value as a string (or `Uncaught …` / `SyntaxError: …`). Buffer-returning.
+#[no_mangle]
+pub extern "C" fn gp_js_eval(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let src = unsafe { str_arg(ptr, len) };
+    let out = match gigapdf_core::js::parse(src) {
+        Ok(prog) => {
+            let mut it = gigapdf_core::js::Interp::new();
+            match it.run(&prog) {
+                Ok(v) => it.to_string_v(&v).unwrap_or_default(),
+                Err(gigapdf_core::js::Abrupt::Throw(e)) => {
+                    format!("Uncaught {}", it.to_string_v(&e).unwrap_or_default())
+                }
+                Err(_) => String::from("Uncaught error"),
+            }
+        }
+        Err(e) => format!("SyntaxError: {e}"),
+    };
+    unsafe { bytes_into_host(out.into_bytes(), out_len) }
+}
+
+/// Run a document's inline `<script>`s and return the resulting HTML (the
+/// renderer does this automatically; exposed for standalone use). Buffer-returning.
+#[no_mangle]
+pub extern "C" fn gp_run_inline_scripts(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let html = unsafe { str_arg(ptr, len) };
+    let out = gigapdf_core::js::run_inline_scripts(html);
+    unsafe { bytes_into_host(out.into_bytes(), out_len) }
+}
+
+/// Serialise font requests to the `[{family,weight,italic,url}]` JSON the SDK
+/// expects. Shared by the plain and `_ex` needed-fonts entry points.
+fn font_reqs_json(reqs: &[gigapdf_core::html::FontRequest]) -> Vec<u8> {
+    let mut json = String::from("[");
+    for (i, r) in reqs.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str("{\"family\":");
+        json_escape(&r.family, &mut json);
+        json.push_str(&format!(",\"weight\":{},\"italic\":{},\"url\":", r.weight, r.italic));
+        json_escape(&r.url, &mut json);
+        json.push('}');
+    }
+    json.push(']');
+    json.into_bytes()
+}
+
+/// Read an optional string arg: `None` when the pointer is null or the length is
+/// zero (so the SDK can pass "no header/footer" as an empty span).
+unsafe fn opt_str_arg<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    if ptr.is_null() || len == 0 {
+        None
+    } else {
+        Some(str_arg(ptr, len))
+    }
+}
+
+/// HTML rendering engine — phase 1: the Google fonts a document needs. Returns a
+/// JSON array of `{family, weight, italic, url}`. Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_html_needed_fonts(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let html = unsafe { str_arg(ptr, len) };
+    let reqs = gigapdf_core::html::needed_fonts(html);
+    unsafe { bytes_into_host(font_reqs_json(&reqs), out_len) }
+}
+
+/// Like [`gp_html_needed_fonts`] but also scans the running header/footer HTML
+/// (empty span = absent), so their fonts are requested too.
+#[no_mangle]
+pub extern "C" fn gp_html_needed_fonts_ex(
+    html_ptr: *const u8,
+    html_len: usize,
+    header_ptr: *const u8,
+    header_len: usize,
+    footer_ptr: *const u8,
+    footer_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let html = unsafe { str_arg(html_ptr, html_len) };
+    let header = unsafe { opt_str_arg(header_ptr, header_len) };
+    let footer = unsafe { opt_str_arg(footer_ptr, footer_len) };
+    let reqs = gigapdf_core::html::needed_fonts_with(html, header, footer);
+    unsafe { bytes_into_host(font_reqs_json(&reqs), out_len) }
+}
+
+/// Resolve a named paper size (`"A4"`, `"a3-landscape"`, `"letter"`, …) to
+/// points. Writes `*out_w`/`*out_h` and returns 1 on success, 0 if unknown.
+#[no_mangle]
+pub extern "C" fn gp_page_size(
+    name_ptr: *const u8,
+    name_len: usize,
+    out_w: *mut f64,
+    out_h: *mut f64,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    match gigapdf_core::html::page_size(name) {
+        Some((w, h)) => {
+            unsafe {
+                *out_w = w;
+                *out_h = h;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// HTML rendering engine — phase 2: render HTML+CSS to PDF with embedded Google
+/// fonts. `fonts` is a packed blob (little-endian): `u32 count`, then per font
+/// `u32 family_len, family utf8, u16 weight, u8 italic, u32 ttf_len, ttf bytes`.
+/// Buffer-returning.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_html_render(
+    html_ptr: *const u8,
+    html_len: usize,
+    fonts_ptr: *const u8,
+    fonts_len: usize,
+    page_w: f64,
+    page_h: f64,
+    margin: f64,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let html = unsafe { str_arg(html_ptr, html_len) };
+    let blob: &[u8] = if fonts_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(fonts_ptr, fonts_len) }
+    };
+    let fonts = parse_font_blob(blob);
+    let pdf = gigapdf_core::html::render(html, &fonts, page_w, page_h, margin);
+    unsafe { bytes_into_host(pdf, out_len) }
+}
+
+/// HTML rendering engine — phase 2 with full page control: per-side margins and
+/// a running header/footer (empty span = absent) carrying `{{page}}`/`{{pages}}`.
+/// `fonts` is the same packed blob as [`gp_html_render`]. Buffer-returning.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_html_render_opts(
+    html_ptr: *const u8,
+    html_len: usize,
+    fonts_ptr: *const u8,
+    fonts_len: usize,
+    page_w: f64,
+    page_h: f64,
+    margin_top: f64,
+    margin_right: f64,
+    margin_bottom: f64,
+    margin_left: f64,
+    header_ptr: *const u8,
+    header_len: usize,
+    footer_ptr: *const u8,
+    footer_len: usize,
+    header_offset: f64,
+    footer_offset: f64,
+    start_page_number: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let html = unsafe { str_arg(html_ptr, html_len) };
+    let blob: &[u8] = if fonts_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(fonts_ptr, fonts_len) }
+    };
+    let fonts = parse_font_blob(blob);
+    let header = unsafe { opt_str_arg(header_ptr, header_len) };
+    let footer = unsafe { opt_str_arg(footer_ptr, footer_len) };
+    let opts = gigapdf_core::html::RenderOptions {
+        page_w,
+        page_h,
+        margins: gigapdf_core::html::Margins {
+            top: margin_top,
+            right: margin_right,
+            bottom: margin_bottom,
+            left: margin_left,
+        },
+        header: header.map(str::to_string),
+        footer: footer.map(str::to_string),
+        header_offset,
+        footer_offset,
+        start_page_number: start_page_number.max(1),
+    };
+    let pdf = gigapdf_core::html::render_with(html, &fonts, &opts);
+    unsafe { bytes_into_host(pdf, out_len) }
+}
+
+/// Decode the packed font blob passed to [`gp_html_render`].
+fn parse_font_blob(b: &[u8]) -> Vec<gigapdf_core::html::ProvidedFont> {
+    fn rd_u32(b: &[u8], i: &mut usize) -> Option<u32> {
+        let v = b.get(*i..*i + 4)?;
+        *i += 4;
+        Some(u32::from_le_bytes(v.try_into().ok()?))
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    let Some(count) = rd_u32(b, &mut i) else {
+        return out;
+    };
+    for _ in 0..count {
+        let Some(fl) = rd_u32(b, &mut i) else { break };
+        let Some(fam) = b.get(i..i + fl as usize) else {
+            break;
+        };
+        i += fl as usize;
+        let Some(wb) = b.get(i..i + 2) else { break };
+        i += 2;
+        let weight = u16::from_le_bytes([wb[0], wb[1]]);
+        let Some(&italic) = b.get(i) else { break };
+        i += 1;
+        let Some(tl) = rd_u32(b, &mut i) else { break };
+        let Some(ttf) = b.get(i..i + tl as usize) else {
+            break;
+        };
+        i += tl as usize;
+        out.push(gigapdf_core::html::ProvidedFont {
+            family: String::from_utf8_lossy(fam).into_owned(),
+            weight,
+            italic: italic != 0,
+            ttf: ttf.to_vec(),
+        });
+    }
+    out
 }
 
 /// RTF → PDF. Buffer-returning.

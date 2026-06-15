@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::annot::{self, Annotation};
 use crate::content::{self, ContentElement, TextRun};
 use crate::error::{EngineError, Result};
-use crate::form::FormField;
+use crate::form::{self, FormField};
 use crate::filters::decode_stream;
 use crate::lexer::{Lexer, Token};
 use crate::link::{Link, LinkTarget};
@@ -47,6 +47,11 @@ fn collect_refs(object: &Object, out: &mut Vec<ObjectId>) {
         Object::Stream(stream) => stream.dict.0.values().for_each(|v| collect_refs(v, out)),
         _ => {}
     }
+}
+
+/// Build a literal PDF text string object (PDFDocEncoding / UTF-16BE as needed).
+fn pdf_text(s: &str) -> Object {
+    Object::String(crate::font::encode_pdf_text(s), StringKind::Literal)
 }
 
 /// Rewrite an object's indirect references through `map` (for grafting between
@@ -579,7 +584,7 @@ impl Document {
         }
         // Optional visible cover; by default the background shows through.
         if let Some(color) = cover {
-            self.add_rectangle(page_no, x, y, width, height, None, Some(color), 0.0)?;
+            self.add_rectangle(page_no, x, y, width, height, None, Some(color), 0.0, 1.0)?;
         }
         Ok(hits.len())
     }
@@ -801,6 +806,12 @@ impl Document {
         crate::convert::office::to_pptx(&self.convert_pages())
     }
 
+    /// Convert the document to an editable OpenDocument Presentation (`.odp`):
+    /// one slide per page, each text run a positioned box, each image a picture.
+    pub fn to_odp(&self) -> Vec<u8> {
+        crate::convert::office::to_odp(&self.convert_pages())
+    }
+
     /// Reconstruct each page's text into a row/column grid and export an Excel
     /// workbook (`.xlsx`), one sheet per page. Tabular PDFs become real cells;
     /// prose collapses to a single column so all document text is preserved.
@@ -947,14 +958,30 @@ impl Document {
             if samples.len() < w * h * components {
                 continue;
             }
+            // A `/SMask` (8-bit DeviceGray image) supplies per-pixel alpha — this
+            // is how PNG transparency survives embedding. Sampled nearest-
+            // neighbour so a soft mask of a different size still maps (identity
+            // when the dimensions match, the common case).
+            let smask = self.decode_gray_smask(dict);
             let mut rgba = Vec::with_capacity(w * h * 4);
-            for px in samples.chunks_exact(components).take(w * h) {
-                let (r, g, b) = if components == 1 {
-                    (px[0], px[0], px[0])
-                } else {
-                    (px[0], px[1], px[2])
-                };
-                rgba.extend_from_slice(&[r, g, b, 255]);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * components;
+                    let (r, g, b) = if components == 1 {
+                        (samples[i], samples[i], samples[i])
+                    } else {
+                        (samples[i], samples[i + 1], samples[i + 2])
+                    };
+                    let a = match &smask {
+                        Some((sw, sh, alpha)) => {
+                            let sx = if *sw == w { x } else { x * *sw / w };
+                            let sy = if *sh == h { y } else { y * *sh / h };
+                            alpha.get(sy * *sw + sx).copied().unwrap_or(255)
+                        }
+                        None => 255,
+                    };
+                    rgba.extend_from_slice(&[r, g, b, a]);
+                }
             }
             out.insert(
                 name.clone(),
@@ -979,6 +1006,30 @@ impl Document {
                 .map(<[u8]>::to_vec),
             _ => None,
         }
+    }
+
+    /// Decode an image's `/SMask` (an 8-bit `/DeviceGray` image XObject) into its
+    /// `(width, height, gray samples)` so the rasterizer can use it as per-pixel
+    /// alpha. Returns `None` when absent or in a form we don't decode (e.g. a
+    /// JPEG-coded mask), in which case the image is treated as opaque.
+    fn decode_gray_smask(&self, dict: &Dictionary) -> Option<(usize, usize, Vec<u8>)> {
+        let stream = dict.get(b"SMask").map(|o| self.resolve(o))?.as_stream()?;
+        let sd = &stream.dict;
+        let sw = sd.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
+        let sh = sd.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
+        let bpc = sd.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap_or(8);
+        if sw <= 0 || sh <= 0 || bpc != 8 {
+            return None;
+        }
+        if matches!(self.first_filter(sd).as_deref(), Some(b"DCTDecode") | Some(b"JPXDecode")) {
+            return None;
+        }
+        let samples = decode_stream(stream).ok()?;
+        let (sw, sh) = (sw as usize, sh as usize);
+        if samples.len() < sw * sh {
+            return None;
+        }
+        Some((sw, sh, samples))
     }
 
     /// Serialize the document, Flate-compressing every uncompressed stream.
@@ -1201,6 +1252,7 @@ impl Document {
     /// Draw a rectangle (frame / table cell / filled box) on a page. Colours are
     /// RGB in `0.0..=1.0`; pass `None` to skip stroke or fill.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_rectangle(
         &mut self,
         page_no: u32,
@@ -1211,13 +1263,11 @@ impl Document {
         stroke: Option<[f64; 3]>,
         fill: Option<[f64; 3]>,
         line_width: f64,
+        opacity: f64,
     ) -> Result<()> {
-        let mut content = self.page_content(page_no)?;
-        content.push(b'\n');
-        content.extend_from_slice(&content::rectangle_ops(
-            x, y, width, height, stroke, fill, line_width,
-        ));
-        self.set_page_content(page_no, content)
+        let ops = content::rectangle_ops(x, y, width, height, stroke, fill, line_width);
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
     }
 
     /// Draw a straight line (table rule / separator / underline) on a page.
@@ -1231,11 +1281,534 @@ impl Document {
         y2: f64,
         stroke: [f64; 3],
         line_width: f64,
+        opacity: f64,
     ) -> Result<()> {
+        let ops = content::line_ops(x1, y1, x2, y2, stroke, line_width);
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Draw an ellipse (or circle when `rx == ry`) centred at `(cx, cy)` on a
+    /// page. Colours are RGB in `0.0..=1.0`; pass `None` to skip stroke or fill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_ellipse(
+        &mut self,
+        page_no: u32,
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        stroke: Option<[f64; 3]>,
+        fill: Option<[f64; 3]>,
+        line_width: f64,
+        opacity: f64,
+    ) -> Result<()> {
+        let ops = content::ellipse_ops(cx, cy, rx, ry, stroke, fill, line_width);
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Draw a polyline / polygon through `points` (flat `[x0, y0, x1, y1, …]`
+    /// pairs) on a page. `close` joins the last vertex to the first. Colours
+    /// are RGB in `0.0..=1.0`; pass `None` to skip stroke or fill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_polygon(
+        &mut self,
+        page_no: u32,
+        points: &[f64],
+        close: bool,
+        stroke: Option<[f64; 3]>,
+        fill: Option<[f64; 3]>,
+        line_width: f64,
+        opacity: f64,
+    ) -> Result<()> {
+        let pairs: Vec<(f64, f64)> = points.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        let ops = content::polygon_ops(&pairs, close, stroke, fill, line_width);
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Draw an arbitrary SVG path (`M`/`L`/`C`/`Q`/`Z`…) on a page, anchored so
+    /// the SVG origin maps to PDF user-space `(ox, oy)` with the Y axis flipped
+    /// (matches `pdf-lib`'s `drawSvgPath`). Covers freeform/polygon/triangle
+    /// shapes. Colours are RGB in `0.0..=1.0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_path(
+        &mut self,
+        page_no: u32,
+        svg_path: &str,
+        ox: f64,
+        oy: f64,
+        stroke: Option<[f64; 3]>,
+        fill: Option<[f64; 3]>,
+        line_width: f64,
+        opacity: f64,
+    ) -> Result<()> {
+        let ops = content::svg_path::svg_path_ops(svg_path, ox, oy, stroke, fill, line_width);
+        if ops.is_empty() {
+            return Ok(()); // nothing drawable in the path
+        }
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Parse SVG markup and draw it onto a page, fitting its viewBox into the box
+    /// `(x, y, width, height)` in PDF user space (origin bottom-left). Renders as
+    /// **native vector paths** — crisp at any zoom, not rasterized. Errors only if
+    /// the SVG can't be parsed or has nothing drawable.
+    pub fn add_svg(&mut self, page_no: u32, src: &str, x: f64, y: f64, width: f64, height: f64) -> Result<()> {
+        let img = crate::svg::parse_svg(src)
+            .ok_or_else(|| EngineError::Missing("unsupported or empty SVG".into()))?;
+        self.draw_svg_image(page_no, &img, x, y, width, height)
+    }
+
+    /// Draw an already-parsed [`crate::svg::SvgImage`] onto a page — the HTML
+    /// renderer uses this for inline `<svg>` so it isn't re-serialized. Maps the
+    /// viewBox onto `(x, y, width, height)` (Y-flipped) and emits PDF path ops.
+    pub fn draw_svg_image(
+        &mut self,
+        page_no: u32,
+        img: &crate::svg::SvgImage,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Result<()> {
+        use crate::content::num;
+        use crate::content::svg_path::Seg;
+        use crate::svg::Fill;
+
+        let [vbx, vby, vbw, vbh] = img.view_box;
+        if vbw <= 0.0 || vbh <= 0.0 || width <= 0.0 || height <= 0.0 {
+            return Ok(());
+        }
+        let sx = width / vbw;
+        let sy = height / vbh;
+        // viewBox (Y-down) → PDF box (Y-up, bottom-left at (x, y)).
+        let map = |px: f64, py: f64| (x + (px - vbx) * sx, y + height - (py - vby) * sy);
+        let stroke_scale = (sx * sy).sqrt();
+
+        for prim in &img.prims {
+            // Build the path once (m/l/c/h) in PDF coordinates.
+            let mut path: Vec<u8> = Vec::new();
+            let mut drew = false;
+            for seg in &prim.segs {
+                match *seg {
+                    Seg::Move(px, py) => {
+                        let (u, v) = map(px, py);
+                        path.extend_from_slice(format!("{} {} m\n", num(u), num(v)).as_bytes());
+                    }
+                    Seg::Line(px, py) => {
+                        let (u, v) = map(px, py);
+                        path.extend_from_slice(format!("{} {} l\n", num(u), num(v)).as_bytes());
+                        drew = true;
+                    }
+                    Seg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                        let (a, b) = map(x1, y1);
+                        let (c, d) = map(x2, y2);
+                        let (e, f) = map(x3, y3);
+                        path.extend_from_slice(
+                            format!("{} {} {} {} {} {} c\n", num(a), num(b), num(c), num(d), num(e), num(f))
+                                .as_bytes(),
+                        );
+                        drew = true;
+                    }
+                    Seg::Close => path.extend_from_slice(b"h\n"),
+                }
+            }
+            if !drew {
+                continue; // move-only / empty subpath draws nothing
+            }
+
+            // Fill setup: a flat colour (`rg`) or a shading pattern (`/Pattern cs … scn`).
+            let mut setup: Vec<u8> = Vec::new();
+            let mut has_fill = false;
+            // A gradient's stop alpha isn't carried in the shading itself (that
+            // needs a soft-mask group); approximate it as a uniform fill alpha.
+            let mut eff_fill_opacity = prim.fill_opacity;
+            match &prim.fill {
+                Some(Fill::Solid([r, g, b])) => {
+                    setup.extend_from_slice(format!("{} {} {} rg\n", num(*r), num(*g), num(*b)).as_bytes());
+                    has_fill = true;
+                }
+                Some(Fill::Gradient(grad)) => {
+                    if let Some(name) = self.register_svg_shading(page_no, grad, map, stroke_scale)? {
+                        setup.extend_from_slice(b"/Pattern cs\n/");
+                        setup.extend_from_slice(&name);
+                        setup.extend_from_slice(b" scn\n");
+                        has_fill = true;
+                        let n = grad.stops.len().max(1) as f64;
+                        eff_fill_opacity *= grad.stops.iter().map(|s| s.alpha).sum::<f64>() / n;
+                    }
+                }
+                None => {}
+            }
+            if let Some([r, g, b]) = prim.stroke {
+                setup.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+                setup.extend_from_slice(format!("{} w\n", num((prim.stroke_w * stroke_scale).max(0.0))).as_bytes());
+            }
+            let has_stroke = prim.stroke.is_some();
+            if !has_fill && !has_stroke {
+                continue;
+            }
+
+            let mut ops: Vec<u8> = b"q\n".to_vec();
+            ops.extend_from_slice(&setup);
+            ops.extend_from_slice(&path);
+            ops.extend_from_slice(match (has_fill, has_stroke) {
+                (true, true) => b"B\n",
+                (true, false) => b"f\n",
+                _ => b"S\n",
+            });
+            ops.extend_from_slice(b"Q\n");
+
+            // Per-primitive alpha (distinct fill/stroke) via a transient ExtGState.
+            if eff_fill_opacity < 1.0 || prim.stroke_opacity < 1.0 {
+                let mut gs = Dictionary::new();
+                gs.set(b"Type".to_vec(), Object::Name(b"ExtGState".to_vec()));
+                gs.set(b"ca".to_vec(), Object::Real(eff_fill_opacity.clamp(0.0, 1.0)));
+                gs.set(b"CA".to_vec(), Object::Real(prim.stroke_opacity.clamp(0.0, 1.0)));
+                let name = self.register_page_resource(page_no, b"ExtGState", "GpGs", Object::Dictionary(gs))?;
+                let mut wrapped = b"q\n/".to_vec();
+                wrapped.extend_from_slice(&name);
+                wrapped.extend_from_slice(b" gs\n");
+                wrapped.extend_from_slice(&ops);
+                wrapped.extend_from_slice(b"Q\n");
+                ops = wrapped;
+            }
+            self.append_page_content(page_no, &ops)?;
+        }
+        Ok(())
+    }
+
+    /// Register a PDF shading pattern (axial/radial) for an SVG gradient and
+    /// return its `/Pattern` resource name. The gradient's coordinates are mapped
+    /// to PDF space by `map`; `rscale` scales a radial radius. `None` if there
+    /// aren't enough stops to form a gradient.
+    fn register_svg_shading(
+        &mut self,
+        page_no: u32,
+        grad: &crate::svg::Gradient,
+        map: impl Fn(f64, f64) -> (f64, f64),
+        rscale: f64,
+    ) -> Result<Option<Vec<u8>>> {
+        use crate::svg::GradKind;
+        if grad.stops.len() < 2 {
+            return Ok(None);
+        }
+        // 1. A type-0 sampled function: 256 RGB samples across the gradient.
+        let mut samples = Vec::with_capacity(256 * 3);
+        for i in 0..256u32 {
+            let [r, g, b] = sample_svg_gradient(&grad.stops, i as f64 / 255.0);
+            samples.extend_from_slice(&[r, g, b]);
+        }
+        let mut fdict = Dictionary::new();
+        fdict.set(b"FunctionType".to_vec(), Object::Integer(0));
+        fdict.set(b"Domain".to_vec(), Object::Array(vec![Object::Integer(0), Object::Integer(1)]));
+        fdict.set(
+            b"Range".to_vec(),
+            Object::Array(vec![
+                Object::Integer(0), Object::Integer(1),
+                Object::Integer(0), Object::Integer(1),
+                Object::Integer(0), Object::Integer(1),
+            ]),
+        );
+        fdict.set(b"Size".to_vec(), Object::Array(vec![Object::Integer(256)]));
+        fdict.set(b"BitsPerSample".to_vec(), Object::Integer(8));
+        fdict.set(b"Length".to_vec(), Object::Integer(samples.len() as i64));
+        let fn_id = (self.next_object_number(), 0u16);
+        self.objects.insert(fn_id, Object::Stream(Stream::new(fdict, samples)));
+
+        // 2. The shading dictionary (axial = type 2, radial = type 3).
+        let mut sh = Dictionary::new();
+        sh.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec()));
+        sh.set(b"Function".to_vec(), Object::Reference(fn_id));
+        sh.set(b"Extend".to_vec(), Object::Array(vec![Object::Boolean(true), Object::Boolean(true)]));
+        match grad.kind {
+            GradKind::Linear { x1, y1, x2, y2 } => {
+                let (a, b) = map(x1, y1);
+                let (c, d) = map(x2, y2);
+                sh.set(b"ShadingType".to_vec(), Object::Integer(2));
+                sh.set(
+                    b"Coords".to_vec(),
+                    Object::Array(vec![Object::Real(a), Object::Real(b), Object::Real(c), Object::Real(d)]),
+                );
+            }
+            GradKind::Radial { cx, cy, r, fx, fy } => {
+                let (pcx, pcy) = map(cx, cy);
+                let (pfx, pfy) = map(fx, fy);
+                sh.set(b"ShadingType".to_vec(), Object::Integer(3));
+                sh.set(
+                    b"Coords".to_vec(),
+                    Object::Array(vec![
+                        Object::Real(pfx), Object::Real(pfy), Object::Real(0.0),
+                        Object::Real(pcx), Object::Real(pcy), Object::Real((r * rscale).max(0.0)),
+                    ]),
+                );
+            }
+        }
+
+        // 3. A shading pattern (PatternType 2) registered on the page.
+        let mut pat = Dictionary::new();
+        pat.set(b"Type".to_vec(), Object::Name(b"Pattern".to_vec()));
+        pat.set(b"PatternType".to_vec(), Object::Integer(2));
+        pat.set(b"Shading".to_vec(), Object::Dictionary(sh));
+        pat.set(
+            b"Matrix".to_vec(),
+            Object::Array(vec![
+                Object::Integer(1), Object::Integer(0), Object::Integer(0),
+                Object::Integer(1), Object::Integer(0), Object::Integer(0),
+            ]),
+        );
+        Ok(Some(self.register_page_resource(page_no, b"Pattern", "GpSh", Object::Dictionary(pat))?))
+    }
+
+    /// Draw a **colour glyph** (COLR/CPAL emoji) as native vector layers at the
+    /// baseline origin `(x, baseline)` (PDF user space, Y-up) for text `size`.
+    /// Each layer fills its glyph's contours with the palette colour (`fg` for
+    /// foreground-indexed layers). Returns the glyph advance in points so the
+    /// caller can move the pen. A non-colour glyph draws nothing (returns its
+    /// advance) so callers can fall back to normal text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_color_glyph(
+        &mut self,
+        page_no: u32,
+        face: &crate::font::truetype::TrueTypeFont,
+        colors: &crate::font::color::ColorGlyphs,
+        base_gid: u16,
+        x: f64,
+        baseline: f64,
+        size: f64,
+        fg: [f64; 3],
+    ) -> Result<f64> {
+        use crate::content::num;
+        let upm = face.units_per_em().max(1.0);
+        let s = size / upm;
+        let advance = face.advance_width(base_gid) * s;
+        let Some(layers) = colors.layers(base_gid) else {
+            return Ok(advance);
+        };
+        // Font outlines are Y-up like PDF, so no flip: glyph y=0 sits on `baseline`.
+        for layer in layers {
+            let contours = face.glyph_polygons(layer.gid);
+            if contours.is_empty() {
+                continue;
+            }
+            let rgb = if layer.use_foreground { fg } else { layer.rgb };
+            let mut ops: Vec<u8> = b"q\n".to_vec();
+            ops.extend_from_slice(format!("{} {} {} rg\n", num(rgb[0]), num(rgb[1]), num(rgb[2])).as_bytes());
+            for contour in &contours {
+                if contour.len() < 2 {
+                    continue;
+                }
+                let (fx, fy) = contour[0];
+                ops.extend_from_slice(format!("{} {} m\n", num(x + fx * s), num(baseline + fy * s)).as_bytes());
+                for &(fx, fy) in &contour[1..] {
+                    ops.extend_from_slice(format!("{} {} l\n", num(x + fx * s), num(baseline + fy * s)).as_bytes());
+                }
+                ops.extend_from_slice(b"h\n");
+            }
+            ops.extend_from_slice(b"f\n"); // nonzero-winding fill
+            ops.extend_from_slice(b"Q\n");
+            let ops = self.with_opacity(page_no, ops, layer.alpha)?;
+            self.append_page_content(page_no, &ops)?;
+        }
+        Ok(advance)
+    }
+
+    /// Draw an Apple `sbix` colour-emoji glyph as a bitmap on the baseline at
+    /// `(x, baseline)` for text `size`. Returns `true` if the glyph had a PNG
+    /// bitmap (placed), `false` otherwise so the caller can fall back.
+    pub fn draw_sbix_glyph(
+        &mut self,
+        page_no: u32,
+        face: &crate::font::truetype::TrueTypeFont,
+        gid: u16,
+        x: f64,
+        baseline: f64,
+        size: f64,
+    ) -> Result<bool> {
+        let Some(sb) = face.sbix_glyphs() else { return Ok(false) };
+        let Some(g) = sb.glyph(gid) else { return Ok(false) };
+        // Origin offsets are pixels at the strike ppem → convert to points; the
+        // bitmap covers roughly the em box, so place a `size × size` image.
+        let scale = size / g.ppem.max(1.0);
+        let _ = self.add_image(page_no, &g.png, x + g.origin_x * scale, baseline + g.origin_y * scale, size, size, 1.0);
+        Ok(true)
+    }
+
+    /// Embed a raster image (PNG or JPEG) on a page and draw it at `(x, y)` with
+    /// size `(width, height)` in PDF user space (origin bottom-left). `opacity`
+    /// in `0.0..=1.0` sets fill alpha via a transient `/ExtGState`. PNG alpha is
+    /// honoured through a soft mask; JPEG embeds losslessly via `/DCTDecode`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_image(
+        &mut self,
+        page_no: u32,
+        data: &[u8],
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        opacity: f64,
+    ) -> Result<()> {
+        use content::image::{ImageColor, ImageFilter};
+        let prep = content::image::prepare_image(data)
+            .ok_or_else(|| EngineError::Missing("unsupported image (need PNG or JPEG)".into()))?;
+
+        // PNG alpha → a /DeviceGray soft-mask image XObject referenced by /SMask.
+        let smask_ref = match prep.smask {
+            Some(alpha) => {
+                let mut m = Dictionary::new();
+                m.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+                m.set(b"Subtype".to_vec(), Object::Name(b"Image".to_vec()));
+                m.set(b"Width".to_vec(), Object::Integer(prep.width as i64));
+                m.set(b"Height".to_vec(), Object::Integer(prep.height as i64));
+                m.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec()));
+                m.set(b"BitsPerComponent".to_vec(), Object::Integer(8));
+                m.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+                m.set(b"Length".to_vec(), Object::Integer(alpha.len() as i64));
+                let id = (self.next_object_number(), 0u16);
+                self.objects
+                    .insert(id, Object::Stream(Stream::new(m, alpha)));
+                Some(id)
+            }
+            None => None,
+        };
+
+        // Main image XObject.
+        let mut dict = Dictionary::new();
+        dict.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+        dict.set(b"Subtype".to_vec(), Object::Name(b"Image".to_vec()));
+        dict.set(b"Width".to_vec(), Object::Integer(prep.width as i64));
+        dict.set(b"Height".to_vec(), Object::Integer(prep.height as i64));
+        dict.set(
+            b"ColorSpace".to_vec(),
+            Object::Name(match prep.color {
+                ImageColor::Gray => b"DeviceGray".to_vec(),
+                ImageColor::Rgb => b"DeviceRGB".to_vec(),
+                ImageColor::Cmyk => b"DeviceCMYK".to_vec(),
+            }),
+        );
+        dict.set(b"BitsPerComponent".to_vec(), Object::Integer(8));
+        dict.set(
+            b"Filter".to_vec(),
+            Object::Name(match prep.filter {
+                ImageFilter::Dct => b"DCTDecode".to_vec(),
+                ImageFilter::Flate => b"FlateDecode".to_vec(),
+            }),
+        );
+        if prep.cmyk_invert {
+            // Adobe CMYK JPEGs store inverted ink; flip every channel.
+            dict.set(
+                b"Decode".to_vec(),
+                Object::Array(vec![
+                    Object::Integer(1),
+                    Object::Integer(0),
+                    Object::Integer(1),
+                    Object::Integer(0),
+                    Object::Integer(1),
+                    Object::Integer(0),
+                    Object::Integer(1),
+                    Object::Integer(0),
+                ]),
+            );
+        }
+        if let Some(id) = smask_ref {
+            dict.set(b"SMask".to_vec(), Object::Reference(id));
+        }
+        dict.set(b"Length".to_vec(), Object::Integer(prep.data.len() as i64));
+        let img_id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(img_id, Object::Stream(Stream::new(dict, prep.data)));
+
+        // Register the image in the page's /Resources /XObject and get its name.
+        let img_name =
+            self.register_page_resource(page_no, b"XObject", "GpImg", Object::Reference(img_id))?;
+
+        let ops = content::image_ops(&img_name, x, y, width, height);
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Register `value` under a fresh name in a page's `/Resources /{category}`
+    /// sub-dictionary (e.g. `XObject`, `ExtGState`), cloning any inherited or
+    /// indirect resource dictionaries onto the page so the addition is local.
+    /// Returns the chosen resource name (`{prefix}{n}`).
+    fn register_page_resource(
+        &mut self,
+        page_no: u32,
+        category: &[u8],
+        prefix: &str,
+        value: Object,
+    ) -> Result<Vec<u8>> {
+        let page_id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .ok_or(EngineError::PageNotFound(page_no))?
+            .clone();
+
+        let mut resources = page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let mut sub = resources
+            .get(category)
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+
+        // First free `{prefix}{n}` name in this sub-dictionary.
+        let mut n = 0usize;
+        let name = loop {
+            let candidate = format!("{prefix}{n}").into_bytes();
+            if sub.get(&candidate).is_none() {
+                break candidate;
+            }
+            n += 1;
+        };
+
+        sub.0.insert(name.clone(), value);
+        resources.set(category.to_vec(), Object::Dictionary(sub));
+        page.set(b"Resources".to_vec(), Object::Dictionary(resources));
+        self.objects.insert(page_id, Object::Dictionary(page));
+        Ok(name)
+    }
+
+    /// Append `ops` to a page's content stream, on a fresh line.
+    fn append_page_content(&mut self, page_no: u32, ops: &[u8]) -> Result<()> {
         let mut content = self.page_content(page_no)?;
         content.push(b'\n');
-        content.extend_from_slice(&content::line_ops(x1, y1, x2, y2, stroke, line_width));
+        content.extend_from_slice(ops);
         self.set_page_content(page_no, content)
+    }
+
+    /// Wrap `ops` in a `q /Gs gs … Q` block applying `opacity` (fill + stroke
+    /// alpha) through an `/ExtGState`, or return `ops` unchanged when fully
+    /// opaque. The outer graphics-state nesting lets the alpha reach the inner
+    /// `q … Q` the shape/image ops already emit.
+    fn with_opacity(&mut self, page_no: u32, ops: Vec<u8>, opacity: f64) -> Result<Vec<u8>> {
+        if opacity >= 1.0 {
+            return Ok(ops);
+        }
+        let ca = opacity.clamp(0.0, 1.0);
+        let mut gs = Dictionary::new();
+        gs.set(b"Type".to_vec(), Object::Name(b"ExtGState".to_vec()));
+        gs.set(b"ca".to_vec(), Object::Real(ca));
+        gs.set(b"CA".to_vec(), Object::Real(ca));
+        let name =
+            self.register_page_resource(page_no, b"ExtGState", "GpGs", Object::Dictionary(gs))?;
+        let mut out = b"q\n/".to_vec();
+        out.extend_from_slice(&name);
+        out.extend_from_slice(b" gs\n");
+        out.extend_from_slice(&ops);
+        out.extend_from_slice(b"Q\n");
+        Ok(out)
     }
 
     // ─── annotations ─────────────────────────────────────────────────────────
@@ -2084,6 +2657,411 @@ impl Document {
             Some(Object::String(bytes, _)) => Some(crate::font::decode_pdf_text(bytes)),
             _ => None,
         }
+    }
+
+    // ─── form field creation (AcroForm, ISO 32000-1 §12.7) ───────────────────
+
+    /// Ensure the catalog has an `/AcroForm` carrying a Helvetica in
+    /// `/DR /Font /Helv`, a default `/DA`, and `NeedAppearances true`. Returns
+    /// the Helvetica font object id (every widget's appearance resources point
+    /// at it). Re-uses an existing `/Helv` if the document already has one.
+    fn ensure_acroform(&mut self, default_da: &Object) -> Result<ObjectId> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?
+            .clone();
+        let mut acro = catalog
+            .get(b"AcroForm")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+
+        let existing = acro
+            .get(b"DR")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|dr| dr.get(b"Font").map(|o| self.resolve(o)))
+            .and_then(Object::as_dict)
+            .and_then(|fonts| fonts.get(b"Helv").and_then(Object::as_reference));
+        let helv_id = match existing {
+            Some(id) => id,
+            None => {
+                let id = (self.next_object_number(), 0u16);
+                let mut f = Dictionary::new();
+                f.set(b"Type", annot::name(b"Font"));
+                f.set(b"Subtype", annot::name(b"Type1"));
+                f.set(b"BaseFont", annot::name(b"Helvetica"));
+                f.set(b"Encoding", annot::name(b"WinAnsiEncoding"));
+                self.objects.insert(id, Object::Dictionary(f));
+
+                let mut fonts = acro
+                    .get(b"DR")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+                    .and_then(|dr| dr.get(b"Font").map(|o| self.resolve(o)))
+                    .and_then(Object::as_dict)
+                    .cloned()
+                    .unwrap_or_default();
+                fonts.set(b"Helv", Object::Reference(id));
+                let mut dr = acro
+                    .get(b"DR")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+                    .cloned()
+                    .unwrap_or_default();
+                dr.set(b"Font", Object::Dictionary(fonts));
+                acro.set(b"DR", Object::Dictionary(dr));
+                id
+            }
+        };
+
+        if acro.get(b"DA").is_none() {
+            acro.set(b"DA", default_da.clone());
+        }
+        acro.set(b"NeedAppearances", Object::Boolean(true));
+        if acro.get(b"Fields").is_none() {
+            acro.set(b"Fields", Object::Array(Vec::new()));
+        }
+        catalog.set(b"AcroForm", Object::Dictionary(acro));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(helv_id)
+    }
+
+    /// Allocate a Form XObject holding `content`, sized `[0 0 w h]`, with a
+    /// `/Helv` font resource; returns its object id.
+    fn make_form_xobject(
+        &mut self,
+        content: Vec<u8>,
+        w: f64,
+        h: f64,
+        helv_id: ObjectId,
+    ) -> ObjectId {
+        let id = (self.next_object_number(), 0u16);
+        let mut fonts = Dictionary::new();
+        fonts.set(b"Helv", Object::Reference(helv_id));
+        let mut resources = Dictionary::new();
+        resources.set(b"Font", Object::Dictionary(fonts));
+        let mut d = Dictionary::new();
+        d.set(b"Type", annot::name(b"XObject"));
+        d.set(b"Subtype", annot::name(b"Form"));
+        d.set(b"FormType", Object::Integer(1));
+        d.set(b"BBox", annot::real_array(&[0.0, 0.0, w, h]));
+        d.set(b"Resources", Object::Dictionary(resources));
+        d.set(b"Length", Object::Integer(content.len() as i64));
+        self.objects.insert(id, Object::Stream(Stream::new(d, content)));
+        id
+    }
+
+    /// Append an annotation/widget reference to a page's `/Annots`.
+    fn append_to_page_annots(&mut self, page_id: ObjectId, annot_id: ObjectId) {
+        if let Some(mut page) = self.objects.get(&page_id).and_then(Object::as_dict).cloned() {
+            let mut annots = page
+                .get(b"Annots")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .map(<[Object]>::to_vec)
+                .unwrap_or_default();
+            annots.push(Object::Reference(annot_id));
+            page.set(b"Annots", Object::Array(annots));
+            self.objects.insert(page_id, Object::Dictionary(page));
+        }
+    }
+
+    /// Append a field reference to the AcroForm `/Fields`.
+    fn register_in_acroform(&mut self, field_id: ObjectId) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let mut acro = catalog
+            .get(b"AcroForm")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let mut fields = acro
+            .get(b"Fields")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        fields.push(Object::Reference(field_id));
+        acro.set(b"Fields", Object::Array(fields));
+        catalog.set(b"AcroForm", Object::Dictionary(acro));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Register a terminal field: page `/Annots` + AcroForm `/Fields`.
+    fn register_field(&mut self, page_id: ObjectId, field_id: ObjectId) -> Result<()> {
+        self.append_to_page_annots(page_id, field_id);
+        self.register_in_acroform(field_id)
+    }
+
+    /// Add a single- or multi-line **text field** to `page` (1-based) covering
+    /// `rect` = `[x0, y0, x1, y1]` (PDF user space).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_field(
+        &mut self,
+        page: u32,
+        name: &str,
+        rect: [f64; 4],
+        value: &str,
+        max_len: Option<u32>,
+        multiline: bool,
+        password: bool,
+        style: &form::FieldStyle,
+    ) -> Result<()> {
+        let da = form::da_string(style);
+        let helv_id = self.ensure_acroform(&da)?;
+        let page_id = self.page_object_id(page)?;
+        let (w, h) = ((rect[2] - rect[0]).abs(), (rect[3] - rect[1]).abs());
+
+        let mut ff = 0u32;
+        if multiline {
+            ff |= form::flags::MULTILINE;
+        }
+        if password {
+            ff |= form::flags::PASSWORD;
+        }
+
+        let mut field = Dictionary::new();
+        field.set(b"FT", annot::name(b"Tx"));
+        field.set(b"T", pdf_text(name));
+        field.set(b"V", pdf_text(value));
+        field.set(b"DA", da);
+        if ff != 0 {
+            field.set(b"Ff", Object::Integer(i64::from(ff)));
+        }
+        if let Some(ml) = max_len {
+            field.set(b"MaxLen", Object::Integer(i64::from(ml)));
+        }
+        if let Some(mk) = form::mk_dict(style) {
+            field.set(b"MK", Object::Dictionary(mk));
+        }
+
+        let ap_id = self.make_form_xobject(form::text_appearance(value, style, w, h), w, h, helv_id);
+        let mut ap = Dictionary::new();
+        ap.set(b"N", Object::Reference(ap_id));
+
+        field.set(b"Type", annot::name(b"Annot"));
+        field.set(b"Subtype", annot::name(b"Widget"));
+        field.set(b"Rect", annot::real_array(&rect));
+        field.set(b"F", Object::Integer(4)); // Print
+        field.set(b"P", Object::Reference(page_id));
+        field.set(b"AP", Object::Dictionary(ap));
+
+        let field_id = (self.next_object_number(), 0u16);
+        self.objects.insert(field_id, Object::Dictionary(field));
+        self.register_field(page_id, field_id)
+    }
+
+    /// Add a **checkbox** to `page`. `export` is the "on" state name (defaults
+    /// to `On`); `checked` sets the initial state.
+    pub fn add_checkbox(
+        &mut self,
+        page: u32,
+        name: &str,
+        rect: [f64; 4],
+        checked: bool,
+        export: &str,
+        style: &form::FieldStyle,
+    ) -> Result<()> {
+        let da = form::da_string(style);
+        let helv_id = self.ensure_acroform(&da)?;
+        let page_id = self.page_object_id(page)?;
+        let (w, h) = ((rect[2] - rect[0]).abs(), (rect[3] - rect[1]).abs());
+        let on = if export.is_empty() { "On" } else { export };
+
+        let on_id = self.make_form_xobject(form::check_appearance(style, w, h), w, h, helv_id);
+        let off_id = self.make_form_xobject(form::empty_appearance(style, w, h), w, h, helv_id);
+        let mut n = Dictionary::new();
+        n.set(on.as_bytes().to_vec(), Object::Reference(on_id));
+        n.set(b"Off", Object::Reference(off_id));
+        let mut ap = Dictionary::new();
+        ap.set(b"N", Object::Dictionary(n));
+
+        let state = if checked { on } else { "Off" };
+        let mut field = Dictionary::new();
+        field.set(b"FT", annot::name(b"Btn"));
+        field.set(b"T", pdf_text(name));
+        field.set(b"V", annot::name(state.as_bytes()));
+        field.set(b"AS", annot::name(state.as_bytes()));
+        if let Some(mk) = form::mk_dict(style) {
+            field.set(b"MK", Object::Dictionary(mk));
+        }
+        field.set(b"Type", annot::name(b"Annot"));
+        field.set(b"Subtype", annot::name(b"Widget"));
+        field.set(b"Rect", annot::real_array(&rect));
+        field.set(b"F", Object::Integer(4));
+        field.set(b"P", Object::Reference(page_id));
+        field.set(b"AP", Object::Dictionary(ap));
+
+        let field_id = (self.next_object_number(), 0u16);
+        self.objects.insert(field_id, Object::Dictionary(field));
+        self.register_field(page_id, field_id)
+    }
+
+    /// Add a **radio-button group**: one logical field (`/Ff Radio`) whose
+    /// `/Kids` are the individual buttons. Each option is `(export_name, rect)`;
+    /// `selected` is the initially-chosen export name.
+    pub fn add_radio_group(
+        &mut self,
+        page: u32,
+        name: &str,
+        options: &[(String, [f64; 4])],
+        selected: Option<&str>,
+        style: &form::FieldStyle,
+    ) -> Result<()> {
+        let da = form::da_string(style);
+        let helv_id = self.ensure_acroform(&da)?;
+        let page_id = self.page_object_id(page)?;
+
+        // Reserve the parent id first so the kids can point at it via /Parent.
+        let parent_id = (self.next_object_number(), 0u16);
+        self.objects.insert(parent_id, Object::Null);
+
+        let mut kids: Vec<Object> = Vec::with_capacity(options.len());
+        for (export, rect) in options {
+            let (w, h) = ((rect[2] - rect[0]).abs(), (rect[3] - rect[1]).abs());
+            let on_id = self.make_form_xobject(form::radio_appearance(style, w, h), w, h, helv_id);
+            let off_id = self.make_form_xobject(form::empty_appearance(style, w, h), w, h, helv_id);
+            let mut n = Dictionary::new();
+            n.set(export.as_bytes().to_vec(), Object::Reference(on_id));
+            n.set(b"Off", Object::Reference(off_id));
+            let mut ap = Dictionary::new();
+            ap.set(b"N", Object::Dictionary(n));
+
+            let state: &str = if selected == Some(export.as_str()) { export } else { "Off" };
+            let mut kid = Dictionary::new();
+            kid.set(b"Type", annot::name(b"Annot"));
+            kid.set(b"Subtype", annot::name(b"Widget"));
+            kid.set(b"Rect", annot::real_array(rect));
+            kid.set(b"F", Object::Integer(4));
+            kid.set(b"P", Object::Reference(page_id));
+            kid.set(b"Parent", Object::Reference(parent_id));
+            kid.set(b"AS", annot::name(state.as_bytes()));
+            if let Some(mk) = form::mk_dict(style) {
+                kid.set(b"MK", Object::Dictionary(mk));
+            }
+            kid.set(b"AP", Object::Dictionary(ap));
+
+            let kid_id = (self.next_object_number(), 0u16);
+            self.objects.insert(kid_id, Object::Dictionary(kid));
+            kids.push(Object::Reference(kid_id));
+            self.append_to_page_annots(page_id, kid_id);
+        }
+
+        let mut parent = Dictionary::new();
+        parent.set(b"FT", annot::name(b"Btn"));
+        parent.set(b"Ff", Object::Integer(i64::from(form::flags::RADIO)));
+        parent.set(b"T", pdf_text(name));
+        parent.set(b"V", annot::name(selected.unwrap_or("Off").as_bytes()));
+        parent.set(b"DA", da);
+        parent.set(b"Kids", Object::Array(kids));
+        self.objects.insert(parent_id, Object::Dictionary(parent));
+
+        self.register_in_acroform(parent_id)
+    }
+
+    /// Add a drop-down **combo box**. `editable` lets the user type a value
+    /// outside `options`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_combo_box(
+        &mut self,
+        page: u32,
+        name: &str,
+        rect: [f64; 4],
+        options: &[String],
+        selected: Option<&str>,
+        editable: bool,
+        style: &form::FieldStyle,
+    ) -> Result<()> {
+        self.add_choice_field(page, name, rect, options, selected, true, editable, false, style)
+    }
+
+    /// Add a scrolling **list box**. `multi` allows selecting several options.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_list_box(
+        &mut self,
+        page: u32,
+        name: &str,
+        rect: [f64; 4],
+        options: &[String],
+        selected: Option<&str>,
+        multi: bool,
+        style: &form::FieldStyle,
+    ) -> Result<()> {
+        self.add_choice_field(page, name, rect, options, selected, false, false, multi, style)
+    }
+
+    /// Shared implementation for combo boxes and list boxes (both `/FT Ch`).
+    #[allow(clippy::too_many_arguments)]
+    fn add_choice_field(
+        &mut self,
+        page: u32,
+        name: &str,
+        rect: [f64; 4],
+        options: &[String],
+        selected: Option<&str>,
+        combo: bool,
+        editable: bool,
+        multi: bool,
+        style: &form::FieldStyle,
+    ) -> Result<()> {
+        let da = form::da_string(style);
+        let helv_id = self.ensure_acroform(&da)?;
+        let page_id = self.page_object_id(page)?;
+        let (w, h) = ((rect[2] - rect[0]).abs(), (rect[3] - rect[1]).abs());
+
+        let mut ff = 0u32;
+        if combo {
+            ff |= form::flags::COMBO;
+        }
+        if editable {
+            ff |= form::flags::EDIT;
+        }
+        if multi {
+            ff |= form::flags::MULTI_SELECT;
+        }
+
+        let opt = Object::Array(options.iter().map(|o| pdf_text(o)).collect());
+        let value = selected.unwrap_or("");
+
+        let mut field = Dictionary::new();
+        field.set(b"FT", annot::name(b"Ch"));
+        field.set(b"T", pdf_text(name));
+        field.set(b"Opt", opt);
+        if ff != 0 {
+            field.set(b"Ff", Object::Integer(i64::from(ff)));
+        }
+        field.set(b"V", pdf_text(value));
+        field.set(b"DA", da);
+        if let Some(mk) = form::mk_dict(style) {
+            field.set(b"MK", Object::Dictionary(mk));
+        }
+
+        let ap_id = self.make_form_xobject(form::text_appearance(value, style, w, h), w, h, helv_id);
+        let mut ap = Dictionary::new();
+        ap.set(b"N", Object::Reference(ap_id));
+
+        field.set(b"Type", annot::name(b"Annot"));
+        field.set(b"Subtype", annot::name(b"Widget"));
+        field.set(b"Rect", annot::real_array(&rect));
+        field.set(b"F", Object::Integer(4));
+        field.set(b"P", Object::Reference(page_id));
+        field.set(b"AP", Object::Dictionary(ap));
+
+        let field_id = (self.next_object_number(), 0u16);
+        self.objects.insert(field_id, Object::Dictionary(field));
+        self.register_field(page_id, field_id)
     }
 
     // ─── destinations, hyperlinks & outline ──────────────────────────────────
@@ -3489,6 +4467,39 @@ fn postscript_name(family: &str) -> String {
     }
 }
 
+/// Linearly interpolate an SVG gradient's stops at `t` ∈ [0,1] → 8-bit RGB (for
+/// the shading function samples). Stop alpha is not applied (opaque shading).
+fn sample_svg_gradient(stops: &[crate::svg::GradStop], t: f64) -> [u8; 3] {
+    let to8 = |c: [f64; 3]| {
+        [
+            (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+        ]
+    };
+    let Some(first) = stops.first() else { return [0, 0, 0] };
+    let last = stops[stops.len() - 1];
+    if t <= first.offset {
+        return to8(first.rgb);
+    }
+    if t >= last.offset {
+        return to8(last.rgb);
+    }
+    for w in stops.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if t >= a.offset && t <= b.offset {
+            let span = (b.offset - a.offset).max(1e-9);
+            let f = ((t - a.offset) / span).clamp(0.0, 1.0);
+            return to8([
+                a.rgb[0] + (b.rgb[0] - a.rgb[0]) * f,
+                a.rgb[1] + (b.rgb[1] - a.rgb[1]) * f,
+                a.rgb[2] + (b.rgb[2] - a.rgb[2]) * f,
+            ]);
+        }
+    }
+    to8(last.rgb)
+}
+
 /// First index of `needle` within `haystack`.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
@@ -3791,7 +4802,7 @@ mod tests {
 
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let before = paths(&doc);
-        doc.add_rectangle(1, 50.0, 50.0, 200.0, 100.0, Some([0.0, 0.0, 0.0]), None, 1.5)
+        doc.add_rectangle(1, 50.0, 50.0, 200.0, 100.0, Some([0.0, 0.0, 0.0]), None, 1.5, 1.0)
             .unwrap();
 
         let reopened = Document::open(&doc.save()).unwrap();
@@ -3840,6 +4851,29 @@ mod tests {
         let reopened = Document::open(&doc.save()).unwrap();
         assert_eq!(reopened.get_metadata("Title"), Some("My Title".to_string()));
         assert_eq!(reopened.get_metadata("Author"), Some("Rony".to_string()));
+    }
+
+    #[test]
+    fn embeds_a_png_image_as_xobject() {
+        let pdf = crate::convert::reverse::txt_to_pdf("image host page");
+        let mut doc = Document::open(&pdf).unwrap();
+
+        // A 2x2 opaque RGB image with four distinct colours.
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
+        let png = crate::raster::png::encode_png(2, 2, &rgba);
+        doc.add_image(1, &png, 100.0, 100.0, 64.0, 64.0, 1.0).unwrap();
+
+        // Reopen the serialized document and confirm the image XObject survives.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let images = reopened.page_images(1);
+        let embedded = images
+            .values()
+            .find(|img| img.width == 2 && img.height == 2)
+            .expect("2x2 image XObject present after round-trip");
+        // PNG → Flate /DeviceRGB embed is lossless: the samples must match.
+        assert_eq!(embedded.rgba, rgba, "round-tripped pixels match the source");
     }
 
     #[test]
@@ -4152,11 +5186,107 @@ mod tests {
     fn renders_a_page_to_png() {
         // Add a vector rectangle so there is guaranteed ink, then rasterize.
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
-        doc.add_rectangle(1, 50.0, 50.0, 200.0, 100.0, None, Some([1.0, 0.0, 0.0]), 0.0)
+        doc.add_rectangle(1, 50.0, 50.0, 200.0, 100.0, None, Some([1.0, 0.0, 0.0]), 0.0, 1.0)
             .unwrap();
         let png = doc.render_page(1, 1.0).unwrap();
         assert_eq!(&png[0..4], &[0x89, b'P', b'N', b'G'], "valid PNG header");
         assert!(png.len() > 1000, "non-trivial PNG ({} bytes)", png.len());
+    }
+
+    #[test]
+    fn rasterizer_honours_png_smask_alpha() {
+        use crate::raster::png::encode_png;
+        // 2×2 RGBA: top-left fully transparent, the rest opaque red.
+        let rgba = [
+            255, 0, 0, 0, 255, 0, 0, 255, //
+            255, 0, 0, 255, 255, 0, 0, 255,
+        ];
+        let png = encode_png(2, 2, &rgba);
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("image host")).unwrap();
+        doc.add_image(1, &png, 100.0, 100.0, 50.0, 50.0, 1.0).unwrap();
+
+        // Re-open the serialized PDF and decode the image the way the rasterizer
+        // does: the `/SMask` must surface as per-pixel alpha (0 where transparent).
+        let reopened = Document::open(&doc.save()).unwrap();
+        let imgs = reopened.page_images(1);
+        assert_eq!(imgs.len(), 1, "one image XObject decoded");
+        let alphas: Vec<u8> = imgs.values().next().unwrap().rgba.chunks_exact(4).map(|p| p[3]).collect();
+        assert!(alphas.iter().any(|&a| a == 0), "transparent pixel survived: {alphas:?}");
+        assert!(alphas.iter().any(|&a| a == 255), "opaque pixels survived: {alphas:?}");
+    }
+
+    #[test]
+    fn add_svg_emits_native_vector_paths() {
+        let svg = r##"<svg viewBox="0 0 100 100">
+            <rect x="10" y="10" width="80" height="80" fill="#3366cc"/>
+            <circle cx="50" cy="50" r="20" fill="none" stroke="red" stroke-width="3"/>
+        </svg>"##;
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("svg host")).unwrap();
+        doc.add_svg(1, svg, 100.0, 100.0, 200.0, 200.0).unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        // Filled rectangle: fill colour set + `f` paint.
+        assert!(content.contains(" rg\n") && content.contains("\nf\n"), "filled rect ops: {content}");
+        // Stroked circle: stroke colour + width + `S` paint, with cubic arcs.
+        assert!(content.contains(" RG\n") && content.contains("\nS\n"), "stroked circle ops present");
+        assert!(content.contains(" c\n"), "circle emitted as cubic Bézier arcs");
+    }
+
+    #[test]
+    fn add_svg_gradient_emits_shading_pattern() {
+        let svg = r##"<svg viewBox="0 0 100 100"><defs>
+            <linearGradient id="g"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient>
+            </defs><rect x="0" y="0" width="100" height="100" fill="url(#g)"/></svg>"##;
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("svg grad host")).unwrap();
+        doc.add_svg(1, svg, 0.0, 0.0, 200.0, 200.0).unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(content.contains("/Pattern cs") && content.contains(" scn"), "shading-pattern fill: {content}");
+        // Round-trip: the Function/Shading objects serialize into a valid PDF.
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert_eq!(reopened.page_count(), 1, "gradient PDF re-opens");
+    }
+
+    #[test]
+    fn draw_color_glyph_emits_palette_filled_layers() {
+        use crate::font::truetype::TrueTypeFont;
+        use crate::font::GlyphSource;
+        // Pull a real embedded TrueType face out of the fixture.
+        let src = Document::open(&fixture("embedded-fonts.pdf")).unwrap();
+        let page = src.page_dict(1).unwrap();
+        let fonts = page
+            .get(b"Resources").map(|o| src.resolve(o)).and_then(Object::as_dict)
+            .and_then(|r| r.get(b"Font")).map(|o| src.resolve(o)).and_then(Object::as_dict)
+            .expect("page has a Font dict");
+        let face: TrueTypeFont = fonts
+            .0
+            .values()
+            .find_map(|v| match src.font_program(src.resolve(v).as_dict()?)? {
+                GlyphSource::TrueType(f) => Some(f),
+                _ => None,
+            })
+            .expect("an embedded TrueType face");
+        let gid = (1..face.num_glyphs())
+            .find(|&g| !face.glyph_polygons(g).is_empty())
+            .expect("a glyph with an outline");
+
+        // Synthesize a 1-layer colour glyph: base `gid` → layer `gid`, palette 0 = red.
+        let g = gid.to_be_bytes();
+        let mut colr = vec![0, 0, 0, 1, 0, 0, 0, 14, 0, 0, 0, 20, 0, 1];
+        colr.extend_from_slice(&[g[0], g[1], 0, 0, 0, 1]); // base: gid, first 0, num 1
+        colr.extend_from_slice(&[g[0], g[1], 0, 0]); // layer: gid, palette 0
+        let mut cpal = vec![0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 14, 0, 0];
+        cpal.extend_from_slice(&[0, 0, 255, 255]); // BGRA red
+        let colors = crate::font::color::ColorGlyphs::parse(&colr, &cpal).unwrap();
+
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("emoji host")).unwrap();
+        let adv = doc
+            .draw_color_glyph(1, &face, &colors, gid, 100.0, 100.0, 40.0, [0.0, 0.0, 0.0])
+            .unwrap();
+        assert!(adv > 0.0, "advance returned for pen movement");
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(
+            content.contains("1 0 0 rg") && content.contains("\nf\n"),
+            "colour layer filled in red"
+        );
     }
 
     #[test]
@@ -4191,5 +5321,70 @@ mod tests {
             let tofu = text.chars().filter(|&c| c == '\u{FFFD}').count();
             assert_eq!(tofu, 0, "{fixture_name}: no replacement chars, got {text:?}");
         }
+    }
+
+    #[test]
+    fn creates_all_acroform_field_types_round_trip() {
+        let pdf = crate::convert::reverse::txt_to_pdf("form host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        assert!(doc.form_fields().unwrap().is_empty(), "starts with no fields");
+        let style = form::FieldStyle::default();
+
+        doc.add_text_field(1, "fullname", [50.0, 700.0, 300.0, 720.0], "Jane", Some(40), false, false, &style)
+            .unwrap();
+        doc.add_checkbox(1, "subscribe", [50.0, 670.0, 64.0, 684.0], true, "Yes", &style)
+            .unwrap();
+        doc.add_radio_group(
+            1,
+            "plan",
+            &[
+                ("Basic".to_string(), [50.0, 640.0, 64.0, 654.0]),
+                ("Pro".to_string(), [80.0, 640.0, 94.0, 654.0]),
+            ],
+            Some("Pro"),
+            &style,
+        )
+        .unwrap();
+        doc.add_combo_box(1, "country", [50.0, 610.0, 200.0, 626.0], &["FR".into(), "US".into()], Some("FR"), false, &style)
+            .unwrap();
+        doc.add_list_box(1, "langs", [50.0, 560.0, 200.0, 600.0], &["en".into(), "fr".into()], None, true, &style)
+            .unwrap();
+
+        // Re-parse the serialized bytes and read the fields back.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let fields = reopened.form_fields().unwrap();
+        assert_eq!(fields.len(), 5, "five fields registered: {fields:#?}");
+        let by = |name: &str| fields.iter().find(|f| f.name == name).unwrap().clone();
+
+        let text = by("fullname");
+        assert_eq!(text.kind(), crate::form::FieldKind::Text);
+        assert_eq!(text.value, "Jane");
+        assert_eq!(text.max_len, Some(40));
+
+        let cb = by("subscribe");
+        assert_eq!(cb.kind(), crate::form::FieldKind::Checkbox);
+        assert_eq!(cb.value, "Yes");
+        assert!(cb.options.contains(&"Yes".to_string()));
+
+        let radio = by("plan");
+        assert_eq!(radio.kind(), crate::form::FieldKind::Radio);
+        assert_eq!(radio.value, "Pro");
+        assert!(radio.options.contains(&"Basic".to_string()) && radio.options.contains(&"Pro".to_string()));
+
+        let combo = by("country");
+        assert_eq!(combo.kind(), crate::form::FieldKind::ComboBox);
+        assert_eq!(combo.value, "FR");
+        assert_eq!(combo.options, vec!["FR".to_string(), "US".to_string()]);
+
+        let list = by("langs");
+        assert_eq!(list.kind(), crate::form::FieldKind::ListBox);
+        assert!(list.is_multi_select());
+        assert_eq!(list.options, vec!["en".to_string(), "fr".to_string()]);
+
+        // Every widget got a visible appearance stream (no reliance on the
+        // viewer regenerating from /V alone).
+        let saved = doc.save();
+        assert!(saved.windows(7).any(|w| w == b"/Tx BMC"), "text appearance present");
+        assert!(saved.windows(16).any(|w| w == b"/NeedAppearances"), "NeedAppearances set");
     }
 }

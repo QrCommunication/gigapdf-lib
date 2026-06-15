@@ -7,6 +7,7 @@
 pub mod catalog;
 pub mod cff;
 pub mod cmap;
+pub mod color;
 pub mod embed;
 pub mod google;
 pub mod truetype;

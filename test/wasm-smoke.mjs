@@ -151,6 +151,82 @@ check(valueOf("agree") === "Yes", "checkbox value survived round-trip");
 check(valueOf("country") === "Germany", "choice value survived round-trip");
 ex.gp_close(fh2);
 
+// 7b. interactive forms CREATION: build every field type via the WASM ABI,
+// save, reopen, and confirm each field reads back with the right kind/value.
+{
+  const host = argStr("blank form host page");
+  const blank = readBufferReturning((lp) => ex.gp_txt_to_pdf(host.ptr, host.len, lp));
+  freeArg(host);
+  const bPtr = toWasm(blank);
+  const ch = ex.gp_open(bPtr, blank.length);
+  ex.gp_free(bPtr, blank.length);
+  check(ch !== 0, "blank host PDF opens for field creation");
+
+  // packed style: fontSize 0 (auto), black text, black border (has=1),
+  // no background (has=0), border width 1.
+  const style = [0, 0x000000, 0x000000, 1, 0x000000, 0, 1];
+
+  {
+    const n = argStr("fullname"), v = argStr("Jane");
+    check(
+      ex.gp_add_text_field(ch, 1, n.ptr, n.len, 50, 700, 300, 720, v.ptr, v.len, 40, 0, 0, ...style) === 0,
+      "gp_add_text_field fullname",
+    );
+    freeArg(n); freeArg(v);
+  }
+  {
+    const n = argStr("subscribe"), e = argStr("Yes");
+    check(
+      ex.gp_add_checkbox(ch, 1, n.ptr, n.len, 50, 670, 64, 684, 1, e.ptr, e.len, ...style) === 0,
+      "gp_add_checkbox subscribe",
+    );
+    freeArg(n); freeArg(e);
+  }
+  {
+    const n = argStr("plan"), exps = argStr("Basic\nPro");
+    const rects = argStr("50,640,64,654,80,640,94,654"), sel = argStr("Pro");
+    check(
+      ex.gp_add_radio_group(ch, 1, n.ptr, n.len, exps.ptr, exps.len, rects.ptr, rects.len, sel.ptr, sel.len, ...style) === 0,
+      "gp_add_radio_group plan",
+    );
+    freeArg(n); freeArg(exps); freeArg(rects); freeArg(sel);
+  }
+  {
+    const n = argStr("country"), o = argStr("FR\nUS"), sel = argStr("FR");
+    check(
+      ex.gp_add_combo_box(ch, 1, n.ptr, n.len, 50, 610, 200, 626, o.ptr, o.len, sel.ptr, sel.len, 0, ...style) === 0,
+      "gp_add_combo_box country",
+    );
+    freeArg(n); freeArg(o); freeArg(sel);
+  }
+  {
+    const n = argStr("langs"), o = argStr("en\nfr"), sel = argStr("");
+    check(
+      ex.gp_add_list_box(ch, 1, n.ptr, n.len, 50, 560, 200, 600, o.ptr, o.len, sel.ptr, sel.len, 1, ...style) === 0,
+      "gp_add_list_box langs",
+    );
+    freeArg(n); freeArg(o); freeArg(sel);
+  }
+
+  const made = readBufferReturning((lp) => ex.gp_save(ch, lp));
+  ex.gp_close(ch);
+  const mPtr2 = toWasm(made);
+  const ch2 = ex.gp_open(mPtr2, made.length);
+  ex.gp_free(mPtr2, made.length);
+  const created = JSON.parse(dec.decode(readBufferReturning((lp) => ex.gp_fields_json(ch2, lp))));
+  check(created.length === 5, `created 5 fields via ABI (${created.length})`);
+  const kindOf = Object.fromEntries(created.map((f) => [f.name, f.kind]));
+  check(kindOf.fullname === "text", "created text field");
+  check(kindOf.subscribe === "checkbox", "created checkbox");
+  check(kindOf.plan === "radio", "created radio group");
+  check(kindOf.country === "combo", "created combo box");
+  check(kindOf.langs === "list", "created list box");
+  const valOf = (n) => created.find((f) => f.name === n)?.value;
+  check(valOf("fullname") === "Jane", "created text field value");
+  check(valOf("plan") === "Pro", "created radio selection");
+  ex.gp_close(ch2);
+}
+
 // 8. page ops + annotations + metadata through the WASM ABI
 const multi = readFileSync("fixtures/multi-page.pdf");
 const mPtr = toWasm(multi);
@@ -483,6 +559,63 @@ const reopenPdf = (bytes, label) => {
   freeArg(h);
   const text = reopenPdf(pdf, "gp_html_to_pdf");
   check(text.includes("Second & line"), "html→PDF preserves escaped text");
+}
+
+// 12c. page-size presets + full page control (per-side margins, running footer)
+{
+  const nm = argStr("A4");
+  const outPtr = ex.gp_alloc(16);
+  const ok = ex.gp_page_size(nm.ptr, nm.len, outPtr, outPtr + 8);
+  freeArg(nm);
+  const pw = dv().getFloat64(outPtr, true);
+  const ph = dv().getFloat64(outPtr + 8, true);
+  ex.gp_free(outPtr, 16);
+  check(
+    ok === 1 && Math.abs(pw - 595.28) < 0.1 && Math.abs(ph - 841.89) < 0.1,
+    `gp_page_size("A4") → ${pw.toFixed(1)}×${ph.toFixed(1)}pt`
+  );
+
+  const body = argStr("<div>" + "<p>line</p>".repeat(120) + "</div>");
+  const footer = argStr('<div style="text-align:center">Page {{page}} / {{pages}}</div>');
+  const pdf = readBufferReturning((lp) =>
+    ex.gp_html_render_opts(
+      body.ptr,
+      body.len,
+      0,
+      0, // no fonts
+      pw,
+      ph,
+      48,
+      36,
+      48,
+      36, // margins t/r/b/l
+      0,
+      0, // no header
+      footer.ptr,
+      footer.len,
+      18,
+      18, // header/footer offsets
+      1, // start page number
+      lp
+    )
+  );
+  freeArg(body);
+  freeArg(footer);
+  check(
+    dec.decode(pdf.subarray(0, 5)) === "%PDF-" && pdf.length > 400,
+    `gp_html_render_opts → A4 PDF w/ footer (${pdf.length} b)`
+  );
+}
+
+// 12d. SVG → native vector paths on a page
+{
+  const svg = argStr(
+    '<svg viewBox="0 0 10 10"><rect width="10" height="10" fill="#0088cc"/>' +
+      '<circle cx="5" cy="5" r="3" fill="none" stroke="red" stroke-width="1"/></svg>'
+  );
+  const rc = ex.gp_add_svg(mh, 1, svg.ptr, svg.len, 50, 50, 100, 100);
+  freeArg(svg);
+  check(rc === 0, `gp_add_svg → native vector on page 1 (rc=${rc})`);
 }
 
 // 13. PDF/A archival metadata

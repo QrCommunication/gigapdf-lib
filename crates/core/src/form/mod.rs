@@ -161,3 +161,180 @@ impl FormField {
             && !self.is_read_only()
     }
 }
+
+// ─── field *creation* ────────────────────────────────────────────────────────
+//
+// The reading model above describes existing fields; the pieces below help
+// *build* new ones. They are pure (no object-id allocation): a builder returns a
+// `/MK` characteristics dict and/or an appearance content stream, and
+// `Document` allocates the objects, appends to the page `/Annots` and registers
+// the field in the AcroForm.
+
+use crate::object::{Dictionary, Object, StringKind};
+
+/// Visual styling applied to a newly created field.
+#[derive(Debug, Clone)]
+pub struct FieldStyle {
+    /// Text size in points; `0.0` requests auto-size (`/DA … 0 Tf`).
+    pub font_size: f64,
+    /// Text / mark colour (RGB, components in `0.0..=1.0`).
+    pub color: [f64; 3],
+    /// Border colour (RGB), or `None` for no visible border.
+    pub border: Option<[f64; 3]>,
+    /// Background fill (RGB), or `None` for transparent.
+    pub background: Option<[f64; 3]>,
+    /// Border width in points.
+    pub border_width: f64,
+}
+
+impl Default for FieldStyle {
+    fn default() -> Self {
+        FieldStyle {
+            font_size: 0.0,
+            color: [0.0, 0.0, 0.0],
+            border: Some([0.0, 0.0, 0.0]),
+            background: None,
+            border_width: 1.0,
+        }
+    }
+}
+
+/// Format a coordinate compactly: up to 3 decimals, trailing zeros trimmed.
+fn n(v: f64) -> String {
+    let mut s = format!("{v:.3}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// Escape a string for use as a `( … )` literal operand inside a content
+/// stream: backslash, parentheses, and control bytes.
+fn escape_stream_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for b in s.bytes() {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'(' => out.push_str("\\("),
+            b')' => out.push_str("\\)"),
+            b'\r' => out.push_str("\\r"),
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(b as char),
+            other => out.push_str(&format!("\\{other:03o}")),
+        }
+    }
+    out
+}
+
+/// The default-appearance string (`/DA`): font, size and colour for the field's
+/// variable text. `/Helv` resolves through the AcroForm `/DR`.
+pub(crate) fn da_string(style: &FieldStyle) -> Object {
+    let [r, g, b] = style.color;
+    let da = format!("/Helv {} Tf {} {} {} rg", n(style.font_size), n(r), n(g), n(b));
+    Object::String(da.into_bytes(), StringKind::Literal)
+}
+
+/// The widget `/MK` appearance-characteristics dict (border + background), or
+/// `None` when the field has neither.
+pub(crate) fn mk_dict(style: &FieldStyle) -> Option<Dictionary> {
+    if style.border.is_none() && style.background.is_none() {
+        return None;
+    }
+    let rgb = |c: [f64; 3]| Object::Array(c.iter().map(|v| Object::Real(*v)).collect());
+    let mut mk = Dictionary::new();
+    if let Some(bc) = style.border {
+        mk.set(b"BC", rgb(bc));
+    }
+    if let Some(bg) = style.background {
+        mk.set(b"BG", rgb(bg));
+    }
+    Some(mk)
+}
+
+/// Draw the field's background fill and border, in the box `[0,0,w,h]`. Shared
+/// prefix for every appearance stream so the static `/AP` matches the `/MK`.
+fn box_decoration(style: &FieldStyle, w: f64, h: f64) -> String {
+    let mut s = String::new();
+    if let Some([r, g, b]) = style.background {
+        s.push_str(&format!("{} {} {} rg\n0 0 {} {} re\nf\n", n(r), n(g), n(b), n(w), n(h)));
+    }
+    if let Some([r, g, b]) = style.border {
+        if style.border_width > 0.0 {
+            let bw = style.border_width;
+            let i = bw / 2.0;
+            s.push_str(&format!(
+                "{} {} {} RG\n{} w\n{} {} {} {} re\nS\n",
+                n(r), n(g), n(b), n(bw), n(i), n(i), n(w - bw), n(h - bw)
+            ));
+        }
+    }
+    s
+}
+
+/// Concrete on-glyph text size for a static appearance (resolves auto-size to a
+/// value that fits the box).
+fn resolved_size(style: &FieldStyle, h: f64) -> f64 {
+    if style.font_size > 0.0 {
+        style.font_size
+    } else {
+        (h - 4.0).clamp(4.0, 12.0)
+    }
+}
+
+/// Appearance content for a text / choice field showing `value` on one line.
+pub(crate) fn text_appearance(value: &str, style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
+    let size = resolved_size(style, h);
+    let pad = 2.0;
+    let ty = ((h - size) / 2.0 + size * 0.2).max(pad);
+    let [r, g, b] = style.color;
+    let mut s = box_decoration(style, w, h);
+    s.push_str("/Tx BMC\nq\nBT\n");
+    s.push_str(&format!("/Helv {} Tf\n", n(size)));
+    s.push_str(&format!("{} {} {} rg\n", n(r), n(g), n(b)));
+    s.push_str(&format!("{} {} Td\n", n(pad), n(ty)));
+    s.push_str(&format!("({}) Tj\n", escape_stream_literal(value)));
+    s.push_str("ET\nQ\nEMC\n");
+    s.into_bytes()
+}
+
+/// Appearance content for a checked checkbox: the box decoration plus a tick
+/// drawn as vector strokes (no font dependency).
+pub(crate) fn check_appearance(style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
+    let [r, g, b] = style.color;
+    let lw = (w.min(h) * 0.1).max(0.6);
+    let mut s = box_decoration(style, w, h);
+    s.push_str(&format!("{} {} {} RG\n{} w\n1 J 1 j\n", n(r), n(g), n(b), n(lw)));
+    s.push_str(&format!("{} {} m\n", n(w * 0.22), n(h * 0.50)));
+    s.push_str(&format!("{} {} l\n", n(w * 0.42), n(h * 0.28)));
+    s.push_str(&format!("{} {} l\nS\n", n(w * 0.80), n(h * 0.75)));
+    s.into_bytes()
+}
+
+/// Appearance content for a selected radio button: a filled dot (a circle
+/// approximated by four cubic Béziers).
+pub(crate) fn radio_appearance(style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
+    let [r, g, b] = style.color;
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let rad = w.min(h) * 0.3;
+    let k = 0.5523 * rad;
+    let mut s = box_decoration(style, w, h);
+    s.push_str(&format!("{} {} {} rg\n", n(r), n(g), n(b)));
+    s.push_str(&format!("{} {} m\n", n(cx + rad), n(cy)));
+    s.push_str(&format!("{} {} {} {} {} {} c\n", n(cx + rad), n(cy + k), n(cx + k), n(cy + rad), n(cx), n(cy + rad)));
+    s.push_str(&format!("{} {} {} {} {} {} c\n", n(cx - k), n(cy + rad), n(cx - rad), n(cy + k), n(cx - rad), n(cy)));
+    s.push_str(&format!("{} {} {} {} {} {} c\n", n(cx - rad), n(cy - k), n(cx - k), n(cy - rad), n(cx), n(cy - rad)));
+    s.push_str(&format!("{} {} {} {} {} {} c\nf\n", n(cx + k), n(cy - rad), n(cx + rad), n(cy - k), n(cx + rad), n(cy)));
+    s.into_bytes()
+}
+
+/// Appearance content for the empty (Off / unfocused) state — just the box
+/// decoration, no glyph.
+pub(crate) fn empty_appearance(style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
+    box_decoration(style, w, h).into_bytes()
+}

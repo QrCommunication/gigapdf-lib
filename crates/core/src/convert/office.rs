@@ -267,6 +267,159 @@ xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
     )
 }
 
+/// Export pages to an editable OpenDocument Presentation (`.odp`): one slide per
+/// page, each text run a positioned text box, each image a picture, each shape a
+/// rectangle — real editable objects (never a page raster).
+pub fn to_odp(pages: &[ConvPage]) -> Vec<u8> {
+    let (pw, ph) = pages
+        .first()
+        .map(|p| (p.width, p.height))
+        .unwrap_or((792.0, 612.0));
+    let mut zip = ZipWriter::new();
+
+    // The mimetype entry must be first and stored uncompressed (ODF §3.3).
+    zip.add_stored("mimetype", b"application/vnd.oasis.opendocument.presentation");
+
+    let mut images: Vec<&PlacedImage> = Vec::new();
+    let content = odp_content_xml(pages, &mut images);
+    zip.add_deflated("content.xml", content.as_bytes());
+    zip.add_deflated("styles.xml", odp_styles_xml(pw, ph).as_bytes());
+    zip.add_deflated("META-INF/manifest.xml", odp_manifest_xml(images.len()).as_bytes());
+    for (i, img) in images.iter().enumerate() {
+        zip.add_deflated(&format!("Pictures/img{}.png", i + 1), &img.png);
+    }
+    zip.finish()
+}
+
+fn odp_styles_xml(pw: f64, ph: f64) -> String {
+    let orient = if ph >= pw { "portrait" } else { "landscape" };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<office:document-styles xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
+xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" \
+xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" office:version=\"1.3\">\
+<office:automatic-styles>\
+<style:page-layout style:name=\"pm1\">\
+<style:page-layout-properties fo:page-width=\"{w}pt\" fo:page-height=\"{h}pt\" \
+fo:margin-top=\"0pt\" fo:margin-bottom=\"0pt\" fo:margin-left=\"0pt\" fo:margin-right=\"0pt\" \
+style:print-orientation=\"{o}\"/></style:page-layout></office:automatic-styles>\
+<office:master-styles>\
+<style:master-page style:name=\"Default\" style:page-layout-name=\"pm1\"/>\
+</office:master-styles></office:document-styles>",
+        w = num(pw),
+        h = num(ph),
+        o = orient
+    )
+}
+
+fn odp_manifest_xml(image_count: usize) -> String {
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<manifest:manifest xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\" manifest:version=\"1.3\">\
+<manifest:file-entry manifest:full-path=\"/\" manifest:version=\"1.3\" manifest:media-type=\"application/vnd.oasis.opendocument.presentation\"/>\
+<manifest:file-entry manifest:full-path=\"content.xml\" manifest:media-type=\"text/xml\"/>\
+<manifest:file-entry manifest:full-path=\"styles.xml\" manifest:media-type=\"text/xml\"/>",
+    );
+    for i in 0..image_count {
+        s.push_str(&format!(
+            "<manifest:file-entry manifest:full-path=\"Pictures/img{}.png\" manifest:media-type=\"image/png\"/>",
+            i + 1
+        ));
+    }
+    s.push_str("</manifest:manifest>");
+    s
+}
+
+/// Build an ODP content.xml: one `<draw:page>` per page, each carrying the
+/// positioned text/image/shape frames. Mirrors `odt_content_xml` but the frames
+/// are direct children of the slide (no text anchor).
+fn odp_content_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage>) -> String {
+    let mut auto = String::new();
+    let mut body = String::new();
+
+    auto.push_str(
+        "<style:style style:name=\"dp1\" style:family=\"drawing-page\">\
+<style:drawing-page-properties draw:fill=\"none\" draw:background-size=\"border\"/></style:style>\
+<style:style style:name=\"frT\" style:family=\"graphic\">\
+<style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\" \
+draw:auto-grow-width=\"false\" draw:auto-grow-height=\"false\" fo:padding=\"0pt\" \
+draw:textarea-vertical-align=\"top\"/></style:style>\
+<style:style style:name=\"frI\" style:family=\"graphic\">\
+<style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\"/></style:style>\
+<style:style style:name=\"frS\" style:family=\"graphic\">\
+<style:graphic-properties draw:fill=\"none\" draw:stroke=\"solid\" \
+svg:stroke-width=\"0.5pt\" svg:stroke-color=\"#808080\"/></style:style>",
+    );
+
+    let mut style_id = 0usize;
+    for page in pages {
+        body.push_str("<draw:page draw:style-name=\"dp1\" draw:master-page-name=\"Default\">");
+
+        for t in &page.texts {
+            let size = t.height.max(1.0);
+            auto.push_str(&format!(
+                "<style:style style:name=\"T{style_id}\" style:family=\"paragraph\">{props}</style:style>",
+                props = odt_text_props(&t.style, size)
+            ));
+            body.push_str(&format!(
+                "<draw:frame draw:style-name=\"frT\" draw:layer=\"layout\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">\
+<draw:text-box><text:p text:style-name=\"T{style_id}\">",
+                x = num(t.x),
+                y = num(t.y),
+                w = num(t.width.max(1.0)),
+                h = num(t.height.max(1.0)),
+            ));
+            esc(&t.text, &mut body);
+            body.push_str("</text:p></draw:text-box></draw:frame>");
+            style_id += 1;
+        }
+
+        for img in &page.images {
+            images.push(img);
+            let n = images.len();
+            body.push_str(&format!(
+                "<draw:frame draw:style-name=\"frI\" draw:layer=\"layout\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">\
+<draw:image xlink:href=\"Pictures/img{n}.png\" xlink:type=\"simple\" xlink:show=\"embed\" \
+xlink:actuate=\"onLoad\"/></draw:frame>",
+                x = num(img.x),
+                y = num(img.y),
+                w = num(img.width.max(1.0)),
+                h = num(img.height.max(1.0)),
+            ));
+        }
+
+        for s in &page.shapes {
+            body.push_str(&format!(
+                "<draw:rect draw:style-name=\"frS\" draw:layer=\"layout\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>",
+                x = num(s.x),
+                y = num(s.y),
+                w = num(s.width.max(1.0)),
+                h = num(s.height.max(1.0)),
+            ));
+        }
+
+        body.push_str("</draw:page>");
+    }
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
+xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" \
+xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
+xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" \
+xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
+xmlns:presentation=\"urn:oasis:names:tc:opendocument:xmlns:presentation:1.0\" \
+xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
+<office:automatic-styles>{auto}</office:automatic-styles>\
+<office:body><office:presentation>{body}</office:presentation></office:body></office:document-content>"
+    )
+}
+
 // ─────────────────────────────── DOCX (OOXML) ───────────────────────────────
 
 /// English Metric Units per point (914400 EMU/inch ÷ 72 pt/inch).
@@ -1068,5 +1221,27 @@ mod tests {
         let pres = String::from_utf8(entry(&zip, "ppt/presentation.xml").unwrap()).unwrap();
         assert!(pres.contains("p:sldSz"), "slide size set from page");
         assert_eq!(pres.matches("<p:sldId ").count(), 1, "one slide per page");
+    }
+
+    #[test]
+    fn to_odp_is_a_presentation_with_slides() {
+        let zip = to_odp(&sample_pages());
+        assert_eq!(
+            entry(&zip, "mimetype").unwrap(),
+            b"application/vnd.oasis.opendocument.presentation"
+        );
+        for part in ["content.xml", "styles.xml", "META-INF/manifest.xml"] {
+            assert!(entry(&zip, part).is_some(), "missing {part}");
+        }
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(content.contains("<office:presentation>"), "presentation body");
+        assert!(content.contains("<draw:page "), "one draw:page per slide");
+        assert!(content.contains("<draw:text-box>"), "text as a positioned box");
+        assert!(
+            content.contains("Hello &lt;World&gt; &amp; co"),
+            "escaped run text"
+        );
+        let styles = String::from_utf8(entry(&zip, "styles.xml").unwrap()).unwrap();
+        assert!(styles.contains("style:master-page"), "master page present");
     }
 }

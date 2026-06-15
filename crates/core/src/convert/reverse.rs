@@ -259,6 +259,27 @@ pub fn ods_to_pdf(bytes: &[u8]) -> Vec<u8> {
     )])
 }
 
+/// ODP → PDF (one page per slide; text runs from `draw:text-box`).
+pub fn odp_to_pdf(bytes: &[u8]) -> Vec<u8> {
+    let zip = super::zip::read_zip(bytes);
+    let xml = zip
+        .get("content.xml")
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    // Slides are `<draw:page>`; their text lives in `<text:p>` runs.
+    let sections: Vec<Vec<String>> = xml
+        .split("<draw:page")
+        .skip(1)
+        .map(|slide| paragraphs_from_xml(slide, &["</text:p>"], &[]))
+        .collect();
+    let sections = if sections.is_empty() {
+        vec![Vec::new()]
+    } else {
+        sections
+    };
+    flow_to_pdf(&sections)
+}
+
 /// Auto-detect an Office container and convert to PDF. Returns `None` if the
 /// bytes are not a recognized OOXML/ODF archive.
 pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -276,12 +297,7 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
         } else if mt.contains("opendocument.spreadsheet") {
             Some(ods_to_pdf(bytes))
         } else if mt.contains("opendocument.presentation") {
-            // ODP: text runs live in content.xml draw:text-box like ODT.
-            let xml = zip
-                .get("content.xml")
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default();
-            Some(flow_to_pdf(&[paragraphs_from_xml(&xml, &["</text:p>"], &[])]))
+            Some(odp_to_pdf(bytes))
         } else {
             None
         }

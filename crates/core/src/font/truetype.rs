@@ -36,6 +36,11 @@ pub struct TrueTypeFont {
     hmtx: usize,
     num_h_metrics: u16,
     cmap: Vec<CmapSub>,
+    /// `(offset, len)` of the `COLR` / `CPAL` colour-font tables, if present.
+    colr: Option<(usize, usize)>,
+    cpal: Option<(usize, usize)>,
+    /// `(offset, len)` of the `sbix` bitmap-emoji table, if present.
+    sbix: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +119,10 @@ impl TrueTypeFont {
             cmap.sort_by(|a, b| b.score.cmp(&a.score));
         }
 
+        let colr = tables.get(b"COLR").copied();
+        let cpal = tables.get(b"CPAL").copied();
+        let sbix = tables.get(b"sbix").copied();
+
         Some(TrueTypeFont {
             data,
             units_per_em,
@@ -123,7 +132,27 @@ impl TrueTypeFont {
             hmtx,
             num_h_metrics,
             cmap,
+            colr,
+            cpal,
+            sbix,
         })
+    }
+
+    /// Parse the font's `sbix` bitmap-emoji table, if present (Apple colour
+    /// emoji). `None` for ordinary fonts.
+    pub fn sbix_glyphs(&self) -> Option<super::color::Sbix> {
+        let (o, l) = self.sbix?;
+        super::color::Sbix::parse(self.data.get(o..o + l)?, self.num_glyphs)
+    }
+
+    /// Parse the font's COLR/CPAL colour-glyph tables, if it has them (colour
+    /// emoji). `None` for ordinary monochrome fonts.
+    pub fn color_glyphs(&self) -> Option<super::color::ColorGlyphs> {
+        let (co, cl) = self.colr?;
+        let (po, pl) = self.cpal?;
+        let colr = self.data.get(co..co + cl)?;
+        let cpal = self.data.get(po..po + pl)?;
+        super::color::ColorGlyphs::parse(colr, cpal)
     }
 
     /// Font design units per em (the outline coordinate scale).

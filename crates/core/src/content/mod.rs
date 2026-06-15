@@ -7,7 +7,9 @@
 //! inline images (`BI…EI`, captured verbatim) — round-trips unchanged, so the
 //! background is preserved by construction.
 
+pub mod image;
 mod interpret;
+pub mod svg_path;
 
 use std::collections::BTreeMap;
 
@@ -784,6 +786,111 @@ pub fn line_ops(x1: f64, y1: f64, x2: f64, y2: f64, stroke: Rgb, line_width: f64
     out.extend_from_slice(format!("{} {} m\n", num(x1), num(y1)).as_bytes());
     out.extend_from_slice(format!("{} {} l\n", num(x2), num(y2)).as_bytes());
     out.extend_from_slice(b"S\nQ\n");
+    out
+}
+
+/// Build content-stream bytes that draw an ellipse centered at `(cx, cy)` with
+/// radii `(rx, ry)`, approximated by four cubic Béziers. Stroked, filled or both.
+pub fn ellipse_ops(
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+    stroke: Option<Rgb>,
+    fill: Option<Rgb>,
+    line_width: f64,
+) -> Vec<u8> {
+    const K: f64 = 0.552_284_749_8; // 4/3 * (sqrt(2) - 1) — circle→Bézier constant
+    let (kx, ky) = (rx * K, ry * K);
+    let mut out = Vec::new();
+    out.extend_from_slice(b"q\n");
+    if let Some([r, g, b]) = fill {
+        out.extend_from_slice(format!("{} {} {} rg\n", num(r), num(g), num(b)).as_bytes());
+    }
+    if let Some([r, g, b]) = stroke {
+        out.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+    }
+    out.extend_from_slice(format!("{} w\n", num(line_width)).as_bytes());
+    let c = |x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64| {
+        format!(
+            "{} {} {} {} {} {} c\n",
+            num(x1),
+            num(y1),
+            num(x2),
+            num(y2),
+            num(x3),
+            num(y3)
+        )
+    };
+    out.extend_from_slice(format!("{} {} m\n", num(cx + rx), num(cy)).as_bytes());
+    out.extend_from_slice(c(cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry).as_bytes());
+    out.extend_from_slice(c(cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy).as_bytes());
+    out.extend_from_slice(c(cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry).as_bytes());
+    out.extend_from_slice(c(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy).as_bytes());
+    let paint: &[u8] = match (fill.is_some(), stroke.is_some()) {
+        (true, true) => b"B\n",
+        (true, false) => b"f\n",
+        _ => b"S\n",
+    };
+    out.extend_from_slice(paint);
+    out.extend_from_slice(b"Q\n");
+    out
+}
+
+/// Build content-stream bytes for a polyline/polygon through `points` (PDF
+/// user-space). `close` joins the last point back to the first. Stroked, filled
+/// or both. Empty when fewer than two points.
+pub fn polygon_ops(
+    points: &[(f64, f64)],
+    close: bool,
+    stroke: Option<Rgb>,
+    fill: Option<Rgb>,
+    line_width: f64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    if points.len() < 2 {
+        return out;
+    }
+    out.extend_from_slice(b"q\n");
+    if let Some([r, g, b]) = fill {
+        out.extend_from_slice(format!("{} {} {} rg\n", num(r), num(g), num(b)).as_bytes());
+    }
+    if let Some([r, g, b]) = stroke {
+        out.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+    }
+    out.extend_from_slice(format!("{} w\n", num(line_width)).as_bytes());
+    let (x0, y0) = points[0];
+    out.extend_from_slice(format!("{} {} m\n", num(x0), num(y0)).as_bytes());
+    for &(x, y) in &points[1..] {
+        out.extend_from_slice(format!("{} {} l\n", num(x), num(y)).as_bytes());
+    }
+    if close {
+        out.extend_from_slice(b"h\n");
+    }
+    let paint: &[u8] = match (fill.is_some(), stroke.is_some()) {
+        (true, true) => b"B\n",
+        (true, false) => b"f\n",
+        _ if close => b"s\n",
+        _ => b"S\n",
+    };
+    out.extend_from_slice(paint);
+    out.extend_from_slice(b"Q\n");
+    out
+}
+
+/// Build content-stream bytes that draw the image XObject named `name` (already
+/// registered in the page's `/Resources /XObject`) into the rectangle at
+/// `(x, y)` with size `(w, h)` in PDF user space. Opacity, if any, is applied by
+/// the caller wrapping this in an `/ExtGState` block.
+pub fn image_ops(name: &[u8], x: f64, y: f64, w: f64, h: f64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"q\n");
+    // An image XObject is drawn through the unit square: this CTM scales it to
+    // (w, h) and translates it to (x, y).
+    out.extend_from_slice(format!("{} 0 0 {} {} {} cm\n", num(w), num(h), num(x), num(y)).as_bytes());
+    out.push(b'/');
+    out.extend_from_slice(name);
+    out.extend_from_slice(b" Do\nQ\n");
     out
 }
 

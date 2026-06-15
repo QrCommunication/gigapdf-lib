@@ -9,6 +9,7 @@ pub mod canvas;
 pub mod ocr;
 pub mod ocr_model;
 pub mod png;
+pub mod png_decode;
 pub mod render;
 
 pub use canvas::Canvas;
