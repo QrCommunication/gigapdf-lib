@@ -156,6 +156,19 @@ pub struct EncryptionInfo {
     pub revision: i32,
 }
 
+/// Adobe AFM advance widths (per 1000 em) for the standard **Helvetica** font,
+/// for printable ASCII `0x20..=0x7E`. Used by [`Document::helvetica_width`] to
+/// position watermark text. Characters outside this range fall back to `556`.
+#[rustfmt::skip]
+const HELVETICA_AFM: [u16; 95] = [
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, // 0x20-0x2F
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, // 0x30-0x3F
+    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, // 0x40-0x4F
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, // 0x50-0x5F
+    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, // 0x60-0x6F
+    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,       // 0x70-0x7E
+];
+
 impl Document {
     /// Parse a PDF from raw bytes.
     pub fn open(bytes: &[u8]) -> Result<Self> {
@@ -2295,6 +2308,102 @@ impl Document {
         self.set_page_content(page_no, content)?;
         self.register_page_font(page_no, res_name.as_bytes(), (font_obj, 0))?;
         Ok(())
+    }
+
+    /// Stamp a watermark: `text` drawn in standard **Helvetica** (no font embed
+    /// needed) at `(x, y)`, rotated `rotation_deg` degrees counter-clockwise,
+    /// with `color` (RGB 0–1) and `opacity` (0–1). Used for diagonal/corner
+    /// watermarks over an existing page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_watermark(
+        &mut self,
+        page_no: u32,
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        color: [f64; 3],
+        opacity: f64,
+        rotation_deg: f64,
+    ) -> Result<()> {
+        let res_name = self.ensure_helvetica_font(page_no)?;
+        let (sin, cos) = rotation_deg.to_radians().sin_cos();
+
+        let mut inner: Vec<u8> = Vec::new();
+        inner.extend_from_slice(b"q\n");
+        inner.extend_from_slice(
+            format!(
+                "{} {} {} rg\nBT\n/",
+                content::num(color[0]),
+                content::num(color[1]),
+                content::num(color[2]),
+            )
+            .as_bytes(),
+        );
+        inner.extend_from_slice(&res_name);
+        inner.extend_from_slice(format!(" {} Tf\n", content::num(size)).as_bytes());
+        // Text matrix carries the rotation: [cos sin -sin cos x y].
+        inner.extend_from_slice(
+            format!(
+                "{} {} {} {} {} {} Tm\n",
+                content::num(cos),
+                content::num(sin),
+                content::num(-sin),
+                content::num(cos),
+                content::num(x),
+                content::num(y),
+            )
+            .as_bytes(),
+        );
+        inner.push(b'(');
+        for &byte in &crate::font::encode_winansi(text) {
+            if byte == b'(' || byte == b')' || byte == b'\\' {
+                inner.push(b'\\');
+            }
+            inner.push(byte);
+        }
+        inner.extend_from_slice(b") Tj\nET\nQ\n");
+
+        let ops = self.with_opacity(page_no, inner, opacity)?;
+        let mut content = self.page_content(page_no)?;
+        content.extend_from_slice(&ops);
+        self.set_page_content(page_no, content)?;
+        Ok(())
+    }
+
+    /// Register a standard `/Type1 /Helvetica /WinAnsiEncoding` font as a page
+    /// resource and return its resource name.
+    fn ensure_helvetica_font(&mut self, page_no: u32) -> Result<Vec<u8>> {
+        let id = (self.next_object_number(), 0u16);
+        let mut f = Dictionary::new();
+        f.set(b"Type".to_vec(), Object::Name(b"Font".to_vec()));
+        f.set(b"Subtype".to_vec(), Object::Name(b"Type1".to_vec()));
+        f.set(b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec()));
+        f.set(
+            b"Encoding".to_vec(),
+            Object::Name(b"WinAnsiEncoding".to_vec()),
+        );
+        self.objects.insert(id, Object::Dictionary(f));
+        let res_name = b"GpHelv".to_vec();
+        self.register_page_font(page_no, &res_name, id)?;
+        Ok(res_name)
+    }
+
+    /// Width of `text` set in standard Helvetica at `size` points (AFM metrics);
+    /// lets a host position watermark/header text without embedding a font.
+    pub fn helvetica_width(text: &str, size: f64) -> f64 {
+        let units: u32 = text
+            .chars()
+            .map(|ch| {
+                let c = ch as u32;
+                if (0x20..=0x7E).contains(&c) {
+                    HELVETICA_AFM[(c - 0x20) as usize] as u32
+                } else {
+                    556
+                }
+            })
+            .sum();
+        units as f64 * size / 1000.0
     }
 
     /// List the `/BaseFont` names that the document **references but does not
@@ -5598,6 +5707,40 @@ mod tests {
         assert_eq!(info.version, 5);
         assert_eq!(info.revision, 6);
         assert_eq!(info.permissions, -44);
+    }
+
+    #[test]
+    fn add_watermark_stamps_rotated_text() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        doc.add_watermark(
+            1,
+            100.0,
+            400.0,
+            48.0,
+            "CONFIDENTIAL",
+            [0.5, 0.5, 0.5],
+            0.3,
+            45.0,
+        )
+        .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(
+            content.contains("(CONFIDENTIAL) Tj"),
+            "watermark text drawn"
+        );
+        assert!(content.contains("Tm"), "rotation via text matrix");
+        assert!(content.contains(" gs"), "opacity via ExtGState");
+        // Serializes + re-opens cleanly (standard Helvetica needs no embedding).
+        let saved = doc.save();
+        assert!(Document::open(&saved).is_ok());
+    }
+
+    #[test]
+    fn helvetica_width_matches_afm() {
+        // Space is 278/1000 em; "AV" = 667 + 667.
+        assert!((Document::helvetica_width(" ", 1000.0) - 278.0).abs() < 1e-6);
+        assert!((Document::helvetica_width("AV", 1000.0) - 1334.0).abs() < 1e-6);
+        assert!(Document::helvetica_width("WWWW", 12.0) > Document::helvetica_width("iiii", 12.0));
     }
 
     #[test]

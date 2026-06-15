@@ -356,6 +356,16 @@ check(
   freeArg(pw); freeArg(owner); freeArg(id);
 }
 
+// watermark (rotated standard-Helvetica text) + Helvetica metrics
+{
+  const wt = argStr("CONFIDENTIAL");
+  const rc = ex.gp_add_watermark(mh, 1, 100, 400, 48, wt.ptr, wt.len, 0x808080, 0.3, 45);
+  check(rc === 0, "gp_add_watermark (rotated Helvetica) rc=0");
+  const w = ex.gp_helvetica_width(wt.ptr, wt.len, 48);
+  check(w > 0 && Number.isFinite(w), `gp_helvetica_width("CONFIDENTIAL", 48) = ${w.toFixed(1)}`);
+  freeArg(wt);
+}
+
 // digitally sign with a freshly generated self-signed digital ID
 {
   const fields = argStr("Tester\tApproval\tD:20260614120000Z\t260614000000Z\t360614000000Z");

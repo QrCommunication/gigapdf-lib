@@ -181,6 +181,14 @@ export class GigaPdfEngine {
     return JSON.parse(dec.decode(json));
   }
 
+  /**
+   * Width of `text` set in standard Helvetica at `size` points (AFM metrics) —
+   * place watermark/header text without embedding a font.
+   */
+  helveticaWidth(size: number, text: string): number {
+    return this._withStr(text, (p, l) => this.ex.gp_helvetica_width(p, l, size));
+  }
+
   // ── stateless <format> → PDF conversions ───────────────────────────────────
   txtToPdf(text: string): Uint8Array {
     return this._withStr(text, (p, l) => this._buffer((o) => this.ex.gp_txt_to_pdf(p, l, o)));
@@ -900,6 +908,27 @@ export class GigaPdfDoc {
     return (
       this.g._withStr(text, (p, l) =>
         this.ex().gp_add_text(this.h, page, x, y, size, p, l, fontObj, RGB(rgb))
+      ) === 0
+    );
+  }
+  /**
+   * Stamp a standard-**Helvetica** watermark (no font embed needed): `text` at
+   * `(x, y)`, rotated `rotationDeg`° counter-clockwise, `rgb` packed `0xRRGGBB`,
+   * `opacity` 0–1. Pair with {@link GigaPdfEngine.helveticaWidth} for centring.
+   */
+  addWatermark(
+    page: number,
+    x: number,
+    y: number,
+    size: number,
+    text: string,
+    rgb = 0x808080,
+    opacity = 0.25,
+    rotationDeg = 0
+  ): boolean {
+    return (
+      this.g._withStr(text, (p, l) =>
+        this.ex().gp_add_watermark(this.h, page, x, y, size, p, l, RGB(rgb), opacity, rotationDeg)
       ) === 0
     );
   }

@@ -4,6 +4,17 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-06-16
+
+### Added
+
+- **`doc.addWatermark(page, x, y, size, text, rgb?, opacity?, rotationDeg?)`** —
+  stamp **rotated** text over an existing page in **standard Helvetica** (no font
+  embedding needed), with opacity, for diagonal/corner watermarks.
+- **`engine.helveticaWidth(size, text)`** — AFM text width in standard Helvetica,
+  to position watermark/header text without a font. ABI `gp_add_watermark` /
+  `gp_helvetica_width`.
+
 ## [0.9.0] - 2026-06-16
 
 ### Added

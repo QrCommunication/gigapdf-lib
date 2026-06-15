@@ -1604,6 +1604,46 @@ pub extern "C" fn gp_add_text(
     })
 }
 
+/// Stamp a standard-Helvetica watermark (no font embed): `text` at `(x, y)`,
+/// rotated `rotation_deg`° CCW, `rgb` packed `0xRRGGBB`, `opacity` 0–1.
+/// Returns 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_watermark(
+    handle: *mut Document,
+    page: u32,
+    x: f64,
+    y: f64,
+    size: f64,
+    text_ptr: *const u8,
+    text_len: usize,
+    rgb: u32,
+    opacity: f64,
+    rotation_deg: f64,
+) -> i32 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    edit(handle, |doc| {
+        doc.add_watermark(
+            page,
+            x,
+            y,
+            size,
+            text,
+            unpack_rgb(rgb),
+            opacity,
+            rotation_deg,
+        )
+    })
+}
+
+/// Width of `text` set in standard Helvetica at `size` points (AFM metrics) —
+/// lets a host place watermark/header text without embedding a font.
+#[no_mangle]
+pub extern "C" fn gp_helvetica_width(text_ptr: *const u8, text_len: usize, size: f64) -> f64 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    Document::helvetica_width(text, size)
+}
+
 /// Extract `count` pages (1-based numbers in the `u32` array at `pages_ptr`)
 /// into a NEW standalone PDF. Buffer-returning (host frees); null on error.
 #[no_mangle]
