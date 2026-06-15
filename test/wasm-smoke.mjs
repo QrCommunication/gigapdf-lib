@@ -344,6 +344,13 @@ check(
   const badHandle = ex.gp_open_encrypted(ePtr, enc.length, 0, 0);
   check(badHandle === 0, "wrong password rejected");
   if (badHandle !== 0) ex.gp_close(badHandle);
+  // encryption_info reads /P /V /R WITHOUT the password.
+  const infoBuf = readBufferReturning((lp) => ex.gp_encryption_info(ePtr, enc.length, lp));
+  const info = JSON.parse(dec.decode(infoBuf));
+  check(
+    info.encrypted === true && info.version === 5 && info.revision === 6 && info.permissions === -44,
+    `gp_encryption_info (no password) → ${JSON.stringify(info)}`,
+  );
   ex.gp_free(ePtr, enc.length);
   ex.gp_free(fekPtr, fek.length);
   freeArg(pw); freeArg(owner); freeArg(id);

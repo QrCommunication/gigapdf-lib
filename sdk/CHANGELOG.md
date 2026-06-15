@@ -4,6 +4,16 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-06-16
+
+### Added
+
+- **`engine.encryptionInfo(pdf)`** — inspect a PDF's encryption **without
+  decrypting it** (no password needed): returns `{ encrypted, permissions,
+  version, revision }`, read straight from the `/Encrypt` dictionary's `/P` /
+  `/V` / `/R`. Works on password-protected files (where `open()` fails). ABI
+  `gp_encryption_info`.
+
 ## [0.8.0] - 2026-06-16
 
 ### Added

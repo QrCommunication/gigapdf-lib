@@ -164,6 +164,23 @@ export class GigaPdfEngine {
     return handle === 0 ? null : new GigaPdfDoc(this, handle);
   }
 
+  /**
+   * Inspect a PDF's encryption **without decrypting it** (no password needed):
+   * whether it has an `/Encrypt` dictionary, plus its `/P` permission bitmask
+   * and handler version/revision (`0` when not encrypted).
+   */
+  encryptionInfo(pdf: Uint8Array): {
+    encrypted: boolean;
+    permissions: number;
+    version: number;
+    revision: number;
+  } {
+    const json = this._withBytes(pdf, (p, l) =>
+      this._buffer((o) => this.ex.gp_encryption_info(p, l, o))
+    );
+    return JSON.parse(dec.decode(json));
+  }
+
   // ── stateless <format> → PDF conversions ───────────────────────────────────
   txtToPdf(text: string): Uint8Array {
     return this._withStr(text, (p, l) => this._buffer((o) => this.ex.gp_txt_to_pdf(p, l, o)));

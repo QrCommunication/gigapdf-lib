@@ -142,10 +142,53 @@ fn build_text_field_appearance(rect: [f64; 4], value: &str) -> (Dictionary, Vec<
     (form, content)
 }
 
+/// What a PDF's `/Encrypt` dictionary declares, read **without** decrypting
+/// (so no password is needed). Returned by [`Document::encryption_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionInfo {
+    /// Whether the trailer references an `/Encrypt` dictionary.
+    pub encrypted: bool,
+    /// The `/P` permission bitmask (0 when not encrypted).
+    pub permissions: i32,
+    /// The handler version `/V` (0 when not encrypted).
+    pub version: i32,
+    /// The handler revision `/R` (0 when not encrypted).
+    pub revision: i32,
+}
+
 impl Document {
     /// Parse a PDF from raw bytes.
     pub fn open(bytes: &[u8]) -> Result<Self> {
         Self::open_with_password(bytes, b"")
+    }
+
+    /// Inspect a PDF's encryption **without decrypting it** — reads the
+    /// `/Encrypt` dictionary's `/P`, `/V` and `/R` straight from the structure,
+    /// so it works on password-protected files (where [`Document::open`] fails).
+    pub fn encryption_info(bytes: &[u8]) -> EncryptionInfo {
+        let (objects, mut trailer) = scan(bytes);
+        recover_trailer_from_xref(&mut trailer, &objects);
+        let not_encrypted = EncryptionInfo {
+            encrypted: false,
+            permissions: 0,
+            version: 0,
+            revision: 0,
+        };
+        let Some(encrypt_ref) = trailer.get(b"Encrypt").and_then(Object::as_reference) else {
+            return not_encrypted;
+        };
+        let Some(dict) = objects.get(&encrypt_ref).and_then(Object::as_dict) else {
+            return EncryptionInfo {
+                encrypted: true,
+                ..not_encrypted
+            };
+        };
+        EncryptionInfo {
+            encrypted: true,
+            permissions: dict.get(b"P").and_then(Object::as_i64).unwrap_or(0) as i32,
+            version: dict.get(b"V").and_then(Object::as_i64).unwrap_or(0) as i32,
+            revision: dict.get(b"R").and_then(Object::as_i64).unwrap_or(0) as i32,
+        }
     }
 
     /// Open a (possibly encrypted) PDF, decrypting with `password`.
@@ -5536,6 +5579,25 @@ mod tests {
             Document::open(&encrypted).is_err(),
             "wrong password must be rejected"
         );
+    }
+
+    #[test]
+    fn encryption_info_reads_p_v_r_without_password() {
+        let doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+
+        // Unencrypted document → encrypted: false.
+        let plain = Document::encryption_info(&doc.save());
+        assert!(!plain.encrypted);
+        assert_eq!(plain.permissions, 0);
+
+        // AES-256 (V5/R6) encrypted → info read WITHOUT the password.
+        let fek = [0x33u8; 32];
+        let enc = doc.save_encrypted(b"user", b"owner", b"id0-1234567890ab", &fek, 2, -44);
+        let info = Document::encryption_info(&enc);
+        assert!(info.encrypted);
+        assert_eq!(info.version, 5);
+        assert_eq!(info.revision, 6);
+        assert_eq!(info.permissions, -44);
     }
 
     #[test]

@@ -152,6 +152,23 @@ pub extern "C" fn gp_save_encrypted(
     }
 }
 
+/// Inspect a PDF's encryption WITHOUT decrypting it (no password needed).
+/// Returns a JSON buffer `{"encrypted":bool,"permissions":int,"version":int,
+/// "revision":int}`. Buffer-returning (host frees); null on a null input.
+#[no_mangle]
+pub extern "C" fn gp_encryption_info(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let info = Document::encryption_info(bytes);
+    let json = format!(
+        "{{\"encrypted\":{},\"permissions\":{},\"version\":{},\"revision\":{}}}",
+        info.encrypted, info.permissions, info.version, info.revision
+    );
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Digitally sign the document with a freshly generated, self-signed digital
 /// ID (`adbe.pkcs7.detached`). `fields` is five tab-separated UTF-8 values:
 /// `name\treason\tdate\tnotBefore\tnotAfter` (the two dates are UTCTime,
