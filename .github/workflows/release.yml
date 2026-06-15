@@ -54,6 +54,10 @@ jobs:
   publish:
     name: Publish to npm
     needs: build
+    # Gate auto-publish behind a repo variable: set OIDC_PUBLISH=true once the
+    # npm trusted publisher is configured. The first v0.1.0 release is published
+    # manually, so this stays skipped until then.
+    if: ${{ vars.OIDC_PUBLISH == 'true' }}
     runs-on: [self-hosted, linux, x64, hetzner, qrcom]
     permissions:
       contents: read
