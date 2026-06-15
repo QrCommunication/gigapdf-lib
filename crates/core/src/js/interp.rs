@@ -256,7 +256,10 @@ impl Interp {
                     "name".into(),
                     PropDesc::Data(Value::str(def.name.clone().unwrap_or_default())),
                 ),
-                ("length".into(), PropDesc::Data(Value::Num(def.params.len() as f64))),
+                (
+                    "length".into(),
+                    PropDesc::Data(Value::Num(def.params.len() as f64)),
+                ),
             ],
             kind: ObjKind::Function(callable),
             extensible: true,
@@ -542,7 +545,8 @@ impl Interp {
     }
 
     fn display_lossy(&mut self, v: &Value) -> String {
-        self.to_string_v(v).unwrap_or_else(|_| "<error>".to_string())
+        self.to_string_v(v)
+            .unwrap_or_else(|_| "<error>".to_string())
     }
 
     /// Parse and run `src` in the given environment (direct `eval`).
@@ -629,7 +633,8 @@ impl Interp {
                 // Already hoisted; ensure the binding exists.
                 let name = f.name.clone().unwrap_or_default();
                 if !env.borrow().vars.contains_key(&name) {
-                    let val = self.make_user_function(Rc::new(f.clone()), env.clone(), false, None, None);
+                    let val =
+                        self.make_user_function(Rc::new(f.clone()), env.clone(), false, None, None);
                     scope_declare_var(env, &name, val);
                 }
                 Ok(Value::Undefined)
@@ -694,8 +699,12 @@ impl Interp {
                 update,
                 body,
             } => self.run_for(init, test, update, body, env, Some(label)),
-            Stmt::ForOf { left, right, body } => self.run_for_of(left, right, body, env, Some(label)),
-            Stmt::ForIn { left, right, body } => self.run_for_in(left, right, body, env, Some(label)),
+            Stmt::ForOf { left, right, body } => {
+                self.run_for_of(left, right, body, env, Some(label))
+            }
+            Stmt::ForIn { left, right, body } => {
+                self.run_for_in(left, right, body, env, Some(label))
+            }
             other => self.eval_stmt(other, env),
         };
         match result {
@@ -704,7 +713,13 @@ impl Interp {
         }
     }
 
-    fn run_while(&mut self, test: &Expr, body: &Stmt, env: &Env, label: Option<&str>) -> Eval<Value> {
+    fn run_while(
+        &mut self,
+        test: &Expr,
+        body: &Stmt,
+        env: &Env,
+        label: Option<&str>,
+    ) -> Eval<Value> {
         while to_boolean(&self.eval_expr(test, env)?) {
             match self.eval_stmt(body, env) {
                 Ok(_) => {}
@@ -980,9 +995,9 @@ impl Interp {
                     self.collect_vars_stmt(a, env);
                 }
             }
-            Stmt::While { body, .. }
-            | Stmt::DoWhile { body, .. }
-            | Stmt::Labeled { body, .. } => self.collect_vars_stmt(body, env),
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
+                self.collect_vars_stmt(body, env)
+            }
             Stmt::For { init, body, .. } => {
                 if let Some(init) = init {
                     if let ForInit::VarDecl {
@@ -1052,7 +1067,8 @@ impl Interp {
             Expr::Template { quasis, exprs } => self.eval_template(quasis, exprs, env),
             Expr::TaggedTemplate { tag, quasis, exprs } => {
                 let tagf = self.eval_expr(tag, env)?;
-                let strings = self.new_array(quasis.iter().map(|q| Value::str(q.clone())).collect());
+                let strings =
+                    self.new_array(quasis.iter().map(|q| Value::str(q.clone())).collect());
                 let raw = self.new_array(quasis.iter().map(|q| Value::str(q.clone())).collect());
                 self.set_member(&strings, "raw", raw)?;
                 let mut argv = vec![strings];
@@ -1063,16 +1079,18 @@ impl Interp {
             }
             Expr::Array(elems) => self.eval_array(elems, env),
             Expr::Object(props) => self.eval_object(props, env),
-            Expr::Func(f) => Ok(self.make_user_function(
-                (**f).clone().into(),
-                env.clone(),
-                false,
-                None,
-                None,
-            )),
+            Expr::Func(f) => {
+                Ok(self.make_user_function((**f).clone().into(), env.clone(), false, None, None))
+            }
             Expr::Arrow(f) => {
                 let this = scope_this(env);
-                Ok(self.make_user_function((**f).clone().into(), env.clone(), true, Some(this), None))
+                Ok(self.make_user_function(
+                    (**f).clone().into(),
+                    env.clone(),
+                    true,
+                    Some(this),
+                    None,
+                ))
             }
             Expr::Class(c) => self.eval_class(c, env),
             Expr::Unary { op, arg } => self.eval_unary(*op, arg, env),
@@ -1267,13 +1285,19 @@ impl Interp {
         // `typeof x` on an undeclared identifier yields "undefined", not an error.
         if matches!(op, UnOp::Typeof) {
             if let Expr::Ident(name) = arg {
-                if name != "undefined" && !scope_has(env, name) && self.global.borrow().get_own(name).is_none() {
+                if name != "undefined"
+                    && !scope_has(env, name)
+                    && self.global.borrow().get_own(name).is_none()
+                {
                     return Ok(Value::str("undefined"));
                 }
             }
         }
         if matches!(op, UnOp::Delete) {
-            if let Expr::Member { object, property, .. } = arg {
+            if let Expr::Member {
+                object, property, ..
+            } = arg
+            {
                 let base = self.eval_expr(object, env)?;
                 let key = self.member_key(property, env)?;
                 if let Value::Object(o) = &base {
@@ -1389,13 +1413,22 @@ impl Interp {
 
     // ---- calls & new ------------------------------------------------------
 
-    fn eval_call(&mut self, callee: &Expr, args: &[Expr], optional: bool, env: &Env) -> Eval<Value> {
+    fn eval_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        optional: bool,
+        env: &Env,
+    ) -> Eval<Value> {
         // `super(...)` — invoke the parent constructor with the current `this`.
         if matches!(callee, Expr::Super) {
             return self.eval_super_call(args, env);
         }
         // `super.method(...)` — invoke an inherited method with the current `this`.
-        if let Expr::Member { object, property, .. } = callee {
+        if let Expr::Member {
+            object, property, ..
+        } = callee
+        {
             if matches!(**object, Expr::Super) {
                 let key = self.member_key(property, env)?;
                 let func = self.super_get(&key, env)?;
@@ -1988,7 +2021,8 @@ impl Interp {
                 }
                 Op::GetEnumIterator => {
                     let obj = frame.pop();
-                    let keys: Vec<Value> = self.enum_keys(&obj).into_iter().map(Value::str).collect();
+                    let keys: Vec<Value> =
+                        self.enum_keys(&obj).into_iter().map(Value::str).collect();
                     let iter = self.make_eager_generator(keys);
                     frame.stack.push(iter);
                 }
@@ -2141,7 +2175,10 @@ impl Interp {
                 f.name = class.name.clone();
                 Rc::new(f)
             }
-            None => Rc::new(default_constructor(class.name.clone(), super_ctor.is_some())),
+            None => Rc::new(default_constructor(
+                class.name.clone(),
+                super_ctor.is_some(),
+            )),
         };
         let ctor_val = self.make_user_function(ctor_def, env.clone(), false, None, None);
         let ctor_obj = ctor_val.as_object().unwrap().clone();
@@ -2167,16 +2204,26 @@ impl Interp {
                 ClassMemberKind::Method => {
                     if let Some(ClassMemberValue::Func(f)) = &m.value {
                         let home = Some(Value::Object(target.clone()));
-                        let fv = self
-                            .make_user_function(Rc::new(f.clone()), env.clone(), false, None, home);
+                        let fv = self.make_user_function(
+                            Rc::new(f.clone()),
+                            env.clone(),
+                            false,
+                            None,
+                            home,
+                        );
                         target.borrow_mut().set_data(&key, fv);
                     }
                 }
                 ClassMemberKind::Get | ClassMemberKind::Set => {
                     if let Some(ClassMemberValue::Func(f)) = &m.value {
                         let home = Some(Value::Object(target.clone()));
-                        let fv = self
-                            .make_user_function(Rc::new(f.clone()), env.clone(), false, None, home);
+                        let fv = self.make_user_function(
+                            Rc::new(f.clone()),
+                            env.clone(),
+                            false,
+                            None,
+                            home,
+                        );
                         let fgc = fv.as_object().cloned();
                         let mut b = target.borrow_mut();
                         let (mut get, mut set) = match b.get_own(&key).cloned() {
@@ -2496,9 +2543,15 @@ impl Interp {
             BinOp::Div => Value::Num(self.to_number(&l)? / self.to_number(&r)?),
             BinOp::Mod => Value::Num(js_mod(self.to_number(&l)?, self.to_number(&r)?)),
             BinOp::Exp => Value::Num(self.to_number(&l)?.powf(self.to_number(&r)?)),
-            BinOp::BitAnd => Value::Num((to_int32(self.to_number(&l)?) & to_int32(self.to_number(&r)?)) as f64),
-            BinOp::BitOr => Value::Num((to_int32(self.to_number(&l)?) | to_int32(self.to_number(&r)?)) as f64),
-            BinOp::BitXor => Value::Num((to_int32(self.to_number(&l)?) ^ to_int32(self.to_number(&r)?)) as f64),
+            BinOp::BitAnd => {
+                Value::Num((to_int32(self.to_number(&l)?) & to_int32(self.to_number(&r)?)) as f64)
+            }
+            BinOp::BitOr => {
+                Value::Num((to_int32(self.to_number(&l)?) | to_int32(self.to_number(&r)?)) as f64)
+            }
+            BinOp::BitXor => {
+                Value::Num((to_int32(self.to_number(&l)?) ^ to_int32(self.to_number(&r)?)) as f64)
+            }
             BinOp::Shl => {
                 let a = to_int32(self.to_number(&l)?);
                 let b = to_uint32(self.to_number(&r)?) & 31;
@@ -2643,7 +2696,8 @@ impl Interp {
                         Some(PropDesc::Data(Value::Num(n))) => *n as usize,
                         _ => 0,
                     };
-                    o.borrow_mut().set_data("__index", Value::Num(items.len() as f64));
+                    o.borrow_mut()
+                        .set_data("__index", Value::Num(items.len() as f64));
                     return Ok(items[idx.min(items.len())..].to_vec());
                 }
                 if class == "Map" {
@@ -3055,7 +3109,9 @@ mod tests {
     fn eval(src: &str) -> Value {
         let mut interp = Interp::new();
         let program = super::super::parser::parse(src).expect("parse");
-        interp.run(&program).unwrap_or_else(|e| panic!("eval error: {e:?}"))
+        interp
+            .run(&program)
+            .unwrap_or_else(|e| panic!("eval error: {e:?}"))
     }
 
     fn num(src: &str) -> f64 {
@@ -3115,13 +3171,11 @@ mod tests {
     fn yield_star_delegation_and_for_of() {
         // `yield*` delegates lazily; `for…of` drives a VM generator step-wise.
         assert_eq!(
-            num(
-                "function* inner(){ yield 1; yield 2; }
+            num("function* inner(){ yield 1; yield 2; }
                  function* outer(){ yield* inner(); yield 3; }
                  let s = 0;
                  for (const x of outer()) { s = s + x; }
-                 s"
-            ),
+                 s"),
             6.0
         );
     }
@@ -3129,11 +3183,9 @@ mod tests {
     #[test]
     fn spread_collects_a_generator() {
         assert_eq!(
-            num(
-                "function* g(){ yield 10; yield 20; yield 30; }
+            num("function* g(){ yield 10; yield 20; yield 30; }
                  const a = [...g()];
-                 a[0] + a[1] + a[2]"
-            ),
+                 a[0] + a[1] + a[2]"),
             60.0
         );
     }
@@ -3464,10 +3516,7 @@ mod tests {
 
     #[test]
     fn template_literals_runtime() {
-        assert_eq!(
-            string("let n = 3; `sum is ${n + n} ok`"),
-            "sum is 6 ok"
-        );
+        assert_eq!(string("let n = 3; `sum is ${n + n} ok`"), "sum is 6 ok");
     }
 
     #[test]
@@ -3538,7 +3587,10 @@ mod tests {
             num("export const a = 7; export function g(){ return a + 1; } g()"),
             8.0
         );
-        assert_eq!(num("import x from './m'; export { a }; export default 5; 9"), 9.0);
+        assert_eq!(
+            num("import x from './m'; export { a }; export default 5; 9"),
+            9.0
+        );
     }
 
     #[test]

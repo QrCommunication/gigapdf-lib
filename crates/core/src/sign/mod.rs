@@ -84,11 +84,7 @@ impl Signer {
         ]);
 
         let signature = key.sign_sha256(&tbs);
-        let certificate = der::sequence(&[
-            tbs,
-            alg_sha256_with_rsa(),
-            der::bit_string(&signature),
-        ]);
+        let certificate = der::sequence(&[tbs, alg_sha256_with_rsa(), der::bit_string(&signature)]);
 
         Some(Signer {
             key,
@@ -104,10 +100,8 @@ impl Signer {
         let message_digest = sha256(content);
 
         // signedAttrs: contentType + messageDigest.
-        let attr_content_type = der::sequence(&[
-            der::oid(OID_CONTENT_TYPE),
-            der::set(&[der::oid(OID_DATA)]),
-        ]);
+        let attr_content_type =
+            der::sequence(&[der::oid(OID_CONTENT_TYPE), der::set(&[der::oid(OID_DATA)])]);
         let attr_message_digest = der::sequence(&[
             der::oid(OID_MESSAGE_DIGEST),
             der::set(&[der::octet_string(&message_digest)]),
@@ -124,7 +118,7 @@ impl Signer {
         let signed_attrs_tagged = der::context(0, &attrs.concat());
 
         let signer_info = der::sequence(&[
-            der::integer_u32(1), // version
+            der::integer_u32(1),                                                  // version
             der::sequence(&[self.issuer.clone(), der::integer_u32(self.serial)]), // issuerAndSerial
             alg_sha256(),
             signed_attrs_tagged,
@@ -136,7 +130,7 @@ impl Signer {
             der::integer_u32(1), // version
             der::set(&[alg_sha256()]),
             der::sequence(&[der::oid(OID_DATA)]), // encapContentInfo (detached)
-            der::context(0, &self.certificate),  // [0] certificates
+            der::context(0, &self.certificate),   // [0] certificates
             der::set(&[signer_info]),
         ]);
 
@@ -156,8 +150,14 @@ mod tests {
     // Small key keeps the test fast while exercising the full DER assembly.
     fn test_signer() -> Signer {
         let randomness: Vec<u8> = (0..256).map(|i| (i * 53 + 7) as u8).collect();
-        Signer::generate("GigaPDF Signer", "260614000000Z", "360614000000Z", 512, &randomness)
-            .expect("signer")
+        Signer::generate(
+            "GigaPDF Signer",
+            "260614000000Z",
+            "360614000000Z",
+            512,
+            &randomness,
+        )
+        .expect("signer")
     }
 
     #[test]
@@ -166,7 +166,11 @@ mod tests {
         let cert = signer.certificate();
         assert_eq!(cert[0], 0x30, "certificate is a SEQUENCE");
         // The declared length must match the actual body length.
-        assert!(cert.len() > 200, "non-trivial certificate ({} bytes)", cert.len());
+        assert!(
+            cert.len() > 200,
+            "non-trivial certificate ({} bytes)",
+            cert.len()
+        );
     }
 
     #[test]

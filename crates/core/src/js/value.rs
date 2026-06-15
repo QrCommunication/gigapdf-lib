@@ -360,9 +360,13 @@ pub fn scope_var_set(env: &Env, name: &str, value: Value) {
     loop {
         let is_fn = cur.borrow().is_function_scope;
         if is_fn || cur.borrow().parent.is_none() {
-            cur.borrow_mut()
-                .vars
-                .insert(name.to_string(), Binding { value, mutable: true });
+            cur.borrow_mut().vars.insert(
+                name.to_string(),
+                Binding {
+                    value,
+                    mutable: true,
+                },
+            );
             return;
         }
         let parent = cur.borrow().parent.clone();
@@ -472,13 +476,19 @@ pub fn str_to_num(s: &str) -> f64 {
         return 0.0;
     }
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return u64::from_str_radix(hex, 16).map(|v| v as f64).unwrap_or(f64::NAN);
+        return u64::from_str_radix(hex, 16)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(oct) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return u64::from_str_radix(oct, 8).map(|v| v as f64).unwrap_or(f64::NAN);
+        return u64::from_str_radix(oct, 8)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(bin) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return u64::from_str_radix(bin, 2).map(|v| v as f64).unwrap_or(f64::NAN);
+        return u64::from_str_radix(bin, 2)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     match t {
         "Infinity" | "+Infinity" => f64::INFINITY,

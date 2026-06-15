@@ -6,8 +6,8 @@
 //! placed text box, an image XObject a placed picture, a vector path a placed
 //! rectangle — never a flattened page raster.
 
-use super::zip::ZipWriter;
 use super::style::{Generic, TextStyle};
+use super::zip::ZipWriter;
 use super::{ConvPage, PlacedImage};
 use crate::content::num;
 
@@ -17,7 +17,9 @@ fn docx_run_props(style: &TextStyle, half_pt: i64) -> String {
     if !style.family.is_empty() {
         let mut fam = String::new();
         esc(&style.family, &mut fam);
-        p.push_str(&format!("<w:rFonts w:ascii=\"{fam}\" w:hAnsi=\"{fam}\" w:cs=\"{fam}\"/>"));
+        p.push_str(&format!(
+            "<w:rFonts w:ascii=\"{fam}\" w:hAnsi=\"{fam}\" w:cs=\"{fam}\"/>"
+        ));
     }
     if style.bold {
         p.push_str("<w:b/>");
@@ -109,7 +111,10 @@ fn esc(text: &str, out: &mut String) {
 
 /// Export pages to an OpenDocument Text (`.odt`) document.
 pub fn to_odt(pages: &[ConvPage]) -> Vec<u8> {
-    let (pw, ph) = pages.first().map(|p| (p.width, p.height)).unwrap_or((612.0, 792.0));
+    let (pw, ph) = pages
+        .first()
+        .map(|p| (p.width, p.height))
+        .unwrap_or((612.0, 792.0));
     let mut zip = ZipWriter::new();
 
     // The mimetype entry must be first and stored uncompressed (ODF §3.3).
@@ -119,7 +124,10 @@ pub fn to_odt(pages: &[ConvPage]) -> Vec<u8> {
     let content = odt_content_xml(pages, &mut images);
     zip.add_deflated("content.xml", content.as_bytes());
     zip.add_deflated("styles.xml", odt_styles_xml(pw, ph).as_bytes());
-    zip.add_deflated("META-INF/manifest.xml", odt_manifest_xml(images.len()).as_bytes());
+    zip.add_deflated(
+        "META-INF/manifest.xml",
+        odt_manifest_xml(images.len()).as_bytes(),
+    );
     for (i, img) in images.iter().enumerate() {
         zip.add_deflated(&format!("Pictures/img{}.png", i + 1), &img.png);
     }
@@ -278,13 +286,19 @@ pub fn to_odp(pages: &[ConvPage]) -> Vec<u8> {
     let mut zip = ZipWriter::new();
 
     // The mimetype entry must be first and stored uncompressed (ODF §3.3).
-    zip.add_stored("mimetype", b"application/vnd.oasis.opendocument.presentation");
+    zip.add_stored(
+        "mimetype",
+        b"application/vnd.oasis.opendocument.presentation",
+    );
 
     let mut images: Vec<&PlacedImage> = Vec::new();
     let content = odp_content_xml(pages, &mut images);
     zip.add_deflated("content.xml", content.as_bytes());
     zip.add_deflated("styles.xml", odp_styles_xml(pw, ph).as_bytes());
-    zip.add_deflated("META-INF/manifest.xml", odp_manifest_xml(images.len()).as_bytes());
+    zip.add_deflated(
+        "META-INF/manifest.xml",
+        odp_manifest_xml(images.len()).as_bytes(),
+    );
     for (i, img) in images.iter().enumerate() {
         zip.add_deflated(&format!("Pictures/img{}.png", i + 1), &img.png);
     }
@@ -441,7 +455,10 @@ pub fn to_docx(pages: &[ConvPage]) -> Vec<u8> {
     let mut images: Vec<&PlacedImage> = Vec::new();
     let document = docx_document_xml(pages, &mut images);
 
-    zip.add_deflated("[Content_Types].xml", docx_content_types(images.len()).as_bytes());
+    zip.add_deflated(
+        "[Content_Types].xml",
+        docx_content_types(images.len()).as_bytes(),
+    );
     zip.add_deflated(
         "_rels/.rels",
         b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -450,7 +467,10 @@ pub fn to_docx(pages: &[ConvPage]) -> Vec<u8> {
 Target=\"word/document.xml\"/></Relationships>",
     );
     zip.add_deflated("word/document.xml", document.as_bytes());
-    zip.add_deflated("word/_rels/document.xml.rels", docx_rels(images.len()).as_bytes());
+    zip.add_deflated(
+        "word/_rels/document.xml.rels",
+        docx_rels(images.len()).as_bytes(),
+    );
     for (i, img) in images.iter().enumerate() {
         zip.add_deflated(&format!("word/media/image{}.png", i + 1), &img.png);
     }
@@ -494,7 +514,11 @@ Target=\"media/image{n}.png\"/>",
 /// A `<w:sectPr>` sizing one page (twips). `kind` is "" for the final body-level
 /// section or " continuous-style" markup handled by the caller.
 fn docx_sect_pr(width: f64, height: f64) -> String {
-    let orient = if height >= width { "portrait" } else { "landscape" };
+    let orient = if height >= width {
+        "portrait"
+    } else {
+        "landscape"
+    };
     format!(
         "<w:sectPr><w:pgSz w:w=\"{w}\" w:h=\"{h}\" w:orient=\"{o}\"/>\
 <w:pgMar w:top=\"0\" w:right=\"0\" w:bottom=\"0\" w:left=\"0\" w:header=\"0\" w:footer=\"0\" w:gutter=\"0\"/></w:sectPr>",
@@ -567,7 +591,9 @@ fn docx_document_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage
                 w = emu(img.width.max(1.0)),
                 h = emu(img.height.max(1.0)),
             );
-            para.push_str(&docx_anchor(id, img.x, img.y, img.width, img.height, &inner));
+            para.push_str(&docx_anchor(
+                id, img.x, img.y, img.width, img.height, &inner,
+            ));
             id += 1;
         }
         for s in &page.shapes {
@@ -588,7 +614,10 @@ fn docx_document_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage
         // Section break: a per-page sectPr lives in the LAST paragraph of a
         // page (except the final page, whose sectPr is a body-level child).
         if pi + 1 < page_count {
-            para.push_str(&format!("<w:pPr>{}</w:pPr>", docx_sect_pr(page.width, page.height)));
+            para.push_str(&format!(
+                "<w:pPr>{}</w:pPr>",
+                docx_sect_pr(page.width, page.height)
+            ));
         }
         para.push_str("</w:p>");
         body.push_str(&para);
@@ -662,7 +691,10 @@ xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" type=\"bl
 /// Export pages to an editable PowerPoint presentation (`.pptx`): one slide per
 /// page, each text run a positioned text box, each image a placed picture.
 pub fn to_pptx(pages: &[ConvPage]) -> Vec<u8> {
-    let (sw, sh) = pages.first().map(|p| (p.width, p.height)).unwrap_or((612.0, 792.0));
+    let (sw, sh) = pages
+        .first()
+        .map(|p| (p.width, p.height))
+        .unwrap_or((612.0, 792.0));
     let mut zip = ZipWriter::new();
 
     // Build slides; collect a flat media list (global imageN.png) plus, per
@@ -677,7 +709,10 @@ pub fn to_pptx(pages: &[ConvPage]) -> Vec<u8> {
         slide_rels.push(used);
     }
 
-    zip.add_deflated("[Content_Types].xml", pptx_content_types(slides.len(), !media.is_empty()).as_bytes());
+    zip.add_deflated(
+        "[Content_Types].xml",
+        pptx_content_types(slides.len(), !media.is_empty()).as_bytes(),
+    );
     zip.add_deflated(
         "_rels/.rels",
         b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -685,8 +720,14 @@ pub fn to_pptx(pages: &[ConvPage]) -> Vec<u8> {
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" \
 Target=\"ppt/presentation.xml\"/></Relationships>",
     );
-    zip.add_deflated("ppt/presentation.xml", pptx_presentation_xml(slides.len(), sw, sh).as_bytes());
-    zip.add_deflated("ppt/_rels/presentation.xml.rels", pptx_presentation_rels(slides.len()).as_bytes());
+    zip.add_deflated(
+        "ppt/presentation.xml",
+        pptx_presentation_xml(slides.len(), sw, sh).as_bytes(),
+    );
+    zip.add_deflated(
+        "ppt/_rels/presentation.xml.rels",
+        pptx_presentation_rels(slides.len()).as_bytes(),
+    );
     zip.add_deflated("ppt/theme/theme1.xml", PPTX_THEME.as_bytes());
     zip.add_deflated("ppt/slideMasters/slideMaster1.xml", PPTX_MASTER.as_bytes());
     zip.add_deflated(
@@ -753,7 +794,11 @@ ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide
 fn pptx_presentation_xml(slide_count: usize, sw: f64, sh: f64) -> String {
     let mut ids = String::new();
     for i in 0..slide_count {
-        ids.push_str(&format!("<p:sldId id=\"{}\" r:id=\"rId{}\"/>", 256 + i, 2 + i));
+        ids.push_str(&format!(
+            "<p:sldId id=\"{}\" r:id=\"rId{}\"/>",
+            256 + i,
+            2 + i
+        ));
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -808,7 +853,11 @@ Target=\"../media/image{}.png\"/>",
 
 /// Build one slide. Images are appended to `media` (global) and their global
 /// index recorded in `used` (the slide's local rId order).
-fn pptx_slide_xml<'a>(page: &'a ConvPage, media: &mut Vec<&'a PlacedImage>, used: &mut Vec<usize>) -> String {
+fn pptx_slide_xml<'a>(
+    page: &'a ConvPage,
+    media: &mut Vec<&'a PlacedImage>,
+    used: &mut Vec<usize>,
+) -> String {
     let mut tree = String::new();
     let mut id = 2usize; // ids 1 is the group shape
 
@@ -897,7 +946,10 @@ pub fn to_xlsx(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
     let sheet_count = grids.len().max(1);
     let mut zip = ZipWriter::new();
 
-    zip.add_deflated("[Content_Types].xml", xlsx_content_types(sheet_count).as_bytes());
+    zip.add_deflated(
+        "[Content_Types].xml",
+        xlsx_content_types(sheet_count).as_bytes(),
+    );
     zip.add_deflated(
         "_rels/.rels",
         b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -906,13 +958,19 @@ pub fn to_xlsx(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
 Target=\"xl/workbook.xml\"/></Relationships>",
     );
     zip.add_deflated("xl/workbook.xml", xlsx_workbook_xml(sheet_count).as_bytes());
-    zip.add_deflated("xl/_rels/workbook.xml.rels", xlsx_workbook_rels(sheet_count).as_bytes());
+    zip.add_deflated(
+        "xl/_rels/workbook.xml.rels",
+        xlsx_workbook_rels(sheet_count).as_bytes(),
+    );
 
     if grids.is_empty() {
         zip.add_deflated("xl/worksheets/sheet1.xml", xlsx_sheet_xml(&[]).as_bytes());
     } else {
         for (i, grid) in grids.iter().enumerate() {
-            zip.add_deflated(&format!("xl/worksheets/sheet{}.xml", i + 1), xlsx_sheet_xml(grid).as_bytes());
+            zip.add_deflated(
+                &format!("xl/worksheets/sheet{}.xml", i + 1),
+                xlsx_sheet_xml(grid).as_bytes(),
+            );
         }
     }
     zip.finish()
@@ -1004,7 +1062,10 @@ fn xlsx_sheet_xml(grid: &[Vec<String>]) -> String {
 /// `table:table` per page. The ODF counterpart of [`to_xlsx`].
 pub fn to_ods(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
     let mut zip = ZipWriter::new();
-    zip.add_stored("mimetype", b"application/vnd.oasis.opendocument.spreadsheet");
+    zip.add_stored(
+        "mimetype",
+        b"application/vnd.oasis.opendocument.spreadsheet",
+    );
 
     let mut content = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -1083,7 +1144,12 @@ mod tests {
                 },
             }],
             images: Vec::new(),
-            shapes: vec![PlacedShape { x: 50.0, y: 50.0, width: 100.0, height: 80.0 }],
+            shapes: vec![PlacedShape {
+                x: 50.0,
+                y: 50.0,
+                width: 100.0,
+                height: 80.0,
+            }],
         }]
     }
 
@@ -1099,7 +1165,11 @@ mod tests {
             let ds = i + 30 + nlen + elen;
             let payload = &zip[ds..ds + comp];
             if ename == name {
-                return Some(if method == 8 { inflate(payload).unwrap() } else { payload.to_vec() });
+                return Some(if method == 8 {
+                    inflate(payload).unwrap()
+                } else {
+                    payload.to_vec()
+                });
             }
             i = ds + comp;
         }
@@ -1121,12 +1191,21 @@ mod tests {
         let zip = to_odt(&sample_pages());
         let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
         assert!(content.contains("draw:text-box"), "text is a real text box");
-        assert!(content.contains("Hello &lt;World&gt; &amp; co"), "escaped run text present");
+        assert!(
+            content.contains("Hello &lt;World&gt; &amp; co"),
+            "escaped run text present"
+        );
         assert!(content.contains("draw:rect"), "shape becomes a rectangle");
-        assert!(!content.contains("draw:image"), "no image when none provided");
+        assert!(
+            !content.contains("draw:image"),
+            "no image when none provided"
+        );
         // style fidelity
         assert!(content.contains("fo:font-weight=\"bold\""), "bold emitted");
-        assert!(content.contains("fo:font-family=\"Helvetica\""), "family emitted");
+        assert!(
+            content.contains("fo:font-family=\"Helvetica\""),
+            "family emitted"
+        );
         assert!(content.contains("fo:color=\"#FF0000\""), "colour emitted");
     }
 
@@ -1135,12 +1214,24 @@ mod tests {
         let zip = to_docx(&sample_pages());
         let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
         assert!(doc.contains("wps:txbx"), "text is a real Word text box");
-        assert!(doc.contains("Hello &lt;World&gt; &amp; co"), "escaped run text present");
-        assert!(doc.contains("<w:t xml:space=\"preserve\">"), "editable run, not image");
+        assert!(
+            doc.contains("Hello &lt;World&gt; &amp; co"),
+            "escaped run text present"
+        );
+        assert!(
+            doc.contains("<w:t xml:space=\"preserve\">"),
+            "editable run, not image"
+        );
         assert!(doc.contains("w:sectPr"), "page becomes a section");
         assert!(doc.contains("<w:b/>"), "bold emitted");
-        assert!(doc.contains("w:rFonts w:ascii=\"Helvetica\""), "font family emitted");
-        assert!(doc.contains("<w:color w:val=\"FF0000\"/>"), "colour emitted");
+        assert!(
+            doc.contains("w:rFonts w:ascii=\"Helvetica\""),
+            "font family emitted"
+        );
+        assert!(
+            doc.contains("<w:color w:val=\"FF0000\"/>"),
+            "colour emitted"
+        );
         // [Content_Types].xml must be a parseable, well-formed part.
         let ct = String::from_utf8(entry(&zip, "[Content_Types].xml").unwrap()).unwrap();
         assert!(ct.contains("wordprocessingml.document.main+xml"));
@@ -1214,10 +1305,19 @@ mod tests {
         }
         let slide = String::from_utf8(entry(&zip, "ppt/slides/slide1.xml").unwrap()).unwrap();
         assert!(slide.contains("<p:sp>"), "text is a real positioned shape");
-        assert!(slide.contains("<a:t>Hello &lt;World&gt; &amp; co</a:t>"), "escaped run text");
+        assert!(
+            slide.contains("<a:t>Hello &lt;World&gt; &amp; co</a:t>"),
+            "escaped run text"
+        );
         assert!(slide.contains(" b=\"1\""), "bold emitted");
-        assert!(slide.contains("<a:latin typeface=\"Helvetica\"/>"), "font family emitted");
-        assert!(slide.contains("<a:srgbClr val=\"FF0000\"/>"), "colour emitted");
+        assert!(
+            slide.contains("<a:latin typeface=\"Helvetica\"/>"),
+            "font family emitted"
+        );
+        assert!(
+            slide.contains("<a:srgbClr val=\"FF0000\"/>"),
+            "colour emitted"
+        );
         let pres = String::from_utf8(entry(&zip, "ppt/presentation.xml").unwrap()).unwrap();
         assert!(pres.contains("p:sldSz"), "slide size set from page");
         assert_eq!(pres.matches("<p:sldId ").count(), 1, "one slide per page");
@@ -1234,9 +1334,15 @@ mod tests {
             assert!(entry(&zip, part).is_some(), "missing {part}");
         }
         let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
-        assert!(content.contains("<office:presentation>"), "presentation body");
+        assert!(
+            content.contains("<office:presentation>"),
+            "presentation body"
+        );
         assert!(content.contains("<draw:page "), "one draw:page per slide");
-        assert!(content.contains("<draw:text-box>"), "text as a positioned box");
+        assert!(
+            content.contains("<draw:text-box>"),
+            "text as a positioned box"
+        );
         assert!(
             content.contains("Hello &lt;World&gt; &amp; co"),
             "escaped run text"

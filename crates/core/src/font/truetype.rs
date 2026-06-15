@@ -19,7 +19,10 @@ fn bei16(d: &[u8], o: usize) -> i16 {
 
 fn be32(d: &[u8], o: usize) -> u32 {
     if o + 4 <= d.len() {
-        ((d[o] as u32) << 24) | ((d[o + 1] as u32) << 16) | ((d[o + 2] as u32) << 8) | d[o + 3] as u32
+        ((d[o] as u32) << 24)
+            | ((d[o + 1] as u32) << 16)
+            | ((d[o + 2] as u32) << 8)
+            | d[o + 3] as u32
     } else {
         0
     }

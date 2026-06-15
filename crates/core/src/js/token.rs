@@ -76,65 +76,103 @@ pub enum Punct {
     OptChain,  // ?.
 
     // Comparison
-    Lt,        // <
-    Gt,        // >
-    LtEq,      // <=
-    GtEq,      // >=
-    EqEq,      // ==
-    NotEq,     // !=
-    EqEqEq,    // ===
-    NotEqEq,   // !==
+    Lt,      // <
+    Gt,      // >
+    LtEq,    // <=
+    GtEq,    // >=
+    EqEq,    // ==
+    NotEq,   // !=
+    EqEqEq,  // ===
+    NotEqEq, // !==
 
     // Arithmetic / bitwise
-    Plus,      // +
-    Minus,     // -
-    Star,      // *
-    Slash,     // /
-    Percent,   // %
-    StarStar,  // **
-    PlusPlus,  // ++
-    MinusMinus,// --
-    Shl,       // <<
-    Shr,       // >>
-    UShr,      // >>>
-    Amp,       // &
-    Pipe,      // |
-    Caret,     // ^
-    Bang,      // !
-    Tilde,     // ~
-    AmpAmp,    // &&
-    PipePipe,  // ||
+    Plus,            // +
+    Minus,           // -
+    Star,            // *
+    Slash,           // /
+    Percent,         // %
+    StarStar,        // **
+    PlusPlus,        // ++
+    MinusMinus,      // --
+    Shl,             // <<
+    Shr,             // >>
+    UShr,            // >>>
+    Amp,             // &
+    Pipe,            // |
+    Caret,           // ^
+    Bang,            // !
+    Tilde,           // ~
+    AmpAmp,          // &&
+    PipePipe,        // ||
     NullishCoalesce, // ??
 
     // Assignment
-    Eq,        // =
-    PlusEq,    // +=
-    MinusEq,   // -=
-    StarEq,    // *=
-    SlashEq,   // /=
-    PercentEq, // %=
-    StarStarEq,// **=
-    ShlEq,     // <<=
-    ShrEq,     // >>=
-    UShrEq,    // >>>=
-    AmpEq,     // &=
-    PipeEq,    // |=
-    CaretEq,   // ^=
-    AmpAmpEq,  // &&=
-    PipePipeEq,// ||=
-    NullishEq, // ??=
+    Eq,         // =
+    PlusEq,     // +=
+    MinusEq,    // -=
+    StarEq,     // *=
+    SlashEq,    // /=
+    PercentEq,  // %=
+    StarStarEq, // **=
+    ShlEq,      // <<=
+    ShrEq,      // >>=
+    UShrEq,     // >>>=
+    AmpEq,      // &=
+    PipeEq,     // |=
+    CaretEq,    // ^=
+    AmpAmpEq,   // &&=
+    PipePipeEq, // ||=
+    NullishEq,  // ??=
 }
 
 /// The ECMAScript reserved words (strict-mode inclusive).
 const RESERVED: &[&str] = &[
-    "break", "case", "catch", "class", "const", "continue", "debugger",
-    "default", "delete", "do", "else", "enum", "export", "extends", "false",
-    "finally", "for", "function", "if", "import", "in", "instanceof", "new",
-    "null", "return", "super", "switch", "this", "throw", "true", "try",
-    "typeof", "var", "void", "while", "with",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
     // strict-mode reserved
-    "implements", "interface", "let", "package", "private", "protected",
-    "public", "static", "yield",
+    "implements",
+    "interface",
+    "let",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "static",
+    "yield",
 ];
 
 /// Whether `word` is an ECMAScript reserved word.
@@ -150,7 +188,19 @@ pub fn is_reserved_word(word: &str) -> bool {
 pub fn expects_expression_after(word: &str) -> bool {
     matches!(
         word,
-        "return" | "typeof" | "instanceof" | "in" | "of" | "new" | "delete"
-            | "void" | "throw" | "do" | "else" | "case" | "yield" | "await"
+        "return"
+            | "typeof"
+            | "instanceof"
+            | "in"
+            | "of"
+            | "new"
+            | "delete"
+            | "void"
+            | "throw"
+            | "do"
+            | "else"
+            | "case"
+            | "yield"
+            | "await"
     )
 }

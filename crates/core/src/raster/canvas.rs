@@ -100,7 +100,8 @@ impl Canvas {
                 if crossings.len() < 2 {
                     continue;
                 }
-                crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                crossings
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Walk spans where the winding rule says "inside".
                 let mut winding = 0i32;
@@ -156,10 +157,30 @@ mod tests {
 
     fn rect_edges(x: f64, y: f64, w: f64, h: f64) -> Vec<Edge> {
         vec![
-            Edge { x0: x, y0: y, x1: x + w, y1: y },
-            Edge { x0: x + w, y0: y, x1: x + w, y1: y + h },
-            Edge { x0: x + w, y0: y + h, x1: x, y1: y + h },
-            Edge { x0: x, y0: y + h, x1: x, y1: y },
+            Edge {
+                x0: x,
+                y0: y,
+                x1: x + w,
+                y1: y,
+            },
+            Edge {
+                x0: x + w,
+                y0: y,
+                x1: x + w,
+                y1: y + h,
+            },
+            Edge {
+                x0: x + w,
+                y0: y + h,
+                x1: x,
+                y1: y + h,
+            },
+            Edge {
+                x0: x,
+                y0: y + h,
+                x1: x,
+                y1: y,
+            },
         ]
     }
 

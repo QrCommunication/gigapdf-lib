@@ -21,7 +21,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, byte: 0, bit: 0 }
+        Self {
+            data,
+            byte: 0,
+            bit: 0,
+        }
     }
 
     fn bit(&mut self) -> Result<u32> {
@@ -323,9 +327,7 @@ mod tests {
     fn stored_block_roundtrip() {
         // zlib header (78 01) + stored block of "Hi!" + (adler omitted).
         // First byte 0x01 = BFINAL=1, BTYPE=00 (stored). LEN=3, NLEN=~3.
-        let blob = [
-            0x78, 0x01, 0x01, 0x03, 0x00, 0xFC, 0xFF, b'H', b'i', b'!',
-        ];
+        let blob = [0x78, 0x01, 0x01, 0x03, 0x00, 0xFC, 0xFF, b'H', b'i', b'!'];
         assert_eq!(flate_decode(&blob).unwrap(), b"Hi!");
     }
 

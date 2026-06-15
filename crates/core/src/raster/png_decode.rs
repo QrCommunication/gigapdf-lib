@@ -73,10 +73,7 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
                 if data.len() % 3 != 0 {
                     return None;
                 }
-                palette = data
-                    .chunks_exact(3)
-                    .map(|c| [c[0], c[1], c[2]])
-                    .collect();
+                palette = data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
             }
             b"tRNS" => {
                 trns = data.to_vec();
@@ -285,7 +282,11 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
         _ => return None,
     }
 
-    Some(DecodedImage { width, height, rgba })
+    Some(DecodedImage {
+        width,
+        height,
+        rgba,
+    })
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -332,7 +333,10 @@ mod tests {
     #[test]
     fn rejects_invalid_inputs() {
         // Garbage input.
-        assert!(decode_png(b"not a png").is_none(), "garbage must return None");
+        assert!(
+            decode_png(b"not a png").is_none(),
+            "garbage must return None"
+        );
         // Correct 8-byte PNG signature but nothing else.
         let truncated = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         assert!(

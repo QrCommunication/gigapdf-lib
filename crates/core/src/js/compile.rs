@@ -207,7 +207,8 @@ impl Compiler {
                 self.push_value(test)?;
                 let to_end = self.chunk.emit(Op::JumpIfFalse(0));
                 let label = self.pending_label.take();
-                self.loops.push(LoopCtx::new(self.handler_depth, label, false));
+                self.loops
+                    .push(LoopCtx::new(self.handler_depth, label, false));
                 let body_ok = self.stmt(body);
                 self.chunk.emit(Op::Jump(start));
                 let end = self.chunk.here();
@@ -218,7 +219,8 @@ impl Compiler {
             Stmt::DoWhile { body, test } => {
                 let start = self.chunk.here();
                 let label = self.pending_label.take();
-                self.loops.push(LoopCtx::new(self.handler_depth, label, false));
+                self.loops
+                    .push(LoopCtx::new(self.handler_depth, label, false));
                 let body_ok = self.stmt(body);
                 let cont = self.chunk.here();
                 if self.push_value(test).is_none() {
@@ -489,7 +491,8 @@ impl Compiler {
             None => None,
         };
         let label = self.pending_label.take();
-        self.loops.push(LoopCtx::new(self.handler_depth, label, false));
+        self.loops
+            .push(LoopCtx::new(self.handler_depth, label, false));
         let body_ok = self.stmt(body);
         let cont = self.chunk.here();
         if let Some(u) = update {
@@ -533,18 +536,19 @@ impl Compiler {
         self.chunk.emit(iter_op); // stack: [iterator]
         let start = self.chunk.here();
         let to_end = self.chunk.emit(Op::IterNext(0)); // done → jump (leaves iterator)
-        // stack: [iterator, value]
+                                                       // stack: [iterator, value]
         self.chunk.emit(Op::PushScope);
         self.bind_for_head(left)?; // pops the value, binds the loop variable(s)
         let label = self.pending_label.take();
-        self.loops.push(LoopCtx::new(self.handler_depth, label, false));
+        self.loops
+            .push(LoopCtx::new(self.handler_depth, label, false));
         let body_ok = self.stmt(body);
         self.chunk.emit(Op::PopScope);
         self.chunk.emit(Op::Jump(start));
         let end = self.chunk.here();
         self.chunk.patch_jump(to_end, end);
         self.chunk.emit(Op::Pop); // discard the iterator
-        // continue jumps to `start` (re-enter the per-iteration scope cleanly).
+                                  // continue jumps to `start` (re-enter the per-iteration scope cleanly).
         self.finish_loop(start, end);
         body_ok
     }
@@ -1056,18 +1060,36 @@ mod tests {
         let body = body_of("function* g(){ let i = 0; while (true) { yield i; i = i + 1; } }");
         let c = compile_body(&body).expect("infinite generator body compiles");
         assert!(has_op(&c, |o| matches!(o, Op::Yield)), "emits Yield");
-        assert!(has_op(&c, |o| matches!(o, Op::JumpIfFalse(_))), "while test branch");
-        assert!(has_op(&c, |o| matches!(o, Op::EvalExpr(_))), "pure parts delegated");
-        assert!(has_op(&c, |o| matches!(o, Op::DeclareLet(_))), "let i declared");
+        assert!(
+            has_op(&c, |o| matches!(o, Op::JumpIfFalse(_))),
+            "while test branch"
+        );
+        assert!(
+            has_op(&c, |o| matches!(o, Op::EvalExpr(_))),
+            "pure parts delegated"
+        );
+        assert!(
+            has_op(&c, |o| matches!(o, Op::DeclareLet(_))),
+            "let i declared"
+        );
     }
 
     #[test]
     fn compiles_for_of_with_yield() {
         let body = body_of("function* g(xs){ for (const x of xs) { yield x * 2; } }");
         let c = compile_body(&body).expect("for-of body compiles");
-        assert!(has_op(&c, |o| matches!(o, Op::GetIterator)), "iterator obtained");
-        assert!(has_op(&c, |o| matches!(o, Op::IterNext(_))), "step-wise iteration");
-        assert!(has_op(&c, |o| matches!(o, Op::Yield)), "yields inside the loop");
+        assert!(
+            has_op(&c, |o| matches!(o, Op::GetIterator)),
+            "iterator obtained"
+        );
+        assert!(
+            has_op(&c, |o| matches!(o, Op::IterNext(_))),
+            "step-wise iteration"
+        );
+        assert!(
+            has_op(&c, |o| matches!(o, Op::Yield)),
+            "yields inside the loop"
+        );
     }
 
     #[test]
@@ -1085,13 +1107,19 @@ mod tests {
         // `BindPattern` (no longer an eager-fallback case).
         let body = body_of("function* g(o){ const { a } = o; yield a; }");
         let c = compile_body(&body).expect("destructuring decl compiles");
-        assert!(has_op(&c, |o| matches!(o, Op::BindPattern(_))), "uses BindPattern");
+        assert!(
+            has_op(&c, |o| matches!(o, Op::BindPattern(_))),
+            "uses BindPattern"
+        );
     }
 
     #[test]
     fn finally_with_return_bails_to_eager() {
         // A `return` crossing a `finally` still falls back to the eager model.
         let body = body_of("function* g(){ try { return; } finally { yield 1; } }");
-        assert!(compile_body(&body).is_none(), "return through finally → None");
+        assert!(
+            compile_body(&body).is_none(),
+            "return through finally → None"
+        );
     }
 }

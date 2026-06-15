@@ -270,7 +270,9 @@ fn parse_compound(s: &str) -> Compound {
     // Optional leading tag / '*'.
     if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'*') {
         let start = i;
-        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'*') {
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'*')
+        {
             i += 1;
         }
         let t = &s[start..i];
@@ -284,7 +286,9 @@ fn parse_compound(s: &str) -> Compound {
             b'.' => {
                 i += 1;
                 let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_') {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+                {
                     i += 1;
                 }
                 c.classes.push(s[start..i].to_string());
@@ -292,7 +296,9 @@ fn parse_compound(s: &str) -> Compound {
             b'#' => {
                 i += 1;
                 let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_') {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+                {
                     i += 1;
                 }
                 c.id = Some(s[start..i].to_string());
@@ -365,7 +371,10 @@ fn strip_comments(css: &str) -> String {
     let mut rest = css;
     while let Some(start) = rest.find("/*") {
         out.push_str(&rest[..start]);
-        rest = rest[start + 2..].find("*/").map(|e| &rest[start + 2 + e + 2..]).unwrap_or("");
+        rest = rest[start + 2..]
+            .find("*/")
+            .map(|e| &rest[start + 2 + e + 2..])
+            .unwrap_or("");
     }
     out.push_str(rest);
     out
@@ -543,7 +552,10 @@ fn parse_grid_columns(v: &str) -> usize {
             return n.max(1);
         }
     }
-    v.split_whitespace().filter(|t| !t.is_empty()).count().max(1)
+    v.split_whitespace()
+        .filter(|t| !t.is_empty())
+        .count()
+        .max(1)
 }
 
 fn apply_one(style: &mut Style, prop: &str, value: &str) {
@@ -620,12 +632,20 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         }
         "font-style" => style.italic = matches!(v, "italic" | "oblique"),
         "font-family" => {
-            let first = v.split(',').next().unwrap_or(v).trim().trim_matches(['"', '\'']);
+            let first = v
+                .split(',')
+                .next()
+                .unwrap_or(v)
+                .trim()
+                .trim_matches(['"', '\'']);
             style.font_family = first.to_string();
             let lower = first.to_ascii_lowercase();
-            style.generic_serif = lower == "serif" || lower.contains("times") || lower.contains("georgia");
-            style.generic_mono =
-                lower == "monospace" || lower.contains("courier") || lower.contains("mono") || lower.contains("consol");
+            style.generic_serif =
+                lower == "serif" || lower.contains("times") || lower.contains("georgia");
+            style.generic_mono = lower == "monospace"
+                || lower.contains("courier")
+                || lower.contains("mono")
+                || lower.contains("consol");
         }
         "text-align" => {
             style.align = match v {
@@ -689,10 +709,12 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         }
         "white-space" => style.pre = v.starts_with("pre"),
         "page-break-before" | "break-before" => {
-            style.page_break_before = matches!(v, "always" | "page" | "left" | "right" | "recto" | "verso");
+            style.page_break_before =
+                matches!(v, "always" | "page" | "left" | "right" | "recto" | "verso");
         }
         "page-break-after" | "break-after" => {
-            style.page_break_after = matches!(v, "always" | "page" | "left" | "right" | "recto" | "verso");
+            style.page_break_after =
+                matches!(v, "always" | "page" | "left" | "right" | "recto" | "verso");
         }
         "margin" => style.margin = parse_edges(v, style.font_size),
         "margin-top" => style.margin.top = parse_len_px(v, style.font_size).unwrap_or(0.0),
@@ -805,7 +827,10 @@ pub fn parse_color(v: &str) -> Option<[f64; 3]> {
         return Some([r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0]);
     }
     if let Some(inner) = v.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        let nums: Vec<f64> = inner.split(',').filter_map(|n| n.trim().parse::<f64>().ok()).collect();
+        let nums: Vec<f64> = inner
+            .split(',')
+            .filter_map(|n| n.trim().parse::<f64>().ok())
+            .collect();
         if nums.len() >= 3 {
             return Some([nums[0] / 255.0, nums[1] / 255.0, nums[2] / 255.0]);
         }

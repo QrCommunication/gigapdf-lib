@@ -8,18 +8,69 @@
 
 // Length codes 257..=285: (base length, extra bits).
 const LENGTH_TABLE: [(u16, u8); 29] = [
-    (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0),
-    (11, 1), (13, 1), (15, 1), (17, 1), (19, 2), (23, 2), (27, 2), (31, 2),
-    (35, 3), (43, 3), (51, 3), (59, 3), (67, 4), (83, 4), (99, 4), (115, 4),
-    (131, 5), (163, 5), (195, 5), (227, 5), (258, 0),
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),
+    (11, 1),
+    (13, 1),
+    (15, 1),
+    (17, 1),
+    (19, 2),
+    (23, 2),
+    (27, 2),
+    (31, 2),
+    (35, 3),
+    (43, 3),
+    (51, 3),
+    (59, 3),
+    (67, 4),
+    (83, 4),
+    (99, 4),
+    (115, 4),
+    (131, 5),
+    (163, 5),
+    (195, 5),
+    (227, 5),
+    (258, 0),
 ];
 
 // Distance codes 0..=29: (base distance, extra bits).
 const DIST_TABLE: [(u16, u8); 30] = [
-    (1, 0), (2, 0), (3, 0), (4, 0), (5, 1), (7, 1), (9, 2), (13, 2),
-    (17, 3), (25, 3), (33, 4), (49, 4), (65, 5), (97, 5), (129, 6), (193, 6),
-    (257, 7), (385, 7), (513, 8), (769, 8), (1025, 9), (1537, 9), (2049, 10),
-    (3073, 10), (4097, 11), (6145, 11), (8193, 12), (12289, 12), (16385, 13), (24577, 13),
+    (1, 0),
+    (2, 0),
+    (3, 0),
+    (4, 0),
+    (5, 1),
+    (7, 1),
+    (9, 2),
+    (13, 2),
+    (17, 3),
+    (25, 3),
+    (33, 4),
+    (49, 4),
+    (65, 5),
+    (97, 5),
+    (129, 6),
+    (193, 6),
+    (257, 7),
+    (385, 7),
+    (513, 8),
+    (769, 8),
+    (1025, 9),
+    (1537, 9),
+    (2049, 10),
+    (3073, 10),
+    (4097, 11),
+    (6145, 11),
+    (8193, 12),
+    (12289, 12),
+    (16385, 13),
+    (24577, 13),
 ];
 
 struct BitWriter {
@@ -30,13 +81,21 @@ struct BitWriter {
 
 impl BitWriter {
     fn new() -> BitWriter {
-        BitWriter { out: Vec::new(), buf: 0, bits: 0 }
+        BitWriter {
+            out: Vec::new(),
+            buf: 0,
+            bits: 0,
+        }
     }
 
     /// Write the low `count` bits of `value`, least-significant bit first
     /// (DEFLATE's packing order for data elements and extra bits).
     fn write_bits(&mut self, value: u32, count: u32) {
-        let mask = if count >= 32 { u32::MAX } else { (1u32 << count) - 1 };
+        let mask = if count >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << count) - 1
+        };
         self.buf |= ((value & mask) as u64) << self.bits;
         self.bits += count;
         while self.bits >= 8 {
@@ -121,7 +180,8 @@ const MAX_MATCH: usize = 258;
 const WINDOW: usize = 32768;
 
 fn hash3(data: &[u8], i: usize) -> usize {
-    ((data[i] as usize) << 10 ^ (data[i + 1] as usize) << 5 ^ data[i + 2] as usize) & (HASH_SIZE - 1)
+    ((data[i] as usize) << 10 ^ (data[i + 1] as usize) << 5 ^ data[i + 2] as usize)
+        & (HASH_SIZE - 1)
 }
 
 /// Raw DEFLATE stream (single fixed-Huffman block) for `data`.
@@ -148,10 +208,7 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
                     break;
                 }
                 let mut len = 0;
-                while len < MAX_MATCH
-                    && i + len < data.len()
-                    && data[jp + len] == data[i + len]
-                {
+                while len < MAX_MATCH && i + len < data.len() && data[jp + len] == data[i + len] {
                     len += 1;
                 }
                 if len > best_len {
@@ -211,8 +268,16 @@ mod tests {
             b"The quick brown fox jumps over the lazy dog. The quick brown fox.",
         ];
         for &data in cases {
-            assert_eq!(inflate(&deflate(data)).unwrap(), data, "raw deflate {data:?}");
-            assert_eq!(flate_decode(&flate_encode(data)).unwrap(), data, "zlib {data:?}");
+            assert_eq!(
+                inflate(&deflate(data)).unwrap(),
+                data,
+                "raw deflate {data:?}"
+            );
+            assert_eq!(
+                flate_decode(&flate_encode(data)).unwrap(),
+                data,
+                "zlib {data:?}"
+            );
         }
     }
 
@@ -220,7 +285,10 @@ mod tests {
     fn compresses_repetitive_data() {
         let data = vec![b'A'; 4096];
         let encoded = flate_encode(&data);
-        assert!(encoded.len() < data.len() / 4, "highly repetitive data shrinks");
+        assert!(
+            encoded.len() < data.len() / 4,
+            "highly repetitive data shrinks"
+        );
         assert_eq!(flate_decode(&encoded).unwrap(), data);
     }
 

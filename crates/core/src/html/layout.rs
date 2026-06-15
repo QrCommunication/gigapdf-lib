@@ -101,7 +101,14 @@ pub fn layout_document(
         nodes,
         sheet,
         measure,
-        &Frame { page_w, page_h, top: margin, right: margin, bottom: margin, left: margin },
+        &Frame {
+            page_w,
+            page_h,
+            top: margin,
+            right: margin,
+            bottom: margin,
+            left: margin,
+        },
     )
 }
 
@@ -341,7 +348,14 @@ impl Flow<'_> {
         }
 
         let new_ancestors = push_ancestor(ancestors, el);
-        cy = self.block_children(&el.children, style, content_x, content_w, cy, &new_ancestors);
+        cy = self.block_children(
+            &el.children,
+            style,
+            content_x,
+            content_w,
+            cy,
+            &new_ancestors,
+        );
 
         cy += p.bottom + b.bottom;
         let mut box_h = (cy - box_top).max(0.1);
@@ -351,7 +365,8 @@ impl Flow<'_> {
 
         // Background + border behind the content (z=0). `visibility: hidden`
         // suppresses the paint but the box still occupies its space.
-        if !style.hidden && (style.background.is_some() || b.top + b.bottom + b.left + b.right > 0.0)
+        if !style.hidden
+            && (style.background.is_some() || b.top + b.bottom + b.left + b.right > 0.0)
         {
             self.out.push(Abs {
                 z: 0,
@@ -361,7 +376,11 @@ impl Flow<'_> {
                     w: box_w,
                     h: box_h,
                     fill: style.background,
-                    stroke: if b.top > 0.0 { Some(style.border_color) } else { None },
+                    stroke: if b.top > 0.0 {
+                        Some(style.border_color)
+                    } else {
+                        None
+                    },
                     stroke_w: b.top,
                     opacity: style.opacity,
                 },
@@ -417,8 +436,14 @@ impl Flow<'_> {
                 // Inline <svg> → native vector box (sized by width/height or viewBox).
                 if e.tag == "svg" {
                     if let Some(img) = crate::svg::from_element(e) {
-                        let w = e.attr("width").and_then(|v| v.parse().ok()).unwrap_or(img.width.max(1.0));
-                        let h = e.attr("height").and_then(|v| v.parse().ok()).unwrap_or(img.height.max(1.0));
+                        let w = e
+                            .attr("width")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(img.width.max(1.0));
+                        let h = e
+                            .attr("height")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(img.height.max(1.0));
                         out.push(InlineItem {
                             text: String::new(),
                             style: st,
@@ -428,14 +453,24 @@ impl Flow<'_> {
                     return;
                 }
                 if e.tag == "img" {
-                    let w = e.attr("width").and_then(|v| v.parse::<f64>().ok()).unwrap_or(64.0);
-                    let h = e.attr("height").and_then(|v| v.parse::<f64>().ok()).unwrap_or(64.0);
+                    let w = e
+                        .attr("width")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(64.0);
+                    let h = e
+                        .attr("height")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(64.0);
                     let src = e.attr("src").unwrap_or_default().to_string();
                     // A `data:image/svg+xml` source renders as native vector, not a bitmap.
                     let media = crate::svg::parse_data_uri(&src)
                         .map(|img| Media::Svg(w, h, img))
                         .unwrap_or(Media::Raster(w, h, src));
-                    out.push(InlineItem { text: String::new(), style: st, media: Some(media) });
+                    out.push(InlineItem {
+                        text: String::new(),
+                        style: st,
+                        media: Some(media),
+                    });
                     return;
                 }
                 let na = push_ancestor(ancestors, e);
@@ -563,14 +598,26 @@ impl Flow<'_> {
                     Some(Media::Raster(iw, ih, src)) => {
                         this.out.push(Abs {
                             z: 1,
-                            frag: Fragment::Image { x: cx, y: *y, w: *iw, h: *ih, src: src.clone() },
+                            frag: Fragment::Image {
+                                x: cx,
+                                y: *y,
+                                w: *iw,
+                                h: *ih,
+                                src: src.clone(),
+                            },
                         });
                         cx += iw + space_w;
                     }
                     Some(Media::Svg(iw, ih, image)) => {
                         this.out.push(Abs {
                             z: 1,
-                            frag: Fragment::Svg { x: cx, y: *y, w: *iw, h: *ih, image: image.clone() },
+                            frag: Fragment::Svg {
+                                x: cx,
+                                y: *y,
+                                w: *iw,
+                                h: *ih,
+                                image: image.clone(),
+                            },
                         });
                         cx += iw + space_w;
                     }
@@ -584,7 +631,12 @@ impl Flow<'_> {
                                 text: w.text.clone(),
                             },
                         });
-                        cx += w.w + if w.space_after { space_w + gap_extra } else { 0.0 };
+                        cx += w.w
+                            + if w.space_after {
+                                space_w + gap_extra
+                            } else {
+                                0.0
+                            };
                     }
                 }
             }
@@ -728,8 +780,7 @@ impl Flow<'_> {
         }
 
         let content_x = x + m.left + b.left + p.left;
-        let content_w =
-            (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
+        let content_w = (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
         let row_top = y + b.top + p.top;
 
         let row_bottom = if style.flex_column {
@@ -917,8 +968,7 @@ impl Flow<'_> {
 
         let cols = style.grid_columns.max(1);
         let content_x = x + m.left + b.left + p.left;
-        let content_w =
-            (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
+        let content_w = (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
         let col_w = content_w / cols as f64;
         let mut y_cursor = y + b.top + p.top;
 
@@ -1078,8 +1128,19 @@ fn roman_marker(n: usize, upper: bool) -> String {
         return n.to_string();
     }
     const VALUES: [(usize, &str); 13] = [
-        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
-        (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
     ];
     let mut n = n;
     let mut out = String::new();
@@ -1165,7 +1226,13 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
             Fragment::Svg { x, y, w, h, image } => {
                 let p = page_of(y);
                 ensure(&mut pages, p);
-                pages[p].push(Fragment::Svg { x, y: local_y(y, p), w, h, image });
+                pages[p].push(Fragment::Svg {
+                    x,
+                    y: local_y(y, p),
+                    w,
+                    h,
+                    image,
+                });
             }
             Fragment::Rect {
                 x,
@@ -1236,7 +1303,12 @@ mod tests {
     fn wraps_long_text_into_multiple_lines() {
         let html = format!("<p>{}</p>", "word ".repeat(200));
         let layout = run(&html);
-        let texts = layout.pages.iter().flatten().filter(|f| matches!(f, Fragment::Text { .. })).count();
+        let texts = layout
+            .pages
+            .iter()
+            .flatten()
+            .filter(|f| matches!(f, Fragment::Text { .. }))
+            .count();
         assert!(texts > 50, "long paragraph wraps into many runs ({texts})");
     }
 
@@ -1244,7 +1316,11 @@ mod tests {
     fn paginates_tall_content() {
         let html = format!("<div>{}</div>", "<p>line</p>".repeat(120));
         let layout = run(&html);
-        assert!(layout.pages.len() > 1, "tall content spans pages ({})", layout.pages.len());
+        assert!(
+            layout.pages.len() > 1,
+            "tall content spans pages ({})",
+            layout.pages.len()
+        );
     }
 
     #[test]
@@ -1316,7 +1392,10 @@ mod tests {
             .collect();
         let l = texts.iter().find(|(_, t)| t == "Left").unwrap().0;
         let r = texts.iter().find(|(_, t)| t == "Right").unwrap().0;
-        assert!(r > l, "flex item 'Right' is to the right of 'Left' (l={l}, r={r})");
+        assert!(
+            r > l,
+            "flex item 'Right' is to the right of 'Left' (l={l}, r={r})"
+        );
     }
 
     fn text_xy(layout: &Layout) -> Vec<(f64, f64, String)> {
@@ -1360,7 +1439,9 @@ mod tests {
         // Bare <ol> defaults to decimal, bare <ul> to a disc bullet.
         let dec = text_runs(&run("<ol><li>a</li><li>b</li></ol>"));
         assert!(dec.iter().any(|s| s == "1.") && dec.iter().any(|s| s == "2."));
-        assert!(text_runs(&run("<ul><li>a</li></ul>")).iter().any(|s| s == "•"));
+        assert!(text_runs(&run("<ul><li>a</li></ul>"))
+            .iter()
+            .any(|s| s == "•"));
     }
 
     #[test]
@@ -1399,7 +1480,11 @@ mod tests {
             Fragment::Svg { w, h, .. } => Some((*w, *h)),
             _ => None,
         });
-        assert_eq!(svg, Some((20.0, 20.0)), "inline <svg> → a 20×20 vector fragment");
+        assert_eq!(
+            svg,
+            Some((20.0, 20.0)),
+            "inline <svg> → a 20×20 vector fragment"
+        );
         // Surrounding text still flows as text runs.
         assert!(text_runs(&layout).iter().any(|t| t == "logo"));
     }
@@ -1418,10 +1503,15 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        assert!(texts(&run(r#"<p style="text-transform: uppercase">hello world</p>"#)).contains("HELLO"));
+        assert!(texts(&run(
+            r#"<p style="text-transform: uppercase">hello world</p>"#
+        ))
+        .contains("HELLO"));
         assert!(texts(&run(r#"<p style="text-transform: lowercase">HELLO</p>"#)).contains("hello"));
         // `capitalize` upper-cases each word's first letter; it is inherited.
-        let cap = texts(&run(r#"<div style="text-transform: capitalize"><span>the quick</span></div>"#));
+        let cap = texts(&run(
+            r#"<div style="text-transform: capitalize"><span>the quick</span></div>"#,
+        ));
         assert!(cap.contains("The") && cap.contains("Quick"), "got: {cap}");
     }
 
@@ -1465,9 +1555,8 @@ mod tests {
     fn flex_grow_widens_the_growing_item() {
         // Item A grows (weight 4), item B does not (weight 1): A's column is wider,
         // so B starts much further right than the equal-split midpoint.
-        let grow = run(
-            r#"<div style="display:flex"><div style="flex:3">A</div><div>B</div></div>"#,
-        );
+        let grow =
+            run(r#"<div style="display:flex"><div style="flex:3">A</div><div>B</div></div>"#);
         let equal = run(r#"<div style="display:flex"><div>A</div><div>B</div></div>"#);
         let bx = |l: &Layout| text_xy(l).into_iter().find(|(_, _, s)| s == "B").unwrap().0;
         assert!(

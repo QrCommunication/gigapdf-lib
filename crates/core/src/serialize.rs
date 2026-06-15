@@ -194,9 +194,7 @@ fn remap_refs(object: &Object, map: &BTreeMap<ObjectId, u32>) -> Object {
             Some(number) => Object::Reference((*number, 0)),
             None => Object::Null,
         },
-        Object::Array(items) => {
-            Object::Array(items.iter().map(|o| remap_refs(o, map)).collect())
-        }
+        Object::Array(items) => Object::Array(items.iter().map(|o| remap_refs(o, map)).collect()),
         Object::Dictionary(dict) => Object::Dictionary(remap_dict(dict, map)),
         Object::Stream(stream) => Object::Stream(Stream {
             dict: remap_dict(&stream.dict, map),

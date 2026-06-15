@@ -212,8 +212,8 @@ impl<'a> Lexer<'a> {
             }
         }
         let slice = &self.data[start..self.pos];
-        let text = std::str::from_utf8(slice)
-            .map_err(|_| EngineError::parse(start, "non-utf8 number"))?;
+        let text =
+            std::str::from_utf8(slice).map_err(|_| EngineError::parse(start, "non-utf8 number"))?;
         if seen_dot {
             let value =
                 parse_pdf_real(text).ok_or_else(|| EngineError::parse(start, "invalid real"))?;
@@ -355,7 +355,10 @@ impl<'a> Lexer<'a> {
         if self.pos == start {
             let b = self.data[self.pos];
             self.pos += 1; // consume one byte to guarantee progress
-            return Err(EngineError::parse(start, format!("unexpected byte 0x{b:02X}")));
+            return Err(EngineError::parse(
+                start,
+                format!("unexpected byte 0x{b:02X}"),
+            ));
         }
         Ok(Token::Keyword(self.data[start..self.pos].to_vec()))
     }

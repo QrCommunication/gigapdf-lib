@@ -57,7 +57,8 @@ impl MeasureBook {
         let faces = fonts
             .iter()
             .filter_map(|f| {
-                TrueTypeFont::parse(&f.ttf).map(|ttf| (key(&f.family, weight_bold(f.weight), f.italic), ttf))
+                TrueTypeFont::parse(&f.ttf)
+                    .map(|ttf| (key(&f.family, weight_bold(f.weight), f.italic), ttf))
             })
             .collect();
         MeasureBook { faces }
@@ -114,7 +115,11 @@ pub fn needed_fonts(html: &str) -> Vec<FontRequest> {
 
 /// Like [`needed_fonts`] but also scans the running `header`/`footer` HTML, so
 /// the fonts they reference are requested too.
-pub fn needed_fonts_with(html: &str, header: Option<&str>, footer: Option<&str>) -> Vec<FontRequest> {
+pub fn needed_fonts_with(
+    html: &str,
+    header: Option<&str>,
+    footer: Option<&str>,
+) -> Vec<FontRequest> {
     // Run inline <script>s on the body first so script-generated content is seen.
     let body = crate::js::run_inline_scripts(html);
     let mut seen: Vec<Key> = Vec::new();
@@ -180,7 +185,13 @@ fn collect_fonts(
 /// `margin` are in points (US-Letter portrait with 0.5in margins is a good
 /// default: `612, 792, 36`). Uniform margins, no running header/footer — for the
 /// full page control see [`render_with`]. Returns the PDF bytes.
-pub fn render(html: &str, fonts: &[ProvidedFont], page_w: f64, page_h: f64, margin: f64) -> Vec<u8> {
+pub fn render(
+    html: &str,
+    fonts: &[ProvidedFont],
+    page_w: f64,
+    page_h: f64,
+    margin: f64,
+) -> Vec<u8> {
     let mut opts = RenderOptions::new(page_w, page_h);
     opts.margins = Margins::uniform(margin);
     render_with(html, fonts, &opts)
@@ -236,7 +247,13 @@ fn build_running(
     for i in 0..n_pages {
         let page_no = opts.start_page_number + i as u32;
         let html = substitute_tokens(tpl, page_no, n_pages as u32);
-        let (frags, h) = layout_band(&html, book, opts.page_w, opts.margins.left, opts.margins.right);
+        let (frags, h) = layout_band(
+            &html,
+            book,
+            opts.page_w,
+            opts.margins.left,
+            opts.margins.right,
+        );
         // Header sits at `header_offset` from the top; footer's bottom sits at
         // `footer_offset` from the page bottom.
         let dy = if is_header {
@@ -260,7 +277,14 @@ fn layout_band(
 ) -> (Vec<Fragment>, f64) {
     let nodes = dom::parse(html);
     let sheet = Stylesheet::new(&collect_style_css(&nodes));
-    let frame = Frame { page_w, page_h: 1.0e6, top: 0.0, right, bottom: 0.0, left };
+    let frame = Frame {
+        page_w,
+        page_h: 1.0e6,
+        top: 0.0,
+        right,
+        bottom: 0.0,
+        left,
+    };
     let layout = layout_document_framed(&nodes, &sheet, book, &frame);
     let frags = layout.pages.into_iter().next().unwrap_or_default();
     let h = frags.iter().fold(0.0_f64, |m, f| {
@@ -280,8 +304,22 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
     frags
         .into_iter()
         .map(|f| match f {
-            Fragment::Text { x, y, style, text } => Fragment::Text { x, y: y + dy, style, text },
-            Fragment::Rect { x, y, w, h, fill, stroke, stroke_w, opacity } => Fragment::Rect {
+            Fragment::Text { x, y, style, text } => Fragment::Text {
+                x,
+                y: y + dy,
+                style,
+                text,
+            },
+            Fragment::Rect {
+                x,
+                y,
+                w,
+                h,
+                fill,
+                stroke,
+                stroke_w,
+                opacity,
+            } => Fragment::Rect {
                 x,
                 y: y + dy,
                 w,
@@ -291,8 +329,20 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 stroke_w,
                 opacity,
             },
-            Fragment::Image { x, y, w, h, src } => Fragment::Image { x, y: y + dy, w, h, src },
-            Fragment::Svg { x, y, w, h, image } => Fragment::Svg { x, y: y + dy, w, h, image },
+            Fragment::Image { x, y, w, h, src } => Fragment::Image {
+                x,
+                y: y + dy,
+                w,
+                h,
+                src,
+            },
+            Fragment::Svg { x, y, w, h, image } => Fragment::Svg {
+                x,
+                y: y + dy,
+                w,
+                h,
+                image,
+            },
         })
         .collect()
 }
@@ -376,11 +426,17 @@ fn paint(
                     let face = book.face(style);
                     let colors = face.and_then(|f| f.color_glyphs()); // COLR/CPAL
                     let sbix = face.and_then(|f| f.sbix_glyphs()); // Apple bitmap emoji
-                    // Classify a char: `Some((gid, is_colr))` for a colour glyph —
-                    // `is_colr=false` is an sbix bitmap; `None` is ordinary text.
-                    let classify = |f: &crate::font::truetype::TrueTypeFont, ch: char| -> Option<(u16, bool)> {
+                                                                   // Classify a char: `Some((gid, is_colr))` for a colour glyph —
+                                                                   // `is_colr=false` is an sbix bitmap; `None` is ordinary text.
+                    let classify = |f: &crate::font::truetype::TrueTypeFont,
+                                    ch: char|
+                     -> Option<(u16, bool)> {
                         let g = f.gid_for_unicode(ch as u32)?;
-                        if colors.as_ref().map(|c| c.layers(g).is_some()).unwrap_or(false) {
+                        if colors
+                            .as_ref()
+                            .map(|c| c.layers(g).is_some())
+                            .unwrap_or(false)
+                        {
                             Some((g, true))
                         } else if sbix.as_ref().map(|s| s.glyph(g).is_some()).unwrap_or(false) {
                             Some((g, false))
@@ -388,7 +444,9 @@ fn paint(
                             None
                         }
                     };
-                    let color_run = face.map(|f| trimmed.chars().any(|ch| classify(f, ch).is_some())).unwrap_or(false);
+                    let color_run = face
+                        .map(|f| trimmed.chars().any(|ch| classify(f, ch).is_some()))
+                        .unwrap_or(false);
 
                     if let (true, Some(face)) = (color_run, face) {
                         // Walk the run, advancing by the same per-glyph widths the
@@ -401,15 +459,39 @@ fn paint(
                             match classify(face, ch) {
                                 Some((g, is_colr)) => {
                                     if !seg.is_empty() {
-                                        let _ = doc.add_text(page, seg_x, baseline, style.font_size, &seg, id, style.color);
+                                        let _ = doc.add_text(
+                                            page,
+                                            seg_x,
+                                            baseline,
+                                            style.font_size,
+                                            &seg,
+                                            id,
+                                            style.color,
+                                        );
                                         seg.clear();
                                     }
                                     if is_colr {
                                         if let Some(c) = colors.as_ref() {
-                                            let _ = doc.draw_color_glyph(page, face, c, g, pen, baseline, style.font_size, style.color);
+                                            let _ = doc.draw_color_glyph(
+                                                page,
+                                                face,
+                                                c,
+                                                g,
+                                                pen,
+                                                baseline,
+                                                style.font_size,
+                                                style.color,
+                                            );
                                         }
                                     } else {
-                                        let _ = doc.draw_sbix_glyph(page, face, g, pen, baseline, style.font_size);
+                                        let _ = doc.draw_sbix_glyph(
+                                            page,
+                                            face,
+                                            g,
+                                            pen,
+                                            baseline,
+                                            style.font_size,
+                                        );
                                     }
                                     pen += cw;
                                     seg_x = pen;
@@ -424,10 +506,26 @@ fn paint(
                             }
                         }
                         if !seg.is_empty() {
-                            let _ = doc.add_text(page, seg_x, baseline, style.font_size, &seg, id, style.color);
+                            let _ = doc.add_text(
+                                page,
+                                seg_x,
+                                baseline,
+                                style.font_size,
+                                &seg,
+                                id,
+                                style.color,
+                            );
                         }
                     } else {
-                        let _ = doc.add_text(page, *x, baseline, style.font_size, trimmed, id, style.color);
+                        let _ = doc.add_text(
+                            page,
+                            *x,
+                            baseline,
+                            style.font_size,
+                            trimmed,
+                            id,
+                            style.color,
+                        );
                     }
 
                     // Decoration rules (underline / line-through / overline) are
@@ -535,7 +633,8 @@ mod tests {
     fn needed_fonts_resolves_google_family() {
         let reqs = needed_fonts(r#"<p style="font-family:Roboto">Hello</p>"#);
         assert!(
-            reqs.iter().any(|r| r.family.eq_ignore_ascii_case("Roboto") && r.url.contains("fonts")),
+            reqs.iter()
+                .any(|r| r.family.eq_ignore_ascii_case("Roboto") && r.url.contains("fonts")),
             "Roboto is requested with a Google-Fonts URL: {reqs:?}"
         );
     }
@@ -572,7 +671,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(p2.contains('2') && p2.contains('3'), "footer text 2/3: {p2:?}");
+        assert!(
+            p2.contains('2') && p2.contains('3'),
+            "footer text 2/3: {p2:?}"
+        );
         // It is positioned down in the bottom margin (near the page bottom).
         let max_y = footers[1]
             .iter()
@@ -581,7 +683,10 @@ mod tests {
                 _ => None,
             })
             .fold(0.0_f64, f64::max);
-        assert!(max_y > 500.0, "footer sits near the page bottom (y={max_y})");
+        assert!(
+            max_y > 500.0,
+            "footer sits near the page bottom (y={max_y})"
+        );
     }
 
     #[test]
@@ -591,7 +696,8 @@ mod tests {
         let mut opts = RenderOptions::new(w, h);
         opts.margins = Margins::symmetric(48.0, 36.0);
         opts.header = Some(r#"<div style="background:#eeeeee">Report</div>"#.into());
-        opts.footer = Some(r#"<div style="text-align:center">Page {{page}}/{{pages}}</div>"#.into());
+        opts.footer =
+            Some(r#"<div style="text-align:center">Page {{page}}/{{pages}}</div>"#.into());
         let html = format!("<div>{}</div>", "<p>content line</p>".repeat(100));
         let pdf = render_with(&html, &[], &opts);
         assert!(pdf.starts_with(b"%PDF-"), "valid PDF");

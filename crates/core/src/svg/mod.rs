@@ -33,13 +33,30 @@ pub(crate) struct Mat {
 
 impl Mat {
     fn identity() -> Self {
-        Self { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
     }
     fn translate(x: f64, y: f64) -> Self {
-        Self { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: x,
+            f: y,
+        }
     }
     fn apply(&self, x: f64, y: f64) -> (f64, f64) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
     }
     /// `self ∘ other` — `other` is applied first, then `self`.
     fn then(&self, o: &Mat) -> Mat {
@@ -97,8 +114,19 @@ pub(crate) struct Gradient {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum GradKind {
-    Linear { x1: f64, y1: f64, x2: f64, y2: f64 },
-    Radial { cx: f64, cy: f64, r: f64, fx: f64, fy: f64 },
+    Linear {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
+    Radial {
+        cx: f64,
+        cy: f64,
+        r: f64,
+        fx: f64,
+        fy: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,18 +193,30 @@ pub fn from_element(svg: &Element) -> Option<SvgImage> {
     let vb = svg.attr("viewbox").and_then(parse_view_box);
     let attr_w = svg.attr("width").and_then(parse_len);
     let attr_h = svg.attr("height").and_then(parse_len);
-    let view_box = vb.unwrap_or_else(|| [0.0, 0.0, attr_w.unwrap_or(100.0), attr_h.unwrap_or(100.0)]);
+    let view_box =
+        vb.unwrap_or_else(|| [0.0, 0.0, attr_w.unwrap_or(100.0), attr_h.unwrap_or(100.0)]);
     let width = attr_w.or_else(|| vb.map(|v| v[2])).unwrap_or(view_box[2]);
     let height = attr_h.or_else(|| vb.map(|v| v[3])).unwrap_or(view_box[3]);
 
     let mut grads = Grads::new();
     collect_gradients(&svg.children, &mut grads);
     let mut prims = Vec::new();
-    walk(&svg.children, Mat::identity(), Paint::root(), &grads, &mut prims);
+    walk(
+        &svg.children,
+        Mat::identity(),
+        Paint::root(),
+        &grads,
+        &mut prims,
+    );
     if prims.is_empty() {
         return None;
     }
-    Some(SvgImage { width, height, view_box, prims })
+    Some(SvgImage {
+        width,
+        height,
+        view_box,
+        prims,
+    })
 }
 
 fn find_svg(nodes: &[Node]) -> Option<&Element> {
@@ -208,11 +248,23 @@ fn walk(nodes: &[Node], ctm: Mat, paint: Paint, grads: &Grads, out: &mut Vec<Pri
             "rect" => push(out, rect_segs(e), ctm, paint, furl, grads),
             "circle" => {
                 let r = attr_f(e, "r");
-                push(out, ellipse_segs(attr_f(e, "cx"), attr_f(e, "cy"), r, r), ctm, paint, furl, grads);
+                push(
+                    out,
+                    ellipse_segs(attr_f(e, "cx"), attr_f(e, "cy"), r, r),
+                    ctm,
+                    paint,
+                    furl,
+                    grads,
+                );
             }
             "ellipse" => push(
                 out,
-                ellipse_segs(attr_f(e, "cx"), attr_f(e, "cy"), attr_f(e, "rx"), attr_f(e, "ry")),
+                ellipse_segs(
+                    attr_f(e, "cx"),
+                    attr_f(e, "cy"),
+                    attr_f(e, "rx"),
+                    attr_f(e, "ry"),
+                ),
                 ctm,
                 paint,
                 furl,
@@ -221,7 +273,14 @@ fn walk(nodes: &[Node], ctm: Mat, paint: Paint, grads: &Grads, out: &mut Vec<Pri
             "line" => push(out, line_segs(e), ctm, paint, furl, grads),
             "polyline" => push(out, poly_segs(e, false), ctm, paint, furl, grads),
             "polygon" => push(out, poly_segs(e, true), ctm, paint, furl, grads),
-            "path" => push(out, e.attr("d").map(parse_path_d).unwrap_or_default(), ctm, paint, furl, grads),
+            "path" => push(
+                out,
+                e.attr("d").map(parse_path_d).unwrap_or_default(),
+                ctm,
+                paint,
+                furl,
+                grads,
+            ),
             _ => {} // <defs>/<title>/<style>/text/… ignored
         }
     }
@@ -230,7 +289,14 @@ fn walk(nodes: &[Node], ctm: Mat, paint: Paint, grads: &Grads, out: &mut Vec<Pri
 /// Bake the transform into the segments and record the primitive (skipping the
 /// invisible: empty geometry, or no fill and no stroke). `fill_url` is a gradient
 /// id from `fill="url(#id)"`, resolved against `grads`.
-fn push(out: &mut Vec<Prim>, segs: Vec<Seg>, ctm: Mat, paint: Paint, fill_url: Option<&str>, grads: &Grads) {
+fn push(
+    out: &mut Vec<Prim>,
+    segs: Vec<Seg>,
+    ctm: Mat,
+    paint: Paint,
+    fill_url: Option<&str>,
+    grads: &Grads,
+) {
     if segs.is_empty() {
         return;
     }
@@ -256,7 +322,12 @@ fn push(out: &mut Vec<Prim>, segs: Vec<Seg>, ctm: Mat, paint: Paint, fill_url: O
 
 /// Axis-aligned bounding box `[min_x, min_y, max_x, max_y]` of path segments.
 fn segs_bbox(segs: &[Seg]) -> [f64; 4] {
-    let (mut nx, mut ny, mut xx, mut xy) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let (mut nx, mut ny, mut xx, mut xy) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
     let mut upd = |x: f64, y: f64| {
         nx = nx.min(x);
         ny = ny.min(y);
@@ -307,7 +378,12 @@ fn transform_seg(s: &Seg, m: &Mat) -> Seg {
 const KAPPA: f64 = 0.552_284_749_830_793_4;
 
 fn rect_segs(e: &Element) -> Vec<Seg> {
-    let (x, y, w, h) = (attr_f(e, "x"), attr_f(e, "y"), attr_f(e, "width"), attr_f(e, "height"));
+    let (x, y, w, h) = (
+        attr_f(e, "x"),
+        attr_f(e, "y"),
+        attr_f(e, "width"),
+        attr_f(e, "height"),
+    );
     if w <= 0.0 || h <= 0.0 {
         return Vec::new();
     }
@@ -337,7 +413,14 @@ fn rect_segs(e: &Element) -> Vec<Seg> {
         Seg::Line(x + w - rx, y),
         Seg::Cubic(x + w - rx + kx, y, x + w, y + ry - ky, x + w, y + ry),
         Seg::Line(x + w, y + h - ry),
-        Seg::Cubic(x + w, y + h - ry + ky, x + w - rx + kx, y + h, x + w - rx, y + h),
+        Seg::Cubic(
+            x + w,
+            y + h - ry + ky,
+            x + w - rx + kx,
+            y + h,
+            x + w - rx,
+            y + h,
+        ),
         Seg::Line(x + rx, y + h),
         Seg::Cubic(x + rx - kx, y + h, x, y + h - ry + ky, x, y + h - ry),
         Seg::Line(x, y + ry),
@@ -461,13 +544,23 @@ fn fill_url(e: &Element) -> Option<String> {
     if let Some(u) = e.attr("fill").and_then(extract_url) {
         return Some(u);
     }
-    e.attr("style")
-        .and_then(|s| parse_style(s).into_iter().find(|(k, _)| k == "fill").and_then(|(_, v)| extract_url(&v)))
+    e.attr("style").and_then(|s| {
+        parse_style(s)
+            .into_iter()
+            .find(|(k, _)| k == "fill")
+            .and_then(|(_, v)| extract_url(&v))
+    })
 }
 
 fn extract_url(v: &str) -> Option<String> {
     let inner = v.trim().strip_prefix("url(")?.strip_suffix(')')?;
-    Some(inner.trim().trim_matches(|c| c == '"' || c == '\'').trim_start_matches('#').to_string())
+    Some(
+        inner
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim_start_matches('#')
+            .to_string(),
+    )
 }
 
 fn collect_gradients(nodes: &[Node], out: &mut Grads) {
@@ -488,7 +581,10 @@ fn parse_raw_grad(e: &Element) -> RawGrad {
             .attr("gradientunits")
             .map(|u| u.eq_ignore_ascii_case("userSpaceOnUse"))
             .unwrap_or(false),
-        transform: e.attr("gradienttransform").map(parse_transform).unwrap_or_else(Mat::identity),
+        transform: e
+            .attr("gradienttransform")
+            .map(parse_transform)
+            .unwrap_or_else(Mat::identity),
         href: e
             .attr("href")
             .or_else(|| e.attr("xlink:href"))
@@ -522,9 +618,20 @@ fn parse_stops(e: &Element) -> Vec<GradStop> {
         if s.tag != "stop" {
             continue;
         }
-        let offset = s.attr("offset").and_then(parse_grad_coord).unwrap_or(0.0).clamp(0.0, 1.0);
-        let mut rgb = s.attr("stop-color").and_then(parse_color).unwrap_or([0.0, 0.0, 0.0]);
-        let mut alpha = s.attr("stop-opacity").and_then(parse_f64).unwrap_or(1.0).clamp(0.0, 1.0);
+        let offset = s
+            .attr("offset")
+            .and_then(parse_grad_coord)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let mut rgb = s
+            .attr("stop-color")
+            .and_then(parse_color)
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let mut alpha = s
+            .attr("stop-opacity")
+            .and_then(parse_f64)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
         if let Some(style) = s.attr("style") {
             for (k, v) in parse_style(style) {
                 match k.as_str() {
@@ -597,7 +704,11 @@ fn resolve_gradient(id: &str, grads: &Grads, bbox: [f64; 4], ctm: &Mat) -> Optio
         GradKind::Radial { cx, cy, r, fx, fy }
     };
     let mut stops = raw.stops;
-    stops.sort_by(|a, b| a.offset.partial_cmp(&b.offset).unwrap_or(std::cmp::Ordering::Equal));
+    stops.sort_by(|a, b| {
+        a.offset
+            .partial_cmp(&b.offset)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Some(Gradient { kind, stops })
 }
 
@@ -636,15 +747,31 @@ fn parse_transform(s: &str) -> Mat {
         let args = parse_num_list(&s[arg_start..i.min(s.len())]);
         i += 1; // past ')'
         let t = match name.as_str() {
-            "translate" => Mat::translate(*args.first().unwrap_or(&0.0), *args.get(1).unwrap_or(&0.0)),
+            "translate" => {
+                Mat::translate(*args.first().unwrap_or(&0.0), *args.get(1).unwrap_or(&0.0))
+            }
             "scale" => {
                 let sx = *args.first().unwrap_or(&1.0);
                 let sy = *args.get(1).unwrap_or(&sx);
-                Mat { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
+                Mat {
+                    a: sx,
+                    b: 0.0,
+                    c: 0.0,
+                    d: sy,
+                    e: 0.0,
+                    f: 0.0,
+                }
             }
             "rotate" => {
                 let (sin, cos) = args.first().unwrap_or(&0.0).to_radians().sin_cos();
-                let rot = Mat { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 };
+                let rot = Mat {
+                    a: cos,
+                    b: sin,
+                    c: -sin,
+                    d: cos,
+                    e: 0.0,
+                    f: 0.0,
+                };
                 if args.len() >= 3 {
                     Mat::translate(args[1], args[2])
                         .then(&rot)
@@ -653,15 +780,30 @@ fn parse_transform(s: &str) -> Mat {
                     rot
                 }
             }
-            "matrix" if args.len() == 6 => {
-                Mat { a: args[0], b: args[1], c: args[2], d: args[3], e: args[4], f: args[5] }
-            }
-            "skewx" => {
-                Mat { a: 1.0, b: 0.0, c: args.first().unwrap_or(&0.0).to_radians().tan(), d: 1.0, e: 0.0, f: 0.0 }
-            }
-            "skewy" => {
-                Mat { a: 1.0, b: args.first().unwrap_or(&0.0).to_radians().tan(), c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
-            }
+            "matrix" if args.len() == 6 => Mat {
+                a: args[0],
+                b: args[1],
+                c: args[2],
+                d: args[3],
+                e: args[4],
+                f: args[5],
+            },
+            "skewx" => Mat {
+                a: 1.0,
+                b: 0.0,
+                c: args.first().unwrap_or(&0.0).to_radians().tan(),
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
+            "skewy" => Mat {
+                a: 1.0,
+                b: args.first().unwrap_or(&0.0).to_radians().tan(),
+                c: 0.0,
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
             _ => Mat::identity(),
         };
         m = m.then(&t);
@@ -679,7 +821,10 @@ fn parse_view_box(s: &str) -> Option<[f64; 4]> {
 }
 
 fn parse_points(s: &str) -> Vec<(f64, f64)> {
-    parse_num_list(s).chunks_exact(2).map(|c| (c[0], c[1])).collect()
+    parse_num_list(s)
+        .chunks_exact(2)
+        .map(|c| (c[0], c[1]))
+        .collect()
 }
 
 fn parse_num_list(s: &str) -> Vec<f64> {
@@ -803,7 +948,10 @@ mod tests {
             _ => panic!("rect should have a solid red fill"),
         }
         let circ = &img.prims[1];
-        assert!(circ.fill.is_none() && circ.stroke.is_some(), "circle stroked, not filled");
+        assert!(
+            circ.fill.is_none() && circ.stroke.is_some(),
+            "circle stroked, not filled"
+        );
     }
 
     #[test]
@@ -818,7 +966,10 @@ mod tests {
                 match g.kind {
                     GradKind::Linear { x1, x2, .. } => {
                         // objectBoundingBox: x1=0 → bbox min x (0), x2=1 → max x (100).
-                        assert!((x1 - 0.0).abs() < 1e-6 && (x2 - 100.0).abs() < 1e-6, "x1={x1} x2={x2}");
+                        assert!(
+                            (x1 - 0.0).abs() < 1e-6 && (x2 - 100.0).abs() < 1e-6,
+                            "x1={x1} x2={x2}"
+                        );
                     }
                     _ => panic!("linear gradient"),
                 }
@@ -843,14 +994,23 @@ mod tests {
     #[test]
     fn fill_none_with_no_stroke_is_dropped() {
         let svg = r#"<svg viewBox="0 0 10 10"><rect width="10" height="10" fill="none"/></svg>"#;
-        assert!(parse_svg(svg).is_none(), "invisible primitive yields no image");
+        assert!(
+            parse_svg(svg).is_none(),
+            "invisible primitive yields no image"
+        );
     }
 
     #[test]
     fn data_uri_percent_encoded_svg() {
         let uri = "data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2010%2010%22%3E%3Crect%20width%3D%2210%22%20height%3D%2210%22%2F%3E%3C%2Fsvg%3E";
-        assert!(parse_data_uri(uri).is_some(), "percent-encoded svg data URI parses");
-        assert!(parse_data_uri("data:image/png;base64,iVBORw0K").is_none(), "non-svg data URI rejected");
+        assert!(
+            parse_data_uri(uri).is_some(),
+            "percent-encoded svg data URI parses"
+        );
+        assert!(
+            parse_data_uri("data:image/png;base64,iVBORw0K").is_none(),
+            "non-svg data URI rejected"
+        );
     }
 
     #[test]

@@ -32,7 +32,11 @@ pub struct Security {
 fn pad_password(pw: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, slot) in out.iter_mut().enumerate() {
-        *slot = if i < pw.len() { pw[i] } else { PAD[i - pw.len().min(32)] };
+        *slot = if i < pw.len() {
+            pw[i]
+        } else {
+            PAD[i - pw.len().min(32)]
+        };
     }
     out
 }
@@ -131,7 +135,10 @@ impl Security {
         }
         let v = encrypt.get(b"V").and_then(Object::as_i64).unwrap_or(0);
         let r = encrypt.get(b"R").and_then(Object::as_i64).unwrap_or(0) as i32;
-        let length = encrypt.get(b"Length").and_then(Object::as_i64).unwrap_or(40) as usize;
+        let length = encrypt
+            .get(b"Length")
+            .and_then(Object::as_i64)
+            .unwrap_or(40) as usize;
         let o = str_bytes(encrypt, b"O");
         let p = encrypt.get(b"P").and_then(Object::as_i64).unwrap_or(0) as i32;
         let encrypt_meta = encrypt
@@ -254,7 +261,13 @@ impl Security {
             Object::String(u, crate::object::StringKind::Literal),
         );
 
-        (Security { method: Method::Rc4, key }, dict)
+        (
+            Security {
+                method: Method::Rc4,
+                key,
+            },
+            dict,
+        )
     }
 }
 
@@ -355,7 +368,10 @@ mod tests {
     #[test]
     fn builds_rc4_encrypt_dictionary() {
         let (sec, dict) = Security::new_rc4(b"hunter2", b"file-id-0000", -44);
-        assert_eq!(dict.get(b"Filter").and_then(Object::as_name), Some(b"Standard".as_slice()));
+        assert_eq!(
+            dict.get(b"Filter").and_then(Object::as_name),
+            Some(b"Standard".as_slice())
+        );
         assert_eq!(dict.get(b"V").and_then(Object::as_i64), Some(2));
         // The derived key actually decrypts what it encrypts.
         let enc = sec.encrypt(5, 0, b"hello");

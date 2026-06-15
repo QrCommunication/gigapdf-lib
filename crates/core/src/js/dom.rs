@@ -127,7 +127,8 @@ fn get_attr(v: &Value, name: &str) -> Option<String> {
 
 fn set_attr(v: &Value, name: &str, val: &str) {
     if let Value::Object(o) = &slot(v, "__attrs") {
-        o.borrow_mut().set_data(&name.to_lowercase(), Value::str(val));
+        o.borrow_mut()
+            .set_data(&name.to_lowercase(), Value::str(val));
     }
 }
 
@@ -386,7 +387,10 @@ fn classlist_add(it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
 fn classlist_remove(it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
     let el = slot(&this, "__el");
     let name = it.to_string_v(&arg(a, 0))?;
-    let tokens: Vec<String> = class_tokens(&el).into_iter().filter(|t| t != &name).collect();
+    let tokens: Vec<String> = class_tokens(&el)
+        .into_iter()
+        .filter(|t| t != &name)
+        .collect();
     set_attr(&el, "class", &tokens.join(" "));
     Ok(Value::Undefined)
 }
@@ -442,7 +446,10 @@ fn el_append_child(_it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
 }
 fn el_remove_child(it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
     let child = arg(a, 0);
-    let remaining: Vec<Value> = kids(&this).into_iter().filter(|k| !same_node(k, &child)).collect();
+    let remaining: Vec<Value> = kids(&this)
+        .into_iter()
+        .filter(|k| !same_node(k, &child))
+        .collect();
     set_slot(&this, "__kids", it.new_array(remaining));
     Ok(child)
 }
@@ -1010,7 +1017,9 @@ fn build_style_string(el: &Value) -> String {
 }
 
 fn escape_text(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;")
@@ -1153,7 +1162,10 @@ mod tests {
         let out = run_inline_scripts(html);
         assert!(out.contains("r1=\"2\""), "child combinator `>`: {out}");
         assert!(out.contains("r2=\"P2\""), "adjacent sibling `+`: {out}");
-        assert!(out.contains("r3=\"S\""), "attribute selector `[a=v]`: {out}");
+        assert!(
+            out.contains("r3=\"S\""),
+            "attribute selector `[a=v]`: {out}"
+        );
         assert!(out.contains("r4=\"1\""), "descendant: {out}");
     }
 

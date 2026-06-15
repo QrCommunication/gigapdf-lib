@@ -105,7 +105,10 @@ mod tests {
             0, 0, 255, 255, 255, 255, 255, 255, // row 1
         ];
         let png = encode_png(2, 2, &rgba);
-        assert_eq!(&png[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
 
         // Locate the IDAT chunk, strip the 2-byte zlib header + 4-byte adler,
         // and inflate the stored blocks back to the filtered scanlines.

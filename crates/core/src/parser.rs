@@ -99,7 +99,10 @@ impl<'a> Parser<'a> {
             match token {
                 Token::ArrayClose => break,
                 Token::Eof => {
-                    return Err(EngineError::parse(self.lexer.position(), "unterminated array"))
+                    return Err(EngineError::parse(
+                        self.lexer.position(),
+                        "unterminated array",
+                    ))
                 }
                 other => items.push(self.value_from(other)?),
             }

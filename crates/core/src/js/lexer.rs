@@ -275,7 +275,10 @@ impl Lexer {
                     let digits = self.take_digits(8);
                     // If the next char makes it a float/decimal, fall back.
                     let next = self.peek(0);
-                    let is_legacy = !matches!(next, Some('.') | Some('e') | Some('E') | Some('8') | Some('9'));
+                    let is_legacy = !matches!(
+                        next,
+                        Some('.') | Some('e') | Some('E') | Some('8') | Some('9')
+                    );
                     if is_legacy && !digits.is_empty() {
                         return Ok(Tok::Num(parse_radix(&digits, 8)));
                     }
@@ -845,10 +848,8 @@ fn is_line_term(c: char) -> bool {
 }
 
 fn is_ws(c: char) -> bool {
-    matches!(
-        c,
-        '\t' | '\u{0B}' | '\u{0C}' | ' ' | '\u{A0}' | '\u{FEFF}'
-    ) || (c != '\n' && c != '\r' && c.is_whitespace())
+    matches!(c, '\t' | '\u{0B}' | '\u{0C}' | ' ' | '\u{A0}' | '\u{FEFF}')
+        || (c != '\n' && c != '\r' && c.is_whitespace())
 }
 
 fn is_id_start(c: char) -> bool {
@@ -969,7 +970,10 @@ mod tests {
             kinds("return /ab+/gi"),
             vec![
                 Tok::Ident("return".into()),
-                Tok::Regex { body: "ab+".into(), flags: "gi".into() },
+                Tok::Regex {
+                    body: "ab+".into(),
+                    flags: "gi".into()
+                },
             ]
         );
         // After an identifier, `/` is division.
@@ -989,7 +993,10 @@ mod tests {
             vec![
                 Tok::Ident("x".into()),
                 Tok::Punct(Punct::Eq),
-                Tok::Regex { body: "[a/b]".into(), flags: "".into() },
+                Tok::Regex {
+                    body: "[a/b]".into(),
+                    flags: "".into()
+                },
             ]
         );
     }

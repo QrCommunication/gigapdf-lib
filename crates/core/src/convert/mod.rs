@@ -70,8 +70,7 @@ pub struct ConvPage {
 /// Standard Base64 (RFC 4648) of `data` — for embedding images as `data:` URIs
 /// in the HTML export. Zero-dependency.
 pub(crate) fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -80,8 +79,16 @@ pub(crate) fn base64(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
         out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

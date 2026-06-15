@@ -35,11 +35,12 @@ fn unescape(s: &str) -> String {
             // Numeric entity &#NN; or &#xHH;
             if let Some(semi) = tail.find(';') {
                 let body = &tail[2..semi];
-                let code = if let Some(hex) = body.strip_prefix('x').or_else(|| body.strip_prefix('X')) {
-                    u32::from_str_radix(hex, 16).ok()
-                } else {
-                    body.parse::<u32>().ok()
-                };
+                let code =
+                    if let Some(hex) = body.strip_prefix('x').or_else(|| body.strip_prefix('X')) {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        body.parse::<u32>().ok()
+                    };
                 match code.and_then(char::from_u32) {
                     Some(c) => (c, semi + 1),
                     None => ('&', 1),
@@ -152,7 +153,15 @@ pub fn flow_to_pdf(sections: &[Vec<String>]) -> Vec<u8> {
                     page = b.add_page(W, H);
                     y = MARGIN;
                 }
-                b.text(page, MARGIN, y, SIZE, &line, StdFont::Helvetica, [0.0, 0.0, 0.0]);
+                b.text(
+                    page,
+                    MARGIN,
+                    y,
+                    SIZE,
+                    &line,
+                    StdFont::Helvetica,
+                    [0.0, 0.0, 0.0],
+                );
                 y += line_h;
                 page_has_content = true;
             }
@@ -174,7 +183,10 @@ pub fn txt_to_pdf(text: &str) -> Vec<u8> {
 pub fn html_to_pdf(html: &str) -> Vec<u8> {
     let paras = paragraphs_from_xml(
         html,
-        &["</p>", "</div>", "</span>", "</h1>", "</h2>", "</h3>", "</li>", "<br>", "<br/>", "<br />"],
+        &[
+            "</p>", "</div>", "</span>", "</h1>", "</h2>", "</h3>", "</li>", "<br>", "<br/>",
+            "<br />",
+        ],
         &[],
     );
     flow_to_pdf(&[paras])
@@ -320,7 +332,11 @@ fn rtf_escape(text: &str, out: &mut String) {
                 // RTF \uN uses a signed 16-bit code unit + an ASCII fallback char.
                 let code = c as u32;
                 if code <= 0xFFFF {
-                    let signed = if code > 0x7FFF { code as i32 - 0x10000 } else { code as i32 };
+                    let signed = if code > 0x7FFF {
+                        code as i32 - 0x10000
+                    } else {
+                        code as i32
+                    };
                     out.push_str(&format!("\\u{signed}?"));
                 } else {
                     out.push('?');
@@ -412,7 +428,11 @@ fn rtf_to_paragraphs(rtf: &str) -> Vec<String> {
                 while k < bytes.len() && bytes[k].is_ascii_digit() {
                     k += 1;
                 }
-                let param: Option<i64> = rtf[num_start..k].parse().ok().map(|n: i64| if neg { -n } else { n });
+                let param: Option<i64> =
+                    rtf[num_start..k]
+                        .parse()
+                        .ok()
+                        .map(|n: i64| if neg { -n } else { n });
                 let mut fallback_skip = 0i64;
                 match word {
                     "par" => {
@@ -428,7 +448,11 @@ fn rtf_to_paragraphs(rtf: &str) -> Vec<String> {
                     "u" => {
                         if let Some(n) = param {
                             if skip_group_depth.is_none() {
-                                let code = if n < 0 { (n + 0x10000) as u32 } else { n as u32 };
+                                let code = if n < 0 {
+                                    (n + 0x10000) as u32
+                                } else {
+                                    n as u32
+                                };
                                 if let Some(ch) = char::from_u32(code) {
                                     cur.push(ch);
                                 }
@@ -492,7 +516,10 @@ mod tests {
 
     #[test]
     fn unescape_decodes_entities() {
-        assert_eq!(unescape("a &amp; b &lt;c&gt; &#65; &#x42;"), "a & b <c> A B");
+        assert_eq!(
+            unescape("a &amp; b &lt;c&gt; &#65; &#x42;"),
+            "a & b <c> A B"
+        );
     }
 
     #[test]
@@ -508,7 +535,10 @@ mod tests {
         let doc = opens(&pdf);
         assert!(doc.page_count() >= 1);
         let text = doc.to_text();
-        assert!(text.contains("Second line"), "text round-trips into the PDF");
+        assert!(
+            text.contains("Second line"),
+            "text round-trips into the PDF"
+        );
     }
 
     #[test]
@@ -517,7 +547,10 @@ mod tests {
         let s = String::from_utf8(rtf).unwrap();
         assert!(s.starts_with("{\\rtf1"));
         let back = rtf_to_paragraphs(&s);
-        assert_eq!(back, vec!["Café déjà".to_string(), "Second \\ {brace}".to_string()]);
+        assert_eq!(
+            back,
+            vec!["Café déjà".to_string(), "Second \\ {brace}".to_string()]
+        );
     }
 
     #[test]

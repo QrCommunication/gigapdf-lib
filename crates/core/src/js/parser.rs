@@ -348,7 +348,7 @@ impl Parser {
 
     fn parse_for(&mut self) -> PResult<Stmt> {
         self.bump(); // for
-        // `for await` is accepted and ignored (no async iteration yet).
+                     // `for await` is accepted and ignored (no async iteration yet).
         self.eat_kw("await");
         self.expect_punct(Punct::LParen)?;
 
@@ -731,8 +731,8 @@ impl Parser {
 
     fn parse_class(&mut self, _require_name: bool) -> PResult<Class> {
         self.bump(); // class
-        // A name is optional in both positions (anonymous class declarations
-        // occur after `export default`).
+                     // A name is optional in both positions (anonymous class declarations
+                     // occur after `export default`).
         let name = if self.cur_is_ident_like() && !self.is_kw("extends") {
             Some(self.ident_name()?)
         } else {
@@ -770,17 +770,26 @@ impl Parser {
         let mut is_async = false;
         let mut is_generator = false;
 
-        if self.is_kw("async") && !self.nth_is_punct(1, Punct::LParen) && !self.nth_is_punct(1, Punct::Eq) {
+        if self.is_kw("async")
+            && !self.nth_is_punct(1, Punct::LParen)
+            && !self.nth_is_punct(1, Punct::Eq)
+        {
             is_async = true;
             self.bump();
         }
         if self.eat_punct(Punct::Star) {
             is_generator = true;
         }
-        if self.is_kw("get") && !self.nth_is_punct(1, Punct::LParen) && !self.nth_is_punct(1, Punct::Eq) {
+        if self.is_kw("get")
+            && !self.nth_is_punct(1, Punct::LParen)
+            && !self.nth_is_punct(1, Punct::Eq)
+        {
             kind = ClassMemberKind::Get;
             self.bump();
-        } else if self.is_kw("set") && !self.nth_is_punct(1, Punct::LParen) && !self.nth_is_punct(1, Punct::Eq) {
+        } else if self.is_kw("set")
+            && !self.nth_is_punct(1, Punct::LParen)
+            && !self.nth_is_punct(1, Punct::Eq)
+        {
             kind = ClassMemberKind::Set;
             self.bump();
         }
@@ -1713,13 +1722,7 @@ mod tests {
     fn member_and_call_chain() {
         let e = one_expr("a.b().c[d]");
         // Outer is computed member [d].
-        assert!(matches!(
-            e,
-            Expr::Member {
-                computed: true,
-                ..
-            }
-        ));
+        assert!(matches!(e, Expr::Member { computed: true, .. }));
     }
 
     #[test]
@@ -1880,9 +1883,7 @@ mod tests {
         let p = prog("try { f(); } catch (e) { g(e); } finally { h(); }");
         match &p.body[0] {
             Stmt::Try {
-                handler,
-                finalizer,
-                ..
+                handler, finalizer, ..
             } => {
                 assert!(handler.is_some());
                 assert!(finalizer.is_some());

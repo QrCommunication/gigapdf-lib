@@ -35,7 +35,10 @@ pub fn svg_path_ops(
     line_width: f64,
 ) -> Vec<u8> {
     let segs = parse(d);
-    if !segs.iter().any(|s| matches!(s, Seg::Line(..) | Seg::Cubic(..))) {
+    if !segs
+        .iter()
+        .any(|s| matches!(s, Seg::Line(..) | Seg::Cubic(..)))
+    {
         return Vec::new(); // moveto-only / empty path draws nothing
     }
 
@@ -243,8 +246,13 @@ pub(crate) fn parse(d: &str) -> Vec<Seg> {
                 if !ok {
                     break;
                 }
-                let (ex, ey) = if rel { (cx + p[5], cy + p[6]) } else { (p[5], p[6]) };
-                let cubics = arc_to_cubics(cx, cy, p[0], p[1], p[2], p[3] != 0.0, p[4] != 0.0, ex, ey);
+                let (ex, ey) = if rel {
+                    (cx + p[5], cy + p[6])
+                } else {
+                    (p[5], p[6])
+                };
+                let cubics =
+                    arc_to_cubics(cx, cy, p[0], p[1], p[2], p[3] != 0.0, p[4] != 0.0, ex, ey);
                 if cubics.is_empty() {
                     segs.push(Seg::Line(ex, ey)); // degenerate radii → straight line
                 } else {
@@ -281,7 +289,11 @@ fn quad_to_cubic(
 fn arc_angle(ux: f64, uy: f64, vx: f64, vy: f64) -> f64 {
     let dot = ux * vx + uy * vy;
     let len = ((ux * ux + uy * uy) * (vx * vx + vy * vy)).sqrt();
-    let mut a = if len > 0.0 { (dot / len).clamp(-1.0, 1.0).acos() } else { 0.0 };
+    let mut a = if len > 0.0 {
+        (dot / len).clamp(-1.0, 1.0).acos()
+    } else {
+        0.0
+    };
     if ux * vy - uy * vx < 0.0 {
         a = -a;
     }
@@ -348,7 +360,9 @@ fn arc_to_cubics(
     }
 
     // Split into ≤90° pieces; the epsilon avoids an extra piece at exact 90°×k.
-    let n = ((dtheta.abs() / std::f64::consts::FRAC_PI_2) - 1e-9).ceil().max(1.0) as usize;
+    let n = ((dtheta.abs() / std::f64::consts::FRAC_PI_2) - 1e-9)
+        .ceil()
+        .max(1.0) as usize;
     let delta = dtheta / n as f64;
     let alpha = 4.0 / 3.0 * (delta / 4.0).tan();
 
@@ -490,12 +504,19 @@ mod tests {
         // 90° arc → exactly one cubic ending at the endpoint.
         let q = arc_to_cubics(1.0, 0.0, 1.0, 1.0, 0.0, false, true, 0.0, 1.0);
         assert_eq!(q.len(), 1);
-        assert!((q[0].4).abs() < 1e-9 && (q[0].5 - 1.0).abs() < 1e-9, "endpoint (0,1): {:?}", q[0]);
+        assert!(
+            (q[0].4).abs() < 1e-9 && (q[0].5 - 1.0).abs() < 1e-9,
+            "endpoint (0,1): {:?}",
+            q[0]
+        );
 
         // Large-arc (~270°) splits into three ≤90° cubics, endpoint preserved.
         let big = arc_to_cubics(1.0, 0.0, 1.0, 1.0, 0.0, true, true, 0.0, 1.0);
         assert_eq!(big.len(), 3, "270° arc → 3 cubics");
-        assert!((big[2].4).abs() < 1e-9 && (big[2].5 - 1.0).abs() < 1e-9, "endpoint preserved");
+        assert!(
+            (big[2].4).abs() < 1e-9 && (big[2].5 - 1.0).abs() < 1e-9,
+            "endpoint preserved"
+        );
 
         // Degenerate radius → no cubics (caller draws a straight line).
         assert!(arc_to_cubics(0.0, 0.0, 0.0, 5.0, 0.0, false, true, 3.0, 4.0).is_empty());
@@ -504,7 +525,10 @@ mod tests {
     #[test]
     fn arc_path_emits_curves_not_a_line() {
         let out = render("M10 10 A20 20 0 0 1 30 30", 0.0, 100.0);
-        assert!(out.contains(" c\n"), "the arc command emits cubic curves: {out}");
+        assert!(
+            out.contains(" c\n"),
+            "the arc command emits cubic curves: {out}"
+        );
     }
 
     #[test]

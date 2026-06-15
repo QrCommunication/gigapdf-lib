@@ -253,12 +253,20 @@ fn install_array(it: &mut Interp) {
         }
     });
     it.define_method(&proto, "pop", |_it, this, _args| {
-        Ok(with_array(&this, |e| e.pop()).flatten().unwrap_or(Value::Undefined))
-    });
-    it.define_method(&proto, "shift", |_it, this, _args| {
-        Ok(with_array(&this, |e| if e.is_empty() { None } else { Some(e.remove(0)) })
+        Ok(with_array(&this, |e| e.pop())
             .flatten()
             .unwrap_or(Value::Undefined))
+    });
+    it.define_method(&proto, "shift", |_it, this, _args| {
+        Ok(with_array(&this, |e| {
+            if e.is_empty() {
+                None
+            } else {
+                Some(e.remove(0))
+            }
+        })
+        .flatten()
+        .unwrap_or(Value::Undefined))
     });
     it.define_method(&proto, "unshift", |_it, this, args| {
         let n = with_array(&this, |e| {
@@ -327,7 +335,9 @@ fn install_array(it: &mut Interp) {
     });
     it.define_method(&proto, "includes", |_it, this, args| {
         let target = arg(args, 0);
-        Ok(Value::Bool(array_snapshot(&this).iter().any(|v| strict_eq(v, &target))))
+        Ok(Value::Bool(
+            array_snapshot(&this).iter().any(|v| strict_eq(v, &target)),
+        ))
     });
     it.define_method(&proto, "at", |_it, this, args| {
         let e = array_snapshot(&this);
@@ -359,7 +369,11 @@ fn install_array(it: &mut Interp) {
         let cb = arg(args, 0);
         let e = array_snapshot(&this);
         for (i, v) in e.iter().enumerate() {
-            it.call(&cb, Value::Undefined, &[v.clone(), Value::Num(i as f64), this.clone()])?;
+            it.call(
+                &cb,
+                Value::Undefined,
+                &[v.clone(), Value::Num(i as f64), this.clone()],
+            )?;
         }
         Ok(Value::Undefined)
     });
@@ -368,7 +382,11 @@ fn install_array(it: &mut Interp) {
         let e = array_snapshot(&this);
         let mut out = Vec::with_capacity(e.len());
         for (i, v) in e.iter().enumerate() {
-            out.push(it.call(&cb, Value::Undefined, &[v.clone(), Value::Num(i as f64), this.clone()])?);
+            out.push(it.call(
+                &cb,
+                Value::Undefined,
+                &[v.clone(), Value::Num(i as f64), this.clone()],
+            )?);
         }
         Ok(it.new_array(out))
     });
@@ -377,7 +395,11 @@ fn install_array(it: &mut Interp) {
         let e = array_snapshot(&this);
         let mut out = Vec::new();
         for (i, v) in e.iter().enumerate() {
-            let keep = it.call(&cb, Value::Undefined, &[v.clone(), Value::Num(i as f64), this.clone()])?;
+            let keep = it.call(
+                &cb,
+                Value::Undefined,
+                &[v.clone(), Value::Num(i as f64), this.clone()],
+            )?;
             if to_boolean(&keep) {
                 out.push(v.clone());
             }
@@ -388,7 +410,11 @@ fn install_array(it: &mut Interp) {
         let cb = arg(args, 0);
         let e = array_snapshot(&this);
         for (i, v) in e.iter().enumerate() {
-            let hit = it.call(&cb, Value::Undefined, &[v.clone(), Value::Num(i as f64), this.clone()])?;
+            let hit = it.call(
+                &cb,
+                Value::Undefined,
+                &[v.clone(), Value::Num(i as f64), this.clone()],
+            )?;
             if to_boolean(&hit) {
                 return Ok(v.clone());
             }
@@ -399,7 +425,11 @@ fn install_array(it: &mut Interp) {
         let cb = arg(args, 0);
         let e = array_snapshot(&this);
         for (i, v) in e.iter().enumerate() {
-            let hit = it.call(&cb, Value::Undefined, &[v.clone(), Value::Num(i as f64), this.clone()])?;
+            let hit = it.call(
+                &cb,
+                Value::Undefined,
+                &[v.clone(), Value::Num(i as f64), this.clone()],
+            )?;
             if to_boolean(&hit) {
                 return Ok(Value::Num(i as f64));
             }
@@ -410,7 +440,11 @@ fn install_array(it: &mut Interp) {
         let cb = arg(args, 0);
         let e = array_snapshot(&this);
         for (i, v) in e.iter().enumerate() {
-            let hit = it.call(&cb, Value::Undefined, &[v.clone(), Value::Num(i as f64), this.clone()])?;
+            let hit = it.call(
+                &cb,
+                Value::Undefined,
+                &[v.clone(), Value::Num(i as f64), this.clone()],
+            )?;
             if to_boolean(&hit) {
                 return Ok(Value::Bool(true));
             }
@@ -421,7 +455,11 @@ fn install_array(it: &mut Interp) {
         let cb = arg(args, 0);
         let e = array_snapshot(&this);
         for (i, v) in e.iter().enumerate() {
-            let hit = it.call(&cb, Value::Undefined, &[v.clone(), Value::Num(i as f64), this.clone()])?;
+            let hit = it.call(
+                &cb,
+                Value::Undefined,
+                &[v.clone(), Value::Num(i as f64), this.clone()],
+            )?;
             if !to_boolean(&hit) {
                 return Ok(Value::Bool(false));
             }
@@ -510,7 +548,11 @@ fn install_array(it: &mut Interp) {
             if mapfn.is_callable() {
                 let mut out = Vec::with_capacity(items.len());
                 for (i, v) in items.iter().enumerate() {
-                    out.push(it.call(&mapfn, Value::Undefined, &[v.clone(), Value::Num(i as f64)])?);
+                    out.push(it.call(
+                        &mapfn,
+                        Value::Undefined,
+                        &[v.clone(), Value::Num(i as f64)],
+                    )?);
                 }
                 Ok(it.new_array(out))
             } else {
@@ -562,12 +604,18 @@ fn install_string(it: &mut Interp) {
         };
     }
 
-    smethod!("toString", |it, this, _a| Ok(Value::str(it.to_string_v(&this)?)));
-    smethod!("valueOf", |it, this, _a| Ok(Value::str(it.to_string_v(&this)?)));
+    smethod!("toString", |it, this, _a| Ok(Value::str(
+        it.to_string_v(&this)?
+    )));
+    smethod!("valueOf", |it, this, _a| Ok(Value::str(
+        it.to_string_v(&this)?
+    )));
     smethod!("charAt", |it, this, a| {
         let s = it.to_string_v(&this)?;
         let i = it.to_number(&arg(a, 0))? as usize;
-        Ok(Value::str(s.chars().nth(i).map(|c| c.to_string()).unwrap_or_default()))
+        Ok(Value::str(
+            s.chars().nth(i).map(|c| c.to_string()).unwrap_or_default(),
+        ))
     });
     smethod!("charCodeAt", |it, this, a| {
         let s = it.to_string_v(&this)?;
@@ -626,14 +674,25 @@ fn install_string(it: &mut Interp) {
         let needle = it.to_string_v(&arg(a, 0))?;
         Ok(Value::Bool(s.ends_with(&needle)))
     });
-    smethod!("toUpperCase", |it, this, _a| Ok(Value::str(it.to_string_v(&this)?.to_uppercase())));
-    smethod!("toLowerCase", |it, this, _a| Ok(Value::str(it.to_string_v(&this)?.to_lowercase())));
-    smethod!("trim", |it, this, _a| Ok(Value::str(it.to_string_v(&this)?.trim().to_string())));
-    smethod!("trimStart", |it, this, _a| Ok(Value::str(it.to_string_v(&this)?.trim_start().to_string())));
-    smethod!("trimEnd", |it, this, _a| Ok(Value::str(it.to_string_v(&this)?.trim_end().to_string())));
+    smethod!("toUpperCase", |it, this, _a| Ok(Value::str(
+        it.to_string_v(&this)?.to_uppercase()
+    )));
+    smethod!("toLowerCase", |it, this, _a| Ok(Value::str(
+        it.to_string_v(&this)?.to_lowercase()
+    )));
+    smethod!("trim", |it, this, _a| Ok(Value::str(
+        it.to_string_v(&this)?.trim().to_string()
+    )));
+    smethod!("trimStart", |it, this, _a| Ok(Value::str(
+        it.to_string_v(&this)?.trim_start().to_string()
+    )));
+    smethod!("trimEnd", |it, this, _a| Ok(Value::str(
+        it.to_string_v(&this)?.trim_end().to_string()
+    )));
     smethod!("slice", |it, this, a| {
         let chars: Vec<char> = it.to_string_v(&this)?.chars().collect();
-        let (start, end) = str_slice_bounds(chars.len(), it.to_number(&arg(a, 0))?, &arg(a, 1), it)?;
+        let (start, end) =
+            str_slice_bounds(chars.len(), it.to_number(&arg(a, 0))?, &arg(a, 1), it)?;
         Ok(Value::str(chars[start..end].iter().collect::<String>()))
     });
     smethod!("substring", |it, this, a| {
@@ -648,7 +707,9 @@ fn install_string(it: &mut Interp) {
         if s > e {
             std::mem::swap(&mut s, &mut e);
         }
-        Ok(Value::str(chars[s as usize..e as usize].iter().collect::<String>()))
+        Ok(Value::str(
+            chars[s as usize..e as usize].iter().collect::<String>(),
+        ))
     });
     smethod!("split", |it, this, a| {
         let s = it.to_string_v(&this)?;
@@ -711,12 +772,17 @@ fn install_string(it: &mut Interp) {
         Ok(Value::str(s))
     });
 
-    let ctor = make_ctor(it, "String", |it, _this, args| {
-        Ok(Value::str(match args.first() {
-            Some(v) => it.to_string_v(v)?,
-            None => String::new(),
-        }))
-    }, &proto);
+    let ctor = make_ctor(
+        it,
+        "String",
+        |it, _this, args| {
+            Ok(Value::str(match args.first() {
+                Some(v) => it.to_string_v(v)?,
+                None => String::new(),
+            }))
+        },
+        &proto,
+    );
     if let Value::Object(c) = &ctor {
         let cc = c.clone();
         it.define_method(&cc, "fromCharCode", |it, _this, args| {
@@ -779,37 +845,56 @@ fn install_number_boolean(it: &mut Interp) {
             }
         }
     });
-    it.define_method(&proto, "valueOf", |it, this, _a| Ok(Value::Num(it.to_number(&this)?)));
+    it.define_method(&proto, "valueOf", |it, this, _a| {
+        Ok(Value::Num(it.to_number(&this)?))
+    });
     it.define_method(&proto, "toFixed", |it, this, a| {
         let n = it.to_number(&this)?;
         let digits = it.to_number(&arg(a, 0))? as usize;
         Ok(Value::str(format!("{n:.digits$}")))
     });
 
-    let ctor = make_ctor(it, "Number", |it, _this, args| {
-        Ok(Value::Num(match args.first() {
-            Some(v) => it.to_number(v)?,
-            None => 0.0,
-        }))
-    }, &proto);
+    let ctor = make_ctor(
+        it,
+        "Number",
+        |it, _this, args| {
+            Ok(Value::Num(match args.first() {
+                Some(v) => it.to_number(v)?,
+                None => 0.0,
+            }))
+        },
+        &proto,
+    );
     if let Value::Object(c) = &ctor {
         let cc = c.clone();
-        cc.borrow_mut().set_data("MAX_SAFE_INTEGER", Value::Num(9_007_199_254_740_991.0));
-        cc.borrow_mut().set_data("MIN_SAFE_INTEGER", Value::Num(-9_007_199_254_740_991.0));
+        cc.borrow_mut()
+            .set_data("MAX_SAFE_INTEGER", Value::Num(9_007_199_254_740_991.0));
+        cc.borrow_mut()
+            .set_data("MIN_SAFE_INTEGER", Value::Num(-9_007_199_254_740_991.0));
         cc.borrow_mut().set_data("MAX_VALUE", Value::Num(f64::MAX));
-        cc.borrow_mut().set_data("MIN_VALUE", Value::Num(f64::MIN_POSITIVE));
-        cc.borrow_mut().set_data("EPSILON", Value::Num(f64::EPSILON));
-        cc.borrow_mut().set_data("POSITIVE_INFINITY", Value::Num(f64::INFINITY));
-        cc.borrow_mut().set_data("NEGATIVE_INFINITY", Value::Num(f64::NEG_INFINITY));
+        cc.borrow_mut()
+            .set_data("MIN_VALUE", Value::Num(f64::MIN_POSITIVE));
+        cc.borrow_mut()
+            .set_data("EPSILON", Value::Num(f64::EPSILON));
+        cc.borrow_mut()
+            .set_data("POSITIVE_INFINITY", Value::Num(f64::INFINITY));
+        cc.borrow_mut()
+            .set_data("NEGATIVE_INFINITY", Value::Num(f64::NEG_INFINITY));
         cc.borrow_mut().set_data("NaN", Value::Num(f64::NAN));
         it.define_method(&cc, "isInteger", |_it, _this, a| {
-            Ok(Value::Bool(matches!(arg(a, 0), Value::Num(n) if n.is_finite() && n.fract() == 0.0)))
+            Ok(Value::Bool(
+                matches!(arg(a, 0), Value::Num(n) if n.is_finite() && n.fract() == 0.0),
+            ))
         });
         it.define_method(&cc, "isFinite", |_it, _this, a| {
-            Ok(Value::Bool(matches!(arg(a, 0), Value::Num(n) if n.is_finite())))
+            Ok(Value::Bool(
+                matches!(arg(a, 0), Value::Num(n) if n.is_finite()),
+            ))
         });
         it.define_method(&cc, "isNaN", |_it, _this, a| {
-            Ok(Value::Bool(matches!(arg(a, 0), Value::Num(n) if n.is_nan())))
+            Ok(Value::Bool(
+                matches!(arg(a, 0), Value::Num(n) if n.is_nan()),
+            ))
         });
         it.define_method(&cc, "parseFloat", global_parse_float);
         it.define_method(&cc, "parseInt", global_parse_int);
@@ -820,8 +905,15 @@ fn install_number_boolean(it: &mut Interp) {
     it.define_method(&bproto, "toString", |_it, this, _a| {
         Ok(Value::str(if to_boolean(&this) { "true" } else { "false" }))
     });
-    it.define_method(&bproto, "valueOf", |_it, this, _a| Ok(Value::Bool(to_boolean(&this))));
-    let bctor = make_ctor(it, "Boolean", |_it, _this, a| Ok(Value::Bool(to_boolean(&arg(a, 0)))), &bproto);
+    it.define_method(&bproto, "valueOf", |_it, this, _a| {
+        Ok(Value::Bool(to_boolean(&this)))
+    });
+    let bctor = make_ctor(
+        it,
+        "Boolean",
+        |_it, _this, a| Ok(Value::Bool(to_boolean(&arg(a, 0)))),
+        &bproto,
+    );
     set_global(it, "Boolean", bctor);
 }
 
@@ -864,10 +956,17 @@ fn install_errors(it: &mut Interp) {
         }))
     });
 
-    for name in ["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError"] {
+    for name in [
+        "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+    ] {
         let ctor = it.native_fn(name, error_construct);
         if let Value::Object(c) = &ctor {
-            c.borrow_mut().set_data("prototype", Value::Object(proto.clone()));
+            c.borrow_mut()
+                .set_data("prototype", Value::Object(proto.clone()));
             // Carry the constructor's own name so `error_construct` can read it.
             c.borrow_mut().set_data("name", Value::str(name));
         }
@@ -981,7 +1080,9 @@ fn install_math(it: &mut Interp) {
         }
         Ok(Value::Num(m))
     });
-    it.define_method(&math, "random", |it, _t, _a| Ok(Value::Num(it.next_random())));
+    it.define_method(&math, "random", |it, _t, _a| {
+        Ok(Value::Num(it.next_random()))
+    });
     set_global(it, "Math", Value::Object(math));
 }
 
@@ -1012,7 +1113,11 @@ fn json_stringify(it: &mut Interp, v: &Value, indent: &str, depth: usize) -> Eva
         Value::Undefined => None,
         Value::Null => Some("null".to_string()),
         Value::Bool(b) => Some(b.to_string()),
-        Value::Num(n) => Some(if n.is_finite() { num_to_str(*n) } else { "null".to_string() }),
+        Value::Num(n) => Some(if n.is_finite() {
+            num_to_str(*n)
+        } else {
+            "null".to_string()
+        }),
         Value::Str(s) => Some(json_quote(s)),
         Value::Object(o) => {
             if matches!(o.borrow().kind, ObjKind::Function(_)) {
@@ -1035,7 +1140,8 @@ fn json_stringify(it: &mut Interp, v: &Value, indent: &str, depth: usize) -> Eva
                 }
                 let mut parts = Vec::new();
                 for e in &elems {
-                    let s = json_stringify(it, e, indent, depth + 1)?.unwrap_or_else(|| "null".to_string());
+                    let s = json_stringify(it, e, indent, depth + 1)?
+                        .unwrap_or_else(|| "null".to_string());
                     parts.push(format!("{pad_in}{s}"));
                 }
                 Some(format!("[{nl}{}{nl}{pad}]", parts.join(&format!(",{nl}"))))
@@ -1052,7 +1158,10 @@ fn json_stringify(it: &mut Interp, v: &Value, indent: &str, depth: usize) -> Eva
                 if parts.is_empty() {
                     return Ok(Some("{}".to_string()));
                 }
-                Some(format!("{{{nl}{}{nl}{pad}}}", parts.join(&format!(",{nl}"))))
+                Some(format!(
+                    "{{{nl}{}{nl}{pad}}}",
+                    parts.join(&format!(",{nl}"))
+                ))
             }
         }
     })
@@ -1080,7 +1189,11 @@ fn json_quote(s: &str) -> String {
 
 fn json_parse(it: &mut Interp, src: &str) -> Eval<Value> {
     let chars: Vec<char> = src.chars().collect();
-    let mut p = JsonParser { it, chars: &chars, pos: 0 };
+    let mut p = JsonParser {
+        it,
+        chars: &chars,
+        pos: 0,
+    };
     p.skip_ws();
     let v = p.value()?;
     p.skip_ws();
@@ -1292,7 +1405,11 @@ fn install_globals(it: &mut Interp) {
             Value::Undefined => 0.0,
             v => it.to_number(&v)?.max(0.0),
         };
-        let extra = if a.len() > 2 { a[2..].to_vec() } else { Vec::new() };
+        let extra = if a.len() > 2 {
+            a[2..].to_vec()
+        } else {
+            Vec::new()
+        };
         if cb.is_callable() {
             it.timers.push((delay, cb, extra));
         }
@@ -1345,7 +1462,8 @@ fn install_globals(it: &mut Interp) {
             s.borrow_mut().set_data(prop, wk);
         }
         let registry = it.new_object(Some(it.object_proto.clone()));
-        s.borrow_mut().set_data("__registry", Value::Object(registry));
+        s.borrow_mut()
+            .set_data("__registry", Value::Object(registry));
         it.define_method(s, "for", symbol_for);
         it.define_method(s, "keyFor", symbol_key_for);
     }
@@ -1434,8 +1552,14 @@ fn global_parse_float(it: &mut Interp, _this: Value, args: &[Value]) -> Eval<Val
     while end < bytes.len() {
         let c = bytes[end] as char;
         let ok = c.is_ascii_digit()
-            || (c == '-' && (end == 0 || (bytes[end - 1] as char) == 'e' || (bytes[end - 1] as char) == 'E'))
-            || (c == '+' && (end == 0 || (bytes[end - 1] as char) == 'e' || (bytes[end - 1] as char) == 'E'))
+            || (c == '-'
+                && (end == 0
+                    || (bytes[end - 1] as char) == 'e'
+                    || (bytes[end - 1] as char) == 'E'))
+            || (c == '+'
+                && (end == 0
+                    || (bytes[end - 1] as char) == 'e'
+                    || (bytes[end - 1] as char) == 'E'))
             || (c == '.' && !seen_dot && !seen_e)
             || ((c == 'e' || c == 'E') && !seen_e && end > 0);
         if !ok {
@@ -1463,7 +1587,8 @@ fn global_parse_int(it: &mut Interp, _this: Value, args: &[Value]) -> Eval<Value
         Some(r) => (true, r),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let rest = if (radix == 16 || radix == 0) && (rest.starts_with("0x") || rest.starts_with("0X")) {
+    let rest = if (radix == 16 || radix == 0) && (rest.starts_with("0x") || rest.starts_with("0X"))
+    {
         radix = 16;
         &rest[2..]
     } else {
@@ -1541,7 +1666,8 @@ fn install_regexp(it: &mut Interp) {
 
     let ctor = it.native_fn("RegExp", regexp_construct);
     if let Value::Object(c) = &ctor {
-        c.borrow_mut().set_data("prototype", Value::Object(proto.clone()));
+        c.borrow_mut()
+            .set_data("prototype", Value::Object(proto.clone()));
     }
     proto.borrow_mut().set_data("constructor", ctor.clone());
     set_global(it, "RegExp", ctor);
@@ -1661,7 +1787,9 @@ fn str_search(it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
         None => return Ok(Value::Num(-1.0)),
     };
     let chars: Vec<char> = s.chars().collect();
-    Ok(Value::Num(re.exec(&chars, 0).map(|m| m.start as f64).unwrap_or(-1.0)))
+    Ok(Value::Num(
+        re.exec(&chars, 0).map(|m| m.start as f64).unwrap_or(-1.0),
+    ))
 }
 
 fn str_match(it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
@@ -1828,10 +1956,19 @@ fn str_replace(it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
             let r = it.call(
                 &repl,
                 Value::Undefined,
-                &[Value::str(from.clone()), Value::Num(s[..idx].chars().count() as f64), Value::str(s.clone())],
+                &[
+                    Value::str(from.clone()),
+                    Value::Num(s[..idx].chars().count() as f64),
+                    Value::str(s.clone()),
+                ],
             )?;
             let rep = it.to_string_v(&r)?;
-            return Ok(Value::str(format!("{}{}{}", &s[..idx], rep, &s[idx + from.len()..])));
+            return Ok(Value::str(format!(
+                "{}{}{}",
+                &s[..idx],
+                rep,
+                &s[idx + from.len()..]
+            )));
         }
         return Ok(Value::str(s));
     }
@@ -1844,7 +1981,11 @@ fn str_replace_all(it: &mut Interp, this: Value, a: &[Value]) -> Eval<Value> {
     let pat = arg(a, 0);
     let repl = arg(a, 1);
     if let Some((src, flags)) = as_regex(&pat) {
-        let flags = if flags.contains('g') { flags } else { format!("{flags}g") };
+        let flags = if flags.contains('g') {
+            flags
+        } else {
+            format!("{flags}g")
+        };
         if let Ok(re) = Regex::new(&src, &flags) {
             return Ok(Value::str(regex_replace(it, &s, &re, &repl)?));
         }
@@ -1957,8 +2098,12 @@ fn install_map_set(it: &mut Interp) {
     it.define_method(&mproto, "delete", map_delete);
     it.define_method(&mproto, "clear", coll_clear);
     it.define_method(&mproto, "forEach", map_for_each);
-    it.define_method(&mproto, "keys", |it, this, _a| Ok(it.new_array(slot_vec(&this, "__keys"))));
-    it.define_method(&mproto, "values", |it, this, _a| Ok(it.new_array(slot_vec(&this, "__vals"))));
+    it.define_method(&mproto, "keys", |it, this, _a| {
+        Ok(it.new_array(slot_vec(&this, "__keys")))
+    });
+    it.define_method(&mproto, "values", |it, this, _a| {
+        Ok(it.new_array(slot_vec(&this, "__vals")))
+    });
     it.define_method(&mproto, "entries", map_entries_method);
     def_getter(it, &mproto, "size", map_size);
     let mctor = make_ctor(it, "Map", map_construct, &mproto);
@@ -1970,8 +2115,12 @@ fn install_map_set(it: &mut Interp) {
     it.define_method(&sproto, "delete", set_delete);
     it.define_method(&sproto, "clear", coll_clear);
     it.define_method(&sproto, "forEach", set_for_each);
-    it.define_method(&sproto, "values", |it, this, _a| Ok(it.new_array(slot_vec(&this, "__vals"))));
-    it.define_method(&sproto, "keys", |it, this, _a| Ok(it.new_array(slot_vec(&this, "__vals"))));
+    it.define_method(&sproto, "values", |it, this, _a| {
+        Ok(it.new_array(slot_vec(&this, "__vals")))
+    });
+    it.define_method(&sproto, "keys", |it, this, _a| {
+        Ok(it.new_array(slot_vec(&this, "__vals")))
+    });
     def_getter(it, &sproto, "size", set_size);
     let sctor = make_ctor(it, "Set", set_construct, &sproto);
     set_global(it, "Set", sctor);
@@ -2029,14 +2178,21 @@ fn map_get(_it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
     let k = arg(args, 0);
     let keys = slot_vec(&this, "__keys");
     match keys.iter().position(|x| same_value_zero(x, &k)) {
-        Some(i) => Ok(slot_vec(&this, "__vals").get(i).cloned().unwrap_or(Value::Undefined)),
+        Some(i) => Ok(slot_vec(&this, "__vals")
+            .get(i)
+            .cloned()
+            .unwrap_or(Value::Undefined)),
         None => Ok(Value::Undefined),
     }
 }
 
 fn map_has(_it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
     let k = arg(args, 0);
-    Ok(Value::Bool(slot_vec(&this, "__keys").iter().any(|x| same_value_zero(x, &k))))
+    Ok(Value::Bool(
+        slot_vec(&this, "__keys")
+            .iter()
+            .any(|x| same_value_zero(x, &k)),
+    ))
 }
 
 fn map_delete(_it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
@@ -2109,7 +2265,10 @@ fn set_construct(it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
 fn set_add(_it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
     let v = arg(args, 0);
     if let Some(vg) = slot_gc(&this, "__vals") {
-        if !slot_vec(&this, "__vals").iter().any(|x| same_value_zero(x, &v)) {
+        if !slot_vec(&this, "__vals")
+            .iter()
+            .any(|x| same_value_zero(x, &v))
+        {
             arr_push(&vg, v);
         }
     }
@@ -2118,7 +2277,11 @@ fn set_add(_it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
 
 fn set_has(_it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
     let v = arg(args, 0);
-    Ok(Value::Bool(slot_vec(&this, "__vals").iter().any(|x| same_value_zero(x, &v))))
+    Ok(Value::Bool(
+        slot_vec(&this, "__vals")
+            .iter()
+            .any(|x| same_value_zero(x, &v)),
+    ))
 }
 
 fn set_delete(_it: &mut Interp, this: Value, args: &[Value]) -> Eval<Value> {
@@ -2161,8 +2324,12 @@ fn install_promise(it: &mut Interp) {
     let ctor = make_ctor(it, "Promise", promise_construct, &proto);
     if let Value::Object(c) = &ctor {
         let cc = c.clone();
-        it.define_method(&cc, "resolve", |it, _t, a| Ok(it.make_resolved_promise(arg(a, 0))));
-        it.define_method(&cc, "reject", |it, _t, a| Ok(it.make_rejected_promise(arg(a, 0))));
+        it.define_method(&cc, "resolve", |it, _t, a| {
+            Ok(it.make_resolved_promise(arg(a, 0)))
+        });
+        it.define_method(&cc, "reject", |it, _t, a| {
+            Ok(it.make_rejected_promise(arg(a, 0)))
+        });
         it.define_method(&cc, "all", promise_all);
         it.define_method(&cc, "race", promise_race);
         it.define_method(&cc, "allSettled", promise_all_settled);
@@ -2364,10 +2531,16 @@ mod tests {
 
     #[test]
     fn array_methods() {
-        assert_eq!(num("[1,2,3].map(x => x * 2).reduce((a,b) => a + b, 0)"), 12.0);
+        assert_eq!(
+            num("[1,2,3].map(x => x * 2).reduce((a,b) => a + b, 0)"),
+            12.0
+        );
         assert_eq!(num("[1,2,3,4].filter(x => x % 2 === 0).length"), 2.0);
         assert_eq!(string("['a','b','c'].join('-')"), "a-b-c");
-        assert_eq!(num("let a=[3,1,2]; a.sort((x,y)=>x-y); a[0]*100 + a[2]"), 103.0);
+        assert_eq!(
+            num("let a=[3,1,2]; a.sort((x,y)=>x-y); a[0]*100 + a[2]"),
+            103.0
+        );
         assert_eq!(num("[1,2,3].indexOf(2)"), 1.0);
         assert!(boolean("[1,2,3].includes(3)"));
         assert_eq!(num("let a=[1]; a.push(2,3); a.length"), 3.0);
@@ -2395,7 +2568,7 @@ mod tests {
         assert_eq!(num("Math.round(2.5)"), 3.0);
         assert_eq!(num("Math.abs(-4)"), 4.0);
         assert_eq!(num("Math.pow(2, 10)"), 1024.0);
-        assert!(num("Math.PI") > 3.14 && num("Math.PI") < 3.15);
+        assert!((num("Math.PI") - std::f64::consts::PI).abs() < 1e-9);
     }
 
     #[test]
@@ -2406,10 +2579,7 @@ mod tests {
         );
         assert_eq!(num("JSON.parse('{\"n\": 42}').n"), 42.0);
         assert_eq!(num("JSON.parse('[1,2,3]').length"), 3.0);
-        assert_eq!(
-            string("JSON.parse(JSON.stringify({k: 'v'})).k"),
-            "v"
-        );
+        assert_eq!(string("JSON.parse(JSON.stringify({k: 'v'})).k"), "v");
     }
 
     #[test]
@@ -2438,7 +2608,8 @@ mod tests {
     #[test]
     fn console_capture() {
         let mut it = Interp::new();
-        let p = super::super::parser::parse("console.log('hello', 42); console.log('world')").unwrap();
+        let p =
+            super::super::parser::parse("console.log('hello', 42); console.log('world')").unwrap();
         it.run(&p).unwrap();
         assert_eq!(it.output, vec!["hello 42".to_string(), "world".to_string()]);
     }
@@ -2447,7 +2618,7 @@ mod tests {
     fn parse_int_float() {
         assert_eq!(num("parseInt('42px')"), 42.0);
         assert_eq!(num("parseInt('ff', 16)"), 255.0);
-        assert_eq!(num("parseFloat('3.14xyz')"), 3.14);
+        assert_eq!(num("parseFloat('12.5xyz')"), 12.5);
         assert!(boolean("isNaN(parseInt('abc'))"));
     }
 
@@ -2478,10 +2649,7 @@ mod tests {
             11.0
         );
         assert!(boolean("let m = new Map([['x', 1]]); m.has('x')"));
-        assert_eq!(
-            num("let s = new Set([1, 2, 2, 3, 3, 3]); s.size"),
-            3.0
-        );
+        assert_eq!(num("let s = new Set([1, 2, 2, 3, 3, 3]); s.size"), 3.0);
         assert!(boolean("let s = new Set(); s.add(5); s.has(5)"));
         // for-of over a Map yields [k, v] entries; over a Set yields values.
         assert_eq!(
@@ -2594,12 +2762,17 @@ mod tests {
             num("function* g(){ yield 10; yield 20; } let it = g(); it.next().value + it.next().value"),
             30.0
         );
-        assert!(boolean("function* g(){ yield 1; } let it = g(); it.next(); it.next().done"));
+        assert!(boolean(
+            "function* g(){ yield 1; } let it = g(); it.next(); it.next().done"
+        ));
         assert_eq!(
             num("function* inner(){ yield 1; yield 2; } function* g(){ yield* inner(); yield 3; } let s=0; for (const x of g()) s += x; s"),
             6.0
         );
-        assert_eq!(num("function* g(){ yield 4; yield 5; } [...g()].length"), 2.0);
+        assert_eq!(
+            num("function* g(){ yield 4; yield 5; } [...g()].length"),
+            2.0
+        );
     }
 
     #[test]
@@ -2607,7 +2780,10 @@ mod tests {
         // Direct eval sees the local scope.
         assert_eq!(num("let x = 10; eval('x + 5')"), 15.0);
         // The Function constructor.
-        assert_eq!(num("let f = new Function('a', 'b', 'return a + b'); f(3, 4)"), 7.0);
+        assert_eq!(
+            num("let f = new Function('a', 'b', 'return a + b'); f(3, 4)"),
+            7.0
+        );
         assert_eq!(num("Function('return 42')()"), 42.0);
         // Tagged template cooking: tag(strings, ...values).
         assert_eq!(

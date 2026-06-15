@@ -71,7 +71,11 @@ impl StdFont {
     /// Pick a face from generic family + weight/style flags.
     pub fn pick(serif: bool, mono: bool, bold: bool, italic: bool) -> StdFont {
         if mono {
-            return if bold { StdFont::CourierBold } else { StdFont::Courier };
+            return if bold {
+                StdFont::CourierBold
+            } else {
+                StdFont::Courier
+            };
         }
         if serif {
             return match (bold, italic) {
@@ -184,7 +188,9 @@ impl PdfBuilder {
         font: StdFont,
         color: [f64; 3],
     ) {
-        let Some(p) = self.pages.get_mut(page) else { return };
+        let Some(p) = self.pages.get_mut(page) else {
+            return;
+        };
         // PDF baseline ≈ top + size*0.8, flipped to bottom-up space.
         let baseline = p.height - (y + size * 0.8);
         let mut s = format!(
@@ -215,14 +221,26 @@ impl PdfBuilder {
         stroke: Option<[f64; 3]>,
         fill: Option<[f64; 3]>,
     ) {
-        let Some(p) = self.pages.get_mut(page) else { return };
+        let Some(p) = self.pages.get_mut(page) else {
+            return;
+        };
         let y_pdf = p.height - y - h; // bottom edge
         let mut s = String::from("\nq\n");
         if let Some([r, g, b]) = fill {
-            s.push_str(&format!("{} {} {} rg\n", Self::num(r), Self::num(g), Self::num(b)));
+            s.push_str(&format!(
+                "{} {} {} rg\n",
+                Self::num(r),
+                Self::num(g),
+                Self::num(b)
+            ));
         }
         if let Some([r, g, b]) = stroke {
-            s.push_str(&format!("{} {} {} RG\n", Self::num(r), Self::num(g), Self::num(b)));
+            s.push_str(&format!(
+                "{} {} {} RG\n",
+                Self::num(r),
+                Self::num(g),
+                Self::num(b)
+            ));
         }
         s.push_str(&format!(
             "{} {} {} {} re\n{}\nQ\n",
@@ -257,7 +275,10 @@ impl PdfBuilder {
             f.set(b"BaseFont", name(font.base_font().as_bytes()));
             f.set(b"Encoding", name(b"WinAnsiEncoding"));
             objects.insert(id, Object::Dictionary(f));
-            font_dict.set(font.resource_name().as_bytes().to_vec(), Object::Reference(id));
+            font_dict.set(
+                font.resource_name().as_bytes().to_vec(),
+                Object::Reference(id),
+            );
         }
         let mut resources = Dictionary::new();
         resources.set(b"Font", Object::Dictionary(font_dict));
@@ -273,7 +294,10 @@ impl PdfBuilder {
 
             let mut cdict = Dictionary::new();
             cdict.set(b"Length", Object::Integer(page.content.len() as i64));
-            objects.insert(content_id, Object::Stream(Stream::new(cdict, page.content.clone())));
+            objects.insert(
+                content_id,
+                Object::Stream(Stream::new(cdict, page.content.clone())),
+            );
 
             let mut pdict = Dictionary::new();
             pdict.set(b"Type", name(b"Page"));
@@ -327,7 +351,15 @@ mod tests {
     fn builds_a_valid_pdf_with_text() {
         let mut b = PdfBuilder::new();
         let p = b.add_page(612.0, 792.0);
-        b.text(p, 72.0, 100.0, 14.0, "Hello (PDF) — café", StdFont::Helvetica, [0.0, 0.0, 0.0]);
+        b.text(
+            p,
+            72.0,
+            100.0,
+            14.0,
+            "Hello (PDF) — café",
+            StdFont::Helvetica,
+            [0.0, 0.0, 0.0],
+        );
         b.rect(p, 50.0, 50.0, 200.0, 30.0, Some([0.5, 0.5, 0.5]), None);
         let pdf = b.finish();
         assert_eq!(&pdf[0..5], b"%PDF-");
@@ -337,7 +369,10 @@ mod tests {
         let doc = crate::Document::open(&pdf).expect("re-open built PDF");
         assert_eq!(doc.page_count(), 1);
         let runs = doc.page_text_runs(1).unwrap();
-        assert!(runs.iter().any(|r| r.text.contains("Hello")), "text extractable");
+        assert!(
+            runs.iter().any(|r| r.text.contains("Hello")),
+            "text extractable"
+        );
     }
 
     #[test]

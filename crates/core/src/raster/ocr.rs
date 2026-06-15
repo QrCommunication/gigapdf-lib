@@ -122,9 +122,29 @@ fn dense(inp: &[f32], w: &[i8], scale: f32, bias: &[f32], out: usize, relu: bool
 /// Classify a normalized `SIZE*SIZE` input (ink=1) as `1×SIZE×SIZE` → class
 /// index + softmax confidence, via the embedded CNN.
 fn classify(input: &[f32]) -> (usize, f32) {
-    let c1 = conv2d_relu(input, 1, m::SIZE, m::SIZE, &m::C1_W, m::C1_SCALE, &m::C1_B, m::C1_OUT, m::KERNEL);
+    let c1 = conv2d_relu(
+        input,
+        1,
+        m::SIZE,
+        m::SIZE,
+        &m::C1_W,
+        m::C1_SCALE,
+        &m::C1_B,
+        m::C1_OUT,
+        m::KERNEL,
+    );
     let (p1, h1, w1) = maxpool2(&c1, m::C1_OUT, m::SIZE, m::SIZE);
-    let c2 = conv2d_relu(&p1, m::C1_OUT, h1, w1, &m::C2_W, m::C2_SCALE, &m::C2_B, m::C2_OUT, m::KERNEL);
+    let c2 = conv2d_relu(
+        &p1,
+        m::C1_OUT,
+        h1,
+        w1,
+        &m::C2_W,
+        m::C2_SCALE,
+        &m::C2_B,
+        m::C2_OUT,
+        m::KERNEL,
+    );
     let (flat, _h2, _w2) = maxpool2(&c2, m::C2_OUT, h1, w1); // channel-major == FLAT
     let fc1 = dense(&flat, &m::F1_W, m::F1_SCALE, &m::F1_B, m::FC1, true);
     let logits = dense(&fc1, &m::F2_W, m::F2_SCALE, &m::F2_B, m::CLASSES, false);
@@ -249,7 +269,10 @@ fn normalize(blob: &Blob, labels: &[i32], id: i32, w: usize, input: &mut [f32]) 
     input.iter_mut().for_each(|v| *v = 0.0);
     let (bw, bh) = (blob.w(), blob.h());
     let scale = m::INK_BOX as f64 / bw.max(bh) as f64;
-    let (tw, th) = ((bw as f64 * scale).round().max(1.0), (bh as f64 * scale).round().max(1.0));
+    let (tw, th) = (
+        (bw as f64 * scale).round().max(1.0),
+        (bh as f64 * scale).round().max(1.0),
+    );
     let ox = (m::SIZE as f64 - tw) / 2.0;
     let oy = (m::SIZE as f64 - th) / 2.0;
     for oyp in 0..th as usize {
@@ -316,7 +339,12 @@ pub fn ocr(gray: &[u8], w: usize, h: usize) -> OcrResult {
         let mut wx1 = 0.0f64;
         let mut wy1 = 0.0f64;
         let mut prev_x1: Option<usize> = None;
-        let flush = |result: &mut OcrResult, word: &mut String, wx0: &mut f64, wy0: &mut f64, wx1: &mut f64, wy1: &mut f64| {
+        let flush = |result: &mut OcrResult,
+                     word: &mut String,
+                     wx0: &mut f64,
+                     wy0: &mut f64,
+                     wx1: &mut f64,
+                     wy1: &mut f64| {
             if !word.is_empty() {
                 result.text.push_str(word);
                 result.text.push(' ');
@@ -337,7 +365,14 @@ pub fn ocr(gray: &[u8], w: usize, h: usize) -> OcrResult {
             let b = &blobs[g];
             if let Some(px1) = prev_x1 {
                 if b.x0 as f64 - px1 as f64 > space_gap {
-                    flush(&mut result, &mut word, &mut wx0, &mut wy0, &mut wx1, &mut wy1);
+                    flush(
+                        &mut result,
+                        &mut word,
+                        &mut wx0,
+                        &mut wy0,
+                        &mut wx1,
+                        &mut wy1,
+                    );
                 }
             }
             normalize(b, &labels, g as i32, w, &mut input);
@@ -349,7 +384,14 @@ pub fn ocr(gray: &[u8], w: usize, h: usize) -> OcrResult {
             wy1 = wy1.max(b.y1 as f64 + 1.0);
             prev_x1 = Some(b.x1);
         }
-        flush(&mut result, &mut word, &mut wx0, &mut wy0, &mut wx1, &mut wy1);
+        flush(
+            &mut result,
+            &mut word,
+            &mut wx0,
+            &mut wy0,
+            &mut wx1,
+            &mut wy1,
+        );
         // Newline between lines.
         if result.text.ends_with(' ') {
             result.text.pop();
@@ -391,7 +433,16 @@ mod tests {
         // Two separate 2x2 ink squares on a 10x4 canvas.
         let (w, h) = (10usize, 4usize);
         let mut ink = vec![false; w * h];
-        for (y, x) in [(1, 1), (1, 2), (2, 1), (2, 2), (1, 6), (1, 7), (2, 6), (2, 7)] {
+        for (y, x) in [
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
+            (1, 6),
+            (1, 7),
+            (2, 6),
+            (2, 7),
+        ] {
             ink[y * w + x] = true;
         }
         let (blobs, _) = connected_components(&ink, w, h);

@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::annot::{self, Annotation};
 use crate::content::{self, ContentElement, TextRun};
 use crate::error::{EngineError, Result};
-use crate::form::{self, FormField};
 use crate::filters::decode_stream;
+use crate::form::{self, FormField};
 use crate::lexer::{Lexer, Token};
 use crate::link::{Link, LinkTarget};
 use crate::object::{Dictionary, Object, ObjectId, Stream, StringKind};
@@ -184,7 +184,10 @@ impl Document {
         let mut sig = Dictionary::new();
         sig.set(b"Type".to_vec(), Object::Name(b"Sig".to_vec()));
         sig.set(b"Filter".to_vec(), Object::Name(b"Adobe.PPKLite".to_vec()));
-        sig.set(b"SubFilter".to_vec(), Object::Name(b"adbe.pkcs7.detached".to_vec()));
+        sig.set(
+            b"SubFilter".to_vec(),
+            Object::Name(b"adbe.pkcs7.detached".to_vec()),
+        );
         sig.set(b"Name".to_vec(), lit(name));
         sig.set(b"Reason".to_vec(), lit(reason));
         sig.set(b"M".to_vec(), lit(date));
@@ -215,7 +218,12 @@ impl Document {
         self.objects.insert(field_id, Object::Dictionary(field));
 
         if let Ok(page_id) = self.page_object_id(1) {
-            if let Some(mut page) = self.objects.get(&page_id).and_then(Object::as_dict).cloned() {
+            if let Some(mut page) = self
+                .objects
+                .get(&page_id)
+                .and_then(Object::as_dict)
+                .cloned()
+            {
                 let mut annots = page
                     .get(b"Annots")
                     .map(|o| self.resolve(o))
@@ -392,7 +400,8 @@ impl Document {
             None => return Ok(()),
         };
 
-        let is_pages_node = dict.get(b"Type").and_then(Object::as_name) == Some(b"Pages".as_slice())
+        let is_pages_node = dict.get(b"Type").and_then(Object::as_name)
+            == Some(b"Pages".as_slice())
             || dict.contains(b"Kids");
 
         if is_pages_node {
@@ -570,7 +579,12 @@ impl Document {
         height: f64,
         cover: Option<[f64; 3]>,
     ) -> Result<usize> {
-        let region = content::Bounds { x, y, width, height };
+        let region = content::Bounds {
+            x,
+            y,
+            width,
+            height,
+        };
         let mut hits: Vec<usize> = self
             .page_elements(page_no)?
             .into_iter()
@@ -633,11 +647,14 @@ impl Document {
         let scale = scale.max(0.01);
         let width = ((w_pts * scale).ceil() as u32).max(1);
         let height = ((h_pts * scale).ceil() as u32).max(1);
-        let base = content::PageMatrix::new(scale, 0.0, 0.0, -scale, -x0 * scale, (y0 + h_pts) * scale);
+        let base =
+            content::PageMatrix::new(scale, 0.0, 0.0, -scale, -x0 * scale, (y0 + h_pts) * scale);
         let content = self.page_content(page_no)?;
         let fonts = self.page_render_fonts(page_no);
         let images = self.page_images(page_no);
-        Ok(crate::raster::render_content(&content, width, height, base, &fonts, &images))
+        Ok(crate::raster::render_content(
+            &content, width, height, base, &fonts, &images,
+        ))
     }
 
     /// OCR a page with the built-in zero-dependency recognizer. The page is
@@ -878,7 +895,10 @@ impl Document {
             b"OutputConditionIdentifier",
             Object::String(b"sRGB IEC61966-2.1".to_vec(), Literal),
         );
-        oi.set(b"Info", Object::String(b"sRGB IEC61966-2.1".to_vec(), Literal));
+        oi.set(
+            b"Info",
+            Object::String(b"sRGB IEC61966-2.1".to_vec(), Literal),
+        );
         oi.set(b"DestOutputProfile", Object::Reference(icc_id));
 
         // Attach Metadata + OutputIntents to the catalog.
@@ -888,7 +908,10 @@ impl Document {
             .cloned()
             .unwrap_or_default();
         catalog.set(b"Metadata", Object::Reference(meta_id));
-        catalog.set(b"OutputIntents", Object::Array(vec![Object::Dictionary(oi)]));
+        catalog.set(
+            b"OutputIntents",
+            Object::Array(vec![Object::Dictionary(oi)]),
+        );
         objects.insert(catalog_id, Object::Dictionary(catalog));
 
         // PDF/A requires a trailer /ID. Derive one deterministically.
@@ -937,7 +960,10 @@ impl Document {
             }
             let width = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
             let height = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
-            let bpc = dict.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap_or(8);
+            let bpc = dict
+                .get(b"BitsPerComponent")
+                .and_then(Object::as_i64)
+                .unwrap_or(8);
             if width <= 0 || height <= 0 || bpc != 8 {
                 continue;
             }
@@ -946,7 +972,11 @@ impl Document {
             if matches!(filter.as_deref(), Some(b"DCTDecode") | Some(b"JPXDecode")) {
                 continue;
             }
-            let components = match dict.get(b"ColorSpace").map(|o| self.resolve(o)).and_then(Object::as_name) {
+            let components = match dict
+                .get(b"ColorSpace")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_name)
+            {
                 Some(b"DeviceRGB") => 3,
                 Some(b"DeviceGray") => 1,
                 _ => continue, // Indexed/ICCBased/CMYK not handled yet
@@ -1017,11 +1047,17 @@ impl Document {
         let sd = &stream.dict;
         let sw = sd.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
         let sh = sd.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
-        let bpc = sd.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap_or(8);
+        let bpc = sd
+            .get(b"BitsPerComponent")
+            .and_then(Object::as_i64)
+            .unwrap_or(8);
         if sw <= 0 || sh <= 0 || bpc != 8 {
             return None;
         }
-        if matches!(self.first_filter(sd).as_deref(), Some(b"DCTDecode") | Some(b"JPXDecode")) {
+        if matches!(
+            self.first_filter(sd).as_deref(),
+            Some(b"DCTDecode") | Some(b"JPXDecode")
+        ) {
             return None;
         }
         let samples = decode_stream(stream).ok()?;
@@ -1168,8 +1204,7 @@ impl Document {
     /// the CIDFont for a Type0 font. `/FontFile2` is TrueType; `/FontFile3` is
     /// CFF/OpenType (tried as both). Type1 (`/FontFile`) is not yet rasterized.
     fn font_program(&self, font: &Dictionary) -> Option<crate::font::GlyphSource> {
-        let carrier = if font.get(b"Subtype").and_then(Object::as_name)
-            == Some(b"Type0".as_slice())
+        let carrier = if font.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice())
         {
             font.get(b"DescendantFonts")
                 .map(|o| self.resolve(o))
@@ -1356,7 +1391,15 @@ impl Document {
     /// `(x, y, width, height)` in PDF user space (origin bottom-left). Renders as
     /// **native vector paths** — crisp at any zoom, not rasterized. Errors only if
     /// the SVG can't be parsed or has nothing drawable.
-    pub fn add_svg(&mut self, page_no: u32, src: &str, x: f64, y: f64, width: f64, height: f64) -> Result<()> {
+    pub fn add_svg(
+        &mut self,
+        page_no: u32,
+        src: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Result<()> {
         let img = crate::svg::parse_svg(src)
             .ok_or_else(|| EngineError::Missing("unsupported or empty SVG".into()))?;
         self.draw_svg_image(page_no, &img, x, y, width, height)
@@ -1408,8 +1451,16 @@ impl Document {
                         let (c, d) = map(x2, y2);
                         let (e, f) = map(x3, y3);
                         path.extend_from_slice(
-                            format!("{} {} {} {} {} {} c\n", num(a), num(b), num(c), num(d), num(e), num(f))
-                                .as_bytes(),
+                            format!(
+                                "{} {} {} {} {} {} c\n",
+                                num(a),
+                                num(b),
+                                num(c),
+                                num(d),
+                                num(e),
+                                num(f)
+                            )
+                            .as_bytes(),
                         );
                         drew = true;
                     }
@@ -1428,11 +1479,15 @@ impl Document {
             let mut eff_fill_opacity = prim.fill_opacity;
             match &prim.fill {
                 Some(Fill::Solid([r, g, b])) => {
-                    setup.extend_from_slice(format!("{} {} {} rg\n", num(*r), num(*g), num(*b)).as_bytes());
+                    setup.extend_from_slice(
+                        format!("{} {} {} rg\n", num(*r), num(*g), num(*b)).as_bytes(),
+                    );
                     has_fill = true;
                 }
                 Some(Fill::Gradient(grad)) => {
-                    if let Some(name) = self.register_svg_shading(page_no, grad, map, stroke_scale)? {
+                    if let Some(name) =
+                        self.register_svg_shading(page_no, grad, map, stroke_scale)?
+                    {
                         setup.extend_from_slice(b"/Pattern cs\n/");
                         setup.extend_from_slice(&name);
                         setup.extend_from_slice(b" scn\n");
@@ -1444,8 +1499,11 @@ impl Document {
                 None => {}
             }
             if let Some([r, g, b]) = prim.stroke {
-                setup.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
-                setup.extend_from_slice(format!("{} w\n", num((prim.stroke_w * stroke_scale).max(0.0))).as_bytes());
+                setup
+                    .extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+                setup.extend_from_slice(
+                    format!("{} w\n", num((prim.stroke_w * stroke_scale).max(0.0))).as_bytes(),
+                );
             }
             let has_stroke = prim.stroke.is_some();
             if !has_fill && !has_stroke {
@@ -1466,9 +1524,20 @@ impl Document {
             if eff_fill_opacity < 1.0 || prim.stroke_opacity < 1.0 {
                 let mut gs = Dictionary::new();
                 gs.set(b"Type".to_vec(), Object::Name(b"ExtGState".to_vec()));
-                gs.set(b"ca".to_vec(), Object::Real(eff_fill_opacity.clamp(0.0, 1.0)));
-                gs.set(b"CA".to_vec(), Object::Real(prim.stroke_opacity.clamp(0.0, 1.0)));
-                let name = self.register_page_resource(page_no, b"ExtGState", "GpGs", Object::Dictionary(gs))?;
+                gs.set(
+                    b"ca".to_vec(),
+                    Object::Real(eff_fill_opacity.clamp(0.0, 1.0)),
+                );
+                gs.set(
+                    b"CA".to_vec(),
+                    Object::Real(prim.stroke_opacity.clamp(0.0, 1.0)),
+                );
+                let name = self.register_page_resource(
+                    page_no,
+                    b"ExtGState",
+                    "GpGs",
+                    Object::Dictionary(gs),
+                )?;
                 let mut wrapped = b"q\n/".to_vec();
                 wrapped.extend_from_slice(&name);
                 wrapped.extend_from_slice(b" gs\n");
@@ -1504,26 +1573,36 @@ impl Document {
         }
         let mut fdict = Dictionary::new();
         fdict.set(b"FunctionType".to_vec(), Object::Integer(0));
-        fdict.set(b"Domain".to_vec(), Object::Array(vec![Object::Integer(0), Object::Integer(1)]));
+        fdict.set(
+            b"Domain".to_vec(),
+            Object::Array(vec![Object::Integer(0), Object::Integer(1)]),
+        );
         fdict.set(
             b"Range".to_vec(),
             Object::Array(vec![
-                Object::Integer(0), Object::Integer(1),
-                Object::Integer(0), Object::Integer(1),
-                Object::Integer(0), Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(1),
             ]),
         );
         fdict.set(b"Size".to_vec(), Object::Array(vec![Object::Integer(256)]));
         fdict.set(b"BitsPerSample".to_vec(), Object::Integer(8));
         fdict.set(b"Length".to_vec(), Object::Integer(samples.len() as i64));
         let fn_id = (self.next_object_number(), 0u16);
-        self.objects.insert(fn_id, Object::Stream(Stream::new(fdict, samples)));
+        self.objects
+            .insert(fn_id, Object::Stream(Stream::new(fdict, samples)));
 
         // 2. The shading dictionary (axial = type 2, radial = type 3).
         let mut sh = Dictionary::new();
         sh.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec()));
         sh.set(b"Function".to_vec(), Object::Reference(fn_id));
-        sh.set(b"Extend".to_vec(), Object::Array(vec![Object::Boolean(true), Object::Boolean(true)]));
+        sh.set(
+            b"Extend".to_vec(),
+            Object::Array(vec![Object::Boolean(true), Object::Boolean(true)]),
+        );
         match grad.kind {
             GradKind::Linear { x1, y1, x2, y2 } => {
                 let (a, b) = map(x1, y1);
@@ -1531,7 +1610,12 @@ impl Document {
                 sh.set(b"ShadingType".to_vec(), Object::Integer(2));
                 sh.set(
                     b"Coords".to_vec(),
-                    Object::Array(vec![Object::Real(a), Object::Real(b), Object::Real(c), Object::Real(d)]),
+                    Object::Array(vec![
+                        Object::Real(a),
+                        Object::Real(b),
+                        Object::Real(c),
+                        Object::Real(d),
+                    ]),
                 );
             }
             GradKind::Radial { cx, cy, r, fx, fy } => {
@@ -1541,8 +1625,12 @@ impl Document {
                 sh.set(
                     b"Coords".to_vec(),
                     Object::Array(vec![
-                        Object::Real(pfx), Object::Real(pfy), Object::Real(0.0),
-                        Object::Real(pcx), Object::Real(pcy), Object::Real((r * rscale).max(0.0)),
+                        Object::Real(pfx),
+                        Object::Real(pfy),
+                        Object::Real(0.0),
+                        Object::Real(pcx),
+                        Object::Real(pcy),
+                        Object::Real((r * rscale).max(0.0)),
                     ]),
                 );
             }
@@ -1556,11 +1644,20 @@ impl Document {
         pat.set(
             b"Matrix".to_vec(),
             Object::Array(vec![
-                Object::Integer(1), Object::Integer(0), Object::Integer(0),
-                Object::Integer(1), Object::Integer(0), Object::Integer(0),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
             ]),
         );
-        Ok(Some(self.register_page_resource(page_no, b"Pattern", "GpSh", Object::Dictionary(pat))?))
+        Ok(Some(self.register_page_resource(
+            page_no,
+            b"Pattern",
+            "GpSh",
+            Object::Dictionary(pat),
+        )?))
     }
 
     /// Draw a **colour glyph** (COLR/CPAL emoji) as native vector layers at the
@@ -1596,15 +1693,21 @@ impl Document {
             }
             let rgb = if layer.use_foreground { fg } else { layer.rgb };
             let mut ops: Vec<u8> = b"q\n".to_vec();
-            ops.extend_from_slice(format!("{} {} {} rg\n", num(rgb[0]), num(rgb[1]), num(rgb[2])).as_bytes());
+            ops.extend_from_slice(
+                format!("{} {} {} rg\n", num(rgb[0]), num(rgb[1]), num(rgb[2])).as_bytes(),
+            );
             for contour in &contours {
                 if contour.len() < 2 {
                     continue;
                 }
                 let (fx, fy) = contour[0];
-                ops.extend_from_slice(format!("{} {} m\n", num(x + fx * s), num(baseline + fy * s)).as_bytes());
+                ops.extend_from_slice(
+                    format!("{} {} m\n", num(x + fx * s), num(baseline + fy * s)).as_bytes(),
+                );
                 for &(fx, fy) in &contour[1..] {
-                    ops.extend_from_slice(format!("{} {} l\n", num(x + fx * s), num(baseline + fy * s)).as_bytes());
+                    ops.extend_from_slice(
+                        format!("{} {} l\n", num(x + fx * s), num(baseline + fy * s)).as_bytes(),
+                    );
                 }
                 ops.extend_from_slice(b"h\n");
             }
@@ -1628,12 +1731,24 @@ impl Document {
         baseline: f64,
         size: f64,
     ) -> Result<bool> {
-        let Some(sb) = face.sbix_glyphs() else { return Ok(false) };
-        let Some(g) = sb.glyph(gid) else { return Ok(false) };
+        let Some(sb) = face.sbix_glyphs() else {
+            return Ok(false);
+        };
+        let Some(g) = sb.glyph(gid) else {
+            return Ok(false);
+        };
         // Origin offsets are pixels at the strike ppem → convert to points; the
         // bitmap covers roughly the em box, so place a `size × size` image.
         let scale = size / g.ppem.max(1.0);
-        let _ = self.add_image(page_no, &g.png, x + g.origin_x * scale, baseline + g.origin_y * scale, size, size, 1.0);
+        let _ = self.add_image(
+            page_no,
+            &g.png,
+            x + g.origin_x * scale,
+            baseline + g.origin_y * scale,
+            size,
+            size,
+            1.0,
+        );
         Ok(true)
     }
 
@@ -1815,7 +1930,11 @@ impl Document {
 
     fn read_rect(&self, dict: &Dictionary) -> [f64; 4] {
         let mut rect = [0.0f64; 4];
-        if let Some(items) = dict.get(b"Rect").map(|o| self.resolve(o)).and_then(Object::as_array) {
+        if let Some(items) = dict
+            .get(b"Rect")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
             for (i, value) in items.iter().take(4).enumerate() {
                 rect[i] = self.resolve(value).as_f64().unwrap_or(0.0);
             }
@@ -1910,7 +2029,9 @@ impl Document {
         // Annotation dict with /AP /N -> form.
         let mut appearance = Dictionary::new();
         appearance.set(b"N".to_vec(), Object::Reference(appearance_id));
-        built.dict.set(b"AP".to_vec(), Object::Dictionary(appearance));
+        built
+            .dict
+            .set(b"AP".to_vec(), Object::Dictionary(appearance));
         built.dict.set(b"Type".to_vec(), annot::name(b"Annot"));
         self.objects
             .insert(annotation_id, Object::Dictionary(built.dict));
@@ -2034,7 +2155,10 @@ impl Document {
         self.objects.insert(fd_id, Object::Dictionary(fd));
 
         // CIDFontType2 with Identity CIDToGIDMap (CID = GID) and full widths.
-        let w_inner: Vec<Object> = advances.iter().map(|&w| Object::Integer(w as i64)).collect();
+        let w_inner: Vec<Object> = advances
+            .iter()
+            .map(|&w| Object::Integer(w as i64))
+            .collect();
         let mut cidsi = Dictionary::new();
         cidsi.set(b"Registry", Object::String(b"Adobe".to_vec(), Literal));
         cidsi.set(b"Ordering", Object::String(b"Identity".to_vec(), Literal));
@@ -2090,9 +2214,9 @@ impl Document {
         font_obj: u32,
         color: [f64; 3],
     ) -> Result<()> {
-        let ttf = self
-            .embedded_truetype(font_obj)
-            .ok_or_else(|| EngineError::Unsupported("font_obj is not an embedded TrueType font".into()))?;
+        let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
+            EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
+        })?;
         // Identity-H shows two-byte glyph ids directly.
         let mut hex = String::new();
         for ch in text.chars() {
@@ -2200,7 +2324,11 @@ impl Document {
         let Ok(page_id) = self.page_object_id(page_no) else {
             return Dictionary::new();
         };
-        let mut current = self.objects.get(&page_id).and_then(Object::as_dict).cloned();
+        let mut current = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .cloned();
         while let Some(dict) = current {
             if let Some(res) = dict
                 .get(b"Resources")
@@ -2414,7 +2542,11 @@ impl Document {
     /// The /Pages tree node whose /Kids contains `child`, if any.
     fn find_kids_parent(&self, child: ObjectId) -> Option<ObjectId> {
         for (id, object) in &self.objects {
-            if let Some(kids) = object.as_dict().and_then(|d| d.get(b"Kids")).and_then(Object::as_array) {
+            if let Some(kids) = object
+                .as_dict()
+                .and_then(|d| d.get(b"Kids"))
+                .and_then(Object::as_array)
+            {
                 if kids.iter().any(|o| o.as_reference() == Some(child)) {
                     return Some(*id);
                 }
@@ -2445,7 +2577,9 @@ impl Document {
     /// Delete a page (cannot delete the last remaining page).
     pub fn delete_page(&mut self, page_no: u32) -> Result<()> {
         if self.page_count() <= 1 {
-            return Err(EngineError::Unsupported("cannot delete the only page".into()));
+            return Err(EngineError::Unsupported(
+                "cannot delete the only page".into(),
+            ));
         }
         let page_id = self.page_object_id(page_no)?;
         let parent_id = self
@@ -2602,12 +2736,20 @@ impl Document {
             .and_then(Object::as_array)
             .map(<[Object]>::to_vec)
             .unwrap_or_default();
-        let count = root.get(b"Count").and_then(Object::as_i64).unwrap_or(kids.len() as i64);
+        let count = root
+            .get(b"Count")
+            .and_then(Object::as_i64)
+            .unwrap_or(kids.len() as i64);
 
         for &page in &other_pages {
             let new_page = map[&page];
             kids.push(Object::Reference(new_page));
-            if let Some(mut page_dict) = self.objects.get(&new_page).and_then(Object::as_dict).cloned() {
+            if let Some(mut page_dict) = self
+                .objects
+                .get(&new_page)
+                .and_then(Object::as_dict)
+                .cloned()
+            {
                 page_dict.set(b"Parent".to_vec(), Object::Reference(root_id));
                 self.objects.insert(new_page, Object::Dictionary(page_dict));
             }
@@ -2627,7 +2769,8 @@ impl Document {
             return id;
         }
         let id = (self.next_object_number(), 0u16);
-        self.objects.insert(id, Object::Dictionary(Dictionary::new()));
+        self.objects
+            .insert(id, Object::Dictionary(Dictionary::new()));
         self.trailer.set(b"Info".to_vec(), Object::Reference(id));
         id
     }
@@ -2752,13 +2895,19 @@ impl Document {
         d.set(b"BBox", annot::real_array(&[0.0, 0.0, w, h]));
         d.set(b"Resources", Object::Dictionary(resources));
         d.set(b"Length", Object::Integer(content.len() as i64));
-        self.objects.insert(id, Object::Stream(Stream::new(d, content)));
+        self.objects
+            .insert(id, Object::Stream(Stream::new(d, content)));
         id
     }
 
     /// Append an annotation/widget reference to a page's `/Annots`.
     fn append_to_page_annots(&mut self, page_id: ObjectId, annot_id: ObjectId) {
-        if let Some(mut page) = self.objects.get(&page_id).and_then(Object::as_dict).cloned() {
+        if let Some(mut page) = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        {
             let mut annots = page
                 .get(b"Annots")
                 .map(|o| self.resolve(o))
@@ -2847,7 +2996,8 @@ impl Document {
             field.set(b"MK", Object::Dictionary(mk));
         }
 
-        let ap_id = self.make_form_xobject(form::text_appearance(value, style, w, h), w, h, helv_id);
+        let ap_id =
+            self.make_form_xobject(form::text_appearance(value, style, w, h), w, h, helv_id);
         let mut ap = Dictionary::new();
         ap.set(b"N", Object::Reference(ap_id));
 
@@ -2939,7 +3089,11 @@ impl Document {
             let mut ap = Dictionary::new();
             ap.set(b"N", Object::Dictionary(n));
 
-            let state: &str = if selected == Some(export.as_str()) { export } else { "Off" };
+            let state: &str = if selected == Some(export.as_str()) {
+                export
+            } else {
+                "Off"
+            };
             let mut kid = Dictionary::new();
             kid.set(b"Type", annot::name(b"Annot"));
             kid.set(b"Subtype", annot::name(b"Widget"));
@@ -2984,7 +3138,9 @@ impl Document {
         editable: bool,
         style: &form::FieldStyle,
     ) -> Result<()> {
-        self.add_choice_field(page, name, rect, options, selected, true, editable, false, style)
+        self.add_choice_field(
+            page, name, rect, options, selected, true, editable, false, style,
+        )
     }
 
     /// Add a scrolling **list box**. `multi` allows selecting several options.
@@ -2999,7 +3155,9 @@ impl Document {
         multi: bool,
         style: &form::FieldStyle,
     ) -> Result<()> {
-        self.add_choice_field(page, name, rect, options, selected, false, false, multi, style)
+        self.add_choice_field(
+            page, name, rect, options, selected, false, false, multi, style,
+        )
     }
 
     /// Shared implementation for combo boxes and list boxes (both `/FT Ch`).
@@ -3048,7 +3206,8 @@ impl Document {
             field.set(b"MK", Object::Dictionary(mk));
         }
 
-        let ap_id = self.make_form_xobject(form::text_appearance(value, style, w, h), w, h, helv_id);
+        let ap_id =
+            self.make_form_xobject(form::text_appearance(value, style, w, h), w, h, helv_id);
         let mut ap = Dictionary::new();
         ap.set(b"N", Object::Reference(ap_id));
 
@@ -3098,7 +3257,11 @@ impl Document {
     fn lookup_named_dest(&self, key: &[u8]) -> Option<Object> {
         let catalog = self.catalog().ok()?;
         // PDF 1.1 style: catalog /Dests is a dictionary of name -> dest.
-        if let Some(dests) = catalog.get(b"Dests").map(|o| self.resolve(o)).and_then(Object::as_dict) {
+        if let Some(dests) = catalog
+            .get(b"Dests")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        {
             if let Some(entry) = dests.get(key) {
                 let resolved = self.resolve(entry);
                 // A named dest may wrap its array in a /D dictionary entry.
@@ -3124,7 +3287,11 @@ impl Document {
             return None;
         }
         let dict = self.resolve(node).as_dict()?;
-        if let Some(names) = dict.get(b"Names").map(|o| self.resolve(o)).and_then(Object::as_array) {
+        if let Some(names) = dict
+            .get(b"Names")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
             let mut i = 0;
             while i + 1 < names.len() {
                 if let Object::String(bytes, _) = self.resolve(&names[i]) {
@@ -3139,7 +3306,11 @@ impl Document {
                 i += 2;
             }
         }
-        if let Some(kids) = dict.get(b"Kids").map(|o| self.resolve(o)).and_then(Object::as_array) {
+        if let Some(kids) = dict
+            .get(b"Kids")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
             for kid in kids {
                 if let Some(found) = self.search_name_tree(kid, key, depth + 1) {
                     return Some(found);
@@ -3177,7 +3348,10 @@ impl Document {
                 return Some(page);
             }
         }
-        let action = dict.get(b"A").map(|o| self.resolve(o)).and_then(Object::as_dict)?;
+        let action = dict
+            .get(b"A")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
         if action.get(b"S").and_then(Object::as_name) == Some(b"GoTo".as_slice()) {
             if let Some(d) = action.get(b"D") {
                 return self.dest_to_page(d);
@@ -3207,15 +3381,24 @@ impl Document {
             }
             let rect = self.read_rect(dict);
             let target = self.link_target(dict);
-            out.push(Link { index, rect, target });
+            out.push(Link {
+                index,
+                rect,
+                target,
+            });
         }
         Ok(out)
     }
 
     fn link_target(&self, dict: &Dictionary) -> LinkTarget {
-        if let Some(action) = dict.get(b"A").map(|o| self.resolve(o)).and_then(Object::as_dict) {
+        if let Some(action) = dict
+            .get(b"A")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        {
             if action.get(b"S").and_then(Object::as_name) == Some(b"URI".as_slice()) {
-                if let Some(Object::String(bytes, _)) = action.get(b"URI").map(|o| self.resolve(o)) {
+                if let Some(Object::String(bytes, _)) = action.get(b"URI").map(|o| self.resolve(o))
+                {
                     return LinkTarget::Uri(String::from_utf8_lossy(bytes).into_owned());
                 }
             }
@@ -3312,7 +3495,13 @@ impl Document {
         out
     }
 
-    fn walk_outline(&self, start: ObjectId, level: usize, out: &mut Vec<OutlineItem>, depth: usize) {
+    fn walk_outline(
+        &self,
+        start: ObjectId,
+        level: usize,
+        out: &mut Vec<OutlineItem>,
+        depth: usize,
+    ) {
         if depth > 64 {
             return;
         }
@@ -3326,7 +3515,10 @@ impl Document {
             let Some(dict) = self.objects.get(&id).and_then(Object::as_dict) else {
                 break;
             };
-            let title = dict.get(b"Title").map(|o| self.string_value(o)).unwrap_or_default();
+            let title = dict
+                .get(b"Title")
+                .map(|o| self.string_value(o))
+                .unwrap_or_default();
             let page = self.dest_page_of(dict);
             out.push(OutlineItem { title, level, page });
             if let Some(child) = dict.get(b"First").and_then(Object::as_reference) {
@@ -3341,7 +3533,12 @@ impl Document {
     pub fn set_outline(&mut self, items: &[(String, Option<u32>, usize)]) -> Result<()> {
         let catalog_id = self.catalog_id()?;
         if items.is_empty() {
-            if let Some(mut catalog) = self.objects.get(&catalog_id).and_then(Object::as_dict).cloned() {
+            if let Some(mut catalog) = self
+                .objects
+                .get(&catalog_id)
+                .and_then(Object::as_dict)
+                .cloned()
+            {
                 catalog.remove(b"Outlines");
                 self.objects.insert(catalog_id, Object::Dictionary(catalog));
             }
@@ -3350,8 +3547,9 @@ impl Document {
 
         let base = self.next_object_number();
         let outlines_id = (base, 0u16);
-        let item_ids: Vec<ObjectId> =
-            (0..items.len()).map(|i| (base + 1 + i as u32, 0u16)).collect();
+        let item_ids: Vec<ObjectId> = (0..items.len())
+            .map(|i| (base + 1 + i as u32, 0u16))
+            .collect();
 
         // Tree linkage computed from the flat level list via an ancestor stack.
         let mut parent = vec![outlines_id; items.len()];
@@ -3464,10 +3662,17 @@ impl Document {
         else {
             return Vec::new();
         };
-        let Some(ocgs) = ocp.get(b"OCGs").map(|o| self.resolve(o)).and_then(Object::as_array) else {
+        let Some(ocgs) = ocp
+            .get(b"OCGs")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        else {
             return Vec::new();
         };
-        let cfg = ocp.get(b"D").map(|o| self.resolve(o)).and_then(Object::as_dict);
+        let cfg = ocp
+            .get(b"D")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict);
         let off = self.oc_ref_ids(cfg.and_then(|c| c.get(b"OFF")));
         let locked = self.oc_ref_ids(cfg.and_then(|c| c.get(b"Locked")));
         let mut order = Vec::new();
@@ -3475,7 +3680,9 @@ impl Document {
 
         let mut out = Vec::new();
         for obj in ocgs {
-            let Some(oid) = obj.as_reference() else { continue };
+            let Some(oid) = obj.as_reference() else {
+                continue;
+            };
             let name = self
                 .objects
                 .get(&oid)
@@ -3542,7 +3749,10 @@ impl Document {
             .cloned()
             .unwrap_or_else(Dictionary::new);
         if cfg.get(b"Name").is_none() {
-            cfg.set(b"Name".to_vec(), Object::String(b"Default".to_vec(), StringKind::Literal));
+            cfg.set(
+                b"Name".to_vec(),
+                Object::String(b"Default".to_vec(), StringKind::Literal),
+            );
         }
         let mut order = cfg
             .get(b"Order")
@@ -3593,14 +3803,26 @@ impl Document {
         else {
             return Ok(());
         };
-        if let Some(mut ocgs) = ocp.get(b"OCGs").and_then(Object::as_array).map(<[Object]>::to_vec) {
+        if let Some(mut ocgs) = ocp
+            .get(b"OCGs")
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+        {
             ocgs.retain(|o| o.as_reference().map(|r| r.0) != Some(layer_id));
             ocp.set(b"OCGs".to_vec(), Object::Array(ocgs));
         }
-        if let Some(mut cfg) = ocp.get(b"D").map(|o| self.resolve(o)).and_then(Object::as_dict).cloned()
+        if let Some(mut cfg) = ocp
+            .get(b"D")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
         {
             for key in [b"OFF".as_ref(), b"ON", b"Locked", b"Order"] {
-                if let Some(mut arr) = cfg.get(key).and_then(Object::as_array).map(<[Object]>::to_vec) {
+                if let Some(mut arr) = cfg
+                    .get(key)
+                    .and_then(Object::as_array)
+                    .map(<[Object]>::to_vec)
+                {
                     Self::remove_oc_ref_deep(&mut arr, layer_id);
                     if arr.is_empty() {
                         cfg.remove(key);
@@ -3627,14 +3849,22 @@ impl Document {
             .and_then(|ocp| ocp.get(b"OCGs"))
             .map(|o| self.resolve(o))
             .and_then(Object::as_array)
-            .and_then(|arr| arr.iter().filter_map(|o| o.as_reference()).find(|r| r.0 == layer_id))
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|o| o.as_reference())
+                    .find(|r| r.0 == layer_id)
+            })
     }
 
     /// Object numbers of the top-level references in an `/OFF`-style array.
     fn oc_ref_ids(&self, obj: Option<&Object>) -> Vec<u32> {
         obj.map(|o| self.resolve(o))
             .and_then(Object::as_array)
-            .map(|arr| arr.iter().filter_map(|o| o.as_reference().map(|r| r.0)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| o.as_reference().map(|r| r.0))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -3683,7 +3913,11 @@ impl Document {
     /// Ensure `oid` is present in (or absent from) `cfg[key]`, dropping the key
     /// when the resulting array is empty.
     fn set_oc_membership(cfg: &mut Dictionary, key: &[u8], oid: ObjectId, present: bool) {
-        let mut arr: Vec<Object> = cfg.get(key).and_then(Object::as_array).map(<[Object]>::to_vec).unwrap_or_default();
+        let mut arr: Vec<Object> = cfg
+            .get(key)
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
         arr.retain(|o| o.as_reference().map(|r| r.0) != Some(oid.0));
         if present {
             arr.push(Object::Reference(oid));
@@ -3726,8 +3960,10 @@ impl Document {
     /// 1-based `after` page (`after == 0` prepends). Returns its object number.
     pub fn add_page(&mut self, width: f64, height: f64, after: u32) -> Result<u32> {
         let content_id = (self.next_object_number(), 0u16);
-        self.objects
-            .insert(content_id, Object::Stream(Stream::new(Dictionary::new(), Vec::new())));
+        self.objects.insert(
+            content_id,
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
         let page_id = (self.next_object_number(), 0u16);
         let mut page = Dictionary::new();
         page.set(b"Type".to_vec(), annot::name(b"Page"));
@@ -3838,7 +4074,12 @@ impl Document {
         parent.set(b"Kids".to_vec(), Object::Array(kids));
         self.objects.insert(parent_id, Object::Dictionary(parent));
 
-        if let Some(mut page) = self.objects.get(&new_page_id).and_then(Object::as_dict).cloned() {
+        if let Some(mut page) = self
+            .objects
+            .get(&new_page_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        {
             page.set(b"Parent".to_vec(), Object::Reference(parent_id));
             self.objects.insert(new_page_id, Object::Dictionary(page));
         }
@@ -3900,7 +4141,10 @@ impl Document {
         let Some(dict) = self.resolve(field).as_dict() else {
             return;
         };
-        let partial = dict.get(b"T").map(|o| self.string_value(o)).unwrap_or_default();
+        let partial = dict
+            .get(b"T")
+            .map(|o| self.string_value(o))
+            .unwrap_or_default();
         let name = match (prefix.is_empty(), partial.is_empty()) {
             (true, _) => partial.clone(),
             (false, true) => prefix.to_string(),
@@ -3913,11 +4157,9 @@ impl Document {
             .map(|o| self.resolve(o))
             .and_then(Object::as_array)
         {
-            let has_named_kids = kids.iter().any(|k| {
-                self.resolve(k)
-                    .as_dict()
-                    .is_some_and(|d| d.contains(b"T"))
-            });
+            let has_named_kids = kids
+                .iter()
+                .any(|k| self.resolve(k).as_dict().is_some_and(|d| d.contains(b"T")));
             if has_named_kids {
                 for kid in kids {
                     self.collect_field(kid, &name, out, depth + 1);
@@ -4039,7 +4281,11 @@ impl Document {
 
     /// Object id of a terminal field with the given fully-qualified name.
     fn find_field_id(&self, target: &str) -> Option<ObjectId> {
-        let acroform = self.catalog().ok()?.get(b"AcroForm").map(|o| self.resolve(o))?;
+        let acroform = self
+            .catalog()
+            .ok()?
+            .get(b"AcroForm")
+            .map(|o| self.resolve(o))?;
         let fields = acroform
             .as_dict()?
             .get(b"Fields")
@@ -4051,13 +4297,22 @@ impl Document {
             .find_map(|f| self.find_field_rec(f, "", target, 0))
     }
 
-    fn find_field_rec(&self, field: &Object, prefix: &str, target: &str, depth: usize) -> Option<ObjectId> {
+    fn find_field_rec(
+        &self,
+        field: &Object,
+        prefix: &str,
+        target: &str,
+        depth: usize,
+    ) -> Option<ObjectId> {
         if depth > 32 {
             return None;
         }
         let id = field.as_reference();
         let dict = self.resolve(field).as_dict()?;
-        let partial = dict.get(b"T").map(|o| self.string_value(o)).unwrap_or_default();
+        let partial = dict
+            .get(b"T")
+            .map(|o| self.string_value(o))
+            .unwrap_or_default();
         let name = match (prefix.is_empty(), partial.is_empty()) {
             (true, _) => partial.clone(),
             (false, true) => prefix.to_string(),
@@ -4094,7 +4349,12 @@ impl Document {
             Some(id) => id,
             None => return,
         };
-        if let Some(mut acro) = self.objects.get(&acro_id).and_then(Object::as_dict).cloned() {
+        if let Some(mut acro) = self
+            .objects
+            .get(&acro_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        {
             acro.set(b"NeedAppearances".to_vec(), Object::Boolean(true));
             self.objects.insert(acro_id, Object::Dictionary(acro));
         }
@@ -4159,11 +4419,7 @@ impl Document {
             .and_then(|ap| ap.get(b"N"))
             .map(|o| self.resolve(o))
             .and_then(Object::as_dict)?;
-        states
-            .0
-            .keys()
-            .find(|k| k.as_slice() != b"Off")
-            .cloned()
+        states.0.keys().find(|k| k.as_slice() != b"Off").cloned()
     }
 
     /// The "on" state of a checkbox, looking at the field and then its widgets.
@@ -4270,8 +4526,8 @@ impl Document {
         let (id, mut dict) = self.require_field(name)?;
         let options = self.choice_options(&dict);
         let flags = dict.get(b"Ff").and_then(Object::as_i64).unwrap_or(0) as u32;
-        let editable = flags & crate::form::flags::COMBO != 0
-            && flags & crate::form::flags::EDIT != 0;
+        let editable =
+            flags & crate::form::flags::COMBO != 0 && flags & crate::form::flags::EDIT != 0;
 
         // Resolve each requested value to (export, display, index).
         let mut chosen: Vec<(String, String, Option<usize>)> = Vec::new();
@@ -4307,7 +4563,11 @@ impl Document {
         }
 
         // /I: selected indices (ascending), omitted when nothing is indexable.
-        let mut indices: Vec<i64> = chosen.iter().filter_map(|c| c.2).map(|i| i as i64).collect();
+        let mut indices: Vec<i64> = chosen
+            .iter()
+            .filter_map(|c| c.2)
+            .map(|i| i as i64)
+            .collect();
         indices.sort_unstable();
         if indices.is_empty() {
             dict.remove(b"I");
@@ -4477,7 +4737,9 @@ fn sample_svg_gradient(stops: &[crate::svg::GradStop], t: f64) -> [u8; 3] {
             (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
         ]
     };
-    let Some(first) = stops.first() else { return [0, 0, 0] };
+    let Some(first) = stops.first() else {
+        return [0, 0, 0];
+    };
     let last = stops[stops.len() - 1];
     if t <= first.offset {
         return to8(first.rgb);
@@ -4705,7 +4967,12 @@ mod tests {
 
         doc.resize_page(1, 200.0, 300.0).unwrap();
         let (w, h) = {
-            let mb = doc.page_dict(1).unwrap().get(b"MediaBox").and_then(Object::as_array).unwrap();
+            let mb = doc
+                .page_dict(1)
+                .unwrap()
+                .get(b"MediaBox")
+                .and_then(Object::as_array)
+                .unwrap();
             (mb[2].as_f64(), mb[3].as_f64())
         };
         assert_eq!((w, h), (Some(200.0), Some(300.0)));
@@ -4761,7 +5028,10 @@ mod tests {
         let saved = doc.save();
 
         let reopened = Document::open(&saved).unwrap();
-        assert!(!reopened.page_ids().unwrap().is_empty(), "pages survived save");
+        assert!(
+            !reopened.page_ids().unwrap().is_empty(),
+            "pages survived save"
+        );
         let content = reopened.page_content(1).unwrap();
         assert!(
             has_op(&content, b"Do") || has_op(&content, b"Tj"),
@@ -4777,13 +5047,15 @@ mod tests {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         assert!(!doc.page_text_runs(1).unwrap().is_empty());
 
-        doc.replace_text_run(1, 0, "Edited by gigapdf-engine").unwrap();
+        doc.replace_text_run(1, 0, "Edited by gigapdf-engine")
+            .unwrap();
         let saved = doc.save();
 
         let reopened = Document::open(&saved).unwrap();
         let runs = reopened.page_text_runs(1).unwrap();
         assert!(
-            runs.iter().any(|r| r.text.contains("Edited by gigapdf-engine")),
+            runs.iter()
+                .any(|r| r.text.contains("Edited by gigapdf-engine")),
             "edited text should survive the save; got {:?}",
             runs.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
         );
@@ -4802,11 +5074,25 @@ mod tests {
 
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let before = paths(&doc);
-        doc.add_rectangle(1, 50.0, 50.0, 200.0, 100.0, Some([0.0, 0.0, 0.0]), None, 1.5, 1.0)
-            .unwrap();
+        doc.add_rectangle(
+            1,
+            50.0,
+            50.0,
+            200.0,
+            100.0,
+            Some([0.0, 0.0, 0.0]),
+            None,
+            1.5,
+            1.0,
+        )
+        .unwrap();
 
         let reopened = Document::open(&doc.save()).unwrap();
-        assert_eq!(paths(&reopened), before + 1, "one frame added and persisted");
+        assert_eq!(
+            paths(&reopened),
+            before + 1,
+            "one frame added and persisted"
+        );
     }
 
     #[test]
@@ -4814,14 +5100,29 @@ mod tests {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let before = doc.page_annotations(1).unwrap().len();
 
-        doc.add_square_annotation(1, [50.0, 50.0, 250.0, 150.0], Some([1.0, 0.0, 0.0]), None, 2.0)
-            .unwrap();
+        doc.add_square_annotation(
+            1,
+            [50.0, 50.0, 250.0, 150.0],
+            Some([1.0, 0.0, 0.0]),
+            None,
+            2.0,
+        )
+        .unwrap();
         doc.add_highlight(1, [60.0, 200.0, 260.0, 220.0], [1.0, 1.0, 0.0])
             .unwrap();
-        doc.add_free_text(1, [50.0, 300.0, 300.0, 340.0], "Note", 14.0, [0.0, 0.0, 1.0])
-            .unwrap();
+        doc.add_free_text(
+            1,
+            [50.0, 300.0, 300.0, 340.0],
+            "Note",
+            14.0,
+            [0.0, 0.0, 1.0],
+        )
+        .unwrap();
 
-        let annots = Document::open(&doc.save()).unwrap().page_annotations(1).unwrap();
+        let annots = Document::open(&doc.save())
+            .unwrap()
+            .page_annotations(1)
+            .unwrap();
         assert_eq!(annots.len(), before + 3, "three annotations persisted");
         assert!(annots.iter().any(|a| a.subtype == "Square"));
         assert!(annots.iter().any(|a| a.subtype == "Highlight"));
@@ -4863,7 +5164,8 @@ mod tests {
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ];
         let png = crate::raster::png::encode_png(2, 2, &rgba);
-        doc.add_image(1, &png, 100.0, 100.0, 64.0, 64.0, 1.0).unwrap();
+        doc.add_image(1, &png, 100.0, 100.0, 64.0, 64.0, 1.0)
+            .unwrap();
 
         // Reopen the serialized document and confirm the image XObject survives.
         let reopened = Document::open(&doc.save()).unwrap();
@@ -4896,7 +5198,11 @@ mod tests {
         doc.move_page(1, ids.len() as u32).unwrap();
         let reordered = doc.page_ids().unwrap();
         assert_eq!(reordered.len(), ids.len());
-        assert_eq!(reordered.last().copied(), Some(first), "page 1 moved to last");
+        assert_eq!(
+            reordered.last().copied(),
+            Some(first),
+            "page 1 moved to last"
+        );
 
         assert_eq!(Document::open(&doc.save()).unwrap().page_count(), ids.len());
     }
@@ -4950,7 +5256,11 @@ mod tests {
         for f in &fields {
             eprintln!(
                 "  {:<10} type={} kind={:?} flags={:#06x} opts={:?}",
-                f.name, f.field_type, f.kind(), f.flags, f.options
+                f.name,
+                f.field_type,
+                f.kind(),
+                f.flags,
+                f.options
             );
         }
         let by = |n: &str| fields.iter().find(|f| f.name == n).unwrap();
@@ -4999,7 +5309,10 @@ mod tests {
         let mut doc = Document::open(&fixture("with-forms.pdf")).unwrap();
         // `country` is a non-editable combo, so an off-list value must fail.
         let result = doc.set_choice_field("country", &["Atlantis"]);
-        assert!(result.is_err(), "off-list value on a closed combo must error");
+        assert!(
+            result.is_err(),
+            "off-list value on a closed combo must error"
+        );
     }
 
     #[test]
@@ -5007,7 +5320,8 @@ mod tests {
         let mut doc = Document::open(&fixture("multi-page.pdf")).unwrap();
         doc.add_uri_link(1, [72.0, 700.0, 300.0, 720.0], "https://giga-pdf.com")
             .unwrap();
-        doc.add_goto_link(1, [72.0, 650.0, 300.0, 670.0], 2).unwrap();
+        doc.add_goto_link(1, [72.0, 650.0, 300.0, 670.0], 2)
+            .unwrap();
 
         let reopened = Document::open(&doc.save()).unwrap();
         let links = reopened.page_links(1).unwrap();
@@ -5045,13 +5359,18 @@ mod tests {
         assert_eq!(items[1].level, 1, "nested under Chapter 1");
         assert_eq!(items[3].title, "Chapter 2");
         assert_eq!(items[3].level, 0);
-        assert_eq!(items[3].page, Some(3), "dest page resolved after renumbering");
+        assert_eq!(
+            items[3].page,
+            Some(3),
+            "dest page resolved after renumbering"
+        );
     }
 
     #[test]
     fn clears_the_outline() {
         let mut doc = Document::open(&fixture("multi-page.pdf")).unwrap();
-        doc.set_outline(&[("Only".to_string(), Some(1), 0)]).unwrap();
+        doc.set_outline(&[("Only".to_string(), Some(1), 0)])
+            .unwrap();
         doc.set_outline(&[]).unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
         assert!(reopened.outline_items().is_empty(), "outline cleared");
@@ -5061,10 +5380,17 @@ mod tests {
     fn adds_text_markup_and_ink_and_stamp() {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let red = [1.0, 0.0, 0.0];
-        doc.add_underline(1, [72.0, 700.0, 300.0, 712.0], red).unwrap();
-        doc.add_strike_out(1, [72.0, 680.0, 300.0, 692.0], red).unwrap();
-        doc.add_ink(1, &[vec![(100.0, 100.0), (130.0, 140.0), (160.0, 110.0)]], [0.0, 0.0, 1.0], 2.0)
+        doc.add_underline(1, [72.0, 700.0, 300.0, 712.0], red)
             .unwrap();
+        doc.add_strike_out(1, [72.0, 680.0, 300.0, 692.0], red)
+            .unwrap();
+        doc.add_ink(
+            1,
+            &[vec![(100.0, 100.0), (130.0, 140.0), (160.0, 110.0)]],
+            [0.0, 0.0, 1.0],
+            2.0,
+        )
+        .unwrap();
         doc.add_stamp(1, [400.0, 700.0, 520.0, 740.0], "DRAFT", red)
             .unwrap();
 
@@ -5086,9 +5412,16 @@ mod tests {
     #[test]
     fn flattens_annotations_into_content() {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
-        doc.add_highlight(1, [72.0, 700.0, 300.0, 712.0], [1.0, 1.0, 0.0]).unwrap();
-        doc.add_free_text(1, [72.0, 650.0, 300.0, 680.0], "Note", 12.0, [0.0, 0.0, 0.0])
+        doc.add_highlight(1, [72.0, 700.0, 300.0, 712.0], [1.0, 1.0, 0.0])
             .unwrap();
+        doc.add_free_text(
+            1,
+            [72.0, 650.0, 300.0, 680.0],
+            "Note",
+            12.0,
+            [0.0, 0.0, 0.0],
+        )
+        .unwrap();
 
         let baked = doc.flatten_annotations(1).unwrap();
         assert_eq!(baked, 2, "both annotations baked");
@@ -5105,7 +5438,10 @@ mod tests {
             .into_iter()
             .filter(|e| e.kind == content::ElementKind::Image)
             .count();
-        assert!(images >= 2, "baked appearances drawn as XObjects ({images})");
+        assert!(
+            images >= 2,
+            "baked appearances drawn as XObjects ({images})"
+        );
     }
 
     #[test]
@@ -5113,7 +5449,11 @@ mod tests {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let randomness: Vec<u8> = (0..256).map(|i| (i * 53 + 7) as u8).collect();
         let signer = crate::sign::Signer::generate(
-            "GigaPDF Tester", "260614000000Z", "360614000000Z", 512, &randomness,
+            "GigaPDF Tester",
+            "260614000000Z",
+            "360614000000Z",
+            512,
+            &randomness,
         )
         .unwrap();
 
@@ -5128,7 +5468,10 @@ mod tests {
             "ByteRange placeholders patched"
         );
         let text = String::from_utf8_lossy(&signed);
-        assert!(text.contains("adbe.pkcs7.detached"), "detached signature subfilter");
+        assert!(
+            text.contains("adbe.pkcs7.detached"),
+            "detached signature subfilter"
+        );
         assert!(text.contains("/ByteRange"), "byte range present");
         // The signed file still parses as a structurally valid PDF.
         let reopened = Document::open(&signed).unwrap();
@@ -5186,8 +5529,18 @@ mod tests {
     fn renders_a_page_to_png() {
         // Add a vector rectangle so there is guaranteed ink, then rasterize.
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
-        doc.add_rectangle(1, 50.0, 50.0, 200.0, 100.0, None, Some([1.0, 0.0, 0.0]), 0.0, 1.0)
-            .unwrap();
+        doc.add_rectangle(
+            1,
+            50.0,
+            50.0,
+            200.0,
+            100.0,
+            None,
+            Some([1.0, 0.0, 0.0]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
         let png = doc.render_page(1, 1.0).unwrap();
         assert_eq!(&png[0..4], &[0x89, b'P', b'N', b'G'], "valid PNG header");
         assert!(png.len() > 1000, "non-trivial PNG ({} bytes)", png.len());
@@ -5203,16 +5556,27 @@ mod tests {
         ];
         let png = encode_png(2, 2, &rgba);
         let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("image host")).unwrap();
-        doc.add_image(1, &png, 100.0, 100.0, 50.0, 50.0, 1.0).unwrap();
+        doc.add_image(1, &png, 100.0, 100.0, 50.0, 50.0, 1.0)
+            .unwrap();
 
         // Re-open the serialized PDF and decode the image the way the rasterizer
         // does: the `/SMask` must surface as per-pixel alpha (0 where transparent).
         let reopened = Document::open(&doc.save()).unwrap();
         let imgs = reopened.page_images(1);
         assert_eq!(imgs.len(), 1, "one image XObject decoded");
-        let alphas: Vec<u8> = imgs.values().next().unwrap().rgba.chunks_exact(4).map(|p| p[3]).collect();
-        assert!(alphas.iter().any(|&a| a == 0), "transparent pixel survived: {alphas:?}");
-        assert!(alphas.iter().any(|&a| a == 255), "opaque pixels survived: {alphas:?}");
+        let alphas: Vec<u8> = imgs
+            .values()
+            .next()
+            .unwrap()
+            .rgba
+            .chunks_exact(4)
+            .map(|p| p[3])
+            .collect();
+        assert!(
+            alphas.contains(&0),
+            "transparent pixel survived: {alphas:?}"
+        );
+        assert!(alphas.contains(&255), "opaque pixels survived: {alphas:?}");
     }
 
     #[test]
@@ -5225,10 +5589,19 @@ mod tests {
         doc.add_svg(1, svg, 100.0, 100.0, 200.0, 200.0).unwrap();
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
         // Filled rectangle: fill colour set + `f` paint.
-        assert!(content.contains(" rg\n") && content.contains("\nf\n"), "filled rect ops: {content}");
+        assert!(
+            content.contains(" rg\n") && content.contains("\nf\n"),
+            "filled rect ops: {content}"
+        );
         // Stroked circle: stroke colour + width + `S` paint, with cubic arcs.
-        assert!(content.contains(" RG\n") && content.contains("\nS\n"), "stroked circle ops present");
-        assert!(content.contains(" c\n"), "circle emitted as cubic Bézier arcs");
+        assert!(
+            content.contains(" RG\n") && content.contains("\nS\n"),
+            "stroked circle ops present"
+        );
+        assert!(
+            content.contains(" c\n"),
+            "circle emitted as cubic Bézier arcs"
+        );
     }
 
     #[test]
@@ -5236,10 +5609,14 @@ mod tests {
         let svg = r##"<svg viewBox="0 0 100 100"><defs>
             <linearGradient id="g"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient>
             </defs><rect x="0" y="0" width="100" height="100" fill="url(#g)"/></svg>"##;
-        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("svg grad host")).unwrap();
+        let mut doc =
+            Document::open(&crate::convert::reverse::txt_to_pdf("svg grad host")).unwrap();
         doc.add_svg(1, svg, 0.0, 0.0, 200.0, 200.0).unwrap();
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
-        assert!(content.contains("/Pattern cs") && content.contains(" scn"), "shading-pattern fill: {content}");
+        assert!(
+            content.contains("/Pattern cs") && content.contains(" scn"),
+            "shading-pattern fill: {content}"
+        );
         // Round-trip: the Function/Shading objects serialize into a valid PDF.
         let reopened = Document::open(&doc.save()).unwrap();
         assert_eq!(reopened.page_count(), 1, "gradient PDF re-opens");
@@ -5253,8 +5630,12 @@ mod tests {
         let src = Document::open(&fixture("embedded-fonts.pdf")).unwrap();
         let page = src.page_dict(1).unwrap();
         let fonts = page
-            .get(b"Resources").map(|o| src.resolve(o)).and_then(Object::as_dict)
-            .and_then(|r| r.get(b"Font")).map(|o| src.resolve(o)).and_then(Object::as_dict)
+            .get(b"Resources")
+            .map(|o| src.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|r| r.get(b"Font"))
+            .map(|o| src.resolve(o))
+            .and_then(Object::as_dict)
             .expect("page has a Font dict");
         let face: TrueTypeFont = fonts
             .0
@@ -5297,16 +5678,15 @@ mod tests {
         let png = doc.render_page(1, 2.0).unwrap();
         // Decode the (stored) zlib IDAT and count non-white pixels.
         let idat = png.windows(4).position(|w| w == b"IDAT").unwrap();
-        let len = u32::from_be_bytes([
-            png[idat - 4],
-            png[idat - 3],
-            png[idat - 2],
-            png[idat - 1],
-        ]) as usize;
+        let len = u32::from_be_bytes([png[idat - 4], png[idat - 3], png[idat - 2], png[idat - 1]])
+            as usize;
         let zlib = &png[idat + 4..idat + 4 + len];
         let raw = crate::filters::inflate::inflate(&zlib[2..zlib.len() - 4]).unwrap();
         let dark = raw.iter().filter(|&&b| b < 200).count();
-        assert!(dark > 500, "embedded-font glyphs painted ink ({dark} dark samples)");
+        assert!(
+            dark > 500,
+            "embedded-font glyphs painted ink ({dark} dark samples)"
+        );
     }
 
     #[test]
@@ -5319,7 +5699,10 @@ mod tests {
             let text: String = runs.iter().map(|r| r.text.as_str()).collect();
             assert!(!text.is_empty(), "{fixture_name}: extracted some text");
             let tofu = text.chars().filter(|&c| c == '\u{FFFD}').count();
-            assert_eq!(tofu, 0, "{fixture_name}: no replacement chars, got {text:?}");
+            assert_eq!(
+                tofu, 0,
+                "{fixture_name}: no replacement chars, got {text:?}"
+            );
         }
     }
 
@@ -5327,13 +5710,32 @@ mod tests {
     fn creates_all_acroform_field_types_round_trip() {
         let pdf = crate::convert::reverse::txt_to_pdf("form host page");
         let mut doc = Document::open(&pdf).unwrap();
-        assert!(doc.form_fields().unwrap().is_empty(), "starts with no fields");
+        assert!(
+            doc.form_fields().unwrap().is_empty(),
+            "starts with no fields"
+        );
         let style = form::FieldStyle::default();
 
-        doc.add_text_field(1, "fullname", [50.0, 700.0, 300.0, 720.0], "Jane", Some(40), false, false, &style)
-            .unwrap();
-        doc.add_checkbox(1, "subscribe", [50.0, 670.0, 64.0, 684.0], true, "Yes", &style)
-            .unwrap();
+        doc.add_text_field(
+            1,
+            "fullname",
+            [50.0, 700.0, 300.0, 720.0],
+            "Jane",
+            Some(40),
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+        doc.add_checkbox(
+            1,
+            "subscribe",
+            [50.0, 670.0, 64.0, 684.0],
+            true,
+            "Yes",
+            &style,
+        )
+        .unwrap();
         doc.add_radio_group(
             1,
             "plan",
@@ -5345,10 +5747,26 @@ mod tests {
             &style,
         )
         .unwrap();
-        doc.add_combo_box(1, "country", [50.0, 610.0, 200.0, 626.0], &["FR".into(), "US".into()], Some("FR"), false, &style)
-            .unwrap();
-        doc.add_list_box(1, "langs", [50.0, 560.0, 200.0, 600.0], &["en".into(), "fr".into()], None, true, &style)
-            .unwrap();
+        doc.add_combo_box(
+            1,
+            "country",
+            [50.0, 610.0, 200.0, 626.0],
+            &["FR".into(), "US".into()],
+            Some("FR"),
+            false,
+            &style,
+        )
+        .unwrap();
+        doc.add_list_box(
+            1,
+            "langs",
+            [50.0, 560.0, 200.0, 600.0],
+            &["en".into(), "fr".into()],
+            None,
+            true,
+            &style,
+        )
+        .unwrap();
 
         // Re-parse the serialized bytes and read the fields back.
         let reopened = Document::open(&doc.save()).unwrap();
@@ -5369,7 +5787,10 @@ mod tests {
         let radio = by("plan");
         assert_eq!(radio.kind(), crate::form::FieldKind::Radio);
         assert_eq!(radio.value, "Pro");
-        assert!(radio.options.contains(&"Basic".to_string()) && radio.options.contains(&"Pro".to_string()));
+        assert!(
+            radio.options.contains(&"Basic".to_string())
+                && radio.options.contains(&"Pro".to_string())
+        );
 
         let combo = by("country");
         assert_eq!(combo.kind(), crate::form::FieldKind::ComboBox);
@@ -5384,7 +5805,13 @@ mod tests {
         // Every widget got a visible appearance stream (no reliance on the
         // viewer regenerating from /V alone).
         let saved = doc.save();
-        assert!(saved.windows(7).any(|w| w == b"/Tx BMC"), "text appearance present");
-        assert!(saved.windows(16).any(|w| w == b"/NeedAppearances"), "NeedAppearances set");
+        assert!(
+            saved.windows(7).any(|w| w == b"/Tx BMC"),
+            "text appearance present"
+        );
+        assert!(
+            saved.windows(16).any(|w| w == b"/NeedAppearances"),
+            "NeedAppearances set"
+        );
     }
 }

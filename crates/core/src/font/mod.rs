@@ -115,8 +115,7 @@ pub fn decode_pdf_text(bytes: &[u8]) -> String {
                 let low = ((bytes[i] as u16) << 8) | bytes[i + 1] as u16;
                 if (0xDC00..=0xDFFF).contains(&low) {
                     i += 2;
-                    let scalar =
-                        0x10000 + (((unit - 0xD800) as u32) << 10) + (low - 0xDC00) as u32;
+                    let scalar = 0x10000 + (((unit - 0xD800) as u32) << 10) + (low - 0xDC00) as u32;
                     if let Some(c) = char::from_u32(scalar) {
                         out.push(c);
                     }

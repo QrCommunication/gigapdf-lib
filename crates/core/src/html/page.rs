@@ -24,7 +24,10 @@ pub fn page_size(name: &str) -> Option<(f64, f64)> {
         .or_else(|| raw.strip_suffix("-l"))
     {
         (b.trim().to_string(), true)
-    } else if let Some(b) = raw.strip_prefix("landscape ").or_else(|| raw.strip_prefix("landscape-")) {
+    } else if let Some(b) = raw
+        .strip_prefix("landscape ")
+        .or_else(|| raw.strip_prefix("landscape-"))
+    {
         (b.trim().to_string(), true)
     } else {
         (raw.clone(), false)
@@ -66,12 +69,22 @@ pub struct Margins {
 impl Margins {
     /// The same margin on every side.
     pub fn uniform(m: f64) -> Self {
-        Self { top: m, right: m, bottom: m, left: m }
+        Self {
+            top: m,
+            right: m,
+            bottom: m,
+            left: m,
+        }
     }
 
     /// Vertical (`top`/`bottom`) and horizontal (`left`/`right`) margins.
     pub fn symmetric(vertical: f64, horizontal: f64) -> Self {
-        Self { top: vertical, right: horizontal, bottom: vertical, left: horizontal }
+        Self {
+            top: vertical,
+            right: horizontal,
+            bottom: vertical,
+            left: horizontal,
+        }
     }
 }
 
@@ -148,7 +161,10 @@ mod tests {
     #[test]
     fn a_series_sizes_and_landscape() {
         let (w, h) = page_size("A4").unwrap();
-        assert!((w - 595.276).abs() < 0.1 && (h - 841.890).abs() < 0.1, "A4 {w}x{h}");
+        assert!(
+            (w - 595.276).abs() < 0.1 && (h - 841.890).abs() < 0.1,
+            "A4 {w}x{h}"
+        );
         let (w3, h3) = page_size("a3").unwrap();
         assert!(h3 > h && w3 > w, "A3 is bigger than A4");
         let (lw, lh) = page_size("A4-landscape").unwrap();
@@ -160,7 +176,10 @@ mod tests {
 
     #[test]
     fn token_substitution() {
-        assert_eq!(substitute_tokens("Page {{page}} / {{pages}}", 2, 7), "Page 2 / 7");
+        assert_eq!(
+            substitute_tokens("Page {{page}} / {{pages}}", 2, 7),
+            "Page 2 / 7"
+        );
         assert_eq!(substitute_tokens("{{ page }}", 3, 9), "3");
         assert_eq!(substitute_tokens("no tokens", 1, 1), "no tokens");
     }

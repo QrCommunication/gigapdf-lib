@@ -177,7 +177,10 @@ impl BigUint {
 
     fn test_bit(&self, bit: usize) -> bool {
         let limb = bit / 32;
-        self.limbs.get(limb).map(|l| l >> (bit % 32) & 1 == 1).unwrap_or(false)
+        self.limbs
+            .get(limb)
+            .map(|l| l >> (bit % 32) & 1 == 1)
+            .unwrap_or(false)
     }
 
     /// Long division: returns `(quotient, remainder)`.
@@ -310,23 +313,41 @@ struct Signed {
 
 impl Signed {
     fn zero() -> Signed {
-        Signed { mag: BigUint::zero(), neg: false }
+        Signed {
+            mag: BigUint::zero(),
+            neg: false,
+        }
     }
     fn one() -> Signed {
-        Signed { mag: BigUint::from_u32(1), neg: false }
+        Signed {
+            mag: BigUint::from_u32(1),
+            neg: false,
+        }
     }
     fn mul_uint(&self, v: &BigUint) -> Signed {
-        Signed { mag: self.mag.mul(v), neg: self.neg && !self.mag.is_zero() }
+        Signed {
+            mag: self.mag.mul(v),
+            neg: self.neg && !self.mag.is_zero(),
+        }
     }
     fn sub(&self, other: &Signed) -> Signed {
         // self - other
         if self.neg == other.neg {
             match self.mag.cmp_ref(&other.mag) {
-                Ordering::Less => Signed { mag: other.mag.sub(&self.mag), neg: !self.neg },
-                _ => Signed { mag: self.mag.sub(&other.mag), neg: self.neg },
+                Ordering::Less => Signed {
+                    mag: other.mag.sub(&self.mag),
+                    neg: !self.neg,
+                },
+                _ => Signed {
+                    mag: self.mag.sub(&other.mag),
+                    neg: self.neg,
+                },
             }
         } else {
-            Signed { mag: self.mag.add(&other.mag), neg: self.neg }
+            Signed {
+                mag: self.mag.add(&other.mag),
+                neg: self.neg,
+            }
         }
     }
     fn reduce(&self, m: &BigUint) -> BigUint {
@@ -503,7 +524,9 @@ mod tests {
     #[test]
     fn mod_inverse_small() {
         // 3^-1 mod 11 = 4 (3*4 = 12 ≡ 1).
-        let inv = BigUint::from_u32(3).mod_inverse(&BigUint::from_u32(11)).unwrap();
+        let inv = BigUint::from_u32(3)
+            .mod_inverse(&BigUint::from_u32(11))
+            .unwrap();
         assert_eq!(inv, BigUint::from_u32(4));
     }
 
@@ -515,7 +538,10 @@ mod tests {
         assert!(is_probable_prime(&p, &[2, 3, 5, 7, 11, 13]), "known prime");
         // 2³²+9 ends in 5 → divisible by 5 → composite.
         let c = BigUint::from_bytes_be(&[0x01, 0x00, 0x00, 0x00, 0x09]);
-        assert!(!is_probable_prime(&c, &[2, 3, 5, 7, 11, 13]), "known composite");
+        assert!(
+            !is_probable_prime(&c, &[2, 3, 5, 7, 11, 13]),
+            "known composite"
+        );
     }
 
     #[test]

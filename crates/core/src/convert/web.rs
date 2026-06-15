@@ -134,6 +134,9 @@ mod tests {
         assert!(html.contains("font-weight:bold"));
         assert!(html.contains("color:#FF0000"));
         assert!(html.contains("font-family:'Helvetica',sans-serif"));
-        assert!(html.contains("data:image/png;base64,iVBORw=="), "image inlined as data URI");
+        assert!(
+            html.contains("data:image/png;base64,iVBORw=="),
+            "image inlined as data URI"
+        );
     }
 }

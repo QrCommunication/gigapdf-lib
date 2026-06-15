@@ -160,11 +160,11 @@ pub extern "C" fn gp_sign(
             std::slice::from_raw_parts(rand_ptr, rand_len)
         }
     };
-    let signer = match gigapdf_core::sign::Signer::generate(parts[0], parts[3], parts[4], bits, rand)
-    {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
+    let signer =
+        match gigapdf_core::sign::Signer::generate(parts[0], parts[3], parts[4], bits, rand) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
     match doc.sign(&signer, parts[0], parts[1], parts[2]) {
         Ok(pdf) => unsafe { bytes_into_host(pdf, out_len) },
         Err(_) => std::ptr::null_mut(),
@@ -703,10 +703,27 @@ pub extern "C" fn gp_add_text_field(
 ) -> i32 {
     let name = unsafe { str_arg(name_ptr, name_len) };
     let value = unsafe { str_arg(value_ptr, value_len) };
-    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    let style = make_field_style(
+        font_size,
+        color_rgb,
+        border_rgb,
+        has_border,
+        bg_rgb,
+        has_bg,
+        border_width,
+    );
     let ml = (max_len >= 0).then_some(max_len as u32);
     edit(handle, |doc| {
-        doc.add_text_field(page, name, [x0, y0, x1, y1], value, ml, multiline != 0, password != 0, &style)
+        doc.add_text_field(
+            page,
+            name,
+            [x0, y0, x1, y1],
+            value,
+            ml,
+            multiline != 0,
+            password != 0,
+            &style,
+        )
     })
 }
 
@@ -736,7 +753,15 @@ pub extern "C" fn gp_add_checkbox(
 ) -> i32 {
     let name = unsafe { str_arg(name_ptr, name_len) };
     let export = unsafe { str_arg(export_ptr, export_len) };
-    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    let style = make_field_style(
+        font_size,
+        color_rgb,
+        border_rgb,
+        has_border,
+        bg_rgb,
+        has_bg,
+        border_width,
+    );
     edit(handle, |doc| {
         doc.add_checkbox(page, name, [x0, y0, x1, y1], checked != 0, export, &style)
     })
@@ -771,17 +796,33 @@ pub extern "C" fn gp_add_radio_group(
     let exports = unsafe { str_arg(exports_ptr, exports_len) };
     let rects = unsafe { str_arg(rects_ptr, rects_len) };
     let selected = unsafe { str_arg(selected_ptr, selected_len) };
-    let nums: Vec<f64> = rects.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let nums: Vec<f64> = rects
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
     let mut options: Vec<(String, [f64; 4])> = Vec::new();
     for (i, ex) in exports.split('\n').filter(|s| !s.is_empty()).enumerate() {
         let b = i * 4;
         if b + 4 <= nums.len() {
-            options.push((ex.to_string(), [nums[b], nums[b + 1], nums[b + 2], nums[b + 3]]));
+            options.push((
+                ex.to_string(),
+                [nums[b], nums[b + 1], nums[b + 2], nums[b + 3]],
+            ));
         }
     }
     let sel = (!selected.is_empty()).then_some(selected);
-    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
-    edit(handle, |doc| doc.add_radio_group(page, name, &options, sel, &style))
+    let style = make_field_style(
+        font_size,
+        color_rgb,
+        border_rgb,
+        has_border,
+        bg_rgb,
+        has_bg,
+        border_width,
+    );
+    edit(handle, |doc| {
+        doc.add_radio_group(page, name, &options, sel, &style)
+    })
 }
 
 /// Create a drop-down combo box. `options` is newline-separated; `selected`
@@ -820,9 +861,25 @@ pub extern "C" fn gp_add_combo_box(
         opts.split('\n').map(str::to_string).collect()
     };
     let sel = (!selected.is_empty()).then_some(selected);
-    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    let style = make_field_style(
+        font_size,
+        color_rgb,
+        border_rgb,
+        has_border,
+        bg_rgb,
+        has_bg,
+        border_width,
+    );
     edit(handle, |doc| {
-        doc.add_combo_box(page, name, [x0, y0, x1, y1], &options, sel, editable != 0, &style)
+        doc.add_combo_box(
+            page,
+            name,
+            [x0, y0, x1, y1],
+            &options,
+            sel,
+            editable != 0,
+            &style,
+        )
     })
 }
 
@@ -862,9 +919,25 @@ pub extern "C" fn gp_add_list_box(
         opts.split('\n').map(str::to_string).collect()
     };
     let sel = (!selected.is_empty()).then_some(selected);
-    let style = make_field_style(font_size, color_rgb, border_rgb, has_border, bg_rgb, has_bg, border_width);
+    let style = make_field_style(
+        font_size,
+        color_rgb,
+        border_rgb,
+        has_border,
+        bg_rgb,
+        has_bg,
+        border_width,
+    );
     edit(handle, |doc| {
-        doc.add_list_box(page, name, [x0, y0, x1, y1], &options, sel, multi != 0, &style)
+        doc.add_list_box(
+            page,
+            name,
+            [x0, y0, x1, y1],
+            &options,
+            sel,
+            multi != 0,
+            &style,
+        )
     })
 }
 
@@ -1089,14 +1162,22 @@ pub extern "C" fn gp_to_pdfa(handle: *const Document, out_len: *mut usize) -> *m
 
 /// Plain text → PDF. Buffer-returning.
 #[no_mangle]
-pub extern "C" fn gp_txt_to_pdf(text_ptr: *const u8, text_len: usize, out_len: *mut usize) -> *mut u8 {
+pub extern "C" fn gp_txt_to_pdf(
+    text_ptr: *const u8,
+    text_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
     let text = unsafe { str_arg(text_ptr, text_len) };
     unsafe { bytes_into_host(gigapdf_core::convert::reverse::txt_to_pdf(text), out_len) }
 }
 
 /// HTML → PDF (text-faithful, fast path). Buffer-returning.
 #[no_mangle]
-pub extern "C" fn gp_html_to_pdf(html_ptr: *const u8, html_len: usize, out_len: *mut usize) -> *mut u8 {
+pub extern "C" fn gp_html_to_pdf(
+    html_ptr: *const u8,
+    html_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
     let html = unsafe { str_arg(html_ptr, html_len) };
     unsafe { bytes_into_host(gigapdf_core::convert::reverse::html_to_pdf(html), out_len) }
 }
@@ -1125,7 +1206,11 @@ pub extern "C" fn gp_js_eval(ptr: *const u8, len: usize, out_len: *mut usize) ->
 /// Run a document's inline `<script>`s and return the resulting HTML (the
 /// renderer does this automatically; exposed for standalone use). Buffer-returning.
 #[no_mangle]
-pub extern "C" fn gp_run_inline_scripts(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+pub extern "C" fn gp_run_inline_scripts(
+    ptr: *const u8,
+    len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
     let html = unsafe { str_arg(ptr, len) };
     let out = gigapdf_core::js::run_inline_scripts(html);
     unsafe { bytes_into_host(out.into_bytes(), out_len) }
@@ -1141,7 +1226,10 @@ fn font_reqs_json(reqs: &[gigapdf_core::html::FontRequest]) -> Vec<u8> {
         }
         json.push_str("{\"family\":");
         json_escape(&r.family, &mut json);
-        json.push_str(&format!(",\"weight\":{},\"italic\":{},\"url\":", r.weight, r.italic));
+        json.push_str(&format!(
+            ",\"weight\":{},\"italic\":{},\"url\":",
+            r.weight, r.italic
+        ));
         json_escape(&r.url, &mut json);
         json.push('}');
     }
@@ -1329,14 +1417,22 @@ fn parse_font_blob(b: &[u8]) -> Vec<gigapdf_core::html::ProvidedFont> {
 
 /// RTF → PDF. Buffer-returning.
 #[no_mangle]
-pub extern "C" fn gp_rtf_to_pdf(rtf_ptr: *const u8, rtf_len: usize, out_len: *mut usize) -> *mut u8 {
+pub extern "C" fn gp_rtf_to_pdf(
+    rtf_ptr: *const u8,
+    rtf_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
     let rtf = unsafe { str_arg(rtf_ptr, rtf_len) };
     unsafe { bytes_into_host(gigapdf_core::convert::reverse::rtf_to_pdf(rtf), out_len) }
 }
 
 /// Office (DOCX/ODT/PPTX/XLSX/ODS) → PDF, auto-detected. Null if unrecognized.
 #[no_mangle]
-pub extern "C" fn gp_office_to_pdf(bytes_ptr: *const u8, bytes_len: usize, out_len: *mut usize) -> *mut u8 {
+pub extern "C" fn gp_office_to_pdf(
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
     if bytes_ptr.is_null() {
         return std::ptr::null_mut();
     }
@@ -1798,7 +1894,10 @@ pub extern "C" fn gp_set_outline(
             continue;
         }
         let mut parts = line.splitn(3, '\t');
-        let level = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        let level = parts
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
         let page = parts.next().and_then(|s| s.parse::<u32>().ok());
         let page = page.filter(|p| *p > 0);
         let title = parts.next().unwrap_or("").to_string();
@@ -1823,11 +1922,7 @@ pub extern "C" fn gp_layers_json(handle: *const Document, out_len: *mut usize) -
 /// Create a new optional-content layer (visible, unlocked). Returns the layer's
 /// object number (pass to the visibility/lock/remove calls), or 0 on error.
 #[no_mangle]
-pub extern "C" fn gp_add_layer(
-    handle: *mut Document,
-    name_ptr: *const u8,
-    name_len: usize,
-) -> u32 {
+pub extern "C" fn gp_add_layer(handle: *mut Document, name_ptr: *const u8, name_len: usize) -> u32 {
     let Some(doc) = (unsafe { handle.as_mut() }) else {
         return 0;
     };
@@ -1837,8 +1932,14 @@ pub extern "C" fn gp_add_layer(
 
 /// Show (`visible != 0`) or hide a layer by id. 0 on success.
 #[no_mangle]
-pub extern "C" fn gp_set_layer_visibility(handle: *mut Document, layer_id: u32, visible: i32) -> i32 {
-    edit(handle, |doc| doc.set_layer_visibility(layer_id, visible != 0))
+pub extern "C" fn gp_set_layer_visibility(
+    handle: *mut Document,
+    layer_id: u32,
+    visible: i32,
+) -> i32 {
+    edit(handle, |doc| {
+        doc.set_layer_visibility(layer_id, visible != 0)
+    })
 }
 
 /// Lock (`locked != 0`) or unlock a layer by id. 0 on success.
@@ -1896,7 +1997,10 @@ fn text_lines_json(lines: &[TextLine]) -> String {
         out.push_str("{\"text\":");
         json_escape(&line.text, &mut out);
         let b = line.bounds;
-        out.push_str(&format!(",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}", b.x, b.y, b.width, b.height));
+        out.push_str(&format!(
+            ",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            b.x, b.y, b.width, b.height
+        ));
     }
     out.push(']');
     out
@@ -1928,7 +2032,10 @@ fn search_json(matches: &[SearchMatch]) -> String {
         out.push_str(&format!("{{\"page\":{},\"text\":", m.page));
         json_escape(&m.text, &mut out);
         let b = m.bounds;
-        out.push_str(&format!(",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}", b.x, b.y, b.width, b.height));
+        out.push_str(&format!(
+            ",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+            b.x, b.y, b.width, b.height
+        ));
     }
     out.push(']');
     out

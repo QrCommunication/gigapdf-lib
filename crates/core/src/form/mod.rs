@@ -157,8 +157,7 @@ impl FormField {
     /// Whether the value can be set programmatically (everything but
     /// push-buttons and signatures).
     pub fn is_fillable(&self) -> bool {
-        !matches!(self.kind(), FieldKind::PushButton | FieldKind::Signature)
-            && !self.is_read_only()
+        !matches!(self.kind(), FieldKind::PushButton | FieldKind::Signature) && !self.is_read_only()
     }
 }
 
@@ -236,7 +235,13 @@ fn escape_stream_literal(s: &str) -> String {
 /// variable text. `/Helv` resolves through the AcroForm `/DR`.
 pub(crate) fn da_string(style: &FieldStyle) -> Object {
     let [r, g, b] = style.color;
-    let da = format!("/Helv {} Tf {} {} {} rg", n(style.font_size), n(r), n(g), n(b));
+    let da = format!(
+        "/Helv {} Tf {} {} {} rg",
+        n(style.font_size),
+        n(r),
+        n(g),
+        n(b)
+    );
     Object::String(da.into_bytes(), StringKind::Literal)
 }
 
@@ -262,7 +267,14 @@ pub(crate) fn mk_dict(style: &FieldStyle) -> Option<Dictionary> {
 fn box_decoration(style: &FieldStyle, w: f64, h: f64) -> String {
     let mut s = String::new();
     if let Some([r, g, b]) = style.background {
-        s.push_str(&format!("{} {} {} rg\n0 0 {} {} re\nf\n", n(r), n(g), n(b), n(w), n(h)));
+        s.push_str(&format!(
+            "{} {} {} rg\n0 0 {} {} re\nf\n",
+            n(r),
+            n(g),
+            n(b),
+            n(w),
+            n(h)
+        ));
     }
     if let Some([r, g, b]) = style.border {
         if style.border_width > 0.0 {
@@ -270,7 +282,14 @@ fn box_decoration(style: &FieldStyle, w: f64, h: f64) -> String {
             let i = bw / 2.0;
             s.push_str(&format!(
                 "{} {} {} RG\n{} w\n{} {} {} {} re\nS\n",
-                n(r), n(g), n(b), n(bw), n(i), n(i), n(w - bw), n(h - bw)
+                n(r),
+                n(g),
+                n(b),
+                n(bw),
+                n(i),
+                n(i),
+                n(w - bw),
+                n(h - bw)
             ));
         }
     }
@@ -309,7 +328,13 @@ pub(crate) fn check_appearance(style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
     let [r, g, b] = style.color;
     let lw = (w.min(h) * 0.1).max(0.6);
     let mut s = box_decoration(style, w, h);
-    s.push_str(&format!("{} {} {} RG\n{} w\n1 J 1 j\n", n(r), n(g), n(b), n(lw)));
+    s.push_str(&format!(
+        "{} {} {} RG\n{} w\n1 J 1 j\n",
+        n(r),
+        n(g),
+        n(b),
+        n(lw)
+    ));
     s.push_str(&format!("{} {} m\n", n(w * 0.22), n(h * 0.50)));
     s.push_str(&format!("{} {} l\n", n(w * 0.42), n(h * 0.28)));
     s.push_str(&format!("{} {} l\nS\n", n(w * 0.80), n(h * 0.75)));
@@ -326,10 +351,42 @@ pub(crate) fn radio_appearance(style: &FieldStyle, w: f64, h: f64) -> Vec<u8> {
     let mut s = box_decoration(style, w, h);
     s.push_str(&format!("{} {} {} rg\n", n(r), n(g), n(b)));
     s.push_str(&format!("{} {} m\n", n(cx + rad), n(cy)));
-    s.push_str(&format!("{} {} {} {} {} {} c\n", n(cx + rad), n(cy + k), n(cx + k), n(cy + rad), n(cx), n(cy + rad)));
-    s.push_str(&format!("{} {} {} {} {} {} c\n", n(cx - k), n(cy + rad), n(cx - rad), n(cy + k), n(cx - rad), n(cy)));
-    s.push_str(&format!("{} {} {} {} {} {} c\n", n(cx - rad), n(cy - k), n(cx - k), n(cy - rad), n(cx), n(cy - rad)));
-    s.push_str(&format!("{} {} {} {} {} {} c\nf\n", n(cx + k), n(cy - rad), n(cx + rad), n(cy - k), n(cx + rad), n(cy)));
+    s.push_str(&format!(
+        "{} {} {} {} {} {} c\n",
+        n(cx + rad),
+        n(cy + k),
+        n(cx + k),
+        n(cy + rad),
+        n(cx),
+        n(cy + rad)
+    ));
+    s.push_str(&format!(
+        "{} {} {} {} {} {} c\n",
+        n(cx - k),
+        n(cy + rad),
+        n(cx - rad),
+        n(cy + k),
+        n(cx - rad),
+        n(cy)
+    ));
+    s.push_str(&format!(
+        "{} {} {} {} {} {} c\n",
+        n(cx - rad),
+        n(cy - k),
+        n(cx - k),
+        n(cy - rad),
+        n(cx),
+        n(cy - rad)
+    ));
+    s.push_str(&format!(
+        "{} {} {} {} {} {} c\nf\n",
+        n(cx + k),
+        n(cy - rad),
+        n(cx + rad),
+        n(cy - k),
+        n(cx + rad),
+        n(cy)
+    ));
     s.into_bytes()
 }
 

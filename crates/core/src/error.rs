@@ -28,7 +28,10 @@ pub enum EngineError {
 impl EngineError {
     /// Convenience constructor for a parse error.
     pub fn parse(offset: usize, message: impl Into<String>) -> Self {
-        EngineError::Parse { offset, message: message.into() }
+        EngineError::Parse {
+            offset,
+            message: message.into(),
+        }
     }
 }
 

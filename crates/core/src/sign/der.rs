@@ -34,7 +34,10 @@ pub fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 /// INTEGER from big-endian magnitude bytes (a leading `0x00` is added when the
 /// high bit is set, keeping the value positive; zero encodes as a single `00`).
 pub fn integer(magnitude: &[u8]) -> Vec<u8> {
-    let first = magnitude.iter().position(|&b| b != 0).unwrap_or(magnitude.len());
+    let first = magnitude
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(magnitude.len());
     let trimmed = &magnitude[first..];
     let mut body = Vec::new();
     if trimmed.is_empty() {

@@ -83,9 +83,12 @@ impl ZipWriter {
         self.out.extend_from_slice(&DOS_TIME.to_le_bytes());
         self.out.extend_from_slice(&DOS_DATE.to_le_bytes());
         self.out.extend_from_slice(&crc.to_le_bytes());
-        self.out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        self.out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        self.out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        self.out
+            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        self.out
+            .extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        self.out
+            .extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         self.out.extend_from_slice(&0u16.to_le_bytes()); // extra len
         self.out.extend_from_slice(name_bytes);
         self.out.extend_from_slice(&payload);
@@ -116,7 +119,8 @@ impl ZipWriter {
             self.out.extend_from_slice(&entry.crc.to_le_bytes());
             self.out.extend_from_slice(&entry.comp_size.to_le_bytes());
             self.out.extend_from_slice(&entry.uncomp_size.to_le_bytes());
-            self.out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            self.out
+                .extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
             self.out.extend_from_slice(&0u16.to_le_bytes()); // extra len
             self.out.extend_from_slice(&0u16.to_le_bytes()); // comment len
             self.out.extend_from_slice(&0u16.to_le_bytes()); // disk number start

@@ -57,14 +57,24 @@ fn blit_image(canvas: &mut Canvas, image: &RenderImage, ctm: &Matrix, base: &Mat
     }
 
     let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].map(|(u, v)| m.apply(u, v));
-    let min_x = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min).floor().max(0.0) as i32;
+    let min_x = corners
+        .iter()
+        .map(|p| p.0)
+        .fold(f64::INFINITY, f64::min)
+        .floor()
+        .max(0.0) as i32;
     let max_x = corners
         .iter()
         .map(|p| p.0)
         .fold(f64::NEG_INFINITY, f64::max)
         .ceil()
         .min(canvas.width as f64) as i32;
-    let min_y = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as i32;
+    let min_y = corners
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::INFINITY, f64::min)
+        .floor()
+        .max(0.0) as i32;
     let max_y = corners
         .iter()
         .map(|p| p.1)
@@ -371,8 +381,17 @@ pub fn render_content(
                 }
                 if let (Some(f), Some(Object::String(bytes, _))) = (font, op.operands.last()) {
                     show_text(
-                        &mut canvas, f, font_size, &mut tm, &state.ctm, &base, state.fill,
-                        char_spacing, word_spacing, h_scale, bytes,
+                        &mut canvas,
+                        f,
+                        font_size,
+                        &mut tm,
+                        &state.ctm,
+                        &base,
+                        state.fill,
+                        char_spacing,
+                        word_spacing,
+                        h_scale,
+                        bytes,
                     );
                 }
             }
@@ -381,8 +400,17 @@ pub fn render_content(
                     for item in items {
                         if let Object::String(bytes, _) = item {
                             show_text(
-                                &mut canvas, f, font_size, &mut tm, &state.ctm, &base, state.fill,
-                                char_spacing, word_spacing, h_scale, bytes,
+                                &mut canvas,
+                                f,
+                                font_size,
+                                &mut tm,
+                                &state.ctm,
+                                &base,
+                                state.fill,
+                                char_spacing,
+                                word_spacing,
+                                h_scale,
+                                bytes,
                             );
                         } else if let Some(adj) = item.as_f64() {
                             let dx = -adj / 1000.0 * font_size * h_scale;
@@ -485,19 +513,11 @@ type Cubic = (Option<Pt>, Option<Pt>, Option<Pt>);
 
 fn bezier_control_points(operator: &[u8], n: &[f64], cur: Pt) -> Cubic {
     match operator {
-        b"c" if n.len() == 6 => (
-            Some((n[0], n[1])),
-            Some((n[2], n[3])),
-            Some((n[4], n[5])),
-        ),
+        b"c" if n.len() == 6 => (Some((n[0], n[1])), Some((n[2], n[3])), Some((n[4], n[5]))),
         // v: first control point = current point.
         b"v" if n.len() == 4 => (Some(cur), Some((n[0], n[1])), Some((n[2], n[3]))),
         // y: second control point = end point.
-        b"y" if n.len() == 4 => (
-            Some((n[0], n[1])),
-            Some((n[2], n[3])),
-            Some((n[2], n[3])),
-        ),
+        b"y" if n.len() == 4 => (Some((n[0], n[1])), Some((n[2], n[3])), Some((n[2], n[3]))),
         _ => (None, None, None),
     }
 }
@@ -514,9 +534,20 @@ mod tests {
     #[test]
     fn fills_a_red_rectangle_from_content() {
         // User-space rect (50,50)-(150,130) → device rows 70..150, cols 50..150.
-        let canvas = render_content(b"1 0 0 rg 50 50 100 80 re f", 200, 200, base(), &RenderFonts::new(), &RenderImages::new());
+        let canvas = render_content(
+            b"1 0 0 rg 50 50 100 80 re f",
+            200,
+            200,
+            base(),
+            &RenderFonts::new(),
+            &RenderImages::new(),
+        );
         let idx = (110 * 200 + 100) * 4;
-        assert_eq!(&canvas.pixels[idx..idx + 3], &[255, 0, 0], "interior is red");
+        assert_eq!(
+            &canvas.pixels[idx..idx + 3],
+            &[255, 0, 0],
+            "interior is red"
+        );
         assert_eq!(&canvas.pixels[0..3], &[255, 255, 255], "corner stays white");
     }
 
@@ -536,9 +567,11 @@ mod tests {
         // Scale the unit square to a 100×100 box at the origin, then draw it.
         let canvas = render_content(
             b"100 0 0 100 0 0 cm /Im0 Do",
-            100, 100,
+            100,
+            100,
             Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 100.0),
-            &RenderFonts::new(), &images,
+            &RenderFonts::new(),
+            &images,
         );
         let at = |x: usize, y: usize| {
             let i = (y * 100 + x) * 4;
@@ -554,7 +587,11 @@ mod tests {
         // Pure cyan via k, then a mid-gray box.
         let canvas = render_content(
             b"1 0 0 0 k 10 10 40 40 re f 0.5 g 100 100 40 40 re f",
-            200, 200, base(), &RenderFonts::new(), &RenderImages::new(),
+            200,
+            200,
+            base(),
+            &RenderFonts::new(),
+            &RenderImages::new(),
         );
         let cyan = ((200 - 30) * 200 + 30) * 4; // inside first box
         assert_eq!(&canvas.pixels[cyan..cyan + 3], &[0, 255, 255]);

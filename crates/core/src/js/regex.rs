@@ -36,14 +36,25 @@ enum Node {
     Empty,
     Char(char),
     AnyChar,
-    Class { negated: bool, items: Vec<ClassItem> },
+    Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
     Start,
     End,
     WordBoundary(bool), // true = \b, false = \B
-    Group { index: Option<usize>, node: Box<Node> },
+    Group {
+        index: Option<usize>,
+        node: Box<Node>,
+    },
     Concat(Vec<Node>),
     Alt(Vec<Node>),
-    Repeat { node: Box<Node>, min: usize, max: Option<usize>, greedy: bool },
+    Repeat {
+        node: Box<Node>,
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+    },
     Backref(usize),
 }
 
@@ -197,9 +208,12 @@ impl Regex {
                 }
                 None => self.m(node, s, pos, caps, cont),
             },
-            Node::Repeat { node, min, max, greedy } => {
-                self.m_repeat(node, *min, *max, *greedy, 0, s, pos, caps, cont)
-            }
+            Node::Repeat {
+                node,
+                min,
+                max,
+                greedy,
+            } => self.m_repeat(node, *min, *max, *greedy, 0, s, pos, caps, cont),
             Node::Backref(idx) => {
                 let span = caps.groups.get(*idx).copied().flatten();
                 match span {
@@ -231,7 +245,9 @@ impl Regex {
         if i >= nodes.len() {
             return cont(pos, caps);
         }
-        self.m(&nodes[i], s, pos, caps, &|p, c| self.m_seq(nodes, i + 1, s, p, c, cont))
+        self.m(&nodes[i], s, pos, caps, &|p, c| {
+            self.m_seq(nodes, i + 1, s, p, c, cont)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -288,12 +304,11 @@ impl Regex {
                 ClassItem::Single(c) => self.char_eq(ch, *c),
                 ClassItem::Range(a, b) => {
                     (*a..=*b).contains(&ch)
-                        || (self.ignore_case
-                            && {
-                                let l = ch.to_ascii_lowercase();
-                                let u = ch.to_ascii_uppercase();
-                                (*a..=*b).contains(&l) || (*a..=*b).contains(&u)
-                            })
+                        || (self.ignore_case && {
+                            let l = ch.to_ascii_lowercase();
+                            let u = ch.to_ascii_uppercase();
+                            (*a..=*b).contains(&l) || (*a..=*b).contains(&u)
+                        })
                 }
                 ClassItem::Digit => ch.is_ascii_digit(),
                 ClassItem::NotDigit => !ch.is_ascii_digit(),
@@ -492,12 +507,30 @@ impl Parser {
     fn parse_escape(&mut self) -> Result<Node, String> {
         let c = self.bump().ok_or("trailing backslash")?;
         Ok(match c {
-            'd' => Node::Class { negated: false, items: vec![ClassItem::Digit] },
-            'D' => Node::Class { negated: false, items: vec![ClassItem::NotDigit] },
-            'w' => Node::Class { negated: false, items: vec![ClassItem::Word] },
-            'W' => Node::Class { negated: false, items: vec![ClassItem::NotWord] },
-            's' => Node::Class { negated: false, items: vec![ClassItem::Space] },
-            'S' => Node::Class { negated: false, items: vec![ClassItem::NotSpace] },
+            'd' => Node::Class {
+                negated: false,
+                items: vec![ClassItem::Digit],
+            },
+            'D' => Node::Class {
+                negated: false,
+                items: vec![ClassItem::NotDigit],
+            },
+            'w' => Node::Class {
+                negated: false,
+                items: vec![ClassItem::Word],
+            },
+            'W' => Node::Class {
+                negated: false,
+                items: vec![ClassItem::NotWord],
+            },
+            's' => Node::Class {
+                negated: false,
+                items: vec![ClassItem::Space],
+            },
+            'S' => Node::Class {
+                negated: false,
+                items: vec![ClassItem::NotSpace],
+            },
             'b' => Node::WordBoundary(true),
             'B' => Node::WordBoundary(false),
             'n' => Node::Char('\n'),
@@ -630,7 +663,8 @@ mod tests {
     fn first_match(pat: &str, flags: &str, input: &str) -> Option<String> {
         let re = Regex::new(pat, flags).unwrap();
         let chars: Vec<char> = input.chars().collect();
-        re.exec(&chars, 0).map(|m| chars[m.start..m.end].iter().collect())
+        re.exec(&chars, 0)
+            .map(|m| chars[m.start..m.end].iter().collect())
     }
 
     #[test]
@@ -651,7 +685,10 @@ mod tests {
 
     #[test]
     fn classes_and_escapes() {
-        assert_eq!(first_match("[0-9]+", "", "abc123def").as_deref(), Some("123"));
+        assert_eq!(
+            first_match("[0-9]+", "", "abc123def").as_deref(),
+            Some("123")
+        );
         assert_eq!(first_match("\\d+", "", "x42y").as_deref(), Some("42"));
         assert_eq!(first_match("[^a-z]+", "", "abc123").as_deref(), Some("123"));
         assert!(matches("\\w+@\\w+", "", "a@b"));
@@ -661,13 +698,19 @@ mod tests {
     fn anchors_and_boundaries() {
         assert!(matches("^abc$", "", "abc"));
         assert!(!matches("^abc$", "", "xabc"));
-        assert_eq!(first_match("\\bword\\b", "", "a word here").as_deref(), Some("word"));
+        assert_eq!(
+            first_match("\\bword\\b", "", "a word here").as_deref(),
+            Some("word")
+        );
     }
 
     #[test]
     fn groups_alternation_backref() {
         assert!(matches("(cat|dog)", "", "I have a dog"));
-        assert_eq!(first_match("(ab)+", "", "ababab").as_deref(), Some("ababab"));
+        assert_eq!(
+            first_match("(ab)+", "", "ababab").as_deref(),
+            Some("ababab")
+        );
         assert!(matches("(.)\\1", "", "aa")); // backreference
         assert!(!matches("(.)\\1", "", "ab"));
     }

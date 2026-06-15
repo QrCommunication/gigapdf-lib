@@ -60,10 +60,7 @@ impl TextStyle {
 /// Strip a subset prefix like `ABCDEF+` (six uppercase letters + `+`).
 fn strip_subset(name: &str) -> &str {
     let bytes = name.as_bytes();
-    if bytes.len() > 7
-        && bytes[6] == b'+'
-        && bytes[..6].iter().all(|b| b.is_ascii_uppercase())
-    {
+    if bytes.len() > 7 && bytes[6] == b'+' && bytes[..6].iter().all(|b| b.is_ascii_uppercase()) {
         &name[7..]
     } else {
         name
@@ -105,7 +102,11 @@ pub fn parse_base_font(base_font: &str) -> TextStyle {
         // Family = text up to the first '-' or ',', cleaned.
         let cut = name.find(['-', ',']).unwrap_or(name.len());
         let raw = name[..cut].trim();
-        let family = if raw.is_empty() { "Helvetica".to_string() } else { raw.to_string() };
+        let family = if raw.is_empty() {
+            "Helvetica".to_string()
+        } else {
+            raw.to_string()
+        };
         let generic = if lower.contains("serif") && !lower.contains("sans") {
             Generic::Serif
         } else {
@@ -114,7 +115,13 @@ pub fn parse_base_font(base_font: &str) -> TextStyle {
         (family, generic)
     };
 
-    TextStyle { family, generic, bold, italic, color: None }
+    TextStyle {
+        family,
+        generic,
+        bold,
+        italic,
+        color: None,
+    }
 }
 
 #[cfg(test)]

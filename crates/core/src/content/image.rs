@@ -91,7 +91,11 @@ fn prepare_png(data: &[u8]) -> Option<PreparedImage> {
         color: ImageColor::Rgb,
         filter: ImageFilter::Flate,
         data: flate_encode(&rgb),
-        smask: if opaque { None } else { Some(flate_encode(&alpha)) },
+        smask: if opaque {
+            None
+        } else {
+            Some(flate_encode(&alpha))
+        },
         cmyk_invert: false,
     })
 }
@@ -139,9 +143,9 @@ fn scan_jpeg(data: &[u8]) -> Option<JpegFrame> {
         let marker = data[i + 1];
         i += 2;
         match marker {
-            0xFF => continue,                       // fill byte
-            0xD8 | 0xD9 | 0x01 => continue,         // SOI/EOI/TEM: no payload
-            0xD0..=0xD7 => continue,                // RSTn: no payload
+            0xFF => continue,               // fill byte
+            0xD8 | 0xD9 | 0x01 => continue, // SOI/EOI/TEM: no payload
+            0xD0..=0xD7 => continue,        // RSTn: no payload
             _ => {}
         }
         // Every other marker carries a 2-byte big-endian segment length that
@@ -229,6 +233,9 @@ mod tests {
     #[test]
     fn rejects_non_image_bytes() {
         assert!(prepare_image(b"not an image at all").is_none());
-        assert!(prepare_image(&[0xFF, 0xD8, 0xFF]).is_none(), "truncated jpeg");
+        assert!(
+            prepare_image(&[0xFF, 0xD8, 0xFF]).is_none(),
+            "truncated jpeg"
+        );
     }
 }

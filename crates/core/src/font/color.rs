@@ -19,7 +19,10 @@ fn be16(d: &[u8], o: usize) -> u16 {
 
 fn be32(d: &[u8], o: usize) -> u32 {
     if o + 4 <= d.len() {
-        ((d[o] as u32) << 24) | ((d[o + 1] as u32) << 16) | ((d[o + 2] as u32) << 8) | d[o + 3] as u32
+        ((d[o] as u32) << 24)
+            | ((d[o + 1] as u32) << 16)
+            | ((d[o + 2] as u32) << 8)
+            | d[o + 3] as u32
     } else {
         0
     }
@@ -105,7 +108,11 @@ impl ColorGlyphs {
         if bases.is_empty() || palette.is_empty() {
             return None;
         }
-        Some(ColorGlyphs { bases, layers, palette })
+        Some(ColorGlyphs {
+            bases,
+            layers,
+            palette,
+        })
     }
 
     /// The colour layers of `base_gid`, or `None` if it isn't a colour glyph.
@@ -116,10 +123,24 @@ impl ColorGlyphs {
         for i in 0..num as usize {
             let (gid, pi) = *self.layers.get(first as usize + i)?;
             if pi == 0xFFFF {
-                out.push(Layer { gid, rgb: [0.0, 0.0, 0.0], alpha: 1.0, use_foreground: true });
+                out.push(Layer {
+                    gid,
+                    rgb: [0.0, 0.0, 0.0],
+                    alpha: 1.0,
+                    use_foreground: true,
+                });
             } else {
-                let c = self.palette.get(pi as usize).copied().unwrap_or([0.0, 0.0, 0.0, 1.0]);
-                out.push(Layer { gid, rgb: [c[0], c[1], c[2]], alpha: c[3], use_foreground: false });
+                let c = self
+                    .palette
+                    .get(pi as usize)
+                    .copied()
+                    .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                out.push(Layer {
+                    gid,
+                    rgb: [c[0], c[1], c[2]],
+                    alpha: c[3],
+                    use_foreground: false,
+                });
             }
         }
         Some(out)
@@ -165,7 +186,12 @@ impl Sbix {
             }
         }
         let (strike_off, ppem) = best?;
-        Some(Sbix { data: sbix.to_vec(), strike_off, ppem: ppem as f64, num_glyphs })
+        Some(Sbix {
+            data: sbix.to_vec(),
+            strike_off,
+            ppem: ppem as f64,
+            num_glyphs,
+        })
     }
 
     /// The PNG bitmap for `gid` in the chosen strike, or `None` if the glyph has

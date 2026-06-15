@@ -196,7 +196,9 @@ impl CffFont {
 
     /// Glyph advance width in font units (from the charstring, else half em).
     pub fn advance_width(&self, gid: u16) -> f64 {
-        self.run(gid).map(|g| g.width).unwrap_or(self.units_per_em * 0.5)
+        self.run(gid)
+            .map(|g| g.width)
+            .unwrap_or(self.units_per_em * 0.5)
     }
 
     /// Flattened glyph contours in font units.
@@ -600,9 +602,16 @@ mod tests {
         // - 139), so all operands stay within that range.
         let n = |v: i32| (v + 139) as u8;
         let cs = vec![
-            n(10), n(100), n(100), 21, // 10 100 100 rmoveto (width 10 stripped)
-            n(50), n(0), 5, // 50 0 rlineto
-            n(0), n(50), 5, // 0 50 rlineto
+            n(10),
+            n(100),
+            n(100),
+            21, // 10 100 100 rmoveto (width 10 stripped)
+            n(50),
+            n(0),
+            5, // 50 0 rlineto
+            n(0),
+            n(50),
+            5,  // 0 50 rlineto
             14, // endchar
         ];
         let mut interp = Interp {

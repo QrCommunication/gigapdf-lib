@@ -235,7 +235,12 @@ pub(crate) fn ink(paths: &[Vec<(f64, f64)>], color: [f64; 3], line_width: f64) -
         max_y = 0.0;
     }
     let margin = line_width.max(1.0);
-    let rect = [min_x - margin, min_y - margin, max_x + margin, max_y + margin];
+    let rect = [
+        min_x - margin,
+        min_y - margin,
+        max_x + margin,
+        max_y + margin,
+    ];
 
     let mut dict = Dictionary::new();
     dict.set(b"Subtype".to_vec(), name(b"Ink"));

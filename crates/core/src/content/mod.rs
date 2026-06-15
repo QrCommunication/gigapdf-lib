@@ -18,8 +18,8 @@ use crate::font::cmap::TextDecoder;
 use crate::lexer::{Lexer, Token};
 use crate::object::{Dictionary, Object, StringKind};
 use crate::serialize::encode_value;
-use interpret::{BoundsBuilder, Matrix};
 pub use interpret::{Bounds, Matrix as PageMatrix};
+use interpret::{BoundsBuilder, Matrix};
 
 /// One content-stream operation: its operands and the operator keyword.
 #[derive(Debug, Clone)]
@@ -107,7 +107,11 @@ pub fn group_lines(elements: &[ContentElement]) -> Vec<TextLine> {
         center(&b.1)
             .partial_cmp(&center(&a.1))
             .unwrap_or(core::cmp::Ordering::Equal)
-            .then(a.1.x.partial_cmp(&b.1.x).unwrap_or(core::cmp::Ordering::Equal))
+            .then(
+                a.1.x
+                    .partial_cmp(&b.1.x)
+                    .unwrap_or(core::cmp::Ordering::Equal),
+            )
     });
 
     let mut lines: Vec<TextLine> = Vec::new();
@@ -117,7 +121,10 @@ pub fn group_lines(elements: &[ContentElement]) -> Vec<TextLine> {
         let c = center(&b);
         let tol = b.height.max(row_height).max(1.0) * 0.6;
         if lines.is_empty() || (row_center - c).abs() > tol {
-            lines.push(TextLine { text: text.to_string(), bounds: b });
+            lines.push(TextLine {
+                text: text.to_string(),
+                bounds: b,
+            });
             row_center = c;
             row_height = b.height;
         } else {
@@ -129,7 +136,12 @@ pub fn group_lines(elements: &[ContentElement]) -> Vec<TextLine> {
             let y0 = line.bounds.y.min(b.y);
             let x1 = (line.bounds.x + line.bounds.width).max(b.x + b.width);
             let y1 = (line.bounds.y + line.bounds.height).max(b.y + b.height);
-            line.bounds = Bounds { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+            line.bounds = Bounds {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            };
             row_height = row_height.max(b.height);
         }
     }
@@ -887,7 +899,9 @@ pub fn image_ops(name: &[u8], x: f64, y: f64, w: f64, h: f64) -> Vec<u8> {
     out.extend_from_slice(b"q\n");
     // An image XObject is drawn through the unit square: this CTM scales it to
     // (w, h) and translates it to (x, y).
-    out.extend_from_slice(format!("{} 0 0 {} {} {} cm\n", num(w), num(h), num(x), num(y)).as_bytes());
+    out.extend_from_slice(
+        format!("{} 0 0 {} {} {} cm\n", num(w), num(h), num(x), num(y)).as_bytes(),
+    );
     out.push(b'/');
     out.extend_from_slice(name);
     out.extend_from_slice(b" Do\nQ\n");
@@ -924,7 +938,10 @@ mod tests {
         let edited = remove_text_run(content, 0).unwrap();
         assert!(extract_text_runs(&edited).unwrap().is_empty());
         // The image draw must survive.
-        assert!(edited.windows(2).any(|w| w == b"Do"), "image Do must remain");
+        assert!(
+            edited.windows(2).any(|w| w == b"Do"),
+            "image Do must remain"
+        );
     }
 
     #[test]
@@ -1002,7 +1019,10 @@ mod tests {
         let content = b"10 10 100 50 re f";
         let edited = move_element(content, 0, 5.0, -3.0).unwrap();
         assert!(count(&edited, b"cm") >= 1, "translation matrix added");
-        assert!(count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1, "wrapped in q/Q");
+        assert!(
+            count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1,
+            "wrapped in q/Q"
+        );
         let paths = extract_elements(&edited)
             .unwrap()
             .into_iter()

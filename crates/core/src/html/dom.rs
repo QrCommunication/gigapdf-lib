@@ -105,16 +105,25 @@ pub fn parse(html: &str) -> Vec<Node> {
         if bytes[pos] == b'<' {
             // Comment / doctype / CDATA → skip.
             if html[pos..].starts_with("<!--") {
-                pos = html[pos..].find("-->").map(|i| pos + i + 3).unwrap_or(bytes.len());
+                pos = html[pos..]
+                    .find("-->")
+                    .map(|i| pos + i + 3)
+                    .unwrap_or(bytes.len());
                 continue;
             }
             if bytes.get(pos + 1) == Some(&b'!') || bytes.get(pos + 1) == Some(&b'?') {
-                pos = html[pos..].find('>').map(|i| pos + i + 1).unwrap_or(bytes.len());
+                pos = html[pos..]
+                    .find('>')
+                    .map(|i| pos + i + 1)
+                    .unwrap_or(bytes.len());
                 continue;
             }
             // End tag.
             if bytes.get(pos + 1) == Some(&b'/') {
-                let end = html[pos..].find('>').map(|i| pos + i).unwrap_or(bytes.len());
+                let end = html[pos..]
+                    .find('>')
+                    .map(|i| pos + i)
+                    .unwrap_or(bytes.len());
                 let name = html[pos + 2..end].trim().to_ascii_lowercase();
                 close_tag(&mut stack, &name);
                 pos = (end + 1).min(bytes.len());
@@ -180,7 +189,10 @@ pub fn parse(html: &str) -> Vec<Node> {
             pos += 1;
         } else {
             // Text run up to the next '<'.
-            let end = html[pos..].find('<').map(|i| pos + i).unwrap_or(bytes.len());
+            let end = html[pos..]
+                .find('<')
+                .map(|i| pos + i)
+                .unwrap_or(bytes.len());
             let text = decode_entities(&html[pos..end]);
             push_text(&mut stack, &text);
             pos = end;
@@ -260,7 +272,11 @@ fn parse_tag(raw: &str) -> Option<(String, Vec<(String, String)>)> {
         }
         // Attribute name.
         let nstart = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' && bytes[i] != b'/' {
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
             i += 1;
         }
         let aname = raw[nstart..i].to_ascii_lowercase();
