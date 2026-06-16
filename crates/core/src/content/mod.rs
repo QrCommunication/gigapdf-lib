@@ -79,6 +79,12 @@ pub struct ContentElement {
     /// For text: the RGB fill colour in effect (`rg`/`g`/`k`), `0..=1` per
     /// channel. `None` means default (black) or non-text.
     pub color: Option<[f64; 3]>,
+    /// For text: the effective glyph size in user-space points (the `Tf` size
+    /// scaled by the text·CTM vertical scale). `None` for image/path.
+    pub font_size: Option<f64>,
+    /// For text: the baseline rotation in degrees (from the text·CTM matrix;
+    /// `0` for upright text). `None` for image/path.
+    pub rotation_deg: Option<f64>,
 }
 
 /// A reading-order text line: the concatenated runs that share a baseline band,
@@ -628,6 +634,13 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                 let text = decode_operand_text(&op.operands, text_decoder);
                 let char_count = text.chars().count();
                 let bounds = text_bounds(&tm, &ctm, font_size, char_count);
+                // Combined text→device matrix: the `Tf` size scaled by its
+                // vertical scale gives the on-page glyph size; its x-axis angle
+                // gives the baseline rotation.
+                let m = tm.then(&ctm).0;
+                let scale_y = (m[2] * m[2] + m[3] * m[3]).sqrt();
+                let eff_size = if scale_y > 0.0 { font_size * scale_y } else { font_size };
+                let rot = m[1].atan2(m[0]).to_degrees();
                 elements.push(ContentElement {
                     index: 0,
                     kind: ElementKind::Text,
@@ -637,6 +650,8 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                     bounds,
                     font: current_font.clone(),
                     color: fill_color,
+                    font_size: Some(eff_size),
+                    rotation_deg: Some(if rot.abs() < 1e-6 { 0.0 } else { rot }),
                 });
                 let advance = char_count as f64 * 0.5 * font_size;
                 tm = Matrix::translate(advance, 0.0).then(&tm);
@@ -657,6 +672,8 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                     bounds: unit_square_bounds(&ctm),
                     font: None,
                     color: None,
+                    font_size: None,
+                    rotation_deg: None,
                 });
             }
             _ if is_path_construction(operator) => {
@@ -674,6 +691,8 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                         bounds: path_bb.build(),
                         font: None,
                         color: None,
+                        font_size: None,
+                        rotation_deg: None,
                     });
                 }
                 path_bb = BoundsBuilder::new();

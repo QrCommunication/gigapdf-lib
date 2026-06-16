@@ -35,6 +35,21 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("extracts rich text elements (font, size, colour, bounds)", () => {
+    const doc = giga.open(giga.txtToPdf("Rich text"));
+    const els = doc.textElements(1);
+    expect(els.length).toBeGreaterThan(0);
+    const e = els.find((el) => el.text.includes("Rich")) ?? els[0]!;
+    expect(typeof e.fontFamily).toBe("string");
+    expect(e.fontFamily.length).toBeGreaterThan(0);
+    expect(e.fontSize).toBeGreaterThan(0);
+    expect(e.color).toHaveLength(3);
+    expect(Number.isFinite(e.x) && Number.isFinite(e.y)).toBe(true);
+    // index is the text-run index that replaceText accepts.
+    expect(Number.isInteger(e.index)).toBe(true);
+    doc.close();
+  });
+
   it("edits (addRectangle with stroke flag) and round-trips a save", () => {
     const doc = giga.open(giga.txtToPdf("Edit me"));
     // Red stroke, no fill, 2pt — exercises the has_stroke/has_fill flags.

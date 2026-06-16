@@ -34,6 +34,7 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 |------|------|
 | `page_text_runs(page) -> Vec<TextRun>` | `gp_text_runs_json(handle,page,outlen)` |
 | `page_elements(page) -> Vec<ContentElement>` | `gp_elements_json(handle,page,outlen)` |
+| `page_text_elements(page) -> Vec<TextElementInfo>` (rich per-run text: bounds + family/bold/italic + size + colour + rotation) | `gp_text_elements_json(handle,page,outlen)` |
 | `element_at(page,x,y) -> Option<usize>` | `gp_element_at(handle,page,x,y)` |
 | `replace_text_run(page,i,&str)` (font-aware: re-encodes Type0/Identity-H runs through the font's char→glyph map) | `gp_replace_text(handle,page,i,ptr,len)` |
 | `remove_text_run(page,i)` / `remove_element(page,i)` | `gp_remove_element(handle,page,i)` |

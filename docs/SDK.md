@@ -114,6 +114,7 @@ try {
 | `textRuns(page)` | `TextRunInfo[]` | Raw content-stream text runs (operator + text), in draw order. |
 | `structuredText(page)` | `TextLine[]` | Lines with bounding boxes (`x,y,w,h` + text) — for selection / extraction. |
 | `elements(page)` | `Element[]` | All content elements (text/image/path) with kind + bounds — the editor scene graph. |
+| `textElements(page)` | `TextElementInfo[]` | **Rich** per-run text for an editor: text + bounds (user space) + resolved `fontFamily`/`bold`/`italic` + `fontSize` + RGB `color` + `rotation`. `index` is the text-run index for `replaceText` — extract, render and edit from one model. |
 | `elementAt(page, x, y)` | `number` | Hit-test: index of the element under a point, or `-1`. |
 | `search(query, caseInsensitive?)` | `SearchHit[]` | Full-text search with per-hit bounding boxes. |
 

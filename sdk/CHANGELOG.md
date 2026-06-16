@@ -4,6 +4,26 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.28.0] - 2026-06-16
+
+### Added
+
+- **Rich per-run text extraction — `textElements(page)`** (ABI
+  `gp_text_elements_json`, `Document::page_text_elements`). Returns every text
+  run with everything a host editor needs to recreate it:
+  `{ index, text, x, y, width, height, fontFamily, bold, italic, fontSize,
+  color, rotation }` — bounds in user space (origin bottom-left), `fontFamily`
+  resolved from `/BaseFont` (bold/italic parsed), `fontSize` the effective
+  on-page point size, `color` the RGB fill (`0..1`), `rotation` the baseline
+  angle. `index` is the **text-run index** accepted by `replaceText`, so a host
+  can extract, render and edit from one model. The native replacement for a
+  reader's per-run text layer (which `elements()` omitted font + colour). New
+  `TextElementInfo` type.
+- `ContentElement` now carries `font_size` and `rotation_deg` for text elements
+  (computed from the text·CTM matrix), feeding the above. Validated against the
+  app's pdfjs text extractor: 100% character-content parity across simple,
+  mixed-font, embedded-font, CJK, RTL, table and rotated fixtures.
+
 ## [0.27.0] - 2026-06-16
 
 ### Changed

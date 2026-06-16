@@ -389,6 +389,53 @@ pub extern "C" fn gp_elements_json(
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
+/// Every text element on a page as JSON, enriched for a host editor:
+/// `[{index,text,x,y,width,height,fontFamily,bold,italic,fontSize,color:[r,g,b],rotation}]`.
+/// Bounds are in user space (origin bottom-left); `index` is the text-run index
+/// accepted by `gp_replace_text`. Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_text_elements_json(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let fnum = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let mut s = String::from("[");
+            for (i, e) in doc.page_text_elements(page).iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("{{\"index\":{},\"text\":", e.index));
+                json_escape(&e.text, &mut s);
+                s.push_str(&format!(
+                    ",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"fontFamily\":",
+                    fnum(e.x),
+                    fnum(e.y),
+                    fnum(e.width),
+                    fnum(e.height)
+                ));
+                json_escape(&e.font_family, &mut s);
+                s.push_str(&format!(
+                    ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{}}}",
+                    e.bold,
+                    e.italic,
+                    fnum(e.font_size),
+                    fnum(e.color[0]),
+                    fnum(e.color[1]),
+                    fnum(e.color[2]),
+                    fnum(e.rotation_deg)
+                ));
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Index of the element at page point `(x, y)`, or -1 if none.
 #[no_mangle]
 pub extern "C" fn gp_element_at(handle: *const Document, page: u32, x: f64, y: f64) -> i32 {

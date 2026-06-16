@@ -266,6 +266,28 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
+/// One text element from [`Document::page_text_elements`]: the decoded text plus
+/// everything a host editor needs to recreate the run — its bounding box (page
+/// user space, origin bottom-left), the resolved `/BaseFont` family and
+/// bold/italic flags, the effective point size, the RGB fill colour (`0..=1`)
+/// and the baseline rotation. `index` is the **text-run** index accepted by
+/// [`Document::replace_text_run`].
+#[derive(Debug, Clone)]
+pub struct TextElementInfo {
+    pub index: usize,
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub font_family: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub font_size: f64,
+    pub color: [f64; 3],
+    pub rotation_deg: f64,
+}
+
 impl Document {
     /// Parse a PDF from raw bytes.
     pub fn open(bytes: &[u8]) -> Result<Self> {
@@ -851,6 +873,51 @@ impl Document {
         let content = self.page_content(page_no)?;
         let fonts = self.page_font_decoders(page_no);
         content::extract_elements_with(&content, &fonts)
+    }
+
+    /// Every **text** element on a page, enriched with everything a host editor
+    /// needs to recreate each run: bounding box (user space, bottom-left), the
+    /// resolved `/BaseFont` family + bold/italic, the effective point size, the
+    /// RGB fill colour and the baseline rotation. The returned `index` is the
+    /// **text-run** index accepted by [`replace_text_run`](Self::replace_text_run),
+    /// so a host can extract, display and edit in one model. The native
+    /// equivalent of a reader's per-run text layer — font and colour included,
+    /// which `page_elements`' bare bounds omit.
+    pub fn page_text_elements(&self, page_no: u32) -> Vec<TextElementInfo> {
+        let styles = self.page_base_fonts(page_no);
+        let Ok(elements) = self.page_elements(page_no) else {
+            return Vec::new();
+        };
+        elements
+            .into_iter()
+            .filter(|e| e.kind == content::ElementKind::Text)
+            .enumerate()
+            .map(|(run_index, e)| {
+                let style = e.font.as_ref().and_then(|name| styles.get(name));
+                let b = e.bounds.unwrap_or(content::Bounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                });
+                TextElementInfo {
+                    index: run_index,
+                    text: e.label,
+                    x: b.x,
+                    y: b.y,
+                    width: b.width,
+                    height: b.height,
+                    font_family: style
+                        .map(|s| s.family.clone())
+                        .unwrap_or_else(|| "Helvetica".to_string()),
+                    bold: style.map(|s| s.bold).unwrap_or(false),
+                    italic: style.map(|s| s.italic).unwrap_or(false),
+                    font_size: e.font_size.filter(|s| *s > 0.0).unwrap_or(b.height),
+                    color: e.color.unwrap_or([0.0, 0.0, 0.0]),
+                    rotation_deg: e.rotation_deg.unwrap_or(0.0),
+                }
+            })
+            .collect()
     }
 
     /// Redact a rectangular region (page user space): permanently **remove**
@@ -7935,6 +8002,40 @@ mod tests {
         assert!(names.contains(&"chapter1"), "inline-array name-tree dest");
         assert!(names.contains(&"chapter2"), "/D-wrapped name-tree dest");
         assert!(dests.iter().all(|(_, p)| *p == 1), "both resolve to page 1");
+    }
+
+    #[test]
+    fn page_text_elements_carry_font_size_colour_family() {
+        let mut doc = blank_doc();
+        doc.add_text_standard(
+            1,
+            120.0,
+            650.0,
+            20.0,
+            "Bold",
+            "Helvetica-Bold",
+            [1.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+
+        let els = doc.page_text_elements(1);
+        assert_eq!(els.len(), 1, "one text element");
+        let e = &els[0];
+        assert_eq!(e.text, "Bold");
+        assert_eq!(e.index, 0, "text-run index (feeds replace_text_run)");
+        assert!((e.font_size - 20.0).abs() < 1.5, "size ~20, got {}", e.font_size);
+        assert!((e.x - 120.0).abs() < 3.0, "x ~120, got {}", e.x);
+        assert!((e.y - 650.0).abs() < 15.0, "y ~650, got {}", e.y);
+        assert!(
+            (e.color[0] - 1.0).abs() < 0.02 && e.color[1] < 0.02 && e.color[2] < 0.02,
+            "red fill, got {:?}",
+            e.color
+        );
+        assert_eq!(e.font_family, "Helvetica", "/BaseFont family");
+        assert!(e.bold, "Helvetica-Bold resolves bold");
+        assert!(e.rotation_deg.abs() < 0.5, "upright, got {}", e.rotation_deg);
     }
 
     #[test]

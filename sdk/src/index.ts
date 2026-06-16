@@ -617,6 +617,30 @@ export interface Element extends Partial<Box> {
   kind: "text" | "image" | "shape";
   label: string;
 }
+/**
+ * A text element from {@link GigaPdfDoc.textElements}: the decoded text plus
+ * everything a host editor needs to recreate the run. `index` is the text-run
+ * index accepted by {@link GigaPdfDoc.replaceText}; the bounding box is page
+ * user space (origin bottom-left).
+ */
+export interface TextElementInfo {
+  index: number;
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Resolved `/BaseFont` family (e.g. "Helvetica", "Times New Roman"). */
+  fontFamily: string;
+  bold: boolean;
+  italic: boolean;
+  /** Effective glyph size in points. */
+  fontSize: number;
+  /** RGB fill colour, `0..1` per channel. */
+  color: [number, number, number];
+  /** Baseline rotation in degrees (0 = upright). */
+  rotation: number;
+}
 export interface TextLine extends Box {
   text: string;
 }
@@ -825,6 +849,17 @@ export class GigaPdfDoc {
   }
   elements(page: number): Element[] {
     return this.g._json((o) => this.ex().gp_elements_json(this.h, page, o));
+  }
+  /**
+   * Every text element on a page, enriched for an editor: the decoded text, its
+   * bounding box (user space, bottom-left), the resolved font family +
+   * bold/italic, the effective point size, the RGB fill colour and the baseline
+   * rotation. `index` is the text-run index for {@link replaceText}, so a host
+   * can extract, render and edit text from one model — the native replacement
+   * for a reader's per-run text layer (which `elements()` omits font + colour).
+   */
+  textElements(page: number): TextElementInfo[] {
+    return this.g._json((o) => this.ex().gp_text_elements_json(this.h, page, o));
   }
   structuredText(page: number): TextLine[] {
     return this.g._json((o) => this.ex().gp_structured_text_json(this.h, page, o));
