@@ -5004,6 +5004,70 @@ impl Document {
         None
     }
 
+    /// Resolve a destination to its explicit `[pageRef, /Fit, …]` array, chasing
+    /// a name/string through the name tree (or inline `/Dests`) and unwrapping a
+    /// `<< /D […] >>` dictionary.
+    fn resolve_dest_array(&self, dest: &Object) -> Option<Vec<Object>> {
+        match self.resolve(dest) {
+            Object::Array(items) => Some(items.clone()),
+            Object::Name(name) => {
+                let target = self.lookup_named_dest(name)?;
+                self.resolve_dest_array(&target)
+            }
+            Object::String(bytes, _) => {
+                let target = self.lookup_named_dest(bytes)?;
+                self.resolve_dest_array(&target)
+            }
+            Object::Dictionary(d) => {
+                let inner = d.get(b"D")?.clone();
+                self.resolve_dest_array(&inner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve an outline/annotation dict's destination to
+    /// `(page, kind, x, y, zoom)`: `kind` is the lowercased fit type
+    /// (`"xyz"`/`"fit"`/`"fith"`/…); for `/XYZ`, `x`/`y` are the top-left point
+    /// and `zoom` the magnification (a `null` operand yields `None`).
+    fn dest_detail_of(
+        &self,
+        dict: &Dictionary,
+    ) -> (Option<u32>, String, Option<f64>, Option<f64>, Option<f64>) {
+        let dest_obj = dict.get(b"Dest").cloned().or_else(|| {
+            dict.get(b"A")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .filter(|a| a.get(b"S").and_then(Object::as_name) == Some(b"GoTo".as_slice()))
+                .and_then(|a| a.get(b"D").cloned())
+        });
+        let Some(arr) = dest_obj.as_ref().and_then(|d| self.resolve_dest_array(d)) else {
+            return (None, String::new(), None, None, None);
+        };
+        let page = arr
+            .first()
+            .and_then(Object::as_reference)
+            .and_then(|id| self.page_number_of(id));
+        let kind = arr
+            .get(1)
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_name)
+            .map(|n| String::from_utf8_lossy(n).to_lowercase())
+            .unwrap_or_default();
+        let num = |i: usize| {
+            arr.get(i).and_then(|o| match self.resolve(o) {
+                Object::Null => None,
+                r => r.as_f64(),
+            })
+        };
+        let (x, y, zoom) = if kind == "xyz" {
+            (num(2), num(3), num(4))
+        } else {
+            (None, None, None)
+        };
+        (page, kind, x, y, zoom)
+    }
+
     /// List a page's hyperlink annotations.
     pub fn page_links(&self, page_no: u32) -> Result<Vec<Link>> {
         let page = self.page_dict(page_no)?;
@@ -5375,8 +5439,29 @@ impl Document {
                 .get(b"Title")
                 .map(|o| self.string_value(o))
                 .unwrap_or_default();
-            let page = self.dest_page_of(dict);
-            out.push(OutlineItem { title, level, page });
+            let flags = dict.get(b"F").and_then(Object::as_i64).unwrap_or(0);
+            let color = dict
+                .get(b"C")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .map(|a| {
+                    let c = |i: usize| a.get(i).and_then(|o| self.resolve(o).as_f64()).unwrap_or(0.0);
+                    [c(0), c(1), c(2)]
+                })
+                .unwrap_or([0.0, 0.0, 0.0]);
+            let (page, dest_kind, dest_x, dest_y, dest_zoom) = self.dest_detail_of(dict);
+            out.push(OutlineItem {
+                title,
+                level,
+                page,
+                bold: flags & 2 != 0,
+                italic: flags & 1 != 0,
+                color,
+                dest_kind,
+                dest_x,
+                dest_y,
+                dest_zoom,
+            });
             if let Some(child) = dict.get(b"First").and_then(Object::as_reference) {
                 self.walk_outline(child, level + 1, out, depth + 1);
             }
@@ -8267,6 +8352,63 @@ mod tests {
         assert!(names.contains(&"chapter1"), "inline-array name-tree dest");
         assert!(names.contains(&"chapter2"), "/D-wrapped name-tree dest");
         assert!(dests.iter().all(|(_, p)| *p == 1), "both resolve to page 1");
+    }
+
+    #[test]
+    fn outline_items_carry_style_and_dest_detail() {
+        let mut doc = blank_doc();
+        let page_id = doc.page_object_id(1).unwrap();
+        let base = doc.next_object_number();
+        let outlines_id = (base, 0u16);
+        let item_id = (base + 1, 0u16);
+
+        let mut item = Dictionary::new();
+        item.set(b"Title", Object::String(b"Chapter 1".to_vec(), StringKind::Literal));
+        item.set(b"Parent", Object::Reference(outlines_id));
+        item.set(b"F", Object::Integer(2)); // bold
+        item.set(
+            b"C",
+            Object::Array(vec![Object::Real(1.0), Object::Real(0.0), Object::Real(0.0)]),
+        );
+        item.set(
+            b"Dest",
+            Object::Array(vec![
+                Object::Reference(page_id),
+                Object::Name(b"XYZ".to_vec()),
+                Object::Integer(100),
+                Object::Integer(700),
+                Object::Real(2.0),
+            ]),
+        );
+        doc.objects.insert(item_id, Object::Dictionary(item));
+
+        let mut outlines = Dictionary::new();
+        outlines.set(b"Type", Object::Name(b"Outlines".to_vec()));
+        outlines.set(b"First", Object::Reference(item_id));
+        outlines.set(b"Last", Object::Reference(item_id));
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+
+        let catalog_id = doc.catalog_id().unwrap();
+        let mut catalog = doc
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+        catalog.set(b"Outlines".to_vec(), Object::Reference(outlines_id));
+        doc.objects.insert(catalog_id, Object::Dictionary(catalog));
+
+        let items = doc.outline_items();
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.title, "Chapter 1");
+        assert_eq!(it.page, Some(1));
+        assert!(it.bold && !it.italic, "F=2 → bold, not italic");
+        assert_eq!(it.color, [1.0, 0.0, 0.0], "red /C");
+        assert_eq!(it.dest_kind, "xyz");
+        assert_eq!(it.dest_x, Some(100.0));
+        assert_eq!(it.dest_y, Some(700.0));
+        assert_eq!(it.dest_zoom, Some(2.0));
     }
 
     #[test]

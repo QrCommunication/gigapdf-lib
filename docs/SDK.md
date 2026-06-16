@@ -228,7 +228,7 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `addLayer(name)` | `number` | Create a layer; returns its id (`0` on error). |
 | `setLayerVisibility(id, visible)` / `setLayerLocked(id, locked)` | `boolean` | Toggle a layer. |
 | `removeLayer(id)` | `boolean` | Delete a layer. |
-| `outline()` | `OutlineEntry[]` | The bookmark tree (`{ title, page, level }`). |
+| `outline()` | `OutlineEntry[]` | The flattened bookmark list: `{ title, level, page?, bold?, italic?, color?, destKind?, x?, y?, zoom? }` — nesting depth, destination page + `/XYZ` position/zoom, and `/F`+`/C` label style. Rebuild the tree from `level`. |
 | `setOutline(entries)` | `boolean` | Replace the bookmark tree. |
 | `getMetadata(key)` / `setMetadata(key, value)` | `string` / `boolean` | Read/write an Info-dictionary entry (`Title`, `Author`, …). |
 | `attachments()` | `Attachment[]` | Extract every embedded file from the `/Names /EmbeddedFiles` name tree: `{ name, filename, mime, description, creationDate, modDate, data }` where `data` is the decoded bytes. The native replacement for a reader's `getAttachments()`. |
@@ -268,6 +268,11 @@ reconstructed tables for spreadsheets) — not a rasterised image.
 
 To make a scanned PDF searchable: `ocr(page)` → map words to placements →
 `addTextLayer(page, runs)` (invisible, selectable).
+
+> Today: Latin (printed + handwritten). Multi-script support (Cyrillic, Greek, CJK,
+> Arabic, Hebrew, Indic) via a line-level CRNN+CTC recognizer is on the roadmap — see
+> [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and
+> [`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md).
 
 ### Security
 

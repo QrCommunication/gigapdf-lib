@@ -3015,6 +3015,23 @@ fn outline_json(items: &[OutlineItem]) -> String {
         if let Some(page) = item.page {
             out.push_str(&format!(",\"page\":{page}"));
         }
+        out.push_str(&format!(
+            ",\"bold\":{},\"italic\":{},\"color\":[{},{},{}]",
+            item.bold, item.italic, item.color[0], item.color[1], item.color[2]
+        ));
+        if !item.dest_kind.is_empty() {
+            out.push_str(",\"destKind\":");
+            json_escape(&item.dest_kind, &mut out);
+        }
+        if let Some(x) = item.dest_x {
+            out.push_str(&format!(",\"x\":{x}"));
+        }
+        if let Some(y) = item.dest_y {
+            out.push_str(&format!(",\"y\":{y}"));
+        }
+        if let Some(z) = item.dest_zoom {
+            out.push_str(&format!(",\"zoom\":{z}"));
+        }
         out.push('}');
     }
     out.push(']');

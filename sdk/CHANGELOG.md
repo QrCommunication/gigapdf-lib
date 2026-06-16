@@ -4,6 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.31.0] - 2026-06-17
+
+### Added
+
+- **Outline entries now carry style + destination detail.** `outline()` /
+  `Document::outline_items` enrich each `OutlineItem`/`OutlineEntry` with `bold`
+  + `italic` (`/F` flag bits), `color` (`/C` RGB), and the resolved destination
+  fit: `destKind` (`xyz`/`fit`/`fith`/`fitv`/…) plus `x`/`y`/`zoom` for `/XYZ`.
+  Destinations are resolved through explicit arrays, the `/Names`/inline `/Dests`
+  name tree, and `/A /GoTo` actions. Lets a host rebuild a full bookmark tree
+  (style + position/zoom) from the flat `level` list — the native replacement
+  for a reader's `getOutline()`. The new fields are optional in `OutlineEntry`,
+  so existing `setOutline` callers are unaffected.
+
 ## [0.30.0] - 2026-06-17
 
 ### Changed

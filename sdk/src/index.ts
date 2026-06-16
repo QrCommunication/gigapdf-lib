@@ -744,6 +744,20 @@ export interface OutlineEntry {
   level: number;
   title: string;
   page?: number;
+  /** `/F` flag bit 2 — label drawn bold (present when read via {@link GigaPdfDoc.outline}). */
+  bold?: boolean;
+  /** `/F` flag bit 1 — label drawn italic. */
+  italic?: boolean;
+  /** `/C` RGB label colour, `0..1` per channel (black when absent in the PDF). */
+  color?: [number, number, number];
+  /** Destination fit type, lowercased (`"xyz"`/`"fit"`/`"fith"`/`"fitv"`/…). */
+  destKind?: string;
+  /** `/XYZ` top-left X (when `destKind === "xyz"`). */
+  x?: number;
+  /** `/XYZ` top-left Y. */
+  y?: number;
+  /** `/XYZ` magnification. */
+  zoom?: number;
 }
 /** A named destination from {@link GigaPdfDoc.namedDests}: a name → page anchor. */
 export interface NamedDest {
