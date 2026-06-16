@@ -80,12 +80,15 @@ const filled = doc.fields(); // read them straight back: kind + value + options
 doc.addStandardText(1, 72, 720, 24, "Heading", "Helvetica-Bold", 0x111111);
 doc.addStandardText(1, 72, 690, 12, "body in Times", "Times-Roman");
 
-// 2. Any family / Google Font — the host performs the network fetch, the engine embeds.
+// 2. Any family / Google Font — the host fetches, the engine embeds. embedFont
+//    accepts any outline file: glyf .ttf OR OpenType-CFF .otf (auto-detected).
 const url = giga.fontRequestUrl("Roboto", 400); // Google Fonts CSS2 URL
 const css = await (await fetch(url, { headers: { "User-Agent": "Mozilla/4.0" } })).text();
 const ttf = new Uint8Array(await (await fetch(giga.parseCssFontUrl(css))).arrayBuffer());
 const fontObj = doc.embedFont("Roboto", ttf);
 doc.addText(1, 72, 660, 18, "Selectable embedded text", fontObj, 0x111111);
+// Font-aware editing: replace the run's text — re-encoded through Roboto's cmap.
+doc.replaceText(1, doc.textRuns(1).length - 1, "Edited in the same font");
 
 // 3. Reuse a face the PDF already embeds: list → extract → re-embed → draw.
 const face = doc.embeddedFonts().find((f) => f.format === "truetype");
@@ -126,14 +129,16 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   `addImage` (PNG/JPEG, alpha + opacity)), pages (`rotatePage`, `deletePage`,
   `movePage`, `appendPages`, `extractPages`, `resizePage`, `addPage`, `copyPage`,
   `pageInfo`),
-  `renderPage`, fonts (base-14 `addStandardText`, embedded `embedFont`/`addText`,
+  `renderPage`, fonts (base-14 `addStandardText`, embed **any** TrueType/OpenType
+  via `embedFont`/`addText`, font-aware editing `replaceText`,
   the document's own faces `embeddedFonts`/`extractFont`, `neededFonts`),
   conversions (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`), security
   (`saveEncrypted`, self-signed `sign`, **PKCS#12** `signP12`), metadata
   (`getMetadata`, `setMetadata`), annotations (`addSquare`,
   `addHighlight`, `addLineAnnotation`, `addFreeText`, `addUnderline`,
   `addStrikeOut`, `addInk`, `addStamp`, `annotations`, `removeAnnotation`,
-  `flattenAnnotations`), links (`links`, `addUriLink`, `addGotoLink`), outline
+  `flattenAnnotations`), links (`links`, `addUriLink`, `addGotoLink`, named
+  destinations `addNamedDest`/`namedDests`/`addGotoLinkNamed`), outline
   (`outline`, `setOutline`), forms — read/fill (`fields`, `setTextField`,
   `setCheckbox`, `setRadio`, `setChoice`) **and create**
   (`addTextField`, `addCheckbox`, `addRadioGroup`, `addComboBox`, `addListBox`,

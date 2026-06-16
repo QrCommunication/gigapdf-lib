@@ -195,4 +195,24 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(doc.addText(1, 72, 500, 14, "reused glyphs", handle)).toBe(true);
     doc.close();
   });
+
+  it("registers named destinations and resolves links that jump to them by name", () => {
+    const doc = giga.open(giga.txtToPdf("Cover"));
+    expect(doc.addPage(612, 792, 1)).toBeGreaterThan(0); // page 2
+    expect(doc.pageCount()).toBe(2);
+
+    expect(doc.addNamedDest("intro", 2)).toBe(true);
+    expect(doc.namedDests()).toEqual([{ name: "intro", page: 2 }]);
+
+    // A link by name resolves to its destination page…
+    expect(doc.addGotoLinkNamed(1, 10, 10, 60, 30, "intro")).toBe(true);
+    expect(doc.links(1).some((l) => l.kind === "page" && l.page === 2)).toBe(true);
+
+    // …and both survive a save round-trip.
+    const reopened = giga.open(doc.save());
+    expect(reopened.namedDests()).toEqual([{ name: "intro", page: 2 }]);
+    expect(reopened.links(1).some((l) => l.kind === "page" && l.page === 2)).toBe(true);
+    reopened.close();
+    doc.close();
+  });
 });

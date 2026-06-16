@@ -752,8 +752,69 @@ impl Document {
     /// Replace a text run's text in place (keeps position and font).
     pub fn replace_text_run(&mut self, page_no: u32, index: usize, new_text: &str) -> Result<()> {
         let content = self.page_content(page_no)?;
-        let edited = content::replace_text_run(&content, index, new_text)?;
+        // Font-aware: a Type0/Identity-H run stores 2-byte glyph ids, so re-encode
+        // `new_text` through the font's char→GID map; simple fonts take the
+        // WinAnsi single-byte path. This makes modify work with *any* font.
+        let edited = match self.encode_run_for_font(page_no, &content, index, new_text) {
+            Some((bytes, kind)) => content::replace_text_run_encoded(&content, index, bytes, kind)?,
+            None => content::replace_text_run(&content, index, new_text)?,
+        };
         self.set_page_content(page_no, edited)
+    }
+
+    /// If the `index`-th run on `page_no` is set in a Type0/Identity-H font,
+    /// encode `new_text` to its 2-byte glyph ids (returned as `Hex` bytes) and
+    /// record those gids for subsetting; otherwise `None` (the caller falls back
+    /// to single-byte WinAnsi). The bridge that lets [`replace_text_run`] handle
+    /// embedded TrueType and OpenType-CFF faces, not just base-14.
+    fn encode_run_for_font(
+        &mut self,
+        page_no: u32,
+        content: &[u8],
+        index: usize,
+        new_text: &str,
+    ) -> Option<(Vec<u8>, StringKind)> {
+        let res = content::text_run_font_name(content, index).ok()??;
+        let font_obj = self.page_font_object(page_no, &res)?;
+        if !self.is_identity_h_font(font_obj) {
+            return None;
+        }
+        let ttf = self.embedded_truetype(font_obj)?;
+        let mut bytes = Vec::with_capacity(new_text.chars().count() * 2);
+        let used = self.font_used_gids.entry(font_obj).or_default();
+        for ch in new_text.chars() {
+            let gid = ttf.gid_for_unicode(ch as u32).unwrap_or(0);
+            used.insert(gid);
+            bytes.extend_from_slice(&gid.to_be_bytes());
+        }
+        Some((bytes, StringKind::Hex))
+    }
+
+    /// The object number of the font registered under resource `name` in
+    /// `page_no`'s `/Resources /Font`, or `None` (inline font dicts have no id).
+    fn page_font_object(&self, page_no: u32, name: &[u8]) -> Option<u32> {
+        let page = self.page_dict(page_no).ok()?;
+        let font_dict = page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|res| res.get(b"Font"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        match font_dict.get(name)? {
+            Object::Reference((num, _)) => Some(*num),
+            _ => None,
+        }
+    }
+
+    /// True when `font_obj` is a Type0 font with the `Identity-H` encoding name
+    /// (its content codes are raw 2-byte glyph ids).
+    fn is_identity_h_font(&self, font_obj: u32) -> bool {
+        let Some(t0) = self.objects.get(&(font_obj, 0)).and_then(Object::as_dict) else {
+            return false;
+        };
+        t0.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice())
+            && t0.get(b"Encoding").and_then(Object::as_name) == Some(b"Identity-H".as_slice())
     }
 
     /// Remove a text run, preserving the rest of the page (background intact).
@@ -2600,28 +2661,79 @@ impl Document {
     /// [`font::google::css_url`](crate::font::google::css_url)) and the engine
     /// bakes them in, so the output renders the same font everywhere.
     pub fn embed_truetype_font(&mut self, family: &str, ttf: &[u8]) -> Result<u32> {
+        self.embed_font(family, ttf)
+    }
+
+    /// Embed **any** outline font program — glyf-based TrueType *or* OpenType-CFF
+    /// (`OTTO`) — as a subsettable Type0 font, returning its object number for
+    /// [`add_text`](Self::add_text). The flavour is detected automatically:
+    ///
+    /// * **glyf TrueType** → `CIDFontType2` descendant + `FontFile2` + Identity
+    ///   `CIDToGIDMap` (CID = GID), later subset by `save_compressed`.
+    /// * **OpenType-CFF** (`OTTO`, outlines in the `CFF ` table) → `CIDFontType0`
+    ///   descendant + `FontFile3` `/Subtype /OpenType` (the whole OpenType file;
+    ///   for a non-CID-keyed CFF the viewer uses the CID directly as a glyph id,
+    ///   ISO 32000-1 §9.7.4.2).
+    ///
+    /// Both flavours encode with Identity-H, carry a full `/W` width array and a
+    /// `/ToUnicode` CMap (so copy/extract round-trips), and resolve their char→GID
+    /// map at draw time — making `add_text`, `replace_text_run` and every other
+    /// text operation work with arbitrary families (base-14, Google Fonts, or a
+    /// face extracted from the document itself). Kept under the historical name
+    /// [`embed_truetype_font`](Self::embed_truetype_font) too.
+    pub fn embed_font(&mut self, family: &str, program: &[u8]) -> Result<u32> {
+        // glyf TrueType parses with the strict reader; OpenType-CFF (no glyf) is
+        // recognised by its `OTTO` sfnt tag and read for metrics/cmap only.
+        if let Some(parsed) = crate::font::truetype::TrueTypeFont::parse(program) {
+            self.embed_cid_font(family, program, &parsed, false)
+        } else if program.get(0..4) == Some(b"OTTO".as_slice()) {
+            let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(program)
+                .ok_or_else(|| EngineError::Unsupported("unparseable OpenType-CFF font".into()))?;
+            self.embed_cid_font(family, program, &parsed, true)
+        } else {
+            Err(EngineError::Unsupported(
+                "not a glyf TrueType or OpenType-CFF font program".into(),
+            ))
+        }
+    }
+
+    /// Assemble the Type0 object graph shared by both font flavours. `is_cff`
+    /// selects `FontFile3`/`CIDFontType0` (OpenType-CFF) over the default
+    /// `FontFile2`/`CIDFontType2` (glyf TrueType).
+    fn embed_cid_font(
+        &mut self,
+        family: &str,
+        program: &[u8],
+        parsed: &crate::font::truetype::TrueTypeFont,
+        is_cff: bool,
+    ) -> Result<u32> {
         use crate::object::StringKind::Literal;
-        let parsed = crate::font::truetype::TrueTypeFont::parse(ttf)
-            .ok_or_else(|| EngineError::Unsupported("not a glyf-based TrueType font".into()))?;
         let ps_name = postscript_name(family);
 
-        let advances = crate::font::embed::scaled_advances(&parsed);
-        let unicode = crate::font::embed::gid_to_unicode(&parsed);
+        let advances = crate::font::embed::scaled_advances(parsed);
+        let unicode = crate::font::embed::gid_to_unicode(parsed);
         let tounicode = crate::font::embed::to_unicode_cmap(&unicode);
 
-        // Five consecutive ids: FontFile2, FontDescriptor, CIDFont, Type0, ToUnicode.
+        // Five consecutive ids: FontFile, FontDescriptor, CIDFont, Type0, ToUnicode.
         let ff_id = (self.next_object_number(), 0u16);
         let fd_id = (ff_id.0 + 1, 0u16);
         let cid_id = (ff_id.0 + 2, 0u16);
         let t0_id = (ff_id.0 + 3, 0u16);
         let tu_id = (ff_id.0 + 4, 0u16);
 
-        // FontFile2 — the raw program (compressed later by save_compressed).
+        // The raw font program (compressed later by save_compressed). glyf goes in
+        // FontFile2 (with Length1); CFF/OpenType in FontFile3 (/Subtype /OpenType).
         let mut ff = Dictionary::new();
-        ff.set(b"Length".to_vec(), Object::Integer(ttf.len() as i64));
-        ff.set(b"Length1".to_vec(), Object::Integer(ttf.len() as i64));
+        ff.set(b"Length".to_vec(), Object::Integer(program.len() as i64));
+        let ff_key: &[u8] = if is_cff {
+            ff.set(b"Subtype".to_vec(), annot::name(b"OpenType"));
+            b"FontFile3"
+        } else {
+            ff.set(b"Length1".to_vec(), Object::Integer(program.len() as i64));
+            b"FontFile2"
+        };
         self.objects
-            .insert(ff_id, Object::Stream(Stream::new(ff, ttf.to_vec())));
+            .insert(ff_id, Object::Stream(Stream::new(ff, program.to_vec())));
 
         // FontDescriptor — generic metrics (fine for display; exact values would
         // need OS/2/hhea parsing).
@@ -2643,10 +2755,11 @@ impl Document {
         fd.set(b"Descent", Object::Integer(-200));
         fd.set(b"CapHeight", Object::Integer(700));
         fd.set(b"StemV", Object::Integer(80));
-        fd.set(b"FontFile2", Object::Reference(ff_id));
+        fd.set(ff_key, Object::Reference(ff_id));
         self.objects.insert(fd_id, Object::Dictionary(fd));
 
-        // CIDFontType2 with Identity CIDToGIDMap (CID = GID) and full widths.
+        // Descendant CIDFont — Type2 (TrueType, with Identity CIDToGIDMap) or
+        // Type0 (CFF). Identity ordering + full widths in either case.
         let w_inner: Vec<Object> = advances
             .iter()
             .map(|&w| Object::Integer(w as i64))
@@ -2657,11 +2770,22 @@ impl Document {
         cidsi.set(b"Supplement", Object::Integer(0));
         let mut cid = Dictionary::new();
         cid.set(b"Type", annot::name(b"Font"));
-        cid.set(b"Subtype", annot::name(b"CIDFontType2"));
+        cid.set(
+            b"Subtype",
+            annot::name(if is_cff {
+                b"CIDFontType0"
+            } else {
+                b"CIDFontType2"
+            }),
+        );
         cid.set(b"BaseFont", annot::name(ps_name.as_bytes()));
         cid.set(b"CIDSystemInfo", Object::Dictionary(cidsi));
         cid.set(b"FontDescriptor", Object::Reference(fd_id));
-        cid.set(b"CIDToGIDMap", annot::name(b"Identity"));
+        if !is_cff {
+            // CIDToGIDMap is a CIDFontType2-only key (TrueType); CIDFontType0 maps
+            // CID→glyph through the CFF charset.
+            cid.set(b"CIDToGIDMap", annot::name(b"Identity"));
+        }
         cid.set(b"DW", Object::Integer(1000));
         cid.set(
             b"W",
@@ -3028,12 +3152,23 @@ impl Document {
             .get(b"FontDescriptor")
             .map(|o| self.resolve(o))
             .and_then(Object::as_dict)?;
-        let ff = fd
+        // glyf TrueType lives in FontFile2; CFF/OpenType in FontFile3. Read either
+        // so add_text / replace_text resolve the char→GID map for *any* embedded
+        // face (FontFile3 outlines aren't needed — only its cmap/metrics).
+        if let Some(ff) = fd
             .get(b"FontFile2")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)
+        {
+            let bytes = decode_stream(ff).ok()?;
+            return crate::font::truetype::TrueTypeFont::parse(&bytes);
+        }
+        let ff = fd
+            .get(b"FontFile3")
             .map(|o| self.resolve(o))
             .and_then(Object::as_stream)?;
         let bytes = decode_stream(ff).ok()?;
-        crate::font::truetype::TrueTypeFont::parse(&bytes)
+        crate::font::truetype::TrueTypeFont::parse_metrics(&bytes)
     }
 
     /// Subset every embedded Type0 font's `FontFile2` to the glyphs actually
@@ -4628,6 +4763,92 @@ impl Document {
             b"Dest".to_vec(),
             Object::Array(vec![Object::Reference(target_id), annot::name(b"Fit")]),
         );
+        self.append_annotation_dict(page_no, dict)
+    }
+
+    /// Register a **named destination** `name` → `target_page` (a whole-page
+    /// `/Fit` view) in the catalog's `/Dests` dictionary, creating it if needed.
+    /// Links and outline items can then jump by name via
+    /// [`add_goto_link_named`](Self::add_goto_link_named); because resolution
+    /// goes through the catalog (not a frozen page number), the anchor survives
+    /// page extraction/split as long as its page is kept. Re-using a `name`
+    /// overwrites its target.
+    pub fn add_named_dest(&mut self, name: &str, target_page: u32) -> Result<()> {
+        let target_id = self.page_object_id(target_page)?;
+        let catalog_id = self.catalog_id()?;
+        let dest = Object::Array(vec![Object::Reference(target_id), annot::name(b"Fit")]);
+
+        // `/Dests` may be an indirect reference (mutate that object) or live
+        // inline in the catalog (mutate the catalog). Create it inline if absent.
+        let dests_ref = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .and_then(|c| c.get(b"Dests"))
+            .and_then(Object::as_reference);
+        if let Some(id) = dests_ref {
+            let mut dict = self
+                .objects
+                .get(&id)
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_else(Dictionary::new);
+            dict.set(name.as_bytes().to_vec(), dest);
+            self.objects.insert(id, Object::Dictionary(dict));
+            return Ok(());
+        }
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("catalog".into()))?
+            .clone();
+        let mut dict = catalog
+            .get(b"Dests")
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(Dictionary::new);
+        dict.set(name.as_bytes().to_vec(), dest);
+        catalog.set(b"Dests".to_vec(), Object::Dictionary(dict));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Every named destination in the catalog's `/Dests` dictionary as
+    /// `(name, 1-based page)` pairs (entries that don't resolve to a page are
+    /// skipped). The PDF 1.2+ name-tree form (`/Names /Dests`) is honoured by
+    /// link/outline resolution but not enumerated here.
+    pub fn named_dests(&self) -> Vec<(String, u32)> {
+        let Some(dests) = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"Dests").map(|o| self.resolve(o)))
+            .and_then(|o| o.as_dict().cloned())
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (name, value) in &dests.0 {
+            if let Some(page) = self.dest_to_page(value) {
+                out.push((String::from_utf8_lossy(name).into_owned(), page));
+            }
+        }
+        out
+    }
+
+    /// Add an internal hyperlink over `rect` that jumps to the **named
+    /// destination** `dest_name` (define it with [`add_named_dest`]). Unlike
+    /// [`add_goto_link`](Self::add_goto_link) (an explicit page reference), this
+    /// stores `/Dest /dest_name` — the indirection that lets the anchor be
+    /// retargeted and keeps cross-references intact through split/extract.
+    pub fn add_goto_link_named(
+        &mut self,
+        page_no: u32,
+        rect: [f64; 4],
+        dest_name: &str,
+    ) -> Result<()> {
+        let mut dict = Self::base_link_dict(rect);
+        dict.set(b"Dest".to_vec(), annot::name(dest_name.as_bytes()));
         self.append_annotation_dict(page_no, dict)
     }
 
@@ -7354,6 +7575,234 @@ mod tests {
         assert!(
             subttf.glyph_polygons(dropped).is_empty(),
             "in-range unused glyph {dropped} stripped from the subset"
+        );
+    }
+
+    /// A minimal but valid SFNT font with a format-6 cmap mapping `'A'..='Z'` →
+    /// glyph ids `1..=26`. `is_cff` selects an **OpenType-CFF** (`OTTO`, a `CFF `
+    /// stub, no outlines) over a **glyf TrueType** (`0x00010000`, empty
+    /// `glyf`/`loca`). Carries exactly the tables the metrics reader needs
+    /// (`head`/`maxp`/`hhea`/`hmtx`/`cmap`), so `embed_font` routes each flavour
+    /// to its proper FontFile/CIDFont without an external fixture.
+    fn minimal_sfnt(is_cff: bool) -> Vec<u8> {
+        fn b16(v: u16) -> [u8; 2] {
+            v.to_be_bytes()
+        }
+        fn b32(v: u32) -> [u8; 4] {
+            v.to_be_bytes()
+        }
+        let num_glyphs: u16 = 27;
+
+        let mut head = vec![0u8; 54];
+        head[18..20].copy_from_slice(&b16(1000)); // unitsPerEm
+        // indexToLocFormat @50 stays 0 (short loca).
+
+        let mut maxp = vec![0u8; 6];
+        let maxp_ver: u32 = if is_cff { 0x0000_5000 } else { 0x0001_0000 };
+        maxp[0..4].copy_from_slice(&b32(maxp_ver)); // 0.5 (CFF) / 1.0 (TrueType)
+        maxp[4..6].copy_from_slice(&b16(num_glyphs));
+
+        let mut hhea = vec![0u8; 36];
+        hhea[34..36].copy_from_slice(&b16(num_glyphs)); // numberOfHMetrics
+
+        let mut hmtx = Vec::new();
+        for _ in 0..num_glyphs {
+            hmtx.extend_from_slice(&b16(500)); // advanceWidth
+            hmtx.extend_from_slice(&b16(0)); // lsb
+        }
+
+        // cmap: header + one (3,1) record → format-6 subtable.
+        let entry_count: u16 = 26;
+        let mut sub = Vec::new();
+        sub.extend_from_slice(&b16(6)); // format
+        sub.extend_from_slice(&b16(10 + entry_count * 2)); // length
+        sub.extend_from_slice(&b16(0)); // language
+        sub.extend_from_slice(&b16(0x41)); // firstCode 'A'
+        sub.extend_from_slice(&b16(entry_count));
+        for g in 1..=entry_count {
+            sub.extend_from_slice(&b16(g)); // 'A'→1, 'B'→2, …
+        }
+        let mut cmap = Vec::new();
+        cmap.extend_from_slice(&b16(0)); // version
+        cmap.extend_from_slice(&b16(1)); // numTables
+        cmap.extend_from_slice(&b16(3)); // platformID Windows
+        cmap.extend_from_slice(&b16(1)); // encodingID BMP Unicode
+        cmap.extend_from_slice(&b32(12)); // offset to subtable (4 header + 8 record)
+        cmap.extend_from_slice(&sub);
+
+        // glyf TrueType needs glyf+loca (empty glyphs); OpenType-CFF needs `CFF `.
+        let mut tables: Vec<(&[u8; 4], Vec<u8>)> = vec![
+            (b"cmap", cmap),
+            (b"head", head),
+            (b"hhea", hhea),
+            (b"hmtx", hmtx),
+            (b"maxp", maxp),
+        ];
+        if is_cff {
+            tables.push((b"CFF ", b"\x01\x00\x04\x01".to_vec()));
+        } else {
+            tables.push((b"glyf", Vec::new())); // all glyphs empty
+            tables.push((b"loca", vec![0u8; (num_glyphs as usize + 1) * 2])); // short
+        }
+
+        let body_start = 12 + tables.len() * 16;
+        let mut dir = Vec::new();
+        let mut body = Vec::new();
+        for (tag, data) in &tables {
+            let off = body_start + body.len();
+            dir.extend_from_slice(*tag);
+            dir.extend_from_slice(&b32(0)); // checksum (parser ignores it)
+            dir.extend_from_slice(&b32(off as u32));
+            dir.extend_from_slice(&b32(data.len() as u32));
+            body.extend_from_slice(data);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(if is_cff { b"OTTO" } else { &[0, 1, 0, 0] }); // sfnt version
+        out.extend_from_slice(&b16(tables.len() as u16));
+        out.extend_from_slice(&[0u8; 6]); // searchRange/entrySelector/rangeShift
+        out.extend_from_slice(&dir);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// A one-page document with **no** existing text — so a single `add_text`
+    /// call leaves its run at index 0 (unlike `txt_to_pdf`, which seeds a run).
+    fn blank_doc() -> Document {
+        let mut b = crate::convert::build::PdfBuilder::new();
+        b.add_page(612.0, 792.0);
+        Document::open(&b.finish()).unwrap()
+    }
+
+    #[test]
+    fn embed_font_handles_opentype_cff() {
+        let otf = minimal_sfnt(true);
+        let mut doc = blank_doc();
+        let font = doc.embed_font("MyCff", &otf).unwrap();
+
+        // The Type0 graph routes a CFF program to FontFile3/CIDFontType0.
+        let t0 = doc.objects.get(&(font, 0)).and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            t0.get(b"Subtype").and_then(Object::as_name),
+            Some(b"Type0".as_slice())
+        );
+        let desc_ref = match &t0.get(b"DescendantFonts").and_then(Object::as_array).unwrap()[0] {
+            Object::Reference(id) => *id,
+            _ => panic!("descendant is a reference"),
+        };
+        let cid = doc.objects.get(&desc_ref).and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            cid.get(b"Subtype").and_then(Object::as_name),
+            Some(b"CIDFontType0".as_slice()),
+            "CFF descendant is CIDFontType0"
+        );
+        assert!(
+            cid.get(b"CIDToGIDMap").is_none(),
+            "CIDFontType0 omits CIDToGIDMap (that key is TrueType-only)"
+        );
+        let fd_ref = match cid.get(b"FontDescriptor").unwrap() {
+            Object::Reference(id) => *id,
+            _ => panic!(),
+        };
+        let fd = doc.objects.get(&fd_ref).and_then(Object::as_dict).unwrap();
+        assert!(fd.get(b"FontFile2").is_none(), "no FontFile2 for CFF");
+        let ff_ref = match fd.get(b"FontFile3").expect("FontFile3 present") {
+            Object::Reference(id) => *id,
+            _ => panic!(),
+        };
+        let ff = doc.objects.get(&ff_ref).and_then(Object::as_stream).unwrap();
+        assert_eq!(
+            ff.dict.get(b"Subtype").and_then(Object::as_name),
+            Some(b"OpenType".as_slice()),
+            "FontFile3 carries /Subtype /OpenType"
+        );
+
+        // add_text resolves the CFF cmap (A→gid1, B→gid2) → 2-byte Identity-H GIDs.
+        doc.add_text(1, 72.0, 700.0, 18.0, "AB", font, [0.0; 3], 1.0, 0.0)
+            .unwrap();
+        let content = doc.page_content(1).unwrap();
+        assert!(
+            has_op(&content, b"<00010002>"),
+            "CFF text drawn as 2-byte glyph ids"
+        );
+
+        // Font-aware replace re-encodes through the same cmap (BA → gid2,gid1).
+        doc.replace_text_run(1, 0, "BA").unwrap();
+        let content = doc.page_content(1).unwrap();
+        assert!(
+            has_op(&content, b"<00020001>"),
+            "replace re-encodes for the CFF font, not WinAnsi"
+        );
+    }
+
+    #[test]
+    fn replace_text_run_reencodes_for_embedded_truetype() {
+        // A run set in an embedded Type0/Identity-H glyf-TrueType face must be
+        // edited through its char→GID map (not WinAnsi). Verified end-to-end: the
+        // edit reads back through the font's /ToUnicode after a save round-trip.
+        let ttf = minimal_sfnt(false);
+        let mut doc = blank_doc();
+        let font = doc.embed_font("Synthetic", &ttf).unwrap();
+        // 'A'..='Z' → glyph ids 1..=26 in this face.
+        doc.add_text(1, 72.0, 700.0, 18.0, "CAB", font, [0.0; 3], 1.0, 0.0)
+            .unwrap();
+        let content = doc.page_content(1).unwrap();
+        assert!(
+            has_op(&content, b"<000300010002>"),
+            "TrueType text drawn as 2-byte glyph ids (C=3,A=1,B=2)"
+        );
+
+        doc.replace_text_run(1, 0, "BAC").unwrap();
+        let re = Document::open(&doc.save()).unwrap();
+        let texts: Vec<String> = re
+            .page_text_runs(1)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+        assert!(texts.iter().any(|t| t == "BAC"), "edited text: {texts:?}");
+        assert!(!texts.iter().any(|t| t == "CAB"), "old text replaced");
+    }
+
+    #[test]
+    fn named_destinations_register_resolve_and_link() {
+        let mut b = crate::convert::build::PdfBuilder::new();
+        for _ in 0..3 {
+            b.add_page(612.0, 792.0);
+        }
+        let mut doc = Document::open(&b.finish()).unwrap();
+        doc.add_named_dest("chapter2", 2).unwrap();
+        doc.add_named_dest("chapter3", 3).unwrap();
+
+        let mut dests = doc.named_dests();
+        dests.sort();
+        assert_eq!(
+            dests,
+            vec![("chapter2".to_string(), 2), ("chapter3".to_string(), 3)]
+        );
+
+        // A link to a named destination resolves to its target page…
+        doc.add_goto_link_named(1, [10.0, 10.0, 50.0, 30.0], "chapter3")
+            .unwrap();
+        assert!(
+            doc.page_links(1)
+                .unwrap()
+                .iter()
+                .any(|l| l.target == LinkTarget::Page(3)),
+            "named link resolves to page 3"
+        );
+
+        // …and both the dests and the named link survive a save round-trip.
+        let re = Document::open(&doc.save()).unwrap();
+        assert_eq!(re.named_dests().len(), 2, "named dests persisted");
+        assert!(
+            re.page_links(1)
+                .unwrap()
+                .iter()
+                .any(|l| l.target == LinkTarget::Page(3)),
+            "named link still resolves after save"
         );
     }
 }

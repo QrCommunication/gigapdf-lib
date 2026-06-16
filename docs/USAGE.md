@@ -256,7 +256,8 @@ const ttfUrl = dec.decode(callBuffer((lp) => ex.gp_parse_css_font_url(c.ptr, c.l
 freeArg(c);
 const ttf = new Uint8Array(await (await fetch(ttfUrl)).arrayBuffer());
 
-// 5. Embed it, then add selectable text in that font.
+// 5. Embed it, then add selectable text in that font. gp_embed_font accepts any
+//    outline file — a glyf .ttf OR an OpenType-CFF .otf (OTTO), auto-detected.
 const f = strArg("Roboto");
 const ttfPtr = toWasm(ttf);
 const fontObj = ex.gp_embed_font(handle, f.ptr, f.len, ttfPtr, ttf.length); // > 0 on success
@@ -277,12 +278,20 @@ const embedded = JSON.parse(dec.decode(callBuffer((lp) => ex.gp_embedded_fonts_j
 const nm = strArg(embedded.find((f) => f.format === "truetype").baseFont);
 const prog = callBuffer((lp) => ex.gp_extract_font(handle, nm.ptr, nm.len, lp)); freeArg(nm);
 //    prog[0] = format tag (1 truetype / 2 cff / 3 type1); prog.slice(1) = the font bytes,
-//    feed back into gp_embed_font to draw new text in the document's own face.
+//    feed back into gp_embed_font to draw new text in the document's own face
+//    (glyf truetype and full OpenType cff re-embed directly).
+
+// 8. Edit text in place — font-aware. A run in an embedded Type0/Identity-H face
+//    (TrueType or OpenType-CFF) is re-encoded through that font's char→glyph map.
+const repl = strArg("Réécrit dans la même police");
+ex.gp_replace_text(handle, 1, 0, repl.ptr, repl.len); // run #0 on page 1
+freeArg(repl);
 ```
 
 > SDK wrappers for the above: `doc.addStandardText(page, x, y, size, text, fontName)`,
-> `doc.embeddedFonts()`, `doc.extractFont(name)`, `doc.embedFont(family, ttf)`,
-> `doc.addText(page, x, y, size, text, fontObj)`.
+> `doc.embeddedFonts()`, `doc.extractFont(name)`, `doc.embedFont(family, font)`
+> (any `.ttf`/`.otf`), `doc.addText(page, x, y, size, text, fontObj)`,
+> `doc.replaceText(page, index, text)` (font-aware).
 
 ## 9. Security: encrypt, sign, PDF/A
 

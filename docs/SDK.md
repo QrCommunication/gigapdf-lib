@@ -119,7 +119,7 @@ try {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `replaceText(page, index, text)` | `boolean` | Replace the text of run `index` in place. |
+| `replaceText(page, index, text)` | `boolean` | Replace the text of run `index` in place. **Font-aware**: a run in an embedded Type0/Identity-H face (TrueType *or* OpenType-CFF) is re-encoded through that font's char→glyph map; base-14/simple fonts use WinAnsi — so it works with **any** font. |
 | `removeElement(page, index)` | `boolean` | Delete a content element. |
 | `moveElement(page, index, dx, dy)` | `boolean` | Translate an element by `(dx, dy)` points. |
 | `duplicateElement(page, index)` | `boolean` | Clone an element. |
@@ -128,7 +128,7 @@ try {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `addText(page, x, y, size, text, fontObj, rgb?, opacity?, rotationDeg?)` | `boolean` | Draw selectable text in an **embedded** font (`fontObj` from `embedFont`/`extractFont`). |
+| `addText(page, x, y, size, text, fontObj, rgb?, opacity?, rotationDeg?)` | `boolean` | Draw selectable text in **any embedded** font (`fontObj` from `embedFont`/`extractFont`) — glyf TrueType or OpenType-CFF, each character encoded through the font's char→glyph map (Identity-H). |
 | `addStandardText(page, x, y, size, text, fontName, rgb?, opacity?, rotationDeg?)` | `boolean` | Draw selectable text in a **built-in base-14** font (no embedding). See [Fonts](#fonts). |
 | `addWatermark(page, x, y, size, text, rgb?, opacity?, rotationDeg?)` | `boolean` | Standard-Helvetica watermark (thin wrapper over `addStandardText`). |
 | `addTextLayer(page, runs)` | `number` | Stamp an invisible (render-mode 3) text layer — e.g. a searchable OCR layer; one content append. Returns runs written. |
@@ -152,19 +152,24 @@ Three ways to draw real, selectable text — **no host font files required**:
    `Courier-Oblique`, `Courier-BoldOblique`, `Symbol`, `ZapfDingbats`. WinAnsi
    encoding (Symbol/ZapfDingbats use their built-in encoding). No embedding —
    every viewer ships these. Several different standard fonts can coexist on one page.
-2. **Any family via embedding** — `embedFont(family, ttf) → fontObj`, then
-   `addText(…, fontObj)`. Builds a Type0/CIDFontType2 font (Identity-H, full
-   widths, `ToUnicode`) from a glyf-based `.ttf`. Feed it a Google Font the host
-   fetched (`fontRequestUrl` → fetch → `parseCssFontUrl` → fetch TTF → `embedFont`)
-   or any `.ttf`.
+2. **Any family via embedding** — `embedFont(family, font) → fontObj`, then
+   `addText(…, fontObj)`. Accepts **any outline font file** — the flavour is
+   auto-detected: a glyf **TrueType** (`.ttf`) becomes a Type0/CIDFontType2 +
+   `FontFile2`; an **OpenType-CFF** (`.otf`/`OTTO`) becomes a Type0/CIDFontType0
+   + `FontFile3` `/Subtype /OpenType`. Either way it's Identity-H with a full
+   `/W` width array and a `/ToUnicode` CMap. Feed it a Google Font the host
+   fetched (`fontRequestUrl` → fetch → `parseCssFontUrl` → fetch the program →
+   `embedFont`) or any `.ttf`/`.otf`.
 3. **The document's own embedded fonts** — `embeddedFonts()` lists `{ baseFont,
-   format }`; `extractFont(name)` pulls a font's raw bytes out. `truetype`
-   re-embeds directly via `embedFont`; `cff`/`type1` need a TTF conversion. Lets
-   you re-bake edited text in the **exact original face**.
+   format }`; `extractFont(name)` pulls a font's raw bytes out. `truetype` (glyf)
+   and full OpenType `cff` (`OTTO`) re-embed directly via `embedFont`; bare `cff`
+   (Type1C) and `type1` are read-only. Lets you re-bake edited text in the
+   **exact original face** — `addText` and `replaceText` resolve its char→glyph
+   map from `FontFile2` or `FontFile3`.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `embedFont(family, ttf)` | `number` | Embed a TrueType program; returns the font handle for `addText` (`0` on failure). |
+| `embedFont(family, font)` | `number` | Embed **any** outline program — glyf TrueType (`.ttf`) or OpenType-CFF (`.otf`), auto-detected; returns the font handle for `addText` (`0` on failure). |
 | `addText(…)` / `addStandardText(…)` | `boolean` | See [Drawing](#drawing-new-content). |
 | `embeddedFonts()` | `EmbeddedFont[]` | List the fonts the PDF embeds (`{ baseFont, format: "truetype"\|"cff"\|"type1" }`). |
 | `extractFont(name)` | `{ format, bytes } \| null` | Pull an embedded font's program out by (fuzzy) `/BaseFont` name. |
@@ -211,7 +216,10 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 |--------|---------|-------------|
 | `links(page)` | `LinkInfo[]` | Hyperlinks with `{ x0,y0,x1,y1, kind: "uri"\|"page"\|"unknown", uri?, page? }`. |
 | `addUriLink(page, x0, y0, x1, y1, uri)` | `boolean` | External URL link over a rect. |
-| `addGotoLink(page, x0, y0, x1, y1, targetPage)` | `boolean` | Internal "jump to page" link. |
+| `addGotoLink(page, x0, y0, x1, y1, targetPage)` | `boolean` | Internal "jump to page" link (explicit page reference). |
+| `addNamedDest(name, targetPage)` | `boolean` | Register a named destination `name` → page (a `/Fit` view) in the catalog `/Dests`. Resolves through the catalog, so it survives split/extract while its page is kept. |
+| `namedDests()` | `NamedDest[]` | The catalog's named destinations as `{ name, page }` pairs. |
+| `addGotoLinkNamed(page, x0, y0, x1, y1, name)` | `boolean` | Internal link that jumps to a **named** destination (`/Dest /name`) — the retargetable, split-safe alternative to `addGotoLink`. |
 | `layers()` | `LayerInfo[]` | Optional-content groups (calques) `{ id, name, visible, locked }`. |
 | `addLayer(name)` | `number` | Create a layer; returns its id (`0` on error). |
 | `setLayerVisibility(id, visible)` / `setLayerLocked(id, locked)` | `boolean` | Toggle a layer. |
@@ -273,7 +281,7 @@ All result/option shapes are exported interfaces — import them for typed code:
 import type {
   FontInfo, EmbeddedFont, PageInfo, TextLine, TextRunInfo, Element,
   SearchHit, OcrWord, AnnotationInfo, FieldInfo, FieldStyle, LinkInfo,
-  LayerInfo, OutlineEntry, HtmlFontRequest, HtmlFont, SignP12Options,
+  LayerInfo, OutlineEntry, NamedDest, HtmlFontRequest, HtmlFont, SignP12Options,
 } from "@qrcommunication/gigapdf-lib";
 ```
 

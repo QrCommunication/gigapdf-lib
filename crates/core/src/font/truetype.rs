@@ -56,6 +56,19 @@ struct CmapSub {
 impl TrueTypeFont {
     /// Parse a font program. Returns `None` if the essential tables are absent.
     pub fn parse(bytes: &[u8]) -> Option<TrueTypeFont> {
+        Self::parse_internal(bytes, true)
+    }
+
+    /// Like [`parse`](Self::parse) but tolerates a missing `glyf`/`loca` — for
+    /// OpenType-CFF (`OTTO`) fonts whose outlines live in the `CFF ` table. The
+    /// result is usable for `units_per_em`, `num_glyphs`, `advance_width` and
+    /// cmap lookups; glyph-outline methods return empty. Used to read widths and
+    /// the char→GID map when embedding/encoding a CFF OpenType font.
+    pub fn parse_metrics(bytes: &[u8]) -> Option<TrueTypeFont> {
+        Self::parse_internal(bytes, false)
+    }
+
+    fn parse_internal(bytes: &[u8], require_glyf: bool) -> Option<TrueTypeFont> {
         let data = bytes.to_vec();
         // `ttcf` collections: use the first font.
         let base = if &data.get(0..4)? == b"ttcf" {
@@ -80,22 +93,31 @@ impl TrueTypeFont {
 
         let head = tables.get(b"head")?.0;
         let maxp = tables.get(b"maxp")?.0;
-        let (glyf, _) = *tables.get(b"glyf")?;
-        let loca_off = tables.get(b"loca")?.0;
-
         let units_per_em = be16(&data, head + 18).max(1);
         let index_to_loc = bei16(&data, head + 50);
         let num_glyphs = be16(&data, maxp + 4);
 
-        let mut loca = Vec::with_capacity(num_glyphs as usize + 1);
-        for i in 0..=num_glyphs as usize {
-            let v = if index_to_loc == 0 {
-                be16(&data, loca_off + i * 2) as u32 * 2
-            } else {
-                be32(&data, loca_off + i * 4)
-            };
-            loca.push(v);
-        }
+        // `glyf`/`loca` are absent in CFF OpenType — optional unless required.
+        let (glyf, loca) = match (tables.get(b"glyf").copied(), tables.get(b"loca").copied()) {
+            (Some((glyf, _)), Some((loca_off, _))) => {
+                let mut loca = Vec::with_capacity(num_glyphs as usize + 1);
+                for i in 0..=num_glyphs as usize {
+                    let v = if index_to_loc == 0 {
+                        be16(&data, loca_off + i * 2) as u32 * 2
+                    } else {
+                        be32(&data, loca_off + i * 4)
+                    };
+                    loca.push(v);
+                }
+                (glyf, loca)
+            }
+            _ => {
+                if require_glyf {
+                    return None;
+                }
+                (0usize, Vec::new())
+            }
+        };
 
         let (hmtx, num_h_metrics) = match (tables.get(b"hmtx"), tables.get(b"hhea")) {
             (Some(&(h, _)), Some(&(hhea, _))) => (h, be16(&data, hhea + 34)),

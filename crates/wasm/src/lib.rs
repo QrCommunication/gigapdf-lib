@@ -404,6 +404,8 @@ pub extern "C" fn gp_element_at(handle: *const Document, page: u32, x: f64, y: f
 // ─── editing ─────────────────────────────────────────────────────────────────
 
 /// Replace text run `index` on `page` with the UTF-8 text at `text_ptr`.
+/// Font-aware: a Type0/Identity-H run (embedded TrueType or OpenType-CFF) is
+/// re-encoded through the font's char→glyph map; simple fonts use WinAnsi.
 /// Returns 0 on success, negative on error.
 #[no_mangle]
 pub extern "C" fn gp_replace_text(
@@ -1583,7 +1585,8 @@ pub extern "C" fn gp_office_to_pdf(
 //
 // The WASM sandbox has no network. The engine ships the catalog, computes the
 // Google Fonts URL, and parses the CSS the host fetched; the HOST performs the
-// HTTP download and hands TTF bytes back to gp_embed_font, which bakes them in.
+// HTTP download and hands the font bytes back to gp_embed_font, which bakes them
+// in — glyf TrueType (.ttf) or OpenType-CFF (.otf), flavour auto-detected.
 
 /// The font catalog as a JSON array of `{family, category, google, weights}`.
 #[no_mangle]
@@ -1657,8 +1660,9 @@ pub extern "C" fn gp_needed_fonts(handle: *const Document, out_len: *mut usize) 
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
-/// Embed a downloaded TrueType program (`family` + raw `.ttf` bytes) as a Type0
-/// font. Returns the font's object number (pass to `gp_add_text`), or 0 on error.
+/// Embed a downloaded outline font (`family` + raw bytes) as a Type0 font —
+/// glyf **TrueType** (`.ttf`) or **OpenType-CFF** (`.otf`/`OTTO`), auto-detected.
+/// Returns the font's object number (pass to `gp_add_text`), or 0 on error.
 #[no_mangle]
 pub extern "C" fn gp_embed_font(
     handle: *mut Document,
@@ -2235,6 +2239,61 @@ pub extern "C" fn gp_add_goto_link(
 ) -> i32 {
     edit(handle, |doc| {
         doc.add_goto_link(page, [x0, y0, x1, y1], target_page)
+    })
+}
+
+/// Register a named destination `name` → `target_page` (a `/Fit` view) in the
+/// catalog's `/Dests`. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_add_named_dest(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    target_page: u32,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    edit(handle, |doc| doc.add_named_dest(name, target_page))
+}
+
+/// The catalog's named destinations as a JSON array `[{name,page}]`. Host frees
+/// the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_named_dests_json(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let mut s = String::from("[");
+            for (i, (name, page)) in doc.named_dests().iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let n = name.replace('\\', "\\\\").replace('"', "\\\"");
+                s.push_str(&format!("{{\"name\":\"{n}\",\"page\":{page}}}"));
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Add an internal hyperlink over a rectangle that jumps to the named
+/// destination `name` (define it with `gp_add_named_dest`). 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_goto_link_named(
+    handle: *mut Document,
+    page: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    edit(handle, |doc| {
+        doc.add_goto_link_named(page, [x0, y0, x1, y1], name)
     })
 }
 

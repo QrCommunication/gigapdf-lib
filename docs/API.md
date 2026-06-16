@@ -35,7 +35,7 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `page_text_runs(page) -> Vec<TextRun>` | `gp_text_runs_json(handle,page,outlen)` |
 | `page_elements(page) -> Vec<ContentElement>` | `gp_elements_json(handle,page,outlen)` |
 | `element_at(page,x,y) -> Option<usize>` | `gp_element_at(handle,page,x,y)` |
-| `replace_text_run(page,i,&str)` | `gp_replace_text(handle,page,i,ptr,len)` |
+| `replace_text_run(page,i,&str)` (font-aware: re-encodes Type0/Identity-H runs through the font's char→glyph map) | `gp_replace_text(handle,page,i,ptr,len)` |
 | `remove_text_run(page,i)` / `remove_element(page,i)` | `gp_remove_element(handle,page,i)` |
 | `move_element(page,i,dx,dy)` | `gp_move_element(handle,page,i,dx,dy)` |
 | `duplicate_element(page,i)` | `gp_duplicate_element(handle,page,i)` |
@@ -52,7 +52,7 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | Rust | WASM |
 |------|------|
 | `add_text_standard(page,x,y,size,text,font_name,rgb,opacity,rot)` | `gp_add_text_standard(handle,page,x,y,size,ptr,len,fontptr,fontlen,rgb,opacity,rot)` |
-| `embed_truetype_font(family,&ttf) -> u32` | `gp_embed_font(handle,famptr,famlen,ttfptr,ttflen) -> u32` |
+| `embed_font(family,&bytes) -> u32` (glyf TrueType **or** OpenType-CFF, auto-detected; `embed_truetype_font` is a kept alias) | `gp_embed_font(handle,famptr,famlen,ttfptr,ttflen) -> u32` |
 | `add_text(page,x,y,size,text,font_obj,rgb)` | `gp_add_text(handle,page,x,y,size,ptr,len,font_obj,rgb)` |
 | `embedded_fonts() -> Vec<EmbeddedFontInfo>` | `gp_embedded_fonts_json(handle,outlen)` |
 | `extract_font_program(name) -> Option<(Vec<u8>,fmt)>` | `gp_extract_font(handle,nameptr,namelen,outlen)` |
@@ -67,15 +67,19 @@ Three complementary ways to draw real, selectable text — no host font files ne
    (`Helvetica`/`Times`/`Courier` × 4 styles, `Symbol`, `ZapfDingbats`). No
    embedding; every viewer ships them. Several different standard fonts can
    coexist on one page.
-2. **Any family via TrueType embedding** — `embed_truetype_font` builds a Type0 /
-   CIDFontType2 font (Identity-H, full widths, `ToUnicode`) from a glyf-based
-   `.ttf`, then `add_text` writes text in it. Feed it a Google Font the host
-   fetched (`font::google::css_url` → download → embed) or any `.ttf`.
+2. **Any family via embedding** — `embed_font` accepts **any** outline program
+   and auto-detects the flavour: a glyf `.ttf` → Type0 / CIDFontType2 +
+   `FontFile2`; an OpenType-CFF `.otf` (`OTTO`) → Type0 / CIDFontType0 +
+   `FontFile3` `/Subtype /OpenType`. Both are Identity-H with full `/W` widths
+   and a `/ToUnicode` CMap; `add_text` then writes text in it. Feed it a Google
+   Font the host fetched (`font::google::css_url` → download → embed) or any
+   `.ttf`/`.otf`. (`embed_truetype_font` remains as an alias.)
 3. **The document's own embedded fonts** — `embedded_fonts` lists the faces a PDF
    already carries (`{base_font, format}`); `extract_font_program` pulls a font's
-   raw bytes out (`truetype` re-embeds directly with `embed_truetype_font`;
-   `cff`/`type1` need conversion), so you can re-bake edited text in the exact
-   original face.
+   raw bytes out. `truetype` (glyf) and full OpenType `cff` (`OTTO`) re-embed
+   directly with `embed_font`; bare `cff` (Type1C) and `type1` are read-only.
+   `add_text`/`replace_text_run` resolve the char→glyph map from `FontFile2`
+   **or** `FontFile3`, so you can re-bake edited text in the exact original face.
 
 ## Annotations & forms
 
@@ -112,6 +116,8 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `extract_pages(&[u32]) -> Vec<u8>` | `gp_extract_pages(handle,ptr,count,outlen)` |
 | `append_pages_from(&[u8])` | `gp_append_pages(handle,ptr,len)` |
 | `add_uri_link(page,rect,uri)` / `add_goto_link(page,rect,target)` | `gp_add_uri_link / gp_add_goto_link` |
+| `add_named_dest(name,target)` / `named_dests() -> Vec<(String,u32)>` | `gp_add_named_dest(handle,nameptr,namelen,target) / gp_named_dests_json(handle,outlen)` |
+| `add_goto_link_named(page,rect,name)` (jumps to a `/Dest /name`; split-safe) | `gp_add_goto_link_named(handle,page,x0,y0,x1,y1,nameptr,namelen)` |
 | `page_links(page)` | `gp_links_json(handle,page,outlen)` |
 | `set_outline(&[(title,page,level)])` / `outline_items()` | `gp_set_outline(handle,ptr,len) / gp_outline_json` |
 | `get_metadata(key)` / `set_metadata(key,val)` | `gp_get_metadata / gp_set_metadata` |

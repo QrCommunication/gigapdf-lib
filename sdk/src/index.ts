@@ -460,7 +460,11 @@ export interface FontInfo {
 export interface EmbeddedFont {
   /** The `/BaseFont` name (may carry a `ABCDEF+` subset prefix). */
   baseFont: string;
-  /** Embedded program format. `truetype` re-embeds directly via `embedFont`. */
+  /**
+   * Embedded program format. `truetype` (glyf) and a full OpenType `cff`
+   * (`OTTO`) re-embed directly via {@link GigaPdfDoc.embedFont}; bare `cff`
+   * (Type1C) and `type1` are read-only here.
+   */
   format: "truetype" | "cff" | "type1";
 }
 export interface Box {
@@ -559,6 +563,11 @@ export interface OutlineEntry {
   level: number;
   title: string;
   page?: number;
+}
+/** A named destination from {@link GigaPdfDoc.namedDests}: a name → page anchor. */
+export interface NamedDest {
+  name: string;
+  page: number;
 }
 /** An optional-content layer (calque): toggle `visible`/`locked` to persist in the PDF. */
 export interface LayerInfo {
@@ -663,6 +672,12 @@ export class GigaPdfDoc {
   }
 
   // editing
+  /**
+   * Replace text run `index` on `page` with `text`. Font-aware: works with
+   * **any** font — a run set in an embedded Type0/Identity-H face (TrueType or
+   * OpenType-CFF) is re-encoded through that font's char→glyph map; base-14 and
+   * simple fonts use WinAnsi. Returns `false` if the run/page doesn't exist.
+   */
   replaceText(page: number, index: number, text: string): boolean {
     return (
       this.g._withStr(text, (p, l) => this.ex().gp_replace_text(this.h, page, index, p, l)) === 0
@@ -950,16 +965,32 @@ export class GigaPdfDoc {
     return this.g._buffer((o) => this.ex().gp_render_page(this.h, page, scale, o));
   }
 
-  // fonts — embed a downloaded TTF, then add real selectable text
-  embedFont(family: string, ttf: Uint8Array): number {
+  // fonts — embed a downloaded font, then add real selectable text
+  /**
+   * Embed an outline font program as a Type0 font and return its object number
+   * (pass to {@link addText} / re-encoded by {@link replaceText}). Accepts
+   * **any** font file — glyf **TrueType** (`.ttf`) or **OpenType-CFF**
+   * (`.otf`/`OTTO`), flavour auto-detected — so `font` may be a Google Font the
+   * host fetched, an `.otf` you supply, or a face pulled out of a document with
+   * {@link extractFont}. Returns 0 on a malformed/unsupported program.
+   */
+  embedFont(family: string, font: Uint8Array): number {
     const b = enc.encode(family);
     const famPtr = this.g._toWasm(b);
-    const obj = this.g._withBytes(ttf, (p, l) =>
+    const obj = this.g._withBytes(font, (p, l) =>
       this.ex().gp_embed_font(this.h, famPtr, b.length, p, l)
     );
     this.g._free(famPtr, b.length);
     return obj;
   }
+  /**
+   * Draw real, selectable text at `(x, y)` (PDF points, origin bottom-left) in a
+   * font embedded with {@link embedFont} (`fontObj`). Works with **any** embedded
+   * face — glyf TrueType or OpenType-CFF — encoding each character through the
+   * font's char→glyph map (Identity-H, 2-byte glyph ids). `rgb` is packed
+   * `0xRRGGBB`; `rotationDeg` rotates CCW about `(x, y)`. For a built-in base-14
+   * family with no embedding, use {@link addStandardText}.
+   */
   addText(
     page: number,
     x: number,
@@ -1432,6 +1463,42 @@ export class GigaPdfDoc {
     targetPage: number
   ): boolean {
     return this.ex().gp_add_goto_link(this.h, page, x0, y0, x1, y1, targetPage) === 0;
+  }
+  /**
+   * Register a named destination `name` → `targetPage` (a whole-page `/Fit`
+   * view) in the catalog. Links and bookmarks can then jump by name via
+   * {@link addGotoLinkNamed}; because resolution goes through the catalog (not a
+   * frozen page number), the anchor survives page extraction/split as long as
+   * its page is kept. Re-using a `name` overwrites its target.
+   */
+  addNamedDest(name: string, targetPage: number): boolean {
+    return (
+      this.g._withStr(name, (p, l) => this.ex().gp_add_named_dest(this.h, p, l, targetPage)) === 0
+    );
+  }
+  /** The catalog's named destinations as `{name, page}` pairs. */
+  namedDests(): NamedDest[] {
+    return this.g._json((o) => this.ex().gp_named_dests_json(this.h, o));
+  }
+  /**
+   * Add an internal hyperlink over a rectangle that jumps to the named
+   * destination `name` (define it with {@link addNamedDest}). Unlike
+   * {@link addGotoLink} (an explicit page), this stores `/Dest /name`, keeping
+   * cross-references intact through split/extract.
+   */
+  addGotoLinkNamed(
+    page: number,
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+    name: string
+  ): boolean {
+    return (
+      this.g._withStr(name, (p, l) =>
+        this.ex().gp_add_goto_link_named(this.h, page, x0, y0, x1, y1, p, l)
+      ) === 0
+    );
   }
 
   // optional-content layers (calques): list + show/hide + lock/unlock + remove

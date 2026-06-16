@@ -4,6 +4,31 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.18.0] - 2026-06-16
+
+### Added
+
+- **Text in *any* font — OpenType-CFF embedding.** `embedFont(family, font)`
+  (Rust `embed_font`, alias `embed_truetype_font`) now accepts **any** outline
+  program and auto-detects the flavour: a glyf `.ttf` embeds as Type0 /
+  CIDFontType2 + `FontFile2` (as before), and an **OpenType-CFF** `.otf`
+  (`OTTO`) embeds as Type0 / CIDFontType0 + `FontFile3` `/Subtype /OpenType`.
+  Both are Identity-H with a full `/W` width array and a `/ToUnicode` CMap, so
+  `addText` draws selectable, copy-able text in `.otf` fonts too.
+- **Font-aware text editing.** `replaceText` (Rust `replace_text_run`) is now
+  font-aware: a run set in an embedded Type0/Identity-H face (TrueType **or**
+  OpenType-CFF) is re-encoded through that font's char→glyph map — so **modify**
+  works with any font, not just base-14/WinAnsi. `addText` and `replaceText`
+  also resolve a document's *own* embedded faces from `FontFile2` **or**
+  `FontFile3`, completing "draw/edit text in the exact original face".
+- **Named destinations.** `addNamedDest(name, page)`, `namedDests()` and
+  `addGotoLinkNamed(page, x0,y0,x1,y1, name)` (Rust `add_named_dest` /
+  `named_dests` / `add_goto_link_named`; ABI `gp_add_named_dest`,
+  `gp_named_dests_json`, `gp_add_goto_link_named`) register and link to catalog
+  `/Dests` by name. Resolution goes through the catalog, so a named anchor is
+  retargetable and survives page split/extract while its page is kept. New
+  `NamedDest` type.
+
 ## [0.17.0] - 2026-06-16
 
 ### Added

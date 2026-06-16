@@ -388,21 +388,60 @@ pub fn remove_text_run(content: &[u8], index: usize) -> Result<Vec<u8>> {
 }
 
 /// Replace the `index`-th text run's text, keeping its position and font.
+/// WinAnsi single-byte encoding — correct for base-14 and simple TrueType fonts.
+/// Type0/Identity-H runs (2-byte glyph ids) must use
+/// [`replace_text_run_encoded`] with pre-encoded glyph bytes.
 pub fn replace_text_run(content: &[u8], index: usize, new_text: &str) -> Result<Vec<u8>> {
+    replace_text_run_encoded(content, index, encode_single_byte(new_text), StringKind::Literal)
+}
+
+/// Replace the `index`-th text run's operand with **pre-encoded** bytes,
+/// preserving its position and font. `kind` selects the on-wire form: `Hex`
+/// (`<...>`) for 2-byte CID/Identity-H glyph ids (bytes round-trip exactly,
+/// embedded NULs and all), `Literal` (`(...)`) for single-byte WinAnsi. This is
+/// the font-agnostic primitive behind text editing — the caller (the
+/// [`Document`](crate::Document) layer) inspects the run's font and encodes
+/// accordingly so modify works with *any* font.
+pub fn replace_text_run_encoded(
+    content: &[u8],
+    index: usize,
+    encoded: Vec<u8>,
+    kind: StringKind,
+) -> Result<Vec<u8>> {
     let mut operations = parse_content(content)?;
     let pos = nth_text_run(&operations, index)?;
-    let encoded = encode_single_byte(new_text);
+    let operand = Object::String(encoded, kind);
     let operation = &mut operations[pos];
     if operation.operator == b"Tj" {
-        operation.operands = vec![Object::String(encoded, StringKind::Literal)];
+        operation.operands = vec![operand];
     } else {
         // TJ: collapse the positioned array to a single string.
-        operation.operands = vec![Object::Array(vec![Object::String(
-            encoded,
-            StringKind::Literal,
-        )])];
+        operation.operands = vec![Object::Array(vec![operand])];
     }
     Ok(encode_content(&operations))
+}
+
+/// The font **resource name** (the `Tf` operand, e.g. `b"GF7"`) in effect for
+/// the `index`-th text run, or `None` if no font was selected before it. Lets
+/// the [`Document`](crate::Document) layer resolve the run's font object and
+/// encode a replacement for the right font program (simple vs Type0).
+pub fn text_run_font_name(content: &[u8], index: usize) -> Result<Option<Vec<u8>>> {
+    let operations = parse_content(content)?;
+    let mut current: Option<Vec<u8>> = None;
+    let mut seen = 0usize;
+    for op in &operations {
+        if op.operator == b"Tf" {
+            if let Some(Object::Name(name)) = op.operands.first() {
+                current = Some(name.clone());
+            }
+        } else if is_text_show(&op.operator) {
+            if seen == index {
+                return Ok(current);
+            }
+            seen += 1;
+        }
+    }
+    Err(EngineError::Missing(format!("text run #{index}")))
 }
 
 // ─── shape / image / element operations ──────────────────────────────────────
