@@ -135,9 +135,16 @@ describe("@qrcommunication/gigapdf-lib", () => {
 
   it("signs with a PKCS#12 identity (native import, no node-forge)", () => {
     const doc = giga.open(giga.txtToPdf("Sign me with a real cert"));
-    const signed = doc.signP12(MODERN_P12, "gigapdf", "Tester\tApproval\tD:20260616120000Z");
+    const signed = doc.signP12(MODERN_P12, "gigapdf", {
+      name: "Tester",
+      reason: "Approval",
+      date: "D:20260616120000Z",
+      location: "Paris",
+    });
     expect(new TextDecoder().decode(signed.slice(0, 5))).toBe("%PDF-");
-    expect(new TextDecoder().decode(signed).includes("adbe.pkcs7.detached")).toBe(true);
+    const text = new TextDecoder().decode(signed);
+    expect(text.includes("adbe.pkcs7.detached")).toBe(true);
+    expect(text.includes("/Location")).toBe(true);
     // The signed PDF re-opens as a structurally valid document.
     const reopened = giga.open(signed);
     expect(reopened.pageCount()).toBe(1);
@@ -147,7 +154,7 @@ describe("@qrcommunication/gigapdf-lib", () => {
 
   it("rejects a wrong PKCS#12 password with a generic error", () => {
     const doc = giga.open(giga.txtToPdf("x"));
-    expect(() => doc.signP12(MODERN_P12, "wrong", "T\tR\tD:20260616120000Z")).toThrow(
+    expect(() => doc.signP12(MODERN_P12, "wrong", { reason: "R" })).toThrow(
       /PKCS#12 signing failed/
     );
     doc.close();

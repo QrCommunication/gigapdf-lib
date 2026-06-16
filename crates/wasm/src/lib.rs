@@ -214,9 +214,10 @@ pub extern "C" fn gp_sign(
 
 /// Digitally sign the document with an identity imported from a PKCS#12
 /// (`.p12`/`.pfx`) file — a CA-issued / eIDAS certificate and its RSA key.
-/// `p12` is the raw file; `password` its passphrase (UTF-8); `fields` is three
-/// tab-separated values: `name\treason\tdate` (`date` a PDF date string,
-/// `D:YYYYMMDDHHMMSSZ`). Buffer-returning (host frees); null on error (wrong
+/// `p12` is the raw file; `password` its passphrase (UTF-8); `fields` is five
+/// tab-separated values: `name\treason\tdate\tlocation\tcontactInfo` (`date` a
+/// PDF date string, `D:YYYYMMDDHHMMSSZ`; the last two are optional `/Location`
+/// and `/ContactInfo`). Buffer-returning (host frees); null on error (wrong
 /// password, malformed file, unsupported cipher, or no usable certificate).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -247,11 +248,13 @@ pub extern "C" fn gp_sign_p12(
     if parts.len() < 3 {
         return std::ptr::null_mut();
     }
+    let location = parts.get(3).copied().unwrap_or("");
+    let contact = parts.get(4).copied().unwrap_or("");
     let identity = match gigapdf_core::sign::pkcs12::parse(p12, password) {
         Ok(id) => id,
         Err(_) => return std::ptr::null_mut(),
     };
-    match doc.sign_p12(&identity, parts[0], parts[1], parts[2]) {
+    match doc.sign_p12(&identity, parts[0], parts[1], parts[2], location, contact) {
         Ok(pdf) => unsafe { bytes_into_host(pdf, out_len) },
         Err(_) => std::ptr::null_mut(),
     }

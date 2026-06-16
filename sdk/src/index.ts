@@ -482,6 +482,19 @@ export interface TextRunInfo {
   operator: string;
   text: string;
 }
+/** Signature-dictionary metadata for {@link GigaPdfDoc.signP12}. */
+export interface SignP12Options {
+  /** `/Name` — human-readable signer name. */
+  name?: string;
+  /** `/Reason` — why the document is being signed. */
+  reason?: string;
+  /** `/M` — signing time as a PDF date string, e.g. `D:20260616120000Z`. */
+  date?: string;
+  /** `/Location` — physical or logical signing location. */
+  location?: string;
+  /** `/ContactInfo` — how to reach the signer. */
+  contactInfo?: string;
+}
 /** A markup annotation (rect corners in PDF user space). */
 export interface AnnotationInfo {
   index: number;
@@ -1114,12 +1127,21 @@ export class GigaPdfDoc {
   }
   /**
    * Sign with a PKCS#12 (`.p12`/`.pfx`) identity — a CA-issued / eIDAS
-   * certificate and its RSA key, imported natively (no external crypto). `fields`
-   * is three tab-separated values: `name\treason\tdate` (`date` a PDF date
-   * string, e.g. `D:20260616120000Z`). Throws a single generic error on a wrong
-   * password, malformed file, unsupported cipher, or missing certificate.
+   * certificate and its RSA key, imported natively (no external crypto). `opts`
+   * populates the signature dictionary: `name` (`/Name`), `reason` (`/Reason`),
+   * `date` (`/M`, a PDF date string e.g. `D:20260616120000Z`), and the optional
+   * `location` (`/Location`) and `contactInfo` (`/ContactInfo`). Throws a single
+   * generic error on a wrong password, malformed file, unsupported cipher, or
+   * missing certificate.
    */
-  signP12(p12: Uint8Array, password: string, fields: string): Uint8Array {
+  signP12(p12: Uint8Array, password: string, opts: SignP12Options = {}): Uint8Array {
+    const fields = [
+      opts.name ?? "",
+      opts.reason ?? "",
+      opts.date ?? "",
+      opts.location ?? "",
+      opts.contactInfo ?? "",
+    ].join("\t");
     const p12Ptr = this.g._toWasm(p12);
     const out = this.g._withStr(password, (pwP, pwL) =>
       this.g._withStr(fields, (fP, fL) =>

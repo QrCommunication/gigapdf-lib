@@ -301,21 +301,27 @@ impl Document {
         reason: &str,
         date: &str,
     ) -> Result<Vec<u8>> {
-        self.sign_with(name, reason, date, |signed| signer.detached_cms(signed))
+        self.sign_with(name, reason, date, "", "", |signed| {
+            signer.detached_cms(signed)
+        })
     }
 
     /// Digitally sign the document with a user-supplied identity imported from a
     /// PKCS#12 (`.p12`/`.pfx`) file — a CA-issued / eIDAS-capable certificate and
     /// its RSA key. Same `adbe.pkcs7.detached` machinery as [`sign`](Self::sign),
     /// but the embedded certificate (and the `SignerInfo` it is referenced by) is
-    /// the imported one. Errors if the identity has no certificate or its
-    /// issuer/serial can't be read.
+    /// the imported one. `location`/`contact_info` populate the optional `/Location`
+    /// and `/ContactInfo` signature fields (empty → omitted). Errors if the
+    /// identity has no certificate or its issuer/serial can't be read.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_p12(
         &mut self,
         identity: &crate::sign::pkcs12::Pkcs12Identity,
         name: &str,
         reason: &str,
         date: &str,
+        location: &str,
+        contact_info: &str,
     ) -> Result<Vec<u8>> {
         let cert = identity
             .certificates
@@ -327,7 +333,7 @@ impl Document {
             EngineError::Unsupported("certificate issuer/serial unreadable".into())
         })?;
         let key = identity.key.clone();
-        self.sign_with(name, reason, date, move |signed| {
+        self.sign_with(name, reason, date, location, contact_info, move |signed| {
             crate::sign::detached_cms_external(&key, &cert, signed).unwrap_or_default()
         })
     }
@@ -340,6 +346,8 @@ impl Document {
         name: &str,
         reason: &str,
         date: &str,
+        location: &str,
+        contact_info: &str,
         build_cms: impl FnOnce(&[u8]) -> Vec<u8>,
     ) -> Result<Vec<u8>> {
         const CONTENTS_BYTES: usize = 8192; // room for the CMS (hex = 16384 chars)
@@ -357,6 +365,13 @@ impl Document {
         sig.set(b"Name".to_vec(), lit(name));
         sig.set(b"Reason".to_vec(), lit(reason));
         sig.set(b"M".to_vec(), lit(date));
+        // /Location and /ContactInfo are optional signature metadata.
+        if !location.is_empty() {
+            sig.set(b"Location".to_vec(), lit(location));
+        }
+        if !contact_info.is_empty() {
+            sig.set(b"ContactInfo".to_vec(), lit(contact_info));
+        }
         // 4 × 10-digit numbers → a fixed-width array we can patch in place.
         sig.set(
             b"ByteRange".to_vec(),
@@ -6548,7 +6563,14 @@ mod tests {
 
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let signed = doc
-            .sign_p12(&identity, "GigaPDF Tester", "Approval", "D:20260614120000Z")
+            .sign_p12(
+                &identity,
+                "GigaPDF Tester",
+                "Approval",
+                "D:20260614120000Z",
+                "Paris",
+                "tester@example.com",
+            )
             .unwrap();
 
         assert_eq!(&signed[0..5], b"%PDF-", "valid PDF header");
