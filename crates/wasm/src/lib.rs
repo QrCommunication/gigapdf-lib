@@ -1302,6 +1302,19 @@ pub extern "C" fn gp_decode_png(ptr: *const u8, len: usize, out_len: *mut usize)
     unsafe { bytes_into_host(out, out_len) }
 }
 
+/// Decode a GIF (first frame) to `[w: u32 LE][h: u32 LE][rgba]` (native decoder).
+/// Empty on a malformed stream. Host frees the result.
+#[no_mangle]
+pub extern "C" fn gp_decode_gif(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let out = if ptr.is_null() {
+        Vec::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        frame_image(gigapdf_core::raster::gif::decode_gif(bytes))
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
 // ─── conversions & compression ───────────────────────────────────────────────
 //
 // All buffer-returning (host frees the result). Office exporters reconstruct

@@ -280,6 +280,10 @@ export class GigaPdfEngine {
   decodePng(png: Uint8Array): DecodedImage | null {
     return this._decodeFramed(png, (p, l, o) => this.ex.gp_decode_png(p, l, o));
   }
+  /** Decode a GIF (first frame) to `{ width, height, rgba }`, or `null`. */
+  decodeGif(gif: Uint8Array): DecodedImage | null {
+    return this._decodeFramed(gif, (p, l, o) => this.ex.gp_decode_gif(p, l, o));
+  }
   /** Unpack a `[w:u32 LE][h:u32 LE][rgba]` decode buffer; `null` if empty. */
   _decodeFramed(
     bytes: Uint8Array,

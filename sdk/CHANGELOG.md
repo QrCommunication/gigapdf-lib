@@ -4,6 +4,16 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.24.0] - 2026-06-16
+
+### Added
+
+- **Native GIF decoder** — `decodeGif(bytes)` (ABI `gp_decode_gif`;
+  `raster::gif::decode_gif`). Decodes the first frame (GIF87a/89a): global/local
+  colour table, variable-width LZW, interlacing and a graphic-control
+  transparency index → RGBA. Extends the native image-decode coverage
+  (PNG/JPEG/GIF) so the host can convert GIFs without a third-party library.
+
 ## [0.23.0] - 2026-06-16
 
 ### Added
