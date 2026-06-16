@@ -444,6 +444,206 @@ impl TrueTypeFont {
             }
         }
     }
+
+    /// The component glyph IDs referenced by a composite glyph (empty for simple
+    /// or empty glyphs). Used to keep a composite's parts when subsetting.
+    fn composite_components(&self, gid: u16) -> Vec<u16> {
+        let mut out = Vec::new();
+        let gi = gid as usize;
+        if gi + 1 >= self.loca.len() {
+            return out;
+        }
+        let start = self.glyf + self.loca[gi] as usize;
+        let end = self.glyf + self.loca[gi + 1] as usize;
+        if end <= start || end > self.data.len() || bei16(&self.data, start) >= 0 {
+            return out; // empty or simple glyph
+        }
+        let mut p = start + 10;
+        loop {
+            if p + 4 > self.data.len() {
+                break;
+            }
+            let flags = be16(&self.data, p);
+            out.push(be16(&self.data, p + 2));
+            p += 4;
+            p += if flags & 0x0001 != 0 { 4 } else { 2 }; // ARG_1_AND_2_ARE_WORDS
+            if flags & 0x0008 != 0 {
+                p += 2; // WE_HAVE_A_SCALE
+            } else if flags & 0x0040 != 0 {
+                p += 4; // WE_HAVE_AN_X_AND_Y_SCALE
+            } else if flags & 0x0080 != 0 {
+                p += 8; // WE_HAVE_A_TWO_BY_TWO
+            }
+            if flags & 0x0020 == 0 {
+                break; // no MORE_COMPONENTS
+            }
+        }
+        out
+    }
+
+    /// Build a subsetted copy keeping only the outlines for `used` glyph IDs
+    /// (always including `.notdef` and any composite components). **Glyph IDs are
+    /// preserved** — unused `glyf` entries become zero-length — so Identity-H
+    /// content streams written against the original GIDs stay valid; only the
+    /// outline data shrinks. All other tables are copied verbatim, `loca` is
+    /// rewritten in the long (32-bit) format, and the checksums are recomputed.
+    /// Returns `None` if the font can't be rebuilt.
+    pub fn subset(&self, used: &std::collections::BTreeSet<u16>) -> Option<Vec<u8>> {
+        use std::collections::BTreeSet;
+        let num = self.num_glyphs as usize;
+
+        // 1. Closure over composite components (+ .notdef).
+        let mut keep: BTreeSet<u16> = used
+            .iter()
+            .copied()
+            .filter(|g| (*g as usize) < num)
+            .collect();
+        keep.insert(0);
+        let mut stack: Vec<u16> = keep.iter().copied().collect();
+        while let Some(g) = stack.pop() {
+            for c in self.composite_components(g) {
+                if (c as usize) < num && keep.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+
+        // 2. Rebuild glyf + loca (long format), GIDs preserved.
+        let mut new_glyf: Vec<u8> = Vec::new();
+        let mut new_loca: Vec<u32> = Vec::with_capacity(num + 1);
+        new_loca.push(0);
+        for gid in 0..num {
+            if keep.contains(&(gid as u16)) && gid + 1 < self.loca.len() {
+                let s = self.glyf + self.loca[gid] as usize;
+                let e = self.glyf + self.loca[gid + 1] as usize;
+                if e > s && e <= self.data.len() {
+                    new_glyf.extend_from_slice(&self.data[s..e]);
+                    if !new_glyf.len().is_multiple_of(2) {
+                        new_glyf.push(0); // keep glyphs word-aligned
+                    }
+                }
+            }
+            new_loca.push(new_glyf.len() as u32);
+        }
+        let mut loca_bytes = Vec::with_capacity(new_loca.len() * 4);
+        for &v in &new_loca {
+            loca_bytes.extend_from_slice(&v.to_be_bytes());
+        }
+
+        // 3. Original table directory.
+        let base = if self.data.get(0..4)? == b"ttcf" {
+            be32(&self.data, 12) as usize
+        } else {
+            0
+        };
+        let num_tables = be16(&self.data, base + 4) as usize;
+        let mut out_tables: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+        for i in 0..num_tables {
+            let rec = base + 12 + i * 16;
+            if rec + 16 > self.data.len() {
+                break;
+            }
+            let mut tag = [0u8; 4];
+            tag.copy_from_slice(&self.data[rec..rec + 4]);
+            let off = be32(&self.data, rec + 8) as usize;
+            let len = be32(&self.data, rec + 12) as usize;
+            if off + len > self.data.len() {
+                continue;
+            }
+            let bytes: Vec<u8> = match &tag {
+                b"glyf" => new_glyf.clone(),
+                b"loca" => loca_bytes.clone(),
+                b"head" => {
+                    let mut h = self.data[off..off + len].to_vec();
+                    if h.len() >= 54 {
+                        // Zero checkSumAdjustment (set after assembly); long loca.
+                        h[8..12].fill(0);
+                        h[50] = 0;
+                        h[51] = 1;
+                    }
+                    h
+                }
+                _ => self.data[off..off + len].to_vec(),
+            };
+            out_tables.push((tag, bytes));
+        }
+        if !out_tables.iter().any(|(t, _)| t == b"glyf")
+            || !out_tables.iter().any(|(t, _)| t == b"loca")
+        {
+            return None;
+        }
+        out_tables.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 4. Assemble: 12-byte header + 16*n directory + 4-aligned tables.
+        let n = out_tables.len();
+        let mut entry_selector = 0u16;
+        let mut pow = 1usize;
+        while pow * 2 <= n {
+            pow *= 2;
+            entry_selector += 1;
+        }
+        let search_range = (pow * 16) as u16;
+        let range_shift = (n as u16).wrapping_mul(16).wrapping_sub(search_range);
+
+        let mut offset = 12 + n * 16;
+        // (tag, checksum, offset, padded bytes)
+        let mut placed: Vec<([u8; 4], u32, u32, Vec<u8>)> = Vec::with_capacity(n);
+        for (tag, bytes) in &out_tables {
+            let mut padded = bytes.clone();
+            while !padded.len().is_multiple_of(4) {
+                padded.push(0);
+            }
+            let checksum = table_checksum(&padded);
+            let padded_len = padded.len();
+            placed.push((*tag, checksum, offset as u32, padded));
+            offset += padded_len;
+        }
+
+        let mut out: Vec<u8> = Vec::with_capacity(offset);
+        out.extend_from_slice(&self.data[base..base + 4]); // sfnt version
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+        out.extend_from_slice(&search_range.to_be_bytes());
+        out.extend_from_slice(&entry_selector.to_be_bytes());
+        out.extend_from_slice(&range_shift.to_be_bytes());
+        let mut head_pos = None;
+        for ((tag, bytes), (_, checksum, toff, _)) in out_tables.iter().zip(placed.iter()) {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&checksum.to_be_bytes());
+            out.extend_from_slice(&toff.to_be_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            if tag == b"head" {
+                head_pos = Some(*toff as usize);
+            }
+        }
+        for (_, _, _, padded) in &placed {
+            out.extend_from_slice(padded);
+        }
+
+        // 5. head.checkSumAdjustment = 0xB1B0AFBA - checksum(whole font).
+        if let Some(hp) = head_pos {
+            if hp + 12 <= out.len() {
+                let total = table_checksum(&out);
+                let adj = 0xB1B0_AFBA_u32.wrapping_sub(total);
+                out[hp + 8..hp + 12].copy_from_slice(&adj.to_be_bytes());
+            }
+        }
+
+        Some(out)
+    }
+}
+
+fn table_checksum(data: &[u8]) -> u32 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i < data.len() {
+        let word = ((*data.get(i).unwrap_or(&0) as u32) << 24)
+            | ((*data.get(i + 1).unwrap_or(&0) as u32) << 16)
+            | ((*data.get(i + 2).unwrap_or(&0) as u32) << 8)
+            | (*data.get(i + 3).unwrap_or(&0) as u32);
+        sum = sum.wrapping_add(word);
+        i += 4;
+    }
+    sum
 }
 
 fn f2dot14(d: &[u8], o: usize) -> f64 {

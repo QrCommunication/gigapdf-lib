@@ -4,6 +4,19 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] - 2026-06-16
+
+### Changed
+
+- **Embedded fonts are now subsetted on save.** Text drawn with `addText` tracks
+  the glyph ids it uses per embedded font; `save`/`saveCompressed` rebuild each
+  embedded `FontFile2` to keep only those glyph outlines (plus `.notdef` and any
+  composite components). Glyph ids are **preserved** (no remap), so existing
+  Identity-H content stays valid — only the outline data shrinks. A minimal edit
+  that previously embedded a full ~300 KB family now adds only the glyphs it
+  draws, fixing the round-trip size blow-up when re-baking edited text. No API
+  change — the subsetting is automatic.
+
 ## [0.13.0] - 2026-06-16
 
 ### Added

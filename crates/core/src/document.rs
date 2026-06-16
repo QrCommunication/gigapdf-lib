@@ -27,6 +27,10 @@ use crate::parser::Parser;
 pub struct Document {
     objects: BTreeMap<ObjectId, Object>,
     trailer: Dictionary,
+    /// GIDs drawn with each embedded Type0 font (keyed by its object number),
+    /// accumulated by [`add_text`](Document::add_text) so the save path can
+    /// subset each embedded `glyf` table to only the glyphs actually used.
+    font_used_gids: BTreeMap<u32, std::collections::BTreeSet<u16>>,
 }
 
 /// A full-text search hit: the page, the matching line's text, and its bounding
@@ -266,7 +270,11 @@ impl Document {
         // (now-plaintext) ObjStm contents are read directly.
         decrypt_objects(&mut objects, &trailer, password)?;
         extract_object_streams(&mut objects);
-        Ok(Self { objects, trailer })
+        Ok(Self {
+            objects,
+            trailer,
+            font_used_gids: BTreeMap::new(),
+        })
     }
 
     /// Digitally sign the document with an engine-managed signer, producing a
@@ -450,7 +458,12 @@ impl Document {
 
     /// Serialize the (possibly edited) document to a fresh, valid PDF.
     pub fn save(&self) -> Vec<u8> {
-        crate::serialize::to_pdf(&self.objects, &self.trailer)
+        if self.font_used_gids.is_empty() {
+            return crate::serialize::to_pdf(&self.objects, &self.trailer);
+        }
+        let mut objects = self.objects.clone();
+        self.subset_embedded_fonts(&mut objects);
+        crate::serialize::to_pdf(&objects, &self.trailer)
     }
 
     /// Fetch an indirect object by id.
@@ -1191,6 +1204,7 @@ impl Document {
     /// stream is only replaced when compression actually shrinks it.
     pub fn save_compressed(&self) -> Vec<u8> {
         let mut objects = self.objects.clone();
+        self.subset_embedded_fonts(&mut objects);
         for object in objects.values_mut() {
             if let Object::Stream(stream) = object {
                 if stream.dict.contains(b"Filter") || stream.raw.len() <= 64 {
@@ -2554,8 +2568,10 @@ impl Document {
         })?;
         // Identity-H shows two-byte glyph ids directly.
         let mut hex = String::new();
+        let used = self.font_used_gids.entry(font_obj).or_default();
         for ch in text.chars() {
             let gid = ttf.gid_for_unicode(ch as u32).unwrap_or(0);
+            used.insert(gid);
             hex.push_str(&format!("{gid:04X}"));
         }
         let res_name = format!("GF{font_obj}");
@@ -2758,6 +2774,65 @@ impl Document {
             .and_then(Object::as_stream)?;
         let bytes = decode_stream(ff).ok()?;
         crate::font::truetype::TrueTypeFont::parse(&bytes)
+    }
+
+    /// Subset every embedded Type0 font's `FontFile2` to the glyphs actually
+    /// drawn (tracked in [`font_used_gids`](Self::font_used_gids)), shrinking the
+    /// saved file. Operates on a (cloned) objects map and drops the stream
+    /// `/Filter` so a later compression pass re-flates the smaller program. A
+    /// no-op for fonts with no recorded use or when subsetting wouldn't shrink.
+    fn subset_embedded_fonts(&self, objects: &mut BTreeMap<ObjectId, Object>) {
+        for (&font_obj, used) in &self.font_used_gids {
+            if used.is_empty() {
+                continue;
+            }
+            let Some(ff_id) = Self::fontfile2_id(objects, font_obj) else {
+                continue;
+            };
+            let decoded = match objects.get(&ff_id) {
+                Some(Object::Stream(s)) => match decode_stream(s) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            let Some(ttf) = crate::font::truetype::TrueTypeFont::parse(&decoded) else {
+                continue;
+            };
+            let Some(sub) = ttf.subset(used) else {
+                continue;
+            };
+            if sub.len() >= decoded.len() {
+                continue; // subsetting would not shrink — keep the original
+            }
+            if let Some(Object::Stream(s)) = objects.get_mut(&ff_id) {
+                s.dict.remove(b"Filter");
+                s.dict
+                    .set(b"Length".to_vec(), Object::Integer(sub.len() as i64));
+                s.dict
+                    .set(b"Length1".to_vec(), Object::Integer(sub.len() as i64));
+                s.raw = sub;
+            }
+        }
+    }
+
+    /// The `FontFile2` stream object id for an embedded Type0 font, resolved
+    /// within `objects` (Type0 → DescendantFonts[0] → FontDescriptor → FontFile2).
+    fn fontfile2_id(objects: &BTreeMap<ObjectId, Object>, font_obj: u32) -> Option<ObjectId> {
+        fn deref<'a>(objects: &'a BTreeMap<ObjectId, Object>, o: &'a Object) -> Option<&'a Object> {
+            match o {
+                Object::Reference(id) => objects.get(id),
+                other => Some(other),
+            }
+        }
+        let t0 = objects.get(&(font_obj, 0))?.as_dict()?;
+        let df = deref(objects, t0.get(b"DescendantFonts")?)?.as_array()?;
+        let cid = deref(objects, df.first()?)?.as_dict()?;
+        let fd = deref(objects, cid.get(b"FontDescriptor")?)?.as_dict()?;
+        match fd.get(b"FontFile2")? {
+            Object::Reference(id) => Some(*id),
+            _ => None,
+        }
     }
 
     /// The nearest `/Resources` dictionary up the page tree (own or inherited),
@@ -6499,6 +6574,46 @@ mod tests {
                 .iter()
                 .any(|a| a.contents.contains("sticky note body")),
             "note contents preserved"
+        );
+    }
+
+    #[test]
+    fn subset_preserves_used_glyphs_and_strips_unused() {
+        // Extract the embedded TrueType program from the fixture.
+        let doc = Document::open(&fixture("embedded-fonts.pdf")).unwrap();
+        let (bytes, format) = doc
+            .extract_font_program("DejaVu")
+            .expect("embedded DejaVu font present");
+        assert_eq!(format, "truetype");
+        let ttf = crate::font::truetype::TrueTypeFont::parse(&bytes).unwrap();
+
+        // Scan glyph ids directly (a subset font's cmap may not map ASCII): keep
+        // the first inked glyph, leave at least one other inked glyph out.
+        let inked: Vec<u16> = (1..ttf.num_glyphs())
+            .filter(|&g| !ttf.glyph_polygons(g).is_empty())
+            .collect();
+        assert!(inked.len() >= 2, "fixture font has several inked glyphs");
+        let kept = inked[0];
+        let dropped = inked[1];
+        let used: std::collections::BTreeSet<u16> = std::iter::once(kept).collect();
+
+        let sub = ttf.subset(&used).expect("subset built");
+        assert!(sub.len() <= bytes.len(), "subset is never larger");
+
+        let subttf = crate::font::truetype::TrueTypeFont::parse(&sub).unwrap();
+        assert_eq!(
+            subttf.num_glyphs(),
+            ttf.num_glyphs(),
+            "glyph ids are preserved (no remap)"
+        );
+        assert_eq!(
+            subttf.glyph_polygons(kept).len(),
+            ttf.glyph_polygons(kept).len(),
+            "kept glyph keeps its outline"
+        );
+        assert!(
+            subttf.glyph_polygons(dropped).is_empty(),
+            "unused glyph {dropped} stripped from the subset"
         );
     }
 }
