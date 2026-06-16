@@ -4,6 +4,21 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.23.0] - 2026-06-16
+
+### Added
+
+- **Native baseline JPEG codec + image decoders** — `encodeJpeg(rgba, w, h,
+  quality?)`, `decodeJpeg(bytes)`, `decodePng(bytes)` (ABIs `gp_encode_jpeg` /
+  `gp_decode_jpeg` / `gp_decode_png`; `raster::jpeg::{encode_jpeg, decode_jpeg}`).
+  A from-scratch ISO 10918-1 baseline JPEG encoder **and** decoder (4:4:4,
+  Annex-K quant/Huffman tables, orthonormal DCT-II/III, exact forward/inverse
+  pair), validated by round-trip. With `rgbaToPng`/`resizeRgba` (v0.21/0.22) and
+  the existing PNG decoder, the native raster toolkit now covers PNG⇄RGBA,
+  JPEG⇄RGBA and resize — the host can re-encode/resize/convert rendered pages
+  with **no third-party image library**. New `DecodedImage` type
+  (`{ width, height, rgba }`).
+
 ## [0.22.0] - 2026-06-16
 
 ### Added

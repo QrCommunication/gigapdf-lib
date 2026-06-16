@@ -1238,6 +1238,70 @@ pub extern "C" fn gp_resize_rgba(
     unsafe { bytes_into_host(out, out_len) }
 }
 
+/// Encode raw RGBA pixels to a baseline JPEG at `quality` (1..=100) with the
+/// engine's native encoder — no third-party image library. Alpha is composited
+/// onto white. 0-length buffer on a bad input. Host frees the result.
+#[no_mangle]
+pub extern "C" fn gp_encode_jpeg(
+    width: u32,
+    height: u32,
+    rgba_ptr: *const u8,
+    rgba_len: usize,
+    quality: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let out = if rgba_ptr.is_null() {
+        Vec::new()
+    } else {
+        let rgba = unsafe { std::slice::from_raw_parts(rgba_ptr, rgba_len) };
+        gigapdf_core::raster::jpeg::encode_jpeg(width, height, rgba, quality)
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
+/// Frame a decoded image as `[width: u32 LE][height: u32 LE][rgba…]`, the wire
+/// format the SDK's `decodeJpeg`/`decodePng` unpack. Empty on a decode failure.
+fn frame_image(decoded: Option<(u32, u32, Vec<u8>)>) -> Vec<u8> {
+    match decoded {
+        Some((w, h, rgba)) => {
+            let mut out = Vec::with_capacity(8 + rgba.len());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&rgba);
+            out
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Decode a baseline JPEG to `[w: u32 LE][h: u32 LE][rgba]` (native decoder, no
+/// third-party library). Empty on an unsupported/malformed stream. Host frees.
+#[no_mangle]
+pub extern "C" fn gp_decode_jpeg(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let out = if ptr.is_null() {
+        Vec::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        frame_image(gigapdf_core::raster::jpeg::decode_jpeg(bytes))
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
+/// Decode a PNG to `[w: u32 LE][h: u32 LE][rgba]` (native decoder). Empty on a
+/// malformed/unsupported stream. Host frees the result.
+#[no_mangle]
+pub extern "C" fn gp_decode_png(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let out = if ptr.is_null() {
+        Vec::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        frame_image(
+            gigapdf_core::raster::decode_png(bytes).map(|d| (d.width, d.height, d.rgba)),
+        )
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
 // ─── conversions & compression ───────────────────────────────────────────────
 //
 // All buffer-returning (host frees the result). Office exporters reconstruct

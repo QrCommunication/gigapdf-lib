@@ -250,6 +250,36 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(giga.resizeRgba(new Uint8Array(3), 1, 1, 2, 2).length).toBe(0);
   });
 
+  it("encodes + decodes JPEG natively (round-trip) and decodes PNG", () => {
+    const w = 16;
+    const h = 16;
+    const rgba = new Uint8Array(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      rgba[i * 4] = (i % w) * 16; // R ramp
+      rgba[i * 4 + 1] = 100;
+      rgba[i * 4 + 2] = 50;
+      rgba[i * 4 + 3] = 255;
+    }
+    const jpg = giga.encodeJpeg(rgba, w, h, 92);
+    expect(jpg[0]).toBe(0xff);
+    expect(jpg[1]).toBe(0xd8); // JPEG SOI
+    const dec = giga.decodeJpeg(jpg);
+    expect(dec).not.toBeNull();
+    expect(dec!.width).toBe(w);
+    expect(dec!.height).toBe(h);
+    expect(dec!.rgba.length).toBe(w * h * 4);
+    // Lossy but close at q92.
+    expect(Math.abs(dec!.rgba[4 * 100 + 1]! - 100)).toBeLessThanOrEqual(8);
+
+    // PNG decode round-trips exactly (lossless).
+    const png = giga.rgbaToPng(rgba, w, h);
+    const pdec = giga.decodePng(png);
+    expect(pdec).not.toBeNull();
+    expect(pdec!.width).toBe(w);
+    expect(Array.from(pdec!.rgba.slice(0, 4))).toEqual([0, 100, 50, 255]);
+    expect(giga.decodeJpeg(new Uint8Array([1, 2, 3]))).toBeNull();
+  });
+
   it("registers named destinations and resolves links that jump to them by name", () => {
     const doc = giga.open(giga.txtToPdf("Cover"));
     expect(doc.addPage(612, 792, 1)).toBeGreaterThan(0); // page 2

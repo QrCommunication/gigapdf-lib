@@ -8,6 +8,7 @@
 pub mod canvas;
 pub mod ocr;
 pub mod ocr_model;
+pub mod jpeg;
 pub mod png;
 pub mod png_decode;
 pub mod render;

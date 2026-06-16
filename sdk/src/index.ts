@@ -262,6 +262,34 @@ export class GigaPdfEngine {
       this._buffer((o) => this.ex.gp_resize_rgba(p, l, sw, sh, dw, dh, o))
     );
   }
+  /**
+   * Encode raw **RGBA** pixels to a baseline JPEG at `quality` (1–100) with the
+   * engine's native encoder — no third-party image library. Alpha is composited
+   * onto white. Empty array on a bad input.
+   */
+  encodeJpeg(rgba: Uint8Array, width: number, height: number, quality = 82): Uint8Array {
+    return this._withBytes(rgba, (p, l) =>
+      this._buffer((o) => this.ex.gp_encode_jpeg(width, height, p, l, quality, o))
+    );
+  }
+  /** Decode a baseline JPEG to `{ width, height, rgba }`, or `null` on failure. */
+  decodeJpeg(jpeg: Uint8Array): DecodedImage | null {
+    return this._decodeFramed(jpeg, (p, l, o) => this.ex.gp_decode_jpeg(p, l, o));
+  }
+  /** Decode a PNG to `{ width, height, rgba }`, or `null` on failure. */
+  decodePng(png: Uint8Array): DecodedImage | null {
+    return this._decodeFramed(png, (p, l, o) => this.ex.gp_decode_png(p, l, o));
+  }
+  /** Unpack a `[w:u32 LE][h:u32 LE][rgba]` decode buffer; `null` if empty. */
+  _decodeFramed(
+    bytes: Uint8Array,
+    fn: (p: number, l: number, o: number) => number
+  ): DecodedImage | null {
+    const framed = this._withBytes(bytes, (p, l) => this._buffer((o) => fn(p, l, o)));
+    if (framed.length < 8) return null;
+    const dv = new DataView(framed.buffer, framed.byteOffset, framed.byteLength);
+    return { width: dv.getUint32(0, true), height: dv.getUint32(4, true), rgba: framed.subarray(8) };
+  }
 
   // ── fonts (catalog / Google Fonts URL — the host performs the fetch) ───────
   fontCatalog(): FontInfo[] {
@@ -630,6 +658,12 @@ export interface NamedDest {
 export interface XlsxSheet {
   name: string;
   rows: string[][];
+}
+/** A decoded raster image (`rgba` is `width*height*4`, row-major, RGBA8). */
+export interface DecodedImage {
+  width: number;
+  height: number;
+  rgba: Uint8Array;
 }
 /** An optional-content layer (calque): toggle `visible`/`locked` to persist in the PDF. */
 export interface LayerInfo {
