@@ -523,6 +523,14 @@ export interface FieldInfo {
   multiline: boolean;
   fillable: boolean;
   maxLen?: number;
+  /** 1-based page the widget sits on (from its `/P`); absent if it has no widget. */
+  page?: number;
+  /**
+   * Widget rectangle `[x, y, width, height]` in points, **top-left origin**
+   * (already Y-flipped from the PDF's bottom-left `/Rect` for direct host use).
+   * Absent when the field carries no `/Rect`.
+   */
+  bounds?: [number, number, number, number];
   value: string;
   options: string[];
 }

@@ -4354,6 +4354,23 @@ impl Document {
             "Btn" => self.button_export_states(dict),
             _ => Vec::new(),
         };
+        // Widget geometry: the field dict itself (merged field+widget) carries
+        // /Rect, or its first widget kid does; /P points at the widget's page.
+        let widget = if dict.contains(b"Rect") {
+            Some(dict)
+        } else {
+            dict.get(b"Kids")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .and_then(|kids| kids.first())
+                .map(|k| self.resolve(k))
+                .and_then(Object::as_dict)
+        };
+        let (page, bounds) = match widget {
+            Some(w) => self.widget_geometry(w),
+            None => (None, None),
+        };
+
         out.push(FormField {
             name,
             field_type,
@@ -4361,7 +4378,43 @@ impl Document {
             flags,
             options,
             max_len,
+            page,
+            bounds,
         });
+    }
+
+    /// A widget's page number (1-based, from `/P`) and top-left bounds
+    /// `[x, y, width, height]` (points) from its `/Rect`. `(None, None)` when
+    /// the widget has no rectangle.
+    fn widget_geometry(&self, widget: &Dictionary) -> (Option<u32>, Option<[f64; 4]>) {
+        let Some(rect) = widget
+            .get(b"Rect")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .filter(|a| a.len() >= 4)
+        else {
+            return (None, None);
+        };
+        let v = |i: usize| self.resolve(&rect[i]).as_f64().unwrap_or(0.0);
+        let (x0, x1) = (v(0).min(v(2)), v(0).max(v(2)));
+        let (y0, y1) = (v(1).min(v(3)), v(1).max(v(3)));
+
+        // Page number from /P; default to the first page if absent.
+        let page = widget
+            .get(b"P")
+            .and_then(Object::as_reference)
+            .and_then(|p_ref| {
+                self.page_ids()
+                    .ok()
+                    .and_then(|ids| ids.iter().position(|id| *id == p_ref))
+            })
+            .map(|idx| idx as u32 + 1)
+            .unwrap_or(1);
+
+        let page_height = self.page_info(page).map(|(_, h, _)| h).unwrap_or(792.0);
+        // /Rect is bottom-left origin; flip to top-left for the host UI.
+        let bounds = [x0, page_height - y1, x1 - x0, y1 - y0];
+        (Some(page), Some(bounds))
     }
 
     /// Read a field's `/V` as a display string, joining array values (multi-
@@ -5996,6 +6049,15 @@ mod tests {
         assert_eq!(text.kind(), crate::form::FieldKind::Text);
         assert_eq!(text.value, "Jane");
         assert_eq!(text.max_len, Some(40));
+        // Widget geometry: page 1, /Rect [50 700 300 720] (bottom-left) maps to
+        // top-left bounds [50, H-720, 250, 20].
+        assert_eq!(text.page, Some(1), "fullname is on page 1");
+        let page_h = reopened.page_info(1).unwrap().1;
+        let b = text.bounds.expect("fullname has widget bounds");
+        assert!((b[0] - 50.0).abs() < 0.5, "x = {}", b[0]);
+        assert!((b[1] - (page_h - 720.0)).abs() < 0.5, "y = {}", b[1]);
+        assert!((b[2] - 250.0).abs() < 0.5, "w = {}", b[2]);
+        assert!((b[3] - 20.0).abs() < 0.5, "h = {}", b[3]);
 
         let cb = by("subscribe");
         assert_eq!(cb.kind(), crate::form::FieldKind::Checkbox);

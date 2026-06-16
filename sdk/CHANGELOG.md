@@ -4,6 +4,17 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] - 2026-06-16
+
+### Added
+
+- **Form-field widget geometry** — `engine.open(pdf).fields()` (`FieldInfo`) now
+  reports each field's `page` (1-based) and `bounds` (`[x, y, width, height]` in
+  points, **top-left origin** — already Y-flipped from the PDF's bottom-left
+  `/Rect`). Lets a host overlay/place field UI without re-parsing the PDF. Both
+  are optional (absent when a field carries no widget rectangle). Read from the
+  widget's `/Rect` and `/P`; falls back to page 1 when `/P` is missing.
+
 ## [0.10.0] - 2026-06-16
 
 ### Added

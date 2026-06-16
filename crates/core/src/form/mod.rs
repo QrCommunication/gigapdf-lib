@@ -96,6 +96,11 @@ pub struct FormField {
     pub options: Vec<String>,
     /// `/MaxLen` for text fields, if present.
     pub max_len: Option<u32>,
+    /// 1-based page number of the field's first widget (from its `/P`), if known.
+    pub page: Option<u32>,
+    /// First widget bounds `[x, y, width, height]` in **top-left** origin
+    /// (points), if the widget has a `/Rect`.
+    pub bounds: Option<[f64; 4]>,
 }
 
 impl FormField {

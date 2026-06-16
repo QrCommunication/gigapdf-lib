@@ -2185,6 +2185,15 @@ fn fields_json(fields: &[FormField]) -> String {
         if let Some(max) = field.max_len {
             out.push_str(&format!(",\"maxLen\":{max}"));
         }
+        if let Some(page) = field.page {
+            out.push_str(&format!(",\"page\":{page}"));
+        }
+        if let Some(b) = field.bounds {
+            out.push_str(&format!(
+                ",\"bounds\":[{},{},{},{}]",
+                b[0], b[1], b[2], b[3]
+            ));
+        }
         out.push_str(",\"value\":");
         json_escape(&field.value, &mut out);
         out.push_str(",\"options\":[");
