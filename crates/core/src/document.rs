@@ -222,6 +222,18 @@ const HELVETICA_AFM: [u16; 95] = [
     556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,       // 0x70-0x7E
 ];
 
+/// One run of an invisible (OCR) text layer for [`Document::add_text_layer`]:
+/// baseline-anchored `text` at `(x, y)` in PDF user space, `size` points,
+/// rotated `rotation_deg`° counter-clockwise.
+#[derive(Debug, Clone)]
+pub struct TextLayerRun {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+    pub text: String,
+    pub rotation_deg: f64,
+}
+
 impl Document {
     /// Parse a PDF from raw bytes.
     pub fn open(bytes: &[u8]) -> Result<Self> {
@@ -2662,6 +2674,65 @@ impl Document {
         content.extend_from_slice(&ops);
         self.set_page_content(page_no, content)?;
         Ok(())
+    }
+
+    /// Add an invisible (text render mode 3) standard-Helvetica text layer to
+    /// `page_no` in a SINGLE content-stream append. Built for OCR layers of many
+    /// words: one font resource, O(n) not O(n²). Glyphs are selectable and
+    /// searchable but never painted. Text is WinAnsi-encoded; a run containing
+    /// any glyph outside WinAnsi is skipped (standard Helvetica cannot show it).
+    /// Returns the number of runs actually written.
+    pub fn add_text_layer(&mut self, page_no: u32, runs: &[TextLayerRun]) -> Result<usize> {
+        if runs.is_empty() {
+            return Ok(0);
+        }
+        let res_name = self.ensure_helvetica_font(page_no)?;
+        let mut inner: Vec<u8> = Vec::new();
+        inner.extend_from_slice(b"q\nBT\n3 Tr\n");
+        let mut written = 0usize;
+        for run in runs {
+            if run.text.is_empty()
+                || run
+                    .text
+                    .chars()
+                    .any(|c| crate::font::char_to_winansi(c).is_none())
+            {
+                continue;
+            }
+            let (sin, cos) = run.rotation_deg.to_radians().sin_cos();
+            inner.push(b'/');
+            inner.extend_from_slice(&res_name);
+            inner.extend_from_slice(format!(" {} Tf\n", content::num(run.size)).as_bytes());
+            inner.extend_from_slice(
+                format!(
+                    "{} {} {} {} {} {} Tm\n",
+                    content::num(cos),
+                    content::num(sin),
+                    content::num(-sin),
+                    content::num(cos),
+                    content::num(run.x),
+                    content::num(run.y),
+                )
+                .as_bytes(),
+            );
+            inner.push(b'(');
+            for &b in &crate::font::encode_winansi(&run.text) {
+                if b == b'(' || b == b')' || b == b'\\' {
+                    inner.push(b'\\');
+                }
+                inner.push(b);
+            }
+            inner.extend_from_slice(b") Tj\n");
+            written += 1;
+        }
+        inner.extend_from_slice(b"ET\nQ\n");
+        if written == 0 {
+            return Ok(0);
+        }
+        let mut content = self.page_content(page_no)?;
+        content.extend_from_slice(&inner);
+        self.set_page_content(page_no, content)?;
+        Ok(written)
     }
 
     /// Register a standard `/Type1 /Helvetica /WinAnsiEncoding` font as a page
@@ -6900,6 +6971,29 @@ mod tests {
             chunk_b.form_fields().unwrap().is_empty(),
             "out-of-chunk field dropped from extraction"
         );
+    }
+
+    #[test]
+    fn add_text_layer_writes_winansi_runs_and_skips_others() {
+        let pdf = crate::convert::reverse::txt_to_pdf("ocr host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let runs = vec![
+            TextLayerRun { x: 50.0, y: 700.0, size: 10.0, text: "café".into(), rotation_deg: 0.0 },
+            TextLayerRun { x: 50.0, y: 680.0, size: 10.0, text: "résumé".into(), rotation_deg: 0.0 },
+            TextLayerRun { x: 50.0, y: 660.0, size: 10.0, text: "日本語".into(), rotation_deg: 0.0 },
+            TextLayerRun { x: 50.0, y: 640.0, size: 10.0, text: String::new(), rotation_deg: 0.0 },
+        ];
+        // Two WinAnsi runs written; the CJK and empty runs are skipped.
+        assert_eq!(doc.add_text_layer(1, &runs).unwrap(), 2);
+        assert_eq!(doc.add_text_layer(1, &[]).unwrap(), 0, "empty input is a no-op");
+
+        let saved = doc.save();
+        let body = String::from_utf8_lossy(&saved);
+        assert!(body.contains("3 Tr"), "invisible text render mode present");
+        assert!(body.contains(" Tj"), "text-show operator present");
+        assert!(body.contains("caf"), "the café run's glyphs were written");
+        // The result re-opens as a valid single-page document.
+        assert_eq!(Document::open(&saved).unwrap().page_ids().unwrap().len(), 1);
     }
 
     #[test]

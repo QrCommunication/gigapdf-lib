@@ -18,7 +18,7 @@
 
 use gigapdf_core::{
     Annotation, ContentElement, Document, ElementKind, FieldKind, FormField, Layer, Link,
-    LinkTarget, OcrWord, OutlineItem, SearchMatch, TextLine, TextRun,
+    LinkTarget, OcrWord, OutlineItem, SearchMatch, TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -1028,6 +1028,53 @@ pub extern "C" fn gp_append_pages(
     let bytes = unsafe { std::slice::from_raw_parts(other_ptr, other_len) };
     match doc.append_pages_from(bytes) {
         Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
+/// Add an invisible (render mode 3) Helvetica OCR text layer to `page` from a
+/// packed run buffer. Each run is `x,y,size,rotation` (4 × f64 little-endian),
+/// then a `u32` little-endian text length and that many UTF-8 bytes. Returns
+/// the number of runs written (≥ 0) on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gp_add_text_layer(
+    handle: *mut Document,
+    page: u32,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> i32 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return -1,
+    };
+    if data_ptr.is_null() {
+        return -2;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    let mut runs: Vec<TextLayerRun> = Vec::new();
+    let mut i = 0usize;
+    while i + 36 <= data.len() {
+        let x = f64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        let y = f64::from_le_bytes(data[i + 8..i + 16].try_into().unwrap());
+        let size = f64::from_le_bytes(data[i + 16..i + 24].try_into().unwrap());
+        let rotation = f64::from_le_bytes(data[i + 24..i + 32].try_into().unwrap());
+        let tlen = u32::from_le_bytes(data[i + 32..i + 36].try_into().unwrap()) as usize;
+        i += 36;
+        if i + tlen > data.len() {
+            break;
+        }
+        let text = String::from_utf8_lossy(&data[i..i + tlen]).into_owned();
+        i += tlen;
+        runs.push(TextLayerRun {
+            x,
+            y,
+            size,
+            text,
+            rotation_deg: rotation,
+        });
+    }
+    match doc.add_text_layer(page, &runs) {
+        Ok(written) => written as i32,
         Err(_) => -3,
     }
 }

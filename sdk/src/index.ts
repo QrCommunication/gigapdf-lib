@@ -866,6 +866,42 @@ export class GigaPdfDoc {
   appendPages(otherPdf: Uint8Array): boolean {
     return this.g._withBytes(otherPdf, (p, l) => this.ex().gp_append_pages(this.h, p, l)) === 0;
   }
+  /**
+   * Add an invisible (text render mode 3) standard-Helvetica text layer to
+   * `page` in a SINGLE content append — for OCR. Each run is `{x, y, size,
+   * text, rotation?}` (PDF user space, baseline-anchored, `rotation`° CCW).
+   * Runs whose text has any non-WinAnsi glyph are skipped. Returns the number
+   * of runs actually written (0 on engine error).
+   */
+  addTextLayer(
+    page: number,
+    runs: { x: number; y: number; size: number; text: string; rotation?: number }[]
+  ): number {
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for (const r of runs) {
+      const t = enc.encode(r.text);
+      const head = new Uint8Array(36);
+      const dv = new DataView(head.buffer);
+      dv.setFloat64(0, r.x, true);
+      dv.setFloat64(8, r.y, true);
+      dv.setFloat64(16, r.size, true);
+      dv.setFloat64(24, r.rotation ?? 0, true);
+      dv.setUint32(32, t.length, true);
+      parts.push(head, t);
+      total += 36 + t.length;
+    }
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) {
+      buf.set(p, off);
+      off += p.length;
+    }
+    const written = this.g._withBytes(buf, (p, l) =>
+      this.ex().gp_add_text_layer(this.h, page, p, l)
+    );
+    return written < 0 ? 0 : written;
+  }
   /** Extract the given 1-based page numbers into a NEW standalone PDF. */
   extractPages(pages: number[]): Uint8Array {
     return this.g._withU32(pages, (p, c) =>
