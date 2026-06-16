@@ -288,6 +288,28 @@ pub struct TextElementInfo {
     pub rotation_deg: f64,
 }
 
+/// One image element from [`Document::page_image_elements`]: its placement box
+/// (page user space, origin bottom-left), the embeddable encoded bytes and
+/// their format, and the source pixel dimensions. `index` is its position among
+/// the page's image elements — the native equivalent of a reader's image
+/// extraction, returning bytes a host can display or re-embed.
+#[derive(Debug, Clone)]
+pub struct ImageElementInfo {
+    pub index: usize,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    /// `"jpeg"` (DCTDecode passthrough), `"png"` (re-encoded from samples),
+    /// `"jp2"` (JPXDecode passthrough), or `"unknown"` (colour space/filter not
+    /// decoded — `data` is then empty).
+    pub format: String,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    /// Embeddable encoded image bytes (empty when `format == "unknown"`).
+    pub data: Vec<u8>,
+}
+
 impl Document {
     /// Parse a PDF from raw bytes.
     pub fn open(bytes: &[u8]) -> Result<Self> {
@@ -918,6 +940,128 @@ impl Document {
                 }
             })
             .collect()
+    }
+
+    /// Every **image** element on a page: its placement box (user space), the
+    /// embeddable encoded bytes + format, and the source pixel dimensions.
+    /// DCTDecode/JPXDecode images pass through as `jpeg`/`jp2`; Flate/raw
+    /// DeviceRGB|DeviceGray 8-bit images are re-encoded to PNG; anything else is
+    /// reported `unknown` with empty bytes. The native equivalent of a reader's
+    /// image extraction (placement + bytes, not just a render).
+    pub fn page_image_elements(&self, page_no: u32) -> Vec<ImageElementInfo> {
+        let Ok(elements) = self.page_elements(page_no) else {
+            return Vec::new();
+        };
+        let images: Vec<(content::Bounds, String)> = elements
+            .into_iter()
+            .filter(|e| e.kind == content::ElementKind::Image)
+            .map(|e| {
+                let b = e.bounds.unwrap_or(content::Bounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                });
+                (b, e.label)
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (idx, (b, name)) in images.into_iter().enumerate() {
+            let Some((format, data, pw, ph)) = self.image_xobject_bytes(page_no, name.as_bytes())
+            else {
+                continue;
+            };
+            out.push(ImageElementInfo {
+                index: idx,
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+                format,
+                pixel_width: pw,
+                pixel_height: ph,
+                data,
+            });
+        }
+        out
+    }
+
+    /// Resolve image XObject `name` in `page_no`'s `/Resources /XObject` to
+    /// `(format, encoded bytes, pixel width, pixel height)`. `None` when the
+    /// name isn't an image XObject.
+    fn image_xobject_bytes(&self, page_no: u32, name: &[u8]) -> Option<(String, Vec<u8>, u32, u32)> {
+        let page = self.page_dict(page_no).ok()?;
+        let stream = page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|res| res.get(b"XObject"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|xo| xo.get(name))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)?;
+        let dict = &stream.dict;
+        if dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Image".as_slice()) {
+            return None;
+        }
+        let pw = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0).max(0) as u32;
+        let ph = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0).max(0) as u32;
+        match self.first_filter(dict).as_deref() {
+            Some(b"DCTDecode") => Some(("jpeg".to_string(), stream.raw.clone(), pw, ph)),
+            Some(b"JPXDecode") => Some(("jp2".to_string(), stream.raw.clone(), pw, ph)),
+            _ => match self.image_to_png(stream) {
+                Some(png) => Some(("png".to_string(), png, pw, ph)),
+                None => Some(("unknown".to_string(), Vec::new(), pw, ph)),
+            },
+        }
+    }
+
+    /// Decode a (Flate/raw, DeviceRGB|DeviceGray, 8-bit) image stream to RGBA —
+    /// honouring an 8-bit DeviceGray `/SMask` for alpha — and PNG-encode it.
+    /// `None` when the colour space / bit depth isn't one we decode.
+    fn image_to_png(&self, stream: &Stream) -> Option<Vec<u8>> {
+        let dict = &stream.dict;
+        if dict.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap_or(8) != 8 {
+            return None;
+        }
+        let components = match dict
+            .get(b"ColorSpace")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_name)
+        {
+            Some(b"DeviceRGB") => 3,
+            Some(b"DeviceGray") => 1,
+            _ => return None,
+        };
+        let width = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0).max(0) as usize;
+        let height = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0).max(0) as usize;
+        let samples = decode_stream(stream).ok()?;
+        if width == 0 || height == 0 || samples.len() < width * height * components {
+            return None;
+        }
+        let smask = self.decode_gray_smask(dict);
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * components;
+                let (r, g, b) = if components == 1 {
+                    (samples[i], samples[i], samples[i])
+                } else {
+                    (samples[i], samples[i + 1], samples[i + 2])
+                };
+                let a = match &smask {
+                    Some((sw, sh, alpha)) => {
+                        let sx = if *sw == width { x } else { x * *sw / width };
+                        let sy = if *sh == height { y } else { y * *sh / height };
+                        alpha.get(sy * *sw + sx).copied().unwrap_or(255)
+                    }
+                    None => 255,
+                };
+                rgba.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+        Some(crate::raster::png::encode_png(width as u32, height as u32, &rgba))
     }
 
     /// Redact a rectangular region (page user space): permanently **remove**
@@ -8036,6 +8180,45 @@ mod tests {
         assert_eq!(e.font_family, "Helvetica", "/BaseFont family");
         assert!(e.bold, "Helvetica-Bold resolves bold");
         assert!(e.rotation_deg.abs() < 0.5, "upright, got {}", e.rotation_deg);
+    }
+
+    #[test]
+    fn page_image_elements_extract_png_and_jpeg() {
+        let mut doc = blank_doc();
+        // A 2x2 opaque RGB image embedded two ways: PNG (→ Flate) + JPEG (→ DCT).
+        let rgba = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
+        let png = crate::raster::png::encode_png(2, 2, &rgba);
+        let jpeg = crate::raster::jpeg::encode_jpeg(2, 2, &rgba, 90);
+        doc.add_image(1, &png, 50.0, 600.0, 64.0, 64.0, 1.0).unwrap();
+        doc.add_image(1, &jpeg, 200.0, 400.0, 80.0, 80.0, 1.0).unwrap();
+
+        let imgs = doc.page_image_elements(1);
+        assert_eq!(imgs.len(), 2, "two image elements");
+        for img in &imgs {
+            assert_eq!((img.pixel_width, img.pixel_height), (2, 2), "2x2 px");
+            assert!(!img.data.is_empty(), "embeddable bytes present");
+            assert!(img.width > 0.0 && img.height > 0.0, "placement box set");
+        }
+        let formats: Vec<&str> = imgs.iter().map(|i| i.format.as_str()).collect();
+        assert!(formats.contains(&"png"), "Flate image → png, got {formats:?}");
+        assert!(formats.contains(&"jpeg"), "DCTDecode image → jpeg, got {formats:?}");
+
+        // The PNG one re-decodes to the original RGB (lossless Flate round-trip).
+        let png_el = imgs.iter().find(|i| i.format == "png").unwrap();
+        let decoded = crate::raster::decode_png(&png_el.data).expect("valid PNG");
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        for px in 0..4 {
+            assert_eq!(
+                decoded.rgba[px * 4..px * 4 + 3],
+                rgba[px * 4..px * 4 + 3],
+                "pixel {px} RGB round-trips"
+            );
+        }
+        // The JPEG one is a real JPEG (SOI marker) passed through untouched.
+        let jpeg_el = imgs.iter().find(|i| i.format == "jpeg").unwrap();
+        assert_eq!(&jpeg_el.data[0..2], &[0xFF, 0xD8], "JPEG SOI passthrough");
     }
 
     #[test]

@@ -50,6 +50,22 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("extracts image elements (placement + bytes + format)", () => {
+    const doc = giga.open(giga.txtToPdf("Has an image"));
+    // 2x2 opaque RGB → PNG, placed on the page.
+    const rgba = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]);
+    doc.addImage(1, giga.rgbaToPng(rgba, 2, 2), 40, 500, 60, 60, 1);
+    const imgs = doc.imageElements(1);
+    expect(imgs.length).toBeGreaterThan(0);
+    const img = imgs[0]!;
+    expect(img.pixelWidth).toBe(2);
+    expect(img.pixelHeight).toBe(2);
+    expect(["png", "jpeg", "jp2"]).toContain(img.format);
+    expect(img.data.length).toBeGreaterThan(0);
+    expect(img.width).toBeGreaterThan(0);
+    doc.close();
+  });
+
   it("edits (addRectangle with stroke flag) and round-trips a save", () => {
     const doc = giga.open(giga.txtToPdf("Edit me"));
     // Red stroke, no fill, 2pt — exercises the has_stroke/has_fill flags.

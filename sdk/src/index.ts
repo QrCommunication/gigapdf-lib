@@ -641,6 +641,24 @@ export interface TextElementInfo {
   /** Baseline rotation in degrees (0 = upright). */
   rotation: number;
 }
+/**
+ * An image element from {@link GigaPdfDoc.imageElements}: its placement box
+ * (page user space, origin bottom-left), the embeddable encoded bytes + format,
+ * and the source pixel dimensions. `data` is empty when `format` is `"unknown"`.
+ */
+export interface ImageElementInfo {
+  index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** `"jpeg"` | `"png"` | `"jp2"` | `"unknown"`. */
+  format: string;
+  pixelWidth: number;
+  pixelHeight: number;
+  /** Embeddable encoded image bytes (empty when `format === "unknown"`). */
+  data: Uint8Array;
+}
 export interface TextLine extends Box {
   text: string;
 }
@@ -860,6 +878,22 @@ export class GigaPdfDoc {
    */
   textElements(page: number): TextElementInfo[] {
     return this.g._json((o) => this.ex().gp_text_elements_json(this.h, page, o));
+  }
+  /**
+   * Every image element on a page: its placement box (user space, bottom-left),
+   * the embeddable encoded bytes (`data`) + `format` (`jpeg`/`png`/`jp2`/
+   * `unknown`), and the source pixel dimensions. DCTDecode/JPXDecode images pass
+   * through as jpeg/jp2; Flate/raw DeviceRGB|DeviceGray are re-encoded to PNG.
+   * The native replacement for a reader's image extraction (bytes + placement).
+   */
+  imageElements(page: number): ImageElementInfo[] {
+    const raw = this.g._json<Array<Omit<ImageElementInfo, 'data'> & { dataBase64: string }>>((o) =>
+      this.ex().gp_image_elements_json(this.h, page, o)
+    );
+    return raw.map(({ dataBase64, ...rest }) => ({
+      ...rest,
+      data: this.g._fromBase64(dataBase64),
+    }));
   }
   structuredText(page: number): TextLine[] {
     return this.g._json((o) => this.ex().gp_structured_text_json(this.h, page, o));

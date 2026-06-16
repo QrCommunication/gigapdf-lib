@@ -4,6 +4,23 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.29.0] - 2026-06-16
+
+### Added
+
+- **Image extraction — `imageElements(page)`** (ABI `gp_image_elements_json`,
+  `Document::page_image_elements`). Returns each image placement as
+  `{ index, x, y, width, height, format, pixelWidth, pixelHeight, data }` —
+  bounds in user space (origin bottom-left), `data` the **embeddable encoded
+  bytes**: DCTDecode/JPXDecode images pass through as `jpeg`/`jp2`, Flate/raw
+  DeviceRGB|DeviceGray 8-bit images are re-encoded to `png` (honouring an 8-bit
+  DeviceGray `/SMask` for alpha), anything else is reported `unknown` with empty
+  bytes. The native replacement for a reader's image extraction (placement +
+  bytes a host can display or re-embed, not just a render). New
+  `ImageElementInfo` type. Closes the image-extraction gap versus pdfjs in the
+  host's parse layer — both text (`textElements`, 0.28.0) and image gates now
+  open.
+
 ## [0.28.0] - 2026-06-16
 
 ### Added

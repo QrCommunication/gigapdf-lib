@@ -51,7 +51,8 @@ pub use annot::Annotation;
 pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, TextRun};
 pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
-    Attachment, Document, EmbeddedFontInfo, SearchMatch, TextElementInfo, TextLayerRun,
+    Attachment, Document, EmbeddedFontInfo, ImageElementInfo, SearchMatch, TextElementInfo,
+    TextLayerRun,
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FormField};

@@ -436,6 +436,49 @@ pub extern "C" fn gp_text_elements_json(
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
+/// Every image element on a page as JSON, for a host editor:
+/// `[{index,x,y,width,height,format,pixelWidth,pixelHeight,dataBase64}]`. Bounds
+/// in user space (origin bottom-left); `format` is `jpeg`/`png`/`jp2`/`unknown`;
+/// `dataBase64` is the embeddable encoded bytes (empty when `unknown`). Host
+/// frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_image_elements_json(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let fnum = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let mut s = String::from("[");
+            for (i, e) in doc.page_image_elements(page).iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!(
+                    "{{\"index\":{},\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"format\":",
+                    e.index,
+                    fnum(e.x),
+                    fnum(e.y),
+                    fnum(e.width),
+                    fnum(e.height)
+                ));
+                json_escape(&e.format, &mut s);
+                s.push_str(&format!(
+                    ",\"pixelWidth\":{},\"pixelHeight\":{},\"dataBase64\":",
+                    e.pixel_width, e.pixel_height
+                ));
+                json_escape(&gigapdf_core::convert::base64(&e.data), &mut s);
+                s.push('}');
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Index of the element at page point `(x, y)`, or -1 if none.
 #[no_mangle]
 pub extern "C" fn gp_element_at(handle: *const Document, page: u32, x: f64, y: f64) -> i32 {
