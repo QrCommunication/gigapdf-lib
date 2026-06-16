@@ -236,6 +236,20 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(giga.rgbaToPng(new Uint8Array(3), w, h).length).toBe(0);
   });
 
+  it("resizes raw RGBA natively (downscale averages, alpha-correct)", () => {
+    // 2×2 (red, green, blue, white) → 1×1 averages to ~ (128,128,128).
+    const src = new Uint8Array([
+      255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    ]);
+    const out = giga.resizeRgba(src, 2, 2, 1, 1);
+    expect(out.length).toBe(4);
+    for (let c = 0; c < 3; c++) expect(Math.abs(out[c]! - 128)).toBeLessThanOrEqual(2);
+    expect(out[3]).toBe(255);
+    // Upscale keeps a flat colour flat; bad input → empty.
+    expect(giga.resizeRgba(new Uint8Array([10, 20, 30, 255]), 1, 1, 3, 2).length).toBe(3 * 2 * 4);
+    expect(giga.resizeRgba(new Uint8Array(3), 1, 1, 2, 2).length).toBe(0);
+  });
+
   it("registers named destinations and resolves links that jump to them by name", () => {
     const doc = giga.open(giga.txtToPdf("Cover"));
     expect(doc.addPage(612, 792, 1)).toBeGreaterThan(0); // page 2

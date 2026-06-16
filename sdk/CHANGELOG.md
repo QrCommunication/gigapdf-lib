@@ -4,6 +4,17 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.22.0] - 2026-06-16
+
+### Added
+
+- **`resizeRgba(rgba, sw, sh, dw, dh)`** — native alpha-correct image resampling
+  (ABI `gp_resize_rgba`; `raster::resize_rgba`). Separable triangle kernel whose
+  support scales with the downscale factor (averages when shrinking, interpolates
+  when enlarging); alpha is premultiplied during filtering so transparent/coloured
+  edges don't fringe. Next piece of the native raster toolkit replacing `sharp`
+  for resize/thumbnail work — no third-party image library.
+
 ## [0.21.0] - 2026-06-16
 
 ### Added

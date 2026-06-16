@@ -251,6 +251,17 @@ export class GigaPdfEngine {
       this._buffer((o) => this.ex.gp_rgba_to_png(width, height, p, l, o))
     );
   }
+  /**
+   * Resample raw **RGBA** pixels (`sw`×`sh`) to `dw`×`dh` with the engine's
+   * native alpha-correct resampler (triangle kernel, footprint scaled for
+   * down/up) — no third-party image library. Returns the resized RGBA
+   * (`dw*dh*4`), or an empty array on a bad input.
+   */
+  resizeRgba(rgba: Uint8Array, sw: number, sh: number, dw: number, dh: number): Uint8Array {
+    return this._withBytes(rgba, (p, l) =>
+      this._buffer((o) => this.ex.gp_resize_rgba(p, l, sw, sh, dw, dh, o))
+    );
+  }
 
   // ── fonts (catalog / Google Fonts URL — the host performs the fetch) ───────
   fontCatalog(): FontInfo[] {

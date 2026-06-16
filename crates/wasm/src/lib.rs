@@ -1215,6 +1215,29 @@ pub extern "C" fn gp_rgba_to_png(
     unsafe { bytes_into_host(png, out_len) }
 }
 
+/// Resample raw RGBA pixels (`sw`×`sh`, `sw*sh*4` bytes) to `dw`×`dh` with the
+/// engine's native alpha-correct resampler — no third-party image library.
+/// Returns the resized RGBA (`dw*dh*4`), or a 0-length buffer on a bad input.
+/// Host frees the result.
+#[no_mangle]
+pub extern "C" fn gp_resize_rgba(
+    src_ptr: *const u8,
+    src_len: usize,
+    sw: u32,
+    sh: u32,
+    dw: u32,
+    dh: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let out = if src_ptr.is_null() {
+        Vec::new()
+    } else {
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, src_len) };
+        gigapdf_core::raster::resize_rgba(src, sw, sh, dw, dh)
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
 // ─── conversions & compression ───────────────────────────────────────────────
 //
 // All buffer-returning (host frees the result). Office exporters reconstruct

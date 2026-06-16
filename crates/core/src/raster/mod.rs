@@ -11,7 +11,10 @@ pub mod ocr_model;
 pub mod png;
 pub mod png_decode;
 pub mod render;
+pub mod resize;
 
 pub use canvas::Canvas;
 pub use png::encode_png;
+pub use png_decode::decode_png;
 pub use render::render_content;
+pub use resize::resize_rgba;
