@@ -8,6 +8,7 @@
 //! CA-backed identity.
 
 pub mod der;
+pub mod pkcs12;
 
 use crate::crypto::rsa::RsaPrivateKey;
 use crate::crypto::sha256::sha256;

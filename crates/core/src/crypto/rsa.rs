@@ -85,6 +85,21 @@ impl RsaPrivateKey {
         })
     }
 
+    /// Rebuild a key from its public modulus `n`, public exponent `e` and
+    /// private exponent `d` (big-endian magnitudes) — e.g. the integers parsed
+    /// out of a PKCS#1 `RSAPrivateKey` imported from a `.p12`. The CRT factors
+    /// (`p`, `q`, …) are not needed: signing uses the straight `mᵈ mod n`.
+    pub fn from_components(n_be: &[u8], e_be: &[u8], d_be: &[u8]) -> RsaPrivateKey {
+        let n = BigUint::from_bytes_be(n_be);
+        let modulus_len = n.to_bytes_be().len();
+        RsaPrivateKey {
+            n,
+            e: BigUint::from_bytes_be(e_be),
+            d: BigUint::from_bytes_be(d_be),
+            modulus_len,
+        }
+    }
+
     /// RSASSA-PKCS#1 v1.5 signature of `message` using SHA-256. Returns the
     /// `modulus_len`-byte big-endian signature.
     pub fn sign_sha256(&self, message: &[u8]) -> Vec<u8> {
