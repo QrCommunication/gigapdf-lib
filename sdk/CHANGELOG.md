@@ -4,6 +4,19 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.25.0] - 2026-06-16
+
+### Added
+
+- **Native lossless WebP (VP8L) codec** — `encodeWebp(rgba, w, h)` and
+  `decodeWebp(bytes)` (ABIs `gp_encode_webp` / `gp_decode_webp`;
+  `raster::webp`). From-scratch RIFF/WebP container + VP8L bitstream: a
+  full canonical-Huffman encoder (code-length-code RLE serialization) writing
+  literal pixels, and a decoder for that stream (single Huffman group, optional
+  colour cache). Exact lossless round-trip. Lossy VP8 and extended/animated WebP
+  are out of scope (decode returns `null`). The native WebP path toward dropping
+  a third-party image library.
+
 ## [0.24.0] - 2026-06-16
 
 ### Added

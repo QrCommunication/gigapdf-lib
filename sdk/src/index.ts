@@ -284,6 +284,22 @@ export class GigaPdfEngine {
   decodeGif(gif: Uint8Array): DecodedImage | null {
     return this._decodeFramed(gif, (p, l, o) => this.ex.gp_decode_gif(p, l, o));
   }
+  /**
+   * Encode raw RGBA pixels to a **lossless** WebP (VP8L) with the engine's native
+   * encoder — no third-party image library. Empty array on a bad input.
+   */
+  encodeWebp(rgba: Uint8Array, width: number, height: number): Uint8Array {
+    return this._withBytes(rgba, (p, l) =>
+      this._buffer((o) => this.ex.gp_encode_webp(width, height, p, l, o))
+    );
+  }
+  /**
+   * Decode a **lossless** (VP8L) WebP to `{ width, height, rgba }`, or `null`.
+   * Lossy (VP8) and extended/animated WebP are not handled (returns `null`).
+   */
+  decodeWebp(webp: Uint8Array): DecodedImage | null {
+    return this._decodeFramed(webp, (p, l, o) => this.ex.gp_decode_webp(p, l, o));
+  }
   /** Unpack a `[w:u32 LE][h:u32 LE][rgba]` decode buffer; `null` if empty. */
   _decodeFramed(
     bytes: Uint8Array,

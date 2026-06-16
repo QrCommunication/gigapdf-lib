@@ -1315,6 +1315,38 @@ pub extern "C" fn gp_decode_gif(ptr: *const u8, len: usize, out_len: *mut usize)
     unsafe { bytes_into_host(out, out_len) }
 }
 
+/// Encode raw RGBA pixels to a **lossless** WebP (VP8L) with the engine's native
+/// encoder — no third-party image library. 0-length on a bad input. Host frees.
+#[no_mangle]
+pub extern "C" fn gp_encode_webp(
+    width: u32,
+    height: u32,
+    rgba_ptr: *const u8,
+    rgba_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let out = if rgba_ptr.is_null() {
+        Vec::new()
+    } else {
+        let rgba = unsafe { std::slice::from_raw_parts(rgba_ptr, rgba_len) };
+        gigapdf_core::raster::webp::encode_webp(width, height, rgba)
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
+/// Decode a **lossless** (VP8L) WebP to `[w: u32 LE][h: u32 LE][rgba]`. Empty for
+/// lossy (VP8) / extended WebP or a malformed stream. Host frees the result.
+#[no_mangle]
+pub extern "C" fn gp_decode_webp(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let out = if ptr.is_null() {
+        Vec::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        frame_image(gigapdf_core::raster::webp::decode_webp(bytes))
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
 // ─── conversions & compression ───────────────────────────────────────────────
 //
 // All buffer-returning (host frees the result). Office exporters reconstruct

@@ -14,6 +14,7 @@ pub mod png;
 pub mod png_decode;
 pub mod render;
 pub mod resize;
+pub mod webp;
 
 pub use canvas::Canvas;
 pub use png::encode_png;

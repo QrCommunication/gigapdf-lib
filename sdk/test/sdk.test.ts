@@ -278,6 +278,15 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(pdec!.width).toBe(w);
     expect(Array.from(pdec!.rgba.slice(0, 4))).toEqual([0, 100, 50, 255]);
     expect(giga.decodeJpeg(new Uint8Array([1, 2, 3]))).toBeNull();
+
+    // Lossless WebP (VP8L) round-trips exactly.
+    const webp = giga.encodeWebp(rgba, w, h);
+    expect(new TextDecoder().decode(webp.slice(0, 4))).toBe("RIFF");
+    expect(new TextDecoder().decode(webp.slice(8, 12))).toBe("WEBP");
+    const wdec = giga.decodeWebp(webp);
+    expect(wdec).not.toBeNull();
+    expect(wdec!.width).toBe(w);
+    expect(Array.from(wdec!.rgba.slice(0, 4))).toEqual([0, 100, 50, 255]);
   });
 
   it("registers named destinations and resolves links that jump to them by name", () => {
