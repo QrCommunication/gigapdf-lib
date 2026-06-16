@@ -3225,6 +3225,10 @@ impl Document {
     }
 
     /// Produce a new PDF containing only the given 1-based pages, in that order.
+    ///
+    /// The extracted chunk is **self-contained**: references that point at pages
+    /// left behind (GoTo links, AcroForm fields, named destinations, outline
+    /// dests) are neutralised or dropped so no orphaned page survives the gc.
     pub fn extract_pages(&self, pages: &[u32]) -> Result<Vec<u8>> {
         let all = self.page_ids()?;
         let selected: Vec<ObjectId> = pages
@@ -3234,10 +3238,348 @@ impl Document {
         if selected.is_empty() {
             return Err(EngineError::PageNotFound(0));
         }
+        let kept: BTreeSet<ObjectId> = selected.iter().copied().collect();
+        let dropped: BTreeSet<ObjectId> =
+            all.iter().copied().filter(|id| !kept.contains(id)).collect();
         let mut clone = self.clone();
         clone.rebuild_page_tree(&selected)?;
+        if !dropped.is_empty() {
+            clone.prune_cross_page_references(&kept, &dropped);
+        }
         clone.gc();
         Ok(clone.save())
+    }
+
+    /// The page object id an explicit destination array points at (its first
+    /// element), if that element is a page reference.
+    fn explicit_dest_target(&self, dest: &Object) -> Option<ObjectId> {
+        self.resolve(dest)
+            .as_array()
+            .and_then(<[Object]>::first)
+            .and_then(Object::as_reference)
+    }
+
+    /// The page object id a GoTo annotation/outline dict targets — from its
+    /// `/Dest` array or its `/A` `GoTo` `/D` array — when it is an explicit page
+    /// reference (named-string destinations resolve via `/Dests`, pruned apart).
+    fn goto_target_page(&self, dict: &Dictionary) -> Option<ObjectId> {
+        if let Some(dest) = dict.get(b"Dest") {
+            if let Some(id) = self.explicit_dest_target(dest) {
+                return Some(id);
+            }
+        }
+        let action = dict
+            .get(b"A")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        if action.get(b"S").and_then(Object::as_name) == Some(b"GoTo".as_slice()) {
+            if let Some(d) = action.get(b"D") {
+                return self.explicit_dest_target(d);
+            }
+        }
+        None
+    }
+
+    /// Remove references to pages outside the extracted set so the chunk is
+    /// self-contained. Called by [`Self::extract_pages`] before `gc`.
+    fn prune_cross_page_references(
+        &mut self,
+        kept: &BTreeSet<ObjectId>,
+        dropped: &BTreeSet<ObjectId>,
+    ) {
+        let widget_page = self.build_widget_page_map(kept, dropped);
+        self.neutralise_cross_page_links(kept, dropped);
+        self.prune_acroform_fields(dropped, &widget_page);
+        self.prune_named_dests(dropped);
+        self.prune_outline_dests(dropped);
+    }
+
+    /// Map each page annotation/widget id to the page object id whose `/Annots`
+    /// contains it, across all original pages (kept ∪ dropped). Lets us locate a
+    /// form widget's page even when its `/P` back-pointer is absent.
+    fn build_widget_page_map(
+        &self,
+        kept: &BTreeSet<ObjectId>,
+        dropped: &BTreeSet<ObjectId>,
+    ) -> BTreeMap<ObjectId, ObjectId> {
+        let mut map = BTreeMap::new();
+        for page_id in kept.iter().chain(dropped.iter()) {
+            let annots: Vec<ObjectId> = self
+                .objects
+                .get(page_id)
+                .and_then(Object::as_dict)
+                .and_then(|d| d.get(b"Annots"))
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .map(|arr| arr.iter().filter_map(Object::as_reference).collect())
+                .unwrap_or_default();
+            for annot in annots {
+                map.entry(annot).or_insert(*page_id);
+            }
+        }
+        map
+    }
+
+    /// Whether a form widget sits on a dropped page — by `/Annots` membership
+    /// first (covers widgets with no `/P`), then by its `/P` back-pointer.
+    fn widget_on_dropped(
+        &self,
+        widget_id: ObjectId,
+        dropped: &BTreeSet<ObjectId>,
+        widget_page: &BTreeMap<ObjectId, ObjectId>,
+    ) -> bool {
+        if let Some(page_id) = widget_page.get(&widget_id) {
+            return dropped.contains(page_id);
+        }
+        self.objects
+            .get(&widget_id)
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"P"))
+            .and_then(Object::as_reference)
+            .is_some_and(|p| dropped.contains(&p))
+    }
+
+    /// On every kept page, strip the `/A`/`/Dest` of Link annotations whose
+    /// GoTo target is a dropped page (the annotation stays, but goes inert).
+    fn neutralise_cross_page_links(
+        &mut self,
+        kept: &BTreeSet<ObjectId>,
+        dropped: &BTreeSet<ObjectId>,
+    ) {
+        for &page_id in kept {
+            let annot_ids: Vec<ObjectId> = self
+                .objects
+                .get(&page_id)
+                .and_then(Object::as_dict)
+                .and_then(|d| d.get(b"Annots"))
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .map(|arr| arr.iter().filter_map(Object::as_reference).collect())
+                .unwrap_or_default();
+            for annot_id in annot_ids {
+                let Some(dict) = self.objects.get(&annot_id).and_then(Object::as_dict).cloned()
+                else {
+                    continue;
+                };
+                if self
+                    .goto_target_page(&dict)
+                    .is_some_and(|t| dropped.contains(&t))
+                {
+                    let mut updated = dict;
+                    updated.remove(b"A");
+                    updated.remove(b"Dest");
+                    self.objects.insert(annot_id, Object::Dictionary(updated));
+                }
+            }
+        }
+    }
+
+    /// Drop AcroForm fields whose every widget sits on a dropped page; for a
+    /// multi-widget field, drop only its on-dropped-page widget kids.
+    fn prune_acroform_fields(
+        &mut self,
+        dropped: &BTreeSet<ObjectId>,
+        widget_page: &BTreeMap<ObjectId, ObjectId>,
+    ) {
+        let Ok(catalog_id) = self.catalog_id() else {
+            return;
+        };
+        let Some(catalog) = self.objects.get(&catalog_id).and_then(Object::as_dict).cloned() else {
+            return;
+        };
+        let Some(acro_obj) = catalog.get(b"AcroForm") else {
+            return;
+        };
+        // `/AcroForm` is stored inline in the catalog here, but may be an indirect
+        // reference in third-party PDFs — handle both.
+        let (acro_id, acro) = match acro_obj {
+            Object::Reference(id) => match self.objects.get(id).and_then(Object::as_dict).cloned() {
+                Some(d) => (Some(*id), d),
+                None => return,
+            },
+            other => match other.as_dict() {
+                Some(d) => (None, d.clone()),
+                None => return,
+            },
+        };
+        let fields = acro
+            .get(b"Fields")
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        let mut kept_fields: Vec<Object> = Vec::with_capacity(fields.len());
+        for field in &fields {
+            match field.as_reference() {
+                Some(fid) if !self.retain_field(fid, dropped, widget_page) => {}
+                _ => kept_fields.push(field.clone()),
+            }
+        }
+        if kept_fields.len() == fields.len() {
+            return;
+        }
+        let mut acro = acro;
+        acro.set(b"Fields".to_vec(), Object::Array(kept_fields));
+        match acro_id {
+            Some(id) => {
+                self.objects.insert(id, Object::Dictionary(acro));
+            }
+            None => {
+                let mut catalog = catalog;
+                catalog.set(b"AcroForm".to_vec(), Object::Dictionary(acro));
+                self.objects.insert(catalog_id, Object::Dictionary(catalog));
+            }
+        }
+    }
+
+    /// Whether an AcroForm field keeps at least one widget on a kept page,
+    /// pruning its on-dropped-page widget kids in place. `true` = keep.
+    fn retain_field(
+        &mut self,
+        field_id: ObjectId,
+        dropped: &BTreeSet<ObjectId>,
+        widget_page: &BTreeMap<ObjectId, ObjectId>,
+    ) -> bool {
+        let Some(dict) = self.objects.get(&field_id).and_then(Object::as_dict).cloned() else {
+            return true;
+        };
+        if let Some(kids) = dict.get(b"Kids").and_then(Object::as_array) {
+            let kids = kids.to_vec();
+            let mut surviving: Vec<Object> = Vec::with_capacity(kids.len());
+            for kid in &kids {
+                let on_dropped = kid
+                    .as_reference()
+                    .is_some_and(|kid_id| self.widget_on_dropped(kid_id, dropped, widget_page));
+                if !on_dropped {
+                    surviving.push(kid.clone());
+                }
+            }
+            if surviving.is_empty() {
+                return false;
+            }
+            if surviving.len() != kids.len() {
+                let mut updated = dict;
+                updated.set(b"Kids".to_vec(), Object::Array(surviving));
+                self.objects.insert(field_id, Object::Dictionary(updated));
+            }
+            return true;
+        }
+        // Merged field/widget: the field dict is itself the widget.
+        !self.widget_on_dropped(field_id, dropped, widget_page)
+    }
+
+    /// Remove catalog `/Dests` named destinations that target a dropped page.
+    fn prune_named_dests(&mut self, dropped: &BTreeSet<ObjectId>) {
+        let Ok(catalog_id) = self.catalog_id() else {
+            return;
+        };
+        let Some(catalog) = self.objects.get(&catalog_id).and_then(Object::as_dict).cloned() else {
+            return;
+        };
+        let Some(dests_obj) = catalog.get(b"Dests") else {
+            return;
+        };
+        // `/Dests` is usually an indirect reference, occasionally an inline dict.
+        let (dict_id, mut dict) = match dests_obj {
+            Object::Reference(id) => match self.objects.get(id).and_then(Object::as_dict).cloned() {
+                Some(d) => (Some(*id), d),
+                None => return,
+            },
+            other => match other.as_dict() {
+                Some(d) => (None, d.clone()),
+                None => return,
+            },
+        };
+        let names: Vec<Vec<u8>> = dict.0.keys().cloned().collect();
+        let mut changed = false;
+        for name in names {
+            let drop_entry = dict
+                .get(&name)
+                .and_then(|val| self.dest_value_target(val))
+                .is_some_and(|t| dropped.contains(&t));
+            if drop_entry {
+                dict.remove(&name);
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        match dict_id {
+            Some(id) => {
+                self.objects.insert(id, Object::Dictionary(dict));
+            }
+            None => {
+                let mut catalog = catalog;
+                catalog.set(b"Dests".to_vec(), Object::Dictionary(dict));
+                self.objects.insert(catalog_id, Object::Dictionary(catalog));
+            }
+        }
+    }
+
+    /// The page id a named-destination value (an array `[pageRef …]` or a dict
+    /// `{ /D [pageRef …] }`) resolves to, if it is an explicit page reference.
+    fn dest_value_target(&self, val: &Object) -> Option<ObjectId> {
+        let resolved = self.resolve(val);
+        if let Some(arr) = resolved.as_array() {
+            return arr.first().and_then(Object::as_reference);
+        }
+        if let Some(inner) = resolved.as_dict().and_then(|d| d.get(b"D")) {
+            return self.explicit_dest_target(inner);
+        }
+        None
+    }
+
+    /// Strip the `/Dest`/`/A` of outline (bookmark) items whose GoTo target is a
+    /// dropped page, so the outline keeps no orphaned page alive.
+    fn prune_outline_dests(&mut self, dropped: &BTreeSet<ObjectId>) {
+        let Some(outlines_id) = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"Outlines"))
+            .and_then(Object::as_reference)
+        else {
+            return;
+        };
+        let mut ids: Vec<ObjectId> = Vec::new();
+        let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
+        let mut stack: Vec<ObjectId> = self
+            .objects
+            .get(&outlines_id)
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"First"))
+            .and_then(Object::as_reference)
+            .into_iter()
+            .collect();
+        let mut guard = 0;
+        while let Some(id) = stack.pop() {
+            guard += 1;
+            if guard > 100_000 || !seen.insert(id) {
+                continue;
+            }
+            ids.push(id);
+            if let Some(d) = self.objects.get(&id).and_then(Object::as_dict) {
+                if let Some(child) = d.get(b"First").and_then(Object::as_reference) {
+                    stack.push(child);
+                }
+                if let Some(next) = d.get(b"Next").and_then(Object::as_reference) {
+                    stack.push(next);
+                }
+            }
+        }
+        for id in ids {
+            let Some(dict) = self.objects.get(&id).and_then(Object::as_dict).cloned() else {
+                continue;
+            };
+            if self
+                .goto_target_page(&dict)
+                .is_some_and(|t| dropped.contains(&t))
+            {
+                let mut updated = dict;
+                updated.remove(b"Dest");
+                updated.remove(b"A");
+                self.objects.insert(id, Object::Dictionary(updated));
+            }
+        }
     }
 
     /// Append all pages of another PDF to the end of this document.
@@ -6523,6 +6865,41 @@ mod tests {
         );
         // A second flatten is a harmless no-op.
         assert_eq!(doc.flatten_form().unwrap(), 0, "re-flatten is a no-op");
+    }
+
+    #[test]
+    fn extract_pages_yields_self_contained_chunks() {
+        // Five-page host doc with a form field on page 2 and a page-1 → page-5 link.
+        let pdf = crate::convert::reverse::txt_to_pdf("page one");
+        let mut doc = Document::open(&pdf).unwrap();
+        for _ in 0..4 {
+            let after = doc.page_ids().unwrap().len() as u32;
+            doc.add_page(612.0, 792.0, after).unwrap();
+        }
+        assert_eq!(doc.page_ids().unwrap().len(), 5);
+        let style = form::FieldStyle::default();
+        doc.add_text_field(2, "fld", [50.0, 700.0, 300.0, 720.0], "", None, false, false, &style)
+            .unwrap();
+        doc.add_goto_link(1, [50.0, 600.0, 200.0, 620.0], 5).unwrap();
+        assert_eq!(doc.form_fields().unwrap().len(), 1);
+
+        // Chunk A = pages 1-3: the field's page (2) is in-chunk → field survives;
+        // the page-1 link targets page 5 (dropped) → neutralised, no orphan kept.
+        let chunk_a = Document::open(&doc.extract_pages(&[1, 2, 3]).unwrap()).unwrap();
+        assert_eq!(chunk_a.page_ids().unwrap().len(), 3, "chunk A keeps 3 pages");
+        assert_eq!(
+            chunk_a.form_fields().unwrap().len(),
+            1,
+            "in-chunk field survives extraction"
+        );
+
+        // Chunk B = pages 4-5: the field lived on page 2 (out-of-chunk) → dropped.
+        let chunk_b = Document::open(&doc.extract_pages(&[4, 5]).unwrap()).unwrap();
+        assert_eq!(chunk_b.page_ids().unwrap().len(), 2, "chunk B keeps 2 pages");
+        assert!(
+            chunk_b.form_fields().unwrap().is_empty(),
+            "out-of-chunk field dropped from extraction"
+        );
     }
 
     #[test]

@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-06-16
+
+### Changed
+
+- **`extractPages` now produces self-contained chunks.** Page extraction (used
+  by document *split*) prunes every reference that points at a page left behind,
+  then garbage-collects the orphans:
+  - cross-page GoTo **link** actions are neutralised — the annotation stays on
+    its page but its `/A`/`/Dest` are stripped (no dangling ref);
+  - **AcroForm fields** whose widgets all sit on dropped pages are removed, and
+    for multi-widget fields only the on-dropped-page widget kids are dropped;
+  - catalog named **`/Dests`** targeting dropped pages are omitted;
+  - **outline** (bookmark) dests to dropped pages are cleared.
+
+  A widget's page is located by `/Annots` membership (so widgets with no `/P`
+  are still handled), and `/AcroForm`/`/Dests` are pruned whether stored inline
+  in the catalog or as indirect references. Object ids are preserved, so
+  in-chunk links, fields and bookmarks keep resolving natively.
+
 ## [0.14.1] - 2026-06-16
 
 ### Changed
