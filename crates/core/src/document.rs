@@ -2687,6 +2687,42 @@ impl Document {
         Ok(forms.len())
     }
 
+    /// Flatten the interactive form: bake every field widget's appearance into
+    /// its page content (across all pages) and drop `/AcroForm` so the document
+    /// is no longer fillable — nor enumerable as a form (`fields()` returns
+    /// empty afterwards). Returns the number of widgets baked. A no-op
+    /// (returns 0) when there is no AcroForm.
+    pub fn flatten_form(&mut self) -> Result<usize> {
+        let has_form = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"AcroForm"))
+            .is_some();
+        if !has_form {
+            return Ok(0);
+        }
+
+        // Bake widget appearances into the page content, page by page.
+        let mut baked = 0;
+        for page_no in 1..=self.page_count() as u32 {
+            baked += self.flatten_annotations(page_no)?;
+        }
+
+        // Drop the interactive layer: the values are now painted into the
+        // pages, so remove `/AcroForm` (fields, /DR, /NeedAppearances) entirely.
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?
+            .clone();
+        catalog.remove(b"AcroForm");
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+
+        Ok(baked)
+    }
+
     // ─── page operations & metadata ──────────────────────────────────────────
 
     /// Set a page's rotation (normalized to 0/90/180/270 degrees).
@@ -6093,5 +6129,47 @@ mod tests {
             saved.windows(16).any(|w| w == b"/NeedAppearances"),
             "NeedAppearances set"
         );
+    }
+
+    #[test]
+    fn flatten_form_bakes_and_removes_acroform() {
+        let pdf = crate::convert::reverse::txt_to_pdf("flatten host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default();
+        doc.add_text_field(
+            1,
+            "name",
+            [50.0, 700.0, 300.0, 720.0],
+            "Jane",
+            None,
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+        doc.add_checkbox(1, "agree", [50.0, 670.0, 64.0, 684.0], true, "Yes", &style)
+            .unwrap();
+        assert_eq!(
+            doc.form_fields().unwrap().len(),
+            2,
+            "two fields before flat"
+        );
+
+        let baked = doc.flatten_form().unwrap();
+        assert_eq!(baked, 2, "both widgets baked");
+
+        // After flattening, the form is gone: no fields, no /AcroForm.
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(
+            reopened.form_fields().unwrap().is_empty(),
+            "no fields after flatten"
+        );
+        let saved = doc.save();
+        assert!(
+            !saved.windows(9).any(|w| w == b"/AcroForm"),
+            "/AcroForm removed"
+        );
+        // A second flatten is a harmless no-op.
+        assert_eq!(doc.flatten_form().unwrap(), 0, "re-flatten is a no-op");
     }
 }

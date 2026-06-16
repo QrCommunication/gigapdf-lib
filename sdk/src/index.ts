@@ -1155,6 +1155,15 @@ export class GigaPdfDoc {
   flattenAnnotations(page: number): number {
     return this.ex().gp_flatten_annotations(this.h, page);
   }
+  /**
+   * Flatten the interactive form: bake every field widget across all pages into
+   * the page content and drop `/AcroForm`, so the document is no longer
+   * fillable and {@link fields} returns empty afterwards. Returns the number of
+   * widgets baked (0 when there is no form).
+   */
+  flattenForm(): number {
+    return this.ex().gp_flatten_form(this.h);
+  }
 
   // hyperlinks
   links(page: number): LinkInfo[] {

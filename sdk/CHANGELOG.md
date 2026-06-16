@@ -4,6 +4,16 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-06-16
+
+### Added
+
+- **`doc.flattenForm()`** — flatten the whole interactive form: bake every field
+  widget across **all pages** into the page content and drop `/AcroForm`, so the
+  result is no longer fillable and `fields()` returns empty afterwards. Returns
+  the number of widgets baked (0 when there is no form). Complements the
+  per-page `flattenAnnotations(page)`. ABI `gp_flatten_form`.
+
 ## [0.11.0] - 2026-06-16
 
 ### Added

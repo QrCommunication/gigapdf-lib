@@ -1860,6 +1860,20 @@ pub extern "C" fn gp_flatten_annotations(handle: *mut Document, page: u32) -> i3
     }
 }
 
+/// Flatten the whole interactive form: bake every field widget across all pages
+/// and drop `/AcroForm`. Returns the number of widgets baked, or a negative
+/// error code.
+#[no_mangle]
+pub extern "C" fn gp_flatten_form(handle: *mut Document) -> i32 {
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.flatten_form() {
+            Ok(count) => count as i32,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
 // ─── metadata ────────────────────────────────────────────────────────────────
 
 /// Set a document info-dictionary entry (e.g. "Title", "Author"). 0 on success.
