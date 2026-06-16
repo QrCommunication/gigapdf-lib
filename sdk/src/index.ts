@@ -29,6 +29,9 @@ const dec = new TextDecoder();
 export class GigaPdfEngine {
   private constructor(private readonly ex: Exports) {}
 
+  /** Lazily-built Base64 reverse-lookup table (see {@link _fromBase64}). */
+  private static _b64rev?: Int16Array;
+
   /** Instantiate from raw wasm bytes, a URL/path, or a Response. */
   static async load(source: ArrayBuffer | Uint8Array | string | Response): Promise<GigaPdfEngine> {
     let bytes: ArrayBuffer | Uint8Array;
@@ -98,6 +101,37 @@ export class GigaPdfEngine {
   _json<T = unknown>(call: (outLenPtr: number) => number): T {
     const s = this._str(call);
     return (s ? JSON.parse(s) : []) as T;
+  }
+  /**
+   * Decode standard Base64 (RFC 4648) to bytes. Pure-JS table decode, so it
+   * works identically in Node and the browser with no dependency (used to turn
+   * the JSON `dataBase64` of {@link GigaPdfDoc.attachments} back into bytes).
+   */
+  _fromBase64(s: string): Uint8Array {
+    let rev = GigaPdfEngine._b64rev;
+    if (!rev) {
+      rev = new Int16Array(256).fill(-1);
+      const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      for (let i = 0; i < alphabet.length; i++) rev[alphabet.charCodeAt(i)] = i;
+      GigaPdfEngine._b64rev = rev;
+    }
+    let count = s.length;
+    while (count > 0 && s[count - 1] === '=') count--;
+    const out = new Uint8Array((count * 3) >> 2);
+    let acc = 0;
+    let bits = 0;
+    let oi = 0;
+    for (let i = 0; i < count; i++) {
+      const v = rev[s.charCodeAt(i)];
+      if (v === undefined || v < 0) continue; // skip stray whitespace defensively
+      acc = (acc << 6) | v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out[oi++] = (acc >> bits) & 0xff;
+      }
+    }
+    return oi === out.length ? out : out.subarray(0, oi);
   }
   /** Pass a string argument; runs `fn(ptr, len)` then frees. */
   _withStr<T>(s: string, fn: (ptr: number, len: number) => T): T {
@@ -673,6 +707,27 @@ export interface OutlineEntry {
 export interface NamedDest {
   name: string;
   page: number;
+}
+/**
+ * One embedded file attachment read back by {@link GigaPdfDoc.attachments}.
+ * `data` is the decoded file bytes; `mime`/`description`/dates are `null` when
+ * the PDF didn't record them.
+ */
+export interface Attachment {
+  /** The `/EmbeddedFiles` name-tree key the file was registered under. */
+  name: string;
+  /** The filespec display filename (`/UF` preferred, else `/F`). */
+  filename: string;
+  /** The embedded stream's `/Subtype` MIME (e.g. `application/pdf`), or null. */
+  mime: string | null;
+  /** The filespec `/Desc` human description, or null. */
+  description: string | null;
+  /** The `/Params /CreationDate` PDF date string, or null. */
+  creationDate: string | null;
+  /** The `/Params /ModDate` PDF date string, or null. */
+  modDate: string | null;
+  /** The decoded (filters applied) file bytes. */
+  data: Uint8Array;
 }
 /** One sheet read back from an `.xlsx` by {@link GigaPdfEngine.xlsxToGrids}. */
 export interface XlsxSheet {
@@ -1595,6 +1650,23 @@ export class GigaPdfDoc {
   /** The catalog's named destinations as `{name, page}` pairs. */
   namedDests(): NamedDest[] {
     return this.g._json((o) => this.ex().gp_named_dests_json(this.h, o));
+  }
+  /**
+   * Every embedded file attachment in the document's `/Names /EmbeddedFiles`
+   * name tree, decoded. Each {@link Attachment} carries the name-tree key, the
+   * filespec display name (`/UF`/`/F`), the embedded stream's MIME (`/Subtype`)
+   * and `/Params` dates, and the decoded bytes. Entries that don't resolve to a
+   * readable embedded stream are skipped, so the result is only extractable
+   * files (the native replacement for a reader's `getAttachments()`).
+   */
+  attachments(): Attachment[] {
+    const raw = this.g._json<Array<Omit<Attachment, 'data'> & { dataBase64: string }>>((o) =>
+      this.ex().gp_attachments_json(this.h, o)
+    );
+    return raw.map(({ dataBase64, ...rest }) => ({
+      ...rest,
+      data: this.g._fromBase64(dataBase64),
+    }));
   }
   /**
    * Add an internal hyperlink over a rectangle that jumps to the named

@@ -69,8 +69,9 @@ pub struct ConvPage {
 }
 
 /// Standard Base64 (RFC 4648) of `data` — for embedding images as `data:` URIs
-/// in the HTML export. Zero-dependency.
-pub(crate) fn base64(data: &[u8]) -> String {
+/// in the HTML export, and for handing decoded attachment/stream bytes to the
+/// WASM host as JSON. Zero-dependency.
+pub fn base64(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

@@ -229,6 +229,7 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `outline()` | `OutlineEntry[]` | The bookmark tree (`{ title, page, level }`). |
 | `setOutline(entries)` | `boolean` | Replace the bookmark tree. |
 | `getMetadata(key)` / `setMetadata(key, value)` | `string` / `boolean` | Read/write an Info-dictionary entry (`Title`, `Author`, …). |
+| `attachments()` | `Attachment[]` | Extract every embedded file from the `/Names /EmbeddedFiles` name tree: `{ name, filename, mime, description, creationDate, modDate, data }` where `data` is the decoded bytes. The native replacement for a reader's `getAttachments()`. |
 
 ### Conversions (PDF → X)
 

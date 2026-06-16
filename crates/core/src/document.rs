@@ -244,6 +244,28 @@ pub struct EmbeddedFontInfo {
     pub format: String,
 }
 
+/// One embedded file attachment (from [`Document::attachments`]). Mirrors what a
+/// reader's `getAttachments()` exposes: the name-tree key, the filespec display
+/// name (`/UF` or `/F`), the optional embedded-stream MIME (`/Subtype`),
+/// description (`/Desc`) and `/Params` dates, plus the decoded file bytes.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    /// The `/EmbeddedFiles` name-tree key the file was registered under.
+    pub name: String,
+    /// The filespec display filename (`/UF` preferred, else `/F`, else `name`).
+    pub filename: String,
+    /// The embedded stream's `/Subtype` (e.g. `application/pdf`), if present.
+    pub mime: Option<String>,
+    /// The filespec `/Desc` human description, if present.
+    pub description: Option<String>,
+    /// The `/Params /CreationDate` PDF date string, if present.
+    pub creation_date: Option<String>,
+    /// The `/Params /ModDate` PDF date string, if present.
+    pub mod_date: Option<String>,
+    /// The decoded (filters applied) file bytes.
+    pub data: Vec<u8>,
+}
+
 impl Document {
     /// Parse a PDF from raw bytes.
     pub fn open(bytes: &[u8]) -> Result<Self> {
@@ -4836,6 +4858,107 @@ impl Document {
         out
     }
 
+    /// Every embedded file attachment in the document's `/Names /EmbeddedFiles`
+    /// name tree (ISO 32000-1 §7.7.4 / §7.11.4), decoded. Each [`Attachment`]
+    /// carries the name-tree key, the filespec's `/UF`/`/F` display name, the
+    /// embedded stream's `/Subtype` (MIME) and `/Params` dates, and the decoded
+    /// bytes. Entries that don't resolve to a readable embedded stream are
+    /// skipped, so the result only contains extractable files.
+    pub fn attachments(&self) -> Vec<Attachment> {
+        let Some(root) = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"Names").map(|o| self.resolve(o)))
+            .and_then(Object::as_dict)
+            .and_then(|n| n.get(b"EmbeddedFiles").map(|o| self.resolve(o).clone()))
+        else {
+            return Vec::new();
+        };
+        let mut pairs = Vec::new();
+        self.collect_name_tree(&root, 0, &mut pairs);
+        pairs
+            .iter()
+            .filter_map(|(key, value)| self.filespec_to_attachment(key, value))
+            .collect()
+    }
+
+    /// Collect every `(key, value)` pair in a name tree — the enumerate-all
+    /// counterpart of [`search_name_tree`](Self::search_name_tree).
+    fn collect_name_tree(&self, node: &Object, depth: usize, out: &mut Vec<(Vec<u8>, Object)>) {
+        if depth > 32 {
+            return; // defend against a cyclic /Kids chain
+        }
+        let Some(dict) = self.resolve(node).as_dict() else {
+            return;
+        };
+        if let Some(names) = dict
+            .get(b"Names")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            let mut i = 0;
+            while i + 1 < names.len() {
+                if let Some(bytes) = self.resolve(&names[i]).as_string() {
+                    out.push((bytes.to_vec(), self.resolve(&names[i + 1]).clone()));
+                }
+                i += 2;
+            }
+        }
+        if let Some(kids) = dict
+            .get(b"Kids")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            for kid in kids {
+                self.collect_name_tree(kid, depth + 1, out);
+            }
+        }
+    }
+
+    /// Resolve a filespec dictionary (the value side of an `/EmbeddedFiles`
+    /// name-tree entry) to a decoded [`Attachment`], or `None` if there is no
+    /// readable `/EF` embedded-file stream.
+    fn filespec_to_attachment(&self, key: &[u8], value: &Object) -> Option<Attachment> {
+        let spec = self.resolve(value).as_dict()?;
+        let text = |o: &Object| self.resolve(o).as_string().map(crate::font::decode_pdf_text);
+        let filename = spec
+            .get(b"UF")
+            .or_else(|| spec.get(b"F"))
+            .and_then(&text)
+            .unwrap_or_else(|| String::from_utf8_lossy(key).into_owned());
+        let description = spec.get(b"Desc").and_then(&text);
+        let ef = spec
+            .get(b"EF")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        let stream = ef
+            .get(b"F")
+            .or_else(|| ef.get(b"UF"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)?;
+        let data = crate::filters::decode_stream(stream).ok()?;
+        let mime = stream
+            .dict
+            .get(b"Subtype")
+            .and_then(Object::as_name)
+            .map(|n| String::from_utf8_lossy(n).into_owned());
+        let params = stream
+            .dict
+            .get(b"Params")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict);
+        let date = |k: &[u8]| params.and_then(|p| p.get(k)).and_then(&text);
+        Some(Attachment {
+            name: String::from_utf8_lossy(key).into_owned(),
+            filename,
+            mime,
+            description,
+            creation_date: date(b"CreationDate"),
+            mod_date: date(b"ModDate"),
+            data,
+        })
+    }
+
     /// Add an internal hyperlink over `rect` that jumps to the **named
     /// destination** `dest_name` (define it with [`add_named_dest`]). Unlike
     /// [`add_goto_link`](Self::add_goto_link) (an explicit page reference), this
@@ -7674,6 +7797,78 @@ mod tests {
         let mut b = crate::convert::build::PdfBuilder::new();
         b.add_page(612.0, 792.0);
         Document::open(&b.finish()).unwrap()
+    }
+
+    #[test]
+    fn attachments_reads_embedded_files_name_tree() {
+        let mut doc = blank_doc();
+
+        // An embedded-file stream "hello" with /Subtype + /Params metadata.
+        let mut sdict = Dictionary::new();
+        sdict.set(b"Type", Object::Name(b"EmbeddedFile".to_vec()));
+        sdict.set(b"Subtype", Object::Name(b"text/plain".to_vec()));
+        let mut params = Dictionary::new();
+        params.set(b"Size", Object::Integer(5));
+        params.set(
+            b"CreationDate",
+            Object::String(b"D:20260101000000Z".to_vec(), StringKind::Literal),
+        );
+        sdict.set(b"Params", Object::Dictionary(params));
+        let ef_id = (doc.next_object_number(), 0u16);
+        doc.objects
+            .insert(ef_id, Object::Stream(Stream::new(sdict, b"hello".to_vec())));
+
+        // The filespec dictionary referencing that stream via /EF /F.
+        let mut ef = Dictionary::new();
+        ef.set(b"F", Object::Reference(ef_id));
+        let mut spec = Dictionary::new();
+        spec.set(b"Type", Object::Name(b"Filespec".to_vec()));
+        spec.set(
+            b"F",
+            Object::String(b"notes.txt".to_vec(), StringKind::Literal),
+        );
+        spec.set(
+            b"UF",
+            Object::String(b"notes.txt".to_vec(), StringKind::Literal),
+        );
+        spec.set(
+            b"Desc",
+            Object::String(b"a test file".to_vec(), StringKind::Literal),
+        );
+        spec.set(b"EF", Object::Dictionary(ef));
+
+        // Catalog /Names /EmbeddedFiles → inline name-tree leaf.
+        let mut leaf = Dictionary::new();
+        leaf.set(
+            b"Names",
+            Object::Array(vec![
+                Object::String(b"notes.txt".to_vec(), StringKind::Literal),
+                Object::Dictionary(spec),
+            ]),
+        );
+        let mut names = Dictionary::new();
+        names.set(b"EmbeddedFiles", Object::Dictionary(leaf));
+        let catalog_id = doc.catalog_id().unwrap();
+        let mut catalog = doc
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+        catalog.set(b"Names".to_vec(), Object::Dictionary(names));
+        doc.objects.insert(catalog_id, Object::Dictionary(catalog));
+
+        let atts = doc.attachments();
+        assert_eq!(atts.len(), 1, "one attachment extracted");
+        assert_eq!(atts[0].name, "notes.txt");
+        assert_eq!(atts[0].filename, "notes.txt");
+        assert_eq!(atts[0].data, b"hello");
+        assert_eq!(atts[0].mime.as_deref(), Some("text/plain"));
+        assert_eq!(atts[0].description.as_deref(), Some("a test file"));
+        assert_eq!(atts[0].creation_date.as_deref(), Some("D:20260101000000Z"));
+
+        // A document with no /Names /EmbeddedFiles yields nothing.
+        assert!(blank_doc().attachments().is_empty());
     }
 
     #[test]

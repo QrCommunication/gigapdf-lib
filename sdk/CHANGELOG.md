@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.26.0] - 2026-06-16
+
+### Added
+
+- **Embedded file attachments — `attachments()`** (ABI `gp_attachments_json`,
+  `Document::attachments`). Walks the `/Names /EmbeddedFiles` name tree
+  (ISO 32000-1 §7.11.4) and returns every extractable file as
+  `{ name, filename, mime, description, creationDate, modDate, data }`, where
+  `data` is the **decoded** bytes (stream filters applied) and the optional
+  string fields are `null` when the PDF didn't record them. Filespec
+  `/UF`/`/F` display names plus the embedded stream's `/Subtype` (MIME) and
+  `/Params` dates are surfaced. The native replacement for a reader's
+  `getAttachments()` — closes the last embedded-files gap versus pdfjs in the
+  host's parse layer. New `Attachment` type.
+- Internals supporting it: `Object::as_string()` accessor; a `collect_name_tree`
+  enumerator (the all-entries counterpart of the existing name-tree search);
+  `convert::base64` widened to `pub` so the WASM host receives decoded bytes as
+  JSON; SDK `_fromBase64` (pure-JS Base64 decode, Node + browser).
+
 ## [0.25.0] - 2026-06-16
 
 ### Added

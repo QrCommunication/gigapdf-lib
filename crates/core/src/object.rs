@@ -57,6 +57,15 @@ impl Object {
         }
     }
 
+    /// Borrow the (already-unescaped) string bytes if this is a
+    /// [`Object::String`].
+    pub fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            Object::String(s, _) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Borrow the dictionary if this is a [`Object::Dictionary`] (or the dict of
     /// a [`Object::Stream`]).
     pub fn as_dict(&self) -> Option<&Dictionary> {

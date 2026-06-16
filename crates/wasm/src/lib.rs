@@ -2530,6 +2530,47 @@ pub extern "C" fn gp_named_dests_json(handle: *const Document, out_len: *mut usi
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
+/// Every embedded file attachment as a JSON array
+/// `[{name,filename,mime,description,creationDate,modDate,dataBase64}]`. The
+/// optional string fields are JSON `null` when absent; `dataBase64` is the
+/// decoded file bytes, standard Base64. Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_attachments_json(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let opt = |v: Option<&str>, out: &mut String| match v {
+                Some(s) => json_escape(s, out),
+                None => out.push_str("null"),
+            };
+            let mut s = String::from("[");
+            for (i, att) in doc.attachments().iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"name\":");
+                json_escape(&att.name, &mut s);
+                s.push_str(",\"filename\":");
+                json_escape(&att.filename, &mut s);
+                s.push_str(",\"mime\":");
+                opt(att.mime.as_deref(), &mut s);
+                s.push_str(",\"description\":");
+                opt(att.description.as_deref(), &mut s);
+                s.push_str(",\"creationDate\":");
+                opt(att.creation_date.as_deref(), &mut s);
+                s.push_str(",\"modDate\":");
+                opt(att.mod_date.as_deref(), &mut s);
+                s.push_str(",\"dataBase64\":");
+                json_escape(&gigapdf_core::convert::base64(&att.data), &mut s);
+                s.push('}');
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Add an internal hyperlink over a rectangle that jumps to the named
 /// destination `name` (define it with `gp_add_named_dest`). 0 on success.
 #[no_mangle]

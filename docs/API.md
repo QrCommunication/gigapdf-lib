@@ -121,6 +121,7 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `page_links(page)` | `gp_links_json(handle,page,outlen)` |
 | `set_outline(&[(title,page,level)])` / `outline_items()` | `gp_set_outline(handle,ptr,len) / gp_outline_json` |
 | `get_metadata(key)` / `set_metadata(key,val)` | `gp_get_metadata / gp_set_metadata` |
+| `attachments() -> Vec<Attachment>` (embedded files from `/Names /EmbeddedFiles`) | `gp_attachments_json(handle,outlen)` → `[{name,filename,mime,description,creationDate,modDate,dataBase64}]` |
 
 ## Security
 

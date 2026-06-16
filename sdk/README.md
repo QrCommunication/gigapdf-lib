@@ -136,7 +136,8 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   engine-level `gridsToXlsx`/`gridsToOds` to emit Office output from a
   host-built table grid), security
   (`saveEncrypted`, self-signed `sign`, **PKCS#12** `signP12`), metadata
-  (`getMetadata`, `setMetadata`), annotations (`addSquare`,
+  (`getMetadata`, `setMetadata`), embedded files (`attachments` — extract every
+  `/EmbeddedFiles` entry with its decoded bytes), annotations (`addSquare`,
   `addHighlight`, `addLineAnnotation`, `addFreeText`, `addUnderline`,
   `addStrikeOut`, `addInk`, `addStamp`, `annotations`, `removeAnnotation`,
   `flattenAnnotations`), links (`links`, `addUriLink`, `addGotoLink`, named
