@@ -229,6 +229,17 @@ export class GigaPdfEngine {
       )
     );
   }
+  /**
+   * Read an `.xlsx` workbook back into per-sheet `{ name, rows }` grids — the
+   * inverse of {@link gridsToXlsx} / {@link GigaPdfDoc.toXlsx}. Cell text is
+   * decoded from inline strings, shared strings (`sharedStrings.xml`) or plain
+   * values; sheets come in workbook order. `[]` for a non-xlsx input.
+   */
+  xlsxToGrids(xlsx: Uint8Array): XlsxSheet[] {
+    return this._withBytes(xlsx, (p, l) =>
+      this._json((o) => this.ex.gp_xlsx_to_grids(p, l, o))
+    );
+  }
 
   // ── fonts (catalog / Google Fonts URL — the host performs the fetch) ───────
   fontCatalog(): FontInfo[] {
@@ -592,6 +603,11 @@ export interface OutlineEntry {
 export interface NamedDest {
   name: string;
   page: number;
+}
+/** One sheet read back from an `.xlsx` by {@link GigaPdfEngine.xlsxToGrids}. */
+export interface XlsxSheet {
+  name: string;
+  rows: string[][];
 }
 /** An optional-content layer (calque): toggle `visible`/`locked` to persist in the PDF. */
 export interface LayerInfo {

@@ -4,6 +4,21 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.20.0] - 2026-06-16
+
+### Added
+
+- **Native `.xlsx` reader — `xlsxToGrids(bytes)`** (the inverse of
+  `gridsToXlsx`/`toXlsx`). Reads a workbook back into per-sheet
+  `{ name, rows: string[][] }` grids, in workbook order, decoding **inline
+  strings** (this engine's output), **shared strings** (`sharedStrings.xml`, as
+  Excel and most libraries emit) and plain numeric/`str` cells — pure std, no
+  dependency. Rust `convert::office::xlsx_to_grids`; ABI `gp_xlsx_to_grids`
+  (returns JSON `[{name, rows}]`). New `XlsxSheet` type.
+  - Completes the spreadsheet round-trip and lets GigaPDF drop `exceljs`
+    **entirely** (its xlsx tests now read back through `xlsxToGrids` instead of a
+    third-party reader).
+
 ## [0.19.0] - 2026-06-16
 
 ### Added

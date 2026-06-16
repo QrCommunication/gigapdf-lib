@@ -1333,6 +1333,49 @@ fn parse_sheet_names(ptr: *const u8, len: usize) -> Vec<String> {
     gigapdf_core::convert::grids::strings_from_json(json).unwrap_or_default()
 }
 
+/// Read an `.xlsx` workbook back into per-sheet grids — the inverse of
+/// `gp_grids_to_xlsx` / `gp_to_xlsx`. Returns JSON `[{name, rows: string[][]}]`
+/// in sheet order (inline strings, shared strings and plain values all handled).
+/// Non-xlsx / unreadable input → `[]`. Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_xlsx_to_grids(
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let sheets = if bytes_ptr.is_null() || bytes_len == 0 {
+        Vec::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
+        gigapdf_core::convert::office::xlsx_to_grids(bytes)
+    };
+    let mut s = String::from("[");
+    for (i, (name, rows)) in sheets.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"name\":");
+        json_escape(name, &mut s);
+        s.push_str(",\"rows\":[");
+        for (r, row) in rows.iter().enumerate() {
+            if r > 0 {
+                s.push(',');
+            }
+            s.push('[');
+            for (c, cell) in row.iter().enumerate() {
+                if c > 0 {
+                    s.push(',');
+                }
+                json_escape(cell, &mut s);
+            }
+            s.push(']');
+        }
+        s.push_str("]}");
+    }
+    s.push(']');
+    unsafe { bytes_into_host(s.into_bytes(), out_len) }
+}
+
 /// Convert the document's text to RTF.
 #[no_mangle]
 pub extern "C" fn gp_to_rtf(handle: *const Document, out_len: *mut usize) -> *mut u8 {

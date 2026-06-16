@@ -215,6 +215,14 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(ods[1]).toBe(0x4b);
     // Malformed/empty grid yields a valid single-sheet workbook (no throw).
     expect(giga.gridsToXlsx([]).length).toBeGreaterThan(100);
+
+    // Round-trip: read the workbook back natively (no third-party reader).
+    const sheets = giga.xlsxToGrids(xlsx);
+    expect(sheets.map((s) => s.name)).toEqual(["People", "Notes"]);
+    expect(sheets[0]!.rows[0]).toEqual(["Name", "Age"]);
+    expect(sheets[0]!.rows[1]).toEqual(["Alice", "30"]);
+    expect(sheets[1]!.rows[0]![0]).toBe("Page two");
+    expect(giga.xlsxToGrids(new Uint8Array([1, 2, 3]))).toEqual([]); // non-xlsx
   });
 
   it("registers named destinations and resolves links that jump to them by name", () => {

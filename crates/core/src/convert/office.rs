@@ -1151,6 +1151,190 @@ office:version=\"1.3\"></office:document-styles>",
     zip.finish()
 }
 
+// ─────────────────────────── XLSX reader (inverse) ────────────────────────────
+
+/// Read an `.xlsx` workbook back into per-sheet `(name, rows)` grids — the
+/// inverse of [`to_xlsx`]/[`to_xlsx_named`]. Each `rows[r][c]` is the cell text
+/// (empty string for blank cells); sheets come in `<sheets>` order. Handles both
+/// **inline strings** (this engine's own output) and **shared strings**
+/// (`sharedStrings.xml`, as Excel and most libraries emit), plus plain numeric /
+/// `str` cells. Non-xlsx or unreadable input yields an empty `Vec`. Pure std.
+pub fn xlsx_to_grids(bytes: &[u8]) -> Vec<(String, Vec<Vec<String>>)> {
+    let zip = crate::convert::zip::read_zip(bytes);
+    let names = {
+        let xml = zip
+            .get("xl/workbook.xml")
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        workbook_sheet_names(&xml)
+    };
+    let worksheet_count = zip
+        .keys()
+        .filter(|k| k.starts_with("xl/worksheets/sheet") && k.ends_with(".xml"))
+        .count();
+    let count = names.len().max(worksheet_count);
+    let shared = {
+        let xml = zip
+            .get("xl/sharedStrings.xml")
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        shared_strings(&xml)
+    };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let name = names
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Page {}", i + 1));
+        let grid = zip
+            .get(&format!("xl/worksheets/sheet{}.xml", i + 1))
+            .map(|b| sheet_grid(&String::from_utf8_lossy(b), &shared))
+            .unwrap_or_default();
+        out.push((name, grid));
+    }
+    out
+}
+
+/// The value of attribute `attr` in an opening-tag fragment (`tag` excludes the
+/// surrounding `<` `>`), or `None`.
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let key = format!("{attr}=\"");
+    let start = tag.find(&key)? + key.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+/// Sheet display names from `xl/workbook.xml`, in `<sheets>` order (unescaped).
+fn workbook_sheet_names(xml: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = xml[i..].find("<sheet ") {
+        let start = i + rel + 7;
+        let end = xml[start..].find('>').map_or(xml.len(), |e| start + e);
+        if let Some(name) = attr_value(&xml[start..end], "name") {
+            names.push(crate::convert::reverse::unescape(&name));
+        }
+        i = end;
+    }
+    names
+}
+
+/// The shared-string table from `xl/sharedStrings.xml`: one entry per `<si>`,
+/// concatenating its `<t>` runs (unescaped).
+fn shared_strings(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = xml[i..].find("<si>") {
+        let start = i + rel + 4;
+        let end = xml[start..].find("</si>").map_or(xml.len(), |e| start + e);
+        out.push(collect_t_runs(&xml[start..end]));
+        i = end;
+    }
+    out
+}
+
+/// Concatenate every `<t…>text</t>` run in `s`, unescaping each.
+fn collect_t_runs(s: &str) -> String {
+    let mut text = String::new();
+    let mut i = 0;
+    while let Some(rel) = s[i..].find("<t") {
+        let tag = i + rel;
+        let Some(grel) = s[tag..].find('>') else { break };
+        let body_start = tag + grel + 1;
+        let Some(erel) = s[body_start..].find("</t>") else {
+            break;
+        };
+        let end = body_start + erel;
+        text.push_str(&crate::convert::reverse::unescape(&s[body_start..end]));
+        i = end + 4;
+    }
+    text
+}
+
+/// Parse a worksheet's `<sheetData>` into a dense row/column grid.
+fn sheet_grid(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
+    let mut cells: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = xml[i..].find("<c ") {
+        let cstart = i + rel;
+        let Some(grel) = xml[cstart..].find('>') else { break };
+        let gt = cstart + grel;
+        let open = &xml[cstart..gt];
+        let self_closing = xml.as_bytes().get(gt.wrapping_sub(1)) == Some(&b'/');
+        let r_attr = attr_value(open, "r").unwrap_or_default();
+        let t_attr = attr_value(open, "t").unwrap_or_default();
+        let text = if self_closing {
+            i = gt + 1;
+            String::new()
+        } else {
+            let body_start = gt + 1;
+            let Some(erel) = xml[body_start..].find("</c>") else {
+                break;
+            };
+            let end = body_start + erel;
+            let value = decode_cell(&xml[body_start..end], &t_attr, shared);
+            i = end + 4;
+            value
+        };
+        if let (Some(row), Some(col)) = cell_ref(&r_attr) {
+            cells.push((row, col, text));
+        }
+    }
+    let Some(max_row) = cells.iter().map(|(r, _, _)| *r).max() else {
+        return Vec::new();
+    };
+    let max_col = cells.iter().map(|(_, c, _)| *c).max().unwrap_or(0);
+    let mut grid = vec![vec![String::new(); max_col + 1]; max_row + 1];
+    for (r, c, t) in cells {
+        grid[r][c] = t;
+    }
+    grid
+}
+
+/// Resolve an A1-style cell reference to `(row, col)` 0-based indices.
+fn cell_ref(r: &str) -> (Option<usize>, Option<usize>) {
+    let bytes = r.as_bytes();
+    let mut col = 0usize;
+    let mut seen = false;
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_alphabetic() {
+        col = col * 26 + (bytes[idx].to_ascii_uppercase() - b'A' + 1) as usize;
+        seen = true;
+        idx += 1;
+    }
+    let row = r[idx..].parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+    (row, seen.then(|| col - 1))
+}
+
+/// The text of one `<c>` body, per its `t` attribute: inline string, shared
+/// string (index into `shared`), or a plain `<v>` value.
+fn decode_cell(body: &str, t: &str, shared: &[String]) -> String {
+    match t {
+        "inlineStr" => collect_t_runs(body),
+        "s" => inner_v(body)
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| shared.get(n).cloned())
+            .unwrap_or_default(),
+        _ => crate::convert::reverse::unescape(&inner_v(body)),
+    }
+}
+
+/// The text between the first `<v…>` and `</v>` in a cell body.
+fn inner_v(body: &str) -> String {
+    let Some(p) = body.find("<v") else {
+        return String::new();
+    };
+    let after = &body[p..];
+    let Some(gt) = after.find('>') else {
+        return String::new();
+    };
+    let rest = &after[gt + 1..];
+    rest.find("</v>")
+        .map(|e| rest[..e].to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,6 +1516,60 @@ mod tests {
         )
         .unwrap();
         assert!(wb2.contains("name=\"Page 1\""), "empty name → default");
+    }
+
+    #[test]
+    fn xlsx_round_trips_through_grids() {
+        // Write a workbook, then read it back natively — names, cells (incl.
+        // escaped text) and the blank-row gap survive the round-trip.
+        let grids = vec![
+            vec![
+                vec!["Name".to_string(), "Age".to_string()],
+                vec!["Alice & <b>".to_string(), "30".to_string()],
+                vec![],                            // blank separator row
+                vec!["Bob".to_string(), "".to_string()],
+            ],
+            vec![vec!["café".to_string()]],
+        ];
+        let names = vec!["People".to_string(), "Notes".to_string()];
+        let read = xlsx_to_grids(&to_xlsx_named(&grids, &names));
+
+        assert_eq!(read.len(), 2, "two sheets");
+        assert_eq!(read[0].0, "People");
+        assert_eq!(read[1].0, "Notes");
+        let s0 = &read[0].1;
+        assert_eq!(s0[0], vec!["Name".to_string(), "Age".to_string()]);
+        assert_eq!(s0[1][0], "Alice & <b>", "escaped cell text decoded");
+        // The blank separator row survives as an all-empty row (dense to max col).
+        assert_eq!(s0.len(), 4, "row-index gap preserves the blank row");
+        assert!(s0[2].iter().all(String::is_empty), "blank row is empty");
+        assert_eq!(s0[3][0], "Bob");
+        assert_eq!(read[1].1[0][0], "café", "utf-8 cell preserved");
+    }
+
+    #[test]
+    fn xlsx_reader_decodes_shared_strings() {
+        // A hand-built workbook using a shared-string table (t="s"), as Excel and
+        // most libraries emit — the reader must resolve the indices.
+        use crate::convert::zip::ZipWriter;
+        let mut zip = ZipWriter::new();
+        zip.add_deflated(
+            "xl/workbook.xml",
+            b"<workbook><sheets><sheet name=\"S\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>",
+        );
+        zip.add_deflated(
+            "xl/sharedStrings.xml",
+            b"<sst><si><t>Hello</t></si><si><t>World</t></si></sst>",
+        );
+        zip.add_deflated(
+            "xl/worksheets/sheet1.xml",
+            b"<worksheet><sheetData><row r=\"1\">\
+<c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c>\
+</row></sheetData></worksheet>",
+        );
+        let read = xlsx_to_grids(&zip.finish());
+        assert_eq!(read[0].0, "S");
+        assert_eq!(read[0].1[0], vec!["Hello".to_string(), "World".to_string()]);
     }
 
     #[test]

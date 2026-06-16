@@ -15,7 +15,7 @@ use super::build::{PdfBuilder, StdFont};
 // ─────────────────────────────── text helpers ──────────────────────────────
 
 /// Decode the XML/HTML entities our exporters (and common tools) emit.
-fn unescape(s: &str) -> String {
+pub(crate) fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(amp) = rest.find('&') {

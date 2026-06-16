@@ -60,6 +60,7 @@ try {
 | `rtfToPdf(rtf)` | `Uint8Array` | Render RTF to PDF. |
 | `officeToPdf(office)` | `Uint8Array` | Convert an Office/ODF file (docx/xlsx/pptx/doc/xls/ppt/odt/ods/odp) to PDF; format auto-detected by magic bytes. |
 | `gridsToXlsx(grids, sheetNames?)` / `gridsToOds(grids, sheetNames?)` | `Uint8Array` | Write a host-built grid (`pages[rows][cells]`, `string[][][]`) to an `.xlsx`/`.ods` workbook — one sheet per page — with the native writer. Supply your own table reconstruction and emit Office output with **no third-party library**. `sheetNames` (index-aligned) overrides the default `Page <n>` titles. |
+| `xlsxToGrids(xlsx)` | `XlsxSheet[]` | Read an `.xlsx` back into `{ name, rows: string[][] }` sheets (the inverse of `gridsToXlsx`/`toXlsx`). Decodes inline strings, shared strings (`sharedStrings.xml`) and plain values. `[]` for non-xlsx input. |
 
 ### Fonts (engine-level helpers)
 
@@ -282,7 +283,8 @@ All result/option shapes are exported interfaces — import them for typed code:
 import type {
   FontInfo, EmbeddedFont, PageInfo, TextLine, TextRunInfo, Element,
   SearchHit, OcrWord, AnnotationInfo, FieldInfo, FieldStyle, LinkInfo,
-  LayerInfo, OutlineEntry, NamedDest, HtmlFontRequest, HtmlFont, SignP12Options,
+  LayerInfo, OutlineEntry, NamedDest, XlsxSheet, HtmlFontRequest, HtmlFont,
+  SignP12Options,
 } from "@qrcommunication/gigapdf-lib";
 ```
 
