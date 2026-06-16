@@ -240,6 +240,17 @@ export class GigaPdfEngine {
       this._json((o) => this.ex.gp_xlsx_to_grids(p, l, o))
     );
   }
+  /**
+   * Encode raw **RGBA** pixels (`width*height*4` bytes, row-major,
+   * non-premultiplied) to a PNG with the engine's native encoder — no
+   * third-party image library. Returns an empty array if the buffer length
+   * doesn't match `width*height*4`.
+   */
+  rgbaToPng(rgba: Uint8Array, width: number, height: number): Uint8Array {
+    return this._withBytes(rgba, (p, l) =>
+      this._buffer((o) => this.ex.gp_rgba_to_png(width, height, p, l, o))
+    );
+  }
 
   // ── fonts (catalog / Google Fonts URL — the host performs the fetch) ───────
   fontCatalog(): FontInfo[] {

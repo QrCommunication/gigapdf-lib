@@ -251,6 +251,7 @@ reconstructed tables for spreadsheets) — not a rasterised image.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `renderPage(page, scale?)` | `Uint8Array` | Rasterise a page to PNG at `scale` (1 = 72 dpi). Native rasteriser (glyphs, images, vectors, SVG, colour emoji). |
+| `rgbaToPng(rgba, width, height)` | `Uint8Array` | *(engine-level)* Encode raw RGBA pixels (`width*height*4`, row-major, non-premultiplied) to PNG with the native encoder — no `canvas`/image library. Empty on a length mismatch. |
 
 ### OCR & text intelligence
 

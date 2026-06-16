@@ -225,6 +225,17 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(giga.xlsxToGrids(new Uint8Array([1, 2, 3]))).toEqual([]); // non-xlsx
   });
 
+  it("encodes raw RGBA to PNG natively", () => {
+    const w = 2;
+    const h = 2;
+    const rgba = new Uint8Array(w * h * 4).fill(255); // 2×2 opaque white
+    const png = giga.rgbaToPng(rgba, w, h);
+    expect(Array.from(png.slice(0, 4))).toEqual([0x89, 0x50, 0x4e, 0x47]); // ‰PNG
+    expect(png.length).toBeGreaterThan(20);
+    // A buffer that doesn't match width*height*4 → empty (no throw).
+    expect(giga.rgbaToPng(new Uint8Array(3), w, h).length).toBe(0);
+  });
+
   it("registers named destinations and resolves links that jump to them by name", () => {
     const doc = giga.open(giga.txtToPdf("Cover"));
     expect(doc.addPage(612, 792, 1)).toBeGreaterThan(0); // page 2

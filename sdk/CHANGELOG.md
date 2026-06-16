@@ -4,6 +4,16 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.21.0] - 2026-06-16
+
+### Added
+
+- **`rgbaToPng(rgba, width, height)`** — encode raw RGBA pixels to a PNG with the
+  engine's native encoder (ABI `gp_rgba_to_png`; wraps `raster::encode_png`). No
+  third-party image library. First piece of the native raster toolkit that lets
+  hosts drop `canvas`/`sharp` for image work (more — resize, JPEG encode — to
+  follow). Returns empty on a length mismatch (`≠ width*height*4`).
+
 ## [0.20.0] - 2026-06-16
 
 ### Added

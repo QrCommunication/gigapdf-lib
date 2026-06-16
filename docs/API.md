@@ -143,6 +143,7 @@ MAC verified — with **no third-party crypto** (all in `crate::crypto`).
 | Rust | WASM |
 |------|------|
 | `render_page(page,scale) -> Vec<u8>` (PNG) | `gp_render_page(handle,page,scale,outlen)` |
+| `raster::encode_png(w,h,&rgba) -> Vec<u8>` | `gp_rgba_to_png(w,h,ptr,len,outlen)` · SDK `rgbaToPng` (native RGBA→PNG, no `canvas`) |
 
 ## Text intelligence & OCR
 

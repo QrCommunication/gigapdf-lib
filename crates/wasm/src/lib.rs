@@ -1192,6 +1192,29 @@ pub extern "C" fn gp_render_page(
     }
 }
 
+/// Encode raw RGBA pixels (`width*height*4` bytes, row-major, non-premultiplied)
+/// to a PNG with the engine's native encoder — no third-party image library.
+/// Returns `null` if the buffer length doesn't match `width*height*4`. Host frees
+/// the result.
+#[no_mangle]
+pub extern "C" fn gp_rgba_to_png(
+    width: u32,
+    height: u32,
+    rgba_ptr: *const u8,
+    rgba_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if rgba_ptr.is_null() || rgba_len != expected || expected == 0 {
+        return std::ptr::null_mut();
+    }
+    let rgba = unsafe { std::slice::from_raw_parts(rgba_ptr, rgba_len) };
+    let png = gigapdf_core::raster::encode_png(width, height, rgba);
+    unsafe { bytes_into_host(png, out_len) }
+}
+
 // ─── conversions & compression ───────────────────────────────────────────────
 //
 // All buffer-returning (host frees the result). Office exporters reconstruct
