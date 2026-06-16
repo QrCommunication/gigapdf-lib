@@ -7,14 +7,18 @@
 
 pub mod aes;
 pub mod bignum;
+pub mod hmac;
 pub mod md5;
 pub mod rc4;
 pub mod rsa;
+pub mod sha1;
 pub mod sha256;
 pub mod sha512;
 
 pub use aes::{aes_cbc_decrypt, aes_cbc_encrypt, Aes};
+pub use hmac::{hmac_sha1, hmac_sha256};
 pub use md5::md5;
 pub use rc4::rc4;
+pub use sha1::sha1;
 pub use sha256::sha256;
 pub use sha512::{sha384, sha512};
