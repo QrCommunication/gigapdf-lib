@@ -774,15 +774,133 @@ impl Document {
                 .and_then(|stream| decode_stream(stream).ok())
                 .map(|bytes| crate::font::cmap::ToUnicode::parse(&bytes))
                 .filter(|cmap| !cmap.is_empty());
+            let widths = if two_byte {
+                self.cid_font_widths(font)
+            } else {
+                self.simple_font_widths(font)
+            };
             decoders.insert(
                 name.clone(),
                 crate::font::cmap::TextDecoder {
                     two_byte,
                     to_unicode,
+                    widths,
                 },
             );
         }
         decoders
+    }
+
+    /// A simple font's per-code advance widths from `/FirstChar` + `/Widths`
+    /// (with `/FontDescriptor /MissingWidth` as the default). When the font has
+    /// no `/Widths` array, base-14 Helvetica/Courier fall back to their built-in
+    /// AFM/monospace metrics; other base-14 (Times) return `None` (estimate).
+    fn simple_font_widths(&self, font: &Dictionary) -> Option<crate::font::cmap::CodeWidths> {
+        let Some(widths) = font
+            .get(b"Widths")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        else {
+            return self.base14_widths(font);
+        };
+        let first = font
+            .get(b"FirstChar")
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+            .max(0) as u32;
+        let missing = font
+            .get(b"FontDescriptor")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"MissingWidth"))
+            .and_then(Object::as_f64)
+            .unwrap_or(0.0);
+        let mut map = BTreeMap::new();
+        for (i, w) in widths.iter().enumerate() {
+            if let Some(v) = self.resolve(w).as_f64() {
+                map.insert(first + i as u32, v);
+            }
+        }
+        Some(crate::font::cmap::CodeWidths::new(map, missing))
+    }
+
+    /// Built-in metrics for a base-14 simple font that omits `/Widths`: the
+    /// Helvetica AFM table for Helvetica/Arial, a flat 600 for Courier
+    /// (monospace). Codes 0x20–0x7E (ASCII/WinAnsi). `None` for fonts whose
+    /// metrics we don't ship (Times) — the caller then estimates.
+    fn base14_widths(&self, font: &Dictionary) -> Option<crate::font::cmap::CodeWidths> {
+        let base = font.get(b"BaseFont").and_then(Object::as_name)?;
+        let name = String::from_utf8_lossy(base);
+        let face = name.rsplit('+').next().unwrap_or(&name).to_lowercase();
+        let mut map = BTreeMap::new();
+        if face.contains("courier") || face.contains("mono") {
+            for code in 0x20u32..=0x7e {
+                map.insert(code, 600.0);
+            }
+            return Some(crate::font::cmap::CodeWidths::new(map, 600.0));
+        }
+        if face.contains("helvetica") || face.contains("arial") {
+            for (i, &w) in HELVETICA_AFM.iter().enumerate() {
+                map.insert(0x20 + i as u32, w as f64);
+            }
+            return Some(crate::font::cmap::CodeWidths::new(map, 500.0));
+        }
+        None
+    }
+
+    /// A Type0 font's per-CID advance widths from its descendant font's `/W`
+    /// array (and `/DW` default, 1000 when absent). Honours both `/W` forms:
+    /// `c [w1 w2 …]` (consecutive CIDs) and `cFirst cLast w` (a CID range).
+    fn cid_font_widths(&self, font: &Dictionary) -> Option<crate::font::cmap::CodeWidths> {
+        let descendant = font
+            .get(b"DescendantFonts")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        let dw = descendant.get(b"DW").and_then(Object::as_f64).unwrap_or(1000.0);
+        let mut map = BTreeMap::new();
+        if let Some(w) = descendant
+            .get(b"W")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            let mut i = 0;
+            while i < w.len() {
+                let Some(c) = self.resolve(&w[i]).as_i64() else {
+                    break;
+                };
+                if let Some(list) = w
+                    .get(i + 1)
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_array)
+                {
+                    // Form: c [w1 w2 …] — CIDs c, c+1, … each with its width.
+                    for (j, wv) in list.iter().enumerate() {
+                        if let Some(v) = self.resolve(wv).as_f64() {
+                            map.insert((c as u32).wrapping_add(j as u32), v);
+                        }
+                    }
+                    i += 2;
+                } else if let (Some(c2), Some(wv)) = (
+                    w.get(i + 1).map(|o| self.resolve(o)).and_then(Object::as_i64),
+                    w.get(i + 2).map(|o| self.resolve(o)).and_then(Object::as_f64),
+                ) {
+                    // Form: cFirst cLast w — every CID in the range gets `w`.
+                    let (lo, hi) = (c.max(0) as u32, c2.max(0) as u32);
+                    if hi >= lo && hi - lo < 70_000 {
+                        for code in lo..=hi {
+                            map.insert(code, wv);
+                        }
+                    }
+                    i += 3;
+                } else {
+                    break;
+                }
+            }
+        }
+        Some(crate::font::cmap::CodeWidths::new(map, dw))
     }
 
     /// Map each font resource name on a page to a recovered [`TextStyle`]
@@ -1696,6 +1814,9 @@ impl Document {
                     decoder: crate::font::cmap::TextDecoder {
                         two_byte,
                         to_unicode,
+                        // Rendering advances glyphs by the font program's own
+                        // metrics, so the PDF width table isn't needed here.
+                        widths: None,
                     },
                     two_byte,
                 },
@@ -8180,6 +8301,34 @@ mod tests {
         assert_eq!(e.font_family, "Helvetica", "/BaseFont family");
         assert!(e.bold, "Helvetica-Bold resolves bold");
         assert!(e.rotation_deg.abs() < 0.5, "upright, got {}", e.rotation_deg);
+    }
+
+    #[test]
+    fn text_width_uses_real_metrics_not_estimate() {
+        // Helvetica AFM: W=944. "WWWW" at 20pt = 4·944·20/1000 = 75.52 pt — far
+        // from the old 0.5-em estimate (4·0.5·20 = 40), so this pins that
+        // base-14 fonts without /Widths now measure by real AFM advances.
+        let mut doc = blank_doc();
+        doc.add_text_standard(1, 50.0, 700.0, 20.0, "WWWW", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        let els = doc.page_text_elements(1);
+        assert_eq!(els.len(), 1);
+        assert!(
+            (els[0].width - 75.52).abs() < 1.5,
+            "AFM advance ~75.5 expected, got {}",
+            els[0].width,
+        );
+
+        // Courier is monospace (600): "iiii" measures the same as "WWWW".
+        let mut mono = blank_doc();
+        mono.add_text_standard(1, 50.0, 700.0, 20.0, "iiii", "Courier", [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        let mels = mono.page_text_elements(1);
+        assert!(
+            (mels[0].width - 48.0).abs() < 0.5,
+            "Courier 600-em: 4·600·20/1000 = 48, got {}",
+            mels[0].width,
+        );
     }
 
     #[test]

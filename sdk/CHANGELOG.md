@@ -4,6 +4,21 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.30.0] - 2026-06-17
+
+### Changed
+
+- **Exact text widths.** Text-run bounding boxes (and the pen advance between
+  runs) now measure by **real glyph advances** instead of a 0.5-em estimate:
+  the content interpreter reads each font's `/Widths` (simple) or `/W`+`/DW`
+  (Type0/CID) table, and base-14 Helvetica/Courier without `/Widths` fall back
+  to built-in AFM/monospace metrics (`TextDecoder` gains a `CodeWidths` table;
+  `TJ` kerning is applied). This makes `textElements`, `structuredText` and
+  `search` bounding-box **widths** match a reference renderer — e.g. "Hello
+  GigaPDF Test" at 24 pt now measures 213.4 pt (was the 216 pt estimate),
+  matching pdfjs. Fonts whose metrics aren't embedded or built in (e.g. Times
+  without `/Widths`) still fall back to the estimate. No API change.
+
 ## [0.29.0] - 2026-06-16
 
 ### Added

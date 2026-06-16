@@ -475,20 +475,54 @@ fn nums(op: &Operation) -> Vec<f64> {
         .collect()
 }
 
-/// Approximate bounding box of a text run from its text/line matrix, the CTM,
-/// the font size, and an average-advance width estimate.
-fn text_bounds(tm: &Matrix, ctm: &Matrix, font_size: f64, char_count: usize) -> Option<Bounds> {
+/// Bounding box of a text run from its text/line matrix, the CTM, the font size
+/// and the run's user-space advance `width` (real glyph advances when the font
+/// carries widths, an average-advance estimate otherwise).
+fn text_bounds(tm: &Matrix, ctm: &Matrix, font_size: f64, width: f64) -> Option<Bounds> {
     if font_size == 0.0 {
         return None;
     }
     let m = tm.then(ctm);
-    let width = char_count as f64 * 0.5 * font_size;
     let mut bb = BoundsBuilder::new();
     bb.add_through(&m, 0.0, -0.2 * font_size); // descender
     bb.add_through(&m, width, -0.2 * font_size);
     bb.add_through(&m, width, font_size); // ascender
     bb.add_through(&m, 0.0, font_size);
     bb.build()
+}
+
+/// The user-space advance of a text-show operand, summed from real glyph widths
+/// (`Tj` string, or `TJ` array with its `1000`-em kerning adjustments applied).
+/// `None` when the font has no width table — the caller then estimates.
+fn text_run_advance(operands: &[Object], decoder: &TextDecoder, font_size: f64) -> Option<f64> {
+    let mut total = 0.0;
+    let mut measured = false;
+    for operand in operands {
+        match operand {
+            Object::String(bytes, _) => {
+                total += decoder.string_advance(bytes, font_size)?;
+                measured = true;
+            }
+            Object::Array(items) => {
+                for item in items {
+                    match item {
+                        Object::String(bytes, _) => {
+                            total += decoder.string_advance(bytes, font_size)?;
+                            measured = true;
+                        }
+                        // TJ number: a position adjustment in 1000-em units,
+                        // subtracted from the advance (positive moves left).
+                        Object::Integer(_) | Object::Real(_) => {
+                            total -= item.as_f64().unwrap_or(0.0) * font_size / 1000.0;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    measured.then_some(total.max(0.0))
 }
 
 /// Bounding box of an XObject draw (`Do`): the unit square through the CTM.
@@ -633,7 +667,12 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
             _ if is_text_show(operator) => {
                 let text = decode_operand_text(&op.operands, text_decoder);
                 let char_count = text.chars().count();
-                let bounds = text_bounds(&tm, &ctm, font_size, char_count);
+                // Real glyph advances when the font carries widths; otherwise a
+                // 0.5-em estimate. Drives both the run's width and the pen
+                // advance for the following run on the line.
+                let width = text_run_advance(&op.operands, text_decoder, font_size)
+                    .unwrap_or(char_count as f64 * 0.5 * font_size);
+                let bounds = text_bounds(&tm, &ctm, font_size, width);
                 // Combined text→device matrix: the `Tf` size scaled by its
                 // vertical scale gives the on-page glyph size; its x-axis angle
                 // gives the baseline rotation.
@@ -653,8 +692,7 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                     font_size: Some(eff_size),
                     rotation_deg: Some(if rot.abs() < 1e-6 { 0.0 } else { rot }),
                 });
-                let advance = char_count as f64 * 0.5 * font_size;
-                tm = Matrix::translate(advance, 0.0).then(&tm);
+                tm = Matrix::translate(width, 0.0).then(&tm);
             }
             b"Do" => {
                 let label = op

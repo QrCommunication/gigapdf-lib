@@ -212,12 +212,58 @@ pub struct TextDecoder {
     pub two_byte: bool,
     /// The font's `/ToUnicode` map, when the font carries one.
     pub to_unicode: Option<ToUnicode>,
+    /// Per-code advance widths from the font's `/Widths` (simple) or `/W`+`/DW`
+    /// (Type0) tables, when present — lets a text run be measured by real glyph
+    /// advances instead of a 0.5-em estimate.
+    pub widths: Option<CodeWidths>,
+}
+
+/// Per-character-code advance widths in PDF glyph space (1000 units = 1 em),
+/// from a font's `/Widths` or `/W` table. `default` is the missing-width / `/DW`
+/// fallback applied to codes absent from the map.
+#[derive(Debug, Clone, Default)]
+pub struct CodeWidths {
+    map: std::collections::BTreeMap<u32, f64>,
+    default: f64,
+}
+
+impl CodeWidths {
+    /// Build from a code→advance map (1000-em units) and a default width.
+    pub fn new(map: std::collections::BTreeMap<u32, f64>, default: f64) -> Self {
+        Self { map, default }
+    }
+
+    /// The advance of `code` in 1000-em units, falling back to the default.
+    pub fn advance(&self, code: u32) -> f64 {
+        self.map.get(&code).copied().unwrap_or(self.default)
+    }
 }
 
 impl TextDecoder {
     /// The default decoder: a single-byte WinAnsi font.
     pub fn winansi() -> Self {
         Self::default()
+    }
+
+    /// The advance of one text-show string in user-space points, summed from the
+    /// real per-glyph widths. `None` when this font carries no width table (the
+    /// caller then falls back to an average-advance estimate).
+    pub fn string_advance(&self, bytes: &[u8], font_size: f64) -> Option<f64> {
+        let widths = self.widths.as_ref()?;
+        let mut units = 0.0;
+        if self.two_byte {
+            let mut i = 0;
+            while i + 1 < bytes.len() {
+                let code = ((bytes[i] as u32) << 8) | bytes[i + 1] as u32;
+                units += widths.advance(code);
+                i += 2;
+            }
+        } else {
+            for &b in bytes {
+                units += widths.advance(b as u32);
+            }
+        }
+        Some(units * font_size / 1000.0)
     }
 
     /// Decode one text-show string to Unicode.
@@ -290,9 +336,26 @@ mod tests {
         let decoder = TextDecoder {
             two_byte: true,
             to_unicode: Some(cmap),
+            widths: None,
         };
         // One 2-byte code 0x0041 → 'É'.
         assert_eq!(decoder.decode(&[0x00, 0x41]), "\u{00C9}");
+    }
+
+    #[test]
+    fn string_advance_sums_real_widths() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(b'A' as u32, 600.0);
+        map.insert(b'B' as u32, 700.0);
+        let decoder = TextDecoder {
+            two_byte: false,
+            to_unicode: None,
+            widths: Some(CodeWidths::new(map, 500.0)),
+        };
+        // "AB?" → 600 + 700 + 500 (default) = 1800 units × 12/1000 = 21.6 pt.
+        assert_eq!(decoder.string_advance(b"AB?", 12.0), Some(21.6));
+        // No width table → None, so the caller falls back to an estimate.
+        assert_eq!(TextDecoder::winansi().string_advance(b"AB", 12.0), None);
     }
 
     #[test]
