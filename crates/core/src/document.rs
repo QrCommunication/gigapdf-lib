@@ -54,6 +54,55 @@ fn pdf_text(s: &str) -> Object {
     Object::String(crate::font::encode_pdf_text(s), StringKind::Literal)
 }
 
+/// Normalise a PDF font name for fuzzy matching: drop a leading `/`, strip a
+/// 6-uppercase-letter subset prefix (`ABCDEF+`), then keep only lowercased
+/// alphanumerics. `"HXBDOG+OCRB10PitchBT-Regular"` → `"ocrb10pitchbtregular"`,
+/// `"Arial-BoldMT"` → `"arialboldmt"`. Suffix variants are absorbed by the
+/// caller's two-direction `contains` match rather than stripped here.
+fn normalize_font_name(raw: &str) -> String {
+    let mut s = raw.trim_start_matches('/');
+    let bytes = s.as_bytes();
+    if bytes.len() > 7 && bytes[6] == b'+' && bytes[..6].iter().all(u8::is_ascii_uppercase) {
+        s = &s[7..];
+    }
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Set the shared reviewer metadata on an annotation dict: popup `/Contents`,
+/// `/T` author, `/NM` id, `/M` modification date and the printable `/F` flag.
+/// Empty strings are skipped. `/Contents` and `/T` go through `pdf_text` so
+/// non-ASCII reviewer text is stored as UTF-16BE.
+fn set_annotation_metadata(
+    dict: &mut Dictionary,
+    contents: &str,
+    author: &str,
+    id: &str,
+    date: &str,
+) {
+    if !contents.is_empty() {
+        dict.set(b"Contents".to_vec(), pdf_text(contents));
+    }
+    if !author.is_empty() {
+        dict.set(b"T".to_vec(), pdf_text(author));
+    }
+    if !id.is_empty() {
+        dict.set(
+            b"NM".to_vec(),
+            Object::String(id.as_bytes().to_vec(), StringKind::Literal),
+        );
+    }
+    if !date.is_empty() {
+        dict.set(
+            b"M".to_vec(),
+            Object::String(date.as_bytes().to_vec(), StringKind::Literal),
+        );
+    }
+    dict.set(b"F".to_vec(), Object::Integer(4));
+}
+
 /// Rewrite an object's indirect references through `map` (for grafting between
 /// documents). References absent from the map are kept as-is.
 fn remap_object(object: &Object, map: &BTreeMap<ObjectId, ObjectId>) -> Object {
@@ -1313,6 +1362,89 @@ impl Document {
         decode_stream(stream).ok()
     }
 
+    /// Find an embedded font program by (fuzzy) `/BaseFont` name and return its
+    /// raw **decoded** bytes plus a format tag (`"truetype"`, `"cff"`, `"type1"`).
+    /// Mirrors a host editor's "re-embed the original font when re-baking edited
+    /// text" path, so the edit keeps the document's own glyphs. Handles Type0
+    /// composites (via `/DescendantFonts`). `None` when nothing matches or the
+    /// match carries no embedded program (only a `/FontDescriptor` reference).
+    pub fn extract_font_program(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+        let target = normalize_font_name(name);
+        if target.is_empty() {
+            return None;
+        }
+        // Collect matching font dicts first (cloned) so we don't keep
+        // `self.objects` borrowed while resolving descriptors via `self.resolve`.
+        let mut candidates: Vec<Dictionary> = Vec::new();
+        for object in self.objects.values() {
+            let Some(dict) = object.as_dict() else {
+                continue;
+            };
+            if dict.get(b"Type").and_then(Object::as_name) != Some(b"Font".as_slice()) {
+                continue;
+            }
+            let base = dict
+                .get(b"BaseFont")
+                .and_then(Object::as_name)
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .unwrap_or_default();
+            let candidate = normalize_font_name(&base);
+            if candidate.is_empty() {
+                continue;
+            }
+            // Two-direction substring match absorbs subset prefixes and the
+            // "-Regular"/"MT"/"PS" suffix variants without explicit stripping.
+            if candidate == target || candidate.contains(&target) || target.contains(&candidate) {
+                candidates.push(dict.clone());
+            }
+        }
+
+        for dict in candidates {
+            // Type0 composites carry the descriptor on the descendant CIDFont.
+            let carrier =
+                if dict.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice()) {
+                    match dict
+                        .get(b"DescendantFonts")
+                        .map(|o| self.resolve(o))
+                        .and_then(Object::as_array)
+                        .and_then(|a| a.first())
+                        .map(|o| self.resolve(o))
+                        .and_then(Object::as_dict)
+                    {
+                        Some(descendant) => descendant.clone(),
+                        None => continue,
+                    }
+                } else {
+                    dict.clone()
+                };
+            let Some(descriptor) = carrier
+                .get(b"FontDescriptor")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+            else {
+                continue;
+            };
+            // FontFile2 (TrueType) is the most embeddable; then FontFile3 (CFF),
+            // then the legacy Type1 FontFile.
+            if let Some(bytes) = self.font_file_bytes(descriptor, b"FontFile2") {
+                if !bytes.is_empty() {
+                    return Some((bytes, "truetype"));
+                }
+            }
+            if let Some(bytes) = self.font_file_bytes(descriptor, b"FontFile3") {
+                if !bytes.is_empty() {
+                    return Some((bytes, "cff"));
+                }
+            }
+            if let Some(bytes) = self.font_file_bytes(descriptor, b"FontFile") {
+                if !bytes.is_empty() {
+                    return Some((bytes, "type1"));
+                }
+            }
+        }
+        None
+    }
+
     /// Index of the element at page point `(x, y)` (user space), preferring the
     /// smallest box when several overlap. `None` if nothing is hit.
     pub fn element_at(&self, page_no: u32, x: f64, y: f64) -> Result<Option<usize>> {
@@ -2143,6 +2275,137 @@ impl Document {
         self.add_annotation(page_no, annot::highlight(rect, color))
     }
 
+    /// Add a text-markup annotation (`Highlight` / `Underline` / `StrikeOut` /
+    /// `Squiggly`) spanning one or more `quads` (each `[x0, y0, x1, y1]` in PDF
+    /// user space, bottom-left origin) — multi-quad covers wrapped text. Carries
+    /// the full reviewer metadata: translucent `color` + `opacity`, popup
+    /// `contents`, `author` (`/T`), stable `id` (`/NM`) and the modification
+    /// `date` (`/M`, a PDF date string supplied by the host since the engine has
+    /// no clock). Empty `contents`/`author`/`id`/`date` are omitted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_markup_annotation(
+        &mut self,
+        page_no: u32,
+        subtype: &str,
+        quads: &[[f64; 4]],
+        color: [f64; 3],
+        opacity: f64,
+        contents: &str,
+        author: &str,
+        id: &str,
+        date: &str,
+    ) -> Result<()> {
+        if quads.is_empty() {
+            return Err(EngineError::Unsupported(
+                "markup annotation needs at least one quad".into(),
+            ));
+        }
+        let subtype_name: &[u8] = match subtype {
+            "Highlight" => b"Highlight",
+            "Underline" => b"Underline",
+            "StrikeOut" => b"StrikeOut",
+            "Squiggly" => b"Squiggly",
+            _ => return Err(EngineError::Unsupported("unknown markup subtype".into())),
+        };
+
+        // Bounding /Rect over every quad.
+        let mut rect = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for q in quads {
+            rect[0] = rect[0].min(q[0]).min(q[2]);
+            rect[1] = rect[1].min(q[1]).min(q[3]);
+            rect[2] = rect[2].max(q[0]).max(q[2]);
+            rect[3] = rect[3].max(q[1]).max(q[3]);
+        }
+
+        // /QuadPoints (UL UR LL LR per quad) + matching per-quad appearance ops.
+        let mut quad_points: Vec<f64> = Vec::with_capacity(quads.len() * 8);
+        let mut appearance: Vec<u8> = Vec::new();
+        for &[x0, y0, x1, y1] in quads {
+            quad_points.extend_from_slice(&[x0, y1, x1, y1, x0, y0, x1, y0]);
+            match subtype {
+                "Highlight" => appearance.extend_from_slice(&content::rectangle_ops(
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    None,
+                    Some(color),
+                    0.0,
+                )),
+                "StrikeOut" => {
+                    let w = ((y1 - y0) * 0.06).max(0.75);
+                    let y = (y0 + y1) / 2.0;
+                    appearance.extend_from_slice(&content::line_ops(x0, y, x1, y, color, w));
+                }
+                _ => {
+                    // Underline / Squiggly: a rule near the baseline.
+                    let w = ((y1 - y0) * 0.06).max(0.75);
+                    let y = y0 + (y1 - y0) * 0.08;
+                    appearance.extend_from_slice(&content::line_ops(x0, y, x1, y, color, w));
+                }
+            }
+        }
+
+        let mut dict = Dictionary::new();
+        dict.set(b"Subtype".to_vec(), annot::name(subtype_name));
+        dict.set(b"Rect".to_vec(), annot::real_array(&rect));
+        dict.set(b"C".to_vec(), annot::real_array(&color));
+        dict.set(b"CA".to_vec(), Object::Real(opacity));
+        dict.set(b"QuadPoints".to_vec(), annot::real_array(&quad_points));
+        set_annotation_metadata(&mut dict, contents, author, id, date);
+
+        self.add_annotation(
+            page_no,
+            annot::Built {
+                dict,
+                appearance,
+                resources: Dictionary::new(),
+            },
+        )
+    }
+
+    /// Add a sticky-note (`/Text`) annotation: a small badge that opens a popup
+    /// with `contents`. `icon` is the `/Name` (`"Note"`, `"Comment"`, …) and
+    /// `open` sets the initial popup state. A filled badge appearance keeps it
+    /// visible in viewers that don't render the named icon.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_note(
+        &mut self,
+        page_no: u32,
+        rect: [f64; 4],
+        contents: &str,
+        author: &str,
+        id: &str,
+        date: &str,
+        open: bool,
+        icon: &str,
+        color: [f64; 3],
+    ) -> Result<()> {
+        let mut dict = Dictionary::new();
+        dict.set(b"Subtype".to_vec(), annot::name(b"Text"));
+        dict.set(b"Rect".to_vec(), annot::real_array(&rect));
+        dict.set(b"Name".to_vec(), annot::name(icon.as_bytes()));
+        dict.set(b"Open".to_vec(), Object::Boolean(open));
+        dict.set(b"C".to_vec(), annot::real_array(&color));
+        set_annotation_metadata(&mut dict, contents, author, id, date);
+        let [x0, y0, x1, y1] = rect;
+        let appearance =
+            content::rectangle_ops(x0, y0, x1 - x0, y1 - y0, Some(color), Some(color), 1.0);
+        self.add_annotation(
+            page_no,
+            annot::Built {
+                dict,
+                appearance,
+                resources: Dictionary::new(),
+            },
+        )
+    }
+
     /// Add a Line annotation.
     #[allow(clippy::too_many_arguments)]
     pub fn add_line_annotation(
@@ -2273,6 +2536,7 @@ impl Document {
     /// `x`/`y` are the text origin in PDF user space (origin bottom-left); `size`
     /// is in points; `color` is the RGB fill `0..=1`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn add_text(
         &mut self,
         page_no: u32,
@@ -2282,6 +2546,8 @@ impl Document {
         text: &str,
         font_obj: u32,
         color: [f64; 3],
+        opacity: f64,
+        rotation_deg: f64,
     ) -> Result<()> {
         let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
             EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
@@ -2293,18 +2559,29 @@ impl Document {
             hex.push_str(&format!("{gid:04X}"));
         }
         let res_name = format!("GF{font_obj}");
-        let snippet = format!(
-            "\nq\n{r} {g} {b} rg\nBT\n/{res} {size} Tf\n{x} {y} Td\n<{hex}> Tj\nET\nQ\n",
+        // Rotation rides on the text matrix [cos sin -sin cos x y]; at 0° this is
+        // the identity rotation (cos=1, sin=0), so glyphs sit at (x, y).
+        let (sin, cos) = rotation_deg.to_radians().sin_cos();
+        let inner = format!(
+            "q\n{r} {g} {b} rg\nBT\n/{res} {size} Tf\n{ma} {mb} {mc} {md} {x} {y} Tm\n<{hex}> Tj\nET\nQ\n",
             r = content::num(color[0]),
             g = content::num(color[1]),
             b = content::num(color[2]),
             res = res_name,
             size = content::num(size),
+            ma = content::num(cos),
+            mb = content::num(sin),
+            mc = content::num(-sin),
+            md = content::num(cos),
             x = content::num(x),
             y = content::num(y),
-        );
+        )
+        .into_bytes();
+        // `with_opacity` wraps the run in an ExtGState (/ca + /CA) when opacity < 1
+        // (and registers it on the page); at opacity 1 it returns `inner` as-is.
+        let ops = self.with_opacity(page_no, inner, opacity)?;
         let mut content = self.page_content(page_no)?;
-        content.extend_from_slice(snippet.as_bytes());
+        content.extend_from_slice(&ops);
         self.set_page_content(page_no, content)?;
         self.register_page_font(page_no, res_name.as_bytes(), (font_obj, 0))?;
         Ok(())
@@ -6171,5 +6448,57 @@ mod tests {
         );
         // A second flatten is a harmless no-op.
         assert_eq!(doc.flatten_form().unwrap(), 0, "re-flatten is a no-op");
+    }
+
+    #[test]
+    fn markup_annotation_and_text_note_round_trip() {
+        let pdf = crate::convert::reverse::txt_to_pdf("annotation host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        // Two-quad highlight (wrapped text) with full reviewer metadata.
+        doc.add_markup_annotation(
+            1,
+            "Highlight",
+            &[[50.0, 700.0, 200.0, 715.0], [50.0, 680.0, 150.0, 695.0]],
+            [1.0, 1.0, 0.0],
+            0.4,
+            "my comment",
+            "Rony",
+            "annot-1",
+            "D:20260616120000Z",
+        )
+        .unwrap();
+        doc.add_text_note(
+            1,
+            [300.0, 700.0, 320.0, 720.0],
+            "sticky note body",
+            "Rony",
+            "note-1",
+            "D:20260616120000Z",
+            true,
+            "Note",
+            [1.0, 0.9, 0.0],
+        )
+        .unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let annots = reopened.page_annotations(1).unwrap();
+        assert!(
+            annots.iter().any(|a| a.subtype == "Highlight"),
+            "highlight present: {annots:?}"
+        );
+        assert!(
+            annots.iter().any(|a| a.subtype == "Text"),
+            "sticky note present"
+        );
+        assert!(
+            annots.iter().any(|a| a.contents.contains("my comment")),
+            "highlight popup contents preserved"
+        );
+        assert!(
+            annots
+                .iter()
+                .any(|a| a.contents.contains("sticky note body")),
+            "note contents preserved"
+        );
     }
 }

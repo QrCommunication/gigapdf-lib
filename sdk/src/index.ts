@@ -911,11 +911,25 @@ export class GigaPdfDoc {
     size: number,
     text: string,
     fontObj: number,
-    rgb = 0
+    rgb = 0,
+    opacity = 1,
+    rotationDeg = 0
   ): boolean {
     return (
       this.g._withStr(text, (p, l) =>
-        this.ex().gp_add_text(this.h, page, x, y, size, p, l, fontObj, RGB(rgb))
+        this.ex().gp_add_text(
+          this.h,
+          page,
+          x,
+          y,
+          size,
+          p,
+          l,
+          fontObj,
+          RGB(rgb),
+          opacity,
+          rotationDeg
+        )
       ) === 0
     );
   }
@@ -942,6 +956,23 @@ export class GigaPdfDoc {
   }
   neededFonts(): string[] {
     return this.g._json((o) => this.ex().gp_needed_fonts(this.h, o));
+  }
+  /**
+   * Extract an embedded font program by (fuzzy) `/BaseFont` name — so a host
+   * editor can re-embed the document's own font when re-baking edited text and
+   * keep the original glyphs. Returns the raw decoded bytes and the program
+   * format (`truetype` embeds directly; `cff`/`type1` need a TTF conversion),
+   * or `null` when nothing embedded matches.
+   */
+  extractFont(
+    name: string
+  ): { format: "truetype" | "cff" | "type1"; bytes: Uint8Array } | null {
+    const buf = this.g._withStr(name, (p, l) =>
+      this.g._buffer((o) => this.ex().gp_extract_font(this.h, p, l, o))
+    );
+    if (buf.length === 0) return null;
+    const format = buf[0] === 1 ? "truetype" : buf[0] === 2 ? "cff" : "type1";
+    return { format, bytes: buf.subarray(1) };
   }
 
   // convert PDF → X
@@ -1129,6 +1160,85 @@ export class GigaPdfDoc {
   }
   addStrikeOut(page: number, x0: number, y0: number, x1: number, y1: number, rgb = 0): boolean {
     return this.ex().gp_add_strike_out(this.h, page, x0, y0, x1, y1, RGB(rgb)) === 0;
+  }
+  /**
+   * Add a text-markup annotation (`highlight` | `underline` | `strikeout` |
+   * `squiggly`) spanning one or more `quads` (each `[x0, y0, x1, y1]` in PDF
+   * user space, bottom-left origin — multi-quad covers wrapped text), with full
+   * reviewer metadata. `date` is a PDF date string (e.g. `"D:20260616T…Z"`) — the
+   * engine has no clock, so the host supplies it.
+   */
+  addMarkupAnnotation(
+    page: number,
+    subtype: "highlight" | "underline" | "strikeout" | "squiggly",
+    quads: Array<[number, number, number, number]>,
+    rgb: number,
+    opacity: number,
+    meta: { contents?: string; author?: string; id?: string; date?: string } = {}
+  ): boolean {
+    const sub =
+      subtype === "highlight"
+        ? "Highlight"
+        : subtype === "underline"
+          ? "Underline"
+          : subtype === "strikeout"
+            ? "StrikeOut"
+            : "Squiggly";
+    const packed = [
+      sub,
+      meta.contents ?? "",
+      meta.author ?? "",
+      meta.id ?? "",
+      meta.date ?? "",
+    ].join("");
+    const flat = quads.flat();
+    return (
+      this.g._withStr(packed, (mp, ml) =>
+        this.g._withF64(flat, (qp, qc) =>
+          this.ex().gp_add_markup_annotation(this.h, page, mp, ml, qp, qc, RGB(rgb), opacity)
+        )
+      ) === 0
+    );
+  }
+  /**
+   * Add a sticky-note (`/Text`) annotation: a badge at `rect` (`[x0,y0,x1,y1]`)
+   * that opens a popup with `meta.contents`. `icon` is the named icon (`"Note"`,
+   * `"Comment"`, …); `open` sets the initial popup state.
+   */
+  addTextNote(
+    page: number,
+    rect: [number, number, number, number],
+    rgb: number,
+    meta: { contents?: string; author?: string; id?: string; date?: string } = {},
+    icon = "Note",
+    open = false
+  ): boolean {
+    const packed = [
+      meta.contents ?? "",
+      meta.author ?? "",
+      meta.id ?? "",
+      meta.date ?? "",
+    ].join("");
+    return (
+      this.g._withStr(packed, (mp, ml) =>
+        this.g._withStr(icon, (ip, il) =>
+          this.ex().gp_add_text_note(
+            this.h,
+            page,
+            rect[0],
+            rect[1],
+            rect[2],
+            rect[3],
+            mp,
+            ml,
+            ip,
+            il,
+            open ? 1 : 0,
+            RGB(rgb)
+          )
+        )
+      ) === 0
+    );
   }
   /** Freehand ink annotation from one polyline (`points` = flat [x0,y0,x1,y1,…]). */
   addInk(page: number, points: number[], rgb = 0, lineWidth = 1): boolean {

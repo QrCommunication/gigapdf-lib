@@ -467,6 +467,8 @@ fn paint(
                                             &seg,
                                             id,
                                             style.color,
+                                            1.0,
+                                            0.0,
                                         );
                                         seg.clear();
                                     }
@@ -514,6 +516,8 @@ fn paint(
                                 &seg,
                                 id,
                                 style.color,
+                                1.0,
+                                0.0,
                             );
                         }
                     } else {
@@ -525,6 +529,8 @@ fn paint(
                             trimmed,
                             id,
                             style.color,
+                            1.0,
+                            0.0,
                         );
                     }
 

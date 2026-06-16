@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] - 2026-06-16
+
+### Added
+
+- **`doc.addText(...)` gains `opacity` and `rotationDeg`** — baked text can now
+  fade and rotate (text matrix), matching a host editor's `drawText` fidelity for
+  edited/added text runs. ABI `gp_add_text` extended.
+- **`doc.extractFont(name)`** — extract an embedded font program by (fuzzy)
+  `/BaseFont` name, returning the raw decoded bytes + format (`truetype` embeds
+  directly; `cff`/`type1` need a TTF conversion). Lets a host re-embed the
+  document's **own** font when re-baking edited text and keep the original
+  glyphs (no pdf-lib needed for source-font extraction). ABI `gp_extract_font`.
+- **`doc.addMarkupAnnotation(page, subtype, quads, rgb, opacity, meta)`** —
+  Highlight / Underline / StrikeOut / Squiggly spanning **multiple quads**
+  (wrapped text), with full reviewer metadata (`contents`, `author`, `id`,
+  `date`). ABI `gp_add_markup_annotation`.
+- **`doc.addTextNote(page, rect, rgb, meta, icon, open)`** — sticky-note
+  (`/Text`) annotation with popup contents + named icon. ABI `gp_add_text_note`.
+
 ## [0.12.0] - 2026-06-16
 
 ### Added

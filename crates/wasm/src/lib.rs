@@ -1597,10 +1597,143 @@ pub extern "C" fn gp_add_text(
     text_len: usize,
     font_obj: u32,
     rgb: u32,
+    opacity: f64,
+    rotation_deg: f64,
 ) -> i32 {
     let text = unsafe { str_arg(text_ptr, text_len) };
     edit(handle, |doc| {
-        doc.add_text(page, x, y, size, text, font_obj, unpack_rgb(rgb))
+        doc.add_text(
+            page,
+            x,
+            y,
+            size,
+            text,
+            font_obj,
+            unpack_rgb(rgb),
+            opacity,
+            rotation_deg,
+        )
+    })
+}
+
+/// Extract an embedded font program by (fuzzy) `/BaseFont` name. Returns a buffer
+/// whose **first byte** is the format tag (1 = truetype, 2 = cff, 3 = type1)
+/// followed by the raw decoded font bytes. Null (empty) when no embedded match —
+/// lets a host re-embed the document's own font when re-baking edited text.
+#[no_mangle]
+pub extern "C" fn gp_extract_font(
+    handle: *const Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_ref() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    match doc.extract_font_program(name) {
+        Some((bytes, format)) => {
+            let tag: u8 = match format {
+                "truetype" => 1,
+                "cff" => 2,
+                _ => 3,
+            };
+            let mut out = Vec::with_capacity(bytes.len() + 1);
+            out.push(tag);
+            out.extend_from_slice(&bytes);
+            unsafe { bytes_into_host(out, out_len) }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Add a text-markup annotation (Highlight / Underline / StrikeOut / Squiggly)
+/// over `quads` (flat `[x0,y0,x1,y1, …]` in PDF coords). `meta` packs five
+/// `\x1f`-separated strings: subtype, contents, author, id, date. `rgb` packed
+/// `0xRRGGBB`, `opacity` 0–1. Returns 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_markup_annotation(
+    handle: *mut Document,
+    page: u32,
+    meta_ptr: *const u8,
+    meta_len: usize,
+    quads_ptr: *const f64,
+    quads_len: usize,
+    rgb: u32,
+    opacity: f64,
+) -> i32 {
+    let meta = unsafe { str_arg(meta_ptr, meta_len) };
+    let mut parts = meta.split('\u{1f}');
+    let subtype = parts.next().unwrap_or("");
+    let contents = parts.next().unwrap_or("");
+    let author = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    let date = parts.next().unwrap_or("");
+    let flat: &[f64] = if quads_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(quads_ptr, quads_len) }
+    };
+    let quads: Vec<[f64; 4]> = flat
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect();
+    edit(handle, |doc| {
+        doc.add_markup_annotation(
+            page,
+            subtype,
+            &quads,
+            unpack_rgb(rgb),
+            opacity,
+            contents,
+            author,
+            id,
+            date,
+        )
+    })
+}
+
+/// Add a sticky-note (`/Text`) annotation. `rect` = `[x0,y0,x1,y1]`. `meta` packs
+/// four `\x1f`-separated strings: contents, author, id, date. `icon` is the
+/// `/Name` (e.g. "Note"). `open` non-zero opens the popup. `rgb` packed
+/// `0xRRGGBB`. Returns 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_text_note(
+    handle: *mut Document,
+    page: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    meta_ptr: *const u8,
+    meta_len: usize,
+    icon_ptr: *const u8,
+    icon_len: usize,
+    open: i32,
+    rgb: u32,
+) -> i32 {
+    let meta = unsafe { str_arg(meta_ptr, meta_len) };
+    let icon = unsafe { str_arg(icon_ptr, icon_len) };
+    let mut parts = meta.split('\u{1f}');
+    let contents = parts.next().unwrap_or("");
+    let author = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    let date = parts.next().unwrap_or("");
+    edit(handle, |doc| {
+        doc.add_text_note(
+            page,
+            [x0, y0, x1, y1],
+            contents,
+            author,
+            id,
+            date,
+            open != 0,
+            icon,
+            unpack_rgb(rgb),
+        )
     })
 }
 
