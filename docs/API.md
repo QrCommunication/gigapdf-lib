@@ -35,7 +35,8 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `page_text_runs(page) -> Vec<TextRun>` | `gp_text_runs_json(handle,page,outlen)` |
 | `page_elements(page) -> Vec<ContentElement>` | `gp_elements_json(handle,page,outlen)` |
 | `page_text_elements(page) -> Vec<TextElementInfo>` (rich per-run text: bounds + family/bold/italic + size + colour + rotation) | `gp_text_elements_json(handle,page,outlen)` |
-| `page_image_elements(page) -> Vec<ImageElementInfo>` (placement bounds + format + embeddable bytes + pixel dims) | `gp_image_elements_json(handle,page,outlen)` → `[{…,format,pixelWidth,pixelHeight,dataBase64}]` |
+| `page_image_elements(page) -> Vec<ImageElementInfo>` (placement bounds + format + embeddable bytes + pixel dims + rotation + opacity) | `gp_image_elements_json(handle,page,outlen)` → `[{…,format,pixelWidth,pixelHeight,dataBase64,rotation,opacity}]` |
+| `page_vector_paths(page) -> Vec<VectorPath>` (painted paths: segments + bounds + fill/stroke RGB + line width + alpha + dash) | `gp_vector_paths_json(handle,page,outlen)` → `[{…,segments,fill,stroke,strokeWidth,fillAlpha,strokeAlpha,dash}]` |
 | `element_at(page,x,y) -> Option<usize>` | `gp_element_at(handle,page,x,y)` |
 | `replace_text_run(page,i,&str)` (font-aware: re-encodes Type0/Identity-H runs through the font's char→glyph map) | `gp_replace_text(handle,page,i,ptr,len)` |
 | `remove_text_run(page,i)` / `remove_element(page,i)` | `gp_remove_element(handle,page,i)` |
@@ -91,7 +92,7 @@ Three complementary ways to draw real, selectable text — no host font files ne
 | `add_free_text(page,rect,text,size,rgb)` | `gp_add_free_text(...)` |
 | `add_square_annotation/add_line_annotation` | `gp_add_square/gp_add_line` |
 | `add_ink(page,paths,rgb,lw)` / `add_stamp` | `gp_add_ink / gp_add_stamp` |
-| `page_annotations(page)` | `gp_annotations_json(handle,page,outlen)` |
+| `page_annotations(page)` (rich: author/subject/dates/colour/opacity/quadPoints/inkList/stamp name/link target) | `gp_annotations_json(handle,page,outlen)` |
 | `remove_annotation(page,i)` | `gp_remove_annotation(handle,page,i)` |
 | `flatten_annotations(page) -> usize` | `gp_flatten_annotations(handle,page)` |
 | `form_fields() -> Vec<FormField>` | `gp_fields_json(handle,outlen)` |
@@ -161,9 +162,13 @@ MAC verified — with **no third-party crypto** (all in `crate::crypto`).
 | `ocr_page_text(page,scale) -> String` | `gp_ocr_text(handle,page,scale,outlen)` | scanned page → plain text |
 
 OCR uses the built-in recognizer (no Tesseract): Otsu → connected components →
-line/word segmentation → an MLP trained offline on EMNIST (handwriting) + synthetic
-font glyphs (printed + accented Latin). Use `scale ≥ 2.0` for small text. For pages
-that already carry a text layer, `structured_text` / `search` are exact and faster.
+line/word segmentation → a compact CNN trained offline on EMNIST (handwriting) +
+synthetic font glyphs (printed + accented Latin). Use `scale ≥ 2.0` for small text.
+For pages that already carry a text layer, `structured_text` / `search` are exact and
+faster. Multi-script support (Cyrillic, Greek, CJK, Arabic, Hebrew, Indic) and a
+line-level CRNN+CTC recognizer are on the roadmap — see
+[`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and
+[`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md).
 
 ## Conversions
 

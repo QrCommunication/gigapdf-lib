@@ -308,6 +308,11 @@ pub struct ImageElementInfo {
     pub pixel_height: u32,
     /// Embeddable encoded image bytes (empty when `format == "unknown"`).
     pub data: Vec<u8>,
+    /// Rotation in degrees from the placement CTM (`0` = upright).
+    pub rotation: f64,
+    /// Non-stroking fill alpha in effect (`0.0..=1.0`, `1.0` = fully opaque),
+    /// from the active `/ExtGState`'s `/ca`.
+    pub opacity: f64,
 }
 
 impl Document {
@@ -1012,7 +1017,64 @@ impl Document {
     pub fn page_elements(&self, page_no: u32) -> Result<Vec<ContentElement>> {
         let content = self.page_content(page_no)?;
         let fonts = self.page_font_decoders(page_no);
-        content::extract_elements_with(&content, &fonts)
+        let gstate_alpha = self.page_gstate_alpha(page_no);
+        content::extract_elements_with(&content, &fonts, &gstate_alpha)
+    }
+
+    /// Map each `/ExtGState` resource name on `page_no` to its `/ca` (non-stroking
+    /// fill alpha). The element walker reads this when it hits a `gs` operator so
+    /// elements carry their effective opacity. Derived from
+    /// [`page_gstate_alpha_pair`](Self::page_gstate_alpha_pair); names without a
+    /// `/ca` are skipped (they leave the alpha unchanged).
+    fn page_gstate_alpha(&self, page_no: u32) -> BTreeMap<String, f64> {
+        self.page_gstate_alpha_pair(page_no)
+            .into_iter()
+            .filter_map(|(name, (ca, _))| ca.map(|v| (name, v)))
+            .collect()
+    }
+
+    /// Map each `/ExtGState` resource name on `page_no` to its `(/ca, /CA)`
+    /// non-stroking and stroking alphas (each `None` when the key is absent so
+    /// the walker leaves that alpha unchanged). Drives both element opacity and
+    /// vector-path fill/stroke opacity.
+    fn page_gstate_alpha_pair(&self, page_no: u32) -> BTreeMap<String, (Option<f64>, Option<f64>)> {
+        let mut out = BTreeMap::new();
+        let Ok(page) = self.page_dict(page_no) else {
+            return out;
+        };
+        let gs_dict = page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|res| res.get(b"ExtGState"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict);
+        let Some(gs_dict) = gs_dict else {
+            return out;
+        };
+        for (name, value) in &gs_dict.0 {
+            let Some(state) = self.resolve(value).as_dict() else {
+                continue;
+            };
+            let ca = state.get(b"ca").and_then(Object::as_f64);
+            let ca_stroke = state.get(b"CA").and_then(Object::as_f64);
+            if ca.is_some() || ca_stroke.is_some() {
+                out.insert(String::from_utf8_lossy(name).into_owned(), (ca, ca_stroke));
+            }
+        }
+        out
+    }
+
+    /// Every painted vector path on a page (frames, rules, lines, filled shapes…)
+    /// as geometry + style: segments in user space (origin bottom-left), the
+    /// fill/stroke RGB colours, line width, alpha and dash. Clip-only paths are
+    /// omitted. The native equivalent of a reader's vector/shape layer, driving a
+    /// host editor without a rasteriser.
+    pub fn page_vector_paths(&self, page_no: u32) -> Result<Vec<content::vector::VectorPath>> {
+        let content = self.page_content(page_no)?;
+        let gstate = self.page_gstate_alpha_pair(page_no);
+        let operations = content::parse_content(&content)?;
+        Ok(content::vector::vector_paths_from_ops(&operations, &gstate))
     }
 
     /// Every **text** element on a page, enriched with everything a host editor
@@ -1070,7 +1132,7 @@ impl Document {
         let Ok(elements) = self.page_elements(page_no) else {
             return Vec::new();
         };
-        let images: Vec<(content::Bounds, String)> = elements
+        let images: Vec<(content::Bounds, String, f64, f64)> = elements
             .into_iter()
             .filter(|e| e.kind == content::ElementKind::Image)
             .map(|e| {
@@ -1080,11 +1142,13 @@ impl Document {
                     width: 0.0,
                     height: 0.0,
                 });
-                (b, e.label)
+                let rotation = e.rotation_deg.unwrap_or(0.0);
+                let opacity = e.fill_alpha.unwrap_or(1.0);
+                (b, e.label, rotation, opacity)
             })
             .collect();
         let mut out = Vec::new();
-        for (idx, (b, name)) in images.into_iter().enumerate() {
+        for (idx, (b, name, rotation, opacity)) in images.into_iter().enumerate() {
             let Some((format, data, pw, ph)) = self.image_xobject_bytes(page_no, name.as_bytes())
             else {
                 continue;
@@ -1099,6 +1163,8 @@ impl Document {
                 pixel_width: pw,
                 pixel_height: ph,
                 data,
+                rotation,
+                opacity,
             });
         }
         out
@@ -2740,18 +2806,114 @@ impl Document {
                 .map(|n| String::from_utf8_lossy(n).into_owned())
                 .unwrap_or_default();
             let rect = self.read_rect(dict);
-            let contents = match dict.get(b"Contents").map(|o| self.resolve(o)) {
+            // `/Contents`, `/T`, `/Subj`, `/CreationDate`, `/M` are all text
+            // strings; `/Name` (stamp) is a name. Dates are left raw (the host
+            // parses the `D:YYYYMMDD…` form).
+            let text_of = |key: &[u8]| match dict.get(key).map(|o| self.resolve(o)) {
                 Some(Object::String(bytes, _)) => crate::font::decode_pdf_text(bytes),
                 _ => String::new(),
+            };
+            let contents = text_of(b"Contents");
+            let author = text_of(b"T");
+            let subject = text_of(b"Subj");
+            let created = text_of(b"CreationDate");
+            let modified = text_of(b"M");
+            let name = match dict.get(b"Name").map(|o| self.resolve(o)) {
+                Some(Object::Name(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+                Some(Object::String(bytes, _)) => crate::font::decode_pdf_text(bytes),
+                _ => String::new(),
+            };
+            let color = self.annotation_rgb(dict);
+            let opacity = dict
+                .get(b"CA")
+                .map(|o| self.resolve(o))
+                .and_then(|o| o.as_f64())
+                .unwrap_or(1.0);
+            let quad_points = self.read_num_array(dict, b"QuadPoints");
+            let ink_list = self.read_ink_list(dict);
+            let (link_uri, link_page) = if subtype == "Link" {
+                match self.link_target(dict) {
+                    LinkTarget::Uri(uri) => (uri, 0),
+                    LinkTarget::Page(p) => (String::new(), p),
+                    LinkTarget::Unknown => (String::new(), 0),
+                }
+            } else {
+                (String::new(), 0)
             };
             out.push(Annotation {
                 index,
                 subtype,
                 rect,
                 contents,
+                author,
+                subject,
+                created,
+                modified,
+                color,
+                opacity,
+                quad_points,
+                ink_list,
+                name,
+                link_uri,
+                link_page,
             });
         }
         Ok(out)
+    }
+
+    /// Read an annotation's `/C` array and normalise it to RGB in `0.0..=1.0`:
+    /// `[]` → empty (no colour), `[g]` → gray replicated, `[r g b]` → as-is,
+    /// `[c m y k]` → naive CMYK→RGB. Anything else → empty.
+    fn annotation_rgb(&self, dict: &Dictionary) -> Vec<f64> {
+        let Some(arr) = dict.get(b"C").map(|o| self.resolve(o)) else {
+            return Vec::new();
+        };
+        let Some(items) = arr.as_array() else {
+            return Vec::new();
+        };
+        let c: Vec<f64> = items.iter().filter_map(Object::as_f64).collect();
+        match c.len() {
+            1 => vec![c[0], c[0], c[0]],
+            3 => c,
+            4 => {
+                let k = c[3];
+                vec![
+                    (1.0 - c[0]) * (1.0 - k),
+                    (1.0 - c[1]) * (1.0 - k),
+                    (1.0 - c[2]) * (1.0 - k),
+                ]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Read a flat number array (e.g. `/QuadPoints`) as `Vec<f64>`; empty when
+    /// absent or not an array.
+    fn read_num_array(&self, dict: &Dictionary, key: &[u8]) -> Vec<f64> {
+        dict.get(key)
+            .map(|o| self.resolve(o))
+            .and_then(|o| o.as_array().map(<[Object]>::to_vec))
+            .map(|items| items.iter().filter_map(Object::as_f64).collect())
+            .unwrap_or_default()
+    }
+
+    /// Read an `/InkList` (array of number arrays) as `Vec<Vec<f64>>`; empty
+    /// when absent.
+    fn read_ink_list(&self, dict: &Dictionary) -> Vec<Vec<f64>> {
+        let Some(arr) = dict.get(b"InkList").map(|o| self.resolve(o)) else {
+            return Vec::new();
+        };
+        let Some(paths) = arr.as_array() else {
+            return Vec::new();
+        };
+        paths
+            .iter()
+            .filter_map(|p| {
+                self.resolve(p)
+                    .as_array()
+                    .map(|pts| pts.iter().filter_map(Object::as_f64).collect())
+            })
+            .collect()
     }
 
     /// Remove the annotation at `index` from a page's `/Annots`.
@@ -8491,6 +8653,9 @@ mod tests {
             assert_eq!((img.pixel_width, img.pixel_height), (2, 2), "2x2 px");
             assert!(!img.data.is_empty(), "embeddable bytes present");
             assert!(img.width > 0.0 && img.height > 0.0, "placement box set");
+            // Axis-aligned placement, fully opaque (`add_image` opacity = 1.0).
+            assert_eq!(img.rotation, 0.0, "upright placement");
+            assert!((img.opacity - 1.0).abs() < 1e-9, "fully opaque");
         }
         let formats: Vec<&str> = imgs.iter().map(|i| i.format.as_str()).collect();
         assert!(formats.contains(&"png"), "Flate image → png, got {formats:?}");
@@ -8510,6 +8675,62 @@ mod tests {
         // The JPEG one is a real JPEG (SOI marker) passed through untouched.
         let jpeg_el = imgs.iter().find(|i| i.format == "jpeg").unwrap();
         assert_eq!(&jpeg_el.data[0..2], &[0xFF, 0xD8], "JPEG SOI passthrough");
+    }
+
+    #[test]
+    fn page_image_elements_report_opacity_from_extgstate() {
+        // `add_image` with opacity < 1 wraps the draw in a `q … gs … Q` block
+        // referencing an /ExtGState whose /ca the walker must surface.
+        let mut doc = blank_doc();
+        let rgba = [255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255];
+        let png = crate::raster::png::encode_png(2, 2, &rgba);
+        doc.add_image(1, &png, 50.0, 600.0, 64.0, 64.0, 0.5).unwrap();
+
+        let imgs = doc.page_image_elements(1);
+        assert_eq!(imgs.len(), 1, "one image element");
+        assert!(
+            (imgs[0].opacity - 0.5).abs() < 1e-9,
+            "image carries /ca 0.5 from its /ExtGState, got {}",
+            imgs[0].opacity
+        );
+    }
+
+    #[test]
+    fn page_annotations_carry_rich_metadata() {
+        let mut doc = blank_doc();
+        doc.add_markup_annotation(
+            1,
+            "Highlight",
+            &[[100.0, 700.0, 200.0, 712.0]],
+            [1.0, 1.0, 0.0],
+            0.5,
+            "review note",
+            "Alice",
+            "nm-1",
+            "D:20260101120000Z",
+        )
+        .unwrap();
+        doc.add_uri_link(1, [10.0, 10.0, 50.0, 20.0], "https://giga-pdf.com")
+            .unwrap();
+
+        let annots = doc.page_annotations(1).unwrap();
+        let hl = annots
+            .iter()
+            .find(|a| a.subtype == "Highlight")
+            .expect("highlight present");
+        assert_eq!(hl.author, "Alice", "/T author");
+        assert_eq!(hl.contents, "review note", "/Contents");
+        assert_eq!(hl.modified, "D:20260101120000Z", "/M raw date");
+        assert!((hl.opacity - 0.5).abs() < 1e-9, "/CA opacity");
+        assert_eq!(hl.color, vec![1.0, 1.0, 0.0], "/C yellow → RGB");
+        assert_eq!(hl.quad_points.len(), 8, "one quad = 8 values");
+
+        let link = annots
+            .iter()
+            .find(|a| a.subtype == "Link")
+            .expect("link present");
+        assert_eq!(link.link_uri, "https://giga-pdf.com", "/A /URI target");
+        assert_eq!(link.link_page, 0, "external link has no internal page");
     }
 
     #[test]

@@ -437,10 +437,11 @@ pub extern "C" fn gp_text_elements_json(
 }
 
 /// Every image element on a page as JSON, for a host editor:
-/// `[{index,x,y,width,height,format,pixelWidth,pixelHeight,dataBase64}]`. Bounds
-/// in user space (origin bottom-left); `format` is `jpeg`/`png`/`jp2`/`unknown`;
-/// `dataBase64` is the embeddable encoded bytes (empty when `unknown`). Host
-/// frees the returned buffer.
+/// `[{index,x,y,width,height,format,pixelWidth,pixelHeight,dataBase64,rotation,
+/// opacity}]`. Bounds in user space (origin bottom-left); `format` is
+/// `jpeg`/`png`/`jp2`/`unknown`; `dataBase64` is the embeddable encoded bytes
+/// (empty when `unknown`); `rotation` is the placement angle in degrees and
+/// `opacity` the `/ExtGState` fill alpha (`1` = opaque). Host frees the buffer.
 #[no_mangle]
 pub extern "C" fn gp_image_elements_json(
     handle: *const Document,
@@ -469,6 +470,82 @@ pub extern "C" fn gp_image_elements_json(
                     e.pixel_width, e.pixel_height
                 ));
                 json_escape(&gigapdf_core::convert::base64(&e.data), &mut s);
+                s.push_str(&format!(
+                    ",\"rotation\":{},\"opacity\":{}}}",
+                    fnum(e.rotation),
+                    fnum(e.opacity)
+                ));
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Every painted vector path on a page as JSON, for a host editor's shape layer:
+/// `[{index,hasBounds,x0,y0,x1,y1,segments,fill,stroke,strokeWidth,fillAlpha,
+/// strokeAlpha,dash}]`. Bounds + segment points are in user space (origin
+/// bottom-left); each segment is `{op:"M"|"L"|"C"|"Z",pts:[…]}`; `fill`/`stroke`
+/// are `[r,g,b]` in `0..=1` or `null`. Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_vector_paths_json(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    use gigapdf_core::content::vector::PathSeg;
+    let fnum = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let paths = doc.page_vector_paths(page).unwrap_or_default();
+            let mut s = String::from("[");
+            for (i, p) in paths.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let (hb, b) = match p.bounds {
+                    Some(b) => (true, [b.x, b.y, b.x + b.width, b.y + b.height]),
+                    None => (false, [0.0; 4]),
+                };
+                s.push_str(&format!(
+                    "{{\"index\":{},\"hasBounds\":{},\"x0\":{},\"y0\":{},\"x1\":{},\"y1\":{},\"segments\":[",
+                    p.index, hb, fnum(b[0]), fnum(b[1]), fnum(b[2]), fnum(b[3])
+                ));
+                for (j, seg) in p.segments.iter().enumerate() {
+                    if j > 0 {
+                        s.push(',');
+                    }
+                    let (op, pts): (&str, Vec<f64>) = match *seg {
+                        PathSeg::Move(x, y) => ("M", vec![x, y]),
+                        PathSeg::Line(x, y) => ("L", vec![x, y]),
+                        PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                            ("C", vec![x1, y1, x2, y2, x3, y3])
+                        }
+                        PathSeg::Close => ("Z", Vec::new()),
+                    };
+                    s.push_str(&format!("{{\"op\":\"{op}\",\"pts\":"));
+                    s.push_str(&num_array_json(&pts));
+                    s.push('}');
+                }
+                s.push_str("],\"fill\":");
+                match p.fill {
+                    Some(c) => s.push_str(&num_array_json(&c)),
+                    None => s.push_str("null"),
+                }
+                s.push_str(",\"stroke\":");
+                match p.stroke {
+                    Some(c) => s.push_str(&num_array_json(&c)),
+                    None => s.push_str("null"),
+                }
+                s.push_str(&format!(
+                    ",\"strokeWidth\":{},\"fillAlpha\":{},\"strokeAlpha\":{},\"dash\":",
+                    fnum(p.stroke_width),
+                    fnum(p.fill_alpha),
+                    fnum(p.stroke_alpha)
+                ));
+                s.push_str(&num_array_json(&p.dash));
                 s.push('}');
             }
             s.push(']');
@@ -2943,6 +3020,19 @@ fn fields_json(fields: &[FormField]) -> String {
     out
 }
 
+/// A JSON array literal of finite numbers (NaN/∞ → 0).
+fn num_array_json(values: &[f64]) -> String {
+    let mut s = String::from("[");
+    for (i, &v) in values.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{}", if v.is_finite() { v } else { 0.0 }));
+    }
+    s.push(']');
+    s
+}
+
 fn annotations_json(annots: &[Annotation]) -> String {
     let mut out = String::from("[");
     for (i, a) in annots.iter().enumerate() {
@@ -2956,7 +3046,32 @@ fn annotations_json(annots: &[Annotation]) -> String {
             a.rect[0], a.rect[1], a.rect[2], a.rect[3]
         ));
         json_escape(&a.contents, &mut out);
-        out.push('}');
+        out.push_str(",\"author\":");
+        json_escape(&a.author, &mut out);
+        out.push_str(",\"subject\":");
+        json_escape(&a.subject, &mut out);
+        out.push_str(",\"created\":");
+        json_escape(&a.created, &mut out);
+        out.push_str(",\"modified\":");
+        json_escape(&a.modified, &mut out);
+        out.push_str(",\"name\":");
+        json_escape(&a.name, &mut out);
+        out.push_str(&format!(",\"opacity\":{}", if a.opacity.is_finite() { a.opacity } else { 1.0 }));
+        out.push_str(",\"color\":");
+        out.push_str(&num_array_json(&a.color));
+        out.push_str(",\"quadPoints\":");
+        out.push_str(&num_array_json(&a.quad_points));
+        out.push_str(",\"inkList\":[");
+        for (j, path) in a.ink_list.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&num_array_json(path));
+        }
+        out.push(']');
+        out.push_str(",\"linkUri\":");
+        json_escape(&a.link_uri, &mut out);
+        out.push_str(&format!(",\"linkPage\":{}}}", a.link_page));
     }
     out.push(']');
     out

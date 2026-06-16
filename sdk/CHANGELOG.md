@@ -4,6 +4,30 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.32.0] - 2026-06-17
+
+### Added
+
+- **Image elements now carry rotation + opacity.** `imageElements()` /
+  `Document::page_image_elements` enrich each `ImageElementInfo` with `rotation`
+  (degrees, from the placement CTM) and `opacity` (the active `/ExtGState`
+  `/ca`, `1` = opaque). The content walker now tracks fill alpha through `q`/`Q`
+  and `gs`, so a host editor recreates an image's tilt and translucency without
+  walking the operator list itself.
+- **Rich annotations.** `annotations()` / `Document::page_annotations` now return
+  the full markup metadata on each `AnnotationInfo`: `author` (`/T`), `subject`
+  (`/Subj`), `created`/`modified` (`/CreationDate`/`/M`, raw PDF dates), `name`
+  (stamp), `opacity` (`/CA`), `color` (`/C` normalised to RGB), `quadPoints`
+  (`/QuadPoints` for text markup), `inkList` (`/InkList` freehand strokes), and
+  the link target (`linkUri` / `linkPage`). The native replacement for a
+  reader's annotation layer.
+- **Vector path layer.** New `vectorPaths(page)` / `Document::page_vector_paths`
+  return every painted path as geometry + style: `segments` (`M`/`L`/`C`/`Z` in
+  user space), `bounds`, `fill`/`stroke` RGB (`null` when not painted),
+  `strokeWidth`, `fillAlpha`/`strokeAlpha` and `dash`. Clip-only paths are
+  omitted. Drives a host editor's shape layer without a rasteriser — the
+  read-side counterpart of the SVG→PDF drawing helpers.
+
 ## [0.31.0] - 2026-06-17
 
 ### Added

@@ -10,6 +10,7 @@
 pub mod image;
 mod interpret;
 pub mod svg_path;
+pub mod vector;
 
 use std::collections::BTreeMap;
 
@@ -83,8 +84,13 @@ pub struct ContentElement {
     /// scaled by the text·CTM vertical scale). `None` for image/path.
     pub font_size: Option<f64>,
     /// For text: the baseline rotation in degrees (from the text·CTM matrix;
-    /// `0` for upright text). `None` for image/path.
+    /// `0` for upright text). For images: the rotation of the placement CTM.
+    /// `None` for path.
     pub rotation_deg: Option<f64>,
+    /// The non-stroking (fill) alpha in effect, `0.0..=1.0`, from the active
+    /// `/ExtGState`'s `/ca` (set via the `gs` operator). `None` means the
+    /// default (fully opaque). Populated for images; drives editor opacity.
+    pub fill_alpha: Option<f64>,
 }
 
 /// A reading-order text line: the concatenated runs that share a baseline band,
@@ -561,12 +567,19 @@ fn accumulate_path(operator: &[u8], n: &[f64], ctm: &Matrix, bb: &mut BoundsBuil
 
 /// Group a flat operation list into addressable elements, computing each one's
 /// bounding box by interpreting the graphics + text state.
-fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<ContentElement> {
+fn elements_from_ops(
+    operations: &[Operation],
+    fonts: &FontDecoders,
+    gstate_alpha: &BTreeMap<String, f64>,
+) -> Vec<ContentElement> {
     let mut elements = Vec::new();
 
-    // Graphics state.
+    // Graphics state. The q/Q stack saves the CTM and the fill alpha together,
+    // mirroring the PDF graphics-state save/restore semantics for the bits we
+    // surface on elements.
     let mut ctm = Matrix::IDENTITY;
-    let mut ctm_stack: Vec<Matrix> = Vec::new();
+    let mut fill_alpha = 1.0f64;
+    let mut ctm_stack: Vec<(Matrix, f64)> = Vec::new();
     // Text state.
     let mut tm = Matrix::IDENTITY;
     let mut tlm = Matrix::IDENTITY;
@@ -583,16 +596,27 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
     for (i, op) in operations.iter().enumerate() {
         let operator = op.operator.as_slice();
         match operator {
-            b"q" => ctm_stack.push(ctm),
+            b"q" => ctm_stack.push((ctm, fill_alpha)),
             b"Q" => {
-                if let Some(m) = ctm_stack.pop() {
+                if let Some((m, a)) = ctm_stack.pop() {
                     ctm = m;
+                    fill_alpha = a;
                 }
             }
             b"cm" => {
                 let n = nums(op);
                 if n.len() == 6 {
                     ctm = Matrix::new(n[0], n[1], n[2], n[3], n[4], n[5]).then(&ctm);
+                }
+            }
+            // `gs` selects a named `/ExtGState`; the caller pre-resolves each
+            // graphics-state dict's `/ca` (fill alpha) into `gstate_alpha`.
+            b"gs" => {
+                if let Some(Object::Name(name)) = op.operands.first() {
+                    let key = String::from_utf8_lossy(name);
+                    if let Some(&a) = gstate_alpha.get(key.as_ref()) {
+                        fill_alpha = a;
+                    }
                 }
             }
             b"BT" => {
@@ -691,6 +715,7 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                     color: fill_color,
                     font_size: Some(eff_size),
                     rotation_deg: Some(if rot.abs() < 1e-6 { 0.0 } else { rot }),
+                    fill_alpha: Some(fill_alpha),
                 });
                 tm = Matrix::translate(width, 0.0).then(&tm);
             }
@@ -701,6 +726,10 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                     .find_map(|o| o.as_name())
                     .map(|n| String::from_utf8_lossy(n).into_owned())
                     .unwrap_or_default();
+                // The placement CTM's x-axis angle is the image's rotation,
+                // exactly as for a text baseline.
+                let m = ctm.0;
+                let img_rot = m[1].atan2(m[0]).to_degrees();
                 elements.push(ContentElement {
                     index: 0,
                     kind: ElementKind::Image,
@@ -711,7 +740,8 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                     font: None,
                     color: None,
                     font_size: None,
-                    rotation_deg: None,
+                    rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
+                    fill_alpha: Some(fill_alpha),
                 });
             }
             _ if is_path_construction(operator) => {
@@ -731,6 +761,7 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
                         color: None,
                         font_size: None,
                         rotation_deg: None,
+                        fill_alpha: Some(fill_alpha),
                     });
                 }
                 path_bb = BoundsBuilder::new();
@@ -747,22 +778,28 @@ fn elements_from_ops(operations: &[Operation], fonts: &FontDecoders) -> Vec<Cont
 }
 
 /// List all addressable elements (text, images, shapes) of a content stream,
-/// decoding text labels with the page's fonts (WinAnsi + `/ToUnicode`).
-pub fn extract_elements_with(content: &[u8], fonts: &FontDecoders) -> Result<Vec<ContentElement>> {
+/// decoding text labels with the page's fonts (WinAnsi + `/ToUnicode`) and
+/// resolving each element's fill alpha through `gstate_alpha` (a map of
+/// `/ExtGState` resource name → `/ca`, built from the page's resources).
+pub fn extract_elements_with(
+    content: &[u8],
+    fonts: &FontDecoders,
+    gstate_alpha: &BTreeMap<String, f64>,
+) -> Result<Vec<ContentElement>> {
     let operations = parse_content(content)?;
-    Ok(elements_from_ops(&operations, fonts))
+    Ok(elements_from_ops(&operations, fonts, gstate_alpha))
 }
 
 /// List all addressable elements (text, images, shapes) of a content stream.
 pub fn extract_elements(content: &[u8]) -> Result<Vec<ContentElement>> {
-    extract_elements_with(content, &FontDecoders::new())
+    extract_elements_with(content, &FontDecoders::new(), &BTreeMap::new())
 }
 
 /// Remove the element at `index` (a text, image, or whole shape), preserving
 /// everything else verbatim.
 pub fn remove_element(content: &[u8], index: usize) -> Result<Vec<u8>> {
     let mut operations = parse_content(content)?;
-    let element = elements_from_ops(&operations, &FontDecoders::new())
+    let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
         .into_iter()
         .nth(index)
         .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;
@@ -774,7 +811,7 @@ pub fn remove_element(content: &[u8], index: usize) -> Result<Vec<u8>> {
 /// at the same position, ready to be moved). Works for text, images and shapes.
 pub fn duplicate_element(content: &[u8], index: usize) -> Result<Vec<u8>> {
     let mut operations = parse_content(content)?;
-    let element = elements_from_ops(&operations, &FontDecoders::new())
+    let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
         .into_iter()
         .nth(index)
         .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;
@@ -791,7 +828,7 @@ pub fn duplicate_element(content: &[u8], index: usize) -> Result<Vec<u8>> {
 /// shapes without touching their internal coordinates.
 pub fn move_element(content: &[u8], index: usize, dx: f64, dy: f64) -> Result<Vec<u8>> {
     let mut operations = parse_content(content)?;
-    let element = elements_from_ops(&operations, &FontDecoders::new())
+    let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
         .into_iter()
         .nth(index)
         .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;

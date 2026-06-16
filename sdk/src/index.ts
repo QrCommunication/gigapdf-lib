@@ -74,8 +74,12 @@ export class GigaPdfEngine {
   }
   /** Copy host bytes into wasm memory; returns the pointer (caller frees). */
   _toWasm(bytes: Uint8Array): number {
-    const ptr = this.ex.gp_alloc(bytes.length);
-    this.u8().set(bytes, ptr);
+    // If `bytes` aliases our own wasm memory (e.g. a buffer the caller didn't
+    // copy out), `gp_alloc` may grow — and detach — that buffer mid-copy.
+    // Snapshot to a host array first so the `.set` source stays valid.
+    const src = bytes.buffer === this.ex.memory.buffer ? new Uint8Array(bytes) : bytes;
+    const ptr = this.ex.gp_alloc(src.length);
+    this.u8().set(src, ptr);
     return ptr;
   }
   _free(ptr: number, len: number) {
@@ -658,6 +662,48 @@ export interface ImageElementInfo {
   pixelHeight: number;
   /** Embeddable encoded image bytes (empty when `format === "unknown"`). */
   data: Uint8Array;
+  /** Rotation in degrees from the placement CTM (`0` = upright). */
+  rotation: number;
+  /** Non-stroking fill alpha (`/ExtGState` `/ca`), `0..=1` (`1` = opaque). */
+  opacity: number;
+}
+/**
+ * One path segment from {@link GigaPdfDoc.vectorPaths} (page user space, origin
+ * bottom-left). `op` is `"M"` (move, 2 pts), `"L"` (line, 2 pts), `"C"` (cubic
+ * Bézier, 6 pts: cp1 cp2 end) or `"Z"` (close, 0 pts). `pts` is the flat
+ * coordinate list.
+ */
+export interface PathSegment {
+  op: "M" | "L" | "C" | "Z";
+  pts: number[];
+}
+/**
+ * A painted vector path from {@link GigaPdfDoc.vectorPaths}: its geometry
+ * (segments, bounds) plus the graphics state — fill/stroke RGB (`0..=1`, `null`
+ * when the paint op doesn't fill/stroke), line width, alpha and dash. Clip-only
+ * paths are omitted. The native equivalent of a reader's shape/vector layer.
+ */
+export interface VectorPathInfo {
+  index: number;
+  /** Whether `x0..y1` describe a real box (`false` for a degenerate path). */
+  hasBounds: boolean;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  segments: PathSegment[];
+  /** Fill colour `[r,g,b]` in `0..=1`, or `null` when not filled. */
+  fill: [number, number, number] | null;
+  /** Stroke colour `[r,g,b]` in `0..=1`, or `null` when not stroked. */
+  stroke: [number, number, number] | null;
+  /** Line width (`w`) in user-space units. */
+  strokeWidth: number;
+  /** Non-stroking alpha (`/ca`), `0..=1`. */
+  fillAlpha: number;
+  /** Stroking alpha (`/CA`), `0..=1`. */
+  strokeAlpha: number;
+  /** Dash pattern (`d` array); empty for a solid line. */
+  dash: number[];
 }
 export interface TextLine extends Box {
   text: string;
@@ -687,7 +733,12 @@ export interface SignP12Options {
   /** `/ContactInfo` — how to reach the signer. */
   contactInfo?: string;
 }
-/** A markup annotation (rect corners in PDF user space). */
+/**
+ * A markup annotation (rect corners in PDF user space, origin bottom-left).
+ * Carries the common metadata plus the type-specific geometry a host editor
+ * needs: text-markup `quadPoints`, freehand `inkList`, `stamp` name, and the
+ * link target (`linkUri` / `linkPage`).
+ */
 export interface AnnotationInfo {
   index: number;
   subtype: string;
@@ -696,6 +747,28 @@ export interface AnnotationInfo {
   x1: number;
   y1: number;
   contents: string;
+  /** `/T` — author / title. Empty when absent. */
+  author: string;
+  /** `/Subj` — subject. Empty when absent. */
+  subject: string;
+  /** `/CreationDate` — raw PDF date (`D:YYYYMMDD…`). Empty when absent. */
+  created: string;
+  /** `/M` — raw PDF modification date. Empty when absent. */
+  modified: string;
+  /** `/Name` — stamp name (e.g. `"Approved"`). Empty when absent. */
+  name: string;
+  /** `/CA` non-stroking opacity, `0..=1` (`1` = opaque). */
+  opacity: number;
+  /** `/C` normalised to RGB `0..=1` (`[]` when no colour). */
+  color: number[];
+  /** `/QuadPoints` (8 values per quad) for text-markup annotations. */
+  quadPoints: number[];
+  /** `/InkList` — one inner array per freehand stroke (`x y x y …`). */
+  inkList: number[][];
+  /** Link external URI (`/A /URI`). Empty when internal/absent. */
+  linkUri: string;
+  /** Link internal destination page (1-based); `0` when external/absent. */
+  linkPage: number;
 }
 /** A hyperlink annotation; `kind` discriminates the target. */
 export interface LinkInfo {
@@ -908,6 +981,16 @@ export class GigaPdfDoc {
       ...rest,
       data: this.g._fromBase64(dataBase64),
     }));
+  }
+  /**
+   * Every painted vector path on `page` (frames, rules, lines, filled shapes…)
+   * as geometry + style: segments and bounds in user space (origin bottom-left),
+   * fill/stroke RGB, line width, alpha and dash. Clip-only paths are omitted.
+   * The native replacement for walking a reader's operator list to rebuild the
+   * shape layer.
+   */
+  vectorPaths(page: number): VectorPathInfo[] {
+    return this.g._json((o) => this.ex().gp_vector_paths_json(this.h, page, o));
   }
   structuredText(page: number): TextLine[] {
     return this.g._json((o) => this.ex().gp_structured_text_json(this.h, page, o));

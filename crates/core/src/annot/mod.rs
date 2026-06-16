@@ -5,8 +5,11 @@
 use crate::content::{self, num};
 use crate::object::{Dictionary, Object, StringKind};
 
-/// An annotation as read from a page's `/Annots`.
-#[derive(Debug, Clone)]
+/// An annotation as read from a page's `/Annots`. Carries the common markup
+/// metadata (author, dates, colour, opacity) plus the type-specific geometry a
+/// host editor needs (quad points, ink paths, stamp name, link target) — the
+/// native equivalent of a reader's annotation layer.
+#[derive(Debug, Clone, Default)]
 pub struct Annotation {
     /// 0-based index in the page `/Annots` array.
     pub index: usize,
@@ -16,6 +19,36 @@ pub struct Annotation {
     pub rect: [f64; 4],
     /// `/Contents` text, if any.
     pub contents: String,
+    /// `/T` — the annotation author / title. Empty when absent.
+    pub author: String,
+    /// `/Subj` — the annotation subject. Empty when absent.
+    pub subject: String,
+    /// `/CreationDate` — raw PDF date string (e.g. `D:20260616120000Z`). Empty
+    /// when absent; the host parses it.
+    pub created: String,
+    /// `/M` — raw PDF modification date string. Empty when absent.
+    pub modified: String,
+    /// `/C` normalised to RGB in `0.0..=1.0` (gray → replicated, CMYK → naive).
+    /// Empty when `/C` is absent or `[]` (no colour).
+    pub color: Vec<f64>,
+    /// `/CA` non-stroking opacity in `0.0..=1.0` (`1.0` = opaque; the default
+    /// when `/CA` is absent).
+    pub opacity: f64,
+    /// `/QuadPoints` (8 values per quad) for text-markup annotations
+    /// (highlight/underline/strikeout/squiggly). PDF user space (bottom-left).
+    pub quad_points: Vec<f64>,
+    /// `/InkList` — one inner `Vec` per freehand stroke, `x y x y …` in PDF
+    /// user space. Empty for non-ink annotations.
+    pub ink_list: Vec<Vec<f64>>,
+    /// `/Name` — the stamp name (e.g. "Approved", "Draft") for Stamp
+    /// annotations. Empty when absent.
+    pub name: String,
+    /// For Link annotations: the external URI (`/A /URI`). Empty when the link
+    /// targets an internal page or is absent.
+    pub link_uri: String,
+    /// For Link annotations: the 1-based internal destination page (`/Dest` or
+    /// `/A /GoTo /D`). `0` when the link is external or has no resolvable page.
+    pub link_page: u32,
 }
 
 pub(crate) fn name(bytes: &[u8]) -> Object {
