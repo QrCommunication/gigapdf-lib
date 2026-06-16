@@ -172,6 +172,7 @@ that already carry a text layer, `structured_text` / `search` are exact and fast
 | `to_odt() -> Vec<u8>` | `gp_to_odt(handle,outlen)` | OpenDocument Text |
 | `to_xlsx() -> Vec<u8>` | `gp_to_xlsx(handle,outlen)` | tables → cells, prose → text |
 | `to_ods() -> Vec<u8>` | `gp_to_ods(handle,outlen)` | OpenDocument Spreadsheet |
+| `convert::office::to_xlsx_named(grids,&names)` / `to_ods_named` (pure; host-built `Vec<Vec<Vec<String>>>` grid + sheet names) | `gp_grids_to_xlsx(grids_json,glen,names_json,nlen,outlen)` / `gp_grids_to_ods(…)` · SDK `gridsToXlsx`/`gridsToOds` | emit `.xlsx`/`.ods` from a caller's own table grid (`string[][][]` JSON + `string[]` names) — no Document needed |
 | `to_rtf() -> Vec<u8>` | `gp_to_rtf(handle,outlen)` | RTF |
 | `to_pdfa() -> Vec<u8>` | `gp_to_pdfa(handle,outlen)` | PDF/A-2b metadata |
 

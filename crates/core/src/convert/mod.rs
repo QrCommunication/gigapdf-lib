@@ -12,6 +12,7 @@
 //! same already-normalized geometry.
 
 pub mod build;
+pub mod grids;
 pub mod office;
 pub mod pdfa;
 pub mod reverse;

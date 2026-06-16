@@ -940,9 +940,27 @@ fn col_letter(mut index: usize) -> String {
     String::from_utf8(letters).unwrap()
 }
 
+/// The display name for sheet `i`: the caller-supplied `names[i]` when present
+/// and non-empty, else the default `Page <i+1>`.
+fn sheet_name(names: &[String], i: usize) -> String {
+    names
+        .get(i)
+        .filter(|n| !n.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("Page {}", i + 1))
+}
+
 /// Export reconstructed tables (one grid per page) to an `.xlsx` workbook — one
 /// sheet per page, cell text carried inline. Use when the PDF is tabular.
+/// Sheets are named `Page <n>`; use [`to_xlsx_named`] for custom names.
 pub fn to_xlsx(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
+    to_xlsx_named(grids, &[])
+}
+
+/// As [`to_xlsx`] but with explicit per-sheet names (index-aligned to `grids`); a
+/// missing or empty name falls back to `Page <n>`. Lets a host preserve its own
+/// sheet titles (e.g. a single concatenated `Sheet1`) when reusing this writer.
+pub fn to_xlsx_named(grids: &[Vec<Vec<String>>], names: &[String]) -> Vec<u8> {
     let sheet_count = grids.len().max(1);
     let mut zip = ZipWriter::new();
 
@@ -957,7 +975,10 @@ pub fn to_xlsx(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" \
 Target=\"xl/workbook.xml\"/></Relationships>",
     );
-    zip.add_deflated("xl/workbook.xml", xlsx_workbook_xml(sheet_count).as_bytes());
+    zip.add_deflated(
+        "xl/workbook.xml",
+        xlsx_workbook_xml(sheet_count, names).as_bytes(),
+    );
     zip.add_deflated(
         "xl/_rels/workbook.xml.rels",
         xlsx_workbook_rels(sheet_count).as_bytes(),
@@ -996,11 +1017,13 @@ ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksh
     s
 }
 
-fn xlsx_workbook_xml(sheet_count: usize) -> String {
+fn xlsx_workbook_xml(sheet_count: usize, names: &[String]) -> String {
     let mut sheets = String::new();
     for i in 0..sheet_count {
+        let mut nm = String::new();
+        esc(&sheet_name(names, i), &mut nm);
         sheets.push_str(&format!(
-            "<sheet name=\"Page {n}\" sheetId=\"{n}\" r:id=\"rId{n}\"/>",
+            "<sheet name=\"{nm}\" sheetId=\"{n}\" r:id=\"rId{n}\"/>",
             n = i + 1
         ));
     }
@@ -1059,8 +1082,15 @@ fn xlsx_sheet_xml(grid: &[Vec<String>]) -> String {
 // ─────────────────────────────── ODS (ODF sheet) ──────────────────────────────
 
 /// Export reconstructed tables to an OpenDocument Spreadsheet (`.ods`), one
-/// `table:table` per page. The ODF counterpart of [`to_xlsx`].
+/// `table:table` per page. The ODF counterpart of [`to_xlsx`]. Sheets are named
+/// `Page <n>`; use [`to_ods_named`] for custom names.
 pub fn to_ods(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
+    to_ods_named(grids, &[])
+}
+
+/// As [`to_ods`] but with explicit per-sheet names (index-aligned to `grids`); a
+/// missing or empty name falls back to `Page <n>`.
+pub fn to_ods_named(grids: &[Vec<Vec<String>>], names: &[String]) -> Vec<u8> {
     let mut zip = ZipWriter::new();
     zip.add_stored(
         "mimetype",
@@ -1076,7 +1106,9 @@ xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" office:version=\"1
     );
     let sheets = grids.len().max(1);
     for s in 0..sheets {
-        content.push_str(&format!("<table:table table:name=\"Page {}\">", s + 1));
+        let mut nm = String::new();
+        esc(&sheet_name(names, s), &mut nm);
+        content.push_str(&format!("<table:table table:name=\"{nm}\">"));
         let grid = grids.get(s).map(Vec::as_slice).unwrap_or(&[]);
         if grid.is_empty() {
             content.push_str("<table:table-row><table:table-cell/></table:table-row>");
@@ -1273,6 +1305,33 @@ mod tests {
         let wb = String::from_utf8(entry(&zip, "xl/workbook.xml").unwrap()).unwrap();
         assert_eq!(wb.matches("<sheet ").count(), 2, "one sheet per page");
         assert!(entry(&zip, "xl/worksheets/sheet2.xml").is_some());
+        // Default names are Page N.
+        assert!(wb.contains("name=\"Page 1\"") && wb.contains("name=\"Page 2\""));
+    }
+
+    #[test]
+    fn xlsx_and_ods_honor_custom_sheet_names() {
+        let grids = vec![vec![vec!["only".to_string()]]];
+        // Provided name overrides the Page <n> default and is XML-escaped.
+        let names = vec!["Sheet1 & <Summary>".to_string()];
+        let wb = String::from_utf8(entry(&to_xlsx_named(&grids, &names), "xl/workbook.xml").unwrap())
+            .unwrap();
+        assert!(
+            wb.contains("name=\"Sheet1 &amp; &lt;Summary&gt;\""),
+            "custom xlsx sheet name, escaped: {wb}"
+        );
+        let content =
+            String::from_utf8(entry(&to_ods_named(&grids, &names), "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("table:name=\"Sheet1 &amp; &lt;Summary&gt;\""),
+            "custom ods sheet name, escaped"
+        );
+        // An empty name falls back to the Page <n> default.
+        let wb2 = String::from_utf8(
+            entry(&to_xlsx_named(&grids, &[String::new()]), "xl/workbook.xml").unwrap(),
+        )
+        .unwrap();
+        assert!(wb2.contains("name=\"Page 1\""), "empty name → default");
     }
 
     #[test]

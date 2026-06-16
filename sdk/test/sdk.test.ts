@@ -196,6 +196,27 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("writes a host-built grid to xlsx/ods natively (with sheet names)", () => {
+    const grids = [
+      [
+        ["Name", "Age"],
+        ["Alice", "30"],
+      ],
+      [["Page two"]],
+    ];
+    const xlsx = giga.gridsToXlsx(grids, ["People", "Notes"]);
+    expect(xlsx[0]).toBe(0x50); // 'P' — XLSX is a ZIP
+    expect(xlsx[1]).toBe(0x4b); // 'K'
+    expect(xlsx.length).toBeGreaterThan(200);
+    // Default names when none supplied still produce a valid workbook.
+    expect(giga.gridsToXlsx(grids).length).toBeGreaterThan(200);
+    const ods = giga.gridsToOds(grids, ["People"]);
+    expect(ods[0]).toBe(0x50);
+    expect(ods[1]).toBe(0x4b);
+    // Malformed/empty grid yields a valid single-sheet workbook (no throw).
+    expect(giga.gridsToXlsx([]).length).toBeGreaterThan(100);
+  });
+
   it("registers named destinations and resolves links that jump to them by name", () => {
     const doc = giga.open(giga.txtToPdf("Cover"));
     expect(doc.addPage(612, 792, 1)).toBeGreaterThan(0); // page 2

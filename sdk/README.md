@@ -132,7 +132,9 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   `renderPage`, fonts (base-14 `addStandardText`, embed **any** TrueType/OpenType
   via `embedFont`/`addText`, font-aware editing `replaceText`,
   the document's own faces `embeddedFonts`/`extractFont`, `neededFonts`),
-  conversions (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`), security
+  conversions (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`, plus
+  engine-level `gridsToXlsx`/`gridsToOds` to emit Office output from a
+  host-built table grid), security
   (`saveEncrypted`, self-signed `sign`, **PKCS#12** `signP12`), metadata
   (`getMetadata`, `setMetadata`), annotations (`addSquare`,
   `addHighlight`, `addLineAnnotation`, `addFreeText`, `addUnderline`,

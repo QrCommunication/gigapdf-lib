@@ -4,6 +4,24 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.19.0] - 2026-06-16
+
+### Added
+
+- **Native spreadsheet writer for host-built grids** — `gridsToXlsx(grids,
+  sheetNames?)` and `gridsToOds(grids, sheetNames?)` write a caller-provided
+  table grid (`pages[rows][cells]`, `string[][][]`) to an `.xlsx`/`.ods`
+  workbook, one sheet per page, with the engine's own zip/sheet writer. A host
+  that already reconstructs tables (its own heuristic) can now emit Office output
+  with **no third-party spreadsheet library**. `sheetNames` (index-aligned)
+  overrides the default `Page <n>` titles (e.g. a single concatenated `Sheet1`).
+  Rust: `convert::office::to_xlsx_named` / `to_ods_named` +
+  `convert::grids::{from_json, strings_from_json}`; ABI `gp_grids_to_xlsx` /
+  `gp_grids_to_ods` (grids JSON + optional names JSON).
+  - This lets GigaPDF drop its runtime `exceljs` dependency: the app keeps its
+    full table-reconstruction heuristic and every option, swapping only the
+    workbook writer for `gridsToXlsx`.
+
 ## [0.18.0] - 2026-06-16
 
 ### Added

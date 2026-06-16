@@ -59,6 +59,7 @@ try {
 | `htmlToPdf(html)` / `htmlRender(html, fonts, w, h, margin)` | `Uint8Array` | Render HTML+CSS to PDF with the **native** engine (no browser). See [HTML-CSS.md](HTML-CSS.md). |
 | `rtfToPdf(rtf)` | `Uint8Array` | Render RTF to PDF. |
 | `officeToPdf(office)` | `Uint8Array` | Convert an Office/ODF file (docx/xlsx/pptx/doc/xls/ppt/odt/ods/odp) to PDF; format auto-detected by magic bytes. |
+| `gridsToXlsx(grids, sheetNames?)` / `gridsToOds(grids, sheetNames?)` | `Uint8Array` | Write a host-built grid (`pages[rows][cells]`, `string[][][]`) to an `.xlsx`/`.ods` workbook — one sheet per page — with the native writer. Supply your own table reconstruction and emit Office output with **no third-party library**. `sheetNames` (index-aligned) overrides the default `Page <n>` titles. |
 
 ### Fonts (engine-level helpers)
 

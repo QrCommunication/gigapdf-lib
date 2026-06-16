@@ -1278,6 +1278,61 @@ pub extern "C" fn gp_to_ods(handle: *const Document, out_len: *mut usize) -> *mu
     }
 }
 
+/// Write a host-provided grid (JSON `string[][][]` = pages → rows → cells) to an
+/// `.xlsx` workbook — one sheet per page — reusing the engine's spreadsheet
+/// writer. `names` is an optional JSON `string[]` of per-sheet titles (pass
+/// `names_len = 0` to default each sheet to `Page <n>`). Lets a host supply its
+/// own table reconstruction *and* sheet names yet emit XLSX with no third-party
+/// library. Empty/malformed grids JSON yields a single blank sheet.
+#[no_mangle]
+pub extern "C" fn gp_grids_to_xlsx(
+    grids_ptr: *const u8,
+    grids_len: usize,
+    names_ptr: *const u8,
+    names_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let grids = parse_grids(grids_ptr, grids_len);
+    let names = parse_sheet_names(names_ptr, names_len);
+    let bytes = gigapdf_core::convert::office::to_xlsx_named(&grids, &names);
+    unsafe { bytes_into_host(bytes, out_len) }
+}
+
+/// Write a host-provided grid (JSON `string[][][]`) with optional sheet `names`
+/// (JSON `string[]`, `names_len = 0` for defaults) to an OpenDocument
+/// Spreadsheet (`.ods`) — the `.ods` counterpart of `gp_grids_to_xlsx`.
+#[no_mangle]
+pub extern "C" fn gp_grids_to_ods(
+    grids_ptr: *const u8,
+    grids_len: usize,
+    names_ptr: *const u8,
+    names_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let grids = parse_grids(grids_ptr, grids_len);
+    let names = parse_sheet_names(names_ptr, names_len);
+    let bytes = gigapdf_core::convert::office::to_ods_named(&grids, &names);
+    unsafe { bytes_into_host(bytes, out_len) }
+}
+
+/// Decode a `string[][][]` grids JSON argument (empty/malformed → empty grid).
+fn parse_grids(ptr: *const u8, len: usize) -> Vec<Vec<Vec<String>>> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    let json = unsafe { str_arg(ptr, len) };
+    gigapdf_core::convert::grids::from_json(json).unwrap_or_default()
+}
+
+/// Decode an optional `string[]` sheet-names JSON argument (`len == 0` → none).
+fn parse_sheet_names(ptr: *const u8, len: usize) -> Vec<String> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    let json = unsafe { str_arg(ptr, len) };
+    gigapdf_core::convert::grids::strings_from_json(json).unwrap_or_default()
+}
+
 /// Convert the document's text to RTF.
 #[no_mangle]
 pub extern "C" fn gp_to_rtf(handle: *const Document, out_len: *mut usize) -> *mut u8 {

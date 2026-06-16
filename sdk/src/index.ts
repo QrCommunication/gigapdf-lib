@@ -205,6 +205,30 @@ export class GigaPdfEngine {
       this._buffer((o) => this.ex.gp_office_to_pdf(p, l, o))
     );
   }
+  /**
+   * Write a host-built grid (`pages[rows][cells]`) to an `.xlsx` workbook — one
+   * sheet per page — with the engine's native spreadsheet writer (no
+   * third-party library). Supply your own table reconstruction and still emit
+   * Office output. `sheetNames` (index-aligned to `grids`) overrides the default
+   * `Page <n>` titles; a missing/empty name falls back to the default.
+   * {@link gridsToOds} is the OpenDocument (`.ods`) counterpart.
+   */
+  gridsToXlsx(grids: string[][][], sheetNames: string[] = []): Uint8Array {
+    return this._withStr(JSON.stringify(grids), (gp, gl) =>
+      this._withStr(JSON.stringify(sheetNames), (np, nl) =>
+        this._buffer((o) => this.ex.gp_grids_to_xlsx(gp, gl, np, nl, o))
+      )
+    );
+  }
+  /** Write a host-built grid (`pages[rows][cells]`) to an `.ods` spreadsheet
+   * (optional `sheetNames`, default `Page <n>`). */
+  gridsToOds(grids: string[][][], sheetNames: string[] = []): Uint8Array {
+    return this._withStr(JSON.stringify(grids), (gp, gl) =>
+      this._withStr(JSON.stringify(sheetNames), (np, nl) =>
+        this._buffer((o) => this.ex.gp_grids_to_ods(gp, gl, np, nl, o))
+      )
+    );
+  }
 
   // ── fonts (catalog / Google Fonts URL — the host performs the fetch) ───────
   fontCatalog(): FontInfo[] {
