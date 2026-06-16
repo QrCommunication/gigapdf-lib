@@ -6593,8 +6593,10 @@ mod tests {
             .filter(|&g| !ttf.glyph_polygons(g).is_empty())
             .collect();
         assert!(inked.len() >= 2, "fixture font has several inked glyphs");
-        let kept = inked[0];
-        let dropped = inked[1];
+        // Keep a higher-GID inked glyph; a lower inked glyph stays in range but
+        // unused, so it must be stripped (its outline emptied).
+        let kept = inked[1];
+        let dropped = inked[0];
         let used: std::collections::BTreeSet<u16> = std::iter::once(kept).collect();
 
         let sub = ttf.subset(&used).expect("subset built");
@@ -6603,8 +6605,8 @@ mod tests {
         let subttf = crate::font::truetype::TrueTypeFont::parse(&sub).unwrap();
         assert_eq!(
             subttf.num_glyphs(),
-            ttf.num_glyphs(),
-            "glyph ids are preserved (no remap)"
+            kept + 1,
+            "glyph table truncated to the highest used id + 1 (GIDs preserved, not remapped)"
         );
         assert_eq!(
             subttf.glyph_polygons(kept).len(),
@@ -6613,7 +6615,7 @@ mod tests {
         );
         assert!(
             subttf.glyph_polygons(dropped).is_empty(),
-            "unused glyph {dropped} stripped from the subset"
+            "in-range unused glyph {dropped} stripped from the subset"
         );
     }
 }

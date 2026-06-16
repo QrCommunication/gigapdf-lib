@@ -508,11 +508,17 @@ impl TrueTypeFont {
             }
         }
 
-        // 2. Rebuild glyf + loca (long format), GIDs preserved.
+        // 2. Rebuild glyf + loca (long format). GIDs are preserved up to the
+        // highest used glyph; the glyph table is *truncated* to `new_num` so the
+        // GID-indexed `loca`/`hmtx`/`maxp` shrink too (every used GID is < new_num
+        // by construction, so Identity-H content stays valid).
+        let new_num = (keep.iter().max().copied().unwrap_or(0) as usize + 1).min(num);
+        let orig_nhm = self.num_h_metrics as usize;
+        let new_nhm = orig_nhm.min(new_num);
         let mut new_glyf: Vec<u8> = Vec::new();
-        let mut new_loca: Vec<u32> = Vec::with_capacity(num + 1);
+        let mut new_loca: Vec<u32> = Vec::with_capacity(new_num + 1);
         new_loca.push(0);
-        for gid in 0..num {
+        for gid in 0..new_num {
             if keep.contains(&(gid as u16)) && gid + 1 < self.loca.len() {
                 let s = self.glyf + self.loca[gid] as usize;
                 let e = self.glyf + self.loca[gid + 1] as usize;
@@ -545,6 +551,18 @@ impl TrueTypeFont {
             }
             let mut tag = [0u8; 4];
             tag.copy_from_slice(&self.data[rec..rec + 4]);
+            // Keep only the tables a PDF Identity-H viewer needs to rasterise
+            // glyph outlines; drop everything else — cmap / OS/2 / name / post /
+            // GPOS / GSUB / GDEF / DSIG and the hinting programs (cvt/fpgm/prep/
+            // gasp), none of which the embedding consults, and which dominate a
+            // full font's size. (Hinting only refines small-size rendering;
+            // viewers rasterise unhinted outlines fine.)
+            if !matches!(
+                &tag,
+                b"head" | b"hhea" | b"maxp" | b"hmtx" | b"loca" | b"glyf"
+            ) {
+                continue;
+            }
             let off = be32(&self.data, rec + 8) as usize;
             let len = be32(&self.data, rec + 12) as usize;
             if off + len > self.data.len() {
@@ -562,6 +580,33 @@ impl TrueTypeFont {
                         h[51] = 1;
                     }
                     h
+                }
+                b"maxp" => {
+                    // Truncate the glyph count to the subset size.
+                    let mut m = self.data[off..off + len].to_vec();
+                    if m.len() >= 6 {
+                        m[4..6].copy_from_slice(&(new_num as u16).to_be_bytes());
+                    }
+                    m
+                }
+                b"hhea" => {
+                    // Cap numberOfHMetrics to the truncated glyph range.
+                    let mut hh = self.data[off..off + len].to_vec();
+                    if hh.len() >= 36 {
+                        hh[34..36].copy_from_slice(&(new_nhm as u16).to_be_bytes());
+                    }
+                    hh
+                }
+                b"hmtx" => {
+                    // hmtx = nhm longHorMetrics (4B) then trailing lsb (2B). After
+                    // truncation the byte length follows the same layout for the
+                    // smaller glyph count, so a prefix slice is exact.
+                    let new_len = if new_num <= orig_nhm {
+                        new_num * 4
+                    } else {
+                        orig_nhm * 4 + (new_num - orig_nhm) * 2
+                    };
+                    self.data[off..off + new_len.min(len)].to_vec()
                 }
                 _ => self.data[off..off + len].to_vec(),
             };

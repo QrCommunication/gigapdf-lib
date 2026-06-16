@@ -4,6 +4,18 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.14.1] - 2026-06-16
+
+### Changed
+
+- **Font subsetting now also drops unused tables and truncates the glyph space.**
+  On save, an embedded font keeps only the tables a PDF Identity-H viewer needs
+  (`head`/`hhea`/`maxp`/`hmtx`/`loca`/`glyf`) — dropping `cmap`, `OS/2`, `name`,
+  `post`, `GPOS`/`GSUB`/`GDEF`, `DSIG` and the hinting programs — and truncates
+  the glyph count to the highest used id, so `loca`/`hmtx` shrink too. A full
+  ~411 KB family now embeds as ~30 KB for a short text run (×13). (Glyph ids are
+  still preserved, not remapped — full GID compaction is a later enhancement.)
+
 ## [0.14.0] - 2026-06-16
 
 ### Changed
