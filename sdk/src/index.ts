@@ -1112,6 +1112,30 @@ export class GigaPdfDoc {
     this.g._free(rPtr, random.length);
     return out;
   }
+  /**
+   * Sign with a PKCS#12 (`.p12`/`.pfx`) identity — a CA-issued / eIDAS
+   * certificate and its RSA key, imported natively (no external crypto). `fields`
+   * is three tab-separated values: `name\treason\tdate` (`date` a PDF date
+   * string, e.g. `D:20260616120000Z`). Throws a single generic error on a wrong
+   * password, malformed file, unsupported cipher, or missing certificate.
+   */
+  signP12(p12: Uint8Array, password: string, fields: string): Uint8Array {
+    const p12Ptr = this.g._toWasm(p12);
+    const out = this.g._withStr(password, (pwP, pwL) =>
+      this.g._withStr(fields, (fP, fL) =>
+        this.g._buffer((o) =>
+          this.ex().gp_sign_p12(this.h, p12Ptr, p12.length, pwP, pwL, fP, fL, o)
+        )
+      )
+    );
+    this.g._free(p12Ptr, p12.length);
+    if (out.length === 0) {
+      throw new Error(
+        "PKCS#12 signing failed: invalid certificate, password, or unsupported file"
+      );
+    }
+    return out;
+  }
 
   // metadata
   getMetadata(key: string): string {

@@ -222,6 +222,15 @@ impl<'a> Reader<'a> {
         Some(Tlv { tag, content })
     }
 
+    /// Like [`read`](Self::read), but also returns the *full* TLV slice
+    /// (`tag..end`). Use it when a value must be re-emitted verbatim — e.g. an
+    /// X.509 issuer Name or serialNumber copied into a CMS `SignerInfo`.
+    pub fn read_raw(&mut self) -> Option<(Tlv<'a>, &'a [u8])> {
+        let start = self.pos;
+        let tlv = self.read()?;
+        Some((tlv, &self.data[start..self.pos]))
+    }
+
     /// Read the next TLV and require it to carry `tag`.
     pub fn next_tag(&mut self, tag: u8) -> Option<Tlv<'a>> {
         let tlv = self.read()?;

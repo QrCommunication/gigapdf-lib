@@ -301,6 +301,47 @@ impl Document {
         reason: &str,
         date: &str,
     ) -> Result<Vec<u8>> {
+        self.sign_with(name, reason, date, |signed| signer.detached_cms(signed))
+    }
+
+    /// Digitally sign the document with a user-supplied identity imported from a
+    /// PKCS#12 (`.p12`/`.pfx`) file — a CA-issued / eIDAS-capable certificate and
+    /// its RSA key. Same `adbe.pkcs7.detached` machinery as [`sign`](Self::sign),
+    /// but the embedded certificate (and the `SignerInfo` it is referenced by) is
+    /// the imported one. Errors if the identity has no certificate or its
+    /// issuer/serial can't be read.
+    pub fn sign_p12(
+        &mut self,
+        identity: &crate::sign::pkcs12::Pkcs12Identity,
+        name: &str,
+        reason: &str,
+        date: &str,
+    ) -> Result<Vec<u8>> {
+        let cert = identity
+            .certificates
+            .first()
+            .ok_or_else(|| EngineError::Missing("PKCS#12 identity has no certificate".into()))?
+            .clone();
+        // Fail fast if we can't reference the cert, so the closure stays infallible.
+        crate::sign::issuer_and_serial(&cert).ok_or_else(|| {
+            EngineError::Unsupported("certificate issuer/serial unreadable".into())
+        })?;
+        let key = identity.key.clone();
+        self.sign_with(name, reason, date, move |signed| {
+            crate::sign::detached_cms_external(&key, &cert, signed).unwrap_or_default()
+        })
+    }
+
+    /// Shared `adbe.pkcs7.detached` embedding: builds the signature dictionary
+    /// and invisible widget, serializes, patches `/ByteRange`, then fills
+    /// `/Contents` with the CMS produced by `build_cms` over the signed bytes.
+    fn sign_with(
+        &mut self,
+        name: &str,
+        reason: &str,
+        date: &str,
+        build_cms: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) -> Result<Vec<u8>> {
         const CONTENTS_BYTES: usize = 8192; // room for the CMS (hex = 16384 chars)
         let lit = |s: &str| Object::String(crate::font::encode_pdf_text(s), StringKind::Literal);
 
@@ -416,7 +457,7 @@ impl Document {
         let mut signed = Vec::with_capacity(byte_range[1] + byte_range[3]);
         signed.extend_from_slice(&bytes[0..lt]);
         signed.extend_from_slice(&bytes[gt + 1..]);
-        let cms = signer.detached_cms(&signed);
+        let cms = build_cms(&signed);
 
         let capacity = gt - (lt + 1); // hex digit slots between < and >
         let mut hex = String::with_capacity(capacity);
@@ -6495,6 +6536,34 @@ mod tests {
         // The signed file still parses as a structurally valid PDF.
         let reopened = Document::open(&signed).unwrap();
         assert!(reopened.page_count() >= 1, "signed PDF re-opens");
+    }
+
+    #[test]
+    fn signs_a_document_with_an_imported_p12_identity() {
+        // A real OpenSSL .p12 (PBES2/AES) imported and used to sign — the
+        // embedded certificate must be the user's, not a self-signed one.
+        const MODERN_P12: &[u8] = include_bytes!("sign/fixtures/modern.p12");
+        const CERT_DER: &[u8] = include_bytes!("sign/fixtures/cert.der");
+        let identity = crate::sign::pkcs12::parse(MODERN_P12, "gigapdf").unwrap();
+
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let signed = doc
+            .sign_p12(&identity, "GigaPDF Tester", "Approval", "D:20260614120000Z")
+            .unwrap();
+
+        assert_eq!(&signed[0..5], b"%PDF-", "valid PDF header");
+        let text = String::from_utf8_lossy(&signed);
+        assert!(
+            text.contains("adbe.pkcs7.detached"),
+            "detached signature subfilter"
+        );
+        // The CMS /Contents (uppercase hex) must contain the imported cert DER.
+        let cert_hex: String = CERT_DER.iter().map(|b| format!("{b:02X}")).collect();
+        assert!(
+            text.contains(&cert_hex),
+            "imported certificate embedded in the signature"
+        );
+        assert!(Document::open(&signed).unwrap().page_count() >= 1);
     }
 
     #[test]

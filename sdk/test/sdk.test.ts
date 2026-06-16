@@ -1,5 +1,11 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect, beforeAll } from "vitest";
 import { GigaPdfEngine } from "../src/index";
+
+// Real OpenSSL-3 PKCS#12 (PBES2/AES + HMAC-SHA256), password "gigapdf".
+const MODERN_P12 = new Uint8Array(
+  readFileSync(new URL("../../crates/core/src/sign/fixtures/modern.p12", import.meta.url))
+);
 
 // Exercises the typed wrappers against the real bundled .wasm (loadDefault reads
 // gigapdf.wasm produced by `pnpm build:wasm`). Catches wrapper-level bugs the
@@ -125,5 +131,25 @@ describe("@qrcommunication/gigapdf-lib", () => {
     const pdf = giga.htmlRender(html, [], 612, 792, 36);
     expect(new TextDecoder().decode(pdf.slice(0, 5))).toBe("%PDF-");
     expect(pdf.length).toBeGreaterThan(200);
+  });
+
+  it("signs with a PKCS#12 identity (native import, no node-forge)", () => {
+    const doc = giga.open(giga.txtToPdf("Sign me with a real cert"));
+    const signed = doc.signP12(MODERN_P12, "gigapdf", "Tester\tApproval\tD:20260616120000Z");
+    expect(new TextDecoder().decode(signed.slice(0, 5))).toBe("%PDF-");
+    expect(new TextDecoder().decode(signed).includes("adbe.pkcs7.detached")).toBe(true);
+    // The signed PDF re-opens as a structurally valid document.
+    const reopened = giga.open(signed);
+    expect(reopened.pageCount()).toBe(1);
+    reopened.close();
+    doc.close();
+  });
+
+  it("rejects a wrong PKCS#12 password with a generic error", () => {
+    const doc = giga.open(giga.txtToPdf("x"));
+    expect(() => doc.signP12(MODERN_P12, "wrong", "T\tR\tD:20260616120000Z")).toThrow(
+      /PKCS#12 signing failed/
+    );
+    doc.close();
   });
 });

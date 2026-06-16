@@ -98,50 +98,107 @@ impl Signer {
     /// Build a detached CMS `SignedData` (DER) over `content` — i.e. a PDF
     /// `adbe.pkcs7.detached` signature blob for the given signed bytes.
     pub fn detached_cms(&self, content: &[u8]) -> Vec<u8> {
-        let message_digest = sha256(content);
-
-        // signedAttrs: contentType + messageDigest.
-        let attr_content_type =
-            der::sequence(&[der::oid(OID_CONTENT_TYPE), der::set(&[der::oid(OID_DATA)])]);
-        let attr_message_digest = der::sequence(&[
-            der::oid(OID_MESSAGE_DIGEST),
-            der::set(&[der::octet_string(&message_digest)]),
-        ]);
-
-        let attrs = [attr_content_type, attr_message_digest];
-        // The signature is computed over the signedAttrs DER explicitly tagged
-        // as a SET (0x31), per CMS §5.4.
-        let signed_attrs_for_signing = der::set(&attrs);
-        let signature = self.key.sign_sha256(&signed_attrs_for_signing);
-
-        // In the SignerInfo the same attributes carry the implicit [0] tag,
-        // which replaces the SET tag around the concatenated attributes.
-        let signed_attrs_tagged = der::context(0, &attrs.concat());
-
-        let signer_info = der::sequence(&[
-            der::integer_u32(1),                                                  // version
-            der::sequence(&[self.issuer.clone(), der::integer_u32(self.serial)]), // issuerAndSerial
-            alg_sha256(),
-            signed_attrs_tagged,
-            der::sequence(&[der::oid(OID_RSA_ENCRYPTION), der::null()]),
-            der::octet_string(&signature),
-        ]);
-
-        let signed_data = der::sequence(&[
-            der::integer_u32(1), // version
-            der::set(&[alg_sha256()]),
-            der::sequence(&[der::oid(OID_DATA)]), // encapContentInfo (detached)
-            der::context(0, &self.certificate),   // [0] certificates
-            der::set(&[signer_info]),
-        ]);
-
-        der::sequence(&[der::oid(OID_SIGNED_DATA), der::context(0, &signed_data)])
+        build_detached_cms(
+            &self.key,
+            &self.certificate,
+            &self.issuer,
+            &der::integer_u32(self.serial),
+            content,
+        )
     }
 
     /// The DER certificate bytes.
     pub fn certificate(&self) -> &[u8] {
         &self.certificate
     }
+}
+
+/// Build a detached CMS `SignedData` (DER) over `content`, signed by `key` and
+/// embedding `cert_der`. The `SignerInfo` references the signer through the
+/// already-encoded `issuer` Name and `serial` INTEGER TLVs (passed verbatim so
+/// they match the certificate byte-for-byte).
+fn build_detached_cms(
+    key: &RsaPrivateKey,
+    cert_der: &[u8],
+    issuer: &[u8],
+    serial: &[u8],
+    content: &[u8],
+) -> Vec<u8> {
+    let message_digest = sha256(content);
+
+    // signedAttrs: contentType + messageDigest.
+    let attr_content_type =
+        der::sequence(&[der::oid(OID_CONTENT_TYPE), der::set(&[der::oid(OID_DATA)])]);
+    let attr_message_digest = der::sequence(&[
+        der::oid(OID_MESSAGE_DIGEST),
+        der::set(&[der::octet_string(&message_digest)]),
+    ]);
+
+    let attrs = [attr_content_type, attr_message_digest];
+    // The signature is computed over the signedAttrs DER explicitly tagged as a
+    // SET (0x31), per CMS §5.4.
+    let signed_attrs_for_signing = der::set(&attrs);
+    let signature = key.sign_sha256(&signed_attrs_for_signing);
+
+    // In the SignerInfo the same attributes carry the implicit [0] tag, which
+    // replaces the SET tag around the concatenated attributes.
+    let signed_attrs_tagged = der::context(0, &attrs.concat());
+
+    let signer_info = der::sequence(&[
+        der::integer_u32(1),                              // version
+        der::sequence(&[issuer.to_vec(), serial.to_vec()]), // issuerAndSerialNumber
+        alg_sha256(),
+        signed_attrs_tagged,
+        der::sequence(&[der::oid(OID_RSA_ENCRYPTION), der::null()]),
+        der::octet_string(&signature),
+    ]);
+
+    let signed_data = der::sequence(&[
+        der::integer_u32(1), // version
+        der::set(&[alg_sha256()]),
+        der::sequence(&[der::oid(OID_DATA)]), // encapContentInfo (detached)
+        der::context(0, cert_der),            // [0] certificates
+        der::set(&[signer_info]),
+    ]);
+
+    der::sequence(&[der::oid(OID_SIGNED_DATA), der::context(0, &signed_data)])
+}
+
+/// Detached CMS over `content` for an externally supplied identity — e.g. a
+/// key + certificate imported from a PKCS#12 file ([`pkcs12::parse`]). The
+/// `SignerInfo`'s `issuerAndSerialNumber` is read straight out of `cert_der`.
+/// `None` if the certificate's issuer/serial can't be parsed.
+pub fn detached_cms_external(
+    key: &RsaPrivateKey,
+    cert_der: &[u8],
+    content: &[u8],
+) -> Option<Vec<u8>> {
+    let (issuer, serial) = issuer_and_serial(cert_der)?;
+    Some(build_detached_cms(key, cert_der, &issuer, &serial, content))
+}
+
+/// Extract the DER `issuer` Name and `serialNumber` INTEGER from an X.509
+/// certificate, each as its verbatim TLV bytes (for a CMS `issuerAndSerial`).
+pub fn issuer_and_serial(cert_der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    use der::{Reader, TAG_CONTEXT_0, TAG_INTEGER, TAG_SEQUENCE};
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let mut top = Reader::new(cert_der);
+    let mut cert = top.descend(TAG_SEQUENCE)?;
+    // TBSCertificate ::= SEQUENCE { [0] version OPTIONAL, serialNumber INTEGER,
+    //                               signature, issuer Name, ... }
+    let mut tbs = cert.descend(TAG_SEQUENCE)?;
+    let (first, first_raw) = tbs.read_raw()?;
+    let serial = if first.tag == TAG_CONTEXT_0 {
+        let (s, raw) = tbs.read_raw()?;
+        (s.tag == TAG_INTEGER).then(|| raw.to_vec())?
+    } else if first.tag == TAG_INTEGER {
+        first_raw.to_vec()
+    } else {
+        return None;
+    };
+    tbs.next_tag(TAG_SEQUENCE)?; // signature AlgorithmIdentifier
+    let (issuer, issuer_raw) = tbs.read_raw()?; // issuer Name
+    (issuer.tag == TAG_SEQUENCE).then(|| (issuer_raw.to_vec(), serial))
 }
 
 #[cfg(test)]

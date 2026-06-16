@@ -212,6 +212,51 @@ pub extern "C" fn gp_sign(
     }
 }
 
+/// Digitally sign the document with an identity imported from a PKCS#12
+/// (`.p12`/`.pfx`) file — a CA-issued / eIDAS certificate and its RSA key.
+/// `p12` is the raw file; `password` its passphrase (UTF-8); `fields` is three
+/// tab-separated values: `name\treason\tdate` (`date` a PDF date string,
+/// `D:YYYYMMDDHHMMSSZ`). Buffer-returning (host frees); null on error (wrong
+/// password, malformed file, unsupported cipher, or no usable certificate).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_sign_p12(
+    handle: *mut Document,
+    p12_ptr: *const u8,
+    p12_len: usize,
+    password_ptr: *const u8,
+    password_len: usize,
+    fields_ptr: *const u8,
+    fields_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let p12 = unsafe {
+        if p12_ptr.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(p12_ptr, p12_len)
+        }
+    };
+    let password = unsafe { str_arg(password_ptr, password_len) };
+    let fields = unsafe { str_arg(fields_ptr, fields_len) };
+    let parts: Vec<&str> = fields.split('\t').collect();
+    if parts.len() < 3 {
+        return std::ptr::null_mut();
+    }
+    let identity = match gigapdf_core::sign::pkcs12::parse(p12, password) {
+        Ok(id) => id,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match doc.sign_p12(&identity, parts[0], parts[1], parts[2]) {
+        Ok(pdf) => unsafe { bytes_into_host(pdf, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Release a document handle.
 #[no_mangle]
 pub extern "C" fn gp_close(handle: *mut Document) {
