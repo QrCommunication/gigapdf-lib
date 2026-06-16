@@ -220,7 +220,7 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `addUriLink(page, x0, y0, x1, y1, uri)` | `boolean` | External URL link over a rect. |
 | `addGotoLink(page, x0, y0, x1, y1, targetPage)` | `boolean` | Internal "jump to page" link (explicit page reference). |
 | `addNamedDest(name, targetPage)` | `boolean` | Register a named destination `name` → page (a `/Fit` view) in the catalog `/Dests`. Resolves through the catalog, so it survives split/extract while its page is kept. |
-| `namedDests()` | `NamedDest[]` | The catalog's named destinations as `{ name, page }` pairs. |
+| `namedDests()` | `NamedDest[]` | The catalog's named destinations as `{ name, page }` pairs — from both the inline `/Dests` dictionary **and** the PDF 1.2+ `/Names /Dests` name tree (parity with a reader's `getDestinations()`). |
 | `addGotoLinkNamed(page, x0, y0, x1, y1, name)` | `boolean` | Internal link that jumps to a **named** destination (`/Dest /name`) — the retargetable, split-safe alternative to `addGotoLink`. |
 | `layers()` | `LayerInfo[]` | Optional-content groups (calques) `{ id, name, visible, locked }`. |
 | `addLayer(name)` | `number` | Create a layer; returns its id (`0` on error). |

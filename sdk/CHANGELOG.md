@@ -4,6 +4,18 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.27.0] - 2026-06-16
+
+### Changed
+
+- **`namedDests()` now enumerates the `/Names /Dests` name tree** (PDF 1.2+),
+  not just the legacy inline `/Dests` dictionary. Tree values that are dest
+  arrays directly **or** wrapped in a `<< /D [dest] >>` dictionary both resolve.
+  This brings the list to parity with a reader's `getDestinations()` — modern
+  PDFs that register destinations through the name tree previously came back
+  empty. Built on the `collect_name_tree` enumerator added in 0.26.0; no API or
+  ABI change (`gp_named_dests_json` simply returns more entries).
+
 ## [0.26.0] - 2026-06-16
 
 ### Added

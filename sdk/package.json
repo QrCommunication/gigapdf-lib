@@ -1,6 +1,6 @@
 {
   "name": "@qrcommunication/gigapdf-lib",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "description": "TypeScript SDK for gigapdf-lib — a zero-dependency Rust→WASM PDF engine: read/edit/render, OCR, full-text search, AcroForm fields (read · fill · create), annotations, signing, encryption, PDF↔Office/HTML/RTF conversions, and a native HTML+CSS+JavaScript→PDF renderer (no headless browser; a suspendable JS VM gives lazy generators and spec-ordered async). Self-contained .wasm, no third-party runtime deps.",
   "license": "PolyForm-Noncommercial-1.0.0",
   "author": "Rony Licha / QR Communication",

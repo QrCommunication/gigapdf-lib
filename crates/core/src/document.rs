@@ -4841,20 +4841,45 @@ impl Document {
     /// skipped). The PDF 1.2+ name-tree form (`/Names /Dests`) is honoured by
     /// link/outline resolution but not enumerated here.
     pub fn named_dests(&self) -> Vec<(String, u32)> {
-        let Some(dests) = self
+        let mut out = Vec::new();
+
+        // Legacy inline `/Dests` dictionary (PDF 1.1).
+        if let Some(dests) = self
             .catalog()
             .ok()
             .and_then(|c| c.get(b"Dests").map(|o| self.resolve(o)))
             .and_then(|o| o.as_dict().cloned())
-        else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for (name, value) in &dests.0 {
-            if let Some(page) = self.dest_to_page(value) {
-                out.push((String::from_utf8_lossy(name).into_owned(), page));
+        {
+            for (name, value) in &dests.0 {
+                if let Some(page) = self.dest_to_page(value) {
+                    out.push((String::from_utf8_lossy(name).into_owned(), page));
+                }
             }
         }
+
+        // PDF 1.2+ `/Names /Dests` name tree. A tree value may be a dest array
+        // directly or a `<< /D [dest] >>` wrapper. Enumerated here (not just
+        // resolved on demand) so the list matches a reader's `getDestinations()`.
+        if let Some(root) = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"Names").map(|o| self.resolve(o)))
+            .and_then(Object::as_dict)
+            .and_then(|n| n.get(b"Dests").map(|o| self.resolve(o).clone()))
+        {
+            let mut pairs = Vec::new();
+            self.collect_name_tree(&root, 0, &mut pairs);
+            for (key, value) in pairs {
+                let page = match value.as_dict().and_then(|d| d.get(b"D")) {
+                    Some(d) => self.dest_to_page(d),
+                    None => self.dest_to_page(&value),
+                };
+                if let Some(page) = page {
+                    out.push((String::from_utf8_lossy(&key).into_owned(), page));
+                }
+            }
+        }
+
         out
     }
 
@@ -7869,6 +7894,47 @@ mod tests {
 
         // A document with no /Names /EmbeddedFiles yields nothing.
         assert!(blank_doc().attachments().is_empty());
+    }
+
+    #[test]
+    fn named_dests_enumerates_name_tree() {
+        let mut doc = blank_doc();
+        let page_id = doc.page_object_id(1).unwrap();
+        let dest_array =
+            || Object::Array(vec![Object::Reference(page_id), Object::Name(b"Fit".to_vec())]);
+
+        // `chapter2` wraps its array in a `<< /D [...] >>` dictionary.
+        let mut wrapper = Dictionary::new();
+        wrapper.set(b"D", dest_array());
+
+        let mut tree = Dictionary::new();
+        tree.set(
+            b"Names",
+            Object::Array(vec![
+                Object::String(b"chapter1".to_vec(), StringKind::Literal),
+                dest_array(),
+                Object::String(b"chapter2".to_vec(), StringKind::Literal),
+                Object::Dictionary(wrapper),
+            ]),
+        );
+        let mut names_dict = Dictionary::new();
+        names_dict.set(b"Dests", Object::Dictionary(tree));
+
+        let catalog_id = doc.catalog_id().unwrap();
+        let mut catalog = doc
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+        catalog.set(b"Names".to_vec(), Object::Dictionary(names_dict));
+        doc.objects.insert(catalog_id, Object::Dictionary(catalog));
+
+        let dests = doc.named_dests();
+        let names: Vec<&str> = dests.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"chapter1"), "inline-array name-tree dest");
+        assert!(names.contains(&"chapter2"), "/D-wrapped name-tree dest");
+        assert!(dests.iter().all(|(_, p)| *p == 1), "both resolve to page 1");
     }
 
     #[test]
