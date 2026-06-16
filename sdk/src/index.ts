@@ -882,6 +882,8 @@ export interface PageInfo {
   width: number;
   height: number;
   rotation: number;
+  /** Raw `/MediaBox` `[x0, y0, x1, y1]` in user-space points (preserves origin). */
+  mediaBox: [number, number, number, number];
 }
 
 const RGB = (rgb: number) => rgb & 0xffffff;

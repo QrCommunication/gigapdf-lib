@@ -1330,12 +1330,19 @@ pub extern "C" fn gp_page_info_json(
     page: u32,
     out_len: *mut usize,
 ) -> *mut u8 {
+    let fallback = "{\"width\":0,\"height\":0,\"rotation\":0,\"mediaBox\":[0,0,0,0]}".to_string();
     let json = match unsafe { handle.as_ref() } {
         Some(doc) => match doc.page_info(page) {
-            Ok((w, h, r)) => format!("{{\"width\":{w},\"height\":{h},\"rotation\":{r}}}"),
-            Err(_) => "{\"width\":0,\"height\":0,\"rotation\":0}".to_string(),
+            Ok((w, h, r)) => {
+                let mb = doc.page_media_box(page).unwrap_or([0.0, 0.0, w, h]);
+                format!(
+                    "{{\"width\":{w},\"height\":{h},\"rotation\":{r},\"mediaBox\":[{},{},{},{}]}}",
+                    mb[0], mb[1], mb[2], mb[3]
+                )
+            }
+            Err(_) => fallback,
         },
-        None => "{\"width\":0,\"height\":0,\"rotation\":0}".to_string(),
+        None => fallback,
     };
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }

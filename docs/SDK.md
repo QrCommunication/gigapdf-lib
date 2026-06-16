@@ -92,7 +92,7 @@ try {
 | `pageCount()` | `number` | Number of pages. |
 | `save()` | `Uint8Array` | Serialize to PDF bytes (plain, uncompressed object structure — easiest to grep/debug). |
 | `saveCompressed()` | `Uint8Array` | Serialize packing objects into Flate object streams (smaller output). |
-| `pageInfo(page)` | `PageInfo` | `{ width, height, rotation }` — MediaBox size (unrotated) and the `/Rotate` flag. |
+| `pageInfo(page)` | `PageInfo` | `{ width, height, rotation, mediaBox }` — MediaBox size (unrotated), the `/Rotate` flag, and the raw `/MediaBox` `[x0,y0,x1,y1]` (preserves the box origin). |
 
 ### Pages
 

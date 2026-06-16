@@ -1317,6 +1317,14 @@ impl Document {
         Ok((width, height, rotation))
     }
 
+    /// A page's raw `/MediaBox` `[x0, y0, x1, y1]` in user-space points (default
+    /// `[0, 0, 612, 792]` US-Letter when absent). Unlike [`page_info`](Self::page_info)
+    /// (which returns the size), this preserves the box origin, so a host can
+    /// reconstruct the exact page coordinate frame.
+    pub fn page_media_box(&self, page_no: u32) -> Result<[f64; 4]> {
+        Ok(self.read_media_box(self.page_dict(page_no)?))
+    }
+
     /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using
     /// the built-in zero-dependency renderer (vector graphics; text glyphs and
     /// images are added by later renderer slices).
@@ -8693,6 +8701,17 @@ mod tests {
             "image carries /ca 0.5 from its /ExtGState, got {}",
             imgs[0].opacity
         );
+    }
+
+    #[test]
+    fn page_media_box_preserves_origin() {
+        let mut doc = blank_doc();
+        doc.resize_page(1, 200.0, 100.0).unwrap();
+        let mb = doc.page_media_box(1).unwrap();
+        // resize_page sets MediaBox to [0, 0, w, h].
+        assert_eq!(mb, [0.0, 0.0, 200.0, 100.0]);
+        let (w, h, _) = doc.page_info(1).unwrap();
+        assert_eq!((w, h), (200.0, 100.0), "page_info size matches the box");
     }
 
     #[test]

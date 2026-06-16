@@ -4,6 +4,17 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.33.0] - 2026-06-17
+
+### Added
+
+- **`PageInfo` now carries the raw `/MediaBox`.** `pageInfo(page)` /
+  `gp_page_info_json` gain a `mediaBox` field (`[x0, y0, x1, y1]` in user-space
+  points), and `Document::page_media_box` exposes it natively. Unlike the
+  derived `width`/`height` (the box size), this preserves the box **origin**, so
+  a host can reconstruct a page's exact coordinate frame — the native
+  replacement for a reader's `page.view` / MediaBox read.
+
 ## [0.32.0] - 2026-06-17
 
 ### Added
