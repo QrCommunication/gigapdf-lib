@@ -8,6 +8,7 @@
 pub mod aes;
 pub mod bignum;
 pub mod hmac;
+pub mod kdf;
 pub mod md5;
 pub mod rc4;
 pub mod rsa;
@@ -17,6 +18,9 @@ pub mod sha512;
 
 pub use aes::{aes_cbc_decrypt, aes_cbc_encrypt, Aes};
 pub use hmac::{hmac_sha1, hmac_sha256};
+pub use kdf::{
+    bmp_string, pbkdf2_hmac_sha1, pbkdf2_hmac_sha256, pkcs12_kdf_sha1, pkcs12_kdf_sha256,
+};
 pub use md5::md5;
 pub use rc4::rc4;
 pub use sha1::sha1;
