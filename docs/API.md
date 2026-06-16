@@ -1,5 +1,9 @@
 # API reference
 
+> Calling from TypeScript/JavaScript? Use the high-level SDK and its complete
+> per-method reference in **[SDK.md](SDK.md)**. This file documents the two
+> lower-level surfaces the SDK is built on.
+
 Two surfaces expose the same engine:
 
 - **Rust** — `gigapdf_core::Document` (+ free functions in `gigapdf_core::convert`).
@@ -47,16 +51,31 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 
 | Rust | WASM |
 |------|------|
+| `add_text_standard(page,x,y,size,text,font_name,rgb,opacity,rot)` | `gp_add_text_standard(handle,page,x,y,size,ptr,len,fontptr,fontlen,rgb,opacity,rot)` |
 | `embed_truetype_font(family,&ttf) -> u32` | `gp_embed_font(handle,famptr,famlen,ttfptr,ttflen) -> u32` |
 | `add_text(page,x,y,size,text,font_obj,rgb)` | `gp_add_text(handle,page,x,y,size,ptr,len,font_obj,rgb)` |
+| `embedded_fonts() -> Vec<EmbeddedFontInfo>` | `gp_embedded_fonts_json(handle,outlen)` |
+| `extract_font_program(name) -> Option<(Vec<u8>,fmt)>` | `gp_extract_font(handle,nameptr,namelen,outlen)` |
 | `needed_fonts() -> Vec<String>` | `gp_needed_fonts(handle,outlen)` (JSON) |
 | `font::catalog::lookup(name)` / `CATALOG` | `gp_font_catalog_json(outlen)` |
 | `font::google::css_url(family,weight,italic)` | `gp_font_request_url(famptr,famlen,weight,italic,outlen)` |
 | `font::google::parse_css_font_url(css)` | `gp_parse_css_font_url(cssptr,csslen,outlen)` |
 
-`embed_truetype_font` builds a Type0 / CIDFontType2 font (Identity-H, full widths,
-`ToUnicode`) from a glyf-based `.ttf`; `add_text` writes real, selectable
-content-stream text in that font.
+Three complementary ways to draw real, selectable text — no host font files needed:
+
+1. **Base-14 standard fonts** — `add_text_standard` with a PostScript name
+   (`Helvetica`/`Times`/`Courier` × 4 styles, `Symbol`, `ZapfDingbats`). No
+   embedding; every viewer ships them. Several different standard fonts can
+   coexist on one page.
+2. **Any family via TrueType embedding** — `embed_truetype_font` builds a Type0 /
+   CIDFontType2 font (Identity-H, full widths, `ToUnicode`) from a glyf-based
+   `.ttf`, then `add_text` writes text in it. Feed it a Google Font the host
+   fetched (`font::google::css_url` → download → embed) or any `.ttf`.
+3. **The document's own embedded fonts** — `embedded_fonts` lists the faces a PDF
+   already carries (`{base_font, format}`); `extract_font_program` pulls a font's
+   raw bytes out (`truetype` re-embeds directly with `embed_truetype_font`;
+   `cff`/`type1` need conversion), so you can re-bake edited text in the exact
+   original face.
 
 ## Annotations & forms
 
@@ -103,10 +122,15 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 |------|------|
 | `redact_region(page,x,y,w,h,cover:Option<[f64;3]>) -> usize` | `gp_redact_region(handle,page,x,y,w,h,cover_rgb,has_cover)` |
 | `sign(&Signer,name,reason,date) -> Result<Vec<u8>>` | `gp_sign(handle,fieldsptr,fieldslen,randptr,randlen,key_bits,outlen)` |
+| `sign_p12(&Pkcs12Identity,name,reason,date,location,contact)` | `gp_sign_p12(handle,p12*,pass*,fields*,outlen)` |
+| `sign::pkcs12::parse(pfx,password) -> Pkcs12Identity` | (via `gp_sign_p12`) |
 | `save_encrypted(...)` | `gp_save_encrypted(...)` |
 
-`Signer` is built from host-supplied randomness; `sign` produces an
-`adbe.pkcs7.detached` CMS signature with a `/ByteRange`-patched PDF.
+`Signer` is built from host-supplied randomness; `sign` produces a self-signed
+`adbe.pkcs7.detached` CMS signature with a `/ByteRange`-patched PDF. `sign_p12`
+signs with a **user-supplied identity** imported natively from a PKCS#12
+(`.p12`/`.pfx`) — PBES2 (PBKDF2 + AES) and PBES1 (3DES, RC2-40) bags, integrity
+MAC verified — with **no third-party crypto** (all in `crate::crypto`).
 
 ## Render
 

@@ -7,6 +7,11 @@ const MODERN_P12 = new Uint8Array(
   readFileSync(new URL("../../crates/core/src/sign/fixtures/modern.p12", import.meta.url))
 );
 
+// A PDF carrying an embedded DejaVu TrueType program.
+const EMBEDDED_FONTS_PDF = new Uint8Array(
+  readFileSync(new URL("../../fixtures/embedded-fonts.pdf", import.meta.url))
+);
+
 // Exercises the typed wrappers against the real bundled .wasm (loadDefault reads
 // gigapdf.wasm produced by `pnpm build:wasm`). Catches wrapper-level bugs the
 // engine smoke test can't (e.g. argument-arity / flag mistakes).
@@ -157,6 +162,37 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(() => doc.signP12(MODERN_P12, "wrong", { reason: "R" })).toThrow(
       /PKCS#12 signing failed/
     );
+    doc.close();
+  });
+
+  it("draws text in built-in base-14 standard fonts (no embedding)", () => {
+    const doc = giga.open(giga.txtToPdf("base14"));
+    expect(doc.addStandardText(1, 72, 700, 18, "Times Bold heading", "Times-Bold", 0x000000)).toBe(
+      true
+    );
+    expect(doc.addStandardText(1, 72, 680, 12, "courier code", "Courier", 0x333333)).toBe(true);
+    // An unknown font name is rejected.
+    expect(doc.addStandardText(1, 72, 660, 12, "x", "NotARealFont")).toBe(false);
+    const out = doc.save();
+    expect(new TextDecoder().decode(out).includes("Times-Bold")).toBe(true);
+    doc.close();
+  });
+
+  it("lists embedded fonts, extracts one, and re-embeds it to draw new text", () => {
+    const doc = giga.open(EMBEDDED_FONTS_PDF);
+    const fonts = doc.embeddedFonts();
+    expect(fonts.length).toBeGreaterThan(0);
+    const ttf = fonts.find((f) => f.format === "truetype");
+    expect(ttf).toBeDefined();
+    expect(/DejaVu/i.test(ttf!.baseFont)).toBe(true);
+
+    // Pull the program out and re-embed it — drawing text in the doc's own face.
+    const program = doc.extractFont(ttf!.baseFont);
+    expect(program).not.toBeNull();
+    expect(program!.format).toBe("truetype");
+    const handle = doc.embedFont("ReusedFace", program!.bytes);
+    expect(handle).toBeGreaterThan(0);
+    expect(doc.addText(1, 72, 500, 14, "reused glyphs", handle)).toBe(true);
     doc.close();
   });
 });

@@ -49,7 +49,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 | **Annotations** | Highlight, underline, strike-out, free-text, square, line, ink, stamp, link; **flatten** |
 | **Forms (AcroForm)** | Text/checkbox/radio/combo/list/signature fields — **read · fill · create** (build widgets from scratch with appearance streams + `NeedAppearances`) |
 | **Pages** | Rotate, delete, move, extract, merge; bookmarks/outline; metadata |
-| **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **true redaction** (delete from stream, no opaque cover) |
+| **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **PKCS#12 signing** (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **true redaction** (delete from stream, no opaque cover) |
 | **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images) |
 | **Text intelligence** | Font-aware extraction, **structured text** (reading-order lines + boxes), **full-text search** with highlight boxes |
 | **OCR** | Built-in recognizer — Otsu → connected components → line/word segmentation → MLP trained on **EMNIST handwriting + synthetic font glyphs** (Latin + accents). No Tesseract, no model download at runtime |
@@ -58,7 +58,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 | **HTML rendering** | Native **HTML + CSS → PDF** engine (parser, selector cascade, block / inline / table / **flex** (direction · justify-content · grow) / **grid** layout, pagination, **`page-break-*` + `<pagebreak>`**) — no headless browser. Text set in **embedded Google fonts** (real glyphs + metrics, identical or nearest match) |
 | **JavaScript** | Built-in zero-dependency **JS engine** that runs a document's inline `<script>`s before layout — **no Chromium/Playwright**. Lexer → parser → tree-walking interpreter with **classes + `super`**, closures, destructuring, generators (`function*`/`yield`), **`async`/`await` + `Promise`** (microtask queue + `setTimeout`), and built-ins: `Object`/`Array`/`String`/`Number`/`Math`/`JSON`/`console`/`Map`/`Set`/**`RegExp`** + a backtracking regex engine. **DOM bindings**: `getElementById`, `querySelector(All)` (`#id`/`.class`/`tag`/`>`/`+`/`~`/`[attr]`), `textContent`, `innerHTML`, `createElement`/`appendChild`, `classList`, `style`, … |
 | **Archival** | **PDF/A-2b** metadata (XMP + sRGB OutputIntent + ID) |
-| **Fonts** | **1951-family catalog**, Google-Fonts URL builder, **TrueType embedding** (Type0/CIDFontType2 + ToUnicode), needed-font detection |
+| **Fonts** | Draw real text in **every font source** — built-in **base-14 standard fonts** (no embedding), any family / **Google Font** (1951-family catalog + URL builder + **TrueType embedding** Type0/CIDFontType2 + ToUnicode), and the **document's own embedded faces** (`embeddedFonts` list + `extractFont` pull-out → re-embed); needed-font detection |
 
 All of it is exercised by `cargo test` (**284 tests**, incl. a 100-test pure-Rust
 JavaScript engine: lexer, parser, interpreter, built-ins, regex, DOM, and a
@@ -158,11 +158,15 @@ const docx = callBuffer(() => ex.gp_to_docx(handle, lenPtr)); // → Uint8Array
 ex.gp_close(handle);
 ```
 
-See [`docs/USAGE.md`](docs/USAGE.md) for the full buffer ABI and an example for
-every feature, [`docs/API.md`](docs/API.md) for the complete reference, and
-[`docs/HTML-CSS.md`](docs/HTML-CSS.md) for the **exhaustive list of supported
-HTML elements, CSS properties, units, colours and selectors** in the HTML→PDF
-renderer.
+### Documentation
+
+| Doc | What's in it |
+|-----|--------------|
+| [`docs/SDK.md`](docs/SDK.md) | **Complete TypeScript SDK reference** — every `GigaPdfEngine`/`GigaPdfDoc` method, grouped by domain, with parameters, returns and notes. |
+| [`docs/USAGE.md`](docs/USAGE.md) | Cookbook: the buffer ABI plus a worked example for every feature area. |
+| [`docs/API.md`](docs/API.md) | The Rust ↔ WASM ABI mapping (every `gp_*` export and its Rust method). |
+| [`docs/HTML-CSS.md`](docs/HTML-CSS.md) | The **exhaustive** list of supported HTML elements, CSS properties, units, colours, selectors and JS in the HTML→PDF renderer. |
+| [`docs/INSTALL.md`](docs/INSTALL.md) | Install, build-from-source, and Next.js (`output: "standalone"`) wiring. |
 
 ## Build
 

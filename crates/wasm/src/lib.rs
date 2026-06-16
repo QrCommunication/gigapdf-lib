@@ -17,8 +17,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use gigapdf_core::{
-    Annotation, ContentElement, Document, ElementKind, FieldKind, FormField, Layer, Link,
-    LinkTarget, OcrWord, OutlineItem, SearchMatch, TextLayerRun, TextLine, TextRun,
+    Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
+    Layer, Link, LinkTarget, OcrWord, OutlineItem, SearchMatch, TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -1711,6 +1711,55 @@ pub extern "C" fn gp_add_text(
     })
 }
 
+/// Draw `text` in a built-in **base-14 standard font** — `font` is the
+/// PostScript name (e.g. `Helvetica`, `Times-Bold`, `Courier-Oblique`,
+/// `Symbol`). Like `gp_add_text` but needs no embedded-font handle. 0 on
+/// success, non-zero on error (unknown font name / bad page).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_text_standard(
+    handle: *mut Document,
+    page: u32,
+    x: f64,
+    y: f64,
+    size: f64,
+    text_ptr: *const u8,
+    text_len: usize,
+    font_ptr: *const u8,
+    font_len: usize,
+    rgb: u32,
+    opacity: f64,
+    rotation_deg: f64,
+) -> i32 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    let font = unsafe { str_arg(font_ptr, font_len) };
+    edit(handle, |doc| {
+        doc.add_text_standard(
+            page,
+            x,
+            y,
+            size,
+            text,
+            font,
+            unpack_rgb(rgb),
+            opacity,
+            rotation_deg,
+        )
+    })
+}
+
+/// The document's embedded fonts as a JSON array
+/// `[{"baseFont":…,"format":"truetype"|"cff"|"type1"}]`. Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_embedded_fonts_json(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let doc = match unsafe { handle.as_ref() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let json = embedded_fonts_json(&doc.embedded_fonts());
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Extract an embedded font program by (fuzzy) `/BaseFont` name. Returns a buffer
 /// whose **first byte** is the format tag (1 = truetype, 2 = cff, 3 = type1)
 /// followed by the raw decoded font bytes. Null (empty) when no embedded match —
@@ -2464,6 +2513,22 @@ fn annotations_json(annots: &[Annotation]) -> String {
             a.rect[0], a.rect[1], a.rect[2], a.rect[3]
         ));
         json_escape(&a.contents, &mut out);
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+fn embedded_fonts_json(fonts: &[EmbeddedFontInfo]) -> String {
+    let mut out = String::from("[");
+    for (i, f) in fonts.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"baseFont\":");
+        json_escape(&f.base_font, &mut out);
+        out.push_str(",\"format\":");
+        json_escape(&f.format, &mut out);
         out.push('}');
     }
     out.push(']');

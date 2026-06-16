@@ -73,15 +73,27 @@ doc.addTextField(1, "vat", [50, 510, 200, 528], "", {
 const filled = doc.fields(); // read them straight back: kind + value + options
 ```
 
-### Fonts (host performs the network fetch)
+### Fonts — three sources, no host font files required
 
 ```ts
+// 1. Base-14 standard fonts — no embedding, no network.
+doc.addStandardText(1, 72, 720, 24, "Heading", "Helvetica-Bold", 0x111111);
+doc.addStandardText(1, 72, 690, 12, "body in Times", "Times-Roman");
+
+// 2. Any family / Google Font — the host performs the network fetch, the engine embeds.
 const url = giga.fontRequestUrl("Roboto", 400); // Google Fonts CSS2 URL
 const css = await (await fetch(url, { headers: { "User-Agent": "Mozilla/4.0" } })).text();
-const ttfUrl = giga.parseCssFontUrl(css); // trusted gstatic URL
-const ttf = new Uint8Array(await (await fetch(ttfUrl)).arrayBuffer());
+const ttf = new Uint8Array(await (await fetch(giga.parseCssFontUrl(css))).arrayBuffer());
 const fontObj = doc.embedFont("Roboto", ttf);
-doc.addText(1, 72, 720, 18, "Selectable text", fontObj, 0x111111);
+doc.addText(1, 72, 660, 18, "Selectable embedded text", fontObj, 0x111111);
+
+// 3. Reuse a face the PDF already embeds: list → extract → re-embed → draw.
+const face = doc.embeddedFonts().find((f) => f.format === "truetype");
+if (face) {
+  const prog = doc.extractFont(face.baseFont)!;        // { format, bytes }
+  const reused = doc.embedFont("Reused", prog.bytes);
+  doc.addText(1, 72, 630, 14, "drawn in the document's own font", reused);
+}
 ```
 
 ## Next.js (`output: "standalone"`)
@@ -101,6 +113,10 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
 
 ## API surface
 
+> **Full, per-method reference:** [`docs/SDK.md`](https://github.com/QrCommunication/gigapdf-lib/blob/main/docs/SDK.md)
+> documents every method (parameters, return, notes) grouped by domain. Exact
+> signatures and defaults also ship in the bundled `.d.ts`.
+
 - **`GigaPdfEngine`** — `load`/`loadDefault`, `open`/`openEncrypted`,
   `txtToPdf`/`htmlToPdf`/`rtfToPdf`/`officeToPdf`, `fontCatalog`/`fontRequestUrl`/`parseCssFontUrl`.
 - **`GigaPdfDoc`** — text intelligence (`textRuns`, `structuredText`, `search`,
@@ -110,9 +126,11 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   `addImage` (PNG/JPEG, alpha + opacity)), pages (`rotatePage`, `deletePage`,
   `movePage`, `appendPages`, `extractPages`, `resizePage`, `addPage`, `copyPage`,
   `pageInfo`),
-  `renderPage`, fonts (`embedFont`, `addText`, `neededFonts`), conversions
-  (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`), security (`saveEncrypted`,
-  `sign`), metadata (`getMetadata`, `setMetadata`), annotations (`addSquare`,
+  `renderPage`, fonts (base-14 `addStandardText`, embedded `embedFont`/`addText`,
+  the document's own faces `embeddedFonts`/`extractFont`, `neededFonts`),
+  conversions (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`), security
+  (`saveEncrypted`, self-signed `sign`, **PKCS#12** `signP12`), metadata
+  (`getMetadata`, `setMetadata`), annotations (`addSquare`,
   `addHighlight`, `addLineAnnotation`, `addFreeText`, `addUnderline`,
   `addStrikeOut`, `addInk`, `addStamp`, `annotations`, `removeAnnotation`,
   `flattenAnnotations`), links (`links`, `addUriLink`, `addGotoLink`), outline

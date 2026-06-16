@@ -456,6 +456,13 @@ export interface FontInfo {
   google: boolean;
   weights: number[];
 }
+/** A font embedded in a document (from {@link GigaPdfDoc.embeddedFonts}). */
+export interface EmbeddedFont {
+  /** The `/BaseFont` name (may carry a `ABCDEF+` subset prefix). */
+  baseFont: string;
+  /** Embedded program format. `truetype` re-embeds directly via `embedFont`. */
+  format: "truetype" | "cff" | "type1";
+}
 export interface Box {
   x: number;
   y: number;
@@ -983,6 +990,46 @@ export class GigaPdfDoc {
     );
   }
   /**
+   * Draw `text` at `(x, y)` in a built-in **base-14 standard font** (`fontName`,
+   * e.g. `"Times-Bold"`, `"Courier-Oblique"`, `"Symbol"`) — no embedding needed,
+   * every viewer ships these 14. For any other family embed a TrueType with
+   * {@link embedFont} (a Google Font fetched by the host, or one pulled out of
+   * the document with {@link extractFont}) and use {@link addText}. Returns
+   * `false` on an unknown font name or bad page.
+   */
+  addStandardText(
+    page: number,
+    x: number,
+    y: number,
+    size: number,
+    text: string,
+    fontName: string,
+    rgb = 0,
+    opacity = 1,
+    rotationDeg = 0
+  ): boolean {
+    return (
+      this.g._withStr(text, (tp, tl) =>
+        this.g._withStr(fontName, (fp, fl) =>
+          this.ex().gp_add_text_standard(
+            this.h,
+            page,
+            x,
+            y,
+            size,
+            tp,
+            tl,
+            fp,
+            fl,
+            RGB(rgb),
+            opacity,
+            rotationDeg
+          )
+        )
+      ) === 0
+    );
+  }
+  /**
    * Stamp a standard-**Helvetica** watermark (no font embed needed): `text` at
    * `(x, y)`, rotated `rotationDeg`° counter-clockwise, `rgb` packed `0xRRGGBB`,
    * `opacity` 0–1. Pair with {@link GigaPdfEngine.helveticaWidth} for centring.
@@ -1022,6 +1069,15 @@ export class GigaPdfDoc {
     if (buf.length === 0) return null;
     const format = buf[0] === 1 ? "truetype" : buf[0] === 2 ? "cff" : "type1";
     return { format, bytes: buf.subarray(1) };
+  }
+  /**
+   * The fonts **embedded** in the document — each `{ baseFont, format }`. Pair
+   * with {@link extractFont} to pull a font's bytes out and re-embed them via
+   * {@link embedFont}, e.g. to draw new text (with {@link addText}) in a face
+   * the document already carries — no external font file needed.
+   */
+  embeddedFonts(): EmbeddedFont[] {
+    return this.g._json((o) => this.ex().gp_embedded_fonts_json(this.h, o));
   }
 
   // convert PDF → X

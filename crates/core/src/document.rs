@@ -234,6 +234,16 @@ pub struct TextLayerRun {
     pub rotation_deg: f64,
 }
 
+/// One embedded font in a document (from [`Document::embedded_fonts`]): its
+/// `/BaseFont` name and embedded program format (`truetype` / `cff` / `type1`).
+/// Feed `base_font` to [`Document::extract_font_program`] to pull the bytes out
+/// and re-embed it (e.g. to draw new text in the document's own face).
+#[derive(Debug, Clone)]
+pub struct EmbeddedFontInfo {
+    pub base_font: String,
+    pub format: String,
+}
+
 impl Document {
     /// Parse a PDF from raw bytes.
     pub fn open(bytes: &[u8]) -> Result<Self> {
@@ -1442,6 +1452,74 @@ impl Document {
             .map(|o| self.resolve(o))
             .and_then(Object::as_stream)?;
         decode_stream(stream).ok()
+    }
+
+    /// Enumerate the fonts **embedded** in the document — every `/Font` whose
+    /// descriptor carries a font program (`/FontFile2` TrueType, `/FontFile3`
+    /// CFF/OpenType, `/FontFile` Type1), with its `/BaseFont` name and format,
+    /// deduplicated and sorted. Pair with
+    /// [`extract_font_program`](Self::extract_font_program) to pull a font's
+    /// bytes out and re-embed it (drawing new text in the document's own face).
+    pub fn embedded_fonts(&self) -> Vec<EmbeddedFontInfo> {
+        let mut out: Vec<EmbeddedFontInfo> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for object in self.objects.values() {
+            let Some(dict) = object.as_dict() else {
+                continue;
+            };
+            if dict.get(b"Type").and_then(Object::as_name) != Some(b"Font".as_slice()) {
+                continue;
+            }
+            let base = dict
+                .get(b"BaseFont")
+                .and_then(Object::as_name)
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .unwrap_or_default();
+            if base.is_empty() {
+                continue;
+            }
+            // Type0 composites carry the descriptor on the descendant CIDFont.
+            let carrier = if dict.get(b"Subtype").and_then(Object::as_name)
+                == Some(b"Type0".as_slice())
+            {
+                dict.get(b"DescendantFonts")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_array)
+                    .and_then(|a| a.first())
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+                    .cloned()
+            } else {
+                Some(dict.clone())
+            };
+            let Some(carrier) = carrier else {
+                continue;
+            };
+            let Some(descriptor) = carrier
+                .get(b"FontDescriptor")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+            else {
+                continue;
+            };
+            let format = if descriptor.contains(b"FontFile2") {
+                "truetype"
+            } else if descriptor.contains(b"FontFile3") {
+                "cff"
+            } else if descriptor.contains(b"FontFile") {
+                "type1"
+            } else {
+                continue;
+            };
+            if seen.insert(base.clone()) {
+                out.push(EmbeddedFontInfo {
+                    base_font: base,
+                    format: format.to_string(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.base_font.cmp(&b.base_font));
+        out
     }
 
     /// Find an embedded font program by (fuzzy) `/BaseFont` name and return its
@@ -2671,23 +2749,50 @@ impl Document {
         Ok(())
     }
 
-    /// Stamp a watermark: `text` drawn in standard **Helvetica** (no font embed
-    /// needed) at `(x, y)`, rotated `rotation_deg` degrees counter-clockwise,
-    /// with `color` (RGB 0–1) and `opacity` (0–1). Used for diagonal/corner
-    /// watermarks over an existing page.
+    /// The PostScript name of a base-14 standard font, or `None` if `name` is
+    /// not one of the 14 (Helvetica/Times/Courier × 4 styles + Symbol +
+    /// ZapfDingbats). These need no embedding — every PDF viewer ships them.
+    pub fn standard_base14(name: &str) -> Option<&'static [u8]> {
+        Some(match name {
+            "Helvetica" => b"Helvetica",
+            "Helvetica-Bold" => b"Helvetica-Bold",
+            "Helvetica-Oblique" => b"Helvetica-Oblique",
+            "Helvetica-BoldOblique" => b"Helvetica-BoldOblique",
+            "Times-Roman" => b"Times-Roman",
+            "Times-Bold" => b"Times-Bold",
+            "Times-Italic" => b"Times-Italic",
+            "Times-BoldItalic" => b"Times-BoldItalic",
+            "Courier" => b"Courier",
+            "Courier-Bold" => b"Courier-Bold",
+            "Courier-Oblique" => b"Courier-Oblique",
+            "Courier-BoldOblique" => b"Courier-BoldOblique",
+            "Symbol" => b"Symbol",
+            "ZapfDingbats" => b"ZapfDingbats",
+            _ => return None,
+        })
+    }
+
+    /// Draw `text` at `(x, y)` in a built-in **base-14 standard font**
+    /// (`font_name`, e.g. `"Times-Bold"`) — no embedding needed. `size` pt,
+    /// `color` (RGB 0–1), `opacity` (0–1), rotated `rotation_deg`° CCW. Text is
+    /// WinAnsi-encoded. For arbitrary families embed a TrueType font and use
+    /// [`add_text`](Self::add_text) instead.
     #[allow(clippy::too_many_arguments)]
-    pub fn add_watermark(
+    pub fn add_text_standard(
         &mut self,
         page_no: u32,
         x: f64,
         y: f64,
         size: f64,
         text: &str,
+        font_name: &str,
         color: [f64; 3],
         opacity: f64,
         rotation_deg: f64,
     ) -> Result<()> {
-        let res_name = self.ensure_helvetica_font(page_no)?;
+        let base = Self::standard_base14(font_name)
+            .ok_or_else(|| EngineError::Unsupported(format!("not a base-14 font: {font_name}")))?;
+        let res_name = self.ensure_standard_font(page_no, base)?;
         let (sin, cos) = rotation_deg.to_radians().sin_cos();
 
         let mut inner: Vec<u8> = Vec::new();
@@ -2730,6 +2835,24 @@ impl Document {
         content.extend_from_slice(&ops);
         self.set_page_content(page_no, content)?;
         Ok(())
+    }
+
+    /// Stamp a watermark: `text` in standard **Helvetica** (no embed) at
+    /// `(x, y)`, rotated `rotation_deg`° CCW, with `color` (RGB 0–1) and
+    /// `opacity` (0–1). A thin wrapper over [`add_text_standard`](Self::add_text_standard).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_watermark(
+        &mut self,
+        page_no: u32,
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        color: [f64; 3],
+        opacity: f64,
+        rotation_deg: f64,
+    ) -> Result<()> {
+        self.add_text_standard(page_no, x, y, size, text, "Helvetica", color, opacity, rotation_deg)
     }
 
     /// Add an invisible (text render mode 3) standard-Helvetica text layer to
@@ -2794,17 +2917,27 @@ impl Document {
     /// Register a standard `/Type1 /Helvetica /WinAnsiEncoding` font as a page
     /// resource and return its resource name.
     fn ensure_helvetica_font(&mut self, page_no: u32) -> Result<Vec<u8>> {
+        self.ensure_standard_font(page_no, b"Helvetica")
+    }
+
+    /// Register a standard (base-14) `/Type1` font with `base_font` as a page
+    /// resource and return a *unique* resource name (so several different
+    /// standard fonts can coexist on one page). Symbol/ZapfDingbats keep their
+    /// built-in encoding; the others use `/WinAnsiEncoding`.
+    fn ensure_standard_font(&mut self, page_no: u32, base_font: &[u8]) -> Result<Vec<u8>> {
         let id = (self.next_object_number(), 0u16);
         let mut f = Dictionary::new();
         f.set(b"Type".to_vec(), Object::Name(b"Font".to_vec()));
         f.set(b"Subtype".to_vec(), Object::Name(b"Type1".to_vec()));
-        f.set(b"BaseFont".to_vec(), Object::Name(b"Helvetica".to_vec()));
-        f.set(
-            b"Encoding".to_vec(),
-            Object::Name(b"WinAnsiEncoding".to_vec()),
-        );
+        f.set(b"BaseFont".to_vec(), Object::Name(base_font.to_vec()));
+        if base_font != b"Symbol" && base_font != b"ZapfDingbats" {
+            f.set(
+                b"Encoding".to_vec(),
+                Object::Name(b"WinAnsiEncoding".to_vec()),
+            );
+        }
         self.objects.insert(id, Object::Dictionary(f));
-        let res_name = b"GpHelv".to_vec();
+        let res_name = format!("GpStd{}", id.0).into_bytes();
         self.register_page_font(page_no, &res_name, id)?;
         Ok(res_name)
     }
@@ -6586,6 +6719,49 @@ mod tests {
             "imported certificate embedded in the signature"
         );
         assert!(Document::open(&signed).unwrap().page_count() >= 1);
+    }
+
+    #[test]
+    fn add_text_standard_draws_with_base14_fonts() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        doc.add_text_standard(1, 100.0, 100.0, 14.0, "Bonjour", "Times-Bold", [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        doc.add_text_standard(1, 100.0, 80.0, 12.0, "Code", "Courier", [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        // A name outside the base-14 set is rejected.
+        assert!(doc
+            .add_text_standard(1, 0.0, 0.0, 10.0, "x", "NotAFont", [0.0; 3], 1.0, 0.0)
+            .is_err());
+
+        let bytes = doc.save();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Times-Bold"), "Times-Bold registered");
+        assert!(text.contains("Courier"), "Courier registered");
+        // Two distinct standard fonts must get distinct resource names.
+        assert!(text.contains("/GpStd"), "unique standard-font resources");
+        assert!(Document::open(&bytes).unwrap().page_count() >= 1, "re-opens");
+    }
+
+    #[test]
+    fn embedded_fonts_lists_embedded_programs() {
+        let doc = Document::open(&fixture("embedded-fonts.pdf")).unwrap();
+        let fonts = doc.embedded_fonts();
+        assert!(!fonts.is_empty(), "fixture carries embedded fonts");
+        assert!(
+            fonts
+                .iter()
+                .any(|f| f.base_font.contains("DejaVu") && f.format == "truetype"),
+            "DejaVu TrueType is listed: {fonts:?}"
+        );
+        // Round-trip: the listed font can be pulled out and re-embedded.
+        let name = &fonts.iter().find(|f| f.format == "truetype").unwrap().base_font;
+        let (program, format) = doc.extract_font_program(name).expect("extractable");
+        assert_eq!(format, "truetype");
+        assert!(!program.is_empty());
+
+        // A standard-font-only PDF lists nothing embedded.
+        let plain = Document::open(&fixture("simple-text.pdf")).unwrap();
+        assert!(plain.embedded_fonts().is_empty(), "no embedded program");
     }
 
     #[test]

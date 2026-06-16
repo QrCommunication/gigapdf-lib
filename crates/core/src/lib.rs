@@ -50,7 +50,7 @@ pub mod svg;
 pub use annot::Annotation;
 pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, TextRun};
 pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
-pub use document::{Document, SearchMatch, TextLayerRun};
+pub use document::{Document, EmbeddedFontInfo, SearchMatch, TextLayerRun};
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FormField};
 pub use lexer::{Lexer, Token};

@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.17.0] - 2026-06-16
+
+### Added
+
+- **`doc.addStandardText(page, x, y, size, text, fontName, …)`** — draw real,
+  selectable text in a built-in **base-14 standard font** (`Helvetica`/`Times`/
+  `Courier` × 4 styles + `Symbol` + `ZapfDingbats`) with **no embedding**. Several
+  different standard fonts can now coexist on one page. (`add_text` still covers
+  arbitrary families via an embedded TrueType.)
+- **`doc.embeddedFonts()`** — list the fonts a PDF already carries, each
+  `{ baseFont, format: "truetype" | "cff" | "type1" }`. Paired with the existing
+  `extractFont(name)`, you can pull a document's own font program out and
+  re-embed it (`embedFont`) to draw new text in the exact original face — the
+  complete "reuse the document's fonts" path, all native.
+
+This rounds out native text drawing to **every font source**: the 14 standard
+fonts (no files), any TrueType/Google Font (embed), and a document's own
+embedded faces (extract + re-embed).
+
 ## [0.16.0] - 2026-06-16
 
 ### Added

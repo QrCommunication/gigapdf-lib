@@ -265,7 +265,24 @@ ex.gp_free(ttfPtr, ttf.length); freeArg(f);
 const txt2 = strArg("Crisp embedded text — café");
 ex.gp_add_text(handle, 1, 72, 700, 18, txt2.ptr, txt2.len, fontObj, 0x000000);
 freeArg(txt2);
+
+// 6. No download needed for the 14 standard fonts — draw straight away.
+const tb = strArg("Times-Bold"), heading = strArg("Heading in Times Bold");
+ex.gp_add_text_standard(handle, 1, 72, 660, 18, heading.ptr, heading.len, tb.ptr, tb.len, 0x000000, 1, 0);
+freeArg(tb); freeArg(heading);
+
+// 7. Reuse a face the PDF already embeds: list → extract → re-embed → draw.
+const embedded = JSON.parse(dec.decode(callBuffer((lp) => ex.gp_embedded_fonts_json(handle, lp))));
+//    embedded = [{ baseFont, format: "truetype" | "cff" | "type1" }]
+const nm = strArg(embedded.find((f) => f.format === "truetype").baseFont);
+const prog = callBuffer((lp) => ex.gp_extract_font(handle, nm.ptr, nm.len, lp)); freeArg(nm);
+//    prog[0] = format tag (1 truetype / 2 cff / 3 type1); prog.slice(1) = the font bytes,
+//    feed back into gp_embed_font to draw new text in the document's own face.
 ```
+
+> SDK wrappers for the above: `doc.addStandardText(page, x, y, size, text, fontName)`,
+> `doc.embeddedFonts()`, `doc.extractFont(name)`, `doc.embedFont(family, ttf)`,
+> `doc.addText(page, x, y, size, text, fontObj)`.
 
 ## 9. Security: encrypt, sign, PDF/A
 
