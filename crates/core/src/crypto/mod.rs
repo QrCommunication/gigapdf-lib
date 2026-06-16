@@ -11,6 +11,7 @@ pub mod des;
 pub mod hmac;
 pub mod kdf;
 pub mod md5;
+pub mod rc2;
 pub mod rc4;
 pub mod rsa;
 pub mod sha1;

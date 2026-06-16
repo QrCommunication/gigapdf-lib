@@ -35,6 +35,7 @@ use super::der::{
 use crate::crypto::aes::aes_cbc_decrypt;
 use crate::crypto::des::des3_cbc_decrypt;
 use crate::crypto::hmac::{hmac_sha1, hmac_sha256};
+use crate::crypto::rc2::rc2_cbc_decrypt;
 use crate::crypto::kdf::{
     bmp_string, pbkdf2_hmac_sha1, pbkdf2_hmac_sha256, pkcs12_kdf_sha1, pkcs12_kdf_sha256,
 };
@@ -52,6 +53,7 @@ const OID_PBES2: &[u64] = &[1, 2, 840, 113549, 1, 5, 13];
 const OID_PBKDF2: &[u64] = &[1, 2, 840, 113549, 1, 5, 12];
 const OID_HMAC_SHA256: &[u64] = &[1, 2, 840, 113549, 2, 9];
 const OID_PBE_SHA1_3DES: &[u64] = &[1, 2, 840, 113549, 1, 12, 1, 3];
+const OID_PBE_SHA1_RC2_40: &[u64] = &[1, 2, 840, 113549, 1, 12, 1, 6];
 const OID_AES128_CBC: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 2];
 const OID_AES192_CBC: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 22];
 const OID_AES256_CBC: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 42];
@@ -274,9 +276,27 @@ fn decrypt_pbe(alg: Tlv, ciphertext: &[u8], password: &str) -> Option<Vec<u8>> {
         decrypt_pbes2(&mut a, ciphertext, password)
     } else if scheme.is_oid(OID_PBE_SHA1_3DES) {
         decrypt_pbes1_3des(&mut a, ciphertext, password)
+    } else if scheme.is_oid(OID_PBE_SHA1_RC2_40) {
+        decrypt_pbes1_rc2_40(&mut a, ciphertext, password)
     } else {
         None
     }
+}
+
+/// PBES1 `pbeWithSHAAnd40BitRC2-CBC`: PKCS#12 KDF (SHA-1, BMPString) → 5-byte
+/// key (id 1) + IV (id 2), then RC2-40-CBC. Legacy cert bags (OpenSSL `-legacy`).
+fn decrypt_pbes1_rc2_40(params: &mut Reader, ciphertext: &[u8], password: &str) -> Option<Vec<u8>> {
+    // PKCS12PBEParams ::= SEQUENCE { salt OCTET STRING, iterations INTEGER }
+    let p = params.next_tag(TAG_SEQUENCE)?;
+    let mut pr = p.reader();
+    let salt = pr.next_tag(TAG_OCTET_STRING)?;
+    let iter = be_to_u32(pr.next_tag(TAG_INTEGER)?.content);
+
+    let pw = bmp_string(password);
+    let key = pkcs12_kdf_sha1(1, &pw, salt.content, iter, 5); // 40-bit key
+    let iv = pkcs12_kdf_sha1(2, &pw, salt.content, iter, 8);
+    let plain = rc2_cbc_decrypt(&key, 40, &iv, ciphertext)?;
+    strip_pkcs7(plain, 8)
 }
 
 /// PBES1 `pbeWithSHAAnd3-KeyTripleDES-CBC`: PKCS#12 KDF (SHA-1, BMPString) → key
@@ -451,15 +471,13 @@ mod tests {
     }
 
     #[test]
-    fn imports_legacy_pbes1_3des_key() {
-        // The legacy key bag is 3DES (supported); its cert bag is RC2-40 (not
-        // yet implemented) so it is skipped — but MAC + key still verify.
-        let id = parse(LEGACY_P12, PASSWORD).expect("legacy .p12 key imports");
+    fn imports_legacy_pbes1_3des_key_and_rc2_cert() {
+        // Legacy export: 3DES key bag + RC2-40 cert bag + HMAC-SHA1 MAC. Both
+        // ciphers are supported, so key AND certificate come through.
+        let id = parse(LEGACY_P12, PASSWORD).expect("legacy .p12 imports");
         assert_eq!(hex(&id.key.n.to_bytes_be()), EXPECTED_N);
-        assert!(
-            id.certificates.is_empty(),
-            "RC2 cert bag skipped (documented gap)"
-        );
+        assert_eq!(id.certificates.len(), 1);
+        assert_eq!(id.certificates[0], CERT_DER);
     }
 
     #[test]

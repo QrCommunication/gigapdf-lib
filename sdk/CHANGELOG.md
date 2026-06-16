@@ -4,6 +4,28 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-06-16
+
+### Added
+
+- **Native PKCS#12 signing — `doc.signP12(p12, password, opts)`.** Sign a PDF
+  with a user-supplied `.p12`/`.pfx` identity (a CA-issued / eIDAS certificate
+  and its RSA key) producing an `adbe.pkcs7.detached` signature — with **no
+  third-party crypto**. The whole pipeline is in the Rust core:
+  - PKCS#12 import from scratch — DER reader, integrity-MAC verification
+    (PKCS#12 KDF + HMAC-SHA1/256), and bag decryption for **PBES2** (PBKDF2 +
+    AES-128/192/256-CBC) and **PBES1** (`3DES` and legacy 40-bit `RC2`), so both
+    modern (OpenSSL 3 default) and legacy `.p12` files import;
+  - the detached CMS `SignedData` is built over the document byte ranges with
+    the imported key + certificate (issuer/serial taken verbatim from the X.509).
+  - `opts` populates `/Name`, `/Reason`, `/M` (date), `/Location`, `/ContactInfo`.
+  - A wrong password / malformed file / unsupported cipher throws one generic
+    error (anti-enumeration — nothing about the credential leaks).
+  - New crypto primitives, each pinned to FIPS/RFC/NIST known-answer vectors:
+    SHA-1, HMAC-SHA1/256, PBKDF2, the PKCS#12 KDF, 3DES-CBC and RC2-CBC.
+- **`doc.addTextLayer(page, runs)`** — stamp an invisible (render-mode 3) text
+  layer over a page, e.g. a searchable OCR layer. One content append per page.
+
 ## [0.15.0] - 2026-06-16
 
 ### Changed
