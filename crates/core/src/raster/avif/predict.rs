@@ -16,6 +16,7 @@ pub(super) const SMOOTH_PRED: u8 = 9;
 pub(super) const SMOOTH_V_PRED: u8 = 10;
 pub(super) const SMOOTH_H_PRED: u8 = 11;
 pub(super) const PAETH_PRED: u8 = 12;
+pub(super) const FILTER_PRED: u8 = 13;
 /// Internal sentinel for the DC_128 downgrade (flat mid-grey).
 const DC_128: u8 = 255;
 
@@ -138,6 +139,117 @@ fn pred_smooth_h(out: &mut [i32], bw: usize, bh: usize, top: &[i32], left: &[i32
     }
 }
 
+/// `dav1d_filter_intra_taps[5][8][7]` — filter-intra weights: [mode][output
+/// (yy*4+xx, 0..7)][tap p0..p6]. From dav1d `src/tables.c` (BSD-2-Clause).
+pub(super) static FILTER_INTRA_TAPS: [[[i32; 7]; 8]; 5] = [
+    [
+        [-6, 10, 0, 0, 0, 12, 0],
+        [-5, 2, 10, 0, 0, 9, 0],
+        [-3, 1, 1, 10, 0, 7, 0],
+        [-3, 1, 1, 2, 10, 5, 0],
+        [-4, 6, 0, 0, 0, 2, 12],
+        [-3, 2, 6, 0, 0, 2, 9],
+        [-3, 2, 2, 6, 0, 2, 7],
+        [-3, 1, 2, 2, 6, 3, 5],
+    ],
+    [
+        [-10, 16, 0, 0, 0, 10, 0],
+        [-6, 0, 16, 0, 0, 6, 0],
+        [-4, 0, 0, 16, 0, 4, 0],
+        [-2, 0, 0, 0, 16, 2, 0],
+        [-10, 16, 0, 0, 0, 0, 10],
+        [-6, 0, 16, 0, 0, 0, 6],
+        [-4, 0, 0, 16, 0, 0, 4],
+        [-2, 0, 0, 0, 16, 0, 2],
+    ],
+    [
+        [-8, 8, 0, 0, 0, 16, 0],
+        [-8, 0, 8, 0, 0, 16, 0],
+        [-8, 0, 0, 8, 0, 16, 0],
+        [-8, 0, 0, 0, 8, 16, 0],
+        [-4, 4, 0, 0, 0, 0, 16],
+        [-4, 0, 4, 0, 0, 0, 16],
+        [-4, 0, 0, 4, 0, 0, 16],
+        [-4, 0, 0, 0, 4, 0, 16],
+    ],
+    [
+        [-2, 8, 0, 0, 0, 10, 0],
+        [-1, 3, 8, 0, 0, 6, 0],
+        [-1, 2, 3, 8, 0, 4, 0],
+        [0, 1, 2, 3, 8, 2, 0],
+        [-1, 4, 0, 0, 0, 3, 10],
+        [-1, 3, 4, 0, 0, 4, 6],
+        [-1, 2, 3, 4, 0, 4, 4],
+        [-1, 2, 2, 3, 4, 3, 3],
+    ],
+    [
+        [-12, 14, 0, 0, 0, 14, 0],
+        [-10, 0, 14, 0, 0, 12, 0],
+        [-9, 0, 0, 14, 0, 11, 0],
+        [-8, 0, 0, 0, 14, 10, 0],
+        [-10, 12, 0, 0, 0, 0, 14],
+        [-9, 1, 12, 0, 0, 0, 12],
+        [-8, 0, 0, 12, 0, 1, 11],
+        [-7, 0, 0, 1, 12, 1, 9],
+    ],
+];
+
+/// Filter-intra prediction (`ipred_filter_c`): recursive 4×2 blocks, each output
+/// a 7-tap weighted sum of the top-left/top/left references, where later blocks
+/// read the already-written outputs of earlier ones. `filt_idx` selects the mode.
+pub(super) fn filter(
+    bw: usize,
+    bh: usize,
+    top: &[i32],
+    left: &[i32],
+    topleft: i32,
+    filt_idx: usize,
+) -> Vec<i32> {
+    let taps = &FILTER_INTRA_TAPS[filt_idx.min(4)];
+    let mut out = vec![0i32; bw * bh];
+    let mut y = 0;
+    while y < bh {
+        let mut x = 0;
+        while x < bw {
+            // 7 references for this 4×2 block (dav1d pointer semantics).
+            let (p1, p2, p3, p4) = if y == 0 {
+                (top[x], top[x + 1], top[x + 2], top[x + 3])
+            } else {
+                let r = (y - 1) * bw + x;
+                (out[r], out[r + 1], out[r + 2], out[r + 3])
+            };
+            let p0 = if x == 0 {
+                if y == 0 { topleft } else { left[y - 1] }
+            } else if y == 0 {
+                top[x - 1]
+            } else {
+                out[(y - 1) * bw + x - 1]
+            };
+            let (p5, p6) = if x == 0 {
+                (left[y], left[y + 1])
+            } else {
+                (out[y * bw + x - 1], out[(y + 1) * bw + x - 1])
+            };
+            for yy in 0..2 {
+                for xx in 0..4 {
+                    let t = &taps[yy * 4 + xx];
+                    let acc = t[0] * p0
+                        + t[1] * p1
+                        + t[2] * p2
+                        + t[3] * p3
+                        + t[4] * p4
+                        + t[5] * p5
+                        + t[6] * p6;
+                    out[(y + yy) * bw + x + xx] = ((acc + 8) >> 4).clamp(0, 255);
+                }
+            }
+            x += 4;
+        }
+        y += 2;
+    }
+    out
+}
+
 /// Predict a `bw*bh` block for intra `mode` from assembled edges. `top`/`left`
 /// hold ≥ `bw`/`bh` samples; `topleft` is the corner. Returns the row-major
 /// predicted block.
@@ -190,9 +302,11 @@ mod tests {
 
     #[test]
     fn predictors_match_dav1d() {
+        // IPRED_REF order per size (stride 12): dc, v, h, paeth, smooth,
+        // smooth_v, smooth_h, filter0..filter4.
         for (si, &n) in [4usize, 8].iter().enumerate() {
             let (top, left, tl) = edges(n);
-            let base = si * 7;
+            let base = si * 12;
             let modes = [
                 DC_PRED,
                 VERT_PRED,
@@ -205,6 +319,10 @@ mod tests {
             for (j, &mode) in modes.iter().enumerate() {
                 let out = predict(mode, true, true, n, n, &top, &left, tl);
                 assert_eq!(out, IPRED_REF[base + j], "mode {mode} size {n}");
+            }
+            for fi in 0..5 {
+                let out = filter(n, n, &top, &left, tl, fi);
+                assert_eq!(out, IPRED_REF[base + 7 + fi], "filter {fi} size {n}");
             }
         }
     }

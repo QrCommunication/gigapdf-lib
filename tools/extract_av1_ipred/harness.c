@@ -28,6 +28,7 @@ static void pixel_set(pixel*d,int v,int n){for(int i=0;i<n;i++)d[i]=(pixel)v;}
 #include "smweights.c"
 /* predictor bodies (extracted from ipred_tmpl.c) */
 #include "ipred_body.c"
+#include "filter_body.c"
 
 static void dump(const char*name,const pixel*b,int w,int h){
   printf("    // %s %dx%d\n    &[",name,w,h);
@@ -54,6 +55,11 @@ int main(void){
     ipred_smooth_c(out,w,tl,w,h,0,0,0);    dump("smooth",out,w,h);
     ipred_smooth_v_c(out,w,tl,w,h,0,0,0);  dump("smooth_v",out,w,h);
     ipred_smooth_h_c(out,w,tl,w,h,0,0,0);  dump("smooth_h",out,w,h);
+    ipred_filter_c(out,w,tl,w,h,0,0,0); dump("filter0",out,w,h);
+    ipred_filter_c(out,w,tl,w,h,1,0,0); dump("filter1",out,w,h);
+    ipred_filter_c(out,w,tl,w,h,2,0,0); dump("filter2",out,w,h);
+    ipred_filter_c(out,w,tl,w,h,3,0,0); dump("filter3",out,w,h);
+    ipred_filter_c(out,w,tl,w,h,4,0,0); dump("filter4",out,w,h);
   }
   printf("];\n");
   return 0;

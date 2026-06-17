@@ -1507,6 +1507,7 @@ impl<'a> Av1Tile<'a> {
         bw: usize,
         bh: usize,
         mode: u8,
+        filt_idx: usize,
         cf: &mut [i32],
         tx: usize,
         txtp: u8,
@@ -1553,7 +1554,12 @@ impl<'a> Av1Tile<'a> {
             128
         };
 
-        let pred = predict::predict(mode, have_top, have_left, bw, bh, &top, &left, topleft);
+        // Luma filter-intra (FILTER_PRED) vs the standard intra predictors.
+        let pred = if plane == 0 && mode == predict::FILTER_PRED {
+            predict::filter(bw, bh, &top, &left, topleft, filt_idx)
+        } else {
+            predict::predict(mode, have_top, have_left, bw, bh, &top, &left, topleft)
+        };
 
         // Residual (skipped block → none).
         let residual = if eob >= 0 {
@@ -1640,6 +1646,7 @@ impl<'a> Av1Tile<'a> {
                             (tw * 4) as usize,
                             (th * 4) as usize,
                             y_mode,
+                            y_angle as usize,
                             &mut cf,
                             tx,
                             txtp,
@@ -1690,6 +1697,7 @@ impl<'a> Av1Tile<'a> {
                                     (uvw * 4) as usize,
                                     (uvh * 4) as usize,
                                     uv_mode,
+                                    0,
                                     &mut cf,
                                     uvtx,
                                     txtp,
