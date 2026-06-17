@@ -259,7 +259,11 @@ reconstructed tables for spreadsheets) — not a rasterised image.
 | `rgbaToPng(rgba, width, height)` | `Uint8Array` | *(engine-level)* Encode raw RGBA pixels (`width*height*4`, row-major, non-premultiplied) to PNG with the native encoder — no `canvas`/image library. Empty on a length mismatch. |
 | `resizeRgba(rgba, sw, sh, dw, dh)` | `Uint8Array` | *(engine-level)* Resample raw RGBA `sw`×`sh` → `dw`×`dh` with the native alpha-correct resampler (triangle kernel, footprint scaled for down/up) — no `sharp`/image library. Empty on a bad input. |
 | `encodeJpeg(rgba, width, height, quality?)` | `Uint8Array` | *(engine-level)* Encode RGBA → baseline JPEG (native codec, 4:4:4, `quality` 1–100, default 82) — no image library. Alpha composited on white. |
+| `encodeWebp(rgba, width, height)` | `Uint8Array` | *(engine-level)* Encode RGBA → **lossless** WebP (VP8L, native codec) — no `libwebp`. Alpha preserved exactly. Empty on a length mismatch. |
 | `decodeJpeg(bytes)` / `decodePng(bytes)` | `DecodedImage \| null` | *(engine-level)* Decode a baseline JPEG / PNG to `{ width, height, rgba }`. `null` on a malformed/unsupported stream. |
+| `decodeWebp(bytes)` | `DecodedImage \| null` | *(engine-level)* Decode a WebP — lossless **VP8L** *and* lossy **VP8** keyframes both supported. Extended/animated (`VP8X`) returns `null`. |
+| `decodeGif(bytes)` | `DecodedImage \| null` | *(engine-level)* Decode the **first frame** of a GIF (LZW, interlace, transparency) to RGBA. `null` if unsupported. |
+| `decodeAvif(bytes)` | `DecodedImage \| null` | *(engine-level)* Decode an AVIF still — pure-Rust AV1 intra decoder (lossy + lossless transforms, deblock §7.14, CDEF §7.15, palette §5.11.46-50, reduced + full headers), bit-exact vs dav1d. `null` for animated / film-grain / loop-restoration streams. |
 
 ### OCR & text intelligence
 

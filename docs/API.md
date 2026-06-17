@@ -151,6 +151,36 @@ MAC verified — with **no third-party crypto** (all in `crate::crypto`).
 | `raster::resize_rgba(&rgba,sw,sh,dw,dh) -> Vec<u8>` (alpha-correct, separable) | `gp_resize_rgba(ptr,len,sw,sh,dw,dh,outlen)` · SDK `resizeRgba` (no `sharp`) |
 | `raster::jpeg::encode_jpeg(w,h,&rgba,quality) -> Vec<u8>` (baseline 4:4:4) | `gp_encode_jpeg(w,h,ptr,len,quality,outlen)` · SDK `encodeJpeg` |
 | `raster::jpeg::decode_jpeg(&bytes) -> Option<(w,h,rgba)>` / `raster::decode_png` | `gp_decode_jpeg` / `gp_decode_png(ptr,len,outlen)` → `[w:u32][h:u32][rgba]` · SDK `decodeJpeg`/`decodePng` |
+| `raster::webp::encode_webp(w,h,&rgba) -> Vec<u8>` (lossless VP8L) | `gp_encode_webp(w,h,ptr,len,outlen)` · SDK `encodeWebp` |
+| `raster::webp::decode_webp(&bytes) -> Option<(w,h,rgba)>` (lossless **VP8L** + lossy **VP8** keyframe; not `VP8X`/animation) | `gp_decode_webp(ptr,len,outlen)` · SDK `decodeWebp` |
+| `raster::gif::decode_gif(&bytes) -> Option<(w,h,rgba)>` (first frame) | `gp_decode_gif(ptr,len,outlen)` · SDK `decodeGif` |
+| `raster::avif::decode_avif(&bytes) -> Option<(w,h,rgba)>` (AV1 intra still — see matrix) | `gp_decode_avif(ptr,len,outlen)` · SDK `decodeAvif` |
+
+All decoders return a framed `[w:u32 LE][h:u32 LE][rgba]` buffer (8-byte header
+the SDK unpacks into `DecodedImage`), `null`/empty on a malformed or unsupported
+stream. Every codec is pure-Rust→WASM with **no third-party image library**
+(no `sharp`, no `canvas`, no `libwebp`/`libaom`).
+
+### AVIF (AV1 intra) — capability matrix
+
+The AVIF decoder is a from-scratch AV1 intra decoder validated **bit-exact vs
+dav1d** on minted fixtures. Supported:
+
+| Area | Status |
+|------|--------|
+| Container | ISOBMFF still image (`ftyp`/`meta`/`mdat`, primary item) |
+| Sequence header | `reduced_still_picture_header` **and** full streaming header (timing/decoder-model/operating-points, frame-id, order-hint feature flags) |
+| Frame header | KEY-frame preamble + `disable_frame_end_update_cdf`, quant/segmentation-off/delta-q, tiles |
+| Transforms | lossy (DCT/ADST/identity/flip) + lossless (4×4 WHT) |
+| Intra prediction | DC, Paeth, Smooth(/V/H), directional Z1/Z2/Z3, CfL, filter-intra |
+| Palette | screen-content **palette** mode (§5.11.46-50): Y + chroma, colour cache/delta coding, wave-front index map, skip + residual paths |
+| In-loop filters | deblocking (§7.14) + CDEF (§7.15) including multi-strength `cdef_bits > 0` |
+| Chroma | 4:2:0 / 4:2:2 / 4:4:4, 8-bit |
+
+Not yet covered (returns wrong pixels or is absent — tracked, see CHANGELOG):
+animated AVIF, film grain, loop restoration (§7.17), the fully bit-exact
+directional top-right/bottom-left intra edge (real-neighbour gather is in, a
+residual Z1/Z3 edge-filter gap remains), and the lossless WHT path at `q ≤ 20`.
 
 ## Text intelligence & OCR
 

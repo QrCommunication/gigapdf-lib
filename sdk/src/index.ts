@@ -332,15 +332,24 @@ export class GigaPdfEngine {
     );
   }
   /**
-   * Decode a **lossless** (VP8L) WebP to `{ width, height, rgba }`, or `null`.
-   * Lossy (VP8) and extended/animated WebP are not handled (returns `null`).
+   * Decode a WebP to `{ width, height, rgba }`, or `null`. Handles both
+   * **lossless** (VP8L) and **lossy** (VP8 keyframe) WebP with the engine's
+   * native decoder — no third-party image library. Extended/animated WebP
+   * (`VP8X`) is not handled (returns `null`).
    */
   decodeWebp(webp: Uint8Array): DecodedImage | null {
     return this._decodeFramed(webp, (p, l, o) => this.ex.gp_decode_webp(p, l, o));
   }
   /**
    * Decode a still **AVIF** (AV1 intra) to `{ width, height, rgba }`, or `null`.
-   * Native AV1 decoder — no third-party library. Animated AVIF is not handled.
+   * Pure-Rust AV1 decoder — no third-party library. Supports lossy + lossless
+   * transforms, in-loop deblocking (AV1 §7.14) and CDEF (§7.15, including the
+   * multi-strength `cdef_bits > 0` path), screen-content **palette** mode
+   * (§5.11.46-50), and both `reduced_still_picture_header` and the full
+   * streaming sequence/frame headers — all validated bit-exact against dav1d.
+   * Not yet covered: animated AVIF, film grain, loop restoration (§7.17), the
+   * fully bit-exact directional top-right/bottom-left intra edge, and the
+   * lossless WHT path at very-high quality (`q ≤ 20`).
    */
   decodeAvif(avif: Uint8Array): DecodedImage | null {
     return this._decodeFramed(avif, (p, l, o) => this.ex.gp_decode_avif(p, l, o));

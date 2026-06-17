@@ -1,12 +1,13 @@
-//! WebP **lossless** (VP8L) encoder + decoder — pure std, zero dependency.
+//! WebP encoder (lossless **VP8L**) + decoder (lossless **VP8L** *and* lossy
+//! **VP8** keyframes) — pure std, zero dependency.
 //!
 //! Encodes RGBA losslessly (no spatial/colour transforms, single Huffman group,
-//! literal pixels — valid VP8L every decoder accepts) and decodes VP8L streams
-//! produced this way, plus the common case (no transforms, optional colour
-//! cache, LZ77 back-references, single Huffman group). The RIFF/WebP container is
-//! read and written here. Lossy VP8 and extended (`VP8X`/animation) WebP are not
-//! handled — `decode_webp` returns `None` for them. This is the native WebP path
-//! replacing a third-party image library for lossless WebP I/O.
+//! literal pixels — valid VP8L every decoder accepts). Decodes VP8L streams (no
+//! transforms, optional colour cache, LZ77 back-references, single Huffman
+//! group) and lossy VP8 keyframes (intra-coded I-frames). The RIFF/WebP
+//! container is read and written here. Extended (`VP8X`) and animated WebP are
+//! not handled — `decode_webp` returns `None` for them. This is the native WebP
+//! path replacing a third-party image library.
 
 // ── bit reader / writer (VP8L is LSB-first) ───────────────────────────────────
 

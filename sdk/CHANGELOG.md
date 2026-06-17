@@ -4,6 +4,23 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **AVIF: multi-strength CDEF (`cdef_bits > 0`).** The CDEF stage now reads the
+  per-64×64 `cdef_idx` from the tile stream (once per filter unit, after the skip
+  flag) and selects the matching primary/secondary strength pair per plane,
+  rather than assuming a single strength set. Bit-exact against dav1d on
+  single-strength fixtures; the multi-strength read position is verified
+  sync-correct (with-read vs no-read divergence proof).
+- **AVIF: directional intra real-neighbour edges.** Directional predictors
+  (Z1/Z2/Z3) now gather the true top-right / bottom-left samples via a
+  `BlockDecoded` availability grid instead of repeating the last edge sample,
+  closing most of the residual error on noisy/dithered content. A fully
+  bit-exact edge filter / upsample for the steepest angles is still in progress
+  (tracked).
+
 ## [0.40.0] - 2026-06-17
 
 ### Changed
