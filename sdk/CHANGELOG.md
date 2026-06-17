@@ -4,6 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.38.0] - 2026-06-17
+
+### Changed
+
+- **AVIF: CDEF in-loop filter (AV1 §7.15).** The AV1 intra decoder behind
+  `decodeAvif` now applies the Constrained Directional Enhancement Filter after
+  deblocking, so AVIFs encoded with CDEF (the common case) decode without ringing
+  / directional artifacts. Per coded 8×8 luma block: an eight-way direction
+  search, a variance-adjusted primary tap set along that direction plus secondary
+  taps at ±45°, and the matching 4:2:0 chroma pass — each soft-thresholded by the
+  signalled strength + damping. Validated **bit-exact** against dav1d on luma and
+  chroma stills. Current scope: the single-strength (`cdef_bits == 0`) case;
+  per-block strength indices and loop restoration remain pending.
+
 ## [0.37.0] - 2026-06-17
 
 ### Changed
