@@ -795,6 +795,10 @@ pub(crate) struct Av1Tile<'a> {
     lossless: [bool; 8],
     /// Reconstructed 8-bit pixel planes (Y, U, V); chroma sized by subsampling.
     planes: [Vec<u8>; 3],
+    /// Per-4×4 "transform block reconstructed" grid per plane (stride `plane_w/4`).
+    /// Drives directional intra top-right / bottom-left neighbour availability
+    /// (AV1 `BlockDecoded`): a neighbour is usable only once its 4×4 is decoded.
+    decoded: [Vec<u8>; 3],
     plane_w: [usize; 3],
     plane_h: [usize; 3],
     /// Chroma subsampling (`monochrome`/`420`/`444`), drives `has_chroma`.
@@ -960,6 +964,7 @@ impl<'a> Av1Tile<'a> {
                     [vec![0u8; yw * yh], vec![0u8; cw * ch], vec![0u8; cw * ch]]
                 }
             },
+            decoded: [Vec::new(), Vec::new(), Vec::new()],
             plane_w: {
                 let yw = cols * 4;
                 if seq.mono_chrome {
@@ -1042,6 +1047,7 @@ impl<'a> Av1Tile<'a> {
             self.db_tx_w4[p] = vec![0u8; gw4 * gh4];
             self.db_tx_h4[p] = vec![0u8; gw4 * gh4];
             self.db_edge[p] = vec![0u8; gw4 * gh4];
+            self.decoded[p] = vec![0u8; gw4 * gh4];
         }
         // Per-MI (4×4 luma) "block coded coefficients" grid for CDEF skip.
         self.cdef_noskip = vec![0u8; self.geom.mi_cols as usize * self.geom.mi_rows as usize];
@@ -2217,9 +2223,59 @@ impl<'a> Av1Tile<'a> {
                 let span = bw + bh;
                 let corner = span;
                 let mut edge = vec![0i32; 2 * span + 1];
+                // Real top-right / bottom-left neighbour availability (AV1
+                // `prepare_intra_edges`): usable only when that 4×4 is already
+                // decoded AND inside the current superblock's column/row span;
+                // otherwise the edge extends the last in-block sample. `n_tr`/
+                // `n_bl` = how many real neighbour pixels are gathered.
+                let (px4, py4) = (px / 4, py / 4);
+                let (pw4, ph4) = (pw / 4, ph / 4);
+                let (tw4, th4) = (bw / 4, bh / 4);
+                let (ssx, ssy) = if plane == 0 {
+                    (0usize, 0usize)
+                } else {
+                    (self.subsampling_x as usize, self.subsampling_y as usize)
+                };
+                let sb4l = if self.sb_bl == BL_128X128 { 32usize } else { 16 };
+                let sb_right4 = (px4 / (sb4l >> ssx) + 1) * (sb4l >> ssx);
+                let sb_bot4 = (py4 / (sb4l >> ssy) + 1) * (sb4l >> ssy);
+                let n_tr = if have_top
+                    && px4 + tw4 < pw4
+                    && px4 + tw4 < sb_right4
+                    && self.decoded[plane][(py4 - 1) * pw4 + px4 + tw4] != 0
+                {
+                    bw.min(pw - (px + bw))
+                } else {
+                    0
+                };
+                let n_bl = if have_left
+                    && py4 + th4 < ph4
+                    && py4 + th4 < sb_bot4
+                    && self.decoded[plane][(py4 + th4) * pw4 + px4 - 1] != 0
+                {
+                    bh.min(ph - (py + bh))
+                } else {
+                    0
+                };
                 for i in 0..span {
-                    edge[corner + 1 + i] = if i < bw { top[i] } else { top[bw - 1] };
-                    edge[corner - 1 - i] = if i < bh { left[i] } else { left[bh - 1] };
+                    edge[corner + 1 + i] = if i < bw {
+                        top[i]
+                    } else if i - bw < n_tr {
+                        buf[(py - 1) * pw + px + i] as i32
+                    } else if n_tr > 0 {
+                        buf[(py - 1) * pw + px + bw + n_tr - 1] as i32
+                    } else {
+                        top[bw - 1]
+                    };
+                    edge[corner - 1 - i] = if i < bh {
+                        left[i]
+                    } else if i - bh < n_bl {
+                        buf[(py + i) * pw + px - 1] as i32
+                    } else if n_bl > 0 {
+                        buf[(py + bh + n_bl - 1) * pw + px - 1] as i32
+                    } else {
+                        left[bh - 1]
+                    };
                 }
                 // Z2 corner gets the 3-tap intra-edge filter for tw+th >= 6.
                 let mut corner_v = topleft;
@@ -2254,6 +2310,17 @@ impl<'a> Av1Tile<'a> {
             for xx in 0..bw {
                 let r = residual.get(yy * bw + xx).copied().unwrap_or(0);
                 buf[(py + yy) * pw + px + xx] = (pred[yy * bw + xx] + r).clamp(0, 255) as u8;
+            }
+        }
+
+        // Mark this transform block's 4×4 cells reconstructed (intra-edge avail).
+        if !self.decoded[plane].is_empty() {
+            let pw4 = pw / 4;
+            let ph4 = ph / 4;
+            for cy in (py / 4)..((py + bh) / 4).min(ph4) {
+                for cx in (px / 4)..((px + bw) / 4).min(pw4) {
+                    self.decoded[plane][cy * pw4 + cx] = 1;
+                }
             }
         }
 
@@ -3061,6 +3128,50 @@ mod tests {
                 maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
             }
             assert_eq!(maxd, 0, "non-reduced: plane {p} ({pw}x{ph}) differs from dav1d");
+            refoff += n;
+        }
+    }
+
+    /// Directional intra prediction with real top-right / bottom-left neighbours
+    /// (AV1 `BlockDecoded` availability). The edge now gathers the real neighbour
+    /// pixels (was: repeat the last in-block sample) — a safe, regression-free
+    /// improvement (it only changes directional predicted values, never the MSAC).
+    /// IGNORED: not yet bit-exact — a residual Z1/Z3 edge-filter/upsample gap on
+    /// the gathered samples remains (tracked in task #54). Run with `--ignored`.
+    #[test]
+    #[ignore = "directional intra not yet bit-exact — residual z-predictor edge gap (task #54)"]
+    fn directional_intra_matches_dav1d() {
+        use super::super::{
+            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
+            OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+        };
+        let avif = include_bytes!("../fixtures/av1noise.avif");
+        let reference = include_bytes!("../fixtures/av1noise_ref.yuv");
+        let stream = extract_av1_stream(avif).unwrap();
+        let obus = split_obus(&stream).unwrap();
+        let seq = parse_sequence_header(
+            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+        )
+        .unwrap();
+        let frame = obus
+            .iter()
+            .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)
+            .unwrap();
+        let fh = parse_frame_header(&seq, frame.data).unwrap();
+        let off = tile_data_offset(fh.header_bits);
+        let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
+        let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
+        let mut tile = Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+        tile.decode();
+        let mut refoff = 0usize;
+        for p in 0..3 {
+            let (buf, pw, ph) = tile.plane(p);
+            let n = pw * ph;
+            let mut maxd = 0i32;
+            for i in 0..n {
+                maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
+            }
+            assert_eq!(maxd, 0, "directional: plane {p} ({pw}x{ph}) differs from dav1d");
             refoff += n;
         }
     }
