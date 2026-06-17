@@ -4,6 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.40.0] - 2026-06-17
+
+### Changed
+
+- **AVIF: full (non-reduced) sequence + frame header.** `decodeAvif` now decodes
+  AVIFs whose AV1 sequence header is *not* `reduced_still_picture_header` — e.g.
+  produced by ffmpeg/libaom without `-still-picture`, and various other encoders.
+  Previously these failed to parse (the header path returned nothing). The
+  streaming sequence header (timing/decoder-model info, operating-points loop,
+  frame-id numbers, order-hint feature flags) and the KEY-frame frame-header
+  preamble — including the `disable_frame_end_update_cdf` bit the reduced header
+  omits — are parsed bit-exact against dav1d. Only shown KEY/intra stills are
+  decoded; references to previously decoded frames and inter frames are rejected.
+
 ## [0.39.0] - 2026-06-17
 
 ### Changed
