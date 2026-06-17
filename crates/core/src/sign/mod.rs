@@ -1,63 +1,76 @@
-//! Engine-managed digital signatures (non-eIDAS) — zero dependencies.
+//! Engine-managed and imported digital signatures — audited RustCrypto
+//! (`x509-cert`, `cms`, `rsa`, `sha2`).
 //!
-//! Builds a self-signed X.509 certificate and a detached CMS/PKCS#7
-//! `SignedData` (the `adbe.pkcs7.detached` subfilter PDF signatures use), all
-//! from our own [`der`] encoder + [`crate::crypto::rsa`]. The private key is
+//! Builds a self-signed X.509 certificate and a detached CMS/PKCS#7 `SignedData`
+//! (the `adbe.pkcs7.detached` subfilter PDF signatures use). The RSA key is
 //! generated in-engine from host randomness (an ephemeral "digital ID", like
-//! Adobe's self-signed IDs). This signs *content*, it does not assert a
-//! CA-backed identity.
+//! Adobe's self-signed IDs) or imported from a PKCS#12 file ([`pkcs12`]). This
+//! signs *content*; it does not assert a CA-backed identity.
 
-pub mod der;
+pub mod der; // the definite-length DER reader the PKCS#12 importer uses
 pub mod pkcs12;
 
 use crate::crypto::rsa::RsaPrivateKey;
-use crate::crypto::sha256::sha256;
+use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
+use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
+use cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
+use ::der::asn1::UtcTime;
+use ::der::{Decode, Encode};
+use rsa::pkcs1v15::SigningKey;
+use rsa::RsaPublicKey;
+use sha2::{Digest, Sha256};
+use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+use std::str::FromStr;
+use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::name::Name;
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::time::{Time, Validity};
+use x509_cert::Certificate;
 
-// Object identifiers used by the structures below.
-const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
-const OID_SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
-const OID_SHA256: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 2, 1];
-const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
-const OID_SIGNED_DATA: &[u64] = &[1, 2, 840, 113549, 1, 7, 2];
-const OID_DATA: &[u64] = &[1, 2, 840, 113549, 1, 7, 1];
-const OID_CONTENT_TYPE: &[u64] = &[1, 2, 840, 113549, 1, 9, 3];
-const OID_MESSAGE_DIGEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 4];
-
-fn alg_sha256_with_rsa() -> Vec<u8> {
-    der::sequence(&[der::oid(OID_SHA256_WITH_RSA), der::null()])
+/// `id-sha256` (2.16.840.1.101.3.4.2.1).
+fn sha256_alg() -> AlgorithmIdentifierOwned {
+    AlgorithmIdentifierOwned {
+        oid: const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
+        parameters: None,
+    }
 }
 
-fn alg_sha256() -> Vec<u8> {
-    der::sequence(&[der::oid(OID_SHA256), der::null()])
+/// `id-data` (1.2.840.113549.1.7.1) — the detached CMS encapsulated content type.
+fn id_data() -> const_oid::ObjectIdentifier {
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1")
 }
 
-fn rsa_public_key_info(key: &RsaPrivateKey) -> Vec<u8> {
-    let rsa_public_key = der::sequence(&[
-        der::integer(&key.n_bytes_be()),
-        der::integer(&key.e_bytes_be()),
-    ]);
-    der::sequence(&[
-        der::sequence(&[der::oid(OID_RSA_ENCRYPTION), der::null()]),
-        der::bit_string(&rsa_public_key),
-    ])
-}
-
-fn common_name(name: &str) -> Vec<u8> {
-    // Name = SEQUENCE OF RDN; RDN = SET OF AttributeTypeAndValue.
-    der::sequence(&[der::set(&[der::sequence(&[
-        der::oid(OID_COMMON_NAME),
-        der::utf8_string(name),
-    ])])])
+/// Parse a `YYMMDDHHMMSSZ` UTCTime string into an X.509 [`Time`].
+fn parse_utc_time(s: &str) -> Option<Time> {
+    let b = s.as_bytes();
+    if b.len() != 13 || b[12] != b'Z' {
+        return None;
+    }
+    let two = |i: usize| -> Option<u16> {
+        let d0 = (b[i] as char).to_digit(10)?;
+        let d1 = (b[i + 1] as char).to_digit(10)?;
+        Some((d0 * 10 + d1) as u16)
+    };
+    let yy = two(0)?;
+    let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
+    let dt = ::der::DateTime::new(
+        year,
+        two(2)? as u8,
+        two(4)? as u8,
+        two(6)? as u8,
+        two(8)? as u8,
+        two(10)? as u8,
+    )
+    .ok()?;
+    Some(Time::UtcTime(UtcTime::from_date_time(dt).ok()?))
 }
 
 /// An engine-managed signer: a freshly generated RSA key and its self-signed
-/// certificate.
+/// certificate (DER).
 #[derive(Debug, Clone)]
 pub struct Signer {
     key: RsaPrivateKey,
     certificate: Vec<u8>,
-    issuer: Vec<u8>,
-    serial: u32,
 }
 
 impl Signer {
@@ -71,40 +84,39 @@ impl Signer {
         randomness: &[u8],
     ) -> Option<Signer> {
         let key = RsaPrivateKey::generate(bits, randomness)?;
-        let serial = 1u32;
-        let name = common_name(common);
+        let subject = Name::from_str(&format!("CN={common}")).ok()?;
+        let serial = SerialNumber::from(1u32);
+        let validity = Validity {
+            not_before: parse_utc_time(not_before)?,
+            not_after: parse_utc_time(not_after)?,
+        };
+        let pub_key = RsaPublicKey::from(key.inner());
+        let spki = SubjectPublicKeyInfoOwned::from_key(pub_key).ok()?;
+        let signing_key = SigningKey::<Sha256>::new(key.inner().clone());
 
-        let tbs = der::sequence(&[
-            der::context(0, &der::integer_u32(2)), // version v3
-            der::integer_u32(serial),
-            alg_sha256_with_rsa(),
-            name.clone(), // issuer == subject (self-signed)
-            der::sequence(&[der::utc_time(not_before), der::utc_time(not_after)]),
-            name.clone(),
-            rsa_public_key_info(&key),
-        ]);
-
-        let signature = key.sign_sha256(&tbs);
-        let certificate = der::sequence(&[tbs, alg_sha256_with_rsa(), der::bit_string(&signature)]);
-
-        Some(Signer {
-            key,
-            certificate,
-            issuer: name,
+        let builder = CertificateBuilder::new(
+            Profile::Root,
             serial,
-        })
+            validity,
+            subject,
+            spki,
+            &signing_key,
+        )
+        .ok()?;
+        let cert: Certificate = builder.build().ok()?;
+        let certificate = cert.to_der().ok()?;
+
+        Some(Signer { key, certificate })
     }
 
-    /// Build a detached CMS `SignedData` (DER) over `content` — i.e. a PDF
+    /// Build a detached CMS `SignedData` (DER) over `content` — a PDF
     /// `adbe.pkcs7.detached` signature blob for the given signed bytes.
     pub fn detached_cms(&self, content: &[u8]) -> Vec<u8> {
-        build_detached_cms(
-            &self.key,
-            &self.certificate,
-            &self.issuer,
-            &der::integer_u32(self.serial),
-            content,
-        )
+        let cert = match Certificate::from_der(&self.certificate) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        build_detached_cms(&self.key, cert, content).unwrap_or_default()
     }
 
     /// The DER certificate bytes.
@@ -113,109 +125,75 @@ impl Signer {
     }
 }
 
-/// Build a detached CMS `SignedData` (DER) over `content`, signed by `key` and
-/// embedding `cert_der`. The `SignerInfo` references the signer through the
-/// already-encoded `issuer` Name and `serial` INTEGER TLVs (passed verbatim so
-/// they match the certificate byte-for-byte).
-fn build_detached_cms(
-    key: &RsaPrivateKey,
-    cert_der: &[u8],
-    issuer: &[u8],
-    serial: &[u8],
-    content: &[u8],
-) -> Vec<u8> {
-    let message_digest = sha256(content);
+/// Build a detached CMS `SignedData` (DER `ContentInfo`) over `content`, signed
+/// by `key` and embedding `cert`. The `SignerInfo` references the signer through
+/// its issuer + serial number.
+fn build_detached_cms(key: &RsaPrivateKey, cert: Certificate, content: &[u8]) -> Option<Vec<u8>> {
+    let digest = Sha256::digest(content);
+    let signing_key = SigningKey::<Sha256>::new(key.inner().clone());
 
-    // signedAttrs: contentType + messageDigest.
-    let attr_content_type =
-        der::sequence(&[der::oid(OID_CONTENT_TYPE), der::set(&[der::oid(OID_DATA)])]);
-    let attr_message_digest = der::sequence(&[
-        der::oid(OID_MESSAGE_DIGEST),
-        der::set(&[der::octet_string(&message_digest)]),
-    ]);
+    let econtent = EncapsulatedContentInfo {
+        econtent_type: id_data(),
+        econtent: None, // detached
+    };
+    let sid = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+        issuer: cert.tbs_certificate.issuer.clone(),
+        serial_number: cert.tbs_certificate.serial_number.clone(),
+    });
 
-    let attrs = [attr_content_type, attr_message_digest];
-    // The signature is computed over the signedAttrs DER explicitly tagged as a
-    // SET (0x31), per CMS §5.4.
-    let signed_attrs_for_signing = der::set(&attrs);
-    let signature = key.sign_sha256(&signed_attrs_for_signing);
+    let signer_info = SignerInfoBuilder::new(
+        &signing_key,
+        sid,
+        sha256_alg(),
+        &econtent,
+        Some(&digest),
+    )
+    .ok()?;
 
-    // In the SignerInfo the same attributes carry the implicit [0] tag, which
-    // replaces the SET tag around the concatenated attributes.
-    let signed_attrs_tagged = der::context(0, &attrs.concat());
+    let content_info = SignedDataBuilder::new(&econtent)
+        .add_digest_algorithm(sha256_alg())
+        .ok()?
+        .add_certificate(CertificateChoices::Certificate(cert))
+        .ok()?
+        .add_signer_info(signer_info)
+        .ok()?
+        .build()
+        .ok()?;
 
-    let signer_info = der::sequence(&[
-        der::integer_u32(1),                              // version
-        der::sequence(&[issuer.to_vec(), serial.to_vec()]), // issuerAndSerialNumber
-        alg_sha256(),
-        signed_attrs_tagged,
-        der::sequence(&[der::oid(OID_RSA_ENCRYPTION), der::null()]),
-        der::octet_string(&signature),
-    ]);
-
-    let signed_data = der::sequence(&[
-        der::integer_u32(1), // version
-        der::set(&[alg_sha256()]),
-        der::sequence(&[der::oid(OID_DATA)]), // encapContentInfo (detached)
-        der::context(0, cert_der),            // [0] certificates
-        der::set(&[signer_info]),
-    ]);
-
-    der::sequence(&[der::oid(OID_SIGNED_DATA), der::context(0, &signed_data)])
+    content_info.to_der().ok()
 }
 
-/// Detached CMS over `content` for an externally supplied identity — e.g. a
-/// key + certificate imported from a PKCS#12 file ([`pkcs12::parse`]). The
-/// `SignerInfo`'s `issuerAndSerialNumber` is read straight out of `cert_der`.
-/// `None` if the certificate's issuer/serial can't be parsed.
+/// Detached CMS over `content` for an externally supplied identity — e.g. a key
+/// and certificate imported from a PKCS#12 file ([`pkcs12::parse`]). `None` if
+/// the certificate can't be parsed.
 pub fn detached_cms_external(
     key: &RsaPrivateKey,
     cert_der: &[u8],
     content: &[u8],
 ) -> Option<Vec<u8>> {
-    let (issuer, serial) = issuer_and_serial(cert_der)?;
-    Some(build_detached_cms(key, cert_der, &issuer, &serial, content))
+    let cert = Certificate::from_der(cert_der).ok()?;
+    build_detached_cms(key, cert, content)
 }
 
 /// Extract the DER `issuer` Name and `serialNumber` INTEGER from an X.509
-/// certificate, each as its verbatim TLV bytes (for a CMS `issuerAndSerial`).
+/// certificate, each as its verbatim TLV bytes (a quick validity probe + for any
+/// caller that needs the raw `issuerAndSerial` parts).
 pub fn issuer_and_serial(cert_der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    use der::{Reader, TAG_CONTEXT_0, TAG_INTEGER, TAG_SEQUENCE};
-    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
-    let mut top = Reader::new(cert_der);
-    let mut cert = top.descend(TAG_SEQUENCE)?;
-    // TBSCertificate ::= SEQUENCE { [0] version OPTIONAL, serialNumber INTEGER,
-    //                               signature, issuer Name, ... }
-    let mut tbs = cert.descend(TAG_SEQUENCE)?;
-    let (first, first_raw) = tbs.read_raw()?;
-    let serial = if first.tag == TAG_CONTEXT_0 {
-        let (s, raw) = tbs.read_raw()?;
-        (s.tag == TAG_INTEGER).then(|| raw.to_vec())?
-    } else if first.tag == TAG_INTEGER {
-        first_raw.to_vec()
-    } else {
-        return None;
-    };
-    tbs.next_tag(TAG_SEQUENCE)?; // signature AlgorithmIdentifier
-    let (issuer, issuer_raw) = tbs.read_raw()?; // issuer Name
-    (issuer.tag == TAG_SEQUENCE).then(|| (issuer_raw.to_vec(), serial))
+    let cert = Certificate::from_der(cert_der).ok()?;
+    let issuer = cert.tbs_certificate.issuer.to_der().ok()?;
+    let serial = cert.tbs_certificate.serial_number.to_der().ok()?;
+    Some((issuer, serial))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cms::content_info::ContentInfo;
 
-    // Small key keeps the test fast while exercising the full DER assembly.
     fn test_signer() -> Signer {
         let randomness: Vec<u8> = (0..256).map(|i| (i * 53 + 7) as u8).collect();
-        Signer::generate(
-            "GigaPDF Signer",
-            "260614000000Z",
-            "360614000000Z",
-            512,
-            &randomness,
-        )
-        .expect("signer")
+        Signer::generate("GigaPDF Signer", "260614000000Z", "360614000000Z", 1024, &randomness)
+            .expect("signer")
     }
 
     #[test]
@@ -223,25 +201,23 @@ mod tests {
         let signer = test_signer();
         let cert = signer.certificate();
         assert_eq!(cert[0], 0x30, "certificate is a SEQUENCE");
-        // The declared length must match the actual body length.
-        assert!(
-            cert.len() > 200,
-            "non-trivial certificate ({} bytes)",
-            cert.len()
-        );
+        assert!(cert.len() > 200, "non-trivial certificate ({} bytes)", cert.len());
+        // It round-trips through the X.509 parser.
+        assert!(Certificate::from_der(cert).is_ok());
     }
 
     #[test]
-    fn detached_cms_embeds_the_digest_and_signed_data_oid() {
+    fn detached_cms_embeds_the_digest_and_parses() {
         let signer = test_signer();
         let content = b"the exact document bytes that were signed";
         let cms = signer.detached_cms(content);
         assert_eq!(cms[0], 0x30, "ContentInfo is a SEQUENCE");
-        // The SHA-256 of the content must appear (as the messageDigest attr).
-        let digest = sha256(content);
+        let digest = Sha256::digest(content);
         assert!(
-            cms.windows(32).any(|w| w == digest),
+            cms.windows(32).any(|w| w == digest.as_slice()),
             "messageDigest attribute carries the content hash"
         );
+        // It parses back as a CMS ContentInfo.
+        assert!(ContentInfo::from_der(&cms).is_ok());
     }
 }
