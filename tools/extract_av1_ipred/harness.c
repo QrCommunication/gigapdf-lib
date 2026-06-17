@@ -27,6 +27,7 @@ static void pixel_set(pixel*d,int v,int n){for(int i=0;i<n;i++)d[i]=(pixel)v;}
 /* sm_weights table */
 #include "smweights.c"
 /* predictor bodies (extracted from ipred_tmpl.c) */
+#include "dr_deriv.c"
 #include "ipred_body.c"
 #include "filter_body.c"
 
@@ -60,6 +61,8 @@ int main(void){
     ipred_filter_c(out,w,tl,w,h,2,0,0); dump("filter2",out,w,h);
     ipred_filter_c(out,w,tl,w,h,3,0,0); dump("filter3",out,w,h);
     ipred_filter_c(out,w,tl,w,h,4,0,0); dump("filter4",out,w,h);
+    ipred_z1_c(out,w,tl,w,h,1083,0,0); dump("z1a",out,w,h);
+    ipred_z1_c(out,w,tl,w,h,1054,0,0); dump("z1b",out,w,h);
   }
   printf("];\n");
   return 0;

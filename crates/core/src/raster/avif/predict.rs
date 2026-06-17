@@ -256,6 +256,163 @@ pub(super) fn filter(
     out
 }
 
+
+// ---- Directional (Z1/Z2/Z3) edge helpers (dav1d ipred_tmpl.c) -------------
+
+/// `dav1d_dr_intra_derivative[44]` — directional intra slope per (angle>>1).
+/// Zero entries are unused. From dav1d `src/tables.c` (BSD-2-Clause).
+pub(super) static DR_INTRA_DERIVATIVE: [i32; 44] = [
+    0, 1023, 0, 547, 372, 0, 0, 273, 215, 0, 178,
+    151, 0, 132, 116, 0, 102, 0, 90, 80, 0, 71,
+    64, 0, 57, 51, 0, 45, 0, 40, 35, 0, 31,
+    27, 0, 23, 19, 0, 15, 0, 11, 0, 7, 3,
+];
+/// `get_filter_strength`: intra-edge low-pass strength (0=off..3) by block size,
+/// angle-from-orthogonal and the smooth-neighbour flag.
+pub(super) fn get_filter_strength(wh: i32, angle: i32, is_sm: bool) -> i32 {
+    if is_sm {
+        if wh <= 8 {
+            if angle >= 64 { return 2; }
+            if angle >= 40 { return 1; }
+        } else if wh <= 16 {
+            if angle >= 48 { return 2; }
+            if angle >= 20 { return 1; }
+        } else if wh <= 24 {
+            if angle >= 4 { return 3; }
+        } else {
+            return 3;
+        }
+    } else if wh <= 8 {
+        if angle >= 56 { return 1; }
+    } else if wh <= 16 {
+        if angle >= 40 { return 1; }
+    } else if wh <= 24 {
+        if angle >= 32 { return 3; }
+        if angle >= 16 { return 2; }
+        if angle >= 8 { return 1; }
+    } else if wh <= 32 {
+        if angle >= 32 { return 3; }
+        if angle >= 4 { return 2; }
+        return 1;
+    } else {
+        return 3;
+    }
+    0
+}
+
+/// `get_upsample`: whether to 2× upsample the reference edge.
+pub(super) fn get_upsample(wh: i32, angle: i32, is_sm: bool) -> bool {
+    angle < 40 && wh <= (16 >> is_sm as i32)
+}
+
+/// `filter_edge`: 5-tap low-pass over `inp[from..to]` (clamped), writing `sz`
+/// samples to `out`. `inp_at(k)` = dav1d `in[iclip(k, from, to-1)]`.
+pub(super) fn filter_edge(
+    out: &mut [i32],
+    sz: usize,
+    lim_from: usize,
+    lim_to: usize,
+    inp: &dyn Fn(i32) -> i32,
+    strength: usize,
+) {
+    const KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+    let mut i = 0usize;
+    while i < sz.min(lim_from) {
+        out[i] = inp(i as i32);
+        i += 1;
+    }
+    while i < lim_to.min(sz) {
+        let mut s = 0i32;
+        for (j, &k) in KERNEL[strength - 1].iter().enumerate() {
+            s += inp(i as i32 - 2 + j as i32) * k;
+        }
+        out[i] = (s + 8) >> 4;
+        i += 1;
+    }
+    while i < sz {
+        out[i] = inp(i as i32);
+        i += 1;
+    }
+}
+
+/// `upsample_edge`: 2× upsample `hsz` samples with a [-1,9,9,-1] interpolation.
+pub(super) fn upsample_edge(out: &mut [i32], hsz: usize, inp: &dyn Fn(i32) -> i32) {
+    const KERNEL: [i32; 4] = [-1, 9, 9, -1];
+    let mut i = 0usize;
+    while i < hsz - 1 {
+        out[i * 2] = inp(i as i32);
+        let mut s = 0i32;
+        for (j, &k) in KERNEL.iter().enumerate() {
+            s += inp(i as i32 + j as i32 - 1) * k;
+        }
+        out[i * 2 + 1] = ((s + 8) >> 4).clamp(0, 255);
+        i += 1;
+    }
+    out[i * 2] = inp(i as i32);
+}
+
+/// Directional Z1 predictor (angle < 90, uses the top edge). `tl` is the edge
+/// buffer with the corner at index `corner`, top samples at `corner+1+i` (incl.
+/// the top-right extension). `angle_full` carries the angle (bits 0-8) plus the
+/// `is_sm` (bit 9) and `enable_intra_edge_filter` (bit 10) flags. dav1d `ipred_z1_c`.
+pub(super) fn z1(bw: usize, bh: usize, angle_full: i32, tl: &[i32], corner: usize) -> Vec<i32> {
+    let is_sm = (angle_full >> 9) & 1 != 0;
+    let enable = angle_full >> 10 != 0;
+    let angle = angle_full & 511;
+    let mut dx = DR_INTRA_DERIVATIVE[(angle >> 1) as usize];
+    let wh = (bw + bh) as i32;
+    let from = -1i32;
+    let to = (bw + bw.min(bh)) as i32;
+    let inn = |k: i32| -> i32 {
+        let c = k.clamp(from, to - 1);
+        tl[(corner as i32 + 1 + c) as usize]
+    };
+    let upsample = enable && get_upsample(wh, 90 - angle, is_sm);
+    let mut buf = vec![0i32; 2 * (bw + bh) + 16];
+    let top: Vec<i32>;
+    let max_base_x;
+    if upsample {
+        upsample_edge(&mut buf, bw + bh, &inn);
+        top = buf;
+        max_base_x = 2 * (bw + bh) - 2;
+        dx <<= 1;
+    } else {
+        let fs = if enable { get_filter_strength(wh, 90 - angle, is_sm) } else { 0 };
+        if fs != 0 {
+            filter_edge(&mut buf, bw + bh, 0, bw + bh, &inn, fs as usize);
+            top = buf;
+            max_base_x = bw + bh - 1;
+        } else {
+            max_base_x = bw + bw.min(bh) - 1;
+            top = (0..=max_base_x + 1).map(|i| inn(i as i32)).collect();
+        }
+    }
+    let base_inc = 1 + upsample as usize;
+    let mut out = vec![0i32; bw * bh];
+    let mut xpos = dx;
+    for y in 0..bh {
+        let frac = xpos & 0x3E;
+        let mut base = (xpos >> 6) as usize;
+        let mut x = 0;
+        while x < bw {
+            if base < max_base_x {
+                let v = top[base] * (64 - frac) + top[base + 1] * frac;
+                out[y * bw + x] = (v + 32) >> 6;
+                base += base_inc;
+                x += 1;
+            } else {
+                let fill = top[max_base_x];
+                for xx in x..bw {
+                    out[y * bw + xx] = fill;
+                }
+                break;
+            }
+        }
+        xpos += dx;
+    }
+    out
+}
+
 /// Chroma-from-luma final blend (`cfl_pred`): `chroma = clip(dc + sign(d) *
 /// ((|d| + 32) >> 6))` where `d = alpha * ac`. `ac` is the mean-removed,
 /// subsampled luma AC; `dc` the chroma DC prediction; `alpha` the signed CfL gain.
@@ -321,11 +478,11 @@ mod tests {
 
     #[test]
     fn predictors_match_dav1d() {
-        // IPRED_REF order per size (stride 12): dc, v, h, paeth, smooth,
-        // smooth_v, smooth_h, filter0..filter4.
+        // IPRED_REF order per size (stride 14): dc, v, h, paeth, smooth,
+        // smooth_v, smooth_h, filter0..filter4, z1a, z1b.
         for (si, &n) in [4usize, 8].iter().enumerate() {
             let (top, left, tl) = edges(n);
-            let base = si * 12;
+            let base = si * 14;
             let modes = [
                 DC_PRED,
                 VERT_PRED,
@@ -343,6 +500,18 @@ mod tests {
                 let out = filter(n, n, &top, &left, tl, fi);
                 assert_eq!(out, IPRED_REF[base + 7 + fi], "filter {fi} size {n}");
             }
+            // Z1 directional: a unified edge buffer (corner + top/topright +
+            // left/bottomleft) matching the harness's `setedge`.
+            let span = 2 * n;
+            let corner = span;
+            let mut buf = vec![0i32; 2 * span + 2];
+            buf[corner] = 100;
+            for i in 0..span {
+                buf[corner + 1 + i] = 130 + 3 * i as i32;
+                buf[corner - 1 - i] = 110 - 2 * i as i32;
+            }
+            assert_eq!(z1(n, n, 1083, &buf, corner), IPRED_REF[base + 12], "z1a size {n}");
+            assert_eq!(z1(n, n, 1054, &buf, corner), IPRED_REF[base + 13], "z1b size {n}");
         }
     }
 
