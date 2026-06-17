@@ -15,6 +15,7 @@
 //! event loop, timers, async/`await` or `Promise` in the first stages.
 
 pub mod ast;
+pub mod boa;
 pub mod builtins;
 pub mod bytecode;
 pub mod compile;
@@ -28,7 +29,9 @@ pub mod value;
 pub mod vm;
 
 pub use ast::Program;
-pub use dom::run_inline_scripts;
+// The HTML renderer's inline-`<script>` path now runs on Boa (see [`boa`]). The
+// hand-written `dom`/`interp` engine is retained for now but no longer wired in.
+pub use boa::run_inline_scripts;
 pub use interp::{Abrupt, Eval, Interp};
 pub use lexer::{tokenize, LexError, Lexer};
 pub use parser::{parse, ParseError};
