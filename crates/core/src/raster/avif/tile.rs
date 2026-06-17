@@ -362,13 +362,21 @@ use super::scan::SCANS;
 pub(crate) mod mode {
     pub const DC_PRED: u8 = 0;
     pub const VERT_PRED: u8 = 1;
+    pub const HOR_PRED: u8 = 2;
     pub const VERT_LEFT_PRED: u8 = 8;
+    pub const SMOOTH_PRED: u8 = 9;
+    pub const SMOOTH_V_PRED: u8 = 10;
+    pub const SMOOTH_H_PRED: u8 = 11;
     pub const PAETH_PRED: u8 = 12;
     pub const N_INTRA_PRED_MODES: u8 = 13;
     pub const CFL_PRED: u8 = 13;
     pub const N_UV_INTRA_PRED_MODES: u8 = 14;
     pub const FILTER_PRED: u8 = 13;
 }
+
+/// `dav1d_av1_mode_to_angle_map` — nominal angle (degrees) for the directional
+/// modes `VERT_PRED..=VERT_LEFT_PRED`, before adding `3 * angle_delta`.
+pub(crate) static AV1_MODE_TO_ANGLE_MAP: [i32; 8] = [90, 180, 45, 135, 113, 157, 203, 67];
 
 /// `dav1d_intra_mode_context[mode]` — maps a neighbour's intra mode to one of 5
 /// contexts for the keyframe Y-mode CDF (`cdf::KF_Y_MODE[above_ctx][left_ctx]`).
@@ -776,6 +784,9 @@ pub(crate) struct Av1Tile<'a> {
     subsampling_x: bool,
     subsampling_y: bool,
     enable_filter_intra: bool,
+    /// `seq_hdr.enable_intra_edge_filter` — gates directional edge low-pass +
+    /// upsampling (`angle | enable<<10`) and the Z2 corner 3-tap filter.
+    intra_edge_filter: bool,
     tx_mode_select: bool,
     reduced_tx_set: bool,
     allow_screen_content_tools: bool,
@@ -784,6 +795,10 @@ pub(crate) struct Av1Tile<'a> {
     /// Above/left neighbour Y-mode (per 4×4) for the keyframe Y-mode context.
     above_mode: Vec<u8>,
     left_mode: [u8; 32],
+    /// Above/left neighbour UV-mode (per 4×4, luma-indexed) for the chroma
+    /// smooth-neighbour flag (`sm_uv_flag`) used by directional edge filtering.
+    above_uvmode: Vec<u8>,
+    left_uvmode: [u8; 32],
     above_skip: Vec<u8>,
     left_skip: [u8; 32],
     /// Above/left neighbour tx log2-dim for the tx-size context (`-1` = unset).
@@ -855,6 +870,7 @@ impl<'a> Av1Tile<'a> {
             subsampling_x: seq.subsampling_x != 0,
             subsampling_y: seq.subsampling_y != 0,
             enable_filter_intra: seq.enable_filter_intra,
+            intra_edge_filter: seq.enable_intra_edge_filter,
             tx_mode_select: fh.tx_mode_select,
             reduced_tx_set: fh.reduced_tx_set,
             allow_screen_content_tools: fh.allow_screen_content_tools,
@@ -862,6 +878,8 @@ impl<'a> Av1Tile<'a> {
             left_partition: [0u8; 16],
             above_mode: vec![mode::DC_PRED; cols + 32],
             left_mode: [mode::DC_PRED; 32],
+            above_uvmode: vec![mode::DC_PRED; cols + 32],
+            left_uvmode: [mode::DC_PRED; 32],
             above_skip: vec![0u8; cols + 32],
             left_skip: [0u8; 32],
             above_tx: vec![-1i8; cols + 32],
@@ -884,6 +902,7 @@ impl<'a> Av1Tile<'a> {
             // Reset the left neighbour contexts at the start of each SB row.
             self.left_partition = [0u8; 16];
             self.left_mode = [mode::DC_PRED; 32];
+            self.left_uvmode = [mode::DC_PRED; 32];
             self.left_skip = [0u8; 32];
             self.left_tx = [-1i8; 32];
             self.left_pal = [0u8; 32];
@@ -967,10 +986,20 @@ impl<'a> Av1Tile<'a> {
         let n_y = (mode::N_INTRA_PRED_MODES - 1) as usize;
         let mut y_mode = self.msac.symbol_adapt(&mut self.cdf.kfym[a_ctx][l_ctx], n_y) as u8;
 
-        // Y angle delta (directional modes, blocks ≥ 8×8).
+        // Smooth-neighbour flags for directional edge filtering (`sm_flag`), sampled
+        // from the neighbour modes BEFORE this block overwrites them.
+        let is_smooth = |m: u8| {
+            m == mode::SMOOTH_PRED || m == mode::SMOOTH_V_PRED || m == mode::SMOOTH_H_PRED
+        };
+        let is_sm_y = is_smooth(self.above_mode[acol]) || is_smooth(self.left_mode[by4]);
+        let is_sm_uv = is_smooth(self.above_uvmode[acol]) || is_smooth(self.left_uvmode[by4]);
+
+        // Y angle delta (directional modes, blocks ≥ 8×8): the directional angle is
+        // `base + 3 * delta`, with delta in [-3, 3] (symbol 0..6 minus 3).
+        let mut y_angle_delta = 0i32;
         if lw + lh >= 2 && (mode::VERT_PRED..=mode::VERT_LEFT_PRED).contains(&y_mode) {
             let idx = (y_mode - mode::VERT_PRED) as usize;
-            self.msac.symbol_adapt(&mut self.cdf.angle_delta[idx], 6);
+            y_angle_delta = self.msac.symbol_adapt(&mut self.cdf.angle_delta[idx], 6) as i32 - 3;
         }
 
         // Chroma intra mode (+ CfL) when this block carries chroma samples.
@@ -982,6 +1011,7 @@ impl<'a> Av1Tile<'a> {
         let mut uv_mode = mode::DC_PRED;
         // CfL alpha [u, v] (signed magnitude, decoded when uv_mode == CFL_PRED).
         let mut cfl_alpha = [0i32; 2];
+        let mut uv_angle_delta = 0i32;
         if has_chroma {
             let cfl_allowed = bw4 <= 8 && bh4 <= 8;
             let n_uv = (mode::N_UV_INTRA_PRED_MODES - 1) as usize - (!cfl_allowed as usize);
@@ -1005,7 +1035,7 @@ impl<'a> Av1Tile<'a> {
                 }
             } else if lw + lh >= 2 && (mode::VERT_PRED..=mode::VERT_LEFT_PRED).contains(&uv_mode) {
                 let idx = (uv_mode - mode::VERT_PRED) as usize;
-                self.msac.symbol_adapt(&mut self.cdf.angle_delta[idx], 6);
+                uv_angle_delta = self.msac.symbol_adapt(&mut self.cdf.angle_delta[idx], 6) as i32 - 3;
             }
         }
 
@@ -1111,6 +1141,7 @@ impl<'a> Av1Tile<'a> {
         } else {
             self.decode_residuals(
                 mi_row, mi_col, bs, tx, uvtx, y_mode, y_angle, uv_mode, cfl_alpha, has_chroma,
+                y_angle_delta, uv_angle_delta, is_sm_y, is_sm_uv,
             );
         }
 
@@ -1123,12 +1154,14 @@ impl<'a> Av1Tile<'a> {
         for i in 0..bw4 as usize {
             if acol + i < self.above_mode.len() {
                 self.above_mode[acol + i] = y_nofilt;
+                self.above_uvmode[acol + i] = uv_mode;
                 self.above_skip[acol + i] = skip as u8;
             }
         }
         for i in 0..bh4 as usize {
             if by4 + i < 32 {
                 self.left_mode[by4 + i] = y_nofilt;
+                self.left_uvmode[by4 + i] = uv_mode;
                 self.left_skip[by4 + i] = skip as u8;
             }
         }
@@ -1542,9 +1575,10 @@ impl<'a> Av1Tile<'a> {
 
     /// Reconstruct one transform block into a pixel plane: intra-predict from the
     /// already-reconstructed top/left neighbours, inverse-transform the residual,
-    /// add and clip. Only DC prediction is implemented so far (the fixture's block
-    /// is DC_PRED with no neighbours → flat 128); other modes fall back to DC until
-    /// their predictors land. `(px, py)` and `(bw, bh)` are in plane pixels.
+    /// add and clip. Covers DC/V/H/Paeth/Smooth, filter-intra (luma), CfL (chroma)
+    /// and the directional Z1/Z2/Z3 modes (resolved from `angle_delta` via the
+    /// `prepare_intra_edges` Z-path; topright/bottomleft availability is the one
+    /// remaining gap — currently repeat-last). `(px, py)`/`(bw, bh)` in plane pixels.
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_tx(
         &mut self,
@@ -1560,6 +1594,8 @@ impl<'a> Av1Tile<'a> {
         tx: usize,
         txtp: u8,
         eob: i32,
+        angle_delta: i32,
+        is_sm: bool,
     ) {
         let pw = self.plane_w[plane];
         let ph = self.plane_h[plane];
@@ -1602,7 +1638,7 @@ impl<'a> Av1Tile<'a> {
             128
         };
 
-        // Luma filter-intra, chroma CfL, or the standard intra predictors.
+        // Luma filter-intra, chroma CfL, or the standard / directional predictors.
         let pred = if plane == 0 && mode == predict::FILTER_PRED {
             predict::filter(bw, bh, &top, &left, topleft, filt_idx)
         } else if plane != 0 && mode == predict::CFL_PRED {
@@ -1610,7 +1646,60 @@ impl<'a> Av1Tile<'a> {
             let ac = self.cfl_ac(px, py, bw, bh);
             predict::cfl_apply(dc, &ac, cfl_alpha)
         } else {
-            predict::predict(mode, have_top, have_left, bw, bh, &top, &left, topleft)
+            // Resolve directional modes (`VERT_PRED..=VERT_LEFT_PRED`) into Z1/Z2/Z3
+            // or fall back to VERT/HOR, mirroring `dav1d_prepare_intra_edges`.
+            let mut m = mode;
+            let mut z = 0u8; // 0 = none, 1 = Z1, 2 = Z2, 3 = Z3
+            let mut z_angle = 0i32;
+            if (mode::VERT_PRED..=mode::VERT_LEFT_PRED).contains(&mode) {
+                let angle = AV1_MODE_TO_ANGLE_MAP[(mode - mode::VERT_PRED) as usize] + 3 * angle_delta;
+                if angle <= 90 {
+                    if angle < 90 && have_top {
+                        z = 1;
+                        z_angle = angle;
+                    } else {
+                        m = mode::VERT_PRED;
+                    }
+                } else if angle < 180 {
+                    z = 2;
+                    z_angle = angle;
+                } else if angle > 180 && have_left {
+                    z = 3;
+                    z_angle = angle;
+                } else {
+                    m = mode::HOR_PRED;
+                }
+            }
+            if z != 0 {
+                // Unified directional edge buffer (predict.rs convention): corner at
+                // `corner`, top+topright at `corner+1+i`, left+bottomleft at
+                // `corner-1-i`. Topright/bottomleft are treated as unavailable here
+                // (origin & the common case) → repeat the last in-block sample, as
+                // dav1d does when the EDGE_*_HAS_* flag is absent. (Threading the real
+                // availability from `decode_sb` is the next refinement.)
+                let span = bw + bh;
+                let corner = span;
+                let mut edge = vec![0i32; 2 * span + 1];
+                for i in 0..span {
+                    edge[corner + 1 + i] = if i < bw { top[i] } else { top[bw - 1] };
+                    edge[corner - 1 - i] = if i < bh { left[i] } else { left[bh - 1] };
+                }
+                // Z2 corner gets the 3-tap intra-edge filter for tw+th >= 6.
+                let mut corner_v = topleft;
+                if z == 2 && (bw >> 2) + (bh >> 2) >= 6 && self.intra_edge_filter {
+                    corner_v = ((left[0] + top[0]) * 5 + topleft * 6 + 8) >> 4;
+                }
+                edge[corner] = corner_v;
+                let angle_full =
+                    z_angle | (is_sm as i32) << 9 | (self.intra_edge_filter as i32) << 10;
+                match z {
+                    1 => predict::z1(bw, bh, angle_full, &edge, corner),
+                    2 => predict::z2(bw, bh, angle_full, &edge, corner, pw - px, ph - py),
+                    _ => predict::z3(bw, bh, angle_full, &edge, corner),
+                }
+            } else {
+                predict::predict(m, have_top, have_left, bw, bh, &top, &left, topleft)
+            }
         };
 
         // Residual (skipped block → none).
@@ -1657,6 +1746,10 @@ impl<'a> Av1Tile<'a> {
         uv_mode: u8,
         cfl_alpha: [i32; 2],
         has_chroma: bool,
+        y_angle_delta: i32,
+        uv_angle_delta: i32,
+        is_sm_y: bool,
+        is_sm_uv: bool,
     ) {
         let dim = BLOCK_DIMENSIONS[bs as usize];
         let (bw4, bh4) = (dim[0] as i32, dim[1] as i32);
@@ -1705,6 +1798,8 @@ impl<'a> Av1Tile<'a> {
                             tx,
                             txtp,
                             eob,
+                            y_angle_delta,
+                            is_sm_y,
                         );
                         let cw = tw.min(mic - (mi_col as i32 + x)).max(0) as usize;
                         let cht = th.min(mir - (mi_row as i32 + y)).max(0) as usize;
@@ -1758,6 +1853,8 @@ impl<'a> Av1Tile<'a> {
                                     uvtx,
                                     txtp,
                                     eob,
+                                    uv_angle_delta,
+                                    is_sm_uv,
                                 );
                                 // Luma-space position of this chroma block for the edge clamp.
                                 let lx = mi_col as i32 + (x << ss_h);
