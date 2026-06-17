@@ -4,22 +4,33 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.41.0] - 2026-06-17
+
+### Fixed
+
+- **AVIF: mixed 2D transforms (ADST/DCT) used the wrong row vs column axis.**
+  The inverse transform applied the *vertical* 1D type to the rows and the
+  *horizontal* one to the columns, so `ADST_DCT` (and every other mixed type)
+  ran its ADST across the rows instead of down the columns. The symmetric types
+  (DCT_DCT, ADST_ADST, FLIPADST_FLIPADST, IDTX) are swap-invariant, which hid
+  the bug until a still used a mixed type — the common case for real-world
+  AVIFs, whose intra residual leans heavily on ADST. The reconstruction is now
+  bit-exact vs dav1d. Versions before this corrupted most photographic AVIFs.
 
 ### Changed
 
 - **AVIF: multi-strength CDEF (`cdef_bits > 0`).** The CDEF stage now reads the
-  per-64×64 `cdef_idx` from the tile stream (once per filter unit, after the skip
-  flag) and selects the matching primary/secondary strength pair per plane,
+  per-64×64 `cdef_idx` from the tile stream (once per filter unit, after the
+  skip flag) and selects the matching primary/secondary strength pair per plane,
   rather than assuming a single strength set. Bit-exact against dav1d on
   single-strength fixtures; the multi-strength read position is verified
   sync-correct (with-read vs no-read divergence proof).
 - **AVIF: directional intra real-neighbour edges.** Directional predictors
-  (Z1/Z2/Z3) now gather the true top-right / bottom-left samples via a
-  `BlockDecoded` availability grid instead of repeating the last edge sample,
-  closing most of the residual error on noisy/dithered content. A fully
-  bit-exact edge filter / upsample for the steepest angles is still in progress
-  (tracked).
+  (Z1/Z2/Z3) gather the true top-right / bottom-left samples via a
+  `BlockDecoded` availability grid instead of repeating the last edge sample.
+  Together with the transform fix above, the whole AVIF intra path — mixed
+  transforms, Z1/Z2/Z3 directional, palette, CDEF and deblocking in a single
+  frame — is now validated bit-exact vs dav1d on a 64×64 noise still.
 
 ## [0.40.0] - 2026-06-17
 
