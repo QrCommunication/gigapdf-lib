@@ -1786,19 +1786,7 @@ pub extern "C" fn gp_html_to_pdf(
 #[no_mangle]
 pub extern "C" fn gp_js_eval(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
     let src = unsafe { str_arg(ptr, len) };
-    let out = match gigapdf_core::js::parse(src) {
-        Ok(prog) => {
-            let mut it = gigapdf_core::js::Interp::new();
-            match it.run(&prog) {
-                Ok(v) => it.to_string_v(&v).unwrap_or_default(),
-                Err(gigapdf_core::js::Abrupt::Throw(e)) => {
-                    format!("Uncaught {}", it.to_string_v(&e).unwrap_or_default())
-                }
-                Err(_) => String::from("Uncaught error"),
-            }
-        }
-        Err(e) => format!("SyntaxError: {e}"),
-    };
+    let out = gigapdf_core::js::eval(src);
     unsafe { bytes_into_host(out.into_bytes(), out_len) }
 }
 
