@@ -349,6 +349,7 @@ fn gather_left_partition_prob(c: &[u16], bl: u8) -> u32 {
 // ── Tile decoder: the partition tree driven by the entropy decoder ────────────
 
 use super::cdf;
+use super::deblock;
 use super::itx;
 use super::msac::Msac;
 use super::predict;
@@ -813,6 +814,20 @@ pub(crate) struct Av1Tile<'a> {
     above_ccoef: [Vec<u8>; 2],
     left_ccoef: [[u8; 32]; 2],
     pub blocks_visited: u32,
+    // ── Deblock (§7.14) per-4×4 grid, per plane (filled during reconstruction) ──
+    /// Transform width/height in 4-px units covering each 4×4 grid cell.
+    db_tx_w4: [Vec<u8>; 3],
+    db_tx_h4: [Vec<u8>; 3],
+    /// Edge flags per 4×4: bit0 = vertical (left) tx-block edge, bit1 = horizontal (top).
+    db_edge: [Vec<u8>; 3],
+    /// Grid dimensions (4×4 units) per plane.
+    db_gw4: [usize; 3],
+    db_gh4: [usize; 3],
+    /// Derived deblock level per `[Yv, Yh, U, V]` (intra, constant: no seg/delta_lf).
+    db_level: [u8; 4],
+    /// Frame `loop_filter_sharpness` (for the FilterLUT) + base Y levels (the on/off gate).
+    db_sharpness: u32,
+    db_level_y: [u32; 2],
 }
 
 impl<'a> Av1Tile<'a> {
@@ -891,11 +906,34 @@ impl<'a> Av1Tile<'a> {
             above_ccoef: [vec![0x40u8; cols + 32], vec![0x40u8; cols + 32]],
             left_ccoef: [[0x40u8; 32]; 2],
             blocks_visited: 0,
+            db_tx_w4: [Vec::new(), Vec::new(), Vec::new()],
+            db_tx_h4: [Vec::new(), Vec::new(), Vec::new()],
+            db_edge: [Vec::new(), Vec::new(), Vec::new()],
+            db_gw4: [0; 3],
+            db_gh4: [0; 3],
+            db_level: [
+                deblock::lf_level(fh.loop_filter_level[0] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
+                deblock::lf_level(fh.loop_filter_level[1] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
+                deblock::lf_level(fh.loop_filter_level[2] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
+                deblock::lf_level(fh.loop_filter_level[3] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
+            ],
+            db_sharpness: fh.loop_filter_sharpness,
+            db_level_y: [fh.loop_filter_level[0], fh.loop_filter_level[1]],
         }
     }
 
     /// Decode the whole tile by walking its superblock grid.
     pub fn decode(&mut self) {
+        // Allocate the deblock per-4×4 grids (one per plane).
+        let nplanes = if self.mono_chrome { 1 } else { 3 };
+        for p in 0..nplanes {
+            let (gw4, gh4) = (self.plane_w[p] / 4, self.plane_h[p] / 4);
+            self.db_gw4[p] = gw4;
+            self.db_gh4[p] = gh4;
+            self.db_tx_w4[p] = vec![0u8; gw4 * gh4];
+            self.db_tx_h4[p] = vec![0u8; gw4 * gh4];
+            self.db_edge[p] = vec![0u8; gw4 * gh4];
+        }
         let sb4: u32 = if self.sb_bl == BL_128X128 { 32 } else { 16 };
         let mut row = 0;
         while row < self.geom.mi_rows {
@@ -914,6 +952,65 @@ impl<'a> Av1Tile<'a> {
                 col += sb4;
             }
             row += sb4;
+        }
+        self.apply_deblock();
+    }
+
+    /// Apply the deblocking loop filter (§7.14) over the reconstructed planes,
+    /// using the per-4×4 tx-edge grid. Vertical edges first, then horizontal, per
+    /// plane (dav1d `lf_apply` / `loop_filter_{h,v}_sb`).
+    fn apply_deblock(&mut self) {
+        // Frame-level gate: no luma loop filter ⇒ no deblock at all.
+        if self.db_level_y[0] == 0 && self.db_level_y[1] == 0 {
+            return;
+        }
+        let lut = deblock::calc_eih(self.db_sharpness);
+        let nplanes = if self.mono_chrome { 1 } else { 3 };
+        for p in 0..nplanes {
+            let is_chroma = p != 0;
+            let pw = self.plane_w[p];
+            let (gw4, gh4) = (self.db_gw4[p], self.db_gh4[p]);
+            // Level per (plane, direction): [Yv, Yh] for luma; U or V for chroma.
+            let (lvl_v, lvl_h) = match p {
+                0 => (self.db_level[0] as i32, self.db_level[1] as i32),
+                1 => (self.db_level[2] as i32, self.db_level[2] as i32),
+                _ => (self.db_level[3] as i32, self.db_level[3] as i32),
+            };
+            // Vertical edges (filter across columns): stride_a = pw (down a row),
+            // stride_b = 1 (across the edge).
+            if lvl_v != 0 {
+                let l = lvl_v as usize;
+                let (e, i, h) = (lut.e[l], lut.i[l], lvl_v >> 4);
+                for gy in 0..gh4 {
+                    for gx in 1..gw4 {
+                        let idx = gy * gw4 + gx;
+                        if self.db_edge[p][idx] & 1 == 0 {
+                            continue;
+                        }
+                        let wmin = (self.db_tx_w4[p][idx].min(self.db_tx_w4[p][idx - 1]) as i32) * 4;
+                        let wd = deblock::lf_wd(wmin, is_chroma);
+                        let pos = gy * 4 * pw + gx * 4;
+                        deblock::loop_filter(&mut self.planes[p], pos, e, i, h, pw as isize, 1, wd);
+                    }
+                }
+            }
+            // Horizontal edges (filter across rows): stride_a = 1, stride_b = pw.
+            if lvl_h != 0 {
+                let l = lvl_h as usize;
+                let (e, i, h) = (lut.e[l], lut.i[l], lvl_h >> 4);
+                for gy in 1..gh4 {
+                    for gx in 0..gw4 {
+                        let idx = gy * gw4 + gx;
+                        if self.db_edge[p][idx] & 2 == 0 {
+                            continue;
+                        }
+                        let hmin = (self.db_tx_h4[p][idx].min(self.db_tx_h4[p][idx - gw4]) as i32) * 4;
+                        let wd = deblock::lf_wd(hmin, is_chroma);
+                        let pos = gy * 4 * pw + gx * 4;
+                        deblock::loop_filter(&mut self.planes[p], pos, e, i, h, 1, pw as isize, wd);
+                    }
+                }
+            }
         }
     }
 
@@ -1719,6 +1816,43 @@ impl<'a> Av1Tile<'a> {
                 buf[(py + yy) * pw + px + xx] = (pred[yy * bw + xx] + r).clamp(0, 255) as u8;
             }
         }
+
+        // Record this tx block into the per-4×4 deblock grid: its dimensions (in
+        // 4-px units) for every cell it covers, plus the left (vertical) and top
+        // (horizontal) tx-edge flags on the block's leftmost column / topmost row.
+        // The apply pass (§7.14) reads these to pick the filter width and locate
+        // edges. Clamp coverage to the grid bounds at the frame edge.
+        let (gw4, gh4) = (self.db_gw4[plane], self.db_gh4[plane]);
+        if gw4 > 0 && gh4 > 0 {
+            let (gx0, gy0) = (px / 4, py / 4);
+            let cells_w = (bw / 4).max(1);
+            let cells_h = (bh / 4).max(1);
+            let txw = (bw / 4).clamp(1, 255) as u8;
+            let txh = (bh / 4).clamp(1, 255) as u8;
+            for cy in 0..cells_h {
+                let gy = gy0 + cy;
+                if gy >= gh4 {
+                    break;
+                }
+                for cx in 0..cells_w {
+                    let gx = gx0 + cx;
+                    if gx >= gw4 {
+                        break;
+                    }
+                    let idx = gy * gw4 + gx;
+                    self.db_tx_w4[plane][idx] = txw;
+                    self.db_tx_h4[plane][idx] = txh;
+                    let mut e = 0u8;
+                    if cx == 0 {
+                        e |= 1; // left / vertical tx edge
+                    }
+                    if cy == 0 {
+                        e |= 2; // top / horizontal tx edge
+                    }
+                    self.db_edge[plane][idx] |= e;
+                }
+            }
+        }
     }
 
     /// A reconstructed plane (`0=Y, 1=U, 2=V`) as `(pixels, width, height)`.
@@ -2336,6 +2470,58 @@ mod tests {
         assert!(tile.blocks_visited > 0, "no blocks visited");
         assert!((0x8000..=0xffff).contains(&rng), "msac rng out of range: {rng:#x}");
         assert!(pos >= blen.saturating_sub(8), "msac consumed only {pos}/{blen} bytes");
+    }
+
+    /// End-to-end deblocking loop filter (§7.14): a 64×64 still with the loop
+    /// filter ON (lf=[4,4,8,0], sharpness 0, delta enabled) and CDEF + loop
+    /// restoration OFF, so the decoded planes must match dav1d's YUV reference
+    /// EXACTLY once the deblock pass runs. Validates the per-4×4 tx-edge grid,
+    /// the FilterLUT/level derivation, the width selection, and the V/H apply
+    /// passes together — a zero gap on every plane proves the whole chain.
+    #[test]
+    fn deblock_matches_dav1d() {
+        use super::super::{
+            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
+            OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+        };
+        let avif = include_bytes!("../fixtures/av1deblock.avif");
+        let reference = include_bytes!("../fixtures/av1deblock_ref.yuv");
+        let stream = extract_av1_stream(avif).unwrap();
+        let obus = split_obus(&stream).unwrap();
+        let seq = parse_sequence_header(
+            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+        )
+        .unwrap();
+        let frame = obus
+            .iter()
+            .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)
+            .unwrap();
+        let fh = parse_frame_header(&seq, frame.data).unwrap();
+        // Guard the fixture's premise: deblock ON, CDEF + restoration OFF (so the
+        // only post-reconstruction stage is the loop filter we're validating).
+        assert_ne!(
+            (fh.loop_filter_level[0], fh.loop_filter_level[1]),
+            (0, 0),
+            "fixture must have the loop filter enabled"
+        );
+        assert_eq!(fh.cdef_bits, 0, "fixture must have CDEF disabled");
+        assert_eq!(fh.lr_type, [0, 0, 0], "fixture must have loop restoration off");
+        let off = tile_data_offset(fh.header_bits);
+        let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
+        let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
+        let mut tile = Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+        tile.decode();
+        let mut refoff = 0usize;
+        for p in 0..3 {
+            let (buf, pw, ph) = tile.plane(p);
+            let n = pw * ph;
+            let mut maxd = 0i32;
+            for i in 0..n {
+                maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
+            }
+            assert_eq!(maxd, 0, "plane {p} ({pw}x{ph}) differs from dav1d after deblock");
+            refoff += n;
+        }
     }
 
     #[test]

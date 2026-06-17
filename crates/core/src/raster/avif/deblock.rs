@@ -172,6 +172,26 @@ pub(super) fn lf_level(
     (base + ref_delta0 * (1 << sh)).clamp(0, 63) as u8
 }
 
+/// Filter width for an edge, from the minimum transform dimension across it
+/// (in pixels) — dav1d `loop_filter_{h,v}_sb128{y,uv}_c`. Luma uses `4 << idx`
+/// (4/8/16) with idx from the txdim≥8 / txdim≥16 masks; chroma uses `4 + 2*idx`
+/// (4/6) from the txdim≥8 mask only. A 0 input (uncovered cell) yields 4.
+pub(super) fn lf_wd(min_dim_px: i32, is_chroma: bool) -> i32 {
+    if is_chroma {
+        if min_dim_px >= 8 {
+            6
+        } else {
+            4
+        }
+    } else if min_dim_px >= 16 {
+        16
+    } else if min_dim_px >= 8 {
+        8
+    } else {
+        4
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
