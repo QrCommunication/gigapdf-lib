@@ -13,6 +13,7 @@
 // (built incrementally in follow-up iterations); allow dead code until it lands.
 #![allow(dead_code)]
 
+pub(crate) mod cdef;
 pub(crate) mod cdf;
 pub(crate) mod deblock;
 pub(crate) mod itx;
