@@ -2,6 +2,8 @@
 //! and the common US sizes), per-side margins, and the [`RenderOptions`] bundle
 //! that carries headers/footers and automatic page numbering.
 
+use std::collections::BTreeMap;
+
 /// Resolve a named paper size to `(width, height)` in **PDF points** (portrait).
 ///
 /// Accepts the ISO A-series `a0`…`a6`, ISO B `b4`/`b5`, and US `letter`,
@@ -114,6 +116,13 @@ pub struct RenderOptions {
     pub footer_offset: f64,
     /// Number assigned to the first page for the `{{page}}` token. Default `1`.
     pub start_page_number: u32,
+    /// Host-fetched external resources, keyed by the exact URL referenced in the
+    /// HTML (`<img src>`, later CSS `url(...)`). The engine itself never touches
+    /// the network: the host downloads each URL listed by
+    /// [`needed_resources`](crate::html::needed_resources) and supplies the bytes
+    /// here, so external images render with browser fidelity while staying
+    /// zero-dependency. `data:` URIs are decoded inline and need no entry.
+    pub resources: BTreeMap<String, Vec<u8>>,
 }
 
 impl RenderOptions {
@@ -129,6 +138,7 @@ impl RenderOptions {
             header_offset: 18.0,
             footer_offset: 18.0,
             start_page_number: 1,
+            resources: BTreeMap::new(),
         }
     }
 

@@ -76,6 +76,7 @@ try {
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `htmlNeededFonts(html)` / `htmlNeededFontsWith(html, header?, footer?)` | `HtmlFontRequest[]` | Which Google Fonts the HTML needs (fetch them, then pass to `htmlRender`). |
+| `htmlNeededResources(html, header?, footer?)` | `HtmlResourceNeed[]` | Unified phase 1: the fonts **and** external `<img>` URLs the document needs. Fetch each, pass fonts to `htmlRenderWith` and image bytes via `HtmlRenderOptions.resources` (the engine is zero-network). |
 | `evalJs(src)` | `string` | Run JavaScript in the native ES2021 interpreter; returns the result stringified. |
 | `runInlineScripts(html)` | `string` | Execute the `<script>`s in an HTML string against a native DOM and return the mutated HTML. |
 | `pageSize(name)` | `{ w, h } \| null` | Look up a named page size (`"A4"`, `"Letter"`, …) in points. |

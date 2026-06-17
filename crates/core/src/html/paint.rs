@@ -149,6 +149,62 @@ pub fn needed_fonts_with(
     out
 }
 
+/// One external thing the document needs the host to fetch. Fonts carry their
+/// Google-Fonts download metadata; images carry the raw URL referenced by an
+/// `<img src>`. A single discovery call so the host runs **one** fetch loop —
+/// the font and image ports share this list rather than duplicating it.
+#[derive(Debug, Clone)]
+pub enum ResourceNeed {
+    /// A font to resolve against Google Fonts (host fetches `url` → TTF).
+    Font(FontRequest),
+    /// An external image URL (`<img src>`, non-`data:`) the host must download.
+    Image(String),
+}
+
+/// Every external resource the document (and its running header/footer) needs:
+/// the [`FontRequest`]s plus the external image URLs. The host downloads each
+/// and supplies the bytes back — fonts via [`ProvidedFont`], images via
+/// [`RenderOptions::resources`](super::page::RenderOptions::resources) — keeping
+/// the engine zero-network. `data:` image URIs are inlined and never listed.
+pub fn needed_resources(
+    html: &str,
+    header: Option<&str>,
+    footer: Option<&str>,
+) -> Vec<ResourceNeed> {
+    let mut out: Vec<ResourceNeed> = needed_fonts_with(html, header, footer)
+        .into_iter()
+        .map(ResourceNeed::Font)
+        .collect();
+    // Same DOM walk shape as the font scan: run inline scripts so script-injected
+    // <img> are seen, then collect external sources.
+    let body = crate::js::run_inline_scripts(html);
+    let mut urls: Vec<String> = Vec::new();
+    for src in [Some(body.as_str()), header, footer].into_iter().flatten() {
+        collect_image_urls(&dom::parse(src), &mut urls);
+    }
+    out.extend(urls.into_iter().map(ResourceNeed::Image));
+    out
+}
+
+/// Collect external `<img src>` URLs (skipping `data:` URIs and duplicates).
+fn collect_image_urls(nodes: &[Node], out: &mut Vec<String>) {
+    for n in nodes {
+        if let Node::Element(e) = n {
+            if e.tag == "img" {
+                if let Some(src) = e.attr("src") {
+                    if !src.is_empty()
+                        && !src.starts_with("data:")
+                        && !out.iter().any(|u| u == src)
+                    {
+                        out.push(src.to_string());
+                    }
+                }
+            }
+            collect_image_urls(&e.children, out);
+        }
+    }
+}
+
 fn collect_fonts(
     nodes: &[Node],
     sheet: &Stylesheet,
@@ -562,7 +618,7 @@ fn paint(
                     }
                 }
                 Fragment::Image { x, y, w, h, src } => {
-                    if let Some(data) = decode_data_uri(src) {
+                    if let Some(data) = resolve_image(src, &opts.resources) {
                         let _ = doc.add_image(page, &data, *x, page_h - y - h, *w, *h, 1.0);
                     }
                 }
@@ -586,6 +642,18 @@ fn paint(
     }
 
     doc.save_compressed().into()
+}
+
+/// Resolve an `<img>` source to image bytes: a `data:` URI is decoded inline; any
+/// other URL is looked up in the host-provided `resources` map (the engine never
+/// fetches the network). Returns `None` when the URL wasn't supplied — the image
+/// is simply omitted, exactly as a browser shows a broken image.
+fn resolve_image(src: &str, resources: &std::collections::BTreeMap<String, Vec<u8>>) -> Option<Vec<u8>> {
+    if src.starts_with("data:") {
+        decode_data_uri(src)
+    } else {
+        resources.get(src).cloned()
+    }
 }
 
 /// Decode a `data:[mime];base64,…` image URI to raw bytes (PNG/JPEG).
@@ -715,5 +783,46 @@ mod tests {
         // "iVBORw0KGgo=" is the base64 of the PNG signature start.
         let bytes = base64_decode("iVBORw0KGgo=").unwrap();
         assert_eq!(&bytes[..4], &[0x89, 0x50, 0x4E, 0x47]);
+    }
+
+    #[test]
+    fn needed_resources_lists_external_image_urls() {
+        let html = r#"<img src="https://x.test/logo.png" width="20" height="20">
+                      <img src="data:image/png;base64,iVBORw0KGgo=">"#;
+        let needs = needed_resources(html, None, None);
+        let imgs: Vec<&str> = needs
+            .iter()
+            .filter_map(|n| match n {
+                ResourceNeed::Image(u) => Some(u.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imgs, vec!["https://x.test/logo.png"], "data: URI excluded");
+    }
+
+    #[test]
+    fn external_image_embeds_from_resources_map() {
+        use super::super::page::RenderOptions;
+        // A real 4x4 PNG the host "downloaded" for the external URL.
+        let rgba = vec![200u8; 4 * 4 * 4];
+        let png = crate::raster::png::encode_png(4, 4, &rgba);
+        let url = "https://x.test/logo.png";
+        let html = format!(r#"<img src="{url}" width="40" height="40">"#);
+
+        // Without the resource: the image URL can't resolve → omitted.
+        let without = render_with(&html, &[], &RenderOptions::new(612.0, 792.0));
+
+        // With the host-provided bytes in the resources map: embedded.
+        let mut opts = RenderOptions::new(612.0, 792.0);
+        opts.resources.insert(url.to_string(), png.clone());
+        let with = render_with(&html, &[], &opts);
+
+        assert!(with.starts_with(b"%PDF-") && without.starts_with(b"%PDF-"));
+        assert!(
+            with.len() > without.len() + png.len() / 2,
+            "the external image bytes were embedded (with={} vs without={})",
+            with.len(),
+            without.len()
+        );
     }
 }

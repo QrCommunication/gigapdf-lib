@@ -4,6 +4,26 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.34.0] - 2026-06-17
+
+### Added
+
+- **External-resource host port for the HTML→PDF engine.** The native renderer
+  is zero-network, so external `<img src>` images (not just `data:` URIs) are now
+  fetched by the **host** in the same two-phase pattern as fonts:
+  - `htmlNeededResources(html, header?, footer?)` / `gp_html_needed_resources` —
+    one unified phase-1 list of everything the document needs: fonts
+    (`{kind:"font",family,weight,italic,url}`) **and** external images
+    (`{kind:"image",url}`). `data:` images are inlined and never listed.
+  - `HtmlRenderOptions.resources` (`{ url, bytes }[]`) on `htmlRenderWith` /
+    `RenderOptions.resources` on `render_with` / the `gp_html_render_opts`
+    `resources` blob — the host hands the fetched image bytes back, keyed by the
+    exact URL referenced in the HTML.
+
+  This lets a host render documents with remote images while keeping the engine
+  fully offline — the native replacement for a headless browser's autonomous
+  resource loading, with every fetched URL auditable up-front (SSRF-friendly).
+
 ## [0.33.0] - 2026-06-17
 
 ### Added

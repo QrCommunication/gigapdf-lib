@@ -217,6 +217,7 @@ Google fonts**, so the host fetches fonts in two phases.
 |------|------|------|
 | `needed_fonts(html) -> Vec<FontRequest>` | `gp_html_needed_fonts` · `htmlNeededFonts` | phase 1: fonts to download (after running `<script>`s) |
 | `needed_fonts_with(html, header, footer)` | `gp_html_needed_fonts_ex` · `htmlNeededFontsWith` | phase 1 incl. the header/footer fonts |
+| `needed_resources(html, header, footer) -> Vec<ResourceNeed>` | `gp_html_needed_resources` · `htmlNeededResources` | phase 1 (unified): fonts **and** external `<img src>` images to fetch |
 | `render(html, &[ProvidedFont], page_w, page_h, margin) -> Vec<u8>` | `gp_html_render` · `htmlRender` | phase 2: HTML+CSS → PDF (uniform margin) |
 | `render_with(html, &[ProvidedFont], &RenderOptions) -> Vec<u8>` | `gp_html_render_opts` · `htmlRenderWith` | phase 2 with size, per-side margins, header/footer, numbering |
 | `page_size(name) -> Option<(f64,f64)>` | `gp_page_size` · `pageSize` | resolve `"A4"`/`"a3-landscape"`/`"letter"`… → points |
@@ -225,6 +226,12 @@ Google fonts**, so the host fetches fonts in two phases.
   per-side margins, and a **running header/footer** painted in the page margins
   with `{{page}}` / `{{pages}}` substitution and `start_page_number`. See
   [`HTML-CSS.md` §1](HTML-CSS.md#1-page-setup).
+- **External images** (`RenderOptions.resources` / `needed_resources`): the
+  engine is **zero-network**, so list every external resource with
+  `needed_resources` (fonts + `http(s)` `<img>` URLs), have the host fetch each,
+  and pass image bytes back via `RenderOptions.resources` (a `url → bytes` map).
+  `data:` image URIs are inlined automatically and need no entry — this is the
+  native replacement for a headless browser's autonomous resource loading.
 - **Layout**: block / inline / table / **flex** (`flex-direction`,
   `justify-content`, `flex-grow`) / **grid** (`grid-template-columns`), selector
   cascade (`tag`/`.class`/`#id`/`*`, descendant), pagination.

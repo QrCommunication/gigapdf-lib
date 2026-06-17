@@ -20,4 +20,7 @@ pub mod page;
 pub mod paint;
 
 pub use page::{page_size, Margins, RenderOptions};
-pub use paint::{needed_fonts, needed_fonts_with, render, render_with, FontRequest, ProvidedFont};
+pub use paint::{
+    needed_fonts, needed_fonts_with, needed_resources, render, render_with, FontRequest,
+    ProvidedFont, ResourceNeed,
+};

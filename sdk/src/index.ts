@@ -485,31 +485,36 @@ export class GigaPdfEngine {
     const footerOffset = options.footerOffset ?? 18;
     const start = options.startPageNumber ?? 1;
     const blob = packHtmlFonts(fonts);
+    const resBlob = packHtmlResources(options.resources ?? []);
 
     return this._withStr(html, (hp, hl) =>
       this._withBytes(blob, (fp, fl) =>
         this._withOptStr(options.header, (hdp, hdl) =>
           this._withOptStr(options.footer, (ftp, ftl) =>
-            this._buffer((o) =>
-              this.ex.gp_html_render_opts(
-                hp,
-                hl,
-                fp,
-                fl,
-                pw,
-                ph,
-                mg.top,
-                mg.right,
-                mg.bottom,
-                mg.left,
-                hdp,
-                hdl,
-                ftp,
-                ftl,
-                headerOffset,
-                footerOffset,
-                start,
-                o
+            this._withBytes(resBlob, (rp, rl) =>
+              this._buffer((o) =>
+                this.ex.gp_html_render_opts(
+                  hp,
+                  hl,
+                  fp,
+                  fl,
+                  pw,
+                  ph,
+                  mg.top,
+                  mg.right,
+                  mg.bottom,
+                  mg.left,
+                  hdp,
+                  hdl,
+                  ftp,
+                  ftl,
+                  headerOffset,
+                  footerOffset,
+                  start,
+                  rp,
+                  rl,
+                  o
+                )
               )
             )
           )
@@ -517,6 +522,50 @@ export class GigaPdfEngine {
       )
     );
   }
+
+  /**
+   * Phase 1 (unified) — every external resource the document needs the host to
+   * fetch, in one list: fonts (`{kind:"font",family,weight,italic,url}`) and
+   * external images (`{kind:"image",url}`). Run **one** fetch loop, then pass
+   * fonts back as the `fonts` argument to {@link GigaPdfEngine.htmlRenderWith}
+   * (download each `url` → TTF) and images via
+   * {@link HtmlRenderOptions.resources} (`{url, bytes}`). `data:` image URIs are
+   * inlined and never listed.
+   */
+  htmlNeededResources(html: string, header?: string, footer?: string): HtmlResourceNeed[] {
+    return this._withStr(html, (hp, hl) =>
+      this._withOptStr(header, (hdp, hdl) =>
+        this._withOptStr(footer, (ftp, ftl) =>
+          this._json((o) => this.ex.gp_html_needed_resources(hp, hl, hdp, hdl, ftp, ftl, o))
+        )
+      )
+    ) as HtmlResourceNeed[];
+  }
+}
+
+/** Pack `HtmlResource[]` (host-fetched URLs) into the little-endian blob
+ * `gp_html_render_opts` expects: `u32 count`, then per entry `u32 url_len, url,
+ * u32 data_len, data`. */
+function packHtmlResources(resources: HtmlResource[]): Uint8Array {
+  let size = 4;
+  for (const r of resources) size += 4 + enc.encode(r.url).length + 4 + r.bytes.length;
+  const buf = new Uint8Array(size);
+  const dv = new DataView(buf.buffer);
+  let o = 0;
+  dv.setUint32(o, resources.length, true);
+  o += 4;
+  for (const r of resources) {
+    const url = enc.encode(r.url);
+    dv.setUint32(o, url.length, true);
+    o += 4;
+    buf.set(url, o);
+    o += url.length;
+    dv.setUint32(o, r.bytes.length, true);
+    o += 4;
+    buf.set(r.bytes, o);
+    o += r.bytes.length;
+  }
+  return buf;
 }
 
 /** Pack `HtmlFont[]` into the little-endian blob `gp_html_render` expects. */
@@ -563,6 +612,24 @@ export interface HtmlFont {
   ttf: Uint8Array;
 }
 
+/**
+ * A host-downloaded external resource (image) handed to
+ * {@link GigaPdfEngine.htmlRenderWith} via {@link HtmlRenderOptions.resources}.
+ * `url` must match the URL referenced in the HTML exactly.
+ */
+export interface HtmlResource {
+  url: string;
+  bytes: Uint8Array;
+}
+
+/**
+ * One entry from {@link GigaPdfEngine.htmlNeededResources}: a `font` (with its
+ * Google-Fonts download metadata) or an external `image` URL the host must fetch.
+ */
+export type HtmlResourceNeed =
+  | { kind: "font"; family: string; weight: number; italic: boolean; url: string }
+  | { kind: "image"; url: string };
+
 /** Per-side page margins in points; omitted sides default to 36pt. */
 export interface HtmlMargins {
   top?: number;
@@ -591,6 +658,13 @@ export interface HtmlRenderOptions {
   footerOffset?: number;
   /** Number assigned to the first page for `{{page}}` (default 1). */
   startPageNumber?: number;
+  /**
+   * Host-downloaded external images, keyed by the exact URL referenced in the
+   * HTML (`<img src>`). Obtain the list with
+   * {@link GigaPdfEngine.htmlNeededResources}, fetch each, and pass the bytes
+   * here — the engine never touches the network. `data:` URIs need no entry.
+   */
+  resources?: HtmlResource[];
 }
 
 export interface FontInfo {

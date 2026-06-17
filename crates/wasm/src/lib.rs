@@ -1912,6 +1912,8 @@ pub extern "C" fn gp_html_render_opts(
     header_offset: f64,
     footer_offset: f64,
     start_page_number: u32,
+    resources_ptr: *const u8,
+    resources_len: usize,
     out_len: *mut usize,
 ) -> *mut u8 {
     let html = unsafe { str_arg(html_ptr, html_len) };
@@ -1921,6 +1923,11 @@ pub extern "C" fn gp_html_render_opts(
         unsafe { std::slice::from_raw_parts(fonts_ptr, fonts_len) }
     };
     let fonts = parse_font_blob(blob);
+    let res_blob: &[u8] = if resources_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(resources_ptr, resources_len) }
+    };
     let header = unsafe { opt_str_arg(header_ptr, header_len) };
     let footer = unsafe { opt_str_arg(footer_ptr, footer_len) };
     let opts = gigapdf_core::html::RenderOptions {
@@ -1937,9 +1944,86 @@ pub extern "C" fn gp_html_render_opts(
         header_offset,
         footer_offset,
         start_page_number: start_page_number.max(1),
+        resources: parse_resources_blob(res_blob),
     };
     let pdf = gigapdf_core::html::render_with(html, &fonts, &opts);
     unsafe { bytes_into_host(pdf, out_len) }
+}
+
+/// Decode the packed resources blob (host-fetched external URLs) passed to
+/// [`gp_html_render_opts`]: little-endian `u32 count`, then per entry
+/// `u32 url_len, url utf8, u32 data_len, data bytes`.
+fn parse_resources_blob(b: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn rd_u32(b: &[u8], i: &mut usize) -> Option<u32> {
+        let v = b.get(*i..*i + 4)?;
+        *i += 4;
+        Some(u32::from_le_bytes(v.try_into().ok()?))
+    }
+    let mut out = std::collections::BTreeMap::new();
+    let mut i = 0;
+    let Some(count) = rd_u32(b, &mut i) else {
+        return out;
+    };
+    for _ in 0..count {
+        let Some(ul) = rd_u32(b, &mut i) else { break };
+        let Some(url) = b.get(i..i + ul as usize) else {
+            break;
+        };
+        i += ul as usize;
+        let Some(dl) = rd_u32(b, &mut i) else { break };
+        let Some(data) = b.get(i..i + dl as usize) else {
+            break;
+        };
+        i += dl as usize;
+        out.insert(String::from_utf8_lossy(url).into_owned(), data.to_vec());
+    }
+    out
+}
+
+/// HTML rendering engine — phase 1 (unified): every external resource the
+/// document needs as JSON. Fonts: `{kind:"font",family,weight,italic,url}`;
+/// images: `{kind:"image",url}`. One discovery call for the host's fetch loop.
+/// Buffer-returning.
+#[no_mangle]
+pub extern "C" fn gp_html_needed_resources(
+    html_ptr: *const u8,
+    html_len: usize,
+    header_ptr: *const u8,
+    header_len: usize,
+    footer_ptr: *const u8,
+    footer_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    use gigapdf_core::html::ResourceNeed;
+    let html = unsafe { str_arg(html_ptr, html_len) };
+    let header = unsafe { opt_str_arg(header_ptr, header_len) };
+    let footer = unsafe { opt_str_arg(footer_ptr, footer_len) };
+    let needs = gigapdf_core::html::needed_resources(html, header, footer);
+    let mut s = String::from("[");
+    for (i, n) in needs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match n {
+            ResourceNeed::Font(f) => {
+                s.push_str(&format!(
+                    "{{\"kind\":\"font\",\"weight\":{},\"italic\":{},\"family\":",
+                    f.weight, f.italic
+                ));
+                json_escape(&f.family, &mut s);
+                s.push_str(",\"url\":");
+                json_escape(&f.url, &mut s);
+                s.push('}');
+            }
+            ResourceNeed::Image(url) => {
+                s.push_str("{\"kind\":\"image\",\"url\":");
+                json_escape(url, &mut s);
+                s.push('}');
+            }
+        }
+    }
+    s.push(']');
+    unsafe { bytes_into_host(s.into_bytes(), out_len) }
 }
 
 /// Decode the packed font blob passed to [`gp_html_render`].
