@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod cdf;
+pub(crate) mod itx;
 pub(crate) mod msac;
 pub(crate) mod scan;
 pub(crate) mod tile;
