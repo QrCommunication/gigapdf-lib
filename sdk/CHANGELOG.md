@@ -4,6 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.39.0] - 2026-06-17
+
+### Changed
+
+- **AVIF: palette mode (AV1 §5.11.46-50).** The AV1 intra decoder behind
+  `decodeAvif` now decodes screen-content palette blocks (logos, UI, charts,
+  flat-colour graphics), validated bit-exact against dav1d. Per palette block:
+  the colour table (neighbour-palette prediction cache with merge/dedup, reuse
+  flags, then delta-coded new entries; U plus delta/literal V for chroma), the
+  per-pixel index map (anti-diagonal wave-front scan with the colour-order
+  context model), and reconstruction from `palette[index]` — with the transform
+  residual added on top for non-skipped blocks. Previously such AVIFs aborted on
+  an unsupported-mode guard.
+
 ## [0.38.0] - 2026-06-17
 
 ### Changed
