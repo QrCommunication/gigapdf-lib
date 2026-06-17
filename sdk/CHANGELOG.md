@@ -4,6 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.37.0] - 2026-06-17
+
+### Changed
+
+- **AVIF: in-loop deblocking filter (AV1 §7.14).** The AV1 intra decoder behind
+  `decodeAvif` now applies the deblocking loop filter after reconstruction, so
+  AVIFs encoded with the loop filter enabled (the common case) decode without
+  blocking artifacts at tx-block boundaries. A per-4×4 grid records each
+  transform block's size and edge flags per plane; the apply pass runs the
+  vertical then horizontal edge filters (4/6/8/14-tap), deriving thresholds and
+  per-block levels exactly as the spec prescribes. Validated **bit-exact**
+  against dav1d on a still with the loop filter on and CDEF + loop restoration
+  off. CDEF and loop restoration remain pending.
+
 ## [0.36.0] - 2026-06-17
 
 ### Added
