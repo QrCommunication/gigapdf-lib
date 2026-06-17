@@ -338,6 +338,13 @@ export class GigaPdfEngine {
   decodeWebp(webp: Uint8Array): DecodedImage | null {
     return this._decodeFramed(webp, (p, l, o) => this.ex.gp_decode_webp(p, l, o));
   }
+  /**
+   * Decode a still **AVIF** (AV1 intra) to `{ width, height, rgba }`, or `null`.
+   * Native AV1 decoder — no third-party library. Animated AVIF is not handled.
+   */
+  decodeAvif(avif: Uint8Array): DecodedImage | null {
+    return this._decodeFramed(avif, (p, l, o) => this.ex.gp_decode_avif(p, l, o));
+  }
   /** Unpack a `[w:u32 LE][h:u32 LE][rgba]` decode buffer; `null` if empty. */
   _decodeFramed(
     bytes: Uint8Array,

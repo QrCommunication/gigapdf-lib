@@ -4,6 +4,22 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.36.0] - 2026-06-17
+
+### Added
+
+- **Still AVIF decoding (`decodeAvif`).** `decodeAvif` / `gp_decode_avif` decode
+  a still AVIF image with a complete, from-scratch **AV1 intra decoder** — no
+  third-party codec. Pipeline: ISOBMFF/OBU parse → sequence + frame headers →
+  multi-symbol arithmetic (msac) entropy decode → coefficient decode, dequant and
+  inverse transforms (DCT 4–64, ADST/FlipADST 4–16, identity, Walsh–Hadamard) →
+  intra prediction (DC, V, H, Paeth, the Smooth family, filter-intra, CfL, and the
+  Z1/Z2/Z3 directional predictors) → YUV→RGBA (BT.601/709/2020-NCL/Identity,
+  limited or full range, 4:2:0/4:2:2/4:4:4 chroma upsample). Every transform and
+  predictor is validated **bit-exact** against dav1d reference vectors.
+  - Current scope: still images, 8-bit. In-loop filters (deblocking, CDEF,
+    loop-restoration) and film-grain synthesis are not yet applied.
+
 ## [0.35.0] - 2026-06-17
 
 ### Added

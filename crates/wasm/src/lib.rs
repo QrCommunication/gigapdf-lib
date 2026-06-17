@@ -1541,6 +1541,20 @@ pub extern "C" fn gp_decode_webp(ptr: *const u8, len: usize, out_len: *mut usize
     unsafe { bytes_into_host(out, out_len) }
 }
 
+/// Decode a still **AVIF** (AV1 intra) to `[w: u32 LE][h: u32 LE][rgba]` with the
+/// engine's native AV1 decoder — no third-party library. Empty for an
+/// unsupported/malformed stream. Host frees the result.
+#[no_mangle]
+pub extern "C" fn gp_decode_avif(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let out = if ptr.is_null() {
+        Vec::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        frame_image(gigapdf_core::raster::avif::decode_avif(bytes))
+    };
+    unsafe { bytes_into_host(out, out_len) }
+}
+
 // ─── conversions & compression ───────────────────────────────────────────────
 //
 // All buffer-returning (host frees the result). Office exporters reconstruct
