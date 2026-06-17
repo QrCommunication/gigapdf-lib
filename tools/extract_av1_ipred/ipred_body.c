@@ -422,3 +422,141 @@ static void ipred_z1_c(pixel *dst, const ptrdiff_t stride,
     }
 }
 
+static void ipred_z2_c(pixel *dst, const ptrdiff_t stride,
+                       const pixel *const topleft_in,
+                       const int width, const int height, int angle,
+                       const int max_width, const int max_height
+                       HIGHBD_DECL_SUFFIX)
+{
+    const int is_sm = (angle >> 9) & 0x1;
+    const int enable_intra_edge_filter = angle >> 10;
+    angle &= 511;
+    assert(angle > 90 && angle < 180);
+    int dy = dav1d_dr_intra_derivative[(angle - 90) >> 1];
+    int dx = dav1d_dr_intra_derivative[(180 - angle) >> 1];
+    const int upsample_left = enable_intra_edge_filter ?
+        get_upsample(width + height, 180 - angle, is_sm) : 0;
+    const int upsample_above = enable_intra_edge_filter ?
+        get_upsample(width + height, angle - 90, is_sm) : 0;
+    pixel edge[64 + 64 + 1];
+    pixel *const topleft = &edge[64];
+
+    if (upsample_above) {
+        upsample_edge(topleft, width + 1, topleft_in, 0, width + 1
+                      HIGHBD_TAIL_SUFFIX);
+        dx <<= 1;
+    } else {
+        const int filter_strength = enable_intra_edge_filter ?
+            get_filter_strength(width + height, angle - 90, is_sm) : 0;
+
+        if (filter_strength) {
+            filter_edge(&topleft[1], width, 0, max_width,
+                        &topleft_in[1], -1, width,
+                        filter_strength);
+        } else {
+            pixel_copy(&topleft[1], &topleft_in[1], width);
+        }
+    }
+    if (upsample_left) {
+        upsample_edge(&topleft[-height * 2], height + 1, &topleft_in[-height],
+                      0, height + 1 HIGHBD_TAIL_SUFFIX);
+        dy <<= 1;
+    } else {
+        const int filter_strength = enable_intra_edge_filter ?
+            get_filter_strength(width + height, 180 - angle, is_sm) : 0;
+
+        if (filter_strength) {
+            filter_edge(&topleft[-height], height, height - max_height, height,
+                        &topleft_in[-height],
+                        0, height + 1, filter_strength);
+        } else {
+            pixel_copy(&topleft[-height], &topleft_in[-height], height);
+        }
+    }
+    *topleft = *topleft_in;
+
+    const int base_inc_x = 1 + upsample_above;
+    const pixel *const left = &topleft[-(1 + upsample_left)];
+    for (int y = 0, xpos = ((1 + upsample_above) << 6) - dx; y < height;
+         y++, xpos -= dx, dst += PXSTRIDE(stride))
+    {
+        int base_x = xpos >> 6;
+        const int frac_x = xpos & 0x3E;
+
+        for (int x = 0, ypos = (y << (6 + upsample_left)) - dy; x < width;
+             x++, base_x += base_inc_x, ypos -= dy)
+        {
+            int v;
+            if (base_x >= 0) {
+                v = topleft[base_x] * (64 - frac_x) +
+                    topleft[base_x + 1] * frac_x;
+            } else {
+                const int base_y = ypos >> 6;
+                assert(base_y >= -(1 + upsample_left));
+                const int frac_y = ypos & 0x3E;
+                v = left[-base_y] * (64 - frac_y) +
+                    left[-(base_y + 1)] * frac_y;
+            }
+            dst[x] = (v + 32) >> 6;
+        }
+    }
+}
+
+static void ipred_z3_c(pixel *dst, const ptrdiff_t stride,
+                       const pixel *const topleft_in,
+                       const int width, const int height, int angle,
+                       const int max_width, const int max_height
+                       HIGHBD_DECL_SUFFIX)
+{
+    const int is_sm = (angle >> 9) & 0x1;
+    const int enable_intra_edge_filter = angle >> 10;
+    angle &= 511;
+    assert(angle > 180);
+    int dy = dav1d_dr_intra_derivative[(270 - angle) >> 1];
+    pixel left_out[64 + 64];
+    const pixel *left;
+    int max_base_y;
+    const int upsample_left = enable_intra_edge_filter ?
+        get_upsample(width + height, angle - 180, is_sm) : 0;
+    if (upsample_left) {
+        upsample_edge(left_out, width + height,
+                      &topleft_in[-(width + height)],
+                      imax(width - height, 0), width + height + 1
+                      HIGHBD_TAIL_SUFFIX);
+        left = &left_out[2 * (width + height) - 2];
+        max_base_y = 2 * (width + height) - 2;
+        dy <<= 1;
+    } else {
+        const int filter_strength = enable_intra_edge_filter ?
+            get_filter_strength(width + height, angle - 180, is_sm) : 0;
+
+        if (filter_strength) {
+            filter_edge(left_out, width + height, 0, width + height,
+                        &topleft_in[-(width + height)],
+                        imax(width - height, 0), width + height + 1,
+                        filter_strength);
+            left = &left_out[width + height - 1];
+            max_base_y = width + height - 1;
+        } else {
+            left = &topleft_in[-1];
+            max_base_y = height + imin(width, height) - 1;
+        }
+    }
+    const int base_inc = 1 + upsample_left;
+    for (int x = 0, ypos = dy; x < width; x++, ypos += dy) {
+        const int frac = ypos & 0x3E;
+
+        for (int y = 0, base = ypos >> 6; y < height; y++, base += base_inc) {
+            if (base < max_base_y) {
+                const int v = left[-base] * (64 - frac) +
+                              left[-(base + 1)] * frac;
+                dst[y * PXSTRIDE(stride) + x] = (v + 32) >> 6;
+            } else {
+                do {
+                    dst[y * PXSTRIDE(stride) + x] = left[-max_base_y];
+                } while (++y < height);
+                break;
+            }
+        }
+    }
+}

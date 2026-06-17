@@ -10,6 +10,7 @@
 typedef uint8_t pixel;
 #define NOINLINE
 static inline int imin(int a,int b){return a<b?a:b;}
+static inline int imax(int a,int b){return a>b?a:b;}
 static inline int iclip(int v,int lo,int hi){return v<lo?lo:(v>hi?hi:v);}
 static inline int iclip_pixel(int v){return iclip(v,0,255);}
 static inline int abs_i(int v){return v<0?-v:v;}
@@ -63,6 +64,8 @@ int main(void){
     ipred_filter_c(out,w,tl,w,h,4,0,0); dump("filter4",out,w,h);
     ipred_z1_c(out,w,tl,w,h,1083,0,0); dump("z1a",out,w,h);
     ipred_z1_c(out,w,tl,w,h,1054,0,0); dump("z1b",out,w,h);
+    ipred_z3_c(out,w,tl,w,h,1227,0,0); dump("z3a",out,w,h);
+    ipred_z3_c(out,w,tl,w,h,1249,0,0); dump("z3b",out,w,h);
   }
   printf("];\n");
   return 0;

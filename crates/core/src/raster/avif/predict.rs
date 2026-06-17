@@ -413,6 +413,70 @@ pub(super) fn z1(bw: usize, bh: usize, angle_full: i32, tl: &[i32], corner: usiz
     out
 }
 
+/// Directional Z3 predictor (angle > 180, uses the left edge). `tl`/`corner` as
+/// in `z1` (left samples at `corner-1-i`, incl. the bottom-left extension).
+/// dav1d `ipred_z3_c` — its negative-stride `left[-base]` reads are flattened
+/// here into a forward `left_fwd[base]` array.
+pub(super) fn z3(bw: usize, bh: usize, angle_full: i32, tl: &[i32], corner: usize) -> Vec<i32> {
+    let is_sm = (angle_full >> 9) & 1 != 0;
+    let enable = angle_full >> 10 != 0;
+    let angle = angle_full & 511;
+    let mut dy = DR_INTRA_DERIVATIVE[((270 - angle) >> 1) as usize];
+    let wh = (bw + bh) as i32;
+    let from = (bw as i32 - bh as i32).max(0);
+    let to = (bw + bh) as i32 + 1;
+    let inn = |k: i32| -> i32 {
+        let c = k.clamp(from, to - 1);
+        tl[(corner as i32 - (bw + bh) as i32 + c) as usize]
+    };
+    let upsample = enable && get_upsample(wh, angle - 180, is_sm);
+    let mut buf = vec![0i32; 2 * (bw + bh) + 16];
+    let max_base_y;
+    let left_fwd: Vec<i32>;
+    if upsample {
+        upsample_edge(&mut buf, bw + bh, &inn);
+        max_base_y = 2 * (bw + bh) - 2;
+        left_fwd = (0..=max_base_y).map(|b| buf[max_base_y - b]).collect();
+        dy <<= 1;
+    } else {
+        let fs = if enable { get_filter_strength(wh, angle - 180, is_sm) } else { 0 };
+        if fs != 0 {
+            filter_edge(&mut buf, bw + bh, 0, bw + bh, &inn, fs as usize);
+            max_base_y = bw + bh - 1;
+            left_fwd = (0..=max_base_y).map(|b| buf[max_base_y - b]).collect();
+        } else {
+            max_base_y = bh + bw.min(bh) - 1;
+            left_fwd = (0..=max_base_y)
+                .map(|b| tl[corner - 1 - b])
+                .collect();
+        }
+    }
+    let base_inc = 1 + upsample as usize;
+    let mut out = vec![0i32; bw * bh];
+    let mut ypos = dy;
+    for x in 0..bw {
+        let frac = ypos & 0x3E;
+        let base0 = (ypos >> 6) as usize;
+        let mut y = 0;
+        while y < bh {
+            let base = base0 + y * base_inc;
+            if base < max_base_y {
+                let v = left_fwd[base] * (64 - frac) + left_fwd[base + 1] * frac;
+                out[y * bw + x] = (v + 32) >> 6;
+                y += 1;
+            } else {
+                let fill = left_fwd[max_base_y];
+                for yy in y..bh {
+                    out[yy * bw + x] = fill;
+                }
+                break;
+            }
+        }
+        ypos += dy;
+    }
+    out
+}
+
 /// Chroma-from-luma final blend (`cfl_pred`): `chroma = clip(dc + sign(d) *
 /// ((|d| + 32) >> 6))` where `d = alpha * ac`. `ac` is the mean-removed,
 /// subsampled luma AC; `dc` the chroma DC prediction; `alpha` the signed CfL gain.
@@ -478,11 +542,11 @@ mod tests {
 
     #[test]
     fn predictors_match_dav1d() {
-        // IPRED_REF order per size (stride 14): dc, v, h, paeth, smooth,
-        // smooth_v, smooth_h, filter0..filter4, z1a, z1b.
+        // IPRED_REF order per size (stride 16): dc, v, h, paeth, smooth,
+        // smooth_v, smooth_h, filter0..filter4, z1a, z1b, z3a, z3b.
         for (si, &n) in [4usize, 8].iter().enumerate() {
             let (top, left, tl) = edges(n);
-            let base = si * 14;
+            let base = si * 16;
             let modes = [
                 DC_PRED,
                 VERT_PRED,
@@ -512,6 +576,8 @@ mod tests {
             }
             assert_eq!(z1(n, n, 1083, &buf, corner), IPRED_REF[base + 12], "z1a size {n}");
             assert_eq!(z1(n, n, 1054, &buf, corner), IPRED_REF[base + 13], "z1b size {n}");
+            assert_eq!(z3(n, n, 1227, &buf, corner), IPRED_REF[base + 14], "z3a size {n}");
+            assert_eq!(z3(n, n, 1249, &buf, corner), IPRED_REF[base + 15], "z3b size {n}");
         }
     }
 
