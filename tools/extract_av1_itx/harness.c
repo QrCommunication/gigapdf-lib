@@ -18,9 +18,9 @@ static void dump(const char*name,const int32_t*v,int n){
   printf("],\n");
 }
 int main(void){
-  /* Deterministic input vectors (length 32 max), reused per size. */
-  int32_t base[32];
-  for(int i=0;i<32;i++) base[i]=((i*37)%97)-48;   /* spread of +/- values */
+  /* Deterministic input vectors (length 64 max), reused per size. */
+  int32_t base[64];
+  for(int i=0;i<64;i++) base[i]=((i*37)%97)-48;   /* spread of +/- values */
   int mn=-32768, mx=32767;
   int32_t c[64];
 
@@ -41,6 +41,7 @@ int main(void){
   for(int i=0;i<16;i++)c[i]=base[i]; inv_identity16_1d_c(c,1,mn,mx); dump("idt16",c,16);
   for(int i=0;i<32;i++)c[i]=base[i]; inv_identity32_1d_c(c,1,mn,mx); dump("idt32",c,32);
   for(int i=0;i<4;i++)c[i]=base[i];  dav1d_inv_wht4_1d_c(c,1);       dump("wht4",c,4);
+  for(int i=0;i<64;i++)c[i]=base[i]; inv_dct64_1d_c(c,1,mn,mx); dump("dct64",c,64);
   printf("];\n");
   return 0;
 }
