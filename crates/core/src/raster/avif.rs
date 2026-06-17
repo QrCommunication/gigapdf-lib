@@ -402,11 +402,46 @@ pub(crate) struct SequenceHeader {
     pub matrix_coefficients: u32,
     pub separate_uv_delta_q: bool,
     pub film_grain_params_present: bool,
+    /// `false` only on the full streaming sequence header (`still_picture` set
+    /// without `reduced_still_picture_header`). The fields below carry the extra
+    /// state the frame header reads in that case.
+    pub reduced_still_picture: bool,
+    /// `seq_force_screen_content_tools` — 0, 1, or 2 = SELECT/ADAPTIVE.
+    pub screen_content_tools: u32,
+    /// `seq_force_integer_mv` — 0, 1, or 2 = SELECT/ADAPTIVE.
+    pub force_integer_mv: u32,
+    pub order_hint: bool,
+    pub order_hint_n_bits: u32,
+    pub frame_id_numbers_present: bool,
+    pub frame_id_n_bits: u32,
+    pub decoder_model_info_present: bool,
+    pub equal_picture_interval: bool,
+    pub frame_presentation_delay_length: u32,
+    pub buffer_removal_delay_length: u32,
+    pub num_operating_points: u32,
 }
 
-/// Parse `sequence_header_obu` (AV1 spec §5.5). Only the
-/// `reduced_still_picture_header` path — what AVIF still images use — is
-/// supported; the full streaming path returns `None`.
+/// `uvlc()` — unsigned variable-length code (AV1 §4.10.3 / dav1d `get_vlc`):
+/// count leading zero bits, then read that many trailing bits. Only its bit
+/// consumption matters here (the decoded value is discarded).
+fn read_uvlc(r: &mut BitReader<'_>) -> u32 {
+    let mut n = 0u32;
+    while r.f(1) == 0 {
+        n += 1;
+        if n == 32 {
+            return u32::MAX;
+        }
+    }
+    if n == 0 {
+        0
+    } else {
+        ((1u32 << n) - 1) + r.f(n)
+    }
+}
+
+/// Parse `sequence_header_obu` (AV1 spec §5.5). Handles both the
+/// `reduced_still_picture_header` path (the common AVIF still case) and the
+/// full streaming header (some encoders / ffmpeg without `-still-picture`).
 pub(crate) fn parse_sequence_header(data: &[u8]) -> Option<SequenceHeader> {
     let mut r = BitReader::new(data);
     let mut s = SequenceHeader {
@@ -415,17 +450,99 @@ pub(crate) fn parse_sequence_header(data: &[u8]) -> Option<SequenceHeader> {
     };
     let _still_picture = r.f(1);
     let reduced = r.f(1) != 0;
-    if !reduced {
-        return None;
+    s.reduced_still_picture = reduced;
+    const SELECT: u32 = 2; // SELECT_SCREEN_CONTENT_TOOLS / SELECT_INTEGER_MV
+
+    if reduced {
+        s.num_operating_points = 1;
+        let _op_level = r.f(5); // seq_level_idx[0] = major(3) + minor(2)
+    } else {
+        // timing_info() + decoder_model_info() (absent for still AVIF, parsed faithfully).
+        let timing_info_present = r.f(1) != 0;
+        if timing_info_present {
+            r.f(32); // num_units_in_display_tick
+            r.f(32); // time_scale
+            s.equal_picture_interval = r.f(1) != 0;
+            if s.equal_picture_interval {
+                read_uvlc(&mut r); // num_ticks_per_picture_minus_1
+            }
+            s.decoder_model_info_present = r.f(1) != 0;
+            if s.decoder_model_info_present {
+                let _buffer_delay_len = r.f(5) + 1;
+                r.f(32); // num_units_in_decoding_tick
+                s.buffer_removal_delay_length = r.f(5) + 1;
+                s.frame_presentation_delay_length = r.f(5) + 1;
+            }
+        }
+        let display_model_info_present = r.f(1) != 0;
+        s.num_operating_points = r.f(5) + 1;
+        for _ in 0..s.num_operating_points {
+            let _idc = r.f(12);
+            let major = 2 + r.f(3);
+            let _minor = r.f(2);
+            if major > 3 {
+                let _tier = r.f(1);
+            }
+            if s.decoder_model_info_present && r.f(1) != 0 {
+                // operating_parameter_info: present only in timed/buffered streams,
+                // never in a still AVIF — bail rather than mis-align the bitstream.
+                return None;
+            }
+            if display_model_info_present {
+                let display_param_present = r.f(1) != 0;
+                if display_param_present {
+                    r.f(4); // initial_display_delay_minus_1
+                }
+            }
+        }
     }
-    let _seq_level_idx0 = r.f(5);
+
     s.frame_width_bits = r.f(4) + 1;
     s.frame_height_bits = r.f(4) + 1;
     s.width = r.f(s.frame_width_bits) + 1;
     s.height = r.f(s.frame_height_bits) + 1;
+
+    if !reduced {
+        s.frame_id_numbers_present = r.f(1) != 0;
+        if s.frame_id_numbers_present {
+            let delta_frame_id_n_bits = r.f(4) + 2;
+            s.frame_id_n_bits = r.f(3) + delta_frame_id_n_bits + 1;
+        }
+    }
+
     s.use_128x128_superblock = r.f(1) != 0;
     s.enable_filter_intra = r.f(1) != 0;
     s.enable_intra_edge_filter = r.f(1) != 0;
+
+    if reduced {
+        s.screen_content_tools = SELECT;
+        s.force_integer_mv = SELECT;
+    } else {
+        let _enable_interintra_compound = r.f(1);
+        let _enable_masked_compound = r.f(1);
+        let _enable_warped_motion = r.f(1);
+        let _enable_dual_filter = r.f(1);
+        s.order_hint = r.f(1) != 0;
+        if s.order_hint {
+            let _enable_jnt_comp = r.f(1);
+            let _enable_ref_frame_mvs = r.f(1);
+        }
+        // seq_choose_screen_content_tools ? SELECT : seq_force_screen_content_tools
+        s.screen_content_tools = if r.f(1) != 0 { SELECT } else { r.f(1) };
+        s.force_integer_mv = if s.screen_content_tools != 0 {
+            if r.f(1) != 0 {
+                SELECT
+            } else {
+                r.f(1)
+            }
+        } else {
+            2
+        };
+        if s.order_hint {
+            s.order_hint_n_bits = r.f(3) + 1;
+        }
+    }
+
     s.enable_superres = r.f(1) != 0;
     s.enable_cdef = r.f(1) != 0;
     s.enable_restoration = r.f(1) != 0;
@@ -682,20 +799,61 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
     let num_planes = if seq.mono_chrome { 1 } else { 3 };
     let mut h = FrameHeader::default();
 
-    h.disable_cdf_update = r.f(1) != 0;
-    // seq_force_screen_content_tools == SELECT (reduced) ⇒ read the flag.
-    let allow_screen_content_tools = r.f(1) != 0;
-    h.allow_screen_content_tools = allow_screen_content_tools;
-    if allow_screen_content_tools {
-        // seq_force_integer_mv == SELECT ⇒ read; intra forces it to 1 regardless.
-        let _force_integer_mv = r.f(1);
+    // Full streaming header: a shown KEY frame carries a frame-type preamble
+    // before the body. We only decode a shown KEY still here (anything else —
+    // show_existing, inter, intra-only, hidden — bails). The reduced header has
+    // KEY/show implied and skips straight to `disable_cdf_update`.
+    let mut frame_size_override = false;
+    if !seq.reduced_still_picture {
+        if r.f(1) != 0 {
+            return None; // show_existing_frame: references an already-decoded frame
+        }
+        let frame_type = r.f(2);
+        let show_frame = r.f(1) != 0;
+        if frame_type != 0 || !show_frame {
+            return None; // only a shown KEY frame is a decodable still
+        }
+        if seq.decoder_model_info_present && !seq.equal_picture_interval {
+            r.f(seq.frame_presentation_delay_length); // frame_presentation_delay
+        }
+        // showable_frame (KEY ⇒ 0) and error_resilient_mode (KEY+show ⇒ 1) take
+        // no bits.
     }
-    // frame_size_override_flag=0, order_hint absent (enable_order_hint=0),
-    // primary_ref_frame=NONE, refresh_frame_flags=0xff: none coded.
 
-    // frame_size(): no override ⇒ sequence dimensions.
-    h.frame_width = seq.width;
-    h.frame_height = seq.height;
+    h.disable_cdf_update = r.f(1) != 0;
+    // allow_screen_content_tools: a bit only when the sequence left it to SELECT.
+    let allow_screen_content_tools = if seq.screen_content_tools == 2 {
+        r.f(1) != 0
+    } else {
+        seq.screen_content_tools != 0
+    };
+    h.allow_screen_content_tools = allow_screen_content_tools;
+    if allow_screen_content_tools && seq.force_integer_mv == 2 {
+        r.f(1); // force_integer_mv (intra forces it to 1 regardless)
+    }
+    if seq.frame_id_numbers_present {
+        r.f(seq.frame_id_n_bits); // current_frame_id
+    }
+    if !seq.reduced_still_picture {
+        frame_size_override = r.f(1) != 0; // KEY ⇒ a coded bit (not SWITCH)
+    }
+    if seq.order_hint {
+        r.f(seq.order_hint_n_bits); // order_hint
+    }
+    // primary_ref_frame = NONE for KEY (no bits).
+    if seq.decoder_model_info_present && r.f(1) != 0 {
+        return None; // buffer_removal_time_present — timed stream, not a still
+    }
+    // refresh_frame_flags = 0xff (no bits) for a shown KEY frame.
+
+    // frame_size(): explicit dimensions only when overridden, else sequence dims.
+    if frame_size_override {
+        h.frame_width = r.f(seq.frame_width_bits) + 1;
+        h.frame_height = r.f(seq.frame_height_bits) + 1;
+    } else {
+        h.frame_width = seq.width;
+        h.frame_height = seq.height;
+    }
     // superres_params()
     h.use_superres = seq.enable_superres && r.f(1) != 0;
     h.superres_denom = if h.use_superres {
@@ -717,6 +875,12 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
     }
     if allow_screen_content_tools && h.upscaled_width == h.frame_width {
         h.allow_intrabc = r.f(1) != 0;
+    }
+    // disable_frame_end_update_cdf: coded in the full header (when CDF update is
+    // on); the reduced header implies 1 and codes no bit. (For KEY/intra there is
+    // no inter reference syntax between this and the preceding fields.)
+    if !seq.reduced_still_picture && !h.disable_cdf_update {
+        r.f(1); // disable_frame_end_update_cdf
     }
 
     // tile_info() (AV1 §5.9.15)

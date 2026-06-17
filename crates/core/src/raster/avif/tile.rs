@@ -2976,6 +2976,52 @@ mod tests {
         }
     }
 
+    /// Full (non-reduced) sequence + frame header path — exercised by an AVIF
+    /// whose `reduced_still_picture_header` is 0 (e.g. ffmpeg/libaom without
+    /// `-still-picture`). Validates the operating-points / feature-flag seq parse
+    /// and the KEY-frame preamble in the frame parse by decoding bit-exact vs
+    /// dav1d (content is the validated 2-colour palette stripe).
+    #[test]
+    fn nonreduced_header_matches_dav1d() {
+        use super::super::{
+            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
+            OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+        };
+        let avif = include_bytes!("../fixtures/av1palns.avif");
+        let reference = include_bytes!("../fixtures/av1palns_ref.yuv");
+        let stream = extract_av1_stream(avif).unwrap();
+        let obus = split_obus(&stream).unwrap();
+        let seq = parse_sequence_header(
+            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+        )
+        .unwrap();
+        assert!(
+            !seq.reduced_still_picture,
+            "fixture must use the full (non-reduced) sequence header"
+        );
+        let frame = obus
+            .iter()
+            .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)
+            .unwrap();
+        let fh = parse_frame_header(&seq, frame.data).unwrap();
+        let off = tile_data_offset(fh.header_bits);
+        let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
+        let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
+        let mut tile = Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+        tile.decode();
+        let mut refoff = 0usize;
+        for p in 0..3 {
+            let (buf, pw, ph) = tile.plane(p);
+            let n = pw * ph;
+            let mut maxd = 0i32;
+            for i in 0..n {
+                maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
+            }
+            assert_eq!(maxd, 0, "non-reduced: plane {p} ({pw}x{ph}) differs from dav1d");
+            refoff += n;
+        }
+    }
+
     /// End-to-end CDEF (§7.15), `cdef_bits == 0` path, validated bit-exact vs
     /// dav1d on three 64×64 stills (deblock ON, loop restoration OFF). `cdefoff`
     /// (CDEF disabled) proves the pre-CDEF lossy+deblock reconstruction already
