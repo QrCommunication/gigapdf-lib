@@ -32,6 +32,9 @@ hmac = "0.12"
 # (AESV2/AESV3) and PKCS#12 PBES2 — replaces the hand-rolled GF(2⁸) AES.
 aes = "0.8"
 cbc = "0.1"
+# Legacy PKCS#12 PBES1 ciphers (3DES key bags, RC2-40 cert bags) — audited.
+des = "0.8"
+rc2 = "0.8"
 # Embedded JavaScript engine (pure Rust) for the HTML→PDF inline-<script> path,
 # replacing the former hand-written interpreter. Unlicense/MIT.
 boa_engine = "0.21"
