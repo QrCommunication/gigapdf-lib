@@ -169,7 +169,48 @@ Always re-verify the licence at the source before downloading or shipping anythi
 5. **Continuous.** Use **Tesseract `tessdata_best` as a teacher** to auto-label unlabeled scans
    (semi-supervised) where licences of real datasets are restrictive.
 
-## 8. Licensing cautions
+## 8. Implemented handwriting pipeline (what is actually wired)
+
+Two ungated, dependency-light sources feed handwriting into training. The gated references
+in §2–6 (official IAM, CASIA, KHATT, IIIT-HW…) need an HF token — see §8.3.
+
+### 8.1 Synthetic handwriting fonts
+`tools/ocr/fonts.py <group> --handwriting` downloads the Google-Fonts **Handwriting**
+category filtered to the group's script subsets (`handwriting_fonts_for_group`). Rendering
+corpus lines in these cursive/handprint faces is the TRDG/Tesseract recipe for handwriting
+robustness; a cmap guard (`font_covers`) stops a Latin face from rendering tofu on
+Cyrillic/Greek. Counts: Latin ~199 faces, other scripts far fewer (Cyrillic 15, Greek/Deva 4,
+Arabic 1, Tamil 1, Bengali 0) — so real datasets matter more there. Trainer knob
+**`GIGA_OCR_HW_FRAC`** = fraction of lines drawn in a covering handwriting face.
+
+### 8.2 Real handwriting datasets (HF datasets-server REST)
+`tools/ocr/hw_datasets.py` streams real (image, transcription) line pairs via the HuggingFace
+**datasets-server** — no `datasets`/`pyarrow` dependency — normalised to the render_lines
+strip convention (H=32, ink-high, float32) with a pickle-free `.npz` cache. Trainer knobs
+**`GIGA_OCR_HW_REAL="iam,rimes,…"`** + `GIGA_OCR_HW_REAL_N`. Ungated mirrors wired:
+
+| Alias | HF dataset (ungated) | Script / lang | Group |
+|-------|----------------------|---------------|-------|
+| `iam` | Teklia/IAM-line | English HW | alpha |
+| `rimes` | Teklia/RIMES-2011-line | French HW | alpha |
+| `norhand` | Teklia/NorHand-v3-line | Norwegian HW | alpha |
+| `newseye` | Teklia/NewsEye-Austrian-line | German HW | alpha |
+| `belfort` | Teklia/Belfort-line | French HW | alpha |
+| `esposalles` | Teklia/Esposalles-line | Catalan HW | alpha |
+| `cyrillic` | deepcopy/synthetic-handwritten-cyrillic-180k | Cyrillic HW | alpha |
+| `casia` | Teklia/CASIA-HWDB2-line | Chinese HW | cjk |
+
+(datasets-server serves only the *converted* row subset for some datasets, so a few cap low:
+IAM ~800, Cyrillic ~1.1k observed.)
+
+### 8.3 HuggingFace token (unlocks gated handwriting)
+`hw_datasets._hf_token()` reads `HF_TOKEN`/`HUGGINGFACE_TOKEN`/`HUGGING_FACE_HUB_TOKEN` env or
+`~/.huggingface/token` and sends `Authorization: Bearer` to huggingface.co. A token unlocks
+gated corpora — most needed for **Arabic** and **Indic** (Devanagari/Bengali/Tamil) where
+ungated line-level (image+text) mirrors are scarce (official IAM, CASIA-full, KHATT, IIIT-HW).
+**Latin, Cyrillic and Chinese are already covered ungated** (table above).
+
+## 9. Licensing cautions
 
 - **Ship only ✅-licensed derived weights.** Models trained on 🔶/⛔ data may inherit usage
   restrictions — keep such data to *internal validation* unless the licence permits otherwise.

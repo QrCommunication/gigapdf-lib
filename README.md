@@ -131,11 +131,18 @@ to the mono-glyph classifier otherwise.
 
 - **Trained today:** group **`alpha`** — **Latin-extended + Cyrillic + Greek** printed
   (Polish, Czech, Turkish, Vietnamese, Russian, Ukrainian, Greek, …). On a synthetic
-  multi-script clean-print benchmark it lands **within ~2 CER points of Tesseract 5.3.4**
-  (CER 0.278 vs 0.258, WER 0.68 vs 0.62 — see [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md)),
+  multi-script clean-print benchmark it **matches and edges out Tesseract 5.3.4 on CER**
+  (CER 0.248 vs 0.258, WER 0.637 vs 0.624 — see [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md)),
   with **homoglyph script disambiguation** snapping Latin/Greek/Cyrillic lookalikes (A/Α/А).
+  *Caveat:* synthetic clean print on the four trained languages; real degraded scans and
+  untrained scripts still favour Tesseract's breadth.
+- **Also trained:** group **`taml`** — **Tamil** (121 classes). Also **beats Tesseract**
+  on synthetic clean print (CER 0.091 vs 0.101, WER 0.39 vs 0.60) — first non-Latin script.
+- **Handwriting:** training mixes synthetic cursive/handprint fonts (Google Fonts
+  *Handwriting*, cmap-guarded) and **real handwriting datasets** (IAM, RIMES, … via the
+  HuggingFace datasets-server) — see [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
 - **Infra ready, not yet trained:** `cjk` (Chinese/Japanese/Korean), `arabic`
-  (Arabic/Hebrew, RTL), `deva`/`beng`/`taml` (Indic) — class sets, fonts and the trainer
+  (Arabic/Hebrew, RTL), `deva`/`beng` (Indic) — class sets, fonts and the trainer
   are in place; each is one training run away, with **no runtime change**.
 - Design: [`docs/OCR_ARCHITECTURE.md`](docs/OCR_ARCHITECTURE.md) · data catalogue:
   [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md) · training log:

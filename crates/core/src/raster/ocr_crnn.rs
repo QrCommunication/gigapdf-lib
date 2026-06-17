@@ -25,7 +25,9 @@
 //! (empty by default → the caller falls back to the mono-glyph classifier); the
 //! numerically-exact primitives (GRU cell, CTC decode) are unit-tested here.
 
-use super::ocr::{conv2d_relu, dense, maxpool2, sauvola_ink, OcrResult, OcrWord};
+use super::ocr::{
+    conv2d_relu, connected_components, dense, maxpool2, sauvola_ink, OcrResult, OcrWord,
+};
 
 /// Height (rows) every line strip is normalized to before the conv stack.
 pub(crate) const STRIP_H: usize = 32;
@@ -285,6 +287,83 @@ fn recognize_line(m: &Crnn, strip: &[f32], w: usize) -> (String, f32) {
     (text, conf_sum / t_len as f32)
 }
 
+/// Rotate a grayscale image about its centre by `angle` rad (bilinear; out-of-bounds →
+/// white). Used to deskew a page before line extraction.
+fn rotate_gray(gray: &[u8], w: usize, h: usize, angle: f64) -> Vec<u8> {
+    let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
+    let (s, c) = angle.sin_cos();
+    let mut out = vec![255u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (x as f64 - cx, y as f64 - cy);
+            let sx = cx + dx * c + dy * s; // inverse map: output → source
+            let sy = cy - dx * s + dy * c;
+            if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f64 || sy >= (h - 1) as f64 {
+                continue; // leave white
+            }
+            let (x0, y0) = (sx as usize, sy as usize);
+            let (fx, fy) = (sx - x0 as f64, sy - y0 as f64);
+            let p = |xx: usize, yy: usize| gray[yy * w + xx] as f64;
+            let top = p(x0, y0) * (1.0 - fx) + p(x0 + 1, y0) * fx;
+            let bot = p(x0, y0 + 1) * (1.0 - fx) + p(x0 + 1, y0 + 1) * fx;
+            out[y * w + x] = (top * (1.0 - fy) + bot * fy).round() as u8;
+        }
+    }
+    out
+}
+
+/// Estimate text skew (radians) as the shear that maximizes the sharpness (sum of
+/// squared row-sums) of the horizontal ink projection — small range, coarse step.
+fn estimate_skew(ink: &[bool], w: usize, h: usize) -> f64 {
+    let (mut best_angle, mut best_score) = (0.0f64, -1.0f64);
+    let cx = w as f64 / 2.0;
+    for i in -10i32..=10 {
+        let angle = i as f64 * 0.01; // ±0.1 rad ≈ ±5.7°
+        let t = angle.tan();
+        let mut prof = vec![0u32; h];
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                if ink[row + x] {
+                    // Shear about the centre column so a flat band stays put at t≈0
+                    // (an off-centre shear + floor would spuriously concentrate it).
+                    let yy = y as f64 - (x as f64 - cx) * t;
+                    if yy >= 0.0 && (yy as usize) < h {
+                        prof[yy as usize] += 1;
+                    }
+                }
+            }
+        }
+        let score: f64 = prof.iter().map(|&v| (v as f64) * (v as f64)).sum();
+        if score > best_score {
+            best_score = score;
+            best_angle = angle;
+        }
+    }
+    best_angle
+}
+
+/// Drop connected components smaller than `min_px` pixels from the ink mask
+/// (salt-and-pepper despeckle); glyphs are far larger and are kept.
+fn despeckle(ink: &mut [bool], w: usize, h: usize, min_px: usize) {
+    let (_blobs, labels) = connected_components(ink, w, h);
+    let n = labels.iter().filter(|&&l| l >= 0).map(|&l| l as usize + 1).max().unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    let mut counts = vec![0usize; n];
+    for &l in &labels {
+        if l >= 0 {
+            counts[l as usize] += 1;
+        }
+    }
+    for (i, slot) in ink.iter_mut().enumerate() {
+        if *slot && labels[i] >= 0 && counts[labels[i] as usize] < min_px {
+            *slot = false;
+        }
+    }
+}
+
 /// Extract reading-order line strips from a grayscale page via a **horizontal
 /// projection profile**: binarize → ink-count per row → contiguous row bands (small
 /// intra-line gaps merged) = text lines → crop each band's ink bbox and scale to
@@ -297,11 +376,19 @@ fn extract_line_strips(gray: &[u8], w: usize, h: usize) -> Vec<LineStrip> {
     if w == 0 || h == 0 || gray.len() < w * h {
         return out;
     }
-    // Adaptive (Sauvola) binarization — robust to uneven illumination / grey scans;
-    // window scales with image height. Drives line/column detection only; the strips
-    // still sample raw grayscale intensity.
+    // Front-end: adaptive binarization (Sauvola) → deskew (projection-variance) →
+    // despeckle. Robust to uneven illumination, page tilt and salt-noise on real scans;
+    // all no-ops on clean print (skew ≈ 0 ⇒ no rotation). Strips sample raw grayscale.
     let radius = (h / 50).clamp(8, 24);
-    let ink = sauvola_ink(gray, w, h, radius, 0.34);
+    let ink0 = sauvola_ink(gray, w, h, radius, 0.34);
+    let angle = estimate_skew(&ink0, w, h);
+    let deskewed = if angle.abs() > 0.012 { Some(rotate_gray(gray, w, h, -angle)) } else { None };
+    let gview: &[u8] = deskewed.as_deref().unwrap_or(gray);
+    let mut ink = match &deskewed {
+        Some(rg) => sauvola_ink(rg, w, h, radius, 0.34),
+        None => ink0,
+    };
+    despeckle(&mut ink, w, h, 3);
     // Ink pixels per row → text-line bands.
     let mut row_ink = vec![0u32; h];
     for (y, slot) in row_ink.iter_mut().enumerate() {
@@ -360,7 +447,7 @@ fn extract_line_strips(gray: &[u8], w: usize, h: usize) -> Vec<LineStrip> {
                 let sy = y0 + ((oy as f64 + 0.5) / scale) as usize;
                 let sx = x0 + ((ox as f64 + 0.5) / scale) as usize;
                 if sy <= y1 && sx <= x1 && sy < h && sx < w {
-                    strip[oy * sw + ox] = (255 - gray[sy * w + sx] as u16) as f32 / 255.0;
+                    strip[oy * sw + ox] = (255 - gview[sy * w + sx] as u16) as f32 / 255.0;
                 }
             }
         }
@@ -841,5 +928,48 @@ mod tests {
         assert_eq!(disambiguate_word(&s), s);
         // Per-token over a line, spaces preserved.
         assert_eq!(disambiguate_line("food bar"), "food bar");
+    }
+
+    // ── front-end: deskew / despeckle (Lever B) ────────────────────────────
+    #[test]
+    fn estimate_skew_recovers_tilt() {
+        let (w, h) = (60usize, 40usize);
+        let mut flat = vec![false; w * h];
+        let mut tilt = vec![false; w * h];
+        for x in 0..w {
+            for dy in 0..3 {
+                flat[(20 + dy) * w + x] = true;
+                let y = 20 + (x as f64 * 0.05).round() as usize + dy;
+                if y < h {
+                    tilt[y * w + x] = true;
+                }
+            }
+        }
+        assert!(estimate_skew(&flat, w, h).abs() < 1e-9, "flat band → no skew");
+        assert!((estimate_skew(&tilt, w, h) - 0.05).abs() < 0.02, "recovers ~0.05 rad tilt");
+    }
+
+    #[test]
+    fn despeckle_drops_specks_keeps_glyph() {
+        let (w, h) = (20usize, 20usize);
+        let mut ink = vec![false; w * h];
+        for y in 5..10 {
+            for x in 5..10 {
+                ink[y * w + x] = true; // 25-px block
+            }
+        }
+        ink[0] = true; // isolated speck
+        ink[2 * w + 15] = true; // isolated speck
+        despeckle(&mut ink, w, h, 3);
+        assert!(ink[7 * w + 7], "glyph block kept");
+        assert!(!ink[0] && !ink[2 * w + 15], "specks removed");
+    }
+
+    #[test]
+    fn rotate_gray_is_identity_at_zero() {
+        let (w, h) = (10usize, 10usize);
+        let mut g = vec![0u8; w * h];
+        g[5 * w + 5] = 200;
+        assert_eq!(rotate_gray(&g, w, h, 0.0)[5 * w + 5], 200);
     }
 }

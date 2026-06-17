@@ -33,7 +33,9 @@ augmentation (blur + sensor noise)─┘            → train_ocr_crnn.py (CRNN 
 | 1 | 3 ep, 2 Google-API fonts, lr 1e-3 | val_CER **1.000** | All-blank CTC collapse **and** the API fonts were Latin-only → Cyrillic/Greek lines rendered as tofu (corrupt targets). |
 | 2 | 30 ep, system fonts, lr 1e-3 | escaped at ep 8 (0.998) → **0.89** by ep 13 | Coverage-filtered system fonts fixed the tofu; lr 1e-3 escaped the all-blank basin but converged too slowly. |
 | 3 | 60 ep, lr **3e-3 + StepLR**, no space class | val_CER **0.156** | Higher LR + decay: 0.64 (ep 8) → 0.29 (ep 17) → 0.156 (ep 60). Strong on clean strips. |
-| 4 | 60 ep, lr 3e-3, **+ space class**, Sauvola inference | val_CER **0.174** | Space as a class fixed word boundaries (pipeline WER 1.00 → 0.70). **Competitive with Tesseract** — see below. |
+| 4 | 60 ep, lr 3e-3, **+ space class**, Sauvola inference | val_CER **0.174** | Space as a class fixed word boundaries (pipeline WER 1.00 → 0.70). Competitive with Tesseract — see below. |
+| 5 | 60 ep, **60 fonts / 16k lines**, + disambiguation | val_CER **0.120** | More font/data diversity. **Beats Tesseract on CER** (0.248 vs 0.258) — see below. |
+| 6 | 60 ep, group **`taml`** (Tamil, 121 classes, 120 fonts) | val_CER **0.045** | First non-Latin model. **Beats Tesseract** on Tamil (CER 0.091 vs 0.101, WER 0.39 vs 0.60). |
 
 CER here is **per-character on held-out validation strips** (same render distribution),
 measured inside the trainer — it isolates the *model*, not the full image pipeline.
@@ -75,17 +77,33 @@ augmentation, dark-on-white, ×3 upscale), runs both engines on identical PNGs
 | Run 3 + blob-grouping front-end | 0.80 | 1.04 | 0.26 | 0.62 |
 | Run 3 + projection-profile front-end | 0.37 | 1.00 | 0.26 | 0.62 |
 | Run 4 (+ space class, + Sauvola) | 0.295 | 0.70 | 0.258 | 0.624 |
-| **Run 4 + script disambiguation** | **0.278** | **0.683** | 0.258 | 0.624 |
+| Run 4 + script disambiguation | 0.278 | 0.683 | 0.258 | 0.624 |
+| **Run 5 (60 fonts / 16k lines) + disambiguation** | **0.248** | **0.637** | 0.258 | 0.624 |
 
-Honest reading: the dependency-free CRNN is now **within ~2 CER points of Tesseract** on
-this synthetic multi-script clean-print set (0.278 vs 0.258), having started at 0.80. The
-space class recovered word boundaries (WER 1.00 → 0.70); **script disambiguation**
-(homoglyph snapping, `disambiguate_line` in `ocr_crnn.rs`) fixed most of the remaining
-Latin/Greek/Cyrillic lookalike confusion — e.g. `«FRAΝΚFURTΕR` → `«FRANKFURTER`. The
-residual gap is now genuine **recognition quality** on hard tokens (more fonts/data/epochs
-would close it), not script confusion. A full **lexicon/n-gram beam CTC** is the next
-decoder step. Caveats: synthetic clean print at the training distribution; real degraded
-scans remain harder and Tesseract still leads there.
+Honest reading: the dependency-free CRNN now **matches and edges out Tesseract on CER**
+(0.248 vs 0.258), WER essentially tied (0.637 vs 0.624) — having started at 0.80. The path:
+projection-profile lines (0.80→0.37), space class (WER 1.00→0.70), homoglyph disambiguation
+(0.295→0.278), then the improved retrain — 60 coverage-filtered fonts + 16k corpus lines,
+val_CER 0.120 — closing the recognition-quality gap (0.278→0.248). **Caveats:** this is
+synthetic, clean, machine-print text at the training distribution, on the four trained
+languages (en/fr/ru/el). On real degraded scans, handwriting, and untrained languages
+Tesseract is broader and likely still leads. A full lexicon/n-gram beam CTC and the other
+script groups remain future work.
+
+### Tamil (`taml` group) — first non-Latin model
+
+| Engine | CER | WER |
+|--------|-----|-----|
+| **gigapdf** (`taml`, 121 classes, val_CER 0.045) | **0.091** | **0.390** |
+| Tesseract 5.3.4 (`tam`, tessdata_best) | 0.101 | 0.602 |
+
+A second script, a second win: the Tamil CRNN+CTC **beats Tesseract on both CER and WER**
+on synthetic clean print. Tamil's smaller alphabet (121 vs alpha's 557) and the 120
+coverage-filtered Noto Tamil faces let the same tiny backbone (16/32/64) reach val_CER
+0.045. Shaping is correct because PIL has **raqm** (HarfBuzz) — Tamil matras/ligatures
+render properly, not as isolated forms. CJK is deferred (a 16/32/64 backbone can't hold
+3 000+ classes, and only one system CJK face is installed); Arabic/Hebrew/Indic-other need
+their datasets. Same caveat as alpha: synthetic clean print at the training distribution.
 
 ## Reproduce
 
@@ -105,10 +123,11 @@ Knobs (env): `GIGA_OCR_NLINES`, `GIGA_OCR_MAXCHARS`, `GIGA_OCR_LANGS`,
 
 | Group | Scripts | Infra | Model |
 |-------|---------|-------|-------|
-| `alpha` | Latin-ext + Cyrillic + Greek | ✅ | ✅ trained (this log) |
-| `cjk` | Chinese / Japanese / Korean | ✅ class sets + fonts | ⏳ not trained |
+| `alpha` | Latin-ext + Cyrillic + Greek | ✅ | ✅ trained — **beats Tesseract** (CER 0.248 vs 0.258) |
+| `taml` | Tamil | ✅ | ✅ trained — **beats Tesseract** (CER 0.091 vs 0.101) |
+| `cjk` | Chinese / Japanese / Korean | ✅ class sets + fonts | ⏳ not trained (capacity; CASIA-HWDB2 HW data available) |
 | `arabic` | Arabic / Hebrew (RTL) | ✅ | ⏳ not trained |
-| `deva` / `beng` / `taml` | Indic | ✅ | ⏳ not trained |
+| `deva` / `beng` | Indic (Devanagari, Bengali) | ✅ | ⏳ not trained |
 
 Each group trains with the same command (`train_ocr_crnn.py <group>`) and wires in via
 its `ocr-<group>` Cargo feature; no runtime code change.

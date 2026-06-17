@@ -131,8 +131,9 @@ when retraining — only the embedded int8 weights.
 **Status (built):** `ocr_crnn.rs` (pure-`std` CNN + bidirectional GRU + CTC greedy),
 Sauvola adaptive binarization, projection-profile line bands, and the `tools/ocr/`
 trainer/data pipeline are in place. Group **`alpha`** (Latin-extended + Cyrillic + Greek)
-is **trained** (`ocr_model_alpha.rs`, val_CER 0.174) and **competitive with Tesseract**
-on clean multi-script print (see [`OCR_TRAINING_LOG.md`](./OCR_TRAINING_LOG.md)). `ocr()`
+is **trained** (`ocr_model_alpha.rs`, val_CER 0.120) and **matches/edges out Tesseract on
+CER** (0.248 vs 0.258) on clean multi-script print (see
+[`OCR_TRAINING_LOG.md`](./OCR_TRAINING_LOG.md)). `ocr()`
 routes to the CRNN when a per-script model is embedded and **falls back** to the
 mono-glyph classifier otherwise.
 
@@ -152,9 +153,13 @@ without retraining). The Cargo `ocr-*` features remain as an optional build-time
 
 **Script disambiguation (built).** `disambiguate_line` (in `ocr_crnn.rs`) votes each
 token's script from its **unambiguous** letters and snaps homoglyphs (Latin A / Greek Α /
-Cyrillic А) to it — fixed most of the multi-script lookalike confusion (CER 0.295 → 0.278,
-~2 points from Tesseract; e.g. `«FRAΝΚFURTΕR` → `«FRANKFURTER`).
+Cyrillic А) to it — fixed most of the multi-script lookalike confusion (CER 0.295 → 0.278 at
+that step, before the improved retrain; e.g. `«FRAΝΚFURTΕR` → `«FRANKFURTER`).
+
+**Deskew + despeckle (built).** `extract_line_strips` estimates page skew (projection-
+variance over ±5.7°, centred shear), deskews via a bilinear rotation, and despeckles small
+connected components — robust to tilted/noisy scans, no-ops on clean print (skew ≈ 0).
 
 **Next (planned):** (a) a full **lexicon / char-n-gram beam CTC** (the disambiguation
-above is the lexicon-lite first step); (b) deskew/despeckle + multi-column XY-cut layout;
+above is the lexicon-lite first step); (b) multi-column **XY-cut** layout analysis;
 (c) train the CJK / Arabic-Hebrew / Indic groups.

@@ -149,6 +149,7 @@ def build_and_train(group: str, epochs: int):
 
     import corpora
     import fonts as fontmod
+    import hw_datasets
     import render_lines as rl
 
     ev = importlib.import_module("eval")
@@ -211,18 +212,50 @@ def build_and_train(group: str, epochs: int):
     if not fonts:
         sys.exit(f"no fonts for '{group}' — check network / fonts.py")
     rsel = random.Random(7)
+    # Handwriting mix: with probability GIGA_OCR_HW_FRAC, render a line in a
+    # cursive/handprint face (downloaded via `fonts.py <group> --handwriting`) instead
+    # of a printed one — trains robustness to real handwriting. Default 0 = unchanged.
+    hw_frac = float(os.environ.get("GIGA_OCR_HW_FRAC", 0))
+    hw_fonts = fontmod.local_handwriting_fonts(group) if hw_frac > 0 else []
     lines = corpora.sample_lines(group, n_lines, seed=7, max_chars=max_chars)
-    print(f"  corpus lines: {len(lines)}  (max_chars={max_chars}, fonts={len(fonts)}, langs={SCRIPTS[group]['langs']})")
+    print(f"  corpus lines: {len(lines)}  (max_chars={max_chars}, fonts={len(fonts)}, "
+          f"hw_fonts={len(hw_fonts)} @ frac={hw_frac}, langs={SCRIPTS[group]['langs']})")
+
+    def pick_font(text: str) -> str:
+        # cmap-guarded handwriting pick (no tofu when a Latin face meets Cyrillic/Greek);
+        # falls back to a printed font if no handwriting face covers the line.
+        if hw_fonts and rsel.random() < hw_frac:
+            for _ in range(6):
+                f = rsel.choice(hw_fonts)
+                if fontmod.font_covers(f, text):
+                    return f
+        return rsel.choice(fonts)
+
     samples = []
     for text in lines:
-        r = rl.render_line(text, rsel.choice(fonts), augment=True, rng=rsel)
+        r = rl.render_line(text, pick_font(text), augment=True, rng=rsel)
         if r is None:
             continue
         arr, t = r
         tgt = [idx[c] for c in t if c in idx]
         if tgt and arr.shape[1] >= 8:
             samples.append((arr.astype(np.float32), tgt))
-    print(f"  usable line samples: {len(samples)}")
+    print(f"  usable line samples: {len(samples)} (synthetic)")
+
+    # Real handwriting lines (IAM/RIMES via HF datasets-server, see hw_datasets.py) —
+    # genuine cursive, normalised to the same strip convention and filtered to the
+    # alphabet. Opt-in via GIGA_OCR_HW_REAL="iam,rimes" (Latin → only the alpha group).
+    hw_real = os.environ.get("GIGA_OCR_HW_REAL", "").strip()
+    if hw_real:
+        per = int(os.environ.get("GIGA_OCR_HW_REAL_N", 4000))
+        added = 0
+        for ds in (d.strip() for d in hw_real.split(",") if d.strip()):
+            for arr, t in hw_datasets.fetch_lines(ds, per):
+                tgt = [idx[c] for c in t if c in idx]
+                if tgt and arr.shape[1] >= 8:
+                    samples.append((arr.astype(np.float32), tgt))
+                    added += 1
+        print(f"  + real handwriting samples: {added} (from {hw_real})")
 
     def collate(batch):
         maxw = max(a.shape[1] for a, _ in batch)
