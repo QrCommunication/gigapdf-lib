@@ -856,15 +856,19 @@ pub(crate) struct Av1Tile<'a> {
     /// Frame `loop_filter_sharpness` (for the FilterLUT) + base Y levels (the on/off gate).
     db_sharpness: u32,
     db_level_y: [u32; 2],
-    /// CDEF (§7.15) frame params. Only `cdef_bits == 0` (a single strength set,
-    /// applied to every 64×64) is wired today — no per-block `cdef_idx` is read
-    /// from the entropy stream yet, so `cdef_bits > 0` is left unfiltered.
+    /// CDEF (§7.15) frame params. `cdef_bits` strength sets (1..=8) are carried;
+    /// the per-64×64 `cdef_idx` (decoded in `decode_block`) selects which set a
+    /// block uses. `cdef_bits == 0` ⇒ a single set, index 0 everywhere.
     cdef_bits: u32,
     cdef_damping: i32,
-    cdef_y_pri: i32,
-    cdef_y_sec: i32,
-    cdef_uv_pri: i32,
-    cdef_uv_sec: i32,
+    cdef_y_pri: [i32; 8],
+    cdef_y_sec: [i32; 8],
+    cdef_uv_pri: [i32; 8],
+    cdef_uv_sec: [i32; 8],
+    /// Per-64×64 CDEF strength-set index (`-1` = not yet decoded). Grid stride
+    /// `cdef_cols` (number of 64×64 units across the frame).
+    cdef_idx: Vec<i8>,
+    cdef_cols: usize,
     /// Per-4×4 luma "block had coded coefficients" grid (mi_cols × mi_rows): CDEF
     /// skips all-skip 8×8 blocks (dav1d `noskip_mask`).
     cdef_noskip: Vec<u8>,
@@ -1017,10 +1021,12 @@ impl<'a> Av1Tile<'a> {
             db_level_y: [fh.loop_filter_level[0], fh.loop_filter_level[1]],
             cdef_bits: fh.cdef_bits,
             cdef_damping: fh.cdef_damping as i32,
-            cdef_y_pri: fh.cdef_y_pri[0] as i32,
-            cdef_y_sec: fh.cdef_y_sec[0] as i32,
-            cdef_uv_pri: fh.cdef_uv_pri[0] as i32,
-            cdef_uv_sec: fh.cdef_uv_sec[0] as i32,
+            cdef_y_pri: std::array::from_fn(|i| fh.cdef_y_pri[i] as i32),
+            cdef_y_sec: std::array::from_fn(|i| fh.cdef_y_sec[i] as i32),
+            cdef_uv_pri: std::array::from_fn(|i| fh.cdef_uv_pri[i] as i32),
+            cdef_uv_sec: std::array::from_fn(|i| fh.cdef_uv_sec[i] as i32),
+            cdef_idx: Vec::new(),
+            cdef_cols: 0,
             cdef_noskip: Vec::new(),
         }
     }
@@ -1039,6 +1045,10 @@ impl<'a> Av1Tile<'a> {
         }
         // Per-MI (4×4 luma) "block coded coefficients" grid for CDEF skip.
         self.cdef_noskip = vec![0u8; self.geom.mi_cols as usize * self.geom.mi_rows as usize];
+        // Per-64×64 CDEF strength-set index grid (-1 = not yet decoded).
+        self.cdef_cols = (self.geom.mi_cols as usize + 15) >> 4;
+        let cdef_rows = (self.geom.mi_rows as usize + 15) >> 4;
+        self.cdef_idx = vec![-1i8; self.cdef_cols * cdef_rows];
         let sb4: u32 = if self.sb_bl == BL_128X128 { 32 } else { 16 };
         let mut row = 0;
         while row < self.geom.mi_rows {
@@ -1121,19 +1131,21 @@ impl<'a> Av1Tile<'a> {
         }
     }
 
-    /// Apply CDEF (§7.15) over the post-deblock planes — the `cdef_bits == 0`
-    /// single-strength path (no per-block `cdef_idx`). For each coded 8×8 luma
-    /// block: find the dominant direction, then filter luma (variance-adjusted
-    /// primary) and the matching 4:2:0 chroma (`damping − 1`, identity dir). All
-    /// taps read a pre-CDEF clone of each plane so neighbour filtering doesn't
-    /// feed back.
+    /// Apply CDEF (§7.15) over the post-deblock planes. Each coded 8×8 luma block
+    /// selects its strength set via the per-64×64 `cdef_idx` decoded in
+    /// `decode_block` (`cdef_bits == 0` ⇒ index 0 everywhere), finds the dominant
+    /// direction, then filters luma (variance-adjusted primary) and the matching
+    /// 4:2:0 chroma (`damping − 1`, identity dir). All taps read a pre-CDEF clone
+    /// of each plane so neighbour filtering doesn't feed back.
     fn apply_cdef(&mut self) {
-        if self.cdef_bits != 0 {
-            return; // per-block cdef_idx (cdef_bits > 0) is not parsed yet
-        }
-        let (y_pri, y_sec) = (self.cdef_y_pri, self.cdef_y_sec);
-        let (uv_pri, uv_sec) = (self.cdef_uv_pri, self.cdef_uv_sec);
-        if y_pri == 0 && y_sec == 0 && uv_pri == 0 && uv_sec == 0 {
+        // No-op when every strength set is zero.
+        let n_sets = 1usize << self.cdef_bits;
+        if (0..n_sets).all(|i| {
+            self.cdef_y_pri[i] == 0
+                && self.cdef_y_sec[i] == 0
+                && self.cdef_uv_pri[i] == 0
+                && self.cdef_uv_sec[i] == 0
+        }) {
             return;
         }
         let damping = self.cdef_damping;
@@ -1162,31 +1174,39 @@ impl<'a> Av1Tile<'a> {
                     }
                 }
                 if coded {
-                    let (dir, var) = if y_pri != 0 || uv_pri != 0 {
-                        cdef::cdef_find_dir(&src[0][by * yw + bx..], yw)
-                    } else {
-                        (0, 0)
-                    };
-                    let adj_y_pri = if y_pri != 0 { cdef::adjust_strength(y_pri, var) } else { 0 };
-                    if adj_y_pri != 0 || y_sec != 0 {
-                        let ydir = if y_pri != 0 { dir as usize } else { 0 };
-                        cdef_apply_one(
-                            &mut self.planes[0], &src[0], yw, yh, bx, by, 8, 8, adj_y_pri, y_sec,
-                            ydir, damping,
-                        );
-                    }
-                    if !mono && (uv_pri != 0 || uv_sec != 0) {
-                        let uvdir = if uv_pri != 0 { dir as usize } else { 0 };
-                        let (cx, cy) = (bx >> ssx, by >> ssy);
-                        let (cw, ch) = (8 >> ssx, 8 >> ssy);
-                        cdef_apply_one(
-                            &mut self.planes[1], &src[1], cpw, cph, cx, cy, cw, ch, uv_pri, uv_sec,
-                            uvdir, damping - 1,
-                        );
-                        cdef_apply_one(
-                            &mut self.planes[2], &src[2], cpw, cph, cx, cy, cw, ch, uv_pri, uv_sec,
-                            uvdir, damping - 1,
-                        );
+                    // Select this 64×64 unit's strength set via its decoded index.
+                    let unit = (by / 64) * self.cdef_cols + (bx / 64);
+                    let ci = self.cdef_idx.get(unit).copied().unwrap_or(0).max(0) as usize;
+                    let (y_pri, y_sec) = (self.cdef_y_pri[ci], self.cdef_y_sec[ci]);
+                    let (uv_pri, uv_sec) = (self.cdef_uv_pri[ci], self.cdef_uv_sec[ci]);
+                    if y_pri != 0 || y_sec != 0 || uv_pri != 0 || uv_sec != 0 {
+                        let (dir, var) = if y_pri != 0 || uv_pri != 0 {
+                            cdef::cdef_find_dir(&src[0][by * yw + bx..], yw)
+                        } else {
+                            (0, 0)
+                        };
+                        let adj_y_pri =
+                            if y_pri != 0 { cdef::adjust_strength(y_pri, var) } else { 0 };
+                        if adj_y_pri != 0 || y_sec != 0 {
+                            let ydir = if y_pri != 0 { dir as usize } else { 0 };
+                            cdef_apply_one(
+                                &mut self.planes[0], &src[0], yw, yh, bx, by, 8, 8, adj_y_pri,
+                                y_sec, ydir, damping,
+                            );
+                        }
+                        if !mono && (uv_pri != 0 || uv_sec != 0) {
+                            let uvdir = if uv_pri != 0 { dir as usize } else { 0 };
+                            let (cx, cy) = (bx >> ssx, by >> ssy);
+                            let (cw, ch) = (8 >> ssx, 8 >> ssy);
+                            cdef_apply_one(
+                                &mut self.planes[1], &src[1], cpw, cph, cx, cy, cw, ch, uv_pri,
+                                uv_sec, uvdir, damping - 1,
+                            );
+                            cdef_apply_one(
+                                &mut self.planes[2], &src[2], cpw, cph, cx, cy, cw, ch, uv_pri,
+                                uv_sec, uvdir, damping - 1,
+                            );
+                        }
                     }
                 }
                 bx += 8;
@@ -1262,6 +1282,29 @@ impl<'a> Av1Tile<'a> {
             for r in 0..bh4.min(mir - mi_row) {
                 for c in 0..bw4.min(mic - mi_col) {
                     self.cdef_noskip[((mi_row + r) * mic + mi_col + c) as usize] = 1;
+                }
+            }
+        }
+
+        // CDEF strength-set index (dav1d `read_cdef`): decoded once per 64×64
+        // unit at its first non-skip block, `cdef_bits` equi-bits (0 bits / index
+        // 0 when `cdef_bits == 0`). A block spanning multiple units propagates its
+        // index to each. Read position: right after `skip` (segmentation and
+        // delta-q, which would precede it, are off for the streams we decode).
+        if skip == 0 && !self.cdef_idx.is_empty() {
+            let (u_r0, u_c0) = ((mi_row >> 4) as usize, (mi_col >> 4) as usize);
+            let unit = u_r0 * self.cdef_cols + u_c0;
+            if self.cdef_idx[unit] == -1 {
+                let v = self.msac.bools(self.cdef_bits) as i8;
+                let u_r1 = ((mi_row + bh4 - 1) >> 4) as usize;
+                let u_c1 = ((mi_col + bw4 - 1) >> 4) as usize;
+                for ur in u_r0..=u_r1 {
+                    for uc in u_c0..=u_c1 {
+                        let u = ur * self.cdef_cols + uc;
+                        if u < self.cdef_idx.len() {
+                            self.cdef_idx[u] = v;
+                        }
+                    }
                 }
             }
         }
