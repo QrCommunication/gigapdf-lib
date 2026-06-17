@@ -16,6 +16,7 @@ pub(super) const SMOOTH_PRED: u8 = 9;
 pub(super) const SMOOTH_V_PRED: u8 = 10;
 pub(super) const SMOOTH_H_PRED: u8 = 11;
 pub(super) const PAETH_PRED: u8 = 12;
+pub(super) const CFL_PRED: u8 = 13;
 pub(super) const FILTER_PRED: u8 = 13;
 /// Internal sentinel for the DC_128 downgrade (flat mid-grey).
 const DC_128: u8 = 255;
@@ -33,8 +34,10 @@ pub(super) static SM_WEIGHTS: [i32; 128] = [
     18, 16, 15, 13, 12, 10, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4,
 ];
 
-fn pred_dc(out: &mut [i32], bw: usize, bh: usize, top: &[i32], left: &[i32], ht: bool, hl: bool) {
-    let dc: i32 = match (ht, hl) {
+/// The scalar DC prediction value (dav1d `dc_gen`/`dc_gen_top`/`dc_gen_left`),
+/// also the base for CfL. 128 when neither neighbour is available.
+pub(super) fn dc_value(bw: usize, bh: usize, top: &[i32], left: &[i32], ht: bool, hl: bool) -> i32 {
+    match (ht, hl) {
         (true, true) => {
             let mut s = ((bw + bh) >> 1) as i32;
             for &t in top.iter().take(bw) {
@@ -65,8 +68,11 @@ fn pred_dc(out: &mut [i32], bw: usize, bh: usize, top: &[i32], left: &[i32], ht:
             s >> bh.trailing_zeros()
         }
         (false, false) => 128,
-    };
-    out.fill(dc);
+    }
+}
+
+fn pred_dc(out: &mut [i32], bw: usize, bh: usize, top: &[i32], left: &[i32], ht: bool, hl: bool) {
+    out.fill(dc_value(bw, bh, top, left, ht, hl));
 }
 
 fn pred_v(out: &mut [i32], bw: usize, bh: usize, top: &[i32]) {
@@ -250,6 +256,19 @@ pub(super) fn filter(
     out
 }
 
+/// Chroma-from-luma final blend (`cfl_pred`): `chroma = clip(dc + sign(d) *
+/// ((|d| + 32) >> 6))` where `d = alpha * ac`. `ac` is the mean-removed,
+/// subsampled luma AC; `dc` the chroma DC prediction; `alpha` the signed CfL gain.
+pub(super) fn cfl_apply(dc: i32, ac: &[i32], alpha: i32) -> Vec<i32> {
+    ac.iter()
+        .map(|&a| {
+            let d = alpha * a;
+            let v = (d.abs() + 32) >> 6;
+            (dc + if d < 0 { -v } else { v }).clamp(0, 255)
+        })
+        .collect()
+}
+
 /// Predict a `bw*bh` block for intra `mode` from assembled edges. `top`/`left`
 /// hold ≥ `bw`/`bh` samples; `topleft` is the corner. Returns the row-major
 /// predicted block.
@@ -325,5 +344,15 @@ mod tests {
                 assert_eq!(out, IPRED_REF[base + 7 + fi], "filter {fi} size {n}");
             }
         }
+    }
+
+    #[test]
+    fn cfl_apply_matches_formula() {
+        // chroma = clip(dc + sign(d)*((|d|+32)>>6)), d = alpha*ac.
+        assert_eq!(cfl_apply(128, &[64, -64, 0], 0), vec![128, 128, 128]); // alpha 0
+        assert_eq!(cfl_apply(128, &[64], 2), vec![130]); // d=128 → +2
+        assert_eq!(cfl_apply(128, &[-64], 2), vec![126]); // d=-128 → -2
+        assert_eq!(cfl_apply(10, &[-1000], 5), vec![0]); // clamps at 0
+        assert_eq!(cfl_apply(250, &[1000], 5), vec![255]); // clamps at 255
     }
 }

@@ -980,6 +980,8 @@ impl<'a> Av1Tile<'a> {
             && (bw4 > ss_h || (mi_col & 1) == 1)
             && (bh4 > ss_v || (mi_row & 1) == 1);
         let mut uv_mode = mode::DC_PRED;
+        // CfL alpha [u, v] (signed magnitude, decoded when uv_mode == CFL_PRED).
+        let mut cfl_alpha = [0i32; 2];
         if has_chroma {
             let cfl_allowed = bw4 <= 8 && bh4 <= 8;
             let n_uv = (mode::N_UV_INTRA_PRED_MODES - 1) as usize - (!cfl_allowed as usize);
@@ -993,11 +995,13 @@ impl<'a> Av1Tile<'a> {
                 let sign_v = sign - sign_u * 3;
                 if sign_u != 0 {
                     let ctx = (sign_u == 2) as usize * 3 + sign_v;
-                    self.msac.symbol_adapt(&mut self.cdf.cfl_alpha[ctx], 15);
+                    let mag = self.msac.symbol_adapt(&mut self.cdf.cfl_alpha[ctx], 15) as i32 + 1;
+                    cfl_alpha[0] = if sign_u == 1 { -mag } else { mag };
                 }
                 if sign_v != 0 {
                     let ctx = (sign_v == 2) as usize * 3 + sign_u;
-                    self.msac.symbol_adapt(&mut self.cdf.cfl_alpha[ctx], 15);
+                    let mag = self.msac.symbol_adapt(&mut self.cdf.cfl_alpha[ctx], 15) as i32 + 1;
+                    cfl_alpha[1] = if sign_v == 1 { -mag } else { mag };
                 }
             } else if lw + lh >= 2 && (mode::VERT_PRED..=mode::VERT_LEFT_PRED).contains(&uv_mode) {
                 let idx = (uv_mode - mode::VERT_PRED) as usize;
@@ -1105,7 +1109,9 @@ impl<'a> Av1Tile<'a> {
                 }
             }
         } else {
-            self.decode_residuals(mi_row, mi_col, bs, tx, uvtx, y_mode, y_angle, uv_mode, has_chroma);
+            self.decode_residuals(
+                mi_row, mi_col, bs, tx, uvtx, y_mode, y_angle, uv_mode, cfl_alpha, has_chroma,
+            );
         }
 
         // Propagate this block's mode/skip into the neighbour contexts.
@@ -1493,6 +1499,47 @@ impl<'a> Av1Tile<'a> {
         (cf, res_ctx, txtp, eob)
     }
 
+    /// CfL luma AC for a chroma block at chroma-pixel `(px,py)` size `(bw,bh)`:
+    /// subsample the reconstructed luma footprint (2×2 average for I420, scaled)
+    /// then subtract the block mean. dav1d `cfl_ac_c`. Common (mi-aligned) case;
+    /// no edge padding.
+    fn cfl_ac(&self, px: usize, py: usize, bw: usize, bh: usize) -> Vec<i32> {
+        let ss_h = self.subsampling_x as usize;
+        let ss_v = self.subsampling_y as usize;
+        let lpw = self.plane_w[0];
+        let luma = &self.planes[0];
+        let (lx0, ly0) = (px << ss_h, py << ss_v);
+        let shift = 1 + (ss_v == 0) as i32 + (ss_h == 0) as i32;
+        let mut ac = vec![0i32; bw * bh];
+        for y in 0..bh {
+            let ly = ly0 + (y << ss_v);
+            for x in 0..bw {
+                let base = ly * lpw + lx0 + (x << ss_h);
+                let mut s = luma[base] as i32;
+                if ss_h == 1 {
+                    s += luma[base + 1] as i32;
+                }
+                if ss_v == 1 {
+                    s += luma[base + lpw] as i32;
+                    if ss_h == 1 {
+                        s += luma[base + lpw + 1] as i32;
+                    }
+                }
+                ac[y * bw + x] = s << shift;
+            }
+        }
+        let log2sz = bw.trailing_zeros() + bh.trailing_zeros();
+        let mut sum: i64 = (1i64 << log2sz) >> 1;
+        for &a in &ac {
+            sum += a as i64;
+        }
+        let dc = (sum >> log2sz) as i32;
+        for a in &mut ac {
+            *a -= dc;
+        }
+        ac
+    }
+
     /// Reconstruct one transform block into a pixel plane: intra-predict from the
     /// already-reconstructed top/left neighbours, inverse-transform the residual,
     /// add and clip. Only DC prediction is implemented so far (the fixture's block
@@ -1508,6 +1555,7 @@ impl<'a> Av1Tile<'a> {
         bh: usize,
         mode: u8,
         filt_idx: usize,
+        cfl_alpha: i32,
         cf: &mut [i32],
         tx: usize,
         txtp: u8,
@@ -1554,9 +1602,13 @@ impl<'a> Av1Tile<'a> {
             128
         };
 
-        // Luma filter-intra (FILTER_PRED) vs the standard intra predictors.
+        // Luma filter-intra, chroma CfL, or the standard intra predictors.
         let pred = if plane == 0 && mode == predict::FILTER_PRED {
             predict::filter(bw, bh, &top, &left, topleft, filt_idx)
+        } else if plane != 0 && mode == predict::CFL_PRED {
+            let dc = predict::dc_value(bw, bh, &top, &left, have_top, have_left);
+            let ac = self.cfl_ac(px, py, bw, bh);
+            predict::cfl_apply(dc, &ac, cfl_alpha)
         } else {
             predict::predict(mode, have_top, have_left, bw, bh, &top, &left, topleft)
         };
@@ -1603,6 +1655,7 @@ impl<'a> Av1Tile<'a> {
         y_mode: u8,
         y_angle: u8,
         uv_mode: u8,
+        cfl_alpha: [i32; 2],
         has_chroma: bool,
     ) {
         let dim = BLOCK_DIMENSIONS[bs as usize];
@@ -1647,6 +1700,7 @@ impl<'a> Av1Tile<'a> {
                             (th * 4) as usize,
                             y_mode,
                             y_angle as usize,
+                            0,
                             &mut cf,
                             tx,
                             txtp,
@@ -1671,6 +1725,7 @@ impl<'a> Av1Tile<'a> {
                 if has_chroma {
                     let sub_ch4 = ch4.min((init_y + 16) >> ss_v);
                     let sub_cw4 = cw4.min((init_x + 16) >> ss_h);
+                    #[allow(clippy::needless_range_loop)]
                     for pl in 0..2usize {
                         let mut y = init_y >> ss_v;
                         while y < sub_ch4 {
@@ -1698,6 +1753,7 @@ impl<'a> Av1Tile<'a> {
                                     (uvh * 4) as usize,
                                     uv_mode,
                                     0,
+                                    cfl_alpha[pl],
                                     &mut cf,
                                     uvtx,
                                     txtp,
