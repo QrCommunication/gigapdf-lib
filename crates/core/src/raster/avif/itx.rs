@@ -43,7 +43,10 @@ pub(super) static ITX_SHIFT: [u8; 19] = [
     2, // RTX_64X16
 ];
 
-/// `dav1d_tx1d_types[txtp]` — `[row, col]` 1D transform types per `TxfmType`.
+/// 1D transform types per `TxfmType`, in AV1 name order `[vertical (column),
+/// horizontal (row)]` — e.g. `ADST_DCT` = `[ADST, DCT]` = ADST down the columns,
+/// DCT across the rows. `inv_txfm_residual` therefore applies `types[1]` to rows
+/// and `types[0]` to columns.
 pub(super) static TX1D_TYPES: [[u8; 2]; 17] = [
     [DCT_1D, DCT_1D],             // DCT_DCT
     [ADST_1D, DCT_1D],            // ADST_DCT
@@ -912,7 +915,12 @@ pub(super) fn inv_txfm_residual(coeff: &mut [i32], tx: usize, txtp: u8, eob: i32
                 *slot = coeff[y + x * sh];
             }
         }
-        itx_1d(row, 1, lw, types[0], row_clip_min, row_clip_max);
+        // `TX1D_TYPES` is `[vertical (col), horizontal (row)]` (AV1 name order),
+        // so the ROW pass uses the HORIZONTAL type `types[1]`; the column pass
+        // below uses the vertical type `types[0]`. (For DCT_DCT / ADST_ADST /
+        // FLIPADST_FLIPADST / IDTX the two are equal, so this only matters for
+        // the mixed transform types — e.g. ADST_DCT.)
+        itx_1d(row, 1, lw, types[1], row_clip_min, row_clip_max);
     }
 
     // Intermediate round + shift + clip.
@@ -920,9 +928,9 @@ pub(super) fn inv_txfm_residual(coeff: &mut [i32], tx: usize, txtp: u8, eob: i32
         *v = clip((*v + rnd) >> shift, col_clip_min, col_clip_max);
     }
 
-    // Column pass (stride = w).
+    // Column pass (stride = w) — vertical type `types[0]`.
     for x in 0..w {
-        itx_1d(&mut tmp[x..], w, lh, types[1], col_clip_min, col_clip_max);
+        itx_1d(&mut tmp[x..], w, lh, types[0], col_clip_min, col_clip_max);
     }
 
     for (o, t) in out.iter_mut().zip(tmp.iter()) {

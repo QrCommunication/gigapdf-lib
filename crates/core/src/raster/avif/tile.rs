@@ -3132,14 +3132,13 @@ mod tests {
         }
     }
 
-    /// Directional intra prediction with real top-right / bottom-left neighbours
-    /// (AV1 `BlockDecoded` availability). The edge now gathers the real neighbour
-    /// pixels (was: repeat the last in-block sample) — a safe, regression-free
-    /// improvement (it only changes directional predicted values, never the MSAC).
-    /// IGNORED: not yet bit-exact — a residual Z1/Z3 edge-filter/upsample gap on
-    /// the gathered samples remains (tracked in task #54). Run with `--ignored`.
+    /// Directional intra (Z1/Z2/Z3) with real top-right / bottom-left neighbours
+    /// (AV1 `BlockDecoded` availability), validated bit-exact vs dav1d on a 64×64
+    /// noise still. This fixture also exercises the mixed 2D transform types
+    /// (e.g. `ADST_DCT`): the ADST runs down the columns and the DCT across the
+    /// rows — the symmetric types (DCT_DCT, ADST_ADST, IDTX) are swap-invariant,
+    /// so only this noise content surfaces a wrong row/column axis assignment.
     #[test]
-    #[ignore = "directional intra not yet bit-exact — residual z-predictor edge gap (task #54)"]
     fn directional_intra_matches_dav1d() {
         use super::super::{
             extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
