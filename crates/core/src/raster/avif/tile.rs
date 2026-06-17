@@ -349,6 +349,7 @@ fn gather_left_partition_prob(c: &[u16], bl: u8) -> u32 {
 // ── Tile decoder: the partition tree driven by the entropy decoder ────────────
 
 use super::cdf;
+use super::itx;
 use super::msac::Msac;
 use super::scan::SCANS;
 
@@ -765,6 +766,10 @@ pub(crate) struct Av1Tile<'a> {
     dq: [[[u16; 2]; 3]; 8],
     /// Per-segment lossless flag (drives WHT_WHT + skips dequant rounding).
     lossless: [bool; 8],
+    /// Reconstructed 8-bit pixel planes (Y, U, V); chroma sized by subsampling.
+    planes: [Vec<u8>; 3],
+    plane_w: [usize; 3],
+    plane_h: [usize; 3],
     /// Chroma subsampling (`monochrome`/`420`/`444`), drives `has_chroma`.
     mono_chrome: bool,
     subsampling_x: bool,
@@ -816,6 +821,35 @@ impl<'a> Av1Tile<'a> {
             cdf: Cdf::new(qcat_for(fh.base_q_idx)),
             dq: init_dq(fh),
             lossless: fh.lossless,
+            planes: {
+                let yw = cols * 4;
+                let yh = mi_rows as usize * 4;
+                if seq.mono_chrome {
+                    [vec![0u8; yw * yh], Vec::new(), Vec::new()]
+                } else {
+                    let cw = yw >> (seq.subsampling_x != 0) as usize;
+                    let ch = yh >> (seq.subsampling_y != 0) as usize;
+                    [vec![0u8; yw * yh], vec![0u8; cw * ch], vec![0u8; cw * ch]]
+                }
+            },
+            plane_w: {
+                let yw = cols * 4;
+                if seq.mono_chrome {
+                    [yw, 0, 0]
+                } else {
+                    let cw = yw >> (seq.subsampling_x != 0) as usize;
+                    [yw, cw, cw]
+                }
+            },
+            plane_h: {
+                let yh = mi_rows as usize * 4;
+                if seq.mono_chrome {
+                    [yh, 0, 0]
+                } else {
+                    let ch = yh >> (seq.subsampling_y != 0) as usize;
+                    [yh, ch, ch]
+                }
+            },
             mono_chrome: seq.mono_chrome,
             subsampling_x: seq.subsampling_x != 0,
             subsampling_y: seq.subsampling_y != 0,
@@ -1411,7 +1445,7 @@ impl<'a> Av1Tile<'a> {
         uv_mode: u8,
         a_off: usize,
         l_off: usize,
-    ) -> (Vec<i32>, u8) {
+    ) -> (Vec<i32>, u8, u8, i32) {
         let chroma = plane != 0;
         let lossless = self.lossless[0];
         // Snapshot the dc-sign neighbour bytes before this block overwrites
@@ -1449,11 +1483,94 @@ impl<'a> Av1Tile<'a> {
             l_off,
         );
         if all_skip {
-            return (Vec::new(), 0x40);
+            return (Vec::new(), 0x40, txtp, -1);
         }
         let eob = self.decode_eob(tx, chroma, txtp);
         let raw = self.decode_coef_levels(tx, chroma, txtp, eob);
-        self.decode_coef_signs(tx, chroma, txtp, eob, plane, 0, &raw, &a_ctx, &l_ctx)
+        let (cf, res_ctx) =
+            self.decode_coef_signs(tx, chroma, txtp, eob, plane, 0, &raw, &a_ctx, &l_ctx);
+        (cf, res_ctx, txtp, eob)
+    }
+
+    /// Reconstruct one transform block into a pixel plane: intra-predict from the
+    /// already-reconstructed top/left neighbours, inverse-transform the residual,
+    /// add and clip. Only DC prediction is implemented so far (the fixture's block
+    /// is DC_PRED with no neighbours → flat 128); other modes fall back to DC until
+    /// their predictors land. `(px, py)` and `(bw, bh)` are in plane pixels.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_tx(
+        &mut self,
+        plane: usize,
+        px: usize,
+        py: usize,
+        bw: usize,
+        bh: usize,
+        _mode: u8,
+        cf: &mut [i32],
+        tx: usize,
+        txtp: u8,
+        eob: i32,
+    ) {
+        let pw = self.plane_w[plane];
+        let have_top = py > 0;
+        let have_left = px > 0;
+        // DC predictor (other intra modes follow in a later layer).
+        let buf = &self.planes[plane];
+        let dc: i32 = match (have_top, have_left) {
+            (true, true) => {
+                let mut s = ((bw + bh) >> 1) as i32;
+                for i in 0..bw {
+                    s += buf[(py - 1) * pw + px + i] as i32;
+                }
+                for i in 0..bh {
+                    s += buf[(py + i) * pw + px - 1] as i32;
+                }
+                s >>= (bw + bh).trailing_zeros();
+                if bw != bh {
+                    // Rect blocks: `dc * MULTIPLIER >> BASE_SHIFT` (8-bit consts).
+                    let m = if bw > bh * 2 || bh > bw * 2 { 0x3334 } else { 0x5556 };
+                    s = (s * m) >> 16;
+                }
+                s
+            }
+            (true, false) => {
+                let mut s = (bw >> 1) as i32;
+                for i in 0..bw {
+                    s += buf[(py - 1) * pw + px + i] as i32;
+                }
+                s >> bw.trailing_zeros()
+            }
+            (false, true) => {
+                let mut s = (bh >> 1) as i32;
+                for i in 0..bh {
+                    s += buf[(py + i) * pw + px - 1] as i32;
+                }
+                s >> bh.trailing_zeros()
+            }
+            (false, false) => 128,
+        };
+        // Residual (skipped block → none).
+        let residual = if eob >= 0 {
+            if txtp == txtp::WHT_WHT {
+                itx::inv_wht4x4_residual(cf)
+            } else {
+                itx::inv_txfm_residual(cf, tx, txtp, eob)
+            }
+        } else {
+            Vec::new()
+        };
+        let buf = &mut self.planes[plane];
+        for yy in 0..bh {
+            for xx in 0..bw {
+                let r = residual.get(yy * bw + xx).copied().unwrap_or(0);
+                buf[(py + yy) * pw + px + xx] = (dc + r).clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    /// A reconstructed plane (`0=Y, 1=U, 2=V`) as `(pixels, width, height)`.
+    pub fn plane(&self, p: usize) -> (&[u8], usize, usize) {
+        (&self.planes[p], self.plane_w[p], self.plane_h[p])
     }
 
     /// Walk a coding block's transform grid (luma first, then both chroma planes),
@@ -1506,8 +1623,22 @@ impl<'a> Av1Tile<'a> {
                     while x < sub_w4 {
                         let a_off = acol + x as usize;
                         let l_off = by4 + y as usize;
-                        let (_cf, res_ctx) =
+                        let (mut cf, res_ctx, txtp, eob) =
                             self.decode_tx_block(tx, bs, 0, y_mode, y_angle, uv_mode, a_off, l_off);
+                        let px = (mi_col as usize + x as usize) * 4;
+                        let py = (mi_row as usize + y as usize) * 4;
+                        self.reconstruct_tx(
+                            0,
+                            px,
+                            py,
+                            (tw * 4) as usize,
+                            (th * 4) as usize,
+                            y_mode,
+                            &mut cf,
+                            tx,
+                            txtp,
+                            eob,
+                        );
                         let cw = tw.min(mic - (mi_col as i32 + x)).max(0) as usize;
                         let cht = th.min(mir - (mi_row as i32 + y)).max(0) as usize;
                         for i in 0..cw {
@@ -1534,7 +1665,7 @@ impl<'a> Av1Tile<'a> {
                             while x < sub_cw4 {
                                 let a_off = cacol + x as usize;
                                 let l_off = cby4 + y as usize;
-                                let (_cf, res_ctx) = self.decode_tx_block(
+                                let (mut cf, res_ctx, txtp, eob) = self.decode_tx_block(
                                     uvtx,
                                     bs,
                                     1 + pl,
@@ -1543,6 +1674,20 @@ impl<'a> Av1Tile<'a> {
                                     uv_mode,
                                     a_off,
                                     l_off,
+                                );
+                                let cpx = ((mi_col as usize >> ss_h) + x as usize) * 4;
+                                let cpy = ((mi_row as usize >> ss_v) + y as usize) * 4;
+                                self.reconstruct_tx(
+                                    1 + pl,
+                                    cpx,
+                                    cpy,
+                                    (uvw * 4) as usize,
+                                    (uvh * 4) as usize,
+                                    uv_mode,
+                                    &mut cf,
+                                    uvtx,
+                                    txtp,
+                                    eob,
                                 );
                                 // Luma-space position of this chroma block for the edge clamp.
                                 let lx = mi_col as i32 + (x << ss_h);
@@ -1976,7 +2121,8 @@ mod tests {
         };
         let mut tile = Av1Tile::new(&bytes, 16, 16, &seq, &fh);
         // One luma 8×8 tx block at the SB origin (a_off=l_off=0, DC_PRED).
-        let (cf, res_ctx) = tile.decode_tx_block(1, bs::BS_8X8, 0, mode::DC_PRED, 0, mode::DC_PRED, 0, 0);
+        let (cf, res_ctx, _txtp, _eob) =
+            tile.decode_tx_block(1, bs::BS_8X8, 0, mode::DC_PRED, 0, mode::DC_PRED, 0, 0);
         // Either skipped (empty cf, res_ctx=0x40) or decoded (64 coefs, valid ctx).
         if res_ctx == 0x40 && cf.is_empty() {
             // all-zero transform block — fine.
@@ -1986,7 +2132,8 @@ mod tests {
             assert!(matches!(res_ctx & 0xc0, 0x00 | 0x40 | 0x80));
         }
         // A chroma block (plane 1, uvtx) right after must also stay in sync.
-        let (_cfu, ctxu) = tile.decode_tx_block(0, bs::BS_8X8, 1, mode::DC_PRED, 0, mode::DC_PRED, 0, 0);
+        let (_cfu, ctxu, _t, _e) =
+            tile.decode_tx_block(0, bs::BS_8X8, 1, mode::DC_PRED, 0, mode::DC_PRED, 0, 0);
         assert!(matches!(ctxu & 0xc0, 0x00 | 0x40 | 0x80));
     }
 
@@ -2022,5 +2169,51 @@ mod tests {
         assert!(tile.blocks_visited > 0, "no blocks visited");
         assert!((0x8000..=0xffff).contains(&rng), "msac rng out of range: {rng:#x}");
         assert!(pos >= blen.saturating_sub(8), "msac consumed only {pos}/{blen} bytes");
+    }
+
+    #[test]
+    fn reconstructs_fixture_pixels() {
+        use super::super::{
+            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
+            OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+        };
+        let avif = include_bytes!("../fixtures/av1test.avif");
+        let reference = include_bytes!("../fixtures/av1test_ref.yuv");
+        let stream = extract_av1_stream(avif).unwrap();
+        let obus = split_obus(&stream).unwrap();
+        let seq = parse_sequence_header(
+            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+        )
+        .unwrap();
+        let frame = obus
+            .iter()
+            .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)
+            .unwrap();
+        let fh = parse_frame_header(&seq, frame.data).unwrap();
+        let off = tile_data_offset(fh.header_bits);
+        let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
+        let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
+        let mut tile = Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+        tile.decode();
+
+        // Reference is I420 planar 32×32: Y(1024) + U(256) + V(256) = 1536 bytes.
+        let mut refoff = 0usize;
+        let mut maxdiff = [0i32; 3];
+        for p in 0..3 {
+            let (buf, pw, ph) = tile.plane(p);
+            let n = pw * ph;
+            for i in 0..n {
+                let d = (buf[i] as i32 - reference[refoff + i] as i32).abs();
+                maxdiff[p] = maxdiff[p].max(d);
+            }
+            refoff += n;
+        }
+        eprintln!(
+            "[recon] maxdiff Y={} U={} V={}",
+            maxdiff[0], maxdiff[1], maxdiff[2]
+        );
+        // First-pixels milestone: the DC_PRED single-block fixture must
+        // reconstruct bit-exactly against dav1d's reference YUV.
+        assert_eq!(maxdiff, [0, 0, 0], "pixel mismatch vs dav1d reference");
     }
 }
