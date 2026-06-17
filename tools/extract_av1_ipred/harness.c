@@ -66,6 +66,9 @@ int main(void){
     ipred_z1_c(out,w,tl,w,h,1054,0,0); dump("z1b",out,w,h);
     ipred_z3_c(out,w,tl,w,h,1227,0,0); dump("z3a",out,w,h);
     ipred_z3_c(out,w,tl,w,h,1249,0,0); dump("z3b",out,w,h);
+    ipred_z2_c(out,w,tl,w,h,1159,w,h); dump("z2a",out,w,h); // angle 135: filter both
+    ipred_z2_c(out,w,tl,w,h,1137,w,h); dump("z2b",out,w,h); // angle 113: ups_above+filt_left
+    ipred_z2_c(out,w,tl,w,h,1181,w,h); dump("z2c",out,w,h); // angle 157: filt_above+ups_left
   }
   printf("];\n");
   return 0;

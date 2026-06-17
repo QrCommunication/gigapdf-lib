@@ -477,6 +477,124 @@ pub(super) fn z3(bw: usize, bh: usize, angle_full: i32, tl: &[i32], corner: usiz
     out
 }
 
+/// Directional Z2 predictor (90 < angle < 180, uses BOTH the top and left
+/// edges). `tl`/`corner` as in `z1`/`z3` (top at `corner+1+i`, left at
+/// `corner-1-i`, corner at `corner`). `max_width`/`max_height` bound the
+/// low-pass-filtered region near the frame edge (pass `bw`/`bh` for a
+/// fully-available block). dav1d `ipred_z2_c` — its negative-stride
+/// `topleft[base_x]` / `left[-base_y]` reads are mirrored here through a single
+/// working buffer centred at `center`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn z2(
+    bw: usize,
+    bh: usize,
+    angle_full: i32,
+    tl: &[i32],
+    corner: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Vec<i32> {
+    let is_sm = (angle_full >> 9) & 1 != 0;
+    let enable = angle_full >> 10 != 0;
+    let angle = angle_full & 511;
+    let mut dy = DR_INTRA_DERIVATIVE[((angle - 90) >> 1) as usize];
+    let mut dx = DR_INTRA_DERIVATIVE[((180 - angle) >> 1) as usize];
+    let wh = (bw + bh) as i32;
+    let upsample_left = enable && get_upsample(wh, 180 - angle, is_sm);
+    let upsample_above = enable && get_upsample(wh, angle - 90, is_sm);
+
+    // Working edge centred at `center`: corner at +0, top at +i, left at -i,
+    // mirroring dav1d's `edge[64+64+1]` with `topleft = &edge[64]`.
+    let center = 2 * (bw + bh) + 16;
+    let mut work = vec![0i32; 2 * center + 1];
+    // `topleft_in[m]` == `tl[corner + m]` (our buffer layout: top at +, left at -).
+    let src = |m: i32| -> i32 { tl[(corner as i32 + m) as usize] };
+
+    // --- top side ---
+    if upsample_above {
+        // upsample_edge(topleft, width+1, topleft_in, 0, width+1) → work[center..center+2w]
+        let inn = |i: i32| -> i32 { src(i.clamp(0, bw as i32)) };
+        let mut tmp = vec![0i32; 2 * (bw + 1)];
+        upsample_edge(&mut tmp, bw + 1, &inn);
+        for (i, &v) in tmp[..2 * bw + 1].iter().enumerate() {
+            work[center + i] = v;
+        }
+        dx <<= 1;
+    } else {
+        let fs = if enable { get_filter_strength(wh, angle - 90, is_sm) } else { 0 };
+        if fs != 0 {
+            // filter_edge(&topleft[1], width, 0, max_width, &topleft_in[1], -1, width, fs)
+            let inn = |k: i32| -> i32 { src(1 + k.clamp(-1, bw as i32 - 1)) };
+            let mut tmp = vec![0i32; bw];
+            filter_edge(&mut tmp, bw, 0, max_width.min(bw), &inn, fs as usize);
+            for (i, &v) in tmp.iter().enumerate() {
+                work[center + 1 + i] = v;
+            }
+        } else {
+            for i in 0..bw {
+                work[center + 1 + i] = src(1 + i as i32);
+            }
+        }
+    }
+
+    // --- left side ---
+    if upsample_left {
+        // upsample_edge(&topleft[-2h], height+1, &topleft_in[-height], 0, height+1)
+        let inn = |i: i32| -> i32 { src(-(bh as i32) + i.clamp(0, bh as i32)) };
+        let mut tmp = vec![0i32; 2 * (bh + 1)];
+        upsample_edge(&mut tmp, bh + 1, &inn);
+        for (j, &v) in tmp[..2 * bh + 1].iter().enumerate() {
+            work[center - 2 * bh + j] = v;
+        }
+        dy <<= 1;
+    } else {
+        let fs = if enable { get_filter_strength(wh, 180 - angle, is_sm) } else { 0 };
+        if fs != 0 {
+            // filter_edge(&topleft[-h], height, height-max_height, height, &topleft_in[-h], 0, height+1, fs)
+            let inn = |k: i32| -> i32 { src(-(bh as i32) + k.clamp(0, bh as i32)) };
+            let mut tmp = vec![0i32; bh];
+            filter_edge(&mut tmp, bh, bh.saturating_sub(max_height), bh, &inn, fs as usize);
+            for (i, &v) in tmp.iter().enumerate() {
+                work[center - bh + i] = v;
+            }
+        } else {
+            for i in 0..bh {
+                work[center - bh + i] = src(-(bh as i32) + i as i32);
+            }
+        }
+    }
+
+    // *topleft = *topleft_in
+    work[center] = src(0);
+
+    let base_inc_x = 1 + upsample_above as i32;
+    let left_off = center as i32 - (1 + upsample_left as i32);
+    let mut out = vec![0i32; bw * bh];
+    let mut xpos_row = ((1 + upsample_above as i32) << 6) - dx;
+    for y in 0..bh {
+        let frac_x = xpos_row & 0x3E;
+        let mut base_x = xpos_row >> 6;
+        let mut ypos = ((y as i32) << (6 + upsample_left as i32)) - dy;
+        for x in 0..bw {
+            let v = if base_x >= 0 {
+                let bxi = (center as i32 + base_x) as usize;
+                work[bxi] * (64 - frac_x) + work[bxi + 1] * frac_x
+            } else {
+                let base_y = ypos >> 6;
+                let frac_y = ypos & 0x3E;
+                let l0 = (left_off - base_y) as usize;
+                let l1 = (left_off - base_y - 1) as usize;
+                work[l0] * (64 - frac_y) + work[l1] * frac_y
+            };
+            out[y * bw + x] = (v + 32) >> 6;
+            base_x += base_inc_x;
+            ypos -= dy;
+        }
+        xpos_row -= dx;
+    }
+    out
+}
+
 /// Chroma-from-luma final blend (`cfl_pred`): `chroma = clip(dc + sign(d) *
 /// ((|d| + 32) >> 6))` where `d = alpha * ac`. `ac` is the mean-removed,
 /// subsampled luma AC; `dc` the chroma DC prediction; `alpha` the signed CfL gain.
@@ -542,11 +660,11 @@ mod tests {
 
     #[test]
     fn predictors_match_dav1d() {
-        // IPRED_REF order per size (stride 16): dc, v, h, paeth, smooth,
-        // smooth_v, smooth_h, filter0..filter4, z1a, z1b, z3a, z3b.
+        // IPRED_REF order per size (stride 19): dc, v, h, paeth, smooth,
+        // smooth_v, smooth_h, filter0..filter4, z1a, z1b, z3a, z3b, z2a, z2b, z2c.
         for (si, &n) in [4usize, 8].iter().enumerate() {
             let (top, left, tl) = edges(n);
-            let base = si * 16;
+            let base = si * 19;
             let modes = [
                 DC_PRED,
                 VERT_PRED,
@@ -578,6 +696,11 @@ mod tests {
             assert_eq!(z1(n, n, 1054, &buf, corner), IPRED_REF[base + 13], "z1b size {n}");
             assert_eq!(z3(n, n, 1227, &buf, corner), IPRED_REF[base + 14], "z3a size {n}");
             assert_eq!(z3(n, n, 1249, &buf, corner), IPRED_REF[base + 15], "z3b size {n}");
+            // Z2 dual-edge: angle 135 (filter both), 113 (ups_above+filt_left),
+            // 157 (filt_above+ups_left); max_width/max_height = block size.
+            assert_eq!(z2(n, n, 1159, &buf, corner, n, n), IPRED_REF[base + 16], "z2a size {n}");
+            assert_eq!(z2(n, n, 1137, &buf, corner, n, n), IPRED_REF[base + 17], "z2b size {n}");
+            assert_eq!(z2(n, n, 1181, &buf, corner, n, n), IPRED_REF[base + 18], "z2c size {n}");
         }
     }
 
