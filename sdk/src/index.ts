@@ -43,11 +43,32 @@ export class GigaPdfEngine {
     } else {
       bytes = source;
     }
+    // The wasm imports one host function: `env.gp_host_random`. wasm32 has no OS
+    // RNG, so the engine (RSA signature blinding, Boa `Math.random`) draws
+    // entropy from the host's Web Crypto. This keeps the module wasm-bindgen-free.
+    let ex: Exports | undefined;
     const { instance } = await WebAssembly.instantiate(
       bytes instanceof Uint8Array ? bytes.slice().buffer : bytes,
-      {}
+      {
+        env: {
+          gp_host_random: (ptr: number, len: number): void => {
+            const c = (globalThis as { crypto?: Crypto }).crypto;
+            if (!c?.getRandomValues) {
+              throw new Error(
+                "gigapdf: wasm entropy needs Web Crypto (globalThis.crypto.getRandomValues)"
+              );
+            }
+            const mem = new Uint8Array(ex!.memory.buffer, ptr, len);
+            // getRandomValues rejects views longer than 65536 bytes; fill in chunks.
+            for (let off = 0; off < len; off += 65536) {
+              c.getRandomValues(mem.subarray(off, Math.min(off + 65536, len)));
+            }
+          },
+        },
+      }
     );
-    return new GigaPdfEngine(instance.exports as Exports);
+    ex = instance.exports as Exports;
+    return new GigaPdfEngine(ex);
   }
 
   /**

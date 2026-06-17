@@ -13,3 +13,12 @@ crate-type = ["cdylib"]
 # Only our own engine — still no third-party dependencies.
 [dependencies]
 gigapdf-core = { path = "../core" }
+
+# wasm32 has no OS RNG. Both getrandom majors in the tree (0.3 via Boa/rand 0.9,
+# 0.2 via RSA/rand_core 0.6) are routed to one host import (env.gp_host_random)
+# by the custom backends in `src/rng.rs` — keeping the engine wasm-bindgen-free.
+# 0.3 uses the `getrandom_backend="custom"` cfg (.cargo/config.toml); 0.2 uses
+# its `custom` feature. These deps name the crates so the backend can compile.
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = "0.3"
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["custom"] }

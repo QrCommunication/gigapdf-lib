@@ -11,8 +11,10 @@ wasm = "build -p gigapdf-wasm --target wasm32-unknown-unknown --release"
 wasm-dev = "build -p gigapdf-wasm --target wasm32-unknown-unknown"
 
 # RustCrypto (RSA blinding) and Boa need an entropy source. On wasm there is no
-# OS RNG, so getrandom's `wasm_js` backend is selected here for the wasm target
-# only — it imports randomness from the host JS env (crypto.getRandomValues).
-# Native targets keep their default OS backend, so this never affects tests.
+# OS RNG, so getrandom's `custom` backend is selected here for the wasm target
+# only; `crates/wasm/src/rng.rs` implements it as a single host import
+# (env.gp_host_random) filled from crypto.getRandomValues — keeping the engine
+# wasm-bindgen-free. Native targets keep their default OS backend (this cfg is
+# wasm-only), so it never affects tests.
 [target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+rustflags = ['--cfg', 'getrandom_backend="custom"']

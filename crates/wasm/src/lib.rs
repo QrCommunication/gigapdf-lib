@@ -16,6 +16,10 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+// Host entropy backend for getrandom (RSA blinding + Boa Math.random) on wasm.
+#[cfg(target_arch = "wasm32")]
+mod rng;
+
 use gigapdf_core::{
     Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
     Layer, Link, LinkTarget, OcrWord, OutlineItem, SearchMatch, TextLayerRun, TextLine, TextRun,

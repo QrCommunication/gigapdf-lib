@@ -46,13 +46,9 @@ spki = "0.7"
 x509-cert = { version = "0.2", features = ["builder"] }
 cms = { version = "0.2", features = ["builder"] }
 
-# wasm has no OS RNG: getrandom's `wasm_js` backend (cfg in .cargo/config.toml)
-# imports entropy from the host. Native targets use the OS backend automatically.
-[target.wasm32-unknown-unknown.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
-# `rsa` → `rand_core` 0.6 pulls getrandom 0.2 transitively; enable its `js`
-# backend so it compiles on wasm too (the cfg above only governs 0.3).
-getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# Note: the wasm32 entropy backend (getrandom) lives in the `gigapdf-wasm`
+# crate (crates/wasm/src/rng.rs), which routes both getrandom majors to a host
+# import. Native builds use the default OS backend; nothing is needed here.
 
 [dev-dependencies]
 # Tests run against ../../fixtures via CARGO_MANIFEST_DIR.
