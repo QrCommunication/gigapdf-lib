@@ -218,10 +218,113 @@ pub(crate) fn extract_av1_stream(avif: &[u8]) -> Option<Vec<u8>> {
 /// it lands).
 pub fn decode_avif(avif: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let stream = extract_av1_stream(avif)?;
-    let _obus = split_obus(&stream)?;
-    // TODO(avif): AV1 sequence/frame header + entropy decode + intra +
-    // transforms + CDEF + loop restoration → YUV → RGBA. See avif/ submodule.
-    None
+    let obus = split_obus(&stream)?;
+    let seq = parse_sequence_header(obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER)?.data)?;
+    // The frame header opens the OBU_FRAME payload (header + tile group) or a
+    // standalone OBU_FRAME_HEADER; the tile data follows the byte-aligned header.
+    let frame = obus
+        .iter()
+        .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)?;
+    let fh = parse_frame_header(&seq, frame.data)?;
+    let off = tile::tile_data_offset(fh.header_bits);
+    if off >= frame.data.len() {
+        return None;
+    }
+    // MiCols/MiRows (AV1 §5.9.2): 4×4 units rounded up to the 8-pixel grid.
+    let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
+    let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
+    let mut tile = tile::Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+    tile.decode();
+    // NOTE: in-loop filters (deblock, CDEF, loop-restoration, film-grain) are not
+    // yet applied — fine for the still-picture fixture (its YUV reference is the
+    // raw intra reconstruction), a documented gap for arbitrary AVIFs.
+    let (w, h) = (fh.frame_width as usize, fh.frame_height as usize);
+    let rgba = yuv_to_rgba(&tile, &seq, w, h);
+    Some((fh.frame_width, fh.frame_height, rgba))
+}
+
+/// Clamp a float colour component to a `u8` (round-to-nearest, saturating).
+#[inline]
+fn to_u8(v: f32) -> u8 {
+    let r = v.round();
+    if r <= 0.0 {
+        0
+    } else if r >= 255.0 {
+        255
+    } else {
+        r as u8
+    }
+}
+
+/// Convert the decoded YUV planes to a cropped `w*h` RGBA8888 buffer (8-bit).
+/// Chroma is nearest-neighbour upsampled per the sequence subsampling; the matrix
+/// (BT.601/709/2020-NCL/Identity) and range (limited/full) come from the sequence
+/// header. ITU-R YCbCr→RGB constants (not codec tables).
+fn yuv_to_rgba(tile: &tile::Av1Tile, seq: &SequenceHeader, w: usize, h: usize) -> Vec<u8> {
+    let (y_buf, yw, _yh) = tile.plane(0);
+    let full = seq.color_range != 0;
+    let mut out = vec![0u8; w * h * 4];
+
+    // Luma → full-range RGB level (shared by mono + the matrix path).
+    let lift = |yv: f32| if full { yv } else { (yv - 16.0) * (255.0 / 219.0) };
+
+    if seq.mono_chrome {
+        for py in 0..h {
+            for px in 0..w {
+                let l = to_u8(lift(y_buf[py * yw + px] as f32));
+                let o = (py * w + px) * 4;
+                out[o] = l;
+                out[o + 1] = l;
+                out[o + 2] = l;
+                out[o + 3] = 255;
+            }
+        }
+        return out;
+    }
+
+    let (u_buf, uw, _) = tile.plane(1);
+    let (v_buf, _vw, _) = tile.plane(2);
+
+    // Identity matrix: the "YUV" planes carry G/B/R directly (lossless RGB AVIF).
+    if seq.matrix_coefficients == 0 {
+        for py in 0..h {
+            for px in 0..w {
+                let o = (py * w + px) * 4;
+                out[o] = v_buf[py * uw + px]; // R
+                out[o + 1] = y_buf[py * yw + px]; // G
+                out[o + 2] = u_buf[py * uw + px]; // B
+                out[o + 3] = 255;
+            }
+        }
+        return out;
+    }
+
+    let (ss_h, ss_v) = (seq.subsampling_x as usize, seq.subsampling_y as usize);
+    let (kr, kb): (f32, f32) = match seq.matrix_coefficients {
+        1 => (0.2126, 0.0722), // BT.709
+        9 => (0.2627, 0.0593), // BT.2020 non-constant-luminance
+        _ => (0.299, 0.114),   // BT.601 (6) / unspecified default
+    };
+    let kg = 1.0 - kr - kb;
+    let (cr_r, cb_b) = (2.0 * (1.0 - kr), 2.0 * (1.0 - kb));
+    let (cr_g, cb_g) = (2.0 * kr * (1.0 - kr) / kg, 2.0 * kb * (1.0 - kb) / kg);
+    let cscale = if full { 1.0 } else { 255.0 / 224.0 };
+
+    for py in 0..h {
+        let cy = py >> ss_v;
+        for px in 0..w {
+            let cx = px >> ss_h;
+            let yl = lift(y_buf[py * yw + px] as f32);
+            let u = (u_buf[cy * uw + cx] as f32 - 128.0) * cscale;
+            let v = (v_buf[cy * uw + cx] as f32 - 128.0) * cscale;
+            let o = (py * w + px) * 4;
+            out[o] = to_u8(yl + cr_r * v);
+            out[o + 1] = to_u8(yl - cb_g * u - cr_g * v);
+            out[o + 2] = to_u8(yl + cb_b * u);
+            out[o + 3] = 255;
+        }
+    }
+    out
 }
 
 // ── AV1 bit reader (MSB-first, used for the uncompressed headers) ─────────────
@@ -291,6 +394,9 @@ pub(crate) struct SequenceHeader {
     pub enable_cdef: bool,
     pub enable_restoration: bool,
     pub color_range: u32,
+    /// `matrix_coefficients` (AV1 color_config): 0=Identity(GBR), 1=BT.709,
+    /// 6=BT.601, 9=BT.2020-NCL, 2=Unspecified (→ BT.601 default). Drives YUV→RGB.
+    pub matrix_coefficients: u32,
     pub separate_uv_delta_q: bool,
     pub film_grain_params_present: bool,
 }
@@ -341,6 +447,7 @@ pub(crate) fn parse_sequence_header(data: &[u8]) -> Option<SequenceHeader> {
     } else {
         (2, 2, 2) // CP/TC/MC_UNSPECIFIED
     };
+    s.matrix_coefficients = mc;
     if s.mono_chrome {
         s.color_range = r.f(1);
         s.subsampling_x = 1;
@@ -945,5 +1052,76 @@ mod tests {
             fh.header_bits,
             frame.data.len() * 8
         );
+    }
+
+    #[test]
+    fn to_u8_rounds_and_saturates() {
+        assert_eq!(super::to_u8(-5.0), 0);
+        assert_eq!(super::to_u8(0.4), 0);
+        assert_eq!(super::to_u8(0.5), 1);
+        assert_eq!(super::to_u8(127.5), 128);
+        assert_eq!(super::to_u8(254.6), 255);
+        assert_eq!(super::to_u8(999.0), 255);
+    }
+
+    #[test]
+    fn decode_avif_produces_rgba_pixels() {
+        // THE pixel milestone: decode_avif drives parse → tile decode → YUV→RGBA
+        // and emits a real image. The intra planes are bit-exact vs the YUV
+        // reference (see tile::reconstructs_fixture_pixels), so the RGBA equals
+        // the documented YCbCr→RGB conversion of that reference.
+        let avif = include_bytes!("fixtures/av1test.avif");
+        let reference = include_bytes!("fixtures/av1test_ref.yuv");
+        let (w, h, rgba) = decode_avif(avif).expect("decode_avif returns pixels");
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+        assert!(rgba.iter().skip(3).step_by(4).all(|&a| a == 255), "alpha not opaque");
+        assert!(rgba.chunks(4).any(|p| p[..3] != [0, 0, 0]), "image is all black");
+
+        // Independent cross-check against the I420 reference (Y 1024 + U/V 256
+        // each), using BT.601 limited-range constants (the fixture's matrix).
+        let seq = parse_sequence_header(
+            split_obus(&extract_av1_stream(avif).unwrap())
+                .unwrap()
+                .iter()
+                .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        eprintln!(
+            "[avif] mc={} range={} mono={} ss=({},{})",
+            seq.matrix_coefficients, seq.color_range, seq.mono_chrome,
+            seq.subsampling_x, seq.subsampling_y
+        );
+        let full = seq.color_range != 0;
+        let (kr, kb) = match seq.matrix_coefficients {
+            1 => (0.2126f32, 0.0722f32),
+            9 => (0.2627, 0.0593),
+            _ => (0.299, 0.114),
+        };
+        let kg = 1.0 - kr - kb;
+        let cscale = if full { 1.0 } else { 255.0 / 224.0 };
+        let mut maxdiff = 0i32;
+        for py in 0..32usize {
+            for px in 0..32usize {
+                let y = reference[py * 32 + px] as f32;
+                let cx = px >> seq.subsampling_x;
+                let cy = py >> seq.subsampling_y;
+                let u = (reference[1024 + cy * 16 + cx] as f32 - 128.0) * cscale;
+                let v = (reference[1024 + 256 + cy * 16 + cx] as f32 - 128.0) * cscale;
+                let yl = if full { y } else { (y - 16.0) * (255.0 / 219.0) };
+                let exp = [
+                    super::to_u8(yl + 2.0 * (1.0 - kr) * v),
+                    super::to_u8(yl - 2.0 * kb * (1.0 - kb) / kg * u - 2.0 * kr * (1.0 - kr) / kg * v),
+                    super::to_u8(yl + 2.0 * (1.0 - kb) * u),
+                ];
+                let o = (py * 32 + px) * 4;
+                for c in 0..3 {
+                    maxdiff = maxdiff.max((rgba[o + c] as i32 - exp[c] as i32).abs());
+                }
+            }
+        }
+        assert_eq!(maxdiff, 0, "RGBA diverges from the reference conversion");
     }
 }
