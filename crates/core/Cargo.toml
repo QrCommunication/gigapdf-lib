@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "PDF editing engine — pure std, no dependencies."
+description = "PDF/Office/image engine — pure-std core (no third-party PDF/Office/image lib); audited RustCrypto + Boa for crypto and JavaScript."
 
 # The PDF/Office/image engine (lexer, object model, xref, FlateDecode, content
 # editing, rasteriser, conversions) is pure `std` with NO third-party library —

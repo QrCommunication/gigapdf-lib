@@ -1,11 +1,14 @@
-//! gigapdf-core — a **zero-dependency** PDF editing engine.
+//! gigapdf-core — a document engine with **no third-party PDF/Office/image
+//! library**.
 //!
 //! Copyright 2025 Rony Licha / QR Communication. Licensed under the PolyForm
 //! Noncommercial License 1.0.0 (see `LICENSE`).
 //!
-//! Implemented in pure `std` with no dependencies — the lexer, parser,
-//! `FlateDecode` inflate, content editor and serializer are all built in, and
-//! it compiles to `wasm32` directly.
+//! The PDF/Office/image stack — lexer, parser, `FlateDecode` inflate, content
+//! editor, serializer, rasteriser, fonts, OCR and the format conversions — is
+//! pure `std` and compiles to `wasm32` directly. Two subsystems delegate to
+//! audited crates by design (see `THIRD-PARTY-LICENSES.md`): cryptography uses
+//! RustCrypto, and the HTML→PDF inline-script path uses the Boa JS engine.
 //!
 //! Editing model: a PDF page's content is a flat list of drawing operators
 //! (`Tj` text, `Do` image, `re`/`f` shapes). The engine parses that stream,
