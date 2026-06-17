@@ -7,6 +7,216 @@
 
 #![allow(dead_code)]
 
+use super::msac::Msac;
+
+/// Floor-log2 of a positive value — dav1d `ulog2` (`31 ^ clz`).
+fn ulog2(x: u32) -> i32 {
+    31 - x.leading_zeros() as i32
+}
+
+/// dav1d `read_pal_plane`: decode one plane's palette colours. `sz_cdf` is
+/// `PAL_SZ[pl][sz_ctx]` (6-symbol adaptive CDF, size = symbol + 2). `l`/`a` are
+/// the left / above neighbour palettes (colours, ascending) with sizes
+/// `l_sz`/`a_sz` — the caller zeroes `a_sz` across the SB64 top boundary so the
+/// above palette is not reused across superblock rows. `pl` is 0 for Y, 1 for U
+/// (the `+!pl` bias on Y deltas keeps successive luma entries strictly rising).
+pub(super) fn read_pal_plane(
+    msac: &mut Msac,
+    sz_cdf: &mut [u16],
+    l: &[u8],
+    l_sz: usize,
+    a: &[u8],
+    a_sz: usize,
+    pl: usize,
+) -> Vec<u8> {
+    let pal_sz = msac.symbol_adapt(sz_cdf, 6) + 2;
+
+    // Merge-sort + dedup the left & above palettes into the prediction cache.
+    let mut cache = [0u8; 16];
+    let mut n_cache = 0usize;
+    macro_rules! push {
+        ($v:expr) => {{
+            let v = $v;
+            if n_cache == 0 || cache[n_cache - 1] != v {
+                cache[n_cache] = v;
+                n_cache += 1;
+            }
+        }};
+    }
+    let (mut li, mut lc) = (0usize, l_sz);
+    let (mut ai, mut ac) = (0usize, a_sz);
+    while lc > 0 && ac > 0 {
+        if l[li] < a[ai] {
+            push!(l[li]);
+            li += 1;
+            lc -= 1;
+        } else {
+            if a[ai] == l[li] {
+                li += 1;
+                lc -= 1;
+            }
+            push!(a[ai]);
+            ai += 1;
+            ac -= 1;
+        }
+    }
+    while lc > 0 {
+        push!(l[li]);
+        li += 1;
+        lc -= 1;
+    }
+    while ac > 0 {
+        push!(a[ai]);
+        ai += 1;
+        ac -= 1;
+    }
+
+    // Reused cache entries: one equi-bit each, until the palette is filled.
+    let mut used = [0u8; 8];
+    let mut nu = 0usize;
+    let mut n = 0usize;
+    while n < n_cache && nu < pal_sz {
+        if msac.bool_equi() != 0 {
+            used[nu] = cache[n];
+            nu += 1;
+        }
+        n += 1;
+    }
+
+    // Freshly-coded entries: first literal, then delta-coded (adaptive width).
+    let n_new = pal_sz - nu;
+    let mut newp = Vec::with_capacity(n_new);
+    if nu < pal_sz {
+        let bpc = 8u32;
+        let not_pl = (pl == 0) as i32;
+        let max = (1i32 << bpc) - 1;
+        let mut prev = msac.bools(bpc) as i32;
+        newp.push(prev as u8);
+        if newp.len() < n_new {
+            let mut bits = bpc as i32 - 3 + msac.bools(2) as i32;
+            loop {
+                let delta = msac.bools(bits as u32) as i32;
+                prev = (prev + delta + not_pl).min(max);
+                newp.push(prev as u8);
+                if prev + not_pl >= max {
+                    while newp.len() < n_new {
+                        newp.push(max as u8);
+                    }
+                    break;
+                }
+                bits = bits.min(1 + ulog2((max - prev - not_pl) as u32));
+                if newp.len() >= n_new {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Merge used-cache + new entries (both ascending) into the final palette.
+    let mut pal = vec![0u8; pal_sz];
+    let (mut nc, mut m) = (0usize, 0usize);
+    for slot in pal.iter_mut() {
+        if nc < nu && (m >= n_new || used[nc] <= newp[m]) {
+            *slot = used[nc];
+            nc += 1;
+        } else {
+            *slot = newp[m];
+            m += 1;
+        }
+    }
+    pal
+}
+
+/// dav1d `read_pal_uv`: U palette via `read_pal_plane(pl=1)`, then the V palette
+/// (delta-coded with optional sign, or a literal run). Returns `(u_pal, v_pal)`.
+pub(super) fn read_pal_uv(
+    msac: &mut Msac,
+    u_sz_cdf: &mut [u16],
+    lu: &[u8],
+    lu_sz: usize,
+    au: &[u8],
+    au_sz: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let u = read_pal_plane(msac, u_sz_cdf, lu, lu_sz, au, au_sz, 1);
+    let pal_sz = u.len();
+    let bpc = 8u32;
+    let max = (1i32 << bpc) - 1;
+    let mut v = vec![0u8; pal_sz];
+    if msac.bool_equi() != 0 {
+        let bits = bpc as i32 - 4 + msac.bools(2) as i32;
+        let mut prev = msac.bools(bpc) as i32;
+        v[0] = prev as u8;
+        for vi in v.iter_mut().skip(1) {
+            let mut delta = msac.bools(bits as u32) as i32;
+            if delta != 0 && msac.bool_equi() != 0 {
+                delta = -delta;
+            }
+            prev = (prev + delta) & max;
+            *vi = prev as u8;
+        }
+    } else {
+        for vi in v.iter_mut() {
+            *vi = msac.bools(bpc) as u8;
+        }
+    }
+    (u, v)
+}
+
+/// dav1d `read_pal_indices` (with `pal_idx_finish` collapsed into a direct
+/// row-major fill). Decodes the per-pixel palette index map for one plane via
+/// the anti-diagonal wavefront, then replicates the right/bottom edges for the
+/// off-frame remainder. Returns a `bw*bh` row-major buffer (stride `bw`).
+pub(super) fn read_pal_indices(
+    msac: &mut Msac,
+    color_map_cdf: &mut [[u16; 8]; 5],
+    pal_sz: usize,
+    bw: usize,
+    bh: usize,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
+    let stride = bw;
+    let mut pal = vec![0u8; bw * bh];
+    pal[0] = msac.decode_uniform(pal_sz as u32) as u8;
+    let mut order = [[0u8; 8]; 8];
+    let mut ctx = [0u8; 8];
+    for i in 1..(w + h - 1) {
+        // top/left → bottom/right diagonals ("wave-front").
+        let first = i.min(w - 1);
+        let last = i.saturating_sub(h - 1); // imax(0, i - h + 1)
+        order_palette(&pal, stride, i, first, last, &mut order, &mut ctx);
+        let mut m = 0usize;
+        let mut j = first;
+        loop {
+            let cidx = msac.symbol_adapt(&mut color_map_cdf[ctx[m] as usize], pal_sz - 1);
+            pal[(i - j) * stride + j] = order[m][cidx];
+            m += 1;
+            if j == last {
+                break;
+            }
+            j -= 1;
+        }
+    }
+
+    // `pal_idx_finish` edge-extension: replicate the last coded column, then the
+    // last coded row, to fill the full block when it overhangs the frame edge.
+    if w < bw {
+        for y in 0..h {
+            let last = pal[y * stride + w - 1];
+            for x in w..bw {
+                pal[y * stride + x] = last;
+            }
+        }
+    }
+    if h < bh {
+        for y in h..bh {
+            let (head, tail) = pal.split_at_mut(y * stride);
+            tail[..bw].copy_from_slice(&head[(h - 1) * stride..(h - 1) * stride + bw]);
+        }
+    }
+    pal
+}
+
 /// Build the per-pixel colour ordering + entropy context for one wavefront
 /// (anti-diagonal) of a palette index block — dav1d `order_palette`. `pal_idx`
 /// is the index grid (row stride `stride`), already filled for earlier

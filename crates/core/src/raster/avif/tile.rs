@@ -353,6 +353,7 @@ use super::cdef;
 use super::deblock;
 use super::itx;
 use super::msac::Msac;
+use super::palette;
 use super::predict;
 use super::scan::SCANS;
 
@@ -693,6 +694,8 @@ pub(crate) struct Cdf {
     pub txsz: [[[u16; 4]; 3]; 4],
     pub pal_y: [[[u16; 2]; 3]; 7],
     pub pal_uv: [[u16; 2]; 2],
+    pub pal_sz: [[[u16; 8]; 7]; 2],
+    pub color_map: [[[[u16; 8]; 5]; 7]; 2],
     // Intra transform-type CDFs (frame-global, not qcat-indexed).
     pub txtp_intra1: [[[u16; 8]; 13]; 2],
     pub txtp_intra2: [[[u16; 8]; 13]; 3],
@@ -729,6 +732,8 @@ impl Cdf {
             txsz: cdf::TX_SIZE,
             pal_y: cdf::PAL_Y_MODE,
             pal_uv: cdf::PAL_UV_MODE,
+            pal_sz: cdf::PAL_SZ,
+            color_map: cdf::COLOR_MAP,
             txtp_intra1: cdf::TXTP_INTRA1,
             txtp_intra2: cdf::TXTP_INTRA2,
             coef_skip: cdf::COEF_SKIP_Q[qcat],
@@ -766,6 +771,17 @@ pub(crate) fn tile_data_offset(header_bits: usize) -> usize {
 /// per-block leaf decode (intra mode, coefficients, reconstruction) is layered
 /// on in follow-up iterations; for now `decode_block` is a counting stub, so the
 /// recursion + entropy wiring are exercised but pixels are not yet produced.
+/// A decoded palette for one plane of one block: the colour table plus the
+/// per-pixel index map (`bw*bh`, row-major, stride `bw`). `reconstruct_tx`
+/// reads `colours[idx[(py-py0+yy)*bw + (px-px0+xx)]]` as the prediction.
+struct PalBlock {
+    colours: Vec<u8>,
+    idx: Vec<u8>,
+    px0: usize,
+    py0: usize,
+    bw: usize,
+}
+
 pub(crate) struct Av1Tile<'a> {
     pub msac: Msac<'a>,
     pub geom: TileGeom,
@@ -806,8 +822,19 @@ pub(crate) struct Av1Tile<'a> {
     /// Above/left neighbour tx log2-dim for the tx-size context (`-1` = unset).
     above_tx: Vec<i8>,
     left_tx: [i8; 32],
-    above_pal: Vec<u8>,
-    left_pal: [u8; 32],
+    /// Palette neighbour state, indexed `[0 = luma, 1 = chroma]`: the palette
+    /// SIZE per MI column/row (0 = no palette), used for the `pal_y`/`pal_uv`
+    /// flag context and to drive the prediction cache. Luma coords throughout
+    /// (chroma reuses luma MI positions — see aomedia bug 2183).
+    above_pal_sz: [Vec<u8>; 2],
+    left_pal_sz: [[u8; 32]; 2],
+    /// Neighbour palette COLOURS for the cache merge, `[0 = Y, 1 = U]` (V is not
+    /// a cache source). Up to 8 entries per MI, ascending.
+    above_pal_col: [Vec<[u8; 8]>; 2],
+    left_pal_col: [[[u8; 8]; 32]; 2],
+    /// Transient palette for the block being reconstructed, per plane (Y, U, V):
+    /// colours + the decoded index map. `pal_pred` reads these in `reconstruct_tx`.
+    pal: [Option<PalBlock>; 3],
     /// Coefficient-level neighbour context (luma + 2 chroma planes), `0x40` =
     /// "no token yet" — consumed by the coefficient decoder's skip/level contexts.
     above_lcoef: Vec<u8>,
@@ -965,8 +992,11 @@ impl<'a> Av1Tile<'a> {
             left_skip: [0u8; 32],
             above_tx: vec![-1i8; cols + 32],
             left_tx: [-1i8; 32],
-            above_pal: vec![0u8; cols + 32],
-            left_pal: [0u8; 32],
+            above_pal_sz: [vec![0u8; cols + 32], vec![0u8; cols + 32]],
+            left_pal_sz: [[0u8; 32]; 2],
+            above_pal_col: [vec![[0u8; 8]; cols + 32], vec![[0u8; 8]; cols + 32]],
+            left_pal_col: [[[0u8; 8]; 32]; 2],
+            pal: [None, None, None],
             above_lcoef: vec![0x40u8; cols + 32],
             left_lcoef: [0x40u8; 32],
             above_ccoef: [vec![0x40u8; cols + 32], vec![0x40u8; cols + 32]],
@@ -1018,7 +1048,8 @@ impl<'a> Av1Tile<'a> {
             self.left_uvmode = [mode::DC_PRED; 32];
             self.left_skip = [0u8; 32];
             self.left_tx = [-1i8; 32];
-            self.left_pal = [0u8; 32];
+            self.left_pal_sz = [[0u8; 32]; 2];
+            self.left_pal_col = [[[0u8; 8]; 32]; 2];
             self.left_lcoef = [0x40u8; 32];
             self.left_ccoef = [[0x40u8; 32]; 2];
             let mut col = 0;
@@ -1296,28 +1327,108 @@ impl<'a> Av1Tile<'a> {
             }
         }
 
-        // Palette (screen-content frames only). The Y/UV palette-mode flags must
-        // be read to stay in sync; reading the palette itself (`read_pal_indices`)
-        // is not yet implemented, but photographic AVIF encoders disable
-        // screen-content tools so the flags read 0.
+        // Palette (§5.11.46-50, screen-content frames). The Y/UV flags select
+        // palette mode; when set we decode the colour table + per-pixel index
+        // map (the palette is a *predictor* — `reconstruct_tx` fills the block
+        // from it, then the transform residual is added on top as usual).
+        self.pal = [None, None, None];
+        let mut pal_sz_y = 0usize;
+        let mut pal_sz_uv = 0usize;
+        // Coded index-map dimensions, recorded with the colours and consumed by
+        // the index decode below (which the bitstream places *after* both colour
+        // tables + filter-intra): `(bw, bh, w, h)` in pixels.
+        let mut y_geo = (0usize, 0usize, 0usize, 0usize);
+        let mut uv_geo = (0usize, 0usize, 0usize, 0usize);
         if self.allow_screen_content_tools && bw4.max(bh4) <= 16 && bw4 + bh4 >= 4 {
             let sz_ctx = (lw + lh - 2) as usize;
+            let mic = self.geom.mi_cols as i32;
+            let mir = self.geom.mi_rows as i32;
+            let w4 = (bw4 as i32).min(mic - mi_col as i32).max(1);
+            let h4 = (bh4 as i32).min(mir - mi_row as i32).max(1);
             if y_mode == mode::DC_PRED {
-                let pal_ctx =
-                    (self.above_pal[acol] > 0) as usize + (self.left_pal[by4] > 0) as usize;
-                let use_y_pal = self.msac.bool_adapt(&mut self.cdf.pal_y[sz_ctx][pal_ctx]);
-                debug_assert!(use_y_pal == 0, "TODO(palette): read_pal_indices");
+                let pal_ctx = (self.above_pal_sz[0][acol] > 0) as usize
+                    + (self.left_pal_sz[0][by4] > 0) as usize;
+                if self.msac.bool_adapt(&mut self.cdf.pal_y[sz_ctx][pal_ctx]) != 0 {
+                    // No above palette across the SB64 top boundary (`by4 & 15`).
+                    let a_sz =
+                        if by4 & 15 != 0 { self.above_pal_sz[0][acol] as usize } else { 0 };
+                    let l_sz = self.left_pal_sz[0][by4] as usize;
+                    let a_col = self.above_pal_col[0][acol];
+                    let l_col = self.left_pal_col[0][by4];
+                    let pal = palette::read_pal_plane(
+                        &mut self.msac,
+                        &mut self.cdf.pal_sz[0][sz_ctx],
+                        &l_col,
+                        l_sz,
+                        &a_col,
+                        a_sz,
+                        0,
+                    );
+                    pal_sz_y = pal.len();
+                    let (bw, bh) = (bw4 as usize * 4, bh4 as usize * 4);
+                    y_geo = (bw, bh, w4 as usize * 4, h4 as usize * 4);
+                    self.pal[0] = Some(PalBlock {
+                        colours: pal,
+                        idx: Vec::new(),
+                        px0: mi_col as usize * 4,
+                        py0: mi_row as usize * 4,
+                        bw,
+                    });
+                }
             }
             if has_chroma && uv_mode == mode::DC_PRED {
-                let use_uv_pal = self.msac.bool_adapt(&mut self.cdf.pal_uv[0]);
-                debug_assert!(use_uv_pal == 0, "TODO(palette): read_pal_uv");
+                let pal_ctx = (pal_sz_y > 0) as usize;
+                if self.msac.bool_adapt(&mut self.cdf.pal_uv[pal_ctx]) != 0 {
+                    let a_sz =
+                        if by4 & 15 != 0 { self.above_pal_sz[1][acol] as usize } else { 0 };
+                    let l_sz = self.left_pal_sz[1][by4] as usize;
+                    let au = self.above_pal_col[1][acol];
+                    let lu = self.left_pal_col[1][by4];
+                    let (u, v) = palette::read_pal_uv(
+                        &mut self.msac,
+                        &mut self.cdf.pal_sz[1][sz_ctx],
+                        &lu,
+                        l_sz,
+                        &au,
+                        a_sz,
+                    );
+                    pal_sz_uv = u.len();
+                    let cbw = (((bw4 as i32 + ss_h as i32) >> ss_h) * 4) as usize;
+                    let cbh = (((bh4 as i32 + ss_v as i32) >> ss_v) * 4) as usize;
+                    uv_geo = (
+                        cbw,
+                        cbh,
+                        (((w4 + ss_h as i32) >> ss_h) * 4) as usize,
+                        (((h4 + ss_v as i32) >> ss_v) * 4) as usize,
+                    );
+                    let cpx0 = (mi_col as usize >> ss_h) * 4;
+                    let cpy0 = (mi_row as usize >> ss_v) * 4;
+                    self.pal[1] = Some(PalBlock {
+                        colours: u,
+                        idx: Vec::new(),
+                        px0: cpx0,
+                        py0: cpy0,
+                        bw: cbw,
+                    });
+                    self.pal[2] = Some(PalBlock {
+                        colours: v,
+                        idx: Vec::new(),
+                        px0: cpx0,
+                        py0: cpy0,
+                        bw: cbw,
+                    });
+                }
             }
         }
 
         // filter-intra: DC_PRED, blocks ≤ 8×8. The chosen filter index becomes
         // `y_angle`, used to derive the luma tx-type (`FILTER_MODE_TO_Y_MODE`).
         let mut y_angle = 0u8;
-        if y_mode == mode::DC_PRED && lw.max(lh) <= 3 && self.enable_filter_intra {
+        if y_mode == mode::DC_PRED
+            && pal_sz_y == 0
+            && lw.max(lh) <= 3
+            && self.enable_filter_intra
+        {
             let is_filter = self.msac.bool_adapt(&mut self.cdf.use_filter_intra[bs as usize]);
             if is_filter != 0 {
                 y_angle = self.msac.symbol_adapt(&mut self.cdf.filter_intra, 4) as u8;
@@ -1325,9 +1436,40 @@ impl<'a> Av1Tile<'a> {
             }
         }
 
-        // Transform size (intra): start at the block's max luma tx, then descend
+        // Palette index maps — read here (after both colour tables + filter-intra)
+        // to match the bitstream order, Y then UV.
+        if pal_sz_y > 0 {
+            let (bw, bh, w, h) = y_geo;
+            let idx = palette::read_pal_indices(
+                &mut self.msac,
+                &mut self.cdf.color_map[0][pal_sz_y - 2],
+                pal_sz_y,
+                bw,
+                bh,
+                w,
+                h,
+            );
+            self.pal[0].as_mut().unwrap().idx = idx;
+        }
+        if pal_sz_uv > 0 {
+            let (cbw, cbh, cw, ch) = uv_geo;
+            let cidx = palette::read_pal_indices(
+                &mut self.msac,
+                &mut self.cdf.color_map[1][pal_sz_uv - 2],
+                pal_sz_uv,
+                cbw,
+                cbh,
+                cw,
+                ch,
+            );
+            self.pal[1].as_mut().unwrap().idx = cidx.clone();
+            self.pal[2].as_mut().unwrap().idx = cidx;
+        }
+
+        // Transform size (intra): a lossless block is always TX_4X4 (AV1
+        // `read_tx_size`); otherwise start at the block's max luma tx and descend
         // via the size-split symbol when the frame uses switchable transforms.
-        let mut tx = MAX_YTX[bs as usize] as usize;
+        let mut tx = if self.lossless[0] { 0 } else { MAX_YTX[bs as usize] as usize };
         let tmax = TXFM_DIMENSIONS[tx][2];
         if self.tx_mode_select && tmax > 0 {
             let max_lw = TXFM_DIMENSIONS[tx][0] as i8;
@@ -1365,7 +1507,8 @@ impl<'a> Av1Tile<'a> {
         } else {
             1 // I420
         };
-        let uvtx = MAX_TXFM_SIZE_FOR_BS[bs as usize][layout] as usize;
+        let uvtx =
+            if self.lossless[0] { 0 } else { MAX_TXFM_SIZE_FOR_BS[bs as usize][layout] as usize };
         if skip != 0 {
             for i in 0..bw4 as usize {
                 if acol + i < self.above_lcoef.len() {
@@ -1395,6 +1538,13 @@ impl<'a> Av1Tile<'a> {
                     }
                 }
             }
+            // Skipped palette planes still need their prediction written (the
+            // residual path that normally calls `pal_pred` does not run).
+            for plane in 0..3 {
+                if self.pal[plane].is_some() {
+                    self.pal_fill(plane);
+                }
+            }
         } else {
             self.decode_residuals(
                 mi_row, mi_col, bs, tx, uvtx, y_mode, y_angle, uv_mode, cfl_alpha, has_chroma,
@@ -1422,7 +1572,78 @@ impl<'a> Av1Tile<'a> {
                 self.left_skip[by4 + i] = skip as u8;
             }
         }
+
+        // Palette neighbour state (luma MI coords for both planes): the size is
+        // written for every block (0 clears a stale palette); colours only when
+        // this block has a palette — the cache merge ignores zero-size entries.
+        let pad = |pb: &PalBlock| {
+            let mut c = [0u8; 8];
+            c[..pb.colours.len()].copy_from_slice(&pb.colours);
+            c
+        };
+        let y_col: Option<[u8; 8]> = self.pal[0].as_ref().map(&pad);
+        let u_col: Option<[u8; 8]> = self.pal[1].as_ref().map(&pad);
+        for i in 0..bw4 as usize {
+            if acol + i < self.above_pal_sz[0].len() {
+                self.above_pal_sz[0][acol + i] = pal_sz_y as u8;
+                if let Some(c) = y_col {
+                    self.above_pal_col[0][acol + i] = c;
+                }
+                if has_chroma {
+                    self.above_pal_sz[1][acol + i] = pal_sz_uv as u8;
+                    if let Some(c) = u_col {
+                        self.above_pal_col[1][acol + i] = c;
+                    }
+                }
+            }
+        }
+        for i in 0..bh4 as usize {
+            if by4 + i < 32 {
+                self.left_pal_sz[0][by4 + i] = pal_sz_y as u8;
+                if let Some(c) = y_col {
+                    self.left_pal_col[0][by4 + i] = c;
+                }
+                if has_chroma {
+                    self.left_pal_sz[1][by4 + i] = pal_sz_uv as u8;
+                    if let Some(c) = u_col {
+                        self.left_pal_col[1][by4 + i] = c;
+                    }
+                }
+            }
+        }
         self.blocks_visited += 1;
+    }
+
+    /// Write a palette plane's prediction (no residual) directly into the plane
+    /// buffer — used for skipped palette blocks, which take no residual path.
+    fn pal_fill(&mut self, plane: usize) {
+        let (colours, idx, px0, py0, bw, bh) = {
+            let pb = self.pal[plane].as_ref().unwrap();
+            (
+                pb.colours.clone(),
+                pb.idx.clone(),
+                pb.px0,
+                pb.py0,
+                pb.bw,
+                pb.idx.len() / pb.bw,
+            )
+        };
+        let pw = self.plane_w[plane];
+        let ph = self.plane_h[plane];
+        let buf = &mut self.planes[plane];
+        for yy in 0..bh {
+            let py = py0 + yy;
+            if py >= ph {
+                break;
+            }
+            for xx in 0..bw {
+                let px = px0 + xx;
+                if px >= pw {
+                    break;
+                }
+                buf[py * pw + px] = colours[idx[yy * bw + xx] as usize];
+            }
+        }
     }
 
     /// Decode a transform block's header: txb_skip (all-zero) and, when not
@@ -1895,8 +2116,24 @@ impl<'a> Av1Tile<'a> {
             128
         };
 
+        // Palette planes predict from the colour table + index map (no intra
+        // prediction); any transform residual is added below as usual.
+        let pal_pred: Option<Vec<i32>> = self.pal[plane].as_ref().map(|pb| {
+            let mut p = vec![0i32; bw * bh];
+            for yy in 0..bh {
+                for xx in 0..bw {
+                    let bx = px - pb.px0 + xx;
+                    let by = py - pb.py0 + yy;
+                    p[yy * bw + xx] = pb.colours[pb.idx[by * pb.bw + bx] as usize] as i32;
+                }
+            }
+            p
+        });
+
         // Luma filter-intra, chroma CfL, or the standard / directional predictors.
-        let pred = if plane == 0 && mode == predict::FILTER_PRED {
+        let pred = if let Some(p) = pal_pred {
+            p
+        } else if plane == 0 && mode == predict::FILTER_PRED {
             predict::filter(bw, bh, &top, &left, topleft, filt_idx)
         } else if plane != 0 && mode == predict::CFL_PRED {
             let dc = predict::dc_value(bw, bh, &top, &left, have_top, have_left);
@@ -2679,6 +2916,63 @@ mod tests {
             }
             assert_eq!(maxd, 0, "plane {p} ({pw}x{ph}) differs from dav1d after deblock");
             refoff += n;
+        }
+    }
+
+    /// End-to-end PALETTE mode (§5.11.46-50), validated bit-exact vs dav1d on two
+    /// screen-content 64×64 stills: `av1pal2` (a solid colour → minimal palette)
+    /// and `av1pal` (testsrc2 → multi-colour palettes). Exercises the colour
+    /// decode (cache reuse + delta coding), the wavefront index map, and the
+    /// `pal_pred` reconstruction (skipped + residual-bearing palette blocks).
+    #[test]
+    fn palette_matches_dav1d() {
+        use super::super::{
+            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
+            OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+        };
+        for (avif, reference, name) in [
+            (
+                include_bytes!("../fixtures/av1pal2.avif").as_slice(),
+                include_bytes!("../fixtures/av1pal2_ref.yuv").as_slice(),
+                "av1pal2",
+            ),
+            (
+                include_bytes!("../fixtures/av1pal.avif").as_slice(),
+                include_bytes!("../fixtures/av1pal_ref.yuv").as_slice(),
+                "av1pal",
+            ),
+        ] {
+            let stream = extract_av1_stream(avif).unwrap();
+            let obus = split_obus(&stream).unwrap();
+            let seq = parse_sequence_header(
+                obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+            )
+            .unwrap();
+            let frame = obus
+                .iter()
+                .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)
+                .unwrap();
+            let fh = parse_frame_header(&seq, frame.data).unwrap();
+            assert!(
+                fh.allow_screen_content_tools,
+                "{name}: fixture must enable screen-content tools (palette)"
+            );
+            let off = tile_data_offset(fh.header_bits);
+            let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
+            let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
+            let mut tile = Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+            tile.decode();
+            let mut refoff = 0usize;
+            for p in 0..3 {
+                let (buf, pw, ph) = tile.plane(p);
+                let n = pw * ph;
+                let mut maxd = 0i32;
+                for i in 0..n {
+                    maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
+                }
+                assert_eq!(maxd, 0, "{name}: plane {p} ({pw}x{ph}) differs from dav1d");
+                refoff += n;
+            }
         }
     }
 
