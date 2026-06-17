@@ -33,12 +33,23 @@ cargo wasm   # alias for the release target build (see .cargo/config.toml)
 # → target/wasm32-unknown-unknown/release/gigapdf_wasm.wasm  (~540 KB)
 ```
 
-The `.wasm` is self-contained: instantiate it with an **empty** import object.
-No JS glue is generated — you call the `gp_*` exports directly over the linear
-memory ABI described in [USAGE.md](USAGE.md).
+The `.wasm` is `wasm-bindgen`-free: it imports a single host function for
+entropy (`env.gp_host_random`) and generates no JS glue — you call the `gp_*`
+exports directly over the linear memory ABI described in [USAGE.md](USAGE.md).
 
 ```js
-const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+let ex; // exports; the import closure reads ex.memory lazily (called post-init)
+const { instance } = await WebAssembly.instantiate(wasmBytes, {
+  env: {
+    gp_host_random(ptr, len) {
+      const view = new Uint8Array(ex.memory.buffer, ptr, len);
+      for (let off = 0; off < len; off += 65536) {
+        crypto.getRandomValues(view.subarray(off, Math.min(off + 65536, len)));
+      }
+    },
+  },
+});
+ex = instance.exports;
 ```
 
 ### Optional size trimming

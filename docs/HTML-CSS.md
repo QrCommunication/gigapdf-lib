@@ -313,11 +313,11 @@ bitmap strikes.
 
 ## 8. JavaScript
 
-A document's inline `<script>` runs **before layout** through the built-in
-zero-dependency JS engine, so script-generated DOM is rendered. It implements
-ES2021-class semantics — classes, closures, destructuring, `RegExp`, `Map`/`Set`,
-`Symbol`, `JSON`, `eval`/`Function`, and **lazy generators + spec-ordered
-`async`/`await`** (a suspendable bytecode VM) — plus DOM bindings:
+A document's inline `<script>` runs **before layout** through the embedded
+**Boa** JavaScript engine, so script-generated DOM is rendered. Boa is a full
+ES2021+ engine — classes, closures, destructuring, `RegExp`, `Map`/`Set`,
+`Symbol`, `JSON`, lazy/infinite generators and spec-ordered `async`/`await` —
+exposed to a JavaScript DOM polyfill:
 
 `document.getElementById` · `getElementsByTagName` · `querySelector(All)` ·
 `createElement` · `body` · `title`; and on elements `textContent` · `innerHTML` ·

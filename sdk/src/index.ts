@@ -1,7 +1,9 @@
 /**
- * @qrcommunication/gigapdf-lib — TypeScript SDK for the zero-dependency Rust→WASM
- * PDF engine (gigapdf-lib). Wraps the flat `extern "C"` `gp_*` ABI behind a typed,
- * ergonomic class. No third-party runtime deps; the `.wasm` is self-contained.
+ * @qrcommunication/gigapdf-lib — TypeScript SDK for the gigapdf-lib Rust→WASM PDF
+ * engine: no third-party PDF/Office/image library (cryptography uses RustCrypto,
+ * JavaScript uses Boa). Wraps the flat `extern "C"` `gp_*` ABI behind a typed,
+ * ergonomic class. No third-party npm deps; the `.wasm` imports a single host
+ * function — `env.gp_host_random` (entropy), which `load()` supplies.
  *
  * Usage:
  *   const giga = await GigaPdfEngine.load(wasmBytesOrUrl);

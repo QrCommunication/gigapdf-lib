@@ -1,18 +1,31 @@
 # Usage — host integration
 
-The engine ships as a single `gigapdf_wasm.wasm` with a flat, dependency-free
-`extern "C"` ABI. This guide shows how a JavaScript host (browser or Node) drives
-it. For the complete symbol list see [API.md](API.md).
+The engine ships as a single `gigapdf_wasm.wasm` with a flat `extern "C"` ABI
+and no `wasm-bindgen`. It imports one host function — `env.gp_host_random`
+(entropy for RSA signatures and `Math.random`) — and exports the `gp_*` symbols.
+This guide shows how a JavaScript host (browser or Node) drives it. For the
+complete symbol list see [API.md](API.md).
 
 ## 1. Load the module
 
 ```js
 import { readFileSync } from "node:fs"; // browser: fetch + arrayBuffer
+let ex; // exports; the import closure reads ex.memory lazily (called post-init)
 const { instance } = await WebAssembly.instantiate(
   readFileSync("gigapdf_wasm.wasm"),
-  {}, // no imports required — the engine is self-contained
+  {
+    env: {
+      // The engine's only host import: entropy for RSA signatures + Math.random.
+      gp_host_random(ptr, len) {
+        const view = new Uint8Array(ex.memory.buffer, ptr, len);
+        for (let off = 0; off < len; off += 65536) {
+          crypto.getRandomValues(view.subarray(off, Math.min(off + 65536, len)));
+        }
+      },
+    },
+  },
 );
-const ex = instance.exports;
+ex = instance.exports;
 ```
 
 ## 2. The memory ABI

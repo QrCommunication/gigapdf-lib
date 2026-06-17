@@ -4,6 +4,31 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.42.0] - 2026-06-18
+
+### Changed
+
+- **Cryptography now uses audited RustCrypto crates** (`rsa`, `sha2`, `aes`,
+  `cbc`, `des`, `rc2`, `hmac`, `x509-cert`, `cms`) instead of hand-rolled
+  primitives — for PDF signing (RSA/X.509/CMS) and the standard security handler
+  (AES/RC4/3DES/RC2). The public ABI and SDK are unchanged.
+- **The HTML→PDF inline-`<script>` engine is now Boa** (`boa_engine`), replacing
+  the hand-written interpreter. `js::run_inline_scripts` / `js::eval` keep their
+  signatures; Boa is a full ES2021+ engine, so generators, `async`/`await`,
+  `RegExp`, `Map`/`Set` and the rest behave per spec. ~14k lines of the former
+  engine were removed.
+- The wasm engine stays **`wasm-bindgen`-free**. Entropy (RSA blinding, Boa
+  `Math.random`) is drawn through a single host import, **`env.gp_host_random`**,
+  which the SDK's `load()` fills from `crypto.getRandomValues`. **Hosts that
+  instantiate the `.wasm` directly must now provide this import** (the import
+  object was previously empty). Dropping the `wasm_js` getrandom backend also
+  removed the transitive `wasm-bindgen`/`js-sys` dependency tree.
+
+> Rationale: rolling your own cryptography (timing/oracle side-channels, eIDAS
+> non-conformance) and maintaining a JS engine are liabilities better delegated
+> to audited, wasm-compatible crates. The "no third-party PDF/Office/image
+> library" invariant is unchanged — see `THIRD-PARTY-LICENSES.md`.
+
 ## [0.41.0] - 2026-06-17
 
 ### Fixed

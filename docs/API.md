@@ -274,21 +274,17 @@ Google fonts**, so the host fetches fonts in two phases.
   content onto a new page.
 - **Exhaustive reference**: every supported HTML element, CSS property, length
   unit, colour and selector is listed in [`HTML-CSS.md`](HTML-CSS.md).
-- **JavaScript** (`js` module): inline `<script>`s execute **before layout** via
-  a zero-dependency engine; `js::run_inline_scripts(html) -> String` does it
-  standalone (the renderer calls it automatically). `js::Interp::eval_source(src)
-  -> Result<Value, String>` evaluates a snippet.
-  - Language: classes + `super`, closures, destructuring, spread, optional
-    chaining, template literals, `RegExp`, `Map`/`Set`, `Symbol`, `eval`/
-    `Function`. `function*`/`async` bodies compile to a **suspendable bytecode
-    VM**: lazy/infinite generators, bidirectional `.next(v)`, `yield*`,
-    spec-ordered `async`/`await`, and full control flow across a suspension
-    (`try/catch/finally`, `for…of`/`for…in`, `switch`, labels, destructuring,
-    spread).
-  - Built-ins: `Object`/`Array`/`String`/`Number`/`Boolean`/`Math`/`JSON`/
-    `console`/`Map`/`Set`/`RegExp` (+ a backtracking regex engine)/`Error`,
-    `parseInt`/`parseFloat`/`setTimeout`/`queueMicrotask`.
-  - DOM: `document.getElementById`/`getElementsByTagName`/`querySelector(All)`
+- **JavaScript** (`js` module): inline `<script>`s execute **before layout** on
+  the embedded **Boa** engine; `js::run_inline_scripts(html) -> String` does it
+  standalone (the renderer calls it automatically), and `js::eval(src) -> String`
+  evaluates a snippet.
+  - Language: Boa is a full ES2021+ engine, so classes + `super`, closures,
+    destructuring, spread, optional chaining, template literals, `RegExp`,
+    `Map`/`Set`, `Symbol`, lazy/infinite generators (`yield*`, bidirectional
+    `.next(v)`) and spec-ordered `async`/`await` all work, alongside the usual
+    `Object`/`Array`/`String`/`Number`/`Math`/`JSON`/`console` built-ins.
+  - DOM: a JavaScript polyfill (built over `crate::html::dom`) provides
+    `document.getElementById`/`getElementsByTagName`/`querySelector(All)`
     (combinators `>`/`+`/`~`, attribute selectors), `createElement`/
     `createTextNode`, and on elements `textContent`/`innerHTML`/`getAttribute`/
     `setAttribute`/`appendChild`/`removeChild`/`classList`/`style`/`children`.
