@@ -173,6 +173,21 @@ impl<'a> Msac<'a> {
         v
     }
 
+    /// Decode a uniformly-distributed value in `0..n` — `dav1d_msac_decode_uniform`.
+    /// Reads `l-1` equi-bits (`l = ulog2(n)+1`); the low `m = 2^l - n` codes map
+    /// directly, the rest take one extra bit. Used for the first palette index.
+    pub fn decode_uniform(&mut self, n: u32) -> u32 {
+        debug_assert!(n > 1);
+        let l = (31 - n.leading_zeros()) + 1;
+        let m = (1u32 << l) - n;
+        let v = self.bools(l - 1);
+        if v < m {
+            v
+        } else {
+            (v << 1) - m + self.bool_equi()
+        }
+    }
+
     /// Decode a coefficient "hi token" (3..=15) via the 3-symbol base-range
     /// cascade on a shared CDF. `dav1d_msac_decode_hi_tok`.
     pub fn decode_hi_tok(&mut self, cdf: &mut [u16]) -> u32 {
