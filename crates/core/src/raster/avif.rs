@@ -544,6 +544,8 @@ pub(crate) struct FrameHeader {
     pub loop_filter_sharpness: u32,
     pub loop_filter_ref_deltas: [i32; 8],
     pub loop_filter_mode_deltas: [i32; 2],
+    /// `loop_filter_delta_enabled` — applies the ref/mode deltas to the level.
+    pub loop_filter_delta_enabled: bool,
     pub cdef_damping: u32,
     pub cdef_bits: u32,
     pub cdef_y_pri: [u32; 8],
@@ -857,6 +859,7 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
         h.loop_filter_sharpness = r.f(3);
         if r.f(1) != 0 {
             // loop_filter_delta_enabled
+            h.loop_filter_delta_enabled = true;
             if r.f(1) != 0 {
                 // loop_filter_delta_update
                 for i in 0..8 {
