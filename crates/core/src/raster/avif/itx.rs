@@ -290,6 +290,178 @@ fn dct32(c: &mut [i32], s: usize, min: i32, max: i32) {
     }
 }
 
+// ---- Inverse ADST / FlipADST --------------------------------------------
+// dav1d's `inv_adstN_1d_internal_c` reads `in` forward and writes `out`; the
+// flip variant writes the output reversed (negative out stride). We compute the
+// outputs into an array then store forward (ADST) or reversed (FlipADST).
+
+#[inline]
+fn store_adst(c: &mut [i32], s: usize, out: &[i32], flip: bool) {
+    let n = out.len();
+    for (i, &v) in out.iter().enumerate() {
+        let idx = if flip { n - 1 - i } else { i };
+        c[idx * s] = v;
+    }
+}
+
+fn adst4(c: &mut [i32], s: usize, _min: i32, _max: i32, flip: bool) {
+    let (in0, in1, in2, in3) = (c[0], c[s], c[2 * s], c[3 * s]);
+    let o0 = ((1321 * in0 + (3803 - 4096) * in2 + (2482 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
+        >> 12)
+        + in2
+        + in3
+        + in1;
+    let o1 = (((2482 - 4096) * in0 - 1321 * in2 - (3803 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
+        >> 12)
+        + in0
+        - in3
+        + in1;
+    let o2 = (209 * (in0 - in2 + in3) + 128) >> 8;
+    let o3 = (((3803 - 4096) * in0 + (2482 - 4096) * in2 - 1321 * in3 - (3344 - 4096) * in1 + 2048)
+        >> 12)
+        + in0
+        + in2
+        - in1;
+    store_adst(c, s, &[o0, o1, o2, o3], flip);
+}
+
+fn adst8(c: &mut [i32], s: usize, min: i32, max: i32, flip: bool) {
+    let (in0, in1, in2, in3) = (c[0], c[s], c[2 * s], c[3 * s]);
+    let (in4, in5, in6, in7) = (c[4 * s], c[5 * s], c[6 * s], c[7 * s]);
+    let t0a = (((4076 - 4096) * in7 + 401 * in0 + 2048) >> 12) + in7;
+    let t1a = ((401 * in7 - (4076 - 4096) * in0 + 2048) >> 12) - in0;
+    let t2a = (((3612 - 4096) * in5 + 1931 * in2 + 2048) >> 12) + in5;
+    let t3a = ((1931 * in5 - (3612 - 4096) * in2 + 2048) >> 12) - in2;
+    let t4a = (1299 * in3 + 1583 * in4 + 1024) >> 11;
+    let t5a = (1583 * in3 - 1299 * in4 + 1024) >> 11;
+    let t6a = ((1189 * in1 + (3920 - 4096) * in6 + 2048) >> 12) + in6;
+    let t7a = (((3920 - 4096) * in1 - 1189 * in6 + 2048) >> 12) + in1;
+    let t0 = clip(t0a + t4a, min, max);
+    let t1 = clip(t1a + t5a, min, max);
+    let mut t2 = clip(t2a + t6a, min, max);
+    let mut t3 = clip(t3a + t7a, min, max);
+    let t4 = clip(t0a - t4a, min, max);
+    let t5 = clip(t1a - t5a, min, max);
+    let mut t6 = clip(t2a - t6a, min, max);
+    let mut t7 = clip(t3a - t7a, min, max);
+    let t4a = (((3784 - 4096) * t4 + 1567 * t5 + 2048) >> 12) + t4;
+    let t5a = ((1567 * t4 - (3784 - 4096) * t5 + 2048) >> 12) - t5;
+    let t6a = (((3784 - 4096) * t7 - 1567 * t6 + 2048) >> 12) + t7;
+    let t7a = ((1567 * t7 + (3784 - 4096) * t6 + 2048) >> 12) + t6;
+    let mut out = [0i32; 8];
+    out[0] = clip(t0 + t2, min, max);
+    out[7] = -clip(t1 + t3, min, max);
+    t2 = clip(t0 - t2, min, max);
+    t3 = clip(t1 - t3, min, max);
+    out[1] = -clip(t4a + t6a, min, max);
+    out[6] = clip(t5a + t7a, min, max);
+    t6 = clip(t4a - t6a, min, max);
+    t7 = clip(t5a - t7a, min, max);
+    out[3] = -(((t2 + t3) * 181 + 128) >> 8);
+    out[4] = ((t2 - t3) * 181 + 128) >> 8;
+    out[2] = ((t6 + t7) * 181 + 128) >> 8;
+    out[5] = -(((t6 - t7) * 181 + 128) >> 8);
+    store_adst(c, s, &out, flip);
+}
+
+fn adst16(c: &mut [i32], s: usize, min: i32, max: i32, flip: bool) {
+    let r = |i: usize| c[i * s];
+    let (in0, in1, in2, in3) = (r(0), r(1), r(2), r(3));
+    let (in4, in5, in6, in7) = (r(4), r(5), r(6), r(7));
+    let (in8, in9, in10, in11) = (r(8), r(9), r(10), r(11));
+    let (in12, in13, in14, in15) = (r(12), r(13), r(14), r(15));
+    let mut t0 = ((in15 * (4091 - 4096) + in0 * 201 + 2048) >> 12) + in15;
+    let mut t1 = ((in15 * 201 - in0 * (4091 - 4096) + 2048) >> 12) - in0;
+    let mut t2 = ((in13 * (3973 - 4096) + in2 * 995 + 2048) >> 12) + in13;
+    let mut t3 = ((in13 * 995 - in2 * (3973 - 4096) + 2048) >> 12) - in2;
+    let mut t4 = ((in11 * (3703 - 4096) + in4 * 1751 + 2048) >> 12) + in11;
+    let mut t5 = ((in11 * 1751 - in4 * (3703 - 4096) + 2048) >> 12) - in4;
+    let mut t6 = (in9 * 1645 + in6 * 1220 + 1024) >> 11;
+    let mut t7 = (in9 * 1220 - in6 * 1645 + 1024) >> 11;
+    let mut t8 = ((in7 * 2751 + in8 * (3035 - 4096) + 2048) >> 12) + in8;
+    let mut t9 = ((in7 * (3035 - 4096) - in8 * 2751 + 2048) >> 12) + in7;
+    let mut t10 = ((in5 * 2106 + in10 * (3513 - 4096) + 2048) >> 12) + in10;
+    let mut t11 = ((in5 * (3513 - 4096) - in10 * 2106 + 2048) >> 12) + in5;
+    let mut t12 = ((in3 * 1380 + in12 * (3857 - 4096) + 2048) >> 12) + in12;
+    let mut t13 = ((in3 * (3857 - 4096) - in12 * 1380 + 2048) >> 12) + in3;
+    let mut t14 = ((in1 * 601 + in14 * (4052 - 4096) + 2048) >> 12) + in14;
+    let mut t15 = ((in1 * (4052 - 4096) - in14 * 601 + 2048) >> 12) + in1;
+    let t0a = clip(t0 + t8, min, max);
+    let t1a = clip(t1 + t9, min, max);
+    let mut t2a = clip(t2 + t10, min, max);
+    let mut t3a = clip(t3 + t11, min, max);
+    let mut t4a = clip(t4 + t12, min, max);
+    let mut t5a = clip(t5 + t13, min, max);
+    let mut t6a = clip(t6 + t14, min, max);
+    let mut t7a = clip(t7 + t15, min, max);
+    let mut t8a = clip(t0 - t8, min, max);
+    let mut t9a = clip(t1 - t9, min, max);
+    let mut t10a = clip(t2 - t10, min, max);
+    let mut t11a = clip(t3 - t11, min, max);
+    let mut t12a = clip(t4 - t12, min, max);
+    let mut t13a = clip(t5 - t13, min, max);
+    let mut t14a = clip(t6 - t14, min, max);
+    let mut t15a = clip(t7 - t15, min, max);
+    t8 = ((t8a * (4017 - 4096) + t9a * 799 + 2048) >> 12) + t8a;
+    t9 = ((t8a * 799 - t9a * (4017 - 4096) + 2048) >> 12) - t9a;
+    t10 = ((t10a * 2276 + t11a * (3406 - 4096) + 2048) >> 12) + t11a;
+    t11 = ((t10a * (3406 - 4096) - t11a * 2276 + 2048) >> 12) + t10a;
+    t12 = ((t13a * (4017 - 4096) - t12a * 799 + 2048) >> 12) + t13a;
+    t13 = ((t13a * 799 + t12a * (4017 - 4096) + 2048) >> 12) + t12a;
+    t14 = ((t15a * 2276 - t14a * (3406 - 4096) + 2048) >> 12) - t14a;
+    t15 = ((t15a * (3406 - 4096) + t14a * 2276 + 2048) >> 12) + t15a;
+    t0 = clip(t0a + t4a, min, max);
+    t1 = clip(t1a + t5a, min, max);
+    t2 = clip(t2a + t6a, min, max);
+    t3 = clip(t3a + t7a, min, max);
+    t4 = clip(t0a - t4a, min, max);
+    t5 = clip(t1a - t5a, min, max);
+    t6 = clip(t2a - t6a, min, max);
+    t7 = clip(t3a - t7a, min, max);
+    t8a = clip(t8 + t12, min, max);
+    t9a = clip(t9 + t13, min, max);
+    t10a = clip(t10 + t14, min, max);
+    t11a = clip(t11 + t15, min, max);
+    t12a = clip(t8 - t12, min, max);
+    t13a = clip(t9 - t13, min, max);
+    t14a = clip(t10 - t14, min, max);
+    t15a = clip(t11 - t15, min, max);
+    t4a = ((t4 * (3784 - 4096) + t5 * 1567 + 2048) >> 12) + t4;
+    t5a = ((t4 * 1567 - t5 * (3784 - 4096) + 2048) >> 12) - t5;
+    t6a = ((t7 * (3784 - 4096) - t6 * 1567 + 2048) >> 12) + t7;
+    t7a = ((t7 * 1567 + t6 * (3784 - 4096) + 2048) >> 12) + t6;
+    t12 = ((t12a * (3784 - 4096) + t13a * 1567 + 2048) >> 12) + t12a;
+    t13 = ((t12a * 1567 - t13a * (3784 - 4096) + 2048) >> 12) - t13a;
+    t14 = ((t15a * (3784 - 4096) - t14a * 1567 + 2048) >> 12) + t15a;
+    t15 = ((t15a * 1567 + t14a * (3784 - 4096) + 2048) >> 12) + t14a;
+    let mut out = [0i32; 16];
+    out[0] = clip(t0 + t2, min, max);
+    out[15] = -clip(t1 + t3, min, max);
+    t2a = clip(t0 - t2, min, max);
+    t3a = clip(t1 - t3, min, max);
+    out[3] = -clip(t4a + t6a, min, max);
+    out[12] = clip(t5a + t7a, min, max);
+    t6 = clip(t4a - t6a, min, max);
+    t7 = clip(t5a - t7a, min, max);
+    out[1] = -clip(t8a + t10a, min, max);
+    out[14] = clip(t9a + t11a, min, max);
+    t10 = clip(t8a - t10a, min, max);
+    t11 = clip(t9a - t11a, min, max);
+    out[2] = clip(t12 + t14, min, max);
+    out[13] = -clip(t13 + t15, min, max);
+    t14a = clip(t12 - t14, min, max);
+    t15a = clip(t13 - t15, min, max);
+    out[7] = -(((t2a + t3a) * 181 + 128) >> 8);
+    out[8] = ((t2a - t3a) * 181 + 128) >> 8;
+    out[4] = ((t6 + t7) * 181 + 128) >> 8;
+    out[11] = -(((t6 - t7) * 181 + 128) >> 8);
+    out[6] = ((t10 + t11) * 181 + 128) >> 8;
+    out[9] = -(((t10 - t11) * 181 + 128) >> 8);
+    out[5] = -(((t14a + t15a) * 181 + 128) >> 8);
+    out[10] = ((t14a - t15a) * 181 + 128) >> 8;
+    store_adst(c, s, &out, flip);
+}
+
 // ---- Identity ------------------------------------------------------------
 
 fn identity4(c: &mut [i32], s: usize, _min: i32, _max: i32) {
@@ -348,9 +520,18 @@ fn itx_1d(c: &mut [i32], s: usize, len_log2: usize, ty: u8, min: i32, max: i32) 
             2 => identity16(c, s, min, max),
             _ => identity32(c, s, min, max),
         },
-        // ADST / FlipADST land in the next layer; never reached by the DCT/IDTX
-        // transform types wired so far.
-        _ => unimplemented!("ADST/FlipADST inverse not yet implemented"),
+        ADST_1D => match len_log2 {
+            0 => adst4(c, s, min, max, false),
+            1 => adst8(c, s, min, max, false),
+            _ => adst16(c, s, min, max, false),
+        },
+        FLIPADST_1D => match len_log2 {
+            0 => adst4(c, s, min, max, true),
+            1 => adst8(c, s, min, max, true),
+            _ => adst16(c, s, min, max, true),
+        },
+        // ADST/FlipADST only exist for 4/8/16; DCT covers 32/64.
+        _ => unreachable!("invalid 1D transform type {ty}"),
     }
 }
 
@@ -460,25 +641,33 @@ mod tests {
     #[test]
     fn dct_idtx_wht_match_dav1d_reference() {
         let (mn, mx) = (-32768, 32767);
-        let cases: [(usize, u8, usize); 9] = [
-            (4, DCT_1D, 0),
-            (8, DCT_1D, 1),
-            (16, DCT_1D, 2),
-            (32, DCT_1D, 3),
-            (4, IDENTITY_1D, 0),
-            (8, IDENTITY_1D, 1),
-            (16, IDENTITY_1D, 2),
-            (32, IDENTITY_1D, 3),
-            (4, 255, 0), // WHT sentinel
+        // (n, ty, len_log2, ref_index). ITX_REF order: dct4/8/16/32, adst4/8/16,
+        // flipadst4/8/16, idt4/8/16/32, wht4.
+        let cases: [(usize, u8, usize, usize); 15] = [
+            (4, DCT_1D, 0, 0),
+            (8, DCT_1D, 1, 1),
+            (16, DCT_1D, 2, 2),
+            (32, DCT_1D, 3, 3),
+            (4, ADST_1D, 0, 4),
+            (8, ADST_1D, 1, 5),
+            (16, ADST_1D, 2, 6),
+            (4, FLIPADST_1D, 0, 7),
+            (8, FLIPADST_1D, 1, 8),
+            (16, FLIPADST_1D, 2, 9),
+            (4, IDENTITY_1D, 0, 10),
+            (8, IDENTITY_1D, 1, 11),
+            (16, IDENTITY_1D, 2, 12),
+            (32, IDENTITY_1D, 3, 13),
+            (4, 255, 0, 14), // WHT sentinel
         ];
-        for (idx, &(n, ty, ll)) in cases.iter().enumerate() {
+        for &(n, ty, ll, ri) in cases.iter() {
             let mut c = input(n);
             if ty == 255 {
                 wht4(&mut c, 1);
             } else {
                 itx_1d(&mut c, 1, ll, ty, mn, mx);
             }
-            assert_eq!(c, ITX_REF[idx], "1D transform case {idx} (n={n}, ty={ty})");
+            assert_eq!(c, ITX_REF[ri], "1D transform (n={n}, ty={ty}, ref={ri})");
         }
     }
 

@@ -30,6 +30,12 @@ int main(void){
   for(int i=0;i<8;i++)c[i]=base[i];  inv_dct8_1d_c(c,1,mn,mx);  dump("dct8",c,8);
   for(int i=0;i<16;i++)c[i]=base[i]; inv_dct16_1d_c(c,1,mn,mx); dump("dct16",c,16);
   for(int i=0;i<32;i++)c[i]=base[i]; inv_dct32_1d_c(c,1,mn,mx); dump("dct32",c,32);
+  for(int i=0;i<4;i++)c[i]=base[i];  inv_adst4_1d_c(c,1,mn,mx);  dump("adst4",c,4);
+  for(int i=0;i<8;i++)c[i]=base[i];  inv_adst8_1d_c(c,1,mn,mx);  dump("adst8",c,8);
+  for(int i=0;i<16;i++)c[i]=base[i]; inv_adst16_1d_c(c,1,mn,mx); dump("adst16",c,16);
+  for(int i=0;i<4;i++)c[i]=base[i];  inv_flipadst4_1d_c(c,1,mn,mx);  dump("flipadst4",c,4);
+  for(int i=0;i<8;i++)c[i]=base[i];  inv_flipadst8_1d_c(c,1,mn,mx);  dump("flipadst8",c,8);
+  for(int i=0;i<16;i++)c[i]=base[i]; inv_flipadst16_1d_c(c,1,mn,mx); dump("flipadst16",c,16);
   for(int i=0;i<4;i++)c[i]=base[i];  inv_identity4_1d_c(c,1,mn,mx);  dump("idt4",c,4);
   for(int i=0;i<8;i++)c[i]=base[i];  inv_identity8_1d_c(c,1,mn,mx);  dump("idt8",c,8);
   for(int i=0;i<16;i++)c[i]=base[i]; inv_identity16_1d_c(c,1,mn,mx); dump("idt16",c,16);
