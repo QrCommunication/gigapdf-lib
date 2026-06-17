@@ -349,6 +349,7 @@ fn gather_left_partition_prob(c: &[u16], bl: u8) -> u32 {
 // ── Tile decoder: the partition tree driven by the entropy decoder ────────────
 
 use super::cdf;
+use super::cdef;
 use super::deblock;
 use super::itx;
 use super::msac::Msac;
@@ -828,6 +829,71 @@ pub(crate) struct Av1Tile<'a> {
     /// Frame `loop_filter_sharpness` (for the FilterLUT) + base Y levels (the on/off gate).
     db_sharpness: u32,
     db_level_y: [u32; 2],
+    /// CDEF (§7.15) frame params. Only `cdef_bits == 0` (a single strength set,
+    /// applied to every 64×64) is wired today — no per-block `cdef_idx` is read
+    /// from the entropy stream yet, so `cdef_bits > 0` is left unfiltered.
+    cdef_bits: u32,
+    cdef_damping: i32,
+    cdef_y_pri: i32,
+    cdef_y_sec: i32,
+    cdef_uv_pri: i32,
+    cdef_uv_sec: i32,
+    /// Per-4×4 luma "block had coded coefficients" grid (mi_cols × mi_rows): CDEF
+    /// skips all-skip 8×8 blocks (dav1d `noskip_mask`).
+    cdef_noskip: Vec<u8>,
+}
+
+/// CDEF availability flags for a `w × h` block at `(bx, by)` in a `pw × ph`
+/// plane: the 2-px halo on a side exists only when it stays inside the plane.
+/// Bits: LEFT=1, RIGHT=2, TOP=4, BOTTOM=8 (dav1d `CdefEdgeFlags`).
+fn cdef_edges(bx: usize, by: usize, w: usize, h: usize, pw: usize, ph: usize) -> u8 {
+    let mut e = 0u8;
+    if bx > 0 {
+        e |= 0b0001;
+    }
+    if bx + w < pw {
+        e |= 0b0010;
+    }
+    if by > 0 {
+        e |= 0b0100;
+    }
+    if by + h < ph {
+        e |= 0b1000;
+    }
+    e
+}
+
+/// Filter one `w × h` block of `dst` (a live plane) in place, taking the
+/// pre-CDEF top/left halo from `src` (a clone) and the not-yet-filtered
+/// right/bottom halo + body from `dst` itself. Frame-edge halos are sentinel-
+/// filled by the filter via the derived edge flags.
+#[allow(clippy::too_many_arguments)]
+fn cdef_apply_one(
+    dst: &mut [u8],
+    src: &[u8],
+    pw: usize,
+    ph: usize,
+    bx: usize,
+    by: usize,
+    w: usize,
+    h: usize,
+    pri: i32,
+    sec: i32,
+    dir: usize,
+    damping: i32,
+) {
+    let edges = cdef_edges(bx, by, w, h, pw, ph);
+    let doff = by * pw + bx;
+    let left: Vec<[u8; 2]> = if edges & 0b0001 != 0 {
+        (0..h).map(|y| [src[(by + y) * pw + bx - 2], src[(by + y) * pw + bx - 1]]).collect()
+    } else {
+        vec![[0u8; 2]; h]
+    };
+    let t_off = if edges & 0b0100 != 0 { (by - 2) * pw + bx } else { 0 };
+    let b_off = if edges & 0b1000 != 0 { (by + h) * pw + bx } else { 0 };
+    cdef::cdef_filter_block(
+        dst, doff, pw, &left, src, t_off, pw, src, b_off, pw, pri, sec, dir, damping, w, h, edges,
+    );
 }
 
 impl<'a> Av1Tile<'a> {
@@ -919,6 +985,13 @@ impl<'a> Av1Tile<'a> {
             ],
             db_sharpness: fh.loop_filter_sharpness,
             db_level_y: [fh.loop_filter_level[0], fh.loop_filter_level[1]],
+            cdef_bits: fh.cdef_bits,
+            cdef_damping: fh.cdef_damping as i32,
+            cdef_y_pri: fh.cdef_y_pri[0] as i32,
+            cdef_y_sec: fh.cdef_y_sec[0] as i32,
+            cdef_uv_pri: fh.cdef_uv_pri[0] as i32,
+            cdef_uv_sec: fh.cdef_uv_sec[0] as i32,
+            cdef_noskip: Vec::new(),
         }
     }
 
@@ -934,6 +1007,8 @@ impl<'a> Av1Tile<'a> {
             self.db_tx_h4[p] = vec![0u8; gw4 * gh4];
             self.db_edge[p] = vec![0u8; gw4 * gh4];
         }
+        // Per-MI (4×4 luma) "block coded coefficients" grid for CDEF skip.
+        self.cdef_noskip = vec![0u8; self.geom.mi_cols as usize * self.geom.mi_rows as usize];
         let sb4: u32 = if self.sb_bl == BL_128X128 { 32 } else { 16 };
         let mut row = 0;
         while row < self.geom.mi_rows {
@@ -954,6 +1029,7 @@ impl<'a> Av1Tile<'a> {
             row += sb4;
         }
         self.apply_deblock();
+        self.apply_cdef();
     }
 
     /// Apply the deblocking loop filter (§7.14) over the reconstructed planes,
@@ -1011,6 +1087,80 @@ impl<'a> Av1Tile<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Apply CDEF (§7.15) over the post-deblock planes — the `cdef_bits == 0`
+    /// single-strength path (no per-block `cdef_idx`). For each coded 8×8 luma
+    /// block: find the dominant direction, then filter luma (variance-adjusted
+    /// primary) and the matching 4:2:0 chroma (`damping − 1`, identity dir). All
+    /// taps read a pre-CDEF clone of each plane so neighbour filtering doesn't
+    /// feed back.
+    fn apply_cdef(&mut self) {
+        if self.cdef_bits != 0 {
+            return; // per-block cdef_idx (cdef_bits > 0) is not parsed yet
+        }
+        let (y_pri, y_sec) = (self.cdef_y_pri, self.cdef_y_sec);
+        let (uv_pri, uv_sec) = (self.cdef_uv_pri, self.cdef_uv_sec);
+        if y_pri == 0 && y_sec == 0 && uv_pri == 0 && uv_sec == 0 {
+            return;
+        }
+        let damping = self.cdef_damping;
+        let mono = self.mono_chrome;
+        let (ssx, ssy) = (self.subsampling_x as usize, self.subsampling_y as usize);
+        let (mic, mir) = (self.geom.mi_cols as usize, self.geom.mi_rows as usize);
+        // Pre-CDEF copies: taps read these, the live planes receive the output.
+        let src: Vec<Vec<u8>> = self.planes.to_vec();
+        let (yw, yh) = (self.plane_w[0], self.plane_h[0]);
+        let (cpw, cph) = (self.plane_w[1], self.plane_h[1]);
+
+        let mut by = 0usize;
+        while by < yh {
+            let mut bx = 0usize;
+            while bx < yw {
+                // noskip: filter only 8×8 blocks with a coded MI (dav1d noskip_mask).
+                let (mr, mcl) = (by / 4, bx / 4);
+                let mut coded = false;
+                'find: for dr in 0..2 {
+                    for dc in 0..2 {
+                        let (r, c) = (mr + dr, mcl + dc);
+                        if r < mir && c < mic && self.cdef_noskip[r * mic + c] != 0 {
+                            coded = true;
+                            break 'find;
+                        }
+                    }
+                }
+                if coded {
+                    let (dir, var) = if y_pri != 0 || uv_pri != 0 {
+                        cdef::cdef_find_dir(&src[0][by * yw + bx..], yw)
+                    } else {
+                        (0, 0)
+                    };
+                    let adj_y_pri = if y_pri != 0 { cdef::adjust_strength(y_pri, var) } else { 0 };
+                    if adj_y_pri != 0 || y_sec != 0 {
+                        let ydir = if y_pri != 0 { dir as usize } else { 0 };
+                        cdef_apply_one(
+                            &mut self.planes[0], &src[0], yw, yh, bx, by, 8, 8, adj_y_pri, y_sec,
+                            ydir, damping,
+                        );
+                    }
+                    if !mono && (uv_pri != 0 || uv_sec != 0) {
+                        let uvdir = if uv_pri != 0 { dir as usize } else { 0 };
+                        let (cx, cy) = (bx >> ssx, by >> ssy);
+                        let (cw, ch) = (8 >> ssx, 8 >> ssy);
+                        cdef_apply_one(
+                            &mut self.planes[1], &src[1], cpw, cph, cx, cy, cw, ch, uv_pri, uv_sec,
+                            uvdir, damping - 1,
+                        );
+                        cdef_apply_one(
+                            &mut self.planes[2], &src[2], cpw, cph, cx, cy, cw, ch, uv_pri, uv_sec,
+                            uvdir, damping - 1,
+                        );
+                    }
+                }
+                bx += 8;
+            }
+            by += 8;
         }
     }
 
@@ -1074,6 +1224,16 @@ impl<'a> Av1Tile<'a> {
         // skip flag
         let sctx = (self.above_skip[acol] + self.left_skip[by4]) as usize;
         let skip = self.msac.bool_adapt(&mut self.cdf.skip[sctx]);
+
+        // Record "block had coded coefficients" per MI for the CDEF skip mask.
+        if !self.cdef_noskip.is_empty() && skip == 0 {
+            let (mic, mir) = (self.geom.mi_cols, self.geom.mi_rows);
+            for r in 0..bh4.min(mir - mi_row) {
+                for c in 0..bw4.min(mic - mi_col) {
+                    self.cdef_noskip[((mi_row + r) * mic + mi_col + c) as usize] = 1;
+                }
+            }
+        }
 
         // Keyframe ⇒ intra (intrabc handled when allow_screen_content_tools lands).
 
@@ -2519,6 +2679,71 @@ mod tests {
             }
             assert_eq!(maxd, 0, "plane {p} ({pw}x{ph}) differs from dav1d after deblock");
             refoff += n;
+        }
+    }
+
+    /// End-to-end CDEF (§7.15), `cdef_bits == 0` path, validated bit-exact vs
+    /// dav1d on three 64×64 stills (deblock ON, loop restoration OFF). `cdefoff`
+    /// (CDEF disabled) proves the pre-CDEF lossy+deblock reconstruction already
+    /// matches, so any gap is pure filter; `diag` exercises primary+secondary
+    /// LUMA CDEF (direction search + variance-adjusted primary + combined
+    /// filter); `vsplit` exercises CHROMA-only CDEF (`damping − 1`, luma-off
+    /// gate). Higher-strength gradient/noise stills trip a separate, pre-existing
+    /// intra-decode gap unrelated to CDEF and are not used here.
+    #[test]
+    fn cdef_matches_dav1d() {
+        use super::super::{
+            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
+            OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+        };
+        let cases: [(&str, &[u8], &[u8]); 3] = [
+            (
+                "cdefoff",
+                include_bytes!("../fixtures/av1cdefoff.avif"),
+                include_bytes!("../fixtures/av1cdefoff_ref.yuv"),
+            ),
+            (
+                "diag",
+                include_bytes!("../fixtures/av1cdef_diag.avif"),
+                include_bytes!("../fixtures/av1cdef_diag.yuv"),
+            ),
+            (
+                "vsplit",
+                include_bytes!("../fixtures/av1cdef_vsplit.avif"),
+                include_bytes!("../fixtures/av1cdef_vsplit.yuv"),
+            ),
+        ];
+        for (name, avif, reference) in cases {
+            let stream = extract_av1_stream(avif).unwrap();
+            let obus = split_obus(&stream).unwrap();
+            let seq = parse_sequence_header(
+                obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+            )
+            .unwrap();
+            let frame =
+                obus.iter().find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER).unwrap();
+            let fh = parse_frame_header(&seq, frame.data).unwrap();
+            assert_eq!(fh.lr_type, [0, 0, 0], "{name}: fixture must have loop restoration off");
+            let off = tile_data_offset(fh.header_bits);
+            let mut tile = Av1Tile::new(
+                &frame.data[off..],
+                2 * ((fh.frame_width + 7) >> 3),
+                2 * ((fh.frame_height + 7) >> 3),
+                &seq,
+                &fh,
+            );
+            tile.decode();
+            let mut refoff = 0usize;
+            for p in 0..3 {
+                let (buf, pw, ph) = tile.plane(p);
+                let n = pw * ph;
+                let mut maxd = 0i32;
+                for i in 0..n {
+                    maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
+                }
+                assert_eq!(maxd, 0, "{name}: plane {p} ({pw}x{ph}) differs from dav1d after CDEF");
+                refoff += n;
+            }
         }
     }
 

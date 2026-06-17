@@ -145,6 +145,16 @@ fn ulog2(x: i32) -> i32 {
     31 - (x as u32).leading_zeros() as i32
 }
 
+/// Scale a primary strength by the block's directional variance — dav1d
+/// `adjust_strength`. A flat block (`var == 0`) disables the primary tap set.
+pub(super) fn adjust_strength(strength: i32, var: u32) -> i32 {
+    if var == 0 {
+        return 0;
+    }
+    let i = if var >> 6 != 0 { ulog2((var >> 6) as i32).min(12) } else { 0 };
+    (strength * (4 + i) + 8) >> 4
+}
+
 /// Fill the 12×12 `tmp` buffer with the `w × h` block plus its 2-px halo — dav1d
 /// `padding`. Available edges are copied from `src`/`left`/`top`/`bottom`;
 /// unavailable ones get the `CDEF_VERY_LARGE` sentinel. `top`/`bottom` index two
@@ -250,7 +260,7 @@ fn cdef_padding(
 /// weights (`pri_tap_k`, `sec_tap = 2 - k`) verbatim from the reference, so they
 /// stay as range loops rather than iterators.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn cdef_filter_block(
+pub(super) fn cdef_filter_block(
     dst: &mut [u8],
     doff: usize,
     dstride: usize,
