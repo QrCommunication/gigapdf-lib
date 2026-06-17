@@ -10,3 +10,7 @@
 /crates/wasm/pkg
 
 .DS_Store
+
+# Python bytecode caches (OCR training tooling)
+__pycache__/
+*.pyc

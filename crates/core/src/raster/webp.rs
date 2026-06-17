@@ -447,19 +447,22 @@ pub fn encode_webp(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
 
 // ── decode ────────────────────────────────────────────────────────────────────
 
-/// Decode a lossless (VP8L) WebP to `(width, height, rgba)`. `None` for lossy
-/// (VP8) / extended WebP or a malformed stream.
+/// Decode a WebP to `(width, height, rgba)` — both lossless (`VP8L`) and lossy
+/// (`VP8 `, a VP8 keyframe). `None` for extended WebP or a malformed stream.
 pub fn decode_webp(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if data.len() < 20 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
         return None;
     }
-    // Find the VP8L chunk.
+    // Find the VP8/VP8L chunk; a lossy `VP8 ` chunk routes to the VP8 decoder.
     let mut pos = 12;
     let mut vp8l: Option<&[u8]> = None;
     while pos + 8 <= data.len() {
         let tag = &data[pos..pos + 4];
         let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
         let body = data.get(pos + 8..pos + 8 + size)?;
+        if tag == b"VP8 " {
+            return super::vp8::decode(body);
+        }
         if tag == b"VP8L" {
             vp8l = Some(body);
             break;

@@ -4,7 +4,17 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.34.0] - 2026-06-17
+## [0.35.0] - 2026-06-17
+
+### Added
+
+- **Lossy WebP decoding (`decodeWebp`).** `decodeWebp` / `gp_decode_webp` now
+  decodes lossy WebP (a `VP8 ` keyframe) in addition to the existing lossless
+  (`VP8L`) path — a complete, from-scratch VP8 intra decoder (RFC 6386):
+  boolean entropy decoder, coefficient token decode, dequantization, inverse
+  WHT/DCT, all intra prediction modes (16×16 / 8×8 / the ten 4×4 sub-block
+  modes), the deblocking loop filter (§15), and YUV→RGB. Validated **bit-exact**
+  against libvpx's reference decode. No third-party codec.
 
 ### Added
 

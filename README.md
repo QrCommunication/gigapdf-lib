@@ -106,21 +106,40 @@ image-only pages** the engine has a built-in OCR following the classic Tesseract
 pipeline — Otsu binarization → connected-component blobs → line/word segmentation
 → per-glyph classification — but with a from-scratch, dependency-free classifier:
 
-- The classifier is a small MLP **trained offline** on two public sources:
+- The classifier is a **compact CNN trained offline** on two public sources:
   **EMNIST** (NIST handwritten digits + letters, public domain) for **handwriting**,
-  and **synthetic glyphs rendered from ~220 system fonts** (the Tesseract
-  `text2image` approach) for **printed text, punctuation and accented Latin**.
-- Training is build-time only (`tools/train_ocr.py`); the engine ships the
+  and **synthetic glyphs rendered from thousands of fonts** (system + Google Fonts,
+  the Tesseract `text2image` approach) for **printed text, punctuation and accented
+  Latin**.
+- Training is build-time only (`tools/train_ocr_cnn.py`); the engine ships the
   **int8-quantized weights** and runs a pure-`std` forward pass — no ML library,
   no model download at runtime.
-- **Scripts/languages:** Latin — `0-9 A-Z a-z`, common punctuation, and accented
-  Latin (`é è à ç ñ ü …`) for French, Spanish, German, Portuguese, etc. Both
-  **printed and handwritten** Latin are recognized. Other scripts (Cyrillic,
-  Greek, CJK, Arabic) are not covered yet — they're a matter of adding classes +
-  data to the trainer, with **no runtime change**.
+- **Scripts/languages (mono-glyph engine):** Latin — `0-9 A-Z a-z`, common
+  punctuation, and accented Latin (`é è à ç ñ ü …`) for French, Spanish, German,
+  Portuguese, etc. Both **printed and handwritten** Latin are recognized.
 - **Honest accuracy:** strong on clean machine print, decent on tidy handwriting
-  (EMNIST-grade); noisy scans and dense layouts are harder. Retrain with more data
-  to improve — the runtime never changes.
+  (EMNIST-grade); noisy scans and dense layouts are harder.
+
+**Line-level CRNN+CTC engine (opt-in, multi-script).** A second recognizer removes the
+per-glyph segmentation that caps the classic pipeline (touching glyphs, cursive scripts,
+noisy scans). It reads a whole text line as a sequence — Otsu **or Sauvola** binarization
+→ projection-profile line bands → CNN → bidirectional GRU → CTC — still a **pure-`std`
+int8** forward pass (`crates/core/src/raster/ocr_crnn.rs`), no ML dependency. Models are
+per script group, trained offline (`tools/train_ocr_crnn.py`) and enabled via Cargo
+features (`ocr-alpha`, …); `ocr()` uses the CRNN when a model is embedded and falls back
+to the mono-glyph classifier otherwise.
+
+- **Trained today:** group **`alpha`** — **Latin-extended + Cyrillic + Greek** printed
+  (Polish, Czech, Turkish, Vietnamese, Russian, Ukrainian, Greek, …). On a synthetic
+  multi-script clean-print benchmark it lands **within ~2 CER points of Tesseract 5.3.4**
+  (CER 0.278 vs 0.258, WER 0.68 vs 0.62 — see [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md)),
+  with **homoglyph script disambiguation** snapping Latin/Greek/Cyrillic lookalikes (A/Α/А).
+- **Infra ready, not yet trained:** `cjk` (Chinese/Japanese/Korean), `arabic`
+  (Arabic/Hebrew, RTL), `deva`/`beng`/`taml` (Indic) — class sets, fonts and the trainer
+  are in place; each is one training run away, with **no runtime change**.
+- Design: [`docs/OCR_ARCHITECTURE.md`](docs/OCR_ARCHITECTURE.md) · data catalogue:
+  [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md) · training log:
+  [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md).
 
 ## Layout
 
@@ -130,7 +149,7 @@ crates/wasm   gigapdf-wasm  — extern "C" WebAssembly bindings (zero-dep ABI)
 fixtures/     test PDFs
 test/         wasm-smoke.mjs — end-to-end Node harness
 tools/        catalog/ICC generators + snapshots
-docs/         API.md · USAGE.md · INSTALL.md
+docs/         API.md · SDK.md · USAGE.md · INSTALL.md · OCR_ARCHITECTURE.md · OCR_TRAINING_DATA.md · OCR_TRAINING_LOG.md
 ```
 
 ## Quickstart

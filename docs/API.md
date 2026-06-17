@@ -165,10 +165,14 @@ OCR uses the built-in recognizer (no Tesseract): Otsu → connected components �
 line/word segmentation → a compact CNN trained offline on EMNIST (handwriting) +
 synthetic font glyphs (printed + accented Latin). Use `scale ≥ 2.0` for small text.
 For pages that already carry a text layer, `structured_text` / `search` are exact and
-faster. Multi-script support (Cyrillic, Greek, CJK, Arabic, Hebrew, Indic) and a
-line-level CRNN+CTC recognizer are on the roadmap — see
-[`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and
-[`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md).
+faster. A second **line-level CRNN+CTC** recognizer (opt-in via the `ocr-*` Cargo
+features — `ocr-alpha` = Latin-extended + Cyrillic + Greek, **trained**;
+`ocr-cjk`/`ocr-arabic`/`ocr-deva`/… infra-ready) removes per-glyph segmentation and is
+competitive with Tesseract on clean multi-script print. `ocr()` routes to it when a model
+is embedded and falls back to the mono-glyph CNN otherwise — same ABI, no signature
+change. See [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md),
+[`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md) and
+[`OCR_TRAINING_LOG.md`](./OCR_TRAINING_LOG.md).
 
 ## Conversions
 

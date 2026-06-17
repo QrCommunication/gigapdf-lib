@@ -271,10 +271,13 @@ reconstructed tables for spreadsheets) — not a rasterised image.
 To make a scanned PDF searchable: `ocr(page)` → map words to placements →
 `addTextLayer(page, runs)` (invisible, selectable).
 
-> Today: Latin (printed + handwritten). Multi-script support (Cyrillic, Greek, CJK,
-> Arabic, Hebrew, Indic) via a line-level CRNN+CTC recognizer is on the roadmap — see
-> [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and
-> [`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md).
+> **Default engine:** Latin (printed + handwritten), mono-glyph. **Opt-in CRNN+CTC
+> engine** (line-level, multi-script): group `alpha` = Latin-extended + Cyrillic + Greek
+> is **trained** and competitive with Tesseract on clean print; CJK / Arabic-Hebrew /
+> Indic are infra-ready. Enabled at build time via the engine's `ocr-*` Cargo features,
+> with the same SDK API. See [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md),
+> [`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md) and
+> [`OCR_TRAINING_LOG.md`](./OCR_TRAINING_LOG.md).
 
 ### Security
 

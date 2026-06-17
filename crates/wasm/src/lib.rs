@@ -372,6 +372,26 @@ pub extern "C" fn gp_ocr_text(
     unsafe { bytes_into_host(text.into_bytes(), out_len) }
 }
 
+/// Load a `.gpocr` line-OCR model blob (emitted by `tools/train_ocr_crnn.py`) into the
+/// runtime registry — the host supplies the bytes like a font, so the core embeds **no**
+/// model and stays lean (~540 KB). Returns 1 on success, 0 on a malformed blob. Once a
+/// model is loaded, `gp_ocr_json`/`gp_ocr_text` route to the line-level CRNN, falling
+/// back per page to the mono-glyph classifier when it yields nothing.
+#[no_mangle]
+pub extern "C" fn gp_ocr_load_model(ptr: *const u8, len: usize) -> i32 {
+    if ptr.is_null() || len == 0 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    i32::from(gigapdf_core::raster::ocr_crnn::load_model_from_bytes(bytes))
+}
+
+/// Drop all runtime-loaded OCR models (host-supplied via `gp_ocr_load_model`).
+#[no_mangle]
+pub extern "C" fn gp_ocr_clear_models() {
+    gigapdf_core::raster::ocr_crnn::clear_models();
+}
+
 /// Elements (text/image/shape) of a page as a JSON array. Host frees the buffer.
 #[no_mangle]
 pub extern "C" fn gp_elements_json(

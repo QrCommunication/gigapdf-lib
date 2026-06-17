@@ -33,7 +33,7 @@ pub struct OcrResult {
 /// `w` is laid out `[out][in][ky][kx]` (PyTorch `Conv2d.weight` order); the
 /// dequantized value is `w[..] as f32 * scale`. Output keeps the input H×W.
 #[allow(clippy::too_many_arguments)]
-fn conv2d_relu(
+pub(crate) fn conv2d_relu(
     inp: &[f32],
     in_ch: usize,
     ih: usize,
@@ -81,7 +81,7 @@ fn conv2d_relu(
 }
 
 /// 2×2 max-pool, stride 2 (floor). Returns `(data, out_h, out_w)`, channel-major.
-fn maxpool2(inp: &[f32], ch: usize, h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+pub(crate) fn maxpool2(inp: &[f32], ch: usize, h: usize, w: usize) -> (Vec<f32>, usize, usize) {
     let (oh, ow) = (h / 2, w / 2);
     let mut out = vec![0f32; ch * oh * ow];
     for c in 0..ch {
@@ -103,7 +103,7 @@ fn maxpool2(inp: &[f32], ch: usize, h: usize, w: usize) -> (Vec<f32>, usize, usi
 
 /// Fully-connected layer; `w` is `[out][in]` (PyTorch `Linear.weight`), int8 +
 /// f32 bias. Applies ReLU when `relu` is set.
-fn dense(inp: &[f32], w: &[i8], scale: f32, bias: &[f32], out: usize, relu: bool) -> Vec<f32> {
+pub(crate) fn dense(inp: &[f32], w: &[i8], scale: f32, bias: &[f32], out: usize, relu: bool) -> Vec<f32> {
     let n = inp.len();
     let mut o = vec![0f32; out];
     for (j, slot) in o.iter_mut().enumerate() {
@@ -166,7 +166,7 @@ fn label(index: usize) -> char {
 }
 
 /// Otsu's global threshold over an 8-bit grayscale image.
-fn otsu_threshold(gray: &[u8]) -> u8 {
+pub(crate) fn otsu_threshold(gray: &[u8]) -> u8 {
     let mut hist = [0u32; 256];
     for &g in gray {
         hist[g as usize] += 1;
@@ -204,28 +204,71 @@ fn otsu_threshold(gray: &[u8]) -> u8 {
     ((t_lo + t_hi) / 2) as u8
 }
 
-struct Blob {
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
+/// Sauvola adaptive binarization → ink mask (`true` = ink/dark). A per-pixel threshold
+/// `t(x,y) = m·(1 + k·(s/R − 1))` over a local window (mean `m`, std `s`, `R=128`)
+/// computed in O(1) per pixel via integral images of the sum and sum-of-squares.
+/// Robust to uneven illumination / grey backgrounds where the global Otsu threshold
+/// collapses (scanned/photographed documents). `radius` ≈ half the window (px).
+pub(crate) fn sauvola_ink(gray: &[u8], w: usize, h: usize, radius: usize, k: f64) -> Vec<bool> {
+    let iw = w + 1;
+    // Integral images (prefix sums) of g and g² — u64 holds 255²·(2³²) comfortably.
+    let mut isum = vec![0u64; iw * (h + 1)];
+    let mut isq = vec![0u64; iw * (h + 1)];
+    for y in 0..h {
+        let (mut row_s, mut row_q) = (0u64, 0u64);
+        for x in 0..w {
+            let g = gray[y * w + x] as u64;
+            row_s += g;
+            row_q += g * g;
+            isum[(y + 1) * iw + (x + 1)] = isum[y * iw + (x + 1)] + row_s;
+            isq[(y + 1) * iw + (x + 1)] = isq[y * iw + (x + 1)] + row_q;
+        }
+    }
+    let r = radius.max(1) as i64;
+    let mut ink = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let x0 = (x as i64 - r).max(0) as usize;
+            let y0 = (y as i64 - r).max(0) as usize;
+            let x1 = ((x as i64 + r) as usize).min(w - 1);
+            let y1 = ((y as i64 + r) as usize).min(h - 1);
+            let area = ((x1 - x0 + 1) * (y1 - y0 + 1)) as f64;
+            let rect = |img: &[u64]| -> f64 {
+                (img[(y1 + 1) * iw + (x1 + 1)] + img[y0 * iw + x0]
+                    - img[y0 * iw + (x1 + 1)]
+                    - img[(y1 + 1) * iw + x0]) as f64
+            };
+            let mean = rect(&isum) / area;
+            let var = (rect(&isq) / area - mean * mean).max(0.0);
+            let t = mean * (1.0 + k * (var.sqrt() / 128.0 - 1.0));
+            ink[y * w + x] = (gray[y * w + x] as f64) < t;
+        }
+    }
+    ink
+}
+
+pub(crate) struct Blob {
+    pub(crate) x0: usize,
+    pub(crate) y0: usize,
+    pub(crate) x1: usize,
+    pub(crate) y1: usize,
 }
 
 impl Blob {
-    fn w(&self) -> usize {
+    pub(crate) fn w(&self) -> usize {
         self.x1 - self.x0 + 1
     }
-    fn h(&self) -> usize {
+    pub(crate) fn h(&self) -> usize {
         self.y1 - self.y0 + 1
     }
-    fn cy(&self) -> f64 {
+    pub(crate) fn cy(&self) -> f64 {
         (self.y0 + self.y1) as f64 / 2.0
     }
 }
 
 /// 8-connected components of the ink mask, returned as labelled bounding boxes.
 /// `labels[i]` is the component id of pixel `i` (`-1` = background).
-fn connected_components(ink: &[bool], w: usize, h: usize) -> (Vec<Blob>, Vec<i32>) {
+pub(crate) fn connected_components(ink: &[bool], w: usize, h: usize) -> (Vec<Blob>, Vec<i32>) {
     let mut labels = vec![-1i32; w * h];
     let mut blobs = Vec::new();
     let mut stack = Vec::new();
@@ -294,6 +337,12 @@ fn normalize(blob: &Blob, labels: &[i32], id: i32, w: usize, input: &mut [f32]) 
 pub fn ocr(gray: &[u8], w: usize, h: usize) -> OcrResult {
     if w == 0 || h == 0 || gray.len() < w * h {
         return OcrResult::default();
+    }
+    // Line-level CRNN first when a per-script model is embedded (ocr-* features);
+    // with none embedded this returns empty and we use the mono-glyph pipeline below.
+    let crnn = super::ocr_crnn::recognize_enabled(gray, w, h);
+    if !crnn.words.is_empty() {
+        return crnn;
     }
     let thresh = otsu_threshold(gray);
     let ink: Vec<bool> = gray.iter().map(|&g| g < thresh).collect();
@@ -401,7 +450,7 @@ pub fn ocr(gray: &[u8], w: usize, h: usize) -> OcrResult {
     result
 }
 
-fn median(values: &[usize]) -> f64 {
+pub(crate) fn median(values: &[usize]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
@@ -426,6 +475,28 @@ mod tests {
         g.extend(vec![230u8; 50]);
         let t = otsu_threshold(&g);
         assert!(t > 20 && t < 230);
+    }
+
+    #[test]
+    fn sauvola_beats_global_threshold_on_uneven_illumination() {
+        // Strong left→right illumination gradient (255 → ~105). "Text" is one pixel
+        // locally ~60 darker than its background; a plain dark-background pixel must
+        // NOT be ink. A single global threshold can't do both — Sauvola's local one can.
+        let (w, h) = (40usize, 24usize);
+        let mut gray = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                gray[y * w + x] = (255 - x as i32 * 150 / (w as i32 - 1)).clamp(0, 255) as u8;
+            }
+        }
+        let (tx, plain) = (34usize, 38usize);
+        gray[12 * w + tx] = gray[12 * w + tx].saturating_sub(60); // local-dark "text"
+
+        let ink = sauvola_ink(&gray, w, h, 6, 0.34);
+        assert!(ink[12 * w + tx], "Sauvola flags the locally-dark text pixel");
+        assert!(!ink[12 * w + plain], "Sauvola leaves the dark-background pixel as bg");
+        // The global Otsu threshold misclassifies that same background pixel as ink.
+        assert!(gray[12 * w + plain] < otsu_threshold(&gray), "global Otsu over-inks the dark bg");
     }
 
     #[test]
