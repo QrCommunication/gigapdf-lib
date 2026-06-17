@@ -17,7 +17,7 @@ pub mod sha1;
 pub mod sha256;
 pub mod sha512;
 
-pub use aes::{aes_cbc_decrypt, aes_cbc_encrypt, Aes};
+pub use aes::{aes_cbc_decrypt, aes_cbc_encrypt};
 pub use des::{des3_cbc_decrypt, des3_cbc_encrypt};
 pub use hmac::{hmac_sha1, hmac_sha256};
 pub use kdf::{

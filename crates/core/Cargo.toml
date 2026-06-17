@@ -28,6 +28,10 @@ rand = "0.8"
 sha1 = "0.10"
 md-5 = "0.10"
 hmac = "0.12"
+# AES-CBC (constant-time, AES-NI when available) for the PDF security handler
+# (AESV2/AESV3) and PKCS#12 PBES2 — replaces the hand-rolled GF(2⁸) AES.
+aes = "0.8"
+cbc = "0.1"
 # Embedded JavaScript engine (pure Rust) for the HTML→PDF inline-<script> path,
 # replacing the former hand-written interpreter. Unlicense/MIT.
 boa_engine = "0.21"
