@@ -1011,7 +1011,7 @@ mod tests {
     fn inv_txfm_2d_full_runs() {
         // Full 8×8 DCT_DCT path with a spread of coefficients: must run and
         // produce a finite residual of the right size.
-        let mut cf: Vec<i32> = (0..64).map(|i| ((i * 11) % 23) as i32 - 11).collect();
+        let mut cf: Vec<i32> = (0..64).map(|i| ((i * 11) % 23) - 11).collect();
         let res = inv_txfm_residual(&mut cf, 1, txtp::DCT_DCT, 20);
         assert_eq!(res.len(), 64);
         assert!(res.iter().all(|&v| v.abs() < 1 << 20));

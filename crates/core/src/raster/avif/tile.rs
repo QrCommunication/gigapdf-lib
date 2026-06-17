@@ -2396,8 +2396,7 @@ mod tests {
         let ctx = [0x40u8; 8];
         let (cf, res_ctx) = tile.decode_coef_signs(1, false, txtp::DCT_DCT, 6, 0, 0, &raw, &ctx, &ctx);
         assert_eq!(cf.len(), 64);
-        // dc_sign_level occupies bits 6-7; cul_level the low 6 bits.
-        assert!((res_ctx & 0x3f) <= 63);
+        // dc_sign_level occupies bits 6-7 (cul_level fills the low 6 bits).
         assert!(matches!(res_ctx & 0xc0, 0x00 | 0x40 | 0x80));
         // Every non-zero raw token yields a (possibly clamped) signed coef.
         for (rc, &t) in raw.iter().enumerate() {
@@ -2429,7 +2428,6 @@ mod tests {
             // all-zero transform block — fine.
         } else {
             assert_eq!(cf.len(), 64);
-            assert!((res_ctx & 0x3f) <= 63);
             assert!(matches!(res_ctx & 0xc0, 0x00 | 0x40 | 0x80));
         }
         // A chroma block (plane 1, uvtx) right after must also stay in sync.
@@ -2552,12 +2550,12 @@ mod tests {
         // Reference is I420 planar 32×32: Y(1024) + U(256) + V(256) = 1536 bytes.
         let mut refoff = 0usize;
         let mut maxdiff = [0i32; 3];
-        for p in 0..3 {
+        for (p, slot) in maxdiff.iter_mut().enumerate() {
             let (buf, pw, ph) = tile.plane(p);
             let n = pw * ph;
             for i in 0..n {
                 let d = (buf[i] as i32 - reference[refoff + i] as i32).abs();
-                maxdiff[p] = maxdiff[p].max(d);
+                *slot = (*slot).max(d);
             }
             refoff += n;
         }
