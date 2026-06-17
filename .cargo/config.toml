@@ -9,3 +9,10 @@
 [alias]
 wasm = "build -p gigapdf-wasm --target wasm32-unknown-unknown --release"
 wasm-dev = "build -p gigapdf-wasm --target wasm32-unknown-unknown"
+
+# RustCrypto (RSA blinding) and Boa need an entropy source. On wasm there is no
+# OS RNG, so getrandom's `wasm_js` backend is selected here for the wasm target
+# only — it imports randomness from the host JS env (crypto.getRandomValues).
+# Native targets keep their default OS backend, so this never affects tests.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

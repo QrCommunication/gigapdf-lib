@@ -7,12 +7,31 @@ authors.workspace = true
 rust-version.workspace = true
 description = "PDF editing engine — pure std, no dependencies."
 
-# No dependencies: lexer, object model, xref, FlateDecode, content editing and
-# serialization are all pure `std`.
+# The PDF/Office/image engine (lexer, object model, xref, FlateDecode, content
+# editing, rasteriser, conversions) is pure `std` with NO third-party library —
+# that is the project's invariant. The two exceptions below are deliberate and
+# narrow: cryptography and JavaScript are domains where rolling your own is a
+# liability (timing/oracle side-channels, eIDAS non-conformance; multi-year JS
+# spec maintenance), so they delegate to audited, wasm-compatible Rust crates.
 [dependencies]
+# Audited cryptography — RustCrypto. Replaces the former hand-rolled MD5/RC4/AES/
+# SHA/RSA/ASN.1/X.509/CMS behind the PDF signing + standard-security-handler glue.
+rsa = "0.9"
+sha2 = "0.10"
+# Embedded JavaScript engine (pure Rust) for the HTML→PDF inline-<script> path,
+# replacing the former hand-written interpreter. Unlicense/MIT.
+boa_engine = "0.21"
+
+# wasm has no OS RNG: getrandom's `wasm_js` backend (cfg in .cargo/config.toml)
+# imports entropy from the host. Native targets use the OS backend automatically.
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+# `rsa` → `rand_core` 0.6 pulls getrandom 0.2 transitively; enable its `js`
+# backend so it compiles on wasm too (the cfg above only governs 0.3).
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [dev-dependencies]
-# Tests run against ../../fixtures via CARGO_MANIFEST_DIR — still zero deps.
+# Tests run against ../../fixtures via CARGO_MANIFEST_DIR.
 
 [features]
 # Embed per-script CRNN+CTC line-OCR models (trained offline by

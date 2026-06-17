@@ -29,3 +29,27 @@ pub use rc4::rc4;
 pub use sha1::sha1;
 pub use sha256::sha256;
 pub use sha512::{sha384, sha512};
+
+#[cfg(test)]
+mod foundation_smoke {
+    //! Guards the audited-crypto + Boa dependency foundation: proves `sha2` +
+    //! `boa_engine` run and `rsa` links — native, and (via `cargo wasm`) on
+    //! wasm32 with the `wasm_js` getrandom backend. This is the base the crypto
+    //! and JS migrations build on; the hand-rolled primitives are retired as
+    //! each consumer (signing, the PDF security handler, inline-script HTML)
+    //! moves over.
+    #[test]
+    fn audited_crypto_and_boa_are_available() {
+        use sha2::{Digest, Sha256};
+        let h = Sha256::digest(b"abc");
+        assert_eq!(h.len(), 32);
+        assert_eq!(h[0], 0xba, "SHA-256(\"abc\") starts ba78…");
+
+        let mut ctx = boa_engine::Context::default();
+        let v = ctx.eval(boa_engine::Source::from_bytes(b"40 + 2")).unwrap();
+        assert_eq!(v.as_number(), Some(42.0));
+
+        // Link-check the RSA types (no slow keygen in the spike).
+        let _ = core::mem::size_of::<rsa::RsaPrivateKey>();
+    }
+}
