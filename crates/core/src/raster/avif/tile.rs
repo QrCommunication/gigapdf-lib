@@ -351,6 +351,7 @@ fn gather_left_partition_prob(c: &[u16], bl: u8) -> u32 {
 use super::cdf;
 use super::itx;
 use super::msac::Msac;
+use super::predict;
 use super::scan::SCANS;
 
 // ── Intra mode decode (decode_b block-info: dav1d src/decode.c) ───────────────
@@ -1505,50 +1506,55 @@ impl<'a> Av1Tile<'a> {
         py: usize,
         bw: usize,
         bh: usize,
-        _mode: u8,
+        mode: u8,
         cf: &mut [i32],
         tx: usize,
         txtp: u8,
         eob: i32,
     ) {
         let pw = self.plane_w[plane];
+        let ph = self.plane_h[plane];
         let have_top = py > 0;
         let have_left = px > 0;
-        // DC predictor (other intra modes follow in a later layer).
+        // Assemble top/left/topleft edges with dav1d's availability fills
+        // (`prepare_intra_edges`): extend past the frame edge with the last
+        // in-frame sample; substitute the neighbouring row/col or 127/129/128
+        // when an edge is unavailable.
         let buf = &self.planes[plane];
-        let dc: i32 = match (have_top, have_left) {
-            (true, true) => {
-                let mut s = ((bw + bh) >> 1) as i32;
-                for i in 0..bw {
-                    s += buf[(py - 1) * pw + px + i] as i32;
-                }
-                for i in 0..bh {
-                    s += buf[(py + i) * pw + px - 1] as i32;
-                }
-                s >>= (bw + bh).trailing_zeros();
-                if bw != bh {
-                    // Rect blocks: `dc * MULTIPLIER >> BASE_SHIFT` (8-bit consts).
-                    let m = if bw > bh * 2 || bh > bw * 2 { 0x3334 } else { 0x5556 };
-                    s = (s * m) >> 16;
-                }
-                s
+        let mut top = vec![0i32; bw];
+        let mut left = vec![0i32; bh];
+        if have_top {
+            let avail = bw.min(pw - px);
+            for (i, t) in top.iter_mut().enumerate() {
+                *t = buf[(py - 1) * pw + px + i.min(avail - 1)] as i32;
             }
-            (true, false) => {
-                let mut s = (bw >> 1) as i32;
-                for i in 0..bw {
-                    s += buf[(py - 1) * pw + px + i] as i32;
-                }
-                s >> bw.trailing_zeros()
+        } else {
+            let fill = if have_left { buf[py * pw + px - 1] as i32 } else { 127 };
+            top.fill(fill);
+        }
+        if have_left {
+            let avail = bh.min(ph - py);
+            for (i, l) in left.iter_mut().enumerate() {
+                *l = buf[(py + i.min(avail - 1)) * pw + px - 1] as i32;
             }
-            (false, true) => {
-                let mut s = (bh >> 1) as i32;
-                for i in 0..bh {
-                    s += buf[(py + i) * pw + px - 1] as i32;
-                }
-                s >> bh.trailing_zeros()
+        } else {
+            let fill = if have_top { buf[(py - 1) * pw + px] as i32 } else { 129 };
+            left.fill(fill);
+        }
+        let topleft = if have_left {
+            if have_top {
+                buf[(py - 1) * pw + px - 1] as i32
+            } else {
+                buf[py * pw + px - 1] as i32
             }
-            (false, false) => 128,
+        } else if have_top {
+            buf[(py - 1) * pw + px] as i32
+        } else {
+            128
         };
+
+        let pred = predict::predict(mode, have_top, have_left, bw, bh, &top, &left, topleft);
+
         // Residual (skipped block → none).
         let residual = if eob >= 0 {
             if txtp == txtp::WHT_WHT {
@@ -1563,7 +1569,7 @@ impl<'a> Av1Tile<'a> {
         for yy in 0..bh {
             for xx in 0..bw {
                 let r = residual.get(yy * bw + xx).copied().unwrap_or(0);
-                buf[(py + yy) * pw + px + xx] = (dc + r).clamp(0, 255) as u8;
+                buf[(py + yy) * pw + px + xx] = (pred[yy * bw + xx] + r).clamp(0, 255) as u8;
             }
         }
     }
