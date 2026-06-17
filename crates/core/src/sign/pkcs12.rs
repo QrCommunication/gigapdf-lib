@@ -400,16 +400,9 @@ fn rsa_from_pkcs8_content(content: &[u8]) -> Option<RsaPrivateKey> {
     rsa_from_pkcs1(private_key.content)
 }
 
-/// Parse a PKCS#1 `RSAPrivateKey` DER, keeping only `n`, `e`, `d`.
+/// Parse a PKCS#1 `RSAPrivateKey` DER into an audited `rsa` key (full CRT).
 fn rsa_from_pkcs1(der: &[u8]) -> Option<RsaPrivateKey> {
-    // RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dp, dq, qinv }
-    let mut r = Reader::new(der);
-    let mut k = r.descend(TAG_SEQUENCE)?;
-    k.next_tag(TAG_INTEGER)?; // version
-    let n = k.next_tag(TAG_INTEGER)?;
-    let e = k.next_tag(TAG_INTEGER)?;
-    let d = k.next_tag(TAG_INTEGER)?;
-    Some(RsaPrivateKey::from_components(n.content, e.content, d.content))
+    RsaPrivateKey::from_pkcs1_der(der)
 }
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
@@ -460,7 +453,7 @@ mod tests {
     fn imports_modern_pbes2_aes_identity() {
         let id = parse(MODERN_P12, PASSWORD).expect("modern .p12 imports");
         // The recovered modulus matches the key OpenSSL exported.
-        assert_eq!(hex(&id.key.n.to_bytes_be()), EXPECTED_N);
+        assert_eq!(hex(&id.key.n_bytes_be()), EXPECTED_N);
         assert_eq!(id.key.modulus_len, 128, "1024-bit modulus");
         // PBES2-encrypted cert bag decrypts to the exact DER certificate.
         assert_eq!(id.certificates.len(), 1);
@@ -475,7 +468,7 @@ mod tests {
         // Legacy export: 3DES key bag + RC2-40 cert bag + HMAC-SHA1 MAC. Both
         // ciphers are supported, so key AND certificate come through.
         let id = parse(LEGACY_P12, PASSWORD).expect("legacy .p12 imports");
-        assert_eq!(hex(&id.key.n.to_bytes_be()), EXPECTED_N);
+        assert_eq!(hex(&id.key.n_bytes_be()), EXPECTED_N);
         assert_eq!(id.certificates.len(), 1);
         assert_eq!(id.certificates[0], CERT_DER);
     }

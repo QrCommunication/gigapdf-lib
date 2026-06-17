@@ -17,7 +17,12 @@ description = "PDF editing engine — pure std, no dependencies."
 # Audited cryptography — RustCrypto. Replaces the former hand-rolled MD5/RC4/AES/
 # SHA/RSA/ASN.1/X.509/CMS behind the PDF signing + standard-security-handler glue.
 rsa = "0.9"
-sha2 = "0.10"
+# `oid` gives Sha256 its AssociatedOid so rsa's prefixed PKCS#1 v1.5 SigningKey
+# emits the SHA-256 DigestInfo (exactly what PDF adbe.pkcs7 signatures need).
+sha2 = { version = "0.10", features = ["oid"] }
+# Seeded keygen RNG + platform RNG for RSA signature blinding (rand 0.8 →
+# rand_core 0.6, matching rsa; OsRng draws from getrandom on wasm).
+rand = "0.8"
 # Embedded JavaScript engine (pure Rust) for the HTML→PDF inline-<script> path,
 # replacing the former hand-written interpreter. Unlicense/MIT.
 boa_engine = "0.21"

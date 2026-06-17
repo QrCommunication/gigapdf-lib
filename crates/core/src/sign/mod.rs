@@ -33,8 +33,8 @@ fn alg_sha256() -> Vec<u8> {
 
 fn rsa_public_key_info(key: &RsaPrivateKey) -> Vec<u8> {
     let rsa_public_key = der::sequence(&[
-        der::integer(&key.n.to_bytes_be()),
-        der::integer(&key.e.to_bytes_be()),
+        der::integer(&key.n_bytes_be()),
+        der::integer(&key.e_bytes_be()),
     ]);
     der::sequence(&[
         der::sequence(&[der::oid(OID_RSA_ENCRYPTION), der::null()]),

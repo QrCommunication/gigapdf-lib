@@ -6,7 +6,6 @@
 //! - [`sha256`] — AES-256 key derivation and document hashing for signatures.
 
 pub mod aes;
-pub mod bignum;
 pub mod des;
 pub mod hmac;
 pub mod kdf;
