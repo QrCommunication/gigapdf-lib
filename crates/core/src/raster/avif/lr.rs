@@ -553,11 +553,14 @@ pub(super) fn apply_plane(
     let unit_size = lr.unit_size;
     let mut y = 0usize;
     while y < h {
-        // The stripe this row belongs to (§7.17.6): stripeNum = (lumaY + 8) / 64.
-        // The stripe selects which buffer the cross-boundary halo reads from.
+        // The stripe this row belongs to (§7.17.6): stripeNum = (lumaY + 8) / 64,
+        // StripeStartY = (-8 + stripeNum*64) >> subY. Stripes are offset up by 8,
+        // so stripe 0 spans [0, 55], stripe 1 [56, 119], … — the end is the NEXT
+        // stripe's start minus one (NOT start + 64 - 1). The stripe selects which
+        // buffer the cross-boundary halo reads from.
         let stripe_num = ((y as i32) + offset) / stripe_h;
         let stripe_start = (-offset + stripe_num * stripe_h).max(0);
-        let stripe_end = (stripe_start + stripe_h - 1).min(h as i32 - 1);
+        let stripe_end = (-offset + (stripe_num + 1) * stripe_h - 1).min(h as i32 - 1);
         let stripe_row_end = stripe_end as usize + 1;
         let src = PlaneSrc {
             cdef,
@@ -897,6 +900,62 @@ mod tests {
         assert_eq!(
             dst, plane,
             "2×2 unit grid must reproduce the gradient input"
+        );
+    }
+
+    /// Cross-stripe halo source (§7.17.6): a plane taller than one stripe
+    /// (`> 56` luma rows) splits into ≥2 stripes. A Wiener unit with a non-zero
+    /// vertical tap reaches across the stripe boundary into the halo, which MUST
+    /// be read from the pre-CDEF buffer, not the post-CDEF plane. We give the two
+    /// buffers different constant values and assert the restored output at the
+    /// boundary row differs when the pre-CDEF buffer differs — proving the driver
+    /// honours the pre-CDEF halo (the bit-exactness fix this enables).
+    #[test]
+    fn apply_plane_cross_stripe_uses_pre_cdef_halo() {
+        let (w, h) = (4usize, 72usize); // 72 > 56 → stripe 0 = rows [0,55], stripe 1 = [56,71]
+                                        // Constant post-CDEF plane so the only variation comes from the halo.
+        let cdef = vec![100u8; w * h];
+        // A real vertical tap (non-symmetric center) so vertical neighbours matter;
+        // horizontal kept identity. v-taps [1,0,0] → kernel [1,0,0,126,0,0,1].
+        let unit = LrUnit {
+            kind: RestorationType::Wiener,
+            wiener: [1, 0, 0, 0, 0, 0],
+            ..LrUnit::default()
+        };
+        let lr = PlaneLr {
+            unit_size: 64,
+            unit_cols: 1,
+            unit_rows: 2,
+            units: vec![unit; 2],
+        };
+
+        // First with pre-CDEF == post-CDEF (flat 100).
+        let mut dst_same = vec![0u8; w * h];
+        apply_plane(&cdef, &cdef, &mut dst_same, w, h, w, 0, &lr);
+
+        // Now with a pre-CDEF buffer whose row at the stripe-0 bottom halo differs.
+        let mut pre = vec![100u8; w * h];
+        // Row 55 is the last in-stripe-0 row; its halo (rows 56/57 from stripe-1's
+        // perspective, and rows 54/55 read by stripe-1's top) come from pre-CDEF.
+        for x in 0..w {
+            pre[54 * w + x] = 200; // a pre-CDEF row inside the cross-stripe reach
+            pre[55 * w + x] = 200;
+        }
+        let mut dst_diff = vec![0u8; w * h];
+        apply_plane(&cdef, &pre, &mut dst_diff, w, h, w, 0, &lr);
+
+        // The output must differ somewhere in stripe 1's top rows (which read the
+        // altered pre-CDEF halo), proving the halo source is the pre-CDEF buffer.
+        assert_ne!(
+            dst_same, dst_diff,
+            "altering the pre-CDEF halo must change the restored output across the stripe boundary"
+        );
+        // And the divergence is confined to the cross-stripe boundary region: the
+        // far interior of stripe 0 (row 0) is untouched by the halo change.
+        assert_eq!(
+            dst_same[0..w],
+            dst_diff[0..w],
+            "rows far from the stripe boundary must be unaffected by the halo change"
         );
     }
 }

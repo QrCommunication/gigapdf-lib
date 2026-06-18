@@ -1111,6 +1111,10 @@ pub(crate) struct Av1Tile<'a> {
     lr_cdf: lr::LrCdf,
     /// `true` if any plane uses loop restoration (skips the whole pass otherwise).
     lr_active: bool,
+    /// Post-deblock / pre-CDEF plane clone (filled only when LR is active),
+    /// used as the cross-stripe + frame-edge halo source so loop restoration is
+    /// bit-exact even when CDEF altered the boundary rows (§7.17.6).
+    lr_pre_cdef: [Vec<u8>; 3],
 }
 
 /// CDEF availability flags for a `w × h` block at `(bx, by)` in a `pw × ph`
@@ -1338,6 +1342,7 @@ impl<'a> Av1Tile<'a> {
             lr_cdf: lr::LrCdf::default(),
             lr_active: !(fh.all_lossless || fh.allow_intrabc)
                 && (0..num_planes).any(|i| fh.lr_type[i] != 0),
+            lr_pre_cdef: [Vec::new(), Vec::new(), Vec::new()],
         }
     }
 
@@ -1387,6 +1392,14 @@ impl<'a> Av1Tile<'a> {
             row += sb4;
         }
         self.apply_deblock();
+        // Snapshot the post-deblock / pre-CDEF planes so loop restoration can read
+        // the stripe + frame-edge halo from them (§7.17.6). CDEF then runs in place.
+        if self.lr_active {
+            let nplanes = if self.mono_chrome { 1 } else { 3 };
+            for p in 0..nplanes {
+                self.lr_pre_cdef[p] = self.planes[p].clone();
+            }
+        }
         self.apply_cdef();
         self.apply_lr();
     }
@@ -1443,9 +1456,10 @@ impl<'a> Av1Tile<'a> {
         }
     }
 
-    /// Apply loop restoration (§7.17) over the post-CDEF planes. Reads from a
-    /// pre-LR clone (the post-CDEF data) for the cross-stripe / frame-edge halo,
-    /// since CDEF was applied in place; writes the restored result back.
+    /// Apply loop restoration (§7.17) over the post-CDEF planes. In-stripe samples
+    /// come from the live post-CDEF plane; the cross-stripe / frame-edge halo comes
+    /// from the pre-CDEF snapshot (§7.17.6) so the result is bit-exact whether or
+    /// not CDEF touched the boundary rows. Writes the restored result back.
     fn apply_lr(&mut self) {
         if !self.lr_active {
             return;
@@ -1461,12 +1475,16 @@ impl<'a> Av1Tile<'a> {
                 self.subsampling_y as u32
             };
             let (w, h) = (self.plane_w[plane], self.plane_h[plane]);
-            // The post-CDEF plane is both the in-stripe source and the cross-stripe
-            // halo (this decoder has no separate pre-CDEF buffer; halos replicate
-            // the post-CDEF edge — exact when CDEF is off, the common AVIF case).
-            let src = self.planes[plane].clone();
-            let mut dst = src.clone();
-            lr::apply_plane(&src, &src, &mut dst, w, h, w, sy, &self.lr_plane[plane]);
+            let cdef = self.planes[plane].clone();
+            // Pre-CDEF halo source: the post-deblock snapshot if CDEF ran, else the
+            // same data (no snapshot when CDEF is a no-op → fall back to post-CDEF).
+            let pre = if self.lr_pre_cdef[plane].len() == cdef.len() {
+                &self.lr_pre_cdef[plane]
+            } else {
+                &cdef
+            };
+            let mut dst = cdef.clone();
+            lr::apply_plane(&cdef, pre, &mut dst, w, h, w, sy, &self.lr_plane[plane]);
             self.planes[plane] = dst;
         }
     }
