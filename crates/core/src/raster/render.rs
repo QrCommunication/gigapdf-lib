@@ -462,6 +462,13 @@ fn show_text(
                 ttf.gid_for_unicode(scalar).unwrap_or(0)
             };
             let s = size / upem;
+            // Accumulate ALL contours of the glyph into one edge set and fill
+            // ONCE. Filling each contour separately painted glyph counters (the
+            // holes in O, e, a, 0, 8, B…) solid, because an isolated inner
+            // contour has no outer contour to subtract from. TrueType/CFF
+            // outlines wind their outer and inner contours in opposite
+            // directions, so a single non-zero fill carves the counters out.
+            let mut edges = Vec::new();
             for poly in ttf.glyph_polygons(gid) {
                 if poly.len() < 3 {
                     continue;
@@ -473,12 +480,13 @@ fn show_text(
                         device(ctm, base, ux, uy)
                     })
                     .collect();
-                let mut edges = Vec::with_capacity(dev.len());
                 for k in 0..dev.len() {
                     let (x0, y0) = dev[k];
                     let (x1, y1) = dev[(k + 1) % dev.len()];
                     edges.push(Edge { x0, y0, x1, y1 });
                 }
+            }
+            if !edges.is_empty() {
                 canvas.fill(&edges, fill, false);
             }
             advance = ttf.advance_width(gid) / upem * size;
