@@ -632,8 +632,8 @@ fn rtf_table_from_model(table: &Table, colors: &[[u8; 3]], first: &mut bool, out
 
 /// Extract plain text paragraphs from an RTF document (minimal control-word
 /// parser: handles groups, `\par`, `\'xx` hex bytes, `\uN` unicode, skips other
-/// control words and the font/color tables).
-fn rtf_to_paragraphs(rtf: &str) -> Vec<String> {
+/// control words and the font/color tables). Shared with the model importer.
+pub(crate) fn rtf_to_paragraphs(rtf: &str) -> Vec<String> {
     let bytes = rtf.as_bytes();
     let mut paras = Vec::new();
     let mut cur = String::new();

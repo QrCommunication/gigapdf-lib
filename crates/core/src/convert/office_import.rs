@@ -140,6 +140,1502 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+// ════════════════════════════ Office → unified model ══════════════════════════
+//
+// The `*_to_model` functions below are the structured counterpart of the
+// `*_to_pdf` exporters above: instead of emitting styled HTML they populate the
+// format-neutral [`crate::model::Document`] tree directly (paragraphs, headings,
+// lists, tables, typed spreadsheet cells, slides). They REUSE the very same
+// parsers (the [`Xml`] tokenizer, `parse_rels`/`parse_docx_styles`/
+// `parse_shared_strings`/`parse_merges`/the PPTX/ODF helpers); only the
+// *emit* step differs. The HTML path is retained as the rendering fallback.
+
+use crate::model::style::{Align as MAlign, LineHeight as MLineHeight};
+use crate::model::{
+    self, Block, BlockKind, Cell, CharStyle, Document, Heading, Inline, InlineRun, List, ListItem,
+    ListMarker, PageGeometry, Paragraph, ParagraphStyle, Row, Section, Sheet, SheetBlock,
+    SheetCell, SheetRow, Slide, SlideBlock, Table,
+};
+
+/// Convert a `PageGeom` (Office fallback/declared geometry) to the model's
+/// [`PageGeometry`], reusing the already-resolved size and margins.
+fn page_geometry(g: PageGeom) -> PageGeometry {
+    PageGeometry {
+        width: g.w,
+        height: g.h,
+        margins: crate::model::Margins {
+            top: g.margins.top,
+            right: g.margins.right,
+            bottom: g.margins.bottom,
+            left: g.margins.left,
+        },
+    }
+}
+
+/// `#RRGGBB` / `RRGGBB` → RGB `0.0..=1.0`, reusing [`hex6_to_rgb`].
+fn hex_to_rgb_f64(s: &str) -> Option<[f64; 3]> {
+    hex6_to_rgb(s).map(|[r, g, b]| [r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0])
+}
+
+/// Derive a [`CharStyle`] from a recovered [`RunStyle`]. The display family name
+/// is kept verbatim; the portable generic class is inferred by reusing
+/// [`super::style::parse_base_font`] (which classifies serif/sans/mono from a
+/// family name). Size is half-points → points; colour is `RRGGBB` → RGB.
+fn run_char_style(run: &RunStyle) -> CharStyle {
+    let family = run.font_family.clone().unwrap_or_default();
+    let generic = if family.is_empty() {
+        crate::convert::style::Generic::default()
+    } else {
+        super::style::parse_base_font(&family).generic
+    };
+    CharStyle {
+        family,
+        generic,
+        size_pt: run.size_half_pt.map(|h| h / 2.0).unwrap_or(0.0),
+        bold: run.bold,
+        italic: run.italic,
+        underline: run.underline,
+        strike: false,
+        color: run.color.as_deref().and_then(hex_to_rgb_f64),
+        vertical_align: model::VAlign::Baseline,
+    }
+}
+
+/// Auto-detect an Office container and lower it to the unified
+/// [`Document`] model, or `None` for an unrecognized archive (or a legacy OLE2
+/// file with no readable text). Dispatch mirrors [`office_to_pdf`].
+pub fn office_to_model(bytes: &[u8]) -> Option<Document> {
+    // Legacy OLE2 Compound File (.doc/.xls/.ppt) — text-only paragraphs.
+    if bytes.len() >= 8 && bytes[..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+        return ole2_to_model(bytes);
+    }
+
+    let zip = read_zip(bytes);
+    if zip.contains_key("word/document.xml") {
+        Some(docx_to_model(&zip))
+    } else if zip.contains_key("ppt/presentation.xml") {
+        Some(pptx_to_model(&zip))
+    } else if zip.contains_key("xl/workbook.xml") {
+        Some(xlsx_to_model(&zip))
+    } else if let Some(mimetype) = zip.get("mimetype") {
+        let mt = String::from_utf8_lossy(mimetype);
+        if mt.contains("opendocument.text") {
+            Some(odt_to_model(&zip))
+        } else if mt.contains("opendocument.spreadsheet") {
+            Some(ods_to_model(&zip))
+        } else if mt.contains("opendocument.presentation") {
+            Some(odp_to_model(&zip))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Wrap a flat list of flow blocks in a one-section, one-page [`Document`] with
+/// the given page geometry (the common shape for prose: DOCX/ODT).
+fn flow_document(blocks: Vec<Block>, geom: PageGeometry) -> Document {
+    Document {
+        sections: vec![Section {
+            geometry: geom,
+            header: None,
+            footer: None,
+            pages: vec![model::Page {
+                blocks,
+                absolute: false,
+            }],
+        }],
+        ..Document::default()
+    }
+}
+
+// ─────────────────────────────── DOCX → model ─────────────────────────────────
+
+/// DOCX → [`Document`]: headings/paragraphs/lists/tables as model blocks.
+/// Reuses the DOCX relationship/style/numbering parsers and the same `w:body`
+/// grammar as [`docx_to_pdf`]; the per-paragraph run properties become
+/// [`InlineRun`]s instead of `<span>`s.
+pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
+    let doc = part(zip, "word/document.xml");
+    let rels = zip
+        .get("word/_rels/document.xml.rels")
+        .map(|b| parse_rels(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+    let styles = parse_docx_styles(&part(zip, "word/styles.xml"));
+    let numbering = parse_docx_numbering(&part(zip, "word/numbering.xml"));
+    let footnotes = parse_docx_footnotes(&part(zip, "word/footnotes.xml"));
+    let geom = docx_page_geom(&doc);
+    let ctx = DocxCtx {
+        zip,
+        rels: &rels,
+        styles: &styles,
+        numbering: &numbering,
+        footnotes: &footnotes,
+    };
+
+    let mut blocks = Vec::new();
+    let mut counters = ListCounters::default();
+    docx_walk_model(&mut Xml::new(&doc), &ctx, &mut blocks, &mut counters, None);
+    flow_document(blocks, page_geometry(geom))
+}
+
+/// Recursive DOCX model walker (mirrors [`docx_walk`]). Emits `w:p`→paragraph/
+/// heading/list-item blocks and `w:tbl`→[`Table`] blocks into `out`.
+fn docx_walk_model(
+    x: &mut Xml,
+    ctx: &DocxCtx,
+    out: &mut Vec<Block>,
+    counters: &mut ListCounters,
+    stop: Option<&str>,
+) {
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, sc) => {
+                let ln = local(&name);
+                if ln == "p" && !sc {
+                    docx_paragraph_model(x, ctx, out, counters);
+                } else if ln == "tbl" && !sc {
+                    let table = docx_table_model(x, ctx);
+                    out.push(Block {
+                        kind: BlockKind::Table(table),
+                        ..Block::default()
+                    });
+                }
+            }
+            Tok::Close(name) => {
+                if Some(local(&name)) == stop {
+                    return;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+}
+
+/// Map a collected [`ParaStyle`] (+ its resolved named style) to a model
+/// [`ParagraphStyle`]. Alignment and line-height are translated; spacing/indents
+/// carry over in points.
+fn para_style_model(para: &ParaStyle) -> ParagraphStyle {
+    let align = match para.align {
+        Some("center") => MAlign::Center,
+        Some("right") => MAlign::Right,
+        Some("justify") => MAlign::Justify,
+        _ => MAlign::Left,
+    };
+    let line_height = match para.line_height {
+        Some(LineHeight::Multiple(m)) => MLineHeight::Multiple(m),
+        Some(LineHeight::Points(p)) => MLineHeight::Points(p),
+        None => MLineHeight::Normal,
+    };
+    // List indent stacks on top of any explicit left indent (mirrors style_attr).
+    let list_indent = para
+        .list_level
+        .map(|lvl| (lvl as f64 + 1.0) * LIST_LEVEL_INDENT_PT)
+        .unwrap_or(0.0);
+    ParagraphStyle {
+        align,
+        space_before_pt: para.space_before_pt.unwrap_or(0.0),
+        space_after_pt: para.space_after_pt.unwrap_or(0.0),
+        indent_left_pt: para.indent_left_pt.unwrap_or(0.0) + list_indent,
+        indent_right_pt: para.indent_right_pt.unwrap_or(0.0),
+        first_line_pt: para.first_line_pt.unwrap_or(0.0),
+        line_height,
+    }
+}
+
+/// Emit one `w:p` (open already consumed) as a model block: a [`Heading`] when
+/// the paragraph carries a heading style, a list-item-wrapped paragraph (kept as
+/// a one-item [`List`] so the marker/ordinal is preserved) for `w:numPr`
+/// paragraphs, else a plain [`Paragraph`]. Mirrors [`docx_paragraph`] but builds
+/// [`Inline`] runs.
+fn docx_paragraph_model(
+    x: &mut Xml,
+    ctx: &DocxCtx,
+    out: &mut Vec<Block>,
+    counters: &mut ListCounters,
+) {
+    let mut heading: Option<u8> = None;
+    let mut style_id: Option<String> = None;
+    let mut runs: Vec<Inline> = Vec::new();
+    let mut run = RunStyle::default();
+    let mut para = ParaStyle::default();
+    let mut num_ref = NumRef::default();
+    let mut in_rpr = false;
+    let mut in_ppr = false;
+    let mut depth = 0i32;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "pPr" if !sc => in_ppr = true,
+                    "rPr" if !sc => in_rpr = true,
+                    "pStyle" => {
+                        if in_ppr {
+                            if let Some(v) = attr(&attrs, "val") {
+                                heading = heading_level(v);
+                                style_id = Some(v.to_string());
+                            }
+                        }
+                    }
+                    "jc" if in_ppr => {
+                        if let Some(v) = attr(&attrs, "val") {
+                            if let Some(a) = jc_to_align(v) {
+                                para.align = Some(a);
+                            }
+                        }
+                    }
+                    "spacing" if in_ppr => {
+                        para.space_before_pt = attr(&attrs, "before")
+                            .and_then(twips_to_pt)
+                            .or(para.space_before_pt);
+                        para.space_after_pt = attr(&attrs, "after")
+                            .and_then(twips_to_pt)
+                            .or(para.space_after_pt);
+                        if let Some(line) = attr(&attrs, "line") {
+                            if let Some(lh) = line_spacing(line, attr(&attrs, "lineRule")) {
+                                para.line_height = Some(lh);
+                            }
+                        }
+                    }
+                    "numPr" if in_ppr => {
+                        para.list_level = Some(para.list_level.unwrap_or(0));
+                    }
+                    "ilvl" if in_ppr => {
+                        if let Some(lvl) = attr(&attrs, "val").and_then(|v| v.trim().parse().ok()) {
+                            para.list_level = Some(lvl);
+                            num_ref.level = lvl;
+                        }
+                    }
+                    "numId" if in_ppr => {
+                        num_ref.num_id = attr(&attrs, "val").and_then(|v| v.trim().parse().ok());
+                    }
+                    "ind" if in_ppr => {
+                        para.indent_left_pt = attr(&attrs, "left")
+                            .and_then(twips_to_pt)
+                            .or(para.indent_left_pt);
+                        para.indent_right_pt = attr(&attrs, "right")
+                            .and_then(twips_to_pt)
+                            .or(para.indent_right_pt);
+                        para.first_line_pt = attr(&attrs, "firstLine")
+                            .and_then(twips_to_pt)
+                            .or(para.first_line_pt);
+                    }
+                    "r" if !sc => {
+                        depth += 1;
+                        run = RunStyle::default();
+                    }
+                    "rFonts" if in_rpr => {
+                        run.font_family = attr(&attrs, "ascii")
+                            .or_else(|| attr(&attrs, "hAnsi"))
+                            .filter(|v| !v.trim().is_empty())
+                            .map(|v| v.to_string());
+                    }
+                    "b" if in_rpr => {
+                        run.bold = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
+                    "i" if in_rpr => {
+                        run.italic = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
+                    "u" if in_rpr => {
+                        if !matches!(attr(&attrs, "val"), Some("none")) {
+                            run.underline = true;
+                        }
+                    }
+                    "sz" if in_rpr => {
+                        run.size_half_pt = attr(&attrs, "val").and_then(|v| v.parse().ok());
+                    }
+                    "color" if in_rpr => {
+                        if let Some(v) = attr(&attrs, "val") {
+                            if v != "auto" && is_hex6(v) {
+                                run.color = Some(v.to_ascii_uppercase());
+                            }
+                        }
+                    }
+                    "tab" => push_run(&mut runs, &run, " "),
+                    "br" | "cr" => runs.push(Inline::LineBreak),
+                    _ => {}
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                match ln {
+                    "p" => break,
+                    "pPr" => in_ppr = false,
+                    "rPr" => in_rpr = false,
+                    "r" => depth = (depth - 1).max(0),
+                    _ => {}
+                }
+            }
+            Tok::Text(t) => {
+                if depth > 0 && !t.is_empty() {
+                    push_run(&mut runs, &run, &t);
+                }
+            }
+        }
+    }
+
+    let resolved = ctx.styles.effective(style_id.as_deref());
+    para.apply_style_defaults(&resolved);
+    let style = para_style_model(&para);
+
+    let mut paragraph = Paragraph {
+        style,
+        style_ref: style_id.clone().map(model::StyleId),
+        runs,
+    };
+    // Fold the resolved named style's run defaults under each run lacking them.
+    apply_named_run_defaults(&mut paragraph.runs, &resolved);
+
+    if let Some(level) = para.list_level {
+        // A list paragraph: wrap as a one-item List so the marker/ordinal is
+        // recorded (reusing the numbering resolution as in the HTML path).
+        let (ordered, marker) = docx_list_marker(ctx, num_ref.num_id, level);
+        if num_ref.num_id.is_some() {
+            // Advance the running counter so ordinals are stable across the list.
+            let _ = counters.next(num_ref.num_id.unwrap_or(0), level);
+        }
+        out.push(Block {
+            kind: BlockKind::List(List {
+                ordered,
+                marker,
+                items: vec![ListItem {
+                    blocks: vec![Block {
+                        kind: BlockKind::Paragraph(paragraph),
+                        ..Block::default()
+                    }],
+                    level: level.min(u8::MAX as u32) as u8,
+                }],
+            }),
+            ..Block::default()
+        });
+        return;
+    }
+
+    let kind = match heading {
+        Some(level) => BlockKind::Heading(Heading {
+            level,
+            para: paragraph,
+        }),
+        None => BlockKind::Paragraph(paragraph),
+    };
+    out.push(Block {
+        kind,
+        ..Block::default()
+    });
+}
+
+/// Fill each run's unset character attributes from the resolved named style
+/// (bold/italic/underline/size/colour/family), so a `Heading1`/`Quote`/… style
+/// propagates its typography to runs that didn't restate it.
+fn apply_named_run_defaults(runs: &mut [Inline], style: &DocxStyle) {
+    for inline in runs.iter_mut() {
+        if let Inline::Run(r) = inline {
+            if !r.style.bold {
+                r.style.bold = style.bold == Some(true);
+            }
+            if !r.style.italic {
+                r.style.italic = style.italic == Some(true);
+            }
+            if !r.style.underline {
+                r.style.underline = style.underline == Some(true);
+            }
+            if r.style.size_pt == 0.0 {
+                if let Some(half) = style.size_half_pt {
+                    r.style.size_pt = half / 2.0;
+                }
+            }
+            if r.style.color.is_none() {
+                r.style.color = style.color.as_deref().and_then(hex_to_rgb_f64);
+            }
+            if r.style.family.is_empty() {
+                if let Some(fam) = &style.font_family {
+                    r.style.family = fam.clone();
+                    r.style.generic = super::style::parse_base_font(fam).generic;
+                }
+            }
+        }
+    }
+}
+
+/// Append `text` to `runs` as a styled [`InlineRun`], coalescing with the
+/// previous run when it carries an identical style (keeps the run list compact).
+fn push_run(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
+    let style = run_char_style(run);
+    if let Some(Inline::Run(last)) = runs.last_mut() {
+        if last.style == style {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    runs.push(Inline::Run(InlineRun {
+        text: text.to_string(),
+        style,
+        source_index: None,
+    }));
+}
+
+/// Resolve a DOCX list paragraph's `(ordered, marker)` for the model: the
+/// numbering format from `numbering.xml` maps to a [`ListMarker`]; bullet/unknown
+/// → an unordered bullet. Reuses [`DocxNumbering::fmt`] and [`NumFmt`].
+fn docx_list_marker(ctx: &DocxCtx, num_id: Option<u32>, level: u32) -> (bool, ListMarker) {
+    match num_id.and_then(|nid| ctx.numbering.fmt(nid, level)) {
+        Some(NumFmt::Decimal) => (true, ListMarker::Decimal),
+        Some(NumFmt::LowerLetter) => (true, ListMarker::LowerAlpha),
+        Some(NumFmt::UpperLetter) => (true, ListMarker::UpperAlpha),
+        Some(NumFmt::LowerRoman) => (true, ListMarker::LowerRoman),
+        Some(NumFmt::UpperRoman) => (true, ListMarker::UpperRoman),
+        _ => (false, ListMarker::Bullet('\u{2022}')),
+    }
+}
+
+/// Emit one `w:tbl` (open already consumed) as a model [`Table`], honouring
+/// `w:tblGrid` column widths and `w:gridSpan`/`w:vMerge` cell merges via
+/// [`Cell::col_span`]/[`Cell::row_span`]. Mirrors [`docx_table`].
+fn docx_table_model(x: &mut Xml, ctx: &DocxCtx) -> Table {
+    let mut col_widths: Vec<f64> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut cur_row: Option<Vec<Cell>> = None;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == "gridCol" {
+                    if let Some(w) = attr(&attrs, "w").and_then(twips_to_pt) {
+                        if w > 0.0 {
+                            col_widths.push(w);
+                        }
+                    }
+                } else if ln == "tr" && !sc {
+                    cur_row = Some(Vec::new());
+                } else if ln == "tc" && !sc {
+                    let cell = docx_cell_model(x, ctx);
+                    if let (Some(row), Some(cell)) = (cur_row.as_mut(), cell) {
+                        row.push(cell);
+                    }
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if ln == "tr" {
+                    if let Some(cells) = cur_row.take() {
+                        rows.push(Row {
+                            cells,
+                            height: None,
+                        });
+                    }
+                } else if ln == "tbl" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+
+    Table {
+        rows,
+        col_widths,
+        border: model::BorderStyle::default(),
+    }
+}
+
+/// Emit one `w:tc` cell (open already consumed) as a model [`Cell`], or `None`
+/// for a vertical-merge continuation (covered by the restart cell above).
+/// `w:gridSpan`→`col_span`, `w:vMerge="restart"`→`row_span = 2`.
+fn docx_cell_model(x: &mut Xml, ctx: &DocxCtx) -> Option<Cell> {
+    let mut span = CellSpan::default();
+    let mut in_tcpr = false;
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut counters = ListCounters::default();
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "tcPr" if !sc => in_tcpr = true,
+                    "gridSpan" if in_tcpr => {
+                        span.grid_span = attr(&attrs, "val")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                    }
+                    "vMerge" if in_tcpr => match attr(&attrs, "val") {
+                        Some("restart") => span.v_merge_restart = true,
+                        _ => span.v_merge_continue = true,
+                    },
+                    "p" if !sc => docx_paragraph_model(x, ctx, &mut blocks, &mut counters),
+                    "tbl" if !sc => {
+                        let table = docx_table_model(x, ctx);
+                        blocks.push(Block {
+                            kind: BlockKind::Table(table),
+                            ..Block::default()
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if ln == "tcPr" {
+                    in_tcpr = false;
+                } else if ln == "tc" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+
+    if span.v_merge_continue {
+        return None;
+    }
+    Some(Cell {
+        blocks,
+        col_span: span.grid_span.max(1).min(u16::MAX as usize) as u16,
+        row_span: if span.v_merge_restart { 2 } else { 1 },
+        shading: None,
+    })
+}
+
+// ─────────────────────────────── XLSX → model ─────────────────────────────────
+
+/// XLSX → [`Document`] holding one [`BlockKind::Sheet`] with all worksheets.
+/// Reuses the shared-strings, theme, style (fills + number formats), sheet-name
+/// and merge parsers; cells become typed [`CellValue`]s rather than HTML.
+pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
+    let shared = zip
+        .get("xl/sharedStrings.xml")
+        .map(|b| parse_shared_strings(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+    let theme = xlsx_theme(zip);
+    let styles = zip
+        .get("xl/styles.xml")
+        .map(|b| parse_xlsx_styles(&String::from_utf8_lossy(b), &theme))
+        .unwrap_or_default();
+    let names = zip
+        .get("xl/workbook.xml")
+        .map(|b| parse_sheet_names(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+
+    let mut sheet_parts: Vec<(usize, String)> = zip
+        .iter()
+        .filter(|(k, _)| k.starts_with("xl/worksheets/sheet") && k.ends_with(".xml"))
+        .filter_map(|(k, v)| {
+            let n: usize = k["xl/worksheets/sheet".len()..k.len() - 4].parse().ok()?;
+            Some((n, String::from_utf8_lossy(v).into_owned()))
+        })
+        .collect();
+    sheet_parts.sort_by_key(|(n, _)| *n);
+
+    let mut sheets = Vec::new();
+    for (idx, (n, xml)) in sheet_parts.iter().enumerate() {
+        let name = names
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("Sheet {n}"));
+        sheets.push(xlsx_sheet_model(name, xml, &shared, &styles));
+    }
+
+    let block = Block {
+        kind: BlockKind::Sheet(SheetBlock { sheets }),
+        ..Block::default()
+    };
+    flow_document(vec![block], page_geometry(PageGeom::tabular_default()))
+}
+
+/// Build one model [`Sheet`] from a worksheet XML, reusing [`parse_merges`] and
+/// the cell type/format/fill resolution from [`xlsx_sheet_table`] — but storing
+/// typed [`CellValue`]s (`Number`/`Text`/`Bool`/`Empty`), per-cell
+/// `number_format` and fill, plus the merge ranges.
+fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxStyles) -> Sheet {
+    // Reuse the worksheet merge parser; map the engine's tuple form to the
+    // model's `MergeRange` struct (0-based inclusive corners).
+    let merges: Vec<model::MergeRange> = parse_merges(xml)
+        .into_iter()
+        .map(|(r0, c0, r1, c1)| model::MergeRange { r0, c0, r1, c1 })
+        .collect();
+    let mut rows: Vec<SheetRow> = Vec::new();
+    let mut x = Xml::new(xml);
+    let mut in_sheet_data = false;
+
+    let mut row_idx = 0usize;
+    let mut next_auto_row = 0usize;
+    // Per-row cells keyed by 0-based column for gap-filling.
+    let mut row_cells: BTreeMap<usize, SheetCell> = BTreeMap::new();
+    let mut row_open = false;
+
+    let mut cell_col = 0usize;
+    let mut cell_type = String::new();
+    let mut cell_text = String::new();
+    let mut cell_bg: Option<[f64; 3]> = None;
+    let mut cell_fmt: Option<String> = None;
+    let mut in_cell = false;
+    let mut in_value = false;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "sheetData" => in_sheet_data = true,
+                "row" if in_sheet_data && !sc => {
+                    row_open = true;
+                    row_cells.clear();
+                    row_idx = attr(&attrs, "r")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .map(|n| n.saturating_sub(1))
+                        .unwrap_or(next_auto_row);
+                    next_auto_row = row_idx + 1;
+                }
+                "c" if in_sheet_data => {
+                    in_cell = true;
+                    cell_text.clear();
+                    cell_type = attr(&attrs, "t").unwrap_or("n").to_string();
+                    cell_col = attr(&attrs, "r").map(col_of_ref).unwrap_or(0);
+                    let style_idx = attr(&attrs, "s").and_then(|v| v.trim().parse::<usize>().ok());
+                    cell_bg = style_idx
+                        .and_then(|i| styles.fill(i))
+                        .as_deref()
+                        .and_then(hex_to_rgb_f64);
+                    cell_fmt = style_idx
+                        .and_then(|i| styles.num_fmt(i))
+                        .map(|(_, code)| code.clone());
+                    if sc {
+                        in_cell = false;
+                    }
+                }
+                "v" | "t" if in_cell => in_value = true,
+                _ => {}
+            },
+            Tok::Text(t) => {
+                if in_cell && in_value {
+                    cell_text.push_str(&t);
+                }
+            }
+            Tok::Close(name) => match local(&name) {
+                "v" | "t" => in_value = false,
+                "c" => {
+                    if in_cell {
+                        let value = xlsx_cell_value(&cell_type, cell_text.trim(), shared);
+                        row_cells.insert(
+                            cell_col,
+                            SheetCell {
+                                value,
+                                number_format: cell_fmt.take(),
+                                fill: cell_bg.take(),
+                                style: CharStyle::default(),
+                            },
+                        );
+                    }
+                    in_cell = false;
+                }
+                "row" => {
+                    if row_open {
+                        rows.resize(row_idx, SheetRow::default());
+                        let max_col = row_cells.keys().last().copied();
+                        let cells = match max_col {
+                            Some(max) => {
+                                let mut v = Vec::with_capacity(max + 1);
+                                for c in 0..=max {
+                                    v.push(row_cells.remove(&c).unwrap_or_default());
+                                }
+                                v
+                            }
+                            None => Vec::new(),
+                        };
+                        if rows.len() == row_idx {
+                            rows.push(SheetRow { cells });
+                        } else {
+                            rows[row_idx] = SheetRow { cells };
+                        }
+                        row_open = false;
+                    }
+                }
+                "sheetData" => in_sheet_data = false,
+                _ => {}
+            },
+        }
+    }
+
+    Sheet {
+        name,
+        rows,
+        merges,
+        col_widths: Vec::new(),
+    }
+}
+
+/// Resolve one XLSX cell's typed value: shared-string index (`t="s"`),
+/// inline/string text (`t="str"`/`t="inlineStr"`), boolean (`t="b"`), else a
+/// parsed [`CellValue::Number`] (or text when unparseable). Empty input ⇒
+/// [`CellValue::Empty`].
+fn xlsx_cell_value(cell_type: &str, raw: &str, shared: &[String]) -> model::CellValue {
+    use model::CellValue;
+    match cell_type {
+        "s" => raw
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| shared.get(i))
+            .cloned()
+            .map(CellValue::Text)
+            .unwrap_or(CellValue::Empty),
+        "b" => CellValue::Bool(raw == "1" || raw.eq_ignore_ascii_case("true")),
+        "str" | "inlineStr" => {
+            if raw.is_empty() {
+                CellValue::Empty
+            } else {
+                CellValue::Text(raw.to_string())
+            }
+        }
+        _ => {
+            if raw.is_empty() {
+                CellValue::Empty
+            } else if let Ok(n) = raw.parse::<f64>() {
+                CellValue::Number(n)
+            } else {
+                CellValue::Text(raw.to_string())
+            }
+        }
+    }
+}
+
+// ─────────────────────────────── PPTX → model ─────────────────────────────────
+
+/// PPTX → [`Document`] with one [`BlockKind::Slide`] holding every slide. Each
+/// `a:sp` shape becomes a [`TextBox`] placeholder (role inferred from
+/// `p:ph@type`), `a:p`/`a:r` runs become paragraphs, and `a:blip` images become
+/// [`Image`] shapes. Reuses the PPTX theme/geometry parsers and run props.
+pub fn pptx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
+    let geom = pptx_page_geom(&part(zip, "ppt/presentation.xml"));
+    let theme = pptx_theme(zip);
+    let mut slide_parts: Vec<(usize, String)> = zip
+        .iter()
+        .filter(|(k, _)| k.starts_with("ppt/slides/slide") && k.ends_with(".xml"))
+        .filter_map(|(k, v)| {
+            let n: usize = k["ppt/slides/slide".len()..k.len() - 4].parse().ok()?;
+            Some((n, String::from_utf8_lossy(v).into_owned()))
+        })
+        .collect();
+    slide_parts.sort_by_key(|(n, _)| *n);
+
+    let mut slides = Vec::new();
+    let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
+    for (n, xml) in &slide_parts {
+        let rels = zip
+            .get(&format!("ppt/slides/_rels/slide{n}.xml.rels"))
+            .map(|b| parse_rels(&String::from_utf8_lossy(b)))
+            .unwrap_or_default();
+        slides.push(pptx_slide_model(
+            xml,
+            zip,
+            &rels,
+            &theme,
+            geom,
+            &mut resources,
+        ));
+    }
+
+    let block = Block {
+        kind: BlockKind::Slide(SlideBlock { slides }),
+        ..Block::default()
+    };
+    let mut doc = flow_document(vec![block], page_geometry(geom));
+    doc.resources.images = resources;
+    doc
+}
+
+/// Build one model [`Slide`] from a slide XML. Walks `p:sp` shapes (a paragraph
+/// list per shape, with its placeholder role) and `p:pic`/`a:blip` images.
+/// Mirrors [`pptx_slide`] but produces structured placeholders/shapes.
+fn pptx_slide_model(
+    xml: &str,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    geom: PageGeom,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Slide {
+    let mut placeholders: Vec<model::Placeholder> = Vec::new();
+    let mut x = Xml::new(xml);
+
+    // Per-shape scratch.
+    let mut in_shape = false;
+    let mut ph_role: Option<model::PlaceholderRole> = None;
+    let mut paras: Vec<Block> = Vec::new();
+    let mut para_runs: Vec<Inline> = Vec::new();
+    let mut in_para = false;
+    let mut run = RunStyle::default();
+    let mut in_rpr = false;
+    let mut in_text = false;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "sp" if !sc => {
+                    in_shape = true;
+                    ph_role = None;
+                    paras.clear();
+                }
+                "ph" => {
+                    // Placeholder role from p:ph@type (title/ctrTitle/subTitle/…).
+                    ph_role = Some(match attr(&attrs, "type") {
+                        Some("title") | Some("ctrTitle") => model::PlaceholderRole::Title,
+                        Some("subTitle") => model::PlaceholderRole::Subtitle,
+                        Some("body") | None => model::PlaceholderRole::Body,
+                        Some(other) => model::PlaceholderRole::Other(other.to_string()),
+                    });
+                }
+                "p" if !sc => {
+                    in_para = true;
+                    para_runs = Vec::new();
+                }
+                "rPr" if !sc => {
+                    in_rpr = true;
+                    run = pptx_run_props(&attrs);
+                    if sc {
+                        in_rpr = false;
+                    }
+                }
+                "srgbClr" if in_rpr => {
+                    if let Some(v) = attr(&attrs, "val") {
+                        if is_hex6(v) {
+                            run.color = Some(v.to_ascii_uppercase());
+                        }
+                    }
+                }
+                "latin" if in_rpr => {
+                    run.font_family = attr(&attrs, "typeface").and_then(|t| theme.resolve(t));
+                }
+                "t" if !sc => in_text = true,
+                "br" => para_runs.push(Inline::LineBreak),
+                "blip" => {
+                    if let Some(rid) = attr(&attrs, "embed").or_else(|| attr(&attrs, "link")) {
+                        if let Some(img) = rels
+                            .get(rid)
+                            .map(|t| resolve_target("ppt", t))
+                            .and_then(|k| image_block(zip, &k, resources))
+                        {
+                            placeholders.push(model::Placeholder {
+                                role: model::PlaceholderRole::Other("picture".to_string()),
+                                block: img,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Text(t) => {
+                if in_para && in_text && !t.is_empty() {
+                    push_run(&mut para_runs, &run, &t);
+                }
+            }
+            Tok::Close(name) => match local(&name) {
+                "t" => in_text = false,
+                "rPr" => in_rpr = false,
+                "p" => {
+                    if in_para && !para_runs.is_empty() {
+                        paras.push(Block {
+                            kind: BlockKind::Paragraph(Paragraph {
+                                runs: std::mem::take(&mut para_runs),
+                                ..Paragraph::default()
+                            }),
+                            ..Block::default()
+                        });
+                    }
+                    in_para = false;
+                }
+                "sp" => {
+                    if in_shape && !paras.is_empty() {
+                        let block = Block {
+                            kind: BlockKind::TextBox(model::TextBox {
+                                blocks: std::mem::take(&mut paras),
+                            }),
+                            ..Block::default()
+                        };
+                        placeholders.push(model::Placeholder {
+                            role: ph_role.take().unwrap_or(model::PlaceholderRole::Body),
+                            block,
+                        });
+                    }
+                    in_shape = false;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    Slide {
+        geometry: page_geometry(geom),
+        shapes: Vec::new(),
+        placeholders,
+        notes: None,
+    }
+}
+
+// ─────────────────────────────── ODF → model ──────────────────────────────────
+
+/// ODT → [`Document`]: `text:h`→heading, `text:p`→paragraph, `text:list`→list,
+/// `table:table`→table. Reuses the ODF text-style and column-width parsers.
+pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
+    let content = part(zip, "content.xml");
+    let styles_xml = part(zip, "styles.xml");
+    let mut styles = odf_text_styles(&styles_xml);
+    styles.extend(odf_text_styles(&content));
+    let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
+    let mut blocks = Vec::new();
+    odf_walk_model(
+        &mut Xml::new(&content),
+        zip,
+        &styles,
+        &mut blocks,
+        None,
+        None,
+    );
+    flow_document(blocks, page_geometry(geom))
+}
+
+/// Recursive ODF model walker (mirrors [`odf_walk`]). Handles `text:h`,
+/// `text:p`, `text:list` (each item → list-item paragraph) and `table:table`.
+fn odf_walk_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    out: &mut Vec<Block>,
+    stop: Option<&str>,
+    list_level: Option<u32>,
+) {
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "h" if !sc => {
+                        let lvl = attr(&attrs, "outline-level")
+                            .and_then(|v| v.parse::<u8>().ok())
+                            .unwrap_or(1)
+                            .clamp(1, 6);
+                        let runs = odf_inline_model(x, styles, "h");
+                        if !runs.is_empty() {
+                            out.push(Block {
+                                kind: BlockKind::Heading(Heading {
+                                    level: lvl,
+                                    para: Paragraph {
+                                        runs,
+                                        ..Paragraph::default()
+                                    },
+                                }),
+                                ..Block::default()
+                            });
+                        }
+                    }
+                    "p" if !sc => {
+                        let runs = odf_inline_model(x, styles, "p");
+                        if runs.is_empty() && list_level.is_none() {
+                            out.push(Block::default()); // preserve blank line spacing
+                            continue;
+                        }
+                        let paragraph = Paragraph {
+                            runs,
+                            ..Paragraph::default()
+                        };
+                        match list_level {
+                            Some(level) => out.push(Block {
+                                kind: BlockKind::List(List {
+                                    ordered: false,
+                                    marker: ListMarker::Bullet('\u{2022}'),
+                                    items: vec![ListItem {
+                                        blocks: vec![Block {
+                                            kind: BlockKind::Paragraph(paragraph),
+                                            ..Block::default()
+                                        }],
+                                        level: level.min(u8::MAX as u32) as u8,
+                                    }],
+                                }),
+                                ..Block::default()
+                            }),
+                            None => out.push(Block {
+                                kind: BlockKind::Paragraph(paragraph),
+                                ..Block::default()
+                            }),
+                        }
+                    }
+                    "list" if !sc => {
+                        let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
+                        odf_walk_model(x, zip, styles, out, Some("list"), next);
+                    }
+                    "table" if !sc => {
+                        let table = odf_table_model(x, zip, styles);
+                        out.push(Block {
+                            kind: BlockKind::Table(table),
+                            ..Block::default()
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) => {
+                if Some(local(&name)) == stop {
+                    return;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+}
+
+/// Collect an ODF block's inline content as model [`Inline`] runs, honouring
+/// `text:span` styles (parsed from the style map into [`CharStyle`]),
+/// `text:tab`/`text:s`/`text:line-break`. Mirrors [`odf_inline`].
+fn odf_inline_model(x: &mut Xml, styles: &BTreeMap<String, String>, block: &str) -> Vec<Inline> {
+    let mut runs: Vec<Inline> = Vec::new();
+    // Stack of span char-styles (closed in order).
+    let mut span_stack: Vec<CharStyle> = Vec::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "span" if !sc => {
+                        let css = attr(&attrs, "style-name")
+                            .and_then(|n| styles.get(n))
+                            .cloned()
+                            .unwrap_or_default();
+                        span_stack.push(odf_css_char_style(&css));
+                    }
+                    "tab" => odf_push(&mut runs, &span_stack, " "),
+                    "line-break" => runs.push(Inline::LineBreak),
+                    "s" => {
+                        let n = attr(&attrs, "c")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        odf_push(&mut runs, &span_stack, &" ".repeat(n));
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Text(t) => odf_push(&mut runs, &span_stack, &t),
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if ln == "span" {
+                    span_stack.pop();
+                } else if ln == block {
+                    break;
+                }
+            }
+        }
+    }
+    runs
+}
+
+/// Append `text` as an [`InlineRun`] carrying the innermost open span style
+/// (default when no span is open), coalescing with an identical previous run.
+fn odf_push(runs: &mut Vec<Inline>, span_stack: &[CharStyle], text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let style = span_stack.last().cloned().unwrap_or_default();
+    if let Some(Inline::Run(last)) = runs.last_mut() {
+        if last.style == style {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    runs.push(Inline::Run(InlineRun {
+        text: text.to_string(),
+        style,
+        source_index: None,
+    }));
+}
+
+/// Parse an ODF `text-properties` CSS fragment (as produced by
+/// [`odf_text_styles`]) back into a [`CharStyle`] (bold/italic/underline/colour/
+/// size/family) — the inverse of the HTML emission, for the model path.
+fn odf_css_char_style(css: &str) -> CharStyle {
+    let mut style = CharStyle::default();
+    for decl in css.split(';') {
+        let Some((k, v)) = decl.split_once(':') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "font-weight" if v == "bold" => style.bold = true,
+            "font-style" if v == "italic" => style.italic = true,
+            "text-decoration" if v.contains("underline") => style.underline = true,
+            "color" => style.color = hex_to_rgb_f64(v.trim_start_matches('#')),
+            "font-size" => {
+                if let Some(pt) = v
+                    .strip_suffix("pt")
+                    .and_then(|n| n.trim().parse::<f64>().ok())
+                {
+                    style.size_pt = pt;
+                }
+            }
+            "font-family" => {
+                let fam = v.trim_matches(['\'', '"']).to_string();
+                if !fam.is_empty() {
+                    style.generic = super::style::parse_base_font(&fam).generic;
+                    style.family = fam;
+                }
+            }
+            _ => {}
+        }
+    }
+    style
+}
+
+/// Emit one ODF `table:table` (open already consumed) as a model [`Table`],
+/// expanding `table:number-columns-repeated` (cap 64). Mirrors [`odf_table`].
+fn odf_table_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+) -> Table {
+    let mut rows: Vec<Row> = Vec::new();
+    let mut cur_row: Option<Vec<Cell>> = None;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == "table-row" && !sc {
+                    cur_row = Some(Vec::new());
+                } else if ln == "table-cell" && !sc {
+                    let repeat = attr(&attrs, "number-columns-repeated")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .min(64);
+                    let mut blocks = Vec::new();
+                    odf_walk_model(x, zip, styles, &mut blocks, Some("table-cell"), None);
+                    if let Some(row) = cur_row.as_mut() {
+                        for _ in 0..repeat {
+                            row.push(Cell {
+                                blocks: blocks.clone(),
+                                ..Cell::default()
+                            });
+                        }
+                    }
+                } else if ln == "covered-table-cell" && sc {
+                    if let Some(row) = cur_row.as_mut() {
+                        row.push(Cell::default());
+                    }
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if ln == "table-row" {
+                    if let Some(cells) = cur_row.take() {
+                        rows.push(Row {
+                            cells,
+                            height: None,
+                        });
+                    }
+                } else if ln == "table" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+
+    Table {
+        rows,
+        col_widths: Vec::new(),
+        border: model::BorderStyle::default(),
+    }
+}
+
+/// ODS → [`Document`] with one [`BlockKind::Sheet`]; each `table:table` becomes a
+/// model [`Sheet`] of typed text cells (ODF spreadsheets carry the displayed
+/// value as `text:p`). Reuses the ODF walker for cell text.
+pub fn ods_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
+    let content = part(zip, "content.xml");
+    let styles_xml = part(zip, "styles.xml");
+    let geom = odf_geom(&styles_xml, &content, PageGeom::tabular_default());
+
+    let mut sheets: Vec<Sheet> = Vec::new();
+    let mut x = Xml::new(&content);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, sc) = &tok {
+            if local(name) == "table" && !sc {
+                let sheet_name = attr(attrs, "name").unwrap_or("Sheet").to_string();
+                let rows = ods_table_model(&mut x);
+                sheets.push(Sheet {
+                    name: sheet_name,
+                    rows,
+                    merges: Vec::new(),
+                    col_widths: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let block = Block {
+        kind: BlockKind::Sheet(SheetBlock { sheets }),
+        ..Block::default()
+    };
+    flow_document(vec![block], page_geometry(geom))
+}
+
+/// Emit one ODS `table:table` (open consumed) as [`SheetRow`]s of typed cells,
+/// expanding repeated rows/columns (cap 64). Mirrors [`ods_table`]/[`ods_row`].
+fn ods_table_model(x: &mut Xml) -> Vec<SheetRow> {
+    let mut rows: Vec<SheetRow> = Vec::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == "table-row" && !sc {
+                    let rep = attr(&attrs, "number-rows-repeated")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .min(64);
+                    let cells = ods_row_model(x);
+                    let emit = if cells.iter().all(|c| c.value == model::CellValue::Empty) {
+                        rep.min(1)
+                    } else {
+                        rep
+                    };
+                    for _ in 0..emit {
+                        rows.push(SheetRow {
+                            cells: cells.clone(),
+                        });
+                    }
+                }
+            }
+            Tok::Close(name) => {
+                if local(&name) == "table" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    rows
+}
+
+/// Collect one `table:table-row`'s typed cells (open already consumed), reusing
+/// [`ods_cell_text`] for the displayed value and classifying it as a number when
+/// it parses, else text.
+fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
+    let mut cells: Vec<SheetCell> = Vec::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if (ln == "table-cell" || ln == "covered-table-cell") && !sc {
+                    let rep = attr(&attrs, "number-columns-repeated")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .min(64);
+                    let text = ods_cell_text(x, ln);
+                    let trimmed = text.trim();
+                    let value = if trimmed.is_empty() {
+                        model::CellValue::Empty
+                    } else if let Ok(n) = trimmed.parse::<f64>() {
+                        model::CellValue::Number(n)
+                    } else {
+                        model::CellValue::Text(trimmed.to_string())
+                    };
+                    let emit = if value == model::CellValue::Empty {
+                        rep.min(1)
+                    } else {
+                        rep
+                    };
+                    for _ in 0..emit {
+                        cells.push(SheetCell {
+                            value: value.clone(),
+                            ..SheetCell::default()
+                        });
+                    }
+                } else if (ln == "table-cell" || ln == "covered-table-cell") && sc {
+                    cells.push(SheetCell::default());
+                }
+            }
+            Tok::Close(name) => {
+                if local(&name) == "table-row" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    cells
+}
+
+/// ODP → [`Document`] with one [`BlockKind::Slide`]; each `draw:page` → a
+/// [`Slide`] whose `text:p` paragraphs become body placeholders and `draw:image`
+/// become image shapes. Reuses the ODF inline walker and geometry.
+pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
+    let content = part(zip, "content.xml");
+    let styles_xml = part(zip, "styles.xml");
+    let mut styles = odf_text_styles(&styles_xml);
+    styles.extend(odf_text_styles(&content));
+    let geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
+
+    let mut slides: Vec<Slide> = Vec::new();
+    let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
+    let mut x = Xml::new(&content);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, _, sc) = &tok {
+            if local(name) == "page" && !sc {
+                slides.push(odp_page_model(&mut x, zip, &styles, geom, &mut resources));
+            }
+        }
+    }
+
+    let block = Block {
+        kind: BlockKind::Slide(SlideBlock { slides }),
+        ..Block::default()
+    };
+    let mut doc = flow_document(vec![block], page_geometry(geom));
+    doc.resources.images = resources;
+    doc
+}
+
+/// Emit one `draw:page` (open consumed) as a model [`Slide`]: its paragraphs as
+/// body placeholders, its images as image-shape placeholders. Mirrors
+/// [`odp_page`].
+fn odp_page_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    geom: PageGeom,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Slide {
+    let mut placeholders: Vec<model::Placeholder> = Vec::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "p" if !sc => {
+                        let runs = odf_inline_model(x, styles, "p");
+                        if !runs.is_empty() {
+                            placeholders.push(model::Placeholder {
+                                role: model::PlaceholderRole::Body,
+                                block: Block {
+                                    kind: BlockKind::Paragraph(Paragraph {
+                                        runs,
+                                        ..Paragraph::default()
+                                    }),
+                                    ..Block::default()
+                                },
+                            });
+                        }
+                    }
+                    "image" if sc => {
+                        if let Some(href) = attr(&attrs, "href") {
+                            let key = href.trim_start_matches('/').to_string();
+                            if let Some(img) = image_block(zip, &key, resources) {
+                                placeholders.push(model::Placeholder {
+                                    role: model::PlaceholderRole::Other("picture".to_string()),
+                                    block: img,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) => {
+                if local(&name) == "page" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    Slide {
+        geometry: page_geometry(geom),
+        shapes: Vec::new(),
+        placeholders,
+        notes: None,
+    }
+}
+
+/// Legacy `.doc/.xls/.ppt` (OLE2) → text-only model: best-effort runs as
+/// paragraphs. Reuses the CFB parser and [`extract_runs`]. `None` if nothing
+/// legible is found.
+fn ole2_to_model(bytes: &[u8]) -> Option<Document> {
+    let cfb = Cfb::parse(bytes)?;
+    let candidates = [
+        "WordDocument",
+        "Workbook",
+        "Book",
+        "PowerPoint Document",
+        "Contents",
+    ];
+    let mut stream: Option<Vec<u8>> = None;
+    for name in candidates {
+        if let Some(s) = cfb.stream(name) {
+            stream = Some(s);
+            break;
+        }
+    }
+    let data = stream.or_else(|| cfb.largest_stream())?;
+    let paras = extract_runs(&data);
+    if paras.is_empty() {
+        return None;
+    }
+    let blocks = paras.into_iter().map(text_paragraph_block).collect();
+    Some(flow_document(
+        blocks,
+        page_geometry(PageGeom::prose_default()),
+    ))
+}
+
+/// A plain-text paragraph [`Block`] carrying a single default-styled run.
+fn text_paragraph_block(text: String) -> Block {
+    Block {
+        kind: BlockKind::Paragraph(Paragraph {
+            runs: vec![Inline::Run(InlineRun {
+                text,
+                style: CharStyle::default(),
+                source_index: None,
+            })],
+            ..Paragraph::default()
+        }),
+        ..Block::default()
+    }
+}
+
+/// Decode a supported image zip entry, register its bytes in `resources` under a
+/// content-hash key, and return an [`BlockKind::Image`] block referencing that
+/// key. `None` for a missing or unsupported (vector/legacy) entry. Identical
+/// bytes hash identically, so a reused picture is stored once.
+fn image_block(
+    zip: &BTreeMap<String, Vec<u8>>,
+    key: &str,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<Block> {
+    let mime = image_mime(key)?;
+    let bytes = zip.get(key)?.clone();
+    let hash = fnv1a(&bytes);
+    let format = mime.rsplit('/').next().unwrap_or("png").to_string();
+    resources
+        .entry(hash)
+        .or_insert(model::ImageResource { bytes, format });
+    Some(Block {
+        kind: BlockKind::Image(model::ImageRef {
+            resource: hash,
+            alt: None,
+        }),
+        ..Block::default()
+    })
+}
+
+/// 64-bit FNV-1a content hash — a stable, dependency-free key for the
+/// [`crate::model::ResourceTable`] (identical bytes hash identically).
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
 // ───────────────────────────── HTML shell + escaping ──────────────────────────
 
 /// Default stylesheet wrapped around every generated body. Sensible document

@@ -16,9 +16,11 @@
 pub mod css;
 pub mod dom;
 pub mod layout;
+pub mod model;
 pub mod page;
 pub mod paint;
 
+pub use model::to_model;
 pub use page::{page_size, Margins, RenderOptions};
 pub use paint::{
     needed_fonts, needed_fonts_with, needed_resources, render, render_with, FontRequest,
