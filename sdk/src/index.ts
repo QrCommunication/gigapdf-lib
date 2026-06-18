@@ -82,8 +82,19 @@ export class GigaPdfEngine {
    * for the consuming route so the `.wasm` is copied into the standalone bundle.
    */
   static async loadDefault(): Promise<GigaPdfEngine> {
-    const { readFile } = await import("node:fs/promises");
-    const { fileURLToPath } = await import("node:url");
+    // Indirect the specifier through a variable so browser bundlers (Turbopack,
+    // webpack, Vite) don't statically resolve these Node-only modules. This path
+    // is never reached in the browser — use `load(url)` there — but the class is
+    // bundled for the browser, and a *static* `import("node:fs/promises")` would
+    // make the bundler try (and fail) to resolve it.
+    const nodeImport = (m: string): Promise<Record<string, unknown>> =>
+      import(/* webpackIgnore: true */ /* @vite-ignore */ m);
+    const { readFile } = (await nodeImport("node:fs/promises")) as {
+      readFile: (p: string) => Promise<Uint8Array>;
+    };
+    const { fileURLToPath } = (await nodeImport("node:url")) as {
+      fileURLToPath: (u: URL) => string;
+    };
     const wasmPath = fileURLToPath(new URL("../gigapdf.wasm", import.meta.url));
     return GigaPdfEngine.load(await readFile(wasmPath));
   }
@@ -386,6 +397,24 @@ export class GigaPdfEngine {
     if (framed.length < 8) return null;
     const dv = new DataView(framed.buffer, framed.byteOffset, framed.byteLength);
     return { width: dv.getUint32(0, true), height: dv.getUint32(4, true), rgba: framed.subarray(8) };
+  }
+
+  // ── OCR models (host-loaded `.gpocr` blobs — multi-script line recognizer) ─
+  /**
+   * Load a `.gpocr` line-level OCR model blob into the engine's runtime registry
+   * — Latin/Cyrillic/Greek (`alpha`), Arabic (RTL), Devanagari, Bengali, Tamil…
+   * The host supplies the bytes (the wasm ships no weights, like fonts), so the
+   * module stays lean. Once loaded, {@link GigaPdfDoc.ocr} / {@link GigaPdfDoc.ocrText}
+   * route to the CRNN+CTC line recognizer (per-page fallback to the built-in
+   * mono-glyph Latin classifier). Models are global to the engine; call after
+   * `load`/`loadDefault`. Returns `true` on success, `false` on a malformed blob.
+   */
+  loadOcrModel(model: Uint8Array): boolean {
+    return this._withBytes(model, (p, l) => this.ex.gp_ocr_load_model(p, l)) === 1;
+  }
+  /** Drop every runtime-loaded OCR model (reverts to the mono-glyph classifier). */
+  clearOcrModels(): void {
+    this.ex.gp_ocr_clear_models();
   }
 
   // ── fonts (catalog / Google Fonts URL — the host performs the fetch) ───────
