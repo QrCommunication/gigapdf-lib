@@ -133,6 +133,13 @@ pub trait ResourceCtx {
     fn tiling_pattern(&self, name: &[u8]) -> Option<FormXObject<'_>>;
     /// Resolve an ExtGState named `name` (the `gs` operator).
     fn ext_gstate(&self, name: &[u8]) -> Option<ExtGStateParams>;
+    /// Resolve a *named* colour space (`cs`/`CS` operand) from the current
+    /// `/Resources /ColorSpace` dictionary and convert `comps` to device RGB.
+    /// Returns `None` when the name isn't a colour space the document can resolve
+    /// (the interpreter then falls back to an arity-based Device interpretation).
+    /// Device-space names (`DeviceGray`/`DeviceRGB`/`DeviceCMYK`) are resolved
+    /// here too so a `cs /DeviceCMYK … scn` path is exact.
+    fn resolve_color(&self, name: &[u8], comps: &[f64]) -> Option<[u8; 3]>;
 }
 
 /// A resource context that resolves nothing — used by [`render_content_into`],
@@ -155,6 +162,9 @@ impl ResourceCtx for NoResources {
         None
     }
     fn ext_gstate(&self, _name: &[u8]) -> Option<ExtGStateParams> {
+        None
+    }
+    fn resolve_color(&self, _name: &[u8], _comps: &[f64]) -> Option<[u8; 3]> {
         None
     }
 }
@@ -291,6 +301,13 @@ struct GState {
     /// Name of the fill colour's shading pattern, if the fill colour space is
     /// `/Pattern` and `scn` named a pattern (axial/radial or tiling).
     fill_pattern: Option<Vec<u8>>,
+    /// Name of the current *non-stroking* colour space set by `cs`, used to
+    /// resolve `sc`/`scn` operands through [`ResourceCtx::resolve_color`] (named
+    /// Separation/DeviceN/Indexed/ICCBased/Lab spaces). `None` = device space
+    /// implied by `g`/`rg`/`k` or by `sc`/`scn` arity.
+    fill_cs: Option<Vec<u8>>,
+    /// Name of the current *stroking* colour space set by `CS` (for `SC`/`SCN`).
+    stroke_cs: Option<Vec<u8>>,
 }
 
 impl GState {
@@ -305,6 +322,8 @@ impl GState {
             fill_alpha: 1.0,
             soft_mask: None,
             fill_pattern: None,
+            fill_cs: None,
+            stroke_cs: None,
         }
     }
 
@@ -338,6 +357,30 @@ fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> [u8; 3] {
 fn gray(v: f64) -> [u8; 3] {
     let g = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     [g, g, g]
+}
+
+/// Resolve an `sc`/`scn`/`SC`/`SCN` colour. When a named colour space is active
+/// (`cs_name`), resolve through the document (`ResourceCtx`) so Separation,
+/// DeviceN, Indexed, ICCBased and Lab spaces convert correctly. Otherwise — or
+/// when the name can't be resolved — fall back to the Device space implied by
+/// the operand count (1=Gray, 3=RGB, 4=CMYK). `None` only when neither path
+/// yields a colour (caller keeps the previous fill/stroke).
+fn resolve_set_color(
+    ctx: &dyn ResourceCtx,
+    cs_name: Option<&[u8]>,
+    comps: &[f64],
+) -> Option<[u8; 3]> {
+    if let Some(name) = cs_name {
+        if let Some(rgb) = ctx.resolve_color(name, comps) {
+            return Some(rgb);
+        }
+    }
+    match comps.len() {
+        1 => Some(gray(comps[0])),
+        3 => Some(rgb(comps[0], comps[1], comps[2])),
+        4 => Some(cmyk_to_rgb(comps[0], comps[1], comps[2], comps[3])),
+        _ => None,
+    }
 }
 
 fn rgb(r: f64, g: f64, b: f64) -> [u8; 3] {
@@ -528,27 +571,57 @@ pub fn render_content_into_ctx(
                 state.ctm = Matrix::new(n[0], n[1], n[2], n[3], n[4], n[5]).then(&state.ctm);
             }
             b"w" if !n.is_empty() => state.line_width = n[0],
+            // The device-colour operators also reset the current colour space to
+            // their device space (ISO 32000-1 §8.6.8), clearing any named `cs`.
             b"rg" if n.len() == 3 => {
                 state.fill = rgb(n[0], n[1], n[2]);
                 state.fill_pattern = None;
+                state.fill_cs = None;
             }
-            b"RG" if n.len() == 3 => state.stroke = rgb(n[0], n[1], n[2]),
+            b"RG" if n.len() == 3 => {
+                state.stroke = rgb(n[0], n[1], n[2]);
+                state.stroke_cs = None;
+            }
             b"g" if !n.is_empty() => {
                 state.fill = gray(n[0]);
                 state.fill_pattern = None;
+                state.fill_cs = None;
             }
-            b"G" if !n.is_empty() => state.stroke = gray(n[0]),
+            b"G" if !n.is_empty() => {
+                state.stroke = gray(n[0]);
+                state.stroke_cs = None;
+            }
             b"k" if n.len() == 4 => {
                 state.fill = cmyk_to_rgb(n[0], n[1], n[2], n[3]);
                 state.fill_pattern = None;
+                state.fill_cs = None;
             }
-            b"K" if n.len() == 4 => state.stroke = cmyk_to_rgb(n[0], n[1], n[2], n[3]),
-            // Colour-space selection: only `/Pattern` matters here (it flips the
-            // fill into pattern mode); a non-pattern `cs` clears any pattern.
+            b"K" if n.len() == 4 => {
+                state.stroke = cmyk_to_rgb(n[0], n[1], n[2], n[3]);
+                state.stroke_cs = None;
+            }
+            // Non-stroking colour space: remember the name so `sc`/`scn` can
+            // resolve it. `/Pattern` flips the fill into pattern mode; any other
+            // space resets the colour to its initial value (black for the device
+            // spaces; the spec's "initial value" otherwise).
             b"cs" => {
                 state.fill_pattern = None;
-                if op.operands.first().and_then(Object::as_name) != Some(b"Pattern".as_slice()) {
+                let name = op.operands.first().and_then(Object::as_name);
+                if name == Some(b"Pattern".as_slice()) {
+                    state.fill_cs = None;
+                } else {
+                    state.fill_cs = name.map(|n| n.to_vec());
                     state.fill = [0, 0, 0];
+                }
+            }
+            // Stroking colour space.
+            b"CS" => {
+                let name = op.operands.first().and_then(Object::as_name);
+                if name == Some(b"Pattern".as_slice()) {
+                    state.stroke_cs = None;
+                } else {
+                    state.stroke_cs = name.map(|n| n.to_vec());
+                    state.stroke = [0, 0, 0];
                 }
             }
             // Set the fill colour from components, or name a pattern (last operand
@@ -558,22 +631,14 @@ pub fn render_content_into_ctx(
                     state.fill_pattern = Some(name.clone());
                 } else {
                     state.fill_pattern = None;
-                    state.fill = match n.len() {
-                        1 => gray(n[0]),
-                        3 => rgb(n[0], n[1], n[2]),
-                        4 => cmyk_to_rgb(n[0], n[1], n[2], n[3]),
-                        _ => state.fill,
-                    };
+                    state.fill = resolve_set_color(ctx, state.fill_cs.as_deref(), &n)
+                        .unwrap_or(state.fill);
                 }
             }
             b"SC" | b"SCN" => {
                 if op.operands.last().and_then(Object::as_name).is_none() {
-                    state.stroke = match n.len() {
-                        1 => gray(n[0]),
-                        3 => rgb(n[0], n[1], n[2]),
-                        4 => cmyk_to_rgb(n[0], n[1], n[2], n[3]),
-                        _ => state.stroke,
-                    };
+                    state.stroke = resolve_set_color(ctx, state.stroke_cs.as_deref(), &n)
+                        .unwrap_or(state.stroke);
                 }
             }
             b"gs" => {

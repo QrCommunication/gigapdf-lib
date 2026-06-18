@@ -6,6 +6,7 @@
 //! build on the same canvas and fill engine.
 
 pub mod canvas;
+pub mod colorspace;
 pub mod ocr;
 pub mod ocr_crnn;
 pub mod ocr_model;

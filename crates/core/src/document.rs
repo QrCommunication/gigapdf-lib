@@ -2508,6 +2508,121 @@ impl Document {
         }
     }
 
+    /// Resolve a PDF colour-space object (ISO 32000-1 §8.6) into a self-contained
+    /// [`ColorSpace`](crate::raster::colorspace::ColorSpace). Handles the device
+    /// names, `/ICCBased`, `/Indexed`, `/Separation`, `/DeviceN`, `/Lab`,
+    /// `/CalRGB`, `/CalGray`, and `/Pattern` (mapped to its underlying space, or
+    /// `DeviceGray` for an uncoloured pattern). `depth` guards against cyclic
+    /// `/Alternate`/`base` chains. `None` when the object isn't a colour space.
+    fn resolve_color_space(
+        &self,
+        obj: &Object,
+        depth: usize,
+    ) -> Option<crate::raster::colorspace::ColorSpace> {
+        use crate::raster::colorspace::ColorSpace;
+        if depth > 8 {
+            return None;
+        }
+        let obj = self.resolve(obj);
+        // A bare name: a device space, or a name to look up in `/ColorSpace`
+        // resources is handled by the caller (it passes the resolved array/dict).
+        if let Some(name) = obj.as_name() {
+            return match name {
+                b"DeviceGray" | b"G" | b"CalGray" => Some(ColorSpace::DeviceGray),
+                b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(ColorSpace::DeviceRgb),
+                b"DeviceCMYK" | b"CMYK" => Some(ColorSpace::DeviceCmyk),
+                b"Pattern" => Some(ColorSpace::DeviceGray),
+                _ => None,
+            };
+        }
+        let arr = obj.as_array()?;
+        let head = arr.first().map(|o| self.resolve(o))?;
+        let kind = head.as_name()?;
+        match kind {
+            b"ICCBased" => {
+                let stream = arr.get(1).map(|o| self.resolve(o))?;
+                let sdict = stream.as_stream().map(|s| &s.dict)?;
+                let n = sdict.get(b"N").and_then(Object::as_i64).unwrap_or(3).clamp(1, 4) as usize;
+                let alternate = sdict
+                    .get(b"Alternate")
+                    .and_then(|a| self.resolve_color_space(a, depth + 1))
+                    .map(Box::new);
+                Some(ColorSpace::Icc { n, alternate })
+            }
+            b"CalGray" => Some(ColorSpace::DeviceGray),
+            b"CalRGB" => Some(ColorSpace::DeviceRgb),
+            b"Lab" => {
+                let params = arr.get(1).map(|o| self.resolve(o));
+                let pdict = params.as_ref().and_then(|o| o.as_dict());
+                let white = pdict
+                    .and_then(|d| read_vec(self, d, b"WhitePoint"))
+                    .filter(|v| v.len() >= 3)
+                    .map(|v| [v[0], v[1], v[2]])
+                    .unwrap_or([0.9642, 1.0, 0.8249]);
+                let range = pdict
+                    .and_then(|d| read_vec(self, d, b"Range"))
+                    .filter(|v| v.len() >= 4)
+                    .map(|v| [v[0], v[1], v[2], v[3]])
+                    .unwrap_or([-100.0, 100.0, -100.0, 100.0]);
+                Some(ColorSpace::Lab { white, range })
+            }
+            b"Indexed" | b"I" => {
+                let base = self.resolve_color_space(arr.get(1)?, depth + 1)?;
+                let hival = arr.get(2).map(|o| self.resolve(o)).and_then(|o| o.as_i64())?.max(0) as usize;
+                let stride = base.components().max(1);
+                // The lookup is a byte string or a stream; each entry is one base
+                // component as a 0..=255 byte → normalised to 0..=1.
+                let lookup = arr.get(3).map(|o| self.resolve(o))?;
+                let bytes: Vec<u8> = match lookup {
+                    Object::String(s, _) => s.clone(),
+                    Object::Stream(ref st) => decode_stream(st).ok()?,
+                    _ => return None,
+                };
+                let mut palette = Vec::with_capacity((hival + 1) * stride);
+                for i in 0..(hival + 1) * stride {
+                    palette.push(bytes.get(i).copied().unwrap_or(0) as f64 / 255.0);
+                }
+                Some(ColorSpace::Indexed {
+                    base: Box::new(base),
+                    hival,
+                    palette,
+                })
+            }
+            b"Separation" => {
+                let colorant = arr.get(1).map(|o| self.resolve(o));
+                let none = colorant.as_ref().and_then(|o| o.as_name()) == Some(b"None".as_slice());
+                let alternate = self.resolve_color_space(arr.get(2)?, depth + 1)?;
+                let tint = self.resolve(arr.get(3)?).clone();
+                Some(ColorSpace::Separation {
+                    n: 1,
+                    none,
+                    alternate: Box::new(alternate),
+                    tint,
+                })
+            }
+            b"DeviceN" => {
+                let names = arr.get(1).map(|o| self.resolve(o)).and_then(Object::as_array)?;
+                let n = names.len().max(1);
+                let alternate = self.resolve_color_space(arr.get(2)?, depth + 1)?;
+                let tint = self.resolve(arr.get(3)?).clone();
+                Some(ColorSpace::Separation {
+                    n,
+                    none: false,
+                    alternate: Box::new(alternate),
+                    tint,
+                })
+            }
+            b"Pattern" => {
+                // `[/Pattern base]` — paint with the underlying colour space.
+                match arr.get(1) {
+                    Some(b) => self.resolve_color_space(b, depth + 1),
+                    None => Some(ColorSpace::DeviceGray),
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate a PDF function object at scalar input `t`, returning its output
     /// component vector. Supports an array of functions (each 1-output, results
     /// concatenated), type 0 (sampled), type 2 (exponential), and type 3
@@ -2638,6 +2753,147 @@ impl Document {
             out.push(r0 + v * (r1 - r0));
         }
         out
+    }
+
+    /// Evaluate a PDF function object with `inputs.len()` input components (the
+    /// general, multi-input case used by Separation/DeviceN tint transforms). For
+    /// single-input function types (2 exponential, 3 stitching) only `inputs[0]`
+    /// is used; type 0 (sampled) supports any input dimensionality; type 4
+    /// (PostScript calculator) runs the calculator program. An array of functions
+    /// concatenates each one's first output. Returns an empty vector on an
+    /// unknown/unsupported type.
+    fn eval_function_multi(&self, func: &Object, inputs: &[f64]) -> Vec<f64> {
+        let func = self.resolve(func);
+        if let Object::Array(items) = func {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let v = self.eval_function_multi(item, inputs);
+                out.push(v.first().copied().unwrap_or(0.0));
+            }
+            return out;
+        }
+        let Some(dict) = func.as_dict() else {
+            return Vec::new();
+        };
+        let ftype = dict.get(b"FunctionType").and_then(Object::as_i64).unwrap_or(-1);
+        match ftype {
+            // Single-input analytic functions: drive them with the first tint.
+            2 | 3 => self.eval_function(func, inputs.first().copied().unwrap_or(0.0)),
+            0 => self.eval_sampled_function_multi(func, inputs),
+            4 => self.eval_postscript_function(func, inputs),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Evaluate a type-0 (sampled) function with arbitrary input dimensionality,
+    /// nearest-sample per axis (no multilinear interpolation — adequate for tint
+    /// transforms where the table is dense). Reads `/Size`, `/BitsPerSample`,
+    /// `/Domain`, `/Encode`, `/Range`, `/Decode`. Empty on malformed input.
+    fn eval_sampled_function_multi(&self, func: &Object, inputs: &[f64]) -> Vec<f64> {
+        let Object::Stream(stream) = func else {
+            return Vec::new();
+        };
+        let dict = &stream.dict;
+        let size: Vec<i64> = dict
+            .get(b"Size")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|a| a.iter().filter_map(|o| self.resolve(o).as_i64()).collect())
+            .unwrap_or_default();
+        let m = size.len();
+        if m == 0 || size.iter().any(|&s| s < 1) {
+            return Vec::new();
+        }
+        // 1-D delegates to the interpolating scalar path for better quality.
+        if m == 1 {
+            let domain = read_pair(self, dict, b"Domain").unwrap_or([0.0, 1.0]);
+            return self.eval_sampled_function(func, inputs.first().copied().unwrap_or(0.0), domain);
+        }
+        let bps = dict.get(b"BitsPerSample").and_then(Object::as_i64).unwrap_or(8);
+        let domain = read_vec(self, dict, b"Domain").unwrap_or_default();
+        let range = read_vec(self, dict, b"Range").unwrap_or_default();
+        if domain.len() < 2 * m || range.is_empty() || !range.len().is_multiple_of(2) {
+            return Vec::new();
+        }
+        let outs = range.len() / 2;
+        let encode = read_vec(self, dict, b"Encode").unwrap_or_default();
+        let data = match decode_stream(stream) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        // Map each input to its nearest sample index along that axis.
+        let mut coord = vec![0usize; m];
+        for (i, c) in coord.iter_mut().enumerate() {
+            let (d0, d1) = (domain[2 * i], domain[2 * i + 1]);
+            let n = size[i] as usize;
+            let (e0, e1) = (
+                encode.get(2 * i).copied().unwrap_or(0.0),
+                encode.get(2 * i + 1).copied().unwrap_or((n - 1) as f64),
+            );
+            let span = d1 - d0;
+            let x = inputs.get(i).copied().unwrap_or(0.0).clamp(d0.min(d1), d0.max(d1));
+            let e = if span.abs() < 1e-12 {
+                e0
+            } else {
+                e0 + (x - d0) / span * (e1 - e0)
+            };
+            *c = (e.round() as i64).clamp(0, (n - 1) as i64) as usize;
+        }
+        // Row-major flatten: first dimension varies fastest (PDF spec §7.10.2).
+        let mut flat = 0u64;
+        let mut stride = 1u64;
+        for i in 0..m {
+            flat += coord[i] as u64 * stride;
+            stride *= size[i] as u64;
+        }
+        let max_val = ((1u64 << bps.min(32)) - 1) as f64;
+        let decode = read_vec(self, dict, b"Decode").unwrap_or_default();
+        let mut out = Vec::with_capacity(outs);
+        for c in 0..outs {
+            let s = read_sample(&data, flat * outs as u64 + c as u64, bps as u32) as f64 / max_val;
+            let (r0, r1) = (
+                decode.get(2 * c).copied().unwrap_or(range[2 * c]),
+                decode.get(2 * c + 1).copied().unwrap_or(range[2 * c + 1]),
+            );
+            out.push(r0 + s * (r1 - r0));
+        }
+        out
+    }
+
+    /// Evaluate a type-4 (PostScript calculator) function: a tiny stack language
+    /// (ISO 32000-1 §7.10.5). Supports the arithmetic, comparison, stack, and
+    /// `if`/`ifelse` operators that tint transforms use. Truncates outputs to
+    /// `/Range` (length = number of outputs). Empty on a parse/eval failure.
+    fn eval_postscript_function(&self, func: &Object, inputs: &[f64]) -> Vec<f64> {
+        let Object::Stream(stream) = func else {
+            return Vec::new();
+        };
+        let range = read_vec(self, &stream.dict, b"Range").unwrap_or_default();
+        if range.is_empty() || !range.len().is_multiple_of(2) {
+            return Vec::new();
+        }
+        let outs = range.len() / 2;
+        let src = match decode_stream(stream) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let tokens = ps_tokenize(&src);
+        let prog = match ps_parse(&tokens, &mut 0) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let mut stack: Vec<f64> = inputs.to_vec();
+        if ps_exec(&prog, &mut stack).is_none() {
+            return Vec::new();
+        }
+        // The final `outs` values on the stack are the outputs, clamped to range.
+        if stack.len() < outs {
+            return Vec::new();
+        }
+        let start = stack.len() - outs;
+        (0..outs)
+            .map(|c| stack[start + c].clamp(range[2 * c].min(range[2 * c + 1]), range[2 * c].max(range[2 * c + 1])))
+            .collect()
     }
 
     /// Resolve an ExtGState (`/ExtGState` resource) named `name`: its `/ca`,
@@ -3331,40 +3587,28 @@ impl Document {
                 let bpc = dict
                     .get(b"BitsPerComponent")
                     .and_then(Object::as_i64)
-                    .unwrap_or(8);
-                if bpc != 8 {
-                    continue;
-                }
+                    .unwrap_or(8)
+                    .clamp(1, 16) as u32;
                 // JPXDecode (JPEG 2000) is not decoded yet; skip rather than
                 // misread its raw bytes as raster samples.
                 if filter.as_deref() == Some(b"JPXDecode") {
                     continue;
                 }
-                let components = match dict
-                    .get(b"ColorSpace")
-                    .map(|o| self.resolve(o))
-                    .and_then(Object::as_name)
-                {
-                    Some(b"DeviceRGB") => 3,
-                    Some(b"DeviceGray") => 1,
-                    _ => continue, // Indexed/ICCBased/CMYK not handled yet
+                // Resolve the image colour space (DeviceGray/RGB/CMYK, Indexed,
+                // ICCBased, Separation/DeviceN, Lab) into a converter, then map
+                // every packed sample group to RGB honouring `/BitsPerComponent`
+                // and `/Decode`. This is the non-RGB "blank/garbled image" fix.
+                let cs_obj = dict.get(b"ColorSpace").map(|o| self.resolve(o));
+                let Some(cs) = cs_obj.and_then(|o| self.resolve_color_space(o, 0)) else {
+                    continue; // unknown colour space — skip rather than misread
                 };
                 let Ok(samples) = decode_stream(stream) else {
                     continue;
                 };
-                if samples.len() < w * h * components {
-                    continue;
+                match self.image_samples_to_rgb(&cs, &samples, w, h, bpc, dict) {
+                    Some(rgb) => rgb,
+                    None => continue,
                 }
-                (0..w * h)
-                    .map(|p| {
-                        let i = p * components;
-                        if components == 1 {
-                            [samples[i], samples[i], samples[i]]
-                        } else {
-                            [samples[i], samples[i + 1], samples[i + 2]]
-                        }
-                    })
-                    .collect()
             };
             // A `/SMask` (8-bit DeviceGray image) supplies per-pixel alpha — this
             // is how PNG transparency (and a JPEG photo's soft cut-out) survives
@@ -3397,6 +3641,80 @@ impl Document {
             );
         }
         out
+    }
+
+    /// Convert a decoded sample grid (`samples`, packed MSB-first, each scanline
+    /// padded to a byte boundary) of a `w × h` image in colour space `cs` to one
+    /// `[r,g,b]` per pixel, honouring `/BitsPerComponent` (`bpc`) and `/Decode`.
+    /// `None` if the data is too short. Indexed images map raw index values
+    /// through the palette; other spaces normalise each component to `0..=1`,
+    /// apply the `/Decode` array, then run the colour-space converter.
+    fn image_samples_to_rgb(
+        &self,
+        cs: &crate::raster::colorspace::ColorSpace,
+        samples: &[u8],
+        w: usize,
+        h: usize,
+        bpc: u32,
+        dict: &Dictionary,
+    ) -> Option<Vec<[u8; 3]>> {
+        use crate::raster::colorspace::ColorSpace;
+        let n = cs.components().max(1);
+        // Bits per scanline, rounded up to a whole byte (PDF §7.4.4 / §8.9.5.2):
+        // each new image row starts on a byte boundary.
+        let row_bits = (w * n * bpc as usize) as u64;
+        let row_bytes = row_bits.div_ceil(8);
+        if (row_bytes * h as u64) > samples.len() as u64 {
+            return None;
+        }
+        let decode = read_vec(self, dict, b"Decode").unwrap_or_default();
+        let indexed = matches!(cs, ColorSpace::Indexed { .. });
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let row_start_bit = y as u64 * row_bytes * 8;
+            for x in 0..w {
+                out.push(self.sample_pixel_rgb(cs, samples, row_start_bit, x, n, bpc, &decode, indexed));
+            }
+        }
+        Some(out)
+    }
+
+    /// Resolve a single pixel at column `x` of a scanline starting at bit
+    /// `row_start_bit` to RGB, reading `n` `bpc`-wide samples and converting via
+    /// `cs`. Split out so the bit addressing accounts for per-row byte padding.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_pixel_rgb(
+        &self,
+        cs: &crate::raster::colorspace::ColorSpace,
+        samples: &[u8],
+        row_start_bit: u64,
+        x: usize,
+        n: usize,
+        bpc: u32,
+        decode: &[f64],
+        indexed: bool,
+    ) -> [u8; 3] {
+        let max_val = ((1u64 << bpc.min(31)) - 1) as f64;
+        let mut comps = [0f64; 8];
+        for (c, slot) in comps.iter_mut().take(n).enumerate() {
+            let bit = row_start_bit + ((x * n + c) as u64 * bpc as u64);
+            let raw = read_bits(samples, bit, bpc) as f64;
+            if indexed {
+                *slot = if decode.len() >= 2 {
+                    decode[0] + raw / max_val.max(1.0) * (decode[1] - decode[0])
+                } else {
+                    raw
+                };
+            } else {
+                let v = raw / max_val.max(1.0);
+                *slot = if decode.len() >= 2 * (c + 1) {
+                    decode[2 * c] + v * (decode[2 * c + 1] - decode[2 * c])
+                } else {
+                    v
+                };
+            }
+        }
+        cs.to_rgb(&comps[..n], self)
     }
 
     /// The first filter name of a stream dict (`/Filter` may be a name or array).
@@ -9324,6 +9642,20 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
             &self.seen,
         )
     }
+
+    fn resolve_color(&self, name: &[u8], comps: &[f64]) -> Option<[u8; 3]> {
+        // The `cs` operand is either a device-space name (resolved directly) or a
+        // name keyed in this resources scope's `/ColorSpace` sub-dictionary.
+        let cs = match name {
+            b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern" | b"G" | b"RGB"
+            | b"CMYK" => self.doc.resolve_color_space(&Object::Name(name.to_vec()), 0)?,
+            _ => {
+                let (_, obj) = self.doc.resource_entry(&self.resources, b"ColorSpace", name)?;
+                self.doc.resolve_color_space(obj, 0)?
+            }
+        };
+        Some(cs.to_rgb(comps, self.doc))
+    }
 }
 
 /// Read a two-element numeric array entry (`key`) from `dict`, resolving each
@@ -9360,6 +9692,342 @@ fn read_sample(data: &[u8], idx: u64, bits: u32) -> u32 {
         value = (value << 1) | b as u32;
     }
     value
+}
+
+/// Read `bits` MSB-first starting at absolute bit offset `start_bit`. Unlike
+/// [`read_sample`] (which assumes a contiguous, unpadded sample stream), this
+/// addresses by bit position so a caller can skip per-scanline byte padding.
+/// Out-of-range reads yield `0`; `bits` is clamped to `1..=31`.
+fn read_bits(data: &[u8], start_bit: u64, bits: u32) -> u32 {
+    let bits = bits.clamp(1, 31);
+    let mut value: u32 = 0;
+    for k in 0..bits as u64 {
+        let bit_pos = start_bit + k;
+        let byte = (bit_pos / 8) as usize;
+        let bit = 7 - (bit_pos % 8) as u32;
+        let b = data.get(byte).map(|&x| (x >> bit) & 1).unwrap_or(0);
+        value = (value << 1) | b as u32;
+    }
+    value
+}
+
+/// A lexical token of a type-4 (PostScript calculator) function program.
+#[derive(Debug, Clone)]
+enum PsTok {
+    Num(f64),
+    Op(Vec<u8>),
+    LBrace,
+    RBrace,
+}
+
+/// A parsed type-4 program: a flat sequence of items, where a `Block` is a
+/// `{ ... }` group (the operand of `if`/`ifelse`).
+#[derive(Debug, Clone)]
+enum PsItem {
+    Num(f64),
+    Op(Vec<u8>),
+    Block(Vec<PsItem>),
+}
+
+/// Tokenise a type-4 function body (whitespace-separated numbers, operator
+/// names, and `{`/`}` braces). Comments (`%`…EOL) are skipped.
+fn ps_tokenize(src: &[u8]) -> Vec<PsTok> {
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < src.len() {
+        let c = src[i];
+        match c {
+            b'{' => {
+                toks.push(PsTok::LBrace);
+                i += 1;
+            }
+            b'}' => {
+                toks.push(PsTok::RBrace);
+                i += 1;
+            }
+            b'%' => {
+                while i < src.len() && src[i] != b'\n' && src[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            _ if c.is_ascii_whitespace() => i += 1,
+            _ => {
+                let start = i;
+                while i < src.len()
+                    && !src[i].is_ascii_whitespace()
+                    && src[i] != b'{'
+                    && src[i] != b'}'
+                    && src[i] != b'%'
+                {
+                    i += 1;
+                }
+                let word = &src[start..i];
+                if let Ok(s) = std::str::from_utf8(word) {
+                    if let Ok(n) = s.parse::<f64>() {
+                        toks.push(PsTok::Num(n));
+                        continue;
+                    }
+                }
+                toks.push(PsTok::Op(word.to_vec()));
+            }
+        }
+    }
+    toks
+}
+
+/// Parse a `{ ... }`-delimited program body starting at `*pos` (just past the
+/// opening brace consumed by the caller). The outermost program is wrapped in
+/// one pair of braces per the spec.
+fn ps_parse(toks: &[PsTok], pos: &mut usize) -> Option<Vec<PsItem>> {
+    // Expect the leading `{`.
+    if !matches!(toks.get(*pos), Some(PsTok::LBrace)) {
+        return None;
+    }
+    *pos += 1;
+    ps_parse_block(toks, pos)
+}
+
+/// Parse items until the matching `}` (which is consumed).
+fn ps_parse_block(toks: &[PsTok], pos: &mut usize) -> Option<Vec<PsItem>> {
+    let mut items = Vec::new();
+    while let Some(tok) = toks.get(*pos) {
+        match tok {
+            PsTok::RBrace => {
+                *pos += 1;
+                return Some(items);
+            }
+            PsTok::LBrace => {
+                *pos += 1;
+                items.push(PsItem::Block(ps_parse_block(toks, pos)?));
+            }
+            PsTok::Num(n) => {
+                items.push(PsItem::Num(*n));
+                *pos += 1;
+            }
+            PsTok::Op(o) => {
+                items.push(PsItem::Op(o.clone()));
+                *pos += 1;
+            }
+        }
+    }
+    None // unterminated block
+}
+
+/// Execute a type-4 calculator program against `stack`. `None` on a malformed
+/// program (stack underflow, unknown operator) so the caller can fall back. The
+/// recursion (`if`/`ifelse`) is bounded by the program's nesting depth.
+fn ps_exec(prog: &[PsItem], stack: &mut Vec<f64>) -> Option<()> {
+    let mut blocks: Vec<&Vec<PsItem>> = Vec::new();
+    for item in prog {
+        match item {
+            PsItem::Num(n) => stack.push(*n),
+            PsItem::Block(b) => blocks.push(b),
+            PsItem::Op(op) => {
+                if op.as_slice() == b"if" {
+                    let proc = blocks.pop()?;
+                    let cond = stack.pop()?;
+                    if cond != 0.0 {
+                        ps_exec(proc, stack)?;
+                    }
+                } else if op.as_slice() == b"ifelse" {
+                    let proc2 = blocks.pop()?;
+                    let proc1 = blocks.pop()?;
+                    let cond = stack.pop()?;
+                    if cond != 0.0 {
+                        ps_exec(proc1, stack)?;
+                    } else {
+                        ps_exec(proc2, stack)?;
+                    }
+                } else {
+                    ps_apply(op, stack)?;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// Apply a single (non-control-flow) type-4 operator to `stack`.
+fn ps_apply(op: &[u8], stack: &mut Vec<f64>) -> Option<()> {
+    let pop = |s: &mut Vec<f64>| s.pop();
+    match op {
+        // Arithmetic.
+        b"add" => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            stack.push(a + b);
+        }
+        b"sub" => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            stack.push(a - b);
+        }
+        b"mul" => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            stack.push(a * b);
+        }
+        b"div" => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            stack.push(if b == 0.0 { 0.0 } else { a / b });
+        }
+        b"idiv" => {
+            let b = pop(stack)? as i64;
+            let a = pop(stack)? as i64;
+            stack.push(if b == 0 { 0.0 } else { (a / b) as f64 });
+        }
+        b"mod" => {
+            let b = pop(stack)? as i64;
+            let a = pop(stack)? as i64;
+            stack.push(if b == 0 { 0.0 } else { (a % b) as f64 });
+        }
+        b"neg" => {
+            let a = pop(stack)?;
+            stack.push(-a);
+        }
+        b"abs" => {
+            let a = pop(stack)?;
+            stack.push(a.abs());
+        }
+        b"sqrt" => {
+            let a = pop(stack)?;
+            stack.push(a.max(0.0).sqrt());
+        }
+        b"sin" => {
+            let a = pop(stack)?;
+            stack.push((a * std::f64::consts::PI / 180.0).sin());
+        }
+        b"cos" => {
+            let a = pop(stack)?;
+            stack.push((a * std::f64::consts::PI / 180.0).cos());
+        }
+        b"atan" => {
+            let den = pop(stack)?;
+            let num = pop(stack)?;
+            let mut d = num.atan2(den) * 180.0 / std::f64::consts::PI;
+            if d < 0.0 {
+                d += 360.0;
+            }
+            stack.push(d);
+        }
+        b"exp" => {
+            let e = pop(stack)?;
+            let base = pop(stack)?;
+            stack.push(base.powf(e));
+        }
+        b"ln" => {
+            let a = pop(stack)?;
+            stack.push(if a > 0.0 { a.ln() } else { 0.0 });
+        }
+        b"log" => {
+            let a = pop(stack)?;
+            stack.push(if a > 0.0 { a.log10() } else { 0.0 });
+        }
+        b"cvi" | b"truncate" => {
+            let a = pop(stack)?;
+            stack.push(a.trunc());
+        }
+        b"cvr" => { /* already real */ }
+        b"floor" => {
+            let a = pop(stack)?;
+            stack.push(a.floor());
+        }
+        b"ceiling" => {
+            let a = pop(stack)?;
+            stack.push(a.ceil());
+        }
+        b"round" => {
+            let a = pop(stack)?;
+            stack.push(a.round());
+        }
+        // Comparison / boolean (booleans are 1.0 / 0.0).
+        b"eq" => bool_op(stack, |a, b| a == b)?,
+        b"ne" => bool_op(stack, |a, b| a != b)?,
+        b"gt" => bool_op(stack, |a, b| a > b)?,
+        b"ge" => bool_op(stack, |a, b| a >= b)?,
+        b"lt" => bool_op(stack, |a, b| a < b)?,
+        b"le" => bool_op(stack, |a, b| a <= b)?,
+        b"and" => {
+            let b = pop(stack)? as i64;
+            let a = pop(stack)? as i64;
+            stack.push((a & b) as f64);
+        }
+        b"or" => {
+            let b = pop(stack)? as i64;
+            let a = pop(stack)? as i64;
+            stack.push((a | b) as f64);
+        }
+        b"not" => {
+            let a = pop(stack)?;
+            stack.push(if a == 0.0 { 1.0 } else { 0.0 });
+        }
+        b"true" => stack.push(1.0),
+        b"false" => stack.push(0.0),
+        // Stack manipulation.
+        b"pop" => {
+            pop(stack)?;
+        }
+        b"exch" => {
+            let b = pop(stack)?;
+            let a = pop(stack)?;
+            stack.push(b);
+            stack.push(a);
+        }
+        b"dup" => {
+            let a = *stack.last()?;
+            stack.push(a);
+        }
+        b"copy" => {
+            let n = pop(stack)? as usize;
+            if n > stack.len() {
+                return None;
+            }
+            let start = stack.len() - n;
+            for i in 0..n {
+                stack.push(stack[start + i]);
+            }
+        }
+        b"index" => {
+            let n = pop(stack)? as usize;
+            if n >= stack.len() {
+                return None;
+            }
+            stack.push(stack[stack.len() - 1 - n]);
+        }
+        b"roll" => {
+            let j = pop(stack)? as i64;
+            let n = pop(stack)? as usize;
+            if n == 0 || n > stack.len() {
+                if n == 0 {
+                    return Some(());
+                }
+                return None;
+            }
+            let len = stack.len();
+            let slice = &mut stack[len - n..];
+            let jm = ((j % n as i64) + n as i64) % n as i64;
+            slice.rotate_right(jm as usize);
+        }
+        _ => return None, // unknown operator
+    }
+    Some(())
+}
+
+/// Apply a comparison, pushing `1.0`/`0.0`.
+fn bool_op(stack: &mut Vec<f64>, f: impl Fn(f64, f64) -> bool) -> Option<()> {
+    let b = stack.pop()?;
+    let a = stack.pop()?;
+    stack.push(if f(a, b) { 1.0 } else { 0.0 });
+    Some(())
+}
+
+/// Bridge so [`ColorSpace`](crate::raster::colorspace::ColorSpace) can evaluate
+/// Separation/DeviceN tint transforms via the document's function evaluator.
+impl crate::raster::colorspace::TintEval for Document {
+    fn eval(&self, func: &Object, inputs: &[f64]) -> Vec<f64> {
+        self.eval_function_multi(func, inputs)
+    }
 }
 
 /// Decrypt every object's strings and stream bytes in place when the trailer
@@ -12751,6 +13419,226 @@ mod tests {
         );
         // Outside the filled path stays white paper.
         assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the pattern-filled path is white");
+    }
+
+    // ─── colour spaces (#67) + non-RGB images (#73) ──────────────────────────
+
+    #[test]
+    fn separation_fill_resolves_through_tint_to_rgb() {
+        // A `/Separation` colorant whose type-2 tint maps tint→CMYK black
+        // (`C0 = no ink`, `C1 = k:1`). Filling at full tint (1.0) must paint
+        // black, proving the named CS is resolved and the tint transform run.
+        let resources = "/ColorSpace << /Sep [ /Separation /MyInk /DeviceCMYK \
+             << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 0 0 1] /N 1 >> ] >>";
+        let page = "/Sep cs 1 scn 20 20 60 60 re f";
+        let canvas = render_canvas(page, resources, &[]);
+        let c = px(&canvas, 50, 50);
+        assert!(
+            c[0] < 40 && c[1] < 40 && c[2] < 40,
+            "full-tint Separation must paint black, got {c:?}"
+        );
+        // A half-tint (0.5) → CMYK k:0.5 → mid-grey (~128).
+        let page2 = "/Sep cs 0.5 scn 20 20 60 60 re f";
+        let canvas2 = render_canvas(page2, resources, &[]);
+        let g = px(&canvas2, 50, 50)[0];
+        assert!((100..=160).contains(&g), "half-tint must be ~mid-grey, got {g}");
+    }
+
+    #[test]
+    fn devicen_fill_resolves_through_postscript_tint() {
+        // A 2-colorant `/DeviceN` with a type-4 (PostScript calculator) tint that
+        // maps (c1, c2) → CMYK `[c1, c2, 0, 0]`. Inputs (1, 0) → cyan.
+        // Tint program: inputs (c1, c2) on the stack; push 0 0 to make the CMYK
+        // tuple [c1, c2, 0, 0]. (c1=1, c2=0) → cyan.
+        let resources = "/ColorSpace << /DN [ /DeviceN [/Ink1 /Ink2] /DeviceCMYK 7 0 R ] >>";
+        let prog = "{ 0 0 }";
+        let func = format!(
+            "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1 0 1] \
+             /Length {} >>\nstream\n{prog}\nendstream",
+            prog.len()
+        );
+        let page = "/DN cs 1 0 scn 20 20 60 60 re f";
+        let canvas = render_canvas(page, resources, &[(7, func)]);
+        let c = px(&canvas, 50, 50);
+        // CMYK (1,0,0,0) = cyan → RGB (0, 255, 255).
+        assert!(
+            c[0] < 40 && c[1] > 200 && c[2] > 200,
+            "DeviceN (1,0) via PostScript tint must be cyan, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn indexed_colorspace_fill_maps_to_palette() {
+        // `/Indexed` over DeviceRGB, 2-entry palette held as a hex string: idx 0
+        // = red (FF0000), idx 1 = green (00FF00). Filling index 1 paints green.
+        let resources = "/ColorSpace << /Idx [ /Indexed /DeviceRGB 1 <FF000000FF00> ] >>";
+        let page = "/Idx cs 1 scn 20 20 60 60 re f";
+        let canvas = render_canvas(page, resources, &[]);
+        let c = px(&canvas, 50, 50);
+        assert!(
+            c[1] > 200 && c[0] < 40 && c[2] < 40,
+            "Indexed index 1 must paint green, got {c:?}"
+        );
+        // Index 0 → red.
+        let page0 = "/Idx cs 0 scn 20 20 60 60 re f";
+        let c0 = px(&render_canvas(page0, resources, &[]), 50, 50);
+        assert!(c0[0] > 200 && c0[1] < 40, "Indexed index 0 must be red, got {c0:?}");
+    }
+
+    #[test]
+    fn iccbased_n3_fill_behaves_like_rgb() {
+        // `/ICCBased` with `/N 3` and no `/Alternate` acts like DeviceRGB. The CS
+        // is named `/CSr` in resources; `cs` selects it, `scn` sets (0,0,1)=blue.
+        let resources = "/ColorSpace << /CSr [ /ICCBased 7 0 R ] >>";
+        let icc = "<< /N 3 /Length 0 >>\nstream\n\nendstream";
+        let page = "/CSr cs 0 0 1 scn 20 20 60 60 re f";
+        let canvas = render_canvas(page, resources, &[(7, icc.to_string())]);
+        let c = px(&canvas, 50, 50);
+        assert!(c[2] > 200 && c[0] < 40 && c[1] < 40, "ICCBased N3 (0,0,1) must be blue, got {c:?}");
+    }
+
+    /// Build a single-image PDF whose `/Im0` is drawn over a 60×60 box and render
+    /// it, returning the page canvas. `image_body` is the full image XObject body
+    /// (dict + stream).
+    fn render_image_canvas(image_body: Vec<u8>) -> crate::raster::Canvas {
+        let draw = b"q 60 0 0 60 20 20 cm /Im0 Do Q".to_vec();
+        let mut content = format!("<< /Length {} >>\nstream\n", draw.len()).into_bytes();
+        content.extend_from_slice(&draw);
+        content.extend_from_slice(b"\nendstream");
+        let objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                  /Resources << /XObject << /Im0 6 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, content),
+            (6, image_body),
+        ];
+        let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        doc.render_page_canvas(1, 1.0).unwrap()
+    }
+
+    #[test]
+    fn indexed_image_decodes_to_palette_colors() {
+        // A 16×16 Indexed image (bpc 8): left half index 0 (red), right index 1
+        // (blue), over a DeviceRGB base palette. Before the fix non-RGB image
+        // colour spaces were skipped, leaving a blank box.
+        let (w, h) = (16usize, 16usize);
+        let mut samples = Vec::with_capacity(w * h);
+        for _y in 0..h {
+            for x in 0..w {
+                samples.push(if x < w / 2 { 0u8 } else { 1u8 });
+            }
+        }
+        // Palette: entry 0 = red (FF0000), entry 1 = blue (0000FF).
+        let palette = [0xFFu8, 0x00, 0x00, 0x00, 0x00, 0xFF];
+        let mut body = format!(
+            "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} \
+             /ColorSpace [ /Indexed /DeviceRGB 1 < "
+        )
+        .into_bytes();
+        for b in palette {
+            body.extend_from_slice(format!("{b:02X} ").as_bytes());
+        }
+        body.extend_from_slice(
+            format!("> ] /BitsPerComponent 8 /Length {} >>\nstream\n", samples.len()).as_bytes(),
+        );
+        body.extend_from_slice(&samples);
+        body.extend_from_slice(b"\nendstream");
+        let canvas = render_image_canvas(body);
+        // Device box spans x,y 20..80; left third red, right third blue.
+        let left = px(&canvas, 30, 50);
+        let right = px(&canvas, 70, 50);
+        assert!(left[0] > 200 && left[2] < 60, "Indexed image left half must be red, got {left:?}");
+        assert!(right[2] > 200 && right[0] < 60, "Indexed image right half must be blue, got {right:?}");
+    }
+
+    #[test]
+    fn device_cmyk_raw_image_converts() {
+        // A 16×16 DeviceCMYK raw image: left half cyan (1,0,0,0)→RGB(0,255,255),
+        // right half magenta (0,1,0,0)→RGB(255,0,255). 4 bytes per pixel.
+        let (w, h) = (16usize, 16usize);
+        let mut samples = Vec::with_capacity(w * h * 4);
+        for _y in 0..h {
+            for x in 0..w {
+                if x < w / 2 {
+                    samples.extend_from_slice(&[255, 0, 0, 0]); // cyan
+                } else {
+                    samples.extend_from_slice(&[0, 255, 0, 0]); // magenta
+                }
+            }
+        }
+        let mut body = format!(
+            "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} \
+             /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Length {} >>\nstream\n",
+            samples.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(&samples);
+        body.extend_from_slice(b"\nendstream");
+        let canvas = render_image_canvas(body);
+        let left = px(&canvas, 30, 50);
+        let right = px(&canvas, 70, 50);
+        assert!(
+            left[0] < 60 && left[1] > 200 && left[2] > 200,
+            "DeviceCMYK left half (cyan) must be (0,255,255)-ish, got {left:?}"
+        );
+        assert!(
+            right[0] > 200 && right[1] < 60 && right[2] > 200,
+            "DeviceCMYK right half (magenta) must be (255,0,255)-ish, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn iccbased_n3_raw_image_behaves_like_rgb() {
+        // A 16×16 raw image whose colour space is `/ICCBased /N 3` — must decode
+        // exactly like DeviceRGB. Left green, right red.
+        let (w, h) = (16usize, 16usize);
+        let mut samples = Vec::with_capacity(w * h * 3);
+        for _y in 0..h {
+            for x in 0..w {
+                if x < w / 2 {
+                    samples.extend_from_slice(&[0, 255, 0]); // green
+                } else {
+                    samples.extend_from_slice(&[255, 0, 0]); // red
+                }
+            }
+        }
+        // ICC profile stream object 7 (its bytes are ignored; only /N matters).
+        let mut body = format!(
+            "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} \
+             /ColorSpace [ /ICCBased 7 0 R ] /BitsPerComponent 8 /Length {} >>\nstream\n",
+            samples.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(&samples);
+        body.extend_from_slice(b"\nendstream");
+        let draw = b"q 60 0 0 60 20 20 cm /Im0 Do Q".to_vec();
+        let mut content = format!("<< /Length {} >>\nstream\n", draw.len()).into_bytes();
+        content.extend_from_slice(&draw);
+        content.extend_from_slice(b"\nendstream");
+        let objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                  /Resources << /XObject << /Im0 6 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, content),
+            (6, body),
+            (7, b"<< /N 3 /Length 0 >>\nstream\n\nendstream".to_vec()),
+        ];
+        let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        let canvas = doc.render_page_canvas(1, 1.0).unwrap();
+        let left = px(&canvas, 30, 50);
+        let right = px(&canvas, 70, 50);
+        assert!(left[1] > 200 && left[0] < 60, "ICCBased N3 image left must be green, got {left:?}");
+        assert!(right[0] > 200 && right[1] < 60, "ICCBased N3 image right must be red, got {right:?}");
     }
 
     // ─── margins + running header/footer ─────────────────────────────────────

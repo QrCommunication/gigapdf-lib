@@ -1,12 +1,16 @@
-//! Baseline (sequential) JPEG encoder + decoder — pure std, zero dependency.
+//! JPEG encoder (baseline) + decoder (baseline **and progressive**) — pure std,
+//! zero dependency.
 //!
-//! Full-resolution 4:4:4 (no chroma subsampling) so the encode/decode pair is
-//! exact and simple. Uses the ISO/IEC 10918-1 Annex K example quantization and
-//! Huffman tables. Orthonormal float DCT-II / DCT-III (forward/inverse are an
-//! exact pair). Enough for re-encoding rendered previews/thumbnails to JPEG and
-//! decoding ordinary baseline JPEGs back to RGBA — the native replacement for a
-//! third-party image library's JPEG path. Progressive / arithmetic / restart
-//! JPEGs are not produced; decoding tolerates restart markers.
+//! The **encoder** emits full-resolution 4:4:4 baseline JPEGs (no chroma
+//! subsampling) using the ISO/IEC 10918-1 Annex K example quantization and
+//! Huffman tables — enough to re-encode rendered previews/thumbnails. The
+//! **decoder** handles both baseline (SOF0) and progressive (SOF2) streams,
+//! including successive-approximation refinement, EOB runs, chroma subsampling
+//! (nearest-neighbour upsample), and restart markers — the native replacement
+//! for a third-party image library's JPEG path. Arithmetic-coded JPEGs
+//! (SOF9/10/11) are unsupported and decode to `None` (the caller skips the
+//! image rather than blanking the page). Orthonormal float DCT-II / DCT-III
+//! (forward/inverse are an exact pair).
 
 use std::collections::HashMap;
 use std::f32::consts::PI;
@@ -456,9 +460,9 @@ struct Component {
     pred: i32,
 }
 
-/// Decode a baseline JPEG into `(width, height, rgba)`. Returns `None` on an
-/// unsupported (progressive/arithmetic) or malformed stream. Chroma components
-/// are upsampled by nearest-neighbour to the luma grid.
+/// Decode a baseline **or progressive** JPEG into `(width, height, rgba)`.
+/// Returns `None` on an unsupported (arithmetic-coded) or malformed stream.
+/// Chroma components are upsampled by nearest-neighbour to the luma grid.
 #[allow(clippy::type_complexity)]
 pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
@@ -471,6 +475,9 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut width = 0u32;
     let mut height = 0u32;
     let mut comps: Vec<Component> = Vec::new();
+    let mut restart_interval = 0usize;
+    // Progressive (SOF2) decode state, allocated when SOF2 is seen.
+    let mut progressive: Option<Progressive> = None;
 
     while pos + 4 <= data.len() {
         if data[pos] != 0xFF {
@@ -481,8 +488,8 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         pos += 2;
         match marker {
             0xD8 | 0xD9 => continue,
-            0xC0 => {
-                // Baseline SOF0.
+            0xC0 | 0xC2 => {
+                // SOF0 (baseline) or SOF2 (progressive) — identical layout.
                 let l = be16(data, pos) as usize;
                 height = be16(data, pos + 3) as u32;
                 width = be16(data, pos + 5) as u32;
@@ -499,9 +506,13 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                         pred: 0,
                     });
                 }
+                if marker == 0xC2 {
+                    // A malformed progressive header aborts the decode.
+                    progressive = Some(Progressive::new(width, height, &comps)?);
+                }
                 pos += l;
             }
-            0xC2 | 0xC1 | 0xC3 | 0xC9 | 0xCA | 0xCB => return None, // not baseline
+            0xC1 | 0xC3 | 0xC9 | 0xCA | 0xCB => return None, // extended/lossless/arithmetic
             0xC4 => {
                 let l = be16(data, pos) as usize;
                 let end = pos + l;
@@ -550,19 +561,53 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                 }
                 pos = end;
             }
+            0xDD => {
+                // DRI — restart interval (in MCUs).
+                let l = be16(data, pos) as usize;
+                restart_interval = be16(data, pos + 2) as usize;
+                pos += l;
+            }
             0xDA => {
                 let l = be16(data, pos) as usize;
                 let ns = data[pos + 2] as usize;
+                // Scan component selectors + table assignments.
+                let mut scan_comps: Vec<usize> = Vec::with_capacity(ns);
                 for i in 0..ns {
                     let o = pos + 3 + i * 2;
                     let cid = data[o];
                     let td_ta = data[o + 1];
-                    if let Some(c) = comps.iter_mut().find(|c| c.id == cid) {
-                        c.dc_tab = (td_ta >> 4) as usize;
-                        c.ac_tab = (td_ta & 0x0F) as usize;
+                    if let Some(ci) = comps.iter().position(|c| c.id == cid) {
+                        comps[ci].dc_tab = (td_ta >> 4) as usize;
+                        comps[ci].ac_tab = (td_ta & 0x0F) as usize;
+                        scan_comps.push(ci);
                     }
                 }
+                // Spectral selection + successive approximation (after the
+                // component list): Ss, Se, Ah<<4 | Al.
+                let sp = pos + 3 + ns * 2;
+                let ss = *data.get(sp).unwrap_or(&0);
+                let se = *data.get(sp + 1).unwrap_or(&63);
+                let ah_al = *data.get(sp + 2).unwrap_or(&0);
                 pos += l;
+                if let Some(prog) = progressive.as_mut() {
+                    // Progressive: decode this scan into the coefficient store,
+                    // then continue to the next marker.
+                    pos = prog.decode_scan(
+                        data,
+                        pos,
+                        &comps,
+                        &dc_tabs,
+                        &ac_tabs,
+                        &scan_comps,
+                        ss,
+                        se,
+                        ah_al >> 4,
+                        ah_al & 0x0F,
+                        restart_interval,
+                    )?;
+                    continue;
+                }
+                // Baseline: a single interleaved scan decodes the whole image.
                 return decode_scan(data, pos, width, height, &mut comps, &quant, &dc_tabs, &ac_tabs);
             }
             0xD0..=0xD7 => continue, // standalone restart (shouldn't appear here)
@@ -571,6 +616,10 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                 pos += l;
             }
         }
+    }
+    // Progressive streams finalize after all scans (no early return at SOS).
+    if let Some(prog) = progressive {
+        return Some(prog.finish(&comps, &quant));
     }
     None
 }
@@ -704,6 +753,501 @@ fn decode_block(
     Some(())
 }
 
+// ── Progressive (SOF2) decoding (ISO/IEC 10918-1 Annex G) ─────────────────────
+//
+// A progressive JPEG ships its coefficients across several scans, each refining
+// a spectral band (DC, or a run of AC coefficients) by adding bits. We keep one
+// quantized-coefficient array per component (in zig-zag order), decode every
+// scan into it, then dequantize + IDCT once at the end. Successive-approximation
+// (bit-plane) refinement is supported. Restart markers are honoured.
+
+/// A bit reader over the whole stream that reports its byte position, aligns at
+/// restart markers, and treats a real (non-stuffed, non-restart) marker as the
+/// end of the entropy-coded segment (returning 0 bits thereafter).
+struct ProgReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    acc: u32,
+    nbits: u32,
+    /// Set once a terminating marker is reached; further reads yield 0.
+    at_marker: bool,
+}
+
+impl<'a> ProgReader<'a> {
+    fn new(data: &'a [u8], pos: usize) -> ProgReader<'a> {
+        ProgReader {
+            data,
+            pos,
+            acc: 0,
+            nbits: 0,
+            at_marker: false,
+        }
+    }
+
+    fn bit(&mut self) -> u32 {
+        if self.nbits == 0 {
+            if self.at_marker {
+                return 0;
+            }
+            let byte = *self.data.get(self.pos).unwrap_or(&0xFF);
+            if byte == 0xFF {
+                match self.data.get(self.pos + 1) {
+                    Some(0x00) => self.pos += 2, // stuffed byte
+                    _ => {
+                        // A real marker terminates the entropy segment.
+                        self.at_marker = true;
+                        return 0;
+                    }
+                }
+            } else {
+                self.pos += 1;
+            }
+            self.acc = byte as u32;
+            self.nbits = 8;
+        }
+        self.nbits -= 1;
+        (self.acc >> self.nbits) & 1
+    }
+
+    fn receive(&mut self, n: u8) -> i32 {
+        let mut v = 0i32;
+        for _ in 0..n {
+            v = (v << 1) | self.bit() as i32;
+        }
+        v
+    }
+
+    fn receive_extend(&mut self, cat: u8) -> i32 {
+        if cat == 0 {
+            return 0;
+        }
+        let v = self.receive(cat);
+        if v < (1 << (cat - 1)) {
+            v - (1 << cat) + 1
+        } else {
+            v
+        }
+    }
+
+    fn decode_huff(&mut self, table: &HashMap<(u8, u16), u8>) -> Option<u8> {
+        let mut code: u16 = 0;
+        for len in 1..=16u8 {
+            code = (code << 1) | self.bit() as u16;
+            if let Some(&v) = table.get(&(len, code)) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Discard buffered bits and skip a following restart marker (`FF Dn`),
+    /// re-syncing for the next restart interval.
+    fn restart(&mut self) {
+        self.nbits = 0;
+        self.acc = 0;
+        self.at_marker = false;
+        // Skip any pad up to the marker, then the two marker bytes.
+        while self.pos + 1 < self.data.len() {
+            if self.data[self.pos] == 0xFF {
+                let m = self.data[self.pos + 1];
+                if (0xD0..=0xD7).contains(&m) {
+                    self.pos += 2;
+                    return;
+                }
+                if m == 0x00 {
+                    self.pos += 2; // stuffed, keep scanning
+                    continue;
+                }
+                return; // some other marker — leave it for the caller
+            }
+            self.pos += 1;
+        }
+    }
+
+    /// Advance `pos` to the next marker so the caller's marker loop resumes
+    /// correctly after the entropy-coded segment (skips stuffed `FF00` and
+    /// restart markers).
+    fn seek_next_marker(&mut self) -> usize {
+        // Flush partial byte first.
+        self.nbits = 0;
+        while self.pos + 1 < self.data.len() {
+            if self.data[self.pos] == 0xFF {
+                let m = self.data[self.pos + 1];
+                if m == 0x00 || (0xD0..=0xD7).contains(&m) {
+                    self.pos += 2; // stuffed byte or restart — part of the scan
+                    continue;
+                }
+                return self.pos; // a genuine marker
+            }
+            self.pos += 1;
+        }
+        self.pos
+    }
+}
+
+/// One component's progressive coefficient grid.
+struct ProgComp {
+    /// Horizontal/vertical sampling factors.
+    h: usize,
+    v: usize,
+    /// Blocks across / down for this component (its own grid).
+    bx: usize,
+    by: usize,
+    quant: usize,
+    /// `bx * by` blocks, each 64 quantized coefficients in **zig-zag** order.
+    coeffs: Vec<[i32; 64]>,
+}
+
+/// Whole-image progressive decode state.
+struct Progressive {
+    width: usize,
+    height: usize,
+    hmax: usize,
+    vmax: usize,
+    /// MCUs across / down (interleaved DC scans iterate this grid).
+    mcus_x: usize,
+    mcus_y: usize,
+    comps: Vec<ProgComp>,
+    /// Carried EOB run between AC blocks within a scan.
+    eobrun: u32,
+}
+
+impl Progressive {
+    fn new(width: u32, height: u32, comps: &[Component]) -> Option<Progressive> {
+        if width == 0 || height == 0 || comps.is_empty() {
+            return None;
+        }
+        let (w, h) = (width as usize, height as usize);
+        let hmax = comps.iter().map(|c| c.h.max(1) as usize).max()?;
+        let vmax = comps.iter().map(|c| c.v.max(1) as usize).max()?;
+        let mcus_x = w.div_ceil(8 * hmax);
+        let mcus_y = h.div_ceil(8 * vmax);
+        let mut pcomps = Vec::with_capacity(comps.len());
+        for c in comps {
+            let ch = c.h.max(1) as usize;
+            let cv = c.v.max(1) as usize;
+            // Each component's block grid covers all MCUs at its sampling.
+            let bx = mcus_x * ch;
+            let by = mcus_y * cv;
+            // Guard against absurd allocations from a corrupt header.
+            let blocks = bx.checked_mul(by)?;
+            if blocks > 64 * 1024 * 1024 {
+                return None;
+            }
+            pcomps.push(ProgComp {
+                h: ch,
+                v: cv,
+                bx,
+                by,
+                quant: c.quant,
+                coeffs: vec![[0i32; 64]; blocks],
+            });
+        }
+        Some(Progressive {
+            width: w,
+            height: h,
+            hmax,
+            vmax,
+            mcus_x,
+            mcus_y,
+            comps: pcomps,
+            eobrun: 0,
+        })
+    }
+
+    /// Decode one scan of entropy-coded data starting at `start`, mutating the
+    /// coefficient store. Returns the byte position of the next marker.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_scan(
+        &mut self,
+        data: &[u8],
+        start: usize,
+        comps: &[Component],
+        dc_tabs: &[HashMap<(u8, u16), u8>],
+        ac_tabs: &[HashMap<(u8, u16), u8>],
+        scan_comps: &[usize],
+        ss: u8,
+        se: u8,
+        ah: u8,
+        al: u8,
+        restart_interval: usize,
+    ) -> Option<usize> {
+        if scan_comps.is_empty() {
+            return Some(start);
+        }
+        let mut rd = ProgReader::new(data, start);
+        self.eobrun = 0;
+        // Per-component DC predictors for this scan.
+        let mut preds = vec![0i32; self.comps.len()];
+
+        if ss == 0 {
+            // DC scan — may be interleaved over several components (MCU order).
+            // Build the per-MCU block list once.
+            let interleaved = scan_comps.len() > 1;
+            let units = if interleaved {
+                self.mcus_x * self.mcus_y
+            } else {
+                let ci = scan_comps[0];
+                self.comps[ci].bx * self.comps[ci].by
+            };
+            let mut since_restart = 0usize;
+            for unit in 0..units {
+                if restart_interval > 0 && unit > 0 && since_restart == restart_interval {
+                    rd.restart();
+                    preds.iter_mut().for_each(|p| *p = 0);
+                    since_restart = 0;
+                }
+                since_restart += 1;
+                if interleaved {
+                    let (mx, my) = (unit % self.mcus_x, unit / self.mcus_x);
+                    for &ci in scan_comps {
+                        let (ch, cv) = (self.comps[ci].h, self.comps[ci].v);
+                        let bxw = self.comps[ci].bx;
+                        for by in 0..cv {
+                            for bx in 0..ch {
+                                let col = mx * ch + bx;
+                                let row = my * cv + by;
+                                let bi = row * bxw + col;
+                                self.dc_block(&mut rd, comps, dc_tabs, ci, bi, ah, al, &mut preds)?;
+                            }
+                        }
+                    }
+                } else {
+                    let ci = scan_comps[0];
+                    self.dc_block(&mut rd, comps, dc_tabs, ci, unit, ah, al, &mut preds)?;
+                }
+            }
+        } else {
+            // AC scan — exactly one component, over its own block grid.
+            let ci = scan_comps[0];
+            let units = self.comps[ci].bx * self.comps[ci].by;
+            let mut since_restart = 0usize;
+            for unit in 0..units {
+                if restart_interval > 0 && unit > 0 && since_restart == restart_interval {
+                    rd.restart();
+                    self.eobrun = 0;
+                    since_restart = 0;
+                }
+                since_restart += 1;
+                if ah == 0 {
+                    self.ac_first(&mut rd, comps, ac_tabs, ci, unit, ss, se, al)?;
+                } else {
+                    self.ac_refine(&mut rd, comps, ac_tabs, ci, unit, ss, se, al)?;
+                }
+            }
+        }
+        Some(rd.seek_next_marker())
+    }
+
+    /// Decode/refine the DC coefficient of one block.
+    #[allow(clippy::too_many_arguments)]
+    fn dc_block(
+        &mut self,
+        rd: &mut ProgReader,
+        comps: &[Component],
+        dc_tabs: &[HashMap<(u8, u16), u8>],
+        ci: usize,
+        bi: usize,
+        ah: u8,
+        al: u8,
+        preds: &mut [i32],
+    ) -> Option<()> {
+        if ah == 0 {
+            let t = rd.decode_huff(&dc_tabs[comps[ci].dc_tab.min(3)])?;
+            let diff = rd.receive_extend(t);
+            preds[ci] += diff;
+            self.comps[ci].coeffs[bi][0] = preds[ci] << al;
+        } else {
+            // Refinement: append one low-order bit.
+            if rd.bit() == 1 {
+                self.comps[ci].coeffs[bi][0] |= 1 << al;
+            }
+        }
+        Some(())
+    }
+
+    /// First AC scan for a band `[ss, se]` of one block (Ah == 0).
+    #[allow(clippy::too_many_arguments)]
+    fn ac_first(
+        &mut self,
+        rd: &mut ProgReader,
+        comps: &[Component],
+        ac_tabs: &[HashMap<(u8, u16), u8>],
+        ci: usize,
+        bi: usize,
+        ss: u8,
+        se: u8,
+        al: u8,
+    ) -> Option<()> {
+        if self.eobrun > 0 {
+            self.eobrun -= 1;
+            return Some(());
+        }
+        let tab = &ac_tabs[comps[ci].ac_tab.min(3)];
+        let block = &mut self.comps[ci].coeffs[bi];
+        let mut k = ss as usize;
+        while k <= se as usize {
+            let rs = rd.decode_huff(tab)?;
+            let run = (rs >> 4) as usize;
+            let size = rs & 0x0F;
+            if size == 0 {
+                if run < 15 {
+                    // EOB run: 2^run + (run extra bits) − 1 more blocks are EOB.
+                    self.eobrun = (1 << run) - 1;
+                    if run > 0 {
+                        self.eobrun += rd.receive(run as u8) as u32;
+                    }
+                    break;
+                }
+                k += 16; // ZRL — 16 zeros
+                continue;
+            }
+            k += run;
+            if k > se as usize {
+                break;
+            }
+            let val = rd.receive_extend(size);
+            block[k] = val << al;
+            k += 1;
+        }
+        Some(())
+    }
+
+    /// AC refinement scan for a band `[ss, se]` of one block (Ah > 0). This is
+    /// the subtle bit-plane refinement of ISO 10918-1 §G.1.2.3.
+    #[allow(clippy::too_many_arguments)]
+    fn ac_refine(
+        &mut self,
+        rd: &mut ProgReader,
+        comps: &[Component],
+        ac_tabs: &[HashMap<(u8, u16), u8>],
+        ci: usize,
+        bi: usize,
+        ss: u8,
+        se: u8,
+        al: u8,
+    ) -> Option<()> {
+        let tab = &ac_tabs[comps[ci].ac_tab.min(3)];
+        let bit = 1i32 << al;
+        let block = &mut self.comps[ci].coeffs[bi];
+        let mut k = ss as usize;
+        if self.eobrun == 0 {
+            while k <= se as usize {
+                let rs = rd.decode_huff(tab)?;
+                let mut run = (rs >> 4) as i32;
+                let size = rs & 0x0F;
+                let mut newval = 0i32;
+                if size == 0 {
+                    if run < 15 {
+                        self.eobrun = (1 << run) - 1;
+                        if run > 0 {
+                            self.eobrun += rd.receive(run as u8) as u32;
+                        }
+                        break;
+                    }
+                    // run == 15: skip 16 zero-history coefficients (ZRL).
+                } else {
+                    // size must be 1 in a refinement scan; the bit gives the sign.
+                    newval = if rd.bit() == 1 { bit } else { -bit };
+                }
+                // Advance over `run` zero-history coefficients, refining any
+                // already-nonzero coefficients we pass.
+                while k <= se as usize {
+                    if block[k] != 0 {
+                        if rd.bit() == 1 && (block[k] & bit) == 0 {
+                            block[k] += if block[k] > 0 { bit } else { -bit };
+                        }
+                    } else {
+                        if run == 0 {
+                            break;
+                        }
+                        run -= 1;
+                    }
+                    k += 1;
+                }
+                if newval != 0 && k <= se as usize {
+                    block[k] = newval;
+                }
+                k += 1;
+            }
+        }
+        if self.eobrun > 0 {
+            // Refine all remaining nonzero coefficients in this block, then
+            // consume one unit of the EOB run.
+            while k <= se as usize {
+                if block[k] != 0 && rd.bit() == 1 && (block[k] & bit) == 0 {
+                    block[k] += if block[k] > 0 { bit } else { -bit };
+                }
+                k += 1;
+            }
+            self.eobrun -= 1;
+        }
+        Some(())
+    }
+
+    /// Dequantize, inverse-DCT, upsample chroma, and colour-convert into RGBA.
+    fn finish(&self, comps: &[Component], quant: &[[u16; 64]; 4]) -> (u32, u32, Vec<u8>) {
+        let (w, h) = (self.width, self.height);
+        let mut planes: Vec<Vec<f32>> = self.comps.iter().map(|_| vec![0f32; w * h]).collect();
+        for (ci, pc) in self.comps.iter().enumerate() {
+            let q = &quant[pc.quant.min(3)];
+            let sx = self.hmax / pc.h;
+            let sy = self.vmax / pc.v;
+            for byk in 0..pc.by {
+                for bxk in 0..pc.bx {
+                    let blk = &pc.coeffs[byk * pc.bx + bxk];
+                    // Dequantize + de-zigzag into natural order.
+                    let mut nat = [0f32; 64];
+                    for k in 0..64 {
+                        nat[ZIGZAG[k]] = blk[k] as f32 * q[ZIGZAG[k]] as f32;
+                    }
+                    transform_2d(&mut nat, dct_iii);
+                    // Place the 8×8 block, scaling each sample to the luma grid.
+                    let ox = bxk * 8;
+                    let oy = byk * 8;
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let val = nat[r * 8 + c] + 128.0;
+                            for dy in 0..sy {
+                                for dx in 0..sx {
+                                    let px = (ox + c) * sx + dx;
+                                    let py = (oy + r) * sy + dy;
+                                    if px < w && py < h {
+                                        planes[ci][py * w + px] = val;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let n = w * h;
+        let mut out = vec![0u8; n * 4];
+        let three = comps.len() >= 3;
+        for i in 0..n {
+            let (r, g, b) = if three {
+                let y = planes[0][i];
+                let cb = planes[1][i] - 128.0;
+                let cr = planes[2][i] - 128.0;
+                (
+                    y + 1.402 * cr,
+                    y - 0.344_136 * cb - 0.714_136 * cr,
+                    y + 1.772 * cb,
+                )
+            } else {
+                let y = planes[0][i];
+                (y, y, y)
+            };
+            out[i * 4] = r.round().clamp(0.0, 255.0) as u8;
+            out[i * 4 + 1] = g.round().clamp(0.0, 255.0) as u8;
+            out[i * 4 + 2] = b.round().clamp(0.0, 255.0) as u8;
+            out[i * 4 + 3] = 255;
+        }
+        (w as u32, h as u32, out)
+    }
+}
+
 fn be16(d: &[u8], o: usize) -> u16 {
     ((*d.get(o).unwrap_or(&0) as u16) << 8) | *d.get(o + 1).unwrap_or(&0) as u16
 }
@@ -768,4 +1312,105 @@ mod tests {
             assert!((px[2] as i32 - 50).abs() <= 6, "B {}", px[2]);
         }
     }
+
+    /// Hand-assemble a minimal **progressive** (SOF2) grayscale JPEG of a single
+    /// 8×8 block of constant luma `gray`, in two scans: a DC scan (Ss=0,Se=0)
+    /// then an AC EOB-run scan (Ss=1,Se=63). Quant table is all-ones (lossless
+    /// DC) so the decode is exact bar IDCT float rounding. Exercises the
+    /// progressive DC-scan and AC-first-scan code paths.
+    fn progressive_gray_8x8(gray: u8) -> Vec<u8> {
+        // The decoder dequantizes (×1) then runs `dct_iii`; pick the DC
+        // coefficient so a constant block round-trips. For a constant input `c`,
+        // the forward DCT-II's DC term is `8 * c * alpha(0)^2 = c` is NOT exact,
+        // so compute it via the real forward transform to stay consistent.
+        let c = gray as f32 - 128.0;
+        let mut blk = [c; 64];
+        transform_2d(&mut blk, dct_ii);
+        let dc = blk[0].round() as i32; // AC terms of a constant block are ~0.
+
+        let dc_tab = build_codes(&DC_LUMA_BITS, &DC_LUMA_VALS);
+        let ac_tab = build_codes(&AC_LUMA_BITS, &AC_LUMA_VALS);
+        // Pad the final partial byte with exactly `8-nbits` one-bits, masked to
+        // that width (the shared `BitWriter::flush` pads with `0x7F`, whose high
+        // bits would bleed into the preceding code field for a sub-7-bit pad).
+        let pad = |w: &mut BitWriter| {
+            let rem = w.nbits % 8;
+            if rem != 0 {
+                let n = 8 - rem;
+                w.put(((1u32 << n) - 1) as u16, n as u8);
+            }
+        };
+
+        // DC scan entropy: one DC diff (predictor starts at 0).
+        let mut dcw = BitWriter::new();
+        let (cat, bits) = magnitude(dc);
+        let (code, len) = dc_tab[&cat];
+        dcw.put(code, len);
+        if cat > 0 {
+            dcw.put(bits, cat);
+        }
+        pad(&mut dcw);
+
+        // AC scan entropy: a single EOB (symbol 0x00) — the one block is all-zero
+        // AC, EOB run of 1.
+        let mut acw = BitWriter::new();
+        let (code, len) = ac_tab[&0x00];
+        acw.put(code, len);
+        pad(&mut acw);
+
+        let mut out: Vec<u8> = vec![0xFF, 0xD8]; // SOI
+        // DQT (all ones).
+        out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        out.extend_from_slice(&[1u8; 64]);
+        // SOF2 — progressive, 1 component, 1×1 sampling.
+        out.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
+        out.extend_from_slice(&[0x01, 0x11, 0x00]);
+        // DHT — DC luma (class 0, id 0) and AC luma (class 1, id 0).
+        for (class_id, bits, vals) in [
+            (0x00u8, &DC_LUMA_BITS[..], &DC_LUMA_VALS[..]),
+            (0x10, &AC_LUMA_BITS[..], &AC_LUMA_VALS[..]),
+        ] {
+            let len = 19 + vals.len();
+            out.extend_from_slice(&[0xFF, 0xC4, (len >> 8) as u8, (len & 0xFF) as u8, class_id]);
+            out.extend_from_slice(bits);
+            out.extend_from_slice(vals);
+        }
+        // SOS #1 — DC scan: 1 comp, Ss=0 Se=0 Ah=0 Al=0.
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&dcw.out);
+        // SOS #2 — AC scan: 1 comp, Ss=1 Se=63 Ah=0 Al=0, AC table id 0.
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3F, 0x00]);
+        out.extend_from_slice(&acw.out);
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
+    #[test]
+    fn decodes_progressive_grayscale() {
+        // A two-scan progressive JPEG of solid gray must decode to that gray.
+        let jpg = progressive_gray_8x8(160);
+        let (w, h, dec) = decode_jpeg(&jpg).expect("progressive decodes");
+        assert_eq!((w, h), (8, 8));
+        for px in dec.chunks_exact(4) {
+            assert!((px[0] as i32 - 160).abs() <= 3, "R {}", px[0]);
+            assert!((px[1] as i32 - 160).abs() <= 3, "G {}", px[1]);
+            assert!((px[2] as i32 - 160).abs() <= 3, "B {}", px[2]);
+            assert_eq!(px[3], 255);
+        }
+        // A second, darker value to ensure the DC scan carries real data.
+        let (_, _, dec2) = decode_jpeg(&progressive_gray_8x8(64)).expect("decodes");
+        assert!((dec2[0] as i32 - 64).abs() <= 3, "dark gray {}", dec2[0]);
+    }
+
+    #[test]
+    fn arithmetic_coded_jpeg_is_rejected_gracefully() {
+        // An arithmetic-coded SOF (0xC9) must return None (not panic), so the
+        // caller skips the single image rather than blanking the page.
+        let mut data: Vec<u8> = vec![0xFF, 0xD8];
+        data.extend_from_slice(&[0xFF, 0xC9, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
+        data.extend_from_slice(&[0x01, 0x11, 0x00]);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        assert!(decode_jpeg(&data).is_none());
+    }
 }
+
