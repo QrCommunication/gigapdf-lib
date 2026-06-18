@@ -1865,8 +1865,20 @@ impl Document {
         let content = self.page_content(page_no)?;
         let fonts = self.page_render_fonts(page_no);
         let images = self.page_images(page_no);
+        let resources = self.page_resources(page_no);
+        let ctx = PageResourceCtx::new(self, resources, width, height, base);
         let mut canvas = crate::raster::Canvas::new(width, height);
-        crate::raster::render_content_into(&mut canvas, &content, base, &fonts, &images, 1.0);
+        crate::raster::render_content_into_ctx(
+            &mut canvas,
+            &content,
+            base,
+            &fonts,
+            &images,
+            1.0,
+            &ctx,
+            0,
+            None,
+        );
         // Paint annotation appearances (`/AP /N`) over the page content, the way
         // every viewer does: page content is the body, annotations layer on top.
         self.render_annotation_appearances(page_no, &mut canvas, base);
@@ -1930,6 +1942,8 @@ impl Document {
                 .unwrap_or_default();
             let fonts = self.render_fonts_for(&resources);
             let images = self.images_for(&resources);
+            let ctx =
+                PageResourceCtx::new(self, resources.clone(), canvas.width, canvas.height, base);
             // Compose: appearance space → page user space → device.
             let device = ap_matrix.then(&base);
             let alpha = dict
@@ -1937,8 +1951,465 @@ impl Document {
                 .map(|o| self.resolve(o))
                 .and_then(|o| o.as_f64())
                 .unwrap_or(1.0);
-            crate::raster::render_content_into(canvas, &appearance, device, &fonts, &images, alpha);
+            crate::raster::render_content_into_ctx(
+                canvas,
+                &appearance,
+                device,
+                &fonts,
+                &images,
+                alpha,
+                &ctx,
+                0,
+                None,
+            );
         }
+    }
+
+    /// A page's `/Resources` dictionary (empty when absent).
+    fn page_resources(&self, page_no: u32) -> Dictionary {
+        self.page_dict(page_no)
+            .ok()
+            .and_then(|page| {
+                page.get(b"Resources")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    // ── rasterizer resource resolution (form XObjects, shadings, ExtGState) ──
+
+    /// Resolve a name in a `/Resources` sub-dictionary (e.g. `/XObject`, `/Shading`,
+    /// `/Pattern`, `/ExtGState`) to its object id (when written indirectly) and the
+    /// resolved object. The id is `None` for an inline dictionary.
+    fn resource_entry<'a>(
+        &'a self,
+        resources: &'a Dictionary,
+        category: &[u8],
+        name: &[u8],
+    ) -> Option<(Option<ObjectId>, &'a Object)> {
+        let sub = resources
+            .get(category)
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        let raw = sub.get(name)?;
+        let id = raw.as_reference();
+        Some((id, self.resolve(raw)))
+    }
+
+    /// Build a [`raster::FormXObject`] for a form stream and child resources, with
+    /// the form's object id pushed onto the cycle-guard `seen` set. `None` when the
+    /// stream isn't a form or can't be decoded.
+    #[allow(clippy::too_many_arguments)]
+    fn build_form_xobject<'a>(
+        &'a self,
+        id: Option<ObjectId>,
+        obj: &'a Object,
+        parent_resources: &Dictionary,
+        seen: &std::collections::BTreeSet<ObjectId>,
+        width: u32,
+        height: u32,
+        base: content::PageMatrix,
+    ) -> Option<crate::raster::render::FormXObject<'a>> {
+        let stream = obj.as_stream()?;
+        if stream.dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Form".as_slice()) {
+            return None;
+        }
+        if let Some(id) = id {
+            if seen.contains(&id) {
+                return None; // cycle: this form is already being drawn
+            }
+        }
+        let content = decode_stream(stream).ok()?;
+        let matrix = self.form_matrix(&stream.dict);
+        let bbox = self.read_bbox(&stream.dict);
+        // A form's own /Resources, else (per ISO 32000-1) the page's.
+        let resources = stream
+            .dict
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(|| parent_resources.clone());
+        let fonts = self.render_fonts_for(&resources);
+        let images = self.images_for(&resources);
+        let mut child_seen = seen.clone();
+        if let Some(id) = id {
+            child_seen.insert(id);
+        }
+        let ctx = PageResourceCtx {
+            doc: self,
+            resources,
+            seen: child_seen,
+            width,
+            height,
+            base,
+        };
+        Some(crate::raster::render::FormXObject {
+            content,
+            matrix,
+            bbox,
+            fonts,
+            images,
+            ctx: Box::new(ctx),
+        })
+    }
+
+    /// Read a shading dictionary (axial type 2 / radial type 3) into a renderer
+    /// [`raster::Shading`] with a pre-sampled 256-entry colour ramp. `pattern_matrix`,
+    /// when given, is folded into `to_device` (a shading pattern's `/Matrix`);
+    /// otherwise `to_device` is identity and the caller sets it (`sh`). Mesh
+    /// shadings (types 4–7) return `None`.
+    fn read_shading(
+        &self,
+        dict: &Dictionary,
+        pattern_matrix: Option<content::PageMatrix>,
+    ) -> Option<crate::raster::render::Shading> {
+        use crate::raster::render::{Shading, ShadingKind};
+        let stype = dict.get(b"ShadingType").and_then(Object::as_i64)?;
+        let coords: Vec<f64> = dict
+            .get(b"Coords")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)?
+            .iter()
+            .filter_map(|o| self.resolve(o).as_f64())
+            .collect();
+        let kind = match stype {
+            2 if coords.len() >= 4 => ShadingKind::Axial {
+                x0: coords[0],
+                y0: coords[1],
+                x1: coords[2],
+                y1: coords[3],
+            },
+            3 if coords.len() >= 6 => ShadingKind::Radial {
+                x0: coords[0],
+                y0: coords[1],
+                r0: coords[2],
+                x1: coords[3],
+                y1: coords[4],
+                r1: coords[5],
+            },
+            _ => return None, // unsupported / mesh shading
+        };
+        let extend = dict
+            .get(b"Extend")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|a| {
+                let f = |i: usize| matches!(a.get(i).map(|o| self.resolve(o)), Some(Object::Boolean(true)));
+                [f(0), f(1)]
+            })
+            .unwrap_or([false, false]);
+        // The shading's [Domain t0 t1] maps the geometric parameter to the function
+        // input; default [0 1].
+        let domain = dict
+            .get(b"Domain")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .and_then(|a| {
+                let v: Vec<f64> = a.iter().filter_map(|o| self.resolve(o).as_f64()).collect();
+                (v.len() >= 2).then(|| [v[0], v[1]])
+            })
+            .unwrap_or([0.0, 1.0]);
+        let func = dict.get(b"Function").map(|o| self.resolve(o));
+        let mut ramp = Vec::with_capacity(256);
+        for i in 0..256u32 {
+            let frac = i as f64 / 255.0;
+            let t = domain[0] + frac * (domain[1] - domain[0]);
+            ramp.push(match func {
+                Some(f) => self.sample_function_rgb(f, t),
+                None => [0, 0, 0],
+            });
+        }
+        Some(Shading {
+            kind,
+            ramp,
+            extend,
+            to_device: pattern_matrix.unwrap_or(content::PageMatrix::IDENTITY),
+        })
+    }
+
+    /// Evaluate a colour `/Function` at parameter `t` (in the function's domain),
+    /// returning an RGB triple. Handles a sampled function (type 0), an exponential
+    /// interpolation (type 2), a stitching function (type 3), and an array of
+    /// single-output functions (one per colour component). DeviceGray (1 output)
+    /// and DeviceCMYK (4 outputs) are mapped to RGB; anything else falls back to
+    /// the first three outputs as RGB.
+    fn sample_function_rgb(&self, func: &Object, t: f64) -> [u8; 3] {
+        let outputs = self.eval_function(func, t);
+        match outputs.len() {
+            0 => [0, 0, 0],
+            1 => {
+                let g = (outputs[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                [g, g, g]
+            }
+            4 => {
+                let r = (1.0 - outputs[0]) * (1.0 - outputs[3]);
+                let g = (1.0 - outputs[1]) * (1.0 - outputs[3]);
+                let b = (1.0 - outputs[2]) * (1.0 - outputs[3]);
+                [
+                    (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+                ]
+            }
+            _ => [
+                (outputs[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (outputs.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+                (outputs.get(2).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+            ],
+        }
+    }
+
+    /// Evaluate a PDF function object at scalar input `t`, returning its output
+    /// component vector. Supports an array of functions (each 1-output, results
+    /// concatenated), type 0 (sampled), type 2 (exponential), and type 3
+    /// (stitching). Unknown types return an empty vector.
+    fn eval_function(&self, func: &Object, t: f64) -> Vec<f64> {
+        let func = self.resolve(func);
+        // An array of functions: evaluate each, concatenate the first output of each.
+        if let Object::Array(items) = func {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let v = self.eval_function(item, t);
+                out.push(v.first().copied().unwrap_or(0.0));
+            }
+            return out;
+        }
+        let Some(dict) = func.as_dict() else {
+            return Vec::new();
+        };
+        let ftype = dict.get(b"FunctionType").and_then(Object::as_i64).unwrap_or(-1);
+        let domain = read_pair(self, dict, b"Domain").unwrap_or([0.0, 1.0]);
+        let x = t.clamp(domain[0].min(domain[1]), domain[0].max(domain[1]));
+        match ftype {
+            2 => {
+                let c0 = read_vec(self, dict, b"C0").unwrap_or_else(|| vec![0.0]);
+                let c1 = read_vec(self, dict, b"C1").unwrap_or_else(|| vec![1.0]);
+                let nexp = dict.get(b"N").and_then(|o| self.resolve(o).as_f64()).unwrap_or(1.0);
+                let span = domain[1] - domain[0];
+                let xn = if span.abs() < 1e-12 {
+                    0.0
+                } else {
+                    ((x - domain[0]) / span).clamp(0.0, 1.0).powf(nexp)
+                };
+                let len = c0.len().max(c1.len());
+                (0..len)
+                    .map(|i| {
+                        let a = c0.get(i).copied().unwrap_or(0.0);
+                        let b = c1.get(i).copied().unwrap_or(0.0);
+                        a + xn * (b - a)
+                    })
+                    .collect()
+            }
+            3 => {
+                let functions = match dict.get(b"Functions").map(|o| self.resolve(o)) {
+                    Some(Object::Array(items)) => items.clone(),
+                    _ => return Vec::new(),
+                };
+                let bounds = read_vec(self, dict, b"Bounds").unwrap_or_default();
+                let encode = read_vec(self, dict, b"Encode").unwrap_or_default();
+                let k = functions.len();
+                if k == 0 {
+                    return Vec::new();
+                }
+                // Find the subdomain index for x.
+                let mut idx = 0;
+                while idx < bounds.len() && x >= bounds[idx] {
+                    idx += 1;
+                }
+                idx = idx.min(k - 1);
+                let lo = if idx == 0 { domain[0] } else { bounds[idx - 1] };
+                let hi = if idx + 1 < k + 1 && idx < bounds.len() {
+                    bounds[idx]
+                } else {
+                    domain[1]
+                };
+                let (e0, e1) = (
+                    encode.get(2 * idx).copied().unwrap_or(0.0),
+                    encode.get(2 * idx + 1).copied().unwrap_or(1.0),
+                );
+                let span = hi - lo;
+                let enc = if span.abs() < 1e-12 {
+                    e0
+                } else {
+                    e0 + (x - lo) / span * (e1 - e0)
+                };
+                self.eval_function(&functions[idx], enc)
+            }
+            0 => self.eval_sampled_function(func, x, domain),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Evaluate a type-0 (sampled) function at `x` with linear interpolation along
+    /// its single input dimension. Reads `/Size`, `/BitsPerSample`, `/Range`, and
+    /// the decoded sample stream; multi-input sampled functions aren't used by
+    /// shadings, so only the 1-D case is handled (others return empty).
+    fn eval_sampled_function(&self, func: &Object, x: f64, domain: [f64; 2]) -> Vec<f64> {
+        let Object::Stream(stream) = func else {
+            return Vec::new();
+        };
+        let dict = &stream.dict;
+        let size: Vec<i64> = dict
+            .get(b"Size")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|a| a.iter().filter_map(|o| self.resolve(o).as_i64()).collect())
+            .unwrap_or_default();
+        if size.len() != 1 || size[0] < 1 {
+            return Vec::new();
+        }
+        let n = size[0] as usize;
+        let bps = dict.get(b"BitsPerSample").and_then(Object::as_i64).unwrap_or(8);
+        let range = read_vec(self, dict, b"Range").unwrap_or_default();
+        if range.is_empty() || !range.len().is_multiple_of(2) {
+            return Vec::new();
+        }
+        let outs = range.len() / 2;
+        let data = match decode_stream(stream) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        // Map x → sample index (continuous), then linearly interpolate.
+        let span = domain[1] - domain[0];
+        let e = if span.abs() < 1e-12 {
+            0.0
+        } else {
+            ((x - domain[0]) / span).clamp(0.0, 1.0) * (n - 1) as f64
+        };
+        let i0 = e.floor() as usize;
+        let i1 = (i0 + 1).min(n - 1);
+        let frac = e - i0 as f64;
+        let max_val = ((1u64 << bps.min(32)) - 1) as f64;
+        let mut out = Vec::with_capacity(outs);
+        for c in 0..outs {
+            let s0 = read_sample(&data, (i0 * outs + c) as u64, bps as u32) as f64 / max_val;
+            let s1 = read_sample(&data, (i1 * outs + c) as u64, bps as u32) as f64 / max_val;
+            let v = s0 + frac * (s1 - s0);
+            let (r0, r1) = (range[2 * c], range[2 * c + 1]);
+            out.push(r0 + v * (r1 - r0));
+        }
+        out
+    }
+
+    /// Resolve an ExtGState (`/ExtGState` resource) named `name`: its `/ca`,
+    /// blend mode `/BM`, and `/SMask` rendered to a device-resolution alpha buffer
+    /// over the page area (`width × height` at the page `base`). `None` when the
+    /// ExtGState can't be found.
+    fn ext_gstate_params(
+        &self,
+        resources: &Dictionary,
+        name: &[u8],
+        width: u32,
+        height: u32,
+        base: content::PageMatrix,
+        seen: &std::collections::BTreeSet<ObjectId>,
+    ) -> Option<crate::raster::render::ExtGStateParams> {
+        let (_, obj) = self.resource_entry(resources, b"ExtGState", name)?;
+        let gs = obj.as_dict()?;
+        let fill_alpha = gs.get(b"ca").map(|o| self.resolve(o)).and_then(|o| o.as_f64());
+        let blend = gs
+            .get(b"BM")
+            .map(|o| self.resolve(o))
+            .and_then(|o| match o {
+                Object::Name(n) => Some(crate::raster::canvas::BlendMode::from_name(n)),
+                // /BM may be an array of names; use the first supported one.
+                Object::Array(items) => items
+                    .first()
+                    .and_then(Object::as_name)
+                    .map(crate::raster::canvas::BlendMode::from_name),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let soft_mask = match gs.get(b"SMask").map(|o| self.resolve(o)) {
+            Some(Object::Dictionary(sm)) => {
+                self.render_soft_mask(sm, resources, width, height, base, seen)
+            }
+            _ => None, // `/None` or absent
+        };
+        Some(crate::raster::render::ExtGStateParams {
+            fill_alpha,
+            blend,
+            soft_mask,
+        })
+    }
+
+    /// Render an ExtGState `/SMask` luminosity/alpha group to a device-resolution
+    /// alpha mask (`raster::ClipMask`). The mask's transparency group form (`/G`)
+    /// is rasterized on a separate canvas; for a `/Luminosity` mask the alpha is
+    /// the group's luminance, for an `/Alpha` mask we approximate with luminance
+    /// too (our canvas is opaque). `None` if the group can't be drawn.
+    fn render_soft_mask(
+        &self,
+        smask: &Dictionary,
+        parent_resources: &Dictionary,
+        width: u32,
+        height: u32,
+        base: content::PageMatrix,
+        seen: &std::collections::BTreeSet<ObjectId>,
+    ) -> Option<crate::raster::ClipMask> {
+        let group_raw = smask.get(b"G")?;
+        let group_id = group_raw.as_reference();
+        let group = self.resolve(group_raw).as_stream()?.clone();
+        if group.dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Form".as_slice()) {
+            return None;
+        }
+        let content = decode_stream(&group).ok()?;
+        let matrix = self.form_matrix(&group.dict);
+        let resources = group
+            .dict
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(|| parent_resources.clone());
+        let fonts = self.render_fonts_for(&resources);
+        let images = self.images_for(&resources);
+        let mut child_seen = seen.clone();
+        if let Some(id) = group_id {
+            child_seen.insert(id);
+        }
+        let ctx = PageResourceCtx {
+            doc: self,
+            resources,
+            seen: child_seen,
+            width,
+            height,
+            base,
+        };
+        // A luminosity mask is composited over black (areas the group doesn't
+        // paint are fully masked out → alpha 0). Start the mask canvas black.
+        let mut mask_canvas = crate::raster::Canvas::new(width, height);
+        for px in mask_canvas.pixels.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        }
+        let group_base = matrix.then(&base);
+        crate::raster::render_content_into_ctx(
+            &mut mask_canvas,
+            &content,
+            group_base,
+            &fonts,
+            &images,
+            1.0,
+            &ctx,
+            1,
+            None,
+        );
+        // Luminance → alpha (Rec. 601 weights), per pixel.
+        let mut cover = vec![0.0f32; (width as usize) * (height as usize)];
+        for (i, px) in mask_canvas.pixels.chunks_exact(4).enumerate() {
+            let lum = 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32;
+            cover[i] = (lum / 255.0).clamp(0.0, 1.0);
+        }
+        Some(crate::raster::ClipMask {
+            width,
+            height,
+            cover,
+        })
     }
 
     /// Read a form XObject's `/BBox` `[x0 y0 x1 y1]`; defaults to a unit box.
@@ -8071,6 +8542,172 @@ impl Document {
     }
 }
 
+/// A [`raster::ResourceCtx`](crate::raster::render::ResourceCtx) backed by a
+/// [`Document`] and a `/Resources` scope: it resolves the named resources a
+/// content stream refers to (form XObjects, shadings, shading/tiling patterns,
+/// ExtGStates) against `resources`, delegating the heavy lifting to the
+/// `Document`'s resource-resolution helpers.
+///
+/// `seen` is the cycle-guard set of form/pattern object ids currently being
+/// drawn (so a self-referential form doesn't recurse forever). `width`, `height`
+/// and `base` are the page-level device dimensions and user-space → device
+/// matrix; they're constant across the whole render tree and are needed to
+/// rasterize an ExtGState `/SMask` group at device resolution.
+struct PageResourceCtx<'a> {
+    doc: &'a Document,
+    resources: Dictionary,
+    seen: std::collections::BTreeSet<ObjectId>,
+    width: u32,
+    height: u32,
+    base: content::PageMatrix,
+}
+
+impl<'a> PageResourceCtx<'a> {
+    /// A fresh top-level context (empty cycle-guard set) for a page or annotation
+    /// appearance, carrying the page device size and base matrix.
+    fn new(
+        doc: &'a Document,
+        resources: Dictionary,
+        width: u32,
+        height: u32,
+        base: content::PageMatrix,
+    ) -> Self {
+        PageResourceCtx {
+            doc,
+            resources,
+            seen: std::collections::BTreeSet::new(),
+            width,
+            height,
+            base,
+        }
+    }
+}
+
+impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
+    fn form_xobject(&self, name: &[u8]) -> Option<crate::raster::render::FormXObject<'_>> {
+        let (id, obj) = self.doc.resource_entry(&self.resources, b"XObject", name)?;
+        self.doc.build_form_xobject(
+            id,
+            obj,
+            &self.resources,
+            &self.seen,
+            self.width,
+            self.height,
+            self.base,
+        )
+    }
+
+    fn shading(&self, name: &[u8]) -> Option<crate::raster::render::Shading> {
+        let (_, obj) = self.doc.resource_entry(&self.resources, b"Shading", name)?;
+        self.doc.read_shading(obj.as_dict()?, None)
+    }
+
+    fn pattern_shading(&self, name: &[u8]) -> Option<crate::raster::render::Shading> {
+        let (_, obj) = self.doc.resource_entry(&self.resources, b"Pattern", name)?;
+        let dict = obj.as_dict()?;
+        // Only PatternType 2 (shading pattern) carries a `/Shading`.
+        if dict.get(b"PatternType").and_then(Object::as_i64) != Some(2) {
+            return None;
+        }
+        let shading = dict.get(b"Shading").map(|o| self.doc.resolve(o))?;
+        let matrix = self.doc.form_matrix(dict);
+        self.doc.read_shading(shading.as_dict()?, Some(matrix))
+    }
+
+    fn tiling_pattern(&self, name: &[u8]) -> Option<crate::raster::render::FormXObject<'_>> {
+        let (id, obj) = self.doc.resource_entry(&self.resources, b"Pattern", name)?;
+        let stream = obj.as_stream()?;
+        // Only PatternType 1 (tiling pattern) is a content stream we can stamp.
+        if stream.dict.get(b"PatternType").and_then(Object::as_i64) != Some(1) {
+            return None;
+        }
+        if let Some(id) = id {
+            if self.seen.contains(&id) {
+                return None; // cycle guard
+            }
+        }
+        let content = decode_stream(stream).ok()?;
+        let matrix = self.doc.form_matrix(&stream.dict);
+        let bbox = self.doc.read_bbox(&stream.dict);
+        let resources = stream
+            .dict
+            .get(b"Resources")
+            .map(|o| self.doc.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(|| self.resources.clone());
+        let fonts = self.doc.render_fonts_for(&resources);
+        let images = self.doc.images_for(&resources);
+        let mut child_seen = self.seen.clone();
+        if let Some(id) = id {
+            child_seen.insert(id);
+        }
+        let ctx = PageResourceCtx {
+            doc: self.doc,
+            resources,
+            seen: child_seen,
+            width: self.width,
+            height: self.height,
+            base: self.base,
+        };
+        Some(crate::raster::render::FormXObject {
+            content,
+            matrix,
+            bbox,
+            fonts,
+            images,
+            ctx: Box::new(ctx),
+        })
+    }
+
+    fn ext_gstate(&self, name: &[u8]) -> Option<crate::raster::render::ExtGStateParams> {
+        self.doc.ext_gstate_params(
+            &self.resources,
+            name,
+            self.width,
+            self.height,
+            self.base,
+            &self.seen,
+        )
+    }
+}
+
+/// Read a two-element numeric array entry (`key`) from `dict`, resolving each
+/// element. `None` if the entry is absent, not an array, or has fewer than two
+/// numeric values. Used for function `/Domain` ranges.
+fn read_pair(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<[f64; 2]> {
+    let arr = dict.get(key).map(|o| doc.resolve(o)).and_then(Object::as_array)?;
+    let v: Vec<f64> = arr.iter().filter_map(|o| doc.resolve(o).as_f64()).collect();
+    (v.len() >= 2).then(|| [v[0], v[1]])
+}
+
+/// Read a numeric array entry (`key`) from `dict` into a `Vec<f64>`, resolving
+/// each element. `None` if the entry is absent or not an array (an empty array
+/// yields `Some(vec![])`). Used for function `/C0`, `/C1`, `/Bounds`, `/Encode`,
+/// and a sampled function's `/Range`.
+fn read_vec(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<Vec<f64>> {
+    let arr = dict.get(key).map(|o| doc.resolve(o)).and_then(Object::as_array)?;
+    Some(arr.iter().filter_map(|o| doc.resolve(o).as_f64()).collect())
+}
+
+/// Extract the `idx`-th `bits`-wide unsigned sample from a big-endian packed
+/// sample buffer (`data`), MSB-first, as used by a type-0 (sampled) function's
+/// stream. Samples are not byte-aligned for `bits` other than 8/16; out-of-range
+/// reads yield `0`. `bits` is clamped to `1..=32`.
+fn read_sample(data: &[u8], idx: u64, bits: u32) -> u32 {
+    let bits = bits.clamp(1, 32);
+    let start_bit = idx * bits as u64;
+    let mut value: u32 = 0;
+    for k in 0..bits as u64 {
+        let bit_pos = start_bit + k;
+        let byte = (bit_pos / 8) as usize;
+        let bit = 7 - (bit_pos % 8) as u32; // MSB-first within each byte
+        let b = data.get(byte).map(|&x| (x >> bit) & 1).unwrap_or(0);
+        value = (value << 1) | b as u32;
+    }
+    value
+}
+
 /// Decrypt every object's strings and stream bytes in place when the trailer
 /// declares an `/Encrypt` dictionary. A wrong or unsupported password leaves
 /// the objects untouched (the document stays unreadable rather than corrupted).
@@ -10997,5 +11634,200 @@ mod tests {
         assert!(has_op(&content, b"Do"), "image `Do` preserved");
         // And the image is still extractable as an image element.
         assert_eq!(doc.page_image_elements(1).len(), 1, "image element intact");
+    }
+
+    // ── rasterizer fidelity: form XObjects (Do), clipping (W/W*), shadings (sh),
+    //    and ExtGState blend modes (gs /BM) ─────────────────────────────────────
+
+    /// Assemble a 100×100 single-page PDF whose page content is `page_stream`,
+    /// with the given extra `/Resources` entries (e.g. `/XObject << … >>`) and
+    /// extra raw objects, then render it to an RGBA `Canvas` at scale 1.0.
+    fn render_canvas(
+        page_stream: &str,
+        resources: &str,
+        extra_objects: &[(u32, String)],
+    ) -> crate::raster::Canvas {
+        let mut objects: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                     /Resources << {resources} >> /Contents 4 0 R >>"
+                ),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+            ),
+        ];
+        objects.extend(extra_objects.iter().cloned());
+        let doc = Document::open(&raw_pdf(&objects)).unwrap();
+        doc.render_page_canvas(1, 1.0).unwrap()
+    }
+
+    /// The `[r, g, b]` of a device pixel `(x, y)` (top-left origin) of a canvas.
+    fn px(canvas: &crate::raster::Canvas, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y as usize) * (canvas.width as usize) + x as usize) * 4;
+        [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]
+    }
+
+    #[test]
+    fn renders_form_xobject_via_do() {
+        // A form XObject draws a blue 60×60 square at user (20,20)→(80,80); the
+        // page invokes it with `Do`. The form's marks must land on the page —
+        // this exercises `render_content_into_ctx`'s `Do` → form-recursion path.
+        let form_stream = "0 0 1 rg 20 20 60 60 re f";
+        let canvas = render_canvas(
+            "/Fm0 Do",
+            "/XObject << /Fm0 5 0 R >>",
+            &[(
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Length {} >> stream\n{form_stream}\nendstream",
+                    form_stream.len()
+                ),
+            )],
+        );
+        // Centre (device 50,50 — the square spans device x,y 20..80) is blue.
+        let c = px(&canvas, 50, 50);
+        assert!(
+            c[2] > 200 && c[0] < 60 && c[1] < 60,
+            "form square centre must be blue, got {c:?}"
+        );
+        // A corner outside the square stays white paper.
+        assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the form square is white");
+    }
+
+    #[test]
+    fn clip_path_confines_fill() {
+        // Clip to a 30×30 box (user 10..40), then fill the WHOLE page red. Only
+        // the clipped region may receive ink — content outside the `W n` clip
+        // must be absent (stay white).
+        let canvas = render_canvas(
+            "10 10 30 30 re W n 1 0 0 rg 0 0 100 100 re f",
+            "",
+            &[],
+        );
+        // Inside the clip (user (25,25) → device (25, 75)) is red.
+        let inside = px(&canvas, 25, 75);
+        assert!(
+            inside[0] > 200 && inside[1] < 60 && inside[2] < 60,
+            "inside the clip must be red, got {inside:?}"
+        );
+        // Outside the clip stays white despite the full-page fill.
+        assert_eq!(px(&canvas, 80, 20), [255, 255, 255], "outside the clip is unpainted");
+        assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the clip is unpainted");
+    }
+
+    #[test]
+    fn axial_shading_varies_across_the_gradient() {
+        // A horizontal axial (type-2) gradient from black (t=0, left) to white
+        // (t=1, right), painted with `sh` across a full-page clip. The colour
+        // must vary along x — a flat fill would be a bug.
+        let shading = "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [0 0 100 0] \
+                       /Function 6 0 R /Extend [true true] >>";
+        let func = "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>";
+        let canvas = render_canvas(
+            "q 0 0 100 100 re W n /Sh0 sh Q",
+            "/Shading << /Sh0 5 0 R >>",
+            &[(5, shading.into()), (6, func.into())],
+        );
+        let left = px(&canvas, 5, 50)[0];
+        let right = px(&canvas, 95, 50)[0];
+        // Shading space x maps directly to device x (identity CTM, base only
+        // flips y): left ≈ black, right ≈ white, and strictly increasing.
+        assert!(left < 60, "gradient left edge ≈ black, got {left}");
+        assert!(right > 200, "gradient right edge ≈ white, got {right}");
+        assert!(
+            right as i32 - left as i32 > 100,
+            "gradient must vary across x (left {left}, right {right})"
+        );
+    }
+
+    #[test]
+    fn multiply_blend_mode_darkens() {
+        // Backdrop: mid-grey over the whole page. Overlay the same mid-grey with
+        // an ExtGState `/BM /Multiply`. Multiply(0.5, 0.5) = 0.25 → the overlap
+        // must be markedly DARKER than either the backdrop or the source grey.
+        let canvas = render_canvas(
+            "0.5 g 0 0 100 100 re f q /GS0 gs 0.5 g 0 0 100 100 re f Q",
+            "/ExtGState << /GS0 5 0 R >>",
+            &[(5, "<< /Type /ExtGState /BM /Multiply >>".into())],
+        );
+        let c = px(&canvas, 50, 50);
+        // 0.5·0.5 ≈ 0.25 → ~64; comfortably below the 128 backdrop/source grey.
+        assert!(
+            c[0] < 100 && c[1] < 100 && c[2] < 100,
+            "Multiply of two mid-greys must darken below 128, got {c:?}"
+        );
+        // Sanity: with the default Normal blend the same overlay stays grey.
+        let normal = render_canvas("0.5 g 0 0 100 100 re f 0.5 g 0 0 100 100 re f", "", &[]);
+        let n = px(&normal, 50, 50);
+        assert!(n[0] > 110, "Normal-blend overlay stays mid-grey (~128), got {n:?}");
+        assert!(c[0] + 30 < n[0], "Multiply ({c:?}) must be darker than Normal ({n:?})");
+    }
+
+    #[test]
+    fn luminosity_soft_mask_gates_paint() {
+        // An ExtGState `/SMask` luminosity group paints the LEFT half white (the
+        // right half stays black → alpha 0). Painting a full-page red rect under
+        // that gs must show red only where the mask's luminance is non-zero —
+        // the right half stays white paper.
+        let group_stream = "1 g 0 0 50 100 re f"; // left half white, right half black
+        let canvas = render_canvas(
+            "q /GS0 gs 1 0 0 rg 0 0 100 100 re f Q",
+            "/ExtGState << /GS0 5 0 R >>",
+            &[
+                (
+                    5,
+                    "<< /Type /ExtGState /SMask << /S /Luminosity /G 6 0 R >> >>".into(),
+                ),
+                (
+                    6,
+                    format!(
+                        "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                         /Group << /S /Transparency /CS /DeviceGray >> \
+                         /Length {} >> stream\n{group_stream}\nendstream",
+                        group_stream.len()
+                    ),
+                ),
+            ],
+        );
+        // Left half (mask alpha 1) shows red.
+        let left = px(&canvas, 25, 50);
+        assert!(
+            left[0] > 200 && left[1] < 60 && left[2] < 60,
+            "left half (mask=white) must show red, got {left:?}"
+        );
+        // Right half (mask alpha 0) is masked out → white paper.
+        assert_eq!(px(&canvas, 75, 50), [255, 255, 255], "right half (mask=black) is masked out");
+    }
+
+    #[test]
+    fn shading_pattern_fill_paints_gradient_inside_path() {
+        // Fill a 60×60 path with a `/Pattern` colour naming a shading pattern
+        // (PatternType 2, horizontal black→white axial). The gradient must fill
+        // the path and vary across it; outside the path stays white.
+        let pattern = "<< /Type /Pattern /PatternType 2 /Matrix [1 0 0 1 0 0] /Shading 6 0 R >>";
+        let shading = "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [20 0 80 0] \
+                       /Function 7 0 R /Extend [true true] >>";
+        let func = "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>";
+        let canvas = render_canvas(
+            "/Pattern cs /P0 scn 20 20 60 60 re f",
+            "/Pattern << /P0 5 0 R >>",
+            &[(5, pattern.into()), (6, shading.into()), (7, func.into())],
+        );
+        // Inside the filled box (device x 20..80): a gradient that varies in x.
+        let left = px(&canvas, 25, 50)[0];
+        let right = px(&canvas, 75, 50)[0];
+        assert!(
+            right as i32 - left as i32 > 80,
+            "shading-pattern fill must vary across x (left {left}, right {right})"
+        );
+        // Outside the filled path stays white paper.
+        assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the pattern-filled path is white");
     }
 }

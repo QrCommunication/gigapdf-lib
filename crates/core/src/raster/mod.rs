@@ -22,8 +22,8 @@ pub mod resize;
 pub mod vp8;
 pub mod webp;
 
-pub use canvas::Canvas;
+pub use canvas::{BlendMode, Canvas, ClipMask};
 pub use png::encode_png;
 pub use png_decode::decode_png;
-pub use render::{render_content, render_content_into};
+pub use render::{render_content, render_content_into, render_content_into_ctx};
 pub use resize::resize_rgba;
