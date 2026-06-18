@@ -81,15 +81,16 @@ log "Fetching handwriting fonts for '$GROUP'…"
 ( cd "$REPO_DIR/tools/ocr" && "$VENV/bin/python" fonts.py "$GROUP" --handwriting ) || \
     log "WARN: handwriting-font fetch partial — continuing"
 
-# ── 5. Real handwriting corpus — download datasets IN PARALLEL (one process each) ────
-log "Downloading real handwriting corpus in parallel (${!NDL[*]})…"
+# ── 5. Real handwriting corpus — bounded concurrency (the datasets-server rate-limits
+#       under heavy parallelism → HTTP 429; 3 streams + in-code retry-on-429 is reliable) ──
+MAXJ="${GIGA_OCR_DL_CONCURRENCY:-3}"
+log "Downloading real handwriting corpus (concurrency=$MAXJ, retry-on-429)…"
 cd "$REPO_DIR"
-pids=()
 for ds in "${!NDL[@]}"; do
     "$VENV/bin/python" tools/ocr/hw_datasets.py "$ds" "${NDL[$ds]}" > "$HOME/dl_$ds.log" 2>&1 &
-    pids+=($!)
+    while [ "$(jobs -rp | wc -l)" -ge "$MAXJ" ]; do wait -n 2>/dev/null || break; done
 done
-for p in "${pids[@]}"; do wait "$p" || true; done
+wait
 log "Corpus download finished. Cached lines:"
 ls -1 /tmp/ocr_hw/*_train_*.npz 2>/dev/null | sed 's#.*/##' || true
 

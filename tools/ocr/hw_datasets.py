@@ -22,6 +22,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -72,14 +74,36 @@ def _hf_token() -> str | None:
     return None
 
 
-def _fetch(url: str, timeout: int = 30) -> bytes:
+def _fetch(url: str, timeout: int = 30, retries: int = 6) -> bytes:
+    """GET with retry+backoff on rate-limit/transient errors. The HF datasets-server
+    rate-limits (HTTP 429) under concurrent load; on 429/5xx we honour `Retry-After` (or
+    back off exponentially, capped) and retry instead of giving up — so a download survives
+    rate-limiting rather than truncating the corpus to a few hundred lines."""
     headers = {"User-Agent": "Mozilla/5.0"}
     tok = _hf_token()
     if tok and "huggingface.co" in url:
         headers["Authorization"] = f"Bearer {tok}"
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    delay = 5.0
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                ra = e.headers.get("Retry-After") if e.headers else None
+                wait = float(ra) if (ra and ra.isdigit()) else delay
+                time.sleep(min(wait, 120.0))
+                delay = min(delay * 2, 120.0)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt < retries - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, 120.0)
+                continue
+            raise
+    raise RuntimeError(f"unreachable: exhausted {retries} retries for {url}")
 
 
 def _to_strip(jpg: bytes, target_h: int = STRIP_H):
