@@ -2026,6 +2026,21 @@ export class GigaPdfDoc {
   flattenForm(): number {
     return this.ex().gp_flatten_form(this.h);
   }
+  /**
+   * Inline a page's form XObjects (`/Subtype /Form` invoked via `Do`) into its
+   * content stream, **de-sharing** each placement so the former form text/graphics
+   * become ordinary page content with real, editable text-run indices (no form
+   * sentinel) — the enabler for editing invoice/template text in place via
+   * {@link replaceText} / {@link moveElement} / {@link removeElement} instead of
+   * the redact+add overlay. Image XObjects are left untouched. Returns the number
+   * of form XObjects inlined (every `Do` invocation, since each is de-shared).
+   *
+   * Distinct from {@link flattenForm}, which flattens **AcroForm** interactive
+   * fields (and drops `/AcroForm`); this flattens reusable Form XObjects.
+   */
+  flattenFormXObjects(page: number): number {
+    return this.ex().gp_flatten_form_xobjects(this.h, page);
+  }
 
   // hyperlinks
   links(page: number): LinkInfo[] {

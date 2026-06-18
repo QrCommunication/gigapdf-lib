@@ -2692,6 +2692,21 @@ pub extern "C" fn gp_flatten_form(handle: *mut Document) -> i32 {
     }
 }
 
+/// Inline a page's form XObjects (`/Subtype /Form` invoked via `Do`) into its
+/// content stream, de-sharing each placement so the former form text becomes
+/// editable page runs. Returns the number of form XObjects inlined, or a
+/// negative error code. Distinct from [`gp_flatten_form`] (AcroForm fields).
+#[no_mangle]
+pub extern "C" fn gp_flatten_form_xobjects(handle: *mut Document, page: u32) -> i32 {
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.flatten_form_xobjects(page) {
+            Ok(count) => count as i32,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
 // ─── metadata ────────────────────────────────────────────────────────────────
 
 /// Set a document info-dictionary entry (e.g. "Title", "Author"). 0 on success.

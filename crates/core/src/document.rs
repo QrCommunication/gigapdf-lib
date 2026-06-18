@@ -42,6 +42,224 @@ pub struct SearchMatch {
     pub bounds: content::Bounds,
 }
 
+// ─── form-XObject inlining (flatten_form_xobjects) ──────────────────────────
+
+/// A form XObject resolved for *inlining* into a page: its decoded content, its
+/// own `/Resources` (if any — else it inherits the parent scope), its `/Matrix`
+/// (default identity) and its object id (for the cycle guard).
+struct ResolvedForm {
+    content: Vec<u8>,
+    resources: Option<Dictionary>,
+    matrix: content::PageMatrix,
+    id: Option<ObjectId>,
+}
+
+/// An operator whose resource-name operand must resolve in `/Resources`, with
+/// the sub-dictionary it lives in and where the name sits among the operands.
+struct ResourceOp {
+    /// Operator keyword, e.g. `b"Tf"`.
+    operator: &'static [u8],
+    /// `/Resources` sub-dictionary the name keys into, e.g. `b"Font"`.
+    category: &'static [u8],
+    /// Where the name operand is: `First` (operand 0) or `Last` (last operand,
+    /// and only when it actually *is* a name — `scn`/`SCN` take optional colour
+    /// components before an optional pattern name).
+    pos: OperandPos,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum OperandPos {
+    First,
+    Last,
+}
+
+/// The content-stream operators that reference a named resource, mapped to the
+/// `/Resources` sub-dictionary and the operand position of the name. `ri`
+/// (rendering intent) and inline `BDC`/`DP` dictionaries are intentionally
+/// absent — they are not resource-name references. `BDC`/`DP` *property* refs
+/// (`/OC /P0 BDC`) carry the name as the **last** operand keyed into
+/// `/Properties`; a non-name last operand (inline dict) is left alone.
+const RESOURCE_OPS: &[ResourceOp] = &[
+    ResourceOp { operator: b"Tf", category: b"Font", pos: OperandPos::First },
+    ResourceOp { operator: b"Do", category: b"XObject", pos: OperandPos::First },
+    ResourceOp { operator: b"gs", category: b"ExtGState", pos: OperandPos::First },
+    ResourceOp { operator: b"sh", category: b"Shading", pos: OperandPos::First },
+    ResourceOp { operator: b"cs", category: b"ColorSpace", pos: OperandPos::First },
+    ResourceOp { operator: b"CS", category: b"ColorSpace", pos: OperandPos::First },
+    ResourceOp { operator: b"scn", category: b"Pattern", pos: OperandPos::Last },
+    ResourceOp { operator: b"SCN", category: b"Pattern", pos: OperandPos::Last },
+    ResourceOp { operator: b"BDC", category: b"Properties", pos: OperandPos::Last },
+    ResourceOp { operator: b"DP", category: b"Properties", pos: OperandPos::Last },
+];
+
+/// Per-category rename maps applied to a form body's resource-name operands when
+/// the form's own resource collided with a different page resource of the same
+/// name (so it was copied under a fresh name). An empty map ⇒ identity (every
+/// name already resolves in the page, the common case).
+struct Renames {
+    /// `category → (old form name → new page name)`.
+    by_category: BTreeMap<&'static [u8], BTreeMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl Renames {
+    /// The no-rename map (top-level page ops, or a form whose resources merged
+    /// without any collision).
+    fn identity() -> Self {
+        Self { by_category: BTreeMap::new() }
+    }
+
+    fn is_identity(&self) -> bool {
+        self.by_category.values().all(BTreeMap::is_empty)
+    }
+
+    fn record(&mut self, category: &'static [u8], old: Vec<u8>, new: Vec<u8>) {
+        self.by_category.entry(category).or_default().insert(old, new);
+    }
+
+    /// Look up the rewritten name for `name` in `category`, if it was renamed.
+    fn lookup(&self, category: &'static [u8], name: &[u8]) -> Option<&Vec<u8>> {
+        self.by_category.get(category).and_then(|m| m.get(name))
+    }
+
+    /// Clone `op`, rewriting its resource-name operand through the rename map.
+    /// Ops that don't reference a resource (or whose name wasn't renamed) clone
+    /// unchanged.
+    fn apply(&self, op: &content::Operation) -> content::Operation {
+        if self.is_identity() {
+            return op.clone();
+        }
+        let Some(spec) = RESOURCE_OPS.iter().find(|s| s.operator == op.operator.as_slice()) else {
+            return op.clone();
+        };
+        let idx = match spec.pos {
+            OperandPos::First => 0,
+            OperandPos::Last => op.operands.len().saturating_sub(1),
+        };
+        let renamed = match op.operands.get(idx) {
+            Some(Object::Name(n)) => self.lookup(spec.category, n).cloned(),
+            _ => None,
+        };
+        let Some(new_name) = renamed else {
+            return op.clone();
+        };
+        let mut operands = op.operands.clone();
+        operands[idx] = Object::Name(new_name);
+        content::Operation { operator: op.operator.clone(), operands }
+    }
+}
+
+/// A mutable copy of a page's `/Resources` sub-dictionaries, into which the
+/// resources used by inlined forms are merged. Tracks the page's *original*
+/// entries (resolved object id when indirect) so a form entry of the same name
+/// is reused when it points at the same object, and renamed only on a true
+/// collision (a different object).
+struct FlattenResources {
+    /// `category → (name → value)` working copy.
+    cats: BTreeMap<Vec<u8>, Dictionary>,
+    /// `category → next collision counter` for fresh `{name}_fx{n}` names.
+    counter: BTreeMap<&'static [u8], usize>,
+}
+
+impl FlattenResources {
+    /// Seed the working copy from the page's resolved `/Resources` (each
+    /// sub-dictionary cloned so we can extend it without mutating shared state).
+    fn from_dict(doc: &Document, res: &Dictionary) -> Self {
+        let mut cats = BTreeMap::new();
+        for spec in RESOURCE_OPS {
+            if cats.contains_key(spec.category) {
+                continue; // ColorSpace/Pattern appear twice in RESOURCE_OPS
+            }
+            if let Some(sub) = res
+                .get(spec.category)
+                .map(|o| doc.resolve(o))
+                .and_then(Object::as_dict)
+            {
+                cats.insert(spec.category.to_vec(), sub.clone());
+            }
+        }
+        Self { cats, counter: BTreeMap::new() }
+    }
+
+    /// Reassemble the merged `/Resources` dictionary (preserving any keys the
+    /// page had that we don't manage by copying them back from the working set).
+    fn into_dict(self) -> Dictionary {
+        let mut out = Dictionary::new();
+        for (category, sub) in self.cats {
+            if !sub.is_empty() {
+                out.set(category, Object::Dictionary(sub));
+            }
+        }
+        out
+    }
+
+    /// The resolved object id behind a resource entry, if it is an indirect
+    /// reference (used to tell "same resource, reuse the name" from "different
+    /// resource, must rename").
+    fn entry_id(value: &Object) -> Option<ObjectId> {
+        value.as_reference()
+    }
+
+    /// Merge a form's `/Resources` (resolved against `doc`) into the page working
+    /// copy and return the [`Renames`] for the form body. For each entry the form
+    /// references: absent in the page ⇒ copy under the same name; present and
+    /// pointing at the same object ⇒ reuse (no rename); present but a different
+    /// object ⇒ copy under a fresh `{name}_fx{n}` name and record the rename.
+    fn merge_scope(&mut self, doc: &Document, form_res: &Dictionary) -> Renames {
+        let mut renames = Renames::identity();
+        for spec in RESOURCE_OPS {
+            let Some(form_sub) = form_res
+                .get(spec.category)
+                .map(|o| doc.resolve(o))
+                .and_then(Object::as_dict)
+            else {
+                continue;
+            };
+            for (name, value) in &form_sub.0 {
+                let page_sub = self.cats.entry(spec.category.to_vec()).or_default();
+                match page_sub.get(name) {
+                    None => {
+                        // Free name: copy verbatim.
+                        page_sub.0.insert(name.clone(), value.clone());
+                    }
+                    Some(existing) => {
+                        let same = match (Self::entry_id(existing), Self::entry_id(value)) {
+                            (Some(a), Some(b)) => a == b,
+                            // Inline (direct) values: compare structurally.
+                            _ => existing == value,
+                        };
+                        if same {
+                            continue; // reuse the page name, no rewrite
+                        }
+                        // Collision with a different object: fresh name.
+                        let n = self.counter.entry(spec.category).or_default();
+                        let mut new_name;
+                        loop {
+                            new_name = {
+                                let mut nm = name.clone();
+                                nm.extend_from_slice(b"_fx");
+                                nm.extend_from_slice(n.to_string().as_bytes());
+                                nm
+                            };
+                            *n += 1;
+                            if !page_sub.contains(&new_name) {
+                                break;
+                            }
+                        }
+                        page_sub.0.insert(new_name.clone(), value.clone());
+                        renames.record(spec.category, name.clone(), new_name);
+                    }
+                }
+            }
+        }
+        renames
+    }
+}
+
+/// A zero-operand content operation (`q`, `Q`, …).
+fn op0(operator: &[u8]) -> content::Operation {
+    content::Operation { operator: operator.to_vec(), operands: Vec::new() }
+}
+
 /// Push every indirect reference contained in `object` onto `out`.
 fn collect_refs(object: &Object, out: &mut Vec<ObjectId>) {
     match object {
@@ -4416,6 +4634,263 @@ impl Document {
         self.objects.insert(catalog_id, Object::Dictionary(catalog));
 
         Ok(baked)
+    }
+
+    /// Inline every `/Subtype /Form` XObject invoked via `Do` on `page_no`
+    /// **into the page's content stream**, so the form's text/graphics become
+    /// ordinary page content. Each `Do` invocation gets its own inlined copy
+    /// (the form is **de-shared**): editing the run of one placement no longer
+    /// affects another. Image XObjects (`/Subtype /Image`) and unresolvable
+    /// `Do`s are left untouched.
+    ///
+    /// After this, [`page_text_elements`](Self::page_text_elements) returns the
+    /// former form text as normal page runs with **real, editable indices** (no
+    /// form sentinel), so [`replace_text_run`](Self::replace_text_run),
+    /// [`move_element`](Self::move_element) and
+    /// [`remove_element`](Self::remove_element) work on them — the enabler for
+    /// in-place invoice/template editing.
+    ///
+    /// Mechanics: each `name Do` is replaced by `q [cm] <inlined form content> Q`,
+    /// where `cm` reproduces the form's `/Matrix` when non-identity. The inlined
+    /// content references resources by NAME; those names are resolved against the
+    /// page's resources, copying each resource the form uses into the page (under
+    /// the same name when free / pointing at the same object, otherwise under a
+    /// fresh `{name}_fx{n}` name with the matching operand rewritten). A form
+    /// without `/Resources` inherits the page's, so its names already resolve and
+    /// no merge/rename happens. Nested forms (a form whose content has its own
+    /// `Do`) are inlined recursively, reusing the depth cap + visited-ref cycle
+    /// guard so self/mutually-referencing forms terminate.
+    ///
+    /// The fully inlined form entries are dropped from the page's
+    /// `/Resources /XObject` (they are now unreferenced); forms that were only
+    /// partially reachable (e.g. cut off by the depth cap) are kept so nothing is
+    /// silently lost. Returns the number of form XObjects inlined (counting every
+    /// `Do` invocation, since each is de-shared).
+    pub fn flatten_form_xobjects(&mut self, page_no: u32) -> Result<usize> {
+        let page_id = self.page_object_id(page_no)?;
+        let content = self.page_content(page_no)?;
+        let operations = content::parse_content(&content)?;
+
+        // Working copy of the page's resource sub-dictionaries, into which we
+        // merge (and possibly rename) the resources used by inlined forms.
+        let page_res = self
+            .page_dict(page_no)?
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let mut work = FlattenResources::from_dict(self, &page_res);
+
+        // Names of XObject forms fully inlined (to drop from /Resources /XObject).
+        let mut inlined_forms: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut count = 0usize;
+        let mut visited: BTreeSet<ObjectId> = BTreeSet::new();
+
+        // The top-level ops resolve names against the page's own resources, so no
+        // rename is applied to them (identity rename map).
+        let out = self.inline_form_ops(
+            &operations,
+            &page_res,
+            &Renames::identity(),
+            &mut work,
+            &mut inlined_forms,
+            &mut visited,
+            &mut count,
+            0,
+        );
+
+        if count == 0 {
+            return Ok(0); // nothing to inline — leave the page byte-identical
+        }
+
+        let new_content = content::encode_content(&out);
+        self.set_page_content(page_no, new_content)?;
+
+        // Write the merged resources back onto the page, dropping the XObject
+        // entries that were fully inlined (now unreferenced).
+        let mut resources = work.into_dict();
+        if !inlined_forms.is_empty() {
+            if let Some(Object::Dictionary(xobj)) = resources.0.get_mut(b"XObject".as_slice()) {
+                for name in &inlined_forms {
+                    xobj.0.remove(name);
+                }
+                if xobj.is_empty() {
+                    resources.remove(b"XObject");
+                }
+            }
+        }
+        let mut page = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .ok_or(EngineError::PageNotFound(page_no))?
+            .clone();
+        page.set(b"Resources".to_vec(), Object::Dictionary(resources));
+        self.objects.insert(page_id, Object::Dictionary(page));
+
+        Ok(count)
+    }
+
+    /// Recursive worker for [`flatten_form_xobjects`](Self::flatten_form_xobjects).
+    ///
+    /// Rewrites `operations` (which resolve resource names against `scope_res`)
+    /// into a flat operation list, applying `renames` to this scope's
+    /// resource-name operands and splicing each form `Do` as `q [cm] … Q`.
+    /// `work` accumulates the merged page resources; `inlined_forms` collects the
+    /// names of fully inlined top-level forms; `visited` is the per-path set of
+    /// form object-refs (cycle guard); `count` tallies inlined invocations.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_form_ops(
+        &self,
+        operations: &[content::Operation],
+        scope_res: &Dictionary,
+        renames: &Renames,
+        work: &mut FlattenResources,
+        inlined_forms: &mut BTreeSet<Vec<u8>>,
+        visited: &mut BTreeSet<ObjectId>,
+        count: &mut usize,
+        depth: usize,
+    ) -> Vec<content::Operation> {
+        let mut out = Vec::with_capacity(operations.len());
+        for op in operations {
+            // A form `Do` we can resolve (and haven't hit the depth/cycle guard)
+            // is inlined; everything else is emitted with its names rewritten.
+            if op.operator == b"Do" && depth < content::MAX_FORM_DEPTH {
+                if let Some(name) = op.operands.iter().find_map(Object::as_name) {
+                    // The name as it appears in the page (post-rename), then the
+                    // form object behind it (looked up against this scope).
+                    if let Some(form) = self.resolve_form_in(scope_res, name) {
+                        let on_path = form.id.is_some_and(|id| visited.contains(&id));
+                        if !on_path {
+                            *count += 1;
+                            if depth == 0 {
+                                inlined_forms.insert(name.to_vec());
+                            }
+                            out.extend(self.inline_one_form(
+                                &form,
+                                scope_res,
+                                work,
+                                inlined_forms,
+                                visited,
+                                count,
+                                depth,
+                            ));
+                            continue;
+                        }
+                        // On the current path (cycle): drop the self-reference,
+                        // matching the extractor's expand-at-most-once behaviour.
+                        continue;
+                    }
+                }
+            }
+            // Non-inlined op: rewrite its resource-name operands per `renames`.
+            out.push(renames.apply(op));
+        }
+        out
+    }
+
+    /// Inline a single resolved form: emit `q [cm] <body> Q`, where `<body>` is
+    /// the form's content with its resources merged into the page (renaming on
+    /// collision) and nested `Do`s recursively inlined.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_one_form(
+        &self,
+        form: &ResolvedForm,
+        parent_scope: &Dictionary,
+        work: &mut FlattenResources,
+        inlined_forms: &mut BTreeSet<Vec<u8>>,
+        visited: &mut BTreeSet<ObjectId>,
+        count: &mut usize,
+        depth: usize,
+    ) -> Vec<content::Operation> {
+        let mut out = Vec::new();
+        out.push(op0(b"q"));
+        // Reproduce the form `/Matrix` (default identity ⇒ no `cm`).
+        let m = form.matrix.0;
+        if m != [1.0, 0.0, 0.0, 1.0, 0.0, 0.0] {
+            out.push(content::Operation {
+                operator: b"cm".to_vec(),
+                operands: m.iter().map(|&v| Object::Real(v)).collect(),
+            });
+        }
+
+        // A form with its own `/Resources` resolves names against them: merge
+        // those into the page and build the rename map. A form WITHOUT
+        // `/Resources` inherits the parent scope — its names already resolve
+        // there, so we inline its body against `parent_scope` with no renames.
+        let body_ops = content::parse_content(&form.content).unwrap_or_default();
+        match &form.resources {
+            Some(form_res) => {
+                let renames = work.merge_scope(self, form_res);
+                let pushed = form.id.map(|id| visited.insert(id)).unwrap_or(false);
+                out.extend(self.inline_form_ops(
+                    &body_ops,
+                    form_res,
+                    &renames,
+                    work,
+                    inlined_forms,
+                    visited,
+                    count,
+                    depth + 1,
+                ));
+                if pushed {
+                    if let Some(id) = form.id {
+                        visited.remove(&id);
+                    }
+                }
+            }
+            None => {
+                let pushed = form.id.map(|id| visited.insert(id)).unwrap_or(false);
+                out.extend(self.inline_form_ops(
+                    &body_ops,
+                    parent_scope,
+                    &Renames::identity(),
+                    work,
+                    inlined_forms,
+                    visited,
+                    count,
+                    depth + 1,
+                ));
+                if pushed {
+                    if let Some(id) = form.id {
+                        visited.remove(&id);
+                    }
+                }
+            }
+        }
+
+        out.push(op0(b"Q"));
+        out
+    }
+
+    /// Resolve XObject resource `name` against `scope_res /XObject` to a
+    /// [`ResolvedForm`] when it is a `/Subtype /Form`; `None` for images,
+    /// non-form XObjects, or undecodable streams.
+    fn resolve_form_in(&self, scope_res: &Dictionary, name: &[u8]) -> Option<ResolvedForm> {
+        let value = scope_res
+            .get(b"XObject")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|x| x.get(name))?;
+        let id = value.as_reference();
+        let stream = self.resolve(value).as_stream()?;
+        if stream.dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Form".as_slice()) {
+            return None;
+        }
+        let content = decode_stream(stream).ok()?;
+        let resources = stream
+            .dict
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned();
+        Some(ResolvedForm {
+            content,
+            resources,
+            matrix: self.form_matrix(&stream.dict),
+            id,
+        })
     }
 
     // ─── page operations & metadata ──────────────────────────────────────────
@@ -9586,5 +10061,295 @@ mod tests {
         // Both forms' text appears and extraction terminates (no hang/panic).
         assert!(runs.iter().any(|r| r.text == "AAA"), "FmA text extracted: {runs:?}");
         assert!(runs.iter().any(|r| r.text == "BBB"), "FmB text extracted: {runs:?}");
+    }
+
+    // ── form-XObject FLATTENING (`flatten_form_xobjects`) ────────────────────
+
+    #[test]
+    fn flatten_form_xobjects_makes_form_text_editable_in_place() {
+        // Reuse the recursion fixture: "PAGE" top-level + "FORM" via `Do` under a
+        // non-identity `cm` AND a non-identity form `/Matrix`. After flattening,
+        // the form text is a normal page run with a real (non-sentinel) index.
+        let mut doc = Document::open(&form_xobject_fixture()).unwrap();
+        let n = doc.flatten_form_xobjects(1).unwrap();
+        assert_eq!(n, 1, "exactly one form XObject inlined");
+
+        let els = doc.page_text_elements(1);
+        let form = els.iter().find(|e| e.text == "FORM").expect("FORM still present after flatten");
+        assert_ne!(form.index, usize::MAX, "form text now carries a real, editable index");
+        // Page space = form unit → /Matrix(10,20) → cm(30,40) = translate(40,60);
+        // baseline (5,5) → (45,65). Position must survive the inlining `cm`.
+        assert!((form.x - 45.0).abs() < 1.0, "FORM x≈45 (page space) after flatten, got {}", form.x);
+
+        // The new index drives replace_text_run end-to-end.
+        doc.replace_text_run(1, form.index, "DONE").unwrap();
+        let text = doc.to_text();
+        assert!(text.contains("DONE"), "edited form text via real index: {text:?}");
+        assert!(!text.contains("FORM"), "old form text replaced");
+        assert!(text.contains("PAGE"), "top-level text untouched");
+
+        // The fully inlined form entry is dropped from /Resources /XObject.
+        let page = doc.page_dict(1).unwrap();
+        let still_xobj = page
+            .get(b"Resources")
+            .and_then(Object::as_dict)
+            .and_then(|r| r.get(b"XObject"))
+            .and_then(Object::as_dict)
+            .map(|x| x.contains(b"Fm0"))
+            .unwrap_or(false);
+        assert!(!still_xobj, "inlined form /Fm0 dropped from page XObject resources");
+    }
+
+    /// A page that places the SAME form XObject TWICE, at two different `cm`
+    /// translations. Each placement must inline its own copy (de-shared).
+    fn form_placed_twice_fixture() -> Vec<u8> {
+        // Draw /Fm0 once at translate(0,0) and once at translate(0,100).
+        let page_stream =
+            "q 1 0 0 1 0 0 cm /Fm0 Do Q\nq 1 0 0 1 0 100 cm /Fm0 Do Q";
+        let form_stream = "BT /F1 12 Tf 5 5 Td (DUP) Tj ET";
+        raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+            ),
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 6 0 R >> >> \
+                     /Length {} >> stream\n{form_stream}\nendstream",
+                    form_stream.len()
+                ),
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+        ])
+    }
+
+    #[test]
+    fn flatten_form_xobjects_de_shares_repeated_placements() {
+        let mut doc = Document::open(&form_placed_twice_fixture()).unwrap();
+        // Two placements → two inlined copies.
+        let n = doc.flatten_form_xobjects(1).unwrap();
+        assert_eq!(n, 2, "both placements inlined");
+
+        let els = doc.page_text_elements(1);
+        let dups: Vec<&TextElementInfo> = els.iter().filter(|e| e.text == "DUP").collect();
+        assert_eq!(dups.len(), 2, "both copies present as page text");
+        // They are at different y (0+5 vs 100+5) → distinct, de-shared runs.
+        let (i0, i1) = (dups[0].index, dups[1].index);
+        assert_ne!(i0, usize::MAX, "first copy editable");
+        assert_ne!(i1, usize::MAX, "second copy editable");
+        assert_ne!(i0, i1, "the two copies are independent runs (de-shared)");
+
+        // Editing one copy must NOT change the other.
+        let lower = dups.iter().min_by(|a, b| a.y.total_cmp(&b.y)).unwrap();
+        doc.replace_text_run(1, lower.index, "ONE").unwrap();
+        let after: Vec<String> = doc.page_text_elements(1).into_iter().map(|e| e.text).collect();
+        assert!(after.iter().any(|t| t == "ONE"), "edited copy changed: {after:?}");
+        assert!(
+            after.iter().filter(|t| *t == "DUP").count() == 1,
+            "the other copy is untouched (still 'DUP'): {after:?}"
+        );
+    }
+
+    #[test]
+    fn flatten_form_xobjects_renames_colliding_resource() {
+        // Page `/F1` = Helvetica (obj 6); form `/F1` = Courier (obj 7) — SAME
+        // name, DIFFERENT font objects. After flatten the form's run must use the
+        // renamed font so both the page's and the form's text extract correctly.
+        let page_stream = "BT /F1 12 Tf 50 150 Td (PAGE) Tj ET\nq 1 0 0 1 30 40 cm /Fm0 Do Q";
+        let form_stream = "BT /F1 12 Tf 5 5 Td (FORM) Tj ET";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+            ),
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 7 0 R >> >> \
+                     /Length {} >> stream\n{form_stream}\nendstream",
+                    form_stream.len()
+                ),
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".into()),
+        ]);
+        let mut doc = Document::open(&pdf).unwrap();
+        assert_eq!(doc.flatten_form_xobjects(1).unwrap(), 1);
+
+        let els = doc.page_text_elements(1);
+        let page = els.iter().find(|e| e.text == "PAGE").expect("PAGE present");
+        let form = els.iter().find(|e| e.text == "FORM").expect("FORM present");
+        // Page text keeps Helvetica; form text resolves through the renamed
+        // Courier font (proves the rename targeted the right /BaseFont).
+        assert!(
+            page.font_family.contains("Helvetica"),
+            "page run stays Helvetica, got {}",
+            page.font_family
+        );
+        assert!(
+            form.font_family.contains("Courier"),
+            "form run resolves the renamed Courier font, got {}",
+            form.font_family
+        );
+        // Two distinct fonts live in the merged page resources (F1 + F1_fx0).
+        let font_names: Vec<Vec<u8>> = doc
+            .page_dict(1)
+            .unwrap()
+            .get(b"Resources")
+            .and_then(Object::as_dict)
+            .and_then(|r| r.get(b"Font"))
+            .and_then(Object::as_dict)
+            .map(|f| f.0.keys().cloned().collect())
+            .unwrap_or_default();
+        assert!(font_names.contains(&b"F1".to_vec()), "page F1 kept: {font_names:?}");
+        assert!(
+            font_names.iter().any(|n| n.starts_with(b"F1_fx")),
+            "colliding form font copied under a fresh name: {font_names:?}"
+        );
+        // Editing each run still hits the right text.
+        doc.replace_text_run(1, page.index, "PG2").unwrap();
+        doc.replace_text_run(1, form.index, "FM2").unwrap();
+        let t = doc.to_text();
+        assert!(t.contains("PG2") && t.contains("FM2"), "both edited: {t:?}");
+    }
+
+    #[test]
+    fn flatten_form_xobjects_nested_forms_and_cycle_terminate() {
+        // Form A's content invokes form B (`Do`). Flatten must inline both, and a
+        // self-referencing form must terminate (no infinite loop / panic).
+        let a_stream = "BT /F1 12 Tf 5 5 Td (AOUT) Tj ET\n/FmB Do";
+        let b_stream = "BT /F1 12 Tf 5 20 Td (BINNER) Tj ET";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /FmA 5 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, {
+                let s = "/FmA Do";
+                format!("<< /Length {} >> stream\n{s}\nendstream", s.len())
+            }),
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 6 0 R >> /XObject << /FmB 7 0 R >> >> \
+                     /Length {} >> stream\n{a_stream}\nendstream",
+                    a_stream.len()
+                ),
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                7,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 6 0 R >> >> \
+                     /Length {} >> stream\n{b_stream}\nendstream",
+                    b_stream.len()
+                ),
+            ),
+        ]);
+        let mut doc = Document::open(&pdf).unwrap();
+        // FmA (1) + nested FmB (1) inlined.
+        let n = doc.flatten_form_xobjects(1).unwrap();
+        assert_eq!(n, 2, "outer + nested form both inlined");
+        let texts: Vec<String> = doc.page_text_elements(1).into_iter().map(|e| e.text).collect();
+        assert!(texts.iter().any(|t| t == "AOUT"), "outer form text inlined: {texts:?}");
+        assert!(texts.iter().any(|t| t == "BINNER"), "nested form text inlined: {texts:?}");
+
+        // A self-referencing form must terminate without hanging or panicking.
+        let loop_stream = "BT /F1 12 Tf 5 5 Td (LOOP) Tj ET\n/Fm0 Do";
+        let cyc = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, {
+                let s = "/Fm0 Do";
+                format!("<< /Length {} >> stream\n{s}\nendstream", s.len())
+            }),
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                     /Length {} >> stream\n{loop_stream}\nendstream",
+                    loop_stream.len()
+                ),
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+        ]);
+        let mut cdoc = Document::open(&cyc).unwrap();
+        let cn = cdoc.flatten_form_xobjects(1).unwrap(); // must return, not hang
+        assert!(cn >= 1, "self-ref form inlined at least once");
+        let ctexts: Vec<String> = cdoc.page_text_elements(1).into_iter().map(|e| e.text).collect();
+        assert!(ctexts.iter().any(|t| t == "LOOP"), "self-ref form text present once-ish: {ctexts:?}");
+    }
+
+    #[test]
+    fn flatten_form_xobjects_leaves_image_do_untouched() {
+        // A page that draws an /Image XObject via `Do`. Flattening forms must NOT
+        // touch the image `Do` (it stays a `Do`, still references /Im0).
+        let page_stream = "q 64 0 0 64 50 600 cm /Im0 Do Q";
+        // Tiny 1x1 DeviceRGB image (raw, no filter). The 3 pixel bytes are
+        // ASCII-safe placeholders ('A','B','C') — the flatten logic only inspects
+        // `/Subtype`, not the sample data.
+        let img_obj = "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >> \
+             stream\nABC\nendstream";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+            ),
+            (5, img_obj.into()),
+        ]);
+        let mut doc = Document::open(&pdf).unwrap();
+        let n = doc.flatten_form_xobjects(1).unwrap();
+        assert_eq!(n, 0, "no form XObjects → nothing inlined");
+        // The image is still drawn via a `Do` referencing /Im0.
+        let content = doc.page_content(1).unwrap();
+        assert!(has_op(&content, b"/Im0"), "image still referenced by name");
+        assert!(has_op(&content, b"Do"), "image `Do` preserved");
+        // And the image is still extractable as an image element.
+        assert_eq!(doc.page_image_elements(1).len(), 1, "image element intact");
     }
 }

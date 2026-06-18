@@ -373,7 +373,7 @@ pub struct FormXObject {
 /// Max recursion depth for nested form XObjects (`Do` inside a form inside a
 /// form …). Beyond this we stop descending and return what we have — a guard
 /// against pathological nesting, complementing the resolver's cycle set.
-const MAX_FORM_DEPTH: usize = 12;
+pub const MAX_FORM_DEPTH: usize = 12;
 
 /// A sentinel `op_position` for runs that live **inside a form XObject**, not in
 /// the page's top-level operation list. The top-level op index is meaningless
