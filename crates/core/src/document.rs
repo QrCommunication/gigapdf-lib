@@ -260,6 +260,51 @@ fn op0(operator: &[u8]) -> content::Operation {
     content::Operation { operator: operator.to_vec(), operands: Vec::new() }
 }
 
+/// The appearance matrix that maps an annotation's appearance stream into its
+/// `/Rect`, per ISO 32000-1 §12.5.5 ("Algorithm: Appearance streams"):
+///
+/// 1. transform the four `/BBox` corners by the form's `/Matrix`;
+/// 2. take the axis-aligned bounding box (the "transformed appearance box");
+/// 3. compute the matrix `A` that scales+translates that box onto `/Rect`;
+/// 4. the appearance is rendered with `Matrix · A` (the form `/Matrix` first,
+///    then `A`).
+///
+/// Returns `None` when the transformed box or the `/Rect` is degenerate (zero
+/// width or height) — there is then no sensible mapping and the caller skips the
+/// annotation. For the engine's own annotations (`/BBox == /Rect`, identity
+/// `/Matrix`) this reduces to the identity, leaving the appearance in page space.
+fn appearance_matrix(
+    bbox: [f64; 4],
+    matrix: content::PageMatrix,
+    rect: [f64; 4],
+) -> Option<content::PageMatrix> {
+    let [bx0, by0, bx1, by1] = bbox;
+    let corners = [(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1)];
+    let mut tx0 = f64::INFINITY;
+    let mut ty0 = f64::INFINITY;
+    let mut tx1 = f64::NEG_INFINITY;
+    let mut ty1 = f64::NEG_INFINITY;
+    for (x, y) in corners {
+        let (px, py) = matrix.apply(x, y);
+        tx0 = tx0.min(px);
+        ty0 = ty0.min(py);
+        tx1 = tx1.max(px);
+        ty1 = ty1.max(py);
+    }
+    let (tw, th) = (tx1 - tx0, ty1 - ty0);
+    let [rx0, ry0, rx1, ry1] = rect;
+    let (rw, rh) = (rx1 - rx0, ry1 - ry0);
+    if tw.abs() < 1e-9 || th.abs() < 1e-9 || rw.abs() < 1e-9 || rh.abs() < 1e-9 {
+        return None;
+    }
+    let sx = rw / tw;
+    let sy = rh / th;
+    // `A`: scale the transformed box by (sx, sy) then translate its origin to the
+    // Rect origin — `[sx 0 0 sy  rx0 - sx·tx0  ry0 - sy·ty0]`.
+    let a = content::PageMatrix::new(sx, 0.0, 0.0, sy, rx0 - sx * tx0, ry0 - sy * ty0);
+    Some(matrix.then(&a))
+}
+
 /// Push every indirect reference contained in `object` onto `out`.
 fn collect_refs(object: &Object, out: &mut Vec<ObjectId>) {
     match object {
@@ -1764,9 +1809,105 @@ impl Document {
         let content = self.page_content(page_no)?;
         let fonts = self.page_render_fonts(page_no);
         let images = self.page_images(page_no);
-        Ok(crate::raster::render_content(
-            &content, width, height, base, &fonts, &images,
-        ))
+        let mut canvas = crate::raster::Canvas::new(width, height);
+        crate::raster::render_content_into(&mut canvas, &content, base, &fonts, &images, 1.0);
+        // Paint annotation appearances (`/AP /N`) over the page content, the way
+        // every viewer does: page content is the body, annotations layer on top.
+        self.render_annotation_appearances(page_no, &mut canvas, base);
+        Ok(canvas)
+    }
+
+    /// Paint each visible annotation's normal appearance stream (`/AP /N`) onto
+    /// `canvas`, over the already-rendered page content. `base` is the page
+    /// user-space → device matrix.
+    ///
+    /// For every annotation on the page we skip the Hidden (bit 2) and NoView
+    /// (bit 6) flags, resolve `/AP /N` (selecting an appearance-state sub-dict
+    /// via `/AS`), then map the appearance's `/BBox` (transformed by its
+    /// `/Matrix`) onto the annotation `/Rect` with the standard appearance
+    /// transform (ISO 32000-1 §12.5.5) and rasterize the form through the shared
+    /// content renderer. Annotations without an appearance are skipped. `/CA`
+    /// (non-stroking opacity) scales the paint.
+    fn render_annotation_appearances(
+        &self,
+        page_no: u32,
+        canvas: &mut crate::raster::Canvas,
+        base: content::PageMatrix,
+    ) {
+        let Ok(page) = self.page_dict(page_no) else {
+            return;
+        };
+        let annots = match page.get(b"Annots").map(|o| self.resolve(o)) {
+            Some(Object::Array(items)) => items,
+            _ => return,
+        };
+        for item in annots {
+            let Some(dict) = self.resolve(item).as_dict() else {
+                continue;
+            };
+            // Skip Hidden (bit 2 → value 2) and NoView (bit 6 → value 32).
+            let flags = dict.get(b"F").and_then(Object::as_i64).unwrap_or(0);
+            if flags & 0b10 != 0 || flags & 0b10_0000 != 0 {
+                continue;
+            }
+            let Some(form_id) = self.annotation_appearance_id(dict) else {
+                continue; // No appearance to draw.
+            };
+            let Some(stream) = self.objects.get(&form_id).and_then(Object::as_stream) else {
+                continue;
+            };
+            let Ok(appearance) = decode_stream(stream) else {
+                continue;
+            };
+            let rect = self.normalized_rect(self.read_rect(dict));
+            let bbox = self.read_bbox(&stream.dict);
+            let matrix = self.form_matrix(&stream.dict);
+            let Some(ap_matrix) = appearance_matrix(bbox, matrix, rect) else {
+                continue; // Degenerate BBox/Rect — nothing sensible to map.
+            };
+            let resources = stream
+                .dict
+                .get(b"Resources")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_default();
+            let fonts = self.render_fonts_for(&resources);
+            let images = self.images_for(&resources);
+            // Compose: appearance space → page user space → device.
+            let device = ap_matrix.then(&base);
+            let alpha = dict
+                .get(b"CA")
+                .map(|o| self.resolve(o))
+                .and_then(|o| o.as_f64())
+                .unwrap_or(1.0);
+            crate::raster::render_content_into(canvas, &appearance, device, &fonts, &images, alpha);
+        }
+    }
+
+    /// Read a form XObject's `/BBox` `[x0 y0 x1 y1]`; defaults to a unit box.
+    fn read_bbox(&self, dict: &Dictionary) -> [f64; 4] {
+        let mut bbox = [0.0, 0.0, 1.0, 1.0];
+        if let Some(items) = dict
+            .get(b"BBox")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            for (i, value) in items.iter().take(4).enumerate() {
+                bbox[i] = self.resolve(value).as_f64().unwrap_or(bbox[i]);
+            }
+        }
+        bbox
+    }
+
+    /// Normalise a `/Rect` so `x0 <= x1` and `y0 <= y1` (PDF allows either order).
+    fn normalized_rect(&self, r: [f64; 4]) -> [f64; 4] {
+        [
+            r[0].min(r[2]),
+            r[1].min(r[3]),
+            r[0].max(r[2]),
+            r[1].max(r[3]),
+        ]
     }
 
     /// OCR a page with the built-in zero-dependency recognizer. The page is
@@ -2102,15 +2243,25 @@ impl Document {
     /// Decode the page's image XObjects (`DeviceRGB`/`DeviceGray`, 8 bpc, Flate
     /// or raw — JPEG/JPX are skipped) into RGBA buffers for the rasterizer.
     fn page_images(&self, page_no: u32) -> crate::raster::render::RenderImages {
+        match self.page_dict(page_no).ok().and_then(|page| {
+            page.get(b"Resources")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .cloned()
+        }) {
+            Some(res) => self.images_for(&res),
+            None => crate::raster::render::RenderImages::new(),
+        }
+    }
+
+    /// Build the decodable image XObjects of a `/Resources` dictionary's
+    /// `/XObject` sub-dictionary, keyed by resource name. Works for a page's
+    /// resources *and* an annotation appearance's own `/Resources`, so an
+    /// appearance that draws images rasterizes them too.
+    fn images_for(&self, resources: &Dictionary) -> crate::raster::render::RenderImages {
         let mut out = crate::raster::render::RenderImages::new();
-        let Ok(page) = self.page_dict(page_no) else {
-            return out;
-        };
-        let xobjects = page
-            .get(b"Resources")
-            .map(|o| self.resolve(o))
-            .and_then(Object::as_dict)
-            .and_then(|res| res.get(b"XObject"))
+        let xobjects = resources
+            .get(b"XObject")
             .map(|o| self.resolve(o))
             .and_then(Object::as_dict);
         let Some(xobjects) = xobjects else {
@@ -2325,15 +2476,25 @@ impl Document {
     /// Build per-font render data (embedded TrueType program + decoder) from a
     /// page's `/Resources /Font`, for the rasterizer's glyph rendering.
     fn page_render_fonts(&self, page_no: u32) -> crate::raster::render::RenderFonts {
+        match self.page_dict(page_no).ok().and_then(|page| {
+            page.get(b"Resources")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .cloned()
+        }) {
+            Some(res) => self.render_fonts_for(&res),
+            None => crate::raster::render::RenderFonts::new(),
+        }
+    }
+
+    /// Build the glyph-bearing render fonts of a `/Resources` dictionary's
+    /// `/Font` sub-dictionary, keyed by resource name. Reused for a page's
+    /// resources *and* an annotation appearance's own `/Resources` so an
+    /// appearance's text (e.g. a FreeText box) rasterizes with the right faces.
+    fn render_fonts_for(&self, resources: &Dictionary) -> crate::raster::render::RenderFonts {
         let mut out = crate::raster::render::RenderFonts::new();
-        let Ok(page) = self.page_dict(page_no) else {
-            return out;
-        };
-        let font_dict = page
-            .get(b"Resources")
-            .map(|o| self.resolve(o))
-            .and_then(Object::as_dict)
-            .and_then(|res| res.get(b"Font"))
+        let font_dict = resources
+            .get(b"Font")
             .map(|o| self.resolve(o))
             .and_then(Object::as_dict);
         let Some(font_dict) = font_dict else {
@@ -8808,6 +8969,226 @@ mod tests {
         let png = doc.render_page(1, 1.0).unwrap();
         assert_eq!(&png[0..4], &[0x89, b'P', b'N', b'G'], "valid PNG header");
         assert!(png.len() > 1000, "non-trivial PNG ({} bytes)", png.len());
+    }
+
+    /// A blank 200×200 page → `Document`, for annotation-render tests.
+    fn blank_200() -> Document {
+        let mut b = crate::convert::build::PdfBuilder::new();
+        b.add_page(200.0, 200.0);
+        Document::open(&b.finish()).unwrap()
+    }
+
+    /// Count non-white pixels of a rendered page inside a device-pixel rectangle
+    /// `[x0, y0, x1, y1)` (top-left origin). Asserts a valid PNG first.
+    fn nonwhite_in(png: &[u8], x0: usize, y0: usize, x1: usize, y1: usize) -> usize {
+        let img = crate::raster::decode_png(png).expect("valid PNG");
+        let w = img.width as usize;
+        let mut n = 0;
+        for y in y0..y1.min(img.height as usize) {
+            for x in x0..x1.min(w) {
+                let i = (y * w + x) * 4;
+                if img.rgba[i] != 255 || img.rgba[i + 1] != 255 || img.rgba[i + 2] != 255 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn renders_square_annotation_appearance_into_its_rect() {
+        // A red-filled Square annotation carries an `/AP /N` appearance. The page
+        // renderer must paint that appearance — previously annotations were
+        // skipped entirely and the page rendered all-white.
+        let mut doc = blank_200();
+        doc.add_square_annotation(
+            1,
+            [50.0, 50.0, 150.0, 150.0],
+            None,
+            Some([1.0, 0.0, 0.0]),
+            2.0,
+        )
+        .unwrap();
+        let png = doc.render_page(1, 1.0).unwrap();
+
+        // Page is 200 tall → user y is flipped to device y. The Rect maps to the
+        // device box rows/cols 50..150; its centre must be the red fill.
+        let img = crate::raster::decode_png(&png).unwrap();
+        let centre = (100 * img.width as usize + 100) * 4;
+        assert_eq!(
+            &img.rgba[centre..centre + 3],
+            &[255, 0, 0],
+            "annotation appearance fill is drawn inside the Rect"
+        );
+        // Inside the Rect: substantial ink. Outside (top-left 40×40 corner): none.
+        assert!(
+            nonwhite_in(&png, 55, 55, 145, 145) > 5000,
+            "appearance fills its Rect"
+        );
+        assert_eq!(
+            nonwhite_in(&png, 0, 0, 40, 40),
+            0,
+            "nothing painted outside the Rect"
+        );
+    }
+
+    #[test]
+    fn hidden_annotation_appearance_is_not_rendered() {
+        // Same red Square, but flagged Hidden (`/F` bit 2). A viewer must not
+        // paint it — the page stays all-white.
+        let mut doc = blank_200();
+        doc.add_square_annotation(
+            1,
+            [50.0, 50.0, 150.0, 150.0],
+            None,
+            Some([1.0, 0.0, 0.0]),
+            2.0,
+        )
+        .unwrap();
+        // Set the Hidden flag on the (only) annotation object.
+        let annot_id = *doc
+            .objects
+            .iter()
+            .find(|(_, o)| {
+                o.as_dict()
+                    .and_then(|d| d.get(b"Subtype"))
+                    .and_then(Object::as_name)
+                    == Some(b"Square".as_slice())
+            })
+            .map(|(id, _)| id)
+            .expect("square annotation object");
+        if let Some(mut dict) = doc
+            .objects
+            .get(&annot_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        {
+            dict.set(b"F".to_vec(), Object::Integer(2)); // Hidden
+            doc.objects.insert(annot_id, Object::Dictionary(dict));
+        }
+        let png = doc.render_page(1, 1.0).unwrap();
+        assert_eq!(
+            nonwhite_in(&png, 0, 0, 200, 200),
+            0,
+            "hidden annotation must not be painted"
+        );
+    }
+
+    #[test]
+    fn appearance_matrix_scales_and_translates_bbox_onto_rect() {
+        // BBox [0 0 10 10], identity /Matrix, Rect [100 100 150 140]:
+        // the box must map onto the Rect with sx = 50/10 = 5, sy = 40/10 = 4 and
+        // origin translated to (100, 100).
+        let m = appearance_matrix(
+            [0.0, 0.0, 10.0, 10.0],
+            content::PageMatrix::IDENTITY,
+            [100.0, 100.0, 150.0, 140.0],
+        )
+        .expect("non-degenerate mapping");
+        let (x0, y0) = m.apply(0.0, 0.0);
+        let (x1, y1) = m.apply(10.0, 10.0);
+        assert!(
+            (x0 - 100.0).abs() < 1e-9 && (y0 - 100.0).abs() < 1e-9,
+            "origin → Rect corner"
+        );
+        assert!(
+            (x1 - 150.0).abs() < 1e-9 && (y1 - 140.0).abs() < 1e-9,
+            "far corner → Rect corner"
+        );
+
+        // The engine's own annotations use BBox == Rect, identity Matrix → the
+        // mapping reduces to the identity.
+        let id = appearance_matrix(
+            [50.0, 50.0, 150.0, 150.0],
+            content::PageMatrix::IDENTITY,
+            [50.0, 50.0, 150.0, 150.0],
+        )
+        .unwrap();
+        let (px, py) = id.apply(75.0, 80.0);
+        assert!(
+            (px - 75.0).abs() < 1e-9 && (py - 80.0).abs() < 1e-9,
+            "identity for BBox==Rect"
+        );
+
+        // Degenerate Rect (zero height) → no mapping.
+        assert!(appearance_matrix(
+            [0.0, 0.0, 10.0, 10.0],
+            content::PageMatrix::IDENTITY,
+            [10.0, 10.0, 20.0, 10.0],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn appearance_with_offset_bbox_is_scaled_onto_rect() {
+        // A hand-built annotation whose appearance draws a green fill across its
+        // own small BBox [0 0 10 10], placed in a larger Rect. Exercises the
+        // general (non-identity) BBox→Rect appearance transform, not just the
+        // engine's own BBox==Rect annotations.
+        let mut doc = blank_200();
+        let rect = [40.0, 60.0, 160.0, 120.0]; // device rows 80..140, cols 40..160
+
+        // Appearance form XObject: BBox [0 0 10 10], fills it green.
+        let appearance = b"0 1 0 rg 0 0 10 10 re f".to_vec();
+        let mut form = Dictionary::new();
+        form.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+        form.set(b"Subtype".to_vec(), Object::Name(b"Form".to_vec()));
+        form.set(
+            b"BBox".to_vec(),
+            Object::Array(vec![
+                Object::Real(0.0),
+                Object::Real(0.0),
+                Object::Real(10.0),
+                Object::Real(10.0),
+            ]),
+        );
+        form.set(b"Length".to_vec(), Object::Integer(appearance.len() as i64));
+        let form_id = (doc.next_object_number(), 0u16);
+        doc.objects
+            .insert(form_id, Object::Stream(Stream::new(form, appearance)));
+
+        // Annotation dict with /AP /N → form, and a Rect bigger than the BBox.
+        let mut ap = Dictionary::new();
+        ap.set(b"N".to_vec(), Object::Reference(form_id));
+        let mut annot = Dictionary::new();
+        annot.set(b"Type".to_vec(), Object::Name(b"Annot".to_vec()));
+        annot.set(b"Subtype".to_vec(), Object::Name(b"Square".to_vec()));
+        annot.set(
+            b"Rect".to_vec(),
+            Object::Array(rect.iter().map(|&v| Object::Real(v)).collect()),
+        );
+        annot.set(b"AP".to_vec(), Object::Dictionary(ap));
+        let annot_id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(annot_id, Object::Dictionary(annot));
+
+        // Attach to the page's /Annots.
+        let page_id = doc.page_object_id(1).unwrap();
+        let mut page = doc
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+        page.set(
+            b"Annots".to_vec(),
+            Object::Array(vec![Object::Reference(annot_id)]),
+        );
+        doc.objects.insert(page_id, Object::Dictionary(page));
+
+        let png = doc.render_page(1, 1.0).unwrap();
+        // The 10×10 appearance must be scaled to fill the whole Rect: its centre
+        // (device row 110, col 100) is green, and most of the Rect is inked.
+        let img = crate::raster::decode_png(&png).unwrap();
+        let centre = (110 * img.width as usize + 100) * 4;
+        assert_eq!(
+            &img.rgba[centre..centre + 3],
+            &[0, 255, 0],
+            "scaled appearance fills the Rect centre"
+        );
+        assert!(
+            nonwhite_in(&png, 45, 85, 155, 135) > 4000,
+            "appearance scaled across the Rect, not left at BBox size"
+        );
     }
 
     #[test]

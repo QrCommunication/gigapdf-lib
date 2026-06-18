@@ -45,7 +45,15 @@ pub type RenderImages = BTreeMap<Vec<u8>, RenderImage>;
 /// Blit an image XObject into the canvas. The image fills the unit square in
 /// user space, mapped to the device by `ctm` then `base`; we inverse-map each
 /// device pixel to a texel so up- and down-scaling both work without gaps.
-fn blit_image(canvas: &mut Canvas, image: &RenderImage, ctm: &Matrix, base: &Matrix) {
+/// `global_alpha` (`0.0..=1.0`) scales the image's own per-pixel alpha — used to
+/// honour an annotation appearance's `/CA` opacity.
+fn blit_image(
+    canvas: &mut Canvas,
+    image: &RenderImage,
+    ctm: &Matrix,
+    base: &Matrix,
+    global_alpha: f64,
+) {
     if image.width == 0 || image.height == 0 {
         return;
     }
@@ -97,7 +105,7 @@ fn blit_image(canvas: &mut Canvas, image: &RenderImage, ctm: &Matrix, base: &Mat
             let row = (((1.0 - v) * h as f64) as usize).min(h - 1);
             let idx = (row * w + col) * 4;
             let color = [image.rgba[idx], image.rgba[idx + 1], image.rgba[idx + 2]];
-            let alpha = image.rgba[idx + 3] as f64 / 255.0;
+            let alpha = image.rgba[idx + 3] as f64 / 255.0 * global_alpha;
             canvas.blend(px, py, color, alpha);
         }
     }
@@ -236,9 +244,33 @@ pub fn render_content(
     images: &RenderImages,
 ) -> Canvas {
     let mut canvas = Canvas::new(width, height);
+    render_content_into(&mut canvas, content, base, fonts, images, 1.0);
+    canvas
+}
+
+/// Rasterize a decoded content stream onto an **existing** canvas, painting over
+/// whatever is already there. `base` maps the stream's user space to the device;
+/// `global_alpha` (`0.0..=1.0`) scales every paint operation's coverage/alpha so
+/// a caller can honour a constant opacity (an annotation appearance's `/CA`).
+///
+/// This is the shared engine behind [`render_content`] (which allocates a fresh
+/// white canvas) and the annotation-appearance pass (which paints each visible
+/// annotation's `/AP /N` form over the page content on the same canvas).
+pub fn render_content_into(
+    canvas: &mut Canvas,
+    content: &[u8],
+    base: Matrix,
+    fonts: &RenderFonts,
+    images: &RenderImages,
+    global_alpha: f64,
+) {
+    let global_alpha = global_alpha.clamp(0.0, 1.0);
+    if global_alpha <= 0.0 {
+        return;
+    }
     let operations = match parse_content(content) {
         Ok(ops) => ops,
-        Err(_) => return canvas,
+        Err(_) => return,
     };
 
     let mut state = GState::new(Matrix::IDENTITY);
@@ -313,16 +345,31 @@ pub fn render_content(
             }
             b"f" | b"F" | b"f*" | b"b" | b"b*" | b"B" | b"B*" => {
                 let even_odd = op.operator.ends_with(b"*");
-                canvas.fill(&subpath_edges(&subpaths), state.fill, even_odd);
+                canvas.fill_alpha(
+                    &subpath_edges(&subpaths),
+                    state.fill,
+                    even_odd,
+                    global_alpha,
+                );
                 if matches!(op.operator.as_slice(), b"b" | b"b*" | b"B" | b"B*") {
                     let lw = device_scale(&state.ctm, &base) * state.line_width;
-                    canvas.fill(&stroke_edges(&subpaths, lw), state.stroke, false);
+                    canvas.fill_alpha(
+                        &stroke_edges(&subpaths, lw),
+                        state.stroke,
+                        false,
+                        global_alpha,
+                    );
                 }
                 subpaths.clear();
             }
             b"S" | b"s" => {
                 let lw = device_scale(&state.ctm, &base) * state.line_width;
-                canvas.fill(&stroke_edges(&subpaths, lw), state.stroke, false);
+                canvas.fill_alpha(
+                    &stroke_edges(&subpaths, lw),
+                    state.stroke,
+                    false,
+                    global_alpha,
+                );
                 subpaths.clear();
             }
             b"n" => subpaths.clear(),
@@ -330,7 +377,7 @@ pub fn render_content(
             b"Do" => {
                 if let Some(Object::Name(name)) = op.operands.first() {
                     if let Some(image) = images.get(name) {
-                        blit_image(&mut canvas, image, &state.ctm, &base);
+                        blit_image(canvas, image, &state.ctm, &base, global_alpha);
                     }
                 }
             }
@@ -381,7 +428,7 @@ pub fn render_content(
                 }
                 if let (Some(f), Some(Object::String(bytes, _))) = (font, op.operands.last()) {
                     show_text(
-                        &mut canvas,
+                        canvas,
                         f,
                         font_size,
                         &mut tm,
@@ -391,6 +438,7 @@ pub fn render_content(
                         char_spacing,
                         word_spacing,
                         h_scale,
+                        global_alpha,
                         bytes,
                     );
                 }
@@ -400,7 +448,7 @@ pub fn render_content(
                     for item in items {
                         if let Object::String(bytes, _) = item {
                             show_text(
-                                &mut canvas,
+                                canvas,
                                 f,
                                 font_size,
                                 &mut tm,
@@ -410,6 +458,7 @@ pub fn render_content(
                                 char_spacing,
                                 word_spacing,
                                 h_scale,
+                                global_alpha,
                                 bytes,
                             );
                         } else if let Some(adj) = item.as_f64() {
@@ -422,11 +471,11 @@ pub fn render_content(
             _ => {}
         }
     }
-    canvas
 }
 
 /// Render a text-show string: for each character code, look up its glyph and
 /// fill the outline, advancing the text matrix by the glyph's width.
+/// `global_alpha` scales the fill coverage (annotation `/CA` opacity).
 #[allow(clippy::too_many_arguments)]
 fn show_text(
     canvas: &mut Canvas,
@@ -439,6 +488,7 @@ fn show_text(
     char_spacing: f64,
     word_spacing: f64,
     h_scale: f64,
+    global_alpha: f64,
     bytes: &[u8],
 ) {
     let mut i = 0;
@@ -487,7 +537,7 @@ fn show_text(
                 }
             }
             if !edges.is_empty() {
-                canvas.fill(&edges, fill, false);
+                canvas.fill_alpha(&edges, fill, false, global_alpha);
             }
             advance = ttf.advance_width(gid) / upem * size;
         }

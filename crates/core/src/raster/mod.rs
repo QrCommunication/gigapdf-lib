@@ -25,5 +25,5 @@ pub mod webp;
 pub use canvas::Canvas;
 pub use png::encode_png;
 pub use png_decode::decode_png;
-pub use render::render_content;
+pub use render::{render_content, render_content_into};
 pub use resize::resize_rgba;

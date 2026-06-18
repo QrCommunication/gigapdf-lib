@@ -56,7 +56,16 @@ impl Canvas {
     /// Fill the polygon described by `edges` with `color`, using non-zero or
     /// even-odd winding. `edges` may contain several sub-paths.
     pub fn fill(&mut self, edges: &[Edge], color: [u8; 3], even_odd: bool) {
-        if edges.is_empty() {
+        self.fill_alpha(edges, color, even_odd, 1.0);
+    }
+
+    /// Like [`fill`](Self::fill) but scales every pixel's coverage by a constant
+    /// `alpha` (`0.0..=1.0`) — used to honour an annotation's `/CA` (non-stroking
+    /// opacity) when painting its appearance. `alpha == 1.0` is identical to
+    /// [`fill`](Self::fill).
+    pub fn fill_alpha(&mut self, edges: &[Edge], color: [u8; 3], even_odd: bool, alpha: f64) {
+        let alpha = alpha.clamp(0.0, 1.0);
+        if edges.is_empty() || alpha <= 0.0 {
             return;
         }
         const SS: usize = 4; // vertical sub-samples per pixel row
@@ -121,7 +130,7 @@ impl Canvas {
             }
             for (px, &cov) in coverage.iter().enumerate() {
                 if cov > 0.0 {
-                    self.blend(px as i32, py, color, cov);
+                    self.blend(px as i32, py, color, cov * alpha);
                 }
             }
         }
