@@ -4,6 +4,36 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.48.0] - 2026-06-18
+
+### Fixed
+
+- **`Z_SYNC_FLUSH` deflate streams without a final block now decode.** Content
+  streams flushed with `Z_SYNC_FLUSH` end with an empty stored block
+  (`00 00 ff ff`, `BFINAL=0`) and no final block — common in signed PDFs (the
+  `q`/`Q`/overlay content pieces of Adobe FillSign) and any deflate produced via
+  a flush. The decoder looped past the flush expecting another block, hit
+  end-of-input and errored, so affected pages extracted **nothing**. It now
+  returns the bytes decoded so far when the input is exhausted at a block
+  boundary (matching pdfjs/Acrobat leniency); mid-block truncation still errors,
+  so genuinely corrupt data is not masked.
+
+### Changed
+
+- **Office → PDF: real page geometry + font names.** Conversions no longer
+  hard-code US-Letter/0.5in. The page size and margins are read from the source
+  document (DOCX `w:sectPr/w:pgSz`+`w:pgMar`, PPTX `p:sldSz`, ODF
+  `style:page-layout-properties`) with sensible per-format fallbacks, and each
+  run's real `font-family` (DOCX `w:rFonts`, PPTX `a:latin`, ODF `fo:font-name`)
+  is emitted so the host font-resolution path embeds the correct faces with true
+  metrics instead of a 0.5-em estimate. DOCX paragraph alignment, spacing and
+  indentation (`w:jc`/`w:spacing`/`w:ind`) are carried through.
+- **PDF → Office: vector shapes keep their geometry and colours.** The Office
+  exporters (DOCX/PPTX DrawingML, ODT/ODP ODF) now emit real shapes — rectangles
+  and `custGeom`/`draw:path` curves — sourced from `page_vector_paths`, with
+  fill/stroke RGB, opacity, stroke width and dash, instead of a single grey
+  bounding-box rectangle. Clip-only paths no longer leak stray rectangles.
+
 ## [0.47.0] - 2026-06-18
 
 ### Fixed
