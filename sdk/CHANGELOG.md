@@ -4,6 +4,51 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.52.0] - 2026-06-18
+
+### Added
+
+- **Unified editable document model — reconstruction, importers, exporters, edit
+  operations, full JS round-trip.** A format-agnostic `model::Document`
+  (Section → Page → Block{Paragraph, Heading, List, Table, Image, Shape, TextBox,
+  Sheet, Slide} → Inline) that every format imports into and exports from. PDF →
+  model via `reconstruct_model` (structural: positioned runs are rebuilt into
+  paragraphs, headings, lists and tables, honouring the `/StructTree` tag tree when
+  present); Office/HTML/image → model importers; model →
+  DOCX/XLSX/PPTX/ODT/ODS/ODP/HTML/RTF/PDF structured exporters (real editable
+  content, not a raster). New `model::edit` operations (`ModelOp`: set/restyle run,
+  insert/delete/move block, table & sheet cells…) with `apply_ops`. Exposed to JS:
+  `toModel`, `officeToModel`, `htmlToModel`, `applyModelOps`, and
+  `modelToDocx/Xlsx/Pptx/Odt/Ods/Odp/Html/Rtf/Pdf`. Foundation for editing any
+  document format through one editable model.
+- **Text direction & document-language detection (RTL).** `documentLanguage()`
+  reports the dominant script and reading direction (Arabic, Hebrew, Latin, CJK…),
+  and each text element now carries its `direction` (`ltr`/`rtl`/`neutral`), so
+  editors can switch the canvas and layer properties to right-to-left for correct
+  editing.
+- **Page margins + running headers/footers.** `pageMargins`/`setPageMargins`
+  (CropBox-aware, falling back to the printable content box) and `setHeader`/
+  `setFooter` with `{{page}}`/`{{pages}}` tokens, alignment, page ranges and a
+  first-page toggle. Baking is idempotent (wrapped in marked content) and
+  reversible via `removeHeaders`/`removeFooters`.
+- **Pixel-perfect colour & images.** Full PDF colour-space resolution — Separation,
+  DeviceN (with type-0/2/3 functions and a new PostScript type-4 calculator tint
+  transform), Indexed, ICCBased (via `/N` + `/Alternate`), CalRGB/CalGray, Lab
+  (D50) and accurate CMYK — applied to fills, strokes (`cs`/`CS` + `sc`/`scn`) and
+  image XObjects (honouring `/BitsPerComponent` and `/Decode`), fixing
+  blank/garbled non-RGB images. **Progressive (SOF2) JPEG** decoding lands in full
+  (baseline already supported; arithmetic-coded JPEG is skipped, not blanked).
+
+### Fixed
+
+- **Subset-CFF glyphs no longer render as tofu.** Simple `/Type1` fonts embedding a
+  CFF program (`/FontFile3 /Type1C`, e.g. subsetted MyriadPro/Nexa) now resolve
+  glyphs through the CFF charset (`code → glyph name → gid`) instead of a Unicode
+  `cmap` they do not carry; an unresolved code paints nothing rather than a box.
+- **Baseline JPEG images now render.** `/DCTDecode` image XObjects (direct and
+  nested inside form XObjects, with `/SMask`) are decoded and blitted — previously
+  they were skipped, leaving blank slides and image-shaped holes.
+
 ## [0.51.0] - 2026-06-18
 
 ### Added
