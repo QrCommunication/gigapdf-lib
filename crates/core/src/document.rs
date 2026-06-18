@@ -899,7 +899,7 @@ impl Document {
     }
 
     /// The document catalog dictionary.
-    fn catalog(&self) -> Result<&Dictionary> {
+    pub(crate) fn catalog(&self) -> Result<&Dictionary> {
         if let Some(root) = self.trailer.get(b"Root") {
             if let Some(dict) = self.resolve(root).as_dict() {
                 return Ok(dict);
@@ -1023,7 +1023,7 @@ impl Document {
 
     /// Build per-font text decoders from a page's `/Resources /Font`, reading
     /// each font's `/Subtype` (Type0 ⇒ 2-byte codes) and `/ToUnicode` CMap.
-    fn page_font_decoders(&self, page_no: u32) -> content::FontDecoders {
+    pub(crate) fn page_font_decoders(&self, page_no: u32) -> content::FontDecoders {
         let Ok(page) = self.page_dict(page_no) else {
             return content::FontDecoders::new();
         };
@@ -2628,6 +2628,165 @@ impl Document {
             pages.push(conv);
         }
         pages
+    }
+
+    /// Reconstruct the **unified editable document model** from this PDF — the
+    /// re-editability crux (epic #74, Phase 2). Where [`convert_pages`](Self::convert_pages)
+    /// produces flat positioned boxes for the Office exporters, this turns the
+    /// page's geometry back into *logical* blocks (paragraphs, headings, lists,
+    /// tables) so the document can be reflowed and restyled, not only re-placed.
+    ///
+    /// One [`Section`](crate::model::Section) is emitted per run of consecutive
+    /// pages that share a MediaBox geometry; each PDF page becomes one
+    /// [`Page`](crate::model::Page). When the catalog carries a `/StructTreeRoot`
+    /// the author's tags are trusted (see [`recon::tag_tree`](crate::recon::tag_tree));
+    /// otherwise the geometric heuristic pipeline runs (lines → columns →
+    /// paragraphs → headings → lists → tables).
+    pub fn reconstruct_model(&self) -> crate::model::Document {
+        use crate::content::ElementKind;
+        use crate::model::{geom::PageGeometry, DocMeta, Page, Section};
+        use crate::recon::{self, IdGen, PlacedImageRef};
+
+        let mut ids = IdGen::default();
+        // A tagged document is reconstructed once, from the struct tree, then its
+        // blocks are split back onto pages by the page each block was bound to.
+        // For simplicity here the heuristic path is per-page; the tag-tree path
+        // produces a single flat block list which we place on the first page (it
+        // is already in logical reading order across the document).
+        let tag_blocks = recon::tag_tree::reconstruct_from_struct_tree(self, &mut ids);
+
+        let page_count = self.page_count() as u32;
+        let mut sections: Vec<Section> = Vec::new();
+        let mut resources = crate::model::ResourceTable::default();
+
+        for page_no in 1..=page_count {
+            let Ok(page) = self.page_dict(page_no) else {
+                continue;
+            };
+            let media = self.read_media_box(page);
+            let (x0, y0) = (media[0], media[1]);
+            let page_w = (media[2] - media[0]).abs();
+            let page_h = (media[3] - media[1]).abs();
+
+            // Build the per-page inputs from the same extraction the Office
+            // converters use (top-level elements + vector paths + images).
+            let elements = self.page_elements(page_no).unwrap_or_default();
+            let font_styles = self.page_base_fonts(page_no);
+            let runs = recon::runs_from_elements(&elements, &font_styles);
+            let vpaths = self.page_vector_paths(page_no).unwrap_or_default();
+
+            // Placed images → content-addressed resources.
+            let images = self.page_images(page_no);
+            let mut image_refs: Vec<PlacedImageRef> = Vec::new();
+            for element in &elements {
+                if element.kind != ElementKind::Image {
+                    continue;
+                }
+                let Some(b) = element.bounds else { continue };
+                let key = element.label.clone().into_bytes();
+                let Some(img) = images.get(&key) else { continue };
+                let png = crate::raster::png::encode_png(img.width, img.height, &img.rgba);
+                let resource = Self::fnv1a(&png);
+                resources
+                    .images
+                    .entry(resource)
+                    .or_insert_with(|| crate::model::ImageResource {
+                        bytes: png,
+                        format: "png".to_string(),
+                    });
+                image_refs.push(PlacedImageRef {
+                    resource,
+                    x: b.x,
+                    y: b.y,
+                    w: b.width,
+                    h: b.height,
+                });
+            }
+
+            // The tag-tree blocks (if any) only attach to the first page.
+            let page_tags = if page_no == 1 { tag_blocks.clone() } else { None };
+            let blocks = recon::reconstruct_page(
+                runs,
+                &vpaths,
+                &image_refs,
+                (x0, y0, page_w, page_h),
+                &mut ids,
+                page_tags,
+            );
+
+            let geometry = PageGeometry {
+                width: page_w,
+                height: page_h,
+                ..PageGeometry::default()
+            };
+            let page_model = Page {
+                blocks,
+                absolute: false,
+            };
+            // Coalesce into the previous section when the geometry matches.
+            match sections.last_mut() {
+                Some(sec) if Self::same_geometry(&sec.geometry, &geometry) => {
+                    sec.pages.push(page_model)
+                }
+                _ => sections.push(Section {
+                    geometry,
+                    header: None,
+                    footer: None,
+                    pages: vec![page_model],
+                }),
+            }
+        }
+
+        let meta = DocMeta {
+            title: self.get_metadata("Title").filter(|s| !s.is_empty()),
+            author: self.get_metadata("Author").filter(|s| !s.is_empty()),
+            subject: self.get_metadata("Subject").filter(|s| !s.is_empty()),
+            keywords: self
+                .get_metadata("Keywords")
+                .filter(|s| !s.is_empty())
+                .map(|k| {
+                    k.split([',', ';'])
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            lang: self
+                .catalog()
+                .ok()
+                .and_then(|c| c.get(b"Lang").map(|o| self.resolve(o)))
+                .and_then(Object::as_string)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .filter(|s| !s.is_empty()),
+        };
+
+        crate::model::Document {
+            meta,
+            sections,
+            resources,
+            ..crate::model::Document::default()
+        }
+    }
+
+    /// FNV-1a 64-bit hash — a zero-dependency content key for de-duplicating the
+    /// reconstructed model's image blobs in its `/ResourceTable`.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Whether two reconstructed page geometries match closely enough to share a
+    /// section (same size to a hairline; margins are model defaults here).
+    fn same_geometry(
+        a: &crate::model::geom::PageGeometry,
+        b: &crate::model::geom::PageGeometry,
+    ) -> bool {
+        (a.width - b.width).abs() < 0.5 && (a.height - b.height).abs() < 0.5
     }
 
     /// Convert the document to an editable OpenDocument Text (`.odt`): every text

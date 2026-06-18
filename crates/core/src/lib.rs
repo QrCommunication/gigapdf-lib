@@ -46,6 +46,7 @@ pub mod ocg;
 pub mod outline;
 pub mod parser;
 pub mod raster;
+pub mod recon;
 pub mod security;
 pub mod serialize;
 pub mod sign;
