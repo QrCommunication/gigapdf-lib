@@ -1,7 +1,8 @@
 node_modules/
 dist/
-# Build artifact produced by scripts/build-wasm.sh (CI regenerates it before publish)
+# Build artifacts produced by scripts/build-wasm.sh (CI regenerates them before publish)
 gigapdf.wasm
+models/
 *.tsbuildinfo
 .DS_Store
 npm-debug.log*

@@ -25,11 +25,13 @@
       "require": "./dist/editor.cjs"
     },
     "./gigapdf.wasm": "./gigapdf.wasm",
+    "./models/*": "./models/*",
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "gigapdf.wasm",
+    "models",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"

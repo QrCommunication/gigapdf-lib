@@ -22,3 +22,18 @@ test -f "$SRC" || { echo "❌ wasm not produced: $SRC" >&2; exit 1; }
 cp "$SRC" "$PKG_DIR/gigapdf.wasm"
 cp "$ENGINE_DIR/LICENSE" "$PKG_DIR/LICENSE" 2>/dev/null || true
 echo "✓ copied $(du -h "$PKG_DIR/gigapdf.wasm" | cut -f1) → $PKG_DIR/gigapdf.wasm"
+
+# Host-loaded OCR model blobs (.gpocr): the wasm embeds NO weights, so consumers
+# load a per-script line-OCR model at runtime via `gp_ocr_load_model`. Ship them
+# next to the SDK so `@qrcommunication/gigapdf-lib/models/ocr_<script>.gpocr`
+# resolves for Node hosts (the per-script CRNN handles non-Latin scripts —
+# Cyrillic, Greek, Arabic, Devanagari, Bengali, Tamil — that the built-in
+# mono-glyph classifier cannot).
+MODELS_SRC="$ENGINE_DIR/models"
+if compgen -G "$MODELS_SRC/*.gpocr" > /dev/null; then
+  mkdir -p "$PKG_DIR/models"
+  cp "$MODELS_SRC"/*.gpocr "$PKG_DIR/models/"
+  echo "✓ copied $(ls "$PKG_DIR/models"/*.gpocr | wc -l) OCR model(s) → $PKG_DIR/models/"
+else
+  echo "⚠ no .gpocr models in $MODELS_SRC — OCR limited to the mono-glyph classifier" >&2
+fi

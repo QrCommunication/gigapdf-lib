@@ -27,6 +27,34 @@ type Exports = {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+/**
+ * A trained per-script OCR model bundled with the package. `alpha` covers
+ * Latin, Cyrillic and Greek; `arabic` is the **RTL group** (Arabic, Urdu,
+ * Hebrew); the rest are dedicated scripts. The matching `.gpocr` CRNN blob
+ * ships under `models/` and is host-loaded on demand. To recognize any shipped
+ * language at once (including models added later), prefer
+ * {@link GigaPdfEngine.loadAllBundledOcrModels}.
+ */
+export type OcrScript = "alpha" | "arabic" | "devanagari" | "bengali" | "tamil";
+
+/** `.gpocr` filename for each {@link OcrScript}. */
+const OCR_MODEL_FILES: Record<OcrScript, string> = {
+  alpha: "ocr_alpha.gpocr",
+  arabic: "ocr_arabic.gpocr",
+  devanagari: "ocr_deva.gpocr",
+  bengali: "ocr_beng.gpocr",
+  tamil: "ocr_taml.gpocr",
+};
+
+/** Every trained script — load all for "recognize text in any language". */
+export const ALL_OCR_SCRIPTS: readonly OcrScript[] = [
+  "alpha",
+  "arabic",
+  "devanagari",
+  "bengali",
+  "tamil",
+];
+
 /** Loaded engine module. Create documents with {@link open} / {@link openEncrypted}. */
 export class GigaPdfEngine {
   private constructor(private readonly ex: Exports) {}
@@ -415,6 +443,80 @@ export class GigaPdfEngine {
   /** Drop every runtime-loaded OCR model (reverts to the mono-glyph classifier). */
   clearOcrModels(): void {
     this.ex.gp_ocr_clear_models();
+  }
+
+  /**
+   * Resolve a bundled `.gpocr` model (shipped under `models/`) and load it into
+   * the engine via {@link loadOcrModel}. **Node hosts only** — it reads the blob
+   * from disk the same way {@link loadDefault} resolves the wasm. Returns `true`
+   * on success. Use this to recognize non-Latin scripts (Arabic, Devanagari,
+   * Bengali, Tamil) or to upgrade Latin/Cyrillic/Greek to the CRNN (`alpha`).
+   */
+  async loadBundledOcrModel(script: OcrScript): Promise<boolean> {
+    // Indirect the Node-only imports so browser bundlers don't try to resolve
+    // them statically (same pattern as `loadDefault`).
+    const nodeImport = (m: string): Promise<Record<string, unknown>> =>
+      import(/* webpackIgnore: true */ /* @vite-ignore */ m);
+    const { readFile } = (await nodeImport("node:fs/promises")) as {
+      readFile: (p: string) => Promise<Uint8Array>;
+    };
+    const { fileURLToPath } = (await nodeImport("node:url")) as {
+      fileURLToPath: (u: URL) => string;
+    };
+    const path = fileURLToPath(
+      new URL(`../models/${OCR_MODEL_FILES[script]}`, import.meta.url),
+    );
+    return this.loadOcrModel(await readFile(path));
+  }
+
+  /**
+   * Load several bundled OCR models (idempotent per call). Returns the scripts
+   * that loaded successfully. Pass {@link ALL_OCR_SCRIPTS} to recognize text in
+   * any supported language; the engine's script detector routes each line to the
+   * right model.
+   */
+  async loadBundledOcrModels(
+    scripts: readonly OcrScript[],
+  ): Promise<OcrScript[]> {
+    const loaded: OcrScript[] = [];
+    for (const script of scripts) {
+      if (await this.loadBundledOcrModel(script)) loaded.push(script);
+    }
+    return loaded;
+  }
+
+  /**
+   * Discover and load EVERY bundled `.gpocr` model (Node hosts only). The
+   * engine's script detector then routes each recognized line to the matching
+   * model, so the OCR recognizes text in any shipped script — Latin, Cyrillic,
+   * Greek, Arabic, Urdu, Hebrew (the RTL group), Devanagari, Bengali, Tamil, and
+   * any model added later — with no code change. Returns the number loaded.
+   */
+  async loadAllBundledOcrModels(): Promise<number> {
+    const nodeImport = (m: string): Promise<Record<string, unknown>> =>
+      import(/* webpackIgnore: true */ /* @vite-ignore */ m);
+    const { readFile, readdir } = (await nodeImport("node:fs/promises")) as {
+      readFile: (p: string) => Promise<Uint8Array>;
+      readdir: (p: string) => Promise<string[]>;
+    };
+    const { fileURLToPath } = (await nodeImport("node:url")) as {
+      fileURLToPath: (u: URL) => string;
+    };
+    let entries: string[];
+    try {
+      entries = await readdir(fileURLToPath(new URL("../models/", import.meta.url)));
+    } catch {
+      return 0; // models/ absent (slimmed install) → mono-glyph fallback
+    }
+    let count = 0;
+    for (const name of entries) {
+      if (!name.endsWith(".gpocr")) continue;
+      const bytes = await readFile(
+        fileURLToPath(new URL(`../models/${name}`, import.meta.url)),
+      );
+      if (this.loadOcrModel(bytes)) count += 1;
+    }
+    return count;
   }
 
   // ── fonts (catalog / Google Fonts URL — the host performs the fetch) ───────
