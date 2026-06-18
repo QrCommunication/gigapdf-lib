@@ -173,7 +173,11 @@ fn is_whitespace(b: u8) -> bool {
 }
 
 fn is_text_show(operator: &[u8]) -> bool {
-    operator == b"Tj" || operator == b"TJ"
+    // `'` (next-line-show) and `"` (set-spacing + next-line-show) are text-show
+    // operators too. Counting them keeps the run ordinal consistent across
+    // extraction, font lookup and the index-based editing APIs; the
+    // interpreters apply their implicit `T*` line move where positions matter.
+    matches!(operator, b"Tj" | b"TJ" | b"'" | b"\"")
 }
 
 // ─── parsing ────────────────────────────────────────────────────────────────
@@ -563,11 +567,18 @@ pub fn replace_text_run_encoded(
     let pos = nth_text_run(&operations, index)?;
     let operand = Object::String(encoded, kind);
     let operation = &mut operations[pos];
-    if operation.operator == b"Tj" {
-        operation.operands = vec![operand];
-    } else {
+    match operation.operator.as_slice() {
+        // `Tj` and `'` (next-line-show) both take a single string operand; the
+        // `'` keeps its implicit line move by preserving the operator.
+        b"Tj" | b"'" => operation.operands = vec![operand],
+        // `"` is `aw ac string "` — preserve the spacing operands, swap the text.
+        b"\"" => {
+            let aw = operation.operands.first().cloned().unwrap_or(Object::Integer(0));
+            let ac = operation.operands.get(1).cloned().unwrap_or(Object::Integer(0));
+            operation.operands = vec![aw, ac, operand];
+        }
         // TJ: collapse the positioned array to a single string.
-        operation.operands = vec![Object::Array(vec![operand])];
+        _ => operation.operands = vec![Object::Array(vec![operand])],
     }
     Ok(encode_content(&operations))
 }
@@ -861,6 +872,16 @@ fn elements_from_ops_resolved(
                 tm = tlm;
             }
             _ if is_text_show(operator) => {
+                // `'` (next-line-show) and `"` (set-spacing + next-line-show)
+                // carry an implicit `T*` BEFORE showing: advance the text line
+                // matrix by the leading. Without this the run lands on the
+                // previous baseline (the bug that left whole invoice blocks
+                // shifted up by their cumulative leading and dropped the run
+                // shown by each `'`).
+                if matches!(operator, b"'" | b"\"") {
+                    tlm = Matrix::translate(0.0, -leading).then(&tlm);
+                    tm = tlm;
+                }
                 let text = decode_operand_text(&op.operands, text_decoder);
                 let char_count = text.chars().count();
                 // Real glyph advances when the font carries widths; otherwise a
@@ -1306,6 +1327,41 @@ mod tests {
         let edited = replace_text_run(content, 0, "new").unwrap();
         let runs = extract_text_runs(&edited).unwrap();
         assert_eq!(runs[0].text, "new");
+    }
+
+    #[test]
+    fn apostrophe_runs_apply_implicit_line_move_and_are_extracted() {
+        // `'` (next-line-show) carries an implicit `T*`: it must drop the
+        // baseline by the current leading BEFORE showing, and it is a text-show
+        // op so it is extracted. Regression: invoice text shown via `'` was
+        // dropped entirely and the whole block drifted up by its leading
+        // (e.g. "Abonnement Freebox Ultra" rendered on the title's line).
+        let content = b"BT /F1 10 Tf 100 700 Tm (A) Tj 12 TL (B) ' (C) ' ET";
+        let texts: Vec<_> = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == ElementKind::Text)
+            .collect();
+        assert_eq!(texts.len(), 3, "Tj + two ' runs are all extracted");
+        let ys: Vec<f64> = texts.iter().map(|e| e.bounds.unwrap().y).collect();
+        // Same font size, so the baseline delta equals the 12-unit leading.
+        assert!((ys[0] - ys[1] - 12.0).abs() < 1e-6, "first ' moved down 12: {ys:?}");
+        assert!((ys[1] - ys[2] - 12.0).abs() < 1e-6, "second ' moved down 12: {ys:?}");
+    }
+
+    #[test]
+    fn quote_run_is_counted_and_editable_in_place() {
+        // `aw ac (txt) "` sets spacing then next-line-shows txt. It must be
+        // reachable by run index and editable in place, preserving the `"`
+        // operator (and so its line-move semantics).
+        let content = b"BT /F1 10 Tf 0 700 Tm (a) Tj 14 TL 5 1 (b) \" ET";
+        let runs = extract_text_runs(content).unwrap();
+        assert_eq!(runs.len(), 2, "Tj + \" run both counted");
+        assert_eq!(runs[1].text, "b");
+        let edited = replace_text_run(content, 1, "Z").unwrap();
+        let runs2 = extract_text_runs(&edited).unwrap();
+        assert_eq!(runs2[1].text, "Z");
+        assert!(count(&edited, b"\"") >= 1, "the \" operator is preserved");
     }
 
     #[test]
