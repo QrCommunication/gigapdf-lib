@@ -4,6 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.52.3] - 2026-06-19
+
+### Added
+
+- **Bake underline & strikethrough into drawn text.** `addText` /
+  `addStandardText` now accept a trailing `opts: { underline?, strikethrough? }`
+  (backed by new `add_text_styled` / `gp_add_text_styled`); the rule is painted
+  as a filled rectangle that follows the text rotation, its length taken from the
+  run's real glyph advances. Existing calls stay byte-identical (flags off).
+- **AVIF (AV1 intra) decode — loop restoration (§7.17 Wiener + SGR) and
+  directional intra-edge filtering/upsampling.** Higher-fidelity AVIF decoding;
+  the post-deblock / pre-CDEF stripe halo is used for restoration so stripe and
+  frame edges are reconstructed correctly.
+
 ## [0.52.2] - 2026-06-19
 
 ### Added
