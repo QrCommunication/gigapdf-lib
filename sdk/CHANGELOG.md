@@ -4,11 +4,24 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.46.0] - 2026-06-18
+## [0.47.0] - 2026-06-18
 
-### Added
+### Fixed
 
-- **Flatten form XObjects for in-place editing.** `flattenFormXObjects(page)`
+- **`'` and `"` (next-line-show) text operators are now extracted and
+  positioned correctly.** The content interpreter behind `textElements`,
+  `textRuns`, full-text search and the PDF→Office converters treated `Tj`/`TJ`
+  as the only text-showing operators, so runs drawn with `'` (move to next line
+  then show) or `"` (set spacing + next-line show) were **dropped entirely** and
+  the implicit line move they perform was **skipped** — shifting every
+  subsequent run in the same `BT…ET` block up by the accumulated leading.
+  Real-world impact: invoice/letter bodies (generated with leading-based line
+  breaks) lost lines and mis-placed the rest (e.g. a subtitle landing on the
+  title's baseline), breaking click-to-edit hit targets and conversion fidelity.
+  `'`/`"` now apply their implicit `T*` before showing and count as text runs,
+  so extraction, the run index used by `replaceText`/`removeElement`/`moveElement`,
+  and font resolution all stay consistent. Rendering (`renderPage`) was already
+  correct. No API change. `flattenFormXObjects(page)`
   inlines every form XObject invoked via `Do` into the page content stream
   (applying its `/Matrix`, merging its resources with collision-safe name
   remapping, recursing into nested forms with a depth + cycle guard). Each
