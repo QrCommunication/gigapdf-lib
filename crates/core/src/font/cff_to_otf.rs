@@ -59,6 +59,30 @@ pub fn wrap(cff_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(assemble_sfnt(0x4F54_544F, &mut tables))
 }
 
+/// Build a glyph-id → Unicode **string** map from a CFF font's charset glyph
+/// names, resolving **ligature** glyphs (`ffi`, `fi`, …) to their multi-character
+/// expansions. Drives the `/ToUnicode` CMap for a CFF-embedded font so a ligated
+/// run extracts/copies as the original characters instead of tofu. CID-keyed CFF
+/// has no name charset, so it yields nothing.
+pub fn cff_gid_unicode_strings(cff: &CffFont) -> std::collections::BTreeMap<u16, String> {
+    let mut map = std::collections::BTreeMap::new();
+    if cff.is_cid() {
+        return map;
+    }
+    for gid in 1..cff.num_glyphs() {
+        let sid = cff.gid_to_sid(gid);
+        // Standard Strings (SID < 391) resolve through their predefined name;
+        // font-specific names come from the String INDEX. Either way, route the
+        // name through the string resolver so ligatures expand.
+        if let Some(name) = cff.sid_name(sid) {
+            if let Some(s) = glyph_name_to_unicode_string(name) {
+                map.insert(gid, s);
+            }
+        }
+    }
+    map
+}
+
 /// Resolve a glyph's charset SID to a Unicode scalar for the synthesised cmap.
 fn sid_to_unicode(cff: &CffFont, sid: u16) -> Option<u32> {
     if cff.is_cid() {
@@ -104,6 +128,57 @@ fn glyph_name_to_unicode(raw: &str) -> Option<u32> {
         return Some(first as u32); // single-character name → that scalar.
     }
     None
+}
+
+/// Resolve a glyph name to a Unicode **string** (not just a single scalar), so
+/// **ligature** glyphs round-trip on `/ToUnicode` extraction. Handles the
+/// standard Latin f-ligatures by name (`ffi`, `ffl`, `ff`, `fi`, `fl`), AGL
+/// `uniXXXX(XXXX…)` runs of 4-hex units, and falls back to the single-scalar
+/// resolver for everything it already knew. Stylistic/unknown names → `None`.
+pub fn glyph_name_to_unicode_string(raw: &str) -> Option<String> {
+    let name = raw.rsplit('+').next().unwrap_or(raw);
+    let name = name.split('.').next().unwrap_or(name);
+    if name.is_empty() || name == "notdef" {
+        return None;
+    }
+    // Standard Latin ligatures (the common cases a `cmap` can't express).
+    let ligature = match name {
+        "ffi" => Some("ffi"),
+        "ffl" => Some("ffl"),
+        "ff" => Some("ff"),
+        "fi" => Some("fi"),
+        "fl" => Some("fl"),
+        "ft" => Some("ft"),
+        "st" => Some("st"),
+        _ => None,
+    };
+    if let Some(s) = ligature {
+        return Some(s.to_string());
+    }
+    // AGL `uniXXXXYYYY…`: a run of 4-hex-digit BMP units (ligatures are encoded
+    // this way too, e.g. `uni0066006900` is not valid — must be multiples of 4).
+    if let Some(hex) = name.strip_prefix("uni") {
+        if hex.len() >= 4 && hex.len().is_multiple_of(4) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let mut s = String::new();
+            let mut ok = true;
+            for chunk in hex.as_bytes().chunks(4) {
+                let h = std::str::from_utf8(chunk).ok()?;
+                match u32::from_str_radix(h, 16).ok().and_then(char::from_u32) {
+                    Some(c) => s.push(c),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    // Otherwise fall back to the single-scalar conventions (uXXXXXX, single char).
+    glyph_name_to_unicode(name).and_then(char::from_u32).map(|c| c.to_string())
 }
 
 // ── sfnt assembly ───────────────────────────────────────────────────────────

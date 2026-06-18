@@ -13,6 +13,7 @@ pub mod color;
 pub mod embed;
 pub mod glyphless;
 pub mod google;
+pub mod shape;
 pub mod truetype;
 pub mod type1;
 

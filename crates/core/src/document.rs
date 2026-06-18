@@ -1064,16 +1064,72 @@ impl Document {
             } else {
                 self.simple_font_widths(font)
             };
+            // For an Identity-H Type0 font lacking a /ToUnicode, derive a
+            // glyph-id → Unicode map from the embedded font's own cmap so text
+            // still extracts as real characters (not tofu).
+            let cid_to_unicode = if two_byte && to_unicode.is_none() {
+                self.cid_font_cmap_unicode(font)
+            } else {
+                None
+            };
             decoders.insert(
                 name.clone(),
                 crate::font::cmap::TextDecoder {
                     two_byte,
                     to_unicode,
                     widths,
+                    cid_to_unicode,
                 },
             );
         }
         decoders
+    }
+
+    /// Glyph-id → Unicode map from a Type0 font's embedded program (`FontFile2`
+    /// glyf or `FontFile3` OpenType/CFF) cmap, for Identity-H fonts that carry no
+    /// `/ToUnicode`. `None` when the font isn't embedded or has no usable cmap.
+    fn cid_font_cmap_unicode(
+        &self,
+        font: &Dictionary,
+    ) -> Option<std::collections::BTreeMap<u16, String>> {
+        let desc = font
+            .get(b"DescendantFonts")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)?
+            .first()?;
+        let cid = self.resolve(desc).as_dict()?;
+        // Identity-H only: a non-identity CIDToGIDMap would break the code==gid
+        // assumption the cmap reverse-map relies on.
+        if let Some(map) = cid.get(b"CIDToGIDMap").map(|o| self.resolve(o)) {
+            if map.as_name() != Some(b"Identity".as_slice()) {
+                return None;
+            }
+        }
+        let fd = cid
+            .get(b"FontDescriptor")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        let ttf = if let Some(ff) = fd
+            .get(b"FontFile2")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)
+        {
+            let bytes = decode_stream(ff).ok()?;
+            crate::font::truetype::TrueTypeFont::parse(&bytes)?
+        } else {
+            let ff = fd
+                .get(b"FontFile3")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_stream)?;
+            let bytes = decode_stream(ff).ok()?;
+            crate::font::truetype::TrueTypeFont::parse_metrics(&bytes)?
+        };
+        let map: std::collections::BTreeMap<u16, String> = ttf
+            .gid_to_unicode_map()
+            .into_iter()
+            .filter_map(|(gid, cp)| char::from_u32(cp).map(|c| (gid, c.to_string())))
+            .collect();
+        (!map.is_empty()).then_some(map)
     }
 
     /// Build a flattened `name → `[`content::FormXObject`]` map of every form
@@ -2523,6 +2579,9 @@ impl Document {
                         // Rendering advances glyphs by the font program's own
                         // metrics, so the PDF width table isn't needed here.
                         widths: None,
+                        // Rasterising uses the glyph id directly; no cmap-derived
+                        // Unicode fallback is required for drawing.
+                        cid_to_unicode: None,
                     },
                     two_byte,
                 },
@@ -3840,12 +3899,17 @@ impl Document {
     pub fn embed_font(&mut self, family: &str, program: &[u8]) -> Result<u32> {
         // glyf TrueType parses with the strict reader; OpenType-CFF (no glyf) is
         // recognised by its `OTTO` sfnt tag and read for metrics/cmap only.
+        let no_extra = std::collections::BTreeMap::new();
         if let Some(parsed) = crate::font::truetype::TrueTypeFont::parse(program) {
-            self.embed_cid_font(family, program, &parsed, false)
+            self.embed_cid_font(family, program, &parsed, false, &no_extra)
         } else if program.get(0..4) == Some(b"OTTO".as_slice()) {
+            // An already-OpenType-CFF program: recover the CFF charset's ligature
+            // names from its `CFF ` table for /ToUnicode (the synthesised cmap on
+            // some such files omits ligature glyphs).
             let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(program)
                 .ok_or_else(|| EngineError::Unsupported("unparseable OpenType-CFF font".into()))?;
-            self.embed_cid_font(family, program, &parsed, true)
+            let extra = cff_ligature_unicode_from_otf(program);
+            self.embed_cid_font(family, program, &parsed, true, &extra)
         } else if program.len() >= 4
             && program[0] == 1
             && program[1] == 0
@@ -3856,11 +3920,14 @@ impl Document {
             // synthesised OpenType-CFF sfnt (cmap/head/hmtx/… built from the
             // CFF's own metrics + charset) so the OpenType-CFF path above can
             // re-embed it — no external fontforge conversion needed.
+            let extra = crate::font::cff::CffFont::parse(program)
+                .map(|cff| crate::font::cff_to_otf::cff_gid_unicode_strings(&cff))
+                .unwrap_or_default();
             let otf = crate::font::cff_to_otf::wrap(program)
                 .ok_or_else(|| EngineError::Unsupported("unparseable bare CFF font".into()))?;
             let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(&otf)
                 .ok_or_else(|| EngineError::Unsupported("wrapped CFF not parseable".into()))?;
-            self.embed_cid_font(family, &otf, &parsed, true)
+            self.embed_cid_font(family, &otf, &parsed, true, &extra)
         } else if is_raw_type1(program) {
             // Raw Type 1 (PDF `FontFile`, `.pfb` or `.pfa`): decrypt eexec,
             // transcode each Type 1 charstring to Type 2, pack a bare CFF, then
@@ -3868,11 +3935,14 @@ impl Document {
             let cff = crate::font::type1::parse_type1(program)
                 .and_then(|font| crate::font::type1::to_cff(&font))
                 .ok_or_else(|| EngineError::Unsupported("unparseable Type1 font".into()))?;
+            let extra = crate::font::cff::CffFont::parse(&cff)
+                .map(|c| crate::font::cff_to_otf::cff_gid_unicode_strings(&c))
+                .unwrap_or_default();
             let otf = crate::font::cff_to_otf::wrap(&cff)
                 .ok_or_else(|| EngineError::Unsupported("unparseable Type1 font".into()))?;
             let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(&otf)
                 .ok_or_else(|| EngineError::Unsupported("unparseable Type1 font".into()))?;
-            self.embed_cid_font(family, &otf, &parsed, true)
+            self.embed_cid_font(family, &otf, &parsed, true, &extra)
         } else {
             Err(EngineError::Unsupported(
                 "not a glyf TrueType, OpenType-CFF, bare CFF or Type1 font program".into(),
@@ -3882,19 +3952,35 @@ impl Document {
 
     /// Assemble the Type0 object graph shared by both font flavours. `is_cff`
     /// selects `FontFile3`/`CIDFontType0` (OpenType-CFF) over the default
-    /// `FontFile2`/`CIDFontType2` (glyf TrueType).
+    /// `FontFile2`/`CIDFontType2` (glyf TrueType). `extra_unicode` overlays extra
+    /// glyph-id → Unicode mappings onto the cmap-derived `/ToUnicode` (used to add
+    /// CFF ligature-name expansions, which the synthesised cmap can't carry).
     fn embed_cid_font(
         &mut self,
         family: &str,
         program: &[u8],
         parsed: &crate::font::truetype::TrueTypeFont,
         is_cff: bool,
+        extra_unicode: &std::collections::BTreeMap<u16, String>,
     ) -> Result<u32> {
         use crate::object::StringKind::Literal;
         let ps_name = postscript_name(family);
 
         let advances = crate::font::embed::scaled_advances(parsed);
-        let unicode = crate::font::embed::gid_to_unicode(parsed);
+        // Full-Unicode cmap reverse-map PLUS ligature-glyph expansions (from the
+        // font's own GSUB), so ligated/astral-plane text extracts & copies
+        // faithfully instead of as tofu.
+        let ligatures = crate::font::shape::Shaper::new(parsed).ligature_rules();
+        let mut unicode_map: std::collections::BTreeMap<u16, String> =
+            crate::font::embed::gid_to_unicode_with_ligatures(parsed, &ligatures)
+                .into_iter()
+                .collect();
+        // CFF ligature names (`ffi`, …) that no code point maps to: overlay them
+        // so a ligated CFF run still extracts as the source characters.
+        for (gid, s) in extra_unicode {
+            unicode_map.entry(*gid).or_insert_with(|| s.clone());
+        }
+        let unicode: Vec<(u16, String)> = unicode_map.into_iter().collect();
         let tounicode = crate::font::embed::to_unicode_cmap(&unicode);
 
         // Five consecutive ids: FontFile, FontDescriptor, CIDFont, Type0, ToUnicode.
@@ -4048,6 +4134,85 @@ impl Document {
         .into_bytes();
         // `with_opacity` wraps the run in an ExtGState (/ca + /CA) when opacity < 1
         // (and registers it on the page); at opacity 1 it returns `inner` as-is.
+        let ops = self.with_opacity(page_no, inner, opacity)?;
+        let mut content = self.page_content(page_no)?;
+        content.extend_from_slice(&ops);
+        self.set_page_content(page_no, content)?;
+        self.register_page_font(page_no, res_name.as_bytes(), (font_obj, 0))?;
+        Ok(())
+    }
+
+    /// Like [`add_text`](Self::add_text) but **shaped**: GSUB standard ligatures
+    /// and substitutions are applied (so `ffi` draws as one glyph) and GPOS pair
+    /// kerning is emitted via a `TJ` array, so the drawn glyphs sit exactly where
+    /// the HTML layout measured them. Falls back to a plain `Tj` run (identical to
+    /// `add_text`) when the embedded face carries no `GSUB`/`GPOS`. Text still
+    /// extracts/copies faithfully: ligature and astral-plane glyphs are reverse-
+    /// mapped in the font's `/ToUnicode` at embed time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_shaped(
+        &mut self,
+        page_no: u32,
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        font_obj: u32,
+        color: [f64; 3],
+        opacity: f64,
+        rotation_deg: f64,
+    ) -> Result<()> {
+        let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
+            EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
+        })?;
+        let shaper = crate::font::shape::Shaper::new(&ttf);
+        if shaper.is_empty() {
+            // No layout tables → identical to the plain run (and cheaper).
+            return self.add_text(page_no, x, y, size, text, font_obj, color, opacity, rotation_deg);
+        }
+        let upm = ttf.units_per_em().max(1.0);
+        let raw: Vec<u16> = text
+            .chars()
+            .map(|c| ttf.gid_for_unicode(c as u32).unwrap_or(0))
+            .collect();
+        let gids = shaper.substitute(&raw);
+
+        // Build a TJ array: glyph hex strings separated by kern adjustments.
+        // PDF TJ numbers are in thousandths of an em and SUBTRACT from the
+        // advance (positive → move left), so a GPOS x-advance of `k` font units
+        // becomes the TJ number `-(k · 1000 / upm)`.
+        let used = self.font_used_gids.entry(font_obj).or_default();
+        let mut tj = String::from("[<");
+        for (i, &g) in gids.iter().enumerate() {
+            used.insert(g);
+            tj.push_str(&format!("{g:04X}"));
+            if i + 1 < gids.len() {
+                let k = shaper.kern(g, gids[i + 1]);
+                if k != 0 {
+                    let adj = -(k as f64) * 1000.0 / upm;
+                    tj.push_str(&format!("> {} <", content::num(adj)));
+                }
+            }
+        }
+        tj.push_str(">] TJ");
+
+        let res_name = format!("GF{font_obj}");
+        let (sin, cos) = rotation_deg.to_radians().sin_cos();
+        let inner = format!(
+            "q\n{r} {g} {b} rg\nBT\n/{res} {size} Tf\n{ma} {mb} {mc} {md} {x} {y} Tm\n{tj}\nET\nQ\n",
+            r = content::num(color[0]),
+            g = content::num(color[1]),
+            b = content::num(color[2]),
+            res = res_name,
+            size = content::num(size),
+            ma = content::num(cos),
+            mb = content::num(sin),
+            mc = content::num(-sin),
+            md = content::num(cos),
+            x = content::num(x),
+            y = content::num(y),
+        )
+        .into_bytes();
         let ops = self.with_opacity(page_no, inner, opacity)?;
         let mut content = self.page_content(page_no)?;
         content.extend_from_slice(&ops);
@@ -4331,10 +4496,10 @@ impl Document {
         let num_glyphs = char_count + 1; // +1 for the .notdef glyph at CID 0
         let program = crate::font::glyphless::build_glyphless_ttf(num_glyphs);
         // CID i+1 → Unicode of chars[i]; CID 0 (.notdef) is left unmapped.
-        let pairs: Vec<(u16, u32)> = chars
+        let pairs: Vec<(u16, String)> = chars
             .iter()
             .enumerate()
-            .map(|(i, &c)| (i as u16 + 1, c as u32))
+            .map(|(i, &c)| (i as u16 + 1, c.to_string()))
             .collect();
         let tounicode = crate::font::embed::to_unicode_cmap(&pairs);
 
@@ -8003,6 +8168,52 @@ fn postscript_name(family: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Extract the `CFF ` table from an OpenType-CFF (`OTTO`) sfnt and build the
+/// glyph-id → Unicode-string ligature map from its charset names. Empty when the
+/// program isn't an OTTO with a parseable `CFF ` table. Used to add CFF ligature
+/// (`ffi`, …) expansions to a font's `/ToUnicode`.
+fn cff_ligature_unicode_from_otf(program: &[u8]) -> std::collections::BTreeMap<u16, String> {
+    let empty = std::collections::BTreeMap::new();
+    if program.get(0..4) != Some(b"OTTO".as_slice()) || program.len() < 12 {
+        return empty;
+    }
+    let be16 = |o: usize| -> usize {
+        if o + 2 <= program.len() {
+            ((program[o] as usize) << 8) | program[o + 1] as usize
+        } else {
+            0
+        }
+    };
+    let be32 = |o: usize| -> usize {
+        if o + 4 <= program.len() {
+            ((program[o] as usize) << 24)
+                | ((program[o + 1] as usize) << 16)
+                | ((program[o + 2] as usize) << 8)
+                | program[o + 3] as usize
+        } else {
+            0
+        }
+    };
+    let num_tables = be16(4);
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        if rec + 16 > program.len() {
+            break;
+        }
+        if &program[rec..rec + 4] == b"CFF " {
+            let off = be32(rec + 8);
+            let len = be32(rec + 12);
+            if let Some(bytes) = program.get(off..off + len) {
+                if let Some(cff) = crate::font::cff::CffFont::parse(bytes) {
+                    return crate::font::cff_to_otf::cff_gid_unicode_strings(&cff);
+                }
+            }
+            break;
+        }
+    }
+    empty
 }
 
 /// Recognise a raw Type 1 font program: a `.pfb` (binary segment marker

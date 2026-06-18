@@ -216,6 +216,11 @@ pub struct TextDecoder {
     /// (Type0) tables, when present — lets a text run be measured by real glyph
     /// advances instead of a 0.5-em estimate.
     pub widths: Option<CodeWidths>,
+    /// For an Identity-H Type0 font **without** a `/ToUnicode` CMap: a
+    /// glyph-id → Unicode map derived from the embedded font program's own
+    /// `cmap`. With Identity encoding the 2-byte code equals the glyph id, so
+    /// this recovers real text (no tofu) where there's no `/ToUnicode` to consult.
+    pub cid_to_unicode: Option<std::collections::BTreeMap<u16, String>>,
 }
 
 /// Per-character-code advance widths in PDF glyph space (1000 units = 1 em),
@@ -292,10 +297,23 @@ impl TextDecoder {
                 }
                 out
             }
-            // Composite font without a ToUnicode map: the codes are CIDs we
-            // cannot turn into Unicode here. Emit one placeholder per glyph so
-            // the run is still detected and counted.
-            (None, true) => "\u{FFFD}".repeat(bytes.len() / 2),
+            // Composite font without a ToUnicode map. With Identity-H the 2-byte
+            // code is the glyph id, so a cmap-derived `cid_to_unicode` map (when
+            // available) recovers real text; otherwise emit one placeholder per
+            // glyph so the run is still detected and counted.
+            (None, true) => {
+                let mut out = String::new();
+                let mut i = 0;
+                while i + 1 < bytes.len() {
+                    let code = ((bytes[i] as u16) << 8) | bytes[i + 1] as u16;
+                    i += 2;
+                    match self.cid_to_unicode.as_ref().and_then(|m| m.get(&code)) {
+                        Some(text) => out.push_str(text),
+                        None => out.push('\u{FFFD}'),
+                    }
+                }
+                out
+            }
             (None, false) => super::decode_winansi(bytes),
         }
     }
@@ -337,6 +355,7 @@ mod tests {
             two_byte: true,
             to_unicode: Some(cmap),
             widths: None,
+            cid_to_unicode: None,
         };
         // One 2-byte code 0x0041 → 'É'.
         assert_eq!(decoder.decode(&[0x00, 0x41]), "\u{00C9}");
@@ -351,6 +370,7 @@ mod tests {
             two_byte: false,
             to_unicode: None,
             widths: Some(CodeWidths::new(map, 500.0)),
+            cid_to_unicode: None,
         };
         // "AB?" → 600 + 700 + 500 (default) = 1800 units × 12/1000 = 21.6 pt.
         assert_eq!(decoder.string_advance(b"AB?", 12.0), Some(21.6));

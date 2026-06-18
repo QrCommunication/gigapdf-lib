@@ -9,7 +9,7 @@
 
 use crate::convert::build::PdfBuilder;
 use crate::document::Document;
-use crate::font::{bundled, catalog, google, truetype::TrueTypeFont};
+use crate::font::{bundled, catalog, google, shape::Shaper, truetype::TrueTypeFont};
 
 use super::css::{collect_style_css, Display, Style, Stylesheet};
 use super::dom::{self, Element, Node};
@@ -47,14 +47,29 @@ fn weight_bold(w: u16) -> bool {
 
 // ─── font resolution + measurement ────────────────────────────────────────────
 
+/// A parsed face plus its OpenType-Layout shaper (kerning + ligatures), built
+/// once and reused for both measuring and painting so the two never disagree.
+struct Face {
+    ttf: TrueTypeFont,
+    shaper: Shaper,
+}
+
+impl Face {
+    fn parse(bytes: &[u8]) -> Option<Face> {
+        let ttf = TrueTypeFont::parse(bytes)?;
+        let shaper = Shaper::new(&ttf);
+        Some(Face { ttf, shaper })
+    }
+}
+
 /// Parsed faces used for line-breaking before any PDF object exists.
 struct MeasureBook {
-    faces: Vec<(Key, TrueTypeFont)>,
+    faces: Vec<(Key, Face)>,
     /// Bundled last-resort face (Liberation Sans), parsed once. Used for real
     /// metrics whenever no host-provided face matches a run, so offline /
     /// unknown-family text still lays out with true advance widths instead of a
     /// rough estimate. `None` only if the bundled program failed to parse.
-    fallback: Option<TrueTypeFont>,
+    fallback: Option<Face>,
 }
 
 impl MeasureBook {
@@ -62,46 +77,45 @@ impl MeasureBook {
         let faces = fonts
             .iter()
             .filter_map(|f| {
-                TrueTypeFont::parse(&f.ttf)
-                    .map(|ttf| (key(&f.family, weight_bold(f.weight), f.italic), ttf))
+                Face::parse(&f.ttf).map(|face| (key(&f.family, weight_bold(f.weight), f.italic), face))
             })
             .collect();
         MeasureBook {
             faces,
-            fallback: TrueTypeFont::parse(bundled::FALLBACK_TTF),
+            fallback: Face::parse(bundled::FALLBACK_TTF),
         }
     }
 
-    /// Nearest *host-provided* face for a style: exact (family,bold,italic) →
-    /// same family → any provided face. `None` when no font was provided at all
-    /// (the caller then falls back to the bundled face).
-    fn provided_face(&self, style: &Style) -> Option<&TrueTypeFont> {
+    /// Nearest *host-provided* face (font + shaper) for a style: exact
+    /// (family,bold,italic) → same family → any provided face. `None` when no
+    /// font was provided at all (the caller then falls back to the bundled face).
+    fn provided(&self, style: &Style) -> Option<&Face> {
         let fam = style.font_family.to_ascii_lowercase();
         self.faces
             .iter()
             .find(|(k, _)| k.0 == fam && k.1 == style.bold && k.2 == style.italic)
             .or_else(|| self.faces.iter().find(|(k, _)| k.0 == fam))
             .or_else(|| self.faces.first())
-            .map(|(_, t)| t)
+            .map(|(_, f)| f)
     }
 
-    /// The face to *measure and draw* a run with: a host-provided face when one
-    /// exists (online path, unchanged), otherwise the bundled fallback. `None`
+    /// The face (font + shaper) to *measure and draw* a run with: a host-provided
+    /// face when one exists (online path), otherwise the bundled fallback. `None`
     /// only if even the bundled font failed to parse.
+    fn resolve_face(&self, style: &Style) -> Option<&Face> {
+        self.provided(style).or(self.fallback.as_ref())
+    }
+
+    /// The TrueType program to measure and draw a run with (provided or bundled).
     fn face(&self, style: &Style) -> Option<&TrueTypeFont> {
-        self.provided_face(style).or(self.fallback.as_ref())
+        self.resolve_face(style).map(|f| &f.ttf)
     }
 }
 
 impl Measure for MeasureBook {
     fn width(&self, text: &str, style: &Style) -> f64 {
-        if let Some(ttf) = self.face(style) {
-            let upm = ttf.units_per_em().max(1.0);
-            let mut w = 0.0;
-            for c in text.chars() {
-                let gid = ttf.gid_for_unicode(c as u32).unwrap_or(0);
-                w += ttf.advance_width(gid) / upm * style.font_size;
-            }
+        if let Some(face) = self.resolve_face(style) {
+            let w = shaped_run_width(&face.ttf, &face.shaper, text, style.font_size);
             let boldish = if style.bold && !style_has_bold_face(self, style) {
                 1.03
             } else {
@@ -115,6 +129,32 @@ impl Measure for MeasureBook {
             text.chars().count() as f64 * style.font_size * per
         }
     }
+}
+
+/// Advance of a text run in points, **shaped**: characters are mapped to glyph
+/// ids, GSUB ligatures/substitutions applied (so a ligated pair counts as one
+/// glyph's advance), then the per-glyph `hmtx` widths are summed with the GPOS
+/// pair-kern adjustment between adjacent glyphs folded in. This is the same
+/// number the painter draws against, so kerned/ligated text lays out correctly.
+fn shaped_run_width(ttf: &TrueTypeFont, shaper: &Shaper, text: &str, font_size: f64) -> f64 {
+    let upm = ttf.units_per_em().max(1.0);
+    let gids: Vec<u16> = text
+        .chars()
+        .map(|c| ttf.gid_for_unicode(c as u32).unwrap_or(0))
+        .collect();
+    let shaped = if shaper.is_empty() {
+        gids
+    } else {
+        shaper.substitute(&gids)
+    };
+    let mut units = 0.0;
+    for (i, &g) in shaped.iter().enumerate() {
+        units += ttf.advance_width(g);
+        if i + 1 < shaped.len() {
+            units += shaper.kern(g, shaped[i + 1]) as f64;
+        }
+    }
+    units / upm * font_size
 }
 
 fn style_has_bold_face(book: &MeasureBook, style: &Style) -> bool {
@@ -987,15 +1027,13 @@ mod tests {
             ..Style::default()
         };
         let chosen = book.face(&style).expect("a face is chosen");
-        let provided_face = book
-            .provided_face(&style)
-            .expect("the provided face exists");
+        let provided_face = &book.provided(&style).expect("the provided face exists").ttf;
         assert!(
             std::ptr::eq(chosen, provided_face),
             "the provided face is used, not the bundled fallback"
         );
         assert!(
-            !std::ptr::eq(chosen, book.fallback.as_ref().unwrap()),
+            !std::ptr::eq(chosen, &book.fallback.as_ref().unwrap().ttf),
             "the bundled fallback does not shadow a provided font"
         );
     }

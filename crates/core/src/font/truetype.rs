@@ -44,6 +44,10 @@ pub struct TrueTypeFont {
     cpal: Option<(usize, usize)>,
     /// `(offset, len)` of the `sbix` bitmap-emoji table, if present.
     sbix: Option<(usize, usize)>,
+    /// `(offset, len)` of the `GPOS` / `GSUB` OpenType-Layout tables, if present
+    /// (drive pair kerning and ligature/standard substitutions when shaping).
+    gpos: Option<(usize, usize)>,
+    gsub: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +151,8 @@ impl TrueTypeFont {
         let colr = tables.get(b"COLR").copied();
         let cpal = tables.get(b"CPAL").copied();
         let sbix = tables.get(b"sbix").copied();
+        let gpos = tables.get(b"GPOS").copied();
+        let gsub = tables.get(b"GSUB").copied();
 
         Some(TrueTypeFont {
             data,
@@ -160,7 +166,26 @@ impl TrueTypeFont {
             colr,
             cpal,
             sbix,
+            gpos,
+            gsub,
         })
+    }
+
+    /// Read-only access to the parsed font bytes (for table-level parsing such as
+    /// the OpenType-Layout shaper, which works directly on `GPOS`/`GSUB`).
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// `(offset, len)` of the `GPOS` table (pair-kerning source), if present.
+    pub(crate) fn gpos_range(&self) -> Option<(usize, usize)> {
+        self.gpos
+    }
+
+    /// `(offset, len)` of the `GSUB` table (ligature/substitution source), if
+    /// present.
+    pub(crate) fn gsub_range(&self) -> Option<(usize, usize)> {
+        self.gsub
     }
 
     /// Parse the font's `sbix` bitmap-emoji table, if present (Apple colour
@@ -217,6 +242,87 @@ impl TrueTypeFont {
             }
         }
         None
+    }
+
+    /// Build a glyph-id → Unicode-scalar map across the **whole** cmap (all
+    /// planes, including supplementary code points via format-12 subtables). The
+    /// lowest code point wins when several map to one glyph. Drives full-coverage
+    /// `/ToUnicode` generation and Type0-without-ToUnicode extraction (so a glyph
+    /// id can be turned back into real text instead of `U+FFFD`).
+    pub fn gid_to_unicode_map(&self) -> std::collections::BTreeMap<u16, u32> {
+        let mut map: std::collections::BTreeMap<u16, u32> = std::collections::BTreeMap::new();
+        // Prefer the highest-scoring subtable (full Unicode first) so a glyph's
+        // canonical scalar wins; later (lower-score) subtables only fill gaps.
+        for sub in &self.cmap {
+            self.collect_cmap_entries(sub.offset, &mut map);
+        }
+        map
+    }
+
+    /// Walk one cmap subtable, inserting `gid → codepoint` pairs (keeping the
+    /// lowest codepoint already recorded for a glyph).
+    fn collect_cmap_entries(&self, sub: usize, map: &mut std::collections::BTreeMap<u16, u32>) {
+        let mut record = |gid: u16, cp: u32| {
+            if gid != 0 {
+                map.entry(gid)
+                    .and_modify(|e| {
+                        if cp < *e {
+                            *e = cp;
+                        }
+                    })
+                    .or_insert(cp);
+            }
+        };
+        match be16(&self.data, sub) {
+            0 => {
+                for cp in 0u32..256 {
+                    let gid = self.data.get(sub + 6 + cp as usize).copied().unwrap_or(0) as u16;
+                    record(gid, cp);
+                }
+            }
+            6 => {
+                let first = be16(&self.data, sub + 6) as u32;
+                let count = be16(&self.data, sub + 8) as u32;
+                for i in 0..count {
+                    let gid = be16(&self.data, sub + 10 + i as usize * 2);
+                    record(gid, first + i);
+                }
+            }
+            4 => {
+                let seg_x2 = be16(&self.data, sub + 6) as usize;
+                let segs = seg_x2 / 2;
+                let end_codes = sub + 14;
+                let start_codes = end_codes + seg_x2 + 2;
+                for i in 0..segs {
+                    let start = be16(&self.data, start_codes + i * 2);
+                    let end = be16(&self.data, end_codes + i * 2);
+                    if start == 0xFFFF {
+                        continue;
+                    }
+                    for cp in start..=end {
+                        if let Some(gid) = self.cmap_format4(sub, cp as u32) {
+                            record(gid, cp as u32);
+                        }
+                    }
+                }
+            }
+            12 => {
+                let n = be32(&self.data, sub + 12) as usize;
+                for i in 0..n {
+                    let g = sub + 16 + i * 12;
+                    let start = be32(&self.data, g);
+                    let end = be32(&self.data, g + 4);
+                    let start_gid = be32(&self.data, g + 8);
+                    // Guard pathological group counts (corrupt fonts) by capping
+                    // the span we expand per group.
+                    let span = end.saturating_sub(start).min(0x10_FFFF);
+                    for off in 0..=span {
+                        record((start_gid + off) as u16, start + off);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn cmap_lookup(&self, sub: usize, cp: u32) -> Option<u16> {
@@ -573,15 +679,28 @@ impl TrueTypeFont {
             }
             let mut tag = [0u8; 4];
             tag.copy_from_slice(&self.data[rec..rec + 4]);
-            // Keep only the tables a PDF Identity-H viewer needs to rasterise
-            // glyph outlines; drop everything else — cmap / OS/2 / name / post /
-            // GPOS / GSUB / GDEF / DSIG and the hinting programs (cvt/fpgm/prep/
+            // Keep the tables a PDF Identity-H viewer needs to rasterise glyph
+            // outlines, PLUS `cmap` (so extracted/copied text round-trips when no
+            // `/ToUnicode` is written) and the OpenType-Layout tables `GPOS` /
+            // `GSUB` / `GDEF` (so the embedded subset still kerns and ligates).
+            // Glyph IDs are preserved by the subsetter, so these GID-indexed
+            // tables stay valid against the truncated glyph range. Drop the rest —
+            // OS/2 / name / post / DSIG and the hinting programs (cvt/fpgm/prep/
             // gasp), none of which the embedding consults, and which dominate a
             // full font's size. (Hinting only refines small-size rendering;
             // viewers rasterise unhinted outlines fine.)
             if !matches!(
                 &tag,
-                b"head" | b"hhea" | b"maxp" | b"hmtx" | b"loca" | b"glyf"
+                b"head"
+                    | b"hhea"
+                    | b"maxp"
+                    | b"hmtx"
+                    | b"loca"
+                    | b"glyf"
+                    | b"cmap"
+                    | b"GPOS"
+                    | b"GSUB"
+                    | b"GDEF"
             ) {
                 continue;
             }
