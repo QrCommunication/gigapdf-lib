@@ -36,6 +36,7 @@ pub mod error;
 pub mod filters;
 pub mod font;
 pub mod form;
+pub mod headerfooter;
 pub mod html;
 pub mod js;
 pub mod lexer;
@@ -62,6 +63,7 @@ pub use document::{
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FormField};
+pub use headerfooter::{Align, HeaderFooterSpec, Margins};
 pub use lexer::{Lexer, Token};
 pub use link::{Link, LinkTarget};
 pub use object::{Dictionary, Object, ObjectId, Stream, StringKind};

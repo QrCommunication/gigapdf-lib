@@ -1150,6 +1150,40 @@ export interface PageInfo {
   mediaBox: [number, number, number, number];
 }
 
+/** Per-side page margins, in points. */
+export interface PageMargins {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/** Horizontal alignment of header/footer text within the printable width. */
+export type HeaderFooterAlign = "left" | "center" | "right";
+
+/**
+ * A running header/footer to bake onto an existing PDF (see {@link GigaPdfDoc.setHeader} /
+ * {@link GigaPdfDoc.setFooter}). `text` may contain the tokens `{{page}}` (1-based page
+ * number) and `{{pages}}` (total page count), substituted per page. Text is drawn in
+ * standard Helvetica inside the top (header) / bottom (footer) margin band.
+ */
+export interface HeaderFooterSpec {
+  /** Template text, with `{{page}}` / `{{pages}}` tokens. */
+  text: string;
+  /** Horizontal alignment (default `"left"`). */
+  align?: HeaderFooterAlign;
+  /** Font size in points (default `10`). */
+  fontSize?: number;
+  /** RGB fill colour, `0..1` per channel (default black `[0,0,0]`). */
+  color?: [number, number, number];
+  /** Inclusive 1-based page range `[first, last]`; omit for every page. */
+  pageRange?: [number, number] | null;
+  /** Draw on the first page of the range too (default `true`). */
+  showOnFirstPage?: boolean;
+  /** Band height from the page edge, in points (default `36`). */
+  bandHeight?: number;
+}
+
 const RGB = (rgb: number) => rgb & 0xffffff;
 
 /** Visual styling for a newly-created form field. */
@@ -1579,6 +1613,51 @@ export class GigaPdfDoc {
   /** A page's size (points) and `/Rotate` (0/90/180/270). */
   pageInfo(page: number): PageInfo {
     return this.g._json((o) => this.ex().gp_page_info_json(this.h, page, o));
+  }
+
+  // margins + running header/footer
+
+  /**
+   * A page's margins (points): the gap between `/CropBox` and `/MediaBox` when a
+   * CropBox exists, else estimated from the content bounding box.
+   */
+  pageMargins(page: number): PageMargins {
+    return this.g._json<PageMargins>((o) => this.ex().gp_page_margins(this.h, page, o));
+  }
+
+  /**
+   * Set a page's margins (points) by insetting its `/CropBox` from the `/MediaBox`
+   * — a real, visible margin change. Returns `true` on success.
+   */
+  setPageMargins(page: number, m: PageMargins): boolean {
+    return this.ex().gp_set_page_margins(this.h, page, m.top, m.right, m.bottom, m.left) === 0;
+  }
+
+  /**
+   * Bake a running header onto every in-range page (idempotent: re-baking
+   * replaces the prior header). Returns `true` on success.
+   */
+  setHeader(spec: HeaderFooterSpec): boolean {
+    return (
+      this.g._withStr(JSON.stringify(spec), (p, l) => this.ex().gp_set_header(this.h, p, l)) === 0
+    );
+  }
+
+  /** Bake a running footer onto every in-range page (idempotent). */
+  setFooter(spec: HeaderFooterSpec): boolean {
+    return (
+      this.g._withStr(JSON.stringify(spec), (p, l) => this.ex().gp_set_footer(this.h, p, l)) === 0
+    );
+  }
+
+  /** Remove every previously-baked running header from all pages. */
+  removeHeaders(): boolean {
+    return this.ex().gp_remove_headers(this.h) === 0;
+  }
+
+  /** Remove every previously-baked running footer from all pages. */
+  removeFooters(): boolean {
+    return this.ex().gp_remove_footers(this.h) === 0;
   }
 
   // render

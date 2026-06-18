@@ -1071,6 +1071,71 @@ pub fn remove_element(content: &[u8], index: usize) -> Result<Vec<u8>> {
     Ok(encode_content(&operations))
 }
 
+/// Strip every marked-content block tagged `/GPHF` whose property dictionary's
+/// `/T` value equals `subtype` (`b"h"` for headers, `b"f"` for footers), removing
+/// the `BDC … EMC` span **and everything between** from the content stream.
+///
+/// This is how previously-baked running headers/footers are removed
+/// idempotently: the bake wraps each H/F draw in `/GPHF <</T (h)>> BDC … EMC`, so
+/// stripping the tagged spans deletes exactly the baked operations (the text is
+/// physically gone from the stream, not merely covered) and leaves all other
+/// content — including any non-H/F marked content — untouched. Nesting is tracked
+/// so a matching `EMC` is found at the depth where the tagged `BDC` opened.
+pub fn strip_marked_content(content: &[u8], subtype: &[u8]) -> Result<Vec<u8>> {
+    let operations = parse_content(content)?;
+    let mut kept: Vec<Operation> = Vec::with_capacity(operations.len());
+    // Depth of the currently-open `GPHF`-of-this-subtype block we are dropping;
+    // `None` when we are keeping ops. We also track the global BDC/BMC nesting so
+    // the right `EMC` closes our block even if it contains nested marked content.
+    let mut drop_open_depth: Option<usize> = None;
+    let mut depth: usize = 0;
+    for op in operations {
+        let is_open = op.operator == b"BDC" || op.operator == b"BMC";
+        let is_close = op.operator == b"EMC";
+        if drop_open_depth.is_some() {
+            // Inside a dropped block: skip ops, only tracking depth to find the end.
+            if is_open {
+                depth += 1;
+            } else if is_close {
+                depth -= 1;
+                if Some(depth) == drop_open_depth {
+                    drop_open_depth = None;
+                }
+            }
+            continue;
+        }
+        if is_open {
+            if op.operator == b"BDC" && bdc_is_gphf(&op.operands, subtype) {
+                // Open a dropped block at the current depth; drop this BDC too.
+                drop_open_depth = Some(depth);
+                depth += 1;
+                continue;
+            }
+            depth += 1;
+        } else if is_close {
+            depth = depth.saturating_sub(1);
+        }
+        kept.push(op);
+    }
+    Ok(encode_content(&kept))
+}
+
+/// `true` when a `BDC` operator's operands are `/GPHF <</T (subtype) …>>` — our
+/// stable marker tagging a baked header (`subtype == b"h"`) or footer (`b"f"`).
+fn bdc_is_gphf(operands: &[Object], subtype: &[u8]) -> bool {
+    if operands.first().and_then(Object::as_name) != Some(b"GPHF".as_slice()) {
+        return false;
+    }
+    let Some(Object::Dictionary(props)) = operands.get(1) else {
+        return false;
+    };
+    match props.get(b"T") {
+        Some(Object::String(bytes, _)) => bytes.as_slice() == subtype,
+        Some(Object::Name(name)) => name.as_slice() == subtype,
+        _ => false,
+    }
+}
+
 /// Duplicate the element at `index`, inserting the copy right after it (it lands
 /// at the same position, ready to be moved). Works for text, images and shapes.
 pub fn duplicate_element(content: &[u8], index: usize) -> Result<Vec<u8>> {
@@ -1461,5 +1526,44 @@ mod tests {
             .filter(|e| e.kind == ElementKind::Path)
             .count();
         assert_eq!(paths, 1, "still one shape after move");
+    }
+
+    #[test]
+    fn strip_marked_content_removes_only_the_matching_subtype() {
+        // A header block (T=h), a footer block (T=f), and untagged body content.
+        let content = b"10 10 100 50 re f\n\
+/GPHF <</T (h)>> BDC\nBT /F 12 Tf (HEADER) Tj ET\nEMC\n\
+/GPHF <</T (f)>> BDC\nBT /F 12 Tf (FOOTER) Tj ET\nEMC\n\
+BT /F 12 Tf (BODY) Tj ET";
+        let no_header = strip_marked_content(content, b"h").unwrap();
+        let s = String::from_utf8_lossy(&no_header);
+        assert!(!s.contains("HEADER"), "header stripped");
+        assert!(s.contains("FOOTER"), "footer kept");
+        assert!(s.contains("BODY"), "body kept");
+        assert!(s.contains("re"), "untagged path kept");
+
+        let no_footer = strip_marked_content(content, b"f").unwrap();
+        let s = String::from_utf8_lossy(&no_footer);
+        assert!(s.contains("HEADER"), "header kept");
+        assert!(!s.contains("FOOTER"), "footer stripped");
+    }
+
+    #[test]
+    fn strip_marked_content_handles_nested_marked_content() {
+        // A tagged header block that itself contains a nested (untagged) marked
+        // block: the matching outer EMC must close the dropped span, not the inner.
+        let content = b"/GPHF <</T (h)>> BDC\n\
+(A) Tj\n/Span BDC (inner) Tj EMC\n(B) Tj\nEMC\n(C) Tj";
+        let stripped = strip_marked_content(content, b"h").unwrap();
+        let s = String::from_utf8_lossy(&stripped);
+        assert!(!s.contains("(A)") && !s.contains("inner") && !s.contains("(B)"));
+        assert!(s.contains("(C)"), "content after the block is preserved");
+    }
+
+    #[test]
+    fn strip_marked_content_is_noop_without_marker() {
+        let content = b"BT /F 12 Tf (plain) Tj ET";
+        let out = strip_marked_content(content, b"h").unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("plain"));
     }
 }

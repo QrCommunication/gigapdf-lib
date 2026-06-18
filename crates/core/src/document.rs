@@ -15,6 +15,7 @@ use crate::content::{self, ContentElement, TextRun};
 use crate::error::{EngineError, Result};
 use crate::filters::decode_stream;
 use crate::form::{self, FormField};
+use crate::headerfooter::{Align, HeaderFooterSpec, Margins};
 use crate::lexer::{Lexer, Token};
 use crate::link::{Link, LinkTarget};
 use crate::object::{Dictionary, Object, ObjectId, Stream, StringKind};
@@ -1864,6 +1865,307 @@ impl Document {
     /// reconstruct the exact page coordinate frame.
     pub fn page_media_box(&self, page_no: u32) -> Result<[f64; 4]> {
         Ok(self.read_media_box(self.page_dict(page_no)?))
+    }
+
+    /// A page's `/CropBox` `[x0, y0, x1, y1]` in user-space points. PDF defines
+    /// the CropBox to default to the MediaBox when absent, so that is what this
+    /// returns (read from the page dict directly, like
+    /// [`page_media_box`](Self::page_media_box)).
+    fn read_crop_box(&self, page: &Dictionary) -> [f64; 4] {
+        if let Some(values) = page
+            .get(b"CropBox")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            let nums: Vec<f64> = values.iter().filter_map(Object::as_f64).collect();
+            if nums.len() == 4 {
+                return [nums[0], nums[1], nums[2], nums[3]];
+            }
+        }
+        self.read_media_box(page)
+    }
+
+    // ─── page margins ────────────────────────────────────────────────────────
+
+    /// A page's margins (points): the printable inset on each side.
+    ///
+    /// When the page carries a `/CropBox` the margins are the gap between it and
+    /// the `/MediaBox` (the visible, intended margins). Without a CropBox there is
+    /// no declared margin, so they are **estimated** from the content bounding box
+    /// — the distance from each MediaBox edge to the outermost drawn content
+    /// (text, images, shapes). An empty page falls back to a 0.5" default.
+    pub fn page_margins(&self, page_no: u32) -> Result<Margins> {
+        let page = self.page_dict(page_no)?;
+        let mb = self.read_media_box(page);
+        let (mx0, my0, mx1, my1) = (
+            mb[0].min(mb[2]),
+            mb[1].min(mb[3]),
+            mb[0].max(mb[2]),
+            mb[1].max(mb[3]),
+        );
+        // CropBox present and not equal to MediaBox → real declared margins.
+        let cb = self.read_crop_box(page);
+        if page.get(b"CropBox").is_some() {
+            let (cx0, cy0, cx1, cy1) = (
+                cb[0].min(cb[2]),
+                cb[1].min(cb[3]),
+                cb[0].max(cb[2]),
+                cb[1].max(cb[3]),
+            );
+            return Ok(Margins {
+                left: (cx0 - mx0).max(0.0),
+                bottom: (cy0 - my0).max(0.0),
+                right: (mx1 - cx1).max(0.0),
+                top: (my1 - cy1).max(0.0),
+            });
+        }
+        // No CropBox: estimate from the content bounding box.
+        match self.content_bbox(page_no)? {
+            Some((bx0, by0, bx1, by1)) => Ok(Margins {
+                left: (bx0 - mx0).max(0.0),
+                bottom: (by0 - my0).max(0.0),
+                right: (mx1 - bx1).max(0.0),
+                top: (my1 - by1).max(0.0),
+            }),
+            None => Ok(Margins::default()),
+        }
+    }
+
+    /// Union bounding box `(x0, y0, x1, y1)` of every element with computable
+    /// bounds on a page (recursing into form XObjects), in page user space.
+    /// `None` for an empty page (nothing measurable).
+    fn content_bbox(&self, page_no: u32) -> Result<Option<(f64, f64, f64, f64)>> {
+        let mut acc: Option<(f64, f64, f64, f64)> = None;
+        for el in self.page_elements_deep(page_no)? {
+            let Some(b) = el.bounds else { continue };
+            if b.width <= 0.0 && b.height <= 0.0 {
+                continue;
+            }
+            let (x0, y0, x1, y1) = (b.x, b.y, b.x + b.width, b.y + b.height);
+            acc = Some(match acc {
+                Some((ax0, ay0, ax1, ay1)) => {
+                    (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1))
+                }
+                None => (x0, y0, x1, y1),
+            });
+        }
+        Ok(acc)
+    }
+
+    /// Set a page's `/CropBox` to its `/MediaBox` inset by `m` (points) — a real,
+    /// visible margin change. Margins are clamped so the resulting box stays
+    /// inside the MediaBox and non-degenerate.
+    pub fn set_page_margins(&mut self, page_no: u32, m: Margins) -> Result<()> {
+        let id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+        let mb = self.read_media_box(&page);
+        let (mx0, my0, mx1, my1) = (
+            mb[0].min(mb[2]),
+            mb[1].min(mb[3]),
+            mb[0].max(mb[2]),
+            mb[1].max(mb[3]),
+        );
+        let left = m.left.max(0.0);
+        let bottom = m.bottom.max(0.0);
+        let right = m.right.max(0.0);
+        let top = m.top.max(0.0);
+        // Keep at least a 1pt-wide/high box; if margins overflow, clamp them.
+        let mut x0 = mx0 + left;
+        let mut y0 = my0 + bottom;
+        let mut x1 = mx1 - right;
+        let mut y1 = my1 - top;
+        if x1 <= x0 {
+            x0 = mx0;
+            x1 = mx1;
+        }
+        if y1 <= y0 {
+            y0 = my0;
+            y1 = my1;
+        }
+        page.set(
+            b"CropBox".to_vec(),
+            Object::Array(vec![
+                Object::Real(x0),
+                Object::Real(y0),
+                Object::Real(x1),
+                Object::Real(y1),
+            ]),
+        );
+        self.objects.insert(id, Object::Dictionary(page));
+        Ok(())
+    }
+
+    // ─── running header / footer ─────────────────────────────────────────────
+
+    /// Bake a running **header** onto every in-range page: `spec.text` (with
+    /// `{{page}}` / `{{pages}}` substituted) drawn in standard Helvetica inside
+    /// the page's top margin band, aligned per `spec.align`. Re-baking is
+    /// idempotent — any previously-baked header is stripped first (the H/F is
+    /// tagged with a stable `/GPHF` marked-content marker). See
+    /// [`remove_headers`](Self::remove_headers) to strip without re-adding.
+    pub fn set_header(&mut self, spec: &HeaderFooterSpec) -> Result<()> {
+        self.bake_header_footer(spec, true)
+    }
+
+    /// Bake a running **footer** onto every in-range page (bottom margin band).
+    /// The footer twin of [`set_header`](Self::set_header) — same tokens,
+    /// alignment and idempotency.
+    pub fn set_footer(&mut self, spec: &HeaderFooterSpec) -> Result<()> {
+        self.bake_header_footer(spec, false)
+    }
+
+    /// Remove every previously-baked running header from all pages (strip the
+    /// tagged `/GPHF` header marked-content blocks; the text is physically
+    /// removed, not covered). A no-op on pages without a baked header.
+    pub fn remove_headers(&mut self) -> Result<()> {
+        self.strip_header_footer(true)
+    }
+
+    /// Remove every previously-baked running footer from all pages.
+    pub fn remove_footers(&mut self) -> Result<()> {
+        self.strip_header_footer(false)
+    }
+
+    /// Marker subtype byte for headers (`b"h"`) / footers (`b"f"`), tagged in the
+    /// `/GPHF <</T (…)>> BDC` property dict so bakes are idempotent and removable.
+    fn hf_subtype(header: bool) -> &'static [u8] {
+        if header {
+            b"h"
+        } else {
+            b"f"
+        }
+    }
+
+    /// Strip baked headers (or footers) from every page.
+    fn strip_header_footer(&mut self, header: bool) -> Result<()> {
+        let subtype = Self::hf_subtype(header);
+        for page_no in 1..=self.page_count() as u32 {
+            let content = self.page_content(page_no)?;
+            let edited = content::strip_marked_content(&content, subtype)?;
+            if edited != content {
+                self.set_page_content(page_no, edited)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared header/footer bake. For every page in `spec.page_range` (1-based
+    /// inclusive; whole document when `None`), strip any prior H/F of this kind,
+    /// then draw the per-page text inside the top (header) / bottom (footer)
+    /// margin band at the requested alignment, wrapped in a `/GPHF` marked-content
+    /// block so it can be re-baked or removed.
+    fn bake_header_footer(&mut self, spec: &HeaderFooterSpec, header: bool) -> Result<()> {
+        let total = self.page_count();
+        if total == 0 {
+            return Ok(());
+        }
+        let (first, last) = spec.page_range.unwrap_or((1, total));
+        let first = first.max(1);
+        let last = last.min(total);
+        let band = spec.band_height.max(1.0);
+        let size = spec.font_size.max(0.01);
+        let subtype = Self::hf_subtype(header);
+
+        for page_1 in first..=last {
+            if !spec.show_on_first_page && page_1 == first {
+                continue;
+            }
+            let page_no = page_1 as u32;
+            // Idempotency: drop any prior baked H/F of this kind on the page first.
+            let content = self.page_content(page_no)?;
+            let stripped = content::strip_marked_content(&content, subtype)?;
+            if stripped != content {
+                self.set_page_content(page_no, stripped)?;
+            }
+
+            let mb = self.read_media_box(self.page_dict(page_no)?);
+            let (mx0, my0, mx1, my1) = (
+                mb[0].min(mb[2]),
+                mb[1].min(mb[3]),
+                mb[0].max(mb[2]),
+                mb[1].max(mb[3]),
+            );
+            let text = spec.render_text(page_1, total);
+            if text.is_empty() {
+                continue;
+            }
+            // Horizontal placement within the printable width (MediaBox minus the
+            // same band as side gutters, so centred text sits visually centred).
+            let gutter = band.min((mx1 - mx0) / 2.0);
+            let avail_x0 = mx0 + gutter;
+            let avail_x1 = mx1 - gutter;
+            let text_w = Self::helvetica_width(&text, size);
+            let x = match spec.align {
+                Align::Left => avail_x0,
+                Align::Center => (avail_x0 + avail_x1 - text_w) / 2.0,
+                Align::Right => avail_x1 - text_w,
+            };
+            // Vertical baseline: centre the cap-height in the band at the edge.
+            // Header band hugs the top edge, footer band hugs the bottom edge.
+            let cap = size * 0.7;
+            let y = if header {
+                my1 - band / 2.0 - cap / 2.0
+            } else {
+                my0 + band / 2.0 - cap / 2.0
+            };
+
+            let ops = self.header_footer_ops(page_no, x, y, size, &text, spec.color, subtype)?;
+            self.append_page_content(page_no, &ops)?;
+        }
+        Ok(())
+    }
+
+    /// Build the marked-content ops that draw one header/footer line: the same
+    /// standard-Helvetica `BT … (text) Tj … ET` run as
+    /// [`add_text_standard`](Self::add_text_standard), wrapped in
+    /// `/GPHF <</T (subtype)>> BDC … EMC` so it carries the stable removal marker.
+    /// Registers the Helvetica font resource on the page.
+    #[allow(clippy::too_many_arguments)]
+    fn header_footer_ops(
+        &mut self,
+        page_no: u32,
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        color: [f64; 3],
+        subtype: &[u8],
+    ) -> Result<Vec<u8>> {
+        let res_name = self.ensure_standard_font(page_no, b"Helvetica")?;
+        let mut ops: Vec<u8> = Vec::new();
+        // /GPHF << /T (h|f) >> BDC  — the idempotency marker.
+        ops.extend_from_slice(b"/GPHF <</T (");
+        ops.extend_from_slice(subtype);
+        ops.extend_from_slice(b")>> BDC\n");
+        ops.extend_from_slice(b"q\n");
+        ops.extend_from_slice(
+            format!(
+                "{} {} {} rg\nBT\n/",
+                content::num(color[0]),
+                content::num(color[1]),
+                content::num(color[2]),
+            )
+            .as_bytes(),
+        );
+        ops.extend_from_slice(&res_name);
+        ops.extend_from_slice(format!(" {} Tf\n", content::num(size)).as_bytes());
+        ops.extend_from_slice(
+            format!("1 0 0 1 {} {} Tm\n", content::num(x), content::num(y)).as_bytes(),
+        );
+        ops.push(b'(');
+        for &byte in &crate::font::encode_winansi(text) {
+            if byte == b'(' || byte == b')' || byte == b'\\' {
+                ops.push(b'\\');
+            }
+            ops.push(byte);
+        }
+        ops.extend_from_slice(b") Tj\nET\nQ\nEMC\n");
+        Ok(ops)
     }
 
     /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using
@@ -12011,5 +12313,194 @@ mod tests {
         );
         // Outside the filled path stays white paper.
         assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the pattern-filled path is white");
+    }
+
+    // ─── margins + running header/footer ─────────────────────────────────────
+
+    /// Build an `n`-page blank PDF, each page `w`×`h` points.
+    fn blank_pages(n: usize, w: f64, h: f64) -> Document {
+        let mut b = crate::convert::build::PdfBuilder::new();
+        for _ in 0..n {
+            b.add_page(w, h);
+        }
+        Document::open(&b.finish()).unwrap()
+    }
+
+    /// `true` when any text element on `page_no` contains `needle` and its
+    /// baseline `y` is within the page's **top band** (above `h - band`).
+    fn header_present(doc: &Document, page_no: u32, needle: &str, h: f64, band: f64) -> bool {
+        doc.page_text_elements(page_no)
+            .iter()
+            .any(|e| e.text.contains(needle) && e.y >= h - band)
+    }
+
+    #[test]
+    fn set_header_substitutes_page_tokens_on_every_page() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(3, w, h);
+        doc.set_header(&HeaderFooterSpec {
+            text: "Doc {{page}}/{{pages}}".into(),
+            align: Align::Center,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Round-trip through save/open: the header must survive serialization.
+        let reopened = Document::open(&doc.save()).unwrap();
+        for (page, expected) in [(1u32, "Doc 1/3"), (2, "Doc 2/3"), (3, "Doc 3/3")] {
+            assert!(
+                header_present(&reopened, page, expected, h, 36.0),
+                "page {page} top band should contain '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn page_margins_reads_cropbox_inset() {
+        // A page with a /CropBox inset 50/40/30/20 (l/b/r/t-ish) reports those
+        // gaps to the MediaBox as its margins.
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(1, w, h);
+        doc.set_page_margins(
+            1,
+            Margins {
+                left: 50.0,
+                bottom: 40.0,
+                right: 30.0,
+                top: 20.0,
+            },
+        )
+        .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let m = reopened.page_margins(1).unwrap();
+        assert!((m.left - 50.0).abs() < 1e-6, "left {}", m.left);
+        assert!((m.bottom - 40.0).abs() < 1e-6, "bottom {}", m.bottom);
+        assert!((m.right - 30.0).abs() < 1e-6, "right {}", m.right);
+        assert!((m.top - 20.0).abs() < 1e-6, "top {}", m.top);
+    }
+
+    #[test]
+    fn remove_headers_strips_the_baked_text() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(2, w, h);
+        doc.set_header(&HeaderFooterSpec {
+            text: "HDR {{page}}".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            header_present(&doc, 1, "HDR 1", h, 36.0),
+            "header should be present before removal"
+        );
+
+        doc.remove_headers().unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        for page in 1..=2u32 {
+            assert!(
+                reopened
+                    .page_text_elements(page)
+                    .iter()
+                    .all(|e| !e.text.contains("HDR")),
+                "page {page} should have no header text after remove_headers"
+            );
+        }
+    }
+
+    #[test]
+    fn show_on_first_page_false_skips_page_one() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(3, w, h);
+        doc.set_header(&HeaderFooterSpec {
+            text: "P {{page}}".into(),
+            show_on_first_page: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(
+            reopened
+                .page_text_elements(1)
+                .iter()
+                .all(|e| !e.text.contains("P 1")),
+            "page 1 header must be skipped when show_on_first_page = false"
+        );
+        assert!(
+            header_present(&reopened, 2, "P 2", h, 36.0),
+            "page 2 should still carry its header"
+        );
+        assert!(
+            header_present(&reopened, 3, "P 3", h, 36.0),
+            "page 3 should still carry its header"
+        );
+    }
+
+    #[test]
+    fn set_header_is_idempotent() {
+        // Baking the same header twice leaves exactly one copy (no duplicate
+        // stacking) — the /GPHF marker is stripped before each re-bake.
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(1, w, h);
+        let spec = HeaderFooterSpec {
+            text: "Once {{page}}".into(),
+            ..Default::default()
+        };
+        doc.set_header(&spec).unwrap();
+        doc.set_header(&spec).unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let count = reopened
+            .page_text_elements(1)
+            .iter()
+            .filter(|e| e.text.contains("Once 1"))
+            .count();
+        assert_eq!(count, 1, "re-baking a header must not duplicate it");
+    }
+
+    #[test]
+    fn set_footer_draws_in_bottom_band() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(2, w, h);
+        doc.set_footer(&HeaderFooterSpec {
+            text: "Foot {{page}}".into(),
+            band_height: 36.0,
+            ..Default::default()
+        })
+        .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        // Footer text sits in the bottom band (baseline y below `band`), not the top.
+        let hit = reopened
+            .page_text_elements(1)
+            .into_iter()
+            .find(|e| e.text.contains("Foot 1"))
+            .expect("footer text present on page 1");
+        assert!(hit.y < 36.0, "footer baseline y should be in the bottom band, got {}", hit.y);
+        // remove_footers clears it; remove_headers must NOT touch the footer.
+        let mut doc2 = reopened;
+        doc2.remove_headers().unwrap();
+        assert!(
+            doc2.page_text_elements(1).iter().any(|e| e.text.contains("Foot 1")),
+            "remove_headers must leave footers intact"
+        );
+        doc2.remove_footers().unwrap();
+        assert!(
+            doc2.page_text_elements(1).iter().all(|e| !e.text.contains("Foot 1")),
+            "remove_footers must strip the footer"
+        );
+    }
+
+    #[test]
+    fn header_respects_page_range() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(4, w, h);
+        doc.set_header(&HeaderFooterSpec {
+            text: "R {{page}}".into(),
+            page_range: Some((2, 3)),
+            ..Default::default()
+        })
+        .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(reopened.page_text_elements(1).iter().all(|e| !e.text.contains("R 1")));
+        assert!(header_present(&reopened, 2, "R 2", h, 36.0));
+        assert!(header_present(&reopened, 3, "R 3", h, 36.0));
+        assert!(reopened.page_text_elements(4).iter().all(|e| !e.text.contains("R 4")));
     }
 }

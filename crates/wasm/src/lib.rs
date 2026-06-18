@@ -22,7 +22,8 @@ mod rng;
 
 use gigapdf_core::{
     Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
-    Layer, Link, LinkTarget, OcrWord, OutlineItem, SearchMatch, TextLayerRun, TextLine, TextRun,
+    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OcrWord, OutlineItem, SearchMatch,
+    TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -1400,6 +1401,106 @@ pub extern "C" fn gp_page_info_json(
         None => fallback,
     };
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// A page's margins as JSON `{"top":…,"right":…,"bottom":…,"left":…}` (points):
+/// the gap between `/CropBox` and `/MediaBox` when a CropBox exists, else
+/// estimated from the content bounding box. Buffer-returning (host frees).
+#[no_mangle]
+pub extern "C" fn gp_page_margins(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let fallback = "{\"top\":0,\"right\":0,\"bottom\":0,\"left\":0}".to_string();
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => match doc.page_margins(page) {
+            Ok(m) => format!(
+                "{{\"top\":{},\"right\":{},\"bottom\":{},\"left\":{}}}",
+                m.top, m.right, m.bottom, m.left
+            ),
+            Err(_) => fallback,
+        },
+        None => fallback,
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Set a page's margins (points) by insetting its `/CropBox` from the
+/// `/MediaBox`. Returns `0` on success, `<0` on error.
+#[no_mangle]
+pub extern "C" fn gp_set_page_margins(
+    handle: *mut Document,
+    page: u32,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    left: f64,
+) -> i32 {
+    let m = Margins {
+        top,
+        right,
+        bottom,
+        left,
+    };
+    edit(handle, |doc| doc.set_page_margins(page, m))
+}
+
+/// Bake a running **header** from a JSON spec (`text`, `align`, `fontSize`,
+/// `color`, `pageRange`, `showOnFirstPage`, `bandHeight`) onto every in-range
+/// page. Idempotent (re-baking replaces the prior header). Returns `0` on
+/// success, `-1` null handle, `-2` malformed JSON, `-3` bake error.
+#[no_mangle]
+pub extern "C" fn gp_set_header(handle: *mut Document, json_ptr: *const u8, json_len: usize) -> i32 {
+    set_header_footer(handle, json_ptr, json_len, true)
+}
+
+/// Bake a running **footer** from a JSON spec onto every in-range page. The
+/// footer twin of [`gp_set_header`].
+#[no_mangle]
+pub extern "C" fn gp_set_footer(handle: *mut Document, json_ptr: *const u8, json_len: usize) -> i32 {
+    set_header_footer(handle, json_ptr, json_len, false)
+}
+
+/// Shared body for [`gp_set_header`]/[`gp_set_footer`]: parse the spec JSON and
+/// bake it as a header (`header == true`) or footer.
+fn set_header_footer(
+    handle: *mut Document,
+    json_ptr: *const u8,
+    json_len: usize,
+    header: bool,
+) -> i32 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return -1,
+    };
+    let json = unsafe { str_arg(json_ptr, json_len) };
+    let spec = match HeaderFooterSpec::from_json(json) {
+        Some(spec) => spec,
+        None => return -2,
+    };
+    let result = if header {
+        doc.set_header(&spec)
+    } else {
+        doc.set_footer(&spec)
+    };
+    match result {
+        Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
+/// Remove every previously-baked running header from all pages. Returns `0` on
+/// success, `<0` on error.
+#[no_mangle]
+pub extern "C" fn gp_remove_headers(handle: *mut Document) -> i32 {
+    edit(handle, |doc| doc.remove_headers())
+}
+
+/// Remove every previously-baked running footer from all pages.
+#[no_mangle]
+pub extern "C" fn gp_remove_footers(handle: *mut Document) -> i32 {
+    edit(handle, |doc| doc.remove_footers())
 }
 
 /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using the
