@@ -4,6 +4,33 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.43.0] - 2026-06-18
+
+### Added
+
+- **Native bare-CFF font embedding.** PDF `FontFile3 /Subtype /Type1C` programs
+  (the common compact-font case) are embedded by wrapping the bare CFF into an
+  OpenType-CFF (`OTTO`) sfnt with a synthesised `cmap`, so the engine no longer
+  needs an external converter (e.g. FontForge) for Type1C faces. The cmap maps
+  CFF Standard Strings 1–95 to ASCII and 96–228 to Latin-1 (covering French and
+  Western-European accents), plus `uniXXXX` / single-character glyph names.
+- **Glyphless Type0 OCR text layer for any script.** `add_text_layer` now
+  carries non-WinAnsi text (Cyrillic, Greek, Arabic, Bengali, Devanagari,
+  Tamil…) through an embedded glyphless Type0 font (`CIDFontType2`, empty
+  `glyf`, Identity `CIDToGIDMap`, `Identity-H`) with a `/ToUnicode` CMap.
+  Drawn in render mode 3 (invisible), the layer makes OCR output searchable and
+  copyable regardless of script. WinAnsi runs keep the compact Helvetica path.
+- **SDK `loadOcrModel(model)` / `clearOcrModels()`.** Hosts can load CRNN OCR
+  model blobs at runtime (the wasm ships none), enabling multi-script
+  recognition (Latin, Cyrillic, Greek, Arabic, Devanagari, Bengali, Tamil).
+
+### Changed
+
+- **SDK `load()` / `loadDefault()` are bundler-opaque.** The Node-only built-in
+  imports in `loadDefault()` are indirected so bundlers (Turbopack, webpack,
+  Vite) no longer try to statically resolve `node:fs/promises` / `node:url` in
+  browser builds.
+
 ## [0.42.0] - 2026-06-18
 
 ### Changed
