@@ -4,6 +4,19 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.46.0] - 2026-06-18
+
+### Added
+
+- **Flatten form XObjects for in-place editing.** `flattenFormXObjects(page)`
+  inlines every form XObject invoked via `Do` into the page content stream
+  (applying its `/Matrix`, merging its resources with collision-safe name
+  remapping, recursing into nested forms with a depth + cycle guard). Each
+  placement is de-shared, so the former form text becomes ordinary page runs with
+  real indices that `replaceText` / `moveElement` / `removeElement` can edit —
+  letting hosts edit invoice/template text in place rather than redact-and-redraw.
+  Distinct from `flattenForm` (AcroForm fields).
+
 ## [0.45.0] - 2026-06-18
 
 ### Added
