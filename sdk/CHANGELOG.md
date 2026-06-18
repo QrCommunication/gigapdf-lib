@@ -4,6 +4,29 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.49.0] - 2026-06-18
+
+### Changed
+
+- **Office → PDF higher fidelity.** DOCX paragraph line spacing
+  (`w:spacing@line/@lineRule` → CSS `line-height`), bullet/numbered lists
+  (`w:numPr`, ODF `text:list` — indentation + bullet), and table cell merges
+  (`w:gridSpan` expands to physical cells so the merge actually spans columns;
+  `w:vMerge`) are now carried through, and XLSX cell fills (`xl/styles.xml`
+  `cellXfs`→`patternFill`/`fgColor`) become `background-color`. Embedded images
+  (DOCX/PPTX `a:blip`, ODF `draw:image`) render as inline `data:` URIs.
+- **PDF → Office higher fidelity.** Vector strokes keep their **exact dash
+  pattern** (DrawingML `a:custDash`, ODF `draw:stroke-dash`) instead of a generic
+  preset, and shapes/text in **ICC-based / `cs`-`scn` colour spaces** now resolve
+  to their real colour (DeviceRGB/Gray/CMYK and ICCBased by component count)
+  instead of defaulting to black.
+
+### Known limitations
+
+- DOCX per-column table widths (`w:tblGrid`) are not yet honoured — the HTML
+  table layout uses equal-width columns (a future layout-engine change).
+- Floating shapes in XLSX/ODS spreadsheets are not yet exported.
+
 ## [0.48.0] - 2026-06-18
 
 ### Fixed
