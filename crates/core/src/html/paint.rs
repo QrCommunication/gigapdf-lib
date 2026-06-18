@@ -9,7 +9,7 @@
 
 use crate::convert::build::PdfBuilder;
 use crate::document::Document;
-use crate::font::{catalog, google, truetype::TrueTypeFont};
+use crate::font::{bundled, catalog, google, truetype::TrueTypeFont};
 
 use super::css::{collect_style_css, Display, Style, Stylesheet};
 use super::dom::{self, Element, Node};
@@ -50,6 +50,11 @@ fn weight_bold(w: u16) -> bool {
 /// Parsed faces used for line-breaking before any PDF object exists.
 struct MeasureBook {
     faces: Vec<(Key, TrueTypeFont)>,
+    /// Bundled last-resort face (Liberation Sans), parsed once. Used for real
+    /// metrics whenever no host-provided face matches a run, so offline /
+    /// unknown-family text still lays out with true advance widths instead of a
+    /// rough estimate. `None` only if the bundled program failed to parse.
+    fallback: Option<TrueTypeFont>,
 }
 
 impl MeasureBook {
@@ -61,12 +66,16 @@ impl MeasureBook {
                     .map(|ttf| (key(&f.family, weight_bold(f.weight), f.italic), ttf))
             })
             .collect();
-        MeasureBook { faces }
+        MeasureBook {
+            faces,
+            fallback: TrueTypeFont::parse(bundled::FALLBACK_TTF),
+        }
     }
 
-    /// Nearest face for a style: exact (family,bold,italic) → same family →
-    /// any face. `None` when no font was provided at all.
-    fn face(&self, style: &Style) -> Option<&TrueTypeFont> {
+    /// Nearest *host-provided* face for a style: exact (family,bold,italic) →
+    /// same family → any provided face. `None` when no font was provided at all
+    /// (the caller then falls back to the bundled face).
+    fn provided_face(&self, style: &Style) -> Option<&TrueTypeFont> {
         let fam = style.font_family.to_ascii_lowercase();
         self.faces
             .iter()
@@ -74,6 +83,13 @@ impl MeasureBook {
             .or_else(|| self.faces.iter().find(|(k, _)| k.0 == fam))
             .or_else(|| self.faces.first())
             .map(|(_, t)| t)
+    }
+
+    /// The face to *measure and draw* a run with: a host-provided face when one
+    /// exists (online path, unchanged), otherwise the bundled fallback. `None`
+    /// only if even the bundled font failed to parse.
+    fn face(&self, style: &Style) -> Option<&TrueTypeFont> {
+        self.provided_face(style).or(self.fallback.as_ref())
     }
 }
 
@@ -93,7 +109,8 @@ impl Measure for MeasureBook {
             };
             w * boldish
         } else {
-            // No fonts provided yet — rough estimate (host still fetches them).
+            // Neither a provided nor the bundled face is available — rough
+            // estimate (should not happen in practice).
             let per = if style.generic_mono { 0.6 } else { 0.5 };
             text.chars().count() as f64 * style.font_size * per
         }
@@ -192,9 +209,7 @@ fn collect_image_urls(nodes: &[Node], out: &mut Vec<String>) {
         if let Node::Element(e) = n {
             if e.tag == "img" {
                 if let Some(src) = e.attr("src") {
-                    if !src.is_empty()
-                        && !src.starts_with("data:")
-                        && !out.iter().any(|u| u == src)
+                    if !src.is_empty() && !src.starts_with("data:") && !out.iter().any(|u| u == src)
                     {
                         out.push(src.to_string());
                     }
@@ -428,13 +443,43 @@ fn paint(
             objs.push((key(&f.family, weight_bold(f.weight), f.italic), id));
         }
     }
-    let resolve = |style: &Style| -> Option<u32> {
+    // Resolve a run to a *provided* font object id (no fallback).
+    let resolve_provided = |objs: &[(Key, u32)], style: &Style| -> Option<u32> {
         let fam = style.font_family.to_ascii_lowercase();
         objs.iter()
             .find(|(k, _)| k.0 == fam && k.1 == style.bold && k.2 == style.italic)
             .or_else(|| objs.iter().find(|(k, _)| k.0 == fam))
             .or_else(|| objs.first())
             .map(|(_, id)| *id)
+    };
+    // Embed the bundled last-resort face only when some painted text run has no
+    // matching provided font — so runs render real, selectable glyphs offline /
+    // for unknown families, without bloating output that needs no fallback (the
+    // full program would otherwise stay embedded when no run references it).
+    let needs_fallback = layout
+        .pages
+        .iter()
+        .chain(headers.iter())
+        .chain(footers.iter())
+        .flatten()
+        .any(|frag| match frag {
+            Fragment::Text { style, text, .. } => {
+                !style.hidden
+                    && !text.trim_end_matches('\n').is_empty()
+                    && resolve_provided(&objs, style).is_none()
+            }
+            _ => false,
+        });
+    let fallback_id = if needs_fallback {
+        doc.embed_truetype_font(bundled::FALLBACK_FAMILY, bundled::FALLBACK_TTF)
+            .ok()
+    } else {
+        None
+    };
+    let resolve = |style: &Style| -> Option<u32> {
+        // Host / Google fonts always win when present; the bundled face is the
+        // last resort (real glyphs + metrics).
+        resolve_provided(&objs, style).or(fallback_id)
     };
 
     // Paint one fragment list onto a page (shared by body, header and footer).
@@ -477,10 +522,10 @@ fn paint(
                     let id = match resolve(style) {
                         Some(id) => id,
                         None => {
-                            // No embedded face matched (e.g. no fonts supplied at
-                            // all): fall back to a built-in base-14 standard font
-                            // so text still renders — picked from the run's
-                            // serif/mono + bold/italic, mapped to WinAnsi.
+                            // Deep safety net: not even the bundled fallback face
+                            // could be embedded. Fall back to a built-in base-14
+                            // standard font so text still renders — picked from the
+                            // run's serif/mono + bold/italic, mapped to WinAnsi.
                             let base14 = base14_for(style);
                             let _ = doc.add_text_standard(
                                 page,
@@ -648,7 +693,12 @@ fn paint(
 /// available: serif→Times, monospace→Courier, else Helvetica — with the
 /// bold/italic suffix each family uses.
 fn base14_for(style: &Style) -> &'static str {
-    match (style.generic_serif, style.generic_mono, style.bold, style.italic) {
+    match (
+        style.generic_serif,
+        style.generic_mono,
+        style.bold,
+        style.italic,
+    ) {
         (true, _, true, true) => "Times-BoldItalic",
         (true, _, true, false) => "Times-Bold",
         (true, _, false, true) => "Times-Italic",
@@ -705,7 +755,10 @@ fn paint_text_decorations(
 /// other URL is looked up in the host-provided `resources` map (the engine never
 /// fetches the network). Returns `None` when the URL wasn't supplied — the image
 /// is simply omitted, exactly as a browser shows a broken image.
-fn resolve_image(src: &str, resources: &std::collections::BTreeMap<String, Vec<u8>>) -> Option<Vec<u8>> {
+fn resolve_image(
+    src: &str,
+    resources: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
     if src.starts_with("data:") {
         decode_data_uri(src)
     } else {
@@ -855,6 +908,96 @@ mod tests {
             })
             .collect();
         assert_eq!(imgs, vec!["https://x.test/logo.png"], "data: URI excluded");
+    }
+
+    #[test]
+    fn unmatched_family_uses_bundled_face_for_metrics() {
+        // No provided fonts and an unknown family: the MeasureBook must measure
+        // with the bundled fallback's *real* advance widths, not the rough
+        // character-count estimate (count · size · 0.5).
+        let book = MeasureBook::new(&[]);
+        let style = Style {
+            font_family: "NoSuchFont".into(),
+            font_size: 12.0,
+            ..Style::default()
+        };
+        let w = book.width("Hello", &style);
+        let rough = 5.0 * 12.0 * 0.5; // the old fallback estimate
+        assert!(book.fallback.is_some(), "the bundled fallback face parsed");
+        assert!(w > 0.0, "non-trivial measured width");
+        assert!(
+            (w - rough).abs() > 0.5,
+            "width comes from real font metrics, not the rough estimate (w={w}, rough={rough})"
+        );
+        // Sanity: the real proportional width of "Hello" at 12pt sits well under
+        // the rough 0.5-em-per-char figure.
+        assert!(
+            w < rough,
+            "proportional metrics are tighter than the estimate (w={w})"
+        );
+    }
+
+    #[test]
+    fn render_with_no_fonts_embeds_selectable_bundled_glyphs() {
+        // Text-bearing HTML with an unknown family and NO provided fonts: the
+        // bundled fallback must be embedded with real glyphs AND a /ToUnicode
+        // CMap, so the text round-trips on extraction (selectable/copyable) — not
+        // tofu, and not invisible. Re-opening the produced PDF and reading the
+        // text back is the definitive proof the bundled face was embedded.
+        let phrase = "Hello bundled fallback";
+        let pdf = render(
+            &format!(r#"<p style="font-family:NoSuchFont">{phrase}</p>"#),
+            &[],
+            612.0,
+            792.0,
+            36.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+
+        let doc = Document::open(&pdf).expect("re-open the rendered PDF");
+        let runs = doc.page_text_runs(1).expect("page text runs");
+        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            text.contains("Hello") && text.contains("fallback"),
+            "bundled glyphs are real & selectable — extracted {text:?}"
+        );
+        assert_eq!(
+            text.chars().filter(|&c| c == '\u{FFFD}').count(),
+            0,
+            "no tofu — the embedded /ToUnicode CMap maps the glyphs ({text:?})"
+        );
+    }
+
+    #[test]
+    fn provided_font_takes_precedence_over_bundled() {
+        // A host-provided font must be the face used for a run — the online path
+        // is unchanged and the bundled fallback never shadows it. Supply a real
+        // parseable font (the bundled program reused under a different family) and
+        // assert `face()` returns the *provided* face, not the bundled one.
+        let provided = ProvidedFont {
+            family: "Provided".into(),
+            weight: 400,
+            italic: false,
+            ttf: bundled::FALLBACK_TTF.to_vec(),
+        };
+        let book = MeasureBook::new(&[provided]);
+        let style = Style {
+            font_family: "Provided".into(),
+            font_size: 10.0,
+            ..Style::default()
+        };
+        let chosen = book.face(&style).expect("a face is chosen");
+        let provided_face = book
+            .provided_face(&style)
+            .expect("the provided face exists");
+        assert!(
+            std::ptr::eq(chosen, provided_face),
+            "the provided face is used, not the bundled fallback"
+        );
+        assert!(
+            !std::ptr::eq(chosen, book.fallback.as_ref().unwrap()),
+            "the bundled fallback does not shadow a provided font"
+        );
     }
 
     #[test]
