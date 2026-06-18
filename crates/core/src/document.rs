@@ -15,7 +15,7 @@ use crate::content::{self, ContentElement, TextRun};
 use crate::error::{EngineError, Result};
 use crate::filters::decode_stream;
 use crate::form::{self, FormField};
-use crate::headerfooter::{Align, HeaderFooterSpec, Margins};
+use crate::headerfooter::{Align, HeaderFooter, HeaderFooterSpec, Margins};
 use crate::lexer::{Lexer, Token};
 use crate::link::{Link, LinkTarget};
 use crate::object::{Dictionary, Object, ObjectId, Stream, StringKind};
@@ -2050,6 +2050,45 @@ impl Document {
     /// Remove every previously-baked running footer from all pages.
     pub fn remove_footers(&mut self) -> Result<()> {
         self.strip_header_footer(false)
+    }
+
+    /// Detect the running header/footer already baked into this PDF — the reader
+    /// counterpart of [`set_header`](Self::set_header) / [`set_footer`](Self::set_footer).
+    ///
+    /// For each side, the pages are scanned (a running H/F is on every in-range
+    /// page, but the range may skip the cover, so the first matching page wins)
+    /// for a `/GPHF <</T (h|f)>> BDC … EMC` span; when found, its drawn text is
+    /// recovered into a [`HeaderFooterSpec`]. The `text` is faithful; `align`,
+    /// `font_size`, `color`, etc. are best-effort defaults (the bake records only
+    /// the text, not the original spec), so a host can reflect *whether* a
+    /// header/footer exists and *what it says*. Absent ⇒ the side is `None`.
+    pub fn header_footer(&self) -> HeaderFooter {
+        HeaderFooter {
+            header: self.detect_header_footer(true),
+            footer: self.detect_header_footer(false),
+        }
+    }
+
+    /// Recover the first baked header (`header == true`) or footer's text across
+    /// the pages, as a [`HeaderFooterSpec`] (text faithful, rest default), or
+    /// `None` when no `/GPHF` span of that kind exists on any page.
+    fn detect_header_footer(&self, header: bool) -> Option<HeaderFooterSpec> {
+        let subtype = Self::hf_subtype(header);
+        for page_no in 1..=self.page_count() as u32 {
+            // A page whose content fails to decode is skipped, not fatal — a
+            // later page may still carry the running H/F.
+            let Ok(content) = self.page_content(page_no) else {
+                continue;
+            };
+            if let Some(text) = content::extract_marked_content_text(&content, subtype) {
+                return Some(HeaderFooterSpec {
+                    text,
+                    align: Align::Center,
+                    ..Default::default()
+                });
+            }
+        }
+        None
     }
 
     /// Marker subtype byte for headers (`b"h"`) / footers (`b"f"`), tagged in the
@@ -13828,5 +13867,81 @@ mod tests {
         assert!(header_present(&reopened, 2, "R 2", h, 36.0));
         assert!(header_present(&reopened, 3, "R 3", h, 36.0));
         assert!(reopened.page_text_elements(4).iter().all(|e| !e.text.contains("R 4")));
+    }
+
+    #[test]
+    fn header_footer_recovers_baked_header_text() {
+        // The bake substitutes `{{page}}`/`{{pages}}` before drawing, so the
+        // reader recovers the drawn (substituted) text of the first page.
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(3, w, h);
+        doc.set_header(&HeaderFooterSpec {
+            text: "Doc {{page}}/{{pages}}".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let hf = doc.header_footer();
+        assert_eq!(hf.header.map(|s| s.text), Some("Doc 1/3".to_string()));
+        assert!(hf.footer.is_none(), "no footer was baked");
+    }
+
+    #[test]
+    fn header_footer_recovers_baked_footer_text() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(2, w, h);
+        doc.set_footer(&HeaderFooterSpec {
+            text: "Foot {{page}}".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let hf = doc.header_footer();
+        assert_eq!(hf.footer.map(|s| s.text), Some("Foot 1".to_string()));
+        assert!(hf.header.is_none(), "no header was baked");
+    }
+
+    #[test]
+    fn header_footer_recovers_both_and_survives_round_trip() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(2, w, h);
+        doc.set_header(&HeaderFooterSpec {
+            text: "Top".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        doc.set_footer(&HeaderFooterSpec {
+            text: "Bottom".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        // Recovered after save/open, proving the marker survives serialization.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let hf = reopened.header_footer();
+        assert_eq!(hf.header.map(|s| s.text), Some("Top".to_string()));
+        assert_eq!(hf.footer.map(|s| s.text), Some("Bottom".to_string()));
+    }
+
+    #[test]
+    fn header_footer_is_none_on_a_fresh_document() {
+        let (w, h) = (612.0, 792.0);
+        let doc = blank_pages(2, w, h);
+        let hf = doc.header_footer();
+        assert!(hf.header.is_none());
+        assert!(hf.footer.is_none());
+    }
+
+    #[test]
+    fn header_footer_scans_past_a_skipped_cover_page() {
+        // show_on_first_page = false leaves page 1 bare; the reader must scan on
+        // and recover the header from a later page.
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(3, w, h);
+        doc.set_header(&HeaderFooterSpec {
+            text: "P {{page}}".into(),
+            show_on_first_page: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let hf = doc.header_footer();
+        assert_eq!(hf.header.map(|s| s.text), Some("P 2".to_string()));
     }
 }

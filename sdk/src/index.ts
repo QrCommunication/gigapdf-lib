@@ -1898,6 +1898,22 @@ export class GigaPdfDoc {
     return this.ex().gp_remove_footers(this.h) === 0;
   }
 
+  /**
+   * Detect the running header/footer already baked into this PDF — the reader
+   * counterpart of {@link GigaPdfDoc.setHeader} / {@link GigaPdfDoc.setFooter}.
+   * Each side is a {@link HeaderFooterSpec} (with its recovered `text`) when a
+   * baked `/GPHF` span is present, or `null` when absent. The `text` is faithful
+   * (the per-page-substituted text of the first matching page); `align`,
+   * `fontSize`, `color`, etc. are best-effort defaults, since the bake records
+   * only the drawn text. Use it to reflect existing document state (e.g. a
+   * Word-like editor toggle).
+   */
+  headerFooter(): { header: HeaderFooterSpec | null; footer: HeaderFooterSpec | null } {
+    return this.g._json<{ header: HeaderFooterSpec | null; footer: HeaderFooterSpec | null }>((o) =>
+      this.ex().gp_header_footer(this.h, o),
+    );
+  }
+
   // render
   renderPage(page: number, scale = 1): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_render_page(this.h, page, scale, o));

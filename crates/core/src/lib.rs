@@ -63,7 +63,7 @@ pub use document::{
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FormField};
-pub use headerfooter::{Align, HeaderFooterSpec, Margins};
+pub use headerfooter::{Align, HeaderFooter, HeaderFooterSpec, Margins};
 pub use lexer::{Lexer, Token};
 pub use link::{Link, LinkTarget};
 pub use object::{Dictionary, Object, ObjectId, Stream, StringKind};

@@ -1136,6 +1136,80 @@ fn bdc_is_gphf(operands: &[Object], subtype: &[u8]) -> bool {
     }
 }
 
+/// Recover the text shown inside the **first** `/GPHF <</T (subtype)>> BDC … EMC`
+/// span of a content stream (`b"h"` for a baked header, `b"f"` for a footer),
+/// the reader counterpart of [`strip_marked_content`]. Walks the operations,
+/// and once inside the tagged block collects the string operands of every
+/// text-show operator (`Tj`/`TJ`/`'`/`"` — the `"` numeric word/char-spacing
+/// operands are ignored, only its string is taken), decoding each as a PDF text
+/// string (UTF-16BE BOM, else WinAnsi — the inverse of the bake's
+/// `encode_winansi`). Returns the joined text, or `None` when no such span
+/// exists. Nesting is tracked like [`strip_marked_content`] so a matching `EMC`
+/// closes the block at the depth its `BDC` opened.
+pub fn extract_marked_content_text(content: &[u8], subtype: &[u8]) -> Option<String> {
+    let operations = parse_content(content).ok()?;
+    // Depth at which the tagged block opened (we are collecting while `Some`);
+    // `depth` tracks the global BDC/BMC nesting so the right `EMC` ends it.
+    let mut collect_open_depth: Option<usize> = None;
+    let mut depth: usize = 0;
+    let mut out = String::new();
+    let mut found = false;
+    for op in &operations {
+        let is_open = op.operator == b"BDC" || op.operator == b"BMC";
+        let is_close = op.operator == b"EMC";
+        if collect_open_depth.is_some() {
+            if is_open {
+                depth += 1;
+            } else if is_close {
+                depth -= 1;
+                if Some(depth) == collect_open_depth {
+                    // First tagged span closed — return what we gathered.
+                    return Some(out);
+                }
+            } else if is_text_show(&op.operator) {
+                append_show_text(&mut out, &op.operands);
+            }
+            continue;
+        }
+        if is_open {
+            if op.operator == b"BDC" && bdc_is_gphf(&op.operands, subtype) {
+                collect_open_depth = Some(depth);
+                found = true;
+                depth += 1;
+                continue;
+            }
+            depth += 1;
+        } else if is_close {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    // An unterminated tagged block (no closing `EMC`) still yields its text.
+    if found {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Append the decoded string operands of one text-show operator to `out`,
+/// decoding each `Object::String` (and the strings inside a `TJ` array) as a PDF
+/// text string. Non-string operands (the `aw`/`ac` numbers of `"`) are skipped.
+fn append_show_text(out: &mut String, operands: &[Object]) {
+    for operand in operands {
+        match operand {
+            Object::String(bytes, _) => out.push_str(&crate::font::decode_pdf_text(bytes)),
+            Object::Array(items) => {
+                for item in items {
+                    if let Object::String(bytes, _) = item {
+                        out.push_str(&crate::font::decode_pdf_text(bytes));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Duplicate the element at `index`, inserting the copy right after it (it lands
 /// at the same position, ready to be moved). Works for text, images and shapes.
 pub fn duplicate_element(content: &[u8], index: usize) -> Result<Vec<u8>> {
@@ -1565,5 +1639,51 @@ BT /F 12 Tf (BODY) Tj ET";
         let content = b"BT /F 12 Tf (plain) Tj ET";
         let out = strip_marked_content(content, b"h").unwrap();
         assert!(String::from_utf8_lossy(&out).contains("plain"));
+    }
+
+    #[test]
+    fn extract_marked_content_text_reads_the_matching_subtype() {
+        let content = b"10 10 100 50 re f\n\
+/GPHF <</T (h)>> BDC\nq 0 0 0 rg BT /F 12 Tf 1 0 0 1 72 760 Tm (HELLO) Tj ET Q\nEMC\n\
+/GPHF <</T (f)>> BDC\nBT /F 12 Tf (PAGE 1) Tj ET\nEMC\n\
+BT /F 12 Tf (BODY) Tj ET";
+        assert_eq!(
+            extract_marked_content_text(content, b"h").as_deref(),
+            Some("HELLO")
+        );
+        assert_eq!(
+            extract_marked_content_text(content, b"f").as_deref(),
+            Some("PAGE 1")
+        );
+    }
+
+    #[test]
+    fn extract_marked_content_text_is_none_without_marker() {
+        let content = b"BT /F 12 Tf (plain) Tj ET";
+        assert_eq!(extract_marked_content_text(content, b"h"), None);
+        assert_eq!(extract_marked_content_text(content, b"f"), None);
+    }
+
+    #[test]
+    fn extract_marked_content_text_only_takes_the_first_span() {
+        // Two header spans: only the first is recovered.
+        let content = b"/GPHF <</T (h)>> BDC (FIRST) Tj EMC\n\
+/GPHF <</T (h)>> BDC (SECOND) Tj EMC";
+        assert_eq!(
+            extract_marked_content_text(content, b"h").as_deref(),
+            Some("FIRST")
+        );
+    }
+
+    #[test]
+    fn extract_marked_content_text_handles_nested_marked_content() {
+        // The text shown directly in the tagged block (plus any nested span's
+        // text) is gathered; the matching outer EMC ends collection.
+        let content = b"/GPHF <</T (h)>> BDC\n\
+(A) Tj\n/Span BDC (B) Tj EMC\n(C) Tj\nEMC\n(D) Tj";
+        assert_eq!(
+            extract_marked_content_text(content, b"h").as_deref(),
+            Some("ABC")
+        );
     }
 }

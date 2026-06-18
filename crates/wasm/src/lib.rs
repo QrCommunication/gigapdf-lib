@@ -1503,6 +1503,20 @@ pub extern "C" fn gp_remove_footers(handle: *mut Document) -> i32 {
     edit(handle, |doc| doc.remove_footers())
 }
 
+/// Detect the running header/footer already baked into this PDF, as JSON
+/// `{"header":<spec|null>,"footer":<spec|null>}` — the reader counterpart of
+/// [`gp_set_header`]/[`gp_set_footer`]. Each present side is a spec object
+/// (same keys as the bake JSON: `text`, `align`, `fontSize`, …) with its
+/// recovered `text`; an absent side is `null`. Buffer-returning (host frees).
+#[no_mangle]
+pub extern "C" fn gp_header_footer(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => doc.header_footer().to_json(),
+        None => "{\"header\":null,\"footer\":null}".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using the
 /// built-in zero-dependency renderer. Buffer-returning (host frees); null on
 /// error.

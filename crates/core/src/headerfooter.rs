@@ -159,6 +159,97 @@ impl HeaderFooterSpec {
             None
         }
     }
+
+    /// Serialise to a flat JSON object with the same keys [`from_json`] reads
+    /// (`text`, `align`, `fontSize`, `color`, `pageRange`, `showOnFirstPage`,
+    /// `bandHeight`), so `from_json(spec.to_json())` round-trips. Hand-rolled,
+    /// zero-dependency; the string escaping matches the crate's other JSON
+    /// emitters. `pageRange` is `null` when [`page_range`](Self::page_range) is
+    /// `None`.
+    ///
+    /// [`from_json`]: Self::from_json
+    /// [`page_range`]: Self::page_range
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        out.push_str("{\"text\":");
+        json_escape(&self.text, &mut out);
+        out.push_str(",\"align\":");
+        json_escape(
+            match self.align {
+                Align::Left => "left",
+                Align::Center => "center",
+                Align::Right => "right",
+            },
+            &mut out,
+        );
+        out.push_str(&format!(",\"fontSize\":{}", self.font_size));
+        out.push_str(&format!(
+            ",\"color\":[{},{},{}]",
+            self.color[0], self.color[1], self.color[2]
+        ));
+        match self.page_range {
+            Some((first, last)) => out.push_str(&format!(",\"pageRange\":[{first},{last}]")),
+            None => out.push_str(",\"pageRange\":null"),
+        }
+        out.push_str(&format!(",\"showOnFirstPage\":{}", self.show_on_first_page));
+        out.push_str(&format!(",\"bandHeight\":{}}}", self.band_height));
+        out
+    }
+}
+
+/// Append a JSON-escaped string literal (`"…"`) to `out`. Same escaping as the
+/// crate's other JSON emitters (`model::json`, the WASM layer).
+fn json_escape(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// The running header and footer currently baked into a PDF, as recovered by
+/// [`Document::header_footer`](crate::document::Document::header_footer). Each
+/// side is `Some` only when a `/GPHF`-tagged span is present on the page(s);
+/// `None` means no baked header (resp. footer) was found.
+///
+/// The recovered [`HeaderFooterSpec`] carries the **text** faithfully (the
+/// important field for reflecting document state — e.g. a Word-like editor
+/// toggle); `align`, `font_size`, `color`, etc. are best-effort defaults, since
+/// the bake stores only the drawn text, not the original spec.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HeaderFooter {
+    /// The recovered running header, or `None` when no baked header is present.
+    pub header: Option<HeaderFooterSpec>,
+    /// The recovered running footer, or `None` when no baked footer is present.
+    pub footer: Option<HeaderFooterSpec>,
+}
+
+impl HeaderFooter {
+    /// Serialise to JSON `{"header":<spec|null>,"footer":<spec|null>}`, each side
+    /// using [`HeaderFooterSpec::to_json`] (or `null`). Hand-rolled,
+    /// zero-dependency; the shape consumed by the SDK reader.
+    pub fn to_json(&self) -> String {
+        let mut out = String::from("{\"header\":");
+        match &self.header {
+            Some(h) => out.push_str(&h.to_json()),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"footer\":");
+        match &self.footer {
+            Some(f) => out.push_str(&f.to_json()),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        out
+    }
 }
 
 /// A minimal, tolerant JSON reader for a **flat** object: strings, numbers,
@@ -461,5 +552,37 @@ mod tests {
         assert_eq!(Align::from_str_lossy("CENTER"), Align::Center);
         assert_eq!(Align::from_str_lossy(" right "), Align::Right);
         assert_eq!(Align::from_str_lossy("weird"), Align::Left);
+    }
+
+    #[test]
+    fn spec_to_json_round_trips_through_from_json() {
+        let spec = HeaderFooterSpec {
+            text: "Doc \"{{page}}\"\n\\end".into(),
+            align: Align::Center,
+            font_size: 11.0,
+            color: [0.1, 0.2, 0.3],
+            page_range: Some((2, 9)),
+            show_on_first_page: false,
+            band_height: 24.0,
+        };
+        let back = HeaderFooterSpec::from_json(&spec.to_json()).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn header_footer_to_json_shapes_both_sides() {
+        let hf = HeaderFooter {
+            header: Some(HeaderFooterSpec {
+                text: "H".into(),
+                ..Default::default()
+            }),
+            footer: None,
+        };
+        let json = hf.to_json();
+        assert!(json.starts_with("{\"header\":{"));
+        assert!(json.contains("\"footer\":null"));
+
+        let empty = HeaderFooter::default().to_json();
+        assert_eq!(empty, "{\"header\":null,\"footer\":null}");
     }
 }
