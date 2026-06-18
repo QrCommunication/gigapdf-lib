@@ -40,6 +40,7 @@ pub mod html;
 pub mod js;
 pub mod lexer;
 pub mod link;
+pub mod model;
 pub mod object;
 pub mod ocg;
 pub mod outline;
