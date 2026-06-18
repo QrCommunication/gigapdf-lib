@@ -2284,7 +2284,7 @@ mod tests {
                                 },
                             },
                             SheetCell {
-                                value: CellValue::Number(3.14159),
+                                value: CellValue::Number(1234.56),
                                 number_format: Some("0.00".to_string()),
                                 fill: None,
                                 style: CharStyle::default(),
