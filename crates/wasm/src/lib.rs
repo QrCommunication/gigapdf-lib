@@ -414,9 +414,11 @@ pub extern "C" fn gp_elements_json(
 }
 
 /// Every text element on a page as JSON, enriched for a host editor:
-/// `[{index,text,x,y,width,height,fontFamily,bold,italic,fontSize,color:[r,g,b],rotation}]`.
-/// Bounds are in user space (origin bottom-left); `index` is the text-run index
-/// accepted by `gp_replace_text`. Host frees the returned buffer.
+/// `[{index,text,x,y,width,height,fontFamily,bold,italic,fontSize,color:[r,g,b],
+/// rotation,direction}]`. Bounds are in user space (origin bottom-left); `index`
+/// is the text-run index accepted by `gp_replace_text`; `direction` is
+/// `"ltr"`|`"rtl"`|`"neutral"` for the run's strong characters. Host frees the
+/// returned buffer.
 #[no_mangle]
 pub extern "C" fn gp_text_elements_json(
     handle: *const Document,
@@ -442,20 +444,49 @@ pub extern "C" fn gp_text_elements_json(
                 ));
                 json_escape(&e.font_family, &mut s);
                 s.push_str(&format!(
-                    ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{}}}",
+                    ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{},\"direction\":\"{}\"}}",
                     e.bold,
                     e.italic,
                     fnum(e.font_size),
                     fnum(e.color[0]),
                     fnum(e.color[1]),
                     fnum(e.color[2]),
-                    fnum(e.rotation_deg)
+                    fnum(e.rotation_deg),
+                    gigapdf_core::text::direction_str(e.direction)
                 ));
             }
             s.push(']');
             s
         }
         None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// The document's aggregate language signal as JSON
+/// `{"direction":"ltr"|"rtl"|"neutral","script":"arabic"|"hebrew"|"latin"|
+/// "greek"|"cyrillic"|"cjk"|"other","lang":<ISO-639-1>|null}`, computed over
+/// every page's decoded text runs. Host frees the returned buffer; a null
+/// handle yields the neutral/other default.
+#[no_mangle]
+pub extern "C" fn gp_document_language(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let dl = doc.document_language();
+            let mut s = String::new();
+            s.push_str(&format!(
+                "{{\"direction\":\"{}\",\"script\":\"{}\",\"lang\":",
+                gigapdf_core::text::direction_str(dl.direction),
+                gigapdf_core::text::script_str(dl.script)
+            ));
+            match dl.lang {
+                Some(code) => json_escape(&code, &mut s),
+                None => s.push_str("null"),
+            }
+            s.push('}');
+            s
+        }
+        None => "{\"direction\":\"neutral\",\"script\":\"other\",\"lang\":null}".to_string(),
     };
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }

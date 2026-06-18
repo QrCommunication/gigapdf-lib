@@ -51,6 +51,7 @@ pub mod security;
 pub mod serialize;
 pub mod sign;
 pub mod svg;
+pub mod text;
 
 pub use annot::Annotation;
 pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, TextRun};
@@ -68,3 +69,4 @@ pub use ocg::Layer;
 pub use outline::OutlineItem;
 pub use parser::Parser;
 pub use raster::ocr::{OcrResult, OcrWord};
+pub use text::{Direction, DocLanguage, Script};

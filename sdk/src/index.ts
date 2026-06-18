@@ -888,6 +888,26 @@ export interface TextElementInfo {
   color: [number, number, number];
   /** Baseline rotation in degrees (0 = upright). */
   rotation: number;
+  /**
+   * Reading direction of this run by its strong characters: `"rtl"` for
+   * Arabic/Hebrew, `"ltr"` for Latin/Greek/Cyrillic/CJK, `"neutral"` when the
+   * run is only digits/punctuation/whitespace.
+   */
+  direction: 'ltr' | 'rtl' | 'neutral';
+}
+/**
+ * The aggregate language signal of a document from
+ * {@link GigaPdfDoc.documentLanguage}: its dominant reading {@link
+ * TextElementInfo.direction | direction}, writing system, and a best-effort
+ * ISO-639-1 language code (`"ar"`, `"he"`, `"zh"`/`"ja"`…), `undefined` when
+ * the script does not pin a single language (e.g. plain Latin).
+ */
+export interface DocumentLanguage {
+  direction: 'ltr' | 'rtl' | 'neutral';
+  /** Dominant script: `"arabic" | "hebrew" | "latin" | "greek" | "cyrillic" | "cjk" | "other"`. */
+  script: string;
+  /** Best-effort ISO-639-1 code, or `undefined` when undecidable. */
+  lang?: string;
 }
 /**
  * An image element from {@link GigaPdfDoc.imageElements}: its placement box
@@ -1211,6 +1231,24 @@ export class GigaPdfDoc {
    */
   textElements(page: number): TextElementInfo[] {
     return this.g._json((o) => this.ex().gp_text_elements_json(this.h, page, o));
+  }
+  /**
+   * The document's aggregate language signal — its dominant reading direction
+   * (`ltr`/`rtl`/`neutral`), writing system, and a best-effort ISO-639-1
+   * language code — computed across every page's decoded text. Lets a host
+   * pick fonts, set the UI direction or label the document without its own bidi
+   * pass (e.g. detect an Arabic/Hebrew/Japanese PDF). `lang` is omitted when the
+   * script does not pin a single language.
+   */
+  documentLanguage(): DocumentLanguage {
+    const raw = this.g._json<{ direction: 'ltr' | 'rtl' | 'neutral'; script: string; lang: string | null }>(
+      (o) => this.ex().gp_document_language(this.h, o)
+    );
+    return {
+      direction: raw.direction,
+      script: raw.script,
+      ...(raw.lang != null ? { lang: raw.lang } : {}),
+    };
   }
   /**
    * Every image element on a page: its placement box (user space, bottom-left),

@@ -549,6 +549,11 @@ pub struct TextElementInfo {
     pub font_size: f64,
     pub color: [f64; 3],
     pub rotation_deg: f64,
+    /// Reading direction of this run's text, by its strong characters
+    /// ([`crate::text::run_direction`]): right-to-left for Arabic/Hebrew,
+    /// left-to-right for Latin/Greek/Cyrillic/CJK, neutral when the run carries
+    /// only digits/punctuation/whitespace.
+    pub direction: crate::text::Direction,
 }
 
 /// One image element from [`Document::page_image_elements`]: its placement box
@@ -1620,6 +1625,7 @@ impl Document {
                     width: 0.0,
                     height: 0.0,
                 });
+                let direction = crate::text::run_direction(&e.label);
                 TextElementInfo {
                     index,
                     text: e.label,
@@ -1635,9 +1641,26 @@ impl Document {
                     font_size: e.font_size.filter(|s| *s > 0.0).unwrap_or(b.height),
                     color: e.color.unwrap_or([0.0, 0.0, 0.0]),
                     rotation_deg: e.rotation_deg.unwrap_or(0.0),
+                    direction,
                 }
             })
             .collect()
+    }
+
+    /// The document's aggregate language signal — its dominant reading
+    /// [`Direction`](crate::text::Direction), writing [`Script`](crate::text::Script)
+    /// and a best-effort ISO-639-1 guess — computed over every page's decoded
+    /// text runs. The native equivalent of detecting "this PDF is in Arabic /
+    /// Hebrew / Japanese", so a host can pick fonts, set the UI direction or
+    /// label the document without its own bidi pass.
+    pub fn document_language(&self) -> crate::text::DocLanguage {
+        let mut runs: Vec<String> = Vec::new();
+        for page_no in 1..=(self.page_count() as u32) {
+            if let Ok(page_runs) = self.page_text_runs(page_no) {
+                runs.extend(page_runs.into_iter().map(|r| r.text));
+            }
+        }
+        crate::text::document_language(runs.iter().map(String::as_str))
     }
 
     /// Every **image** element on a page: its placement box (user space), the
