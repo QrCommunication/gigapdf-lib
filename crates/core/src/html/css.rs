@@ -35,6 +35,36 @@ pub enum Align {
     Justify,
 }
 
+/// CSS `position`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Position {
+    /// `static` — normal flow (the default).
+    #[default]
+    Static,
+    /// `relative` — laid out in flow, then shifted by `inset` (still occupies
+    /// its normal space).
+    Relative,
+    /// `absolute` — removed from flow, positioned against the nearest
+    /// positioned ancestor's content box (the containing block).
+    Absolute,
+    /// `fixed` — removed from flow, positioned against the page box.
+    Fixed,
+}
+
+/// CSS `align-items` / `align-self` cross-axis alignment (basic flex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlignItems {
+    /// `stretch` — items fill the cross dimension (the default).
+    #[default]
+    Stretch,
+    /// `flex-start` / `start`.
+    Start,
+    /// `center`.
+    Center,
+    /// `flex-end` / `end`.
+    End,
+}
+
 /// Four-sided lengths in points.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Edges {
@@ -113,6 +143,53 @@ pub struct Style {
     pub min_height: Option<f64>,
     /// `box-sizing: border-box` — `width` includes padding + border.
     pub border_box: bool,
+    // ── positioning (not inherited) ──
+    /// `position` scheme.
+    pub position: Position,
+    /// `top`, `right`, `bottom`, `left` offsets (each optional), in points or
+    /// percentages of the containing block.
+    pub inset: [Option<Len>; 4],
+    /// `z-index` paint order (higher paints later/on top). 0 by default.
+    pub z_index: i32,
+    /// `overflow: hidden|clip|scroll|auto` — clip descendants to this box.
+    pub overflow_clip: bool,
+    // ── flex extras (not inherited) ──
+    /// `flex-wrap: wrap|wrap-reverse` — allow flex lines to wrap.
+    pub flex_wrap: bool,
+    /// `align-items` on a flex container (cross-axis alignment of items).
+    pub align_items: AlignItems,
+    /// `align-self` on a flex item (overrides the container's `align-items`).
+    pub align_self: Option<AlignItems>,
+    /// `order` — visual reordering of flex items (lower comes first).
+    pub order: i32,
+    // ── grid extras (not inherited) ──
+    /// `grid-template-rows` → explicit row count (0 = auto-flow rows).
+    pub grid_rows: usize,
+    /// `row-gap` / `gap` — vertical gutter between grid/flex tracks (points).
+    pub gap_row: f64,
+    /// `column-gap` / `gap` — horizontal gutter between tracks (points).
+    pub gap_col: f64,
+    /// `grid-column` start (1-based; 0 = auto-flow). Basic line placement.
+    pub grid_col_start: usize,
+    /// `grid-row` start (1-based; 0 = auto-flow).
+    pub grid_row_start: usize,
+    // ── typography extras ──
+    /// `letter-spacing` added between characters (points, inherited).
+    pub letter_spacing: f64,
+    /// `word-spacing` added at spaces (points, inherited).
+    pub word_spacing: f64,
+    /// `float` direction, if any — floated boxes are taken beside inline flow.
+    pub float: FloatSide,
+}
+
+/// CSS `float` side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FloatSide {
+    /// `none` (the default).
+    #[default]
+    None,
+    Left,
+    Right,
 }
 
 /// `list-style-type` marker styles.
@@ -228,6 +305,22 @@ impl Default for Style {
             max_width: None,
             min_height: None,
             border_box: false,
+            position: Position::Static,
+            inset: [None; 4],
+            z_index: 0,
+            overflow_clip: false,
+            flex_wrap: false,
+            align_items: AlignItems::Stretch,
+            align_self: None,
+            order: 0,
+            grid_rows: 0,
+            gap_row: 0.0,
+            gap_col: 0.0,
+            grid_col_start: 0,
+            grid_row_start: 0,
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
+            float: FloatSide::None,
         }
     }
 }
@@ -366,6 +459,31 @@ fn parse_rules(css: &str, order_base: usize) -> Vec<Rule> {
     rules
 }
 
+/// Scan `@font-face { font-family: <name>; … }` blocks and return the declared
+/// family names (lower-cased, de-quoted, de-duplicated, in source order).
+fn collect_font_faces(css: &str) -> Vec<String> {
+    let css = strip_comments(css);
+    let mut names = Vec::new();
+    let mut rest = css.as_str();
+    while let Some(at) = rest.find("@font-face") {
+        rest = &rest[at + "@font-face".len()..];
+        let Some(open) = rest.find('{') else { break };
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        let body = &after[..close];
+        for (k, val) in parse_decls(body) {
+            if k == "font-family" {
+                let name = val.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    names
+}
+
 fn strip_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
@@ -448,6 +566,9 @@ fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -
 #[derive(Debug)]
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    /// Family names declared by `@font-face` rules (lower-cased), so callers
+    /// can tell which families the document defines locally.
+    font_faces: Vec<String>,
 }
 
 impl Stylesheet {
@@ -455,7 +576,15 @@ impl Stylesheet {
     pub fn new(author_css: &str) -> Stylesheet {
         let mut rules = parse_rules(UA_CSS, 0);
         rules.extend(parse_rules(author_css, 100_000));
-        Stylesheet { rules }
+        Stylesheet {
+            rules,
+            font_faces: collect_font_faces(author_css),
+        }
+    }
+
+    /// Family names registered via `@font-face` (lower-cased).
+    pub fn font_faces(&self) -> &[String] {
+        &self.font_faces
     }
 
     /// Compute the style of `el` given its inherited (parent) style and its
@@ -523,11 +652,28 @@ fn inherit(parent: &Style) -> Style {
         opacity: parent.opacity,
         text_indent: parent.text_indent,
         list_style: parent.list_style,
+        // Inherited:
+        letter_spacing: parent.letter_spacing,
+        word_spacing: parent.word_spacing,
         // Reset:
         min_width: None,
         max_width: None,
         min_height: None,
         border_box: false,
+        position: Position::Static,
+        inset: [None; 4],
+        z_index: 0,
+        overflow_clip: false,
+        flex_wrap: false,
+        align_items: AlignItems::Stretch,
+        align_self: None,
+        order: 0,
+        grid_rows: 0,
+        gap_row: 0.0,
+        gap_col: 0.0,
+        grid_col_start: 0,
+        grid_row_start: 0,
+        float: FloatSide::None,
     }
 }
 
@@ -556,6 +702,27 @@ fn parse_grid_columns(v: &str) -> usize {
         .filter(|t| !t.is_empty())
         .count()
         .max(1)
+}
+
+/// Parse a `grid-column`/`grid-row` placement into a 1-based start line.
+/// Supports a bare line number and `<n> / <m>` (we keep the start) and the
+/// `span N` form (treated as auto: 0). `auto` / unknown ⇒ 0 (auto-flow).
+fn parse_grid_line(v: &str) -> usize {
+    let first = v.split('/').next().unwrap_or(v).trim();
+    if first.is_empty() || first == "auto" || first.starts_with("span") {
+        return 0;
+    }
+    first.parse::<usize>().unwrap_or(0)
+}
+
+/// Parse an `align-items` / `align-self` keyword.
+fn parse_align_items(v: &str) -> AlignItems {
+    match v {
+        "flex-start" | "start" | "self-start" => AlignItems::Start,
+        "center" => AlignItems::Center,
+        "flex-end" | "end" | "self-end" => AlignItems::End,
+        _ => AlignItems::Stretch,
+    }
 }
 
 fn apply_one(style: &mut Style, prop: &str, value: &str) {
@@ -607,12 +774,117 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         "grid-template-columns" => {
             style.grid_columns = parse_grid_columns(v);
         }
-        "float" => {
-            // `float: left|right` is approximated by inline-block so floated
-            // boxes sit beside each other; `none` leaves block flow.
-            if v == "left" || v == "right" {
-                style.display = Display::InlineBlock;
+        "grid-template-rows" => {
+            style.grid_rows = parse_grid_columns(v);
+        }
+        "gap" | "grid-gap" => {
+            // `gap: <row> [col]` — one value sets both, two split row/col.
+            let parts: Vec<f64> = v
+                .split_whitespace()
+                .filter_map(|t| parse_len_px(t, style.font_size))
+                .collect();
+            match parts.as_slice() {
+                [a] => {
+                    style.gap_row = *a;
+                    style.gap_col = *a;
+                }
+                [a, b, ..] => {
+                    style.gap_row = *a;
+                    style.gap_col = *b;
+                }
+                _ => {}
             }
+        }
+        "row-gap" | "grid-row-gap" => {
+            style.gap_row = parse_len_px(v, style.font_size).unwrap_or(0.0);
+        }
+        "column-gap" | "grid-column-gap" => {
+            style.gap_col = parse_len_px(v, style.font_size).unwrap_or(0.0);
+        }
+        "grid-column" | "grid-column-start" => {
+            style.grid_col_start = parse_grid_line(v);
+        }
+        "grid-row" | "grid-row-start" => {
+            style.grid_row_start = parse_grid_line(v);
+        }
+        "grid-area" => {
+            // `grid-area: <row> / <col> [/ …]` — take the first two lines.
+            let mut it = v.split('/');
+            style.grid_row_start = it.next().map(parse_grid_line).unwrap_or(0);
+            style.grid_col_start = it.next().map(parse_grid_line).unwrap_or(0);
+        }
+        "flex-wrap" => {
+            style.flex_wrap = v == "wrap" || v == "wrap-reverse";
+        }
+        "flex-flow" => {
+            // `flex-flow: <direction> || <wrap>` shorthand.
+            for tok in v.split_whitespace() {
+                match tok {
+                    "column" | "column-reverse" => style.flex_column = true,
+                    "row" | "row-reverse" => style.flex_column = false,
+                    "wrap" | "wrap-reverse" => style.flex_wrap = true,
+                    "nowrap" => style.flex_wrap = false,
+                    _ => {}
+                }
+            }
+        }
+        "align-items" => style.align_items = parse_align_items(v),
+        "align-self" => {
+            style.align_self = if v == "auto" {
+                None
+            } else {
+                Some(parse_align_items(v))
+            };
+        }
+        "order" => {
+            style.order = v.parse().unwrap_or(0);
+        }
+        "position" => {
+            style.position = match v {
+                "relative" => Position::Relative,
+                "absolute" => Position::Absolute,
+                "fixed" => Position::Fixed,
+                "sticky" => Position::Relative, // approximated as relative
+                _ => Position::Static,
+            };
+        }
+        "top" => style.inset[0] = parse_len(v, style.font_size),
+        "right" => style.inset[1] = parse_len(v, style.font_size),
+        "bottom" => style.inset[2] = parse_len(v, style.font_size),
+        "left" => style.inset[3] = parse_len(v, style.font_size),
+        "z-index" => {
+            style.z_index = v.parse().unwrap_or(0);
+        }
+        "overflow" | "overflow-x" | "overflow-y" => {
+            // Any non-visible overflow clips descendants to the box.
+            if matches!(v, "hidden" | "clip" | "scroll" | "auto") {
+                style.overflow_clip = true;
+            } else if v == "visible" {
+                style.overflow_clip = false;
+            }
+        }
+        "letter-spacing" => {
+            style.letter_spacing = if v == "normal" {
+                0.0
+            } else {
+                parse_len_px(v, style.font_size).unwrap_or(0.0)
+            };
+        }
+        "word-spacing" => {
+            style.word_spacing = if v == "normal" {
+                0.0
+            } else {
+                parse_len_px(v, style.font_size).unwrap_or(0.0)
+            };
+        }
+        "float" => {
+            // `float: left|right` registers the side; the inline formatter flows
+            // surrounding text around the float box. `none` leaves block flow.
+            style.float = match v {
+                "left" => FloatSide::Left,
+                "right" => FloatSide::Right,
+                _ => FloatSide::None,
+            };
         }
         "color" => {
             if let Some(c) = parse_color(v) {
@@ -777,20 +1049,88 @@ fn parse_edges(v: &str, em: f64) -> Edges {
     }
 }
 
-/// Parse a length to absolute points (1px ≈ 0.75pt at 96dpi), resolving `em`.
-fn parse_len_px(v: &str, em: f64) -> Option<f64> {
+/// Reference viewport (US-Letter content) used to resolve `vw`/`vh` lengths
+/// when no live page size is threaded into the cascade. Width 612pt, height
+/// 792pt — approximate but consistent with the default page box.
+const VIEWPORT_W_PT: f64 = 612.0;
+const VIEWPORT_H_PT: f64 = 792.0;
+/// Assumed root font size (1rem) in points.
+const ROOT_EM_PT: f64 = 12.0;
+
+/// Strip a single level of `var(--name[, fallback])`, yielding the fallback (the
+/// declared behaviour when the custom property is unknown — custom properties
+/// are not tracked). Returns the inner text unchanged when there is no `var(`.
+fn resolve_var(v: &str) -> String {
     let v = v.trim();
+    if let Some(rest) = v.strip_prefix("var(") {
+        if let Some(inner) = rest.strip_suffix(')') {
+            // `var(--name, fallback)` → fallback; `var(--name)` → empty.
+            return inner
+                .split_once(',')
+                .map(|(_, fb)| fb.trim().to_string())
+                .unwrap_or_default();
+        }
+    }
+    v.to_string()
+}
+
+/// Evaluate a basic `calc(A op B)` with `+ - * /` over two point-resolved
+/// operands; `None` if it is not a `calc(...)` or cannot be reduced to points.
+fn parse_calc_px(v: &str, em: f64) -> Option<f64> {
+    let inner = v.trim().strip_prefix("calc(")?.strip_suffix(')')?.trim();
+    // Find a top-level binary operator (single operation only; no nesting).
+    for op in ['+', '-', '*', '/'] {
+        // Skip a leading sign so `-5px + 1px` still splits on the real `+`.
+        if let Some(pos) = inner[1..].find(op).map(|i| i + 1) {
+            let (a, b) = inner.split_at(pos);
+            let b = &b[1..];
+            let (a, b) = (a.trim(), b.trim());
+            return match op {
+                '+' => Some(parse_len_px(a, em)? + parse_len_px(b, em)?),
+                '-' => Some(parse_len_px(a, em)? - parse_len_px(b, em)?),
+                '*' => {
+                    // One side must be a unitless multiplier.
+                    let an = a.parse::<f64>().ok();
+                    let bn = b.parse::<f64>().ok();
+                    match (an, bn) {
+                        (Some(k), None) => Some(k * parse_len_px(b, em)?),
+                        (None, Some(k)) => Some(parse_len_px(a, em)? * k),
+                        _ => None,
+                    }
+                }
+                '/' => Some(parse_len_px(a, em)? / b.parse::<f64>().ok()?),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Parse a length to absolute points (1px ≈ 0.75pt at 96dpi), resolving `em`,
+/// `rem`, `vw`/`vh` (reference viewport) and a basic `calc()`/`var()`.
+fn parse_len_px(v: &str, em: f64) -> Option<f64> {
+    let resolved = resolve_var(v);
+    let v = resolved.trim();
+    if v.starts_with("calc(") {
+        return parse_calc_px(v, em);
+    }
     if let Some(n) = v.strip_suffix("px") {
         return n.trim().parse::<f64>().ok().map(|p| p * 0.75);
     }
     if let Some(n) = v.strip_suffix("pt") {
         return n.trim().parse::<f64>().ok();
     }
+    if let Some(n) = v.strip_suffix("rem") {
+        return n.trim().parse::<f64>().ok().map(|p| p * ROOT_EM_PT);
+    }
     if let Some(n) = v.strip_suffix("em") {
         return n.trim().parse::<f64>().ok().map(|p| p * em);
     }
-    if let Some(n) = v.strip_suffix("rem") {
-        return n.trim().parse::<f64>().ok().map(|p| p * 12.0);
+    if let Some(n) = v.strip_suffix("vw") {
+        return n.trim().parse::<f64>().ok().map(|p| VIEWPORT_W_PT * p / 100.0);
+    }
+    if let Some(n) = v.strip_suffix("vh") {
+        return n.trim().parse::<f64>().ok().map(|p| VIEWPORT_H_PT * p / 100.0);
     }
     if let Some(n) = v.strip_suffix('%') {
         // Percent of font size only makes sense for line-height/font-size here.
@@ -800,8 +1140,14 @@ fn parse_len_px(v: &str, em: f64) -> Option<f64> {
 }
 
 fn parse_len(v: &str, em: f64) -> Option<Len> {
-    let v = v.trim();
+    let resolved = resolve_var(v);
+    let v = resolved.trim();
     if let Some(n) = v.strip_suffix('%') {
+        return n.trim().parse::<f64>().ok().map(Len::Percent);
+    }
+    // `vw` maps to a percentage of the container width (closer to spec for
+    // box widths than the fixed reference viewport `parse_len_px` would use).
+    if let Some(n) = v.strip_suffix("vw") {
         return n.trim().parse::<f64>().ok().map(Len::Percent);
     }
     parse_len_px(v, em).map(Len::Pt)

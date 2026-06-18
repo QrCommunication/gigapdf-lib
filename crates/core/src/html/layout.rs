@@ -8,7 +8,7 @@
 //! fonts). Lists get markers, tables lay cells side-by-side, and the whole flow
 //! is sliced into pages with backgrounds/borders split across page bands.
 
-use super::css::{Align, Display, Justify, Len, Style, Stylesheet};
+use super::css::{Align, AlignItems, Display, FloatSide, Justify, Len, Position, Style, Stylesheet};
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
 
@@ -63,8 +63,13 @@ pub enum Fragment {
 
 #[derive(Debug, Clone)]
 struct Abs {
-    /// z=0 backgrounds/borders, z=1 content (text/images) — paint order.
+    /// z=0 backgrounds/borders, z=1 content (text/images) — paint order within
+    /// a stacking level.
     z: u8,
+    /// CSS `z-index` stacking order (higher paints later). Positioned subtrees
+    /// stamp their `z-index` here so they paint above/below in-flow content
+    /// (which stays at 0).
+    zi: i32,
     frag: Fragment,
 }
 
@@ -120,6 +125,13 @@ pub fn layout_document_framed(
     measure: &dyn Measure,
     frame: &Frame,
 ) -> Layout {
+    let content_w = (frame.page_w - frame.left - frame.right).max(1.0);
+    let page_cb = Cb {
+        x: frame.left,
+        y: frame.top,
+        w: content_w,
+        h: (frame.page_h - frame.top - frame.bottom).max(1.0),
+    };
     let mut flow = Flow {
         out: Vec::new(),
         m: measure,
@@ -127,8 +139,10 @@ pub fn layout_document_framed(
         page_h: frame.page_h,
         top: frame.top,
         bottom: frame.bottom,
+        page_cb,
+        cb: page_cb,
+        floats: FloatCtx::default(),
     };
-    let content_w = (frame.page_w - frame.left - frame.right).max(1.0);
     // Find <body> if present, else lay out the whole forest.
     let roots = find_body(nodes).unwrap_or(nodes);
     let root_style = Style {
@@ -162,6 +176,62 @@ fn find_body(nodes: &[Node]) -> Option<&[Node]> {
     None
 }
 
+/// A containing-block rectangle (the reference box absolute children resolve
+/// their `inset` against), in absolute top-down points.
+#[derive(Debug, Clone, Copy)]
+struct Cb {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// A placed float box: its side and the band `[top, bottom)` it occupies, plus
+/// the inline `width` it steals from that band. Inline lines overlapping the
+/// band are narrowed (and left-floats also shift the line start right).
+#[derive(Debug, Clone, Copy)]
+struct FloatBox {
+    left: bool,
+    top: f64,
+    bottom: f64,
+    width: f64,
+}
+
+/// The active floats inside the current block container. Reset per container so
+/// floats don't leak across block boundaries (a pragmatic clearing model).
+#[derive(Debug, Clone, Default)]
+struct FloatCtx {
+    boxes: Vec<FloatBox>,
+}
+
+impl FloatCtx {
+    /// Left and right inline insets to apply to a line spanning `[y, y+h)`:
+    /// the summed widths of left- and right-floats overlapping that band.
+    fn insets(&self, y: f64, h: f64) -> (f64, f64) {
+        let (mut l, mut r) = (0.0, 0.0);
+        let line_bottom = y + h;
+        for f in &self.boxes {
+            // Overlap test (a line touching the float's band is affected).
+            if f.top < line_bottom && y < f.bottom {
+                if f.left {
+                    l += f.width;
+                } else {
+                    r += f.width;
+                }
+            }
+        }
+        (l, r)
+    }
+
+    /// The lowest bottom among placed floats (for clearing after a block).
+    fn max_bottom(&self) -> f64 {
+        self.boxes
+            .iter()
+            .map(|f| f.bottom)
+            .fold(0.0_f64, f64::max)
+    }
+}
+
 struct Flow<'a> {
     out: Vec<Abs>,
     m: &'a dyn Measure,
@@ -172,6 +242,16 @@ struct Flow<'a> {
     top: f64,
     /// Content-area bottom inset (page `margin-bottom`).
     bottom: f64,
+    /// The page content box (margins applied) — the containing block for
+    /// `position: fixed` (and the initial containing block for `absolute`).
+    page_cb: Cb,
+    /// The current containing block for `position: absolute` (the nearest
+    /// positioned ancestor's content box). Saved/restored around positioned
+    /// blocks.
+    cb: Cb,
+    /// Floats active in the current block container (narrow inline lines that
+    /// overlap their vertical band). Saved/restored per container.
+    floats: FloatCtx,
 }
 
 impl Flow<'_> {
@@ -183,6 +263,73 @@ impl Flow<'_> {
         let next_k = (rel / content_h - 1e-9).ceil().max(0.0);
         self.top + next_k * content_h
     }
+
+    /// Shift every fragment emitted at `self.out[start..]` by `(dx, dy)`
+    /// (used to realise `position: relative|absolute|fixed` offsets after a
+    /// subtree was laid out in place).
+    fn translate_range(&mut self, start: usize, dx: f64, dy: f64) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        for a in &mut self.out[start..] {
+            shift_fragment(&mut a.frag, dx, dy);
+        }
+    }
+
+    /// Stamp `zi` (CSS `z-index`) on every fragment at `self.out[start..]` so a
+    /// positioned subtree paints as one stacking unit.
+    fn stamp_z(&mut self, start: usize, zi: i32) {
+        if zi == 0 {
+            return;
+        }
+        for a in &mut self.out[start..] {
+            a.zi = zi;
+        }
+    }
+
+    /// Drop fragments at `self.out[start..]` that fall entirely outside the clip
+    /// `rect` (a pragmatic `overflow: hidden|clip` — whole fragments are culled
+    /// rather than pixel-clipped, since the paint layer has no clip primitive).
+    fn clip_range(&mut self, start: usize, rect: Cb) {
+        let rx0 = rect.x;
+        let ry0 = rect.y;
+        let rx1 = rect.x + rect.w;
+        let ry1 = rect.y + rect.h;
+        let mut i = start;
+        while i < self.out.len() {
+            if fragment_outside(&self.out[i].frag, rx0, ry0, rx1, ry1) {
+                self.out.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Translate one fragment by `(dx, dy)` in place.
+fn shift_fragment(frag: &mut Fragment, dx: f64, dy: f64) {
+    match frag {
+        Fragment::Text { x, y, .. }
+        | Fragment::Rect { x, y, .. }
+        | Fragment::Image { x, y, .. }
+        | Fragment::Svg { x, y, .. } => {
+            *x += dx;
+            *y += dy;
+        }
+    }
+}
+
+/// True if a fragment's bounding box lies entirely outside `[x0,x1)×[y0,y1)`.
+/// Text height is approximated from its font size.
+fn fragment_outside(frag: &Fragment, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    let (fx0, fy0, fx1, fy1) = match frag {
+        Fragment::Text { x, y, style, .. } => (*x, *y, *x, *y + style.font_size),
+        Fragment::Rect { x, y, w, h, .. }
+        | Fragment::Image { x, y, w, h, .. }
+        | Fragment::Svg { x, y, w, h, .. } => (*x, *y, *x + *w, *y + *h),
+    };
+    // No overlap with the clip rect on either axis ⇒ fully outside.
+    fx1 < x0 || fx0 > x1 || fy1 < y0 || fy0 > y1
 }
 
 /// An atomic inline item for line breaking.
@@ -210,6 +357,16 @@ struct InlineItem {
     media: Option<Media>,
 }
 
+/// One atom on a line: a text token or a replaced box, its measured width, and
+/// whether a collapsible space follows it.
+struct Word {
+    text: String,
+    style: Style,
+    w: f64,
+    media: Option<Media>,
+    space_after: bool,
+}
+
 impl Flow<'_> {
     /// Lay out the children of a block container, partitioning runs of
     /// inline-level content into inline formatting contexts. Returns the bottom
@@ -223,10 +380,43 @@ impl Flow<'_> {
         mut y: f64,
         ancestors: &[&Element],
     ) -> f64 {
+        // Each block container establishes a fresh float context: floats placed
+        // inside it don't leak into sibling/parent containers.
+        let saved_floats = std::mem::take(&mut self.floats);
+
         let mut inline_run: Vec<&Node> = Vec::new();
         let mut list_index = 0usize;
 
         for child in children {
+            // Out-of-flow children (float / absolute / fixed) are placed without
+            // disturbing the normal-flow `y`. Detect them before the block/inline
+            // partition so an inline-`display` floated/positioned box still works.
+            if let Node::Element(e) = child {
+                let st = self.style_of(e, parent_style, ancestors);
+                if st.display == Display::None {
+                    continue;
+                }
+                if st.float != FloatSide::None {
+                    if !inline_run.is_empty() {
+                        y = self.inline_context_f(
+                            &inline_run,
+                            parent_style,
+                            x,
+                            avail_w,
+                            y,
+                            ancestors,
+                        );
+                        inline_run.clear();
+                    }
+                    self.place_float(e, &st, x, avail_w, y, ancestors);
+                    continue;
+                }
+                if matches!(st.position, Position::Absolute | Position::Fixed) {
+                    self.place_positioned(e, &st, ancestors);
+                    continue;
+                }
+            }
+
             let is_block = match child {
                 Node::Text(t) => {
                     if t.trim().is_empty() {
@@ -250,7 +440,7 @@ impl Flow<'_> {
 
             if is_block {
                 if !inline_run.is_empty() {
-                    y = self.inline_context(&inline_run, parent_style, x, avail_w, y, ancestors);
+                    y = self.inline_context_f(&inline_run, parent_style, x, avail_w, y, ancestors);
                     inline_run.clear();
                 }
                 if let Node::Element(e) = child {
@@ -261,7 +451,17 @@ impl Flow<'_> {
                     if st.page_break_before {
                         y = self.break_to_next_page(y);
                     }
+                    // `position: relative` lays out in flow, then shifts its
+                    // fragments by `inset` (its normal space is preserved).
+                    let start = self.out.len();
                     y = self.block(e, &st, parent_style, x, avail_w, y, ancestors, list_index);
+                    if st.position == Position::Relative {
+                        let (dx, dy) = self.relative_offset(&st, avail_w);
+                        self.translate_range(start, dx, dy);
+                    }
+                    if st.z_index != 0 {
+                        self.stamp_z(start, st.z_index);
+                    }
                     if st.page_break_after {
                         y = self.break_to_next_page(y);
                     }
@@ -271,9 +471,173 @@ impl Flow<'_> {
             }
         }
         if !inline_run.is_empty() {
-            y = self.inline_context(&inline_run, parent_style, x, avail_w, y, ancestors);
+            y = self.inline_context_f(&inline_run, parent_style, x, avail_w, y, ancestors);
         }
+        // Clear past any floats that extend below the in-flow content, so the
+        // container fully contains its floats (matches `overflow`/clearfix).
+        y = y.max(self.floats.max_bottom());
+
+        self.floats = saved_floats;
         y
+    }
+
+    /// `position: relative` offset in points from `top`/`left` (falling back to
+    /// the negated `bottom`/`right` when only those are set), resolved against
+    /// the containing width/height.
+    fn relative_offset(&self, st: &Style, avail_w: f64) -> (f64, f64) {
+        let resolve = |len: Len, base: f64| match len {
+            Len::Pt(p) => p,
+            Len::Percent(pc) => base * pc / 100.0,
+        };
+        let dx = match (st.inset[3], st.inset[1]) {
+            (Some(l), _) => resolve(l, avail_w),
+            (None, Some(r)) => -resolve(r, avail_w),
+            _ => 0.0,
+        };
+        let dy = match (st.inset[0], st.inset[2]) {
+            (Some(t), _) => resolve(t, self.cb.h),
+            (None, Some(b)) => -resolve(b, self.cb.h),
+            _ => 0.0,
+        };
+        (dx, dy)
+    }
+
+    /// Place an out-of-flow `position: absolute|fixed` element: lay its subtree
+    /// out at the origin of its containing block, then translate it to the
+    /// position resolved from `inset`. Fixed resolves against the page box,
+    /// absolute against the current containing block. Does not affect flow `y`.
+    fn place_positioned(&mut self, el: &Element, st: &Style, ancestors: &[&Element]) {
+        let cb = if st.position == Position::Fixed {
+            self.page_cb
+        } else {
+            self.cb
+        };
+        // Resolve width: explicit `width`, else left+right insets pin both
+        // edges, else shrink to the containing block.
+        let resolve = |len: Len, base: f64| match len {
+            Len::Pt(p) => p,
+            Len::Percent(pc) => base * pc / 100.0,
+        };
+        let left = st.inset[3].map(|l| resolve(l, cb.w));
+        let right = st.inset[1].map(|r| resolve(r, cb.w));
+        let top = st.inset[0].map(|t| resolve(t, cb.h));
+        let bottom = st.inset[2].map(|b| resolve(b, cb.h));
+
+        let box_w = match (st.width, left, right) {
+            (Some(len), ..) => resolve(len, cb.w),
+            (None, Some(l), Some(r)) => (cb.w - l - r).max(1.0),
+            _ => cb.w,
+        };
+        // Lay the subtree out at the containing block's top-left, in isolation
+        // from the surrounding float context.
+        let saved_floats = std::mem::take(&mut self.floats);
+        let saved_cb = self.cb;
+        self.cb = Cb {
+            x: cb.x,
+            y: cb.y,
+            w: box_w,
+            h: cb.h,
+        };
+        let start = self.out.len();
+        // Treat it as a block (its own formatting context).
+        let bstyle = Style {
+            display: Display::Block,
+            position: Position::Static,
+            float: FloatSide::None,
+            ..st.clone()
+        };
+        let bottom_y = self.block(el, &bstyle, st, cb.x, box_w, cb.y, ancestors, 0);
+        let laid_h = bottom_y - cb.y;
+
+        // Final top-left from insets (default: the containing block origin).
+        let final_x = match (left, right) {
+            (Some(l), _) => cb.x + l,
+            (None, Some(r)) => cb.x + cb.w - r - box_w,
+            _ => cb.x,
+        };
+        let final_y = match (top, bottom) {
+            (Some(t), _) => cb.y + t,
+            (None, Some(b)) => cb.y + cb.h - b - laid_h,
+            _ => cb.y,
+        };
+        self.translate_range(start, final_x - cb.x, final_y - cb.y);
+        // Absolutely-positioned content stacks above in-flow content by default.
+        self.stamp_z(start, if st.z_index != 0 { st.z_index } else { 1 });
+
+        self.cb = saved_cb;
+        self.floats = saved_floats;
+    }
+
+    /// Place a `float: left|right` box: lay it out as a block sized to its
+    /// `width` (or shrink-to-fit fallback) at the appropriate edge of the
+    /// content box, then register its band so following inline lines wrap.
+    fn place_float(
+        &mut self,
+        el: &Element,
+        st: &Style,
+        x: f64,
+        avail_w: f64,
+        y: f64,
+        ancestors: &[&Element],
+    ) {
+        let left = st.float == FloatSide::Left;
+        // Width: explicit `width` else a third of the line (a pragmatic
+        // shrink-to-fit that keeps room for the wrapping text).
+        let box_w = match st.width {
+            Some(Len::Pt(w)) => w,
+            Some(Len::Percent(pc)) => avail_w * pc / 100.0,
+            None => (avail_w / 3.0).max(1.0),
+        }
+        .min(avail_w);
+
+        // Existing same-side floats overlapping `y` stack inward.
+        let (l_in, r_in) = self.floats.insets(y, 1.0);
+        let box_x = if left {
+            x + l_in
+        } else {
+            x + avail_w - r_in - box_w
+        };
+
+        let start = self.out.len();
+        let bstyle = Style {
+            display: Display::Block,
+            float: FloatSide::None,
+            position: Position::Static,
+            ..st.clone()
+        };
+        let bottom_y = self.block(el, &bstyle, st, box_x, box_w, y, ancestors, 0);
+
+        if st.z_index != 0 {
+            self.stamp_z(start, st.z_index);
+        }
+        self.floats.boxes.push(FloatBox {
+            left,
+            top: y,
+            bottom: bottom_y.max(y + 0.1),
+            width: box_w,
+        });
+    }
+
+    /// Lay out an inline run, applying the active floats so lines wrap around
+    /// them. Falls back to the plain inline context when no floats are active.
+    fn inline_context_f(
+        &mut self,
+        nodes: &[&Node],
+        style: &Style,
+        x: f64,
+        avail_w: f64,
+        y: f64,
+        ancestors: &[&Element],
+    ) -> f64 {
+        if self.floats.boxes.is_empty() {
+            return self.inline_context(nodes, style, x, avail_w, y, ancestors);
+        }
+        let mut items = Vec::new();
+        for n in nodes {
+            self.collect_inline(n, style, ancestors, &mut items);
+        }
+        let floats = self.floats.clone();
+        self.flow_lines_floated(&items, x, avail_w, y, style.align, style.text_indent, &floats)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -337,6 +701,7 @@ impl Flow<'_> {
                 let mw = self.m.width(&marker, &mstyle);
                 self.out.push(Abs {
                     z: 1,
+                    zi: 0,
                     frag: Fragment::Text {
                         x: content_x - mw - 4.0,
                         y: cy,
@@ -348,6 +713,19 @@ impl Flow<'_> {
         }
 
         let new_ancestors = push_ancestor(ancestors, el);
+        // A positioned box becomes the containing block for descendant
+        // `position: absolute` elements. Save/restore the previous one.
+        let establishes_cb = style.position != Position::Static;
+        let saved_cb = self.cb;
+        if establishes_cb {
+            self.cb = Cb {
+                x: content_x,
+                y: cy,
+                w: content_w,
+                h: style.min_height.unwrap_or(self.cb.h),
+            };
+        }
+        let children_start = self.out.len();
         cy = self.block_children(
             &el.children,
             style,
@@ -363,6 +741,21 @@ impl Flow<'_> {
             box_h = box_h.max(mh); // `height` / `min-height`
         }
 
+        // `overflow: hidden|clip` — cull descendant fragments outside the
+        // padding box (the visible content area, including padding).
+        if style.overflow_clip {
+            let clip = Cb {
+                x: box_x + b.left,
+                y: box_top + b.top,
+                w: (box_w - b.left - b.right).max(0.0),
+                h: (box_h - b.top - b.bottom).max(0.0),
+            };
+            self.clip_range(children_start, clip);
+        }
+        if establishes_cb {
+            self.cb = saved_cb;
+        }
+
         // Background + border behind the content (z=0). `visibility: hidden`
         // suppresses the paint but the box still occupies its space.
         if !style.hidden
@@ -370,6 +763,7 @@ impl Flow<'_> {
         {
             self.out.push(Abs {
                 z: 0,
+                zi: 0,
                 frag: Fragment::Rect {
                     x: box_x,
                     y: box_top,
@@ -481,26 +875,23 @@ impl Flow<'_> {
         }
     }
 
-    /// Break inline items into lines and emit positioned text/images.
-    /// `indent` (`text-indent`) shifts and shortens the first line only.
-    fn flow_lines(
-        &mut self,
-        items: &[InlineItem],
-        x: f64,
-        avail_w: f64,
-        mut y: f64,
-        align: Align,
-        indent: f64,
-    ) -> f64 {
-        // A line is a vector of (text|image, style, width).
-        struct Word {
-            text: String,
-            style: Style,
-            w: f64,
-            media: Option<Media>,
-            space_after: bool,
-        }
+    /// Tokenise inline items into measured [`Word`]s for line breaking,
+    /// honouring `white-space: pre` (newlines kept) and `letter-spacing`
+    /// (added to each token's measured width).
+    fn build_words(&self, items: &[InlineItem]) -> Vec<Word> {
         let mut words: Vec<Word> = Vec::new();
+        let push_text = |words: &mut Vec<Word>, text: String, style: &Style, space: bool| {
+            let base = self.m.width(&text, style);
+            // `letter-spacing` widens the token by one step per character.
+            let ls = style.letter_spacing * text.chars().count().max(1) as f64;
+            words.push(Word {
+                w: base + ls,
+                text,
+                style: style.clone(),
+                media: None,
+                space_after: space,
+            });
+        };
         for it in items {
             if let Some(m) = &it.media {
                 words.push(Word {
@@ -525,13 +916,7 @@ impl Flow<'_> {
                         });
                     }
                     if !seg.is_empty() {
-                        words.push(Word {
-                            text: seg.to_string(),
-                            style: it.style.clone(),
-                            w: self.m.width(seg, &it.style),
-                            media: None,
-                            space_after: false,
-                        });
+                        push_text(&mut words, seg.to_string(), &it.style, false);
                     }
                 }
                 continue;
@@ -551,97 +936,114 @@ impl Flow<'_> {
                 if token.is_empty() {
                     continue;
                 }
-                words.push(Word {
-                    text: token.to_string(),
-                    style: it.style.clone(),
-                    w: self.m.width(token, &it.style),
-                    media: None,
-                    space_after: true,
-                });
+                push_text(&mut words, token.to_string(), &it.style, true);
             }
         }
+        words
+    }
 
+    /// Emit one line of words at vertical position `*y`, aligned within
+    /// `[line_x, line_x + line_avail)`, then advance `*y` by the line height.
+    /// `space_w` is the inter-word space; `word_extra` is added at each space on
+    /// top of it (used by `word-spacing`). `last` suppresses justification.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_line(
+        &mut self,
+        line: &[&Word],
+        line_w: f64,
+        y: &mut f64,
+        last: bool,
+        line_x: f64,
+        line_avail: f64,
+        align: Align,
+        space_w: f64,
+    ) {
+        if line.is_empty() {
+            *y += default_line_height(&Style::default());
+            return;
+        }
+        let line_h = line
+            .iter()
+            .map(|w| w.style.font_size * w.style.line_height.max(1.0))
+            .fold(0.0_f64, f64::max);
+        let extra = (line_avail - line_w).max(0.0);
+        let (mut cx, gap_extra) = match align {
+            Align::Left => (line_x, 0.0),
+            Align::Right => (line_x + extra, 0.0),
+            Align::Center => (line_x + extra / 2.0, 0.0),
+            Align::Justify => {
+                let gaps = line.iter().filter(|w| w.space_after).count().max(1);
+                (line_x, if last { 0.0 } else { extra / gaps as f64 })
+            }
+        };
+        for w in line.iter() {
+            match &w.media {
+                Some(Media::Raster(iw, ih, src)) => {
+                    self.out.push(Abs {
+                        z: 1,
+                        zi: 0,
+                        frag: Fragment::Image {
+                            x: cx,
+                            y: *y,
+                            w: *iw,
+                            h: *ih,
+                            src: src.clone(),
+                        },
+                    });
+                    cx += iw + space_w;
+                }
+                Some(Media::Svg(iw, ih, image)) => {
+                    self.out.push(Abs {
+                        z: 1,
+                        zi: 0,
+                        frag: Fragment::Svg {
+                            x: cx,
+                            y: *y,
+                            w: *iw,
+                            h: *ih,
+                            image: image.clone(),
+                        },
+                    });
+                    cx += iw + space_w;
+                }
+                None => {
+                    self.out.push(Abs {
+                        z: 1,
+                        zi: 0,
+                        frag: Fragment::Text {
+                            x: cx,
+                            y: *y,
+                            style: w.style.clone(),
+                            text: w.text.clone(),
+                        },
+                    });
+                    cx += w.w
+                        + if w.space_after {
+                            space_w + gap_extra + w.style.word_spacing
+                        } else {
+                            0.0
+                        };
+                }
+            }
+        }
+        *y += line_h;
+    }
+
+    /// Break inline items into lines and emit positioned text/images.
+    /// `indent` (`text-indent`) shifts and shortens the first line only.
+    fn flow_lines(
+        &mut self,
+        items: &[InlineItem],
+        x: f64,
+        avail_w: f64,
+        mut y: f64,
+        align: Align,
+        indent: f64,
+    ) -> f64 {
+        let words = self.build_words(items);
         let mut line: Vec<&Word> = Vec::new();
         let mut line_w = 0.0;
         let space_w = self.m.width(" ", &Style::default());
-
-        // `line_x` / `line_avail` are per-line (the first line is indented and
-        // therefore narrower), so they're passed in rather than captured.
-        let flush = |this: &mut Self,
-                     line: &mut Vec<&Word>,
-                     line_w: f64,
-                     y: &mut f64,
-                     last: bool,
-                     line_x: f64,
-                     line_avail: f64| {
-            if line.is_empty() {
-                *y += default_line_height(&Style::default());
-                return;
-            }
-            let line_h = line
-                .iter()
-                .map(|w| w.style.font_size * w.style.line_height.max(1.0))
-                .fold(0.0_f64, f64::max);
-            // Horizontal offset for alignment.
-            let extra = (line_avail - line_w).max(0.0);
-            let (mut cx, gap_extra) = match align {
-                Align::Left => (line_x, 0.0),
-                Align::Right => (line_x + extra, 0.0),
-                Align::Center => (line_x + extra / 2.0, 0.0),
-                Align::Justify => {
-                    let gaps = line.iter().filter(|w| w.space_after).count().max(1);
-                    (line_x, if last { 0.0 } else { extra / gaps as f64 })
-                }
-            };
-            for w in line.iter() {
-                match &w.media {
-                    Some(Media::Raster(iw, ih, src)) => {
-                        this.out.push(Abs {
-                            z: 1,
-                            frag: Fragment::Image {
-                                x: cx,
-                                y: *y,
-                                w: *iw,
-                                h: *ih,
-                                src: src.clone(),
-                            },
-                        });
-                        cx += iw + space_w;
-                    }
-                    Some(Media::Svg(iw, ih, image)) => {
-                        this.out.push(Abs {
-                            z: 1,
-                            frag: Fragment::Svg {
-                                x: cx,
-                                y: *y,
-                                w: *iw,
-                                h: *ih,
-                                image: image.clone(),
-                            },
-                        });
-                        cx += iw + space_w;
-                    }
-                    None => {
-                        this.out.push(Abs {
-                            z: 1,
-                            frag: Fragment::Text {
-                                x: cx,
-                                y: *y,
-                                style: w.style.clone(),
-                                text: w.text.clone(),
-                            },
-                        });
-                        cx += w.w
-                            + if w.space_after {
-                                space_w + gap_extra
-                            } else {
-                                0.0
-                            };
-                    }
-                }
-            }
-            *y += line_h;
-        };
 
         // The first line uses a reduced budget `avail_w - indent` and starts at
         // `x + indent`; every subsequent line spans the full width at `x`.
@@ -659,7 +1061,7 @@ impl Flow<'_> {
             let (line_x, line_avail) = line_geom(first_line);
             let w = &words[i];
             if w.text == "\n" {
-                flush(self, &mut line, line_w, &mut y, true, line_x, line_avail);
+                self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
                 line.clear();
                 line_w = 0.0;
                 first_line = false;
@@ -668,7 +1070,7 @@ impl Flow<'_> {
             }
             let add = w.w + if line.is_empty() { 0.0 } else { space_w };
             if !line.is_empty() && line_w + add > line_avail {
-                flush(self, &mut line, line_w, &mut y, false, line_x, line_avail);
+                self.emit_line(&line, line_w, &mut y, false, line_x, line_avail, align, space_w);
                 line.clear();
                 first_line = false;
                 // Re-evaluate the same word on the fresh line.
@@ -681,7 +1083,69 @@ impl Flow<'_> {
             i += 1;
         }
         let (line_x, line_avail) = line_geom(first_line);
-        flush(self, &mut line, line_w, &mut y, true, line_x, line_avail);
+        self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
+        y
+    }
+
+    /// Like [`flow_lines`] but narrows each line by the active `floats` for that
+    /// line's vertical band, so inline text wraps around floated boxes. Left
+    /// floats shift the line start right; both sides shrink the available width.
+    #[allow(clippy::too_many_arguments)]
+    fn flow_lines_floated(
+        &mut self,
+        items: &[InlineItem],
+        x: f64,
+        avail_w: f64,
+        mut y: f64,
+        align: Align,
+        indent: f64,
+        floats: &FloatCtx,
+    ) -> f64 {
+        let words = self.build_words(items);
+        let space_w = self.m.width(" ", &Style::default());
+        let mut line: Vec<&Word> = Vec::new();
+        let mut line_w = 0.0;
+        let mut first_line = true;
+
+        // Per-line geometry at the current `y`: shrink/shift by float insets,
+        // then apply `text-indent` to the first line.
+        let geom = |this: &Self, y: f64, first: bool| -> (f64, f64) {
+            let line_h = this
+                .m
+                .width("x", &Style::default())
+                .max(default_line_height(&Style::default()));
+            let (l, r) = floats.insets(y, line_h);
+            let ind = if first { indent } else { 0.0 };
+            (x + l + ind, (avail_w - l - r - ind).max(1.0))
+        };
+
+        let mut i = 0;
+        while i < words.len() {
+            let (line_x, line_avail) = geom(self, y, first_line);
+            let w = &words[i];
+            if w.text == "\n" {
+                self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
+                line.clear();
+                line_w = 0.0;
+                first_line = false;
+                i += 1;
+                continue;
+            }
+            let add = w.w + if line.is_empty() { 0.0 } else { space_w };
+            if !line.is_empty() && line_w + add > line_avail {
+                self.emit_line(&line, line_w, &mut y, false, line_x, line_avail, align, space_w);
+                line.clear();
+                first_line = false;
+                line.push(w);
+                line_w = w.w;
+            } else {
+                line.push(w);
+                line_w += add;
+            }
+            i += 1;
+        }
+        let (line_x, line_avail) = geom(self, y, first_line);
+        self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
         y
     }
 
@@ -760,6 +1224,7 @@ impl Flow<'_> {
                 let (dx, cw) = span_geom(start, span);
                 self.out.push(Abs {
                     z: 0,
+                    zi: 0,
                     frag: Fragment::Rect {
                         x: x + dx,
                         y: row_top,
@@ -862,9 +1327,8 @@ impl Flow<'_> {
     }
 
     /// A flex container. Supports `flex-direction` (row | column),
-    /// `justify-content`, and per-item `flex-grow`. Cross-axis sizing is
-    /// `stretch` (items fill the cross dimension); wrap, shrink, `align-items`
-    /// and `order` are not modelled.
+    /// `justify-content` (both axes), `flex-grow`, `flex-wrap`, `order`, and
+    /// `align-items`/`align-self` (cross-axis). Shrinking is not modelled.
     fn flex(
         &mut self,
         el: &Element,
@@ -880,7 +1344,7 @@ impl Flow<'_> {
         let b = &style.border_width;
         let na = push_ancestor(ancestors, el);
 
-        let items: Vec<&Element> = el
+        let mut items: Vec<&Element> = el
             .children
             .iter()
             .filter_map(|n| match n {
@@ -892,6 +1356,8 @@ impl Flow<'_> {
         if items.is_empty() {
             return y + style.margin.bottom;
         }
+        // `order` reorders items for layout (stable; ties keep document order).
+        items.sort_by_key(|e| self.style_of(e, style, &na).order);
 
         let content_x = x + m.left + b.left + p.left;
         let content_w = (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
@@ -906,13 +1372,16 @@ impl Flow<'_> {
         row_bottom + p.bottom + b.bottom + style.margin.bottom
     }
 
-    /// Horizontal flex: resolve each item's main-axis width, then place them
-    /// left-to-right. Width model:
-    /// * if any item has an explicit `width`, those are honoured and remaining
-    ///   free space is distributed by `flex-grow` (or, if none grow, positioned
-    ///   via `justify-content`);
-    /// * otherwise every item fills the row with weight `1 + flex-grow` (so the
-    ///   default — no grow set — yields equal columns).
+    /// The cross-axis alignment used for a flex item: its `align-self` if set,
+    /// else the container's `align-items`.
+    fn item_align(&self, item_style: &Style, container: &Style) -> AlignItems {
+        item_style.align_self.unwrap_or(container.align_items)
+    }
+
+    /// Horizontal flex: resolve item main-axis widths and place them
+    /// left-to-right. With `flex-wrap` the items break into successive flex
+    /// lines whenever their explicit widths overflow `content_w`. Returns the
+    /// bottom `y` of the last line.
     fn flex_row_axis(
         &mut self,
         items: &[&Element],
@@ -922,7 +1391,79 @@ impl Flow<'_> {
         row_top: f64,
         na: &[&Element],
     ) -> f64 {
+        // Break items into flex lines. Wrap only applies when widths are
+        // explicit (the fill model always fits by construction).
+        let lines = self.flex_wrap_lines(items, style, content_w, na);
+        let mut y = row_top;
+        let row_gap = style.gap_row;
+        for (li, line) in lines.iter().enumerate() {
+            if li > 0 {
+                y += row_gap;
+            }
+            y = self.flex_row_line(line, style, content_x, content_w, y, na);
+        }
+        y
+    }
+
+    /// Partition flex items into lines for `flex-wrap`. Without wrap (or with no
+    /// explicit widths) every item stays on a single line.
+    fn flex_wrap_lines<'b>(
+        &self,
+        items: &[&'b Element],
+        style: &Style,
+        content_w: f64,
+        na: &[&Element],
+    ) -> Vec<Vec<&'b Element>> {
+        let any_explicit = items.iter().any(|it| self.style_of(it, style, na).width.is_some());
+        if !style.flex_wrap || !any_explicit {
+            return vec![items.to_vec()];
+        }
+        let gap = style.gap_col;
+        let mut lines: Vec<Vec<&Element>> = Vec::new();
+        let mut cur: Vec<&Element> = Vec::new();
+        let mut used = 0.0;
+        for it in items {
+            let st = self.style_of(it, style, na);
+            let w = match st.width {
+                Some(Len::Pt(w)) => w.max(0.0),
+                Some(Len::Percent(pc)) => content_w * pc / 100.0,
+                None => 0.0,
+            };
+            let add = if cur.is_empty() { w } else { w + gap };
+            if !cur.is_empty() && used + add > content_w + 0.01 {
+                lines.push(std::mem::take(&mut cur));
+                used = w;
+            } else {
+                used += add;
+            }
+            cur.push(it);
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
+    }
+
+    /// Lay out a single flex line of items at `row_top`, applying the width
+    /// model, `justify-content` (main axis) and `align-items`/`align-self`
+    /// (cross axis). Returns the line's bottom `y`.
+    fn flex_row_line(
+        &mut self,
+        items: &[&Element],
+        style: &Style,
+        content_x: f64,
+        content_w: f64,
+        row_top: f64,
+        na: &[&Element],
+    ) -> f64 {
         let n = items.len();
+        if n == 0 {
+            return row_top;
+        }
+        let gap = style.gap_col;
+        let gaps_w = gap * (n.saturating_sub(1)) as f64;
+        let avail = (content_w - gaps_w).max(0.0);
+
         let mut ws: Vec<f64> = Vec::with_capacity(n);
         let mut grows: Vec<f64> = Vec::with_capacity(n);
         let mut any_explicit = false;
@@ -935,7 +1476,7 @@ impl Flow<'_> {
                     any_explicit = true;
                 }
                 Some(Len::Percent(pc)) => {
-                    ws.push(content_w * pc / 100.0);
+                    ws.push(avail * pc / 100.0);
                     any_explicit = true;
                 }
                 None => ws.push(f64::NAN), // resolved below
@@ -943,12 +1484,12 @@ impl Flow<'_> {
         }
         let total_grow: f64 = grows.iter().sum();
 
-        let (offset, gap) = if any_explicit {
+        let (offset, extra_gap) = if any_explicit {
             // Items with no explicit width share the leftover equally as basis.
             let known: f64 = ws.iter().filter(|w| !w.is_nan()).sum();
             let unknown = ws.iter().filter(|w| w.is_nan()).count();
             let fill = if unknown > 0 {
-                (content_w - known).max(0.0) / unknown as f64
+                (avail - known).max(0.0) / unknown as f64
             } else {
                 0.0
             };
@@ -957,7 +1498,7 @@ impl Flow<'_> {
                     *w = fill;
                 }
             }
-            let mut free = (content_w - ws.iter().sum::<f64>()).max(0.0);
+            let mut free = (avail - ws.iter().sum::<f64>()).max(0.0);
             if total_grow > 0.0 {
                 for (w, g) in ws.iter_mut().zip(&grows) {
                     *w += free * g / total_grow;
@@ -966,10 +1507,10 @@ impl Flow<'_> {
             }
             justify_offsets(style.justify, free, n)
         } else {
-            // Fill model: weight = 1 + grow, sums to content_w exactly.
+            // Fill model: weight = 1 + grow, sums to `avail` exactly.
             let total_w: f64 = grows.iter().map(|g| 1.0 + g).sum();
             for (w, g) in ws.iter_mut().zip(&grows) {
-                *w = content_w * (1.0 + g) / total_w;
+                *w = avail * (1.0 + g) / total_w;
             }
             (0.0, 0.0)
         };
@@ -978,15 +1519,20 @@ impl Flow<'_> {
         let mut cx = content_x + offset;
         for w in &ws {
             xs.push(cx);
-            cx += w + gap;
+            cx += w + gap + extra_gap;
         }
 
+        // Lay out each item, recording its fragment range + natural height so
+        // cross-axis alignment can shift shorter items within the line band.
+        let mut heights: Vec<f64> = Vec::with_capacity(n);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(n);
         let mut row_bottom = row_top;
         for (i, it) in items.iter().enumerate() {
             let istyle = self.style_of(it, style, na);
             let nca = push_ancestor(na, it);
             let ip = &istyle.padding;
             let ib = &istyle.border_width;
+            let start = self.out.len();
             let cy = self.block_children(
                 &it.children,
                 &istyle,
@@ -995,19 +1541,43 @@ impl Flow<'_> {
                 row_top + ip.top + ib.top,
                 &nca,
             );
-            row_bottom = row_bottom.max(cy + ip.bottom + ib.bottom);
+            let item_h = (cy + ip.bottom + ib.bottom - row_top).max(0.0);
+            heights.push(item_h);
+            ranges.push((start, self.out.len()));
+            row_bottom = row_bottom.max(row_top + item_h);
         }
 
+        let line_h = row_bottom - row_top;
+        // Cross-axis alignment: stretch fills the band (no shift); start/center/
+        // end position the natural-height item within it.
         for (i, it) in items.iter().enumerate() {
             let istyle = self.style_of(it, style, na);
-            self.paint_item_box(&istyle, xs[i], row_top, ws[i], row_bottom - row_top);
+            let dy = match self.item_align(&istyle, style) {
+                AlignItems::Stretch | AlignItems::Start => 0.0,
+                AlignItems::Center => (line_h - heights[i]) / 2.0,
+                AlignItems::End => line_h - heights[i],
+            };
+            if dy.abs() > f64::EPSILON {
+                let (s, e) = ranges[i];
+                for a in &mut self.out[s..e] {
+                    shift_fragment(&mut a.frag, 0.0, dy);
+                }
+            }
+            // Backgrounds: stretched items fill the band, others wrap content.
+            let box_h = match self.item_align(&istyle, style) {
+                AlignItems::Stretch => line_h,
+                _ => heights[i],
+            };
+            self.paint_item_box(&istyle, xs[i], row_top + dy.max(0.0), ws[i], box_h);
         }
         row_bottom
     }
 
-    /// Vertical flex: stack items top-to-bottom, each stretched to the full
-    /// container width (`justify-content` along the block axis is not modelled
-    /// since the container has no fixed height here).
+    /// Vertical flex: stack items top-to-bottom. `row-gap` separates items,
+    /// `align-items`/`align-self` position each item on the cross (horizontal)
+    /// axis, and — when the container has an explicit height (`min_height`) with
+    /// leftover space — `justify-content` distributes that space along the
+    /// block axis.
     fn flex_column_axis(
         &mut self,
         items: &[&Element],
@@ -1017,8 +1587,14 @@ impl Flow<'_> {
         row_top: f64,
         na: &[&Element],
     ) -> f64 {
+        let gap = style.gap_row;
         let mut y = row_top;
-        for it in items {
+        // Per-item fragment ranges so we can redistribute for justify-content.
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(items.len());
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                y += gap;
+            }
             let istyle = self.style_of(it, style, na);
             let nca = push_ancestor(na, it);
             let im = &istyle.margin;
@@ -1026,12 +1602,33 @@ impl Flow<'_> {
             let ib = &istyle.border_width;
             y += im.top;
             let item_top = y;
-            let inner_w =
+            // Cross-axis (horizontal) sizing: stretch fills the width; otherwise
+            // the item is laid out at its natural content width.
+            let cross = self.item_align(&istyle, style);
+            let full_inner =
                 (content_w - im.left - im.right - ib.left - ib.right - ip.left - ip.right).max(1.0);
+            let item_w = match istyle.width {
+                Some(Len::Pt(w)) => w.max(0.0),
+                Some(Len::Percent(pc)) => content_w * pc / 100.0,
+                None => content_w - im.left - im.right,
+            };
+            let (box_w, inner_w) = if cross == AlignItems::Stretch && istyle.width.is_none() {
+                ((content_w - im.left - im.right).max(0.1), full_inner)
+            } else {
+                let bw = item_w.max(0.1);
+                (bw, (bw - ib.left - ib.right - ip.left - ip.right).max(1.0))
+            };
+            let dx = match cross {
+                AlignItems::Stretch | AlignItems::Start => 0.0,
+                AlignItems::Center => (content_w - im.left - im.right - box_w) / 2.0,
+                AlignItems::End => content_w - im.left - im.right - box_w,
+            }
+            .max(0.0);
+            let start = self.out.len();
             let cy = self.block_children(
                 &it.children,
                 &istyle,
-                content_x + im.left + ib.left + ip.left,
+                content_x + im.left + dx + ib.left + ip.left,
                 inner_w,
                 y + ip.top + ib.top,
                 &nca,
@@ -1039,12 +1636,32 @@ impl Flow<'_> {
             let item_bottom = cy + ip.bottom + ib.bottom;
             self.paint_item_box(
                 &istyle,
-                content_x + im.left,
+                content_x + im.left + dx,
                 item_top,
-                (content_w - im.left - im.right).max(0.1),
+                box_w,
                 item_bottom - item_top,
             );
+            ranges.push((start, self.out.len()));
             y = item_bottom + im.bottom;
+        }
+
+        // Block-axis `justify-content`: only meaningful with an explicit
+        // container height that exceeds the content. Distribute the free space.
+        if let Some(h) = style.min_height {
+            let used = y - row_top;
+            let free = h - used;
+            if free > 0.01 && !items.is_empty() {
+                let (offset, item_gap) = justify_offsets(style.justify, free, items.len());
+                for (i, (s, e)) in ranges.iter().enumerate() {
+                    let dy = offset + item_gap * i as f64;
+                    if dy.abs() > f64::EPSILON {
+                        for a in &mut self.out[*s..*e] {
+                            shift_fragment(&mut a.frag, 0.0, dy);
+                        }
+                    }
+                }
+                return row_top + h;
+            }
         }
         y
     }
@@ -1127,6 +1744,7 @@ impl Flow<'_> {
         if istyle.background.is_some() || has_border {
             self.out.push(Abs {
                 z: 0,
+                zi: 0,
                 frag: Fragment::Rect {
                     x,
                     y,
@@ -1400,8 +2018,10 @@ fn parse_table_width(v: &str, avail_w: f64) -> Option<f64> {
 /// Slice the absolute-positioned fragments into pages, splitting rects that
 /// straddle a page boundary so backgrounds/borders stay correct.
 fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<Fragment>> {
-    // Backgrounds (z=0) before content (z=1), preserving insertion order.
-    frags.sort_by_key(|a| a.z);
+    // Stacking order: by CSS `z-index` first (positioned subtrees lift their
+    // whole range), then backgrounds (z=0) before content (z=1) within a level.
+    // A stable sort keeps insertion (document) order for equal keys.
+    frags.sort_by_key(|a| (a.zi, a.z));
     let content_h = (page_h - top - bottom).max(1.0);
     let mut pages: Vec<Vec<Fragment>> = Vec::new();
 
