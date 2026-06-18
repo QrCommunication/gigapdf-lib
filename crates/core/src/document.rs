@@ -3214,9 +3214,24 @@ impl Document {
             let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(program)
                 .ok_or_else(|| EngineError::Unsupported("unparseable OpenType-CFF font".into()))?;
             self.embed_cid_font(family, program, &parsed, true)
+        } else if program.len() >= 4
+            && program[0] == 1
+            && program[1] == 0
+            && program[2] >= 4
+            && (1..=4).contains(&program[3])
+        {
+            // Bare CFF (a PDF `FontFile3 /Subtype /Type1C`): wrap it in a
+            // synthesised OpenType-CFF sfnt (cmap/head/hmtx/… built from the
+            // CFF's own metrics + charset) so the OpenType-CFF path above can
+            // re-embed it — no external fontforge conversion needed.
+            let otf = crate::font::cff_to_otf::wrap(program)
+                .ok_or_else(|| EngineError::Unsupported("unparseable bare CFF font".into()))?;
+            let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(&otf)
+                .ok_or_else(|| EngineError::Unsupported("wrapped CFF not parseable".into()))?;
+            self.embed_cid_font(family, &otf, &parsed, true)
         } else {
             Err(EngineError::Unsupported(
-                "not a glyf TrueType or OpenType-CFF font program".into(),
+                "not a glyf TrueType, OpenType-CFF or bare CFF font program".into(),
             ))
         }
     }

@@ -18,6 +18,12 @@ pub struct CffFont {
     fd_select: Vec<u8>,
     is_cid: bool,
     units_per_em: f64,
+    /// String INDEX (custom strings; SID >= 391). Kept to resolve glyph names
+    /// for charset → name → Unicode mapping when wrapping bare CFF in OpenType.
+    strings: Vec<Vec<u8>>,
+    /// `charset[gid] = sid` (the glyph name SID, or CID when CID-keyed). GID 0 is
+    /// always `.notdef` (SID 0). Empty falls back to the identity charset.
+    charset: Vec<u16>,
 }
 
 fn read_index(data: &[u8], pos: usize) -> (Vec<Vec<u8>>, usize) {
@@ -133,6 +139,39 @@ fn subr_bias(count: usize) -> i32 {
     }
 }
 
+/// Count of predefined CFF Standard Strings per the spec (Adobe TN #5176
+/// Appendix A): SIDs `0..391` are predefined, `391..` index the font's own
+/// String INDEX. Fixed at 391 — only the names with a meaningful Unicode value
+/// (SID 0..=228) are tabulated below; the stylistic remainder (small caps,
+/// old-style figures, version strings) resolve to `None`, which is correct
+/// because they carry no base code point.
+const N_STANDARD_STRINGS: usize = 391;
+
+// The predefined names are stored as space-separated fragments and joined at
+// compile time, so each fragment stays small.
+const STD_A: &str = ".notdef space exclam quotedbl numbersign dollar percent ampersand quoteright parenleft parenright asterisk plus comma hyphen period slash zero one two three four five six seven eight nine colon semicolon less equal greater question at";
+const STD_B: &str = "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z bracketleft backslash bracketright asciicircum underscore quoteleft";
+const STD_C: &str = "a b c d e f g h i j k l m n o p q r s t u v w x y z braceleft bar braceright asciitilde";
+const STD_D: &str = "exclamdown cent sterling fraction yen florin section currency quotesingle quotedblleft guillemotleft guilsinglleft guilsinglright fi fl endash dagger daggerdbl periodcentered paragraph bullet quotesinglbase quotedblbase quotedblright guillemotright ellipsis perthousand questiondown grave acute circumflex tilde macron breve dotaccent dieresis ring cedilla hungarumlaut ogonek caron emdash";
+const STD_E: &str = "AE ordfeminine Lslash Oslash OE ordmasculine ae dotlessi lslash oslash oe germandbls onesuperior logicalnot mu trademark Eth onehalf plusminus Thorn onequarter divide brokenbar degree thorn threequarters twosuperior registered minus eth multiply threesuperior copyright";
+const STD_F: &str = "Aacute Acircumflex Adieresis Agrave Aring Atilde Ccedilla Eacute Ecircumflex Edieresis Egrave Iacute Icircumflex Idieresis Igrave Ntilde Oacute Ocircumflex Odieresis Ograve Otilde Scaron Uacute Ucircumflex Udieresis Ugrave Yacute Ydieresis Zcaron aacute acircumflex adieresis agrave aring atilde ccedilla eacute ecircumflex edieresis egrave iacute icircumflex idieresis igrave ntilde oacute ocircumflex odieresis ograve otilde scaron uacute ucircumflex udieresis ugrave yacute ydieresis zcaron";
+
+const STD_FRAGMENTS: [&str; 6] = [STD_A, STD_B, STD_C, STD_D, STD_E, STD_F];
+
+/// Resolve a predefined Standard String SID to its glyph name (`None` for the
+/// untabulated stylistic SIDs 229..391, which carry no base code point).
+fn standard_string(sid: usize) -> Option<&'static str> {
+    let mut remaining = sid;
+    for frag in STD_FRAGMENTS {
+        let count = frag.split(' ').count();
+        if remaining < count {
+            return frag.split(' ').nth(remaining);
+        }
+        remaining -= count;
+    }
+    None
+}
+
 impl CffFont {
     /// Parse a CFF font program. Returns `None` if it is not valid CFF.
     pub fn parse(data: &[u8]) -> Option<CffFont> {
@@ -142,13 +181,20 @@ impl CffFont {
         let hdr_size = data[2] as usize;
         let (_names, p) = read_index(data, hdr_size);
         let (top_dicts, p) = read_index(data, p);
-        let (_strings, p) = read_index(data, p);
+        let (strings, p) = read_index(data, p);
         let (gsubrs, _) = read_index(data, p);
         let top = parse_dict(top_dicts.first()?);
 
         let cs_off = *top.get(&17)?.first()? as usize;
         let (charstrings, _) = read_index(data, cs_off);
         let num_glyphs = charstrings.len();
+
+        // charset (top DICT op 15): maps glyph id → SID (glyph name). Absent or a
+        // predefined id (0 ISOAdobe / 1 Expert / 2 ExpertSubset) → identity SIDs.
+        let charset = match top.get(&15).and_then(|v| v.first()).copied() {
+            Some(off) if off > 2.0 => parse_charset(data, off as usize, num_glyphs),
+            _ => Vec::new(),
+        };
 
         let units_per_em = match top.get(&0x0c07) {
             Some(m) if m.first().copied().unwrap_or(0.0).abs() > 1e-9 => 1.0 / m[0],
@@ -181,6 +227,8 @@ impl CffFont {
             fd_select,
             is_cid,
             units_per_em,
+            strings,
+            charset,
         })
     }
 
@@ -204,6 +252,38 @@ impl CffFont {
     /// Flattened glyph contours in font units.
     pub fn glyph_polygons(&self, gid: u16) -> Vec<Vec<(f64, f64)>> {
         self.run(gid).map(|g| g.contours).unwrap_or_default()
+    }
+
+    /// `true` when the CFF is CID-keyed (ROS present). For CID-keyed fonts the
+    /// charset holds CIDs, not name SIDs, so glyph-name resolution is unavailable.
+    pub fn is_cid(&self) -> bool {
+        self.is_cid
+    }
+
+    /// Resolve a String ID to its name: a predefined Adobe Standard String for
+    /// `sid < 391` (TN #5176 Appendix A), otherwise an entry from this font's
+    /// String INDEX (`sid - 391`). `None` if out of range or not valid UTF-8.
+    pub fn sid_name(&self, sid: u16) -> Option<&str> {
+        let sid = sid as usize;
+        if sid < N_STANDARD_STRINGS {
+            return standard_string(sid);
+        }
+        self.strings
+            .get(sid - N_STANDARD_STRINGS)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    }
+
+    /// Map a glyph id to its charset SID (the glyph-name SID for name-keyed CFF,
+    /// or the CID for CID-keyed CFF). GID 0 is `.notdef` (SID 0). When the font
+    /// carries no explicit charset, falls back to the identity (`sid = gid`).
+    pub fn gid_to_sid(&self, gid: u16) -> u16 {
+        if gid == 0 {
+            return 0;
+        }
+        self.charset
+            .get(gid as usize)
+            .copied()
+            .unwrap_or(gid)
     }
 
     fn local_for(&self, gid: u16) -> &[Vec<u8>] {
@@ -283,6 +363,54 @@ fn parse_fd_select(data: &[u8], top: &BTreeMap<u16, Vec<f64>>, num_glyphs: usize
                     *slot = fd;
                 }
                 p += 3;
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Parse the charset (TN #5176 §13). `charset[gid] = sid`; GID 0 (`.notdef`) is
+/// implicit (SID 0) and not stored in the table. Formats: 0 = flat SID list;
+/// 1/2 = ranges of consecutive SIDs (1 has u8 nLeft, 2 has u16 nLeft).
+fn parse_charset(data: &[u8], pos: usize, num_glyphs: usize) -> Vec<u16> {
+    let mut out = vec![0u16; num_glyphs];
+    let Some(&format) = data.get(pos) else {
+        return out;
+    };
+    let mut p = pos + 1;
+    let mut gid = 1usize; // GID 0 is .notdef, not encoded.
+    match format {
+        0 => {
+            while gid < num_glyphs && p + 1 < data.len() {
+                out[gid] = u16::from_be_bytes([data[p], data[p + 1]]);
+                p += 2;
+                gid += 1;
+            }
+        }
+        1 | 2 => {
+            while gid < num_glyphs && p + 2 < data.len() {
+                let first = u16::from_be_bytes([data[p], data[p + 1]]);
+                p += 2;
+                let n_left = if format == 1 {
+                    let v = *data.get(p).unwrap_or(&0) as usize;
+                    p += 1;
+                    v
+                } else {
+                    let v = u16::from_be_bytes([
+                        *data.get(p).unwrap_or(&0),
+                        *data.get(p + 1).unwrap_or(&0),
+                    ]) as usize;
+                    p += 2;
+                    v
+                };
+                for k in 0..=n_left {
+                    if gid >= num_glyphs {
+                        break;
+                    }
+                    out[gid] = first.wrapping_add(k as u16);
+                    gid += 1;
+                }
             }
         }
         _ => {}

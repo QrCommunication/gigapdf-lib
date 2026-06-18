@@ -6,6 +6,7 @@
 
 pub mod catalog;
 pub mod cff;
+pub mod cff_to_otf;
 pub mod cmap;
 pub mod color;
 pub mod embed;
