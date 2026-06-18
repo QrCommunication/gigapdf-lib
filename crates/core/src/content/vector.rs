@@ -50,6 +50,10 @@ struct GfxState {
     ctm: Matrix,
     fill: [f64; 3],
     stroke: [f64; 3],
+    /// Current non-stroking / stroking colour spaces (set by `cs`/`CS`), used to
+    /// interpret subsequent `scn`/`SCN` components.
+    fill_space: ColorSpace,
+    stroke_space: ColorSpace,
     line_width: f64,
     dash: Vec<f64>,
     fill_alpha: f64,
@@ -63,6 +67,60 @@ fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> [f64; 3] {
         (1.0 - m) * (1.0 - k),
         (1.0 - y) * (1.0 - k),
     ]
+}
+
+/// The component model of the colour space selected by `cs`/`CS` (ISO 32000-1
+/// §8.6). Device and CIE-based families resolve to a known channel count;
+/// everything else (named resources, `ICCBased`, `Separation`, `Indexed`,
+/// `Pattern`…) is `Unknown` and resolved best-effort from the operand count at
+/// `scn`/`SCN` time — which, for `ICCBased`, equals the stream's `/N`.
+#[derive(Clone, Copy, PartialEq)]
+enum ColorSpace {
+    Gray,
+    Rgb,
+    Cmyk,
+    Unknown,
+}
+
+/// Map a `cs`/`CS` colour-space name to its component model. The device and
+/// CIE-based names are self-describing; any other name (a `/ColorSpace`
+/// resource — `ICCBased`, `Separation`, `Indexed`, `Pattern`, …) is `Unknown`
+/// and left to operand-count inference.
+fn color_space_for(name: &[u8]) -> ColorSpace {
+    match name {
+        b"DeviceGray" | b"CalGray" | b"G" => ColorSpace::Gray,
+        b"DeviceRGB" | b"CalRGB" | b"Lab" | b"RGB" => ColorSpace::Rgb,
+        b"DeviceCMYK" | b"CMYK" => ColorSpace::Cmyk,
+        _ => ColorSpace::Unknown,
+    }
+}
+
+/// Resolve `scn`/`SCN` numeric components to RGB in the current colour space.
+/// For an `Unknown` space (named/`ICCBased`/…), infer the model from the
+/// component count: 1→gray, 3→RGB, 4→CMYK — for `ICCBased` this matches the
+/// stream's `/N` exactly. Returns `None` when there is nothing numeric to set
+/// (e.g. a `Pattern` colour: `/P0 scn`), leaving the previous colour in effect.
+/// `Separation`/`DeviceN`/`Indexed` tints are not interpreted (no tint
+/// transform/base here): a single-component value falls into the gray path,
+/// a documented best-effort fallback.
+fn resolve_scn(space: ColorSpace, nums: &[f64]) -> Option<[f64; 3]> {
+    let space = match space {
+        ColorSpace::Unknown => match nums.len() {
+            1 => ColorSpace::Gray,
+            3 => ColorSpace::Rgb,
+            4 => ColorSpace::Cmyk,
+            _ => return None,
+        },
+        s => s,
+    };
+    match space {
+        ColorSpace::Gray if !nums.is_empty() => Some([nums[0], nums[0], nums[0]]),
+        ColorSpace::Rgb if nums.len() >= 3 => Some([nums[0], nums[1], nums[2]]),
+        ColorSpace::Cmyk if nums.len() >= 4 => {
+            Some(cmyk_to_rgb(nums[0], nums[1], nums[2], nums[3]))
+        }
+        _ => None,
+    }
 }
 
 fn nums(op: &Operation) -> Vec<f64> {
@@ -119,6 +177,8 @@ pub fn vector_paths_from_ops(
         ctm: Matrix::IDENTITY,
         fill: [0.0, 0.0, 0.0],
         stroke: [0.0, 0.0, 0.0],
+        fill_space: ColorSpace::Unknown,
+        stroke_space: ColorSpace::Unknown,
         line_width: 1.0,
         dash: Vec::new(),
         fill_alpha: 1.0,
@@ -157,14 +217,57 @@ pub fn vector_paths_from_ops(
                     }
                 }
             }
-            // Fill colour.
-            b"rg" if n.len() == 3 => st.fill = [n[0], n[1], n[2]],
-            b"g" if n.len() == 1 => st.fill = [n[0], n[0], n[0]],
-            b"k" if n.len() == 4 => st.fill = cmyk_to_rgb(n[0], n[1], n[2], n[3]),
+            // Fill colour (the shorthand operators also set the colour space).
+            b"rg" if n.len() == 3 => {
+                st.fill = [n[0], n[1], n[2]];
+                st.fill_space = ColorSpace::Rgb;
+            }
+            b"g" if n.len() == 1 => {
+                st.fill = [n[0], n[0], n[0]];
+                st.fill_space = ColorSpace::Gray;
+            }
+            b"k" if n.len() == 4 => {
+                st.fill = cmyk_to_rgb(n[0], n[1], n[2], n[3]);
+                st.fill_space = ColorSpace::Cmyk;
+            }
             // Stroke colour.
-            b"RG" if n.len() == 3 => st.stroke = [n[0], n[1], n[2]],
-            b"G" if n.len() == 1 => st.stroke = [n[0], n[0], n[0]],
-            b"K" if n.len() == 4 => st.stroke = cmyk_to_rgb(n[0], n[1], n[2], n[3]),
+            b"RG" if n.len() == 3 => {
+                st.stroke = [n[0], n[1], n[2]];
+                st.stroke_space = ColorSpace::Rgb;
+            }
+            b"G" if n.len() == 1 => {
+                st.stroke = [n[0], n[0], n[0]];
+                st.stroke_space = ColorSpace::Gray;
+            }
+            b"K" if n.len() == 4 => {
+                st.stroke = cmyk_to_rgb(n[0], n[1], n[2], n[3]);
+                st.stroke_space = ColorSpace::Cmyk;
+            }
+            // Colour-space selection (`/Name cs|CS`). The name is a device/CIE
+            // family or a `/ColorSpace` resource (resolved by operand count).
+            b"cs" => {
+                if let Some(Object::Name(name)) = op.operands.first() {
+                    st.fill_space = color_space_for(name);
+                }
+            }
+            b"CS" => {
+                if let Some(Object::Name(name)) = op.operands.first() {
+                    st.stroke_space = color_space_for(name);
+                }
+            }
+            // Set colour in the current space (`scn`/`SCN`). A trailing pattern
+            // name (non-numeric) is ignored by `nums`; pattern-only paints leave
+            // the colour unchanged.
+            b"scn" | b"sc" => {
+                if let Some(rgb) = resolve_scn(st.fill_space, &n) {
+                    st.fill = rgb;
+                }
+            }
+            b"SCN" | b"SC" => {
+                if let Some(rgb) = resolve_scn(st.stroke_space, &n) {
+                    st.stroke = rgb;
+                }
+            }
             b"w" if !n.is_empty() => st.line_width = n[0],
             b"d" => {
                 st.dash = match op.operands.first() {
@@ -318,5 +421,54 @@ mod tests {
         let p = paths(b"1 0 0 rg 0 1 0 RG 0 0 20 20 re B");
         assert_eq!(p[0].fill, Some([1.0, 0.0, 0.0]));
         assert_eq!(p[0].stroke, Some([0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn device_rgb_cs_scn_sets_fill_colour() {
+        // `/DeviceRGB cs 1 0 0 scn` paints red via the colour-space machinery.
+        let p = paths(b"/DeviceRGB cs 1 0 0 scn 0 0 10 10 re f");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].fill, Some([1.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn icc_based_n4_cmyk_scn_converts_to_rgb() {
+        // A named (ICCBased) space with four `scn` components is interpreted as
+        // CMYK (N=4) and converted to RGB. Pure cyan → (0,1,1).
+        let p = paths(b"/CS0 cs 1 0 0 0 scn 0 0 10 10 re f");
+        let fill = p[0].fill.unwrap();
+        assert!((fill[0] - 0.0).abs() < 1e-9, "C inks out red: {fill:?}");
+        assert!((fill[1] - 1.0).abs() < 1e-9 && (fill[2] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn icc_based_n3_scn_is_rgb_on_stroke() {
+        // Named stroke space with three components → RGB (e.g. ICCBased N=3).
+        let p = paths(b"/CS0 CS 0 0 1 SCN 1 w 0 0 m 50 0 l S");
+        assert_eq!(p[0].stroke, Some([0.0, 0.0, 1.0]));
+        assert_eq!(p[0].fill, None);
+    }
+
+    #[test]
+    fn device_gray_cs_scn_sets_gray_fill() {
+        let p = paths(b"/DeviceGray cs 0.5 scn 0 0 10 10 re f");
+        assert_eq!(p[0].fill, Some([0.5, 0.5, 0.5]));
+    }
+
+    #[test]
+    fn device_cmyk_cs_scn_converts_to_rgb() {
+        // Pure magenta in DeviceCMYK → (1,0,1).
+        let p = paths(b"/DeviceCMYK cs 0 1 0 0 scn 0 0 10 10 re f");
+        let fill = p[0].fill.unwrap();
+        assert!((fill[0] - 1.0).abs() < 1e-9 && (fill[1] - 0.0).abs() < 1e-9);
+        assert!((fill[2] - 1.0).abs() < 1e-9, "magenta keeps blue: {fill:?}");
+    }
+
+    #[test]
+    fn pattern_scn_without_components_keeps_previous_colour() {
+        // `1 0 0 rg` then a component-less `/P0 scn` (pattern): the fill stays red
+        // rather than being cleared.
+        let p = paths(b"1 0 0 rg /Pattern cs /P0 scn 0 0 10 10 re f");
+        assert_eq!(p[0].fill, Some([1.0, 0.0, 0.0]));
     }
 }

@@ -181,8 +181,42 @@ fn odf_path_d(segments: &[PathSeg]) -> String {
     d.trim_end().to_string()
 }
 
+/// Points → centimetres (1 pt = 1/72", 1" = 2.54 cm), for ODF dash lengths.
+fn pt_to_cm(points: f64) -> f64 {
+    points / 28.3465
+}
+
+/// The `draw:stroke-dash` name for a shape style `name` (e.g. `S5` → `sdS5`),
+/// referenced from its `<style:graphic-properties draw:stroke-dash=…>`.
+fn odf_dash_name(name: &str) -> String {
+    format!("sd{name}")
+}
+
+/// An ODF `<draw:stroke-dash>` definition for a shape's `dash` pattern, lengths
+/// converted from points to centimetres. The PDF dash array is cyclic and may be
+/// odd-length, read here as on/off pairs (final element duplicated when odd).
+/// `draw:style="rect"`, `draw:dots1` count + `draw:dots1-length` give the dash
+/// segments; `draw:distance` the gap. Empty for a solid line. Lives in
+/// automatic-styles and is referenced via `draw:stroke-dash="sd<name>"`.
+fn odf_stroke_dash(name: &str, dash: &[f64]) -> String {
+    if dash.is_empty() {
+        return String::new();
+    }
+    let on = dash[0];
+    let off = *dash.get(1).unwrap_or(&on);
+    format!(
+        "<draw:stroke-dash draw:name=\"{dn}\" draw:display-name=\"{dn}\" draw:style=\"rect\" \
+draw:dots1=\"1\" draw:dots1-length=\"{onl}cm\" draw:distance=\"{offl}cm\"/>",
+        dn = odf_dash_name(name),
+        onl = num(pt_to_cm(on.max(0.0))),
+        offl = num(pt_to_cm(off.max(0.0))),
+    )
+}
+
 /// Inline ODF `<style:style>` graphic properties for a shape's paint state.
 /// `name` is the autostyle id; the element references it via `draw:style-name`.
+/// When the shape is dashed, a sibling [`odf_stroke_dash`] definition is
+/// prepended and referenced via `draw:stroke-dash`.
 fn odf_shape_style(name: &str, shape: &PlacedShape) -> String {
     let mut p = String::from(
         "<style:graphic-properties style:wrap=\"none\" style:horizontal-pos=\"from-left\" \
@@ -206,8 +240,17 @@ style:flow-with-text=\"false\"",
     }
     match shape.stroke {
         Some(rgb) => {
+            // Dashed strokes reference a `<draw:stroke-dash>`; solid otherwise.
+            if shape.dash.is_empty() {
+                p.push_str(" draw:stroke=\"solid\"");
+            } else {
+                p.push_str(&format!(
+                    " draw:stroke=\"dash\" draw:stroke-dash=\"{}\"",
+                    odf_dash_name(name)
+                ));
+            }
             p.push_str(&format!(
-                " draw:stroke=\"solid\" svg:stroke-width=\"{}pt\" svg:stroke-color=\"#{}\"",
+                " svg:stroke-width=\"{}pt\" svg:stroke-color=\"#{}\"",
                 num(shape.stroke_width.max(0.0)),
                 shape_hex(rgb)
             ));
@@ -221,7 +264,14 @@ style:flow-with-text=\"false\"",
         None => p.push_str(" draw:stroke=\"none\""),
     }
     p.push_str("/>");
-    format!("<style:style style:name=\"{name}\" style:family=\"graphic\">{p}</style:style>")
+    // The dash definition (if any) precedes the style that references it.
+    let dash_def = match shape.stroke {
+        Some(_) => odf_stroke_dash(name, &shape.dash),
+        None => String::new(),
+    };
+    format!(
+        "{dash_def}<style:style style:name=\"{name}\" style:family=\"graphic\">{p}</style:style>"
+    )
 }
 
 /// DrawingML `<a:custGeom>` for a shape path, with coordinates in EMU **relative
@@ -277,21 +327,47 @@ fn dml_fill(shape: &PlacedShape) -> String {
     }
 }
 
+/// DrawingML dash element for a shape's `dash` pattern. DrawingML expresses dash
+/// lengths as a **percentage of the line width** in thousandths of a percent
+/// (`ST_PositivePercentage`), so each PDF on/off length (points) becomes
+/// `round(len / stroke_width * 100000)`. The PDF dash array is cyclic and may be
+/// odd-length (e.g. `[3]` = 3 on / 3 off), so it is read as on/off pairs, the
+/// final element duplicated when the count is odd. Returns `<a:prstDash>` (a
+/// generic dash) when the width is non-positive — there is no width to scale by.
+fn dml_dash(shape: &PlacedShape) -> String {
+    if shape.dash.is_empty() {
+        return String::new();
+    }
+    let w = shape.stroke_width;
+    if w <= 0.0 {
+        return "<a:prstDash val=\"dash\"/>".to_string();
+    }
+    let pct = |len: f64| ((len.max(0.0) / w) * 100_000.0).round().max(1.0) as i64;
+    let d = &shape.dash;
+    let mut stops = String::new();
+    let mut i = 0;
+    while i < d.len() {
+        let on = d[i];
+        // Odd-length array: the missing "off" repeats the on length (PDF treats
+        // an odd array as itself concatenated, which yields on==off here).
+        let off = *d.get(i + 1).unwrap_or(&on);
+        stops.push_str(&format!("<a:ds d=\"{}\" sp=\"{}\"/>", pct(on), pct(off)));
+        i += 2;
+    }
+    format!("<a:custDash>{stops}</a:custDash>")
+}
+
 /// DrawingML `<a:ln>` (outline) for a shape's stroke.
 fn dml_line(shape: &PlacedShape) -> String {
     match shape.stroke {
         Some(rgb) => {
-            let dash = if shape.dash.is_empty() {
-                String::new()
-            } else {
-                "<a:prstDash val=\"dash\"/>".to_string()
-            };
             format!(
                 "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{}\"><a:alpha val=\"{}\"/>\
 </a:srgbClr></a:solidFill>{dash}</a:ln>",
                 emu(shape.stroke_width.max(0.0)),
                 shape_hex(rgb),
-                dml_alpha(shape.stroke_alpha)
+                dml_alpha(shape.stroke_alpha),
+                dash = dml_dash(shape),
             )
         }
         None => "<a:ln><a:noFill/></a:ln>".to_string(),
@@ -1467,7 +1543,9 @@ fn collect_t_runs(s: &str) -> String {
     let mut i = 0;
     while let Some(rel) = s[i..].find("<t") {
         let tag = i + rel;
-        let Some(grel) = s[tag..].find('>') else { break };
+        let Some(grel) = s[tag..].find('>') else {
+            break;
+        };
         let body_start = tag + grel + 1;
         let Some(erel) = s[body_start..].find("</t>") else {
             break;
@@ -1485,7 +1563,9 @@ fn sheet_grid(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
     let mut i = 0;
     while let Some(rel) = xml[i..].find("<c ") {
         let cstart = i + rel;
-        let Some(grel) = xml[cstart..].find('>') else { break };
+        let Some(grel) = xml[cstart..].find('>') else {
+            break;
+        };
         let gt = cstart + grel;
         let open = &xml[cstart..gt];
         let self_closing = xml.as_bytes().get(gt.wrapping_sub(1)) == Some(&b'/');
@@ -1530,7 +1610,10 @@ fn cell_ref(r: &str) -> (Option<usize>, Option<usize>) {
         seen = true;
         idx += 1;
     }
-    let row = r[idx..].parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+    let row = r[idx..]
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1));
     (row, seen.then(|| col - 1))
 }
 
@@ -1732,14 +1815,16 @@ mod tests {
         let grids = vec![vec![vec!["only".to_string()]]];
         // Provided name overrides the Page <n> default and is XML-escaped.
         let names = vec!["Sheet1 & <Summary>".to_string()];
-        let wb = String::from_utf8(entry(&to_xlsx_named(&grids, &names), "xl/workbook.xml").unwrap())
-            .unwrap();
+        let wb =
+            String::from_utf8(entry(&to_xlsx_named(&grids, &names), "xl/workbook.xml").unwrap())
+                .unwrap();
         assert!(
             wb.contains("name=\"Sheet1 &amp; &lt;Summary&gt;\""),
             "custom xlsx sheet name, escaped: {wb}"
         );
         let content =
-            String::from_utf8(entry(&to_ods_named(&grids, &names), "content.xml").unwrap()).unwrap();
+            String::from_utf8(entry(&to_ods_named(&grids, &names), "content.xml").unwrap())
+                .unwrap();
         assert!(
             content.contains("table:name=\"Sheet1 &amp; &lt;Summary&gt;\""),
             "custom ods sheet name, escaped"
@@ -1760,7 +1845,7 @@ mod tests {
             vec![
                 vec!["Name".to_string(), "Age".to_string()],
                 vec!["Alice & <b>".to_string(), "30".to_string()],
-                vec![],                            // blank separator row
+                vec![], // blank separator row
                 vec!["Bob".to_string(), "".to_string()],
             ],
             vec![vec!["café".to_string()]],
@@ -2031,5 +2116,148 @@ mod tests {
             "blue stroke"
         );
         assert!(!content.contains("#808080"), "no hardcoded grey");
+    }
+
+    // ── exact dash patterns (PDF→Office P2/P3) ─────────────────────────────────
+
+    /// A dashed-stroke rectangle: 4 pt line, dash `[6, 3]` (6 pt on / 3 pt off).
+    /// Exercises the exact-pattern path (`<a:custDash>` / `<draw:stroke-dash>`).
+    fn dashed_shape_pages() -> Vec<ConvPage> {
+        vec![ConvPage {
+            width: 612.0,
+            height: 792.0,
+            shapes: vec![PlacedShape {
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: 60.0,
+                stroke: Some([0.0, 0.0, 0.0]),
+                stroke_width: 4.0,
+                dash: vec![6.0, 3.0],
+                ..PlacedShape::default()
+            }],
+            ..ConvPage::default()
+        }]
+    }
+
+    #[test]
+    fn dml_dash_emits_exact_custom_pattern() {
+        // dash [3,2] at width 4 → on=3/4=75000, off=2/4=50000 thousandths-%.
+        let shape = PlacedShape {
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 4.0,
+            dash: vec![3.0, 2.0],
+            ..PlacedShape::default()
+        };
+        let ln = dml_line(&shape);
+        assert!(
+            ln.contains("<a:custDash>"),
+            "exact dash, not a preset: {ln}"
+        );
+        assert!(
+            ln.contains("<a:ds d=\"75000\" sp=\"50000\"/>"),
+            "on/off scaled to % of width: {ln}"
+        );
+        assert!(!ln.contains("prstDash"), "no generic preset when scalable");
+    }
+
+    #[test]
+    fn dml_dash_falls_back_to_preset_when_width_zero() {
+        // No width to scale by → generic preset rather than a bogus 0-scaled dash.
+        let shape = PlacedShape {
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 0.0,
+            dash: vec![3.0, 2.0],
+            ..PlacedShape::default()
+        };
+        let ln = dml_line(&shape);
+        assert!(
+            ln.contains("<a:prstDash val=\"dash\"/>"),
+            "preset fallback: {ln}"
+        );
+        assert!(!ln.contains("custDash"));
+    }
+
+    #[test]
+    fn dml_dash_pairs_odd_length_array() {
+        // [4] (cyclic 4-on/4-off) at width 2 → one ds with d==sp==200000.
+        let shape = PlacedShape {
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 2.0,
+            dash: vec![4.0],
+            ..PlacedShape::default()
+        };
+        let ln = dml_line(&shape);
+        assert!(
+            ln.contains("<a:ds d=\"200000\" sp=\"200000\"/>"),
+            "odd array → on==off: {ln}"
+        );
+    }
+
+    #[test]
+    fn docx_dashed_shape_uses_custom_dash() {
+        let zip = to_docx(&dashed_shape_pages());
+        let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
+        // dash [6,3] at width 4 → on=150000, off=75000.
+        assert!(doc.contains("<a:custDash>"), "DOCX exact dash");
+        assert!(
+            doc.contains("<a:ds d=\"150000\" sp=\"75000\"/>"),
+            "DOCX dash stops scaled: {doc}"
+        );
+    }
+
+    #[test]
+    fn pptx_dashed_shape_uses_custom_dash() {
+        let zip = to_pptx(&dashed_shape_pages());
+        let slide = String::from_utf8(entry(&zip, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(slide.contains("<a:custDash>"), "PPTX exact dash");
+        assert!(slide.contains("<a:ds d=\"150000\" sp=\"75000\"/>"));
+    }
+
+    #[test]
+    fn odt_dashed_shape_emits_stroke_dash_definition() {
+        let zip = to_odt(&dashed_shape_pages());
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<draw:stroke-dash "),
+            "ODT defines a dash style"
+        );
+        assert!(
+            content.contains("draw:stroke=\"dash\" draw:stroke-dash=\""),
+            "the shape style references the dash: {content}"
+        );
+        // 6 pt → 0.212 cm, 3 pt → 0.106 cm (pt/28.3465, num() rounds to 3 dp).
+        assert!(
+            content.contains("draw:dots1-length=\"0.212cm\""),
+            "on length cm: {content}"
+        );
+        assert!(
+            content.contains("draw:distance=\"0.106cm\""),
+            "off length cm"
+        );
+    }
+
+    #[test]
+    fn odp_dashed_shape_emits_stroke_dash_definition() {
+        let zip = to_odp(&dashed_shape_pages());
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<draw:stroke-dash "),
+            "ODP defines a dash style"
+        );
+        assert!(content.contains("draw:stroke=\"dash\""), "stroke is dashed");
+    }
+
+    #[test]
+    fn solid_stroke_shape_has_no_dash_artifacts() {
+        // The non-dashed rect must stay solid: no custDash / stroke-dash anywhere.
+        let docx =
+            String::from_utf8(entry(&to_docx(&rect_shape_pages()), "word/document.xml").unwrap())
+                .unwrap();
+        assert!(!docx.contains("custDash") && !docx.contains("prstDash"));
+        let odt =
+            String::from_utf8(entry(&to_odt(&rect_shape_pages()), "content.xml").unwrap()).unwrap();
+        assert!(!odt.contains("stroke-dash"));
+        assert!(odt.contains("draw:stroke=\"solid\""), "still solid");
     }
 }
