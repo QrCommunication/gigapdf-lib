@@ -479,9 +479,7 @@ fn docx_header_footer(
     let prefix = format!("word/{kind}");
     let mut parts: Vec<&String> = zip
         .keys()
-        .filter(|k| {
-            k.starts_with(&prefix) && k.ends_with(".xml") && !k.contains("_rels")
-        })
+        .filter(|k| k.starts_with(&prefix) && k.ends_with(".xml") && !k.contains("_rels"))
         .collect();
     parts.sort();
     for key in parts {
@@ -1029,7 +1027,12 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
 /// Resolve a list paragraph's marker: the formatted ordinal from `numbering.xml`
 /// (advancing the running counter), or a bullet when the format is bullet/
 /// unknown or the numbering is missing.
-fn list_marker(ctx: &DocxCtx, num_id: Option<u32>, level: u32, counters: &mut ListCounters) -> String {
+fn list_marker(
+    ctx: &DocxCtx,
+    num_id: Option<u32>,
+    level: u32,
+    counters: &mut ListCounters,
+) -> String {
     match num_id.and_then(|nid| ctx.numbering.fmt(nid, level).map(|f| (nid, f))) {
         Some((nid, fmt)) if !matches!(fmt, NumFmt::Bullet | NumFmt::Other) => {
             let n = counters.next(nid, level);
@@ -1334,7 +1337,9 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
                     t.font_family = Some(v.to_string());
                 }
             }
-            "b" if in_rpr => t.bold = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false"))),
+            "b" if in_rpr => {
+                t.bold = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")))
+            }
             "i" if in_rpr => {
                 t.italic = Some(!matches!(attr(attrs, "val"), Some("0") | Some("false")))
             }
@@ -1583,8 +1588,8 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
         if let Tok::Open(name, attrs, _) = tok {
             match local(&name) {
                 "abstractNum" => {
-                    cur_abstract = attr(&attrs, "abstractNumId")
-                        .and_then(|v| v.trim().parse::<u32>().ok());
+                    cur_abstract =
+                        attr(&attrs, "abstractNumId").and_then(|v| v.trim().parse::<u32>().ok());
                     if let Some(a) = cur_abstract {
                         abstracts.entry(a).or_default();
                     }
@@ -1605,9 +1610,10 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
                     cur_num = attr(&attrs, "numId").and_then(|v| v.trim().parse::<u32>().ok());
                 }
                 "abstractNumId" if in_num => {
-                    if let (Some(n), Some(a)) =
-                        (cur_num, attr(&attrs, "val").and_then(|v| v.trim().parse::<u32>().ok()))
-                    {
+                    if let (Some(n), Some(a)) = (
+                        cur_num,
+                        attr(&attrs, "val").and_then(|v| v.trim().parse::<u32>().ok()),
+                    ) {
                         num_to_abstract.insert(n, a);
                     }
                 }
@@ -1696,10 +1702,14 @@ pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         .map(|b| parse_shared_strings(&String::from_utf8_lossy(b)))
         .unwrap_or_default();
 
-    // Cell-style index → solid-fill colour (`#RRGGBB`), from xl/styles.xml.
-    let fills = zip
+    // Workbook theme colour scheme, for `@theme`+`tint` fill resolution.
+    let theme = xlsx_theme(zip);
+
+    // Cell-style index → resolved formatting (solid fill colour + number format),
+    // from xl/styles.xml. Resolves theme/indexed colours and the numFmt table.
+    let styles = zip
         .get("xl/styles.xml")
-        .map(|b| parse_cell_fills(&String::from_utf8_lossy(b)))
+        .map(|b| parse_xlsx_styles(&String::from_utf8_lossy(b), &theme))
         .unwrap_or_default();
 
     // Sheet name order from the workbook; fall back to file order.
@@ -1728,7 +1738,7 @@ pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
             .cloned()
             .unwrap_or_else(|| format!("Sheet {n}"));
         body.push_str(&format!("<h2>{}</h2>", escaped(&title)));
-        body.push_str(&xlsx_sheet_table(xml, &shared, &fills));
+        body.push_str(&xlsx_sheet_table(xml, &shared, &styles));
     }
     if sheets.is_empty() {
         body.push_str("<p></p>");
@@ -1738,46 +1748,68 @@ pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 }
 
 /// Render one worksheet XML to an HTML `<table>`, gap-filling so cells land in
-/// their declared column (`r="C3"`) and colouring each cell from its style
-/// index (`c@s` → `fills` → `background-color`).
-fn xlsx_sheet_table(xml: &str, shared: &[String], fills: &[Option<String>]) -> String {
+/// their declared column (`r="C3"`), colouring each cell from its style index
+/// (`c@s` → [`XlsxStyles::fill`] → `background-color`, with theme/indexed
+/// resolution), formatting numeric/date cells via their `numFmt`
+/// ([`XlsxStyles::num_fmt`] → [`format_cell_number`]), and honouring
+/// `<mergeCells>` by emitting `colspan`/`rowspan` on anchor cells and skipping
+/// the covered ones.
+fn xlsx_sheet_table(xml: &str, shared: &[String], styles: &XlsxStyles) -> String {
+    // Merge regions: anchors carry spans, covered cells are suppressed.
+    let merges = MergeMap::build(&parse_merges(xml));
+
     let mut out = String::from("<table>");
     let mut x = Xml::new(xml);
     let mut in_sheet_data = false;
     // (col_index, escaped html, optional `#RRGGBB` background).
     let mut row_cells: Vec<(usize, String, Option<String>)> = Vec::new();
     let mut row_open = false;
+    // 0-based index of the current row: from the row's `r` attribute when
+    // present, else a running counter incremented per `<row>`.
+    let mut row_idx = 0usize;
+    let mut next_auto_row = 0usize;
 
     // Current-cell scratch.
     let mut cell_col = 0usize;
     let mut cell_type = String::new();
     let mut cell_text = String::new();
     let mut cell_bg: Option<String> = None;
+    // numFmt code resolved from `c@s`, applied to numeric cells at close.
+    let mut cell_fmt: Option<String> = None;
     let mut in_cell = false;
     let mut in_value = false; // inside <v> or <t>
 
-    let flush_row = |row_cells: &mut Vec<(usize, String, Option<String>)>, out: &mut String| {
-        if row_cells.is_empty() {
-            out.push_str("<tr></tr>");
-            return;
-        }
-        out.push_str("<tr>");
-        let max_col = row_cells.iter().map(|(c, _, _)| *c).max().unwrap_or(0);
-        let mut by_col: BTreeMap<usize, (String, Option<String>)> = BTreeMap::new();
-        for (c, h, bg) in row_cells.drain(..) {
-            by_col.insert(c, (h, bg));
-        }
-        for c in 0..=max_col {
-            match by_col.get(&c) {
-                Some((h, Some(bg))) => {
-                    out.push_str(&format!("<td style=\"background-color:{bg}\">{h}</td>"))
-                }
-                Some((h, None)) => out.push_str(&format!("<td>{h}</td>")),
-                None => out.push_str("<td></td>"),
+    let flush_row =
+        |row: usize, row_cells: &mut Vec<(usize, String, Option<String>)>, out: &mut String| {
+            if row_cells.is_empty() {
+                out.push_str("<tr></tr>");
+                return;
             }
-        }
-        out.push_str("</tr>");
-    };
+            out.push_str("<tr>");
+            let max_col = row_cells.iter().map(|(c, _, _)| *c).max().unwrap_or(0);
+            let mut by_col: BTreeMap<usize, (String, Option<String>)> = BTreeMap::new();
+            for (c, h, bg) in row_cells.drain(..) {
+                by_col.insert(c, (h, bg));
+            }
+            for c in 0..=max_col {
+                // A cell covered by a merge (not its anchor) is dropped entirely.
+                if merges.is_covered(row, c) {
+                    continue;
+                }
+                let span = merges
+                    .anchor(row, c)
+                    .map(|(cs, rs)| span_attrs(cs, rs))
+                    .unwrap_or_default();
+                match by_col.get(&c) {
+                    Some((h, Some(bg))) => out.push_str(&format!(
+                        "<td{span} style=\"background-color:{bg}\">{h}</td>"
+                    )),
+                    Some((h, None)) => out.push_str(&format!("<td{span}>{h}</td>")),
+                    None => out.push_str(&format!("<td{span}></td>")),
+                }
+            }
+            out.push_str("</tr>");
+        };
 
     while let Some(tok) = x.next() {
         match tok {
@@ -1786,17 +1818,24 @@ fn xlsx_sheet_table(xml: &str, shared: &[String], fills: &[Option<String>]) -> S
                 "row" if in_sheet_data && !sc => {
                     row_open = true;
                     row_cells.clear();
+                    // `<row r="N">` is 1-based; fall back to the running counter.
+                    row_idx = attr(&attrs, "r")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .map(|n| n.saturating_sub(1))
+                        .unwrap_or(next_auto_row);
+                    next_auto_row = row_idx + 1;
                 }
                 "c" if in_sheet_data => {
                     in_cell = true;
                     cell_text.clear();
                     cell_type = attr(&attrs, "t").unwrap_or("n").to_string();
                     cell_col = attr(&attrs, "r").map(col_of_ref).unwrap_or(0);
-                    // `c@s` is the cellXfs index → solid-fill colour, if any.
-                    cell_bg = attr(&attrs, "s")
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                        .and_then(|i| fills.get(i))
-                        .and_then(|c| c.clone());
+                    // `c@s` is the cellXfs index → solid-fill colour + numFmt.
+                    let style_idx = attr(&attrs, "s").and_then(|v| v.trim().parse::<usize>().ok());
+                    cell_bg = style_idx.and_then(|i| styles.fill(i));
+                    cell_fmt = style_idx
+                        .and_then(|i| styles.num_fmt(i))
+                        .map(|(_, code)| code.clone());
                     if sc {
                         in_cell = false;
                     }
@@ -1822,15 +1861,24 @@ fn xlsx_sheet_table(xml: &str, shared: &[String], fills: &[Option<String>]) -> S
                                 .cloned()
                                 .unwrap_or_default()
                         } else {
-                            cell_text.clone()
+                            // Numeric/date cell: apply its number format when one
+                            // is set and the value parses; else show as-is.
+                            match cell_fmt
+                                .as_deref()
+                                .and_then(|code| format_cell_number(cell_text.trim(), code))
+                            {
+                                Some(formatted) => formatted,
+                                None => cell_text.clone(),
+                            }
                         };
                         row_cells.push((cell_col, escaped(resolved.trim()), cell_bg.take()));
+                        cell_fmt = None;
                     }
                     in_cell = false;
                 }
                 "row" => {
                     if row_open {
-                        flush_row(&mut row_cells, &mut out);
+                        flush_row(row_idx, &mut row_cells, &mut out);
                         row_open = false;
                     }
                 }
@@ -1841,6 +1889,19 @@ fn xlsx_sheet_table(xml: &str, shared: &[String], fills: &[Option<String>]) -> S
     }
     out.push_str("</table>");
     out
+}
+
+/// Build the ` colspan="…" rowspan="…"` attribute fragment for a merge anchor,
+/// emitting each part only when it spans more than one cell.
+fn span_attrs(colspan: usize, rowspan: usize) -> String {
+    let mut s = String::new();
+    if colspan > 1 {
+        s.push_str(&format!(" colspan=\"{colspan}\""));
+    }
+    if rowspan > 1 {
+        s.push_str(&format!(" rowspan=\"{rowspan}\""));
+    }
+    s
 }
 
 /// Resolved per-cell-style XLSX formatting: for each `cellXfs` index (a cell's
@@ -1942,9 +2003,7 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                         fills.push(color);
                         let fmt = attr(&attrs, "numFmtId")
                             .and_then(|v| v.trim().parse::<u32>().ok())
-                            .and_then(|id| {
-                                num_fmt_code(id, &custom_fmts).map(|code| (id, code))
-                            });
+                            .and_then(|id| num_fmt_code(id, &custom_fmts).map(|code| (id, code)));
                         num_fmts.push(fmt);
                     }
                     _ => {}
@@ -2016,75 +2075,6 @@ fn indexed_color(idx: usize) -> Option<String> {
         65 => Some("#FFFFFF".to_string()),
         _ => None,
     }
-}
-
-fn parse_cell_fills(xml: &str) -> Vec<Option<String>> {
-    // Pass 1: fillId → colour. `fills` is an ordered list of `<fill>`.
-    let mut fill_colors: Vec<Option<String>> = Vec::new();
-    {
-        let mut x = Xml::new(xml);
-        let mut in_fills = false;
-        let mut cur: Option<String> = None;
-        let mut solid = false;
-        while let Some(tok) = x.next() {
-            match tok {
-                Tok::Open(name, attrs, sc) => match local(&name) {
-                    "fills" if !sc => in_fills = true,
-                    "patternFill" if in_fills => {
-                        solid = matches!(attr(&attrs, "patternType"), Some("solid"));
-                        // Some writers put fgColor as an attribute; usually a child.
-                        if solid {
-                            cur = argb_to_hex6(attr(&attrs, "fgColor"));
-                        }
-                    }
-                    "fgColor" if in_fills && solid => {
-                        if let Some(c) = argb_to_hex6(attr(&attrs, "rgb")) {
-                            cur = Some(c);
-                        }
-                    }
-                    _ => {}
-                },
-                Tok::Close(name) => match local(&name) {
-                    "fill" if in_fills => {
-                        fill_colors.push(cur.take());
-                        solid = false;
-                    }
-                    "fills" => in_fills = false,
-                    _ => {}
-                },
-                Tok::Text(_) => {}
-            }
-        }
-    }
-
-    // Pass 2: cellXfs order → fillId → colour.
-    let mut out: Vec<Option<String>> = Vec::new();
-    {
-        let mut x = Xml::new(xml);
-        let mut in_cellxfs = false;
-        while let Some(tok) = x.next() {
-            match tok {
-                Tok::Open(name, attrs, _) => match local(&name) {
-                    "cellXfs" => in_cellxfs = true,
-                    "xf" if in_cellxfs => {
-                        let color = attr(&attrs, "fillId")
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .and_then(|fid| fill_colors.get(fid))
-                            .and_then(|c| c.clone());
-                        out.push(color);
-                    }
-                    _ => {}
-                },
-                Tok::Close(name) => {
-                    if local(&name) == "cellXfs" {
-                        in_cellxfs = false;
-                    }
-                }
-                Tok::Text(_) => {}
-            }
-        }
-    }
-    out
 }
 
 /// Convert an XLSX colour string to `#RRGGBB`, or `None`. XLSX `rgb` is ARGB
@@ -2245,7 +2235,7 @@ fn num_fmt_code(id: u32, custom: &BTreeMap<u32, String>) -> Option<String> {
         37 | 38 => "#,##0",
         39 | 40 => "#,##0.00",
         // Currency / accounting.
-        5 | 6 | 7 | 8 => "$#,##0.00",
+        5..=8 => "$#,##0.00",
         44 | 42 | 41 => "$#,##0.00",
         45 => "mm:ss",
         46 => "[h]:mm:ss",
@@ -2340,18 +2330,14 @@ fn group_thousands(v: f64, decimals: usize) -> String {
         let mut grouped = String::new();
         let len = bytes.len();
         for (i, b) in bytes.iter().enumerate() {
-            if i > 0 && (len - i) % 3 == 0 {
+            if i > 0 && (len - i).is_multiple_of(3) {
                 grouped.push(',');
             }
             grouped.push(*b as char);
         }
         grouped
     };
-    let mut out = if neg {
-        format!("-{int_str}")
-    } else {
-        int_str
-    };
+    let mut out = if neg { format!("-{int_str}") } else { int_str };
     if decimals > 0 {
         let frac = (v.fract() * 10f64.powi(decimals as i32)).round() as u64;
         out.push('.');
@@ -2513,6 +2499,17 @@ impl MergeMap {
             }
         }
         m
+    }
+
+    /// `(colspan, rowspan)` if `(row, col)` is a merge anchor (top-left cell).
+    fn anchor(&self, row: usize, col: usize) -> Option<(usize, usize)> {
+        self.anchors.get(&(row, col)).copied()
+    }
+
+    /// Whether `(row, col)` is covered by a merge but is not its anchor, and so
+    /// must be omitted from the rendered row.
+    fn is_covered(&self, row: usize, col: usize) -> bool {
+        self.covered.contains(&(row, col))
     }
 }
 
@@ -2884,7 +2881,12 @@ fn pptx_table(x: &mut Xml, theme: &PptxTheme, out: &mut String) {
 /// merge continuation (`hMerge`) is suppressed (covered by the span to its left);
 /// a vertical-merge continuation (`vMerge`) emits an empty placeholder `<td>` so
 /// the row keeps its column count. Cell text reuses the slide paragraph grammar.
-fn pptx_table_cell(x: &mut Xml, theme: &PptxTheme, cell_attrs: &[(String, String)], out: &mut String) {
+fn pptx_table_cell(
+    x: &mut Xml,
+    theme: &PptxTheme,
+    cell_attrs: &[(String, String)],
+    out: &mut String,
+) {
     let grid_span = attr(cell_attrs, "gridSpan")
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(1)
@@ -2984,7 +2986,10 @@ fn pptx_table_cell(x: &mut Xml, theme: &PptxTheme, cell_attrs: &[(String, String
     } else {
         String::new()
     };
-    out.push_str(&format!("<td{colspan_attr}{rowspan_attr}>{}</td>", body.trim()));
+    out.push_str(&format!(
+        "<td{colspan_attr}{rowspan_attr}>{}</td>",
+        body.trim()
+    ));
     // Pad the row to `grid_span` physical columns (like the DOCX gridSpan path)
     // so the equal/colgroup layout advances the right number of columns.
     for _ in 1..grid_span {
@@ -4712,7 +4717,13 @@ mod tests {
           </a:tbl>
         </a:graphicData></a:graphic></a:graphicFrame></p:sld>"#;
         let mut body = String::new();
-        pptx_slide(xml, &BTreeMap::new(), &BTreeMap::new(), &PptxTheme::default(), &mut body);
+        pptx_slide(
+            xml,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &PptxTheme::default(),
+            &mut body,
+        );
         assert!(body.contains("<table>"), "table emitted: {body}");
         assert!(body.contains("<colgroup>"), "colgroup emitted: {body}");
         assert!(body.contains("width:72pt"), "first col 72pt: {body}");
@@ -4910,7 +4921,10 @@ mod tests {
           <w:p><w:r><w:t>Plain</w:t></w:r></w:p>
         </w:body></w:document>"#;
         let html = docx_html_with(doc, styles, "");
-        assert!(html.contains("font-family:Garamond"), "doc default font: {html}");
+        assert!(
+            html.contains("font-family:Garamond"),
+            "doc default font: {html}"
+        );
     }
 
     #[test]
@@ -4944,7 +4958,12 @@ mod tests {
         z.add_stored("word/footnotes.xml", footnotes.as_bytes());
         let pdf = office_to_pdf(&z.finish()).expect("docx converts");
         let text = norm(&opens(&pdf).to_text());
-        for needle in ["Top Header", "Main body line", "Bottom Footer", "A note text"] {
+        for needle in [
+            "Top Header",
+            "Main body line",
+            "Bottom Footer",
+            "A note text",
+        ] {
             assert!(text.contains(needle), "missing {needle:?}: {text}");
         }
         // The separator placeholder footnote is not surfaced.
@@ -5229,7 +5248,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_cell_fills_maps_style_index_to_solid_colour() {
+    fn parse_xlsx_styles_maps_style_index_to_solid_colour() {
         // cellXfs[0] → fillId 0 (none); [1] → fillId 2 (solid yellow).
         let styles = r#"<styleSheet xmlns="s">
           <fills count="3">
@@ -5242,10 +5261,10 @@ mod tests {
             <xf numFmtId="0" fontId="0" fillId="2" applyFill="1"/>
           </cellXfs>
         </styleSheet>"#;
-        let fills = parse_cell_fills(styles);
-        assert_eq!(fills.len(), 2);
-        assert_eq!(fills[0], None, "default style: no fill");
-        assert_eq!(fills[1], Some("#FFFF00".to_string()), "solid yellow");
+        let s = parse_xlsx_styles(styles, &XlsxTheme::default());
+        assert_eq!(s.fills.len(), 2);
+        assert_eq!(s.fill(0), None, "default style: no fill");
+        assert_eq!(s.fill(1), Some("#FFFF00".to_string()), "solid yellow");
     }
 
     #[test]
@@ -5283,10 +5302,13 @@ mod tests {
         let xlsx = z.finish();
         // Exercise the table HTML directly so we can assert on the colour.
         let shared: Vec<String> = Vec::new();
-        let fills = parse_cell_fills(&String::from_utf8_lossy(&read_zip(&xlsx)["xl/styles.xml"]));
+        let styles = parse_xlsx_styles(
+            &String::from_utf8_lossy(&read_zip(&xlsx)["xl/styles.xml"]),
+            &XlsxTheme::default(),
+        );
         let sheet_xml =
             String::from_utf8_lossy(&read_zip(&xlsx)["xl/worksheets/sheet1.xml"]).into_owned();
-        let table = xlsx_sheet_table(&sheet_xml, &shared, &fills);
+        let table = xlsx_sheet_table(&sheet_xml, &shared, &styles);
         assert!(
             table.contains("background-color:#FFFF00"),
             "B1 painted: {table}"
@@ -5303,6 +5325,161 @@ mod tests {
             text.contains("Painted") && text.contains("Yellow"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn xlsx_theme_and_indexed_fills_resolve_to_concrete_rgb() {
+        // accent1 = blue (#4472C4). cellXfs[0] → fillId 1 = theme accent1 with a
+        // positive tint (lightens); cellXfs[1] → fillId 2 = indexed red (idx 2).
+        let theme = parse_xlsx_theme(
+            r#"<theme><themeElements><clrScheme>
+              <dk1><srgbClr val="000000"/></dk1>
+              <lt1><srgbClr val="FFFFFF"/></lt1>
+              <dk2><srgbClr val="44546A"/></dk2>
+              <lt2><srgbClr val="E7E6E6"/></lt2>
+              <accent1><srgbClr val="4472C4"/></accent1>
+            </clrScheme></themeElements></theme>"#,
+        );
+        // Spreadsheet @theme index 4 == accent1.
+        assert_eq!(theme.color(4), Some([0x44, 0x72, 0xC4]), "accent1 parsed");
+
+        let styles_xml = r#"<styleSheet>
+          <fills count="3">
+            <fill><patternFill patternType="none"/></fill>
+            <fill><patternFill patternType="solid"><fgColor theme="4" tint="0.5"/></patternFill></fill>
+            <fill><patternFill patternType="solid"><fgColor indexed="2"/></patternFill></fill>
+          </fills>
+          <cellXfs count="2">
+            <xf fillId="1" applyFill="1"/>
+            <xf fillId="2" applyFill="1"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let s = parse_xlsx_styles(styles_xml, &theme);
+        // Theme accent1 lightened by tint=0.5 → blended toward white, not None.
+        let themed = s.fill(0).expect("themed fill resolved");
+        assert_eq!(themed, apply_tint([0x44, 0x72, 0xC4], 0.5));
+        assert_ne!(themed, "#4472C4", "tint actually applied");
+        // Indexed colour 2 is pure red in the classic palette.
+        assert_eq!(s.fill(1), Some("#FF0000".to_string()), "indexed red");
+
+        // And it lands on the <td> background when rendered.
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="0" t="inlineStr"><is><t>Themed</t></is></c>
+            <c r="B1" s="1" t="inlineStr"><is><t>Indexed</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let table = xlsx_sheet_table(sheet, &[], &s);
+        assert!(
+            table.contains(&format!("background-color:{themed}")),
+            "themed bg present: {table}"
+        );
+        assert!(
+            table.contains("background-color:#FF0000"),
+            "indexed bg present: {table}"
+        );
+    }
+
+    #[test]
+    fn xlsx_numfmt_renders_date_serial_and_currency() {
+        // numFmtId 14 = built-in date (mm-dd-yy → date); custom 164 = currency.
+        let styles_xml = r#"<styleSheet>
+          <numFmts count="1">
+            <numFmt numFmtId="164" formatCode="&quot;$&quot;#,##0.00"/>
+          </numFmts>
+          <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+          <cellXfs count="3">
+            <xf numFmtId="0"/>
+            <xf numFmtId="14" applyNumberFormat="1"/>
+            <xf numFmtId="164" applyNumberFormat="1"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let s = parse_xlsx_styles(styles_xml, &XlsxTheme::default());
+
+        // Direct format-code checks: serial 45000 = 2023-03-15; 1234.5 → grouped $.
+        // (Excel 1900 system: serial 45000 → 2023-03-15.)
+        assert_eq!(
+            format_cell_number("45000", "mm-dd-yy"),
+            Some("2023-03-15".to_string()),
+            "date serial → formatted date"
+        );
+        assert_eq!(
+            format_cell_number("1234.5", "\"$\"#,##0.00"),
+            Some("$1,234.50".to_string()),
+            "currency → grouped with $"
+        );
+
+        // Rendered: the raw serial/value must NOT appear; the formatted form does.
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="1"><v>45000</v></c>
+            <c r="B1" s="2"><v>1234.5</v></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let table = xlsx_sheet_table(sheet, &[], &s);
+        assert!(
+            table.contains("2023-03-15"),
+            "date rendered formatted: {table}"
+        );
+        assert!(!table.contains(">45000<"), "raw serial suppressed: {table}");
+        assert!(
+            table.contains("$1,234.50"),
+            "currency rendered formatted: {table}"
+        );
+    }
+
+    #[test]
+    fn xlsx_merge_cells_emit_spans_and_skip_covered() {
+        // A1:B1 horizontal merge (colspan 2) and A2:A3 vertical merge (rowspan 2).
+        let sheet = r#"<worksheet>
+          <mergeCells count="2">
+            <mergeCell ref="A1:B1"/>
+            <mergeCell ref="A2:A3"/>
+          </mergeCells>
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="inlineStr"><is><t>Wide</t></is></c>
+              <c r="B1" t="inlineStr"><is><t>Hidden</t></is></c>
+            </row>
+            <row r="2">
+              <c r="A2" t="inlineStr"><is><t>Tall</t></is></c>
+              <c r="B2" t="inlineStr"><is><t>Right</t></is></c>
+            </row>
+            <row r="3">
+              <c r="A3" t="inlineStr"><is><t>Covered</t></is></c>
+              <c r="B3" t="inlineStr"><is><t>Below</t></is></c>
+            </row>
+          </sheetData>
+        </worksheet>"#;
+        let table = xlsx_sheet_table(sheet, &[], &XlsxStyles::default());
+
+        // Anchor A1 carries colspan=2; the covered B1 ("Hidden") is dropped.
+        assert!(
+            table.contains("<td colspan=\"2\">Wide</td>"),
+            "A1 spans 2 cols: {table}"
+        );
+        assert!(!table.contains("Hidden"), "B1 covered & skipped: {table}");
+
+        // Anchor A2 carries rowspan=2; the covered A3 ("Covered") is dropped.
+        assert!(
+            table.contains("<td rowspan=\"2\">Tall</td>"),
+            "A2 spans 2 rows: {table}"
+        );
+        assert!(!table.contains("Covered"), "A3 covered & skipped: {table}");
+
+        // Non-merged neighbours stay put.
+        assert!(
+            table.contains("Right") && table.contains("Below"),
+            "B2/B3 preserved: {table}"
+        );
+
+        // MergeMap accessors agree with the rendering.
+        let m = MergeMap::build(&parse_merges(sheet));
+        assert_eq!(m.anchor(0, 0), Some((2, 1)), "A1 colspan");
+        assert_eq!(m.anchor(1, 0), Some((1, 2)), "A2 rowspan");
+        assert!(m.is_covered(0, 1), "B1 covered");
+        assert!(m.is_covered(2, 0), "A3 covered");
+        assert!(!m.is_covered(1, 1), "B2 not covered");
     }
 
     #[test]
