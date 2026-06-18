@@ -1265,12 +1265,42 @@ pub fn to_xlsx(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
 /// missing or empty name falls back to `Page <n>`. Lets a host preserve its own
 /// sheet titles (e.g. a single concatenated `Sheet1`) when reusing this writer.
 pub fn to_xlsx_named(grids: &[Vec<Vec<String>>], names: &[String]) -> Vec<u8> {
+    to_xlsx_with_shapes(grids, names, &[])
+}
+
+/// As [`to_xlsx_named`] but also lays out each sheet's floating vector shapes
+/// (`shapes_per_sheet`, index-aligned to `grids`). A sheet with shapes gains a
+/// DrawingML drawing part (`xl/drawings/drawingN.xml`) wired to the worksheet via
+/// an `<drawing>` reference + a worksheet rels part; the `drawing` content-type
+/// and the `drawings/drawingN.xml` overrides are registered in
+/// `[Content_Types].xml`. Each shape is an `xdr:absoluteAnchor` placed in EMU
+/// (1 pt = 12700 EMU), drawn with the same `a:custGeom`/`prstGeom` + fill/line/
+/// dash helpers as the DOCX/PPTX exporters. Sheets without shapes are unchanged.
+pub fn to_xlsx_with_shapes(
+    grids: &[Vec<Vec<String>>],
+    names: &[String],
+    shapes_per_sheet: &[Vec<PlacedShape>],
+) -> Vec<u8> {
     let sheet_count = grids.len().max(1);
     let mut zip = ZipWriter::new();
 
+    // Which sheets carry shapes (and so need a drawing part). The Nth such sheet
+    // maps to drawing{N} (1-based), shared by the content-type override, the
+    // worksheet `<drawing r:id>` and the worksheet rels.
+    let shapes_for =
+        |i: usize| -> &[PlacedShape] { shapes_per_sheet.get(i).map(Vec::as_slice).unwrap_or(&[]) };
+    let mut drawing_no = vec![0usize; sheet_count]; // sheet → drawing number (0 = none)
+    let mut next = 0usize;
+    for (slot, n) in drawing_no.iter_mut().enumerate() {
+        if !shapes_for(slot).is_empty() {
+            next += 1;
+            *n = next;
+        }
+    }
+
     zip.add_deflated(
         "[Content_Types].xml",
-        xlsx_content_types(sheet_count).as_bytes(),
+        xlsx_content_types(sheet_count, &drawing_no).as_bytes(),
     );
     zip.add_deflated(
         "_rels/.rels",
@@ -1289,19 +1319,37 @@ Target=\"xl/workbook.xml\"/></Relationships>",
     );
 
     if grids.is_empty() {
-        zip.add_deflated("xl/worksheets/sheet1.xml", xlsx_sheet_xml(&[]).as_bytes());
+        zip.add_deflated(
+            "xl/worksheets/sheet1.xml",
+            xlsx_sheet_xml(&[], drawing_no[0] != 0).as_bytes(),
+        );
     } else {
         for (i, grid) in grids.iter().enumerate() {
             zip.add_deflated(
                 &format!("xl/worksheets/sheet{}.xml", i + 1),
-                xlsx_sheet_xml(grid).as_bytes(),
+                xlsx_sheet_xml(grid, drawing_no[i] != 0).as_bytes(),
             );
         }
+    }
+
+    // Per-sheet drawing parts + their rels (worksheet → drawing).
+    for (i, &n) in drawing_no.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        zip.add_deflated(
+            &format!("xl/drawings/drawing{n}.xml"),
+            xlsx_drawing_xml(shapes_for(i)).as_bytes(),
+        );
+        zip.add_deflated(
+            &format!("xl/worksheets/_rels/sheet{}.xml.rels", i + 1),
+            xlsx_sheet_rels(n).as_bytes(),
+        );
     }
     zip.finish()
 }
 
-fn xlsx_content_types(sheet_count: usize) -> String {
+fn xlsx_content_types(sheet_count: usize, drawing_no: &[usize]) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
@@ -1316,6 +1364,15 @@ ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.
 ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
             i + 1
         ));
+    }
+    // One drawing override per sheet that has shapes.
+    for &n in drawing_no {
+        if n != 0 {
+            s.push_str(&format!(
+                "<Override PartName=\"/xl/drawings/drawing{n}.xml\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/>"
+            ));
+        }
     }
     s.push_str("</Types>");
     s
@@ -1356,7 +1413,7 @@ Target=\"worksheets/sheet{n}.xml\"/>",
     s
 }
 
-fn xlsx_sheet_xml(grid: &[Vec<String>]) -> String {
+fn xlsx_sheet_xml(grid: &[Vec<String>], has_drawing: bool) -> String {
     let mut data = String::new();
     for (r, row) in grid.iter().enumerate() {
         let mut cells = String::new();
@@ -1376,10 +1433,71 @@ fn xlsx_sheet_xml(grid: &[Vec<String>]) -> String {
             data.push_str(&format!("<row r=\"{}\">{cells}</row>", r + 1));
         }
     }
+    // The `<drawing>` reference must follow `<sheetData>` (schema order). The
+    // single relationship in the sheet's rels is always rId1.
+    let (r_ns, drawing) = if has_drawing {
+        (
+            " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+            "<drawing r:id=\"rId1\"/>",
+        )
+    } else {
+        ("", "")
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
-<sheetData>{data}</sheetData></worksheet>"
+<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"{r_ns}>\
+<sheetData>{data}</sheetData>{drawing}</worksheet>"
+    )
+}
+
+/// The worksheet → drawing relationship part (`xl/worksheets/_rels/sheetK.xml.rels`).
+/// `drawing_no` is the global drawing index for this sheet; the relationship id is
+/// always `rId1` (one drawing per sheet).
+fn xlsx_sheet_rels(drawing_no: usize) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" \
+Target=\"../drawings/drawing{drawing_no}.xml\"/></Relationships>"
+    )
+}
+
+/// A spreadsheet DrawingML part (`xl/drawings/drawingN.xml`): one
+/// `<xdr:absoluteAnchor>` per shape, positioned in EMU (1 pt = 12700 EMU). Each
+/// anchor holds an `<xdr:sp>` whose `<xdr:spPr>` reuses the same custom-geometry
+/// (or `prstGeom rect`) + fill/line/dash helpers as the DOCX/PPTX shape exporters,
+/// so fills, strokes, alpha and exact dash patterns carry through identically.
+fn xlsx_drawing_xml(shapes: &[PlacedShape]) -> String {
+    let mut anchors = String::new();
+    for (i, s) in shapes.iter().enumerate() {
+        let geom = if shape_is_rect(s) {
+            "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>".to_string()
+        } else {
+            dml_cust_geom(s, s.width, s.height)
+        };
+        let id = i + 2; // 1 is reserved for the group shape by convention
+        anchors.push_str(&format!(
+            "<xdr:absoluteAnchor>\
+<xdr:pos x=\"{x}\" y=\"{y}\"/><xdr:ext cx=\"{w}\" cy=\"{h}\"/>\
+<xdr:sp macro=\"\" textlink=\"\"><xdr:nvSpPr>\
+<xdr:cNvPr id=\"{id}\" name=\"Shape {id}\"/><xdr:cNvSpPr/></xdr:nvSpPr>\
+<xdr:spPr><a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
+{geom}{fill}{ln}</xdr:spPr>\
+<xdr:txBody><a:bodyPr/><a:p/></xdr:txBody></xdr:sp>\
+<xdr:clientData/></xdr:absoluteAnchor>",
+            x = emu(s.x),
+            y = emu(s.y),
+            w = emu(s.width.max(1.0)),
+            h = emu(s.height.max(1.0)),
+            fill = dml_fill(s),
+            ln = dml_line(s),
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" \
+xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">{anchors}</xdr:wsDr>"
     )
 }
 
@@ -1395,46 +1513,108 @@ pub fn to_ods(grids: &[Vec<Vec<String>>]) -> Vec<u8> {
 /// As [`to_ods`] but with explicit per-sheet names (index-aligned to `grids`); a
 /// missing or empty name falls back to `Page <n>`.
 pub fn to_ods_named(grids: &[Vec<Vec<String>>], names: &[String]) -> Vec<u8> {
+    to_ods_with_shapes(grids, names, &[])
+}
+
+/// As [`to_ods_named`] but also lays out each sheet's floating vector shapes
+/// (`shapes_per_sheet`, index-aligned to `grids`) inside that sheet's
+/// `table:table`, mirroring the [`to_odp`] shape rendering: a `draw:rect` for an
+/// axis-aligned box, a `draw:path` (absolute `svg:d` + `svg:viewBox`) otherwise,
+/// each referencing an automatic `<style:style>` carrying its real fill/stroke/
+/// dash via [`odf_shape_style`]. Sheets without shapes are byte-identical to the
+/// plain table output.
+pub fn to_ods_with_shapes(
+    grids: &[Vec<Vec<String>>],
+    names: &[String],
+    shapes_per_sheet: &[Vec<PlacedShape>],
+) -> Vec<u8> {
     let mut zip = ZipWriter::new();
     zip.add_stored(
         "mimetype",
         b"application/vnd.oasis.opendocument.spreadsheet",
     );
 
-    let mut content = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
-xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
-xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" office:version=\"1.3\">\
-<office:body><office:spreadsheet>",
-    );
+    // Shape paint styles go in automatic-styles; the shapes themselves inside the
+    // owning table. Build both, then assemble content.xml.
+    let mut auto = String::new();
+    let mut body = String::new();
     let sheets = grids.len().max(1);
+    let mut style_id = 0usize;
     for s in 0..sheets {
         let mut nm = String::new();
         esc(&sheet_name(names, s), &mut nm);
-        content.push_str(&format!("<table:table table:name=\"{nm}\">"));
+        body.push_str(&format!("<table:table table:name=\"{nm}\">"));
         let grid = grids.get(s).map(Vec::as_slice).unwrap_or(&[]);
         if grid.is_empty() {
-            content.push_str("<table:table-row><table:table-cell/></table:table-row>");
+            body.push_str("<table:table-row><table:table-cell/></table:table-row>");
         }
         for row in grid {
-            content.push_str("<table:table-row>");
+            body.push_str("<table:table-row>");
             for value in row {
                 if value.is_empty() {
-                    content.push_str("<table:table-cell/>");
+                    body.push_str("<table:table-cell/>");
                 } else {
                     let mut text = String::new();
                     esc(value, &mut text);
-                    content.push_str(&format!(
+                    body.push_str(&format!(
                         "<table:table-cell office:value-type=\"string\"><text:p>{text}</text:p></table:table-cell>"
                     ));
                 }
             }
-            content.push_str("</table:table-row>");
+            body.push_str("</table:table-row>");
         }
-        content.push_str("</table:table>");
+        // Floating shapes are sheet-level drawing objects: emitted after the rows
+        // but still inside the `table:table` (ODF §9.2.5 allows `draw:*` there).
+        for shape in shapes_per_sheet.get(s).map(Vec::as_slice).unwrap_or(&[]) {
+            let style = format!("S{style_id}");
+            auto.push_str(&odf_shape_style(&style, shape));
+            let (x, y) = (num(shape.x), num(shape.y));
+            let (w, h) = (num(shape.width.max(1.0)), num(shape.height.max(1.0)));
+            if shape_is_rect(shape) {
+                body.push_str(&format!(
+                    "<draw:rect draw:style-name=\"{style}\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>"
+                ));
+            } else {
+                // `svg:d` is absolute top-down points; the viewBox is offset by the
+                // box origin so those coordinates map straight onto the frame.
+                body.push_str(&format!(
+                    "<draw:path draw:style-name=\"{style}\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
+svg:viewBox=\"{vbx} {vby} {vbw} {vbh}\" svg:d=\"{d}\"/>",
+                    vbx = num(shape.x),
+                    vby = num(shape.y),
+                    vbw = num(shape.width.max(1.0)),
+                    vbh = num(shape.height.max(1.0)),
+                    d = odf_path_d(&shape.segments),
+                ));
+            }
+            style_id += 1;
+        }
+        body.push_str("</table:table>");
     }
-    content.push_str("</office:spreadsheet></office:body></office:document-content>");
+
+    // The drawing namespaces and the automatic-styles block are only emitted when
+    // shapes are present, so a shape-less workbook stays byte-identical to the
+    // historical plain-table output.
+    let (draw_ns, styles) = if auto.is_empty() {
+        ("", String::new())
+    } else {
+        (
+            " xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
+xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
+xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"",
+            format!("<office:automatic-styles>{auto}</office:automatic-styles>"),
+        )
+    };
+    let content = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
+xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"{draw_ns} office:version=\"1.3\">\
+{styles}\
+<office:body><office:spreadsheet>{body}</office:spreadsheet></office:body></office:document-content>"
+    );
 
     zip.add_deflated("content.xml", content.as_bytes());
     zip.add_deflated(
@@ -2259,5 +2439,186 @@ mod tests {
             String::from_utf8(entry(&to_odt(&rect_shape_pages()), "content.xml").unwrap()).unwrap();
         assert!(!odt.contains("stroke-dash"));
         assert!(odt.contains("draw:stroke=\"solid\""), "still solid");
+    }
+
+    // ── spreadsheet shapes (XLSX/ODS drawing layer) ───────────────────────────
+
+    /// A red-filled, blue-stroked, dashed non-rectangular path — exercises the
+    /// custom-geometry + exact-dash branch in both spreadsheet exporters.
+    fn sheet_shape() -> PlacedShape {
+        PlacedShape {
+            x: 12.0,
+            y: 24.0,
+            width: 80.0,
+            height: 40.0,
+            segments: vec![
+                PathSeg::Move(12.0, 24.0),
+                PathSeg::Line(92.0, 24.0),
+                PathSeg::Cubic(80.0, 50.0, 40.0, 60.0, 12.0, 64.0),
+                PathSeg::Close,
+            ],
+            fill: Some([1.0, 0.0, 0.0]),
+            stroke: Some([0.0, 0.0, 1.0]),
+            stroke_width: 4.0,
+            dash: vec![6.0, 3.0],
+            ..PlacedShape::default()
+        }
+    }
+
+    #[test]
+    fn xlsx_with_shapes_embeds_a_drawing_part() {
+        let grids = vec![vec![vec!["A1".to_string()]]];
+        let shapes = vec![vec![sheet_shape()]];
+        let zip = to_xlsx_with_shapes(&grids, &[], &shapes);
+
+        // Valid zip: the cell sheet and the drawing part are both readable.
+        let s1 = String::from_utf8(entry(&zip, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(s1.contains("inlineStr"), "cells still written");
+        assert!(
+            s1.contains("<drawing r:id=\"rId1\"/>"),
+            "worksheet references its drawing: {s1}"
+        );
+
+        let d1 = String::from_utf8(entry(&zip, "xl/drawings/drawing1.xml").unwrap()).unwrap();
+        assert!(d1.contains("<xdr:wsDr "), "spreadsheet drawing root");
+        assert!(d1.contains("<xdr:absoluteAnchor>"), "absolute anchor");
+        // 12 pt → 152400 EMU on x; the box is positioned in EMU.
+        assert!(d1.contains("<xdr:pos x=\"152400\""), "EMU position: {d1}");
+        assert!(d1.contains("<a:path "), "custom path geometry present");
+        assert!(d1.contains("<a:cubicBezTo>"), "cubic segment carried");
+        assert!(
+            d1.contains("<a:srgbClr val=\"FF0000\">"),
+            "red fill colour: {d1}"
+        );
+        assert!(
+            d1.contains("<a:srgbClr val=\"0000FF\">"),
+            "blue stroke colour"
+        );
+        // dash [6,3] at width 4 → on=150000, off=75000 (% of width, thousandths).
+        assert!(
+            d1.contains("<a:custDash>"),
+            "exact dash in the spreadsheet drawing"
+        );
+        assert!(
+            d1.contains("<a:ds d=\"150000\" sp=\"75000\"/>"),
+            "dash stops scaled"
+        );
+
+        // The drawing content-type override + the worksheet→drawing rel are wired.
+        let ct = String::from_utf8(entry(&zip, "[Content_Types].xml").unwrap()).unwrap();
+        assert!(
+            ct.contains("PartName=\"/xl/drawings/drawing1.xml\"")
+                && ct.contains("officedocument.drawing+xml"),
+            "drawing registered in content types: {ct}"
+        );
+        let rels =
+            String::from_utf8(entry(&zip, "xl/worksheets/_rels/sheet1.xml.rels").unwrap()).unwrap();
+        assert!(
+            rels.contains("Target=\"../drawings/drawing1.xml\""),
+            "sheet rels point at the drawing: {rels}"
+        );
+    }
+
+    #[test]
+    fn xlsx_rect_shape_uses_prstgeom() {
+        let grids = vec![vec![vec!["x".to_string()]]];
+        let shapes = vec![vec![PlacedShape {
+            x: 0.0,
+            y: 0.0,
+            width: 50.0,
+            height: 50.0,
+            fill: Some([0.0, 1.0, 0.0]),
+            ..PlacedShape::default()
+        }]];
+        let zip = to_xlsx_with_shapes(&grids, &[], &shapes);
+        let d1 = String::from_utf8(entry(&zip, "xl/drawings/drawing1.xml").unwrap()).unwrap();
+        assert!(
+            d1.contains("<a:prstGeom prst=\"rect\">"),
+            "rect → preset geom"
+        );
+        assert!(
+            d1.contains("<a:srgbClr val=\"00FF00\">"),
+            "green fill: {d1}"
+        );
+    }
+
+    #[test]
+    fn xlsx_without_shapes_is_unchanged() {
+        // A shape-less workbook must not gain any drawing parts/refs and stays
+        // byte-identical to the plain writer.
+        let grids = vec![vec![vec!["only".to_string()]]];
+        let plain = to_xlsx(&grids);
+        let with_empty = to_xlsx_with_shapes(&grids, &[], &[Vec::new()]);
+        assert_eq!(plain, with_empty, "no shapes ⇒ identical output");
+        let s1 = String::from_utf8(entry(&plain, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(!s1.contains("<drawing "), "no drawing reference");
+        assert!(entry(&plain, "xl/drawings/drawing1.xml").is_none());
+    }
+
+    #[test]
+    fn xlsx_shapes_only_on_sheets_that_have_them() {
+        // Sheet 1 has no shapes, sheet 2 does → the only drawing is drawing1,
+        // wired to sheet2 (drawings are numbered over shape-bearing sheets).
+        let grids = vec![vec![vec!["one".to_string()]], vec![vec!["two".to_string()]]];
+        let shapes = vec![Vec::new(), vec![sheet_shape()]];
+        let zip = to_xlsx_with_shapes(&grids, &[], &shapes);
+        assert!(entry(&zip, "xl/drawings/drawing1.xml").is_some());
+        assert!(entry(&zip, "xl/drawings/drawing2.xml").is_none());
+        let s1 = String::from_utf8(entry(&zip, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(!s1.contains("<drawing "), "sheet 1 has no drawing");
+        let s2 = String::from_utf8(entry(&zip, "xl/worksheets/sheet2.xml").unwrap()).unwrap();
+        assert!(
+            s2.contains("<drawing r:id=\"rId1\"/>"),
+            "sheet 2 has the drawing"
+        );
+        let rels =
+            String::from_utf8(entry(&zip, "xl/worksheets/_rels/sheet2.xml.rels").unwrap()).unwrap();
+        assert!(rels.contains("Target=\"../drawings/drawing1.xml\""));
+    }
+
+    #[test]
+    fn ods_with_shapes_draws_path_and_colours() {
+        let grids = vec![vec![vec!["A".to_string()]]];
+        let shapes = vec![vec![sheet_shape()]];
+        let zip = to_ods_with_shapes(&grids, &[], &shapes);
+        // mimetype still first + stored (unchanged container contract).
+        let nlen = u16::from_le_bytes([zip[26], zip[27]]) as usize;
+        assert_eq!(&zip[30..30 + nlen], b"mimetype");
+
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("office:value-type=\"string\""),
+            "cells still written"
+        );
+        assert!(
+            content.contains("<draw:path "),
+            "non-rect shape → draw:path"
+        );
+        assert!(content.contains("svg:d=\""), "path data present");
+        assert!(
+            content.contains("draw:fill=\"solid\" draw:fill-color=\"#FF0000\""),
+            "red fill carried: {content}"
+        );
+        assert!(
+            content.contains("svg:stroke-color=\"#0000FF\""),
+            "blue stroke"
+        );
+        assert!(content.contains("<draw:stroke-dash "), "exact dash defined");
+        // The dash style must be referenced from automatic-styles, inside the sheet.
+        assert!(
+            content.contains("<office:automatic-styles>")
+                && content.contains("draw:stroke=\"dash\""),
+            "dash style wired"
+        );
+    }
+
+    #[test]
+    fn ods_without_shapes_is_unchanged() {
+        let grids = vec![vec![vec!["only".to_string()]]];
+        assert_eq!(
+            to_ods(&grids),
+            to_ods_with_shapes(&grids, &[], &[Vec::new()]),
+            "no shapes ⇒ identical ODS output"
+        );
     }
 }

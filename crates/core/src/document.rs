@@ -1991,14 +1991,14 @@ impl Document {
     /// workbook (`.xlsx`), one sheet per page. Tabular PDFs become real cells;
     /// prose collapses to a single column so all document text is preserved.
     pub fn to_xlsx(&self) -> Vec<u8> {
-        let grids = self.convert_grids();
-        crate::convert::office::to_xlsx(&grids)
+        let (grids, shapes) = self.convert_grids_and_shapes();
+        crate::convert::office::to_xlsx_with_shapes(&grids, &[], &shapes)
     }
 
     /// As [`to_xlsx`](Self::to_xlsx) but to an OpenDocument Spreadsheet (`.ods`).
     pub fn to_ods(&self) -> Vec<u8> {
-        let grids = self.convert_grids();
-        crate::convert::office::to_ods(&grids)
+        let (grids, shapes) = self.convert_grids_and_shapes();
+        crate::convert::office::to_ods_with_shapes(&grids, &[], &shapes)
     }
 
     /// Convert the document's text to an RTF document (one paragraph per text
@@ -2083,12 +2083,20 @@ impl Document {
         crate::serialize::to_pdf(&objects, &trailer)
     }
 
-    /// Per-page reconstructed table grids (shared by the spreadsheet exporters).
-    fn convert_grids(&self) -> Vec<Vec<Vec<String>>> {
-        self.convert_pages()
+    /// Per-page reconstructed table grids and floating shapes (shared by the
+    /// spreadsheet exporters), from a single [`convert_pages`](Self::convert_pages)
+    /// pass: grids drive the cells, shapes the drawing layer.
+    #[allow(clippy::type_complexity)]
+    fn convert_grids_and_shapes(
+        &self,
+    ) -> (Vec<Vec<Vec<String>>>, Vec<Vec<crate::convert::PlacedShape>>) {
+        let pages = self.convert_pages();
+        let grids = pages
             .iter()
             .map(|page| crate::convert::table::reconstruct(&page.texts))
-            .collect()
+            .collect();
+        let shapes = pages.into_iter().map(|page| page.shapes).collect();
+        (grids, shapes)
     }
 
     /// Decode the page's image XObjects (`DeviceRGB`/`DeviceGray`, 8 bpc, Flate
