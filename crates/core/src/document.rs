@@ -3229,9 +3229,21 @@ impl Document {
             let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(&otf)
                 .ok_or_else(|| EngineError::Unsupported("wrapped CFF not parseable".into()))?;
             self.embed_cid_font(family, &otf, &parsed, true)
+        } else if is_raw_type1(program) {
+            // Raw Type 1 (PDF `FontFile`, `.pfb` or `.pfa`): decrypt eexec,
+            // transcode each Type 1 charstring to Type 2, pack a bare CFF, then
+            // route it through the same wrap → OpenType-CFF path as above.
+            let cff = crate::font::type1::parse_type1(program)
+                .and_then(|font| crate::font::type1::to_cff(&font))
+                .ok_or_else(|| EngineError::Unsupported("unparseable Type1 font".into()))?;
+            let otf = crate::font::cff_to_otf::wrap(&cff)
+                .ok_or_else(|| EngineError::Unsupported("unparseable Type1 font".into()))?;
+            let parsed = crate::font::truetype::TrueTypeFont::parse_metrics(&otf)
+                .ok_or_else(|| EngineError::Unsupported("unparseable Type1 font".into()))?;
+            self.embed_cid_font(family, &otf, &parsed, true)
         } else {
             Err(EngineError::Unsupported(
-                "not a glyf TrueType, OpenType-CFF or bare CFF font program".into(),
+                "not a glyf TrueType, OpenType-CFF, bare CFF or Type1 font program".into(),
             ))
         }
     }
@@ -7104,6 +7116,22 @@ fn postscript_name(family: &str) -> String {
     }
 }
 
+/// Recognise a raw Type 1 font program: a `.pfb` (binary segment marker
+/// `0x80 0x01`), a `.pfa` (`%!` clear-text header), or a PDF `FontFile` body —
+/// all of which carry an `eexec`-encrypted private section. The `eexec` token is
+/// the reliable discriminator; the leading-byte checks short-circuit common
+/// cases. Called only after the glyf/OpenType-CFF/bare-CFF checks, so it never
+/// shadows those flavours.
+fn is_raw_type1(program: &[u8]) -> bool {
+    let pfb = program.first() == Some(&0x80) && program.get(1) == Some(&0x01);
+    let pfa = program.get(0..2) == Some(b"%!".as_slice());
+    let has_eexec = program
+        .windows(5)
+        .take(4096) // the eexec keyword sits early, in the clear-text header.
+        .any(|w| w == b"eexec");
+    pfb || (pfa && has_eexec) || (has_eexec && program.first() != Some(&1))
+}
+
 /// Linearly interpolate an SVG gradient's stops at `t` ∈ [0,1] → 8-bit RGB (for
 /// the shading function samples). Stop alpha is not applied (opaque shading).
 fn sample_svg_gradient(stops: &[crate::svg::GradStop], t: f64) -> [u8; 3] {
@@ -9060,6 +9088,54 @@ mod tests {
             has_op(&content, b"<00020001>"),
             "replace re-encodes for the CFF font, not WinAnsi"
         );
+    }
+
+    #[test]
+    fn embed_font_handles_raw_type1() {
+        // A raw Type 1 face (PDF `FontFile` / `.pfb`) must route through the
+        // decrypt → Type 2 → bare-CFF → OpenType-CFF path and embed as a Type0.
+        // Best-effort on a system PFB; a no-op when none is installed.
+        const CANDIDATES: &[&str] = &[
+            "/usr/share/fonts/X11/Type1/NimbusSansNarrow-Bold.pfb",
+            "/usr/share/fonts/X11/Type1/c0419bt_.pfb",
+            "/usr/share/fonts/X11/Type1/C059-Roman.pfb",
+        ];
+        let Some(pfb) = CANDIDATES
+            .iter()
+            .find_map(|p| std::fs::read(p).ok().filter(|b| b.len() > 2000))
+        else {
+            eprintln!("no system Type1 fixture; skipped embed_font_handles_raw_type1");
+            return;
+        };
+        assert!(super::is_raw_type1(&pfb), "PFB recognised as raw Type1");
+
+        let mut doc = blank_doc();
+        let font = doc.embed_font("MyType1", &pfb).expect("Type1 embeds");
+        assert_ne!(font, 0, "non-zero Type0 object id");
+
+        // The descendant is a CFF-flavoured CIDFontType0 (Type1 → CFF route).
+        let t0 = doc.objects.get(&(font, 0)).and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            t0.get(b"Subtype").and_then(Object::as_name),
+            Some(b"Type0".as_slice())
+        );
+        let desc_ref = match &t0.get(b"DescendantFonts").and_then(Object::as_array).unwrap()[0] {
+            Object::Reference(id) => *id,
+            _ => panic!("descendant is a reference"),
+        };
+        let cid = doc.objects.get(&desc_ref).and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            cid.get(b"Subtype").and_then(Object::as_name),
+            Some(b"CIDFontType0".as_slice()),
+            "Type1→CFF descendant is CIDFontType0"
+        );
+
+        // 'A' renders (its glyph resolved via the synthesised cmap) and the
+        // document survives a save/open round-trip.
+        doc.add_text(1, 72.0, 700.0, 18.0, "A", font, [0.0; 3], 1.0, 0.0)
+            .expect("draw text in the Type1 face");
+        let bytes = doc.save();
+        Document::open(&bytes).expect("re-opens after embedding a Type1 font");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod embed;
 pub mod glyphless;
 pub mod google;
 pub mod truetype;
+pub mod type1;
 
 /// A glyph outline source: an embedded TrueType (`/FontFile2`) or CFF
 /// (`/FontFile3`) program. Both expose the same outline interface so the
