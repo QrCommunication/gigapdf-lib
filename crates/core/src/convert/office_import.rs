@@ -548,8 +548,10 @@ impl RunStyle {
 
 /// Paragraph-level formatting from `w:pPr` mapped to inline block CSS:
 /// `w:jc` → `text-align`, `w:spacing@before/@after` → `margin-top/-bottom`,
-/// `w:ind@left/@right/@firstLine` → `margin-left/-right`/`text-indent`. All
-/// distances are twips (`pt = twips / 20`).
+/// `w:spacing@line/@lineRule` → `line-height`, `w:ind@left/@right/@firstLine` →
+/// `margin-left/-right`/`text-indent`, and `w:numPr@ilvl` → list `margin-left`
+/// (the bullet is prepended to the text). All distances are twips
+/// (`pt = twips / 20`).
 #[derive(Default, Clone)]
 struct ParaStyle {
     align: Option<&'static str>,
@@ -558,11 +560,30 @@ struct ParaStyle {
     indent_left_pt: Option<f64>,
     indent_right_pt: Option<f64>,
     first_line_pt: Option<f64>,
+    /// Resolved `line-height`: either a unitless multiple (`w:lineRule="auto"`,
+    /// `line/240`) or an absolute points value (`exact`/`atLeast`, `line/20`).
+    line_height: Option<LineHeight>,
+    /// List indent level from `w:numPr/w:ilvl` (each level adds 36pt of
+    /// `margin-left`, on top of any explicit `w:ind`).
+    list_level: Option<u32>,
 }
+
+/// A DOCX line-spacing value, mapped to the engine's `line-height`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LineHeight {
+    /// Unitless multiple of the font size (`w:lineRule="auto"`).
+    Multiple(f64),
+    /// Absolute points (`w:lineRule="exact"` / `"atLeast"`).
+    Points(f64),
+}
+
+/// Each DOCX list indent level (`w:ilvl`) maps to this much left margin.
+const LIST_LEVEL_INDENT_PT: f64 = 36.0;
 
 impl ParaStyle {
     /// A ` style="…"` attribute (with leading space) for the block element, or
-    /// an empty string when no paragraph property was set.
+    /// an empty string when no paragraph property was set. List levels add
+    /// `LIST_LEVEL_INDENT_PT` per level to any explicit left indent.
     fn style_attr(&self) -> String {
         let mut css = String::new();
         if let Some(a) = self.align {
@@ -574,7 +595,15 @@ impl ParaStyle {
         if let Some(v) = self.space_after_pt {
             css.push_str(&format!("margin-bottom:{v}pt;"));
         }
-        if let Some(v) = self.indent_left_pt {
+        // List level indent stacks on top of any explicit w:ind left margin.
+        let list_indent = self
+            .list_level
+            .map(|lvl| (lvl as f64 + 1.0) * LIST_LEVEL_INDENT_PT);
+        let left = match (self.indent_left_pt, list_indent) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        if let Some(v) = left {
             css.push_str(&format!("margin-left:{v}pt;"));
         }
         if let Some(v) = self.indent_right_pt {
@@ -583,11 +612,31 @@ impl ParaStyle {
         if let Some(v) = self.first_line_pt {
             css.push_str(&format!("text-indent:{v}pt;"));
         }
+        match self.line_height {
+            Some(LineHeight::Multiple(m)) => css.push_str(&format!("line-height:{m};")),
+            Some(LineHeight::Points(p)) => css.push_str(&format!("line-height:{p}pt;")),
+            None => {}
+        }
         if css.is_empty() {
             String::new()
         } else {
             format!(" style=\"{css}\"")
         }
+    }
+}
+
+/// Map a `w:spacing@line` (+ `@lineRule`) to a [`LineHeight`]. With `auto` (or
+/// no rule) the value is 240ths of a line (`240` = single); with `exact`/
+/// `atLeast` it is twentieths of a point. Returns `None` for an unparseable or
+/// non-positive value.
+fn line_spacing(line: &str, rule: Option<&str>) -> Option<LineHeight> {
+    let n: f64 = line.trim().parse().ok()?;
+    if n <= 0.0 {
+        return None;
+    }
+    match rule {
+        Some("exact") | Some("atLeast") => Some(LineHeight::Points(n / TWIP_PER_PT)),
+        _ => Some(LineHeight::Multiple(n / 240.0)),
     }
 }
 
@@ -689,6 +738,20 @@ fn docx_paragraph(
                         para.space_after_pt = attr(&attrs, "after")
                             .and_then(twips_to_pt)
                             .or(para.space_after_pt);
+                        if let Some(line) = attr(&attrs, "line") {
+                            if let Some(lh) = line_spacing(line, attr(&attrs, "lineRule")) {
+                                para.line_height = Some(lh);
+                            }
+                        }
+                    }
+                    "numPr" if in_ppr => {
+                        // A paragraph in a list; default level 0 unless w:ilvl says.
+                        para.list_level = Some(para.list_level.unwrap_or(0));
+                    }
+                    "ilvl" if in_ppr => {
+                        if let Some(lvl) = attr(&attrs, "val").and_then(|v| v.trim().parse().ok()) {
+                            para.list_level = Some(lvl);
+                        }
                     }
                     "ind" if in_ppr => {
                         para.indent_left_pt = attr(&attrs, "left")
@@ -775,6 +838,12 @@ fn docx_paragraph(
         }
     }
 
+    // List paragraphs get a bullet prefix (numbering is best-effort: we render
+    // a `•` rather than reconstruct the exact ordinal from numbering.xml).
+    if para.list_level.is_some() && !inner.trim().is_empty() {
+        inner.insert_str(0, "\u{2022} ");
+    }
+
     let trimmed = inner.trim();
     let para_attr = para.style_attr();
     match heading {
@@ -788,7 +857,23 @@ fn docx_paragraph(
     }
 }
 
-/// Emit one `w:tbl` (open already consumed) as an HTML `<table>`.
+/// Cell-merge metadata read from `w:tc/w:tcPr`.
+#[derive(Default, Clone, Copy)]
+struct CellSpan {
+    /// `w:gridSpan@w:val` — horizontal merge (columns covered).
+    grid_span: usize,
+    /// `w:vMerge` with no `@w:val` (or `="continue"`) — this cell is the
+    /// continuation of a vertical merge started above.
+    v_merge_continue: bool,
+    /// `w:vMerge@w:val="restart"` — this cell starts a vertical merge.
+    v_merge_restart: bool,
+}
+
+/// Emit one `w:tbl` (open already consumed) as an HTML `<table>`. Honours cell
+/// merges: `w:gridSpan` widens the cell (expanded to that many physical `<td>`s
+/// so the equal-column layout reflects the span, the first carrying a `colspan`
+/// for forward-compat); `w:vMerge` carries a `rowspan` hint and the covered
+/// continuation cells are dropped.
 fn docx_table(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
@@ -796,28 +881,20 @@ fn docx_table(
     out: &mut String,
 ) {
     out.push_str("<table>");
-    let mut in_row = false;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, _, sc) => {
                 let ln = local(&name);
                 if ln == "tr" && !sc {
                     out.push_str("<tr>");
-                    in_row = true;
                 } else if ln == "tc" && !sc {
-                    out.push_str("<td>");
-                    // Cell body recurses with the same walker; stop at </w:tc>.
-                    let mut cell = String::new();
-                    docx_walk(x, zip, rels, &mut cell, Some("tc"));
-                    out.push_str(cell.trim());
-                    out.push_str("</td>");
+                    docx_cell(x, zip, rels, out);
                 }
             }
             Tok::Close(name) => {
                 let ln = local(&name);
                 if ln == "tr" {
                     out.push_str("</tr>");
-                    in_row = false;
                 } else if ln == "tbl" {
                     break;
                 }
@@ -825,8 +902,82 @@ fn docx_table(
             Tok::Text(_) => {}
         }
     }
-    let _ = in_row;
     out.push_str("</table>");
+}
+
+/// Emit one `w:tc` cell (open already consumed) until `</w:tc>`, applying its
+/// `w:tcPr` merge properties. A `w:gridSpan="N"` cell is emitted as N physical
+/// `<td>`s (content + `colspan="N"` in the first, the rest empty) so the
+/// equal-width table layout still spreads the cell across N columns. A
+/// `w:vMerge` continuation cell is suppressed (its content belongs to the
+/// restart cell above); a restart cell gets a `rowspan="2"` hint.
+fn docx_cell(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    out: &mut String,
+) {
+    let mut span = CellSpan::default();
+    let mut in_tcpr = false;
+    let mut body = String::new();
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "tcPr" if !sc => in_tcpr = true,
+                    "gridSpan" if in_tcpr => {
+                        span.grid_span = attr(&attrs, "val")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                    }
+                    "vMerge" if in_tcpr => match attr(&attrs, "val") {
+                        Some("restart") => span.v_merge_restart = true,
+                        // No val (or "continue") → this is a covered cell.
+                        _ => span.v_merge_continue = true,
+                    },
+                    "p" if !sc => docx_paragraph(x, zip, rels, &mut body),
+                    "tbl" if !sc => docx_table(x, zip, rels, &mut body),
+                    _ => {}
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if ln == "tcPr" {
+                    in_tcpr = false;
+                } else if ln == "tc" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+
+    // A vertical-merge continuation cell is covered by the restart cell above:
+    // drop it so the column count of the row above is preserved.
+    if span.v_merge_continue {
+        return;
+    }
+
+    let trimmed = body.trim();
+    let cols = span.grid_span.max(1);
+    let colspan_attr = if cols > 1 {
+        format!(" colspan=\"{cols}\"")
+    } else {
+        String::new()
+    };
+    let rowspan_attr = if span.v_merge_restart {
+        " rowspan=\"2\""
+    } else {
+        ""
+    };
+    out.push_str(&format!("<td{colspan_attr}{rowspan_attr}>{trimmed}</td>"));
+    // Pad with empty cells so the equal-column layout actually advances `cols`
+    // columns for this logically-merged cell.
+    for _ in 1..cols {
+        out.push_str("<td></td>");
+    }
 }
 
 /// Map a DOCX style id (`Heading1`, `Title`, …) to a heading level 1..=6.
@@ -853,11 +1004,18 @@ fn heading_level(style: &str) -> Option<u8> {
 /// XLSX → one HTML `<table>` per sheet (page break between), sheet name as
 /// `<h2>`. Resolves `t="s"` shared strings and the exporter's own
 /// `t="inlineStr"` cells, positioning each cell by its column letter so columns
-/// align. Rendered landscape for width.
+/// align, and colours cells from their style's solid fill. Rendered landscape
+/// for width.
 pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let shared = zip
         .get("xl/sharedStrings.xml")
         .map(|b| parse_shared_strings(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+
+    // Cell-style index → solid-fill colour (`#RRGGBB`), from xl/styles.xml.
+    let fills = zip
+        .get("xl/styles.xml")
+        .map(|b| parse_cell_fills(&String::from_utf8_lossy(b)))
         .unwrap_or_default();
 
     // Sheet name order from the workbook; fall back to file order.
@@ -886,7 +1044,7 @@ pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
             .cloned()
             .unwrap_or_else(|| format!("Sheet {n}"));
         body.push_str(&format!("<h2>{}</h2>", escaped(&title)));
-        body.push_str(&xlsx_sheet_table(xml, &shared));
+        body.push_str(&xlsx_sheet_table(xml, &shared, &fills));
     }
     if sheets.is_empty() {
         body.push_str("<p></p>");
@@ -896,35 +1054,41 @@ pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 }
 
 /// Render one worksheet XML to an HTML `<table>`, gap-filling so cells land in
-/// their declared column (`r="C3"`).
-fn xlsx_sheet_table(xml: &str, shared: &[String]) -> String {
+/// their declared column (`r="C3"`) and colouring each cell from its style
+/// index (`c@s` → `fills` → `background-color`).
+fn xlsx_sheet_table(xml: &str, shared: &[String], fills: &[Option<String>]) -> String {
     let mut out = String::from("<table>");
     let mut x = Xml::new(xml);
     let mut in_sheet_data = false;
-    let mut row_cells: Vec<(usize, String)> = Vec::new(); // (col_index, html)
+    // (col_index, escaped html, optional `#RRGGBB` background).
+    let mut row_cells: Vec<(usize, String, Option<String>)> = Vec::new();
     let mut row_open = false;
 
     // Current-cell scratch.
     let mut cell_col = 0usize;
     let mut cell_type = String::new();
     let mut cell_text = String::new();
+    let mut cell_bg: Option<String> = None;
     let mut in_cell = false;
     let mut in_value = false; // inside <v> or <t>
 
-    let flush_row = |row_cells: &mut Vec<(usize, String)>, out: &mut String| {
+    let flush_row = |row_cells: &mut Vec<(usize, String, Option<String>)>, out: &mut String| {
         if row_cells.is_empty() {
             out.push_str("<tr></tr>");
             return;
         }
         out.push_str("<tr>");
-        let max_col = row_cells.iter().map(|(c, _)| *c).max().unwrap_or(0);
-        let mut by_col: BTreeMap<usize, String> = BTreeMap::new();
-        for (c, h) in row_cells.drain(..) {
-            by_col.insert(c, h);
+        let max_col = row_cells.iter().map(|(c, _, _)| *c).max().unwrap_or(0);
+        let mut by_col: BTreeMap<usize, (String, Option<String>)> = BTreeMap::new();
+        for (c, h, bg) in row_cells.drain(..) {
+            by_col.insert(c, (h, bg));
         }
         for c in 0..=max_col {
             match by_col.get(&c) {
-                Some(h) => out.push_str(&format!("<td>{h}</td>")),
+                Some((h, Some(bg))) => {
+                    out.push_str(&format!("<td style=\"background-color:{bg}\">{h}</td>"))
+                }
+                Some((h, None)) => out.push_str(&format!("<td>{h}</td>")),
                 None => out.push_str("<td></td>"),
             }
         }
@@ -944,6 +1108,11 @@ fn xlsx_sheet_table(xml: &str, shared: &[String]) -> String {
                     cell_text.clear();
                     cell_type = attr(&attrs, "t").unwrap_or("n").to_string();
                     cell_col = attr(&attrs, "r").map(col_of_ref).unwrap_or(0);
+                    // `c@s` is the cellXfs index → solid-fill colour, if any.
+                    cell_bg = attr(&attrs, "s")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .and_then(|i| fills.get(i))
+                        .and_then(|c| c.clone());
                     if sc {
                         in_cell = false;
                     }
@@ -971,7 +1140,7 @@ fn xlsx_sheet_table(xml: &str, shared: &[String]) -> String {
                         } else {
                             cell_text.clone()
                         };
-                        row_cells.push((cell_col, escaped(resolved.trim())));
+                        row_cells.push((cell_col, escaped(resolved.trim()), cell_bg.take()));
                     }
                     in_cell = false;
                 }
@@ -988,6 +1157,104 @@ fn xlsx_sheet_table(xml: &str, shared: &[String]) -> String {
     }
     out.push_str("</table>");
     out
+}
+
+/// Parse `xl/styles.xml` into a per-cell-style fill table: index `i` (a `c@s`
+/// value into `cellXfs`) → `Some("#RRGGBB")` when that style has a **solid**
+/// pattern fill with a usable colour, else `None`.
+///
+/// The chain is `cellXfs[i] → @fillId → fills[fillId] → patternFill@fgColor@rgb`.
+/// Only `patternType="solid"` fills with an explicit `fgColor rgb` (ARGB, the
+/// leading alpha byte stripped) are surfaced; `none`/`gray125` placeholders and
+/// theme-only colours yield `None`.
+fn parse_cell_fills(xml: &str) -> Vec<Option<String>> {
+    // Pass 1: fillId → colour. `fills` is an ordered list of `<fill>`.
+    let mut fill_colors: Vec<Option<String>> = Vec::new();
+    {
+        let mut x = Xml::new(xml);
+        let mut in_fills = false;
+        let mut cur: Option<String> = None;
+        let mut solid = false;
+        while let Some(tok) = x.next() {
+            match tok {
+                Tok::Open(name, attrs, sc) => match local(&name) {
+                    "fills" if !sc => in_fills = true,
+                    "patternFill" if in_fills => {
+                        solid = matches!(attr(&attrs, "patternType"), Some("solid"));
+                        // Some writers put fgColor as an attribute; usually a child.
+                        if solid {
+                            cur = argb_to_hex6(attr(&attrs, "fgColor"));
+                        }
+                    }
+                    "fgColor" if in_fills && solid => {
+                        if let Some(c) = argb_to_hex6(attr(&attrs, "rgb")) {
+                            cur = Some(c);
+                        }
+                    }
+                    _ => {}
+                },
+                Tok::Close(name) => match local(&name) {
+                    "fill" if in_fills => {
+                        fill_colors.push(cur.take());
+                        solid = false;
+                    }
+                    "fills" => in_fills = false,
+                    _ => {}
+                },
+                Tok::Text(_) => {}
+            }
+        }
+    }
+
+    // Pass 2: cellXfs order → fillId → colour.
+    let mut out: Vec<Option<String>> = Vec::new();
+    {
+        let mut x = Xml::new(xml);
+        let mut in_cellxfs = false;
+        while let Some(tok) = x.next() {
+            match tok {
+                Tok::Open(name, attrs, _) => match local(&name) {
+                    "cellXfs" => in_cellxfs = true,
+                    "xf" if in_cellxfs => {
+                        let color = attr(&attrs, "fillId")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .and_then(|fid| fill_colors.get(fid))
+                            .and_then(|c| c.clone());
+                        out.push(color);
+                    }
+                    _ => {}
+                },
+                Tok::Close(name) => {
+                    if local(&name) == "cellXfs" {
+                        in_cellxfs = false;
+                    }
+                }
+                Tok::Text(_) => {}
+            }
+        }
+    }
+    out
+}
+
+/// Convert an XLSX colour string to `#RRGGBB`, or `None`. XLSX `rgb` is ARGB
+/// (`FFFFFF00`); the leading alpha byte is dropped. A bare `RRGGBB` is also
+/// accepted. Fully-transparent (`00……`) and unparseable values yield `None`.
+fn argb_to_hex6(v: Option<&str>) -> Option<String> {
+    let s = v?.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    let (alpha, rgb) = match s.len() {
+        8 => (Some(&s[0..2]), &s[2..8]),
+        6 => (None, s),
+        _ => return None,
+    };
+    if !rgb.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Drop a fully transparent colour (alpha 00).
+    if alpha == Some("00") {
+        return None;
+    }
+    Some(format!("#{}", rgb.to_ascii_uppercase()))
 }
 
 /// Parse `xl/sharedStrings.xml` into an index→string table. Concatenates the
@@ -1354,7 +1621,7 @@ pub fn odt_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 
     let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
     let mut body = String::new();
-    odf_walk(&mut Xml::new(&content), zip, &styles, &mut body, None);
+    odf_walk(&mut Xml::new(&content), zip, &styles, &mut body, None, None);
     render_geom(&body, geom)
 }
 
@@ -1367,13 +1634,16 @@ fn odf_geom(styles_xml: &str, content_xml: &str, fallback: PageGeom) -> PageGeom
 }
 
 /// Recursive ODF text walker (shared by ODT body and table cells). `stop` ends
-/// the region. Handles `text:h`, `text:p`, `table:table`.
+/// the region. Handles `text:h`, `text:p`, `table:table`, and `text:list`
+/// (nested lists indent and bullet their paragraphs). `list_level` is `Some(n)`
+/// when walking inside a list (`n` = nesting depth, 0-based).
 fn odf_walk(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
     out: &mut String,
     stop: Option<&str>,
+    list_level: Option<u32>,
 ) {
     while let Some(tok) = x.next() {
         match tok {
@@ -1392,7 +1662,22 @@ fn odf_walk(
                     }
                     "p" if !sc => {
                         let inner = odf_inline(x, zip, styles, "p");
-                        out.push_str(&format!("<p>{inner}</p>"));
+                        match list_level {
+                            // A paragraph inside a list item → bullet + indent.
+                            Some(lvl) if !inner.trim().is_empty() => {
+                                let indent = (lvl as f64 + 1.0) * LIST_LEVEL_INDENT_PT;
+                                out.push_str(&format!(
+                                    "<p style=\"margin-left:{indent}pt\">\u{2022} {inner}</p>"
+                                ));
+                            }
+                            _ => out.push_str(&format!("<p>{inner}</p>")),
+                        }
+                    }
+                    // text:list nests; descend with a deeper level. text:list-item
+                    // is transparent — its paragraphs are handled at this level.
+                    "list" if !sc => {
+                        let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
+                        odf_walk(x, zip, styles, out, Some("list"), next);
                     }
                     "table" if !sc => odf_table(x, zip, styles, out),
                     _ => {}
@@ -1498,7 +1783,7 @@ fn odf_table(
                         .unwrap_or(1)
                         .min(64);
                     let mut cell = String::new();
-                    odf_walk(x, zip, styles, &mut cell, Some("table-cell"));
+                    odf_walk(x, zip, styles, &mut cell, Some("table-cell"), None);
                     let cell = cell.trim().to_string();
                     for _ in 0..repeat {
                         out.push_str("<td>");
@@ -2783,5 +3068,303 @@ mod tests {
             css.get("T1").map(String::as_str),
             Some("font-family:'Liberation Serif';")
         );
+    }
+
+    // ── P2/P3: line spacing, lists, cell merge, image data URIs, xlsx fills ──
+
+    #[test]
+    fn line_spacing_auto_and_exact() {
+        // auto: 240ths of a line — 360 → 1.5×.
+        assert_eq!(
+            line_spacing("360", Some("auto")),
+            Some(LineHeight::Multiple(1.5))
+        );
+        // no rule defaults to auto semantics.
+        assert_eq!(line_spacing("240", None), Some(LineHeight::Multiple(1.0)));
+        // exact/atLeast: twentieths of a point — 360 → 18pt.
+        assert_eq!(
+            line_spacing("360", Some("exact")),
+            Some(LineHeight::Points(18.0))
+        );
+        assert_eq!(
+            line_spacing("480", Some("atLeast")),
+            Some(LineHeight::Points(24.0))
+        );
+        assert!(line_spacing("0", Some("auto")).is_none());
+        assert!(line_spacing("x", None).is_none());
+    }
+
+    #[test]
+    fn docx_line_height_auto_injected() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:pPr><w:spacing w:line="360" w:lineRule="auto"/></w:pPr>
+              <w:r><w:t>Spaced</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("line-height:1.5"), "html: {html}");
+    }
+
+    #[test]
+    fn docx_line_height_exact_in_points() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:pPr><w:spacing w:line="480" w:lineRule="exact"/></w:pPr>
+              <w:r><w:t>Fixed</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("line-height:24pt"), "html: {html}");
+    }
+
+    #[test]
+    fn docx_list_bullet_and_indent() {
+        // ilvl 0 → 36pt; ilvl 1 → 72pt. Bullet prepended.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>
+              <w:r><w:t>First</w:t></w:r></w:p>
+            <w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="1"/></w:numPr></w:pPr>
+              <w:r><w:t>Nested</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("\u{2022} First"), "bullet on item: {html}");
+        assert!(html.contains("margin-left:36pt"), "ilvl0 indent: {html}");
+        assert!(html.contains("margin-left:72pt"), "ilvl1 indent: {html}");
+        // The whole document still renders to a valid PDF carrying the text.
+        let pdf = office_to_pdf(&build_docx(doc, None, &[])).expect("docx converts");
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("First") && text.contains("Nested"), "{text}");
+    }
+
+    #[test]
+    fn docx_list_indent_stacks_on_explicit_ind() {
+        // Explicit w:ind left 18pt + ilvl0 (36pt) → 54pt total.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:pPr>
+              <w:ind w:left="360"/>
+              <w:numPr><w:ilvl w:val="0"/></w:numPr>
+            </w:pPr><w:r><w:t>Item</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("margin-left:54pt"), "stacked indent: {html}");
+    }
+
+    #[test]
+    fn docx_gridspan_expands_to_physical_cells() {
+        // A 2-column gridSpan cell becomes "<td colspan=2>…</td><td></td>".
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:tbl>
+              <w:tr>
+                <w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Wide</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:p><w:r><w:t>L</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>R</w:t></w:r></w:p></w:tc>
+              </w:tr>
+            </w:tbl>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("colspan=\"2\""), "colspan emitted: {html}");
+        // The spanning cell carries the content; a single empty <td> pads the
+        // row to 2 physical columns so the equal-width layout spreads it.
+        assert!(
+            html.contains("Wide</p></td><td></td>"),
+            "padded cell: {html}"
+        );
+        let pdf = office_to_pdf(&build_docx(doc, None, &[])).expect("docx converts");
+        let text = norm(&opens(&pdf).to_text());
+        for needle in ["Wide", "L", "R"] {
+            assert!(text.contains(needle), "missing {needle:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn docx_vmerge_restart_and_continue() {
+        // restart → rowspan hint; continue cell is dropped (column preserved).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:tbl>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>Top</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>Hidden</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>Bottom</w:t></w:r></w:p></w:tc>
+              </w:tr>
+            </w:tbl>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("rowspan=\"2\""), "rowspan on restart: {html}");
+        // The continuation cell's content ("Hidden") is suppressed.
+        assert!(!html.contains("Hidden"), "covered cell dropped: {html}");
+        // Second row therefore has exactly one <td> (Bottom).
+        let pdf = office_to_pdf(&build_docx(doc, None, &[])).expect("docx converts");
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("Merged") && text.contains("Bottom"), "{text}");
+    }
+
+    #[test]
+    fn argb_strips_alpha_and_rejects_transparent() {
+        assert_eq!(argb_to_hex6(Some("FFFFFF00")), Some("#FFFF00".to_string()));
+        assert_eq!(argb_to_hex6(Some("ff00ff00")), Some("#00FF00".to_string()));
+        assert_eq!(argb_to_hex6(Some("00AABB")), Some("#00AABB".to_string()));
+        assert_eq!(argb_to_hex6(Some("#FF112233")), Some("#112233".to_string()));
+        assert!(argb_to_hex6(Some("00FFFFFF")).is_none(), "transparent");
+        assert!(argb_to_hex6(Some("xyz")).is_none());
+        assert!(argb_to_hex6(None).is_none());
+    }
+
+    #[test]
+    fn parse_cell_fills_maps_style_index_to_solid_colour() {
+        // cellXfs[0] → fillId 0 (none); [1] → fillId 2 (solid yellow).
+        let styles = r#"<styleSheet xmlns="s">
+          <fills count="3">
+            <fill><patternFill patternType="none"/></fill>
+            <fill><patternFill patternType="gray125"/></fill>
+            <fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill>
+          </fills>
+          <cellXfs count="2">
+            <xf numFmtId="0" fontId="0" fillId="0"/>
+            <xf numFmtId="0" fontId="0" fillId="2" applyFill="1"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let fills = parse_cell_fills(styles);
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0], None, "default style: no fill");
+        assert_eq!(fills[1], Some("#FFFF00".to_string()), "solid yellow");
+    }
+
+    #[test]
+    fn xlsx_cell_fill_becomes_background_color() {
+        // Hand-built XLSX where B1 uses a yellow solid fill (style index 1).
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "xl/workbook.xml",
+            br#"<workbook><sheets><sheet name="Painted" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        z.add_stored(
+            "xl/styles.xml",
+            br#"<styleSheet>
+              <fills count="3">
+                <fill><patternFill patternType="none"/></fill>
+                <fill><patternFill patternType="gray125"/></fill>
+                <fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/></patternFill></fill>
+              </fills>
+              <cellXfs count="2">
+                <xf fillId="0"/>
+                <xf fillId="2" applyFill="1"/>
+              </cellXfs>
+            </styleSheet>"#,
+        );
+        z.add_stored(
+            "xl/worksheets/sheet1.xml",
+            br#"<worksheet><sheetData>
+              <row r="1">
+                <c r="A1" t="inlineStr"><is><t>Plain</t></is></c>
+                <c r="B1" s="1" t="inlineStr"><is><t>Yellow</t></is></c>
+              </row>
+            </sheetData></worksheet>"#,
+        );
+        let xlsx = z.finish();
+        // Exercise the table HTML directly so we can assert on the colour.
+        let shared: Vec<String> = Vec::new();
+        let fills = parse_cell_fills(&String::from_utf8_lossy(&read_zip(&xlsx)["xl/styles.xml"]));
+        let sheet_xml =
+            String::from_utf8_lossy(&read_zip(&xlsx)["xl/worksheets/sheet1.xml"]).into_owned();
+        let table = xlsx_sheet_table(&sheet_xml, &shared, &fills);
+        assert!(
+            table.contains("background-color:#FFFF00"),
+            "B1 painted: {table}"
+        );
+        // And the inlineStr text is present.
+        assert!(
+            table.contains("Yellow") && table.contains("Plain"),
+            "{table}"
+        );
+        // Full pipeline still produces a valid PDF with the text.
+        let pdf = office_to_pdf(&xlsx).expect("xlsx converts");
+        let text = norm(&opens(&pdf).to_text());
+        assert!(
+            text.contains("Painted") && text.contains("Yellow"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn docx_image_embedded_as_data_uri() {
+        // The DOCX blip→rels→media path emits an <img src="data:image/png">.
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z"><w:body>
+            <w:p><w:r><w:drawing><a:blip r:embed="rId9"/></w:drawing></w:r></w:p>
+          </w:body></w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId9" Type="image" Target="media/logo.png"/>
+        </Relationships>"#;
+        let png = red_png();
+        let zip = {
+            let mut z = ZipWriter::new();
+            z.add_stored("word/document.xml", doc.as_bytes());
+            z.add_stored("word/_rels/document.xml.rels", rels.as_bytes());
+            z.add_stored("word/media/logo.png", &png);
+            read_zip(&z.finish())
+        };
+        let rmap = parse_rels(&String::from_utf8_lossy(
+            &zip["word/_rels/document.xml.rels"],
+        ));
+        let mut body = String::new();
+        docx_body(
+            &String::from_utf8_lossy(&zip["word/document.xml"]),
+            &zip,
+            &rmap,
+            &mut body,
+        );
+        assert!(
+            body.contains("<img src=\"data:image/png;base64,"),
+            "image embedded as data URI: {body}"
+        );
+    }
+
+    #[test]
+    fn odf_list_bullets_and_indents() {
+        // text:list → bulleted, indented paragraphs; nested list indents more.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+          <office:body><office:text>
+            <text:list>
+              <text:list-item><text:p>Alpha</text:p></text:list-item>
+              <text:list-item>
+                <text:list>
+                  <text:list-item><text:p>Beta</text:p></text:list-item>
+                </text:list>
+              </text:list-item>
+            </text:list>
+          </office:text></office:body>
+        </office:document-content>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
+        z.add_stored("content.xml", content.as_bytes());
+        let odt = z.finish();
+        // Inspect the generated body markup directly.
+        let zip = read_zip(&odt);
+        let styles = BTreeMap::new();
+        let mut body = String::new();
+        odf_walk(
+            &mut Xml::new(&String::from_utf8_lossy(&zip["content.xml"])),
+            &zip,
+            &styles,
+            &mut body,
+            None,
+            None,
+        );
+        assert!(
+            body.contains("\u{2022} Alpha"),
+            "bullet on top item: {body}"
+        );
+        assert!(
+            body.contains("\u{2022} Beta"),
+            "bullet on nested item: {body}"
+        );
+        assert!(body.contains("margin-left:36pt"), "level-0 indent: {body}");
+        assert!(body.contains("margin-left:72pt"), "level-1 indent: {body}");
+        // Full pipeline still renders both items.
+        let pdf = office_to_pdf(&odt).expect("odt converts");
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("Alpha") && text.contains("Beta"), "{text}");
     }
 }
