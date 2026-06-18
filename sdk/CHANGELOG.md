@@ -4,6 +4,16 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.52.2] - 2026-06-19
+
+### Added
+
+- **Read baked running headers/footers.** `GigaPdfDoc.headerFooter()` returns
+  `{ header, footer }` recovered from the `/GPHF` marked-content spans that
+  `setHeader`/`setFooter` write, so a host can detect whether a PDF already
+  carries a running header/footer (and recover its text) and reflect that in its
+  UI — the read complement to the existing writer.
+
 ## [0.52.1] - 2026-06-18
 
 ### Fixed
