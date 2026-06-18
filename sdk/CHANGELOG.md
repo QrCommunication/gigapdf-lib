@@ -4,6 +4,29 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.44.0] - 2026-06-18
+
+### Added
+
+- **Raw Type1 (PFB/PFA) font embedding.** Classic encrypted Type1 programs
+  (PDF `FontFile`, PFB, PFA) are parsed (eexec + charstring decryption),
+  transcoded to Type2 and embedded through the bare-CFF → OpenType path — the
+  last font format that required an external converter (FontForge).
+- **Bundled per-script OCR models + multi-language recognition.** The `.gpocr`
+  CRNN models ship under `models/`; `GigaPdfEngine.loadAllBundledOcrModels()`
+  (plus `loadBundledOcrModel` / `loadBundledOcrModels` and the `OcrScript` type)
+  load them so `doc.ocr` recognizes non-Latin scripts — Cyrillic, Greek, Arabic,
+  Urdu, Hebrew (the RTL group), Devanagari, Bengali, Tamil — routed per line by
+  the engine's script detector. The wasm still ships no weights.
+
+### Fixed
+
+- **Glyph counters are now hollow in `renderPage`.** Each glyph contour was
+  filled separately, painting counters (the holes in O, e, a, 0, 8, B…) solid.
+  Every contour of a glyph is now accumulated and filled once with the non-zero
+  winding rule, so inner contours carve out correctly — fixing blobby,
+  low-quality text in the rasterized page (editor background, OCR input).
+
 ## [0.43.0] - 2026-06-18
 
 ### Added
