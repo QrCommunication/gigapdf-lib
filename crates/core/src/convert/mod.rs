@@ -49,14 +49,51 @@ pub struct PlacedImage {
     pub height: f64,
 }
 
-/// A vector path element, reduced to its bounding rectangle (a structural hint
-/// — frames, table rules, separators).
+/// A vector path placed on a page, carrying both its geometry and the resolved
+/// paint state recovered from the PDF graphics state. The exporters draw the
+/// `segments` as a real path (top-down, origin top-left, points) when present;
+/// otherwise they fall back to the bounding rectangle (`x`/`y`/`width`/`height`),
+/// which always describes the same box. Frames, table rules and separators thus
+/// keep their actual fill/stroke colours instead of a hardcoded grey rectangle.
 #[derive(Debug, Clone)]
 pub struct PlacedShape {
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// Path geometry in top-down points (origin top-left), already Y-flipped from
+    /// PDF user space. Empty ⇒ the exporter emits the bounding rectangle instead.
+    pub segments: Vec<crate::content::vector::PathSeg>,
+    /// Fill colour (RGB `0..=1`) when the path is filled; `None` ⇒ no fill.
+    pub fill: Option<[f64; 3]>,
+    /// Stroke colour (RGB `0..=1`) when the path is stroked; `None` ⇒ no stroke.
+    pub stroke: Option<[f64; 3]>,
+    /// Stroke width in points.
+    pub stroke_width: f64,
+    /// Non-stroking (fill) alpha, `0..=1`.
+    pub fill_alpha: f64,
+    /// Stroking alpha, `0..=1`.
+    pub stroke_alpha: f64,
+    /// Dash pattern (point lengths); empty ⇒ solid line.
+    pub dash: Vec<f64>,
+}
+
+impl Default for PlacedShape {
+    fn default() -> Self {
+        PlacedShape {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            segments: Vec::new(),
+            fill: None,
+            stroke: None,
+            stroke_width: 1.0,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        }
+    }
 }
 
 /// One page's editable content in top-down points.

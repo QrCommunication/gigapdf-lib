@@ -1827,6 +1827,7 @@ impl Document {
     /// all the Office exporters — they reconstruct real objects from this, never
     /// a page raster.
     fn convert_pages(&self) -> Vec<crate::convert::ConvPage> {
+        use crate::content::vector::PathSeg;
         use crate::content::ElementKind;
         use crate::convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 
@@ -1841,6 +1842,14 @@ impl Document {
             let page_h = (media[3] - media[1]).abs();
 
             let elements = self.page_elements(page_no).unwrap_or_default();
+            // Vector paths carry the geometry + paint state (fill/stroke RGB,
+            // alpha, width, dash) the `ElementKind::Path` boxes drop. They come
+            // from the same top-level content stream as `elements`, but exclude
+            // clip-only / no-paint (`n`) paths — which the element walker keeps —
+            // so they cannot be zipped positionally against the Path elements.
+            // Shapes are therefore sourced solely from here (a single coherent
+            // source: correct colours, no stray grey rectangles for clip paths).
+            let vpaths = self.page_vector_paths(page_no).unwrap_or_default();
             let images = self.page_images(page_no);
             let font_styles = self.page_base_fonts(page_no);
             // Encode each referenced image once per page (a single XObject may be
@@ -1901,15 +1910,52 @@ impl Document {
                             });
                         }
                     }
-                    ElementKind::Path => {
-                        conv.shapes.push(PlacedShape {
-                            x: left,
-                            y: top,
-                            width: b.width,
-                            height: b.height,
-                        });
-                    }
+                    // Shapes are emitted from `vpaths` below (geometry + paint
+                    // state), not from these bounding-box-only Path elements.
+                    ElementKind::Path => {}
                 }
+            }
+
+            // Emit one enriched shape per painted vector path. Each path's points
+            // are in PDF user space (origin bottom-left); flip to top-down points
+            // matching the rest of the model: `x' = x - x0`, `y' = page_h - (y - y0)`.
+            // The bounding rectangle is flipped the same way the element loop does
+            // (anchor at the box's top-left), so the rect fallback stays exact.
+            for vp in &vpaths {
+                let segments: Vec<PathSeg> = vp
+                    .segments
+                    .iter()
+                    .map(|seg| match *seg {
+                        PathSeg::Move(x, y) => PathSeg::Move(x - x0, page_h - (y - y0)),
+                        PathSeg::Line(x, y) => PathSeg::Line(x - x0, page_h - (y - y0)),
+                        PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => PathSeg::Cubic(
+                            x1 - x0,
+                            page_h - (y1 - y0),
+                            x2 - x0,
+                            page_h - (y2 - y0),
+                            x3 - x0,
+                            page_h - (y3 - y0),
+                        ),
+                        PathSeg::Close => PathSeg::Close,
+                    })
+                    .collect();
+                let (x, y, width, height) = match vp.bounds {
+                    Some(b) => (b.x - x0, page_h - (b.y - y0) - b.height, b.width, b.height),
+                    None => continue,
+                };
+                conv.shapes.push(PlacedShape {
+                    x,
+                    y,
+                    width,
+                    height,
+                    segments,
+                    fill: vp.fill,
+                    stroke: vp.stroke,
+                    stroke_width: vp.stroke_width,
+                    fill_alpha: vp.fill_alpha,
+                    stroke_alpha: vp.stroke_alpha,
+                    dash: vp.dash.clone(),
+                });
             }
             pages.push(conv);
         }

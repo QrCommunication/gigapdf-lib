@@ -3,13 +3,14 @@
 //! Each `to_*` takes already-normalized [`ConvPage`]s (top-down points) and
 //! returns a complete `.odt`/`.docx`/`.pptx` byte stream via the [`super::zip`]
 //! container. Content is **native and editable**: a PDF show-text run becomes a
-//! placed text box, an image XObject a placed picture, a vector path a placed
-//! rectangle — never a flattened page raster.
+//! placed text box, an image XObject a placed picture, a vector path a real
+//! coloured shape (rectangle or custom path) — never a flattened page raster.
 
 use super::style::{Generic, TextStyle};
 use super::zip::ZipWriter;
-use super::{ConvPage, PlacedImage};
+use super::{ConvPage, PlacedImage, PlacedShape};
 use crate::content::num;
+use crate::content::vector::PathSeg;
 
 /// DOCX `<w:rPr>` run properties (fonts/bold/italic/colour/size) for a style.
 fn docx_run_props(style: &TextStyle, half_pt: i64) -> String {
@@ -107,6 +108,196 @@ fn esc(text: &str, out: &mut String) {
     }
 }
 
+// ───────────────────────────── shape paint helpers ─────────────────────────────
+
+/// An RGB triple (`0..=1`) as an upper-case `RRGGBB` hex string.
+fn shape_hex(rgb: [f64; 3]) -> String {
+    let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("{:02X}{:02X}{:02X}", q(rgb[0]), q(rgb[1]), q(rgb[2]))
+}
+
+/// Alpha (`0..=1`) as an ODF percentage string, e.g. `0.5` → `"50%"`.
+fn odf_opacity(a: f64) -> String {
+    format!("{}%", (a.clamp(0.0, 1.0) * 100.0).round() as i64)
+}
+
+/// Alpha (`0..=1`) as DrawingML thousandths-of-a-percent, e.g. `0.5` → `50000`.
+fn dml_alpha(a: f64) -> i64 {
+    (a.clamp(0.0, 1.0) * 100_000.0).round() as i64
+}
+
+/// True when the path is a single axis-aligned rectangle (the common case —
+/// `re`, or `m`/`l`×3/`h`). Such shapes are emitted as a plain rectangle (with
+/// the real colours) rather than a custom path.
+fn shape_is_rect(shape: &PlacedShape) -> bool {
+    let segs = &shape.segments;
+    if segs.is_empty() {
+        return true; // no geometry → fall back to the bounding rectangle
+    }
+    let core = if matches!(segs.last(), Some(PathSeg::Close)) {
+        &segs[..segs.len() - 1]
+    } else {
+        &segs[..]
+    };
+    if core.len() != 4 {
+        return false;
+    }
+    // First op a Move, the other three straight Lines, four corner points total.
+    let mut pts = [(0.0f64, 0.0f64); 4];
+    for (i, seg) in core.iter().enumerate() {
+        match (*seg, i) {
+            (PathSeg::Move(x, y), 0) => pts[0] = (x, y),
+            (PathSeg::Line(x, y), i) if i > 0 => pts[i] = (x, y),
+            _ => return false,
+        }
+    }
+    // Every edge is horizontal or vertical ⇒ axis-aligned rectangle.
+    (0..4).all(|i| {
+        let (ax, ay) = pts[i];
+        let (bx, by) = pts[(i + 1) % 4];
+        (ax - bx).abs() < 1e-3 || (ay - by).abs() < 1e-3
+    })
+}
+
+/// ODF `svg:d` path data (absolute, in points) for a top-down shape path.
+fn odf_path_d(segments: &[PathSeg]) -> String {
+    let mut d = String::new();
+    for seg in segments {
+        match *seg {
+            PathSeg::Move(x, y) => d.push_str(&format!("M {} {} ", num(x), num(y))),
+            PathSeg::Line(x, y) => d.push_str(&format!("L {} {} ", num(x), num(y))),
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => d.push_str(&format!(
+                "C {} {} {} {} {} {} ",
+                num(x1),
+                num(y1),
+                num(x2),
+                num(y2),
+                num(x3),
+                num(y3)
+            )),
+            PathSeg::Close => d.push_str("Z "),
+        }
+    }
+    d.trim_end().to_string()
+}
+
+/// Inline ODF `<style:style>` graphic properties for a shape's paint state.
+/// `name` is the autostyle id; the element references it via `draw:style-name`.
+fn odf_shape_style(name: &str, shape: &PlacedShape) -> String {
+    let mut p = String::from(
+        "<style:graphic-properties style:wrap=\"none\" style:horizontal-pos=\"from-left\" \
+style:horizontal-rel=\"page\" style:vertical-pos=\"from-top\" style:vertical-rel=\"page\" \
+style:flow-with-text=\"false\"",
+    );
+    match shape.fill {
+        Some(rgb) => {
+            p.push_str(&format!(
+                " draw:fill=\"solid\" draw:fill-color=\"#{}\"",
+                shape_hex(rgb)
+            ));
+            if shape.fill_alpha < 0.999 {
+                p.push_str(&format!(
+                    " draw:opacity=\"{}\"",
+                    odf_opacity(shape.fill_alpha)
+                ));
+            }
+        }
+        None => p.push_str(" draw:fill=\"none\""),
+    }
+    match shape.stroke {
+        Some(rgb) => {
+            p.push_str(&format!(
+                " draw:stroke=\"solid\" svg:stroke-width=\"{}pt\" svg:stroke-color=\"#{}\"",
+                num(shape.stroke_width.max(0.0)),
+                shape_hex(rgb)
+            ));
+            if shape.stroke_alpha < 0.999 {
+                p.push_str(&format!(
+                    " svg:stroke-opacity=\"{}\"",
+                    odf_opacity(shape.stroke_alpha)
+                ));
+            }
+        }
+        None => p.push_str(" draw:stroke=\"none\""),
+    }
+    p.push_str("/>");
+    format!("<style:style style:name=\"{name}\" style:family=\"graphic\">{p}</style:style>")
+}
+
+/// DrawingML `<a:custGeom>` for a shape path, with coordinates in EMU **relative
+/// to the shape's bounding box** (origin = the box's top-left). `w`/`h` are the
+/// box size in points (the geometry guide space). Used by DOCX and PPTX.
+fn dml_cust_geom(shape: &PlacedShape, w_pt: f64, h_pt: f64) -> String {
+    let cx = emu(w_pt.max(1.0));
+    let cy = emu(h_pt.max(1.0));
+    let mut path = String::new();
+    let ex = |x: f64| emu(x - shape.x);
+    let ey = |y: f64| emu(y - shape.y);
+    for seg in &shape.segments {
+        match *seg {
+            PathSeg::Move(x, y) => path.push_str(&format!(
+                "<a:moveTo><a:pt x=\"{}\" y=\"{}\"/></a:moveTo>",
+                ex(x),
+                ey(y)
+            )),
+            PathSeg::Line(x, y) => path.push_str(&format!(
+                "<a:lnTo><a:pt x=\"{}\" y=\"{}\"/></a:lnTo>",
+                ex(x),
+                ey(y)
+            )),
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => path.push_str(&format!(
+                "<a:cubicBezTo><a:pt x=\"{}\" y=\"{}\"/><a:pt x=\"{}\" y=\"{}\"/>\
+<a:pt x=\"{}\" y=\"{}\"/></a:cubicBezTo>",
+                ex(x1),
+                ey(y1),
+                ex(x2),
+                ey(y2),
+                ex(x3),
+                ey(y3)
+            )),
+            PathSeg::Close => path.push_str("<a:close/>"),
+        }
+    }
+    format!(
+        "<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/>\
+<a:rect l=\"0\" t=\"0\" r=\"{cx}\" b=\"{cy}\"/>\
+<a:pathLst><a:path w=\"{cx}\" h=\"{cy}\">{path}</a:path></a:pathLst></a:custGeom>"
+    )
+}
+
+/// DrawingML `<a:solidFill>`/`<a:noFill>` for a shape's fill.
+fn dml_fill(shape: &PlacedShape) -> String {
+    match shape.fill {
+        Some(rgb) => format!(
+            "<a:solidFill><a:srgbClr val=\"{}\"><a:alpha val=\"{}\"/></a:srgbClr></a:solidFill>",
+            shape_hex(rgb),
+            dml_alpha(shape.fill_alpha)
+        ),
+        None => "<a:noFill/>".to_string(),
+    }
+}
+
+/// DrawingML `<a:ln>` (outline) for a shape's stroke.
+fn dml_line(shape: &PlacedShape) -> String {
+    match shape.stroke {
+        Some(rgb) => {
+            let dash = if shape.dash.is_empty() {
+                String::new()
+            } else {
+                "<a:prstDash val=\"dash\"/>".to_string()
+            };
+            format!(
+                "<a:ln w=\"{}\"><a:solidFill><a:srgbClr val=\"{}\"><a:alpha val=\"{}\"/>\
+</a:srgbClr></a:solidFill>{dash}</a:ln>",
+                emu(shape.stroke_width.max(0.0)),
+                shape_hex(rgb),
+                dml_alpha(shape.stroke_alpha)
+            )
+        }
+        None => "<a:ln><a:noFill/></a:ln>".to_string(),
+    }
+}
+
 // ─────────────────────────────── ODT (ODF text) ───────────────────────────────
 
 /// Export pages to an OpenDocument Text (`.odt`) document.
@@ -188,10 +379,6 @@ draw:fill=\"none\" draw:stroke=\"none\" style:flow-with-text=\"false\"/></style:
 <style:style style:name=\"frI\" style:family=\"graphic\">\
 <style:graphic-properties style:wrap=\"none\" style:horizontal-pos=\"from-left\" \
 style:horizontal-rel=\"page\" style:vertical-pos=\"from-top\" style:vertical-rel=\"page\"/></style:style>\
-<style:style style:name=\"frS\" style:family=\"graphic\">\
-<style:graphic-properties style:wrap=\"none\" style:horizontal-pos=\"from-left\" \
-style:horizontal-rel=\"page\" style:vertical-pos=\"from-top\" style:vertical-rel=\"page\" \
-draw:fill=\"none\" draw:stroke=\"solid\" svg:stroke-width=\"0.5pt\" svg:stroke-color=\"#808080\"/></style:style>\
 <style:style style:name=\"Pg\" style:family=\"paragraph\"/>\
 <style:style style:name=\"PgB\" style:family=\"paragraph\">\
 <style:paragraph-properties fo:break-before=\"page\"/></style:style>",
@@ -246,15 +433,32 @@ xlink:actuate=\"onLoad\"/></draw:frame>",
         }
 
         for s in &page.shapes {
-            body.push_str(&format!(
-                "<draw:rect draw:style-name=\"frS\" text:anchor-type=\"page\" \
+            let style = format!("S{style_id}");
+            auto.push_str(&odf_shape_style(&style, s));
+            let (x, y) = (num(s.x), num(s.y));
+            let (w, h) = (num(s.width.max(1.0)), num(s.height.max(1.0)));
+            if shape_is_rect(s) {
+                body.push_str(&format!(
+                    "<draw:rect draw:style-name=\"{style}\" text:anchor-type=\"page\" \
 text:anchor-page-number=\"{page_no}\" draw:z-index=\"{z}\" \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>",
-                x = num(s.x),
-                y = num(s.y),
-                w = num(s.width.max(1.0)),
-                h = num(s.height.max(1.0)),
-            ));
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>"
+                ));
+            } else {
+                // `svg:d` is in absolute top-down points; the viewBox is offset by
+                // the box origin so those coordinates map straight onto the frame.
+                body.push_str(&format!(
+                    "<draw:path draw:style-name=\"{style}\" text:anchor-type=\"page\" \
+text:anchor-page-number=\"{page_no}\" draw:z-index=\"{z}\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
+svg:viewBox=\"{vbx} {vby} {vbw} {vbh}\" svg:d=\"{d}\"/>",
+                    vbx = num(s.x),
+                    vby = num(s.y),
+                    vbw = num(s.width.max(1.0)),
+                    vbh = num(s.height.max(1.0)),
+                    d = odf_path_d(&s.segments),
+                ));
+            }
+            style_id += 1;
             z += 1;
         }
 
@@ -360,10 +564,7 @@ fn odp_content_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage>)
 draw:auto-grow-width=\"false\" draw:auto-grow-height=\"false\" fo:padding=\"0pt\" \
 draw:textarea-vertical-align=\"top\"/></style:style>\
 <style:style style:name=\"frI\" style:family=\"graphic\">\
-<style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\"/></style:style>\
-<style:style style:name=\"frS\" style:family=\"graphic\">\
-<style:graphic-properties draw:fill=\"none\" draw:stroke=\"solid\" \
-svg:stroke-width=\"0.5pt\" svg:stroke-color=\"#808080\"/></style:style>",
+<style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\"/></style:style>",
     );
 
     let mut style_id = 0usize;
@@ -406,14 +607,28 @@ xlink:actuate=\"onLoad\"/></draw:frame>",
         }
 
         for s in &page.shapes {
-            body.push_str(&format!(
-                "<draw:rect draw:style-name=\"frS\" draw:layer=\"layout\" \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>",
-                x = num(s.x),
-                y = num(s.y),
-                w = num(s.width.max(1.0)),
-                h = num(s.height.max(1.0)),
-            ));
+            let style = format!("S{style_id}");
+            auto.push_str(&odf_shape_style(&style, s));
+            let (x, y) = (num(s.x), num(s.y));
+            let (w, h) = (num(s.width.max(1.0)), num(s.height.max(1.0)));
+            if shape_is_rect(s) {
+                body.push_str(&format!(
+                    "<draw:rect draw:style-name=\"{style}\" draw:layer=\"layout\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>"
+                ));
+            } else {
+                body.push_str(&format!(
+                    "<draw:path draw:style-name=\"{style}\" draw:layer=\"layout\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
+svg:viewBox=\"{vbx} {vby} {vbw} {vbh}\" svg:d=\"{d}\"/>",
+                    vbx = num(s.x),
+                    vby = num(s.y),
+                    vbw = num(s.width.max(1.0)),
+                    vbh = num(s.height.max(1.0)),
+                    d = odf_path_d(&s.segments),
+                ));
+            }
+            style_id += 1;
         }
 
         body.push_str("</draw:page>");
@@ -597,15 +812,22 @@ fn docx_document_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage
             id += 1;
         }
         for s in &page.shapes {
+            let geom = if shape_is_rect(s) {
+                "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>".to_string()
+            } else {
+                dml_cust_geom(s, s.width, s.height)
+            };
+            let sp_pr = format!(
+                "<wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>{geom}{fill}{ln}</wps:spPr>",
+                w = emu(s.width.max(1.0)),
+                h = emu(s.height.max(1.0)),
+                fill = dml_fill(s),
+                ln = dml_line(s),
+            );
             let inner = format!(
                 "<a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
 <wps:wsp xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
-<wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
-<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/>\
-<a:ln w=\"6350\"><a:solidFill><a:srgbClr val=\"808080\"/></a:solidFill></a:ln></wps:spPr>\
-<wps:bodyPr/></wps:wsp></a:graphicData>",
-                w = emu(s.width.max(1.0)),
-                h = emu(s.height.max(1.0)),
+<wps:cNvSpPr/>{sp_pr}<wps:bodyPr/></wps:wsp></a:graphicData>"
             );
             para.push_str(&docx_anchor(id, s.x, s.y, s.width, s.height, &inner));
             id += 1;
@@ -899,16 +1121,22 @@ fn pptx_slide_xml<'a>(
     }
 
     for s in &page.shapes {
-        tree.push_str(&format!(
-            "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"s{id}\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>\
-<p:spPr><a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
-<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/>\
-<a:ln w=\"6350\"><a:solidFill><a:srgbClr val=\"808080\"/></a:solidFill></a:ln></p:spPr>\
-<p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>",
+        let geom = if shape_is_rect(s) {
+            "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>".to_string()
+        } else {
+            dml_cust_geom(s, s.width, s.height)
+        };
+        let sp_pr = format!(
+            "<p:spPr><a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>{geom}{fill}{ln}</p:spPr>",
             x = emu(s.x),
             y = emu(s.y),
             w = emu(s.width.max(1.0)),
             h = emu(s.height.max(1.0)),
+            fill = dml_fill(s),
+            ln = dml_line(s),
+        );
+        tree.push_str(&format!(
+            "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"s{id}\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>{sp_pr}<p:txBody><a:bodyPr/><a:p/></p:txBody></p:sp>"
         ));
         id += 1;
     }
@@ -1360,11 +1588,17 @@ mod tests {
                 },
             }],
             images: Vec::new(),
+            // Axis-aligned rectangle (no explicit segments → rect fallback),
+            // green fill + blue stroke, to exercise the paint plumbing.
             shapes: vec![PlacedShape {
                 x: 50.0,
                 y: 50.0,
                 width: 100.0,
                 height: 80.0,
+                fill: Some([0.0, 1.0, 0.0]),
+                stroke: Some([0.0, 0.0, 1.0]),
+                stroke_width: 2.0,
+                ..PlacedShape::default()
             }],
         }]
     }
@@ -1646,5 +1880,156 @@ mod tests {
         );
         let styles = String::from_utf8(entry(&zip, "styles.xml").unwrap()).unwrap();
         assert!(styles.contains("style:master-page"), "master page present");
+    }
+
+    // ── shape geometry + colour fidelity (PDF→Office vectors) ──────────────────
+
+    /// A red-filled, blue-stroked axis-aligned rectangle (segments-less → rect
+    /// fallback), the common frame/table-rule case.
+    fn rect_shape_pages() -> Vec<ConvPage> {
+        vec![ConvPage {
+            width: 612.0,
+            height: 792.0,
+            shapes: vec![PlacedShape {
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: 60.0,
+                fill: Some([1.0, 0.0, 0.0]),
+                stroke: Some([0.0, 0.0, 1.0]),
+                stroke_width: 1.5,
+                ..PlacedShape::default()
+            }],
+            ..ConvPage::default()
+        }]
+    }
+
+    /// A non-rectangular path (triangle whose hypotenuse is a cubic), red fill,
+    /// to exercise the custom-geometry / `draw:path` branch.
+    fn path_shape_pages() -> Vec<ConvPage> {
+        vec![ConvPage {
+            width: 612.0,
+            height: 792.0,
+            shapes: vec![PlacedShape {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+                segments: vec![
+                    PathSeg::Move(0.0, 100.0),
+                    PathSeg::Line(100.0, 100.0),
+                    PathSeg::Cubic(80.0, 60.0, 40.0, 20.0, 0.0, 0.0),
+                    PathSeg::Close,
+                ],
+                fill: Some([1.0, 0.0, 0.0]),
+                stroke: Some([0.0, 0.0, 1.0]),
+                stroke_width: 2.0,
+                ..PlacedShape::default()
+            }],
+            ..ConvPage::default()
+        }]
+    }
+
+    #[test]
+    fn odt_rect_shape_carries_fill_and_stroke_colours() {
+        let zip = to_odt(&rect_shape_pages());
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(content.contains("<draw:rect "), "rect emitted, not a path");
+        assert!(
+            content.contains("draw:fill=\"solid\" draw:fill-color=\"#FF0000\""),
+            "red fill"
+        );
+        assert!(
+            content.contains("svg:stroke-color=\"#0000FF\""),
+            "blue stroke"
+        );
+        assert!(!content.contains("#808080"), "no hardcoded grey");
+    }
+
+    #[test]
+    fn odt_non_rect_shape_becomes_a_path() {
+        let zip = to_odt(&path_shape_pages());
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(content.contains("<draw:path "), "non-rect → draw:path");
+        assert!(content.contains("svg:d=\""), "path data present");
+        assert!(
+            content.contains("draw:fill-color=\"#FF0000\""),
+            "fill colour carried onto the path"
+        );
+    }
+
+    #[test]
+    fn docx_rect_shape_uses_prstgeom_with_colours() {
+        let zip = to_docx(&rect_shape_pages());
+        let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            doc.contains("<a:prstGeom prst=\"rect\">"),
+            "rect preset geom"
+        );
+        assert!(
+            doc.contains("<a:solidFill><a:srgbClr val=\"FF0000\">"),
+            "red fill"
+        );
+        assert!(
+            doc.contains("<a:srgbClr val=\"0000FF\">"),
+            "blue stroke colour"
+        );
+        assert!(!doc.contains("808080"), "no hardcoded grey");
+    }
+
+    #[test]
+    fn docx_non_rect_shape_emits_custom_geometry() {
+        let zip = to_docx(&path_shape_pages());
+        let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
+        assert!(doc.contains("<a:custGeom>"), "non-rect → custGeom");
+        assert!(doc.contains("<a:cubicBezTo>"), "cubic segment emitted");
+        assert!(doc.contains("<a:moveTo>") && doc.contains("<a:lnTo>"));
+        assert!(
+            doc.contains("<a:srgbClr val=\"FF0000\">"),
+            "fill colour carried"
+        );
+    }
+
+    #[test]
+    fn pptx_rect_shape_uses_prstgeom_with_colours() {
+        let zip = to_pptx(&rect_shape_pages());
+        let slide = String::from_utf8(entry(&zip, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide.contains("<a:prstGeom prst=\"rect\">"),
+            "rect preset geom"
+        );
+        assert!(
+            slide.contains("<a:solidFill><a:srgbClr val=\"FF0000\">"),
+            "red fill"
+        );
+        assert!(slide.contains("<a:srgbClr val=\"0000FF\">"), "blue stroke");
+        assert!(!slide.contains("808080"), "no hardcoded grey");
+    }
+
+    #[test]
+    fn pptx_non_rect_shape_emits_custom_geometry() {
+        let zip = to_pptx(&path_shape_pages());
+        let slide = String::from_utf8(entry(&zip, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(slide.contains("<a:custGeom>"), "non-rect → custGeom");
+        assert!(slide.contains("<a:cubicBezTo>"), "cubic segment emitted");
+        assert!(
+            slide.contains("<a:srgbClr val=\"FF0000\">"),
+            "fill colour carried"
+        );
+    }
+
+    #[test]
+    fn odp_shape_carries_colours() {
+        let zip = to_odp(&rect_shape_pages());
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("draw:fill-color=\"#FF0000\""),
+            "red fill on the slide shape"
+        );
+        assert!(
+            content.contains("svg:stroke-color=\"#0000FF\""),
+            "blue stroke"
+        );
+        assert!(!content.contains("#808080"), "no hardcoded grey");
     }
 }
