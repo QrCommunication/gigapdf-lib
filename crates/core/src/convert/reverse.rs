@@ -341,6 +341,295 @@ pub fn to_rtf(paragraphs: &[String]) -> Vec<u8> {
     s.into_bytes()
 }
 
+// ─────────────────────────────── model → RTF ───────────────────────────────
+
+use crate::model::{
+    Block, BlockKind, CharStyle, Document, Heading, Inline, List, Paragraph, Table,
+};
+
+/// Serialize a unified [`Document`] to RTF with real paragraph breaks and
+/// character styling (bold/italic/underline/strike/size/colour). Headings,
+/// lists and tables are flattened to styled paragraphs (an RTF reader gets the
+/// full text with formatting; a true `\trowd` table grid is out of scope here).
+pub fn rtf_from_model(doc: &Document) -> Vec<u8> {
+    // Collect the distinct run colours into the RTF colour table; runs reference
+    // a colour by 1-based index (`\cfN`).
+    let mut colors: Vec<[u8; 3]> = Vec::new();
+    collect_colors(doc, &mut colors);
+
+    let mut color_tbl = String::from("{\\colortbl;");
+    for c in &colors {
+        color_tbl.push_str(&format!("\\red{}\\green{}\\blue{};", c[0], c[1], c[2]));
+    }
+    color_tbl.push('}');
+
+    let mut s = format!("{{\\rtf1\\ansi\\deff0{{\\fonttbl{{\\f0 Helvetica;}}}}{color_tbl}\\fs22\n");
+    let mut first = true;
+    rtf_blocks_from_model(&collect_blocks(doc), &colors, &mut first, &mut s);
+    s.push_str("}\n");
+    s.into_bytes()
+}
+
+/// All top-level blocks across the document's sections/pages (header first,
+/// footer last) flattened into one sequence.
+fn collect_blocks(doc: &Document) -> Vec<Block> {
+    let mut out = Vec::new();
+    if let Some(h) = doc.sections.first().and_then(|s| s.header.as_ref()) {
+        out.extend(h.iter().cloned());
+    }
+    for section in &doc.sections {
+        for page in &section.pages {
+            out.extend(page.blocks.iter().cloned());
+        }
+    }
+    if let Some(f) = doc.sections.first().and_then(|s| s.footer.as_ref()) {
+        out.extend(f.iter().cloned());
+    }
+    out
+}
+
+fn collect_colors(doc: &Document, colors: &mut Vec<[u8; 3]>) {
+    for b in collect_blocks(doc) {
+        collect_block_colors(&b, colors);
+    }
+}
+
+fn collect_block_colors(block: &Block, colors: &mut Vec<[u8; 3]>) {
+    match &block.kind {
+        BlockKind::Paragraph(p) => collect_para_colors(p, colors),
+        BlockKind::Heading(h) => collect_para_colors(&h.para, colors),
+        BlockKind::List(list) => {
+            for item in &list.items {
+                for b in &item.blocks {
+                    collect_block_colors(b, colors);
+                }
+            }
+        }
+        BlockKind::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for b in &cell.blocks {
+                        collect_block_colors(b, colors);
+                    }
+                }
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            for b in &tb.blocks {
+                collect_block_colors(b, colors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_para_colors(para: &Paragraph, colors: &mut Vec<[u8; 3]>) {
+    for r in &para.runs {
+        collect_inline_colors(r, colors);
+    }
+}
+
+fn collect_inline_colors(inline: &Inline, colors: &mut Vec<[u8; 3]>) {
+    match inline {
+        Inline::Run(run) => {
+            if let Some(c) = rtf_run_color(&run.style) {
+                if !colors.contains(&c) {
+                    colors.push(c);
+                }
+            }
+        }
+        Inline::Link { children, .. } => {
+            for c in children {
+                collect_inline_colors(c, colors);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A run's colour as an RGB byte triple, when set and not (near-)black.
+fn rtf_run_color(style: &CharStyle) -> Option<[u8; 3]> {
+    match style.color {
+        Some([r, g, b]) if r > 0.02 || g > 0.02 || b > 0.02 => {
+            let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+            Some([q(r), q(g), q(b)])
+        }
+        _ => None,
+    }
+}
+
+fn rtf_blocks_from_model(blocks: &[Block], colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+    for b in blocks {
+        rtf_block_from_model(b, colors, first, out);
+    }
+}
+
+fn rtf_block_from_model(block: &Block, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+    match &block.kind {
+        BlockKind::Paragraph(p) => rtf_para_from_model(p, colors, false, first, out),
+        BlockKind::Heading(h) => rtf_heading_from_model(h, colors, first, out),
+        BlockKind::List(list) => rtf_list_from_model(list, colors, first, out),
+        BlockKind::Table(table) => rtf_table_from_model(table, colors, first, out),
+        BlockKind::TextBox(tb) => rtf_blocks_from_model(&tb.blocks, colors, first, out),
+        BlockKind::Sheet(sb) => {
+            for sheet in &sb.sheets {
+                for row in &sheet.rows {
+                    let line = row
+                        .cells
+                        .iter()
+                        .map(|c| match &c.value {
+                            crate::model::CellValue::Empty => String::new(),
+                            crate::model::CellValue::Text(t) => t.clone(),
+                            crate::model::CellValue::Number(n) => crate::content::num(*n),
+                            crate::model::CellValue::Bool(b) => {
+                                if *b { "TRUE" } else { "FALSE" }.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\t");
+                    rtf_plain_line(&line, first, out);
+                }
+            }
+        }
+        BlockKind::Slide(sb) => {
+            for slide in &sb.slides {
+                for ph in &slide.placeholders {
+                    rtf_block_from_model(&ph.block, colors, first, out);
+                }
+            }
+        }
+        BlockKind::Image(_) | BlockKind::Shape(_) => {}
+    }
+}
+
+fn rtf_par_sep(first: &mut bool, out: &mut String) {
+    if *first {
+        *first = false;
+    } else {
+        out.push_str("\\par\n");
+    }
+}
+
+fn rtf_plain_line(text: &str, first: &mut bool, out: &mut String) {
+    rtf_par_sep(first, out);
+    rtf_escape(text, out);
+}
+
+fn rtf_para_from_model(
+    para: &Paragraph,
+    colors: &[[u8; 3]],
+    force_bold: bool,
+    first: &mut bool,
+    out: &mut String,
+) {
+    rtf_par_sep(first, out);
+    // Paragraph alignment control word.
+    match para.style.align {
+        crate::model::Align::Left => {}
+        crate::model::Align::Center => out.push_str("\\qc "),
+        crate::model::Align::Right => out.push_str("\\qr "),
+        crate::model::Align::Justify => out.push_str("\\qj "),
+    }
+    for r in &para.runs {
+        rtf_inline_from_model(r, colors, force_bold, out);
+    }
+}
+
+fn rtf_inline_from_model(inline: &Inline, colors: &[[u8; 3]], force_bold: bool, out: &mut String) {
+    match inline {
+        Inline::Run(run) => {
+            if run.text.is_empty() {
+                return;
+            }
+            out.push('{');
+            rtf_char_controls(&run.style, colors, force_bold, out);
+            rtf_escape(&run.text, out);
+            out.push('}');
+        }
+        Inline::LineBreak => out.push_str("\\line "),
+        Inline::Image(_) => {}
+        Inline::Link { children, .. } => {
+            for c in children {
+                rtf_inline_from_model(c, colors, force_bold, out);
+            }
+        }
+    }
+}
+
+/// RTF character control words for a run, opening a styled group.
+fn rtf_char_controls(style: &CharStyle, colors: &[[u8; 3]], force_bold: bool, out: &mut String) {
+    if style.bold || force_bold {
+        out.push_str("\\b");
+    }
+    if style.italic {
+        out.push_str("\\i");
+    }
+    if style.underline {
+        out.push_str("\\ul");
+    }
+    if style.strike {
+        out.push_str("\\strike");
+    }
+    if style.size_pt > 0.0 {
+        // RTF font size is in half-points.
+        out.push_str(&format!(
+            "\\fs{}",
+            (style.size_pt * 2.0).round().max(1.0) as i64
+        ));
+    }
+    if let Some(c) = rtf_run_color(style) {
+        if let Some(idx) = colors.iter().position(|x| *x == c) {
+            out.push_str(&format!("\\cf{}", idx + 1)); // 1-based (0 = default)
+        }
+    }
+    out.push(' ');
+}
+
+fn rtf_heading_from_model(h: &Heading, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+    // Headings render bold; the level is conveyed by the bold styling + text.
+    rtf_para_from_model(&h.para, colors, true, first, out);
+}
+
+fn rtf_list_from_model(list: &List, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+    for item in &list.items {
+        for (i, b) in item.blocks.iter().enumerate() {
+            if i == 0 {
+                if let BlockKind::Paragraph(p) = &b.kind {
+                    rtf_par_sep(first, out);
+                    out.push_str("\\bullet  ");
+                    for r in &p.runs {
+                        rtf_inline_from_model(r, colors, false, out);
+                    }
+                    continue;
+                }
+            }
+            rtf_block_from_model(b, colors, first, out);
+        }
+    }
+}
+
+fn rtf_table_from_model(table: &Table, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+    // Flatten each row to a tab-separated styled line.
+    for row in &table.rows {
+        rtf_par_sep(first, out);
+        let mut firstcell = true;
+        for cell in &row.cells {
+            if firstcell {
+                firstcell = false;
+            } else {
+                out.push_str("\\tab ");
+            }
+            for b in &cell.blocks {
+                if let BlockKind::Paragraph(p) = &b.kind {
+                    for r in &p.runs {
+                        rtf_inline_from_model(r, colors, false, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Extract plain text paragraphs from an RTF document (minimal control-word
 /// parser: handles groups, `\par`, `\'xx` hex bytes, `\uN` unicode, skips other
 /// control words and the font/color tables).

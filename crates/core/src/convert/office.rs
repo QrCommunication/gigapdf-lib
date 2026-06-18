@@ -92,7 +92,7 @@ fn pptx_run_props(style: &TextStyle, sz: i64) -> String {
 }
 
 /// Append `text` with XML metacharacters escaped.
-fn esc(text: &str, out: &mut String) {
+pub(super) fn esc(text: &str, out: &mut String) {
     for ch in text.chars() {
         match ch {
             '&' => out.push_str("&amp;"),
@@ -111,7 +111,7 @@ fn esc(text: &str, out: &mut String) {
 // ───────────────────────────── shape paint helpers ─────────────────────────────
 
 /// An RGB triple (`0..=1`) as an upper-case `RRGGBB` hex string.
-fn shape_hex(rgb: [f64; 3]) -> String {
+pub(super) fn shape_hex(rgb: [f64; 3]) -> String {
     let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("{:02X}{:02X}{:02X}", q(rgb[0]), q(rgb[1]), q(rgb[2]))
 }
@@ -129,7 +129,7 @@ fn dml_alpha(a: f64) -> i64 {
 /// True when the path is a single axis-aligned rectangle (the common case —
 /// `re`, or `m`/`l`×3/`h`). Such shapes are emitted as a plain rectangle (with
 /// the real colours) rather than a custom path.
-fn shape_is_rect(shape: &PlacedShape) -> bool {
+pub(super) fn shape_is_rect(shape: &PlacedShape) -> bool {
     let segs = &shape.segments;
     if segs.is_empty() {
         return true; // no geometry → fall back to the bounding rectangle
@@ -160,7 +160,7 @@ fn shape_is_rect(shape: &PlacedShape) -> bool {
 }
 
 /// ODF `svg:d` path data (absolute, in points) for a top-down shape path.
-fn odf_path_d(segments: &[PathSeg]) -> String {
+pub(super) fn odf_path_d(segments: &[PathSeg]) -> String {
     let mut d = String::new();
     for seg in segments {
         match *seg {
@@ -217,7 +217,7 @@ draw:dots1=\"1\" draw:dots1-length=\"{onl}cm\" draw:distance=\"{offl}cm\"/>",
 /// `name` is the autostyle id; the element references it via `draw:style-name`.
 /// When the shape is dashed, a sibling [`odf_stroke_dash`] definition is
 /// prepended and referenced via `draw:stroke-dash`.
-fn odf_shape_style(name: &str, shape: &PlacedShape) -> String {
+pub(super) fn odf_shape_style(name: &str, shape: &PlacedShape) -> String {
     let mut p = String::from(
         "<style:graphic-properties style:wrap=\"none\" style:horizontal-pos=\"from-left\" \
 style:horizontal-rel=\"page\" style:vertical-pos=\"from-top\" style:vertical-rel=\"page\" \
@@ -277,7 +277,7 @@ style:flow-with-text=\"false\"",
 /// DrawingML `<a:custGeom>` for a shape path, with coordinates in EMU **relative
 /// to the shape's bounding box** (origin = the box's top-left). `w`/`h` are the
 /// box size in points (the geometry guide space). Used by DOCX and PPTX.
-fn dml_cust_geom(shape: &PlacedShape, w_pt: f64, h_pt: f64) -> String {
+pub(super) fn dml_cust_geom(shape: &PlacedShape, w_pt: f64, h_pt: f64) -> String {
     let cx = emu(w_pt.max(1.0));
     let cy = emu(h_pt.max(1.0));
     let mut path = String::new();
@@ -316,7 +316,7 @@ fn dml_cust_geom(shape: &PlacedShape, w_pt: f64, h_pt: f64) -> String {
 }
 
 /// DrawingML `<a:solidFill>`/`<a:noFill>` for a shape's fill.
-fn dml_fill(shape: &PlacedShape) -> String {
+pub(super) fn dml_fill(shape: &PlacedShape) -> String {
     match shape.fill {
         Some(rgb) => format!(
             "<a:solidFill><a:srgbClr val=\"{}\"><a:alpha val=\"{}\"/></a:srgbClr></a:solidFill>",
@@ -358,7 +358,7 @@ fn dml_dash(shape: &PlacedShape) -> String {
 }
 
 /// DrawingML `<a:ln>` (outline) for a shape's stroke.
-fn dml_line(shape: &PlacedShape) -> String {
+pub(super) fn dml_line(shape: &PlacedShape) -> String {
     match shape.stroke {
         Some(rgb) => {
             format!(
@@ -730,11 +730,11 @@ xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
 /// English Metric Units per point (914400 EMU/inch ÷ 72 pt/inch).
 const EMU_PER_PT: f64 = 12700.0;
 
-fn emu(points: f64) -> i64 {
+pub(super) fn emu(points: f64) -> i64 {
     (points * EMU_PER_PT).round() as i64
 }
 
-fn twips(points: f64) -> i64 {
+pub(super) fn twips(points: f64) -> i64 {
     (points * 20.0).round() as i64
 }
 
@@ -939,7 +939,7 @@ xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
 // ─────────────────────────────── PPTX (OOXML) ───────────────────────────────
 
 /// A minimal, valid Office theme (required by the slide-master chain).
-const PPTX_THEME: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+pub(super) const PPTX_THEME: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office Theme\">\
 <a:themeElements><a:clrScheme name=\"Office\">\
 <a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/></a:dk1>\
@@ -966,7 +966,7 @@ const PPTX_THEME: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"
 <a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill></a:bgFillStyleLst>\
 </a:fmtScheme></a:themeElements></a:theme>";
 
-const PPTX_MASTER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+pub(super) const PPTX_MASTER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <p:sldMaster xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
 xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">\
@@ -977,7 +977,7 @@ xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">\
 accent3=\"accent3\" accent4=\"accent4\" accent5=\"accent5\" accent6=\"accent6\" hlink=\"hlink\" folHlink=\"folHlink\"/>\
 <p:sldLayoutIdLst><p:sldLayoutId id=\"2147483649\" r:id=\"rId1\"/></p:sldLayoutIdLst></p:sldMaster>";
 
-const PPTX_LAYOUT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+pub(super) const PPTX_LAYOUT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <p:sldLayout xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
 xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" type=\"blank\" preserve=\"1\">\
@@ -1231,7 +1231,7 @@ xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">\
 // ─────────────────────────────── XLSX (OOXML) ───────────────────────────────
 
 /// Spreadsheet column letters for a 0-based index: 0→A, 25→Z, 26→AA …
-fn col_letter(mut index: usize) -> String {
+pub(super) fn col_letter(mut index: usize) -> String {
     let mut letters = Vec::new();
     loop {
         letters.push(b'A' + (index % 26) as u8);

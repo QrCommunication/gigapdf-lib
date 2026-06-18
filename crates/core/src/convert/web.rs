@@ -95,6 +95,334 @@ img{position:absolute}</style></head><body>",
     html
 }
 
+// ───────────────────────────── model → semantic HTML ─────────────────────────────
+
+use crate::model::CellValue;
+use crate::model::{
+    Align, Block, BlockKind, Cell, CharStyle, Document, ImageRef, Inline, LinkTarget, List,
+    ListMarker, Paragraph, Shape, Sheet, SheetBlock, Slide, SlideBlock, Table,
+};
+
+/// Convert a unified [`Document`] to **semantic, reflowable** HTML: headings
+/// become `<h1>`..`<h6>`, paragraphs `<p>`, lists `<ul>`/`<ol>` with `<li>`,
+/// tables real `<table>`/`<tr>`/`<td>` (with `colspan`/`rowspan`), inline runs
+/// styled `<span>`s, links `<a href>`, and images `<img>` data-URIs. Unlike
+/// [`to_html`] (absolutely-positioned PDF text boxes) this is flowing markup an
+/// author could edit.
+pub fn html_from_model(doc: &Document) -> String {
+    let mut html = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
+    if let Some(lang) = &doc.meta.lang {
+        // Re-open the <html> tag with the language; simplest is to inject it.
+        html = html.replace("<html>", &format!("<html lang=\"{}\">", attr_esc(lang)));
+    }
+    if let Some(title) = &doc.meta.title {
+        let mut t = String::new();
+        esc(title, &mut t);
+        html.push_str(&format!("<title>{t}</title>"));
+    }
+    html.push_str(
+        "<style>body{font-family:sans-serif;max-width:50em;margin:2em auto;padding:0 1em}\
+table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.25em .5em}\
+img{max-width:100%}</style></head><body>",
+    );
+    for section in &doc.sections {
+        if let Some(header) = &section.header {
+            html.push_str("<header>");
+            html_blocks(header, doc, &mut html);
+            html.push_str("</header>");
+        }
+        for page in &section.pages {
+            html_blocks(&page.blocks, doc, &mut html);
+        }
+        if let Some(footer) = &section.footer {
+            html.push_str("<footer>");
+            html_blocks(footer, doc, &mut html);
+            html.push_str("</footer>");
+        }
+    }
+    html.push_str("</body></html>");
+    html
+}
+
+/// Escape a string for use inside a double-quoted HTML attribute.
+fn attr_esc(s: &str) -> String {
+    let mut out = String::new();
+    esc(s, &mut out);
+    out
+}
+
+fn html_blocks(blocks: &[Block], doc: &Document, out: &mut String) {
+    for b in blocks {
+        html_block(b, doc, out);
+    }
+}
+
+fn html_block(block: &Block, doc: &Document, out: &mut String) {
+    match &block.kind {
+        BlockKind::Paragraph(p) => {
+            out.push_str(&format!("<p{}>", para_style_attr(p)));
+            html_inlines(&p.runs, doc, out);
+            out.push_str("</p>");
+        }
+        BlockKind::Heading(h) => {
+            let lvl = h.level.clamp(1, 6);
+            out.push_str(&format!("<h{lvl}{}>", para_style_attr(&h.para)));
+            html_inlines(&h.para.runs, doc, out);
+            out.push_str(&format!("</h{lvl}>"));
+        }
+        BlockKind::List(list) => html_list(list, doc, out),
+        BlockKind::Table(table) => html_table(table, doc, out),
+        BlockKind::Image(img) => html_image(img, doc, out),
+        BlockKind::Shape(shape) => html_shape(shape, out),
+        BlockKind::TextBox(tb) => {
+            out.push_str("<div>");
+            html_blocks(&tb.blocks, doc, out);
+            out.push_str("</div>");
+        }
+        BlockKind::Sheet(sb) => html_sheet(sb, out),
+        BlockKind::Slide(sb) => html_slides(sb, doc, out),
+    }
+}
+
+/// A `style="…"` attribute for a paragraph's alignment (only when not the
+/// default left), else empty.
+fn para_style_attr(p: &Paragraph) -> String {
+    match p.style.align {
+        Align::Left => String::new(),
+        Align::Center => " style=\"text-align:center\"".to_string(),
+        Align::Right => " style=\"text-align:right\"".to_string(),
+        Align::Justify => " style=\"text-align:justify\"".to_string(),
+    }
+}
+
+fn html_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
+    for r in runs {
+        match r {
+            Inline::Run(run) => {
+                if run.text.is_empty() {
+                    continue;
+                }
+                let style = char_style_css(&run.style);
+                if style.is_empty() {
+                    esc(&run.text, out);
+                } else {
+                    out.push_str(&format!("<span style=\"{style}\">"));
+                    esc(&run.text, out);
+                    out.push_str("</span>");
+                }
+            }
+            Inline::LineBreak => out.push_str("<br/>"),
+            Inline::Image(img) => html_image_inline(img, doc, out),
+            Inline::Link { href, children } => {
+                let target = match href {
+                    LinkTarget::Url(u) => attr_esc(u),
+                    LinkTarget::Page(p) => format!("#page{p}"),
+                };
+                out.push_str(&format!("<a href=\"{target}\">"));
+                html_inlines(children, doc, out);
+                out.push_str("</a>");
+            }
+        }
+    }
+}
+
+/// Inline CSS for a [`CharStyle`] (font/size/weight/style/decoration/colour).
+fn char_style_css(style: &CharStyle) -> String {
+    let mut css = String::new();
+    if !style.family.is_empty() {
+        css.push_str(&format!(
+            "font-family:'{}',{}",
+            attr_esc(&style.family),
+            style.generic.css()
+        ));
+    }
+    if style.size_pt > 0.0 {
+        css.push_str(&format!(";font-size:{}pt", n(style.size_pt)));
+    }
+    if style.bold {
+        css.push_str(";font-weight:bold");
+    }
+    if style.italic {
+        css.push_str(";font-style:italic");
+    }
+    let mut decos = Vec::new();
+    if style.underline {
+        decos.push("underline");
+    }
+    if style.strike {
+        decos.push("line-through");
+    }
+    if !decos.is_empty() {
+        css.push_str(&format!(";text-decoration:{}", decos.join(" ")));
+    }
+    if let Some([r, g, b]) = style.color {
+        if r > 0.02 || g > 0.02 || b > 0.02 {
+            let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+            css.push_str(&format!(";color:#{:02X}{:02X}{:02X}", q(r), q(g), q(b)));
+        }
+    }
+    css.trim_start_matches(';').to_string()
+}
+
+fn html_list(list: &List, doc: &Document, out: &mut String) {
+    let tag = if list.ordered { "ol" } else { "ul" };
+    let type_attr = if list.ordered {
+        match list.marker {
+            ListMarker::LowerAlpha => " type=\"a\"",
+            ListMarker::UpperAlpha => " type=\"A\"",
+            ListMarker::LowerRoman => " type=\"i\"",
+            ListMarker::UpperRoman => " type=\"I\"",
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    out.push_str(&format!("<{tag}{type_attr}>"));
+    for item in &list.items {
+        out.push_str("<li>");
+        html_blocks(&item.blocks, doc, out);
+        out.push_str("</li>");
+    }
+    out.push_str(&format!("</{tag}>"));
+}
+
+fn html_table(table: &Table, doc: &Document, out: &mut String) {
+    out.push_str("<table>");
+    if !table.col_widths.is_empty() {
+        out.push_str("<colgroup>");
+        for w in &table.col_widths {
+            if *w > 0.0 {
+                out.push_str(&format!("<col style=\"width:{}pt\"/>", n(*w)));
+            } else {
+                out.push_str("<col/>");
+            }
+        }
+        out.push_str("</colgroup>");
+    }
+    for row in &table.rows {
+        out.push_str("<tr>");
+        for cell in &row.cells {
+            html_cell(cell, doc, out);
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</table>");
+}
+
+fn html_cell(cell: &Cell, doc: &Document, out: &mut String) {
+    let mut attrs = String::new();
+    if cell.col_span > 1 {
+        attrs.push_str(&format!(" colspan=\"{}\"", cell.col_span));
+    }
+    if cell.row_span > 1 {
+        attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
+    }
+    if let Some([r, g, b]) = cell.shading {
+        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        attrs.push_str(&format!(
+            " style=\"background-color:#{:02X}{:02X}{:02X}\"",
+            q(r),
+            q(g),
+            q(b)
+        ));
+    }
+    out.push_str(&format!("<td{attrs}>"));
+    html_blocks(&cell.blocks, doc, out);
+    out.push_str("</td>");
+}
+
+fn html_image(img: &ImageRef, doc: &Document, out: &mut String) {
+    out.push_str("<p>");
+    html_image_inline(img, doc, out);
+    out.push_str("</p>");
+}
+
+fn html_image_inline(img: &ImageRef, doc: &Document, out: &mut String) {
+    let Some(res) = doc.resources.images.get(&img.resource) else {
+        return;
+    };
+    let mime = match res.format.as_str() {
+        "jpeg" | "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    let alt = attr_esc(img.alt.as_deref().unwrap_or(""));
+    out.push_str(&format!(
+        "<img alt=\"{alt}\" src=\"data:{mime};base64,{}\"/>",
+        base64(&res.bytes)
+    ));
+}
+
+fn html_shape(shape: &Shape, out: &mut String) {
+    // A reflowable document can't position a vector path meaningfully; render a
+    // small bordered box carrying the fill colour so the shape is not lost.
+    let mut style = String::from("display:inline-block;width:1em;height:1em;border:1px solid #888");
+    if let Some([r, g, b]) = shape.fill {
+        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        style.push_str(&format!(
+            ";background:#{:02X}{:02X}{:02X}",
+            q(r),
+            q(g),
+            q(b)
+        ));
+    }
+    out.push_str(&format!("<span style=\"{style}\"></span>"));
+}
+
+fn html_sheet(sheet: &SheetBlock, out: &mut String) {
+    for s in &sheet.sheets {
+        html_sheet_table(s, out);
+    }
+}
+
+fn html_sheet_table(sheet: &Sheet, out: &mut String) {
+    out.push_str("<table>");
+    for row in &sheet.rows {
+        out.push_str("<tr>");
+        for cell in &row.cells {
+            let mut style = String::new();
+            if let Some([r, g, b]) = cell.fill {
+                let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+                style = format!(
+                    " style=\"background-color:#{:02X}{:02X}{:02X}\"",
+                    q(r),
+                    q(g),
+                    q(b)
+                );
+            }
+            out.push_str(&format!("<td{style}>"));
+            let text = match &cell.value {
+                CellValue::Empty => String::new(),
+                CellValue::Text(t) => t.clone(),
+                CellValue::Number(num) => crate::content::num(*num),
+                CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            };
+            esc(&text, out);
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</table>");
+}
+
+fn html_slides(slides: &SlideBlock, doc: &Document, out: &mut String) {
+    for slide in &slides.slides {
+        html_slide(slide, doc, out);
+    }
+}
+
+fn html_slide(slide: &Slide, doc: &Document, out: &mut String) {
+    out.push_str("<section>");
+    for ph in &slide.placeholders {
+        html_block(&ph.block, doc, out);
+    }
+    for sh in &slide.shapes {
+        html_block(sh, doc, out);
+    }
+    out.push_str("</section>");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
