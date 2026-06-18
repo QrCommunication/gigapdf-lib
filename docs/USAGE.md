@@ -6,6 +6,12 @@ and no `wasm-bindgen`. It imports one host function — `env.gp_host_random`
 This guide shows how a JavaScript host (browser or Node) drives it. For the
 complete symbol list see [API.md](API.md).
 
+> **Prefer the high-level SDK?** Most hosts never touch the raw ABI below. The
+> `GigaPdfEngine` / `GigaPdfDoc` classes wrap all of it — start with the
+> [SDK recipes](../sdk/README.md#recipes) (merge, split, encrypt, sign, annotate,
+> HTML→PDF with fonts, searchable OCR…) and the per-method [`SDK.md`](SDK.md)
+> reference. The guide below is for hosts driving the `extern "C"` module directly.
+
 ## 1. Load the module
 
 ```js

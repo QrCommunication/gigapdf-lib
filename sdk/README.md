@@ -99,6 +99,139 @@ if (face) {
 }
 ```
 
+## Recipes
+
+Task-oriented snippets using the high-level classes. Each assumes
+`const giga = await GigaPdfEngine.loadDefault()` (Node) or
+`GigaPdfEngine.load(url)` (browser), `Uint8Array` in/out, and a final `close()`.
+
+### Merge several PDFs
+
+```ts
+const doc = giga.open(first);                 // the base document
+for (const extra of [second, third]) doc.appendPages(extra); // append every page
+const merged = doc.saveCompressed();
+doc.close();
+```
+
+### Split — extract a page range into a new PDF
+
+```ts
+const doc = giga.open(pdfBytes);
+const partA = doc.extractPages([1, 2, 3]);    // a NEW, self-contained PDF…
+const partB = doc.extractPages([4, 5, 6]);    // …links / fields / dests to dropped pages pruned
+doc.close();
+```
+
+### Encrypt (AES-256) and re-open
+
+```ts
+// `fileId` is the document /ID (any stable string). AES-256 auto-generates the
+// 32-byte key via Web Crypto; pass `opts.keySeed` to supply your own.
+const locked = doc.saveEncrypted("user-pw", "doc-001", {
+  ownerPassword: "owner-pw",
+  algorithm: "aes256",           // "rc4" | "aes128" | "aes256" (default)
+  // permissions: -44,           // PDF permission bitmask (optional)
+});
+doc.close();
+
+const reopened = giga.openEncrypted(locked, "user-pw"); // null on a wrong password
+reopened?.close();
+// Inspect without opening:
+const info = giga.encryptionInfo(locked); // { encrypted, permissions, version, revision }
+```
+
+### Digital signature
+
+```ts
+// (a) Self-signed — an ephemeral digital ID. `random` ≥ 256 host-entropy bytes.
+//     fields = "name\treason\tdate\tnotBefore\tnotAfter" (PDF date strings).
+const fields = "Jane Doe\tApproved\tD:20260618120000Z\t260618000000Z\t360618000000Z";
+const random = crypto.getRandomValues(new Uint8Array(256));
+const signed = doc.sign(fields, random);
+
+// (b) PKCS#12 — your CA / eIDAS certificate + RSA key (.p12/.pfx), imported
+//     natively. Throws on a wrong password / malformed file.
+const signed2 = doc.signP12(p12Bytes, "p12-password", {
+  name: "Jane Doe",
+  reason: "I approve this document",
+  date: "D:20260618120000Z",
+  location: "Paris",
+});
+doc.close();
+```
+
+### Annotate, then flatten
+
+```ts
+doc.addHighlight(1, 72, 690, 252, 704, 0xffff00);
+doc.addTextNote(1, 300, 700, 0xff0000, { contents: "Check this clause", author: "Reviewer" });
+doc.addSquare(1, 60, 680, 264, 712, 0xff0000, null);   // stroke red, no fill
+const all = doc.annotations(1);                         // read back, with full metadata
+doc.flattenAnnotations(1);                              // bake into page content (non-interactive)
+const out = doc.save();
+doc.close();
+```
+
+### HTML + CSS → PDF with auto-fetched Google Fonts
+
+```ts
+import type { HtmlFontRequest, HtmlFont } from "@qrcommunication/gigapdf-lib";
+
+// Phase 1: ask the engine which fonts the HTML needs; the HOST fetches them
+// (the wasm has no network). Phase 2: render with those fonts embedded.
+async function fetchFonts(reqs: HtmlFontRequest[]): Promise<HtmlFont[]> {
+  return Promise.all(reqs.map(async (r) => {
+    const css = await (await fetch(r.url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0)" }, // → TTF, not WOFF2
+    })).text();
+    const ttf = new Uint8Array(await (await fetch(giga.parseCssFontUrl(css))).arrayBuffer());
+    return { family: r.family, weight: r.weight, italic: r.italic, ttf };
+  }));
+}
+
+const html = `<body style="font-family: Roboto"><h1>Invoice</h1><p>Net 30.</p></body>`;
+const fonts = await fetchFonts(giga.htmlNeededFonts(html));
+const pdf = giga.htmlRender(html, fonts, 595, 842, 36);  // A4 in points, 36pt margin
+// Named sizes, per-side margins and a header/footer with {{page}}/{{pages}} tokens:
+// giga.htmlRenderWith(html, fonts, { pageSize: "A4", header, footer });
+```
+
+### Make a scanned PDF searchable (OCR → invisible text layer)
+
+```ts
+const doc = giga.open(scannedPdf);
+const scale = 2;                                  // rasterise at 2× = 144 dpi for OCR
+for (let page = 1; page <= doc.pageCount(); page++) {
+  const { height } = doc.pageInfo(page);
+  const words = doc.ocr(page, scale);             // OcrWord[] in raster pixels (top-left)
+  // Map each word box back to PDF user space (bottom-left, Y up) and stamp an
+  // invisible (render-mode 3) text layer — selectable & searchable, pixel-aligned.
+  doc.addTextLayer(page, words.map((w) => ({
+    x: w.x / scale,
+    y: height - (w.y + w.h) / scale,
+    size: w.h / scale,
+    text: w.text,
+  })));
+}
+const searchable = doc.save();
+doc.close();
+```
+
+### Metadata & bookmarks (outline)
+
+```ts
+doc.setMetadata("Title", "Quarterly report");
+doc.setMetadata("Author", "Finance");
+doc.setOutline([
+  { title: "Summary", level: 0, page: 1 },
+  { title: "Details", level: 0, page: 2 },
+  { title: "Appendix", level: 1, page: 5 },
+]);
+const out = doc.save();
+doc.close();
+```
+
 ## Next.js (`output: "standalone"`)
 
 `loadDefault()` reads `gigapdf.wasm` from the package directory. In standalone
