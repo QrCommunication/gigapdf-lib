@@ -4,6 +4,18 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.52.1] - 2026-06-18
+
+### Fixed
+
+- **JPEG encoder — final-byte padding no longer corrupts the last code.** The
+  entropy writer's `flush` padded the trailing partial byte with a fixed 7-bit
+  `0x7F`; for any partial byte holding more than one written bit, the extra
+  1-bits bled into the already-written Huffman code (ITU-T T.81 §F.1.2.3
+  requires padding *only* the free low bits with 1s). The lib's own decoder
+  tolerated it, but strict third-party decoders could misread the last code or
+  reject the non-conformant padding. `flush` now pads exactly the free bits.
+
 ## [0.52.0] - 2026-06-18
 
 ### Added
