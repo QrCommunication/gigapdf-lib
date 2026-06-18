@@ -62,6 +62,15 @@ impl GlyphSource {
             GlyphSource::Cff(_) => None,
         }
     }
+
+    /// The CFF program, if this source is one. Lets the PDF layer resolve a
+    /// simple font's `/Encoding` against the CFF charset (`code → name → gid`).
+    pub fn as_cff(&self) -> Option<&cff::CffFont> {
+        match self {
+            GlyphSource::Cff(f) => Some(f),
+            GlyphSource::TrueType(_) => None,
+        }
+    }
 }
 
 /// WinAnsi mapping for the 0x80–0x9F range (the only bytes that differ from

@@ -169,6 +169,15 @@ pub struct RenderFont {
     pub decoder: TextDecoder,
     /// Composite (Type0) font: 2-byte codes, glyph id taken as the CID.
     pub two_byte: bool,
+    /// Simple-font character-code → glyph-id map, resolved from the PDF
+    /// `/Encoding` (base + `/Differences`) against the program's own charset.
+    /// Primary glyph-selection path for simple fonts whose program has no usable
+    /// Unicode cmap (notably subset CFF, where `gid_for_unicode` is unavailable).
+    /// `None` falls back to the code→Unicode→cmap path.
+    pub code_to_gid: Option<BTreeMap<u32, u16>>,
+    /// Composite-font CID → glyph-id map from a non-identity `/CIDToGIDMap`
+    /// stream. `None` means identity (CID is the glyph id), the common case.
+    pub cid_to_gid: Option<Vec<u16>>,
 }
 
 /// Per-page render fonts, keyed by font resource name (as used by `Tf`).
@@ -916,7 +925,21 @@ fn show_text(
         if let Some(ttf) = &font.program {
             let upem = ttf.units_per_em();
             let gid = if font.two_byte {
-                code as u16 // Identity CIDToGIDMap (common Type0 case)
+                // Composite font: the 2-byte code is the CID. Map CID → glyph id
+                // through a non-identity `/CIDToGIDMap` when present, else the
+                // CID is the glyph id directly (the Identity case).
+                match &font.cid_to_gid {
+                    Some(map) => map.get(code as usize).copied().unwrap_or(0),
+                    None => code as u16,
+                }
+            } else if let Some(gid) = font
+                .code_to_gid
+                .as_ref()
+                .and_then(|m| m.get(&code).copied())
+            {
+                // Simple font: PDF `/Encoding` → charset glyph id (handles subset
+                // CFF, whose program carries no Unicode cmap).
+                gid
             } else {
                 let decoded = font.decoder.decode(code_bytes);
                 let scalar = decoded.chars().next().map(|c| c as u32).unwrap_or(code);
@@ -929,8 +952,18 @@ fn show_text(
             // contour has no outer contour to subtract from. TrueType/CFF
             // outlines wind their outer and inner contours in opposite
             // directions, so a single non-zero fill carves the counters out.
+            //
+            // Skip glyph id 0 (`.notdef`): an unresolved code must render as
+            // *nothing*, never the notdef box — drawing it would litter the page
+            // with tofu wherever a code didn't map (e.g. a glyph absent from a
+            // subset). The cursor still advances by the notdef width below.
             let mut edges = Vec::new();
-            for poly in ttf.glyph_polygons(gid) {
+            let polygons = if gid == 0 {
+                Vec::new()
+            } else {
+                ttf.glyph_polygons(gid)
+            };
+            for poly in polygons {
                 if poly.len() < 3 {
                     continue;
                 }

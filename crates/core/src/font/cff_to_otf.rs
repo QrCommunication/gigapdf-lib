@@ -83,6 +83,28 @@ pub fn cff_gid_unicode_strings(cff: &CffFont) -> std::collections::BTreeMap<u16,
     map
 }
 
+/// Build a Unicode-scalar → glyph-id map from a CFF font's charset, the inverse
+/// direction needed to draw a simple CFF font through its PDF `/Encoding`
+/// (`code → Unicode → gid`). Resolves each glyph's charset SID through the same
+/// logic that drives the synthesised cmap (`sid_to_unicode`), so it recognises
+/// the StandardEncoding/Latin-1 standard names by SID number — including names
+/// the *string* resolver can't decode (e.g. `space`, `comma`, `two`). Lower
+/// glyph ids win on a shared scalar (the canonical glyph). Empty for CID-keyed
+/// fonts (their charset holds CIDs, not name SIDs).
+pub fn cff_unicode_to_gid(cff: &CffFont) -> std::collections::BTreeMap<u32, u16> {
+    let mut map = std::collections::BTreeMap::new();
+    if cff.is_cid() {
+        return map;
+    }
+    for gid in 1..cff.num_glyphs() {
+        let sid = cff.gid_to_sid(gid);
+        if let Some(cp) = sid_to_unicode(cff, sid) {
+            map.entry(cp).or_insert(gid);
+        }
+    }
+    map
+}
+
 /// Resolve a glyph's charset SID to a Unicode scalar for the synthesised cmap.
 fn sid_to_unicode(cff: &CffFont, sid: u16) -> Option<u32> {
     if cff.is_cid() {

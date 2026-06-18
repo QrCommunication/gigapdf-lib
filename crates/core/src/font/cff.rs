@@ -286,6 +286,40 @@ impl CffFont {
             .unwrap_or(gid)
     }
 
+    /// Build a glyph-**name** → glyph-id map from the charset, so a simple
+    /// (name-keyed) CFF font's PDF `/Encoding` (`code → name`) can be resolved to
+    /// outlines. Empty for CID-keyed fonts (their charset holds CIDs, not names).
+    /// Lower glyph ids win on duplicate names (the canonical glyph for a name).
+    pub fn name_to_gid_map(&self) -> BTreeMap<String, u16> {
+        let mut map = BTreeMap::new();
+        if self.is_cid {
+            return map;
+        }
+        for gid in 0..self.num_glyphs() {
+            let sid = self.gid_to_sid(gid);
+            if let Some(name) = self.sid_name(sid) {
+                map.entry(name.to_string()).or_insert(gid);
+            }
+        }
+        map
+    }
+
+    /// Map a CID to its glyph id for a CID-keyed CFF font (the charset holds
+    /// `gid → CID`, so this inverts it). Identity when the font carries no
+    /// explicit charset. Returns `None` for name-keyed CFF or an unknown CID.
+    pub fn gid_for_cid(&self, cid: u16) -> Option<u16> {
+        if !self.is_cid {
+            return None;
+        }
+        if self.charset.is_empty() {
+            return (cid < self.num_glyphs()).then_some(cid);
+        }
+        self.charset
+            .iter()
+            .position(|&c| c == cid)
+            .map(|g| g as u16)
+    }
+
     fn local_for(&self, gid: u16) -> &[Vec<u8>] {
         if self.is_cid {
             let fd = self.fd_select.get(gid as usize).copied().unwrap_or(0) as usize;
@@ -719,6 +753,144 @@ impl Interp<'_> {
     }
 }
 
+/// Encode a CFF INDEX (count, offSize, offsets, data) for `items`. Test-only:
+/// assumes each item and the running offset fit in a single byte.
+#[cfg(test)]
+pub(crate) fn test_index(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![(items.len() >> 8) as u8, items.len() as u8];
+    if items.is_empty() {
+        return out;
+    }
+    out.push(1); // offSize = 1 byte (small test data)
+    let mut off = 1u8;
+    out.push(off);
+    for it in items {
+        off += it.len() as u8;
+        out.push(off);
+    }
+    for it in items {
+        out.extend_from_slice(it);
+    }
+    out
+}
+
+/// Build a minimal name-keyed CFF: `.notdef` (empty) plus one glyph whose
+/// charset SID is `sid_a` (e.g. SID 34 names it "A"), drawn as a square outline
+/// so it produces real ink. The Top DICT offsets are back-patched once the
+/// layout stabilises. Returns the CFF bytes. Test-only fixture builder, shared
+/// with the document-level render test.
+#[cfg(test)]
+pub(crate) fn tiny_named_cff(sid_a: u16) -> Vec<u8> {
+    // Type2 charstring number: single byte (-107..=107), else the 3-byte
+    // `255 + 16.16 fixed` form is overkill — use the 2-byte 28/hi/lo short int.
+    let cn = |v: i32, out: &mut Vec<u8>| {
+        if (-107..=107).contains(&v) {
+            out.push((v + 139) as u8);
+        } else {
+            out.push(28);
+            out.push((v >> 8) as u8);
+            out.push((v & 0xFF) as u8);
+        }
+    };
+    let notdef = vec![14u8]; // .notdef: just endchar — no outline.
+                             // 'A': an outer square with an inner counter wound the opposite way, so
+                             // the non-zero fill leaves a hole — a genuinely non-uniform glyph (not a
+                             // solid box). All moves/lines are relative (rmoveto=21, rlineto=5).
+    let glyph_a = {
+        let mut g = Vec::new();
+        // Outer contour (CCW): (40,40)→(240,40)→(240,240)→(40,240).
+        cn(40, &mut g);
+        cn(40, &mut g);
+        g.push(21); // rmoveto
+        cn(200, &mut g);
+        cn(0, &mut g);
+        g.push(5); // rlineto →(240,40)
+        cn(0, &mut g);
+        cn(200, &mut g);
+        g.push(5); // rlineto →(240,240)
+        cn(-200, &mut g);
+        cn(0, &mut g);
+        g.push(5); // rlineto →(40,240)
+                   // Inner counter (CW): move from (40,240) to (100,100), then a small square.
+        cn(60, &mut g);
+        cn(-140, &mut g);
+        g.push(21); // rmoveto →(100,100)
+        cn(0, &mut g);
+        cn(80, &mut g);
+        g.push(5); // rlineto →(100,180)
+        cn(80, &mut g);
+        cn(0, &mut g);
+        g.push(5); // rlineto →(180,180)
+        cn(0, &mut g);
+        cn(-80, &mut g);
+        g.push(5); // rlineto →(180,100)
+        g.push(14); // endchar
+        g
+    };
+    let charstrings = test_index(&[notdef, glyph_a]);
+
+    // Top DICT integer operand encoding (TN #5176 §4): single byte for
+    // -107..=107, two bytes for 108..=1131, else the 3-byte `28 hi lo` form.
+    let enc_int = |v: i32| -> Vec<u8> {
+        if (-107..=107).contains(&v) {
+            vec![(v + 139) as u8]
+        } else if (108..=1131).contains(&v) {
+            let v = v - 108;
+            vec![247 + (v >> 8) as u8, (v & 0xFF) as u8]
+        } else {
+            vec![28, (v >> 8) as u8, (v & 0xFF) as u8]
+        }
+    };
+
+    let header = vec![1u8, 0, 4, 1];
+    let names = test_index(&[b"F".to_vec()]);
+    let strings = test_index(&[]); // no custom strings — SID is a Standard String
+    let gsubrs = test_index(&[]);
+    // charset format 0: one SID (for gid 1); gid 0 is implicitly .notdef.
+    let charset = vec![0u8, (sid_a >> 8) as u8, sid_a as u8];
+    // Minimal Private DICT: defaultWidthX(20)=0, nominalWidthX(21)=0.
+    let private = [enc_int(0), vec![20u8], enc_int(0), vec![21u8]].concat();
+
+    let build_top = |charset_off: i32, cs_off: i32, priv_off: i32| -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(enc_int(charset_off));
+        d.push(15); // charset
+        d.extend(enc_int(cs_off));
+        d.push(17); // CharStrings
+        d.extend(enc_int(private.len() as i32));
+        d.extend(enc_int(priv_off));
+        d.push(18); // Private = [size offset]
+        d
+    };
+
+    // The Top DICT INDEX size depends on the offsets it encodes, which depend on
+    // its own size — iterate to a fixed point.
+    let mut top_index = test_index(&[build_top(0, 0, 0)]);
+    let mut prev_len = 0;
+    loop {
+        let base = header.len() + names.len() + top_index.len() + strings.len() + gsubrs.len();
+        let charset_off = base as i32;
+        let cs_off = (base + charset.len()) as i32;
+        let priv_off = (base + charset.len() + charstrings.len()) as i32;
+        top_index = test_index(&[build_top(charset_off, cs_off, priv_off)]);
+        if top_index.len() == prev_len {
+            break;
+        }
+        prev_len = top_index.len();
+    }
+
+    let mut out = Vec::new();
+    out.extend(header);
+    out.extend(names);
+    out.extend(top_index);
+    out.extend(strings);
+    out.extend(gsubrs);
+    out.extend(charset);
+    out.extend(charstrings);
+    out.extend(private);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,5 +940,28 @@ mod tests {
     #[test]
     fn rejects_non_cff() {
         assert!(CffFont::parse(b"not a cff").is_none());
+    }
+
+    #[test]
+    fn tiny_cff_parses_and_resolves_names_and_unicode() {
+        // SID 34 names "A" in this build's Standard Strings table.
+        let bytes = tiny_named_cff(34);
+        let cff = CffFont::parse(&bytes).expect("hand-built CFF must parse");
+        assert_eq!(cff.num_glyphs(), 2, ".notdef + A");
+        assert!(!cff.is_cid(), "name-keyed");
+        assert_eq!(cff.sid_name(cff.gid_to_sid(1)), Some("A"), "gid 1 is named A");
+
+        // The fix's resolution maps: name "A" → gid 1, and Unicode U+0041 → gid 1.
+        let n2g = cff.name_to_gid_map();
+        assert_eq!(n2g.get("A").copied(), Some(1), "name→gid resolves A");
+        let u2g = crate::font::cff_to_otf::cff_unicode_to_gid(&cff);
+        assert_eq!(u2g.get(&0x41).copied(), Some(1), "unicode→gid resolves A");
+
+        // The glyph has real outline ink (a square), not an empty/notdef shape.
+        assert!(
+            !cff.glyph_polygons(1).is_empty(),
+            "glyph A produces contours"
+        );
+        assert!(cff.glyph_polygons(0).is_empty(), ".notdef is empty");
     }
 }

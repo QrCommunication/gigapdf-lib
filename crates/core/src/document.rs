@@ -339,6 +339,27 @@ fn normalize_font_name(raw: &str) -> String {
         .collect()
 }
 
+/// Resolve a PDF `/Encoding` glyph name to a glyph id, for simple-font
+/// `code → gid` mapping. Tries the embedded program's charset directly (by name)
+/// — exact for subset fonts — then falls back to the name's Unicode scalar via
+/// the charset's Unicode map (handles AGL `uniXXXX`/single-char names whose
+/// literal name isn't in the charset).
+fn gid_for_glyph_name(
+    name: &str,
+    name_to_gid: &BTreeMap<String, u16>,
+    unicode_to_gid: &BTreeMap<u32, u16>,
+) -> Option<u16> {
+    if let Some(&gid) = name_to_gid.get(name) {
+        return Some(gid);
+    }
+    let s = crate::font::cff_to_otf::glyph_name_to_unicode_string(name)?;
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => unicode_to_gid.get(&(c as u32)).copied(),
+        _ => None,
+    }
+}
+
 /// Set the shared reviewer metadata on an annotation dict: popup `/Contents`,
 /// `/T` author, `/NM` id, `/M` modification date and the printable `/F` flag.
 /// Empty strings are skipped. `/Contents` and `/T` go through `pdf_text` so
@@ -3288,48 +3309,73 @@ impl Document {
             }
             let width = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
             let height = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
-            let bpc = dict
-                .get(b"BitsPerComponent")
-                .and_then(Object::as_i64)
-                .unwrap_or(8);
-            if width <= 0 || height <= 0 || bpc != 8 {
+            if width <= 0 || height <= 0 {
                 continue;
             }
-            // Skip compressed-photo filters we don't decode yet.
-            let filter = self.first_filter(dict);
-            if matches!(filter.as_deref(), Some(b"DCTDecode") | Some(b"JPXDecode")) {
-                continue;
-            }
-            let components = match dict
-                .get(b"ColorSpace")
-                .map(|o| self.resolve(o))
-                .and_then(Object::as_name)
-            {
-                Some(b"DeviceRGB") => 3,
-                Some(b"DeviceGray") => 1,
-                _ => continue, // Indexed/ICCBased/CMYK not handled yet
-            };
-            let Ok(samples) = decode_stream(stream) else {
-                continue;
-            };
             let (w, h) = (width as usize, height as usize);
-            if samples.len() < w * h * components {
-                continue;
-            }
+            let filter = self.first_filter(dict);
+            // Decode the image's RGB samples (one `[r, g, b]` triple per pixel,
+            // row-major). A baseline JPEG (`/DCTDecode`) is decoded by the
+            // built-in JPEG decoder from the raw (still-DCT-coded) stream bytes;
+            // everything else is an uncompressed/Flate sample grid whose
+            // component layout the `/ColorSpace` describes.
+            let rgb: Vec<[u8; 3]> = if filter.as_deref() == Some(b"DCTDecode") {
+                let Some((jw, jh, jrgba)) = crate::raster::jpeg::decode_jpeg(&stream.raw) else {
+                    continue; // progressive/arithmetic/malformed — not yet decoded
+                };
+                if jw as usize != w || jh as usize != h || jrgba.len() < w * h * 4 {
+                    continue;
+                }
+                jrgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect()
+            } else {
+                let bpc = dict
+                    .get(b"BitsPerComponent")
+                    .and_then(Object::as_i64)
+                    .unwrap_or(8);
+                if bpc != 8 {
+                    continue;
+                }
+                // JPXDecode (JPEG 2000) is not decoded yet; skip rather than
+                // misread its raw bytes as raster samples.
+                if filter.as_deref() == Some(b"JPXDecode") {
+                    continue;
+                }
+                let components = match dict
+                    .get(b"ColorSpace")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_name)
+                {
+                    Some(b"DeviceRGB") => 3,
+                    Some(b"DeviceGray") => 1,
+                    _ => continue, // Indexed/ICCBased/CMYK not handled yet
+                };
+                let Ok(samples) = decode_stream(stream) else {
+                    continue;
+                };
+                if samples.len() < w * h * components {
+                    continue;
+                }
+                (0..w * h)
+                    .map(|p| {
+                        let i = p * components;
+                        if components == 1 {
+                            [samples[i], samples[i], samples[i]]
+                        } else {
+                            [samples[i], samples[i + 1], samples[i + 2]]
+                        }
+                    })
+                    .collect()
+            };
             // A `/SMask` (8-bit DeviceGray image) supplies per-pixel alpha — this
-            // is how PNG transparency survives embedding. Sampled nearest-
-            // neighbour so a soft mask of a different size still maps (identity
-            // when the dimensions match, the common case).
+            // is how PNG transparency (and a JPEG photo's soft cut-out) survives
+            // embedding. Sampled nearest-neighbour so a soft mask of a different
+            // size still maps (identity when the dimensions match, the common
+            // case).
             let smask = self.decode_gray_smask(dict);
             let mut rgba = Vec::with_capacity(w * h * 4);
             for y in 0..h {
                 for x in 0..w {
-                    let i = (y * w + x) * components;
-                    let (r, g, b) = if components == 1 {
-                        (samples[i], samples[i], samples[i])
-                    } else {
-                        (samples[i], samples[i + 1], samples[i + 2])
-                    };
+                    let [r, g, b] = rgb[y * w + x];
                     let a = match &smask {
                         Some((sw, sh, alpha)) => {
                             let sx = if *sw == w { x } else { x * *sw / w };
@@ -3524,10 +3570,21 @@ impl Document {
                 .and_then(|s| decode_stream(s).ok())
                 .map(|bytes| crate::font::cmap::ToUnicode::parse(&bytes))
                 .filter(|c| !c.is_empty());
+            let program = self.font_program(font);
+            // Resolve the glyph-selection maps the rasterizer needs. Simple fonts
+            // map `code → glyph id` via their PDF `/Encoding` against the embedded
+            // program's charset (essential for subset CFF, which carries no
+            // Unicode cmap); composite fonts may carry a non-identity
+            // `/CIDToGIDMap`.
+            let (code_to_gid, cid_to_gid) = if two_byte {
+                (None, self.composite_cid_to_gid(font, program.as_ref()))
+            } else {
+                (self.simple_code_to_gid(font, program.as_ref()), None)
+            };
             out.insert(
                 name.clone(),
                 crate::raster::render::RenderFont {
-                    program: self.font_program(font),
+                    program,
                     decoder: crate::font::cmap::TextDecoder {
                         two_byte,
                         to_unicode,
@@ -3539,10 +3596,123 @@ impl Document {
                         cid_to_unicode: None,
                     },
                     two_byte,
+                    code_to_gid,
+                    cid_to_gid,
                 },
             );
         }
         out
+    }
+
+    /// Build a simple font's `code → glyph id` map by resolving its PDF
+    /// `/Encoding` (base encoding + `/Differences`) against the embedded
+    /// program's own glyph charset. This is the spec resolution order
+    /// (ISO 32000-1 §9.6.6) and is the *only* way to draw a subset CFF font,
+    /// whose program ships no Unicode `cmap` (so `gid_for_unicode` can't help).
+    ///
+    /// Built only for CFF programs — TrueType simple fonts already resolve via
+    /// their embedded `cmap` on the code→Unicode path, so we leave them be to
+    /// avoid disturbing that working route. Returns `None` when nothing maps.
+    fn simple_code_to_gid(
+        &self,
+        font: &Dictionary,
+        program: Option<&crate::font::GlyphSource>,
+    ) -> Option<BTreeMap<u32, u16>> {
+        let cff = program?.as_cff()?;
+        let name_to_gid = cff.name_to_gid_map();
+        // GID lookup by Unicode scalar, derived from the CFF charset via the same
+        // SID→Unicode logic that drives `/ToUnicode` synthesis — so it knows the
+        // StandardEncoding/Latin-1 names by SID number (e.g. `space`, `comma`),
+        // not just AGL single-character/`uniXXXX` names.
+        let unicode_to_gid = crate::font::cff_to_otf::cff_unicode_to_gid(cff);
+
+        // code → glyph name from the PDF /Encoding /Differences (explicit
+        // overrides win over the base encoding).
+        let differences = self.encoding_differences(font);
+
+        let mut map = BTreeMap::new();
+        for code in 0u32..=255 {
+            let gid = if let Some(name) = differences.get(&(code as u8)) {
+                gid_for_glyph_name(name, &name_to_gid, &unicode_to_gid)
+            } else {
+                // Base encoding: the code's Unicode scalar (WinAnsi covers the
+                // simple-Latin fonts that embed CFF), resolved through the
+                // charset's Unicode map.
+                let scalar = crate::font::winansi_to_char(code as u8) as u32;
+                unicode_to_gid.get(&scalar).copied()
+            };
+            if let Some(gid) = gid {
+                if gid != 0 {
+                    map.insert(code, gid);
+                }
+            }
+        }
+        (!map.is_empty()).then_some(map)
+    }
+
+    /// Parse a simple font's `/Encoding` `/Differences` array into a
+    /// `code → glyph name` map. Absent or a bare base-encoding name yields an
+    /// empty map (the base encoding is then applied code-by-code by the caller).
+    fn encoding_differences(&self, font: &Dictionary) -> BTreeMap<u8, String> {
+        let mut out = BTreeMap::new();
+        let Some(Object::Dictionary(enc)) = font.get(b"Encoding").map(|o| self.resolve(o)) else {
+            return out;
+        };
+        let Some(diffs) = enc
+            .get(b"Differences")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        else {
+            return out;
+        };
+        let mut code = 0u32;
+        for item in diffs {
+            match self.resolve(item) {
+                Object::Integer(n) => code = (*n).max(0) as u32,
+                Object::Name(name) => {
+                    if code <= 255 {
+                        if let Ok(s) = std::str::from_utf8(name) {
+                            out.insert(code as u8, s.to_string());
+                        }
+                    }
+                    code += 1;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Load a composite (Type0) font's `/CIDToGIDMap` when it is a stream of
+    /// big-endian 16-bit glyph ids (one per CID). Returns `None` for the
+    /// `/Identity` name (CID *is* the glyph id), which the rasterizer handles
+    /// directly.
+    fn composite_cid_to_gid(
+        &self,
+        font: &Dictionary,
+        _program: Option<&crate::font::GlyphSource>,
+    ) -> Option<Vec<u16>> {
+        let cid_font = font
+            .get(b"DescendantFonts")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        let stream = cid_font
+            .get(b"CIDToGIDMap")
+            .map(|o| self.resolve(o))?
+            .as_stream()?;
+        let bytes = decode_stream(stream).ok()?;
+        if bytes.len() < 2 {
+            return None;
+        }
+        Some(
+            bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect(),
+        )
     }
 
     /// Extract and parse the embedded glyph program of a font, descending into
@@ -12183,6 +12353,274 @@ mod tests {
         );
         // A corner outside the square stays white paper.
         assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the form square is white");
+    }
+
+    /// Assemble a PDF from binary object bodies with a real cross-reference
+    /// table, so streams carrying arbitrary bytes (embedded fonts, JPEGs) round-
+    /// trip. `objects` are `(number, body)` pairs already including the dict and,
+    /// where present, `stream … endstream`.
+    fn raw_pdf_binary(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let max_id = objects.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        let mut offsets = vec![0usize; (max_id + 1) as usize];
+        for (num, body) in objects {
+            offsets[*num as usize] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", max_id + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for id in 1..=max_id {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[id as usize]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF",
+                max_id + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// A `/FontFile3` (Type1C) stream object body wrapping the given CFF bytes.
+    fn fontfile3_obj(cff: &[u8]) -> Vec<u8> {
+        let mut body = format!(
+            "<< /Length {} /Subtype /Type1C >>\nstream\n",
+            cff.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(cff);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+
+    /// Render a PDF whose only text is one `(A) Tj` in a subset CFF (Type1)
+    /// simple font, and report the device pixels. `nested` routes the text-show
+    /// through a form XObject (`Do`) to exercise the form-recursion path too.
+    fn render_cff_letter(nested: bool) -> crate::raster::Canvas {
+        // SID 34 names glyph 1 "A"; WinAnsi code 0x41 ('A') must resolve to it.
+        let cff = crate::font::cff::tiny_named_cff(34);
+        // Draw the glyph large (size 80) near the page origin so it lands well
+        // inside the 100×100 media box.
+        let show = b"BT /F0 80 Tf 10 20 Td (A) Tj ET".to_vec();
+        let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+Test \
+                     /FontDescriptor 6 0 R /Encoding /WinAnsiEncoding >>"
+            .to_vec();
+        let descriptor = b"<< /Type /FontDescriptor /FontName /ABCDEF+Test /Flags 4 \
+                           /FontFile3 7 0 R >>"
+            .to_vec();
+
+        let mut objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (6, descriptor),
+            (7, fontfile3_obj(&cff)),
+        ];
+
+        if nested {
+            // The page invokes a form XObject; the form holds the text + the font.
+            let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                         /Resources << /XObject << /Fm0 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec();
+            let page_content = b"<< /Length 8 >>\nstream\n/Fm0 Do\nendstream".to_vec();
+            let mut form = format!(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Resources << /Font << /F0 8 0 R >> >> /Length {} >>\nstream\n",
+                show.len()
+            )
+            .into_bytes();
+            form.extend_from_slice(&show);
+            form.extend_from_slice(b"\nendstream");
+            objects.push((3, page));
+            objects.push((4, page_content));
+            objects.push((5, form));
+            objects.push((8, font));
+        } else {
+            let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                         /Resources << /Font << /F0 8 0 R >> >> /Contents 4 0 R >>"
+                .to_vec();
+            let mut content =
+                format!("<< /Length {} >>\nstream\n", show.len()).into_bytes();
+            content.extend_from_slice(&show);
+            content.extend_from_slice(b"\nendstream");
+            objects.push((3, page));
+            objects.push((4, content));
+            objects.push((8, font));
+        }
+
+        let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        doc.render_page_canvas(1, 1.0).unwrap()
+    }
+
+    #[test]
+    fn renders_subset_cff_simple_font_glyph_not_notdef() {
+        // Regression for the subset-CFF tofu bug: a `/Type1` font with a
+        // `/FontFile3` (CFF) program and NO Unicode cmap must still draw real
+        // glyphs, by resolving the PDF `/Encoding` against the CFF charset
+        // (`code → name/Unicode → gid`). Before the fix every code fell back to
+        // glyph 0 and painted the `.notdef` box.
+        for nested in [false, true] {
+            let canvas = render_cff_letter(nested);
+            // The glyph is the square outline (100..200,100..200 in font units →
+            // at size 80 and Td (10,20): device span roughly x 18..34, y 64..80).
+            // Count dark pixels and confirm the inked region is NON-UNIFORM
+            // (a real outline), not a solid filled notdef box.
+            let mut dark = 0usize;
+            let mut cols: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            let mut rows: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            for y in 0..canvas.height {
+                for x in 0..canvas.width {
+                    let p = px(&canvas, x, y);
+                    if p[0] < 120 && p[1] < 120 && p[2] < 120 {
+                        dark += 1;
+                        cols.insert(x);
+                        rows.insert(y);
+                    }
+                }
+            }
+            assert!(
+                dark > 20,
+                "nested={nested}: subset-CFF glyph must paint ink ({dark} dark px)"
+            );
+            // A real glyph spans several columns and rows (an outline), unlike a
+            // 1-pixel artefact; and it must NOT cover the whole page (notdef box
+            // / solid fill would). Width/height of the inked box stays modest.
+            let w = cols.last().unwrap() - cols.first().unwrap() + 1;
+            let h = rows.last().unwrap() - rows.first().unwrap() + 1;
+            assert!(w >= 3 && h >= 3, "nested={nested}: glyph spans a 2-D region ({w}x{h})");
+            assert!(
+                (dark as u32) < canvas.width * canvas.height / 2,
+                "nested={nested}: glyph is an outline, not a page-filling box"
+            );
+            // Non-uniformity: at least one bright (paper) pixel sits inside the
+            // glyph's bounding box — a solid notdef box would have none.
+            let mut bright_inside = false;
+            for y in *rows.first().unwrap()..=*rows.last().unwrap() {
+                for x in *cols.first().unwrap()..=*cols.last().unwrap() {
+                    let p = px(&canvas, x, y);
+                    if p[0] > 220 && p[1] > 220 && p[2] > 220 {
+                        bright_inside = true;
+                    }
+                }
+            }
+            assert!(
+                bright_inside,
+                "nested={nested}: glyph outline has paper showing through (non-uniform)"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_baseline_jpeg_image_xobject_direct_and_nested() {
+        // Regression for the baseline-JPEG blank-page bug: a `/DCTDecode` image
+        // XObject must be decoded and blitted, both when placed directly on the
+        // page and when nested inside a form XObject. Before the fix DCTDecode
+        // was skipped outright, leaving the area blank.
+        //
+        // A 16×16 image: left half solid red, right half solid blue — a clearly
+        // non-blank, position-checkable photo.
+        let (w, h) = (16u32, 16u32);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                if x < w / 2 {
+                    rgba.extend_from_slice(&[220, 30, 30, 255]); // red
+                } else {
+                    rgba.extend_from_slice(&[30, 30, 220, 255]); // blue
+                }
+            }
+        }
+        let jpeg = crate::raster::jpeg::encode_jpeg(w, h, &rgba, 90);
+        assert!(!jpeg.is_empty(), "encoder produced a baseline JPEG");
+
+        let image_obj = |id: u32| -> (u32, Vec<u8>) {
+            let mut body = format!(
+                "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} \
+                 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode \
+                 /Length {} >>\nstream\n",
+                jpeg.len()
+            )
+            .into_bytes();
+            body.extend_from_slice(&jpeg);
+            body.extend_from_slice(b"\nendstream");
+            (id, body)
+        };
+
+        for nested in [false, true] {
+            // The image fills the unit square; `cm` scales it to a 60×60 box at
+            // user (20,20)→(80,80).
+            let draw = b"q 60 0 0 60 20 20 cm /Im0 Do Q".to_vec();
+            let mut objects: Vec<(u32, Vec<u8>)> = vec![
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            ];
+            if nested {
+                objects.push((
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                      /Resources << /XObject << /Fm0 5 0 R >> >> /Contents 4 0 R >>"
+                        .to_vec(),
+                ));
+                objects.push((4, b"<< /Length 8 >>\nstream\n/Fm0 Do\nendstream".to_vec()));
+                let mut form = format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /XObject << /Im0 6 0 R >> >> /Length {} >>\nstream\n",
+                    draw.len()
+                )
+                .into_bytes();
+                form.extend_from_slice(&draw);
+                form.extend_from_slice(b"\nendstream");
+                objects.push((5, form));
+                objects.push(image_obj(6));
+            } else {
+                objects.push((
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                      /Resources << /XObject << /Im0 6 0 R >> >> /Contents 4 0 R >>"
+                        .to_vec(),
+                ));
+                let mut content =
+                    format!("<< /Length {} >>\nstream\n", draw.len()).into_bytes();
+                content.extend_from_slice(&draw);
+                content.extend_from_slice(b"\nendstream");
+                objects.push((4, content));
+                objects.push(image_obj(6));
+            }
+
+            let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+            let canvas = doc.render_page_canvas(1, 1.0).unwrap();
+
+            // Non-white pixels appear where the image is placed (device y is
+            // flipped: user (20..80) → device (20..80) here on a 100-tall page).
+            let mut non_white = 0usize;
+            for y in 0..canvas.height {
+                for x in 0..canvas.width {
+                    let p = px(&canvas, x, y);
+                    if p[0] < 250 || p[1] < 250 || p[2] < 250 {
+                        non_white += 1;
+                    }
+                }
+            }
+            assert!(
+                non_white > 1000,
+                "nested={nested}: JPEG image must paint pixels ({non_white} non-white)"
+            );
+            // Left of the placed image reads reddish, right reads bluish — proves
+            // the actual decoded photo (not a flat fill) reached the canvas.
+            let left = px(&canvas, 32, 50);
+            let right = px(&canvas, 68, 50);
+            assert!(
+                left[0] > left[2] + 40,
+                "nested={nested}: image left half is red-dominant, got {left:?}"
+            );
+            assert!(
+                right[2] > right[0] + 40,
+                "nested={nested}: image right half is blue-dominant, got {right:?}"
+            );
+        }
     }
 
     #[test]
