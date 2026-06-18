@@ -198,8 +198,13 @@ impl BitWriter {
     }
     fn flush(&mut self) {
         if self.nbits > 0 {
-            // Pad the final partial byte with 1-bits (JPEG convention).
-            self.put(0x7F, (8 - self.nbits) as u8);
+            // Pad the final partial byte with 1-bits (JPEG convention, ITU-T
+            // T.81 §F.1.2.3). Only the `pad` free low bits may be set: a fixed
+            // 7-bit `0x7F` would, for any `nbits > 1`, bleed its extra 1-bits
+            // into the already-written code field via the `|=` in `put`,
+            // corrupting the final Huffman code.
+            let pad = (8 - self.nbits) as u8; // 1..=7
+            self.put((1u16 << pad) - 1, pad);
         }
     }
 }
@@ -1268,6 +1273,30 @@ mod tests {
             }
         }
         v
+    }
+
+    #[test]
+    fn bitwriter_flush_pads_final_byte_without_corrupting_code() {
+        // 7 written zero-bits + flush ⇒ 7 zeros and ONE 1-bit pad = 0b0000_0001.
+        // The old `put(0x7F, 1)` OR-ed seven 1-bits over the written zeros and
+        // produced 0x7F — corrupting the final code. This is the regression.
+        let mut w = BitWriter::new();
+        w.put(0b000_0000, 7);
+        w.flush();
+        assert_eq!(w.out, vec![0b0000_0001]);
+
+        // 5 written bits 0b10101 + flush (3 pad bits) ⇒ 0b10101_111 = 0xAF.
+        // The buggy version yielded 0xFF (+ a stuffed 0x00).
+        let mut w = BitWriter::new();
+        w.put(0b1_0101, 5);
+        w.flush();
+        assert_eq!(w.out, vec![0xAF]);
+
+        // A final byte that legitimately becomes 0xFF must still be 0x00-stuffed.
+        let mut w = BitWriter::new();
+        w.put(0b111, 3);
+        w.flush();
+        assert_eq!(w.out, vec![0xFF, 0x00]);
     }
 
     #[test]
