@@ -4,6 +4,35 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.50.0] - 2026-06-18
+
+### Added
+
+- **Bundled fallback font (offline rendering).** HTML→PDF and Office→PDF now embed
+  a permissively-licensed fallback font (Liberation Sans, SIL OFL 1.1) when the
+  host provides no matching font, so text renders with real, selectable glyphs and
+  correct advance widths with **zero network** — instead of rough average-width
+  estimates. Host-provided / Google fonts still take precedence; `needed_fonts`
+  is unchanged.
+- **Annotation appearances in the rasterizer.** `renderPage` now composites each
+  annotation's normal appearance stream (`/AP /N`, selected by `/AS`) onto the
+  page, mapping the appearance `/BBox`·`/Matrix` onto the annotation `/Rect`
+  (ISO 32000-1 §12.5.5) and honouring `/CA` opacity plus the Hidden/NoView flags.
+  Previously annotation appearances were not drawn.
+- **Floating shapes in XLSX / ODS export.** Page vector shapes are now carried
+  into a real drawing layer (XLSX `xl/drawings` `xdr:absoluteAnchor` + DrawingML
+  geometry/fill/stroke/dash; ODS `draw:` shapes), matching the DOCX/PPTX/ODT/ODP
+  exporters. Shape-less output stays byte-identical.
+
+### Changed
+
+- **Table column widths honoured.** The native HTML layout engine reads per-column
+  widths (`<colgroup>`/`<col>` or first-row cell widths; pt/px/%) and positions
+  cells proportionally, with `colspan` summing the spanned widths, instead of
+  forcing equal columns. The DOCX (`w:tblGrid`/`w:gridCol`) and ODF
+  (`table:table-column` / `style:column-width`) importers emit those widths.
+  Tables without declared widths keep equal columns (no regression).
+
 ## [0.49.0] - 2026-06-18
 
 ### Changed
