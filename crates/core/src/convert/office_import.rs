@@ -869,11 +869,12 @@ struct CellSpan {
     v_merge_restart: bool,
 }
 
-/// Emit one `w:tbl` (open already consumed) as an HTML `<table>`. Honours cell
-/// merges: `w:gridSpan` widens the cell (expanded to that many physical `<td>`s
-/// so the equal-column layout reflects the span, the first carrying a `colspan`
-/// for forward-compat); `w:vMerge` carries a `rowspan` hint and the covered
-/// continuation cells are dropped.
+/// Emit one `w:tbl` (open already consumed) as an HTML `<table>`. Reads the
+/// `w:tblGrid` (`w:gridCol w:w`, twips) into a leading `<colgroup>` so the
+/// layout honours real column widths. Honours cell merges: `w:gridSpan` widens
+/// the cell (expanded to that many physical `<td>`s so the layout reflects the
+/// span, the first carrying a `colspan` for forward-compat); `w:vMerge` carries
+/// a `rowspan` hint and the covered continuation cells are dropped.
 fn docx_table(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
@@ -881,11 +882,22 @@ fn docx_table(
     out: &mut String,
 ) {
     out.push_str("<table>");
+    // Collect `w:gridCol w:w` widths (twips→pt) and flush them as a <colgroup>
+    // just before the first row. `w:tblGrid` always precedes the rows.
+    let mut col_pts: Vec<f64> = Vec::new();
+    let mut colgroup_done = false;
     while let Some(tok) = x.next() {
         match tok {
-            Tok::Open(name, _, sc) => {
+            Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "tr" && !sc {
+                if ln == "gridCol" {
+                    if let Some(w) = attr(&attrs, "w").and_then(twips_to_pt) {
+                        if w > 0.0 {
+                            col_pts.push(w);
+                        }
+                    }
+                } else if ln == "tr" && !sc {
+                    flush_colgroup(&mut col_pts, &mut colgroup_done, out);
                     out.push_str("<tr>");
                 } else if ln == "tc" && !sc {
                     docx_cell(x, zip, rels, out);
@@ -903,6 +915,35 @@ fn docx_table(
         }
     }
     out.push_str("</table>");
+}
+
+/// Emit a `<colgroup>` of `<col style="width:Xpt">` from collected point widths,
+/// once, before the first row. No-op when no widths were declared.
+fn flush_colgroup(col_pts: &mut Vec<f64>, done: &mut bool, out: &mut String) {
+    if *done {
+        return;
+    }
+    *done = true;
+    if col_pts.is_empty() {
+        return;
+    }
+    out.push_str("<colgroup>");
+    for w in col_pts.drain(..) {
+        out.push_str(&format!("<col style=\"width:{}pt\">", fmt_pt(w)));
+    }
+    out.push_str("</colgroup>");
+}
+
+/// Format a point value compactly (trim trailing zeros) for inline CSS.
+fn fmt_pt(v: f64) -> String {
+    let mut s = format!("{v:.2}");
+    while s.contains('.') && s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
 }
 
 /// Emit one `w:tc` cell (open already consumed) until `</w:tc>`, applying its
@@ -1609,6 +1650,75 @@ fn parse_odf_pt(v: &str) -> Option<f64> {
     }
 }
 
+/// Build a `column-style-name → width(pt)` map from an ODF part. Reads each
+/// `style:style`'s `style:table-column-properties/@style:column-width` (ODF
+/// lengths via [`parse_odf_pt`]). Malformed/absent widths are simply omitted.
+fn odf_column_widths(xml: &str) -> BTreeMap<String, f64> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => cur_name = attr(&attrs, "name").map(|s| s.to_string()),
+                "table-column-properties" => {
+                    if let Some(nm) = &cur_name {
+                        if let Some(w) = attr(&attrs, "column-width")
+                            .and_then(parse_odf_pt)
+                            .filter(|w| *w > 0.0)
+                        {
+                            map.insert(nm.clone(), w);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    cur_name = None;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
+/// Handle a `table:table-column` token inside an ODF table: append `<col>`
+/// entries (honouring `table:number-columns-repeated`, cap 64) carrying the
+/// resolved width (when the column style declares one) into `pending`.
+fn odf_push_column(attrs: &[(String, String)], cols: &BTreeMap<String, f64>, pending: &mut String) {
+    let repeat = attr(attrs, "number-columns-repeated")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .min(64);
+    let width = attr(attrs, "style-name").and_then(|s| cols.get(s).copied());
+    for _ in 0..repeat {
+        match width {
+            Some(w) => pending.push_str(&format!("<col style=\"width:{}pt\">", fmt_pt(w))),
+            None => pending.push_str("<col>"),
+        }
+    }
+}
+
+/// Wrap accumulated `<col>` entries in a `<colgroup>` (once, before the first
+/// row). Emits nothing when no column carried a width (`<col>`-only padding is
+/// pointless for equal columns).
+fn flush_odf_colgroup(pending: &mut String, done: &mut bool, out: &mut String) {
+    if *done {
+        return;
+    }
+    *done = true;
+    if pending.is_empty() || !pending.contains("width:") {
+        pending.clear();
+        return;
+    }
+    out.push_str("<colgroup>");
+    out.push_str(pending);
+    out.push_str("</colgroup>");
+    pending.clear();
+}
+
 /// ODT → styled HTML → PDF. `text:h`→`<hN>`, `text:p`→`<p>`, `text:span`
 /// styled via the automatic/named style map, `table:table`→`<table>`,
 /// `draw:image xlink:href`→`<img>`.
@@ -1618,10 +1728,20 @@ pub fn odt_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut styles = odf_text_styles(&styles_xml);
     // Automatic styles in content.xml take precedence / add to the named ones.
     styles.extend(odf_text_styles(&content));
+    let mut cols = odf_column_widths(&styles_xml);
+    cols.extend(odf_column_widths(&content));
 
     let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
     let mut body = String::new();
-    odf_walk(&mut Xml::new(&content), zip, &styles, &mut body, None, None);
+    odf_walk(
+        &mut Xml::new(&content),
+        zip,
+        &styles,
+        &cols,
+        &mut body,
+        None,
+        None,
+    );
     render_geom(&body, geom)
 }
 
@@ -1641,6 +1761,7 @@ fn odf_walk(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
+    cols: &BTreeMap<String, f64>,
     out: &mut String,
     stop: Option<&str>,
     list_level: Option<u32>,
@@ -1677,9 +1798,9 @@ fn odf_walk(
                     // is transparent — its paragraphs are handled at this level.
                     "list" if !sc => {
                         let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
-                        odf_walk(x, zip, styles, out, Some("list"), next);
+                        odf_walk(x, zip, styles, cols, out, Some("list"), next);
                     }
-                    "table" if !sc => odf_table(x, zip, styles, out),
+                    "table" if !sc => odf_table(x, zip, styles, cols, out),
                     _ => {}
                 }
             }
@@ -1763,19 +1884,27 @@ fn odf_inline(
     out
 }
 
-/// Emit one `table:table` (open already consumed) as an HTML `<table>`.
+/// Emit one `table:table` (open already consumed) as an HTML `<table>`. Reads
+/// the `table:table-column` declarations into a leading `<colgroup>` so the
+/// layout honours each column style's `style:column-width`.
 fn odf_table(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
+    cols: &BTreeMap<String, f64>,
     out: &mut String,
 ) {
     out.push_str("<table>");
+    let mut pending_cols = String::new();
+    let mut colgroup_done = false;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "table-row" && !sc {
+                if ln == "table-column" {
+                    odf_push_column(&attrs, cols, &mut pending_cols);
+                } else if ln == "table-row" && !sc {
+                    flush_odf_colgroup(&mut pending_cols, &mut colgroup_done, out);
                     out.push_str("<tr>");
                 } else if ln == "table-cell" && !sc {
                     let repeat = attr(&attrs, "number-columns-repeated")
@@ -1783,7 +1912,7 @@ fn odf_table(
                         .unwrap_or(1)
                         .min(64);
                     let mut cell = String::new();
-                    odf_walk(x, zip, styles, &mut cell, Some("table-cell"), None);
+                    odf_walk(x, zip, styles, cols, &mut cell, Some("table-cell"), None);
                     let cell = cell.trim().to_string();
                     for _ in 0..repeat {
                         out.push_str("<td>");
@@ -1812,11 +1941,10 @@ fn odf_table(
 /// `table:number-columns-repeated` (capped ~64). Rendered landscape.
 pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let content = part(zip, "content.xml");
-    let geom = odf_geom(
-        &part(zip, "styles.xml"),
-        &content,
-        PageGeom::tabular_default(),
-    );
+    let styles_xml = part(zip, "styles.xml");
+    let geom = odf_geom(&styles_xml, &content, PageGeom::tabular_default());
+    let mut cols = odf_column_widths(&styles_xml);
+    cols.extend(odf_column_widths(&content));
     let mut body = String::new();
     let mut x = Xml::new(&content);
     let mut first = true;
@@ -1830,7 +1958,7 @@ pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
                 if let Some(nm) = attr(attrs, "name") {
                     body.push_str(&format!("<h2>{}</h2>", escaped(nm)));
                 }
-                ods_table(&mut x, &mut body);
+                ods_table(&mut x, &cols, &mut body);
             }
         }
     }
@@ -1842,13 +1970,19 @@ pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 
 /// Emit one ODS `table:table` (open consumed) as an HTML `<table>`, expanding
 /// repeated rows/columns (cap 64) and reading cell text from `text:p` runs.
-fn ods_table(x: &mut Xml, out: &mut String) {
+/// `table:table-column` declarations seed a leading `<colgroup>`.
+fn ods_table(x: &mut Xml, cols: &BTreeMap<String, f64>, out: &mut String) {
     out.push_str("<table>");
+    let mut pending_cols = String::new();
+    let mut colgroup_done = false;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "table-row" && !sc {
+                if ln == "table-column" {
+                    odf_push_column(&attrs, cols, &mut pending_cols);
+                } else if ln == "table-row" && !sc {
+                    flush_odf_colgroup(&mut pending_cols, &mut colgroup_done, out);
                     let rep = attr(&attrs, "number-rows-repeated")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
@@ -3176,6 +3310,134 @@ mod tests {
     }
 
     #[test]
+    fn docx_tblgrid_emits_proportional_colgroup() {
+        // w:tblGrid 3000/1000 twips → 150pt / 50pt columns in a leading
+        // <colgroup>; the rows still emit their cells unchanged.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:tbl>
+              <w:tblGrid>
+                <w:gridCol w:w="3000"/>
+                <w:gridCol w:w="1000"/>
+              </w:tblGrid>
+              <w:tr>
+                <w:tc><w:p><w:r><w:t>Wide</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>Narrow</w:t></w:r></w:p></w:tc>
+              </w:tr>
+            </w:tbl>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            html.contains(
+                "<colgroup><col style=\"width:150pt\"><col style=\"width:50pt\"></colgroup>"
+            ),
+            "proportional colgroup before rows: {html}"
+        );
+        // The colgroup precedes the first row.
+        let cg = html.find("<colgroup>").expect("colgroup present");
+        let tr = html.find("<tr>").expect("row present");
+        assert!(cg < tr, "colgroup precedes first row: {html}");
+        let pdf = office_to_pdf(&build_docx(doc, None, &[])).expect("docx converts");
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("Wide") && text.contains("Narrow"), "{text}");
+    }
+
+    #[test]
+    fn docx_gridspan_still_works_with_tblgrid() {
+        // gridSpan expansion (colspan + padding) is unaffected by the colgroup.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:tbl>
+              <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>
+              <w:tr>
+                <w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Wide</w:t></w:r></w:p></w:tc>
+              </w:tr>
+            </w:tbl>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            html.contains("colspan=\"2\""),
+            "colspan still emitted: {html}"
+        );
+        assert!(
+            html.contains("Wide</p></td><td></td>"),
+            "padding intact: {html}"
+        );
+        assert!(
+            html.contains("<colgroup>"),
+            "colgroup still emitted: {html}"
+        );
+    }
+
+    #[test]
+    fn docx_table_without_grid_has_no_colgroup() {
+        // No w:tblGrid ⇒ no <colgroup> (layout keeps equal columns).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:tbl><w:tr>
+              <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+              <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+            </w:tr></w:tbl>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            !html.contains("<colgroup>"),
+            "no grid ⇒ no colgroup: {html}"
+        );
+    }
+
+    #[test]
+    fn odf_table_column_widths_become_colgroup() {
+        // table:table-column referencing a style whose column-width is 3cm/1cm
+        // ⇒ a <colgroup> with the converted point widths (3cm ≈ 85.04pt).
+        let xml = r#"<x xmlns:table="tb" xmlns:text="t">
+            <table:table table:name="T">
+              <table:table-column table:style-name="co1"/>
+              <table:table-column table:style-name="co2"/>
+              <table:table-row>
+                <table:table-cell><text:p>A</text:p></table:table-cell>
+                <table:table-cell><text:p>B</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+          </x>"#;
+        let mut cols = BTreeMap::new();
+        cols.insert("co1".to_string(), 85.04); // 3cm
+        cols.insert("co2".to_string(), 28.35); // 1cm
+        let zip: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let styles: BTreeMap<String, String> = BTreeMap::new();
+        let mut x = Xml::new(xml);
+        // Advance to the <table:table> open so odf_table consumes from there.
+        while let Some(tok) = x.next() {
+            if let Tok::Open(name, _, false) = &tok {
+                if local(name) == "table" {
+                    break;
+                }
+            }
+        }
+        let mut out = String::new();
+        odf_table(&mut x, &zip, &styles, &cols, &mut out);
+        assert!(
+            out.contains(
+                "<colgroup><col style=\"width:85.04pt\"><col style=\"width:28.35pt\"></colgroup>"
+            ),
+            "ODF column widths in colgroup: {out}"
+        );
+        let cg = out.find("<colgroup>").expect("colgroup present");
+        let tr = out.find("<tr>").expect("row present");
+        assert!(cg < tr, "colgroup precedes first row: {out}");
+    }
+
+    #[test]
+    fn odf_column_widths_parses_column_properties() {
+        // style:column-width on a table-column style is read (cm→pt).
+        let xml = r#"<x xmlns:style="s" xmlns:table="tb">
+            <style:style style:name="co1" style:family="table-column">
+              <style:table-column-properties style:column-width="2cm"/>
+            </style:style>
+          </x>"#;
+        let map = odf_column_widths(xml);
+        let w = map.get("co1").copied().expect("co1 width parsed");
+        assert!((w - 56.6929134).abs() < 0.01, "2cm ≈ 56.69pt ({w})");
+    }
+
+    #[test]
     fn docx_vmerge_restart_and_continue() {
         // restart → rowspan hint; continue cell is dropped (column preserved).
         let doc = r#"<w:document xmlns:w="x"><w:body>
@@ -3343,11 +3605,13 @@ mod tests {
         // Inspect the generated body markup directly.
         let zip = read_zip(&odt);
         let styles = BTreeMap::new();
+        let cols = BTreeMap::new();
         let mut body = String::new();
         odf_walk(
             &mut Xml::new(&String::from_utf8_lossy(&zip["content.xml"])),
             &zip,
             &styles,
+            &cols,
             &mut body,
             None,
             None,

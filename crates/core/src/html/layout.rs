@@ -685,8 +685,13 @@ impl Flow<'_> {
         y
     }
 
-    /// Minimal table layout: equal-width columns, cells side-by-side, row height
-    /// = tallest cell. Good enough for tabular data; not full auto table layout.
+    /// Pragmatic table layout. Column widths come from a `<colgroup>`/`<col>`
+    /// set or the first row's per-cell `width`, normalised to fit `avail_w`
+    /// (fixed-layout style); columns with no declared width share the remainder
+    /// equally, so a table that declares nothing keeps **equal** columns. Cells
+    /// sit at the cumulative x of their starting column; `colspan` (including the
+    /// physical-cell expansion the Office importers emit) covers the summed
+    /// width of the columns it spans. Row height = tallest cell.
     fn table(
         &mut self,
         el: &Element,
@@ -699,17 +704,40 @@ impl Flow<'_> {
         y += style.margin.top;
         let na = push_ancestor(ancestors, el);
         let rows = collect_rows(el);
+
+        // Resolve per-column widths once for the whole table, then prefix-sum
+        // them so each cell can be placed by its starting column index.
+        let ncols = table_column_count(&rows);
+        let col_w = self.resolve_col_widths(el, style, &rows, &na, avail_w, ncols);
+        let mut cum_x = Vec::with_capacity(col_w.len() + 1);
+        let mut acc = 0.0;
+        cum_x.push(0.0);
+        for w in &col_w {
+            acc += w;
+            cum_x.push(acc);
+        }
+        // Width spanning columns `[start, start+span)`, clamped to the grid.
+        let span_geom = |start: usize, span: usize| -> (f64, f64) {
+            let s = start.min(col_w.len());
+            let e = (start + span.max(1)).min(col_w.len());
+            (cum_x[s], (cum_x[e] - cum_x[s]).max(1.0))
+        };
+
         for row in rows {
             let cells = collect_cells(row);
             if cells.is_empty() {
                 continue;
             }
-            let col_w = avail_w / cells.len() as f64;
             let row_top = y;
             let mut row_bottom = y;
-            for (ci, cell) in cells.iter().enumerate() {
+            // First pass: lay out content; remember each cell's column span.
+            let mut placed: Vec<(usize, usize)> = Vec::with_capacity(cells.len());
+            let mut col = 0usize;
+            for cell in &cells {
                 let cstyle = self.style_of(cell, style, &na);
-                let cx = x + ci as f64 * col_w;
+                let span = cell_colspan(cell);
+                let (dx, cw) = span_geom(col, span);
+                let cx = x + dx;
                 let nca = push_ancestor(&na, cell);
                 let p = &cstyle.padding;
                 let mut cy = row_top + p.top + cstyle.border_width.top;
@@ -717,23 +745,25 @@ impl Flow<'_> {
                     &cell.children,
                     &cstyle,
                     cx + p.left + cstyle.border_width.left,
-                    (col_w - p.left - p.right).max(1.0),
+                    (cw - p.left - p.right).max(1.0),
                     cy,
                     &nca,
                 );
                 cy += p.bottom + cstyle.border_width.bottom;
                 row_bottom = row_bottom.max(cy);
+                placed.push((col, span));
+                col += span.max(1);
             }
             // Cell borders/backgrounds spanning the full row height (z=0).
-            for (ci, cell) in cells.iter().enumerate() {
+            for (cell, &(start, span)) in cells.iter().zip(&placed) {
                 let cstyle = self.style_of(cell, style, &na);
-                let cx = x + ci as f64 * col_w;
+                let (dx, cw) = span_geom(start, span);
                 self.out.push(Abs {
                     z: 0,
                     frag: Fragment::Rect {
-                        x: cx,
+                        x: x + dx,
                         y: row_top,
-                        w: col_w,
+                        w: cw,
                         h: (row_bottom - row_top).max(0.1),
                         fill: cstyle.background,
                         stroke: Some(cstyle.border_color),
@@ -745,6 +775,90 @@ impl Flow<'_> {
             y = row_bottom;
         }
         y + style.margin.bottom
+    }
+
+    /// Resolve the table's column widths (length `ncols`) to absolute points
+    /// summing to `avail_w`. Declared widths come first from `<col>` elements
+    /// (honouring `span`), else from the first row's per-cell `width`. Columns
+    /// without a declared width split the remaining space equally; if every
+    /// column is declared the widths are scaled proportionally to fit `avail_w`
+    /// (browser fixed-layout). With nothing declared this yields equal columns.
+    fn resolve_col_widths(
+        &self,
+        table: &Element,
+        style: &Style,
+        rows: &[&Element],
+        na: &[&Element],
+        avail_w: f64,
+        ncols: usize,
+    ) -> Vec<f64> {
+        if ncols == 0 {
+            return Vec::new();
+        }
+        let equal = avail_w / ncols as f64;
+        let mut decl: Vec<Option<f64>> = vec![None; ncols];
+
+        // Source 1: <colgroup>/<col> declarations (each <col span="N">).
+        let cols = collect_cols(table);
+        if !cols.is_empty() {
+            let mut ci = 0usize;
+            for c in cols {
+                if ci >= ncols {
+                    break;
+                }
+                let span = cell_colspan(c); // reads `span`/`colspan`
+                let w = col_declared_width(c, avail_w);
+                for k in 0..span.max(1) {
+                    if ci + k < ncols {
+                        // A multi-column <col> applies its width per column.
+                        decl[ci + k] = w;
+                    }
+                }
+                ci += span.max(1);
+            }
+        } else if let Some(first) = rows.first() {
+            // Source 2: per-cell width on the first row's cells. A colspan cell
+            // distributes its declared width equally over the columns it covers.
+            let mut ci = 0usize;
+            for cell in collect_cells(first) {
+                if ci >= ncols {
+                    break;
+                }
+                let span = cell_colspan(cell);
+                let cstyle = self.style_of(cell, style, na);
+                let w = cstyle.width.map(|len| match len {
+                    Len::Pt(pt) => pt.max(0.0),
+                    Len::Percent(pc) => avail_w * pc / 100.0,
+                });
+                if let Some(total) = w {
+                    let per = total / span.max(1) as f64;
+                    for k in 0..span.max(1) {
+                        if ci + k < ncols {
+                            decl[ci + k] = Some(per);
+                        }
+                    }
+                }
+                ci += span.max(1);
+            }
+        }
+
+        let declared_sum: f64 = decl.iter().filter_map(|d| *d).sum();
+        let undeclared = decl.iter().filter(|d| d.is_none()).count();
+
+        if undeclared == 0 {
+            // All columns declared: scale to fit avail_w (fixed-layout). Guard a
+            // zero/degenerate sum by falling back to equal columns.
+            if declared_sum > 0.0 {
+                let scale = avail_w / declared_sum;
+                decl.iter().map(|d| d.unwrap_or(equal) * scale).collect()
+            } else {
+                vec![equal; ncols]
+            }
+        } else {
+            // Undeclared columns share whatever space the declared ones leave.
+            let fill = ((avail_w - declared_sum).max(0.0)) / undeclared as f64;
+            decl.iter().map(|d| d.unwrap_or(fill)).collect()
+        }
     }
 
     /// A flex container. Supports `flex-direction` (row | column),
@@ -1184,6 +1298,105 @@ fn collect_cells(row: &Element) -> Vec<&Element> {
         .collect()
 }
 
+/// `<col>` elements declared under the table's `<colgroup>` children (or a
+/// `<colgroup>` that itself acts as a column via its `span`, when it has no
+/// `<col>` children — per HTML semantics). Returns them in document order.
+fn collect_cols(table: &Element) -> Vec<&Element> {
+    let mut cols = Vec::new();
+    for c in &table.children {
+        if let Node::Element(group) = c {
+            if group.tag != "colgroup" {
+                continue;
+            }
+            let children: Vec<&Element> = group
+                .children
+                .iter()
+                .filter_map(|n| match n {
+                    Node::Element(e) if e.tag == "col" => Some(e),
+                    _ => None,
+                })
+                .collect();
+            if children.is_empty() {
+                // A childless <colgroup> spans `span` columns itself.
+                cols.push(group);
+            } else {
+                cols.extend(children);
+            }
+        }
+    }
+    cols
+}
+
+/// Number of physical columns a cell occupies: `colspan` (cells) or `span`
+/// (`<col>`/`<colgroup>`), defaulting to 1. Zero/garbage clamps to 1.
+fn cell_colspan(el: &Element) -> usize {
+    el.attr("colspan")
+        .or_else(|| el.attr("span"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
+/// Column count of a table: the maximum, over its rows, of the sum of cell
+/// `colspan`s in that row.
+fn table_column_count(rows: &[&Element]) -> usize {
+    rows.iter()
+        .map(|r| collect_cells(r).iter().map(|c| cell_colspan(c)).sum())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Declared width of a `<col>`: `style="width:.."` first, then a `width=".."`
+/// attribute. Percentages resolve against `avail_w`; bare numbers and `px` are
+/// pixels (1px = 0.75pt), `pt` is points — matching the CSS length convention.
+fn col_declared_width(col: &Element, avail_w: f64) -> Option<f64> {
+    if let Some(style) = col.attr("style") {
+        // Scan the inline declarations for a `width:` (ignore `min/max-width`).
+        for decl in style.split(';') {
+            let mut kv = decl.splitn(2, ':');
+            let key = kv.next().unwrap_or("").trim();
+            if key.eq_ignore_ascii_case("width") {
+                if let Some(val) = kv.next() {
+                    if let Some(w) = parse_table_width(val.trim(), avail_w) {
+                        return Some(w);
+                    }
+                }
+            }
+        }
+    }
+    col.attr("width")
+        .and_then(|v| parse_table_width(v.trim(), avail_w))
+}
+
+/// Parse a column width to absolute points. `%` → fraction of `avail_w`; `pt`
+/// stays; `px`/bare number → pixels (×0.75). Negatives and unparseable → None.
+fn parse_table_width(v: &str, avail_w: f64) -> Option<f64> {
+    let v = v.trim();
+    if let Some(n) = v.strip_suffix('%') {
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|p| *p >= 0.0)
+            .map(|p| avail_w * p / 100.0);
+    }
+    if let Some(n) = v.strip_suffix("pt") {
+        return n.trim().parse::<f64>().ok().filter(|p| *p >= 0.0);
+    }
+    if let Some(n) = v.strip_suffix("px") {
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|p| *p >= 0.0)
+            .map(|p| p * 0.75);
+    }
+    v.parse::<f64>()
+        .ok()
+        .filter(|p| *p >= 0.0)
+        .map(|p| p * 0.75)
+}
+
 /// Slice the absolute-positioned fragments into pages, splitting rects that
 /// straddle a page boundary so backgrounds/borders stay correct.
 fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<Fragment>> {
@@ -1376,6 +1589,92 @@ mod tests {
         let a = texts.iter().find(|(_, t)| t == "A").unwrap().0;
         let b = texts.iter().find(|(_, t)| t == "B").unwrap().0;
         assert!(b > a, "second cell is to the right of the first");
+    }
+
+    // x of a cell's text fragment.
+    fn cell_x(layout: &Layout, label: &str) -> f64 {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Text { x, text, .. } if text == label => Some(*x),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no text fragment {label:?}"))
+    }
+
+    // Page 612pt, margins 36pt ⇒ avail_w = 540. Default `td` padding 2pt +
+    // border 1pt ⇒ cell text sits 3pt inside its column, so a cell starting at
+    // column x renders its text at 36 + x + 3.
+    const CELL_INSET: f64 = 36.0 + 3.0;
+
+    #[test]
+    fn table_honours_colgroup_widths() {
+        // Declared 400/100pt (sum 500) is scaled to fill avail_w=540 (fixed
+        // layout): scale 1.08 ⇒ col[0] = 432, so cell B sits at 39 + 432 = 471,
+        // far past the equal-split midpoint (39 + 270 = 309).
+        let layout = run(
+            "<table><colgroup><col style=\"width:400pt\"><col style=\"width:100pt\"></colgroup>\
+             <tr><td>A</td><td>B</td></tr></table>",
+        );
+        let a = cell_x(&layout, "A");
+        let b = cell_x(&layout, "B");
+        assert!((a - CELL_INSET).abs() < 1.0, "first cell at left ({a})");
+        assert!(
+            (b - (CELL_INSET + 432.0)).abs() < 1.0,
+            "cell B starts at scaled col[0] width (~471), not avail_w/2 ({b})"
+        );
+    }
+
+    #[test]
+    fn table_honours_percent_col_widths() {
+        // 75% / 25% of 540 ⇒ col[0] = 405; cell B at 39 + 405 = 444.
+        let layout = run(
+            "<table><colgroup><col style=\"width:75%\"><col style=\"width:25%\"></colgroup>\
+             <tr><td>A</td><td>B</td></tr></table>",
+        );
+        let b = cell_x(&layout, "B");
+        assert!(
+            (b - (CELL_INSET + 405.0)).abs() < 1.0,
+            "cell B near 39 + 75%×540 = 444 ({b})"
+        );
+    }
+
+    #[test]
+    fn table_without_widths_keeps_equal_columns() {
+        // No declared widths ⇒ equal columns (270 each): cell B at 39 + 270.
+        let layout = run("<table><tr><td>A</td><td>B</td></tr></table>");
+        let b = cell_x(&layout, "B");
+        assert!(
+            (b - (CELL_INSET + 270.0)).abs() < 1.0,
+            "equal columns put B at ~309 ({b})"
+        );
+    }
+
+    #[test]
+    fn table_colspan_sums_column_widths() {
+        // Equal 3-col grid (180 each). A colspan=2 cell covers cols 0–1 (360),
+        // so "Tail" starts at column 2 ⇒ 39 + 360 = 399. Row 2 fixes the grid.
+        let layout = run("<table>\
+             <tr><td colspan=\"2\">Wide</td><td>Tail</td></tr>\
+             <tr><td>a</td><td>b</td><td>c</td></tr></table>");
+        let wide = cell_x(&layout, "Wide");
+        let tail = cell_x(&layout, "Tail");
+        let c = cell_x(&layout, "c");
+        assert!(
+            (wide - CELL_INSET).abs() < 1.0,
+            "spanning cell at left ({wide})"
+        );
+        assert!(
+            (tail - (CELL_INSET + 360.0)).abs() < 1.0,
+            "Tail after 2 columns (~399), proving colspan summed ({tail})"
+        );
+        // Third column of row 2 aligns under "Tail" (same start column index 2).
+        assert!(
+            (c - tail).abs() < 1.0,
+            "col 2 aligns across rows ({c} vs {tail})"
+        );
     }
 
     #[test]
