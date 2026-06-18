@@ -1944,6 +1944,11 @@ export class GigaPdfDoc {
    * font's char→glyph map (Identity-H, 2-byte glyph ids). `rgb` is packed
    * `0xRRGGBB`; `rotationDeg` rotates CCW about `(x, y)`. For a built-in base-14
    * family with no embedding, use {@link addStandardText}.
+   *
+   * Pass `opts` to bake **text decorations** into the run: `{ underline: true }`
+   * draws a rule just below the baseline, `{ strikethrough: true }` a rule near
+   * the x-height — both span the run's advance and are filled in the text colour.
+   * Omitting `opts` is fully backward-compatible (no decoration).
    */
   addText(
     page: number,
@@ -1954,11 +1959,14 @@ export class GigaPdfDoc {
     fontObj: number,
     rgb = 0,
     opacity = 1,
-    rotationDeg = 0
+    rotationDeg = 0,
+    opts?: { underline?: boolean; strikethrough?: boolean }
   ): boolean {
+    const underline = opts?.underline ? 1 : 0;
+    const strikethrough = opts?.strikethrough ? 1 : 0;
     return (
       this.g._withStr(text, (p, l) =>
-        this.ex().gp_add_text(
+        this.ex().gp_add_text_styled(
           this.h,
           page,
           x,
@@ -1969,7 +1977,9 @@ export class GigaPdfDoc {
           fontObj,
           RGB(rgb),
           opacity,
-          rotationDeg
+          rotationDeg,
+          underline,
+          strikethrough
         )
       ) === 0
     );
@@ -1981,6 +1991,10 @@ export class GigaPdfDoc {
    * {@link embedFont} (a Google Font fetched by the host, or one pulled out of
    * the document with {@link extractFont}) and use {@link addText}. Returns
    * `false` on an unknown font name or bad page.
+   *
+   * Pass `opts` to bake **text decorations** into the run: `{ underline: true }`
+   * and/or `{ strikethrough: true }` draw filled rules in the text colour.
+   * Omitting `opts` is fully backward-compatible (no decoration).
    */
   addStandardText(
     page: number,
@@ -1991,12 +2005,15 @@ export class GigaPdfDoc {
     fontName: string,
     rgb = 0,
     opacity = 1,
-    rotationDeg = 0
+    rotationDeg = 0,
+    opts?: { underline?: boolean; strikethrough?: boolean }
   ): boolean {
+    const underline = opts?.underline ? 1 : 0;
+    const strikethrough = opts?.strikethrough ? 1 : 0;
     return (
       this.g._withStr(text, (tp, tl) =>
         this.g._withStr(fontName, (fp, fl) =>
-          this.ex().gp_add_text_standard(
+          this.ex().gp_add_text_standard_styled(
             this.h,
             page,
             x,
@@ -2008,7 +2025,9 @@ export class GigaPdfDoc {
             fl,
             RGB(rgb),
             opacity,
-            rotationDeg
+            rotationDeg,
+            underline,
+            strikethrough
           )
         )
       ) === 0

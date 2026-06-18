@@ -5566,11 +5566,85 @@ impl Document {
         Ok(t0_id.0)
     }
 
+    /// Build the content-stream bytes for one or both text **decorations**
+    /// (`underline` / `strikethrough`) of a run, as filled rectangles in a `q … Q`
+    /// block. Returns empty bytes when both flags are off.
+    ///
+    /// The run is drawn along the text matrix's local +X axis from baseline origin
+    /// `(x, y)`, so the decoration lives in that same rotated frame: a `cm` carries
+    /// the rotation+translation `[cos sin -sin cos x y]` and the rectangles are
+    /// axis-aligned in local user space (run along +X, baseline at local Y=0).
+    /// Underline sits just below the baseline; strikethrough crosses near x-height.
+    /// `run_width` is the run's total advance in points (computed by the caller from
+    /// the glyph widths it already knows). Fill colour matches the text colour.
+    #[allow(clippy::too_many_arguments)]
+    fn decoration_ops(
+        x: f64,
+        y: f64,
+        run_width: f64,
+        size: f64,
+        color: [f64; 3],
+        rotation_deg: f64,
+        underline: bool,
+        strikethrough: bool,
+    ) -> Vec<u8> {
+        if (!underline && !strikethrough) || run_width <= 0.0 || size <= 0.0 {
+            return Vec::new();
+        }
+        let (sin, cos) = rotation_deg.to_radians().sin_cos();
+        let mut out = b"q\n".to_vec();
+        out.extend_from_slice(
+            format!(
+                "{r} {g} {b} rg\n{ma} {mb} {mc} {md} {x} {y} cm\n",
+                r = content::num(color[0]),
+                g = content::num(color[1]),
+                b = content::num(color[2]),
+                ma = content::num(cos),
+                mb = content::num(sin),
+                mc = content::num(-sin),
+                md = content::num(cos),
+                x = content::num(x),
+                y = content::num(y),
+            )
+            .as_bytes(),
+        );
+        // Local-frame rectangles: y is relative to the baseline (Y=0).
+        if underline {
+            // Just below the baseline; a stroke ~6% of the em.
+            let ty = -0.12 * size;
+            let th = 0.06 * size;
+            out.extend_from_slice(
+                format!(
+                    "0 {y} {w} {h} re\n",
+                    y = content::num(ty),
+                    w = content::num(run_width),
+                    h = content::num(th),
+                )
+                .as_bytes(),
+            );
+        }
+        if strikethrough {
+            // Around x-height (mid-glyph); a stroke ~5% of the em.
+            let ty = 0.26 * size;
+            let th = 0.05 * size;
+            out.extend_from_slice(
+                format!(
+                    "0 {y} {w} {h} re\n",
+                    y = content::num(ty),
+                    w = content::num(run_width),
+                    h = content::num(th),
+                )
+                .as_bytes(),
+            );
+        }
+        out.extend_from_slice(b"f\nQ\n");
+        out
+    }
+
     /// Add a real, selectable text run to a page's content stream, set in a font
     /// previously embedded with [`embed_truetype_font`](Self::embed_truetype_font).
     /// `x`/`y` are the text origin in PDF user space (origin bottom-left); `size`
     /// is in points; `color` is the RGB fill `0..=1`.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn add_text(
         &mut self,
@@ -5584,22 +5658,62 @@ impl Document {
         opacity: f64,
         rotation_deg: f64,
     ) -> Result<()> {
+        self.add_text_styled(
+            page_no,
+            x,
+            y,
+            size,
+            text,
+            font_obj,
+            color,
+            opacity,
+            rotation_deg,
+            false,
+            false,
+        )
+    }
+
+    /// Like [`add_text`](Self::add_text) but also bakes text **decorations**:
+    /// `underline` draws a rule just below the baseline and `strikethrough` a rule
+    /// near the x-height, both spanning the run's advance and filled in the text
+    /// colour. Pass `false`/`false` for an undecorated run (identical to
+    /// [`add_text`](Self::add_text)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_styled(
+        &mut self,
+        page_no: u32,
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        font_obj: u32,
+        color: [f64; 3],
+        opacity: f64,
+        rotation_deg: f64,
+        underline: bool,
+        strikethrough: bool,
+    ) -> Result<()> {
         let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
             EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
         })?;
-        // Identity-H shows two-byte glyph ids directly.
+        // Identity-H shows two-byte glyph ids directly. Accumulate the run advance
+        // (font units → points) for the decoration length while we build the hex.
+        let upm = ttf.units_per_em().max(1.0);
+        let mut run_units = 0.0f64;
         let mut hex = String::new();
         let used = self.font_used_gids.entry(font_obj).or_default();
         for ch in text.chars() {
             let gid = ttf.gid_for_unicode(ch as u32).unwrap_or(0);
             used.insert(gid);
+            run_units += ttf.advance_width(gid);
             hex.push_str(&format!("{gid:04X}"));
         }
+        let run_width = run_units * size / upm;
         let res_name = format!("GF{font_obj}");
         // Rotation rides on the text matrix [cos sin -sin cos x y]; at 0° this is
         // the identity rotation (cos=1, sin=0), so glyphs sit at (x, y).
         let (sin, cos) = rotation_deg.to_radians().sin_cos();
-        let inner = format!(
+        let mut inner = format!(
             "q\n{r} {g} {b} rg\nBT\n/{res} {size} Tf\n{ma} {mb} {mc} {md} {x} {y} Tm\n<{hex}> Tj\nET\nQ\n",
             r = content::num(color[0]),
             g = content::num(color[1]),
@@ -5614,6 +5728,18 @@ impl Document {
             y = content::num(y),
         )
         .into_bytes();
+        // Decoration rides in the same rotated frame, painted after the glyphs and
+        // under the same opacity envelope.
+        inner.extend_from_slice(&Self::decoration_ops(
+            x,
+            y,
+            run_width,
+            size,
+            color,
+            rotation_deg,
+            underline,
+            strikethrough,
+        ));
         // `with_opacity` wraps the run in an ExtGState (/ca + /CA) when opacity < 1
         // (and registers it on the page); at opacity 1 it returns `inner` as-is.
         let ops = self.with_opacity(page_no, inner, opacity)?;
@@ -5744,6 +5870,42 @@ impl Document {
         opacity: f64,
         rotation_deg: f64,
     ) -> Result<()> {
+        self.add_text_standard_styled(
+            page_no,
+            x,
+            y,
+            size,
+            text,
+            font_name,
+            color,
+            opacity,
+            rotation_deg,
+            false,
+            false,
+        )
+    }
+
+    /// Like [`add_text_standard`](Self::add_text_standard) but also bakes text
+    /// **decorations**: `underline` and `strikethrough` are filled rules spanning
+    /// the run, in the text colour. Pass `false`/`false` for an undecorated run
+    /// (identical to [`add_text_standard`](Self::add_text_standard)). The decoration
+    /// length uses the Helvetica advance metrics (per
+    /// [`helvetica_width`](Self::helvetica_width)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_standard_styled(
+        &mut self,
+        page_no: u32,
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        font_name: &str,
+        color: [f64; 3],
+        opacity: f64,
+        rotation_deg: f64,
+        underline: bool,
+        strikethrough: bool,
+    ) -> Result<()> {
         let base = Self::standard_base14(font_name)
             .ok_or_else(|| EngineError::Unsupported(format!("not a base-14 font: {font_name}")))?;
         let res_name = self.ensure_standard_font(page_no, base)?;
@@ -5783,6 +5945,19 @@ impl Document {
             inner.push(byte);
         }
         inner.extend_from_slice(b") Tj\nET\nQ\n");
+
+        // Decoration in the same rotated frame; length from the AFM advance widths.
+        let run_width = Self::helvetica_width(text, size);
+        inner.extend_from_slice(&Self::decoration_ops(
+            x,
+            y,
+            run_width,
+            size,
+            color,
+            rotation_deg,
+            underline,
+            strikethrough,
+        ));
 
         let ops = self.with_opacity(page_no, inner, opacity)?;
         let mut content = self.page_content(page_no)?;
@@ -11035,6 +11210,124 @@ mod tests {
         // Two distinct standard fonts must get distinct resource names.
         assert!(text.contains("/GpStd"), "unique standard-font resources");
         assert!(Document::open(&bytes).unwrap().page_count() >= 1, "re-opens");
+    }
+
+    /// Count occurrences of the `re` rectangle operator (token-boundary aware) in
+    /// the appended bytes — one per decoration rule.
+    fn count_re_ops(s: &str) -> usize {
+        s.lines().filter(|l| l.trim_end().ends_with(" re")).count()
+    }
+
+    #[test]
+    fn add_text_standard_underline_emits_rule() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let before = doc.page_content(1).unwrap().len();
+        doc.add_text_standard_styled(
+            1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, true, false,
+        )
+        .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        let added = &content[before..];
+        // Exactly one decoration rule, drawn in its own rotated frame (`cm` + fill).
+        assert_eq!(count_re_ops(added), 1, "one underline rectangle");
+        assert!(added.contains(" cm\n"), "decoration rides a cm frame");
+        assert!(added.contains("re\nf\n"), "rule is filled, not stroked");
+        // The underline sits at local Y = -0.12*size.
+        let expect_y = content::num(-0.12 * 20.0);
+        assert!(
+            added.contains(&format!("0 {expect_y} ")),
+            "underline rectangle at baseline offset {expect_y}: {added}"
+        );
+    }
+
+    #[test]
+    fn add_text_standard_strikethrough_emits_rule() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let before = doc.page_content(1).unwrap().len();
+        doc.add_text_standard_styled(
+            1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, false, true,
+        )
+        .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        let added = &content[before..];
+        assert_eq!(count_re_ops(added), 1, "one strikethrough rectangle");
+        // The strike crosses near x-height at local Y = 0.26*size.
+        let expect_y = content::num(0.26 * 20.0);
+        assert!(
+            added.contains(&format!("0 {expect_y} ")),
+            "strikethrough rectangle at x-height {expect_y}: {added}"
+        );
+    }
+
+    #[test]
+    fn add_text_standard_styled_emits_both() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let before = doc.page_content(1).unwrap().len();
+        doc.add_text_standard_styled(
+            1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, true, true,
+        )
+        .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        let added = &content[before..];
+        // Both rules in a single decoration block.
+        assert_eq!(count_re_ops(added), 2, "underline + strikethrough rectangles");
+        assert!(added.contains(&format!("0 {} ", content::num(-0.12 * 20.0))), "underline");
+        assert!(added.contains(&format!("0 {} ", content::num(0.26 * 20.0))), "strikethrough");
+    }
+
+    #[test]
+    fn add_text_standard_styled_none_matches_plain() {
+        // Flags off must produce byte-identical content to the undecorated call.
+        let mut styled = Document::open(&fixture("simple-text.pdf")).unwrap();
+        styled
+            .add_text_standard_styled(
+                1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, false,
+                false,
+            )
+            .unwrap();
+        let mut plain = Document::open(&fixture("simple-text.pdf")).unwrap();
+        plain
+            .add_text_standard(1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            styled.page_content(1).unwrap(),
+            plain.page_content(1).unwrap(),
+            "no decoration ⇒ identical to add_text_standard"
+        );
+        // And neither emits a rectangle.
+        let plain_str = String::from_utf8_lossy(&plain.page_content(1).unwrap()).into_owned();
+        assert_eq!(count_re_ops(&plain_str), 0, "no decoration rectangles when flags off");
+    }
+
+    #[test]
+    fn add_text_styled_embedded_bakes_decoration() {
+        // Embedded-font path: decoration is baked there too, spanning the run.
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let font = doc
+            .embed_truetype_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
+            .unwrap();
+        let before = doc.page_content(1).unwrap().len();
+        doc.add_text_styled(
+            1, 80.0, 650.0, 24.0, "Word", font, [0.0, 0.0, 0.0], 1.0, 0.0, true, true,
+        )
+        .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        let added = &content[before..];
+        // The glyph run is shown, plus both decoration rules.
+        assert!(added.contains("Tj"), "glyph run emitted");
+        assert_eq!(count_re_ops(added), 2, "underline + strikethrough on embedded run");
+        // Undecorated embedded run draws no rectangle.
+        let mut plain = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let f2 = plain
+            .embed_truetype_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
+            .unwrap();
+        let b2 = plain.page_content(1).unwrap().len();
+        plain
+            .add_text(1, 80.0, 650.0, 24.0, "Word", f2, [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        let plain_added =
+            String::from_utf8_lossy(&plain.page_content(1).unwrap()).into_owned()[b2..].to_string();
+        assert_eq!(count_re_ops(&plain_added), 0, "no rectangle on undecorated embedded run");
     }
 
     #[test]

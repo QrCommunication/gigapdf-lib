@@ -2628,6 +2628,84 @@ pub extern "C" fn gp_add_text_standard(
     })
 }
 
+/// Like `gp_add_text` but also bakes text decorations: pass `underline` and/or
+/// `strikethrough` non-zero to draw the corresponding rule (filled in the text
+/// colour, spanning the run). 0/0 is identical to `gp_add_text`. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_text_styled(
+    handle: *mut Document,
+    page: u32,
+    x: f64,
+    y: f64,
+    size: f64,
+    text_ptr: *const u8,
+    text_len: usize,
+    font_obj: u32,
+    rgb: u32,
+    opacity: f64,
+    rotation_deg: f64,
+    underline: i32,
+    strikethrough: i32,
+) -> i32 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    edit(handle, |doc| {
+        doc.add_text_styled(
+            page,
+            x,
+            y,
+            size,
+            text,
+            font_obj,
+            unpack_rgb(rgb),
+            opacity,
+            rotation_deg,
+            underline != 0,
+            strikethrough != 0,
+        )
+    })
+}
+
+/// Like `gp_add_text_standard` but also bakes text decorations: pass `underline`
+/// and/or `strikethrough` non-zero to draw the corresponding rule (filled in the
+/// text colour). 0/0 is identical to `gp_add_text_standard`. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_text_standard_styled(
+    handle: *mut Document,
+    page: u32,
+    x: f64,
+    y: f64,
+    size: f64,
+    text_ptr: *const u8,
+    text_len: usize,
+    font_ptr: *const u8,
+    font_len: usize,
+    rgb: u32,
+    opacity: f64,
+    rotation_deg: f64,
+    underline: i32,
+    strikethrough: i32,
+) -> i32 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    let font = unsafe { str_arg(font_ptr, font_len) };
+    edit(handle, |doc| {
+        doc.add_text_standard_styled(
+            page,
+            x,
+            y,
+            size,
+            text,
+            font,
+            unpack_rgb(rgb),
+            opacity,
+            rotation_deg,
+            underline != 0,
+            strikethrough != 0,
+        )
+    })
+}
+
 /// The document's embedded fonts as a JSON array
 /// `[{"baseFont":…,"format":"truetype"|"cff"|"type1"}]`. Host frees the buffer.
 #[no_mangle]
