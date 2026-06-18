@@ -139,8 +139,10 @@ mono-glyph classifier otherwise.
 
 - Per-script models are **feature-gated** (`ocr-alpha`, `ocr-cjk`, …); the default build
   embeds none, so it stays at the base size and behaviour.
-- `cjk` / `arabic` (RTL) / `deva` / `beng` / `taml` are **infra-ready** (class sets, fonts,
-  trainer) — each one training run away, **no runtime change**.
+- **Trained:** `alpha`, `taml`, `arabic` (RTL), `deva`, `beng` (`.gpocr` blobs) — see the
+  [training log](./OCR_TRAINING_LOG.md). `cjk` is **deliberately out of scope** (a real model
+  needs the full frequency charset, many CJK faces, and a much larger backbone for 3 000+
+  classes; the infra is in place if revisited).
 - Public API (`Document::ocr_page`, `OcrWord`, WASM `gp_ocr_*`, SDK `doc.ocr`) is preserved.
 
 **Host-loaded models (built).** Weights ship as a compact **`.gpocr`** blob the host loads
@@ -160,6 +162,11 @@ that step, before the improved retrain; e.g. `«FRAΝΚFURTΕR` → `«FRANKFURT
 variance over ±5.7°, centred shear), deskews via a bilinear rotation, and despeckles small
 connected components — robust to tilted/noisy scans, no-ops on clean print (skew ≈ 0).
 
-**Next (planned):** (a) a full **lexicon / char-n-gram beam CTC** (the disambiguation
-above is the lexicon-lite first step); (b) multi-column **XY-cut** layout analysis;
-(c) train the CJK / Arabic-Hebrew / Indic groups.
+**Configurable backbone (built).** Conv/GRU sizes are env-overridable (`GIGA_OCR_C1` /
+`C2` / `HID`); the `.gpocr` format and the runtime read every dimension from the blob, so a
+**larger model** (for dense Indic, or a future CJK) trains and host-loads with no runtime change.
+
+**Next (planned):** (a) a full **lexicon / char-n-gram beam CTC** (the disambiguation above
+is the lexicon-lite first step); (b) multi-column **XY-cut** layout analysis; (c) larger
+backbones to push the competitive Indic models past Tesseract. CJK remains **out of scope by
+decision**.

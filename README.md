@@ -131,19 +131,27 @@ to the mono-glyph classifier otherwise.
 
 - **Trained today:** group **`alpha`** — **Latin-extended + Cyrillic + Greek** printed
   (Polish, Czech, Turkish, Vietnamese, Russian, Ukrainian, Greek, …). On a synthetic
-  multi-script clean-print benchmark it **matches and edges out Tesseract 5.3.4 on CER**
-  (CER 0.248 vs 0.258, WER 0.637 vs 0.624 — see [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md)),
-  with **homoglyph script disambiguation** snapping Latin/Greek/Cyrillic lookalikes (A/Α/А).
+  multi-script clean-print benchmark it **comfortably beats Tesseract 5.3.4** — CER **0.119
+  vs 0.258** (~2.2×), WER 0.41 vs 0.62 (larger 24/48/96 backbone; see
+  [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md)) — with **homoglyph disambiguation**
+  snapping Latin/Greek/Cyrillic lookalikes (A/Α/А).
   *Caveat:* synthetic clean print on the four trained languages; real degraded scans and
   untrained scripts still favour Tesseract's breadth.
-- **Also trained:** group **`taml`** — **Tamil** (121 classes). Also **beats Tesseract**
-  on synthetic clean print (CER 0.091 vs 0.101, WER 0.39 vs 0.60) — first non-Latin script.
-- **Handwriting:** training mixes synthetic cursive/handprint fonts (Google Fonts
-  *Handwriting*, cmap-guarded) and **real handwriting datasets** (IAM, RIMES, … via the
-  HuggingFace datasets-server) — see [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
-- **Infra ready, not yet trained:** `cjk` (Chinese/Japanese/Korean), `arabic`
-  (Arabic/Hebrew, RTL), `deva`/`beng` (Indic) — class sets, fonts and the trainer
-  are in place; each is one training run away, with **no runtime change**.
+- **Also trained (non-Latin):** **Tamil** (`taml`) — **beats Tesseract** (0.077 vs 0.101);
+  **Arabic + Hebrew** (`arabic`, **RTL**) — beats Tesseract on synthetic (0.071 vs 0.349),
+  output verified non-mirrored; **Devanagari** (`deva`, larger 24/48/96 backbone) — now
+  **beats Tesseract** (0.078 vs 0.089); **Bengali** (`beng`) — competitive (0.104 vs 0.073),
+  larger-backbone retrain pending. Backbone is env-tunable (`GIGA_OCR_C1/C2/HID`); PIL **raqm**
+  shaping handles Indic/Arabic forms.
+- **Handwriting:** a handwriting-augmented variant **`ocr_alpha_hw.gpocr`** (synthetic
+  *Handwriting* fonts + real IAM/RIMES lines via the HF datasets-server, 24/48/96 backbone)
+  roughly **halves cursive CER** vs the print model (0.44 vs 0.84 on IAM test) while still
+  beating Tesseract on clean print; the printed champion stays primary for clean scans. Load
+  the variant via `gp_ocr_load_model` for handwriting-heavy input — see
+  [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
+- **Deliberately out of scope:** `cjk` (Chinese/Japanese/Korean) — **not trained by design**.
+  A usable model needs the full frequency charset, many CJK fonts, and a much larger backbone
+  for 3 000+ classes (a 152-char proof would be a toy); the infra is in place if revisited.
 - Design: [`docs/OCR_ARCHITECTURE.md`](docs/OCR_ARCHITECTURE.md) · data catalogue:
   [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md) · training log:
   [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md).

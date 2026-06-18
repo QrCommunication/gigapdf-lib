@@ -36,6 +36,13 @@ augmentation (blur + sensor noise)─┘            → train_ocr_crnn.py (CRNN 
 | 4 | 60 ep, lr 3e-3, **+ space class**, Sauvola inference | val_CER **0.174** | Space as a class fixed word boundaries (pipeline WER 1.00 → 0.70). Competitive with Tesseract — see below. |
 | 5 | 60 ep, **60 fonts / 16k lines**, + disambiguation | val_CER **0.120** | More font/data diversity. **Beats Tesseract on CER** (0.248 vs 0.258) — see below. |
 | 6 | 60 ep, group **`taml`** (Tamil, 121 classes, 120 fonts) | val_CER **0.045** | First non-Latin model. **Beats Tesseract** on Tamil (CER 0.091 vs 0.101, WER 0.39 vs 0.60). |
+| 7 | 60 ep, `alpha`+HW: 25 % HW fonts **+ 3 800 real IAM/RIMES** | val_CER 0.358 (mixed) | Handwriting variant `ocr_alpha_hw.gpocr`: real-HW CER 0.891→**0.499** (−44 %); clean print 0.248→0.282, so printed model stays primary — see below. |
+| 8 | 60 ep, group **`deva`** (Devanagari, 138 classes, 100 fonts) | val_CER **0.108** | Competitive on Devanagari — CER 0.104 vs Tesseract `hin` 0.089 (trails ~1.5 pts; conjuncts are hard). |
+| 9 | 60 ep, group **`beng`** (Bengali, 129 classes, 60 fonts) | val_CER **0.105** | Competitive on Bengali — CER 0.104 vs Tesseract `ben` 0.073 (Indic stacked conjuncts favour Tesseract). |
+| 10 | 60 ep, group **`arabic`** (Arabic+Hebrew, **RTL**, 142 classes, 4 fonts) | val_CER **0.054** | First RTL model: targets reversed to visual order for the monotonic CTC, runtime reverses back. Output verified **not** mirror-flipped. CER 0.071 vs Tesseract 0.349 (in-distribution; see caveat). |
+| 11 | 60 ep, **`deva` larger backbone 24/48/96** (vs 16/32/64) | val_CER **0.080** (was 0.108) | Capacity was the Indic bottleneck: deva **flips to beating Tesseract** (CER 0.104→**0.078** vs 0.089). `.gpocr` 124 KB (was 62). Backbone now env-tunable (`GIGA_OCR_C1/C2/HID`); being applied to all groups. |
+| 12 | 60 ep, **`alpha` larger backbone 24/48/96**, 16k lines | val_CER **0.093** (was 0.120) | Big win: clean-print CER **0.248→0.119** — now **~2.2× better than Tesseract** (0.258). 557 classes were badly capacity-starved at 16/32/64. `.gpocr` 207 KB. |
+| 13 | 60 ep, **`taml` larger backbone 24/48/96** | val_CER **0.030** (was 0.045) | Tamil CER 0.091→**0.077** vs Tesseract 0.101 — wider win. |
 
 CER here is **per-character on held-out validation strips** (same render distribution),
 measured inside the trainer — it isolates the *model*, not the full image pipeline.
@@ -79,6 +86,7 @@ augmentation, dark-on-white, ×3 upscale), runs both engines on identical PNGs
 | Run 4 (+ space class, + Sauvola) | 0.295 | 0.70 | 0.258 | 0.624 |
 | Run 4 + script disambiguation | 0.278 | 0.683 | 0.258 | 0.624 |
 | **Run 5 (60 fonts / 16k lines) + disambiguation** | **0.248** | **0.637** | 0.258 | 0.624 |
+| **Larger backbone 24/48/96 (run 12)** | **0.119** | **0.406** | 0.258 | 0.624 |
 
 Honest reading: the dependency-free CRNN now **matches and edges out Tesseract on CER**
 (0.248 vs 0.258), WER essentially tied (0.637 vs 0.624) — having started at 0.80. The path:
@@ -105,6 +113,30 @@ render properly, not as isolated forms. CJK is deferred (a 16/32/64 backbone can
 3 000+ classes, and only one system CJK face is installed); Arabic/Hebrew/Indic-other need
 their datasets. Same caveat as alpha: synthetic clean print at the training distribution.
 
+### Handwriting — printed vs handwriting-augmented `alpha` (two specialised models)
+
+Run 7 trained a handwriting mix into `alpha` — 25 % of synthetic lines rendered in
+Google-Fonts *Handwriting* faces (199, cmap-guarded) **+ 3 800 real IAM/RIMES lines**
+(HF datasets-server). One backbone can't fully excel at clean print **and** cursive at once,
+so we ship **two artifacts** and let the host pick at load time (`gp_ocr_load_model`). Both
+were retrained at the **larger 24/48/96 backbone**:
+
+| Model | Clean-print CER | Real-handwriting CER (IAM test, n=80) |
+|-------|-----------------|----------------------------------------|
+| `ocr_alpha.gpocr` (printed champion, 24/48/96) | **0.119** (beats Tesseract 0.258) | 0.839 |
+| `ocr_alpha_hw.gpocr` (handwriting-augmented, 24/48/96) | 0.187 | **0.440** |
+| Tesseract 5.3.4 | 0.258 | 0.353 |
+
+The handwriting mix roughly **halves** handwriting CER (0.839 → 0.440, **−48 %**) while still
+beating Tesseract on clean print (0.187 vs 0.258); the printed champion stays the clean-print
+leader (0.119). The larger backbone improved **both** axes over the original 16/32/64 variant
+(clean 0.282→0.187, cursive 0.499→0.440). gigapdf's handwriting model still trails Tesseract
+on cursive (0.440 vs 0.353): closing that needs **more real handwriting data** — an **HF
+token** unlocks the gated IAM-full / CASIA / KHATT / IIIT-HW corpora (`hw_datasets._hf_token`).
+Knobs: train with `GIGA_OCR_HW_FRAC` + `GIGA_OCR_HW_REAL="iam,rimes,…"`; eval with
+`tools/ocr/bench_hw.py`. Bake a chosen variant into its Cargo feature with
+`tools/ocr/gpocr_to_rs.py`.
+
 ## Reproduce
 
 ```bash
@@ -123,11 +155,12 @@ Knobs (env): `GIGA_OCR_NLINES`, `GIGA_OCR_MAXCHARS`, `GIGA_OCR_LANGS`,
 
 | Group | Scripts | Infra | Model |
 |-------|---------|-------|-------|
-| `alpha` | Latin-ext + Cyrillic + Greek | ✅ | ✅ trained — **beats Tesseract** (CER 0.248 vs 0.258) |
-| `taml` | Tamil | ✅ | ✅ trained — **beats Tesseract** (CER 0.091 vs 0.101) |
-| `cjk` | Chinese / Japanese / Korean | ✅ class sets + fonts | ⏳ not trained (capacity; CASIA-HWDB2 HW data available) |
-| `arabic` | Arabic / Hebrew (RTL) | ✅ | ⏳ not trained |
-| `deva` / `beng` | Indic (Devanagari, Bengali) | ✅ | ⏳ not trained |
+| `alpha` | Latin-ext + Cyrillic + Greek | ✅ | ✅ trained, **larger backbone 24/48/96** — CER **0.119** vs Tesseract 0.258 (was 0.248 at 16/32/64 — capacity was the limit) |
+| `taml` | Tamil | ✅ | ✅ trained, **24/48/96** — beats Tesseract (CER **0.077** vs 0.101; was 0.091 at 16/32/64) |
+| `cjk` | Chinese / Japanese / Korean | ✅ class sets + fonts | ⛔ **deliberately not trained** (scope decision) — a 152-char fallback would be a toy; a real CJK model needs the full frequency charset (`load_charset`), many CJK faces (1 system), and a much larger backbone for 3 000+ classes |
+| `arabic` | Arabic / Hebrew (**RTL**) | ✅ | ✅ trained **24/48/96**, RTL verified; CER **0.063** vs Tesseract 0.349 (was 0.071; only 4 fonts cap the gain) |
+| `deva` | Devanagari | ✅ | ✅ trained, **larger backbone 24/48/96** — now **beats Tesseract** (CER **0.078** vs 0.089; was 0.104 at 16/32/64) |
+| `beng` | Bengali | ✅ | ✅ trained **24/48/96** — competitive (CER **0.097** vs Tesseract `ben` 0.073; font/data-limited, not capacity) |
 
 Each group trains with the same command (`train_ocr_crnn.py <group>`) and wires in via
 its `ocr-<group>` Cargo feature; no runtime code change.

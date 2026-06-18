@@ -40,8 +40,12 @@ from scripts import SCRIPTS, alphabet_for, is_rtl  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 H = 32                   # must equal ocr_crnn::STRIP_H and render_lines.STRIP_H
-C1_OUT, C2_OUT = 16, 32
-HID = 64                 # GRU hidden units per direction
+# Backbone size — env-overridable so a larger model can be trained for hard scripts
+# (CJK, dense Indic). The .gpocr format and the Rust runtime read every conv/GRU
+# dimension from the blob, so a bigger model host-loads with no runtime change.
+C1_OUT = int(os.environ.get("GIGA_OCR_C1", 16))
+C2_OUT = int(os.environ.get("GIGA_OCR_C2", 32))
+HID = int(os.environ.get("GIGA_OCR_HID", 64))    # GRU hidden units per direction
 N_LINES = 60_000         # synthetic lines sampled from the corpus
 BATCH = 64
 
@@ -205,6 +209,16 @@ def build_and_train(group: str, epochs: int):
 
     alphabet = alphabet_for(group)
     idx = {c: i for i, c in enumerate(alphabet)}
+    rtl = is_rtl(group)
+
+    def encode(text: str) -> list[int]:
+        # Class-index target. For RTL scripts (Arabic/Hebrew), raqm renders glyphs in visual
+        # order (first logical char on the right), but CTC is monotonic over the L→R pixel
+        # sequence — so the target must be in VISUAL order too. We reverse here; the runtime
+        # reverses the decode back to logical (ocr_crnn::ctc_greedy_decode honours `rtl`). The
+        # trainer's val metric uses these same visual-order targets, so it stays consistent.
+        tgt = [idx[c] for c in text if c in idx]
+        return tgt[::-1] if rtl else tgt
     # Prefer coverage-filtered SYSTEM fonts (correct glyphs, high diversity, no
     # network/subset tofu); fall back to the Google/Noto API downloader.
     fontlimit = int(os.environ.get("GIGA_OCR_FONTLIMIT", 60))
@@ -237,7 +251,7 @@ def build_and_train(group: str, epochs: int):
         if r is None:
             continue
         arr, t = r
-        tgt = [idx[c] for c in t if c in idx]
+        tgt = encode(t)
         if tgt and arr.shape[1] >= 8:
             samples.append((arr.astype(np.float32), tgt))
     print(f"  usable line samples: {len(samples)} (synthetic)")
@@ -251,7 +265,7 @@ def build_and_train(group: str, epochs: int):
         added = 0
         for ds in (d.strip() for d in hw_real.split(",") if d.strip()):
             for arr, t in hw_datasets.fetch_lines(ds, per):
-                tgt = [idx[c] for c in t if c in idx]
+                tgt = encode(t)
                 if tgt and arr.shape[1] >= 8:
                     samples.append((arr.astype(np.float32), tgt))
                     added += 1
