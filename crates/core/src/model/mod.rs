@@ -27,12 +27,14 @@
 //! [`Generic`](crate::convert::style::Generic)), [`PathSeg`](crate::content::vector::PathSeg)
 //! for vector shapes.
 
+pub mod edit;
 pub mod geom;
 pub mod json;
 pub mod sheet;
 pub mod slide;
 pub mod style;
 
+pub use edit::{apply_ops, parse_ops, BlockAddr, ModelOp, StylePatch};
 pub use geom::{Margins, PageGeometry, Rect, Rotation};
 pub use sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
 pub use slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};

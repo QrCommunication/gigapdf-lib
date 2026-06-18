@@ -711,6 +711,106 @@ export class GigaPdfEngine {
       )
     ) as HtmlResourceNeed[];
   }
+
+  // ── unified editable model: lower / edit / raise ───────────────────────────
+  //
+  // The {@link GigaDocument} model is a format-neutral tree (sections → pages →
+  // blocks → runs). Lower any format into it (`*ToModel`), edit it with
+  // {@link applyModelOps}, then raise it back to any format (`modelTo*`). This is
+  // the substrate for a universal editor that edits every format the same way.
+
+  /** Decode a model-JSON buffer returned by a `gp_model_*` export; `null` on an
+   * empty (error) result. */
+  private _modelOrNull(call: (outLenPtr: number) => number): GigaDocument | null {
+    const s = this._str(call);
+    return s ? (JSON.parse(s) as GigaDocument) : null;
+  }
+
+  /**
+   * Lower an Office document (DOCX/XLSX/PPTX/ODT/ODS/ODP, auto-detected) into the
+   * unified {@link GigaDocument} model. Returns `null` if the bytes aren't a
+   * recognized Office container.
+   */
+  officeToModel(office: Uint8Array): GigaDocument | null {
+    return this._withBytes(office, (p, l) =>
+      this._modelOrNull((o) => this.ex.gp_model_from_office(p, l, o))
+    );
+  }
+
+  /** Lower an HTML string into the unified {@link GigaDocument} model. */
+  htmlToModel(html: string): GigaDocument {
+    return this._withStr(html, (p, l) =>
+      JSON.parse(this._str((o) => this.ex.gp_model_from_html(p, l, o)))
+    ) as GigaDocument;
+  }
+
+  /**
+   * Apply a batch of {@link ModelOp} edits to a model and return the edited
+   * model. Ops run in order; out-of-range addresses (and any op that can't be
+   * parsed) are silently skipped, so a partially-valid batch never throws.
+   */
+  applyModelOps(model: GigaDocument, ops: ModelOp[]): GigaDocument {
+    return this._withStr(JSON.stringify(model), (mp, ml) =>
+      this._withStr(JSON.stringify(ops), (op, ol) =>
+        JSON.parse(this._str((o) => this.ex.gp_model_apply_ops(mp, ml, op, ol, o)))
+      )
+    ) as GigaDocument;
+  }
+
+  /** Raise a {@link GigaDocument} model to an editable Word document (`.docx`). */
+  modelToDocx(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_docx(p, l, o))
+    );
+  }
+  /** Raise a model to an Excel workbook (`.xlsx`). */
+  modelToXlsx(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_xlsx(p, l, o))
+    );
+  }
+  /** Raise a model to a PowerPoint presentation (`.pptx`). */
+  modelToPptx(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_pptx(p, l, o))
+    );
+  }
+  /** Raise a model to an OpenDocument Text (`.odt`). */
+  modelToOdt(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_odt(p, l, o))
+    );
+  }
+  /** Raise a model to an OpenDocument Spreadsheet (`.ods`). */
+  modelToOds(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_ods(p, l, o))
+    );
+  }
+  /** Raise a model to an OpenDocument Presentation (`.odp`). */
+  modelToOdp(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_odp(p, l, o))
+    );
+  }
+  /** Raise a model back to a PDF. */
+  modelToPdf(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_pdf(p, l, o))
+    );
+  }
+  /** Raise a model to standalone HTML (decoded UTF-8 string). */
+  modelToHtml(model: GigaDocument): string {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._str((o) => this.ex.gp_model_to_html(p, l, o))
+    );
+  }
+  /** Raise a model to RTF (decoded UTF-8 string). */
+  modelToRtf(model: GigaDocument): string {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._str((o) => this.ex.gp_model_to_rtf(p, l, o))
+    );
+  }
 }
 
 /** Pack `HtmlResource[]` (host-fetched URLs) into the little-endian blob
@@ -909,6 +1009,144 @@ export interface DocumentLanguage {
   /** Best-effort ISO-639-1 code, or `undefined` when undecidable. */
   lang?: string;
 }
+
+// ── unified editable model (structural mirror of crate::model::Document JSON) ──
+//
+// These interfaces are a permissive, partial mirror of the model's stable JSON
+// envelope. They give a host enough structure to read and rebuild a model (the
+// fields it edits) without re-declaring every leaf; opaque sub-objects are typed
+// loosely. The producers ({@link GigaPdfDoc.toModel}, {@link
+// GigaPdfEngine.officeToModel}, {@link GigaPdfEngine.htmlToModel}) and the
+// consumers ({@link GigaPdfEngine.modelToDocx} …) all round-trip this shape.
+
+/** A portable font fallback class (mirrors `convert::style::Generic`). */
+export type GigaGeneric = 'sans' | 'serif' | 'mono';
+
+/** A run's character style (mirror of `model::style::CharStyle`'s JSON). */
+export interface GigaCharStyle {
+  family: string;
+  generic: GigaGeneric;
+  size_pt: number;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  strike: boolean;
+  /** RGB `0..=1`, or `null` for default black. */
+  color: [number, number, number] | null;
+  valign: 'baseline' | 'super' | 'sub';
+}
+
+/** An inline node (tagged): a styled run, a line break, an image, or a link. */
+export type GigaInline =
+  | { t: 'run'; text: string; style: GigaCharStyle; source_index: number | null }
+  | { t: 'break' }
+  | { t: 'image'; [k: string]: unknown }
+  | { t: 'link'; [k: string]: unknown };
+
+/** A block payload (tagged by `t`); only the common shapes are spelled out. */
+export interface GigaBlockKind {
+  t: 'paragraph' | 'heading' | 'list' | 'table' | 'image' | 'shape' | 'textbox' | 'sheet' | 'slide';
+  /** The variant body — e.g. a paragraph carries `{ runs: GigaInline[], … }`. */
+  v?: unknown;
+}
+
+/** A block: a stable id, an optional placement frame + rotation, and its kind. */
+export interface GigaBlock {
+  id: number;
+  frame: { x: number; y: number; w: number; h: number } | null;
+  rotation: { t: 'd0' | 'd90' | 'd180' | 'd270' | 'deg'; v?: number };
+  kind: GigaBlockKind;
+}
+
+/** A page: a list of blocks; `absolute` flags slide/form (positioned) layout. */
+export interface GigaPage {
+  blocks: GigaBlock[];
+  absolute: boolean;
+}
+
+/** A section: one page geometry, optional running header/footer, and its pages. */
+export interface GigaSection {
+  geometry: { width: number; height: number; [k: string]: unknown };
+  header: GigaBlock[] | null;
+  footer: GigaBlock[] | null;
+  pages: GigaPage[];
+}
+
+/**
+ * The unified editable document model — the format-neutral tree every format
+ * lowers into and is reconstructed from. `v` is the envelope version. Leaves
+ * beyond what a host typically edits (`styles`, `outline`, `resources`) are
+ * carried opaquely so a round-trip preserves them.
+ */
+export interface GigaDocument {
+  v: number;
+  meta: {
+    title: string | null;
+    author: string | null;
+    subject: string | null;
+    keywords: string[];
+    lang: string | null;
+  };
+  styles: unknown;
+  sections: GigaSection[];
+  outline: unknown[];
+  resources: unknown;
+}
+
+/**
+ * A positional block address `[section, page, index]` (all zero-based) — the
+ * stable handle an edit op uses to target a block (mirrors `model::BlockAddr`).
+ */
+export type GigaBlockAddr = [section: number, page: number, index: number];
+
+/**
+ * A character-style patch for restyle/insert ops: only the present fields are
+ * applied (mirror of `model::edit::StylePatch`). `color: null` clears the colour
+ * (→ default black); omitting `color` leaves it unchanged.
+ */
+export interface GigaStylePatch {
+  family?: string;
+  generic?: GigaGeneric;
+  size_pt?: number;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strike?: boolean;
+  color?: [number, number, number] | null;
+}
+
+/** A typed spreadsheet cell value (tagged; mirror of `model::CellValue`). */
+export type GigaCellValue =
+  | { t: 'empty' }
+  | { t: 'text'; v: string }
+  | { t: 'number'; v: number }
+  | { t: 'bool'; v: boolean };
+
+/**
+ * A single editing operation against a {@link GigaDocument} model, mirroring the
+ * JSON shape of `model::edit::ModelOp`. Pass an array to
+ * {@link GigaPdfEngine.applyModelOps}; ops run in order and out-of-range
+ * addresses are no-ops.
+ */
+export type ModelOp =
+  | { op: 'setRunText'; addr: GigaBlockAddr; run: number; text: string }
+  | { op: 'restyleRun'; addr: GigaBlockAddr; run: number; style: GigaStylePatch }
+  | { op: 'insertRun'; addr: GigaBlockAddr; run: number; text: string; style?: GigaStylePatch }
+  | { op: 'deleteRun'; addr: GigaBlockAddr; run: number }
+  | { op: 'insertBlock'; addr: GigaBlockAddr; block: GigaBlock }
+  | { op: 'deleteBlock'; addr: GigaBlockAddr }
+  | { op: 'moveBlock'; addr: GigaBlockAddr; to: GigaBlockAddr }
+  | { op: 'setBlockText'; addr: GigaBlockAddr; text: string }
+  | { op: 'restyleBlock'; addr: GigaBlockAddr; style: GigaStylePatch }
+  | { op: 'setCellText'; addr: GigaBlockAddr; row: number; col: number; text: string }
+  | {
+      op: 'setSheetCell';
+      addr: GigaBlockAddr;
+      sheet: number;
+      row: number;
+      col: number;
+      value: GigaCellValue;
+    };
 /**
  * An image element from {@link GigaPdfDoc.imageElements}: its placement box
  * (page user space, origin bottom-left), the embeddable encoded bytes + format,
@@ -1817,6 +2055,17 @@ export class GigaPdfDoc {
   }
   toHtml(): string {
     return this.g._str((o) => this.ex().gp_to_html(this.h, o));
+  }
+  /**
+   * Reconstruct this PDF into the **unified editable model** — the
+   * format-neutral {@link GigaDocument} tree (sections → pages → blocks → runs)
+   * that every format lowers into. Edit it with
+   * {@link GigaPdfEngine.applyModelOps}, then export it to any target with
+   * {@link GigaPdfEngine.modelToDocx} / {@link GigaPdfEngine.modelToPdf} / … —
+   * the foundation for editing any document indifferently of its source format.
+   */
+  toModel(): GigaDocument {
+    return JSON.parse(this.g._str((o) => this.ex().gp_model_from_pdf(this.h, o))) as GigaDocument;
   }
   toDocx(): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_to_docx(this.h, o));

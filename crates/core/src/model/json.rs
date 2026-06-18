@@ -72,6 +72,30 @@ impl Document {
     }
 }
 
+/// Serialize a single [`Block`] to its stable JSON shape — the exact inverse of
+/// [`block_from_json`]. Lets a host emit a block to splice via
+/// [`model::edit`](crate::model::edit)'s `insertBlock` op.
+pub fn block_to_json(block: &Block) -> String {
+    let mut w = Writer::new();
+    w.block(block);
+    w.out
+}
+
+/// Parse a single [`Block`] from the same JSON shape [`block_to_json`] (and
+/// [`Document::to_json`]) emit for a block — used by
+/// [`model::edit`](crate::model::edit)'s `insertBlock` op. Returns `None` on
+/// malformed input or trailing junk.
+pub fn block_from_json(s: &str) -> Option<Block> {
+    let mut r = Reader::new(s.as_bytes());
+    let block = r.block()?;
+    r.ws();
+    if r.i == r.b.len() {
+        Some(block)
+    } else {
+        None
+    }
+}
+
 // ───────────────────────── writer ────────────────────────────────────────────
 
 /// Tiny JSON writer: object/array scaffolding + primitive emitters. Keeps a

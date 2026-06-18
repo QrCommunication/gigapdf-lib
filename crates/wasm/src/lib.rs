@@ -1893,6 +1893,199 @@ pub extern "C" fn gp_to_pdfa(handle: *const Document, out_len: *mut usize) -> *m
     }
 }
 
+// ─── unified editable model: produce / edit / export ─────────────────────────
+//
+// The format-neutral `model::Document` is carried across the FFI boundary as its
+// stable JSON envelope (UTF-8 bytes). The host parses it, edits it (directly or
+// via `gp_model_apply_ops`), then exports it to any target format. Every export
+// fn parses the JSON model, runs the matching `*_from_model` converter, and
+// returns the bytes; bad JSON / null input → null pointer + `out_len = 0`.
+
+/// Reconstruct the unified editable model from an open PDF handle. Returns the
+/// model as JSON (the `model::Document` envelope). Null on null handle.
+#[no_mangle]
+pub extern "C" fn gp_model_from_pdf(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => unsafe {
+            bytes_into_host(doc.reconstruct_model().to_json().into_bytes(), out_len)
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Lower an Office document (DOCX/XLSX/PPTX/ODT/ODS/ODP, auto-detected) at
+/// `(ptr, len)` into the unified model, returned as JSON. Null on unrecognized
+/// or empty input.
+#[no_mangle]
+pub extern "C" fn gp_model_from_office(
+    ptr: *const u8,
+    len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if ptr.is_null() || len == 0 {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match gigapdf_core::convert::office_to_model(bytes) {
+        Some(model) => unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Lower an HTML string at `(ptr, len)` into the unified model, returned as JSON.
+#[no_mangle]
+pub extern "C" fn gp_model_from_html(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let html = unsafe { str_arg(ptr, len) };
+    let model = gigapdf_core::convert::html_to_model(html);
+    unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) }
+}
+
+/// Apply a batch of edit ops to a model. `(model_ptr, model_len)` is the model
+/// JSON, `(ops_ptr, ops_len)` is a JSON array of ops (see `model::edit`).
+/// Returns the edited model as JSON. Null when the model JSON is malformed.
+/// (Unparseable individual ops and out-of-range addresses are silently skipped.)
+#[no_mangle]
+pub extern "C" fn gp_model_apply_ops(
+    model_ptr: *const u8,
+    model_len: usize,
+    ops_ptr: *const u8,
+    ops_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let model_json = unsafe { str_arg(model_ptr, model_len) };
+    let mut model = match gigapdf_core::model::Document::from_json(model_json) {
+        Some(m) => m,
+        None => return std::ptr::null_mut(),
+    };
+    let ops_json = unsafe { str_arg(ops_ptr, ops_len) };
+    let ops = gigapdf_core::model::parse_ops(ops_json);
+    gigapdf_core::model::apply_ops(&mut model, &ops);
+    unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) }
+}
+
+/// Shared body for the model exporters: parse the model JSON, run `convert` on
+/// it, return the bytes. Null pointer + `out_len = 0` on malformed model JSON.
+fn model_export(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+    convert: impl FnOnce(&gigapdf_core::model::Document) -> Vec<u8>,
+) -> *mut u8 {
+    let json = unsafe { str_arg(model_ptr, model_len) };
+    match gigapdf_core::model::Document::from_json(json) {
+        Some(model) => unsafe { bytes_into_host(convert(&model), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Export a model (JSON) to an editable Word document (`.docx`).
+#[no_mangle]
+pub extern "C" fn gp_model_to_docx(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::docx_from_model(m)
+    })
+}
+
+/// Export a model (JSON) to an Excel workbook (`.xlsx`).
+#[no_mangle]
+pub extern "C" fn gp_model_to_xlsx(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::xlsx_from_model(m)
+    })
+}
+
+/// Export a model (JSON) to a PowerPoint presentation (`.pptx`).
+#[no_mangle]
+pub extern "C" fn gp_model_to_pptx(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::pptx_from_model(m)
+    })
+}
+
+/// Export a model (JSON) to an OpenDocument Text (`.odt`).
+#[no_mangle]
+pub extern "C" fn gp_model_to_odt(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::odt_from_model(m)
+    })
+}
+
+/// Export a model (JSON) to an OpenDocument Spreadsheet (`.ods`).
+#[no_mangle]
+pub extern "C" fn gp_model_to_ods(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::ods_from_model(m)
+    })
+}
+
+/// Export a model (JSON) to an OpenDocument Presentation (`.odp`).
+#[no_mangle]
+pub extern "C" fn gp_model_to_odp(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::odp_from_model(m)
+    })
+}
+
+/// Export a model (JSON) to standalone HTML (returned as UTF-8 string bytes).
+#[no_mangle]
+pub extern "C" fn gp_model_to_html(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::web::html_from_model(m).into_bytes()
+    })
+}
+
+/// Export a model (JSON) to RTF (returned as UTF-8 string bytes).
+#[no_mangle]
+pub extern "C" fn gp_model_to_rtf(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::reverse::rtf_from_model(m)
+    })
+}
+
+/// Export a model (JSON) back to a PDF.
+#[no_mangle]
+pub extern "C" fn gp_model_to_pdf(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::project::pdf_from_model(m)
+    })
+}
+
 // ─── reverse conversions: <format> → PDF (stateless byte transforms) ──────────
 
 /// Plain text → PDF. Buffer-returning.
