@@ -4,6 +4,34 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.45.0] - 2026-06-18
+
+### Added
+
+- **Rich Office → PDF conversion.** `officeToPdf` now maps DOCX/XLSX/PPTX/
+  ODT/ODS/ODP (and legacy OLE2 `.doc`/`.xls`/`.ppt`) to styled HTML — headings,
+  bold/italic/size/colour runs, tables, lists and embedded images — and renders
+  it through the native HTML→PDF engine instead of the old text-only flatten. No
+  LibreOffice/soffice dependency.
+- **More OCR languages.** New host-loaded `.gpocr` line models beyond
+  Latin/Cyrillic/Greek: Arabic + Hebrew (RTL), Devanagari, Bengali and Tamil,
+  plus a larger 24/48/96 backbone retrain (clean-print CER now well past
+  Tesseract) and a handwriting-augmented `alpha` variant. Auto-discovered by
+  `loadAllBundledOcrModels`; the wasm still ships no weights.
+
+### Fixed
+
+- **Text extraction recurses into form XObjects.** Text drawn via reusable form
+  XObjects (the `Do` operator — common in invoice/template PDFs) was rasterised
+  but never extracted, so it showed in the page image yet could not be selected
+  or edited. The extractor now walks `Do` into `/Subtype /Form` XObjects
+  (composing the form `/Matrix` with the CTM, with depth and cycle guards), so
+  form text is recovered in page space.
+- **Font-less HTML render no longer drops text.** The HTML renderer skipped
+  every text run when no embedded font matched, so a render with no
+  host-provided fonts produced a blank page; a base-14 standard-font fallback
+  now always paints text.
+
 ## [0.44.0] - 2026-06-18
 
 ### Added
