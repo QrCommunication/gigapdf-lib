@@ -12,7 +12,7 @@ mod interpret;
 pub mod svg_path;
 pub mod vector;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{EngineError, Result};
 use crate::font::cmap::TextDecoder;
@@ -91,6 +91,13 @@ pub struct ContentElement {
     /// `/ExtGState`'s `/ca` (set via the `gs` operator). `None` means the
     /// default (fully opaque). Populated for images; drives editor opacity.
     pub fill_alpha: Option<f64>,
+    /// `true` when this element comes from **inside a form XObject** (reached by
+    /// recursing through a `Do`), not the top-level content stream. Such elements
+    /// have their `op_start`/`op_end` collapsed onto the `Do` op and are **not**
+    /// addressable by the top-level index-based mutation/edit APIs (their bounds
+    /// are page-space and correct for display). Always `false` for top-level
+    /// elements.
+    pub nested: bool,
 }
 
 /// A reading-order text line: the concatenated runs that share a baseline band,
@@ -342,29 +349,161 @@ fn decode_operand_text(operands: &[Object], decoder: &TextDecoder) -> String {
     text
 }
 
-/// List the text runs in a decoded content stream, decoding each with the
-/// active font's [`TextDecoder`] (selected by the `Tf` operator). Fonts not in
-/// `fonts` — and the state before any `Tf` — fall back to WinAnsi.
-pub fn extract_text_runs_with(content: &[u8], fonts: &FontDecoders) -> Result<Vec<TextRun>> {
+/// A form XObject resolved for text extraction: its decoded content stream, the
+/// per-font decoders built from *its own* `/Resources /Font` (falling back to the
+/// page's), and its `/Matrix` (form unit space → the space in which it is drawn,
+/// default identity). Returned by a [`extract_text_runs_resolved`] resolver when
+/// it recognises a `Do` operand as a `/Subtype /Form` XObject.
+#[derive(Clone, Debug)]
+pub struct FormXObject {
+    /// The form's decoded content stream.
+    pub content: Vec<u8>,
+    /// Per-font decoders for the form's content (its `/Resources /Font`, with the
+    /// page's as a fallback per the inheritance rule).
+    pub fns: FontDecoders,
+    /// The form's `/Matrix` (default identity).
+    pub matrix: Matrix,
+    /// The form XObject's object id `(number, generation)`, when it is an
+    /// indirect object. Threaded into a per-path visited set so a form that
+    /// references itself (directly or transitively) is expanded at most once on
+    /// any recursion path — the runtime cycle guard, complementing the depth cap.
+    pub ref_id: Option<(u32, u16)>,
+}
+
+/// Max recursion depth for nested form XObjects (`Do` inside a form inside a
+/// form …). Beyond this we stop descending and return what we have — a guard
+/// against pathological nesting, complementing the resolver's cycle set.
+const MAX_FORM_DEPTH: usize = 12;
+
+/// A sentinel `op_position` for runs that live **inside a form XObject**, not in
+/// the page's top-level operation list. The top-level op index is meaningless
+/// for them, so we flag them rather than report a bogus position. (No consumer
+/// edits a form-XObject run by op position; editing targets top-level runs.)
+pub const NESTED_OP_POSITION: usize = usize::MAX;
+
+/// List the text runs in a decoded content stream, **recursing into form
+/// XObjects** invoked via `Do`. `initial_ctm` seeds the CTM (use
+/// [`Matrix::IDENTITY`] at the top level); recursed forms start from the CTM in
+/// effect at their `Do`, composed with the form's `/Matrix`, so nested text is
+/// gathered correctly. `resolve_form(name)` maps an XObject resource name to a
+/// [`FormXObject`] (its content, fonts and matrix) when it is a form, or `None`
+/// for image/unresolvable XObjects (ignored, the historical behaviour).
+///
+/// Runs are returned in document order: each form's runs are appended at the
+/// point its `Do` is reached. `depth` is the current nesting level; recursion
+/// stops past [`MAX_FORM_DEPTH`]. The `index` field is reassigned sequentially
+/// over the whole flattened result; form-XObject runs carry
+/// [`NESTED_OP_POSITION`] as their `op_position`.
+pub fn extract_text_runs_resolved(
+    content: &[u8],
+    fonts: &FontDecoders,
+    initial_ctm: Matrix,
+    resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
+    depth: usize,
+) -> Result<Vec<TextRun>> {
+    let mut visited: BTreeSet<(u32, u16)> = BTreeSet::new();
+    let mut runs = text_runs_inner(content, fonts, initial_ctm, resolve_form, depth, &mut visited)?;
+    // Renumber so `index` is sequential over the whole (possibly flattened) list.
+    for (i, run) in runs.iter_mut().enumerate() {
+        run.index = i;
+    }
+    Ok(runs)
+}
+
+/// Recursive worker for [`extract_text_runs_resolved`], threading the per-path
+/// `visited` set of form object-refs (the runtime cycle guard).
+fn text_runs_inner(
+    content: &[u8],
+    fonts: &FontDecoders,
+    initial_ctm: Matrix,
+    resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
+    depth: usize,
+    visited: &mut BTreeSet<(u32, u16)>,
+) -> Result<Vec<TextRun>> {
     let operations = parse_content(content)?;
     let mut runs = Vec::new();
     let fallback = TextDecoder::winansi();
     let mut current: &TextDecoder = &fallback;
+
+    // Track the CTM (graphics state) so a `Do` recurses with the right matrix.
+    // Only `cm`/`q`/`Q` affect it; text matrices don't change the CTM.
+    let mut ctm = initial_ctm;
+    let mut ctm_stack: Vec<Matrix> = Vec::new();
+    let nested = depth > 0;
+
     for (op_position, operation) in operations.iter().enumerate() {
-        if operation.operator == b"Tf" {
-            if let Some(Object::Name(name)) = operation.operands.first() {
-                current = fonts.get(name).unwrap_or(&fallback);
+        match operation.operator.as_slice() {
+            b"q" => ctm_stack.push(ctm),
+            b"Q" => {
+                if let Some(m) = ctm_stack.pop() {
+                    ctm = m;
+                }
             }
-        } else if is_text_show(&operation.operator) {
-            runs.push(TextRun {
-                index: runs.len(),
-                operator: operation.operator.clone(),
-                text: decode_operand_text(&operation.operands, current),
-                op_position,
-            });
+            b"cm" => {
+                let n = nums(operation);
+                if n.len() == 6 {
+                    ctm = Matrix::new(n[0], n[1], n[2], n[3], n[4], n[5]).then(&ctm);
+                }
+            }
+            b"Tf" => {
+                if let Some(Object::Name(name)) = operation.operands.first() {
+                    current = fonts.get(name).unwrap_or(&fallback);
+                }
+            }
+            b"Do" => {
+                if depth >= MAX_FORM_DEPTH {
+                    continue;
+                }
+                if let Some(name) = operation.operands.iter().find_map(|o| o.as_name()) {
+                    if let Some(form) = resolve_form(name) {
+                        // Runtime cycle guard: skip a form already on this path.
+                        if form.ref_id.is_some_and(|id| visited.contains(&id)) {
+                            continue;
+                        }
+                        // Child CTM: form unit space → its `/Matrix` → the CTM in
+                        // effect at this `Do`. Gives page-space coordinates after
+                        // the recursion's own bounds composition.
+                        let child_ctm = form.matrix.then(&ctm);
+                        let pushed = form.ref_id.map(|id| visited.insert(id)).unwrap_or(false);
+                        if let Ok(child) = text_runs_inner(
+                            &form.content,
+                            &form.fns,
+                            child_ctm,
+                            resolve_form,
+                            depth + 1,
+                            visited,
+                        ) {
+                            runs.extend(child);
+                        }
+                        if pushed {
+                            if let Some(id) = form.ref_id {
+                                visited.remove(&id);
+                            }
+                        }
+                    }
+                }
+            }
+            _ if is_text_show(&operation.operator) => {
+                runs.push(TextRun {
+                    index: runs.len(),
+                    operator: operation.operator.clone(),
+                    text: decode_operand_text(&operation.operands, current),
+                    op_position: if nested { NESTED_OP_POSITION } else { op_position },
+                });
+            }
+            _ => {}
         }
     }
     Ok(runs)
+}
+
+/// List the text runs in a decoded content stream, decoding each with the
+/// active font's [`TextDecoder`] (selected by the `Tf` operator). Fonts not in
+/// `fonts` — and the state before any `Tf` — fall back to WinAnsi. Does **not**
+/// descend into form XObjects; use [`extract_text_runs_resolved`] (with a
+/// resolver) for that.
+pub fn extract_text_runs_with(content: &[u8], fonts: &FontDecoders) -> Result<Vec<TextRun>> {
+    extract_text_runs_resolved(content, fonts, Matrix::IDENTITY, &|_| None, 0)
 }
 
 /// List the text runs in a decoded content stream using WinAnsi decoding.
@@ -572,12 +711,43 @@ fn elements_from_ops(
     fonts: &FontDecoders,
     gstate_alpha: &BTreeMap<String, f64>,
 ) -> Vec<ContentElement> {
+    let mut visited: BTreeSet<(u32, u16)> = BTreeSet::new();
+    elements_from_ops_resolved(
+        operations,
+        fonts,
+        gstate_alpha,
+        Matrix::IDENTITY,
+        &|_| None,
+        0,
+        &mut visited,
+    )
+}
+
+/// Like [`elements_from_ops`] but **recursing into form XObjects** (`Do`):
+/// `initial_ctm` seeds the CTM (identity at top level), and `resolve_form` maps
+/// an XObject resource name to a [`FormXObject`] when it is a form. A form's
+/// elements are interpreted with the CTM in effect at its `Do` composed with the
+/// form's `/Matrix`, so their bounds come out in page space exactly like
+/// top-level elements. A `Do` that resolves to a form yields the form's nested
+/// elements (text/shapes/images) instead of a single opaque `Image`; a `Do` that
+/// is an image (or unresolvable) keeps the historical single-`Image` behaviour.
+/// `visited` holds the form object-refs on the current path (runtime cycle guard).
+#[allow(clippy::too_many_arguments)]
+fn elements_from_ops_resolved(
+    operations: &[Operation],
+    fonts: &FontDecoders,
+    gstate_alpha: &BTreeMap<String, f64>,
+    initial_ctm: Matrix,
+    resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
+    depth: usize,
+    visited: &mut BTreeSet<(u32, u16)>,
+) -> Vec<ContentElement> {
     let mut elements = Vec::new();
 
     // Graphics state. The q/Q stack saves the CTM and the fill alpha together,
     // mirroring the PDF graphics-state save/restore semantics for the bits we
     // surface on elements.
-    let mut ctm = Matrix::IDENTITY;
+    let mut ctm = initial_ctm;
     let mut fill_alpha = 1.0f64;
     let mut ctm_stack: Vec<(Matrix, f64)> = Vec::new();
     // Text state.
@@ -592,6 +762,8 @@ fn elements_from_ops(
     // Current path.
     let mut path_start: Option<usize> = None;
     let mut path_bb = BoundsBuilder::new();
+    // Elements built at depth > 0 come from inside a form XObject.
+    let nested = depth > 0;
 
     for (i, op) in operations.iter().enumerate() {
         let operator = op.operator.as_slice();
@@ -716,14 +888,56 @@ fn elements_from_ops(
                     font_size: Some(eff_size),
                     rotation_deg: Some(if rot.abs() < 1e-6 { 0.0 } else { rot }),
                     fill_alpha: Some(fill_alpha),
+                    nested,
                 });
                 tm = Matrix::translate(width, 0.0).then(&tm);
             }
             b"Do" => {
-                let label = op
-                    .operands
-                    .iter()
-                    .find_map(|o| o.as_name())
+                let name = op.operands.iter().find_map(|o| o.as_name());
+                // A form XObject: recurse, interpreting its content under the
+                // CTM in effect here · the form's `/Matrix`, so its nested
+                // elements land in page space. Falls through to the image case
+                // when the name isn't a (resolvable) form, or nesting is capped.
+                let form = if depth < MAX_FORM_DEPTH {
+                    name.and_then(resolve_form)
+                } else {
+                    None
+                };
+                // Runtime cycle guard: a form already on this path is skipped
+                // entirely (don't recurse, and don't fall back to an image box).
+                if let Some(form) = form {
+                    if form.ref_id.is_some_and(|id| visited.contains(&id)) {
+                        continue;
+                    }
+                    let child_ctm = form.matrix.then(&ctm);
+                    let pushed = form.ref_id.map(|id| visited.insert(id)).unwrap_or(false);
+                    let mut child = elements_from_ops_resolved(
+                        &parse_content(&form.content).unwrap_or_default(),
+                        &form.fns,
+                        gstate_alpha,
+                        child_ctm,
+                        resolve_form,
+                        depth + 1,
+                        visited,
+                    );
+                    if pushed {
+                        if let Some(id) = form.ref_id {
+                            visited.remove(&id);
+                        }
+                    }
+                    // Re-anchor the form's elements to this `Do`'s op index so the
+                    // stable `op_start` sort places them where the form is drawn
+                    // (their own op indices are relative to the form's stream and
+                    // would otherwise scramble document order). Nested elements
+                    // aren't edited by op position, so collapsing the range is safe.
+                    for c in &mut child {
+                        c.op_start = i;
+                        c.op_end = i;
+                    }
+                    elements.extend(child);
+                    continue;
+                }
+                let label = name
                     .map(|n| String::from_utf8_lossy(n).into_owned())
                     .unwrap_or_default();
                 // The placement CTM's x-axis angle is the image's rotation,
@@ -742,6 +956,7 @@ fn elements_from_ops(
                     font_size: None,
                     rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
                     fill_alpha: Some(fill_alpha),
+                    nested,
                 });
             }
             _ if is_path_construction(operator) => {
@@ -762,6 +977,7 @@ fn elements_from_ops(
                         font_size: None,
                         rotation_deg: None,
                         fill_alpha: Some(fill_alpha),
+                        nested,
                     });
                 }
                 path_bb = BoundsBuilder::new();
@@ -788,6 +1004,33 @@ pub fn extract_elements_with(
 ) -> Result<Vec<ContentElement>> {
     let operations = parse_content(content)?;
     Ok(elements_from_ops(&operations, fonts, gstate_alpha))
+}
+
+/// List all addressable elements (text, images, shapes) of a content stream,
+/// **recursing into form XObjects** invoked via `Do`. `resolve_form(name)` maps
+/// an XObject resource name to a [`FormXObject`] when it is a form (its content,
+/// own fonts, and `/Matrix`); image/unresolvable XObjects fall back to a single
+/// opaque `Image` element. Each form's elements are interpreted with the CTM in
+/// effect at the `Do` composed with the form's `/Matrix`, so their bounds come
+/// out in page user space just like top-level elements. This is what makes text
+/// drawn inside reusable form XObjects (invoice/template content) addressable.
+pub fn extract_elements_resolved(
+    content: &[u8],
+    fonts: &FontDecoders,
+    gstate_alpha: &BTreeMap<String, f64>,
+    resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
+) -> Result<Vec<ContentElement>> {
+    let operations = parse_content(content)?;
+    let mut visited: BTreeSet<(u32, u16)> = BTreeSet::new();
+    Ok(elements_from_ops_resolved(
+        &operations,
+        fonts,
+        gstate_alpha,
+        Matrix::IDENTITY,
+        resolve_form,
+        0,
+        &mut visited,
+    ))
 }
 
 /// List all addressable elements (text, images, shapes) of a content stream.

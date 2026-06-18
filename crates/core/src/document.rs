@@ -746,24 +746,41 @@ impl Document {
     pub fn page_text_runs(&self, page_no: u32) -> Result<Vec<TextRun>> {
         let content = self.page_content(page_no)?;
         let fonts = self.page_font_decoders(page_no);
-        content::extract_text_runs_with(&content, &fonts)
+        // Recurse into form XObjects (`Do`) so text drawn via reusable forms
+        // (invoice/template content) is extracted, not just the top-level stream.
+        let forms = self.page_form_xobjects(page_no);
+        content::extract_text_runs_resolved(
+            &content,
+            &fonts,
+            content::PageMatrix::IDENTITY,
+            &|name| forms.get(name).cloned(),
+            0,
+        )
     }
 
     /// Build per-font text decoders from a page's `/Resources /Font`, reading
     /// each font's `/Subtype` (Type0 ⇒ 2-byte codes) and `/ToUnicode` CMap.
     fn page_font_decoders(&self, page_no: u32) -> content::FontDecoders {
-        let mut decoders = content::FontDecoders::new();
         let Ok(page) = self.page_dict(page_no) else {
-            return decoders;
+            return content::FontDecoders::new();
         };
-        let font_dict = page
-            .get(b"Resources")
+        match page.get(b"Resources").map(|o| self.resolve(o)).and_then(Object::as_dict) {
+            Some(res) => self.font_decoders_for(res),
+            None => content::FontDecoders::new(),
+        }
+    }
+
+    /// Build per-font text decoders from a `/Resources` dictionary's `/Font`
+    /// sub-dictionary, reading each font's `/Subtype` (Type0 ⇒ 2-byte codes) and
+    /// `/ToUnicode` CMap. Works for a page's resources *and* a form XObject's own
+    /// resources, so text drawn inside form XObjects decodes with the right font.
+    fn font_decoders_for(&self, resources: &Dictionary) -> content::FontDecoders {
+        let mut decoders = content::FontDecoders::new();
+        let Some(font_dict) = resources
+            .get(b"Font")
             .map(|o| self.resolve(o))
             .and_then(Object::as_dict)
-            .and_then(|res| res.get(b"Font"))
-            .map(|o| self.resolve(o))
-            .and_then(Object::as_dict);
-        let Some(font_dict) = font_dict else {
+        else {
             return decoders;
         };
         for (name, value) in &font_dict.0 {
@@ -794,6 +811,144 @@ impl Document {
             );
         }
         decoders
+    }
+
+    /// Build a flattened `name → `[`content::FormXObject`]` map of every form
+    /// XObject reachable from `page_no` (the page's `/Resources /XObject`, and
+    /// recursively each form's own `/Resources /XObject`), so text drawn inside
+    /// reusable form XObjects becomes addressable.
+    ///
+    /// Each form carries its decoded content, its per-font decoders (its *own*
+    /// `/Resources /Font` overlaid on the page's, form wins), and its `/Matrix`.
+    /// Outer scopes win on name collision (insert-if-absent during the descent),
+    /// and a visited-`ObjectId` set breaks self/mutual cycles. The returned map
+    /// backs the `resolve_form` closure passed to
+    /// [`content::extract_text_runs_resolved`] / [`content::extract_elements_resolved`].
+    fn page_form_xobjects(&self, page_no: u32) -> BTreeMap<Vec<u8>, content::FormXObject> {
+        let mut forms = BTreeMap::new();
+        let Ok(page) = self.page_dict(page_no) else {
+            return forms;
+        };
+        let Some(page_res) = page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+        else {
+            return forms;
+        };
+        let mut visited: BTreeSet<ObjectId> = BTreeSet::new();
+        self.collect_form_xobjects(&page_res, &page_res, &mut forms, &mut visited, 0);
+        forms
+    }
+
+    /// Recursive worker for [`page_form_xobjects`](Self::page_form_xobjects):
+    /// scan `scope`'s `/XObject` for `/Subtype /Form` entries, record each under
+    /// its name (insert-if-absent), then descend into the form's own resources
+    /// (falling back to `page_res`). `visited` holds the object ids on the
+    /// current path to break cycles; `depth` caps pathological nesting.
+    fn collect_form_xobjects(
+        &self,
+        scope: &Dictionary,
+        page_res: &Dictionary,
+        forms: &mut BTreeMap<Vec<u8>, content::FormXObject>,
+        visited: &mut BTreeSet<ObjectId>,
+        depth: usize,
+    ) {
+        if depth > 16 {
+            return;
+        }
+        let Some(xobjects) = scope
+            .get(b"XObject")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        else {
+            return;
+        };
+        for (name, value) in &xobjects.0 {
+            // Cycle guard: skip a form already on the current resolution path.
+            let oid = value.as_reference();
+            if let Some(id) = oid {
+                if visited.contains(&id) {
+                    continue;
+                }
+            }
+            let Some(stream) = self.resolve(value).as_stream() else {
+                continue;
+            };
+            if stream.dict.get(b"Subtype").and_then(Object::as_name)
+                != Some(b"Form".as_slice())
+            {
+                continue;
+            }
+            let Ok(content) = decode_stream(stream) else {
+                continue;
+            };
+            // The form's own resources take precedence; fall back to the page's
+            // for inherited fonts/XObjects (PDF resource-inheritance rule).
+            let own_res = stream
+                .dict
+                .get(b"Resources")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict);
+            let fns = self.form_font_decoders(own_res, page_res);
+            let matrix = self.form_matrix(&stream.dict);
+            // Insert-if-absent: an outer scope's definition of `name` wins.
+            forms
+                .entry(name.clone())
+                .or_insert_with(|| content::FormXObject {
+                    content,
+                    fns,
+                    matrix,
+                    ref_id: oid,
+                });
+            // Descend into this form's resources for nested forms, guarding the
+            // path against cycles.
+            if let Some(res) = own_res {
+                let res = res.clone();
+                let pushed = oid.map(|id| visited.insert(id)).unwrap_or(false);
+                self.collect_form_xobjects(&res, page_res, forms, visited, depth + 1);
+                if pushed {
+                    if let Some(id) = oid {
+                        visited.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-font decoders for a form XObject: its own `/Resources /Font` overlaid
+    /// on the page's (form definitions win), honouring resource inheritance so a
+    /// form that omits a font still decodes via the page's.
+    fn form_font_decoders(
+        &self,
+        own_res: Option<&Dictionary>,
+        page_res: &Dictionary,
+    ) -> content::FontDecoders {
+        let mut decoders = self.font_decoders_for(page_res);
+        if let Some(res) = own_res {
+            for (name, decoder) in self.font_decoders_for(res) {
+                decoders.insert(name, decoder);
+            }
+        }
+        decoders
+    }
+
+    /// A form XObject's `/Matrix` (default identity) as a [`content::PageMatrix`].
+    fn form_matrix(&self, dict: &Dictionary) -> content::PageMatrix {
+        let m = dict
+            .get(b"Matrix")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|a| {
+                let v: Vec<f64> = a.iter().filter_map(|o| self.resolve(o).as_f64()).collect();
+                v
+            })
+            .filter(|v| v.len() == 6);
+        match m {
+            Some(v) => content::PageMatrix::new(v[0], v[1], v[2], v[3], v[4], v[5]),
+            None => content::PageMatrix::IDENTITY,
+        }
     }
 
     /// A simple font's per-code advance widths from `/FirstChar` + `/Widths`
@@ -1013,12 +1168,40 @@ impl Document {
         self.set_page_content(page_no, edited)
     }
 
-    /// All addressable elements (text, images, shapes) of a page, in order.
+    /// All addressable elements (text, images, shapes) of a page's **top-level**
+    /// content stream, in order. Does **not** descend into form XObjects, so each
+    /// element's `index` and `op_start..=op_end` map one-to-one onto the editable
+    /// top-level operations — this is the list the index-based mutation and
+    /// hit-test APIs ([`remove_element`](Self::remove_element),
+    /// [`move_element`](Self::move_element),
+    /// [`duplicate_element`](Self::duplicate_element),
+    /// [`element_at`](Self::element_at), [`redact_region`](Self::redact_region))
+    /// rely on. For *extraction/display* that also reaches text drawn inside
+    /// reusable form XObjects, use [`page_elements_deep`](Self::page_elements_deep).
     pub fn page_elements(&self, page_no: u32) -> Result<Vec<ContentElement>> {
         let content = self.page_content(page_no)?;
         let fonts = self.page_font_decoders(page_no);
         let gstate_alpha = self.page_gstate_alpha(page_no);
         content::extract_elements_with(&content, &fonts, &gstate_alpha)
+    }
+
+    /// All addressable elements of a page **recursing into form XObjects** (`Do`):
+    /// text/graphics drawn through reusable forms (invoice/template content) yield
+    /// their nested elements — in page user space — instead of one opaque image.
+    ///
+    /// This is the **extraction** view (reading, conversion, structured text and
+    /// `page_text_elements`); its element indices include form content and so do
+    /// **not** line up with the top-level op stream — never feed them to the
+    /// index-based mutation APIs (use [`page_elements`](Self::page_elements) for
+    /// that). Nested elements collapse their `op_start`/`op_end` onto the `Do`.
+    pub fn page_elements_deep(&self, page_no: u32) -> Result<Vec<ContentElement>> {
+        let content = self.page_content(page_no)?;
+        let fonts = self.page_font_decoders(page_no);
+        let gstate_alpha = self.page_gstate_alpha(page_no);
+        let forms = self.page_form_xobjects(page_no);
+        content::extract_elements_resolved(&content, &fonts, &gstate_alpha, &|name| {
+            forms.get(name).cloned()
+        })
     }
 
     /// Map each `/ExtGState` resource name on `page_no` to its `/ca` (non-stroking
@@ -1080,21 +1263,37 @@ impl Document {
     /// Every **text** element on a page, enriched with everything a host editor
     /// needs to recreate each run: bounding box (user space, bottom-left), the
     /// resolved `/BaseFont` family + bold/italic, the effective point size, the
-    /// RGB fill colour and the baseline rotation. The returned `index` is the
-    /// **text-run** index accepted by [`replace_text_run`](Self::replace_text_run),
-    /// so a host can extract, display and edit in one model. The native
-    /// equivalent of a reader's per-run text layer — font and colour included,
-    /// which `page_elements`' bare bounds omit.
+    /// RGB fill colour and the baseline rotation. **Recurses into form XObjects**
+    /// so text drawn through reusable forms (invoice/template content) is
+    /// returned too, positioned in page space — previously visible on screen but
+    /// missing from this list.
+    ///
+    /// For **top-level** runs the returned `index` is the text-run index accepted
+    /// by [`replace_text_run`](Self::replace_text_run), so a host can extract,
+    /// display and edit in one model. Text that lives **inside a form XObject**
+    /// is included for display but is not editable in place (it is shared across
+    /// every placement of the form); such elements carry `index == usize::MAX`,
+    /// which `replace_text_run` rejects rather than misrouting to a top-level run.
     pub fn page_text_elements(&self, page_no: u32) -> Vec<TextElementInfo> {
         let styles = self.page_base_fonts(page_no);
-        let Ok(elements) = self.page_elements(page_no) else {
+        let Ok(elements) = self.page_elements_deep(page_no) else {
             return Vec::new();
         };
+        // Top-level text runs keep their ordinal (it indexes `replace_text_run`,
+        // which counts only the page's own `Tj`/`TJ`); form-XObject text gets a
+        // sentinel index so editing it is a safe no-op, not a wrong-run edit.
+        let mut top_run = 0usize;
         elements
             .into_iter()
             .filter(|e| e.kind == content::ElementKind::Text)
-            .enumerate()
-            .map(|(run_index, e)| {
+            .map(|e| {
+                let index = if e.nested {
+                    usize::MAX
+                } else {
+                    let idx = top_run;
+                    top_run += 1;
+                    idx
+                };
                 let style = e.font.as_ref().and_then(|name| styles.get(name));
                 let b = e.bounds.unwrap_or(content::Bounds {
                     x: 0.0,
@@ -1103,7 +1302,7 @@ impl Document {
                     height: 0.0,
                 });
                 TextElementInfo {
-                    index: run_index,
+                    index,
                     text: e.label,
                     x: b.x,
                     y: b.y,
@@ -9205,5 +9404,187 @@ mod tests {
                 .any(|l| l.target == LinkTarget::Page(3)),
             "named link still resolves after save"
         );
+    }
+
+    // ── form-XObject text extraction (`Do` recursion) ────────────────────────
+
+    /// Assemble a minimal one-page PDF from a list of `(number, body)` objects.
+    /// The parser scans objects + the `trailer` (it ignores the xref), so a
+    /// placeholder xref is fine. Used to exercise form-XObject recursion.
+    fn raw_pdf(objects: &[(u32, String)]) -> Vec<u8> {
+        let mut out = String::from("%PDF-1.7\n");
+        for (num, body) in objects {
+            out.push_str(&format!("{num} 0 obj\n{body}\nendobj\n"));
+        }
+        // Minimal (dummy) xref + trailer: open() locates objects by scanning and
+        // the catalog via `trailer /Root`, so the offsets need not be accurate.
+        out.push_str("xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF");
+        out.into_bytes()
+    }
+
+    /// A page whose text comes BOTH from the top-level stream and from a form
+    /// XObject drawn via `Do` under a non-identity `cm` and a non-identity form
+    /// `/Matrix`. The form text must be extracted at the correct page-space
+    /// position by both `page_text_runs` and `page_text_elements`.
+    fn form_xobject_fixture() -> Vec<u8> {
+        // Page content: top-level "PAGE" at (50,150); then draw the form under
+        // cm = translate(30,40).
+        let page_stream = "BT /F1 12 Tf 50 150 Td (PAGE) Tj ET\nq 1 0 0 1 30 40 cm /Fm0 Do Q";
+        // Form content: "FORM" at baseline (5,5) in form space.
+        let form_stream = "BT /F1 12 Tf 5 5 Td (FORM) Tj ET";
+        raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+            ),
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Matrix [1 0 0 1 10 20] \
+                     /Resources << /Font << /F1 6 0 R >> >> \
+                     /Length {} >> stream\n{form_stream}\nendstream",
+                    form_stream.len()
+                ),
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+        ])
+    }
+
+    #[test]
+    fn page_text_runs_recurse_into_form_xobjects() {
+        let doc = Document::open(&form_xobject_fixture()).unwrap();
+        let texts: Vec<String> = doc
+            .page_text_runs(1)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.text)
+            .collect();
+        assert!(texts.iter().any(|t| t == "PAGE"), "top-level text present: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "FORM"),
+            "form-XObject text must be extracted via Do recursion: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn page_text_elements_recurse_into_forms_with_page_space_bounds() {
+        let doc = Document::open(&form_xobject_fixture()).unwrap();
+        let els = doc.page_text_elements(1);
+
+        let page = els.iter().find(|e| e.text == "PAGE").expect("top-level PAGE element");
+        // Top-level run keeps an editable text-run index (0 here, the first run).
+        assert_eq!(page.index, 0, "top-level run index feeds replace_text_run");
+        assert!((page.x - 50.0).abs() < 1.0, "PAGE x≈50, got {}", page.x);
+
+        let form = els.iter().find(|e| e.text == "FORM").expect("form-XObject FORM element");
+        // Page space = form unit → /Matrix(10,20) → cm(30,40) = translate(40,60).
+        // Form baseline (5,5) → (45, 65); bounds.y is the descender (−0.2·12).
+        assert!((form.x - 45.0).abs() < 1.0, "FORM x≈45 (page space), got {}", form.x);
+        assert!(
+            (form.y - 62.6).abs() < 2.5,
+            "FORM y≈62.6 (page space, descender of baseline 65), got {}",
+            form.y
+        );
+        assert!(form.width > 0.0 && form.height > 0.0, "FORM has positive size");
+        // Form text is not editable in place → sentinel index, which
+        // replace_text_run rejects rather than misrouting to a top-level run.
+        assert_eq!(form.index, usize::MAX, "form-XObject text carries the sentinel index");
+        assert!(
+            doc.clone().replace_text_run(1, form.index, "x").is_err(),
+            "editing a form-XObject run is a safe no-op error, not a wrong-run edit"
+        );
+    }
+
+    #[test]
+    fn self_referencing_form_terminates() {
+        // A form that draws itself via `Do` must not loop the extractor.
+        let form_stream = "BT /F1 12 Tf 5 5 Td (LOOP) Tj ET\n/Fm0 Do";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, {
+                let s = "q 1 0 0 1 0 0 cm /Fm0 Do Q";
+                format!("<< /Length {} >> stream\n{s}\nendstream", s.len())
+            }),
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                     /Length {} >> stream\n{form_stream}\nendstream",
+                    form_stream.len()
+                ),
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        // Must return (no infinite loop / panic) and surface the form text.
+        let runs = doc.page_text_runs(1).unwrap();
+        assert!(runs.iter().any(|r| r.text == "LOOP"), "self-ref form text extracted once: {runs:?}");
+        let els = doc.page_text_elements(1);
+        assert!(els.iter().any(|e| e.text == "LOOP"), "self-ref form text in elements");
+    }
+
+    #[test]
+    fn mutually_recursive_forms_terminate() {
+        // FmA draws FmB and FmB draws FmA: extraction must terminate.
+        let a_stream = "BT /F1 12 Tf 5 5 Td (AAA) Tj ET\n/FmB Do";
+        let b_stream = "BT /F1 12 Tf 5 5 Td (BBB) Tj ET\n/FmA Do";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /FmA 5 0 R /FmB 7 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, {
+                let s = "/FmA Do";
+                format!("<< /Length {} >> stream\n{s}\nendstream", s.len())
+            }),
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 6 0 R >> /XObject << /FmB 7 0 R >> >> \
+                     /Length {} >> stream\n{a_stream}\nendstream",
+                    a_stream.len()
+                ),
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                7,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 6 0 R >> /XObject << /FmA 5 0 R >> >> \
+                     /Length {} >> stream\n{b_stream}\nendstream",
+                    b_stream.len()
+                ),
+            ),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        let runs = doc.page_text_runs(1).unwrap();
+        // Both forms' text appears and extraction terminates (no hang/panic).
+        assert!(runs.iter().any(|r| r.text == "AAA"), "FmA text extracted: {runs:?}");
+        assert!(runs.iter().any(|r| r.text == "BBB"), "FmB text extracted: {runs:?}");
     }
 }
