@@ -15,14 +15,93 @@
 //! best-effort text-only path for legacy OLE2 `.doc/.xls/.ppt`.
 
 use super::zip::read_zip;
+use crate::html::{Margins, RenderOptions};
 use std::collections::BTreeMap;
 
-// US-Letter, points. Sheets/slides render landscape for more horizontal room.
-const PAGE_W: f64 = 612.0;
-const PAGE_H: f64 = 792.0;
-const LAND_W: f64 = 792.0;
-const LAND_H: f64 = 612.0;
-const MARGIN: f64 = 36.0;
+// ─────────────────────────────── page geometry ────────────────────────────────
+//
+// The real page size and margins are read from each format's document part
+// (DOCX `w:sectPr`, PPTX `p:sldSz`, ODF `style:page-layout-properties`). These
+// constants are only the *fallback* used when the source declares no geometry.
+//
+// Documents (DOCX/ODT) fall back to A4 portrait; spreadsheets/slides
+// (XLSX/PPTX/ODS/ODP) get more horizontal room (A4 landscape / 16:9). Margins
+// default to a comfortable 72pt for prose and 36pt for tabular/slide layouts.
+
+/// A4 portrait, points (`210mm × 297mm`). Prose fallback.
+const A4_W: f64 = 595.276;
+const A4_H: f64 = 841.890;
+/// 16:9 slide, points (`10in × 5.625in` = PowerPoint default 960×540pt).
+const SLIDE_W: f64 = 960.0;
+const SLIDE_H: f64 = 540.0;
+/// Default prose margin (1 inch) and tabular/slide margin (0.5 inch), points.
+const PROSE_MARGIN: f64 = 72.0;
+const TABULAR_MARGIN: f64 = 36.0;
+
+/// DOCX/ODF length unit conversions to PDF points.
+/// DOCX measurements are twentieths-of-a-point (twips): `pt = twips / 20`.
+const TWIP_PER_PT: f64 = 20.0;
+/// OOXML drawing measurements (PPTX slide size) are EMUs: `pt = emu / 12700`.
+const EMU_PER_PT: f64 = 12700.0;
+
+/// Resolved page size + margins for an Office document, in PDF points.
+#[derive(Debug, Clone, Copy)]
+struct PageGeom {
+    w: f64,
+    h: f64,
+    margins: Margins,
+}
+
+impl PageGeom {
+    /// Prose fallback: A4 portrait, 1in margins (DOCX/ODT with no `sectPr`).
+    fn prose_default() -> Self {
+        PageGeom {
+            w: A4_W,
+            h: A4_H,
+            margins: Margins::uniform(PROSE_MARGIN),
+        }
+    }
+
+    /// Tabular fallback: A4 landscape, 0.5in margins (XLSX/ODS).
+    fn tabular_default() -> Self {
+        PageGeom {
+            w: A4_H,
+            h: A4_W,
+            margins: Margins::uniform(TABULAR_MARGIN),
+        }
+    }
+
+    /// Slide fallback: 16:9, 0.5in margins (PPTX/ODP with no slide size).
+    fn slide_default() -> Self {
+        PageGeom {
+            w: SLIDE_W,
+            h: SLIDE_H,
+            margins: Margins::uniform(TABULAR_MARGIN),
+        }
+    }
+
+    /// Build the [`RenderOptions`] the HTML engine expects.
+    fn render_options(&self) -> RenderOptions {
+        let mut opts = RenderOptions::new(self.w, self.h);
+        opts.margins = self.margins;
+        opts
+    }
+}
+
+/// Sanity-clamp a page dimension so a malformed source can't produce a
+/// zero/negative or absurdly large page. Keeps the layout engine well-behaved.
+fn clamp_page_dim(pt: f64) -> f64 {
+    pt.clamp(72.0, 14400.0) // 1in … 200in
+}
+
+/// Render the generated `html` body through the HTML→PDF engine using the
+/// resolved page geometry. Fonts are host-supplied via the engine's two-phase
+/// contract ([`crate::html::needed_fonts`]); this in-engine path has no font
+/// bytes of its own, so it passes an empty set — the real `font-family` names
+/// injected into the HTML let the host resolve and embed the matching faces.
+fn render_geom(body: &str, geom: PageGeom) -> Vec<u8> {
+    crate::html::render_with(&html_doc(body), &[], &geom.render_options())
+}
 
 /// Auto-detect an Office container and render it to a styled PDF, or `None` if
 /// the bytes are not a recognized OOXML/ODF archive (or, for legacy OLE2, hold
@@ -357,9 +436,67 @@ pub fn docx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         .map(|b| parse_rels(&String::from_utf8_lossy(b)))
         .unwrap_or_default();
 
+    let geom = docx_page_geom(&doc);
     let mut body = String::new();
     docx_body(&doc, zip, &rels, &mut body);
-    crate::html::render(&html_doc(&body), &[], PAGE_W, PAGE_H, MARGIN)
+    render_geom(&body, geom)
+}
+
+/// Read the section's page size/margins from the body's `w:sectPr` —
+/// `w:pgSz@w:w/@w:h` (+ `@w:orient`) and `w:pgMar@w:top/@w:right/@w:bottom/@w:left`,
+/// all in twips (`pt = twips / 20`). Falls back to A4 portrait with 1in margins.
+fn docx_page_geom(document_xml: &str) -> PageGeom {
+    let mut geom = PageGeom::prose_default();
+    let mut x = Xml::new(document_xml);
+    let mut in_sect = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "sectPr" => in_sect = true,
+                "pgSz" if in_sect => {
+                    let w = attr(&attrs, "w").and_then(twips_to_pt);
+                    let h = attr(&attrs, "h").and_then(twips_to_pt);
+                    if let (Some(w), Some(h)) = (w, h) {
+                        // `w:orient="landscape"` reports w<h but means swapped.
+                        let landscape = matches!(attr(&attrs, "orient"), Some("landscape"));
+                        let (pw, ph) = if landscape && h > w { (h, w) } else { (w, h) };
+                        geom.w = clamp_page_dim(pw);
+                        geom.h = clamp_page_dim(ph);
+                    }
+                    let _ = sc; // pgSz is self-closing; keep scanning for pgMar.
+                }
+                "pgMar" if in_sect => {
+                    let m = &mut geom.margins;
+                    if let Some(v) = attr(&attrs, "top").and_then(twips_to_pt) {
+                        m.top = v.max(0.0);
+                    }
+                    if let Some(v) = attr(&attrs, "right").and_then(twips_to_pt) {
+                        m.right = v.max(0.0);
+                    }
+                    if let Some(v) = attr(&attrs, "bottom").and_then(twips_to_pt) {
+                        m.bottom = v.max(0.0);
+                    }
+                    if let Some(v) = attr(&attrs, "left").and_then(twips_to_pt) {
+                        m.left = v.max(0.0);
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "sectPr" {
+                    // First section's geometry is enough for a single-flow render.
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    geom
+}
+
+/// Twips (`1/20` pt) attribute string → points.
+fn twips_to_pt(v: &str) -> Option<f64> {
+    v.trim().parse::<f64>().ok().map(|t| t / TWIP_PER_PT)
 }
 
 /// Run/paragraph state while walking `w:document`.
@@ -370,6 +507,10 @@ struct RunStyle {
     underline: bool,
     size_half_pt: Option<f64>,
     color: Option<String>,
+    /// Typeface name from `w:rFonts@ascii` (DOCX) / `a:latin@typeface` (PPTX) /
+    /// `fo:font-name` (ODF). Surfaced as `font-family` so the host two-phase
+    /// font fetch embeds the real face and the layout uses its true metrics.
+    font_family: Option<String>,
 }
 
 impl RunStyle {
@@ -391,11 +532,73 @@ impl RunStyle {
         if let Some(c) = &self.color {
             css.push_str(&format!("color:#{c};"));
         }
+        if let Some(fam) = &self.font_family {
+            let family = css_font_family(fam);
+            if !family.is_empty() {
+                css.push_str(&format!("font-family:{family};"));
+            }
+        }
         if css.is_empty() {
             String::new()
         } else {
             format!("<span style=\"{css}\">")
         }
+    }
+}
+
+/// Paragraph-level formatting from `w:pPr` mapped to inline block CSS:
+/// `w:jc` → `text-align`, `w:spacing@before/@after` → `margin-top/-bottom`,
+/// `w:ind@left/@right/@firstLine` → `margin-left/-right`/`text-indent`. All
+/// distances are twips (`pt = twips / 20`).
+#[derive(Default, Clone)]
+struct ParaStyle {
+    align: Option<&'static str>,
+    space_before_pt: Option<f64>,
+    space_after_pt: Option<f64>,
+    indent_left_pt: Option<f64>,
+    indent_right_pt: Option<f64>,
+    first_line_pt: Option<f64>,
+}
+
+impl ParaStyle {
+    /// A ` style="…"` attribute (with leading space) for the block element, or
+    /// an empty string when no paragraph property was set.
+    fn style_attr(&self) -> String {
+        let mut css = String::new();
+        if let Some(a) = self.align {
+            css.push_str(&format!("text-align:{a};"));
+        }
+        if let Some(v) = self.space_before_pt {
+            css.push_str(&format!("margin-top:{v}pt;"));
+        }
+        if let Some(v) = self.space_after_pt {
+            css.push_str(&format!("margin-bottom:{v}pt;"));
+        }
+        if let Some(v) = self.indent_left_pt {
+            css.push_str(&format!("margin-left:{v}pt;"));
+        }
+        if let Some(v) = self.indent_right_pt {
+            css.push_str(&format!("margin-right:{v}pt;"));
+        }
+        if let Some(v) = self.first_line_pt {
+            css.push_str(&format!("text-indent:{v}pt;"));
+        }
+        if css.is_empty() {
+            String::new()
+        } else {
+            format!(" style=\"{css}\"")
+        }
+    }
+}
+
+/// Map a `w:jc@w:val` justification to a CSS `text-align` keyword.
+fn jc_to_align(val: &str) -> Option<&'static str> {
+    match val {
+        "center" => Some("center"),
+        "right" | "end" => Some("right"),
+        "both" | "distribute" => Some("justify"),
+        "left" | "start" => Some("left"),
+        _ => None,
     }
 }
 
@@ -453,6 +656,7 @@ fn docx_paragraph(
     let mut heading: Option<u8> = None;
     let mut inner = String::new();
     let mut run = RunStyle::default();
+    let mut para = ParaStyle::default();
     let mut in_rpr = false; // inside <w:rPr> (run properties)
     let mut in_ppr = false; // inside <w:pPr> (paragraph properties)
     let mut depth = 0i32; // nesting of <w:r> runs (to scope rPr)
@@ -471,12 +675,48 @@ fn docx_paragraph(
                             }
                         }
                     }
+                    "jc" if in_ppr => {
+                        if let Some(v) = attr(&attrs, "val") {
+                            if let Some(a) = jc_to_align(v) {
+                                para.align = Some(a);
+                            }
+                        }
+                    }
+                    "spacing" if in_ppr => {
+                        para.space_before_pt = attr(&attrs, "before")
+                            .and_then(twips_to_pt)
+                            .or(para.space_before_pt);
+                        para.space_after_pt = attr(&attrs, "after")
+                            .and_then(twips_to_pt)
+                            .or(para.space_after_pt);
+                    }
+                    "ind" if in_ppr => {
+                        para.indent_left_pt = attr(&attrs, "left")
+                            .and_then(twips_to_pt)
+                            .or(para.indent_left_pt);
+                        para.indent_right_pt = attr(&attrs, "right")
+                            .and_then(twips_to_pt)
+                            .or(para.indent_right_pt);
+                        para.first_line_pt = attr(&attrs, "firstLine")
+                            .and_then(twips_to_pt)
+                            .or(para.first_line_pt);
+                    }
                     "r" if !sc => {
                         depth += 1;
                         run = RunStyle::default();
                     }
-                    "b" if in_rpr => run.bold = !matches!(attr(&attrs, "val"), Some("0") | Some("false")),
-                    "i" if in_rpr => run.italic = !matches!(attr(&attrs, "val"), Some("0") | Some("false")),
+                    "rFonts" if in_rpr => {
+                        run.font_family = attr(&attrs, "ascii")
+                            .or_else(|| attr(&attrs, "hAnsi"))
+                            .filter(|v| !v.trim().is_empty())
+                            .map(|v| v.to_string());
+                    }
+                    "b" if in_rpr => {
+                        run.bold = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
+                    "i" if in_rpr => {
+                        run.italic = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
                     "u" if in_rpr => {
                         if !matches!(attr(&attrs, "val"), Some("none")) {
                             run.underline = true;
@@ -536,13 +776,14 @@ fn docx_paragraph(
     }
 
     let trimmed = inner.trim();
+    let para_attr = para.style_attr();
     match heading {
         Some(n) if !trimmed.is_empty() => {
-            out.push_str(&format!("<h{n}>{inner}</h{n}>"));
+            out.push_str(&format!("<h{n}{para_attr}>{inner}</h{n}>"));
         }
         _ => {
             // Always emit a <p> (even empty) to preserve blank-line spacing.
-            out.push_str(&format!("<p>{inner}</p>"));
+            out.push_str(&format!("<p{para_attr}>{inner}</p>"));
         }
     }
 }
@@ -650,7 +891,8 @@ pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if sheets.is_empty() {
         body.push_str("<p></p>");
     }
-    crate::html::render(&html_doc(&body), &[], LAND_W, LAND_H, MARGIN)
+    // Spreadsheets have no single declared page size; render landscape for width.
+    render_geom(&body, PageGeom::tabular_default())
 }
 
 /// Render one worksheet XML to an HTML `<table>`, gap-filling so cells land in
@@ -820,6 +1062,7 @@ fn col_of_ref(r: &str) -> usize {
 /// PPTX → one page per slide (page break between). Text from `a:p`/`a:r`/`a:t`;
 /// images via `a:blip r:embed` resolved through each slide's relationships.
 pub fn pptx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let geom = pptx_page_geom(&part(zip, "ppt/presentation.xml"));
     let mut slides: Vec<(usize, String)> = zip
         .iter()
         .filter(|(k, _)| k.starts_with("ppt/slides/slide") && k.ends_with(".xml"))
@@ -844,7 +1087,35 @@ pub fn pptx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if slides.is_empty() {
         body.push_str("<p></p>");
     }
-    crate::html::render(&html_doc(&body), &[], LAND_W, LAND_H, MARGIN)
+    render_geom(&body, geom)
+}
+
+/// Read the slide size from `p:presentation/p:sldSz@cx/@cy` (EMUs,
+/// `pt = emu / 12700`); margins are zero (slides bleed to the edges). Falls back
+/// to a 16:9 slide when absent.
+fn pptx_page_geom(presentation_xml: &str) -> PageGeom {
+    let mut geom = PageGeom::slide_default();
+    let mut x = Xml::new(presentation_xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == "sldSz" {
+                let cx = attr(&attrs, "cx").and_then(emu_to_pt);
+                let cy = attr(&attrs, "cy").and_then(emu_to_pt);
+                if let (Some(w), Some(h)) = (cx, cy) {
+                    geom.w = clamp_page_dim(w);
+                    geom.h = clamp_page_dim(h);
+                    geom.margins = Margins::uniform(0.0);
+                }
+                break;
+            }
+        }
+    }
+    geom
+}
+
+/// EMU (`1/914400` inch) attribute string → points (`emu / 12700`).
+fn emu_to_pt(v: &str) -> Option<f64> {
+    v.trim().parse::<f64>().ok().map(|e| e / EMU_PER_PT)
 }
 
 /// Emit one slide's text paragraphs and images into `out`.
@@ -889,6 +1160,11 @@ fn pptx_slide(
                             run.color = Some(v.to_ascii_uppercase());
                         }
                     }
+                }
+                "latin" if in_rpr => {
+                    run.font_family = attr(&attrs, "typeface")
+                        .filter(|v| !v.trim().is_empty() && !v.starts_with('+'))
+                        .map(|v| v.to_string());
                 }
                 "t" if !sc => in_text = true,
                 "br" => para.push_str("<br>"),
@@ -983,6 +1259,14 @@ fn odf_text_styles(xml: &str) -> BTreeMap<String, String> {
                                 css.push_str(&format!("font-size:{pt}pt;"));
                             }
                         }
+                        // `fo:font-name` (or `style:font-name`) → real family so
+                        // the host embeds the matching face and uses its metrics.
+                        if let Some(fam) = attr(&attrs, "font-name") {
+                            let family = css_font_family(fam);
+                            if !family.is_empty() {
+                                css.push_str(&format!("font-family:{family};"));
+                            }
+                        }
                         if !css.is_empty() {
                             map.insert(nm.clone(), css);
                         }
@@ -999,6 +1283,45 @@ fn odf_text_styles(xml: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// Read the first `style:page-layout-properties` from an ODF part —
+/// `fo:page-width`/`fo:page-height` and `fo:margin-*` (with `fo:margin`
+/// shorthand) — into a [`PageGeom`], using `fallback` for anything absent. ODF
+/// lengths (`21cm`, `2.54cm`, …) are parsed via [`parse_odf_pt`].
+fn odf_page_geom(xml: &str, fallback: PageGeom) -> PageGeom {
+    let mut geom = fallback;
+    let mut x = Xml::new(xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == "page-layout-properties" {
+                if let Some(w) = attr(&attrs, "page-width").and_then(parse_odf_pt) {
+                    geom.w = clamp_page_dim(w);
+                }
+                if let Some(h) = attr(&attrs, "page-height").and_then(parse_odf_pt) {
+                    geom.h = clamp_page_dim(h);
+                }
+                if let Some(all) = attr(&attrs, "margin").and_then(parse_odf_pt) {
+                    geom.margins = Margins::uniform(all.max(0.0));
+                }
+                if let Some(v) = attr(&attrs, "margin-top").and_then(parse_odf_pt) {
+                    geom.margins.top = v.max(0.0);
+                }
+                if let Some(v) = attr(&attrs, "margin-right").and_then(parse_odf_pt) {
+                    geom.margins.right = v.max(0.0);
+                }
+                if let Some(v) = attr(&attrs, "margin-bottom").and_then(parse_odf_pt) {
+                    geom.margins.bottom = v.max(0.0);
+                }
+                if let Some(v) = attr(&attrs, "margin-left").and_then(parse_odf_pt) {
+                    geom.margins.left = v.max(0.0);
+                }
+                // First page layout is the document default — stop here.
+                break;
+            }
+        }
+    }
+    geom
 }
 
 /// Parse an ODF length like `12pt`, `0.5cm`, `14px` to points (best effort).
@@ -1024,16 +1347,23 @@ fn parse_odf_pt(v: &str) -> Option<f64> {
 /// `draw:image xlink:href`→`<img>`.
 pub fn odt_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let content = part(zip, "content.xml");
-    let mut styles = zip
-        .get("styles.xml")
-        .map(|b| odf_text_styles(&String::from_utf8_lossy(b)))
-        .unwrap_or_default();
+    let styles_xml = part(zip, "styles.xml");
+    let mut styles = odf_text_styles(&styles_xml);
     // Automatic styles in content.xml take precedence / add to the named ones.
     styles.extend(odf_text_styles(&content));
 
+    let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
     let mut body = String::new();
     odf_walk(&mut Xml::new(&content), zip, &styles, &mut body, None);
-    crate::html::render(&html_doc(&body), &[], PAGE_W, PAGE_H, MARGIN)
+    render_geom(&body, geom)
+}
+
+/// Resolve ODF page geometry: the page-layout in `styles.xml` is authoritative
+/// for prose; an automatic page-layout in `content.xml` (presentations/sheets
+/// often put it there) overrides. `fallback` covers a part with neither.
+fn odf_geom(styles_xml: &str, content_xml: &str, fallback: PageGeom) -> PageGeom {
+    let from_styles = odf_page_geom(styles_xml, fallback);
+    odf_page_geom(content_xml, from_styles)
 }
 
 /// Recursive ODF text walker (shared by ODT body and table cells). `stop` ends
@@ -1111,7 +1441,9 @@ fn odf_inline(
                     "line-break" => out.push_str("<br>"),
                     "s" => {
                         // text:s = run of spaces (count via text:c).
-                        let n = attr(&attrs, "c").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+                        let n = attr(&attrs, "c")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(1);
                         for _ in 0..n {
                             out.push(' ');
                         }
@@ -1195,6 +1527,11 @@ fn odf_table(
 /// `table:number-columns-repeated` (capped ~64). Rendered landscape.
 pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let content = part(zip, "content.xml");
+    let geom = odf_geom(
+        &part(zip, "styles.xml"),
+        &content,
+        PageGeom::tabular_default(),
+    );
     let mut body = String::new();
     let mut x = Xml::new(&content);
     let mut first = true;
@@ -1215,7 +1552,7 @@ pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if first {
         body.push_str("<p></p>");
     }
-    crate::html::render(&html_doc(&body), &[], LAND_W, LAND_H, MARGIN)
+    render_geom(&body, geom)
 }
 
 /// Emit one ODS `table:table` (open consumed) as an HTML `<table>`, expanding
@@ -1233,7 +1570,11 @@ fn ods_table(x: &mut Xml, out: &mut String) {
                         .min(64);
                     let row = ods_row(x);
                     // Skip emitting many identical *empty* trailing rows.
-                    let emit = if row.trim().is_empty() { rep.min(1) } else { rep };
+                    let emit = if row.trim().is_empty() {
+                        rep.min(1)
+                    } else {
+                        rep
+                    };
                     for _ in 0..emit {
                         out.push_str(&format!("<tr>{row}</tr>"));
                     }
@@ -1266,7 +1607,11 @@ fn ods_row(x: &mut Xml) -> String {
                         .unwrap_or(1)
                         .min(64);
                     let text = ods_cell_text(x, ln);
-                    let emit = if text.trim().is_empty() { rep.min(1) } else { rep };
+                    let emit = if text.trim().is_empty() {
+                        rep.min(1)
+                    } else {
+                        rep
+                    };
                     for _ in 0..emit {
                         out.push_str(&format!("<td>{}</td>", text.trim()));
                     }
@@ -1323,7 +1668,10 @@ fn ods_cell_text(x: &mut Xml, cell_tag: &str) -> String {
 /// styles), images via `draw:image`. Rendered landscape.
 pub fn odp_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let content = part(zip, "content.xml");
-    let styles = odf_text_styles(&content);
+    let styles_xml = part(zip, "styles.xml");
+    let mut styles = odf_text_styles(&styles_xml);
+    styles.extend(odf_text_styles(&content));
+    let geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
     let mut body = String::new();
     let mut x = Xml::new(&content);
     let mut first = true;
@@ -1341,7 +1689,7 @@ pub fn odp_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if first {
         body.push_str("<p></p>");
     }
-    crate::html::render(&html_doc(&body), &[], LAND_W, LAND_H, MARGIN)
+    render_geom(&body, geom)
 }
 
 /// Emit one `draw:page` (open consumed) — its paragraphs and images — until
@@ -1423,7 +1771,8 @@ fn ole2_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
         esc(&p, &mut body);
         body.push_str("</p>");
     }
-    Some(crate::html::render(&html_doc(&body), &[], PAGE_W, PAGE_H, MARGIN))
+    // Legacy binaries carry no recoverable page geometry — prose A4 default.
+    Some(render_geom(&body, PageGeom::prose_default()))
 }
 
 /// Extract readable text runs from a raw binary stream: prefer UTF-16LE runs of
@@ -1655,10 +2004,8 @@ impl Cfb {
             if name_len >= 2 {
                 let chars = (name_len / 2).saturating_sub(1).min(32);
                 for k in 0..chars {
-                    let c = u16::from_le_bytes([
-                        dir_bytes[off + k * 2],
-                        dir_bytes[off + k * 2 + 1],
-                    ]);
+                    let c =
+                        u16::from_le_bytes([dir_bytes[off + k * 2], dir_bytes[off + k * 2 + 1]]);
                     if let Some(ch) = char::from_u32(c as u32) {
                         name.push(ch);
                     }
@@ -1814,6 +2161,26 @@ fn is_hex6(s: &str) -> bool {
     s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Normalize a typeface name into a safe CSS `font-family` token: drop the
+/// characters that would break an inline `style="…"` declaration (`;:"<>`),
+/// collapse internal whitespace, and single-quote names that contain a space
+/// (e.g. `Times New Roman` → `'Times New Roman'`). Returns an empty string for
+/// names that reduce to nothing (caller then omits the declaration).
+fn css_font_family(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !matches!(c, ';' | ':' | '"' | '\'' | '<' | '>' | '{' | '}') && !c.is_control())
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        String::new()
+    } else if collapsed.contains(' ') {
+        format!("'{collapsed}'")
+    } else {
+        collapsed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1841,10 +2208,7 @@ mod tests {
     #[test]
     fn xml_walker_tokens_and_attrs() {
         let mut x = Xml::new(r#"<w:p><w:r a="1" b='two'>Hi &amp; bye</w:r></w:p>"#);
-        assert_eq!(
-            x.next(),
-            Some(Tok::Open("w:p".into(), vec![], false))
-        );
+        assert_eq!(x.next(), Some(Tok::Open("w:p".into(), vec![], false)));
         let open = x.next().unwrap();
         match open {
             Tok::Open(n, attrs, sc) => {
@@ -1885,7 +2249,11 @@ mod tests {
 
     // ── DOCX ──
 
-    fn build_docx(document_xml: &str, rels_xml: Option<&str>, media: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    fn build_docx(
+        document_xml: &str,
+        rels_xml: Option<&str>,
+        media: &[(&str, Vec<u8>)],
+    ) -> Vec<u8> {
         let mut z = ZipWriter::new();
         z.add_stored("[Content_Types].xml", b"<Types/>");
         z.add_stored("word/document.xml", document_xml.as_bytes());
@@ -2060,7 +2428,10 @@ mod tests {
   </office:spreadsheet></office:body>
 </office:document-content>"#;
         let mut z = ZipWriter::new();
-        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.spreadsheet");
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.spreadsheet",
+        );
         z.add_stored("content.xml", content.as_bytes());
         let ods = z.finish();
         let pdf = office_to_pdf(&ods).expect("ods converts");
@@ -2081,7 +2452,10 @@ mod tests {
   </office:presentation></office:body>
 </office:document-content>"#;
         let mut z = ZipWriter::new();
-        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.presentation");
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.presentation",
+        );
         z.add_stored("content.xml", content.as_bytes());
         let odp = z.finish();
         let pdf = office_to_pdf(&odp).expect("odp converts");
@@ -2125,8 +2499,10 @@ mod tests {
 
         // ── Header ──
         out[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
-        let put16 = |o: &mut [u8], at: usize, v: u16| o[at..at + 2].copy_from_slice(&v.to_le_bytes());
-        let put32 = |o: &mut [u8], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put16 =
+            |o: &mut [u8], at: usize, v: u16| o[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 =
+            |o: &mut [u8], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
         put16(&mut out, 24, 0x003E); // minor version
         put16(&mut out, 26, 0x0003); // major version 3 (512-byte sectors)
         put16(&mut out, 28, 0xFFFE); // byte order
@@ -2139,7 +2515,7 @@ mod tests {
         put32(&mut out, 64, 0); // number of MiniFAT sectors
         put32(&mut out, 68, EOC); // DIFAT start
         put32(&mut out, 72, 0); // number of DIFAT sectors
-        // DIFAT[0] = sector 1 (the FAT); rest free.
+                                // DIFAT[0] = sector 1 (the FAT); rest free.
         put32(&mut out, 76, 1);
         for k in 1..109 {
             put32(&mut out, 76 + k * 4, FREE);
@@ -2157,7 +2533,7 @@ mod tests {
         }
         put32(&mut out, fat_base, EOC); // sector 0 (dir) = end
         put32(&mut out, fat_base + 4, FATSECT); // sector 1 = FAT self
-        // Data sectors 2..(2+data_secs) chained.
+                                                // Data sectors 2..(2+data_secs) chained.
         for d in 0..data_secs {
             let sec = 2 + d;
             let next = if d + 1 < data_secs {
@@ -2181,14 +2557,14 @@ mod tests {
         put_name(&mut out, dir_base, "Root Entry");
         out[dir_base + 66] = 5; // object type: root storage
         put32(&mut out, dir_base + 116, EOC); // root has no mini stream here
-        // size 0 → mini stream empty (our WordDocument uses the FAT chain).
+                                              // size 0 → mini stream empty (our WordDocument uses the FAT chain).
 
         // Entry 1: WordDocument stream (object type 2), starts at sector 2.
         let e1 = dir_base + 128;
         put_name(&mut out, e1, "WordDocument");
         out[e1 + 66] = 2; // object type: stream
         put32(&mut out, e1 + 116, 2); // start sector
-        // size (8 bytes at +120): the text length, ≥ cutoff guaranteed by caller.
+                                      // size (8 bytes at +120): the text length, ≥ cutoff guaranteed by caller.
         let size = text_utf16.len() as u64;
         out[e1 + 120..e1 + 128].copy_from_slice(&size.to_le_bytes());
 
@@ -2219,5 +2595,193 @@ mod tests {
         for needle in ["Legacy", "Word", "Document", "Body", "Text"] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    // ── page geometry & font-family ──
+
+    /// Build the DOCX HTML body the renderer receives (bypasses PDF rendering so
+    /// we can assert on the generated markup directly).
+    fn docx_html(document_xml: &str) -> String {
+        let mut body = String::new();
+        docx_body(document_xml, &BTreeMap::new(), &BTreeMap::new(), &mut body);
+        body
+    }
+
+    #[test]
+    fn unit_conversions_twips_and_emu() {
+        // 1 inch = 1440 twips = 72pt; A4 width 11906 twips ≈ 595.3pt.
+        assert!((twips_to_pt("1440").unwrap() - 72.0).abs() < 1e-9);
+        assert!((twips_to_pt("11906").unwrap() - 595.3).abs() < 0.1);
+        assert!(twips_to_pt("nope").is_none());
+        // 1 inch = 914400 EMU = 72pt; PowerPoint 16:9 width 9144000 EMU = 720pt.
+        assert!((emu_to_pt("914400").unwrap() - 72.0).abs() < 1e-9);
+        assert!((emu_to_pt("9144000").unwrap() - 720.0).abs() < 1e-9);
+        assert!(emu_to_pt("x").is_none());
+    }
+
+    #[test]
+    fn css_font_family_quotes_and_sanitizes() {
+        assert_eq!(css_font_family("Arial"), "Arial");
+        assert_eq!(css_font_family("Times New Roman"), "'Times New Roman'");
+        // Stray delimiters that would break an inline style are dropped.
+        assert_eq!(css_font_family("Ev;il\"<x>"), "Evilx");
+        assert_eq!(css_font_family("  "), "");
+    }
+
+    #[test]
+    fn docx_a4_page_size_from_sectpr() {
+        // A4 portrait: 11906 × 16838 twips, 1440-twip (1in) margins.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>Body</w:t></w:r></w:p>
+            <w:sectPr>
+              <w:pgSz w:w="11906" w:h="16838"/>
+              <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/>
+            </w:sectPr>
+          </w:body></w:document>"#;
+        // Geometry parser resolves ~A4 (595.3 × 841.9).
+        let geom = docx_page_geom(doc);
+        assert!((geom.w - 595.3).abs() < 0.5, "w = {}", geom.w);
+        assert!((geom.h - 841.9).abs() < 0.5, "h = {}", geom.h);
+        assert!((geom.margins.top - 72.0).abs() < 0.5);
+        // …and the rendered PDF's first page carries that media box.
+        let pdf = office_to_pdf(&build_docx(doc, None, &[])).expect("docx converts");
+        let (w, h, _rot) = opens(&pdf).page_info(1).expect("page size");
+        assert!(
+            (w - 595.0).abs() < 2.0 && (h - 842.0).abs() < 2.0,
+            "{w}x{h}"
+        );
+    }
+
+    #[test]
+    fn docx_landscape_orientation_swaps_axes() {
+        // orient="landscape" with w<h means the axes are swapped at render time.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:sectPr><w:pgSz w:w="11906" w:h="16838" w:orient="landscape"/></w:sectPr>
+          </w:body></w:document>"#;
+        let geom = docx_page_geom(doc);
+        assert!(geom.w > geom.h, "landscape is wider than tall: {geom:?}");
+    }
+
+    #[test]
+    fn docx_missing_sectpr_falls_back_to_a4() {
+        let geom = docx_page_geom(r#"<w:document xmlns:w="x"><w:body/></w:document>"#);
+        assert!((geom.w - A4_W).abs() < 0.01 && (geom.h - A4_H).abs() < 0.01);
+    }
+
+    #[test]
+    fn docx_run_font_injected_as_font_family() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:rPr><w:rFonts w:ascii="Arial"/></w:rPr><w:t>Hello</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("font-family:Arial"), "html was: {html}");
+    }
+
+    #[test]
+    fn docx_paragraph_alignment_spacing_indent() {
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p>
+              <w:pPr>
+                <w:jc w:val="center"/>
+                <w:spacing w:before="240" w:after="120"/>
+                <w:ind w:left="720" w:firstLine="360"/>
+              </w:pPr>
+              <w:r><w:t>Centered</w:t></w:r>
+            </w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("text-align:center"), "html: {html}");
+        assert!(
+            html.contains("margin-top:12pt"),
+            "before 240twip=12pt: {html}"
+        );
+        assert!(
+            html.contains("margin-bottom:6pt"),
+            "after 120twip=6pt: {html}"
+        );
+        assert!(
+            html.contains("margin-left:36pt"),
+            "ind left 720twip=36pt: {html}"
+        );
+        assert!(
+            html.contains("text-indent:18pt"),
+            "firstLine 360twip=18pt: {html}"
+        );
+    }
+
+    #[test]
+    fn docx_jc_right_and_both_map_to_css() {
+        let right = docx_html(
+            r#"<w:document xmlns:w="x"><w:body><w:p><w:pPr><w:jc w:val="right"/></w:pPr><w:r><w:t>R</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        assert!(right.contains("text-align:right"), "{right}");
+        let just = docx_html(
+            r#"<w:document xmlns:w="x"><w:body><w:p><w:pPr><w:jc w:val="both"/></w:pPr><w:r><w:t>J</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        assert!(just.contains("text-align:justify"), "{just}");
+    }
+
+    #[test]
+    fn pptx_slide_size_from_presentation() {
+        // 16:9 = 9144000 × 5143500 EMU → 720 × 405 pt, zero margins.
+        let geom = pptx_page_geom(
+            r#"<p:presentation xmlns:p="x"><p:sldSz cx="9144000" cy="5143500"/></p:presentation>"#,
+        );
+        assert!((geom.w - 720.0).abs() < 0.01, "w = {}", geom.w);
+        assert!((geom.h - 405.0).abs() < 0.01, "h = {}", geom.h);
+        assert_eq!(geom.margins.left, 0.0);
+        // Absent → 16:9 fallback.
+        let fb = pptx_page_geom("<p:presentation/>");
+        assert!((fb.w - SLIDE_W).abs() < 0.01 && (fb.h - SLIDE_H).abs() < 0.01);
+    }
+
+    #[test]
+    fn pptx_latin_typeface_injected_and_theme_skipped() {
+        // A real typeface flows into the generated slide HTML as font-family.
+        let mut body = String::new();
+        pptx_slide(
+            r#"<p:sld xmlns:a="y"><a:p><a:r><a:rPr><a:latin typeface="Calibri"/></a:rPr><a:t>Hi</a:t></a:r></a:p></p:sld>"#,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut body,
+        );
+        assert!(body.contains("font-family:Calibri"), "body: {body}");
+
+        // Theme placeholders (`+mn-lt`) are not real families — skipped.
+        let mut themed = String::new();
+        pptx_slide(
+            r#"<p:sld xmlns:a="y"><a:p><a:r><a:rPr><a:latin typeface="+mn-lt"/></a:rPr><a:t>Hi</a:t></a:r></a:p></p:sld>"#,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut themed,
+        );
+        assert!(!themed.contains("font-family"), "themed: {themed}");
+    }
+
+    #[test]
+    fn odf_page_geometry_and_font_name() {
+        // ODF page layout in styles.xml: 21cm × 29.7cm (A4), 2cm margins.
+        let styles = r#"<office:document-styles xmlns:office="o" xmlns:style="s" xmlns:fo="f">
+            <office:automatic-styles>
+              <style:page-layout style:name="PL1">
+                <style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" fo:margin="2cm"/>
+              </style:page-layout>
+            </office:automatic-styles>
+          </office:document-styles>"#;
+        let geom = odf_geom(styles, "", PageGeom::prose_default());
+        assert!((geom.w - 595.28).abs() < 0.5, "w = {}", geom.w); // 21cm
+        assert!((geom.h - 841.89).abs() < 0.5, "h = {}", geom.h); // 29.7cm
+        assert!((geom.margins.left - 56.69).abs() < 0.5, "2cm margin"); // 2cm
+
+        // fo:font-name flows into the text-style CSS map.
+        let css = odf_text_styles(
+            r#"<doc xmlns:style="s" xmlns:fo="f">
+              <style:style style:name="T1"><style:text-properties fo:font-name="Liberation Serif"/></style:style>
+            </doc>"#,
+        );
+        assert_eq!(
+            css.get("T1").map(String::as_str),
+            Some("font-family:'Liberation Serif';")
+        );
     }
 }
