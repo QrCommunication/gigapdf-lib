@@ -44,6 +44,7 @@ DATASETS: dict[str, dict] = {
     "norhand": {"id": "Teklia/NorHand-v3-line", "text": "text", "group": "alpha"},  # Norwegian
     "newseye": {"id": "Teklia/NewsEye-Austrian-line", "text": "text", "group": "alpha"},  # German
     "belfort": {"id": "Teklia/Belfort-line", "text": "text", "group": "alpha"},  # French
+    "popp": {"id": "Teklia/POPP-line", "text": "text", "group": "alpha"},  # French (census)
     "esposalles": {"id": "Teklia/Esposalles-line", "text": "text", "group": "alpha"},  # Catalan
     # Cyrillic → `alpha` (real-style handwriting; fonts cover Cyrillic poorly)
     "cyrillic": {"id": "deepcopy/synthetic-handwritten-cyrillic-180k", "text": "text", "group": "alpha"},
@@ -138,6 +139,10 @@ def _best_cache(safe: str, split: str, n: int) -> str | None:
     ]
     if not sized:
         return None
+    # Prefer the smallest cache holding ≥ n (its [:n] slice suffices); else the largest
+    # available — which, because caches are now named by ACTUAL line count, is the most
+    # complete pull of that dataset (a cache smaller than n means the dataset itself, after
+    # filtering, has no more to give, so re-downloading would not yield more).
     ge = sorted(c for c in sized if c[0] >= n)
     return ge[0][1] if ge else max(sized)[1]
 
@@ -158,7 +163,6 @@ def fetch_lines(name: str, n: int, split: str = "train", *, cache: bool = True) 
     line). `name` is a key of DATASETS or a raw "owner/dataset" id."""
     spec = DATASETS.get(name, {"id": name, "text": "text"})
     safe = name.replace("/", "_")
-    cache_path = os.path.join(CACHE_ROOT, f"{safe}_{split}_{n}.npz")
     if cache:
         best = _best_cache(safe, split, n)
         if best is not None:
@@ -200,7 +204,9 @@ def fetch_lines(name: str, n: int, split: str = "train", *, cache: bool = True) 
             print(f"  [{name}] fetched {len(out)}/{n}", flush=True)
 
     if cache and out:
-        _save_cache(cache_path, out)
+        # Name the cache by the ACTUAL number of lines fetched (not the requested n) so a
+        # short/capped pull can't later masquerade as a larger cache (see _best_cache).
+        _save_cache(os.path.join(CACHE_ROOT, f"{safe}_{split}_{len(out)}.npz"), out)
     return out
 
 
