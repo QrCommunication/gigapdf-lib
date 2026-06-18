@@ -4,6 +4,40 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.51.0] - 2026-06-18
+
+### Added
+
+- **Rasterizer fidelity — form XObjects, clipping, shadings, soft masks, blend modes.**
+  `renderPage` now paints page-content form XObjects (`Do`, cycle-guarded, clipped to
+  `/BBox`), honours path clipping (`W`/`W*`), renders axial (type 2) and radial (type 3)
+  **shadings** (the `sh` operator and shading-`/Pattern` fills) with `/Function` ramps and
+  `/Extend`, stamps tiling patterns, and applies ExtGState separable **blend modes**
+  (`/BM`), constant alpha (`/ca`) and luminosity **soft masks** (`/SMask`). Previously
+  these were ignored (clips bled, gradients/patterns/transparency were missing).
+- **OpenType shaping — GPOS kerning + GSUB ligatures.** Text measurement and layout now
+  apply GPOS pair kerning and GSUB ligature/substitution; the embedded font subset keeps
+  its `cmap` so text extraction stays correct.
+- **Full-Unicode ToUnicode.** Type0/CFF fonts and supplementary-plane glyphs get a
+  ToUnicode mapping derived from the font `cmap` — no more `U+FFFD` for composite fonts
+  lacking `/ToUnicode`, and CFF ligature glyph names resolve.
+- **Unified editable document model (foundation).** A new zero-dependency `model` module
+  (`Document → Section → Page → Block → Inline`, plus spreadsheet/slide sub-models, named
+  styles, page geometry) with a versioned JSON round-trip — the base for format-agnostic
+  re-editability.
+
+### Changed
+
+- **HTML/CSS layout fidelity.** `position` (relative/absolute/fixed) + `z-index` +
+  `overflow` clipping, real `float` text wrapping, flex `align-*`/`flex-wrap`/`order` and
+  vertical `justify-content`, CSS grid rows + `gap`, table `rowspan`, plus `@font-face`,
+  `letter-spacing`/`word-spacing`, `calc()`/`var()` and `rem`/`vw`/`vh` units.
+- **Office import fidelity.** DOCX named-style inheritance (`styles.xml`/`docDefaults`) +
+  headers/footers + `PAGE`/`NUMPAGES` fields; PPTX tables (`a:tbl`) render with column
+  widths and theme fonts; real ordered-list numbering; XLSX theme/indexed cell colours,
+  number formats (date serials and currency render formatted, not raw), and merged cells
+  (`colspan`/`rowspan`).
+
 ## [0.50.0] - 2026-06-18
 
 ### Added
