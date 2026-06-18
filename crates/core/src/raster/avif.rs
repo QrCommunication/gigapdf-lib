@@ -17,6 +17,7 @@ pub(crate) mod cdef;
 pub(crate) mod cdf;
 pub(crate) mod deblock;
 pub(crate) mod itx;
+pub(crate) mod lr;
 pub(crate) mod msac;
 pub(crate) mod palette;
 pub(crate) mod predict;

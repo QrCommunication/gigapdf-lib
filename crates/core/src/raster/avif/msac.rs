@@ -236,6 +236,40 @@ impl<'a> Msac<'a> {
             (v << 1) - m + self.bool_equi()
         }
     }
+
+    /// Fused signed subexp-with-ref decode (`dav1d_msac_decode_subexp`), used for
+    /// loop-restoration Wiener taps and SGR weights (§5.11.58). Returns a value in
+    /// `[ref - (n - 1) ..]` recentred around `ref`; the caller subtracts its
+    /// per-tap bias to land in `[min, max]`. Precondition: `n >> k == 8` (all LR
+    /// cases: 16/1, 32/2, 64/3, 128/4). Reads equiprobable (literal) bits only.
+    pub fn decode_subexp(&mut self, reference: i32, n: u32, mut k: u32) -> i32 {
+        debug_assert_eq!(n >> k, 8);
+        let mut a = 0u32;
+        if self.bool_equi() != 0 {
+            if self.bool_equi() != 0 {
+                k += self.bool_equi() + 1;
+            }
+            a = 1 << k;
+        }
+        let v = self.bools(k) + a;
+        let r = reference as u32;
+        if r * 2 <= n {
+            inv_recenter(r, v) as i32
+        } else {
+            (n - 1 - inv_recenter(n - 1 - r, v)) as i32
+        }
+    }
+}
+
+/// `inverse_recenter(r, v)` (AV1 §5.9.29): undo the recentre-around-`r` mapping.
+fn inv_recenter(r: u32, v: u32) -> u32 {
+    if v > 2 * r {
+        v
+    } else if v & 1 != 0 {
+        r - ((v + 1) >> 1)
+    } else {
+        r + (v >> 1)
+    }
 }
 
 #[cfg(test)]

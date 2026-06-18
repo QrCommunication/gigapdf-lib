@@ -24,14 +24,12 @@ const DC_128: u8 = 255;
 /// `dav1d_sm_weights[128]` — SMOOTH blend weights, indexed `[size + i]`
 /// (size = block dim, ≥2). From dav1d `src/tables.c` (BSD-2-Clause).
 pub(super) static SM_WEIGHTS: [i32; 128] = [
-    0, 0, 255, 128, 255, 149, 85, 64, 255, 197, 146, 105, 73, 50, 37, 32,
-    255, 225, 196, 170, 145, 123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16,
-    255, 240, 225, 210, 196, 182, 169, 157, 145, 133, 122, 111, 101, 92, 83, 74,
-    66, 59, 52, 45, 39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8,
-    255, 248, 240, 233, 225, 218, 210, 203, 196, 189, 182, 176, 169, 163, 156, 150,
-    144, 138, 133, 127, 121, 116, 111, 106, 101, 96, 91, 86, 82, 77, 73, 69,
-    65, 61, 57, 54, 50, 47, 44, 41, 38, 35, 32, 29, 27, 25, 22, 20,
-    18, 16, 15, 13, 12, 10, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4,
+    0, 0, 255, 128, 255, 149, 85, 64, 255, 197, 146, 105, 73, 50, 37, 32, 255, 225, 196, 170, 145,
+    123, 102, 84, 68, 54, 43, 33, 26, 20, 17, 16, 255, 240, 225, 210, 196, 182, 169, 157, 145, 133,
+    122, 111, 101, 92, 83, 74, 66, 59, 52, 45, 39, 34, 29, 25, 21, 17, 14, 12, 10, 9, 8, 8, 255,
+    248, 240, 233, 225, 218, 210, 203, 196, 189, 182, 176, 169, 163, 156, 150, 144, 138, 133, 127,
+    121, 116, 111, 106, 101, 96, 91, 86, 82, 77, 73, 69, 65, 61, 57, 54, 50, 47, 44, 41, 38, 35,
+    32, 29, 27, 25, 22, 20, 18, 16, 15, 13, 12, 10, 9, 8, 7, 6, 6, 5, 5, 4, 4, 4,
 ];
 
 /// The scalar DC prediction value (dav1d `dc_gen`/`dc_gen_top`/`dc_gen_left`),
@@ -48,7 +46,11 @@ pub(super) fn dc_value(bw: usize, bh: usize, top: &[i32], left: &[i32], ht: bool
             }
             s >>= (bw + bh).trailing_zeros();
             if bw != bh {
-                let m = if bw > bh * 2 || bh > bw * 2 { 0x3334 } else { 0x5556 };
+                let m = if bw > bh * 2 || bh > bw * 2 {
+                    0x3334
+                } else {
+                    0x5556
+                };
                 s = (s * m) >> 16;
             }
             s
@@ -114,10 +116,8 @@ fn pred_smooth(out: &mut [i32], bw: usize, bh: usize, top: &[i32], left: &[i32])
     let bottom = left[bh - 1];
     for y in 0..bh {
         for x in 0..bw {
-            let pred = wv[y] * top[x]
-                + (256 - wv[y]) * bottom
-                + wh[x] * left[y]
-                + (256 - wh[x]) * right;
+            let pred =
+                wv[y] * top[x] + (256 - wv[y]) * bottom + wh[x] * left[y] + (256 - wh[x]) * right;
             out[y * bw + x] = (pred + 256) >> 9;
         }
     }
@@ -225,7 +225,11 @@ pub(super) fn filter(
                 (out[r], out[r + 1], out[r + 2], out[r + 3])
             };
             let p0 = if x == 0 {
-                if y == 0 { topleft } else { left[y - 1] }
+                if y == 0 {
+                    topleft
+                } else {
+                    left[y - 1]
+                }
             } else if y == 0 {
                 top[x - 1]
             } else {
@@ -256,43 +260,64 @@ pub(super) fn filter(
     out
 }
 
-
 // ---- Directional (Z1/Z2/Z3) edge helpers (dav1d ipred_tmpl.c) -------------
 
 /// `dav1d_dr_intra_derivative[44]` — directional intra slope per (angle>>1).
 /// Zero entries are unused. From dav1d `src/tables.c` (BSD-2-Clause).
 pub(super) static DR_INTRA_DERIVATIVE: [i32; 44] = [
-    0, 1023, 0, 547, 372, 0, 0, 273, 215, 0, 178,
-    151, 0, 132, 116, 0, 102, 0, 90, 80, 0, 71,
-    64, 0, 57, 51, 0, 45, 0, 40, 35, 0, 31,
-    27, 0, 23, 19, 0, 15, 0, 11, 0, 7, 3,
+    0, 1023, 0, 547, 372, 0, 0, 273, 215, 0, 178, 151, 0, 132, 116, 0, 102, 0, 90, 80, 0, 71, 64,
+    0, 57, 51, 0, 45, 0, 40, 35, 0, 31, 27, 0, 23, 19, 0, 15, 0, 11, 0, 7, 3,
 ];
 /// `get_filter_strength`: intra-edge low-pass strength (0=off..3) by block size,
 /// angle-from-orthogonal and the smooth-neighbour flag.
 pub(super) fn get_filter_strength(wh: i32, angle: i32, is_sm: bool) -> i32 {
     if is_sm {
         if wh <= 8 {
-            if angle >= 64 { return 2; }
-            if angle >= 40 { return 1; }
+            if angle >= 64 {
+                return 2;
+            }
+            if angle >= 40 {
+                return 1;
+            }
         } else if wh <= 16 {
-            if angle >= 48 { return 2; }
-            if angle >= 20 { return 1; }
+            if angle >= 48 {
+                return 2;
+            }
+            if angle >= 20 {
+                return 1;
+            }
         } else if wh <= 24 {
-            if angle >= 4 { return 3; }
+            if angle >= 4 {
+                return 3;
+            }
         } else {
             return 3;
         }
     } else if wh <= 8 {
-        if angle >= 56 { return 1; }
+        if angle >= 56 {
+            return 1;
+        }
     } else if wh <= 16 {
-        if angle >= 40 { return 1; }
+        if angle >= 40 {
+            return 1;
+        }
     } else if wh <= 24 {
-        if angle >= 32 { return 3; }
-        if angle >= 16 { return 2; }
-        if angle >= 8 { return 1; }
+        if angle >= 32 {
+            return 3;
+        }
+        if angle >= 16 {
+            return 2;
+        }
+        if angle >= 8 {
+            return 1;
+        }
     } else if wh <= 32 {
-        if angle >= 32 { return 3; }
-        if angle >= 4 { return 2; }
+        if angle >= 32 {
+            return 3;
+        }
+        if angle >= 4 {
+            return 2;
+        }
         return 1;
     } else {
         return 3;
@@ -377,7 +402,11 @@ pub(super) fn z1(bw: usize, bh: usize, angle_full: i32, tl: &[i32], corner: usiz
         max_base_x = 2 * (bw + bh) - 2;
         dx <<= 1;
     } else {
-        let fs = if enable { get_filter_strength(wh, 90 - angle, is_sm) } else { 0 };
+        let fs = if enable {
+            get_filter_strength(wh, 90 - angle, is_sm)
+        } else {
+            0
+        };
         if fs != 0 {
             filter_edge(&mut buf, bw + bh, 0, bw + bh, &inn, fs as usize);
             top = buf;
@@ -439,16 +468,18 @@ pub(super) fn z3(bw: usize, bh: usize, angle_full: i32, tl: &[i32], corner: usiz
         left_fwd = (0..=max_base_y).map(|b| buf[max_base_y - b]).collect();
         dy <<= 1;
     } else {
-        let fs = if enable { get_filter_strength(wh, angle - 180, is_sm) } else { 0 };
+        let fs = if enable {
+            get_filter_strength(wh, angle - 180, is_sm)
+        } else {
+            0
+        };
         if fs != 0 {
             filter_edge(&mut buf, bw + bh, 0, bw + bh, &inn, fs as usize);
             max_base_y = bw + bh - 1;
             left_fwd = (0..=max_base_y).map(|b| buf[max_base_y - b]).collect();
         } else {
             max_base_y = bh + bw.min(bh) - 1;
-            left_fwd = (0..=max_base_y)
-                .map(|b| tl[corner - 1 - b])
-                .collect();
+            left_fwd = (0..=max_base_y).map(|b| tl[corner - 1 - b]).collect();
         }
     }
     let base_inc = 1 + upsample as usize;
@@ -521,7 +552,11 @@ pub(super) fn z2(
         }
         dx <<= 1;
     } else {
-        let fs = if enable { get_filter_strength(wh, angle - 90, is_sm) } else { 0 };
+        let fs = if enable {
+            get_filter_strength(wh, angle - 90, is_sm)
+        } else {
+            0
+        };
         if fs != 0 {
             // filter_edge(&topleft[1], width, 0, max_width, &topleft_in[1], -1, width, fs)
             let inn = |k: i32| -> i32 { src(1 + k.clamp(-1, bw as i32 - 1)) };
@@ -548,12 +583,23 @@ pub(super) fn z2(
         }
         dy <<= 1;
     } else {
-        let fs = if enable { get_filter_strength(wh, 180 - angle, is_sm) } else { 0 };
+        let fs = if enable {
+            get_filter_strength(wh, 180 - angle, is_sm)
+        } else {
+            0
+        };
         if fs != 0 {
             // filter_edge(&topleft[-h], height, height-max_height, height, &topleft_in[-h], 0, height+1, fs)
             let inn = |k: i32| -> i32 { src(-(bh as i32) + k.clamp(0, bh as i32)) };
             let mut tmp = vec![0i32; bh];
-            filter_edge(&mut tmp, bh, bh.saturating_sub(max_height), bh, &inn, fs as usize);
+            filter_edge(
+                &mut tmp,
+                bh,
+                bh.saturating_sub(max_height),
+                bh,
+                &inn,
+                fs as usize,
+            );
             for (i, &v) in tmp.iter().enumerate() {
                 work[center - bh + i] = v;
             }
@@ -692,15 +738,43 @@ mod tests {
                 buf[corner + 1 + i] = 130 + 3 * i as i32;
                 buf[corner - 1 - i] = 110 - 2 * i as i32;
             }
-            assert_eq!(z1(n, n, 1083, &buf, corner), IPRED_REF[base + 12], "z1a size {n}");
-            assert_eq!(z1(n, n, 1054, &buf, corner), IPRED_REF[base + 13], "z1b size {n}");
-            assert_eq!(z3(n, n, 1227, &buf, corner), IPRED_REF[base + 14], "z3a size {n}");
-            assert_eq!(z3(n, n, 1249, &buf, corner), IPRED_REF[base + 15], "z3b size {n}");
+            assert_eq!(
+                z1(n, n, 1083, &buf, corner),
+                IPRED_REF[base + 12],
+                "z1a size {n}"
+            );
+            assert_eq!(
+                z1(n, n, 1054, &buf, corner),
+                IPRED_REF[base + 13],
+                "z1b size {n}"
+            );
+            assert_eq!(
+                z3(n, n, 1227, &buf, corner),
+                IPRED_REF[base + 14],
+                "z3a size {n}"
+            );
+            assert_eq!(
+                z3(n, n, 1249, &buf, corner),
+                IPRED_REF[base + 15],
+                "z3b size {n}"
+            );
             // Z2 dual-edge: angle 135 (filter both), 113 (ups_above+filt_left),
             // 157 (filt_above+ups_left); max_width/max_height = block size.
-            assert_eq!(z2(n, n, 1159, &buf, corner, n, n), IPRED_REF[base + 16], "z2a size {n}");
-            assert_eq!(z2(n, n, 1137, &buf, corner, n, n), IPRED_REF[base + 17], "z2b size {n}");
-            assert_eq!(z2(n, n, 1181, &buf, corner, n, n), IPRED_REF[base + 18], "z2c size {n}");
+            assert_eq!(
+                z2(n, n, 1159, &buf, corner, n, n),
+                IPRED_REF[base + 16],
+                "z2a size {n}"
+            );
+            assert_eq!(
+                z2(n, n, 1137, &buf, corner, n, n),
+                IPRED_REF[base + 17],
+                "z2b size {n}"
+            );
+            assert_eq!(
+                z2(n, n, 1181, &buf, corner, n, n),
+                IPRED_REF[base + 18],
+                "z2c size {n}"
+            );
         }
     }
 
@@ -712,5 +786,132 @@ mod tests {
         assert_eq!(cfl_apply(128, &[-64], 2), vec![126]); // d=-128 → -2
         assert_eq!(cfl_apply(10, &[-1000], 5), vec![0]); // clamps at 0
         assert_eq!(cfl_apply(250, &[1000], 5), vec![255]); // clamps at 255
+    }
+
+    /// `get_filter_strength` (intra edge low-pass strength) must match dav1d's
+    /// `get_filter_strength` branch table for both the non-smooth and
+    /// smooth-neighbour (`is_sm`) cases, across the blkWh thresholds 8/16/24/32
+    /// and the per-bucket angle thresholds. `wh = bw + bh`, `angle` = the per-zone
+    /// deviation from orthogonal.
+    #[test]
+    fn filter_strength_table_matches_dav1d() {
+        // Non-smooth buckets.
+        assert_eq!(get_filter_strength(8, 55, false), 0); // wh<=8, angle<56 → 0
+        assert_eq!(get_filter_strength(8, 56, false), 1); // wh<=8, angle>=56 → 1
+        assert_eq!(get_filter_strength(16, 39, false), 0);
+        assert_eq!(get_filter_strength(16, 40, false), 1);
+        assert_eq!(get_filter_strength(24, 8, false), 1);
+        assert_eq!(get_filter_strength(24, 16, false), 2);
+        assert_eq!(get_filter_strength(24, 32, false), 3);
+        assert_eq!(get_filter_strength(24, 7, false), 0);
+        assert_eq!(get_filter_strength(32, 0, false), 1); // wh<=32 else-branch → 1
+        assert_eq!(get_filter_strength(32, 4, false), 2);
+        assert_eq!(get_filter_strength(32, 32, false), 3);
+        assert_eq!(get_filter_strength(40, 0, false), 3); // wh>32 → always 3
+                                                          // Smooth-neighbour buckets.
+        assert_eq!(get_filter_strength(8, 40, true), 1);
+        assert_eq!(get_filter_strength(8, 64, true), 2);
+        assert_eq!(get_filter_strength(8, 39, true), 0);
+        assert_eq!(get_filter_strength(16, 20, true), 1);
+        assert_eq!(get_filter_strength(16, 48, true), 2);
+        assert_eq!(get_filter_strength(24, 4, true), 3);
+        assert_eq!(get_filter_strength(24, 3, true), 0);
+        assert_eq!(get_filter_strength(40, 0, true), 3); // wh>24 → 3
+    }
+
+    /// `get_upsample`: `angle < 40 && wh <= (16 >> is_sm)`. Non-smooth caps at
+    /// wh 16, smooth at wh 8; both require deviation < 40.
+    #[test]
+    fn upsample_decision_matches_dav1d() {
+        assert!(get_upsample(16, 39, false)); // wh<=16, angle<40, non-sm
+        assert!(!get_upsample(16, 40, false)); // angle not < 40
+        assert!(!get_upsample(18, 10, false)); // wh > 16
+        assert!(get_upsample(8, 10, true)); // wh<=8 smooth
+        assert!(!get_upsample(16, 10, true)); // wh > 8 for smooth
+    }
+
+    /// `filter_edge` 5-tap low-pass: with the unavailable-corner gate
+    /// (`lim_from = 1`) the first sample is copied verbatim, interior samples take
+    /// the strength-1 kernel `[0,4,8,4,0]/16`, and the tail is copied. Hand-check
+    /// a constant input is a fixed point (kernel sums to 16).
+    #[test]
+    fn filter_edge_kernels() {
+        let inp = [10, 20, 30, 40, 50];
+        let src = |k: i32| inp[k.clamp(0, 4) as usize];
+        let mut out = vec![0i32; 5];
+        // strength 1, filter [1..4], copy ends.
+        filter_edge(&mut out, 5, 1, 4, &src, 1);
+        assert_eq!(out[0], 10); // lim_from=1 → copied
+        assert_eq!(out[1], (20 * 8 + 10 * 4 + 30 * 4 + 8) >> 4); // (160+40+120+8)/16 = 20
+        assert_eq!(out[4], 50); // beyond lim_to → copied
+                                // Constant input is preserved by all three kernels.
+        let flat = |_k: i32| 77;
+        for strength in 1..=3 {
+            let mut o = vec![0i32; 6];
+            filter_edge(&mut o, 6, 0, 6, &flat, strength);
+            assert!(
+                o.iter().all(|&v| v == 77),
+                "strength {strength} smears a constant"
+            );
+        }
+    }
+
+    /// `upsample_edge` 2× interpolation `[-1,9,9,-1]/16`: even outputs copy the
+    /// source samples, odd outputs interpolate. A linear ramp upsamples to a
+    /// finer ramp (the `[-1,9,9,-1]` kernel is exact on linear data).
+    #[test]
+    fn upsample_edge_doubles_samples() {
+        let inp = [10, 20, 30, 40];
+        let src = |k: i32| inp[k.clamp(0, 3) as usize];
+        let mut out = vec![0i32; 8];
+        upsample_edge(&mut out, 4, &src);
+        assert_eq!(out[0], 10); // even = source[0]
+        assert_eq!(out[2], 20); // even = source[1]
+        assert_eq!(out[4], 30);
+        // odd[1] interpolates 10,10,20,30 → (-10+90+180-30+8)>>4 = 15.
+        assert_eq!(out[1], ((-10 + 9 * 10 + 9 * 20 - 30) + 8) >> 4);
+        assert_eq!(out[3], ((-10 + 9 * 20 + 9 * 30 - 40) + 8) >> 4); // = 25
+    }
+
+    /// Edge availability at a tile/frame corner: with neither top nor left
+    /// available (the top-left block at `(0,0)`), `dav1d_prepare_intra_edges`
+    /// downgrades. PAETH → DC_128 (flat mid-grey 128); DC → the 128 fallback;
+    /// SMOOTH/V/H read the sentinel-filled (127/129) edges the caller supplies.
+    /// This exercises the `av1_mode_conv` corner downgrade in `predict`.
+    #[test]
+    fn intra_corner_availability_downgrade() {
+        let (bw, bh) = (4usize, 4usize);
+        // Caller-supplied corner sentinels (reconstruct_tx fills 127/129/128).
+        let top = vec![127i32; bw];
+        let left = vec![129i32; bh];
+        let topleft = 128;
+        // PAETH with no neighbours → DC_128 = flat 128.
+        let paeth = predict(PAETH_PRED, false, false, bw, bh, &top, &left, topleft);
+        assert!(
+            paeth.iter().all(|&v| v == 128),
+            "PAETH at corner must downgrade to 128"
+        );
+        // DC with no neighbours → 128 fallback.
+        let dc = predict(DC_PRED, false, false, bw, bh, &top, &left, topleft);
+        assert!(dc.iter().all(|&v| v == 128), "DC at corner must be 128");
+        // With only the top available, PAETH downgrades to VERT (copies top row).
+        let top2: Vec<i32> = (0..bw).map(|i| 100 + 4 * i as i32).collect();
+        let paeth_v = predict(PAETH_PRED, true, false, bw, bh, &top2, &left, topleft);
+        for y in 0..bh {
+            assert_eq!(
+                &paeth_v[y * bw..y * bw + bw],
+                &top2[..],
+                "PAETH(top-only) = VERT"
+            );
+        }
+        // With only the left available, PAETH downgrades to HOR (copies left col).
+        let left2: Vec<i32> = (0..bh).map(|i| 90 - 3 * i as i32).collect();
+        let paeth_h = predict(PAETH_PRED, false, true, bw, bh, &top, &left2, topleft);
+        for y in 0..bh {
+            assert!(
+                paeth_h[y * bw..y * bw + bw].iter().all(|&v| v == left2[y]),
+                "PAETH(left)=HOR"
+            );
+        }
     }
 }

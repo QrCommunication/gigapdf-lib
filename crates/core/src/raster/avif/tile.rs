@@ -348,10 +348,11 @@ fn gather_left_partition_prob(c: &[u16], bl: u8) -> u32 {
 
 // ── Tile decoder: the partition tree driven by the entropy decoder ────────────
 
-use super::cdf;
 use super::cdef;
+use super::cdf;
 use super::deblock;
 use super::itx;
+use super::lr;
 use super::msac::Msac;
 use super::palette;
 use super::predict;
@@ -383,33 +384,32 @@ pub(crate) static AV1_MODE_TO_ANGLE_MAP: [i32; 8] = [90, 180, 45, 135, 113, 157,
 
 /// `dav1d_intra_mode_context[mode]` — maps a neighbour's intra mode to one of 5
 /// contexts for the keyframe Y-mode CDF (`cdf::KF_Y_MODE[above_ctx][left_ctx]`).
-pub(crate) static INTRA_MODE_CONTEXT: [u8; 13] =
-    [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+pub(crate) static INTRA_MODE_CONTEXT: [u8; 13] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
 
 /// `dav1d_txfm_dimensions[tx] = [lw, lh, max, sub, min, ctx]` (19 square+rect
 /// sizes; `lw`/`lh` = log2 width/height in 4×4, `max`/`min` = larger/smaller log2
 /// dim, `sub` = next-smaller tx for the size-split descent, `ctx` = coef-skip CDF
 /// index). `TX_4X4`=0..`TX_64X64`=4, then rectangular `RTX_*` from 5.
 pub(crate) static TXFM_DIMENSIONS: [[u8; 6]; 19] = [
-    [0, 0, 0, 0, 0, 0],   // TX_4X4
-    [1, 1, 1, 0, 1, 1],   // TX_8X8
-    [2, 2, 2, 1, 2, 2],   // TX_16X16
-    [3, 3, 3, 2, 3, 3],   // TX_32X32
-    [4, 4, 4, 3, 4, 4],   // TX_64X64
-    [0, 1, 1, 0, 0, 1],   // RTX_4X8
-    [1, 0, 1, 0, 0, 1],   // RTX_8X4
-    [1, 2, 2, 1, 1, 2],   // RTX_8X16
-    [2, 1, 2, 1, 1, 2],   // RTX_16X8
-    [2, 3, 3, 2, 2, 3],   // RTX_16X32
-    [3, 2, 3, 2, 2, 3],   // RTX_32X16
-    [3, 4, 4, 3, 3, 4],   // RTX_32X64
-    [4, 3, 4, 3, 3, 4],   // RTX_64X32
-    [0, 2, 2, 5, 0, 1],   // RTX_4X16
-    [2, 0, 2, 6, 0, 1],   // RTX_16X4
-    [1, 3, 3, 7, 1, 2],   // RTX_8X32
-    [3, 1, 3, 8, 1, 2],   // RTX_32X8
-    [2, 4, 4, 9, 2, 3],   // RTX_16X64
-    [4, 2, 4, 10, 2, 3],  // RTX_64X16
+    [0, 0, 0, 0, 0, 0],  // TX_4X4
+    [1, 1, 1, 0, 1, 1],  // TX_8X8
+    [2, 2, 2, 1, 2, 2],  // TX_16X16
+    [3, 3, 3, 2, 3, 3],  // TX_32X32
+    [4, 4, 4, 3, 4, 4],  // TX_64X64
+    [0, 1, 1, 0, 0, 1],  // RTX_4X8
+    [1, 0, 1, 0, 0, 1],  // RTX_8X4
+    [1, 2, 2, 1, 1, 2],  // RTX_8X16
+    [2, 1, 2, 1, 1, 2],  // RTX_16X8
+    [2, 3, 3, 2, 2, 3],  // RTX_16X32
+    [3, 2, 3, 2, 2, 3],  // RTX_32X16
+    [3, 4, 4, 3, 3, 4],  // RTX_32X64
+    [4, 3, 4, 3, 3, 4],  // RTX_64X32
+    [0, 2, 2, 5, 0, 1],  // RTX_4X16
+    [2, 0, 2, 6, 0, 1],  // RTX_16X4
+    [1, 3, 3, 7, 1, 2],  // RTX_8X32
+    [3, 1, 3, 8, 1, 2],  // RTX_32X8
+    [2, 4, 4, 9, 2, 3],  // RTX_16X64
+    [4, 2, 4, 10, 2, 3], // RTX_64X16
 ];
 
 /// `dav1d_skip_ctx[la][ll]` — coefficient all-zero (txb_skip) context for luma.
@@ -444,8 +444,7 @@ pub(crate) mod txtp {
 
 /// `dav1d_tx_type_class[txtp]` — 0 = 2D, 1 = horizontal (H), 2 = vertical (V).
 /// Drives the eob CDF's `is_1d` index and the coefficient scan class.
-pub(crate) static TX_TYPE_CLASS: [u8; 17] =
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 2, 1, 2, 1, 0];
+pub(crate) static TX_TYPE_CLASS: [u8; 17] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 2, 1, 2, 1, 0];
 const TX_CLASS_2D: u8 = 0;
 
 /// `dav1d_lo_ctx_offsets[shape][y][x]` — base context offset for `coeff_base`,
@@ -551,38 +550,262 @@ fn get_dc_sign_ctx(tx: usize, a: &[u8], l: &[u8]) -> usize {
 /// dav1d `dav1d_dq_tbl[0]` (8-bit): [qindex][dc=0, ac=1] dequant factors.
 /// Transcribed from dav1d `src/dequant_tables.c` (BSD-2-Clause).
 pub(crate) static DQ_TBL_8BIT: [[u16; 2]; 256] = [
-    [4, 4], [8, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13], [12, 14],
-    [13, 15], [14, 16], [15, 17], [16, 18], [17, 19], [18, 20], [19, 21], [19, 22],
-    [20, 23], [21, 24], [22, 25], [23, 26], [24, 27], [25, 28], [26, 29], [26, 30],
-    [27, 31], [28, 32], [29, 33], [30, 34], [31, 35], [32, 36], [32, 37], [33, 38],
-    [34, 39], [35, 40], [36, 41], [37, 42], [38, 43], [38, 44], [39, 45], [40, 46],
-    [41, 47], [42, 48], [43, 49], [43, 50], [44, 51], [45, 52], [46, 53], [47, 54],
-    [48, 55], [48, 56], [49, 57], [50, 58], [51, 59], [52, 60], [53, 61], [53, 62],
-    [54, 63], [55, 64], [56, 65], [57, 66], [57, 67], [58, 68], [59, 69], [60, 70],
-    [61, 71], [62, 72], [62, 73], [63, 74], [64, 75], [65, 76], [66, 77], [66, 78],
-    [67, 79], [68, 80], [69, 81], [70, 82], [70, 83], [71, 84], [72, 85], [73, 86],
-    [74, 87], [74, 88], [75, 89], [76, 90], [77, 91], [78, 92], [78, 93], [79, 94],
-    [80, 95], [81, 96], [81, 97], [82, 98], [83, 99], [84, 100], [85, 101], [85, 102],
-    [87, 104], [88, 106], [90, 108], [92, 110], [93, 112], [95, 114], [96, 116], [98, 118],
-    [99, 120], [101, 122], [102, 124], [104, 126], [105, 128], [107, 130], [108, 132], [110, 134],
-    [111, 136], [113, 138], [114, 140], [116, 142], [117, 144], [118, 146], [120, 148], [121, 150],
-    [123, 152], [125, 155], [127, 158], [129, 161], [131, 164], [134, 167], [136, 170], [138, 173],
-    [140, 176], [142, 179], [144, 182], [146, 185], [148, 188], [150, 191], [152, 194], [154, 197],
-    [156, 200], [158, 203], [161, 207], [164, 211], [166, 215], [169, 219], [172, 223], [174, 227],
-    [177, 231], [180, 235], [182, 239], [185, 243], [187, 247], [190, 251], [192, 255], [195, 260],
-    [199, 265], [202, 270], [205, 275], [208, 280], [211, 285], [214, 290], [217, 295], [220, 300],
-    [223, 305], [226, 311], [230, 317], [233, 323], [237, 329], [240, 335], [243, 341], [247, 347],
-    [250, 353], [253, 359], [257, 366], [261, 373], [265, 380], [269, 387], [272, 394], [276, 401],
-    [280, 408], [284, 416], [288, 424], [292, 432], [296, 440], [300, 448], [304, 456], [309, 465],
-    [313, 474], [317, 483], [322, 492], [326, 501], [330, 510], [335, 520], [340, 530], [344, 540],
-    [349, 550], [354, 560], [359, 571], [364, 582], [369, 593], [374, 604], [379, 615], [384, 627],
-    [389, 639], [395, 651], [400, 663], [406, 676], [411, 689], [417, 702], [423, 715], [429, 729],
-    [435, 743], [441, 757], [447, 771], [454, 786], [461, 801], [467, 816], [475, 832], [482, 848],
-    [489, 864], [497, 881], [505, 898], [513, 915], [522, 933], [530, 951], [539, 969], [549, 988],
-    [559, 1007], [569, 1026], [579, 1046], [590, 1066], [602, 1087], [614, 1108], [626, 1129], [640, 1151],
-    [654, 1173], [668, 1196], [684, 1219], [700, 1243], [717, 1267], [736, 1292], [755, 1317], [775, 1343],
-    [796, 1369], [819, 1396], [843, 1423], [869, 1451], [896, 1479], [925, 1508], [955, 1537], [988, 1567],
-    [1022, 1597], [1058, 1628], [1098, 1660], [1139, 1692], [1184, 1725], [1232, 1759], [1282, 1793], [1336, 1828],
+    [4, 4],
+    [8, 8],
+    [8, 9],
+    [9, 10],
+    [10, 11],
+    [11, 12],
+    [12, 13],
+    [12, 14],
+    [13, 15],
+    [14, 16],
+    [15, 17],
+    [16, 18],
+    [17, 19],
+    [18, 20],
+    [19, 21],
+    [19, 22],
+    [20, 23],
+    [21, 24],
+    [22, 25],
+    [23, 26],
+    [24, 27],
+    [25, 28],
+    [26, 29],
+    [26, 30],
+    [27, 31],
+    [28, 32],
+    [29, 33],
+    [30, 34],
+    [31, 35],
+    [32, 36],
+    [32, 37],
+    [33, 38],
+    [34, 39],
+    [35, 40],
+    [36, 41],
+    [37, 42],
+    [38, 43],
+    [38, 44],
+    [39, 45],
+    [40, 46],
+    [41, 47],
+    [42, 48],
+    [43, 49],
+    [43, 50],
+    [44, 51],
+    [45, 52],
+    [46, 53],
+    [47, 54],
+    [48, 55],
+    [48, 56],
+    [49, 57],
+    [50, 58],
+    [51, 59],
+    [52, 60],
+    [53, 61],
+    [53, 62],
+    [54, 63],
+    [55, 64],
+    [56, 65],
+    [57, 66],
+    [57, 67],
+    [58, 68],
+    [59, 69],
+    [60, 70],
+    [61, 71],
+    [62, 72],
+    [62, 73],
+    [63, 74],
+    [64, 75],
+    [65, 76],
+    [66, 77],
+    [66, 78],
+    [67, 79],
+    [68, 80],
+    [69, 81],
+    [70, 82],
+    [70, 83],
+    [71, 84],
+    [72, 85],
+    [73, 86],
+    [74, 87],
+    [74, 88],
+    [75, 89],
+    [76, 90],
+    [77, 91],
+    [78, 92],
+    [78, 93],
+    [79, 94],
+    [80, 95],
+    [81, 96],
+    [81, 97],
+    [82, 98],
+    [83, 99],
+    [84, 100],
+    [85, 101],
+    [85, 102],
+    [87, 104],
+    [88, 106],
+    [90, 108],
+    [92, 110],
+    [93, 112],
+    [95, 114],
+    [96, 116],
+    [98, 118],
+    [99, 120],
+    [101, 122],
+    [102, 124],
+    [104, 126],
+    [105, 128],
+    [107, 130],
+    [108, 132],
+    [110, 134],
+    [111, 136],
+    [113, 138],
+    [114, 140],
+    [116, 142],
+    [117, 144],
+    [118, 146],
+    [120, 148],
+    [121, 150],
+    [123, 152],
+    [125, 155],
+    [127, 158],
+    [129, 161],
+    [131, 164],
+    [134, 167],
+    [136, 170],
+    [138, 173],
+    [140, 176],
+    [142, 179],
+    [144, 182],
+    [146, 185],
+    [148, 188],
+    [150, 191],
+    [152, 194],
+    [154, 197],
+    [156, 200],
+    [158, 203],
+    [161, 207],
+    [164, 211],
+    [166, 215],
+    [169, 219],
+    [172, 223],
+    [174, 227],
+    [177, 231],
+    [180, 235],
+    [182, 239],
+    [185, 243],
+    [187, 247],
+    [190, 251],
+    [192, 255],
+    [195, 260],
+    [199, 265],
+    [202, 270],
+    [205, 275],
+    [208, 280],
+    [211, 285],
+    [214, 290],
+    [217, 295],
+    [220, 300],
+    [223, 305],
+    [226, 311],
+    [230, 317],
+    [233, 323],
+    [237, 329],
+    [240, 335],
+    [243, 341],
+    [247, 347],
+    [250, 353],
+    [253, 359],
+    [257, 366],
+    [261, 373],
+    [265, 380],
+    [269, 387],
+    [272, 394],
+    [276, 401],
+    [280, 408],
+    [284, 416],
+    [288, 424],
+    [292, 432],
+    [296, 440],
+    [300, 448],
+    [304, 456],
+    [309, 465],
+    [313, 474],
+    [317, 483],
+    [322, 492],
+    [326, 501],
+    [330, 510],
+    [335, 520],
+    [340, 530],
+    [344, 540],
+    [349, 550],
+    [354, 560],
+    [359, 571],
+    [364, 582],
+    [369, 593],
+    [374, 604],
+    [379, 615],
+    [384, 627],
+    [389, 639],
+    [395, 651],
+    [400, 663],
+    [406, 676],
+    [411, 689],
+    [417, 702],
+    [423, 715],
+    [429, 729],
+    [435, 743],
+    [441, 757],
+    [447, 771],
+    [454, 786],
+    [461, 801],
+    [467, 816],
+    [475, 832],
+    [482, 848],
+    [489, 864],
+    [497, 881],
+    [505, 898],
+    [513, 915],
+    [522, 933],
+    [530, 951],
+    [539, 969],
+    [549, 988],
+    [559, 1007],
+    [569, 1026],
+    [579, 1046],
+    [590, 1066],
+    [602, 1087],
+    [614, 1108],
+    [626, 1129],
+    [640, 1151],
+    [654, 1173],
+    [668, 1196],
+    [684, 1219],
+    [700, 1243],
+    [717, 1267],
+    [736, 1292],
+    [755, 1317],
+    [775, 1343],
+    [796, 1369],
+    [819, 1396],
+    [843, 1423],
+    [869, 1451],
+    [896, 1479],
+    [925, 1508],
+    [955, 1537],
+    [988, 1567],
+    [1022, 1597],
+    [1058, 1628],
+    [1098, 1660],
+    [1139, 1692],
+    [1184, 1725],
+    [1232, 1759],
+    [1282, 1793],
+    [1336, 1828],
 ];
 
 /// `init_quant_tables` (dav1d decode.c): per-segment, per-plane `[dc, ac]`
@@ -654,28 +877,28 @@ pub(crate) static MAX_YTX: [u8; 22] = [
 /// size and chroma layout (0=luma/I400, 1=I420, 2=I422, 3=I444). Column 0
 /// equals `MAX_YTX`; the others give `uvtx`. From dav1d `src/tables.c`.
 pub(crate) static MAX_TXFM_SIZE_FOR_BS: [[u8; 4]; 22] = [
-    [4, 3, 3, 3], // BS_128x128
-    [4, 3, 3, 3], // BS_128x64
-    [4, 3, 0, 3], // BS_64x128
-    [4, 3, 3, 3], // BS_64x64
-    [12, 10, 3, 3], // BS_64x32
+    [4, 3, 3, 3],     // BS_128x128
+    [4, 3, 3, 3],     // BS_128x64
+    [4, 3, 0, 3],     // BS_64x128
+    [4, 3, 3, 3],     // BS_64x64
+    [12, 10, 3, 3],   // BS_64x32
     [18, 16, 10, 10], // BS_64x16
-    [11, 9, 0, 3], // BS_32x64
-    [3, 2, 9, 3], // BS_32x32
-    [10, 8, 2, 10], // BS_32x16
-    [16, 14, 8, 16], // BS_32x8
-    [17, 15, 0, 9], // BS_16x64
-    [9, 7, 0, 9], // BS_16x32
-    [2, 1, 7, 2], // BS_16x16
-    [8, 6, 1, 8], // BS_16x8
-    [14, 6, 6, 14], // BS_16x4
-    [15, 13, 0, 15], // BS_8x32
-    [7, 5, 0, 7], // BS_8x16
-    [1, 0, 5, 1], // BS_8x8
-    [6, 0, 0, 6], // BS_8x4
-    [13, 5, 0, 13], // BS_4x16
-    [5, 0, 0, 5], // BS_4x8
-    [0, 0, 0, 0], // BS_4x4
+    [11, 9, 0, 3],    // BS_32x64
+    [3, 2, 9, 3],     // BS_32x32
+    [10, 8, 2, 10],   // BS_32x16
+    [16, 14, 8, 16],  // BS_32x8
+    [17, 15, 0, 9],   // BS_16x64
+    [9, 7, 0, 9],     // BS_16x32
+    [2, 1, 7, 2],     // BS_16x16
+    [8, 6, 1, 8],     // BS_16x8
+    [14, 6, 6, 14],   // BS_16x4
+    [15, 13, 0, 15],  // BS_8x32
+    [7, 5, 0, 7],     // BS_8x16
+    [1, 0, 5, 1],     // BS_8x8
+    [6, 0, 0, 6],     // BS_8x4
+    [13, 5, 0, 13],   // BS_4x16
+    [5, 0, 0, 5],     // BS_4x8
+    [0, 0, 0, 0],     // BS_4x4
 ];
 
 /// The adapting CDF state a frame's intra tile decode mutates. Seeded from the
@@ -876,6 +1099,18 @@ pub(crate) struct Av1Tile<'a> {
     /// Per-4×4 luma "block had coded coefficients" grid (mi_cols × mi_rows): CDEF
     /// skips all-skip 8×8 blocks (dav1d `noskip_mask`).
     cdef_noskip: Vec<u8>,
+    // ── Loop restoration (§7.17) ──────────────────────────────────────────────
+    /// Per-plane `frame_restoration_type` (`Remap_Lr_Type` of `fh.lr_type`).
+    lr_ft: [lr::FrameRestoration; 3],
+    /// Per-plane restoration unit size (plane pixels) + decoded unit params,
+    /// filled by `read_lr` during the superblock walk.
+    lr_plane: [lr::PlaneLr; 3],
+    /// Per-plane subexp reference taps (reset per tile, updated by each read).
+    lr_ref: [lr::LrRef; 3],
+    /// Adaptive restoration-type CDFs (wiener/sgrproj/switchable bools+symbol).
+    lr_cdf: lr::LrCdf,
+    /// `true` if any plane uses loop restoration (skips the whole pass otherwise).
+    lr_active: bool,
 }
 
 /// CDEF availability flags for a `w × h` block at `(bx, by)` in a `pw × ph`
@@ -920,12 +1155,22 @@ fn cdef_apply_one(
     let edges = cdef_edges(bx, by, w, h, pw, ph);
     let doff = by * pw + bx;
     let left: Vec<[u8; 2]> = if edges & 0b0001 != 0 {
-        (0..h).map(|y| [src[(by + y) * pw + bx - 2], src[(by + y) * pw + bx - 1]]).collect()
+        (0..h)
+            .map(|y| [src[(by + y) * pw + bx - 2], src[(by + y) * pw + bx - 1]])
+            .collect()
     } else {
         vec![[0u8; 2]; h]
     };
-    let t_off = if edges & 0b0100 != 0 { (by - 2) * pw + bx } else { 0 };
-    let b_off = if edges & 0b1000 != 0 { (by + h) * pw + bx } else { 0 };
+    let t_off = if edges & 0b0100 != 0 {
+        (by - 2) * pw + bx
+    } else {
+        0
+    };
+    let b_off = if edges & 0b1000 != 0 {
+        (by + h) * pw + bx
+    } else {
+        0
+    };
     cdef::cdef_filter_block(
         dst, doff, pw, &left, src, t_off, pw, src, b_off, pw, pri, sec, dir, damping, w, h, edges,
     );
@@ -942,6 +1187,7 @@ impl<'a> Av1Tile<'a> {
         fh: &super::FrameHeader,
     ) -> Self {
         let cols = mi_cols as usize;
+        let num_planes = if seq.mono_chrome { 1 } else { 3 };
         Av1Tile {
             msac: Msac::new(tile_bytes, fh.disable_cdf_update),
             geom: TileGeom { mi_cols, mi_rows },
@@ -1017,10 +1263,34 @@ impl<'a> Av1Tile<'a> {
             db_gw4: [0; 3],
             db_gh4: [0; 3],
             db_level: [
-                deblock::lf_level(fh.loop_filter_level[0] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
-                deblock::lf_level(fh.loop_filter_level[1] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
-                deblock::lf_level(fh.loop_filter_level[2] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
-                deblock::lf_level(fh.loop_filter_level[3] as i32, 0, 0, fh.loop_filter_ref_deltas[0], fh.loop_filter_delta_enabled),
+                deblock::lf_level(
+                    fh.loop_filter_level[0] as i32,
+                    0,
+                    0,
+                    fh.loop_filter_ref_deltas[0],
+                    fh.loop_filter_delta_enabled,
+                ),
+                deblock::lf_level(
+                    fh.loop_filter_level[1] as i32,
+                    0,
+                    0,
+                    fh.loop_filter_ref_deltas[0],
+                    fh.loop_filter_delta_enabled,
+                ),
+                deblock::lf_level(
+                    fh.loop_filter_level[2] as i32,
+                    0,
+                    0,
+                    fh.loop_filter_ref_deltas[0],
+                    fh.loop_filter_delta_enabled,
+                ),
+                deblock::lf_level(
+                    fh.loop_filter_level[3] as i32,
+                    0,
+                    0,
+                    fh.loop_filter_ref_deltas[0],
+                    fh.loop_filter_delta_enabled,
+                ),
             ],
             db_sharpness: fh.loop_filter_sharpness,
             db_level_y: [fh.loop_filter_level[0], fh.loop_filter_level[1]],
@@ -1033,6 +1303,41 @@ impl<'a> Av1Tile<'a> {
             cdef_idx: Vec::new(),
             cdef_cols: 0,
             cdef_noskip: Vec::new(),
+            lr_ft: std::array::from_fn(|i| {
+                // Loop restoration is forced off for lossless / intrabc frames.
+                if fh.all_lossless || fh.allow_intrabc || i >= num_planes {
+                    lr::FrameRestoration::None
+                } else {
+                    lr::frame_restoration(fh.lr_type[i])
+                }
+            }),
+            lr_plane: std::array::from_fn(|p| {
+                // Unit grid sized from the real frame dims (§7.17.1): luma uses the
+                // frame size, chroma the subsampled size. Empty until a plane is on.
+                if fh.all_lossless || fh.allow_intrabc || p >= num_planes || fh.lr_type[p] == 0 {
+                    return lr::PlaneLr::default();
+                }
+                let unit_size = fh.lr_unit_size[p] as usize;
+                let (sx, sy) = if p == 0 {
+                    (0u32, 0u32)
+                } else {
+                    (seq.subsampling_x, seq.subsampling_y)
+                };
+                let pw = (fh.upscaled_width as usize).div_ceil(1usize << sx);
+                let ph = (fh.frame_height as usize).div_ceil(1usize << sy);
+                let unit_cols = lr::count_units(unit_size, pw);
+                let unit_rows = lr::count_units(unit_size, ph);
+                lr::PlaneLr {
+                    unit_size,
+                    unit_cols,
+                    unit_rows,
+                    units: vec![lr::LrUnit::default(); unit_rows * unit_cols],
+                }
+            }),
+            lr_ref: [lr::LrRef::default(); 3],
+            lr_cdf: lr::LrCdf::default(),
+            lr_active: !(fh.all_lossless || fh.allow_intrabc)
+                && (0..num_planes).any(|i| fh.lr_type[i] != 0),
         }
     }
 
@@ -1070,6 +1375,12 @@ impl<'a> Av1Tile<'a> {
             self.left_ccoef = [[0x40u8; 32]; 2];
             let mut col = 0;
             while col < self.geom.mi_cols {
+                // Loop-restoration params are interleaved with the SB stream
+                // (§5.11.5): read the LR units starting in this superblock before
+                // its partition/coefficients.
+                if self.lr_active {
+                    self.read_lr(row, col, sb4);
+                }
                 self.decode_sb(row, col, self.sb_bl);
                 col += sb4;
             }
@@ -1077,6 +1388,87 @@ impl<'a> Av1Tile<'a> {
         }
         self.apply_deblock();
         self.apply_cdef();
+        self.apply_lr();
+    }
+
+    /// Read the restoration-unit params (`read_lr`, §5.11.5) for the superblock at
+    /// MI `(sb_row, sb_col)` spanning `sb4` MI units. For each plane with LR on,
+    /// reads every unit whose top-left falls inside this superblock — matching the
+    /// spec's `unitRowStart..unitRowEnd × unitColStart..unitColEnd` bounds.
+    fn read_lr(&mut self, sb_row: u32, sb_col: u32, sb4: u32) {
+        const MI_SIZE: u32 = 4;
+        for plane in 0..3usize {
+            let ft = self.lr_ft[plane];
+            if ft == lr::FrameRestoration::None {
+                continue;
+            }
+            let (sx, sy) = if plane == 0 {
+                (0u32, 0u32)
+            } else {
+                (self.subsampling_x as u32, self.subsampling_y as u32)
+            };
+            let (unit_size, unit_rows, unit_cols) = {
+                let pl = &self.lr_plane[plane];
+                (
+                    pl.unit_size as u32,
+                    pl.unit_rows as u32,
+                    pl.unit_cols as u32,
+                )
+            };
+            if unit_size == 0 {
+                continue;
+            }
+            // Plane-pixel span of this superblock (§5.11.57 read_lr bounds).
+            let row_px = (sb_row * MI_SIZE) >> sy;
+            let col_px = (sb_col * MI_SIZE) >> sx;
+            let row_px_end = ((sb_row + sb4) * MI_SIZE) >> sy;
+            let col_px_end = ((sb_col + sb4) * MI_SIZE) >> sx;
+            let unit_row_start = row_px.div_ceil(unit_size);
+            let unit_row_end = unit_rows.min(row_px_end.div_ceil(unit_size));
+            let unit_col_start = col_px.div_ceil(unit_size);
+            let unit_col_end = unit_cols.min(col_px_end.div_ceil(unit_size));
+            for ur in unit_row_start..unit_row_end {
+                for uc in unit_col_start..unit_col_end {
+                    let unit = lr::read_lr_unit(
+                        &mut self.msac,
+                        plane,
+                        ft,
+                        &mut self.lr_ref[plane],
+                        &mut self.lr_cdf,
+                    );
+                    let idx = (ur * unit_cols + uc) as usize;
+                    self.lr_plane[plane].units[idx] = unit;
+                }
+            }
+        }
+    }
+
+    /// Apply loop restoration (§7.17) over the post-CDEF planes. Reads from a
+    /// pre-LR clone (the post-CDEF data) for the cross-stripe / frame-edge halo,
+    /// since CDEF was applied in place; writes the restored result back.
+    fn apply_lr(&mut self) {
+        if !self.lr_active {
+            return;
+        }
+        let nplanes = if self.mono_chrome { 1 } else { 3 };
+        for plane in 0..nplanes {
+            if self.lr_ft[plane] == lr::FrameRestoration::None {
+                continue;
+            }
+            let sy = if plane == 0 {
+                0
+            } else {
+                self.subsampling_y as u32
+            };
+            let (w, h) = (self.plane_w[plane], self.plane_h[plane]);
+            // The post-CDEF plane is both the in-stripe source and the cross-stripe
+            // halo (this decoder has no separate pre-CDEF buffer; halos replicate
+            // the post-CDEF edge — exact when CDEF is off, the common AVIF case).
+            let src = self.planes[plane].clone();
+            let mut dst = src.clone();
+            lr::apply_plane(&src, &src, &mut dst, w, h, w, sy, &self.lr_plane[plane]);
+            self.planes[plane] = dst;
+        }
     }
 
     /// Apply the deblocking loop filter (§7.14) over the reconstructed planes,
@@ -1110,7 +1502,8 @@ impl<'a> Av1Tile<'a> {
                         if self.db_edge[p][idx] & 1 == 0 {
                             continue;
                         }
-                        let wmin = (self.db_tx_w4[p][idx].min(self.db_tx_w4[p][idx - 1]) as i32) * 4;
+                        let wmin =
+                            (self.db_tx_w4[p][idx].min(self.db_tx_w4[p][idx - 1]) as i32) * 4;
                         let wd = deblock::lf_wd(wmin, is_chroma);
                         let pos = gy * 4 * pw + gx * 4;
                         deblock::loop_filter(&mut self.planes[p], pos, e, i, h, pw as isize, 1, wd);
@@ -1127,7 +1520,8 @@ impl<'a> Av1Tile<'a> {
                         if self.db_edge[p][idx] & 2 == 0 {
                             continue;
                         }
-                        let hmin = (self.db_tx_h4[p][idx].min(self.db_tx_h4[p][idx - gw4]) as i32) * 4;
+                        let hmin =
+                            (self.db_tx_h4[p][idx].min(self.db_tx_h4[p][idx - gw4]) as i32) * 4;
                         let wd = deblock::lf_wd(hmin, is_chroma);
                         let pos = gy * 4 * pw + gx * 4;
                         deblock::loop_filter(&mut self.planes[p], pos, e, i, h, 1, pw as isize, wd);
@@ -1191,13 +1585,26 @@ impl<'a> Av1Tile<'a> {
                         } else {
                             (0, 0)
                         };
-                        let adj_y_pri =
-                            if y_pri != 0 { cdef::adjust_strength(y_pri, var) } else { 0 };
+                        let adj_y_pri = if y_pri != 0 {
+                            cdef::adjust_strength(y_pri, var)
+                        } else {
+                            0
+                        };
                         if adj_y_pri != 0 || y_sec != 0 {
                             let ydir = if y_pri != 0 { dir as usize } else { 0 };
                             cdef_apply_one(
-                                &mut self.planes[0], &src[0], yw, yh, bx, by, 8, 8, adj_y_pri,
-                                y_sec, ydir, damping,
+                                &mut self.planes[0],
+                                &src[0],
+                                yw,
+                                yh,
+                                bx,
+                                by,
+                                8,
+                                8,
+                                adj_y_pri,
+                                y_sec,
+                                ydir,
+                                damping,
                             );
                         }
                         if !mono && (uv_pri != 0 || uv_sec != 0) {
@@ -1205,12 +1612,32 @@ impl<'a> Av1Tile<'a> {
                             let (cx, cy) = (bx >> ssx, by >> ssy);
                             let (cw, ch) = (8 >> ssx, 8 >> ssy);
                             cdef_apply_one(
-                                &mut self.planes[1], &src[1], cpw, cph, cx, cy, cw, ch, uv_pri,
-                                uv_sec, uvdir, damping - 1,
+                                &mut self.planes[1],
+                                &src[1],
+                                cpw,
+                                cph,
+                                cx,
+                                cy,
+                                cw,
+                                ch,
+                                uv_pri,
+                                uv_sec,
+                                uvdir,
+                                damping - 1,
                             );
                             cdef_apply_one(
-                                &mut self.planes[2], &src[2], cpw, cph, cx, cy, cw, ch, uv_pri,
-                                uv_sec, uvdir, damping - 1,
+                                &mut self.planes[2],
+                                &src[2],
+                                cpw,
+                                cph,
+                                cx,
+                                cy,
+                                cw,
+                                ch,
+                                uv_pri,
+                                uv_sec,
+                                uvdir,
+                                damping - 1,
                             );
                         }
                     }
@@ -1222,12 +1649,19 @@ impl<'a> Av1Tile<'a> {
     }
 
     fn read_partition(&mut self, bl: u8, mi_row: u32, mi_col: u32, case: PartCase) -> u8 {
-        let ctx = get_partition_ctx(&self.above_partition, &self.left_partition, bl, mi_row, mi_col);
+        let ctx = get_partition_ctx(
+            &self.above_partition,
+            &self.left_partition,
+            bl,
+            mi_row,
+            mi_col,
+        );
         let bl_i = bl as usize;
         match case {
             PartCase::Both => {
                 let n = PARTITION_TYPE_COUNT[bl_i];
-                self.msac.symbol_adapt(&mut self.cdf.partition[bl_i][ctx], n) as u8
+                self.msac
+                    .symbol_adapt(&mut self.cdf.partition[bl_i][ctx], n) as u8
             }
             PartCase::ColsOnly => {
                 let prob = gather_top_partition_prob(&self.cdf.partition[bl_i][ctx], bl);
@@ -1321,13 +1755,14 @@ impl<'a> Av1Tile<'a> {
         let a_ctx = INTRA_MODE_CONTEXT[self.above_mode[acol] as usize] as usize;
         let l_ctx = INTRA_MODE_CONTEXT[self.left_mode[by4] as usize] as usize;
         let n_y = (mode::N_INTRA_PRED_MODES - 1) as usize;
-        let mut y_mode = self.msac.symbol_adapt(&mut self.cdf.kfym[a_ctx][l_ctx], n_y) as u8;
+        let mut y_mode = self
+            .msac
+            .symbol_adapt(&mut self.cdf.kfym[a_ctx][l_ctx], n_y) as u8;
 
         // Smooth-neighbour flags for directional edge filtering (`sm_flag`), sampled
         // from the neighbour modes BEFORE this block overwrites them.
-        let is_smooth = |m: u8| {
-            m == mode::SMOOTH_PRED || m == mode::SMOOTH_V_PRED || m == mode::SMOOTH_H_PRED
-        };
+        let is_smooth =
+            |m: u8| m == mode::SMOOTH_PRED || m == mode::SMOOTH_V_PRED || m == mode::SMOOTH_H_PRED;
         let is_sm_y = is_smooth(self.above_mode[acol]) || is_smooth(self.left_mode[by4]);
         let is_sm_uv = is_smooth(self.above_uvmode[acol]) || is_smooth(self.left_uvmode[by4]);
 
@@ -1352,10 +1787,10 @@ impl<'a> Av1Tile<'a> {
         if has_chroma {
             let cfl_allowed = bw4 <= 8 && bh4 <= 8;
             let n_uv = (mode::N_UV_INTRA_PRED_MODES - 1) as usize - (!cfl_allowed as usize);
-            uv_mode = self
-                .msac
-                .symbol_adapt(&mut self.cdf.uv_mode[cfl_allowed as usize][y_mode as usize], n_uv)
-                as u8;
+            uv_mode = self.msac.symbol_adapt(
+                &mut self.cdf.uv_mode[cfl_allowed as usize][y_mode as usize],
+                n_uv,
+            ) as u8;
             if uv_mode == mode::CFL_PRED {
                 let sign = self.msac.symbol_adapt(&mut self.cdf.cfl_sign, 7) + 1;
                 let sign_u = (sign * 0x56) >> 8; // = sign / 3
@@ -1372,7 +1807,8 @@ impl<'a> Av1Tile<'a> {
                 }
             } else if lw + lh >= 2 && (mode::VERT_PRED..=mode::VERT_LEFT_PRED).contains(&uv_mode) {
                 let idx = (uv_mode - mode::VERT_PRED) as usize;
-                uv_angle_delta = self.msac.symbol_adapt(&mut self.cdf.angle_delta[idx], 6) as i32 - 3;
+                uv_angle_delta =
+                    self.msac.symbol_adapt(&mut self.cdf.angle_delta[idx], 6) as i32 - 3;
             }
         }
 
@@ -1399,8 +1835,11 @@ impl<'a> Av1Tile<'a> {
                     + (self.left_pal_sz[0][by4] > 0) as usize;
                 if self.msac.bool_adapt(&mut self.cdf.pal_y[sz_ctx][pal_ctx]) != 0 {
                     // No above palette across the SB64 top boundary (`by4 & 15`).
-                    let a_sz =
-                        if by4 & 15 != 0 { self.above_pal_sz[0][acol] as usize } else { 0 };
+                    let a_sz = if by4 & 15 != 0 {
+                        self.above_pal_sz[0][acol] as usize
+                    } else {
+                        0
+                    };
                     let l_sz = self.left_pal_sz[0][by4] as usize;
                     let a_col = self.above_pal_col[0][acol];
                     let l_col = self.left_pal_col[0][by4];
@@ -1428,8 +1867,11 @@ impl<'a> Av1Tile<'a> {
             if has_chroma && uv_mode == mode::DC_PRED {
                 let pal_ctx = (pal_sz_y > 0) as usize;
                 if self.msac.bool_adapt(&mut self.cdf.pal_uv[pal_ctx]) != 0 {
-                    let a_sz =
-                        if by4 & 15 != 0 { self.above_pal_sz[1][acol] as usize } else { 0 };
+                    let a_sz = if by4 & 15 != 0 {
+                        self.above_pal_sz[1][acol] as usize
+                    } else {
+                        0
+                    };
                     let l_sz = self.left_pal_sz[1][by4] as usize;
                     let au = self.above_pal_col[1][acol];
                     let lu = self.left_pal_col[1][by4];
@@ -1473,12 +1915,10 @@ impl<'a> Av1Tile<'a> {
         // filter-intra: DC_PRED, blocks ≤ 8×8. The chosen filter index becomes
         // `y_angle`, used to derive the luma tx-type (`FILTER_MODE_TO_Y_MODE`).
         let mut y_angle = 0u8;
-        if y_mode == mode::DC_PRED
-            && pal_sz_y == 0
-            && lw.max(lh) <= 3
-            && self.enable_filter_intra
-        {
-            let is_filter = self.msac.bool_adapt(&mut self.cdf.use_filter_intra[bs as usize]);
+        if y_mode == mode::DC_PRED && pal_sz_y == 0 && lw.max(lh) <= 3 && self.enable_filter_intra {
+            let is_filter = self
+                .msac
+                .bool_adapt(&mut self.cdf.use_filter_intra[bs as usize]);
             if is_filter != 0 {
                 y_angle = self.msac.symbol_adapt(&mut self.cdf.filter_intra, 4) as u8;
                 y_mode = mode::FILTER_PRED;
@@ -1518,7 +1958,11 @@ impl<'a> Av1Tile<'a> {
         // Transform size (intra): a lossless block is always TX_4X4 (AV1
         // `read_tx_size`); otherwise start at the block's max luma tx and descend
         // via the size-split symbol when the frame uses switchable transforms.
-        let mut tx = if self.lossless[0] { 0 } else { MAX_YTX[bs as usize] as usize };
+        let mut tx = if self.lossless[0] {
+            0
+        } else {
+            MAX_YTX[bs as usize] as usize
+        };
         let tmax = TXFM_DIMENSIONS[tx][2];
         if self.tx_mode_select && tmax > 0 {
             let max_lw = TXFM_DIMENSIONS[tx][0] as i8;
@@ -1526,7 +1970,9 @@ impl<'a> Av1Tile<'a> {
             let tctx =
                 (self.left_tx[by4] >= max_lh) as usize + (self.above_tx[acol] >= max_lw) as usize;
             let n = (tmax as usize).min(2);
-            let mut depth = self.msac.symbol_adapt(&mut self.cdf.txsz[(tmax - 1) as usize][tctx], n);
+            let mut depth = self
+                .msac
+                .symbol_adapt(&mut self.cdf.txsz[(tmax - 1) as usize][tctx], n);
             while depth > 0 {
                 tx = TXFM_DIMENSIONS[tx][3] as usize;
                 depth -= 1;
@@ -1556,8 +2002,11 @@ impl<'a> Av1Tile<'a> {
         } else {
             1 // I420
         };
-        let uvtx =
-            if self.lossless[0] { 0 } else { MAX_TXFM_SIZE_FOR_BS[bs as usize][layout] as usize };
+        let uvtx = if self.lossless[0] {
+            0
+        } else {
+            MAX_TXFM_SIZE_FOR_BS[bs as usize][layout] as usize
+        };
         if skip != 0 {
             for i in 0..bw4 as usize {
                 if acol + i < self.above_lcoef.len() {
@@ -1596,8 +2045,20 @@ impl<'a> Av1Tile<'a> {
             }
         } else {
             self.decode_residuals(
-                mi_row, mi_col, bs, tx, uvtx, y_mode, y_angle, uv_mode, cfl_alpha, has_chroma,
-                y_angle_delta, uv_angle_delta, is_sm_y, is_sm_uv,
+                mi_row,
+                mi_col,
+                bs,
+                tx,
+                uvtx,
+                y_mode,
+                y_angle,
+                uv_mode,
+                cfl_alpha,
+                has_chroma,
+                y_angle_delta,
+                uv_angle_delta,
+                is_sm_y,
+                is_sm_uv,
             );
         }
 
@@ -1736,7 +2197,14 @@ impl<'a> Av1Tile<'a> {
         };
         let all_skip = self.msac.bool_adapt(&mut self.cdf.coef_skip[tctx][sctx]) != 0;
         if all_skip {
-            return (true, if lossless { txtp::WHT_WHT } else { txtp::DCT_DCT });
+            return (
+                true,
+                if lossless {
+                    txtp::WHT_WHT
+                } else {
+                    txtp::DCT_DCT
+                },
+            );
         }
         let (tmax, tmin) = (tdim[2], tdim[4] as usize);
         let ty = if lossless {
@@ -1753,10 +2221,14 @@ impl<'a> Av1Tile<'a> {
                 y_mode
             };
             if reduced_txtp || tmin == 2 {
-                let idx = self.msac.symbol_adapt(&mut self.cdf.txtp_intra2[tmin][y_nofilt as usize], 4);
+                let idx = self
+                    .msac
+                    .symbol_adapt(&mut self.cdf.txtp_intra2[tmin][y_nofilt as usize], 4);
                 TX_TYPES_PER_SET[idx]
             } else {
-                let idx = self.msac.symbol_adapt(&mut self.cdf.txtp_intra1[tmin][y_nofilt as usize], 6);
+                let idx = self
+                    .msac
+                    .symbol_adapt(&mut self.cdf.txtp_intra1[tmin][y_nofilt as usize], 6);
                 TX_TYPES_PER_SET[idx + 5]
             }
         };
@@ -1774,11 +2246,21 @@ impl<'a> Av1Tile<'a> {
         let c = chroma as usize;
         let n = 4 + tx2dszctx;
         let mut eob = match tx2dszctx {
-            0 => self.msac.symbol_adapt(&mut self.cdf.eob_bin_16[c][is_1d], n),
-            1 => self.msac.symbol_adapt(&mut self.cdf.eob_bin_32[c][is_1d], n),
-            2 => self.msac.symbol_adapt(&mut self.cdf.eob_bin_64[c][is_1d], n),
-            3 => self.msac.symbol_adapt(&mut self.cdf.eob_bin_128[c][is_1d], n),
-            4 => self.msac.symbol_adapt(&mut self.cdf.eob_bin_256[c][is_1d], n),
+            0 => self
+                .msac
+                .symbol_adapt(&mut self.cdf.eob_bin_16[c][is_1d], n),
+            1 => self
+                .msac
+                .symbol_adapt(&mut self.cdf.eob_bin_32[c][is_1d], n),
+            2 => self
+                .msac
+                .symbol_adapt(&mut self.cdf.eob_bin_64[c][is_1d], n),
+            3 => self
+                .msac
+                .symbol_adapt(&mut self.cdf.eob_bin_128[c][is_1d], n),
+            4 => self
+                .msac
+                .symbol_adapt(&mut self.cdf.eob_bin_256[c][is_1d], n),
             5 => self.msac.symbol_adapt(&mut self.cdf.eob_bin_512[c], n),
             _ => self.msac.symbol_adapt(&mut self.cdf.eob_bin_1024[c], n),
         } as i32;
@@ -1812,7 +2294,9 @@ impl<'a> Av1Tile<'a> {
 
         if eob <= 0 {
             // dc-only block.
-            let tok_br = self.msac.symbol_adapt(&mut self.cdf.coeff_base_eob[tctx][c][0], 2);
+            let tok_br = self
+                .msac
+                .symbol_adapt(&mut self.cdf.coeff_base_eob[tctx][c][0], 2);
             cf[0] = if tok_br == 2 {
                 self.msac.decode_hi_tok(&mut self.cdf.coeff_br[br][c][0]) as i32
             } else {
@@ -1839,9 +2323,10 @@ impl<'a> Av1Tile<'a> {
         let mut levels = vec![0u8; stride * ((4 << slw.max(slh)) + 2) + 2 * stride + 8];
 
         // eob coefficient.
-        let eob_ctx =
-            1 + (eob > (2 << tx2dszctx)) as usize + (eob > (4 << tx2dszctx)) as usize;
-        let eob_tok = self.msac.symbol_adapt(&mut self.cdf.coeff_base_eob[tctx][c][eob_ctx], 2);
+        let eob_ctx = 1 + (eob > (2 << tx2dszctx)) as usize + (eob > (4 << tx2dszctx)) as usize;
+        let eob_tok = self
+            .msac
+            .symbol_adapt(&mut self.cdf.coeff_base_eob[tctx][c][eob_ctx], 2);
         let (x, y, rc) = coef_xyrc(tx, tx_class, eob as usize, shift, shift2, mask);
         let (tok, lvl) = if eob_tok == 2 {
             let big = if tx_class == TX_CLASS_2D {
@@ -1857,18 +2342,32 @@ impl<'a> Av1Tile<'a> {
             (t, (t * 0x41) as u8)
         };
         cf[rc] = tok;
-        levels[if tx_class == TX_CLASS_2D { rc } else { x * stride + y }] = lvl;
+        levels[if tx_class == TX_CLASS_2D {
+            rc
+        } else {
+            x * stride + y
+        }] = lvl;
 
         // AC coefficients, reverse scan order.
         for i in (1..eob as usize).rev() {
             let (xi, yi, rci) = coef_xyrc(tx, tx_class, i, shift, shift2, mask);
-            let lpos = if tx_class == TX_CLASS_2D { rci } else { xi * stride + yi };
+            let lpos = if tx_class == TX_CLASS_2D {
+                rci
+            } else {
+                xi * stride + yi
+            };
             let (lo_ctx, mag) = get_lo_ctx(&levels[lpos..], tx_class, xi, yi, stride, offsets);
             let yy = if tx_class == TX_CLASS_2D { yi | xi } else { yi };
-            let t0 = self.msac.symbol_adapt(&mut self.cdf.coeff_base[tctx][c][lo_ctx], 3);
+            let t0 = self
+                .msac
+                .symbol_adapt(&mut self.cdf.coeff_base[tctx][c][lo_ctx], 3);
             let (tok_i, lvl_i) = if t0 == 3 {
                 let m = mag & 63;
-                let base = if yy > (tx_class == TX_CLASS_2D) as usize { 14 } else { 7 };
+                let base = if yy > (tx_class == TX_CLASS_2D) as usize {
+                    14
+                } else {
+                    7
+                };
                 let hctx = base + if m > 12 { 6 } else { ((m + 1) >> 1) as usize };
                 let t = self.msac.decode_hi_tok(&mut self.cdf.coeff_br[br][c][hctx]) as i32;
                 (t, (t + (3 << 6)) as u8)
@@ -1885,13 +2384,19 @@ impl<'a> Av1Tile<'a> {
         } else {
             get_lo_ctx(&levels[0..], tx_class, 0, 0, stride, offsets)
         };
-        let dt = self.msac.symbol_adapt(&mut self.cdf.coeff_base[tctx][c][dc_ctx], 3);
+        let dt = self
+            .msac
+            .symbol_adapt(&mut self.cdf.coeff_base[tctx][c][dc_ctx], 3);
         cf[0] = if dt == 3 {
             if tx_class == TX_CLASS_2D {
                 dc_mag = levels[1] as u32 + levels[stride] as u32 + levels[stride + 1] as u32;
             }
             dc_mag &= 63;
-            let hctx = if dc_mag > 12 { 6 } else { ((dc_mag + 1) >> 1) as usize };
+            let hctx = if dc_mag > 12 {
+                6
+            } else {
+                ((dc_mag + 1) >> 1) as usize
+            };
             self.msac.decode_hi_tok(&mut self.cdf.coeff_br[br][c][hctx]) as i32
         } else {
             dt as i32
@@ -2141,7 +2646,11 @@ impl<'a> Av1Tile<'a> {
                 *t = buf[(py - 1) * pw + px + i.min(avail - 1)] as i32;
             }
         } else {
-            let fill = if have_left { buf[py * pw + px - 1] as i32 } else { 127 };
+            let fill = if have_left {
+                buf[py * pw + px - 1] as i32
+            } else {
+                127
+            };
             top.fill(fill);
         }
         if have_left {
@@ -2150,7 +2659,11 @@ impl<'a> Av1Tile<'a> {
                 *l = buf[(py + i.min(avail - 1)) * pw + px - 1] as i32;
             }
         } else {
-            let fill = if have_top { buf[(py - 1) * pw + px] as i32 } else { 129 };
+            let fill = if have_top {
+                buf[(py - 1) * pw + px] as i32
+            } else {
+                129
+            };
             left.fill(fill);
         }
         let topleft = if have_left {
@@ -2195,7 +2708,8 @@ impl<'a> Av1Tile<'a> {
             let mut z = 0u8; // 0 = none, 1 = Z1, 2 = Z2, 3 = Z3
             let mut z_angle = 0i32;
             if (mode::VERT_PRED..=mode::VERT_LEFT_PRED).contains(&mode) {
-                let angle = AV1_MODE_TO_ANGLE_MAP[(mode - mode::VERT_PRED) as usize] + 3 * angle_delta;
+                let angle =
+                    AV1_MODE_TO_ANGLE_MAP[(mode - mode::VERT_PRED) as usize] + 3 * angle_delta;
                 if angle <= 90 {
                     if angle < 90 && have_top {
                         z = 1;
@@ -2236,7 +2750,11 @@ impl<'a> Av1Tile<'a> {
                 } else {
                     (self.subsampling_x as usize, self.subsampling_y as usize)
                 };
-                let sb4l = if self.sb_bl == BL_128X128 { 32usize } else { 16 };
+                let sb4l = if self.sb_bl == BL_128X128 {
+                    32usize
+                } else {
+                    16
+                };
                 let sb_right4 = (px4 / (sb4l >> ssx) + 1) * (sb4l >> ssx);
                 let sb_bot4 = (py4 / (sb4l >> ssy) + 1) * (sb4l >> ssy);
                 let n_tr = if have_top
@@ -2404,8 +2922,14 @@ impl<'a> Av1Tile<'a> {
         let h4 = bh4.min(mir - mi_row as i32);
         let cw4 = (w4 + ss_h) >> ss_h;
         let ch4 = (h4 + ss_v) >> ss_v;
-        let (tw, th) = (1i32 << TXFM_DIMENSIONS[tx][0], 1i32 << TXFM_DIMENSIONS[tx][1]);
-        let (uvw, uvh) = (1i32 << TXFM_DIMENSIONS[uvtx][0], 1i32 << TXFM_DIMENSIONS[uvtx][1]);
+        let (tw, th) = (
+            1i32 << TXFM_DIMENSIONS[tx][0],
+            1i32 << TXFM_DIMENSIONS[tx][1],
+        );
+        let (uvw, uvh) = (
+            1i32 << TXFM_DIMENSIONS[uvtx][0],
+            1i32 << TXFM_DIMENSIONS[uvtx][1],
+        );
         let cacol = acol >> ss_h;
         let cby4 = by4 >> ss_v;
 
@@ -2816,8 +3340,18 @@ mod tests {
             ..Default::default()
         };
         let mut tile = Av1Tile::new(&bytes, 16, 16, &seq, &fh);
-        let (_skip, ty) =
-            tile.decode_txb_header(0, bs::BS_4X4, 0, mode::DC_PRED, 0, mode::DC_PRED, false, false, 0, 0);
+        let (_skip, ty) = tile.decode_txb_header(
+            0,
+            bs::BS_4X4,
+            0,
+            mode::DC_PRED,
+            0,
+            mode::DC_PRED,
+            false,
+            false,
+            0,
+            0,
+        );
         assert!(ty <= 16, "txtp out of range: {ty}");
     }
 
@@ -2828,7 +3362,10 @@ mod tests {
         // offset = LO_CTX_OFFSETS[0][0][0] = 0; ctx = 0 + ((100+64)>>7) = 1.
         let mut lv = [0u8; 64];
         lv[1] = 100;
-        assert_eq!(get_lo_ctx(&lv, TX_CLASS_2D, 0, 0, 8, &LO_CTX_OFFSETS[0]), (1, 100));
+        assert_eq!(
+            get_lo_ctx(&lv, TX_CLASS_2D, 0, 0, 8, &LO_CTX_OFFSETS[0]),
+            (1, 100)
+        );
         // mag > 512 saturates the magnitude term to 4; offset[1][2] = 6 → ctx 10.
         let mut lv2 = [0u8; 64];
         lv2[1] = 255;
@@ -2852,15 +3389,24 @@ mod tests {
         };
         let mut tile = Av1Tile::new(&bytes, 16, 16, &seq, &fh);
         // A 4×4 tx has ≤16 coefficients; the eob must be a sane position.
-        for &tx in &[0usize /*TX_4X4*/, 1 /*TX_8X8*/, 4 /*TX_64X64*/] {
+        for &tx in &[
+            0usize, /*TX_4X4*/
+            1,      /*TX_8X8*/
+            4,      /*TX_64X64*/
+        ] {
             let eob = tile.decode_eob(tx, false, txtp::DCT_DCT);
-            assert!((0..=1024).contains(&eob), "eob out of range: {eob} (tx={tx})");
+            assert!(
+                (0..=1024).contains(&eob),
+                "eob out of range: {eob} (tx={tx})"
+            );
         }
     }
 
     #[test]
     fn coef_levels_loop_runs() {
-        let bytes = vec![0xa1u8, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18, 0x29, 0x3a, 0x4b, 0x5c];
+        let bytes = vec![
+            0xa1u8, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18, 0x29, 0x3a, 0x4b, 0x5c,
+        ];
         let seq = super::super::SequenceHeader {
             subsampling_x: 1,
             subsampling_y: 1,
@@ -2874,7 +3420,10 @@ mod tests {
         // 8×8 2D tx (TX_8X8=1, DCT_DCT) with a moderate eob → tokens in [0,15].
         let cf = tile.decode_coef_levels(1, false, txtp::DCT_DCT, 5);
         assert_eq!(cf.len(), 64);
-        assert!(cf.iter().all(|&t| (0..=15).contains(&t)), "token out of range");
+        assert!(
+            cf.iter().all(|&t| (0..=15).contains(&t)),
+            "token out of range"
+        );
         // dc-only path (eob = 0).
         let cf2 = tile.decode_coef_levels(0, false, txtp::DCT_DCT, 0);
         assert_eq!(cf2.len(), 16);
@@ -2883,7 +3432,9 @@ mod tests {
 
     #[test]
     fn coef_signs_dequant_runs() {
-        let bytes = vec![0x3c, 0xd2, 0x91, 0x4e, 0xa7, 0x60, 0xf1, 0x28, 0xbb, 0x05, 0x9d, 0x46];
+        let bytes = vec![
+            0x3c, 0xd2, 0x91, 0x4e, 0xa7, 0x60, 0xf1, 0x28, 0xbb, 0x05, 0x9d, 0x46,
+        ];
         let seq = super::super::SequenceHeader {
             subsampling_x: 1,
             subsampling_y: 1,
@@ -2901,7 +3452,8 @@ mod tests {
         // signed coefficients; res_ctx packs cul_level (0-63) | dc_sign bits.
         let raw = tile.decode_coef_levels(1, false, txtp::DCT_DCT, 6);
         let ctx = [0x40u8; 8];
-        let (cf, res_ctx) = tile.decode_coef_signs(1, false, txtp::DCT_DCT, 6, 0, 0, &raw, &ctx, &ctx);
+        let (cf, res_ctx) =
+            tile.decode_coef_signs(1, false, txtp::DCT_DCT, 6, 0, 0, &raw, &ctx, &ctx);
         assert_eq!(cf.len(), 64);
         // dc_sign_level occupies bits 6-7 (cul_level fills the low 6 bits).
         assert!(matches!(res_ctx & 0xc0, 0x00 | 0x40 | 0x80));
@@ -2911,12 +3463,17 @@ mod tests {
                 assert_eq!(cf[rc], 0, "zero token must stay zero at rc={rc}");
             }
         }
-        assert!(cf.iter().all(|&v| v.abs() <= 32767 + 1), "coef exceeds clamp");
+        assert!(
+            cf.iter().all(|&v| v.abs() <= 32767 + 1),
+            "coef exceeds clamp"
+        );
     }
 
     #[test]
     fn tx_block_glue_runs() {
-        let bytes = vec![0x71, 0x2c, 0x9e, 0x53, 0x80, 0xd6, 0x1b, 0xf4, 0x4a, 0xa9, 0x37, 0x62];
+        let bytes = vec![
+            0x71, 0x2c, 0x9e, 0x53, 0x80, 0xd6, 0x1b, 0xf4, 0x4a, 0xa9, 0x37, 0x62,
+        ];
         let seq = super::super::SequenceHeader {
             subsampling_x: 1,
             subsampling_y: 1,
@@ -2946,8 +3503,8 @@ mod tests {
     #[test]
     fn tile_decodes_fixture_without_panic() {
         use super::super::{
-            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus,
-            OBU_FRAME, OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+            extract_av1_stream, parse_frame_header, parse_sequence_header, split_obus, OBU_FRAME,
+            OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
         };
         let avif = include_bytes!("../fixtures/av1test.avif");
         let stream = extract_av1_stream(avif).unwrap();
@@ -2960,7 +3517,11 @@ mod tests {
             .unwrap();
         let fh = parse_frame_header(&seq, frame.data).unwrap();
         let off = tile_data_offset(fh.header_bits);
-        assert!(off < frame.data.len(), "tile offset {off} >= {}", frame.data.len());
+        assert!(
+            off < frame.data.len(),
+            "tile offset {off} >= {}",
+            frame.data.len()
+        );
         let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
         let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
         let tile_len = frame.data[off..].len();
@@ -2971,10 +3532,19 @@ mod tests {
         // range renormalised in `[0x8000, 0xFFFF]`.
         tile.decode();
         let (pos, blen, rng) = (tile.msac.pos(), tile.msac.buf_len(), tile.msac.rng());
-        eprintln!("[fixture] blocks={} msac pos={pos}/{blen} (tile_len={tile_len}) rng={rng:#06x}", tile.blocks_visited);
+        eprintln!(
+            "[fixture] blocks={} msac pos={pos}/{blen} (tile_len={tile_len}) rng={rng:#06x}",
+            tile.blocks_visited
+        );
         assert!(tile.blocks_visited > 0, "no blocks visited");
-        assert!((0x8000..=0xffff).contains(&rng), "msac rng out of range: {rng:#x}");
-        assert!(pos >= blen.saturating_sub(8), "msac consumed only {pos}/{blen} bytes");
+        assert!(
+            (0x8000..=0xffff).contains(&rng),
+            "msac rng out of range: {rng:#x}"
+        );
+        assert!(
+            pos >= blen.saturating_sub(8),
+            "msac consumed only {pos}/{blen} bytes"
+        );
     }
 
     /// End-to-end deblocking loop filter (§7.14): a 64×64 still with the loop
@@ -2994,7 +3564,10 @@ mod tests {
         let stream = extract_av1_stream(avif).unwrap();
         let obus = split_obus(&stream).unwrap();
         let seq = parse_sequence_header(
-            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+            obus.iter()
+                .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                .unwrap()
+                .data,
         )
         .unwrap();
         let frame = obus
@@ -3010,7 +3583,11 @@ mod tests {
             "fixture must have the loop filter enabled"
         );
         assert_eq!(fh.cdef_bits, 0, "fixture must have CDEF disabled");
-        assert_eq!(fh.lr_type, [0, 0, 0], "fixture must have loop restoration off");
+        assert_eq!(
+            fh.lr_type,
+            [0, 0, 0],
+            "fixture must have loop restoration off"
+        );
         let off = tile_data_offset(fh.header_bits);
         let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
         let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
@@ -3024,7 +3601,10 @@ mod tests {
             for i in 0..n {
                 maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
             }
-            assert_eq!(maxd, 0, "plane {p} ({pw}x{ph}) differs from dav1d after deblock");
+            assert_eq!(
+                maxd, 0,
+                "plane {p} ({pw}x{ph}) differs from dav1d after deblock"
+            );
             refoff += n;
         }
     }
@@ -3055,7 +3635,10 @@ mod tests {
             let stream = extract_av1_stream(avif).unwrap();
             let obus = split_obus(&stream).unwrap();
             let seq = parse_sequence_header(
-                obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+                obus.iter()
+                    .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                    .unwrap()
+                    .data,
             )
             .unwrap();
             let frame = obus
@@ -3102,7 +3685,10 @@ mod tests {
         let stream = extract_av1_stream(avif).unwrap();
         let obus = split_obus(&stream).unwrap();
         let seq = parse_sequence_header(
-            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+            obus.iter()
+                .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                .unwrap()
+                .data,
         )
         .unwrap();
         assert!(
@@ -3127,7 +3713,10 @@ mod tests {
             for i in 0..n {
                 maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
             }
-            assert_eq!(maxd, 0, "non-reduced: plane {p} ({pw}x{ph}) differs from dav1d");
+            assert_eq!(
+                maxd, 0,
+                "non-reduced: plane {p} ({pw}x{ph}) differs from dav1d"
+            );
             refoff += n;
         }
     }
@@ -3149,7 +3738,10 @@ mod tests {
         let stream = extract_av1_stream(avif).unwrap();
         let obus = split_obus(&stream).unwrap();
         let seq = parse_sequence_header(
-            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+            obus.iter()
+                .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                .unwrap()
+                .data,
         )
         .unwrap();
         let frame = obus
@@ -3170,7 +3762,10 @@ mod tests {
             for i in 0..n {
                 maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
             }
-            assert_eq!(maxd, 0, "directional: plane {p} ({pw}x{ph}) differs from dav1d");
+            assert_eq!(
+                maxd, 0,
+                "directional: plane {p} ({pw}x{ph}) differs from dav1d"
+            );
             refoff += n;
         }
     }
@@ -3210,13 +3805,22 @@ mod tests {
             let stream = extract_av1_stream(avif).unwrap();
             let obus = split_obus(&stream).unwrap();
             let seq = parse_sequence_header(
-                obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+                obus.iter()
+                    .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                    .unwrap()
+                    .data,
             )
             .unwrap();
-            let frame =
-                obus.iter().find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER).unwrap();
+            let frame = obus
+                .iter()
+                .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)
+                .unwrap();
             let fh = parse_frame_header(&seq, frame.data).unwrap();
-            assert_eq!(fh.lr_type, [0, 0, 0], "{name}: fixture must have loop restoration off");
+            assert_eq!(
+                fh.lr_type,
+                [0, 0, 0],
+                "{name}: fixture must have loop restoration off"
+            );
             let off = tile_data_offset(fh.header_bits);
             let mut tile = Av1Tile::new(
                 &frame.data[off..],
@@ -3234,7 +3838,10 @@ mod tests {
                 for i in 0..n {
                     maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
                 }
-                assert_eq!(maxd, 0, "{name}: plane {p} ({pw}x{ph}) differs from dav1d after CDEF");
+                assert_eq!(
+                    maxd, 0,
+                    "{name}: plane {p} ({pw}x{ph}) differs from dav1d after CDEF"
+                );
                 refoff += n;
             }
         }
@@ -3251,7 +3858,10 @@ mod tests {
         let stream = extract_av1_stream(avif).unwrap();
         let obus = split_obus(&stream).unwrap();
         let seq = parse_sequence_header(
-            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+            obus.iter()
+                .find(|o| o.kind == OBU_SEQUENCE_HEADER)
+                .unwrap()
+                .data,
         )
         .unwrap();
         let frame = obus
