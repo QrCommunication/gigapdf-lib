@@ -3518,29 +3518,55 @@ impl Document {
         self.add_text_standard(page_no, x, y, size, text, "Helvetica", color, opacity, rotation_deg)
     }
 
-    /// Add an invisible (text render mode 3) standard-Helvetica text layer to
-    /// `page_no` in a SINGLE content-stream append. Built for OCR layers of many
-    /// words: one font resource, O(n) not O(n²). Glyphs are selectable and
-    /// searchable but never painted. Text is WinAnsi-encoded; a run containing
-    /// any glyph outside WinAnsi is skipped (standard Helvetica cannot show it).
-    /// Returns the number of runs actually written.
+    /// Add an invisible (text render mode 3) text layer to `page_no` in a SINGLE
+    /// content-stream append. Built for OCR layers of many words: glyphs are
+    /// selectable and searchable but never painted. Returns the number of runs
+    /// actually written.
+    ///
+    /// Runs whose characters are all WinAnsi take the compact standard-Helvetica
+    /// path (`(...) Tj`, one font resource). A run containing any non-WinAnsi
+    /// character (Cyrillic, Greek, Arabic, CJK…) is written through an embedded
+    /// **glyphless Type0 font** (empty outlines, `/Identity-H`) plus a
+    /// `/ToUnicode` CMap — so multi-script OCR is searchable regardless of
+    /// script. Only empty runs and characters outside the BMP are skipped.
     pub fn add_text_layer(&mut self, page_no: u32, runs: &[TextLayerRun]) -> Result<usize> {
+        if runs.is_empty() {
+            return Ok(0);
+        }
+        // Partition: WinAnsi-representable runs keep the compact path; the rest
+        // need the Unicode (glyphless Type0) path. Empty runs are dropped either way.
+        let mut winansi: Vec<&TextLayerRun> = Vec::new();
+        let mut unicode: Vec<&TextLayerRun> = Vec::new();
+        for run in runs {
+            if run.text.is_empty() {
+                continue;
+            }
+            if run
+                .text
+                .chars()
+                .any(|c| crate::font::char_to_winansi(c).is_none())
+            {
+                unicode.push(run);
+            } else {
+                winansi.push(run);
+            }
+        }
+
+        let mut written = self.add_winansi_text_runs(page_no, &winansi)?;
+        written += self.add_unicode_text_runs(page_no, &unicode)?;
+        Ok(written)
+    }
+
+    /// WinAnsi text-layer path: a single `3 Tr` block set in standard Helvetica,
+    /// appended to the page content. Returns the number of runs written.
+    fn add_winansi_text_runs(&mut self, page_no: u32, runs: &[&TextLayerRun]) -> Result<usize> {
         if runs.is_empty() {
             return Ok(0);
         }
         let res_name = self.ensure_helvetica_font(page_no)?;
         let mut inner: Vec<u8> = Vec::new();
         inner.extend_from_slice(b"q\nBT\n3 Tr\n");
-        let mut written = 0usize;
         for run in runs {
-            if run.text.is_empty()
-                || run
-                    .text
-                    .chars()
-                    .any(|c| crate::font::char_to_winansi(c).is_none())
-            {
-                continue;
-            }
             let (sin, cos) = run.rotation_deg.to_radians().sin_cos();
             inner.push(b'/');
             inner.extend_from_slice(&res_name);
@@ -3565,16 +3591,188 @@ impl Document {
                 inner.push(b);
             }
             inner.extend_from_slice(b") Tj\n");
+        }
+        inner.extend_from_slice(b"ET\nQ\n");
+        let mut content = self.page_content(page_no)?;
+        content.extend_from_slice(&inner);
+        self.set_page_content(page_no, content)?;
+        Ok(runs.len())
+    }
+
+    /// Unicode text-layer path: embed a glyphless Type0 font carrying one empty
+    /// glyph per distinct (BMP) character of `runs`, with a `/ToUnicode` CMap so
+    /// the invisible text is searchable for any script. Text is shown via
+    /// `/Identity-H` (2-byte CIDs). Returns the number of runs written; a run
+    /// is counted once at least one of its characters lands in the BMP.
+    fn add_unicode_text_runs(&mut self, page_no: u32, runs: &[&TextLayerRun]) -> Result<usize> {
+        if runs.is_empty() {
+            return Ok(0);
+        }
+        // CID 0 is `.notdef`; assign CID 1.. to each distinct BMP character in a
+        // stable order. Out-of-BMP characters (> U+FFFF) are skipped in v1.
+        let mut cid_of: std::collections::HashMap<char, u16> = std::collections::HashMap::new();
+        let mut chars: Vec<char> = Vec::new(); // chars[i] has CID i+1
+        for run in runs {
+            for ch in run.text.chars() {
+                if (ch as u32) <= 0xFFFF {
+                    cid_of.entry(ch).or_insert_with(|| {
+                        chars.push(ch);
+                        chars.len() as u16
+                    });
+                }
+            }
+        }
+        if chars.is_empty() {
+            return Ok(0);
+        }
+
+        // Build the encoded runs first; any run with no in-BMP character is dropped.
+        let mut inner: Vec<u8> = Vec::new();
+        inner.extend_from_slice(b"q\nBT\n3 Tr\n");
+        let mut written = 0usize;
+        // Resource name is resolved after the font object is allocated (below);
+        // use a placeholder marker and patch the resource selects afterwards is
+        // avoided by pre-computing the object number deterministically.
+        let res_name = format!("GpU{}", self.next_object_number() + 3); // Type0 id = ff_id + 3
+        for run in runs {
+            let mut hex = String::new();
+            for ch in run.text.chars() {
+                if let Some(&cid) = cid_of.get(&ch) {
+                    hex.push_str(&format!("{cid:04X}"));
+                }
+            }
+            if hex.is_empty() {
+                continue; // every character was out-of-BMP
+            }
+            let (sin, cos) = run.rotation_deg.to_radians().sin_cos();
+            inner.extend_from_slice(
+                format!(
+                    "/{res_name} {sz} Tf\n{ma} {mb} {mc} {md} {x} {y} Tm\n<{hex}> Tj\n",
+                    res_name = res_name,
+                    sz = content::num(run.size),
+                    ma = content::num(cos),
+                    mb = content::num(sin),
+                    mc = content::num(-sin),
+                    md = content::num(cos),
+                    x = content::num(run.x),
+                    y = content::num(run.y),
+                )
+                .as_bytes(),
+            );
             written += 1;
         }
         inner.extend_from_slice(b"ET\nQ\n");
         if written == 0 {
             return Ok(0);
         }
+
+        // Embed the glyphless Type0 font (object graph mirrors `embed_cid_font`,
+        // but with a uniform width and a ToUnicode CMap built from `chars`).
+        let font_id = self.embed_glyphless_type0(chars.len() as u16, &chars)?;
+        debug_assert_eq!(format!("GpU{}", font_id), res_name);
+        self.register_page_font(page_no, res_name.as_bytes(), (font_id, 0))?;
+
         let mut content = self.page_content(page_no)?;
         content.extend_from_slice(&inner);
         self.set_page_content(page_no, content)?;
         Ok(written)
+    }
+
+    /// Build the glyphless Type0 object graph: `FontFile2` (empty `glyf`),
+    /// `FontDescriptor`, `CIDFontType2` (`/Identity` `CIDToGIDMap`, uniform `/W`),
+    /// `Type0` (`/Identity-H`) and a `/ToUnicode` CMap mapping each CID to its
+    /// Unicode scalar. `chars[i]` is the character for CID `i + 1`; CID 0 is
+    /// `.notdef`. Returns the Type0 font object number. Mirrors `embed_cid_font`.
+    fn embed_glyphless_type0(&mut self, char_count: u16, chars: &[char]) -> Result<u32> {
+        let num_glyphs = char_count + 1; // +1 for the .notdef glyph at CID 0
+        let program = crate::font::glyphless::build_glyphless_ttf(num_glyphs);
+        // CID i+1 → Unicode of chars[i]; CID 0 (.notdef) is left unmapped.
+        let pairs: Vec<(u16, u32)> = chars
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i as u16 + 1, c as u32))
+            .collect();
+        let tounicode = crate::font::embed::to_unicode_cmap(&pairs);
+
+        // Five consecutive ids: FontFile, FontDescriptor, CIDFont, Type0, ToUnicode.
+        let ff_id = (self.next_object_number(), 0u16);
+        let fd_id = (ff_id.0 + 1, 0u16);
+        let cid_id = (ff_id.0 + 2, 0u16);
+        let t0_id = (ff_id.0 + 3, 0u16);
+        let tu_id = (ff_id.0 + 4, 0u16);
+
+        // FontFile2 — the glyphless TrueType program (compressed later by save).
+        let mut ff = Dictionary::new();
+        ff.set(b"Length".to_vec(), Object::Integer(program.len() as i64));
+        ff.set(b"Length1".to_vec(), Object::Integer(program.len() as i64));
+        self.objects
+            .insert(ff_id, Object::Stream(Stream::new(ff, program)));
+
+        // FontDescriptor — generic metrics; Symbolic since the glyphless face
+        // carries no usable cmap (text is shown via Identity-H, not encoding).
+        let mut fd = Dictionary::new();
+        fd.set(b"Type", annot::name(b"FontDescriptor"));
+        fd.set(b"FontName", annot::name(b"GigaPDFOCR"));
+        fd.set(b"Flags", Object::Integer(4)); // Symbolic
+        fd.set(
+            b"FontBBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(-200),
+                Object::Integer(1000),
+                Object::Integer(800),
+            ]),
+        );
+        fd.set(b"ItalicAngle", Object::Integer(0));
+        fd.set(b"Ascent", Object::Integer(800));
+        fd.set(b"Descent", Object::Integer(-200));
+        fd.set(b"CapHeight", Object::Integer(700));
+        fd.set(b"StemV", Object::Integer(80));
+        fd.set(b"FontFile2", Object::Reference(ff_id));
+        self.objects.insert(fd_id, Object::Dictionary(fd));
+
+        // Descendant CIDFontType2 — Identity ordering, Identity CIDToGIDMap,
+        // uniform width (the glyphs are invisible so the exact value is cosmetic).
+        let mut cidsi = Dictionary::new();
+        cidsi.set(
+            b"Registry",
+            Object::String(b"Adobe".to_vec(), crate::object::StringKind::Literal),
+        );
+        cidsi.set(
+            b"Ordering",
+            Object::String(b"Identity".to_vec(), crate::object::StringKind::Literal),
+        );
+        cidsi.set(b"Supplement", Object::Integer(0));
+        let mut cid = Dictionary::new();
+        cid.set(b"Type", annot::name(b"Font"));
+        cid.set(b"Subtype", annot::name(b"CIDFontType2"));
+        cid.set(b"BaseFont", annot::name(b"GigaPDFOCR"));
+        cid.set(b"CIDSystemInfo", Object::Dictionary(cidsi));
+        cid.set(b"FontDescriptor", Object::Reference(fd_id));
+        cid.set(b"CIDToGIDMap", annot::name(b"Identity"));
+        cid.set(b"DW", Object::Integer(500));
+        self.objects.insert(cid_id, Object::Dictionary(cid));
+
+        // ToUnicode CMap — makes the invisible text searchable/copyable.
+        let mut tu = Dictionary::new();
+        tu.set(b"Length", Object::Integer(tounicode.len() as i64));
+        self.objects
+            .insert(tu_id, Object::Stream(Stream::new(tu, tounicode)));
+
+        // Type0 wrapper.
+        let mut t0 = Dictionary::new();
+        t0.set(b"Type", annot::name(b"Font"));
+        t0.set(b"Subtype", annot::name(b"Type0"));
+        t0.set(b"BaseFont", annot::name(b"GigaPDFOCR"));
+        t0.set(b"Encoding", annot::name(b"Identity-H"));
+        t0.set(
+            b"DescendantFonts",
+            Object::Array(vec![Object::Reference(cid_id)]),
+        );
+        t0.set(b"ToUnicode", Object::Reference(tu_id));
+        self.objects.insert(t0_id, Object::Dictionary(t0));
+
+        Ok(t0_id.0)
     }
 
     /// Register a standard `/Type1 /Helvetica /WinAnsiEncoding` font as a page
@@ -8212,17 +8410,19 @@ mod tests {
     }
 
     #[test]
-    fn add_text_layer_writes_winansi_runs_and_skips_others() {
+    fn add_text_layer_writes_winansi_and_unicode_runs() {
         let pdf = crate::convert::reverse::txt_to_pdf("ocr host page");
         let mut doc = Document::open(&pdf).unwrap();
         let runs = vec![
             TextLayerRun { x: 50.0, y: 700.0, size: 10.0, text: "café".into(), rotation_deg: 0.0 },
             TextLayerRun { x: 50.0, y: 680.0, size: 10.0, text: "résumé".into(), rotation_deg: 0.0 },
+            // Non-WinAnsi (CJK) now goes through the glyphless Type0 path instead
+            // of being skipped.
             TextLayerRun { x: 50.0, y: 660.0, size: 10.0, text: "日本語".into(), rotation_deg: 0.0 },
             TextLayerRun { x: 50.0, y: 640.0, size: 10.0, text: String::new(), rotation_deg: 0.0 },
         ];
-        // Two WinAnsi runs written; the CJK and empty runs are skipped.
-        assert_eq!(doc.add_text_layer(1, &runs).unwrap(), 2);
+        // Two WinAnsi + one Unicode run written; only the empty run is skipped.
+        assert_eq!(doc.add_text_layer(1, &runs).unwrap(), 3);
         assert_eq!(doc.add_text_layer(1, &[]).unwrap(), 0, "empty input is a no-op");
 
         let saved = doc.save();
@@ -8230,8 +8430,42 @@ mod tests {
         assert!(body.contains("3 Tr"), "invisible text render mode present");
         assert!(body.contains(" Tj"), "text-show operator present");
         assert!(body.contains("caf"), "the café run's glyphs were written");
+        assert!(body.contains("Type0"), "a Type0 font was embedded for the CJK run");
+        assert!(body.contains("Identity-H"), "the Type0 font uses Identity-H");
         // The result re-opens as a valid single-page document.
         assert_eq!(Document::open(&saved).unwrap().page_ids().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_text_layer_unicode_round_trips_for_extraction() {
+        // The decisive criterion: a multi-script OCR layer (Latin + Cyrillic +
+        // Greek) must be re-extractable from the saved PDF, proving the ToUnicode
+        // CMap of the glyphless Type0 font carries the real code points.
+        let pdf = crate::convert::reverse::txt_to_pdf("ocr host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let runs = vec![
+            TextLayerRun { x: 50.0, y: 700.0, size: 10.0, text: "Latin café".into(), rotation_deg: 0.0 },
+            TextLayerRun { x: 50.0, y: 680.0, size: 10.0, text: "Привет".into(), rotation_deg: 0.0 },
+            TextLayerRun { x: 50.0, y: 660.0, size: 10.0, text: "Ελληνικά".into(), rotation_deg: 0.0 },
+        ];
+        assert_eq!(doc.add_text_layer(1, &runs).unwrap(), 3);
+
+        let saved = doc.save();
+        let reopened = Document::open(&saved).unwrap();
+        let extracted: String = reopened
+            .structured_text(1)
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            extracted.contains("Привет"),
+            "Cyrillic text must be extractable, got: {extracted:?}"
+        );
+        assert!(
+            extracted.contains("Ελληνικά"),
+            "Greek text must be extractable, got: {extracted:?}"
+        );
     }
 
     #[test]

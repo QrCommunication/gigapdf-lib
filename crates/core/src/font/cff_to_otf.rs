@@ -110,7 +110,7 @@ fn glyph_name_to_unicode(raw: &str) -> Option<u32> {
 
 /// Assemble a table directory + padded table data into a complete sfnt, fixing
 /// up `head.checkSumAdjustment` once the whole font is laid out.
-fn assemble_sfnt(sfnt_version: u32, tables: &mut [(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+pub(crate) fn assemble_sfnt(sfnt_version: u32, tables: &mut [(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
     let n = tables.len() as u16;
     let max_pow2 = 15u16 - n.leading_zeros() as u16; // floor(log2(n))
     let search_range = (1u16 << max_pow2) * 16;
@@ -163,7 +163,7 @@ fn assemble_sfnt(sfnt_version: u32, tables: &mut [(&[u8; 4], Vec<u8>)]) -> Vec<u
 }
 
 /// sfnt table checksum: sum of big-endian u32 words (zero-padded).
-fn table_checksum(data: &[u8]) -> u32 {
+pub(crate) fn table_checksum(data: &[u8]) -> u32 {
     let mut sum = 0u32;
     let mut i = 0;
     while i < data.len() {
