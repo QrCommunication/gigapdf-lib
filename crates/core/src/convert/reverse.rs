@@ -179,17 +179,13 @@ pub fn txt_to_pdf(text: &str) -> Vec<u8> {
     flow_to_pdf(&[paras])
 }
 
-/// HTML → PDF (text-faithful: paragraph/line tags become breaks).
+/// HTML → PDF. Renders through the native HTML+CSS engine
+/// ([`crate::html::render`]) so structure and typography are preserved
+/// (headings, bold/italic, colour, tables, lists, `data:` images) — US-Letter
+/// portrait with 0.5in margins. External `<img src>`/web-font URLs are omitted
+/// here (no host fetch on this entry point); use the host-fetch path for those.
 pub fn html_to_pdf(html: &str) -> Vec<u8> {
-    let paras = paragraphs_from_xml(
-        html,
-        &[
-            "</p>", "</div>", "</span>", "</h1>", "</h2>", "</h3>", "</li>", "<br>", "<br/>",
-            "<br />",
-        ],
-        &[],
-    );
-    flow_to_pdf(&[paras])
+    crate::html::render(html, &[], 612.0, 792.0, 36.0)
 }
 
 /// DOCX → PDF.
@@ -294,28 +290,14 @@ pub fn odp_to_pdf(bytes: &[u8]) -> Vec<u8> {
 
 /// Auto-detect an Office container and convert to PDF. Returns `None` if the
 /// bytes are not a recognized OOXML/ODF archive.
+///
+/// Delegates to [`super::office_import::office_to_pdf`], which maps the document
+/// to styled HTML (headings, bold/italic, colour, tables, lists, images) and
+/// renders it through the native HTML→PDF engine for rich fidelity — and adds a
+/// best-effort text path for legacy OLE2 `.doc/.xls/.ppt`. The per-format
+/// text-only helpers below remain available for callers that want the flat flow.
 pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
-    let zip = super::zip::read_zip(bytes);
-    if zip.contains_key("word/document.xml") {
-        Some(docx_to_pdf(bytes))
-    } else if zip.contains_key("ppt/presentation.xml") {
-        Some(pptx_to_pdf(bytes))
-    } else if zip.contains_key("xl/workbook.xml") {
-        Some(xlsx_to_pdf(bytes))
-    } else if let Some(mimetype) = zip.get("mimetype") {
-        let mt = String::from_utf8_lossy(mimetype);
-        if mt.contains("opendocument.text") {
-            Some(odt_to_pdf(bytes))
-        } else if mt.contains("opendocument.spreadsheet") {
-            Some(ods_to_pdf(bytes))
-        } else if mt.contains("opendocument.presentation") {
-            Some(odp_to_pdf(bytes))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    super::office_import::office_to_pdf(bytes)
 }
 
 // ─────────────────────────────── RTF (both ways) ───────────────────────────

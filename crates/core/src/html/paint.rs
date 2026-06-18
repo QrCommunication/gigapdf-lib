@@ -472,9 +472,32 @@ fn paint(
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let Some(id) = resolve(style) else { continue };
                     // Baseline ≈ top + ascent (0.8·size), flipped.
                     let baseline = page_h - (y + style.font_size * 0.8);
+                    let id = match resolve(style) {
+                        Some(id) => id,
+                        None => {
+                            // No embedded face matched (e.g. no fonts supplied at
+                            // all): fall back to a built-in base-14 standard font
+                            // so text still renders — picked from the run's
+                            // serif/mono + bold/italic, mapped to WinAnsi.
+                            let base14 = base14_for(style);
+                            let _ = doc.add_text_standard(
+                                page,
+                                *x,
+                                baseline,
+                                style.font_size,
+                                trimmed,
+                                base14,
+                                style.color,
+                                style.opacity,
+                                0.0,
+                            );
+                            let w = book.width(trimmed, style);
+                            paint_text_decorations(doc, page, page_h, *x, *y, w, style);
+                            continue;
+                        }
+                    };
 
                     // Colour-emoji fast path: when the resolved face has COLR/CPAL
                     // tables and this run holds a colour glyph, draw those glyphs as
@@ -590,32 +613,9 @@ fn paint(
                         );
                     }
 
-                    // Decoration rules (underline / line-through / overline) are
-                    // thin filled rects at the run's top-down offset.
-                    let size = style.font_size;
-                    let mut rule = |top_offset: f64| {
-                        let w = book.width(trimmed, style);
-                        let _ = doc.add_rectangle(
-                            page,
-                            *x,
-                            page_h - (y + top_offset),
-                            w,
-                            (size * 0.06).max(0.4),
-                            None,
-                            Some(style.color),
-                            0.0,
-                            style.opacity,
-                        );
-                    };
-                    if style.underline {
-                        rule(size); // at the baseline
-                    }
-                    if style.strike {
-                        rule(size * 0.55); // through the x-height
-                    }
-                    if style.overline {
-                        rule(size * 0.05); // near the top
-                    }
+                    // Decoration rules (underline / line-through / overline).
+                    let w = book.width(trimmed, style);
+                    paint_text_decorations(doc, page, page_h, *x, *y, w, style);
                 }
                 Fragment::Image { x, y, w, h, src } => {
                     if let Some(data) = resolve_image(src, &opts.resources) {
@@ -642,6 +642,63 @@ fn paint(
     }
 
     doc.save_compressed().into()
+}
+
+/// Choose the base-14 standard font name for a style when no embedded face is
+/// available: serif→Times, monospace→Courier, else Helvetica — with the
+/// bold/italic suffix each family uses.
+fn base14_for(style: &Style) -> &'static str {
+    match (style.generic_serif, style.generic_mono, style.bold, style.italic) {
+        (true, _, true, true) => "Times-BoldItalic",
+        (true, _, true, false) => "Times-Bold",
+        (true, _, false, true) => "Times-Italic",
+        (true, _, false, false) => "Times-Roman",
+        (_, true, true, true) => "Courier-BoldOblique",
+        (_, true, true, false) => "Courier-Bold",
+        (_, true, false, true) => "Courier-Oblique",
+        (_, true, false, false) => "Courier",
+        (_, _, true, true) => "Helvetica-BoldOblique",
+        (_, _, true, false) => "Helvetica-Bold",
+        (_, _, false, true) => "Helvetica-Oblique",
+        (_, _, false, false) => "Helvetica",
+    }
+}
+
+/// Paint a run's text-decoration rules (underline / line-through / overline) as
+/// thin filled rectangles spanning `width`, at the run's top-down offset.
+/// Shared by the embedded and base-14 text paths.
+fn paint_text_decorations(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    style: &Style,
+) {
+    let size = style.font_size;
+    let mut draw = |top_offset: f64| {
+        let _ = doc.add_rectangle(
+            page,
+            x,
+            page_h - (y + top_offset),
+            width,
+            (size * 0.06).max(0.4),
+            None,
+            Some(style.color),
+            0.0,
+            style.opacity,
+        );
+    };
+    if style.underline {
+        draw(size); // at the baseline
+    }
+    if style.strike {
+        draw(size * 0.55); // through the x-height
+    }
+    if style.overline {
+        draw(size * 0.05); // near the top
+    }
 }
 
 /// Resolve an `<img>` source to image bytes: a `data:` URI is decoded inline; any

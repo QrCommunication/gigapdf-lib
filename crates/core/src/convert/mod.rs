@@ -14,6 +14,7 @@
 pub mod build;
 pub mod grids;
 pub mod office;
+pub mod office_import;
 pub mod pdfa;
 pub mod reverse;
 pub mod srgb_icc;
