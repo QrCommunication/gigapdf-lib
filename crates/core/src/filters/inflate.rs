@@ -272,7 +272,19 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>> {
     let mut reader = BitReader::new(data);
     let mut out = Vec::new();
     loop {
-        let final_block = reader.bit()?;
+        // A stream flushed with `Z_SYNC_FLUSH` ends with an empty stored block
+        // (`00 00 ff ff`, BFINAL=0) and *no* final block — common in PDF content
+        // streams (e.g. the `q`/`Q`/overlay pieces of signed PDFs). zlib's strict
+        // mode errors ("unexpected end"), but PDF readers return what was decoded
+        // so far. Match that leniency: once the input is exhausted at a block
+        // boundary and we have produced output, stop instead of failing the whole
+        // page. Mid-block truncation still errors (the read happens inside the
+        // block, not here), so genuinely corrupt data is not masked.
+        let final_block = match reader.bit() {
+            Ok(b) => b,
+            Err(_) if !out.is_empty() => break,
+            Err(e) => return Err(e),
+        };
         let block_type = reader.bits(2)?;
         match block_type {
             0 => {
@@ -333,6 +345,30 @@ mod tests {
 
     #[test]
     fn rejects_truncated_stream() {
+        // Truncated mid-stored-block (no output yet) must still error — the
+        // leniency only applies at a clean block boundary after some output.
         assert!(inflate(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn sync_flush_without_final_block_returns_decoded() {
+        // `Z_SYNC_FLUSH` ends a stream with an empty stored block
+        // (`00 00 ff ff`, BFINAL=0) and no final block — exactly the `q`/`Q`/
+        // overlay content pieces of signed PDFs (real bytes from a Free/Adobe
+        // FillSign document). zlib errors here; PDF readers return the decoded
+        // bytes, and so must we — otherwise the whole page extracts nothing.
+        let q = [0x78, 0x9c, 0x2a, 0xe4, 0x02, 0x00, 0x00, 0x00, 0xff, 0xff];
+        assert_eq!(flate_decode(&q).unwrap(), b"q\n");
+
+        let overlay = [
+            0x78, 0x9c, 0xd2, 0x77, 0x74, 0x71, 0x72, 0x8d, 0x77, 0xcb, 0xcc, 0xc9, 0x09, 0xce,
+            0x4c, 0xcf, 0x53, 0x70, 0xf2, 0x75, 0x56, 0xe0, 0x2a, 0x54, 0xe0, 0xd2, 0x77, 0xcb,
+            0x35, 0x50, 0x70, 0xc9, 0x57, 0xe0, 0x0a, 0x54, 0xe0, 0x72, 0xf5, 0x75, 0x06, 0x00,
+            0x00, 0x00, 0xff, 0xff,
+        ];
+        assert_eq!(
+            flate_decode(&overlay).unwrap(),
+            b"/ADBE_FillSign BMC \nq \n/Fm0 Do \nQ \nEMC"
+        );
     }
 }
