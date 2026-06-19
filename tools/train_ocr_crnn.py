@@ -47,7 +47,7 @@ C1_OUT = int(os.environ.get("GIGA_OCR_C1", 16))
 C2_OUT = int(os.environ.get("GIGA_OCR_C2", 32))
 HID = int(os.environ.get("GIGA_OCR_HID", 64))    # GRU hidden units per direction
 N_LINES = 60_000         # synthetic lines sampled from the corpus
-BATCH = 64
+BATCH = int(os.environ.get("GIGA_OCR_BATCH", 128))
 
 
 # ── int8 export (torch-free; mirrors ConvSpec/GruSpec/Crnn in ocr_crnn.rs) ─────
@@ -316,9 +316,14 @@ def build_and_train(group: str, epochs: int):
     best = 2.0  # > 1.0 so the first epoch always writes an initial checkpoint
     for ep in range(epochs):
         net.train()
-        rng.shuffle(tr)
-        for i in range(0, len(tr), BATCH):
-            x, widths, targets, tlens = collate(tr[i : i + BATCH])
+        # Length-bucketed batching: group samples of similar strip width so each batch pads to a
+        # near-uniform width. Variable-width lines (esp. wide real handwriting) otherwise force the
+        # collate to pad every batch to its widest member, wasting most of the CPU matmul. Shuffle
+        # the batch ORDER (not within) to keep stochasticity. Cuts CPU epoch time ~2-4× on wide HW.
+        order = sorted(range(len(tr)), key=lambda j: tr[j][0].shape[1])
+        batches = [order[i : i + BATCH] for i in range(0, len(order), BATCH)]
+        for k in rng.permutation(len(batches)).tolist():
+            x, widths, targets, tlens = collate([tr[j] for j in batches[k]])
             logp = net(x).log_softmax(2).permute(1, 0, 2)
             loss = ctc(logp, targets, widths.clamp(min=1), tlens)
             opt.zero_grad()

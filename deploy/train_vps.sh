@@ -16,7 +16,7 @@ set -uo pipefail
 REPO_DIR="${REPO_DIR:-$HOME/gigapdf-lib}"
 VENV="${VENV:-$HOME/ocrvenv}"
 GROUP="${GROUP:-alpha}"
-EPOCHS="${EPOCHS:-80}"
+EPOCHS="${EPOCHS:-50}"   # 50 over ~148k samples ≈ 3× the local 60-epoch exposure; bucketing keeps it ~1 day
 SESSION="${SESSION:-megatrain${GIGA_OCR_VARIANT:+_${GIGA_OCR_VARIANT}}}"
 LOG="$HOME/$SESSION.log"
 NPROC="$(nproc)"
@@ -34,6 +34,7 @@ export GIGA_OCR_HW_REAL_N="${GIGA_OCR_HW_REAL_N:-30000}"   # per-dataset cap (re
 export GIGA_OCR_LANGS="${GIGA_OCR_LANGS:-eng,fra,deu,spa,ita,por,pol,ces,tur,vie,rus,ukr,bul,srp,ell}"
 export GIGA_OCR_DEGRADE="${GIGA_OCR_DEGRADE:-0}"   # photo variant: 1 = heavy in-the-wild degradation aug
 export GIGA_OCR_VARIANT="${GIGA_OCR_VARIANT:-}"    # output suffix, e.g. 'photo' → models/ocr_<group>_photo.gpocr
+export GIGA_OCR_BATCH="${GIGA_OCR_BATCH:-256}"     # length-bucketed → large batch is efficient on CPU
 export OMP_NUM_THREADS="$NPROC" MKL_NUM_THREADS="$NPROC"   # PyTorch CPU intra-op = all cores
 
 # per-dataset download volume (real handwriting lines); reuse-largest cache means a bigger
@@ -107,7 +108,7 @@ export GIGA_OCR_NLINES=$GIGA_OCR_NLINES GIGA_OCR_MAXCHARS=$GIGA_OCR_MAXCHARS
 export GIGA_OCR_FONTLIMIT=$GIGA_OCR_FONTLIMIT GIGA_OCR_HW_FRAC=$GIGA_OCR_HW_FRAC
 export GIGA_OCR_HW_REAL="$GIGA_OCR_HW_REAL" GIGA_OCR_HW_REAL_N=$GIGA_OCR_HW_REAL_N
 export GIGA_OCR_LANGS="$GIGA_OCR_LANGS"
-export GIGA_OCR_DEGRADE=$GIGA_OCR_DEGRADE GIGA_OCR_VARIANT="$GIGA_OCR_VARIANT"
+export GIGA_OCR_DEGRADE=$GIGA_OCR_DEGRADE GIGA_OCR_VARIANT="$GIGA_OCR_VARIANT" GIGA_OCR_BATCH=$GIGA_OCR_BATCH
 export OMP_NUM_THREADS=$NPROC MKL_NUM_THREADS=$NPROC
 cd "$REPO_DIR"
 echo "=== $SESSION start \$(date -u) — backbone $GIGA_OCR_C1/$GIGA_OCR_C2/$GIGA_OCR_HID, $EPOCHS epochs, $NPROC threads, degrade=$GIGA_OCR_DEGRADE variant='$GIGA_OCR_VARIANT' ==="
