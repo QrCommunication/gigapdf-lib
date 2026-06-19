@@ -210,7 +210,38 @@ gated corpora — most needed for **Arabic** and **Indic** (Devanagari/Bengali/T
 ungated line-level (image+text) mirrors are scarce (official IAM, CASIA-full, KHATT, IIIT-HW).
 **Latin, Cyrillic and Chinese are already covered ungated** (table above).
 
-## 9. Licensing cautions
+## 9. Degraded / photographed documents (photo variant — tooling built)
+
+Crumpled paper, phone photos, faded thermal receipts: the model must **see** such degradation at
+train time (domain randomization), complemented by the planned `ocr.rs` restoration front-end
+(see [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) §6 "Degraded / photographed documents").
+
+### 9.1 Degradation augmentation (built)
+`render_lines.py::_degrade` (gated by `GIGA_OCR_DEGRADE=1`) applies, per line: paper-curl wave,
+shear, Gaussian blur, uneven illumination + background haze/stains, low-resolution down/up-sample,
+JPEG artefacts, sensor + salt-pepper noise, contrast/brightness jitter — all pure numpy/PIL,
+preserving the H=32 strip. Off by default (clean training keeps a light aug).
+
+### 9.2 Training the photo variant
+```
+GIGA_OCR_DEGRADE=1 GIGA_OCR_VARIANT=photo GIGA_OCR_HW_FRAC=0.3 bash deploy/train_vps.sh
+```
+`GIGA_OCR_VARIANT=photo` writes `models/ocr_alpha_photo.gpocr` + `ocr_model_alpha_photo.rs`
+(no clobber of the clean primary `ocr_alpha`); the host picks it via `gp_ocr_load_model` for
+noisy input. Runs detached (tmux `megatrain_photo`).
+
+### 9.3 Real degraded / receipt corpora (to add)
+| Dataset | Type | Licence | Note |
+|---|---|---|---|
+| **SROIE** (ICDAR2019) | scanned receipts | research | line/word boxes + text — receipt domain |
+| **CORD** | receipt photos | CC-BY 4.0 ✅ | line-level, HF-hosted |
+| **FUNSD** | scanned forms | research | noisy forms, word boxes |
+| **RVL-CDIP** | document photos | research | degraded-doc imagery |
+
+Wire as `hw_datasets` entries (image+text line mirrors) once the HF config is confirmed; mix at a
+modest fraction so IAM/RIMES still anchor the clean-text signal.
+
+## 10. Licensing cautions
 
 - **Ship only ✅-licensed derived weights.** Models trained on 🔶/⛔ data may inherit usage
   restrictions — keep such data to *internal validation* unless the licence permits otherwise.

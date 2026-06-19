@@ -14,6 +14,7 @@ Run:  python3 tools/ocr/render_lines.py <group> [n] [font.ttf]
 """
 from __future__ import annotations
 
+import io
 import os
 import random
 import sys
@@ -30,8 +31,73 @@ FONT_PX = 40
 PAD = 4
 
 
+# Set GIGA_OCR_DEGRADE=1 (or 'photo') to train the degraded/photo variant — heavy
+# "in-the-wild" domain randomization instead of the light default scan augmentation.
+_DEGRADE_ON = os.environ.get("GIGA_OCR_DEGRADE", "0").strip().lower() not in ("", "0", "off", "false", "no")
+
+
+def _smooth_field(h: int, w: int, rng: random.Random, lo: float, hi: float) -> np.ndarray:
+    """Low-frequency random field in [lo, hi] (tiny random grid upsampled bilinearly) —
+    models uneven illumination / shadows / background haze on a photographed page."""
+    gw = max(2, w // 50)
+    grid = np.array([[rng.random() for _ in range(gw)] for _ in range(3)], np.float32)
+    up = Image.fromarray((grid * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
+    return lo + (hi - lo) * (np.asarray(up, np.float32) / 255.0)
+
+
+def _wave(a: np.ndarray, rng: random.Random) -> np.ndarray:
+    """Per-column vertical displacement (a sine) — mimics paper curl/crumple; preserves H."""
+    h, w = a.shape
+    amp, freq, phase = rng.uniform(0.8, 2.6), rng.uniform(0.4, 2.0), rng.uniform(0, 6.283)
+    offs = np.round(amp * np.sin(2 * np.pi * freq * np.arange(w) / max(w, 1) + phase)).astype(int)
+    idx = np.clip(np.arange(h)[:, None] + offs[None, :], 0, h - 1)
+    return np.take_along_axis(a, idx, axis=0)
+
+
+def _degrade(a: np.ndarray, rng: random.Random) -> np.ndarray:
+    """Heavy 'in-the-wild' degradations (crumpled / photographed / receipt) — domain
+    randomization for the photo variant: curl, shear, blur, uneven light, background haze,
+    low-res, JPEG, noise, contrast jitter. Float32 ink image (ink≈1, bg≈0), preserves H."""
+    h, w = a.shape
+    if rng.random() < 0.7:
+        a = _wave(a, rng)
+    img = Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8))
+    if rng.random() < 0.4:  # shear ≈ slight tilt
+        s = rng.uniform(-0.15, 0.15)
+        img = img.transform((w, h), Image.AFFINE, (1, s, -s * h / 2, 0, 1, 0), Image.BILINEAR)
+    if rng.random() < 0.6:
+        img = img.filter(ImageFilter.GaussianBlur(rng.uniform(0.4, 1.8)))
+    a = np.asarray(img, np.float32) / 255.0
+    if rng.random() < 0.7:  # uneven ink / lighting
+        a = a * _smooth_field(h, w, rng, 0.45, 1.0)
+    if rng.random() < 0.5:  # background haze / stains
+        a = a + _smooth_field(h, w, rng, 0.0, 0.18)
+    if rng.random() < 0.4:  # low resolution
+        f = rng.uniform(0.45, 0.8)
+        u8 = (np.clip(a, 0, 1) * 255).astype(np.uint8)
+        small = Image.fromarray(u8).resize((max(1, int(w * f)), max(1, int(h * f))), Image.BILINEAR)
+        a = np.asarray(small.resize((w, h), Image.BILINEAR), np.float32) / 255.0
+    if rng.random() < 0.5:  # JPEG artefacts
+        buf = io.BytesIO()
+        Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8)).save(buf, "JPEG", quality=rng.randint(18, 55))
+        buf.seek(0)
+        a = np.asarray(Image.open(buf).convert("L"), np.float32) / 255.0
+    nrng = np.random.default_rng(rng.randint(0, 2**31 - 1))
+    if rng.random() < 0.7:  # sensor noise
+        a = a + nrng.normal(0, rng.uniform(0.03, 0.10), a.shape).astype(np.float32)
+    if rng.random() < 0.15:  # salt-and-pepper speckle
+        m = nrng.random(a.shape)
+        a = np.where(m < 0.01, 1.0, np.where(m > 0.99, 0.0, a))
+    if rng.random() < 0.5:  # contrast / brightness jitter
+        a = (a - 0.5) * rng.uniform(0.8, 1.4) + 0.5 + rng.uniform(-0.1, 0.1)
+    return np.clip(a, 0.0, 1.0).astype(np.float32)
+
+
 def _augment(a: np.ndarray, rng: random.Random) -> np.ndarray:
-    """Light scan-like degradations on a float32 ink image (ink≈1, bg≈0)."""
+    """Scan-like degradations on a float32 ink image (ink≈1, bg≈0). Heavy photo/receipt
+    degradation when GIGA_OCR_DEGRADE is set (photo variant), else a light default."""
+    if _DEGRADE_ON:
+        return _degrade(a, rng)
     img = Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8))
     if rng.random() < 0.5:
         img = img.filter(ImageFilter.GaussianBlur(rng.uniform(0.3, 1.1)))

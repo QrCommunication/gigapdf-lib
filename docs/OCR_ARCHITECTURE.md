@@ -166,7 +166,27 @@ connected components — robust to tilted/noisy scans, no-ops on clean print (sk
 `C2` / `HID`); the `.gpocr` format and the runtime read every dimension from the blob, so a
 **larger model** (for dense Indic, or a future CJK) trains and host-loads with no runtime change.
 
-**Next (planned):** (a) a full **lexicon / char-n-gram beam CTC** (the disambiguation above
-is the lexicon-lite first step); (b) multi-column **XY-cut** layout analysis; (c) larger
-backbones to push the competitive Indic models past Tesseract. CJK remains **out of scope by
-decision**.
+**Degraded / photographed documents (crumpled, receipts, phone photos) — strategy.** Poor
+real-world input fails on three axes: **geometry** (perspective, curl, crumple), **photometry**
+(shadows, glare, blur, noise, JPEG, low-res), and **domain gap** (the model has only seen clean
+synthetic). Plan, by ROI — all staying pure-`std` (no ML dewarp net):
+
+1. **Front-end restoration in `ocr.rs` (no retrain) — planned.** Illumination normalization
+   (estimate background → flatten shadows/glare), **perspective dewarp** (document quadrilateral
+   → homography) + **per-line baseline dewarp** for curled receipts, feed the CRNN a **grayscale**
+   strip (skip hard binarization, which destroys info on degraded scans), denoise + local
+   contrast (CLAHE) + light super-resolution for small receipt text.
+2. **Photo/degraded model variant — tooling built.** A heavy "in-the-wild" domain-randomization
+   augmentation (curl wave, shear, uneven illumination, background haze, blur, low-res, JPEG,
+   noise, contrast jitter) lives in `render_lines.py::_degrade`, gated by `GIGA_OCR_DEGRADE=1`.
+   Train it as a **separate** model (no clobber of the clean primary) via `GIGA_OCR_VARIANT=photo`
+   → `models/ocr_alpha_photo.gpocr`; the host loads it for noisy input. Launch on a VPS:
+   `GIGA_OCR_DEGRADE=1 GIGA_OCR_VARIANT=photo bash deploy/train_vps.sh`. Add real receipt/photo
+   corpora (SROIE, CORD, FUNSD) — see [`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md).
+3. **Lexicon / char-n-gram beam CTC — planned.** LM rescoring fixes garbled characters when the
+   visual signal is weak (the biggest decoder lever on degraded input); the `disambiguate_line`
+   homoglyph vote is the lexicon-lite first step.
+4. **Test-time augmentation** — decode a few preprocessing variants, keep the highest CTC confidence.
+
+**Also planned:** multi-column **XY-cut** layout analysis; larger backbones to push the
+competitive Indic models past Tesseract. CJK remains **out of scope by decision**.

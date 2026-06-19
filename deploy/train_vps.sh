@@ -17,7 +17,8 @@ REPO_DIR="${REPO_DIR:-$HOME/gigapdf-lib}"
 VENV="${VENV:-$HOME/ocrvenv}"
 GROUP="${GROUP:-alpha}"
 EPOCHS="${EPOCHS:-80}"
-SESSION="${SESSION:-megatrain}"
+SESSION="${SESSION:-megatrain${GIGA_OCR_VARIANT:+_${GIGA_OCR_VARIANT}}}"
+LOG="$HOME/$SESSION.log"
 NPROC="$(nproc)"
 
 # ── "mega" config — scaled for 48 vCPU / 192 GB (override via env) ──────────────────
@@ -31,6 +32,8 @@ export GIGA_OCR_HW_FRAC="${GIGA_OCR_HW_FRAC:-0.4}"   # share of synthetic lines 
 export GIGA_OCR_HW_REAL="${GIGA_OCR_HW_REAL:-iam,rimes,norhand,newseye,belfort,popp,esposalles,cyrillic}"
 export GIGA_OCR_HW_REAL_N="${GIGA_OCR_HW_REAL_N:-30000}"   # per-dataset cap (reuse-largest cache)
 export GIGA_OCR_LANGS="${GIGA_OCR_LANGS:-eng,fra,deu,spa,ita,por,pol,ces,tur,vie,rus,ukr,bul,srp,ell}"
+export GIGA_OCR_DEGRADE="${GIGA_OCR_DEGRADE:-0}"   # photo variant: 1 = heavy in-the-wild degradation aug
+export GIGA_OCR_VARIANT="${GIGA_OCR_VARIANT:-}"    # output suffix, e.g. 'photo' → models/ocr_<group>_photo.gpocr
 export OMP_NUM_THREADS="$NPROC" MKL_NUM_THREADS="$NPROC"   # PyTorch CPU intra-op = all cores
 
 # per-dataset download volume (real handwriting lines); reuse-largest cache means a bigger
@@ -95,7 +98,7 @@ log "Corpus download finished. Cached lines:"
 ls -1 /tmp/ocr_hw/*_train_*.npz 2>/dev/null | sed 's#.*/##' || true
 
 # ── 6. Launch training DETACHED in tmux (survives disconnect / local shutdown) ──────
-RUN="$HOME/run_megatrain.sh"
+RUN="$HOME/run_$SESSION.sh"
 cat > "$RUN" <<EOF
 #!/usr/bin/env bash
 set -uo pipefail
@@ -104,9 +107,10 @@ export GIGA_OCR_NLINES=$GIGA_OCR_NLINES GIGA_OCR_MAXCHARS=$GIGA_OCR_MAXCHARS
 export GIGA_OCR_FONTLIMIT=$GIGA_OCR_FONTLIMIT GIGA_OCR_HW_FRAC=$GIGA_OCR_HW_FRAC
 export GIGA_OCR_HW_REAL="$GIGA_OCR_HW_REAL" GIGA_OCR_HW_REAL_N=$GIGA_OCR_HW_REAL_N
 export GIGA_OCR_LANGS="$GIGA_OCR_LANGS"
+export GIGA_OCR_DEGRADE=$GIGA_OCR_DEGRADE GIGA_OCR_VARIANT="$GIGA_OCR_VARIANT"
 export OMP_NUM_THREADS=$NPROC MKL_NUM_THREADS=$NPROC
 cd "$REPO_DIR"
-echo "=== megatrain start \$(date -u) — backbone $GIGA_OCR_C1/$GIGA_OCR_C2/$GIGA_OCR_HID, $EPOCHS epochs, $NPROC threads ==="
+echo "=== $SESSION start \$(date -u) — backbone $GIGA_OCR_C1/$GIGA_OCR_C2/$GIGA_OCR_HID, $EPOCHS epochs, $NPROC threads, degrade=$GIGA_OCR_DEGRADE variant='$GIGA_OCR_VARIANT' ==="
 exec "$VENV/bin/python" tools/train_ocr_crnn.py "$GROUP" "$EPOCHS"
 EOF
 chmod +x "$RUN"
@@ -114,7 +118,7 @@ chmod +x "$RUN"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     log "tmux session '$SESSION' already exists — not relaunching. Attach: tmux attach -t $SESSION"
 else
-    tmux new-session -d -s "$SESSION" "bash '$RUN' 2>&1 | tee $HOME/megatrain.log"
+    tmux new-session -d -s "$SESSION" "bash '$RUN' 2>&1 | tee $LOG"
     log "Launched detached training in tmux '$SESSION'."
 fi
-log "Monitor:  tmux attach -t $SESSION   |   tail -f ~/megatrain.log   |   grep epoch ~/megatrain.log | tail"
+log "Monitor:  tmux attach -t $SESSION   |   tail -f $LOG   |   grep epoch $LOG | tail"

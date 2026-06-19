@@ -97,7 +97,15 @@ def _gru_ctor(prefix: str) -> str:
     )
 
 
-def emit_rust(net, alphabet: str, group: str, cer: float):
+def _out_group(group: str) -> str:
+    """Output-file group name: `<group>` normally, `<group>_<variant>` when GIGA_OCR_VARIANT
+    is set (e.g. 'photo'). Lets a degraded/photo variant train without clobbering the primary
+    `ocr_<group>` model — the alphabet/RTL/scripts logic keeps using the real `group`."""
+    v = os.environ.get("GIGA_OCR_VARIANT", "").strip()
+    return f"{group}_{v}" if v else group
+
+
+def emit_rust(net, alphabet: str, group: str, cer: float, out_group: str | None = None):
     k = len(alphabet)
     c1w, c1s = _i8("C1_W", net.c1.weight)
     c2w, c2s = _i8("C2_W", net.c2.weight)
@@ -133,7 +141,7 @@ def emit_rust(net, alphabet: str, group: str, cer: float):
         "    }\n"
         "}\n"
     )
-    dest = os.path.join(ROOT, f"crates/core/src/raster/ocr_model_{group}.rs")
+    dest = os.path.join(ROOT, f"crates/core/src/raster/ocr_model_{out_group or group}.rs")
     with open(dest, "w") as f:
         f.write(body)
     print(f"wrote {dest} ({os.path.getsize(dest) // 1024} KB)")
@@ -323,13 +331,13 @@ def build_and_train(group: str, epochs: int):
         cer = ev.corpus_cer(pairs)
         if cer < best:  # checkpoint the best model so far (robust to a long run dying)
             best = cer
-            emit_rust(net, alphabet, group, cer)  # build-time-embed option (Cargo feature)
-            emit_gpocr(net, alphabet, group)  # runtime host-load blob (recommended)
+            emit_rust(net, alphabet, group, cer, out_group=_out_group(group))  # baked Cargo feature
+            emit_gpocr(net, alphabet, group, out_group=_out_group(group))  # runtime host-load blob
         print(f"  epoch {ep + 1:2d}/{epochs}  val_CER={cer:.4f}  best={best:.4f}", flush=True)
     return net, alphabet, best
 
 
-def emit_gpocr(net, alphabet: str, group: str) -> str:
+def emit_gpocr(net, alphabet: str, group: str, out_group: str | None = None) -> str:
     """Write the runtime-loadable `.gpocr` blob (same int8 quantization as emit_rust,
     serialized for `gp_ocr_load_model`) to models/ocr_<group>.gpocr."""
     def ql(t, scale=None):
@@ -363,7 +371,7 @@ def emit_gpocr(net, alphabet: str, group: str) -> str:
     )
     out_dir = os.path.join(ROOT, "models")
     os.makedirs(out_dir, exist_ok=True)
-    dest = os.path.join(out_dir, f"ocr_{group}.gpocr")
+    dest = os.path.join(out_dir, f"ocr_{out_group or group}.gpocr")
     with open(dest, "wb") as f:
         f.write(blob)
     return dest
