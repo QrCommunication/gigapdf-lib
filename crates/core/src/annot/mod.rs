@@ -134,16 +134,44 @@ pub(crate) fn highlight(rect: [f64; 4], color: [f64; 3]) -> Built {
     }
 }
 
-/// Line annotation.
-pub(crate) fn line(x1: f64, y1: f64, x2: f64, y2: f64, color: [f64; 3], line_width: f64) -> Built {
+/// Line annotation. When `end_arrow` is set, an open arrowhead is drawn at the
+/// `(x2,y2)` end and `/LE [/None /OpenArrow]` is recorded so conforming readers
+/// render the same ending even if they regenerate the appearance.
+pub(crate) fn line(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    color: [f64; 3],
+    line_width: f64,
+    end_arrow: bool,
+) -> Built {
     let mut dict = Dictionary::new();
     dict.set(b"Subtype".to_vec(), name(b"Line"));
-    let rect = [x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2)];
+    // Pad the bounding box so the arrowhead is never clipped by /Rect.
+    let pad = if end_arrow {
+        (3.0 * line_width).max(8.0)
+    } else {
+        0.0
+    };
+    let rect = [
+        x1.min(x2) - pad,
+        y1.min(y2) - pad,
+        x1.max(x2) + pad,
+        y1.max(y2) + pad,
+    ];
     dict.set(b"Rect".to_vec(), real_array(&rect));
     dict.set(b"L".to_vec(), real_array(&[x1, y1, x2, y2]));
     dict.set(b"C".to_vec(), real_array(&color));
     dict.set(b"BS".to_vec(), border_style(line_width));
-    let appearance = content::line_ops(x1, y1, x2, y2, color, line_width);
+    let mut appearance = content::line_ops(x1, y1, x2, y2, color, line_width);
+    if end_arrow {
+        dict.set(
+            b"LE".to_vec(),
+            Object::Array(vec![name(b"None"), name(b"OpenArrow")]),
+        );
+        appearance.extend_from_slice(&content::arrowhead_ops(x1, y1, x2, y2, color, line_width));
+    }
     Built {
         dict,
         appearance,

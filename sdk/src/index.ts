@@ -2315,6 +2315,12 @@ export class GigaPdfDoc {
   addHighlight(page: number, x0: number, y0: number, x1: number, y1: number, rgb = 0xffff00): boolean {
     return this.ex().gp_add_highlight(this.h, page, x0, y0, x1, y1, RGB(rgb)) === 0;
   }
+  /**
+   * Add a `/Line` annotation from `(x1,y1)` to `(x2,y2)`. When `endArrow` is
+   * `true`, an open arrowhead (`/LE [/None /OpenArrow]`) is drawn at the
+   * `(x2,y2)` end — a real, editable annotation in conforming readers, ideal
+   * for callouts that point at content.
+   */
   addLineAnnotation(
     page: number,
     x1: number,
@@ -2322,9 +2328,12 @@ export class GigaPdfDoc {
     x2: number,
     y2: number,
     rgb = 0,
-    lineWidth = 1
+    lineWidth = 1,
+    endArrow = false
   ): boolean {
-    return this.ex().gp_add_line(this.h, page, x1, y1, x2, y2, RGB(rgb), lineWidth) === 0;
+    return (
+      this.ex().gp_add_line(this.h, page, x1, y1, x2, y2, RGB(rgb), lineWidth, endArrow ? 1 : 0) === 0
+    );
   }
   addFreeText(
     page: number,

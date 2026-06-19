@@ -85,6 +85,18 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("adds line and arrow (/Line + /LE OpenArrow) annotations", () => {
+    const doc = giga.open(giga.txtToPdf("Point at me"));
+    expect(doc.addLineAnnotation(1, 50, 50, 250, 50, 0x000000, 1.5)).toBe(true);
+    expect(doc.addLineAnnotation(1, 50, 120, 250, 200, 0xff0000, 2, true)).toBe(true);
+    const out = doc.save();
+    const lines = giga.open(out).annotations(1).filter((a) => a.subtype === "Line");
+    expect(lines.length).toBe(2);
+    // The arrow ending is recorded as /LE [/None /OpenArrow] for conforming readers.
+    expect(new TextDecoder("latin1").decode(out)).toContain("OpenArrow");
+    doc.close();
+  });
+
   it("exposes the font catalog", () => {
     const cat = giga.fontCatalog();
     expect(cat.length).toBeGreaterThan(100);

@@ -5631,6 +5631,10 @@ impl Document {
 
     /// Add a Line annotation.
     #[allow(clippy::too_many_arguments)]
+    /// Add a `/Line` annotation. When `end_arrow` is set, an open arrowhead is
+    /// drawn at the `(x2,y2)` end (`/LE [/None /OpenArrow]`) — useful for
+    /// callouts that point at content.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_line_annotation(
         &mut self,
         page_no: u32,
@@ -5640,8 +5644,12 @@ impl Document {
         y2: f64,
         color: [f64; 3],
         line_width: f64,
+        end_arrow: bool,
     ) -> Result<()> {
-        self.add_annotation(page_no, annot::line(x1, y1, x2, y2, color, line_width))
+        self.add_annotation(
+            page_no,
+            annot::line(x1, y1, x2, y2, color, line_width, end_arrow),
+        )
     }
 
     /// Add a FreeText annotation (a text box on the page).
@@ -11121,6 +11129,33 @@ mod tests {
         assert!(annots
             .iter()
             .any(|a| a.subtype == "FreeText" && a.contents == "Note"));
+    }
+
+    #[test]
+    fn adds_line_annotation_with_and_without_arrow() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let before = doc.page_annotations(1).unwrap().len();
+
+        // Plain line (no ending) + an arrow line (open arrowhead at the end).
+        doc.add_line_annotation(1, 50.0, 50.0, 250.0, 50.0, [0.0, 0.0, 0.0], 1.5, false)
+            .unwrap();
+        doc.add_line_annotation(1, 50.0, 120.0, 250.0, 200.0, [1.0, 0.0, 0.0], 2.0, true)
+            .unwrap();
+
+        let saved = doc.save();
+        let annots = Document::open(&saved).unwrap().page_annotations(1).unwrap();
+        assert_eq!(annots.len(), before + 2, "two line annotations persisted");
+        assert_eq!(
+            annots.iter().filter(|a| a.subtype == "Line").count(),
+            2,
+            "both persist as /Line annotations"
+        );
+        // The arrow line records /LE [/None /OpenArrow] for conforming readers.
+        let bytes = String::from_utf8_lossy(&saved);
+        assert!(
+            bytes.contains("OpenArrow"),
+            "arrow line writes an /LE OpenArrow ending"
+        );
     }
 
     #[test]

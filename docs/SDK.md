@@ -219,7 +219,7 @@ Three ways to draw real, selectable text — **no host font files required**:
 | `annotations(page)` | `AnnotationInfo[]` | List markup annotations **with full metadata**: subtype + rect + `author`/`subject`/`created`/`modified`/`name` + `opacity` + `color` (RGB) + `quadPoints` (text markup) + `inkList` (freehand) + link target (`linkUri`/`linkPage`). |
 | `addHighlight / addUnderline / addStrikeOut(page, x0, y0, x1, y1, rgb?)` | `boolean` | Text-markup annotations over a quad. |
 | `addSquare(page, x0, y0, x1, y1, stroke?, fill?)` | `boolean` | Rectangle annotation. |
-| `addLineAnnotation(page, x1, y1, x2, y2, rgb?, lineWidth?)` | `boolean` | Line annotation. |
+| `addLineAnnotation(page, x1, y1, x2, y2, rgb?, lineWidth?, endArrow?)` | `boolean` | Line annotation. `endArrow` (default `false`) draws an open arrowhead at the `(x2,y2)` end (`/LE [/None /OpenArrow]`). |
 | `addFreeText(page, x0, y0, x1, y1, text, …)` | `boolean` | Free-text (typewriter) annotation. |
 | `addTextNote(page, rect, rgb, meta?, icon?, open?)` | `boolean` | Sticky note at `rect = [x0,y0,x1,y1]`; `meta = { contents, author, id, date }`, `icon` (e.g. `"Note"`, `"Comment"`), `open` initial popup state. |
 | `addInk(page, points, rgb?, lineWidth?)` | `boolean` | Freehand ink path from a flat point list. |

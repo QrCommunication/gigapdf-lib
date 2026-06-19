@@ -3005,6 +3005,7 @@ pub extern "C" fn gp_add_highlight(
 }
 
 /// Add a Line annotation from `(x1,y1)` to `(x2,y2)`. `rgb` packed `0xRRGGBB`.
+/// `end_arrow != 0` draws an open arrowhead at the `(x2,y2)` end.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn gp_add_line(
@@ -3016,9 +3017,10 @@ pub extern "C" fn gp_add_line(
     y2: f64,
     rgb: u32,
     line_width: f64,
+    end_arrow: u32,
 ) -> i32 {
     edit(handle, |doc| {
-        doc.add_line_annotation(page, x1, y1, x2, y2, unpack_rgb(rgb), line_width)
+        doc.add_line_annotation(page, x1, y1, x2, y2, unpack_rgb(rgb), line_width, end_arrow != 0)
     })
 }
 

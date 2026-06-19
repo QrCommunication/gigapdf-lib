@@ -1337,6 +1337,41 @@ pub fn line_ops(x1: f64, y1: f64, x2: f64, y2: f64, stroke: Rgb, line_width: f64
     out
 }
 
+/// Build content-stream bytes that draw an open arrowhead (a stroked "V") at the
+/// `(x2,y2)` end of a line whose direction is `(x1,y1) -> (x2,y2)`. Matches the
+/// `/LE [/None /OpenArrow]` line-ending of a `/Line` annotation. Returns empty
+/// bytes for a degenerate (zero-length) line.
+pub fn arrowhead_ops(x1: f64, y1: f64, x2: f64, y2: f64, stroke: Rgb, line_width: f64) -> Vec<u8> {
+    let [r, g, b] = stroke;
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len = (dx * dx + dy * dy).sqrt();
+    let mut out = Vec::new();
+    if len < 1e-6 {
+        return out;
+    }
+    // Unit vector along the line, then its reverse (the barbs splay backwards
+    // from the tip). Barb length scales with the stroke but stays visible.
+    let (ux, uy) = (dx / len, dy / len);
+    let (rx, ry) = (-ux, -uy);
+    let head = (3.0 * line_width).max(8.0);
+    let angle = 25.0_f64.to_radians();
+    let (sin_a, cos_a) = angle.sin_cos();
+    // Reversed unit vector rotated by +/- angle, scaled to the barb length.
+    let lx = x2 + head * (rx * cos_a - ry * sin_a);
+    let ly = y2 + head * (rx * sin_a + ry * cos_a);
+    let r2x = x2 + head * (rx * cos_a + ry * sin_a);
+    let r2y = y2 + head * (-rx * sin_a + ry * cos_a);
+    out.extend_from_slice(b"q\n");
+    out.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+    out.extend_from_slice(format!("{} w\n", num(line_width)).as_bytes());
+    out.extend_from_slice(format!("{} {} m\n", num(lx), num(ly)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(x2), num(y2)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(r2x), num(r2y)).as_bytes());
+    out.extend_from_slice(b"S\nQ\n");
+    out
+}
+
 /// Build content-stream bytes that draw an ellipse centered at `(cx, cy)` with
 /// radii `(rx, ry)`, approximated by four cubic Béziers. Stroked, filled or both.
 pub fn ellipse_ops(

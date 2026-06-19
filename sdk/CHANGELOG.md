@@ -4,6 +4,17 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.52.5] - 2026-06-19
+
+### Added
+
+- **Arrow line annotations — `addLineAnnotation(page, x1, y1, x2, y2, rgb, lineWidth, endArrow?)`.**
+  The new `endArrow` flag draws an open arrowhead at the `(x2,y2)` end and records
+  `/LE [/None /OpenArrow]` on the `/Line` annotation, so the arrowhead survives in
+  any conforming reader (Adobe Reader, Preview, Chrome) — and stays editable, not
+  baked. The `/Rect` is padded around the arrowhead so it is never clipped. Ideal
+  for callouts that point at content. Backward compatible: `endArrow` defaults to `false`.
+
 ## [0.52.4] - 2026-06-19
 
 ### Added
