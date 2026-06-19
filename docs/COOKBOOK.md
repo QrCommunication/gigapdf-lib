@@ -62,12 +62,14 @@ pulling the image back out.
 ```ts
 const doc = giga.open(pdfBytes);
 
-// Redact a name and an account number on page 1 (rects in PDF user space:
-// [x, y, w, h], origin bottom-left).
+// Redact a name and an account number on page 1 (rects in PDF user space,
+// origin bottom-left).
 doc.redactPii(1, [
-  { x: 72, y: 690, w: 180, h: 14 },   // the customer name
-  { x: 72, y: 660, w: 220, h: 14 },   // the IBAN
+  { x: 72, y: 690, width: 180, height: 14 },   // the customer name
+  { x: 72, y: 660, width: 220, height: 14 },   // the IBAN
 ]);
+// opts (optional): { cover?: boolean (default true), coverRgb?: number }.
+// `cover: false` erases the content/pixels with no visible mark.
 
 const redacted = doc.save();
 doc.close();

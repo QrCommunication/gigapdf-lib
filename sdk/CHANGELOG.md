@@ -4,6 +4,28 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.52.4] - 2026-06-19
+
+### Added
+
+- **True PII redaction — `redactPii(page, rects, opts?)`.** Physically removes
+  the text operators in each rect, **overwrites the pixels of any image** that
+  intersects the rect (so a scanned / OCR'd page is genuinely sanitised, not
+  just covered), strips overlapping annotations + form-field values, and paints
+  an opaque black mark (the PII default). Not recoverable by copy-paste, text
+  extraction, or pulling the image back out — closing the gap where `redact()`
+  left images intact. ABI `gp_redact_pii`; `rects` are `{ x, y, width, height }`
+  in PDF user space, `opts: { cover?, coverRgb? }`.
+- **Documentation — new `docs/COOKBOOK.md`** (task-oriented recipes) plus a full
+  refresh of the README, SDK, API and usage docs covering the recent additions
+  (text decorations, the running header/footer reader, the unified editable
+  model and its `modelTo*` exporters, AVIF).
+
+### Changed
+
+- **OCR recognition models refreshed** — larger-backbone models and expanded
+  training data for better accuracy.
+
 ## [0.52.3] - 2026-06-19
 
 ### Added

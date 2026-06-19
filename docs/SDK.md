@@ -176,7 +176,7 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 | `drawLine(page, x1, y1, x2, y2, rgb?, lineWidth?, opacity?)` | `boolean` | Straight line. |
 | `addSvg(page, svg, x, y, w, h)` | `boolean` | Render SVG markup as **native vector paths** fitting its `viewBox` into `(x,y,w,h)`. |
 | `redact(page, x, y, w, h, coverRgb?, hasCover?)` | `number` | True redaction: physically delete content intersecting the region; optional opaque cover. **Leaves images intact** — for scans/OCR use `redactPii`. Returns ops removed. |
-| `redactPii(page, rects, opts?)` *(v0.52.4)* | — | **Irreversible** redaction of one or more `{ x, y, w, h }` rects: removes the text operators, **overwrites the pixels of any image** in the zone (safe on scanned/OCR'd pages), and draws an opaque black box. Not recoverable by copy-paste/extraction. See the [security note](COOKBOOK.md#note-redact-vs-redactpii). |
+| `redactPii(page, rects, opts?)` *(v0.52.4)* | — | **Irreversible** redaction of one or more `{ x, y, width, height }` rects (opts `{ cover?, coverRgb? }`): removes the text operators, **overwrites the pixels of any image** in the zone (safe on scanned/OCR'd pages), and draws an opaque black box. Not recoverable by copy-paste/extraction. See the [security note](COOKBOOK.md#note-redact-vs-redactpii). |
 
 ### Fonts
 
