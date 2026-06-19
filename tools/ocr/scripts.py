@@ -12,6 +12,8 @@ Self-test:  python3 tools/ocr/scripts.py
 """
 from __future__ import annotations
 
+import os
+
 
 def _range(lo: int, hi: int, exclude: set[int] | None = None) -> str:
     """All code points in [lo, hi] as a string, minus `exclude`."""
@@ -173,6 +175,18 @@ SCRIPTS: dict[str, dict] = {
 for _s in SCRIPTS.values():
     if " " not in _s["chars"]:
         _s["chars"] = _s["chars"] + " "
+
+
+# Optional per-group charset override from a file (e.g. a real CJK frequency list built by
+# tools/ocr/build_cjk_charset.py): set GIGA_OCR_CHARSET_<GROUP>=path (e.g. GIGA_OCR_CHARSET_CJK).
+# Enables a real ~2–6k-class CJK model in place of the tiny built-in fallback. Space is kept
+# as a class. Unknown/missing paths are ignored (falls back to the built-in set).
+for _g in list(SCRIPTS):
+    _p = os.environ.get(f"GIGA_OCR_CHARSET_{_g.upper()}")
+    if _p and os.path.exists(_p):
+        _cs = load_charset(_p)
+        if _cs:
+            SCRIPTS[_g]["chars"] = _cs if " " in _cs else _cs + " "
 
 
 def alphabet_for(group: str) -> str:

@@ -35,14 +35,10 @@ export GIGA_OCR_LANGS="${GIGA_OCR_LANGS:-eng,fra,deu,spa,ita,por,pol,ces,tur,vie
 export GIGA_OCR_DEGRADE="${GIGA_OCR_DEGRADE:-0}"   # photo variant: 1 = heavy in-the-wild degradation aug
 export GIGA_OCR_VARIANT="${GIGA_OCR_VARIANT:-}"    # output suffix, e.g. 'photo' → models/ocr_<group>_photo.gpocr
 export GIGA_OCR_BATCH="${GIGA_OCR_BATCH:-256}"     # length-bucketed → large batch is efficient on CPU
+# Real CJK charset (~2.4k classes) built by tools/ocr/build_cjk_charset.py; only used by the
+# cjk group (scripts.py reads GIGA_OCR_CHARSET_<GROUP>). Harmless for other groups.
+export GIGA_OCR_CHARSET_CJK="${GIGA_OCR_CHARSET_CJK:-$REPO_DIR/tools/ocr/cjk_charset.txt}"
 export OMP_NUM_THREADS="$NPROC" MKL_NUM_THREADS="$NPROC"   # PyTorch CPU intra-op = all cores
-
-# per-dataset download volume (real handwriting lines); reuse-largest cache means a bigger
-# cached pull is reused, a smaller request is truncated — so these are upper bounds.
-# "max data": full IAM/RIMES/POPP/Esposalles + large slices of the big corpora (NorHand
-# 222k, NewsEye 51k, Belfort 25k available) — ~108k real lines, well within 192 GB RAM.
-declare -A NDL=( [iam]=6482 [rimes]=10188 [norhand]=30000 [newseye]=20000
-                 [belfort]=20000 [popp]=3835 [esposalles]=2328 [cyrillic]=15000 )
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
@@ -61,6 +57,11 @@ if [ -n "$SUDO" ]; then
         fonts-noto-core fonts-noto-extra fonts-noto-ui-core \
         fonts-dejavu-core fonts-liberation fonts-freefont-ttf || \
         log "WARN: apt install partial — continuing"
+    if [ "$GROUP" = cjk ]; then
+        log "Installing Noto CJK fonts (group=cjk)…"
+        echo "${SUDO_PASS:-}" | $SUDO apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra || \
+            log "WARN: CJK font install partial — continuing"
+    fi
 fi
 
 # ── 2. Python venv + Torch (CPU) ───────────────────────────────────────────────────
@@ -85,13 +86,14 @@ log "Fetching handwriting fonts for '$GROUP'…"
 ( cd "$REPO_DIR/tools/ocr" && "$VENV/bin/python" fonts.py "$GROUP" --handwriting ) || \
     log "WARN: handwriting-font fetch partial — continuing"
 
-# ── 5. Real handwriting corpus — bounded concurrency (the datasets-server rate-limits
-#       under heavy parallelism → HTTP 429; 3 streams + in-code retry-on-429 is reliable) ──
+# ── 5. Real corpus — download each GIGA_OCR_HW_REAL dataset up to GIGA_OCR_HW_REAL_N lines.
+#       Bounded concurrency (the datasets-server rate-limits heavy parallelism → HTTP 429;
+#       3 streams + in-code retry-on-429 is reliable). Reuse-largest cache skips re-download. ──
 MAXJ="${GIGA_OCR_DL_CONCURRENCY:-3}"
-log "Downloading real handwriting corpus (concurrency=$MAXJ, retry-on-429)…"
+log "Downloading real corpus [$GIGA_OCR_HW_REAL] up to $GIGA_OCR_HW_REAL_N each (concurrency=$MAXJ)…"
 cd "$REPO_DIR"
-for ds in "${!NDL[@]}"; do
-    "$VENV/bin/python" tools/ocr/hw_datasets.py "$ds" "${NDL[$ds]}" > "$HOME/dl_$ds.log" 2>&1 &
+for ds in ${GIGA_OCR_HW_REAL//,/ }; do
+    "$VENV/bin/python" tools/ocr/hw_datasets.py "$ds" "$GIGA_OCR_HW_REAL_N" > "$HOME/dl_$ds.log" 2>&1 &
     while [ "$(jobs -rp | wc -l)" -ge "$MAXJ" ]; do wait -n 2>/dev/null || break; done
 done
 wait
@@ -109,6 +111,7 @@ export GIGA_OCR_FONTLIMIT=$GIGA_OCR_FONTLIMIT GIGA_OCR_HW_FRAC=$GIGA_OCR_HW_FRAC
 export GIGA_OCR_HW_REAL="$GIGA_OCR_HW_REAL" GIGA_OCR_HW_REAL_N=$GIGA_OCR_HW_REAL_N
 export GIGA_OCR_LANGS="$GIGA_OCR_LANGS"
 export GIGA_OCR_DEGRADE=$GIGA_OCR_DEGRADE GIGA_OCR_VARIANT="$GIGA_OCR_VARIANT" GIGA_OCR_BATCH=$GIGA_OCR_BATCH
+export GIGA_OCR_CHARSET_CJK="$GIGA_OCR_CHARSET_CJK"
 export OMP_NUM_THREADS=$NPROC MKL_NUM_THREADS=$NPROC
 cd "$REPO_DIR"
 echo "=== $SESSION start \$(date -u) — backbone $GIGA_OCR_C1/$GIGA_OCR_C2/$GIGA_OCR_HID, $EPOCHS epochs, $NPROC threads, degrade=$GIGA_OCR_DEGRADE variant='$GIGA_OCR_VARIANT' ==="

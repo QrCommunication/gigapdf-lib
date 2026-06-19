@@ -50,8 +50,9 @@ DATASETS: dict[str, dict] = {
     "esposalles": {"id": "Teklia/Esposalles-line", "text": "text", "group": "alpha"},  # Catalan
     # Cyrillic → `alpha` (real-style handwriting; fonts cover Cyrillic poorly)
     "cyrillic": {"id": "deepcopy/synthetic-handwritten-cyrillic-180k", "text": "text", "group": "alpha"},
-    # Chinese → `cjk` (CASIA-HWDB2 line mirror — gated upstream, open here)
-    "casia": {"id": "Teklia/CASIA-HWDB2-line", "text": "text", "group": "cjk"},
+    # Chinese → `cjk` (CASIA-HWDB2 handwriting line mirror + a large printed/scene corpus)
+    "casia": {"id": "Teklia/CASIA-HWDB2-line", "text": "text", "group": "cjk"},  # handwriting
+    "chinese": {"id": "priyank-m/chinese_text_recognition", "text": "text", "group": "cjk"},  # printed/scene, 400k
 }
 
 
