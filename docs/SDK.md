@@ -4,6 +4,11 @@ Complete reference for the TypeScript SDK. Exact signatures and defaults ship in
 the bundled `.d.ts` (your IDE surfaces them inline); this document explains what
 every method *does*, its parameters, return value, and the gotchas.
 
+> Looking for ready-made, copy-pasteable snippets? See the
+> **[Cookbook](COOKBOOK.md)** — redaction, styled text, headers/footers,
+> conversions, OCR, forms, annotations, signing, encryption and the editable
+> model, each as a short worked recipe.
+
 Two classes:
 
 - **`GigaPdfEngine`** — the loaded WebAssembly module. Stateless factory:
@@ -75,11 +80,16 @@ try {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `htmlNeededFonts(html)` / `htmlNeededFontsWith(html, header?, footer?)` | `HtmlFontRequest[]` | Which Google Fonts the HTML needs (fetch them, then pass to `htmlRender`). |
-| `htmlNeededResources(html, header?, footer?)` | `HtmlResourceNeed[]` | Unified phase 1: the fonts **and** external `<img>` URLs the document needs. Fetch each, pass fonts to `htmlRenderWith` and image bytes via `HtmlRenderOptions.resources` (the engine is zero-network). |
-| `evalJs(src)` | `string` | Run JavaScript in the native ES2021 interpreter; returns the result stringified. |
-| `runInlineScripts(html)` | `string` | Execute the `<script>`s in an HTML string against a native DOM and return the mutated HTML. |
-| `pageSize(name)` | `{ w, h } \| null` | Look up a named page size (`"A4"`, `"Letter"`, …) in points. |
+| `htmlNeededFonts(html)` / `htmlNeededFontsWith(html, header?, footer?)` | `HtmlFontRequest[]` | Which Google Fonts the HTML needs (fetch them, then pass to `htmlRender` / `htmlRenderWith`). The `*With` form also scans the running header/footer. |
+| `htmlNeededResources(html, header?, footer?)` | `HtmlResourceNeed[]` | Unified phase 1: the fonts **and** external `<img>` URLs the document needs, in one list. Fetch each, pass fonts to `htmlRenderWith` and image bytes via `HtmlRenderOptions.resources` (the engine is zero-network); `data:` URIs need no entry. |
+| `htmlRenderWith(html, fonts?, options?)` | `Uint8Array` | Phase 2 with full page control: `options = { pageSize?, pageWidth?, pageHeight?, margin?, header?, footer?, headerOffset?, footerOffset?, startPageNumber?, resources? }`. The header/footer are HTML painted in the page margins with `{{page}}`/`{{pages}}` tokens. |
+| `evalJs(src)` | `string` | Run JavaScript in the native ES2021+ engine (Boa); returns the result stringified. |
+| `runInlineScripts(html)` | `string` | Execute the `<script>`s in an HTML string against a native DOM and return the mutated HTML (the render paths do this automatically). |
+| `pageSize(name)` | `{ w, h } \| null` | Look up a named page size (`"A4"`, `"a3-landscape"`, `"letter"`, …) in points; `null` if unknown. |
+
+The unified-model lowering helpers (`officeToModel`, `htmlToModel`,
+`applyModelOps`, `modelTo*`) also live on `GigaPdfEngine` — see
+[The unified editable model](#the-unified-editable-model).
 
 ---
 
@@ -108,6 +118,26 @@ try {
 | `extractPages(pages)` | `Uint8Array` | A new **self-contained** PDF with just `pages` (1-based) — cross-page links/AcroForm fields/named dests/outline entries to dropped pages are pruned. Powers *split*. |
 | `appendPages(otherPdf)` | `boolean` | Append every page of another PDF. Powers *merge*. |
 
+### Margins & running header/footer
+
+Page margins and a baked running header/footer on an **existing** PDF (for an
+HTML→PDF header/footer instead, use `htmlRenderWith` — see [HTML / JavaScript](#html--javascript-engine)).
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `pageMargins(page)` | `PageMargins` | A page's `{ top, right, bottom, left }` margins (points): the `/CropBox`↔`/MediaBox` gap when a CropBox exists, else estimated from the content box. |
+| `setPageMargins(page, m)` | `boolean` | Set a page's margins by insetting its `/CropBox` from the `/MediaBox` — a real, visible change. |
+| `setHeader(spec)` | `boolean` | Bake a running **header** onto every in-range page (idempotent — re-baking replaces the prior one). `spec` is a [`HeaderFooterSpec`](#headerfooterspec). |
+| `setFooter(spec)` | `boolean` | Bake a running **footer** (same spec). |
+| `removeHeaders()` / `removeFooters()` | `boolean` | Remove every previously-baked running header / footer from all pages. |
+| `headerFooter()` | `{ header, footer }` | **Reader** counterpart: detect the header/footer already baked into the PDF. Each side is a `HeaderFooterSpec` (with its recovered, per-page-substituted `text`) or `null`. Lets a Word-like editor reflect existing state. |
+
+<a id="headerfooterspec"></a>`HeaderFooterSpec = { text, align?, fontSize?, color?, pageRange?, showOnFirstPage?, bandHeight? }`.
+`text` may contain `{{page}}` (1-based page number) and `{{pages}}` (total page
+count), substituted per page. Text is drawn in standard Helvetica inside the top
+(header) / bottom (footer) margin band — no font embedding required. Defaults:
+`align: "left"`, `fontSize: 10`, `color: [0,0,0]`, every page, `bandHeight: 36`.
+
 ### Reading text & content elements
 
 | Method | Returns | Description |
@@ -134,18 +164,19 @@ try {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `addText(page, x, y, size, text, fontObj, rgb?, opacity?, rotationDeg?)` | `boolean` | Draw selectable text in **any embedded** font (`fontObj` from `embedFont`/`extractFont`) — glyf TrueType or OpenType-CFF, each character encoded through the font's char→glyph map (Identity-H). |
-| `addStandardText(page, x, y, size, text, fontName, rgb?, opacity?, rotationDeg?)` | `boolean` | Draw selectable text in a **built-in base-14** font (no embedding). See [Fonts](#fonts). |
+| `addText(page, x, y, size, text, fontObj, rgb?, opacity?, rotationDeg?, opts?)` | `boolean` | Draw selectable text in **any embedded** font (`fontObj` from `embedFont`/`extractFont`) — glyf TrueType or OpenType-CFF, each character encoded through the font's char→glyph map (Identity-H). `rotationDeg` rotates CCW about `(x,y)`. `opts = { underline?, strikethrough? }` bakes filled decoration rules (in the text colour, spanning the real glyph advance, following the rotation). |
+| `addStandardText(page, x, y, size, text, fontName, rgb?, opacity?, rotationDeg?, opts?)` | `boolean` | Draw selectable text in a **built-in base-14** font (no embedding). Same `opts = { underline?, strikethrough? }` decorations as `addText`. See [Fonts](#fonts). |
 | `addWatermark(page, x, y, size, text, rgb?, opacity?, rotationDeg?)` | `boolean` | Standard-Helvetica watermark (thin wrapper over `addStandardText`). |
-| `addTextLayer(page, runs)` | `number` | Stamp an invisible (render-mode 3) text layer — e.g. a searchable OCR layer; one content append. Returns runs written. |
+| `addTextLayer(page, runs)` | `number` | Stamp an invisible (render-mode 3) text layer — e.g. a searchable OCR layer; one content append. Each run is `{ x, y, size, text, rotation? }`. Returns runs written. |
 | `addImage(page, data, x, y, w, h, opacity?)` | `boolean` | Embed a PNG/JPEG as an image XObject in the box `(x,y,w,h)`. |
-| `addRectangle(page, x, y, w, h, stroke?, fill?, lineWidth?)` | `boolean` | Vector rectangle. `stroke`/`fill` are `0xRRGGBB` or `null`. |
+| `addRectangle(page, x, y, w, h, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Vector rectangle. `stroke`/`fill` are `0xRRGGBB` or `null`. |
 | `addEllipse(page, cx, cy, rx, ry, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Vector ellipse (Bézier). |
-| `addPolygon(page, points, close, stroke?, fill?)` | `boolean` | Polyline/polygon from a flat `[x0,y0,x1,y1,…]` list. |
-| `addPath(page, svgPath, x, y, stroke?, fill?, lineWidth?)` | `boolean` | Draw an SVG `<path d="…">` at `(x,y)`. |
-| `drawLine(page, x1, y1, x2, y2, rgb?, lineWidth?)` | `boolean` | Straight line. |
+| `addPolygon(page, points, close, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Polyline/polygon from a flat `[x0,y0,x1,y1,…]` list. |
+| `addPath(page, svgPath, ox, oy, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Draw an SVG `<path d="…">` anchored at `(ox,oy)` (Y-flipped, `pdf-lib` convention). |
+| `drawLine(page, x1, y1, x2, y2, rgb?, lineWidth?, opacity?)` | `boolean` | Straight line. |
 | `addSvg(page, svg, x, y, w, h)` | `boolean` | Render SVG markup as **native vector paths** fitting its `viewBox` into `(x,y,w,h)`. |
-| `redact(page, x, y, w, h, coverRgb?, hasCover?)` | `number` | True redaction: physically delete content intersecting the region; optional opaque cover. Returns ops removed. |
+| `redact(page, x, y, w, h, coverRgb?, hasCover?)` | `number` | True redaction: physically delete content intersecting the region; optional opaque cover. **Leaves images intact** — for scans/OCR use `redactPii`. Returns ops removed. |
+| `redactPii(page, rects, opts?)` *(v0.52.4)* | — | **Irreversible** redaction of one or more `{ x, y, w, h }` rects: removes the text operators, **overwrites the pixels of any image** in the zone (safe on scanned/OCR'd pages), and draws an opaque black box. Not recoverable by copy-paste/extraction. See the [security note](COOKBOOK.md#note-redact-vs-redactpii). |
 
 ### Fonts
 
@@ -190,7 +221,7 @@ Three ways to draw real, selectable text — **no host font files required**:
 | `addSquare(page, x0, y0, x1, y1, stroke?, fill?)` | `boolean` | Rectangle annotation. |
 | `addLineAnnotation(page, x1, y1, x2, y2, rgb?, lineWidth?)` | `boolean` | Line annotation. |
 | `addFreeText(page, x0, y0, x1, y1, text, …)` | `boolean` | Free-text (typewriter) annotation. |
-| `addTextNote(page, x, y, rgb, meta?)` | `boolean` | Sticky note; `meta = { contents, author, id, date }`. |
+| `addTextNote(page, rect, rgb, meta?, icon?, open?)` | `boolean` | Sticky note at `rect = [x0,y0,x1,y1]`; `meta = { contents, author, id, date }`, `icon` (e.g. `"Note"`, `"Comment"`), `open` initial popup state. |
 | `addInk(page, points, rgb?, lineWidth?)` | `boolean` | Freehand ink path from a flat point list. |
 | `addStamp(page, x0, y0, x1, y1, label, rgb?)` | `boolean` | Rubber-stamp annotation. |
 | `addMarkupAnnotation(…)` | `boolean` | Generic markup with shared reviewer metadata. |
@@ -245,11 +276,37 @@ reconstructed tables for spreadsheets) — not a rasterised image.
 |--------|--------|
 | `toText()` | plain text (`string`) |
 | `toHtml()` | HTML (`string`) |
+| `toModel()` | the unified editable [`GigaDocument`](#the-unified-editable-model) model |
 | `toDocx()` / `toOdt()` | Word / OpenDocument Text |
 | `toPptx()` / `toOdp()` | PowerPoint / OpenDocument Presentation |
 | `toXlsx()` / `toOds()` | Excel / OpenDocument Spreadsheet |
 | `toRtf()` | Rich Text Format |
 | `toPdfA()` | PDF/A-2b archival PDF |
+
+### The unified editable model
+
+A **format-neutral document tree** ([`GigaDocument`](#types): sections → pages →
+blocks → runs) every format lowers into and is rebuilt from. Lower any source
+into it, edit it with structured ops, then raise it to any target — the substrate
+for a universal editor that edits every format the same way. See the
+[round-trip recipe](COOKBOOK.md#round-trip-the-unified-editable-model).
+
+| Method | Class | Returns | Description |
+|--------|-------|---------|-------------|
+| `doc.toModel()` | `GigaPdfDoc` | `GigaDocument` | Lower this PDF into the unified model. |
+| `officeToModel(office)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower an Office/ODF file (auto-detected); `null` if not a recognised container. |
+| `htmlToModel(html)` | `GigaPdfEngine` | `GigaDocument` | Lower an HTML string into the model. |
+| `applyModelOps(model, ops)` | `GigaPdfEngine` | `GigaDocument` | Apply a batch of [`ModelOp`](#types) edits (run in order; out-of-range addresses are no-ops, so a partial batch never throws). |
+| `modelToDocx / modelToXlsx / modelToPptx / modelToOdt / modelToOds / modelToOdp / modelToPdf(model)` | `GigaPdfEngine` | `Uint8Array` | Raise the model to each binary target. |
+| `modelToHtml(model)` / `modelToRtf(model)` | `GigaPdfEngine` | `string` | Raise the model to HTML / RTF text. |
+
+A `ModelOp` addresses a block by `[section, page, index]` (zero-based). The
+ops: `setRunText`, `restyleRun`, `insertRun`, `deleteRun`, `insertBlock`,
+`deleteBlock`, `moveBlock`, `setBlockText`, `restyleBlock`, `setCellText`,
+`setSheetCell`. A run's character style (`GigaCharStyle`) carries `bold`,
+`italic`, `underline`, `strike`, `color`, `size_pt`, and `valign`
+(`"baseline" | "super" | "sub"` — sub/superscript), so decorations and offset
+baselines survive a round-trip.
 
 ### Render
 
@@ -267,13 +324,25 @@ reconstructed tables for spreadsheets) — not a rasterised image.
 
 ### OCR & text intelligence
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `ocr(page, scale?)` | `OcrWord[]` | Recognise words (with boxes) on a scanned page — native CNN, no external engine. |
-| `ocrText(page, scale?)` | `string` | OCR'd plain text. |
+Recognise text on scanned/image-only pages (`GigaPdfDoc`), and load the per-script
+recognizer models (`GigaPdfEngine`, global to the engine):
+
+| Method | Class | Returns | Description |
+|--------|-------|---------|-------------|
+| `ocr(page, scale?)` | `GigaPdfDoc` | `OcrWord[]` | Recognise words (with PDF-space boxes) on a scanned page — native CNN, no external engine. `scale ≥ 2` for small text. |
+| `ocrText(page, scale?)` | `GigaPdfDoc` | `string` | OCR'd plain text. |
+| `loadOcrModel(blob)` | `GigaPdfEngine` | `boolean` | Load a `.gpocr` line-recognizer blob (any host); routes `ocr`/`ocrText` through the CRNN+CTC engine. `false` on a malformed blob. |
+| `loadBundledOcrModel(script)` | `GigaPdfEngine` | `Promise<boolean>` | **(Node)** Load one bundled script (`"alpha"`, `"arabic"`, `"devanagari"`, `"bengali"`, `"tamil"`) from the package's `models/`. |
+| `loadBundledOcrModels(scripts)` | `GigaPdfEngine` | `Promise<OcrScript[]>` | **(Node)** Load several bundled scripts; returns the ones that loaded. |
+| `loadAllBundledOcrModels()` | `GigaPdfEngine` | `Promise<number>` | **(Node)** Discover and load **every** bundled `.gpocr`; the script detector then routes each line to the right model (any shipped language). Returns the count loaded. |
+| `clearOcrModels()` | `GigaPdfEngine` | `void` | Drop every runtime-loaded model (reverts to the mono-glyph Latin classifier). |
 
 To make a scanned PDF searchable: `ocr(page)` → map words to placements →
-`addTextLayer(page, runs)` (invisible, selectable).
+`addTextLayer(page, runs)` (invisible, selectable). Full recipe in the
+[cookbook](COOKBOOK.md#ocr-a-scanned-page--full-text-search).
+
+`ALL_OCR_SCRIPTS` is the exported list of every trained script (pass to
+`loadBundledOcrModels` to recognise any shipped language).
 
 > **Default engine:** Latin (printed + handwritten), mono-glyph. **Opt-in CRNN+CTC
 > engine** (line-level, multi-script): group `alpha` = Latin-extended + Cyrillic + Greek
@@ -302,13 +371,21 @@ All result/option shapes are exported interfaces — import them for typed code:
 
 ```ts
 import type {
-  FontInfo, EmbeddedFont, PageInfo, TextLine, TextRunInfo, Element,
+  FontInfo, EmbeddedFont, PageInfo, PageMargins, HeaderFooterSpec, HeaderFooterAlign,
+  TextLine, TextRunInfo, Element, TextElementInfo, DocumentLanguage,
   ImageElementInfo, VectorPathInfo, PathSegment,
-  SearchHit, OcrWord, AnnotationInfo, FieldInfo, FieldStyle, LinkInfo,
-  LayerInfo, OutlineEntry, NamedDest, XlsxSheet, HtmlFontRequest, HtmlFont,
-  SignP12Options,
+  SearchHit, OcrWord, OcrScript, AnnotationInfo, FieldInfo, FieldStyle, RadioOption,
+  LinkInfo, LayerInfo, OutlineEntry, NamedDest, Attachment, XlsxSheet, DecodedImage,
+  HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
+  HtmlMargins, SignP12Options,
+  // unified editable model:
+  GigaDocument, GigaSection, GigaPage, GigaBlock, GigaInline, GigaCharStyle,
+  GigaGeneric, GigaBlockAddr, GigaStylePatch, GigaCellValue, ModelOp,
 } from "@qrcommunication/gigapdf-lib";
 ```
 
-See also: [USAGE.md](USAGE.md) (cookbook), [API.md](API.md) (Rust + WASM ABI),
-[HTML-CSS.md](HTML-CSS.md) (HTML→PDF), [INSTALL.md](INSTALL.md).
+Runtime exports (not just types): `ALL_OCR_SCRIPTS` (every trained OCR script).
+
+See also: [COOKBOOK.md](COOKBOOK.md) (task-oriented recipes), [USAGE.md](USAGE.md)
+(raw buffer ABI), [API.md](API.md) (Rust + WASM ABI), [HTML-CSS.md](HTML-CSS.md)
+(HTML→PDF), [INSTALL.md](INSTALL.md).

@@ -8,9 +8,11 @@ complete symbol list see [API.md](API.md).
 
 > **Prefer the high-level SDK?** Most hosts never touch the raw ABI below. The
 > `GigaPdfEngine` / `GigaPdfDoc` classes wrap all of it — start with the
-> [SDK recipes](../sdk/README.md#recipes) (merge, split, encrypt, sign, annotate,
-> HTML→PDF with fonts, searchable OCR…) and the per-method [`SDK.md`](SDK.md)
-> reference. The guide below is for hosts driving the `extern "C"` module directly.
+> **[Cookbook](COOKBOOK.md)** (redaction, styled text, headers/footers,
+> conversions, OCR, forms, annotations, signing, encryption, the editable
+> model), the [SDK recipes](../sdk/README.md#recipes), and the per-method
+> [`SDK.md`](SDK.md) reference. The guide below is for hosts driving the
+> `extern "C"` module directly.
 
 ## 1. Load the module
 
@@ -101,6 +103,28 @@ ex.gp_add_rectangle(handle, 1, 72, 72, 200, 100, 0x808080, -1, 1.0);
 
 // True redaction: delete everything intersecting the region (no opaque cover)
 ex.gp_redact_region(handle, 1, 100, 100, 200, 20, 0, /*has_cover=*/0);
+```
+
+> **`redactPii` (SDK, v0.52.4)** — for genuinely sensitive data, the SDK's
+> `redactPii(page, rects)` goes further than `gp_redact_region`: it also
+> **erases the pixels of any image** in the zone (so a scanned/OCR'd page can't
+> be recovered) and stamps an opaque mark. `gp_redact_region` removes text
+> operators only and leaves images intact.
+
+### Styled text (underline / strikethrough)
+
+`gp_add_text_styled` / `gp_add_text_standard_styled` add the rotation and two
+decoration flags after the colour/opacity (`…, rgb, opacity, rotation_deg,
+underline, strikethrough`). The rules are filled in the text colour and follow
+the rotation. The SDK exposes these as the optional `opts = { underline,
+strikethrough }` argument on `addText` / `addStandardText`.
+
+```js
+// Underlined standard-Helvetica text at 0° (underline=1, strikethrough=0).
+const t = strArg("Confidential"), fn = strArg("Helvetica");
+ex.gp_add_text_standard_styled(handle, 1, 72, 700, 12, t.ptr, t.len, fn.ptr, fn.len,
+  0xcc0000, 1.0, 0, /*underline=*/1, /*strikethrough=*/0);
+freeArg(t); freeArg(fn);
 ```
 
 ## 4b. Build an interactive form (AcroForm, no `pdf-lib`)
@@ -333,6 +357,53 @@ ex.gp_free(rPtr, rand.length); freeArg(fields);
 
 // PDF/A-2b archival metadata
 const pdfa = callBuffer((lp) => ex.gp_to_pdfa(handle, lp));
+```
+
+## 9b. Running headers & footers
+
+Bake a running header/footer onto an existing PDF. The spec is JSON (the SDK's
+`HeaderFooterSpec`); `{{page}}` / `{{pages}}` are substituted per page.
+`gp_header_footer` reads back what's baked (the reader side).
+
+```js
+const hdr = strArg(JSON.stringify({ text: "Acme Inc.", align: "center", fontSize: 10 }));
+ex.gp_set_header(handle, hdr.ptr, hdr.len); freeArg(hdr);
+
+const ftr = strArg(JSON.stringify({ text: "Page {{page}} / {{pages}}", align: "right" }));
+ex.gp_set_footer(handle, ftr.ptr, ftr.len); freeArg(ftr);
+
+// Read them back: { header: {...}|null, footer: {...}|null }
+const hf = JSON.parse(dec.decode(callBuffer((lp) => ex.gp_header_footer(handle, lp))));
+
+// Remove: ex.gp_remove_headers(handle) / ex.gp_remove_footers(handle)
+// Margins: ex.gp_page_margins(handle, page, lp) / ex.gp_set_page_margins(handle, page, t, r, b, l)
+```
+
+## 9c. The unified editable model
+
+The model is a format-neutral JSON tree (the SDK's `GigaDocument`). Lower any
+format into it, edit it with ops, and raise it to any format — all through JSON
+strings across the ABI.
+
+```js
+// Lower this PDF → model JSON.
+const model = dec.decode(callBuffer((lp) => ex.gp_model_from_pdf(handle, lp)));
+//   also: gp_model_from_office(ptr,len,lp) · gp_model_from_html(ptr,len,lp)
+
+// Edit: apply an ops array (JSON). Addresses are [section, page, blockIndex].
+const ops = JSON.stringify([
+  { op: "setRunText", addr: [0, 0, 0], run: 0, text: "Revised title" },
+]);
+const m = strArg(model), o = strArg(ops);
+const edited = dec.decode(callBuffer((lp) => ex.gp_model_apply_ops(m.ptr, m.len, o.ptr, o.len, lp)));
+freeArg(m); freeArg(o);
+
+// Raise: model JSON → any target.
+const e = strArg(edited);
+const docx = callBuffer((lp) => ex.gp_model_to_docx(e.ptr, e.len, lp));
+//   also: gp_model_to_{xlsx,pptx,odt,ods,odp,pdf}  → bytes
+//         gp_model_to_{html,rtf}                    → string
+freeArg(e);
 ```
 
 ## 10. Always free what you allocate

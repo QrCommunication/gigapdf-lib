@@ -34,7 +34,8 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 |------|------|
 | `page_text_runs(page) -> Vec<TextRun>` | `gp_text_runs_json(handle,page,outlen)` |
 | `page_elements(page) -> Vec<ContentElement>` | `gp_elements_json(handle,page,outlen)` |
-| `page_text_elements(page) -> Vec<TextElementInfo>` (rich per-run text: bounds + family/bold/italic + size + colour + rotation) | `gp_text_elements_json(handle,page,outlen)` |
+| `page_text_elements(page) -> Vec<TextElementInfo>` (rich per-run text: bounds + family/bold/italic + size + colour + rotation + direction) | `gp_text_elements_json(handle,page,outlen)` |
+| `document_language() -> DocumentLanguage` (dominant direction + script + ISO-639-1) | `gp_document_language(handle,outlen)` → `{direction,script,lang?}` · SDK `documentLanguage` |
 | `page_image_elements(page) -> Vec<ImageElementInfo>` (placement bounds + format + embeddable bytes + pixel dims + rotation + opacity) | `gp_image_elements_json(handle,page,outlen)` → `[{…,format,pixelWidth,pixelHeight,dataBase64,rotation,opacity}]` |
 | `page_vector_paths(page) -> Vec<VectorPath>` (painted paths: segments + bounds + fill/stroke RGB + line width + alpha + dash) | `gp_vector_paths_json(handle,page,outlen)` → `[{…,segments,fill,stroke,strokeWidth,fillAlpha,strokeAlpha,dash}]` |
 | `element_at(page,x,y) -> Option<usize>` | `gp_element_at(handle,page,x,y)` |
@@ -55,8 +56,10 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | Rust | WASM |
 |------|------|
 | `add_text_standard(page,x,y,size,text,font_name,rgb,opacity,rot)` | `gp_add_text_standard(handle,page,x,y,size,ptr,len,fontptr,fontlen,rgb,opacity,rot)` |
+| `add_text_standard_styled(…,rot,underline,strike)` (base-14 + decoration rules) | `gp_add_text_standard_styled(handle,page,x,y,size,ptr,len,fontptr,fontlen,rgb,opacity,rot,underline,strike)` · SDK `addStandardText(…,opts)` |
 | `embed_font(family,&bytes) -> u32` (glyf TrueType **or** OpenType-CFF, auto-detected; `embed_truetype_font` is a kept alias) | `gp_embed_font(handle,famptr,famlen,ttfptr,ttflen) -> u32` |
 | `add_text(page,x,y,size,text,font_obj,rgb)` | `gp_add_text(handle,page,x,y,size,ptr,len,font_obj,rgb)` |
+| `add_text_styled(…,rot,underline,strike)` (embedded font + decoration rules) | `gp_add_text_styled(handle,page,x,y,size,ptr,len,font_obj,rgb,opacity,rot,underline,strike)` · SDK `addText(…,opts)` |
 | `embedded_fonts() -> Vec<EmbeddedFontInfo>` | `gp_embedded_fonts_json(handle,outlen)` |
 | `extract_font_program(name) -> Option<(Vec<u8>,fmt)>` | `gp_extract_font(handle,nameptr,namelen,outlen)` |
 | `needed_fonts() -> Vec<String>` | `gp_needed_fonts(handle,outlen)` (JSON) |
@@ -116,8 +119,12 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | Rust | WASM |
 |------|------|
 | `rotate_page(page,deg)` / `delete_page(page)` / `move_page(from,to)` | `gp_rotate_page / gp_delete_page / gp_move_page` |
+| `resize_page(page,w,h)` / `add_page(w,h,after)` / `copy_page(page)` / `page_info(page)` | `gp_resize_page / gp_add_page / gp_copy_page / gp_page_info_json` |
 | `extract_pages(&[u32]) -> Vec<u8>` | `gp_extract_pages(handle,ptr,count,outlen)` |
 | `append_pages_from(&[u8])` | `gp_append_pages(handle,ptr,len)` |
+| `page_margins(page)` / `set_page_margins(page,t,r,b,l)` | `gp_page_margins(handle,page,outlen) / gp_set_page_margins(handle,page,t,r,b,l)` |
+| `set_header(spec)` / `set_footer(spec)` (JSON `HeaderFooterSpec`, `{{page}}`/`{{pages}}` tokens) | `gp_set_header(handle,ptr,len) / gp_set_footer(handle,ptr,len)` |
+| `remove_headers()` / `remove_footers()` / `header_footer()` (reader) | `gp_remove_headers / gp_remove_footers / gp_header_footer(handle,outlen)` |
 | `add_uri_link(page,rect,uri)` / `add_goto_link(page,rect,target)` | `gp_add_uri_link / gp_add_goto_link` |
 | `add_named_dest(name,target)` / `named_dests() -> Vec<(String,u32)>` | `gp_add_named_dest(handle,nameptr,namelen,target) / gp_named_dests_json(handle,outlen)` |
 | `add_goto_link_named(page,rect,name)` (jumps to a `/Dest /name`; split-safe) | `gp_add_goto_link_named(handle,page,x0,y0,x1,y1,nameptr,namelen)` |
@@ -130,7 +137,8 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 
 | Rust | WASM |
 |------|------|
-| `redact_region(page,x,y,w,h,cover:Option<[f64;3]>) -> usize` | `gp_redact_region(handle,page,x,y,w,h,cover_rgb,has_cover)` |
+| `redact_region(page,x,y,w,h,cover:Option<[f64;3]>) -> usize` (text only; image left intact) | `gp_redact_region(handle,page,x,y,w,h,cover_rgb,has_cover)` · SDK `redact` |
+| `redact_pii(page,&[rect], …)` *(v0.52.4)* — **irreversible**: remove text **+ erase image pixels** (safe on scans/OCR) under an opaque mark | (ABI added in v0.52.4) · SDK `redactPii(page, rects)` |
 | `sign(&Signer,name,reason,date) -> Result<Vec<u8>>` | `gp_sign(handle,fieldsptr,fieldslen,randptr,randlen,key_bits,outlen)` |
 | `sign_p12(&Pkcs12Identity,name,reason,date,location,contact)` | `gp_sign_p12(handle,p12*,pass*,fields*,outlen)` |
 | `sign::pkcs12::parse(pfx,password) -> Pkcs12Identity` | (via `gp_sign_p12`) |
@@ -190,6 +198,7 @@ residual Z1/Z3 edge-filter gap remains), and the lossless WHT path at `q ≤ 20`
 | `search(query,case_insensitive) -> Vec<SearchMatch>` | `gp_search_json(handle,ptr,len,ci,outlen)` | match lines + highlight boxes |
 | `ocr_page(page,scale) -> Vec<OcrWord>` | `gp_ocr_json(handle,page,scale,outlen)` | scanned pages → words + boxes (PDF space) |
 | `ocr_page_text(page,scale) -> String` | `gp_ocr_text(handle,page,scale,outlen)` | scanned page → plain text |
+| `ocr::load_model(&[u8]) -> bool` / `ocr::clear_models()` | `gp_ocr_load_model(ptr,len) / gp_ocr_clear_models()` | host-load a `.gpocr` line model (CRNN+CTC) / reset to mono-glyph · SDK `loadOcrModel` / `clearOcrModels` (+ Node `loadBundledOcrModel(s)` / `loadAllBundledOcrModels`) |
 
 OCR uses the built-in recognizer (no Tesseract): Otsu → connected components →
 line/word segmentation → a compact CNN trained offline on EMNIST (handwriting) +
@@ -232,6 +241,25 @@ change. See [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md),
 | `rtf_to_pdf(&str)` | `gp_rtf_to_pdf(ptr,len,outlen)` |
 | `office_to_pdf(&[u8]) -> Option<Vec<u8>>` | `gp_office_to_pdf(ptr,len,outlen)` (auto-detect docx/odt/odp/pptx/xlsx/ods) |
 | `docx_to_pdf / odt_to_pdf / odp_to_pdf / pptx_to_pdf / xlsx_to_pdf / ods_to_pdf` | via `gp_office_to_pdf` |
+
+### Unified editable model (lower / edit / raise)
+
+A format-neutral document tree (`model::Document`, JSON-serialized). Lower any
+format into it, edit with `ModelOp`s, raise to any format — see
+[SDK.md § The unified editable model](SDK.md#the-unified-editable-model).
+
+| Rust (`model`) | WASM | SDK |
+|------|------|-----|
+| `Document::from_pdf(&doc) -> model::Document` | `gp_model_from_pdf(handle,outlen)` | `doc.toModel()` |
+| `model::from_office(&[u8]) -> Option<Document>` | `gp_model_from_office(ptr,len,outlen)` | `officeToModel` |
+| `model::from_html(&str) -> Document` | `gp_model_from_html(ptr,len,outlen)` | `htmlToModel` |
+| `model.apply_ops(&[ModelOp]) -> Document` | `gp_model_apply_ops(modelptr,modellen,opsptr,opslen,outlen)` | `applyModelOps` |
+| `model.to_{docx,xlsx,pptx,odt,ods,odp,pdf}() -> Vec<u8>` | `gp_model_to_{docx,xlsx,pptx,odt,ods,odp,pdf}(ptr,len,outlen)` | `modelTo{Docx,…}` |
+| `model.to_{html,rtf}() -> String` | `gp_model_to_{html,rtf}(ptr,len,outlen)` | `modelToHtml` / `modelToRtf` |
+
+All model functions take/return the model's JSON envelope as a string. A
+`ModelOp` addresses a block by `[section, page, index]` (zero-based); ops run in
+order and out-of-range addresses are no-ops.
 
 ### Building blocks (Rust)
 
@@ -293,8 +321,11 @@ Google fonts**, so the host fetches fonts in two phases.
 
 - `ContentElement { index, kind: Text|Image|Path, label, bounds, font, color }`
 - `TextRun { index, operator, text, op_position }`
+- `TextElementInfo { index, text, bounds, font_family, bold, italic, size, color, rotation, direction }`
 - `FormField { name, field_type, value, flags, options, max_len }`
 - `Link { kind: uri|page, uri, page, rect }`, `OutlineItem { title, page, level }`
+- `HeaderFooterSpec { text, align, font_size, color, page_range, show_on_first_page, band_height }`
+- `model::{Document, Section, Page, Block, Inline, CharStyle, CellValue, ModelOp, BlockAddr, StylePatch}`
 - `convert::{ConvPage, PlacedText, PlacedImage, PlacedShape, TextStyle, Generic}`
 
 JSON-returning WASM functions serialize these structures directly.

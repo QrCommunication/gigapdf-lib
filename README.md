@@ -44,18 +44,20 @@ performs Google-Fonts downloads). Everything else is in the engine.
 |------|--------------|
 | **Read** | PDF 1.7, xref + object streams, FlateDecode, encrypted (RC4/AESV2/AESV3) |
 | **Write** | Renumbering serializer, `save`, `save_compressed` (Flate streams) |
-| **Edit content** | Text edit/remove, elements (text/image/shape) list/remove/move/duplicate/add; draw text/rect/line/ellipse/polygon/SVG-path/image (opacity + PNG alpha); hit-test |
-| **Text extraction** | Font-aware, zero-tofu via WinAnsi + `/ToUnicode` CMap (CID/Type0) |
-| **Annotations** | Highlight, underline, strike-out, free-text, square, line, ink, stamp, link; **flatten** |
+| **Edit content** | Text edit/remove (with **underline / strikethrough** decorations), elements (text/image/shape) list/remove/move/duplicate/add; draw text/rect/line/ellipse/polygon/SVG-path/image (opacity + PNG alpha); hit-test |
+| **Text extraction** | Font-aware, zero-tofu via WinAnsi + `/ToUnicode` CMap (CID/Type0); per-run colour/size/rotation/direction; document language detection |
+| **Headers / footers** | Bake a running header/footer onto an existing PDF (`{{page}}`/`{{pages}}` tokens) and **read back** what's baked; per-page margins read/write |
+| **Annotations** | Highlight, underline, strike-out, squiggly, free-text, square, line, ink, sticky note, stamp, link; rich read-back metadata; **flatten** |
 | **Forms (AcroForm)** | Text/checkbox/radio/combo/list/signature fields — **read · fill · create** (build widgets from scratch with appearance streams + `NeedAppearances`) |
-| **Pages** | Rotate, delete, move, extract, merge; bookmarks/outline; metadata |
-| **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **PKCS#12 signing** (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **true redaction** (delete from stream, no opaque cover) |
-| **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images) |
+| **Pages** | Rotate, delete, move, extract, merge, resize, insert, copy; bookmarks/outline; metadata; embedded-file attachments |
+| **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **PKCS#12 signing** (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **true redaction** (delete from stream) + **`redactPii`** *(v0.52.4)* — irreversible redaction that also **erases image pixels** (safe on scans/OCR) under an opaque mark |
+| **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images); native image codecs — encode/decode PNG · JPEG · lossless WebP, decode GIF + **AVIF** (AV1 intra); alpha-correct resize |
 | **Text intelligence** | Font-aware extraction, **structured text** (reading-order lines + boxes), **full-text search** with highlight boxes |
-| **OCR** | Built-in recognizer — Otsu → connected components → line/word segmentation → MLP trained on **EMNIST handwriting + synthetic font glyphs** (Latin + accents). No Tesseract, no model download at runtime |
+| **OCR** | Built-in recognizer — Otsu → connected components → line/word segmentation → CNN trained on **EMNIST handwriting + synthetic font glyphs** (Latin + accents); opt-in line-level CRNN+CTC models per script (Latin/Cyrillic/Greek, Arabic/Hebrew, Devanagari, Bengali, Tamil). No Tesseract, no model download at runtime |
 | **Convert →** | PDF → **TXT, HTML, DOCX, PPTX, ODP, ODT, XLSX, ODS, RTF** (real editable elements, not a page image) |
 | **Convert ←** | **TXT, HTML, RTF, DOCX, ODT, ODP, PPTX, XLSX, ODS** → PDF (ODF `.odt`/`.ods`/`.odp` are fully bidirectional) |
-| **HTML rendering** | Native **HTML + CSS → PDF** engine (parser, selector cascade, block / inline / table / **flex** (direction · justify-content · grow) / **grid** layout, pagination, **`page-break-*` + `<pagebreak>`**) — no headless browser. Text set in **embedded Google fonts** (real glyphs + metrics, identical or nearest match) |
+| **Unified editable model** | Format-neutral document tree (sections → pages → blocks → runs): lower **any** format in (`toModel`/`officeToModel`/`htmlToModel`), edit with structured ops (`applyModelOps`), raise to **any** format (`modelTo{Docx,Xlsx,Pptx,Odt,Ods,Odp,Pdf,Html,Rtf}`) — edit every format the same way |
+| **HTML rendering** | Native **HTML + CSS → PDF** engine (parser, selector cascade, block / inline / table / **flex** (direction · justify-content · grow) / **grid** layout, pagination, **`page-break-*` + `<pagebreak>`**, running header/footer in the page margins) — no headless browser. Text set in **embedded Google fonts** (real glyphs + metrics, identical or nearest match) |
 | **JavaScript** | Built-in zero-dependency **JS engine** that runs a document's inline `<script>`s before layout — **no Chromium/Playwright**. Lexer → parser → tree-walking interpreter with **classes + `super`**, closures, destructuring, generators (`function*`/`yield`), **`async`/`await` + `Promise`** (microtask queue + `setTimeout`), and built-ins: `Object`/`Array`/`String`/`Number`/`Math`/`JSON`/`console`/`Map`/`Set`/**`RegExp`** + a backtracking regex engine. **DOM bindings**: `getElementById`, `querySelector(All)` (`#id`/`.class`/`tag`/`>`/`+`/`~`/`[attr]`), `textContent`, `innerHTML`, `createElement`/`appendChild`, `classList`, `style`, … |
 | **Archival** | **PDF/A-2b** metadata (XMP + sRGB OutputIntent + ID) |
 | **Fonts** | Draw **and edit** real text in **every font source & any font file** — built-in **base-14 standard fonts** (no embedding), any family / **Google Font** (1951-family catalog + URL builder + **TrueType *and* OpenType-CFF embedding**: glyf→Type0/CIDFontType2+FontFile2, `.otf`/`OTTO`→Type0/CIDFontType0+FontFile3, Identity-H + full widths + ToUnicode), and the **document's own embedded faces** (`embeddedFonts` + `extractFont` → re-embed). `addText` **and** font-aware `replaceText` resolve any face's char→glyph map (`FontFile2`/`FontFile3`); needed-font detection |
@@ -164,7 +166,7 @@ crates/wasm   gigapdf-wasm  — extern "C" WebAssembly bindings (zero-dep ABI)
 fixtures/     test PDFs
 test/         wasm-smoke.mjs — end-to-end Node harness
 tools/        catalog/ICC generators + snapshots
-docs/         API.md · SDK.md · USAGE.md · INSTALL.md · OCR_ARCHITECTURE.md · OCR_TRAINING_DATA.md · OCR_TRAINING_LOG.md
+docs/         SDK.md · COOKBOOK.md · USAGE.md · API.md · HTML-CSS.md · INSTALL.md · OCR_ARCHITECTURE.md · OCR_TRAINING_DATA.md · OCR_TRAINING_LOG.md
 ```
 
 ## Quickstart
@@ -197,7 +199,8 @@ ex.gp_close(handle);
 | Doc | What's in it |
 |-----|--------------|
 | [`docs/SDK.md`](docs/SDK.md) | **Complete TypeScript SDK reference** — every `GigaPdfEngine`/`GigaPdfDoc` method, grouped by domain, with parameters, returns and notes. |
-| [`docs/USAGE.md`](docs/USAGE.md) | Cookbook: the buffer ABI plus a worked example for every feature area. |
+| [`docs/COOKBOOK.md`](docs/COOKBOOK.md) | **Task-oriented recipes** — redaction, styled text, headers/footers, conversions, OCR, forms, annotations, signing, encryption, and the editable model, each as a short runnable snippet. |
+| [`docs/USAGE.md`](docs/USAGE.md) | Host integration: the raw `extern "C"` buffer ABI plus a worked example for every feature area. |
 | [`docs/API.md`](docs/API.md) | The Rust ↔ WASM ABI mapping (every `gp_*` export and its Rust method). |
 | [`docs/HTML-CSS.md`](docs/HTML-CSS.md) | The **exhaustive** list of supported HTML elements, CSS properties, units, colours, selectors and JS in the HTML→PDF renderer. |
 | [`docs/INSTALL.md`](docs/INSTALL.md) | Install, build-from-source, and Next.js (`output: "standalone"`) wiring. |
