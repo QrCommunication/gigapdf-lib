@@ -196,7 +196,14 @@ def system_fonts_for_group(group: str, limit: int = 60, min_cov: float = 0.8, se
 
     cps = _probe_cps(group)
     need = max(1, int(len(cps) * min_cov))
-    paths = sorted(glob.glob("/usr/share/fonts/**/*.ttf", recursive=True))
+    # Include .ttc/.otf too — Noto CJK ships as TrueType Collections (.ttc); without these
+    # the CJK group finds 0 system fonts. _font_cmap/TTFont below open them with fontNumber=0,
+    # and PIL renders .ttc via its default face index.
+    paths = sorted(
+        p
+        for ext in ("ttf", "ttc", "otf")
+        for p in glob.glob(f"/usr/share/fonts/**/*.{ext}", recursive=True)
+    )
     _r.Random(seed).shuffle(paths)
     out: list[str] = []
     for p in paths:
