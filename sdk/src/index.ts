@@ -1781,6 +1781,40 @@ export class GigaPdfDoc {
     return this.ex().gp_redact_region(this.h, page, x, y, w, h, RGB(coverRgb), hasCover ? 1 : 0);
   }
 
+  /**
+   * True **PII redaction** of one or more rectangles `(x, y, width, height)` in
+   * PDF points (origin bottom-left), in a single call. For every rect this:
+   *
+   * - **deletes** the overlapping text/vector elements from the content stream —
+   *   the glyphs and their `/ToUnicode` mapping are gone, so copy/paste and text
+   *   extraction reveal nothing in the area;
+   * - **overwrites the pixels** of any underlying image (a scan/photo) with opaque
+   *   black — only the intersecting sub-rectangle, so the rest of the page image
+   *   survives — and re-encodes the image, erasing the sensitive pixels from the
+   *   bytes (not merely covering them);
+   * - strips overlapping annotations and clears their form-field values;
+   * - paints an opaque **black** box over the rect as the visible redaction mark.
+   *
+   * The black cover is the default for PII (unlike {@link redact}). Pass
+   * `opts.coverRgb` to change the mark colour, or `opts.cover = false` to remove
+   * the content/pixels with no visible box. Returns the number of content
+   * elements deleted across all rects.
+   */
+  redactPii(
+    page: number,
+    rects: { x: number; y: number; width: number; height: number }[],
+    opts: { cover?: boolean; coverRgb?: number } = {}
+  ): number {
+    if (rects.length === 0) return 0;
+    const flat: number[] = [];
+    for (const r of rects) flat.push(r.x, r.y, r.width, r.height);
+    const cover = opts.cover ?? true;
+    const coverRgb = opts.coverRgb ?? 0x000000;
+    return this.g._withF64(flat, (p, c) =>
+      this.ex().gp_redact_pii(this.h, page, p, c, RGB(coverRgb), cover ? 1 : 0)
+    );
+  }
+
   // pages
   rotatePage(page: number, degrees: number): boolean {
     return this.ex().gp_rotate_page(this.h, page, degrees) === 0;

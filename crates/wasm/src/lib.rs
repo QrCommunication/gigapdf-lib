@@ -704,6 +704,43 @@ pub extern "C" fn gp_redact_region(
     }
 }
 
+/// True **PII redaction** of one or more regions on `page`. `rects_ptr`/`rects_len`
+/// is a flat `[x0,y0,w0,h0, x1,y1,w1,h1, …]` f64 array (page user space); for each
+/// region the overlapping text/vectors are deleted from the stream, the covered
+/// sub-rectangle of any underlying image XObject is overwritten with opaque black
+/// (and the image re-encoded), overlapping annotations + field values are stripped,
+/// and — when `has_cover != 0` — a `cover_rgb` (packed `0xRRGGBB`) box is painted
+/// as the visible mark. Returns the number of content elements removed, or a
+/// negative error code.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_redact_pii(
+    handle: *mut Document,
+    page: u32,
+    rects_ptr: *const f64,
+    rects_len: usize,
+    cover_rgb: u32,
+    has_cover: i32,
+) -> i32 {
+    let flat: &[f64] = if rects_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(rects_ptr, rects_len) }
+    };
+    let rects: Vec<(f64, f64, f64, f64)> = flat
+        .chunks_exact(4)
+        .map(|c| (c[0], c[1], c[2], c[3]))
+        .collect();
+    let cover = (has_cover != 0).then(|| unpack_rgb(cover_rgb));
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.redact_pii_with(page, &rects, cover) {
+            Ok(count) => count as i32,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
 /// Draw a rectangle. `stroke_rgb`/`fill_rgb` are packed `0xRRGGBB`; the `has_*`
 /// flags select which to apply. 0 on success.
 #[no_mangle]

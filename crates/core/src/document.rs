@@ -1811,6 +1811,311 @@ impl Document {
         Some(crate::raster::png::encode_png(width as u32, height as u32, &rgba))
     }
 
+    /// Every top-level placement matrix (unit square `[0,1]²` → page user space)
+    /// of image XObject `name` on `page_no`. Scans the page's own content stream
+    /// tracking the CTM through `q`/`Q`/`cm`, recording the CTM in effect at each
+    /// `<name> Do`. Images placed only inside a form XObject aren't reported (the
+    /// scan/OCR redaction case draws the image at the page level); callers treat
+    /// an empty result as "nothing to overwrite".
+    fn image_placements(&self, page_no: u32, name: &[u8]) -> Vec<content::PageMatrix> {
+        let Ok(content) = self.page_content(page_no) else {
+            return Vec::new();
+        };
+        let Ok(ops) = content::parse_content(&content) else {
+            return Vec::new();
+        };
+        let mut placements = Vec::new();
+        let mut ctm = content::PageMatrix::IDENTITY;
+        let mut stack: Vec<content::PageMatrix> = Vec::new();
+        for op in &ops {
+            match op.operator.as_slice() {
+                b"q" => stack.push(ctm),
+                b"Q" => {
+                    if let Some(m) = stack.pop() {
+                        ctm = m;
+                    }
+                }
+                b"cm" => {
+                    let n: Vec<f64> = op.operands.iter().filter_map(Object::as_f64).collect();
+                    if n.len() == 6 {
+                        ctm = content::PageMatrix::new(n[0], n[1], n[2], n[3], n[4], n[5]).then(&ctm);
+                    }
+                }
+                b"Do" => {
+                    if let Some(Object::Name(n)) = op.operands.first() {
+                        if n.as_slice() == name {
+                            placements.push(ctm);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        placements
+    }
+
+    /// Black out — in the **pixels** of image XObject `name` on `page_no` — every
+    /// texel whose placement lands inside any redaction `rects` (page user space,
+    /// `(x, y, w, h)`). The image is decoded to RGBA, the covered sub-rectangle is
+    /// overwritten with opaque black (alpha forced to 255 so a transparent texel
+    /// can't leak the original behind it), and the XObject stream is re-encoded in
+    /// place as a Flate DeviceRGB PNG-filtered image — so the sensitive content is
+    /// gone from the bytes, not merely hidden. Returns `true` when any pixel was
+    /// overwritten. A shared XObject is edited once (every placement is affected).
+    fn overwrite_image_pixels(&mut self, page_no: u32, name: &[u8], rects: &[content::Bounds]) -> bool {
+        // Quick reject: does this image's placement box meet any rect at all?
+        let placements = self.image_placements(page_no, name);
+        if placements.is_empty() || rects.is_empty() {
+            return false;
+        }
+        // Decode the image to RGBA via the existing extraction path.
+        let Some((format, data, pw, ph)) = self.image_xobject_bytes(page_no, name) else {
+            return false;
+        };
+        if pw == 0 || ph == 0 {
+            return false;
+        }
+        let mut rgba = match format.as_str() {
+            "png" => crate::raster::decode_png(&data).map(|d| (d.width, d.height, d.rgba)),
+            "jpeg" => crate::raster::jpeg::decode_jpeg(&data)
+                .map(|(w, h, rgb)| (w, h, rgb_to_rgba(&rgb))),
+            _ => None,
+        };
+        let Some((dw, dh, ref mut pixels)) = rgba.as_mut().map(|(w, h, p)| (*w, *h, p)) else {
+            return false;
+        };
+        if dw == 0 || dh == 0 || pixels.len() < (dw as usize) * (dh as usize) * 4 {
+            return false;
+        }
+
+        // For every texel, map its centre to page space through each placement and
+        // blacken it if it falls inside a redaction rect. (Row 0 is the top of the
+        // image, i.e. v = 1 — the same convention as the rasterizer's blit.)
+        let mut changed = false;
+        for row in 0..dh as usize {
+            let v = 1.0 - (row as f64 + 0.5) / dh as f64;
+            for col in 0..dw as usize {
+                let u = (col as f64 + 0.5) / dw as f64;
+                let mut hit = false;
+                'place: for m in &placements {
+                    let (px, py) = m.apply(u, v);
+                    for r in rects {
+                        if r.contains(px, py) {
+                            hit = true;
+                            break 'place;
+                        }
+                    }
+                }
+                if hit {
+                    let i = (row * dw as usize + col) * 4;
+                    pixels[i] = 0;
+                    pixels[i + 1] = 0;
+                    pixels[i + 2] = 0;
+                    pixels[i + 3] = 255;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return false;
+        }
+
+        // Re-encode the overwritten image and rewrite the XObject stream in place,
+        // keeping its placement (resource name + `cm`) untouched. Drop the original
+        // `/SMask`, `/Decode`, palette etc.: the re-encoded PNG-filtered DeviceRGB
+        // stream is self-describing and carries the (now-censored) pixels directly.
+        let png = crate::raster::png::encode_png(dw, dh, pixels);
+        let Some(prep) = content::image::prepare_image(&png) else {
+            return false;
+        };
+        let Some(id) = self.xobject_id(page_no, name) else {
+            return false;
+        };
+        let mut dict = Dictionary::new();
+        dict.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+        dict.set(b"Subtype".to_vec(), Object::Name(b"Image".to_vec()));
+        dict.set(b"Width".to_vec(), Object::Integer(prep.width as i64));
+        dict.set(b"Height".to_vec(), Object::Integer(prep.height as i64));
+        dict.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec()));
+        dict.set(b"BitsPerComponent".to_vec(), Object::Integer(8));
+        dict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+        dict.set(b"Length".to_vec(), Object::Integer(prep.data.len() as i64));
+        self.objects.insert(id, Object::Stream(Stream::new(dict, prep.data)));
+        true
+    }
+
+    /// The object id backing image/form XObject `name` in `page_no`'s
+    /// `/Resources /XObject`, when it is an indirect reference (the normal case).
+    fn xobject_id(&self, page_no: u32, name: &[u8]) -> Option<ObjectId> {
+        let page = self.page_dict(page_no).ok()?;
+        page.get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|res| res.get(b"XObject"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|xo| xo.get(name))
+            .and_then(Object::as_reference)
+    }
+
+    /// Strip every annotation (and form-field widget) whose `/Rect` overlaps any
+    /// redaction `rects` from `page_no`'s `/Annots`, and clear the field value of
+    /// any text/choice widget removed — so a redacted form value isn't recoverable
+    /// from the AcroForm. Returns the number of annotation refs removed.
+    fn strip_annotations_in(&mut self, page_no: u32, rects: &[content::Bounds]) -> usize {
+        let Ok(page_id) = self.page_object_id(page_no) else {
+            return 0;
+        };
+        let Some(page) = self.objects.get(&page_id).and_then(Object::as_dict).cloned() else {
+            return 0;
+        };
+        let items: Vec<Object> = match page.get(b"Annots") {
+            Some(o) => match self.resolve(o).as_array() {
+                Some(a) => a.to_vec(),
+                None => return 0,
+            },
+            None => return 0,
+        };
+        let mut kept: Vec<Object> = Vec::with_capacity(items.len());
+        let mut removed = 0usize;
+        for item in items {
+            let overlaps = self
+                .resolve(&item)
+                .as_dict()
+                .map(|d| {
+                    let r = self.normalized_rect(self.read_rect(d));
+                    let b = content::Bounds {
+                        x: r[0],
+                        y: r[1],
+                        width: (r[2] - r[0]).max(0.0),
+                        height: (r[3] - r[1]).max(0.0),
+                    };
+                    rects.iter().any(|rect| rect.intersects(&b))
+                })
+                .unwrap_or(false);
+            if overlaps {
+                // Clear the field value so the censored data can't be read back
+                // from the widget/AcroForm, then drop the annotation entirely.
+                if let Some(id) = item.as_reference() {
+                    if let Some(mut d) = self.objects.get(&id).and_then(Object::as_dict).cloned() {
+                        d.remove(b"V");
+                        d.remove(b"AP");
+                        d.remove(b"DV");
+                        self.objects.insert(id, Object::Dictionary(d));
+                    }
+                }
+                removed += 1;
+            } else {
+                kept.push(item);
+            }
+        }
+        if removed == 0 {
+            return 0;
+        }
+        let mut page = page;
+        if kept.is_empty() {
+            page.remove(b"Annots");
+        } else {
+            page.set(b"Annots".to_vec(), Object::Array(kept));
+        }
+        self.objects.insert(page_id, Object::Dictionary(page));
+        removed
+    }
+
+    /// True **PII redaction** of one or more rectangular regions (page user space,
+    /// `(x, y, width, height)`). For every region this:
+    ///
+    /// 1. **deletes** the text/vector elements overlapping it from the content
+    ///    stream — the glyphs (and the `/ToUnicode` mapping that would decode them)
+    ///    are gone, so copy/paste and extraction reveal nothing;
+    /// 2. **overwrites the pixels** of any image XObject under the region with
+    ///    opaque black — only the intersecting sub-rectangle, so the rest of a
+    ///    scanned page survives — and re-encodes the image, so the sensitive pixels
+    ///    are erased from the bytes (the gap [`redact_region`](Self::redact_region)
+    ///    leaves: it can only drop whole image elements);
+    /// 3. strips annotations and form-field values inside the region;
+    /// 4. paints an opaque black box over the region as the visible redaction mark.
+    ///
+    /// The black cover is the default for PII (unlike [`redact_region`](Self::redact_region),
+    /// where a cover is optional) — pass `cover` to override the colour, or `None`
+    /// to skip the visible mark (the content is still physically removed). Returns
+    /// the number of content elements deleted across all regions.
+    pub fn redact_pii(&mut self, page_no: u32, rects: &[(f64, f64, f64, f64)]) -> Result<usize> {
+        self.redact_pii_with(page_no, rects, Some([0.0, 0.0, 0.0]))
+    }
+
+    /// [`redact_pii`](Self::redact_pii) with an explicit cover colour: `Some(rgb)`
+    /// paints that colour over each region (default black for PII), `None` removes
+    /// the content and image pixels without drawing a visible mark.
+    pub fn redact_pii_with(
+        &mut self,
+        page_no: u32,
+        rects: &[(f64, f64, f64, f64)],
+        cover: Option<[f64; 3]>,
+    ) -> Result<usize> {
+        if rects.is_empty() {
+            return Ok(0);
+        }
+        let regions: Vec<content::Bounds> = rects
+            .iter()
+            .map(|&(x, y, width, height)| content::Bounds {
+                x,
+                y,
+                width,
+                height,
+            })
+            .collect();
+
+        // 1. Overwrite image pixels FIRST — while the placements are still in the
+        //    content stream (deleting elements next would drop the `Do`s). Collect
+        //    the distinct image XObject names whose placement box meets a region.
+        let mut image_names: Vec<Vec<u8>> = Vec::new();
+        for e in self.page_elements(page_no)? {
+            if e.kind != content::ElementKind::Image {
+                continue;
+            }
+            if !e.bounds.is_some_and(|b| regions.iter().any(|r| r.intersects(&b))) {
+                continue;
+            }
+            let name = e.label.into_bytes();
+            if !image_names.contains(&name) {
+                image_names.push(name);
+            }
+        }
+        for name in &image_names {
+            self.overwrite_image_pixels(page_no, name, &regions);
+        }
+
+        // 2. Delete every text/vector element overlapping any region (highest index
+        //    first so the remaining target indices stay valid). Image elements are
+        //    NOT deleted here — their sensitive pixels were already overwritten in
+        //    place (step 1); deleting the element would wipe the whole scan.
+        let mut hits: Vec<usize> = self
+            .page_elements(page_no)?
+            .into_iter()
+            .filter(|e| e.kind != content::ElementKind::Image)
+            .filter(|e| e.bounds.is_some_and(|b| regions.iter().any(|r| r.intersects(&b))))
+            .map(|e| e.index)
+            .collect();
+        hits.sort_unstable_by(|a, b| b.cmp(a));
+        for index in &hits {
+            self.remove_element(page_no, *index)?;
+        }
+
+        // 3. Strip overlapping annotations + clear their field values.
+        for region in &regions {
+            self.strip_annotations_in(page_no, std::slice::from_ref(region));
+        }
+
+        // 4. Visible black cover (default for PII).
+        if let Some(color) = cover {
+            for &(x, y, width, height) in rects {
+                self.add_rectangle(page_no, x, y, width, height, None, Some(color), 0.0, 1.0)?;
+            }
+        }
+        Ok(hits.len())
+    }
+
     /// Redact a rectangular region (page user space): permanently **remove**
     /// every content element overlapping it from the content stream. Returns how
     /// many elements were removed.
@@ -10448,6 +10753,15 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Expand a packed RGB buffer (3 bytes/pixel) to opaque RGBA (4 bytes/pixel).
+fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
+    for px in rgb.chunks_exact(3) {
+        out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+    }
+    out
+}
+
 /// Scan a whole PDF for `n g obj` definitions and `trailer` dictionaries.
 fn scan(data: &[u8]) -> (BTreeMap<ObjectId, Object>, Dictionary) {
     let mut objects = BTreeMap::new();
@@ -11367,6 +11681,145 @@ mod tests {
         let reopened = Document::open(&doc.save()).unwrap();
         let after = reopened.page_text_runs(1).unwrap().len();
         assert!(after < before, "text runs removed ({before} → {after})");
+    }
+
+    /// Build a one-page PDF (`100×100` pt) whose only content is a `100×100`
+    /// DeviceRGB image placed to fill the page (`cm 100 0 0 100 0 0`); every pixel
+    /// is `fill`. Used by the PII image-pixel-overwrite tests.
+    fn single_image_page(fill: [u8; 3]) -> Vec<u8> {
+        let (w, h) = (100usize, 100usize);
+        let mut samples = Vec::with_capacity(w * h * 3);
+        for _ in 0..w * h {
+            samples.extend_from_slice(&fill);
+        }
+        let mut body = format!(
+            "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+            samples.len()
+        )
+        .into_bytes();
+        body.extend_from_slice(&samples);
+        body.extend_from_slice(b"\nendstream");
+        let draw = b"q 100 0 0 100 0 0 cm /Im0 Do Q".to_vec();
+        let mut content = format!("<< /Length {} >>\nstream\n", draw.len()).into_bytes();
+        content.extend_from_slice(&draw);
+        content.extend_from_slice(b"\nendstream");
+        let objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                  /Resources << /XObject << /Im0 6 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, content),
+            (6, body),
+        ];
+        raw_pdf_binary(&objects)
+    }
+
+    #[test]
+    fn redact_pii_blacks_out_only_the_image_subrect() {
+        // A scanned-page case: the whole page is one image. Redact the TOP band
+        // (page y ∈ [60,100], full width). Afterwards the image's top rows must be
+        // black and its bottom rows untouched — the sensitive sub-rectangle is
+        // erased from the pixels while the rest of the scan survives.
+        let mut doc = Document::open(&single_image_page([200, 30, 30])).unwrap(); // red fill
+        let removed = doc
+            .redact_pii(1, &[(0.0, 60.0, 100.0, 40.0)])
+            .unwrap();
+        assert_eq!(removed, 0, "no text/vector elements — only image pixels change");
+
+        // Pull the (re-encoded) image back out and decode it.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let images = reopened.page_image_elements(1);
+        assert_eq!(images.len(), 1, "still exactly one image element");
+        let img = &images[0];
+        assert_eq!(img.format, "png", "overwritten image re-encoded as PNG");
+        let decoded = crate::raster::decode_png(&img.data).expect("decodes");
+        let (dw, dh) = (decoded.width as usize, decoded.height as usize);
+        assert_eq!((dw, dh), (100, 100), "dimensions preserved");
+        let texel = |row: usize, col: usize| -> [u8; 4] {
+            let i = (row * dw + col) * 4;
+            [
+                decoded.rgba[i],
+                decoded.rgba[i + 1],
+                decoded.rgba[i + 2],
+                decoded.rgba[i + 3],
+            ]
+        };
+        // Image row 0 = top of the page (high y). The redacted top band → black.
+        let top = texel(5, 50);
+        assert_eq!(
+            [top[0], top[1], top[2]],
+            [0, 0, 0],
+            "redacted top band pixel must be black, got {top:?}"
+        );
+        assert_eq!(top[3], 255, "blacked pixel is opaque (no leak behind it)");
+        // The bottom of the page (low y, outside the rect) keeps the original red.
+        let bottom = texel(95, 50);
+        assert!(
+            bottom[0] > 150 && bottom[1] < 80 && bottom[2] < 80,
+            "untouched bottom pixel must keep original red, got {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn redact_pii_removes_text_and_paints_black_cover() {
+        // Text-bearing page: redact the whole page. The text is physically removed
+        // from the stream (uncopyable) AND an opaque black box is painted as the
+        // visible mark (the PII default — no cover argument needed).
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let before = doc.page_text_runs(1).unwrap().len();
+        assert!(before > 0, "fixture has text");
+        let (pw, ph, _) = doc.page_info(1).unwrap();
+
+        let removed = doc.redact_pii(1, &[(0.0, 0.0, pw, ph)]).unwrap();
+        assert!(removed > 0, "text elements were deleted");
+
+        let reopened = Document::open(&doc.save()).unwrap();
+
+        // 1. Copy/paste & extraction reveal nothing in the zone: the runs are gone
+        //    from the stream, not merely hidden under the cover.
+        let runs = reopened.page_text_runs(1).unwrap();
+        assert!(
+            runs.is_empty(),
+            "no recoverable text in the redacted zone (got {} runs)",
+            runs.len()
+        );
+        assert!(
+            reopened.page_text_elements(1).is_empty(),
+            "structured extraction also reveals nothing in the zone"
+        );
+
+        // 2. A visible opaque black box covers the zone (rasterize and sample the
+        //    centre — it must be black, not the white paper).
+        let canvas = reopened.render_page_canvas(1, 1.0).unwrap();
+        let mid = px(&canvas, canvas.width / 2, canvas.height / 2);
+        assert_eq!(mid, [0, 0, 0], "centre of the page is the black redaction cover, got {mid:?}");
+    }
+
+    #[test]
+    fn redact_pii_multiple_rects_in_one_call() {
+        // Two disjoint bands on the single-image page redacted in ONE call: both
+        // are blacked out, the gap between them is untouched.
+        let mut doc = Document::open(&single_image_page([40, 60, 220])).unwrap(); // blue fill
+        doc.redact_pii(1, &[(0.0, 80.0, 100.0, 20.0), (0.0, 0.0, 100.0, 20.0)])
+            .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let img = &reopened.page_image_elements(1)[0];
+        let decoded = crate::raster::decode_png(&img.data).expect("decodes");
+        let dw = decoded.width as usize;
+        let rgb = |row: usize, col: usize| -> [u8; 3] {
+            let i = (row * dw + col) * 4;
+            [decoded.rgba[i], decoded.rgba[i + 1], decoded.rgba[i + 2]]
+        };
+        assert_eq!(rgb(5, 50), [0, 0, 0], "top band redacted");
+        assert_eq!(rgb(95, 50), [0, 0, 0], "bottom band redacted");
+        // Middle row (page y ≈ 50, outside both bands) keeps original blue.
+        let mid = rgb(50, 50);
+        assert!(mid[2] > 150 && mid[0] < 90, "middle band untouched, got {mid:?}");
     }
 
     #[test]
