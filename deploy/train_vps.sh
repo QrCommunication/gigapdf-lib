@@ -20,6 +20,7 @@ EPOCHS="${EPOCHS:-50}"   # 50 over ~148k samples ≈ 3× the local 60-epoch expo
 SESSION="${SESSION:-megatrain${GIGA_OCR_VARIANT:+_${GIGA_OCR_VARIANT}}}"
 LOG="$HOME/$SESSION.log"
 NPROC="$(nproc)"
+THREADS="${GIGA_OCR_THREADS:-$NPROC}"   # cap for concurrent runs (e.g. CJK alongside another train)
 
 # ── "mega" config — scaled for 48 vCPU / 192 GB (override via env) ──────────────────
 export GIGA_OCR_C1="${GIGA_OCR_C1:-32}"          # larger backbone than the 24/48/96 local run
@@ -38,7 +39,7 @@ export GIGA_OCR_BATCH="${GIGA_OCR_BATCH:-256}"     # length-bucketed → large b
 # Real CJK charset (~2.4k classes) built by tools/ocr/build_cjk_charset.py; only used by the
 # cjk group (scripts.py reads GIGA_OCR_CHARSET_<GROUP>). Harmless for other groups.
 export GIGA_OCR_CHARSET_CJK="${GIGA_OCR_CHARSET_CJK:-$REPO_DIR/tools/ocr/cjk_charset.txt}"
-export OMP_NUM_THREADS="$NPROC" MKL_NUM_THREADS="$NPROC"   # PyTorch CPU intra-op = all cores
+export OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS"   # PyTorch CPU intra-op (GIGA_OCR_THREADS to cap)
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
@@ -112,7 +113,7 @@ export GIGA_OCR_HW_REAL="$GIGA_OCR_HW_REAL" GIGA_OCR_HW_REAL_N=$GIGA_OCR_HW_REAL
 export GIGA_OCR_LANGS="$GIGA_OCR_LANGS"
 export GIGA_OCR_DEGRADE=$GIGA_OCR_DEGRADE GIGA_OCR_VARIANT="$GIGA_OCR_VARIANT" GIGA_OCR_BATCH=$GIGA_OCR_BATCH
 export GIGA_OCR_CHARSET_CJK="$GIGA_OCR_CHARSET_CJK"
-export OMP_NUM_THREADS=$NPROC MKL_NUM_THREADS=$NPROC
+export OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS
 cd "$REPO_DIR"
 echo "=== $SESSION start \$(date -u) — backbone $GIGA_OCR_C1/$GIGA_OCR_C2/$GIGA_OCR_HID, $EPOCHS epochs, $NPROC threads, degrade=$GIGA_OCR_DEGRADE variant='$GIGA_OCR_VARIANT' ==="
 exec "$VENV/bin/python" tools/train_ocr_crnn.py "$GROUP" "$EPOCHS"
