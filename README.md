@@ -145,12 +145,12 @@ to the mono-glyph classifier otherwise.
   **beats Tesseract** (0.078 vs 0.089); **Bengali** (`beng`) — competitive (0.104 vs 0.073),
   larger-backbone retrain pending. Backbone is env-tunable (`GIGA_OCR_C1/C2/HID`); PIL **raqm**
   shaping handles Indic/Arabic forms.
-- **Handwriting:** a handwriting-augmented variant **`ocr_alpha_hw.gpocr`** (synthetic
-  *Handwriting* fonts + real IAM/RIMES lines via the HF datasets-server, 24/48/96 backbone)
-  roughly **halves cursive CER** vs the print model (0.44 vs 0.84 on IAM test) while still
-  beating Tesseract on clean print; the printed champion stays primary for clean scans. Load
-  the variant via `gp_ocr_load_model` for handwriting-heavy input — see
-  [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
+- **Handwriting:** a handwriting variant **`ocr_alpha_hw.gpocr`** (32/64/128 backbone, trained
+  on ~108k real handwriting lines — IAM/RIMES/NorHand/NewsEye/Belfort/POPP/Esposalles/Cyrillic
+  via the HF datasets-server — plus synthetic *Handwriting* fonts) **beats Tesseract on real
+  cursive: CER 0.309 vs 0.353** (WER 0.737 vs 0.775) on the IAM test set. The printed champion
+  stays primary for clean scans; load the HW variant via `gp_ocr_load_model` for
+  handwriting-heavy input — see [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
 - **Deliberately out of scope:** `cjk` (Chinese/Japanese/Korean) — **not trained by design**.
   A usable model needs the full frequency charset, many CJK fonts, and a much larger backbone
   for 3 000+ classes (a 152-char proof would be a toy); the infra is in place if revisited.

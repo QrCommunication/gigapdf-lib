@@ -124,15 +124,17 @@ were retrained at the **larger 24/48/96 backbone**:
 | Model | Clean-print CER | Real-handwriting CER (IAM test, n=80) |
 |-------|-----------------|----------------------------------------|
 | `ocr_alpha.gpocr` (printed champion, 24/48/96) | **0.119** (beats Tesseract 0.258) | 0.839 |
-| `ocr_alpha_hw.gpocr` (handwriting-augmented, 24/48/96) | 0.187 | **0.440** |
+| `ocr_alpha_hw.gpocr` (handwriting, **32/64/128, ~108k real lines**) | — | **0.309** (beats Tesseract 0.353; WER 0.737 vs 0.775) |
 | Tesseract 5.3.4 | 0.258 | 0.353 |
 
-The handwriting mix roughly **halves** handwriting CER (0.839 → 0.440, **−48 %**) while still
-beating Tesseract on clean print (0.187 vs 0.258); the printed champion stays the clean-print
-leader (0.119). The larger backbone improved **both** axes over the original 16/32/64 variant
-(clean 0.282→0.187, cursive 0.499→0.440). gigapdf's handwriting model still trails Tesseract
-on cursive (0.440 vs 0.353): closing that needs **more real handwriting data** — an **HF
-token** unlocks the gated IAM-full / CASIA / KHATT / IIIT-HW corpora (`hw_datasets._hf_token`).
+The decisive lever was **real handwriting data**: scaling from 3 800 → **~108k real lines**
+(IAM/RIMES/NorHand/NewsEye/Belfort/POPP/Esposalles/Cyrillic — full pagination unlocked by an
+**HF token**) at a larger **32/64/128** backbone took cursive CER **0.499 → 0.440 → 0.309 —
+now BEATING Tesseract (0.353)** on the IAM test set for the first time (WER 0.737 vs 0.775).
+The 50-epoch run on a 48-vCPU VPS was made tractable (**~9 h, not ~5 days**) by **length-bucketed
+batching** (`train_ocr_crnn.py`: sort strips by width so each batch pads near-uniformly — a
+~9× epoch speedup on wide HW lines). The printed champion stays the clean-print leader (0.119);
+the HW variant is host-loaded for handwriting-heavy input.
 Knobs: train with `GIGA_OCR_HW_FRAC` + `GIGA_OCR_HW_REAL="iam,rimes,…"`; eval with
 `tools/ocr/bench_hw.py`. Bake a chosen variant into its Cargo feature with
 `tools/ocr/gpocr_to_rs.py`.
