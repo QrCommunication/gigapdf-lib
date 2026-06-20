@@ -173,11 +173,18 @@ real-world input fails on three axes: **geometry** (perspective, curl, crumple),
 (shadows, glare, blur, noise, JPEG, low-res), and **domain gap** (the model has only seen clean
 synthetic). Plan, by ROI — all staying pure-`std` (no ML dewarp net):
 
-1. **Front-end restoration in `ocr.rs` (no retrain) — planned.** Illumination normalization
-   (estimate background → flatten shadows/glare), **perspective dewarp** (document quadrilateral
-   → homography) + **per-line baseline dewarp** for curled receipts, feed the CRNN a **grayscale**
-   strip (skip hard binarization, which destroys info on degraded scans), denoise + local
-   contrast (CLAHE) + light super-resolution for small receipt text.
+1. **Front-end restoration in `ocr.rs` (no retrain) — illumination done; dewarp planned.**
+   **Illumination normalization is implemented**: `normalize_illumination` flat-fields the page
+   (divide by a large-window local-mean background → shadows/glare/paper-gradients flatten to a
+   uniform bright background, text contrast preserved; O(1)/px via an integral image), gated by
+   `illumination_is_uneven` (4×4 brightness-spread test) so clean scans/print are byte-for-byte
+   unchanged. It runs at the top of `ocr()`, feeding the **grayscale** strip extractor
+   (`extract_line_strips` already samples grayscale, not a hard binarization). **Still planned:**
+   **perspective dewarp** (document quadrilateral → homography) + **per-line baseline dewarp** for
+   curled receipts, denoise + local contrast (CLAHE) + light super-resolution for small receipt
+   text. (Unit-tested in `ocr.rs`; an end-to-end CER gain on degraded full-page fixtures is the
+   next validation — pairs with the photo variant below: augmentation hardens the model, the
+   front-end fixes the input.)
 2. **Photo/degraded model variant — tooling built.** A heavy "in-the-wild" domain-randomization
    augmentation (curl wave, shear, uneven illumination, background haze, blur, low-res, JPEG,
    noise, contrast jitter) lives in `render_lines.py::_degrade`, gated by `GIGA_OCR_DEGRADE=1`.

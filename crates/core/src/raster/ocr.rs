@@ -247,6 +247,73 @@ pub(crate) fn sauvola_ink(gray: &[u8], w: usize, h: usize, radius: usize, k: f64
     ink
 }
 
+/// Coarse test for uneven illumination: the spread of mean brightness across a 4×4
+/// grid of cells. A large spread ⇒ shadows / glare / paper gradient (photographed or
+/// poorly-scanned pages) ⇒ worth flat-fielding; a small spread ⇒ already uniform
+/// (clean scan/print) ⇒ skip, so the easy case is never perturbed.
+pub(crate) fn illumination_is_uneven(gray: &[u8], w: usize, h: usize) -> bool {
+    let (gx, gy) = (4usize, 4usize);
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    for cy in 0..gy {
+        for cx in 0..gx {
+            let (x0, y0) = (cx * w / gx, cy * h / gy);
+            let (x1, y1) = (((cx + 1) * w / gx).min(w), ((cy + 1) * h / gy).min(h));
+            let (mut sum, mut n) = (0u64, 0u64);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    sum += gray[y * w + x] as u64;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            let mean = (sum / n) as u32;
+            lo = lo.min(mean);
+            hi = hi.max(mean);
+        }
+    }
+    hi.saturating_sub(lo) > 35
+}
+
+/// Flat-field illumination correction: divide each pixel by its **local background**
+/// (a large-window mean — the slowly-varying illumination field, since sparse text
+/// averages out) and rescale to 8-bit, so shadows / glare / paper-gradients flatten to
+/// a uniform bright background while local text contrast is preserved. O(1) per pixel
+/// via an integral image (same trick as [`sauvola_ink`]). Near-identity on uniform
+/// pages (bg/bg ≈ 1), so it only meaningfully changes unevenly-lit input — run it
+/// behind [`illumination_is_uneven`] to stay byte-for-byte on clean scans.
+pub(crate) fn normalize_illumination(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let radius = (w.min(h) / 10).clamp(12, 64);
+    let iw = w + 1;
+    let mut isum = vec![0u64; iw * (h + 1)];
+    for y in 0..h {
+        let mut row = 0u64;
+        for x in 0..w {
+            row += gray[y * w + x] as u64;
+            isum[(y + 1) * iw + (x + 1)] = isum[y * iw + (x + 1)] + row;
+        }
+    }
+    let r = radius as i64;
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let x0 = (x as i64 - r).max(0) as usize;
+            let y0 = (y as i64 - r).max(0) as usize;
+            let x1 = ((x as i64 + r) as usize).min(w - 1);
+            let y1 = ((y as i64 + r) as usize).min(h - 1);
+            let area = ((x1 - x0 + 1) * (y1 - y0 + 1)) as u64;
+            let s = isum[(y1 + 1) * iw + (x1 + 1)] + isum[y0 * iw + x0]
+                - isum[y0 * iw + (x1 + 1)]
+                - isum[(y1 + 1) * iw + x0];
+            let bg = (s / area).max(1) as f32; // local paper / illumination level
+            let v = gray[y * w + x] as f32 / bg * 255.0; // flat-field: local-white → 255
+            out[y * w + x] = v.min(255.0) as u8;
+        }
+    }
+    out
+}
+
 pub(crate) struct Blob {
     pub(crate) x0: usize,
     pub(crate) y0: usize,
@@ -338,6 +405,18 @@ pub fn ocr(gray: &[u8], w: usize, h: usize) -> OcrResult {
     if w == 0 || h == 0 || gray.len() < w * h {
         return OcrResult::default();
     }
+    // Front-end restoration: on unevenly-lit pages (phone photos, creased paper, poor
+    // scans) flatten the illumination first, so the CRNN line strips (which sample raw
+    // grayscale) and the mono-glyph binarization both see a uniform bright page instead
+    // of shadows/glare. Gated by `illumination_is_uneven` → byte-for-byte unchanged on
+    // clean scans and print, so it can only help the hard case.
+    let restored;
+    let gray: &[u8] = if illumination_is_uneven(gray, w, h) {
+        restored = normalize_illumination(gray, w, h);
+        &restored
+    } else {
+        gray
+    };
     // Line-level CRNN first when a per-script model is embedded (ocr-* features);
     // with none embedded this returns empty and we use the mono-glyph pipeline below.
     let crnn = super::ocr_crnn::recognize_enabled(gray, w, h);
@@ -497,6 +576,43 @@ mod tests {
         assert!(!ink[12 * w + plain], "Sauvola leaves the dark-background pixel as bg");
         // The global Otsu threshold misclassifies that same background pixel as ink.
         assert!(gray[12 * w + plain] < otsu_threshold(&gray), "global Otsu over-inks the dark bg");
+    }
+
+    #[test]
+    fn illumination_normalization_flattens_gradient_preserving_text() {
+        // Strong top→bottom illumination gradient (bright 240 → dark ~90) over uniform
+        // paper, plus one locally-dark "text" pixel. Flat-fielding must equalize paper
+        // across the gradient (shadows removed) while keeping the text clearly darker
+        // than its surrounding paper — exactly what rescues a phone-photo of a page.
+        let (w, h) = (60usize, 60usize);
+        let mut gray = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                gray[y * w + x] = (240 - y as i32 * 150 / (h as i32 - 1)).clamp(0, 255) as u8;
+            }
+        }
+        let (tx, ty) = (30usize, 45usize);
+        gray[ty * w + tx] = gray[ty * w + tx].saturating_sub(70); // local-dark "text"
+
+        assert!(illumination_is_uneven(&gray, w, h), "the gradient must register as uneven");
+        let out = normalize_illumination(&gray, w, h);
+        // Paper at the bright top and dark bottom flattens to near-equal bright values.
+        let (top, bot) = (out[5 * w + 30] as i32, out[55 * w + 30] as i32);
+        assert!((top - bot).abs() < 25, "flat-field equalizes paper across the gradient (top={top} bot={bot})");
+        assert!(top > 200 && bot > 200, "paper flattens toward white (top={top} bot={bot})");
+        // The text pixel stays markedly darker than the surrounding flattened paper.
+        let text = out[ty * w + tx] as i32;
+        assert!(text < bot - 40, "text contrast preserved (text={text} paper≈{bot})");
+    }
+
+    #[test]
+    fn illumination_normalization_skipped_on_uniform_page() {
+        // A clean uniform page is NOT flagged uneven → the front-end is a no-op (no
+        // train/inference skew introduced on the easy case).
+        let (w, h) = (40usize, 40usize);
+        let mut gray = vec![245u8; w * h];
+        gray[20 * w + 20] = 40; // a glyph pixel
+        assert!(!illumination_is_uneven(&gray, w, h), "uniform page must not be flagged uneven");
     }
 
     #[test]
