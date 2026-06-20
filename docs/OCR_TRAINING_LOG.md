@@ -139,6 +139,25 @@ Knobs: train with `GIGA_OCR_HW_FRAC` + `GIGA_OCR_HW_REAL="iam,rimes,…"`; eval 
 `tools/ocr/bench_hw.py`. Bake a chosen variant into its Cargo feature with
 `tools/ocr/gpocr_to_rs.py`.
 
+### Photo / degraded variant `ocr_alpha_photo.gpocr` (heavy degradation aug)
+
+Trained on the same ~108k-real-line alpha corpus with `GIGA_OCR_DEGRADE=1` (curl, shear,
+illumination, blur, low-res, JPEG, noise — `render_lines._degrade`). Benchmarked with
+`bench_hw.py … --degrade` (degradations applied to the IAM test set):
+
+| IAM test (n=80) | Clean CER | Degraded CER |
+|-----------------|-----------|--------------|
+| `ocr_alpha_hw.gpocr` (handwriting) | **0.309** | 0.861 |
+| `ocr_alpha_photo.gpocr` (degradation-aug) | 0.333 | **0.769** |
+| Tesseract 5.3.4 | 0.353 | **0.653** |
+
+The degradation aug **beats the plain HW model on degraded input** (0.769 vs 0.861, −11 %) at a
+small clean-cursive cost (0.333 vs 0.309) — and still **beats Tesseract on clean** cursive. On
+**heavily** degraded input Tesseract still leads (0.653): closing that needs the **front-end
+restoration** (illumination normalize + perspective/per-line dewarp + grayscale strips) planned
+in [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) §6 — augmentation hardens the model, the
+front-end fixes the input. Host-load the photo variant for photographed/crumpled documents.
+
 ## Reproduce
 
 ```bash

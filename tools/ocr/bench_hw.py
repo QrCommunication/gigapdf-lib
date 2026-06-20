@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import eval as ev  # noqa: E402
 import hw_datasets  # noqa: E402
+import render_lines as rl  # noqa: E402  (for --degrade: apply the photo-degradation pipeline)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GIGA_BIN = os.path.join(ROOT, "target", "release", "examples", "ocr_image")
@@ -53,6 +55,7 @@ def main(argv: list[str]) -> int:
     split = opt.get("split", "test")
     models = [m for m in opt.get("models", "models/ocr_alpha.gpocr").split(",") if m]
     tess = opt.get("tesseract")
+    degrade = any(a == "--degrade" for a in argv[1:])  # simulate photo/crumpled input on the test set
     if not os.path.exists(GIGA_BIN):
         sys.exit("build first: cargo build --release -p gigapdf-core --example ocr_image")
 
@@ -62,11 +65,13 @@ def main(argv: list[str]) -> int:
 
     with tempfile.TemporaryDirectory() as td:
         pngs = []
+        drng = random.Random(7)
         for i, (strip, _) in enumerate(pairs):
             p = os.path.join(td, f"{i:04d}.png")
-            _strip_to_png(strip, p)
+            _strip_to_png(rl._degrade(strip, drng) if degrade else strip, p)
             pngs.append(p)
-        print("\n=== CER / WER on real handwriting — lower is better ===")
+        tag = " (DEGRADED test input)" if degrade else ""
+        print(f"\n=== CER / WER on real handwriting{tag} — lower is better ===")
         for model in models:
             cers, wers = [], []
             for p, r in zip(pngs, refs):
