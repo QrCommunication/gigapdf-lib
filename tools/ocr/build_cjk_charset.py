@@ -113,10 +113,16 @@ def build(n_samples: int, top_k: int, out: str) -> int:
         if offset % 2000 == 0:
             print(f"  sampled {seen} transcriptions, {len(freq)} distinct chars", flush=True)
 
-    # keep the top-K CJK chars by frequency + the ASCII letters/digits/punct that co-occur
+    # keep the top-K CJK chars by frequency, + the FULL printable ASCII (digits, Latin,
+    # punctuation). Real CJK documents mix in alphanumerics (prices, dates, codes, URLs)
+    # even when a synthetic corpus is pure-script — so bake the ASCII classes in regardless
+    # of co-occurrence. NOTE: the model must also SEE these glyphs during training, so render
+    # some Latin synthetic lines too (e.g. GIGA_OCR_LANGS includes 'eng'); classes without
+    # training signal stay dead.
     cjk = [c for c, _ in freq.most_common() if _is_cjk(c)][:top_k]
-    ascii_punct = sorted({c for c in freq if 0x20 <= ord(c) < 0x7F})
-    charset = "".join(dict.fromkeys(cjk + ascii_punct))  # de-dup, preserve order
+    ascii_full = [chr(c) for c in range(0x21, 0x7F)]  # '!'..'~' (printable, space added by scripts.py)
+    co_occur = sorted({c for c in freq if 0x20 <= ord(c) < 0x7F})  # anything else seen (full-width etc.)
+    charset = "".join(dict.fromkeys(cjk + ascii_full + co_occur))  # de-dup, preserve order
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(charset)
