@@ -389,12 +389,72 @@ fn extract_line_strips(gray: &[u8], w: usize, h: usize) -> Vec<LineStrip> {
         None => ink0,
     };
     despeckle(&mut ink, w, h, 3);
-    // Ink pixels per row → text-line bands.
+    // Dense layouts: split the page into columns on **wide vertical gutters**, then extract
+    // text-line bands within each column (reading order: columns left→right, lines top→bottom).
+    // A single-column page yields one full-width band, so clean pages are unchanged.
+    for (cx0, cx1) in column_bands(&ink, w, h) {
+        extract_lines_in_column(gview, &ink, w, h, cx0, cx1, &mut out);
+    }
+    out
+}
+
+/// Split a page into column x-ranges by vertical ink projection: columns of ink separated by
+/// **wide** whitespace gutters (much wider than inter-word gaps). Returns the full width when no
+/// clear multi-column structure is found, so single-column pages are processed exactly as before.
+fn column_bands(ink: &[bool], w: usize, h: usize) -> Vec<(usize, usize)> {
+    if w < 40 {
+        return vec![(0, w.saturating_sub(1))];
+    }
+    let mut col_ink = vec![0u32; w];
+    for (x, slot) in col_ink.iter_mut().enumerate() {
+        *slot = (0..h).filter(|&y| ink[y * w + x]).count() as u32;
+    }
+    let col_thr = 1u32.max(h as u32 / 100); // a column with real ink
+    let min_gutter = (w / 25).max(12); // a true column gutter is far wider than a word space
+    let min_col_w = (w / 12).max(24); // ignore thin noise strips
+    let mut bands: Vec<(usize, usize)> = Vec::new();
+    let mut x = 0usize;
+    while x < w {
+        if col_ink[x] <= col_thr {
+            x += 1;
+            continue;
+        }
+        let (x0, mut x1, mut gap) = (x, x, 0usize);
+        x += 1;
+        while x < w {
+            if col_ink[x] > col_thr {
+                x1 = x;
+                gap = 0;
+            } else {
+                gap += 1;
+                if gap > min_gutter {
+                    break;
+                }
+            }
+            x += 1;
+        }
+        if x1 - x0 + 1 >= min_col_w {
+            bands.push((x0, x1));
+        }
+    }
+    if bands.len() <= 1 {
+        vec![(0, w - 1)] // one (or zero) column → keep the whole width
+    } else {
+        bands
+    }
+}
+
+/// Horizontal projection-profile line extraction **restricted to one column** `[cx0, cx1]`:
+/// ink-count per row (within the column) → contiguous row bands → crop each band's ink bbox and
+/// scale to height [`STRIP_H`], sampling grayscale ink. Small lines are bilinearly upscaled to
+/// `STRIP_H` here (the strip-normalization "super-resolution" for dense small text).
+fn extract_lines_in_column(gview: &[u8], ink: &[bool], w: usize, h: usize, cx0: usize, cx1: usize, out: &mut Vec<LineStrip>) {
+    let colw = cx1 + 1 - cx0;
     let mut row_ink = vec![0u32; h];
     for (y, slot) in row_ink.iter_mut().enumerate() {
-        *slot = (0..w).filter(|&x| ink[y * w + x]).count() as u32;
+        *slot = (cx0..=cx1).filter(|&x| ink[y * w + x]).count() as u32;
     }
-    let row_thr = 1u32.max(w as u32 / 200); // a couple of ink px qualifies a row
+    let row_thr = 1u32.max(colw as u32 / 200); // a couple of ink px qualifies a row
     let max_gap = (h / 100).max(2); // bridge small vertical gaps within a line
     let mut bands: Vec<(usize, usize)> = Vec::new();
     let mut y = 0usize;
@@ -424,11 +484,11 @@ fn extract_line_strips(gray: &[u8], w: usize, h: usize) -> Vec<LineStrip> {
         if bh < 6 {
             continue; // too thin to be a text line
         }
-        // Horizontal ink extent of this band.
-        let (mut x0, mut x1) = (w, 0usize);
+        // Horizontal ink extent of this band, within the column.
+        let (mut x0, mut x1) = (cx1 + 1, cx0);
         for yy in y0..=y1 {
             let base = yy * w;
-            for x in 0..w {
+            for x in cx0..=cx1 {
                 if ink[base + x] {
                     x0 = x0.min(x);
                     x1 = x1.max(x);
@@ -453,7 +513,6 @@ fn extract_line_strips(gray: &[u8], w: usize, h: usize) -> Vec<LineStrip> {
         }
         out.push((strip, sw, (x0, y0, x1 + 1, y1 + 1)));
     }
-    out
 }
 
 /// Run the line-level recognizer over a grayscale page. Each line is routed to the
@@ -794,6 +853,40 @@ mod tests {
         assert!(*sw > 0);
         assert_eq!(strip.len(), STRIP_H * sw, "strip is STRIP_H rows tall");
         assert!(strip.contains(&1.0), "strip carries ink");
+    }
+
+    #[test]
+    fn dense_two_column_page_splits_into_columns() {
+        // A 120×60 page with TWO text columns separated by a wide blank gutter, each carrying
+        // two lines. Without column detection the row projection would merge left+right into one
+        // wide "line" per row band (2 lines total); with it we get the columns' lines separately
+        // (4), in reading order — and no line spans the gutter.
+        let (w, h) = (120usize, 60usize);
+        let mut gray = vec![255u8; w * h];
+        let paint = |g: &mut [u8], xr: std::ops::Range<usize>, yr: std::ops::Range<usize>| {
+            for y in yr { for x in xr.clone() { g[y * w + x] = 0; } }
+        };
+        // Left column x∈[8,40], right column x∈[80,112] — gutter x∈(40,80) ≈ 40px wide.
+        for (xr0, xr1) in [(8usize, 40usize), (80usize, 112usize)] {
+            paint(&mut gray, xr0..xr1, 8..18);  // line 1
+            paint(&mut gray, xr0..xr1, 30..40); // line 2
+        }
+        assert_eq!(column_bands(&sauvola_ink(&gray, w, h, 8, 0.34), w, h).len(), 2, "two columns detected");
+        let strips = extract_line_strips(&gray, w, h);
+        assert_eq!(strips.len(), 4, "2 columns × 2 lines = 4 separate line strips");
+        // No strip may span the gutter (width ≈ a single column, not the whole page).
+        for (_s, _sw, (x0, _y0, x1, _y1)) in &strips {
+            assert!(x1 - x0 < 60, "a line stays within its column (w={})", x1 - x0);
+        }
+    }
+
+    #[test]
+    fn single_column_page_is_one_band() {
+        // A normal single-column page must still yield one full-width column (no regression).
+        let (w, h) = (80usize, 40usize);
+        let mut gray = vec![255u8; w * h];
+        for y in 10..20 { for x in 6..74 { gray[y * w + x] = 0; } }
+        assert_eq!(column_bands(&sauvola_ink(&gray, w, h, 8, 0.34), w, h), vec![(0, w - 1)]);
     }
 
     #[test]

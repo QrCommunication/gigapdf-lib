@@ -193,11 +193,19 @@ synthetic). Plan, by ROI — all staying pure-`std` (no ML dewarp net):
    it head-on to an axis-aligned rectangle — the "scanner app" crop. Gated to fire only on a distinct
    sub-frame quad, so already-cropped scans pass through untouched. `ocr()` runs it **before**
    illumination (crop → flatten → recognize), feeding the **grayscale** strip extractor
-   (`extract_line_strips` already samples grayscale, not a hard binarization). **Still planned:**
-   **per-line baseline dewarp** for curled receipts, denoise + local contrast (CLAHE) + light
-   super-resolution for small receipt text. (All unit-tested in `ocr.rs`/`dewarp.rs`; an end-to-end
-   CER gain on degraded full-page fixtures is the next validation — pairs with the photo variant
-   below: augmentation hardens the model, the front-end fixes the input.)
+   (`extract_line_strips` already samples grayscale, not a hard binarization). **Dense layouts** are
+   handled too: `extract_line_strips` first splits the page into **columns** on wide vertical
+   gutters (`column_bands` — vertical ink projection; single-column pages are unchanged), then
+   extracts lines per column in reading order, so two-column scans no longer merge left+right text
+   into one line. Small/dense text is bilinearly **upscaled to `STRIP_H`** by the strip
+   normalization itself (the pure-`std` "super-resolution"). **Still planned:** **per-line baseline
+   dewarp** for curled receipts, denoise + local contrast (CLAHE). (All unit-tested in
+   `ocr.rs`/`dewarp.rs`/`ocr_crnn.rs`.)
+
+   The **model-side** half of degraded robustness is the per-script **photo variants**
+   (`deploy/train_photo_variants.sh`, `GIGA_OCR_DEGRADE=1` → `ocr_<group>_photo.gpocr`): heavy
+   in-the-wild augmentation hardens each model the same way `ocr_alpha_photo` beats the plain HW
+   model on degraded input — front-end fixes the input, augmentation hardens the model.
 2. **Photo/degraded model variant — tooling built.** A heavy "in-the-wild" domain-randomization
    augmentation (curl wave, shear, uneven illumination, background haze, blur, low-res, JPEG,
    noise, contrast jitter) lives in `render_lines.py::_degrade`, gated by `GIGA_OCR_DEGRADE=1`.
