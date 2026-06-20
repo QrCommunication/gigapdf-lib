@@ -43,6 +43,8 @@ augmentation (blur + sensor noise)─┘            → train_ocr_crnn.py (CRNN 
 | 11 | 60 ep, **`deva` larger backbone 24/48/96** (vs 16/32/64) | val_CER **0.080** (was 0.108) | Capacity was the Indic bottleneck: deva **flips to beating Tesseract** (CER 0.104→**0.078** vs 0.089). `.gpocr` 124 KB (was 62). Backbone now env-tunable (`GIGA_OCR_C1/C2/HID`); being applied to all groups. |
 | 12 | 60 ep, **`alpha` larger backbone 24/48/96**, 16k lines | val_CER **0.093** (was 0.120) | Big win: clean-print CER **0.248→0.119** — now **~2.2× better than Tesseract** (0.258). 557 classes were badly capacity-starved at 16/32/64. `.gpocr` 207 KB. |
 | 13 | 60 ep, **`taml` larger backbone 24/48/96** | val_CER **0.030** (was 0.045) | Tamil CER 0.091→**0.077** vs Tesseract 0.101 — wider win. |
+| 14 | 50 ep, **non-Latin 32/64/128** on a 48-vCPU VPS (20k synthetic, bucketed) | val_CER deva **0.039** (was 0.080), beng **0.042** (0.105), taml **0.011** (0.030), arabic **0.030** (0.054) | The larger backbone **roughly halves** Indic/Arabic val_CER — capacity, not data, was the bound. All four `.gpocr`+baked `.rs` shipped at 64/128. |
+| 15 | 40 ep, **`cjk` (new)** 32/64/128, **2401-class** data-driven charset | val_CER **0.221**; **CER 0.206 on CASIA handwritten Chinese** | First CJK model: charset from priyank-m (`build_cjk_charset.py`), Noto CJK `.ttc`, ~93k real lines (priyank-m printed + CASIA handwriting). Chinese-first; JP/KR need dedicated data. |
 
 CER here is **per-character on held-out validation strips** (same render distribution),
 measured inside the trainer — it isolates the *model*, not the full image pipeline.
