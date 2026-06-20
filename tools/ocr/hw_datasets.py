@@ -53,6 +53,9 @@ DATASETS: dict[str, dict] = {
     # Chinese → `cjk` (CASIA-HWDB2 handwriting line mirror + a large printed/scene corpus)
     "casia": {"id": "Teklia/CASIA-HWDB2-line", "text": "text", "group": "cjk"},  # handwriting
     "chinese": {"id": "priyank-m/chinese_text_recognition", "text": "text", "group": "cjk"},  # printed/scene, 400k
+    # Japanese / Korean → their own groups (note the non-standard text fields).
+    "japanese": {"id": "deepcopy/japanese-synthetic-ocr-150k", "text": "string", "group": "jpn"},  # synthetic, 150k
+    "korean": {"id": "Jiwon-Kang/OCR-Synthetic-Rendered-Korean-200K", "text": "render_text", "group": "kor"},  # synthetic, 200k
 }
 
 

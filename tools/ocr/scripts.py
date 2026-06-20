@@ -167,6 +167,25 @@ SCRIPTS: dict[str, dict] = {
         "noto": ["Noto Sans Tamil"],
         "langs": ["tam"],
     },
+    # Japanese (Hiragana/Katakana + common Kanji) and Korean (Hangul) get their own
+    # models, like each Indic script — distinct from the Chinese-only `cjk` group. The
+    # real class set is data-driven (top-frequency chars from the corpus): set
+    # GIGA_OCR_CHARSET_JPN / GIGA_OCR_CHARSET_KOR to a build_cjk_charset.py output. The
+    # built-in fallback only keeps the group usable without that file.
+    "jpn": {
+        "chars": CJK_FALLBACK,  # kana + a few Kanji; replace via GIGA_OCR_CHARSET_JPN
+        "rtl": False,
+        "subsets": ["japanese"],
+        "noto": ["Noto Sans JP"],
+        "langs": ["jpn"],
+    },
+    "kor": {
+        "chars": _dedup("가나다라마바사아자차카타파하" + DIGITS + PUNCT),  # replace via GIGA_OCR_CHARSET_KOR
+        "rtl": False,
+        "subsets": ["korean"],
+        "noto": ["Noto Sans KR"],
+        "langs": ["kor"],
+    },
 }
 
 
