@@ -405,11 +405,18 @@ pub fn ocr(gray: &[u8], w: usize, h: usize) -> OcrResult {
     if w == 0 || h == 0 || gray.len() < w * h {
         return OcrResult::default();
     }
-    // Front-end restoration: on unevenly-lit pages (phone photos, creased paper, poor
-    // scans) flatten the illumination first, so the CRNN line strips (which sample raw
-    // grayscale) and the mono-glyph binarization both see a uniform bright page instead
-    // of shadows/glare. Gated by `illumination_is_uneven` → byte-for-byte unchanged on
-    // clean scans and print, so it can only help the hard case.
+    // Front-end restoration, stage 1 — auto-crop: if the input is a *photo* of a page (a
+    // document quadrilateral on a contrasting background), find its four corners and warp
+    // it head-on to an axis-aligned rectangle. No-op on already-cropped scans/pages.
+    let rectified = super::dewarp::rectify_document(gray, w, h);
+    let (gray, w, h): (&[u8], usize, usize) = match &rectified {
+        Some((g, ow, oh)) => (g, *ow, *oh),
+        None => (gray, w, h),
+    };
+    // Stage 2 — illumination: flatten uneven lighting (shadows/glare) so the CRNN line
+    // strips (which sample raw grayscale) and the mono-glyph binarization both see a
+    // uniform bright page. Gated by `illumination_is_uneven` → byte-for-byte unchanged on
+    // clean scans/print, so it can only help the hard case.
     let restored;
     let gray: &[u8] = if illumination_is_uneven(gray, w, h) {
         restored = normalize_illumination(gray, w, h);

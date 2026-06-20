@@ -178,13 +178,18 @@ synthetic). Plan, by ROI — all staying pure-`std` (no ML dewarp net):
    (divide by a large-window local-mean background → shadows/glare/paper-gradients flatten to a
    uniform bright background, text contrast preserved; O(1)/px via an integral image), gated by
    `illumination_is_uneven` (4×4 brightness-spread test) so clean scans/print are byte-for-byte
-   unchanged. It runs at the top of `ocr()`, feeding the **grayscale** strip extractor
+   unchanged. **Perspective auto-crop is also implemented** (`dewarp.rs`): when the input is a *photo* of
+   a page (a document quadrilateral on a contrasting background), `rectify_document` finds the
+   sheet's four corners (bright-region mask → largest connected component → extreme x±y corners),
+   solves the perspective homography (8×8 DLT + Gaussian elimination, pure `std`) and bilinear-warps
+   it head-on to an axis-aligned rectangle — the "scanner app" crop. Gated to fire only on a distinct
+   sub-frame quad, so already-cropped scans pass through untouched. `ocr()` runs it **before**
+   illumination (crop → flatten → recognize), feeding the **grayscale** strip extractor
    (`extract_line_strips` already samples grayscale, not a hard binarization). **Still planned:**
-   **perspective dewarp** (document quadrilateral → homography) + **per-line baseline dewarp** for
-   curled receipts, denoise + local contrast (CLAHE) + light super-resolution for small receipt
-   text. (Unit-tested in `ocr.rs`; an end-to-end CER gain on degraded full-page fixtures is the
-   next validation — pairs with the photo variant below: augmentation hardens the model, the
-   front-end fixes the input.)
+   **per-line baseline dewarp** for curled receipts, denoise + local contrast (CLAHE) + light
+   super-resolution for small receipt text. (All unit-tested in `ocr.rs`/`dewarp.rs`; an end-to-end
+   CER gain on degraded full-page fixtures is the next validation — pairs with the photo variant
+   below: augmentation hardens the model, the front-end fixes the input.)
 2. **Photo/degraded model variant — tooling built.** A heavy "in-the-wild" domain-randomization
    augmentation (curl wave, shear, uneven illumination, background haze, blur, low-res, JPEG,
    noise, contrast jitter) lives in `render_lines.py::_degrade`, gated by `GIGA_OCR_DEGRADE=1`.
