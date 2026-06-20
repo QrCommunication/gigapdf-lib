@@ -40,12 +40,27 @@ const dec = new TextDecoder();
 /**
  * A trained per-script OCR model bundled with the package. `alpha` covers
  * Latin, Cyrillic and Greek; `arabic` is the **RTL group** (Arabic, Urdu,
- * Hebrew); the rest are dedicated scripts. The matching `.gpocr` CRNN blob
- * ships under `models/` and is host-loaded on demand. To recognize any shipped
- * language at once (including models added later), prefer
+ * Hebrew); `cjk` is Chinese (2401-class); `japanese` / `korean` are their own
+ * groups (kana+kanji / Hangul, each + full ASCII for mixed alphanumerics); the
+ * rest are dedicated Indic scripts. The matching `.gpocr` CRNN blob ships under
+ * `models/` and is host-loaded on demand. To recognize any shipped language at
+ * once (including models added later), prefer
  * {@link GigaPdfEngine.loadAllBundledOcrModels}.
+ *
+ * Some models may not be bundled in every release (a script can still be
+ * training upstream) — {@link GigaPdfEngine.loadBundledOcrModel} returns `false`
+ * for an absent blob instead of throwing, so listing them in
+ * {@link ALL_OCR_SCRIPTS} stays safe.
  */
-export type OcrScript = "alpha" | "arabic" | "devanagari" | "bengali" | "tamil";
+export type OcrScript =
+  | "alpha"
+  | "arabic"
+  | "devanagari"
+  | "bengali"
+  | "tamil"
+  | "cjk"
+  | "japanese"
+  | "korean";
 
 /** `.gpocr` filename for each {@link OcrScript}. */
 const OCR_MODEL_FILES: Record<OcrScript, string> = {
@@ -54,6 +69,9 @@ const OCR_MODEL_FILES: Record<OcrScript, string> = {
   devanagari: "ocr_deva.gpocr",
   bengali: "ocr_beng.gpocr",
   tamil: "ocr_taml.gpocr",
+  cjk: "ocr_cjk.gpocr",
+  japanese: "ocr_jpn.gpocr",
+  korean: "ocr_kor.gpocr",
 };
 
 /** Every trained script — load all for "recognize text in any language". */
@@ -63,6 +81,9 @@ export const ALL_OCR_SCRIPTS: readonly OcrScript[] = [
   "devanagari",
   "bengali",
   "tamil",
+  "cjk",
+  "japanese",
+  "korean",
 ];
 
 /** Loaded engine module. Create documents with {@link open} / {@link openEncrypted}. */
@@ -448,12 +469,19 @@ export class GigaPdfEngine {
    * the engine via {@link loadOcrModel}. **Node hosts only** — it reads the blob
    * from disk the same way {@link loadDefault} resolves the wasm. Returns `true`
    * on success. Use this to recognize non-Latin scripts (Arabic, Devanagari,
-   * Bengali, Tamil) or to upgrade Latin/Cyrillic/Greek to the CRNN (`alpha`).
+   * Bengali, Tamil, Chinese `cjk`, Japanese, Korean) or to upgrade
+   * Latin/Cyrillic/Greek to the CRNN (`alpha`). Returns `false` (rather than
+   * throwing) when the blob isn't bundled in this release — e.g. a script still
+   * training upstream — so loading a set stays resilient.
    */
   async loadBundledOcrModel(script: OcrScript): Promise<boolean> {
     // fs access lives in `./node-fs` (browser-stubbed) — same pattern as
     // `loadDefault` — so browser bundlers never resolve `node:*`.
-    return this.loadOcrModel(await readModelFile(OCR_MODEL_FILES[script]));
+    try {
+      return this.loadOcrModel(await readModelFile(OCR_MODEL_FILES[script]));
+    } catch {
+      return false; // model not present in this build → skip gracefully
+    }
   }
 
   /**

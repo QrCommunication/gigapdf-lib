@@ -4,6 +4,35 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.54.0] - 2026-06-20
+
+### Added
+
+- **OCR front-end restoration (no API change — automatic in `ocr`).** Before recognition the
+  engine now (1) **auto-crops a photographed page** — detects the document's four corners on a
+  contrasting background and perspective-warps it head-on (8×8 DLT homography + bilinear warp,
+  pure `std`), and (2) **flattens uneven illumination** (flat-field divide by a local background:
+  shadows/glare → uniform page). Both are **gated to no-op on already-clean scans**, so they only
+  help phone photos / creased paper. Rescues real-world captures with zero caller changes.
+- **Chinese OCR — new `cjk` script.** `loadBundledOcrModel("cjk")` / `ALL_OCR_SCRIPTS` now load
+  `ocr_cjk.gpocr` (data-driven **2401-class** charset, 32/64/128 backbone) — **CER 0.206 on CASIA
+  handwritten Chinese**, the first CJK model shipped.
+- **Japanese & Korean scripts declared** (`"japanese"`, `"korean"` → `ocr_jpn.gpocr` /
+  `ocr_kor.gpocr`). Their charsets include kana+kanji / Hangul **plus full ASCII** (mixed
+  alphanumerics). Models train upstream and land in a follow-up release — `loadBundledOcrModel`
+  now **returns `false` for an absent blob instead of throwing**, so `ALL_OCR_SCRIPTS` stays safe.
+- **Handwriting & degraded variants** bundled: `ocr_alpha_hw.gpocr` (real-cursive, **beats
+  Tesseract on IAM — CER 0.309 vs 0.353**) and `ocr_alpha_photo.gpocr` (degradation-augmented,
+  beats the plain HW model on degraded input). Host-load via `loadOcrModel`.
+
+### Changed
+
+- **Non-Latin models rebuilt at the 32/64/128 backbone** — Devanagari, Bengali, Tamil and
+  Arabic validation CER roughly **halved** (deva 0.039, beng 0.042, taml 0.011, arabic 0.030);
+  the bundled `.gpocr` blobs are updated. Capacity, not data, was the bound.
+- **Faster real-dataset training downloads** (dev tooling): `hw_datasets.py` fetches line images
+  **concurrently** (`GIGA_OCR_DL_WORKERS`), ~16× quicker — pairs with an HF Pro token.
+
 ## [0.52.5] - 2026-06-19
 
 ### Added
