@@ -213,6 +213,15 @@ rate limits lifted; `_fetch` still honours 429/`Retry-After`). Ungated mirrors w
 | `chinese` | priyank-m/chinese_text_recognition | Chinese printed/scene | cjk |
 | `japanese` | deepcopy/japanese-synthetic-ocr-150k | Japanese (synthetic, 150k; text field `string`) | jpn |
 | `korean` | Jiwon-Kang/OCR-Synthetic-Rendered-Korean-200K | Korean (synthetic, 200k; text field `render_text`) | kor |
+| `iiit_hindi` | c3rl/IIIT-INDIC-HW-WORDS-Hindi | Devanagari **handwriting** words (~70k) | deva |
+| `iiit_tamil` | c3rl/IIIT-INDIC-HW-WORDS-Tamil | Tamil **handwriting** words (~76k) | taml |
+
+**Non-Latin handwriting variants** (`deploy/train_hw_nonlatin.sh`, output `ocr_<group>_hw.gpocr`):
+Devanagari & Tamil have strong ungated real HW above (IIIT-INDIC-HW-WORDS). **Arabic, Hebrew and
+Bengali have no ungated real HW line corpus** (KHATT mirrors ship empty transcriptions; Hebrew sets
+are doc-/text-level) → those fall back to synthetic *Handwriting*-font lines only and stay weaker.
+All HW variants are **mixed**: the deva/beng/taml charsets now include Latin + digits and training
+renders Latin synthetic lines (`GIGA_OCR_LANGS=<lang>,eng`), so dates / numbers / codes are read.
 
 (datasets-server serves only the *converted* row subset for some datasets, so a few cap low:
 IAM ~800, Cyrillic ~1.1k observed. The JP/KR synthetic sets are pure-script, so their data-driven

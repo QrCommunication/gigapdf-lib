@@ -57,6 +57,10 @@ DATASETS: dict[str, dict] = {
     # Japanese / Korean → their own groups (note the non-standard text fields).
     "japanese": {"id": "deepcopy/japanese-synthetic-ocr-150k", "text": "string", "group": "jpn"},  # synthetic, 150k
     "korean": {"id": "Jiwon-Kang/OCR-Synthetic-Rendered-Korean-200K", "text": "render_text", "group": "kor"},  # synthetic, 200k
+    # Real non-Latin handwriting (IIIT-INDIC-HW-WORDS, word-level — short strips the CRNN handles
+    # fine). Strong ungated mirrors for Devanagari (Hindi) and Tamil; feed the `*_hw` variants.
+    "iiit_hindi": {"id": "c3rl/IIIT-INDIC-HW-WORDS-Hindi", "text": "text", "group": "deva"},  # ~70k HW words
+    "iiit_tamil": {"id": "c3rl/IIIT-INDIC-HW-WORDS-Tamil", "text": "text", "group": "taml"},  # ~76k HW words
 }
 
 
