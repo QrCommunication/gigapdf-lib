@@ -131,6 +131,22 @@ per script group, trained offline (`tools/train_ocr_crnn.py`) and enabled via Ca
 features (`ocr-alpha`, …); `ocr()` uses the CRNN when a model is embedded and falls back
 to the mono-glyph classifier otherwise.
 
+### Benchmarks — CER vs Tesseract 5.3.4
+
+Character Error Rate (CER, lower is better) on held-out benchmarks — a **dependency-free, in-WASM** recognizer measured against the reference engine. Full methodology and per-run history in [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md).
+
+| Script | gigapdf-lib | Tesseract 5.3.4 | |
+|---|---|---|---|
+| **Latin-ext + Cyrillic + Greek** (clean print) | **0.119** | 0.258 | ✅ ~2.2× better — WER 0.41 vs 0.62 |
+| **Arabic / Hebrew** (RTL, non-mirrored) | **0.063** | 0.349 | ✅ ~5.5× better |
+| **Tamil** | **0.077** | 0.101 | ✅ beats — WER 0.39 vs 0.60 |
+| **Devanagari** (Hindi, …) | **0.078** | 0.089 | ✅ beats |
+| **Bengali** | 0.097 | 0.073 | ≈ competitive (font/data-bound, not capacity) |
+| **Latin handwriting** (IAM test) | **0.309** | 0.353 | ✅ first dependency-free engine to beat Tesseract on real handwriting — WER 0.737 vs 0.775 |
+| **Chinese (CJK)** | **0.206** | — | CASIA handwritten, 2401-class data-driven charset |
+
+Every model is an **int8 CRNN+CTC** running **client-side in WebAssembly** — **no Tesseract binary, no runtime model download**. The larger 32/64/128 backbone roughly **halves** Indic/Arabic validation CER (deva 0.039, beng 0.042, taml 0.011, arabic 0.030 — capacity, not data, was the bound). *Honest caveat:* heavily degraded or dense scans still favour Tesseract's breadth.
+
 - **Trained today:** group **`alpha`** — **Latin-extended + Cyrillic + Greek** printed
   (Polish, Czech, Turkish, Vietnamese, Russian, Ukrainian, Greek, …). On a synthetic
   multi-script clean-print benchmark it **comfortably beats Tesseract 5.3.4** — CER **0.119
@@ -140,10 +156,10 @@ to the mono-glyph classifier otherwise.
   *Caveat:* synthetic clean print on the four trained languages; real degraded scans and
   untrained scripts still favour Tesseract's breadth.
 - **Also trained (non-Latin):** **Tamil** (`taml`) — **beats Tesseract** (0.077 vs 0.101);
-  **Arabic + Hebrew** (`arabic`, **RTL**) — beats Tesseract on synthetic (0.071 vs 0.349),
+  **Arabic + Hebrew** (`arabic`, **RTL**) — beats Tesseract on synthetic (0.063 vs 0.349),
   output verified non-mirrored; **Devanagari** (`deva`, larger 24/48/96 backbone) — now
-  **beats Tesseract** (0.078 vs 0.089); **Bengali** (`beng`) — competitive (0.104 vs 0.073),
-  larger-backbone retrain pending. Backbone is env-tunable (`GIGA_OCR_C1/C2/HID`); PIL **raqm**
+  **beats Tesseract** (0.078 vs 0.089); **Bengali** (`beng`) — competitive (0.097 vs 0.073),
+  font/data-bound. **Chinese (CJK)** (`cjk`, 2401-class) — CER **0.206** on CASIA handwritten. Backbone is env-tunable (`GIGA_OCR_C1/C2/HID`); PIL **raqm**
   shaping handles Indic/Arabic forms.
 - **Handwriting:** a handwriting variant **`ocr_alpha_hw.gpocr`** (32/64/128 backbone, trained
   on ~108k real handwriting lines — IAM/RIMES/NorHand/NewsEye/Belfort/POPP/Esposalles/Cyrillic
