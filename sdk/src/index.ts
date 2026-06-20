@@ -13,6 +13,16 @@
  *   doc.close();
  */
 
+// Node-only filesystem loaders. Swapped for a throwing browser stub via the
+// package.json `"browser"` field, so browser bundlers never see `node:fs`/
+// `node:url`. The specifier is a plain relative path (well-supported by
+// Turbopack/webpack/Vite), unlike the previous inline `import("node:...")`.
+import {
+  loadDefaultWasmBytes,
+  readModelFile,
+  readModelsDir,
+} from "./node-fs.js";
+
 // FFI boundary: the wasm exports are an untyped table of `gp_*` functions
 // (numbers in, numbers out) plus `memory`. `any` here is the documented FFI
 // exception — every public method below re-imposes precise types.
@@ -110,21 +120,9 @@ export class GigaPdfEngine {
    * for the consuming route so the `.wasm` is copied into the standalone bundle.
    */
   static async loadDefault(): Promise<GigaPdfEngine> {
-    // Indirect the specifier through a variable so browser bundlers (Turbopack,
-    // webpack, Vite) don't statically resolve these Node-only modules. This path
-    // is never reached in the browser — use `load(url)` there — but the class is
-    // bundled for the browser, and a *static* `import("node:fs/promises")` would
-    // make the bundler try (and fail) to resolve it.
-    const nodeImport = (m: string): Promise<Record<string, unknown>> =>
-      import(/* webpackIgnore: true */ /* @vite-ignore */ m);
-    const { readFile } = (await nodeImport("node:fs/promises")) as {
-      readFile: (p: string) => Promise<Uint8Array>;
-    };
-    const { fileURLToPath } = (await nodeImport("node:url")) as {
-      fileURLToPath: (u: URL) => string;
-    };
-    const wasmPath = fileURLToPath(new URL("../gigapdf.wasm", import.meta.url));
-    return GigaPdfEngine.load(await readFile(wasmPath));
+    // The fs access lives in `./node-fs` (Node-only; browser-stubbed via the
+    // package.json `"browser"` map) so browser bundlers never resolve `node:*`.
+    return GigaPdfEngine.load(await loadDefaultWasmBytes());
   }
 
   // ── linear-memory ABI helpers (internal) ─────────────────────────────────
@@ -453,20 +451,9 @@ export class GigaPdfEngine {
    * Bengali, Tamil) or to upgrade Latin/Cyrillic/Greek to the CRNN (`alpha`).
    */
   async loadBundledOcrModel(script: OcrScript): Promise<boolean> {
-    // Indirect the Node-only imports so browser bundlers don't try to resolve
-    // them statically (same pattern as `loadDefault`).
-    const nodeImport = (m: string): Promise<Record<string, unknown>> =>
-      import(/* webpackIgnore: true */ /* @vite-ignore */ m);
-    const { readFile } = (await nodeImport("node:fs/promises")) as {
-      readFile: (p: string) => Promise<Uint8Array>;
-    };
-    const { fileURLToPath } = (await nodeImport("node:url")) as {
-      fileURLToPath: (u: URL) => string;
-    };
-    const path = fileURLToPath(
-      new URL(`../models/${OCR_MODEL_FILES[script]}`, import.meta.url),
-    );
-    return this.loadOcrModel(await readFile(path));
+    // fs access lives in `./node-fs` (browser-stubbed) — same pattern as
+    // `loadDefault` — so browser bundlers never resolve `node:*`.
+    return this.loadOcrModel(await readModelFile(OCR_MODEL_FILES[script]));
   }
 
   /**
@@ -493,27 +480,11 @@ export class GigaPdfEngine {
    * any model added later — with no code change. Returns the number loaded.
    */
   async loadAllBundledOcrModels(): Promise<number> {
-    const nodeImport = (m: string): Promise<Record<string, unknown>> =>
-      import(/* webpackIgnore: true */ /* @vite-ignore */ m);
-    const { readFile, readdir } = (await nodeImport("node:fs/promises")) as {
-      readFile: (p: string) => Promise<Uint8Array>;
-      readdir: (p: string) => Promise<string[]>;
-    };
-    const { fileURLToPath } = (await nodeImport("node:url")) as {
-      fileURLToPath: (u: URL) => string;
-    };
-    let entries: string[];
-    try {
-      entries = await readdir(fileURLToPath(new URL("../models/", import.meta.url)));
-    } catch {
-      return 0; // models/ absent (slimmed install) → mono-glyph fallback
-    }
+    // Discovery + fs access lives in `./node-fs` (browser-stubbed). Returns an
+    // empty list when `models/` is absent (slimmed install → mono-glyph fallback).
+    const models = await readModelsDir();
     let count = 0;
-    for (const name of entries) {
-      if (!name.endsWith(".gpocr")) continue;
-      const bytes = await readFile(
-        fileURLToPath(new URL(`../models/${name}`, import.meta.url)),
-      );
+    for (const { bytes } of models) {
       if (this.loadOcrModel(bytes)) count += 1;
     }
     return count;
