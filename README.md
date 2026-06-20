@@ -151,7 +151,10 @@ to the mono-glyph classifier otherwise.
   cursive: CER 0.309 vs 0.353** (WER 0.737 vs 0.775) on the IAM test set. The printed champion
   stays primary for clean scans; load the HW variant via `gp_ocr_load_model` for
   handwriting-heavy input — see [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
-- **Deliberately out of scope:** `cjk` (Chinese/Japanese/Korean) — **not trained by design**.
+- **CJK (Chinese):** now **trained** — `ocr_cjk.gpocr` (data-driven **2401-class** charset, 32/64/128
+  backbone, ~93k real lines: priyank-m printed + CASIA handwriting) reaches **CER 0.206 on CASIA
+  handwritten Chinese**. Japanese/Korean share the group but need their own data (planned). Host-load
+  via `gp_ocr_load_model`.
   A usable model needs the full frequency charset, many CJK fonts, and a much larger backbone
   for 3 000+ classes (a 152-char proof would be a toy); the infra is in place if revisited.
 - Design: [`docs/OCR_ARCHITECTURE.md`](docs/OCR_ARCHITECTURE.md) · data catalogue:

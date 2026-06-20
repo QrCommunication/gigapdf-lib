@@ -139,10 +139,12 @@ mono-glyph classifier otherwise.
 
 - Per-script models are **feature-gated** (`ocr-alpha`, `ocr-cjk`, …); the default build
   embeds none, so it stays at the base size and behaviour.
-- **Trained:** `alpha`, `taml`, `arabic` (RTL), `deva`, `beng` (`.gpocr` blobs) — see the
-  [training log](./OCR_TRAINING_LOG.md). `cjk` is **deliberately out of scope** (a real model
-  needs the full frequency charset, many CJK faces, and a much larger backbone for 3 000+
-  classes; the infra is in place if revisited).
+- **Trained:** `alpha`, `taml`, `arabic` (RTL), `deva`, `beng`, and **`cjk`** (`.gpocr` blobs) —
+  see the [training log](./OCR_TRAINING_LOG.md). **`cjk` is now a real model**: a data-driven
+  **2401-class** charset (top-frequency Han + ASCII, `tools/ocr/build_cjk_charset.py`), Noto CJK
+  faces (`.ttc`), 32/64/128 backbone, trained on ~93k real lines (priyank-m printed + CASIA
+  handwriting) — **CER 0.206 on CASIA handwritten Chinese**. Japanese/Korean share the group but
+  need dedicated data; the charset can grow (more samples → more classes).
 - Public API (`Document::ocr_page`, `OcrWord`, WASM `gp_ocr_*`, SDK `doc.ocr`) is preserved.
 
 **Host-loaded models (built).** Weights ship as a compact **`.gpocr`** blob the host loads
@@ -189,4 +191,5 @@ synthetic). Plan, by ROI — all staying pure-`std` (no ML dewarp net):
 4. **Test-time augmentation** — decode a few preprocessing variants, keep the highest CTC confidence.
 
 **Also planned:** multi-column **XY-cut** layout analysis; larger backbones to push the
-competitive Indic models past Tesseract. CJK remains **out of scope by decision**.
+competitive Indic models past Tesseract. **CJK Chinese is now trained** (CER 0.206 on CASIA);
+**Japanese/Korean** extend the same group once dedicated data is added.
