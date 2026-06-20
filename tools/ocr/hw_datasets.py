@@ -61,6 +61,8 @@ DATASETS: dict[str, dict] = {
     # fine). Strong ungated mirrors for Devanagari (Hindi) and Tamil; feed the `*_hw` variants.
     "iiit_hindi": {"id": "c3rl/IIIT-INDIC-HW-WORDS-Hindi", "text": "text", "group": "deva"},  # ~70k HW words
     "iiit_tamil": {"id": "c3rl/IIIT-INDIC-HW-WORDS-Tamil", "text": "text", "group": "taml"},  # ~76k HW words
+    # Breadth: real data where an ungated mirror exists (most new scripts are synthetic-only).
+    "myanmar": {"id": "chuuhtetnaing/myanmar-ocr-dataset", "text": "text", "group": "mymr"},  # 7.5M lines (capped)
 }
 
 

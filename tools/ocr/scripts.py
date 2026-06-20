@@ -186,6 +186,66 @@ SCRIPTS: dict[str, dict] = {
         "noto": ["Noto Sans KR"],
         "langs": ["kor"],
     },
+    # ── Breadth: the remaining major writing systems Tesseract covers but we didn't. Each is a
+    # dedicated single-script model rendered synthetically from Noto + the Tesseract langdata_lstm
+    # corpus (all confirmed available). Charsets are the script's Unicode block + Latin + digits
+    # (mixed, for dates/numbers/codes); unassigned codepoints in a block are harmless dead classes.
+    "thai": {  # Thai
+        "chars": _dedup(_range(0x0E01, 0x0E3A) + _range(0x0E40, 0x0E4E) + _range(0x0E50, 0x0E59) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["thai"], "noto": ["Noto Sans Thai"], "langs": ["tha"],
+    },
+    "telu": {  # Telugu
+        "chars": _dedup(_range(0x0C00, 0x0C7F) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["telugu"], "noto": ["Noto Sans Telugu"], "langs": ["tel"],
+    },
+    "kann": {  # Kannada
+        "chars": _dedup(_range(0x0C80, 0x0CFF) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["kannada"], "noto": ["Noto Sans Kannada"], "langs": ["kan"],
+    },
+    "mlym": {  # Malayalam
+        "chars": _dedup(_range(0x0D00, 0x0D7F) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["malayalam"], "noto": ["Noto Sans Malayalam"], "langs": ["mal"],
+    },
+    "gujr": {  # Gujarati
+        "chars": _dedup(_range(0x0A80, 0x0AFF) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["gujarati"], "noto": ["Noto Sans Gujarati"], "langs": ["guj"],
+    },
+    "guru": {  # Gurmukhi (Punjabi)
+        "chars": _dedup(_range(0x0A00, 0x0A7F) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["gurmukhi"], "noto": ["Noto Sans Gurmukhi"], "langs": ["pan"],
+    },
+    "orya": {  # Oriya (Odia)
+        "chars": _dedup(_range(0x0B00, 0x0B7F) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["oriya"], "noto": ["Noto Sans Oriya"], "langs": ["ori"],
+    },
+    "sinh": {  # Sinhala
+        "chars": _dedup(_range(0x0D80, 0x0DFF) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["sinhala"], "noto": ["Noto Sans Sinhala"], "langs": ["sin"],
+    },
+    "geor": {  # Georgian
+        "chars": _dedup(_range(0x10A0, 0x10FF) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["georgian"], "noto": ["Noto Sans Georgian"], "langs": ["kat"],
+    },
+    "armn": {  # Armenian
+        "chars": _dedup(_range(0x0531, 0x0556) + _range(0x0561, 0x0586) + _range(0x0559, 0x055F) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["armenian"], "noto": ["Noto Sans Armenian"], "langs": ["hye"],
+    },
+    "khmr": {  # Khmer
+        "chars": _dedup(_range(0x1780, 0x17FF) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["khmer"], "noto": ["Noto Sans Khmer"], "langs": ["khm"],
+    },
+    "laoo": {  # Lao
+        "chars": _dedup(_range(0x0E81, 0x0EDF) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["lao"], "noto": ["Noto Sans Lao"], "langs": ["lao"],
+    },
+    "mymr": {  # Myanmar (Burmese)
+        "chars": _dedup(_range(0x1000, 0x109F) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["myanmar"], "noto": ["Noto Sans Myanmar"], "langs": ["mya"],
+    },
+    "ethi": {  # Ethiopic (Amharic)
+        "chars": _dedup(_range(0x1200, 0x137F) + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
+        "rtl": False, "subsets": ["ethiopic"], "noto": ["Noto Sans Ethiopic"], "langs": ["amh"],
+    },
 }
 
 
