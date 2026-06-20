@@ -105,6 +105,14 @@ Always re-verify the licence at the source before downloading or shipping anythi
 
 > Thousands of classes → a **dedicated per-script model** (see architecture doc). Mostly
 > block-segmentable, so synthetic line rendering from Noto CJK + corpora carries most of it.
+>
+> **Wired today:** Chinese = group `cjk` (trained, 2401-class, CER 0.206 on CASIA — see the
+> training log). **Japanese (`jpn`) and Korean (`kor`) are their own groups** (kana+kanji /
+> Hangul), each built data-driven by `build_cjk_charset.py` from the synthetic-OCR datasets in
+> §8.2 (`japanese` 150k / `korean` 200k). Those corpora are **pure-script**, so the charset
+> **force-includes full printable ASCII** and training mixes in **Latin synthetic lines**
+> (`GIGA_OCR_LANGS=jpn,eng` / `kor,eng`) — otherwise the model could never read the
+> alphanumerics (prices, dates, codes) that pepper real JP/KR documents.
 
 | Dataset | Type | Licence | Note |
 |---|---|---|---|
@@ -187,7 +195,10 @@ Arabic 1, Tamil 1, Bengali 0) — so real datasets matter more there. Trainer kn
 `tools/ocr/hw_datasets.py` streams real (image, transcription) line pairs via the HuggingFace
 **datasets-server** — no `datasets`/`pyarrow` dependency — normalised to the render_lines
 strip convention (H=32, ink-high, float32) with a pickle-free `.npz` cache. Trainer knobs
-**`GIGA_OCR_HW_REAL="iam,rimes,…"`** + `GIGA_OCR_HW_REAL_N`. Ungated mirrors wired:
+**`GIGA_OCR_HW_REAL="iam,rimes,…"`** + `GIGA_OCR_HW_REAL_N`. Image fetching is **concurrent**
+(`ThreadPoolExecutor`, `GIGA_OCR_DL_WORKERS`, default 16): the per-image HTTP round-trip is the
+bottleneck, so a pool gives a ~16× speed-up — pairs with an **HF Pro token** (datasets-server
+rate limits lifted; `_fetch` still honours 429/`Retry-After`). Ungated mirrors wired:
 
 | Alias | HF dataset (ungated) | Script / lang | Group |
 |-------|----------------------|---------------|-------|
@@ -199,9 +210,13 @@ strip convention (H=32, ink-high, float32) with a pickle-free `.npz` cache. Trai
 | `esposalles` | Teklia/Esposalles-line | Catalan HW | alpha |
 | `cyrillic` | deepcopy/synthetic-handwritten-cyrillic-180k | Cyrillic HW | alpha |
 | `casia` | Teklia/CASIA-HWDB2-line | Chinese HW | cjk |
+| `chinese` | priyank-m/chinese_text_recognition | Chinese printed/scene | cjk |
+| `japanese` | deepcopy/japanese-synthetic-ocr-150k | Japanese (synthetic, 150k; text field `string`) | jpn |
+| `korean` | Jiwon-Kang/OCR-Synthetic-Rendered-Korean-200K | Korean (synthetic, 200k; text field `render_text`) | kor |
 
 (datasets-server serves only the *converted* row subset for some datasets, so a few cap low:
-IAM ~800, Cyrillic ~1.1k observed.)
+IAM ~800, Cyrillic ~1.1k observed. The JP/KR synthetic sets are pure-script, so their data-driven
+charsets force-include full printable ASCII and training adds Latin synthetic lines — see §4.)
 
 ### 8.3 HuggingFace token (unlocks gated handwriting)
 `hw_datasets._hf_token()` reads `HF_TOKEN`/`HUGGINGFACE_TOKEN`/`HUGGING_FACE_HUB_TOKEN` env or

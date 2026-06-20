@@ -53,7 +53,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 | **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **PKCS#12 signing** (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **true redaction** (delete from stream) + **`redactPii`** *(v0.52.4)* — irreversible redaction that also **erases image pixels** (safe on scans/OCR) under an opaque mark |
 | **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images); native image codecs — encode/decode PNG · JPEG · lossless WebP, decode GIF + **AVIF** (AV1 intra); alpha-correct resize |
 | **Text intelligence** | Font-aware extraction, **structured text** (reading-order lines + boxes), **full-text search** with highlight boxes |
-| **OCR** | Built-in recognizer — Otsu → connected components → line/word segmentation → CNN trained on **EMNIST handwriting + synthetic font glyphs** (Latin + accents); opt-in line-level CRNN+CTC models per script (Latin/Cyrillic/Greek, Arabic/Hebrew, Devanagari, Bengali, Tamil). No Tesseract, no model download at runtime |
+| **OCR** | Built-in recognizer — **photo auto-crop (4-corner perspective dewarp) + illumination flat-field** front-end → line/word segmentation → int8 **CRNN+CTC** line models per script (Latin/Cyrillic/Greek, Arabic/Hebrew, Devanagari, Bengali, Tamil, **Chinese**, **Japanese/Korean** in training) + handwriting & photo/degraded variants. Beats Tesseract on most trained scripts. No Tesseract, no model download at runtime |
 | **Convert →** | PDF → **TXT, HTML, DOCX, PPTX, ODP, ODT, XLSX, ODS, RTF** (real editable elements, not a page image) |
 | **Convert ←** | **TXT, HTML, RTF, DOCX, ODT, ODP, PPTX, XLSX, ODS** → PDF (ODF `.odt`/`.ods`/`.odp` are fully bidirectional) |
 | **Unified editable model** | Format-neutral document tree (sections → pages → blocks → runs): lower **any** format in (`toModel`/`officeToModel`/`htmlToModel`), edit with structured ops (`applyModelOps`), raise to **any** format (`modelTo{Docx,Xlsx,Pptx,Odt,Ods,Odp,Pdf,Html,Rtf}`) — edit every format the same way |
@@ -167,12 +167,22 @@ Every model is an **int8 CRNN+CTC** running **client-side in WebAssembly** — *
   cursive: CER 0.309 vs 0.353** (WER 0.737 vs 0.775) on the IAM test set. The printed champion
   stays primary for clean scans; load the HW variant via `gp_ocr_load_model` for
   handwriting-heavy input — see [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
-- **CJK (Chinese):** now **trained** — `ocr_cjk.gpocr` (data-driven **2401-class** charset, 32/64/128
+- **CJK (Chinese):** **trained** — `ocr_cjk.gpocr` (data-driven **2401-class** charset, 32/64/128
   backbone, ~93k real lines: priyank-m printed + CASIA handwriting) reaches **CER 0.206 on CASIA
-  handwritten Chinese**. Japanese/Korean share the group but need their own data (planned). Host-load
-  via `gp_ocr_load_model`.
-  A usable model needs the full frequency charset, many CJK fonts, and a much larger backbone
-  for 3 000+ classes (a 152-char proof would be a toy); the infra is in place if revisited.
+  handwritten Chinese**. Host-load via `gp_ocr_load_model`.
+- **Japanese & Korean:** their own groups (`jpn`, `kor`) and datasets (synthetic **150k JP** /
+  **200k KR**) are wired in; each gets a data-driven charset (kana+kanji / Hangul) **plus the full
+  ASCII set** so mixed alphanumerics (prices, dates, codes) are read, trained on the real corpus +
+  Latin synthetic lines so those glyphs are actually seen. *(Training in progress on a VPS; the
+  real-dataset download is now concurrent — `GIGA_OCR_DL_WORKERS`, lifted by an HF Pro token.)*
+- **Degraded-input front-end** (`ocr.rs` + `dewarp.rs`, **no retrain**): before recognition `ocr()`
+  **auto-crops a photographed page** — finds the document's four corners on a contrasting background
+  and perspective-warps it head-on (`rectify_document`: bright mask → largest component → 8×8 DLT
+  homography → bilinear warp) — then **flattens uneven illumination** (flat-field divide by a local
+  background; shadows/glare → uniform page). Both **gated to no-op on already-clean scans**, so they
+  only act on phone photos / creased paper. Pairs with the photo variant `ocr_alpha_photo.gpocr`
+  (degradation-augmented; beats the plain HW model on degraded input): augmentation hardens the
+  model, the front-end fixes the input.
 - Design: [`docs/OCR_ARCHITECTURE.md`](docs/OCR_ARCHITECTURE.md) · data catalogue:
   [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md) · training log:
   [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md).

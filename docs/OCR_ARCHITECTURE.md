@@ -143,8 +143,16 @@ mono-glyph classifier otherwise.
   see the [training log](./OCR_TRAINING_LOG.md). **`cjk` is now a real model**: a data-driven
   **2401-class** charset (top-frequency Han + ASCII, `tools/ocr/build_cjk_charset.py`), Noto CJK
   faces (`.ttc`), 32/64/128 backbone, trained on ~93k real lines (priyank-m printed + CASIA
-  handwriting) — **CER 0.206 on CASIA handwritten Chinese**. Japanese/Korean share the group but
-  need dedicated data; the charset can grow (more samples → more classes).
+  handwriting) — **CER 0.206 on CASIA handwritten Chinese**.
+- **Japanese & Korean** get their **own groups** `jpn` / `kor` (distinct scripts — kana+kanji vs
+  Hangul — like each Indic script, not one mega-CJK model). Each has a data-driven charset
+  (`build_cjk_charset.py` on the JP/KR corpus) **plus full printable ASCII** so mixed alphanumerics
+  are recognized, trained on the real synthetic-OCR datasets (150k JP / 200k KR) **+** Latin synthetic
+  lines (`GIGA_OCR_LANGS=jpn,eng` / `kor,eng`) so the ASCII classes are actually seen. *(In training
+  on a VPS at the time of writing; `.gpocr` blobs land in `models/ocr_jpn.gpocr` / `ocr_kor.gpocr`.)*
+- **Degraded-input front-end** (`dewarp.rs` + `ocr.rs`, no retrain): `ocr()` first **auto-crops a
+  photographed page** via perspective rectification (`rectify_document` — see §6) then **flattens
+  uneven illumination** (`normalize_illumination`); both gated to no-op on clean scans.
 - Public API (`Document::ocr_page`, `OcrWord`, WASM `gp_ocr_*`, SDK `doc.ocr`) is preserved.
 
 **Host-loaded models (built).** Weights ship as a compact **`.gpocr`** blob the host loads
