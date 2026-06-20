@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
@@ -108,6 +109,15 @@ def _fetch(url: str, timeout: int = 30, retries: int = 6) -> bytes:
                 continue
             raise
     raise RuntimeError(f"unreachable: exhausted {retries} retries for {url}")
+
+
+def _try_fetch(url: str) -> bytes | None:
+    """`_fetch` that returns None instead of raising — for concurrent image pulls where
+    a single failed JPEG should be skipped, not abort the whole page."""
+    try:
+        return _fetch(url)
+    except Exception:
+        return None
 
 
 def _to_strip(jpg: bytes, target_h: int = STRIP_H):
@@ -197,6 +207,7 @@ def fetch_lines(name: str, n: int, split: str = "train", *, cache: bool = True) 
             return _load_cache(best)[:n]  # reuse any cache with ≥ n lines (or the largest)
 
     config = spec.get("config") or _resolve_config(spec["id"])
+    workers = max(1, int(os.environ.get("GIGA_OCR_DL_WORKERS", "16")))
     out: list[tuple] = []
     offset = 0
     while len(out) < n:
@@ -212,15 +223,24 @@ def fetch_lines(name: str, n: int, split: str = "train", *, cache: bool = True) 
         rows = page.get("rows", [])
         if not rows:
             break
+        # The per-image HTTP round-trip dominates (one JPEG GET per line); pulling a page's
+        # images concurrently gives a ~`workers`× speed-up. Safe with an HF Pro token
+        # (datasets-server rate limits lifted); `_fetch` still honours 429/Retry-After.
+        jobs = []
         for r in rows:
             row = r["row"]
             img = row.get("image") or {}
             src = img.get("src") if isinstance(img, dict) else None
             text = (row.get(spec["text"]) or "").strip()
-            if not src or not text:
+            if src and text:
+                jobs.append((src, text))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fetched = list(ex.map(lambda st: (_try_fetch(st[0]), st[1]), jobs))
+        for jpg, text in fetched:
+            if jpg is None:
                 continue
             try:
-                strip = _to_strip(_fetch(src))
+                strip = _to_strip(jpg)
             except Exception:
                 continue
             if strip is not None and strip.shape[1] >= 8:
