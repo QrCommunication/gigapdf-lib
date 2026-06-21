@@ -4,6 +4,55 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.58.0] - 2026-06-21
+
+### Added
+
+- **`setElementOpacity(page, index, fillAlpha)` — constant opacity on *any*
+  element.** Sets a single transparency value on a text, image **or** shape
+  element in place by registering a page `/ExtGState` (`/ca` = `/CA` =
+  `fillAlpha`, clamped to `0..=1`, auto-named `GpGs<n>`) and wrapping the
+  element's op range in `q /<gs> gs … Q`, so the alpha applies to that run only
+  and following content is unaffected. This is the way to set an **image**'s
+  opacity in place; shapes may use either this or `setPathStyle`'s `fillAlpha` /
+  `strokeAlpha` (same underlying `/ExtGState` mechanism — the difference is that
+  `setElementOpacity` uses one value for both `/ca` and `/CA`, while `setPathStyle`
+  can set fill and stroke alpha independently). New ABI
+  `gp_set_element_opacity(handle, page, index, fill_alpha)` and core
+  `Document::set_element_opacity` / `content::set_element_opacity`. Returns
+  `false` for a missing page/index.
+- **`reorderElement(page, index, toFront)` — native PDF stacking order.** Changes
+  an element's paint (z) order by splicing its op range to the **end** of the
+  content stream (`toFront = true` → painted last, on top) or to the **start**
+  (`toFront = false` → painted first, behind everything). The moved range is
+  re-wrapped in `q … Q` so it neither inherits nor leaks graphics state; works for
+  text, image and shape elements. **The element's unified index changes after the
+  splice — re-read `pageElements`.** New ABI `gp_reorder_element(handle, page,
+  index, to_front)` and core `Document::reorder_element` /
+  `content::reorder_element`. Returns `false` for a missing page/index.
+- **`renderPageExcluding(page, indices, scale?)` — rasterise a page minus given
+  elements.** Rasterises a page to PNG while **omitting** the listed top-level
+  unified element `indices` (from `pageElements`) — each excluded element paints
+  nothing (fills, strokes, shadings, images and text alike) while all
+  non-excluded content renders normally. Generalises `renderPageNoText` (which
+  suppresses *all* text); an empty `indices` renders the full page and unknown
+  indices are ignored. Built for live-overlay editing — paint a background
+  without the element currently being edited, then overlay an editable version on
+  top. Native rasteriser, no third-party image library. New ABI
+  `gp_render_page_excluding(handle, page, indices_ptr, indices_len, scale,
+  out_len)` and core `Document::render_page_excluding`, alongside the unchanged
+  `renderPage` / `renderPageNoText`.
+
+### Changed
+
+- **`setPathStyle` opacity is now real.** `fillAlpha` / `strokeAlpha` (`0..=1`)
+  are now **fully applied** (previously accepted for API symmetry but a no-op):
+  the engine registers an `/ExtGState` carrying `/ca` / `/CA` on the page and
+  injects a `/<gs> gs` into the path's `q … Q` wrap, so the alpha applies to that
+  path run only. The earlier "opacity not applied — needs an `/ExtGState`"
+  limitation no longer holds. For non-path elements (e.g. images) use
+  `setElementOpacity`.
+
 ## [0.57.0] - 2026-06-21
 
 ### Added

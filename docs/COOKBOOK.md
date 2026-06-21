@@ -39,7 +39,8 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Annotate (highlight, note, ink, stamp)](#annotate)
 - [Sign with a PKCS#12 identity](#sign-with-a-pkcs12-identity)
 - [Encrypt with AES-256](#encrypt-with-aes-256)
-- [Move, resize & restyle existing elements in place](#move-resize--restyle-existing-elements-in-place)
+- [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
+- [Render a page without a specific element (live-overlay editing)](#render-a-page-without-a-specific-element-live-overlay-editing) — *v0.58.0*
 - [Round-trip the unified editable model](#round-trip-the-unified-editable-model)
 
 ---
@@ -560,12 +561,94 @@ const out = doc.save();
 doc.close();
 ```
 
-> **Opacity is not applied.** `fillAlpha` / `strokeAlpha` are accepted for API
-> symmetry but have **no effect** — PDF opacity requires a named `/ExtGState`
-> resource, which a pure content-stream edit can't create. When you need real
-> transparency, draw the shape with a resource-level helper instead
-> (`addRectangle` / `addEllipse` / `addPath` / … all take an `opacity` argument
-> that allocates the `/ExtGState`).
+> **Opacity is applied.** `fillAlpha` / `strokeAlpha` (`0..=1`) take effect — the
+> engine registers an `/ExtGState` carrying `/ca` / `/CA` on the page and injects a
+> `/<gs> gs` into the path's `q … Q` wrap, so the alpha applies to that path run
+> only. For a **non-path** element (e.g. an image), use `setElementOpacity`
+> (below) instead.
+
+### Make a shape or image semi-transparent
+
+For **any** element — text, image **or** shape — `setElementOpacity(page, index,
+fillAlpha)` sets one constant opacity (`0..=1`) in place: it registers a page
+`/ExtGState` (`/ca` = `/CA` = `fillAlpha`) and wraps the element's op range in
+`q /<gs> gs … Q`. This is the way to fade an **image** in place.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Fade the first image on page 1 to 40% opacity.
+const img = doc.imageElements(1)[0];
+doc.setElementOpacity(1, img.index, 0.4); // true on success
+
+const out = doc.save();
+doc.close();
+```
+
+For a **shape** you can use either API: `setElementOpacity` (one value for both
+fill and stroke) or `setPathStyle` when you need independent fill / stroke alpha:
+
+```ts
+// Path element: 30% fill, fully opaque stroke.
+doc.setPathStyle(1, pathIndex, { fillAlpha: 0.3, strokeAlpha: 1 });
+```
+
+### Bring an element to front / send it to back
+
+`reorderElement(page, index, toFront)` changes the native PDF paint (z) order of
+any element. `toFront = true` splices its op range to the **end** of the content
+stream (painted last → on top); `false` splices it to the **start** (painted
+first → behind everything). The moved range is re-wrapped in `q … Q` so it
+neither inherits nor leaks graphics state.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Bring the first image on page 1 on top of everything else.
+const img = doc.imageElements(1)[0];
+doc.reorderElement(1, img.index, true); // true → on top
+
+// …or send element #2 behind everything:
+// doc.reorderElement(1, 2, false);
+
+const out = doc.save();
+doc.close();
+```
+
+> **The index changes after the splice.** Because the element's ops are moved
+> within the stream, its unified index is no longer valid — re-read
+> `pageElements(page)` (or `imageElements` / `vectorPaths`) before addressing it
+> again by index.
+
+---
+
+## Render a page without a specific element (live-overlay editing)
+
+`renderPageExcluding(page, indices, scale?)` rasterises a page to PNG while
+**omitting** the given top-level unified element `indices` (from `pageElements`).
+Each excluded element paints nothing — fills, strokes, shadings, images and text
+alike — while everything else renders normally. It **generalises**
+`renderPageNoText` (which suppresses *all* text). The classic use: paint a
+background **without** the element the user is currently editing, then overlay an
+editable, live version (real Fabric/HTML widget) exactly on top.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// The element under edit on page 1 (e.g. the run the user clicked).
+const els = doc.elements(1);
+const editing = els.findIndex((e) => e.kind === "text");
+
+// Background = the page minus that element, at 2× (144 dpi). Overlay your
+// editable widget at the element's bounds on top of this PNG.
+const bg = doc.renderPageExcluding(1, [editing], 2);
+
+// Hide several at once; an empty list renders the full page; unknown indices
+// are ignored:
+// const clean = doc.renderPageExcluding(1, [editing, 5, 9], 2);
+
+doc.close();
+```
 
 ---
 

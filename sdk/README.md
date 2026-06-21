@@ -272,14 +272,18 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
 - **`GigaPdfDoc`** — text intelligence (`textRuns`, `structuredText`, `search`,
   `ocr`, `ocrText`, `elements`, `elementAt`), editing (`replaceText`,
   `removeElement`, `moveElement`, `transformElement` (full affine — move + resize
-  + rotate in place), `setPathStyle` (in-place vector restyle: fill/stroke/width/dash),
+  + rotate in place), `reorderElement` (native z-order — bring to front / send to
+  back), `setPathStyle` (in-place vector restyle: fill/stroke/width/dash + **real
+  opacity**), `setElementOpacity` (constant opacity on any element — text/image/shape),
   `duplicateElement`, `redact`), vector drawing
   (`addRectangle`, `drawLine`, `addEllipse`, `addPolygon`, `addPath` (SVG path),
   `addImage` (PNG/JPEG, alpha + opacity)), pages (`rotatePage`, `deletePage`,
   `movePage`, `appendPages`, `extractPages`, `resizePage`, `addPage`, `copyPage`,
   `pageInfo`),
   `renderPage` (and `renderPageNoText` — a text-free background for editors that
-  overlay real editable text; vectors/gradients/images/annotations still rendered),
+  overlay real editable text; vectors/gradients/images/annotations still rendered —
+  plus `renderPageExcluding` — a background omitting specific elements for
+  live-overlay editing),
   fonts (base-14 `addStandardText`, embed **any** TrueType/OpenType
   via `embedFont`/`addText`, font-aware editing `replaceText`,
   the document's own faces `embeddedFonts`/`extractFont`, `neededFonts`),

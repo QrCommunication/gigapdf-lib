@@ -145,6 +145,41 @@ A pure translate `[1,0,0,1,dx,dy]` is exactly what `gp_move_element` emits — s
 `transform_element` is its strict generalisation. For a rotation by θ (about the
 element's own origin) use `[cosθ, sinθ, −sinθ, cosθ, 0, 0]`.
 
+### Change an element's stacking order (z-order)
+
+`gp_reorder_element(handle, page, i, to_front)` changes the paint order of any
+element — text, image or shape. With `to_front = 1` the element's op range is
+spliced to the **end** of the content stream (painted last → on top); with
+`to_front = 0` it is spliced to the **start** (painted first → behind
+everything). The moved range is re-wrapped in `q … Q`, so it neither inherits nor
+leaks graphics state.
+
+```js
+// Bring element #2 on page 1 to the front (on top of everything else).
+ex.gp_reorder_element(handle, 1, 2, /*to_front=*/1); // 0 = success
+// …or send it behind everything: to_front = 0.
+```
+
+> The element's **index changes after the splice** (the ops moved within the
+> stream), so re-read the page's elements (`gp_page_elements_json`) before any
+> further edit that addresses it by index.
+
+### Set a constant opacity on any element
+
+`gp_set_element_opacity(handle, page, i, fill_alpha)` applies one transparency
+value (`0..=1`) to **any** element — text, image **or** shape. The engine
+registers a page `/ExtGState` (`/ca` = `/CA` = `fill_alpha`, auto-named
+`GpGs<n>`) and wraps the element's op range in `q /<gs> gs … Q`, so the alpha
+applies to that run only. This is how you set an **image**'s opacity in place.
+
+```js
+// Make image element #0 on page 1 semi-transparent (50%).
+ex.gp_set_element_opacity(handle, 1, 0, 0.5); // 0 = success
+```
+
+For a **shape** you can use this (one alpha for both fill and stroke) or
+`gp_set_path_style_json` below (independent `fillAlpha` / `strokeAlpha`).
+
 ### Re-style a vector path in place
 
 `gp_set_path_style_json(handle, page, i, json_ptr, json_len)` re-styles a **path**
@@ -164,11 +199,11 @@ ex.gp_set_path_style_json(handle, 1, 3, s.ptr, s.len); // 0 = success
 freeArg(s);
 ```
 
-> **Opacity caveat.** `fillAlpha` / `strokeAlpha` are accepted for API symmetry
-> but are **not** applied — PDF opacity requires a named `/ExtGState` resource,
-> which a pure content-stream edit can't create. When you need real transparency,
-> draw the shape with the resource-level helpers (`gp_add_rectangle`, …) whose
-> `opacity` argument allocates the `/ExtGState`.
+> **Opacity.** `fillAlpha` / `strokeAlpha` (`0..=1`) **are applied**: the engine
+> registers an `/ExtGState` carrying `/ca` / `/CA` on the page and injects a
+> `/<gs> gs` into the path's `q … Q` wrap, so the alpha applies to that path run
+> only. (For non-path elements such as images, use `gp_set_element_opacity`
+> above.)
 
 ## 4b. Build an interactive form (AcroForm, no `pdf-lib`)
 
@@ -223,6 +258,14 @@ const png = callBuffer((lp) => ex.gp_render_page(handle, 1, 2.0, lp)); // 2× sc
 // Text-free background for an editor that overlays real, editable text
 // (vectors/gradients/images/annotations still rendered):
 const bg = callBuffer((lp) => ex.gp_render_page_no_text(handle, 1, 2.0, lp));
+
+// Background omitting specific top-level elements (e.g. the one being edited).
+// `indices` is a packed u32 array in WASM memory (ptr + count); generalises
+// gp_render_page_no_text. Empty list = full page; unknown indices are ignored.
+const ix = u32Arg([2, 5]); // hide unified elements #2 and #5 on page 1
+const minus = callBuffer((lp) =>
+  ex.gp_render_page_excluding(handle, 1, ix.ptr, ix.count, 2.0, lp));
+freeArg(ix);
 ```
 
 ## 6. Convert PDF → anything
