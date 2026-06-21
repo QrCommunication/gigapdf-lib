@@ -31,12 +31,13 @@ from __future__ import annotations
 
 import os
 import sys
+import unicodedata
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr"))
 import gpocr  # noqa: E402
-from scripts import SCRIPTS, alphabet_for, is_rtl  # noqa: E402
+from scripts import SCRIPTS, alphabet_for, decompose_mode, is_rtl  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 H = 32                   # must equal ocr_crnn::STRIP_H and render_lines.STRIP_H
@@ -218,13 +219,19 @@ def build_and_train(group: str, epochs: int):
     alphabet = alphabet_for(group)
     idx = {c: i for i, c in enumerate(alphabet)}
     rtl = is_rtl(group)
+    decompose = decompose_mode(group)  # e.g. 'nfd' for Korean: syllables → conjoining jamo
 
     def encode(text: str) -> list[int]:
-        # Class-index target. For RTL scripts (Arabic/Hebrew), raqm renders glyphs in visual
-        # order (first logical char on the right), but CTC is monotonic over the L→R pixel
-        # sequence — so the target must be in VISUAL order too. We reverse here; the runtime
-        # reverses the decode back to logical (ocr_crnn::ctc_greedy_decode honours `rtl`). The
-        # trainer's val metric uses these same visual-order targets, so it stays consistent.
+        # Class-index target. For decomposing scripts (Korean), NFD-split each precomposed
+        # syllable into its conjoining jamo so the model learns ~68 base shapes, not thousands of
+        # rare syllables (the runtime recomposes jamo → syllables).
+        if decompose == "nfd":
+            text = unicodedata.normalize("NFD", text)
+        # For RTL scripts (Arabic/Hebrew), raqm renders glyphs in visual order (first logical char
+        # on the right), but CTC is monotonic over the L→R pixel sequence — so the target must be
+        # in VISUAL order too. We reverse here; the runtime reverses the decode back to logical
+        # (ocr_crnn::ctc_greedy_decode honours `rtl`). The trainer's val metric uses these same
+        # visual-order targets, so it stays consistent.
         tgt = [idx[c] for c in text if c in idx]
         return tgt[::-1] if rtl else tgt
     # Prefer coverage-filtered SYSTEM fonts (correct glyphs, high diversity, no

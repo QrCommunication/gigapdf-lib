@@ -108,6 +108,17 @@ CJK_FALLBACK = _dedup(
 )
 
 
+# Hangul **conjoining jamo** (the NFD-decomposed form of syllables): 19 leading consonants +
+# 21 vowels + 28 trailing consonants = 68 classes. Training NFD-decomposes each syllable into
+# these (so the model learns ~68 base shapes, not ~2.4k rare precomposed syllables); the runtime
+# recomposes jamo → syllables (Hangul L+V+T composition). Far more learnable for Korean.
+HANGUL_JAMO = _dedup(
+    _range(0x1100, 0x1112)  # choseong (leading consonants)
+    + _range(0x1161, 0x1175)  # jungseong (vowels)
+    + _range(0x11A8, 0x11C2)  # jongseong (trailing consonants)
+)
+
+
 def load_charset(path: str) -> str:
     """Load a newline- or char-separated charset file (e.g. a CJK frequency list),
     de-duplicated and whitespace-stripped. Use for large scripts (CJK)."""
@@ -180,8 +191,11 @@ SCRIPTS: dict[str, dict] = {
         "langs": ["jpn"],
     },
     "kor": {
-        "chars": _dedup("가나다라마바사아자차카타파하" + DIGITS + PUNCT),  # replace via GIGA_OCR_CHARSET_KOR
+        # Jamo decomposition: ~68 base jamo + ASCII instead of ~2.4k precomposed syllables.
+        # `decompose: nfd` tells the trainer to NFD-decompose targets; runtime recomposes.
+        "chars": _dedup(HANGUL_JAMO + DIGITS + LATIN_UP + LATIN_LO + PUNCT),
         "rtl": False,
+        "decompose": "nfd",
         "subsets": ["korean"],
         "noto": ["Noto Sans KR"],
         "langs": ["kor"],
@@ -275,6 +289,13 @@ def alphabet_for(group: str) -> str:
 
 def is_rtl(group: str) -> bool:
     return SCRIPTS[group]["rtl"]
+
+
+def decompose_mode(group: str) -> str | None:
+    """Unicode normalization to apply to TARGET text before encoding to CTC classes — e.g.
+    `'nfd'` for Korean (decompose syllables → ~68 conjoining jamo). The runtime recomposes
+    jamo → syllables. `None` ⇒ use the text as-is."""
+    return SCRIPTS.get(group, {}).get("decompose")
 
 
 # ── self-test ──────────────────────────────────────────────────────────────────

@@ -41,11 +41,16 @@ JOBS=(
   "mymr|mymr||0|mya,eng|myanmar|-|50"
   "deva_hw|deva|hw|0|hin,eng|iiit_hindi|-|50"
   "taml_hw|taml|hw|0|tam,eng|iiit_tamil|-|50"
+  # CJK retrain — overwrite ocr_cjk.gpocr with the full-ASCII charset (was missing A-Z) → mixed
+  "cjk|cjk||0|eng|chinese,casia|tools/ocr/cjk_charset.txt|40"
+  # Korean retrain — JAMO decomposition (scripts.py kor decompose=nfd, ~175 classes vs 1487);
+  # NO charset file (built-in jamo charset), runtime recomposes. Overwrites the weak ocr_kor.gpocr.
+  "kor|kor||0|kor,eng|korean|-|45"
   "deva_photo|deva|photo|1|hin,eng|iiit_hindi|-|45"
   "taml_photo|taml|photo|1|tam,eng|iiit_tamil|-|45"
   "cjk_photo|cjk|photo|1|eng|chinese,casia|tools/ocr/cjk_charset.txt|45"
   "jpn_photo|jpn|photo|1|jpn,eng|japanese|tools/ocr/jpn_charset.txt|45"
-  "kor_photo|kor|photo|1|kor,eng|korean|tools/ocr/kor_charset.txt|45"
+  "kor_photo|kor|photo|1|kor,eng|korean|-|45"
 )
 
 log() { echo "[$(date -u +%H:%M:%S)] $*" >> ~/parallel_queue.log; }

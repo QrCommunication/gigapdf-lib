@@ -153,11 +153,41 @@ fn ctc_greedy_decode(logits: &[Vec<f32>], alphabet: &str, rtl: bool) -> String {
         }
         prev = idx;
     }
-    if rtl {
-        s.chars().rev().collect()
-    } else {
-        s
+    let s = if rtl { s.chars().rev().collect() } else { s };
+    compose_hangul(&s) // recompose conjoining jamo → syllables (no-op for non-Korean output)
+}
+
+/// Recompose Hangul **conjoining jamo** (the Korean model's output, trained on NFD-decomposed
+/// targets) into precomposed syllables: a leading consonant L + vowel V (+ optional trailing
+/// consonant T) → `U+AC00 + (L·21 + V)·28 + T`. Strings without an L+V jamo run pass through
+/// unchanged, so this is a safe no-op for every other script.
+fn compose_hangul(s: &str) -> String {
+    let is_l = |c: u32| (0x1100..=0x1112).contains(&c); // choseong
+    let is_v = |c: u32| (0x1161..=0x1175).contains(&c); // jungseong
+    let is_t = |c: u32| (0x11A8..=0x11C2).contains(&c); // jongseong
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i] as u32;
+        if is_l(c) && i + 1 < chars.len() && is_v(chars[i + 1] as u32) {
+            let l = c - 0x1100;
+            let v = chars[i + 1] as u32 - 0x1161;
+            let (mut t, mut adv) = (0u32, 2usize);
+            if i + 2 < chars.len() && is_t(chars[i + 2] as u32) {
+                t = chars[i + 2] as u32 - 0x11A7; // U+11A8 → 1 (0 = no final)
+                adv = 3;
+            }
+            if let Some(ch) = char::from_u32(0xAC00 + (l * 21 + v) * 28 + t) {
+                out.push(ch);
+            }
+            i += adv;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
     }
+    out
 }
 
 /// Homoglyph confusion sets: `(Latin, Cyrillic, Greek)` glyphs that render near-
@@ -887,6 +917,15 @@ mod tests {
         let mut gray = vec![255u8; w * h];
         for y in 10..20 { for x in 6..74 { gray[y * w + x] = 0; } }
         assert_eq!(column_bands(&sauvola_ink(&gray, w, h, 8, 0.34), w, h), vec![(0, w - 1)]);
+    }
+
+    #[test]
+    fn compose_hangul_recomposes_jamo() {
+        // NFD of "안녕" = ᄋ ᅡ ᆫ ᄂ ᅧ ᆼ (conjoining jamo) → recompose → "안녕".
+        assert_eq!(compose_hangul("\u{110B}\u{1161}\u{11AB}\u{1102}\u{1167}\u{11BC}"), "안녕");
+        // L+V with no final → "가"; non-Korean text is untouched.
+        assert_eq!(compose_hangul("\u{1100}\u{1161}"), "가");
+        assert_eq!(compose_hangul("Invoice 2026-06"), "Invoice 2026-06");
     }
 
     #[test]
