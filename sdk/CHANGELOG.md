@@ -4,6 +4,41 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.60.0] - 2026-06-22
+
+### Added
+
+- **`pageBlocks(page)`** — per-page layout blocks (paragraphs, headings, tables,
+  lists, columns) in reading order, each run carrying its `source_index` for
+  lossless editing. Surfaces the existing `recon/` reconstruction pipeline
+  (until now whole-document only, via `toModel()`) one page at a time, for
+  continuous / lazily-virtualised editors. Routes through form XObject text so
+  cerfa / invoice template text is reconstructed into blocks too.
+- **Base-14 standard fonts in the rasterizer** — `renderPage` now draws the
+  standard 14 fonts (Helvetica / Arial / Times / Courier / Symbol /
+  ZapfDingbats) via a bundled metric-compatible face, **in memory only**
+  (nothing is written to the PDF). Authoritative Symbol + ZapfDingbats
+  `code → Unicode` tables (e.g. ZapfDingbats `0x34` → U+2714 ✔, not the digit).
+
+### Changed
+
+- **Form-field appearances reference the field's `/DA` standard font** (e.g.
+  `/Helv`) instead of injecting a bundled font resource into the PDF. Filling a
+  text field adds **no** font to the document; Adobe draws the standard font
+  natively. A `/DA` font missing from `/DR` is registered as a bare base-14
+  `/Type1` dict (no `FontFile`), exactly what a clean AcroForm carries.
+
+### Fixed
+
+- Embedded **Type1 / CFF subsets with a base-14 BaseFont** (e.g. `Times-Bold`)
+  now render — they were drawn as `.notdef` (invisible) because the base-14
+  substitution was applied even when the font embeds its own program. The
+  substitute is now used only when no program is embedded.
+- Glyph advances honour the PDF **`/Widths`** (`/W` + `/DW`, or `/Widths` +
+  `/FirstChar`) authoritatively per ISO 32000-1 §9.2.4; the embedded-font
+  advance is the fallback. Fixes collapsed / overlapping words on subset fonts
+  whose charstring advances are degenerate.
+
 ## [0.59.0] - 2026-06-21
 
 ### Added — Universal font decoding (text extraction matches Adobe, zero OCR)
