@@ -677,6 +677,110 @@ pub extern "C" fn gp_move_element(
     edit(handle, |doc| doc.move_element(page, index, dx, dy))
 }
 
+/// Apply the affine transform `[a, b, c, d, e, f]` to element `index` on `page`
+/// (wraps it in `q … cm … Q`). Generalises [`gp_move_element`] to
+/// scale/rotate/shear. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_transform_element(
+    handle: *mut Document,
+    page: u32,
+    index: usize,
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+) -> i32 {
+    edit(handle, |doc| {
+        doc.transform_element(page, index, [a, b, c, d, e, f])
+    })
+}
+
+/// Re-style the **path** element `index` on `page` in place. `json_ptr`/`json_len`
+/// is a small JSON object with optional keys: `fill`/`stroke` (`[r,g,b]` in
+/// `0..=1`), `strokeWidth` (number), `dash` (number array), and `fillAlpha`/
+/// `strokeAlpha` (numbers, accepted but not emitted — opacity needs an
+/// `/ExtGState`). 0 on success; negative on error (incl. non-path element).
+#[no_mangle]
+pub extern "C" fn gp_set_path_style_json(
+    handle: *mut Document,
+    page: u32,
+    index: usize,
+    json_ptr: *const u8,
+    json_len: usize,
+) -> i32 {
+    let json = unsafe { str_arg(json_ptr, json_len) };
+    let style = parse_path_style_json(json);
+    edit(handle, |doc| doc.set_path_style(page, index, &style))
+}
+
+/// Parse a small `{fill,stroke,strokeWidth,dash,fillAlpha,strokeAlpha}` JSON
+/// object into a [`PathStyle`]. Std-only, tailored to this fixed shape (no
+/// third-party JSON dependency): unknown keys are ignored, missing keys stay
+/// `None`. RGB arrays must hold exactly three numbers to be applied.
+fn parse_path_style_json(json: &str) -> gigapdf_core::content::PathStyle {
+    gigapdf_core::content::PathStyle {
+        fill: json_rgb(json, "fill"),
+        stroke: json_rgb(json, "stroke"),
+        stroke_width: json_number(json, "strokeWidth"),
+        fill_alpha: json_number(json, "fillAlpha"),
+        stroke_alpha: json_number(json, "strokeAlpha"),
+        dash: json_number_array(json, "dash"),
+    }
+}
+
+/// Find the byte position just after `"key"` and its `:` in `json`, or `None`.
+fn json_value_start(json: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{key}\"");
+    let key_at = json.find(&needle)?;
+    let after_key = &json[key_at + needle.len()..];
+    let colon = after_key.find(':')?;
+    Some(key_at + needle.len() + colon + 1)
+}
+
+/// Read a JSON number value for `key` (e.g. `"strokeWidth": 3.5`).
+fn json_number(json: &str, key: &str) -> Option<f64> {
+    let start = json_value_start(json, key)?;
+    let rest = json[start..].trim_start();
+    let end = rest
+        .find(|c: char| !matches!(c, '0'..='9' | '.' | '-' | '+' | 'e' | 'E'))
+        .unwrap_or(rest.len());
+    rest[..end].trim().parse().ok()
+}
+
+/// Read a JSON array of numbers for `key` (e.g. `"dash": [4, 2]`).
+fn json_number_array(json: &str, key: &str) -> Option<Vec<f64>> {
+    let start = json_value_start(json, key)?;
+    let rest = json[start..].trim_start();
+    let open = rest.find('[')?;
+    let close = rest[open..].find(']')? + open;
+    let inner = &rest[open + 1..close];
+    let nums: Vec<f64> = inner
+        .split(',')
+        .filter_map(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse().ok()
+            }
+        })
+        .collect();
+    Some(nums)
+}
+
+/// Read a 3-number RGB array for `key`; `None` unless exactly three numbers.
+fn json_rgb(json: &str, key: &str) -> Option<[f64; 3]> {
+    let nums = json_number_array(json, key)?;
+    if nums.len() == 3 {
+        Some([nums[0], nums[1], nums[2]])
+    } else {
+        None
+    }
+}
+
 /// Redact a rectangular region: permanently remove overlapping content from the
 /// page stream (the background behind it is preserved). When `has_cover != 0` a
 /// `cover_rgb` (packed `0xRRGGBB`) box is drawn to visibly mark the area;

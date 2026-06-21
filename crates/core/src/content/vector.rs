@@ -25,7 +25,14 @@ pub enum PathSeg {
 /// One painted vector path: its geometry plus the resolved graphics state.
 #[derive(Debug, Clone)]
 pub struct VectorPath {
-    /// 0-based index among the page's painted paths.
+    /// The path's addressable index. When produced via
+    /// [`Document::page_vector_paths`](crate::Document::page_vector_paths) this is
+    /// the **unified [`ContentElement`](super::ContentElement) index** — the same
+    /// value accepted by `remove_element` / `transform_element` /
+    /// `set_path_style`, so a host can extract a path and edit *that exact* path.
+    /// When obtained directly from [`vector_paths_from_ops`] (no element
+    /// correlation) it is the painted-path ordinal; use
+    /// [`vector_paths_from_ops_with_pos`] to recover the unified index.
     pub index: usize,
     /// Bounding box over every segment point (user space), if non-empty.
     pub bounds: Option<Bounds>,
@@ -168,10 +175,36 @@ fn path_bounds(path: &[PathSeg]) -> Option<Bounds> {
 /// so `gs` operators resolve to the right fill/stroke opacity. Clip-only paths
 /// (`W`/`W*` … `n`) are skipped; every fill/stroke/fill-stroke paint op emits a
 /// [`VectorPath`] carrying the geometry transformed into user space by the CTM.
+///
+/// The returned `index` is the path's 0-based ordinal **among painted paths**;
+/// callers that need the *unified* [`ContentElement`](super::ContentElement)
+/// index (the one accepted by `remove_element`/`transform_element`/
+/// `set_path_style`) should use [`vector_paths_from_ops_with_pos`] and correlate
+/// each path's paint-operator position with the `op_end` of the corresponding
+/// `Path`-kind element.
 pub fn vector_paths_from_ops(
     operations: &[Operation],
     gstate: &BTreeMap<String, (Option<f64>, Option<f64>)>,
 ) -> Vec<VectorPath> {
+    vector_paths_from_ops_with_pos(operations, gstate)
+        .into_iter()
+        .map(|(path, _pos)| path)
+        .collect()
+}
+
+/// Like [`vector_paths_from_ops`], but pairs each painted [`VectorPath`] with the
+/// **operation index of its paint operator** (`f`/`S`/`B`/…) in `operations`.
+///
+/// This is the robust correlation key for mapping paths to the unified
+/// [`ContentElement`](super::ContentElement) model: the element walker emits a
+/// `Path` element whose `op_end` is exactly that paint operator's index, so a
+/// caller can assign each path its element's unified index regardless of any
+/// count divergence (e.g. clip-only `… W n` paths produce a `Path` element but
+/// **no** `VectorPath`, so they are simply skipped — never mis-correlated).
+pub fn vector_paths_from_ops_with_pos(
+    operations: &[Operation],
+    gstate: &BTreeMap<String, (Option<f64>, Option<f64>)>,
+) -> Vec<(VectorPath, usize)> {
     let mut out = Vec::new();
     let mut st = GfxState {
         ctm: Matrix::IDENTITY,
@@ -191,7 +224,7 @@ pub fn vector_paths_from_ops(
     let mut cur = (0.0f64, 0.0f64);
     let mut start = (0.0f64, 0.0f64);
 
-    for op in operations {
+    for (op_pos, op) in operations.iter().enumerate() {
         let operator = op.operator.as_slice();
         let n = nums(op);
         match operator {
@@ -351,17 +384,20 @@ pub fn vector_paths_from_ops(
                 let fill = paints_fill(operator).then_some(st.fill);
                 let stroke = paints_stroke(operator).then_some(st.stroke);
                 let bounds = path_bounds(&path);
-                out.push(VectorPath {
-                    index: out.len(),
-                    bounds,
-                    segments: std::mem::take(&mut path),
-                    fill,
-                    stroke,
-                    stroke_width: st.line_width,
-                    fill_alpha: st.fill_alpha,
-                    stroke_alpha: st.stroke_alpha,
-                    dash: st.dash.clone(),
-                });
+                out.push((
+                    VectorPath {
+                        index: out.len(),
+                        bounds,
+                        segments: std::mem::take(&mut path),
+                        fill,
+                        stroke,
+                        stroke_width: st.line_width,
+                        fill_alpha: st.fill_alpha,
+                        stroke_alpha: st.stroke_alpha,
+                        dash: st.dash.clone(),
+                    },
+                    op_pos,
+                ));
             }
             _ => {}
         }

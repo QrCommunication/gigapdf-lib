@@ -1269,6 +1269,166 @@ pub fn move_element(content: &[u8], index: usize, dx: f64, dy: f64) -> Result<Ve
     Ok(encode_content(&operations))
 }
 
+/// Apply an arbitrary affine transform to the element at `index` by wrapping its
+/// operations in `q … Q` with the caller's matrix `m = [a, b, c, d, e, f]`.
+///
+/// This generalises [`move_element`] (whose `cm` is the pure translate
+/// `[1, 0, 0, 1, dx, dy]`) to a full `cm`, so it covers scale, rotation, shear
+/// and translation in one call. Because everything happens via the matrix, it
+/// works identically for text, images and shapes — their internal coordinates
+/// are never touched. The emitted wrapping is exactly:
+/// `q  a b c d e f cm  <element ops>  Q`.
+pub fn transform_element(content: &[u8], index: usize, m: [f64; 6]) -> Result<Vec<u8>> {
+    let mut operations = parse_content(content)?;
+    let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;
+
+    // Insert closing `Q` after the element, then `q` + `cm` before it, so the
+    // final order is: q  a b c d e f cm  <element ops>  Q
+    operations.insert(
+        element.op_end + 1,
+        Operation {
+            operator: b"Q".to_vec(),
+            operands: Vec::new(),
+        },
+    );
+    operations.insert(
+        element.op_start,
+        Operation {
+            operator: b"cm".to_vec(),
+            operands: vec![
+                Object::Real(m[0]),
+                Object::Real(m[1]),
+                Object::Real(m[2]),
+                Object::Real(m[3]),
+                Object::Real(m[4]),
+                Object::Real(m[5]),
+            ],
+        },
+    );
+    operations.insert(
+        element.op_start,
+        Operation {
+            operator: b"q".to_vec(),
+            operands: Vec::new(),
+        },
+    );
+    Ok(encode_content(&operations))
+}
+
+/// An in-place restyle for a vector path: any `Some(_)` field overrides that part
+/// of the graphics state for the path's paint; `None` fields keep the inherited
+/// state. RGB colours are `0.0..=1.0` per channel; `dash` is the `d` array
+/// (empty = solid). `*_alpha` are best-effort (see [`set_path_style`]).
+#[derive(Debug, Clone, Default)]
+pub struct PathStyle {
+    /// Non-stroking (fill) colour, `r g b rg`.
+    pub fill: Option<[f64; 3]>,
+    /// Stroking colour, `r g b RG`.
+    pub stroke: Option<[f64; 3]>,
+    /// Line width, `w w`.
+    pub stroke_width: Option<f64>,
+    /// Non-stroking alpha (`/ca`). Cannot be set by an inline content operator —
+    /// see [`set_path_style`]; ignored when no resource-level `gs` is available.
+    pub fill_alpha: Option<f64>,
+    /// Stroking alpha (`/CA`). Same limitation as `fill_alpha`.
+    pub stroke_alpha: Option<f64>,
+    /// Dash pattern (`[ … ] 0 d`), empty array = solid.
+    pub dash: Option<Vec<f64>>,
+}
+
+/// Re-style the **path** element at `index` in place, wrapping its operation
+/// range in `q … Q` and **injecting** the requested state operators *before* the
+/// path's construction + paint ops, so they override the inherited graphics
+/// state for that run only. The original paint operator (`f`/`S`/`B`/`b`…) is
+/// preserved — it now paints with the overridden state — and the `q/Q` isolates
+/// the change from following content. The original colour operators in the
+/// element are **not** mutated in situ.
+///
+/// Returns `Err` if the element at `index` is not a [`ElementKind::Path`].
+///
+/// Only `Some(_)` fields emit an operator (`fill`→`r g b rg`, `stroke`→
+/// `r g b RG`, `stroke_width`→`w w`, `dash`→`[ … ] 0 d`); `None` fields are left
+/// to the inherited state.
+///
+/// **Alpha limitation:** PDF opacity (`/ca`, `/CA`) can only be set via the `gs`
+/// operator, which references a *named* `/ExtGState` resource — something a pure
+/// content-stream edit cannot create. So `fill_alpha`/`stroke_alpha` are
+/// accepted for API symmetry but are **not** emitted here (skipped rather than
+/// risk corrupting the stream). Use the resource-level shape-drawing APIs (which
+/// register an `ExtGState`) when opacity is required.
+pub fn set_path_style(content: &[u8], index: usize, style: &PathStyle) -> Result<Vec<u8>> {
+    let mut operations = parse_content(content)?;
+    let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;
+    if element.kind != ElementKind::Path {
+        return Err(EngineError::Unsupported(format!(
+            "set_path_style: element #{index} is not a path"
+        )));
+    }
+
+    // Build the override operators to inject right after the opening `q`, before
+    // the path's own construction + paint ops.
+    let mut overrides: Vec<Operation> = Vec::new();
+    if let Some([r, g, b]) = style.fill {
+        overrides.push(rgb_op(b"rg", r, g, b));
+    }
+    if let Some([r, g, b]) = style.stroke {
+        overrides.push(rgb_op(b"RG", r, g, b));
+    }
+    if let Some(width) = style.stroke_width {
+        overrides.push(Operation {
+            operator: b"w".to_vec(),
+            operands: vec![Object::Real(width)],
+        });
+    }
+    if let Some(dash) = &style.dash {
+        overrides.push(Operation {
+            operator: b"d".to_vec(),
+            operands: vec![
+                Object::Array(dash.iter().map(|v| Object::Real(*v)).collect()),
+                Object::Integer(0),
+            ],
+        });
+    }
+    // `fill_alpha`/`stroke_alpha` are intentionally not emitted — see the doc
+    // comment: opacity needs a named `/ExtGState`, unavailable to an inline edit.
+
+    // Insert closing `Q` after the element, then `q` + the overrides before it,
+    // so the final order is: q  <overrides>  <element ops>  Q
+    operations.insert(
+        element.op_end + 1,
+        Operation {
+            operator: b"Q".to_vec(),
+            operands: Vec::new(),
+        },
+    );
+    // Insert overrides in reverse at op_start so they end up in declared order.
+    for op in overrides.into_iter().rev() {
+        operations.insert(element.op_start, op);
+    }
+    operations.insert(
+        element.op_start,
+        Operation {
+            operator: b"q".to_vec(),
+            operands: Vec::new(),
+        },
+    );
+    Ok(encode_content(&operations))
+}
+
+/// One RGB colour-setting operation (`rg` for fill, `RG` for stroke).
+fn rgb_op(operator: &[u8], r: f64, g: f64, b: f64) -> Operation {
+    Operation {
+        operator: operator.to_vec(),
+        operands: vec![Object::Real(r), Object::Real(g), Object::Real(b)],
+    }
+}
+
 // ─── content creation (add shapes/frames) ────────────────────────────────────
 
 /// Format a number for a content stream (no scientific notation, trimmed).
@@ -1720,5 +1880,99 @@ BT /F 12 Tf (BODY) Tj ET";
             extract_marked_content_text(content, b"h").as_deref(),
             Some("ABC")
         );
+    }
+
+    #[test]
+    fn transform_element_wraps_in_q_cm_q() {
+        // A scale matrix should wrap the shape in `q a b c d e f cm … Q` without
+        // changing the structure (still one path) or its `re` op.
+        let content = b"10 10 100 50 re f";
+        let edited = transform_element(content, 0, [2.0, 0.0, 0.0, 2.0, 0.0, 0.0]).unwrap();
+        assert_eq!(count(&edited, b"cm"), 1, "transform matrix added");
+        assert!(
+            count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1,
+            "wrapped in q/Q"
+        );
+        assert_eq!(count(&edited, b"re"), 1, "the original re op is preserved");
+        let paths = extract_elements(&edited)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == ElementKind::Path)
+            .count();
+        assert_eq!(paths, 1, "still one shape after transform");
+    }
+
+    #[test]
+    fn transform_element_identity_roundtrips_structurally() {
+        // The identity matrix changes nothing visually; structurally it adds the
+        // q/cm/Q wrapper but re-parsing still yields the same kinds of elements.
+        let content = b"BT /F1 12 Tf 100 700 Td (Hi) Tj ET";
+        let edited = transform_element(content, 0, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap();
+        let runs = extract_text_runs(&edited).unwrap();
+        assert_eq!(runs.len(), 1, "still one text run");
+        assert_eq!(runs[0].text, "Hi", "text unchanged");
+        assert_eq!(count(&edited, b"cm"), 1);
+        assert!(count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1);
+    }
+
+    #[test]
+    fn set_path_style_injects_new_fill_before_paint() {
+        // Recolour a black rectangle red: a `1 0 0 rg` must be injected inside the
+        // q/Q wrapper, the original `re`/`f` ops preserved, and the path still
+        // reports the new fill colour when re-extracted.
+        let content = b"10 10 100 50 re f";
+        let style = PathStyle {
+            fill: Some([1.0, 0.0, 0.0]),
+            ..PathStyle::default()
+        };
+        let edited = set_path_style(content, 0, &style).unwrap();
+        assert!(count(&edited, b"rg") >= 1, "fill colour op injected");
+        assert_eq!(count(&edited, b"re"), 1, "original construction preserved");
+        assert!(count(&edited, b"f") >= 1, "original paint preserved");
+        assert!(count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1, "wrapped");
+        let paths = vector::vector_paths_from_ops(
+            &parse_content(&edited).unwrap(),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].fill, Some([1.0, 0.0, 0.0]), "fill is now red");
+    }
+
+    #[test]
+    fn set_path_style_sets_stroke_width_and_dash() {
+        // Stroke a line: override stroke colour, width and dash. The injected ops
+        // (`RG`, `w`, `d`) appear and the path reports the new style.
+        let content = b"10 10 m 110 10 l S";
+        let style = PathStyle {
+            stroke: Some([0.0, 0.0, 1.0]),
+            stroke_width: Some(3.0),
+            dash: Some(vec![4.0, 2.0]),
+            ..PathStyle::default()
+        };
+        let edited = set_path_style(content, 0, &style).unwrap();
+        assert!(count(&edited, b"RG") >= 1, "stroke colour injected");
+        assert!(count(&edited, b" w") >= 1 || count(&edited, b"3 w") >= 1, "width injected");
+        assert!(count(&edited, b" d") >= 1, "dash injected");
+        let paths = vector::vector_paths_from_ops(
+            &parse_content(&edited).unwrap(),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].stroke, Some([0.0, 0.0, 1.0]));
+        assert!((paths[0].stroke_width - 3.0).abs() < 1e-9);
+        assert_eq!(paths[0].dash, vec![4.0, 2.0]);
+    }
+
+    #[test]
+    fn set_path_style_on_non_path_index_errors() {
+        // A text run is not a path → set_path_style must return Err.
+        let content = b"BT /F1 12 Tf 0 0 Td (txt) Tj ET";
+        let text_index = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .position(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        let result = set_path_style(content, text_index, &PathStyle::default());
+        assert!(result.is_err(), "styling a text element must fail");
     }
 }

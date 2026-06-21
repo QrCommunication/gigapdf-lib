@@ -42,6 +42,8 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `replace_text_run(page,i,&str)` (font-aware: re-encodes Type0/Identity-H runs through the font's char→glyph map) | `gp_replace_text(handle,page,i,ptr,len)` |
 | `remove_text_run(page,i)` / `remove_element(page,i)` | `gp_remove_element(handle,page,i)` |
 | `move_element(page,i,dx,dy)` | `gp_move_element(handle,page,i,dx,dy)` |
+| `transform_element(page,i,[a,b,c,d,e,f])` (affine generalisation of `move_element`; wraps the element in `q a b c d e f cm … Q` — move/resize/rotate, non-destructive, same for text/image/path) | `gp_transform_element(handle,page,i,a,b,c,d,e,f)` · SDK `transformElement(page,i,m)` |
+| `set_path_style(page,i,&PathStyle)` (path elements only; wraps the op range in `q … Q` and injects override ops before the paint: `fill`→`rg`, `stroke`→`RG`, `strokeWidth`→`w`, `dash`→`d`. `fillAlpha`/`strokeAlpha` accepted but **not** applied — needs an `/ExtGState`) | `gp_set_path_style_json(handle,page,i,json_ptr,json_len)` · SDK `setPathStyle(page,i,style)`; `PathStyle = {fill?,stroke?:[r,g,b] 0..=1, strokeWidth?, fillAlpha?, strokeAlpha?, dash?:number[]}` |
 | `duplicate_element(page,i)` | `gp_duplicate_element(handle,page,i)` |
 | `add_rectangle(page,x,y,w,h,stroke,fill,lw,opacity)` | `gp_add_rectangle(...)` |
 | `add_line(page,x1,y1,x2,y2,stroke,lw,opacity)` | `gp_draw_line(...)` |

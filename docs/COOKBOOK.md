@@ -39,6 +39,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Annotate (highlight, note, ink, stamp)](#annotate)
 - [Sign with a PKCS#12 identity](#sign-with-a-pkcs12-identity)
 - [Encrypt with AES-256](#encrypt-with-aes-256)
+- [Move, resize & restyle existing elements in place](#move-resize--restyle-existing-elements-in-place)
 - [Round-trip the unified editable model](#round-trip-the-unified-editable-model)
 
 ---
@@ -493,6 +494,78 @@ const reopened = giga.openEncrypted(locked, "user-pw"); // null on wrong passwor
 reopened?.close();
 const info = giga.encryptionInfo(locked); // { encrypted, permissions, version, revision }
 ```
+
+---
+
+## Move, resize & restyle existing elements in place
+
+Two in-place editors operate on the existing content stream — they wrap the
+target element's ops in `q … Q` and inject only the override operators, so the
+edit is **non-destructive** (internal coordinates are never rewritten) and the
+rest of the page is untouched.
+
+### Move + resize an image with `transformElement`
+
+`transformElement(page, index, m)` applies a full affine PDF matrix
+`m = [a, b, c, d, e, f]` (scale / rotate / shear / translate) to an element. It
+**generalises** `moveElement` — whose matrix is the pure translate
+`[1,0,0,1,dx,dy]` — to move **and** resize **and** rotate in a single call, and
+because it is purely matrix-based it works identically for text, images and
+shapes. The engine emits `q  a b c d e f cm  <element ops>  Q`.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Find the image we want to shrink + reposition (element index on page 1).
+const imgs = doc.imageElements(1);
+const index = imgs[0].index;
+
+// Scale to 50% (a = d = 0.5), no rotation/shear (b = c = 0), and translate
+// +100pt right / +40pt up (e = 100, f = 40). One call = move + resize.
+doc.transformElement(1, index, [0.5, 0, 0, 0.5, 100, 40]); // true on success
+
+// Rotate an element 90° CCW about its own origin: [cosθ, sinθ, −sinθ, cosθ, 0, 0].
+// doc.transformElement(1, index, [0, 1, -1, 0, 0, 0]);
+
+const out = doc.save();
+doc.close();
+```
+
+### Restyle a vector path with `setPathStyle`
+
+`setPathStyle(page, index, style)` re-styles a **path** element in place — it
+returns `false` for any non-path index. Colours are RGB `[r,g,b]` in `0..=1` and
+`dash` is the PDF dash array (`[]` = solid). For each field you set, one override
+operator is injected before the path's paint op (`fill`→`r g b rg`,
+`stroke`→`r g b RG`, `strokeWidth`→`w`, `dash`→`[…] 0 d`); omitted fields keep
+the inherited graphics state.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Find the path we want to recolour (e.g. the first painted path on page 1).
+const paths = doc.vectorPaths(1);
+const index = doc.elements(1).findIndex((e) => e.kind === "path");
+
+// Fill red, 2pt black stroke, dashed 4-on / 2-off.
+const ok = doc.setPathStyle(1, index, {
+  fill: [1, 0, 0],
+  stroke: [0, 0, 0],
+  strokeWidth: 2,
+  dash: [4, 2],
+});
+// ok === false would mean `index` isn't a path.
+
+const out = doc.save();
+doc.close();
+```
+
+> **Opacity is not applied.** `fillAlpha` / `strokeAlpha` are accepted for API
+> symmetry but have **no effect** — PDF opacity requires a named `/ExtGState`
+> resource, which a pure content-stream edit can't create. When you need real
+> transparency, draw the shape with a resource-level helper instead
+> (`addRectangle` / `addEllipse` / `addPath` / … all take an `opacity` argument
+> that allocates the `/ExtGState`).
 
 ---
 

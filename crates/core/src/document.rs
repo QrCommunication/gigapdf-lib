@@ -580,11 +580,17 @@ pub struct TextElementInfo {
 
 /// One image element from [`Document::page_image_elements`]: its placement box
 /// (page user space, origin bottom-left), the embeddable encoded bytes and
-/// their format, and the source pixel dimensions. `index` is its position among
-/// the page's image elements — the native equivalent of a reader's image
+/// their format, and the source pixel dimensions. `index` is the **unified
+/// [`ContentElement`](crate::content::ContentElement) index** (the value accepted
+/// by `remove_element`/`transform_element`), so a host can extract an image and
+/// edit *that exact* image — the native equivalent of a reader's image
 /// extraction, returning bytes a host can display or re-embed.
 #[derive(Debug, Clone)]
 pub struct ImageElementInfo {
+    /// The image's unified element index — identical to the matching
+    /// [`ContentElement::index`](crate::content::ContentElement::index) and usable
+    /// directly with `remove_element` / `transform_element`. **Not** an
+    /// image-local 0,1,2 counter.
     pub index: usize,
     pub x: f64,
     pub y: f64,
@@ -1599,11 +1605,41 @@ impl Document {
     /// fill/stroke RGB colours, line width, alpha and dash. Clip-only paths are
     /// omitted. The native equivalent of a reader's vector/shape layer, driving a
     /// host editor without a rasteriser.
+    ///
+    /// Each path's [`index`](content::vector::VectorPath::index) is the **unified
+    /// [`ContentElement`](content::ContentElement) index** — the very value
+    /// accepted by [`remove_element`](Self::remove_element),
+    /// [`transform_element`](Self::transform_element) and
+    /// [`set_path_style`](Self::set_path_style) — so a host can extract a path and
+    /// edit *that exact* path. The index is correlated by the path's paint-operator
+    /// position against the matching `Path`-kind element's `op_end`, which is robust
+    /// to count divergence: a clip-only `… W n` path yields a `Path` element but no
+    /// vector path, so its index is simply not reported here (never mis-assigned).
     pub fn page_vector_paths(&self, page_no: u32) -> Result<Vec<content::vector::VectorPath>> {
         let content = self.page_content(page_no)?;
         let gstate = self.page_gstate_alpha_pair(page_no);
         let operations = content::parse_content(&content)?;
-        Ok(content::vector::vector_paths_from_ops(&operations, &gstate))
+        let mut paths = content::vector::vector_paths_from_ops_with_pos(&operations, &gstate);
+
+        // Unified `Path`-kind elements, in content-stream order; each carries the
+        // paint operator's op index as `op_end`. Map paint-op position → unified
+        // `ContentElement.index`.
+        let elements = self.page_elements(page_no).unwrap_or_default();
+        let by_paint_op: BTreeMap<usize, usize> = elements
+            .iter()
+            .filter(|e| e.kind == content::ElementKind::Path)
+            .map(|e| (e.op_end, e.index))
+            .collect();
+
+        Ok(paths
+            .drain(..)
+            .map(|(mut path, paint_op_pos)| {
+                if let Some(&unified) = by_paint_op.get(&paint_op_pos) {
+                    path.index = unified;
+                }
+                path
+            })
+            .collect())
     }
 
     /// Every **text** element on a page, enriched with everything a host editor
@@ -1695,7 +1731,11 @@ impl Document {
         let Ok(elements) = self.page_elements(page_no) else {
             return Vec::new();
         };
-        let images: Vec<(content::Bounds, String, f64, f64)> = elements
+        // Carry each image element's **unified `ContentElement.index`** (the value
+        // accepted by `remove_element`/`transform_element`) through to the reported
+        // index — NOT an image-local 0,1,2 counter, which would target the wrong
+        // element on any page that also has text/paths.
+        let images: Vec<(usize, content::Bounds, String, f64, f64)> = elements
             .into_iter()
             .filter(|e| e.kind == content::ElementKind::Image)
             .map(|e| {
@@ -1707,17 +1747,17 @@ impl Document {
                 });
                 let rotation = e.rotation_deg.unwrap_or(0.0);
                 let opacity = e.fill_alpha.unwrap_or(1.0);
-                (b, e.label, rotation, opacity)
+                (e.index, b, e.label, rotation, opacity)
             })
             .collect();
         let mut out = Vec::new();
-        for (idx, (b, name, rotation, opacity)) in images.into_iter().enumerate() {
+        for (index, b, name, rotation, opacity) in images.into_iter() {
             let Some((format, data, pw, ph)) = self.image_xobject_bytes(page_no, name.as_bytes())
             else {
                 continue;
             };
             out.push(ImageElementInfo {
-                index: idx,
+                index,
                 x: b.x,
                 y: b.y,
                 width: b.width,
@@ -4637,6 +4677,29 @@ impl Document {
     pub fn move_element(&mut self, page_no: u32, index: usize, dx: f64, dy: f64) -> Result<()> {
         let content = self.page_content(page_no)?;
         let edited = content::move_element(&content, index, dx, dy)?;
+        self.set_page_content(page_no, edited)
+    }
+
+    /// Apply a full affine transform `m = [a, b, c, d, e, f]` to an element
+    /// (text, image, or shape) by wrapping it in `q … cm … Q`. Generalises
+    /// [`move_element`] (whose matrix is a pure translate) to scale/rotate/shear.
+    pub fn transform_element(&mut self, page_no: u32, index: usize, m: [f64; 6]) -> Result<()> {
+        let content = self.page_content(page_no)?;
+        let edited = content::transform_element(&content, index, m)?;
+        self.set_page_content(page_no, edited)
+    }
+
+    /// Re-style the **path** element at `index` in place (fill/stroke colour,
+    /// line width, dash). `Err` if the element is not a path. Opacity fields are
+    /// best-effort — see [`content::set_path_style`].
+    pub fn set_path_style(
+        &mut self,
+        page_no: u32,
+        index: usize,
+        style: &content::PathStyle,
+    ) -> Result<()> {
+        let content = self.page_content(page_no)?;
+        let edited = content::set_path_style(&content, index, style)?;
         self.set_page_content(page_no, edited)
     }
 
@@ -11027,6 +11090,215 @@ mod tests {
             "decoded content should contain a text operator ({} bytes)",
             content.len()
         );
+    }
+
+    /// Register a DCTDecode (JPEG-passthrough) image XObject under a fresh name in
+    /// `page_no`'s `/Resources /XObject` and return its name. The bytes are opaque
+    /// (passthrough), so extraction succeeds without needing a real codec — exactly
+    /// what `page_image_elements` reports as `format == "jpeg"`.
+    fn register_test_image(doc: &mut Document, page_no: u32, pw: i64, ph: i64) -> Vec<u8> {
+        let bytes = vec![0xFFu8, 0xD8, 0xFF, 0xD9]; // tiny opaque "jpeg" payload
+        let mut dict = Dictionary::new();
+        dict.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+        dict.set(b"Subtype".to_vec(), Object::Name(b"Image".to_vec()));
+        dict.set(b"Width".to_vec(), Object::Integer(pw));
+        dict.set(b"Height".to_vec(), Object::Integer(ph));
+        dict.set(b"BitsPerComponent".to_vec(), Object::Integer(8));
+        dict.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec()));
+        dict.set(b"Filter".to_vec(), Object::Name(b"DCTDecode".to_vec()));
+        dict.set(b"Length".to_vec(), Object::Integer(bytes.len() as i64));
+        let img_id = (doc.next_object_number(), 0u16);
+        doc.objects
+            .insert(img_id, Object::Stream(Stream::new(dict, bytes)));
+        doc.register_page_resource(page_no, b"XObject", "GpTestImg", Object::Reference(img_id))
+            .unwrap()
+    }
+
+    /// Build a single page whose content stream mixes, in stream order:
+    /// `[text, image, path, image]`. Returns the document plus the two image names.
+    /// The unified `ContentElement` indices are therefore: text=0, image=1,
+    /// path=2, image=3 — chosen so the per-kind local index (image-local 0,1;
+    /// path-local 0) DIFFERS from the unified index, which is the whole point.
+    fn page_with_text_image_path_image() -> (Document, Vec<u8>, Vec<u8>) {
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        let im0 = register_test_image(&mut doc, 1, 10, 10);
+        let im1 = register_test_image(&mut doc, 1, 20, 20);
+
+        // text → image(im0) → path(rectangle, filled) → image(im1)
+        let content = format!(
+            "BT /F0 12 Tf 50 750 Td (Hello) Tj ET\n\
+             q 40 0 0 40 100 600 cm /{im0} Do Q\n\
+             1 0 0 rg 100 400 80 60 re f\n\
+             q 30 0 0 30 300 200 cm /{im1} Do Q\n",
+            im0 = String::from_utf8_lossy(&im0),
+            im1 = String::from_utf8_lossy(&im1),
+        );
+        doc.set_page_content(1, content.into_bytes()).unwrap();
+        (doc, im0, im1)
+    }
+
+    #[test]
+    fn image_elements_report_unified_index_not_image_local() {
+        let (doc, _im0, _im1) = page_with_text_image_path_image();
+
+        // Sanity: the unified element model is [text, image, path, image].
+        let elements = doc.page_elements(1).unwrap();
+        let kinds: Vec<_> = elements.iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                content::ElementKind::Text,
+                content::ElementKind::Image,
+                content::ElementKind::Path,
+                content::ElementKind::Image,
+            ],
+            "stream order must be text, image, path, image"
+        );
+
+        let imgs = doc.page_image_elements(1);
+        assert_eq!(imgs.len(), 2, "two images extracted");
+        // Image-local would be 0 and 1; unified is 1 and 3.
+        assert_eq!(imgs[0].index, 1, "1st image's unified index is 1, not 0");
+        assert_eq!(imgs[1].index, 3, "2nd image's unified index is 3, not 1");
+
+        // Each reported index resolves to an Image element in the unified model.
+        for img in &imgs {
+            assert_eq!(elements[img.index].kind, content::ElementKind::Image);
+        }
+    }
+
+    #[test]
+    fn image_element_index_roundtrips_through_remove_element() {
+        let (mut doc, _im0, _im1) = page_with_text_image_path_image();
+        let imgs = doc.page_image_elements(1);
+        let second_index = imgs[1].index; // 3
+        assert_eq!(second_index, 3);
+
+        // Remove the 2ND image by its reported index. If the index were
+        // image-local (1) it would target the wrong unified element; with the
+        // unified index (3) it removes exactly that image.
+        doc.remove_element(1, second_index).unwrap();
+
+        let after = doc.page_image_elements(1);
+        assert_eq!(after.len(), 1, "exactly one image removed");
+        assert_eq!(
+            after[0].index, 1,
+            "the surviving image is the FIRST one (unified index 1)"
+        );
+
+        // Text + path survive intact: [text, image, path].
+        let kinds: Vec<_> = doc.page_elements(1).unwrap().iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                content::ElementKind::Text,
+                content::ElementKind::Image,
+                content::ElementKind::Path,
+            ],
+            "removing the 2nd image leaves text + 1st image + path"
+        );
+    }
+
+    #[test]
+    fn image_element_index_roundtrips_through_transform_element() {
+        let (mut doc, _im0, _im1) = page_with_text_image_path_image();
+        let imgs = doc.page_image_elements(1);
+        let target = imgs[1].clone(); // 2nd image, unified index 3
+        let before_x = target.x;
+        let first_x = imgs[0].x;
+
+        // Translate the 2ND image using its reported (unified) index. The transform
+        // is applied in the element's own coordinate space (its `cm` is composed
+        // after the placement CTM), so we don't assert an exact page-space delta —
+        // only that THIS image moved and the OTHER did not.
+        doc.transform_element(1, target.index, [1.0, 0.0, 0.0, 1.0, 500.0, 0.0])
+            .unwrap();
+
+        let after = doc.page_image_elements(1);
+        assert_eq!(after.len(), 2);
+        // The 1st image (unified index 1) must be untouched…
+        assert!(
+            (after[0].x - first_x).abs() < 1e-6,
+            "1st image must not move (was {first_x}, now {})",
+            after[0].x
+        );
+        // …and the 2nd image must have shifted in +x (the targeted element).
+        assert!(
+            after[1].x > before_x + 1.0,
+            "2nd image must move right: was {before_x}, now {}",
+            after[1].x
+        );
+    }
+
+    #[test]
+    fn vector_path_index_is_unified_and_roundtrips_through_set_path_style() {
+        let (mut doc, _im0, _im1) = page_with_text_image_path_image();
+
+        let paths = doc.page_vector_paths(1).unwrap();
+        assert_eq!(paths.len(), 1, "one painted path");
+        // Path-local index would be 0; unified index is 2.
+        assert_eq!(paths[0].index, 2, "path's unified index is 2, not 0");
+        assert_eq!(
+            doc.page_elements(1).unwrap()[paths[0].index].kind,
+            content::ElementKind::Path
+        );
+
+        // Restyle that path (fill → blue) by its reported index. A wrong index (0)
+        // would hit the text element and `set_path_style` would error.
+        let style = content::PathStyle {
+            fill: Some([0.0, 0.0, 1.0]),
+            ..Default::default()
+        };
+        doc.set_path_style(1, paths[0].index, &style).unwrap();
+
+        // The path is still there and now carries the blue fill.
+        let after = doc.page_vector_paths(1).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].fill, Some([0.0, 0.0, 1.0]), "fill restyled to blue");
+    }
+
+    #[test]
+    fn vector_path_index_skips_clip_only_paths() {
+        // [text, clip-only path (W n → Path element but NO VectorPath), painted
+        // path]. The painted path's unified index must be 2 (after text=0 and the
+        // clip-only Path element=1), proving the correlation is robust to the
+        // element/vector count divergence.
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        let content = b"BT /F0 12 Tf 50 750 Td (Hi) Tj ET\n\
+                        0 0 50 50 re W n\n\
+                        1 0 0 rg 100 100 40 40 re f\n"
+            .to_vec();
+        doc.set_page_content(1, content).unwrap();
+
+        let kinds: Vec<_> = doc.page_elements(1).unwrap().iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                content::ElementKind::Text,
+                content::ElementKind::Path, // clip-only `… W n`
+                content::ElementKind::Path, // the painted `re f`
+            ],
+            "clip-only path is a Path element too"
+        );
+
+        let paths = doc.page_vector_paths(1).unwrap();
+        assert_eq!(paths.len(), 1, "only the painted path is a VectorPath");
+        assert_eq!(
+            paths[0].index, 2,
+            "painted path's unified index is 2 (clip-only path took index 1)"
+        );
+
+        // And that unified index restyles the painted path, not the clip path.
+        // (The painted path is filled, so we override its fill.)
+        let style = content::PathStyle {
+            fill: Some([0.0, 1.0, 0.0]),
+            ..Default::default()
+        };
+        doc.set_path_style(1, paths[0].index, &style).unwrap();
+        let after = doc.page_vector_paths(1).unwrap();
+        assert_eq!(after[0].fill, Some([0.0, 1.0, 0.0]));
     }
 
     #[test]

@@ -1185,6 +1185,13 @@ export type ModelOp =
  * and the source pixel dimensions. `data` is empty when `format` is `"unknown"`.
  */
 export interface ImageElementInfo {
+  /**
+   * The image's **unified element index** — the same value accepted by
+   * {@link GigaPdfDoc.removeElement} / {@link GigaPdfDoc.transformElement} /
+   * {@link GigaPdfDoc.duplicateElement} / {@link GigaPdfDoc.moveElement}. Extract
+   * an image here and pass this index to edit *that exact* image. It is **not** an
+   * image-local 0,1,2 counter, so it is correct on pages that also have text/paths.
+   */
   index: number;
   x: number;
   y: number;
@@ -1218,6 +1225,13 @@ export interface PathSegment {
  * paths are omitted. The native equivalent of a reader's shape/vector layer.
  */
 export interface VectorPathInfo {
+  /**
+   * The path's **unified element index** — the same value accepted by
+   * {@link GigaPdfDoc.setPathStyle} / {@link GigaPdfDoc.removeElement} /
+   * {@link GigaPdfDoc.transformElement}. Extract a path here and pass this index
+   * to restyle or remove *that exact* path. Clip-only paths are not reported, so
+   * the painted path you see is the one your index targets — not a path-local ordinal.
+   */
   index: number;
   /** Whether `x0..y1` describe a real box (`false` for a degenerate path). */
   hasBounds: boolean;
@@ -1560,6 +1574,10 @@ export class GigaPdfDoc {
    * `unknown`), and the source pixel dimensions. DCTDecode/JPXDecode images pass
    * through as jpeg/jp2; Flate/raw DeviceRGB|DeviceGray are re-encoded to PNG.
    * The native replacement for a reader's image extraction (bytes + placement).
+   *
+   * Each result's `index` is the **unified element index** usable directly with
+   * {@link removeElement} / {@link transformElement} / {@link duplicateElement} /
+   * {@link moveElement} — so you can extract an image and edit *that exact* image.
    */
   imageElements(page: number): ImageElementInfo[] {
     const raw = this.g._json<Array<Omit<ImageElementInfo, 'data'> & { dataBase64: string }>>((o) =>
@@ -1576,6 +1594,10 @@ export class GigaPdfDoc {
    * fill/stroke RGB, line width, alpha and dash. Clip-only paths are omitted.
    * The native replacement for walking a reader's operator list to rebuild the
    * shape layer.
+   *
+   * Each result's `index` is the **unified element index** usable directly with
+   * {@link setPathStyle} / {@link removeElement} / {@link transformElement} — so
+   * you can extract a path and restyle/remove *that exact* path.
    */
   vectorPaths(page: number): VectorPathInfo[] {
     return this.g._json((o) => this.ex().gp_vector_paths_json(this.h, page, o));
@@ -1613,6 +1635,57 @@ export class GigaPdfDoc {
   }
   moveElement(page: number, index: number, dx: number, dy: number): boolean {
     return this.ex().gp_move_element(this.h, page, index, dx, dy) === 0;
+  }
+  /**
+   * Apply a full affine transform to element `index` on `page`, wrapping it in
+   * `q … cm … Q` with the matrix `m = [a, b, c, d, e, f]`. This **generalises**
+   * {@link moveElement} (whose matrix is the pure translate `[1,0,0,1,dx,dy]`)
+   * to scale, rotation, shear and translation in one call. Because it is purely
+   * matrix-based it works identically for text, images and shapes — their
+   * internal coordinates are never touched. Returns `false` if the element/page
+   * doesn't exist.
+   */
+  transformElement(
+    page: number,
+    index: number,
+    m: [number, number, number, number, number, number]
+  ): boolean {
+    return (
+      this.ex().gp_transform_element(this.h, page, index, m[0], m[1], m[2], m[3], m[4], m[5]) === 0
+    );
+  }
+  /**
+   * Re-style the **path** element `index` on `page` in place: any provided field
+   * overrides that part of the graphics state for the path's paint; omitted
+   * fields keep the inherited state. Implemented by wrapping the path's op range
+   * in `q … Q` and injecting the requested state operators (`rg`/`RG`/`w`/`d`)
+   * before its construction + paint ops, so the original paint op now draws with
+   * the override and following content is unaffected. RGB colours are `[r,g,b]`
+   * in `0..=1`; `dash` is the PDF dash array (`[]` = solid). Returns `false` if
+   * the element is not a path (or the page/index doesn't exist).
+   *
+   * Opacity note: `fillAlpha`/`strokeAlpha` are accepted for API symmetry but
+   * are **not** emitted — PDF opacity needs a named `/ExtGState`, which a pure
+   * content-stream edit cannot create. Use the resource-level shape APIs when
+   * opacity is required.
+   */
+  setPathStyle(
+    page: number,
+    index: number,
+    style: {
+      fill?: [number, number, number];
+      stroke?: [number, number, number];
+      strokeWidth?: number;
+      fillAlpha?: number;
+      strokeAlpha?: number;
+      dash?: number[];
+    }
+  ): boolean {
+    return (
+      this.g._withStr(JSON.stringify(style), (p, l) =>
+        this.ex().gp_set_path_style_json(this.h, page, index, p, l)
+      ) === 0
+    );
   }
   duplicateElement(page: number, index: number): boolean {
     return this.ex().gp_duplicate_element(this.h, page, index) === 0;

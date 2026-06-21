@@ -271,7 +271,9 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   `mergePdfs` (concatenate many PDFs), `fontCatalog`/`fontRequestUrl`/`parseCssFontUrl`.
 - **`GigaPdfDoc`** — text intelligence (`textRuns`, `structuredText`, `search`,
   `ocr`, `ocrText`, `elements`, `elementAt`), editing (`replaceText`,
-  `removeElement`, `moveElement`, `duplicateElement`, `redact`), vector drawing
+  `removeElement`, `moveElement`, `transformElement` (full affine — move + resize
+  + rotate in place), `setPathStyle` (in-place vector restyle: fill/stroke/width/dash),
+  `duplicateElement`, `redact`), vector drawing
   (`addRectangle`, `drawLine`, `addEllipse`, `addPolygon`, `addPath` (SVG path),
   `addImage` (PNG/JPEG, alpha + opacity)), pages (`rotatePage`, `deletePage`,
   `movePage`, `appendPages`, `extractPages`, `resizePage`, `addPage`, `copyPage`,

@@ -44,7 +44,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 |------|--------------|
 | **Read** | PDF 1.7, xref + object streams, FlateDecode, encrypted (RC4/AESV2/AESV3) |
 | **Write** | Renumbering serializer, `save`, `save_compressed` (Flate streams) |
-| **Edit content** | Text edit/remove (with **underline / strikethrough** decorations), elements (text/image/shape) list/remove/move/duplicate/add; draw text/rect/line/ellipse/polygon/SVG-path/image (opacity + PNG alpha); hit-test |
+| **Edit content** | Text edit/remove (with **underline / strikethrough** decorations), elements (text/image/shape) list/remove/move/**affine-transform** (move + resize + rotate in place)/duplicate/add; **in-place vector restyle** (`setPathStyle`: fill/stroke/width/dash); draw text/rect/line/ellipse/polygon/SVG-path/image (opacity + PNG alpha); hit-test |
 | **Text extraction** | Font-aware, zero-tofu via WinAnsi + `/ToUnicode` CMap (CID/Type0); per-run colour/size/rotation/direction; document language detection |
 | **Headers / footers** | Bake a running header/footer onto an existing PDF (`{{page}}`/`{{pages}}` tokens) and **read back** what's baked; per-page margins read/write |
 | **Annotations** | Highlight, underline, strike-out, squiggly, free-text, square, line, ink, sticky note, stamp, link; rich read-back metadata; **flatten** |

@@ -66,6 +66,43 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("imageElements/vectorPaths report the unified index (round-trips through edits)", () => {
+    // Mixed page in stream order: text → image → path → image.
+    const doc = giga.open(giga.txtToPdf("mixed"));
+    const rgba = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]);
+    const png = giga.rgbaToPng(rgba, 2, 2);
+    expect(doc.addImage(1, png, 40, 600, 60, 60, 1)).toBe(true); // image #1
+    expect(doc.addRectangle(1, 100, 400, 80, 60, null, 0x0000ff, 1)).toBe(true); // filled path
+    expect(doc.addImage(1, png, 300, 200, 40, 40, 1)).toBe(true); // image #2
+
+    const imgs = doc.imageElements(1);
+    expect(imgs.length).toBe(2);
+    // Image-local would be 0 and 1; the two images' unified indices must differ
+    // and the 2nd must be strictly greater than the 1st (the path sits between).
+    expect(imgs[0].index).toBeLessThan(imgs[1].index);
+    expect(imgs[1].index - imgs[0].index).toBeGreaterThanOrEqual(2);
+
+    const paths = doc.vectorPaths(1);
+    expect(paths.length).toBe(1);
+    const pathIdx = paths[0]!.index;
+    // The path's unified index sits between the two image indices (text,img,path,img).
+    expect(pathIdx).toBeGreaterThan(imgs[0].index);
+    expect(pathIdx).toBeLessThan(imgs[1].index);
+
+    // Restyle THAT path by its reported index → fill turns green.
+    expect(doc.setPathStyle(1, pathIdx, { fill: [0, 1, 0] })).toBe(true);
+    expect(doc.vectorPaths(1)[0]!.fill).toEqual([0, 1, 0]);
+
+    // Remove the 2nd image by its reported (unified) index → only it goes.
+    expect(doc.removeElement(1, imgs[1].index)).toBe(true);
+    const after = doc.imageElements(1);
+    expect(after.length).toBe(1);
+    expect(after[0].index).toBe(imgs[0].index); // the FIRST image survived
+    // The path is still present too.
+    expect(doc.vectorPaths(1).length).toBe(1);
+    doc.close();
+  });
+
   it("edits (addRectangle with stroke flag) and round-trips a save", () => {
     const doc = giga.open(giga.txtToPdf("Edit me"));
     // Red stroke, no fill, 2pt — exercises the has_stroke/has_fill flags.

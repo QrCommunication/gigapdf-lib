@@ -127,6 +127,49 @@ ex.gp_add_text_standard_styled(handle, 1, 72, 700, 12, t.ptr, t.len, fn.ptr, fn.
 freeArg(t); freeArg(fn);
 ```
 
+### Move + resize an element in place (affine transform)
+
+`gp_move_element(handle, page, i, dx, dy)` only translates. To **move, resize
+and rotate** an element in one call, use `gp_transform_element` with a full PDF
+affine matrix `[a, b, c, d, e, f]`. It is non-destructive — the engine wraps the
+element in `q  a b c d e f cm  … Q`, so its internal coordinates are never
+rewritten and it behaves identically for text, images and shapes.
+
+```js
+// Image is element #0 on page 1. Halve its size and move it right 100pt / up 40pt.
+// Matrix: a=d=0.5 (scale 50%), b=c=0 (no rotation/shear), e=100, f=40 (translate).
+ex.gp_transform_element(handle, 1, 0, 0.5, 0.0, 0.0, 0.5, 100.0, 40.0); // 0 = success
+```
+
+A pure translate `[1,0,0,1,dx,dy]` is exactly what `gp_move_element` emits — so
+`transform_element` is its strict generalisation. For a rotation by θ (about the
+element's own origin) use `[cosθ, sinθ, −sinθ, cosθ, 0, 0]`.
+
+### Re-style a vector path in place
+
+`gp_set_path_style_json(handle, page, i, json_ptr, json_len)` re-styles a **path**
+element in place (it returns non-zero / `false` for a non-path index). The JSON is
+`{ fill?, stroke?, strokeWidth?, fillAlpha?, strokeAlpha?, dash? }` — colours are
+RGB `[r,g,b]` in `0..=1`, `dash` is the PDF dash array (`[]` = solid). Each
+provided field injects one override operator before the path's paint op
+(`fill`→`rg`, `stroke`→`RG`, `strokeWidth`→`w`, `dash`→`d`); the op range is
+wrapped in `q … Q` so following content is untouched.
+
+```js
+// Path is element #3 on page 1: fill red, 2pt stroke, dashed 4-on/2-off.
+const s = strArg(JSON.stringify({
+  fill: [1, 0, 0], stroke: [0, 0, 0], strokeWidth: 2, dash: [4, 2],
+}));
+ex.gp_set_path_style_json(handle, 1, 3, s.ptr, s.len); // 0 = success
+freeArg(s);
+```
+
+> **Opacity caveat.** `fillAlpha` / `strokeAlpha` are accepted for API symmetry
+> but are **not** applied — PDF opacity requires a named `/ExtGState` resource,
+> which a pure content-stream edit can't create. When you need real transparency,
+> draw the shape with the resource-level helpers (`gp_add_rectangle`, …) whose
+> `opacity` argument allocates the `/ExtGState`.
+
 ## 4b. Build an interactive form (AcroForm, no `pdf-lib`)
 
 Coordinates are PDF user space `[x0, y0, x1, y1]` (origin bottom-left). The style

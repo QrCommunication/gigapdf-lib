@@ -4,6 +4,35 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.57.0] - 2026-06-21
+
+### Added
+
+- **`transformElement(page, index, m)` — full affine transform of an element in
+  place.** Generalises `moveElement` (a translate-only `[1,0,0,1,dx,dy]` matrix)
+  to a complete PDF affine matrix `m = [a, b, c, d, e, f]` — scale, rotate, shear
+  and translate — so an element can be moved **and** resized **and** rotated in a
+  single call. Non-destructive: the element is wrapped in `q  a b c d e f cm  …
+  Q`, so its internal coordinates are never rewritten and it behaves identically
+  for text, images and shapes. New ABI `gp_transform_element(handle, page, index,
+  a, b, c, d, e, f)` and core `Document::transform_element` /
+  `content::transform_element`, alongside the existing `moveElement` /
+  `gp_move_element` (kept). Returns `false` for a missing page/element.
+- **`setPathStyle(page, index, style)` — in-place vector restyle.** Re-styles a
+  **path** element (returns `false` for a non-path index) without touching its
+  geometry: the path's op range is wrapped in `q … Q` and, for each provided
+  field, an override operator is injected before the paint op — `fill`→`r g b rg`,
+  `stroke`→`r g b RG`, `strokeWidth`→`w`, `dash`→`[…] 0 d`; omitted fields keep
+  the inherited graphics state. `style = { fill?, stroke?, strokeWidth?,
+  fillAlpha?, strokeAlpha?, dash? }`; colours are RGB `[r,g,b]` in `0..=1` and
+  `dash` is the PDF dash array (`[]` = solid). New ABI
+  `gp_set_path_style_json(handle, page, index, json_ptr, json_len)` and core
+  `content::set_path_style` + `PathStyle` / `Document::set_path_style`. **Note:**
+  `fillAlpha` / `strokeAlpha` are accepted for API symmetry but are **not**
+  applied — PDF opacity requires a named `/ExtGState` resource, which a pure
+  content-stream edit cannot create; use the resource-level shape APIs (whose
+  `opacity` argument allocates the `/ExtGState`) when real transparency is needed.
+
 ## [0.56.0] - 2026-06-21
 
 ### Added
