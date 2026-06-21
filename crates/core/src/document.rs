@@ -513,22 +513,57 @@ impl Default for TextFieldStyle {
 }
 
 /// Parse a default-appearance string (`/DA`, e.g. `0 0 1 rg /Helv 12 Tf`) for
-/// the point size and fill colour the field's text should use. Recognises the
-/// `… N Tf` size and the `g` / `rg` / `k` colour operators (the last colour set
-/// wins, mirroring how a content stream evaluates). Unparsed `/DA`s leave the
-/// defaults (size 0 = auto, black).
+/// the point size and fill colour the field's text should use. Thin wrapper over
+/// [`parse_da_full`] dropping the font resource name.
 fn parse_da(da: &str) -> (f64, [f64; 3]) {
+    let (_, size, color) = parse_da_full(da);
+    (size, color)
+}
+
+/// Map a base-14 classification to the `BaseEncoding` implied by its built-in
+/// encoding: `Symbol` and `ZapfDingbats` carry their own (so their bytes decode
+/// to Greek/maths and dingbats, not Latin); the Latin base-14 families don't
+/// override the document's `/Encoding`, so they yield `None`.
+fn base14_to_base_encoding(
+    kind: crate::font::bundled::Base14,
+) -> Option<crate::font::encoding::BaseEncoding> {
+    use crate::font::bundled::Base14;
+    use crate::font::encoding::BaseEncoding;
+    match kind {
+        Base14::Symbol => Some(BaseEncoding::Symbol),
+        Base14::ZapfDingbats => Some(BaseEncoding::ZapfDingbats),
+        Base14::Sans | Base14::Serif | Base14::Mono => None,
+    }
+}
+
+/// Parse a `/DA` string for the **font resource name** (the `/Name` operand of
+/// `Tf`, e.g. `Helv`, `ZaDb`, `F1` — without the leading slash), the point size,
+/// and the fill colour. Recognises the `/Name N Tf` font+size and the `g` / `rg`
+/// / `k` colour operators (the last colour set wins, mirroring how a content
+/// stream evaluates). Unparsed `/DA`s leave the defaults (no font, size 0 =
+/// auto, black). The font name is what the regenerated appearance's `Tf` and its
+/// `/Resources /Font` key must use, so it resolves against the AcroForm `/DR`.
+fn parse_da_full(da: &str) -> (Option<String>, f64, [f64; 3]) {
     let toks: Vec<&str> = da.split_whitespace().collect();
+    let mut font: Option<String> = None;
     let mut size = 0.0f64;
     let mut color = [0.0f64, 0.0, 0.0];
     let num = |s: &str| s.parse::<f64>().ok();
     for (i, &tok) in toks.iter().enumerate() {
         match tok {
-            // `<size> Tf` — the operand right before `Tf`.
+            // `/Name <size> Tf` — operands right before `Tf`.
             "Tf" => {
                 if let Some(v) = i.checked_sub(1).and_then(|j| toks.get(j)).and_then(|s| num(s)) {
                     if v > 0.0 {
                         size = v;
+                    }
+                }
+                // The font resource name is two tokens back, a `/Name`.
+                if let Some(name) = i.checked_sub(2).and_then(|j| toks.get(j)) {
+                    if let Some(stripped) = name.strip_prefix('/') {
+                        if !stripped.is_empty() {
+                            font = Some(stripped.to_string());
+                        }
                     }
                 }
             }
@@ -568,27 +603,30 @@ fn parse_da(da: &str) -> (f64, [f64; 3]) {
             _ => {}
         }
     }
-    (size, color)
+    (font, size, color)
 }
-
-/// The font resource name used inside generated form appearances. Points at the
-/// embedded simple-TrueType fallback (see `ensure_form_render_font`) so the text
-/// rasterizes with our own engine *and* in external viewers.
-const FORM_FONT_RES: &[u8] = b"GpFormSans";
 
 /// Build a field's appearance form (dictionary without `/Length`) and its
 /// content stream, drawing `value` in `style`'s colour/size/quadding inside the
-/// widget rectangle. `font_id` is the embedded font object the appearance's
-/// `/Resources /Font /GpFormSans` references — a real glyph program so the value
-/// paints in our rasterizer (base-14 names don't). A `value` containing newlines
-/// is laid out as multiple top-aligned lines (multiline text and list boxes); a
-/// single line is vertically centred. `/Q` quadding offsets each line
-/// horizontally using Helvetica metrics (`align` 1 = centre, 2 = right;
-/// 0/default = left).
+/// widget rectangle.
+///
+/// `font_res` is the font **resource name** the appearance's `Tf` operator and
+/// its `/Resources /Font` key use — taken from the field's `/DA` (e.g. `Helv`)
+/// — and `font_id` is the object that name resolves to in the AcroForm `/DR`
+/// (the document's own standard `/Helvetica`, or an already-embedded face). The
+/// appearance therefore references the **field's declared font**, never a font
+/// added by us, so the saved PDF stays clean and Adobe draws it natively; our
+/// rasterizer draws it via the base-14 substitution in `render_fonts_for`.
+///
+/// A `value` containing newlines is laid out as multiple top-aligned lines
+/// (multiline text and list boxes); a single line is vertically centred. `/Q`
+/// quadding offsets each line horizontally using Helvetica metrics (`align`
+/// 1 = centre, 2 = right; 0/default = left).
 fn build_text_field_appearance(
     rect: [f64; 4],
     value: &str,
     style: TextFieldStyle,
+    font_res: &[u8],
     font_id: ObjectId,
 ) -> (Dictionary, Vec<u8>) {
     let w = rect[2] - rect[0];
@@ -614,7 +652,7 @@ fn build_text_field_appearance(
     // Inner left padding; the usable text width is the rect minus both pads.
     let pad = 2.0;
     let usable = (w - 2.0 * pad).max(0.0);
-    let res = String::from_utf8_lossy(FORM_FONT_RES).into_owned();
+    let res = String::from_utf8_lossy(font_res).into_owned();
 
     // Horizontal offset for a line under the current quadding.
     let line_x = |line: &str| -> f64 {
@@ -657,7 +695,7 @@ fn build_text_field_appearance(
     content.extend_from_slice(b"ET\nQ\nEMC\n");
 
     let mut fonts = Dictionary::new();
-    fonts.set(FORM_FONT_RES.to_vec(), Object::Reference(font_id));
+    fonts.set(font_res.to_vec(), Object::Reference(font_id));
     let mut resources = Dictionary::new();
     resources.set(b"Font".to_vec(), Object::Dictionary(fonts));
 
@@ -1439,14 +1477,27 @@ impl Document {
     /// `/Differences`.
     fn font_base_encoding(&self, font: &Dictionary) -> crate::font::encoding::BaseEncoding {
         use crate::font::encoding::BaseEncoding;
+        // Symbol / ZapfDingbats imply their own built-in encoding (not named via
+        // `/Encoding`): `0x34` is ✔, not the digit '4'. Their bytes must never be
+        // decoded as WinAnsi. A `/BaseFont /Symbol` or `/ZapfDingbats` (or the
+        // `/Helv`-style `/Name /ZaDb`) selects it, unless an explicit named base
+        // `/Encoding` overrides (rare; honoured below).
+        let symbolic = font
+            .get(b"BaseFont")
+            .and_then(Object::as_name)
+            .or_else(|| font.get(b"Name").and_then(Object::as_name))
+            .and_then(|n| crate::font::bundled::base14_kind(&String::from_utf8_lossy(n)));
         match font.get(b"Encoding").map(|o| self.resolve(o)) {
             Some(Object::Name(n)) => BaseEncoding::from_name(n).unwrap_or(BaseEncoding::WinAnsi),
             Some(Object::Dictionary(enc)) => enc
                 .get(b"BaseEncoding")
                 .and_then(Object::as_name)
                 .and_then(BaseEncoding::from_name)
+                .or_else(|| symbolic.and_then(base14_to_base_encoding))
                 .unwrap_or(BaseEncoding::WinAnsi),
-            _ => BaseEncoding::WinAnsi,
+            _ => symbolic
+                .and_then(base14_to_base_encoding)
+                .unwrap_or(BaseEncoding::WinAnsi),
         }
     }
 
@@ -4872,16 +4923,43 @@ impl Document {
                 .and_then(|s| decode_stream(s).ok())
                 .map(|bytes| crate::font::cmap::ToUnicode::parse(&bytes))
                 .filter(|c| !c.is_empty());
-            let program = self.font_program(font);
+            // The embedded program, or — for a non-embedded standard **base-14**
+            // font (`/Helvetica`, `/Times-Roman`, `/Courier`, `/Symbol`,
+            // `/ZapfDingbats`, …) — a bundled, metric-compatible substitute
+            // loaded **only here at render time** (never written into the PDF).
+            // Without this the rasterizer draws nothing for such a font (no
+            // `/FontFile`): the path that paints base-14 form-field appearances
+            // (`/Helv` text) and any base-14 page text. The substitute resolves
+            // codes through its own `cmap` on the WinAnsi → Unicode route below.
+            let base14 = if two_byte {
+                None
+            } else {
+                self.base14_substitute(font)
+            };
+            let is_base14_substitute = base14.is_some();
+            let program = self.font_program(font).or(base14);
             // Resolve the glyph-selection maps the rasterizer needs. Simple fonts
             // map `code → glyph id` via their PDF `/Encoding` against the embedded
             // program's charset (essential for subset CFF, which carries no
             // Unicode cmap); composite fonts may carry a non-identity
-            // `/CIDToGIDMap`.
+            // `/CIDToGIDMap`. A base-14 substitute is resolved purely on the
+            // code → Unicode → cmap route, so it takes no `code_to_gid`.
             let (code_to_gid, cid_to_gid) = if two_byte {
                 (None, self.composite_cid_to_gid(font, program.as_ref()))
+            } else if is_base14_substitute {
+                (None, None)
             } else {
                 (self.simple_code_to_gid(font, program.as_ref()), None)
+            };
+            // A base-14 substitute has no embedded charset/`code_to_gid`, so its
+            // glyphs are found via `code → Unicode → cmap`. Build the simple
+            // `/Encoding` (+`/Differences`) map so accented Latin and remapped
+            // codes resolve precisely (bare WinAnsi otherwise); embedded fonts
+            // keep `None` (they resolve by glyph id and don't need it).
+            let simple_encoding = if is_base14_substitute {
+                self.simple_font_encoding(font, program.as_ref())
+            } else {
+                None
             };
             out.insert(
                 name.clone(),
@@ -4896,9 +4974,7 @@ impl Document {
                         // Rasterising uses the glyph id directly; no cmap-derived
                         // Unicode fallback is required for drawing.
                         cid_to_unicode: None,
-                        // Drawing resolves codes via the glyph program, not text
-                        // Unicode, so the simple-encoding map isn't needed here.
-                        simple_encoding: None,
+                        simple_encoding,
                     },
                     two_byte,
                     code_to_gid,
@@ -5062,6 +5138,37 @@ impl Document {
             .map(|o| self.resolve(o))
             .and_then(Object::as_stream)?;
         decode_stream(stream).ok()
+    }
+
+    /// A bundled, metric-compatible glyph program to **draw** a non-embedded
+    /// standard base-14 font with (Helvetica/Arial, Times, Courier, Symbol,
+    /// ZapfDingbats), or `None` when the font isn't a base-14 family. Classifies
+    /// the font's `/BaseFont` name with [`crate::font::bundled::base14_kind`].
+    ///
+    /// This is purely a **render-time** substitution: viewers ship the base-14
+    /// faces, our zero-network rasterizer does not, so without a substitute it
+    /// paints nothing for these fonts (they carry no `/FontFile`). The returned
+    /// face is **never embedded** into the document — it only feeds the
+    /// per-page render-fonts table, so generated PDFs stay free of any added
+    /// font resource. The face's own `cmap` resolves codes via the
+    /// `code → Unicode → glyph` route in the text decoder.
+    fn base14_substitute(&self, font: &Dictionary) -> Option<crate::font::GlyphSource> {
+        // Only standard simple fonts (Type1/TrueType) carry base-14 names; if a
+        // `/FontDescriptor` already embeds a program, `font_program` handles it.
+        let base = font
+            .get(b"BaseFont")
+            .and_then(Object::as_name)
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            // Fall back to the resource `/Name` (e.g. `/Helv`, `/ZaDb`) some
+            // AcroForm `/DR` fonts use in place of a `/BaseFont`.
+            .or_else(|| {
+                font.get(b"Name")
+                    .and_then(Object::as_name)
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+            })?;
+        let kind = crate::font::bundled::base14_kind(&base)?;
+        crate::font::bundled::bundled_program_for_base14(kind)
+            .map(|ttf| crate::font::GlyphSource::TrueType(ttf.clone()))
     }
 
     /// Enumerate the fonts **embedded** in the document — every `/Font` whose
@@ -10504,7 +10611,16 @@ impl Document {
     /// `/Q` quadding. Mirrors how a viewer resolves a field's default
     /// appearance (ISO 32000-1 §12.7.3.3).
     fn field_text_style(&self, field: &Dictionary) -> TextFieldStyle {
-        let da = field
+        let da = self.field_da(field);
+        let (size, color) = parse_da(&da);
+        let align = field.get(b"Q").and_then(Object::as_i64).unwrap_or(0).clamp(0, 2) as u8;
+        TextFieldStyle { size, color, align }
+    }
+
+    /// The effective `/DA` string for a field: its own `/DA`, or the AcroForm's
+    /// `/DA` when the field has none (ISO 32000-1 §12.7.3.3).
+    fn field_da(&self, field: &Dictionary) -> String {
+        field
             .get(b"DA")
             .map(|o| self.string_value(o))
             .filter(|s| !s.is_empty())
@@ -10516,15 +10632,41 @@ impl Document {
                     .and_then(|acro| acro.get(b"DA").map(|o| self.string_value(o)))
                     .filter(|s| !s.is_empty())
             })
-            .unwrap_or_default();
-        let (size, color) = parse_da(&da);
-        let align = field.get(b"Q").and_then(Object::as_i64).unwrap_or(0).clamp(0, 2) as u8;
-        TextFieldStyle { size, color, align }
+            .unwrap_or_default()
     }
 
-    /// The object id of an already-embedded `/GpFormSans` form font, looked up
-    /// in the AcroForm `/DR /Font`, or `None` if it hasn't been created yet.
-    fn existing_form_render_font(&self) -> Option<ObjectId> {
+    /// Resolve the font a regenerated appearance must reference: the resource
+    /// **name** from the field's `/DA` (e.g. `Helv`) and the object id it maps to
+    /// in the AcroForm `/DR /Font`. Returns `(name, font_id)`.
+    ///
+    /// This is the spec-correct, **non-polluting** path: the appearance points at
+    /// the document's *own* declared font, so the saved PDF gains **no** new font
+    /// resource. Adobe draws the base-14 face natively; our rasterizer draws it
+    /// via the base-14 substitution in `render_fonts_for`. When the `/DA` names a
+    /// font missing from `/DR` (or names none), we ensure a standard base-14
+    /// `/Helvetica` entry exists under `/Helv` — a bare Type1 dict with **no**
+    /// `/FontFile` (exactly what a clean AcroForm carries), never an embedded
+    /// program.
+    fn resolve_da_font(&mut self, field: &Dictionary) -> Result<(Vec<u8>, ObjectId)> {
+        let da = self.field_da(field);
+        let (font_name, _, _) = parse_da_full(&da);
+        let name = font_name.unwrap_or_else(|| "Helv".to_string());
+        let name_bytes = name.clone().into_bytes();
+
+        // Use the existing `/DR /Font /<name>` if present.
+        if let Some(id) = self.dr_font_id(&name_bytes) {
+            return Ok((name_bytes, id));
+        }
+
+        // Missing: register a bare base-14 standard font under this name. For
+        // any non-`Helv` name that isn't a known base-14 we still fall back to a
+        // Helvetica dict (the universal default) so the appearance resolves.
+        let font_id = self.ensure_base14_dr_font(&name_bytes);
+        Ok((name_bytes, font_id))
+    }
+
+    /// The object id of an AcroForm `/DR /Font /<name>` resource, if present.
+    fn dr_font_id(&self, name: &[u8]) -> Option<ObjectId> {
         let acro = self
             .catalog()
             .ok()?
@@ -10534,85 +10676,41 @@ impl Document {
             .clone();
         let dr = acro.get(b"DR").map(|o| self.resolve(o))?.as_dict()?.clone();
         let fonts = dr.get(b"Font").map(|o| self.resolve(o))?.as_dict()?.clone();
-        fonts.get(FORM_FONT_RES).and_then(Object::as_reference)
+        fonts.get(name).and_then(Object::as_reference)
     }
 
-    /// Ensure the document carries a single embedded **simple TrueType** font
-    /// (the bundled Liberation Sans, a metric-compatible Helvetica substitute)
-    /// usable as `/GpFormSans` in form appearance streams, and return its object
-    /// id. Cached in the AcroForm `/DR /Font /GpFormSans` so it is created once
-    /// and reused for every field.
-    ///
-    /// Generated text-field appearances **must** reference a real glyph program:
-    /// our rasterizer (and a strict offline pipeline) draws nothing for a bare
-    /// base-14 `/Helvetica` (no `/FontFile`). A simple WinAnsi TrueType with an
-    /// embedded `/FontFile2` paints in our engine via the code→Unicode→cmap path
-    /// and renders identically in Adobe.
-    fn ensure_form_render_font(&mut self) -> Result<ObjectId> {
-        // Reuse an existing /GpFormSans from the AcroForm /DR if present.
-        if let Some(id) = self.existing_form_render_font() {
-            return Ok(id);
-        }
-
-        let ttf = crate::font::bundled::FALLBACK_TTF;
-        let parsed = crate::font::truetype::TrueTypeFont::parse(ttf)
-            .ok_or_else(|| EngineError::Unsupported("bundled form font failed to parse".into()))?;
-        let upem = parsed.units_per_em();
-
-        // Per-code advance widths (1000-unit text space) for WinAnsi 32..=255.
-        let first = 32u8;
-        let last = 255u8;
-        let mut widths: Vec<Object> = Vec::with_capacity((last - first + 1) as usize);
-        for code in first..=last {
-            let ch = crate::font::winansi_to_char(code);
-            let gid = parsed.gid_for_unicode(ch as u32).unwrap_or(0);
-            let w1000 = if upem > 0.0 {
-                parsed.advance_width(gid) * 1000.0 / upem
-            } else {
-                500.0
-            };
-            widths.push(Object::Integer(w1000.round() as i64));
-        }
-
-        // FontFile2 stream (the raw TrueType program).
-        let ff_id = (self.next_object_number(), 0u16);
-        let mut ff_dict = Dictionary::new();
-        ff_dict.set(b"Length1".to_vec(), Object::Integer(ttf.len() as i64));
-        ff_dict.set(b"Length".to_vec(), Object::Integer(ttf.len() as i64));
-        self.objects
-            .insert(ff_id, Object::Stream(Stream::new(ff_dict, ttf.to_vec())));
-
-        // FontDescriptor (minimal but valid for a non-symbolic simple TrueType).
-        let fd_id = (self.next_object_number(), 0u16);
-        let mut fd = Dictionary::new();
-        fd.set(b"Type".to_vec(), annot::name(b"FontDescriptor"));
-        fd.set(b"FontName".to_vec(), annot::name(b"LiberationSans"));
-        fd.set(b"Flags".to_vec(), Object::Integer(32)); // Nonsymbolic
-        fd.set(b"FontBBox".to_vec(), annot::real_array(&[-203.0, -303.0, 1050.0, 910.0]));
-        fd.set(b"ItalicAngle".to_vec(), Object::Integer(0));
-        fd.set(b"Ascent".to_vec(), Object::Integer(905));
-        fd.set(b"Descent".to_vec(), Object::Integer(-212));
-        fd.set(b"CapHeight".to_vec(), Object::Integer(716));
-        fd.set(b"StemV".to_vec(), Object::Integer(80));
-        fd.set(b"FontFile2".to_vec(), Object::Reference(ff_id));
-        self.objects.insert(fd_id, Object::Dictionary(fd));
-
-        // The simple TrueType font dict (WinAnsi, full Latin-1 range).
+    /// Create a **base-14** standard font dictionary (`/Type1 /Helvetica`,
+    /// WinAnsi, **no** `/FontFile`), register it as `/DR /Font /<name>`, and
+    /// return its id. This is a *reference* to a standard face — what every
+    /// clean AcroForm `/DR` holds — not an embedded font program, so it adds no
+    /// glyph data to the document. Used only when a field's `/DA` names a font
+    /// absent from `/DR`.
+    fn ensure_base14_dr_font(&mut self, name: &[u8]) -> ObjectId {
+        // Pick the standard BaseFont matching the resource name; default Helvetica.
+        let base: &[u8] = match crate::font::bundled::base14_kind(&String::from_utf8_lossy(name)) {
+            Some(crate::font::bundled::Base14::Serif) => b"Times-Roman",
+            Some(crate::font::bundled::Base14::Mono) => b"Courier",
+            Some(crate::font::bundled::Base14::Symbol) => b"Symbol",
+            Some(crate::font::bundled::Base14::ZapfDingbats) => b"ZapfDingbats",
+            _ => b"Helvetica",
+        };
         let font_id = (self.next_object_number(), 0u16);
         let mut font = Dictionary::new();
         font.set(b"Type".to_vec(), annot::name(b"Font"));
-        font.set(b"Subtype".to_vec(), annot::name(b"TrueType"));
-        font.set(b"BaseFont".to_vec(), annot::name(b"LiberationSans"));
-        font.set(b"FirstChar".to_vec(), Object::Integer(i64::from(first)));
-        font.set(b"LastChar".to_vec(), Object::Integer(i64::from(last)));
-        font.set(b"Widths".to_vec(), Object::Array(widths));
-        font.set(b"Encoding".to_vec(), annot::name(b"WinAnsiEncoding"));
-        font.set(b"FontDescriptor".to_vec(), Object::Reference(fd_id));
+        font.set(b"Subtype".to_vec(), annot::name(b"Type1"));
+        font.set(b"BaseFont".to_vec(), annot::name(base));
+        font.set(b"Name".to_vec(), annot::name(name));
+        // Symbol/ZapfDingbats carry their own built-in encoding; the Latin
+        // base-14 use WinAnsi so the appearance's text bytes map correctly.
+        if base != b"Symbol" && base != b"ZapfDingbats" {
+            font.set(b"Encoding".to_vec(), annot::name(b"WinAnsiEncoding"));
+        }
         self.objects.insert(font_id, Object::Dictionary(font));
-
-        // Register it in the AcroForm /DR /Font so it is found on reuse.
-        self.register_dr_font(FORM_FONT_RES, font_id)?;
-        Ok(font_id)
+        // Best-effort registration in `/DR /Font`; if the chain can't be built
+        // the appearance still references `font_id` by name (and a viewer's own
+        // `/DR` resolves it), so we ignore the error.
+        let _ = self.register_dr_font(name, font_id);
+        font_id
     }
 
     /// Add `name → font_id` to the AcroForm's `/DR /Font` resource dictionary,
@@ -10658,25 +10756,20 @@ impl Document {
 
     /// Build a fresh `/AP /N` form XObject drawing `text` in `style` inside
     /// `rect`, register it, and point `widget`'s `/AP /N` at it. The widget
-    /// dict is mutated in place; callers persist it afterwards.
+    /// dict is mutated in place; callers persist it afterwards. `font_res` /
+    /// `font_id` are the field's `/DA` font resource name and the `/DR` object
+    /// it resolves to (see [`Self::resolve_da_font`]) — so the appearance
+    /// references the document's own font and adds nothing to the PDF.
     fn write_text_appearance(
         &mut self,
         widget: &mut Dictionary,
         rect: [f64; 4],
         text: &str,
         style: TextFieldStyle,
+        font_res: &[u8],
+        font_id: ObjectId,
     ) {
-        // Embed (once) the simple-TrueType font the appearance references so the
-        // value rasterizes in our engine, not just in external viewers.
-        let font_id = match self.ensure_form_render_font() {
-            Ok(id) => id,
-            Err(_) => {
-                // Last resort: store /V only and ask a viewer to regenerate.
-                self.set_need_appearances();
-                return;
-            }
-        };
-        let (mut form, content) = build_text_field_appearance(rect, text, style, font_id);
+        let (mut form, content) = build_text_field_appearance(rect, text, style, font_res, font_id);
         form.set(b"Length".to_vec(), Object::Integer(content.len() as i64));
         let ap_id = (self.next_object_number(), 0u16);
         self.objects
@@ -10700,11 +10793,19 @@ impl Document {
     /// rectangle is found anywhere do we fall back to `/NeedAppearances`.
     fn regenerate_text_appearance(&mut self, field: &mut Dictionary, text: &str) {
         let style = self.field_text_style(field);
+        // Resolve the field's `/DA` font once (its `/DR` resource name + object).
+        let (font_res, font_id) = match self.resolve_da_font(field) {
+            Ok(pair) => pair,
+            Err(_) => {
+                self.set_need_appearances();
+                return;
+            }
+        };
 
         // Merged widget: the field object is itself the widget.
         if field.contains(b"Rect") {
             let rect = self.read_rect(field);
-            self.write_text_appearance(field, rect, text, style);
+            self.write_text_appearance(field, rect, text, style, &font_res, font_id);
             return;
         }
 
@@ -10724,7 +10825,7 @@ impl Document {
                 continue;
             }
             let rect = self.read_rect(&kid);
-            self.write_text_appearance(&mut kid, rect, text, style);
+            self.write_text_appearance(&mut kid, rect, text, style, &font_res, font_id);
             self.objects.insert(kid_id, Object::Dictionary(kid));
             wrote_any = true;
         }
@@ -12765,6 +12866,50 @@ mod tests {
         assert!(
             count_ink(&again, bounds, scale) > ink_before + 20,
             "value still painted after save + reopen"
+        );
+    }
+
+    /// Filling a text field must paint the value **without embedding any font
+    /// into the PDF**: the regenerated appearance references the field's own
+    /// `/DA` font (the document's base-14 `/Helv`), and our rasterizer draws it
+    /// via the render-time base-14 substitution — so no `/FontFile` and no
+    /// `GpFormSans` resource is added. (Earlier the engine injected a bundled
+    /// Liberation Sans `/FontFile2` as `/GpFormSans`; that is now forbidden.)
+    #[test]
+    fn filling_text_field_adds_no_font_to_the_pdf() {
+        let mut doc = Document::open(&fixture("with-forms.pdf")).unwrap();
+
+        // Count embedded font programs before any edit.
+        let before = doc.save();
+        let count = |hay: &[u8], needle: &[u8]| {
+            hay.windows(needle.len()).filter(|w| *w == needle).count()
+        };
+        let ff_before = count(&before, b"FontFile");
+
+        doc.set_text_field("name", "NO_NEW_FONT").unwrap();
+        doc.set_text_field("email", "still@clean.test").unwrap();
+        let after = doc.save();
+
+        // The value is stored, the appearance references `/Helv`, and the value
+        // is painted in the regenerated stream.
+        assert!(after.windows(11).any(|w| w == b"NO_NEW_FONT"), "value stored");
+        // No engine-injected form font, and no new embedded font program.
+        assert_eq!(
+            count(&after, b"GpFormSans"),
+            0,
+            "must not inject a GpFormSans form font"
+        );
+        assert_eq!(
+            count(&after, b"FontFile"),
+            ff_before,
+            "filling fields must not add any embedded font program"
+        );
+        // The regenerated appearance references the field's `/DA` font by name
+        // (this fixture's fields declare `/Helvetica`), proving it draws with the
+        // document's own font rather than an injected one.
+        assert!(
+            after.windows(11).any(|w| w == b"/Helvetica "),
+            "appearance references the field /DA font (/Helvetica) from /DR"
         );
     }
 
