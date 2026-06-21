@@ -176,15 +176,18 @@ def font_covers(path: str, text: str, min_frac: float = 0.999) -> bool:
 
 
 def _probe_cps(group: str) -> list[int]:
-    """~10 script-defining codepoints sampled across a group's non-ASCII alphabet."""
+    """~16 script-defining codepoints sampled across a group's non-ASCII alphabet. We sample
+    generously because some charsets span a whole Unicode block (with **unassigned** gaps that no
+    font's cmap contains) — paired with a tolerant `min_cov`, this reliably identifies a font that
+    really supports the script without being defeated by those gaps."""
     chars = [c for c in SCRIPTS[group]["chars"] if ord(c) > 0x7F]
     if not chars:
         return [ord("A")]
-    step = max(1, len(chars) // 10)
-    return [ord(c) for c in chars[::step]][:10]
+    step = max(1, len(chars) // 16)
+    return [ord(c) for c in chars[::step]][:16]
 
 
-def system_fonts_for_group(group: str, limit: int = 60, min_cov: float = 0.8, seed: int = 7) -> list[str]:
+def system_fonts_for_group(group: str, limit: int = 60, min_cov: float = 0.4, seed: int = 7) -> list[str]:
     """Installed TTFs whose cmap covers the group's script (via fontTools), so we
     never render tofu. Returns up to `limit` paths (shuffled for diversity). Empty if
     fontTools is missing or no font covers the script — callers fall back to Noto."""

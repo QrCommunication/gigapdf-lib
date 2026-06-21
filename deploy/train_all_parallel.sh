@@ -74,7 +74,7 @@ run_job() {
   [ "$real" != "-" ] && { real_env="$real"; realn=40000; }
   env GIGA_OCR_VARIANT="$variant" GIGA_OCR_DEGRADE="$degrade" \
       GIGA_OCR_HW_FRAC=0.4 GIGA_OCR_HW_REAL="$real_env" GIGA_OCR_HW_REAL_N="$realn" \
-      GIGA_OCR_NLINES=22000 GIGA_OCR_LANGS="$langs" $cs_env \
+      GIGA_OCR_NLINES=40000 GIGA_OCR_FONTLIMIT=200 GIGA_OCR_LANGS="$langs" $cs_env \
       GIGA_OCR_C1=32 GIGA_OCR_C2=64 GIGA_OCR_HID=128 GIGA_OCR_BATCH=256 \
       OMP_NUM_THREADS="$TPJ" MKL_NUM_THREADS="$TPJ" \
       "$VENV/bin/python" tools/train_ocr_crnn.py "$group" "$epochs" > ~/train_${label}.log 2>&1 \
