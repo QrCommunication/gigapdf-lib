@@ -100,7 +100,7 @@ fn be_n(d: &[u8], o: &mut usize, n: usize) -> Option<u64> {
 /// Find the byte range `[start, end)` of the first child box of `type tag`
 /// within `[off, end)`. Returns the box *payload* range (after the 8/16-byte
 /// header), and whether it is a FullBox-style container is left to the caller.
-fn find_box(d: &[u8], mut off: usize, end: usize, tag: &[u8; 4]) -> Option<(usize, usize)> {
+pub(crate) fn find_box(d: &[u8], mut off: usize, end: usize, tag: &[u8; 4]) -> Option<(usize, usize)> {
     while off + 8 <= end {
         let size = be32(d, off)? as usize;
         let typ = &d[off + 4..off + 8];

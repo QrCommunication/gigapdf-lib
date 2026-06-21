@@ -325,6 +325,39 @@ export class GigaPdfEngine {
     );
   }
   /**
+   * Image (PNG/JPEG/GIF/WebP/AVIF) → one-page PDF, format auto-detected: the
+   * image is centred and scaled to fit on an A4 portrait page. PNG/JPEG embed
+   * directly; GIF/WebP/AVIF are transcoded to PNG first — all in pure Rust/WASM,
+   * no third-party image library. Empty array if the bytes are not a recognized
+   * image. To combine many images into a single document, pipe each result
+   * through {@link mergePdfs}.
+   */
+  imageToPdf(image: Uint8Array): Uint8Array {
+    return this._withBytes(image, (p, l) =>
+      this._buffer((o) => this.ex.gp_image_to_pdf(p, l, o))
+    );
+  }
+  /**
+   * Merge several PDFs into one by appending their pages in order. Returns an
+   * empty document for an empty list, or the single input unchanged for a list
+   * of one. Each subsequent PDF is appended onto the first via
+   * {@link GigaPdfDoc.appendPages}; the merged bytes are returned and the working
+   * document is closed.
+   */
+  mergePdfs(pdfs: Uint8Array[]): Uint8Array {
+    if (pdfs.length === 0) return new Uint8Array(0);
+    if (pdfs.length === 1) return pdfs[0]!;
+    const base = this.open(pdfs[0]!);
+    try {
+      for (let i = 1; i < pdfs.length; i++) {
+        base.appendPages(pdfs[i]!);
+      }
+      return base.save();
+    } finally {
+      base.close();
+    }
+  }
+  /**
    * Write a host-built grid (`pages[rows][cells]`) to an `.xlsx` workbook — one
    * sheet per page — with the engine's native spreadsheet writer (no
    * third-party library). Supply your own table reconstruction and still emit

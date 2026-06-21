@@ -32,6 +32,8 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Styled text: bold · underline · strikethrough · sub/superscript](#styled-text)
 - [Read & write running headers and footers](#headers-and-footers)
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
+- [Image → PDF (single & batch)](#image--pdf)
+- [Merge multiple PDFs](#merge-multiple-pdfs)
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
 - [Fill and create form fields](#fill-and-create-form-fields)
 - [Annotate (highlight, note, ink, stamp)](#annotate)
@@ -268,6 +270,50 @@ pass with `htmlNeededResources(html, header?, footer?)`, fetch each, and hand th
 image bytes back via `HtmlRenderOptions.resources` (the engine never touches the
 network). `data:` image URIs need no entry. Full element/property/selector list:
 [`HTML-CSS.md`](HTML-CSS.md).
+
+---
+
+## Image → PDF
+
+Wrap a raster image in a one-page PDF. The format is auto-detected — **PNG,
+JPEG, GIF, WebP, AVIF** — and the image is placed on an A4 page, centred and
+shrunk to fit (never upscaled). PNG keeps every color-type and bit-depth, Adam7
+interlacing and transparency (via `/SMask`); GIF/WebP/AVIF are transcoded to PNG
+before embedding. An unrecognized format returns an empty `Uint8Array`.
+
+```ts
+const pdf = giga.imageToPdf(imageBytes); // one A4 page
+if (pdf.length === 0) throw new Error("not a recognized image");
+```
+
+Batch — turn a folder of images into a single multi-page PDF by wrapping each
+one and merging the results:
+
+```ts
+const pages = images.map((bytes) => giga.imageToPdf(bytes)).filter((p) => p.length > 0);
+const album = giga.mergePdfs(pages); // one PDF, one image per page
+```
+
+---
+
+## Merge multiple PDFs
+
+`mergePdfs` concatenates a list of PDFs into one, in order:
+
+```ts
+const merged = giga.mergePdfs([first, second, third]);
+// 0 inputs → empty; 1 → returned unchanged; N → pages appended sequentially
+```
+
+For finer control (e.g. interleaving with edits) append page-by-page on an open
+document instead:
+
+```ts
+const doc = giga.open(first);
+for (const extra of [second, third]) doc.appendPages(extra);
+const merged = doc.saveCompressed();
+doc.close();
+```
 
 ---
 

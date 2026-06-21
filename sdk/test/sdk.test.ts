@@ -351,4 +351,65 @@ describe("@qrcommunication/gigapdf-lib", () => {
     reopened.close();
     doc.close();
   });
+
+  it("converts an image (PNG) to a one-page PDF carrying the image", () => {
+    // 2×2 opaque RGBA → PNG, then PNG → one-page PDF.
+    const rgba = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]);
+    const png = giga.rgbaToPng(rgba, 2, 2);
+    const pdf = giga.imageToPdf(png);
+    expect(new TextDecoder().decode(pdf.slice(0, 5))).toBe("%PDF-");
+
+    const doc = giga.open(pdf);
+    expect(doc.pageCount()).toBe(1);
+    // The image is embedded as a real /Image XObject on the page.
+    expect(doc.imageElements(1).length).toBeGreaterThan(0);
+    doc.close();
+
+    // Unrecognized bytes → empty array (no PDF produced).
+    expect(giga.imageToPdf(new Uint8Array([1, 2, 3, 4])).length).toBe(0);
+  });
+
+  it("converts a transparent RGBA (type 6) PNG to a PDF (alpha → soft mask)", () => {
+    // 4×4 RGBA where half the pixels are semi-transparent. Before the fix this
+    // produced an EMPTY buffer; it must now yield a real one-page PDF with the
+    // image embedded (the alpha channel becomes a /SMask, not flattened).
+    const rgba = new Uint8Array(4 * 4 * 4);
+    for (let i = 0; i < 16; i++) {
+      rgba[i * 4] = (i * 9) & 0xff;
+      rgba[i * 4 + 1] = (i * 5) & 0xff;
+      rgba[i * 4 + 2] = (i * 3) & 0xff;
+      rgba[i * 4 + 3] = i % 2 === 0 ? 96 : 255; // semi-transparent / opaque
+    }
+    const png = giga.rgbaToPng(rgba, 4, 4);
+    const pdf = giga.imageToPdf(png);
+    expect(pdf.length).toBeGreaterThan(0);
+    expect(new TextDecoder().decode(pdf.slice(0, 5))).toBe("%PDF-");
+
+    const doc = giga.open(pdf);
+    expect(doc.pageCount()).toBe(1);
+    expect(doc.imageElements(1).length).toBeGreaterThan(0);
+    doc.close();
+  });
+
+  it("merges several PDFs into one (page count is the sum)", () => {
+    const onePage = giga.txtToPdf("Single page");
+
+    // Build a two-page PDF.
+    const twoPageDoc = giga.open(giga.txtToPdf("First"));
+    expect(twoPageDoc.addPage(612, 792, 1)).toBeGreaterThan(0);
+    expect(twoPageDoc.pageCount()).toBe(2);
+    const twoPage = twoPageDoc.save();
+    twoPageDoc.close();
+
+    const merged = giga.mergePdfs([onePage, twoPage, onePage]);
+    expect(new TextDecoder().decode(merged.slice(0, 5))).toBe("%PDF-");
+
+    const doc = giga.open(merged);
+    expect(doc.pageCount()).toBe(1 + 2 + 1); // 4 pages total
+    doc.close();
+
+    // Edge cases: empty list → empty bytes; single PDF → returned unchanged.
+    expect(giga.mergePdfs([]).length).toBe(0);
+    expect(giga.mergePdfs([onePage])).toBe(onePage);
+  });
 });

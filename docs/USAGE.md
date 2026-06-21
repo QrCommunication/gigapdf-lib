@@ -199,6 +199,11 @@ ex.gp_free(dPtr, docxBytes.length);
 const html = strArg("<p>Hello</p>");
 const pdf2 = callBuffer((lp) => ex.gp_html_to_pdf(html.ptr, html.len, lp));
 freeArg(html);
+
+const imgBytes = /* PNG/JPEG/GIF/WebP/AVIF */;
+const iPtr = toWasm(imgBytes);
+const pdf3 = callBuffer((lp) => ex.gp_image_to_pdf(iPtr, imgBytes.length, lp)); // null if not an image — one A4 page, centred & shrink-to-fit
+ex.gp_free(iPtr, imgBytes.length);
 // also: gp_txt_to_pdf, gp_rtf_to_pdf
 ```
 

@@ -146,14 +146,16 @@ fn paragraph_block(text: &str) -> Block {
 }
 
 /// Read just the pixel dimensions (and a format tag) from a raster image's
-/// header — PNG, JPEG, GIF, or WebP (VP8/VP8L/VP8X) — without decoding pixels.
-/// Returns `(width, height, format)` or `None` for an unrecognized container.
-fn image_dimensions(b: &[u8]) -> Option<(u32, u32, &'static str)> {
+/// header — PNG, JPEG, GIF, WebP (VP8/VP8L/VP8X), or AVIF — without decoding
+/// pixels. Returns `(width, height, format)` or `None` for an unrecognized
+/// container.
+pub(crate) fn image_dimensions(b: &[u8]) -> Option<(u32, u32, &'static str)> {
     png_dims(b)
         .map(|(w, h)| (w, h, "png"))
         .or_else(|| jpeg_dims(b).map(|(w, h)| (w, h, "jpeg")))
         .or_else(|| gif_dims(b).map(|(w, h)| (w, h, "gif")))
         .or_else(|| webp_dims(b).map(|(w, h)| (w, h, "webp")))
+        .or_else(|| avif_dims(b).map(|(w, h)| (w, h, "avif")))
 }
 
 /// PNG: signature + IHDR width/height (big-endian) from the first chunk.
@@ -273,6 +275,56 @@ fn webp_dims(b: &[u8]) -> Option<(u32, u32)> {
         _ => None,
     }
 }
+
+/// AVIF (ISOBMFF): confirm the `ftyp` brand is an AVIF/HEIF still, then read the
+/// primary item's canvas size from the `meta → iprp → ipco → ispe` box. The
+/// `ispe` ("image spatial extents") FullBox carries width/height as big-endian
+/// `u32`s right after its 4-byte version/flags — a cheap header probe, no AV1
+/// decode. Falls back to a full [`decode_avif`](crate::raster::avif::decode_avif)
+/// only if the `ispe` walk fails (handles unusual box orderings).
+fn avif_dims(b: &[u8]) -> Option<(u32, u32)> {
+    use crate::raster::avif::find_box;
+
+    // `ftyp` at offset 4, with an AVIF/HEIF-still brand (major or compatible).
+    if b.len() < 16 || b.get(4..8)? != b"ftyp" {
+        return None;
+    }
+    let (ftyp_s, ftyp_e) = find_box(b, 0, b.len(), b"ftyp")?;
+    let mut is_avif = false;
+    // Brands are 4-byte tags: major_brand at ftyp_s, then minor_version (4),
+    // then the compatible_brands list to the end of the box.
+    let mut o = ftyp_s;
+    if let Some(major) = b.get(o..o + 4) {
+        is_avif |= AVIF_BRANDS.contains(&major);
+    }
+    o += 8; // skip major_brand + minor_version
+    while o + 4 <= ftyp_e {
+        if let Some(brand) = b.get(o..o + 4) {
+            is_avif |= AVIF_BRANDS.contains(&brand);
+        }
+        o += 4;
+    }
+    if !is_avif {
+        return None;
+    }
+
+    // meta (FullBox: +4 version/flags) → iprp → ipco → ispe.
+    let dims_from_ispe = (|| {
+        let (meta_s, meta_e) = find_box(b, 0, b.len(), b"meta")?;
+        let (iprp_s, iprp_e) = find_box(b, meta_s + 4, meta_e, b"iprp")?;
+        let (ipco_s, ipco_e) = find_box(b, iprp_s, iprp_e, b"ipco")?;
+        let (ispe_s, _) = find_box(b, ipco_s, ipco_e, b"ispe")?;
+        // ispe is a FullBox: skip 4 bytes version/flags, then width(4)+height(4).
+        let w = u32::from_be_bytes(b.get(ispe_s + 4..ispe_s + 8)?.try_into().ok()?);
+        let h = u32::from_be_bytes(b.get(ispe_s + 8..ispe_s + 12)?.try_into().ok()?);
+        (w != 0 && h != 0).then_some((w, h))
+    })();
+
+    dims_from_ispe.or_else(|| crate::raster::avif::decode_avif(b).map(|(w, h, _)| (w, h)))
+}
+
+/// `ftyp` brands that mark an AVIF / HEIF-still container we accept.
+const AVIF_BRANDS: [&[u8]; 5] = [b"avif", b"avis", b"mif1", b"miaf", b"MA1B"];
 
 /// 64-bit FNV-1a content hash — a stable, dependency-free resource key.
 fn fnv1a(data: &[u8]) -> u64 {
@@ -488,6 +540,22 @@ mod tests {
         // GIF89a 5×3 header (logical screen size little-endian).
         let gif = b"GIF89a\x05\x00\x03\x00\x00\x00\x00";
         assert_eq!(image_dimensions(gif), Some((5, 3, "gif")));
+    }
+
+    #[test]
+    fn image_dimensions_probe_avif_ispe() {
+        // The 32×32 AVIF still fixture: dimensions read from its `ispe` box
+        // header (no AV1 decode), dispatched as the "avif" format.
+        let avif = include_bytes!("../raster/fixtures/av1test.avif");
+        assert_eq!(image_dimensions(avif), Some((32, 32, "avif")));
+        // image_to_model wraps it into a full-page image document, storing the
+        // AVIF bytes verbatim under the "avif" format tag.
+        let doc = image_to_model(avif).expect("avif → model");
+        let img_key = match &doc.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Image(i) => i.resource,
+            other => panic!("expected image, got {other:?}"),
+        };
+        assert_eq!(doc.resources.images[&img_key].format, "avif");
     }
 
     // ── text / RTF → model ──

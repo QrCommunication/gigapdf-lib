@@ -241,6 +241,7 @@ change. See [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md),
 | `rtf_to_pdf(&str)` | `gp_rtf_to_pdf(ptr,len,outlen)` |
 | `office_to_pdf(&[u8]) -> Option<Vec<u8>>` | `gp_office_to_pdf(ptr,len,outlen)` (auto-detect docx/odt/odp/pptx/xlsx/ods) |
 | `docx_to_pdf / odt_to_pdf / odp_to_pdf / pptx_to_pdf / xlsx_to_pdf / ods_to_pdf` | via `gp_office_to_pdf` |
+| `image_to_pdf(&[u8]) -> Option<Vec<u8>>` | `gp_image_to_pdf(ptr,len,outlen)` (auto-detect **PNG/JPEG/GIF/WebP/AVIF**; one A4 page, image centred & shrink-to-fit, never upscaled; GIF/WebP/AVIF transcoded to PNG before embed; PNG covers every color-type 0/2/3/4/6, bit-depths 1/2/4/8/16, Adam7 interlacing, transparency via `/SMask`. `null`/empty if the format is unrecognized) |
 
 ### Unified editable model (lower / edit / raise)
 

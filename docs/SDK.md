@@ -64,6 +64,8 @@ try {
 | `htmlToPdf(html)` / `htmlRender(html, fonts, w, h, margin)` | `Uint8Array` | Render HTML+CSS to PDF with the **native** engine (no browser). See [HTML-CSS.md](HTML-CSS.md). |
 | `rtfToPdf(rtf)` | `Uint8Array` | Render RTF to PDF. |
 | `officeToPdf(office)` | `Uint8Array` | Convert an Office/ODF file (docx/xlsx/pptx/doc/xls/ppt/odt/ods/odp) to PDF; format auto-detected by magic bytes. |
+| `imageToPdf(image)` | `Uint8Array` | Wrap a raster image in a single A4-page PDF (centred, shrink-to-fit, never upscaled). Format auto-detected: **PNG, JPEG, GIF, WebP, AVIF** (GIF/WebP/AVIF transcoded to PNG before embed; PNG keeps every color-type & bit-depth, Adam7 interlacing and transparency via `/SMask`). Empty `Uint8Array` for an unrecognized format. |
+| `mergePdfs(pdfs)` | `Uint8Array` | Concatenate a list of PDFs into one (sequential `appendPages` under the hood). `0` inputs → empty; `1` → returned unchanged; `N` → merged. |
 | `gridsToXlsx(grids, sheetNames?)` / `gridsToOds(grids, sheetNames?)` | `Uint8Array` | Write a host-built grid (`pages[rows][cells]`, `string[][][]`) to an `.xlsx`/`.ods` workbook — one sheet per page — with the native writer. Supply your own table reconstruction and emit Office output with **no third-party library**. `sheetNames` (index-aligned) overrides the default `Page <n>` titles. |
 | `xlsxToGrids(xlsx)` | `XlsxSheet[]` | Read an `.xlsx` back into `{ name, rows: string[][] }` sheets (the inverse of `gridsToXlsx`/`toXlsx`). Decodes inline strings, shared strings (`sharedStrings.xml`) and plain values. `[]` for non-xlsx input. |
 

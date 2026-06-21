@@ -4,6 +4,37 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.55.1] - 2026-06-21
+
+### Fixed
+
+- **`imageToPdf` now embeds every PNG variant — no more empty buffer.** The pure-Rust
+  PNG decoder only handled 8-bit, non-interlaced images, so any PNG with a 16-bit
+  depth (common from screenshots and image editors), a sub-byte depth (1/2/4-bit
+  greyscale and palette), or Adam7 interlacing was rejected — `imageToPdf` returned
+  an **empty array** for those inputs. The decoder now supports the full PNG matrix:
+  colour types 0/2/3/4/6 at bit depths 1, 2, 4, 8 and 16, both non-interlaced and
+  interlaced, plus `tRNS` colour-key transparency for greyscale and truecolour
+  images. Transparency (PNG alpha and transcoded GIF/WebP/AVIF alpha) is preserved
+  via a `/DeviceGray` soft mask (`/SMask`), never flattened.
+
+### Added
+
+- **`imageToPdf(image)` — raster image → one-page PDF.** PNG, JPEG, GIF, WebP and
+  AVIF are accepted (format auto-detected); the image is centred and scaled to fit
+  on an A4 portrait page and embedded as a real `/Image` XObject. PNG/JPEG embed
+  directly (JPEG verbatim via `/DCTDecode`); **GIF/WebP/AVIF are transcoded to PNG**
+  first (native `gif`/`webp`/`avif` decode → PNG encode), since the embedder only
+  writes PNG/JPEG XObjects. Returns an empty array for unrecognized bytes. Pure
+  Rust/WASM — no third-party image library.
+- **AVIF dimension probe.** The image-header reader now recognizes AVIF/HEIF-still
+  containers and reads the canvas size from the `meta → iprp → ipco → ispe` box (a
+  cheap header parse, no AV1 decode; falls back to a full decode for unusual box
+  orderings), so `image_to_model` lowers an AVIF to a full-page image document too.
+- **`mergePdfs(pdfs)` — concatenate several PDFs into one.** Appends each input's
+  pages in order onto the first (empty list → empty bytes; single PDF → returned
+  unchanged). Built on the existing `appendPages`.
+
 ## [0.54.0] - 2026-06-20
 
 ### Added

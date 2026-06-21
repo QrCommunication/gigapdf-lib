@@ -300,6 +300,80 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     super::office_import::office_to_pdf(bytes)
 }
 
+// ─────────────────────────────── image → PDF ───────────────────────────────
+
+/// A raster image (PNG / JPEG / GIF / WebP / AVIF) → a one-page PDF, the image
+/// centred on an A4 portrait page and scaled to fit (preserving aspect, never
+/// upscaled past 1:1). `None` if the bytes are not a recognized image.
+///
+/// PNG and JPEG embed directly (the PDF `/Image` XObject path takes them as-is —
+/// JPEG verbatim via `/DCTDecode`, PNG decoded to a Flate colour stream + soft
+/// mask). GIF / WebP / AVIF are **transcoded to PNG** first
+/// ([`gif`](crate::raster::gif) / [`webp`](crate::raster::webp) /
+/// [`avif`](crate::raster::avif) decode → [`encode_png`](crate::raster::png::encode_png)),
+/// because the embedder only writes PNG/JPEG XObjects. Every step is pure Rust —
+/// no third-party image library.
+pub fn image_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
+    use crate::model::{Margins, PageGeometry};
+
+    // Reduce any input to embeddable PNG/JPEG bytes + pixel dimensions.
+    let (embed, w_px, h_px) = embeddable_image(bytes)?;
+    let (iw, ih) = (w_px.max(1) as f64, h_px.max(1) as f64);
+
+    // A4 portrait with the default margins, the image fit inside the content box.
+    let geom = PageGeometry::default();
+    let Margins {
+        top,
+        right,
+        bottom,
+        left,
+    } = geom.margins;
+    let avail_w = (geom.width - left - right).max(1.0);
+    let avail_h = (geom.height - top - bottom).max(1.0);
+    let scale = (avail_w / iw).min(avail_h / ih).min(1.0);
+    let (draw_w, draw_h) = (iw * scale, ih * scale);
+    // PDF user space is bottom-up: centre horizontally, and place the image's
+    // lower-left so it is vertically centred in the content area.
+    let x = left + (avail_w - draw_w) / 2.0;
+    let y = bottom + (avail_h - draw_h) / 2.0;
+
+    // Build a blank one-page PDF, then embed the image as a real XObject.
+    let mut builder = PdfBuilder::new();
+    builder.add_page(geom.width, geom.height);
+    let mut doc = crate::Document::open(&builder.finish()).ok()?;
+    doc.add_image(1, &embed, x, y, draw_w, draw_h, 1.0).ok()?;
+    Some(doc.save())
+}
+
+/// Coerce a raster image to bytes the PDF image embedder accepts (PNG or JPEG)
+/// plus its pixel size. `None` for unrecognized bytes.
+///
+/// * **JPEG** passes through untouched (embedded verbatim under `/DCTDecode`).
+/// * **PNG** passes through untouched: the embedder ([`crate::content::image`])
+///   fully decodes it to RGBA (any colour type, bit depth 1–16, interlaced)
+///   and splits it into an RGB stream + alpha soft-mask, so transparency is
+///   preserved for every PNG variant.
+/// * **GIF / WebP / AVIF** are decoded to RGBA and re-encoded as an RGBA PNG
+///   (colour type 6), keeping any alpha channel intact for the soft-mask path.
+fn embeddable_image(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    // PNG and JPEG are accepted by the embedder directly — read dimensions
+    // from the header.
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        let (w, h, _) = super::import::image_dimensions(bytes)?;
+        return Some((bytes.to_vec(), w, h));
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let (w, h, _) = super::import::image_dimensions(bytes)?;
+        return Some((bytes.to_vec(), w, h));
+    }
+    // GIF / WebP / AVIF: decode to RGBA, then re-encode as an RGBA (type 6) PNG
+    // so the embedder keeps the alpha channel as a soft mask.
+    let (w, h, rgba) = crate::raster::gif::decode_gif(bytes)
+        .or_else(|| crate::raster::webp::decode_webp(bytes))
+        .or_else(|| crate::raster::avif::decode_avif(bytes))?;
+    Some((crate::raster::png::encode_png(w, h, &rgba), w, h))
+}
+
 // ─────────────────────────────── RTF (both ways) ───────────────────────────
 
 /// Escape a string for an RTF body (`\`, `{`, `}` and non-ASCII via `\uN?`).
@@ -829,5 +903,191 @@ mod tests {
         let lines = wrap(&"word ".repeat(60), 40);
         assert!(lines.len() > 1, "wrapped into multiple lines");
         assert!(lines.iter().all(|l| l.chars().count() <= 40));
+    }
+
+    #[test]
+    fn image_to_pdf_embeds_a_png() {
+        // A 4×3 opaque red PNG → a valid one-page PDF carrying an image XObject.
+        let rgba = [255u8, 0, 0, 255].repeat(4 * 3);
+        let png = crate::raster::png::encode_png(4, 3, &rgba);
+        let pdf = image_to_pdf(&png).expect("png → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert_eq!(doc.page_count(), 1, "one-page document");
+        // The image is embedded as a real /Image XObject (DeviceRGB stream).
+        let imgs = doc.page_image_elements(1);
+        assert!(!imgs.is_empty(), "image embedded on the page");
+
+        // Garbage is rejected.
+        assert!(image_to_pdf(b"not an image").is_none());
+    }
+
+    #[test]
+    fn image_to_pdf_embeds_a_transparent_rgba_png() {
+        // 8×8 RGBA with half the pixels semi-transparent → exercises the SMask
+        // (soft-mask) path: the image must still embed and the PDF be valid.
+        let mut rgba = Vec::new();
+        for i in 0..(8 * 8) {
+            rgba.extend_from_slice(&[
+                (i * 3) as u8,
+                (i * 5) as u8,
+                (i * 7) as u8,
+                if i % 2 == 0 { 128 } else { 255 },
+            ]);
+        }
+        let png = crate::raster::png::encode_png(8, 8, &rgba);
+        let pdf = image_to_pdf(&png).expect("transparent RGBA png → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert_eq!(doc.page_count(), 1);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "RGBA image embedded on the page"
+        );
+    }
+
+    #[test]
+    fn image_to_pdf_embeds_a_16bit_rgba_png() {
+        // Forge a 2×2, 16-bit RGBA PNG (real tools emit depth-16); it must no
+        // longer yield an empty buffer.
+        let png = make_test_png_16bit_rgba();
+        let pdf = image_to_pdf(&png).expect("16-bit RGBA png → pdf (no empty buffer)");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "16-bit image embedded on the page"
+        );
+    }
+
+    #[test]
+    fn image_to_pdf_embeds_a_greyscale_png() {
+        // 4×4, 8-bit greyscale (colour type 0) PNG → opaque grey image.
+        let png = make_test_png_grey_8bit(4, 4);
+        let pdf = image_to_pdf(&png).expect("greyscale png → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "greyscale image embedded on the page"
+        );
+    }
+
+    // ── Tiny spec-conformant PNG forgers (filter-0 + zlib-stored IDAT) ─────
+
+    fn png_crc32(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_in = Vec::new();
+        crc_in.extend_from_slice(kind);
+        crc_in.extend_from_slice(data);
+        out.extend_from_slice(&png_crc32(&crc_in).to_be_bytes());
+    }
+
+    fn png_zlib_store(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01, 0x01];
+        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(data.len() as u16)).to_le_bytes());
+        out.extend_from_slice(data);
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        out
+    }
+
+    fn make_test_png(w: u32, h: u32, depth: u8, ct: u8, idat: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[depth, ct, 0, 0, 0]);
+        png_chunk(&mut out, b"IHDR", &ihdr);
+        png_chunk(&mut out, b"IDAT", &png_zlib_store(idat));
+        png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    fn make_test_png_16bit_rgba() -> Vec<u8> {
+        // 2×2, each pixel 4 channels × 2 bytes, filter byte 0 per row.
+        let mut idat = Vec::new();
+        for _row in 0..2 {
+            idat.push(0u8);
+            for px in 0..2u16 {
+                for ch in 0..4u16 {
+                    // (px+1)*(ch+1)*8000 ≤ 64000 < 65536, fits a 16-bit sample.
+                    let v: u16 = (px + 1) * (ch + 1) * 8000;
+                    idat.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+        }
+        make_test_png(2, 2, 16, 6, &idat)
+    }
+
+    fn make_test_png_grey_8bit(w: u32, h: u32) -> Vec<u8> {
+        let mut idat = Vec::new();
+        for y in 0..h {
+            idat.push(0u8);
+            for x in 0..w {
+                idat.push(((x * y) & 0xFF) as u8);
+            }
+        }
+        make_test_png(w, h, 8, 0, &idat)
+    }
+
+    #[test]
+    fn transcoded_transparent_webp_keeps_alpha_as_smask() {
+        // A WebP (transcode path) with semi-transparent pixels must end up with
+        // an /SMask soft mask in the PDF — i.e. transparency is NOT flattened.
+        let mut rgba = Vec::new();
+        for i in 0..(4 * 4) {
+            rgba.extend_from_slice(&[
+                (i * 9) as u8,
+                (i * 5) as u8,
+                (i * 3) as u8,
+                if i % 2 == 0 { 64 } else { 255 },
+            ]);
+        }
+        let webp = crate::raster::webp::encode_webp(4, 4, &rgba);
+        let pdf = image_to_pdf(&webp).expect("transparent webp → pdf");
+        assert!(pdf.starts_with(b"%PDF-"));
+        let has_smask = pdf.windows(6).any(|w| w == b"/SMask");
+        assert!(
+            has_smask,
+            "transparent WebP must embed an /SMask (alpha preserved, not flattened)"
+        );
+    }
+
+    #[test]
+    fn image_to_pdf_transcodes_avif() {
+        // AVIF is decoded to RGBA and re-encoded as PNG before embedding (the
+        // 32×32 still fixture shared with the raster::avif tests).
+        let avif = include_bytes!("../raster/fixtures/av1test.avif");
+        let pdf = image_to_pdf(avif).expect("avif → pdf");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        let doc = opens(&pdf);
+        assert_eq!(doc.page_count(), 1);
+        assert!(
+            !doc.page_image_elements(1).is_empty(),
+            "transcoded AVIF embedded as an image"
+        );
     }
 }

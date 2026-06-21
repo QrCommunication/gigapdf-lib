@@ -2494,6 +2494,24 @@ pub extern "C" fn gp_office_to_pdf(
     }
 }
 
+/// Image (PNG/JPEG/GIF/WebP/AVIF) → one-page PDF, format auto-detected (the
+/// image centred and fit on an A4 page). Null if the bytes are unrecognized.
+#[no_mangle]
+pub extern "C" fn gp_image_to_pdf(
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if bytes_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
+    match gigapdf_core::convert::reverse::image_to_pdf(bytes) {
+        Some(pdf) => unsafe { bytes_into_host(pdf, out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 // ─── fonts: catalog, Google Fonts download (host port), embedding ────────────
 //
 // The WASM sandbox has no network. The engine ships the catalog, computes the

@@ -108,10 +108,23 @@ Task-oriented snippets using the high-level classes. Each assumes
 ### Merge several PDFs
 
 ```ts
+const merged = giga.mergePdfs([first, second, third]); // one PDF, pages in order
+```
+
+Or, for finer control, append page-by-page yourself:
+
+```ts
 const doc = giga.open(first);                 // the base document
 for (const extra of [second, third]) doc.appendPages(extra); // append every page
 const merged = doc.saveCompressed();
 doc.close();
+```
+
+### Image → PDF
+
+```ts
+const pdf = giga.imageToPdf(imageBytes); // PNG/JPEG/GIF/WebP/AVIF → one A4 page
+// (image centred, shrink-to-fit, never upscaled; empty array if not an image)
 ```
 
 ### Split — extract a page range into a new PDF
@@ -254,7 +267,8 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
 > signatures and defaults also ship in the bundled `.d.ts`.
 
 - **`GigaPdfEngine`** — `load`/`loadDefault`, `open`/`openEncrypted`,
-  `txtToPdf`/`htmlToPdf`/`rtfToPdf`/`officeToPdf`, `fontCatalog`/`fontRequestUrl`/`parseCssFontUrl`.
+  `txtToPdf`/`htmlToPdf`/`rtfToPdf`/`officeToPdf`/`imageToPdf` (PNG/JPEG/GIF/WebP/AVIF → A4 page),
+  `mergePdfs` (concatenate many PDFs), `fontCatalog`/`fontRequestUrl`/`parseCssFontUrl`.
 - **`GigaPdfDoc`** — text intelligence (`textRuns`, `structuredText`, `search`,
   `ocr`, `ocrText`, `elements`, `elementAt`), editing (`replaceText`,
   `removeElement`, `moveElement`, `duplicateElement`, `redact`), vector drawing
