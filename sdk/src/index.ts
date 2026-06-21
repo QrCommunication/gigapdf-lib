@@ -1985,6 +1985,17 @@ export class GigaPdfDoc {
     return this.g._buffer((o) => this.ex().gp_render_page(this.h, page, scale, o));
   }
 
+  /**
+   * Rasterize a page to a PNG **without the page content stream's text** — glyphs
+   * are suppressed while gradients, shadings, images, vectors and patterns are
+   * preserved. Annotation/widget appearances are still painted in full. Use this
+   * to paint a text-free raster background the editor can overlay real, editable
+   * text on top of.
+   */
+  renderPageNoText(page: number, scale = 1): Uint8Array {
+    return this.g._buffer((o) => this.ex().gp_render_page_no_text(this.h, page, scale, o));
+  }
+
   // fonts — embed a downloaded font, then add real selectable text
   /**
    * Embed an outline font program as a Type0 font and return its object number

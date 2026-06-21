@@ -176,6 +176,10 @@ const fields = JSON.parse(dec.decode(callBuffer((lp) => ex.gp_fields_json(handle
 
 ```js
 const png = callBuffer((lp) => ex.gp_render_page(handle, 1, 2.0, lp)); // 2× scale
+
+// Text-free background for an editor that overlays real, editable text
+// (vectors/gradients/images/annotations still rendered):
+const bg = callBuffer((lp) => ex.gp_render_page_no_text(handle, 1, 2.0, lp));
 ```
 
 ## 6. Convert PDF → anything

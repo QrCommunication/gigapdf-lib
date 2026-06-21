@@ -508,6 +508,7 @@ pub fn render_content_into(
         &NoResources,
         0,
         None,
+        false,
     );
 }
 
@@ -517,6 +518,12 @@ pub fn render_content_into(
 /// (`gs`). `depth` is the current form-nesting depth (cycle/recursion guard);
 /// `init_clip` seeds the graphics-state clip (a parent form's `/BBox` + active
 /// clip when recursing).
+///
+/// When `skip_text` is true, the text-showing operators (`Tj`, `'`, `"`, `TJ`)
+/// paint nothing: all text-state bookkeeping (the text matrix advances driven by
+/// `'`/`"`/`Td`/`Tm`/…) still runs, but the glyph fills are suppressed. Vector,
+/// shading, image and pattern painting are unaffected. The flag is threaded into
+/// nested form XObjects and tiling patterns so the whole content tree honours it.
 #[allow(clippy::too_many_arguments)]
 pub fn render_content_into_ctx(
     canvas: &mut Canvas,
@@ -528,6 +535,7 @@ pub fn render_content_into_ctx(
     ctx: &dyn ResourceCtx,
     depth: usize,
     init_clip: Option<&ClipMask>,
+    skip_text: bool,
 ) {
     let global_alpha = global_alpha.clamp(0.0, 1.0);
     if global_alpha <= 0.0 {
@@ -705,6 +713,7 @@ pub fn render_content_into_ctx(
                         global_alpha,
                         ctx,
                         depth,
+                        skip_text,
                     );
                 } else {
                     canvas.fill_ext(
@@ -776,7 +785,7 @@ pub fn render_content_into_ctx(
                         );
                     } else if depth < crate::content::MAX_FORM_DEPTH {
                         if let Some(form) = ctx.form_xobject(name) {
-                            draw_form(canvas, &form, &state, &base, global_alpha, depth);
+                            draw_form(canvas, &form, &state, &base, global_alpha, depth, skip_text);
                         }
                     }
                 }
@@ -827,22 +836,24 @@ pub fn render_content_into_ctx(
                     tm = tlm;
                 }
                 if let (Some(f), Some(Object::String(bytes, _))) = (font, op.operands.last()) {
-                    show_text(
-                        canvas,
-                        f,
-                        font_size,
-                        &mut tm,
-                        &state.ctm,
-                        &base,
-                        state.fill,
-                        char_spacing,
-                        word_spacing,
-                        h_scale,
-                        global_alpha * state.fill_alpha,
-                        state.paint_clip().as_ref(),
-                        state.blend,
-                        bytes,
-                    );
+                    if !skip_text {
+                        show_text(
+                            canvas,
+                            f,
+                            font_size,
+                            &mut tm,
+                            &state.ctm,
+                            &base,
+                            state.fill,
+                            char_spacing,
+                            word_spacing,
+                            h_scale,
+                            global_alpha * state.fill_alpha,
+                            state.paint_clip().as_ref(),
+                            state.blend,
+                            bytes,
+                        );
+                    }
                 }
             }
             b"TJ" => {
@@ -850,22 +861,24 @@ pub fn render_content_into_ctx(
                     let clip = state.paint_clip();
                     for item in items {
                         if let Object::String(bytes, _) = item {
-                            show_text(
-                                canvas,
-                                f,
-                                font_size,
-                                &mut tm,
-                                &state.ctm,
-                                &base,
-                                state.fill,
-                                char_spacing,
-                                word_spacing,
-                                h_scale,
-                                global_alpha * state.fill_alpha,
-                                clip.as_ref(),
-                                state.blend,
-                                bytes,
-                            );
+                            if !skip_text {
+                                show_text(
+                                    canvas,
+                                    f,
+                                    font_size,
+                                    &mut tm,
+                                    &state.ctm,
+                                    &base,
+                                    state.fill,
+                                    char_spacing,
+                                    word_spacing,
+                                    h_scale,
+                                    global_alpha * state.fill_alpha,
+                                    clip.as_ref(),
+                                    state.blend,
+                                    bytes,
+                                );
+                            }
                         } else if let Some(adj) = item.as_f64() {
                             let dx = -adj / 1000.0 * font_size * h_scale;
                             tm = Matrix::translate(dx, 0.0).then(&tm);
@@ -906,6 +919,7 @@ fn commit_pending_clip(
 /// resources and child context. The composed `/BBox` ∩ active clip is seeded as
 /// the child's initial clip so the form's marks stay inside its box. `depth+1`
 /// bounds nesting (cycle guard).
+#[allow(clippy::too_many_arguments)]
 fn draw_form(
     canvas: &mut Canvas,
     form: &FormXObject,
@@ -913,6 +927,7 @@ fn draw_form(
     base: &Matrix,
     global_alpha: f64,
     depth: usize,
+    skip_text: bool,
 ) {
     // Form space → invoking user space → device base. The form draws in this
     // composed coordinate system, so we fold it into a new base for the recursion.
@@ -952,6 +967,7 @@ fn draw_form(
         form.ctx.as_ref(),
         depth + 1,
         Some(&clip),
+        skip_text,
     );
 }
 
@@ -1236,6 +1252,7 @@ fn paint_pattern_fill(
     global_alpha: f64,
     ctx: &dyn ResourceCtx,
     depth: usize,
+    skip_text: bool,
 ) {
     let path_mask = ClipMask::from_edges(
         canvas.width,
@@ -1271,6 +1288,7 @@ fn paint_pattern_fill(
                 form.ctx.as_ref(),
                 depth + 1,
                 Some(&clip),
+                skip_text,
             );
         }
     }

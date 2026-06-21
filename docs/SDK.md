@@ -315,6 +315,7 @@ baselines survive a round-trip.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `renderPage(page, scale?)` | `Uint8Array` | Rasterise a page to PNG at `scale` (1 = 72 dpi). Native rasteriser (glyphs, images, vectors, SVG, colour emoji). |
+| `renderPageNoText(page, scale?)` | `Uint8Array` | Rasterise a page to PNG **without** its page-content text — for editors that overlay real editable text on a text-free background; vectors/gradients/images/annotations are still rendered. |
 | `rgbaToPng(rgba, width, height)` | `Uint8Array` | *(engine-level)* Encode raw RGBA pixels (`width*height*4`, row-major, non-premultiplied) to PNG with the native encoder — no `canvas`/image library. Empty on a length mismatch. |
 | `resizeRgba(rgba, sw, sh, dw, dh)` | `Uint8Array` | *(engine-level)* Resample raw RGBA `sw`×`sh` → `dw`×`dh` with the native alpha-correct resampler (triangle kernel, footprint scaled for down/up) — no `sharp`/image library. Empty on a bad input. |
 | `encodeJpeg(rgba, width, height, quality?)` | `Uint8Array` | *(engine-level)* Encode RGBA → baseline JPEG (native codec, 4:4:4, `quality` 1–100, default 82) — no image library. Alpha composited on white. |

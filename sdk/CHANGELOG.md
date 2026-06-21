@@ -4,6 +4,19 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.56.0] - 2026-06-21
+
+### Added
+
+- **`renderPageNoText(page, scale?)` — text-free page raster.** Rasterise a page to
+  PNG **without** its page-content text (glyphs from `Tj`/`'`/`"`/`TJ` are suppressed)
+  while every non-text element — vectors, gradients/shadings, images and patterns —
+  plus annotation/widget appearances are rendered in full. Built for editors that
+  overlay real, editable text on top of a text-free background. Native rasteriser, no
+  third-party image library. New ABI `gp_render_page_no_text(handle, page, scale,
+  out_len)` and core `Document::render_page_no_text`, alongside the existing
+  `renderPage` / `gp_render_page`.
+
 ## [0.55.1] - 2026-06-21
 
 ### Fixed

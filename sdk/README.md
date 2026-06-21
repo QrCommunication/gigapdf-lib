@@ -276,7 +276,9 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   `addImage` (PNG/JPEG, alpha + opacity)), pages (`rotatePage`, `deletePage`,
   `movePage`, `appendPages`, `extractPages`, `resizePage`, `addPage`, `copyPage`,
   `pageInfo`),
-  `renderPage`, fonts (base-14 `addStandardText`, embed **any** TrueType/OpenType
+  `renderPage` (and `renderPageNoText` — a text-free background for editors that
+  overlay real editable text; vectors/gradients/images/annotations still rendered),
+  fonts (base-14 `addStandardText`, embed **any** TrueType/OpenType
   via `embedFont`/`addText`, font-aware editing `replaceText`,
   the document's own faces `embeddedFonts`/`extractFont`, `neededFonts`),
   conversions (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`, plus

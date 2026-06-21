@@ -1573,6 +1573,28 @@ pub extern "C" fn gp_render_page(
     }
 }
 
+/// Rasterize a page to a PNG at `scale` device pixels per PDF point **without**
+/// the page content stream's text (glyphs from `Tj`/`'`/`"`/`TJ` are suppressed);
+/// gradients, shadings, images, vectors and patterns are preserved. Annotation
+/// appearances are still painted in full. Lets the editor lay real, editable text
+/// over a text-free raster background. Buffer-returning (host frees); null on
+/// error.
+#[no_mangle]
+pub extern "C" fn gp_render_page_no_text(
+    handle: *const Document,
+    page: u32,
+    scale: f64,
+    out_len: *mut usize,
+) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => match doc.render_page_no_text(page, scale) {
+            Ok(png) => unsafe { bytes_into_host(png, out_len) },
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Encode raw RGBA pixels (`width*height*4` bytes, row-major, non-premultiplied)
 /// to a PNG with the engine's native encoder — no third-party image library.
 /// Returns `null` if the buffer length doesn't match `width*height*4`. Host frees

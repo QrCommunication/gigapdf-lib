@@ -155,6 +155,7 @@ MAC verified — with **no third-party crypto** (all in `crate::crypto`).
 | Rust | WASM |
 |------|------|
 | `render_page(page,scale) -> Vec<u8>` (PNG) | `gp_render_page(handle,page,scale,outlen)` |
+| `render_page_no_text(page,scale) -> Vec<u8>` (PNG, page-content text suppressed) | `gp_render_page_no_text(handle,page,scale,outlen)` · SDK `renderPageNoText` (text-free background for editor overlays; vectors/gradients/images/annotations still rendered) |
 | `raster::encode_png(w,h,&rgba) -> Vec<u8>` | `gp_rgba_to_png(w,h,ptr,len,outlen)` · SDK `rgbaToPng` (native RGBA→PNG, no `canvas`) |
 | `raster::resize_rgba(&rgba,sw,sh,dw,dh) -> Vec<u8>` (alpha-correct, separable) | `gp_resize_rgba(ptr,len,sw,sh,dw,dh,outlen)` · SDK `resizeRgba` (no `sharp`) |
 | `raster::jpeg::encode_jpeg(w,h,&rgba,quality) -> Vec<u8>` (baseline 4:4:4) | `gp_encode_jpeg(w,h,ptr,len,quality,outlen)` · SDK `encodeJpeg` |

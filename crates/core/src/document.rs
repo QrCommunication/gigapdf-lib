@@ -2537,12 +2537,34 @@ impl Document {
     /// the built-in zero-dependency renderer (vector graphics; text glyphs and
     /// images are added by later renderer slices).
     pub fn render_page(&self, page_no: u32, scale: f64) -> Result<Vec<u8>> {
-        Ok(self.render_page_canvas(page_no, scale)?.to_png())
+        Ok(self.render_page_canvas(page_no, scale, false)?.to_png())
+    }
+
+    /// Rasterize a page to a PNG at `scale` device pixels per PDF point **without
+    /// painting the page content stream's text** (glyphs from `Tj`/`'`/`"`/`TJ`
+    /// are suppressed). Gradients, shadings, images, vectors and tiling patterns
+    /// are preserved untouched. This produces a text-free background the editor
+    /// can overlay real, editable text on top of.
+    ///
+    /// Note: annotation/widget appearance streams (`/AP /N`) are still painted
+    /// in full — their text is intentionally **not** suppressed — so form fields
+    /// and other widget appearances remain unaffected. Only the page's own
+    /// content-stream text is removed.
+    pub fn render_page_no_text(&self, page_no: u32, scale: f64) -> Result<Vec<u8>> {
+        Ok(self.render_page_canvas(page_no, scale, true)?.to_png())
     }
 
     /// Rasterize a page to an RGBA [`Canvas`](crate::raster::Canvas) at `scale`
-    /// device pixels per point. Shared by `render_page` and `ocr_page`.
-    fn render_page_canvas(&self, page_no: u32, scale: f64) -> Result<crate::raster::Canvas> {
+    /// device pixels per point. Shared by `render_page`, `render_page_no_text`
+    /// and `ocr_page`. When `skip_text` is true the page content stream's text is
+    /// suppressed (see [`Document::render_page_no_text`]); annotation appearances
+    /// are always rendered in full.
+    fn render_page_canvas(
+        &self,
+        page_no: u32,
+        scale: f64,
+        skip_text: bool,
+    ) -> Result<crate::raster::Canvas> {
         let media_box = self.read_media_box(self.page_dict(page_no)?);
         let [x0, y0, x1, y1] = media_box;
         let w_pts = (x1 - x0).abs();
@@ -2568,9 +2590,13 @@ impl Document {
             &ctx,
             0,
             None,
+            skip_text,
         );
         // Paint annotation appearances (`/AP /N`) over the page content, the way
         // every viewer does: page content is the body, annotations layer on top.
+        // We deliberately render annotation appearances in full even when
+        // `skip_text` is set — only the PAGE content-stream text is suppressed,
+        // so form/widget appearances stay intact for the editor overlay.
         self.render_annotation_appearances(page_no, &mut canvas, base);
         Ok(canvas)
     }
@@ -2651,6 +2677,7 @@ impl Document {
                 &ctx,
                 0,
                 None,
+                false,
             );
         }
     }
@@ -3344,6 +3371,7 @@ impl Document {
             &ctx,
             1,
             None,
+            false,
         );
         // Luminance → alpha (Rec. 601 weights), per pixel.
         let mut cover = vec![0.0f32; (width as usize) * (height as usize)];
@@ -3389,7 +3417,7 @@ impl Document {
     /// host can highlight or overlay. Works on scanned (image-only) pages — for
     /// pages that already carry a text layer, prefer [`structured_text`](Self::structured_text).
     pub fn ocr_page(&self, page_no: u32, scale: f64) -> Vec<crate::raster::ocr::OcrWord> {
-        let Ok(canvas) = self.render_page_canvas(page_no, scale) else {
+        let Ok(canvas) = self.render_page_canvas(page_no, scale, false) else {
             return Vec::new();
         };
         let (w, h) = (canvas.width as usize, canvas.height as usize);
@@ -3423,7 +3451,7 @@ impl Document {
 
     /// OCR a page and return only the recognized text (newline-separated lines).
     pub fn ocr_page_text(&self, page_no: u32, scale: f64) -> String {
-        let Ok(canvas) = self.render_page_canvas(page_no, scale) else {
+        let Ok(canvas) = self.render_page_canvas(page_no, scale, false) else {
             return String::new();
         };
         let (w, h) = (canvas.width as usize, canvas.height as usize);
@@ -11830,7 +11858,7 @@ mod tests {
 
         // 2. A visible opaque black box covers the zone (rasterize and sample the
         //    centre — it must be black, not the white paper).
-        let canvas = reopened.render_page_canvas(1, 1.0).unwrap();
+        let canvas = reopened.render_page_canvas(1, 1.0, false).unwrap();
         let mid = px(&canvas, canvas.width / 2, canvas.height / 2);
         assert_eq!(mid, [0, 0, 0], "centre of the page is the black redaction cover, got {mid:?}");
     }
@@ -12321,6 +12349,43 @@ mod tests {
         assert!(
             dark > 500,
             "embedded-font glyphs painted ink ({dark} dark samples)"
+        );
+    }
+
+    #[test]
+    fn render_page_no_text_suppresses_page_glyphs() {
+        // embedded-fonts.pdf paints real glyph ink. Rendering with text suppressed
+        // must produce a *different* image with strictly fewer non-background
+        // pixels than the normal render — the glyphs are the only difference.
+        let doc = Document::open(&fixture("embedded-fonts.pdf")).unwrap();
+        let with_text = doc.render_page(1, 2.0).unwrap();
+        let no_text = doc.render_page_no_text(1, 2.0).unwrap();
+
+        // The two PNG byte buffers must differ (text was removed).
+        assert_ne!(
+            with_text, no_text,
+            "no-text render must differ from the normal render"
+        );
+
+        // And the no-text render must have fewer painted (non-white) pixels: the
+        // glyphs are gone, nothing else changed. Compare full-page pixel counts.
+        let img_with = crate::raster::decode_png(&with_text).expect("valid PNG (with text)");
+        let img_without = crate::raster::decode_png(&no_text).expect("valid PNG (no text)");
+        let count_nonwhite = |img: &crate::raster::png_decode::DecodedImage| -> usize {
+            img.rgba
+                .chunks_exact(4)
+                .filter(|px| px[0] != 255 || px[1] != 255 || px[2] != 255)
+                .count()
+        };
+        let n_with = count_nonwhite(&img_with);
+        let n_without = count_nonwhite(&img_without);
+        assert!(
+            n_with > 0,
+            "normal render paints glyph ink ({n_with} non-white pixels)"
+        );
+        assert!(
+            n_without < n_with,
+            "no-text render has fewer non-white pixels ({n_without}) than with text ({n_with})"
         );
     }
 
@@ -13806,7 +13871,7 @@ mod tests {
         ];
         objects.extend(extra_objects.iter().cloned());
         let doc = Document::open(&raw_pdf(&objects)).unwrap();
-        doc.render_page_canvas(1, 1.0).unwrap()
+        doc.render_page_canvas(1, 1.0, false).unwrap()
     }
 
     /// The `[r, g, b]` of a device pixel `(x, y)` (top-left origin) of a canvas.
@@ -13940,7 +14005,7 @@ mod tests {
         }
 
         let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
-        doc.render_page_canvas(1, 1.0).unwrap()
+        doc.render_page_canvas(1, 1.0, false).unwrap()
     }
 
     #[test]
@@ -14079,7 +14144,7 @@ mod tests {
             }
 
             let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
-            let canvas = doc.render_page_canvas(1, 1.0).unwrap();
+            let canvas = doc.render_page_canvas(1, 1.0, false).unwrap();
 
             // Non-white pixels appear where the image is placed (device y is
             // flipped: user (20..80) → device (20..80) here on a 100-tall page).
@@ -14338,7 +14403,7 @@ mod tests {
             (6, image_body),
         ];
         let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
-        doc.render_page_canvas(1, 1.0).unwrap()
+        doc.render_page_canvas(1, 1.0, false).unwrap()
     }
 
     #[test]
@@ -14454,7 +14519,7 @@ mod tests {
             (7, b"<< /N 3 /Length 0 >>\nstream\n\nendstream".to_vec()),
         ];
         let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
-        let canvas = doc.render_page_canvas(1, 1.0).unwrap();
+        let canvas = doc.render_page_canvas(1, 1.0, false).unwrap();
         let left = px(&canvas, 30, 50);
         let right = px(&canvas, 70, 50);
         assert!(left[1] > 200 && left[0] < 60, "ICCBased N3 image left must be green, got {left:?}");
