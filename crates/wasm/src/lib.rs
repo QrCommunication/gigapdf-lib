@@ -716,6 +716,34 @@ pub extern "C" fn gp_set_path_style_json(
     edit(handle, |doc| doc.set_path_style(page, index, &style))
 }
 
+/// Set a constant opacity (`fill_alpha`, `0..=1`) on element `index` on `page`
+/// — text, image **or** shape — by registering an `/ExtGState` (`/ca` = `/CA` =
+/// `fill_alpha`) and wrapping the element's op range in `q /<gs> gs … Q`. This is
+/// how an **image**'s alpha is set in place. 0 on success; negative on error.
+#[no_mangle]
+pub extern "C" fn gp_set_element_opacity(
+    handle: *mut Document,
+    page: u32,
+    index: usize,
+    fill_alpha: f64,
+) -> i32 {
+    edit(handle, |doc| doc.set_element_opacity(page, index, fill_alpha))
+}
+
+/// Change the paint order (z-order) of element `index` on `page`: `to_front != 0`
+/// brings it on top (painted last), otherwise it goes behind (painted first). The
+/// element's index changes after the move — the caller should re-read the element
+/// list. 0 on success; negative on error (incl. out-of-range index).
+#[no_mangle]
+pub extern "C" fn gp_reorder_element(
+    handle: *mut Document,
+    page: u32,
+    index: usize,
+    to_front: i32,
+) -> i32 {
+    edit(handle, |doc| doc.reorder_element(page, index, to_front != 0))
+}
+
 /// Parse a small `{fill,stroke,strokeWidth,dash,fillAlpha,strokeAlpha}` JSON
 /// object into a [`PathStyle`]. Std-only, tailored to this fixed shape (no
 /// third-party JSON dependency): unknown keys are ignored, missing keys stay
@@ -1692,6 +1720,37 @@ pub extern "C" fn gp_render_page_no_text(
 ) -> *mut u8 {
     match unsafe { handle.as_ref() } {
         Some(doc) => match doc.render_page_no_text(page, scale) {
+            Ok(png) => unsafe { bytes_into_host(png, out_len) },
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Rasterize `page` to a PNG at `scale` while **omitting** the top-level element
+/// indices in `indices_ptr`/`indices_len` (a `u32` array). Each excluded element
+/// paints nothing (fills/strokes/shadings/images/text); everything else renders
+/// normally. Lets the host paint a background without specific elements and
+/// overlay live editable versions. Buffer-returning (host frees); null on error.
+#[no_mangle]
+pub extern "C" fn gp_render_page_excluding(
+    handle: *const Document,
+    page: u32,
+    indices_ptr: *const u32,
+    indices_len: usize,
+    scale: f64,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let indices: Vec<usize> = if indices_ptr.is_null() || indices_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(indices_ptr, indices_len) }
+            .iter()
+            .map(|&v| v as usize)
+            .collect()
+    };
+    match unsafe { handle.as_ref() } {
+        Some(doc) => match doc.render_page_excluding(page, &indices, scale) {
             Ok(png) => unsafe { bytes_into_host(png, out_len) },
             Err(_) => std::ptr::null_mut(),
         },

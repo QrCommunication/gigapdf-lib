@@ -509,6 +509,7 @@ pub fn render_content_into(
         0,
         None,
         false,
+        &[],
     );
 }
 
@@ -524,6 +525,14 @@ pub fn render_content_into(
 /// `'`/`"`/`Td`/`Tm`/…) still runs, but the glyph fills are suppressed. Vector,
 /// shading, image and pattern painting are unaffected. The flag is threaded into
 /// nested form XObjects and tiling patterns so the whole content tree honours it.
+///
+/// `excluded` is an optional per-operation mask (indexed by this stream's parsed
+/// op position): when `excluded[i]` is true, the **painting** of op `i` is
+/// suppressed — fills/strokes/shadings/images/text — while all state bookkeeping
+/// still runs (so positions of following content are unchanged). It applies to
+/// the **top-level** stream only (nested forms/patterns are passed an empty mask,
+/// since unified element op ranges are top-level), and generalises `skip_text` to
+/// arbitrary element op ranges. An empty slice means "exclude nothing".
 #[allow(clippy::too_many_arguments)]
 pub fn render_content_into_ctx(
     canvas: &mut Canvas,
@@ -536,6 +545,7 @@ pub fn render_content_into_ctx(
     depth: usize,
     init_clip: Option<&ClipMask>,
     skip_text: bool,
+    excluded: &[bool],
 ) {
     let global_alpha = global_alpha.clamp(0.0, 1.0);
     if global_alpha <= 0.0 {
@@ -566,8 +576,13 @@ pub fn render_content_into_ctx(
     let mut word_spacing = 0.0f64;
     let mut h_scale = 1.0f64;
 
-    for op in &operations {
+    for (op_index, op) in operations.iter().enumerate() {
         let n = nums(op);
+        // When this op falls inside an excluded element's range, suppress its
+        // painting (like `skip_text`, but for arbitrary op ranges) while still
+        // running all graphics/text-state bookkeeping below.
+        let op_excluded = excluded.get(op_index).copied().unwrap_or(false);
+        let skip_paint = op_excluded;
         match op.operator.as_slice() {
             b"q" => stack.push(state.clone()),
             b"Q" => {
@@ -702,31 +717,51 @@ pub fn render_content_into_ctx(
             b"f" | b"F" | b"f*" | b"b" | b"b*" | b"B" | b"B*" => {
                 let even_odd = op.operator.ends_with(b"*");
                 let clip = state.paint_clip();
-                if let Some(pat) = state.fill_pattern.clone() {
-                    paint_pattern_fill(
-                        canvas,
-                        &subpaths,
-                        even_odd,
-                        &pat,
-                        &state,
-                        &base,
-                        global_alpha,
-                        ctx,
-                        depth,
-                        skip_text,
-                    );
-                } else {
-                    canvas.fill_ext(
-                        &subpath_edges(&subpaths),
-                        state.fill,
-                        even_odd,
-                        global_alpha * state.fill_alpha,
-                        clip.as_ref(),
-                        state.blend,
-                    );
+                // Excluded element: skip the actual fill/stroke paint, but still
+                // commit the clip and clear the path so the stream stays correct.
+                if !skip_paint {
+                    if let Some(pat) = state.fill_pattern.clone() {
+                        paint_pattern_fill(
+                            canvas,
+                            &subpaths,
+                            even_odd,
+                            &pat,
+                            &state,
+                            &base,
+                            global_alpha,
+                            ctx,
+                            depth,
+                            skip_text,
+                        );
+                    } else {
+                        canvas.fill_ext(
+                            &subpath_edges(&subpaths),
+                            state.fill,
+                            even_odd,
+                            global_alpha * state.fill_alpha,
+                            clip.as_ref(),
+                            state.blend,
+                        );
+                    }
+                    if matches!(op.operator.as_slice(), b"b" | b"b*" | b"B" | b"B*") {
+                        let lw = device_scale(&state.ctm, &base) * state.line_width;
+                        canvas.fill_ext(
+                            &stroke_edges(&subpaths, lw),
+                            state.stroke,
+                            false,
+                            global_alpha,
+                            clip.as_ref(),
+                            state.blend,
+                        );
+                    }
                 }
-                if matches!(op.operator.as_slice(), b"b" | b"b*" | b"B" | b"B*") {
-                    let lw = device_scale(&state.ctm, &base) * state.line_width;
+                commit_pending_clip(&mut state, &subpaths, &mut pending_clip, canvas);
+                subpaths.clear();
+            }
+            b"S" | b"s" => {
+                let lw = device_scale(&state.ctm, &base) * state.line_width;
+                let clip = state.paint_clip();
+                if !skip_paint {
                     canvas.fill_ext(
                         &stroke_edges(&subpaths, lw),
                         state.stroke,
@@ -739,27 +774,13 @@ pub fn render_content_into_ctx(
                 commit_pending_clip(&mut state, &subpaths, &mut pending_clip, canvas);
                 subpaths.clear();
             }
-            b"S" | b"s" => {
-                let lw = device_scale(&state.ctm, &base) * state.line_width;
-                let clip = state.paint_clip();
-                canvas.fill_ext(
-                    &stroke_edges(&subpaths, lw),
-                    state.stroke,
-                    false,
-                    global_alpha,
-                    clip.as_ref(),
-                    state.blend,
-                );
-                commit_pending_clip(&mut state, &subpaths, &mut pending_clip, canvas);
-                subpaths.clear();
-            }
             b"n" => {
                 commit_pending_clip(&mut state, &subpaths, &mut pending_clip, canvas);
                 subpaths.clear();
             }
 
             // Paint a shading directly across the current clip region.
-            b"sh" => {
+            b"sh" if !skip_paint => {
                 if let Some(Object::Name(name)) = op.operands.first() {
                     if let Some(mut shading) = ctx.shading(name) {
                         // `sh` paints in the current user space → device.
@@ -770,7 +791,7 @@ pub fn render_content_into_ctx(
                 }
             }
 
-            b"Do" => {
+            b"Do" if !skip_paint => {
                 if let Some(Object::Name(name)) = op.operands.first() {
                     if let Some(image) = images.get(name) {
                         let clip = state.paint_clip();
@@ -836,7 +857,7 @@ pub fn render_content_into_ctx(
                     tm = tlm;
                 }
                 if let (Some(f), Some(Object::String(bytes, _))) = (font, op.operands.last()) {
-                    if !skip_text {
+                    if !skip_text && !skip_paint {
                         show_text(
                             canvas,
                             f,
@@ -861,7 +882,7 @@ pub fn render_content_into_ctx(
                     let clip = state.paint_clip();
                     for item in items {
                         if let Object::String(bytes, _) = item {
-                            if !skip_text {
+                            if !skip_text && !skip_paint {
                                 show_text(
                                     canvas,
                                     f,
@@ -968,6 +989,9 @@ fn draw_form(
         depth + 1,
         Some(&clip),
         skip_text,
+        // Exclusion masks address top-level element op ranges only; nested form
+        // content carries no such index, so it always paints.
+        &[],
     );
 }
 
@@ -1289,6 +1313,7 @@ fn paint_pattern_fill(
                 depth + 1,
                 Some(&clip),
                 skip_text,
+                &[],
             );
         }
     }

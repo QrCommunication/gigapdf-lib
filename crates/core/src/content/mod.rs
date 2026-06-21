@@ -1353,13 +1353,21 @@ pub struct PathStyle {
 /// `r g b RG`, `stroke_width`→`w w`, `dash`→`[ … ] 0 d`); `None` fields are left
 /// to the inherited state.
 ///
-/// **Alpha limitation:** PDF opacity (`/ca`, `/CA`) can only be set via the `gs`
-/// operator, which references a *named* `/ExtGState` resource — something a pure
-/// content-stream edit cannot create. So `fill_alpha`/`stroke_alpha` are
-/// accepted for API symmetry but are **not** emitted here (skipped rather than
-/// risk corrupting the stream). Use the resource-level shape-drawing APIs (which
-/// register an `ExtGState`) when opacity is required.
-pub fn set_path_style(content: &[u8], index: usize, style: &PathStyle) -> Result<Vec<u8>> {
+/// **Opacity:** PDF alpha (`/ca`, `/CA`) can only be set via the `gs` operator,
+/// which references a *named* `/ExtGState` resource — something a pure
+/// content-stream edit cannot create on its own. When `gstate` is `Some(name)`
+/// (the caller having registered an `/ExtGState` resource named `name` carrying
+/// the requested `/ca`/`/CA`), a `/<name> gs` op is injected first inside the
+/// `q … Q` wrap so the alpha applies to this path run only. When `gstate` is
+/// `None`, the `fill_alpha`/`stroke_alpha` fields are ignored (no `gs` is
+/// emitted). The document-level [`Document::set_path_style`] registers the
+/// resource and passes the name through, so opacity works end-to-end there.
+pub fn set_path_style(
+    content: &[u8],
+    index: usize,
+    style: &PathStyle,
+    gstate: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut operations = parse_content(content)?;
     let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
         .into_iter()
@@ -1374,6 +1382,14 @@ pub fn set_path_style(content: &[u8], index: usize, style: &PathStyle) -> Result
     // Build the override operators to inject right after the opening `q`, before
     // the path's own construction + paint ops.
     let mut overrides: Vec<Operation> = Vec::new();
+    // Opacity first: a `/<name> gs` selects the caller-registered `/ExtGState`
+    // (its `/ca`/`/CA`) for this run. Only emitted when the caller supplies a
+    // name AND an alpha was actually requested.
+    if let Some(name) = gstate {
+        if style.fill_alpha.is_some() || style.stroke_alpha.is_some() {
+            overrides.push(gs_op(name));
+        }
+    }
     if let Some([r, g, b]) = style.fill {
         overrides.push(rgb_op(b"rg", r, g, b));
     }
@@ -1395,9 +1411,6 @@ pub fn set_path_style(content: &[u8], index: usize, style: &PathStyle) -> Result
             ],
         });
     }
-    // `fill_alpha`/`stroke_alpha` are intentionally not emitted — see the doc
-    // comment: opacity needs a named `/ExtGState`, unavailable to an inline edit.
-
     // Insert closing `Q` after the element, then `q` + the overrides before it,
     // so the final order is: q  <overrides>  <element ops>  Q
     operations.insert(
@@ -1427,6 +1440,102 @@ fn rgb_op(operator: &[u8], r: f64, g: f64, b: f64) -> Operation {
         operator: operator.to_vec(),
         operands: vec![Object::Real(r), Object::Real(g), Object::Real(b)],
     }
+}
+
+/// A `/<name> gs` operation selecting a named `/ExtGState` resource.
+fn gs_op(name: &[u8]) -> Operation {
+    Operation {
+        operator: b"gs".to_vec(),
+        operands: vec![Object::Name(name.to_vec())],
+    }
+}
+
+/// Apply a constant opacity to the element at `index` (text, image **or** shape)
+/// by wrapping its operation range in `q /<gstate> gs … Q`. `gstate` is the
+/// resource name of a `/ExtGState` (carrying `/ca` and optionally `/CA`) the
+/// caller has registered on the page's `/Resources`. Like [`transform_element`]
+/// the element's internal coordinates are untouched; only the graphics state in
+/// effect for that run changes. For an image (`Do`) this is the only way to set
+/// its alpha; shapes can use this or [`set_path_style`]'s alpha (same mechanism).
+///
+/// The emitted wrapping is exactly: `q  /<gstate> gs  <element ops>  Q`.
+pub fn set_element_opacity(content: &[u8], index: usize, gstate: &[u8]) -> Result<Vec<u8>> {
+    let mut operations = parse_content(content)?;
+    let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;
+
+    // Insert closing `Q` after the element, then `q` + `/<gstate> gs` before it,
+    // so the final order is: q  /<gstate> gs  <element ops>  Q
+    operations.insert(
+        element.op_end + 1,
+        Operation {
+            operator: b"Q".to_vec(),
+            operands: Vec::new(),
+        },
+    );
+    operations.insert(element.op_start, gs_op(gstate));
+    operations.insert(
+        element.op_start,
+        Operation {
+            operator: b"q".to_vec(),
+            operands: Vec::new(),
+        },
+    );
+    Ok(encode_content(&operations))
+}
+
+/// Change the paint order (z-order) of the element at `index` by splicing its
+/// whole operation range to a new position in the page content stream and
+/// re-wrapping it in `q … Q` (so it does not inherit a different graphics state
+/// at its new home, and does not leak its own state onto neighbours).
+///
+/// * `to_front == true` → moved to the **end** of the stream → painted last →
+///   visually on top of everything else.
+/// * `to_front == false` → moved to the **start** of the stream → painted first
+///   → behind everything else.
+///
+/// Works for text, image and shape elements addressed by their unified index.
+/// The element's index changes after the splice (it is now first or last among
+/// the elements) — callers should re-read [`extract_elements`]. Returns `Err`
+/// for an out-of-range index. The stream stays balanced (the spliced run is
+/// self-contained and the `q … Q` it gains is itself balanced).
+pub fn reorder_element(content: &[u8], index: usize, to_front: bool) -> Result<Vec<u8>> {
+    let mut operations = parse_content(content)?;
+    let element = elements_from_ops(&operations, &FontDecoders::new(), &BTreeMap::new())
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;
+
+    // Lift the element's operation range out of the stream (it is contiguous).
+    let moved: Vec<Operation> = operations
+        .drain(element.op_start..=element.op_end)
+        .collect();
+
+    // Re-wrap the lifted run in a balanced `q … Q` so it carries no inherited or
+    // leaking graphics state at its new position.
+    let mut wrapped: Vec<Operation> = Vec::with_capacity(moved.len() + 2);
+    wrapped.push(Operation {
+        operator: b"q".to_vec(),
+        operands: Vec::new(),
+    });
+    wrapped.extend(moved);
+    wrapped.push(Operation {
+        operator: b"Q".to_vec(),
+        operands: Vec::new(),
+    });
+
+    if to_front {
+        // Painted last → on top. Append at the very end.
+        operations.extend(wrapped);
+    } else {
+        // Painted first → behind. Prepend at the very start.
+        for (offset, op) in wrapped.into_iter().enumerate() {
+            operations.insert(offset, op);
+        }
+    }
+    Ok(encode_content(&operations))
 }
 
 // ─── content creation (add shapes/frames) ────────────────────────────────────
@@ -1925,7 +2034,7 @@ BT /F 12 Tf (BODY) Tj ET";
             fill: Some([1.0, 0.0, 0.0]),
             ..PathStyle::default()
         };
-        let edited = set_path_style(content, 0, &style).unwrap();
+        let edited = set_path_style(content, 0, &style, None).unwrap();
         assert!(count(&edited, b"rg") >= 1, "fill colour op injected");
         assert_eq!(count(&edited, b"re"), 1, "original construction preserved");
         assert!(count(&edited, b"f") >= 1, "original paint preserved");
@@ -1949,7 +2058,7 @@ BT /F 12 Tf (BODY) Tj ET";
             dash: Some(vec![4.0, 2.0]),
             ..PathStyle::default()
         };
-        let edited = set_path_style(content, 0, &style).unwrap();
+        let edited = set_path_style(content, 0, &style, None).unwrap();
         assert!(count(&edited, b"RG") >= 1, "stroke colour injected");
         assert!(count(&edited, b" w") >= 1 || count(&edited, b"3 w") >= 1, "width injected");
         assert!(count(&edited, b" d") >= 1, "dash injected");
@@ -1972,7 +2081,122 @@ BT /F 12 Tf (BODY) Tj ET";
             .into_iter()
             .position(|e| e.kind == ElementKind::Text)
             .unwrap();
-        let result = set_path_style(content, text_index, &PathStyle::default());
+        let result = set_path_style(content, text_index, &PathStyle::default(), None);
         assert!(result.is_err(), "styling a text element must fail");
+    }
+
+    #[test]
+    fn set_path_style_emits_gs_for_alpha_when_named() {
+        // With a registered gstate name and an alpha, a `/<name> gs` is injected
+        // first inside the q/Q wrap, before the colour override.
+        let content = b"10 10 100 50 re f";
+        let style = PathStyle {
+            fill: Some([1.0, 0.0, 0.0]),
+            fill_alpha: Some(0.5),
+            ..PathStyle::default()
+        };
+        let edited = set_path_style(content, 0, &style, Some(b"GpGs0")).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("/GpGs0 gs"), "gs op for the named gstate injected");
+        // gs must precede the fill colour op (declared-order injection).
+        let gs_at = s.find("/GpGs0 gs").unwrap();
+        let rg_at = s.find(" rg").or_else(|| s.find("rg")).unwrap();
+        assert!(gs_at < rg_at, "gs comes before the colour op");
+        assert!(count(&edited, b"re") == 1 && count(&edited, b"f") >= 1, "path preserved");
+    }
+
+    #[test]
+    fn set_path_style_skips_gs_without_alpha() {
+        // A name is supplied but no alpha was requested → no gs op.
+        let content = b"10 10 100 50 re f";
+        let style = PathStyle {
+            fill: Some([1.0, 0.0, 0.0]),
+            ..PathStyle::default()
+        };
+        let edited = set_path_style(content, 0, &style, Some(b"GpGs0")).unwrap();
+        assert!(!String::from_utf8_lossy(&edited).contains("gs"), "no gs without alpha");
+    }
+
+    #[test]
+    fn set_element_opacity_wraps_in_q_gs_q() {
+        // An image element gets `q /<gs> gs … Do … Q`; the Do op is preserved and
+        // the element still resolves after the edit.
+        let content = b"q /Im0 Do Q BT (hi) Tj ET";
+        let img_index = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .position(|e| e.kind == ElementKind::Image)
+            .unwrap();
+        let edited = set_element_opacity(content, img_index, b"GpGs0").unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("/GpGs0 gs"), "gs op injected");
+        assert!(s.contains("Do"), "the image draw is preserved");
+        // The image element still exists when re-extracted.
+        let imgs = extract_elements(&edited)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == ElementKind::Image)
+            .count();
+        assert_eq!(imgs, 1, "still one image after opacity wrap");
+    }
+
+    #[test]
+    fn set_element_opacity_invalid_index_errors() {
+        let content = b"10 10 100 50 re f";
+        assert!(set_element_opacity(content, 99, b"GpGs0").is_err());
+    }
+
+    #[test]
+    fn reorder_element_to_front_moves_range_to_end() {
+        // Two shapes then a text run. Bring the FIRST shape to front: its `re`
+        // must now appear after the text's `Tj` in the stream, wrapped in q/Q,
+        // and re-extraction still yields the same kinds of elements.
+        let content = b"10 10 20 20 re f 50 50 20 20 re f BT (T) Tj ET";
+        let edited = reorder_element(content, 0, true).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        // The first shape's geometry now trails the text show.
+        let tj_at = s.find("(T) Tj").unwrap();
+        let first_re_at = s.find("10 10 20 20 re").unwrap();
+        assert!(first_re_at > tj_at, "brought-to-front shape now painted last");
+        assert!(count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1, "re-wrapped");
+        // Stream still parses and the element set is unchanged in composition.
+        let els = extract_elements(&edited).unwrap();
+        assert_eq!(
+            els.iter().filter(|e| e.kind == ElementKind::Path).count(),
+            2,
+            "still two shapes"
+        );
+        assert_eq!(
+            els.iter().filter(|e| e.kind == ElementKind::Text).count(),
+            1,
+            "still one text run"
+        );
+    }
+
+    #[test]
+    fn reorder_element_to_back_moves_range_to_start() {
+        // Bring the text run (last element) to the back: its `Tj` must precede the
+        // first shape's `re`.
+        let content = b"10 10 20 20 re f 50 50 20 20 re f BT (T) Tj ET";
+        let text_index = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .position(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        let edited = reorder_element(content, text_index, false).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        let tj_at = s.find("(T) Tj").unwrap();
+        let first_re_at = s.find("10 10 20 20 re").unwrap();
+        assert!(tj_at < first_re_at, "sent-to-back text now painted first");
+        // The text run is still resolvable and reads the same.
+        let runs = extract_text_runs(&edited).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "T");
+    }
+
+    #[test]
+    fn reorder_element_invalid_index_errors() {
+        let content = b"10 10 100 50 re f";
+        assert!(reorder_element(content, 7, true).is_err());
     }
 }

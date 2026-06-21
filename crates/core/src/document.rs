@@ -2594,6 +2594,48 @@ impl Document {
         Ok(self.render_page_canvas(page_no, scale, true)?.to_png())
     }
 
+    /// Rasterize a page to a PNG at `scale` device pixels per PDF point while
+    /// **omitting** the given top-level element `indices` (from
+    /// [`page_elements`](Self::page_elements)). Each excluded element's whole op
+    /// range paints nothing — fills, strokes, shadings, images and text alike —
+    /// while everything else (including the non-text content of non-excluded
+    /// elements) renders normally. This lets a host render the page background
+    /// without specific elements and overlay live, editable versions on top.
+    ///
+    /// Generalises [`render_page_no_text`](Self::render_page_no_text) (which
+    /// suppresses *all* text); `render_page_no_text` is unchanged. Unknown indices
+    /// are ignored; an empty `indices` renders the full page. Annotation/widget
+    /// appearances are always painted in full.
+    pub fn render_page_excluding(
+        &self,
+        page_no: u32,
+        indices: &[usize],
+        scale: f64,
+    ) -> Result<Vec<u8>> {
+        Ok(self
+            .render_page_canvas_ex(page_no, scale, false, indices)?
+            .to_png())
+    }
+
+    /// Build a per-operation boolean mask for `page_no`'s top-level content stream
+    /// where every op inside any of `excluded_indices`' element op ranges is
+    /// `true`. Resolves indices through [`page_elements`](Self::page_elements) (so
+    /// the same `op_start..=op_end` mapping the mutation APIs use). Out-of-range
+    /// indices are skipped.
+    fn element_op_mask(&self, page_no: u32, excluded_indices: &[usize]) -> Result<Vec<bool>> {
+        let elements = self.page_elements(page_no)?;
+        let max_op = elements.iter().map(|e| e.op_end).max().map_or(0, |m| m + 1);
+        let mut mask = vec![false; max_op];
+        for &idx in excluded_indices {
+            if let Some(el) = elements.iter().find(|e| e.index == idx) {
+                for slot in mask.iter_mut().take(el.op_end + 1).skip(el.op_start) {
+                    *slot = true;
+                }
+            }
+        }
+        Ok(mask)
+    }
+
     /// Rasterize a page to an RGBA [`Canvas`](crate::raster::Canvas) at `scale`
     /// device pixels per point. Shared by `render_page`, `render_page_no_text`
     /// and `ocr_page`. When `skip_text` is true the page content stream's text is
@@ -2604,6 +2646,23 @@ impl Document {
         page_no: u32,
         scale: f64,
         skip_text: bool,
+    ) -> Result<crate::raster::Canvas> {
+        self.render_page_canvas_ex(page_no, scale, skip_text, &[])
+    }
+
+    /// Like [`render_page_canvas`](Self::render_page_canvas) but also suppresses
+    /// the painting of the **top-level** content elements whose unified indices
+    /// are in `excluded_indices` (resolved to op ranges via
+    /// [`page_elements`](Self::page_elements)). Non-excluded content (including
+    /// the non-text content of non-excluded elements) still renders. Backs
+    /// [`render_page_excluding`](Self::render_page_excluding); generalises the
+    /// `skip_text` background.
+    fn render_page_canvas_ex(
+        &self,
+        page_no: u32,
+        scale: f64,
+        skip_text: bool,
+        excluded_indices: &[usize],
     ) -> Result<crate::raster::Canvas> {
         let media_box = self.read_media_box(self.page_dict(page_no)?);
         let [x0, y0, x1, y1] = media_box;
@@ -2618,6 +2677,14 @@ impl Document {
         let fonts = self.page_render_fonts(page_no);
         let images = self.page_images(page_no);
         let resources = self.page_resources(page_no);
+        // Build the per-operation exclusion mask from the requested element
+        // indices (each element occupies `op_start..=op_end` of the top-level
+        // op stream). Empty when nothing is excluded — zero overhead.
+        let excluded_ops: Vec<bool> = if excluded_indices.is_empty() {
+            Vec::new()
+        } else {
+            self.element_op_mask(page_no, excluded_indices)?
+        };
         let ctx = PageResourceCtx::new(self, resources, width, height, base);
         let mut canvas = crate::raster::Canvas::new(width, height);
         crate::raster::render_content_into_ctx(
@@ -2631,6 +2698,7 @@ impl Document {
             0,
             None,
             skip_text,
+            &excluded_ops,
         );
         // Paint annotation appearances (`/AP /N`) over the page content, the way
         // every viewer does: page content is the body, annotations layer on top.
@@ -2718,6 +2786,7 @@ impl Document {
                 0,
                 None,
                 false,
+                &[],
             );
         }
     }
@@ -3412,6 +3481,7 @@ impl Document {
             1,
             None,
             false,
+            &[],
         );
         // Luminance → alpha (Rec. 601 weights), per pixel.
         let mut cover = vec![0.0f32; (width as usize) * (height as usize)];
@@ -4690,16 +4760,76 @@ impl Document {
     }
 
     /// Re-style the **path** element at `index` in place (fill/stroke colour,
-    /// line width, dash). `Err` if the element is not a path. Opacity fields are
-    /// best-effort — see [`content::set_path_style`].
+    /// line width, dash). `Err` if the element is not a path.
+    ///
+    /// Opacity is fully supported: when `style.fill_alpha`/`stroke_alpha` is set,
+    /// an `/ExtGState` resource carrying `/ca`/`/CA` is registered on the page and
+    /// a `/<name> gs` is injected into the path's `q … Q` wrap (see
+    /// [`content::set_path_style`]), so the alpha applies to that path run only.
     pub fn set_path_style(
         &mut self,
         page_no: u32,
         index: usize,
         style: &content::PathStyle,
     ) -> Result<()> {
+        // Register an ExtGState only when an alpha was actually requested, so the
+        // pure colour/width/dash restyle path is unchanged.
+        let gstate = if style.fill_alpha.is_some() || style.stroke_alpha.is_some() {
+            Some(self.register_alpha_gstate(page_no, style.fill_alpha, style.stroke_alpha)?)
+        } else {
+            None
+        };
         let content = self.page_content(page_no)?;
-        let edited = content::set_path_style(&content, index, style)?;
+        let edited = content::set_path_style(&content, index, style, gstate.as_deref())?;
+        self.set_page_content(page_no, edited)
+    }
+
+    /// Set a constant opacity on the element at `index` (text, image **or**
+    /// shape) by registering an `/ExtGState` (with `/ca` = `/CA` = `fill_alpha`,
+    /// clamped to `0..=1`) on the page and wrapping the element's op range in
+    /// `q /<gs> gs … Q`. This is the way to set an **image**'s alpha in place;
+    /// shapes can use this or the alpha fields of [`set_path_style`] (same
+    /// underlying `/ExtGState` mechanism).
+    pub fn set_element_opacity(
+        &mut self,
+        page_no: u32,
+        index: usize,
+        fill_alpha: f64,
+    ) -> Result<()> {
+        let name = self.register_alpha_gstate(page_no, Some(fill_alpha), Some(fill_alpha))?;
+        let content = self.page_content(page_no)?;
+        let edited = content::set_element_opacity(&content, index, &name)?;
+        self.set_page_content(page_no, edited)
+    }
+
+    /// Register an `/ExtGState` on `page_no` carrying the given fill (`/ca`) and
+    /// stroke (`/CA`) alphas (each clamped to `0..=1` when present), returning its
+    /// fresh resource name. Reuses [`register_page_resource`] for unique naming
+    /// and resource-dict mutation, mirroring [`with_opacity`].
+    fn register_alpha_gstate(
+        &mut self,
+        page_no: u32,
+        fill_alpha: Option<f64>,
+        stroke_alpha: Option<f64>,
+    ) -> Result<Vec<u8>> {
+        let mut gs = Dictionary::new();
+        gs.set(b"Type".to_vec(), Object::Name(b"ExtGState".to_vec()));
+        if let Some(ca) = fill_alpha {
+            gs.set(b"ca".to_vec(), Object::Real(ca.clamp(0.0, 1.0)));
+        }
+        if let Some(ca_stroke) = stroke_alpha {
+            gs.set(b"CA".to_vec(), Object::Real(ca_stroke.clamp(0.0, 1.0)));
+        }
+        self.register_page_resource(page_no, b"ExtGState", "GpGs", Object::Dictionary(gs))
+    }
+
+    /// Change the paint order (z-order) of the element at `index` on `page_no`.
+    /// `to_front` brings it on top (painted last); otherwise it goes behind
+    /// (painted first). The element's index changes after the move — re-read
+    /// [`page_elements`]. See [`content::reorder_element`].
+    pub fn reorder_element(&mut self, page_no: u32, index: usize, to_front: bool) -> Result<()> {
+        let content = self.page_content(page_no)?;
+        let edited = content::reorder_element(&content, index, to_front)?;
         self.set_page_content(page_no, edited)
     }
 
@@ -11256,6 +11386,169 @@ mod tests {
         let after = doc.page_vector_paths(1).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].fill, Some([0.0, 0.0, 1.0]), "fill restyled to blue");
+    }
+
+    #[test]
+    fn set_path_style_alpha_registers_extgstate_and_injects_gs() {
+        // Restyling a path with fill_alpha must (1) create an /ExtGState resource
+        // carrying /ca, and (2) inject a `/<name> gs` into the path's content. The
+        // path's effective fill alpha is then surfaced by the element walker.
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_page_content(1, b"1 0 0 rg 100 100 40 40 re f\n".to_vec())
+            .unwrap();
+
+        // No ExtGState before.
+        assert!(
+            doc.page_gstate_alpha_pair(1).is_empty(),
+            "no ExtGState before restyle"
+        );
+
+        let style = content::PathStyle {
+            fill: Some([1.0, 0.0, 0.0]),
+            fill_alpha: Some(0.4),
+            ..Default::default()
+        };
+        doc.set_path_style(1, 0, &style).unwrap();
+
+        // (1) An /ExtGState named like `GpGs*` now carries /ca = 0.4.
+        let pairs = doc.page_gstate_alpha_pair(1);
+        assert_eq!(pairs.len(), 1, "exactly one ExtGState registered");
+        let (name, (ca, _ca_stroke)) = pairs.into_iter().next().unwrap();
+        assert!(name.starts_with("GpGs"), "gstate name is GpGs*, got {name}");
+        assert!((ca.unwrap() - 0.4).abs() < 1e-9, "/ca recorded as 0.4");
+
+        // (2) The page content now references that gstate via `gs`.
+        let content = doc.page_content(1).unwrap();
+        let s = String::from_utf8_lossy(&content);
+        assert!(s.contains(&format!("/{name} gs")), "gs op references the gstate");
+
+        // The path's effective fill alpha is now 0.4 (walker resolves the gs).
+        let paths = doc.page_vector_paths(1).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].fill, Some([1.0, 0.0, 0.0]), "fill restyled red");
+        assert!(
+            (paths[0].fill_alpha - 0.4).abs() < 1e-9,
+            "path fill alpha is 0.4, got {}",
+            paths[0].fill_alpha
+        );
+    }
+
+    #[test]
+    fn set_element_opacity_registers_gstate_for_an_image() {
+        // An image element gets a registered /ExtGState and a `q /<gs> gs … Q`
+        // wrap; the walker then reports the image's fill alpha.
+        let (mut doc, _im0, _im1) = page_with_text_image_path_image();
+        // Find the first image element's unified index.
+        let img_index = doc
+            .page_elements(1)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == content::ElementKind::Image)
+            .map(|e| e.index)
+            .expect("an image element");
+
+        doc.set_element_opacity(1, img_index, 0.25).unwrap();
+
+        let pairs = doc.page_gstate_alpha_pair(1);
+        assert!(!pairs.is_empty(), "ExtGState registered for the image opacity");
+        let has_quarter = pairs
+            .values()
+            .any(|(ca, ca_stroke)| {
+                ca.is_some_and(|v| (v - 0.25).abs() < 1e-9)
+                    && ca_stroke.is_some_and(|v| (v - 0.25).abs() < 1e-9)
+            });
+        assert!(has_quarter, "an ExtGState carries /ca = /CA = 0.25");
+
+        // The image's effective alpha is now 0.25 (the wrap reached the Do).
+        let img = doc
+            .page_elements(1)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == content::ElementKind::Image)
+            .unwrap();
+        assert!(
+            img.fill_alpha.is_some_and(|a| (a - 0.25).abs() < 1e-9),
+            "image fill alpha is 0.25, got {:?}",
+            img.fill_alpha
+        );
+    }
+
+    #[test]
+    fn reorder_element_moves_op_range_and_keeps_stream_valid() {
+        // Two filled shapes then a text run. Bring the first shape to front: it
+        // must paint after the text in the stream, the stream must still parse to
+        // the same element composition, and the element stays resolvable.
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_page_content(
+            1,
+            b"1 0 0 rg 10 10 20 20 re f\n0 1 0 rg 50 50 20 20 re f\n\
+              BT /F0 12 Tf 100 700 Td (Z) Tj ET\n"
+                .to_vec(),
+        )
+        .unwrap();
+
+        doc.reorder_element(1, 0, true).unwrap();
+
+        let content = doc.page_content(1).unwrap();
+        let s = String::from_utf8_lossy(&content);
+        let tj = s.find("(Z) Tj").unwrap();
+        let re = s.find("10 10 20 20 re").unwrap();
+        assert!(re > tj, "front-most shape now painted after the text");
+
+        // Stream still parses to two paths + one text run.
+        let kinds: Vec<_> = doc.page_elements(1).unwrap().iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == content::ElementKind::Path).count(),
+            2
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| **k == content::ElementKind::Text).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn render_page_excluding_omits_the_chosen_element() {
+        // A page with a single filled red box: excluding its element index must
+        // produce a raster with strictly fewer painted pixels than the full
+        // render (the box is gone), while excluding nothing equals the full page.
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_page_content(1, b"1 0 0 rg 100 100 200 200 re f\n".to_vec())
+            .unwrap();
+
+        let box_index = doc
+            .page_elements(1)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == content::ElementKind::Path)
+            .map(|e| e.index)
+            .expect("the box element");
+
+        let full = doc.render_page(1, 1.0).unwrap();
+        let excluding = doc.render_page_excluding(1, &[box_index], 1.0).unwrap();
+        let none = doc.render_page_excluding(1, &[], 1.0).unwrap();
+
+        assert_ne!(full, excluding, "excluding the box changes the raster");
+        assert_eq!(full, none, "excluding nothing equals the full render");
+
+        let count_nonwhite = |png: &[u8]| -> usize {
+            crate::raster::decode_png(png)
+                .expect("valid PNG")
+                .rgba
+                .chunks_exact(4)
+                .filter(|px| px[0] != 255 || px[1] != 255 || px[2] != 255)
+                .count()
+        };
+        let n_full = count_nonwhite(&full);
+        let n_excl = count_nonwhite(&excluding);
+        assert!(n_full > 0, "full render paints the red box ({n_full} px)");
+        assert!(
+            n_excl < n_full,
+            "excluded render has fewer painted pixels ({n_excl}) than full ({n_full})"
+        );
     }
 
     #[test]

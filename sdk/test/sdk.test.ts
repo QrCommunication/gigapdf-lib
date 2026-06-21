@@ -449,4 +449,63 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(giga.mergePdfs([]).length).toBe(0);
     expect(giga.mergePdfs([onePage])).toBe(onePage);
   });
+
+  it("setPathStyle opacity sets a path's fill alpha (ExtGState)", () => {
+    const doc = giga.open(giga.txtToPdf("Opacity"));
+    expect(doc.addRectangle(1, 100, 100, 80, 60, null, 0xff0000, 1)).toBe(true);
+    const idx = doc.vectorPaths(1)[0]!.index;
+    // fillAlpha is now honoured end-to-end (registers an /ExtGState + injects gs).
+    expect(doc.setPathStyle(1, idx, { fill: [1, 0, 0], fillAlpha: 0.5 })).toBe(true);
+    const path = doc.vectorPaths(1)[0]!;
+    expect(path.fill).toEqual([1, 0, 0]);
+    expect(Math.abs(path.fillAlpha - 0.5)).toBeLessThan(1e-6);
+    // Survives a save/reopen.
+    const reopened = giga.open(doc.save());
+    expect(Math.abs(reopened.vectorPaths(1)[0]!.fillAlpha - 0.5)).toBeLessThan(1e-6);
+    doc.close();
+    reopened.close();
+  });
+
+  it("setElementOpacity sets an image's alpha in place", () => {
+    const doc = giga.open(giga.txtToPdf("Image opacity"));
+    const rgba = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]);
+    const png = giga.rgbaToPng(rgba, 2, 2);
+    expect(doc.addImage(1, png, 40, 600, 60, 60, 1)).toBe(true);
+    const imgIdx = doc.imageElements(1)[0]!.index;
+    expect(doc.setElementOpacity(1, imgIdx, 0.25)).toBe(true);
+    const img = doc.imageElements(1)[0]!;
+    expect(Math.abs(img.opacity - 0.25)).toBeLessThan(1e-6);
+    doc.close();
+  });
+
+  it("reorderElement changes z-order (front/back)", () => {
+    const doc = giga.open(giga.txtToPdf("Z order"));
+    expect(doc.addRectangle(1, 10, 10, 20, 20, null, 0xff0000, 1)).toBe(true); // shape A
+    expect(doc.addRectangle(1, 50, 50, 20, 20, null, 0x00ff00, 1)).toBe(true); // shape B
+    const before = doc.vectorPaths(1);
+    expect(before.length).toBe(2);
+    const firstIdx = before[0]!.index;
+    // Bring the first shape to front; both shapes still present afterwards.
+    expect(doc.reorderElement(1, firstIdx, true)).toBe(true);
+    expect(doc.vectorPaths(1).length).toBe(2);
+    // Send a shape to the back too.
+    expect(doc.reorderElement(1, doc.vectorPaths(1)[0]!.index, false)).toBe(true);
+    expect(doc.vectorPaths(1).length).toBe(2);
+    doc.close();
+  });
+
+  it("renderPageExcluding omits the chosen element from the raster", () => {
+    const doc = giga.open(giga.txtToPdf("Exclude me"));
+    expect(doc.addRectangle(1, 100, 100, 200, 200, null, 0xff0000, 1)).toBe(true);
+    const boxIdx = doc.vectorPaths(1)[0]!.index;
+    const full = doc.renderPage(1, 1);
+    const excluding = doc.renderPageExcluding(1, [boxIdx], 1);
+    const none = doc.renderPageExcluding(1, [], 1);
+    expect(full.length).toBeGreaterThan(0);
+    expect(excluding.length).toBeGreaterThan(0);
+    // Excluding the box changes the raster; excluding nothing equals the full render.
+    expect(Buffer.from(excluding).equals(Buffer.from(full))).toBe(false);
+    expect(Buffer.from(none).equals(Buffer.from(full))).toBe(true);
+    doc.close();
+  });
 });

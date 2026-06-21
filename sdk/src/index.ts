@@ -1664,10 +1664,11 @@ export class GigaPdfDoc {
    * in `0..=1`; `dash` is the PDF dash array (`[]` = solid). Returns `false` if
    * the element is not a path (or the page/index doesn't exist).
    *
-   * Opacity note: `fillAlpha`/`strokeAlpha` are accepted for API symmetry but
-   * are **not** emitted — PDF opacity needs a named `/ExtGState`, which a pure
-   * content-stream edit cannot create. Use the resource-level shape APIs when
-   * opacity is required.
+   * Opacity: `fillAlpha`/`strokeAlpha` (`0..=1`) are fully supported — an
+   * `/ExtGState` carrying `/ca`/`/CA` is registered on the page and a `/<gs> gs`
+   * is injected into the path's `q … Q` wrap, so the alpha applies to that path
+   * run only. (For non-path elements such as images, use
+   * {@link setElementOpacity}.)
    */
   setPathStyle(
     page: number,
@@ -1686,6 +1687,30 @@ export class GigaPdfDoc {
         this.ex().gp_set_path_style_json(this.h, page, index, p, l)
       ) === 0
     );
+  }
+  /**
+   * Set a constant opacity on element `index` on `page` — text, image **or**
+   * shape — by registering an `/ExtGState` (`/ca` = `/CA` = `fillAlpha`, clamped
+   * to `0..=1`) on the page and wrapping the element's op range in
+   * `q /<gs> gs … Q`. This is the way to set an **image**'s alpha in place;
+   * shapes may also use {@link setPathStyle}'s `fillAlpha`/`strokeAlpha` (same
+   * underlying `/ExtGState` mechanism). Returns `false` if the page/index doesn't
+   * exist.
+   */
+  setElementOpacity(page: number, index: number, fillAlpha: number): boolean {
+    return this.ex().gp_set_element_opacity(this.h, page, index, fillAlpha) === 0;
+  }
+  /**
+   * Change the paint order (z-order) of element `index` on `page`. `toFront`
+   * brings it visually on top (its op range is moved to the end of the content
+   * stream, painted last); otherwise it is sent behind everything (moved to the
+   * start, painted first). The moved range is re-wrapped in `q … Q` so it neither
+   * inherits nor leaks graphics state. Works for text, image and shape elements.
+   * The element's index changes after the move — re-read {@link pageElements}.
+   * Returns `false` if the page/index doesn't exist.
+   */
+  reorderElement(page: number, index: number, toFront: boolean): boolean {
+    return this.ex().gp_reorder_element(this.h, page, index, toFront ? 1 : 0) === 0;
   }
   duplicateElement(page: number, index: number): boolean {
     return this.ex().gp_duplicate_element(this.h, page, index) === 0;
@@ -2067,6 +2092,24 @@ export class GigaPdfDoc {
    */
   renderPageNoText(page: number, scale = 1): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_render_page_no_text(this.h, page, scale, o));
+  }
+
+  /**
+   * Rasterize a page to a PNG while **omitting** the given top-level element
+   * `indices` (from {@link pageElements}). Each excluded element paints nothing
+   * — fills, strokes, shadings, images and text alike — while everything else
+   * (including the non-text content of non-excluded elements) renders normally.
+   * Use it to paint a background without specific elements and overlay live,
+   * editable versions on top. Generalises {@link renderPageNoText} (which
+   * suppresses *all* text). An empty `indices` renders the full page; unknown
+   * indices are ignored.
+   */
+  renderPageExcluding(page: number, indices: number[], scale = 1): Uint8Array {
+    return this.g._buffer((o) =>
+      this.g._withU32(indices, (p, c) =>
+        this.ex().gp_render_page_excluding(this.h, page, p, c, scale, o)
+      )
+    );
   }
 
   // fonts — embed a downloaded font, then add real selectable text
