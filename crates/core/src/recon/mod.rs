@@ -113,6 +113,12 @@ pub(crate) fn body_font_size(runs: &[ReconRun], fallback: f64) -> f64 {
 /// Build the [`ReconRun`] list for a page from its **text** content elements and
 /// the per-font styles. Non-text elements and blank runs are dropped; bounds are
 /// required (a run with no computable box can't be placed).
+///
+/// Works for both the top-level element list and the **deep** one (text reached
+/// through form XObjects): a `nested` element is included for layout/display but
+/// gets `source_index = None`, because its element index doesn't address a
+/// top-level editable content-stream operator (the form is shared across every
+/// placement). Top-level runs keep `Some(index)` for in-place round-tripping.
 pub fn runs_from_elements(
     elements: &[ContentElement],
     font_styles: &std::collections::BTreeMap<String, TextStyle>,
@@ -141,7 +147,9 @@ pub fn runs_from_elements(
                 size: e.font_size.unwrap_or(b.height).max(1.0),
                 style,
                 rotation: e.rotation_deg.unwrap_or(0.0),
-                source_index: Some(e.index),
+                // Form-XObject (nested) text is display-only — not editable by a
+                // top-level run index, so it carries no source index.
+                source_index: if e.nested { None } else { Some(e.index) },
             })
         })
         .collect()

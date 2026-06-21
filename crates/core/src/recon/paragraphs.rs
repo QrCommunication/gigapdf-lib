@@ -302,6 +302,28 @@ mod tests {
     }
 
     #[test]
+    fn full_width_inner_lines_yield_justify_align() {
+        // A justified block: the inner lines all reach both margins (left x=72,
+        // right x=372), and only the last line is short (ends well inside the
+        // right margin). With ≥3 lines and every non-last line flush both sides,
+        // the alignment reads as Justify.
+        let runs = vec![
+            run("inner line one stretched full", 72.0, 700.0, 300.0), // 72..372
+            run("inner line two stretched full", 72.0, 686.0, 300.0), // 72..372
+            run("inner line three stretch full", 72.0, 672.0, 300.0), // 72..372
+            run("last short tail", 72.0, 658.0, 120.0),               // 72..192 (ragged right)
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let mut ids = IdGen::default();
+        let block = build_paragraph(&refs, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(p.style.align, Align::Justify);
+    }
+
+    #[test]
     fn paragraph_block_carries_runs_and_linebreaks() {
         let runs = vec![
             run("alpha", 72.0, 700.0, 60.0),

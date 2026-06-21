@@ -327,6 +327,37 @@ pub extern "C" fn gp_structured_text_json(
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
+/// **Layout blocks** of a single page as a JSON array of `model::Block`s
+/// (`[<Block>,…]`, the same per-block shape `gp_model_from_pdf` emits): the
+/// structural reconstruction (paragraphs / headings / lists / tables / shapes /
+/// images) in reading order, each block keeping a top-down `frame` and every
+/// text run its `source_index`. The per-page counterpart of `gp_model_from_pdf`,
+/// for a continuous/lazy editor requesting one page at a time. Host frees the
+/// buffer; null handle → `[]`.
+#[no_mangle]
+pub extern "C" fn gp_page_blocks_json(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let blocks = doc.page_blocks(page);
+            let mut out = String::from("[");
+            for (i, b) in blocks.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&gigapdf_core::model::json::block_to_json(b));
+            }
+            out.push(']');
+            out
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Full-text search → JSON `[{page,text,x,y,w,h}]`. `case_insensitive` != 0 folds case.
 #[no_mangle]
 pub extern "C" fn gp_search_json(

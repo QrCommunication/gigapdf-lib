@@ -4280,9 +4280,8 @@ impl Document {
     /// otherwise the geometric heuristic pipeline runs (lines → columns →
     /// paragraphs → headings → lists → tables).
     pub fn reconstruct_model(&self) -> crate::model::Document {
-        use crate::content::ElementKind;
         use crate::model::{geom::PageGeometry, DocMeta, Page, Section};
-        use crate::recon::{self, IdGen, PlacedImageRef};
+        use crate::recon::{self, IdGen};
 
         let mut ids = IdGen::default();
         // A tagged document is reconstructed once, from the struct tree, then its
@@ -4305,49 +4304,17 @@ impl Document {
             let page_w = (media[2] - media[0]).abs();
             let page_h = (media[3] - media[1]).abs();
 
-            // Build the per-page inputs from the same extraction the Office
-            // converters use (top-level elements + vector paths + images).
-            let elements = self.page_elements(page_no).unwrap_or_default();
-            let font_styles = self.page_base_fonts(page_no);
-            let runs = recon::runs_from_elements(&elements, &font_styles);
-            let vpaths = self.page_vector_paths(page_no).unwrap_or_default();
-
-            // Placed images → content-addressed resources.
-            let images = self.page_images(page_no);
-            let mut image_refs: Vec<PlacedImageRef> = Vec::new();
-            for element in &elements {
-                if element.kind != ElementKind::Image {
-                    continue;
-                }
-                let Some(b) = element.bounds else { continue };
-                let key = element.label.clone().into_bytes();
-                let Some(img) = images.get(&key) else { continue };
-                let png = crate::raster::png::encode_png(img.width, img.height, &img.rgba);
-                let resource = Self::fnv1a(&png);
-                resources
-                    .images
-                    .entry(resource)
-                    .or_insert_with(|| crate::model::ImageResource {
-                        bytes: png,
-                        format: "png".to_string(),
-                    });
-                image_refs.push(PlacedImageRef {
-                    resource,
-                    x: b.x,
-                    y: b.y,
-                    w: b.width,
-                    h: b.height,
-                });
-            }
-
             // The tag-tree blocks (if any) only attach to the first page.
             let page_tags = if page_no == 1 { tag_blocks.clone() } else { None };
-            let blocks = recon::reconstruct_page(
-                runs,
-                &vpaths,
-                &image_refs,
+            // Single source of truth for per-page block assembly (shared with
+            // [`page_blocks`](Self::page_blocks)): extract runs/paths/images and
+            // run the reconstruction pipeline, recording image blobs into the
+            // document-wide `resources` table.
+            let blocks = self.reconstruct_page_blocks(
+                page_no,
                 (x0, y0, page_w, page_h),
                 &mut ids,
+                Some(&mut resources),
                 page_tags,
             );
 
@@ -4404,6 +4371,100 @@ impl Document {
             resources,
             ..crate::model::Document::default()
         }
+    }
+
+    /// Logical **layout blocks** for a single page: the structural
+    /// reconstruction (paragraphs, headings, lists, tables, shapes, images) of
+    /// the page's flat glyph/path geometry, in reading order (column-major), each
+    /// block keeping a top-down `frame` for fidelity and every text run carrying
+    /// its `source_index` back to the editable content-stream operator.
+    ///
+    /// This is the **per-page** entry point to the same pipeline
+    /// [`reconstruct_model`](Self::reconstruct_model) runs across the whole
+    /// document — the unit a continuous/lazy editor requests one page at a time.
+    /// It runs the heuristic path (lines → columns → paragraphs → headings →
+    /// lists → tables); the `/StructTreeRoot` tag-tree path stays a whole-document
+    /// concern of `reconstruct_model`. An out-of-range or unreadable page yields
+    /// an empty list.
+    pub fn page_blocks(&self, page_no: u32) -> Vec<crate::model::Block> {
+        use crate::recon::IdGen;
+
+        let Ok(page) = self.page_dict(page_no) else {
+            return Vec::new();
+        };
+        let media = self.read_media_box(page);
+        let (x0, y0) = (media[0], media[1]);
+        let page_w = (media[2] - media[0]).abs();
+        let page_h = (media[3] - media[1]).abs();
+
+        let mut ids = IdGen::default();
+        self.reconstruct_page_blocks(page_no, (x0, y0, page_w, page_h), &mut ids, None, None)
+    }
+
+    /// Per-page block-assembly worker shared by [`page_blocks`](Self::page_blocks)
+    /// and [`reconstruct_model`](Self::reconstruct_model): extract the page's text
+    /// runs, vector paths and placed images, then run the reconstruction pipeline
+    /// (`recon::reconstruct_page`).
+    ///
+    /// `geom` is `(x0, y0, page_w, page_h)` (MediaBox origin + size, points).
+    /// `ids` mints block ids. `resources`, when `Some`, receives each placed
+    /// image's PNG blob keyed by content hash (the document-wide table built by
+    /// `reconstruct_model`); when `None` the image blobs are still referenced by
+    /// the same hash but not retained (the per-page caller doesn't need them).
+    /// `tag_blocks` short-circuits to an author-tagged block list when present.
+    fn reconstruct_page_blocks(
+        &self,
+        page_no: u32,
+        geom: (f64, f64, f64, f64),
+        ids: &mut crate::recon::IdGen,
+        mut resources: Option<&mut crate::model::ResourceTable>,
+        tag_blocks: Option<Vec<crate::model::Block>>,
+    ) -> Vec<crate::model::Block> {
+        use crate::content::ElementKind;
+        use crate::recon::{self, PlacedImageRef};
+
+        // Build the per-page inputs from the **deep** extraction (recursing into
+        // form XObjects) so reusable-template text (cerfa/invoice/letterhead) is
+        // reconstructed as blocks too, not just the top-level content stream.
+        // Nested runs are display-only (no editable source index — see
+        // `runs_from_elements`). Vector paths and images come from the top-level
+        // resources as before.
+        let elements = self.page_elements_deep(page_no).unwrap_or_default();
+        let font_styles = self.page_base_fonts(page_no);
+        let runs = recon::runs_from_elements(&elements, &font_styles);
+        let vpaths = self.page_vector_paths(page_no).unwrap_or_default();
+
+        // Placed images → content-addressed resources (retained only when the
+        // caller supplied a resource table to fill).
+        let images = self.page_images(page_no);
+        let mut image_refs: Vec<PlacedImageRef> = Vec::new();
+        for element in &elements {
+            if element.kind != ElementKind::Image {
+                continue;
+            }
+            let Some(b) = element.bounds else { continue };
+            let key = element.label.clone().into_bytes();
+            let Some(img) = images.get(&key) else { continue };
+            let png = crate::raster::png::encode_png(img.width, img.height, &img.rgba);
+            let resource = Self::fnv1a(&png);
+            if let Some(res) = resources.as_deref_mut() {
+                res.images
+                    .entry(resource)
+                    .or_insert_with(|| crate::model::ImageResource {
+                        bytes: png,
+                        format: "png".to_string(),
+                    });
+            }
+            image_refs.push(PlacedImageRef {
+                resource,
+                x: b.x,
+                y: b.y,
+                w: b.width,
+                h: b.height,
+            });
+        }
+
+        recon::reconstruct_page(runs, &vpaths, &image_refs, geom, ids, tag_blocks)
     }
 
     /// FNV-1a 64-bit hash — a zero-dependency content key for de-duplicating the
@@ -16599,5 +16660,61 @@ mod tests {
             runs.iter().any(|r| r.text == "àB"),
             "/Differences must remap 0x41→agrave, keep 0x42→B: {runs:?}"
         );
+    }
+
+    #[test]
+    fn page_blocks_match_reconstruct_model_per_page() {
+        use crate::convert::build::{PdfBuilder, StdFont};
+        use crate::model::BlockKind;
+
+        // Two identical pages, each a large isolated title (24pt) well above two
+        // tight 12pt body lines — the title promotes to a heading, the body lines
+        // form one paragraph. (Mirrors recon's own heading test fixture spacing.)
+        let mut b = PdfBuilder::new();
+        let f = StdFont::Helvetica;
+        for _ in 0..2 {
+            let page = b.add_page(612.0, 792.0);
+            b.text(page, 72.0, 80.0, 24.0, "A Page Title", f, [0.0; 3]);
+            b.text(page, 72.0, 160.0, 12.0, "First body line of text here.", f, [0.0; 3]);
+            b.text(page, 72.0, 176.0, 12.0, "Second body line follows along.", f, [0.0; 3]);
+        }
+        let doc = Document::open(&b.finish()).unwrap();
+
+        // The per-page entry point must yield the same blocks the whole-document
+        // reconstruction puts on that page (its single source of truth), modulo
+        // block ids (per-page uses a fresh IdGen).
+        let model = doc.reconstruct_model();
+        let strip = |k: &BlockKind| match k {
+            BlockKind::Heading(h) => format!("H{}", h.level),
+            BlockKind::Paragraph(_) => "P".to_string(),
+            BlockKind::List(_) => "L".to_string(),
+            BlockKind::Table(_) => "T".to_string(),
+            other => format!("{other:?}"),
+        };
+        let mut model_pages = model.sections.iter().flat_map(|s| s.pages.iter());
+
+        for page_no in 1..=doc.page_count() as u32 {
+            let blocks = doc.page_blocks(page_no);
+            // Each page reconstructs to a heading + a paragraph.
+            assert!(
+                blocks.iter().any(|bl| matches!(bl.kind, BlockKind::Heading(_))),
+                "page {page_no} has a heading: {blocks:?}"
+            );
+            assert!(
+                blocks.iter().any(|bl| matches!(bl.kind, BlockKind::Paragraph(_))),
+                "page {page_no} has a paragraph"
+            );
+            // Frames are present (top-down) and text runs carry a source index.
+            assert!(blocks.iter().all(|bl| bl.frame.is_some()), "every block framed");
+
+            // Same block-kind sequence as reconstruct_model's matching page.
+            let mp = model_pages.next().expect("a model page per source page");
+            let want: Vec<String> = mp.blocks.iter().map(|bl| strip(&bl.kind)).collect();
+            let got: Vec<String> = blocks.iter().map(|bl| strip(&bl.kind)).collect();
+            assert_eq!(got, want, "page {page_no} block kinds match reconstruct_model");
+        }
+
+        // Out-of-range page → empty, never panics.
+        assert!(doc.page_blocks(999).is_empty());
     }
 }

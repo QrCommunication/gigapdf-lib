@@ -1647,6 +1647,23 @@ export class GigaPdfDoc {
   structuredText(page: number): TextLine[] {
     return this.g._json((o) => this.ex().gp_structured_text_json(this.h, page, o));
   }
+  /**
+   * The **layout blocks** of a single page — the structural reconstruction
+   * (paragraphs, headings, lists, tables, shapes, images) of the page's flat
+   * glyph/path geometry, in reading order (column-major), each {@link GigaBlock}
+   * keeping a top-down `frame` and every text run its `source_index` back to the
+   * editable content-stream operator.
+   *
+   * The **per-page** counterpart of {@link GigaPdfDoc.toModel} (which
+   * reconstructs the whole document at once): a continuous / lazily-virtualized
+   * editor calls this one page at a time. Identifies 1- and 2-column layouts,
+   * merges lines into justified/left/centred/right paragraphs, promotes large
+   * isolated lines to headings, and recovers ruled tables. An out-of-range page
+   * yields `[]`.
+   */
+  pageBlocks(page: number): GigaBlock[] {
+    return this.g._json((o) => this.ex().gp_page_blocks_json(this.h, page, o));
+  }
   search(query: string, caseInsensitive = true): SearchHit[] {
     return this.g._withStr(query, (p, l) =>
       this.g._json((o) => this.ex().gp_search_json(this.h, p, l, caseInsensitive ? 1 : 0, o))
