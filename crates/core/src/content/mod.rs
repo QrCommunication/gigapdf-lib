@@ -1486,10 +1486,109 @@ pub fn set_element_opacity(content: &[u8], index: usize, gstate: &[u8]) -> Resul
     Ok(encode_content(&operations))
 }
 
+/// Compute the **effective** graphics state in force at operation `boundary` by a
+/// last-write-wins scan over `operations[0..boundary]`, returning the original
+/// state-setting [`Operation`]s (cloned, in a canonical re-emit order) that the
+/// paint at `boundary` depends on but which live *outside* the element's range.
+///
+/// Captured slots (each tracks the last value still in scope, honouring the
+/// `q`/`Q` save/restore stack): fill colour (`rg`/`g`/`k`, or `cs`+`scn`/`sc`),
+/// stroke colour (`RG`/`G`/`K`, or `CS`+`SCN`/`SC`), line width (`w`), dash (`d`),
+/// line cap (`J`), line join (`j`), miter limit (`M`), the active `/ExtGState`
+/// (`gs`), and the text font+size (`Tf`, painted with the fill colour). Only
+/// operators that were *actually set* before `boundary` are emitted — no defaults
+/// are fabricated. The colour-space (`cs`/`CS`) op is paired with its `scn`/`SCN`
+/// so the colour resolves in the right space at the new position.
+///
+/// Re-emit order: graphics-state resource (`gs`) first, then line params
+/// (`w`/`d`/`J`/`j`/`M`), then fill colour-space + colour, then stroke
+/// colour-space + colour, then font (`Tf`). This places appearance state before
+/// the moved run inside its `q … Q`; the trailing `Q` restores, so nothing leaks.
+fn effective_state_ops(operations: &[Operation], boundary: usize) -> Vec<Operation> {
+    /// One save/restore frame: the last-seen op for each tracked slot, `None`
+    /// until set. `fill_cs`/`stroke_cs` hold the colour-space op so a later
+    /// `scn`/`SCN` re-emits in the right space; `fill`/`stroke` hold the colour op.
+    #[derive(Clone, Default)]
+    struct Frame {
+        gs: Option<Operation>,
+        line_width: Option<Operation>,
+        dash: Option<Operation>,
+        line_cap: Option<Operation>,
+        line_join: Option<Operation>,
+        miter: Option<Operation>,
+        fill_cs: Option<Operation>,
+        fill: Option<Operation>,
+        stroke_cs: Option<Operation>,
+        stroke: Option<Operation>,
+        font: Option<Operation>,
+    }
+
+    let mut st = Frame::default();
+    let mut stack: Vec<Frame> = Vec::new();
+
+    for op in operations.iter().take(boundary) {
+        match op.operator.as_slice() {
+            b"q" => stack.push(st.clone()),
+            b"Q" => {
+                if let Some(prev) = stack.pop() {
+                    st = prev;
+                }
+            }
+            // Fill colour. A shorthand colour op (`rg`/`g`/`k`) also fixes the
+            // space, so a stale `cs` no longer applies → drop the paired `cs`.
+            b"rg" | b"g" | b"k" => {
+                st.fill = Some(op.clone());
+                st.fill_cs = None;
+            }
+            // Stroke colour shorthand — same reasoning for the stroke `CS`.
+            b"RG" | b"G" | b"K" => {
+                st.stroke = Some(op.clone());
+                st.stroke_cs = None;
+            }
+            // Explicit colour-space selection (paired with a following scn/SCN).
+            b"cs" => st.fill_cs = Some(op.clone()),
+            b"CS" => st.stroke_cs = Some(op.clone()),
+            b"scn" | b"sc" => st.fill = Some(op.clone()),
+            b"SCN" | b"SC" => st.stroke = Some(op.clone()),
+            b"w" => st.line_width = Some(op.clone()),
+            b"d" => st.dash = Some(op.clone()),
+            b"J" => st.line_cap = Some(op.clone()),
+            b"j" => st.line_join = Some(op.clone()),
+            b"M" => st.miter = Some(op.clone()),
+            b"gs" => st.gs = Some(op.clone()),
+            b"Tf" => st.font = Some(op.clone()),
+            _ => {}
+        }
+    }
+
+    // Emit in a stable, render-correct order. `cs`/`CS` precede their `scn`/`SCN`.
+    let mut out: Vec<Operation> = Vec::new();
+    out.extend(st.gs);
+    out.extend(st.line_width);
+    out.extend(st.dash);
+    out.extend(st.line_cap);
+    out.extend(st.line_join);
+    out.extend(st.miter);
+    out.extend(st.fill_cs);
+    out.extend(st.fill);
+    out.extend(st.stroke_cs);
+    out.extend(st.stroke);
+    out.extend(st.font);
+    out
+}
+
 /// Change the paint order (z-order) of the element at `index` by splicing its
 /// whole operation range to a new position in the page content stream and
-/// re-wrapping it in `q … Q` (so it does not inherit a different graphics state
-/// at its new home, and does not leak its own state onto neighbours).
+/// re-wrapping it in `q … Q`.
+///
+/// To keep the element's **appearance** identical at its new home, the graphics
+/// state it depends on but does not itself set — fill/stroke colour (`rg`/`g`/`k`,
+/// `RG`/`G`/`K`, `cs`/`CS`+`scn`/`SCN`), line width (`w`), dash (`d`), caps/joins
+/// (`J`/`j`/`M`), the active `/ExtGState` (`gs`) and, for text, the font (`Tf`) —
+/// is captured by a last-write-wins scan over the operators preceding the element
+/// and **re-emitted inside the `q … Q`, before the moved run**. The trailing `Q`
+/// restores the prior state, so the move neither inherits a wrong state at its new
+/// position nor leaks state onto neighbours.
 ///
 /// * `to_front == true` → moved to the **end** of the stream → painted last →
 ///   visually on top of everything else.
@@ -1497,9 +1596,10 @@ pub fn set_element_opacity(content: &[u8], index: usize, gstate: &[u8]) -> Resul
 ///   → behind everything else.
 ///
 /// Works for text, image and shape elements addressed by their unified index.
-/// The element's index changes after the splice (it is now first or last among
-/// the elements) — callers should re-read [`extract_elements`]. Returns `Err`
-/// for an out-of-range index. The stream stays balanced (the spliced run is
+/// (Images carry no colour state; capturing nothing extra is harmless.) The
+/// element's index changes after the splice (it is now first or last among the
+/// elements) — callers should re-read [`extract_elements`]. Returns `Err` for an
+/// out-of-range index. The stream stays balanced (the spliced run is
 /// self-contained and the `q … Q` it gains is itself balanced).
 pub fn reorder_element(content: &[u8], index: usize, to_front: bool) -> Result<Vec<u8>> {
     let mut operations = parse_content(content)?;
@@ -1508,18 +1608,24 @@ pub fn reorder_element(content: &[u8], index: usize, to_front: bool) -> Result<V
         .nth(index)
         .ok_or_else(|| EngineError::Missing(format!("content element #{index}")))?;
 
+    // Capture the effective graphics state at the element's first op, BEFORE the
+    // range is lifted (indices still refer to the original stream).
+    let state_ops = effective_state_ops(&operations, element.op_start);
+
     // Lift the element's operation range out of the stream (it is contiguous).
     let moved: Vec<Operation> = operations
         .drain(element.op_start..=element.op_end)
         .collect();
 
-    // Re-wrap the lifted run in a balanced `q … Q` so it carries no inherited or
-    // leaking graphics state at its new position.
-    let mut wrapped: Vec<Operation> = Vec::with_capacity(moved.len() + 2);
+    // Re-wrap the lifted run in a balanced `q … Q`, re-emitting the captured
+    // state before it so it renders identically at its new position and does not
+    // leak its own state onto neighbours.
+    let mut wrapped: Vec<Operation> = Vec::with_capacity(moved.len() + state_ops.len() + 2);
     wrapped.push(Operation {
         operator: b"q".to_vec(),
         operands: Vec::new(),
     });
+    wrapped.extend(state_ops);
     wrapped.extend(moved);
     wrapped.push(Operation {
         operator: b"Q".to_vec(),
@@ -2198,5 +2304,119 @@ BT /F 12 Tf (BODY) Tj ET";
     fn reorder_element_invalid_index_errors() {
         let content = b"10 10 100 50 re f";
         assert!(reorder_element(content, 7, true).is_err());
+    }
+
+    #[test]
+    fn reorder_element_to_front_preserves_fill_colour() {
+        // A red shape whose fill is set by a PRECEDING `rg` (outside its op range).
+        // After bringing it to the front it must STILL report the red fill — the
+        // captured `rg` is re-emitted inside the new `q … Q` wrap.
+        let content = b"1 0 0 rg 10 10 20 20 re f 0 0 1 rg 50 50 20 20 re f";
+        let no_color = std::collections::BTreeMap::new();
+        // Sanity: before the move the first path is red.
+        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color);
+        assert_eq!(before[0].fill, Some([1.0, 0.0, 0.0]), "first path starts red");
+
+        let edited = reorder_element(content, 0, true).unwrap();
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        assert_eq!(paths.len(), 2, "still two painted paths");
+        // The moved (red) shape is now painted last → last in the path list.
+        assert_eq!(
+            paths.last().unwrap().fill,
+            Some([1.0, 0.0, 0.0]),
+            "reordered shape keeps its red fill (not black)"
+        );
+        // The other (blue) shape is undisturbed.
+        assert_eq!(
+            paths[0].fill,
+            Some([0.0, 0.0, 1.0]),
+            "neighbour shape's blue fill is not corrupted"
+        );
+    }
+
+    #[test]
+    fn reorder_element_to_back_preserves_stroke_colour_width_and_dash() {
+        // A stroked line whose stroke colour, width and dash are set by PRECEDING
+        // ops. Send it to the back: it must keep blue / width 3 / dash [4,2].
+        let content = b"0 0 1 RG 3 w [4 2] 0 d 10 10 m 110 10 l S 1 0 0 RG 0 80 m 100 80 l S";
+        let no_color = std::collections::BTreeMap::new();
+
+        // Path index 1 is the dashed blue line (declared first → drawn first).
+        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color);
+        assert_eq!(before[0].stroke, Some([0.0, 0.0, 1.0]), "first line starts blue");
+
+        let line_index = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .position(|e| e.kind == ElementKind::Path)
+            .unwrap();
+        let edited = reorder_element(content, line_index, false).unwrap();
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        assert_eq!(paths.len(), 2, "still two painted paths");
+        // Sent to back → painted first → first in the path list.
+        let moved = &paths[0];
+        assert_eq!(moved.stroke, Some([0.0, 0.0, 1.0]), "stroke stays blue");
+        assert!((moved.stroke_width - 3.0).abs() < 1e-9, "stroke width preserved");
+        assert_eq!(moved.dash, vec![4.0, 2.0], "dash preserved");
+        // The red neighbour keeps its own stroke colour (not leaked to blue).
+        assert_eq!(paths[1].stroke, Some([1.0, 0.0, 0.0]), "neighbour stays red");
+    }
+
+    #[test]
+    fn reorder_element_does_not_corrupt_second_element_state() {
+        // Two red shapes, each relying on a single leading `rg`. Reordering the
+        // first must not alter the appearance of the second.
+        let content = b"1 0 0 rg 10 10 20 20 re f 50 50 20 20 re f";
+        let no_color = std::collections::BTreeMap::new();
+        let edited = reorder_element(content, 0, true).unwrap();
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        assert_eq!(paths.len(), 2);
+        // Both shapes must still be red.
+        for p in &paths {
+            assert_eq!(p.fill, Some([1.0, 0.0, 0.0]), "both shapes stay red");
+        }
+    }
+
+    #[test]
+    fn reorder_element_text_preserves_font_and_fill_colour() {
+        // A green text run whose font and colour are set by PRECEDING ops. Sending
+        // it to the back must keep the green fill colour on the run.
+        let content = b"0 1 0 rg BT /F1 12 Tf 0 0 Td (T) Tj ET 10 10 20 20 re f";
+        let text_index = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .position(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        let edited = reorder_element(content, text_index, false).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        // The captured fill colour and font are re-emitted before the moved run.
+        assert!(s.contains("0 1 0 rg"), "fill colour re-emitted for the text");
+        assert!(s.contains("/F1 12 Tf"), "font re-emitted for the text");
+        // The element's colour, as read back, is green.
+        let text = extract_elements(&edited)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        assert_eq!(text.color, Some([0.0, 1.0, 0.0]), "text keeps its green fill");
+        assert_eq!(text.font.as_deref(), Some("F1"), "text keeps its font");
+    }
+
+    #[test]
+    fn reorder_element_skips_state_popped_before_boundary() {
+        // A `rg` inside a `q … Q` that closes BEFORE the element must NOT be
+        // captured (it is out of scope at the element's first op). The element
+        // relies on no preceding colour → default black, no stray `rg` injected.
+        let content = b"q 1 0 0 rg 0 0 5 5 re f Q 10 10 20 20 re f";
+        let no_color = std::collections::BTreeMap::new();
+        // Element index 1 is the second (black) rectangle.
+        let edited = reorder_element(content, 1, true).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        // Exactly one `rg` (the original scoped one) — none injected for the move.
+        assert_eq!(count(&edited, b"rg"), 1, "popped fill colour is not re-captured");
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        // The moved shape (last painted) is default black.
+        assert_eq!(paths.last().unwrap().fill, Some([0.0, 0.0, 0.0]), "stays black");
+        let _ = s;
     }
 }

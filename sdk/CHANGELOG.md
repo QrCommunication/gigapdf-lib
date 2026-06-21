@@ -4,6 +4,23 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.58.1] - 2026-06-21
+
+### Fixed
+
+- **`reorderElement` now preserves the element's effective graphics state
+  (fill/stroke colour, line width, dash, font) so reordered shapes/text keep
+  their appearance.** Previously the moved op range was re-wrapped in a *bare*
+  `q … Q`, dropping the graphics state set *before* the element (fill colour via
+  `rg`/`g`/`k` or `cs`+`scn`, stroke colour via `RG`/`G`/`K` or `CS`+`SCN`, line
+  width `w`, dash `d`, caps/joins `J`/`j`/`M`, the active `/ExtGState` `gs`, and —
+  for text — the font `Tf`). A red shape brought to the front would render black,
+  etc. `reorderElement` now runs a last-write-wins scan over the operators
+  preceding the element (honouring the `q`/`Q` save/restore stack) and re-emits
+  the actually-set state operators inside the new `q … Q`, before the moved run,
+  so the element renders identically at its new position; the trailing `Q` still
+  restores, so neighbours are unaffected. Images (no colour state) are unchanged.
+
 ## [0.58.0] - 2026-06-21
 
 ### Added

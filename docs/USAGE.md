@@ -151,8 +151,10 @@ element's own origin) use `[cosθ, sinθ, −sinθ, cosθ, 0, 0]`.
 element — text, image or shape. With `to_front = 1` the element's op range is
 spliced to the **end** of the content stream (painted last → on top); with
 `to_front = 0` it is spliced to the **start** (painted first → behind
-everything). The moved range is re-wrapped in `q … Q`, so it neither inherits nor
-leaks graphics state.
+everything). The moved range is re-wrapped in `q … Q` with the element's
+effective graphics state (fill/stroke colour, line width, dash, font) re-emitted
+inside it, so it renders identically at its new position and does not leak state
+onto neighbours.
 
 ```js
 // Bring element #2 on page 1 to the front (on top of everything else).

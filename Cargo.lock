@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "gigapdf-core"
-version = "0.58.0"
+version = "0.58.1"
 dependencies = [
  "aes",
  "boa_engine",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "gigapdf-wasm"
-version = "0.58.0"
+version = "0.58.1"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",

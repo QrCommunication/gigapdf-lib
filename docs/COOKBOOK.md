@@ -598,8 +598,10 @@ doc.setPathStyle(1, pathIndex, { fillAlpha: 0.3, strokeAlpha: 1 });
 `reorderElement(page, index, toFront)` changes the native PDF paint (z) order of
 any element. `toFront = true` splices its op range to the **end** of the content
 stream (painted last → on top); `false` splices it to the **start** (painted
-first → behind everything). The moved range is re-wrapped in `q … Q` so it
-neither inherits nor leaks graphics state.
+first → behind everything). The moved range is re-wrapped in `q … Q` with the
+element's effective graphics state (fill/stroke colour, line width, dash and, for
+text, font) re-emitted inside it, so it renders identically at its new position
+and does not leak state onto neighbours.
 
 ```ts
 const doc = giga.open(pdfBytes);
