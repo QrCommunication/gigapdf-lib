@@ -1079,6 +1079,10 @@ impl Document {
         else {
             return decoders;
         };
+        // Document-wide affine offset for recovering codes that broken subset
+        // `/ToUnicode` CMaps omit (lets a font with a near-empty CMap borrow the
+        // offset its sibling subsets establish). `None` ⇒ no recovery.
+        let doc_delta = self.document_ascii_offset();
         for (name, value) in &font_dict.0 {
             let Some(font) = self.resolve(value).as_dict() else {
                 continue;
@@ -1091,19 +1095,40 @@ impl Document {
                 .and_then(Object::as_stream)
                 .and_then(|stream| decode_stream(stream).ok())
                 .map(|bytes| crate::font::cmap::ToUnicode::parse(&bytes))
-                .filter(|cmap| !cmap.is_empty());
+                .filter(|cmap| !cmap.is_empty())
+                .map(|mut cmap| {
+                    // Recover codes a broken subset `/ToUnicode` omits when the
+                    // font assigns glyph codes by a single affine ASCII offset and
+                    // ships no embedded `cmap`/`post` (the only remaining mapping
+                    // is this incomplete CMap). Self-calibrating + conservative;
+                    // a no-op for well-formed CMaps.
+                    cmap.infer_ascii_gaps(doc_delta);
+                    cmap
+                });
             let widths = if two_byte {
                 self.cid_font_widths(font)
             } else {
                 self.simple_font_widths(font)
             };
-            // For an Identity-H Type0 font lacking a /ToUnicode, derive a
-            // glyph-id → Unicode map from the embedded font's own cmap so text
-            // still extracts as real characters (not tofu).
-            let cid_to_unicode = if two_byte && to_unicode.is_none() {
+            // For an Identity-H Type0 font, derive a glyph-id → Unicode map from
+            // the embedded font's own cmap (and `post` names). Built even when a
+            // `/ToUnicode` is present: subset fonts routinely ship a **partial**
+            // `/ToUnicode` that omits some codes, and this map fills those gaps so
+            // they extract as real characters instead of `U+FFFD` tofu.
+            let cid_to_unicode = if two_byte {
                 self.cid_font_cmap_unicode(font)
             } else {
                 None
+            };
+            // For a simple (single-byte) font, resolve its base `/Encoding` +
+            // `/Differences` to a code → Unicode map (via the Adobe Glyph List),
+            // the spec route for simple fonts without `/ToUnicode`. Correct for
+            // MacRoman/Standard-encoded and custom-`/Differences` fonts, where the
+            // bare WinAnsi fallback would corrupt accents and punctuation.
+            let simple_encoding = if two_byte {
+                None
+            } else {
+                self.simple_font_encoding(font)
             };
             decoders.insert(
                 name.clone(),
@@ -1112,15 +1137,119 @@ impl Document {
                     to_unicode,
                     widths,
                     cid_to_unicode,
+                    simple_encoding,
                 },
             );
         }
         decoders
     }
 
+    /// Build a simple font's character-code → Unicode map from its base
+    /// `/Encoding` (`WinAnsiEncoding`/`MacRomanEncoding`/`StandardEncoding`)
+    /// overlaid with its `/Encoding` `/Differences` (each code → glyph name →
+    /// Unicode via the Adobe Glyph List). This is the spec resolution order
+    /// (ISO 32000-1 §9.6.6) for extracting text from a simple font that ships no
+    /// `/ToUnicode` CMap.
+    ///
+    /// Returns `None` for the common WinAnsi-without-`/Differences` case so the
+    /// decoder keeps its (identical) hard-coded WinAnsi path — the map is only
+    /// built when it would actually change a code's Unicode (MacRoman/Standard
+    /// base, or any `/Differences`).
+    fn simple_font_encoding(
+        &self,
+        font: &Dictionary,
+    ) -> Option<std::collections::BTreeMap<u8, String>> {
+        use crate::font::encoding::{glyph_name_to_unicode, BaseEncoding};
+
+        let differences = self.encoding_differences(font);
+        let base = self.font_base_encoding(font);
+
+        // WinAnsi base + no Differences == the decoder's default WinAnsi path.
+        if base == BaseEncoding::WinAnsi && differences.is_empty() {
+            return None;
+        }
+
+        let mut map = std::collections::BTreeMap::new();
+        for code in 0u8..=255 {
+            if let Some(name) = differences.get(&code) {
+                if let Some(s) = glyph_name_to_unicode(name) {
+                    map.insert(code, s);
+                    continue;
+                }
+            }
+            if let Some(c) = base.to_char(code) {
+                // Skip the C0/C1 control slots WinAnsi leaves as raw scalars; they
+                // never carry text and only add noise.
+                if !c.is_control() {
+                    map.insert(code, c.to_string());
+                }
+            }
+        }
+        (!map.is_empty()).then_some(map)
+    }
+
+    /// The named base encoding of a simple font: its `/Encoding` name, or the
+    /// `/BaseEncoding` of an `/Encoding` dictionary. Defaults to `WinAnsiEncoding`
+    /// (the office default) when unspecified or unrecognised — close enough for
+    /// the Latin simple fonts this path serves, and overridden code-by-code by any
+    /// `/Differences`.
+    fn font_base_encoding(&self, font: &Dictionary) -> crate::font::encoding::BaseEncoding {
+        use crate::font::encoding::BaseEncoding;
+        match font.get(b"Encoding").map(|o| self.resolve(o)) {
+            Some(Object::Name(n)) => BaseEncoding::from_name(n).unwrap_or(BaseEncoding::WinAnsi),
+            Some(Object::Dictionary(enc)) => enc
+                .get(b"BaseEncoding")
+                .and_then(Object::as_name)
+                .and_then(BaseEncoding::from_name)
+                .unwrap_or(BaseEncoding::WinAnsi),
+            _ => BaseEncoding::WinAnsi,
+        }
+    }
+
+    /// The document-wide affine offset (`unicode - code`) shared by this file's
+    /// subset `/ToUnicode` CMaps, or `None` when there is no overwhelmingly
+    /// dominant one.
+    ///
+    /// Producers that emit subset fonts with an affine glyph-code layout
+    /// (`code = unicode - delta`) but **incomplete** per-font `/ToUnicode` (and no
+    /// embedded `cmap`/`post`) leave some codes unrecoverable from a single font.
+    /// Computing the dominant offset across *every* Type0 `/ToUnicode` in the file
+    /// lets a near-empty CMap borrow the offset its sibling subsets establish
+    /// ([`crate::font::cmap::ToUnicode::infer_ascii_gaps`]). Requires a strong
+    /// consensus (≥16 samples, ≥95% on one offset) so a mixed-encoding document
+    /// never gets a bogus global offset applied.
+    fn document_ascii_offset(&self) -> Option<i64> {
+        let mut acc: std::collections::BTreeMap<i64, u32> = std::collections::BTreeMap::new();
+        for obj in self.objects.values() {
+            let Some(font) = obj.as_dict() else { continue };
+            if font.get(b"Subtype").and_then(Object::as_name) != Some(b"Type0".as_slice()) {
+                continue;
+            }
+            if let Some(cmap) = font
+                .get(b"ToUnicode")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_stream)
+                .and_then(|stream| decode_stream(stream).ok())
+                .map(|bytes| crate::font::cmap::ToUnicode::parse(&bytes))
+            {
+                cmap.accumulate_ascii_deltas(&mut acc);
+            }
+        }
+        let total: u32 = acc.values().sum();
+        if total < 16 {
+            return None;
+        }
+        acc.into_iter()
+            .max_by_key(|&(_, n)| n)
+            .filter(|&(_, hits)| hits as f64 >= 0.95 * total as f64)
+            .map(|(delta, _)| delta)
+    }
+
     /// Glyph-id → Unicode map from a Type0 font's embedded program (`FontFile2`
-    /// glyf or `FontFile3` OpenType/CFF) cmap, for Identity-H fonts that carry no
-    /// `/ToUnicode`. `None` when the font isn't embedded or has no usable cmap.
+    /// glyf or `FontFile3` OpenType/CFF) cmap, for Identity-H fonts. Used as the
+    /// composite-font fallback when there is no `/ToUnicode`, **and** to fill the
+    /// gaps a partial `/ToUnicode` leaves. `None` when the font isn't embedded or
+    /// has no usable cmap.
     fn cid_font_cmap_unicode(
         &self,
         font: &Dictionary,
@@ -4433,6 +4562,9 @@ impl Document {
                         // Rasterising uses the glyph id directly; no cmap-derived
                         // Unicode fallback is required for drawing.
                         cid_to_unicode: None,
+                        // Drawing resolves codes via the glyph program, not text
+                        // Unicode, so the simple-encoding map isn't needed here.
+                        simple_encoding: None,
                     },
                     two_byte,
                     code_to_gid,
@@ -15500,6 +15632,132 @@ mod tests {
         assert!(
             fill[0] < 1e-9 && (fill[1] - 1.0).abs() < 1e-9 && (fill[2] - 1.0).abs() < 1e-9,
             "ICCBased N=4 cyan → (0,1,1), got {fill:?}"
+        );
+    }
+
+    // ── font-aware text extraction: no tofu from broken `/ToUnicode` or
+    //    MacRoman/Differences simple fonts (regression for the s1106 bug class) ──
+
+    /// A one-page PDF reproducing the s1106 extraction failure modes:
+    /// - **F1**: a Type0 subset font whose `/ToUnicode` is *affine but partial*
+    ///   (`code = unicode − 0x1D`) and omits `J`(0x2d) and the space(0x03) — the
+    ///   producer never mapped them, and (like s1106) the font ships no embedded
+    ///   `cmap`/`post`. The decoder must recover them from the inferred offset.
+    /// - **F2**: a simple font with `/MacRomanEncoding` (no `/ToUnicode`) drawing
+    ///   `à`(0x88) and the curly apostrophe(0xD5). Decoding these as WinAnsi (the
+    ///   old hard-coded fallback) corrupts both; the base-encoding map fixes it.
+    fn tofu_fixture() -> Vec<u8> {
+        // F1 content (Type0, 2-byte codes): "Je ve".
+        //   J=0x2d (UNMAPPED), e=0x48, space=0x03 (UNMAPPED), v=0x59, e=0x48
+        let f1_stream = "BT /F1 12 Tf 20 120 Td <002d0048000300590048> Tj ET";
+        // F2 content (simple MacRoman): byte 0x88 = à, 0xD5 = ’.
+        // Use a literal string with the two raw bytes via octal escapes.
+        let f2_stream = "BT /F2 12 Tf 20 80 Td (\\210\\325) Tj ET";
+        let content = format!("{f1_stream}\n{f2_stream}");
+        // F1 `/ToUnicode`: affine 0x1D over a..i and l..v plus `e`, enough samples
+        // to self-calibrate; deliberately omits J(0x2d) and space(0x03).
+        let tounicode = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            1 begincodespacerange <0000> <FFFF> endcodespacerange \
+            2 beginbfrange \
+            <0044> <004c> <0061> \
+            <004f> <0059> <006c> \
+            endbfrange \
+            1 beginbfchar <0048> <0065> endbfchar \
+            endcmap end end";
+        raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] \
+                 /Resources << /Font << /F1 6 0 R /F2 9 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, format!("<< /Length {} >> stream\n{content}\nendstream", content.len())),
+            // F1: Type0 + descendant CIDFontType2, ToUnicode = obj 7. No FontFile,
+            // so the embedded-cmap fallback is unavailable — recovery is via the
+            // inferred affine offset alone (exactly the s1106 situation).
+            (
+                6,
+                "<< /Type /Font /Subtype /Type0 /BaseFont /AAAAAA+TimesNewRoman \
+                 /Encoding /Identity-H /DescendantFonts [8 0 R] /ToUnicode 7 0 R >>"
+                    .into(),
+            ),
+            (7, format!("<< /Length {} >> stream\n{tounicode}\nendstream", tounicode.len())),
+            (
+                8,
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /AAAAAA+TimesNewRoman \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+                 /CIDToGIDMap /Identity >>"
+                    .into(),
+            ),
+            // F2: simple font, MacRomanEncoding, no ToUnicode.
+            (
+                9,
+                "<< /Type /Font /Subtype /TrueType /BaseFont /BBBBBB+Times \
+                 /Encoding /MacRomanEncoding >>"
+                    .into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn extraction_recovers_broken_tounicode_and_macroman() {
+        let doc = Document::open(&tofu_fixture()).unwrap();
+        let runs = doc.page_text_runs(1).unwrap();
+        let all: String = runs.iter().map(|r| r.text.as_str()).collect();
+
+        // No replacement characters anywhere.
+        assert_eq!(
+            all.matches('\u{FFFD}').count(),
+            0,
+            "extraction must be tofu-free, got: {all:?}"
+        );
+        // F1: the affine offset recovered the unmapped J and space.
+        assert!(
+            runs.iter().any(|r| r.text == "Je ve"),
+            "Type0 affine gap-fill must recover 'J'/space: {runs:?}"
+        );
+        // F2: MacRoman base decoded à and the curly apostrophe correctly (decoding
+        // these bytes as WinAnsi would yield 'ˆ' / 'Õ').
+        assert!(
+            runs.iter().any(|r| r.text == "à\u{2019}"),
+            "MacRoman simple font must decode à + ’: {runs:?}"
+        );
+    }
+
+    /// `/Differences` glyph names override the base encoding and resolve through
+    /// the Adobe Glyph List, even on a `WinAnsiEncoding` base.
+    #[test]
+    fn extraction_applies_encoding_differences() {
+        // Code 0x41 ('A' in WinAnsi) is remapped to `agrave` via /Differences;
+        // code 0x42 stays 'B' from the WinAnsi base.
+        let stream = "BT /F1 12 Tf 20 100 Td (AB) Tj ET";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, format!("<< /Length {} >> stream\n{stream}\nendstream", stream.len())),
+            (
+                6,
+                "<< /Type /Font /Subtype /TrueType /BaseFont /Helvetica \
+                 /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding \
+                 /Differences [65 /agrave] >> >>"
+                    .into(),
+            ),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        let runs = doc.page_text_runs(1).unwrap();
+        let all: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(all.matches('\u{FFFD}').count(), 0, "no tofu: {all:?}");
+        assert!(
+            runs.iter().any(|r| r.text == "àB"),
+            "/Differences must remap 0x41→agrave, keep 0x42→B: {runs:?}"
         );
     }
 }

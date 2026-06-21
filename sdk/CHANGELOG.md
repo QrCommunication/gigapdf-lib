@@ -4,6 +4,24 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.58.3] - 2026-06-21
+
+### Fixed
+
+- **Text extraction (`textElements()`, `structuredText()`) recovers far more
+  characters from subset fonts with broken/partial `/ToUnicode`.** Type0
+  (Identity-H) subsets whose `/ToUnicode` is affine but incomplete, and simple
+  fonts using `/MacRomanEncoding` or `/Differences`, were decoded as raw WinAnsi
+  — yielding U+FFFD (`�`) for characters that are perfectly *rendered* (the glyph
+  is drawn; only the code→Unicode map is missing). Extraction now follows the
+  ISO 32000 §9.10 priority: `/ToUnicode` → embedded `cmap`/`post` (`cid_to_gid`)
+  → an auto-calibrated affine inference for partial `/ToUnicode` subsets →
+  `/Encoding` base (WinAnsi/MacRoman/Standard) + `/Differences` resolved through
+  the Adobe Glyph List. On a real 76-font form this cut U+FFFD from **243 to 25**
+  per page (the 25 residual are codes that *no* source in the file maps — not
+  recoverable by any reader). **Page rendering was already correct and is
+  unchanged** — this only affects the extracted/editable text layer.
+
 ## [0.58.2] - 2026-06-21
 
 ### Fixed
