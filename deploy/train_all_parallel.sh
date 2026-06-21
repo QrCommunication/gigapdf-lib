@@ -16,13 +16,9 @@ TPJ="${TPJ:-12}"                  # threads per job (MAXJOBS×TPJ ≤ NPROC, lea
 export GIGA_OCR_DL_WORKERS="${GIGA_OCR_DL_WORKERS:-8}"
 
 # label | group | variant | degrade | langs | real(csv or -) | charset(path or -) | epochs
+# Ordered SYNTHETIC-ONLY first (train immediately, no download) then REAL-DATA jobs (self-fetch).
 JOBS=(
-  # ── Handwriting variants for non-Latin (mixed) — VARIANT=hw → ocr_<g>_hw.gpocr
-  "deva_hw|deva|hw|0|hin,eng|iiit_hindi|-|50"
-  "taml_hw|taml|hw|0|tam,eng|iiit_tamil|-|50"
-  "arabic_hw|arabic|hw|0|ara|-|-|50"
-  "beng_hw|beng|hw|0|ben,eng|-|-|50"
-  # ── Breadth: 14 new script primaries (mixed) — VARIANT="" → ocr_<g>.gpocr
+  # ── Breadth: 13 synthetic-only new-script primaries (mixed) — VARIANT="" → ocr_<g>.gpocr
   "thai|thai||0|tha,eng|-|-|50"
   "telu|telu||0|tel,eng|-|-|50"
   "kann|kann||0|kan,eng|-|-|50"
@@ -35,26 +31,29 @@ JOBS=(
   "armn|armn||0|hye,eng|-|-|50"
   "khmr|khmr||0|khm,eng|-|-|50"
   "laoo|laoo||0|lao,eng|-|-|50"
-  "mymr|mymr||0|mya,eng|myanmar|-|50"
   "ethi|ethi||0|amh,eng|-|-|50"
-  # ── Photo / degraded variants (mixed) — VARIANT=photo + DEGRADE=1 → ocr_<g>_photo.gpocr
+  # ── Synthetic-only HW + photo variants (Arabic/Bengali have no ungated real HW)
+  "arabic_hw|arabic|hw|0|ara|-|-|50"
+  "beng_hw|beng|hw|0|ben,eng|-|-|50"
   "arabic_photo|arabic|photo|1|ara|-|-|45"
-  "deva_photo|deva|photo|1|hin,eng|iiit_hindi|-|45"
   "beng_photo|beng|photo|1|ben,eng|-|-|45"
+  # ── Real-data jobs (stream their images via the trainer; cache shared across same-script pairs)
+  "mymr|mymr||0|mya,eng|myanmar|-|50"
+  "deva_hw|deva|hw|0|hin,eng|iiit_hindi|-|50"
+  "taml_hw|taml|hw|0|tam,eng|iiit_tamil|-|50"
+  "deva_photo|deva|photo|1|hin,eng|iiit_hindi|-|45"
   "taml_photo|taml|photo|1|tam,eng|iiit_tamil|-|45"
   "cjk_photo|cjk|photo|1|eng|chinese,casia|tools/ocr/cjk_charset.txt|45"
   "jpn_photo|jpn|photo|1|jpn,eng|japanese|tools/ocr/jpn_charset.txt|45"
   "kor_photo|kor|photo|1|kor,eng|korean|tools/ocr/kor_charset.txt|45"
 )
 
-# ── Pre-download every unique real dataset once (cached) so concurrent same-script jobs reuse it.
 log() { echo "[$(date -u +%H:%M:%S)] $*" >> ~/parallel_queue.log; }
-log "pre-downloading real datasets (cached)…"
-for d in iiit_hindi iiit_tamil myanmar chinese casia japanese korean; do
-  ls /tmp/ocr_hw/${d}_train_*.npz >/dev/null 2>&1 && { log "  $d cached"; continue; }
-  GIGA_OCR_DL_WORKERS=16 "$VENV/bin/python" tools/ocr/hw_datasets.py "$d" 60000 > ~/dl_${d}.log 2>&1 || log "  $d dl failed"
-done
 
+# Jobs self-download their real data via the trainer (hw_datasets caches by actual count, so a
+# concurrent same-script pair at worst fetches twice — minor). No blocking pre-download phase:
+# synthetic-only jobs (listed first) start training **immediately**, keeping the cores busy while
+# the real-data jobs stream their images.
 run_job() {
   local spec="$1"
   IFS='|' read -r label group variant degrade langs real charset epochs <<<"$spec"
