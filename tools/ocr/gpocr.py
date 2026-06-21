@@ -39,3 +39,35 @@ def serialize(rtl, h, gru_in, gru_hid, alphabet, conv, fwd, bwd, fc) -> bytes:
     o += struct.pack("<%db" % len(w), *w)
     o += struct.pack("<%df" % len(b), *b)
     return bytes(o)
+
+
+MAGIC_F32 = b"GPO2"
+
+
+def serialize_f32(rtl, h, gru_in, gru_hid, alphabet, conv, fwd, bwd, fc) -> bytes:
+    """Full-precision **GPO2** blob — same layout as `serialize` but weights are raw **f32**
+    (scale fields written as 1.0 placeholders, ignored by the reader). Recurrent recognizers
+    need this precision: per-tensor int8 rounding compounds over a line and collapsed non-Latin
+    decoding despite a good float val. `conv`: (in_ch, out_ch, w_f32[], b_f32[]). `fwd`/`bwd`:
+    ([wz,wr,wn], [uz,ur,un], [bz,br,bn]). `fc`: (w_f32[], b_f32[])."""
+    o = bytearray(MAGIC_F32)
+    o += struct.pack("<B", 1 if rtl else 0)
+    o += struct.pack("<HHH", h, gru_in, gru_hid)
+    ab = alphabet.encode("utf-8")
+    o += struct.pack("<I", len(ab)) + ab
+    o += struct.pack("<B", len(conv))
+    for in_ch, out_ch, w, b in conv:
+        o += struct.pack("<HHf", in_ch, out_ch, 1.0)
+        o += struct.pack("<%df" % len(w), *w)
+        o += struct.pack("<%df" % len(b), *b)
+    for wmats, umats, bvecs in (fwd, bwd):
+        o += struct.pack("<ff", 1.0, 1.0)
+        for m in (*wmats, *umats):
+            o += struct.pack("<%df" % len(m), *m)
+        for v in bvecs:
+            o += struct.pack("<%df" % len(v), *v)
+    w, b = fc
+    o += struct.pack("<f", 1.0)
+    o += struct.pack("<%df" % len(w), *w)
+    o += struct.pack("<%df" % len(b), *b)
+    return bytes(o)

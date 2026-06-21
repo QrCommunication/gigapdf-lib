@@ -37,7 +37,12 @@ class _Cur:
 
 def parse(blob: bytes) -> dict:
     c = _Cur(blob)
-    if c.take(4) != b"GPO1":
+    magic = c.take(4)
+    if magic == b"GPO1":
+        wfmt = "b"  # int8 weights (legacy)
+    elif magic == b"GPO2":
+        wfmt = "f"  # full-precision f32 weights (scale fields are 1.0 placeholders)
+    else:
         raise ValueError("bad magic — not a .gpocr blob")
     (rtl,) = c.unpack("B")
     h, gru_in, gru_hid = c.unpack("HHH")
@@ -47,18 +52,18 @@ def parse(blob: bytes) -> dict:
     convs = []
     for _ in range(n_conv):
         in_ch, out_ch, scale = c.unpack("HHf")
-        w = list(c.unpack("%db" % (out_ch * in_ch * 9)))
+        w = list(c.unpack(("%d" + wfmt) % (out_ch * in_ch * 9)))
         b = list(c.unpack("%df" % out_ch))
         convs.append((in_ch, out_ch, scale, w, b))
     grus = []
     for _ in range(2):
         w_scale, u_scale = c.unpack("ff")
-        mats = [list(c.unpack("%db" % (gru_hid * gru_in))) for _ in range(3)]    # wz, wr, wn
-        mats += [list(c.unpack("%db" % (gru_hid * gru_hid))) for _ in range(3)]  # uz, ur, un
-        bvecs = [list(c.unpack("%df" % gru_hid)) for _ in range(3)]              # bz, br, bn
+        mats = [list(c.unpack(("%d" + wfmt) % (gru_hid * gru_in))) for _ in range(3)]    # wz, wr, wn
+        mats += [list(c.unpack(("%d" + wfmt) % (gru_hid * gru_hid))) for _ in range(3)]  # uz, ur, un
+        bvecs = [list(c.unpack("%df" % gru_hid)) for _ in range(3)]                       # bz, br, bn
         grus.append((w_scale, u_scale, mats, bvecs))
     (fc_scale,) = c.unpack("f")
-    fc_w = list(c.unpack("%db" % ((len(alphabet) + 1) * 2 * gru_hid)))
+    fc_w = list(c.unpack(("%d" + wfmt) % ((len(alphabet) + 1) * 2 * gru_hid)))
     fc_b = list(c.unpack("%df" % (len(alphabet) + 1)))
     return {"rtl": rtl, "h": h, "gru_in": gru_in, "gru_hid": gru_hid,
             "alphabet": alphabet, "convs": convs, "grus": grus, "fc": (fc_scale, fc_w, fc_b)}

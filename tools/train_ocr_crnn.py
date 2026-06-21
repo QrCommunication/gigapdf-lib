@@ -362,36 +362,27 @@ def build_and_train(group: str, epochs: int):
 
 
 def emit_gpocr(net, alphabet: str, group: str, out_group: str | None = None) -> str:
-    """Write the runtime-loadable `.gpocr` blob (same int8 quantization as emit_rust,
-    serialized for `gp_ocr_load_model`) to models/ocr_<group>.gpocr."""
-    def ql(t, scale=None):
-        a = t.detach().cpu().numpy().reshape(-1)
-        scale = scale or (float(np.abs(a).max()) / 127.0 or 1.0)
-        q = np.clip(np.round(a / scale), -127, 127).astype(np.int8)
-        return [int(x) for x in q], scale
-
+    """Write the runtime-loadable **GPO2** `.gpocr` blob — full-precision **f32** weights (NOT
+    int8). The host path is recurrent (GRU) and per-tensor int8 rounding compounds over a line,
+    collapsing non-Latin decoding despite a good float val; f32 keeps the trained net exactly.
+    Size doubles vs int8 but the blob is host-delivered, so this is cheap insurance."""
     def fl(t):
         return [float(x) for x in t.detach().cpu().numpy().reshape(-1)]
 
-    c1w, c1s = ql(net.c1.weight)
-    c2w, c2s = ql(net.c2.weight)
     conv = [
-        (1, C1_OUT, c1s, c1w, fl(net.c1.bias)),
-        (C1_OUT, C2_OUT, c2s, c2w, fl(net.c2.bias)),
+        (1, C1_OUT, fl(net.c1.weight), fl(net.c1.bias)),
+        (C1_OUT, C2_OUT, fl(net.c2.weight), fl(net.c2.bias)),
     ]
 
     def gdir(g):
-        ws = max(float(np.abs(m.weight.detach().cpu().numpy()).max()) for m in (g.wz, g.wr, g.wn)) / 127.0 or 1.0
-        us = max(float(np.abs(m.weight.detach().cpu().numpy()).max()) for m in (g.uz, g.ur, g.un)) / 127.0 or 1.0
-        wmats = [ql(m.weight, ws)[0] for m in (g.wz, g.wr, g.wn)]
-        umats = [ql(m.weight, us)[0] for m in (g.uz, g.ur, g.un)]
+        wmats = [fl(m.weight) for m in (g.wz, g.wr, g.wn)]
+        umats = [fl(m.weight) for m in (g.uz, g.ur, g.un)]
         bvecs = [fl(g.wz.bias), fl(g.wr.bias), fl(g.wn.bias)]
-        return (ws, us, wmats, umats, bvecs)
+        return (wmats, umats, bvecs)
 
-    fcw, fcs = ql(net.fc.weight)
-    blob = gpocr.serialize(
+    blob = gpocr.serialize_f32(
         rtl=is_rtl(group), h=H, gru_in=C2_OUT, gru_hid=HID, alphabet=alphabet,
-        conv=conv, fwd=gdir(net.fwd), bwd=gdir(net.bwd), fc=(fcs, fcw, fl(net.fc.bias)),
+        conv=conv, fwd=gdir(net.fwd), bwd=gdir(net.bwd), fc=(fl(net.fc.weight), fl(net.fc.bias)),
     )
     out_dir = os.path.join(ROOT, "models")
     os.makedirs(out_dir, exist_ok=True)

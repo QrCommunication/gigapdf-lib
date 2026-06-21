@@ -33,12 +33,33 @@ pub struct OcrResult {
 /// `w` is laid out `[out][in][ky][kx]` (PyTorch `Conv2d.weight` order); the
 /// dequantized value is `w[..] as f32 * scale`. Output keeps the input H×W.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn conv2d_relu(
+/// A quantized weight element. Lets the conv/GRU/FC primitives run over **`i8`** (the lean
+/// feature-baked models) or **`f32`** (full-precision host-loaded `.gpocr` blobs) from one
+/// implementation. For `W = i8` this monomorphizes to byte-for-byte the previous code, so the
+/// mono-glyph and feature-baked paths are unchanged; `f32` host models skip the lossy int8
+/// quantization that collapsed recurrent non-Latin recognizers.
+pub(crate) trait Qw: Copy {
+    fn to_f32(self) -> f32;
+}
+impl Qw for i8 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+}
+impl Qw for f32 {
+    #[inline]
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+
+pub(crate) fn conv2d_relu<W: Qw>(
     inp: &[f32],
     in_ch: usize,
     ih: usize,
     iw: usize,
-    w: &[i8],
+    w: &[W],
     scale: f32,
     bias: &[f32],
     out_ch: usize,
@@ -68,7 +89,7 @@ pub(crate) fn conv2d_relu(
                             }
                             let pix = inp[row + (sx - pad)];
                             if pix != 0.0 {
-                                acc += pix * (w[wrow + kx] as f32) * scale;
+                                acc += pix * w[wrow + kx].to_f32() * scale;
                             }
                         }
                     }
@@ -103,7 +124,7 @@ pub(crate) fn maxpool2(inp: &[f32], ch: usize, h: usize, w: usize) -> (Vec<f32>,
 
 /// Fully-connected layer; `w` is `[out][in]` (PyTorch `Linear.weight`), int8 +
 /// f32 bias. Applies ReLU when `relu` is set.
-pub(crate) fn dense(inp: &[f32], w: &[i8], scale: f32, bias: &[f32], out: usize, relu: bool) -> Vec<f32> {
+pub(crate) fn dense<W: Qw>(inp: &[f32], w: &[W], scale: f32, bias: &[f32], out: usize, relu: bool) -> Vec<f32> {
     let n = inp.len();
     let mut o = vec![0f32; out];
     for (j, slot) in o.iter_mut().enumerate() {
@@ -111,7 +132,7 @@ pub(crate) fn dense(inp: &[f32], w: &[i8], scale: f32, bias: &[f32], out: usize,
         let wbase = j * n;
         for (i, &x) in inp.iter().enumerate() {
             if x != 0.0 {
-                acc += x * (w[wbase + i] as f32) * scale;
+                acc += x * w[wbase + i].to_f32() * scale;
             }
         }
         *slot = if relu { acc.max(0.0) } else { acc };

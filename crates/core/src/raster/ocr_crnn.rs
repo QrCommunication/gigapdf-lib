@@ -26,7 +26,7 @@
 //! numerically-exact primitives (GRU cell, CTC decode) are unit-tested here.
 
 use super::ocr::{
-    conv2d_relu, connected_components, dense, maxpool2, sauvola_ink, OcrResult, OcrWord,
+    conv2d_relu, connected_components, dense, maxpool2, sauvola_ink, OcrResult, OcrWord, Qw,
 };
 
 /// Height (rows) every line strip is normalized to before the conv stack.
@@ -36,25 +36,26 @@ pub(crate) const STRIP_H: usize = 32;
 /// the source line's `(x0, y0, x1, y1)` bounding box in image pixels.
 type LineStrip = (Vec<f32>, usize, (usize, usize, usize, usize));
 
-/// One int8 convolution layer (3×3 same-pad, ReLU), each followed by a 2×2 pool.
-/// `w` is `[out][in][3][3]` (PyTorch `Conv2d.weight` order); value = `w as f32 * scale`.
-pub(crate) struct ConvSpec<'a> {
-    pub w: &'a [i8],
+/// One convolution layer (3×3 same-pad, ReLU), each followed by a 2×2 pool. `w` is
+/// `[out][in][3][3]` (PyTorch `Conv2d.weight` order); value = `w.to_f32() * scale`. Generic over
+/// the weight type: `i8` for feature-baked models, `f32` for full-precision host blobs.
+pub(crate) struct ConvSpec<'a, W: Qw> {
+    pub w: &'a [W],
     pub scale: f32,
     pub b: &'a [f32],
     pub in_ch: usize,
     pub out_ch: usize,
 }
 
-/// One int8 GRU direction. Input weights `w*` are `[hid][in]`, recurrent `u*` are
-/// `[hid][hid]` (PyTorch order); biases are f32; the hidden state stays f32.
-pub(crate) struct GruSpec<'a> {
-    pub wz: &'a [i8],
-    pub wr: &'a [i8],
-    pub wn: &'a [i8],
-    pub uz: &'a [i8],
-    pub ur: &'a [i8],
-    pub un: &'a [i8],
+/// One GRU direction. Input weights `w*` are `[hid][in]`, recurrent `u*` are `[hid][hid]`
+/// (PyTorch order); biases are f32; the hidden state stays f32. Generic over the weight type.
+pub(crate) struct GruSpec<'a, W: Qw> {
+    pub wz: &'a [W],
+    pub wr: &'a [W],
+    pub wn: &'a [W],
+    pub uz: &'a [W],
+    pub ur: &'a [W],
+    pub un: &'a [W],
     pub w_scale: f32,
     pub u_scale: f32,
     pub bz: &'a [f32],
@@ -62,20 +63,21 @@ pub(crate) struct GruSpec<'a> {
     pub bn: &'a [f32],
 }
 
-/// A full CRNN line recognizer — an inference-only view over embedded int8 statics.
-pub(crate) struct Crnn<'a> {
+/// A full CRNN line recognizer — an inference-only view over embedded statics (`W = i8`) or
+/// owned full-precision weights (`W = f32`, host-loaded).
+pub(crate) struct Crnn<'a, W: Qw> {
     /// Input strip height; must equal [`STRIP_H`] for the trained model.
     pub h: usize,
     /// Conv layers, each followed by a 2×2 max-pool (height shrinks by 2^N).
-    pub conv: &'a [ConvSpec<'a>],
+    pub conv: &'a [ConvSpec<'a, W>],
     /// Sequence feature dim (= last conv `out_ch`, = GRU input size).
     pub gru_in: usize,
     /// Hidden units per GRU direction.
     pub gru_hid: usize,
-    pub fwd: GruSpec<'a>,
-    pub bwd: GruSpec<'a>,
+    pub fwd: GruSpec<'a, W>,
+    pub bwd: GruSpec<'a, W>,
     /// Output projection `[K+1][2*gru_hid]` over the alphabet + a trailing blank.
-    pub fc_w: &'a [i8],
+    pub fc_w: &'a [W],
     pub fc_scale: f32,
     pub fc_b: &'a [f32],
     /// `K` characters; the CTC blank is the implicit index `K`.
@@ -104,20 +106,20 @@ fn argmax(v: &[f32]) -> usize {
 
 /// One GRU step (int8 weights, f32 state): `h' = (1−z)⊙n + z⊙h`, with
 /// `z = σ(Wz x + Uz h)`, `r = σ(Wr x + Ur h)`, `n = tanh(Wn x + Un (r⊙h))`.
-fn gru_cell(g: &GruSpec, x: &[f32], hprev: &[f32], hid: usize, inn: usize) -> Vec<f32> {
+fn gru_cell<W: Qw>(g: &GruSpec<W>, x: &[f32], hprev: &[f32], hid: usize, inn: usize) -> Vec<f32> {
     // Pre-activation of one gate row `j`, given the recurrent vector `rec`.
-    let gate = |w: &[i8], u: &[i8], b: &[f32], j: usize, rec: &[f32]| -> f32 {
+    let gate = |w: &[W], u: &[W], b: &[f32], j: usize, rec: &[f32]| -> f32 {
         let mut acc = b[j];
         let wb = j * inn;
         for i in 0..inn {
-            let wv = w[wb + i] as f32;
+            let wv = w[wb + i].to_f32();
             if wv != 0.0 {
                 acc += wv * g.w_scale * x[i];
             }
         }
         let ub = j * hid;
         for k in 0..hid {
-            let uv = u[ub + k] as f32;
+            let uv = u[ub + k].to_f32();
             if uv != 0.0 {
                 acc += uv * g.u_scale * rec[k];
             }
@@ -255,7 +257,7 @@ fn disambiguate_line(line: &str) -> String {
 }
 
 /// Recognize one normalized line strip (`1×h×w`, ink=1) → `(text, mean confidence)`.
-fn recognize_line(m: &Crnn, strip: &[f32], w: usize) -> (String, f32) {
+fn recognize_line<W: Qw>(m: &Crnn<W>, strip: &[f32], w: usize) -> (String, f32) {
     let mut data = strip.to_vec();
     let (mut ih, mut iw) = (m.h, w);
     for layer in m.conv {
@@ -568,7 +570,7 @@ fn extract_lines_in_column(gview: &[u8], ink: &[bool], w: usize, h: usize, cx0: 
 /// [`OcrWord`] is emitted per line (box in image pixels). Empty if `models` is empty
 /// (no per-script model embedded for this build) — callers fall back to
 /// [`super::ocr::ocr`].
-pub(crate) fn recognize(gray: &[u8], w: usize, h: usize, models: &[&Crnn]) -> OcrResult {
+pub(crate) fn recognize<W: Qw>(gray: &[u8], w: usize, h: usize, models: &[&Crnn<W>]) -> OcrResult {
     let mut res = OcrResult::default();
     if models.is_empty() {
         return res;
@@ -599,9 +601,9 @@ pub(crate) fn recognize(gray: &[u8], w: usize, h: usize, models: &[&Crnn]) -> Oc
 
 /// Per-script CRNN models embedded in this build (one per enabled `ocr-*` feature).
 /// Empty when none are enabled — the default build.
-fn enabled_models() -> Vec<Crnn<'static>> {
+fn enabled_models() -> Vec<Crnn<'static, i8>> {
     #[allow(unused_mut)]
-    let mut v: Vec<Crnn<'static>> = Vec::new();
+    let mut v: Vec<Crnn<'static, i8>> = Vec::new();
     #[cfg(feature = "ocr-alpha")]
     v.push(super::ocr_model_alpha::model());
     // future groups: ocr-cjk, ocr-arabic, ocr-deva, ocr-beng, ocr-taml
@@ -614,23 +616,23 @@ fn enabled_models() -> Vec<Crnn<'static>> {
 // font (WASM export `gp_ocr_load_model`). The core stays ~540 KB; advanced OCR is
 // opt-in at runtime. `tools/train_ocr_crnn.py` emits the matching format.
 
+// Host models keep **dequantized f32** weights (scale already folded in): GPO1 blobs are int8 →
+// `i8 * scale`, GPO2 blobs carry raw f32. Recurrent recognizers need this precision — int8
+// rounding compounded over a line and collapsed non-Latin decoding despite a good float val.
 struct LoadedConv {
-    w: Vec<i8>,
-    scale: f32,
+    w: Vec<f32>,
     b: Vec<f32>,
     in_ch: usize,
     out_ch: usize,
 }
 
 struct LoadedGru {
-    wz: Vec<i8>,
-    wr: Vec<i8>,
-    wn: Vec<i8>,
-    uz: Vec<i8>,
-    ur: Vec<i8>,
-    un: Vec<i8>,
-    w_scale: f32,
-    u_scale: f32,
+    wz: Vec<f32>,
+    wr: Vec<f32>,
+    wn: Vec<f32>,
+    uz: Vec<f32>,
+    ur: Vec<f32>,
+    un: Vec<f32>,
     bz: Vec<f32>,
     br: Vec<f32>,
     bn: Vec<f32>,
@@ -648,12 +650,12 @@ struct LoadedModel {
     conv: Vec<LoadedConv>,
     fwd: LoadedGru,
     bwd: LoadedGru,
-    fc_w: Vec<i8>,
-    fc_scale: f32,
+    fc_w: Vec<f32>,
     fc_b: Vec<f32>,
 }
 
-const GPOCR_MAGIC: &[u8; 4] = b"GPO1";
+const GPOCR_MAGIC: &[u8; 4] = b"GPO1"; // int8 weights + per-tensor scale (legacy, lossy)
+const GPOCR_MAGIC_F32: &[u8; 4] = b"GPO2"; // full-precision f32 weights (recurrent-safe)
 
 /// Bounds-checked little-endian forward byte cursor.
 struct Cur<'a> {
@@ -684,6 +686,15 @@ impl<'a> Cur<'a> {
     fn i8s(&mut self, n: usize) -> Option<Vec<i8>> {
         Some(self.take(n)?.iter().map(|&b| b as i8).collect())
     }
+    /// Read `n` weights as **f32**: GPO2 reads raw f32; GPO1 reads int8 and dequantizes
+    /// (`i8 * scale`), so both formats land as full-precision weights for inference.
+    fn weights(&mut self, n: usize, is_f32: bool, scale: f32) -> Option<Vec<f32>> {
+        if is_f32 {
+            self.f32s(n)
+        } else {
+            Some(self.i8s(n)?.into_iter().map(|q| q as f32 * scale).collect())
+        }
+    }
     fn f32s(&mut self, n: usize) -> Option<Vec<f32>> {
         let s = self.take(n.checked_mul(4)?)?;
         Some((0..n).map(|k| f32::from_le_bytes([s[4 * k], s[4 * k + 1], s[4 * k + 2], s[4 * k + 3]])).collect())
@@ -691,11 +702,11 @@ impl<'a> Cur<'a> {
 }
 
 /// Build a transient [`GruSpec`] borrowing an owned direction.
-fn mk_gru(g: &LoadedGru) -> GruSpec<'_> {
+fn mk_gru(g: &LoadedGru) -> GruSpec<'_, f32> {
     GruSpec {
         wz: &g.wz, wr: &g.wr, wn: &g.wn,
         uz: &g.uz, ur: &g.ur, un: &g.un,
-        w_scale: g.w_scale, u_scale: g.u_scale,
+        w_scale: 1.0, u_scale: 1.0, // weights are pre-dequantized
         bz: &g.bz, br: &g.br, bn: &g.bn,
     }
 }
@@ -708,9 +719,11 @@ impl LoadedModel {
     /// f32 bz/br/bn[hid]}, fc {f32 scale, i8[(K+1)·2hid] w, f32[K+1] b}.
     fn from_bytes(bytes: &[u8]) -> Option<LoadedModel> {
         let mut c = Cur { b: bytes, i: 0 };
-        if c.take(4)? != GPOCR_MAGIC {
-            return None;
-        }
+        let is_f32 = match c.take(4)? {
+            m if m == GPOCR_MAGIC => false,
+            m if m == GPOCR_MAGIC_F32 => true,
+            _ => return None,
+        };
         let rtl = c.u8()? != 0;
         let (h, gru_in, gru_hid) = (c.u16()?, c.u16()?, c.u16()?);
         let alen = c.u32()?;
@@ -720,40 +733,39 @@ impl LoadedModel {
         let mut conv = Vec::with_capacity(n_conv);
         for _ in 0..n_conv {
             let (in_ch, out_ch) = (c.u16()?, c.u16()?);
-            let scale = c.f32()?;
-            let w = c.i8s(out_ch.checked_mul(in_ch)?.checked_mul(9)?)?;
+            let scale = c.f32()?; // GPO1: int8 scale; GPO2: 1.0 placeholder (ignored)
+            let w = c.weights(out_ch.checked_mul(in_ch)?.checked_mul(9)?, is_f32, scale)?;
             let b = c.f32s(out_ch)?;
-            conv.push(LoadedConv { w, scale, b, in_ch, out_ch });
+            conv.push(LoadedConv { w, b, in_ch, out_ch });
         }
         let read_gru = |c: &mut Cur| -> Option<LoadedGru> {
             let (w_scale, u_scale) = (c.f32()?, c.f32()?);
             let (wi, ui) = (gru_hid.checked_mul(gru_in)?, gru_hid.checked_mul(gru_hid)?);
             Some(LoadedGru {
-                wz: c.i8s(wi)?, wr: c.i8s(wi)?, wn: c.i8s(wi)?,
-                uz: c.i8s(ui)?, ur: c.i8s(ui)?, un: c.i8s(ui)?,
-                w_scale, u_scale,
+                wz: c.weights(wi, is_f32, w_scale)?, wr: c.weights(wi, is_f32, w_scale)?, wn: c.weights(wi, is_f32, w_scale)?,
+                uz: c.weights(ui, is_f32, u_scale)?, ur: c.weights(ui, is_f32, u_scale)?, un: c.weights(ui, is_f32, u_scale)?,
                 bz: c.f32s(gru_hid)?, br: c.f32s(gru_hid)?, bn: c.f32s(gru_hid)?,
             })
         };
         let fwd = read_gru(&mut c)?;
         let bwd = read_gru(&mut c)?;
         let fc_scale = c.f32()?;
-        let fc_w = c.i8s((k + 1).checked_mul(2)?.checked_mul(gru_hid)?)?;
+        let fc_w = c.weights((k + 1).checked_mul(2)?.checked_mul(gru_hid)?, is_f32, fc_scale)?;
         let fc_b = c.f32s(k + 1)?;
-        Some(LoadedModel { h, gru_in, gru_hid, rtl, alphabet, conv, fwd, bwd, fc_w, fc_scale, fc_b })
+        Some(LoadedModel { h, gru_in, gru_hid, rtl, alphabet, conv, fwd, bwd, fc_w, fc_b })
     }
 
     /// Recognize a page through this model (transient borrowing [`Crnn`], no copy).
     fn recognize(&self, gray: &[u8], w: usize, h: usize) -> OcrResult {
-        let conv: Vec<ConvSpec> = self
+        let conv: Vec<ConvSpec<f32>> = self
             .conv
             .iter()
-            .map(|c| ConvSpec { w: &c.w, scale: c.scale, b: &c.b, in_ch: c.in_ch, out_ch: c.out_ch })
+            .map(|c| ConvSpec { w: &c.w, scale: 1.0, b: &c.b, in_ch: c.in_ch, out_ch: c.out_ch })
             .collect();
         let crnn = Crnn {
             h: self.h, conv: &conv, gru_in: self.gru_in, gru_hid: self.gru_hid,
             fwd: mk_gru(&self.fwd), bwd: mk_gru(&self.bwd),
-            fc_w: &self.fc_w, fc_scale: self.fc_scale, fc_b: &self.fc_b,
+            fc_w: &self.fc_w, fc_scale: 1.0, fc_b: &self.fc_b,
             alphabet: &self.alphabet, rtl: self.rtl,
         };
         recognize(gray, w, h, &[&crnn])
@@ -790,26 +802,26 @@ pub(crate) fn recognize_enabled(gray: &[u8], w: usize, h: usize) -> OcrResult {
             1 => return g[0].recognize(gray, w, h),
             _ => {
                 // Route per line across all loaded models (build transient Crnns).
-                let convs: Vec<Vec<ConvSpec>> = g
+                let convs: Vec<Vec<ConvSpec<f32>>> = g
                     .iter()
                     .map(|m| {
                         m.conv
                             .iter()
-                            .map(|c| ConvSpec { w: &c.w, scale: c.scale, b: &c.b, in_ch: c.in_ch, out_ch: c.out_ch })
+                            .map(|c| ConvSpec { w: &c.w, scale: 1.0, b: &c.b, in_ch: c.in_ch, out_ch: c.out_ch })
                             .collect()
                     })
                     .collect();
-                let crnns: Vec<Crnn> = g
+                let crnns: Vec<Crnn<f32>> = g
                     .iter()
                     .zip(&convs)
                     .map(|(m, conv)| Crnn {
                         h: m.h, conv, gru_in: m.gru_in, gru_hid: m.gru_hid,
                         fwd: mk_gru(&m.fwd), bwd: mk_gru(&m.bwd),
-                        fc_w: &m.fc_w, fc_scale: m.fc_scale, fc_b: &m.fc_b,
+                        fc_w: &m.fc_w, fc_scale: 1.0, fc_b: &m.fc_b,
                         alphabet: &m.alphabet, rtl: m.rtl,
                     })
                     .collect();
-                let refs: Vec<&Crnn> = crnns.iter().collect();
+                let refs: Vec<&Crnn<f32>> = crnns.iter().collect();
                 return recognize(gray, w, h, &refs);
             }
         }
@@ -818,7 +830,7 @@ pub(crate) fn recognize_enabled(gray: &[u8], w: usize, h: usize) -> OcrResult {
     if models.is_empty() {
         return OcrResult::default();
     }
-    let refs: Vec<&Crnn> = models.iter().collect();
+    let refs: Vec<&Crnn<i8>> = models.iter().collect();
     recognize(gray, w, h, &refs)
 }
 
@@ -989,7 +1001,7 @@ mod tests {
     #[test]
     fn recognize_returns_empty_without_models() {
         let gray = vec![255u8; 40 * 20];
-        let res = recognize(&gray, 40, 20, &[]);
+        let res = recognize::<i8>(&gray, 40, 20, &[]);
         assert!(res.text.is_empty() && res.words.is_empty());
     }
 
@@ -1000,37 +1012,36 @@ mod tests {
         fn pu16(o: &mut Vec<u8>, v: usize) { o.extend_from_slice(&(v as u16).to_le_bytes()); }
         fn pu32(o: &mut Vec<u8>, v: usize) { o.extend_from_slice(&(v as u32).to_le_bytes()); }
         fn pf(o: &mut Vec<u8>, v: f32) { o.extend_from_slice(&v.to_le_bytes()); }
-        fn pi8(o: &mut Vec<u8>, v: &[i8]) { o.extend(v.iter().map(|&x| x as u8)); }
         fn pf32(o: &mut Vec<u8>, v: &[f32]) { for &x in v { o.extend_from_slice(&x.to_le_bytes()); } }
         let mut o = Vec::new();
-        o.extend_from_slice(GPOCR_MAGIC);
+        o.extend_from_slice(GPOCR_MAGIC_F32); // GPO2: full-precision f32 weights
         o.push(m.rtl as u8);
         pu16(&mut o, m.h); pu16(&mut o, m.gru_in); pu16(&mut o, m.gru_hid);
         pu32(&mut o, m.alphabet.len());
         o.extend_from_slice(m.alphabet.as_bytes());
         o.push(m.conv.len() as u8);
         for cv in &m.conv {
-            pu16(&mut o, cv.in_ch); pu16(&mut o, cv.out_ch); pf(&mut o, cv.scale);
-            pi8(&mut o, &cv.w); pf32(&mut o, &cv.b);
+            pu16(&mut o, cv.in_ch); pu16(&mut o, cv.out_ch); pf(&mut o, 1.0); // scale placeholder
+            pf32(&mut o, &cv.w); pf32(&mut o, &cv.b);
         }
         for g in [&m.fwd, &m.bwd] {
-            pf(&mut o, g.w_scale); pf(&mut o, g.u_scale);
-            for blk in [&g.wz, &g.wr, &g.wn, &g.uz, &g.ur, &g.un] { pi8(&mut o, blk); }
+            pf(&mut o, 1.0); pf(&mut o, 1.0); // w_scale/u_scale placeholders
+            for blk in [&g.wz, &g.wr, &g.wn, &g.uz, &g.ur, &g.un] { pf32(&mut o, blk); }
             for blk in [&g.bz, &g.br, &g.bn] { pf32(&mut o, blk); }
         }
-        pf(&mut o, m.fc_scale); pi8(&mut o, &m.fc_w); pf32(&mut o, &m.fc_b);
+        pf(&mut o, 1.0); pf32(&mut o, &m.fc_w); pf32(&mut o, &m.fc_b);
         o
     }
 
     fn tiny_model() -> LoadedModel {
         let g = || LoadedGru {
-            wz: vec![1], wr: vec![1], wn: vec![1], uz: vec![1], ur: vec![1], un: vec![1],
-            w_scale: 0.1, u_scale: 0.1, bz: vec![0.0], br: vec![0.0], bn: vec![0.0],
+            wz: vec![0.1], wr: vec![0.1], wn: vec![0.1], uz: vec![0.1], ur: vec![0.1], un: vec![0.1],
+            bz: vec![0.0], br: vec![0.0], bn: vec![0.0],
         };
         LoadedModel {
             h: STRIP_H, gru_in: 1, gru_hid: 1, rtl: false, alphabet: "a".into(),
-            conv: vec![LoadedConv { w: vec![1; 9], scale: 0.1, b: vec![0.0], in_ch: 1, out_ch: 1 }],
-            fwd: g(), bwd: g(), fc_w: vec![1; 4], fc_scale: 0.1, fc_b: vec![0.0; 2],
+            conv: vec![LoadedConv { w: vec![0.1; 9], b: vec![0.0], in_ch: 1, out_ch: 1 }],
+            fwd: g(), bwd: g(), fc_w: vec![0.1; 4], fc_b: vec![0.0; 2],
         }
     }
 
@@ -1040,8 +1051,8 @@ mod tests {
         assert_eq!((p.h, p.gru_in, p.gru_hid, p.rtl), (STRIP_H, 1, 1, false));
         assert_eq!(p.alphabet, "a");
         assert_eq!(p.conv.len(), 1);
-        assert_eq!(p.conv[0].w, vec![1i8; 9]);
-        assert_eq!(p.fwd.wz, vec![1i8]);
+        assert_eq!(p.conv[0].w, vec![0.1f32; 9]);
+        assert_eq!(p.fwd.wz, vec![0.1f32]);
         assert_eq!((p.fc_w.len(), p.fc_b.len()), (4, 2));
     }
 
