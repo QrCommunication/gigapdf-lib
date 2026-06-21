@@ -4,6 +4,51 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.59.0] - 2026-06-21
+
+### Added — Universal font decoding (text extraction matches Adobe, zero OCR)
+
+A per-font `code → Unicode` resolver, built once at font setup via the full
+ISO 32000 §9.10 priority chain, now covers the real-world font matrix that made
+`textElements()`/`structuredText()` emit `�` or dingbats before:
+
+- **Standard Macintosh Glyph Ordering** — `/gNN` glyph names (in `/Differences`
+  and via CID GID) resolve through the 258 standard Mac glyph names
+  (`g49`→`N`, `g106`→`agrave`→`à`). This is how Adobe reads subset fonts that
+  **MuPDF and poppler drop** to `�`.
+- **Type1C (CFF) simple fonts** without `/ToUnicode` — fall back on the embedded
+  **CFF charset** (`code → gid → SID → name → Unicode`), recovering accents
+  (`à/è/ê/ç`) that were `�`.
+- **AGL ligature names** `f_l`→`fl`, `f_i`→`fi`, `f_f_i`→`ffi` (recursive).
+- **`/ToUnicode` CMap** (bfchar/bfrange, UTF-16BE, multi-char), **CID cmap/post**,
+  **named/embedded CMaps**, base encodings (WinAnsi/MacRoman/Standard), digit
+  names. Unmapped codes emit **nothing** (like Adobe), never an invented letter
+  or a control char.
+
+### Added — Coloured text extraction via named colour spaces
+
+`textElements()` now resolves `/Separation`, `/ICCBased`, `/Indexed`, `/DeviceN`
+fill colours (running the tint transform) for text, reusing the rasteriser's
+`NamedColorResolver`. Text painted via `cs`/`sc`/`scn` is no longer reported as
+black `[0,0,0]`.
+
+### Added — Right-to-left (Hebrew/Arabic) logical order
+
+RTL runs extracted in visual order are reordered to logical Unicode order
+(`direction:"rtl"`), guarded against double-reversal via Hebrew final-form
+position. `"רצואה / לארשי תנידמ"` → `"מדינת ישראל / האוצר"`.
+
+### Fixed — AcroForm text-field appearance (`/AP`)
+
+`setTextField()`/`setChoice()` now regenerate the widget's `/AP /N` appearance
+stream (iterating `/Kids` widgets), honouring `/DA` (font size + colour) and
+`/Q` quadding, so filled values render natively and in Adobe.
+
+### Fixed — Split-word run joining
+
+Adjacent runs on a line are joined unless separated by a real horizontal gap
+(`"N om et adresse"` → `"Nom et adresse"`, `"ENFANT S"` → `"ENFANTS"`).
+
 ## [0.58.3] - 2026-06-21
 
 ### Fixed

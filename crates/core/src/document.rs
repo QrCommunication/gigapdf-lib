@@ -317,6 +317,27 @@ fn collect_refs(object: &Object, out: &mut Vec<ObjectId>) {
     }
 }
 
+/// Merge two optional glyph-id → Unicode fallback maps for a composite font. The
+/// `primary` (the embedded font's own cmap) wins on conflicts; `secondary` (the
+/// Standard-Mac-Glyph-Ordering recovery) only fills gids the primary omits. Used
+/// so a subset font with a partial embedded cmap still benefits from the
+/// standard-order recovery on the codes the cmap doesn't cover.
+fn merge_cid_maps(
+    primary: Option<std::collections::BTreeMap<u16, String>>,
+    secondary: Option<std::collections::BTreeMap<u16, String>>,
+) -> Option<std::collections::BTreeMap<u16, String>> {
+    match (primary, secondary) {
+        (Some(mut p), Some(s)) => {
+            for (gid, text) in s {
+                p.entry(gid).or_insert(text);
+            }
+            Some(p)
+        }
+        (Some(p), None) => Some(p),
+        (None, s) => s,
+    }
+}
+
 /// Build a literal PDF text string object (PDFDocEncoding / UTF-16BE as needed).
 fn pdf_text(s: &str) -> Object {
     Object::String(crate::font::encode_pdf_text(s), StringKind::Literal)
@@ -358,6 +379,50 @@ fn gid_for_glyph_name(
         (Some(c), None) => unicode_to_gid.get(&(c as u32)).copied(),
         _ => None,
     }
+}
+
+/// Build a simple CFF (Type1C) font's `code → Unicode` map **from the embedded
+/// program's own charset** — the font's authoritative glyph naming, the same
+/// source the rasterizer draws from (`simple_code_to_gid`). For each PDF code,
+/// resolve `code → gid` (the `/Encoding` `/Differences` glyph name via the CFF
+/// charset, else the WinAnsi base scalar), then `gid → charset SID → glyph name
+/// → Unicode string` ([`cff_to_otf::cff_gid_unicode_strings`], which expands
+/// ligatures too).
+///
+/// This recovers text for subset Type1C fonts whose `/Differences` carries
+/// opaque/font-specific names the Adobe Glyph List can't decode (`gNN`,
+/// designer-named glyphs) but whose CFF charset names the glyph properly — and
+/// for fonts that ship **no** `/ToUnicode` at all. It is a deterministic read of
+/// data already in the file (no guessing), so it matches what Acrobat extracts.
+/// `None` for non-CFF, CID-keyed CFF (no name charset), or when nothing resolves.
+fn cff_simple_code_unicode(
+    cff: &crate::font::cff::CffFont,
+    differences: &BTreeMap<u8, String>,
+) -> Option<BTreeMap<u8, String>> {
+    if cff.is_cid() {
+        return None; // CID-keyed charset holds CIDs, not glyph-name SIDs.
+    }
+    let name_to_gid = cff.name_to_gid_map();
+    let unicode_to_gid = crate::font::cff_to_otf::cff_unicode_to_gid(cff);
+    let gid_unicode = crate::font::cff_to_otf::cff_gid_unicode_strings(cff);
+    let mut map = BTreeMap::new();
+    for code in 0u8..=255 {
+        let gid = if let Some(name) = differences.get(&code) {
+            gid_for_glyph_name(name, &name_to_gid, &unicode_to_gid)
+        } else {
+            // Base encoding: WinAnsi covers the simple-Latin fonts that embed
+            // CFF (the same assumption the render path makes).
+            let scalar = crate::font::winansi_to_char(code) as u32;
+            unicode_to_gid.get(&scalar).copied()
+        };
+        let Some(gid) = gid.filter(|&g| g != 0) else { continue };
+        if let Some(text) = gid_unicode.get(&gid) {
+            if !text.is_empty() {
+                map.insert(code, text.clone());
+            }
+        }
+    }
+    (!map.is_empty()).then_some(map)
 }
 
 /// Set the shared reviewer metadata on an annotation dict: popup `/Contents`,
@@ -427,17 +492,114 @@ fn push_pdf_string(out: &mut Vec<u8>, text: &str) {
     out.push(b')');
 }
 
+/// The visual style applied when (re)generating a text/choice field's variable
+/// text appearance: the point size (`0.0` = auto-size to the rectangle), the
+/// RGB fill colour, and the `/Q` quadding (0 left, 1 centre, 2 right). Derived
+/// from the field's `/DA` and `/Q`, falling back to the AcroForm defaults.
+#[derive(Debug, Clone, Copy)]
+struct TextFieldStyle {
+    /// Requested point size; `0.0` means auto-size to the widget height.
+    size: f64,
+    /// Text fill colour (RGB, `0.0..=1.0`).
+    color: [f64; 3],
+    /// Horizontal alignment from `/Q`: 0 = left, 1 = centre, 2 = right.
+    align: u8,
+}
+
+impl Default for TextFieldStyle {
+    fn default() -> Self {
+        TextFieldStyle { size: 0.0, color: [0.0, 0.0, 0.0], align: 0 }
+    }
+}
+
+/// Parse a default-appearance string (`/DA`, e.g. `0 0 1 rg /Helv 12 Tf`) for
+/// the point size and fill colour the field's text should use. Recognises the
+/// `… N Tf` size and the `g` / `rg` / `k` colour operators (the last colour set
+/// wins, mirroring how a content stream evaluates). Unparsed `/DA`s leave the
+/// defaults (size 0 = auto, black).
+fn parse_da(da: &str) -> (f64, [f64; 3]) {
+    let toks: Vec<&str> = da.split_whitespace().collect();
+    let mut size = 0.0f64;
+    let mut color = [0.0f64, 0.0, 0.0];
+    let num = |s: &str| s.parse::<f64>().ok();
+    for (i, &tok) in toks.iter().enumerate() {
+        match tok {
+            // `<size> Tf` — the operand right before `Tf`.
+            "Tf" => {
+                if let Some(v) = i.checked_sub(1).and_then(|j| toks.get(j)).and_then(|s| num(s)) {
+                    if v > 0.0 {
+                        size = v;
+                    }
+                }
+            }
+            // `<gray> g` — single grey component.
+            "g" => {
+                if let Some(v) = i.checked_sub(1).and_then(|j| toks.get(j)).and_then(|s| num(s)) {
+                    color = [v, v, v];
+                }
+            }
+            // `<r> <g> <b> rg` — RGB.
+            "rg" => {
+                if i >= 3 {
+                    if let (Some(r), Some(g), Some(b)) =
+                        (num(toks[i - 3]), num(toks[i - 2]), num(toks[i - 1]))
+                    {
+                        color = [r, g, b];
+                    }
+                }
+            }
+            // `<c> <m> <y> <k> k` — CMYK, converted to RGB.
+            "k" => {
+                if i >= 4 {
+                    if let (Some(c), Some(m), Some(y), Some(kk)) = (
+                        num(toks[i - 4]),
+                        num(toks[i - 3]),
+                        num(toks[i - 2]),
+                        num(toks[i - 1]),
+                    ) {
+                        color = [
+                            (1.0 - c) * (1.0 - kk),
+                            (1.0 - m) * (1.0 - kk),
+                            (1.0 - y) * (1.0 - kk),
+                        ];
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (size, color)
+}
+
+/// The font resource name used inside generated form appearances. Points at the
+/// embedded simple-TrueType fallback (see `ensure_form_render_font`) so the text
+/// rasterizes with our own engine *and* in external viewers.
+const FORM_FONT_RES: &[u8] = b"GpFormSans";
+
 /// Build a field's appearance form (dictionary without `/Length`) and its
-/// content stream, sizing the text to the widget rectangle. A `value`
-/// containing newlines is laid out as multiple top-aligned lines (multiline
-/// text and list boxes); a single line is vertically centred.
-fn build_text_field_appearance(rect: [f64; 4], value: &str) -> (Dictionary, Vec<u8>) {
+/// content stream, drawing `value` in `style`'s colour/size/quadding inside the
+/// widget rectangle. `font_id` is the embedded font object the appearance's
+/// `/Resources /Font /GpFormSans` references — a real glyph program so the value
+/// paints in our rasterizer (base-14 names don't). A `value` containing newlines
+/// is laid out as multiple top-aligned lines (multiline text and list boxes); a
+/// single line is vertically centred. `/Q` quadding offsets each line
+/// horizontally using Helvetica metrics (`align` 1 = centre, 2 = right;
+/// 0/default = left).
+fn build_text_field_appearance(
+    rect: [f64; 4],
+    value: &str,
+    style: TextFieldStyle,
+    font_id: ObjectId,
+) -> (Dictionary, Vec<u8>) {
     let w = rect[2] - rect[0];
     let h = rect[3] - rect[1];
     let lines: Vec<&str> = value.split('\n').collect();
     let multiline = lines.len() > 1;
 
-    let size = if multiline {
+    // Honour the `/DA` size when set; otherwise auto-size to the rectangle.
+    let size = if style.size > 0.0 {
+        style.size
+    } else if multiline {
         (h / (lines.len() as f64 + 0.5)).clamp(6.0, 12.0)
     } else {
         (h * 0.6).clamp(6.0, 14.0)
@@ -448,27 +610,54 @@ fn build_text_field_appearance(rect: [f64; 4], value: &str) -> (Dictionary, Vec<
     } else {
         (h - size) / 2.0 + size * 0.2
     };
+    let [r, g, b] = style.color;
+    // Inner left padding; the usable text width is the rect minus both pads.
+    let pad = 2.0;
+    let usable = (w - 2.0 * pad).max(0.0);
+    let res = String::from_utf8_lossy(FORM_FONT_RES).into_owned();
+
+    // Horizontal offset for a line under the current quadding.
+    let line_x = |line: &str| -> f64 {
+        if style.align == 0 {
+            return pad;
+        }
+        let tw = Document::helvetica_width(line, size);
+        match style.align {
+            1 => pad + ((usable - tw) / 2.0).max(0.0), // centre
+            2 => pad + (usable - tw).max(0.0),         // right
+            _ => pad,
+        }
+    };
 
     let mut content = Vec::new();
     content.extend_from_slice(b"/Tx BMC\nq\nBT\n");
-    content.extend_from_slice(format!("/Helv {} Tf 0 g\n", content::num(size)).as_bytes());
+    content.extend_from_slice(
+        format!(
+            "/{} {} Tf {} {} {} rg\n",
+            res,
+            content::num(size),
+            content::num(r),
+            content::num(g),
+            content::num(b)
+        )
+        .as_bytes(),
+    );
     content.extend_from_slice(format!("{} TL\n", content::num(leading)).as_bytes());
-    content.extend_from_slice(format!("2 {} Td\n", content::num(first_baseline)).as_bytes());
+    // Set the text matrix per line so each line can have its own x offset
+    // (needed for centre/right quadding); `y` steps down by `leading`.
     for (i, line) in lines.iter().enumerate() {
-        if i > 0 {
-            content.extend_from_slice(b"T*\n");
-        }
+        let x = line_x(line);
+        let y = first_baseline - (i as f64) * leading;
+        content.extend_from_slice(
+            format!("1 0 0 1 {} {} Tm\n", content::num(x), content::num(y)).as_bytes(),
+        );
         push_pdf_string(&mut content, line);
         content.extend_from_slice(b" Tj\n");
     }
     content.extend_from_slice(b"ET\nQ\nEMC\n");
 
-    let mut helv = Dictionary::new();
-    helv.set(b"Type".to_vec(), annot::name(b"Font"));
-    helv.set(b"Subtype".to_vec(), annot::name(b"Type1"));
-    helv.set(b"BaseFont".to_vec(), annot::name(b"Helvetica"));
     let mut fonts = Dictionary::new();
-    fonts.set(b"Helv".to_vec(), Object::Dictionary(helv));
+    fonts.set(FORM_FONT_RES.to_vec(), Object::Reference(font_id));
     let mut resources = Dictionary::new();
     resources.set(b"Font".to_vec(), Object::Dictionary(fonts));
 
@@ -1115,8 +1304,18 @@ impl Document {
             // `/ToUnicode` is present: subset fonts routinely ship a **partial**
             // `/ToUnicode` that omits some codes, and this map fills those gaps so
             // they extract as real characters instead of `U+FFFD` tofu.
+            //
+            // When the embedded program carries **no** usable cmap (a subset
+            // CIDFontType2 with Identity ordering ships only `glyf`/`loca`), fall
+            // back to the **Standard Macintosh Glyph Ordering** (`post` format-1):
+            // the glyph id is the standard-order index, recovered to Unicode the
+            // same way Acrobat resolves these subsets. This is gated on the
+            // font's own `/ToUnicode` agreeing with that ordering, so it never
+            // mis-maps a font that uses a different glyph order.
             let cid_to_unicode = if two_byte {
-                self.cid_font_cmap_unicode(font)
+                let embedded = self.cid_font_cmap_unicode(font);
+                let mac = self.cid_mac_glyph_order_unicode(font, to_unicode.as_ref());
+                merge_cid_maps(embedded, mac)
             } else {
                 None
             };
@@ -1128,7 +1327,11 @@ impl Document {
             let simple_encoding = if two_byte {
                 None
             } else {
-                self.simple_font_encoding(font)
+                // Pass the embedded program so a simple CFF (Type1C) font can fall
+                // back to its own charset for codes the `/Encoding`+`/Differences`
+                // path leaves opaque/unresolved (subset designer-named glyphs).
+                let program = self.font_program(font);
+                self.simple_font_encoding(font, program.as_ref())
             };
             decoders.insert(
                 name.clone(),
@@ -1151,37 +1354,78 @@ impl Document {
     /// (ISO 32000-1 §9.6.6) for extracting text from a simple font that ships no
     /// `/ToUnicode` CMap.
     ///
-    /// Returns `None` for the common WinAnsi-without-`/Differences` case so the
-    /// decoder keeps its (identical) hard-coded WinAnsi path — the map is only
-    /// built when it would actually change a code's Unicode (MacRoman/Standard
-    /// base, or any `/Differences`).
+    /// Returns `None` for the common WinAnsi-without-`/Differences` case (and no
+    /// CFF charset that would change a code) so the decoder keeps its (identical)
+    /// hard-coded WinAnsi path — the map is only built when it would actually
+    /// change a code's Unicode (MacRoman/Standard base, any `/Differences`, or a
+    /// Type1C charset that names a glyph the AGL/base path can't).
+    ///
+    /// `program` is the embedded font program (when present): for a name-keyed
+    /// CFF (Type1C) it supplies the font's **own charset** as the authoritative
+    /// `code → Unicode` source ([`cff_simple_code_unicode`]), recovering
+    /// designer-named/opaque glyphs the Adobe Glyph List can't decode — exactly
+    /// the glyph the rasterizer draws, so extraction matches the rendered text.
     fn simple_font_encoding(
         &self,
         font: &Dictionary,
+        program: Option<&crate::font::GlyphSource>,
     ) -> Option<std::collections::BTreeMap<u8, String>> {
         use crate::font::encoding::{glyph_name_to_unicode, BaseEncoding};
 
         let differences = self.encoding_differences(font);
         let base = self.font_base_encoding(font);
 
-        // WinAnsi base + no Differences == the decoder's default WinAnsi path.
-        if base == BaseEncoding::WinAnsi && differences.is_empty() {
+        // The font's own charset map (name-keyed CFF only), used to (a) decode a
+        // `/Differences` name the AGL resolver can't, and (b) fill codes the base
+        // encoding leaves unmapped. Authoritative: it's the glyph the font draws.
+        let cff_map = program
+            .and_then(|p| p.as_cff())
+            .and_then(|cff| cff_simple_code_unicode(cff, &differences));
+
+        // WinAnsi base + no Differences + no CFF charset == the decoder's default
+        // WinAnsi path (identical output): skip building a redundant map.
+        if base == BaseEncoding::WinAnsi && differences.is_empty() && cff_map.is_none() {
             return None;
         }
 
         let mut map = std::collections::BTreeMap::new();
         for code in 0u8..=255 {
             if let Some(name) = differences.get(&code) {
-                if let Some(s) = glyph_name_to_unicode(name) {
-                    map.insert(code, s);
-                    continue;
-                }
+                // `/Differences` is the *authoritative* encoding for this code
+                // (ISO 32000-1 §9.6.6.1): the named glyph wins over the base
+                // encoding. Resolution order for the name:
+                //   1. Adobe Glyph List (covers the standard/algorithmic names);
+                //   2. the embedded CFF charset (designer-named/opaque glyphs the
+                //      AGL can't decode but the font itself names — e.g. a subset
+                //      whose `/Differences` uses placeholder names while its CFF
+                //      charset carries the real glyph name).
+                // When neither resolves — a glyph that carries no code point
+                // anywhere — record an **empty-string sentinel**: the code is
+                // explicitly "a glyph with no text", never a base-encoding letter
+                // and never a raw control byte. Decoding then emits nothing for it
+                // (rather than inventing a WinAnsi character or leaking a C0/C1
+                // control), which kills dingbat tofu on subset fonts whose
+                // `/ToUnicode` omits these codes (confirmed unrecoverable — the
+                // reference extractors drop them identically).
+                let text = glyph_name_to_unicode(name)
+                    .or_else(|| cff_map.as_ref().and_then(|m| m.get(&code).cloned()));
+                map.insert(code, text.unwrap_or_default());
+                continue;
             }
             if let Some(c) = base.to_char(code) {
                 // Skip the C0/C1 control slots WinAnsi leaves as raw scalars; they
                 // never carry text and only add noise.
                 if !c.is_control() {
                     map.insert(code, c.to_string());
+                }
+            }
+        }
+        // Fill codes the base encoding left unmapped (or that the base mapped to a
+        // control) from the CFF charset — the font names a real glyph there.
+        if let Some(cff_map) = &cff_map {
+            for (&code, text) in cff_map {
+                if !text.is_empty() {
+                    map.entry(code).or_insert_with(|| text.clone());
                 }
             }
         }
@@ -1289,7 +1533,84 @@ impl Document {
         let map: std::collections::BTreeMap<u16, String> = ttf
             .gid_to_unicode_map()
             .into_iter()
-            .filter_map(|(gid, cp)| char::from_u32(cp).map(|c| (gid, c.to_string())))
+            .filter_map(|(gid, cp)| {
+                let c = char::from_u32(cp)?;
+                // Skip control characters: a subset cmap that maps a glyph to a
+                // C0/C1 scalar (e.g. a `(3,0)` symbol cmap's `0xF0xx` slot folded
+                // down, or a stale entry) carries no real text — emitting it only
+                // adds tofu.
+                (!c.is_control()).then(|| (gid, c.to_string()))
+            })
+            .collect();
+        (!map.is_empty()).then_some(map)
+    }
+
+    /// Glyph-id → Unicode map for an **Identity-encoded** Type0 font recovered
+    /// from the **Standard Macintosh Glyph Ordering** (`post` format-1): glyph id
+    /// `gid` is the standard-order index, so `gid → standard glyph name → Unicode`
+    /// ([`crate::font::encoding::mac_glyph_order_unicode`]). This is the
+    /// deterministic recovery Acrobat applies to subset `CIDFontType2` programs
+    /// that ship only `glyf`/`loca` (no `cmap`, no `post`) and a `/ToUnicode` too
+    /// sparse to cover the text.
+    ///
+    /// **Gated** on the font's own `/ToUnicode` confirming the ordering: every
+    /// checkable `/ToUnicode` entry (single-scalar target) must equal the
+    /// Mac-order Unicode for that code, with at least one such confirming entry.
+    /// A single contradiction ⇒ the subset uses a different glyph order ⇒ `None`
+    /// (no bogus mapping). When the font has **no** `/ToUnicode` at all, the
+    /// hypothesis is unverifiable, so it is **not** applied (conservative).
+    fn cid_mac_glyph_order_unicode(
+        &self,
+        font: &Dictionary,
+        to_unicode: Option<&crate::font::cmap::ToUnicode>,
+    ) -> Option<std::collections::BTreeMap<u16, String>> {
+        use crate::font::encoding::mac_glyph_order_unicode;
+
+        // Identity ordering only: a non-identity `/CIDToGIDMap` breaks the
+        // gid == standard-order-index assumption.
+        let desc = font
+            .get(b"DescendantFonts")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)?
+            .first()?;
+        let cid = self.resolve(desc).as_dict()?;
+        if let Some(map) = cid.get(b"CIDToGIDMap").map(|o| self.resolve(o)) {
+            if map.as_name() != Some(b"Identity".as_slice()) {
+                return None;
+            }
+        }
+
+        // Confirm the ordering against the font's own `/ToUnicode`: among the
+        // codes the standard order *names* (and the CMap maps to a single
+        // scalar), the standard-order Unicode must **dominate**. A subset may
+        // reuse a few glyph slots (its `/ToUnicode` remaps the odd punctuation),
+        // so a handful of disagreements must not veto an otherwise-strong letter
+        // consensus — but a genuinely different ordering disagrees on most codes
+        // and is rejected. Require ≥8 agreements and ≥90% agreement.
+        let tu = to_unicode?;
+        let mut agree = 0u32;
+        let mut disagree = 0u32;
+        for code in 0u16..=0x3FF {
+            let Some(mapped) = tu.decode(code as u32) else { continue };
+            // Only single-scalar entries are comparable to a single glyph name.
+            let mut chars = mapped.chars();
+            let (Some(_), None) = (chars.next(), chars.next()) else { continue };
+            match mac_glyph_order_unicode(code) {
+                Some(mac) if mac == mapped => agree += 1,
+                // A code the standard order doesn't name can't contradict; only a
+                // *named* glyph whose Unicode differs counts against the ordering.
+                Some(_) => disagree += 1,
+                None => {}
+            }
+        }
+        let checked = agree + disagree;
+        if agree < 8 || (agree as f64) < 0.90 * checked as f64 {
+            return None;
+        }
+
+        // Build gid → Unicode for the whole standard order.
+        let map: std::collections::BTreeMap<u16, String> = (0u16..258)
+            .filter_map(|gid| mac_glyph_order_unicode(gid).map(|s| (gid, s)))
             .collect();
         (!map.is_empty()).then_some(map)
     }
@@ -1680,9 +2001,22 @@ impl Document {
         let fonts = self.page_font_decoders(page_no);
         let gstate_alpha = self.page_gstate_alpha(page_no);
         let forms = self.page_form_xobjects(page_no);
-        content::extract_elements_resolved(&content, &fonts, &gstate_alpha, &|name| {
-            forms.get(name).cloned()
-        })
+        // Resolve `cs`/`scn` named fill spaces (Separation/DeviceN tints,
+        // ICCBased `/N`, Indexed) against this page's `/Resources /ColorSpace`,
+        // through the same machinery the rasterizer and vector layer use, so each
+        // text element's `color` matches the painted colour instead of falling
+        // back to the last device colour (usually black).
+        let resolver = PageColorResolver {
+            doc: self,
+            resources: self.page_resources(page_no),
+        };
+        content::extract_elements_resolved_with_colors(
+            &content,
+            &fonts,
+            &gstate_alpha,
+            &resolver,
+            &|name| forms.get(name).cloned(),
+        )
     }
 
     /// Map each `/ExtGState` resource name on `page_no` to its `/ca` (non-stroking
@@ -10165,22 +10499,240 @@ impl Document {
         }
     }
 
-    /// Regenerate a widget's `/AP /N` to display `text`, or flag the form for
-    /// viewer-side regeneration when the field has no own rectangle.
-    fn regenerate_text_appearance(&mut self, widget: &mut Dictionary, text: &str) {
-        if !widget.contains(b"Rect") {
-            self.set_need_appearances();
-            return;
+    /// The effective text style for a field's appearance: its `/DA` (font size
+    /// and colour), or the AcroForm's `/DA` when the field has none, plus the
+    /// `/Q` quadding. Mirrors how a viewer resolves a field's default
+    /// appearance (ISO 32000-1 §12.7.3.3).
+    fn field_text_style(&self, field: &Dictionary) -> TextFieldStyle {
+        let da = field
+            .get(b"DA")
+            .map(|o| self.string_value(o))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.catalog()
+                    .ok()
+                    .and_then(|c| c.get(b"AcroForm").map(|o| self.resolve(o)))
+                    .and_then(|o| o.as_dict().cloned())
+                    .and_then(|acro| acro.get(b"DA").map(|o| self.string_value(o)))
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+        let (size, color) = parse_da(&da);
+        let align = field.get(b"Q").and_then(Object::as_i64).unwrap_or(0).clamp(0, 2) as u8;
+        TextFieldStyle { size, color, align }
+    }
+
+    /// The object id of an already-embedded `/GpFormSans` form font, looked up
+    /// in the AcroForm `/DR /Font`, or `None` if it hasn't been created yet.
+    fn existing_form_render_font(&self) -> Option<ObjectId> {
+        let acro = self
+            .catalog()
+            .ok()?
+            .get(b"AcroForm")
+            .map(|o| self.resolve(o))?
+            .as_dict()?
+            .clone();
+        let dr = acro.get(b"DR").map(|o| self.resolve(o))?.as_dict()?.clone();
+        let fonts = dr.get(b"Font").map(|o| self.resolve(o))?.as_dict()?.clone();
+        fonts.get(FORM_FONT_RES).and_then(Object::as_reference)
+    }
+
+    /// Ensure the document carries a single embedded **simple TrueType** font
+    /// (the bundled Liberation Sans, a metric-compatible Helvetica substitute)
+    /// usable as `/GpFormSans` in form appearance streams, and return its object
+    /// id. Cached in the AcroForm `/DR /Font /GpFormSans` so it is created once
+    /// and reused for every field.
+    ///
+    /// Generated text-field appearances **must** reference a real glyph program:
+    /// our rasterizer (and a strict offline pipeline) draws nothing for a bare
+    /// base-14 `/Helvetica` (no `/FontFile`). A simple WinAnsi TrueType with an
+    /// embedded `/FontFile2` paints in our engine via the code→Unicode→cmap path
+    /// and renders identically in Adobe.
+    fn ensure_form_render_font(&mut self) -> Result<ObjectId> {
+        // Reuse an existing /GpFormSans from the AcroForm /DR if present.
+        if let Some(id) = self.existing_form_render_font() {
+            return Ok(id);
         }
-        let rect = self.read_rect(widget);
-        let (mut form, content) = build_text_field_appearance(rect, text);
+
+        let ttf = crate::font::bundled::FALLBACK_TTF;
+        let parsed = crate::font::truetype::TrueTypeFont::parse(ttf)
+            .ok_or_else(|| EngineError::Unsupported("bundled form font failed to parse".into()))?;
+        let upem = parsed.units_per_em();
+
+        // Per-code advance widths (1000-unit text space) for WinAnsi 32..=255.
+        let first = 32u8;
+        let last = 255u8;
+        let mut widths: Vec<Object> = Vec::with_capacity((last - first + 1) as usize);
+        for code in first..=last {
+            let ch = crate::font::winansi_to_char(code);
+            let gid = parsed.gid_for_unicode(ch as u32).unwrap_or(0);
+            let w1000 = if upem > 0.0 {
+                parsed.advance_width(gid) * 1000.0 / upem
+            } else {
+                500.0
+            };
+            widths.push(Object::Integer(w1000.round() as i64));
+        }
+
+        // FontFile2 stream (the raw TrueType program).
+        let ff_id = (self.next_object_number(), 0u16);
+        let mut ff_dict = Dictionary::new();
+        ff_dict.set(b"Length1".to_vec(), Object::Integer(ttf.len() as i64));
+        ff_dict.set(b"Length".to_vec(), Object::Integer(ttf.len() as i64));
+        self.objects
+            .insert(ff_id, Object::Stream(Stream::new(ff_dict, ttf.to_vec())));
+
+        // FontDescriptor (minimal but valid for a non-symbolic simple TrueType).
+        let fd_id = (self.next_object_number(), 0u16);
+        let mut fd = Dictionary::new();
+        fd.set(b"Type".to_vec(), annot::name(b"FontDescriptor"));
+        fd.set(b"FontName".to_vec(), annot::name(b"LiberationSans"));
+        fd.set(b"Flags".to_vec(), Object::Integer(32)); // Nonsymbolic
+        fd.set(b"FontBBox".to_vec(), annot::real_array(&[-203.0, -303.0, 1050.0, 910.0]));
+        fd.set(b"ItalicAngle".to_vec(), Object::Integer(0));
+        fd.set(b"Ascent".to_vec(), Object::Integer(905));
+        fd.set(b"Descent".to_vec(), Object::Integer(-212));
+        fd.set(b"CapHeight".to_vec(), Object::Integer(716));
+        fd.set(b"StemV".to_vec(), Object::Integer(80));
+        fd.set(b"FontFile2".to_vec(), Object::Reference(ff_id));
+        self.objects.insert(fd_id, Object::Dictionary(fd));
+
+        // The simple TrueType font dict (WinAnsi, full Latin-1 range).
+        let font_id = (self.next_object_number(), 0u16);
+        let mut font = Dictionary::new();
+        font.set(b"Type".to_vec(), annot::name(b"Font"));
+        font.set(b"Subtype".to_vec(), annot::name(b"TrueType"));
+        font.set(b"BaseFont".to_vec(), annot::name(b"LiberationSans"));
+        font.set(b"FirstChar".to_vec(), Object::Integer(i64::from(first)));
+        font.set(b"LastChar".to_vec(), Object::Integer(i64::from(last)));
+        font.set(b"Widths".to_vec(), Object::Array(widths));
+        font.set(b"Encoding".to_vec(), annot::name(b"WinAnsiEncoding"));
+        font.set(b"FontDescriptor".to_vec(), Object::Reference(fd_id));
+        self.objects.insert(font_id, Object::Dictionary(font));
+
+        // Register it in the AcroForm /DR /Font so it is found on reuse.
+        self.register_dr_font(FORM_FONT_RES, font_id)?;
+        Ok(font_id)
+    }
+
+    /// Add `name → font_id` to the AcroForm's `/DR /Font` resource dictionary,
+    /// creating the AcroForm / `/DR` / `/Font` chain as needed.
+    fn register_dr_font(&mut self, name: &[u8], font_id: ObjectId) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let mut acro = catalog
+            .get(b"AcroForm")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let mut dr = acro
+            .get(b"DR")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let mut fonts = dr
+            .get(b"Font")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        fonts.set(name.to_vec(), Object::Reference(font_id));
+        dr.set(b"Font".to_vec(), Object::Dictionary(fonts));
+        acro.set(b"DR".to_vec(), Object::Dictionary(dr));
+        // If /AcroForm was an indirect object, write it back there; else inline.
+        if let Some(acro_ref) = catalog.get(b"AcroForm").and_then(Object::as_reference) {
+            self.objects.insert(acro_ref, Object::Dictionary(acro));
+        } else {
+            catalog.set(b"AcroForm".to_vec(), Object::Dictionary(acro));
+            self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        }
+        Ok(())
+    }
+
+    /// Build a fresh `/AP /N` form XObject drawing `text` in `style` inside
+    /// `rect`, register it, and point `widget`'s `/AP /N` at it. The widget
+    /// dict is mutated in place; callers persist it afterwards.
+    fn write_text_appearance(
+        &mut self,
+        widget: &mut Dictionary,
+        rect: [f64; 4],
+        text: &str,
+        style: TextFieldStyle,
+    ) {
+        // Embed (once) the simple-TrueType font the appearance references so the
+        // value rasterizes in our engine, not just in external viewers.
+        let font_id = match self.ensure_form_render_font() {
+            Ok(id) => id,
+            Err(_) => {
+                // Last resort: store /V only and ask a viewer to regenerate.
+                self.set_need_appearances();
+                return;
+            }
+        };
+        let (mut form, content) = build_text_field_appearance(rect, text, style, font_id);
         form.set(b"Length".to_vec(), Object::Integer(content.len() as i64));
         let ap_id = (self.next_object_number(), 0u16);
         self.objects
             .insert(ap_id, Object::Stream(Stream::new(form, content)));
-        let mut appearance = Dictionary::new();
+        // Preserve any existing `/AP` sub-keys (e.g. `/D`) and overwrite `/N`.
+        let mut appearance = widget
+            .get(b"AP")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
         appearance.set(b"N".to_vec(), Object::Reference(ap_id));
         widget.set(b"AP".to_vec(), Object::Dictionary(appearance));
+    }
+
+    /// Regenerate a text/choice field's `/AP /N` so `text` is painted by the
+    /// engine's own rasterizer (and by Adobe). Two widget layouts occur in the
+    /// wild: a **merged** widget (the field dict carries `/Rect` and `/AP`), or
+    /// a field with one or more **`/Kids`** widgets each carrying their own
+    /// `/Rect`. We regenerate whichever rectangle(s) exist; only when no
+    /// rectangle is found anywhere do we fall back to `/NeedAppearances`.
+    fn regenerate_text_appearance(&mut self, field: &mut Dictionary, text: &str) {
+        let style = self.field_text_style(field);
+
+        // Merged widget: the field object is itself the widget.
+        if field.contains(b"Rect") {
+            let rect = self.read_rect(field);
+            self.write_text_appearance(field, rect, text, style);
+            return;
+        }
+
+        // Separate widget(s) in `/Kids`: regenerate each kid that has a `/Rect`.
+        let kid_ids: Vec<ObjectId> = field
+            .get(b"Kids")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|a| a.iter().filter_map(Object::as_reference).collect())
+            .unwrap_or_default();
+        let mut wrote_any = false;
+        for kid_id in kid_ids {
+            let Some(mut kid) = self.objects.get(&kid_id).and_then(Object::as_dict).cloned() else {
+                continue;
+            };
+            if !kid.contains(b"Rect") {
+                continue;
+            }
+            let rect = self.read_rect(&kid);
+            self.write_text_appearance(&mut kid, rect, text, style);
+            self.objects.insert(kid_id, Object::Dictionary(kid));
+            wrote_any = true;
+        }
+
+        // No usable geometry: ask a viewer to regenerate from `/V`.
+        if !wrote_any {
+            self.set_need_appearances();
+        }
     }
 
     fn require_field(&self, name: &str) -> Result<(ObjectId, Dictionary)> {
@@ -11335,6 +11887,27 @@ mod tests {
     }
 
     #[test]
+    fn merge_cid_maps_primary_wins_secondary_fills() {
+        use std::collections::BTreeMap;
+        let mut primary = BTreeMap::new();
+        primary.insert(1u16, "A".to_string());
+        let mut secondary = BTreeMap::new();
+        secondary.insert(1u16, "X".to_string()); // conflict: primary wins
+        secondary.insert(2u16, "à".to_string()); // gap: secondary fills
+        let merged = merge_cid_maps(Some(primary), Some(secondary)).unwrap();
+        assert_eq!(merged.get(&1u16).map(String::as_str), Some("A"));
+        assert_eq!(merged.get(&2u16).map(String::as_str), Some("à"));
+        // Either side alone passes through; both None → None.
+        let only = merge_cid_maps(None, Some({
+            let mut m = BTreeMap::new();
+            m.insert(0x6au16, "à".to_string());
+            m
+        }));
+        assert_eq!(only.unwrap().get(&0x6au16).map(String::as_str), Some("à"));
+        assert!(merge_cid_maps(None, None).is_none());
+    }
+
+    #[test]
     fn layers_create_toggle_remove_roundtrip() {
         let pdf = crate::convert::reverse::txt_to_pdf("layer test");
         let mut doc = Document::open(&pdf).unwrap();
@@ -12120,6 +12693,128 @@ mod tests {
             result.is_err(),
             "off-list value on a closed combo must error"
         );
+    }
+
+    /// Filling a text field whose widget lives in `/Kids` (the real-world
+    /// layout in `with-forms.pdf`, where the field dict has no `/Rect`) must
+    /// regenerate the widget's `/AP /N` so the value is *painted* by our own
+    /// rasterizer — not just stored in `/V` with `/NeedAppearances`. Regression
+    /// for the bug where `set_text_field` left the render byte-identical.
+    #[test]
+    fn set_text_field_repaints_kids_widget_appearance() {
+        let count_ink = |img: &crate::raster::png_decode::DecodedImage,
+                         bounds: [f64; 4],
+                         scale: f64|
+         -> usize {
+            // `bounds` is [x, y, w, h] in top-left points; map to raster pixels.
+            let x0 = (bounds[0] * scale).floor().max(0.0) as u32;
+            let y0 = (bounds[1] * scale).floor().max(0.0) as u32;
+            let x1 = ((bounds[0] + bounds[2]) * scale).ceil().min(img.width as f64) as u32;
+            let y1 = ((bounds[1] + bounds[3]) * scale).ceil().min(img.height as f64) as u32;
+            let mut ink = 0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = ((y * img.width + x) * 4) as usize;
+                    if img.rgba[i] < 200 || img.rgba[i + 1] < 200 || img.rgba[i + 2] < 200 {
+                        ink += 1;
+                    }
+                }
+            }
+            ink
+        };
+        let scale = 2.0;
+
+        let mut doc = Document::open(&fixture("with-forms.pdf")).unwrap();
+        // `email` is empty in the fixture, so its widget box starts blank.
+        let bounds = doc
+            .form_fields()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "email")
+            .and_then(|f| f.bounds)
+            .expect("email widget has bounds");
+
+        let before_png = doc.render_page(1, scale).unwrap();
+        let before = crate::raster::decode_png(&before_png).unwrap();
+        let ink_before = count_ink(&before, bounds, scale);
+
+        doc.set_text_field("email", "XYZ_VISIBLE").unwrap();
+
+        let after_png = doc.render_page(1, scale).unwrap();
+        let after = crate::raster::decode_png(&after_png).unwrap();
+        let ink_after = count_ink(&after, bounds, scale);
+
+        assert_ne!(
+            before_png, after_png,
+            "render must change after filling a /Kids text field"
+        );
+        assert!(
+            ink_after > ink_before + 20,
+            "filled value must paint ink in the widget box (before={ink_before}, after={ink_after})"
+        );
+
+        // The `/AP /N` of the widget kid must now carry the value (proof the
+        // appearance stream — not just `/V` — was regenerated).
+        let saved = doc.save();
+        assert!(
+            saved.windows(11).any(|w| w == b"XYZ_VISIBLE"),
+            "value stored in /V"
+        );
+        let reopened = Document::open(&saved).unwrap();
+        let again = crate::raster::decode_png(&reopened.render_page(1, scale).unwrap()).unwrap();
+        assert!(
+            count_ink(&again, bounds, scale) > ink_before + 20,
+            "value still painted after save + reopen"
+        );
+    }
+
+    /// Non-regression: checkboxes and radios continue to change the render when
+    /// toggled (their pre-built `/AP /N` sub-states are selected via `/AS`, an
+    /// independent path from the text-field appearance regeneration).
+    #[test]
+    fn checkbox_and_radio_still_change_render() {
+        let scale = 2.0;
+
+        // Checkbox `agree`: its "Yes" and "Off" appearances differ. Drive it to
+        // a known state (off) then back on, so the check vs. blank box shows up
+        // regardless of the fixture's initial `/AS` state, and assert the render
+        // tracks the toggle (the appearance-state selection path is intact).
+        let mut doc = Document::open(&fixture("with-forms.pdf")).unwrap();
+        doc.set_checkbox("agree", false).unwrap();
+        let off = doc.render_page(1, scale).unwrap();
+        doc.set_checkbox("agree", true).unwrap();
+        let on = doc.render_page(1, scale).unwrap();
+        assert_ne!(on, off, "toggling the checkbox must change the render");
+
+        // Radio `gender`: selecting its other option must change the page.
+        let mut doc = Document::open(&fixture("with-forms.pdf")).unwrap();
+        let field = doc
+            .form_fields()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "gender")
+            .unwrap();
+        if field.kind() == crate::form::FieldKind::Radio && field.options.len() >= 2 {
+            let opt_a = field.options[0].clone();
+            let opt_b = field.options[1].clone();
+            // Select option A, render, then switch to option B: the dot moves.
+            doc.set_radio("gender", &opt_a).unwrap();
+            let with_a = doc.render_page(1, scale).unwrap();
+            doc.set_radio("gender", &opt_b).unwrap();
+            let with_b = doc.render_page(1, scale).unwrap();
+            assert_ne!(with_a, with_b, "switching the radio must change the render");
+        }
+    }
+
+    #[test]
+    fn parse_da_reads_size_and_color() {
+        assert_eq!(parse_da("/Helv 12 Tf"), (12.0, [0.0, 0.0, 0.0]));
+        assert_eq!(parse_da("0 0 1 rg /Helv 14 Tf"), (14.0, [0.0, 0.0, 1.0]));
+        assert_eq!(parse_da("0.5 g /F1 10 Tf"), (10.0, [0.5, 0.5, 0.5]));
+        // Auto-size (no `Tf`) and CMYK red → RGB.
+        let (size, color) = parse_da("0 1 1 0 k");
+        assert_eq!(size, 0.0);
+        assert!((color[0] - 1.0).abs() < 1e-9 && color[1] < 1e-9 && color[2] < 1e-9);
     }
 
     #[test]

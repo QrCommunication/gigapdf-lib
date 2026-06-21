@@ -186,8 +186,79 @@ pub fn glyph_name_to_unicode(raw: &str) -> Option<String> {
     if let Some(&cp) = AGL_NAMES.iter().find(|&&(n, _)| n == name).map(|(_, cp)| cp) {
         return char::from_u32(cp as u32).map(|c| c.to_string());
     }
+    // Subset-font glyph placeholder name `gNN` (e.g. `g49`): the producer named
+    // the glyph by its index in the **Standard Macintosh Glyph Ordering** (the
+    // 258-name list from the TrueType/OpenType `post` format-1 spec). This is the
+    // deterministic convention Acrobat itself uses to recover such names — map
+    // `gNN` → the standard glyph name at index `NN` → Unicode. (Mac OS, the
+    // common Times-New-Roman subsetter, emits these `gNN` `/Differences` names.)
+    if let Some(real) = glyph_index_name(name) {
+        if real != name {
+            return glyph_name_to_unicode(real);
+        }
+    }
     super::cff_to_otf::glyph_name_to_unicode_string(name)
 }
+
+/// Resolve a subset placeholder glyph name `gNN` to the Standard Macintosh Glyph
+/// Ordering name at index `NN` (TrueType/OpenType `post` format-1, the 258 names
+/// in `MAC_GLYPH_ORDER`). Returns `None` for any other name shape, or when the
+/// index is out of range. The `g` must be followed only by ASCII digits, so real
+/// AGL names that merely start with `g` (`grave`, `guillemotleft`, …) are not
+/// misread.
+pub fn glyph_index_name(name: &str) -> Option<&'static str> {
+    let digits = name.strip_prefix('g')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let idx: usize = digits.parse().ok()?;
+    MAC_GLYPH_ORDER.get(idx).copied()
+}
+
+/// Unicode string for glyph id `gid` under the Standard Macintosh Glyph Ordering
+/// (`post` format-1). Used as a **last-resort** recovery for Identity-encoded
+/// subset fonts whose glyph ids follow that standard order but which ship no
+/// usable `/ToUnicode`, `cmap`, or `post` name table. `None` when the gid is out
+/// of range or its standard name carries no code point.
+pub fn mac_glyph_order_unicode(gid: u16) -> Option<String> {
+    let name = MAC_GLYPH_ORDER.get(gid as usize).copied()?;
+    glyph_name_to_unicode(name)
+}
+
+/// The Standard Macintosh Glyph Ordering (Apple TrueType `post` table format 1 /
+/// OpenType spec): the 258 standard glyph names, in the canonical order a
+/// `post` format-1 table and Mac-style subsetters assign. Index = glyph id.
+const MAC_GLYPH_ORDER: [&str; 258] = [
+    ".notdef", ".null", "nonmarkingreturn", "space", "exclam", "quotedbl", "numbersign", "dollar",
+    "percent", "ampersand", "quotesingle", "parenleft", "parenright", "asterisk", "plus", "comma",
+    "hyphen", "period", "slash", "zero", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine", "colon", "semicolon", "less", "equal", "greater", "question", "at", "A", "B",
+    "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U",
+    "V", "W", "X", "Y", "Z", "bracketleft", "backslash", "bracketright", "asciicircum", "underscore",
+    "grave", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+    "r", "s", "t", "u", "v", "w", "x", "y", "z", "braceleft", "bar", "braceright", "asciitilde",
+    "Adieresis", "Aring", "Ccedilla", "Eacute", "Ntilde", "Odieresis", "Udieresis", "aacute",
+    "agrave", "acircumflex", "adieresis", "atilde", "aring", "ccedilla", "eacute", "egrave",
+    "ecircumflex", "edieresis", "iacute", "igrave", "icircumflex", "idieresis", "ntilde", "oacute",
+    "ograve", "ocircumflex", "odieresis", "otilde", "uacute", "ugrave", "ucircumflex", "udieresis",
+    "dagger", "degree", "cent", "sterling", "section", "bullet", "paragraph", "germandbls",
+    "registered", "copyright", "trademark", "acute", "dieresis", "notequal", "AE", "Oslash",
+    "infinity", "plusminus", "lessequal", "greaterequal", "yen", "mu", "partialdiff", "summation",
+    "product", "pi", "integral", "ordfeminine", "ordmasculine", "Omega", "ae", "oslash",
+    "questiondown", "exclamdown", "logicalnot", "radical", "florin", "approxequal", "Delta",
+    "guillemotleft", "guillemotright", "ellipsis", "nonbreakingspace", "Agrave", "Atilde", "Otilde",
+    "OE", "oe", "endash", "emdash", "quotedblleft", "quotedblright", "quoteleft", "quoteright",
+    "divide", "lozenge", "ydieresis", "Ydieresis", "fraction", "currency", "guilsinglleft",
+    "guilsinglright", "fi", "fl", "daggerdbl", "periodcentered", "quotesinglbase", "quotedblbase",
+    "perthousand", "Acircumflex", "Ecircumflex", "Aacute", "Edieresis", "Egrave", "Iacute",
+    "Icircumflex", "Idieresis", "Igrave", "Oacute", "Ocircumflex", "apple", "Ograve", "Uacute",
+    "Ucircumflex", "Ugrave", "dotlessi", "circumflex", "tilde", "macron", "breve", "dotaccent",
+    "ring", "cedilla", "hungarumlaut", "ogonek", "caron", "Lslash", "lslash", "Scaron", "scaron",
+    "Zcaron", "zcaron", "brokenbar", "Eth", "eth", "Yacute", "yacute", "Thorn", "thorn", "minus",
+    "multiply", "onesuperior", "twosuperior", "threesuperior", "onehalf", "onequarter",
+    "threequarters", "franc", "Gbreve", "gbreve", "Idotaccent", "Scedilla", "scedilla", "Cacute",
+    "cacute", "Ccaron", "ccaron", "dcroat",
+];
 
 /// Adobe glyph-name → Unicode for the named glyphs of the standard Latin
 /// encodings (WinAnsi/MacRoman/Standard) — the slice of the Adobe Glyph List a
@@ -212,6 +283,18 @@ const AGL_NAMES: &[(&str, u16)] = &[
     ("hyphen", 0x002D),
     ("period", 0x002E),
     ("slash", 0x002F),
+    // Digit glyph names (AGL): needed so the Standard-Mac-Glyph-Ordering recovery
+    // resolves `g19`..`g28` (zero..nine) — e.g. the "1" of "VOLET 1" (g20).
+    ("zero", 0x0030),
+    ("one", 0x0031),
+    ("two", 0x0032),
+    ("three", 0x0033),
+    ("four", 0x0034),
+    ("five", 0x0035),
+    ("six", 0x0036),
+    ("seven", 0x0037),
+    ("eight", 0x0038),
+    ("nine", 0x0039),
     ("colon", 0x003A),
     ("semicolon", 0x003B),
     ("less", 0x003C),
@@ -402,6 +485,39 @@ mod tests {
         assert_eq!(glyph_name_to_unicode("ABCDEF+agrave.sc").as_deref(), Some("à"));
         // Unknown stylistic name → None.
         assert_eq!(glyph_name_to_unicode("foobar"), None);
+    }
+
+    #[test]
+    fn subset_gnn_names_resolve_via_mac_glyph_order() {
+        // `gNN` = index in the Standard Macintosh Glyph Ordering. These are the
+        // exact placeholder names Mac-subset Times-New-Roman uses, and the codes
+        // that drove the s3705 "Numéro/Adresse/VOLET 1" recovery.
+        assert_eq!(glyph_name_to_unicode("g49").as_deref(), Some("N"));
+        assert_eq!(glyph_name_to_unicode("g36").as_deref(), Some("A"));
+        assert_eq!(glyph_name_to_unicode("g57").as_deref(), Some("V"));
+        assert_eq!(glyph_name_to_unicode("g50").as_deref(), Some("O"));
+        assert_eq!(glyph_name_to_unicode("g47").as_deref(), Some("L"));
+        assert_eq!(glyph_name_to_unicode("g3").as_deref(), Some(" ")); // space
+        assert_eq!(glyph_name_to_unicode("g20").as_deref(), Some("1")); // one
+        assert_eq!(glyph_name_to_unicode("g106").as_deref(), Some("à")); // agrave
+        // A real AGL name that merely starts with `g` must NOT be misread as `gNN`.
+        assert_eq!(glyph_name_to_unicode("grave").as_deref(), Some("`"));
+        assert_eq!(glyph_name_to_unicode("guillemotleft").as_deref(), Some("«"));
+        // Out-of-range index → not in the 258-name table → None (no panic).
+        assert_eq!(glyph_name_to_unicode("g9999"), None);
+        // `g` with no digits / non-numeric tail is not an index name.
+        assert_eq!(glyph_index_name("g"), None);
+        assert_eq!(glyph_index_name("g1a"), None);
+    }
+
+    #[test]
+    fn mac_glyph_order_unicode_recovers_letters_and_accents() {
+        assert_eq!(mac_glyph_order_unicode(49).as_deref(), Some("N"));
+        assert_eq!(mac_glyph_order_unicode(50).as_deref(), Some("O"));
+        assert_eq!(mac_glyph_order_unicode(0x6a).as_deref(), Some("à")); // 106
+        assert_eq!(mac_glyph_order_unicode(112).as_deref(), Some("é")); // eacute
+        assert_eq!(mac_glyph_order_unicode(0).as_deref(), None); // .notdef
+        assert_eq!(mac_glyph_order_unicode(9999), None); // out of range
     }
 
     #[test]

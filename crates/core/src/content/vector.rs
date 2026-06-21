@@ -85,7 +85,7 @@ impl NamedColorResolver for NoNamedColors {
 /// **name** is kept verbatim so `scn`/`sc` can resolve it through a
 /// [`NamedColorResolver`] (Separation tint, ICCBased `/N`, Indexed palette).
 #[derive(Clone)]
-enum CsKind {
+pub(crate) enum CsKind {
     /// A device/CIE family (`DeviceGray/RGB/CMYK`, `Cal*`, `Lab`) — convert
     /// `scn` components inline via [`resolve_scn`].
     Device(ColorSpace),
@@ -124,7 +124,7 @@ fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> [f64; 3] {
 /// `Pattern`…) is `Unknown` and resolved best-effort from the operand count at
 /// `scn`/`SCN` time — which, for `ICCBased`, equals the stream's `/N`.
 #[derive(Clone, Copy, PartialEq)]
-enum ColorSpace {
+pub(crate) enum ColorSpace {
     Gray,
     Rgb,
     Cmyk,
@@ -136,7 +136,7 @@ enum ColorSpace {
 /// other name is a `/Resources /ColorSpace` resource ([`CsKind::Named`]) —
 /// `ICCBased`, `Separation`, `DeviceN`, `Indexed`, `Pattern`, … — to be resolved
 /// through the [`NamedColorResolver`] at `scn`/`SCN` time.
-fn cs_kind_for(name: &[u8]) -> CsKind {
+pub(crate) fn cs_kind_for(name: &[u8]) -> CsKind {
     match name {
         b"DeviceGray" | b"CalGray" | b"G" => CsKind::Device(ColorSpace::Gray),
         b"DeviceRGB" | b"CalRGB" | b"Lab" | b"RGB" => CsKind::Device(ColorSpace::Rgb),
@@ -145,12 +145,20 @@ fn cs_kind_for(name: &[u8]) -> CsKind {
     }
 }
 
+impl CsKind {
+    /// The PDF initial non-stroking colour space, `DeviceGray` (ISO 32000-1
+    /// §8.6.3): the value to seed a fill-space tracker with before any `cs`.
+    pub(crate) fn initial() -> CsKind {
+        CsKind::Device(ColorSpace::Gray)
+    }
+}
+
 /// Resolve `scn`/`sc` components against the current colour space, preferring the
 /// document-backed [`NamedColorResolver`] for a named resource (exact: runs the
 /// Separation/DeviceN tint transform, honours ICCBased `/N`, Indexed palettes)
 /// and falling back to operand-count inference when the space is a device family
 /// or the resolver can't resolve the name.
-fn resolve_color(space: &CsKind, nums: &[f64], resolver: &dyn NamedColorResolver) -> Option<[f64; 3]> {
+pub(crate) fn resolve_color(space: &CsKind, nums: &[f64], resolver: &dyn NamedColorResolver) -> Option<[f64; 3]> {
     match space {
         CsKind::Device(s) => resolve_scn(*s, nums),
         CsKind::Named(name) => resolver

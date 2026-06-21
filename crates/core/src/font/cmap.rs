@@ -401,7 +401,9 @@ impl TextDecoder {
     /// Resolution order per code (ISO 32000-1 §9.10):
     /// - composite (2-byte): `/ToUnicode` → embedded-cmap `cid_to_unicode`
     ///   fallback (covers codes a **partial** `/ToUnicode` omits — subset fonts
-    ///   routinely do) → `U+FFFD` placeholder (so the run is still counted).
+    ///   routinely do) → **nothing** (a code no source maps is unrecoverable;
+    ///   the glyph draws but its Unicode exists nowhere — drop it silently, as
+    ///   reference extractors do, never a `U+FFFD` tofu placeholder).
     /// - simple (1-byte): `/ToUnicode` → base-`/Encoding` + `/Differences`
     ///   (`simple_encoding`) → WinAnsi last-resort.
     pub fn decode(&self, bytes: &[u8]) -> String {
@@ -411,10 +413,17 @@ impl TextDecoder {
             while i + 1 < bytes.len() {
                 let code = ((bytes[i] as u16) << 8) | bytes[i + 1] as u16;
                 i += 2;
-                match self.decode_two_byte(code) {
-                    Some(text) => out.push_str(text),
-                    None => out.push('\u{FFFD}'),
+                if let Some(text) = self.decode_two_byte(code) {
+                    out.push_str(text);
                 }
+                // A 2-byte code that **no** source maps (a partial `/ToUnicode`
+                // with no embedded `cmap`/`post` to fill the gap — the subset
+                // Hebrew/CJK fonts whose `FontFile2` ships only `glyf`/`loca`)
+                // is genuinely unrecoverable: the glyph draws, but its Unicode
+                // exists nowhere in the file. Emit **nothing** for it — never a
+                // `U+FFFD` placeholder — mirroring the simple-font empty-glyph
+                // rule and every reference extractor (pdftotext/Adobe drop such
+                // CIDs silently). A tofu character helps no consumer.
             }
             out
         } else {
@@ -441,16 +450,31 @@ impl TextDecoder {
     /// Append the Unicode for one single-byte simple-font code: `/ToUnicode`,
     /// then the base-`/Encoding`+`/Differences` map, then WinAnsi as a last
     /// resort. Each source may yield a multi-character string (e.g. a ligature).
+    ///
+    /// Two rules keep subset fonts from emitting tofu:
+    /// - An entry **present** in `simple_encoding` is *authoritative* (the
+    ///   font's `/Encoding`/`/Differences` explicitly assigned this code). Its
+    ///   value may be the empty string — a glyph that carries no Unicode (an
+    ///   opaque `/gNN` subset name) — in which case the code contributes **no
+    ///   text** and we do **not** fall back to WinAnsi (which would invent a
+    ///   wrong letter or leak a control byte).
+    /// - The WinAnsi last resort (for codes no map covers) **skips control
+    ///   characters**: a C0/C1 byte with no encoding mapping is never visible
+    ///   text, so emitting its raw scalar only produces dingbats.
     fn decode_one_byte(&self, b: u8, out: &mut String) {
         if let Some(text) = self.to_unicode.as_ref().and_then(|c| c.decode(b as u32)) {
             out.push_str(text);
             return;
         }
         if let Some(text) = self.simple_encoding.as_ref().and_then(|m| m.get(&b)) {
+            // Present ⇒ authoritative (may be "" = explicitly no text). Stop here.
             out.push_str(text);
             return;
         }
-        out.push(super::winansi_to_char(b));
+        let c = super::winansi_to_char(b);
+        if !c.is_control() {
+            out.push(c);
+        }
     }
 }
 
@@ -597,6 +621,41 @@ mod tests {
     }
 
     #[test]
+    fn simple_decoder_empty_sentinel_emits_nothing_not_winansi() {
+        // A `/Differences` code whose glyph carries no Unicode (opaque subset
+        // `gNN`) is recorded as the empty-string sentinel; the code must emit NO
+        // text and must NOT fall back to a WinAnsi letter for that byte.
+        let mut enc = std::collections::BTreeMap::new();
+        enc.insert(0x18u8, String::new()); // explicitly "no text"
+        enc.insert(0x41u8, "A".to_string());
+        let dec = TextDecoder {
+            two_byte: false,
+            to_unicode: None,
+            widths: None,
+            cid_to_unicode: None,
+            simple_encoding: Some(enc),
+        };
+        // 0x18 → nothing (sentinel, not WinAnsi 'N'/control), 0x41 → 'A',
+        // 0x42 (unmapped, printable) → WinAnsi 'B'.
+        assert_eq!(dec.decode(&[0x18, 0x41, 0x42]), "AB");
+    }
+
+    #[test]
+    fn simple_decoder_skips_unmapped_control_bytes() {
+        // A control-range byte not covered by ToUnicode or the encoding map must
+        // not leak its raw scalar (the dingbat tofu) — it is dropped.
+        let dec = TextDecoder {
+            two_byte: false,
+            to_unicode: None,
+            widths: None,
+            cid_to_unicode: None,
+            simple_encoding: None,
+        };
+        // 0x02..0x08 (controls) drop; 'A'..'C' pass through.
+        assert_eq!(dec.decode(&[0x02, b'A', 0x07, b'B', 0x1F, b'C']), "ABC");
+    }
+
+    #[test]
     fn composite_decoder_falls_back_to_cid_map_for_partial_tounicode() {
         // ToUnicode covers code 0x41 only; the embedded-cmap fallback covers 0x42.
         let to = ToUnicode::parse(b"beginbfchar <0041> <0041> endbfchar");
@@ -609,7 +668,29 @@ mod tests {
             cid_to_unicode: Some(cid),
             simple_encoding: None,
         };
-        // 0x0041 → A (ToUnicode), 0x0042 → B (cid fallback), 0x0043 → tofu.
-        assert_eq!(dec.decode(&[0x00, 0x41, 0x00, 0x42, 0x00, 0x43]), "AB\u{FFFD}");
+        // 0x0041 → A (ToUnicode), 0x0042 → B (cid fallback), 0x0043 → no source
+        // maps it ⇒ emit NOTHING (never a U+FFFD tofu). The glyph would draw, but
+        // its Unicode lives nowhere in the file — exactly what reference
+        // extractors (pdftotext/Adobe) drop. So the run is "AB", not "AB\u{FFFD}".
+        assert_eq!(dec.decode(&[0x00, 0x41, 0x00, 0x42, 0x00, 0x43]), "AB");
+    }
+
+    #[test]
+    fn composite_decoder_drops_fully_unmapped_codes() {
+        // A composite font whose codes are covered by NO source at all (partial
+        // `/ToUnicode`, no embedded cmap) must yield empty text — never tofu.
+        let to = ToUnicode::parse(b"beginbfchar <0003> <0020> endbfchar");
+        let dec = TextDecoder {
+            two_byte: true,
+            to_unicode: Some(to),
+            widths: None,
+            cid_to_unicode: None,
+            simple_encoding: None,
+        };
+        // 0x0003 → space (mapped); the Hebrew CIDs 0x02A2/0x02A4 map nowhere ⇒
+        // dropped. Result is just the one space, with zero U+FFFD.
+        let out = dec.decode(&[0x00, 0x03, 0x02, 0xA2, 0x02, 0xA4]);
+        assert_eq!(out, " ");
+        assert!(!out.contains('\u{FFFD}'));
     }
 }

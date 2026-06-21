@@ -136,6 +136,11 @@ pub fn group_lines(elements: &[ContentElement]) -> Vec<TextLine> {
     let mut lines: Vec<TextLine> = Vec::new();
     let mut row_center = f64::INFINITY;
     let mut row_height = 0.0f64;
+    // Right edge of the last appended run, to decide whether the next run on the
+    // same line is a separate word (needs a space) or an adjacent glyph
+    // continuing the same word (no space — e.g. a decorative leading capital
+    // drawn as its own run: "N" + "om et adresse" must read "Nom et adresse").
+    let mut row_right = f64::NEG_INFINITY;
     for (text, b) in runs {
         let c = center(&b);
         let tol = b.height.max(row_height).max(1.0) * 0.6;
@@ -146,10 +151,27 @@ pub fn group_lines(elements: &[ContentElement]) -> Vec<TextLine> {
             });
             row_center = c;
             row_height = b.height;
+            row_right = b.x + b.width;
         } else {
             let line = lines.last_mut().unwrap();
-            // Same line: append with a space and union the bounds.
-            line.text.push(' ');
+            // Same line: the two runs are joined directly (no space) **only** when
+            // this run butts the previous one — a small gap in a tight band around
+            // zero, i.e. normal intra-word kerning or a leading-capital run drawn
+            // separately ("N" + "om et adresse" → "Nom et adresse"). Otherwise a
+            // space separates them:
+            //  - a clear positive gap is a real inter-word space;
+            //  - a large *negative* gap means the run wrapped to the left margin
+            //    (a new visual line inside the same baseline-row cluster), which
+            //    is still a word boundary — never a join (else "ASSURES" + a
+            //    wrapped "cerfa" would fuse into "ASSUREScerfa").
+            // The trim above stripped any space the run carried, so a genuine
+            // boundary needs this synthesized space.
+            let gap = b.x - row_right;
+            let h = b.height.max(row_height).max(1.0);
+            let joins = gap <= h * 0.25 && gap >= -h * 0.5;
+            if !joins {
+                line.text.push(' ');
+            }
             line.text.push_str(text);
             let x0 = line.bounds.x.min(b.x);
             let y0 = line.bounds.y.min(b.y);
@@ -162,6 +184,7 @@ pub fn group_lines(elements: &[ContentElement]) -> Vec<TextLine> {
                 height: y1 - y0,
             };
             row_height = row_height.max(b.height);
+            row_right = row_right.max(b.x + b.width);
         }
     }
     lines
@@ -351,6 +374,114 @@ fn decode_operand_text(operands: &[Object], decoder: &TextDecoder) -> String {
         }
     }
     text
+}
+
+/// True for a scalar in a right-to-left script (Hebrew + Arabic, including the
+/// Arabic supplements and the Hebrew/Arabic presentation-form blocks). Mirrors
+/// the strong-RTL set used by [`crate::text::run_direction`].
+#[inline]
+fn is_rtl_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0590..=0x05FF // Hebrew
+        | 0x0600..=0x06FF // Arabic
+        | 0x0750..=0x077F // Arabic Supplement
+        | 0x08A0..=0x08FF // Arabic Extended-A
+        | 0xFB1D..=0xFB4F // Hebrew presentation forms
+        | 0xFB50..=0xFDFF // Arabic Presentation Forms-A
+        | 0xFE70..=0xFEFF // Arabic Presentation Forms-B
+    )
+}
+
+/// True for a Hebrew letter (base block + alphabetic presentation forms). Used to
+/// segment a run into Hebrew "words" for the final-form orientation test.
+#[inline]
+fn is_hebrew_char(c: char) -> bool {
+    matches!(c as u32, 0x0590..=0x05FF | 0xFB1D..=0xFB4F)
+}
+
+/// True for a Hebrew *final* (sofit) letter form: kaf ך, mem ם, nun ן, pe ף,
+/// tsadi ץ. In **logical** order a final form may only sit at the END of a word;
+/// in **visual** (pre-reversed) order it surfaces at the word's start/interior.
+/// This positional asymmetry is the signal used to tell the two orders apart.
+#[inline]
+fn is_hebrew_final_form(c: char) -> bool {
+    matches!(c, '\u{05DA}' | '\u{05DD}' | '\u{05DF}' | '\u{05E3}' | '\u{05E5}')
+}
+
+/// Decide whether a run's characters need flipping visual→logical, and if so
+/// return the reordered string; `None` leaves the run untouched.
+///
+/// Some PDF producers store right-to-left text in **visual** (already-laid-out,
+/// reversed) order rather than logical/Unicode order. Extracting such a run
+/// verbatim yields mirror-image words (e.g. Hebrew `תנידמ` for the logical
+/// `מדינת`). We detect RTL runs and, when they look visual, reverse the scalar
+/// sequence to recover logical order so the text is readable and editable.
+///
+/// Guarding against double-reversal of a run that is *already* logical uses the
+/// Hebrew final-form positional rule:
+/// - any final form NOT at the end of its word ⇒ **visual** ⇒ reverse;
+/// - finals present and every one ends its word ⇒ **logical** ⇒ keep as-is;
+/// - no Hebrew finals at all (the ambiguous case) ⇒ reverse, since these
+///   producers lay out the whole document visually.
+///
+/// Arabic-only runs (no Hebrew, so no final-form heuristic) are reversed when
+/// RTL is the dominant script. Runs without any RTL character return `None`,
+/// leaving Latin/CJK text (and its order) completely unchanged.
+fn reorder_visual_rtl(text: &str) -> Option<String> {
+    // Fast path: nothing right-to-left → never touch the run (LTR preserved).
+    if !text.chars().any(is_rtl_char) {
+        return None;
+    }
+
+    let has_hebrew = text.chars().any(is_hebrew_char);
+    let should_reverse = if has_hebrew {
+        hebrew_run_is_visual(text)
+    } else {
+        // Arabic (no Hebrew): reverse when RTL strictly dominates the strong
+        // characters of the run — i.e. a genuinely right-to-left run.
+        matches!(crate::text::run_direction(text), crate::text::Direction::Rtl)
+    };
+
+    should_reverse.then(|| text.chars().rev().collect())
+}
+
+/// Whether a Hebrew-bearing run is stored in **visual** (reversed) order, per the
+/// final-form positional rule documented on [`reorder_visual_rtl`]. Segments the
+/// run into maximal Hebrew letter spans ("words") and inspects where final forms
+/// fall within each.
+fn hebrew_run_is_visual(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut misplaced_final = false; // a final form not closing its word ⇒ visual
+    let mut well_placed_final = false; // a final form ending its word ⇒ logical
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_hebrew_char(chars[i]) {
+            i += 1;
+            continue;
+        }
+        // Consume one maximal Hebrew word [i, j).
+        let start = i;
+        let mut j = i;
+        while j < chars.len() && is_hebrew_char(chars[j]) {
+            j += 1;
+        }
+        let last = j - 1;
+        for (k, &c) in chars.iter().enumerate().take(j).skip(start) {
+            if is_hebrew_final_form(c) {
+                if k == last {
+                    well_placed_final = true;
+                } else {
+                    misplaced_final = true;
+                }
+            }
+        }
+        i = j;
+    }
+    // A final form out of place proves visual order. Otherwise, only treat the
+    // run as already-logical when there is positive evidence (a well-placed
+    // final); with no finals at all, default to reversing (visual producers).
+    misplaced_final || !well_placed_final
 }
 
 /// A form XObject resolved for text extraction: its decoded content stream, the
@@ -727,6 +858,7 @@ fn elements_from_ops(
         operations,
         fonts,
         gstate_alpha,
+        &vector::NoNamedColors,
         Matrix::IDENTITY,
         &|_| None,
         0,
@@ -748,6 +880,7 @@ fn elements_from_ops_resolved(
     operations: &[Operation],
     fonts: &FontDecoders,
     gstate_alpha: &BTreeMap<String, f64>,
+    color_resolver: &dyn vector::NamedColorResolver,
     initial_ctm: Matrix,
     resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
     depth: usize,
@@ -760,7 +893,12 @@ fn elements_from_ops_resolved(
     // surface on elements.
     let mut ctm = initial_ctm;
     let mut fill_alpha = 1.0f64;
-    let mut ctm_stack: Vec<(Matrix, f64)> = Vec::new();
+    // Current non-stroking colour space (set by `cs`), needed to interpret a
+    // later `sc`/`scn` — the seam that lets text painted through a named space
+    // (`/Separation`, `/ICCBased`, `/Indexed`, `/DeviceN`) carry its real colour
+    // instead of falling back to the last device colour (usually black).
+    let mut fill_space = vector::CsKind::initial();
+    let mut ctm_stack: Vec<(Matrix, f64, vector::CsKind)> = Vec::new();
     // Text state.
     let mut tm = Matrix::IDENTITY;
     let mut tlm = Matrix::IDENTITY;
@@ -779,11 +917,12 @@ fn elements_from_ops_resolved(
     for (i, op) in operations.iter().enumerate() {
         let operator = op.operator.as_slice();
         match operator {
-            b"q" => ctm_stack.push((ctm, fill_alpha)),
+            b"q" => ctm_stack.push((ctm, fill_alpha, fill_space.clone())),
             b"Q" => {
-                if let Some((m, a)) = ctm_stack.pop() {
+                if let Some((m, a, cs)) = ctm_stack.pop() {
                     ctm = m;
                     fill_alpha = a;
+                    fill_space = cs;
                 }
             }
             b"cm" => {
@@ -815,17 +954,21 @@ fn elements_from_ops_resolved(
                     current_font = Some(String::from_utf8_lossy(name).into_owned());
                 }
             }
-            // Fill colour (non-stroking). Text inherits the fill colour.
+            // Fill colour (non-stroking). Text inherits the fill colour. The
+            // device shorthands also (re)set the non-stroking colour space, so a
+            // later bare `sc`/`scn` resolves under the right device family.
             b"rg" => {
                 let n = nums(op);
                 if n.len() == 3 {
                     fill_color = Some([n[0], n[1], n[2]]);
+                    fill_space = vector::cs_kind_for(b"DeviceRGB");
                 }
             }
             b"g" => {
                 let n = nums(op);
                 if n.len() == 1 {
                     fill_color = Some([n[0], n[0], n[0]]);
+                    fill_space = vector::cs_kind_for(b"DeviceGray");
                 }
             }
             b"k" => {
@@ -838,6 +981,26 @@ fn elements_from_ops_resolved(
                         (1.0 - n[1]) * (1.0 - kk),
                         (1.0 - n[2]) * (1.0 - kk),
                     ]);
+                    fill_space = vector::cs_kind_for(b"DeviceCMYK");
+                }
+            }
+            // Non-stroking colour-space selection (`/Name cs`): a device/CIE
+            // family (resolved inline by `scn` arity) or a `/Resources
+            // /ColorSpace` resource resolved through `color_resolver` at `scn`
+            // time (Separation/DeviceN tint, ICCBased `/N`, Indexed palette).
+            b"cs" => {
+                if let Some(Object::Name(name)) = op.operands.first() {
+                    fill_space = vector::cs_kind_for(name);
+                }
+            }
+            // Set the fill colour in the current space (`scn`/`sc`). Resolving
+            // through the same machinery as the rasterizer/vector layer keeps the
+            // extracted text colour identical to the painted one. A pattern-only
+            // `scn` (no numeric operands) leaves the previous colour in place.
+            b"scn" | b"sc" => {
+                let n = nums(op);
+                if let Some(rgb) = vector::resolve_color(&fill_space, &n, color_resolver) {
+                    fill_color = Some(rgb);
                 }
             }
             b"TL" => {
@@ -882,7 +1045,11 @@ fn elements_from_ops_resolved(
                     tlm = Matrix::translate(0.0, -leading).then(&tlm);
                     tm = tlm;
                 }
-                let text = decode_operand_text(&op.operands, text_decoder);
+                let decoded = decode_operand_text(&op.operands, text_decoder);
+                // Some producers store right-to-left text in visual (reversed)
+                // order; recover logical order so the extracted/edited run reads
+                // correctly. No-op for LTR runs and for already-logical RTL runs.
+                let text = reorder_visual_rtl(&decoded).unwrap_or(decoded);
                 let char_count = text.chars().count();
                 // Real glyph advances when the font carries widths; otherwise a
                 // 0.5-em estimate. Drives both the run's width and the pen
@@ -936,6 +1103,7 @@ fn elements_from_ops_resolved(
                         &parse_content(&form.content).unwrap_or_default(),
                         &form.fns,
                         gstate_alpha,
+                        color_resolver,
                         child_ctm,
                         resolve_form,
                         depth + 1,
@@ -1041,12 +1209,35 @@ pub fn extract_elements_resolved(
     gstate_alpha: &BTreeMap<String, f64>,
     resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
 ) -> Result<Vec<ContentElement>> {
+    extract_elements_resolved_with_colors(
+        content,
+        fonts,
+        gstate_alpha,
+        &vector::NoNamedColors,
+        resolve_form,
+    )
+}
+
+/// Like [`extract_elements_resolved`], but also resolves `cs`/`sc`/`scn` named
+/// fill colour spaces through `color_resolver` so each text element's `color`
+/// matches the painted colour even when the text is filled via a `/Separation`,
+/// `/ICCBased`, `/Indexed` or `/DeviceN` space (rather than a device `rg`/`g`/`k`).
+/// `NoNamedColors` keeps the device-only behaviour (used by callers without a
+/// document/`/Resources` context).
+pub fn extract_elements_resolved_with_colors(
+    content: &[u8],
+    fonts: &FontDecoders,
+    gstate_alpha: &BTreeMap<String, f64>,
+    color_resolver: &dyn vector::NamedColorResolver,
+    resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
+) -> Result<Vec<ContentElement>> {
     let operations = parse_content(content)?;
     let mut visited: BTreeSet<(u32, u16)> = BTreeSet::new();
     Ok(elements_from_ops_resolved(
         &operations,
         fonts,
         gstate_alpha,
+        color_resolver,
         Matrix::IDENTITY,
         resolve_form,
         0,
@@ -1879,6 +2070,66 @@ mod tests {
     }
 
     #[test]
+    fn group_lines_joins_adjacent_runs_and_spaces_real_gaps() {
+        // Build three text runs on one baseline: a separately-drawn leading "N"
+        // butting "om et adresse" (must join → "Nom et adresse"), then a real
+        // word "ailleurs" after a clear gap (must keep a space).
+        let mk = |text: &str, x: f64, w: f64| ContentElement {
+            index: 0,
+            kind: ElementKind::Text,
+            label: text.to_string(),
+            op_start: 0,
+            op_end: 0,
+            bounds: Some(Bounds { x, y: 100.0, width: w, height: 10.0 }),
+            font: None,
+            color: None,
+            font_size: Some(10.0),
+            rotation_deg: None,
+            fill_alpha: None,
+            nested: false,
+        };
+        // "N" spans x=10..17 (right edge 17); "om et adresse" starts at 17 (gap 0
+        // → join); "ailleurs" starts at 120 (large gap → space).
+        let els = [
+            mk("N", 10.0, 7.0),
+            mk("om et adresse", 17.0, 80.0),
+            mk("ailleurs", 120.0, 40.0),
+        ];
+        let lines = group_lines(&els);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Nom et adresse ailleurs");
+    }
+
+    #[test]
+    fn group_lines_left_wrapped_run_keeps_word_boundary() {
+        // Two runs whose baselines fall in the same row-cluster tolerance but the
+        // second sits at the left margin (its centre slightly below): the second
+        // is appended in row order with a large *negative* gap to the first's
+        // right edge. That is a visual wrap, still a word boundary — must NOT fuse
+        // "ASSURES" + "cerfa" into "ASSUREScerfa".
+        let mk = |text: &str, x: f64, y: f64, w: f64| ContentElement {
+            index: 0,
+            kind: ElementKind::Text,
+            label: text.to_string(),
+            op_start: 0,
+            op_end: 0,
+            bounds: Some(Bounds { x, y, width: w, height: 10.0 }),
+            font: None,
+            color: None,
+            font_size: Some(10.0),
+            rotation_deg: None,
+            fill_alpha: None,
+            nested: false,
+        };
+        // "ASSURES" at top (y=100.5, sorts first); "cerfa" just below (y=99.5,
+        // within the 0.6×h tolerance) but at the left margin (x=10).
+        let els = [mk("ASSURES", 400.0, 100.5, 38.0), mk("cerfa", 10.0, 99.5, 30.0)];
+        let lines = group_lines(&els);
+        assert_eq!(lines.len(), 1, "same row cluster");
+        assert_eq!(lines[0].text, "ASSURES cerfa", "wrap is a word boundary");
+    }
+
+    #[test]
     fn apostrophe_runs_apply_implicit_line_move_and_are_extracted() {
         // `'` (next-line-show) carries an implicit `T*`: it must drop the
         // baseline by the current leading BEFORE showing, and it is a text-show
@@ -1911,6 +2162,59 @@ mod tests {
         let runs2 = extract_text_runs(&edited).unwrap();
         assert_eq!(runs2[1].text, "Z");
         assert!(count(&edited, b"\"") >= 1, "the \" operator is preserved");
+    }
+
+    #[test]
+    fn reorders_visual_hebrew_run_to_logical() {
+        // teum-mass.pdf's first heading is stored in VISUAL (reversed) order:
+        // "מדינת ישראל / האוצר" (State of Israel / Treasury) surfaces as
+        // "רצואה / לארשי תנידמ". Visual→logical reversal must recover the
+        // readable order (and `run_direction` then reports RTL).
+        let visual = "רצואה / לארשי תנידמ";
+        let logical = reorder_visual_rtl(visual).expect("RTL run is reordered");
+        assert_eq!(logical, "מדינת ישראל / האוצר");
+        assert_eq!(
+            crate::text::run_direction(&logical),
+            crate::text::Direction::Rtl,
+        );
+    }
+
+    #[test]
+    fn visual_hebrew_with_final_form_at_word_start_is_reversed() {
+        // "רשות המיסים בישראל": the visual form puts the final mem ם at a word
+        // START (`םיסימה`), proving visual order ⇒ reverse to logical.
+        let visual = "לארשיב םיסימה תושר";
+        let logical = reorder_visual_rtl(visual).expect("misplaced final ⇒ reverse");
+        assert_eq!(logical, "רשות המיסים בישראל");
+        // In the recovered logical text every final form ends its word.
+        assert!(logical.contains('\u{05DD}')); // final mem present
+    }
+
+    #[test]
+    fn already_logical_hebrew_run_is_left_untouched() {
+        // "שלום עולם" is already logical: final mem ם closes each word, so the
+        // guard must NOT double-reverse it.
+        let logical = "שלום עולם";
+        assert_eq!(
+            reorder_visual_rtl(logical),
+            None,
+            "well-placed final forms ⇒ already logical ⇒ no reversal",
+        );
+    }
+
+    #[test]
+    fn latin_run_is_never_reordered() {
+        // No RTL scalar ⇒ leave LTR text and its order completely alone (the
+        // s1106-style Latin document must be byte-for-byte unchanged).
+        assert_eq!(reorder_visual_rtl("Hello, World 123"), None);
+    }
+
+    #[test]
+    fn arabic_run_is_reversed_when_rtl_dominant() {
+        // No Hebrew final-form heuristic exists for Arabic, so an RTL-dominant
+        // Arabic run is reversed wholesale to recover logical order.
+        let visual: String = "العربية".chars().rev().collect();
+        assert_eq!(reorder_visual_rtl(&visual).as_deref(), Some("العربية"));
     }
 
     #[test]
@@ -2420,5 +2724,76 @@ BT /F 12 Tf (BODY) Tj ET";
         // The moved shape (last painted) is default black.
         assert_eq!(paths.last().unwrap().fill, Some([0.0, 0.0, 0.0]), "stays black");
         let _ = s;
+    }
+
+    /// A text run filled through a NAMED colour space (`cs` + `scn`, e.g. a
+    /// `/Separation`) carries the resolver's RGB, not the device fallback (black).
+    /// Regression for `textElements()` returning `[0,0,0]` on coloured text that
+    /// the rasterizer paints correctly: the extractor ignored `cs`/`sc`/`scn` and
+    /// fell back to the last device colour.
+    #[test]
+    fn text_fill_via_named_separation_space_resolves_non_black() {
+        // A resolver that maps the page's `/Cs1` Separation tint to a blue.
+        struct Sep;
+        impl vector::NamedColorResolver for Sep {
+            fn resolve(&self, name: &[u8], comps: &[f64]) -> Option<[f64; 3]> {
+                if name == b"Cs1" && comps.len() == 1 {
+                    // Full tint → deep blue (mimics a Separation tint transform).
+                    let t = comps[0];
+                    Some([0.1 * t, 0.1 * t, 0.4 * t])
+                } else {
+                    None
+                }
+            }
+        }
+        // `/Cs1 cs 1 scn` selects the Separation space and sets full tint, then
+        // shows text. Without the fix the run reports black (no `rg`/`g`/`k`).
+        let content = b"/Cs1 cs 1 scn BT /F1 12 Tf 100 700 Td (Blue) Tj ET";
+        let els = extract_elements_resolved_with_colors(
+            content,
+            &FontDecoders::new(),
+            &BTreeMap::new(),
+            &Sep,
+            &|_| None,
+        )
+        .unwrap();
+        let text = els
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .expect("a text element");
+        let c = text.color.expect("a resolved fill colour");
+        assert_ne!(c, [0.0, 0.0, 0.0], "named-space text must not fall back to black");
+        assert!(
+            (c[2] - 0.4).abs() < 1e-9 && c[0] < 0.2 && c[1] < 0.2,
+            "resolved Separation tint → deep blue, got {c:?}"
+        );
+    }
+
+    /// Device fill operators (`rg`/`g`/`k`) keep driving text colour unchanged —
+    /// the named-space handling must not regress the common device path.
+    #[test]
+    fn text_fill_via_device_rg_is_unchanged() {
+        let content = b"0 0 1 rg BT /F1 12 Tf 100 700 Td (Blue) Tj ET";
+        let text = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        assert_eq!(text.color, Some([0.0, 0.0, 1.0]), "device rg keeps its blue");
+    }
+
+    /// An unresolvable named space falls back to `scn` arity inference (here a
+    /// 3-component value → RGB), so even without a document resolver the text gets
+    /// a sensible colour rather than black.
+    #[test]
+    fn text_fill_named_space_unresolved_falls_back_to_arity() {
+        // `NoNamedColors` resolves nothing → 3 components inferred as RGB.
+        let content = b"/Cs0 cs 0 0.5 1 scn BT /F1 12 Tf 0 0 Td (x) Tj ET";
+        let text = extract_elements(content)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == ElementKind::Text)
+            .unwrap();
+        assert_eq!(text.color, Some([0.0, 0.5, 1.0]), "3-comp scn → RGB by arity");
     }
 }

@@ -200,7 +200,36 @@ pub fn glyph_name_to_unicode_string(raw: &str) -> Option<String> {
         }
     }
     // Otherwise fall back to the single-scalar conventions (uXXXXXX, single char).
-    glyph_name_to_unicode(name).and_then(char::from_u32).map(|c| c.to_string())
+    if let Some(c) = glyph_name_to_unicode(name).and_then(char::from_u32) {
+        return Some(c.to_string());
+    }
+    // AGL ligature convention (Adobe Glyph List spec §4.3): a ligature glyph is
+    // named as its components joined by `_` — `f_l` → "fl", `f_i` → "fi",
+    // `f_f_i` → "ffi", `c_t` → "ct". Resolve each component (recursively, so a
+    // component may itself be an AGL/`uni…`/single-char name) and concatenate.
+    // This recovers the *very* common subset/OpenType ligature `/Differences`
+    // names that no single-scalar rule and no `cmap` can express. Requires every
+    // component to resolve (one opaque part ⇒ the whole name is unrecoverable),
+    // and at least two parts, so a plain `_`-free name never reaches here.
+    if name.contains('_') {
+        let mut s = String::new();
+        let mut parts = 0u32;
+        for part in name.split('_') {
+            // An empty part (leading/trailing/double `_`) is not a real ligature.
+            if part.is_empty() {
+                return None;
+            }
+            match glyph_name_to_unicode_string(part) {
+                Some(p) => s.push_str(&p),
+                None => return None,
+            }
+            parts += 1;
+        }
+        if parts >= 2 && !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
 }
 
 // ── sfnt assembly ───────────────────────────────────────────────────────────
@@ -517,6 +546,30 @@ mod tests {
         assert_eq!(glyph_name_to_unicode("a.sc"), Some(0x61)); // suffix stripped
         assert_eq!(glyph_name_to_unicode("ffi"), None); // ligature: no base scalar
         assert_eq!(glyph_name_to_unicode(".notdef"), None);
+    }
+
+    #[test]
+    fn ligature_glyph_name_strings() {
+        // Spelled-out f-ligatures.
+        assert_eq!(glyph_name_to_unicode_string("fi").as_deref(), Some("fi"));
+        assert_eq!(glyph_name_to_unicode_string("ffl").as_deref(), Some("ffl"));
+        // AGL underscore-joined ligature convention (the LBPC `/Differences`
+        // `/f_l` `/f_i` names, plus deeper component runs).
+        assert_eq!(glyph_name_to_unicode_string("f_l").as_deref(), Some("fl"));
+        assert_eq!(glyph_name_to_unicode_string("f_i").as_deref(), Some("fi"));
+        assert_eq!(glyph_name_to_unicode_string("f_f").as_deref(), Some("ff"));
+        assert_eq!(glyph_name_to_unicode_string("f_f_i").as_deref(), Some("ffi"));
+        assert_eq!(glyph_name_to_unicode_string("c_t").as_deref(), Some("ct"));
+        // Component may itself be an accented single-char / uni name.
+        assert_eq!(glyph_name_to_unicode_string("uni0066_l").as_deref(), Some("fl"));
+        // Subset prefix + `.suffix` still stripped before the split.
+        assert_eq!(glyph_name_to_unicode_string("ABCDEF+f_l.alt").as_deref(), Some("fl"));
+        // Malformed / opaque components are not a ligature.
+        assert_eq!(glyph_name_to_unicode_string("f_"), None);
+        assert_eq!(glyph_name_to_unicode_string("_l"), None);
+        assert_eq!(glyph_name_to_unicode_string("f_zzzz"), None);
+        // A plain name with no `_` and no scalar stays unresolved.
+        assert_eq!(glyph_name_to_unicode_string("ornament"), None);
     }
 
     #[test]
