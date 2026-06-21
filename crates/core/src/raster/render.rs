@@ -1026,7 +1026,20 @@ fn show_text(
         let code_bytes = &bytes[i..i + consumed];
         i += consumed;
 
-        let mut advance = size * 0.5; // fallback width
+        // Authoritative pen advance from the PDF width table (`/Widths` keyed by
+        // code for simple fonts, `/W`+`/DW` keyed by CID for composite ones — the
+        // `code` here is exactly that key). ISO 32000-1 §9.2.4 makes these widths
+        // the displacement of record; the embedded program's own metric is only a
+        // fallback, and a subset CFF that omits the charstring width operand can
+        // otherwise report 0 and collapse whole words. `None` → no width table →
+        // use the program's `advance_width` (filled below), else the 0.5-em guess.
+        let dict_advance = font
+            .decoder
+            .widths
+            .as_ref()
+            .map(|w| w.advance(code) * size / 1000.0);
+
+        let mut advance = dict_advance.unwrap_or(size * 0.5); // fallback width
         if let Some(ttf) = &font.program {
             let upem = ttf.units_per_em();
             let gid = if font.two_byte {
@@ -1088,7 +1101,12 @@ fn show_text(
             if !edges.is_empty() {
                 canvas.fill_ext(&edges, fill, false, global_alpha, clip, blend);
             }
-            advance = ttf.advance_width(gid) / upem * size;
+            // The PDF width table wins when present (already in `advance`); only
+            // fall back to the program's own glyph metric when the font carries
+            // no `/Widths`/`/W`.
+            if dict_advance.is_none() {
+                advance = ttf.advance_width(gid) / upem * size;
+            }
         }
 
         let mut step = advance + char_spacing;

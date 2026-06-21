@@ -4997,8 +4997,17 @@ impl Document {
             } else {
                 self.base14_substitute(font)
             };
-            let is_base14_substitute = base14.is_some();
-            let program = self.font_program(font).or(base14);
+            let embedded = self.font_program(font);
+            // `is_base14_substitute` must reflect whether the program we will use
+            // is *actually* the bundled base-14 substitute — i.e. only when the
+            // font embeds **no** usable program. A subset font that ships its own
+            // `/FontFile3` (CFF) yet carries a base-14 `/BaseFont` name (e.g.
+            // `HKPKFC+Times-Bold`) must NOT take the substitute's code→Unicode→cmap
+            // route: its embedded subset has no Unicode cmap, so every glyph would
+            // resolve to `.notdef` and draw nothing. It needs the `/Encoding`-vs-
+            // charset map (`simple_code_to_gid`) instead.
+            let is_base14_substitute = embedded.is_none() && base14.is_some();
+            let program = embedded.or(base14);
             // Resolve the glyph-selection maps the rasterizer needs. Simple fonts
             // map `code → glyph id` via their PDF `/Encoding` against the embedded
             // program's charset (essential for subset CFF, which carries no
@@ -5022,6 +5031,19 @@ impl Document {
             } else {
                 None
             };
+            // The PDF width table is **authoritative** for the pen advance
+            // (ISO 32000-1 §9.2.4): `/W`+`/DW` for composite fonts, `/Widths`+
+            // `/FirstChar` (with `/MissingWidth`) for simple fonts. The embedded
+            // program's own glyph metric is only a fallback — a subset CFF whose
+            // charstrings omit the width operand (relying on the Private DICT's
+            // `defaultWidthX`) can report a 0 advance, collapsing every word onto
+            // one another (e.g. `HKPKFC+Times-Bold` titles). Carrying the dict
+            // widths here lets `show_text` advance by the real, spec widths.
+            let widths = if two_byte {
+                self.cid_font_widths(font)
+            } else {
+                self.simple_font_widths(font)
+            };
             out.insert(
                 name.clone(),
                 crate::raster::render::RenderFont {
@@ -5029,9 +5051,9 @@ impl Document {
                     decoder: crate::font::cmap::TextDecoder {
                         two_byte,
                         to_unicode,
-                        // Rendering advances glyphs by the font program's own
-                        // metrics, so the PDF width table isn't needed here.
-                        widths: None,
+                        // Authoritative per-code advances (`/Widths` or `/W`+`/DW`)
+                        // — `show_text` prefers these over the program's metric.
+                        widths,
                         // Rasterising uses the glyph id directly; no cmap-derived
                         // Unicode fallback is required for drawing.
                         cid_to_unicode: None,
@@ -14002,6 +14024,59 @@ mod tests {
         assert!(
             dark > 500,
             "embedded-font glyphs painted ink ({dark} dark samples)"
+        );
+    }
+
+    #[test]
+    fn embedded_cff_with_base14_name_draws_and_spaces_words() {
+        // Regression: `embedded-cff-base14.pdf` shows "DESERTS DE TRESS" (24pt)
+        // in a SUBSET CFF font whose `/BaseFont` is a base-14 name
+        // (`HKPKFC+Times-Bold`) embedded via `/FontFile3`, and whose charstring
+        // advances are degenerate (~uniform, wrong). Two bugs this guards:
+        //
+        //   1. The font must NOT be treated as a base-14 *substitute*: a subset
+        //      CFF ships no Unicode cmap, so the substitute's code→Unicode→cmap
+        //      route resolves every glyph to `.notdef` and paints nothing. It
+        //      must resolve codes via the PDF `/Encoding` against the CFF charset
+        //      → real glyph ink. (`is_base14_substitute` only when no program is
+        //      embedded.)
+        //   2. The pen advance must come from the PDF `/Widths` table (the
+        //      authoritative displacement, ISO 32000-1 §9.2.4), not the CFF's
+        //      broken charstring widths — otherwise the words collapse onto one
+        //      another. The glyph run must span a wide horizontal extent.
+        let doc = Document::open(&fixture("embedded-cff-base14.pdf")).unwrap();
+        let img = crate::raster::decode_png(&doc.render_page(1, 3.0).unwrap())
+            .expect("valid PNG");
+        let (w, h) = (img.width as usize, img.height as usize);
+
+        // Per-row dark-pixel scan: count ink and find the title row's horizontal
+        // extent.
+        let mut dark = 0usize;
+        let (mut min_x, mut max_x) = (w, 0usize);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let lum =
+                    (img.rgba[i] as u32 + img.rgba[i + 1] as u32 + img.rgba[i + 2] as u32) / 3;
+                if lum < 128 {
+                    dark += 1;
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                }
+            }
+        }
+
+        // Bug 1 guard: the glyphs draw at all (a substitute-routed subset CFF
+        // would paint nothing).
+        assert!(dark > 2_000, "embedded base-14-named CFF glyphs draw ink ({dark} px)");
+
+        // Bug 2 guard: "DESERTS DE TRESS" with real /Widths advances (~225 PDF
+        // pt at 24pt) spans well over 400 device px at scale 3. A collapsed
+        // (0-advance or near-uniform tiny advance) title would be a narrow blob.
+        let extent = max_x.saturating_sub(min_x);
+        assert!(
+            extent > 450,
+            "title spans a wide extent ({extent}px) — words are not collapsed"
         );
     }
 
