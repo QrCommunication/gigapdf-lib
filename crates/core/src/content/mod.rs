@@ -2148,6 +2148,7 @@ BT /F 12 Tf (BODY) Tj ET";
         let paths = vector::vector_paths_from_ops(
             &parse_content(&edited).unwrap(),
             &std::collections::BTreeMap::new(),
+            &vector::NoNamedColors,
         );
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].fill, Some([1.0, 0.0, 0.0]), "fill is now red");
@@ -2171,6 +2172,7 @@ BT /F 12 Tf (BODY) Tj ET";
         let paths = vector::vector_paths_from_ops(
             &parse_content(&edited).unwrap(),
             &std::collections::BTreeMap::new(),
+            &vector::NoNamedColors,
         );
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].stroke, Some([0.0, 0.0, 1.0]));
@@ -2314,11 +2316,11 @@ BT /F 12 Tf (BODY) Tj ET";
         let content = b"1 0 0 rg 10 10 20 20 re f 0 0 1 rg 50 50 20 20 re f";
         let no_color = std::collections::BTreeMap::new();
         // Sanity: before the move the first path is red.
-        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color);
+        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color, &vector::NoNamedColors);
         assert_eq!(before[0].fill, Some([1.0, 0.0, 0.0]), "first path starts red");
 
         let edited = reorder_element(content, 0, true).unwrap();
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
         assert_eq!(paths.len(), 2, "still two painted paths");
         // The moved (red) shape is now painted last → last in the path list.
         assert_eq!(
@@ -2342,7 +2344,7 @@ BT /F 12 Tf (BODY) Tj ET";
         let no_color = std::collections::BTreeMap::new();
 
         // Path index 1 is the dashed blue line (declared first → drawn first).
-        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color);
+        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color, &vector::NoNamedColors);
         assert_eq!(before[0].stroke, Some([0.0, 0.0, 1.0]), "first line starts blue");
 
         let line_index = extract_elements(content)
@@ -2351,7 +2353,7 @@ BT /F 12 Tf (BODY) Tj ET";
             .position(|e| e.kind == ElementKind::Path)
             .unwrap();
         let edited = reorder_element(content, line_index, false).unwrap();
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
         assert_eq!(paths.len(), 2, "still two painted paths");
         // Sent to back → painted first → first in the path list.
         let moved = &paths[0];
@@ -2369,7 +2371,7 @@ BT /F 12 Tf (BODY) Tj ET";
         let content = b"1 0 0 rg 10 10 20 20 re f 50 50 20 20 re f";
         let no_color = std::collections::BTreeMap::new();
         let edited = reorder_element(content, 0, true).unwrap();
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
         assert_eq!(paths.len(), 2);
         // Both shapes must still be red.
         for p in &paths {
@@ -2414,7 +2416,7 @@ BT /F 12 Tf (BODY) Tj ET";
         let s = String::from_utf8_lossy(&edited);
         // Exactly one `rg` (the original scoped one) — none injected for the move.
         assert_eq!(count(&edited, b"rg"), 1, "popped fill colour is not re-captured");
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color);
+        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
         // The moved shape (last painted) is default black.
         assert_eq!(paths.last().unwrap().fill, Some([0.0, 0.0, 0.0]), "stays black");
         let _ = s;

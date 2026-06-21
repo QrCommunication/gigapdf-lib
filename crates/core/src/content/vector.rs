@@ -52,6 +52,48 @@ pub struct VectorPath {
     pub dash: Vec<f64>,
 }
 
+/// Resolves a **named** colour space — a `cs`/`CS` operand keyed in the page's
+/// `/Resources /ColorSpace` (e.g. `/Cs1` → `[/Separation /Black /DeviceCMYK …]`,
+/// `/CS0` → `[/ICCBased …]`, an `/Indexed`/`/DeviceN`…) — together with its
+/// `scn`/`sc` components to **device RGB floats** (`0..=1`).
+///
+/// This is the seam that lets the shape extractor produce the *exact* same
+/// colour the rasterizer paints (running the Separation/DeviceN **tint
+/// transform**, honouring ICCBased `/N`, looking up `/Indexed` palettes) instead
+/// of guessing from the operand count. The implementor (the document) owns the
+/// object graph and the PDF function evaluator; this module stays object-graph
+/// free. Returning `None` (name not a resolvable colour space) makes the caller
+/// fall back to arity-based Device inference — the previous behaviour.
+pub trait NamedColorResolver {
+    /// Resolve the named space `name` and convert `comps` to device RGB `0..=1`.
+    fn resolve(&self, name: &[u8], comps: &[f64]) -> Option<[f64; 3]>;
+}
+
+/// A resolver that resolves nothing — every named space falls back to operand-
+/// count inference. Used by callers without a document context (and by tests).
+#[derive(Debug)]
+pub struct NoNamedColors;
+
+impl NamedColorResolver for NoNamedColors {
+    fn resolve(&self, _name: &[u8], _comps: &[f64]) -> Option<[f64; 3]> {
+        None
+    }
+}
+
+/// The current colour space selected by `cs`/`CS`. Device/CIE families are
+/// resolved inline by operand arity (already exact); a `/Resources` colour-space
+/// **name** is kept verbatim so `scn`/`sc` can resolve it through a
+/// [`NamedColorResolver`] (Separation tint, ICCBased `/N`, Indexed palette).
+#[derive(Clone)]
+enum CsKind {
+    /// A device/CIE family (`DeviceGray/RGB/CMYK`, `Cal*`, `Lab`) — convert
+    /// `scn` components inline via [`resolve_scn`].
+    Device(ColorSpace),
+    /// A named `/ColorSpace` resource — resolve `scn` components through the
+    /// [`NamedColorResolver`], falling back to arity inference on `None`.
+    Named(Vec<u8>),
+}
+
 #[derive(Clone)]
 struct GfxState {
     ctm: Matrix,
@@ -59,8 +101,8 @@ struct GfxState {
     stroke: [f64; 3],
     /// Current non-stroking / stroking colour spaces (set by `cs`/`CS`), used to
     /// interpret subsequent `scn`/`SCN` components.
-    fill_space: ColorSpace,
-    stroke_space: ColorSpace,
+    fill_space: CsKind,
+    stroke_space: CsKind,
     line_width: f64,
     dash: Vec<f64>,
     fill_alpha: f64,
@@ -89,16 +131,31 @@ enum ColorSpace {
     Unknown,
 }
 
-/// Map a `cs`/`CS` colour-space name to its component model. The device and
-/// CIE-based names are self-describing; any other name (a `/ColorSpace`
-/// resource — `ICCBased`, `Separation`, `Indexed`, `Pattern`, …) is `Unknown`
-/// and left to operand-count inference.
-fn color_space_for(name: &[u8]) -> ColorSpace {
+/// Classify a `cs`/`CS` colour-space name. Self-describing device/CIE names map
+/// to a [`CsKind::Device`] family (converted inline by operand arity); every
+/// other name is a `/Resources /ColorSpace` resource ([`CsKind::Named`]) —
+/// `ICCBased`, `Separation`, `DeviceN`, `Indexed`, `Pattern`, … — to be resolved
+/// through the [`NamedColorResolver`] at `scn`/`SCN` time.
+fn cs_kind_for(name: &[u8]) -> CsKind {
     match name {
-        b"DeviceGray" | b"CalGray" | b"G" => ColorSpace::Gray,
-        b"DeviceRGB" | b"CalRGB" | b"Lab" | b"RGB" => ColorSpace::Rgb,
-        b"DeviceCMYK" | b"CMYK" => ColorSpace::Cmyk,
-        _ => ColorSpace::Unknown,
+        b"DeviceGray" | b"CalGray" | b"G" => CsKind::Device(ColorSpace::Gray),
+        b"DeviceRGB" | b"CalRGB" | b"Lab" | b"RGB" => CsKind::Device(ColorSpace::Rgb),
+        b"DeviceCMYK" | b"CMYK" => CsKind::Device(ColorSpace::Cmyk),
+        _ => CsKind::Named(name.to_vec()),
+    }
+}
+
+/// Resolve `scn`/`sc` components against the current colour space, preferring the
+/// document-backed [`NamedColorResolver`] for a named resource (exact: runs the
+/// Separation/DeviceN tint transform, honours ICCBased `/N`, Indexed palettes)
+/// and falling back to operand-count inference when the space is a device family
+/// or the resolver can't resolve the name.
+fn resolve_color(space: &CsKind, nums: &[f64], resolver: &dyn NamedColorResolver) -> Option<[f64; 3]> {
+    match space {
+        CsKind::Device(s) => resolve_scn(*s, nums),
+        CsKind::Named(name) => resolver
+            .resolve(name, nums)
+            .or_else(|| resolve_scn(ColorSpace::Unknown, nums)),
     }
 }
 
@@ -185,8 +242,9 @@ fn path_bounds(path: &[PathSeg]) -> Option<Bounds> {
 pub fn vector_paths_from_ops(
     operations: &[Operation],
     gstate: &BTreeMap<String, (Option<f64>, Option<f64>)>,
+    resolver: &dyn NamedColorResolver,
 ) -> Vec<VectorPath> {
-    vector_paths_from_ops_with_pos(operations, gstate)
+    vector_paths_from_ops_with_pos(operations, gstate, resolver)
         .into_iter()
         .map(|(path, _pos)| path)
         .collect()
@@ -204,14 +262,16 @@ pub fn vector_paths_from_ops(
 pub fn vector_paths_from_ops_with_pos(
     operations: &[Operation],
     gstate: &BTreeMap<String, (Option<f64>, Option<f64>)>,
+    resolver: &dyn NamedColorResolver,
 ) -> Vec<(VectorPath, usize)> {
     let mut out = Vec::new();
     let mut st = GfxState {
         ctm: Matrix::IDENTITY,
         fill: [0.0, 0.0, 0.0],
         stroke: [0.0, 0.0, 0.0],
-        fill_space: ColorSpace::Unknown,
-        stroke_space: ColorSpace::Unknown,
+        // Initial colour space is DeviceGray (ISO 32000-1 §8.6.3): black fill.
+        fill_space: CsKind::Device(ColorSpace::Gray),
+        stroke_space: CsKind::Device(ColorSpace::Gray),
         line_width: 1.0,
         dash: Vec::new(),
         fill_alpha: 1.0,
@@ -253,51 +313,53 @@ pub fn vector_paths_from_ops_with_pos(
             // Fill colour (the shorthand operators also set the colour space).
             b"rg" if n.len() == 3 => {
                 st.fill = [n[0], n[1], n[2]];
-                st.fill_space = ColorSpace::Rgb;
+                st.fill_space = CsKind::Device(ColorSpace::Rgb);
             }
             b"g" if n.len() == 1 => {
                 st.fill = [n[0], n[0], n[0]];
-                st.fill_space = ColorSpace::Gray;
+                st.fill_space = CsKind::Device(ColorSpace::Gray);
             }
             b"k" if n.len() == 4 => {
                 st.fill = cmyk_to_rgb(n[0], n[1], n[2], n[3]);
-                st.fill_space = ColorSpace::Cmyk;
+                st.fill_space = CsKind::Device(ColorSpace::Cmyk);
             }
             // Stroke colour.
             b"RG" if n.len() == 3 => {
                 st.stroke = [n[0], n[1], n[2]];
-                st.stroke_space = ColorSpace::Rgb;
+                st.stroke_space = CsKind::Device(ColorSpace::Rgb);
             }
             b"G" if n.len() == 1 => {
                 st.stroke = [n[0], n[0], n[0]];
-                st.stroke_space = ColorSpace::Gray;
+                st.stroke_space = CsKind::Device(ColorSpace::Gray);
             }
             b"K" if n.len() == 4 => {
                 st.stroke = cmyk_to_rgb(n[0], n[1], n[2], n[3]);
-                st.stroke_space = ColorSpace::Cmyk;
+                st.stroke_space = CsKind::Device(ColorSpace::Cmyk);
             }
             // Colour-space selection (`/Name cs|CS`). The name is a device/CIE
-            // family or a `/ColorSpace` resource (resolved by operand count).
+            // family (resolved inline by arity) or a `/ColorSpace` resource
+            // (resolved through `resolver` at `scn` time — Separation tint,
+            // ICCBased `/N`, Indexed palette, …).
             b"cs" => {
                 if let Some(Object::Name(name)) = op.operands.first() {
-                    st.fill_space = color_space_for(name);
+                    st.fill_space = cs_kind_for(name);
                 }
             }
             b"CS" => {
                 if let Some(Object::Name(name)) = op.operands.first() {
-                    st.stroke_space = color_space_for(name);
+                    st.stroke_space = cs_kind_for(name);
                 }
             }
             // Set colour in the current space (`scn`/`SCN`). A trailing pattern
             // name (non-numeric) is ignored by `nums`; pattern-only paints leave
             // the colour unchanged.
             b"scn" | b"sc" => {
-                if let Some(rgb) = resolve_scn(st.fill_space, &n) {
+                if let Some(rgb) = resolve_color(&st.fill_space, &n, resolver) {
                     st.fill = rgb;
                 }
             }
             b"SCN" | b"SC" => {
-                if let Some(rgb) = resolve_scn(st.stroke_space, &n) {
+                if let Some(rgb) = resolve_color(&st.stroke_space, &n, resolver) {
                     st.stroke = rgb;
                 }
             }
@@ -412,7 +474,7 @@ mod tests {
 
     fn paths(content: &[u8]) -> Vec<VectorPath> {
         let ops = parse_content(content).unwrap();
-        vector_paths_from_ops(&ops, &BTreeMap::new())
+        vector_paths_from_ops(&ops, &BTreeMap::new(), &NoNamedColors)
     }
 
     #[test]

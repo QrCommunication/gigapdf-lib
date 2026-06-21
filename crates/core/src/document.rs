@@ -1619,7 +1619,16 @@ impl Document {
         let content = self.page_content(page_no)?;
         let gstate = self.page_gstate_alpha_pair(page_no);
         let operations = content::parse_content(&content)?;
-        let mut paths = content::vector::vector_paths_from_ops_with_pos(&operations, &gstate);
+        // Resolve `cs`/`scn` named colour spaces (Separation/DeviceN tints,
+        // ICCBased `/N`, Indexed) against THIS page's `/Resources /ColorSpace`,
+        // through the same machinery the rasterizer uses, so the shape layer's
+        // fill/stroke matches the painted colour exactly.
+        let resolver = PageColorResolver {
+            doc: self,
+            resources: self.page_resources(page_no),
+        };
+        let mut paths =
+            content::vector::vector_paths_from_ops_with_pos(&operations, &gstate, &resolver);
 
         // Unified `Path`-kind elements, in content-stream order; each carries the
         // paint operator's op index as `op_end`. Map paint-op position → unified
@@ -3101,6 +3110,36 @@ impl Document {
             }
             _ => None,
         }
+    }
+
+    /// Resolve a **named** colour space (`cs`/`CS` operand) keyed in `resources`'
+    /// `/ColorSpace` sub-dictionary and convert `comps` to **device RGB floats**
+    /// (`0..=1`). Mirrors the rasterizer's [`PageResourceCtx::resolve_color`] but
+    /// returns floats so the vector-shape extractor stores `VectorPath.fill`
+    /// without an extra byte round-trip. `None` when the name isn't a colour space
+    /// the document can resolve — the extractor then falls back to arity inference.
+    ///
+    /// This is the read-side seam that makes the editor's shape layer show the
+    /// *same* colour the rasterizer paints: Separation/DeviceN tints run through
+    /// the function evaluator, ICCBased honours `/N`, `/Indexed` looks up its
+    /// palette — instead of guessing a colour from the `scn` operand count.
+    pub(crate) fn resolve_named_color_f(
+        &self,
+        resources: &Dictionary,
+        name: &[u8],
+        comps: &[f64],
+    ) -> Option<[f64; 3]> {
+        // Device-space names are resolved directly; everything else is a name in
+        // this resources scope's `/ColorSpace` sub-dictionary.
+        let cs = match name {
+            b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern" | b"G" | b"RGB"
+            | b"CMYK" => self.resolve_color_space(&Object::Name(name.to_vec()), 0)?,
+            _ => {
+                let (_, obj) = self.resource_entry(resources, b"ColorSpace", name)?;
+                self.resolve_color_space(obj, 0)?
+            }
+        };
+        Some(cs.to_rgb_f(comps, self))
     }
 
     /// Evaluate a PDF function object at scalar input `t`, returning its output
@@ -10778,6 +10817,22 @@ impl crate::raster::colorspace::TintEval for Document {
     }
 }
 
+/// Adapts a [`Document`] + a page's `/Resources` into a
+/// [`NamedColorResolver`](crate::content::vector::NamedColorResolver) for the
+/// vector-shape extractor: a `cs`/`scn` named space is resolved through
+/// [`Document::resolve_named_color_f`] (Separation/DeviceN tint, ICCBased `/N`,
+/// Indexed palette), so a shape's stored fill/stroke matches the painted colour.
+struct PageColorResolver<'a> {
+    doc: &'a Document,
+    resources: Dictionary,
+}
+
+impl crate::content::vector::NamedColorResolver for PageColorResolver<'_> {
+    fn resolve(&self, name: &[u8], comps: &[f64]) -> Option<[f64; 3]> {
+        self.doc.resolve_named_color_f(&self.resources, name, comps)
+    }
+}
+
 /// Decrypt every object's strings and stream bytes in place when the trailer
 /// declares an `/Encrypt` dictionary. A wrong or unsupported password leaves
 /// the objects untouched (the document stays unreadable rather than corrupted).
@@ -15354,5 +15409,97 @@ mod tests {
         .unwrap();
         let hf = doc.header_footer();
         assert_eq!(hf.header.map(|s| s.text), Some("P 2".to_string()));
+    }
+
+    /// Build a one-page PDF whose page stream is `stream` and whose `/Resources`
+    /// contains `resources`, then return its `page_vector_paths`. The shared
+    /// builder for the named-colour-space shape-extraction tests below.
+    fn vector_paths_with_resources(
+        stream: &str,
+        resources: &str,
+    ) -> Vec<content::vector::VectorPath> {
+        let objects: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                     /Resources << {resources} >> /Contents 4 0 R >>"
+                ),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{stream}\nendstream", stream.len()),
+            ),
+        ];
+        let doc = Document::open(&raw_pdf(&objects)).unwrap();
+        doc.page_vector_paths(1).unwrap()
+    }
+
+    #[test]
+    fn vector_fill_resolves_separation_named_space_through_tint() {
+        // `/Cs1` is a Separation `/Black` over DeviceCMYK with a type-2 tint
+        // mapping `t → [0 0 0 t]`. `/Cs1 cs 1 sc … f` fills at full tint → CMYK
+        // K=1 → BLACK. Before the fix the 1-operand `sc` fell into the naive Gray
+        // path and the shape reported `[1,1,1]` (white) — the exact prod bug where
+        // coloured Separation shapes showed black/grey-wrong and many vanished.
+        let resources = "/ColorSpace << /Cs1 [ /Separation /Black /DeviceCMYK \
+             << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [0 0 0 1] /N 1 >> ] >>";
+        let paths = vector_paths_with_resources("/Cs1 cs 1 sc 20 20 60 60 re f", resources);
+        assert_eq!(paths.len(), 1, "the Separation-filled path must be emitted");
+        let fill = paths[0].fill.expect("a fill colour");
+        for (ch, v) in fill.iter().enumerate() {
+            assert!(*v < 1e-9, "Separation tint=1 → black, channel {ch} = {v} (got {fill:?})");
+        }
+    }
+
+    #[test]
+    fn vector_fill_resolves_separation_spot_colour_to_its_rgb() {
+        // A spot colorant whose tint maps `t → RGB [0 0 t]` (blue at full tint),
+        // alternate DeviceRGB. `/Sb cs 1 sc` must paint blue, not grey — proving a
+        // genuinely *coloured* Separation reaches the editor with its real colour.
+        let resources = "/ColorSpace << /Sb [ /Separation /Blue /DeviceRGB \
+             << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [0 0 1] /N 1 >> ] >>";
+        let paths = vector_paths_with_resources("/Sb cs 1 sc 20 20 60 60 re f", resources);
+        assert_eq!(paths.len(), 1);
+        let fill = paths[0].fill.unwrap();
+        assert!(
+            fill[0] < 1e-9 && fill[1] < 1e-9 && (fill[2] - 1.0).abs() < 1e-9,
+            "spot colorant tint=1 → blue, got {fill:?}"
+        );
+    }
+
+    #[test]
+    fn vector_fill_resolves_iccbased_n4_named_space_as_cmyk() {
+        // `/CsI` is an ICCBased stream with `/N 4` (no `/Alternate`) → behaves as
+        // DeviceCMYK. `1 0 0 0 scn` = pure cyan → RGB (0,1,1). The arity fallback
+        // would also pick CMYK here, but this pins the named-resource resolution.
+        let resources = "/ColorSpace << /CsI 5 0 R >>";
+        let icc = "<< /N 4 /Length 0 >> stream\n\nendstream";
+        let objects: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Resources << /ColorSpace << /CsI 5 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, {
+                let s = "/CsI cs 1 0 0 0 scn 20 20 60 60 re f";
+                format!("<< /Length {} >> stream\n{s}\nendstream", s.len())
+            }),
+            (5, icc.into()),
+        ];
+        let _ = resources; // resources are inlined per-object above (indirect ICC stream)
+        let doc = Document::open(&raw_pdf(&objects)).unwrap();
+        let paths = doc.page_vector_paths(1).unwrap();
+        assert_eq!(paths.len(), 1);
+        let fill = paths[0].fill.unwrap();
+        assert!(
+            fill[0] < 1e-9 && (fill[1] - 1.0).abs() < 1e-9 && (fill[2] - 1.0).abs() < 1e-9,
+            "ICCBased N=4 cyan → (0,1,1), got {fill:?}"
+        );
     }
 }

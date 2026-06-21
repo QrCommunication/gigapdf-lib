@@ -4,6 +4,24 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.58.2] - 2026-06-21
+
+### Fixed
+
+- **Named colour spaces (`/Separation`, `/ICCBased`, `/Indexed`, `/DeviceN`) are
+  now resolved when extracting vector paths (`elements()`, `vectorPaths()`).**
+  Previously the content-layer vector extractor carried its own simplistic
+  colour-space model (Device Gray/RGB/CMYK only): any *named* colour space set
+  via `cs`/`CS` fell back to `Unknown` and `sc`/`scn` operands were guessed by
+  arity, so a 1-component Separation tint was misread as grey — a blue spot/ICC
+  fill rendered **black/grey**, and unresolvable fills were **dropped entirely**.
+  Vector extraction now reuses the rasteriser's full colour pipeline
+  (`raster/colorspace.rs` tint-transform via the PDF function evaluator,
+  ICCBased by `/N`, Indexed palette lookup), resolving named spaces against the
+  page `/Resources/ColorSpace`. Separation `/Black` tint `1.0` → true black,
+  spot/ICC blues → their real RGB. The rasteriser path was already correct and
+  is unchanged.
+
 ## [0.58.1] - 2026-06-21
 
 ### Fixed

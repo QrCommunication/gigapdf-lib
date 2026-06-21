@@ -101,7 +101,14 @@ impl ColorSpace {
 
     /// As [`to_rgb`](Self::to_rgb) but returning unclamped `0..=1` floats, used
     /// internally so a recursive alternate space composes without rounding.
-    fn to_rgb_f(&self, comps: &[f64], eval: &dyn TintEval) -> [f64; 3] {
+    ///
+    /// Exposed crate-wide so the vector-path extractor
+    /// ([`content::vector`](crate::content::vector)) can drive an editor's shape
+    /// layer with the *same* exact colour the rasterizer paints — Separation /
+    /// DeviceN tints, ICCBased `/N`, Indexed palettes — instead of a naive
+    /// arity-guess. Returns `0..=1` floats so the caller stores `VectorPath.fill`
+    /// without an extra round-trip through bytes.
+    pub(crate) fn to_rgb_f(&self, comps: &[f64], eval: &dyn TintEval) -> [f64; 3] {
         let g = |i: usize| comps.get(i).copied().unwrap_or(0.0);
         match self {
             ColorSpace::DeviceGray => {
