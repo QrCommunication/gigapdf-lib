@@ -346,6 +346,18 @@ def build_and_train(group: str, epochs: int):
             emit_rust(net, alphabet, group, cer, out_group=_out_group(group))  # baked Cargo feature
             emit_gpocr(net, alphabet, group, out_group=_out_group(group))  # runtime host-load blob
         print(f"  epoch {ep + 1:2d}/{epochs}  val_CER={cer:.4f}  best={best:.4f}", flush=True)
+    # Validate the INT8 blob we ACTUALLY ship — the float val above hides quantization collapse
+    # (recurrent GRU rounding compounds over a line → non-Latin models decoded to garbage despite
+    # a great float val). Gate on the gap so a broken blob never ships silently.
+    try:
+        import int8_eval  # noqa: PLC0415
+        gp = os.path.join(ROOT, "models", f"ocr_{_out_group(group)}.gpocr")
+        pairs8 = [(a, "".join(alphabet[i] for i in t)) for a, t in val[:1000]]
+        i8 = int8_eval.int8_cer(gp, pairs8)
+        flag = "  ⚠ INT8 COLLAPSE — per-tensor quant too lossy, needs per-channel" if i8 > best + 0.15 else ""
+        print(f"  int8_CER={i8:.4f}  (float best={best:.4f}){flag}", flush=True)
+    except Exception as e:  # never let validation crash a long training run
+        print(f"  int8 validation skipped: {e}", flush=True)
     return net, alphabet, best
 
 

@@ -531,14 +531,32 @@ fn extract_lines_in_column(gview: &[u8], ink: &[bool], w: usize, h: usize, cx0: 
         let lw = x1 - x0 + 1;
         let scale = STRIP_H as f64 / bh as f64;
         let sw = ((lw as f64 * scale).round() as usize).max(1);
+        // **Bilinear** resample the ink band [y0..=y1]×[x0..=x1] → STRIP_H×sw, matching the
+        // trainer's PIL `Image.BILINEAR` normalization (render_lines.render_line). The previous
+        // nearest-neighbour sampling aliased badly on DOWNSCALE (large line → 32 px), dropping
+        // every K-th row and erasing the fine strokes / stacked diacritics of dense conjunct
+        // scripts (Kannada/Telugu/Thai) — the dominant train↔inference skew behind the
+        // val→full-page accuracy gap. Same output coordinate mapping as PIL: src = (dst+0.5)·
+        // (in/out) − 0.5, sampled in band-local coords with edge clamping.
+        let inv = |r: usize, c: usize| -> f32 {
+            (255 - gview[(y0 + r) * w + (x0 + c)] as u16) as f32 / 255.0
+        };
+        let sample = |r: f64, c: f64| -> f32 {
+            let r = r.clamp(0.0, (bh - 1) as f64);
+            let c = c.clamp(0.0, (lw - 1) as f64);
+            let (r0, c0) = (r.floor() as usize, c.floor() as usize);
+            let (r1, c1) = ((r0 + 1).min(bh - 1), (c0 + 1).min(lw - 1));
+            let (fr, fc) = ((r - r0 as f64) as f32, (c - c0 as f64) as f32);
+            let top = inv(r0, c0) * (1.0 - fc) + inv(r0, c1) * fc;
+            let bot = inv(r1, c0) * (1.0 - fc) + inv(r1, c1) * fc;
+            top * (1.0 - fr) + bot * fr
+        };
         let mut strip = vec![0f32; STRIP_H * sw];
         for oy in 0..STRIP_H {
+            let sr = (oy as f64 + 0.5) * bh as f64 / STRIP_H as f64 - 0.5;
             for ox in 0..sw {
-                let sy = y0 + ((oy as f64 + 0.5) / scale) as usize;
-                let sx = x0 + ((ox as f64 + 0.5) / scale) as usize;
-                if sy <= y1 && sx <= x1 && sy < h && sx < w {
-                    strip[oy * sw + ox] = (255 - gview[sy * w + sx] as u16) as f32 / 255.0;
-                }
+                let sc = (ox as f64 + 0.5) * lw as f64 / sw as f64 - 0.5;
+                strip[oy * sw + ox] = sample(sr, sc);
             }
         }
         out.push((strip, sw, (x0, y0, x1 + 1, y1 + 1)));
