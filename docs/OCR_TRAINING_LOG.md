@@ -47,7 +47,18 @@ augmentation (blur + sensor noise)─┘            → train_ocr_crnn.py (CRNN 
 | 15 | 40 ep, **`cjk` (new)** 32/64/128, **2401-class** data-driven charset | val_CER **0.221**; **CER 0.206 on CASIA handwritten Chinese** | First CJK model: charset from priyank-m (`build_cjk_charset.py`), Noto CJK `.ttc`, ~93k real lines (priyank-m printed + CASIA handwriting). Chinese-first; JP/KR need dedicated data. |
 | 16 | 40 ep, **`jpn` (new)** 32/64/128, **3095-class** (kana+kanji + full ASCII) | val_CER **0.336** | First Japanese model: data-driven charset from deepcopy/japanese-synthetic-ocr-150k + forced ASCII, ~60k real lines + 20k synthetic (`jpn,eng` → mixed alphanumerics for dates/numbers). |
 | 17 | 40 ep, **`kor` (new)** 32/64/128, **1487-class** (Hangul syllables + ASCII) | val_CER **0.749** | First Korean model — **weak/preliminary**: ~2.4k precomposed Hangul syllables are individually rare in 60k samples, and the synthetic-OCR source carries render artifacts. **Superseded by the jamo-decomposition retrain** (run 18). |
-| 18 | **Breadth campaign** — 14 new script primaries (32/64/128, mixed Latin+digits, synthetic Noto+corpus + real where ungated), **parallel** (4 jobs × 12 threads, tmux) + CJK ASCII retrain + **Korean jamo** retrain | val_CER (done): kann **0.129**, mlym **0.379**, telu **0.432**, thai **0.491** … (rest in progress) | Closes the script-coverage gap vs Tesseract. Korean redone with **jamo decomposition** (175 classes vs 1487; runtime `compose_hangul` recomposes). CJK redone with **full ASCII** (was missing A-Z). Synthetic-only scripts are coverage baselines; Thai (no word spaces) is hardest. |
+| 18 | **Breadth campaign** — 14 new script primaries (32/64/128, mixed Latin+digits, synthetic Noto+corpus + real where ungated), **parallel** (4 jobs × 12 threads, tmux) + CJK ASCII retrain + **Korean jamo** retrain | val_CER (done): kann **0.129**, mlym **0.379**, telu **0.432**, thai **0.491** … (rest in progress) | Closes the script-**coverage** gap vs Tesseract. Korean redone with **jamo decomposition** (175 classes vs 1487; runtime `compose_hangul` recomposes). CJK redone with **full ASCII** (was missing A-Z). Synthetic-only scripts are coverage baselines; Thai (no word spaces) is hardest. **Honest vs Tesseract — see below.** |
+
+### Breadth vs Tesseract 5.3.4 (synthetic full-page bench, `bench.py <g> --lang=<t>`)
+
+| Script | gigapdf CER (val / full-pipeline) | Tesseract CER | Verdict |
+|--------|-----------------------------------|---------------|---------|
+| Thai (`thai`) | 0.49 / 0.82 | **0.18** | Tesseract wins |
+| Telugu (`telu`) | 0.43 / 0.66 | **0.10** | Tesseract wins |
+| Malayalam (`mlym`) | 0.38 / **0.32** | 0.13 | Tesseract wins |
+| Kannada (`kann`) | **0.13** / 0.85 | 2.08 | both degrade on the bench render |
+
+**Honest reading:** on these complex Brahmic/SE-Asian scripts, **mature Tesseract beats gigapdf** on clean synthetic print. The large val→full-pipeline gap (e.g. Kannada 0.13 → 0.85) shows the loss is largely in the **front-end line-segmentation** for dense conjunct scripts, not the recognizer itself (the model's held-out val is strong). gigapdf's value on these scripts is **zero-dependency, in-WASM, client-side coverage** — no Tesseract binary, no model download — *not* accuracy superiority here. Closing the gap needs script-aware line/glyph segmentation + real-data fine-tuning, tracked as follow-up. (Latin/Tamil/Devanagari/Chinese-handwriting, where gigapdf *does* match or beat Tesseract, are the trained-and-validated wins above.)
 
 CER here is **per-character on held-out validation strips** (same render distribution),
 measured inside the trainer — it isolates the *model*, not the full image pipeline.
