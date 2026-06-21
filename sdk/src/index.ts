@@ -60,7 +60,21 @@ export type OcrScript =
   | "tamil"
   | "cjk"
   | "japanese"
-  | "korean";
+  | "korean"
+  | "thai"
+  | "telugu"
+  | "kannada"
+  | "malayalam"
+  | "gujarati"
+  | "gurmukhi"
+  | "oriya"
+  | "sinhala"
+  | "georgian"
+  | "armenian"
+  | "khmer"
+  | "lao"
+  | "myanmar"
+  | "amharic";
 
 /** `.gpocr` filename for each {@link OcrScript}. */
 const OCR_MODEL_FILES: Record<OcrScript, string> = {
@@ -72,6 +86,20 @@ const OCR_MODEL_FILES: Record<OcrScript, string> = {
   cjk: "ocr_cjk.gpocr",
   japanese: "ocr_jpn.gpocr",
   korean: "ocr_kor.gpocr",
+  thai: "ocr_thai.gpocr",
+  telugu: "ocr_telu.gpocr",
+  kannada: "ocr_kann.gpocr",
+  malayalam: "ocr_mlym.gpocr",
+  gujarati: "ocr_gujr.gpocr",
+  gurmukhi: "ocr_guru.gpocr",
+  oriya: "ocr_orya.gpocr",
+  sinhala: "ocr_sinh.gpocr",
+  georgian: "ocr_geor.gpocr",
+  armenian: "ocr_armn.gpocr",
+  khmer: "ocr_khmr.gpocr",
+  lao: "ocr_laoo.gpocr",
+  myanmar: "ocr_mymr.gpocr",
+  amharic: "ocr_ethi.gpocr",
 };
 
 /** Every trained script — load all for "recognize text in any language". */
@@ -84,6 +112,20 @@ export const ALL_OCR_SCRIPTS: readonly OcrScript[] = [
   "cjk",
   "japanese",
   "korean",
+  "thai",
+  "telugu",
+  "kannada",
+  "malayalam",
+  "gujarati",
+  "gurmukhi",
+  "oriya",
+  "sinhala",
+  "georgian",
+  "armenian",
+  "khmer",
+  "lao",
+  "myanmar",
+  "amharic",
 ];
 
 /** Loaded engine module. Create documents with {@link open} / {@link openEncrypted}. */
