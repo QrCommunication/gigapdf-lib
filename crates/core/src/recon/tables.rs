@@ -81,8 +81,15 @@ pub fn plan_tables(lines: &[ReconLine], vpaths: &[VectorPath]) -> TablePlan {
         return plan;
     }
 
+    // A ruled candidate is only accepted if it looks like a real *data* table
+    // and not a **form** layout (dense rules that merely separate fields). When
+    // rejected, its lines are left free so they flow back to the normal prose
+    // pipeline (headings / paragraphs) instead of being swallowed by a giant,
+    // mostly-empty grid. See [`passes_table_sanity`].
     if let Some(t) = plan_ruled(lines, vpaths) {
-        plan.tables.push(t);
+        if passes_table_sanity(&t, lines) {
+            plan.tables.push(t);
+        }
     }
 
     // Borderless fallback over lines not already covered.
@@ -93,9 +100,89 @@ pub fn plan_tables(lines: &[ReconLine], vpaths: &[VectorPath]) -> TablePlan {
         .collect();
     let free: Vec<usize> = (0..lines.len()).filter(|i| !claimed.contains(i)).collect();
     if let Some(t) = plan_borderless(lines, &free) {
-        plan.tables.push(t);
+        if passes_table_sanity(&t, lines) {
+            plan.tables.push(t);
+        }
     }
     plan
+}
+
+// ── form-vs-table guardrails ─────────────────────────────────────────────────
+//
+// A cerfa-style **form** is drawn with many short ruling segments that fence off
+// input fields. Clustered naively, those rules synthesise a huge grid (e.g.
+// 15×47 on one A4 page) whose cells are mostly empty and whose labels/intro
+// prose get vacuumed into cells — so the editor can no longer treat that text as
+// paragraphs/headings. A genuine *data* table, by contrast, is compact, has few
+// columns, and its cells are mostly filled. These geometric thresholds, all
+// calibrated against real fixtures (data tables: rib 16×4 @63%, permis 4×8 @31%;
+// forms: s3705 15×47 @14% / 6×16 @24%, s1106 17×16 @21% / 18×42 @7%), reject the
+// form layouts while preserving the data tables.
+
+/// Hard cap on columns: a real data table rarely exceeds a dozen; a form's
+/// field fences explode well past it. Forms here have 16/42/47 columns; the two
+/// genuine tables have 4 and 8. `14` leaves head-room for wide-but-real tables.
+const MAX_TABLE_COLS: usize = 14;
+
+/// Hard cap on total cells (rows × cols): an A4 page does not hold a 100+-cell
+/// data table; that many cells is a form. Genuine tables here are 64 and 32
+/// cells; forms are 96 / 272 / 705 / 756. `160` sits clear of both, and catches
+/// a tall form that might sneak under the column cap.
+const MAX_TABLE_CELLS: usize = 160;
+
+/// Minimum fraction of cells that must carry text. Form grids are mostly empty
+/// fences (forms here: 7–24 % filled); data tables are dense (31 % and 63 %).
+/// `0.28` sits in the gap, with margin on both sides.
+const MIN_FILL_RATIO: f64 = 0.28;
+
+/// Whether a planned grid looks like a real **data table** rather than a
+/// **form** layout. Rejects grids that are too wide, too large, or too sparse —
+/// any one failure is disqualifying (a form needs only one tell). The rejected
+/// grid's text returns to the prose pipeline.
+fn passes_table_sanity(table: &PlannedTable, lines: &[ReconLine]) -> bool {
+    let n_cols = table.cols.len().saturating_sub(1);
+    let n_rows = table.rows.len().saturating_sub(1);
+    if n_cols == 0 || n_rows == 0 {
+        return false;
+    }
+    if n_cols > MAX_TABLE_COLS {
+        return false;
+    }
+    if n_cols.saturating_mul(n_rows) > MAX_TABLE_CELLS {
+        return false;
+    }
+    let (filled, total) = cell_fill(table, lines);
+    if total == 0 {
+        return false;
+    }
+    (filled as f64) / (total as f64) >= MIN_FILL_RATIO
+}
+
+/// Count `(cells_with_text, total_cells)` for a planned grid by dropping every
+/// run's centre into its cell — the same placement [`build_table`] uses, so the
+/// fill ratio reflects exactly what the materialised table would contain.
+fn cell_fill(table: &PlannedTable, lines: &[ReconLine]) -> (usize, usize) {
+    let n_cols = table.cols.len().saturating_sub(1);
+    let n_rows = table.rows.len().saturating_sub(1);
+    let total = n_cols.saturating_mul(n_rows);
+    if total == 0 {
+        return (0, 0);
+    }
+    let mut occupied = vec![false; total];
+    for &li in &table.covered_lines {
+        let Some(line) = lines.get(li) else { continue };
+        for run in &line.runs {
+            if run.text.trim().is_empty() {
+                continue;
+            }
+            let cx = run.x + run.w / 2.0;
+            let cy = run.y + run.h / 2.0;
+            if let (Some(c), Some(r)) = (col_of(&table.cols, cx), row_of(&table.rows, cy)) {
+                occupied[r * n_cols + c] = true;
+            }
+        }
+    }
+    (occupied.iter().filter(|&&o| o).count(), total)
 }
 
 /// Build a [`Table`] block from a planned table. Runs are dropped into the cell
@@ -554,6 +641,107 @@ mod tests {
         assert_eq!(t.rows[0].cells.len(), 2);
         // Borderless ⇒ no widened border.
         assert_eq!(t.border.width, 0.0);
+    }
+
+    #[test]
+    fn sparse_form_like_ruled_grid_is_rejected() {
+        // A form: many vertical + horizontal field fences make a wide grid, but
+        // almost every cell is empty (one short label per row). It must NOT be
+        // promoted to a giant table — the labels stay free for the prose path.
+        let mut paths: Vec<VectorPath> = Vec::new();
+        // 16 vertical rules at x = 50,80,…,500 (15 columns), spanning y∈[100,400].
+        let xs: Vec<f64> = (0..16).map(|i| 50.0 + i as f64 * 30.0).collect();
+        for &x in &xs {
+            paths.push(vrule(x, 100.0, 400.0));
+        }
+        // 11 horizontal rules at y = 100,130,…,400 (10 rows).
+        let ys: Vec<f64> = (0..11).map(|i| 100.0 + i as f64 * 30.0).collect();
+        for &y in &ys {
+            paths.push(hrule(y, 50.0, 500.0));
+        }
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        // One short label in the top-left cell of each row → ~10/150 cells.
+        let runs: Vec<ReconRun> = (0..10)
+            .map(|r| run("x", 55.0, 105.0 + r as f64 * 30.0, 8.0))
+            .collect();
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &paths);
+        assert!(
+            plan.take_if_starts_at(0).is_none(),
+            "a sparse {}-column form grid must not become a table",
+            xs.len() - 1
+        );
+    }
+
+    #[test]
+    fn dense_compact_ruled_grid_is_kept() {
+        // A real 2×3 data table, fully filled → survives the sanity gate.
+        let mut paths = vec![
+            hrule(100.0, 50.0, 350.0),
+            hrule(120.0, 50.0, 350.0),
+            hrule(140.0, 50.0, 350.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+            vrule(350.0, 100.0, 140.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let runs = vec![
+            run("A", 60.0, 122.0, 30.0),
+            run("B", 160.0, 122.0, 30.0),
+            run("C", 260.0, 122.0, 30.0),
+            run("D", 60.0, 102.0, 30.0),
+            run("E", 160.0, 102.0, 30.0),
+            run("F", 260.0, 102.0, 30.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &paths);
+        let tbl = plan
+            .take_if_starts_at(0)
+            .expect("a dense compact grid stays a table");
+        assert!(passes_table_sanity(&tbl, &lines));
+    }
+
+    #[test]
+    fn sanity_gate_thresholds() {
+        // Build a planner table directly and probe the three rejection paths.
+        let dense = PlannedTable {
+            cols: vec![0.0, 10.0, 20.0],
+            rows: vec![20.0, 10.0, 0.0],
+            ruled: true,
+            covered_lines: BTreeSet::new(),
+            used_paths: BTreeSet::new(),
+            start_line: 0,
+        };
+        // 2×2 grid, 4 cells, all filled.
+        let runs = vec![
+            run("a", 1.0, 11.0, 8.0),
+            run("b", 11.0, 11.0, 8.0),
+            run("c", 1.0, 1.0, 8.0),
+            run("d", 11.0, 1.0, 8.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let mut t = dense.clone();
+        t.covered_lines = (0..lines.len()).collect();
+        assert!(passes_table_sanity(&t, &lines), "dense 2×2 passes");
+
+        // Too many columns.
+        let mut wide = dense.clone();
+        wide.cols = (0..=MAX_TABLE_COLS as i32 + 2).map(|i| i as f64 * 5.0).collect();
+        wide.covered_lines = (0..lines.len()).collect();
+        assert!(!passes_table_sanity(&wide, &lines), "over-wide grid rejected");
+
+        // Empty grid (no runs land in cells) → zero fill → rejected.
+        let mut empty = dense.clone();
+        empty.covered_lines = BTreeSet::new();
+        assert!(
+            !passes_table_sanity(&empty, &lines),
+            "an empty grid is rejected (0% fill)"
+        );
     }
 
     #[test]
