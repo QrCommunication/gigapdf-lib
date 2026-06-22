@@ -35,6 +35,24 @@ pub enum Align {
     Justify,
 }
 
+/// CSS `vertical-align` for table cells — how the cell content box is placed
+/// inside the (taller) row box. Only the table-cell values are modelled; the
+/// inline values (`text-top`, `super`, …) collapse to the nearest of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VAlign {
+    /// `top` — content hugs the top of the cell. This is the initial value for
+    /// our single-line model (a single-line cell fills its row, so top is
+    /// indistinguishable from middle/baseline there — keeps existing layouts
+    /// byte-identical).
+    #[default]
+    Top,
+    /// `middle` — content centred vertically (what Office emits for most
+    /// invoice cells with multi-line neighbours).
+    Middle,
+    /// `bottom` / `baseline` — content hugs the bottom of the cell.
+    Bottom,
+}
+
 /// CSS `position`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Position {
@@ -104,7 +122,21 @@ pub struct Style {
     pub margin: Edges,
     pub padding: Edges,
     pub border_width: Edges,
+    /// Single border colour (the `border`/`border-color` shorthand). Kept for
+    /// the block/flex/grid uniform-border paths; per-side colours live in
+    /// `border_color_edges`.
     pub border_color: [f64; 3],
+    /// Per-side border colours in `[top, right, bottom, left]` order. Each side
+    /// defaults to `border_color`; the `border-{top,right,bottom,left}[-color]`
+    /// longhands override an individual side, letting a cell stroke (say) only
+    /// a coloured bottom rule.
+    pub border_color_edges: [[f64; 3]; 4],
+    /// `vertical-align` of table-cell content within its (taller) row box.
+    pub vertical_align: VAlign,
+    /// `border-collapse: collapse` — adjacent table-cell borders share a single
+    /// rule instead of each cell drawing its own (Office tables default to
+    /// collapse, giving the clean single-line grid of an invoice).
+    pub border_collapse: bool,
     pub width: Option<Len>,
     pub line_height: f64,
     pub pre: bool,
@@ -286,6 +318,9 @@ impl Default for Style {
             padding: Edges::default(),
             border_width: Edges::default(),
             border_color: [0.0, 0.0, 0.0],
+            border_color_edges: [[0.0, 0.0, 0.0]; 4],
+            vertical_align: VAlign::Top,
+            border_collapse: false,
             width: None,
             line_height: 1.2,
             pre: false,
@@ -638,6 +673,14 @@ fn inherit(parent: &Style) -> Style {
         padding: Edges::default(),
         border_width: Edges::default(),
         border_color: parent.color,
+        // Per-side colours reset to the (resolved) text colour like
+        // `border-color`; longhands repaint individual sides during cascade.
+        border_color_edges: [parent.color; 4],
+        // `vertical-align` is not inherited (resets to the initial value).
+        vertical_align: VAlign::Top,
+        // `border-collapse` IS inherited so it can be set once on the <table>
+        // and reach every cell.
+        border_collapse: parent.border_collapse,
         width: None,
         page_break_before: false,
         page_break_after: false,
@@ -1000,24 +1043,133 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         "padding-left" => style.padding.left = parse_len_px(v, style.font_size).unwrap_or(0.0),
         "border" | "border-width" => {
             // `border: 1px solid #ccc` — take first length + a colour if present.
-            let mut w = 1.0;
-            for tok in v.split_whitespace() {
-                if let Some(px) = parse_len_px(tok, style.font_size) {
-                    w = px;
-                } else if let Some(c) = parse_color(tok) {
-                    style.border_color = c;
-                }
+            // A bare `border-width` carries only the length(s); `none`/`hidden`
+            // zero the side(s).
+            let (w, c, vis) = parse_border_shorthand(v, style.font_size);
+            style.border_width = Edges::all(if vis { w } else { 0.0 });
+            if let Some(c) = c {
+                style.border_color = c;
+                style.border_color_edges = [c; 4];
             }
-            style.border_width = Edges::all(w);
+        }
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let (w, c, vis) = parse_border_shorthand(v, style.font_size);
+            let i = border_side_index(prop);
+            set_border_side(style, i, if vis { Some(w) } else { Some(0.0) }, c);
+        }
+        "border-top-width" | "border-right-width" | "border-bottom-width"
+        | "border-left-width" => {
+            let i = border_side_index(prop);
+            let w = parse_len_px(v, style.font_size).unwrap_or(0.0);
+            set_border_side(style, i, Some(w), None);
         }
         "border-color" => {
+            // `border-color` accepts 1–4 colours (TRBL like the box shorthands).
+            apply_border_color_shorthand(style, v);
+        }
+        "border-top-color" | "border-right-color" | "border-bottom-color"
+        | "border-left-color" => {
             if let Some(c) = parse_color(v) {
-                style.border_color = c;
+                set_border_side(style, border_side_index(prop), None, Some(c));
             }
         }
+        // `border-style` longhands carry no geometry in our model, but `none`/
+        // `hidden` must suppress the rule even when a width is also declared.
+        "border-style" | "border-top-style" | "border-right-style"
+        | "border-bottom-style" | "border-left-style" => {
+            if matches!(v, "none" | "hidden") {
+                match prop {
+                    "border-style" => style.border_width = Edges::default(),
+                    _ => set_border_side(style, border_side_index(prop), Some(0.0), None),
+                }
+            }
+        }
+        "vertical-align" => {
+            style.vertical_align = match v {
+                "middle" => VAlign::Middle,
+                "bottom" | "text-bottom" => VAlign::Bottom,
+                _ => VAlign::Top, // top, baseline, sub, super, … ⇒ top in our model
+            };
+        }
+        "border-collapse" => style.border_collapse = v == "collapse",
         "width" => style.width = parse_len(v, style.font_size),
         _ => {}
     }
+}
+
+/// `[top, right, bottom, left]` index for a `border-{side}*` property.
+fn border_side_index(prop: &str) -> usize {
+    if prop.contains("-top") {
+        0
+    } else if prop.contains("-right") {
+        1
+    } else if prop.contains("-bottom") {
+        2
+    } else {
+        3 // -left
+    }
+}
+
+/// Parse a `border` / `border-{side}` shorthand value into
+/// `(width_pt, colour?, visible)`. Width defaults to a hairline (1pt) when a
+/// style/colour is given without a length (matching the CSS `medium` initial
+/// width pragmatically); `none`/`hidden` set `visible = false`.
+fn parse_border_shorthand(v: &str, em: f64) -> (f64, Option<[f64; 3]>, bool) {
+    let mut w = 1.0;
+    let mut got_w = false;
+    let mut color = None;
+    let mut visible = true;
+    for tok in v.split_whitespace() {
+        if let Some(px) = parse_len_px(tok, em) {
+            w = px;
+            got_w = true;
+        } else if matches!(tok, "none" | "hidden") {
+            visible = false;
+        } else if let Some(c) = parse_color(tok) {
+            color = Some(c);
+        }
+        // other style keywords (solid/dashed/dotted/double/…) carry no geometry
+    }
+    // `border: 0` (explicit zero length) keeps width 0 even though `visible`.
+    if got_w && w <= 0.0 {
+        visible = false;
+    }
+    (w, color, visible)
+}
+
+/// Set one side's border width and/or colour, keeping `border_color` (the
+/// shorthand colour) in step when a single side is the only one styled.
+fn set_border_side(style: &mut Style, i: usize, width: Option<f64>, color: Option<[f64; 3]>) {
+    if let Some(w) = width {
+        match i {
+            0 => style.border_width.top = w,
+            1 => style.border_width.right = w,
+            2 => style.border_width.bottom = w,
+            _ => style.border_width.left = w,
+        }
+    }
+    if let Some(c) = color {
+        style.border_color_edges[i] = c;
+        style.border_color = c;
+    }
+}
+
+/// `border-color` shorthand: 1–4 colours applied TRBL (with the CSS
+/// shorthand fill rules), painting every per-side colour.
+fn apply_border_color_shorthand(style: &mut Style, v: &str) {
+    let cols: Vec<[f64; 3]> = v
+        .split_whitespace()
+        .filter_map(parse_color)
+        .collect();
+    let edges = match cols.as_slice() {
+        [a] => [*a, *a, *a, *a],
+        [a, b] => [*a, *b, *a, *b],
+        [a, b, c] => [*a, *b, *c, *b],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        _ => return,
+    };
+    style.border_color_edges = edges;
+    style.border_color = edges[0];
 }
 
 fn parse_edges(v: &str, em: f64) -> Edges {
@@ -1223,10 +1375,10 @@ li { display: list-item; }
 blockquote { margin-left: 30pt; margin-top: 8pt; margin-bottom: 8pt; }
 pre { display: block; white-space: pre; font-family: monospace; margin-top: 8pt; margin-bottom: 8pt; }
 code, kbd, samp { font-family: monospace; }
-table { display: table; }
+table { display: table; border-collapse: collapse; }
 tr { display: table-row; }
-td, th { display: table-cell; padding: 2pt; border: 1pt solid #c0c0c0; }
-th { font-weight: bold; }
+td, th { display: table-cell; padding: 2pt; border: 1pt solid #c0c0c0; vertical-align: top; }
+th { font-weight: bold; text-align: center; }
 hr { display: block; margin-top: 8pt; margin-bottom: 8pt; border: 1pt solid #808080; }
 small { font-size: 10pt; }
 pagebreak, page-break { display: block; page-break-after: always; }
@@ -1315,5 +1467,97 @@ mod tests {
         let child = inherit(&parent);
         assert_eq!(child.color, [1.0, 0.0, 0.0], "color inherits");
         assert_eq!(child.margin.top, 0.0, "margin does not inherit");
+    }
+
+    // Compute the style of the first element from an inline `style` string.
+    fn inline_style(decls: &str) -> Style {
+        let mut s = Style::default();
+        for (k, v) in parse_decls(decls) {
+            apply_one(&mut s, &k, &v);
+        }
+        s
+    }
+
+    #[test]
+    fn per_side_border_widths_and_colors_parse() {
+        let s = inline_style(
+            "border:none;border-bottom:3pt solid #ff0000;border-left:2pt solid #0000ff",
+        );
+        assert_eq!(s.border_width.top, 0.0, "border:none zeroed the top");
+        assert_eq!(s.border_width.right, 0.0);
+        assert_eq!(s.border_width.bottom, 3.0, "border-bottom width");
+        assert_eq!(s.border_width.left, 2.0, "border-left width");
+        // TRBL colour edges: bottom=red, left=blue, others stay default black.
+        assert_eq!(s.border_color_edges[2], [1.0, 0.0, 0.0]);
+        assert_eq!(s.border_color_edges[3], [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn border_shorthand_syncs_all_four_color_edges() {
+        let s = inline_style("border:1pt solid #00ff00");
+        assert_eq!(s.border_width.top, 1.0);
+        assert_eq!(s.border_color, [0.0, 1.0, 0.0]);
+        assert_eq!(s.border_color_edges, [[0.0, 1.0, 0.0]; 4]);
+    }
+
+    #[test]
+    fn border_color_shorthand_is_trbl() {
+        let s = inline_style("border-color:#ff0000 #00ff00 #0000ff");
+        assert_eq!(s.border_color_edges[0], [1.0, 0.0, 0.0], "top");
+        assert_eq!(s.border_color_edges[1], [0.0, 1.0, 0.0], "right");
+        assert_eq!(s.border_color_edges[2], [0.0, 0.0, 1.0], "bottom");
+        assert_eq!(s.border_color_edges[3], [0.0, 1.0, 0.0], "left = right");
+    }
+
+    #[test]
+    fn border_style_none_suppresses_a_declared_width() {
+        // width then style:none → side suppressed (CSS: a none side has no rule).
+        let s = inline_style("border-bottom-width:4pt;border-bottom-style:none");
+        assert_eq!(s.border_width.bottom, 0.0);
+    }
+
+    #[test]
+    fn vertical_align_and_collapse_parse() {
+        assert_eq!(
+            inline_style("vertical-align:middle").vertical_align,
+            VAlign::Middle
+        );
+        assert_eq!(
+            inline_style("vertical-align:bottom").vertical_align,
+            VAlign::Bottom
+        );
+        assert!(inline_style("border-collapse:collapse").border_collapse);
+        assert!(!inline_style("border-collapse:separate").border_collapse);
+    }
+
+    #[test]
+    fn ua_table_defaults_collapse_and_header_center() {
+        // <table> defaults to collapse and inherits it to its <th>, which also
+        // defaults to bold + centred text.
+        let nodes = parse("<table><tr><th>H</th></tr></table>");
+        let sheet = Stylesheet::new("");
+        let table = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "table" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let tstyle = sheet.computed(table, &Style::default(), &[]);
+        assert!(tstyle.border_collapse, "table defaults to border-collapse");
+
+        // Resolve the <th> with the table as ancestor/parent (collapse inherits).
+        let tr = match &table.children[0] {
+            Node::Element(e) => e,
+            _ => panic!(),
+        };
+        let th = match &tr.children[0] {
+            Node::Element(e) => e,
+            _ => panic!(),
+        };
+        let th_style = sheet.computed(th, &tstyle, &[table, tr]);
+        assert!(th_style.bold, "th is bold");
+        assert_eq!(th_style.align, Align::Center, "th text-align is center");
+        assert!(th_style.border_collapse, "collapse inherited into the cell");
     }
 }

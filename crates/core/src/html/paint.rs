@@ -885,6 +885,32 @@ mod tests {
     }
 
     #[test]
+    fn render_invoice_table_with_borders_and_shaded_header() {
+        // A collapsed, fully-ruled table with a grey header row and per-side
+        // border + background on cells. Exercises the whole pipeline (cascade →
+        // table layout → per-side border rects + cell backgrounds → PDF). It must
+        // produce a valid, non-trivial PDF without panicking.
+        let html = r#"
+            <table style="border-collapse:collapse">
+              <tr>
+                <th style="background:#dddddd;border:1pt solid #000000">Item</th>
+                <th style="background:#dddddd;border:1pt solid #000000;text-align:right">Total</th>
+              </tr>
+              <tr>
+                <td style="border:1pt solid #000000;vertical-align:middle">Widget</td>
+                <td style="border:1pt solid #000000;border-bottom:2pt solid #ff0000;text-align:right">12.00</td>
+              </tr>
+            </table>"#;
+        let pdf = render(html, &[], 612.0, 792.0, 36.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        assert!(
+            pdf.len() > 400,
+            "invoice table produced a non-trivial PDF ({} bytes)",
+            pdf.len()
+        );
+    }
+
+    #[test]
     fn footer_tokens_and_bottom_placement() {
         use super::super::page::RenderOptions;
         let book = MeasureBook::new(&[]);

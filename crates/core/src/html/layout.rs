@@ -8,7 +8,9 @@
 //! fonts). Lists get markers, tables lay cells side-by-side, and the whole flow
 //! is sliced into pages with backgrounds/borders split across page bands.
 
-use super::css::{Align, AlignItems, Display, FloatSide, Justify, Len, Position, Style, Stylesheet};
+use super::css::{
+    Align, AlignItems, Display, FloatSide, Justify, Len, Position, Style, Stylesheet, VAlign,
+};
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
 
@@ -757,28 +759,38 @@ impl Flow<'_> {
         }
 
         // Background + border behind the content (z=0). `visibility: hidden`
-        // suppresses the paint but the box still occupies its space.
-        if !style.hidden
-            && (style.background.is_some() || b.top + b.bottom + b.left + b.right > 0.0)
-        {
-            self.out.push(Abs {
-                z: 0,
-                zi: 0,
-                frag: Fragment::Rect {
-                    x: box_x,
-                    y: box_top,
-                    w: box_w,
-                    h: box_h,
-                    fill: style.background,
-                    stroke: if b.top > 0.0 {
-                        Some(style.border_color)
-                    } else {
-                        None
+        // suppresses the paint but the box still occupies its space. The
+        // background is a fill-only rect; borders are drawn per-side so
+        // `border-bottom`/`border-left` (etc.) keep their own width and colour.
+        let any_border = b.top + b.bottom + b.left + b.right > 0.0;
+        if !style.hidden && (style.background.is_some() || any_border) {
+            if style.background.is_some() {
+                self.out.push(Abs {
+                    z: 0,
+                    zi: 0,
+                    frag: Fragment::Rect {
+                        x: box_x,
+                        y: box_top,
+                        w: box_w,
+                        h: box_h,
+                        fill: style.background,
+                        stroke: None,
+                        stroke_w: 0.0,
+                        opacity: style.opacity,
                     },
-                    stroke_w: b.top,
-                    opacity: style.opacity,
-                },
-            });
+                });
+            }
+            if any_border {
+                self.emit_border_edges(
+                    box_x,
+                    box_top,
+                    box_w,
+                    box_h,
+                    [b.top, b.right, b.bottom, b.left],
+                    &style.border_color_edges,
+                    style.opacity,
+                );
+            }
         }
 
         box_top + box_h + m.bottom
@@ -1187,15 +1199,36 @@ impl Flow<'_> {
             (cum_x[s], (cum_x[e] - cum_x[s]).max(1.0))
         };
 
-        for row in rows {
+        // Whether borders collapse (Office tables default to `collapse`). In
+        // collapse mode every shared interior edge is drawn exactly once: each
+        // cell always draws its top + left rule (its top is the table edge or
+        // the rule it shares with the cell above; its left likewise), draws its
+        // bottom only in the last row, and its right only when it reaches the
+        // last column. This yields a single-line invoice grid (no doubled
+        // traits) while still honouring each cell's own per-side border widths
+        // and colours on the table's outer boundary.
+        let collapse = style.border_collapse;
+        let n_rows = rows.len();
+
+        for (row_idx, row) in rows.into_iter().enumerate() {
             let cells = collect_cells(row);
             if cells.is_empty() {
                 continue;
             }
+            let is_last_row = row_idx + 1 == n_rows;
             let row_top = y;
             let mut row_bottom = y;
-            // First pass: lay out content; remember each cell's column span.
-            let mut placed: Vec<(usize, usize)> = Vec::with_capacity(cells.len());
+            // First pass: lay out content; remember each cell's column span, the
+            // fragment range it produced (for vertical-align shifting) and the
+            // top-down y its content reached.
+            struct Placed {
+                start: usize,
+                span: usize,
+                frag_lo: usize,
+                frag_hi: usize,
+                content_bottom: f64,
+            }
+            let mut placed: Vec<Placed> = Vec::with_capacity(cells.len());
             let mut col = 0usize;
             for cell in &cells {
                 let cstyle = self.style_of(cell, style, &na);
@@ -1204,42 +1237,140 @@ impl Flow<'_> {
                 let cx = x + dx;
                 let nca = push_ancestor(&na, cell);
                 let p = &cstyle.padding;
-                let mut cy = row_top + p.top + cstyle.border_width.top;
-                cy = self.block_children(
+                let content_top = row_top + p.top + cstyle.border_width.top;
+                let frag_lo = self.out.len();
+                let mut cy = self.block_children(
                     &cell.children,
                     &cstyle,
                     cx + p.left + cstyle.border_width.left,
                     (cw - p.left - p.right).max(1.0),
-                    cy,
+                    content_top,
                     &nca,
                 );
+                let frag_hi = self.out.len();
                 cy += p.bottom + cstyle.border_width.bottom;
                 row_bottom = row_bottom.max(cy);
-                placed.push((col, span));
+                placed.push(Placed {
+                    start: col,
+                    span,
+                    frag_lo,
+                    frag_hi,
+                    content_bottom: cy - p.bottom - cstyle.border_width.bottom,
+                });
                 col += span.max(1);
             }
-            // Cell borders/backgrounds spanning the full row height (z=0).
-            for (cell, &(start, span)) in cells.iter().zip(&placed) {
+            let row_h = (row_bottom - row_top).max(0.1);
+
+            // Second pass: vertical-align shifting, backgrounds, per-side borders.
+            for (cell, pl) in cells.iter().zip(&placed) {
                 let cstyle = self.style_of(cell, style, &na);
-                let (dx, cw) = span_geom(start, span);
-                self.out.push(Abs {
-                    z: 0,
-                    zi: 0,
-                    frag: Fragment::Rect {
-                        x: x + dx,
-                        y: row_top,
-                        w: cw,
-                        h: (row_bottom - row_top).max(0.1),
-                        fill: cstyle.background,
-                        stroke: Some(cstyle.border_color),
-                        stroke_w: cstyle.border_width.top.max(0.5),
-                        opacity: cstyle.opacity,
-                    },
-                });
+                let (dx, cw) = span_geom(pl.start, pl.span);
+                let cell_x = x + dx;
+
+                // `vertical-align`: nudge the cell's content fragments down so a
+                // short cell sits middle/bottom in a row sized by a taller peer.
+                let slack = (row_bottom - cstyle.padding.bottom - cstyle.border_width.bottom)
+                    - pl.content_bottom;
+                let shift = match cstyle.vertical_align {
+                    VAlign::Top => 0.0,
+                    VAlign::Middle => (slack / 2.0).max(0.0),
+                    VAlign::Bottom => slack.max(0.0),
+                };
+                if shift > 0.05 {
+                    for a in &mut self.out[pl.frag_lo..pl.frag_hi] {
+                        shift_fragment(&mut a.frag, 0.0, shift);
+                    }
+                }
+
+                // Background fill behind the content (z=0), no stroke.
+                if cstyle.background.is_some() {
+                    self.out.push(Abs {
+                        z: 0,
+                        zi: 0,
+                        frag: Fragment::Rect {
+                            x: cell_x,
+                            y: row_top,
+                            w: cw,
+                            h: row_h,
+                            fill: cstyle.background,
+                            stroke: None,
+                            stroke_w: 0.0,
+                            opacity: cstyle.opacity,
+                        },
+                    });
+                }
+
+                // Per-side borders. In collapse mode draw top + left always, but
+                // bottom only on the last row and right only on the last column,
+                // so interior edges (shared with the next cell down / right) are
+                // drawn exactly once. Separate mode draws all four sides.
+                let bw = &cstyle.border_width;
+                let bc = &cstyle.border_color_edges;
+                let reaches_last_col = pl.start + pl.span.max(1) >= ncols.max(1);
+                let sides = if collapse {
+                    [
+                        bw.top,
+                        if reaches_last_col { bw.right } else { 0.0 },
+                        if is_last_row { bw.bottom } else { 0.0 },
+                        bw.left,
+                    ]
+                } else {
+                    [bw.top, bw.right, bw.bottom, bw.left]
+                };
+                self.emit_border_edges(cell_x, row_top, cw, row_h, sides, bc, cstyle.opacity);
             }
             y = row_bottom;
         }
         y + style.margin.bottom
+    }
+
+    /// Emit up to four per-side border rules for the box `(x, y, w, h)` as thin
+    /// filled rectangles (top-down). `widths`/`colors` are `[top, right, bottom,
+    /// left]`. Filled rects (rather than a single stroked rect) give exact
+    /// per-side placement, width and colour — the only way to honour
+    /// `border-bottom: 2pt` without also thickening the other three sides.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_border_edges(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        widths: [f64; 4],
+        colors: &[[f64; 3]; 4],
+        opacity: f64,
+    ) {
+        // (rect x, y, w, h) for each present side; corners overlap so the frame
+        // joins cleanly (acceptable: same colour, opaque overlap).
+        let push = |out: &mut Vec<Abs>, rx: f64, ry: f64, rw: f64, rh: f64, c: [f64; 3]| {
+            out.push(Abs {
+                z: 0,
+                zi: 0,
+                frag: Fragment::Rect {
+                    x: rx,
+                    y: ry,
+                    w: rw,
+                    h: rh,
+                    fill: Some(c),
+                    stroke: None,
+                    stroke_w: 0.0,
+                    opacity,
+                },
+            });
+        };
+        let [wt, wr, wb, wl] = widths;
+        if wt > 0.0 {
+            push(&mut self.out, x, y, w, wt, colors[0]); // top
+        }
+        if wb > 0.0 {
+            push(&mut self.out, x, y + h - wb, w, wb, colors[2]); // bottom
+        }
+        if wl > 0.0 {
+            push(&mut self.out, x, y, wl, h, colors[3]); // left
+        }
+        if wr > 0.0 {
+            push(&mut self.out, x + w - wr, y, wr, h, colors[1]); // right
+        }
     }
 
     /// Resolve the table's column widths (length `ncols`) to absolute points
@@ -2295,6 +2426,180 @@ mod tests {
             (c - tail).abs() < 1.0,
             "col 2 aligns across rows ({c} vs {tail})"
         );
+    }
+
+    // All filled rects on page 0 as (x, y, w, h, fill, opacity).
+    #[allow(clippy::type_complexity)]
+    fn rects(layout: &Layout) -> Vec<(f64, f64, f64, f64, Option<[f64; 3]>)> {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Rect {
+                    x, y, w, h, fill, ..
+                } => Some((*x, *y, *w, *h, *fill)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_cell_border_bottom_only_draws_a_bottom_rule() {
+        // A red 3pt bottom border with no other sides: expect a thin filled rect
+        // hugging the cell's bottom (h≈3pt, full cell width, red), and NO 3pt
+        // rule at the cell top — the old uniform-stroke path could not do this.
+        let layout = run(
+            r#"<table><tr><td style="border:none;border-bottom:3pt solid #ff0000">Cell</td></tr></table>"#,
+        );
+        let red = [1.0, 0.0, 0.0];
+        let bottoms: Vec<_> = rects(&layout)
+            .into_iter()
+            .filter(|(_, _, _, h, fill)| *fill == Some(red) && (*h - 3.0).abs() < 0.01)
+            .collect();
+        assert_eq!(
+            bottoms.len(),
+            1,
+            "exactly one 3pt-tall red rule (the bottom border): {bottoms:?}"
+        );
+        let (_rx, ry, rw, _rh, _) = bottoms[0];
+        // It must sit at the bottom of the cell, not the top (cell starts at the
+        // content-area top = 36pt).
+        assert!(ry > 36.0 + 5.0, "bottom rule is below the cell top ({ry})");
+        assert!(rw > 100.0, "bottom rule spans the (full-width) cell ({rw})");
+        // No red rect taller than a hairline anywhere else (no spurious side).
+        let red_count = rects(&layout)
+            .into_iter()
+            .filter(|(_, _, _, _, fill)| *fill == Some(red))
+            .count();
+        assert_eq!(red_count, 1, "only the bottom side is red ({red_count})");
+    }
+
+    #[test]
+    fn table_header_cell_background_paints_behind_text() {
+        // A grey header background must render as a fill rect at z=0 *before* the
+        // header text (so text stays legible on top).
+        let layout = run(
+            r#"<table><tr><th style="background:#cccccc">Head</th></tr></table>"#,
+        );
+        let page = &layout.pages[0];
+        let grey = [0.8, 0.8, 0.8];
+        let bg_idx = page.iter().position(|f| {
+            matches!(f, Fragment::Rect { fill: Some(c), .. } if *c == grey)
+        });
+        let text_idx = page
+            .iter()
+            .position(|f| matches!(f, Fragment::Text { text, .. } if text == "Head"));
+        let bg = bg_idx.expect("a grey header-background rect");
+        let tx = text_idx.expect("the header text");
+        assert!(bg < tx, "header background paints before its text");
+    }
+
+    #[test]
+    fn table_per_side_border_colors_are_distinct() {
+        // border-left blue, border-bottom green → two differently-coloured rules.
+        let layout = run(
+            r#"<table><tr><td style="border:none;border-left:2pt solid #0000ff;border-bottom:2pt solid #00ff00">X</td></tr></table>"#,
+        );
+        let has = |c: [f64; 3]| {
+            rects(&layout)
+                .into_iter()
+                .any(|(_, _, _, _, fill)| fill == Some(c))
+        };
+        assert!(has([0.0, 0.0, 1.0]), "blue left border present");
+        assert!(has([0.0, 1.0, 0.0]), "green bottom border present");
+    }
+
+    #[test]
+    fn table_vertical_align_middle_lowers_short_cell_text() {
+        // Two cells in one row: the left cell wraps into several lines (tall),
+        // the right cell holds one line with vertical-align:middle. The short
+        // cell's text must sit *below* where top-alignment would place it.
+        let long = "word ".repeat(60);
+        let html = format!(
+            r#"<table><tr>
+                 <td style="width:80%">{long}</td>
+                 <td style="width:20%;vertical-align:middle">Mid</td>
+               </tr></table>"#,
+        );
+        let mid_top = run(&html_top_variant(&long))
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Text { y, text, .. } if text == "Mid" => Some(*y),
+                _ => None,
+            })
+            .expect("Mid (top-aligned)");
+        let mid_mid = run(&html)
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Text { y, text, .. } if text == "Mid" => Some(*y),
+                _ => None,
+            })
+            .expect("Mid (middle-aligned)");
+        assert!(
+            mid_mid > mid_top + 5.0,
+            "middle-aligned text is lower than top-aligned ({mid_mid} vs {mid_top})"
+        );
+    }
+
+    // Same table but the short cell is top-aligned (baseline for the assertion).
+    fn html_top_variant(long: &str) -> String {
+        format!(
+            r#"<table><tr>
+                 <td style="width:80%">{long}</td>
+                 <td style="width:20%;vertical-align:top">Mid</td>
+               </tr></table>"#,
+        )
+    }
+
+    #[test]
+    fn collapsed_table_does_not_double_interior_rules() {
+        // 2×2 collapsed grid. At the interior vertical grid line each row
+        // contributes exactly ONE rule segment (the right cell's left edge); the
+        // left cell does NOT also stroke its right edge there. So the boundary
+        // carries n_rows segments (2), not 2×n_rows (4) — that's the collapse
+        // dedup. Separate mode (next test) would draw both adjacent sides.
+        let layout = run(
+            "<table style=\"border-collapse:collapse\">\
+               <tr><td>a</td><td>b</td></tr>\
+               <tr><td>c</td><td>d</td></tr></table>",
+        );
+        // Equal 2-col grid over avail 540 ⇒ boundary at 36 + 270 = 306.
+        let boundary = 36.0 + 270.0;
+        let verticals: Vec<_> = rects(&layout)
+            .into_iter()
+            // thin vertical rules straddling the interior boundary
+            .filter(|(rx, _, rw, rh, fill)| {
+                fill.is_some()
+                    && *rw < 4.0
+                    && *rh > 4.0
+                    && (*rx - boundary).abs() < 2.5
+            })
+            .collect();
+        assert_eq!(
+            verticals.len(),
+            2,
+            "interior boundary drawn once per row (2), not doubled (4): {verticals:?}"
+        );
+    }
+
+    #[test]
+    fn separated_table_draws_all_four_cell_sides() {
+        // With border-collapse:separate a single cell draws top/right/bottom/left
+        // → at least 4 border rects (plus none shared away).
+        let layout = run(
+            r#"<table style="border-collapse:separate"><tr><td style="border:1pt solid #000000">x</td></tr></table>"#,
+        );
+        let black = [0.0, 0.0, 0.0];
+        let n = rects(&layout)
+            .into_iter()
+            .filter(|(_, _, _, _, fill)| *fill == Some(black))
+            .count();
+        assert!(n >= 4, "separate mode draws all four cell sides ({n})");
     }
 
     #[test]
