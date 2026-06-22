@@ -763,18 +763,100 @@ fn cluster_edges(values: impl Iterator<Item = f64>) -> Vec<f64> {
 
 // ── borderless fallback ──────────────────────────────────────────────────────
 
+/// Estimate the abscissa of a numeric run's **decimal separator** (the decimal
+/// tab a financial column aligns on), or `None` when the run is not a decimal
+/// value. This is the R10 refinement of R8: amounts with *different* decimal
+/// counts (`1,5` / `12,00` / `3,75`) share neither a right edge nor a left edge
+/// but DO share the X of their `,` (or `.`). Returns the X of the last decimal
+/// separator so `1.234,00` aligns on its `,`, not on a thousands `.`.
+///
+/// The position is approximated proportionally from the run's box: a run spans
+/// `[x, x + w]`, so the separator at character offset `k` of an `n`-character
+/// string sits at roughly `x + w * (k / n)`. This assumes near-monospaced digit
+/// advance, which holds well enough for clustering (a tolerance absorbs the
+/// drift). `text` is trimmed first so leading currency/sign/space don't bias the
+/// ratio — the trimmed offsets are mapped back onto the original box width.
+fn decimal_sep_x(text: &str, x: f64, w: f64) -> Option<f64> {
+    if w <= 0.0 {
+        return None;
+    }
+    let trimmed = text.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let n = chars.len();
+    if n < 2 {
+        return None;
+    }
+    // European convention (matching the codebase's amounts, e.g. `1.234,00`): the
+    // decimal separator is a `,` when any `,` is present — then a `.` is always a
+    // thousands grouping, never the decimal point. With no `,`, a `.` may be the
+    // decimal point UNLESS the value is a dot-grouped integer (≥ 2 dots, each
+    // group exactly 3 digits, e.g. `1.234.567`), which carries no fractional part.
+    let has_comma = chars.contains(&',');
+    let dot_count = chars.iter().filter(|&&c| c == '.').count();
+    // Decide which separator character is the decimal point for this run.
+    let decimal_char: char = if has_comma {
+        ','
+    } else if dot_count >= 2 {
+        // Looks like dot-grouped thousands; only a `,` could be decimal, and there
+        // is none → no decimal separator.
+        return None;
+    } else {
+        '.'
+    };
+    // Find the last occurrence of the decimal character that is a real decimal
+    // separator: 1–3 trailing fractional digits, at least one digit before it, and
+    // only currency/space/sign after the fractional digits.
+    let mut sep_idx: Option<usize> = None;
+    for i in (0..n).rev() {
+        if chars[i] != decimal_char {
+            continue;
+        }
+        let mut frac = 0usize;
+        let mut j = i + 1;
+        while j < n && chars[j].is_ascii_digit() {
+            frac += 1;
+            j += 1;
+        }
+        let tail_ok = chars[j..]
+            .iter()
+            .all(|&c| c.is_whitespace() || matches!(c, '€' | '$' | '%' | '£' | '-' | '+'));
+        let has_lead_digit = i > 0 && chars[..i].iter().any(|c| c.is_ascii_digit());
+        if (1..=3).contains(&frac) && tail_ok && has_lead_digit {
+            sep_idx = Some(i);
+            break;
+        }
+    }
+    let sep_idx = sep_idx?;
+    // The separator occupies offset `sep_idx`; place X at its *centre* (offset +
+    // 0.5) over the trimmed span, mapped onto the original box. Leading trimmed
+    // chars shift the trimmed text right within the box, but proportionally over
+    // the *trimmed* length the centre estimate stays stable, so we map the ratio
+    // straight onto `[x, x + w]`.
+    let ratio = (sep_idx as f64 + 0.5) / n as f64;
+    Some(x + w * ratio)
+}
+
 /// One detected borderless column: the abscissa its cells align on (`anchor`) and
 /// *which* edge that is (`align`). A left-aligned column shares its runs' **left**
 /// edge (`run.x`); a right-aligned column shares their **right** edge
-/// (`run.x + run.w`) — the latter is how numeric/financial columns (amounts,
-/// decimals) line up, with widely varying left edges. Decimal columns are
-/// approximated as right-aligned: integers and money amounts share their last
-/// digit's right edge, which is the decimal-tab to a tolerance.
+/// (`run.x + run.w`) — the latter is how numeric/financial columns with a fixed
+/// right edge line up. R10 adds a third family, the **decimal column**: amounts
+/// with differing decimal counts (`1,5` / `12,00` / `3,75`) share neither a left
+/// nor a right edge, but they share the X of their decimal separator. A decimal
+/// column anchors on that separator X yet is *reported* as `Align::Right` (the
+/// nearest existing semantic — the `Align` enum lives outside `recon/` and is not
+/// extended here), so downstream cell styling is unchanged.
 #[derive(Debug, Clone, Copy)]
 struct Column {
-    /// The shared edge abscissa (left edge for `Left`, right edge for `Right`).
+    /// The shared edge abscissa used to *assign* runs to this column: the left
+    /// edge for `Left`, the right edge for `Right` (or the decimal-separator X for
+    /// a decimal column — see [`Column::decimal`]).
     anchor: f64,
     align: Align,
+    /// `true` when this column was detected as a **decimal** column: `align` is
+    /// still `Right` (no `Align::Decimal`), but `anchor` is the decimal-separator
+    /// X and runs are matched on their own separator X, not their right edge.
+    decimal: bool,
     /// A representative horizontal position used only to *order* columns and place
     /// the boundary between neighbours — the cluster's centre-of-mass X.
     center: f64,
@@ -822,83 +904,120 @@ fn cluster_1d(values: &[f64], gap: f64) -> Vec<Cluster> {
     out
 }
 
-/// Detect the borderless columns of a region by clustering **both** the left and
-/// the right edges of its runs and letting each run vote for whichever edge it
-/// sits on most tightly. This recognises right-aligned numeric columns (shared
-/// right edge, scattered left edges) and mixed layouts (a left-aligned label
-/// column beside a right-aligned amount column) that pure left-edge clustering
-/// would otherwise shatter or fuse.
+/// Detect the borderless columns of a region by clustering the left edges, the
+/// right edges, **and** the decimal-separator abscissae of its runs, then letting
+/// each run vote for whichever it sits on most tightly. This recognises
+/// right-aligned numeric columns (shared right edge, scattered left edges), mixed
+/// layouts (a left-aligned label column beside an amount column), and — the R10
+/// refinement — **decimal columns** whose amounts have varying decimal counts
+/// (`1,5` / `12,00` / `3,75`) so they share only the X of their `,`. Pure
+/// left/right-edge clustering would shatter that last case into parasitic columns.
 ///
-/// `runs` is `(left, right)` per run across the region. The gate is deliberately
-/// kept downstream (≥ 2 rows hitting ≥ 2 columns); this only *proposes* columns.
-fn detect_columns(runs: &[(f64, f64)], col_gap: f64) -> Vec<Column> {
+/// `runs` is `(left, right, decimal_x)` per run across the region, where
+/// `decimal_x` is `Some(x_of_separator)` for a numeric value with decimals (from
+/// [`decimal_sep_x`]) and `None` otherwise. The gate is deliberately kept
+/// downstream (≥ 2 rows hitting ≥ 2 columns); this only *proposes* columns.
+fn detect_columns(runs: &[(f64, f64, Option<f64>)], col_gap: f64) -> Vec<Column> {
     if runs.len() < 2 {
         return Vec::new();
     }
-    let lefts: Vec<f64> = runs.iter().map(|&(l, _)| l).collect();
-    let rights: Vec<f64> = runs.iter().map(|&(_, r)| r).collect();
+    let lefts: Vec<f64> = runs.iter().map(|&(l, _, _)| l).collect();
+    let rights: Vec<f64> = runs.iter().map(|&(_, r, _)| r).collect();
+    let decimals: Vec<f64> = runs.iter().filter_map(|&(_, _, d)| d).collect();
     let left_clusters = cluster_1d(&lefts, col_gap);
     let right_clusters = cluster_1d(&rights, col_gap);
+    // Decimal columns align on the separator, which is tighter than a right edge,
+    // so cluster them on a smaller gap to avoid fusing two adjacent money columns.
+    let dec_clusters = cluster_1d(&decimals, (col_gap * 0.5).max(4.0));
 
-    // Candidate columns from both edge families. Each run will be assigned to the
-    // single best candidate (by the matching edge), so overlapping left/right
-    // candidates compete for runs rather than both surviving.
+    /// What a candidate column aligns on. `Decimal` is reported to callers as a
+    /// right-aligned column (`Align::Right`) but matches runs on their separator X.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Kind {
+        Left,
+        Right,
+        Decimal,
+    }
+    // Candidate columns from the three families. Each run is assigned to a single
+    // best candidate, so overlapping candidates compete for runs rather than all
+    // surviving.
     struct Cand {
         pos: f64,
-        align: Align,
+        kind: Kind,
         spread: f64,
         /// Cluster support = how many edges fell in this candidate's cluster. The
         /// *primary* tiebreak when a run sits equally on two candidates: a shared
-        /// right edge backed by many runs beats each run's own singleton left edge,
-        /// so right-aligned numeric columns win over the accidental per-row
+        /// right edge (or separator X) backed by many runs beats each run's own
+        /// singleton left edge, so numeric columns win over the accidental per-row
         /// left-edge clusters their scattered left edges create.
         support: usize,
-        // Edges of the runs that ended up choosing this candidate (the chosen-edge
-        // value), used to re-fit the anchor and to compute the centre.
+        // Edges of the runs that ended up choosing this candidate, used to re-fit
+        // the anchor and to compute the centre.
         chosen_left: Vec<f64>,
         chosen_right: Vec<f64>,
+        // Separator X of the (decimal) runs that chose this candidate; only filled
+        // for `Decimal` candidates, used to re-fit the decimal anchor.
+        chosen_dec: Vec<f64>,
     }
+    let mk = |pos: f64, kind: Kind, spread: f64, support: usize| Cand {
+        pos,
+        kind,
+        spread,
+        support,
+        chosen_left: Vec::new(),
+        chosen_right: Vec::new(),
+        chosen_dec: Vec::new(),
+    };
     let mut cands: Vec<Cand> = Vec::new();
     for c in &left_clusters {
-        cands.push(Cand {
-            pos: c.mean,
-            align: Align::Left,
-            spread: c.spread(),
-            support: c.members.len(),
-            chosen_left: Vec::new(),
-            chosen_right: Vec::new(),
-        });
+        cands.push(mk(c.mean, Kind::Left, c.spread(), c.members.len()));
     }
     for c in &right_clusters {
-        cands.push(Cand {
-            pos: c.mean,
-            align: Align::Right,
-            spread: c.spread(),
-            support: c.members.len(),
-            chosen_left: Vec::new(),
-            chosen_right: Vec::new(),
-        });
+        cands.push(mk(c.mean, Kind::Right, c.spread(), c.members.len()));
+    }
+    for c in &dec_clusters {
+        // A decimal column needs ≥ 2 amounts agreeing on the separator to be
+        // evidence; a lone decimal value is not a column on its own.
+        if c.members.len() >= 2 {
+            cands.push(mk(c.mean, Kind::Decimal, c.spread(), c.members.len()));
+        }
     }
 
     // Assign each run to its best candidate: the nearest left-candidate by its left
-    // edge, or the nearest right-candidate by its right edge. When a run sits on
-    // two candidates at (near-)equal distance — the common case for a numeric cell
-    // whose left edge happens to form its own singleton cluster — prefer the
-    // candidate with **more support**, then the tighter one, then left (stable).
-    for &(l, r) in runs {
-        // (idx, dist, support, spread)
-        let mut best: Option<(usize, f64, usize, f64)> = None;
+    // edge, the nearest right-candidate by its right edge, or — for a numeric run —
+    // the nearest decimal-candidate by its separator X. When a run sits on two
+    // candidates at (near-)equal distance, prefer a decimal match (the most
+    // specific evidence for a money column), then more support, then the tighter
+    // one, then left (stable).
+    for &(l, r, dec) in runs {
+        // (idx, dist, is_decimal, support, spread)
+        let mut best: Option<(usize, f64, bool, usize, f64)> = None;
         for (idx, cand) in cands.iter().enumerate() {
-            let edge = if cand.align == Align::Left { l } else { r };
+            let edge = match cand.kind {
+                Kind::Left => l,
+                Kind::Right => r,
+                // Only a numeric run (with its own separator X) can match a decimal
+                // candidate; a label never lands in a decimal column.
+                Kind::Decimal => match dec {
+                    Some(d) => d,
+                    None => continue,
+                },
+            };
             let dist = (edge - cand.pos).abs();
             if dist > col_gap {
                 continue;
             }
+            let is_dec = cand.kind == Kind::Decimal;
             let better = match best {
                 None => true,
-                Some((_, bd, bsup, bspr)) => {
+                Some((_, bd, bdec, bsup, bspr)) => {
                     if (dist - bd).abs() > 1e-6 {
                         dist < bd
+                    } else if is_dec != bdec {
+                        // Equal distance: the decimal-tab interpretation wins, so a
+                        // money column anchors on its separator rather than fanning
+                        // out across right-edge / left-edge singletons.
+                        is_dec
                     } else if cand.support != bsup {
                         cand.support > bsup
                     } else {
@@ -907,19 +1026,22 @@ fn detect_columns(runs: &[(f64, f64)], col_gap: f64) -> Vec<Column> {
                 }
             };
             if better {
-                best = Some((idx, dist, cand.support, cand.spread));
+                best = Some((idx, dist, is_dec, cand.support, cand.spread));
             }
         }
-        if let Some((idx, _, _, _)) = best {
+        if let Some((idx, _, _, _, _)) = best {
             cands[idx].chosen_left.push(l);
             cands[idx].chosen_right.push(r);
+            if let Some(d) = dec {
+                cands[idx].chosen_dec.push(d);
+            }
         }
     }
 
     // Keep only candidates that actually won runs, re-fit their anchor from the
-    // chosen edges, and compute a centre-of-mass for ordering. A right candidate
-    // that lost all its runs to a coincident left candidate (or vice-versa) drops
-    // out here, so we never emit two columns for the same physical column.
+    // chosen edges, and compute a centre-of-mass for ordering. A candidate that
+    // lost all its runs to a coincident one drops out here, so we never emit two
+    // columns for the same physical column.
     let mut columns: Vec<Column> = Vec::new();
     for cand in &cands {
         if cand.chosen_left.len() < 2 {
@@ -927,12 +1049,18 @@ fn detect_columns(runs: &[(f64, f64)], col_gap: f64) -> Vec<Column> {
             // run is just a word and never anchors a column on its own.
             continue;
         }
-        let anchor_src = if cand.align == Align::Left {
-            &cand.chosen_left
-        } else {
-            &cand.chosen_right
+        let is_decimal = cand.kind == Kind::Decimal;
+        let anchor = match cand.kind {
+            Kind::Left => cand.chosen_left.iter().sum::<f64>() / cand.chosen_left.len() as f64,
+            Kind::Right => cand.chosen_right.iter().sum::<f64>() / cand.chosen_right.len() as f64,
+            // Decimal columns anchor on the mean separator X of their amounts.
+            Kind::Decimal => {
+                if cand.chosen_dec.len() < 2 {
+                    continue;
+                }
+                cand.chosen_dec.iter().sum::<f64>() / cand.chosen_dec.len() as f64
+            }
         };
-        let anchor = anchor_src.iter().sum::<f64>() / anchor_src.len() as f64;
         let lo = cand
             .chosen_left
             .iter()
@@ -944,9 +1072,16 @@ fn detect_columns(runs: &[(f64, f64)], col_gap: f64) -> Vec<Column> {
             .cloned()
             .fold(f64::NEG_INFINITY, f64::max);
         let center = (lo + hi) / 2.0;
+        // A decimal column reports as right-aligned (no `Align::Decimal`); the
+        // other families map to their natural alignment.
+        let align = match cand.kind {
+            Kind::Left => Align::Left,
+            Kind::Right | Kind::Decimal => Align::Right,
+        };
         columns.push(Column {
             anchor,
-            align: cand.align,
+            align,
+            decimal: is_decimal,
             center,
         });
     }
@@ -969,14 +1104,34 @@ fn detect_columns(runs: &[(f64, f64)], col_gap: f64) -> Vec<Column> {
     deduped
 }
 
-/// Which detected column a run belongs to: the column whose *matching* edge
-/// (left edge for a `Left` column, right edge for a `Right` column) is nearest the
-/// run's corresponding edge. Returns the index, or `None` if nothing is within
-/// `col_gap` (a stray run between columns is not counted toward the row's hits).
-fn column_of_run(columns: &[Column], left: f64, right: f64, col_gap: f64) -> Option<usize> {
+/// Which detected column a run belongs to: the column whose *matching* abscissa is
+/// nearest the run's corresponding one — the left edge for a `Left` column, the
+/// right edge for a `Right` column, or the **decimal-separator X** for a decimal
+/// column (when the run has one). Returns the index, or `None` if nothing is
+/// within `col_gap` (a stray run between columns is not counted toward the row's
+/// hits). `dec` is the run's separator X from [`decimal_sep_x`], or `None`.
+fn column_of_run(
+    columns: &[Column],
+    left: f64,
+    right: f64,
+    dec: Option<f64>,
+    col_gap: f64,
+) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for (i, col) in columns.iter().enumerate() {
-        let edge = if col.align == Align::Left { left } else { right };
+        // A decimal column is matched on the run's separator X when the run is
+        // numeric; a non-numeric run falls back to its right edge so labels still
+        // resolve sensibly against the column's (separator) anchor.
+        let edge = if col.decimal {
+            match dec {
+                Some(d) => d,
+                None => right,
+            }
+        } else if col.align == Align::Left {
+            left
+        } else {
+            right
+        };
         let dist = (edge - col.anchor).abs();
         if dist > col_gap {
             continue;
@@ -1002,11 +1157,13 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
     // First pass: global columns only to *identify* which free lines are tabular
     // (hit ≥ 2 columns). The grid itself is rebuilt per region below with local
     // columns, so a global mismatch between two regions can't distort either.
-    let mut edges: Vec<(f64, f64)> = Vec::new();
+    // Each edge tuple is `(left, right, decimal_x)` — the third carries the X of a
+    // numeric run's decimal separator so amounts with varying decimals still group.
+    let mut edges: Vec<(f64, f64, Option<f64>)> = Vec::new();
     let mut heights: Vec<f64> = Vec::new();
     for &i in free {
         for r in &lines[i].runs {
-            edges.push((r.x, r.x + r.w));
+            edges.push((r.x, r.x + r.w, decimal_sep_x(&r.text, r.x, r.w)));
             heights.push(r.h.max(1.0));
         }
     }
@@ -1024,7 +1181,8 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
     for &i in free {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
         for r in &lines[i].runs {
-            if let Some(c) = column_of_run(&global_columns, r.x, r.x + r.w, col_gap) {
+            let dec = decimal_sep_x(&r.text, r.x, r.w);
+            if let Some(c) = column_of_run(&global_columns, r.x, r.x + r.w, dec, col_gap) {
                 hit.insert(c);
             }
         }
@@ -1079,10 +1237,12 @@ fn build_borderless_region(
     if region.len() < 2 {
         return None;
     }
-    let mut edges: Vec<(f64, f64)> = Vec::new();
+    // `(left, right, decimal_x)` per run — the decimal X groups varying-decimal
+    // amounts onto their shared separator (R10).
+    let mut edges: Vec<(f64, f64, Option<f64>)> = Vec::new();
     for &i in region {
         for r in &lines[i].runs {
-            edges.push((r.x, r.x + r.w));
+            edges.push((r.x, r.x + r.w, decimal_sep_x(&r.text, r.x, r.w)));
         }
     }
     let columns = detect_columns(&edges, col_gap);
@@ -1094,7 +1254,8 @@ fn build_borderless_region(
     for &i in region {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
         for r in &lines[i].runs {
-            if let Some(c) = column_of_run(&columns, r.x, r.x + r.w, col_gap) {
+            let dec = decimal_sep_x(&r.text, r.x, r.w);
+            if let Some(c) = column_of_run(&columns, r.x, r.x + r.w, dec, col_gap) {
                 hit.insert(c);
             }
         }
@@ -1769,14 +1930,17 @@ mod tests {
         // resolve to exactly TWO columns — Left then Right — not three shattered
         // numeric columns. Left-edge-only clustering produced four anchors here.
         let edges = vec![
-            // labels: (left, right) — left edge fixed, varying widths
-            (72.0, 112.0),
-            (72.0, 192.0),
-            (72.0, 132.0),
-            // amounts: right edge fixed at 540, widely varying left edge
-            (490.0, 540.0),
-            (465.0, 540.0),
-            (520.0, 540.0),
+            // labels: (left, right, decimal_x) — left edge fixed, varying widths,
+            // no decimal separator.
+            (72.0, 112.0, None),
+            (72.0, 192.0, None),
+            (72.0, 132.0, None),
+            // amounts: right edge fixed at 540, widely varying left edge. These
+            // amounts carry no fractional text in this unit test (the edges are
+            // synthetic), so they stay a right-aligned column, not a decimal one.
+            (490.0, 540.0, None),
+            (465.0, 540.0, None),
+            (520.0, 540.0, None),
         ];
         let cols = detect_columns(&edges, 20.0);
         assert_eq!(cols.len(), 2, "label + amount = 2 columns, got {cols:?}");
@@ -1945,6 +2109,155 @@ mod tests {
         assert!(
             plan.take_if_starts_at(0).is_none(),
             "a shared right edge alone is not a column"
+        );
+    }
+
+    // ── R10: decimal-tab borderless columns (varying decimal counts) ─────────
+
+    #[test]
+    fn decimal_sep_x_locates_the_separator() {
+        // The estimate places the separator proportionally inside the run box. For
+        // a box [400, 480] (w=80), the `,` of "12,00" (offset 2 of 5) lands near the
+        // middle; an integer or a trailing-dot string has no decimal separator.
+        let x = decimal_sep_x("12,00", 400.0, 80.0).expect("comma is a decimal sep");
+        assert!((x - 440.0).abs() < 1.0, "sep ≈ 440 (mid box), got {x}");
+        // "1.234,00": the LAST separator (the comma) is the decimal point, not the
+        // thousands dot.
+        let x2 = decimal_sep_x("1.234,00", 400.0, 80.0).expect("last sep is the comma");
+        assert!(x2 > 440.0, "decimal sep is the comma (right of centre), got {x2}");
+        // Non-decimal text returns None.
+        assert!(decimal_sep_x("Total", 0.0, 50.0).is_none(), "word: no separator");
+        assert!(decimal_sep_x("42", 0.0, 20.0).is_none(), "integer: no separator");
+        assert!(
+            decimal_sep_x("End of sentence.", 0.0, 90.0).is_none(),
+            "trailing dot is not a decimal separator"
+        );
+        assert!(
+            decimal_sep_x("1.234.567", 0.0, 60.0).is_none(),
+            "grouped integer (no fractional part) is not a decimal value"
+        );
+    }
+
+    #[test]
+    fn detect_columns_groups_varying_decimal_amounts_into_one_column() {
+        // R10 unit-level: a left-aligned label column plus amounts whose DECIMAL
+        // SEPARATORS align at X=500 but whose left edges (440..480, spread 40) AND
+        // right edges (510..545, spread 35) both scatter beyond col_gap (20). Pure
+        // R8 left/right clustering shatters the amounts into singletons (no column
+        // survives); the decimal family recovers a single amount column.
+        let edges_with_dec: Vec<(f64, f64, Option<f64>)> = vec![
+            // labels: left edge fixed at 72, ragged right edges.
+            (72.0, 110.0, None),
+            (72.0, 190.0, None),
+            (72.0, 130.0, None),
+            // amounts "1,5" / "12,00" / "3,75"-like: separator X = 500, scattered edges.
+            (480.0, 510.0, Some(500.0)),
+            (450.0, 525.0, Some(500.0)),
+            (440.0, 545.0, Some(500.0)),
+        ];
+        let cols = detect_columns(&edges_with_dec, 20.0);
+        assert_eq!(cols.len(), 2, "label + decimal amount = 2 columns, got {cols:?}");
+        assert_eq!(cols[0].align, Align::Left, "label column is left-aligned");
+        assert!(!cols[0].decimal, "label column is not a decimal column");
+        // The amount column is a decimal column anchored on the separator X (≈500),
+        // reported as right-aligned (no Align::Decimal variant).
+        assert!(cols[1].decimal, "amount column is detected as decimal");
+        assert_eq!(cols[1].align, Align::Right, "decimal column reports as Right");
+        assert!(
+            (cols[1].anchor - 500.0).abs() < 1.0,
+            "decimal anchor ≈ separator X 500, got {}",
+            cols[1].anchor
+        );
+
+        // Proof the decimal path is what saves it: drop the separator info and the
+        // SAME scattered edges no longer yield an amount column at all (R8 alone).
+        let edges_no_dec: Vec<(f64, f64, Option<f64>)> =
+            edges_with_dec.iter().map(|&(l, r, _)| (l, r, None)).collect();
+        let r8_only = detect_columns(&edges_no_dec, 20.0);
+        assert!(
+            r8_only.len() < 2,
+            "without the decimal family these amounts shatter (no 2nd column), got {r8_only:?}"
+        );
+    }
+
+    #[test]
+    fn borderless_varying_decimal_amounts_is_one_amount_column() {
+        // R10 integration: a "Libellé … Montant" table where amounts have DIFFERENT
+        // decimal counts (1, 2 and 3 decimals) so their separators align but their
+        // left edges scatter (436..468, spread > col_gap) — exactly the case R8's
+        // right-edge approximation could not hold. Must resolve to a 2-column table
+        // (label + amount), with the amount column right-aligned.
+        // Amounts placed so the decimal separator sits at X≈480 (8px/char widths).
+        let runs = vec![
+            // Header.
+            run("Libelle", 72.0, 700.0, 56.0), // right 128
+            run("Montant", 440.0, 700.0, 56.0), // header over the amount column
+            // "5,5"  (1 decimal)   x=468 w=24  right=492
+            run("Service", 72.0, 684.0, 56.0),
+            run("5,5", 468.0, 684.0, 24.0),
+            // "1.250,00" (2 decimals) x=436 w=64 right=500
+            run("Materiel divers", 72.0, 668.0, 120.0),
+            run("1.250,00", 436.0, 668.0, 64.0),
+            // "99,750" (3 decimals) x=460 w=48 right=508
+            run("Quantite", 72.0, 652.0, 64.0),
+            run("99,750", 460.0, 652.0, 48.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines).expect("decimal-aligned amounts form a table");
+        assert_eq!(
+            table.rows.len(),
+            4,
+            "four rows (header + 3 lines), got {}",
+            table.rows.len()
+        );
+        // Each row has exactly two cells: the amount column did not shatter into
+        // several decimal-count columns.
+        for (ri, row) in table.rows.iter().enumerate() {
+            assert_eq!(
+                row.cells.len(),
+                2,
+                "row {ri} must have 2 cells (label + amount), got {}",
+                row.cells.len()
+            );
+        }
+        // Amounts land together in column 1.
+        assert_eq!(cell_text(&table.rows[2].cells[1]), "1.250,00");
+        assert_eq!(cell_text(&table.rows[3].cells[1]), "99,750");
+        // The amount column is right-aligned (decimal reported as Right).
+        assert_eq!(
+            cell_align(&table.rows[2].cells[1]),
+            Align::Right,
+            "amount cell is right-aligned"
+        );
+        assert_eq!(
+            cell_align(&table.rows[1].cells[0]),
+            Align::Left,
+            "label cell is left-aligned"
+        );
+        // Borderless ⇒ no widened border.
+        assert_eq!(table.border.width, 0.0);
+    }
+
+    #[test]
+    fn decimals_scattered_in_prose_are_not_promoted_to_a_table() {
+        // R10 anti-prose: a single column of body text that merely *mentions*
+        // numbers with decimals must not become a table. The lines share their left
+        // edge (prose), there is no aligned separator forming a real column, and no
+        // second column — so the decimal family must not manufacture one.
+        let runs = vec![
+            run("The total was 12,50 last quarter", 72.0, 700.0, 190.0),
+            run("but only 3,7 in the prior period", 72.0, 686.0, 188.0),
+            run("and roughly 145,99 the year before", 72.0, 672.0, 196.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+        assert!(
+            plan.take_if_starts_at(0).is_none(),
+            "prose mentioning decimals stays prose"
+        );
+        assert!(
+            borderless_table(&lines).is_none(),
+            "no table is built from prose with stray decimals"
         );
     }
 }
