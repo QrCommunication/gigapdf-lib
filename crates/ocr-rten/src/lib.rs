@@ -48,7 +48,16 @@ pub enum Profile {
 }
 
 const LEGACY_H: usize = 32; // legacy CRNN strip height
-const LEGACY_W: usize = 800; // legacy ONNX fixed width (custom GRU unrolls → fixed length)
+const LEGACY_W: usize = 800; // legacy ONNX fixed width (custom GRU unrolls → fixed length); must
+                             // match convert_legacy_gpocr.py's export width. NB: long trailing
+                             // padding degrades the backward GRU → accuracy caps below the model's
+                             // isolated quality; a dynamic-width export (ONNX Loop) would lift it.
+
+/// Name of the bundled handwriting recognizer. Pass to [`OcrEngine::recognize_page_with`] /
+/// [`OcrEngine::recognize_line_with`], or use [`OcrEngine::recognize_page_handwriting`].
+/// Handwriting is **opt-in** (not in auto script selection) — call it when the input is known
+/// to be handwritten.
+pub const HANDWRITING_MODEL: &str = "latin_hw";
 
 /// An axis-aligned text box in original-image pixel coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -311,6 +320,20 @@ impl OcrEngine {
         Ok(out)
     }
 
+    /// Convenience: OCR a page with the **handwriting** recognizer ([`HANDWRITING_MODEL`]).
+    /// Errors if the handwriting model isn't loaded in this models dir.
+    pub fn recognize_page_handwriting(
+        &self,
+        img: &RgbImage,
+    ) -> Result<Vec<Line>, Box<dyn std::error::Error>> {
+        self.recognize_page_with(img, HANDWRITING_MODEL)
+    }
+
+    /// Whether the handwriting recognizer ([`HANDWRITING_MODEL`]) is loaded.
+    pub fn has_handwriting(&self) -> bool {
+        self.recs.iter().any(|m| m.name == HANDWRITING_MODEL)
+    }
+
     /// Run one rec model on a cropped line → (text, mean confidence). Reverses RTL output to logical.
     fn decode(&self, m: &RecModel, line: &RgbImage) -> Result<(String, f32), Box<dyn std::error::Error>> {
         let (w0, h0) = (line.width().max(1) as f32, line.height().max(1) as f32);
@@ -333,16 +356,35 @@ impl OcrEngine {
                 NdTensor::from_data([1, 3, REC_H, w], data)
             }
             Profile::LegacyGray32 => {
-                // Grayscale, height 32, ink = 1 − gray (dark text → 1), right-padded to the fixed
-                // LEGACY_W (the legacy ONNX has an unrolled GRU → fixed length); bg = 0.
-                let w32 = (((LEGACY_H as f32) * w0 / h0).round().max(1.0) as usize).min(LEGACY_W);
-                let resized = image::imageops::resize(line, w32 as u32, LEGACY_H as u32, FilterType::Triangle);
+                // Match the legacy trainer's render: ink = 1 − gray (dark text → 1), TIGHT-CROP to
+                // the ink bounding box, resize to height 32, right-pad to the fixed LEGACY_W (the
+                // legacy ONNX has an unrolled GRU → fixed length); bg = 0.
+                let (lw, lh) = (line.width() as usize, line.height() as usize);
+                let ink = |px: &image::Rgb<u8>| 1.0 - (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0 / 255.0;
+                let (mut x0, mut y0, mut x1, mut y1) = (lw, lh, 0usize, 0usize);
+                for y in 0..lh {
+                    for x in 0..lw {
+                        if ink(line.get_pixel(x as u32, y as u32)) > 0.16 {
+                            x0 = x0.min(x);
+                            y0 = y0.min(y);
+                            x1 = x1.max(x);
+                            y1 = y1.max(y);
+                        }
+                    }
+                }
+                // Fallback to the full crop if no ink found.
+                let (cx, cy, cw, ch) = if x1 >= x0 && y1 >= y0 {
+                    (x0 as u32, y0 as u32, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32)
+                } else {
+                    (0, 0, lw as u32, lh as u32)
+                };
+                let cropped = image::imageops::crop_imm(line, cx, cy, cw, ch).to_image();
+                let w32 = (((LEGACY_H as f32) * cw as f32 / ch as f32).round().max(1.0) as usize).min(LEGACY_W);
+                let resized = image::imageops::resize(&cropped, w32 as u32, LEGACY_H as u32, FilterType::Triangle);
                 let mut data = vec![0f32; LEGACY_H * LEGACY_W];
                 for y in 0..LEGACY_H {
                     for x in 0..w32 {
-                        let px = resized.get_pixel(x as u32, y as u32);
-                        let gray = (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0 / 255.0;
-                        data[y * LEGACY_W + x] = 1.0 - gray;
+                        data[y * LEGACY_W + x] = ink(resized.get_pixel(x as u32, y as u32));
                     }
                 }
                 NdTensor::from_data([1, 1, LEGACY_H, LEGACY_W], data)
