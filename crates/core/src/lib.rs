@@ -70,5 +70,4 @@ pub use object::{Dictionary, Object, ObjectId, Stream, StringKind};
 pub use ocg::Layer;
 pub use outline::OutlineItem;
 pub use parser::Parser;
-pub use raster::ocr::{OcrResult, OcrWord};
 pub use text::{Direction, DocLanguage, Script};

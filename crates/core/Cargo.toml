@@ -53,14 +53,5 @@ cms = { version = "0.2", features = ["builder"] }
 [dev-dependencies]
 # Tests run against ../../fixtures via CARGO_MANIFEST_DIR.
 
-[features]
-# Embed per-script CRNN+CTC line-OCR models (trained offline by
-# tools/train_ocr_crnn.py → crates/core/src/raster/ocr_model_<group>.rs). OFF by
-# default: the base build ships only the mono-glyph model (ocr_model.rs). Enabling a
-# group bundles its int8 line recognizer and routes lines to it via ocr_crnn.
-ocr-alpha = []   # Latin + Cyrillic + Greek
-ocr-cjk = []     # Chinese / Japanese / Korean
-ocr-arabic = []  # Arabic / Hebrew (RTL)
-ocr-deva = []    # Devanagari
-ocr-beng = []    # Bengali
-ocr-taml = []    # Tamil
+# No [features]: OCR moved host-side to the `gigapdf-ocr-rten` crate (PaddleOCR + RTen).
+# The core stays pure-std with no optional model-embedding features.

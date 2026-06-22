@@ -7,13 +7,6 @@
 
 pub mod canvas;
 pub mod colorspace;
-pub mod dewarp;
-pub mod ocr;
-pub mod ocr_crnn;
-pub mod ocr_model;
-// Per-script CRNN line models (feature-gated; files emitted by tools/train_ocr_crnn.py).
-#[cfg(feature = "ocr-alpha")]
-pub mod ocr_model_alpha;
 pub mod gif;
 pub mod jpeg;
 pub mod png;

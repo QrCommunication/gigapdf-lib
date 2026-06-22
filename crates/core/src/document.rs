@@ -4084,58 +4084,6 @@ impl Document {
         ]
     }
 
-    /// OCR a page with the built-in zero-dependency recognizer. The page is
-    /// rasterized at `scale` (≥ 2.0 recommended for small text), binarized, and
-    /// recognized; returns the text plus word boxes in **PDF user space** so the
-    /// host can highlight or overlay. Works on scanned (image-only) pages — for
-    /// pages that already carry a text layer, prefer [`structured_text`](Self::structured_text).
-    pub fn ocr_page(&self, page_no: u32, scale: f64) -> Vec<crate::raster::ocr::OcrWord> {
-        let Ok(canvas) = self.render_page_canvas(page_no, scale, false) else {
-            return Vec::new();
-        };
-        let (w, h) = (canvas.width as usize, canvas.height as usize);
-        let gray: Vec<u8> = canvas
-            .pixels
-            .chunks_exact(4)
-            .map(|p| ((p[0] as u32 + p[1] as u32 + p[2] as u32) / 3) as u8)
-            .collect();
-        let result = crate::raster::ocr::ocr(&gray, w, h);
-
-        // Map image pixels (top-left origin) back to PDF user space (bottom-left).
-        let media = self
-            .page_dict(page_no)
-            .map(|p| self.read_media_box(p))
-            .unwrap_or([0.0, 0.0, 612.0, 792.0]);
-        let (x0, y0) = (media[0], media[1]);
-        let page_h = (media[3] - media[1]).abs();
-        let s = scale.max(0.01);
-        result
-            .words
-            .into_iter()
-            .map(|word| crate::raster::ocr::OcrWord {
-                text: word.text,
-                x: x0 + word.x / s,
-                y: y0 + page_h - (word.y + word.height) / s,
-                width: word.width / s,
-                height: word.height / s,
-            })
-            .collect()
-    }
-
-    /// OCR a page and return only the recognized text (newline-separated lines).
-    pub fn ocr_page_text(&self, page_no: u32, scale: f64) -> String {
-        let Ok(canvas) = self.render_page_canvas(page_no, scale, false) else {
-            return String::new();
-        };
-        let (w, h) = (canvas.width as usize, canvas.height as usize);
-        let gray: Vec<u8> = canvas
-            .pixels
-            .chunks_exact(4)
-            .map(|p| ((p[0] as u32 + p[1] as u32 + p[2] as u32) / 3) as u8)
-            .collect();
-        crate::raster::ocr::ocr(&gray, w, h).text
-    }
-
     /// Extract every page's editable content (positioned text, re-embedded
     /// images, shape rectangles) into the conversion model, normalizing PDF
     /// bottom-up user space to top-down points. This is the shared front-end for

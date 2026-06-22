@@ -22,7 +22,7 @@ mod rng;
 
 use gigapdf_core::{
     Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
-    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OcrWord, OutlineItem, SearchMatch,
+    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, SearchMatch,
     TextLayerRun, TextLine, TextRun,
 };
 
@@ -377,56 +377,9 @@ pub extern "C" fn gp_search_json(
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
-/// OCR a page with the built-in recognizer → JSON `[{text,x,y,w,h}]` (PDF user
-/// space). `scale` ≥ 2.0 recommended for small text.
-#[no_mangle]
-pub extern "C" fn gp_ocr_json(
-    handle: *const Document,
-    page: u32,
-    scale: f64,
-    out_len: *mut usize,
-) -> *mut u8 {
-    let json = match unsafe { handle.as_ref() } {
-        Some(doc) => ocr_words_json(&doc.ocr_page(page, scale)),
-        None => "[]".to_string(),
-    };
-    unsafe { bytes_into_host(json.into_bytes(), out_len) }
-}
-
-/// OCR a page → plain recognized text (UTF-8).
-#[no_mangle]
-pub extern "C" fn gp_ocr_text(
-    handle: *const Document,
-    page: u32,
-    scale: f64,
-    out_len: *mut usize,
-) -> *mut u8 {
-    let text = match unsafe { handle.as_ref() } {
-        Some(doc) => doc.ocr_page_text(page, scale),
-        None => String::new(),
-    };
-    unsafe { bytes_into_host(text.into_bytes(), out_len) }
-}
-
-/// Load a `.gpocr` line-OCR model blob (emitted by `tools/train_ocr_crnn.py`) into the
-/// runtime registry — the host supplies the bytes like a font, so the core embeds **no**
-/// model and stays lean (~540 KB). Returns 1 on success, 0 on a malformed blob. Once a
-/// model is loaded, `gp_ocr_json`/`gp_ocr_text` route to the line-level CRNN, falling
-/// back per page to the mono-glyph classifier when it yields nothing.
-#[no_mangle]
-pub extern "C" fn gp_ocr_load_model(ptr: *const u8, len: usize) -> i32 {
-    if ptr.is_null() || len == 0 {
-        return 0;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    i32::from(gigapdf_core::raster::ocr_crnn::load_model_from_bytes(bytes))
-}
-
-/// Drop all runtime-loaded OCR models (host-supplied via `gp_ocr_load_model`).
-#[no_mangle]
-pub extern "C" fn gp_ocr_clear_models() {
-    gigapdf_core::raster::ocr_crnn::clear_models();
-}
+// OCR moved host-side: PaddleOCR PP-OCR models run via RTen in the `gigapdf-ocr-rten` crate
+// (state-of-the-art, multilingual). The lean pure-std WASM core no longer ships an OCR engine;
+// the host exposes OCR as an endpoint. The legacy CRNN `gp_ocr_*` exports were removed.
 
 /// Elements (text/image/shape) of a page as a JSON array. Host frees the buffer.
 #[no_mangle]
@@ -3738,23 +3691,6 @@ fn text_lines_json(lines: &[TextLine]) -> String {
         out.push_str(&format!(
             ",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
             b.x, b.y, b.width, b.height
-        ));
-    }
-    out.push(']');
-    out
-}
-
-fn ocr_words_json(words: &[OcrWord]) -> String {
-    let mut out = String::from("[");
-    for (i, word) in words.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str("{\"text\":");
-        json_escape(&word.text, &mut out);
-        out.push_str(&format!(
-            ",\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
-            word.x, word.y, word.width, word.height
         ));
     }
     out.push(']');
