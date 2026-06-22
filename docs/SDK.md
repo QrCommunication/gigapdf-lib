@@ -332,22 +332,41 @@ baselines survive a round-trip.
 
 ### OCR & text intelligence
 
-Recognise text on scanned/image-only pages (`GigaPdfDoc`), and load the per-script
-recognizer models (`GigaPdfEngine`, global to the engine):
+**OCR is not in this WASM SDK** — it's a separate **native** crate, **`gigapdf-ocr-rten`**, because
+it runs **PaddleOCR PP-OCR** models through **RTen** (a pure-Rust ONNX runtime, no C++/Tesseract)
+whose weights are far heavier than the lean ~540 KB WASM core. Run it host-side (a service/binary)
+and expose it as an endpoint; this WASM SDK provides the **text-layer** side (`addTextLayer`) so a
+host can stamp recognized words back onto the PDF to make a scan searchable. For PDFs that already
+carry text, prefer the SDK's `extractText` / `structuredText` / `search` (exact, no OCR needed).
 
-OCR is **no longer part of this WASM SDK**. It moved host-side to the
-**`gigapdf-ocr-rten`** crate — PaddleOCR PP-OCR models on the pure-Rust **RTen**
-runtime (13 languages incl. Hebrew + automatic per-line script selection, state of
-the art). Run it natively and expose it as an endpoint; this SDK keeps the
-extraction/search APIs (`extractText`, `structuredText`, `search`, `addTextLayer`)
-for PDFs that already carry text. See [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md).
+**Engine:** shared **DBNet** detector + per-language **SVTR/CRNN + CTC** recognizers, with automatic
+per-line **script selection** (each line routed to the highest-confidence printed recognizer — no
+separate classifier). **13 printed languages**: Arabic (RTL), **Hebrew** (RTL, our own trained
+model), Simplified/Traditional Chinese, Japanese, Korean, Cyrillic, Devanagari, Tamil, Telugu,
+Kannada, English, Latin (FR/DE/ES/…). Plus **opt-in Latin/Cyrillic/Greek handwriting** (`latin_hw`,
+the reused legacy CRNN).
 
-> **Engine:** host-side `gigapdf-ocr-rten` — PaddleOCR PP-OCR (DBNet detect + SVTR/CRNN
-> recognize) on the pure-Rust **RTen** runtime (no C++, no Tesseract). 13 languages incl.
-> Hebrew + Arabic (RTL), CJK, Cyrillic, Devanagari, Tamil/Telugu/Kannada, Latin — with
-> automatic per-line script selection. Not part of this WASM SDK (native engine). See
-> [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and
-> [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md).
+Rust API (`gigapdf_ocr_rten`):
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `OcrEngine::load_models_dir(dir)` | `OcrEngine` | Load the shared `det.rten` + every recognizer present in `dir` (per `REC_MODELS`). |
+| `OcrEngine::load(det, rec, dict)` | `OcrEngine` | Detector + a single recognizer (convenience). |
+| `recognize_page(&img)` | `Vec<Line>` | Detect + recognize, **auto script selection** (printed). `Line { bbox, text, confidence, model }`. |
+| `recognize_line_auto(&line)` | `(text, conf, model)` | One cropped line, auto-selected recognizer. |
+| `ocr_pdf_page(&doc, page, scale)` | `Vec<OcrWord>` | OCR a **PDF page** (rasterized via `gigapdf-core`); boxes in **PDF user space** (bottom-left). `scale ≥ 2`. |
+| `ocr_pdf_page_text(&doc, page, scale)` | `String` | Same, plain text (reading order). |
+| `recognize_page_handwriting(&img)` | `Vec<Line>` | **Handwriting** (`latin_hw`) — bypasses auto selection. |
+| `recognize_page_with(&img, name)` / `recognize_line_with(&line, name)` | `Vec<Line>` / `Option<(text,conf)>` | Force a specific recognizer by name (`HANDWRITING_MODEL` = `"latin_hw"`). |
+| `has_handwriting()` / `rec_count()` | `bool` / `usize` | Introspection. |
+
+`OcrWord { text, x, y, width, height, confidence, model }` is the replacement for the old
+`Document::ocr_page` — map straight onto `addTextLayer` to make a scan searchable. Handwriting is
+**opt-in** (a HW model is overconfident on printed input, so it's excluded from auto selection):
+call `recognize_page_handwriting` / `..._with(img, HANDWRITING_MODEL)` when the input is handwritten.
+
+Models are fetched/converted at deploy (`tools/fetch_models.sh`); see
+[`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md).
 
 ### Security
 

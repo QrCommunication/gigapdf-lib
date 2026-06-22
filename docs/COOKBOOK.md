@@ -326,28 +326,65 @@ exact and fast. For **scanned, image-only** pages, OCR them and stamp an
 invisible (render-mode 3) text layer so the result becomes selectable and
 searchable.
 
-OCR now runs **host-side** in the **`gigapdf-ocr-rten`** crate (PaddleOCR + RTen,
-13 languages incl. Hebrew + automatic per-line script selection). `ocr_pdf_page`
-rasterizes the page, recognizes it, and returns words already in **PDF user space**
-— then stamp an invisible text layer to make the scan searchable:
+OCR runs **host-side** in the **`gigapdf-ocr-rten`** crate (PaddleOCR + RTen — pure-Rust, no
+Tesseract; 13 printed languages incl. Hebrew + **automatic per-line script selection**, plus opt-in
+handwriting). `ocr_pdf_page` rasterizes a page, recognizes it, and returns words already in **PDF
+user space** so they drop straight onto `addTextLayer`.
+
+### Native: OCR every page → searchable PDF (auto script selection)
 
 ```rust
-// Native (server-side): OCR a PDF page end-to-end with the RTen+PaddleOCR engine.
-let doc = gigapdf_core::Document::open(&scanned_pdf)?;
-let eng = gigapdf_ocr_rten::OcrEngine::load_models_dir("models")?;
-let words = eng.ocr_pdf_page(&doc, page, 2.0)?; // OcrWord{ text,x,y,width,height,confidence,model }
-// `words` map straight onto the SDK's addTextLayer (PDF user space, bottom-left):
-//   addTextLayer(page, words.map(w => ({ x: w.x, y: w.y, size: w.height, text: w.text })))
+use gigapdf_core::Document;
+use gigapdf_ocr_rten::OcrEngine;
+
+let pdf = std::fs::read("scan.pdf")?;
+let doc = Document::open(&pdf)?;
+let eng = OcrEngine::load_models_dir("models")?; // shared DBNet det + every recognizer present
+
+for page in 1..=doc.page_count() as u32 {
+    // Detect lines, recognize each with the best-matching printed recognizer (KR→ko, RU→cyrillic…).
+    let words = eng.ocr_pdf_page(&doc, page, 2.0)?; // scale ≥ 2 for small text
+    for w in &words {
+        // w: OcrWord { text, x, y, width, height, confidence, model } — PDF user space, bottom-left.
+        println!("p{page} [{:.2}|{}] {}", w.confidence, w.model, w.text);
+    }
+}
 ```
 
+### Handwriting (opt-in — explicit recognizer)
+
+A handwriting model is overconfident on printed text, so it's **excluded from auto selection**.
+Call it explicitly when the input is known to be handwritten (Latin/Cyrillic/Greek):
+
+```rust
+use gigapdf_ocr_rten::{OcrEngine, HANDWRITING_MODEL};
+
+let eng = OcrEngine::load_models_dir("models")?;
+if eng.has_handwriting() {
+    // Either the convenience method…
+    let lines = eng.recognize_page_handwriting(&page_rgb)?;
+    // …or force any recognizer by name:
+    let lines = eng.recognize_page_with(&page_rgb, HANDWRITING_MODEL)?; // "latin_hw"
+    for l in &lines { println!("[{:.2}] {}", l.confidence, l.text); }
+}
+```
+
+### Stamp the text layer (this WASM SDK) → searchable
+
+The native engine returns boxes in PDF user space; map them onto `addTextLayer` (render-mode 3,
+invisible) so the scan becomes selectable + searchable:
+
 ```ts
-// In a JS/Node host, send the page to your OCR service (the native engine above)
-// and stamp the returned words as an invisible (render-mode 3) layer via this SDK:
+// `words` come from your OCR service (the native engine above).
 const doc = giga.open(scannedPdf);
 doc.addTextLayer(page, words.map((w) => ({ x: w.x, y: w.y, size: w.height, text: w.text })));
 const searchable = doc.save();
 doc.close();
 ```
+
+> Models (det + recognizers + Hebrew + handwriting) are fetched/converted at deploy time
+> (`crates/ocr-rten/tools/fetch_models.sh`) and are **not** bundled in the package. Full design:
+> [OCR_ARCHITECTURE.md](OCR_ARCHITECTURE.md).
 
 ---
 
