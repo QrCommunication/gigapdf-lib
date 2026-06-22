@@ -4113,11 +4113,15 @@ pub fn pptx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 
 /// The deck's resolved typefaces for the OOXML theme-font placeholders that text
 /// runs reference with `a:latin typeface="+mn-lt"` (minor / body) and `"+mj-lt"`
-/// (major / heading). Read from the theme's `a:fontScheme`.
+/// (major / heading), plus the theme colour scheme (`a:clrScheme`) that runs and
+/// fills reference with `a:schemeClr@val`. Read from the deck's first theme part.
 #[derive(Default, Clone)]
 struct PptxTheme {
     minor_latin: Option<String>,
     major_latin: Option<String>,
+    /// Theme colour scheme slot name (`dk1`/`lt1`/`accent1`…/`hlink`/`folHlink`)
+    /// → `RRGGBB` (uppercase, no `#`). Empty when no theme part was present.
+    scheme: BTreeMap<String, String>,
 }
 
 impl PptxTheme {
@@ -4132,6 +4136,23 @@ impl PptxTheme {
             t if t.trim().is_empty() => None,
             t => Some(t.to_string()),
         }
+    }
+
+    /// Resolve an `a:schemeClr@val` slot to a concrete `RRGGBB` colour.
+    ///
+    /// The presentation-level `p:clrMap` aliases (`bg1`/`tx1`/`bg2`/`tx2`) are
+    /// folded onto the canonical scheme slots it maps them to (default mapping:
+    /// `bg1→lt1`, `tx1→dk1`, `bg2→lt2`, `tx2→dk2`); `phClr` is a placeholder
+    /// resolved by the caller's context, so it has no fixed colour here.
+    fn resolve_scheme(&self, val: &str) -> Option<String> {
+        let slot = match val {
+            "bg1" => "lt1",
+            "tx1" => "dk1",
+            "bg2" => "lt2",
+            "tx2" => "dk2",
+            other => other,
+        };
+        self.scheme.get(slot).cloned()
     }
 }
 
@@ -4148,13 +4169,28 @@ fn pptx_theme(zip: &BTreeMap<String, Vec<u8>>) -> PptxTheme {
     parse_pptx_theme(&String::from_utf8_lossy(&zip[key]))
 }
 
-/// Parse a theme XML's `a:fontScheme`: the first `a:latin@typeface` inside
-/// `a:majorFont` → major family, inside `a:minorFont` → minor family.
+/// Parse a theme XML's `a:fontScheme` (the first `a:latin@typeface` inside
+/// `a:majorFont` → major family, inside `a:minorFont` → minor family) and its
+/// `a:clrScheme` (each named slot's `a:srgbClr@val` / `a:sysClr@lastClr` → its
+/// `RRGGBB` colour, keyed by slot name).
 fn parse_pptx_theme(xml: &str) -> PptxTheme {
+    const COLOR_SLOTS: [&str; 12] = [
+        "dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3", "accent4", "accent5",
+        "accent6", "hlink", "folHlink",
+    ];
+
     let mut theme = PptxTheme::default();
     let mut x = Xml::new(xml);
     let mut in_major = false;
     let mut in_minor = false;
+    let mut in_clr_scheme = false;
+    // The colour-scheme slot we're currently inside (its `a:srgbClr`/`a:sysClr`
+    // child carries the value).
+    let mut cur_slot: Option<&'static str> = None;
+    let slot_name = |ln: &str| -> Option<&'static str> {
+        COLOR_SLOTS.iter().copied().find(|s| *s == ln)
+    };
+
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, _) => match local(&name) {
@@ -4176,11 +4212,41 @@ fn parse_pptx_theme(xml: &str) -> PptxTheme {
                         }
                     }
                 }
+                "clrScheme" => in_clr_scheme = true,
+                ln if in_clr_scheme && slot_name(ln).is_some() => {
+                    cur_slot = slot_name(ln);
+                }
+                "srgbClr" if in_clr_scheme => {
+                    if let (Some(slot), Some(v)) = (cur_slot, attr(&attrs, "val")) {
+                        if is_hex6(v) {
+                            theme
+                                .scheme
+                                .entry(slot.to_string())
+                                .or_insert_with(|| v.to_ascii_uppercase());
+                        }
+                    }
+                }
+                "sysClr" if in_clr_scheme => {
+                    // System colours carry a resolved `lastClr` (e.g. window text).
+                    if let (Some(slot), Some(v)) = (cur_slot, attr(&attrs, "lastClr")) {
+                        if is_hex6(v) {
+                            theme
+                                .scheme
+                                .entry(slot.to_string())
+                                .or_insert_with(|| v.to_ascii_uppercase());
+                        }
+                    }
+                }
                 _ => {}
             },
             Tok::Close(name) => match local(&name) {
                 "majorFont" => in_major = false,
                 "minorFont" => in_minor = false,
+                "clrScheme" => {
+                    in_clr_scheme = false;
+                    cur_slot = None;
+                }
+                ln if cur_slot == slot_name(ln) => cur_slot = None,
                 _ => {}
             },
             Tok::Text(_) => {}
@@ -4217,9 +4283,112 @@ fn emu_to_pt(v: &str) -> Option<f64> {
     v.trim().parse::<f64>().ok().map(|e| e / EMU_PER_PT)
 }
 
-/// Emit one slide's text paragraphs, tables and images into `out`. Theme fonts
-/// (`+mn-lt`/`+mj-lt`) are resolved through `theme`; `a:tbl` renders as a real
-/// HTML `<table>` with a `<colgroup>` from `a:tblGrid`.
+/// A shape's absolute placement from its `a:xfrm`: offset (`a:off@x,@y`), extent
+/// (`a:ext@cx,@cy`), all in points, plus the `a:xfrm@rot` (60000ths of a degree)
+/// and the `@flipH`/`@flipV` booleans. A shape WITH an explicit `a:xfrm` is laid
+/// out at absolute coordinates; without one (layout/master inheritance) it falls
+/// back to document-order flow.
+#[derive(Default, Clone, Copy)]
+struct XfrmBox {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    /// Clockwise rotation in degrees (OOXML stores 60000ths of a degree).
+    rot_deg: f64,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+impl XfrmBox {
+    /// True once an `a:off` + `a:ext` defined a usable (non-degenerate) box.
+    fn is_placed(&self) -> bool {
+        self.w > 0.0 && self.h > 0.0
+    }
+
+    /// The inline CSS for an absolutely-positioned wrapper `<div>` at this box.
+    /// A non-zero rotation and the flips combine into one `transform` (rotation
+    /// about the box centre, matching PowerPoint). The HTML engine ignores
+    /// `transform` today, so this is a forward-compatible hint that never
+    /// regresses the absolute left/top/width/height placement it does honour.
+    fn abs_style(&self) -> String {
+        let mut s = format!(
+            "position:absolute;left:{}pt;top:{}pt;width:{}pt;height:{}pt",
+            fmt_pt(self.x),
+            fmt_pt(self.y),
+            fmt_pt(self.w),
+            fmt_pt(self.h),
+        );
+        let mut tf = String::new();
+        if self.rot_deg != 0.0 {
+            tf.push_str(&format!("rotate({}deg)", fmt_pt(self.rot_deg)));
+        }
+        if self.flip_h {
+            tf.push_str("scaleX(-1)");
+        }
+        if self.flip_v {
+            tf.push_str("scaleY(-1)");
+        }
+        if !tf.is_empty() {
+            s.push_str(";transform:");
+            s.push_str(&tf);
+            s.push_str(";transform-origin:center");
+        }
+        s
+    }
+}
+
+/// Read a shape's transform from an `a:xfrm` open tag (its attrs carry `@rot`/
+/// `@flipH`/`@flipV`) and the immediately-following `a:off`/`a:ext` children,
+/// consuming the subtree up to `</a:xfrm>`. Other children (e.g. `a:chOff`) are
+/// skipped; only the FIRST `a:off`/`a:ext` are taken (the shape's own).
+fn parse_xfrm(x: &mut Xml, xfrm_attrs: &[(String, String)]) -> XfrmBox {
+    let mut b = XfrmBox::default();
+    if let Some(r) = attr(xfrm_attrs, "rot").and_then(|v| v.trim().parse::<f64>().ok()) {
+        b.rot_deg = r / 60000.0;
+    }
+    b.flip_h = matches!(attr(xfrm_attrs, "flipH"), Some("1") | Some("true"));
+    b.flip_v = matches!(attr(xfrm_attrs, "flipV"), Some("1") | Some("true"));
+    let mut have_off = false;
+    let mut have_ext = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "off" if !have_off => {
+                    if let Some(v) = attr(&attrs, "x").and_then(emu_to_pt) {
+                        b.x = v;
+                    }
+                    if let Some(v) = attr(&attrs, "y").and_then(emu_to_pt) {
+                        b.y = v;
+                    }
+                    have_off = true;
+                }
+                "ext" if !have_ext => {
+                    if let Some(v) = attr(&attrs, "cx").and_then(emu_to_pt) {
+                        b.w = v;
+                    }
+                    if let Some(v) = attr(&attrs, "cy").and_then(emu_to_pt) {
+                        b.h = v;
+                    }
+                    have_ext = true;
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "xfrm" => break,
+            _ => {}
+        }
+    }
+    b
+}
+
+/// Emit one slide into `out`. Each shape tree (`p:sp` / `p:pic` /
+/// `p:graphicFrame`) carrying an explicit `a:xfrm` is wrapped in an
+/// absolutely-positioned `<div>` at its slide coordinates, so a deck's layout is
+/// preserved instead of stacking every box in document order; shapes WITHOUT an
+/// `a:xfrm` (layout/master inheritance) fall back to flow. The slide background
+/// (`p:cSld/p:bg` solid fill) becomes a full-slide backdrop. Theme fonts
+/// (`+mn-lt`/`+mj-lt`) and colours (`a:schemeClr`) resolve through `theme`;
+/// `a:tbl` renders as a real HTML `<table>`.
 fn pptx_slide(
     xml: &str,
     zip: &BTreeMap<String, Vec<u8>>,
@@ -4227,9 +4396,181 @@ fn pptx_slide(
     theme: &PptxTheme,
     out: &mut String,
 ) {
+    // Build this slide into a local buffer so the "no shapes → flow fallback"
+    // decision sees only THIS slide's output, not the deck accumulated in `out`.
+    let mut slide = String::new();
     let mut x = Xml::new(xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, _attrs, sc) = tok {
+            match local(&name) {
+                // Slide background fill (solid colour) → full-slide backdrop.
+                "bg" if !sc => {
+                    if let Some(div) = pptx_bg(&mut x, theme) {
+                        slide.push_str(&div);
+                    }
+                }
+                // A shape / picture / graphic-frame subtree: position it from its
+                // own `a:xfrm`, falling back to flow when it has none.
+                "sp" | "pic" | "graphicFrame" if !sc => {
+                    pptx_shape(&mut x, zip, rels, theme, local(&name), &mut slide);
+                }
+                _ => {}
+            }
+        }
+    }
+    // No recognised shapes (e.g. a minimal/synthetic slide): parse the whole body
+    // as flowing content so plain `a:p`/`a:tbl`/`a:blip` still render.
+    if slide.is_empty() {
+        let mut x2 = Xml::new(xml);
+        pptx_content(&mut x2, zip, rels, theme, None, &mut slide);
+    }
+    out.push_str(&slide);
+}
+
+/// Render the slide background `p:bg` (open consumed): a `p:bgPr/a:solidFill`
+/// with an `a:srgbClr`/`a:schemeClr` becomes a full-slide absolutely-positioned
+/// backdrop `<div>`. Width is `100%` of the page box (so any slide aspect ratio
+/// is covered); height is the standard slide height (`SLIDE_H`, 7.5in = 540pt —
+/// PowerPoint's height for both 4:3 and 16:9). The engine clips any overflow to
+/// the page. Returns `None` for picture/gradient/inherited fills (out of scope
+/// here). Consumes up to `</p:bg>`.
+fn pptx_bg(x: &mut Xml, theme: &PptxTheme) -> Option<String> {
+    let mut color: Option<String> = None;
+    let mut in_solid = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "solidFill" => in_solid = true,
+                "srgbClr" if in_solid && color.is_none() => {
+                    if let Some(v) = attr(&attrs, "val").filter(|v| is_hex6(v)) {
+                        color = Some(v.to_ascii_uppercase());
+                    }
+                }
+                "schemeClr" if in_solid && color.is_none() => {
+                    color = attr(&attrs, "val").and_then(|v| theme.resolve_scheme(v));
+                }
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "solidFill" => in_solid = false,
+                "bg" => break,
+                _ => {}
+            },
+            Tok::Text(_) => {}
+        }
+    }
+    color.map(|c| {
+        format!(
+            "<div style=\"position:absolute;left:0pt;top:0pt;width:100%;min-height:{}pt;background:#{c}\"></div>",
+            fmt_pt(SLIDE_H),
+        )
+    })
+}
+
+/// Render one shape subtree (`p:sp` / `p:pic` / `p:graphicFrame`, open consumed;
+/// `tag` is its local name). The first `a:xfrm` (the shape's own, in `p:spPr` /
+/// `p:grpSpPr` or the graphic-frame `p:xfrm`) gives the absolute box; the body
+/// (text/table/image) is rendered via [`pptx_content`]. With a usable box the
+/// body is wrapped in an absolutely-positioned `<div>`; otherwise it flows.
+/// Consumes the subtree up to the matching `</tag>`.
+fn pptx_shape(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    tag: &str,
+    out: &mut String,
+) {
+    let mut xfrm = XfrmBox::default();
+    let mut have_xfrm = false;
+    let mut body = String::new();
+
+    while let Some(tok) = x.next() {
+        match &tok {
+            Tok::Open(name, attrs, sc) => match local(name) {
+                // The shape transform: take the first one (its own), then keep
+                // scanning the rest of the shape for its body content.
+                "xfrm" if !sc && !have_xfrm => {
+                    xfrm = parse_xfrm(x, attrs);
+                    have_xfrm = true;
+                }
+                // Body grammar — delegate each content subtree to pptx_content,
+                // which stops at the element's own close tag.
+                "p" if !sc => {
+                    pptx_content_paragraph(x, theme, &mut body);
+                }
+                "tbl" if !sc => {
+                    pptx_table(x, theme, &mut body);
+                }
+                "blip" => {
+                    if let Some(rid) = attr(attrs, "embed").or_else(|| attr(attrs, "link")) {
+                        if let Some(t) = rels
+                            .get(rid)
+                            .map(|t| resolve_target("ppt", t))
+                            .and_then(|k| img_tag(zip, &k))
+                        {
+                            body.push_str(&t);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(name) == tag => break,
+            _ => {}
+        }
+    }
+
+    if body.trim().is_empty() {
+        return;
+    }
+    if have_xfrm && xfrm.is_placed() {
+        out.push_str(&format!("<div style=\"{}\">{}</div>", xfrm.abs_style(), body));
+    } else {
+        out.push_str(&body);
+    }
+}
+
+/// Parse a flowing run of slide content (paragraphs, tables, images) until
+/// `stop_tag`'s close (or EOF when `None`), emitting into `out`. Shared by the
+/// orphan-content fallback. Paragraph runs honour `a:srgbClr`/`a:schemeClr`
+/// colour and `a:latin` typeface (resolved through `theme`).
+fn pptx_content(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    stop_tag: Option<&str>,
+    out: &mut String,
+) {
+    while let Some(tok) = x.next() {
+        match &tok {
+            Tok::Open(name, attrs, sc) => match local(name) {
+                "tbl" if !sc => pptx_table(x, theme, out),
+                "p" if !sc => pptx_content_paragraph(x, theme, out),
+                "blip" => {
+                    if let Some(rid) = attr(attrs, "embed").or_else(|| attr(attrs, "link")) {
+                        if let Some(t) = rels
+                            .get(rid)
+                            .map(|t| resolve_target("ppt", t))
+                            .and_then(|k| img_tag(zip, &k))
+                        {
+                            out.push_str(&t);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if stop_tag == Some(local(name)) => break,
+            _ => {}
+        }
+    }
+}
+
+/// Emit one PPTX `a:p` paragraph (open consumed) as `<p>…</p>` into `out`,
+/// applying each run's `a:rPr` (`b`/`i`/`sz`), `a:srgbClr`/`a:schemeClr` colour
+/// and `a:latin` typeface. Consumes up to `</a:p>`.
+fn pptx_content_paragraph(x: &mut Xml, theme: &PptxTheme, out: &mut String) {
     let mut para = String::new();
-    let mut in_para = false;
     let mut run = RunStyle::default();
     let mut in_rpr = false;
     let mut in_text = false;
@@ -4237,25 +4578,11 @@ fn pptx_slide(
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => match local(&name) {
-                // A graphic-frame table: hand the whole subtree to pptx_table.
-                "tbl" if !sc => {
-                    if !para.trim().is_empty() {
-                        out.push_str(&format!("<p>{}</p>", para.trim()));
-                        para.clear();
-                    }
-                    pptx_table(&mut x, theme, out);
-                }
-                "p" if !sc => {
-                    in_para = true;
-                    para.clear();
-                }
                 "rPr" if !sc => {
                     in_rpr = true;
                     run = pptx_run_props(&attrs);
-                    if sc {
-                        in_rpr = false;
-                    }
                 }
+                "rPr" if sc => run = pptx_run_props(&attrs),
                 "srgbClr" if in_rpr => {
                     if let Some(v) = attr(&attrs, "val") {
                         if is_hex6(v) {
@@ -4263,46 +4590,33 @@ fn pptx_slide(
                         }
                     }
                 }
+                "schemeClr" if in_rpr => {
+                    if let Some(c) = attr(&attrs, "val").and_then(|v| theme.resolve_scheme(v)) {
+                        run.color = Some(c);
+                    }
+                }
                 "latin" if in_rpr => {
                     run.font_family = attr(&attrs, "typeface").and_then(|t| theme.resolve(t));
                 }
                 "t" if !sc => in_text = true,
                 "br" => para.push_str("<br>"),
-                "blip" => {
-                    if let Some(rid) = attr(&attrs, "embed").or_else(|| attr(&attrs, "link")) {
-                        if let Some(tag) = rels
-                            .get(rid)
-                            .map(|t| resolve_target("ppt", t))
-                            .and_then(|k| img_tag(zip, &k))
-                        {
-                            // Flush any pending paragraph, then place the image.
-                            if !para.trim().is_empty() {
-                                out.push_str(&format!("<p>{}</p>", para.trim()));
-                                para.clear();
-                            }
-                            out.push_str(&tag);
-                        }
-                    }
-                }
                 _ => {}
             },
             Tok::Text(t) => {
-                if in_para && in_text && !t.is_empty() {
+                if in_text && !t.is_empty() {
                     push_run_text(&run, &t, &mut para);
                 }
             }
             Tok::Close(name) => match local(&name) {
                 "t" => in_text = false,
                 "rPr" => in_rpr = false,
-                "p" => {
-                    if in_para && !para.trim().is_empty() {
-                        out.push_str(&format!("<p>{}</p>", para.trim()));
-                    }
-                    in_para = false;
-                }
+                "p" => break,
                 _ => {}
             },
         }
+    }
+    if !para.trim().is_empty() {
+        out.push_str(&format!("<p>{}</p>", para.trim()));
     }
 }
 
@@ -5062,7 +5376,11 @@ pub fn odp_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let styles_xml = part(zip, "styles.xml");
     let mut styles = odf_text_styles(&styles_xml);
     styles.extend(odf_text_styles(&content));
-    let geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
+    let mut geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
+    // Slides bleed to the edges: drop the prose content margins so absolutely
+    // positioned `draw:frame`s (whose `svg:x/y` are page-relative) land at the
+    // right place — the layout engine's initial containing block is the page box.
+    geom.margins = Margins::uniform(0.0);
     let mut body = String::new();
     let mut x = Xml::new(&content);
     let mut first = true;
@@ -5083,8 +5401,14 @@ pub fn odp_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     render_geom(&body, geom)
 }
 
-/// Emit one `draw:page` (open consumed) — its paragraphs and images — until
-/// `</draw:page>`.
+/// Emit one `draw:page` (open consumed) until `</draw:page>`.
+///
+/// A `draw:frame` carrying a position+size (`svg:x`/`svg:y` + `svg:width`/
+/// `svg:height`) is rendered as an absolutely-positioned `<div>` at those page
+/// coordinates, preserving the slide layout; its whole subtree is consumed so it
+/// is not also flowed. A frame WITHOUT a position is left to the flat-flow path
+/// (its inner `text:p`/`draw:image` render in document order), matching the
+/// previous behaviour.
 fn odp_page(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
@@ -5096,6 +5420,12 @@ fn odp_page(
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
                 match ln {
+                    // A positioned frame → absolute box (consumes its subtree).
+                    // A frame without a box falls through to the flow grammar.
+                    "frame" if !sc && odp_frame_box(&attrs).is_some() => {
+                        let bx = odp_frame_box(&attrs).unwrap();
+                        odp_frame(x, zip, styles, bx, out);
+                    }
                     "p" if !sc => {
                         let inner = odf_inline(x, zip, styles, "p");
                         if !inner.trim().is_empty() {
@@ -5121,6 +5451,68 @@ fn odp_page(
             Tok::Text(_) => {}
         }
     }
+}
+
+/// A `draw:frame`'s page box in points: `(x, y, w, h)` from `svg:x`/`svg:y`/
+/// `svg:width`/`svg:height` (ODF units, cm/mm/in/pt/px). `None` unless BOTH an
+/// origin component and a non-zero size are present (an unpositioned frame).
+fn odp_frame_box(attrs: &[(String, String)]) -> Option<(f64, f64, f64, f64)> {
+    let w = attr(attrs, "width").and_then(parse_odf_pt)?;
+    let h = attr(attrs, "height").and_then(parse_odf_pt)?;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let x = attr(attrs, "x").and_then(parse_odf_pt)?;
+    let y = attr(attrs, "y").and_then(parse_odf_pt)?;
+    Some((x, y, w, h))
+}
+
+/// Render a positioned `draw:frame` (open consumed; `bx` = its page box) as an
+/// absolutely-positioned `<div>`. The body is the frame's `draw:text-box`
+/// paragraphs and `draw:image`s. Consumes the subtree up to `</draw:frame>`.
+fn odp_frame(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    bx: (f64, f64, f64, f64),
+    out: &mut String,
+) {
+    let mut body = String::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "p" if !sc => {
+                        let inner = odf_inline(x, zip, styles, "p");
+                        if !inner.trim().is_empty() {
+                            body.push_str(&format!("<p>{}</p>", inner.trim()));
+                        }
+                    }
+                    "image" if sc => {
+                        if let Some(href) = attr(&attrs, "href") {
+                            let key = href.trim_start_matches('/').to_string();
+                            if let Some(tag) = img_tag(zip, &key) {
+                                body.push_str(&tag);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) if local(&name) == "frame" => break,
+            _ => {}
+        }
+    }
+    let (fx, fy, fw, fh) = bx;
+    out.push_str(&format!(
+        "<div style=\"position:absolute;left:{}pt;top:{}pt;width:{}pt;height:{}pt\">{}</div>",
+        fmt_pt(fx),
+        fmt_pt(fy),
+        fmt_pt(fw),
+        fmt_pt(fh),
+        body,
+    ));
 }
 
 // ════════════════════════════════ legacy OLE2 ═════════════════════════════════
@@ -5855,6 +6247,247 @@ mod tests {
         let text = norm(&document.to_text());
         assert!(text.contains("First Deck Page"));
         assert!(text.contains("Page Two Content"));
+    }
+
+    // ── PPTX absolute positioning (wave 1) ──
+
+    /// Render one slide's HTML body directly (no theme, empty zip/rels) to assert
+    /// on the generated markup — the absolute coordinates we care about.
+    fn slide_html(xml: &str) -> String {
+        let zip = BTreeMap::new();
+        let rels = BTreeMap::new();
+        let theme = PptxTheme::default();
+        let mut out = String::new();
+        pptx_slide(xml, &zip, &rels, &theme, &mut out);
+        out
+    }
+
+    #[test]
+    fn pptx_shape_with_xfrm_is_absolutely_positioned() {
+        // a:off x=914400 EMU (72pt), y=457200 (36pt); a:ext cx=1828800 (144pt),
+        // cy=914400 (72pt). 1pt = 12700 EMU.
+        let xml = r#"<p:sld xmlns:a="a" xmlns:p="p">
+          <p:cSld><p:spTree>
+            <p:sp>
+              <p:spPr><a:xfrm><a:off x="914400" y="457200"/><a:ext cx="1828800" cy="914400"/></a:xfrm></p:spPr>
+              <p:txBody><a:p><a:r><a:t>Positioned Box</a:t></a:r></a:p></p:txBody>
+            </p:sp>
+          </p:spTree></p:cSld>
+        </p:sld>"#;
+        let html = slide_html(xml);
+        assert!(html.contains("position:absolute"), "absolute: {html}");
+        assert!(html.contains("left:72pt"), "left 72pt: {html}");
+        assert!(html.contains("top:36pt"), "top 36pt: {html}");
+        assert!(html.contains("width:144pt"), "width 144pt: {html}");
+        assert!(html.contains("height:72pt"), "height 72pt: {html}");
+        assert!(html.contains("Positioned Box"), "text kept: {html}");
+    }
+
+    #[test]
+    fn pptx_two_shapes_keep_distinct_positions_not_stacked() {
+        let xml = r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm></p:spPr>
+              <p:txBody><a:p><a:r><a:t>Top Left</a:t></a:r></a:p></p:txBody></p:sp>
+            <p:sp><p:spPr><a:xfrm><a:off x="3810000" y="2540000"/><a:ext cx="1270000" cy="635000"/></a:xfrm></p:spPr>
+              <p:txBody><a:p><a:r><a:t>Lower Right</a:t></a:r></a:p></p:txBody></p:sp>
+          </p:spTree></p:cSld></p:sld>"#;
+        let html = slide_html(xml);
+        // Box 1 at (0,0); box 2 at (300pt,200pt) — both present, not stacked.
+        assert!(html.contains("left:0pt;top:0pt"), "box1 origin: {html}");
+        assert!(html.contains("left:300pt;top:200pt"), "box2 offset: {html}");
+        // Two distinct absolute wrappers.
+        assert_eq!(
+            html.matches("position:absolute").count(),
+            2,
+            "two positioned shapes: {html}"
+        );
+        assert!(html.contains("Top Left") && html.contains("Lower Right"));
+    }
+
+    #[test]
+    fn pptx_shape_rotation_and_flip_emit_transform() {
+        // rot=5400000 (60000ths) = 90deg; flipH=1.
+        let xml = r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:sp><p:spPr><a:xfrm rot="5400000" flipH="1"><a:off x="127000" y="127000"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+              <p:txBody><a:p><a:r><a:t>Rotated</a:t></a:r></a:p></p:txBody></p:sp>
+          </p:spTree></p:cSld></p:sld>"#;
+        let html = slide_html(xml);
+        assert!(html.contains("transform:rotate(90deg)"), "rotate: {html}");
+        assert!(html.contains("scaleX(-1)"), "flipH: {html}");
+        assert!(html.contains("transform-origin:center"), "origin: {html}");
+    }
+
+    #[test]
+    fn pptx_shape_without_xfrm_stays_in_flow() {
+        let xml = r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:sp><p:spPr></p:spPr>
+              <p:txBody><a:p><a:r><a:t>Flowing Text</a:t></a:r></a:p></p:txBody></p:sp>
+          </p:spTree></p:cSld></p:sld>"#;
+        let html = slide_html(xml);
+        assert!(
+            !html.contains("position:absolute"),
+            "no-xfrm shape must flow, not absolute: {html}"
+        );
+        assert!(html.contains("Flowing Text"), "text kept: {html}");
+        assert!(html.contains("<p>"), "flowed as paragraph: {html}");
+    }
+
+    #[test]
+    fn pptx_scheme_colour_resolves_through_theme() {
+        let theme_xml = r#"<a:theme xmlns:a="a"><a:themeElements><a:clrScheme name="Office">
+            <a:dk1><a:srgbClr val="000000"/></a:dk1>
+            <a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+            <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
+          </a:clrScheme></a:themeElements></a:theme>"#;
+        let theme = parse_pptx_theme(theme_xml);
+        assert_eq!(theme.resolve_scheme("accent1").as_deref(), Some("4472C4"));
+        // clrMap alias bg1 → lt1 (white).
+        assert_eq!(theme.resolve_scheme("bg1").as_deref(), Some("FFFFFF"));
+
+        let xml = r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+              <p:txBody><a:p><a:r><a:rPr><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></a:rPr><a:t>Themed</a:t></a:r></a:p></p:txBody></p:sp>
+          </p:spTree></p:cSld></p:sld>"#;
+        let zip = BTreeMap::new();
+        let rels = BTreeMap::new();
+        let mut out = String::new();
+        pptx_slide(xml, &zip, &rels, &theme, &mut out);
+        assert!(out.contains("color:#4472C4"), "schemeClr → colour: {out}");
+    }
+
+    #[test]
+    fn pptx_solid_background_fill_becomes_backdrop() {
+        let xml = r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld>
+            <p:bg><p:bgPr><a:solidFill><a:srgbClr val="203864"/></a:solidFill></p:bgPr></p:bg>
+            <p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                <p:txBody><a:p><a:r><a:t>On Dark</a:t></a:r></a:p></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#;
+        let html = slide_html(xml);
+        assert!(html.contains("background:#203864"), "bg fill: {html}");
+        // Backdrop is a full-slide absolute div at the origin.
+        assert!(
+            html.contains("left:0pt;top:0pt;width:") && html.contains("background:#203864"),
+            "full-slide backdrop: {html}"
+        );
+        assert!(html.contains("On Dark"), "content over backdrop: {html}");
+    }
+
+    #[test]
+    fn pptx_graphic_frame_table_is_positioned() {
+        // A table inside a graphicFrame carries its p:xfrm; the whole table must
+        // be wrapped absolutely.
+        let xml = r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:graphicFrame>
+              <p:xfrm><a:off x="635000" y="1270000"/><a:ext cx="2540000" cy="1270000"/></p:xfrm>
+              <a:graphic><a:graphicData>
+                <a:tbl><a:tblGrid><a:gridCol w="1270000"/><a:gridCol w="1270000"/></a:tblGrid>
+                  <a:tr><a:tc><a:txBody><a:p><a:r><a:t>R1C1</a:t></a:r></a:p></a:txBody></a:tc>
+                  <a:tc><a:txBody><a:p><a:r><a:t>R1C2</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+                </a:tbl>
+              </a:graphicData></a:graphic>
+            </p:graphicFrame>
+          </p:spTree></p:cSld></p:sld>"#;
+        let html = slide_html(xml);
+        assert!(html.contains("position:absolute"), "frame absolute: {html}");
+        assert!(html.contains("left:50pt;top:100pt"), "frame coords: {html}");
+        assert!(html.contains("<table>"), "renders a table: {html}");
+        assert!(html.contains("R1C1") && html.contains("R1C2"), "cells: {html}");
+        // The table markup is inside the absolute wrapper.
+        let abs = html.find("position:absolute").unwrap();
+        let tbl = html.find("<table>").unwrap();
+        assert!(abs < tbl, "table nested in absolute div: {html}");
+    }
+
+    #[test]
+    fn parse_xfrm_reads_offset_extent_rotation_flip() {
+        let mut x = Xml::new(
+            r#"<a:xfrm rot="2700000" flipV="1"><a:off x="254000" y="127000"/><a:ext cx="508000" cy="254000"/></a:xfrm>"#,
+        );
+        // Advance to the a:xfrm open token, then hand off to parse_xfrm.
+        let attrs = loop {
+            match x.next() {
+                Some(Tok::Open(name, attrs, _)) if local(&name) == "xfrm" => break attrs,
+                Some(_) => continue,
+                None => panic!("no xfrm open"),
+            }
+        };
+        let b = parse_xfrm(&mut x, &attrs);
+        assert!((b.x - 20.0).abs() < 1e-9, "x=20pt: {}", b.x);
+        assert!((b.y - 10.0).abs() < 1e-9, "y=10pt: {}", b.y);
+        assert!((b.w - 40.0).abs() < 1e-9, "w=40pt: {}", b.w);
+        assert!((b.h - 20.0).abs() < 1e-9, "h=20pt: {}", b.h);
+        assert!((b.rot_deg - 45.0).abs() < 1e-9, "rot=45deg: {}", b.rot_deg);
+        assert!(b.flip_v && !b.flip_h, "flipV only");
+        assert!(b.is_placed());
+    }
+
+    // ── ODP absolute positioning (wave 1) ──
+
+    /// Render one `draw:page`'s HTML body directly to assert on positioning.
+    fn odp_page_html(page_xml: &str) -> String {
+        let zip = BTreeMap::new();
+        let styles = BTreeMap::new();
+        let mut x = Xml::new(page_xml);
+        // Advance into the <draw:page> open tag.
+        loop {
+            match x.next() {
+                Some(Tok::Open(name, _, sc)) if local(&name) == "page" && !sc => break,
+                Some(_) => continue,
+                None => panic!("no draw:page open"),
+            }
+        }
+        let mut out = String::new();
+        odp_page(&mut x, &zip, &styles, &mut out);
+        out
+    }
+
+    #[test]
+    fn odp_positioned_frame_is_absolute() {
+        // svg:x=2cm (≈56.69pt), y=1cm (≈28.35pt), width=8cm, height=3cm.
+        let page = r#"<draw:page xmlns:draw="d" xmlns:svg="s" xmlns:text="t">
+            <draw:frame svg:x="2cm" svg:y="1cm" svg:width="8cm" svg:height="3cm">
+              <draw:text-box><text:p>Placed Frame</text:p></draw:text-box>
+            </draw:frame>
+          </draw:page>"#;
+        let html = odp_page_html(page);
+        assert!(html.contains("position:absolute"), "absolute: {html}");
+        assert!(html.contains("left:56.69pt"), "x≈56.69pt: {html}");
+        assert!(html.contains("top:28.35pt"), "y≈28.35pt: {html}");
+        assert!(html.contains("width:226.77pt"), "w 8cm: {html}");
+        assert!(html.contains("Placed Frame"), "text kept: {html}");
+    }
+
+    #[test]
+    fn odp_two_positioned_frames_not_stacked() {
+        let page = r#"<draw:page xmlns:draw="d" xmlns:svg="s" xmlns:text="t">
+            <draw:frame svg:x="1cm" svg:y="1cm" svg:width="4cm" svg:height="2cm">
+              <draw:text-box><text:p>Frame A</text:p></draw:text-box></draw:frame>
+            <draw:frame svg:x="10cm" svg:y="6cm" svg:width="4cm" svg:height="2cm">
+              <draw:text-box><text:p>Frame B</text:p></draw:text-box></draw:frame>
+          </draw:page>"#;
+        let html = odp_page_html(page);
+        assert_eq!(
+            html.matches("position:absolute").count(),
+            2,
+            "two positioned frames: {html}"
+        );
+        assert!(html.contains("left:28.35pt"), "frame A x=1cm: {html}");
+        assert!(html.contains("left:283.46pt"), "frame B x=10cm: {html}");
+        assert!(html.contains("Frame A") && html.contains("Frame B"));
+    }
+
+    #[test]
+    fn odp_unpositioned_frame_stays_in_flow() {
+        let page = r#"<draw:page xmlns:draw="d" xmlns:text="t">
+            <draw:frame><draw:text-box><text:p>Flowing Frame</text:p></draw:text-box></draw:frame>
+          </draw:page>"#;
+        let html = odp_page_html(page);
+        assert!(
+            !html.contains("position:absolute"),
+            "no-position frame must flow: {html}"
+        );
+        assert!(html.contains("Flowing Frame"), "text kept: {html}");
     }
 
     // ── dispatch / robustness ──
