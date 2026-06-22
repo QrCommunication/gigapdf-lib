@@ -33,6 +33,43 @@ type Exports = {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+/**
+ * The eight PDF access permissions carried by an `/Encrypt` dictionary's `/P`
+ * entry (ISO 32000-1 §7.6.3.2, Table 22). Each flag is `true` when the action
+ * is **granted** to a user opening the document with the user password; the
+ * owner password always lifts every restriction.
+ */
+export type PdfPermissions = {
+  /** Print the document (low resolution unless {@link printHighRes} is also set). */
+  print: boolean;
+  /** Modify the document contents (other than annotating, filling or assembling). */
+  modify: boolean;
+  /** Copy or otherwise extract text and graphics. */
+  copy: boolean;
+  /** Add or modify annotations and fill in interactive form fields. */
+  annotate: boolean;
+  /** Fill in existing interactive form fields (even if {@link annotate} is clear). */
+  fillForms: boolean;
+  /** Extract text and graphics for accessibility tools. */
+  accessibility: boolean;
+  /** Assemble the document: insert, rotate and delete pages. */
+  assemble: boolean;
+  /** Print to a high-resolution device (requires {@link print}). */
+  printHighRes: boolean;
+};
+
+/** Every permission granted — the unrestricted baseline (`/P` = -196). */
+const ALL_PERMISSIONS: PdfPermissions = {
+  print: true,
+  modify: true,
+  copy: true,
+  annotate: true,
+  fillForms: true,
+  accessibility: true,
+  assemble: true,
+  printHighRes: true,
+};
+
 // OCR moved host-side to the `gigapdf-ocr-rten` crate (PaddleOCR PP-OCR via RTen, 12 languages +
 // auto script selection + Hebrew). The WASM SDK no longer ships a client-side recognizer; hosts
 // call the OCR service/binary directly. The legacy `.gpocr` model-loading API was removed.
@@ -269,6 +306,46 @@ export class GigaPdfEngine {
       this._buffer((o) => this.ex.gp_encryption_info(p, l, o))
     );
     return JSON.parse(dec.decode(json));
+  }
+
+  /**
+   * Decode the eight access-permission flags from a `/P` permission bitmask
+   * (ISO 32000-1 Table 22) into named booleans (`true` = the action is
+   * granted). Reserved bits are ignored.
+   */
+  decodePermissions(p: number): PdfPermissions {
+    const json = dec.decode(this._buffer((o) => this.ex.gp_permissions_from_p(p, o)));
+    return JSON.parse(json) as PdfPermissions;
+  }
+
+  /**
+   * Read a PDF's access permissions **without decrypting it** (no password
+   * needed). Returns the eight named flags decoded from the `/Encrypt`
+   * dictionary's `/P`; an unencrypted document grants everything.
+   */
+  getPermissions(pdf: Uint8Array): PdfPermissions {
+    const { encrypted, permissions } = this.encryptionInfo(pdf);
+    return encrypted ? this.decodePermissions(permissions) : { ...ALL_PERMISSIONS };
+  }
+
+  /**
+   * Pack eight access-permission flags into a signed 32-bit `/P` value
+   * (ISO 32000-1 Table 22). Omitted flags default to **granted**, so an empty
+   * object means "all allowed". Feed the result to {@link GigaPdfDoc.saveEncrypted}
+   * via `opts.permissions`, or pass `opts.flags` directly.
+   */
+  permissionsToP(flags: Partial<PdfPermissions> = {}): number {
+    const f = { ...ALL_PERMISSIONS, ...flags };
+    return this.ex.gp_permissions_to_p(
+      f.print ? 1 : 0,
+      f.modify ? 1 : 0,
+      f.copy ? 1 : 0,
+      f.annotate ? 1 : 0,
+      f.fillForms ? 1 : 0,
+      f.accessibility ? 1 : 0,
+      f.assemble ? 1 : 0,
+      f.printHighRes ? 1 : 0
+    );
   }
 
   /**
@@ -1376,7 +1453,33 @@ export type ModelOp =
       row: number;
       col: number;
       value: GigaCellValue;
-    };
+    }
+  // Structural table edits. These keep the column geometry (`col_widths` +
+  // per-cell spans) coherent: an inserted row spans every logical column, an
+  // inserted column passes through any merge it lands inside, and deletes shrink
+  // or drop the cells/spans they touch. `at` is a grid index (clamped).
+  | { op: 'insertTableRow'; addr: GigaBlockAddr; at: number }
+  | { op: 'deleteTableRow'; addr: GigaBlockAddr; at: number }
+  | { op: 'insertTableColumn'; addr: GigaBlockAddr; at: number }
+  | { op: 'deleteTableColumn'; addr: GigaBlockAddr; at: number }
+  | {
+      op: 'setCellSpan';
+      addr: GigaBlockAddr;
+      /** Row index in `rows`. */
+      row: number;
+      /** Cell index in `rows[row].cells` (not a grid column). */
+      col: number;
+      /** Columns the cell spans (clamped to ≥ 1). */
+      col_span: number;
+      /** Rows the cell spans (clamped to ≥ 1). */
+      row_span: number;
+    }
+  // Structural spreadsheet edits: shift cells and re-map merge ranges. `at` is a
+  // row/column index (clamped); merges that collapse are dropped.
+  | { op: 'insertSheetRow'; addr: GigaBlockAddr; sheet: number; at: number }
+  | { op: 'deleteSheetRow'; addr: GigaBlockAddr; sheet: number; at: number }
+  | { op: 'insertSheetColumn'; addr: GigaBlockAddr; sheet: number; at: number }
+  | { op: 'deleteSheetColumn'; addr: GigaBlockAddr; sheet: number; at: number };
 /**
  * An image element from {@link GigaPdfDoc.imageElements}: its placement box
  * (page user space, origin bottom-left), the embeddable encoded bytes + format,
@@ -2540,13 +2643,27 @@ export class GigaPdfDoc {
     opts: {
       ownerPassword?: string;
       algorithm?: "rc4" | "aes128" | "aes256";
+      /**
+       * Named access permissions (ISO 32000-1 Table 22). Omitted flags default
+       * to **granted**. Takes precedence over `permissions` when present.
+       */
+      flags?: Partial<PdfPermissions>;
+      /**
+       * Raw signed 32-bit `/P` bitmask. Use {@link flags} for a readable API.
+       * Defaults to all permissions granted when neither is given.
+       */
       permissions?: number;
       keySeed?: Uint8Array;
     } = {}
   ): Uint8Array {
     const algo = opts.algorithm ?? "aes256";
     const algoCode = algo === "rc4" ? 0 : algo === "aes128" ? 1 : 2;
-    const permissions = opts.permissions ?? -44;
+    // Precedence: explicit `flags` → packed /P; else raw `permissions`; else
+    // the unrestricted spec-strict baseline (`/P` = -196, all eight granted).
+    const permissions =
+      opts.flags !== undefined
+        ? this.g.permissionsToP(opts.flags)
+        : opts.permissions ?? this.g.permissionsToP();
     let key = opts.keySeed ?? new Uint8Array(0);
     if (algoCode === 2 && key.length < 32) {
       const c = (globalThis as { crypto?: Crypto }).crypto;
