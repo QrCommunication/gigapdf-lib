@@ -192,6 +192,13 @@ pub fn needed_fonts_with(
 
     let mut out = Vec::new();
     for (fam, bold, italic) in seen {
+        // base-14 standard families are drawn natively from the bundled
+        // substitute (the render path uses `add_text_standard`), so the host
+        // must NOT fetch or supply them — otherwise they'd be embedded/
+        // referenced as a normal provided face. Skip them from the fetch list.
+        if bundled::base14_kind(&fam).is_some() {
+            continue;
+        }
         // Resolve to a real catalogue family (handles aliases / casing).
         let canonical = catalog::lookup(&fam).map(|f| f.family.to_string());
         let Some(family) = canonical else { continue };

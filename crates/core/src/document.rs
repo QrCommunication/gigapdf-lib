@@ -32,6 +32,15 @@ pub struct Document {
     /// accumulated by [`add_text`](Document::add_text) so the save path can
     /// subset each embedded `glyf` table to only the glyphs actually used.
     font_used_gids: BTreeMap<u32, std::collections::BTreeSet<u16>>,
+    /// Font handles (from [`embed_font`](Document::embed_font)) that resolved to
+    /// a **base-14 standard** face and were registered as a bare `/Type1` font
+    /// **without** a `/FontFile` — keyed by object number, valued by the chosen
+    /// standard `/BaseFont` (e.g. `Helvetica-Bold`). [`add_text`](Document::add_text)
+    /// draws these via the simple WinAnsi text path (referencing the standard
+    /// font Adobe + the rasterizer both draw natively) instead of embedding a
+    /// substitute program, exactly as the AcroForm `/AP` regeneration references
+    /// `/Helv` (see `build_text_field_appearance`). Keeps the saved PDF small.
+    base14_refs: BTreeMap<u32, Vec<u8>>,
 }
 
 /// A full-text search hit: the page, the matching line's text, and its bounding
@@ -890,6 +899,7 @@ impl Document {
             objects,
             trailer,
             font_used_gids: BTreeMap::new(),
+            base14_refs: BTreeMap::new(),
         })
     }
 
@@ -6608,6 +6618,19 @@ impl Document {
     /// face extracted from the document itself). Kept under the historical name
     /// [`embed_truetype_font`](Self::embed_truetype_font) too.
     pub fn embed_font(&mut self, family: &str, program: &[u8]) -> Result<u32> {
+        // Base-14 standard families (`Helvetica`, `Arial`, `Times`, `Courier`,
+        // `Symbol`, `ZapfDingbats`, with any weight/style) need NO embedded
+        // program: every viewer ships them and the rasterizer draws them from a
+        // bundled substitute at render time. Register a bare `/Type1` reference
+        // (no `/FontFile`) and return its handle — `add_text` then draws it via
+        // the simple WinAnsi path, exactly as the AcroForm `/AP` path references
+        // `/Helv`. This avoids subsetting + embedding a substitute (~57 KB for a
+        // few characters). A non-base-14 `family` (a real custom face, including
+        // a substitute deliberately named e.g. `LiberationSans-Regular`) falls
+        // through and is subset + embedded as before.
+        if let Some(base) = Self::base14_postscript_name(family) {
+            return Ok(self.register_base14_ref_font(&base));
+        }
         // glyf TrueType parses with the strict reader; OpenType-CFF (no glyf) is
         // recognised by its `OTTO` sfnt tag and read for metrics/cmap only.
         let no_extra = std::collections::BTreeMap::new();
@@ -6922,6 +6945,17 @@ impl Document {
         underline: bool,
         strikethrough: bool,
     ) -> Result<()> {
+        // Base-14 reference handle (from `embed_font` on a standard family): no
+        // embedded program — draw the simple WinAnsi run referencing the bare
+        // `/Type1` font registered at embed time. Register it on this page first.
+        if self.base14_refs.contains_key(&font_obj) {
+            let res_name = format!("GpStd{font_obj}").into_bytes();
+            self.register_page_font(page_no, &res_name, (font_obj, 0))?;
+            return self.draw_simple_text_run(
+                page_no, &res_name, x, y, size, text, color, opacity, rotation_deg, underline,
+                strikethrough,
+            );
+        }
         let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
             EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
         })?;
@@ -6999,6 +7033,11 @@ impl Document {
         opacity: f64,
         rotation_deg: f64,
     ) -> Result<()> {
+        // A base-14 reference handle carries no embedded program to shape with —
+        // draw the plain simple-font run (identical to `add_text`).
+        if self.base14_refs.contains_key(&font_obj) {
+            return self.add_text(page_no, x, y, size, text, font_obj, color, opacity, rotation_deg);
+        }
         let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
             EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
         })?;
@@ -7081,6 +7120,82 @@ impl Document {
         })
     }
 
+    /// Map an **arbitrary family string** (`"helvetica"`, `"Arial Bold"`,
+    /// `"Times New Roman Italic"`, `"LiberationSans-Bold"`, `"Courier"`, …) to
+    /// the canonical base-14 PostScript `/BaseFont` name to *reference* (e.g.
+    /// `Helvetica-BoldOblique`), or `None` when the family is not a base-14
+    /// standard. The family→family classification reuses
+    /// [`base14_kind`](crate::font::bundled::base14_kind); the bold/italic
+    /// weight is parsed from style hints anywhere in the string (`-Bold`,
+    /// `,Italic`, ` Oblique`, `BoldItalic`, …).
+    ///
+    /// This is the lever that lets [`embed_font`](Self::embed_font) register a
+    /// **reference** to a standard font with no embedded program — drawing added
+    /// base-14 text the same lightweight way the AcroForm `/AP` path references
+    /// `/Helv`, instead of subsetting and embedding a substitute (~57 KB of
+    /// glyph data for a handful of characters).
+    fn base14_postscript_name(family: &str) -> Option<Vec<u8>> {
+        use crate::font::bundled::{base14_kind, Base14};
+        let kind = base14_kind(family)?;
+        let lower = family.to_ascii_lowercase();
+        let bold = lower.contains("bold");
+        // `italic`/`oblique` mark a slanted face; Helvetica/Courier use the
+        // PostScript suffix `Oblique`, Times uses `Italic`.
+        let slanted = lower.contains("italic") || lower.contains("oblique");
+        let name: &[u8] = match kind {
+            Base14::Sans => match (bold, slanted) {
+                (true, true) => b"Helvetica-BoldOblique",
+                (true, false) => b"Helvetica-Bold",
+                (false, true) => b"Helvetica-Oblique",
+                (false, false) => b"Helvetica",
+            },
+            Base14::Serif => match (bold, slanted) {
+                (true, true) => b"Times-BoldItalic",
+                (true, false) => b"Times-Bold",
+                (false, true) => b"Times-Italic",
+                (false, false) => b"Times-Roman",
+            },
+            Base14::Mono => match (bold, slanted) {
+                (true, true) => b"Courier-BoldOblique",
+                (true, false) => b"Courier-Bold",
+                (false, true) => b"Courier-Oblique",
+                (false, false) => b"Courier",
+            },
+            Base14::Symbol => b"Symbol",
+            Base14::ZapfDingbats => b"ZapfDingbats",
+        };
+        Some(name.to_vec())
+    }
+
+    /// Register a bare `/Type1` base-14 standard font (no `/FontFile`) as a
+    /// standalone object and return its object number, recording it in
+    /// [`base14_refs`](Self::base14_refs) so [`add_text`](Self::add_text) draws
+    /// it via the simple WinAnsi reference path. `base` is a canonical base-14
+    /// PostScript name (from [`base14_postscript_name`](Self::base14_postscript_name)).
+    ///
+    /// Unlike [`ensure_standard_font`](Self::ensure_standard_font) this does
+    /// **not** attach to a page (the page registration happens lazily in
+    /// `add_text`, keyed on the actual draw page), so a single handle can be
+    /// reused across pages — matching the `embed_font` contract.
+    fn register_base14_ref_font(&mut self, base: &[u8]) -> u32 {
+        let id = (self.next_object_number(), 0u16);
+        let mut f = Dictionary::new();
+        f.set(b"Type".to_vec(), Object::Name(b"Font".to_vec()));
+        f.set(b"Subtype".to_vec(), Object::Name(b"Type1".to_vec()));
+        f.set(b"BaseFont".to_vec(), Object::Name(base.to_vec()));
+        // Symbol/ZapfDingbats carry their own built-in encoding; the Latin
+        // base-14 use WinAnsi so the WinAnsi-encoded run bytes map correctly.
+        if base != b"Symbol" && base != b"ZapfDingbats" {
+            f.set(
+                b"Encoding".to_vec(),
+                Object::Name(b"WinAnsiEncoding".to_vec()),
+            );
+        }
+        self.objects.insert(id, Object::Dictionary(f));
+        self.base14_refs.insert(id.0, base.to_vec());
+        id.0
+    }
+
     /// Draw `text` at `(x, y)` in a built-in **base-14 standard font**
     /// (`font_name`, e.g. `"Times-Bold"`) — no embedding needed. `size` pt,
     /// `color` (RGB 0–1), `opacity` (0–1), rotated `rotation_deg`° CCW. Text is
@@ -7138,6 +7253,34 @@ impl Document {
         let base = Self::standard_base14(font_name)
             .ok_or_else(|| EngineError::Unsupported(format!("not a base-14 font: {font_name}")))?;
         let res_name = self.ensure_standard_font(page_no, base)?;
+        self.draw_simple_text_run(
+            page_no, &res_name, x, y, size, text, color, opacity, rotation_deg, underline,
+            strikethrough,
+        )
+    }
+
+    /// Append a single **simple-font** text run to `page_no`'s content stream:
+    /// WinAnsi-encoded `(...) Tj` drawn with the page font resource `res_name`
+    /// (which the caller must already have registered — a base-14 `/Type1` with
+    /// no `/FontFile`). Shared by [`add_text_standard_styled`](Self::add_text_standard_styled)
+    /// and the base-14-reference branch of [`add_text_styled`](Self::add_text_styled).
+    /// Rotation rides on the text matrix; decorations use the Helvetica AFM
+    /// advance for their length; `opacity < 1` is wrapped in an ExtGState.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_simple_text_run(
+        &mut self,
+        page_no: u32,
+        res_name: &[u8],
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        color: [f64; 3],
+        opacity: f64,
+        rotation_deg: f64,
+        underline: bool,
+        strikethrough: bool,
+    ) -> Result<()> {
         let (sin, cos) = rotation_deg.to_radians().sin_cos();
 
         let mut inner: Vec<u8> = Vec::new();
@@ -7151,7 +7294,7 @@ impl Document {
             )
             .as_bytes(),
         );
-        inner.extend_from_slice(&res_name);
+        inner.extend_from_slice(res_name);
         inner.extend_from_slice(format!(" {} Tf\n", content::num(size)).as_bytes());
         // Text matrix carries the rotation: [cos sin -sin cos x y].
         inner.extend_from_slice(
@@ -13380,6 +13523,102 @@ mod tests {
         let plain_added =
             String::from_utf8_lossy(&plain.page_content(1).unwrap()).into_owned()[b2..].to_string();
         assert_eq!(count_re_ops(&plain_added), 0, "no rectangle on undecorated embedded run");
+    }
+
+    /// Count `/FontFile`, `/FontFile2` and `/FontFile3` occurrences in raw PDF
+    /// bytes — i.e. how many embedded font *programs* the saved file carries.
+    fn count_font_files(pdf: &[u8]) -> usize {
+        let needle = b"/FontFile";
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i + needle.len() <= pdf.len() {
+            if &pdf[i..i + needle.len()] == needle {
+                n += 1;
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn base14_add_text_references_standard_no_fontfile() {
+        // Baseline: how many font programs the untouched fixture already embeds.
+        let base_pdf = Document::open(&fixture("simple-text.pdf")).unwrap().save();
+        let base_ff = count_font_files(&base_pdf);
+
+        // `embed_font` on a base-14 family must return a *reference* handle (a
+        // bare /Type1, no /FontFile) and `add_text` must draw it natively.
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let font = doc.embed_font("Helvetica", &[]).unwrap();
+        assert_ne!(font, 0, "base-14 reference handle allocated");
+        doc.add_text(1, 80.0, 700.0, 18.0, "Hello base-14", font, [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        let pdf = doc.save();
+
+        // No NEW font program added — the run references the standard font.
+        assert_eq!(
+            count_font_files(&pdf),
+            base_ff,
+            "adding base-14 text must embed zero new /FontFile programs",
+        );
+        // The standard /BaseFont is referenced, and the run is in the content.
+        assert!(
+            pdf.windows(b"/Helvetica".len()).any(|w| w == b"/Helvetica"),
+            "saved PDF references /Helvetica",
+        );
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(content.contains("Tj"), "base-14 run emitted in page content");
+        // Size stays close to baseline (no ~57 KB substitute subset baked in).
+        assert!(
+            pdf.len() < base_pdf.len() + 4_000,
+            "base-14 reference adds <4 KB (got +{} bytes)",
+            pdf.len() as i64 - base_pdf.len() as i64,
+        );
+    }
+
+    #[test]
+    fn embed_font_custom_family_still_embeds_fontfile() {
+        // Non-regression: a real custom face (a family `base14_kind` does NOT
+        // recognise) is still subset + embedded — it carries a /FontFile.
+        let base_ff = count_font_files(&Document::open(&fixture("simple-text.pdf")).unwrap().save());
+
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let font = doc
+            .embed_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
+            .unwrap();
+        doc.add_text(1, 80.0, 650.0, 18.0, "Custom face", font, [0.0, 0.0, 0.0], 1.0, 0.0)
+            .unwrap();
+        let pdf = doc.save();
+
+        assert!(
+            count_font_files(&pdf) > base_ff,
+            "embedding a custom font must add a /FontFile (got {} vs baseline {})",
+            count_font_files(&pdf),
+            base_ff,
+        );
+    }
+
+    #[test]
+    fn base14_postscript_name_maps_family_and_style() {
+        let n = |f: &str| Document::base14_postscript_name(f);
+        // Family + style hints (case-insensitive, anywhere in the string).
+        assert_eq!(n("helvetica").as_deref(), Some(&b"Helvetica"[..]));
+        assert_eq!(n("Helvetica-Bold").as_deref(), Some(&b"Helvetica-Bold"[..]));
+        assert_eq!(n("Arial Bold Italic").as_deref(), Some(&b"Helvetica-BoldOblique"[..]));
+        assert_eq!(n("ArialMT").as_deref(), Some(&b"Helvetica"[..]));
+        assert_eq!(n("Times New Roman").as_deref(), Some(&b"Times-Roman"[..]));
+        assert_eq!(n("Times-Italic").as_deref(), Some(&b"Times-Italic"[..]));
+        assert_eq!(n("TimesNewRoman,BoldItalic").as_deref(), Some(&b"Times-BoldItalic"[..]));
+        assert_eq!(n("Courier").as_deref(), Some(&b"Courier"[..]));
+        assert_eq!(n("courier-boldoblique").as_deref(), Some(&b"Courier-BoldOblique"[..]));
+        assert_eq!(n("Symbol").as_deref(), Some(&b"Symbol"[..]));
+        assert_eq!(n("ZapfDingbats").as_deref(), Some(&b"ZapfDingbats"[..]));
+        // Real custom families are NOT base-14 → embedded path.
+        assert_eq!(n("Liberation Sans"), None);
+        assert_eq!(n("Roboto"), None);
+        assert_eq!(n("DejaVuSans"), None);
     }
 
     #[test]
