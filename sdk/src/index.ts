@@ -819,6 +819,27 @@ export class GigaPdfEngine {
   }
 
   /**
+   * Lower a Markdown string into the unified {@link GigaDocument} model
+   * (CommonMark-ish: headings, lists, GFM tables, fenced code, emphasis/links).
+   */
+  mdToModel(md: string): GigaDocument {
+    return this._withStr(md, (p, l) =>
+      JSON.parse(this._str((o) => this.ex.gp_model_from_md(p, l, o)))
+    ) as GigaDocument;
+  }
+
+  /**
+   * Lower a CSV file (UTF-8 bytes, RFC 4180, auto-detected `,`/`;`/tab/`|`
+   * delimiter) into the unified {@link GigaDocument} model as a single editable
+   * table. Returns `null` if the bytes contain no parseable fields.
+   */
+  csvToModel(csv: Uint8Array): GigaDocument | null {
+    return this._withBytes(csv, (p, l) =>
+      this._modelOrNull((o) => this.ex.gp_model_from_csv(p, l, o))
+    );
+  }
+
+  /**
    * Apply a batch of {@link ModelOp} edits to a model and return the edited
    * model. Ops run in order; out-of-range addresses (and any op that can't be
    * parsed) are silently skipped, so a partially-valid batch never throws.

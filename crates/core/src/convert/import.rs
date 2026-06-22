@@ -108,6 +108,20 @@ pub fn rtf_to_model(rtf: &str) -> Document {
     flow_document(blocks)
 }
 
+/// Markdown → [`Document`]: a CommonMark-ish parse producing real structure —
+/// headings, paragraphs, lists, GFM tables, fenced code and inline emphasis/
+/// links (see [`super::md_import`]).
+pub fn md_to_model(md: &str) -> Document {
+    super::md_import::md_to_model(md)
+}
+
+/// CSV → [`Document`]: an RFC 4180 parse (quoting, auto-detected delimiter)
+/// lowered to a single editable table (see [`super::csv_import`]). `None` for
+/// input with no parseable fields.
+pub fn csv_to_model(bytes: &[u8]) -> Option<Document> {
+    super::csv_import::csv_to_model(bytes)
+}
+
 /// A one-section, one-page [`Document`] of flow blocks (A4 default geometry).
 fn flow_document(blocks: Vec<Block>) -> Document {
     Document {

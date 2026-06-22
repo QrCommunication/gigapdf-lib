@@ -12,9 +12,11 @@
 //! same already-normalized geometry.
 
 pub mod build;
+pub mod csv_import;
 pub mod export_model;
 pub mod grids;
 pub mod import;
+pub mod md_import;
 pub mod office;
 pub mod office_import;
 pub mod pdfa;
@@ -26,7 +28,10 @@ pub mod table;
 pub mod web;
 pub mod zip;
 
-pub use import::{html_to_model, image_to_model, office_to_model, rtf_to_model, txt_to_model};
+pub use import::{
+    csv_to_model, html_to_model, image_to_model, md_to_model, office_to_model, rtf_to_model,
+    txt_to_model,
+};
 pub use style::{Generic, TextStyle};
 
 /// A text run placed on a page (top-left origin, points).

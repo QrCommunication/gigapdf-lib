@@ -2207,6 +2207,30 @@ pub extern "C" fn gp_model_from_html(ptr: *const u8, len: usize, out_len: *mut u
     unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) }
 }
 
+/// Lower a Markdown string at `(ptr, len)` into the unified model, returned as
+/// JSON (CommonMark-ish: headings, lists, tables, code, emphasis, links).
+#[no_mangle]
+pub extern "C" fn gp_model_from_md(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let md = unsafe { str_arg(ptr, len) };
+    let model = gigapdf_core::convert::md_to_model(md);
+    unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) }
+}
+
+/// Lower a CSV buffer at `(ptr, len)` (RFC 4180, auto-detected delimiter) into
+/// the unified model — a single editable table — returned as JSON. Null on input
+/// with no parseable fields.
+#[no_mangle]
+pub extern "C" fn gp_model_from_csv(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    if ptr.is_null() || len == 0 {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match gigapdf_core::convert::csv_to_model(bytes) {
+        Some(model) => unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Apply a batch of edit ops to a model. `(model_ptr, model_len)` is the model
 /// JSON, `(ops_ptr, ops_len)` is a JSON array of ops (see `model::edit`).
 /// Returns the edited model as JSON. Null when the model JSON is malformed.
