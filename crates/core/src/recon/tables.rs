@@ -97,21 +97,25 @@ pub fn plan_tables(
     // and not a **form** layout (dense rules that merely separate fields). When
     // rejected, its lines are left free so they flow back to the normal prose
     // pipeline (headings / paragraphs) instead of being swallowed by a giant,
-    // mostly-empty grid. See [`passes_table_sanity`].
-    if let Some(t) = plan_ruled(lines, vpaths, ignore_paths) {
+    // mostly-empty grid. See [`passes_table_sanity`]. Two tables stacked on one
+    // page each come back as their own grid (the rules are segmented into vertical
+    // bands first), so each is gated and kept independently — neither is lost to a
+    // fused englobing grid.
+    for t in plan_ruled_all(lines, vpaths, ignore_paths) {
         if passes_table_sanity(&t, lines) {
             plan.tables.push(t);
         }
     }
 
-    // Borderless fallback over lines not already covered.
+    // Borderless fallback over lines not already covered (also segmented into
+    // vertical regions, one grid per region).
     let claimed: BTreeSet<usize> = plan
         .tables
         .iter()
         .flat_map(|t| t.covered_lines.iter().copied())
         .collect();
     let free: Vec<usize> = (0..lines.len()).filter(|i| !claimed.contains(i)).collect();
-    if let Some(t) = plan_borderless(lines, &free) {
+    for t in plan_borderless_all(lines, &free) {
         if passes_table_sanity(&t, lines) {
             plan.tables.push(t);
         }
@@ -493,16 +497,54 @@ fn row_of(rows: &[f64], y: f64) -> Option<usize> {
 
 // ── ruled tables ─────────────────────────────────────────────────────────────
 
-/// Plan a ruled table from horizontal + vertical ruling lines. Needs ≥ 2 column
-/// edges and ≥ 2 row edges to form at least one cell.
-fn plan_ruled(
+/// A ruling segment kept with the painted-path index that drew it, so each table
+/// a band yields can claim exactly the paths whose rules lie inside it (a path
+/// belonging to table A must not be marked used by table B).
+#[derive(Clone, Copy)]
+struct HSeg {
+    y: f64,
+    x0: f64,
+    x1: f64,
+    path: usize,
+}
+#[derive(Clone, Copy)]
+struct VSeg {
+    x: f64,
+    y0: f64,
+    y1: f64,
+    path: usize,
+}
+
+/// A maximal vertical band the rules glue together — the connected component on
+/// the **Y axis** that becomes one candidate table. Two ruled tables stacked on a
+/// page leave a vertical gap with no rule, which splits them into two bands.
+struct RuleBand {
+    /// Inclusive Y-extent `[lo, hi]` (PDF user space, lo ≤ hi).
+    lo: f64,
+    hi: f64,
+}
+
+/// Maximum vertical gap, **as a fraction of the band's own height built so far**,
+/// that two rule intervals may straddle and still join the same table. Within one
+/// table the vertical rules bridge its full height into a single continuous
+/// interval, so consecutive horizontal rules never open a hole; a genuine
+/// inter-table gap is a clear void of rules. A tiny absolute floor
+/// ([`BAND_MIN_GAP`]) keeps slivers from over-splitting.
+const BAND_MIN_GAP: f64 = 6.0;
+
+/// Plan **all** ruled tables on the page. Rules are first segmented into vertical
+/// connected components (bands separated by a rule-free gap); each band that
+/// still has ≥ 2 column edges and ≥ 2 row edges becomes its own [`PlannedTable`].
+/// Replaces the previous single-grid planner so two tables stacked on one page are
+/// no longer fused into one englobing grid (which the sanity gate then dropped,
+/// losing both).
+fn plan_ruled_all(
     lines: &[ReconLine],
     vpaths: &[VectorPath],
     ignore_paths: &BTreeSet<usize>,
-) -> Option<PlannedTable> {
-    let mut h_rules: Vec<(f64, f64, f64)> = Vec::new(); // (y, x0, x1)
-    let mut v_rules: Vec<(f64, f64, f64)> = Vec::new(); // (x, y0, y1)
-    let mut used_paths: BTreeSet<usize> = BTreeSet::new();
+) -> Vec<PlannedTable> {
+    let mut h_rules: Vec<HSeg> = Vec::new();
+    let mut v_rules: Vec<VSeg> = Vec::new();
 
     for vp in vpaths {
         // Skip rules already claimed as text underlines — they must not be read
@@ -512,23 +554,60 @@ fn plan_ruled(
             continue;
         }
         match ruling_orientation(vp) {
-            Some(Ruling::Horizontal { y, x0, x1 }) => {
-                h_rules.push((y, x0, x1));
-                used_paths.insert(vp.index);
-            }
-            Some(Ruling::Vertical { x, y0, y1 }) => {
-                v_rules.push((x, y0, y1));
-                used_paths.insert(vp.index);
-            }
+            Some(Ruling::Horizontal { y, x0, x1 }) => h_rules.push(HSeg {
+                y,
+                x0,
+                x1,
+                path: vp.index,
+            }),
+            Some(Ruling::Vertical { x, y0, y1 }) => v_rules.push(VSeg {
+                x,
+                y0,
+                y1,
+                path: vp.index,
+            }),
             None => {}
         }
     }
     if h_rules.len() < 2 || v_rules.len() < 2 {
+        return Vec::new();
+    }
+
+    let bands = segment_rule_bands(&h_rules, &v_rules);
+
+    let mut out: Vec<PlannedTable> = Vec::new();
+    for band in &bands {
+        // Rules whose Y-extent sits inside this band (a horizontal rule is a point
+        // in Y; a vertical rule is included if it overlaps the band — its whole
+        // segment then drives the grid).
+        let lo = band.lo - EDGE_TOL;
+        let hi = band.hi + EDGE_TOL;
+        let band_h: Vec<HSeg> = h_rules
+            .iter()
+            .copied()
+            .filter(|s| s.y >= lo && s.y <= hi)
+            .collect();
+        let band_v: Vec<VSeg> = v_rules
+            .iter()
+            .copied()
+            .filter(|s| s.y0.min(s.y1) <= hi && s.y0.max(s.y1) >= lo)
+            .collect();
+        if let Some(t) = build_ruled_band(lines, &band_h, &band_v) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Materialise one ruled table from the rules of a single band. Mirror of the old
+/// `plan_ruled` body, but over a pre-segmented slice of rules.
+fn build_ruled_band(lines: &[ReconLine], h_rules: &[HSeg], v_rules: &[VSeg]) -> Option<PlannedTable> {
+    if h_rules.len() < 2 || v_rules.len() < 2 {
         return None;
     }
 
-    let cols = cluster_edges(v_rules.iter().map(|r| r.0));
-    let rows_asc = cluster_edges(h_rules.iter().map(|r| r.0));
+    let cols = cluster_edges(v_rules.iter().map(|r| r.x));
+    let rows_asc = cluster_edges(h_rules.iter().map(|r| r.y));
     if cols.len() < 2 || rows_asc.len() < 2 {
         return None;
     }
@@ -551,6 +630,13 @@ fn plan_ruled(
         })
         .collect();
 
+    // Each table owns only the paths whose rules lie in its band.
+    let used_paths: BTreeSet<usize> = h_rules
+        .iter()
+        .map(|s| s.path)
+        .chain(v_rules.iter().map(|s| s.path))
+        .collect();
+
     let start_line = *covered.iter().min()?;
     Some(PlannedTable {
         cols,
@@ -559,9 +645,82 @@ fn plan_ruled(
         covered_lines: covered,
         used_paths,
         start_line,
-        h_segs: h_rules,
-        v_segs: v_rules,
+        h_segs: h_rules.iter().map(|s| (s.y, s.x0, s.x1)).collect(),
+        v_segs: v_rules.iter().map(|s| (s.x, s.y0, s.y1)).collect(),
     })
+}
+
+/// Segment the page's ruling segments into vertical connected components.
+///
+/// Each segment projects to a Y-interval: a horizontal rule to the point
+/// `[y, y]`, a vertical rule to `[min(y0,y1), max(y0,y1)]`. We sort the intervals
+/// and merge any that overlap or are separated by less than an adaptive gap; a
+/// wider void of rules opens a new band. Because a single table's vertical rules
+/// run its full height, they fuse all its horizontal-rule points into one
+/// interval — so a fully-ruled grid stays **one** band (non-regression), while two
+/// stacked tables, whose rules never bridge the gap between them, split into two.
+fn segment_rule_bands(h_rules: &[HSeg], v_rules: &[VSeg]) -> Vec<RuleBand> {
+    let mut intervals: Vec<(f64, f64)> = Vec::with_capacity(h_rules.len() + v_rules.len());
+    for s in h_rules {
+        intervals.push((s.y, s.y));
+    }
+    for s in v_rules {
+        intervals.push((s.y0.min(s.y1), s.y0.max(s.y1)));
+    }
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+
+    // Split scale = one row pitch. A single table's frame verticals normally
+    // bridge its whole height (union gapless ⇒ never splits, whatever the
+    // threshold); the threshold only bites if verticals are drawn piecewise, where
+    // the worst intra-table hole is about one row pitch. We therefore split only on
+    // a void wider than `max(BAND_MIN_GAP, 1.5 × median row pitch)` — above any
+    // single-row hole, yet below the frame-to-frame whitespace separating two
+    // stacked tables. Conservative by construction: a single grid never splits.
+    let split_gap = BAND_MIN_GAP.max(row_pitch(h_rules) * 1.5);
+
+    let mut bands: Vec<RuleBand> = Vec::new();
+    let (mut cur_lo, mut cur_hi) = intervals[0];
+    for &(lo, hi) in &intervals[1..] {
+        if lo - cur_hi > split_gap {
+            bands.push(RuleBand {
+                lo: cur_lo,
+                hi: cur_hi,
+            });
+            cur_lo = lo;
+            cur_hi = hi;
+        } else {
+            cur_hi = cur_hi.max(hi);
+        }
+    }
+    bands.push(RuleBand {
+        lo: cur_lo,
+        hi: cur_hi,
+    });
+    bands
+}
+
+/// Median spacing between consecutive distinct horizontal-rule Y positions — the
+/// natural "one row" scale used to size the band-splitting gap. Falls back to a
+/// small positive value when fewer than two distinct rows exist (then only
+/// [`BAND_MIN_GAP`] governs the split, which is already conservative).
+fn row_pitch(h_rules: &[HSeg]) -> f64 {
+    let mut ys: Vec<f64> = h_rules.iter().map(|s| s.y).collect();
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let mut gaps: Vec<f64> = Vec::new();
+    for w in ys.windows(2) {
+        let g = w[1] - w[0];
+        if g > EDGE_TOL {
+            gaps.push(g);
+        }
+    }
+    if gaps.is_empty() {
+        return 0.0;
+    }
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    gaps[gaps.len() / 2]
 }
 
 /// Cluster a set of nearly-equal edge coordinates into distinct edges (merging
@@ -583,14 +742,20 @@ fn cluster_edges(values: impl Iterator<Item = f64>) -> Vec<f64> {
 
 // ── borderless fallback ──────────────────────────────────────────────────────
 
-/// Plan a borderless table from the free lines. Only promotes when ≥ 2 rows
-/// share ≥ 2 consistent column anchors, so prose is never turned into a table.
-fn plan_borderless(lines: &[ReconLine], free: &[usize]) -> Option<PlannedTable> {
+/// Plan **all** borderless tables among the free lines. Candidate tabular rows
+/// (those hitting ≥ 2 column anchors) are first segmented into vertical regions
+/// separated by a band of prose (a large baseline gap); each region is then built
+/// into its own grid with **region-local** column anchors, so two stacked lists
+/// with different column layouts are not fused into one englobing grid (which the
+/// sanity gate could then drop, losing both).
+fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable> {
     if free.len() < 2 {
-        return None;
+        return Vec::new();
     }
 
-    // Column anchors from run start-x across the free lines.
+    // First pass: global anchors only to *identify* which free lines are tabular
+    // (hit ≥ 2 columns). The grid itself is rebuilt per region below with local
+    // anchors, so a global mismatch between two regions can't distort either.
     let mut xs: Vec<f64> = Vec::new();
     let mut heights: Vec<f64> = Vec::new();
     for &i in free {
@@ -600,52 +765,98 @@ fn plan_borderless(lines: &[ReconLine], free: &[usize]) -> Option<PlannedTable> 
         }
     }
     if xs.len() < 4 {
-        return None;
+        return Vec::new();
     }
     let h_med = median(&mut heights, 10.0);
     let col_gap = (h_med * 2.0).max(16.0);
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-    let mut anchors: Vec<f64> = vec![xs[0]];
-    for &x in &xs[1..] {
-        if x - *anchors.last().unwrap() > col_gap {
-            anchors.push(x);
-        }
-    }
-    if anchors.len() < 2 {
-        return None; // single column ⇒ prose, not a table
+    let global_anchors = anchors_from_xs(&xs, col_gap);
+    if global_anchors.len() < 2 {
+        return Vec::new(); // single column ⇒ prose, not a table
     }
 
-    // Count, per free line, how many distinct anchors its runs hit. A table row
-    // hits ≥ 2 anchors; a prose line hits 1.
-    let anchor_of = |x: f64| -> usize {
-        anchors
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (x - **a)
-                    .abs()
-                    .partial_cmp(&(x - **b).abs())
-                    .unwrap_or(core::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    };
     let mut row_lines: Vec<usize> = Vec::new();
     for &i in free {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
         for r in &lines[i].runs {
-            hit.insert(anchor_of(r.x));
+            hit.insert(nearest_anchor(&global_anchors, r.x));
         }
         if hit.len() >= 2 {
             row_lines.push(i);
         }
     }
     if row_lines.len() < 2 {
-        return None; // need ≥ 2 tabular rows
+        return Vec::new(); // need ≥ 2 tabular rows somewhere
     }
 
-    // Build column edges midway between anchors (extend out by half a gap at the
-    // ends), and row edges from the tabular lines' vertical extents.
+    // Segment the tabular rows into vertical regions: a baseline gap wider than a
+    // few line-heights is a band of prose splitting two separate tables. Rows are
+    // ordered top→bottom (descending centre-Y) before scanning the gaps.
+    let row_gap = (h_med * 2.5).max(20.0);
+    let mut ordered = row_lines.clone();
+    ordered.sort_by(|&a, &b| {
+        lines[b]
+            .center_y()
+            .partial_cmp(&lines[a].center_y())
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    let mut regions: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = vec![ordered[0]];
+    for &i in &ordered[1..] {
+        let prev = *cur.last().unwrap();
+        if (lines[prev].center_y() - lines[i].center_y()).abs() > row_gap {
+            regions.push(std::mem::take(&mut cur));
+        }
+        cur.push(i);
+    }
+    regions.push(cur);
+
+    let mut out: Vec<PlannedTable> = Vec::new();
+    for region in &regions {
+        if let Some(t) = build_borderless_region(lines, region, h_med, col_gap) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Build one borderless table from a vertical region of candidate rows, using
+/// **region-local** column anchors. Re-validates the ≥ 2 rows / ≥ 2 columns gate
+/// so a region that no longer looks tabular on its own is dropped.
+fn build_borderless_region(
+    lines: &[ReconLine],
+    region: &[usize],
+    h_med: f64,
+    col_gap: f64,
+) -> Option<PlannedTable> {
+    if region.len() < 2 {
+        return None;
+    }
+    let mut xs: Vec<f64> = Vec::new();
+    for &i in region {
+        for r in &lines[i].runs {
+            xs.push(r.x);
+        }
+    }
+    let anchors = anchors_from_xs(&xs, col_gap);
+    if anchors.len() < 2 {
+        return None;
+    }
+    // Keep only rows that hit ≥ 2 of the region's own anchors.
+    let mut row_lines: Vec<usize> = Vec::new();
+    for &i in region {
+        let mut hit: BTreeSet<usize> = BTreeSet::new();
+        for r in &lines[i].runs {
+            hit.insert(nearest_anchor(&anchors, r.x));
+        }
+        if hit.len() >= 2 {
+            row_lines.push(i);
+        }
+    }
+    if row_lines.len() < 2 {
+        return None;
+    }
+
+    // Column edges midway between anchors (extend out at the ends).
     let mut cols: Vec<f64> = Vec::with_capacity(anchors.len() + 1);
     cols.push(anchors[0] - col_gap / 2.0);
     for w in anchors.windows(2) {
@@ -653,9 +864,9 @@ fn plan_borderless(lines: &[ReconLine], free: &[usize]) -> Option<PlannedTable> 
     }
     cols.push(*anchors.last().unwrap() + col_gap * 4.0);
 
-    // Row edges: above the top line and below the bottom line, plus midpoints.
+    // Row edges from the tabular rows' centres (descending Y).
     let mut centers: Vec<f64> = row_lines.iter().map(|&i| lines[i].center_y()).collect();
-    centers.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal)); // desc
+    centers.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
     let top_h = lines[row_lines[0]].h.max(h_med);
     let mut rows: Vec<f64> = Vec::with_capacity(centers.len() + 1);
     rows.push(centers[0] + top_h);
@@ -679,6 +890,36 @@ fn plan_borderless(lines: &[ReconLine], free: &[usize]) -> Option<PlannedTable> 
         h_segs: Vec::new(),
         v_segs: Vec::new(),
     })
+}
+
+/// Cluster sorted-or-unsorted run start-Xs into column anchors: a new anchor opens
+/// when a value sits more than `col_gap` past the last. Returns anchors ascending.
+fn anchors_from_xs(xs: &[f64], col_gap: f64) -> Vec<f64> {
+    let mut v: Vec<f64> = xs.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let mut anchors: Vec<f64> = Vec::new();
+    for x in v {
+        match anchors.last() {
+            Some(&last) if x - last <= col_gap => {}
+            _ => anchors.push(x),
+        }
+    }
+    anchors
+}
+
+/// Index of the anchor nearest `x`.
+fn nearest_anchor(anchors: &[f64], x: f64) -> usize {
+    anchors
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (x - **a)
+                .abs()
+                .partial_cmp(&(x - **b).abs())
+                .unwrap_or(core::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1088,5 +1329,184 @@ mod tests {
                 "fully-ruled grid produces only 1×1 cells"
             );
         }
+    }
+
+    /// Count the `Table` blocks emitted for a page, the way `reconstruct_page`
+    /// does: walk every line, materialise the table that starts there.
+    fn count_tables(lines: &[ReconLine], paths: &[VectorPath]) -> usize {
+        let plan = plan_tables(lines, paths, &BTreeSet::new());
+        let mut ids = IdGen::default();
+        let mut n = 0;
+        for li in 0..lines.len() {
+            if let Some(tbl) = plan.take_if_starts_at(li) {
+                if let Some(block) = build_table(&tbl, lines, &mut ids, Rect::new) {
+                    if matches!(block.kind, BlockKind::Table(_)) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn two_stacked_ruled_tables_yield_two_tables() {
+        // GAP #5 — two distinct ruled grids stacked on one page, separated by a
+        // clear vertical void. Table A (top) at y∈[300,340], Table B (bottom) at
+        // y∈[100,140]; the 160-unit gap (140 → 300) carries no rule. Before the
+        // fix these fused into ONE englobing grid (then dropped by the sanity gate,
+        // losing both). Now the rules are segmented into two bands ⇒ two tables.
+        let mut paths = vec![
+            // Table A: 2×2, columns x=50,150,250; rows y=300,320,340.
+            hrule(300.0, 50.0, 250.0),
+            hrule(320.0, 50.0, 250.0),
+            hrule(340.0, 50.0, 250.0),
+            vrule(50.0, 300.0, 340.0),
+            vrule(150.0, 300.0, 340.0),
+            vrule(250.0, 300.0, 340.0),
+            // Table B: 2×2, columns x=50,150,250; rows y=100,120,140.
+            hrule(100.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(140.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let runs = vec![
+            // Table A cells.
+            run("Name", 60.0, 322.0, 40.0),
+            run("Age", 160.0, 322.0, 30.0),
+            run("Alice", 60.0, 302.0, 40.0),
+            run("30", 160.0, 302.0, 20.0),
+            // Table B cells.
+            run("Item", 60.0, 122.0, 40.0),
+            run("Qty", 160.0, 122.0, 30.0),
+            run("Pen", 60.0, 102.0, 40.0),
+            run("5", 160.0, 102.0, 20.0),
+        ];
+        let lines = group_into_lines(&runs);
+
+        assert_eq!(
+            count_tables(&lines, &paths),
+            2,
+            "two stacked ruled tables must yield two Table blocks, not one fused (or zero)"
+        );
+
+        // Both bands' paths are claimed, none leak back to the shape pass.
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        for i in 0..paths.len() {
+            assert!(plan.uses_path(i), "rule path {i} should be owned by a table");
+        }
+    }
+
+    #[test]
+    fn single_ruled_grid_stays_one_table() {
+        // Non-regression on the table *count*: a single fully-ruled grid — even a
+        // tall one with several rows — must come back as exactly ONE table (its
+        // frame verticals bridge the full height, so the band segmenter never
+        // splits it).
+        let mut paths = vec![
+            hrule(100.0, 50.0, 250.0),
+            hrule(130.0, 50.0, 250.0),
+            hrule(160.0, 50.0, 250.0),
+            hrule(190.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 190.0),
+            vrule(150.0, 100.0, 190.0),
+            vrule(250.0, 100.0, 190.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let runs = vec![
+            run("A", 60.0, 172.0, 30.0),
+            run("B", 160.0, 172.0, 30.0),
+            run("C", 60.0, 142.0, 30.0),
+            run("D", 160.0, 142.0, 30.0),
+            run("E", 60.0, 112.0, 30.0),
+            run("F", 160.0, 112.0, 30.0),
+        ];
+        let lines = group_into_lines(&runs);
+        assert_eq!(
+            count_tables(&lines, &paths),
+            1,
+            "a single (tall) ruled grid stays one table"
+        );
+    }
+
+    #[test]
+    fn two_stacked_borderless_tables_yield_two_tables() {
+        // Two borderless lists stacked on one page, separated by a band of prose.
+        // List A (top) at y≈700/684, list B (bottom) at y≈300/284; the ~380-unit
+        // baseline void splits them into two regions, each rebuilt with its own
+        // column anchors ⇒ two tables.
+        let runs = vec![
+            // List A.
+            run("Product", 72.0, 700.0, 50.0),
+            run("Price", 300.0, 700.0, 40.0),
+            run("Widget", 72.0, 684.0, 50.0),
+            run("9.99", 300.0, 684.0, 30.0),
+            // List B (different right column position is fine — anchors are local).
+            run("City", 72.0, 300.0, 50.0),
+            run("Pop", 320.0, 300.0, 40.0),
+            run("Paris", 72.0, 284.0, 50.0),
+            run("2M", 320.0, 284.0, 30.0),
+        ];
+        let lines = group_into_lines(&runs);
+        assert_eq!(
+            count_tables(&lines, &[]),
+            2,
+            "two stacked borderless tables must yield two Table blocks"
+        );
+    }
+
+    #[test]
+    fn segment_rule_bands_splits_on_gap_not_on_row_pitch() {
+        // The segmenter splits on an inter-table void but never on a normal row
+        // pitch. Build raw HSeg/VSeg directly.
+        let h = |y: f64| HSeg {
+            y,
+            x0: 50.0,
+            x1: 250.0,
+            path: 0,
+        };
+        let v = |x: f64, y0: f64, y1: f64| VSeg {
+            x,
+            y0,
+            y1,
+            path: 0,
+        };
+
+        // One grid: rows 100/120/140, verticals bridge full height → ONE band.
+        let h1 = vec![h(100.0), h(120.0), h(140.0)];
+        let v1 = vec![v(50.0, 100.0, 140.0), v(250.0, 100.0, 140.0)];
+        assert_eq!(
+            segment_rule_bands(&h1, &v1).len(),
+            1,
+            "a single framed grid is one band"
+        );
+
+        // Two grids: [100..140] and [300..340], 160-unit void → TWO bands.
+        let h2 = vec![
+            h(100.0),
+            h(120.0),
+            h(140.0),
+            h(300.0),
+            h(320.0),
+            h(340.0),
+        ];
+        let v2 = vec![
+            v(50.0, 100.0, 140.0),
+            v(250.0, 100.0, 140.0),
+            v(50.0, 300.0, 340.0),
+            v(250.0, 300.0, 340.0),
+        ];
+        assert_eq!(
+            segment_rule_bands(&h2, &v2).len(),
+            2,
+            "two grids separated by a void are two bands"
+        );
     }
 }
