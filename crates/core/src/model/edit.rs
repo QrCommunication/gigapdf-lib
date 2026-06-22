@@ -17,8 +17,21 @@
 //!   [`DeleteBlock`](ModelOp::DeleteBlock), [`MoveBlock`](ModelOp::MoveBlock)
 //!   (reorder or relocate across pages), [`SetBlockText`](ModelOp::SetBlockText)
 //!   (replace a paragraph/heading's text wholesale),
-//!   [`RestyleBlock`](ModelOp::RestyleBlock).
-//! - table cell: [`SetCellText`](ModelOp::SetCellText).
+//!   [`RestyleBlock`](ModelOp::RestyleBlock),
+//!   [`SetBlockFrame`](ModelOp::SetBlockFrame) /
+//!   [`SetBlockRotation`](ModelOp::SetBlockRotation) (place / rotate a block in
+//!   absolute coordinates).
+//! - paragraph formatting: [`SetParagraphStyle`](ModelOp::SetParagraphStyle) —
+//!   a patch of optional fields (alignment, indents, spacing, leading) onto the
+//!   addressed paragraph/heading/text-box's [`ParagraphStyle`].
+//! - list level: [`SetListLevel`](ModelOp::SetListLevel),
+//!   [`SetListMarker`](ModelOp::SetListMarker),
+//!   [`SetListOrdered`](ModelOp::SetListOrdered) — on a [`List`] block.
+//! - table cell: [`SetCellText`](ModelOp::SetCellText),
+//!   [`SetCellShading`](ModelOp::SetCellShading) (per-cell background).
+//! - table geometry: [`SetRowHeight`](ModelOp::SetRowHeight),
+//!   [`SetColWidth`](ModelOp::SetColWidth),
+//!   [`SetTableBorder`](ModelOp::SetTableBorder).
 //! - table structure: [`InsertTableRow`](ModelOp::InsertTableRow),
 //!   [`DeleteTableRow`](ModelOp::DeleteTableRow),
 //!   [`InsertTableColumn`](ModelOp::InsertTableColumn),
@@ -51,9 +64,10 @@
 //! ```
 
 use crate::convert::style::Generic;
+use crate::model::geom::{Rect, Rotation};
 use crate::model::{
-    Block, BlockId, BlockKind, Cell, CellValue, Document, Inline, InlineRun, MergeRange, Page, Row,
-    Sheet, SheetCell, SheetRow, Table,
+    Block, BlockId, BlockKind, BorderStyle, Cell, CellValue, Document, Inline, InlineRun, List,
+    ListMarker, MergeRange, Page, Row, Sheet, SheetCell, SheetRow, Table,
 };
 
 /// A positional block address: `(section, page-in-section, block index)`,
@@ -135,6 +149,59 @@ impl StylePatch {
     }
 }
 
+/// A subset of [`ParagraphStyle`](crate::model::style::ParagraphStyle) fields to
+/// patch onto a paragraph/heading/text-box. Every field is optional: `None`
+/// leaves the existing value untouched, so the op only changes what it names.
+/// This is the paragraph-formatting counterpart of [`StylePatch`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ParaPatch {
+    pub align: Option<crate::model::style::Align>,
+    pub indent_left_pt: Option<f64>,
+    pub indent_right_pt: Option<f64>,
+    pub first_line_pt: Option<f64>,
+    pub space_before_pt: Option<f64>,
+    pub space_after_pt: Option<f64>,
+    pub line_height: Option<crate::model::style::LineHeight>,
+}
+
+impl ParaPatch {
+    /// True when this patch carries no field (a no-op).
+    fn is_empty(&self) -> bool {
+        self.align.is_none()
+            && self.indent_left_pt.is_none()
+            && self.indent_right_pt.is_none()
+            && self.first_line_pt.is_none()
+            && self.space_before_pt.is_none()
+            && self.space_after_pt.is_none()
+            && self.line_height.is_none()
+    }
+
+    /// Apply this patch in place to a paragraph style.
+    fn apply(&self, style: &mut crate::model::style::ParagraphStyle) {
+        if let Some(a) = self.align {
+            style.align = a;
+        }
+        if let Some(v) = self.indent_left_pt {
+            style.indent_left_pt = v;
+        }
+        if let Some(v) = self.indent_right_pt {
+            style.indent_right_pt = v;
+        }
+        if let Some(v) = self.first_line_pt {
+            style.first_line_pt = v;
+        }
+        if let Some(v) = self.space_before_pt {
+            style.space_before_pt = v;
+        }
+        if let Some(v) = self.space_after_pt {
+            style.space_after_pt = v;
+        }
+        if let Some(lh) = self.line_height {
+            style.line_height = lh;
+        }
+    }
+}
+
 /// A single editing command against a [`Document`] model.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelOp {
@@ -191,6 +258,71 @@ pub enum ModelOp {
         row: usize,
         col: usize,
         value: CellValue,
+    },
+
+    // ── paragraph formatting ──────────────────────────────────────────────────
+    /// Patch the [`ParagraphStyle`](crate::model::style::ParagraphStyle) of the
+    /// addressed paragraph/heading/text-box (alignment, indents, spacing,
+    /// leading). Only the patch's named fields change. No-op on other block
+    /// kinds, on an out-of-range address, or when the patch is empty.
+    SetParagraphStyle { addr: BlockAddr, patch: ParaPatch },
+
+    // ── list editing ──────────────────────────────────────────────────────────
+    /// Set the nesting `level` of **every** item in the addressed
+    /// [`List`](crate::model::List). No-op on non-list blocks.
+    SetListLevel { addr: BlockAddr, level: u8 },
+    /// Set the bullet/number [`marker`](crate::model::ListMarker) of the
+    /// addressed list. No-op on non-list blocks.
+    SetListMarker {
+        addr: BlockAddr,
+        marker: ListMarker,
+    },
+    /// Set whether the addressed list is `ordered` (numbered) or not. No-op on
+    /// non-list blocks.
+    SetListOrdered { addr: BlockAddr, ordered: bool },
+
+    // ── absolute block placement ──────────────────────────────────────────────
+    /// Set the addressed block's absolute placement [`frame`](crate::model::Block::frame)
+    /// (move / resize). The rectangle is in PDF points (lower-left origin).
+    SetBlockFrame { addr: BlockAddr, rect: Rect },
+    /// Rotate the addressed block by `deg` degrees counter-clockwise. The four
+    /// cardinal angles map to the exact [`Rotation`](crate::model::Rotation)
+    /// variants; any other value becomes [`Rotation::Deg`].
+    SetBlockRotation { addr: BlockAddr, deg: f64 },
+
+    // ── per-cell shading ──────────────────────────────────────────────────────
+    /// Set the background shading of the `(row, col)` cell in the addressed
+    /// [`Table`](crate::model::Table). `Some(rgb)` sets the colour, `None`
+    /// clears it. The cell is addressed by its position in `rows[row].cells`.
+    /// Out-of-range ⇒ no-op.
+    SetCellShading {
+        addr: BlockAddr,
+        row: usize,
+        col: usize,
+        color: Option<[f64; 3]>,
+    },
+
+    // ── table geometry ────────────────────────────────────────────────────────
+    /// Set the fixed `height` (points) of row `row` in the addressed table.
+    /// Out-of-range ⇒ no-op.
+    SetRowHeight {
+        addr: BlockAddr,
+        row: usize,
+        height: f64,
+    },
+    /// Set the `width` (points) of grid-column `col` in the addressed table,
+    /// growing `col_widths` up to the logical column count if needed. A `col`
+    /// at or past the logical column count ⇒ no-op.
+    SetColWidth {
+        addr: BlockAddr,
+        col: usize,
+        width: f64,
+    },
+    /// Set the [`border`](crate::model::Table::border) of the addressed table.
+    /// No-op on non-table blocks.
+    SetTableBorder {
+        addr: BlockAddr,
+        border: BorderStyle,
     },
 
     // ── structural table editing ──────────────────────────────────────────────
@@ -288,6 +420,18 @@ fn block_runs_mut(block: &mut Block) -> Option<&mut Vec<Inline>> {
         BlockKind::Paragraph(p) => Some(&mut p.runs),
         BlockKind::Heading(h) => Some(&mut h.para.runs),
         BlockKind::TextBox(tb) => tb.blocks.first_mut().and_then(block_runs_mut),
+        _ => None,
+    }
+}
+
+/// The mutable [`ParagraphStyle`](crate::model::style::ParagraphStyle) of a
+/// paragraph/heading/text-box block, if it has one. (Text boxes expose their
+/// first paragraph's style — mirroring [`block_runs_mut`].)
+fn block_para_style_mut(block: &mut Block) -> Option<&mut crate::model::style::ParagraphStyle> {
+    match &mut block.kind {
+        BlockKind::Paragraph(p) => Some(&mut p.style),
+        BlockKind::Heading(h) => Some(&mut h.para.style),
+        BlockKind::TextBox(tb) => tb.blocks.first_mut().and_then(block_para_style_mut),
         _ => None,
     }
 }
@@ -472,6 +616,89 @@ fn apply_one(doc: &mut Document, op: &ModelOp) -> bool {
             r.cells[*col].value = value.clone();
             true
         }
+        ModelOp::SetParagraphStyle { addr, patch } => {
+            if patch.is_empty() {
+                return false;
+            }
+            let Some(block) = block_mut(doc, addr) else {
+                return false;
+            };
+            match block_para_style_mut(block) {
+                Some(style) => {
+                    patch.apply(style);
+                    true
+                }
+                None => false,
+            }
+        }
+        ModelOp::SetListLevel { addr, level } => with_list(doc, addr, |l| {
+            for item in &mut l.items {
+                item.level = *level;
+            }
+            true
+        }),
+        ModelOp::SetListMarker { addr, marker } => with_list(doc, addr, |l| {
+            l.marker = *marker;
+            true
+        }),
+        ModelOp::SetListOrdered { addr, ordered } => with_list(doc, addr, |l| {
+            l.ordered = *ordered;
+            true
+        }),
+        ModelOp::SetBlockFrame { addr, rect } => {
+            let Some(block) = block_mut(doc, addr) else {
+                return false;
+            };
+            block.frame = Some(*rect);
+            true
+        }
+        ModelOp::SetBlockRotation { addr, deg } => {
+            let Some(block) = block_mut(doc, addr) else {
+                return false;
+            };
+            block.rotation = rotation_from_degrees(*deg);
+            true
+        }
+        ModelOp::SetCellShading {
+            addr,
+            row,
+            col,
+            color,
+        } => with_table(doc, addr, |t| {
+            let Some(r) = t.rows.get_mut(*row) else {
+                return false;
+            };
+            let Some(cell) = r.cells.get_mut(*col) else {
+                return false;
+            };
+            cell.shading = *color;
+            true
+        }),
+        ModelOp::SetRowHeight { addr, row, height } => with_table(doc, addr, |t| {
+            let Some(r) = t.rows.get_mut(*row) else {
+                return false;
+            };
+            r.height = Some(*height);
+            true
+        }),
+        ModelOp::SetColWidth { addr, col, width } => with_table(doc, addr, |t| {
+            let cols = table_columns(t);
+            if *col >= cols {
+                return false;
+            }
+            // Grow `col_widths` up to the logical column count so a sparse table
+            // becomes addressable at `col`, then set the named width.
+            if t.col_widths.len() <= *col {
+                let seed = default_col_width(t);
+                t.col_widths.resize(cols, seed);
+            }
+            t.col_widths[*col] = *width;
+            true
+        }),
+        ModelOp::SetTableBorder { addr, border } => with_table(doc, addr, |t| {
+            t.border = *border;
+            true
+        }),
         ModelOp::InsertTableRow { addr, at } => {
             with_table(doc, addr, |t| insert_table_row(t, *at))
         }
@@ -546,6 +773,31 @@ fn with_sheet(
         return false;
     };
     f(sh)
+}
+
+/// Run `f` on the [`List`] at `addr`, or return `false` when the address does
+/// not resolve to a list block.
+fn with_list(doc: &mut Document, addr: &BlockAddr, f: impl FnOnce(&mut List) -> bool) -> bool {
+    let Some(block) = block_mut(doc, addr) else {
+        return false;
+    };
+    let BlockKind::List(list) = &mut block.kind else {
+        return false;
+    };
+    f(list)
+}
+
+/// Map a CCW degree value to a [`Rotation`]: the four cardinal angles become the
+/// exact first-class variants (so the common `/Rotate` cases stay exact), any
+/// other value becomes [`Rotation::Deg`].
+fn rotation_from_degrees(deg: f64) -> Rotation {
+    match deg {
+        0.0 => Rotation::D0,
+        90.0 => Rotation::D90,
+        180.0 => Rotation::D180,
+        270.0 => Rotation::D270,
+        d => Rotation::Deg(d),
+    }
 }
 
 /// Move the block at `from` to `to`, clamping the destination index. A move
@@ -1181,6 +1433,119 @@ impl<'a> OpReader<'a> {
         }
     }
 
+    /// A plain `[r, g, b]` triple (no `null` form).
+    fn rgb(&mut self) -> Option<[f64; 3]> {
+        let v = self.array(OpReader::number)?;
+        if v.len() == 3 {
+            Some([v[0], v[1], v[2]])
+        } else {
+            None
+        }
+    }
+
+    /// A `{ "x","y","w","h" }` rectangle (any missing field defaults to 0).
+    fn rect(&mut self) -> Option<Rect> {
+        let mut r = Rect::default();
+        self.object(|rd, k| {
+            match k {
+                "x" => r.x = rd.number()?,
+                "y" => r.y = rd.number()?,
+                "w" => r.w = rd.number()?,
+                "h" => r.h = rd.number()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(r)
+    }
+
+    /// A `{ "width", "color":[r,g,b] }` border (mirrors `model::json`).
+    fn border(&mut self) -> Option<BorderStyle> {
+        let mut b = BorderStyle::default();
+        self.object(|rd, k| {
+            match k {
+                "width" => b.width = rd.number()?,
+                "color" => b.color = rd.rgb()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(b)
+    }
+
+    /// A `LineHeight` tagged object: `{ "t":"normal"|"multiple"|"points", "v"? }`
+    /// (mirrors `model::json::line_height`).
+    fn line_height(&mut self) -> Option<crate::model::style::LineHeight> {
+        use crate::model::style::LineHeight;
+        let mut tag: Option<String> = None;
+        let mut v: Option<f64> = None;
+        self.object(|rd, k| {
+            match k {
+                "t" => tag = Some(rd.string()?),
+                "v" => v = Some(rd.number()?),
+                _ => return None,
+            }
+            Some(())
+        })?;
+        match tag.as_deref()? {
+            "normal" => Some(LineHeight::Normal),
+            "multiple" => Some(LineHeight::Multiple(v?)),
+            "points" => Some(LineHeight::Points(v?)),
+            _ => None,
+        }
+    }
+
+    /// A `ListMarker` tagged object: `{ "t":"bullet"|"decimal"|… , "v"? }`
+    /// (mirrors `model::json::list_marker`).
+    fn list_marker(&mut self) -> Option<ListMarker> {
+        let mut tag: Option<String> = None;
+        let mut v: Option<String> = None;
+        self.object(|rd, k| {
+            match k {
+                "t" => tag = Some(rd.string()?),
+                "v" => v = Some(rd.string()?),
+                _ => return None,
+            }
+            Some(())
+        })?;
+        match tag.as_deref()? {
+            "bullet" => {
+                let s = v?;
+                let mut chars = s.chars();
+                let c = chars.next()?;
+                if chars.next().is_some() {
+                    return None; // exactly one char
+                }
+                Some(ListMarker::Bullet(c))
+            }
+            "decimal" => Some(ListMarker::Decimal),
+            "lower_alpha" => Some(ListMarker::LowerAlpha),
+            "upper_alpha" => Some(ListMarker::UpperAlpha),
+            "lower_roman" => Some(ListMarker::LowerRoman),
+            "upper_roman" => Some(ListMarker::UpperRoman),
+            _ => None,
+        }
+    }
+
+    /// A paragraph-style patch object — only the fields that are present are set.
+    fn para_patch(&mut self) -> Option<ParaPatch> {
+        let mut pp = ParaPatch::default();
+        self.object(|r, k| {
+            match k {
+                "align" => pp.align = Some(parse_align_tag(&r.string()?)?),
+                "indent_left" => pp.indent_left_pt = Some(r.number()?),
+                "indent_right" => pp.indent_right_pt = Some(r.number()?),
+                "first_line" => pp.first_line_pt = Some(r.number()?),
+                "space_before" => pp.space_before_pt = Some(r.number()?),
+                "space_after" => pp.space_after_pt = Some(r.number()?),
+                "line_height" => pp.line_height = Some(r.line_height()?),
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(pp)
+    }
+
     // ── op envelope ───────────────────────────────────────────────────────────
 
     /// Parse the top-level `[ <op>, … ]` array.
@@ -1323,6 +1688,16 @@ impl<'a> OpReader<'a> {
         let mut style: Option<StylePatch> = None;
         let mut block: Option<Block> = None;
         let mut value: Option<CellValue> = None;
+        let mut patch: Option<ParaPatch> = None;
+        let mut level: Option<usize> = None;
+        let mut marker: Option<ListMarker> = None;
+        let mut ordered: Option<bool> = None;
+        let mut rect: Option<Rect> = None;
+        let mut deg: Option<f64> = None;
+        let mut color: Option<Option<[f64; 3]>> = None;
+        let mut height: Option<f64> = None;
+        let mut width: Option<f64> = None;
+        let mut border: Option<BorderStyle> = None;
 
         self.object(|r, k| {
             match k {
@@ -1340,6 +1715,16 @@ impl<'a> OpReader<'a> {
                 "style" => style = Some(r.style_patch()?),
                 "block" => block = Some(r.block()?),
                 "value" => value = Some(r.cell_value()?),
+                "patch" => patch = Some(r.para_patch()?),
+                "level" => level = Some(r.usize()?),
+                "marker" => marker = Some(r.list_marker()?),
+                "ordered" => ordered = Some(r.bool()?),
+                "rect" => rect = Some(r.rect()?),
+                "deg" => deg = Some(r.number()?),
+                "color" => color = Some(r.opt_rgb()?),
+                "height" => height = Some(r.number()?),
+                "width" => width = Some(r.number()?),
+                "border" => border = Some(r.border()?),
                 _ => return None,
             }
             Some(())
@@ -1417,9 +1802,52 @@ impl<'a> OpReader<'a> {
                 sheet: sheet?,
                 at: at?,
             }),
+            "setParagraphStyle" => Some(ModelOp::SetParagraphStyle {
+                addr,
+                patch: patch?,
+            }),
+            "setListLevel" => Some(ModelOp::SetListLevel {
+                addr,
+                level: u8_from(level?)?,
+            }),
+            "setListMarker" => Some(ModelOp::SetListMarker {
+                addr,
+                marker: marker?,
+            }),
+            "setListOrdered" => Some(ModelOp::SetListOrdered {
+                addr,
+                ordered: ordered?,
+            }),
+            "setBlockFrame" => Some(ModelOp::SetBlockFrame { addr, rect: rect? }),
+            "setBlockRotation" => Some(ModelOp::SetBlockRotation { addr, deg: deg? }),
+            "setCellShading" => Some(ModelOp::SetCellShading {
+                addr,
+                row: row?,
+                col: col?,
+                color: color?,
+            }),
+            "setRowHeight" => Some(ModelOp::SetRowHeight {
+                addr,
+                row: row?,
+                height: height?,
+            }),
+            "setColWidth" => Some(ModelOp::SetColWidth {
+                addr,
+                col: col?,
+                width: width?,
+            }),
+            "setTableBorder" => Some(ModelOp::SetTableBorder {
+                addr,
+                border: border?,
+            }),
             _ => None,
         }
     }
+}
+
+/// Narrow a JSON-parsed `usize` to the model's `u8`, rejecting overflow.
+fn u8_from(n: usize) -> Option<u8> {
+    u8::try_from(n).ok()
 }
 
 /// Narrow a JSON-parsed `usize` span to the model's `u16`, rejecting overflow.
@@ -1437,11 +1865,23 @@ fn parse_generic_tag(s: &str) -> Option<Generic> {
     }
 }
 
+/// Parse the model's `align` tag (mirrors `model::json::parse_align`).
+fn parse_align_tag(s: &str) -> Option<crate::model::style::Align> {
+    use crate::model::style::Align;
+    match s {
+        "left" => Some(Align::Left),
+        "center" => Some(Align::Center),
+        "right" => Some(Align::Right),
+        "justify" => Some(Align::Justify),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::style::CharStyle;
-    use crate::model::{Cell, Row};
+    use crate::model::style::{Align, CharStyle, LineHeight, ParagraphStyle};
+    use crate::model::{Cell, ListItem, Row};
     use crate::model::{Heading, Paragraph, Section, Sheet, SheetBlock, Table};
 
     fn run(text: &str) -> Inline {
@@ -2286,6 +2726,487 @@ mod tests {
             run_texts(&doc.sections[0].pages[0].blocks[0]),
             vec!["injected"]
         );
+    }
+
+    // ── paragraph formatting ops ──────────────────────────────────────────────
+
+    fn para_style(doc: &Document) -> &ParagraphStyle {
+        match &first_block(doc).kind {
+            BlockKind::Paragraph(p) => &p.style,
+            BlockKind::Heading(h) => &h.para.style,
+            _ => panic!("expected a paragraph/heading block"),
+        }
+    }
+
+    #[test]
+    fn set_paragraph_style_patches_only_named_fields() {
+        let mut doc = doc_with(vec![Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style: ParagraphStyle {
+                    align: Align::Left,
+                    indent_left_pt: 5.0,
+                    line_height: LineHeight::Normal,
+                    ..ParagraphStyle::default()
+                },
+                runs: vec![run("x")],
+                ..Paragraph::default()
+            }),
+            ..Block::default()
+        }]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetParagraphStyle {
+                addr: BlockAddr::new(0, 0, 0),
+                patch: ParaPatch {
+                    align: Some(Align::Center),
+                    indent_right_pt: Some(12.0),
+                    first_line_pt: Some(-9.0),
+                    space_before_pt: Some(6.0),
+                    space_after_pt: Some(3.0),
+                    line_height: Some(LineHeight::Multiple(1.5)),
+                    ..ParaPatch::default()
+                },
+            },
+        );
+        assert_eq!(n, 1);
+        let s = para_style(&doc);
+        assert_eq!(s.align, Align::Center, "align patched");
+        assert_eq!(s.indent_right_pt, 12.0, "indent_right patched");
+        assert_eq!(s.first_line_pt, -9.0, "first_line patched");
+        assert_eq!(s.space_before_pt, 6.0, "space_before patched");
+        assert_eq!(s.space_after_pt, 3.0, "space_after patched");
+        assert_eq!(s.line_height, LineHeight::Multiple(1.5), "line_height patched");
+        assert_eq!(s.indent_left_pt, 5.0, "indent_left untouched");
+    }
+
+    #[test]
+    fn set_paragraph_style_on_heading_targets_inner_paragraph() {
+        let mut doc = doc_with(vec![Block {
+            kind: BlockKind::Heading(Heading {
+                level: 1,
+                para: Paragraph {
+                    runs: vec![run("Title")],
+                    ..Paragraph::default()
+                },
+            }),
+            ..Block::default()
+        }]);
+        run_one(
+            &mut doc,
+            ModelOp::SetParagraphStyle {
+                addr: BlockAddr::new(0, 0, 0),
+                patch: ParaPatch {
+                    align: Some(Align::Right),
+                    ..ParaPatch::default()
+                },
+            },
+        );
+        assert_eq!(para_style(&doc).align, Align::Right);
+    }
+
+    #[test]
+    fn set_paragraph_style_empty_patch_and_non_paragraph_are_no_ops() {
+        // Empty patch → no-op.
+        let mut doc = doc_with(vec![para_block(vec![run("x")])]);
+        let before = doc.clone();
+        assert_eq!(
+            run_one(
+                &mut doc,
+                ModelOp::SetParagraphStyle {
+                    addr: BlockAddr::new(0, 0, 0),
+                    patch: ParaPatch::default(),
+                }
+            ),
+            0
+        );
+        assert_eq!(doc, before, "empty patch must not mutate");
+        // Non-paragraph block (table) → no-op.
+        let mut doc = doc_with(vec![table_block(grid_table(1, 1))]);
+        let before = doc.clone();
+        assert_eq!(
+            run_one(
+                &mut doc,
+                ModelOp::SetParagraphStyle {
+                    addr: BlockAddr::new(0, 0, 0),
+                    patch: ParaPatch {
+                        align: Some(Align::Center),
+                        ..ParaPatch::default()
+                    },
+                }
+            ),
+            0
+        );
+        assert_eq!(doc, before);
+    }
+
+    // ── list ops ──────────────────────────────────────────────────────────────
+
+    fn list_block(ordered: bool, marker: ListMarker, levels: &[u8]) -> Block {
+        Block {
+            kind: BlockKind::List(List {
+                ordered,
+                marker,
+                items: levels
+                    .iter()
+                    .map(|&level| ListItem {
+                        blocks: vec![para_block(vec![run("item")])],
+                        level,
+                    })
+                    .collect(),
+            }),
+            ..Block::default()
+        }
+    }
+
+    fn get_list(doc: &Document) -> &List {
+        let BlockKind::List(l) = &first_block(doc).kind else {
+            panic!("expected a list block")
+        };
+        l
+    }
+
+    #[test]
+    fn set_list_level_sets_every_item_level() {
+        let mut doc = doc_with(vec![list_block(false, ListMarker::default(), &[0, 1, 0])]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetListLevel {
+                addr: BlockAddr::new(0, 0, 0),
+                level: 2,
+            },
+        );
+        assert_eq!(n, 1);
+        assert!(
+            get_list(&doc).items.iter().all(|it| it.level == 2),
+            "every item's level set to 2"
+        );
+    }
+
+    #[test]
+    fn set_list_marker_and_ordered() {
+        let mut doc = doc_with(vec![list_block(false, ListMarker::Bullet('•'), &[0])]);
+        run_one(
+            &mut doc,
+            ModelOp::SetListMarker {
+                addr: BlockAddr::new(0, 0, 0),
+                marker: ListMarker::Decimal,
+            },
+        );
+        run_one(
+            &mut doc,
+            ModelOp::SetListOrdered {
+                addr: BlockAddr::new(0, 0, 0),
+                ordered: true,
+            },
+        );
+        let l = get_list(&doc);
+        assert_eq!(l.marker, ListMarker::Decimal, "marker → decimal");
+        assert!(l.ordered, "ordered → true");
+    }
+
+    #[test]
+    fn list_ops_on_non_list_are_no_ops() {
+        let mut doc = doc_with(vec![para_block(vec![run("not a list")])]);
+        let before = doc.clone();
+        let n = apply_ops(
+            &mut doc,
+            &[
+                ModelOp::SetListLevel {
+                    addr: BlockAddr::new(0, 0, 0),
+                    level: 1,
+                },
+                ModelOp::SetListOrdered {
+                    addr: BlockAddr::new(0, 0, 0),
+                    ordered: true,
+                },
+            ],
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    // ── absolute block placement ops ──────────────────────────────────────────
+
+    #[test]
+    fn set_block_frame_places_the_block() {
+        let mut doc = doc_with(vec![para_block(vec![run("x")])]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetBlockFrame {
+                addr: BlockAddr::new(0, 0, 0),
+                rect: Rect::new(10.0, 20.0, 100.0, 50.0),
+            },
+        );
+        assert_eq!(n, 1);
+        assert_eq!(first_block(&doc).frame, Some(Rect::new(10.0, 20.0, 100.0, 50.0)));
+    }
+
+    #[test]
+    fn set_block_rotation_snaps_cardinals_and_keeps_arbitrary() {
+        // Cardinal → first-class variant.
+        let mut doc = doc_with(vec![para_block(vec![run("x")])]);
+        run_one(
+            &mut doc,
+            ModelOp::SetBlockRotation {
+                addr: BlockAddr::new(0, 0, 0),
+                deg: 90.0,
+            },
+        );
+        assert_eq!(first_block(&doc).rotation, Rotation::D90);
+        // Arbitrary → Deg.
+        run_one(
+            &mut doc,
+            ModelOp::SetBlockRotation {
+                addr: BlockAddr::new(0, 0, 0),
+                deg: 33.0,
+            },
+        );
+        assert_eq!(first_block(&doc).rotation, Rotation::Deg(33.0));
+    }
+
+    #[test]
+    fn set_block_frame_out_of_range_is_no_op() {
+        let mut doc = doc_with(vec![para_block(vec![run("x")])]);
+        let before = doc.clone();
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetBlockFrame {
+                addr: BlockAddr::new(0, 0, 9),
+                rect: Rect::new(1.0, 2.0, 3.0, 4.0),
+            },
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    // ── table shading & geometry ops ──────────────────────────────────────────
+
+    #[test]
+    fn set_cell_shading_sets_and_clears() {
+        let mut doc = doc_with(vec![table_block(grid_table(1, 2))]);
+        run_one(
+            &mut doc,
+            ModelOp::SetCellShading {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 0,
+                col: 1,
+                color: Some([0.9, 0.9, 0.9]),
+            },
+        );
+        assert_eq!(get_table(&doc).rows[0].cells[1].shading, Some([0.9, 0.9, 0.9]));
+        // Clear it again.
+        run_one(
+            &mut doc,
+            ModelOp::SetCellShading {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 0,
+                col: 1,
+                color: None,
+            },
+        );
+        assert_eq!(get_table(&doc).rows[0].cells[1].shading, None);
+    }
+
+    #[test]
+    fn set_cell_shading_out_of_range_is_no_op() {
+        let mut doc = doc_with(vec![table_block(grid_table(1, 1))]);
+        let before = doc.clone();
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetCellShading {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 5,
+                col: 0,
+                color: Some([0.0, 0.0, 0.0]),
+            },
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn set_row_height() {
+        let mut doc = doc_with(vec![table_block(grid_table(2, 2))]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetRowHeight {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 1,
+                height: 24.0,
+            },
+        );
+        assert_eq!(n, 1);
+        assert_eq!(get_table(&doc).rows[1].height, Some(24.0));
+    }
+
+    #[test]
+    fn set_col_width_sets_and_grows_sparse_widths() {
+        // A 3-column table with NO explicit col_widths → SetColWidth must grow it.
+        let table = Table {
+            rows: vec![Row {
+                cells: vec![Cell::default(); 3],
+                height: None,
+            }],
+            col_widths: Vec::new(),
+            ..Table::default()
+        };
+        let mut doc = doc_with(vec![table_block(table)]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetColWidth {
+                addr: BlockAddr::new(0, 0, 0),
+                col: 2,
+                width: 80.0,
+            },
+        );
+        assert_eq!(n, 1);
+        let t = get_table(&doc);
+        assert_eq!(t.col_widths.len(), 3, "widths grown to the column count");
+        assert_eq!(t.col_widths[2], 80.0, "target width set");
+    }
+
+    #[test]
+    fn set_col_width_out_of_range_is_no_op() {
+        let mut doc = doc_with(vec![table_block(grid_table(1, 2))]);
+        let before = doc.clone();
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetColWidth {
+                addr: BlockAddr::new(0, 0, 0),
+                col: 5,
+                width: 99.0,
+            },
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn set_table_border() {
+        let mut doc = doc_with(vec![table_block(grid_table(1, 1))]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::SetTableBorder {
+                addr: BlockAddr::new(0, 0, 0),
+                border: BorderStyle {
+                    width: 1.5,
+                    color: [0.0, 0.0, 1.0],
+                },
+            },
+        );
+        assert_eq!(n, 1);
+        let t = get_table(&doc);
+        assert_eq!(t.border.width, 1.5);
+        assert_eq!(t.border.color, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn table_geometry_ops_on_non_table_are_no_ops() {
+        let mut doc = doc_with(vec![para_block(vec![run("x")])]);
+        let before = doc.clone();
+        let n = apply_ops(
+            &mut doc,
+            &[
+                ModelOp::SetRowHeight {
+                    addr: BlockAddr::new(0, 0, 0),
+                    row: 0,
+                    height: 10.0,
+                },
+                ModelOp::SetTableBorder {
+                    addr: BlockAddr::new(0, 0, 0),
+                    border: BorderStyle::default(),
+                },
+            ],
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    // ── JSON parsing of the new ops ───────────────────────────────────────────
+
+    #[test]
+    fn parse_new_ops_from_json() {
+        let ops = parse_ops(
+            r#"[
+                { "op":"setParagraphStyle", "addr":[0,0,0],
+                  "patch": { "align":"center", "indent_left":18, "first_line":-9,
+                             "space_after":6, "line_height": {"t":"multiple","v":1.5} } },
+                { "op":"setListLevel", "addr":[0,0,0], "level":2 },
+                { "op":"setListMarker", "addr":[0,0,0], "marker": {"t":"decimal"} },
+                { "op":"setListOrdered", "addr":[0,0,0], "ordered":true },
+                { "op":"setBlockFrame", "addr":[0,0,0], "rect": {"x":1,"y":2,"w":3,"h":4} },
+                { "op":"setBlockRotation", "addr":[0,0,0], "deg":270 },
+                { "op":"setCellShading", "addr":[0,0,0], "row":0, "col":1, "color":[0.5,0.5,0.5] },
+                { "op":"setCellShading", "addr":[0,0,0], "row":0, "col":1, "color":null },
+                { "op":"setRowHeight", "addr":[0,0,0], "row":0, "height":24 },
+                { "op":"setColWidth", "addr":[0,0,0], "col":1, "width":80 },
+                { "op":"setTableBorder", "addr":[0,0,0], "border": {"width":1,"color":[0,0,0]} }
+            ]"#,
+        );
+        assert_eq!(ops.len(), 11);
+        assert_eq!(
+            ops[0],
+            ModelOp::SetParagraphStyle {
+                addr: BlockAddr::new(0, 0, 0),
+                patch: ParaPatch {
+                    align: Some(Align::Center),
+                    indent_left_pt: Some(18.0),
+                    first_line_pt: Some(-9.0),
+                    space_after_pt: Some(6.0),
+                    line_height: Some(LineHeight::Multiple(1.5)),
+                    ..ParaPatch::default()
+                },
+            }
+        );
+        assert_eq!(
+            ops[1],
+            ModelOp::SetListLevel {
+                addr: BlockAddr::new(0, 0, 0),
+                level: 2,
+            }
+        );
+        assert_eq!(
+            ops[5],
+            ModelOp::SetBlockRotation {
+                addr: BlockAddr::new(0, 0, 0),
+                deg: 270.0,
+            }
+        );
+        assert_eq!(
+            ops[6],
+            ModelOp::SetCellShading {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 0,
+                col: 1,
+                color: Some([0.5, 0.5, 0.5]),
+            }
+        );
+        assert_eq!(
+            ops[7],
+            ModelOp::SetCellShading {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 0,
+                col: 1,
+                color: None,
+            }
+        );
+    }
+
+    #[test]
+    fn new_op_survives_json_round_trip_end_to_end() {
+        // Apply a parsed paragraph-style op against a model that round-trips
+        // through JSON, then re-serialise to prove stability.
+        let model = doc_with(vec![para_block(vec![run("hello")])]);
+        let mut reparsed = Document::from_json(&model.to_json()).expect("round-trips");
+        let ops = parse_ops(
+            r#"[{ "op":"setParagraphStyle", "addr":[0,0,0],
+                 "patch": { "align":"justify", "indent_left":24 } }]"#,
+        );
+        assert_eq!(apply_ops(&mut reparsed, &ops), 1);
+        assert_eq!(para_style(&reparsed).align, Align::Justify);
+        assert_eq!(para_style(&reparsed).indent_left_pt, 24.0);
+        let again = Document::from_json(&reparsed.to_json()).expect("re-round-trips");
+        assert_eq!(again, reparsed);
     }
 
     // ── end-to-end: a real PDF → model → edit → export ────────────────────────
