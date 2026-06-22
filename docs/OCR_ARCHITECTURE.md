@@ -43,16 +43,14 @@ PDF page ──render_page(scale)──▶ PNG ──▶ RGB image
 
 ## 2. CTC charlist convention
 
-Every recognizer's class list is `[blank] + dict + [space]`:
+Profile-dependent (see §4):
 
-```
-class 0      = CTC blank
-class 1..=N  = dict.txt lines (one char per line)
-class N+1    = space (PaddleOCR use_space_char)
-```
+- **PaddleStd**: class 0 = blank, 1..=N = `dict.txt` lines, N+1 = space (`use_space_char`); output
+  dim = `len(dict) + 2`.
+- **LegacyGray32**: `dict.txt` IS the alphabet (idx i → char), blank = `len(alphabet)` (last class);
+  output dim = `len(alphabet) + 1`.
 
-`OcrEngine::load` / `load_models_dir` build this list from `dict.txt`; the model's output dimension
-is `len(dict) + 2`.
+`load_charlist` builds the right list + blank index from the profile.
 
 ## 3. RTL scripts (Arabic, Hebrew)
 
@@ -62,24 +60,42 @@ sequence is reversed back to logical order. Embedded LTR runs (digits, Latin) ar
 BiDi algorithm at training time (the Hebrew model is trained on visual-order labels via
 `python-bidi`).
 
-## 4. Languages
+## 4. Languages & input profiles
 
-13 recognizers (shared DBNet detector). PaddleOCR PP-OCRv3/v4 covers ~12; **Hebrew** is our own
-model (PaddleOCR/EasyOCR/MMOCR ship none).
+14 recognizers (shared DBNet detector). PaddleOCR PP-OCRv3/v4 covers 12 printed scripts; **Hebrew**
+is our own trained CRNN (PaddleOCR/EasyOCR/MMOCR ship none); **`latin_hw`** is the reused legacy
+handwriting CRNN. Each recognizer declares an **input profile** (`Profile` in `lib.rs`):
 
-| key | script | RTL | source |
-|---|---|---|---|
-| `ar` | Arabic | ✔ | PaddleOCR `arabic_PP-OCRv3_rec` |
-| `he` | Hebrew | ✔ | **our model** (`tools/train_hebrew.py`) |
-| `zh` / `zh_tw` | Chinese (Simplified / Traditional) | | `ch_PP-OCRv4_rec` / `chinese_cht_PP-OCRv3_rec` |
-| `ja` / `ko` | Japanese / Korean | | `japan_PP-OCRv3_rec` / `korean_PP-OCRv3_rec` |
-| `cyrillic` | Russian/Ukrainian/… | | `cyrillic_PP-OCRv3_rec` |
-| `devanagari` | Hindi/Marathi/… | | `devanagari_PP-OCRv3_rec` |
-| `en` / `latin` | English / French·German·Spanish·… | | `en_PP-OCRv4_rec` / `latin_PP-OCRv3_rec` |
-| `ta` / `te` / `kn` | Tamil / Telugu / Kannada | | `ta`/`te`/`ka_PP-OCRv3_rec` |
+- **`PaddleStd`** — PaddleOCR convention: RGB, height 48, normalize `(px/255−0.5)/0.5`, `[1,3,48,W]`
+  (dynamic width); CTC **blank = 0**, charlist `[blank] + dict + [space]`.
+- **`LegacyGray32`** — the reused gigapdf CRNN: **grayscale**, height 32, ink `= 1 − gray` (dark
+  text → 1), right-padded to a **fixed** width (the legacy ONNX has an unrolled GRU), `[1,1,32,800]`;
+  CTC **blank = last** class, charlist = the dict alphabet directly.
+
+| key | script | RTL | profile | source |
+|---|---|---|---|---|
+| `ar` | Arabic | ✔ | PaddleStd | PaddleOCR `arabic_PP-OCRv3_rec` |
+| `he` | Hebrew | ✔ | PaddleStd | **our trained CRNN** (`tools/train_hebrew.py`, ONNX→RTen) |
+| `zh` / `zh_tw` | Chinese (Simp./Trad.) | | PaddleStd | `ch_PP-OCRv4_rec` / `chinese_cht_PP-OCRv3_rec` |
+| `ja` / `ko` | Japanese / Korean | | PaddleStd | `japan_PP-OCRv3_rec` / `korean_PP-OCRv3_rec` |
+| `cyrillic` | Russian/Ukrainian/… | | PaddleStd | `cyrillic_PP-OCRv3_rec` |
+| `devanagari` | Hindi/Marathi/… | | PaddleStd | `devanagari_PP-OCRv3_rec` |
+| `en` / `latin` | English / French·German·… (printed) | | PaddleStd | `en_PP-OCRv4_rec` / `latin_PP-OCRv3_rec` |
+| `ta` / `te` / `kn` | Tamil / Telugu / Kannada | | PaddleStd | `ta`/`te`/`ka_PP-OCRv3_rec` |
+| `latin_hw` | **Latin/Cyrillic/Greek handwriting** | | LegacyGray32 | **reused** gigapdf CRNN (`convert_legacy_gpocr.py` from `ocr_alpha_hw.gpocr`; beat Tesseract on IAM) |
 
 The manifest is `REC_MODELS` in `crates/ocr-rten/src/lib.rs`. Add a language by appending an entry
 and dropping its `<subdir>/{model.rten,dict.txt}` into the models dir — PaddleOCR covers 100+ scripts.
+
+### Handwriting is opt-in (not in auto-selection)
+
+Auto script selection (`recognize_page`) competes **only PaddleStd printed recognizers** by mean
+argmax-logit. Handwriting (`LegacyGray32`) models are **excluded** from that competition: an
+undertrained/specialized CRNN is overconfident on out-of-domain input and would hijack routing
+(and mean-logit isn't comparable across alphabet sizes anyway). So handwriting is **explicit** —
+the caller selects it when the input is known to be handwriting, via `recognize_page_with(img,
+"latin_hw")` / `recognize_line_with`. This matches the old engine, where the host explicitly loaded
+the HW model for handwriting-heavy input.
 
 ## 5. Public API
 
@@ -95,10 +111,16 @@ for line in eng.recognize_page(&rgb_image)? { /* line.text, .bbox, .confidence, 
 // OCR a PDF page (rasterized via gigapdf-core), boxes in PDF user space:
 let words: Vec<OcrWord> = eng.ocr_pdf_page(&doc, page, 2.0)?;
 let text: String        = eng.ocr_pdf_page_text(&doc, page, 2.0)?;
+
+// Handwriting (opt-in — bypasses auto selection, uses the reused legacy CRNN):
+let hw: Vec<Line> = eng.recognize_page_with(&rgb_image, "latin_hw")?;
 ```
 
-- `OcrEngine::new(det)` + `add_rec(name, rec, dict, rtl)` — build incrementally.
+- `OcrEngine::new(det)` + `add_rec(name, rec, dict, rtl)` / `add_rec_profiled(.., profile)` — build incrementally.
 - `OcrEngine::load(det, rec, dict)` — single-recognizer convenience.
+- `recognize_page` / `recognize_line_auto` — auto script selection over printed recognizers.
+- `recognize_page_with(img, name)` / `recognize_line_with(line, name)` — force a specific recognizer
+  (e.g. `"latin_hw"` for handwriting).
 - `OcrWord { text, x, y, width, height, confidence, model }` — PDF user space (bottom-left origin),
   the replacement for the old `Document::ocr_page`.
 
@@ -108,8 +130,11 @@ Models are **not committed** (kept out of the lean package, like fonts). At depl
 
 1. `crates/ocr-rten/tools/fetch_models.sh [out_dir]` downloads PaddleOCR ONNX (det + 12 rec) from
    `deepghs/paddleocr` on Hugging Face and converts each to `.rten` (`pip install rten-convert`).
-2. The Hebrew model is produced by `crates/ocr-rten/tools/train_hebrew.py` (ONNX → `rten-convert`)
-   and dropped into `<out_dir>/hebrew/{model.rten,dict.txt}`.
+2. **Hebrew** — `crates/ocr-rten/tools/train_hebrew.py` trains the CRNN, exports ONNX → `rten-convert`
+   → `<out_dir>/hebrew/{model.rten,dict.txt}`.
+3. **Handwriting** (`latin_hw`) — `crates/ocr-rten/tools/convert_legacy_gpocr.py` re-exports the
+   already-trained legacy `ocr_alpha_hw.gpocr` (GPO1 int8 ×scale → f32) to ONNX → `rten-convert` →
+   `<out_dir>/latin_hw/{model.rten,dict.txt}`. No retraining — the proven weights are reused.
 
 Layout consumed by `load_models_dir`:
 
@@ -118,6 +143,7 @@ models/
   det.rten
   arabic_PP-OCRv3_rec/{model.rten,dict.txt}
   hebrew/{model.rten,dict.txt}
+  latin_hw/{model.rten,dict.txt}
   …
 ```
 

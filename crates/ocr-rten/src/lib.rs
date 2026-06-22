@@ -16,24 +16,39 @@ const REC_H: usize = 48; // PP-OCRv4 recognition input height
 const DET_MAX_SIDE: u32 = 960; // cap the detection input's long side
 const DET_BIN_THRESH: f32 = 0.3; // DBNet probability-map binarization threshold
 
-/// Language manifest: (display name, models-dir subdirectory, RTL?). PaddleOCR PP-OCRv3/v4 rec
-/// models (shared DBNet detector) + our own Hebrew model (PaddleOCR has none). One DBNet detector
-/// covers every script; only the recognizer + dict vary. Detection model is shared.
-pub const REC_MODELS: &[(&str, &str, bool)] = &[
-    ("ar", "arabic_PP-OCRv3_rec", true),   // Arabic — RTL
-    ("he", "hebrew", true),                // Hebrew — our model (PaddleOCR ships none), RTL
-    ("zh", "ch_PP-OCRv4_rec", false),      // Simplified Chinese (+ Latin + digits)
-    ("zh_tw", "chinese_cht_PP-OCRv3_rec", false), // Traditional Chinese
-    ("cyrillic", "cyrillic_PP-OCRv3_rec", false), // Russian/Ukrainian/…
-    ("devanagari", "devanagari_PP-OCRv3_rec", false), // Hindi/Marathi/…
-    ("en", "en_PP-OCRv4_rec", false),      // English
-    ("ja", "japan_PP-OCRv3_rec", false),   // Japanese
-    ("kn", "ka_PP-OCRv3_rec", false),      // Kannada
-    ("ko", "korean_PP-OCRv3_rec", false),  // Korean
-    ("latin", "latin_PP-OCRv3_rec", false), // French/German/Spanish/… (Latin script)
-    ("ta", "ta_PP-OCRv3_rec", false),      // Tamil
-    ("te", "te_PP-OCRv3_rec", false),      // Telugu
+/// Language manifest: (display name, models-dir subdirectory, RTL?, input profile). PaddleOCR
+/// PP-OCRv3/v4 rec models (shared DBNet detector) + our own Hebrew model (PaddleOCR has none) +
+/// the reused legacy handwriting recognizer (gigapdf's own CRNN, grayscale H32). One DBNet detector
+/// covers every script; only the recognizer + dict (+ input profile) vary.
+pub const REC_MODELS: &[(&str, &str, bool, Profile)] = &[
+    ("ar", "arabic_PP-OCRv3_rec", true, Profile::PaddleStd),   // Arabic — RTL
+    ("he", "hebrew", true, Profile::PaddleStd),                // Hebrew — our model, RTL
+    ("zh", "ch_PP-OCRv4_rec", false, Profile::PaddleStd),      // Simplified Chinese (+ Latin + digits)
+    ("zh_tw", "chinese_cht_PP-OCRv3_rec", false, Profile::PaddleStd), // Traditional Chinese
+    ("cyrillic", "cyrillic_PP-OCRv3_rec", false, Profile::PaddleStd), // Russian/Ukrainian/…
+    ("devanagari", "devanagari_PP-OCRv3_rec", false, Profile::PaddleStd), // Hindi/Marathi/…
+    ("en", "en_PP-OCRv4_rec", false, Profile::PaddleStd),      // English
+    ("ja", "japan_PP-OCRv3_rec", false, Profile::PaddleStd),   // Japanese
+    ("kn", "ka_PP-OCRv3_rec", false, Profile::PaddleStd),      // Kannada
+    ("ko", "korean_PP-OCRv3_rec", false, Profile::PaddleStd),  // Korean
+    ("latin", "latin_PP-OCRv3_rec", false, Profile::PaddleStd), // French/German/Spanish/… (printed Latin)
+    ("ta", "ta_PP-OCRv3_rec", false, Profile::PaddleStd),      // Tamil
+    ("te", "te_PP-OCRv3_rec", false, Profile::PaddleStd),      // Telugu
+    // Reused legacy handwriting CRNN (Latin/Cyrillic/Greek) — grayscale H32, beat Tesseract on IAM.
+    ("latin_hw", "latin_hw", false, Profile::LegacyGray32),
 ];
+
+/// Recognizer input/output convention. PaddleOCR: RGB H48, CTC blank-first, dict = `[blank]+chars+[space]`.
+/// LegacyGray32: gigapdf's reused CRNN — grayscale H32 ink image at a fixed width, CTC blank-last over
+/// a direct alphabet.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Profile {
+    PaddleStd,
+    LegacyGray32,
+}
+
+const LEGACY_H: usize = 32; // legacy CRNN strip height
+const LEGACY_W: usize = 800; // legacy ONNX fixed width (custom GRU unrolls → fixed length)
 
 /// An axis-aligned text box in original-image pixel coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -66,12 +81,15 @@ pub struct OcrWord {
     pub model: String,
 }
 
-/// A loaded recognition model: its CTC charlist plus a right-to-left flag (Hebrew/Arabic).
+/// A loaded recognition model: CTC charlist, blank index, input profile, RTL flag.
 pub struct RecModel {
     pub name: String,
     model: Model,
-    /// CTC charlist: index 0 = blank, 1..=N = dict chars, last = space.
+    /// `chars[i]` is the char for output class `i` (the blank class maps to nothing).
     chars: Vec<String>,
+    /// CTC blank class index (0 for PaddleStd, `chars.len()` for LegacyGray32).
+    blank: usize,
+    profile: Profile,
     /// True for RTL scripts — the CTC output is in visual L→R order, so we reverse to logical.
     pub rtl: bool,
 }
@@ -83,13 +101,27 @@ pub struct OcrEngine {
     recs: Vec<RecModel>,
 }
 
-fn load_charlist(dict: impl AsRef<Path>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+fn load_charlist(
+    dict: impl AsRef<Path>,
+    profile: Profile,
+) -> Result<(Vec<String>, usize), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(dict)?;
-    let mut chars = Vec::with_capacity(raw.lines().count() + 2);
-    chars.push(String::new()); // 0 = blank
-    chars.extend(raw.lines().map(str::to_string)); // 1..=N
-    chars.push(" ".to_string()); // trailing space (use_space_char)
-    Ok(chars)
+    match profile {
+        Profile::PaddleStd => {
+            // CTC: index 0 = blank, 1..=N = dict chars, last = space (use_space_char).
+            let mut chars = Vec::with_capacity(raw.lines().count() + 2);
+            chars.push(String::new());
+            chars.extend(raw.lines().map(str::to_string));
+            chars.push(" ".to_string());
+            Ok((chars, 0))
+        }
+        Profile::LegacyGray32 => {
+            // Legacy CRNN: dict IS the alphabet (idx i → char), blank = len(alphabet) = last class.
+            let chars: Vec<String> = raw.lines().map(str::to_string).collect();
+            let blank = chars.len();
+            Ok((chars, blank))
+        }
+    }
 }
 
 impl OcrEngine {
@@ -98,7 +130,7 @@ impl OcrEngine {
         Ok(OcrEngine { det: Model::load_file(det.as_ref())?, recs: Vec::new() })
     }
 
-    /// Register a recognition model (its dict + RTL flag) under `name`.
+    /// Register a PaddleOCR-convention recognition model (RGB H48) under `name`.
     pub fn add_rec(
         &mut self,
         name: impl Into<String>,
@@ -106,10 +138,25 @@ impl OcrEngine {
         dict: impl AsRef<Path>,
         rtl: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.add_rec_profiled(name, rec, dict, rtl, Profile::PaddleStd)
+    }
+
+    /// Register a recognition model with an explicit input [`Profile`].
+    pub fn add_rec_profiled(
+        &mut self,
+        name: impl Into<String>,
+        rec: impl AsRef<Path>,
+        dict: impl AsRef<Path>,
+        rtl: bool,
+        profile: Profile,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (chars, blank) = load_charlist(dict, profile)?;
         self.recs.push(RecModel {
             name: name.into(),
             model: Model::load_file(rec.as_ref())?,
-            chars: load_charlist(dict)?,
+            chars,
+            blank,
+            profile,
             rtl,
         });
         Ok(())
@@ -120,11 +167,11 @@ impl OcrEngine {
     pub fn load_models_dir(dir: impl AsRef<Path>) -> Result<OcrEngine, Box<dyn std::error::Error>> {
         let dir = dir.as_ref();
         let mut e = OcrEngine::new(dir.join("det.rten"))?;
-        for (name, subdir, rtl) in REC_MODELS {
+        for (name, subdir, rtl, profile) in REC_MODELS {
             let rec = dir.join(subdir).join("model.rten");
             let dict = dir.join(subdir).join("dict.txt");
             if rec.exists() && dict.exists() {
-                e.add_rec(*name, rec, dict, *rtl)?;
+                e.add_rec_profiled(*name, rec, dict, *rtl, *profile)?;
             }
         }
         if e.recs.is_empty() {
@@ -214,7 +261,11 @@ impl OcrEngine {
         line: &RgbImage,
     ) -> Result<(String, f32, String), Box<dyn std::error::Error>> {
         let (mut best, mut best_conf, mut best_name) = (String::new(), f32::NEG_INFINITY, "");
-        for m in &self.recs {
+        // Only PaddleStd (printed) recognizers compete by confidence. Legacy handwriting models
+        // are overconfident on out-of-domain input, so they are opt-in via `recognize_*_with`
+        // (the caller selects them when the input is known to be handwriting) — matching how the
+        // old engine required the host to explicitly load the HW model.
+        for m in self.recs.iter().filter(|m| m.profile == Profile::PaddleStd) {
             let (text, conf) = self.decode(m, line)?;
             if conf > best_conf {
                 (best, best_conf, best_name) = (text, conf, m.name.as_str());
@@ -223,27 +274,88 @@ impl OcrEngine {
         Ok((best, best_conf.max(0.0), best_name.to_string()))
     }
 
-    /// Run one rec model on a cropped line → (text, mean confidence). Reverses RTL output to logical.
-    fn decode(&self, m: &RecModel, line: &RgbImage) -> Result<(String, f32), Box<dyn std::error::Error>> {
-        let (w0, h0) = (line.width().max(1) as f32, line.height().max(1) as f32);
-        let new_w = ((REC_H as f32) * w0 / h0).round().max(1.0) as u32;
-        let resized = image::imageops::resize(line, new_w, REC_H as u32, FilterType::Triangle);
-        let w = new_w as usize;
-        let mut data = vec![0f32; 3 * REC_H * w];
-        for y in 0..REC_H {
-            for x in 0..w {
-                let px = resized.get_pixel(x as u32, y as u32);
-                for c in 0..3 {
-                    data[c * REC_H * w + y * w + x] = (px[c] as f32 / 255.0 - 0.5) / 0.5;
+    /// Recognize one cropped line with a SPECIFIC recognizer by name (e.g. `"latin_hw"` for
+    /// handwriting). Returns `None` if no recognizer with that name is loaded.
+    pub fn recognize_line_with(
+        &self,
+        line: &RgbImage,
+        model: &str,
+    ) -> Result<Option<(String, f32)>, Box<dyn std::error::Error>> {
+        match self.recs.iter().find(|m| m.name == model) {
+            Some(m) => Ok(Some(self.decode(m, line)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Full page recognized with a SPECIFIC recognizer (e.g. handwriting `"latin_hw"`), bypassing
+    /// auto script selection. Returns an error if the named recognizer isn't loaded.
+    pub fn recognize_page_with(
+        &self,
+        img: &RgbImage,
+        model: &str,
+    ) -> Result<Vec<Line>, Box<dyn std::error::Error>> {
+        if !self.recs.iter().any(|m| m.name == model) {
+            return Err(format!("recognizer '{model}' not loaded").into());
+        }
+        let mut boxes = self.detect(img)?;
+        boxes.sort_by_key(|b| (b.y0 / 10, b.x0));
+        let mut out = Vec::with_capacity(boxes.len());
+        for b in boxes {
+            let crop = image::imageops::crop_imm(img, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0).to_image();
+            if let Some((text, confidence)) = self.recognize_line_with(&crop, model)? {
+                if !text.trim().is_empty() {
+                    out.push(Line { bbox: b, text, confidence, model: model.to_string() });
                 }
             }
         }
-        let input: NdTensor<f32, 4> = NdTensor::from_data([1, 3, REC_H, w], data);
+        Ok(out)
+    }
+
+    /// Run one rec model on a cropped line → (text, mean confidence). Reverses RTL output to logical.
+    fn decode(&self, m: &RecModel, line: &RgbImage) -> Result<(String, f32), Box<dyn std::error::Error>> {
+        let (w0, h0) = (line.width().max(1) as f32, line.height().max(1) as f32);
+        // Preprocess per input profile.
+        let input: NdTensor<f32, 4> = match m.profile {
+            Profile::PaddleStd => {
+                // RGB, height 48, normalize (px/255 − 0.5)/0.5, [1,3,48,W] (dynamic width).
+                let new_w = ((REC_H as f32) * w0 / h0).round().max(1.0) as u32;
+                let resized = image::imageops::resize(line, new_w, REC_H as u32, FilterType::Triangle);
+                let w = new_w as usize;
+                let mut data = vec![0f32; 3 * REC_H * w];
+                for y in 0..REC_H {
+                    for x in 0..w {
+                        let px = resized.get_pixel(x as u32, y as u32);
+                        for c in 0..3 {
+                            data[c * REC_H * w + y * w + x] = (px[c] as f32 / 255.0 - 0.5) / 0.5;
+                        }
+                    }
+                }
+                NdTensor::from_data([1, 3, REC_H, w], data)
+            }
+            Profile::LegacyGray32 => {
+                // Grayscale, height 32, ink = 1 − gray (dark text → 1), right-padded to the fixed
+                // LEGACY_W (the legacy ONNX has an unrolled GRU → fixed length); bg = 0.
+                let w32 = (((LEGACY_H as f32) * w0 / h0).round().max(1.0) as usize).min(LEGACY_W);
+                let resized = image::imageops::resize(line, w32 as u32, LEGACY_H as u32, FilterType::Triangle);
+                let mut data = vec![0f32; LEGACY_H * LEGACY_W];
+                for y in 0..LEGACY_H {
+                    for x in 0..w32 {
+                        let px = resized.get_pixel(x as u32, y as u32);
+                        let gray = (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0 / 255.0;
+                        data[y * LEGACY_W + x] = 1.0 - gray;
+                    }
+                }
+                NdTensor::from_data([1, 1, LEGACY_H, LEGACY_W], data)
+            }
+        };
         let logits: NdTensor<f32, 3> = m.model.run_one((&input).into(), None)?.try_into()?;
         let (t_len, n_cls) = (logits.shape()[1], logits.shape()[2]);
         let mut prev = usize::MAX;
         let (mut chars_out, mut conf_sum) = (Vec::<&str>::new(), 0f32);
         for t in 0..t_len {
+            // argmax + its raw logit. Confidence = mean argmax-logit: this is what auto script
+            // selection compares across the (same-architecture) PaddleOCR recognizers. NB: softmax
+            // max-prob is NOT used — it biases toward small-alphabet models (e.g. en=95 vs ko=3688).
             let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
             for c in 0..n_cls {
                 let v = logits[[0, t, c]];
@@ -252,7 +364,7 @@ impl OcrEngine {
                 }
             }
             conf_sum += bv;
-            if bi != prev && bi != 0 {
+            if bi != prev && bi != m.blank {
                 if let Some(ch) = m.chars.get(bi) {
                     chars_out.push(ch);
                 }
