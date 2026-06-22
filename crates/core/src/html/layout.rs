@@ -263,6 +263,16 @@ impl Flow<'_> {
         self.top + next_k * content_h
     }
 
+    /// Whether a block occupying `[top_y, bottom_y]` (absolute, flow-space)
+    /// spans more than one page band — i.e. a page boundary cuts through it.
+    /// Used by `page-break-inside: avoid`.
+    fn crosses_page_break(&self, top_y: f64, bottom_y: f64) -> bool {
+        let content_h = (self.page_h - self.top - self.bottom).max(1.0);
+        let page_of = |y: f64| ((y - self.top).max(0.0) / content_h).floor() as i64;
+        // A zero-height block can't be "cut"; only flag genuine spans.
+        bottom_y - top_y > 0.05 && page_of(top_y) != page_of((bottom_y - 0.05).max(top_y))
+    }
+
     /// Shift every fragment emitted at `self.out[start..]` by `(dx, dy)`
     /// (used to realise `position: relative|absolute|fixed` offsets after a
     /// subtree was laid out in place).
@@ -464,6 +474,11 @@ impl Flow<'_> {
         // `<ol start="N">` makes the first item count from N (default 1), so the
         // pre-increment counter starts at N-1. Plain lists count from 1.
         let mut list_index = list_start_offset(ancestors);
+        // Bottom margin of the previous in-flow block, kept so the next block's
+        // top margin can collapse against it (CSS adjacent-sibling margin
+        // collapsing: the gap is `max(prev.bottom, next.top)`, not their sum).
+        // Reset to `None` whenever inline content interrupts the block flow.
+        let mut prev_block_bottom: Option<f64> = None;
 
         for child in children {
             // Out-of-flow children (float / absolute / fixed) are placed without
@@ -520,19 +535,47 @@ impl Flow<'_> {
                 if !inline_run.is_empty() {
                     y = self.inline_context_f(&inline_run, parent_style, x, avail_w, y, ancestors);
                     inline_run.clear();
+                    prev_block_bottom = None; // inline content broke the adjacency
                 }
                 if let Node::Element(e) = child {
                     let st = self.style_of(e, parent_style, ancestors);
                     if st.display == Display::ListItem {
                         list_index += 1;
                     }
+                    // Collapse this block's top margin against the previous
+                    // block's bottom margin: pull `y` up by the overlap so the
+                    // visible gap becomes `max(prev.bottom, this.top)`.
+                    if let Some(prev_bottom) = prev_block_bottom {
+                        y -= prev_bottom.min(st.margin.top).max(0.0);
+                    }
                     if st.page_break_before {
                         y = self.break_to_next_page(y);
                     }
                     // `position: relative` lays out in flow, then shifts its
                     // fragments by `inset` (its normal space is preserved).
-                    let start = self.out.len();
+                    let mut start = self.out.len();
+                    let y_before = y;
                     y = self.block(e, &st, parent_style, x, avail_w, y, ancestors, list_index);
+                    // `page-break-inside: avoid` — if the block straddled a page
+                    // boundary yet fits within one page, discard it and re-lay
+                    // from the next page top so it stays intact.
+                    if st.page_break_inside_avoid
+                        && st.position != Position::Relative
+                        && self.crosses_page_break(y_before, y)
+                    {
+                        let height = y - y_before;
+                        let content_h = (self.page_h - self.top - self.bottom).max(1.0);
+                        if height <= content_h {
+                            self.out.truncate(start);
+                            let moved = self.break_to_next_page(y_before);
+                            if moved > y_before {
+                                start = self.out.len();
+                                y = self.block(
+                                    e, &st, parent_style, x, avail_w, moved, ancestors, list_index,
+                                );
+                            }
+                        }
+                    }
                     if st.position == Position::Relative {
                         let (dx, dy) = self.relative_offset(&st, avail_w);
                         self.translate_range(start, dx, dy);
@@ -542,10 +585,14 @@ impl Flow<'_> {
                     }
                     if st.page_break_after {
                         y = self.break_to_next_page(y);
+                        prev_block_bottom = None;
+                    } else {
+                        prev_block_bottom = Some(st.margin.bottom);
                     }
                 }
             } else {
                 inline_run.push(child);
+                prev_block_bottom = None;
             }
         }
         if !inline_run.is_empty() {
@@ -762,7 +809,6 @@ impl Flow<'_> {
 
         y += m.top;
         let box_top = y;
-        let box_x = x + m.left;
         let resolve_w = |len: Len| match len {
             Len::Pt(w) => w,
             Len::Percent(pc) => avail_w * pc / 100.0,
@@ -780,6 +826,21 @@ impl Flow<'_> {
         if let Some(mw) = style.min_width {
             box_w = box_w.max(resolve_w(mw));
         }
+        // `margin: 0 auto` (or `margin-left/right: auto`) on a fixed-width block
+        // centres it in the available width: the auto side(s) split the free
+        // space. With only one auto side, that side pushes the box to the
+        // opposite edge. Falls back to the normal `x + margin-left` otherwise.
+        let box_x = if style.width.is_some() && (style.margin_left_auto || style.margin_right_auto) {
+            let free = (avail_w - box_w).max(0.0);
+            match (style.margin_left_auto, style.margin_right_auto) {
+                (true, true) => x + free / 2.0,
+                (true, false) => x + (free - m.right).max(0.0),
+                (false, true) => x + m.left,
+                (false, false) => x + m.left,
+            }
+        } else {
+            x + m.left
+        };
         let content_x = box_x + b.left + p.left;
         let content_w = (box_w - b.left - b.right - p.left - p.right).max(1.0);
 
@@ -3712,5 +3773,101 @@ mod tests {
             (first_y - 36.0).abs() < 12.0,
             "First sits at the top of the left column ({first_y})"
         );
+    }
+
+    // ── Quick-win 3: `margin: 0 auto` centres a fixed-width block ───────────
+
+    #[test]
+    fn margin_auto_centres_fixed_width_block() {
+        // A 200pt block centred in the 540pt content area (page 612 − 2×36
+        // margin) should start at x ≈ 36 + (540 − 200)/2 = 206.
+        let layout = run(
+            "<div style=\"width:200pt;margin:0 auto;background:#eee\">centered</div>",
+        );
+        let x = layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Text { x, text, .. } if text == "centered" => Some(*x),
+                _ => None,
+            })
+            .expect("text fragment");
+        assert!(
+            (x - 206.0).abs() < 4.0,
+            "centred block content starts near x=206 (got {x})"
+        );
+
+        // Without auto margins the same block hugs the left content edge (x≈36).
+        let left = run("<div style=\"width:200pt;background:#eee\">left</div>");
+        let lx = left
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Text { x, text, .. } if text == "left" => Some(*x),
+                _ => None,
+            })
+            .expect("text fragment");
+        assert!(lx < 60.0, "non-auto block stays left ({lx})");
+    }
+
+    // ── Quick-win 4: adjacent block margins collapse (max, not sum) ─────────
+
+    #[test]
+    fn adjacent_block_margins_collapse() {
+        // Two stacked blocks, each with 20pt vertical margins. The gap between
+        // them must be ~20pt (the larger margin), not 40pt (their sum).
+        let layout = run(
+            "<div style=\"margin:20pt 0;height:10pt\">A</div>\
+             <div style=\"margin:20pt 0;height:10pt\">B</div>",
+        );
+        let ay = cell_y(&layout, "A");
+        let by = cell_y(&layout, "B");
+        let gap = by - ay; // baseline-to-baseline ≈ A height + collapsed margin
+        // A's content (~10pt height) + 20pt collapsed margin ≈ 30pt. Without
+        // collapsing it would be ~50pt. Assert it is clearly under 45.
+        assert!(
+            (25.0..45.0).contains(&gap),
+            "collapsed gap ~30pt, not the 50pt sum (got {gap})"
+        );
+    }
+
+    // ── Quick-win 5: `page-break-inside: avoid` keeps a block whole ─────────
+
+    #[test]
+    fn page_break_inside_avoid_moves_block_to_next_page() {
+        // Fill most of page 1 with a tall spacer, then an `avoid` block that is
+        // short enough to fit on one page but, placed in flow, would straddle
+        // the page-1/page-2 boundary. It must move whole onto page 2.
+        let layout = run(
+            "<div style=\"height:700pt\">spacer</div>\
+             <div style=\"page-break-inside:avoid;height:120pt\">keep</div>",
+        );
+        assert!(layout.pages.len() >= 2, "content spans pages");
+        // The whole `keep` block (its text) lands on page 2, not page 1.
+        let on_p1 = layout.pages[0]
+            .iter()
+            .any(|f| matches!(f, Fragment::Text { text, .. } if text == "keep"));
+        let on_p2 = layout
+            .pages
+            .get(1)
+            .map(|p| p.iter().any(|f| matches!(f, Fragment::Text { text, .. } if text == "keep")))
+            .unwrap_or(false);
+        assert!(!on_p1, "avoid block does not start on page 1");
+        assert!(on_p2, "avoid block moved whole to page 2");
+    }
+
+    #[test]
+    fn page_break_inside_avoid_keeps_block_that_already_fits() {
+        // A short `avoid` block that fits entirely on page 1 is NOT moved.
+        let layout = run(
+            "<div style=\"height:50pt\">top</div>\
+             <div style=\"page-break-inside:avoid;height:50pt\">keep</div>",
+        );
+        let on_p1 = layout.pages[0]
+            .iter()
+            .any(|f| matches!(f, Fragment::Text { text, .. } if text == "keep"));
+        assert!(on_p1, "fitting avoid block stays on page 1");
     }
 }

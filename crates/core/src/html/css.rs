@@ -140,6 +140,11 @@ pub struct Style {
     /// `text-transform` applied to rendered text (inherited).
     pub text_transform: TextTransform,
     pub margin: Edges,
+    /// `margin-left: auto` — the left margin absorbs free space. With its right
+    /// counterpart this centres a fixed-width block horizontally. Not inherited.
+    pub margin_left_auto: bool,
+    /// `margin-right: auto`. Not inherited.
+    pub margin_right_auto: bool,
     pub padding: Edges,
     pub border_width: Edges,
     /// Single border colour (the `border`/`border-color` shorthand). Kept for
@@ -166,6 +171,10 @@ pub struct Style {
     /// `page-break-after: always` / `break-after: page` — start a new page
     /// after this block.
     pub page_break_after: bool,
+    /// `page-break-inside: avoid` / `break-inside: avoid` — keep this block on a
+    /// single page when it fits, pushing it to the next page rather than letting
+    /// a page boundary cut through it. Not inherited.
+    pub page_break_inside_avoid: bool,
     /// `flex-direction: column` (else row).
     pub flex_column: bool,
     /// `justify-content` along the main axis.
@@ -348,6 +357,8 @@ impl Default for Style {
             align: Align::Left,
             text_transform: TextTransform::None,
             margin: Edges::default(),
+            margin_left_auto: false,
+            margin_right_auto: false,
             padding: Edges::default(),
             border_width: Edges::default(),
             border_color: [0.0, 0.0, 0.0],
@@ -359,6 +370,7 @@ impl Default for Style {
             pre: false,
             page_break_before: false,
             page_break_after: false,
+            page_break_inside_avoid: false,
             flex_column: false,
             justify: Justify::Start,
             flex_grow: 0.0,
@@ -405,17 +417,44 @@ pub enum Len {
 
 // ─── selectors ──────────────────────────────────────────────────────────────
 
+/// An `[attr]` / `[attr=val]` attribute condition on a compound selector.
+#[derive(Debug, Clone)]
+struct AttrCond {
+    name: String,
+    /// `Some(v)` for `[attr=v]` (exact match); `None` for bare `[attr]`
+    /// (presence only). Values are stored as written (case-sensitive).
+    value: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Compound {
     tag: Option<String>,
     classes: Vec<String>,
     id: Option<String>,
+    /// `[attr]` / `[attr=val]` conditions (all must hold).
+    attrs: Vec<AttrCond>,
+}
+
+/// How a compound relates to the one before it in the selector chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Combinator {
+    /// (whitespace) descendant: an ancestor must match.
+    Descendant,
+    /// `>` child: the immediate parent must match.
+    Child,
+    /// `+` adjacent sibling: the immediately preceding sibling must match.
+    AdjacentSibling,
+    /// `~` general sibling: some preceding sibling must match.
+    GeneralSibling,
 }
 
 #[derive(Debug, Clone)]
 struct Selector {
-    /// Ancestor-to-target compound chain (descendant combinator).
-    parts: Vec<Compound>,
+    /// Target-first-to-ancestor chain: `parts[0]` matches the element itself,
+    /// each later part carries the combinator linking it to the previous one
+    /// and is checked against the appropriate relative (parent / ancestor /
+    /// sibling). Storing the chain target-first lets matching walk outward.
+    parts: Vec<(Combinator, Compound)>,
     specificity: u32,
 }
 
@@ -467,6 +506,33 @@ fn parse_compound(s: &str) -> Compound {
                 }
                 c.id = Some(s[start..i].to_string());
             }
+            b'[' => {
+                // `[attr]` or `[attr=value]` / `[attr="value"]`. Other operators
+                // (`~=`, `^=`, …) are not modelled: we keep the bare-name
+                // presence test, which is a safe over-match (better than dropping
+                // the rule).
+                i += 1;
+                let inner_start = i;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                let inner = &s[inner_start..i];
+                if i < bytes.len() {
+                    i += 1; // consume ']'
+                }
+                if let Some((name, val)) = inner.split_once('=') {
+                    let name = name.trim_end_matches(['~', '^', '$', '*', '|']).trim();
+                    c.attrs.push(AttrCond {
+                        name: name.to_ascii_lowercase(),
+                        value: Some(val.trim().trim_matches(['"', '\'']).to_string()),
+                    });
+                } else if !inner.trim().is_empty() {
+                    c.attrs.push(AttrCond {
+                        name: inner.trim().to_ascii_lowercase(),
+                        value: None,
+                    });
+                }
+            }
             _ => i += 1,
         }
     }
@@ -474,25 +540,109 @@ fn parse_compound(s: &str) -> Compound {
 }
 
 fn parse_selector(s: &str) -> Option<Selector> {
-    let parts: Vec<Compound> = s.split_whitespace().map(parse_compound).collect();
-    if parts.is_empty() {
+    // Tokenize into compound strings and combinator symbols. A `>`/`+`/`~`
+    // between compounds sets the relationship of the FOLLOWING compound to the
+    // one before it; whitespace alone means descendant.
+    let toks = tokenize_selector(s);
+    // Build the source-order chain (ancestor → target) of (incoming-combinator,
+    // compound) pairs. The first compound has no incoming combinator.
+    let mut src: Vec<(Combinator, Compound)> = Vec::new();
+    let mut pending = Combinator::Descendant; // ignored for the first compound
+    for tok in toks {
+        match tok {
+            SelTok::Combinator(c) => pending = c,
+            SelTok::Compound(text) => {
+                src.push((pending, parse_compound(&text)));
+                pending = Combinator::Descendant;
+            }
+        }
+    }
+    if src.is_empty() {
         return None;
     }
-    // Specificity: ids*100 + classes*10 + tags.
+    // Specificity: ids*100 + (classes + attrs)*10 + tags. Combinators add none.
     let mut spec = 0u32;
-    for p in &parts {
+    for (_, p) in &src {
         if p.id.is_some() {
             spec += 100;
         }
-        spec += 10 * p.classes.len() as u32;
+        spec += 10 * (p.classes.len() + p.attrs.len()) as u32;
         if p.tag.is_some() {
             spec += 1;
         }
+    }
+    // Re-order target-first: the LAST source compound matches the element; each
+    // earlier compound carries the combinator that, in source order, preceded
+    // the compound on its right. Walking target-first, that is the combinator
+    // stored on the compound immediately to the right in the source chain.
+    let mut parts: Vec<(Combinator, Compound)> = Vec::with_capacity(src.len());
+    for i in (0..src.len()).rev() {
+        let combinator = if i + 1 < src.len() {
+            src[i + 1].0
+        } else {
+            Combinator::Descendant // target itself: relationship is unused
+        };
+        parts.push((combinator, src[i].1.clone()));
     }
     Some(Selector {
         parts,
         specificity: spec,
     })
+}
+
+/// A token in a complex selector: a compound (`div.x#y[a]`) or a combinator.
+enum SelTok {
+    Compound(String),
+    Combinator(Combinator),
+}
+
+/// Split a complex selector into compound/combinator tokens. Whitespace is a
+/// descendant combinator unless it merely surrounds an explicit `>`/`+`/`~`.
+fn tokenize_selector(s: &str) -> Vec<SelTok> {
+    let mut toks: Vec<SelTok> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_ws = false;
+    let flush = |cur: &mut String, toks: &mut Vec<SelTok>| {
+        if !cur.is_empty() {
+            toks.push(SelTok::Compound(std::mem::take(cur)));
+        }
+    };
+    for ch in s.chars() {
+        match ch {
+            '>' | '+' | '~' => {
+                flush(&mut cur, &mut toks);
+                // Replace a trailing descendant (from surrounding whitespace)
+                // with the explicit combinator.
+                if matches!(toks.last(), Some(SelTok::Combinator(Combinator::Descendant))) {
+                    toks.pop();
+                }
+                toks.push(SelTok::Combinator(match ch {
+                    '>' => Combinator::Child,
+                    '+' => Combinator::AdjacentSibling,
+                    _ => Combinator::GeneralSibling,
+                }));
+                prev_ws = false;
+            }
+            c if c.is_whitespace() => {
+                flush(&mut cur, &mut toks);
+                prev_ws = true;
+            }
+            c => {
+                // A space between two compounds (no explicit combinator) is a
+                // descendant relationship.
+                if prev_ws
+                    && cur.is_empty()
+                    && matches!(toks.last(), Some(SelTok::Compound(_)))
+                {
+                    toks.push(SelTok::Combinator(Combinator::Descendant));
+                }
+                prev_ws = false;
+                cur.push(c);
+            }
+        }
+    }
+    flush(&mut cur, &mut toks);
+    toks
 }
 
 /// Parse a stylesheet body into rules.
@@ -605,32 +755,125 @@ fn matches(compound: &Compound, el: &Element) -> bool {
             return false;
         }
     }
+    for cond in &compound.attrs {
+        match el.attr(&cond.name) {
+            None => return false,
+            Some(actual) => {
+                if let Some(want) = &cond.value {
+                    if actual != want.as_str() {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
     true
 }
 
-/// Does `selector` match `el` given its ancestor chain (root-first)?
-fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -> bool {
-    let parts = &selector.parts;
-    // The last compound must match the element itself.
-    if !matches(parts.last().unwrap(), el) {
-        return false;
-    }
-    // Remaining compounds must match ancestors in order (descendant combinator).
-    let mut ai = ancestors.len();
-    for compound in parts[..parts.len() - 1].iter().rev() {
-        let mut found = false;
-        while ai > 0 {
-            ai -= 1;
-            if matches(compound, ancestors[ai]) {
-                found = true;
+/// Preceding element siblings of `el` (source order) given its parent's
+/// children. Text nodes are skipped, so `a + b` ignores whitespace between
+/// tags. Identity is by pointer (the `ancestors`/`el` references are live
+/// borrows into the same tree).
+fn preceding_siblings<'a>(el: &Element, parent: &'a Element) -> Vec<&'a Element> {
+    let mut out: Vec<&Element> = Vec::new();
+    for child in &parent.children {
+        if let Node::Element(e) = child {
+            if std::ptr::eq(e, el) {
                 break;
             }
+            out.push(e);
         }
-        if !found {
-            return false;
+    }
+    out
+}
+
+/// Does `selector` match `el` given its ancestor chain (root-first, excluding
+/// `el`)? Handles descendant / child / adjacent-sibling / general-sibling
+/// combinators. `selector.parts` is target-first: `parts[0]` is `el`, and each
+/// later part's combinator describes how it relates to the part before it.
+fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -> bool {
+    let parts = &selector.parts;
+    // parts[0] always matches the element itself.
+    if !matches(&parts[0].1, el) {
+        return false;
+    }
+    let parent = ancestors.last().copied();
+    // `cur` tracks the element currently anchored; `ai` the next ancestor index
+    // available for descendant/child hops (ancestors are root-first).
+    let mut cur: &Element = el;
+    let mut ai = ancestors.len();
+    for (combinator, compound) in parts[1..].iter() {
+        match combinator {
+            Combinator::Child => {
+                // Immediate parent of `cur` must match. The parent is the
+                // ancestor just below the current `ai` cursor.
+                if ai == 0 {
+                    return false;
+                }
+                ai -= 1;
+                let p = ancestors[ai];
+                if !matches(compound, p) {
+                    return false;
+                }
+                cur = p;
+            }
+            Combinator::Descendant => {
+                let mut found = false;
+                while ai > 0 {
+                    ai -= 1;
+                    if matches(compound, ancestors[ai]) {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return false;
+                }
+                cur = ancestors[ai];
+            }
+            Combinator::AdjacentSibling => {
+                // The element immediately before `cur` under the same parent.
+                let Some(par) = sibling_parent(cur, el, parent, ancestors, ai) else {
+                    return false;
+                };
+                let prev = preceding_siblings(cur, par);
+                match prev.last() {
+                    Some(p) if matches(compound, p) => cur = p,
+                    _ => return false,
+                }
+            }
+            Combinator::GeneralSibling => {
+                let Some(par) = sibling_parent(cur, el, parent, ancestors, ai) else {
+                    return false;
+                };
+                let prev = preceding_siblings(cur, par);
+                match prev.iter().rev().find(|p| matches(compound, p)) {
+                    Some(p) => cur = p,
+                    None => return false,
+                }
+            }
         }
     }
     true
+}
+
+/// The parent element of `cur` for a sibling combinator. When `cur` is still
+/// `el`, the parent is `ancestors.last()` (`parent`); after one or more
+/// descendant/child hops, it is the ancestor just below the `ai` cursor.
+fn sibling_parent<'a>(
+    cur: &Element,
+    el: &Element,
+    parent: Option<&'a Element>,
+    ancestors: &[&'a Element],
+    ai: usize,
+) -> Option<&'a Element> {
+    if std::ptr::eq(cur, el) {
+        parent
+    } else if ai > 0 {
+        Some(ancestors[ai - 1])
+    } else {
+        None
+    }
 }
 
 /// The full stylesheet context: user-agent defaults + author rules.
@@ -716,6 +959,8 @@ fn inherit(parent: &Style) -> Style {
         display: Display::Inline,
         background: None,
         margin: Edges::default(),
+        margin_left_auto: false,
+        margin_right_auto: false,
         padding: Edges::default(),
         border_width: Edges::default(),
         border_color: parent.color,
@@ -730,6 +975,7 @@ fn inherit(parent: &Style) -> Style {
         width: None,
         page_break_before: false,
         page_break_after: false,
+        page_break_inside_avoid: false,
         flex_column: false,
         justify: Justify::Start,
         flex_grow: 0.0,
@@ -1112,11 +1358,34 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             style.page_break_after =
                 matches!(v, "always" | "page" | "left" | "right" | "recto" | "verso");
         }
-        "margin" => style.margin = parse_edges(v, style.font_size),
+        "page-break-inside" | "break-inside" => {
+            style.page_break_inside_avoid = matches!(v, "avoid" | "avoid-page");
+        }
+        "margin" => {
+            style.margin = parse_edges(v, style.font_size);
+            // Detect `auto` on the horizontal sides so a fixed-width block can
+            // centre. The shorthand maps 1→all, 2→(v,h), 3→(t,h,b), 4→(t,r,b,l);
+            // the left/right tokens are where horizontal `auto` lands.
+            let toks: Vec<&str> = v.split_whitespace().collect();
+            let (l_auto, r_auto) = match toks.as_slice() {
+                [a] => (*a == "auto", *a == "auto"),
+                [_, h] | [_, h, _] => (*h == "auto", *h == "auto"),
+                [_, r, _, l] => (*l == "auto", *r == "auto"),
+                _ => (false, false),
+            };
+            style.margin_left_auto = l_auto;
+            style.margin_right_auto = r_auto;
+        }
         "margin-top" => style.margin.top = parse_len_px(v, style.font_size).unwrap_or(0.0),
-        "margin-right" => style.margin.right = parse_len_px(v, style.font_size).unwrap_or(0.0),
+        "margin-right" => {
+            style.margin_right_auto = v == "auto";
+            style.margin.right = parse_len_px(v, style.font_size).unwrap_or(0.0);
+        }
         "margin-bottom" => style.margin.bottom = parse_len_px(v, style.font_size).unwrap_or(0.0),
-        "margin-left" => style.margin.left = parse_len_px(v, style.font_size).unwrap_or(0.0),
+        "margin-left" => {
+            style.margin_left_auto = v == "auto";
+            style.margin.left = parse_len_px(v, style.font_size).unwrap_or(0.0);
+        }
         "padding" => style.padding = parse_edges(v, style.font_size),
         "padding-top" => style.padding.top = parse_len_px(v, style.font_size).unwrap_or(0.0),
         "padding-right" => style.padding.right = parse_len_px(v, style.font_size).unwrap_or(0.0),
@@ -1419,50 +1688,278 @@ fn parse_len(v: &str, em: f64) -> Option<Len> {
 pub fn parse_color(v: &str) -> Option<[f64; 3]> {
     let v = v.trim().to_ascii_lowercase();
     if let Some(hex) = v.strip_prefix('#') {
+        // `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`. The alpha nibble/byte is
+        // parsed for validity but dropped — the paint layer has no per-fill
+        // alpha here, so an opaque RGB is the faithful approximation (the
+        // colour is kept rather than the whole declaration being discarded).
         let (r, g, b) = match hex.len() {
-            3 => (
+            3 | 4 => (
                 u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?,
                 u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?,
                 u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?,
             ),
-            6 => (
+            6 | 8 => (
                 u8::from_str_radix(&hex[0..2], 16).ok()?,
                 u8::from_str_radix(&hex[2..4], 16).ok()?,
                 u8::from_str_radix(&hex[4..6], 16).ok()?,
             ),
             _ => return None,
         };
+        // For the 4-/8-digit forms, validate the alpha component too (so a
+        // malformed `#12345` still returns None rather than a half-parsed RGB).
+        if hex.len() == 4 {
+            u8::from_str_radix(&hex[3..4].repeat(2), 16).ok()?;
+        } else if hex.len() == 8 {
+            u8::from_str_radix(&hex[6..8], 16).ok()?;
+        }
         return Some([r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0]);
     }
-    if let Some(inner) = v.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+    // `rgb()` / `rgba()` — comma- or space-separated; the alpha (4th value, or
+    // after a `/`) is ignored but the colour is still returned.
+    if let Some(inner) = v
+        .strip_prefix("rgba(")
+        .or_else(|| v.strip_prefix("rgb("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let nums: Vec<f64> = inner
-            .split(',')
-            .filter_map(|n| n.trim().parse::<f64>().ok())
+            .replace('/', " ")
+            .split([',', ' '])
+            .filter(|t| !t.trim().is_empty())
+            .filter_map(|n| parse_rgb_component(n.trim()))
             .collect();
         if nums.len() >= 3 {
-            return Some([nums[0] / 255.0, nums[1] / 255.0, nums[2] / 255.0]);
+            return Some([nums[0], nums[1], nums[2]]);
         }
+        return None;
     }
-    let named = match v.as_str() {
-        "black" => [0.0, 0.0, 0.0],
-        "white" => [1.0, 1.0, 1.0],
-        "red" => [1.0, 0.0, 0.0],
-        "green" => [0.0, 0.5, 0.0],
-        "lime" => [0.0, 1.0, 0.0],
-        "blue" => [0.0, 0.0, 1.0],
-        "gray" | "grey" => [0.5, 0.5, 0.5],
-        "silver" => [0.75, 0.75, 0.75],
-        "lightgray" | "lightgrey" => [0.83, 0.83, 0.83],
-        "navy" => [0.0, 0.0, 0.5],
-        "orange" => [1.0, 0.647, 0.0],
-        "yellow" => [1.0, 1.0, 0.0],
-        "purple" => [0.5, 0.0, 0.5],
-        "teal" => [0.0, 0.5, 0.5],
-        "maroon" => [0.5, 0.0, 0.0],
+    // `hsl()` / `hsla()` — hue in degrees, saturation/lightness in `%`. Alpha
+    // (4th value, or after `/`) ignored.
+    if let Some(inner) = v
+        .strip_prefix("hsla(")
+        .or_else(|| v.strip_prefix("hsl("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let normalized = inner.replace('/', " ");
+        let parts: Vec<&str> = normalized
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if parts.len() >= 3 {
+            let h = parse_angle_deg(parts[0])?;
+            let s = parse_percent_unit(parts[1])?;
+            let l = parse_percent_unit(parts[2])?;
+            return Some(hsl_to_rgb(h, s, l));
+        }
+        return None;
+    }
+    named_color(&v)
+}
+
+/// One `rgb()` channel → 0..=1. Accepts `0-255` integers/floats and `%`.
+fn parse_rgb_component(t: &str) -> Option<f64> {
+    if let Some(p) = t.strip_suffix('%') {
+        return p.trim().parse::<f64>().ok().map(|n| (n / 100.0).clamp(0.0, 1.0));
+    }
+    t.parse::<f64>().ok().map(|n| (n / 255.0).clamp(0.0, 1.0))
+}
+
+/// An HSL hue angle in degrees (bare number or `deg`), normalised to [0,360).
+fn parse_angle_deg(t: &str) -> Option<f64> {
+    let t = t.strip_suffix("deg").unwrap_or(t).trim();
+    let mut a = t.parse::<f64>().ok()? % 360.0;
+    if a < 0.0 {
+        a += 360.0;
+    }
+    Some(a)
+}
+
+/// A `%` value → 0..=1 (used for HSL saturation/lightness).
+fn parse_percent_unit(t: &str) -> Option<f64> {
+    let p = t.strip_suffix('%')?;
+    p.trim().parse::<f64>().ok().map(|n| (n / 100.0).clamp(0.0, 1.0))
+}
+
+/// Convert HSL (`h` in degrees, `s`/`l` in 0..=1) to linear-free sRGB 0..=1.
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [f64; 3] {
+    if s == 0.0 {
+        return [l, l, l]; // achromatic (grey)
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hk = h / 360.0;
+    let hue = |mut t: f64| {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 1.0 / 2.0 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    [hue(hk + 1.0 / 3.0), hue(hk), hue(hk - 1.0 / 3.0)]
+}
+
+/// The full CSS named-colour table (147 keywords + `transparent`), lower-cased.
+/// `transparent` and unknown names return `None` so the property is dropped.
+fn named_color(name: &str) -> Option<[f64; 3]> {
+    // Stored as 0xRRGGBB for compactness; expanded to 0..=1 floats on hit.
+    let rgb: u32 = match name {
         "transparent" => return None,
+        "aliceblue" => 0xf0f8ff,
+        "antiquewhite" => 0xfaebd7,
+        "aqua" | "cyan" => 0x00ffff,
+        "aquamarine" => 0x7fffd4,
+        "azure" => 0xf0ffff,
+        "beige" => 0xf5f5dc,
+        "bisque" => 0xffe4c4,
+        "black" => 0x000000,
+        "blanchedalmond" => 0xffebcd,
+        "blue" => 0x0000ff,
+        "blueviolet" => 0x8a2be2,
+        "brown" => 0xa52a2a,
+        "burlywood" => 0xdeb887,
+        "cadetblue" => 0x5f9ea0,
+        "chartreuse" => 0x7fff00,
+        "chocolate" => 0xd2691e,
+        "coral" => 0xff7f50,
+        "cornflowerblue" => 0x6495ed,
+        "cornsilk" => 0xfff8dc,
+        "crimson" => 0xdc143c,
+        "darkblue" => 0x00008b,
+        "darkcyan" => 0x008b8b,
+        "darkgoldenrod" => 0xb8860b,
+        "darkgray" | "darkgrey" => 0xa9a9a9,
+        "darkgreen" => 0x006400,
+        "darkkhaki" => 0xbdb76b,
+        "darkmagenta" => 0x8b008b,
+        "darkolivegreen" => 0x556b2f,
+        "darkorange" => 0xff8c00,
+        "darkorchid" => 0x9932cc,
+        "darkred" => 0x8b0000,
+        "darksalmon" => 0xe9967a,
+        "darkseagreen" => 0x8fbc8f,
+        "darkslateblue" => 0x483d8b,
+        "darkslategray" | "darkslategrey" => 0x2f4f4f,
+        "darkturquoise" => 0x00ced1,
+        "darkviolet" => 0x9400d3,
+        "deeppink" => 0xff1493,
+        "deepskyblue" => 0x00bfff,
+        "dimgray" | "dimgrey" => 0x696969,
+        "dodgerblue" => 0x1e90ff,
+        "firebrick" => 0xb22222,
+        "floralwhite" => 0xfffaf0,
+        "forestgreen" => 0x228b22,
+        "fuchsia" | "magenta" => 0xff00ff,
+        "gainsboro" => 0xdcdcdc,
+        "ghostwhite" => 0xf8f8ff,
+        "gold" => 0xffd700,
+        "goldenrod" => 0xdaa520,
+        "gray" | "grey" => 0x808080,
+        "green" => 0x008000,
+        "greenyellow" => 0xadff2f,
+        "honeydew" => 0xf0fff0,
+        "hotpink" => 0xff69b4,
+        "indianred" => 0xcd5c5c,
+        "indigo" => 0x4b0082,
+        "ivory" => 0xfffff0,
+        "khaki" => 0xf0e68c,
+        "lavender" => 0xe6e6fa,
+        "lavenderblush" => 0xfff0f5,
+        "lawngreen" => 0x7cfc00,
+        "lemonchiffon" => 0xfffacd,
+        "lightblue" => 0xadd8e6,
+        "lightcoral" => 0xf08080,
+        "lightcyan" => 0xe0ffff,
+        "lightgoldenrodyellow" => 0xfafad2,
+        "lightgray" | "lightgrey" => 0xd3d3d3,
+        "lightgreen" => 0x90ee90,
+        "lightpink" => 0xffb6c1,
+        "lightsalmon" => 0xffa07a,
+        "lightseagreen" => 0x20b2aa,
+        "lightskyblue" => 0x87cefa,
+        "lightslategray" | "lightslategrey" => 0x778899,
+        "lightsteelblue" => 0xb0c4de,
+        "lightyellow" => 0xffffe0,
+        "lime" => 0x00ff00,
+        "limegreen" => 0x32cd32,
+        "linen" => 0xfaf0e6,
+        "maroon" => 0x800000,
+        "mediumaquamarine" => 0x66cdaa,
+        "mediumblue" => 0x0000cd,
+        "mediumorchid" => 0xba55d3,
+        "mediumpurple" => 0x9370db,
+        "mediumseagreen" => 0x3cb371,
+        "mediumslateblue" => 0x7b68ee,
+        "mediumspringgreen" => 0x00fa9a,
+        "mediumturquoise" => 0x48d1cc,
+        "mediumvioletred" => 0xc71585,
+        "midnightblue" => 0x191970,
+        "mintcream" => 0xf5fffa,
+        "mistyrose" => 0xffe4e1,
+        "moccasin" => 0xffe4b5,
+        "navajowhite" => 0xffdead,
+        "navy" => 0x000080,
+        "oldlace" => 0xfdf5e6,
+        "olive" => 0x808000,
+        "olivedrab" => 0x6b8e23,
+        "orange" => 0xffa500,
+        "orangered" => 0xff4500,
+        "orchid" => 0xda70d6,
+        "palegoldenrod" => 0xeee8aa,
+        "palegreen" => 0x98fb98,
+        "paleturquoise" => 0xafeeee,
+        "palevioletred" => 0xdb7093,
+        "papayawhip" => 0xffefd5,
+        "peachpuff" => 0xffdab9,
+        "peru" => 0xcd853f,
+        "pink" => 0xffc0cb,
+        "plum" => 0xdda0dd,
+        "powderblue" => 0xb0e0e6,
+        "purple" => 0x800080,
+        "rebeccapurple" => 0x663399,
+        "red" => 0xff0000,
+        "rosybrown" => 0xbc8f8f,
+        "royalblue" => 0x4169e1,
+        "saddlebrown" => 0x8b4513,
+        "salmon" => 0xfa8072,
+        "sandybrown" => 0xf4a460,
+        "seagreen" => 0x2e8b57,
+        "seashell" => 0xfff5ee,
+        "sienna" => 0xa0522d,
+        "silver" => 0xc0c0c0,
+        "skyblue" => 0x87ceeb,
+        "slateblue" => 0x6a5acd,
+        "slategray" | "slategrey" => 0x708090,
+        "snow" => 0xfffafa,
+        "springgreen" => 0x00ff7f,
+        "steelblue" => 0x4682b4,
+        "tan" => 0xd2b48c,
+        "teal" => 0x008080,
+        "thistle" => 0xd8bfd8,
+        "tomato" => 0xff6347,
+        "turquoise" => 0x40e0d0,
+        "violet" => 0xee82ee,
+        "wheat" => 0xf5deb3,
+        "white" => 0xffffff,
+        "whitesmoke" => 0xf5f5f5,
+        "yellow" => 0xffff00,
+        "yellowgreen" => 0x9acd32,
         _ => return None,
     };
-    Some(named)
+    Some([
+        ((rgb >> 16) & 0xff) as f64 / 255.0,
+        ((rgb >> 8) & 0xff) as f64 / 255.0,
+        (rgb & 0xff) as f64 / 255.0,
+    ])
 }
 
 /// The minimal user-agent stylesheet (tag defaults). Sizes in points.
@@ -1534,6 +2031,62 @@ mod tests {
         assert_eq!(parse_color("#ff0000"), Some([1.0, 0.0, 0.0]));
         assert_eq!(parse_color("rgb(0,128,0)").map(|c| c[1] > 0.4), Some(true));
         assert!(parse_color("blue").is_some());
+    }
+
+    // Helper: are two colours equal within a small tolerance?
+    fn approx(a: [f64; 3], b: [f64; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.01)
+    }
+
+    #[test]
+    fn extended_named_colors_are_not_dropped() {
+        // Quick-win 1: previously-unknown names now resolve instead of being
+        // discarded (which made the property fall back to black/no-fill).
+        assert!(approx(
+            parse_color("cornflowerblue").unwrap(),
+            [0x64 as f64 / 255.0, 0x95 as f64 / 255.0, 0xed as f64 / 255.0],
+        ));
+        assert!(approx(parse_color("crimson").unwrap(), [0.863, 0.078, 0.235]));
+        assert!(approx(parse_color("gold").unwrap(), [1.0, 0.843, 0.0]));
+        assert!(approx(parse_color("darkblue").unwrap(), [0.0, 0.0, 0.545]));
+        assert_eq!(parse_color("rebeccapurple"), Some([0.4, 0.2, 0.6]));
+        // Case-insensitive + cyan/magenta/fuchsia/aqua aliases.
+        assert_eq!(parse_color("CornflowerBlue"), parse_color("cornflowerblue"));
+        assert_eq!(parse_color("cyan"), parse_color("aqua"));
+        // Genuinely unknown name still drops.
+        assert_eq!(parse_color("notacolor"), None);
+    }
+
+    #[test]
+    fn rgba_keeps_colour_and_ignores_alpha() {
+        // `rgba(...)` returns the RGB (alpha dropped, but the colour is kept).
+        assert!(approx(parse_color("rgba(255, 0, 0, 0.5)").unwrap(), [1.0, 0.0, 0.0]));
+        // Space-separated + slash-alpha form.
+        assert!(approx(parse_color("rgb(0 128 0 / 50%)").unwrap(), [0.0, 0.502, 0.0]));
+        // Percentage channels.
+        assert!(approx(parse_color("rgb(100%, 0%, 0%)").unwrap(), [1.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn hsl_and_hsla_convert_to_rgb() {
+        // hsl(0,100%,50%) = red, hsl(120,100%,50%) = green, hsl(240,…) = blue.
+        assert!(approx(parse_color("hsl(0, 100%, 50%)").unwrap(), [1.0, 0.0, 0.0]));
+        assert!(approx(parse_color("hsl(120, 100%, 50%)").unwrap(), [0.0, 1.0, 0.0]));
+        assert!(approx(parse_color("hsl(240, 100%, 50%)").unwrap(), [0.0, 0.0, 1.0]));
+        // Saturation 0 → grey at the lightness level.
+        assert!(approx(parse_color("hsl(0, 0%, 50%)").unwrap(), [0.5, 0.5, 0.5]));
+        // hsla keeps the colour, drops alpha.
+        assert!(approx(parse_color("hsla(0,100%,50%,0.3)").unwrap(), [1.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn hex_with_alpha_keeps_rgb() {
+        // `#rgba` / `#rrggbbaa` — the alpha nibble/byte is validated then dropped.
+        assert_eq!(parse_color("#ff0000ff"), Some([1.0, 0.0, 0.0]));
+        assert_eq!(parse_color("#f00f"), Some([1.0, 0.0, 0.0]));
+        assert!(approx(parse_color("#aabbccdd").unwrap(), [0.667, 0.733, 0.8]));
+        // A malformed 5-digit hex is still rejected.
+        assert_eq!(parse_color("#12345"), None);
     }
 
     #[test]
@@ -1751,5 +2304,178 @@ mod tests {
         assert!(th_style.bold, "th is bold");
         assert_eq!(th_style.align, Align::Center, "th text-align is center");
         assert!(th_style.border_collapse, "collapse inherited into the cell");
+    }
+
+    // ── Quick-win 2: combinators + attribute selectors ─────────────────────
+
+    /// Compute the colour of the first element with `tag` in the tree, threading
+    /// the full ancestor chain so descendant/child/sibling combinators resolve.
+    fn color_of_first(html: &str, tag: &str) -> [f64; 3] {
+        let nodes = parse(html);
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        fn walk<'a>(
+            nodes: &'a [Node],
+            sheet: &Stylesheet,
+            parent: &Style,
+            chain: &mut Vec<&'a Element>,
+            target: &str,
+            out: &mut Option<[f64; 3]>,
+        ) {
+            for n in nodes {
+                if let Node::Element(e) = n {
+                    let st = sheet.computed(e, parent, chain);
+                    if e.tag == target && out.is_none() {
+                        *out = Some(st.color);
+                    }
+                    chain.push(e);
+                    walk(&e.children, sheet, &st, chain, target, out);
+                    chain.pop();
+                }
+            }
+        }
+        let mut out = None;
+        walk(&nodes, &sheet, &Style::default(), &mut Vec::new(), tag, &mut out);
+        out.expect("target element not found")
+    }
+
+    const RED: [f64; 3] = [1.0, 0.0, 0.0];
+    const GREEN_LIME: [f64; 3] = [0.0, 1.0, 0.0];
+
+    #[test]
+    fn child_combinator_matches_only_direct_child() {
+        // `div > p` colours a direct child <p> but NOT a grandchild <p>.
+        let direct = color_of_first(
+            "<style>div > p { color: lime }</style><div><p>x</p></div>",
+            "p",
+        );
+        assert_eq!(direct, GREEN_LIME, "direct child matched");
+
+        let nested = color_of_first(
+            "<style>div > p { color: lime }</style><div><span><p>x</p></span></div>",
+            "p",
+        );
+        assert_eq!(nested, [0.0, 0.0, 0.0], "grandchild not matched by `>`");
+
+        // The descendant combinator still matches the grandchild (non-regression).
+        let desc = color_of_first(
+            "<style>div p { color: lime }</style><div><span><p>x</p></span></div>",
+            "p",
+        );
+        assert_eq!(desc, GREEN_LIME, "descendant combinator still works");
+    }
+
+    #[test]
+    fn adjacent_sibling_combinator() {
+        // `h2 + p` colours the <p> immediately after an <h2> (whitespace/text
+        // between tags is ignored).
+        let matched = color_of_first(
+            "<style>h2 + p { color: red }</style><div><h2>t</h2> <p>x</p></div>",
+            "p",
+        );
+        assert_eq!(matched, RED, "adjacent sibling matched");
+
+        // A <p> NOT immediately after an <h2> is not matched.
+        let not_adjacent = color_of_first(
+            "<style>h2 + p { color: red }</style><div><h2>t</h2><span>s</span><p>x</p></div>",
+            "p",
+        );
+        assert_eq!(not_adjacent, [0.0, 0.0, 0.0], "non-adjacent not matched");
+    }
+
+    #[test]
+    fn general_sibling_combinator() {
+        // `h2 ~ p` colours ANY <p> that follows an <h2> under the same parent.
+        let matched = color_of_first(
+            "<style>h2 ~ p { color: red }</style><div><h2>t</h2><span>s</span><p>x</p></div>",
+            "p",
+        );
+        assert_eq!(matched, RED, "general sibling matched across a non-sibling");
+
+        // A <p> BEFORE the <h2> is not matched.
+        let before = color_of_first(
+            "<style>h2 ~ p { color: red }</style><div><p>x</p><h2>t</h2></div>",
+            "p",
+        );
+        assert_eq!(before, [0.0, 0.0, 0.0], "preceding sibling not matched");
+    }
+
+    #[test]
+    fn attribute_selectors_presence_and_value() {
+        // `[data-x]` presence test.
+        let present = color_of_first(
+            "<style>[data-x] { color: lime }</style><p data-x=\"1\">x</p>",
+            "p",
+        );
+        assert_eq!(present, GREEN_LIME, "[data-x] presence matched");
+
+        let absent = color_of_first(
+            "<style>[data-x] { color: lime }</style><p>x</p>",
+            "p",
+        );
+        assert_eq!(absent, [0.0, 0.0, 0.0], "missing attribute not matched");
+
+        // `[type=text]` exact-value test (quoted or not).
+        let exact = color_of_first(
+            "<style>input[type=text] { color: red }</style><input type=\"text\">",
+            "input",
+        );
+        assert_eq!(exact, RED, "[type=text] value matched");
+
+        let wrong = color_of_first(
+            "<style>input[type=text] { color: red }</style><input type=\"password\">",
+            "input",
+        );
+        assert_eq!(wrong, [0.0, 0.0, 0.0], "wrong value not matched");
+    }
+
+    #[test]
+    fn combinators_do_not_break_class_or_id_selectors() {
+        // Non-regression: plain class + id selectors still resolve.
+        let by_class = color_of_first(
+            "<style>.hl { color: red }</style><p class=\"hl\">x</p>",
+            "p",
+        );
+        assert_eq!(by_class, RED, "class selector still works");
+
+        let by_id = color_of_first(
+            "<style>#a { color: lime }</style><p id=\"a\">x</p>",
+            "p",
+        );
+        assert_eq!(by_id, GREEN_LIME, "id selector still works");
+
+        // Compound child: `.box > p.note` exercises classes on both sides.
+        let compound = color_of_first(
+            "<style>.box > p.note { color: red }</style><div class=\"box\"><p class=\"note\">x</p></div>",
+            "p",
+        );
+        assert_eq!(compound, RED, "compound child combinator matched");
+    }
+
+    // ── Quick-win 3: margin auto parsing ───────────────────────────────────
+
+    #[test]
+    fn margin_auto_flags_parse() {
+        // `margin: 0 auto` sets both horizontal-auto flags (centring intent).
+        let s = inline_style("margin: 0 auto");
+        assert!(s.margin_left_auto && s.margin_right_auto, "0 auto → both auto");
+        // Longhands.
+        assert!(inline_style("margin-left: auto").margin_left_auto);
+        assert!(inline_style("margin-right: auto").margin_right_auto);
+        // 4-value form: `margin: 0 auto 0 5pt` → right auto, left fixed.
+        let four = inline_style("margin: 0 auto 0 5pt");
+        assert!(four.margin_right_auto && !four.margin_left_auto);
+        assert_eq!(four.margin.left, 5.0);
+        // A plain numeric margin sets neither flag.
+        let fixed = inline_style("margin: 10pt");
+        assert!(!fixed.margin_left_auto && !fixed.margin_right_auto);
+    }
+
+    // ── Quick-win 5: page-break-inside parsing ─────────────────────────────
+
+    #[test]
+    fn page_break_inside_avoid_parses() {
+        assert!(inline_style("page-break-inside: avoid").page_break_inside_avoid);
+        assert!(inline_style("break-inside: avoid").page_break_inside_avoid);
+        assert!(!inline_style("page-break-inside: auto").page_break_inside_avoid);
     }
 }
