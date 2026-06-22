@@ -3492,55 +3492,61 @@ fn xlsx_sheet_table(xml: &str, shared: &[String], styles: &XlsxStyles) -> String
     let mut out = String::from("<table>");
     let mut x = Xml::new(xml);
     let mut in_sheet_data = false;
-    // (col_index, escaped html, optional `#RRGGBB` background).
-    let mut row_cells: Vec<(usize, String, Option<String>)> = Vec::new();
+    // (col_index, escaped html, optional `#RRGGBB` background, non-fill CSS).
+    let mut row_cells: Vec<(usize, String, Option<String>, String)> = Vec::new();
     let mut row_open = false;
     // 0-based index of the current row: from the row's `r` attribute when
     // present, else a running counter incremented per `<row>`.
     let mut row_idx = 0usize;
     let mut next_auto_row = 0usize;
+    // The current row's `<tr>` style fragment (custom height), reset per row.
+    let mut row_style = String::new();
 
     // Current-cell scratch.
     let mut cell_col = 0usize;
     let mut cell_type = String::new();
     let mut cell_text = String::new();
     let mut cell_bg: Option<String> = None;
+    // Non-fill CSS (font/border/alignment) resolved from `c@s`.
+    let mut cell_css = String::new();
     // numFmt code resolved from `c@s`, applied to numeric cells at close.
     let mut cell_fmt: Option<String> = None;
     let mut in_cell = false;
     let mut in_value = false; // inside <v> or <t>
 
-    let flush_row =
-        |row: usize, row_cells: &mut Vec<(usize, String, Option<String>)>, out: &mut String| {
-            if row_cells.is_empty() {
-                out.push_str("<tr></tr>");
-                return;
+    let flush_row = |row: usize,
+                     row_style: &str,
+                     row_cells: &mut Vec<(usize, String, Option<String>, String)>,
+                     out: &mut String| {
+        if row_cells.is_empty() {
+            out.push_str(&format!("<tr{}></tr>", style_attr(row_style)));
+            return;
+        }
+        out.push_str(&format!("<tr{}>", style_attr(row_style)));
+        let max_col = row_cells.iter().map(|(c, _, _, _)| *c).max().unwrap_or(0);
+        let mut by_col: BTreeMap<usize, (String, Option<String>, String)> = BTreeMap::new();
+        for (c, h, bg, css) in row_cells.drain(..) {
+            by_col.insert(c, (h, bg, css));
+        }
+        for c in 0..=max_col {
+            // A cell covered by a merge (not its anchor) is dropped entirely.
+            if merges.is_covered(row, c) {
+                continue;
             }
-            out.push_str("<tr>");
-            let max_col = row_cells.iter().map(|(c, _, _)| *c).max().unwrap_or(0);
-            let mut by_col: BTreeMap<usize, (String, Option<String>)> = BTreeMap::new();
-            for (c, h, bg) in row_cells.drain(..) {
-                by_col.insert(c, (h, bg));
-            }
-            for c in 0..=max_col {
-                // A cell covered by a merge (not its anchor) is dropped entirely.
-                if merges.is_covered(row, c) {
-                    continue;
+            let span = merges
+                .anchor(row, c)
+                .map(|(cs, rs)| span_attrs(cs, rs))
+                .unwrap_or_default();
+            match by_col.get(&c) {
+                Some((h, bg, css)) => {
+                    let style = td_style_attr(bg.as_deref(), css);
+                    out.push_str(&format!("<td{span}{style}>{h}</td>"));
                 }
-                let span = merges
-                    .anchor(row, c)
-                    .map(|(cs, rs)| span_attrs(cs, rs))
-                    .unwrap_or_default();
-                match by_col.get(&c) {
-                    Some((h, Some(bg))) => out.push_str(&format!(
-                        "<td{span} style=\"background-color:{bg}\">{h}</td>"
-                    )),
-                    Some((h, None)) => out.push_str(&format!("<td{span}>{h}</td>")),
-                    None => out.push_str(&format!("<td{span}></td>")),
-                }
+                None => out.push_str(&format!("<td{span}></td>")),
             }
-            out.push_str("</tr>");
-        };
+        }
+        out.push_str("</tr>");
+    };
 
     while let Some(tok) = x.next() {
         match tok {
@@ -3555,18 +3561,28 @@ fn xlsx_sheet_table(xml: &str, shared: &[String], styles: &XlsxStyles) -> String
                         .map(|n| n.saturating_sub(1))
                         .unwrap_or(next_auto_row);
                     next_auto_row = row_idx + 1;
+                    // `@ht` is a custom row height in points (only when `customHeight`).
+                    row_style = match attr(&attrs, "ht")
+                        .filter(|_| attr(&attrs, "customHeight").is_some())
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .filter(|h| *h > 0.0)
+                    {
+                        Some(h) => format!("height:{}pt", fmt_pt(h)),
+                        None => String::new(),
+                    };
                 }
                 "c" if in_sheet_data => {
                     in_cell = true;
                     cell_text.clear();
                     cell_type = attr(&attrs, "t").unwrap_or("n").to_string();
                     cell_col = attr(&attrs, "r").map(col_of_ref).unwrap_or(0);
-                    // `c@s` is the cellXfs index → solid-fill colour + numFmt.
+                    // `c@s` is the cellXfs index → solid-fill colour + numFmt + CSS.
                     let style_idx = attr(&attrs, "s").and_then(|v| v.trim().parse::<usize>().ok());
                     cell_bg = style_idx.and_then(|i| styles.fill(i));
                     cell_fmt = style_idx
                         .and_then(|i| styles.num_fmt(i))
                         .map(|(_, code)| code.clone());
+                    cell_css = style_idx.map(|i| styles.css(i).to_string()).unwrap_or_default();
                     if sc {
                         in_cell = false;
                     }
@@ -3602,14 +3618,19 @@ fn xlsx_sheet_table(xml: &str, shared: &[String], styles: &XlsxStyles) -> String
                                 None => cell_text.clone(),
                             }
                         };
-                        row_cells.push((cell_col, escaped(resolved.trim()), cell_bg.take()));
+                        row_cells.push((
+                            cell_col,
+                            escaped(resolved.trim()),
+                            cell_bg.take(),
+                            std::mem::take(&mut cell_css),
+                        ));
                         cell_fmt = None;
                     }
                     in_cell = false;
                 }
                 "row" => {
                     if row_open {
-                        flush_row(row_idx, &mut row_cells, &mut out);
+                        flush_row(row_idx, &row_style, &mut row_cells, &mut out);
                         row_open = false;
                     }
                 }
@@ -3635,9 +3656,35 @@ fn span_attrs(colspan: usize, rowspan: usize) -> String {
     s
 }
 
+/// ` style="…"` attribute for a table cell, combining the solid-fill
+/// `background-color` (if any) with the non-fill CSS (font/border/alignment).
+/// Empty string when neither contributes anything.
+fn td_style_attr(bg: Option<&str>, css: &str) -> String {
+    let mut style = String::new();
+    if let Some(bg) = bg {
+        style.push_str(&format!("background-color:{bg};"));
+    }
+    style.push_str(css);
+    style_attr(&style)
+}
+
+/// ` style="…"` attribute wrapping a CSS fragment (a trailing `;` is trimmed),
+/// or `""` when the fragment is empty. Shared by `<tr>`/`<td>` emitters.
+fn style_attr(css: &str) -> String {
+    let css = css.trim_end_matches(';');
+    if css.is_empty() {
+        String::new()
+    } else {
+        format!(" style=\"{css}\"")
+    }
+}
+
 /// Resolved per-cell-style XLSX formatting: for each `cellXfs` index (a cell's
-/// `@s`), the solid-fill background colour (if any) and the number-format id +
-/// its format code, so numeric cells can be formatted (dates, currency, …).
+/// `@s`), the solid-fill background colour (if any), the number-format id + its
+/// format code (so numeric cells can be formatted: dates, currency, …), and the
+/// combined non-fill CSS (font weight/style/underline/size/colour/family from
+/// the referenced `<font>`, a collapsed `border` from the referenced
+/// `<border>`, and `text-align`/`vertical-align` from the `xf`'s `<alignment>`).
 #[derive(Default)]
 struct XlsxStyles {
     /// cellXfs index → `Some("#RRGGBB")` solid fill, else `None`.
@@ -3645,6 +3692,9 @@ struct XlsxStyles {
     /// cellXfs index → `(numFmtId, format-code)`. The code is resolved from the
     /// built-in table or the custom `<numFmts>` map; `None` when general/absent.
     num_fmts: Vec<Option<(u32, String)>>,
+    /// cellXfs index → combined CSS declarations (font + border + alignment),
+    /// already terminated with `;`. Empty string when the style adds nothing.
+    css: Vec<String>,
 }
 
 impl XlsxStyles {
@@ -3654,13 +3704,21 @@ impl XlsxStyles {
     fn num_fmt(&self, idx: usize) -> Option<&(u32, String)> {
         self.num_fmts.get(idx).and_then(|f| f.as_ref())
     }
+    /// Non-fill CSS for a cellXfs index (`""` when none / out of range).
+    fn css(&self, idx: usize) -> &str {
+        self.css.get(idx).map(String::as_str).unwrap_or("")
+    }
 }
 
 /// Parse `xl/styles.xml` (with `theme` for theme-colour resolution) into an
 /// [`XlsxStyles`]: the `cellXfs` order maps each style index to its solid-fill
 /// colour (`@fillId → fills[…] → patternFill@fgColor`, resolving `rgb`,
-/// `theme`+`tint` and `indexed`) and its number format (`@numFmtId`, resolved
-/// against the built-in ids and the custom `<numFmts>` map).
+/// `theme`+`tint` and `indexed`), its number format (`@numFmtId`, resolved
+/// against the built-in ids and the custom `<numFmts>` map), and its combined
+/// non-fill CSS — the referenced `<font>` (`@fontId → fonts[…]`: bold/italic/
+/// underline/size/colour/family), the referenced `<border>` (`@borderId →
+/// borders[…]`: a collapsed `border` shorthand), and the `xf`'s own
+/// `<alignment>` (`text-align`/`vertical-align`).
 fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
     // Pass 0: custom number formats (numFmtId → formatCode).
     let mut custom_fmts: BTreeMap<u32, String> = BTreeMap::new();
@@ -3716,15 +3774,24 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
         }
     }
 
-    // Pass 2: cellXfs order → (fillId → colour, numFmtId → format code).
+    // Pass 1b: fontId → CSS, borderId → CSS (ordered lists of `<font>`/`<border>`).
+    let font_css = parse_xlsx_fonts(xml, theme);
+    let border_css = parse_xlsx_borders(xml, theme);
+
+    // Pass 2: cellXfs order → (fillId → colour, numFmtId → format code, combined
+    // non-fill CSS from fontId + borderId + the xf's own `<alignment>`).
     let mut fills: Vec<Option<String>> = Vec::new();
     let mut num_fmts: Vec<Option<(u32, String)>> = Vec::new();
+    let mut css: Vec<String> = Vec::new();
     {
         let mut x = Xml::new(xml);
         let mut in_cellxfs = false;
+        // The xf currently being assembled (open, not yet closed): its combined
+        // CSS so a child `<alignment>` can append to it before we push.
+        let mut cur_css: Option<String> = None;
         while let Some(tok) = x.next() {
             match tok {
-                Tok::Open(name, attrs, _) => match local(&name) {
+                Tok::Open(name, attrs, sc) => match local(&name) {
                     "cellXfs" => in_cellxfs = true,
                     "xf" if in_cellxfs => {
                         let color = attr(&attrs, "fillId")
@@ -3736,19 +3803,225 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                             .and_then(|v| v.trim().parse::<u32>().ok())
                             .and_then(|id| num_fmt_code(id, &custom_fmts).map(|code| (id, code)));
                         num_fmts.push(fmt);
+                        // Combine the referenced font + border CSS now; a nested
+                        // `<alignment>` (if present) appends before the xf closes.
+                        let mut c = String::new();
+                        if let Some(f) = attr(&attrs, "fontId")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .and_then(|i| font_css.get(i))
+                            .and_then(|f| f.as_deref())
+                        {
+                            c.push_str(f);
+                        }
+                        if let Some(b) = attr(&attrs, "borderId")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .and_then(|i| border_css.get(i))
+                            .and_then(|b| b.as_deref())
+                        {
+                            c.push_str(b);
+                        }
+                        if sc {
+                            // Self-closing xf: no `<alignment>` child possible.
+                            css.push(c);
+                        } else {
+                            cur_css = Some(c);
+                        }
+                    }
+                    "alignment" if in_cellxfs => {
+                        if let Some(c) = cur_css.as_mut() {
+                            c.push_str(&xlsx_alignment_css(&attrs));
+                        }
                     }
                     _ => {}
                 },
-                Tok::Close(name) => {
-                    if local(&name) == "cellXfs" {
-                        in_cellxfs = false;
+                Tok::Close(name) => match local(&name) {
+                    "xf" if in_cellxfs => {
+                        if let Some(c) = cur_css.take() {
+                            css.push(c);
+                        }
                     }
-                }
+                    "cellXfs" => in_cellxfs = false,
+                    _ => {}
+                },
                 Tok::Text(_) => {}
             }
         }
     }
-    XlsxStyles { fills, num_fmts }
+    XlsxStyles {
+        fills,
+        num_fmts,
+        css,
+    }
+}
+
+/// Map `xl/styles.xml`'s `<fonts>` list to per-`fontId` CSS: `<b>`→`font-weight:
+/// bold`, `<i>`→`font-style:italic`, `<u>`→`text-decoration:underline`, `<sz
+/// val>`→`font-size`, `<color>`→`color` (rgb/theme+tint/indexed via
+/// [`xlsx_color`]), `<name val>`→`font-family`. `None` when a font adds nothing.
+fn parse_xlsx_fonts(xml: &str, theme: &XlsxTheme) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut x = Xml::new(xml);
+    let mut in_fonts = false;
+    let mut cur = String::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "fonts" => in_fonts = true,
+                // A self-closing `<font/>` carries no children → empty entry; this
+                // keeps the index aligned with `fontId` (self-closing emits no Close).
+                "font" if in_fonts && sc => out.push(None),
+                _ if in_fonts => match local(&name) {
+                    // `<b/>` with no/`val="true"` ⇒ bold; `val="0"/"false"` cancels.
+                    "b" if xlsx_bool_attr(&attrs) => cur.push_str("font-weight:bold;"),
+                    "i" if xlsx_bool_attr(&attrs) => cur.push_str("font-style:italic;"),
+                    "u" if attr(&attrs, "val") != Some("none") => {
+                        cur.push_str("text-decoration:underline;")
+                    }
+                    "sz" => {
+                        if let Some(pt) =
+                            attr(&attrs, "val").and_then(|v| v.trim().parse::<f64>().ok())
+                        {
+                            cur.push_str(&format!("font-size:{}pt;", fmt_pt(pt)));
+                        }
+                    }
+                    "color" => {
+                        if let Some(c) = xlsx_color(&attrs, theme) {
+                            cur.push_str(&format!("color:{c};"));
+                        }
+                    }
+                    "name" | "rFont" => {
+                        if let Some(fam) = attr(&attrs, "val") {
+                            let family = css_font_family(fam);
+                            if !family.is_empty() {
+                                cur.push_str(&format!("font-family:{family};"));
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "font" if in_fonts => {
+                    out.push(if cur.is_empty() {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut cur))
+                    });
+                }
+                "fonts" => in_fonts = false,
+                _ => {}
+            },
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Map `xl/styles.xml`'s `<borders>` list to per-`borderId` CSS. XLSX borders
+/// are per-edge, but the HTML engine only honours a single uniform `border`
+/// shorthand, so we collapse: emit `border:<w>px solid <colour>` when ANY edge
+/// has a real (non-`none`) style, using the heaviest edge's width and the first
+/// edge colour found. `None` when no edge is styled.
+fn parse_xlsx_borders(xml: &str, theme: &XlsxTheme) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut x = Xml::new(xml);
+    let mut in_borders = false;
+    // Per-`<border>` accumulator: heaviest edge width (px) and first edge colour.
+    let mut width = 0.0f64;
+    let mut color: Option<String> = None;
+    // The edge element we're inside, so a nested `<color>` attaches to it.
+    let mut in_edge = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "borders" => in_borders = true,
+                // A self-closing `<border/>` has no edges → no border; keep the
+                // index aligned with `borderId` (self-closing emits no Close).
+                "border" if in_borders && sc => out.push(None),
+                "left" | "right" | "top" | "bottom" | "diagonal" if in_borders => {
+                    in_edge = true;
+                    if let Some(w) = border_style_width(attr(&attrs, "style")) {
+                        width = width.max(w);
+                    }
+                }
+                "color" if in_borders && in_edge => {
+                    if color.is_none() {
+                        color = xlsx_color(&attrs, theme);
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "left" | "right" | "top" | "bottom" | "diagonal" if in_borders => in_edge = false,
+                "border" if in_borders => {
+                    out.push(if width > 0.0 {
+                        let c = color.take().unwrap_or_else(|| "#000000".to_string());
+                        Some(format!("border:{}px solid {c};", fmt_pt(width)))
+                    } else {
+                        color = None;
+                        None
+                    });
+                    width = 0.0;
+                    in_edge = false;
+                }
+                "borders" => in_borders = false,
+                _ => {}
+            },
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Width in CSS px for an XLSX border line `style` (`thin`/`medium`/`thick`/
+/// `hair`/`dashed`/…). `None`/`"none"` ⇒ no edge. Thin styles map to 1px,
+/// medium to 2px, thick to 3px — enough to make the grid visible.
+fn border_style_width(style: Option<&str>) -> Option<f64> {
+    match style? {
+        "none" | "" => None,
+        "thick" | "double" => Some(3.0),
+        "medium" | "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" => Some(2.0),
+        // thin, hair, dotted, dashed, dashDot, dashDotDot, slantDashDot, …
+        _ => Some(1.0),
+    }
+}
+
+/// CSS for an `xf`'s `<alignment>`: `@horizontal` → `text-align`, `@vertical` →
+/// `vertical-align`. Excel's `center`/`centerContinuous` map to `center`;
+/// `justify`/`distributed` to `justify`. Unknown values are skipped.
+fn xlsx_alignment_css(attrs: &[(String, String)]) -> String {
+    let mut css = String::new();
+    if let Some(h) = attr(attrs, "horizontal") {
+        let v = match h {
+            "left" => "left",
+            "center" | "centerContinuous" => "center",
+            "right" => "right",
+            "justify" | "distributed" | "fill" => "justify",
+            _ => "",
+        };
+        if !v.is_empty() {
+            css.push_str(&format!("text-align:{v};"));
+        }
+    }
+    if let Some(va) = attr(attrs, "vertical") {
+        let v = match va {
+            "top" => "top",
+            "center" => "middle",
+            "bottom" => "bottom",
+            _ => "",
+        };
+        if !v.is_empty() {
+            css.push_str(&format!("vertical-align:{v};"));
+        }
+    }
+    css
+}
+
+/// An XLSX boolean toggle (`<b/>`, `<i/>`): present means on unless an explicit
+/// `val` says otherwise (`0`/`false`/`off` ⇒ off).
+fn xlsx_bool_attr(attrs: &[(String, String)]) -> bool {
+    !matches!(attr(attrs, "val"), Some("0") | Some("false") | Some("off"))
 }
 
 /// Resolve a colour element's `rgb` / `theme`+`tint` / `indexed` attributes to
@@ -5205,6 +5478,155 @@ fn odf_column_widths(xml: &str) -> BTreeMap<String, f64> {
     map
 }
 
+/// Build a `cell-style-name → CSS` map from an ODF part, for the WYSIWYG render
+/// of spreadsheet cells. Each `style:style` (any family) contributes its
+/// `style:text-properties` (font weight/style/underline/colour/size/family) and
+/// `style:table-cell-properties` (collapsed `fo:border*` → uniform `border`,
+/// `fo:background-color`, `style:vertical-align`). `None`-valued styles are
+/// simply omitted. Mirrors [`odf_text_styles`] but also reads cell properties.
+fn odf_cell_styles(xml: &str) -> BTreeMap<String, String> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => cur_name = attr(&attrs, "name").map(|s| s.to_string()),
+                "text-properties" => {
+                    if let Some(nm) = &cur_name {
+                        let css = odf_text_props_css(&attrs);
+                        if !css.is_empty() {
+                            map.entry(nm.clone()).or_default().push_str(&css);
+                        }
+                    }
+                }
+                "table-cell-properties" => {
+                    if let Some(nm) = &cur_name {
+                        let css = odf_cell_props_css(&attrs);
+                        if !css.is_empty() {
+                            map.entry(nm.clone()).or_default().push_str(&css);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    cur_name = None;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
+/// CSS for a `style:text-properties` element: `fo:font-weight`/`fo:font-style`/
+/// `fo:color`/`text-underline-style`/`fo:font-size`/`fo:font-name`.
+fn odf_text_props_css(attrs: &[(String, String)]) -> String {
+    let mut css = String::new();
+    if attr(attrs, "font-weight") == Some("bold") {
+        css.push_str("font-weight:bold;");
+    }
+    if matches!(attr(attrs, "font-style"), Some("italic") | Some("oblique")) {
+        css.push_str("font-style:italic;");
+    }
+    if let Some(c) = attr(attrs, "color") {
+        let hex = c.trim_start_matches('#');
+        if is_hex6(hex) {
+            css.push_str(&format!("color:#{};", hex.to_ascii_uppercase()));
+        }
+    }
+    if matches!(attr(attrs, "text-underline-style"), Some(u) if u != "none") {
+        css.push_str("text-decoration:underline;");
+    }
+    if let Some(pt) = attr(attrs, "font-size").and_then(parse_odf_pt) {
+        css.push_str(&format!("font-size:{}pt;", fmt_pt(pt)));
+    }
+    if let Some(fam) = attr(attrs, "font-name") {
+        let family = css_font_family(fam);
+        if !family.is_empty() {
+            css.push_str(&format!("font-family:{family};"));
+        }
+    }
+    css
+}
+
+/// CSS for a `style:table-cell-properties` element. ODF borders are per-edge,
+/// but the HTML engine honours one uniform `border`, so we collapse: `fo:border`
+/// (uniform) when present, else the first styled edge among top/right/bottom/
+/// left. Also `fo:background-color` and `style:vertical-align`.
+fn odf_cell_props_css(attrs: &[(String, String)]) -> String {
+    let mut css = String::new();
+    if let Some(bg) = attr(attrs, "background-color") {
+        let b = bg.trim();
+        // `transparent`/`none` ⇒ no fill; a `#RRGGBB` becomes the background.
+        if !matches!(b, "transparent" | "none" | "") {
+            let hex = b.trim_start_matches('#');
+            if is_hex6(hex) {
+                css.push_str(&format!("background-color:#{};", hex.to_ascii_uppercase()));
+            }
+        }
+    }
+    // Uniform border first; otherwise the first per-edge border that is set.
+    let border = attr(attrs, "border").or_else(|| {
+        ["border-top", "border-right", "border-bottom", "border-left"]
+            .iter()
+            .find_map(|k| attr(attrs, k))
+    });
+    if let Some(spec) = border
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "none")
+    {
+        css.push_str(&format!("border:{spec};"));
+    }
+    if let Some(va) = attr(attrs, "vertical-align") {
+        let v = match va {
+            "top" => "top",
+            "middle" => "middle",
+            "bottom" => "bottom",
+            _ => "",
+        };
+        if !v.is_empty() {
+            css.push_str(&format!("vertical-align:{v};"));
+        }
+    }
+    css
+}
+
+/// Build a `row-style-name → row-height(pt)` map from an ODF part. Reads each
+/// `style:style`'s `style:table-row-properties/@style:row-height` (ODF lengths).
+fn odf_row_heights(xml: &str) -> BTreeMap<String, f64> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => cur_name = attr(&attrs, "name").map(|s| s.to_string()),
+                "table-row-properties" => {
+                    if let Some(nm) = &cur_name {
+                        if let Some(h) = attr(&attrs, "row-height")
+                            .and_then(parse_odf_pt)
+                            .filter(|h| *h > 0.0)
+                        {
+                            map.insert(nm.clone(), h);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    cur_name = None;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
 /// Handle a `table:table-column` token inside an ODF table: append `<col>`
 /// entries (honouring `table:number-columns-repeated`, cap 64) carrying the
 /// resolved width (when the column style declares one) into `pending`.
@@ -5466,6 +5888,12 @@ pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let geom = odf_geom(&styles_xml, &content, PageGeom::tabular_default());
     let mut cols = odf_column_widths(&styles_xml);
     cols.extend(odf_column_widths(&content));
+    // Cell-style → CSS and row-style → height, from both the named styles
+    // (styles.xml) and the automatic styles (content.xml; latter wins).
+    let mut cell_styles = odf_cell_styles(&styles_xml);
+    cell_styles.extend(odf_cell_styles(&content));
+    let mut row_heights = odf_row_heights(&styles_xml);
+    row_heights.extend(odf_row_heights(&content));
     let mut body = String::new();
     let mut x = Xml::new(&content);
     let mut first = true;
@@ -5479,7 +5907,7 @@ pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
                 if let Some(nm) = attr(attrs, "name") {
                     body.push_str(&format!("<h2>{}</h2>", escaped(nm)));
                 }
-                ods_table(&mut x, &cols, &mut body);
+                ods_table(&mut x, &cols, &cell_styles, &row_heights, &mut body);
             }
         }
     }
@@ -5491,16 +5919,35 @@ pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
 
 /// Emit one ODS `table:table` (open consumed) as an HTML `<table>`, expanding
 /// repeated rows/columns (cap 64) and reading cell text from `text:p` runs.
-/// `table:table-column` declarations seed a leading `<colgroup>`.
-fn ods_table(x: &mut Xml, cols: &BTreeMap<String, f64>, out: &mut String) {
+/// `table:table-column` declarations seed a leading `<colgroup>` and record each
+/// column's `@table:default-cell-style-name`. Each row applies its style's
+/// height and resolves cell formatting (cell own style → row default → column
+/// default) from `cell_styles` for a WYSIWYG render.
+fn ods_table(
+    x: &mut Xml,
+    cols: &BTreeMap<String, f64>,
+    cell_styles: &BTreeMap<String, String>,
+    row_heights: &BTreeMap<String, f64>,
+    out: &mut String,
+) {
     out.push_str("<table>");
     let mut pending_cols = String::new();
     let mut colgroup_done = false;
+    // Per-column default cell-style name, expanded over repeats; index = column.
+    let mut col_defaults: Vec<Option<String>> = Vec::new();
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
                 if ln == "table-column" {
+                    let rep = attr(&attrs, "number-columns-repeated")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .min(1024);
+                    let def = attr(&attrs, "default-cell-style-name").map(str::to_string);
+                    for _ in 0..rep {
+                        col_defaults.push(def.clone());
+                    }
                     odf_push_column(&attrs, cols, &mut pending_cols);
                 } else if ln == "table-row" && !sc {
                     flush_odf_colgroup(&mut pending_cols, &mut colgroup_done, out);
@@ -5508,7 +5955,13 @@ fn ods_table(x: &mut Xml, cols: &BTreeMap<String, f64>, out: &mut String) {
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
                         .min(64);
-                    let row = ods_row(x);
+                    // Row height from the row style; row default cell style.
+                    let row_css = attr(&attrs, "style-name")
+                        .and_then(|s| row_heights.get(s))
+                        .map(|h| format!("height:{}pt", fmt_pt(*h)))
+                        .unwrap_or_default();
+                    let row_default = attr(&attrs, "default-cell-style-name");
+                    let row = ods_row(x, cell_styles, &col_defaults, row_default);
                     // Skip emitting many identical *empty* trailing rows.
                     let emit = if row.trim().is_empty() {
                         rep.min(1)
@@ -5516,7 +5969,7 @@ fn ods_table(x: &mut Xml, cols: &BTreeMap<String, f64>, out: &mut String) {
                         rep
                     };
                     for _ in 0..emit {
-                        out.push_str(&format!("<tr>{row}</tr>"));
+                        out.push_str(&format!("<tr{}>{row}</tr>", style_attr(&row_css)));
                     }
                 } else if ln == "table" && sc {
                     // nested? ignore
@@ -5534,29 +5987,49 @@ fn ods_table(x: &mut Xml, cols: &BTreeMap<String, f64>, out: &mut String) {
 }
 
 /// Collect the `<td>` cells of one `table:table-row` (open already consumed)
-/// until `</table:table-row>`.
-fn ods_row(x: &mut Xml) -> String {
+/// until `</table:table-row>`. Each cell's CSS is resolved from its own
+/// `@table:style-name`, else the row default, else the column default (by
+/// column index, honouring `@number-columns-repeated`), via `cell_styles`.
+fn ods_row(
+    x: &mut Xml,
+    cell_styles: &BTreeMap<String, String>,
+    col_defaults: &[Option<String>],
+    row_default: Option<&str>,
+) -> String {
     let mut out = String::new();
+    let mut col = 0usize;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if (ln == "table-cell" || ln == "covered-table-cell") && !sc {
+                let is_cell = ln == "table-cell" || ln == "covered-table-cell";
+                if is_cell {
                     let rep = attr(&attrs, "number-columns-repeated")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
                         .min(64);
-                    let text = ods_cell_text(x, ln);
-                    let emit = if text.trim().is_empty() {
-                        rep.min(1)
-                    } else {
-                        rep
-                    };
+                    // Resolve style: cell own → row default → column default.
+                    let css = attr(&attrs, "style-name")
+                        .or(row_default)
+                        .and_then(|s| cell_styles.get(s))
+                        .map(String::as_str)
+                        .or_else(|| {
+                            col_defaults
+                                .get(col)
+                                .and_then(|d| d.as_deref())
+                                .and_then(|s| cell_styles.get(s))
+                                .map(String::as_str)
+                        })
+                        .unwrap_or("");
+                    let style = style_attr(css);
+                    let text = if sc { String::new() } else { ods_cell_text(x, ln) };
+                    let trimmed = text.trim();
+                    // Many identical *empty* trailing cells collapse to one.
+                    let emit = if trimmed.is_empty() { rep.min(1) } else { rep };
                     for _ in 0..emit {
-                        out.push_str(&format!("<td>{}</td>", text.trim()));
+                        out.push_str(&format!("<td{style}>{trimmed}</td>"));
                     }
-                } else if (ln == "table-cell" || ln == "covered-table-cell") && sc {
-                    out.push_str("<td></td>");
+                    col += rep;
                 }
             }
             Tok::Close(name) => {
@@ -6457,6 +6930,117 @@ mod tests {
         for needle in ["Sheet1", "X", "Y", "1", "2"] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    /// Drive `ods_table` over a single `<table:table>` fragment and return the
+    /// emitted HTML, so cell/row styling can be asserted on the markup directly.
+    fn ods_table_html(content: &str) -> String {
+        let cell_styles = odf_cell_styles(content);
+        let row_heights = odf_row_heights(content);
+        let cols = odf_column_widths(content);
+        let mut x = Xml::new(content);
+        let mut out = String::new();
+        while let Some(tok) = x.next() {
+            if let Tok::Open(name, _, sc) = &tok {
+                if local(name) == "table" && !sc {
+                    ods_table(&mut x, &cols, &cell_styles, &row_heights, &mut out);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ods_cell_style_font_border_background_apply_to_td() {
+        // `ce1` = bold + red + Arial 12 + thin black border + yellow background +
+        // middle vertical-align. The cell that references it must carry them all.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st" xmlns:fo="fo">
+  <office:automatic-styles>
+    <style:style style:name="ce1" style:family="table-cell">
+      <style:table-cell-properties fo:border="0.5pt solid #000000" fo:background-color="#FFFF00" style:vertical-align="middle"/>
+      <style:text-properties fo:font-weight="bold" fo:color="#FF0000" fo:font-size="12pt" style:font-name="Arial"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="Sheet1">
+      <table:table-row>
+        <table:table-cell table:style-name="ce1"><text:p>Styled</text:p></table:table-cell>
+        <table:table-cell><text:p>Plain</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"##;
+
+        // Parse-level: ce1 collapses text + cell properties into one CSS blob.
+        let styles = odf_cell_styles(content);
+        let css = styles.get("ce1").map(String::as_str).unwrap_or("");
+        assert!(css.contains("font-weight:bold;"), "bold: {css}");
+        assert!(css.contains("color:#FF0000;"), "red: {css}");
+        assert!(css.contains("font-size:12pt;"), "size: {css}");
+        assert!(css.contains("font-family:Arial;"), "family: {css}");
+        assert!(css.contains("border:0.5pt solid #000000;"), "border: {css}");
+        assert!(css.contains("background-color:#FFFF00;"), "bg: {css}");
+        assert!(css.contains("vertical-align:middle;"), "v-align: {css}");
+
+        // Render-level: the styled <td> carries them; the plain one is styleless.
+        let table = ods_table_html(content);
+        assert!(table.contains("font-weight:bold"), "td bold: {table}");
+        assert!(table.contains("color:#FF0000"), "td red: {table}");
+        assert!(
+            table.contains("border:0.5pt solid #000000"),
+            "td border: {table}"
+        );
+        assert!(table.contains("background-color:#FFFF00"), "td bg: {table}");
+        assert!(table.contains("<td>Plain</td>"), "plain unstyled: {table}");
+
+        // End-to-end PDF still carries the text.
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.spreadsheet");
+        z.add_stored("content.xml", content.as_bytes());
+        let pdf = office_to_pdf(&z.finish()).expect("ods converts");
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("Styled") && text.contains("Plain"), "{text}");
+    }
+
+    #[test]
+    fn ods_column_default_cell_style_and_row_height_apply() {
+        // A column-level default cell style (bold) applies to cells without their
+        // own style; the row style sets a height on the <tr>.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st" xmlns:fo="fo">
+  <office:automatic-styles>
+    <style:style style:name="ceBold" style:family="table-cell">
+      <style:text-properties fo:font-weight="bold"/>
+    </style:style>
+    <style:style style:name="roTall" style:family="table-row">
+      <style:table-row-properties style:row-height="24pt"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="Sheet1">
+      <table:table-column table:default-cell-style-name="ceBold"/>
+      <table:table-column/>
+      <table:table-row table:style-name="roTall">
+        <table:table-cell><text:p>InheritBold</text:p></table:table-cell>
+        <table:table-cell><text:p>Normal</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+
+        let table = ods_table_html(content);
+        // First column's default style (bold) reaches the first cell.
+        assert!(
+            table.contains("<td style=\"font-weight:bold\">InheritBold</td>"),
+            "column default applied: {table}"
+        );
+        // Second column has no default → its cell is styleless.
+        assert!(table.contains("<td>Normal</td>"), "no default: {table}");
+        // The row style's height lands on the <tr>.
+        assert!(
+            table.contains("<tr style=\"height:24pt\">"),
+            "row height: {table}"
+        );
     }
 
     // ── ODP ──
@@ -7790,6 +8374,130 @@ mod tests {
             table.contains("$1,234.50"),
             "currency rendered formatted: {table}"
         );
+    }
+
+    #[test]
+    fn xlsx_cell_font_border_alignment_apply_to_td() {
+        // fontId 1 = bold + red + Arial 14; borderId 1 = thin black box; the xf's
+        // own <alignment> centres the cell. The <td> must carry all of them.
+        let styles_xml = r#"<styleSheet>
+          <fonts count="2">
+            <font><sz val="11"/><name val="Calibri"/></font>
+            <font><b/><sz val="14"/><color rgb="FFFF0000"/><name val="Arial"/></font>
+          </fonts>
+          <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+          <borders count="2">
+            <border><left/><right/><top/><bottom/></border>
+            <border>
+              <left style="thin"><color rgb="FF000000"/></left>
+              <right style="thin"><color rgb="FF000000"/></right>
+              <top style="thin"><color rgb="FF000000"/></top>
+              <bottom style="thin"><color rgb="FF000000"/></bottom>
+            </border>
+          </borders>
+          <cellXfs count="2">
+            <xf fontId="0" borderId="0"/>
+            <xf fontId="1" borderId="1" applyFont="1" applyBorder="1" applyAlignment="1">
+              <alignment horizontal="center" vertical="center"/>
+            </xf>
+          </cellXfs>
+        </styleSheet>"#;
+        let s = parse_xlsx_styles(styles_xml, &XlsxTheme::default());
+
+        // Style 0 = the default font (Calibri 11) — its size/family may be set,
+        // but it must NOT carry the discriminating bold/border/alignment styles.
+        let css0 = s.css(0);
+        assert!(!css0.contains("font-weight"), "default not bold: {css0}");
+        assert!(!css0.contains("border"), "default no border: {css0}");
+        assert!(!css0.contains("text-align"), "default no align: {css0}");
+        // Style 1 carries the full font + border + alignment CSS.
+        let css = s.css(1);
+        assert!(css.contains("font-weight:bold;"), "bold: {css}");
+        assert!(css.contains("color:#FF0000;"), "red font: {css}");
+        assert!(css.contains("font-size:14pt;"), "size: {css}");
+        assert!(css.contains("font-family:Arial;"), "family: {css}");
+        assert!(css.contains("border:1px solid #000000;"), "border: {css}");
+        assert!(css.contains("text-align:center;"), "h-align: {css}");
+        assert!(css.contains("vertical-align:middle;"), "v-align: {css}");
+
+        // And those land on the cell when rendered.
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="0" t="inlineStr"><is><t>Plain</t></is></c>
+            <c r="B1" s="1" t="inlineStr"><is><t>Fancy</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let table = xlsx_sheet_table(sheet, &[], &s);
+        assert!(table.contains("font-weight:bold"), "td bold: {table}");
+        assert!(table.contains("color:#FF0000"), "td red: {table}");
+        assert!(table.contains("border:1px solid #000000"), "td border: {table}");
+        assert!(table.contains("text-align:center"), "td align: {table}");
+        // The plain cell renders (it may carry only the default font, but no
+        // bold/border/alignment from the fancy style).
+        assert!(table.contains(">Plain</td>"), "plain present: {table}");
+
+        // Full pipeline still renders a valid PDF carrying the text.
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "xl/workbook.xml",
+            br#"<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        z.add_stored("xl/styles.xml", styles_xml.as_bytes());
+        z.add_stored("xl/worksheets/sheet1.xml", sheet.as_bytes());
+        let pdf = office_to_pdf(&z.finish()).expect("xlsx converts");
+        let text = norm(&opens(&pdf).to_text());
+        assert!(text.contains("Fancy") && text.contains("Plain"), "{text}");
+    }
+
+    #[test]
+    fn xlsx_theme_font_colour_resolves_and_custom_row_height() {
+        // Font colour by theme index 4 (accent1=blue) → resolved #4472C4; and a
+        // custom row height becomes a `height:..pt` on the <tr>.
+        let theme = parse_xlsx_theme(
+            r#"<theme><themeElements><clrScheme>
+              <dk1><srgbClr val="000000"/></dk1>
+              <lt1><srgbClr val="FFFFFF"/></lt1>
+              <dk2><srgbClr val="44546A"/></dk2>
+              <lt2><srgbClr val="E7E6E6"/></lt2>
+              <accent1><srgbClr val="4472C4"/></accent1>
+            </clrScheme></themeElements></theme>"#,
+        );
+        let styles_xml = r#"<styleSheet>
+          <fonts count="2">
+            <font/>
+            <font><color theme="4"/></font>
+          </fonts>
+          <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+          <cellXfs count="2">
+            <xf fontId="0"/>
+            <xf fontId="1" applyFont="1"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let s = parse_xlsx_styles(styles_xml, &theme);
+        assert!(
+            s.css(1).contains("color:#4472C4;"),
+            "theme font colour resolved: {}",
+            s.css(1)
+        );
+
+        // customHeight row → height on the <tr>; a plain row has none.
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1" ht="30" customHeight="1">
+            <c r="A1" s="1" t="inlineStr"><is><t>Tall</t></is></c>
+          </row>
+          <row r="2">
+            <c r="A2" t="inlineStr"><is><t>Normal</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let table = xlsx_sheet_table(sheet, &[], &s);
+        assert!(
+            table.contains("<tr style=\"height:30pt\">"),
+            "custom row height: {table}"
+        );
+        assert!(table.contains("color:#4472C4"), "themed font on td: {table}");
+        // The second row carries no height style.
+        assert!(table.contains("<tr><td>Normal</td></tr>"), "plain row: {table}");
     }
 
     #[test]
