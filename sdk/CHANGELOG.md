@@ -4,6 +4,21 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.61.0] - 2026-06-22
+
+### Fixed
+
+- **Form layouts no longer mis-detected as giant tables.** The layout
+  reconstruction (`recon/tables`, surfaced by `pageBlocks`/`toModel`) clustered
+  every ruling line into grid edges and claimed every text line inside the grid
+  bounding box, so a form's field-separator rules synthesised a giant table that
+  swallowed the title and intro prose into cells. A geometric sanity gate now
+  rejects a table candidate when `n_cols > 14`, `n_rows × n_cols > 160`, or the
+  cell fill ratio `< 0.28` — the text flows back to the heading/paragraph
+  pipeline. Real data tables (regular grid, well-filled) are preserved; dense
+  ruled forms (16–47 columns, 7–24% fill) become standalone headings/paragraphs
+  in reading order. No change to genuine `table` blocks.
+
 ## [0.60.0] - 2026-06-22
 
 ### Added
