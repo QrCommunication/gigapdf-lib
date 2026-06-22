@@ -2188,6 +2188,13 @@ pub extern "C" fn gp_model_from_csv(ptr: *const u8, len: usize, out_len: *mut us
 /// JSON, `(ops_ptr, ops_len)` is a JSON array of ops (see `model::edit`).
 /// Returns the edited model as JSON. Null when the model JSON is malformed.
 /// (Unparseable individual ops and out-of-range addresses are silently skipped.)
+///
+/// This entry point is op-agnostic: every `ModelOp` variant — run/block/text
+/// edits, `setCellText`/`setSheetCell`, and the structural table/sheet ops
+/// (`insertTableRow`/`deleteTableRow`/`insertTableColumn`/`deleteTableColumn`/
+/// `setCellSpan`, `insertSheetRow`/`deleteSheetRow`/`insertSheetColumn`/
+/// `deleteSheetColumn`) — is dispatched here via `parse_ops`, so no per-op FFI
+/// function is needed.
 #[no_mangle]
 pub extern "C" fn gp_model_apply_ops(
     model_ptr: *const u8,

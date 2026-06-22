@@ -19,7 +19,18 @@
 //!   (replace a paragraph/heading's text wholesale),
 //!   [`RestyleBlock`](ModelOp::RestyleBlock).
 //! - table cell: [`SetCellText`](ModelOp::SetCellText).
+//! - table structure: [`InsertTableRow`](ModelOp::InsertTableRow),
+//!   [`DeleteTableRow`](ModelOp::DeleteTableRow),
+//!   [`InsertTableColumn`](ModelOp::InsertTableColumn),
+//!   [`DeleteTableColumn`](ModelOp::DeleteTableColumn),
+//!   [`SetCellSpan`](ModelOp::SetCellSpan) — these keep the column geometry
+//!   (`col_widths` + per-cell spans) coherent.
 //! - sheet cell: [`SetSheetCell`](ModelOp::SetSheetCell).
+//! - sheet structure: [`InsertSheetRow`](ModelOp::InsertSheetRow),
+//!   [`DeleteSheetRow`](ModelOp::DeleteSheetRow),
+//!   [`InsertSheetColumn`](ModelOp::InsertSheetColumn),
+//!   [`DeleteSheetColumn`](ModelOp::DeleteSheetColumn) — these shift cells and
+//!   adjust merge ranges.
 //!
 //! ## JSON
 //!
@@ -40,7 +51,10 @@
 //! ```
 
 use crate::convert::style::Generic;
-use crate::model::{Block, BlockId, BlockKind, CellValue, Document, Inline, InlineRun, Page};
+use crate::model::{
+    Block, BlockId, BlockKind, Cell, CellValue, Document, Inline, InlineRun, MergeRange, Page, Row,
+    Sheet, SheetCell, SheetRow, Table,
+};
 
 /// A positional block address: `(section, page-in-section, block index)`,
 /// all zero-based. The triple is stable for a given tree snapshot and survives
@@ -177,6 +191,70 @@ pub enum ModelOp {
         row: usize,
         col: usize,
         value: CellValue,
+    },
+
+    // ── structural table editing ──────────────────────────────────────────────
+    /// Insert an empty row into the addressed [`Table`](crate::model::Table) at
+    /// `at` (clamped to the row count). The new row is filled with one empty
+    /// single-column cell per logical column so it spans the table's full width.
+    InsertTableRow { addr: BlockAddr, at: usize },
+    /// Delete row `at` from the addressed table. Cells in earlier rows whose
+    /// `row_span` reaches across `at` are shrunk by one so the grid stays
+    /// rectangular. Out-of-range ⇒ no-op.
+    DeleteTableRow { addr: BlockAddr, at: usize },
+    /// Insert a column at grid-index `at` (clamped to the column count) into the
+    /// addressed table: a fresh width is added to `col_widths`, and every row
+    /// gains a cell at that boundary — or, when `at` falls inside a spanning
+    /// cell, that cell's `col_span` is widened so the new column passes through
+    /// the merge.
+    InsertTableColumn { addr: BlockAddr, at: usize },
+    /// Delete the column at grid-index `at` from the addressed table: its
+    /// `col_widths` entry is removed and, per row, the cell covering that grid
+    /// column is removed (span 1) or shrunk (span > 1). Out-of-range ⇒ no-op.
+    DeleteTableColumn { addr: BlockAddr, at: usize },
+    /// Set the `(col_span, row_span)` of the `(row, col)` cell in the addressed
+    /// table. Both spans are clamped to at least 1. The cell is addressed by its
+    /// position in `rows[row].cells` (not by grid column). Out-of-range ⇒ no-op.
+    SetCellSpan {
+        addr: BlockAddr,
+        row: usize,
+        col: usize,
+        col_span: u16,
+        row_span: u16,
+    },
+
+    // ── structural sheet editing ──────────────────────────────────────────────
+    /// Insert an empty row into the addressed [`Sheet`](crate::model::Sheet) of a
+    /// [`SheetBlock`](crate::model::SheetBlock) at `at` (clamped). Merge ranges at
+    /// or below `at` shift down by one row.
+    InsertSheetRow {
+        addr: BlockAddr,
+        sheet: usize,
+        at: usize,
+    },
+    /// Delete row `at` from the addressed sheet, dropping cells in that row and
+    /// shifting lower rows up. Merge ranges are adjusted (shrunk, shifted, or
+    /// dropped when they collapse). Out-of-range ⇒ no-op.
+    DeleteSheetRow {
+        addr: BlockAddr,
+        sheet: usize,
+        at: usize,
+    },
+    /// Insert a column at index `at` (clamped) into the addressed sheet: every
+    /// row gains an empty cell at `at`, `col_widths` gains a slot, and merge
+    /// ranges at or right of `at` shift right by one column.
+    InsertSheetColumn {
+        addr: BlockAddr,
+        sheet: usize,
+        at: usize,
+    },
+    /// Delete column `at` from the addressed sheet, dropping that cell in every
+    /// row and shifting the rest left. `col_widths` and merge ranges are adjusted
+    /// (shrunk, shifted, or dropped). Out-of-range ⇒ no-op.
+    DeleteSheetColumn {
+        addr: BlockAddr,
+        sheet: usize,
+        at: usize,
     },
 }
 
@@ -394,7 +472,80 @@ fn apply_one(doc: &mut Document, op: &ModelOp) -> bool {
             r.cells[*col].value = value.clone();
             true
         }
+        ModelOp::InsertTableRow { addr, at } => {
+            with_table(doc, addr, |t| insert_table_row(t, *at))
+        }
+        ModelOp::DeleteTableRow { addr, at } => {
+            with_table(doc, addr, |t| delete_table_row(t, *at))
+        }
+        ModelOp::InsertTableColumn { addr, at } => {
+            with_table(doc, addr, |t| insert_table_column(t, *at))
+        }
+        ModelOp::DeleteTableColumn { addr, at } => {
+            with_table(doc, addr, |t| delete_table_column(t, *at))
+        }
+        ModelOp::SetCellSpan {
+            addr,
+            row,
+            col,
+            col_span,
+            row_span,
+        } => with_table(doc, addr, |t| {
+            let Some(r) = t.rows.get_mut(*row) else {
+                return false;
+            };
+            let Some(cell) = r.cells.get_mut(*col) else {
+                return false;
+            };
+            cell.col_span = (*col_span).max(1);
+            cell.row_span = (*row_span).max(1);
+            true
+        }),
+        ModelOp::InsertSheetRow { addr, sheet, at } => {
+            with_sheet(doc, addr, *sheet, |s| insert_sheet_row(s, *at))
+        }
+        ModelOp::DeleteSheetRow { addr, sheet, at } => {
+            with_sheet(doc, addr, *sheet, |s| delete_sheet_row(s, *at))
+        }
+        ModelOp::InsertSheetColumn { addr, sheet, at } => {
+            with_sheet(doc, addr, *sheet, |s| insert_sheet_column(s, *at))
+        }
+        ModelOp::DeleteSheetColumn { addr, sheet, at } => {
+            with_sheet(doc, addr, *sheet, |s| delete_sheet_column(s, *at))
+        }
     }
+}
+
+/// Run `f` on the [`Table`] at `addr`, or return `false` when the address does
+/// not resolve to a table block.
+fn with_table(doc: &mut Document, addr: &BlockAddr, f: impl FnOnce(&mut Table) -> bool) -> bool {
+    let Some(block) = block_mut(doc, addr) else {
+        return false;
+    };
+    let BlockKind::Table(table) = &mut block.kind else {
+        return false;
+    };
+    f(table)
+}
+
+/// Run `f` on the `sheet`-th [`Sheet`] of the [`SheetBlock`] at `addr`, or
+/// return `false` when the address does not resolve to that sheet.
+fn with_sheet(
+    doc: &mut Document,
+    addr: &BlockAddr,
+    sheet: usize,
+    f: impl FnOnce(&mut Sheet) -> bool,
+) -> bool {
+    let Some(block) = block_mut(doc, addr) else {
+        return false;
+    };
+    let BlockKind::Sheet(sb) = &mut block.kind else {
+        return false;
+    };
+    let Some(sh) = sb.sheets.get_mut(sheet) else {
+        return false;
+    };
+    f(sh)
 }
 
 /// Move the block at `from` to `to`, clamping the destination index. A move
@@ -461,6 +612,278 @@ fn paragraph_block(text: &str) -> Block {
             })],
             ..Paragraph::default()
         }),
+    }
+}
+
+// ───────────────────────── table geometry ─────────────────────────────────────
+//
+// A table is a grid: `col_widths[i]` is the width of grid-column `i`, and each
+// `Row::cells` entry occupies a contiguous run of grid-columns of length
+// `col_span`. The logical column count is `max` over rows of `Σ col_span`,
+// matching `convert::export_model::table_col_count`. The helpers below keep
+// `col_widths` and the per-cell spans coherent across structural edits.
+
+/// The table's logical grid-column count: the widest row's summed `col_span`,
+/// never below `col_widths.len()`.
+fn table_columns(table: &Table) -> usize {
+    let from_rows = table
+        .rows
+        .iter()
+        .map(row_columns)
+        .max()
+        .unwrap_or(0);
+    from_rows.max(table.col_widths.len())
+}
+
+/// The number of grid-columns a row covers: the sum of its cells' spans (each at
+/// least 1).
+fn row_columns(row: &Row) -> usize {
+    row.cells.iter().map(|c| c.col_span.max(1) as usize).sum()
+}
+
+/// A representative column width to seed a newly inserted column: the mean of the
+/// existing widths, or a sensible default when the table has none yet.
+fn default_col_width(table: &Table) -> f64 {
+    /// Fallback width (points) when a table carries no explicit `col_widths`.
+    const FALLBACK_COL_WIDTH: f64 = 72.0;
+    if table.col_widths.is_empty() {
+        FALLBACK_COL_WIDTH
+    } else {
+        table.col_widths.iter().sum::<f64>() / table.col_widths.len() as f64
+    }
+}
+
+/// Insert an empty, full-width row at `at` (clamped). The row gets one empty
+/// single-column cell per logical column so the grid stays rectangular.
+fn insert_table_row(table: &mut Table, at: usize) -> bool {
+    let cols = table_columns(table).max(1);
+    let at = at.min(table.rows.len());
+    let row = Row {
+        cells: vec![Cell::default(); cols],
+        height: None,
+    };
+    table.rows.insert(at, row);
+    true
+}
+
+/// Delete row `at`. Cells in earlier rows whose `row_span` extends across the
+/// deleted row are shrunk by one so they no longer over-cover the grid.
+fn delete_table_row(table: &mut Table, at: usize) -> bool {
+    if at >= table.rows.len() {
+        return false;
+    }
+    table.rows.remove(at);
+    // Earlier rows can carry a vertical span that reached into `at`; shrink any
+    // whose span crossed the removed row.
+    for (ri, row) in table.rows.iter_mut().enumerate() {
+        if ri >= at {
+            break; // only rows above the deletion point could span across it
+        }
+        let from_top = at - ri; // 1-based distance from this row down to `at`
+        for cell in &mut row.cells {
+            if (cell.row_span as usize) > from_top {
+                cell.row_span -= 1;
+            }
+        }
+    }
+    true
+}
+
+/// Insert a grid-column at `at` (clamped to the column count). Adds a width to
+/// `col_widths` and, per row, either splits in a fresh empty cell at the column
+/// boundary or widens the spanning cell the new column passes through.
+fn insert_table_column(table: &mut Table, at: usize) -> bool {
+    let cols = table_columns(table);
+    let at = at.min(cols);
+    let width = default_col_width(table);
+    // Keep `col_widths` addressable up to the current column count before
+    // inserting, so the new slot lands at `at` regardless of prior sparseness.
+    if table.col_widths.len() < cols {
+        table.col_widths.resize(cols, width);
+    }
+    table.col_widths.insert(at.min(table.col_widths.len()), width);
+
+    for row in &mut table.rows {
+        insert_row_column(row, at);
+    }
+    true
+}
+
+/// Insert one grid-column at `at` within a single row: widen the cell that
+/// *straddles* `at`, or splice an empty single-column cell at the boundary.
+fn insert_row_column(row: &mut Row, at: usize) {
+    let mut grid = 0usize;
+    for (ci, cell) in row.cells.iter_mut().enumerate() {
+        let span = cell.col_span.max(1) as usize;
+        if at > grid && at < grid + span {
+            // `at` falls strictly inside this cell's span → the column passes
+            // through the merge, so the cell simply gets one column wider.
+            cell.col_span += 1;
+            return;
+        }
+        if at == grid {
+            row.cells.insert(ci, Cell::default());
+            return;
+        }
+        grid += span;
+    }
+    // `at` is at or past the row's right edge → append an empty cell.
+    row.cells.push(Cell::default());
+}
+
+/// Delete the grid-column at `at`. Removes its `col_widths` entry and, per row,
+/// removes the covering cell (span 1) or shrinks it (span > 1).
+fn delete_table_column(table: &mut Table, at: usize) -> bool {
+    if at >= table_columns(table) {
+        return false;
+    }
+    if at < table.col_widths.len() {
+        table.col_widths.remove(at);
+    }
+    for row in &mut table.rows {
+        delete_row_column(row, at);
+    }
+    true
+}
+
+/// Remove one grid-column at `at` within a single row.
+fn delete_row_column(row: &mut Row, at: usize) {
+    let mut grid = 0usize;
+    for ci in 0..row.cells.len() {
+        let span = row.cells[ci].col_span.max(1) as usize;
+        if at >= grid && at < grid + span {
+            if span > 1 {
+                row.cells[ci].col_span -= 1;
+            } else {
+                row.cells.remove(ci);
+            }
+            return;
+        }
+        grid += span;
+    }
+    // `at` past this row's columns → nothing to remove in this row.
+}
+
+// ───────────────────────── sheet geometry ─────────────────────────────────────
+//
+// A sheet is a dense grid of `SheetCell`s with separate `merges` (inclusive
+// rectangles) and `col_widths`. Row/column edits shift cells and re-map the
+// merge ranges; a merge that collapses to nothing is dropped.
+
+/// Insert an empty row at `at` (clamped); merges at or below `at` shift down.
+fn insert_sheet_row(sheet: &mut Sheet, at: usize) -> bool {
+    let at = at.min(sheet.rows.len());
+    sheet.rows.insert(at, SheetRow::default());
+    for m in &mut sheet.merges {
+        if m.r0 >= at {
+            m.r0 += 1;
+        }
+        if m.r1 >= at {
+            m.r1 += 1;
+        }
+    }
+    true
+}
+
+/// Delete row `at`, shifting lower rows up and re-mapping merges (shrink the ones
+/// that span `at`, shift the ones below it, drop the ones that collapse).
+fn delete_sheet_row(sheet: &mut Sheet, at: usize) -> bool {
+    if at >= sheet.rows.len() {
+        return false;
+    }
+    sheet.rows.remove(at);
+    sheet.merges.retain_mut(|m| remap_delete(m.r0_r1_mut(), at));
+    true
+}
+
+/// Insert an empty column at `at` (clamped) in every row; `col_widths` and
+/// merges shift to match.
+fn insert_sheet_column(sheet: &mut Sheet, at: usize) -> bool {
+    let cols = sheet_columns(sheet);
+    let at = at.min(cols);
+    for row in &mut sheet.rows {
+        let pos = at.min(row.cells.len());
+        row.cells.insert(pos, SheetCell::default());
+    }
+    if at <= sheet.col_widths.len() {
+        // Only widen `col_widths` when `at` lands within (or just past) the
+        // tracked widths; leave a sparse tail sparse.
+        sheet.col_widths.insert(at, 0.0);
+    }
+    for m in &mut sheet.merges {
+        if m.c0 >= at {
+            m.c0 += 1;
+        }
+        if m.c1 >= at {
+            m.c1 += 1;
+        }
+    }
+    true
+}
+
+/// Delete column `at` from every row, shifting the rest left; `col_widths` and
+/// merges shift to match (collapsing merges are dropped).
+fn delete_sheet_column(sheet: &mut Sheet, at: usize) -> bool {
+    if at >= sheet_columns(sheet) {
+        return false;
+    }
+    for row in &mut sheet.rows {
+        if at < row.cells.len() {
+            row.cells.remove(at);
+        }
+    }
+    if at < sheet.col_widths.len() {
+        sheet.col_widths.remove(at);
+    }
+    sheet.merges.retain_mut(|m| remap_delete(m.c0_c1_mut(), at));
+    true
+}
+
+/// The sheet's column count: the widest row's cell count, never below
+/// `col_widths.len()`.
+fn sheet_columns(sheet: &Sheet) -> usize {
+    sheet
+        .rows
+        .iter()
+        .map(|r| r.cells.len())
+        .max()
+        .unwrap_or(0)
+        .max(sheet.col_widths.len())
+}
+
+/// Re-map an inclusive `(lo, hi)` merge span across the deletion of line `at`.
+/// Returns `false` when the span collapses to nothing (caller should drop it).
+fn remap_delete((lo, hi): (&mut usize, &mut usize), at: usize) -> bool {
+    if *hi < at {
+        // Wholly before the deleted line → unaffected.
+        return true;
+    }
+    if *lo > at {
+        // Wholly after → shift both ends up by one.
+        *lo -= 1;
+        *hi -= 1;
+        return true;
+    }
+    // The deleted line lies within `[lo, hi]`. A single-line span collapses;
+    // otherwise the span loses exactly one line. Every line below `at` (inside
+    // the span) slides up, so the high end always decrements; `lo` is already
+    // ≤ `at`, so it stays put (a deletion of the span's top line just lets the
+    // next line become the new top, keeping `lo`).
+    if *lo == *hi {
+        return false;
+    }
+    *hi -= 1;
+    true
+}
+
+impl MergeRange {
+    /// Mutable references to the row endpoints `(r0, r1)`.
+    fn r0_r1_mut(&mut self) -> (&mut usize, &mut usize) {
+        (&mut self.r0, &mut self.r1)
+    }
+    /// Mutable references to the column endpoints `(c0, c1)`.
+    fn c0_c1_mut(&mut self) -> (&mut usize, &mut usize) {
+        (&mut self.c0, &mut self.c1)
     }
 }
 
@@ -893,6 +1316,9 @@ impl<'a> OpReader<'a> {
         let mut row: Option<usize> = None;
         let mut col: Option<usize> = None;
         let mut sheet: Option<usize> = None;
+        let mut at: Option<usize> = None;
+        let mut col_span: Option<usize> = None;
+        let mut row_span: Option<usize> = None;
         let mut text: Option<String> = None;
         let mut style: Option<StylePatch> = None;
         let mut block: Option<Block> = None;
@@ -907,6 +1333,9 @@ impl<'a> OpReader<'a> {
                 "row" => row = Some(r.usize()?),
                 "col" => col = Some(r.usize()?),
                 "sheet" => sheet = Some(r.usize()?),
+                "at" => at = Some(r.usize()?),
+                "col_span" => col_span = Some(r.usize()?),
+                "row_span" => row_span = Some(r.usize()?),
                 "text" => text = Some(r.string()?),
                 "style" => style = Some(r.style_patch()?),
                 "block" => block = Some(r.block()?),
@@ -957,9 +1386,45 @@ impl<'a> OpReader<'a> {
                 col: col?,
                 value: value?,
             }),
+            "insertTableRow" => Some(ModelOp::InsertTableRow { addr, at: at? }),
+            "deleteTableRow" => Some(ModelOp::DeleteTableRow { addr, at: at? }),
+            "insertTableColumn" => Some(ModelOp::InsertTableColumn { addr, at: at? }),
+            "deleteTableColumn" => Some(ModelOp::DeleteTableColumn { addr, at: at? }),
+            "setCellSpan" => Some(ModelOp::SetCellSpan {
+                addr,
+                row: row?,
+                col: col?,
+                col_span: u16_from(col_span?)?,
+                row_span: u16_from(row_span?)?,
+            }),
+            "insertSheetRow" => Some(ModelOp::InsertSheetRow {
+                addr,
+                sheet: sheet?,
+                at: at?,
+            }),
+            "deleteSheetRow" => Some(ModelOp::DeleteSheetRow {
+                addr,
+                sheet: sheet?,
+                at: at?,
+            }),
+            "insertSheetColumn" => Some(ModelOp::InsertSheetColumn {
+                addr,
+                sheet: sheet?,
+                at: at?,
+            }),
+            "deleteSheetColumn" => Some(ModelOp::DeleteSheetColumn {
+                addr,
+                sheet: sheet?,
+                at: at?,
+            }),
             _ => None,
         }
     }
+}
+
+/// Narrow a JSON-parsed `usize` span to the model's `u16`, rejecting overflow.
+fn u16_from(n: usize) -> Option<u16> {
+    u16::try_from(n).ok()
 }
 
 /// Parse the model's `generic` tag (mirrors `model::json::parse_generic`).
@@ -1250,6 +1715,484 @@ mod tests {
             panic!()
         };
         assert_eq!(run_texts(&t.rows[0].cells[1].blocks[0]), vec!["cell!"]);
+    }
+
+    // ── structural table ops ──────────────────────────────────────────────────
+
+    /// A `c×r` table of empty single-column cells with equal column widths.
+    fn grid_table(rows: usize, cols: usize) -> Table {
+        Table {
+            rows: (0..rows)
+                .map(|_| Row {
+                    cells: vec![Cell::default(); cols],
+                    height: None,
+                })
+                .collect(),
+            col_widths: vec![100.0; cols],
+            ..Table::default()
+        }
+    }
+
+    fn table_block(table: Table) -> Block {
+        Block {
+            kind: BlockKind::Table(table),
+            ..Block::default()
+        }
+    }
+
+    fn get_table(doc: &Document) -> &Table {
+        let BlockKind::Table(t) = &first_block(doc).kind else {
+            panic!("expected a table block")
+        };
+        t
+    }
+
+    fn run_one(doc: &mut Document, op: ModelOp) -> usize {
+        apply_ops(doc, &[op])
+    }
+
+    #[test]
+    fn insert_table_row_adds_full_width_row_at_index() {
+        let mut doc = doc_with(vec![table_block(grid_table(2, 3))]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::InsertTableRow {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 1,
+            },
+        );
+        assert_eq!(n, 1);
+        let t = get_table(&doc);
+        assert_eq!(t.rows.len(), 3, "one more row");
+        assert_eq!(t.rows[1].cells.len(), 3, "new row spans all 3 columns");
+        assert!(
+            t.rows[1].cells.iter().all(|c| c.col_span == 1),
+            "new cells are single-column"
+        );
+    }
+
+    #[test]
+    fn insert_table_row_clamps_past_end() {
+        let mut doc = doc_with(vec![table_block(grid_table(2, 2))]);
+        run_one(
+            &mut doc,
+            ModelOp::InsertTableRow {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 99,
+            },
+        );
+        assert_eq!(get_table(&doc).rows.len(), 3, "clamped to append");
+    }
+
+    #[test]
+    fn delete_table_row_removes_row_and_shrinks_crossing_rowspans() {
+        let mut table = grid_table(3, 2);
+        // Make the top-left cell span all 3 rows.
+        table.rows[0].cells[0].row_span = 3;
+        let mut doc = doc_with(vec![table_block(table)]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::DeleteTableRow {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 1,
+            },
+        );
+        assert_eq!(n, 1);
+        let t = get_table(&doc);
+        assert_eq!(t.rows.len(), 2, "one fewer row");
+        assert_eq!(
+            t.rows[0].cells[0].row_span, 2,
+            "span across the deleted row shrinks 3→2"
+        );
+    }
+
+    #[test]
+    fn delete_table_row_out_of_range_is_no_op() {
+        let mut doc = doc_with(vec![table_block(grid_table(2, 2))]);
+        let before = doc.clone();
+        let n = run_one(
+            &mut doc,
+            ModelOp::DeleteTableRow {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 9,
+            },
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn insert_table_column_adds_width_and_cell_per_row() {
+        let mut doc = doc_with(vec![table_block(grid_table(2, 3))]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::InsertTableColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 1,
+            },
+        );
+        assert_eq!(n, 1);
+        let t = get_table(&doc);
+        assert_eq!(t.col_widths.len(), 4, "one more column width");
+        assert_eq!(table_columns(t), 4, "logical columns now 4");
+        for row in &t.rows {
+            assert_eq!(row.cells.len(), 4, "every row gains a cell");
+        }
+    }
+
+    #[test]
+    fn insert_table_column_inside_span_widens_that_cell() {
+        let mut table = grid_table(1, 3);
+        // One row whose single cell spans all 3 columns.
+        table.rows[0].cells = vec![Cell {
+            col_span: 3,
+            ..Cell::default()
+        }];
+        let mut doc = doc_with(vec![table_block(table)]);
+        run_one(
+            &mut doc,
+            ModelOp::InsertTableColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 1, // strictly inside the span
+            },
+        );
+        let t = get_table(&doc);
+        assert_eq!(t.col_widths.len(), 4);
+        assert_eq!(t.rows[0].cells.len(), 1, "still a single (wider) cell");
+        assert_eq!(t.rows[0].cells[0].col_span, 4, "span widened 3→4");
+        assert_eq!(table_columns(t), 4);
+    }
+
+    #[test]
+    fn delete_table_column_removes_width_and_shrinks_spans() {
+        // Row 0: one cell spanning 2 cols, then a single cell  → 3 columns.
+        // Row 1: three single cells                            → 3 columns.
+        let mut table = grid_table(2, 3);
+        table.rows[0].cells = vec![
+            Cell {
+                col_span: 2,
+                ..Cell::default()
+            },
+            Cell::default(),
+        ];
+        let mut doc = doc_with(vec![table_block(table)]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::DeleteTableColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 0, // covered by the span cell in row 0, a single cell in row 1
+            },
+        );
+        assert_eq!(n, 1);
+        let t = get_table(&doc);
+        assert_eq!(t.col_widths.len(), 2, "3→2 column widths");
+        assert_eq!(
+            t.rows[0].cells[0].col_span, 1,
+            "spanning cell shrinks 2→1"
+        );
+        assert_eq!(t.rows[0].cells.len(), 2, "row 0 keeps both cells");
+        assert_eq!(t.rows[1].cells.len(), 2, "row 1 drops a single cell");
+        assert_eq!(table_columns(t), 2);
+    }
+
+    #[test]
+    fn delete_table_column_out_of_range_is_no_op() {
+        let mut doc = doc_with(vec![table_block(grid_table(2, 2))]);
+        let before = doc.clone();
+        let n = run_one(
+            &mut doc,
+            ModelOp::DeleteTableColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                at: 5,
+            },
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn set_cell_span_clamps_to_at_least_one() {
+        let mut doc = doc_with(vec![table_block(grid_table(2, 2))]);
+        run_one(
+            &mut doc,
+            ModelOp::SetCellSpan {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 0,
+                col: 0,
+                col_span: 2,
+                row_span: 0, // clamps to 1
+            },
+        );
+        let t = get_table(&doc);
+        assert_eq!(t.rows[0].cells[0].col_span, 2);
+        assert_eq!(t.rows[0].cells[0].row_span, 1, "0 clamped to 1");
+    }
+
+    #[test]
+    fn structural_table_ops_on_non_table_are_no_ops() {
+        let mut doc = doc_with(vec![para_block(vec![run("not a table")])]);
+        let before = doc.clone();
+        let n = apply_ops(
+            &mut doc,
+            &[
+                ModelOp::InsertTableRow {
+                    addr: BlockAddr::new(0, 0, 0),
+                    at: 0,
+                },
+                ModelOp::DeleteTableColumn {
+                    addr: BlockAddr::new(0, 0, 0),
+                    at: 0,
+                },
+            ],
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    // ── structural sheet ops ──────────────────────────────────────────────────
+
+    fn sheet_block(sheet: Sheet) -> Block {
+        Block {
+            kind: BlockKind::Sheet(SheetBlock {
+                sheets: vec![sheet],
+            }),
+            ..Block::default()
+        }
+    }
+
+    /// A dense `rows × cols` sheet of text cells `"r,c"`, with equal col widths.
+    fn dense_sheet(rows: usize, cols: usize) -> Sheet {
+        Sheet {
+            name: "S".into(),
+            rows: (0..rows)
+                .map(|r| SheetRow {
+                    cells: (0..cols)
+                        .map(|c| SheetCell {
+                            value: CellValue::Text(format!("{r},{c}")),
+                            ..SheetCell::default()
+                        })
+                        .collect(),
+                })
+                .collect(),
+            merges: Vec::new(),
+            col_widths: vec![50.0; cols],
+        }
+    }
+
+    fn get_sheet(doc: &Document) -> &Sheet {
+        let BlockKind::Sheet(sb) = &first_block(doc).kind else {
+            panic!("expected a sheet block")
+        };
+        &sb.sheets[0]
+    }
+
+    fn cell_text(sheet: &Sheet, r: usize, c: usize) -> String {
+        match &sheet.rows[r].cells[c].value {
+            CellValue::Text(s) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_sheet_row_shifts_cells_and_merges() {
+        let mut sheet = dense_sheet(2, 2);
+        sheet.merges.push(MergeRange {
+            r0: 1,
+            c0: 0,
+            r1: 1,
+            c1: 1,
+        });
+        let mut doc = doc_with(vec![sheet_block(sheet)]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::InsertSheetRow {
+                addr: BlockAddr::new(0, 0, 0),
+                sheet: 0,
+                at: 1,
+            },
+        );
+        assert_eq!(n, 1);
+        let s = get_sheet(&doc);
+        assert_eq!(s.rows.len(), 3, "one more row");
+        assert!(s.rows[1].cells.is_empty(), "inserted row is empty");
+        assert_eq!(cell_text(s, 2, 0), "1,0", "old row 1 pushed to index 2");
+        assert_eq!(s.merges[0].r0, 2, "merge shifted down");
+        assert_eq!(s.merges[0].r1, 2);
+    }
+
+    #[test]
+    fn delete_sheet_row_shifts_up_and_drops_collapsed_merge() {
+        let mut sheet = dense_sheet(3, 2);
+        // Single-row merge on row 1 (collapses on delete) + a 2-row merge
+        // (rows 0..=1, shrinks to a single row).
+        sheet.merges.push(MergeRange {
+            r0: 1,
+            c0: 0,
+            r1: 1,
+            c1: 1,
+        });
+        sheet.merges.push(MergeRange {
+            r0: 0,
+            c0: 0,
+            r1: 1,
+            c1: 0,
+        });
+        let mut doc = doc_with(vec![sheet_block(sheet)]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::DeleteSheetRow {
+                addr: BlockAddr::new(0, 0, 0),
+                sheet: 0,
+                at: 1,
+            },
+        );
+        assert_eq!(n, 1);
+        let s = get_sheet(&doc);
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(cell_text(s, 1, 0), "2,0", "row 2 shifted up to index 1");
+        assert_eq!(s.merges.len(), 1, "single-row merge dropped");
+        assert_eq!((s.merges[0].r0, s.merges[0].r1), (0, 0), "2-row merge → 1");
+    }
+
+    #[test]
+    fn insert_sheet_column_shifts_cells_widths_and_merges() {
+        let mut sheet = dense_sheet(2, 2);
+        sheet.merges.push(MergeRange {
+            r0: 0,
+            c0: 1,
+            r1: 1,
+            c1: 1,
+        });
+        let mut doc = doc_with(vec![sheet_block(sheet)]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::InsertSheetColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                sheet: 0,
+                at: 1,
+            },
+        );
+        assert_eq!(n, 1);
+        let s = get_sheet(&doc);
+        assert_eq!(s.rows[0].cells.len(), 3, "row gains a cell");
+        assert_eq!(s.col_widths.len(), 3, "width slot added");
+        assert_eq!(cell_text(s, 0, 2), "0,1", "old col 1 pushed to index 2");
+        assert_eq!(s.merges[0].c0, 2, "merge shifted right");
+        assert_eq!(s.merges[0].c1, 2);
+    }
+
+    #[test]
+    fn delete_sheet_column_shifts_left_and_remaps_merge() {
+        let mut sheet = dense_sheet(2, 3);
+        sheet.merges.push(MergeRange {
+            r0: 0,
+            c0: 1,
+            r1: 0,
+            c1: 2,
+        });
+        let mut doc = doc_with(vec![sheet_block(sheet)]);
+        let n = run_one(
+            &mut doc,
+            ModelOp::DeleteSheetColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                sheet: 0,
+                at: 1,
+            },
+        );
+        assert_eq!(n, 1);
+        let s = get_sheet(&doc);
+        assert_eq!(s.rows[0].cells.len(), 2, "row loses a cell");
+        assert_eq!(s.col_widths.len(), 2);
+        assert_eq!(cell_text(s, 0, 1), "0,2", "old col 2 shifted to index 1");
+        assert_eq!(
+            (s.merges[0].c0, s.merges[0].c1),
+            (1, 1),
+            "2-col merge (1..=2) → single col 1"
+        );
+    }
+
+    #[test]
+    fn delete_sheet_column_out_of_range_is_no_op() {
+        let mut doc = doc_with(vec![sheet_block(dense_sheet(2, 2))]);
+        let before = doc.clone();
+        let n = run_one(
+            &mut doc,
+            ModelOp::DeleteSheetColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                sheet: 0,
+                at: 9,
+            },
+        );
+        assert_eq!(n, 0);
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn parse_structural_table_ops_from_json() {
+        let ops = parse_ops(
+            r#"[
+                { "op":"insertTableRow", "addr":[0,0,0], "at":1 },
+                { "op":"insertTableColumn", "addr":[0,0,0], "at":0 },
+                { "op":"setCellSpan", "addr":[0,0,0], "row":0, "col":0, "col_span":2, "row_span":3 },
+                { "op":"deleteTableRow", "addr":[0,0,0], "at":0 },
+                { "op":"deleteTableColumn", "addr":[0,0,0], "at":0 }
+            ]"#,
+        );
+        assert_eq!(ops.len(), 5);
+        assert_eq!(
+            ops[2],
+            ModelOp::SetCellSpan {
+                addr: BlockAddr::new(0, 0, 0),
+                row: 0,
+                col: 0,
+                col_span: 2,
+                row_span: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_structural_sheet_ops_from_json() {
+        let ops = parse_ops(
+            r#"[
+                { "op":"insertSheetRow", "addr":[0,0,0], "sheet":0, "at":2 },
+                { "op":"deleteSheetColumn", "addr":[0,0,0], "sheet":1, "at":0 }
+            ]"#,
+        );
+        assert_eq!(ops.len(), 2);
+        assert_eq!(
+            ops[0],
+            ModelOp::InsertSheetRow {
+                addr: BlockAddr::new(0, 0, 0),
+                sheet: 0,
+                at: 2,
+            }
+        );
+        assert_eq!(
+            ops[1],
+            ModelOp::DeleteSheetColumn {
+                addr: BlockAddr::new(0, 0, 0),
+                sheet: 1,
+                at: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn structural_table_op_survives_json_round_trip_end_to_end() {
+        // A 2×2 table → JSON → apply insertTableColumn via parsed op → still
+        // coherent (3 logical columns, every row 3 cells).
+        let model = doc_with(vec![table_block(grid_table(2, 2))]);
+        let json = model.to_json();
+        let mut reparsed = Document::from_json(&json).expect("round-trips");
+        let ops = parse_ops(r#"[{ "op":"insertTableColumn", "addr":[0,0,0], "at":2 }]"#);
+        assert_eq!(apply_ops(&mut reparsed, &ops), 1);
+        let t = get_table(&reparsed);
+        assert_eq!(table_columns(t), 3);
+        assert!(t.rows.iter().all(|r| r.cells.len() == 3));
+        // And it re-serialises stably.
+        let again = Document::from_json(&reparsed.to_json()).expect("re-round-trips");
+        assert_eq!(again, reparsed);
     }
 
     #[test]
