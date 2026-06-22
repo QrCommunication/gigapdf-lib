@@ -69,6 +69,9 @@ augmentation (blur + sensor noise)─┘            → train_ocr_crnn.py (CRNN 
 | Malayalam (`mlym`) | 0.38 / **0.34** | 0.13 | Tesseract wins; no pipeline gap, decodes real text |
 | Telugu (`telu`) | 0.46 / 0.71 | 0.10 | Tesseract wins + residual front-end gap |
 | Thai (`thai`) | 0.49 / 0.88 | 0.19 | Tesseract wins + larger front-end gap |
+| Kannada (`kann`) | 0.70 / 0.50 | 0.05 | Tesseract dominates (capacity-limited) |
+| Gujarati (`gujr`) | 0.68 / 0.75 | 0.07 | Tesseract dominates (capacity-limited) |
+| Gurmukhi (`guru`) | 0.63 / 0.62 | 0.28 | Tesseract wins (its Punjabi is itself weak) |
 
 **Honest verdict:** the models now **work** (real-script decode, not garbage — int8 collapse fixed), but **Tesseract still wins** on these complex scripts. gigapdf's value stays zero-dep in-WASM coverage. Malayalam tracks its val (no front-end gap); Telugu/Thai keep a val→pipeline gap → script-aware segmentation is the next lever. Capacity-limited scripts (Kannada/Gujarati/Gurmukhi) plateau ~0.65-0.73 val → would need a bigger backbone.
 
