@@ -2329,6 +2329,190 @@ struct NumRef {
     level: u32,
 }
 
+/// What a `<w:drawing>` resolves to, once its envelope is inspected.
+///
+/// A `wp:inline` (or an enveloped-but-not-anchored drawing) stays in the text
+/// flow as an `<img>`; a `wp:anchor` (a floating/anchored object) is lifted out
+/// of flow into an absolutely-positioned `<div>` so a corner logo, a floating
+/// image, or a text-box keeps its page position instead of collapsing into the
+/// paragraph flow.
+enum DrawingResult {
+    /// Markup that belongs inline in the run (typically an `<img>`).
+    Inline(String),
+    /// An absolutely-positioned wrapper `<div>` to emit as a paragraph sibling.
+    Float(String),
+    /// Nothing renderable (e.g. an embed that resolved to no media).
+    Empty,
+}
+
+/// An anchored drawing's placement, gathered from `wp:anchor`:
+/// `wp:positionH/positionV → wp:posOffset` (absolute EMU offset) or `wp:align`
+/// (relative keyword), and the `wp:extent@cx/@cy` size. Offsets are taken
+/// relative to the page content box (the layout engine's containing block for
+/// `position:absolute`), which is exactly right for `relativeFrom="margin"` and
+/// a sound, non-regressing approximation for `page`-relative anchors.
+#[derive(Default)]
+struct AnchorBox {
+    /// Horizontal offset in points (`wp:positionH/wp:posOffset`).
+    off_x: Option<f64>,
+    /// Vertical offset in points (`wp:positionV/wp:posOffset`).
+    off_y: Option<f64>,
+    /// `wp:positionH/wp:align` — `left` / `center` / `right`.
+    align_h: Option<&'static str>,
+    /// `wp:positionV/wp:align` — `top` / `center` / `bottom`.
+    align_v: Option<&'static str>,
+    /// Box width in points (`wp:extent@cx`).
+    w: Option<f64>,
+    /// Box height in points (`wp:extent@cy`).
+    h: Option<f64>,
+}
+
+impl AnchorBox {
+    /// The inline CSS for the absolute wrapper. `wp:posOffset` maps to
+    /// `left`/`top`; a `wp:align` keyword maps to the matching edge inset
+    /// (`right:0`/`bottom:0`) or centring via an auto margin. Width/height come
+    /// from `wp:extent` when present so the box reserves its real footprint.
+    fn abs_style(&self) -> String {
+        let mut css = String::from("position:absolute");
+        match (self.off_x, self.align_h) {
+            (Some(x), _) => css.push_str(&format!(";left:{}pt", fmt_pt(x))),
+            (None, Some("right")) => css.push_str(";right:0pt"),
+            (None, Some("center")) => css.push_str(";left:0pt;right:0pt;margin-left:auto;margin-right:auto"),
+            (None, Some(_)) => css.push_str(";left:0pt"), // "left"/inside/outside → left edge
+            (None, None) => css.push_str(";left:0pt"),
+        }
+        match (self.off_y, self.align_v) {
+            (Some(y), _) => css.push_str(&format!(";top:{}pt", fmt_pt(y))),
+            (None, Some("bottom")) => css.push_str(";bottom:0pt"),
+            (None, Some(_)) => css.push_str(";top:0pt"), // "top"/"center" → top edge
+            (None, None) => css.push_str(";top:0pt"),
+        }
+        if let Some(w) = self.w {
+            css.push_str(&format!(";width:{}pt", fmt_pt(w)));
+        }
+        if let Some(h) = self.h {
+            css.push_str(&format!(";height:{}pt", fmt_pt(h)));
+        }
+        css
+    }
+}
+
+/// Consume a whole `<w:drawing>` subtree (its open tag already seen) up to
+/// `</w:drawing>` and resolve it to inline or floating markup.
+///
+/// Detection: an enclosed `wp:anchor` means a floating object → absolute
+/// `<div>`; otherwise (`wp:inline`, or a bare drawing) the content stays inline.
+/// The drawing's body is either an image (`a:blip`) or a Word/VML text box
+/// (`w:txbxContent`, reached through `mc:AlternateContent`/`wps:txbx`/
+/// `v:textbox`) — the text box is rendered as its own styled box (the
+/// "encadré"). For a float we wrap whatever body we built in the absolutely-
+/// positioned `<div>`; inline drawings emit the body as-is.
+fn docx_drawing(x: &mut Xml, ctx: &DocxCtx) -> DrawingResult {
+    let mut anchored = false;
+    let mut anchor = AnchorBox::default();
+    // Which axis a `wp:posOffset`/`wp:align` we are reading belongs to.
+    let mut cur_axis: Option<bool> = None; // Some(true)=H, Some(false)=V
+    let mut body = String::new();
+    // True while inside `wp:extent` so a stray `a:ext` (image scale) cannot
+    // override the drawing's declared footprint.
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "anchor" => anchored = true,
+                "extent" => {
+                    // `wp:extent@cx/@cy` is the drawing's overall size (EMU).
+                    anchor.w = attr(&attrs, "cx").and_then(emu_to_pt).or(anchor.w);
+                    anchor.h = attr(&attrs, "cy").and_then(emu_to_pt).or(anchor.h);
+                }
+                "positionH" => cur_axis = Some(true),
+                "positionV" => cur_axis = Some(false),
+                "align" => {} // value arrives as the element's text node
+                "posOffset" => {} // value arrives as the element's text node
+                // A blip inside the drawing → embed the referenced image.
+                "blip" => {
+                    if let Some(tag) = blip_img(ctx, &attrs) {
+                        body.push_str(&tag);
+                    }
+                }
+                // A Word/VML text box: render its paragraphs as a styled box.
+                "txbxContent" if !sc => {
+                    let mut inner = String::new();
+                    docx_walk(x, ctx, &mut inner, Some("txbxContent"));
+                    if !inner.trim().is_empty() {
+                        body.push_str(&format!(
+                            "<div style=\"border:1px solid #000;padding:2pt\">{inner}</div>"
+                        ));
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "drawing" {
+                    break;
+                }
+            }
+            Tok::Text(t) => {
+                // `wp:posOffset` / `wp:align` carry their value as text; route it
+                // to the current axis (H/V) set by the enclosing position element.
+                let v = t.trim();
+                if v.is_empty() {
+                    continue;
+                }
+                if let Ok(emu) = v.parse::<f64>() {
+                    let pts = emu / EMU_PER_PT;
+                    match cur_axis {
+                        Some(true) => anchor.off_x = Some(pts),
+                        Some(false) => anchor.off_y = Some(pts),
+                        None => {}
+                    }
+                } else {
+                    let kw = match v {
+                        "left" | "center" | "right" => Some(v),
+                        "top" => Some("top"),
+                        "bottom" => Some("bottom"),
+                        _ => None,
+                    };
+                    if let Some(k) = kw {
+                        // Map borrowed slice to a 'static keyword for storage.
+                        let s: &'static str = match k {
+                            "left" => "left",
+                            "center" => "center",
+                            "right" => "right",
+                            "top" => "top",
+                            "bottom" => "bottom",
+                            _ => "left",
+                        };
+                        match cur_axis {
+                            Some(true) => anchor.align_h = Some(s),
+                            Some(false) => anchor.align_v = Some(s),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if body.trim().is_empty() {
+        return DrawingResult::Empty;
+    }
+    if anchored {
+        DrawingResult::Float(format!("<div style=\"{}\">{body}</div>", anchor.abs_style()))
+    } else {
+        DrawingResult::Inline(body)
+    }
+}
+
+/// Resolve an `a:blip@r:embed`/`@r:link` to an `<img>` data-URI via the document
+/// relationships + media, or `None` when the target is missing/unsupported.
+fn blip_img(ctx: &DocxCtx, attrs: &[(String, String)]) -> Option<String> {
+    let rid = attr(attrs, "embed").or_else(|| attr(attrs, "link"))?;
+    ctx.rels
+        .get(rid)
+        .map(|t| resolve_target("word", t))
+        .and_then(|k| img_tag(ctx.zip, &k))
+}
+
 /// Emit one `w:p` (already consumed its open tag) until `</w:p>`.
 fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut ListCounters) {
     let mut heading: Option<u8> = None;
@@ -2342,6 +2526,14 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
     let mut depth = 0i32; // nesting of <w:r> runs (to scope rPr)
     let mut field_instr = String::new(); // accumulating <w:instrText>
     let mut in_instr = false;
+    // Absolutely-positioned drawings (`wp:anchor`) collected here and flushed as
+    // paragraph siblings after the `<p>`, so they keep their page position
+    // instead of being trapped in the text flow.
+    let mut floats = String::new();
+    // `w:pPr/w:pageBreakBefore` → this paragraph starts a new page.
+    let mut page_break_before = false;
+    // A run-level `<w:br w:type="page"/>` → force a new page after this paragraph.
+    let mut page_break_after = false;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -2349,6 +2541,19 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                 let ln = local(&name);
                 match ln {
                     "pPr" if !sc => in_ppr = true,
+                    "pageBreakBefore" if in_ppr => {
+                        // `w:val="0"`/`"false"` cancels an inherited page break.
+                        page_break_before =
+                            !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                    }
+                    "sectPr" if in_ppr => {
+                        // A section break carried on a paragraph (`w:pPr/w:sectPr`)
+                        // ends a section: the following content starts a new page
+                        // (the default `nextPage` section start). The document's
+                        // final `w:sectPr` is a direct `w:body` child, not here, so
+                        // this never adds a spurious trailing page.
+                        page_break_after = true;
+                    }
                     "rPr" if !sc => in_rpr = true,
                     "pStyle" => {
                         if in_ppr {
@@ -2437,17 +2642,26 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                         in_instr = true;
                     }
                     "tab" => inner.push(' '),
+                    "br" if matches!(attr(&attrs, "type"), Some("page")) => {
+                        // An explicit run-level page break (`<w:br w:type="page"/>`)
+                        // ends the current line and forces a new page after this
+                        // paragraph (flushed as a sibling so the break is a real
+                        // block boundary, not nested in `<p>`).
+                        inner.push_str("<br>");
+                        page_break_after = true;
+                    }
                     "br" | "cr" => inner.push_str("<br>"),
+                    // A drawing: inline images stay in the run; anchored
+                    // (floating) objects are lifted into absolute siblings.
+                    "drawing" if !sc => match docx_drawing(x, ctx) {
+                        DrawingResult::Inline(tag) => inner.push_str(&tag),
+                        DrawingResult::Float(div) => floats.push_str(&div),
+                        DrawingResult::Empty => {}
+                    },
+                    // Bare blip outside a `<w:drawing>` (legacy/VML) → inline image.
                     "blip" => {
-                        if let Some(rid) = attr(&attrs, "embed").or_else(|| attr(&attrs, "link")) {
-                            if let Some(tag) = ctx
-                                .rels
-                                .get(rid)
-                                .map(|t| resolve_target("word", t))
-                                .and_then(|k| img_tag(ctx.zip, &k))
-                            {
-                                inner.push_str(&tag);
-                            }
+                        if let Some(tag) = blip_img(ctx, &attrs) {
+                            inner.push_str(&tag);
                         }
                     }
                     _ => {}
@@ -2507,6 +2721,12 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
         }
     }
 
+    // A `w:pageBreakBefore` paragraph opens a new page: emit a block break
+    // *before* the paragraph so the engine advances to the next page boundary.
+    if page_break_before {
+        out.push_str(PAGE_BREAK_DIV);
+    }
+
     let trimmed = inner.trim();
     let para_attr = para.style_attr_with(&resolved);
     match heading {
@@ -2518,7 +2738,22 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
             out.push_str(&format!("<p{para_attr}>{inner}</p>"));
         }
     }
+
+    // A run-level `<w:br w:type="page"/>` forces the next page *after* this
+    // paragraph's content.
+    if page_break_after {
+        out.push_str(PAGE_BREAK_DIV);
+    }
+
+    // Anchored (floating) drawings ride along as paragraph siblings: being
+    // out-of-flow (`position:absolute`), they anchor to the page content box at
+    // their own coordinates regardless of where they sit in the body stream.
+    out.push_str(&floats);
 }
+
+/// A block element the HTML engine treats as a hard page break
+/// (`page-break-before: always`); used for DOCX explicit page breaks.
+const PAGE_BREAK_DIV: &str = "<div style=\"page-break-before:always\"></div>";
 
 /// Resolve a list paragraph's marker: the formatted ordinal from `numbering.xml`
 /// (advancing the running counter), or a bullet when the format is bullet/
@@ -7651,6 +7886,225 @@ mod tests {
             body.contains("<img src=\"data:image/png;base64,"),
             "image embedded as data URI: {body}"
         );
+    }
+
+    // ── DOCX wave 2: floating/anchored objects + page breaks ──
+
+    /// Render a DOCX body that references media, so anchored-image markup
+    /// (the absolute wrapper around an `<img>`) can be asserted on.
+    fn docx_html_with_media(document_xml: &str, rels_xml: &str, media: &[(&str, Vec<u8>)]) -> String {
+        let mut zip: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for (k, v) in media {
+            zip.insert((*k).to_string(), v.clone());
+        }
+        let rels = parse_rels(rels_xml);
+        let styles = DocxStyles::default();
+        let numbering = DocxNumbering::default();
+        let footnotes = DocxFootnotes::default();
+        let ctx = DocxCtx {
+            zip: &zip,
+            rels: &rels,
+            styles: &styles,
+            numbering: &numbering,
+            footnotes: &footnotes,
+        };
+        let mut body = String::new();
+        docx_body(document_xml, &ctx, &mut body);
+        body
+    }
+
+    #[test]
+    fn docx_anchored_drawing_emits_absolute_at_offset() {
+        // wp:anchor with posOffset X=914400 EMU (72pt), Y=457200 (36pt) and
+        // wp:extent cx=1828800 (144pt), cy=914400 (72pt). The image must be
+        // wrapped in a position:absolute div at left:72pt;top:36pt.
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z" xmlns:wp="wp"><w:body>
+            <w:p><w:r><w:drawing>
+              <wp:anchor>
+                <wp:extent cx="1828800" cy="914400"/>
+                <wp:positionH relativeFrom="page"><wp:posOffset>914400</wp:posOffset></wp:positionH>
+                <wp:positionV relativeFrom="page"><wp:posOffset>457200</wp:posOffset></wp:positionV>
+                <a:blip r:embed="rId7"/>
+              </wp:anchor>
+            </w:drawing></w:r></w:p>
+          </w:body></w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId7" Type="image" Target="media/logo.png"/>
+        </Relationships>"#;
+        let html = docx_html_with_media(doc, rels, &[("word/media/logo.png", red_png())]);
+        assert!(html.contains("position:absolute"), "absolute wrapper: {html}");
+        assert!(html.contains("left:72pt"), "left 72pt: {html}");
+        assert!(html.contains("top:36pt"), "top 36pt: {html}");
+        assert!(html.contains("width:144pt"), "extent w 144pt: {html}");
+        assert!(html.contains("height:72pt"), "extent h 72pt: {html}");
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "image embedded inside the float: {html}"
+        );
+        // The absolute div is a paragraph sibling, not nested inside <p>.
+        let p_open = html.find("<p").unwrap();
+        let abs = html.find("position:absolute").unwrap();
+        let p_close = html.find("</p>").unwrap();
+        assert!(abs > p_close || abs < p_open, "float is a sibling of <p>: {html}");
+    }
+
+    #[test]
+    fn docx_inline_drawing_stays_in_flow_not_absolute() {
+        // A wp:inline drawing (no anchor) must remain an inline <img>, never
+        // an absolute wrapper — guards the existing inline-image behaviour.
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z" xmlns:wp="wp"><w:body>
+            <w:p><w:r><w:drawing>
+              <wp:inline><wp:extent cx="914400" cy="914400"/><a:blip r:embed="rId3"/></wp:inline>
+            </w:drawing></w:r></w:p>
+          </w:body></w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId3" Type="image" Target="media/p.png"/>
+        </Relationships>"#;
+        let html = docx_html_with_media(doc, rels, &[("word/media/p.png", red_png())]);
+        assert!(
+            !html.contains("position:absolute"),
+            "inline drawing must stay in flow: {html}"
+        );
+        assert!(html.contains("<img src=\"data:image/png;base64,"), "inline img: {html}");
+    }
+
+    #[test]
+    fn docx_anchored_textbox_becomes_absolute_frame() {
+        // A wp:anchor wrapping a w:txbxContent (a Word text box / "encadré")
+        // must surface as an absolutely-positioned box carrying its text.
+        let doc = r#"<w:document xmlns:w="x" xmlns:wp="wp" xmlns:mc="mc" xmlns:wps="wps"><w:body>
+            <w:p><w:r><w:drawing>
+              <wp:anchor>
+                <wp:extent cx="2540000" cy="635000"/>
+                <wp:positionH relativeFrom="margin"><wp:posOffset>635000</wp:posOffset></wp:positionH>
+                <wp:positionV relativeFrom="margin"><wp:posOffset>1270000</wp:posOffset></wp:positionV>
+                <mc:AlternateContent><mc:Choice><wps:wsp><wps:txbx><w:txbxContent>
+                  <w:p><w:r><w:t>Boxed note</w:t></w:r></w:p>
+                </w:txbxContent></wps:txbx></wps:wsp></mc:Choice></mc:AlternateContent>
+              </wp:anchor>
+            </w:drawing></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(html.contains("position:absolute"), "absolute frame: {html}");
+        // posOffset 635000 EMU = 50pt, 1270000 EMU = 100pt.
+        assert!(html.contains("left:50pt"), "frame x=50pt: {html}");
+        assert!(html.contains("top:100pt"), "frame y=100pt: {html}");
+        assert!(html.contains("width:200pt"), "extent w=200pt: {html}");
+        assert!(html.contains("Boxed note"), "text box content kept: {html}");
+        assert!(html.contains("border:1px solid"), "rendered as a framed box: {html}");
+    }
+
+    #[test]
+    fn docx_anchor_align_keywords_map_to_edges() {
+        // wp:align right/bottom → pin to the right/bottom edge of the box.
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z" xmlns:wp="wp"><w:body>
+            <w:p><w:r><w:drawing>
+              <wp:anchor>
+                <wp:extent cx="914400" cy="914400"/>
+                <wp:positionH relativeFrom="margin"><wp:align>right</wp:align></wp:positionH>
+                <wp:positionV relativeFrom="margin"><wp:align>bottom</wp:align></wp:positionV>
+                <a:blip r:embed="rId1"/>
+              </wp:anchor>
+            </w:drawing></w:r></w:p>
+          </w:body></w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId1" Type="image" Target="media/c.png"/>
+        </Relationships>"#;
+        let html = docx_html_with_media(doc, rels, &[("word/media/c.png", red_png())]);
+        assert!(html.contains("position:absolute"), "absolute: {html}");
+        assert!(html.contains("right:0pt"), "align right → right edge: {html}");
+        assert!(html.contains("bottom:0pt"), "align bottom → bottom edge: {html}");
+    }
+
+    #[test]
+    fn docx_run_page_break_forces_new_page() {
+        // <w:br w:type="page"/> must emit a hard page break after the paragraph.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>Page one</w:t></w:r><w:r><w:br w:type="page"/></w:r></w:p>
+            <w:p><w:r><w:t>Page two</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            html.contains("page-break-before:always"),
+            "explicit page break emitted: {html}"
+        );
+        // The break sits between the two paragraphs.
+        let one = html.find("Page one").unwrap();
+        let brk = html.find("page-break-before:always").unwrap();
+        let two = html.find("Page two").unwrap();
+        assert!(one < brk && brk < two, "break between the pages: {html}");
+        // A plain in-paragraph soft break stays a <br>, not a page break.
+        let soft = docx_html(
+            r#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>a</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>b</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        assert!(soft.contains("<br>") && !soft.contains("page-break"), "soft break: {soft}");
+    }
+
+    #[test]
+    fn docx_page_break_before_paragraph_starts_new_page() {
+        // w:pPr/w:pageBreakBefore → a hard break right before the paragraph.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>Section A</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>Section B</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        let a = html.find("Section A").unwrap();
+        let brk = html.find("page-break-before:always").unwrap();
+        let b = html.find("Section B").unwrap();
+        assert!(a < brk && brk < b, "break precedes Section B: {html}");
+    }
+
+    #[test]
+    fn docx_section_break_paragraph_starts_new_page() {
+        // A paragraph carrying w:pPr/w:sectPr ends a section → next page.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>End of section one</w:t></w:r></w:p>
+            <w:p><w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:pPr></w:p>
+            <w:p><w:r><w:t>Start of section two</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let html = docx_html(doc);
+        assert!(
+            html.contains("page-break-before:always"),
+            "intermediate sectPr forces a page break: {html}"
+        );
+        let one = html.find("End of section one").unwrap();
+        let brk = html.find("page-break-before:always").unwrap();
+        let two = html.find("Start of section two").unwrap();
+        assert!(one < brk && brk < two, "break between sections: {html}");
+    }
+
+    #[test]
+    fn docx_anchor_and_page_break_render_to_multipage_pdf_end_to_end() {
+        // Full pipeline (parse → HTML → layout → PDF): an anchored image plus a
+        // hard page break must yield a valid, multi-page PDF without panicking.
+        let doc = r#"<?xml version="1.0"?>
+<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z" xmlns:wp="wp"><w:body>
+  <w:p><w:r><w:t>First page body</w:t></w:r></w:p>
+  <w:p><w:r><w:drawing>
+    <wp:anchor>
+      <wp:extent cx="914400" cy="914400"/>
+      <wp:positionH relativeFrom="page"><wp:posOffset>457200</wp:posOffset></wp:positionH>
+      <wp:positionV relativeFrom="page"><wp:posOffset>457200</wp:posOffset></wp:positionV>
+      <a:blip r:embed="rId4"/>
+    </wp:anchor>
+  </w:drawing></w:r></w:p>
+  <w:p><w:r><w:br w:type="page"/></w:r></w:p>
+  <w:p><w:r><w:t>Second page body</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId4" Type="image" Target="media/anchor.png"/>
+        </Relationships>"#;
+        let bytes = build_docx(doc, Some(rels), &[("word/media/anchor.png", red_png())]);
+        let pdf = office_to_pdf(&bytes).expect("docx converts");
+        let document = opens(&pdf);
+        assert!(
+            document.page_count() >= 2,
+            "hard page break splits into >=2 pages (got {})",
+            document.page_count()
+        );
+        let text = norm(&document.to_text());
+        assert!(text.contains("First page body"), "first page text: {text}");
+        assert!(text.contains("Second page body"), "second page text: {text}");
     }
 
     #[test]
