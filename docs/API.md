@@ -204,18 +204,14 @@ residual Z1/Z3 edge-filter gap remains), and the lossless WHT path at `q ≤ 20`
 | `search(query,case_insensitive) -> Vec<SearchMatch>` | `gp_search_json(handle,ptr,len,ci,outlen)` | match lines + highlight boxes |
 | _(OCR removed from core/WASM)_ | — | OCR is host-side: **`gigapdf-ocr-rten`** crate (PaddleOCR PP-OCR on pure-Rust RTen, 13 langs + auto script selection). See [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md) |
 
-OCR uses the built-in recognizer (no Tesseract): Otsu → connected components →
-line/word segmentation → a compact CNN trained offline on EMNIST (handwriting) +
-synthetic font glyphs (printed + accented Latin). Use `scale ≥ 2.0` for small text.
-For pages that already carry a text layer, `structured_text` / `search` are exact and
-faster. A second **line-level CRNN+CTC** recognizer (opt-in via the `ocr-*` Cargo
-features — `ocr-alpha` = Latin-extended + Cyrillic + Greek, **trained**;
-`ocr-cjk`/`ocr-arabic`/`ocr-deva`/… infra-ready) removes per-glyph segmentation and is
-competitive with Tesseract on clean multi-script print. `ocr()` routes to it when a model
-is embedded and falls back to the mono-glyph CNN otherwise — same ABI, no signature
-change. See [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md),
-[`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md) and
-[`OCR_TRAINING_LOG.md`](./OCR_TRAINING_LOG.md).
+OCR is **not** in the pure-`std` core/WASM. It runs host-side in the **`gigapdf-ocr-rten`**
+crate — PaddleOCR PP-OCR (DBNet detect + SVTR/CRNN recognize) on the pure-Rust **RTen**
+runtime (no C++, no Tesseract), 13 languages incl. Hebrew + automatic per-line script
+selection. API: `OcrEngine::ocr_pdf_page(&Document, page, scale) -> Vec<OcrWord>` (boxes in
+PDF user space) / `recognize_page(&img)`. For pages that already carry a text layer,
+`structured_text` / `search` are exact and faster. See
+[`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and
+[`../crates/ocr-rten/README.md`](../crates/ocr-rten/README.md).
 
 ## Conversions
 

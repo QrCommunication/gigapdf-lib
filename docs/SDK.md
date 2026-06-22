@@ -342,13 +342,12 @@ the art). Run it natively and expose it as an endpoint; this SDK keeps the
 extraction/search APIs (`extractText`, `structuredText`, `search`, `addTextLayer`)
 for PDFs that already carry text. See [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md).
 
-> **Default engine:** Latin (printed + handwritten), mono-glyph. **Opt-in CRNN+CTC
-> engine** (line-level, multi-script): group `alpha` = Latin-extended + Cyrillic + Greek
-> is **trained** and competitive with Tesseract on clean print; CJK / Arabic-Hebrew /
-> Indic are infra-ready. Enabled at build time via the engine's `ocr-*` Cargo features,
-> with the same SDK API. See [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md),
-> [`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md) and
-> [`OCR_TRAINING_LOG.md`](./OCR_TRAINING_LOG.md).
+> **Engine:** host-side `gigapdf-ocr-rten` — PaddleOCR PP-OCR (DBNet detect + SVTR/CRNN
+> recognize) on the pure-Rust **RTen** runtime (no C++, no Tesseract). 13 languages incl.
+> Hebrew + Arabic (RTL), CJK, Cyrillic, Devanagari, Tamil/Telugu/Kannada, Latin — with
+> automatic per-line script selection. Not part of this WASM SDK (native engine). See
+> [`OCR_ARCHITECTURE.md`](./OCR_ARCHITECTURE.md) and
+> [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md).
 
 ### Security
 
@@ -381,8 +380,6 @@ import type {
   GigaGeneric, GigaBlockAddr, GigaStylePatch, GigaCellValue, ModelOp,
 } from "@qrcommunication/gigapdf-lib";
 ```
-
-Runtime exports (not just types): `ALL_OCR_SCRIPTS` (every trained OCR script).
 
 See also: [COOKBOOK.md](COOKBOOK.md) (task-oriented recipes), [USAGE.md](USAGE.md)
 (raw buffer ABI), [API.md](API.md) (Rust + WASM ABI), [HTML-CSS.md](HTML-CSS.md)

@@ -327,25 +327,24 @@ invisible (render-mode 3) text layer so the result becomes selectable and
 searchable.
 
 OCR now runs **host-side** in the **`gigapdf-ocr-rten`** crate (PaddleOCR + RTen,
-13 languages incl. Hebrew + automatic per-line script selection). Recognize a
-rasterized page there, then stamp the words back with this SDK's `addTextLayer`:
+13 languages incl. Hebrew + automatic per-line script selection). `ocr_pdf_page`
+rasterizes the page, recognizes it, and returns words already in **PDF user space**
+— then stamp an invisible text layer to make the scan searchable:
 
 ```rust
-// Native (server-side): recognize the page image with the RTen+PaddleOCR engine.
+// Native (server-side): OCR a PDF page end-to-end with the RTen+PaddleOCR engine.
+let doc = gigapdf_core::Document::open(&scanned_pdf)?;
 let eng = gigapdf_ocr_rten::OcrEngine::load_models_dir("models")?;
-let lines = eng.recognize_page(&page_rgb)?; // [{ bbox, text, confidence, model }]
+let words = eng.ocr_pdf_page(&doc, page, 2.0)?; // OcrWord{ text,x,y,width,height,confidence,model }
+// `words` map straight onto the SDK's addTextLayer (PDF user space, bottom-left):
+//   addTextLayer(page, words.map(w => ({ x: w.x, y: w.y, size: w.height, text: w.text })))
 ```
 
 ```ts
-// Then, in the SDK: stamp an invisible (render-mode 3) text layer so the PDF
-// becomes selectable + searchable. Map each line's box to PDF user space.
+// In a JS/Node host, send the page to your OCR service (the native engine above)
+// and stamp the returned words as an invisible (render-mode 3) layer via this SDK:
 const doc = giga.open(scannedPdf);
-doc.addTextLayer(page, lines.map((l) => ({
-  x: l.bbox.x0 / scale,
-  y: height - l.bbox.y1 / scale,
-  size: (l.bbox.y1 - l.bbox.y0) / scale,
-  text: l.text,
-})));
+doc.addTextLayer(page, words.map((w) => ({ x: w.x, y: w.y, size: w.height, text: w.text })));
 const searchable = doc.save();
 doc.close();
 ```
