@@ -139,6 +139,26 @@ export class GigaPdfEngine {
     return (s ? JSON.parse(s) : []) as T;
   }
   /**
+   * Like {@link _json} but distinguishes a **null** result (the export returned a
+   * null pointer — e.g. an unrecognized container) from a present-but-empty JSON
+   * payload (`[]` / `{}`). Returns `null` only for the null pointer; otherwise the
+   * parsed JSON. Used where the Rust side is `Option<…>` and "nothing" and
+   * "unrecognized" must stay distinct.
+   */
+  _jsonOrNull<T = unknown>(call: (outLenPtr: number) => number): T | null {
+    const lenPtr = this.ex.gp_alloc(4);
+    const dataPtr = call(lenPtr);
+    if (dataPtr === 0) {
+      this.ex.gp_free(lenPtr, 4);
+      return null;
+    }
+    const len = this.dv().getUint32(lenPtr, true);
+    const s = dec.decode(this.u8().slice(dataPtr, dataPtr + len));
+    this.ex.gp_free(dataPtr, len);
+    this.ex.gp_free(lenPtr, 4);
+    return (s ? JSON.parse(s) : []) as T;
+  }
+  /**
    * Decode standard Base64 (RFC 4648) to bytes. Pure-JS table decode, so it
    * works identically in Node and the browser with no dependency (used to turn
    * the JSON `dataBase64` of {@link GigaPdfDoc.attachments} back into bytes).
@@ -273,6 +293,19 @@ export class GigaPdfEngine {
   officeToPdf(office: Uint8Array): Uint8Array {
     return this._withBytes(office, (p, l) =>
       this._buffer((o) => this.ex.gp_office_to_pdf(p, l, o))
+    );
+  }
+  /**
+   * Phase 1 for {@link officeToPdf} — the Google/system fonts an Office container
+   * **references but doesn't embed**. Download each `url` (→ TTF) and supply the
+   * bytes back to the host font cache so {@link officeToPdf}'s styled runs lay out
+   * with the right metrics. Faces the container embeds itself are de-obfuscated
+   * and used automatically (not listed here). Returns `null` if the bytes are not
+   * a recognized Office container, `[]` if it needs no host fonts.
+   */
+  officeNeededFonts(office: Uint8Array): HtmlFontRequest[] | null {
+    return this._withBytes(office, (p, l) =>
+      this._jsonOrNull<HtmlFontRequest[]>((o) => this.ex.gp_office_needed_fonts(p, l, o))
     );
   }
   /**

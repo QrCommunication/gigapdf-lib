@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.63.0] - 2026-06-22
 
+### Added
+
+- **Office→PDF now embeds the document's own fonts** — a self-embedding DOCX/PPTX/
+  XLSX (`word|ppt|xl/fonts/*.odttf`, de-obfuscated per ECMA-376 §17.8.1) or ODT/
+  ODS/ODP (`Fonts/*`, plain TTF/OTF) renders with its **own** typefaces — exact
+  glyphs and metrics, no reflow drift — instead of the bundled Liberation
+  fallback. Extraction feeds those faces into the HTML renderer for every Office
+  mapper. Self-embedded files now render identically offline with **no** host
+  round-trip.
+- **`officeNeededFonts(office)` / `gp_office_needed_fonts`** — phase-1 for
+  `officeToPdf`: returns the Google/system fonts a container **references but
+  doesn't embed** (`HtmlFontRequest[]`: `{family, weight, italic, url}`), so the
+  host can fetch them and supply them to its font cache for correct metrics. Faces
+  the container embeds itself, and the base-14 standards, are excluded. Returns
+  `null` for an unrecognized archive, `[]` when nothing is needed. Mirrors
+  `htmlNeededFonts` for the Office path.
+
 ### Changed
 
 - **Added base-14 text references the standard font instead of embedding a

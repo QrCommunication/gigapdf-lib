@@ -15,7 +15,7 @@
 //! best-effort text-only path for legacy OLE2 `.doc/.xls/.ppt`.
 
 use super::zip::read_zip;
-use crate::html::{Margins, RenderOptions};
+use crate::html::{FontRequest, Margins, ProvidedFont, RenderOptions};
 use std::collections::BTreeMap;
 
 // ─────────────────────────────── page geometry ────────────────────────────────
@@ -95,12 +95,29 @@ fn clamp_page_dim(pt: f64) -> f64 {
 }
 
 /// Render the generated `html` body through the HTML→PDF engine using the
-/// resolved page geometry. Fonts are host-supplied via the engine's two-phase
-/// contract ([`crate::html::needed_fonts`]); this in-engine path has no font
-/// bytes of its own, so it passes an empty set — the real `font-family` names
-/// injected into the HTML let the host resolve and embed the matching faces.
+/// resolved page geometry, with **no document-embedded fonts**.
+///
+/// Families the document *references* (Calibri, Arial, …) are still resolved by
+/// the host via the engine's two-phase contract ([`office_needed_fonts`]); the
+/// real `font-family` names injected into the HTML let the host fetch and embed
+/// the matching faces. Use [`render_geom_with_fonts`] to additionally pass faces
+/// extracted from inside the container so a self-embedding document renders with
+/// its own typefaces (exact glyphs + metrics) — no host round-trip needed.
 fn render_geom(body: &str, geom: PageGeom) -> Vec<u8> {
-    crate::html::render_with(&html_doc(body), &[], &geom.render_options())
+    render_geom_with_fonts(body, geom, &[])
+}
+
+/// Like [`render_geom`] but feeds the [`ProvidedFont`](crate::html::ProvidedFont)
+/// faces extracted from the Office container (DOCX/PPTX `word|ppt/fonts/*.odttf`
+/// de-obfuscated, ODF `Fonts/*`) into the renderer. A run whose `font-family`
+/// matches an extracted face is then laid out and painted with that exact face
+/// (true advance widths + glyphs) instead of the bundled Liberation fallback.
+fn render_geom_with_fonts(
+    body: &str,
+    geom: PageGeom,
+    fonts: &[crate::html::ProvidedFont],
+) -> Vec<u8> {
+    crate::html::render_with(&html_doc(body), fonts, &geom.render_options())
 }
 
 /// Auto-detect an Office container and render it to a styled PDF, or `None` if
@@ -1891,6 +1908,383 @@ fn resolve_target(base: &str, target: &str) -> String {
     }
 }
 
+// ════════════════════════ embedded-font extraction ════════════════════════════
+//
+// A self-embedding Office file ships the actual typefaces it uses inside the
+// container, so it renders identically anywhere — even offline, even with fonts
+// the host doesn't have. We surface those faces as the renderer's
+// [`ProvidedFont`]s so the layout uses their *real* advance widths (no reflow
+// drift) and the painter draws their *real* glyphs (not the Liberation
+// fallback).
+//
+// Two embedding schemes:
+//   • OOXML (DOCX/PPTX): `word|ppt/fontTable.xml` lists `<w:font w:name="…">`
+//     with `<w:embedRegular|Bold|Italic|BoldItalic r:id w:fontKey>`. Each `r:id`
+//     resolves (via the sibling `_rels`) to `…/fonts/fontN.odttf` — an
+//     **obfuscated** TTF/OTF whose first 32 bytes are XORed with the GUID
+//     (ECMA-376 §17.8.1). We de-obfuscate, then validate as a font program.
+//   • ODF (ODT/ODS/ODP): `Fonts/*` holds plain TTF/OTF; `content.xml`/`styles.xml`
+//     `<style:font-face><svg:font-face-src><svg:font-face-uri xlink:href="…">`
+//     names the family and points at the file.
+
+/// Every embedded face we could extract from the container, ready to hand to the
+/// renderer. The `family` is the **raw** typeface name (matched case-insensitively
+/// against the run `font-family` the HTML carries); `weight`/`italic` pick the
+/// nearest face for a styled run. Empty when the document embeds no fonts (the
+/// common case) — then referenced families are resolved by the host instead.
+fn extract_embedded_fonts(zip: &BTreeMap<String, Vec<u8>>) -> Vec<ProvidedFont> {
+    if zip.contains_key("word/fontTable.xml") {
+        ooxml_embedded_fonts(zip, "word")
+    } else if zip.contains_key("ppt/fontTable.xml") {
+        ooxml_embedded_fonts(zip, "ppt")
+    } else if zip.contains_key("xl/fontTable.xml") {
+        // Rare, but XLSX can embed fonts the same way.
+        ooxml_embedded_fonts(zip, "xl")
+    } else if zip.contains_key("mimetype") {
+        odf_embedded_fonts(zip)
+    } else {
+        Vec::new()
+    }
+}
+
+/// A single `<w:embed…>` reference recovered from an OOXML `fontTable.xml`:
+/// which face of `family` it is, the relationship id pointing at the obfuscated
+/// font part, and the GUID used to de-obfuscate it.
+struct OoxmlFontRef {
+    family: String,
+    bold: bool,
+    italic: bool,
+    rel_id: String,
+    font_key: Option<String>,
+}
+
+/// Parse `<base>/fontTable.xml`, resolve each embedded face through the sibling
+/// `_rels`, de-obfuscate the `.odttf` part, and return the validated faces.
+fn ooxml_embedded_fonts(zip: &BTreeMap<String, Vec<u8>>, base: &str) -> Vec<ProvidedFont> {
+    let table = part(zip, &format!("{base}/fontTable.xml"));
+    if table.is_empty() {
+        return Vec::new();
+    }
+    let rels = zip
+        .get(&format!("{base}/_rels/fontTable.xml.rels"))
+        .map(|b| parse_rels(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for r in parse_ooxml_font_table(&table) {
+        let Some(target) = rels.get(&r.rel_id) else {
+            continue;
+        };
+        let key = resolve_target(base, target);
+        let Some(raw) = zip.get(&key) else { continue };
+        // De-obfuscate when a GUID is present (OOXML obfuscated `.odttf`);
+        // a missing key means the part is a plain font program already.
+        let program = match r.font_key.as_deref().and_then(parse_guid) {
+            Some(guid) => deobfuscate_odttf(raw, &guid),
+            None => raw.clone(),
+        };
+        if let Some(font) = make_provided_font(&r.family, r.bold, r.italic, program) {
+            out.push(font);
+        }
+    }
+    out
+}
+
+/// Walk an OOXML `fontTable.xml`, emitting one [`OoxmlFontRef`] per embedded
+/// face. Inside each `<w:font w:name="…">` the embed elements
+/// (`w:embedRegular|Bold|Italic|BoldItalic`) carry the `r:id` and `w:fontKey`.
+fn parse_ooxml_font_table(xml: &str) -> Vec<OoxmlFontRef> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None; // family of the open <w:font>
+    let mut x = Xml::new(xml);
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "font" => current = attr(&attrs, "name").map(|s| s.to_string()),
+                tag @ ("embedRegular" | "embedBold" | "embedItalic" | "embedBoldItalic") => {
+                    if let (Some(fam), Some(id)) =
+                        (current.as_ref(), attr(&attrs, "id").or_else(|| attr(&attrs, "rid")))
+                    {
+                        let (bold, italic) = match tag {
+                            "embedBold" => (true, false),
+                            "embedItalic" => (false, true),
+                            "embedBoldItalic" => (true, true),
+                            _ => (false, false),
+                        };
+                        out.push(OoxmlFontRef {
+                            family: fam.clone(),
+                            bold,
+                            italic,
+                            rel_id: id.to_string(),
+                            font_key: attr(&attrs, "fontKey").map(|s| s.to_string()),
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "font" => current = None,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parse an OOXML obfuscation GUID (`{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`)
+/// into its 16 raw bytes in **string order** — i.e. the first hex pair is byte 0.
+/// The de-obfuscation XOR key reverses this (see [`deobfuscate_odttf`]). Returns
+/// `None` unless exactly 32 hex digits are present.
+fn parse_guid(guid: &str) -> Option<[u8; 16]> {
+    let hex: Vec<u8> = guid
+        .bytes()
+        .filter(|b| b.is_ascii_hexdigit())
+        .collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = (hex[i * 2] as char).to_digit(16)? as u8;
+        let lo = (hex[i * 2 + 1] as char).to_digit(16)? as u8;
+        *byte = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+/// De-obfuscate an OOXML embedded font part (`.odttf`). ECMA-376 §17.8.1: the
+/// first **32 bytes** of the program are XORed with a 16-byte key derived from
+/// the `fontKey` GUID, applied twice (bytes 0..16 and 16..32). The GUID bytes
+/// are used in **reverse** of their textual order, which is exactly the
+/// little-endian layout of the GUID's hex string read back-to-front. The rest of
+/// the file is the untouched TTF/OTF program.
+fn deobfuscate_odttf(data: &[u8], guid_str_order: &[u8; 16]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    // Key = GUID bytes in reverse string order.
+    let mut key = [0u8; 16];
+    for (i, k) in key.iter_mut().enumerate() {
+        *k = guid_str_order[15 - i];
+    }
+    let n = out.len().min(32);
+    for (i, b) in out.iter_mut().take(n).enumerate() {
+        *b ^= key[i % 16];
+    }
+    out
+}
+
+// ─────────────────────────────── ODF embedded fonts ───────────────────────────
+
+/// Extract embedded faces from an ODF package. The `<style:font-face>` entries in
+/// `content.xml`/`styles.xml` declare the family and (via
+/// `<svg:font-face-uri xlink:href>`) the `Fonts/*` part holding a plain TTF/OTF.
+/// Weight/italic are read from the font-face's `fo:font-weight`/`fo:font-style`.
+fn odf_embedded_fonts(zip: &BTreeMap<String, Vec<u8>>) -> Vec<ProvidedFont> {
+    let mut out: Vec<ProvidedFont> = Vec::new();
+    let mut seen: Vec<(String, bool, bool)> = Vec::new();
+    for part_name in ["content.xml", "styles.xml"] {
+        let xml = part(zip, part_name);
+        if xml.is_empty() {
+            continue;
+        }
+        for r in parse_odf_font_faces(&xml) {
+            let Some(raw) = zip.get(&r.href) else { continue };
+            let dedup = (r.family.to_ascii_lowercase(), r.bold, r.italic);
+            if seen.contains(&dedup) {
+                continue;
+            }
+            if let Some(font) = make_provided_font(&r.family, r.bold, r.italic, raw.clone()) {
+                seen.push(dedup);
+                out.push(font);
+            }
+        }
+    }
+    out
+}
+
+/// One embedded ODF face: family + weight/italic + the `Fonts/*` zip key.
+struct OdfFontRef {
+    family: String,
+    bold: bool,
+    italic: bool,
+    href: String,
+}
+
+/// Parse ODF `<style:font-face>` blocks into [`OdfFontRef`]s. A face is emitted
+/// only when it contains an `<svg:font-face-uri>` pointing at an embedded part
+/// (declarations without an embedded file are skipped — the family is still
+/// referenced and resolved by the host).
+fn parse_odf_font_faces(xml: &str) -> Vec<OdfFontRef> {
+    let mut out = Vec::new();
+    // State for the currently-open <style:font-face>.
+    let mut family: Option<String> = None;
+    let mut bold = false;
+    let mut italic = false;
+    let mut href: Option<String> = None;
+    let mut x = Xml::new(xml);
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, self_closing) => match local(&name) {
+                "font-face" => {
+                    family = attr(&attrs, "name")
+                        .or_else(|| attr(&attrs, "font-family"))
+                        .map(|s| s.trim_matches('\'').trim_matches('"').to_string());
+                    bold = attr(&attrs, "font-weight")
+                        .map(odf_weight_is_bold)
+                        .unwrap_or(false);
+                    italic = attr(&attrs, "font-style")
+                        .map(|s| matches!(s, "italic" | "oblique"))
+                        .unwrap_or(false);
+                    href = None;
+                }
+                "font-face-uri" => {
+                    if let Some(h) = attr(&attrs, "href") {
+                        href = Some(h.trim_start_matches('/').to_string());
+                    }
+                    // `<svg:font-face-uri>` is usually a container; the close is
+                    // handled below. If it self-closes, flush immediately.
+                    if self_closing {
+                        flush_odf_face(&family, bold, italic, &href, &mut out);
+                        href = None;
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "font-face-uri" => {
+                    flush_odf_face(&family, bold, italic, &href, &mut out);
+                    href = None;
+                }
+                "font-face" => {
+                    family = None;
+                    href = None;
+                    bold = false;
+                    italic = false;
+                }
+                _ => {}
+            },
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Emit an [`OdfFontRef`] when the open font-face has both a family and an href.
+fn flush_odf_face(
+    family: &Option<String>,
+    bold: bool,
+    italic: bool,
+    href: &Option<String>,
+    out: &mut Vec<OdfFontRef>,
+) {
+    if let (Some(fam), Some(h)) = (family, href) {
+        if !fam.is_empty() && !h.is_empty() {
+            out.push(OdfFontRef {
+                family: fam.clone(),
+                bold,
+                italic,
+                href: h.clone(),
+            });
+        }
+    }
+}
+
+/// ODF `fo:font-weight` → bold? Accepts `bold` and numeric weights (≥600).
+fn odf_weight_is_bold(w: &str) -> bool {
+    if w.eq_ignore_ascii_case("bold") {
+        return true;
+    }
+    w.parse::<u16>().map(|n| n >= 600).unwrap_or(false)
+}
+
+// ─────────────────────────── shared face construction ─────────────────────────
+
+/// Validate a (de-obfuscated / raw) font program and wrap it as a
+/// [`ProvidedFont`]. Accepts both glyf-TrueType and OpenType-CFF (`OTTO`) — the
+/// renderer embeds either — so a CFF-flavoured embedded face still renders with
+/// its real glyphs. Returns `None` for bytes that aren't a usable sfnt program.
+fn make_provided_font(family: &str, bold: bool, italic: bool, program: Vec<u8>) -> Option<ProvidedFont> {
+    let family = family.trim();
+    if family.is_empty() {
+        return None;
+    }
+    if !is_sfnt_font(&program) {
+        return None;
+    }
+    Some(ProvidedFont {
+        family: family.to_string(),
+        weight: if bold { 700 } else { 400 },
+        italic,
+        ttf: program,
+    })
+}
+
+/// Cheap structural check that `bytes` is a usable sfnt font program — glyf
+/// TrueType (`0x00010000` or `true`), an `OTTO` OpenType-CFF, or a `ttcf`
+/// collection. `parse_metrics` accepts all three (it tolerates the missing
+/// `glyf` of a CFF font), matching what the renderer's `embed_font` can embed.
+fn is_sfnt_font(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.get(0..4),
+        Some(b"\x00\x01\x00\x00") | Some(b"OTTO") | Some(b"true") | Some(b"ttcf")
+    ) && crate::font::truetype::TrueTypeFont::parse_metrics(bytes).is_some()
+}
+
+// ─────────────────────────── referenced fonts (phase 1) ───────────────────────
+
+/// The fonts an Office container **references but does not embed** — the set the
+/// host should fetch (Google Fonts / system) before [`office_to_pdf`] so styled
+/// runs lay out and paint with the right face. Families the container embeds
+/// itself ([`extract_embedded_fonts`]) and the base-14 standards are excluded:
+/// the former render from the embedded bytes, the latter from the bundled
+/// substitute — neither needs a host fetch.
+///
+/// Returns `None` for an unrecognized archive. Use this for the
+/// fetch-then-supply (two-phase) host flow; if you skip it, referenced-but-
+/// unembedded families fall back to the nearest bundled metric-compatible face.
+pub fn office_needed_fonts(bytes: &[u8]) -> Option<Vec<FontRequest>> {
+    // Legacy OLE2 carries no font program references we can resolve.
+    if bytes.len() >= 8 && bytes[..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+        return Some(Vec::new());
+    }
+    let zip = read_zip(bytes);
+    // Render to HTML once (per format) and ask the HTML engine which families it
+    // references; then drop the ones the container already embeds.
+    let body = office_body_html(&zip)?;
+    let embedded: Vec<String> = extract_embedded_fonts(&zip)
+        .iter()
+        .map(|f| f.family.to_ascii_lowercase())
+        .collect();
+    let reqs = crate::html::needed_fonts(&html_doc(&body))
+        .into_iter()
+        .filter(|r| !embedded.contains(&r.family.to_ascii_lowercase()))
+        .collect();
+    Some(reqs)
+}
+
+/// Build just the HTML `<body>` content for a recognized container (no render),
+/// reusing each format's mapper. Shared by [`office_needed_fonts`] so the font
+/// scan sees exactly the families the real render would.
+fn office_body_html(zip: &BTreeMap<String, Vec<u8>>) -> Option<String> {
+    if zip.contains_key("word/document.xml") {
+        Some(docx_body_html(zip))
+    } else if zip.contains_key("ppt/presentation.xml") {
+        Some(pptx_body_html(zip))
+    } else if zip.contains_key("xl/workbook.xml") {
+        Some(xlsx_body_html(zip))
+    } else if let Some(mimetype) = zip.get("mimetype") {
+        let mt = String::from_utf8_lossy(mimetype);
+        if mt.contains("opendocument.text") {
+            Some(odt_body_html(zip))
+        } else if mt.contains("opendocument.spreadsheet") {
+            Some(ods_body_html(zip))
+        } else if mt.contains("opendocument.presentation") {
+            Some(odp_body_html(zip))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────── image → data URI embedding ───────────────────────
 
 /// Map a media filename to an image MIME the renderer can decode (PNG/JPEG/WebP).
@@ -1926,6 +2320,16 @@ fn img_tag(zip: &BTreeMap<String, Vec<u8>>, key: &str) -> Option<String> {
 /// (`b`/`i`/`sz`/`color`/`u`) to inline `<span>`s, `w:tbl`→`<table>`, and inline
 /// images via `a:blip r:embed` resolved through the document relationships.
 pub fn docx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let (body, geom) = docx_body_geom(zip);
+    // Any face the DOCX embeds itself (`word/fonts/*.odttf`) is fed to the
+    // renderer so its runs lay out and paint with the real typeface.
+    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+}
+
+/// Build the DOCX HTML `<body>` and resolve its page geometry, without
+/// rendering. Shared by [`docx_to_pdf`] (which then renders it) and the
+/// font-need scan ([`office_needed_fonts`]) so both see identical markup.
+fn docx_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     let doc = part(zip, "word/document.xml");
     let rels = zip
         .get("word/_rels/document.xml.rels")
@@ -1950,7 +2354,12 @@ pub fn docx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     docx_body(&doc, &ctx, &mut body);
     docx_footnotes_section(&ctx, &mut body);
     docx_header_footer(zip, &ctx, "footer", &mut body);
-    render_geom(&body, geom)
+    (body, geom)
+}
+
+/// The DOCX HTML `<body>` only (geometry dropped) — used by the font-need scan.
+fn docx_body_html(zip: &BTreeMap<String, Vec<u8>>) -> String {
+    docx_body_geom(zip).0
 }
 
 /// Per-document DOCX context threaded through the body walker: media/relationship
@@ -3428,6 +3837,18 @@ fn parse_docx_footnotes(xml: &str) -> DocxFootnotes {
 /// align, and colours cells from their style's solid fill. Rendered landscape
 /// for width.
 pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    // Spreadsheets have no single declared page size; render landscape for width.
+    // Any embedded face (`xl/fonts/*.odttf`) is passed to the renderer.
+    render_geom_with_fonts(
+        &xlsx_body_html(zip),
+        PageGeom::tabular_default(),
+        &extract_embedded_fonts(zip),
+    )
+}
+
+/// Build the XLSX HTML `<body>` (one `<table>` per sheet) without rendering.
+/// Shared by [`xlsx_to_pdf`] and the font-need scan.
+fn xlsx_body_html(zip: &BTreeMap<String, Vec<u8>>) -> String {
     let shared = zip
         .get("xl/sharedStrings.xml")
         .map(|b| parse_shared_strings(&String::from_utf8_lossy(b)))
@@ -3474,8 +3895,7 @@ pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if sheets.is_empty() {
         body.push_str("<p></p>");
     }
-    // Spreadsheets have no single declared page size; render landscape for width.
-    render_geom(&body, PageGeom::tabular_default())
+    body
 }
 
 /// Render one worksheet XML to an HTML `<table>`, gap-filling so cells land in
@@ -4589,6 +5009,14 @@ fn col_of_ref(r: &str) -> usize {
 /// PPTX → one page per slide (page break between). Text from `a:p`/`a:r`/`a:t`;
 /// images via `a:blip r:embed` resolved through each slide's relationships.
 pub fn pptx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let (body, geom) = pptx_body_geom(zip);
+    // Embedded deck fonts (`ppt/fonts/*.odttf`) are passed to the renderer.
+    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+}
+
+/// Build the PPTX HTML `<body>` (one slide per page) and resolve slide geometry,
+/// without rendering. Shared by [`pptx_to_pdf`] and the font-need scan.
+fn pptx_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     let geom = pptx_page_geom(&part(zip, "ppt/presentation.xml"));
     // The deck's font scheme (`+mn-lt`/`+mj-lt`) from the first theme part.
     let theme = pptx_theme(zip);
@@ -4616,7 +5044,12 @@ pub fn pptx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if slides.is_empty() {
         body.push_str("<p></p>");
     }
-    render_geom(&body, geom)
+    (body, geom)
+}
+
+/// The PPTX HTML `<body>` only — used by the font-need scan.
+fn pptx_body_html(zip: &BTreeMap<String, Vec<u8>>) -> String {
+    pptx_body_geom(zip).0
 }
 
 /// The deck's resolved typefaces for the OOXML theme-font placeholders that text
@@ -5666,6 +6099,14 @@ fn flush_odf_colgroup(pending: &mut String, done: &mut bool, out: &mut String) {
 /// styled via the automatic/named style map, `table:table`→`<table>`,
 /// `draw:image xlink:href`→`<img>`.
 pub fn odt_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let (body, geom) = odt_body_geom(zip);
+    // ODF embedded faces (`Fonts/*`) are passed to the renderer.
+    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+}
+
+/// Build the ODT HTML `<body>` and resolve geometry, without rendering. Shared
+/// by [`odt_to_pdf`] and the font-need scan.
+fn odt_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     let content = part(zip, "content.xml");
     let styles_xml = part(zip, "styles.xml");
     let mut styles = odf_text_styles(&styles_xml);
@@ -5685,7 +6126,12 @@ pub fn odt_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         None,
         None,
     );
-    render_geom(&body, geom)
+    (body, geom)
+}
+
+/// The ODT HTML `<body>` only — used by the font-need scan.
+fn odt_body_html(zip: &BTreeMap<String, Vec<u8>>) -> String {
+    odt_body_geom(zip).0
 }
 
 /// Resolve ODF page geometry: the page-layout in `styles.xml` is authoritative
@@ -5883,6 +6329,14 @@ fn odf_table(
 /// ODS → one HTML `<table>` per `table:table`, honoring
 /// `table:number-columns-repeated` (capped ~64). Rendered landscape.
 pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let (body, geom) = ods_body_geom(zip);
+    // ODF embedded faces (`Fonts/*`) are passed to the renderer.
+    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+}
+
+/// Build the ODS HTML `<body>` (one `<table>` per sheet) and resolve geometry,
+/// without rendering. Shared by [`ods_to_pdf`] and the font-need scan.
+fn ods_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     let content = part(zip, "content.xml");
     let styles_xml = part(zip, "styles.xml");
     let geom = odf_geom(&styles_xml, &content, PageGeom::tabular_default());
@@ -5914,7 +6368,12 @@ pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if first {
         body.push_str("<p></p>");
     }
-    render_geom(&body, geom)
+    (body, geom)
+}
+
+/// The ODS HTML `<body>` only — used by the font-need scan.
+fn ods_body_html(zip: &BTreeMap<String, Vec<u8>>) -> String {
+    ods_body_geom(zip).0
 }
 
 /// Emit one ODS `table:table` (open consumed) as an HTML `<table>`, expanding
@@ -6080,6 +6539,14 @@ fn ods_cell_text(x: &mut Xml, cell_tag: &str) -> String {
 /// ODP → one page per `draw:page`; text from `text:p` (with `text:span`
 /// styles), images via `draw:image`. Rendered landscape.
 pub fn odp_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let (body, geom) = odp_body_geom(zip);
+    // ODF embedded faces (`Fonts/*`) are passed to the renderer.
+    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+}
+
+/// Build the ODP HTML `<body>` (one slide per page) and resolve geometry,
+/// without rendering. Shared by [`odp_to_pdf`] and the font-need scan.
+fn odp_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
     let content = part(zip, "content.xml");
     let styles_xml = part(zip, "styles.xml");
     let mut styles = odf_text_styles(&styles_xml);
@@ -6106,7 +6573,12 @@ pub fn odp_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     if first {
         body.push_str("<p></p>");
     }
-    render_geom(&body, geom)
+    (body, geom)
+}
+
+/// The ODP HTML `<body>` only — used by the font-need scan.
+fn odp_body_html(zip: &BTreeMap<String, Vec<u8>>) -> String {
+    odp_body_geom(zip).0
 }
 
 /// Emit one `draw:page` (open consumed) until `</draw:page>`.
@@ -7536,6 +8008,198 @@ mod tests {
           </w:body></w:document>"#;
         let html = docx_html(doc);
         assert!(html.contains("font-family:Arial"), "html was: {html}");
+    }
+
+    // ── embedded-font extraction ──
+
+    /// A real, parseable font program for fixtures: the bundled Liberation Sans
+    /// (already in the crate). We embed it under a *different* family name so we
+    /// can prove the renderer used the extracted face, not its own fallback.
+    fn fixture_ttf() -> Vec<u8> {
+        crate::font::bundled::FALLBACK_TTF.to_vec()
+    }
+
+    #[test]
+    fn parse_guid_reads_32_hex_digits() {
+        let g = parse_guid("{01234567-89AB-CDEF-0011-223344556677}").expect("valid GUID");
+        assert_eq!(g[0], 0x01, "first hex pair is byte 0 (string order)");
+        assert_eq!(g[15], 0x77, "last hex pair is byte 15");
+        // Anything other than exactly 32 hex digits is rejected.
+        assert!(parse_guid("not-a-guid").is_none());
+        assert!(parse_guid("{0123}").is_none());
+    }
+
+    #[test]
+    fn deobfuscate_odttf_is_its_own_inverse() {
+        // ECMA-376 obfuscation is a 32-byte XOR with the reversed-GUID key, so
+        // applying it twice with the same key restores the original — the same
+        // routine de-obfuscates and (in reverse) would obfuscate.
+        let guid = parse_guid("{DEADBEEF-1234-5678-9ABC-DEF012345678}").unwrap();
+        let original = fixture_ttf();
+        // Obfuscate (== deobfuscate, the XOR is symmetric), then de-obfuscate.
+        let obfuscated = deobfuscate_odttf(&original, &guid);
+        let restored = deobfuscate_odttf(&obfuscated, &guid);
+        assert_eq!(restored, original, "XOR round-trips to the original bytes");
+        // The first 32 bytes actually changed (the sfnt header is scrambled).
+        assert_ne!(
+            &obfuscated[..32],
+            &original[..32],
+            "the header is obfuscated"
+        );
+        assert_eq!(
+            &obfuscated[32..],
+            &original[32..],
+            "only the first 32 bytes are touched"
+        );
+    }
+
+    /// Build a DOCX that embeds an (obfuscated) font, referenced from a
+    /// `fontTable.xml`, under `family` with the given GUID. The font part is the
+    /// real `fixture_ttf()` obfuscated with `guid` (so de-obfuscation yields a
+    /// parseable program).
+    fn build_docx_with_embedded_font(family: &str, guid: &str) -> Vec<u8> {
+        let g = parse_guid(guid).expect("test GUID parses");
+        let obfuscated = deobfuscate_odttf(&fixture_ttf(), &g); // XOR == obfuscate
+        let document = format!(
+            r#"<w:document xmlns:w="x"><w:body>
+                 <w:p><w:r><w:rPr><w:rFonts w:ascii="{family}"/></w:rPr><w:t>Embedded Sample</w:t></w:r></w:p>
+               </w:body></w:document>"#
+        );
+        let font_table = format!(
+            r#"<w:fonts xmlns:w="x" xmlns:r="y">
+                 <w:font w:name="{family}">
+                   <w:embedRegular r:id="rId1" w:fontKey="{guid}"/>
+                 </w:font>
+               </w:fonts>"#
+        );
+        let font_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" Target="fonts/font1.odttf"/>
+          </Relationships>"#;
+        build_docx(
+            &document,
+            None,
+            &[
+                ("word/fontTable.xml", font_table.into_bytes()),
+                ("word/_rels/fontTable.xml.rels", font_rels.as_bytes().to_vec()),
+                ("word/fonts/font1.odttf", obfuscated),
+            ],
+        )
+    }
+
+    #[test]
+    fn docx_embedded_font_is_deobfuscated_and_provided_to_renderer() {
+        // A DOCX that ships its own "Calibri" face: extraction must return the
+        // de-obfuscated, parseable program under that exact family — so the
+        // renderer lays the run out and paints it with the document's own font
+        // rather than the bundled Liberation fallback.
+        let guid = "{12345678-9ABC-DEF0-1122-334455667788}";
+        let docx = build_docx_with_embedded_font("Calibri", guid);
+        let zip = read_zip(&docx);
+
+        let fonts = extract_embedded_fonts(&zip);
+        assert_eq!(fonts.len(), 1, "one embedded face extracted: {:?}", fonts.len());
+        let f = &fonts[0];
+        assert_eq!(f.family, "Calibri", "raw family name preserved (matches HTML)");
+        assert_eq!(f.weight, 400);
+        assert!(!f.italic);
+        // The bytes are a real, parseable font program (de-obfuscation worked).
+        assert!(
+            crate::font::truetype::TrueTypeFont::parse(&f.ttf).is_some(),
+            "the extracted, de-obfuscated bytes parse as a TrueType program"
+        );
+        // And they equal the original fixture (round-tripped through obfuscation).
+        assert_eq!(f.ttf, fixture_ttf(), "extracted face == the embedded original");
+
+        // End-to-end: the rendered PDF embeds the document's OWN face. The run's
+        // `font-family` is "Calibri", so the painter must use the extracted
+        // Calibri face — proven by a `/BaseFont …Calibri…` font program in the
+        // output (a subset prefix like `ABCDEF+Calibri` is normal). If the
+        // extraction had failed, the run would render with the bundled Liberation
+        // fallback and no "Calibri" font would appear.
+        let pdf = docx_to_pdf(&zip);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF produced");
+        let out = crate::Document::open(&pdf).expect("re-open rendered PDF");
+        let fonts = out.embedded_fonts();
+        assert!(
+            fonts
+                .iter()
+                .any(|f| f.base_font.to_ascii_lowercase().contains("calibri")),
+            "the document's own Calibri face is embedded in the output: {fonts:?}"
+        );
+    }
+
+    #[test]
+    fn office_needed_fonts_lists_referenced_but_unembedded_family() {
+        // A DOCX that *references* Calibri without embedding it: the host must be
+        // told to fetch Calibri (so the run lays out with the right metrics). A
+        // base-14 family (Arial) would be excluded — the bundled substitute draws
+        // it natively — so use a non-base-14 family the catalogue knows.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:rPr><w:rFonts w:ascii="Roboto"/></w:rPr><w:t>Hello Roboto</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let docx = build_docx(doc, None, &[]);
+        let reqs = office_needed_fonts(&docx).expect("recognized DOCX");
+        assert!(
+            reqs.iter().any(|r| r.family.eq_ignore_ascii_case("Roboto")),
+            "referenced Roboto is requested for the host to fetch: {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn office_needed_fonts_excludes_self_embedded_family() {
+        // When the container embeds the very family it references, the host must
+        // NOT be asked to fetch it — the embedded bytes already render it. Use a
+        // catalogue family (not base-14) so the only reason it's excluded is the
+        // embedding.
+        let guid = "{AABBCCDD-1122-3344-5566-77889900AABB}";
+        let docx = build_docx_with_embedded_font("Roboto", guid);
+        let reqs = office_needed_fonts(&docx).expect("recognized DOCX");
+        assert!(
+            !reqs.iter().any(|r| r.family.eq_ignore_ascii_case("Roboto")),
+            "self-embedded Roboto is NOT in the host fetch list: {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn odf_embedded_font_extracted_from_fonts_dir() {
+        // An ODT that embeds a plain TTF in `Fonts/` and declares it via a
+        // `<style:font-face>` with an `<svg:font-face-uri>`: extraction returns
+        // the face under its declared family, ready for the renderer.
+        let content = r#"<?xml version="1.0"?>
+          <office:document-content
+              xmlns:office="o" xmlns:style="s" xmlns:svg="g" xmlns:fo="f" xmlns:xlink="x" xmlns:text="t">
+            <office:font-face-decls>
+              <style:font-face style:name="MyEmbedded" svg:font-family="MyEmbedded" fo:font-weight="bold">
+                <svg:font-face-src>
+                  <svg:font-face-uri xlink:href="Fonts/embed.ttf"/>
+                </svg:font-face-src>
+              </style:font-face>
+            </office:font-face-decls>
+            <office:body><office:text>
+              <text:p>Hello</text:p>
+            </office:text></office:body>
+          </office:document-content>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
+        z.add_stored("content.xml", content.as_bytes());
+        z.add_stored("Fonts/embed.ttf", &fixture_ttf());
+        let odt = z.finish();
+        let zip = read_zip(&odt);
+
+        let fonts = extract_embedded_fonts(&zip);
+        assert_eq!(fonts.len(), 1, "one ODF face extracted");
+        assert_eq!(fonts[0].family, "MyEmbedded");
+        assert_eq!(fonts[0].weight, 700, "fo:font-weight=bold → 700");
+        assert_eq!(fonts[0].ttf, fixture_ttf(), "plain ODF font bytes pass through");
+    }
+
+    #[test]
+    fn non_font_bytes_are_rejected_as_provided_face() {
+        // A corrupt / non-sfnt embedded part must not become a ProvidedFont
+        // (it would otherwise poison the renderer's font book).
+        assert!(make_provided_font("Bad", false, false, vec![0, 1, 2, 3, 4, 5]).is_none());
+        assert!(!is_sfnt_font(b"not a font"));
+        assert!(is_sfnt_font(&fixture_ttf()), "the bundled fixture is a valid sfnt");
     }
 
     #[test]

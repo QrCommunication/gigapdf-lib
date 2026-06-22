@@ -300,6 +300,15 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     super::office_import::office_to_pdf(bytes)
 }
 
+/// The Google/system fonts an Office container **references but doesn't embed** —
+/// the two-phase host fetch list for [`office_to_pdf`] (so referenced families
+/// lay out with the right metrics). Fonts the container embeds itself, and the
+/// base-14 standards, are excluded. `None` for an unrecognized archive. Mirrors
+/// [`crate::html::needed_fonts`] for the Office path.
+pub fn office_needed_fonts(bytes: &[u8]) -> Option<Vec<crate::html::FontRequest>> {
+    super::office_import::office_needed_fonts(bytes)
+}
+
 // ─────────────────────────────── image → PDF ───────────────────────────────
 
 /// A raster image (PNG / JPEG / GIF / WebP / AVIF) → a one-page PDF, the image

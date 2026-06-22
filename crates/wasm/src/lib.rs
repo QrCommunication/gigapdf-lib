@@ -2687,6 +2687,29 @@ pub extern "C" fn gp_office_to_pdf(
     }
 }
 
+/// Office (DOCX/ODT/PPTX/XLSX/ODS/ODP) phase-1 fonts: the families the container
+/// **references but doesn't embed**, as a JSON array of `{family, weight, italic,
+/// url}` — the set the host should fetch (Google Fonts) before [`gp_office_to_pdf`]
+/// so styled runs lay out with the right metrics. Faces the container embeds
+/// itself are de-obfuscated and used directly, so they're excluded here. Returns
+/// `[]` JSON for a recognized archive that needs nothing, and null for an
+/// unrecognized one. Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_office_needed_fonts(
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if bytes_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
+    match gigapdf_core::convert::reverse::office_needed_fonts(bytes) {
+        Some(reqs) => unsafe { bytes_into_host(font_reqs_json(&reqs), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Image (PNG/JPEG/GIF/WebP/AVIF) → one-page PDF, format auto-detected (the
 /// image centred and fit on an A4 page). Null if the bytes are unrecognized.
 #[no_mangle]
