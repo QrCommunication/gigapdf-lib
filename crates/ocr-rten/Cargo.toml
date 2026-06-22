@@ -1,0 +1,19 @@
+# Server-side OCR backend: PaddleOCR PP-OCR models run via RTen (pure-Rust ONNX
+# engine, no C++ dependency). NOT part of the lean pure-std core/wasm — this crate
+# carries the heavy ML deps and runs host-side; the WASM client calls it via an endpoint.
+[package]
+name = "gigapdf-ocr-rten"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rten = "0.24"
+rten-tensor = "0.24"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[bin]]
+name = "rec_probe"
+path = "src/bin/rec_probe.rs"

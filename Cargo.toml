@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/wasm"]
+members = ["crates/core", "crates/wasm", "crates/ocr-rten"]
 
 [workspace.package]
 # Single source of truth for the whole workspace — the core + wasm crates

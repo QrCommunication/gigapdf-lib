@@ -1,0 +1,5 @@
+# Heavy model blobs + test images — fetched/converted at build/deploy time, not committed.
+*.rten
+*.onnx
+*.png
+*.jpg
