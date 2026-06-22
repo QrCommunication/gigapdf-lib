@@ -28,7 +28,7 @@ ONNX → `.rten` conversion uses `rten-convert` (`pip install rten-convert`). Pa
 covers **100+ scripts** — to add one, drop its `model.rten` + `dict.txt` into the models dir and add
 an entry to `REC_MODELS` in `crates/ocr-rten/src/lib.rs`.
 
-## 2. Hebrew (the only trained model)
+## 2. Hebrew (the only newly-trained model)
 
 PaddleOCR has no Hebrew model. Hebrew is a small, non-stacking alphabet (≈22 letters + 5 finals),
 so a compact CRNN+CTC trains well on synthetic data. Trainer: **`crates/ocr-rten/tools/train_hebrew.py`**.
@@ -48,7 +48,17 @@ so a compact CRNN+CTC trains well on synthetic data. Trainer: **`crates/ocr-rten
 - **Run:** `python train_hebrew.py --fonts ~/hebrew_fonts --out models/ocr_hebrew --nlines 20000 --epochs 20`.
   Drop the resulting `.rten` + dict into `<models_dir>/hebrew/{model.rten,dict.txt}`.
 
-## 3. Adding a new language
+## 3. Handwriting (`latin_hw`) — reused, not trained
+
+PaddleOCR is printed-text only. For **handwriting** (Latin/Cyrillic/Greek) we **reuse** the retired
+engine's already-trained CRNN — no new training, no data. `tools/convert_legacy_gpocr.py` parses
+`ocr_alpha_hw.gpocr` (the old handwriting model that beat Tesseract on IAM, CER 0.309), rebuilds the
+CRNN, loads its weights (GPO1 int8 × per-layer scale → f32), and exports ONNX → `.rten`. It keeps the
+legacy input convention (grayscale H32, ink=1, fixed width, blank-last) — the `LegacyGray32` profile
+— and is **opt-in** (`recognize_page_with(img, "latin_hw")`), since a handwriting model is
+overconfident on printed/other-script input and must not enter auto script selection.
+
+## 4. Adding a new language
 
 1. **PaddleOCR already supports it** → add its `rec/<lang>` to `fetch_models.sh`, add an entry to
    `REC_MODELS`, redeploy.

@@ -5,18 +5,29 @@ State-of-the-art multilingual OCR using **PaddleOCR PP-OCR** models run through
 Replaces the legacy hand-trained CRNN. Heavy ML deps live here, host-side; the
 lean pure-std `core`/`wasm` crates stay dependency-free and call this via an endpoint.
 
-## Models (not committed — fetch + convert)
-1. **Detection** (shared, language-agnostic) + Chinese/English **rec** ONNX from RapidOCR:
-   `https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_{rec,det}_infer.onnx`
-2. **Multilingual rec** (Korean, Japanese, Latin, Arabic, Cyrillic, Devanagari, Tamil, Telugu,
-   Kannada, Thai … — PP-OCRv5 covers 100+ languages): `deepghs/paddleocr` or
-   `monkt/paddleocr-onnx` on Hugging Face. Each language = its own rec model + dict; **detection
-   is shared**, the pipeline is identical — only the model+dict swap.
-3. Convert ONNX → `.rten`:  `pip install rten-convert && rten-convert model.onnx`
-4. Dict per language ships with PaddleOCR (`ppocr/utils/dict/<lang>_dict.txt`); CTC charlist =
-   `[blank] + dict + [space]`.
+See [`../../docs/OCR_ARCHITECTURE.md`](../../docs/OCR_ARCHITECTURE.md) for the full design (pipeline,
+input profiles, CTC, RTL, auto script selection, handwriting opt-in, API).
 
-## Validated (Phase 1)
+## Models (not committed — fetched/converted at deploy)
+Run **`tools/fetch_models.sh [out_dir]`** to download the shared **DBNet detector** + 12 PaddleOCR
+recognizers from `deepghs/paddleocr` (Hugging Face) and convert each ONNX → `.rten`
+(`pip install rten-convert`). Two models we provide ourselves:
+
+- **Hebrew** (`hebrew/`) — our trained CRNN (`tools/train_hebrew.py` → ONNX → `rten-convert`);
+  PaddleOCR ships none.
+- **Handwriting** (`latin_hw/`) — the **reused** legacy CRNN, re-exported from `ocr_alpha_hw.gpocr`
+  via `tools/convert_legacy_gpocr.py` (no retraining; beat Tesseract on IAM 0.309). Grayscale H32
+  `LegacyGray32` profile, **opt-in** via `recognize_page_with(img, "latin_hw")`.
+
+PaddleOCR PP-OCRv4/v5 covers 100+ scripts — add one by dropping `<subdir>/{model.rten,dict.txt}` in
+the models dir + an entry in `REC_MODELS` (`src/lib.rs`).
+
+## Validated
 - `rec_probe`: Chinese line `深度学习模型测试2026` decoded **100% correct** (conf 0.999).
-- `ocr_probe` (full det+rec pipeline): 3-line CJK page → **all 3 detected, ~95% accuracy**.
-- Multilingual = same architecture (SVTR rec + DBNet det) → proven by transitivity.
+- `ocr_auto` (det + auto script selection, 13 printed recognizers): KR→`ko`, JA→`ja`, FR→`zh`,
+  RU→`cyrillic` — all routed correctly; Korean & Latin perfect, Cyrillic ~90%.
+- Reused HW model (`validate_legacy_hw.py`): reads `Bonjour le monde` / `facture 2026` 100%.
+
+## Probes / tools
+`rec_probe` (single rec), `ocr_probe` (det+rec, one model), `ocr_auto` (load all + auto-select);
+`tools/{fetch_models,train_hebrew,convert_legacy_gpocr,validate_legacy_hw}`.

@@ -30,6 +30,9 @@ first dependency-free engine to beat Tesseract on real handwriting (IAM CER 0.30
    spirit, vastly better accuracy, zero training — except **Hebrew** (PaddleOCR ships none), which we
    still train (small alphabet, easy): [`OCR_TRAINING_DATA.md`](OCR_TRAINING_DATA.md).
 
+> Not lost: this engine's **handwriting** model (`ocr_alpha_hw`, the IAM 0.309 one) is **reused** on
+> RTen — re-exported (GPO1 int8 ×scale → ONNX) by `convert_legacy_gpocr.py`, opt-in as `latin_hw`.
+
 ## Lessons carried forward
 
 - Validate the **quantized/exported** model, not just the float net — a great float CER can hide a
