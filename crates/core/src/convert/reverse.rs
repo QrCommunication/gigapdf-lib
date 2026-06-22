@@ -856,8 +856,15 @@ pub(crate) fn rtf_to_paragraphs(rtf: &str) -> Vec<String> {
 }
 
 /// RTF → PDF.
+///
+/// Routed through the stateful RTF parser ([`super::rtf::rtf_to_html`]), which
+/// recovers character formatting (bold/italic/underline/strike, colour, font,
+/// size), paragraph alignment/indents and tables, then renders the styled HTML
+/// with the in-house [`crate::html`] engine. (The text-only [`rtf_to_paragraphs`]
+/// remains for the editor model path, which is plain-text by design.)
 pub fn rtf_to_pdf(rtf: &str) -> Vec<u8> {
-    flow_to_pdf(&[rtf_to_paragraphs(rtf)])
+    let html = super::rtf::rtf_to_html(rtf);
+    crate::html::render(&html, &[], 612.0, 792.0, 36.0)
 }
 
 #[cfg(test)]
@@ -905,6 +912,41 @@ mod tests {
             back,
             vec!["Café déjà".to_string(), "Second \\ {brace}".to_string()]
         );
+    }
+
+    #[test]
+    fn rtf_to_pdf_renders_styled_content_and_table() {
+        // Bold + italic runs, a coloured run, and a two-cell table row — the
+        // whole stateful-parser → HTML engine → PDF pipeline end to end.
+        let rtf = r"{\rtf1\ansi{\colortbl ;\red255\green0\blue0;}\qc {\b Titre}\par
+\ql {\i italique} et {\cf1 rouge}\par
+\trowd \cell Cellule A\cell Cellule B\row}";
+        let pdf = rtf_to_pdf(rtf);
+        let doc = opens(&pdf);
+        assert!(doc.page_count() >= 1, "valid PDF with a page");
+        let text = doc.to_text();
+        assert!(text.contains("Titre"), "heading text present: {text:?}");
+        assert!(text.contains("italique"), "italic run present: {text:?}");
+        assert!(text.contains("rouge"), "coloured run present: {text:?}");
+        // Cell text may wrap across extracted lines ("Cellule\nA"); check words.
+        for word in ["Cellule", "A", "B"] {
+            assert!(
+                text.contains(word),
+                "table cell word {word:?} present: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtf_to_pdf_decodes_cp1252_in_styled_html() {
+        // The RTF layer's responsibility: \'80 → € in the styled HTML handed to
+        // the renderer (the downstream PDF-text round-trip of U+20AC is a shared
+        // html-engine/font concern, exercised by the html module's own tests).
+        let html = super::super::rtf::rtf_to_html(r"{\rtf1\ansi Prix: 10\'80\par}");
+        assert!(html.contains('€'), "euro decoded into HTML: {html}");
+        // And the pipeline still yields a valid PDF.
+        let pdf = rtf_to_pdf(r"{\rtf1\ansi Prix: 10\'80\par}");
+        assert!(opens(&pdf).page_count() >= 1);
     }
 
     #[test]

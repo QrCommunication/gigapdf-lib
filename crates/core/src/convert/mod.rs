@@ -22,6 +22,7 @@ pub mod office_import;
 pub mod pdfa;
 pub mod project;
 pub mod reverse;
+pub mod rtf;
 pub mod srgb_icc;
 pub mod style;
 pub mod table;
