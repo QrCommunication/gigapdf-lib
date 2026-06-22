@@ -22,7 +22,7 @@ mod rng;
 
 use gigapdf_core::{
     Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
-    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, SearchMatch,
+    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, Permissions, SearchMatch,
     TextLayerRun, TextLine, TextRun,
 };
 
@@ -170,6 +170,59 @@ pub extern "C" fn gp_encryption_info(ptr: *const u8, len: usize, out_len: *mut u
     let json = format!(
         "{{\"encrypted\":{},\"permissions\":{},\"version\":{},\"revision\":{}}}",
         info.encrypted, info.permissions, info.version, info.revision
+    );
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Pack eight access-permission flags into the signed 32-bit `/P` value for the
+/// `/Encrypt` dictionary (ISO 32000-1 Table 22). Each argument is a boolean
+/// (`0` = denied, non-zero = granted) in spec-bit order: print (3), modify (4),
+/// copy (5), annotate (6), fill forms (9), accessibility (10), assemble (11),
+/// high-resolution print (12). Reserved bits are set per the spec. Pass this
+/// result as the `permissions` argument of [`gp_save_encrypted`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_permissions_to_p(
+    print: i32,
+    modify: i32,
+    copy: i32,
+    annotate: i32,
+    fill_forms: i32,
+    accessibility: i32,
+    assemble: i32,
+    print_high_res: i32,
+) -> i32 {
+    Permissions {
+        print: print != 0,
+        modify: modify != 0,
+        copy: copy != 0,
+        annotate: annotate != 0,
+        fill_forms: fill_forms != 0,
+        accessibility: accessibility != 0,
+        assemble: assemble != 0,
+        print_high_res: print_high_res != 0,
+    }
+    .to_p()
+}
+
+/// Decode a `/P` value into its eight access-permission flags. Returns a JSON
+/// buffer `{"print":bool,"modify":bool,"copy":bool,"annotate":bool,
+/// "fillForms":bool,"accessibility":bool,"assemble":bool,"printHighRes":bool}`.
+/// Combine with [`gp_encryption_info`]'s `permissions` to read a document's
+/// permissions. Buffer-returning (host frees).
+#[no_mangle]
+pub extern "C" fn gp_permissions_from_p(p: i32, out_len: *mut usize) -> *mut u8 {
+    let perms = Permissions::from_p(p);
+    let json = format!(
+        "{{\"print\":{},\"modify\":{},\"copy\":{},\"annotate\":{},\"fillForms\":{},\"accessibility\":{},\"assemble\":{},\"printHighRes\":{}}}",
+        perms.print,
+        perms.modify,
+        perms.copy,
+        perms.annotate,
+        perms.fill_forms,
+        perms.accessibility,
+        perms.assemble,
+        perms.print_high_res
     );
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }

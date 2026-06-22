@@ -22,6 +22,145 @@ enum Method {
     AesV3,
 }
 
+/// The user access permissions encoded in an `/Encrypt` dictionary's `/P` entry
+/// (ISO 32000-1 §7.6.3.2, Table 22). Each field maps to one permission bit; a
+/// permission is **granted** when its field is `true`.
+///
+/// `/P` is a signed 32-bit integer. The spec fixes the reserved bits: bits 1–2
+/// and 7–8 are `0`, and bits 13–32 are `1`. Only the eight bits below are
+/// meaningful to a host. Round-trips losslessly through [`Permissions::to_p`] /
+/// [`Permissions::from_p`].
+///
+/// | Bit (1-indexed) | Field | Granted when set |
+/// |-----------------|-------|------------------|
+/// | 3  | [`print`](Self::print)            | Print the document (low resolution if 12 is clear). |
+/// | 4  | [`modify`](Self::modify)          | Modify the contents (other than 6/9/11). |
+/// | 5  | [`copy`](Self::copy)              | Copy / extract text and graphics. |
+/// | 6  | [`annotate`](Self::annotate)      | Add or modify annotations; fill form fields (with 4). |
+/// | 9  | [`fill_forms`](Self::fill_forms)  | Fill existing interactive form fields (even if 6 is clear). |
+/// | 10 | [`accessibility`](Self::accessibility) | Extract text/graphics for accessibility. |
+/// | 11 | [`assemble`](Self::assemble)      | Assemble: insert, delete and rotate pages. |
+/// | 12 | [`print_high_res`](Self::print_high_res) | Print to a high-resolution device (requires 3). |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permissions {
+    /// Bit 3 — print the document.
+    pub print: bool,
+    /// Bit 4 — modify the contents of the document.
+    pub modify: bool,
+    /// Bit 5 — copy or otherwise extract text and graphics.
+    pub copy: bool,
+    /// Bit 6 — add or modify text annotations and fill in interactive form fields.
+    pub annotate: bool,
+    /// Bit 9 — fill in existing interactive form fields (R3+).
+    pub fill_forms: bool,
+    /// Bit 10 — extract text and graphics for accessibility (R3+).
+    pub accessibility: bool,
+    /// Bit 11 — assemble the document: insert, rotate or delete pages (R3+).
+    pub assemble: bool,
+    /// Bit 12 — print to a high-resolution device (R3+).
+    pub print_high_res: bool,
+}
+
+/// Bit masks for the meaningful `/P` permission bits (1-indexed in the spec).
+const P_PRINT: u32 = 1 << 2; // bit 3
+const P_MODIFY: u32 = 1 << 3; // bit 4
+const P_COPY: u32 = 1 << 4; // bit 5
+const P_ANNOTATE: u32 = 1 << 5; // bit 6
+const P_FILL_FORMS: u32 = 1 << 8; // bit 9
+const P_ACCESSIBILITY: u32 = 1 << 9; // bit 10
+const P_ASSEMBLE: u32 = 1 << 10; // bit 11
+const P_PRINT_HIGH_RES: u32 = 1 << 11; // bit 12
+
+/// Reserved high bits (13–32) that the spec requires to be set to 1.
+const P_RESERVED_HIGH: u32 = 0xFFFF_F000;
+
+impl Default for Permissions {
+    /// Everything allowed — the unrestricted default applied when a caller asks
+    /// to encrypt without specifying any flags. Equivalent to [`Permissions::all`].
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl Permissions {
+    /// All eight permissions granted (the unrestricted default).
+    pub const fn all() -> Self {
+        Self {
+            print: true,
+            modify: true,
+            copy: true,
+            annotate: true,
+            fill_forms: true,
+            accessibility: true,
+            assemble: true,
+            print_high_res: true,
+        }
+    }
+
+    /// No permissions granted (maximally restrictive; the owner password still
+    /// lifts every restriction).
+    pub const fn none() -> Self {
+        Self {
+            print: false,
+            modify: false,
+            copy: false,
+            annotate: false,
+            fill_forms: false,
+            accessibility: false,
+            assemble: false,
+            print_high_res: false,
+        }
+    }
+
+    /// Encode to the `/P` value (ISO 32000-1 Table 22): a signed 32-bit integer
+    /// with the reserved bits 1–2 and 7–8 cleared and bits 13–32 set, plus one
+    /// bit per granted permission.
+    pub const fn to_p(self) -> i32 {
+        let mut p = P_RESERVED_HIGH;
+        if self.print {
+            p |= P_PRINT;
+        }
+        if self.modify {
+            p |= P_MODIFY;
+        }
+        if self.copy {
+            p |= P_COPY;
+        }
+        if self.annotate {
+            p |= P_ANNOTATE;
+        }
+        if self.fill_forms {
+            p |= P_FILL_FORMS;
+        }
+        if self.accessibility {
+            p |= P_ACCESSIBILITY;
+        }
+        if self.assemble {
+            p |= P_ASSEMBLE;
+        }
+        if self.print_high_res {
+            p |= P_PRINT_HIGH_RES;
+        }
+        p as i32
+    }
+
+    /// Decode a `/P` value back into the eight permission flags, ignoring the
+    /// reserved bits. The inverse of [`Permissions::to_p`].
+    pub const fn from_p(p: i32) -> Self {
+        let p = p as u32;
+        Self {
+            print: p & P_PRINT != 0,
+            modify: p & P_MODIFY != 0,
+            copy: p & P_COPY != 0,
+            annotate: p & P_ANNOTATE != 0,
+            fill_forms: p & P_FILL_FORMS != 0,
+            accessibility: p & P_ACCESSIBILITY != 0,
+            assemble: p & P_ASSEMBLE != 0,
+            print_high_res: p & P_PRINT_HIGH_RES != 0,
+        }
+    }
+}
+
 /// A resolved security context able to decrypt/encrypt object data.
 #[derive(Debug, Clone)]
 pub struct Security {
@@ -597,5 +736,142 @@ mod tests {
 
         // A wrong password is rejected.
         assert!(Security::open(&dict, b"", b"nope").is_none());
+    }
+
+    // ─── Permissions (`/P`) — ISO 32000-1 Table 22 ──────────────────────────
+
+    #[test]
+    fn permissions_default_is_all_allowed() {
+        assert_eq!(Permissions::default(), Permissions::all());
+        let p = Permissions::all();
+        assert!(p.print && p.modify && p.copy && p.annotate);
+        assert!(p.fill_forms && p.accessibility && p.assemble && p.print_high_res);
+    }
+
+    #[test]
+    fn permissions_all_encodes_to_spec_p_value() {
+        // bits 3,4,5,6,9,10,11,12 set + reserved high bits 13..32 set,
+        // reserved low bits 1,2,7,8 clear → 0xFFFFFF3C → -196 as i32.
+        assert_eq!(Permissions::all().to_p(), -196);
+    }
+
+    #[test]
+    fn permissions_none_encodes_to_reserved_only() {
+        // Only reserved high bits set → 0xFFFFF000 → -4096 as i32.
+        assert_eq!(Permissions::none().to_p(), -4096);
+    }
+
+    #[test]
+    fn permissions_reserved_bits_are_fixed_per_spec() {
+        // For ALL eight on/off combinations, reserved bits 1,2,7,8 stay 0 and
+        // bits 13..32 stay 1.
+        for mask in 0u32..256 {
+            let p = Permissions {
+                print: mask & 1 != 0,
+                modify: mask & 2 != 0,
+                copy: mask & 4 != 0,
+                annotate: mask & 8 != 0,
+                fill_forms: mask & 16 != 0,
+                accessibility: mask & 32 != 0,
+                assemble: mask & 64 != 0,
+                print_high_res: mask & 128 != 0,
+            };
+            let bits = p.to_p() as u32;
+            // Reserved low bits 1,2 (mask 0b11) and 7,8 (mask 0b1100_0000) clear.
+            assert_eq!(bits & 0b0000_0011, 0, "bits 1-2 must be 0");
+            assert_eq!(bits & 0b1100_0000, 0, "bits 7-8 must be 0");
+            // Reserved high bits 13..32 set.
+            assert_eq!(bits & 0xFFFF_F000, 0xFFFF_F000, "bits 13-32 must be 1");
+        }
+    }
+
+    #[test]
+    fn each_flag_sets_exactly_its_bit() {
+        let base = Permissions::none().to_p() as u32;
+        let cases = [
+            (Permissions { print: true, ..Permissions::none() }, 1u32 << 2),
+            (Permissions { modify: true, ..Permissions::none() }, 1 << 3),
+            (Permissions { copy: true, ..Permissions::none() }, 1 << 4),
+            (Permissions { annotate: true, ..Permissions::none() }, 1 << 5),
+            (Permissions { fill_forms: true, ..Permissions::none() }, 1 << 8),
+            (Permissions { accessibility: true, ..Permissions::none() }, 1 << 9),
+            (Permissions { assemble: true, ..Permissions::none() }, 1 << 10),
+            (Permissions { print_high_res: true, ..Permissions::none() }, 1 << 11),
+        ];
+        for (perm, bit) in cases {
+            let bits = perm.to_p() as u32;
+            assert_eq!(bits, base | bit, "exactly one extra bit set");
+        }
+    }
+
+    #[test]
+    fn permissions_round_trip_to_p_from_p() {
+        for mask in 0u32..256 {
+            let p = Permissions {
+                print: mask & 1 != 0,
+                modify: mask & 2 != 0,
+                copy: mask & 4 != 0,
+                annotate: mask & 8 != 0,
+                fill_forms: mask & 16 != 0,
+                accessibility: mask & 32 != 0,
+                assemble: mask & 64 != 0,
+                print_high_res: mask & 128 != 0,
+            };
+            assert_eq!(Permissions::from_p(p.to_p()), p, "mask {mask:#b}");
+        }
+    }
+
+    #[test]
+    fn from_p_ignores_reserved_bits() {
+        // -1 (every bit set, including the reserved 1,2,7,8) decodes to all
+        // eight permissions granted — reserved bits are ignored on decode.
+        assert_eq!(Permissions::from_p(-1), Permissions::all());
+
+        // The legacy sentinel -44 (0xFFFFFFD4) is NOT all-allowed: bit 4
+        // (modify) and bit 6 (annotate) are clear, so it denies content
+        // modification and annotation while granting the rest.
+        let p = Permissions::from_p(-44);
+        assert!(p.print && p.copy && p.fill_forms);
+        assert!(p.accessibility && p.assemble && p.print_high_res);
+        assert!(!p.modify, "bit 4 (modify) is clear in -44");
+        assert!(!p.annotate, "bit 6 (annotate) is clear in -44");
+    }
+
+    #[test]
+    fn no_print_clears_print_bit_in_p() {
+        // A document encrypted with "no printing" has bit 3 cleared.
+        let p = Permissions { print: false, ..Permissions::all() };
+        let bits = p.to_p() as u32;
+        assert_eq!(bits & (1 << 2), 0, "bit 3 (print) must be 0");
+        // The other permissions remain granted.
+        assert_ne!(bits & (1 << 3), 0, "bit 4 (modify) still set");
+        assert_ne!(bits & (1 << 4), 0, "bit 5 (copy) still set");
+        // And decoding confirms only printing is denied.
+        let decoded = Permissions::from_p(p.to_p());
+        assert!(!decoded.print);
+        assert!(decoded.modify && decoded.copy && decoded.assemble);
+    }
+
+    #[test]
+    fn copy_only_combination() {
+        let p = Permissions { copy: true, ..Permissions::none() };
+        let decoded = Permissions::from_p(p.to_p());
+        assert!(decoded.copy);
+        assert!(!decoded.print && !decoded.modify && !decoded.annotate);
+        assert!(!decoded.fill_forms && !decoded.accessibility);
+        assert!(!decoded.assemble && !decoded.print_high_res);
+    }
+
+    #[test]
+    fn permissions_drive_encrypt_dictionary_p() {
+        // The computed `/P` flows verbatim into the `/Encrypt` dict that the
+        // AES-256 builder writes, and re-reads identically.
+        let no_print = Permissions { print: false, ..Permissions::all() };
+        let fek = [0x33u8; 32];
+        let (_sec, dict) =
+            Security::new_aes_v3(b"user", b"owner", &fek, no_print.to_p(), true);
+        let stored = dict.get(b"P").and_then(Object::as_i64).unwrap() as i32;
+        assert_eq!(stored, no_print.to_p());
+        assert!(!Permissions::from_p(stored).print);
     }
 }
