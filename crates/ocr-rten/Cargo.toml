@@ -14,6 +14,14 @@ rten = "0.24"
 rten-tensor = "0.24"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
+[lib]
+name = "gigapdf_ocr_rten"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rec_probe"
 path = "src/bin/rec_probe.rs"
+
+[[bin]]
+name = "ocr_probe"
+path = "src/bin/ocr_probe.rs"
