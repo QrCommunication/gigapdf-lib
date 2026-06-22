@@ -134,6 +134,11 @@ pub struct Style {
     pub generic_serif: bool,
     pub generic_mono: bool,
     pub bold: bool,
+    /// Numeric `font-weight` (100–900), preserved verbatim even though the
+    /// renderer currently only distinguishes bold from regular. Kept so callers
+    /// (e.g. variant-aware face selection) can pick a graduated weight later;
+    /// `bold` stays the convenience flag (`weight >= 600`). Inherited.
+    pub font_weight: u16,
     pub italic: bool,
     pub underline: bool,
     pub align: Align,
@@ -246,6 +251,9 @@ pub struct Style {
     pub word_spacing: f64,
     /// `float` direction, if any — floated boxes are taken beside inline flow.
     pub float: FloatSide,
+    /// `clear` — drop this block below preceding floats before placing it. Not
+    /// inherited.
+    pub clear: Clear,
     /// Inline `vertical-align` (super/sub/length) for THIS run, before cascade
     /// resolves it to a point offset. Not inherited (resets to `baseline`).
     pub valign: VShift,
@@ -264,6 +272,21 @@ pub enum FloatSide {
     None,
     Left,
     Right,
+}
+
+/// CSS `clear` — push a block below preceding floats of the chosen side(s)
+/// before it is placed. Not inherited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Clear {
+    /// `none` (the default) — no clearance.
+    #[default]
+    None,
+    /// `left` — drop below left floats.
+    Left,
+    /// `right` — drop below right floats.
+    Right,
+    /// `both` — drop below floats on either side.
+    Both,
 }
 
 /// `list-style-type` marker styles.
@@ -352,6 +375,7 @@ impl Default for Style {
             generic_serif: false,
             generic_mono: false,
             bold: false,
+            font_weight: 400,
             italic: false,
             underline: false,
             align: Align::Left,
@@ -402,6 +426,7 @@ impl Default for Style {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             float: FloatSide::None,
+            clear: Clear::None,
             valign: VShift::Baseline,
             valign_shift: 0.0,
         }
@@ -649,35 +674,126 @@ fn tokenize_selector(s: &str) -> Vec<SelTok> {
 fn parse_rules(css: &str, order_base: usize) -> Vec<Rule> {
     let css = strip_comments(css);
     let mut rules = Vec::new();
-    let mut rest = css.as_str();
+    parse_rules_into(&css, order_base, &mut rules);
+    rules
+}
+
+/// Recursive worker behind [`parse_rules`]. Appends parsed rules to `out` and
+/// returns the next source order to use. Splitting this out lets a conditional
+/// group rule (`@media print { … }`) recurse on its body while preserving the
+/// global source order across nested and top-level rules.
+fn parse_rules_into(css: &str, order_base: usize, out: &mut Vec<Rule>) -> usize {
+    let mut rest = css;
     let mut order = order_base;
     while let Some(brace) = rest.find('{') {
-        let sel_part = rest[..brace].trim();
+        let preamble = rest[..brace].trim();
         let after = &rest[brace + 1..];
-        let close = match after.find('}') {
-            Some(c) => c,
-            None => break,
+        // Find the brace that matches THIS `{` by depth counting. A normal rule
+        // body holds no braces, so depth-matching reduces to the old "first `}`";
+        // a conditional group rule (`@media { .x { … } }`) needs the balanced
+        // close so its nested rules aren't mistaken for a truncated declaration.
+        let Some((body, consumed)) = take_balanced_block(after) else {
+            break;
         };
-        let body = &after[..close];
-        rest = &after[close + 1..];
+        rest = &after[consumed..];
 
-        // Skip at-rules (@media, @font-face, …) — not yet interpreted.
-        if sel_part.starts_with('@') {
-            order += 1;
+        if let Some(query) = preamble.strip_prefix('@') {
+            // Conditional group rules (`@media …`) nest rules. Apply the inner
+            // rules when the query matches the print target; otherwise drop them.
+            // Other at-rules (@font-face, @keyframes, @supports, @page, …) carry
+            // no plain selector rules we interpret, so they're skipped wholesale.
+            let name_end = query
+                .find(|c: char| c.is_whitespace() || c == '{')
+                .unwrap_or(query.len());
+            if query[..name_end].eq_ignore_ascii_case("media") {
+                if media_query_applies(query[name_end..].trim()) {
+                    order = parse_rules_into(body, order, out);
+                } else {
+                    order += 1;
+                }
+            } else {
+                order += 1;
+            }
             continue;
         }
-        let selectors: Vec<Selector> = sel_part.split(',').filter_map(parse_selector).collect();
+        let selectors: Vec<Selector> = preamble.split(',').filter_map(parse_selector).collect();
         if selectors.is_empty() {
             continue;
         }
-        rules.push(Rule {
+        out.push(Rule {
             selectors,
             decls: parse_decls(body),
             order,
         });
         order += 1;
     }
-    rules
+    order
+}
+
+/// Given the text immediately after an opening `{`, return the block body (text
+/// up to the matching `}`) and the number of bytes consumed including that `}`.
+/// Returns `None` if the brace is never closed (truncated stylesheet).
+fn take_balanced_block(after: &str) -> Option<(&str, usize)> {
+    let bytes = after.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&after[..i], i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decide whether an `@media` query applies to the print target. We render to
+/// paged PDF, so `print` and the universal/empty queries apply; `screen`-only
+/// queries do not. Comma-separated queries apply if ANY component applies
+/// (CSS media query lists are a logical OR). Feature queries we can't evaluate
+/// (`(max-width: …)`) are treated as applying for the matched media type so a
+/// stylesheet's intended print rules aren't silently dropped.
+fn media_query_applies(query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true; // bare `@media { … }` — always-on group.
+    }
+    q.split(',').any(|component| {
+        let c = component.trim();
+        // A query that opens directly on a feature (`(max-width: …)`) has an
+        // implicit `all` media type → applies (we can't evaluate the feature, so
+        // we don't drop the author's intended rules).
+        if c.starts_with('(') {
+            return true;
+        }
+        // The leading media type is the first whitespace-delimited token.
+        let media_type = c.split_whitespace().next().unwrap_or("");
+        match media_type.to_ascii_lowercase().as_str() {
+            "print" | "all" => true,
+            // `only print`, `not screen` modifiers: honour the common form where
+            // the media type after `only`/`not` decides.
+            "only" | "not" => {
+                let next = c
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if media_type.eq_ignore_ascii_case("not") {
+                    // `not screen` ⇒ applies to print; `not print` ⇒ does not.
+                    !matches!(next.as_str(), "print" | "all")
+                } else {
+                    matches!(next.as_str(), "print" | "all")
+                }
+            }
+            _ => false, // `screen`, `speech`, and anything else: not for print.
+        }
+    })
 }
 
 /// Scan `@font-face { font-family: <name>; … }` blocks and return the declared
@@ -949,6 +1065,7 @@ fn inherit(parent: &Style) -> Style {
         generic_serif: parent.generic_serif,
         generic_mono: parent.generic_mono,
         bold: parent.bold,
+        font_weight: parent.font_weight,
         italic: parent.italic,
         underline: parent.underline,
         align: parent.align,
@@ -1010,6 +1127,8 @@ fn inherit(parent: &Style) -> Style {
         grid_col_start: 0,
         grid_row_start: 0,
         float: FloatSide::None,
+        // `clear` is not inherited (resets to the initial value).
+        clear: Clear::None,
         // `vertical-align` is not inherited; super/sub apply to the run only.
         valign: VShift::Baseline,
         valign_shift: 0.0,
@@ -1069,6 +1188,134 @@ fn parse_grid_line(v: &str) -> usize {
         return 0;
     }
     first.parse::<usize>().unwrap_or(0)
+}
+
+/// Apply `font-family` (a comma-separated stack): adopt the first family name
+/// and infer the serif/mono generic buckets used for fallback metrics.
+fn apply_font_family(style: &mut Style, v: &str) {
+    let first = v
+        .split(',')
+        .next()
+        .unwrap_or(v)
+        .trim()
+        .trim_matches(['"', '\'']);
+    style.font_family = first.to_string();
+    let lower = first.to_ascii_lowercase();
+    style.generic_serif =
+        lower == "serif" || lower.contains("times") || lower.contains("georgia");
+    style.generic_mono = lower == "monospace"
+        || lower.contains("courier")
+        || lower.contains("mono")
+        || lower.contains("consol");
+}
+
+/// Apply a `font-weight` value: store the numeric weight (named keywords map to
+/// the canonical 400/700; `bolder`/`lighter` are approximated relative to the
+/// current weight) and refresh the `bold` rendering flag (`weight >= 600`).
+fn apply_font_weight(style: &mut Style, v: &str) {
+    let weight = match v.trim() {
+        "normal" => 400,
+        "bold" => 700,
+        // Relative keywords: step one weight band from the inherited value.
+        "bolder" => (style.font_weight + 300).min(900),
+        "lighter" => style.font_weight.saturating_sub(300).max(100),
+        n => n.parse::<u16>().map(|w| w.clamp(1, 1000)).unwrap_or(style.font_weight),
+    };
+    style.font_weight = weight;
+    style.bold = weight >= 600;
+}
+
+/// Decompose the `font` shorthand into its longhands.
+///
+/// CSS grammar: `[ <style> || <variant> || <weight> || <stretch> ]? <size>[/<line-height>]? <family>`.
+/// The size is the pivot: it's the first token that is a `<length>`/`<percentage>`
+/// (optionally carrying `/<line-height>`); everything before it is the optional
+/// style/variant/weight prefix and everything after it is the family list. The
+/// `font: inherit|caption|menu|…` system/keyword forms carry no size and are left
+/// to the cascade (a no-op here, which keeps the inherited font intact).
+fn apply_font_shorthand(style: &mut Style, v: &str) {
+    let v = v.trim();
+    let tokens: Vec<&str> = v.split_whitespace().collect();
+    // Locate the size token: the first token whose head (before any `/`) is a
+    // genuine `<font-size>`. Crucially this must NOT match a bare unitless number
+    // (e.g. the `600` weight in `font: 600 14pt Arial`) — `font-size` requires a
+    // unit/`%` or an absolute size keyword, so a unitless number stays a weight.
+    let size_idx = tokens
+        .iter()
+        .position(|t| is_font_size_token(t.split('/').next().unwrap_or(t), style.font_size));
+    let Some(size_idx) = size_idx else {
+        return; // no size → system font / keyword form: leave the font as-is.
+    };
+
+    // Prefix tokens (style / variant / weight). `font` resets these longhands to
+    // their initial values first, then re-applies whatever the prefix specifies.
+    style.italic = false;
+    style.font_weight = 400;
+    style.bold = false;
+    for t in &tokens[..size_idx] {
+        match *t {
+            "italic" | "oblique" => style.italic = true,
+            "normal" | "small-caps" => {} // variant/normal: nothing to model.
+            _ => apply_font_weight(style, t), // `bold`/`100`…`900`/`bolder`/`lighter`.
+        }
+    }
+
+    // Size (and optional `/line-height`).
+    let size_tok = tokens[size_idx];
+    if let Some((size_str, lh_str)) = size_tok.split_once('/') {
+        if let Some(px) = font_size_px(size_str, style.font_size) {
+            style.font_size = px;
+        }
+        apply_one(style, "line-height", lh_str);
+    } else if let Some(px) = font_size_px(size_tok, style.font_size) {
+        style.font_size = px;
+    }
+
+    // Family: everything after the size, rejoined (it may contain spaces/commas).
+    if size_idx + 1 < tokens.len() {
+        let family = tokens[size_idx + 1..].join(" ");
+        apply_font_family(style, &family);
+    }
+}
+
+/// Is `t` a valid `<font-size>` token? Accepts a length/percentage that carries
+/// a unit or `%`, plus the absolute/relative size keywords. A bare unitless
+/// number is rejected so it is not mistaken for the size in the `font` shorthand
+/// (where it is actually a `font-weight`).
+fn is_font_size_token(t: &str, em: f64) -> bool {
+    font_size_px(t, em).is_some()
+}
+
+/// Resolve a `<font-size>` token to points: a length/percentage with a unit, or
+/// an absolute/relative size keyword. Returns `None` for bare unitless numbers
+/// and anything else (so the `font` shorthand's size detection stays precise).
+fn font_size_px(t: &str, em: f64) -> Option<f64> {
+    let t = t.trim();
+    // Absolute/relative keyword sizes (CSS `<absolute-size>` / `<relative-size>`),
+    // anchored to the conventional 12pt medium baseline.
+    match t.to_ascii_lowercase().as_str() {
+        "xx-small" => return Some(12.0 * 0.6),
+        "x-small" => return Some(12.0 * 0.75),
+        "small" => return Some(12.0 * 0.89),
+        "medium" => return Some(12.0),
+        "large" => return Some(12.0 * 1.2),
+        "x-large" => return Some(12.0 * 1.5),
+        "xx-large" => return Some(12.0 * 2.0),
+        "smaller" => return Some(em * 0.833),
+        "larger" => return Some(em * 1.2),
+        _ => {}
+    }
+    // A length/percentage must carry a unit (or `%`); a bare number is not a
+    // valid font-size and must not pivot the shorthand. Limit to the units
+    // `parse_len_px` resolves so detection and resolution stay in lock-step.
+    let has_unit = t.ends_with('%')
+        || ["px", "pt", "rem", "em", "vw", "vh"]
+            .iter()
+            .any(|u| t.len() > u.len() && t.ends_with(u));
+    if !has_unit {
+        return None;
+    }
+    parse_len_px(t, em)
 }
 
 /// Parse an `align-items` / `align-self` keyword.
@@ -1256,6 +1503,16 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 _ => FloatSide::None,
             };
         }
+        "clear" => {
+            // `clear: left|right|both` drops the block below the chosen side's
+            // preceding floats before it is placed. `none` leaves it untouched.
+            style.clear = match v {
+                "left" => Clear::Left,
+                "right" => Clear::Right,
+                "both" => Clear::Both,
+                _ => Clear::None,
+            };
+        }
         "color" => {
             if let Some(c) = parse_color(v) {
                 style.color = c;
@@ -1269,26 +1526,10 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 style.font_size = px;
             }
         }
-        "font-weight" => {
-            style.bold = matches!(v, "bold" | "bolder" | "600" | "700" | "800" | "900");
-        }
+        "font-weight" => apply_font_weight(style, v),
         "font-style" => style.italic = matches!(v, "italic" | "oblique"),
-        "font-family" => {
-            let first = v
-                .split(',')
-                .next()
-                .unwrap_or(v)
-                .trim()
-                .trim_matches(['"', '\'']);
-            style.font_family = first.to_string();
-            let lower = first.to_ascii_lowercase();
-            style.generic_serif =
-                lower == "serif" || lower.contains("times") || lower.contains("georgia");
-            style.generic_mono = lower == "monospace"
-                || lower.contains("courier")
-                || lower.contains("mono")
-                || lower.contains("consol");
-        }
+        "font" => apply_font_shorthand(style, v),
+        "font-family" => apply_font_family(style, v),
         "text-align" => {
             style.align = match v {
                 "center" => Align::Center,
@@ -2477,5 +2718,177 @@ mod tests {
         assert!(inline_style("page-break-inside: avoid").page_break_inside_avoid);
         assert!(inline_style("break-inside: avoid").page_break_inside_avoid);
         assert!(!inline_style("page-break-inside: auto").page_break_inside_avoid);
+    }
+
+    // ── CSS-2 quick-win 1: @media print/screen ─────────────────────────────
+
+    #[test]
+    fn media_query_applies_selects_print() {
+        // Print and the universal/empty queries apply; screen-only does not.
+        assert!(media_query_applies("print"));
+        assert!(media_query_applies("all"));
+        assert!(media_query_applies(""), "bare @media is always-on");
+        assert!(!media_query_applies("screen"));
+        assert!(!media_query_applies("speech"));
+        // Comma list is an OR: applies if ANY component matches.
+        assert!(media_query_applies("screen, print"));
+        assert!(!media_query_applies("screen, speech"));
+        // `only print` / `not screen` modifiers resolve to print.
+        assert!(media_query_applies("only print"));
+        assert!(media_query_applies("not screen"));
+        assert!(!media_query_applies("not print"));
+        assert!(!media_query_applies("only screen"));
+        // A feature-only query has an implicit `all` → applies (can't evaluate
+        // the feature, so we keep the author's intended rules).
+        assert!(media_query_applies("(max-width: 600px)"));
+        assert!(media_query_applies("print and (color)"));
+    }
+
+    #[test]
+    fn media_print_rules_apply_screen_rules_drop() {
+        // The print block's rule wins; the screen block is dropped entirely, so
+        // the later (source-order) screen rule does NOT override the print one.
+        let c = color_of_first(
+            "<style>@media print { p { color: red } } \
+                    @media screen { p { color: blue } }</style><p>x</p>",
+            "p",
+        );
+        assert_eq!(c, [1.0, 0.0, 0.0], "print rule applies, screen rule dropped");
+    }
+
+    #[test]
+    fn media_nested_balanced_braces_do_not_truncate_following_rules() {
+        // The `@media` body holds two nested rules; the balanced-brace scan must
+        // consume the whole group so the trailing `h1` rule outside it is still
+        // parsed (a naive "first }" would stop mid-group and lose `h1`).
+        let css = "@media print { p { color: red } span { color: lime } } \
+                   h1 { color: blue }";
+        let p = color_of_first(
+            &format!("<style>{css}</style><p>x</p>"),
+            "p",
+        );
+        let h1 = color_of_first(
+            &format!("<style>{css}</style><h1>x</h1>"),
+            "h1",
+        );
+        assert_eq!(p, [1.0, 0.0, 0.0], "nested print rule applies");
+        assert_eq!(h1, [0.0, 0.0, 1.0], "rule after the @media group survives");
+    }
+
+    // ── CSS-2 quick-win 2: font shorthand + numeric weight ─────────────────
+
+    #[test]
+    fn font_weight_keeps_numeric_value_and_bold_flag() {
+        // Numeric weights are preserved verbatim; `bold` flips at >= 600.
+        let w300 = inline_style("font-weight: 300");
+        assert_eq!(w300.font_weight, 300);
+        assert!(!w300.bold, "300 is not bold");
+        let w600 = inline_style("font-weight: 600");
+        assert_eq!(w600.font_weight, 600);
+        assert!(w600.bold, "600 is bold");
+        // Named keywords map to canonical 400/700.
+        assert_eq!(inline_style("font-weight: normal").font_weight, 400);
+        let bold = inline_style("font-weight: bold");
+        assert_eq!(bold.font_weight, 700);
+        assert!(bold.bold);
+        // Relative keywords step from the (default 400) weight.
+        assert_eq!(inline_style("font-weight: bolder").font_weight, 700);
+        assert_eq!(inline_style("font-weight: lighter").font_weight, 100);
+    }
+
+    #[test]
+    fn font_shorthand_decomposes_into_longhands() {
+        // `italic bold 18pt/24pt "Times New Roman"`: style, weight, size,
+        // line-height and family all land in their longhands.
+        let s = inline_style("font: italic bold 18pt/24pt \"Times New Roman\"");
+        assert!(s.italic, "italic from the style token");
+        assert!(s.bold && s.font_weight == 700, "bold weight from the prefix");
+        assert!((s.font_size - 18.0).abs() < 0.01, "size 18pt ({})", s.font_size);
+        // line-height: 24pt against an 18pt font → ratio ~1.333.
+        assert!(
+            (s.line_height - 24.0 / 18.0).abs() < 0.05,
+            "line-height 24/18 ({})",
+            s.line_height
+        );
+        assert_eq!(s.font_family, "Times New Roman");
+        assert!(s.generic_serif, "Times → serif bucket");
+    }
+
+    #[test]
+    fn font_shorthand_numeric_weight_and_reset() {
+        // A numeric weight in the prefix; size without line-height; sans family.
+        let s = inline_style("font: 600 14pt Arial");
+        assert_eq!(s.font_weight, 600);
+        assert!(s.bold);
+        assert!((s.font_size - 14.0).abs() < 0.01);
+        assert_eq!(s.font_family, "Arial");
+        assert!(!s.generic_serif && !s.generic_mono, "Arial is the sans bucket");
+        // `font` resets the style/weight longhands first: a plain `font: 12pt x`
+        // after an italic/bold context clears them.
+        let mut st = Style::default();
+        apply_one(&mut st, "font-style", "italic");
+        apply_one(&mut st, "font-weight", "bold");
+        apply_one(&mut st, "font", "12pt serif");
+        assert!(!st.italic, "font shorthand reset italic");
+        assert!(!st.bold && st.font_weight == 400, "font shorthand reset weight");
+    }
+
+    #[test]
+    fn font_shorthand_keyword_form_is_a_noop() {
+        // System/keyword forms carry no size → leave the inherited font intact.
+        let mut st = Style {
+            font_size: 20.0,
+            bold: true,
+            font_weight: 700,
+            ..Style::default()
+        };
+        apply_one(&mut st, "font", "inherit");
+        assert!((st.font_size - 20.0).abs() < 0.01, "size unchanged");
+        assert!(st.bold && st.font_weight == 700, "weight unchanged");
+    }
+
+    // ── CSS-2 quick-win 4: clear parsing ───────────────────────────────────
+
+    #[test]
+    fn clear_property_parses() {
+        assert_eq!(inline_style("clear: left").clear, Clear::Left);
+        assert_eq!(inline_style("clear: right").clear, Clear::Right);
+        assert_eq!(inline_style("clear: both").clear, Clear::Both);
+        assert_eq!(inline_style("clear: none").clear, Clear::None);
+        // An unknown value is treated as `none`.
+        assert_eq!(inline_style("clear: inline-start").clear, Clear::None);
+        // `clear` is not inherited (resets to none).
+        let parent = Style {
+            clear: Clear::Both,
+            ..Style::default()
+        };
+        assert_eq!(inherit(&parent).clear, Clear::None, "clear does not inherit");
+    }
+
+    // ── CSS-2 quick-win 3: grid-column / grid-row start lines ───────────────
+
+    #[test]
+    fn grid_line_placement_parses() {
+        // `grid-column`/`grid-row` (and their `-start` longhands) store a 1-based
+        // start line; `grid-area: <row> / <col>` takes the first two lines.
+        assert_eq!(inline_style("grid-column: 2").grid_col_start, 2);
+        assert_eq!(inline_style("grid-row: 3").grid_row_start, 3);
+        assert_eq!(inline_style("grid-column-start: 4").grid_col_start, 4);
+        assert_eq!(inline_style("grid-row-start: 5").grid_row_start, 5);
+        let area = inline_style("grid-area: 2 / 3");
+        assert_eq!(area.grid_row_start, 2, "grid-area row");
+        assert_eq!(area.grid_col_start, 3, "grid-area col");
+        // `span N` / `auto` resolve to 0 (auto-flow).
+        assert_eq!(inline_style("grid-column: span 2").grid_col_start, 0);
+        assert_eq!(inline_style("grid-column: auto").grid_col_start, 0);
+        // Not inherited.
+        let parent = Style {
+            grid_col_start: 2,
+            grid_row_start: 3,
+            ..Style::default()
+        };
+        let child = inherit(&parent);
+        assert_eq!(child.grid_col_start, 0, "grid-column-start does not inherit");
+        assert_eq!(child.grid_row_start, 0, "grid-row-start does not inherit");
     }
 }

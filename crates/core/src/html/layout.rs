@@ -9,7 +9,7 @@
 //! is sliced into pages with backgrounds/borders split across page bands.
 
 use super::css::{
-    Align, AlignItems, Display, FloatSide, Justify, Len, Position, Style, Stylesheet, VAlign,
+    Align, AlignItems, Clear, Display, FloatSide, Justify, Len, Position, Style, Stylesheet, VAlign,
 };
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
@@ -206,6 +206,16 @@ struct FloatCtx {
     boxes: Vec<FloatBox>,
 }
 
+/// A CSS-grid item's resolved cell: which item (index into the item list) sits
+/// at which 0-based `(row, col)` of a fixed-column `display: grid`. (Distinct
+/// from the `<table>` `GridCell`, which models colspan/rowspan cells.)
+#[derive(Debug, Clone, Copy)]
+struct GridPlace {
+    item: usize,
+    row: usize,
+    col: usize,
+}
+
 impl FloatCtx {
     /// Left and right inline insets to apply to a line spanning `[y, y+h)`:
     /// the summed widths of left- and right-floats overlapping that band.
@@ -228,6 +238,22 @@ impl FloatCtx {
     /// The lowest bottom among placed floats (for clearing after a block).
     fn max_bottom(&self) -> f64 {
         self.boxes.iter().map(|f| f.bottom).fold(0.0_f64, f64::max)
+    }
+
+    /// The lowest bottom among floats on the side(s) selected by `clear`, for
+    /// honouring `clear: left|right|both` on a block: the block's top is pushed
+    /// down to at least this value. `Clear::None` yields `0.0` (no clearance).
+    fn clear_bottom(&self, clear: Clear) -> f64 {
+        self.boxes
+            .iter()
+            .filter(|f| match clear {
+                Clear::Left => f.left,
+                Clear::Right => !f.left,
+                Clear::Both => true,
+                Clear::None => false,
+            })
+            .map(|f| f.bottom)
+            .fold(0.0_f64, f64::max)
     }
 }
 
@@ -542,11 +568,29 @@ impl Flow<'_> {
                     if st.display == Display::ListItem {
                         list_index += 1;
                     }
+                    // `clear: left|right|both` — drop this block below the
+                    // preceding floats on the chosen side(s) before placing it.
+                    // Clearance establishes a hard boundary, so it suppresses
+                    // margin collapsing against the previous sibling.
+                    let cleared = if st.clear != Clear::None {
+                        let clear_to = self.floats.clear_bottom(st.clear);
+                        if clear_to > y {
+                            y = clear_to;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     // Collapse this block's top margin against the previous
                     // block's bottom margin: pull `y` up by the overlap so the
-                    // visible gap becomes `max(prev.bottom, this.top)`.
-                    if let Some(prev_bottom) = prev_block_bottom {
-                        y -= prev_bottom.min(st.margin.top).max(0.0);
+                    // visible gap becomes `max(prev.bottom, this.top)`. Skipped
+                    // when clearance already moved the block down.
+                    if !cleared {
+                        if let Some(prev_bottom) = prev_block_bottom {
+                            y -= prev_bottom.min(st.margin.top).max(0.0);
+                        }
                     }
                     if st.page_break_before {
                         y = self.break_to_next_page(y);
@@ -2075,17 +2119,35 @@ impl Flow<'_> {
         let content_x = x + m.left + b.left + p.left;
         let content_w = (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
         let col_w = content_w / cols as f64;
-        let mut y_cursor = y + b.top + p.top;
+        let y_cursor = y + b.top + p.top;
 
-        for row in items.chunks(cols) {
-            let row_top = y_cursor;
+        // Assign each item a (row, col) cell. Items with an explicit
+        // `grid-column`/`grid-row` start line land on that line; the rest
+        // auto-flow into the next free cell (left-to-right, top-to-bottom).
+        // With no explicit placement this reproduces the row-by-row `chunks(cols)`
+        // layout exactly (cursor advances column then row).
+        let placement = self.place_grid_items(&items, style, &na, cols);
+        let row_count = placement
+            .iter()
+            .map(|p| p.row + 1)
+            .max()
+            .unwrap_or(0);
+
+        // Lay each row's cells out, tracking the tallest cell so the whole row
+        // shares one height (matching the previous behaviour).
+        let mut row_tops = vec![y_cursor; row_count];
+        let mut row_bottoms = vec![y_cursor; row_count];
+        for r in 0..row_count {
+            let row_top = if r == 0 { y_cursor } else { row_bottoms[r - 1] };
+            row_tops[r] = row_top;
             let mut row_bottom = row_top;
-            for (c, it) in row.iter().enumerate() {
+            for cell in placement.iter().filter(|p| p.row == r) {
+                let it = items[cell.item];
                 let istyle = self.style_of(it, style, &na);
                 let nca = push_ancestor(&na, it);
                 let ip = &istyle.padding;
                 let ib = &istyle.border_width;
-                let cx = content_x + c as f64 * col_w;
+                let cx = content_x + cell.col as f64 * col_w;
                 let cy = self.block_children(
                     &it.children,
                     &istyle,
@@ -2096,19 +2158,105 @@ impl Flow<'_> {
                 );
                 row_bottom = row_bottom.max(cy + ip.bottom + ib.bottom);
             }
-            for (c, it) in row.iter().enumerate() {
-                let istyle = self.style_of(it, style, &na);
-                self.paint_item_box(
-                    &istyle,
-                    content_x + c as f64 * col_w,
-                    row_top,
-                    col_w,
-                    row_bottom - row_top,
-                );
-            }
-            y_cursor = row_bottom;
+            row_bottoms[r] = row_bottom;
         }
-        y_cursor + p.bottom + b.bottom + style.margin.bottom
+        for cell in &placement {
+            let it = items[cell.item];
+            let istyle = self.style_of(it, style, &na);
+            self.paint_item_box(
+                &istyle,
+                content_x + cell.col as f64 * col_w,
+                row_tops[cell.row],
+                col_w,
+                row_bottoms[cell.row] - row_tops[cell.row],
+            );
+        }
+        let grid_bottom = row_bottoms.last().copied().unwrap_or(y_cursor);
+        grid_bottom + p.bottom + b.bottom + style.margin.bottom
+    }
+
+    /// Resolve each grid item to a `(row, col)` cell in a fixed-`cols` grid.
+    ///
+    /// Honours explicit `grid-column`/`grid-row` start lines (1-based, clamped to
+    /// the column count); items without an explicit column auto-flow into the next
+    /// free cell scanning columns then rows, and items without an explicit row but
+    /// with an explicit column take the next free row in that column. A cell is
+    /// "occupied" once any item is placed there, so an explicitly-placed item is
+    /// skipped over by the auto-flow cursor. With no explicit placement at all the
+    /// result is the plain row-major fill (identical to `chunks(cols)`).
+    fn place_grid_items(
+        &mut self,
+        items: &[&Element],
+        style: &Style,
+        na: &[&Element],
+        cols: usize,
+    ) -> Vec<GridPlace> {
+        let mut occupied: Vec<bool> = Vec::new();
+        let idx = |row: usize, col: usize| row * cols + col;
+        let ensure_rows = |occ: &mut Vec<bool>, rows: usize| {
+            if occ.len() < rows * cols {
+                occ.resize(rows * cols, false);
+            }
+        };
+        let mut cursor = 0usize; // auto-flow scan position (row-major).
+        let mut out = Vec::with_capacity(items.len());
+
+        for (i, it) in items.iter().enumerate() {
+            let istyle = self.style_of(it, style, na);
+            // Explicit column (1-based) clamped into range; 0 = auto.
+            let col_hint = if istyle.grid_col_start >= 1 && istyle.grid_col_start <= cols {
+                Some(istyle.grid_col_start - 1)
+            } else {
+                None
+            };
+            let row_hint = istyle.grid_row_start.checked_sub(1); // 0 = auto → None.
+
+            let (row, col) = match (row_hint, col_hint) {
+                // Both explicit: place exactly there (growing the grid as needed).
+                (Some(r), Some(c)) => (r, c),
+                // Column only: next free row in that column.
+                (None, Some(c)) => {
+                    let mut r = 0;
+                    loop {
+                        ensure_rows(&mut occupied, r + 1);
+                        if !occupied[idx(r, c)] {
+                            break (r, c);
+                        }
+                        r += 1;
+                    }
+                }
+                // Row only: next free column in that row (then overflow downward).
+                (Some(r), None) => {
+                    let mut rr = r;
+                    let mut cc = 0;
+                    loop {
+                        ensure_rows(&mut occupied, rr + 1);
+                        if !occupied[idx(rr, cc)] {
+                            break (rr, cc);
+                        }
+                        cc += 1;
+                        if cc == cols {
+                            cc = 0;
+                            rr += 1;
+                        }
+                    }
+                }
+                // Fully auto: advance the row-major cursor to the next free cell.
+                (None, None) => loop {
+                    let r = cursor / cols;
+                    let c = cursor % cols;
+                    ensure_rows(&mut occupied, r + 1);
+                    cursor += 1;
+                    if !occupied[idx(r, c)] {
+                        break (r, c);
+                    }
+                },
+            };
+            ensure_rows(&mut occupied, row + 1);
+            occupied[idx(row, col)] = true;
+            out.push(GridPlace { item: i, row, col });
+        }
+        out
     }
 
     /// Lay a normal block's flow content out into `column_count` equal-width
@@ -3587,6 +3735,110 @@ mod tests {
         assert!(
             c3.1 > c1.1 && (c3.0 - c1.0).abs() < 1.0,
             "C3 wraps below C1 in the next row (c1={c1:?}, c3={c3:?})"
+        );
+    }
+
+    #[test]
+    fn grid_column_start_places_item_explicitly() {
+        // 2 columns. The FIRST item carries `grid-column: 2`, so it lands in the
+        // right column; the auto-flowing second item fills the (free) left cell of
+        // the same row. Hence "A" ends up to the RIGHT of "B" despite source order.
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr">
+                 <div style="grid-column:2">A</div><div>B</div>
+               </div>"#,
+        );
+        let t = text_xy(&layout);
+        let a = t.iter().find(|(_, _, s)| s == "A").unwrap();
+        let b = t.iter().find(|(_, _, s)| s == "B").unwrap();
+        assert!(
+            a.0 > b.0,
+            "explicit grid-column:2 puts A right of the auto-placed B (a={a:?}, b={b:?})"
+        );
+        assert!((a.1 - b.1).abs() < 1.0, "A and B share the first row");
+    }
+
+    #[test]
+    fn grid_row_start_places_item_on_a_later_row() {
+        // An item with `grid-row: 2` drops to the second row; a plain item stays
+        // on the first. So "Late" sits below "Early".
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr">
+                 <div>Early</div><div style="grid-row:2;grid-column:1">Late</div>
+               </div>"#,
+        );
+        let t = text_xy(&layout);
+        let early = t.iter().find(|(_, _, s)| s == "Early").unwrap();
+        let late = t.iter().find(|(_, _, s)| s == "Late").unwrap();
+        assert!(
+            late.1 > early.1,
+            "grid-row:2 places 'Late' below 'Early' (early={early:?}, late={late:?})"
+        );
+        assert!((late.0 - early.0).abs() < 1.0, "both in column 1 (same x)");
+    }
+
+    // ── clear (CSS clear: left | right | both) ──
+
+    #[test]
+    fn clear_left_drops_block_below_a_left_float() {
+        // A tall left float, then a `clear:left` block. The cleared block's top
+        // must sit at/below the float's bottom; without `clear` it would start at
+        // the container top (much higher). We compare the two layouts' block y.
+        let floated = "<div style=\"float:left;width:80pt\">\
+                       <p>f1</p><p>f2</p><p>f3</p><p>f4</p><p>f5</p></div>";
+        let cleared = run(&format!(
+            "<div>{floated}<div style=\"clear:left\">After</div></div>"
+        ));
+        let not_cleared = run(&format!(
+            "<div>{floated}<div>After</div></div>"
+        ));
+        let y_of = |l: &Layout| text_xy(l).into_iter().find(|(_, _, s)| s == "After").unwrap().1;
+        let yc = y_of(&cleared);
+        let yn = y_of(&not_cleared);
+        assert!(
+            yc > yn + 20.0,
+            "clear:left pushes 'After' well below the non-cleared baseline (cleared={yc}, baseline={yn})"
+        );
+    }
+
+    #[test]
+    fn clear_right_ignores_a_left_float() {
+        // `clear:right` only clears RIGHT floats. Against a LEFT float it has no
+        // effect, so the block stays at the same height as a non-cleared block.
+        let floated = "<div style=\"float:left;width:80pt\">\
+                       <p>f1</p><p>f2</p><p>f3</p><p>f4</p><p>f5</p></div>";
+        let clear_right = run(&format!(
+            "<div>{floated}<div style=\"clear:right\">After</div></div>"
+        ));
+        let not_cleared = run(&format!(
+            "<div>{floated}<div>After</div></div>"
+        ));
+        let y_of = |l: &Layout| text_xy(l).into_iter().find(|(_, _, s)| s == "After").unwrap().1;
+        assert!(
+            (y_of(&clear_right) - y_of(&not_cleared)).abs() < 1.0,
+            "clear:right does not clear a left float (right={}, baseline={})",
+            y_of(&clear_right),
+            y_of(&not_cleared)
+        );
+    }
+
+    #[test]
+    fn clear_both_drops_below_a_right_float() {
+        // `clear:both` clears either side, so it drops below a RIGHT float too.
+        let floated = "<div style=\"float:right;width:80pt\">\
+                       <p>f1</p><p>f2</p><p>f3</p><p>f4</p><p>f5</p></div>";
+        let cleared = run(&format!(
+            "<div>{floated}<div style=\"clear:both\">After</div></div>"
+        ));
+        let not_cleared = run(&format!(
+            "<div>{floated}<div>After</div></div>"
+        ));
+        let y_of = |l: &Layout| text_xy(l).into_iter().find(|(_, _, s)| s == "After").unwrap().1;
+        assert!(
+            y_of(&cleared) > y_of(&not_cleared) + 20.0,
+            "clear:both drops below a right float (cleared={}, baseline={})",
+            y_of(&cleared),
+            y_of(&not_cleared)
         );
     }
 
