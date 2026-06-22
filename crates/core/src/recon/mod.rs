@@ -496,19 +496,210 @@ pub fn reconstruct_page(
     }
 
     // Images pass through as Image blocks (resource key handed by the caller).
+    // Before each image is emitted, a short caption paragraph sitting directly
+    // above or below it — same width, opening with a "Figure"/"Table"/… cue — is
+    // lifted into the image's `alt` and removed from the prose, so a figure and
+    // its legend reunite as one editable unit (the model has no separate caption
+    // field). Conservative: no association without a clear cue.
     for img in image_refs {
+        let frame = frame_top_down(img.x, img.y, img.w, img.h, x0, y0, page_h);
+        let alt = take_caption_for(&mut out, &frame);
         out.push(Block {
             id: ids.mint(),
-            frame: Some(frame_top_down(img.x, img.y, img.w, img.h, x0, y0, page_h)),
+            frame: Some(frame),
             rotation: Rotation::D0,
             kind: BlockKind::Image(ImageRef {
                 resource: img.resource,
-                alt: None,
+                alt,
             }),
         });
     }
 
     out
+}
+
+/// Find a caption paragraph for an image at `image_frame` (model **top-down**
+/// points), remove it from `blocks`, and return its text. A candidate must be a
+/// plain [`Paragraph`], lie immediately above or below the image (vertical gap
+/// ≤ `CAPTION_MAX_GAP_PT`), span roughly the image's width
+/// (`CAPTION_WIDTH_TOL`), and open with a caption cue
+/// (`Figure`/`Fig.`/`Table`/`Tableau`/`Image`/`Illustration`). Returns `None`
+/// when nothing qualifies — no figure ever loses an unrelated paragraph.
+fn take_caption_for(blocks: &mut Vec<Block>, image_frame: &Rect) -> Option<String> {
+    let img_top = image_frame.y;
+    let img_bottom = image_frame.y + image_frame.h;
+    let img_cx = image_frame.x + image_frame.w / 2.0;
+
+    let mut best: Option<(usize, f64)> = None; // (index, vertical gap)
+    for (i, b) in blocks.iter().enumerate() {
+        let BlockKind::Paragraph(para) = &b.kind else {
+            continue;
+        };
+        let Some(frame) = b.frame else { continue };
+        let text = paragraph_text(para);
+        if !is_caption_text(&text) {
+            continue;
+        }
+        // Width must be comparable to the image (a caption hugs its figure, not a
+        // full-measure body paragraph that merely happens to start with "Table").
+        if image_frame.w <= 0.0 {
+            continue;
+        }
+        let width_ratio = frame.w / image_frame.w;
+        if !(CAPTION_WIDTH_TOL.0..=CAPTION_WIDTH_TOL.1).contains(&width_ratio) {
+            continue;
+        }
+        // Horizontal overlap with the image (centre within the image span) guards
+        // against a same-width caption belonging to a neighbouring column.
+        if img_cx < frame.x - 1.0 || img_cx > frame.x + frame.w + 1.0 {
+            continue;
+        }
+        let para_top = frame.y;
+        let para_bottom = frame.y + frame.h;
+        // Gap to the nearest edge: caption directly below (para_top under image
+        // bottom) or directly above (para_bottom over image top).
+        let gap = if para_top >= img_bottom - 1.0 {
+            para_top - img_bottom
+        } else if para_bottom <= img_top + 1.0 {
+            img_top - para_bottom
+        } else {
+            continue; // overlaps the image vertically → not a caption band
+        };
+        if gap > CAPTION_MAX_GAP_PT {
+            continue;
+        }
+        if best.is_none_or(|(_, g)| gap < g) {
+            best = Some((i, gap));
+        }
+    }
+
+    let (idx, _) = best?;
+    let block = blocks.remove(idx);
+    let BlockKind::Paragraph(para) = block.kind else {
+        return None;
+    };
+    Some(paragraph_text(&para))
+}
+
+/// Maximum vertical gap (points) between an image edge and its caption.
+const CAPTION_MAX_GAP_PT: f64 = 24.0;
+
+/// Allowed caption-to-image width ratio band: a caption may be a touch narrower
+/// or wider than the image it labels, but not a full-measure body paragraph.
+const CAPTION_WIDTH_TOL: (f64, f64) = (0.5, 1.5);
+
+/// Whether `text` opens with a figure/table caption cue (case-insensitive,
+/// leading whitespace ignored). Matches `Figure`, `Fig.`, `Table`, `Tableau`,
+/// `Image`, `Illustration` — the conservative set of unambiguous legend leads.
+fn is_caption_text(text: &str) -> bool {
+    let t = text.trim_start();
+    if t.is_empty() {
+        return false;
+    }
+    const CUES: [&str; 6] = ["figure", "fig.", "table", "tableau", "image", "illustration"];
+    let lower = t.to_ascii_lowercase();
+    CUES.iter().any(|cue| {
+        lower.strip_prefix(cue).is_some_and(|rest| {
+            // A real cue is followed by a separator or number, not more letters
+            // ("imagery"/"tabletop" must not match).
+            rest.chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphabetic())
+        })
+    })
+}
+
+/// The display title of a [`Heading`](crate::model::Heading): its paragraph's
+/// flattened text. Used by [`reconstruct_model`](crate::Document::reconstruct_model)'s
+/// heading-based outline fallback.
+pub fn heading_title(heading: &crate::model::Heading) -> String {
+    paragraph_text(&heading.para)
+}
+
+/// Flatten a paragraph's inline runs (text + link text) into a single string,
+/// joining successive runs and rendering line breaks as spaces.
+fn paragraph_text(para: &crate::model::Paragraph) -> String {
+    use crate::model::Inline;
+    let mut s = String::new();
+    for inline in &para.runs {
+        match inline {
+            Inline::Run(run) => s.push_str(&run.text),
+            Inline::LineBreak => s.push(' '),
+            Inline::Link { children, .. } => {
+                for c in children {
+                    if let Inline::Run(run) = c {
+                        s.push_str(&run.text);
+                    }
+                }
+            }
+            Inline::Image(_) => {}
+        }
+    }
+    s.trim().to_string()
+}
+
+/// One flat outline entry to fold into a tree: a label, its nesting `level`
+/// (`0` = top), and a zero-based destination page. The source's reading-order
+/// sequence + `level` fully determines the parent/child shape.
+#[derive(Debug, Clone)]
+pub struct FlatOutline {
+    pub title: String,
+    pub level: usize,
+    pub page: usize,
+}
+
+/// Fold a pre-order, `level`-tagged flat outline into the model's nested
+/// [`OutlineNode`](crate::model::OutlineNode) tree.
+///
+/// This is the shared assembler for both outline sources in
+/// [`reconstruct_model`](crate::Document::reconstruct_model): the PDF's own
+/// `/Outlines` (preferred) and, as a fallback, detected document headings. A
+/// node attaches under the nearest preceding node of a strictly lower level; a
+/// level that jumps ahead (e.g. a stray `h3` with no `h2`) attaches at the
+/// deepest currently-open level rather than being dropped, so no entry is lost.
+pub fn fold_outline(flat: &[FlatOutline]) -> Vec<crate::model::OutlineNode> {
+    use crate::model::OutlineNode;
+
+    let mut roots: Vec<OutlineNode> = Vec::new();
+    // Path of indices from each root down to the current insertion point, one
+    // entry per open level. `stack[k]` locates the level-`k` ancestor.
+    let mut stack: Vec<usize> = Vec::new();
+
+    for item in flat {
+        let node = OutlineNode {
+            title: item.title.clone(),
+            page: item.page,
+            children: Vec::new(),
+        };
+        // Trim the open path so the new node hangs under a strictly shallower
+        // ancestor (clamped: a deeper jump than the path can't open extra levels).
+        let depth = item.level.min(stack.len());
+        stack.truncate(depth);
+
+        // Walk to the children list the node belongs in, following the path.
+        let siblings = walk_to_children(&mut roots, &stack);
+        siblings.push(node);
+        stack.push(siblings.len() - 1);
+    }
+    roots
+}
+
+/// Follow `path` (a chain of child indices from the roots) to the children list
+/// a new node should join. `path` is always well-formed by construction in
+/// [`fold_outline`] (each index was the freshly-pushed last child of its level),
+/// so every `idx` indexes a node that exists.
+fn walk_to_children<'a>(
+    roots: &'a mut Vec<crate::model::OutlineNode>,
+    path: &[usize],
+) -> &'a mut Vec<crate::model::OutlineNode> {
+    let mut level = roots;
+    for &idx in path {
+        // `idx` is guaranteed in-range (it indexes a node pushed earlier at this
+        // level); descend into its children. The unconditional reassignment keeps
+        // the borrow checker happy where a conditional `break` would not.
+        level = &mut level[idx].children;
+    }
+    level
 }
 
 /// A placed image, in PDF user space, keyed by its resource hash in the
@@ -1383,5 +1574,137 @@ mod tests {
             text.contains("documentation"),
             "the link wraps the covered run text, got {text:?}"
         );
+    }
+
+    // ── outline folding (#4) ────────────────────────────────────────────────
+
+    fn flat(title: &str, level: usize, page: usize) -> FlatOutline {
+        FlatOutline {
+            title: title.to_string(),
+            level,
+            page,
+        }
+    }
+
+    #[test]
+    fn fold_outline_builds_a_nested_tree() {
+        // h1 / (h2, h2 / h3) / h1 → two roots, the first with two children, the
+        // second child carrying a grandchild.
+        let tree = fold_outline(&[
+            flat("Chapter 1", 0, 0),
+            flat("Section 1.1", 1, 1),
+            flat("Section 1.2", 1, 2),
+            flat("Sub 1.2.1", 2, 2),
+            flat("Chapter 2", 0, 5),
+        ]);
+        assert_eq!(tree.len(), 2, "two top-level chapters");
+        assert_eq!(tree[0].title, "Chapter 1");
+        assert_eq!(tree[0].page, 0);
+        assert_eq!(tree[0].children.len(), 2, "chapter 1 has two sections");
+        assert_eq!(tree[0].children[1].title, "Section 1.2");
+        assert_eq!(
+            tree[0].children[1].children.len(),
+            1,
+            "section 1.2 nests a subsection"
+        );
+        assert_eq!(tree[0].children[1].children[0].title, "Sub 1.2.1");
+        assert_eq!(tree[1].title, "Chapter 2");
+        assert_eq!(tree[1].page, 5);
+        assert!(tree[1].children.is_empty());
+    }
+
+    #[test]
+    fn fold_outline_keeps_a_level_jump_instead_of_dropping_it() {
+        // A stray deep level with no intermediate parent must still be retained
+        // (clamped under the deepest open level), never silently lost.
+        let tree = fold_outline(&[flat("Top", 0, 0), flat("Way Deep", 5, 1)]);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].children.len(), 1, "deep entry attaches, not dropped");
+        assert_eq!(tree[0].children[0].title, "Way Deep");
+    }
+
+    #[test]
+    fn fold_outline_empty_is_empty() {
+        assert!(fold_outline(&[]).is_empty());
+    }
+
+    // ── figure captions (#9) ────────────────────────────────────────────────
+
+    #[test]
+    fn caption_cue_detection_is_conservative() {
+        assert!(is_caption_text("Figure 3: a flowchart"));
+        assert!(is_caption_text("  Fig. 2 — overview"));
+        assert!(is_caption_text("Table 1"));
+        assert!(is_caption_text("Tableau 4 : résultats"));
+        assert!(is_caption_text("Illustration 7"));
+        // Must not fire on words that merely start with a cue substring.
+        assert!(!is_caption_text("Imagery of the coast"));
+        assert!(!is_caption_text("Tabletop layout"));
+        assert!(!is_caption_text("Ordinary body sentence."));
+        assert!(!is_caption_text(""));
+    }
+
+    fn caption_para_block(text: &str, frame: Rect) -> Block {
+        use crate::model::{Inline, InlineRun, Paragraph};
+        Block {
+            id: BlockId(0),
+            frame: Some(frame),
+            rotation: Rotation::D0,
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: text.to_string(),
+                    ..InlineRun::default()
+                })],
+                ..Paragraph::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn caption_directly_below_an_image_is_lifted_out() {
+        // Image occupies y∈[100,200] (top-down), the caption sits just below it,
+        // same width and horizontally aligned.
+        let image_frame = Rect::new(50.0, 100.0, 200.0, 100.0);
+        let mut blocks = vec![
+            caption_para_block("Body paragraph far above", Rect::new(50.0, 10.0, 400.0, 12.0)),
+            caption_para_block("Figure 1: the diagram", Rect::new(55.0, 205.0, 190.0, 12.0)),
+        ];
+        let alt = take_caption_for(&mut blocks, &image_frame);
+        assert_eq!(alt.as_deref(), Some("Figure 1: the diagram"));
+        assert_eq!(blocks.len(), 1, "the caption paragraph is removed");
+        assert_eq!(
+            match &blocks[0].kind {
+                BlockKind::Paragraph(p) => paragraph_text(p),
+                _ => String::new(),
+            },
+            "Body paragraph far above",
+            "the unrelated body paragraph stays"
+        );
+    }
+
+    #[test]
+    fn full_width_paragraph_starting_with_table_is_not_a_caption() {
+        // "Table of contents" body line at full measure must NOT be absorbed: too
+        // wide relative to the image.
+        let image_frame = Rect::new(50.0, 100.0, 120.0, 80.0);
+        let mut blocks = vec![caption_para_block(
+            "Table of historical events from 1900",
+            Rect::new(50.0, 185.0, 500.0, 12.0),
+        )];
+        let alt = take_caption_for(&mut blocks, &image_frame);
+        assert!(alt.is_none(), "a full-measure paragraph is not a caption");
+        assert_eq!(blocks.len(), 1, "nothing removed");
+    }
+
+    #[test]
+    fn distant_caption_is_not_associated() {
+        // Right cue and width, but far below the image (gap ≫ CAPTION_MAX_GAP_PT).
+        let image_frame = Rect::new(50.0, 100.0, 200.0, 100.0);
+        let mut blocks = vec![caption_para_block(
+            "Figure 9: detached",
+            Rect::new(55.0, 400.0, 190.0, 12.0),
+        )];
+        assert!(take_caption_for(&mut blocks, &image_frame).is_none());
+        assert_eq!(blocks.len(), 1);
     }
 }

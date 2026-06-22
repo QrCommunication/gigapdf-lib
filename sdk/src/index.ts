@@ -1287,10 +1287,25 @@ export interface GigaSection {
 }
 
 /**
+ * A document outline (bookmark) entry — a label, a zero-based destination page,
+ * and nested children (mirror of `model::OutlineNode`). Populated by
+ * {@link GigaPdf.officeToModel}/reconstruction from the source's own bookmarks
+ * (PDF `/Outlines`) or, lacking those, from detected headings.
+ */
+export interface GigaOutlineNode {
+  /** The bookmark label. */
+  title: string;
+  /** Zero-based destination page in the document's flattened page sequence. */
+  page: number;
+  /** Nested sub-bookmarks. */
+  children: GigaOutlineNode[];
+}
+
+/**
  * The unified editable document model — the format-neutral tree every format
  * lowers into and is reconstructed from. `v` is the envelope version. Leaves
- * beyond what a host typically edits (`styles`, `outline`, `resources`) are
- * carried opaquely so a round-trip preserves them.
+ * beyond what a host typically edits (`styles`, `resources`) are carried
+ * opaquely so a round-trip preserves them.
  */
 export interface GigaDocument {
   v: number;
@@ -1303,7 +1318,8 @@ export interface GigaDocument {
   };
   styles: unknown;
   sections: GigaSection[];
-  outline: unknown[];
+  /** Bookmark / chapter hierarchy (empty when the source has none). */
+  outline: GigaOutlineNode[];
   resources: unknown;
 }
 

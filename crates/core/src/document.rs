@@ -4323,12 +4323,72 @@ impl Document {
                 .filter(|s| !s.is_empty()),
         };
 
+        // Outline (bookmarks → chapter hierarchy). Prefer the PDF's own
+        // `/Outlines` tree (the author's real structure); when absent, fall back
+        // to folding the detected `Heading` blocks by level so a host still gets
+        // a navigable table of contents. Both lower into the same nested
+        // `OutlineNode` tree via `recon::fold_outline`.
+        let outline = {
+            let from_pdf: Vec<recon::FlatOutline> = self
+                .outline_items()
+                .into_iter()
+                .map(|it| recon::FlatOutline {
+                    title: it.title,
+                    level: it.level,
+                    // `OutlineItem::page` is 1-based (or `None` when it doesn't
+                    // resolve); the model's `OutlineNode::page` is 0-based.
+                    page: it.page.map_or(0, |p| p.saturating_sub(1) as usize),
+                })
+                .collect();
+            let flat = if from_pdf.is_empty() {
+                Self::headings_outline(&sections)
+            } else {
+                from_pdf
+            };
+            recon::fold_outline(&flat)
+        };
+
         crate::model::Document {
             meta,
             sections,
             resources,
+            outline,
             ..crate::model::Document::default()
         }
+    }
+
+    /// Fallback outline source: fold the reconstructed `Heading` blocks into a
+    /// flat, level-tagged list (pre-order over the flattened page sequence) for
+    /// [`recon::fold_outline`]. Used only when the PDF carries no `/Outlines`.
+    /// The page index is the heading's zero-based position in the document's
+    /// flattened page sequence (matching `OutlineNode::page`); the title is the
+    /// heading paragraph's text. Headings nested inside tables/cells/text-boxes
+    /// are not surfaced (a TOC reflects top-level structure).
+    fn headings_outline(sections: &[crate::model::Section]) -> Vec<crate::recon::FlatOutline> {
+        use crate::model::BlockKind;
+
+        let mut flat = Vec::new();
+        let mut page_index = 0usize;
+        for section in sections {
+            for page in &section.pages {
+                for block in &page.blocks {
+                    if let BlockKind::Heading(h) = &block.kind {
+                        let title = crate::recon::heading_title(h);
+                        if !title.is_empty() {
+                            flat.push(crate::recon::FlatOutline {
+                                // Heading levels are 1-based (`1..=6`); outline
+                                // levels are 0-based (`0` = top).
+                                level: usize::from(h.level.saturating_sub(1)),
+                                title,
+                                page: page_index,
+                            });
+                        }
+                    }
+                }
+                page_index += 1;
+            }
+        }
+        flat
     }
 
     /// Logical **layout blocks** for a single page: the structural
@@ -14960,6 +15020,166 @@ mod tests {
         assert_eq!(it.dest_x, Some(100.0));
         assert_eq!(it.dest_y, Some(700.0));
         assert_eq!(it.dest_zoom, Some(2.0));
+    }
+
+    /// #4(a): a PDF that carries a `/Outlines` bookmark tree lowers that exact
+    /// structure into `reconstruct_model().outline` (title + 0-based page + the
+    /// parent/child nesting), preferring it over any heading heuristic.
+    #[test]
+    fn reconstruct_model_populates_outline_from_pdf_bookmarks() {
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        let page_id = doc.page_object_id(1).unwrap();
+        let base = doc.next_object_number();
+        let outlines_id = (base, 0u16);
+        let chapter_id = (base + 1, 0u16);
+        let section_id = (base + 2, 0u16);
+
+        // /Outlines → "Chapter 1" → (child) "Section 1.1", both → page 1.
+        let dest = || {
+            Object::Array(vec![
+                Object::Reference(page_id),
+                Object::Name(b"XYZ".to_vec()),
+                Object::Integer(0),
+                Object::Integer(792),
+                Object::Integer(0),
+            ])
+        };
+        let mut chapter = Dictionary::new();
+        chapter.set(b"Title", Object::String(b"Chapter 1".to_vec(), StringKind::Literal));
+        chapter.set(b"Parent", Object::Reference(outlines_id));
+        chapter.set(b"First", Object::Reference(section_id));
+        chapter.set(b"Last", Object::Reference(section_id));
+        chapter.set(b"Dest", dest());
+        doc.objects.insert(chapter_id, Object::Dictionary(chapter));
+
+        let mut section = Dictionary::new();
+        section.set(b"Title", Object::String(b"Section 1.1".to_vec(), StringKind::Literal));
+        section.set(b"Parent", Object::Reference(chapter_id));
+        section.set(b"Dest", dest());
+        doc.objects.insert(section_id, Object::Dictionary(section));
+
+        let mut outlines = Dictionary::new();
+        outlines.set(b"Type", Object::Name(b"Outlines".to_vec()));
+        outlines.set(b"First", Object::Reference(chapter_id));
+        outlines.set(b"Last", Object::Reference(chapter_id));
+        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+
+        let catalog_id = doc.catalog_id().unwrap();
+        let mut catalog = doc
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+        catalog.set(b"Outlines".to_vec(), Object::Reference(outlines_id));
+        doc.objects.insert(catalog_id, Object::Dictionary(catalog));
+
+        let model = doc.reconstruct_model();
+        assert_eq!(model.outline.len(), 1, "one top-level chapter");
+        let chapter = &model.outline[0];
+        assert_eq!(chapter.title, "Chapter 1");
+        assert_eq!(chapter.page, 0, "1-based PDF dest page 1 → 0-based model page 0");
+        assert_eq!(chapter.children.len(), 1, "the section nests under the chapter");
+        assert_eq!(chapter.children[0].title, "Section 1.1");
+    }
+
+    /// #4(b): with no `/Outlines`, the reconstructed `Heading` blocks are folded
+    /// into an outline by level so a host still gets a navigable chapter tree.
+    #[test]
+    fn reconstruct_model_falls_back_to_heading_outline() {
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        // A 24pt title (→ heading L1) high on the page, with 12pt body lines well
+        // below it (large leading gap so the title stays its own one-line
+        // paragraph, not merged with the body). The body median is 12, so the
+        // 24pt title clears the 1.15× heading-promotion threshold.
+        let content = "BT /F0 24 Tf 72 740 Td (Chapter One) Tj ET\n\
+                       BT /F0 12 Tf 72 600 Td (Body text that stays a paragraph.) Tj ET\n\
+                       BT /F0 12 Tf 72 584 Td (A second body line follows it.) Tj ET\n";
+        doc.set_page_content(1, content.as_bytes().to_vec()).unwrap();
+
+        let model = doc.reconstruct_model();
+        // Sanity: the title really did promote to a heading.
+        let has_heading = model.sections.iter().any(|s| {
+            s.pages.iter().any(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b.kind, crate::model::BlockKind::Heading(_)))
+            })
+        });
+        assert!(has_heading, "the 24pt line should promote to a Heading");
+        assert_eq!(model.outline.len(), 1, "the heading seeds one outline entry");
+        assert_eq!(model.outline[0].title, "Chapter One");
+        assert_eq!(model.outline[0].page, 0, "heading on the first (index 0) page");
+    }
+
+    /// #9: an image with a "Figure N: …" caption directly below it carries that
+    /// legend in `ImageRef.alt`, and the caption paragraph is no longer a
+    /// standalone block.
+    #[test]
+    fn reconstruct_model_attaches_figure_caption_to_image() {
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        // A real (decodable) 2×2 PNG placed as a 120×100 figure at user-space
+        // (100, 560); `add_image` is the same path production uses, so the image
+        // reconstructs as an Image block.
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
+        let png = crate::raster::png::encode_png(2, 2, &rgba);
+        doc.add_image(1, &png, 100.0, 560.0, 120.0, 100.0, 1.0)
+            .unwrap();
+        // Caption directly below the image bottom (user-space y≈545), roughly the
+        // image's width, opening with a "Figure" cue.
+        doc.add_text_standard(
+            1,
+            105.0,
+            545.0,
+            11.0,
+            "Figure 1: the sample chart",
+            "Helvetica",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+
+        let model = doc.reconstruct_model();
+        let mut image_alt: Option<String> = None;
+        let mut caption_is_standalone = false;
+        for section in &model.sections {
+            for page in &section.pages {
+                for block in &page.blocks {
+                    match &block.kind {
+                        crate::model::BlockKind::Image(img) => image_alt = img.alt.clone(),
+                        crate::model::BlockKind::Paragraph(p) => {
+                            let text: String = p
+                                .runs
+                                .iter()
+                                .filter_map(|r| match r {
+                                    crate::model::Inline::Run(run) => Some(run.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            if text.contains("Figure 1") {
+                                caption_is_standalone = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            image_alt.as_deref(),
+            Some("Figure 1: the sample chart"),
+            "the image carries the caption as alt text"
+        );
+        assert!(
+            !caption_is_standalone,
+            "the caption is lifted into the image, not left as a loose paragraph"
+        );
     }
 
     #[test]
