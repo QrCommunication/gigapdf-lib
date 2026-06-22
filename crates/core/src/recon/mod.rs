@@ -69,6 +69,10 @@ pub struct ReconRun {
     /// drawn underline (PDF has no font underline flag). Set by
     /// [`mark_underlines`] before line grouping so it flows into every stage.
     pub underline: bool,
+    /// Whether a thin horizontal ruling line crosses the run at mid-glyph — a
+    /// drawn strikethrough (PDF has no font strike flag either). Set by
+    /// [`mark_strikes`] before line grouping so it flows into every stage.
+    pub strike: bool,
 }
 
 impl ReconRun {
@@ -154,8 +158,10 @@ pub fn runs_from_elements(
                 // Form-XObject (nested) text is display-only — not editable by a
                 // top-level run index, so it carries no source index.
                 source_index: if e.nested { None } else { Some(e.index) },
-                // Set later by `mark_underlines` from the page's ruling lines.
+                // Set later by `mark_underlines` / `mark_strikes` from the page's
+                // ruling lines.
                 underline: false,
+                strike: false,
             })
         })
         .collect()
@@ -193,12 +199,13 @@ pub(crate) fn char_style(style: &TextStyle, size_pt: f64) -> CharStyle {
 }
 
 /// [`char_style`] for a concrete [`ReconRun`], carrying its recovered
-/// `underline` flag through. Every reconstruction stage that materialises an
-/// [`InlineRun`](crate::model::InlineRun) from a run uses this so a drawn
-/// underline reaches the editable model.
+/// `underline` and `strike` flags through. Every reconstruction stage that
+/// materialises an [`InlineRun`](crate::model::InlineRun) from a run uses this so
+/// a drawn underline or strikethrough reaches the editable model.
 pub(crate) fn run_char_style(run: &ReconRun) -> CharStyle {
     CharStyle {
         underline: run.underline,
+        strike: run.strike,
         ..char_style(&run.style, run.size)
     }
 }
@@ -321,6 +328,59 @@ pub(crate) fn mark_underlines(runs: &mut [ReconRun], vpaths: &[VectorPath]) -> V
     consumed.into_iter().collect()
 }
 
+/// Set [`ReconRun::strike`] for runs crossed by a thin **horizontal** ruling line
+/// at **mid-glyph**, and return the path indices consumed as strikethroughs (so
+/// the caller does not also emit them as [`Shape`] blocks, nor read them as table
+/// grid edges — the same hygiene [`mark_underlines`] applies).
+///
+/// This is the underline detector applied one band higher. An underline rides
+/// just under the baseline (`[box_bottom − 0.30·h, box_bottom + 0.22·h]`); a
+/// strikethrough sits across the centre of the glyph body, well above the
+/// baseline — so the rule's `y` must land in `[box_bottom + 0.35·h, box_bottom +
+/// 0.58·h]`. The `0.35·h` floor leaves a clear gap above the underline band's
+/// `0.22·h` ceiling, so a single rule is never read as both. As with underlines,
+/// a path must overlap ≥ 55 % of the run's width, and one drawn rule may strike
+/// several adjacent runs (a whole phrase) yet is recorded once as consumed.
+pub(crate) fn mark_strikes(runs: &mut [ReconRun], vpaths: &[VectorPath]) -> Vec<usize> {
+    // Candidate horizontal rules: (y, x0, x1, path index).
+    let rules: Vec<(f64, f64, f64, usize)> = vpaths
+        .iter()
+        .filter_map(|vp| match ruling_orientation(vp) {
+            Some(Ruling::Horizontal { y, x0, x1 }) => Some((y, x0, x1, vp.index)),
+            _ => None,
+        })
+        .collect();
+    if rules.is_empty() {
+        return Vec::new();
+    }
+
+    let mut consumed = std::collections::BTreeSet::new();
+    for run in runs.iter_mut() {
+        if run.text.trim().is_empty() || run.w <= 0.0 {
+            continue;
+        }
+        // Mid-glyph band, measured up from the run box bottom (`y`). Clear of the
+        // underline band (which tops out at +0.22·h) so no rule is double-claimed.
+        let bottom = run.y;
+        let lo = bottom + run.h * 0.35;
+        let hi = bottom + run.h * 0.58;
+        let run_x0 = run.x;
+        let run_x1 = run.x + run.w;
+        for &(ry, rx0, rx1, idx) in &rules {
+            if ry < lo || ry > hi {
+                continue;
+            }
+            let overlap = (run_x1.min(rx1) - run_x0.max(rx0)).max(0.0);
+            if overlap >= run.w * 0.55 {
+                run.strike = true;
+                consumed.insert(idx);
+                break;
+            }
+        }
+    }
+    consumed.into_iter().collect()
+}
+
 /// Assemble all logical blocks for one page from its text runs, painted paths
 /// and images. The reading order is column-major (left band first, top→bottom
 /// within a band); each block keeps `frame = Some(rect)` for fidelity. Non-rule
@@ -343,10 +403,16 @@ pub fn reconstruct_page(
         return blocks;
     }
 
-    // 0. Recover drawn underlines: flag runs sitting above a thin horizontal rule
-    //    and collect those rules' path indices so they aren't re-emitted as shapes.
-    let underline_paths: std::collections::BTreeSet<usize> =
-        mark_underlines(&mut text_runs, vpaths).into_iter().collect();
+    // 0. Recover drawn text decorations: flag runs sitting above a thin horizontal
+    //    rule (underline) or crossed by one at mid-glyph (strikethrough), and
+    //    collect those rules' path indices. They must neither be re-emitted as
+    //    shapes (double-drawing the decoration) nor read as table grid edges
+    //    (phantom rows/columns), so both sets feed the one `consumed_rule_paths`.
+    let mut consumed_rule_paths: std::collections::BTreeSet<usize> =
+        mark_underlines(&mut text_runs, vpaths)
+            .into_iter()
+            .collect();
+    consumed_rule_paths.extend(mark_strikes(&mut text_runs, vpaths));
 
     // 1. Lines, then 2. reading-order columns over those lines.
     let lines = lines::group_into_lines(&text_runs);
@@ -357,7 +423,7 @@ pub fn reconstruct_page(
 
     // Ruling-line tables first, so the lines they cover are not also emitted as
     // prose. A table consumes the line indices that fall inside its grid.
-    let table_plan = tables::plan_tables(&lines, vpaths, &underline_paths);
+    let table_plan = tables::plan_tables(&lines, vpaths, &consumed_rule_paths);
 
     for &line_idx in &order {
         if let Some(tbl) = table_plan.take_if_starts_at(line_idx) {
@@ -389,7 +455,7 @@ pub fn reconstruct_page(
     // ruling line not consumed by a table also survives as a shape so nothing is
     // silently dropped.
     for vp in vpaths {
-        if table_plan.uses_path(vp.index) || underline_paths.contains(&vp.index) {
+        if table_plan.uses_path(vp.index) || consumed_rule_paths.contains(&vp.index) {
             continue;
         }
         let Some(b) = vp.bounds else { continue };
@@ -554,6 +620,7 @@ mod tests {
             rotation: 0.0,
             source_index: None,
             underline: false,
+            strike: false,
         }
     }
 
@@ -870,7 +937,11 @@ mod tests {
         };
         let consumed = mark_underlines(&mut runs, &[rule]);
         assert!(runs[0].underline, "run over a thin rule is underlined");
-        assert_eq!(consumed, vec![5], "the rule path is consumed, not drawn twice");
+        assert_eq!(
+            consumed,
+            vec![5],
+            "the rule path is consumed, not drawn twice"
+        );
     }
 
     /// A rule far from any baseline (or not overlapping) leaves runs un-underlined.
@@ -902,6 +973,162 @@ mod tests {
         assert!(consumed.is_empty());
     }
 
+    // ── strikethrough recovery (drawn rule across mid-glyph) ─────────────────
+
+    /// A thin horizontal rule crossing a run at mid-glyph flags it struck through
+    /// and is consumed (so it isn't also re-emitted as a shape).
+    #[test]
+    fn mark_strikes_flags_a_run_crossed_at_mid_glyph() {
+        use crate::content::vector::{PathSeg, VectorPath};
+        use crate::content::Bounds;
+        // A run at lower-left (72,700), 100 wide, 12 tall.
+        let mut runs = vec![run("struck", 72.0, 700.0, 12.0)];
+        runs[0].w = 100.0;
+        // A 0.6pt-tall rule at ~0.45·h above the box bottom (y ≈ 700 + 5.4).
+        let rule = VectorPath {
+            index: 7,
+            bounds: Some(Bounds {
+                x: 72.0,
+                y: 705.1,
+                width: 100.0,
+                height: 0.6,
+            }),
+            segments: vec![PathSeg::Move(72.0, 705.4), PathSeg::Line(172.0, 705.4)],
+            fill: None,
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 0.6,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        };
+        let consumed = mark_strikes(&mut runs, &[rule]);
+        assert!(runs[0].strike, "run crossed at mid-glyph is struck through");
+        assert!(
+            !runs[0].underline,
+            "a strike rule must not also flag underline"
+        );
+        assert_eq!(
+            consumed,
+            vec![7],
+            "the rule path is consumed, not drawn twice"
+        );
+    }
+
+    /// The underline and strikethrough bands do not overlap: an underline rule
+    /// (just under the baseline) is never read as a strike, and a strike rule
+    /// (mid-glyph) is never read as an underline. Same rule geometry, two passes.
+    #[test]
+    fn underline_and_strike_bands_are_disjoint() {
+        use crate::content::vector::{PathSeg, VectorPath};
+        use crate::content::Bounds;
+        let thin = |index: usize, y: f64| VectorPath {
+            index,
+            bounds: Some(Bounds {
+                x: 72.0,
+                y: y - 0.3,
+                width: 100.0,
+                height: 0.6,
+            }),
+            segments: vec![PathSeg::Move(72.0, y), PathSeg::Line(172.0, y)],
+            fill: None,
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 0.6,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        };
+        // Underline rule just under the baseline (≈ box bottom): strike must ignore it.
+        let mut r1 = vec![run("x", 72.0, 700.0, 12.0)];
+        r1[0].w = 100.0;
+        let under = thin(1, 700.1);
+        assert!(
+            mark_strikes(&mut r1, &[under]).is_empty(),
+            "strike ignores the underline band"
+        );
+        assert!(!r1[0].strike);
+
+        // Strike rule at mid-glyph: underline must ignore it.
+        let mut r2 = vec![run("x", 72.0, 700.0, 12.0)];
+        r2[0].w = 100.0;
+        let strike = thin(2, 705.4);
+        assert!(
+            mark_underlines(&mut r2, &[strike]).is_empty(),
+            "underline ignores the strike band"
+        );
+        assert!(!r2[0].underline);
+    }
+
+    /// A struck-through run reaches the editable model: `pageBlocks` surfaces a
+    /// paragraph whose inline run carries `style.strike = true`. Mirrors the
+    /// underline e2e test, but the bar is drawn one band higher (mid-glyph) so it
+    /// is recovered as a strikethrough, not an underline.
+    #[test]
+    fn page_blocks_expose_a_struck_through_run() {
+        let mut b = PdfBuilder::new();
+        let page = b.add_page(612.0, 792.0);
+        let black = [0.0, 0.0, 0.0];
+        let body = StdFont::Helvetica;
+
+        // Three tightly-spaced 12pt body lines; the third is struck through by a
+        // thin rule drawn across its mid-glyph (≈ baseline − 0.35·size, i.e. a few
+        // points *above* the underline position of the same line).
+        b.text(
+            page,
+            72.0,
+            140.0,
+            12.0,
+            "Plain opening line of body text.",
+            body,
+            black,
+        );
+        b.text(
+            page,
+            72.0,
+            156.0,
+            12.0,
+            "A second body line continues on.",
+            body,
+            black,
+        );
+        b.text(
+            page,
+            72.0,
+            172.0,
+            12.0,
+            "Struck-through closing line now.",
+            body,
+            black,
+        );
+        // Underline of this line would sit at top-down ≈ 182.2 (just under the
+        // baseline ≈ 181.6); the strike rides mid-glyph, ≈ 4–5pt higher.
+        b.rect(page, 72.0, 177.0, 150.0, 0.6, None, Some(black));
+
+        let doc = open(b.finish());
+        let blocks = doc.page_blocks(1);
+        assert!(
+            !blocks.is_empty(),
+            "page_blocks returns the reconstructed blocks"
+        );
+
+        let any_strike = blocks.iter().any(|bl| match &bl.kind {
+            BK::Paragraph(p) => para_has_strike(p),
+            BK::Heading(h) => para_has_strike(&h.para),
+            _ => false,
+        });
+        assert!(
+            any_strike,
+            "the rule across the line flags a struck-through run"
+        );
+    }
+
+    /// Whether any run in a paragraph is flagged struck through.
+    fn para_has_strike(p: &crate::model::Paragraph) -> bool {
+        p.runs.iter().any(|inl| match inl {
+            crate::model::Inline::Run(r) => r.style.strike,
+            _ => false,
+        })
+    }
+
     // ── end-to-end: `page_blocks` exposes the recognised structure (typed) ───
 
     /// The SDK's `pageBlocks` (→ `Document::page_blocks`) must surface the
@@ -922,9 +1149,33 @@ mod tests {
         b.text(page, 72.0, 70.0, 24.0, "Quarterly Report", bold, black);
         // Body paragraph: three 12pt lines at a regular 16pt leading. The third is
         // underlined by a thin rule drawn just under its baseline.
-        b.text(page, 72.0, 140.0, 12.0, "Plain opening line of body text.", body, black);
-        b.text(page, 72.0, 156.0, 12.0, "A second body line continues on.", body, black);
-        b.text(page, 72.0, 172.0, 12.0, "Underlined closing line here now.", body, black);
+        b.text(
+            page,
+            72.0,
+            140.0,
+            12.0,
+            "Plain opening line of body text.",
+            body,
+            black,
+        );
+        b.text(
+            page,
+            72.0,
+            156.0,
+            12.0,
+            "A second body line continues on.",
+            body,
+            black,
+        );
+        b.text(
+            page,
+            72.0,
+            172.0,
+            12.0,
+            "Underlined closing line here now.",
+            body,
+            black,
+        );
         // Underline rule under the third line: builder baseline ≈ top + size*0.8,
         // i.e. top-down 172 + 9.6 ≈ 181.6; draw a 0.6pt bar a hair below.
         b.rect(page, 72.0, 182.2, 150.0, 0.6, None, Some(black));
@@ -943,7 +1194,10 @@ mod tests {
 
         let doc = open(b.finish());
         let blocks = doc.page_blocks(1);
-        assert!(!blocks.is_empty(), "page_blocks returns the reconstructed blocks");
+        assert!(
+            !blocks.is_empty(),
+            "page_blocks returns the reconstructed blocks"
+        );
 
         // 1) A heading with a recovered level.
         let heading = blocks
@@ -953,7 +1207,10 @@ mod tests {
                 _ => None,
             })
             .expect("the large bold title is exposed as a Heading");
-        assert!(heading.level >= 1 && heading.level <= 6, "heading carries a level");
+        assert!(
+            heading.level >= 1 && heading.level <= 6,
+            "heading carries a level"
+        );
         // Its run is bold (recovered from the BaseFont name).
         let head_bold = first_run_style(&heading.para)
             .map(|s| s.bold)
@@ -966,7 +1223,10 @@ mod tests {
             BK::Heading(h) => para_has_underline(&h.para),
             _ => false,
         });
-        assert!(any_underline, "the rule under the second line flags an underlined run");
+        assert!(
+            any_underline,
+            "the rule under the second line flags an underlined run"
+        );
 
         // 3) A table with rows of cells whose content is reachable.
         let table = blocks
@@ -977,7 +1237,10 @@ mod tests {
             })
             .expect("the ruled grid is exposed as a Table");
         assert_eq!(table.rows.len(), 2, "two body rows");
-        assert!(table.rows.iter().all(|r| r.cells.len() == 2), "two cells per row");
+        assert!(
+            table.rows.iter().all(|r| r.cells.len() == 2),
+            "two cells per row"
+        );
         // Cells carry editable block content (a paragraph with a run).
         let cell_text = cell_first_text(&table.rows[0].cells[0]);
         assert!(!cell_text.is_empty(), "a cell exposes its text run");

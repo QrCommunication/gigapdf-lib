@@ -40,6 +40,14 @@ pub struct PlannedTable {
     covered_lines: BTreeSet<usize>,
     used_paths: BTreeSet<usize>,
     start_line: usize,
+    /// Raw horizontal rule segments `(y, x0, x1)` that drew the grid (ruled only;
+    /// empty for the borderless fallback). Used by [`build_table`] to detect a
+    /// **missing interior rule** ⇒ a merged (spanning) cell. Keeping the segments
+    /// (not just the clustered edges) is what lets us tell "edge exists but this
+    /// row has no rule along it" apart from "edge exists everywhere".
+    h_segs: Vec<(f64, f64, f64)>,
+    /// Raw vertical rule segments `(x, y0, y1)` (ruled only; empty otherwise).
+    v_segs: Vec<(f64, f64, f64)>,
 }
 
 /// The set of tables planned for a page, with helpers `reconstruct_page` uses to
@@ -234,17 +242,98 @@ pub fn build_table(
     // Column widths from the edges.
     let col_widths: Vec<f64> = table.cols.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
 
+    // ── merged-cell inference (ruled tables only) ────────────────────────────
+    //
+    // A grid edge in `cols`/`rows` exists because *some* rule lies along it, but a
+    // **merged** cell is one where the interior rule along its boundary is
+    // *missing for those particular rows/columns* (e.g. an invoice header that
+    // spans two columns leaves no vertical divider in the header row). We grow a
+    // span out of a slot only while the interior rule is provably **absent** — a
+    // fully-ruled data table has every interior edge drawn, so nothing merges and
+    // the output is byte-for-byte the previous 1×1 grid. Borderless tables carry
+    // no segments, so this never fires there.
+    let infer_spans = table.ruled && (!table.h_segs.is_empty() || !table.v_segs.is_empty());
+
+    // `covered[r][c]` = this slot was absorbed by a span anchored above/left, so
+    // it is not emitted as its own cell.
+    let mut covered = vec![vec![false; n_cols]; n_rows];
+    // Per-anchor computed spans (1×1 unless inference grows them).
+    let mut span = vec![vec![(1usize, 1usize); n_cols]; n_rows];
+
+    if infer_spans {
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                if covered[r][c] {
+                    continue;
+                }
+                // Grow the column span: extend right while the vertical edge
+                // between the current block and the next column is absent across
+                // row r's full height. Stop at the first present divider.
+                let mut cspan = 1;
+                while c + cspan < n_cols && !vrule_present(table, table.cols[c + cspan], r, r + 1) {
+                    cspan += 1;
+                }
+                // Grow the row span: extend down while, for **every** column the
+                // block already covers, the horizontal edge below the current
+                // block is absent. A single present segment anywhere along the
+                // boundary blocks the merge (keeps the grid honest).
+                let mut rspan = 1;
+                while r + rspan < n_rows
+                    && (c..c + cspan)
+                        .all(|cc| !hrule_present(table, table.rows[r + rspan], cc, cc + 1))
+                {
+                    rspan += 1;
+                }
+                span[r][c] = (cspan, rspan);
+                // Mark the absorbed slots covered, and fold their text/style into
+                // the anchor so nothing a span swallows is lost.
+                for rr in r..r + rspan {
+                    for cc in c..c + cspan {
+                        if rr == r && cc == c {
+                            continue;
+                        }
+                        covered[rr][cc] = true;
+                        let absorbed = std::mem::take(&mut grid[rr][cc]);
+                        if !absorbed.is_empty() {
+                            let anchor = &mut grid[r][c];
+                            if !anchor.is_empty() {
+                                anchor.push(' ');
+                            }
+                            anchor.push_str(&absorbed);
+                        }
+                        if styles[r][c].is_none() {
+                            styles[r][c] = styles[rr][cc].take();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut rows: Vec<Row> = Vec::with_capacity(n_rows);
     for r in 0..n_rows {
         // Row edges are top→bottom (descending Y); height is the gap.
         let height = (table.rows[r] - table.rows[r + 1]).abs();
         let mut cells: Vec<Cell> = Vec::with_capacity(n_cols);
         for c in 0..n_cols {
+            // A slot absorbed by a span anchored above/left is not emitted: the
+            // row supplies fewer cells, which is exactly how the model (and the
+            // DOCX/ODT exporters) express a merge — see `Cell::col_span`.
+            if covered[r][c] {
+                continue;
+            }
             // Empty interior cells stay empty cells (an unfilled span renders as
             // blank), so the grid shape is preserved rather than collapsed.
             let text = std::mem::take(&mut grid[r][c]);
             let style = styles[r][c].take();
-            cells.push(make_cell(text, style, ids));
+            let (cspan, rspan) = span[r][c];
+            cells.push(make_cell_spanned(
+                text,
+                style,
+                cspan as u16,
+                rspan as u16,
+                ids,
+            ));
         }
         rows.push(Row {
             cells,
@@ -280,7 +369,17 @@ pub fn build_table(
     })
 }
 
-fn make_cell(text: String, style: Option<crate::model::CharStyle>, ids: &mut IdGen) -> Cell {
+/// Materialise one [`Cell`] holding `text` (one paragraph run) with the given
+/// spans. A 1×1 cell is the common case; `col_span`/`row_span` > 1 mark a merged
+/// region whose absorbed slots were dropped from their rows (the merge encoding
+/// the model and exporters expect).
+fn make_cell_spanned(
+    text: String,
+    style: Option<crate::model::CharStyle>,
+    col_span: u16,
+    row_span: u16,
+    ids: &mut IdGen,
+) -> Cell {
     use crate::model::{Inline, InlineRun};
     let runs = if text.is_empty() {
         Vec::new()
@@ -303,10 +402,71 @@ fn make_cell(text: String, style: Option<crate::model::CharStyle>, ids: &mut IdG
     };
     Cell {
         blocks: vec![para],
-        col_span: 1,
-        row_span: 1,
+        col_span: col_span.max(1),
+        row_span: row_span.max(1),
         shading: None,
     }
+}
+
+// ── interior-rule probes (drive merged-cell inference) ───────────────────────
+//
+// X/Y match tolerance for "a segment lies on this edge" — the same slack
+// `cluster_edges` used to fuse near-equal coordinates into one edge.
+const EDGE_TOL: f64 = 3.0;
+// A boundary counts as **ruled** only when drawn segments cover at least this
+// fraction of its length. High enough that a real interior divider (drawn full
+// height/width) always qualifies, so only a *deliberately omitted* divider reads
+// as absent and triggers a span. Conservative by design.
+const RULE_COVER: f64 = 0.6;
+
+/// Whether a **vertical** rule lies along `x_edge` across the Y-band between row
+/// edges `r0` (top) and `r1` (bottom). Sums the coverage of every collinear
+/// vertical segment (a divider can be drawn in pieces) and tests it against
+/// [`RULE_COVER`] of the band height.
+fn vrule_present(table: &PlannedTable, x_edge: f64, r0: usize, r1: usize) -> bool {
+    let (Some(&y_top), Some(&y_bot)) = (table.rows.get(r0), table.rows.get(r1)) else {
+        return false;
+    };
+    let band = (y_top - y_bot).abs();
+    if band <= 0.0 {
+        return false;
+    }
+    let mut covered = 0.0;
+    for &(x, sy0, sy1) in &table.v_segs {
+        if (x - x_edge).abs() > EDGE_TOL {
+            continue;
+        }
+        let lo = sy0.min(sy1).max(y_bot.min(y_top));
+        let hi = sy0.max(sy1).min(y_top.max(y_bot));
+        if hi > lo {
+            covered += hi - lo;
+        }
+    }
+    covered >= band * RULE_COVER
+}
+
+/// Whether a **horizontal** rule lies along `y_edge` across the X-band between
+/// column edges `c0` (left) and `c1` (right). Mirror of [`vrule_present`].
+fn hrule_present(table: &PlannedTable, y_edge: f64, c0: usize, c1: usize) -> bool {
+    let (Some(&x_lo), Some(&x_hi)) = (table.cols.get(c0), table.cols.get(c1)) else {
+        return false;
+    };
+    let band = (x_hi - x_lo).abs();
+    if band <= 0.0 {
+        return false;
+    }
+    let mut covered = 0.0;
+    for &(y, sx0, sx1) in &table.h_segs {
+        if (y - y_edge).abs() > EDGE_TOL {
+            continue;
+        }
+        let lo = sx0.min(sx1).max(x_lo.min(x_hi));
+        let hi = sx0.max(sx1).min(x_lo.max(x_hi));
+        if hi > lo {
+            covered += hi - lo;
+        }
+    }
+    covered >= band * RULE_COVER
 }
 
 /// Find the column index whose `[lo, hi)` contains `x` (edges ascending).
@@ -399,6 +559,8 @@ fn plan_ruled(
         covered_lines: covered,
         used_paths,
         start_line,
+        h_segs: h_rules,
+        v_segs: v_rules,
     })
 }
 
@@ -511,6 +673,11 @@ fn plan_borderless(lines: &[ReconLine], free: &[usize]) -> Option<PlannedTable> 
         covered_lines: covered,
         used_paths: BTreeSet::new(),
         start_line,
+        // Borderless tables have no rules, so cell-merge inference (which proves
+        // a span by a *missing* interior rule) cannot run — leave the segs empty
+        // and every cell stays 1×1.
+        h_segs: Vec::new(),
+        v_segs: Vec::new(),
     })
 }
 
@@ -534,6 +701,7 @@ mod tests {
             rotation: 0.0,
             source_index: None,
             underline: false,
+            strike: false,
         }
     }
 
@@ -731,6 +899,8 @@ mod tests {
             covered_lines: BTreeSet::new(),
             used_paths: BTreeSet::new(),
             start_line: 0,
+            h_segs: Vec::new(),
+            v_segs: Vec::new(),
         };
         // 2×2 grid, 4 cells, all filled.
         let runs = vec![
@@ -746,9 +916,14 @@ mod tests {
 
         // Too many columns.
         let mut wide = dense.clone();
-        wide.cols = (0..=MAX_TABLE_COLS as i32 + 2).map(|i| i as f64 * 5.0).collect();
+        wide.cols = (0..=MAX_TABLE_COLS as i32 + 2)
+            .map(|i| i as f64 * 5.0)
+            .collect();
         wide.covered_lines = (0..lines.len()).collect();
-        assert!(!passes_table_sanity(&wide, &lines), "over-wide grid rejected");
+        assert!(
+            !passes_table_sanity(&wide, &lines),
+            "over-wide grid rejected"
+        );
 
         // Empty grid (no runs land in cells) → zero fill → rejected.
         let mut empty = dense.clone();
@@ -770,5 +945,148 @@ mod tests {
         assert_eq!(row_of(&rows, 130.0), Some(0));
         assert_eq!(row_of(&rows, 110.0), Some(1));
         assert_eq!(row_of(&rows, 10.0), None);
+    }
+
+    /// Build a table and return its rows, for span assertions.
+    fn build_rows(paths: &[VectorPath], runs: &[ReconRun]) -> Vec<Row> {
+        let lines = group_into_lines(runs);
+        let mut paths = paths.to_vec();
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("a table");
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        t.rows
+    }
+
+    fn cell_text(c: &Cell) -> String {
+        match &c.blocks[0].kind {
+            BlockKind::Paragraph(p) => match p.runs.first() {
+                Some(crate::model::Inline::Run(r)) => r.text.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn header_spanning_two_columns_gets_col_span_2() {
+        // 2 rows × 3 columns. Columns at x=50,150,250,350; rows at y=140,120,100.
+        // The interior vertical at x=150 is drawn **only in the bottom row**
+        // [100,120] — it is missing across the header band [120,140]. So the top
+        // cell spans columns 0+1 (col_span 2); x=250 is full-height, capping the
+        // span. The bottom row stays three 1×1 cells.
+        let paths = vec![
+            hrule(140.0, 50.0, 350.0),
+            hrule(120.0, 50.0, 350.0),
+            hrule(100.0, 50.0, 350.0),
+            // Outer verticals: full height.
+            vrule(50.0, 100.0, 140.0),
+            vrule(350.0, 100.0, 140.0),
+            // x=150 interior: ONLY bottom row → absent in the header band.
+            vrule(150.0, 100.0, 120.0),
+            // x=250 interior: full height → present everywhere (caps the span).
+            vrule(250.0, 100.0, 140.0),
+        ];
+        let runs = vec![
+            // Header text sits in the merged region (col 0).
+            run("Billing address", 60.0, 126.0, 80.0),
+            run("Qty", 260.0, 126.0, 20.0),
+            run("Rue de Paris", 60.0, 106.0, 40.0),
+            run("75001", 160.0, 106.0, 30.0),
+            run("3", 260.0, 106.0, 10.0),
+        ];
+        let rows = build_rows(&paths, &runs);
+        assert_eq!(rows.len(), 2, "two rows");
+
+        // Top row: a spanning cell (col_span 2) then a 1×1 cell ⇒ 2 cells total.
+        assert_eq!(rows[0].cells.len(), 2, "header row merges to 2 cells");
+        assert_eq!(
+            rows[0].cells[0].col_span, 2,
+            "header cell spans two columns"
+        );
+        assert_eq!(rows[0].cells[0].row_span, 1);
+        assert_eq!(cell_text(&rows[0].cells[0]), "Billing address");
+        assert_eq!(rows[0].cells[1].col_span, 1, "third column not merged");
+        assert_eq!(cell_text(&rows[0].cells[1]), "Qty");
+
+        // Bottom row: three full 1×1 cells (every interior divider present).
+        assert_eq!(rows[1].cells.len(), 3, "body row keeps three cells");
+        assert!(rows[1]
+            .cells
+            .iter()
+            .all(|c| c.col_span == 1 && c.row_span == 1));
+    }
+
+    #[test]
+    fn cell_spanning_two_rows_gets_row_span_2() {
+        // 2 rows × 2 columns. The horizontal divider at y=120 is drawn **only in
+        // the right column** [150,250] — missing under the left column. So the
+        // left cell spans both rows (row_span 2); the right column stays two
+        // 1×1 cells. No interior vertical is missing ⇒ no column merge.
+        let paths = vec![
+            hrule(140.0, 50.0, 250.0),
+            hrule(100.0, 50.0, 250.0),
+            // Interior horizontal at y=120: ONLY the right column.
+            hrule(120.0, 150.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        let runs = vec![
+            run("Logo", 60.0, 116.0, 40.0),
+            run("Name", 160.0, 126.0, 40.0),
+            run("Addr", 160.0, 106.0, 40.0),
+        ];
+        let rows = build_rows(&paths, &runs);
+        assert_eq!(rows.len(), 2);
+
+        // Top row: left cell row_span 2 (col 0) + right 1×1 ⇒ 2 cells.
+        assert_eq!(rows[0].cells.len(), 2);
+        assert_eq!(rows[0].cells[0].row_span, 2, "left cell spans two rows");
+        assert_eq!(rows[0].cells[0].col_span, 1, "left cell is one column");
+        assert_eq!(cell_text(&rows[0].cells[0]), "Logo");
+
+        // Bottom row: the left slot is covered by the row span above, so the row
+        // supplies only the right cell.
+        assert_eq!(rows[1].cells.len(), 1, "left slot absorbed by the row span");
+        assert_eq!(cell_text(&rows[1].cells[0]), "Addr");
+    }
+
+    #[test]
+    fn fully_ruled_grid_keeps_unit_cells() {
+        // The conservative contract: when **every** interior rule is drawn, no
+        // cell merges — output is the plain 1×1 grid (guards against the merge
+        // inference firing spuriously on a normal data table).
+        let paths = vec![
+            hrule(140.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(100.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        let runs = vec![
+            run("A", 60.0, 126.0, 30.0),
+            run("B", 160.0, 126.0, 30.0),
+            run("C", 60.0, 106.0, 30.0),
+            run("D", 160.0, 106.0, 30.0),
+        ];
+        let rows = build_rows(&paths, &runs);
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.cells.len(), 2, "every row keeps both cells");
+            assert!(
+                row.cells.iter().all(|c| c.col_span == 1 && c.row_span == 1),
+                "fully-ruled grid produces only 1×1 cells"
+            );
+        }
     }
 }

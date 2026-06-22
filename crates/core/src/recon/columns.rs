@@ -160,6 +160,7 @@ mod tests {
             rotation: 0.0,
             source_index: None,
             underline: false,
+            strike: false,
         }
     }
 
