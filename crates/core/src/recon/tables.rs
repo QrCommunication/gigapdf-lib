@@ -21,8 +21,8 @@ use super::lines::ReconLine;
 use super::{median, ruling_orientation, run_char_style, IdGen, Ruling};
 use crate::content::vector::VectorPath;
 use crate::model::{
-    geom::Rotation, Block, BlockKind, BorderStyle, Cell, Paragraph, ParagraphStyle, Rect, Row,
-    Table,
+    geom::Rotation, Align, Block, BlockKind, BorderStyle, Cell, Paragraph, ParagraphStyle, Rect,
+    Row, Table,
 };
 
 /// A table the planner found: its grid edges (PDF user space), the line indices
@@ -48,6 +48,13 @@ pub struct PlannedTable {
     h_segs: Vec<(f64, f64, f64)>,
     /// Raw vertical rule segments `(x, y0, y1)` (ruled only; empty otherwise).
     v_segs: Vec<(f64, f64, f64)>,
+    /// Per-column horizontal alignment, `cols.len() - 1` entries (one per column).
+    /// Borderless tables fill this from the detected anchor type (left-edge vs
+    /// right-edge clustering); ruled tables leave it `Align::Left` (their cells
+    /// are placed by centre and carry no alignment evidence). Drives the cell
+    /// [`ParagraphStyle::align`] so a right-aligned numeric column round-trips as
+    /// right-aligned. Length is kept in lock-step with `cols` by construction.
+    col_align: Vec<Align>,
 }
 
 /// The set of tables planned for a page, with helpers `reconstruct_page` uses to
@@ -331,11 +338,16 @@ pub fn build_table(
             let text = std::mem::take(&mut grid[r][c]);
             let style = styles[r][c].take();
             let (cspan, rspan) = span[r][c];
+            // Per-column alignment (borderless detection sets `Right` for numeric
+            // columns); absent ⇒ left. A spanning cell takes its anchor column's
+            // alignment.
+            let align = table.col_align.get(c).copied().unwrap_or(Align::Left);
             cells.push(make_cell_spanned(
                 text,
                 style,
                 cspan as u16,
                 rspan as u16,
+                align,
                 ids,
             ));
         }
@@ -382,6 +394,7 @@ fn make_cell_spanned(
     style: Option<crate::model::CharStyle>,
     col_span: u16,
     row_span: u16,
+    align: Align,
     ids: &mut IdGen,
 ) -> Cell {
     use crate::model::{Inline, InlineRun};
@@ -399,7 +412,10 @@ fn make_cell_spanned(
         frame: None,
         rotation: Rotation::D0,
         kind: BlockKind::Paragraph(Paragraph {
-            style: ParagraphStyle::default(),
+            style: ParagraphStyle {
+                align,
+                ..ParagraphStyle::default()
+            },
             style_ref: None,
             runs,
         }),
@@ -638,6 +654,10 @@ fn build_ruled_band(lines: &[ReconLine], h_rules: &[HSeg], v_rules: &[VSeg]) -> 
         .collect();
 
     let start_line = *covered.iter().min()?;
+    // Ruled cells are placed by centre and carry no per-column alignment evidence
+    // (the rules say where columns *are*, not how text sits in them), so default
+    // every column to left — matching the prior behaviour exactly.
+    let col_align = vec![Align::Left; cols.len().saturating_sub(1)];
     Some(PlannedTable {
         cols,
         rows,
@@ -647,6 +667,7 @@ fn build_ruled_band(lines: &[ReconLine], h_rules: &[HSeg], v_rules: &[VSeg]) -> 
         start_line,
         h_segs: h_rules.iter().map(|s| (s.y, s.x0, s.x1)).collect(),
         v_segs: v_rules.iter().map(|s| (s.x, s.y0, s.y1)).collect(),
+        col_align,
     })
 }
 
@@ -742,35 +763,260 @@ fn cluster_edges(values: impl Iterator<Item = f64>) -> Vec<f64> {
 
 // ── borderless fallback ──────────────────────────────────────────────────────
 
+/// One detected borderless column: the abscissa its cells align on (`anchor`) and
+/// *which* edge that is (`align`). A left-aligned column shares its runs' **left**
+/// edge (`run.x`); a right-aligned column shares their **right** edge
+/// (`run.x + run.w`) — the latter is how numeric/financial columns (amounts,
+/// decimals) line up, with widely varying left edges. Decimal columns are
+/// approximated as right-aligned: integers and money amounts share their last
+/// digit's right edge, which is the decimal-tab to a tolerance.
+#[derive(Debug, Clone, Copy)]
+struct Column {
+    /// The shared edge abscissa (left edge for `Left`, right edge for `Right`).
+    anchor: f64,
+    align: Align,
+    /// A representative horizontal position used only to *order* columns and place
+    /// the boundary between neighbours — the cluster's centre-of-mass X.
+    center: f64,
+}
+
+/// A 1-D cluster: members fused because each sits within `gap` of the previous,
+/// keeping their mean position and spread so callers can score tightness.
+struct Cluster {
+    /// Mean of the member values.
+    mean: f64,
+    /// Member values (an edge abscissa each); `len()` is the support.
+    members: Vec<f64>,
+}
+
+impl Cluster {
+    /// Max member distance from the mean — smaller = tighter = stronger evidence
+    /// the runs deliberately share this edge.
+    fn spread(&self) -> f64 {
+        self.members
+            .iter()
+            .map(|v| (v - self.mean).abs())
+            .fold(0.0, f64::max)
+    }
+}
+
+/// Cluster values (each tagged with the row it came from) into 1-D groups: a new
+/// cluster opens when a value sits more than `gap` past the previous. Returns the
+/// clusters with their mean and members, ascending.
+fn cluster_1d(values: &[f64], gap: f64) -> Vec<Cluster> {
+    let mut v: Vec<f64> = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let mut out: Vec<Cluster> = Vec::new();
+    for x in v {
+        match out.last_mut() {
+            Some(c) if x - *c.members.last().unwrap() <= gap => {
+                c.members.push(x);
+                c.mean = c.members.iter().sum::<f64>() / c.members.len() as f64;
+            }
+            _ => out.push(Cluster {
+                mean: x,
+                members: vec![x],
+            }),
+        }
+    }
+    out
+}
+
+/// Detect the borderless columns of a region by clustering **both** the left and
+/// the right edges of its runs and letting each run vote for whichever edge it
+/// sits on most tightly. This recognises right-aligned numeric columns (shared
+/// right edge, scattered left edges) and mixed layouts (a left-aligned label
+/// column beside a right-aligned amount column) that pure left-edge clustering
+/// would otherwise shatter or fuse.
+///
+/// `runs` is `(left, right)` per run across the region. The gate is deliberately
+/// kept downstream (≥ 2 rows hitting ≥ 2 columns); this only *proposes* columns.
+fn detect_columns(runs: &[(f64, f64)], col_gap: f64) -> Vec<Column> {
+    if runs.len() < 2 {
+        return Vec::new();
+    }
+    let lefts: Vec<f64> = runs.iter().map(|&(l, _)| l).collect();
+    let rights: Vec<f64> = runs.iter().map(|&(_, r)| r).collect();
+    let left_clusters = cluster_1d(&lefts, col_gap);
+    let right_clusters = cluster_1d(&rights, col_gap);
+
+    // Candidate columns from both edge families. Each run will be assigned to the
+    // single best candidate (by the matching edge), so overlapping left/right
+    // candidates compete for runs rather than both surviving.
+    struct Cand {
+        pos: f64,
+        align: Align,
+        spread: f64,
+        /// Cluster support = how many edges fell in this candidate's cluster. The
+        /// *primary* tiebreak when a run sits equally on two candidates: a shared
+        /// right edge backed by many runs beats each run's own singleton left edge,
+        /// so right-aligned numeric columns win over the accidental per-row
+        /// left-edge clusters their scattered left edges create.
+        support: usize,
+        // Edges of the runs that ended up choosing this candidate (the chosen-edge
+        // value), used to re-fit the anchor and to compute the centre.
+        chosen_left: Vec<f64>,
+        chosen_right: Vec<f64>,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for c in &left_clusters {
+        cands.push(Cand {
+            pos: c.mean,
+            align: Align::Left,
+            spread: c.spread(),
+            support: c.members.len(),
+            chosen_left: Vec::new(),
+            chosen_right: Vec::new(),
+        });
+    }
+    for c in &right_clusters {
+        cands.push(Cand {
+            pos: c.mean,
+            align: Align::Right,
+            spread: c.spread(),
+            support: c.members.len(),
+            chosen_left: Vec::new(),
+            chosen_right: Vec::new(),
+        });
+    }
+
+    // Assign each run to its best candidate: the nearest left-candidate by its left
+    // edge, or the nearest right-candidate by its right edge. When a run sits on
+    // two candidates at (near-)equal distance — the common case for a numeric cell
+    // whose left edge happens to form its own singleton cluster — prefer the
+    // candidate with **more support**, then the tighter one, then left (stable).
+    for &(l, r) in runs {
+        // (idx, dist, support, spread)
+        let mut best: Option<(usize, f64, usize, f64)> = None;
+        for (idx, cand) in cands.iter().enumerate() {
+            let edge = if cand.align == Align::Left { l } else { r };
+            let dist = (edge - cand.pos).abs();
+            if dist > col_gap {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((_, bd, bsup, bspr)) => {
+                    if (dist - bd).abs() > 1e-6 {
+                        dist < bd
+                    } else if cand.support != bsup {
+                        cand.support > bsup
+                    } else {
+                        cand.spread < bspr - 1e-6
+                    }
+                }
+            };
+            if better {
+                best = Some((idx, dist, cand.support, cand.spread));
+            }
+        }
+        if let Some((idx, _, _, _)) = best {
+            cands[idx].chosen_left.push(l);
+            cands[idx].chosen_right.push(r);
+        }
+    }
+
+    // Keep only candidates that actually won runs, re-fit their anchor from the
+    // chosen edges, and compute a centre-of-mass for ordering. A right candidate
+    // that lost all its runs to a coincident left candidate (or vice-versa) drops
+    // out here, so we never emit two columns for the same physical column.
+    let mut columns: Vec<Column> = Vec::new();
+    for cand in &cands {
+        if cand.chosen_left.len() < 2 {
+            // A column needs ≥ 2 stacked runs to be evidence of alignment; a lone
+            // run is just a word and never anchors a column on its own.
+            continue;
+        }
+        let anchor_src = if cand.align == Align::Left {
+            &cand.chosen_left
+        } else {
+            &cand.chosen_right
+        };
+        let anchor = anchor_src.iter().sum::<f64>() / anchor_src.len() as f64;
+        let lo = cand
+            .chosen_left
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        let hi = cand
+            .chosen_right
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let center = (lo + hi) / 2.0;
+        columns.push(Column {
+            anchor,
+            align: cand.align,
+            center,
+        });
+    }
+
+    // Order columns left→right by centre and drop any whose centres collide within
+    // `col_gap` (defensive — should not happen after the run-assignment contest),
+    // keeping the first (already the lower-X) one.
+    columns.sort_by(|a, b| {
+        a.center
+            .partial_cmp(&b.center)
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    let mut deduped: Vec<Column> = Vec::new();
+    for col in columns {
+        match deduped.last() {
+            Some(prev) if (col.center - prev.center).abs() <= col_gap => {}
+            _ => deduped.push(col),
+        }
+    }
+    deduped
+}
+
+/// Which detected column a run belongs to: the column whose *matching* edge
+/// (left edge for a `Left` column, right edge for a `Right` column) is nearest the
+/// run's corresponding edge. Returns the index, or `None` if nothing is within
+/// `col_gap` (a stray run between columns is not counted toward the row's hits).
+fn column_of_run(columns: &[Column], left: f64, right: f64, col_gap: f64) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (i, col) in columns.iter().enumerate() {
+        let edge = if col.align == Align::Left { left } else { right };
+        let dist = (edge - col.anchor).abs();
+        if dist > col_gap {
+            continue;
+        }
+        if best.is_none_or(|(_, bd)| dist < bd) {
+            best = Some((i, dist));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 /// Plan **all** borderless tables among the free lines. Candidate tabular rows
-/// (those hitting ≥ 2 column anchors) are first segmented into vertical regions
-/// separated by a band of prose (a large baseline gap); each region is then built
-/// into its own grid with **region-local** column anchors, so two stacked lists
-/// with different column layouts are not fused into one englobing grid (which the
-/// sanity gate could then drop, losing both).
+/// (those hitting ≥ 2 columns) are first segmented into vertical regions separated
+/// by a band of prose (a large baseline gap); each region is then built into its
+/// own grid with **region-local**, alignment-aware columns (see [`detect_columns`]),
+/// so two stacked lists with different column layouts are not fused into one
+/// englobing grid (which the sanity gate could then drop, losing both).
 fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable> {
     if free.len() < 2 {
         return Vec::new();
     }
 
-    // First pass: global anchors only to *identify* which free lines are tabular
+    // First pass: global columns only to *identify* which free lines are tabular
     // (hit ≥ 2 columns). The grid itself is rebuilt per region below with local
-    // anchors, so a global mismatch between two regions can't distort either.
-    let mut xs: Vec<f64> = Vec::new();
+    // columns, so a global mismatch between two regions can't distort either.
+    let mut edges: Vec<(f64, f64)> = Vec::new();
     let mut heights: Vec<f64> = Vec::new();
     for &i in free {
         for r in &lines[i].runs {
-            xs.push(r.x);
+            edges.push((r.x, r.x + r.w));
             heights.push(r.h.max(1.0));
         }
     }
-    if xs.len() < 4 {
+    if edges.len() < 4 {
         return Vec::new();
     }
     let h_med = median(&mut heights, 10.0);
     let col_gap = (h_med * 2.0).max(16.0);
-    let global_anchors = anchors_from_xs(&xs, col_gap);
-    if global_anchors.len() < 2 {
+    let global_columns = detect_columns(&edges, col_gap);
+    if global_columns.len() < 2 {
         return Vec::new(); // single column ⇒ prose, not a table
     }
 
@@ -778,7 +1024,9 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
     for &i in free {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
         for r in &lines[i].runs {
-            hit.insert(nearest_anchor(&global_anchors, r.x));
+            if let Some(c) = column_of_run(&global_columns, r.x, r.x + r.w, col_gap) {
+                hit.insert(c);
+            }
         }
         if hit.len() >= 2 {
             row_lines.push(i);
@@ -820,8 +1068,8 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
 }
 
 /// Build one borderless table from a vertical region of candidate rows, using
-/// **region-local** column anchors. Re-validates the ≥ 2 rows / ≥ 2 columns gate
-/// so a region that no longer looks tabular on its own is dropped.
+/// **region-local**, alignment-aware columns. Re-validates the ≥ 2 rows / ≥ 2
+/// columns gate so a region that no longer looks tabular on its own is dropped.
 fn build_borderless_region(
     lines: &[ReconLine],
     region: &[usize],
@@ -831,22 +1079,24 @@ fn build_borderless_region(
     if region.len() < 2 {
         return None;
     }
-    let mut xs: Vec<f64> = Vec::new();
+    let mut edges: Vec<(f64, f64)> = Vec::new();
     for &i in region {
         for r in &lines[i].runs {
-            xs.push(r.x);
+            edges.push((r.x, r.x + r.w));
         }
     }
-    let anchors = anchors_from_xs(&xs, col_gap);
-    if anchors.len() < 2 {
+    let columns = detect_columns(&edges, col_gap);
+    if columns.len() < 2 {
         return None;
     }
-    // Keep only rows that hit ≥ 2 of the region's own anchors.
+    // Keep only rows that hit ≥ 2 of the region's own columns.
     let mut row_lines: Vec<usize> = Vec::new();
     for &i in region {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
         for r in &lines[i].runs {
-            hit.insert(nearest_anchor(&anchors, r.x));
+            if let Some(c) = column_of_run(&columns, r.x, r.x + r.w, col_gap) {
+                hit.insert(c);
+            }
         }
         if hit.len() >= 2 {
             row_lines.push(i);
@@ -856,13 +1106,18 @@ fn build_borderless_region(
         return None;
     }
 
-    // Column edges midway between anchors (extend out at the ends).
-    let mut cols: Vec<f64> = Vec::with_capacity(anchors.len() + 1);
-    cols.push(anchors[0] - col_gap / 2.0);
-    for w in anchors.windows(2) {
+    // Column edges midway between adjacent columns' centres (extend out at the
+    // ends). Using the centre-of-mass — not the alignment anchor — keeps the
+    // boundary between a left- and a right-aligned column on the visual gap
+    // between them, so every run's *centre* still lands in the right cell.
+    let centers: Vec<f64> = columns.iter().map(|c| c.center).collect();
+    let mut cols: Vec<f64> = Vec::with_capacity(centers.len() + 1);
+    cols.push(centers[0] - col_gap / 2.0);
+    for w in centers.windows(2) {
         cols.push((w[0] + w[1]) / 2.0);
     }
-    cols.push(*anchors.last().unwrap() + col_gap * 4.0);
+    cols.push(*centers.last().unwrap() + col_gap * 4.0);
+    let col_align: Vec<Align> = columns.iter().map(|c| c.align).collect();
 
     // Row edges from the tabular rows' centres (descending Y).
     let mut centers: Vec<f64> = row_lines.iter().map(|&i| lines[i].center_y()).collect();
@@ -889,37 +1144,8 @@ fn build_borderless_region(
         // and every cell stays 1×1.
         h_segs: Vec::new(),
         v_segs: Vec::new(),
+        col_align,
     })
-}
-
-/// Cluster sorted-or-unsorted run start-Xs into column anchors: a new anchor opens
-/// when a value sits more than `col_gap` past the last. Returns anchors ascending.
-fn anchors_from_xs(xs: &[f64], col_gap: f64) -> Vec<f64> {
-    let mut v: Vec<f64> = xs.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-    let mut anchors: Vec<f64> = Vec::new();
-    for x in v {
-        match anchors.last() {
-            Some(&last) if x - last <= col_gap => {}
-            _ => anchors.push(x),
-        }
-    }
-    anchors
-}
-
-/// Index of the anchor nearest `x`.
-fn nearest_anchor(anchors: &[f64], x: f64) -> usize {
-    anchors
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            (x - **a)
-                .abs()
-                .partial_cmp(&(x - **b).abs())
-                .unwrap_or(core::cmp::Ordering::Equal)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1142,6 +1368,7 @@ mod tests {
             start_line: 0,
             h_segs: Vec::new(),
             v_segs: Vec::new(),
+            col_align: vec![Align::Left, Align::Left],
         };
         // 2×2 grid, 4 cells, all filled.
         let runs = vec![
@@ -1507,6 +1734,217 @@ mod tests {
             segment_rule_bands(&h2, &v2).len(),
             2,
             "two grids separated by a void are two bands"
+        );
+    }
+
+    // ── R8: right-aligned / decimal borderless columns ───────────────────────
+
+    /// Build the (single) borderless table a layout produces, or `None`.
+    fn borderless_table(lines: &[ReconLine]) -> Option<Table> {
+        let plan = plan_tables(lines, &[], &BTreeSet::new());
+        let mut ids = IdGen::default();
+        for li in 0..lines.len() {
+            if let Some(tbl) = plan.take_if_starts_at(li) {
+                if let Some(block) = build_table(&tbl, lines, &mut ids, Rect::new) {
+                    if let BlockKind::Table(t) = block.kind {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn cell_align(c: &Cell) -> Align {
+        match c.blocks.first().map(|b| &b.kind) {
+            Some(BlockKind::Paragraph(p)) => p.style.align,
+            _ => Align::Left,
+        }
+    }
+
+    #[test]
+    fn detect_columns_separates_left_label_from_right_amount() {
+        // Unit-level: a left-aligned label column (left edge x=72) and a
+        // right-aligned amount column (right edge 540, scattered left edges) must
+        // resolve to exactly TWO columns — Left then Right — not three shattered
+        // numeric columns. Left-edge-only clustering produced four anchors here.
+        let edges = vec![
+            // labels: (left, right) — left edge fixed, varying widths
+            (72.0, 112.0),
+            (72.0, 192.0),
+            (72.0, 132.0),
+            // amounts: right edge fixed at 540, widely varying left edge
+            (490.0, 540.0),
+            (465.0, 540.0),
+            (520.0, 540.0),
+        ];
+        let cols = detect_columns(&edges, 20.0);
+        assert_eq!(cols.len(), 2, "label + amount = 2 columns, got {cols:?}");
+        assert_eq!(cols[0].align, Align::Left, "label column is left-aligned");
+        assert_eq!(cols[1].align, Align::Right, "amount column is right-aligned");
+        // The right column's anchor is its shared right edge.
+        assert!(
+            (cols[1].anchor - 540.0).abs() < 1.0,
+            "right anchor ≈ 540, got {}",
+            cols[1].anchor
+        );
+    }
+
+    #[test]
+    fn borderless_invoice_right_aligned_amounts_is_one_amount_column() {
+        // GAP #7 — a borderless "Libellé … Montant" table: labels left-aligned
+        // (x=72, variable widths), amounts right-aligned (right edge=540, widely
+        // varying left edges so left-edge clustering would shatter the column into
+        // three). Must become a 2-column table (label + amount), not 4 columns and
+        // not fused prose.
+        let runs = vec![
+            // Header row.
+            run("Libelle", 72.0, 700.0, 40.0), // right 112
+            run("Montant", 490.0, 700.0, 50.0), // right 540
+            // "Consulting services" 1.234,00
+            run("Consulting services", 72.0, 684.0, 120.0), // right 192
+            run("1.234,00", 480.0, 684.0, 60.0),            // right 540
+            // "Travel" 99,50
+            run("Travel", 72.0, 668.0, 40.0),  // right 112
+            run("99,50", 505.0, 668.0, 35.0),  // right 540
+            // "Software license" 12.345,67
+            run("Software license", 72.0, 652.0, 100.0), // right 172
+            run("12.345,67", 465.0, 652.0, 75.0),        // right 540
+        ];
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines).expect("invoice rows form a borderless table");
+        assert_eq!(
+            table.rows.len(),
+            4,
+            "four rows (header + 3 lines), got {}",
+            table.rows.len()
+        );
+        // Every row has exactly two cells: the amount column did not shatter.
+        for (ri, row) in table.rows.iter().enumerate() {
+            assert_eq!(
+                row.cells.len(),
+                2,
+                "row {ri} must have 2 cells (label + amount), got {}",
+                row.cells.len()
+            );
+        }
+        // Labels land in column 0, amounts in column 1.
+        assert_eq!(cell_text(&table.rows[1].cells[0]), "Consulting services");
+        assert_eq!(cell_text(&table.rows[1].cells[1]), "1.234,00");
+        assert_eq!(cell_text(&table.rows[3].cells[1]), "12.345,67");
+        // Borderless ⇒ no widened border.
+        assert_eq!(table.border.width, 0.0);
+        // Bonus #3: the amount column is marked right-aligned; the label column is
+        // left-aligned.
+        assert_eq!(
+            cell_align(&table.rows[1].cells[0]),
+            Align::Left,
+            "label cell is left-aligned"
+        );
+        assert_eq!(
+            cell_align(&table.rows[1].cells[1]),
+            Align::Right,
+            "amount cell is right-aligned"
+        );
+    }
+
+    #[test]
+    fn borderless_three_columns_mixed_alignment() {
+        // A 3-column borderless table: left-aligned label, left-aligned quantity,
+        // right-aligned amount (shared right edge 540). All three must be detected
+        // with the correct per-column alignment.
+        let runs = vec![
+            run("Item", 72.0, 700.0, 40.0),     // label, left @72
+            run("Qty", 260.0, 700.0, 30.0),     // qty, left @260
+            run("Total", 490.0, 700.0, 50.0),   // amount header, right 540
+            run("Apples", 72.0, 684.0, 60.0),   // left @72
+            run("3", 260.0, 684.0, 12.0),       // left @260
+            run("1.234,00", 480.0, 684.0, 60.0), // right 540
+            run("Pears", 72.0, 668.0, 50.0),    // left @72
+            run("12", 260.0, 668.0, 22.0),      // left @260
+            run("99,50", 505.0, 668.0, 35.0),   // right 540
+        ];
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines).expect("three-column mixed table");
+        assert_eq!(table.rows.len(), 3, "three rows");
+        for (ri, row) in table.rows.iter().enumerate() {
+            assert_eq!(row.cells.len(), 3, "row {ri} has 3 columns");
+        }
+        // Alignment per column on a data row.
+        let data = &table.rows[1];
+        assert_eq!(cell_align(&data.cells[0]), Align::Left, "label left");
+        assert_eq!(cell_align(&data.cells[1]), Align::Left, "qty left");
+        assert_eq!(cell_align(&data.cells[2]), Align::Right, "amount right");
+        assert_eq!(cell_text(&data.cells[0]), "Apples");
+        assert_eq!(cell_text(&data.cells[2]), "1.234,00");
+    }
+
+    #[test]
+    fn borderless_left_aligned_table_still_detected_unchanged() {
+        // Non-regression: a plain left-aligned borderless table (both columns share
+        // their left edge) is detected exactly as before — two columns, both
+        // left-aligned, three rows.
+        let runs = vec![
+            run("Name", 72.0, 700.0, 50.0),
+            run("Role", 300.0, 700.0, 50.0),
+            run("Alice", 72.0, 684.0, 50.0),
+            run("Engineer", 300.0, 684.0, 70.0),
+            run("Bob", 72.0, 668.0, 50.0),
+            run("Designer", 300.0, 668.0, 70.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines).expect("left-aligned borderless table");
+        assert_eq!(table.rows.len(), 3, "three rows");
+        for row in &table.rows {
+            assert_eq!(row.cells.len(), 2, "two columns");
+            for cell in &row.cells {
+                assert_eq!(
+                    cell_align(cell),
+                    Align::Left,
+                    "left-aligned columns stay left-aligned"
+                );
+            }
+        }
+        assert_eq!(cell_text(&table.rows[1].cells[0]), "Alice");
+        assert_eq!(cell_text(&table.rows[1].cells[1]), "Engineer");
+    }
+
+    #[test]
+    fn right_ragged_prose_is_not_promoted_to_a_table() {
+        // Anti-prose: ordinary single-column body text. The left edges share x=72
+        // but the right edges are ragged (justified-off prose), so NEITHER edge
+        // family yields a second column — it must stay prose, never a table.
+        let runs = vec![
+            run("The quick brown fox jumps over", 72.0, 700.0, 180.0),
+            run("the lazy dog while the sun sets", 72.0, 686.0, 188.0),
+            run("slowly behind the distant hills", 72.0, 672.0, 176.0),
+            run("and the evening grows quiet now", 72.0, 658.0, 184.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+        assert!(
+            plan.take_if_starts_at(0).is_none(),
+            "single-column ragged prose stays prose"
+        );
+        assert!(borderless_table(&lines).is_none());
+    }
+
+    #[test]
+    fn coincidental_shared_right_edge_in_prose_is_not_a_table() {
+        // Stronger anti-prose: two lines happen to end at the same right edge (a
+        // coincidence justified text can produce) but there is no left-aligned
+        // second column and no consistent interior column — still single-column,
+        // so not promoted.
+        let runs = vec![
+            run("First paragraph line ending here", 72.0, 700.0, 200.0), // right 272
+            run("A different second line ends too", 72.0, 686.0, 200.0), // right 272
+            run("Third line is a bit shorter ok", 72.0, 672.0, 170.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+        assert!(
+            plan.take_if_starts_at(0).is_none(),
+            "a shared right edge alone is not a column"
         );
     }
 }
