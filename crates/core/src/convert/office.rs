@@ -2621,4 +2621,279 @@ mod tests {
             "no shapes ⇒ identical ODS output"
         );
     }
+
+    // ── 1:1 absolute placement: exact coordinates + container validity ─────────
+    //
+    // These prove the export half reproduces the PDF layout: two text runs at
+    // *distinct* positions plus a framed rectangle (an "encadré") land at their
+    // exact coordinates — EMU for OOXML (DOCX/PPTX), points for ODF (ODT/ODP) —
+    // and the produced .pptx/.odp/.docx/.odt is a valid, unzippable container
+    // whose part XML is well-formed (balanced tags). This is the visual 1:1 a
+    // reader (PowerPoint/Word/Impress) renders from the placed objects.
+
+    /// One page with two text boxes at clearly different positions plus a
+    /// red-filled blue-stroked rectangle (the box/frame). Coordinates picked so
+    /// every EMU/point value is exact and unambiguous.
+    fn two_boxes_and_rect_page() -> Vec<ConvPage> {
+        vec![ConvPage {
+            width: 612.0,
+            height: 792.0,
+            texts: vec![
+                PlacedText {
+                    text: "Box A".to_string(),
+                    x: 72.0,
+                    y: 100.0,
+                    width: 144.0,
+                    height: 12.0,
+                    style: TextStyle::default(),
+                },
+                PlacedText {
+                    text: "Box B".to_string(),
+                    x: 300.0,
+                    y: 400.0,
+                    width: 180.0,
+                    height: 18.0,
+                    style: TextStyle::default(),
+                },
+            ],
+            images: Vec::new(),
+            shapes: vec![PlacedShape {
+                x: 130.0,
+                y: 560.0,
+                width: 200.0,
+                height: 90.0,
+                fill: Some([1.0, 0.0, 0.0]),
+                stroke: Some([0.0, 0.0, 1.0]),
+                stroke_width: 2.0,
+                ..PlacedShape::default()
+            }],
+        }]
+    }
+
+    /// All local-file-header entry names in our ZIP, in stored order. A non-empty
+    /// list with our known parts proves the container is unzippable.
+    fn zip_entry_names(zip: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut i = 0;
+        while i + 30 <= zip.len() && zip[i..i + 4] == [0x50, 0x4b, 0x03, 0x04] {
+            let comp = u32::from_le_bytes(zip[i + 18..i + 22].try_into().unwrap()) as usize;
+            let nlen = u16::from_le_bytes([zip[i + 26], zip[i + 27]]) as usize;
+            let elen = u16::from_le_bytes([zip[i + 28], zip[i + 29]]) as usize;
+            names.push(String::from_utf8_lossy(&zip[i + 30..i + 30 + nlen]).into_owned());
+            i = i + 30 + nlen + elen + comp;
+        }
+        names
+    }
+
+    /// Lightweight well-formedness check: every `<tag …>`/`</tag>` pair balances
+    /// (self-closing `<…/>`, the `<?xml …?>` PI and `<!-- -->` comments ignored).
+    /// Enough to catch a truncated or mis-nested part without a full XML parser.
+    fn xml_is_balanced(xml: &str) -> bool {
+        let bytes = xml.as_bytes();
+        let mut stack: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            // Processing instruction or comment/declaration: skip to '>'.
+            if xml[i..].starts_with("<?") || xml[i..].starts_with("<!") {
+                match xml[i..].find('>') {
+                    Some(rel) => {
+                        i += rel + 1;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            let Some(rel) = xml[i..].find('>') else {
+                return false;
+            };
+            let inner = &xml[i + 1..i + rel];
+            i += rel + 1;
+            if let Some(name) = inner.strip_prefix('/') {
+                // Closing tag: must match the top of the stack.
+                let name = name.trim();
+                match stack.pop() {
+                    Some(open) if open == name => {}
+                    _ => return false,
+                }
+            } else if inner.ends_with('/') {
+                // Self-closing element: no stack change.
+            } else {
+                // Opening tag: push the element name (up to first whitespace).
+                let name = inner.split_whitespace().next().unwrap_or("").to_string();
+                if name.is_empty() {
+                    return false;
+                }
+                stack.push(name);
+            }
+        }
+        stack.is_empty()
+    }
+
+    #[test]
+    fn xml_balance_checker_is_sound() {
+        assert!(xml_is_balanced("<?xml version=\"1.0\"?><a><b/><c>x</c></a>"));
+        assert!(xml_is_balanced("<ns:a xmlns:ns=\"u\"><ns:b/></ns:a>"));
+        assert!(!xml_is_balanced("<a><b></a>"), "mis-nested");
+        assert!(!xml_is_balanced("<a><b>"), "unclosed");
+        assert!(!xml_is_balanced("<a></a></b>"), "extra close");
+    }
+
+    #[test]
+    fn pptx_places_two_boxes_and_a_rect_at_exact_emu() {
+        let zip = to_pptx(&two_boxes_and_rect_page());
+
+        // Container is a valid, unzippable .pptx with the slide part present.
+        let names = zip_entry_names(&zip);
+        assert!(
+            names.iter().any(|n| n == "ppt/slides/slide1.xml"),
+            "slide part present in a readable zip: {names:?}"
+        );
+
+        let slide = String::from_utf8(entry(&zip, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(xml_is_balanced(&slide), "slide XML is well-formed");
+
+        // 1 pt = 12700 EMU. Box A at (72,100), Box B at (300,400): distinct
+        // a:off — proof the two boxes are NOT stacked at the origin.
+        assert!(
+            slide.contains("<a:off x=\"914400\" y=\"1270000\"/>"),
+            "Box A at exact EMU (72pt,100pt): {slide}"
+        );
+        assert!(
+            slide.contains("<a:off x=\"3810000\" y=\"5080000\"/>"),
+            "Box B at exact EMU (300pt,400pt) — distinct from Box A"
+        );
+        // Box extents are exact too (144×12 and 180×18 pt).
+        assert!(
+            slide.contains("<a:ext cx=\"1828800\" cy=\"152400\"/>"),
+            "Box A extent 144×12 pt"
+        );
+        assert!(
+            slide.contains("<a:ext cx=\"2286000\" cy=\"228600\"/>"),
+            "Box B extent 180×18 pt"
+        );
+        // The framed rectangle (encadré) at (130,560), 200×90 pt, as a real
+        // rect shape carrying its fill + stroke colours.
+        assert!(
+            slide.contains("<a:off x=\"1651000\" y=\"7112000\"/>"),
+            "rectangle at exact EMU (130pt,560pt)"
+        );
+        assert!(
+            slide.contains("<a:ext cx=\"2540000\" cy=\"1143000\"/>"),
+            "rectangle extent 200×90 pt"
+        );
+        assert!(
+            slide.contains("<a:prstGeom prst=\"rect\">"),
+            "encadré is a real rectangle shape"
+        );
+        assert!(
+            slide.contains("<a:srgbClr val=\"FF0000\">")
+                && slide.contains("<a:srgbClr val=\"0000FF\">"),
+            "rectangle keeps its red fill + blue stroke"
+        );
+        // Both runs are real, editable text.
+        assert!(slide.contains("<a:t>Box A</a:t>") && slide.contains("<a:t>Box B</a:t>"));
+    }
+
+    #[test]
+    fn odp_places_two_boxes_and_a_rect_at_exact_points() {
+        let zip = to_odp(&two_boxes_and_rect_page());
+
+        // Valid .odp: mimetype is the first, stored entry; content part present.
+        let names = zip_entry_names(&zip);
+        assert_eq!(names.first().map(String::as_str), Some("mimetype"));
+        assert!(names.iter().any(|n| n == "content.xml"), "content present");
+
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(xml_is_balanced(&content), "ODP content XML is well-formed");
+
+        // ODF places frames in points via num(): integers stay integral.
+        // Box A at (72,100), Box B at (300,400) — distinct svg:x/svg:y.
+        assert!(
+            content.contains("svg:x=\"72pt\" svg:y=\"100pt\" svg:width=\"144pt\" svg:height=\"12pt\""),
+            "Box A frame at exact points: {content}"
+        );
+        assert!(
+            content.contains("svg:x=\"300pt\" svg:y=\"400pt\" svg:width=\"180pt\" svg:height=\"18pt\""),
+            "Box B frame at exact points — distinct from Box A"
+        );
+        // The framed rectangle at (130,560), 200×90 pt — a real draw:rect with
+        // its fill + stroke colours.
+        assert!(
+            content.contains("<draw:rect "),
+            "encadré is a real ODF rectangle"
+        );
+        assert!(
+            content.contains("svg:x=\"130pt\" svg:y=\"560pt\" svg:width=\"200pt\" svg:height=\"90pt\""),
+            "rectangle at exact points"
+        );
+        assert!(
+            content.contains("draw:fill-color=\"#FF0000\"")
+                && content.contains("svg:stroke-color=\"#0000FF\""),
+            "rectangle keeps its red fill + blue stroke"
+        );
+        assert!(
+            content.contains("Box A") && content.contains("Box B"),
+            "both runs present as text boxes"
+        );
+    }
+
+    #[test]
+    fn docx_anchors_two_boxes_and_a_rect_at_exact_emu() {
+        let zip = to_docx(&two_boxes_and_rect_page());
+        let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
+        assert!(xml_is_balanced(&doc), "document XML is well-formed");
+
+        // Word anchors carry the page-relative offset in EMU on posOffset.
+        assert!(
+            doc.contains("<wp:posOffset>914400</wp:posOffset>")
+                && doc.contains("<wp:posOffset>1270000</wp:posOffset>"),
+            "Box A anchored at exact EMU (72pt,100pt): {doc}"
+        );
+        assert!(
+            doc.contains("<wp:posOffset>3810000</wp:posOffset>")
+                && doc.contains("<wp:posOffset>5080000</wp:posOffset>"),
+            "Box B anchored at exact EMU (300pt,400pt)"
+        );
+        // The framed rectangle anchored at (130,560) pt with its colours.
+        assert!(
+            doc.contains("<wp:posOffset>1651000</wp:posOffset>")
+                && doc.contains("<wp:posOffset>7112000</wp:posOffset>"),
+            "rectangle anchored at exact EMU (130pt,560pt)"
+        );
+        assert!(
+            doc.contains("<a:srgbClr val=\"FF0000\">")
+                && doc.contains("<a:srgbClr val=\"0000FF\">"),
+            "rectangle keeps red fill + blue stroke"
+        );
+    }
+
+    #[test]
+    fn odt_frames_two_boxes_and_a_rect_at_exact_points() {
+        let zip = to_odt(&two_boxes_and_rect_page());
+        let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
+        assert!(xml_is_balanced(&content), "ODT content XML is well-formed");
+
+        assert!(
+            content.contains("svg:x=\"72pt\" svg:y=\"100pt\" svg:width=\"144pt\" svg:height=\"12pt\""),
+            "Box A frame at exact points: {content}"
+        );
+        assert!(
+            content.contains("svg:x=\"300pt\" svg:y=\"400pt\" svg:width=\"180pt\" svg:height=\"18pt\""),
+            "Box B frame at exact points"
+        );
+        assert!(
+            content.contains("<draw:rect ")
+                && content.contains("svg:x=\"130pt\" svg:y=\"560pt\" svg:width=\"200pt\" svg:height=\"90pt\""),
+            "encadré is a real ODF rectangle at exact points"
+        );
+        assert!(
+            content.contains("draw:fill-color=\"#FF0000\"")
+                && content.contains("svg:stroke-color=\"#0000FF\""),
+            "rectangle keeps red fill + blue stroke"
+        );
+    }
 }
