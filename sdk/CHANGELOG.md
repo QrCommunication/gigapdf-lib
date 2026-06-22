@@ -4,24 +4,45 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.63.0] - 2026-06-22
+## [0.64.0] - 2026-06-22
+
+Office↔PDF fidelity program — import all formats → PDF and export PDF → all
+formats much closer to 1:1, including complex layouts (boxes/encadrés).
 
 ### Added
 
-- **Office→PDF now embeds the document's own fonts** — a self-embedding DOCX/PPTX/
+- **Office→PDF preserves absolute layout** — presentation/box geometry is no
+  longer reflowed into a flat stack. PPTX/ODP shapes, images and tables carrying
+  an explicit `a:xfrm` / `draw:frame` are emitted at their exact coordinates
+  (EMU/ODF units → pt), with slide backgrounds and `a:schemeClr` theme colours
+  resolved. DOCX floating/anchored drawings (`wp:anchor`) and text boxes
+  (`w:txbxContent`) become absolutely-positioned frames (the “encadrés”), and
+  explicit page breaks (`w:br type=page`, `w:pageBreakBefore`, section breaks)
+  are honoured.
+- **XLSX/ODS render with cell styling** — fonts (bold/italic/underline/size/
+  colour/family), borders, alignment and row heights are read from each cell's
+  style and applied at render (theme colours resolved); ODS cells were previously
+  unstyled. Merges, column widths and number formats unchanged.
+- **PDF→Office export preserves absolute layout** — text boxes, images and vector
+  rectangles/paths (fill/stroke/dash) are exported at their exact coordinates for
+  PPTX/ODP/DOCX/ODT, so an exported deck/doc opened in PowerPoint/Word/Impress/
+  Writer looks like the source PDF, encadrés included.
+- **Office→PDF embeds the document's own fonts** — a self-embedding DOCX/PPTX/
   XLSX (`word|ppt|xl/fonts/*.odttf`, de-obfuscated per ECMA-376 §17.8.1) or ODT/
-  ODS/ODP (`Fonts/*`, plain TTF/OTF) renders with its **own** typefaces — exact
-  glyphs and metrics, no reflow drift — instead of the bundled Liberation
-  fallback. Extraction feeds those faces into the HTML renderer for every Office
-  mapper. Self-embedded files now render identically offline with **no** host
-  round-trip.
+  ODS/ODP (`Fonts/*`, TTF/OTF) renders with its **own** typefaces (exact glyphs
+  and metrics, no reflow drift) instead of the bundled Liberation fallback.
 - **`officeNeededFonts(office)` / `gp_office_needed_fonts`** — phase-1 for
-  `officeToPdf`: returns the Google/system fonts a container **references but
-  doesn't embed** (`HtmlFontRequest[]`: `{family, weight, italic, url}`), so the
-  host can fetch them and supply them to its font cache for correct metrics. Faces
-  the container embeds itself, and the base-14 standards, are excluded. Returns
-  `null` for an unrecognized archive, `[]` when nothing is needed. Mirrors
-  `htmlNeededFonts` for the Office path.
+  `officeToPdf`: returns the fonts a container **references but doesn't embed**
+  (`HtmlFontRequest[]`), so the host can fetch metric clones (Carlito↔Calibri,
+  Arimo↔Arial, …) into its font cache for correct line-breaking. `null` for an
+  unrecognized archive, `[]` when nothing is needed.
+- **Stateful RTF rendering** — `rtfToPdf` now uses a real RTF parser with a `{}`
+  group state stack: character styling (`\b \i \ul \strike \cf \fs \f` via
+  font/colour tables), paragraph alignment/indents (`\qc\qr\qj\li\fi`), tables
+  (`\trowd\cell\row`) and correct CP1252 (`\'80`→€, smart quotes, dashes) instead
+  of the previous text-only extraction.
+
+## [0.63.0] - 2026-06-22
 
 ### Changed
 
