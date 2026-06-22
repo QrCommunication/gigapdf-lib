@@ -4422,7 +4422,32 @@ impl Document {
             });
         }
 
-        recon::reconstruct_page(runs, &vpaths, &image_refs, geom, ids, tag_blocks)
+        // Hyperlinks: map each page-link annotation to the editable model target
+        // and carry its clickable rect (PDF user space) so reconstruction wraps
+        // covered prose runs in `Inline::Link`. `page_links` rects share the
+        // runs' bottom-left coordinate space, so no flip is needed for matching.
+        // `link::LinkTarget::Page` is 1-based; the model's `Page` is a 0-based
+        // index (matching `OutlineNode::page`), so convert with a saturating −1.
+        let links: Vec<recon::ParaLink> = self
+            .page_links(page_no)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|link| {
+                let target = match link.target {
+                    crate::link::LinkTarget::Uri(u) => crate::model::LinkTarget::Url(u),
+                    crate::link::LinkTarget::Page(p) => {
+                        crate::model::LinkTarget::Page(p.saturating_sub(1) as usize)
+                    }
+                    crate::link::LinkTarget::Unknown => return None,
+                };
+                Some(recon::ParaLink {
+                    target,
+                    rect: link.rect,
+                })
+            })
+            .collect();
+
+        recon::reconstruct_page(runs, &vpaths, &image_refs, geom, ids, &links, tag_blocks)
     }
 
     /// FNV-1a 64-bit hash — a zero-dependency content key for de-duplicating the

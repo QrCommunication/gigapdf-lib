@@ -387,7 +387,9 @@ pub(crate) fn mark_strikes(runs: &mut [ReconRun], vpaths: &[VectorPath]) -> Vec<
 /// shapes pass through as [`Shape`] blocks and images as [`Image`] blocks.
 ///
 /// `geom` is `(x0, y0, page_w, page_h)`: the MediaBox origin and the page size
-/// in points. `tag_blocks`, when `Some`, is the already-built block list from a
+/// in points. `links` are the page's hyperlinks (PDF user space), used to wrap
+/// covered prose runs in [`Inline::Link`](crate::model::Inline::Link).
+/// `tag_blocks`, when `Some`, is the already-built block list from a
 /// `/StructTreeRoot` walk and is used verbatim (the author tagged the document).
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_page(
@@ -396,6 +398,7 @@ pub fn reconstruct_page(
     image_refs: &[PlacedImageRef],
     geom: (f64, f64, f64, f64),
     ids: &mut IdGen,
+    links: &[ParaLink],
     tag_blocks: Option<Vec<Block>>,
 ) -> Vec<Block> {
     let (x0, y0, _page_w, page_h) = geom;
@@ -445,7 +448,9 @@ pub fn reconstruct_page(
     }
 
     // Resolve the pending text-line placeholders into paragraphs/headings/lists.
-    let blocks = resolve_text_blocks(blocks, &lines, body, ids, |x, y, w, h| {
+    // The page's MediaBox left (`x0`) anchors recovered left-indents; `links`
+    // flow down so covered prose runs become `Inline::Link`.
+    let blocks = resolve_text_blocks(blocks, &lines, body, x0, links, ids, |x, y, w, h| {
         frame_top_down(x, y, w, h, x0, y0, page_h)
     });
 
@@ -517,6 +522,18 @@ pub struct PlacedImageRef {
     pub h: f64,
 }
 
+/// A page hyperlink mapped into the editable model: the destination plus the
+/// clickable rectangle `[x0, y0, x1, y1]` in **PDF user space** (origin
+/// bottom-left, same space as [`ReconRun`]). Built by the caller from
+/// [`Document::page_links`](crate::Document::page_links) and matched against run
+/// boxes during reconstruction so each covered run becomes an
+/// [`Inline::Link`](crate::model::Inline::Link).
+#[derive(Debug, Clone)]
+pub struct ParaLink {
+    pub target: crate::model::LinkTarget,
+    pub rect: [f64; 4],
+}
+
 // ── pending text-line placeholder plumbing ──────────────────────────────────
 //
 // `reconstruct_page` walks the reading order once, deciding table vs text per
@@ -542,10 +559,15 @@ fn pending_line(block: &Block) -> Option<usize> {
 
 /// Replace runs of pending placeholders with real paragraph/heading/list blocks,
 /// preserving the interleaving with already-built (table/shape) blocks.
+/// `page_left` is the MediaBox left (PDF user space) and `links` the page's
+/// hyperlinks; both flow into each prose paragraph's [`paragraphs::ParaContext`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_text_blocks(
     blocks: Vec<Block>,
     lines: &[lines::ReconLine],
     body: f64,
+    page_left: f64,
+    links: &[ParaLink],
     ids: &mut IdGen,
     to_frame: impl Fn(f64, f64, f64, f64) -> Rect + Copy,
 ) -> Vec<Block> {
@@ -557,7 +579,7 @@ fn resolve_text_blocks(
             return;
         }
         let group: Vec<&lines::ReconLine> = pending.iter().map(|&i| &lines[i]).collect();
-        let text_blocks = lower_text_group(&group, body, ids, to_frame);
+        let text_blocks = lower_text_group(&group, body, page_left, links, ids, to_frame);
         out.extend(text_blocks);
         pending.clear();
     };
@@ -575,10 +597,14 @@ fn resolve_text_blocks(
 }
 
 /// Lower a contiguous group of text lines (already in reading order) to blocks:
-/// paragraphs, with headings and lists promoted out of them.
+/// paragraphs (with recovered spacing/indents + link-wrapped runs), with
+/// headings and lists promoted out of them.
+#[allow(clippy::too_many_arguments)]
 fn lower_text_group(
     group: &[&lines::ReconLine],
     body: f64,
+    page_left: f64,
+    links: &[ParaLink],
     ids: &mut IdGen,
     to_frame: impl Fn(f64, f64, f64, f64) -> Rect + Copy,
 ) -> Vec<Block> {
@@ -594,8 +620,24 @@ fn lower_text_group(
                 }
             }
             lists::Segment::Prose(lines) => {
+                // Group-wide geometry calibrates each paragraph's recovered
+                // spacing: one leading and one body-left for the whole prose run.
+                let leading = paragraphs::group_leading(&lines, body);
+                let group_left = paragraphs::group_left(&lines);
+                let mut prev_bottom: Option<f64> = None;
                 for para_lines in paragraphs::split_paragraphs(&lines, body) {
-                    let block = paragraphs::build_paragraph(&para_lines, ids, to_frame);
+                    let ctx = paragraphs::ParaContext {
+                        body,
+                        leading,
+                        group_left,
+                        page_left,
+                        prev_bottom,
+                        links,
+                    };
+                    let block =
+                        paragraphs::build_paragraph_styled(&para_lines, &ctx, ids, to_frame);
+                    // Remember this paragraph's bottom for the next one's gap.
+                    prev_bottom = Some(paragraphs::paragraph_bottom(&para_lines));
                     out.push(headings::promote(block, body));
                 }
             }
@@ -652,6 +694,7 @@ mod tests {
             &[],
             (0.0, 0.0, 600.0, 800.0),
             &mut ids,
+            &[],
             None,
         );
         assert!(blocks.is_empty());
@@ -667,6 +710,7 @@ mod tests {
             &[],
             (0.0, 0.0, 600.0, 800.0),
             &mut ids,
+            &[],
             Some(tagged.clone()),
         );
         assert_eq!(blocks.len(), 1);
@@ -1274,5 +1318,70 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    // ── #1 hyperlink recovery (e2e through `page_blocks`) ─────────────────────
+
+    /// A URI link annotation over a run's box surfaces in `pageBlocks` as an
+    /// `Inline::Link` carrying the URL, wrapping the covered run. Mirrors the
+    /// other `page_blocks_expose_*` e2e tests: build a real PDF, attach the link
+    /// in PDF user space (the runs' own coordinate space), reconstruct.
+    #[test]
+    fn page_blocks_expose_a_hyperlinked_run() {
+        let mut b = PdfBuilder::new();
+        let page = b.add_page(612.0, 792.0);
+        let body = StdFont::Helvetica;
+        // A single body line near the top. Top-down y=140, size 12 → in PDF user
+        // space the glyph box spans roughly y ∈ [640, 652], x from 72.
+        b.text(
+            page,
+            72.0,
+            140.0,
+            12.0,
+            "Visit our documentation site",
+            body,
+            [0.0; 3],
+        );
+
+        let mut doc = open(b.finish());
+        // Link rect over the run (PDF user space, generous band around the box).
+        doc.add_uri_link(1, [70.0, 637.0, 320.0, 655.0], "https://example.com/docs")
+            .expect("add link");
+
+        let blocks = doc.page_blocks(1);
+        assert!(!blocks.is_empty(), "page_blocks returns the blocks");
+
+        // Find an Inline::Link anywhere in the page's paragraphs/headings.
+        let mut found: Option<(crate::model::LinkTarget, String)> = None;
+        for bl in &blocks {
+            let para = match &bl.kind {
+                BK::Paragraph(p) => Some(p),
+                BK::Heading(h) => Some(&h.para),
+                _ => None,
+            };
+            let Some(p) = para else { continue };
+            for inl in &p.runs {
+                if let crate::model::Inline::Link { href, children } = inl {
+                    let text = children
+                        .iter()
+                        .find_map(|c| match c {
+                            crate::model::Inline::Run(r) => Some(r.text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    found = Some((href.clone(), text));
+                }
+            }
+        }
+        let (href, text) = found.expect("a hyperlinked run is exposed as Inline::Link");
+        assert_eq!(
+            href,
+            crate::model::LinkTarget::Url("https://example.com/docs".to_string()),
+            "the link carries its URL"
+        );
+        assert!(
+            text.contains("documentation"),
+            "the link wraps the covered run text, got {text:?}"
+        );
     }
 }

@@ -12,10 +12,43 @@
 //! lines).
 
 use super::lines::ReconLine;
-use super::{median, run_char_style, IdGen};
+use super::{median, run_char_style, IdGen, ParaLink, ReconRun};
 use crate::model::{
-    geom::Rotation, Align, Block, BlockKind, Inline, InlineRun, Paragraph, ParagraphStyle, Rect,
+    geom::Rotation, Align, Block, BlockKind, Inline, InlineRun, LineHeight, Paragraph,
+    ParagraphStyle, Rect, VAlign,
 };
+
+/// Geometry + decoration context a paragraph needs to recover its
+/// [`ParagraphStyle`] spacing/indents and to wrap link runs.
+///
+/// All coordinates are **PDF user space** (origin bottom-left, *Y up*) — the
+/// same space the [`ReconLine`] runs live in. Defaults (`page_left = 0`, empty
+/// `links`, `prev_bottom = None`, `leading = 0`) reproduce the legacy
+/// no-spacing behaviour, so the back-compat [`build_paragraph`] wrapper can lean
+/// on `ParaContext::default()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ParaContext<'a> {
+    /// Document body font size (points) — calibrates super/sub detection.
+    pub body: f64,
+    /// Estimated body leading for the prose group this paragraph belongs to
+    /// (points). `0` ⇒ leading not known ⇒ `line_height` left `Normal`.
+    pub leading: f64,
+    /// The prose **group's** left margin (min line-left across the whole group),
+    /// so a first-line indent is measured against the body, not just this
+    /// paragraph's own (possibly already-indented) lines.
+    pub group_left: f64,
+    /// The page's MediaBox left edge (points): `indent_left_pt` is the block's
+    /// left margin relative to this, so a host re-lays the paragraph in the same
+    /// horizontal position.
+    pub page_left: f64,
+    /// Bottom edge (PDF user-space `y`, lower = further down) of the previous
+    /// emitted paragraph in this group, or `None` for the first. Drives
+    /// `space_before_pt` from the inter-paragraph gap.
+    pub prev_bottom: Option<f64>,
+    /// Hyperlink rectangles (already mapped to the model target), in PDF user
+    /// space. A run whose box overlaps a rect is wrapped in [`Inline::Link`].
+    pub links: &'a [ParaLink],
+}
 
 /// Split a group of reading-order lines into paragraphs (each a `Vec` of line
 /// references). `body` is the document body font size, used to estimate leading.
@@ -51,11 +84,34 @@ pub fn split_paragraphs<'a>(lines: &[&'a ReconLine], body: f64) -> Vec<Vec<&'a R
     paras
 }
 
-/// Build one [`Block::Paragraph`] from a paragraph's lines. The runs of every
-/// line are concatenated into inline runs separated by [`Inline::LineBreak`];
-/// the frame is the union of the lines' boxes (flipped to top-down by `to_frame`).
+/// Build one [`Block::Paragraph`] from a paragraph's lines with no recovered
+/// spacing/indents and no link wrapping — the back-compat entry point. The runs
+/// of every line are concatenated into inline runs separated by
+/// [`Inline::LineBreak`]; the frame is the union of the lines' boxes (flipped to
+/// top-down by `to_frame`).
 pub fn build_paragraph(
     para: &[&ReconLine],
+    ids: &mut IdGen,
+    to_frame: impl Fn(f64, f64, f64, f64) -> Rect,
+) -> Block {
+    build_paragraph_styled(para, &ParaContext::default(), ids, to_frame)
+}
+
+/// Build a [`Block::Paragraph`] **with recovered [`ParagraphStyle`]** (line
+/// height, first-line/left indents, space-before) and **link-wrapped runs**,
+/// using the geometry/decoration carried in `ctx`.
+///
+/// Spacing recovery (all PDF points):
+/// - `line_height = Multiple(leading / body_size)` when a multi-line paragraph
+///   has a measurable leading distinct from a single-spaced body.
+/// - `first_line_pt` = the first line's left minus the body left, when the
+///   opener is indented to the right of the rest of the group.
+/// - `indent_left_pt` = the block's left margin minus the page's left edge.
+/// - `space_before_pt` = the gap from the previous paragraph's bottom to this
+///   paragraph's top, beyond one line of leading (the normal single step).
+pub(crate) fn build_paragraph_styled(
+    para: &[&ReconLine],
+    ctx: &ParaContext,
     ids: &mut IdGen,
     to_frame: impl Fn(f64, f64, f64, f64) -> Rect,
 ) -> Block {
@@ -63,30 +119,41 @@ pub fn build_paragraph(
     let left = block_left(para);
     let right = block_right(para);
 
+    // Dominant baseline + body size of each line, to flag super/sub runs that
+    // sit smaller-and-raised (or smaller-and-lowered) relative to their line.
     let mut runs: Vec<Inline> = Vec::new();
     for (i, line) in para.iter().enumerate() {
         if i > 0 {
             runs.push(Inline::LineBreak);
         }
+        let (line_base, line_size) = line_baseline_and_size(line);
         for r in &line.runs {
             let t = r.text.trim();
             if t.is_empty() {
                 continue;
             }
-            runs.push(Inline::Run(InlineRun {
+            let mut style = run_char_style(r);
+            style.vertical_align = vertical_align_of(r, line_base, line_size);
+            let inline = Inline::Run(InlineRun {
                 text: r.text.clone(),
-                style: run_char_style(r),
+                style,
                 source_index: r.source_index,
-            }));
+            });
+            // Wrap the run in a Link when its box overlaps a link rect.
+            match link_for_run(r, ctx.links) {
+                Some(href) => runs.push(Inline::Link {
+                    href,
+                    children: vec![inline],
+                }),
+                None => runs.push(inline),
+            }
         }
     }
 
     let align = paragraph_align(para, left, right);
+    let style = paragraph_style(para, ctx, align, left, right, y, h);
     let paragraph = Paragraph {
-        style: ParagraphStyle {
-            align,
-            ..ParagraphStyle::default()
-        },
+        style,
         style_ref: None,
         runs,
     };
@@ -96,6 +163,189 @@ pub fn build_paragraph(
         rotation: Rotation::D0,
         kind: BlockKind::Paragraph(paragraph),
     }
+}
+
+/// Assemble the [`ParagraphStyle`] for a paragraph from its geometry and the
+/// surrounding [`ParaContext`]. `y`/`h` are the paragraph's union box bottom and
+/// height in PDF user space (`top = y + h`).
+fn paragraph_style(
+    para: &[&ReconLine],
+    ctx: &ParaContext,
+    align: Align,
+    left: f64,
+    right: f64,
+    y: f64,
+    h: f64,
+) -> ParagraphStyle {
+    let _ = right;
+    let body = ctx.body.max(1.0);
+
+    // Line height: only meaningful for multi-line paragraphs whose leading is
+    // known and visibly different from single spacing. Encode as a multiple of
+    // the body size so the figure is resolution-independent.
+    let line_height = if para.len() >= 2 && ctx.leading > 0.0 {
+        let mult = ctx.leading / body;
+        // Round-trip-friendly: leave Normal when it's within 3% of 1.0× (the
+        // font's own single spacing) to avoid spurious 1.00× annotations.
+        if (mult - 1.0).abs() > 0.03 {
+            LineHeight::Multiple(round2(mult))
+        } else {
+            LineHeight::Normal
+        }
+    } else {
+        LineHeight::Normal
+    };
+
+    // First-line indent: the opener sits to the right of the group's body left
+    // (the same jump that triggered a paragraph split). Measured against the
+    // group left, not this block's own left (which equals the indented opener).
+    let first_line_pt = {
+        let opener_left = para.first().map(|l| l.left()).unwrap_or(left);
+        let indent = opener_left - ctx.group_left;
+        let threshold = (body * 0.6).max(6.0);
+        if indent > threshold {
+            round2(indent)
+        } else {
+            0.0
+        }
+    };
+
+    // Left indent: the block's left margin relative to the page's left edge.
+    let indent_left_pt = {
+        let indent = left - ctx.page_left;
+        if indent > 1.0 {
+            round2(indent)
+        } else {
+            0.0
+        }
+    };
+
+    // Space-before: the inter-paragraph gap beyond a normal single line step.
+    // `prev_bottom` and our `top` are PDF user-space Y (larger = higher), so the
+    // visual gap is `prev_bottom - top`; subtract one line of leading (the step
+    // that would exist even with no extra spacing).
+    let space_before_pt = match ctx.prev_bottom {
+        Some(prev_bottom) if ctx.leading > 0.0 => {
+            let top = y + h;
+            let gap = prev_bottom - top - (ctx.leading - body).max(0.0);
+            if gap > body * 0.25 {
+                round2(gap)
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    };
+
+    ParagraphStyle {
+        align,
+        space_before_pt,
+        space_after_pt: 0.0,
+        indent_left_pt,
+        indent_right_pt: 0.0,
+        first_line_pt,
+        line_height,
+    }
+}
+
+/// The line's dominant baseline (`y`, PDF user space) and body font size,
+/// derived from its **largest** runs — the run set that defines the main text
+/// of the line, against which smaller raised/lowered runs read as super/sub.
+fn line_baseline_and_size(line: &ReconLine) -> (f64, f64) {
+    // Body size = the line's representative (median) run size.
+    let mut sizes: Vec<f64> = line.runs.iter().map(|r| r.size.max(1.0)).collect();
+    let body_size = median(&mut sizes, line.h.max(1.0));
+    // Dominant baseline = the median box-bottom of runs at/above ~0.85× the body
+    // size (the main-text runs), so a single small super/sub run can't drag it.
+    let mut bases: Vec<f64> = line
+        .runs
+        .iter()
+        .filter(|r| r.size >= body_size * 0.85)
+        .map(|r| r.y)
+        .collect();
+    let base = median(&mut bases, line.y);
+    (base, body_size)
+}
+
+/// Classify a run as super/sub/baseline against its line's dominant baseline and
+/// body size. A super/subscript run is **distinctly smaller** (≤ 0.75× the body
+/// size) **and** offset vertically: its box bottom rides clearly above the
+/// baseline (superscript) or sits clearly below it (subscript). The vertical
+/// offset must exceed a fraction of the body size so ordinary baseline jitter
+/// (kerning, hinting) is not misread.
+fn vertical_align_of(run: &ReconRun, line_base: f64, body_size: f64) -> VAlign {
+    if body_size <= 0.0 || run.size > body_size * 0.75 {
+        return VAlign::Baseline;
+    }
+    // Offset of this run's box bottom from the line baseline (PDF Y up: positive
+    // = higher on the page = raised).
+    let offset = run.y - line_base;
+    let threshold = body_size * 0.20;
+    if offset > threshold {
+        VAlign::Super
+    } else if offset < -threshold {
+        VAlign::Sub
+    } else {
+        VAlign::Baseline
+    }
+}
+
+/// The link target whose rectangle overlaps a run's box, if any. Overlap is
+/// generous (centre-in or ≥ 50 % box coverage) so a link rect drawn a little
+/// tighter or looser than the glyph extent still claims the run.
+fn link_for_run(run: &ReconRun, links: &[ParaLink]) -> Option<crate::model::LinkTarget> {
+    if links.is_empty() || run.w <= 0.0 {
+        return None;
+    }
+    let rx0 = run.x;
+    let rx1 = run.x + run.w;
+    let ry0 = run.y;
+    let ry1 = run.y + run.h;
+    let cx = (rx0 + rx1) / 2.0;
+    let cy = (ry0 + ry1) / 2.0;
+    for link in links {
+        let [lx0, ly0, lx1, ly1] = link.rect;
+        let (lx0, lx1) = (lx0.min(lx1), lx0.max(lx1));
+        let (ly0, ly1) = (ly0.min(ly1), ly0.max(ly1));
+        // Centre of the run inside the rect → claimed.
+        let center_in = cx >= lx0 && cx <= lx1 && cy >= ly0 && cy <= ly1;
+        // Or a healthy box overlap (handles a rect tighter than the glyph box).
+        let ox = (rx1.min(lx1) - rx0.max(lx0)).max(0.0);
+        let oy = (ry1.min(ly1) - ry0.max(ly0)).max(0.0);
+        let area = (rx1 - rx0).max(0.01) * (ry1 - ry0).max(0.01);
+        let covered = ox * oy >= area * 0.5;
+        if center_in || covered {
+            return Some(link.target.clone());
+        }
+    }
+    None
+}
+
+/// Round to 2 decimals — keeps recovered spacing/indents tidy (and JSON stable)
+/// without pretending to sub-point precision the heuristic doesn't have.
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// The leading (line-to-line step) of a whole prose group — exposed so the
+/// caller can build a [`ParaContext`] whose `leading` reflects the group, not a
+/// single paragraph (a one-line paragraph has no internal step to measure).
+pub(crate) fn group_leading(lines: &[&ReconLine], body: f64) -> f64 {
+    estimate_leading(lines, body)
+}
+
+/// The group's left margin (min line-left) — exposed for [`ParaContext::group_left`]
+/// so a first-line indent is measured against the whole group's body.
+pub(crate) fn group_left(lines: &[&ReconLine]) -> f64 {
+    block_left(lines)
+}
+
+/// A paragraph's union-box bottom edge (PDF user-space `y`, lower = further down
+/// the page) — fed to the next paragraph's [`ParaContext::prev_bottom`] to
+/// recover inter-paragraph `space_before`.
+pub(crate) fn paragraph_bottom(para: &[&ReconLine]) -> f64 {
+    let (_, y, _, _) = union_box(para);
+    y
 }
 
 /// Estimate body leading from consecutive line steps; fall back to `1.2 × body`.
@@ -341,5 +591,298 @@ mod tests {
         // alpha, LineBreak, beta
         assert_eq!(p.runs.len(), 3);
         assert!(matches!(p.runs[1], Inline::LineBreak));
+    }
+
+    // ── #10 super/sub recovery ───────────────────────────────────────────────
+
+    /// A run with the full geometry the heuristic reads (size + raised/lowered
+    /// baseline). `sized(text, x, y, w, size)`.
+    fn sized(text: &str, x: f64, y: f64, w: f64, size: f64) -> ReconRun {
+        ReconRun {
+            text: text.to_string(),
+            x,
+            y,
+            w,
+            h: size,
+            size,
+            style: TextStyle::default(),
+            rotation: 0.0,
+            source_index: None,
+            underline: false,
+            strike: false,
+        }
+    }
+
+    /// The first inline run's [`VAlign`], reading through any `Link` wrapper.
+    fn nth_run_valign(p: &Paragraph, n: usize) -> Option<crate::model::VAlign> {
+        p.runs
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.style.vertical_align),
+                _ => None,
+            })
+            .nth(n)
+    }
+
+    #[test]
+    fn a_small_raised_run_is_superscript() {
+        // Two runs on one baseline band: 12pt body at y=700, then a 7pt run
+        // raised ~4pt (y=704) — "x²"-style. The small+raised run reads as Super,
+        // the body run stays Baseline. They share a line (centres within band).
+        let body = sized("E = mc", 72.0, 700.0, 60.0, 12.0);
+        let sup = sized("2", 132.0, 704.0, 6.0, 7.0); // 7/12 ≈ 0.58 ≤ 0.75, +4 > 0.2·12
+        let lines = lines_of(&[body, sup]);
+        // The two runs must share a single line for the per-line baseline to apply.
+        assert_eq!(lines.len(), 1, "body + superscript group into one line");
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            ..ParaContext::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(
+            nth_run_valign(&p, 0),
+            Some(crate::model::VAlign::Baseline),
+            "the body run stays on the baseline"
+        );
+        assert_eq!(
+            nth_run_valign(&p, 1),
+            Some(crate::model::VAlign::Super),
+            "the small raised run is a superscript"
+        );
+    }
+
+    #[test]
+    fn a_small_lowered_run_is_subscript() {
+        // "H₂O": the 7pt "2" sits ~3pt below the 12pt body baseline.
+        let h = sized("H", 72.0, 700.0, 10.0, 12.0);
+        let two = sized("2", 82.0, 696.5, 6.0, 7.0); // -3.5 < -0.2·12
+        let o = sized("O", 88.0, 700.0, 10.0, 12.0);
+        let lines = lines_of(&[h, two, o]);
+        assert_eq!(lines.len(), 1, "subscript groups with its body run");
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            ..ParaContext::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        // Order left→right: H (base), 2 (sub), O (base).
+        assert_eq!(nth_run_valign(&p, 0), Some(crate::model::VAlign::Baseline));
+        assert_eq!(
+            nth_run_valign(&p, 1),
+            Some(crate::model::VAlign::Sub),
+            "the small lowered run is a subscript"
+        );
+        assert_eq!(nth_run_valign(&p, 2), Some(crate::model::VAlign::Baseline));
+    }
+
+    #[test]
+    fn same_size_baseline_jitter_is_not_super_sub() {
+        // A full-size run a couple of points off baseline must NOT be tagged:
+        // super/sub requires the run to be distinctly *smaller* than the body.
+        let a = sized("normal", 72.0, 700.0, 60.0, 12.0);
+        let b = sized("text", 134.0, 702.0, 30.0, 12.0); // same size, +2pt
+        let lines = lines_of(&[a, b]);
+        assert_eq!(lines.len(), 1);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            ..ParaContext::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(nth_run_valign(&p, 0), Some(crate::model::VAlign::Baseline));
+        assert_eq!(
+            nth_run_valign(&p, 1),
+            Some(crate::model::VAlign::Baseline),
+            "same-size off-baseline run is not a super/subscript"
+        );
+    }
+
+    // ── #2 paragraph spacing / indents ───────────────────────────────────────
+
+    #[test]
+    fn indented_double_spaced_paragraph_populates_style() {
+        // A 3-line paragraph at ~24pt leading (2× a 12pt body), its first line
+        // indented +30pt, and the block left 100 (page left 72 → 28pt left
+        // indent). `build_paragraph_styled` must recover all of these.
+        let runs = vec![
+            run("indented opening line here", 130.0, 700.0, 200.0), // first line indented (left 130)
+            run("second line flush at block", 100.0, 676.0, 200.0), // body left = 100
+            run("third line also flush left", 100.0, 652.0, 200.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let body = 12.0;
+        let leading = group_leading(&refs, body); // ≈ 24
+        let group_left = group_left(&refs); // = 100
+        let ctx = ParaContext {
+            body,
+            leading,
+            group_left,
+            page_left: 72.0,
+            prev_bottom: None,
+            links: &[],
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        let st = &p.style;
+        // Line height ≈ 24/12 = 2.0× (well above the 1.0× Normal threshold).
+        match st.line_height {
+            LineHeight::Multiple(m) => {
+                assert!((m - 2.0).abs() < 0.1, "≈2.0× leading, got {m}")
+            }
+            other => panic!("expected Multiple leading, got {other:?}"),
+        }
+        // First-line indent ≈ 30pt (130 − 100), well over the (12·0.6)=7.2 floor.
+        assert!(
+            (st.first_line_pt - 30.0).abs() < 1.0,
+            "first-line indent ≈ 30, got {}",
+            st.first_line_pt
+        );
+        // Left indent = block left (100) − page left (72) = 28pt.
+        assert!(
+            (st.indent_left_pt - 28.0).abs() < 1.0,
+            "left indent ≈ 28, got {}",
+            st.indent_left_pt
+        );
+    }
+
+    #[test]
+    fn gap_before_a_paragraph_recovers_space_before() {
+        // A single body paragraph whose top sits 40pt below the previous
+        // paragraph's bottom, at a 14pt body leading. The extra gap beyond one
+        // line step is recovered as space_before.
+        let runs = vec![run("a fresh paragraph body", 72.0, 600.0, 200.0)];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        // Previous paragraph bottom 40pt above this para's top (top = 600+12=612).
+        let ctx = ParaContext {
+            body: 12.0,
+            leading: 14.0,
+            group_left: 72.0,
+            page_left: 72.0,
+            prev_bottom: Some(612.0 + 40.0),
+            links: &[],
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        // gap = prev_bottom - top - (leading-body) = 652 - 612 - 2 = 38.
+        assert!(
+            (p.style.space_before_pt - 38.0).abs() < 1.0,
+            "space_before ≈ 38, got {}",
+            p.style.space_before_pt
+        );
+    }
+
+    #[test]
+    fn plain_single_spaced_paragraph_leaves_style_quiet() {
+        // A tight, flush-left, single-spaced paragraph at the page margin and no
+        // preceding paragraph: every recovered field stays at its quiet default
+        // (no spurious 1.0× leading, no phantom indents).
+        let runs = vec![
+            run("flush left line one", 72.0, 700.0, 150.0),
+            run("flush left line two", 72.0, 688.0, 150.0), // ~12pt leading = 1.0× body
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let body = 12.0;
+        let ctx = ParaContext {
+            body,
+            leading: group_leading(&refs, body),
+            group_left: group_left(&refs),
+            page_left: 72.0,
+            prev_bottom: None,
+            links: &[],
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        let st = &p.style;
+        assert_eq!(st.line_height, LineHeight::Normal, "1.0× leading ⇒ Normal");
+        assert_eq!(st.first_line_pt, 0.0, "no first-line indent");
+        assert_eq!(st.indent_left_pt, 0.0, "at the page margin");
+        assert_eq!(st.space_before_pt, 0.0, "no preceding paragraph");
+    }
+
+    // ── #1 link wrapping (run inside a link rect) ────────────────────────────
+
+    #[test]
+    fn a_run_under_a_link_rect_is_wrapped_in_link() {
+        use crate::model::LinkTarget;
+        // One body line; a link rect covers the whole run's box (PDF user space).
+        let runs = vec![run("click me", 72.0, 700.0, 80.0)]; // box x 72..152, y 700..712
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let links = [ParaLink {
+            target: LinkTarget::Url("https://example.com".into()),
+            rect: [70.0, 698.0, 156.0, 714.0],
+        }];
+        let ctx = ParaContext {
+            body: 12.0,
+            links: &links,
+            ..ParaContext::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        let link = p.runs.iter().find_map(|i| match i {
+            Inline::Link { href, children } => Some((href.clone(), children.clone())),
+            _ => None,
+        });
+        let (href, children) = link.expect("the covered run is wrapped in a Link");
+        assert_eq!(href, LinkTarget::Url("https://example.com".into()));
+        assert!(
+            matches!(children.first(), Some(Inline::Run(r)) if r.text.trim() == "click me"),
+            "the link wraps the run it covers"
+        );
+    }
+
+    #[test]
+    fn a_run_outside_every_link_rect_is_not_wrapped() {
+        use crate::model::LinkTarget;
+        let runs = vec![run("plain text", 72.0, 700.0, 80.0)];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        // A link rect far from the run (200pt below) must not claim it.
+        let links = [ParaLink {
+            target: LinkTarget::Url("https://example.com".into()),
+            rect: [72.0, 498.0, 152.0, 512.0],
+        }];
+        let ctx = ParaContext {
+            body: 12.0,
+            links: &links,
+            ..ParaContext::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            !p.runs.iter().any(|i| matches!(i, Inline::Link { .. })),
+            "a run outside every rect stays a plain Run"
+        );
     }
 }
