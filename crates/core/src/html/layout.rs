@@ -227,10 +227,7 @@ impl FloatCtx {
 
     /// The lowest bottom among placed floats (for clearing after a block).
     fn max_bottom(&self) -> f64 {
-        self.boxes
-            .iter()
-            .map(|f| f.bottom)
-            .fold(0.0_f64, f64::max)
+        self.boxes.iter().map(|f| f.bottom).fold(0.0_f64, f64::max)
     }
 }
 
@@ -367,6 +364,83 @@ struct Word {
     w: f64,
     media: Option<Media>,
     space_after: bool,
+}
+
+/// A unit of a multi-column block's flow, as the column placer distributes it:
+/// either a single block-level child or a maximal run of inline-level siblings
+/// (which lay out together as one inline formatting context).
+enum FlowUnit<'a> {
+    /// A block-level child element, with its 1-based list index (for markers).
+    Block { el: &'a Element, list_index: usize },
+    /// A contiguous run of inline-level nodes (text + inline elements).
+    Inline(Vec<&'a Node>),
+}
+
+/// Partition a multi-column block's children into [`FlowUnit`]s: maximal runs of
+/// inline-level content interleaved with block-level children, mirroring the
+/// block/inline classification of [`Flow::block_children`] (whitespace-only text
+/// between blocks is dropped, `display:none` is skipped, and list-item indices
+/// honour an enclosing `<ol start>`). Out-of-flow children (float / absolute /
+/// fixed) are treated as block units so they still lay out; their precise
+/// out-of-flow behaviour inside a column is not modelled (a pragmatic choice —
+/// floats/absolutes are rare inside multi-column text).
+fn flow_units<'a>(
+    children: &'a [Node],
+    parent_style: &Style,
+    ancestors: &[&Element],
+    flow: &Flow,
+) -> Vec<FlowUnit<'a>> {
+    let mut units: Vec<FlowUnit<'a>> = Vec::new();
+    let mut inline_run: Vec<&'a Node> = Vec::new();
+    let mut list_index = list_start_offset(ancestors);
+
+    for child in children {
+        let is_block = match child {
+            Node::Text(t) => {
+                if t.trim().is_empty() {
+                    continue; // collapse whitespace between blocks
+                }
+                false
+            }
+            Node::Element(e) => {
+                let st = flow.style_of(e, parent_style, ancestors);
+                if st.display == Display::None {
+                    continue;
+                }
+                matches!(
+                    st.display,
+                    Display::Block
+                        | Display::ListItem
+                        | Display::Table
+                        | Display::TableRow
+                        | Display::Flex
+                        | Display::Grid
+                )
+            }
+        };
+
+        if is_block {
+            if !inline_run.is_empty() {
+                units.push(FlowUnit::Inline(std::mem::take(&mut inline_run)));
+            }
+            if let Node::Element(e) = child {
+                let st = flow.style_of(e, parent_style, ancestors);
+                if st.display == Display::ListItem {
+                    list_index += 1;
+                }
+                units.push(FlowUnit::Block {
+                    el: e,
+                    list_index,
+                });
+            }
+        } else {
+            inline_run.push(child);
+        }
+    }
+    if !inline_run.is_empty() {
+        units.push(FlowUnit::Inline(inline_run));
+    }
+    units
 }
 
 impl Flow<'_> {
@@ -641,7 +715,15 @@ impl Flow<'_> {
             self.collect_inline(n, style, ancestors, &mut items);
         }
         let floats = self.floats.clone();
-        self.flow_lines_floated(&items, x, avail_w, y, style.align, style.text_indent, &floats)
+        self.flow_lines_floated(
+            &items,
+            x,
+            avail_w,
+            y,
+            style.align,
+            style.text_indent,
+            &floats,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -667,6 +749,11 @@ impl Flow<'_> {
         }
         if style.display == Display::Grid {
             return self.grid(el, style, x, avail_w, y, ancestors);
+        }
+        // A normal block with `column-count`/`columns` > 1 lays its flow content
+        // out as equal-width balanced columns (newspaper/newsletter flow).
+        if style.column_count > 1 {
+            return self.columns(el, style, x, avail_w, y, ancestors);
         }
 
         let m = &style.margin;
@@ -1084,7 +1171,9 @@ impl Flow<'_> {
             let (line_x, line_avail) = line_geom(first_line);
             let w = &words[i];
             if w.text == "\n" {
-                self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
+                self.emit_line(
+                    &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+                );
                 line.clear();
                 line_w = 0.0;
                 first_line = false;
@@ -1093,7 +1182,9 @@ impl Flow<'_> {
             }
             let add = w.w + if line.is_empty() { 0.0 } else { space_w };
             if !line.is_empty() && line_w + add > line_avail {
-                self.emit_line(&line, line_w, &mut y, false, line_x, line_avail, align, space_w);
+                self.emit_line(
+                    &line, line_w, &mut y, false, line_x, line_avail, align, space_w,
+                );
                 line.clear();
                 first_line = false;
                 // Re-evaluate the same word on the fresh line.
@@ -1106,7 +1197,9 @@ impl Flow<'_> {
             i += 1;
         }
         let (line_x, line_avail) = line_geom(first_line);
-        self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
+        self.emit_line(
+            &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+        );
         y
     }
 
@@ -1147,7 +1240,9 @@ impl Flow<'_> {
             let (line_x, line_avail) = geom(self, y, first_line);
             let w = &words[i];
             if w.text == "\n" {
-                self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
+                self.emit_line(
+                    &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+                );
                 line.clear();
                 line_w = 0.0;
                 first_line = false;
@@ -1156,7 +1251,9 @@ impl Flow<'_> {
             }
             let add = w.w + if line.is_empty() { 0.0 } else { space_w };
             if !line.is_empty() && line_w + add > line_avail {
-                self.emit_line(&line, line_w, &mut y, false, line_x, line_avail, align, space_w);
+                self.emit_line(
+                    &line, line_w, &mut y, false, line_x, line_avail, align, space_w,
+                );
                 line.clear();
                 first_line = false;
                 line.push(w);
@@ -1168,7 +1265,9 @@ impl Flow<'_> {
             i += 1;
         }
         let (line_x, line_avail) = geom(self, y, first_line);
-        self.emit_line(&line, line_w, &mut y, true, line_x, line_avail, align, space_w);
+        self.emit_line(
+            &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+        );
         y
     }
 
@@ -1626,7 +1725,9 @@ impl Flow<'_> {
         content_w: f64,
         na: &[&Element],
     ) -> Vec<Vec<&'b Element>> {
-        let any_explicit = items.iter().any(|it| self.style_of(it, style, na).width.is_some());
+        let any_explicit = items
+            .iter()
+            .any(|it| self.style_of(it, style, na).width.is_some());
         if !style.flex_wrap || !any_explicit {
             return vec![items.to_vec()];
         }
@@ -1947,6 +2048,177 @@ impl Flow<'_> {
             y_cursor = row_bottom;
         }
         y_cursor + p.bottom + b.bottom + style.margin.bottom
+    }
+
+    /// Lay a normal block's flow content out into `column_count` equal-width
+    /// columns (CSS multi-column: `column-count` / `columns`, gutter from
+    /// `column-gap`, falling back to a 1em gutter when unset).
+    ///
+    /// The block's own box (margin / border / padding / width / background) is
+    /// handled exactly like [`Flow::block`]; only its *content* is split. Flow
+    /// units — each top-level block child, and each maximal run of inline-level
+    /// siblings — are distributed left-to-right and **height-balanced**: a
+    /// measure pass lays every unit out once (at the column width) to total the
+    /// content height, the target per column is `total / N`, and the place pass
+    /// fills each column until adding the next unit would pass the target (then
+    /// it moves to the next column, except in the last one which takes the rest).
+    ///
+    /// Pagination interaction: columns are emitted in absolute coordinates, so a
+    /// region that overflows a single page is sliced by the y-band paginator like
+    /// any other content (each column simply continues down the next page band).
+    /// True column-then-page balancing across multiple pages is **not** modelled;
+    /// the single-page case (the common newsletter/report block) is exact.
+    fn columns(
+        &mut self,
+        el: &Element,
+        style: &Style,
+        x: f64,
+        avail_w: f64,
+        mut y: f64,
+        ancestors: &[&Element],
+    ) -> f64 {
+        let m = &style.margin;
+        let p = &style.padding;
+        let b = &style.border_width;
+
+        y += m.top;
+        let box_top = y;
+        let box_x = x + m.left;
+        let resolve_w = |len: Len| match len {
+            Len::Pt(w) => w,
+            Len::Percent(pc) => avail_w * pc / 100.0,
+        };
+        // Box width, matching `block`'s sizing (incl. `box-sizing`/min/max).
+        let mut box_w = match style.width {
+            Some(Len::Pt(w)) if style.border_box => w,
+            Some(Len::Pt(w)) => w + p.left + p.right + b.left + b.right,
+            Some(Len::Percent(pc)) => avail_w * pc / 100.0,
+            None => avail_w - m.left - m.right,
+        };
+        if let Some(mw) = style.max_width {
+            box_w = box_w.min(resolve_w(mw));
+        }
+        if let Some(mw) = style.min_width {
+            box_w = box_w.max(resolve_w(mw));
+        }
+        let content_x = box_x + b.left + p.left;
+        let content_w = (box_w - b.left - b.right - p.left - p.right).max(1.0);
+        let content_top = box_top + b.top + p.top;
+
+        let n = style.column_count.max(1);
+        // Gutter: explicit `column-gap`, else a 1em default (CSS `normal`).
+        let gap = if style.gap_col > 0.0 {
+            style.gap_col
+        } else {
+            style.font_size
+        };
+        // Equal column width: total minus the (n-1) gutters, split n ways.
+        let col_w = ((content_w - gap * (n - 1) as f64) / n as f64).max(1.0);
+        let col_x = |c: usize| content_x + c as f64 * (col_w + gap);
+
+        let new_ancestors = push_ancestor(ancestors, el);
+        // Partition the children into flow units (block child | inline run).
+        let units = flow_units(&el.children, style, &new_ancestors, self);
+
+        // ── Measure pass: lay each unit out once at the column width, record its
+        // height, then discard the probe fragments (truncate `self.out`). ──
+        let mut heights: Vec<f64> = Vec::with_capacity(units.len());
+        for unit in &units {
+            let probe_start = self.out.len();
+            let bottom =
+                self.lay_unit(unit, style, content_x, col_w, content_top, &new_ancestors);
+            self.out.truncate(probe_start);
+            heights.push((bottom - content_top).max(0.0));
+        }
+        let total: f64 = heights.iter().sum();
+        let target = total / n as f64;
+
+        // ── Place pass: greedily fill columns to the balanced target. Each unit
+        // is re-laid at its column's running `y`; a column advances when the next
+        // unit would push it past the target (never on the last column). ──
+        let mut col = 0usize;
+        let mut col_y = content_top;
+        let mut max_bottom = content_top;
+        for (unit, uh) in units.iter().zip(&heights) {
+            // Move to the next column when this column already holds content and
+            // adding the unit would overshoot the balanced target. Skip degenerate
+            // units (height 0) so they never trigger a premature break.
+            if col + 1 < n
+                && col_y > content_top + 0.05
+                && *uh > 0.0
+                && (col_y - content_top) + *uh > target + 0.05
+            {
+                col += 1;
+                col_y = content_top;
+            }
+            let bottom =
+                self.lay_unit(unit, style, col_x(col), col_w, col_y, &new_ancestors);
+            col_y = bottom;
+            max_bottom = max_bottom.max(col_y);
+        }
+
+        let mut box_h = (max_bottom + p.bottom + b.bottom - box_top).max(0.1);
+        if let Some(mh) = style.min_height {
+            box_h = box_h.max(mh);
+        }
+
+        // Background + per-side borders behind the columns (z=0), like `block`.
+        let any_border = b.top + b.bottom + b.left + b.right > 0.0;
+        if !style.hidden && (style.background.is_some() || any_border) {
+            if style.background.is_some() {
+                self.out.push(Abs {
+                    z: 0,
+                    zi: 0,
+                    frag: Fragment::Rect {
+                        x: box_x,
+                        y: box_top,
+                        w: box_w,
+                        h: box_h,
+                        fill: style.background,
+                        stroke: None,
+                        stroke_w: 0.0,
+                        opacity: style.opacity,
+                    },
+                });
+            }
+            if any_border {
+                self.emit_border_edges(
+                    box_x,
+                    box_top,
+                    box_w,
+                    box_h,
+                    [b.top, b.right, b.bottom, b.left],
+                    &style.border_color_edges,
+                    style.opacity,
+                );
+            }
+        }
+
+        box_top + box_h + m.bottom
+    }
+
+    /// Lay one flow unit (a block child, or a run of inline siblings) out at
+    /// `(x, avail_w, y)`, returning its bottom `y`. The shared building block of
+    /// the multi-column placer (measure pass + place pass), so a unit is laid out
+    /// identically wherever it lands.
+    fn lay_unit(
+        &mut self,
+        unit: &FlowUnit,
+        parent_style: &Style,
+        x: f64,
+        avail_w: f64,
+        y: f64,
+        ancestors: &[&Element],
+    ) -> f64 {
+        match unit {
+            FlowUnit::Block { el, list_index } => {
+                let st = self.style_of(el, parent_style, ancestors);
+                self.block(el, &st, parent_style, x, avail_w, y, ancestors, *list_index)
+            }
+            FlowUnit::Inline(nodes) => {
+                self.inline_context_f(nodes, parent_style, x, avail_w, y, ancestors)
+            }
+        }
     }
 
     /// Paint a flex/grid item's background + border as a single rect spanning
@@ -2638,16 +2910,17 @@ mod tests {
         //
         //   row0: | Span (rowspan 2) | B0 |
         //   row1: |     (reserved)   | C1 |
-        let layout = run(
-            "<table>\
+        let layout = run("<table>\
              <tr><td rowspan=\"2\">Span</td><td>B0</td></tr>\
-             <tr><td>C1</td></tr></table>",
-        );
+             <tr><td>C1</td></tr></table>");
         let span = cell_x(&layout, "Span");
         let b0 = cell_x(&layout, "B0");
         let c1 = cell_x(&layout, "C1");
         // Spanning cell anchors column 0 (left edge).
-        assert!((span - CELL_INSET).abs() < 1.0, "rowspan cell at col 0 ({span})");
+        assert!(
+            (span - CELL_INSET).abs() < 1.0,
+            "rowspan cell at col 0 ({span})"
+        );
         // B0 sits in column 1.
         assert!(
             (b0 - (CELL_INSET + 270.0)).abs() < 1.0,
@@ -2674,11 +2947,9 @@ mod tests {
         //   row0: | A (rowspan 2) | B0 |        (B0 → col 1; nothing in col 2)
         //   row1: |  (reserved)   | C1 | D1 |   (C1 → col 1, D1 → col 2)
         // So D1 must sit in column 2 (the third of three equal 180-pt columns).
-        let layout = run(
-            "<table>\
+        let layout = run("<table>\
              <tr><td rowspan=\"2\">A</td><td>B0</td></tr>\
-             <tr><td>C1</td><td>D1</td></tr></table>",
-        );
+             <tr><td>C1</td><td>D1</td></tr></table>");
         let b0 = cell_x(&layout, "B0");
         let c1 = cell_x(&layout, "C1");
         let d1 = cell_x(&layout, "D1");
@@ -2702,11 +2973,9 @@ mod tests {
         // The spanning cell's background rect must cover the full height of the
         // two rows it spans — i.e. be taller than either single row alone, and
         // start at the table top. A grey background makes the rect findable.
-        let layout = run(
-            "<table>\
+        let layout = run("<table>\
              <tr><td rowspan=\"2\" style=\"background:#cccccc\">S</td><td>B0</td></tr>\
-             <tr><td>C1</td></tr></table>",
-        );
+             <tr><td>C1</td></tr></table>");
         let grey = [0.8, 0.8, 0.8];
         // The spanning cell's background fill rect.
         let span_rect = rects(&layout)
@@ -2718,14 +2987,20 @@ mod tests {
         let b0_y = cell_y(&layout, "B0");
         let c1_y = cell_y(&layout, "C1");
         let one_row = c1_y - b0_y; // top-to-top distance ≈ row-0 height
-        assert!(one_row > 1.0, "the two rows are vertically separated ({one_row})");
+        assert!(
+            one_row > 1.0,
+            "the two rows are vertically separated ({one_row})"
+        );
         // The spanning rect must be taller than a single row (it covers two).
         assert!(
             sh > one_row + 1.0,
             "spanning cell rect ({sh}) is taller than one row ({one_row})"
         );
         // And it starts at (or above) row 0's content baseline area.
-        assert!(sy <= b0_y, "spanning rect starts at/above row 0 ({sy} vs {b0_y})");
+        assert!(
+            sy <= b0_y,
+            "spanning rect starts at/above row 0 ({sy} vs {b0_y})"
+        );
     }
 
     #[test]
@@ -2741,12 +3016,10 @@ mod tests {
              <tr><td>C1</td></tr>\
              <tr><td>R2L</td><td>R2R</td></tr></table>"
         ));
-        let short = run(
-            "<table>\
+        let short = run("<table>\
              <tr><td rowspan=\"2\">x</td><td>B0</td></tr>\
              <tr><td>C1</td></tr>\
-             <tr><td>R2L</td><td>R2R</td></tr></table>",
-        );
+             <tr><td>R2L</td><td>R2R</td></tr></table>");
         let y_tall = cell_y(&with_tall, "R2L");
         let y_short = cell_y(&short, "R2L");
         assert!(
@@ -2807,14 +3080,12 @@ mod tests {
     fn table_header_cell_background_paints_behind_text() {
         // A grey header background must render as a fill rect at z=0 *before* the
         // header text (so text stays legible on top).
-        let layout = run(
-            r#"<table><tr><th style="background:#cccccc">Head</th></tr></table>"#,
-        );
+        let layout = run(r#"<table><tr><th style="background:#cccccc">Head</th></tr></table>"#);
         let page = &layout.pages[0];
         let grey = [0.8, 0.8, 0.8];
-        let bg_idx = page.iter().position(|f| {
-            matches!(f, Fragment::Rect { fill: Some(c), .. } if *c == grey)
-        });
+        let bg_idx = page
+            .iter()
+            .position(|f| matches!(f, Fragment::Rect { fill: Some(c), .. } if *c == grey));
         let text_idx = page
             .iter()
             .position(|f| matches!(f, Fragment::Text { text, .. } if text == "Head"));
@@ -2891,21 +3162,16 @@ mod tests {
         // left cell does NOT also stroke its right edge there. So the boundary
         // carries n_rows segments (2), not 2×n_rows (4) — that's the collapse
         // dedup. Separate mode (next test) would draw both adjacent sides.
-        let layout = run(
-            "<table style=\"border-collapse:collapse\">\
+        let layout = run("<table style=\"border-collapse:collapse\">\
                <tr><td>a</td><td>b</td></tr>\
-               <tr><td>c</td><td>d</td></tr></table>",
-        );
+               <tr><td>c</td><td>d</td></tr></table>");
         // Equal 2-col grid over avail 540 ⇒ boundary at 36 + 270 = 306.
         let boundary = 36.0 + 270.0;
         let verticals: Vec<_> = rects(&layout)
             .into_iter()
             // thin vertical rules straddling the interior boundary
             .filter(|(rx, _, rw, rh, fill)| {
-                fill.is_some()
-                    && *rw < 4.0
-                    && *rh > 4.0
-                    && (*rx - boundary).abs() < 2.5
+                fill.is_some() && *rw < 4.0 && *rh > 4.0 && (*rx - boundary).abs() < 2.5
             })
             .collect();
         assert_eq!(
@@ -3001,11 +3267,7 @@ mod tests {
         // `<ol><li>A<li>B</ol>` → markers "1." / "2.", each to the left of and
         // vertically aligned with its item's text.
         let xy = text_xy(&run("<ol><li>Alpha</li><li>Beta</li></ol>"));
-        let find = |t: &str| {
-            xy.iter()
-                .find(|(_, _, s)| s == t)
-                .map(|(x, y, _)| (*x, *y))
-        };
+        let find = |t: &str| xy.iter().find(|(_, _, s)| s == t).map(|(x, y, _)| (*x, *y));
         let (m1x, m1y) = find("1.").expect("marker 1.");
         let (m2x, m2y) = find("2.").expect("marker 2.");
         let (a_x, a_y) = find("Alpha").expect("item Alpha");
@@ -3032,7 +3294,10 @@ mod tests {
         let inner_x = find("Inner").expect("inner item text");
         // Nested bullet is indented past the outer "1." marker, and still sits
         // left of its own item's text.
-        assert!(bul_x > one_x, "nested bullet indented (bul={bul_x}, top={one_x})");
+        assert!(
+            bul_x > one_x,
+            "nested bullet indented (bul={bul_x}, top={one_x})"
+        );
         assert!(bul_x < inner_x, "bullet left of inner text");
     }
 
@@ -3142,12 +3407,13 @@ mod tests {
     fn explicit_vertical_align_length_raises_the_run() {
         // `vertical-align: 5px` (positive = up in CSS) raises the run; the
         // shifted run's top-down y is above its un-shifted sibling.
-        let layout = run(
-            r#"<p><span>base</span><span style="vertical-align:5px">up</span></p>"#,
-        );
+        let layout = run(r#"<p><span>base</span><span style="vertical-align:5px">up</span></p>"#);
         let (_, base_y) = run_metrics(&layout, "base").expect("base run");
         let (_, up_y) = run_metrics(&layout, "up").expect("raised run");
-        assert!(up_y < base_y, "explicit length raised the run ({up_y} < {base_y})");
+        assert!(
+            up_y < base_y,
+            "explicit length raised the run ({up_y} < {base_y})"
+        );
     }
 
     #[test]
@@ -3260,6 +3526,191 @@ mod tests {
         assert!(
             c3.1 > c1.1 && (c3.0 - c1.0).abs() < 1.0,
             "C3 wraps below C1 in the next row (c1={c1:?}, c3={c3:?})"
+        );
+    }
+
+    // ── multi-column (CSS column-count / columns / column-gap) ──
+
+    #[test]
+    fn column_count_splits_content_into_two_columns() {
+        // Six paragraphs in a 2-column block: the first paragraphs fill the left
+        // column (x near the content origin), the later ones spill into the right
+        // column (a distinctly larger x). The right column starts at roughly the
+        // column width + gutter further right than the left.
+        let layout = run(
+            r#"<div style="column-count:2">
+                 <p>Alpha</p><p>Bravo</p><p>Charlie</p>
+                 <p>Delta</p><p>Echo</p><p>Foxtrot</p>
+               </div>"#,
+        );
+        let t = text_xy(&layout);
+        let x_of = |s: &str| t.iter().find(|(_, _, label)| label == s).unwrap().0;
+
+        let left_x = x_of("Alpha");
+        let right_x = x_of("Foxtrot");
+        // Left column hugs the content origin (page margin 36).
+        assert!(
+            (left_x - 36.0).abs() < 2.0,
+            "first paragraph is in the left column at the content origin ({left_x})"
+        );
+        // The last paragraph landed in the right column — clearly further right.
+        assert!(
+            right_x > left_x + 100.0,
+            "later content flows into the right column (left={left_x}, right={right_x})"
+        );
+        // Both columns sit within the content box and don't overlap horizontally.
+        // content_w = 540, gap defaults to 1em (=12pt for the inherited 12pt
+        // body font) ⇒ col_w = (540 - 12) / 2 = 264, right column at 36+264+12.
+        assert!(
+            (right_x - (36.0 + 264.0 + 12.0)).abs() < 4.0,
+            "right column starts at ~col_w + gutter from the left ({right_x})"
+        );
+    }
+
+    #[test]
+    fn columns_balance_height_across_columns() {
+        // Many short paragraphs: balancing should put roughly half in each column,
+        // so the left and right columns reach comparable bottoms (neither column
+        // is left almost empty). We compare the lowest y in each column.
+        let mut html = String::from(r#"<div style="column-count:2">"#);
+        for i in 0..12 {
+            html.push_str(&format!("<p>Para number {i}</p>"));
+        }
+        html.push_str("</div>");
+        let layout = run(&html);
+        let t = text_xy(&layout);
+        // Split fragments by which column their x falls into (boundary ≈ midway).
+        let boundary = 36.0 + 264.0; // left col right edge
+        let left_bottom = t
+            .iter()
+            .filter(|(x, _, _)| *x < boundary)
+            .map(|(_, y, _)| *y)
+            .fold(0.0_f64, f64::max);
+        let right_bottom = t
+            .iter()
+            .filter(|(x, _, _)| *x >= boundary)
+            .map(|(_, y, _)| *y)
+            .fold(0.0_f64, f64::max);
+        assert!(left_bottom > 36.0, "left column has content");
+        assert!(right_bottom > 36.0, "right column has content");
+        // Balanced: the two columns end within ~one paragraph-height of each other.
+        assert!(
+            (left_bottom - right_bottom).abs() < 40.0,
+            "columns are height-balanced (left bottom {left_bottom}, right {right_bottom})"
+        );
+    }
+
+    #[test]
+    fn column_gap_widens_the_gutter_and_pushes_the_right_column() {
+        // A larger `column-gap` narrows each column and shifts the right column's
+        // start further right than the default gutter would.
+        let wide = run(
+            r#"<div style="column-count:2;column-gap:60pt">
+                 <p>One</p><p>Two</p><p>Three</p><p>Four</p>
+               </div>"#,
+        );
+        let narrow = run(
+            r#"<div style="column-count:2;column-gap:4pt">
+                 <p>One</p><p>Two</p><p>Three</p><p>Four</p>
+               </div>"#,
+        );
+        let right_x = |l: &Layout| {
+            // The right-column start = the largest distinct x among fragments.
+            text_xy(l)
+                .into_iter()
+                .map(|(x, _, _)| x)
+                .fold(0.0_f64, f64::max)
+        };
+        let rw = right_x(&wide);
+        let rn = right_x(&narrow);
+        // wide gutter ⇒ col_w=(540-60)/2=240, right col at 36+240+60=336.
+        // narrow gutter ⇒ col_w=(540-4)/2=268, right col at 36+268+4=308.
+        assert!(
+            rw > rn + 20.0,
+            "a wider column-gap pushes the right column further right (wide={rw}, narrow={rn})"
+        );
+        assert!(
+            (rw - 336.0).abs() < 5.0,
+            "wide-gutter right column starts near 336 ({rw})"
+        );
+    }
+
+    #[test]
+    fn columns_shorthand_count_is_honoured() {
+        // `columns: 3` (the count form of the shorthand) yields three columns;
+        // with nine short blocks the last one lands in the third column, well
+        // right of the first.
+        let layout = run(
+            r#"<div style="columns:3">
+                 <p>A1</p><p>A2</p><p>A3</p>
+                 <p>B1</p><p>B2</p><p>B3</p>
+                 <p>C1</p><p>C2</p><p>C3</p>
+               </div>"#,
+        );
+        let t = text_xy(&layout);
+        let xs: Vec<f64> = t.iter().map(|(x, _, _)| *x).collect();
+        let min_x = xs.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_x = xs.iter().copied().fold(0.0_f64, f64::max);
+        // Three columns over 540 with a 12pt default gutter ⇒ col_w=172,
+        // third column at 36 + 2*(172+12) = 404 — far right of the first.
+        assert!(
+            max_x > min_x + 250.0,
+            "three columns span the content width (min={min_x}, max={max_x})"
+        );
+        assert!(
+            (min_x - 36.0).abs() < 2.0,
+            "first column at the content origin ({min_x})"
+        );
+    }
+
+    #[test]
+    fn single_column_block_is_unchanged_no_regression() {
+        // A plain block (no column-count) must lay out exactly as before: all
+        // paragraphs stack in one column at the content origin, increasing y.
+        let plain = run("<div><p>One</p><p>Two</p><p>Three</p></div>");
+        let t = text_xy(&plain);
+        assert_eq!(t.len(), 3, "three paragraphs, one each");
+        // All at the same (content-origin) x and strictly increasing y.
+        for (x, _, _) in &t {
+            assert!((*x - 36.0).abs() < 1.0, "stacked at the content origin ({x})");
+        }
+        assert!(
+            t[0].1 < t[1].1 && t[1].1 < t[2].1,
+            "paragraphs stack top-to-bottom ({:?})",
+            t.iter().map(|(_, y, _)| *y).collect::<Vec<_>>()
+        );
+        // `column-count:1` is explicitly a no-op (single column).
+        let one = run(r#"<div style="column-count:1"><p>One</p><p>Two</p></div>"#);
+        let to = text_xy(&one);
+        for (x, _, _) in &to {
+            assert!((*x - 36.0).abs() < 1.0, "column-count:1 stays single-column ({x})");
+        }
+    }
+
+    #[test]
+    fn columns_preserve_reading_order_left_then_right() {
+        // The unit that fills the left column comes before, in document order,
+        // the unit that opens the right column — i.e. the flow goes top-of-left
+        // then top-of-right (newspaper columns), not interleaved.
+        let layout = run(
+            r#"<div style="column-count:2">
+                 <p>First</p><p>Second</p><p>Third</p>
+                 <p>Fourth</p><p>Fifth</p><p>Sixth</p>
+               </div>"#,
+        );
+        let t = text_xy(&layout);
+        let pos = |s: &str| {
+            let (x, y, _) = t.iter().find(|(_, _, l)| l == s).unwrap();
+            (*x, *y)
+        };
+        let (first_x, first_y) = pos("First");
+        let (sixth_x, _sixth_y) = pos("Sixth");
+        // "First" tops the left column; "Sixth" is in the right column lower than
+        // where it would be if all six stacked in one column.
+        assert!(first_x < sixth_x - 100.0, "First in left, Sixth in right");
+        assert!(
+            (first_y - 36.0).abs() < 12.0,
+            "First sits at the top of the left column ({first_y})"
         );
     }
 }

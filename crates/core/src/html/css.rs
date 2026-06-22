@@ -219,8 +219,13 @@ pub struct Style {
     pub grid_rows: usize,
     /// `row-gap` / `gap` — vertical gutter between grid/flex tracks (points).
     pub gap_row: f64,
-    /// `column-gap` / `gap` — horizontal gutter between tracks (points).
+    /// `column-gap` / `gap` — horizontal gutter between tracks (points). Shared
+    /// by grid/flex gutters and the multi-column gutter (`columns`/`column-gap`).
     pub gap_col: f64,
+    /// `column-count` / `columns` — number of equal-width columns the block's
+    /// flow content is split into (`0`/`1` = a single normal column, i.e. not a
+    /// multi-column block). Not inherited.
+    pub column_count: usize,
     /// `grid-column` start (1-based; 0 = auto-flow). Basic line placement.
     pub grid_col_start: usize,
     /// `grid-row` start (1-based; 0 = auto-flow).
@@ -379,6 +384,7 @@ impl Default for Style {
             grid_rows: 0,
             gap_row: 0.0,
             gap_col: 0.0,
+            column_count: 0,
             grid_col_start: 0,
             grid_row_start: 0,
             letter_spacing: 0.0,
@@ -754,6 +760,7 @@ fn inherit(parent: &Style) -> Style {
         grid_rows: 0,
         gap_row: 0.0,
         gap_col: 0.0,
+        column_count: 0,
         grid_col_start: 0,
         grid_row_start: 0,
         float: FloatSide::None,
@@ -788,6 +795,23 @@ fn parse_grid_columns(v: &str) -> usize {
         .filter(|t| !t.is_empty())
         .count()
         .max(1)
+}
+
+/// Parse the column count from a `columns` shorthand (`column-width ||
+/// column-count`). The shorthand mixes a length (the column *width*) and a bare
+/// integer (the column *count*) in either order; we model the count only, so we
+/// take the first bare integer token. A sole `column-width` (no count) and the
+/// `auto` keyword leave the count unset (`0`) — we can't derive a count from a
+/// width without the container width, so the block stays single-column.
+fn parse_columns_shorthand(v: &str) -> usize {
+    for tok in v.split_whitespace() {
+        // A bare unitless integer is the column-count; anything with a unit is
+        // the column-width (ignored), and `auto` carries no count.
+        if let Ok(n) = tok.parse::<usize>() {
+            return n;
+        }
+    }
+    0
 }
 
 /// Parse a `grid-column`/`grid-row` placement into a 1-based start line.
@@ -885,7 +909,21 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             style.gap_row = parse_len_px(v, style.font_size).unwrap_or(0.0);
         }
         "column-gap" | "grid-column-gap" => {
-            style.gap_col = parse_len_px(v, style.font_size).unwrap_or(0.0);
+            // `normal` (the initial value) keeps the default gutter (0 here);
+            // multi-column layout falls back to a 1em gutter when unset.
+            style.gap_col = if v == "normal" {
+                0.0
+            } else {
+                parse_len_px(v, style.font_size).unwrap_or(0.0)
+            };
+        }
+        "column-count" => {
+            // `column-count: <integer>`; `auto` (or a non-integer) ⇒ 0 (none).
+            style.column_count = v.parse::<usize>().unwrap_or(0);
+        }
+        "columns" => {
+            // `columns: <column-width> || <column-count>` — we model the count.
+            style.column_count = parse_columns_shorthand(v);
         }
         "grid-column" | "grid-column-start" => {
             style.grid_col_start = parse_grid_line(v);
@@ -1100,8 +1138,7 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             let i = border_side_index(prop);
             set_border_side(style, i, if vis { Some(w) } else { Some(0.0) }, c);
         }
-        "border-top-width" | "border-right-width" | "border-bottom-width"
-        | "border-left-width" => {
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             let i = border_side_index(prop);
             let w = parse_len_px(v, style.font_size).unwrap_or(0.0);
             set_border_side(style, i, Some(w), None);
@@ -1110,16 +1147,18 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             // `border-color` accepts 1–4 colours (TRBL like the box shorthands).
             apply_border_color_shorthand(style, v);
         }
-        "border-top-color" | "border-right-color" | "border-bottom-color"
-        | "border-left-color" => {
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
             if let Some(c) = parse_color(v) {
                 set_border_side(style, border_side_index(prop), None, Some(c));
             }
         }
         // `border-style` longhands carry no geometry in our model, but `none`/
         // `hidden` must suppress the rule even when a width is also declared.
-        "border-style" | "border-top-style" | "border-right-style"
-        | "border-bottom-style" | "border-left-style" => {
+        "border-style"
+        | "border-top-style"
+        | "border-right-style"
+        | "border-bottom-style"
+        | "border-left-style" => {
             if matches!(v, "none" | "hidden") {
                 match prop {
                     "border-style" => style.border_width = Edges::default(),
@@ -1144,7 +1183,10 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                     VShift::Baseline
                 }
                 _ => {
-                    if let Some(p) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f64>().ok()) {
+                    if let Some(p) = v
+                        .strip_suffix('%')
+                        .and_then(|n| n.trim().parse::<f64>().ok())
+                    {
                         VShift::Points(style.font_size * p / 100.0)
                     } else if let Some(pt) = parse_len_px(v, style.font_size) {
                         VShift::Points(pt)
@@ -1220,10 +1262,7 @@ fn set_border_side(style: &mut Style, i: usize, width: Option<f64>, color: Optio
 /// `border-color` shorthand: 1–4 colours applied TRBL (with the CSS
 /// shorthand fill rules), painting every per-side colour.
 fn apply_border_color_shorthand(style: &mut Style, v: &str) {
-    let cols: Vec<[f64; 3]> = v
-        .split_whitespace()
-        .filter_map(parse_color)
-        .collect();
+    let cols: Vec<[f64; 3]> = v.split_whitespace().filter_map(parse_color).collect();
     let edges = match cols.as_slice() {
         [a] => [*a, *a, *a, *a],
         [a, b] => [*a, *b, *a, *b],
@@ -1342,10 +1381,18 @@ fn parse_len_px(v: &str, em: f64) -> Option<f64> {
         return n.trim().parse::<f64>().ok().map(|p| p * em);
     }
     if let Some(n) = v.strip_suffix("vw") {
-        return n.trim().parse::<f64>().ok().map(|p| VIEWPORT_W_PT * p / 100.0);
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|p| VIEWPORT_W_PT * p / 100.0);
     }
     if let Some(n) = v.strip_suffix("vh") {
-        return n.trim().parse::<f64>().ok().map(|p| VIEWPORT_H_PT * p / 100.0);
+        return n
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|p| VIEWPORT_H_PT * p / 100.0);
     }
     if let Some(n) = v.strip_suffix('%') {
         // Percent of font size only makes sense for line-height/font-size here.
@@ -1581,6 +1628,32 @@ mod tests {
         // width then style:none → side suppressed (CSS: a none side has no rule).
         let s = inline_style("border-bottom-width:4pt;border-bottom-style:none");
         assert_eq!(s.border_width.bottom, 0.0);
+    }
+
+    #[test]
+    fn multi_column_properties_parse() {
+        // `column-count` sets the count; `column-gap` sets the gutter (reusing
+        // gap_col); `auto`/`normal` leave the defaults.
+        assert_eq!(inline_style("column-count:3").column_count, 3);
+        assert_eq!(inline_style("column-count:auto").column_count, 0);
+        let g = inline_style("column-count:2;column-gap:24pt");
+        assert_eq!(g.column_count, 2);
+        assert_eq!(g.gap_col, 24.0);
+        assert_eq!(inline_style("column-gap:normal").gap_col, 0.0);
+        // `columns` shorthand: the integer token is the count, a length is the
+        // (ignored) column-width, in either order.
+        assert_eq!(inline_style("columns:3").column_count, 3);
+        assert_eq!(inline_style("columns:200px 2").column_count, 2);
+        assert_eq!(inline_style("columns:2 200px").column_count, 2);
+        // A sole column-width (no count) leaves the block single-column.
+        assert_eq!(inline_style("columns:200px").column_count, 0);
+        assert_eq!(inline_style("columns:auto").column_count, 0);
+        // `column-count` is not inherited.
+        let parent = Style {
+            column_count: 3,
+            ..Style::default()
+        };
+        assert_eq!(inherit(&parent).column_count, 0, "column-count does not inherit");
     }
 
     #[test]
