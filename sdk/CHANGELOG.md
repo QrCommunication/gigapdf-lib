@@ -4,6 +4,21 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.62.0] - 2026-06-22
+
+### Added
+
+- **Markdown importer** — `mdToModel(md)` parses CommonMark-ish Markdown
+  (pure Rust, zero deps) into the unified editable model: ATX headings,
+  paragraphs, ordered/unordered nested lists, inline bold/italic/code/links with
+  backslash escapes, fenced code blocks, block quotes, thematic breaks, and GFM
+  pipe tables. ABI `gp_model_from_md`.
+- **CSV importer** — `csvToModel(csv)` parses RFC 4180 CSV (quoted fields with
+  embedded delimiters/newlines, `""` escape, CRLF/CR/LF, UTF-8 BOM strip,
+  delimiter auto-detection among `,` `;` tab `|`) into a single table block
+  (header row bold + shaded). ABI `gp_model_from_csv`. Returns `null` for empty
+  input.
+
 ## [0.61.0] - 2026-06-22
 
 ### Fixed
