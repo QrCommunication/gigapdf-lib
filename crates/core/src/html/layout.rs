@@ -9,8 +9,8 @@
 //! is sliced into pages with backgrounds/borders split across page bands.
 
 use super::css::{
-    Align, AlignItems, Clear, Display, FloatSide, Justify, Len, Position, Style, Stylesheet,
-    TrackSize, VAlign,
+    Align, AlignItems, Clear, Direction, Display, FloatSide, Justify, Len, Position, Style,
+    Stylesheet, TrackSize, VAlign,
 };
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
@@ -818,6 +818,7 @@ impl Flow<'_> {
             style.align,
             style.text_indent,
             &floats,
+            style.direction,
         )
     }
 
@@ -1015,7 +1016,7 @@ impl Flow<'_> {
         for n in nodes {
             self.collect_inline(n, style, ancestors, &mut items);
         }
-        self.flow_lines(&items, x, avail_w, y, style.align, style.text_indent)
+        self.flow_lines(&items, x, avail_w, y, style.align, style.text_indent, style.direction)
     }
 
     fn collect_inline(
@@ -1163,6 +1164,16 @@ impl Flow<'_> {
     /// `[line_x, line_x + line_avail)`, then advance `*y` by the line height.
     /// `space_w` is the inter-word space; `word_extra` is added at each space on
     /// top of it (used by `word-spacing`). `last` suppresses justification.
+    ///
+    /// `dir` is the inline base direction. With [`Direction::Ltr`] (the default,
+    /// and the only value reachable for any existing document) the original
+    /// left-to-right placement runs verbatim. With [`Direction::Rtl`] the same
+    /// words — still in logical order — are placed from the right edge leftward:
+    /// the first logical box sits flush right and each subsequent box advances to
+    /// its left. The glyphs inside a run keep the order the font produced (the PDF
+    /// text object draws them from the box's left corner), which is correct for a
+    /// purely-RTL run; mixed-direction reordering (the full bidi algorithm) is out
+    /// of scope.
     #[allow(clippy::too_many_arguments)]
     fn emit_line(
         &mut self,
@@ -1174,6 +1185,7 @@ impl Flow<'_> {
         line_avail: f64,
         align: Align,
         space_w: f64,
+        dir: Direction,
     ) {
         if line.is_empty() {
             *y += default_line_height(&Style::default());
@@ -1183,7 +1195,17 @@ impl Flow<'_> {
             .iter()
             .map(|w| w.style.font_size * w.style.line_height.max(1.0))
             .fold(0.0_f64, f64::max);
+        // Resolve direction-relative alignment (`start`/`end`) to a physical edge.
+        let align = align.resolve(dir);
         let extra = (line_avail - line_w).max(0.0);
+
+        if dir == Direction::Rtl {
+            self.emit_line_rtl(line, y, last, line_x, line_avail, align, space_w, extra);
+            *y += line_h;
+            return;
+        }
+
+        // ── LTR (default): unchanged left-to-right placement ──
         let (mut cx, gap_extra) = match align {
             Align::Left => (line_x, 0.0),
             Align::Right => (line_x + extra, 0.0),
@@ -1192,6 +1214,8 @@ impl Flow<'_> {
                 let gaps = line.iter().filter(|w| w.space_after).count().max(1);
                 (line_x, if last { 0.0 } else { extra / gaps as f64 })
             }
+            // `Start`/`End` are resolved above; nothing reaches here.
+            Align::Start | Align::End => (line_x, 0.0),
         };
         for w in line.iter() {
             match &w.media {
@@ -1248,8 +1272,103 @@ impl Flow<'_> {
         *y += line_h;
     }
 
+    /// Place one already-broken line right-to-left. Words stay in logical order;
+    /// `cx_right` tracks the right edge of the next box and walks leftward. Each
+    /// box is emitted at `cx_right - content_width` (its physical left corner),
+    /// then `cx_right` recedes by the box's advance (content + trailing space, plus
+    /// `word-spacing`/justification at a real inter-word space). The starting right
+    /// edge encodes the resolved alignment, mirroring the LTR `cx` computation.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_line_rtl(
+        &mut self,
+        line: &[&Word],
+        y: &f64,
+        last: bool,
+        line_x: f64,
+        line_avail: f64,
+        align: Align,
+        space_w: f64,
+        extra: f64,
+    ) {
+        let right = line_x + line_avail;
+        // The right edge of the line's content block. `Right` (the RTL default)
+        // hugs the trailing/right edge; `Left` pushes the block to the leading/left
+        // edge so its right side sits `extra` in from the right; `Center` splits.
+        // `Justify` keeps the block flush right and spreads the slack into gaps.
+        let (mut cx_right, gap_extra) = match align {
+            Align::Right | Align::Justify => (right, 0.0),
+            Align::Left => (right - extra, 0.0),
+            Align::Center => (right - extra / 2.0, 0.0),
+            Align::Start | Align::End => (right, 0.0),
+        };
+        let gap_extra = if matches!(align, Align::Justify) && !last {
+            let gaps = line.iter().filter(|w| w.space_after).count().max(1);
+            extra / gaps as f64
+        } else {
+            gap_extra
+        };
+        for w in line.iter() {
+            // The visible content width placed for this box (text run or media);
+            // the trailing inter-word space is advance-only, not drawn.
+            let content = match &w.media {
+                Some(m) => m.width(),
+                None => w.w,
+            };
+            let x = cx_right - content;
+            match &w.media {
+                Some(Media::Raster(iw, ih, src)) => {
+                    self.out.push(Abs {
+                        z: 1,
+                        zi: 0,
+                        frag: Fragment::Image {
+                            x,
+                            y: *y,
+                            w: *iw,
+                            h: *ih,
+                            src: src.clone(),
+                        },
+                    });
+                    cx_right = x - space_w;
+                }
+                Some(Media::Svg(iw, ih, image)) => {
+                    self.out.push(Abs {
+                        z: 1,
+                        zi: 0,
+                        frag: Fragment::Svg {
+                            x,
+                            y: *y,
+                            w: *iw,
+                            h: *ih,
+                            image: image.clone(),
+                        },
+                    });
+                    cx_right = x - space_w;
+                }
+                None => {
+                    self.out.push(Abs {
+                        z: 1,
+                        zi: 0,
+                        frag: Fragment::Text {
+                            x,
+                            y: *y + w.style.valign_shift,
+                            style: w.style.clone(),
+                            text: w.text.clone(),
+                        },
+                    });
+                    cx_right = x
+                        - if w.space_after {
+                            space_w + gap_extra + w.style.word_spacing
+                        } else {
+                            0.0
+                        };
+                }
+            }
+        }
+    }
+
     /// Break inline items into lines and emit positioned text/images.
     /// `indent` (`text-indent`) shifts and shortens the first line only.
+    #[allow(clippy::too_many_arguments)]
     fn flow_lines(
         &mut self,
         items: &[InlineItem],
@@ -1258,6 +1377,7 @@ impl Flow<'_> {
         mut y: f64,
         align: Align,
         indent: f64,
+        dir: Direction,
     ) -> f64 {
         let words = self.build_words(items);
         let mut line: Vec<&Word> = Vec::new();
@@ -1281,7 +1401,7 @@ impl Flow<'_> {
             let w = &words[i];
             if w.text == "\n" {
                 self.emit_line(
-                    &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+                    &line, line_w, &mut y, true, line_x, line_avail, align, space_w, dir,
                 );
                 line.clear();
                 line_w = 0.0;
@@ -1292,7 +1412,7 @@ impl Flow<'_> {
             let add = w.w + if line.is_empty() { 0.0 } else { space_w };
             if !line.is_empty() && line_w + add > line_avail {
                 self.emit_line(
-                    &line, line_w, &mut y, false, line_x, line_avail, align, space_w,
+                    &line, line_w, &mut y, false, line_x, line_avail, align, space_w, dir,
                 );
                 line.clear();
                 first_line = false;
@@ -1307,7 +1427,7 @@ impl Flow<'_> {
         }
         let (line_x, line_avail) = line_geom(first_line);
         self.emit_line(
-            &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+            &line, line_w, &mut y, true, line_x, line_avail, align, space_w, dir,
         );
         y
     }
@@ -1325,6 +1445,7 @@ impl Flow<'_> {
         align: Align,
         indent: f64,
         floats: &FloatCtx,
+        dir: Direction,
     ) -> f64 {
         let words = self.build_words(items);
         let space_w = self.m.width(" ", &Style::default());
@@ -1350,7 +1471,7 @@ impl Flow<'_> {
             let w = &words[i];
             if w.text == "\n" {
                 self.emit_line(
-                    &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+                    &line, line_w, &mut y, true, line_x, line_avail, align, space_w, dir,
                 );
                 line.clear();
                 line_w = 0.0;
@@ -1361,7 +1482,7 @@ impl Flow<'_> {
             let add = w.w + if line.is_empty() { 0.0 } else { space_w };
             if !line.is_empty() && line_w + add > line_avail {
                 self.emit_line(
-                    &line, line_w, &mut y, false, line_x, line_avail, align, space_w,
+                    &line, line_w, &mut y, false, line_x, line_avail, align, space_w, dir,
                 );
                 line.clear();
                 first_line = false;
@@ -1375,7 +1496,7 @@ impl Flow<'_> {
         }
         let (line_x, line_avail) = geom(self, y, first_line);
         self.emit_line(
-            &line, line_w, &mut y, true, line_x, line_avail, align, space_w,
+            &line, line_w, &mut y, true, line_x, line_avail, align, space_w, dir,
         );
         y
     }
@@ -4645,6 +4766,158 @@ mod tests {
         assert!(
             short.1 > t1.1 + 10.0,
             "align-items:center lowers the short item below the tall item's first line (t1={t1:?}, short={short:?})"
+        );
+    }
+
+    // ── RTL (right-to-left) ──────────────────────────────────────────────────
+    //
+    // Page 612pt, margins 36pt ⇒ content runs in [36, 576] (avail_w = 540).
+    // `AverageMeasure` gives 8pt per glyph at the default 16pt font, and a space
+    // is one glyph (8pt). So a 4-glyph word is 32pt wide.
+
+    // x of the (single) text fragment whose text equals `label`.
+    fn run_x(layout: &Layout, label: &str) -> f64 {
+        text_xy(layout)
+            .into_iter()
+            .find(|(_, _, s)| s == label)
+            .unwrap_or_else(|| panic!("no text fragment {label:?}"))
+            .0
+    }
+
+    #[test]
+    fn rtl_block_defaults_to_right_alignment() {
+        // The same word in an RTL block hugs the right edge; in an LTR block it
+        // starts at the left content edge (x = 36). Right edge = 576, word = 32pt,
+        // so the RTL run's left corner lands near 576 - 32 = 544.
+        let rtl = run_x(&run(r#"<p dir="rtl">word</p>"#), "word");
+        let ltr = run_x(&run(r#"<p>word</p>"#), "word");
+        assert!(
+            (ltr - 36.0).abs() < 0.01,
+            "LTR word starts at the left content edge (x={ltr})"
+        );
+        assert!(
+            rtl > ltr + 400.0,
+            "RTL word is right-aligned, far past the LTR position (rtl={rtl}, ltr={ltr})"
+        );
+        assert!(
+            (rtl - (576.0 - 32.0)).abs() < 1.0,
+            "RTL word's left corner sits one word-width in from the right edge (x={rtl})"
+        );
+    }
+
+    #[test]
+    fn rtl_inline_boxes_run_right_to_left() {
+        // Two adjacent inline spans in logical order AAA then BBB. In RTL the first
+        // logical box sits at the right, the next advances to its left, so
+        // x(AAA) > x(BBB). The LTR control keeps source order: x(AAA) < x(BBB).
+        let rtl = run(r#"<p dir="rtl"><span>AAA</span><span>BBB</span></p>"#);
+        let a = run_x(&rtl, "AAA");
+        let b = run_x(&rtl, "BBB");
+        assert!(
+            a > b,
+            "RTL lays the first logical box (AAA) to the right of the next (BBB) (a={a}, b={b})"
+        );
+
+        let ltr = run(r#"<p><span>AAA</span><span>BBB</span></p>"#);
+        let la = run_x(&ltr, "AAA");
+        let lb = run_x(&ltr, "BBB");
+        assert!(
+            la < lb,
+            "LTR keeps source order left-to-right (la={la}, lb={lb})"
+        );
+    }
+
+    #[test]
+    fn rtl_hebrew_run_placed_from_right_edge() {
+        // A Hebrew word (logical order preserved in the fragment text) is placed
+        // with its left corner one word-width in from the right edge. The glyphs
+        // themselves are whatever the font yields — we never reorder the string.
+        let layout = run(r#"<p dir="rtl">שלום</p>"#);
+        let (x, _, text) = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "שלום")
+            .expect("hebrew run present, text unchanged");
+        assert_eq!(text, "שלום", "the run's logical text is left intact");
+        // 4 Hebrew glyphs ⇒ 32pt wide ⇒ left corner ≈ 576 - 32 = 544.
+        assert!(
+            (x - (576.0 - 32.0)).abs() < 1.0,
+            "hebrew run starts from the right edge (x={x})"
+        );
+    }
+
+    #[test]
+    fn rtl_via_css_direction_property() {
+        // `direction: rtl` (the CSS property, not the `dir` attribute) also flips
+        // the block to right alignment.
+        let x = run_x(&run(r#"<p style="direction:rtl">word</p>"#), "word");
+        assert!(
+            x > 36.0 + 400.0,
+            "CSS direction:rtl right-aligns the run (x={x})"
+        );
+    }
+
+    #[test]
+    fn rtl_direction_inherits_to_children() {
+        // `dir` on an ancestor cascades: the inner <p> inherits rtl and right-aligns.
+        let x = run_x(&run(r#"<div dir="rtl"><p>child</p></div>"#), "child");
+        assert!(
+            x > 36.0 + 400.0,
+            "inner paragraph inherits rtl and right-aligns (x={x})"
+        );
+    }
+
+    #[test]
+    fn text_align_start_end_resolve_per_direction() {
+        // `start`/`end` are direction-relative. In LTR: start = left (36), end =
+        // right edge. In RTL: start = right edge, end = left (36).
+        let ltr_start = run_x(&run(r#"<p style="text-align:start">w</p>"#), "w");
+        let ltr_end = run_x(&run(r#"<p style="text-align:end">w</p>"#), "w");
+        assert!(
+            (ltr_start - 36.0).abs() < 0.01,
+            "LTR text-align:start = left edge (x={ltr_start})"
+        );
+        assert!(
+            ltr_end > 36.0 + 400.0,
+            "LTR text-align:end = right edge (x={ltr_end})"
+        );
+
+        let rtl_start = run_x(&run(r#"<p dir="rtl" style="text-align:start">w</p>"#), "w");
+        let rtl_end = run_x(&run(r#"<p dir="rtl" style="text-align:end">w</p>"#), "w");
+        assert!(
+            rtl_start > 36.0 + 400.0,
+            "RTL text-align:start = right edge (x={rtl_start})"
+        );
+        assert!(
+            (rtl_end - 36.0).abs() < 0.01,
+            "RTL text-align:end = left edge (x={rtl_end})"
+        );
+    }
+
+    #[test]
+    fn rtl_explicit_left_align_pushes_to_left_edge() {
+        // An explicit physical `text-align:left` inside an RTL block still lands
+        // the run's left corner at the left content edge (36) — the box block is
+        // pushed left, only the within-line box order is reversed.
+        let x = run_x(&run(r#"<p dir="rtl" style="text-align:left">word</p>"#), "word");
+        assert!(
+            (x - 36.0).abs() < 0.01,
+            "RTL + text-align:left puts the single run at the left edge (x={x})"
+        );
+    }
+
+    #[test]
+    fn ltr_default_layout_is_byte_identical() {
+        // Guard: a plain LTR paragraph keeps the exact pre-RTL geometry — left
+        // content edge, no direction machinery engaged.
+        let layout = run(r#"<p>hello world example</p>"#);
+        let first = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "hello")
+            .unwrap();
+        assert!(
+            (first.0 - 36.0).abs() < 0.01,
+            "LTR first run still starts at x=36 (got {})",
+            first.0
         );
     }
 }

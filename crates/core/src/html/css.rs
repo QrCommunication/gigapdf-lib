@@ -26,6 +26,13 @@ pub enum Display {
 }
 
 /// CSS `text-align`.
+///
+/// `Start`/`End` are *direction-relative*: they resolve to `Left`/`Right` (or the
+/// reverse) only at layout time, against the element's [`Direction`]. Keeping them
+/// as distinct variants — rather than collapsing them to `Left` at parse time —
+/// is what lets `text-align: start` follow `direction: rtl`. The default stays
+/// `Left` (not `Start`) so every existing LTR document lays out byte-identically:
+/// an absent `text-align` is `Left`, never the direction-relative path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Align {
     #[default]
@@ -33,6 +40,40 @@ pub enum Align {
     Center,
     Right,
     Justify,
+    /// `text-align: start` — the line's leading edge (left in LTR, right in RTL).
+    Start,
+    /// `text-align: end` — the line's trailing edge (right in LTR, left in RTL).
+    End,
+}
+
+/// CSS `direction` — the inline base direction of a box, set by the `direction`
+/// property or the `dir="ltr|rtl"` HTML attribute. Inherited. The default is
+/// [`Direction::Ltr`], so the whole RTL machinery is dormant for every existing
+/// document and the LTR layout paths are reached unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    /// `ltr` — left-to-right (the default).
+    #[default]
+    Ltr,
+    /// `rtl` — right-to-left (Hebrew, Arabic). Inline boxes flow from the right
+    /// edge leftward; the default text alignment becomes `right`.
+    Rtl,
+}
+
+impl Align {
+    /// Resolve a direction-relative alignment against `dir`. `Start`/`End` map to
+    /// the physical `Left`/`Right`; the physical and justify variants pass
+    /// through unchanged. This is the single point where direction influences the
+    /// horizontal placement of a line.
+    pub fn resolve(self, dir: Direction) -> Align {
+        match (self, dir) {
+            (Align::Start, Direction::Ltr) => Align::Left,
+            (Align::Start, Direction::Rtl) => Align::Right,
+            (Align::End, Direction::Ltr) => Align::Right,
+            (Align::End, Direction::Rtl) => Align::Left,
+            (other, _) => other,
+        }
+    }
 }
 
 /// CSS `vertical-align` for table cells — how the cell content box is placed
@@ -142,6 +183,11 @@ pub struct Style {
     pub italic: bool,
     pub underline: bool,
     pub align: Align,
+    /// `direction` (`ltr`/`rtl`) — the inline base direction, from the CSS
+    /// `direction` property or the `dir` HTML attribute. Inherited. Drives RTL
+    /// block alignment, inline box ordering, and run placement. Defaults to
+    /// `ltr`, keeping every existing layout unchanged.
+    pub direction: Direction,
     /// `text-transform` applied to rendered text (inherited).
     pub text_transform: TextTransform,
     pub margin: Edges,
@@ -398,7 +444,12 @@ impl Default for Style {
             font_weight: 400,
             italic: false,
             underline: false,
-            align: Align::Left,
+            // CSS initial value of `text-align` is `start` (direction-relative):
+            // `Start` resolves to `Left` in LTR — byte-identical to the old default
+            // for every existing document — and to `Right` in RTL, giving an RTL
+            // block its right alignment when no explicit `text-align` is set.
+            align: Align::Start,
+            direction: Direction::Ltr,
             text_transform: TextTransform::None,
             margin: Edges::default(),
             margin_left_auto: false,
@@ -1070,6 +1121,19 @@ impl Stylesheet {
     pub fn computed(&self, el: &Element, parent: &Style, ancestors: &[&Element]) -> Style {
         let mut style = inherit(parent);
 
+        // The `dir` HTML attribute is a presentational hint: apply it before the
+        // author stylesheet and inline `style` so an explicit `direction:` rule (or
+        // inline declaration) can still override it. `dir="auto"` would require the
+        // Unicode bidi algorithm to detect the base direction, which is out of
+        // scope, so it is ignored (the inherited direction stands).
+        if let Some(dir) = el.attr("dir") {
+            match dir.trim().to_ascii_lowercase().as_str() {
+                "rtl" => style.direction = Direction::Rtl,
+                "ltr" => style.direction = Direction::Ltr,
+                _ => {}
+            }
+        }
+
         // Gather matching declarations, ordered by (specificity, source order).
         let mut hits: Vec<(&Selector, &Rule)> = Vec::new();
         for rule in &self.rules {
@@ -1117,6 +1181,9 @@ fn inherit(parent: &Style) -> Style {
         italic: parent.italic,
         underline: parent.underline,
         align: parent.align,
+        // `direction` is inherited (CSS), and the `dir` attribute likewise cascades
+        // to descendants, so children start from the parent's base direction.
+        direction: parent.direction,
         text_transform: parent.text_transform,
         line_height: parent.line_height,
         pre: parent.pre,
@@ -1846,9 +1913,21 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 "center" => Align::Center,
                 "right" => Align::Right,
                 "justify" => Align::Justify,
+                // Direction-relative: kept as `Start`/`End` and resolved against
+                // `direction` at layout time (so `start` follows `rtl`).
+                "start" => Align::Start,
+                "end" => Align::End,
                 _ => Align::Left,
             }
         }
+        // `direction: ltr|rtl`. Unknown values leave the (inherited) direction
+        // untouched rather than forcing `ltr`, so a typo never silently flips a
+        // child back to LTR inside an RTL ancestor.
+        "direction" => match v {
+            "rtl" => style.direction = Direction::Rtl,
+            "ltr" => style.direction = Direction::Ltr,
+            _ => {}
+        },
         "text-decoration" | "text-decoration-line" => {
             style.underline = v.contains("underline");
             style.strike = v.contains("line-through");
