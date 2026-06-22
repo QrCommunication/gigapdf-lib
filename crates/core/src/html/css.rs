@@ -186,8 +186,28 @@ pub struct Style {
     pub justify: Justify,
     /// `flex` / `flex-grow` factor (a flex item's share of free space).
     pub flex_grow: f64,
-    /// `grid-template-columns` → number of columns (0 = not a grid).
+    /// `flex-shrink` factor (a flex item's share of overflow reduction). The CSS
+    /// initial value is `1`; the `flex`/`flex-grow` longhands leave it untouched
+    /// unless the `flex` shorthand provides a second number. Not inherited.
+    pub flex_shrink: f64,
+    /// `flex-basis` — a flex item's initial main-size before grow/shrink. `None`
+    /// means `auto` (fall back to `width`, then content). Not inherited.
+    pub flex_basis: Option<Len>,
+    /// `grid-template-columns` → number of columns (0 = not a grid). Kept as the
+    /// authoritative column COUNT; the detailed per-track sizings live in
+    /// `grid_template_columns` (which always has this many entries when non-empty).
     pub grid_columns: usize,
+    /// Resolved `grid-template-columns` track sizings (empty = none declared, so
+    /// the grid falls back to equal columns). Length equals `grid_columns`.
+    pub grid_template_columns: Vec<TrackSize>,
+    /// Resolved `grid-template-rows` track sizings (empty = auto rows sized to
+    /// content). Length equals `grid_rows` when non-empty.
+    pub grid_template_rows: Vec<TrackSize>,
+    /// `grid-column: span N` — the item spans `N` columns (1 = no span). Honoured
+    /// alongside an explicit/auto start. Not inherited.
+    pub grid_col_span: usize,
+    /// `grid-row: span N` — the item spans `N` rows (1 = no span). Not inherited.
+    pub grid_row_span: usize,
     // ── decorations / visibility (inherited) ──
     /// `text-decoration: line-through` — struck-through text.
     pub strike: bool,
@@ -398,7 +418,13 @@ impl Default for Style {
             flex_column: false,
             justify: Justify::Start,
             flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: None,
             grid_columns: 0,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_col_span: 1,
+            grid_row_span: 1,
             strike: false,
             overline: false,
             hidden: false,
@@ -438,6 +464,28 @@ impl Default for Style {
 pub enum Len {
     Pt(f64),
     Percent(f64),
+}
+
+/// A single `grid-template-columns` / `grid-template-rows` track sizing.
+///
+/// Models the track-list values documents actually use: a flexible `fr` share,
+/// a fixed length (points), a percentage of the container, intrinsic `auto`
+/// (sized to content), and `minmax(min, max)`. Anything unrecognised parses as
+/// `Auto`, so an unknown function never drops the track (the grid still lays out
+/// with the right column count).
+#[derive(Debug, Clone)]
+pub enum TrackSize {
+    /// `<number>fr` — a share of the leftover space after fixed/percent tracks.
+    Fr(f64),
+    /// A fixed length resolved to points (`px`/`pt`/`em`/…).
+    Pt(f64),
+    /// `<percentage>` of the grid's content width/height.
+    Percent(f64),
+    /// `auto` — sized to the column's max content (rows: tallest cell).
+    Auto,
+    /// `minmax(min, max)` — clamp the resolved size between two track sizings.
+    /// Boxed to keep the enum small (recursive variant).
+    MinMax(Box<TrackSize>, Box<TrackSize>),
 }
 
 // ─── selectors ──────────────────────────────────────────────────────────────
@@ -1096,7 +1144,13 @@ fn inherit(parent: &Style) -> Style {
         flex_column: false,
         justify: Justify::Start,
         flex_grow: 0.0,
+        flex_shrink: 1.0,
+        flex_basis: None,
         grid_columns: 0,
+        grid_template_columns: Vec::new(),
+        grid_template_rows: Vec::new(),
+        grid_col_span: 1,
+        grid_row_span: 1,
         // Inherited:
         strike: parent.strike,
         overline: parent.overline,
@@ -1141,25 +1195,131 @@ fn apply_decls(style: &mut Style, decls: &[(String, String)]) {
     }
 }
 
-/// Count the columns declared by `grid-template-columns`.
+/// Parse a `grid-template-columns` / `grid-template-rows` value into a list of
+/// per-track sizings.
 ///
-/// Supports the two common spellings: an explicit track list
-/// (`1fr 1fr 200px` → 3) and the `repeat(N, …)` shorthand (→ N). Any other
-/// value yields a single column so the grid still lays out as one stack.
-fn parse_grid_columns(v: &str) -> usize {
-    if let Some(rest) = v.strip_prefix("repeat(") {
-        if let Some(n) = rest
-            .split(',')
-            .next()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-        {
-            return n.max(1);
+/// Supports the forms documents use: an explicit track list
+/// (`1fr 1fr 200px auto`), `repeat(N, <track-list>)` (expanded inline, with N
+/// the count), `minmax(min, max)`, `fr`, fixed lengths, percentages and `auto`.
+/// `none`/empty yields an empty list (the grid then falls back to equal
+/// columns / content-sized rows). Unknown tokens parse as `auto`, never
+/// dropping the track, so the column *count* stays faithful.
+fn parse_track_list(v: &str, em: f64) -> Vec<TrackSize> {
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for tok in tokenize_track_list(v) {
+        if let Some(rest) = strip_func(&tok, "repeat") {
+            // `repeat(N, <track-list>)` — expand the inner list N times. A
+            // keyword count (`auto-fill`/`auto-fit`) can't be sized without the
+            // container, so treat it as a single repetition of the inner list.
+            if let Some((count_tok, list)) = rest.split_once(',') {
+                let inner = parse_track_list(list.trim(), em);
+                let n = count_tok.trim().parse::<usize>().unwrap_or(1).max(1);
+                for _ in 0..n {
+                    out.extend(inner.iter().cloned());
+                }
+                continue;
+            }
+        }
+        out.push(parse_track_size(&tok, em));
+    }
+    out
+}
+
+/// Parse one track sizing token (already isolated by `tokenize_track_list`).
+fn parse_track_size(tok: &str, em: f64) -> TrackSize {
+    let t = tok.trim();
+    if let Some(rest) = strip_func(t, "minmax") {
+        if let Some((a, b)) = split_top_level_comma(rest) {
+            return TrackSize::MinMax(
+                Box::new(parse_track_size(a.trim(), em)),
+                Box::new(parse_track_size(b.trim(), em)),
+            );
         }
     }
-    v.split_whitespace()
-        .filter(|t| !t.is_empty())
-        .count()
-        .max(1)
+    if t.eq_ignore_ascii_case("auto") || t.eq_ignore_ascii_case("min-content")
+        || t.eq_ignore_ascii_case("max-content")
+    {
+        return TrackSize::Auto;
+    }
+    if let Some(n) = t.strip_suffix("fr") {
+        if let Ok(f) = n.trim().parse::<f64>() {
+            return TrackSize::Fr(f.max(0.0));
+        }
+    }
+    if let Some(n) = t.strip_suffix('%') {
+        if let Ok(p) = n.trim().parse::<f64>() {
+            return TrackSize::Percent(p);
+        }
+    }
+    if let Some(px) = parse_len_px(t, em) {
+        return TrackSize::Pt(px);
+    }
+    // `fit-content(...)`, named-line `[…]` remnants, or anything unknown.
+    TrackSize::Auto
+}
+
+/// Split a track list into top-level tokens, keeping parenthesised functions
+/// (`repeat(...)`, `minmax(...)`) whole and dropping `[line-name]` blocks.
+fn tokenize_track_list(v: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_name = false; // inside a `[ … ]` line-name block
+    for ch in v.chars() {
+        match ch {
+            '[' if depth == 0 => in_name = true,
+            ']' if in_name => in_name = false,
+            _ if in_name => {}
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// If `t` is `name(<inner>)` (case-insensitive name), return `<inner>`.
+fn strip_func<'a>(t: &'a str, name: &str) -> Option<&'a str> {
+    let t = t.trim();
+    let open = t.find('(')?;
+    if t[..open].eq_ignore_ascii_case(name) {
+        t.strip_suffix(')').map(|s| &s[open + 1..])
+    } else {
+        None
+    }
+}
+
+/// Split `a, b` on the first top-level comma (ignoring commas inside nested
+/// parentheses, e.g. a nested `minmax(...)`).
+fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse the column count from a `columns` shorthand (`column-width ||
@@ -1179,15 +1339,129 @@ fn parse_columns_shorthand(v: &str) -> usize {
     0
 }
 
-/// Parse a `grid-column`/`grid-row` placement into a 1-based start line.
-/// Supports a bare line number and `<n> / <m>` (we keep the start) and the
-/// `span N` form (treated as auto: 0). `auto` / unknown ⇒ 0 (auto-flow).
-fn parse_grid_line(v: &str) -> usize {
-    let first = v.split('/').next().unwrap_or(v).trim();
-    if first.is_empty() || first == "auto" || first.starts_with("span") {
-        return 0;
+/// Parse a `grid-column`/`grid-row` placement into a 1-based `(start, span)`.
+///
+/// `start` is 0 for auto-flow, else the 1-based start line. `span` is the track
+/// count the item covers (≥ 1). Supported forms:
+/// - `2` → start 2, span 1
+/// - `1 / 3` → start 1, end line 3 ⇒ span 2
+/// - `span 2` → start 0 (auto), span 2
+/// - `2 / span 3` → start 2, span 3
+/// - `auto` / unknown ⇒ start 0, span 1.
+fn parse_grid_placement(v: &str) -> (usize, usize) {
+    let mut it = v.split('/');
+    let first = it.next().unwrap_or(v).trim();
+    let second = it.next().map(str::trim);
+
+    let parse_span = |s: &str| -> Option<usize> {
+        s.strip_prefix("span")
+            .map(str::trim)
+            .and_then(|n| n.parse::<usize>().ok())
+            .map(|n| n.max(1))
+    };
+
+    // Leading `span N` (no explicit start) → auto start, N-track span.
+    if let Some(span) = parse_span(first) {
+        return (0, span);
     }
-    first.parse::<usize>().unwrap_or(0)
+    let start = if first.is_empty() || first == "auto" {
+        0
+    } else {
+        first.parse::<usize>().unwrap_or(0)
+    };
+    // Second component: `span N`, or an end line (`/ <m>` ⇒ span = m − start).
+    let span = match second {
+        Some(s) => {
+            if let Some(span) = parse_span(s) {
+                span
+            } else if let Ok(end) = s.parse::<usize>() {
+                if start >= 1 && end > start {
+                    end - start
+                } else {
+                    1
+                }
+            } else {
+                1
+            }
+        }
+        None => 1,
+    };
+    (start, span)
+}
+
+/// Decompose the `flex` shorthand into `flex-grow`, `flex-shrink`, `flex-basis`.
+///
+/// CSS grammar: `none | [ <grow> <shrink>? || <basis> ]`. Per spec the shorthand
+/// resets all three components; the common forms are handled:
+/// - `flex: none` → `0 0 auto`
+/// - `flex: auto` → `1 1 auto`
+/// - `flex: initial` → `0 1 auto`
+/// - `flex: <number>` (e.g. `flex: 1`) → `<n> 1 0` (basis 0, the one-value rule)
+/// - `flex: <grow> <shrink>` → those two, basis `0`
+/// - `flex: <grow> <basis>` / `flex: <grow> <shrink> <basis>` — a token carrying
+///   a unit/`%`/`auto` is the basis; bare numbers are grow then shrink.
+fn apply_flex_shorthand(style: &mut Style, v: &str) {
+    let v = v.trim();
+    match v {
+        "none" => {
+            style.flex_grow = 0.0;
+            style.flex_shrink = 0.0;
+            style.flex_basis = None;
+            return;
+        }
+        "auto" => {
+            style.flex_grow = 1.0;
+            style.flex_shrink = 1.0;
+            style.flex_basis = None;
+            return;
+        }
+        "initial" => {
+            style.flex_grow = 0.0;
+            style.flex_shrink = 1.0;
+            style.flex_basis = None;
+            return;
+        }
+        _ => {}
+    }
+
+    // Reset to the shorthand's defaults, then apply the provided components.
+    let mut grow = 0.0;
+    let mut shrink = 1.0;
+    let mut basis: Option<Len> = None;
+    let mut numbers_seen = 0; // bare numbers map to grow (0th) then shrink (1st)
+    let mut basis_seen = false;
+    let mut saw_any_number = false;
+
+    for tok in v.split_whitespace() {
+        if tok == "auto" || tok == "content" {
+            basis = None;
+            basis_seen = true;
+        } else if tok.ends_with('%')
+            || ["px", "pt", "rem", "em", "vw", "vh"]
+                .iter()
+                .any(|u| tok.len() > u.len() && tok.ends_with(u))
+        {
+            basis = parse_len(tok, style.font_size);
+            basis_seen = true;
+        } else if let Ok(n) = tok.parse::<f64>() {
+            match numbers_seen {
+                0 => grow = n.max(0.0),
+                1 => shrink = n.max(0.0),
+                _ => {}
+            }
+            numbers_seen += 1;
+            saw_any_number = true;
+        }
+    }
+
+    // One-value numeric form (`flex: 1`): grow = n, shrink = 1, basis = 0.
+    if saw_any_number && numbers_seen == 1 && !basis_seen {
+        basis = Some(Len::Pt(0.0));
+    }
+
+    style.flex_grow = grow;
+    style.flex_shrink = shrink;
+    style.flex_basis = basis;
 }
 
 /// Apply `font-family` (a comma-separated stack): adopt the first family name
@@ -1361,24 +1635,29 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         "flex-grow" => {
             style.flex_grow = v.parse().unwrap_or(0.0);
         }
-        "flex" => {
-            // `flex: <grow> [shrink] [basis]` — the first number is the grow
-            // factor. The `none`/`auto`/`initial` keywords map to sane grows.
-            style.flex_grow = match v {
-                "none" | "initial" | "0" => 0.0,
-                "auto" => 1.0,
-                _ => v
-                    .split_whitespace()
-                    .next()
-                    .and_then(|t| t.parse().ok())
-                    .unwrap_or(1.0),
+        "flex-shrink" => {
+            style.flex_shrink = v.parse::<f64>().unwrap_or(1.0).max(0.0);
+        }
+        "flex-basis" => {
+            style.flex_basis = if v == "auto" || v == "content" {
+                None
+            } else {
+                parse_len(v, style.font_size)
             };
         }
+        "flex" => apply_flex_shorthand(style, v),
         "grid-template-columns" => {
-            style.grid_columns = parse_grid_columns(v);
+            let tracks = parse_track_list(v, style.font_size);
+            // Keep the column COUNT as the authoritative value (≥ 1 when a track
+            // list is present) so existing equal-column behaviour is preserved
+            // when no detailed sizing applies.
+            style.grid_columns = tracks.len().max(1);
+            style.grid_template_columns = tracks;
         }
         "grid-template-rows" => {
-            style.grid_rows = parse_grid_columns(v);
+            let tracks = parse_track_list(v, style.font_size);
+            style.grid_rows = tracks.len();
+            style.grid_template_rows = tracks;
         }
         "gap" | "grid-gap" => {
             // `gap: <row> [col]` — one value sets both, two split row/col.
@@ -1419,16 +1698,48 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             style.column_count = parse_columns_shorthand(v);
         }
         "grid-column" | "grid-column-start" => {
-            style.grid_col_start = parse_grid_line(v);
+            let (start, span) = parse_grid_placement(v);
+            style.grid_col_start = start;
+            style.grid_col_span = span;
         }
         "grid-row" | "grid-row-start" => {
-            style.grid_row_start = parse_grid_line(v);
+            let (start, span) = parse_grid_placement(v);
+            style.grid_row_start = start;
+            style.grid_row_span = span;
+        }
+        "grid-column-end" => {
+            // `grid-column-end: span N` widens an item placed by its start; a bare
+            // end line is honoured only when a start is already known.
+            let (_, span) = parse_grid_placement(&format!("{} / {v}", style.grid_col_start));
+            style.grid_col_span = span;
+        }
+        "grid-row-end" => {
+            let (_, span) = parse_grid_placement(&format!("{} / {v}", style.grid_row_start));
+            style.grid_row_span = span;
         }
         "grid-area" => {
-            // `grid-area: <row> / <col> [/ …]` — take the first two lines.
-            let mut it = v.split('/');
-            style.grid_row_start = it.next().map(parse_grid_line).unwrap_or(0);
-            style.grid_col_start = it.next().map(parse_grid_line).unwrap_or(0);
+            // `grid-area: <row-start> / <col-start> [/ <row-end> / <col-end>]`.
+            // Resolve start lines from the first two components, and a span from
+            // an end component when it is a `span N` or a numeric end line.
+            let parts: Vec<&str> = v.split('/').map(str::trim).collect();
+            if let Some(rs) = parts.first() {
+                let (s, sp) = parse_grid_placement(rs);
+                style.grid_row_start = s;
+                style.grid_row_span = sp;
+            }
+            if let Some(cs) = parts.get(1) {
+                let (s, sp) = parse_grid_placement(cs);
+                style.grid_col_start = s;
+                style.grid_col_span = sp;
+            }
+            if let Some(re) = parts.get(2) {
+                let (_, sp) = parse_grid_placement(&format!("{} / {re}", style.grid_row_start));
+                style.grid_row_span = sp;
+            }
+            if let Some(ce) = parts.get(3) {
+                let (_, sp) = parse_grid_placement(&format!("{} / {ce}", style.grid_col_start));
+                style.grid_col_span = sp;
+            }
         }
         "flex-wrap" => {
             style.flex_wrap = v == "wrap" || v == "wrap-reverse";
@@ -2890,5 +3201,159 @@ mod tests {
         let child = inherit(&parent);
         assert_eq!(child.grid_col_start, 0, "grid-column-start does not inherit");
         assert_eq!(child.grid_row_start, 0, "grid-row-start does not inherit");
+    }
+
+    // ── grid-template track lists ──────────────────────────────────────────
+
+    #[test]
+    fn grid_template_columns_fr_tracks_parse() {
+        let s = inline_style("display: grid; grid-template-columns: 1fr 2fr 1fr");
+        assert_eq!(s.grid_columns, 3, "three fr tracks ⇒ 3 columns");
+        assert_eq!(s.grid_template_columns.len(), 3);
+        assert!(
+            matches!(s.grid_template_columns[1], TrackSize::Fr(f) if (f - 2.0).abs() < 1e-9),
+            "middle track is 2fr ({:?})",
+            s.grid_template_columns[1]
+        );
+    }
+
+    #[test]
+    fn grid_template_columns_mixed_units_parse() {
+        let s = inline_style("display: grid; grid-template-columns: 200px 1fr 25%");
+        assert_eq!(s.grid_columns, 3);
+        // 200px → 150pt (×0.75).
+        assert!(
+            matches!(s.grid_template_columns[0], TrackSize::Pt(p) if (p - 150.0).abs() < 0.5),
+            "200px ⇒ 150pt ({:?})",
+            s.grid_template_columns[0]
+        );
+        assert!(matches!(s.grid_template_columns[1], TrackSize::Fr(_)));
+        assert!(
+            matches!(s.grid_template_columns[2], TrackSize::Percent(p) if (p - 25.0).abs() < 1e-9),
+            "third track is 25% ({:?})",
+            s.grid_template_columns[2]
+        );
+    }
+
+    #[test]
+    fn grid_template_columns_repeat_expands() {
+        let s = inline_style("display: grid; grid-template-columns: repeat(3, 1fr)");
+        assert_eq!(s.grid_columns, 3, "repeat(3, 1fr) ⇒ 3 columns");
+        assert!(s
+            .grid_template_columns
+            .iter()
+            .all(|t| matches!(t, TrackSize::Fr(_))));
+
+        // Nested repeat with a 2-track inner list expands to 4 tracks.
+        let s2 = inline_style("display: grid; grid-template-columns: repeat(2, 100px 1fr)");
+        assert_eq!(s2.grid_columns, 4, "repeat(2, 100px 1fr) ⇒ 4 columns");
+    }
+
+    #[test]
+    fn grid_template_columns_minmax_parses() {
+        let s = inline_style("display: grid; grid-template-columns: minmax(100px, 1fr) auto");
+        assert_eq!(s.grid_columns, 2);
+        match &s.grid_template_columns[0] {
+            TrackSize::MinMax(min, max) => {
+                assert!(matches!(**min, TrackSize::Pt(p) if (p - 75.0).abs() < 0.5));
+                assert!(matches!(**max, TrackSize::Fr(_)));
+            }
+            other => panic!("expected minmax, got {other:?}"),
+        }
+        assert!(matches!(s.grid_template_columns[1], TrackSize::Auto));
+    }
+
+    #[test]
+    fn grid_template_rows_store_explicit_heights() {
+        let s = inline_style("display: grid; grid-template-rows: 40pt auto 60pt");
+        assert_eq!(s.grid_rows, 3);
+        assert!(matches!(s.grid_template_rows[0], TrackSize::Pt(p) if (p - 40.0).abs() < 1e-9));
+        assert!(matches!(s.grid_template_rows[1], TrackSize::Auto));
+        assert!(matches!(s.grid_template_rows[2], TrackSize::Pt(p) if (p - 60.0).abs() < 1e-9));
+    }
+
+    // ── grid-column / grid-row span ────────────────────────────────────────
+
+    #[test]
+    fn grid_column_span_parses() {
+        assert_eq!(inline_style("grid-column: span 2").grid_col_span, 2);
+        assert_eq!(inline_style("grid-column: span 3").grid_col_start, 0, "span only ⇒ auto start");
+        // `start / end` line form ⇒ span = end − start.
+        let s = inline_style("grid-column: 1 / 3");
+        assert_eq!(s.grid_col_start, 1);
+        assert_eq!(s.grid_col_span, 2, "lines 1..3 span 2 columns");
+        // `start / span N`.
+        let s2 = inline_style("grid-row: 2 / span 3");
+        assert_eq!(s2.grid_row_start, 2);
+        assert_eq!(s2.grid_row_span, 3);
+        // Default span is 1.
+        assert_eq!(inline_style("grid-column: 2").grid_col_span, 1);
+    }
+
+    #[test]
+    fn grid_area_resolves_start_and_span() {
+        let s = inline_style("grid-area: 1 / 1 / 3 / span 2");
+        assert_eq!(s.grid_row_start, 1);
+        assert_eq!(s.grid_col_start, 1);
+        assert_eq!(s.grid_row_span, 2, "rows 1..3 ⇒ span 2");
+        assert_eq!(s.grid_col_span, 2, "col span 2");
+    }
+
+    // ── flex shorthand: grow / shrink / basis ──────────────────────────────
+
+    #[test]
+    fn flex_shorthand_one_value_sets_grow_and_zero_basis() {
+        // `flex: 1` ⇒ grow 1, shrink 1, basis 0.
+        let s = inline_style("flex: 1");
+        assert!((s.flex_grow - 1.0).abs() < 1e-9);
+        assert!((s.flex_shrink - 1.0).abs() < 1e-9);
+        assert!(matches!(s.flex_basis, Some(Len::Pt(b)) if b.abs() < 1e-9), "basis 0");
+    }
+
+    #[test]
+    fn flex_shorthand_three_values_split_correctly() {
+        // `flex: 2 0 120pt` ⇒ grow 2, shrink 0, basis 120pt.
+        let s = inline_style("flex: 2 0 120pt");
+        assert!((s.flex_grow - 2.0).abs() < 1e-9);
+        assert!((s.flex_shrink - 0.0).abs() < 1e-9);
+        assert!(matches!(s.flex_basis, Some(Len::Pt(b)) if (b - 120.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn flex_shorthand_keywords() {
+        let none = inline_style("flex: none");
+        assert!((none.flex_grow).abs() < 1e-9 && (none.flex_shrink).abs() < 1e-9);
+        assert!(none.flex_basis.is_none(), "none ⇒ basis auto");
+        let auto = inline_style("flex: auto");
+        assert!((auto.flex_grow - 1.0).abs() < 1e-9 && (auto.flex_shrink - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn flex_basis_and_shrink_longhands() {
+        assert!(matches!(
+            inline_style("flex-basis: 200px").flex_basis,
+            Some(Len::Pt(p)) if (p - 150.0).abs() < 0.5
+        ));
+        assert!(inline_style("flex-basis: auto").flex_basis.is_none());
+        assert!((inline_style("flex-shrink: 0").flex_shrink).abs() < 1e-9);
+        assert!((inline_style("flex-shrink: 3").flex_shrink - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn flex_fields_do_not_inherit() {
+        let parent = Style {
+            flex_grow: 3.0,
+            flex_shrink: 0.0,
+            flex_basis: Some(Len::Pt(50.0)),
+            grid_col_span: 4,
+            grid_template_columns: vec![TrackSize::Fr(1.0)],
+            ..Style::default()
+        };
+        let child = inherit(&parent);
+        assert!((child.flex_grow).abs() < 1e-9, "flex-grow resets");
+        assert!((child.flex_shrink - 1.0).abs() < 1e-9, "flex-shrink resets to 1");
+        assert!(child.flex_basis.is_none(), "flex-basis resets to auto");
+        assert_eq!(child.grid_col_span, 1, "grid span resets to 1");
+        assert!(child.grid_template_columns.is_empty(), "track list resets");
     }
 }

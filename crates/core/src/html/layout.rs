@@ -9,7 +9,8 @@
 //! is sliced into pages with backgrounds/borders split across page bands.
 
 use super::css::{
-    Align, AlignItems, Clear, Display, FloatSide, Justify, Len, Position, Style, Stylesheet, VAlign,
+    Align, AlignItems, Clear, Display, FloatSide, Justify, Len, Position, Style, Stylesheet,
+    TrackSize, VAlign,
 };
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
@@ -207,13 +208,16 @@ struct FloatCtx {
 }
 
 /// A CSS-grid item's resolved cell: which item (index into the item list) sits
-/// at which 0-based `(row, col)` of a fixed-column `display: grid`. (Distinct
-/// from the `<table>` `GridCell`, which models colspan/rowspan cells.)
+/// at which 0-based `(row, col)` of a fixed-column `display: grid`, and how many
+/// columns/rows it spans (`col_span`/`row_span` ≥ 1). (Distinct from the
+/// `<table>` `GridCell`, which models colspan/rowspan cells.)
 #[derive(Debug, Clone, Copy)]
 struct GridPlace {
     item: usize,
     row: usize,
     col: usize,
+    col_span: usize,
+    row_span: usize,
 }
 
 impl FloatCtx {
@@ -1830,9 +1834,10 @@ impl Flow<'_> {
         content_w: f64,
         na: &[&Element],
     ) -> Vec<Vec<&'b Element>> {
-        let any_explicit = items
-            .iter()
-            .any(|it| self.style_of(it, style, na).width.is_some());
+        let any_explicit = items.iter().any(|it| {
+            let st = self.style_of(it, style, na);
+            st.flex_basis.is_some() || st.width.is_some()
+        });
         if !style.flex_wrap || !any_explicit {
             return vec![items.to_vec()];
         }
@@ -1842,7 +1847,8 @@ impl Flow<'_> {
         let mut used = 0.0;
         for it in items {
             let st = self.style_of(it, style, na);
-            let w = match st.width {
+            // Wrap decision uses the flex base size (basis, else width).
+            let w = match st.flex_basis.or(st.width) {
                 Some(Len::Pt(w)) => w.max(0.0),
                 Some(Len::Percent(pc)) => content_w * pc / 100.0,
                 None => 0.0,
@@ -1882,20 +1888,35 @@ impl Flow<'_> {
         let gaps_w = gap * (n.saturating_sub(1)) as f64;
         let avail = (content_w - gaps_w).max(0.0);
 
+        // Each item's resolved main-axis basis. The basis is `flex-basis` when
+        // set, else `width` (both resolve % against `avail`); `NaN` marks an
+        // `auto`/`content` basis to be filled from the leftover. `flex-grow` and
+        // `flex-shrink` factors are collected alongside for free-space handling.
         let mut ws: Vec<f64> = Vec::with_capacity(n);
         let mut grows: Vec<f64> = Vec::with_capacity(n);
+        let mut shrinks: Vec<f64> = Vec::with_capacity(n);
         let mut any_explicit = false;
+        let resolve_len = |len: Len| match len {
+            Len::Pt(w) => w.max(0.0),
+            Len::Percent(pc) => avail * pc / 100.0,
+        };
         for it in items {
             let st = self.style_of(it, style, na);
             grows.push(st.flex_grow.max(0.0));
-            match st.width {
-                Some(Len::Pt(w)) => {
-                    ws.push(w.max(0.0));
-                    any_explicit = true;
-                }
-                Some(Len::Percent(pc)) => {
-                    ws.push(avail * pc / 100.0);
-                    any_explicit = true;
+            shrinks.push(st.flex_shrink.max(0.0));
+            // `flex-basis` takes precedence over `width` for the main size.
+            match st.flex_basis.or(st.width) {
+                Some(len) => {
+                    let base = resolve_len(len);
+                    ws.push(base);
+                    // A `flex-basis: 0` (e.g. from `flex: 3`) is NOT a fixed
+                    // width: it means "start at 0, then grow". Treating it as
+                    // explicit would let auto-basis siblings eat the leftover
+                    // before grow runs. Only a genuinely sized basis (or width)
+                    // makes the line use the explicit-width model.
+                    if base > 0.01 {
+                        any_explicit = true;
+                    }
                 }
                 None => ws.push(f64::NAN), // resolved below
             }
@@ -1903,7 +1924,7 @@ impl Flow<'_> {
         let total_grow: f64 = grows.iter().sum();
 
         let (offset, extra_gap) = if any_explicit {
-            // Items with no explicit width share the leftover equally as basis.
+            // Items with an `auto` basis share the leftover equally as their base.
             let known: f64 = ws.iter().filter(|w| !w.is_nan()).sum();
             let unknown = ws.iter().filter(|w| w.is_nan()).count();
             let fill = if unknown > 0 {
@@ -1916,14 +1937,21 @@ impl Flow<'_> {
                     *w = fill;
                 }
             }
-            let mut free = (avail - ws.iter().sum::<f64>()).max(0.0);
-            if total_grow > 0.0 {
+            let mut free = avail - ws.iter().sum::<f64>();
+            if free > 0.0 && total_grow > 0.0 {
+                // Positive free space: grow flexible items by their grow factor.
                 for (w, g) in ws.iter_mut().zip(&grows) {
                     *w += free * g / total_grow;
                 }
                 free = 0.0;
+            } else if free < 0.0 {
+                // Overflow: shrink items weighted by `flex-shrink × basis` (the
+                // CSS scaled-shrink factor), so wider/more-shrinkable items give
+                // up proportionally more. Items reaching 0 stop contributing.
+                shrink_to_fit(&mut ws, &shrinks, -free);
+                free = (avail - ws.iter().sum::<f64>()).max(0.0);
             }
-            justify_offsets(style.justify, free, n)
+            justify_offsets(style.justify, free.max(0.0), n)
         } else {
             // Fill model: weight = 1 + grow, sums to `avail` exactly.
             let total_w: f64 = grows.iter().map(|g| 1.0 + g).sum();
@@ -2084,9 +2112,12 @@ impl Flow<'_> {
         y
     }
 
-    /// A grid with a fixed column count (`grid-template-columns`). Children fill
-    /// equal-width cells left-to-right, wrapping every `cols` items; each row's
-    /// height is its tallest cell. No spanning or named lines.
+    /// A CSS grid (`grid-template-columns`/`-rows`). Column widths come from the
+    /// track list (`fr`, `minmax`, fixed px/pt, `%`, `auto`, `repeat`), separated
+    /// by `column-gap`; rows are sized to their tallest cell unless a row track
+    /// gives an explicit height, separated by `row-gap`. Items honour
+    /// `grid-column`/`grid-row` start lines and `span N`. With no track list the
+    /// grid falls back to equal columns (the legacy behaviour).
     fn grid(
         &mut self,
         el: &Element,
@@ -2118,58 +2149,120 @@ impl Flow<'_> {
         let cols = style.grid_columns.max(1);
         let content_x = x + m.left + b.left + p.left;
         let content_w = (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
-        let col_w = content_w / cols as f64;
         let y_cursor = y + b.top + p.top;
+        let gap_col = style.gap_col.max(0.0);
+        let gap_row = style.gap_row.max(0.0);
 
-        // Assign each item a (row, col) cell. Items with an explicit
+        // Resolve per-column widths from the track list (or equal columns when no
+        // track list is present), then the cumulative x of each column's left
+        // edge (including the column gaps that precede it).
+        let col_widths = resolve_track_sizes(&style.grid_template_columns, cols, content_w, gap_col);
+        let col_x: Vec<f64> = cumulative_offsets(content_x, &col_widths, gap_col);
+
+        // Assign each item a (row, col) cell + span. Items with an explicit
         // `grid-column`/`grid-row` start line land on that line; the rest
         // auto-flow into the next free cell (left-to-right, top-to-bottom).
-        // With no explicit placement this reproduces the row-by-row `chunks(cols)`
-        // layout exactly (cursor advances column then row).
         let placement = self.place_grid_items(&items, style, &na, cols);
         let row_count = placement
             .iter()
-            .map(|p| p.row + 1)
+            .map(|p| p.row + p.row_span)
             .max()
             .unwrap_or(0);
 
+        // The x span (left edge → right edge) of a cell covering
+        // `[col, col+span)`: from `col_x[col]` to the right edge of the last
+        // spanned column, so the interior column gaps are absorbed into the cell.
+        let span_x = |col: usize, span: usize| -> (f64, f64) {
+            let start = col_x[col.min(cols - 1)];
+            let last = (col + span).min(cols).saturating_sub(1);
+            let end = col_x[last] + col_widths[last];
+            (start, (end - start).max(1.0))
+        };
+
+        // Explicit row-track heights (if any), indexed by row; `None` = auto
+        // (sized to the tallest cell). `auto`/`fr` rows resolve to auto here
+        // (no fixed height), matching the content-sized default.
+        let row_track_h = |r: usize| -> Option<f64> {
+            style
+                .grid_template_rows
+                .get(r)
+                .and_then(track_fixed_height)
+        };
+
         // Lay each row's cells out, tracking the tallest cell so the whole row
-        // shares one height (matching the previous behaviour).
+        // shares one height. A row-spanning cell only contributes its height to
+        // its LAST row (so earlier rows aren't inflated by it); single-row cells
+        // size their row directly.
         let mut row_tops = vec![y_cursor; row_count];
         let mut row_bottoms = vec![y_cursor; row_count];
+        // First pass: place content for single-row cells, sizing each row.
         for r in 0..row_count {
-            let row_top = if r == 0 { y_cursor } else { row_bottoms[r - 1] };
+            let row_top = if r == 0 {
+                y_cursor
+            } else {
+                row_bottoms[r - 1] + gap_row
+            };
             row_tops[r] = row_top;
-            let mut row_bottom = row_top;
-            for cell in placement.iter().filter(|p| p.row == r) {
+            let mut row_bottom = row_top + row_track_h(r).unwrap_or(0.0);
+            for cell in placement.iter().filter(|p| p.row == r && p.row_span == 1) {
                 let it = items[cell.item];
                 let istyle = self.style_of(it, style, &na);
                 let nca = push_ancestor(&na, it);
                 let ip = &istyle.padding;
                 let ib = &istyle.border_width;
-                let cx = content_x + cell.col as f64 * col_w;
+                let (cx, cw) = span_x(cell.col, cell.col_span);
                 let cy = self.block_children(
                     &it.children,
                     &istyle,
                     cx + ip.left + ib.left,
-                    (col_w - ip.left - ip.right - ib.left - ib.right).max(1.0),
+                    (cw - ip.left - ip.right - ib.left - ib.right).max(1.0),
                     row_top + ip.top + ib.top,
                     &nca,
                 );
                 row_bottom = row_bottom.max(cy + ip.bottom + ib.bottom);
             }
-            row_bottoms[r] = row_bottom;
+            row_bottoms[r] = row_bottom.max(row_top);
         }
+        // Second pass: row-spanning cells. Lay them out within their first row's
+        // top; if their content overflows the spanned rows, grow the last row so
+        // the grid still contains them (and shift later rows down).
+        for cell in placement.iter().filter(|p| p.row_span > 1) {
+            let it = items[cell.item];
+            let istyle = self.style_of(it, style, &na);
+            let nca = push_ancestor(&na, it);
+            let ip = &istyle.padding;
+            let ib = &istyle.border_width;
+            let (cx, cw) = span_x(cell.col, cell.col_span);
+            let top = row_tops[cell.row];
+            let cy = self.block_children(
+                &it.children,
+                &istyle,
+                cx + ip.left + ib.left,
+                (cw - ip.left - ip.right - ib.left - ib.right).max(1.0),
+                top + ip.top + ib.top,
+                &nca,
+            );
+            let needed = cy + ip.bottom + ib.bottom;
+            let last_row = (cell.row + cell.row_span - 1).min(row_count - 1);
+            if needed > row_bottoms[last_row] {
+                let grow = needed - row_bottoms[last_row];
+                // Push the last spanned row's bottom and all subsequent rows down.
+                for r in last_row..row_count {
+                    row_tops[r] += if r == last_row { 0.0 } else { grow };
+                    row_bottoms[r] += grow;
+                }
+            }
+        }
+
+        // Paint each cell's box spanning its full (row × column) area.
         for cell in &placement {
             let it = items[cell.item];
             let istyle = self.style_of(it, style, &na);
-            self.paint_item_box(
-                &istyle,
-                content_x + cell.col as f64 * col_w,
-                row_tops[cell.row],
-                col_w,
-                row_bottoms[cell.row] - row_tops[cell.row],
-            );
+            let (cx, cw) = span_x(cell.col, cell.col_span);
+            let last_row = (cell.row + cell.row_span - 1).min(row_count - 1);
+            let top = row_tops[cell.row];
+            let bottom = row_bottoms[last_row];
+            self.paint_item_box(&istyle, cx, top, cw, (bottom - top).max(0.0));
         }
         let grid_bottom = row_bottoms.last().copied().unwrap_or(y_cursor);
         grid_bottom + p.bottom + b.bottom + style.margin.bottom
@@ -2198,14 +2291,29 @@ impl Flow<'_> {
                 occ.resize(rows * cols, false);
             }
         };
+        // Is the `[col, col+span) × [row, row+row_span)` block entirely free?
+        let block_free = |occ: &mut Vec<bool>, row: usize, col: usize, cs: usize, rs: usize| {
+            ensure_rows(occ, row + rs);
+            for r in row..row + rs {
+                for c in col..col + cs {
+                    if occ[idx(r, c)] {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
         let mut cursor = 0usize; // auto-flow scan position (row-major).
         let mut out = Vec::with_capacity(items.len());
 
         for (i, it) in items.iter().enumerate() {
             let istyle = self.style_of(it, style, na);
-            // Explicit column (1-based) clamped into range; 0 = auto.
+            // Column span clamped so the cell never runs past the last column.
+            let col_span = istyle.grid_col_span.max(1).min(cols);
+            let row_span = istyle.grid_row_span.max(1);
+            // Explicit column (1-based) clamped so the spanned cell fits; 0 = auto.
             let col_hint = if istyle.grid_col_start >= 1 && istyle.grid_col_start <= cols {
-                Some(istyle.grid_col_start - 1)
+                Some((istyle.grid_col_start - 1).min(cols - col_span))
             } else {
                 None
             };
@@ -2214,47 +2322,55 @@ impl Flow<'_> {
             let (row, col) = match (row_hint, col_hint) {
                 // Both explicit: place exactly there (growing the grid as needed).
                 (Some(r), Some(c)) => (r, c),
-                // Column only: next free row in that column.
+                // Column only: next free row range in that column.
                 (None, Some(c)) => {
                     let mut r = 0;
-                    loop {
-                        ensure_rows(&mut occupied, r + 1);
-                        if !occupied[idx(r, c)] {
-                            break (r, c);
-                        }
+                    while !block_free(&mut occupied, r, c, col_span, row_span) {
                         r += 1;
                     }
+                    (r, c)
                 }
-                // Row only: next free column in that row (then overflow downward).
+                // Row only: next free column run in that row (then overflow down).
                 (Some(r), None) => {
                     let mut rr = r;
                     let mut cc = 0;
                     loop {
-                        ensure_rows(&mut occupied, rr + 1);
-                        if !occupied[idx(rr, cc)] {
+                        if cc + col_span <= cols
+                            && block_free(&mut occupied, rr, cc, col_span, row_span)
+                        {
                             break (rr, cc);
                         }
                         cc += 1;
-                        if cc == cols {
+                        if cc + col_span > cols {
                             cc = 0;
                             rr += 1;
                         }
                     }
                 }
-                // Fully auto: advance the row-major cursor to the next free cell.
+                // Fully auto: advance the row-major cursor to the next free run
+                // that fits the column span.
                 (None, None) => loop {
                     let r = cursor / cols;
                     let c = cursor % cols;
-                    ensure_rows(&mut occupied, r + 1);
                     cursor += 1;
-                    if !occupied[idx(r, c)] {
+                    if c + col_span <= cols && block_free(&mut occupied, r, c, col_span, row_span) {
                         break (r, c);
                     }
                 },
             };
-            ensure_rows(&mut occupied, row + 1);
-            occupied[idx(row, col)] = true;
-            out.push(GridPlace { item: i, row, col });
+            ensure_rows(&mut occupied, row + row_span);
+            for r in row..row + row_span {
+                for c in col..(col + col_span).min(cols) {
+                    occupied[idx(r, c)] = true;
+                }
+            }
+            out.push(GridPlace {
+                item: i,
+                row,
+                col,
+                col_span,
+                row_span,
+            });
         }
         out
     }
@@ -2463,6 +2579,168 @@ impl Flow<'_> {
 
 fn default_line_height(style: &Style) -> f64 {
     style.font_size * style.line_height.max(1.0)
+}
+
+/// Resolve a `grid-template-columns`/`-rows` track list into `cols` concrete
+/// sizes (points), distributing the leftover space across `fr` tracks.
+///
+/// Sizing follows the documents'-eye-view of the CSS algorithm:
+/// 1. Fixed (`px`/`pt`) and `%` tracks take their resolved size first.
+/// 2. `auto` tracks (and `auto`/`min-content` sides of `minmax`) get an equal
+///    share of whatever space remains alongside the `fr` distribution, treated
+///    as a flexible weight of `1` so a bare `auto` column still gets room.
+/// 3. `fr` tracks split the remaining free space in proportion to their factor;
+///    a `minmax(min, max)` track is clamped between its resolved bounds.
+///
+/// When the track list is empty (or shorter than `cols`), the missing columns
+/// fall back to equal widths — preserving the legacy equal-column grid. `total`
+/// is the content size to fill; `gap` is the gutter between adjacent tracks
+/// (subtracted once per interior gap before distribution).
+fn resolve_track_sizes(tracks: &[TrackSize], cols: usize, total: f64, gap: f64) -> Vec<f64> {
+    let cols = cols.max(1);
+    let inner = (total - gap * cols.saturating_sub(1) as f64).max(0.0);
+
+    // Fall back to equal columns when no usable track list is present.
+    if tracks.is_empty() {
+        return vec![inner / cols as f64; cols];
+    }
+
+    // Build a per-column track sizing, padding short lists with `auto`.
+    let get = |i: usize| tracks.get(i).cloned().unwrap_or(TrackSize::Auto);
+
+    // First pass: resolve fixed/percent minimums; collect flexible weights.
+    let mut sizes = vec![0.0f64; cols];
+    let mut fr_weight = vec![0.0f64; cols]; // fr factor (or 1 for auto)
+    let mut fixed_total = 0.0;
+    let mut total_fr = 0.0;
+    for i in 0..cols {
+        let (base, fr) = track_base_and_fr(&get(i), inner);
+        sizes[i] = base;
+        fixed_total += base;
+        if fr > 0.0 {
+            fr_weight[i] = fr;
+            total_fr += fr;
+        }
+    }
+
+    // Distribute the free space across flexible tracks by their fr weight.
+    let free = (inner - fixed_total).max(0.0);
+    if total_fr > 0.0 {
+        for i in 0..cols {
+            if fr_weight[i] > 0.0 {
+                let mut add = free * fr_weight[i] / total_fr;
+                // Clamp `minmax(min, max)` flexible tracks to their max bound.
+                if let TrackSize::MinMax(_, max) = get(i) {
+                    if let Some(cap) = track_fixed_height(&max) {
+                        add = add.min((cap - sizes[i]).max(0.0));
+                    }
+                }
+                sizes[i] += add;
+            }
+        }
+    } else if free > 0.0 {
+        // No flexible tracks but space remains: spread it equally so the grid
+        // still fills its width (e.g. an all-fixed list narrower than the box).
+        let share = free / cols as f64;
+        for s in sizes.iter_mut() {
+            *s += share;
+        }
+    }
+    sizes
+}
+
+/// The fixed base size (points) and flexible `fr` weight of one track against a
+/// container `inner` size. Fixed/percent tracks return `(size, 0)`; `fr` tracks
+/// return `(0, factor)`; `auto`/intrinsic tracks return `(0, 1)` so they share
+/// leftover space like a 1fr track. `minmax(min, max)` uses `min` as the base
+/// and is flexible up to `max` (weight 1) — a pragmatic reading that gives the
+/// track its minimum then lets it grow.
+fn track_base_and_fr(track: &TrackSize, inner: f64) -> (f64, f64) {
+    match track {
+        TrackSize::Pt(p) => (p.max(0.0), 0.0),
+        TrackSize::Percent(pc) => ((inner * pc / 100.0).max(0.0), 0.0),
+        TrackSize::Fr(f) => (0.0, f.max(0.0)),
+        TrackSize::Auto => (0.0, 1.0),
+        TrackSize::MinMax(min, _max) => {
+            // Base = resolved min (fixed/percent); the track stays flexible.
+            let base = track_fixed_height(min).unwrap_or(0.0);
+            (base, 1.0)
+        }
+    }
+}
+
+/// The fixed height (points) of a row track, or `None` for `auto`/`fr`
+/// (content-sized). Used both for explicit row heights and `minmax` max bounds.
+/// Percentages can't be resolved without the container height here, so they are
+/// treated as auto (content-sized) for rows.
+fn track_fixed_height(track: &TrackSize) -> Option<f64> {
+    match track {
+        TrackSize::Pt(p) => Some(p.max(0.0)),
+        TrackSize::MinMax(_, max) => track_fixed_height(max),
+        _ => None,
+    }
+}
+
+/// Reduce `widths` in place to absorb `overflow` points, distributing the
+/// reduction by the CSS scaled flex-shrink factor (`shrink × basis`) so wider
+/// and more-shrinkable items give up proportionally more. Items that would go
+/// below 0 are clamped to 0 and frozen, and the remaining overflow is
+/// redistributed across the still-shrinkable items (bounded iteration).
+fn shrink_to_fit(widths: &mut [f64], shrinks: &[f64], overflow: f64) {
+    let n = widths.len();
+    let mut frozen = vec![false; n];
+    let mut remaining = overflow;
+    // At most `n` rounds: each round freezes at least one item or finishes.
+    for _ in 0..n {
+        if remaining <= 0.01 {
+            break;
+        }
+        // Total scaled-shrink weight over the still-flexible items.
+        let total: f64 = (0..n)
+            .filter(|&i| !frozen[i] && shrinks[i] > 0.0)
+            .map(|i| shrinks[i] * widths[i])
+            .sum();
+        if total <= 0.0 {
+            break; // nothing left can shrink (all shrink:0 or already 0-wide)
+        }
+        let mut any_clamped = false;
+        let mut absorbed = 0.0;
+        for i in 0..n {
+            if frozen[i] || shrinks[i] <= 0.0 {
+                continue;
+            }
+            let want = remaining * (shrinks[i] * widths[i]) / total;
+            if want >= widths[i] {
+                // Item bottoms out at 0 and freezes.
+                absorbed += widths[i];
+                widths[i] = 0.0;
+                frozen[i] = true;
+                any_clamped = true;
+            } else {
+                widths[i] -= want;
+                absorbed += want;
+            }
+        }
+        remaining -= absorbed;
+        if !any_clamped {
+            break; // a clean pass fully distributed the overflow
+        }
+    }
+}
+
+/// Cumulative left/top edges for `widths` starting at `origin`, inserting `gap`
+/// between adjacent tracks. `offsets[i]` is the start coordinate of track `i`.
+fn cumulative_offsets(origin: f64, widths: &[f64], gap: f64) -> Vec<f64> {
+    let mut offsets = Vec::with_capacity(widths.len());
+    let mut cur = origin;
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            cur += gap;
+        }
+        offsets.push(cur);
+        cur += w;
+    }
+    offsets
 }
 
 /// Leading offset and inter-item gap realising a `justify-content` value, given
@@ -4121,5 +4399,252 @@ mod tests {
             .iter()
             .any(|f| matches!(f, Fragment::Text { text, .. } if text == "keep"));
         assert!(on_p1, "fitting avoid block stays on page 1");
+    }
+
+    // ── CSS grid: fr / fixed / minmax tracks, gaps, spanning ───────────────
+
+    #[test]
+    fn grid_fr_tracks_share_space_proportionally() {
+        // Two columns 1fr / 3fr over a 540pt content area: col0 = 135, col1 = 405.
+        // Cell B (in the 3fr column) starts at 36 + 135 = 171.
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 3fr"><div>A</div><div>B</div></div>"#,
+        );
+        let a = cell_x(&layout, "A");
+        let b = cell_x(&layout, "B");
+        assert!((a - 36.0).abs() < 2.0, "A hugs the left ({a})");
+        assert!(
+            (b - (36.0 + 135.0)).abs() < 3.0,
+            "B starts at the 1fr boundary (~171), not the equal-split 306 ({b})"
+        );
+    }
+
+    #[test]
+    fn grid_fixed_px_column_then_fr_fills_rest() {
+        // `120pt fixed | 1fr`: col0 = 120pt, so B starts at 36 + 120 = 156, well
+        // left of the equal-split midpoint (36 + 270 = 306).
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:120pt 1fr"><div>A</div><div>B</div></div>"#,
+        );
+        let b = cell_x(&layout, "B");
+        assert!(
+            (b - (36.0 + 120.0)).abs() < 3.0,
+            "B starts after the fixed 120pt column (~156), not 306 ({b})"
+        );
+    }
+
+    #[test]
+    fn grid_minmax_min_pushes_second_column() {
+        // `minmax(300pt, 1fr) | 1fr`: the first track takes at least 300pt, so it
+        // gets 300 (min) + half the 240 leftover = 420; B starts at 36 + 420.
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:minmax(300pt,1fr) 1fr"><div>A</div><div>B</div></div>"#,
+        );
+        let b = cell_x(&layout, "B");
+        assert!(
+            b > 36.0 + 300.0,
+            "minmax min (300pt) pushes B past x=336 ({b})"
+        );
+    }
+
+    #[test]
+    fn grid_column_gap_pushes_second_column() {
+        // 1fr / 1fr with a 60pt column-gap: inner = 540 − 60 = 480, each col 240;
+        // col1 starts at 36 + 240 + 60 = 336 (vs 306 with no gap).
+        let gapped = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr;column-gap:60pt"><div>A</div><div>B</div></div>"#,
+        );
+        let nogap = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr"><div>A</div><div>B</div></div>"#,
+        );
+        let bg = cell_x(&gapped, "B");
+        let bn = cell_x(&nogap, "B");
+        assert!(
+            bg > bn + 20.0,
+            "column-gap pushes B right (gapped={bg}, nogap={bn})"
+        );
+    }
+
+    #[test]
+    fn grid_row_gap_separates_rows() {
+        // Two rows separated by a 50pt row-gap: C3 (row 2) sits at least 50pt
+        // below where it would without the gap.
+        let gapped = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr;row-gap:50pt"><div>C1</div><div>C2</div><div>C3</div><div>C4</div></div>"#,
+        );
+        let nogap = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr"><div>C1</div><div>C2</div><div>C3</div><div>C4</div></div>"#,
+        );
+        let yg = cell_y(&gapped, "C3");
+        let yn = cell_y(&nogap, "C3");
+        assert!(
+            yg > yn + 40.0,
+            "row-gap drops C3 onto a lower row (gapped={yg}, nogap={yn})"
+        );
+    }
+
+    #[test]
+    fn grid_column_span_widens_a_cell() {
+        // 3 columns; the first item spans 2 columns. The auto-flowing second
+        // item lands in column 3 (x = 36 + 2·180 = 396), proving the spanning
+        // cell occupied columns 1–2.
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr 1fr">
+                 <div style="grid-column:span 2">Wide</div><div>Next</div>
+               </div>"#,
+        );
+        let wide = cell_x(&layout, "Wide");
+        let next = cell_x(&layout, "Next");
+        assert!((wide - 36.0).abs() < 2.0, "spanning cell starts at the left ({wide})");
+        assert!(
+            (next - (36.0 + 360.0)).abs() < 4.0,
+            "Next lands in column 3 after the 2-col span (~396), got {next}"
+        );
+    }
+
+    #[test]
+    fn grid_row_span_keeps_following_item_on_first_row() {
+        // A row-spanning item in column 1 leaves column 2 of the first row free,
+        // so the next item stays on row 1 (same y), to its right.
+        let layout = run(
+            r#"<div style="display:grid;grid-template-columns:1fr 1fr">
+                 <div style="grid-row:span 2">Tall</div><div>Side</div><div>Below</div>
+               </div>"#,
+        );
+        let tall = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Tall").unwrap();
+        let side = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Side").unwrap();
+        let below = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Below").unwrap();
+        assert!(side.0 > tall.0, "Side is right of the spanning Tall");
+        assert!((side.1 - tall.1).abs() < 2.0, "Side shares the first row with Tall");
+        // `Below` auto-flows into row 2 column 2 (Tall still occupies r2c1).
+        assert!(below.1 > tall.1, "Below drops to a later row ({:?})", below);
+        assert!(below.0 > tall.0, "Below sits in column 2 under Side");
+    }
+
+    #[test]
+    fn grid_explicit_row_height_is_honoured() {
+        // A first row fixed at 100pt pushes the second-row cell down by ~100pt
+        // (vs an auto first row sized to one line of text, ~12pt).
+        let fixed = run(
+            r#"<div style="display:grid;grid-template-columns:1fr;grid-template-rows:100pt auto"><div>R1</div><div>R2</div></div>"#,
+        );
+        let auto = run(
+            r#"<div style="display:grid;grid-template-columns:1fr"><div>R1</div><div>R2</div></div>"#,
+        );
+        let yf = cell_y(&fixed, "R2");
+        let ya = cell_y(&auto, "R2");
+        assert!(
+            yf > ya + 60.0,
+            "explicit 100pt first row pushes R2 well below the auto layout (fixed={yf}, auto={ya})"
+        );
+    }
+
+    // ── flexbox: basis, shrink, wrap, justify, align ───────────────────────
+
+    #[test]
+    fn flex_basis_sets_initial_main_size() {
+        // A with flex-basis 120pt, B fills the rest: B starts at 36 + 120 = 156.
+        let layout = run(
+            r#"<div style="display:flex"><div style="flex-basis:120pt">A</div><div>B</div></div>"#,
+        );
+        let b = cell_x(&layout, "B");
+        assert!(
+            (b - (36.0 + 120.0)).abs() < 4.0,
+            "flex-basis fixes A at 120pt so B starts ~156 ({b})"
+        );
+    }
+
+    #[test]
+    fn flex_shrink_reduces_overflowing_items() {
+        // Two items each basis 400pt (sum 800 > 540 content). With equal shrink
+        // they shrink proportionally; B must start LEFT of its un-shrunk 400pt
+        // position (36 + 400 = 436) — around the 540/2 = 270 mark.
+        let layout = run(
+            r#"<div style="display:flex"><div style="flex:0 1 400pt">A</div><div style="flex:0 1 400pt">B</div></div>"#,
+        );
+        let b = cell_x(&layout, "B");
+        assert!(
+            b < 36.0 + 400.0 - 50.0,
+            "flex-shrink pulls B left of its 400pt basis position ({b})"
+        );
+        assert!(b > 36.0 + 200.0, "but B is still past the midpoint area ({b})");
+    }
+
+    #[test]
+    fn flex_shrink_zero_keeps_item_at_basis() {
+        // A: flex-shrink 0 basis 400pt — refuses to shrink. B (shrinkable) gives
+        // up the overflow, so A still starts at the left edge and keeps its width:
+        // B starts at ~36 + 400 = 436 (A unshrunk), unlike the both-shrink case.
+        let layout = run(
+            r#"<div style="display:flex"><div style="flex:0 0 400pt">A</div><div style="flex:0 1 400pt">B</div></div>"#,
+        );
+        let b = cell_x(&layout, "B");
+        assert!(
+            b > 36.0 + 360.0,
+            "flex-shrink:0 keeps A at 400pt so B starts near 436 ({b})"
+        );
+    }
+
+    #[test]
+    fn flex_wrap_breaks_onto_a_second_line() {
+        // Three items each basis 250pt (sum 750 > 540) with flex-wrap: the third
+        // wraps below the first. Item 3 sits lower than item 1, at the same x.
+        let layout = run(
+            r#"<div style="display:flex;flex-wrap:wrap">
+                 <div style="flex:0 0 250pt">One</div>
+                 <div style="flex:0 0 250pt">Two</div>
+                 <div style="flex:0 0 250pt">Three</div>
+               </div>"#,
+        );
+        let one = text_xy(&layout).into_iter().find(|(_, _, s)| s == "One").unwrap();
+        let three = text_xy(&layout).into_iter().find(|(_, _, s)| s == "Three").unwrap();
+        assert!(
+            three.1 > one.1 && (three.0 - one.0).abs() < 3.0,
+            "Three wraps below One at the same x (one={one:?}, three={three:?})"
+        );
+    }
+
+    #[test]
+    fn flex_justify_content_center_offsets_items() {
+        // Two fixed 100pt items, justify-content center: total content 200, free
+        // 340, leading offset 170 ⇒ A starts at ~36 + 170 = 206.
+        let layout = run(
+            r#"<div style="display:flex;justify-content:center"><div style="flex:0 0 100pt">A</div><div style="flex:0 0 100pt">B</div></div>"#,
+        );
+        let a = cell_x(&layout, "A");
+        assert!(
+            a > 36.0 + 120.0,
+            "justify-content:center pushes the first item right (~206), got {a}"
+        );
+    }
+
+    #[test]
+    fn flex_justify_content_space_between_pins_edges() {
+        // space-between: first item at the left edge, last at the right. B (100pt
+        // wide) ends at the content right edge 576, so it starts near 476.
+        let layout = run(
+            r#"<div style="display:flex;justify-content:space-between"><div style="flex:0 0 100pt">A</div><div style="flex:0 0 100pt">B</div></div>"#,
+        );
+        let a = cell_x(&layout, "A");
+        let b = cell_x(&layout, "B");
+        assert!((a - 36.0).abs() < 4.0, "A pinned to the left ({a})");
+        assert!(b > 36.0 + 400.0, "B pushed to the right edge ({b})");
+    }
+
+    #[test]
+    fn flex_align_items_center_lowers_short_item() {
+        // A short item next to a tall one, align-items:center. The short item's
+        // text is vertically centred in the line band, so it sits LOWER than the
+        // tall item's first line (which starts at the band top).
+        let tall = "<div style=\"flex:0 0 200pt\"><p>t1</p><p>t2</p><p>t3</p><p>t4</p></div>";
+        let layout = run(&format!(
+            "<div style=\"display:flex;align-items:center\">{tall}<div style=\"flex:0 0 200pt\">short</div></div>"
+        ));
+        let t1 = text_xy(&layout).into_iter().find(|(_, _, s)| s == "t1").unwrap();
+        let short = text_xy(&layout).into_iter().find(|(_, _, s)| s == "short").unwrap();
+        assert!(
+            short.1 > t1.1 + 10.0,
+            "align-items:center lowers the short item below the tall item's first line (t1={t1:?}, short={short:?})"
+        );
     }
 }
