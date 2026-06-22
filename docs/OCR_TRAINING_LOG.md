@@ -1,3 +1,7 @@
+> **⚠️ HISTORICAL.** Training log of the retired hand-trained CRNN/CTC engine (the pivot to
+> PaddleOCR+RTen replaced it — see [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md)).
+> Kept for reference.
+
 # OCR training log — line-level CRNN+CTC
 
 > Chronological record of training the line-level recognizer (see

@@ -202,9 +202,7 @@ residual Z1/Z3 edge-filter gap remains), and the lossless WHT path at `q ≤ 20`
 |------|------|-------|
 | `structured_text(page) -> Vec<TextLine>` | `gp_structured_text_json(handle,page,outlen)` | reading-order lines + bounds |
 | `search(query,case_insensitive) -> Vec<SearchMatch>` | `gp_search_json(handle,ptr,len,ci,outlen)` | match lines + highlight boxes |
-| `ocr_page(page,scale) -> Vec<OcrWord>` | `gp_ocr_json(handle,page,scale,outlen)` | scanned pages → words + boxes (PDF space) |
-| `ocr_page_text(page,scale) -> String` | `gp_ocr_text(handle,page,scale,outlen)` | scanned page → plain text |
-| `ocr::load_model(&[u8]) -> bool` / `ocr::clear_models()` | `gp_ocr_load_model(ptr,len) / gp_ocr_clear_models()` | host-load a `.gpocr` line model (CRNN+CTC) / reset to mono-glyph · SDK `loadOcrModel` / `clearOcrModels` (+ Node `loadBundledOcrModel(s)` / `loadAllBundledOcrModels`) |
+| _(OCR removed from core/WASM)_ | — | OCR is host-side: **`gigapdf-ocr-rten`** crate (PaddleOCR PP-OCR on pure-Rust RTen, 13 langs + auto script selection). See [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md) |
 
 OCR uses the built-in recognizer (no Tesseract): Otsu → connected components →
 line/word segmentation → a compact CNN trained offline on EMNIST (handwriting) +

@@ -335,22 +335,12 @@ baselines survive a round-trip.
 Recognise text on scanned/image-only pages (`GigaPdfDoc`), and load the per-script
 recognizer models (`GigaPdfEngine`, global to the engine):
 
-| Method | Class | Returns | Description |
-|--------|-------|---------|-------------|
-| `ocr(page, scale?)` | `GigaPdfDoc` | `OcrWord[]` | Recognise words (with PDF-space boxes) on a scanned page — native CNN, no external engine. `scale ≥ 2` for small text. |
-| `ocrText(page, scale?)` | `GigaPdfDoc` | `string` | OCR'd plain text. |
-| `loadOcrModel(blob)` | `GigaPdfEngine` | `boolean` | Load a `.gpocr` line-recognizer blob (any host); routes `ocr`/`ocrText` through the CRNN+CTC engine. `false` on a malformed blob. |
-| `loadBundledOcrModel(script)` | `GigaPdfEngine` | `Promise<boolean>` | **(Node)** Load one bundled script (`"alpha"`, `"arabic"`, `"devanagari"`, `"bengali"`, `"tamil"`) from the package's `models/`. |
-| `loadBundledOcrModels(scripts)` | `GigaPdfEngine` | `Promise<OcrScript[]>` | **(Node)** Load several bundled scripts; returns the ones that loaded. |
-| `loadAllBundledOcrModels()` | `GigaPdfEngine` | `Promise<number>` | **(Node)** Discover and load **every** bundled `.gpocr`; the script detector then routes each line to the right model (any shipped language). Returns the count loaded. |
-| `clearOcrModels()` | `GigaPdfEngine` | `void` | Drop every runtime-loaded model (reverts to the mono-glyph Latin classifier). |
-
-To make a scanned PDF searchable: `ocr(page)` → map words to placements →
-`addTextLayer(page, runs)` (invisible, selectable). Full recipe in the
-[cookbook](COOKBOOK.md#ocr-a-scanned-page--full-text-search).
-
-`ALL_OCR_SCRIPTS` is the exported list of every trained script (pass to
-`loadBundledOcrModels` to recognise any shipped language).
+OCR is **no longer part of this WASM SDK**. It moved host-side to the
+**`gigapdf-ocr-rten`** crate — PaddleOCR PP-OCR models on the pure-Rust **RTen**
+runtime (13 languages incl. Hebrew + automatic per-line script selection, state of
+the art). Run it natively and expose it as an endpoint; this SDK keeps the
+extraction/search APIs (`extractText`, `structuredText`, `search`, `addTextLayer`)
+for PDFs that already carry text. See [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md).
 
 > **Default engine:** Latin (printed + handwritten), mono-glyph. **Opt-in CRNN+CTC
 > engine** (line-level, multi-script): group `alpha` = Latin-extended + Cyrillic + Greek
@@ -382,7 +372,7 @@ import type {
   FontInfo, EmbeddedFont, PageInfo, PageMargins, HeaderFooterSpec, HeaderFooterAlign,
   TextLine, TextRunInfo, Element, TextElementInfo, DocumentLanguage,
   ImageElementInfo, VectorPathInfo, PathSegment,
-  SearchHit, OcrWord, OcrScript, AnnotationInfo, FieldInfo, FieldStyle, RadioOption,
+  SearchHit, AnnotationInfo, FieldInfo, FieldStyle, RadioOption,
   LinkInfo, LayerInfo, OutlineEntry, NamedDest, Attachment, XlsxSheet, DecodedImage,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options,

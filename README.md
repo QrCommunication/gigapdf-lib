@@ -53,7 +53,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 | **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **PKCS#12 signing** (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **true redaction** (delete from stream) + **`redactPii`** *(v0.52.4)* — irreversible redaction that also **erases image pixels** (safe on scans/OCR) under an opaque mark |
 | **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images), **without its text** (`renderPageNoText`) or **omitting specific elements** (`renderPageExcluding`) for live-overlay editing; native image codecs — encode/decode PNG · JPEG · lossless WebP, decode GIF + **AVIF** (AV1 intra); alpha-correct resize |
 | **Text intelligence** | Font-aware extraction, **structured text** (reading-order lines + boxes), **full-text search** with highlight boxes |
-| **OCR** | Built-in recognizer — **photo auto-crop (4-corner perspective dewarp) + illumination flat-field** front-end → line/word segmentation → int8 **CRNN+CTC** line models per script (Latin/Cyrillic/Greek, Arabic/Hebrew, Devanagari, Bengali, Tamil, **Chinese**, **Japanese/Korean** in training) + handwriting & photo/degraded variants. Beats Tesseract on most trained scripts. No Tesseract, no model download at runtime |
+| **OCR** | **`gigapdf-ocr-rten`** crate (host-side) — **PaddleOCR PP-OCR** (DBNet detect + SVTR/CRNN recognize) on **RTen**, a **pure-Rust ONNX runtime (no C++, no Tesseract)**. 13 languages incl. **Hebrew** (own model) + Arabic (RTL), CJK, Cyrillic, Devanagari, Tamil/Telugu/Kannada, Latin — with **automatic per-line script selection**. State-of-the-art (PaddleOCR beats Tesseract on most scripts) |
 | **Convert →** | PDF → **TXT, HTML, DOCX, PPTX, ODP, ODT, XLSX, ODS, RTF** (real editable elements, not a page image) |
 | **Convert ←** | **TXT, HTML, RTF, DOCX, ODT, ODP, PPTX, XLSX, ODS** → PDF (ODF `.odt`/`.ods`/`.odp` are fully bidirectional) · raster **PNG, JPEG, GIF, WebP, AVIF** → PDF (one A4 page, centred & shrink-to-fit) |
 | **Unified editable model** | Format-neutral document tree (sections → pages → blocks → runs): lower **any** format in (`toModel`/`officeToModel`/`htmlToModel`), edit with structured ops (`applyModelOps`), raise to **any** format (`modelTo{Docx,Xlsx,Pptx,Odt,Ods,Odp,Pdf,Html,Rtf}`) — edit every format the same way |
@@ -103,89 +103,38 @@ resolves on the microtask queue). CSS **flex** supports `flex-direction`,
 ## OCR & text intelligence
 
 Text already in a PDF is extracted **font-aware** (zero tofu) with reading-order
-lines and bounding boxes, and is searchable with highlight boxes. For **scanned,
-image-only pages** the engine has a built-in OCR following the classic Tesseract
-pipeline — Otsu binarization → connected-component blobs → line/word segmentation
-→ per-glyph classification — but with a from-scratch, dependency-free classifier:
+lines and bounding boxes, and is searchable with highlight boxes.
 
-- The classifier is a **compact CNN trained offline** on two public sources:
-  **EMNIST** (NIST handwritten digits + letters, public domain) for **handwriting**,
-  and **synthetic glyphs rendered from thousands of fonts** (system + Google Fonts,
-  the Tesseract `text2image` approach) for **printed text, punctuation and accented
-  Latin**.
-- Training is build-time only (`tools/train_ocr_cnn.py`); the engine ships the
-  **int8-quantized weights** and runs a pure-`std` forward pass — no ML library,
-  no model download at runtime.
-- **Scripts/languages (mono-glyph engine):** Latin — `0-9 A-Z a-z`, common
-  punctuation, and accented Latin (`é è à ç ñ ü …`) for French, Spanish, German,
-  Portuguese, etc. Both **printed and handwritten** Latin are recognized.
-- **Honest accuracy:** strong on clean machine print, decent on tidy handwriting
-  (EMNIST-grade); noisy scans and dense layouts are harder.
+For **scanned, image-only pages**, OCR is the **`gigapdf-ocr-rten`** crate — a
+**host-side** engine running **PaddleOCR PP-OCR** models through **RTen**, a
+pure-Rust ONNX runtime (**no C++, no Tesseract**). It carries the ML weights and
+runs natively; the lean pure-`std` `core`/`wasm` stay dependency-free and the host
+exposes OCR as an endpoint.
 
-**Line-level CRNN+CTC engine (opt-in, multi-script).** A second recognizer removes the
-per-glyph segmentation that caps the classic pipeline (touching glyphs, cursive scripts,
-noisy scans). It reads a whole text line as a sequence — Otsu **or Sauvola** binarization
-→ projection-profile line bands → CNN → bidirectional GRU → CTC — still a **pure-`std`
-int8** forward pass (`crates/core/src/raster/ocr_crnn.rs`), no ML dependency. Models are
-per script group, trained offline (`tools/train_ocr_crnn.py`) and enabled via Cargo
-features (`ocr-alpha`, …); `ocr()` uses the CRNN when a model is embedded and falls back
-to the mono-glyph classifier otherwise.
+- **Pipeline:** a shared **DBNet** text detector → per-line **SVTR/CRNN+CTC**
+  recognition → automatic **per-line script selection** (each line is routed to the
+  highest-confidence recognizer — no separate script classifier needed).
+- **Languages (13):** Arabic (RTL), **Hebrew** (RTL — our own model, since PaddleOCR
+  ships none), Simplified & Traditional Chinese, Cyrillic, Devanagari, English,
+  Japanese, Kannada, Korean, Latin (French/German/Spanish/…), Tamil, Telugu.
+  PaddleOCR PP-OCRv4/v5 covers 100+ scripts — add one by dropping its `.rten` + dict
+  into the models dir (`REC_MODELS` in `crates/ocr-rten/src/lib.rs`).
+- **State of the art:** PaddleOCR beats Tesseract on most scripts. Validated so far:
+  a Chinese line decoded 100% (conf 0.999), and multilingual auto-routing
+  (Korean→ko, Japanese→ja, Russian→cyrillic) correct on a mixed page.
+- **Models** are fetched + converted at deploy time
+  (`crates/ocr-rten/tools/fetch_models.sh`, ONNX→`.rten` via `rten-convert`); the
+  Hebrew model is trained by `crates/ocr-rten/tools/train_hebrew.py`. They are **not
+  committed** (kept out of the lean package, like fonts).
 
-### Benchmarks — CER vs Tesseract 5.3.4
+```rust
+let eng = gigapdf_ocr_rten::OcrEngine::load_models_dir("models")?;
+for line in eng.recognize_page(&rgb_image)? {
+    println!("[{:.2}|{}] {}", line.confidence, line.model, line.text);
+}
+```
 
-Character Error Rate (CER, lower is better) on held-out benchmarks — a **dependency-free, in-WASM** recognizer measured against the reference engine. Full methodology and per-run history in [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md).
-
-| Script | gigapdf-lib | Tesseract 5.3.4 | |
-|---|---|---|---|
-| **Latin-ext + Cyrillic + Greek** (clean print) | **0.119** | 0.258 | ✅ ~2.2× better — WER 0.41 vs 0.62 |
-| **Arabic / Hebrew** (RTL, non-mirrored) | **0.063** | 0.349 | ✅ ~5.5× better |
-| **Tamil** | **0.077** | 0.101 | ✅ beats — WER 0.39 vs 0.60 |
-| **Devanagari** (Hindi, …) | **0.078** | 0.089 | ✅ beats |
-| **Bengali** | 0.097 | 0.073 | ≈ competitive (font/data-bound, not capacity) |
-| **Latin handwriting** (IAM test) | **0.309** | 0.353 | ✅ first dependency-free engine to beat Tesseract on real handwriting — WER 0.737 vs 0.775 |
-| **Chinese (CJK)** | **0.206** | — | CASIA handwritten, 2401-class data-driven charset |
-
-Every model is an **int8 CRNN+CTC** running **client-side in WebAssembly** — **no Tesseract binary, no runtime model download**. The larger 32/64/128 backbone roughly **halves** Indic/Arabic validation CER (deva 0.039, beng 0.042, taml 0.011, arabic 0.030 — capacity, not data, was the bound). *Honest caveat:* heavily degraded or dense scans still favour Tesseract's breadth.
-
-- **Trained today:** group **`alpha`** — **Latin-extended + Cyrillic + Greek** printed
-  (Polish, Czech, Turkish, Vietnamese, Russian, Ukrainian, Greek, …). On a synthetic
-  multi-script clean-print benchmark it **comfortably beats Tesseract 5.3.4** — CER **0.119
-  vs 0.258** (~2.2×), WER 0.41 vs 0.62 (larger 24/48/96 backbone; see
-  [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md)) — with **homoglyph disambiguation**
-  snapping Latin/Greek/Cyrillic lookalikes (A/Α/А).
-  *Caveat:* synthetic clean print on the four trained languages; real degraded scans and
-  untrained scripts still favour Tesseract's breadth.
-- **Also trained (non-Latin):** **Tamil** (`taml`) — **beats Tesseract** (0.077 vs 0.101);
-  **Arabic + Hebrew** (`arabic`, **RTL**) — beats Tesseract on synthetic (0.063 vs 0.349),
-  output verified non-mirrored; **Devanagari** (`deva`, larger 24/48/96 backbone) — now
-  **beats Tesseract** (0.078 vs 0.089); **Bengali** (`beng`) — competitive (0.097 vs 0.073),
-  font/data-bound. **Chinese (CJK)** (`cjk`, 2401-class) — CER **0.206** on CASIA handwritten. Backbone is env-tunable (`GIGA_OCR_C1/C2/HID`); PIL **raqm**
-  shaping handles Indic/Arabic forms.
-- **Handwriting:** a handwriting variant **`ocr_alpha_hw.gpocr`** (32/64/128 backbone, trained
-  on ~108k real handwriting lines — IAM/RIMES/NorHand/NewsEye/Belfort/POPP/Esposalles/Cyrillic
-  via the HF datasets-server — plus synthetic *Handwriting* fonts) **beats Tesseract on real
-  cursive: CER 0.309 vs 0.353** (WER 0.737 vs 0.775) on the IAM test set. The printed champion
-  stays primary for clean scans; load the HW variant via `gp_ocr_load_model` for
-  handwriting-heavy input — see [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md).
-- **CJK (Chinese):** **trained** — `ocr_cjk.gpocr` (data-driven **2401-class** charset, 32/64/128
-  backbone, ~93k real lines: priyank-m printed + CASIA handwriting) reaches **CER 0.206 on CASIA
-  handwritten Chinese**. Host-load via `gp_ocr_load_model`.
-- **Japanese & Korean:** their own groups (`jpn`, `kor`) and datasets (synthetic **150k JP** /
-  **200k KR**) are wired in; each gets a data-driven charset (kana+kanji / Hangul) **plus the full
-  ASCII set** so mixed alphanumerics (prices, dates, codes) are read, trained on the real corpus +
-  Latin synthetic lines so those glyphs are actually seen. *(Training in progress on a VPS; the
-  real-dataset download is now concurrent — `GIGA_OCR_DL_WORKERS`, lifted by an HF Pro token.)*
-- **Degraded-input front-end** (`ocr.rs` + `dewarp.rs`, **no retrain**): before recognition `ocr()`
-  **auto-crops a photographed page** — finds the document's four corners on a contrasting background
-  and perspective-warps it head-on (`rectify_document`: bright mask → largest component → 8×8 DLT
-  homography → bilinear warp) — then **flattens uneven illumination** (flat-field divide by a local
-  background; shadows/glare → uniform page). Both **gated to no-op on already-clean scans**, so they
-  only act on phone photos / creased paper. Pairs with the photo variant `ocr_alpha_photo.gpocr`
-  (degradation-augmented; beats the plain HW model on degraded input): augmentation hardens the
-  model, the front-end fixes the input.
-- Design: [`docs/OCR_ARCHITECTURE.md`](docs/OCR_ARCHITECTURE.md) · data catalogue:
-  [`docs/OCR_TRAINING_DATA.md`](docs/OCR_TRAINING_DATA.md) · training log:
-  [`docs/OCR_TRAINING_LOG.md`](docs/OCR_TRAINING_LOG.md).
+See [`crates/ocr-rten/README.md`](crates/ocr-rten/README.md) for the full pipeline.
 
 ## Layout
 

@@ -1,3 +1,7 @@
+> **⚠️ HISTORICAL.** Training-data catalogue for the retired hand-trained CRNN engine. OCR now
+> uses pre-trained **PaddleOCR** models via **RTen** (`gigapdf-ocr-rten`); only the Hebrew model is
+> still trained here (`crates/ocr-rten/tools/train_hebrew.py`). Kept for reference.
+
 # OCR training data — multi-script sources catalogue
 
 > **Goal.** Take gigapdf's built-in OCR from *Latin-only, single-glyph, ~61 % per-glyph*

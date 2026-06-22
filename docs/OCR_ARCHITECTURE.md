@@ -1,3 +1,7 @@
+> **⚠️ HISTORICAL.** This documents the retired hand-trained CRNN/CTC engine. OCR now runs
+> host-side via the **`gigapdf-ocr-rten`** crate (PaddleOCR PP-OCR on the pure-Rust **RTen**
+> runtime — see [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md)). Kept for reference.
+
 # OCR architecture — from mono-glyph CNN to line-level CRNN+CTC
 
 > Companion to [`OCR_TRAINING_DATA.md`](./OCR_TRAINING_DATA.md). This document explains the

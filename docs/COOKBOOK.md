@@ -326,42 +326,29 @@ exact and fast. For **scanned, image-only** pages, OCR them and stamp an
 invisible (render-mode 3) text layer so the result becomes selectable and
 searchable.
 
+OCR now runs **host-side** in the **`gigapdf-ocr-rten`** crate (PaddleOCR + RTen,
+13 languages incl. Hebrew + automatic per-line script selection). Recognize a
+rasterized page there, then stamp the words back with this SDK's `addTextLayer`:
+
+```rust
+// Native (server-side): recognize the page image with the RTen+PaddleOCR engine.
+let eng = gigapdf_ocr_rten::OcrEngine::load_models_dir("models")?;
+let lines = eng.recognize_page(&page_rgb)?; // [{ bbox, text, confidence, model }]
+```
+
 ```ts
+// Then, in the SDK: stamp an invisible (render-mode 3) text layer so the PDF
+// becomes selectable + searchable. Map each line's box to PDF user space.
 const doc = giga.open(scannedPdf);
-
-// (Node) load every bundled OCR script so any language is recognised — Latin,
-// Cyrillic, Greek, Arabic/Hebrew (RTL), Devanagari, Bengali, Tamil. The script
-// detector routes each line to the right model.
-await giga.loadAllBundledOcrModels();
-
-const scale = 2; // rasterise at 2× (= 144 dpi) for small text
-for (let page = 1; page <= doc.pageCount(); page++) {
-  const { height } = doc.pageInfo(page);
-  const words = doc.ocr(page, scale); // OcrWord[] — boxes in raster pixels, top-left
-  doc.addTextLayer(
-    page,
-    // Map each word box back to PDF user space (bottom-left, Y up).
-    words.map((w) => ({
-      x: w.x / scale,
-      y: height - (w.y + w.h) / scale,
-      size: w.h / scale,
-      text: w.text,
-    })),
-  );
-}
-
-// Now the document is searchable, with per-hit boxes.
-const hits = doc.search("invoice");          // [{ page, text, x, y, w, h }]
-const plain = doc.ocrText(1, scale);         // OCR'd page as a plain string
-
+doc.addTextLayer(page, lines.map((l) => ({
+  x: l.bbox.x0 / scale,
+  y: height - l.bbox.y1 / scale,
+  size: (l.bbox.y1 - l.bbox.y0) / scale,
+  text: l.text,
+})));
 const searchable = doc.save();
 doc.close();
 ```
-
-> Need only Latin? Skip `loadAllBundledOcrModels()` — the built-in mono-glyph
-> classifier recognises printed and handwritten Latin out of the box. Load a
-> single script with `giga.loadBundledOcrModel("arabic")` (Node) or
-> `giga.loadOcrModel(blobBytes)` (any host) instead.
 
 ---
 
