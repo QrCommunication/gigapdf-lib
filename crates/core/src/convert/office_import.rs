@@ -157,6 +157,47 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Phase 2 of the two-phase font flow for [`office_to_pdf`]: render the container
+/// with `host`-supplied faces (the families [`office_needed_fonts`] reported as
+/// referenced-but-unembedded, fetched by the host and handed back here — e.g.
+/// Carlito for a Calibri reference) so styled runs lay out with the right
+/// advance widths instead of drifting onto the bundled Liberation metrics.
+///
+/// Each format [merges](merge_fonts) the host faces with whatever the document
+/// embeds itself; **embedded faces win on conflict**, so calling this with the
+/// right `host` set never regresses a self-embedding document. Dispatch mirrors
+/// [`office_to_pdf`]; legacy OLE2 has no resolvable font references, so its output
+/// is identical to [`office_to_pdf`] regardless of `host`. `None` for an
+/// unrecognized archive.
+pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<Vec<u8>> {
+    // Legacy OLE2 Compound File (.doc/.xls/.ppt) — no resolvable font references.
+    if bytes.len() >= 8 && bytes[..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+        return ole2_to_pdf(bytes);
+    }
+
+    let zip = read_zip(bytes);
+    if zip.contains_key("word/document.xml") {
+        Some(docx_to_pdf_with(&zip, host))
+    } else if zip.contains_key("ppt/presentation.xml") {
+        Some(pptx_to_pdf_with(&zip, host))
+    } else if zip.contains_key("xl/workbook.xml") {
+        Some(xlsx_to_pdf_with(&zip, host))
+    } else if let Some(mimetype) = zip.get("mimetype") {
+        let mt = String::from_utf8_lossy(mimetype);
+        if mt.contains("opendocument.text") {
+            Some(odt_to_pdf_with(&zip, host))
+        } else if mt.contains("opendocument.spreadsheet") {
+            Some(ods_to_pdf_with(&zip, host))
+        } else if mt.contains("opendocument.presentation") {
+            Some(odp_to_pdf_with(&zip, host))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 // ════════════════════════════ Office → unified model ══════════════════════════
 //
 // The `*_to_model` functions below are the structured counterpart of the
@@ -1947,6 +1988,40 @@ fn extract_embedded_fonts(zip: &BTreeMap<String, Vec<u8>>) -> Vec<ProvidedFont> 
     }
 }
 
+/// The renderer's face-key for de-duplication: `(family lowercased, bold,
+/// italic)`, where `bold` mirrors the painter's `weight >= 600` threshold so two
+/// faces collide here exactly when they would in [`crate::html`]'s font book.
+fn font_key(f: &ProvidedFont) -> (String, bool, bool) {
+    (f.family.to_ascii_lowercase(), f.weight >= 600, f.italic)
+}
+
+/// Merge the faces the container embeds itself with the `host`-supplied faces
+/// (phase 2 of the two-phase font flow: families [`office_needed_fonts`] reported
+/// as referenced-but-unembedded, fetched and handed back by the host — e.g.
+/// Carlito for a Calibri reference).
+///
+/// **Embedded wins on conflict.** Embedded faces are listed first and the
+/// renderer resolves a run by the *first* matching face (exact key → same family
+/// → any), so a document that ships its own typeface keeps it; a `host` face is
+/// only appended when its exact key isn't already embedded, so it fills the gaps
+/// (referenced-but-unembedded families) without ever shadowing an embedded face
+/// and without poisoning the font book with dead duplicates.
+fn merge_fonts(embedded: Vec<ProvidedFont>, host: &[ProvidedFont]) -> Vec<ProvidedFont> {
+    if host.is_empty() {
+        return embedded;
+    }
+    let mut keys: std::collections::BTreeSet<(String, bool, bool)> =
+        embedded.iter().map(font_key).collect();
+    let mut out = embedded;
+    out.reserve(host.len());
+    for f in host {
+        if keys.insert(font_key(f)) {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 /// A single `<w:embed…>` reference recovered from an OOXML `fontTable.xml`:
 /// which face of `family` it is, the relationship id pointing at the obfuscated
 /// font part, and the GUID used to de-obfuscate it.
@@ -2320,10 +2395,17 @@ fn img_tag(zip: &BTreeMap<String, Vec<u8>>, key: &str) -> Option<String> {
 /// (`b`/`i`/`sz`/`color`/`u`) to inline `<span>`s, `w:tbl`→`<table>`, and inline
 /// images via `a:blip r:embed` resolved through the document relationships.
 pub fn docx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    docx_to_pdf_with(zip, &[])
+}
+
+/// Like [`docx_to_pdf`] but also feeds `host` faces (phase 2 of
+/// [`office_needed_fonts`]): the DOCX's own embedded faces (`word/fonts/*.odttf`)
+/// are [merged](merge_fonts) with the host-supplied ones (embedded wins) so a
+/// referenced-but-unembedded family (Calibri→Carlito) lays out with the right
+/// metrics.
+fn docx_to_pdf_with(zip: &BTreeMap<String, Vec<u8>>, host: &[ProvidedFont]) -> Vec<u8> {
     let (body, geom) = docx_body_geom(zip);
-    // Any face the DOCX embeds itself (`word/fonts/*.odttf`) is fed to the
-    // renderer so its runs lay out and paint with the real typeface.
-    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+    render_geom_with_fonts(&body, geom, &merge_fonts(extract_embedded_fonts(zip), host))
 }
 
 /// Build the DOCX HTML `<body>` and resolve its page geometry, without
@@ -3837,12 +3919,17 @@ fn parse_docx_footnotes(xml: &str) -> DocxFootnotes {
 /// align, and colours cells from their style's solid fill. Rendered landscape
 /// for width.
 pub fn xlsx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
-    // Spreadsheets have no single declared page size; render landscape for width.
-    // Any embedded face (`xl/fonts/*.odttf`) is passed to the renderer.
+    xlsx_to_pdf_with(zip, &[])
+}
+
+/// Like [`xlsx_to_pdf`] but also feeds `host` faces (phase 2 of
+/// [`office_needed_fonts`]); embedded faces still win on conflict.
+/// Spreadsheets have no single declared page size — rendered landscape for width.
+fn xlsx_to_pdf_with(zip: &BTreeMap<String, Vec<u8>>, host: &[ProvidedFont]) -> Vec<u8> {
     render_geom_with_fonts(
         &xlsx_body_html(zip),
         PageGeom::tabular_default(),
-        &extract_embedded_fonts(zip),
+        &merge_fonts(extract_embedded_fonts(zip), host),
     )
 }
 
@@ -5009,9 +5096,14 @@ fn col_of_ref(r: &str) -> usize {
 /// PPTX → one page per slide (page break between). Text from `a:p`/`a:r`/`a:t`;
 /// images via `a:blip r:embed` resolved through each slide's relationships.
 pub fn pptx_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    pptx_to_pdf_with(zip, &[])
+}
+
+/// Like [`pptx_to_pdf`] but also feeds `host` faces (phase 2 of
+/// [`office_needed_fonts`]); embedded deck fonts still win on conflict.
+fn pptx_to_pdf_with(zip: &BTreeMap<String, Vec<u8>>, host: &[ProvidedFont]) -> Vec<u8> {
     let (body, geom) = pptx_body_geom(zip);
-    // Embedded deck fonts (`ppt/fonts/*.odttf`) are passed to the renderer.
-    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+    render_geom_with_fonts(&body, geom, &merge_fonts(extract_embedded_fonts(zip), host))
 }
 
 /// Build the PPTX HTML `<body>` (one slide per page) and resolve slide geometry,
@@ -6099,9 +6191,14 @@ fn flush_odf_colgroup(pending: &mut String, done: &mut bool, out: &mut String) {
 /// styled via the automatic/named style map, `table:table`→`<table>`,
 /// `draw:image xlink:href`→`<img>`.
 pub fn odt_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    odt_to_pdf_with(zip, &[])
+}
+
+/// Like [`odt_to_pdf`] but also feeds `host` faces (phase 2 of
+/// [`office_needed_fonts`]); ODF embedded faces (`Fonts/*`) still win on conflict.
+fn odt_to_pdf_with(zip: &BTreeMap<String, Vec<u8>>, host: &[ProvidedFont]) -> Vec<u8> {
     let (body, geom) = odt_body_geom(zip);
-    // ODF embedded faces (`Fonts/*`) are passed to the renderer.
-    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+    render_geom_with_fonts(&body, geom, &merge_fonts(extract_embedded_fonts(zip), host))
 }
 
 /// Build the ODT HTML `<body>` and resolve geometry, without rendering. Shared
@@ -6329,9 +6426,14 @@ fn odf_table(
 /// ODS → one HTML `<table>` per `table:table`, honoring
 /// `table:number-columns-repeated` (capped ~64). Rendered landscape.
 pub fn ods_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    ods_to_pdf_with(zip, &[])
+}
+
+/// Like [`ods_to_pdf`] but also feeds `host` faces (phase 2 of
+/// [`office_needed_fonts`]); ODF embedded faces (`Fonts/*`) still win on conflict.
+fn ods_to_pdf_with(zip: &BTreeMap<String, Vec<u8>>, host: &[ProvidedFont]) -> Vec<u8> {
     let (body, geom) = ods_body_geom(zip);
-    // ODF embedded faces (`Fonts/*`) are passed to the renderer.
-    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+    render_geom_with_fonts(&body, geom, &merge_fonts(extract_embedded_fonts(zip), host))
 }
 
 /// Build the ODS HTML `<body>` (one `<table>` per sheet) and resolve geometry,
@@ -6539,9 +6641,14 @@ fn ods_cell_text(x: &mut Xml, cell_tag: &str) -> String {
 /// ODP → one page per `draw:page`; text from `text:p` (with `text:span`
 /// styles), images via `draw:image`. Rendered landscape.
 pub fn odp_to_pdf(zip: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    odp_to_pdf_with(zip, &[])
+}
+
+/// Like [`odp_to_pdf`] but also feeds `host` faces (phase 2 of
+/// [`office_needed_fonts`]); ODF embedded faces (`Fonts/*`) still win on conflict.
+fn odp_to_pdf_with(zip: &BTreeMap<String, Vec<u8>>, host: &[ProvidedFont]) -> Vec<u8> {
     let (body, geom) = odp_body_geom(zip);
-    // ODF embedded faces (`Fonts/*`) are passed to the renderer.
-    render_geom_with_fonts(&body, geom, &extract_embedded_fonts(zip))
+    render_geom_with_fonts(&body, geom, &merge_fonts(extract_embedded_fonts(zip), host))
 }
 
 /// Build the ODP HTML `<body>` (one slide per page) and resolve geometry,
@@ -8158,6 +8265,135 @@ mod tests {
             !reqs.iter().any(|r| r.family.eq_ignore_ascii_case("Roboto")),
             "self-embedded Roboto is NOT in the host fetch list: {reqs:?}"
         );
+    }
+
+    #[test]
+    fn office_to_pdf_with_fonts_uses_host_face_for_referenced_unembedded_family() {
+        // A DOCX that *references* "Calibri" but does not embed it. Phase 1
+        // (`office_needed_fonts`) would tell the host to fetch it; phase 2
+        // (`office_to_pdf_with_fonts`) hands the fetched face back so the run is
+        // laid out and painted with it (a Carlito-like metric-compatible
+        // substitute) instead of drifting onto the bundled Liberation fallback.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:rPr><w:rFonts w:ascii="Calibri"/></w:rPr><w:t>Hello Calibri</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let docx = build_docx(doc, None, &[]);
+
+        // Sanity: the DOCX embeds nothing, so without a host face the renderer
+        // falls back to the bundled "Fallback Sans" — no "Calibri" in the output.
+        let baseline = office_to_pdf(&docx).expect("recognized DOCX");
+        let base_doc = crate::Document::open(&baseline).expect("re-open baseline PDF");
+        assert!(
+            !base_doc
+                .embedded_fonts()
+                .iter()
+                .any(|f| f.base_font.to_ascii_lowercase().contains("calibri")),
+            "without a host face, the Calibri run uses the bundled fallback (no Calibri embedded): {:?}",
+            base_doc.embedded_fonts()
+        );
+
+        // Phase 2: supply a "Calibri" face (here the bundled program reused under
+        // that family name, standing in for a host-fetched Carlito). The renderer
+        // embeds it under "Calibri" — proving the FOURNIE face was consulted, not
+        // the Liberation fallback (which embeds as "Fallback Sans").
+        let host = vec![ProvidedFont {
+            family: "Calibri".to_string(),
+            weight: 400,
+            italic: false,
+            ttf: fixture_ttf(),
+        }];
+        let pdf = office_to_pdf_with_fonts(&docx, &host).expect("recognized DOCX");
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF produced");
+        let out = crate::Document::open(&pdf).expect("re-open rendered PDF");
+        let fonts = out.embedded_fonts();
+        assert!(
+            fonts
+                .iter()
+                .any(|f| f.base_font.to_ascii_lowercase().contains("calibri")),
+            "the host-supplied Calibri face is embedded in the output: {fonts:?}"
+        );
+        assert!(
+            !fonts
+                .iter()
+                .any(|f| f.base_font.contains("Fallback Sans")),
+            "the bundled fallback is NOT used for the Calibri run when the host face is supplied: {fonts:?}"
+        );
+
+        // `office_to_pdf` (no host fonts) must remain unchanged — same output as
+        // the baseline (the public no-fonts API is not regressed by phase 2).
+        assert_eq!(
+            office_to_pdf(&docx).expect("recognized DOCX"),
+            baseline,
+            "office_to_pdf without host fonts is byte-identical (no regression)"
+        );
+    }
+
+    #[test]
+    fn merge_fonts_keeps_embedded_over_host_and_appends_gaps() {
+        let prog = fixture_ttf();
+        let embedded = vec![ProvidedFont {
+            family: "Calibri".to_string(),
+            weight: 400,
+            italic: false,
+            ttf: prog.clone(),
+        }];
+        let host = vec![
+            // Same exact key as the embedded face (case-insensitive) → dropped:
+            // the embedded face wins on conflict.
+            ProvidedFont {
+                family: "calibri".to_string(),
+                weight: 400,
+                italic: false,
+                ttf: vec![9, 9, 9],
+            },
+            // A family the container does NOT embed → appended (fills the gap).
+            ProvidedFont {
+                family: "Cambria".to_string(),
+                weight: 400,
+                italic: false,
+                ttf: prog.clone(),
+            },
+            // Same family, different weight (bold ≥ 600) → distinct key, kept.
+            ProvidedFont {
+                family: "Calibri".to_string(),
+                weight: 700,
+                italic: false,
+                ttf: prog.clone(),
+            },
+        ];
+
+        let merged = merge_fonts(embedded, &host);
+        // Embedded Calibri/regular first (priority), then the two non-colliding
+        // host faces; the colliding host Calibri/regular is dropped.
+        assert_eq!(merged.len(), 3, "one collision dropped: {:?}", merged.len());
+        assert_eq!(merged[0].family, "Calibri", "embedded face stays first (wins)");
+        assert_eq!(merged[0].ttf, prog, "embedded bytes preserved, not the host's");
+        assert!(
+            merged.iter().any(|f| f.family == "Cambria"),
+            "a referenced-but-unembedded host family is appended"
+        );
+        assert!(
+            merged.iter().any(|f| f.family == "Calibri" && f.weight == 700),
+            "a host face with a different weight key is appended"
+        );
+        assert!(
+            !merged.iter().any(|f| f.ttf == vec![9, 9, 9]),
+            "the colliding host Calibri/regular is dropped (embedded won)"
+        );
+    }
+
+    #[test]
+    fn merge_fonts_empty_host_is_identity() {
+        let embedded = vec![ProvidedFont {
+            family: "Roboto".to_string(),
+            weight: 400,
+            italic: false,
+            ttf: fixture_ttf(),
+        }];
+        let merged = merge_fonts(embedded.clone(), &[]);
+        assert_eq!(merged.len(), embedded.len());
+        assert_eq!(merged[0].family, "Roboto");
+        assert_eq!(merged[0].ttf, embedded[0].ttf);
     }
 
     #[test]

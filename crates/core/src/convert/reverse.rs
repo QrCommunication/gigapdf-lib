@@ -300,6 +300,21 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     super::office_import::office_to_pdf(bytes)
 }
 
+/// Phase 2 of the two-phase font flow: like [`office_to_pdf`] but also embeds the
+/// `host`-supplied faces — the families [`office_needed_fonts`] reported as
+/// referenced-but-unembedded, fetched by the host (Google Fonts / system) and
+/// handed back so styled runs lay out with the right metrics (e.g. Carlito for a
+/// Calibri reference). Faces the container embeds itself win on conflict, so this
+/// never regresses a self-embedding document; `None` for an unrecognized archive.
+///
+/// Delegates to [`super::office_import::office_to_pdf_with_fonts`].
+pub fn office_to_pdf_with_fonts(
+    bytes: &[u8],
+    host: &[crate::html::ProvidedFont],
+) -> Option<Vec<u8>> {
+    super::office_import::office_to_pdf_with_fonts(bytes, host)
+}
+
 /// The Google/system fonts an Office container **references but doesn't embed** —
 /// the two-phase host fetch list for [`office_to_pdf`] (so referenced families
 /// lay out with the right metrics). Fonts the container embeds itself, and the

@@ -2710,6 +2710,38 @@ pub extern "C" fn gp_office_needed_fonts(
     }
 }
 
+/// Office (DOCX/ODT/PPTX/XLSX/ODS/ODP) → PDF, auto-detected, phase 2 of the
+/// two-phase font flow: `fonts` carries the host-fetched faces for the families
+/// [`gp_office_needed_fonts`] reported (e.g. Carlito for a Calibri reference) so
+/// styled runs lay out with the right metrics. `fonts` is the SAME packed blob as
+/// [`gp_html_render`] (little-endian `u32 count`, then per font `u32 family_len,
+/// family utf8, u16 weight, u8 italic, u32 ttf_len, ttf bytes`); a null/empty blob
+/// behaves like [`gp_office_to_pdf`]. Faces the container embeds itself win on
+/// conflict. Null if the bytes are unrecognized. Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_office_to_pdf_with_fonts(
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    fonts_ptr: *const u8,
+    fonts_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if bytes_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
+    let blob: &[u8] = if fonts_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(fonts_ptr, fonts_len) }
+    };
+    let fonts = parse_font_blob(blob);
+    match gigapdf_core::convert::reverse::office_to_pdf_with_fonts(bytes, &fonts) {
+        Some(pdf) => unsafe { bytes_into_host(pdf, out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Image (PNG/JPEG/GIF/WebP/AVIF) → one-page PDF, format auto-detected (the
 /// image centred and fit on an A4 page). Null if the bytes are unrecognized.
 #[no_mangle]

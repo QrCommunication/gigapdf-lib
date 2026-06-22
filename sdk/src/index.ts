@@ -309,6 +309,30 @@ export class GigaPdfEngine {
     );
   }
   /**
+   * Phase 2 for {@link officeNeededFonts} — render an Office container to PDF with
+   * the host-fetched `fonts` embedded, so families the container **references but
+   * doesn't embed** (reported by {@link officeNeededFonts}) lay out with the right
+   * metrics (e.g. Carlito for a Calibri reference) instead of drifting onto the
+   * bundled fallback. Faces the container embeds itself win on conflict, so an
+   * empty `fonts` array yields exactly {@link officeToPdf}'s output. Empty array
+   * if the bytes are not a recognized Office container.
+   *
+   * @example
+   * const reqs = giga.officeNeededFonts(docx);            // phase 1: what to fetch
+   * const fonts = await Promise.all(                       // host fetches each url → TTF
+   *   (reqs ?? []).map(async (r) => ({ ...r, ttf: await fetchTtf(r.url) }))
+   * );
+   * const pdf = giga.officeToPdfWith(docx, fonts);         // phase 2: render with them
+   */
+  officeToPdfWith(office: Uint8Array, fonts: HtmlFont[] = []): Uint8Array {
+    const blob = packHtmlFonts(fonts);
+    return this._withBytes(office, (op, ol) =>
+      this._withBytes(blob, (fp, fl) =>
+        this._buffer((o) => this.ex.gp_office_to_pdf_with_fonts(op, ol, fp, fl, o))
+      )
+    );
+  }
+  /**
    * Image (PNG/JPEG/GIF/WebP/AVIF) → one-page PDF, format auto-detected: the
    * image is centred and scaled to fit on an A4 portrait page. PNG/JPEG embed
    * directly; GIF/WebP/AVIF are transcoded to PNG first — all in pure Rust/WASM,

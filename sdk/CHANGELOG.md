@@ -4,6 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Office→PDF phase-2 fonts** — `officeToPdfWith(office, fonts)` (ABI
+  `gp_office_to_pdf_with_fonts`, core `office_to_pdf_with_fonts`) completes the
+  two-phase font flow opened by `officeNeededFonts`: hand back the host-fetched
+  faces for the families a container **references but doesn't embed** (e.g.
+  Carlito for a Calibri reference) and styled runs lay out + paint with the right
+  metrics instead of drifting onto the bundled fallback. The supplied faces are
+  merged with whatever the document embeds itself — **embedded faces win on
+  conflict** — so an empty `fonts` array yields exactly `officeToPdf`'s output
+  (no regression). `fonts` uses the same packed blob as `htmlRender`.
+
 ## [0.64.0] - 2026-06-22
 
 Office↔PDF fidelity program — import all formats → PDF and export PDF → all
