@@ -4,6 +4,37 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.66.0] - 2026-06-23
+
+### Added
+
+- **HTML/CSS rendering — LibreOffice-level fidelity.** `htmlRender` gains real **CSS
+  grid** (`fr`/`minmax`/`repeat`/`span`/`auto-rows`) and **complete flexbox**
+  (basis/grow/shrink/wrap/justify/align), **multi-column** (`column-count`/`columns`/
+  `column-gap`), **pragmatic RTL/bidi** (`direction`/`dir`, RTL block/inline/run
+  layout), table fidelity (colspan/rowspan, LibreOffice-level), text styling
+  (super/sub, underline, strike), `@media`, font shorthand and further CSS-2 coverage.
+- **Document reconstruction (`structuredText`) — waves R1–R10.** Typed + populated
+  `pageBlocks` bodies, merged-cell spans, strikethrough, hyperlinks, paragraph
+  spacing, super/subscript, document outline + figure captions, list nesting +
+  continuation lines, multi-column reading order, multiple tables per page
+  (connected-component split), borderless right/decimal-aligned columns, true
+  decimal-tab alignment.
+- **PDF permissions — 8 functional flags.** `getPermissions` + correct `/P` encoding
+  of the 8 standard permission bits (print, modify, copy, annotate, fill-forms,
+  extract, assemble, high-res print).
+- **Model structural edits.** Table & sheet structural-edit ModelOps.
+
+### OCR (native `gigapdf-ocr-rten` crate — host-side, not bundled in the npm package)
+
+- Pivoted the OCR engine to **PaddleOCR PP-OCR on RTen** (pure-Rust ONNX, no C++/
+  Tesseract): 13 printed languages incl. our own **Hebrew** model, with automatic
+  per-line **script selection**.
+- **Handwriting** recognizer (`latin_hw`) — our own CRNN trained on real handwriting
+  (IAM/RIMES/NorHand/…; standard `nn.LSTM` → dynamic-width ONNX), **opt-in** via
+  `recognize_page_handwriting` / `recognize_page_with(img, "latin_hw")`.
+- Full OCR documentation refresh (architecture, training data, SDK, cookbook).
+
 ## [0.65.0] - 2026-06-22
 
 ### Added
