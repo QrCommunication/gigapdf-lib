@@ -1165,9 +1165,12 @@ impl Flow<'_> {
     /// set or the first row's per-cell `width`, normalised to fit `avail_w`
     /// (fixed-layout style); columns with no declared width share the remainder
     /// equally, so a table that declares nothing keeps **equal** columns. Cells
-    /// sit at the cumulative x of their starting column; `colspan` (including the
-    /// physical-cell expansion the Office importers emit) covers the summed
-    /// width of the columns it spans. Row height = tallest cell.
+    /// are placed onto a grid honouring both `colspan` and `rowspan`
+    /// ([`build_grid`]): a `colspan` cell covers the summed width of its columns,
+    /// a `rowspan` cell covers the summed height of its rows and reserves those
+    /// columns so the rows below shift their cells past it. A simple row's height
+    /// is its tallest 1-row cell; a `rowspan` cell that is taller than the rows
+    /// it covers grows them (deficit spread over the spanned rows).
     fn table(
         &mut self,
         el: &Element,
@@ -1178,12 +1181,13 @@ impl Flow<'_> {
         ancestors: &[&Element],
     ) -> f64 {
         y += style.margin.top;
+        let table_top = y;
         let na = push_ancestor(ancestors, el);
         let rows = collect_rows(el);
 
-        // Resolve per-column widths once for the whole table, then prefix-sum
-        // them so each cell can be placed by its starting column index.
-        let ncols = table_column_count(&rows);
+        // Place every cell on the grid (colspan + rowspan), then resolve column
+        // widths and prefix-sum them so a cell is positioned by its start column.
+        let (grid, ncols) = build_grid(&rows);
         let col_w = self.resolve_col_widths(el, style, &rows, &na, avail_w, ncols);
         let mut cum_x = Vec::with_capacity(col_w.len() + 1);
         let mut acc = 0.0;
@@ -1199,129 +1203,195 @@ impl Flow<'_> {
             (cum_x[s], (cum_x[e] - cum_x[s]).max(1.0))
         };
 
-        // Whether borders collapse (Office tables default to `collapse`). In
-        // collapse mode every shared interior edge is drawn exactly once: each
-        // cell always draws its top + left rule (its top is the table edge or
-        // the rule it shares with the cell above; its left likewise), draws its
-        // bottom only in the last row, and its right only when it reaches the
-        // last column. This yields a single-line invoice grid (no doubled
-        // traits) while still honouring each cell's own per-side border widths
-        // and colours on the table's outer boundary.
         let collapse = style.border_collapse;
         let n_rows = rows.len();
 
-        for (row_idx, row) in rows.into_iter().enumerate() {
-            let cells = collect_cells(row);
-            if cells.is_empty() {
-                continue;
-            }
-            let is_last_row = row_idx + 1 == n_rows;
-            let row_top = y;
-            let mut row_bottom = y;
-            // First pass: lay out content; remember each cell's column span, the
-            // fragment range it produced (for vertical-align shifting) and the
-            // top-down y its content reached.
-            struct Placed {
-                start: usize,
-                span: usize,
-                frag_lo: usize,
-                frag_hi: usize,
-                content_bottom: f64,
-            }
-            let mut placed: Vec<Placed> = Vec::with_capacity(cells.len());
-            let mut col = 0usize;
-            for cell in &cells {
-                let cstyle = self.style_of(cell, style, &na);
-                let span = cell_colspan(cell);
-                let (dx, cw) = span_geom(col, span);
+        // Per-placed-cell record carried from the measure pass to placement.
+        struct Placed {
+            start: usize,
+            col_span: usize,
+            row: usize,
+            row_span: usize,
+            frag_lo: usize,
+            frag_hi: usize,
+            /// Content height (top of content area → bottom of content area),
+            /// excluding the cell's own border but including padding.
+            content_h: f64,
+            /// Absolute top of the cell's content fragments as emitted in the
+            /// measure pass (= provisional row top + border.top + padding.top).
+            /// Placement translates from here to the final content top.
+            prov_content_top: f64,
+            /// Top padding (final content top = final cell top + border.top +
+            /// padding.top).
+            pad_top: f64,
+            background: Option<[f64; 3]>,
+            border_width: super::css::Edges,
+            border_color_edges: [[f64; 3]; 4],
+            vertical_align: VAlign,
+            opacity: f64,
+        }
+
+        // Provisional per-row top (set as we walk rows) and per-row height
+        // (seeded by 1-row cells; grown later by rowspan deficits).
+        let mut row_top = vec![table_top; n_rows];
+        let mut row_h = vec![0.1f64; n_rows];
+        let mut placed: Vec<Placed> = Vec::with_capacity(grid.len());
+
+        // Measure pass: lay each cell's content out once, at its anchor row's
+        // provisional top. Horizontal placement is final (column x never moves);
+        // the vertical position is corrected by a translate once row heights are
+        // resolved. `y` tracks the provisional top of the current row.
+        let mut gi = 0usize;
+        for r in 0..n_rows {
+            row_top[r] = y;
+            let mut single_row_h = 0.1f64;
+            while gi < grid.len() && grid[gi].row == r {
+                let gc = &grid[gi];
+                gi += 1;
+                let cstyle = self.style_of(gc.el, style, &na);
+                let (dx, cw) = span_geom(gc.col, gc.col_span);
                 let cx = x + dx;
-                let nca = push_ancestor(&na, cell);
+                let nca = push_ancestor(&na, gc.el);
                 let p = &cstyle.padding;
-                let content_top = row_top + p.top + cstyle.border_width.top;
+                let bw = cstyle.border_width;
+                let content_top = y + p.top + bw.top;
                 let frag_lo = self.out.len();
                 let mut cy = self.block_children(
-                    &cell.children,
+                    &gc.el.children,
                     &cstyle,
-                    cx + p.left + cstyle.border_width.left,
+                    cx + p.left + bw.left,
                     (cw - p.left - p.right).max(1.0),
                     content_top,
                     &nca,
                 );
                 let frag_hi = self.out.len();
-                cy += p.bottom + cstyle.border_width.bottom;
-                row_bottom = row_bottom.max(cy);
+                cy += p.bottom;
+                let content_h = (cy - content_top).max(0.0) + p.top;
+                // Total cell height (content + both borders) the rows it spans
+                // must accommodate.
+                let cell_h = content_h + bw.top + bw.bottom;
+                if gc.row_span <= 1 {
+                    single_row_h = single_row_h.max(cell_h);
+                }
                 placed.push(Placed {
-                    start: col,
-                    span,
+                    start: gc.col,
+                    col_span: gc.col_span,
+                    row: r,
+                    row_span: gc.row_span,
                     frag_lo,
                     frag_hi,
-                    content_bottom: cy - p.bottom - cstyle.border_width.bottom,
+                    content_h,
+                    prov_content_top: content_top,
+                    pad_top: p.top,
+                    background: cstyle.background,
+                    border_width: bw,
+                    border_color_edges: cstyle.border_color_edges,
+                    vertical_align: cstyle.vertical_align,
+                    opacity: cstyle.opacity,
                 });
-                col += span.max(1);
             }
-            let row_h = (row_bottom - row_top).max(0.1);
-
-            // Second pass: vertical-align shifting, backgrounds, per-side borders.
-            for (cell, pl) in cells.iter().zip(&placed) {
-                let cstyle = self.style_of(cell, style, &na);
-                let (dx, cw) = span_geom(pl.start, pl.span);
-                let cell_x = x + dx;
-
-                // `vertical-align`: nudge the cell's content fragments down so a
-                // short cell sits middle/bottom in a row sized by a taller peer.
-                let slack = (row_bottom - cstyle.padding.bottom - cstyle.border_width.bottom)
-                    - pl.content_bottom;
-                let shift = match cstyle.vertical_align {
-                    VAlign::Top => 0.0,
-                    VAlign::Middle => (slack / 2.0).max(0.0),
-                    VAlign::Bottom => slack.max(0.0),
-                };
-                if shift > 0.05 {
-                    for a in &mut self.out[pl.frag_lo..pl.frag_hi] {
-                        shift_fragment(&mut a.frag, 0.0, shift);
-                    }
-                }
-
-                // Background fill behind the content (z=0), no stroke.
-                if cstyle.background.is_some() {
-                    self.out.push(Abs {
-                        z: 0,
-                        zi: 0,
-                        frag: Fragment::Rect {
-                            x: cell_x,
-                            y: row_top,
-                            w: cw,
-                            h: row_h,
-                            fill: cstyle.background,
-                            stroke: None,
-                            stroke_w: 0.0,
-                            opacity: cstyle.opacity,
-                        },
-                    });
-                }
-
-                // Per-side borders. In collapse mode draw top + left always, but
-                // bottom only on the last row and right only on the last column,
-                // so interior edges (shared with the next cell down / right) are
-                // drawn exactly once. Separate mode draws all four sides.
-                let bw = &cstyle.border_width;
-                let bc = &cstyle.border_color_edges;
-                let reaches_last_col = pl.start + pl.span.max(1) >= ncols.max(1);
-                let sides = if collapse {
-                    [
-                        bw.top,
-                        if reaches_last_col { bw.right } else { 0.0 },
-                        if is_last_row { bw.bottom } else { 0.0 },
-                        bw.left,
-                    ]
-                } else {
-                    [bw.top, bw.right, bw.bottom, bw.left]
-                };
-                self.emit_border_edges(cell_x, row_top, cw, row_h, sides, bc, cstyle.opacity);
-            }
-            y = row_bottom;
+            row_h[r] = single_row_h;
+            y += single_row_h;
         }
-        y + style.margin.bottom
+
+        // Resolve rowspan deficits: a cell spanning rows `[r, r+rs)` must fit in
+        // their summed height; spread any shortfall evenly over those rows.
+        for pl in &placed {
+            if pl.row_span <= 1 {
+                continue;
+            }
+            let end = (pl.row + pl.row_span).min(n_rows);
+            let span_rows = end - pl.row;
+            if span_rows == 0 {
+                continue;
+            }
+            let have: f64 = row_h[pl.row..end].iter().sum();
+            let need = pl.content_h + pl.border_width.top + pl.border_width.bottom;
+            let deficit = need - have;
+            if deficit > 0.05 {
+                let add = deficit / span_rows as f64;
+                for h in &mut row_h[pl.row..end] {
+                    *h += add;
+                }
+            }
+        }
+
+        // Recompute the final row tops from the resolved heights.
+        let mut acc_y = table_top;
+        for r in 0..n_rows {
+            row_top[r] = acc_y;
+            acc_y += row_h[r];
+        }
+
+        // Placement pass: correct each cell vertically (translate from its
+        // provisional top to the final one), apply `vertical-align`, then emit
+        // the background and per-side borders over the cell's full merged rect.
+        for pl in &placed {
+            let (dx, cw) = span_geom(pl.start, pl.col_span);
+            let cell_x = x + dx;
+            let top = row_top[pl.row];
+            let end_row = (pl.row + pl.row_span).min(n_rows).max(pl.row + 1);
+            // Merged-cell height = sum of the rows it spans.
+            let cell_h: f64 = row_h[pl.row..end_row].iter().sum::<f64>().max(0.1);
+
+            // Translate the cell's content from its provisional top to its final
+            // top, then add the `vertical-align` slack so a short cell sits
+            // middle/bottom within a row sized by a taller peer or stretched by a
+            // rowspan. Final content top = cell top + border.top + padding.top.
+            let avail_content = (cell_h - pl.border_width.top - pl.border_width.bottom).max(0.0);
+            let slack = (avail_content - pl.content_h).max(0.0);
+            let valign_shift = match pl.vertical_align {
+                VAlign::Top => 0.0,
+                VAlign::Middle => slack / 2.0,
+                VAlign::Bottom => slack,
+            };
+            let final_content_top = top + pl.border_width.top + pl.pad_top;
+            let dy = (final_content_top - pl.prov_content_top) + valign_shift;
+            if dy.abs() > 0.05 {
+                for a in &mut self.out[pl.frag_lo..pl.frag_hi] {
+                    shift_fragment(&mut a.frag, 0.0, dy);
+                }
+            }
+
+            if let Some(fill) = pl.background {
+                self.out.push(Abs {
+                    z: 0,
+                    zi: 0,
+                    frag: Fragment::Rect {
+                        x: cell_x,
+                        y: top,
+                        w: cw,
+                        h: cell_h,
+                        fill: Some(fill),
+                        stroke: None,
+                        stroke_w: 0.0,
+                        opacity: pl.opacity,
+                    },
+                });
+            }
+
+            // Per-side borders. In collapse mode draw top + left always, bottom
+            // only when the cell reaches the last row, right only when it reaches
+            // the last column — so interior edges (shared with the next cell down
+            // / right) are drawn exactly once. Separate mode draws all four.
+            let bw = &pl.border_width;
+            let bc = &pl.border_color_edges;
+            let reaches_last_col = pl.start + pl.col_span.max(1) >= ncols.max(1);
+            let reaches_last_row = end_row >= n_rows;
+            let sides = if collapse {
+                [
+                    bw.top,
+                    if reaches_last_col { bw.right } else { 0.0 },
+                    if reaches_last_row { bw.bottom } else { 0.0 },
+                    bw.left,
+                ]
+            } else {
+                [bw.top, bw.right, bw.bottom, bw.left]
+            };
+            self.emit_border_edges(cell_x, top, cw, cell_h, sides, bc, pl.opacity);
+        }
+
+        acc_y + style.margin.bottom
     }
 
     /// Emit up to four per-side border rules for the box `(x, y, w, h)` as thin
@@ -2086,13 +2156,79 @@ fn cell_colspan(el: &Element) -> usize {
         .unwrap_or(1)
 }
 
-/// Column count of a table: the maximum, over its rows, of the sum of cell
-/// `colspan`s in that row.
-fn table_column_count(rows: &[&Element]) -> usize {
-    rows.iter()
-        .map(|r| collect_cells(r).iter().map(|c| cell_colspan(c)).sum())
-        .max()
-        .unwrap_or(0)
+/// Number of rows a cell occupies via `rowspan`, defaulting to 1. Zero/garbage
+/// clamps to 1. (`rowspan="0"`, the "span to the end of the row group" form, is
+/// rare in the Office-generated HTML we render and is treated as 1.)
+fn cell_rowspan(el: &Element) -> usize {
+    el.attr("rowspan")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
+/// One `td`/`th` resolved onto the table grid by the standard occupation
+/// algorithm: cells skip columns still covered by a `rowspan` anchored in an
+/// earlier row, so the physical `<td>` order maps to the right grid columns.
+struct GridCell<'a> {
+    el: &'a Element,
+    /// Anchor row index (into the `rows` slice — rows with no cells included).
+    row: usize,
+    /// First column the cell occupies.
+    col: usize,
+    /// Columns spanned (`colspan`, clamped ≥ 1).
+    col_span: usize,
+    /// Rows spanned (`rowspan`, clamped ≥ 1).
+    row_span: usize,
+}
+
+/// Place a table's `td`/`th` cells onto a grid honouring both `colspan` and
+/// `rowspan`. Returns the placed cells in document order plus the total column
+/// count. A `rowspan` cell reserves its columns for the rows below it, so the
+/// next row's physical cells shift past those reserved slots (rather than
+/// colliding with the spanning cell). This is the canonical HTML table model:
+/// a per-column "rows still occupied" counter, decremented once per processed
+/// row.
+fn build_grid<'a>(rows: &[&'a Element]) -> (Vec<GridCell<'a>>, usize) {
+    let mut placed: Vec<GridCell<'a>> = Vec::new();
+    // `occupied[c]` = number of *remaining* rows (counting the current one) that
+    // column `c` is covered by a rowspan anchored at or above the current row.
+    let mut occupied: Vec<usize> = Vec::new();
+    let mut ncols = 0usize;
+    for (r, row) in rows.iter().enumerate() {
+        let mut c = 0usize;
+        for cell in collect_cells(row) {
+            // Skip leading columns still covered by a rowspan from a row above.
+            while c < occupied.len() && occupied[c] > 0 {
+                c += 1;
+            }
+            let col_span = cell_colspan(cell);
+            let row_span = cell_rowspan(cell);
+            let end = c + col_span;
+            if end > occupied.len() {
+                occupied.resize(end, 0);
+            }
+            ncols = ncols.max(end);
+            // Reserve this cell's columns for `row_span` rows (the current row
+            // plus `row_span - 1` below); the end-of-row decrement turns this
+            // into exactly `row_span - 1` rows of downward coverage.
+            for slot in occupied[c..end].iter_mut() {
+                *slot = row_span;
+            }
+            placed.push(GridCell {
+                el: cell,
+                row: r,
+                col: c,
+                col_span,
+                row_span,
+            });
+            c = end;
+        }
+        // Consume the current row from every active rowspan's remaining count.
+        for slot in occupied.iter_mut() {
+            *slot = slot.saturating_sub(1);
+        }
+    }
+    (placed, ncols)
 }
 
 /// Declared width of a `<col>`: `style="width:.."` first, then a `width=".."`
@@ -2425,6 +2561,146 @@ mod tests {
         assert!(
             (c - tail).abs() < 1.0,
             "col 2 aligns across rows ({c} vs {tail})"
+        );
+    }
+
+    // y of a cell's (first) text fragment.
+    fn cell_y(layout: &Layout, label: &str) -> f64 {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .find_map(|f| match f {
+                Fragment::Text { y, text, .. } if text == label => Some(*y),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no text fragment {label:?}"))
+    }
+
+    #[test]
+    fn table_rowspan_skips_occupied_slot_in_next_row() {
+        // 2-col equal grid (270 each). The left cell of row 0 spans both rows
+        // (rowspan=2), so it reserves column 0 for row 1 — the single physical
+        // cell of row 1 must therefore land in *column 1*, not collide with the
+        // spanning cell in column 0.
+        //
+        //   row0: | Span (rowspan 2) | B0 |
+        //   row1: |     (reserved)   | C1 |
+        let layout = run(
+            "<table>\
+             <tr><td rowspan=\"2\">Span</td><td>B0</td></tr>\
+             <tr><td>C1</td></tr></table>",
+        );
+        let span = cell_x(&layout, "Span");
+        let b0 = cell_x(&layout, "B0");
+        let c1 = cell_x(&layout, "C1");
+        // Spanning cell anchors column 0 (left edge).
+        assert!((span - CELL_INSET).abs() < 1.0, "rowspan cell at col 0 ({span})");
+        // B0 sits in column 1.
+        assert!(
+            (b0 - (CELL_INSET + 270.0)).abs() < 1.0,
+            "B0 in column 1 (~309) ({b0})"
+        );
+        // C1 is pushed into column 1 (under B0), NOT column 0 where it would
+        // overlap the spanning cell — this is the whole point of rowspan
+        // occupation.
+        assert!(
+            (c1 - b0).abs() < 1.0,
+            "row-1 cell skips the reserved col 0 and aligns under B0 ({c1} vs {b0})"
+        );
+        assert!(
+            (c1 - span).abs() > 100.0,
+            "row-1 cell does NOT land on the spanning cell's column ({c1} vs {span})"
+        );
+    }
+
+    #[test]
+    fn table_rowspan_under_counts_without_occupation() {
+        // A rowspan in row 0 makes row 1 hold *more* physical cells than row 0.
+        // Counting columns by a naive per-row colspan sum (max(1, 2) = 2) would
+        // under-report; the real grid is 3 wide:
+        //   row0: | A (rowspan 2) | B0 |        (B0 → col 1; nothing in col 2)
+        //   row1: |  (reserved)   | C1 | D1 |   (C1 → col 1, D1 → col 2)
+        // So D1 must sit in column 2 (the third of three equal 180-pt columns).
+        let layout = run(
+            "<table>\
+             <tr><td rowspan=\"2\">A</td><td>B0</td></tr>\
+             <tr><td>C1</td><td>D1</td></tr></table>",
+        );
+        let b0 = cell_x(&layout, "B0");
+        let c1 = cell_x(&layout, "C1");
+        let d1 = cell_x(&layout, "D1");
+        // 3 equal columns of 180. col1 = 180, col2 = 360.
+        assert!(
+            (b0 - (CELL_INSET + 180.0)).abs() < 1.5,
+            "B0 in column 1 of a 3-col grid (~219) ({b0})"
+        );
+        assert!(
+            (c1 - (CELL_INSET + 180.0)).abs() < 1.5,
+            "C1 aligns under B0 in column 1 ({c1})"
+        );
+        assert!(
+            (d1 - (CELL_INSET + 360.0)).abs() < 1.5,
+            "D1 in column 2 (~399), proving the grid is 3 wide ({d1})"
+        );
+    }
+
+    #[test]
+    fn table_rowspan_cell_covers_both_rows_vertically() {
+        // The spanning cell's background rect must cover the full height of the
+        // two rows it spans — i.e. be taller than either single row alone, and
+        // start at the table top. A grey background makes the rect findable.
+        let layout = run(
+            "<table>\
+             <tr><td rowspan=\"2\" style=\"background:#cccccc\">S</td><td>B0</td></tr>\
+             <tr><td>C1</td></tr></table>",
+        );
+        let grey = [0.8, 0.8, 0.8];
+        // The spanning cell's background fill rect.
+        let span_rect = rects(&layout)
+            .into_iter()
+            .find(|(_, _, _, _, fill)| *fill == Some(grey))
+            .expect("a grey background rect for the spanning cell");
+        let (_sx, sy, _sw, sh, _) = span_rect;
+        // Heights of the two simple cells in column 1 give a single-row scale.
+        let b0_y = cell_y(&layout, "B0");
+        let c1_y = cell_y(&layout, "C1");
+        let one_row = c1_y - b0_y; // top-to-top distance ≈ row-0 height
+        assert!(one_row > 1.0, "the two rows are vertically separated ({one_row})");
+        // The spanning rect must be taller than a single row (it covers two).
+        assert!(
+            sh > one_row + 1.0,
+            "spanning cell rect ({sh}) is taller than one row ({one_row})"
+        );
+        // And it starts at (or above) row 0's content baseline area.
+        assert!(sy <= b0_y, "spanning rect starts at/above row 0 ({sy} vs {b0_y})");
+    }
+
+    #[test]
+    fn table_tall_rowspan_stretches_the_rows_it_spans() {
+        // A rowspan=2 cell whose content is much taller than the simple peers in
+        // the rows it spans must push the row *below* its anchor downward (the
+        // rows grow to fit). We compare the y of a cell in row 2 (outside the
+        // span) with and without a tall rowspan in rows 0–1.
+        let tall = "line ".repeat(40);
+        let with_tall = run(&format!(
+            "<table>\
+             <tr><td rowspan=\"2\">{tall}</td><td>B0</td></tr>\
+             <tr><td>C1</td></tr>\
+             <tr><td>R2L</td><td>R2R</td></tr></table>"
+        ));
+        let short = run(
+            "<table>\
+             <tr><td rowspan=\"2\">x</td><td>B0</td></tr>\
+             <tr><td>C1</td></tr>\
+             <tr><td>R2L</td><td>R2R</td></tr></table>",
+        );
+        let y_tall = cell_y(&with_tall, "R2L");
+        let y_short = cell_y(&short, "R2L");
+        assert!(
+            y_tall > y_short + 20.0,
+            "a tall rowspan grows the spanned rows, pushing row 2 down \
+             (tall {y_tall} vs short {y_short})"
         );
     }
 
