@@ -15,9 +15,9 @@ recognizers from `deepghs/paddleocr` (Hugging Face) and convert each ONNX → `.
 
 - **Hebrew** (`hebrew/`) — our trained CRNN (`tools/train_hebrew.py` → ONNX → `rten-convert`);
   PaddleOCR ships none.
-- **Handwriting** (`latin_hw/`) — the **reused** legacy CRNN, re-exported from `ocr_alpha_hw.gpocr`
-  via `tools/convert_legacy_gpocr.py` (no retraining; beat Tesseract on IAM 0.309). Grayscale H32
-  `LegacyGray32` profile, **opt-in** via `recognize_page_with(img, "latin_hw")`.
+- **Handwriting** (`latin_hw/`) — our trained CRNN (`tools/train_handwriting.py`, real IAM/RIMES/…
+  via `hw_datasets` + synthetic; standard `nn.LSTM` → **dynamic-width** ONNX → `rten-convert`).
+  Grayscale H32 `Gray32` profile, **opt-in** via `recognize_page_handwriting` / `..._with(img, "latin_hw")`.
 
 PaddleOCR PP-OCRv4/v5 covers 100+ scripts — add one by dropping `<subdir>/{model.rten,dict.txt}` in
 the models dir + an entry in `REC_MODELS` (`src/lib.rs`).
@@ -26,8 +26,7 @@ the models dir + an entry in `REC_MODELS` (`src/lib.rs`).
 - `rec_probe`: Chinese line `深度学习模型测试2026` decoded **100% correct** (conf 0.999).
 - `ocr_auto` (det + auto script selection, 13 printed recognizers): KR→`ko`, JA→`ja`, FR→`zh`,
   RU→`cyrillic` — all routed correctly; Korean & Latin perfect, Cyrillic ~90%.
-- Reused HW model (`validate_legacy_hw.py`): reads `Bonjour le monde` / `facture 2026` 100%.
-
 ## Probes / tools
-`rec_probe` (single rec), `ocr_probe` (det+rec, one model), `ocr_auto` (load all + auto-select);
-`tools/{fetch_models,train_hebrew,convert_legacy_gpocr,validate_legacy_hw}`.
+`rec_probe` (single rec), `ocr_probe` (det+rec, one model), `ocr_auto` (load all + auto-select, or
+`ocr_auto <dir> <png> latin_hw` to force the handwriting model);
+`tools/{fetch_models,train_hebrew,train_handwriting}`.

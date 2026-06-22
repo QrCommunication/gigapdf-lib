@@ -53,7 +53,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 | **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **PKCS#12 signing** (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **true redaction** (delete from stream) + **`redactPii`** *(v0.52.4)* — irreversible redaction that also **erases image pixels** (safe on scans/OCR) under an opaque mark |
 | **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images), **without its text** (`renderPageNoText`) or **omitting specific elements** (`renderPageExcluding`) for live-overlay editing; native image codecs — encode/decode PNG · JPEG · lossless WebP, decode GIF + **AVIF** (AV1 intra); alpha-correct resize |
 | **Text intelligence** | Font-aware extraction, **structured text** (reading-order lines + boxes), **full-text search** with highlight boxes |
-| **OCR** | **`gigapdf-ocr-rten`** crate (host-side) — **PaddleOCR PP-OCR** (DBNet detect + SVTR/CRNN recognize) on **RTen**, a **pure-Rust ONNX runtime (no C++, no Tesseract)**. 13 printed languages incl. **Hebrew** (own model) + Arabic (RTL), CJK, Cyrillic, Devanagari, Tamil/Telugu/Kannada, Latin — with **automatic per-line script selection** — **plus opt-in Latin handwriting** (the reused legacy CRNN, beat Tesseract on IAM). State-of-the-art (PaddleOCR beats Tesseract on most scripts) |
+| **OCR** | **`gigapdf-ocr-rten`** crate (host-side) — **PaddleOCR PP-OCR** (DBNet detect + SVTR/CRNN recognize) on **RTen**, a **pure-Rust ONNX runtime (no C++, no Tesseract)**. 13 printed languages incl. **Hebrew** (own model) + Arabic (RTL), CJK, Cyrillic, Devanagari, Tamil/Telugu/Kannada, Latin — with **automatic per-line script selection** — **plus opt-in Latin handwriting** (our own trained CRNN — IAM/RIMES/…). State-of-the-art (PaddleOCR beats Tesseract on most scripts) |
 | **Convert →** | PDF → **TXT, HTML, DOCX, PPTX, ODP, ODT, XLSX, ODS, RTF** (real editable elements, not a page image) |
 | **Convert ←** | **TXT, HTML, RTF, DOCX, ODT, ODP, PPTX, XLSX, ODS** → PDF (ODF `.odt`/`.ods`/`.odp` are fully bidirectional) · raster **PNG, JPEG, GIF, WebP, AVIF** → PDF (one A4 page, centred & shrink-to-fit) |
 | **Unified editable model** | Format-neutral document tree (sections → pages → blocks → runs): lower **any** format in (`toModel`/`officeToModel`/`htmlToModel`), edit with structured ops (`applyModelOps`), raise to **any** format (`modelTo{Docx,Xlsx,Pptx,Odt,Ods,Odp,Pdf,Html,Rtf}`) — edit every format the same way |
@@ -119,16 +119,16 @@ exposes OCR as an endpoint.
   English, Japanese, Kannada, Korean, Latin (French/German/Spanish/…), Tamil, Telugu.
   PaddleOCR PP-OCRv4/v5 covers 100+ scripts — add one by dropping its `.rten` + dict
   into the models dir (`REC_MODELS` in `crates/ocr-rten/src/lib.rs`).
-- **Handwriting (opt-in):** a Latin/Cyrillic/Greek **handwriting** recognizer (`latin_hw`) —
-  the retired engine's CRNN **reused** (re-exported to RTen, no retraining; it beat
-  Tesseract on IAM 0.309). Excluded from auto-selection (a HW model is overconfident on
-  printed input); call `recognize_page_with(img, "latin_hw")` for handwriting-heavy input.
+- **Handwriting (opt-in):** a Latin/Cyrillic/Greek **handwriting** recognizer (`latin_hw`) — our
+  own CRNN trained on real IAM/RIMES/NorHand/… lines + synthetic (standard `nn.LSTM` →
+  **dynamic-width** ONNX). Excluded from auto-selection (a HW model is overconfident on printed
+  input); call `recognize_page_handwriting(img)` for handwriting-heavy input.
 - **State of the art:** PaddleOCR beats Tesseract on most scripts. Validated: a Chinese line
   decoded 100% (conf 0.999); multilingual auto-routing (Korean→ko, Japanese→ja,
-  Russian→cyrillic) correct on a mixed page; the reused HW model reads clean Latin 100%.
-- **Models** are fetched/converted at deploy time (`crates/ocr-rten/tools/fetch_models.sh`,
-  ONNX→`.rten` via `rten-convert`); Hebrew is trained by `tools/train_hebrew.py`, the HW
-  model re-exported by `tools/convert_legacy_gpocr.py`. **Not committed** (lean package, like fonts).
+  Russian→cyrillic) correct on a mixed page.
+- **Models** are fetched/trained at deploy time (`crates/ocr-rten/tools/fetch_models.sh`,
+  ONNX→`.rten` via `rten-convert`); Hebrew by `tools/train_hebrew.py`, handwriting by
+  `tools/train_handwriting.py`. **Not committed** (lean package, like fonts).
 
 ```rust
 let eng = gigapdf_ocr_rten::OcrEngine::load_models_dir("models")?;

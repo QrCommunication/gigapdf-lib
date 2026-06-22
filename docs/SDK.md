@@ -344,7 +344,7 @@ per-line **script selection** (each line routed to the highest-confidence printe
 separate classifier). **13 printed languages**: Arabic (RTL), **Hebrew** (RTL, our own trained
 model), Simplified/Traditional Chinese, Japanese, Korean, Cyrillic, Devanagari, Tamil, Telugu,
 Kannada, English, Latin (FR/DE/ES/…). Plus **opt-in Latin/Cyrillic/Greek handwriting** (`latin_hw`,
-the reused legacy CRNN).
+our own trained CRNN — real IAM/RIMES/… handwriting, dynamic-width).
 
 Rust API (`gigapdf_ocr_rten`):
 

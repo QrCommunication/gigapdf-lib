@@ -18,7 +18,7 @@ const DET_BIN_THRESH: f32 = 0.3; // DBNet probability-map binarization threshold
 
 /// Language manifest: (display name, models-dir subdirectory, RTL?, input profile). PaddleOCR
 /// PP-OCRv3/v4 rec models (shared DBNet detector) + our own Hebrew model (PaddleOCR has none) +
-/// the reused legacy handwriting recognizer (gigapdf's own CRNN, grayscale H32). One DBNet detector
+/// our own Latin/Cyrillic/Greek handwriting recognizer (grayscale H32 CRNN). One DBNet detector
 /// covers every script; only the recognizer + dict (+ input profile) vary.
 pub const REC_MODELS: &[(&str, &str, bool, Profile)] = &[
     ("ar", "arabic_PP-OCRv3_rec", true, Profile::PaddleStd),   // Arabic — RTL
@@ -34,24 +34,20 @@ pub const REC_MODELS: &[(&str, &str, bool, Profile)] = &[
     ("latin", "latin_PP-OCRv3_rec", false, Profile::PaddleStd), // French/German/Spanish/… (printed Latin)
     ("ta", "ta_PP-OCRv3_rec", false, Profile::PaddleStd),      // Tamil
     ("te", "te_PP-OCRv3_rec", false, Profile::PaddleStd),      // Telugu
-    // Reused legacy handwriting CRNN (Latin/Cyrillic/Greek) — grayscale H32, beat Tesseract on IAM.
-    ("latin_hw", "latin_hw", false, Profile::LegacyGray32),
+    // Our Latin/Cyrillic/Greek handwriting CRNN (tools/train_handwriting.py) — grayscale H32.
+    ("latin_hw", "latin_hw", false, Profile::Gray32),
 ];
 
 /// Recognizer input/output convention. PaddleOCR: RGB H48, CTC blank-first, dict = `[blank]+chars+[space]`.
-/// LegacyGray32: gigapdf's reused CRNN — grayscale H32 ink image at a fixed width, CTC blank-last over
-/// a direct alphabet.
+/// Gray32: our handwriting CRNN — grayscale H32 ink image at its NATURAL (dynamic) width, CTC
+/// blank-last over a direct alphabet. (Standard `nn.LSTM` → dynamic-width ONNX, so no padding.)
 #[derive(Clone, Copy, PartialEq)]
 pub enum Profile {
     PaddleStd,
-    LegacyGray32,
+    Gray32,
 }
 
-const LEGACY_H: usize = 32; // legacy CRNN strip height
-const LEGACY_W: usize = 800; // legacy ONNX fixed width (custom GRU unrolls → fixed length); must
-                             // match convert_legacy_gpocr.py's export width. NB: long trailing
-                             // padding degrades the backward GRU → accuracy caps below the model's
-                             // isolated quality; a dynamic-width export (ONNX Loop) would lift it.
+const GRAY_H: usize = 32; // grayscale handwriting-recognizer strip height (width is dynamic)
 
 /// Name of the bundled handwriting recognizer. Pass to [`OcrEngine::recognize_page_with`] /
 /// [`OcrEngine::recognize_line_with`], or use [`OcrEngine::recognize_page_handwriting`].
@@ -96,7 +92,7 @@ pub struct RecModel {
     model: Model,
     /// `chars[i]` is the char for output class `i` (the blank class maps to nothing).
     chars: Vec<String>,
-    /// CTC blank class index (0 for PaddleStd, `chars.len()` for LegacyGray32).
+    /// CTC blank class index (0 for PaddleStd, `chars.len()` for Gray32).
     blank: usize,
     profile: Profile,
     /// True for RTL scripts — the CTC output is in visual L→R order, so we reverse to logical.
@@ -124,8 +120,8 @@ fn load_charlist(
             chars.push(" ".to_string());
             Ok((chars, 0))
         }
-        Profile::LegacyGray32 => {
-            // Legacy CRNN: dict IS the alphabet (idx i → char), blank = len(alphabet) = last class.
+        Profile::Gray32 => {
+            // Handwriting CRNN: dict IS the alphabet (idx i → char), blank = len(alphabet) = last.
             let chars: Vec<String> = raw.lines().map(str::to_string).collect();
             let blank = chars.len();
             Ok((chars, blank))
@@ -355,10 +351,10 @@ impl OcrEngine {
                 }
                 NdTensor::from_data([1, 3, REC_H, w], data)
             }
-            Profile::LegacyGray32 => {
-                // Match the legacy trainer's render: ink = 1 − gray (dark text → 1), TIGHT-CROP to
-                // the ink bounding box, resize to height 32, right-pad to the fixed LEGACY_W (the
-                // legacy ONNX has an unrolled GRU → fixed length); bg = 0.
+            Profile::Gray32 => {
+                // Handwriting CRNN: ink = 1 − gray (dark text → 1), TIGHT-CROP to the ink bounding
+                // box, resize to height 32 at its NATURAL width (the standard-LSTM ONNX is dynamic
+                // — no padding, so the backward pass sees the real line end). bg = 0.
                 let (lw, lh) = (line.width() as usize, line.height() as usize);
                 let ink = |px: &image::Rgb<u8>| 1.0 - (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0 / 255.0;
                 let (mut x0, mut y0, mut x1, mut y1) = (lw, lh, 0usize, 0usize);
@@ -379,15 +375,15 @@ impl OcrEngine {
                     (0, 0, lw as u32, lh as u32)
                 };
                 let cropped = image::imageops::crop_imm(line, cx, cy, cw, ch).to_image();
-                let w32 = (((LEGACY_H as f32) * cw as f32 / ch as f32).round().max(1.0) as usize).min(LEGACY_W);
-                let resized = image::imageops::resize(&cropped, w32 as u32, LEGACY_H as u32, FilterType::Triangle);
-                let mut data = vec![0f32; LEGACY_H * LEGACY_W];
-                for y in 0..LEGACY_H {
-                    for x in 0..w32 {
-                        data[y * LEGACY_W + x] = ink(resized.get_pixel(x as u32, y as u32));
+                let w = (((GRAY_H as f32) * cw as f32 / ch as f32).round().max(1.0) as usize).max(8);
+                let resized = image::imageops::resize(&cropped, w as u32, GRAY_H as u32, FilterType::Triangle);
+                let mut data = vec![0f32; GRAY_H * w];
+                for y in 0..GRAY_H {
+                    for x in 0..w {
+                        data[y * w + x] = ink(resized.get_pixel(x as u32, y as u32));
                     }
                 }
-                NdTensor::from_data([1, 1, LEGACY_H, LEGACY_W], data)
+                NdTensor::from_data([1, 1, GRAY_H, w], data)
             }
         };
         let logits: NdTensor<f32, 3> = m.model.run_one((&input).into(), None)?.try_into()?;

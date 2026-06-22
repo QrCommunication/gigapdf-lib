@@ -48,15 +48,27 @@ so a compact CRNN+CTC trains well on synthetic data. Trainer: **`crates/ocr-rten
 - **Run:** `python train_hebrew.py --fonts ~/hebrew_fonts --out models/ocr_hebrew --nlines 20000 --epochs 20`.
   Drop the resulting `.rten` + dict into `<models_dir>/hebrew/{model.rten,dict.txt}`.
 
-## 3. Handwriting (`latin_hw`) — reused, not trained
+## 3. Handwriting (`latin_hw`) — our own trained CRNN
 
-PaddleOCR is printed-text only. For **handwriting** (Latin/Cyrillic/Greek) we **reuse** the retired
-engine's already-trained CRNN — no new training, no data. `tools/convert_legacy_gpocr.py` parses
-`ocr_alpha_hw.gpocr` (the old handwriting model that beat Tesseract on IAM, CER 0.309), rebuilds the
-CRNN, loads its weights (GPO1 int8 × per-layer scale → f32), and exports ONNX → `.rten`. It keeps the
-legacy input convention (grayscale H32, ink=1, fixed width, blank-last) — the `LegacyGray32` profile
-— and is **opt-in** (`recognize_page_with(img, "latin_hw")`), since a handwriting model is
+PaddleOCR is printed-text only. For **handwriting** (Latin/Cyrillic/Greek) we train our own
+CRNN — **`tools/train_handwriting.py`** — on the `alpha` alphabet (557 chars: Latin-ext + Cyrillic +
+Greek), using:
+
+- **Real handwriting lines** (the gold data) via `hw_datasets` (ungated HF mirrors, cached in
+  `/tmp/ocr_hw`): IAM, RIMES, NorHand, NewsEye, Belfort, POPP, Esposalles (Latin) + a synthetic
+  Cyrillic-handwriting set — ~100k real lines.
+- **Synthetic lines** from `corpora` × fonts, with a handwriting-font fraction (`GIGA_OCR_HW_FRAC`)
+  for breadth on glyphs the real corpora under-cover (Cyrillic/Greek).
+
+Architecture: conv backbone → bidirectional **`nn.LSTM`** → CTC. Exported to a **dynamic-width**
+ONNX (standard LSTM op) so the engine feeds each line at its natural width — no fixed-width padding.
+Strip convention: grayscale H32, ink=1, blank-last (the `Gray32` profile). **Opt-in**
+(`recognize_page_handwriting` / `recognize_page_with(img, "latin_hw")`), since a handwriting model is
 overconfident on printed/other-script input and must not enter auto script selection.
+
+Run: `PYTHONPATH=tools/ocr GIGA_OCR_HW_REAL="iam,rimes,belfort,esposalles,newseye,norhand,popp,cyrillic"
+GIGA_OCR_HW_FRAC=0.45 python train_handwriting.py --out models/ocr_handwriting --nlines 40000 --epochs 30`,
+then `rten-convert` → `<models_dir>/latin_hw/{model.rten,dict.txt}`.
 
 ## 4. Adding a new language
 
