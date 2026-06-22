@@ -60,6 +60,18 @@ augmentation (blur + sensor noise)─┘            → train_ocr_crnn.py (CRNN 
 
 **Honest reading:** on these complex Brahmic/SE-Asian scripts, **mature Tesseract beats gigapdf** on clean synthetic print. The large val→full-pipeline gap (e.g. Kannada 0.13 → 0.85) shows the loss is largely in the **front-end line-segmentation** for dense conjunct scripts, not the recognizer itself (the model's held-out val is strong). gigapdf's value on these scripts is **zero-dependency, in-WASM, client-side coverage** — no Tesseract binary, no model download — *not* accuracy superiority here. Closing the gap needs script-aware line/glyph segmentation + real-data fine-tuning, tracked as follow-up. (Latin/Tamil/Devanagari/Chinese-handwriting, where gigapdf *does* match or beat Tesseract, are the trained-and-validated wins above.)
 
+| 19 | **CRITICAL FIX — host `.gpocr` was int8 and silently COLLAPSED on non-Latin** (recurrent GRU compounds per-tensor int8 rounding over a line → ASCII garbage despite a great float val; never caught because the trainer validated only the float net). Host blobs switched to **full-precision f32 (GPO2)** + int8/blob guardrail (`int8_eval.py`; trainer now prints `int8_CER`). Inference made generic over weight type — `i8` feature-baked path byte-identical (alpha still beats Tesseract), `f32` host path exact. | **`int8_CER == float` exactly** (thai 0.4905, telu 0.4608, mlym 0.3842) | THE fix: before it, **every host-loaded non-Latin model (jpn/kor/cjk + all breadth) decoded to garbage in production**. After it they decode real script text (Malayalam `ലോകത്തിന്റെ`→`ലൊകത്തിനറ`). Front-end healthy (compile-time alpha pipeline 0.289 < Tesseract 0.53). Retrained at GPO2, balanced config (24k lines, 96 fonts, 6 jobs). |
+
+### GPO2 breadth wave 1 vs Tesseract 5.3.4 (synthetic full-page bench)
+
+| Script | gigapdf CER (val / pipeline) | Tesseract CER | Verdict |
+|--------|------------------------------|---------------|---------|
+| Malayalam (`mlym`) | 0.38 / **0.34** | 0.13 | Tesseract wins; no pipeline gap, decodes real text |
+| Telugu (`telu`) | 0.46 / 0.71 | 0.10 | Tesseract wins + residual front-end gap |
+| Thai (`thai`) | 0.49 / 0.88 | 0.19 | Tesseract wins + larger front-end gap |
+
+**Honest verdict:** the models now **work** (real-script decode, not garbage — int8 collapse fixed), but **Tesseract still wins** on these complex scripts. gigapdf's value stays zero-dep in-WASM coverage. Malayalam tracks its val (no front-end gap); Telugu/Thai keep a val→pipeline gap → script-aware segmentation is the next lever. Capacity-limited scripts (Kannada/Gujarati/Gurmukhi) plateau ~0.65-0.73 val → would need a bigger backbone.
+
 CER here is **per-character on held-out validation strips** (same render distribution),
 measured inside the trainer — it isolates the *model*, not the full image pipeline.
 
