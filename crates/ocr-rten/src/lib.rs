@@ -24,59 +24,107 @@ pub struct BBox {
     pub y1: u32,
 }
 
-/// One recognized line: its box, decoded text, and mean per-step confidence.
+/// One recognized line: its box, decoded text, mean per-step confidence, and which rec model won.
 #[derive(Clone, Debug)]
 pub struct Line {
     pub bbox: BBox,
     pub text: String,
     pub confidence: f32,
+    pub model: String,
 }
 
-/// A loaded PaddleOCR detection+recognition pair plus its CTC character list.
-pub struct OcrEngine {
-    det: Model,
-    rec: Model,
+/// A loaded recognition model: its CTC charlist plus a right-to-left flag (Hebrew/Arabic).
+pub struct RecModel {
+    pub name: String,
+    model: Model,
     /// CTC charlist: index 0 = blank, 1..=N = dict chars, last = space.
     chars: Vec<String>,
+    /// True for RTL scripts — the CTC output is in visual L→R order, so we reverse to logical.
+    pub rtl: bool,
+}
+
+/// A shared (language-agnostic) DBNet detector plus one or more recognition models. With several
+/// recs loaded, lines are routed by **confidence-based script selection** (highest mean CTC logit).
+pub struct OcrEngine {
+    det: Model,
+    recs: Vec<RecModel>,
+}
+
+fn load_charlist(dict: impl AsRef<Path>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(dict)?;
+    let mut chars = Vec::with_capacity(raw.lines().count() + 2);
+    chars.push(String::new()); // 0 = blank
+    chars.extend(raw.lines().map(str::to_string)); // 1..=N
+    chars.push(" ".to_string()); // trailing space (use_space_char)
+    Ok(chars)
 }
 
 impl OcrEngine {
-    /// Load a detection model, a recognition model and the recognition dictionary.
+    /// Build an engine with only the (shared) detection model; add rec models with `add_rec`.
+    pub fn new(det: impl AsRef<Path>) -> Result<OcrEngine, Box<dyn std::error::Error>> {
+        Ok(OcrEngine { det: Model::load_file(det.as_ref())?, recs: Vec::new() })
+    }
+
+    /// Register a recognition model (its dict + RTL flag) under `name`.
+    pub fn add_rec(
+        &mut self,
+        name: impl Into<String>,
+        rec: impl AsRef<Path>,
+        dict: impl AsRef<Path>,
+        rtl: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.recs.push(RecModel {
+            name: name.into(),
+            model: Model::load_file(rec.as_ref())?,
+            chars: load_charlist(dict)?,
+            rtl,
+        });
+        Ok(())
+    }
+
+    /// Convenience: detector + a single LTR recognition model (back-compat with the probes).
     pub fn load(
         det: impl AsRef<Path>,
         rec: impl AsRef<Path>,
         dict: impl AsRef<Path>,
     ) -> Result<OcrEngine, Box<dyn std::error::Error>> {
-        let dict_chars = std::fs::read_to_string(dict)?;
-        let mut chars = Vec::with_capacity(dict_chars.lines().count() + 2);
-        chars.push(String::new()); // 0 = blank
-        chars.extend(dict_chars.lines().map(str::to_string));
-        chars.push(" ".to_string()); // trailing space (use_space_char)
-        Ok(OcrEngine {
-            det: Model::load_file(det.as_ref())?,
-            rec: Model::load_file(rec.as_ref())?,
-            chars,
-        })
+        let mut e = OcrEngine::new(det)?;
+        e.add_rec("default", rec, dict, false)?;
+        Ok(e)
     }
 
-    /// Full page → recognized lines (detect text regions, recognize each, top-to-bottom).
+    /// Full page → recognized lines (detect, recognize each via best-confidence rec, reading order).
     pub fn recognize_page(&self, img: &RgbImage) -> Result<Vec<Line>, Box<dyn std::error::Error>> {
         let mut boxes = self.detect(img)?;
-        // Reading order: top-to-bottom, then left-to-right.
-        boxes.sort_by_key(|b| (b.y0 / 10, b.x0));
+        boxes.sort_by_key(|b| (b.y0 / 10, b.x0)); // top-to-bottom, then left-to-right
         let mut out = Vec::with_capacity(boxes.len());
         for b in boxes {
             let crop = image::imageops::crop_imm(img, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0).to_image();
-            let (text, confidence) = self.recognize_line(&crop)?;
+            let (text, confidence, model) = self.recognize_line_auto(&crop)?;
             if !text.trim().is_empty() {
-                out.push(Line { bbox: b, text, confidence });
+                out.push(Line { bbox: b, text, confidence, model });
             }
         }
         Ok(out)
     }
 
-    /// Recognize one already-cropped text line.
-    pub fn recognize_line(&self, line: &RgbImage) -> Result<(String, f32), Box<dyn std::error::Error>> {
+    /// Recognize one cropped line, auto-selecting the rec model with the highest confidence.
+    pub fn recognize_line_auto(
+        &self,
+        line: &RgbImage,
+    ) -> Result<(String, f32, String), Box<dyn std::error::Error>> {
+        let (mut best, mut best_conf, mut best_name) = (String::new(), f32::NEG_INFINITY, "");
+        for m in &self.recs {
+            let (text, conf) = self.decode(m, line)?;
+            if conf > best_conf {
+                (best, best_conf, best_name) = (text, conf, m.name.as_str());
+            }
+        }
+        Ok((best, best_conf.max(0.0), best_name.to_string()))
+    }
+
+    /// Run one rec model on a cropped line → (text, mean confidence). Reverses RTL output to logical.
+    fn decode(&self, m: &RecModel, line: &RgbImage) -> Result<(String, f32), Box<dyn std::error::Error>> {
         let (w0, h0) = (line.width().max(1) as f32, line.height().max(1) as f32);
         let new_w = ((REC_H as f32) * w0 / h0).round().max(1.0) as u32;
         let resized = image::imageops::resize(line, new_w, REC_H as u32, FilterType::Triangle);
@@ -91,10 +139,10 @@ impl OcrEngine {
             }
         }
         let input: NdTensor<f32, 4> = NdTensor::from_data([1, 3, REC_H, w], data);
-        let logits: NdTensor<f32, 3> = self.rec.run_one((&input).into(), None)?.try_into()?;
+        let logits: NdTensor<f32, 3> = m.model.run_one((&input).into(), None)?.try_into()?;
         let (t_len, n_cls) = (logits.shape()[1], logits.shape()[2]);
         let mut prev = usize::MAX;
-        let (mut text, mut conf_sum) = (String::new(), 0f32);
+        let (mut chars_out, mut conf_sum) = (Vec::<&str>::new(), 0f32);
         for t in 0..t_len {
             let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
             for c in 0..n_cls {
@@ -105,13 +153,17 @@ impl OcrEngine {
             }
             conf_sum += bv;
             if bi != prev && bi != 0 {
-                if let Some(ch) = self.chars.get(bi) {
-                    text.push_str(ch);
+                if let Some(ch) = m.chars.get(bi) {
+                    chars_out.push(ch);
                 }
             }
             prev = bi;
         }
-        Ok((text, conf_sum / t_len.max(1) as f32))
+        // RTL: the model emits glyphs in visual L→R order; reverse the token sequence to logical.
+        if m.rtl {
+            chars_out.reverse();
+        }
+        Ok((chars_out.concat(), conf_sum / t_len.max(1) as f32))
     }
 
     /// DBNet text detection → axis-aligned line boxes (original-image coords).

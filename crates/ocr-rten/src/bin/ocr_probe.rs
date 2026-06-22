@@ -15,8 +15,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{} line(s) detected", lines.len());
     for l in &lines {
         println!(
-            "[{:.2}] ({},{})-({},{}) {}",
-            l.confidence, l.bbox.x0, l.bbox.y0, l.bbox.x1, l.bbox.y1, l.text
+            "[{:.2}|{}] ({},{})-({},{}) {}",
+            l.confidence, l.model, l.bbox.x0, l.bbox.y0, l.bbox.x1, l.bbox.y1, l.text
         );
     }
     Ok(())
