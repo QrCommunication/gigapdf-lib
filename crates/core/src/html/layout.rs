@@ -1028,12 +1028,14 @@ impl Flow<'_> {
                     cx += iw + space_w;
                 }
                 None => {
+                    // `vertical-align: super|sub` raises/lowers the run's baseline
+                    // within the line (negative = up). Width/advance are unchanged.
                     self.out.push(Abs {
                         z: 1,
                         zi: 0,
                         frag: Fragment::Text {
                             x: cx,
-                            y: *y,
+                            y: *y + w.style.valign_shift,
                             style: w.style.clone(),
                             text: w.text.clone(),
                         },
@@ -3091,6 +3093,61 @@ mod tests {
         });
         let st = st.expect("the text run");
         assert!(st.strike && st.overline, "line-through + overline flagged");
+    }
+
+    /// Find the (font_size, top-down y) of the first text run whose text equals
+    /// `needle`, across all pages.
+    fn run_metrics(layout: &Layout, needle: &str) -> Option<(f64, f64)> {
+        layout.pages.iter().flatten().find_map(|f| match f {
+            Fragment::Text { style, text, y, .. } if text == needle => Some((style.font_size, *y)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn sup_run_is_smaller_and_raised() {
+        // `x<sup>2</sup>`: the superscript "2" must be a smaller font AND sit
+        // higher on the page (smaller top-down y) than the base "x".
+        let layout = run("<p>x<sup>2</sup></p>");
+        let (base_sz, base_y) = run_metrics(&layout, "x").expect("base run");
+        let (sup_sz, sup_y) = run_metrics(&layout, "2").expect("superscript run");
+        assert!(
+            sup_sz < base_sz,
+            "superscript glyph is smaller ({sup_sz} < {base_sz})"
+        );
+        assert!(
+            sup_y < base_y - 1.0,
+            "superscript baseline is raised (top-down y {sup_y} < {base_y})"
+        );
+    }
+
+    #[test]
+    fn sub_run_is_smaller_and_lowered() {
+        // `H<sub>2</sub>O`: the subscript "2" must be smaller AND sit lower on
+        // the page (larger top-down y) than the base "H".
+        let layout = run("<p>H<sub>2</sub>O</p>");
+        let (base_sz, base_y) = run_metrics(&layout, "H").expect("base run");
+        let (sub_sz, sub_y) = run_metrics(&layout, "2").expect("subscript run");
+        assert!(
+            sub_sz < base_sz,
+            "subscript glyph is smaller ({sub_sz} < {base_sz})"
+        );
+        assert!(
+            sub_y > base_y + 1.0,
+            "subscript baseline is lowered (top-down y {sub_y} > {base_y})"
+        );
+    }
+
+    #[test]
+    fn explicit_vertical_align_length_raises_the_run() {
+        // `vertical-align: 5px` (positive = up in CSS) raises the run; the
+        // shifted run's top-down y is above its un-shifted sibling.
+        let layout = run(
+            r#"<p><span>base</span><span style="vertical-align:5px">up</span></p>"#,
+        );
+        let (_, base_y) = run_metrics(&layout, "base").expect("base run");
+        let (_, up_y) = run_metrics(&layout, "up").expect("raised run");
+        assert!(up_y < base_y, "explicit length raised the run ({up_y} < {base_y})");
     }
 
     #[test]

@@ -53,6 +53,26 @@ pub enum VAlign {
     Bottom,
 }
 
+/// Inline `vertical-align` for super/subscript text. The table-cell values are
+/// modelled separately by [`VAlign`]; this carries the baseline shift that moves
+/// a run up (super) or down (sub) relative to the surrounding text. The cascade
+/// resolves it to an absolute point offset in `Style::valign_shift` using the
+/// *parent* font-size, so a shrunk `<sup>` glyph still lifts by the right amount.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum VShift {
+    /// `baseline` (the default) — no vertical shift.
+    #[default]
+    Baseline,
+    /// `super` — raise by ~⅓ of the parent em.
+    Super,
+    /// `sub` — lower by ~⅕ of the parent em.
+    Sub,
+    /// An explicit `vertical-align: <length>` or `<percentage>` already resolved
+    /// to points (positive = raise the run, matching CSS). Percentages resolve
+    /// against the element's own font-size at parse time.
+    Points(f64),
+}
+
 /// CSS `position`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Position {
@@ -212,6 +232,14 @@ pub struct Style {
     pub word_spacing: f64,
     /// `float` direction, if any — floated boxes are taken beside inline flow.
     pub float: FloatSide,
+    /// Inline `vertical-align` (super/sub/length) for THIS run, before cascade
+    /// resolves it to a point offset. Not inherited (resets to `baseline`).
+    pub valign: VShift,
+    /// Resolved super/subscript baseline offset in points, top-down: a negative
+    /// value raises the run (super), a positive value lowers it (sub). Computed
+    /// during cascade from the *parent* em so a shrunk glyph still shifts by the
+    /// surrounding text's scale. Not inherited.
+    pub valign_shift: f64,
 }
 
 /// CSS `float` side.
@@ -356,6 +384,8 @@ impl Default for Style {
             letter_spacing: 0.0,
             word_spacing: 0.0,
             float: FloatSide::None,
+            valign: VShift::Baseline,
+            valign_shift: 0.0,
         }
     }
 }
@@ -645,7 +675,17 @@ impl Stylesheet {
         if let Some(inline) = el.attr("style") {
             apply_decls(&mut style, &parse_decls(inline));
         }
-        // Tag-driven defaults the UA sheet can't express as inheritance.
+        // Resolve the inline super/subscript shift to a top-down point offset.
+        // Keyword shifts use the *parent* em so a shrunk `<sup>` glyph still
+        // lifts by the surrounding text's scale; explicit lengths are kept as-is.
+        // Top-down sign: negative raises (super), positive lowers (sub).
+        let parent_em = parent.font_size;
+        style.valign_shift = match style.valign {
+            VShift::Baseline => 0.0,
+            VShift::Super => -parent_em * 0.33,
+            VShift::Sub => parent_em * 0.20,
+            VShift::Points(p) => -p, // CSS positive = up ⇒ negative top-down
+        };
         style
     }
 }
@@ -717,6 +757,9 @@ fn inherit(parent: &Style) -> Style {
         grid_col_start: 0,
         grid_row_start: 0,
         float: FloatSide::None,
+        // `vertical-align` is not inherited; super/sub apply to the run only.
+        valign: VShift::Baseline,
+        valign_shift: 0.0,
     }
 }
 
@@ -1085,10 +1128,30 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             }
         }
         "vertical-align" => {
+            // Table-cell box alignment (kept) — the inline super/sub values map
+            // to `top` here since a single-line cell fills its row.
             style.vertical_align = match v {
                 "middle" => VAlign::Middle,
                 "bottom" | "text-bottom" => VAlign::Bottom,
-                _ => VAlign::Top, // top, baseline, sub, super, … ⇒ top in our model
+                _ => VAlign::Top,
+            };
+            // Inline baseline shift for super/subscript text. Lengths/percentages
+            // resolve against the run's own font-size; `%` is positive-up like CSS.
+            style.valign = match v {
+                "super" => VShift::Super,
+                "sub" => VShift::Sub,
+                "baseline" | "top" | "middle" | "bottom" | "text-top" | "text-bottom" => {
+                    VShift::Baseline
+                }
+                _ => {
+                    if let Some(p) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f64>().ok()) {
+                        VShift::Points(style.font_size * p / 100.0)
+                    } else if let Some(pt) = parse_len_px(v, style.font_size) {
+                        VShift::Points(pt)
+                    } else {
+                        VShift::Baseline
+                    }
+                }
             };
         }
         "border-collapse" => style.border_collapse = v == "collapse",
@@ -1368,7 +1431,11 @@ h5 { display: block; font-size: 12pt; font-weight: bold; margin-top: 8pt; margin
 h6 { display: block; font-size: 11pt; font-weight: bold; margin-top: 8pt; margin-bottom: 5pt; }
 b, strong { font-weight: bold; }
 i, em { font-style: italic; }
-u { text-decoration: underline; }
+u, ins { text-decoration: underline; }
+s, strike, del { text-decoration: line-through; }
+sup { font-size: 0.75em; vertical-align: super; }
+sub { font-size: 0.75em; vertical-align: sub; }
+mark { background: #ffff00; }
 a { color: #0645ad; text-decoration: underline; }
 ul, ol { margin-top: 8pt; margin-bottom: 8pt; padding-left: 30pt; }
 li { display: list-item; }
@@ -1528,6 +1595,58 @@ mod tests {
         );
         assert!(inline_style("border-collapse:collapse").border_collapse);
         assert!(!inline_style("border-collapse:separate").border_collapse);
+    }
+
+    #[test]
+    fn inline_vertical_align_super_sub_parse() {
+        assert_eq!(inline_style("vertical-align:super").valign, VShift::Super);
+        assert_eq!(inline_style("vertical-align:sub").valign, VShift::Sub);
+        assert_eq!(
+            inline_style("vertical-align:baseline").valign,
+            VShift::Baseline
+        );
+        // A length resolves to points (positive-up retained in the variant).
+        match inline_style("font-size:20pt;vertical-align:4pt").valign {
+            VShift::Points(p) => assert!((p - 4.0).abs() < 0.5, "4pt → ~4 points ({p})"),
+            other => panic!("expected Points, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cascade_resolves_super_sub_shift_from_parent_em() {
+        // <sup> inside a 20pt parent: UA shrinks it to 15pt, and the shift is
+        // computed from the PARENT em (20pt), top-down negative = raised.
+        let nodes = parse("<p style=\"font-size:20pt\">x<sup>2</sup></p>");
+        let p = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "p" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let sheet = Stylesheet::new("");
+        let pstyle = sheet.computed(p, &Style::default(), &[]);
+        let sup = p
+            .children
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e) if e.tag == "sup" => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let sup_style = sheet.computed(sup, &pstyle, &[p]);
+        assert!(
+            sup_style.font_size < pstyle.font_size,
+            "superscript shrinks ({} < {})",
+            sup_style.font_size,
+            pstyle.font_size
+        );
+        // Parent em 20pt × 0.33 ≈ 6.6, raised ⇒ negative.
+        assert!(
+            sup_style.valign_shift < -3.0,
+            "superscript raised from parent em (shift {})",
+            sup_style.valign_shift
+        );
     }
 
     #[test]

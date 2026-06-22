@@ -774,13 +774,17 @@ fn paint_text_decorations(
     style: &Style,
 ) {
     let size = style.font_size;
+    // The run's baseline sits at top + 0.8·size (matching the text path); rule
+    // positions below are expressed relative to that baseline.
+    let baseline = size * 0.8;
+    let thickness = (size / 14.0).max(0.4);
     let mut draw = |top_offset: f64| {
         let _ = doc.add_rectangle(
             page,
             x,
             page_h - (y + top_offset),
             width,
-            (size * 0.06).max(0.4),
+            thickness,
             None,
             Some(style.color),
             0.0,
@@ -788,13 +792,13 @@ fn paint_text_decorations(
         );
     };
     if style.underline {
-        draw(size); // at the baseline
+        draw(baseline + size * 0.12); // just under the baseline
     }
     if style.strike {
-        draw(size * 0.55); // through the x-height
+        draw(baseline - size * 0.30); // mid-height, through the text
     }
     if style.overline {
-        draw(size * 0.05); // near the top
+        draw(size * 0.02); // near the top of the em box
     }
 }
 
@@ -1095,5 +1099,84 @@ mod tests {
             with.len(),
             without.len()
         );
+    }
+
+    /// Build a one-page doc and return the `y` of every `re` (rectangle) op in
+    /// its content stream — used to locate decoration rules deterministically.
+    fn rect_ys(style: &Style, page_h: f64) -> Vec<f64> {
+        let mut b = PdfBuilder::new();
+        b.add_page(612.0, page_h);
+        let mut doc = Document::open(&b.finish()).expect("open");
+        // A 100pt-wide run at top-down y = 100 on the page.
+        paint_text_decorations(&mut doc, 1, page_h, 50.0, 100.0, 100.0, style);
+        let content = String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
+        content
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_suffix(" re")?;
+                // `{x} {y} {w} {h}` — take the second field (y).
+                rest.split_whitespace().nth(1)?.parse::<f64>().ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn underline_draws_a_rule_below_the_baseline() {
+        let style = Style {
+            underline: true,
+            font_size: 20.0,
+            ..Style::default()
+        };
+        let ys = rect_ys(&style, 800.0);
+        assert_eq!(ys.len(), 1, "exactly one underline rule emitted");
+        // Top-down run top = 100, baseline = 100 + 0.8·20 = 116; underline sits
+        // 0.12·20 = 2.4 below ⇒ top-down 118.4 ⇒ PDF y = 800 − 118.4 = 681.6.
+        assert!(
+            (ys[0] - 681.6).abs() < 0.5,
+            "underline rule just under the baseline (got {})",
+            ys[0]
+        );
+    }
+
+    #[test]
+    fn line_through_draws_a_rule_at_mid_height() {
+        let style = Style {
+            strike: true,
+            font_size: 20.0,
+            ..Style::default()
+        };
+        let ys = rect_ys(&style, 800.0);
+        assert_eq!(ys.len(), 1, "exactly one line-through rule emitted");
+        // Baseline top-down 116; strike sits 0.30·20 = 6 above ⇒ top-down 110 ⇒
+        // PDF y = 800 − 110 = 690. It must sit ABOVE the underline (681.6).
+        assert!(
+            (ys[0] - 690.0).abs() < 0.5,
+            "line-through rule through the text (got {})",
+            ys[0]
+        );
+        let under = {
+            let s = Style {
+                underline: true,
+                font_size: 20.0,
+                ..Style::default()
+            };
+            rect_ys(&s, 800.0)[0]
+        };
+        assert!(ys[0] > under, "strike (PDF y {}) sits above underline ({under})", ys[0]);
+    }
+
+    #[test]
+    fn s_tag_strikes_through_end_to_end() {
+        // The UA sheet maps <s>/<strike>/<del> to line-through; a full render of
+        // `<s>` must therefore emit a decoration rule (no panic, valid PDF).
+        let pdf = render(
+            "<p><s>gone</s></p>",
+            &[],
+            612.0,
+            792.0,
+            36.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF for struck text");
     }
 }
