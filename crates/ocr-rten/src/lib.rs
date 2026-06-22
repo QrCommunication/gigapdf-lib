@@ -15,6 +15,25 @@ const REC_H: usize = 48; // PP-OCRv4 recognition input height
 const DET_MAX_SIDE: u32 = 960; // cap the detection input's long side
 const DET_BIN_THRESH: f32 = 0.3; // DBNet probability-map binarization threshold
 
+/// Language manifest: (display name, models-dir subdirectory, RTL?). PaddleOCR PP-OCRv3/v4 rec
+/// models (shared DBNet detector) + our own Hebrew model (PaddleOCR has none). One DBNet detector
+/// covers every script; only the recognizer + dict vary. Detection model is shared.
+pub const REC_MODELS: &[(&str, &str, bool)] = &[
+    ("ar", "arabic_PP-OCRv3_rec", true),   // Arabic — RTL
+    ("he", "hebrew", true),                // Hebrew — our model (PaddleOCR ships none), RTL
+    ("zh", "ch_PP-OCRv4_rec", false),      // Simplified Chinese (+ Latin + digits)
+    ("zh_tw", "chinese_cht_PP-OCRv3_rec", false), // Traditional Chinese
+    ("cyrillic", "cyrillic_PP-OCRv3_rec", false), // Russian/Ukrainian/…
+    ("devanagari", "devanagari_PP-OCRv3_rec", false), // Hindi/Marathi/…
+    ("en", "en_PP-OCRv4_rec", false),      // English
+    ("ja", "japan_PP-OCRv3_rec", false),   // Japanese
+    ("kn", "ka_PP-OCRv3_rec", false),      // Kannada
+    ("ko", "korean_PP-OCRv3_rec", false),  // Korean
+    ("latin", "latin_PP-OCRv3_rec", false), // French/German/Spanish/… (Latin script)
+    ("ta", "ta_PP-OCRv3_rec", false),      // Tamil
+    ("te", "te_PP-OCRv3_rec", false),      // Telugu
+];
+
 /// An axis-aligned text box in original-image pixel coordinates.
 #[derive(Clone, Copy, Debug)]
 pub struct BBox {
@@ -80,6 +99,29 @@ impl OcrEngine {
             rtl,
         });
         Ok(())
+    }
+
+    /// Load a whole models directory laid out as `det.rten` + `<subdir>/{model.rten,dict.txt}`
+    /// per [`REC_MODELS`]. Missing languages are skipped, so any available subset works.
+    pub fn load_models_dir(dir: impl AsRef<Path>) -> Result<OcrEngine, Box<dyn std::error::Error>> {
+        let dir = dir.as_ref();
+        let mut e = OcrEngine::new(dir.join("det.rten"))?;
+        for (name, subdir, rtl) in REC_MODELS {
+            let rec = dir.join(subdir).join("model.rten");
+            let dict = dir.join(subdir).join("dict.txt");
+            if rec.exists() && dict.exists() {
+                e.add_rec(*name, rec, dict, *rtl)?;
+            }
+        }
+        if e.recs.is_empty() {
+            return Err("no recognition models found in models dir".into());
+        }
+        Ok(e)
+    }
+
+    /// Number of loaded recognition models.
+    pub fn rec_count(&self) -> usize {
+        self.recs.len()
     }
 
     /// Convenience: detector + a single LTR recognition model (back-compat with the probes).

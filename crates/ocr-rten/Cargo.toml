@@ -25,3 +25,7 @@ path = "src/bin/rec_probe.rs"
 [[bin]]
 name = "ocr_probe"
 path = "src/bin/ocr_probe.rs"
+
+[[bin]]
+name = "ocr_auto"
+path = "src/bin/ocr_auto.rs"
