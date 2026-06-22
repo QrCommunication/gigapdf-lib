@@ -1422,6 +1422,24 @@ export interface GigaStylePatch {
   color?: [number, number, number] | null;
 }
 
+/**
+ * A paragraph-style patch for {@link ModelOp} `setParagraphStyle`: only the
+ * present fields are applied (mirror of `model::edit::ParaPatch`). Keys are the
+ * op's short names (`indent_left`, not `indent_left_pt`); values in PDF points.
+ * Omitting a field leaves the existing value unchanged.
+ */
+export interface GigaParaPatch {
+  align?: 'left' | 'center' | 'right' | 'justify';
+  indent_left?: number;
+  indent_right?: number;
+  /** First-line indent (positive) or hanging indent (negative), in points. */
+  first_line?: number;
+  space_before?: number;
+  space_after?: number;
+  /** Leading policy: font-natural, a size multiple, or a fixed point value. */
+  line_height?: { t: 'normal' } | { t: 'multiple'; v: number } | { t: 'points'; v: number };
+}
+
 /** A typed spreadsheet cell value (tagged; mirror of `model::CellValue`). */
 export type GigaCellValue =
   | { t: 'empty' }
@@ -1479,7 +1497,29 @@ export type ModelOp =
   | { op: 'insertSheetRow'; addr: GigaBlockAddr; sheet: number; at: number }
   | { op: 'deleteSheetRow'; addr: GigaBlockAddr; sheet: number; at: number }
   | { op: 'insertSheetColumn'; addr: GigaBlockAddr; sheet: number; at: number }
-  | { op: 'deleteSheetColumn'; addr: GigaBlockAddr; sheet: number; at: number };
+  | { op: 'deleteSheetColumn'; addr: GigaBlockAddr; sheet: number; at: number }
+  // ── paragraph formatting ──
+  | { op: 'setParagraphStyle'; addr: GigaBlockAddr; patch: GigaParaPatch }
+  // ── list ──
+  | { op: 'setListLevel'; addr: GigaBlockAddr; level: number }
+  | { op: 'setListMarker'; addr: GigaBlockAddr; marker: GigaListMarker }
+  | { op: 'setListOrdered'; addr: GigaBlockAddr; ordered: boolean }
+  // ── absolute block placement ──
+  | { op: 'setBlockFrame'; addr: GigaBlockAddr; rect: GigaRect }
+  /** `deg` is CCW; 0/90/180/270 snap to exact rotations, else an arbitrary angle. */
+  | { op: 'setBlockRotation'; addr: GigaBlockAddr; deg: number }
+  // ── table shading & geometry ──
+  /** `color: null` clears the cell's shading; a triple sets it. */
+  | {
+      op: 'setCellShading';
+      addr: GigaBlockAddr;
+      row: number;
+      col: number;
+      color: [number, number, number] | null;
+    }
+  | { op: 'setRowHeight'; addr: GigaBlockAddr; row: number; height: number }
+  | { op: 'setColWidth'; addr: GigaBlockAddr; col: number; width: number }
+  | { op: 'setTableBorder'; addr: GigaBlockAddr; border: GigaBorderStyle };
 /**
  * An image element from {@link GigaPdfDoc.imageElements}: its placement box
  * (page user space, origin bottom-left), the embeddable encoded bytes + format,
