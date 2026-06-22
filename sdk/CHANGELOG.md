@@ -4,6 +4,24 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.63.0] - 2026-06-22
+
+### Changed
+
+- **Added base-14 text references the standard font instead of embedding a
+  substitute** — `embed_font` now detects base-14 families (Helvetica/Arial,
+  Times, Courier, Symbol, ZapfDingbats — including Bold/Italic styles, via the new
+  `base14_postscript_name`) and registers a nude `/Type1` base-14 font (no
+  `FontFile`, WinAnsi encoding) rather than subsetting and embedding a Liberation
+  substitute. This mirrors the principle the form `/AP` regeneration already
+  applies. Adding text in a base-14 font now writes ~1 KB instead of ~57 KB per
+  font (≈50× smaller saved PDFs) while rendering identically (the rasteriser draws
+  base-14 natively). Custom (non-base-14) families are unchanged — still
+  subset + embedded. HTML rendering excludes base-14 from host font fetches.
+  Opt-in by family name: pass a base-14 PostScript/family name
+  (`'Helvetica'`, `'Times-Roman'`, `'Courier'`, …) to `embedFont` to reference
+  rather than embed.
+
 ## [0.62.0] - 2026-06-22
 
 ### Added
