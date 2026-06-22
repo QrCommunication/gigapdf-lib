@@ -387,7 +387,9 @@ impl Flow<'_> {
         let saved_floats = std::mem::take(&mut self.floats);
 
         let mut inline_run: Vec<&Node> = Vec::new();
-        let mut list_index = 0usize;
+        // `<ol start="N">` makes the first item count from N (default 1), so the
+        // pre-increment counter starts at N-1. Plain lists count from 1.
+        let mut list_index = list_start_offset(ancestors);
 
         for child in children {
             // Out-of-flow children (float / absolute / fixed) are placed without
@@ -696,9 +698,16 @@ impl Flow<'_> {
 
         let mut cy = y + b.top + p.top;
 
-        // Marker for list items (honours `list-style-type`).
+        // Marker for list items (honours `list-style-type`). `ancestors` ends at
+        // the enclosing list container, so its `<ol>`/`<ul>` depth drives the
+        // default bullet glyph (disc → circle → square) when unspecified.
         if style.display == Display::ListItem {
-            if let Some(marker) = list_marker(style, list_marker_ordered(ancestors), list_index) {
+            if let Some(marker) = list_marker(
+                style,
+                list_marker_ordered(ancestors),
+                list_index,
+                list_nesting_depth(ancestors),
+            ) {
                 let mstyle = style.clone();
                 let mw = self.m.width(&marker, &mstyle);
                 self.out.push(Abs {
@@ -2016,14 +2025,55 @@ fn list_marker_ordered(ancestors: &[&Element]) -> bool {
     ancestors.last().map(|e| e.tag == "ol").unwrap_or(false)
 }
 
+/// Number of `<ol>`/`<ul>` containers among the ancestors (1 for a top-level
+/// list, 2 for a list nested once, …). Drives the default bullet cycle.
+fn list_nesting_depth(ancestors: &[&Element]) -> usize {
+    ancestors
+        .iter()
+        .filter(|e| e.tag == "ol" || e.tag == "ul")
+        .count()
+}
+
+/// The 1-based start index for the items of the list container that immediately
+/// encloses these `ancestors`, honouring `<ol start="N">` (default 1). The
+/// pre-increment counter therefore begins one below the returned value.
+fn list_start_offset(ancestors: &[&Element]) -> usize {
+    match ancestors.last() {
+        Some(e) if e.tag == "ol" => e
+            .attr("start")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.saturating_sub(1))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// The marker string for a list item, honouring `list-style-type`. An unset
-/// type (`Disc`, the inherited default) inside an `<ol>` becomes `decimal`.
+/// type (`Disc`, the inherited default) inside an `<ol>` becomes `decimal`; an
+/// unset type inside a `<ul>` cycles disc → circle → square with nesting depth.
 /// `None` ⇒ no marker (`list-style-type: none`).
-fn list_marker(style: &Style, ordered_ancestor: bool, index: usize) -> Option<String> {
+fn list_marker(
+    style: &Style,
+    ordered_ancestor: bool,
+    index: usize,
+    nesting_depth: usize,
+) -> Option<String> {
     use super::css::ListStyle as L;
-    let kind = match style.list_style {
-        L::Disc if ordered_ancestor => L::Decimal,
-        other => other,
+    // Only the inherited default reacts to its context; an explicit
+    // `list-style-type` is always honoured verbatim.
+    let kind = if style.list_style == L::Disc {
+        if ordered_ancestor {
+            L::Decimal
+        } else {
+            // depth 1 → disc, 2 → circle, ≥3 → square.
+            match nesting_depth {
+                0 | 1 => L::Disc,
+                2 => L::Circle,
+                _ => L::Square,
+            }
+        }
+    } else {
+        style.list_style
     };
     match kind {
         L::None => None,
@@ -2942,6 +2992,78 @@ mod tests {
         assert!(text_runs(&run("<ul><li>a</li></ul>"))
             .iter()
             .any(|s| s == "•"));
+    }
+
+    #[test]
+    fn ordered_list_markers_are_left_of_their_item() {
+        // `<ol><li>A<li>B</ol>` → markers "1." / "2.", each to the left of and
+        // vertically aligned with its item's text.
+        let xy = text_xy(&run("<ol><li>Alpha</li><li>Beta</li></ol>"));
+        let find = |t: &str| {
+            xy.iter()
+                .find(|(_, _, s)| s == t)
+                .map(|(x, y, _)| (*x, *y))
+        };
+        let (m1x, m1y) = find("1.").expect("marker 1.");
+        let (m2x, m2y) = find("2.").expect("marker 2.");
+        let (a_x, a_y) = find("Alpha").expect("item Alpha");
+        let (b_x, b_y) = find("Beta").expect("item Beta");
+        // Marker sits in the left gutter (before the content) on the item's line.
+        assert!(m1x < a_x, "marker 1. left of item (m={m1x}, item={a_x})");
+        assert!(m2x < b_x, "marker 2. left of item (m={m2x}, item={b_x})");
+        assert!((m1y - a_y).abs() < 1.0, "marker 1. aligned with item line");
+        assert!((m2y - b_y).abs() < 1.0, "marker 2. aligned with item line");
+        // Both markers share the same left edge; the second is below the first.
+        assert!((m1x - m2x).abs() < 0.5, "markers share a left edge");
+        assert!(m2y > m1y, "second item below the first");
+    }
+
+    #[test]
+    fn nested_ul_inside_ol_indents_its_bullet() {
+        // The outer ordered item gets "1."; the inner unordered item gets a
+        // bullet, indented to the right of the outer marker. The inner list is
+        // at nesting depth 2 (<ol> then <ul>), so its default glyph is a circle.
+        let xy = text_xy(&run("<ol><li>Outer<ul><li>Inner</li></ul></li></ol>"));
+        let find = |t: &str| xy.iter().find(|(_, _, s)| s == t).map(|(x, _, _)| *x);
+        let one_x = find("1.").expect("ordered marker 1.");
+        let bul_x = find("◦").expect("nested bullet (circle at depth 2)");
+        let inner_x = find("Inner").expect("inner item text");
+        // Nested bullet is indented past the outer "1." marker, and still sits
+        // left of its own item's text.
+        assert!(bul_x > one_x, "nested bullet indented (bul={bul_x}, top={one_x})");
+        assert!(bul_x < inner_x, "bullet left of inner text");
+    }
+
+    #[test]
+    fn lower_alpha_markers() {
+        let alpha = text_runs(&run(
+            r#"<ol style="list-style-type: lower-alpha"><li>a</li><li>b</li></ol>"#,
+        ));
+        assert!(
+            alpha.iter().any(|s| s == "a.") && alpha.iter().any(|s| s == "b."),
+            "lower-alpha a./b.: {alpha:?}"
+        );
+    }
+
+    #[test]
+    fn ordered_list_start_attribute() {
+        // `<ol start="5">` counts 5, 6, 7…
+        let runs = text_runs(&run(r#"<ol start="5"><li>a</li><li>b</li><li>c</li></ol>"#));
+        for m in ["5.", "6.", "7."] {
+            assert!(runs.iter().any(|s| s == m), "start=5 marker {m}: {runs:?}");
+        }
+        assert!(!runs.iter().any(|s| s == "1."), "no 1. when start=5");
+    }
+
+    #[test]
+    fn nested_unordered_bullets_cycle_by_depth() {
+        // Bare nested <ul>s cycle disc → circle → square with depth.
+        let runs = text_runs(&run(
+            "<ul><li>a<ul><li>b<ul><li>c</li></ul></li></ul></li></ul>",
+        ));
+        assert!(runs.iter().any(|s| s == "•"), "depth 1 disc: {runs:?}");
+        assert!(runs.iter().any(|s| s == "◦"), "depth 2 circle: {runs:?}");
+        assert!(runs.iter().any(|s| s == "▪"), "depth 3 square: {runs:?}");
     }
 
     #[test]
