@@ -13,6 +13,9 @@ repository.workspace = true
 rten = "0.24"
 rten-tensor = "0.24"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Native-only: rasterize a PDF page (PNG) so the OCR API can take a Document + page directly,
+# restoring the end-to-end `ocr_pdf_page` surface on top of the RTen engine.
+gigapdf-core = { path = "../core" }
 
 [lib]
 name = "gigapdf_ocr_rten"

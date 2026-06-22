@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use gigapdf_core::Document;
 use image::imageops::FilterType;
 use image::RgbImage;
 use rten::Model;
@@ -48,6 +49,19 @@ pub struct BBox {
 pub struct Line {
     pub bbox: BBox,
     pub text: String,
+    pub confidence: f32,
+    pub model: String,
+}
+
+/// A recognized word/line mapped back to **PDF user space** (bottom-left origin, Y up) — the
+/// host can overlay it or stamp an invisible text layer to make a scan searchable.
+#[derive(Clone, Debug)]
+pub struct OcrWord {
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
     pub confidence: f32,
     pub model: String,
 }
@@ -148,6 +162,50 @@ impl OcrEngine {
             }
         }
         Ok(out)
+    }
+
+    /// OCR a **PDF page** end-to-end: rasterize it at `scale` via `gigapdf-core`, recognize every
+    /// line, and map the boxes back to **PDF user space** (bottom-left origin). Replaces the old
+    /// `Document::ocr_page`, now powered by the RTen + PaddleOCR engine. `scale ≥ 2` for small text.
+    pub fn ocr_pdf_page(
+        &self,
+        doc: &Document,
+        page: u32,
+        scale: f64,
+    ) -> Result<Vec<OcrWord>, Box<dyn std::error::Error>> {
+        let png = doc.render_page(page, scale).map_err(|e| format!("render_page: {e:?}"))?;
+        let img = image::load_from_memory(&png)?.to_rgb8();
+        let (_pw, ph, _rot) = doc.page_info(page).map_err(|e| format!("page_info: {e:?}"))?;
+        let s = scale.max(0.01);
+        Ok(self
+            .recognize_page(&img)?
+            .into_iter()
+            .map(|l| OcrWord {
+                // Raster pixels (top-left origin) → PDF user space (bottom-left, Y up).
+                x: l.bbox.x0 as f64 / s,
+                y: ph - l.bbox.y1 as f64 / s,
+                width: (l.bbox.x1 - l.bbox.x0) as f64 / s,
+                height: (l.bbox.y1 - l.bbox.y0) as f64 / s,
+                text: l.text,
+                confidence: l.confidence,
+                model: l.model,
+            })
+            .collect())
+    }
+
+    /// OCR a PDF page → plain text (one line per recognized region, reading order).
+    pub fn ocr_pdf_page_text(
+        &self,
+        doc: &Document,
+        page: u32,
+        scale: f64,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(self
+            .ocr_pdf_page(doc, page, scale)?
+            .into_iter()
+            .map(|w| w.text)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     /// Recognize one cropped line, auto-selecting the rec model with the highest confidence.
