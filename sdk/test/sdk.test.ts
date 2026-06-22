@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect, beforeAll } from "vitest";
 import { GigaPdfEngine } from "../src/index";
+import type { GigaBlock, GigaInline } from "../src/index";
 
 // Real OpenSSL-3 PKCS#12 (PBES2/AES + HMAC-SHA256), password "gigapdf".
 const MODERN_P12 = new Uint8Array(
@@ -506,6 +507,83 @@ describe("@qrcommunication/gigapdf-lib", () => {
     // Excluding the box changes the raster; excluding nothing equals the full render.
     expect(Buffer.from(excluding).equals(Buffer.from(full))).toBe(false);
     expect(Buffer.from(none).equals(Buffer.from(full))).toBe(true);
+    doc.close();
+  });
+
+  it("pageBlocks exposes the recognised structure as a typed, narrowable tree", () => {
+    // A document with a heading, bold body run, and a small table — rendered to a
+    // real PDF, then reconstructed. The point of this test is that the SDK types
+    // narrow on `kind.t` and expose runs/styles/levels/cells *without any cast*.
+    const html =
+      "<html><body>" +
+      "<h1>Quarterly Report</h1>" +
+      "<p>Plain intro then a <b>bold phrase</b> closing the line.</p>" +
+      "<table><tr><td>Name</td><td>Total</td></tr><tr><td>Alice</td><td>42</td></tr></table>" +
+      "</body></html>";
+    const doc = giga.open(giga.htmlToPdf(html));
+    const blocks: GigaBlock[] = doc.pageBlocks(1);
+    expect(blocks.length).toBeGreaterThan(0);
+
+    // Walk the typed tree, narrowing purely on the `t` discriminant. Collect proof
+    // that runs/levels/cells are reachable with full typing (no `as`, no `any`).
+    let sawTypedRun = false;
+    let sawHeadingLevel = false;
+    let sawTableCell = false;
+
+    const visitInlines = (runs: GigaInline[]): void => {
+      for (const inline of runs) {
+        if (inline.t === "run") {
+          // `inline.v` is GigaInlineRun: these field accesses are type-checked.
+          expect(typeof inline.v.text).toBe("string");
+          expect(typeof inline.v.style.bold).toBe("boolean");
+          expect(typeof inline.v.style.italic).toBe("boolean");
+          expect(typeof inline.v.style.underline).toBe("boolean");
+          expect(typeof inline.v.style.size_pt).toBe("number");
+          // color is a tuple or null — both are valid typed shapes.
+          expect(inline.v.style.color === null || inline.v.style.color.length === 3).toBe(true);
+          sawTypedRun = true;
+        } else if (inline.t === "link") {
+          visitInlines(inline.children);
+        }
+      }
+    };
+
+    const visitBlocks = (bs: GigaBlock[]): void => {
+      for (const b of bs) {
+        switch (b.kind.t) {
+          case "paragraph":
+            visitInlines(b.kind.v.runs);
+            break;
+          case "heading":
+            expect(typeof b.kind.v.level).toBe("number");
+            expect(b.kind.v.level).toBeGreaterThanOrEqual(1);
+            sawHeadingLevel = true;
+            visitInlines(b.kind.v.para.runs);
+            break;
+          case "table":
+            for (const row of b.kind.v.rows) {
+              for (const cell of row.cells) {
+                expect(typeof cell.col_span).toBe("number");
+                expect(typeof cell.row_span).toBe("number");
+                visitBlocks(cell.blocks); // cell content is itself a block tree
+                sawTableCell = true;
+              }
+            }
+            break;
+          case "list":
+            for (const item of b.kind.v.items) visitBlocks(item.blocks);
+            break;
+          default:
+            break;
+        }
+      }
+    };
+
+    visitBlocks(blocks);
+    // The reconstruction recovers at least styled text runs; structural elements
+    // (heading level, table cells) are recovered when the layout exposes them.
+    expect(sawTypedRun).toBe(true);
+    expect(sawHeadingLevel || sawTableCell).toBe(true);
     doc.close();
   });
 });

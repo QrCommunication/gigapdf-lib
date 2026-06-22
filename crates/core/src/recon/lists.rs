@@ -8,7 +8,7 @@
 //! then builds the [`List`] block from the item lines.
 
 use super::lines::ReconLine;
-use super::{char_style, IdGen};
+use super::{run_char_style, IdGen};
 use crate::model::{
     geom::Rotation, Block, BlockKind, Inline, InlineRun, List, ListItem, ListMarker, Paragraph,
     ParagraphStyle, Rect,
@@ -133,7 +133,7 @@ pub fn build_list(
             }
             runs.push(Inline::Run(InlineRun {
                 text: take,
-                style: char_style(&r.style, r.size),
+                style: run_char_style(r),
                 source_index: r.source_index,
             }));
         }
@@ -142,7 +142,7 @@ pub fn build_list(
             let style = items
                 .first()
                 .and_then(|l| l.runs.first())
-                .map(|r| char_style(&r.style, r.size))
+                .map(run_char_style)
                 .unwrap_or_default();
             runs.push(Inline::Run(InlineRun {
                 text: stripped.clone(),
@@ -288,6 +288,7 @@ mod tests {
             style: TextStyle::default(),
             rotation: 0.0,
             source_index: None,
+            underline: false,
         }
     }
 

@@ -12,7 +12,7 @@
 //! lines).
 
 use super::lines::ReconLine;
-use super::{char_style, median, IdGen};
+use super::{median, run_char_style, IdGen};
 use crate::model::{
     geom::Rotation, Align, Block, BlockKind, Inline, InlineRun, Paragraph, ParagraphStyle, Rect,
 };
@@ -75,7 +75,7 @@ pub fn build_paragraph(
             }
             runs.push(Inline::Run(InlineRun {
                 text: r.text.clone(),
-                style: char_style(&r.style, r.size),
+                style: run_char_style(r),
                 source_index: r.source_index,
             }));
         }
@@ -233,6 +233,7 @@ mod tests {
             style: TextStyle::default(),
             rotation: 0.0,
             source_index: None,
+            underline: false,
         }
     }
 

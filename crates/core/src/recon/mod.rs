@@ -65,6 +65,10 @@ pub struct ReconRun {
     pub rotation: f64,
     /// Originating page text-run index, for round-tripping to the exact operator.
     pub source_index: Option<usize>,
+    /// Whether a thin horizontal ruling line sits under the run's baseline — a
+    /// drawn underline (PDF has no font underline flag). Set by
+    /// [`mark_underlines`] before line grouping so it flows into every stage.
+    pub underline: bool,
 }
 
 impl ReconRun {
@@ -150,6 +154,8 @@ pub fn runs_from_elements(
                 // Form-XObject (nested) text is display-only — not editable by a
                 // top-level run index, so it carries no source index.
                 source_index: if e.nested { None } else { Some(e.index) },
+                // Set later by `mark_underlines` from the page's ruling lines.
+                underline: false,
             })
         })
         .collect()
@@ -170,6 +176,8 @@ impl IdGen {
 }
 
 /// Convert a recovered [`TextStyle`] into the model's [`CharStyle`] at `size_pt`.
+/// `underline` is carried separately because the PDF font model has no underline
+/// flag — it is recovered from drawn ruling lines (see [`mark_underlines`]).
 pub(crate) fn char_style(style: &TextStyle, size_pt: f64) -> CharStyle {
     CharStyle {
         family: style.family.clone(),
@@ -181,6 +189,17 @@ pub(crate) fn char_style(style: &TextStyle, size_pt: f64) -> CharStyle {
         strike: false,
         color: style.style_color(),
         vertical_align: crate::model::VAlign::Baseline,
+    }
+}
+
+/// [`char_style`] for a concrete [`ReconRun`], carrying its recovered
+/// `underline` flag through. Every reconstruction stage that materialises an
+/// [`InlineRun`](crate::model::InlineRun) from a run uses this so a drawn
+/// underline reaches the editable model.
+pub(crate) fn run_char_style(run: &ReconRun) -> CharStyle {
+    CharStyle {
+        underline: run.underline,
+        ..char_style(&run.style, run.size)
     }
 }
 
@@ -245,6 +264,63 @@ pub(crate) enum Ruling {
     Vertical { x: f64, y0: f64, y1: f64 },
 }
 
+/// Set [`ReconRun::underline`] for runs that have a thin **horizontal** ruling
+/// line drawn just under their baseline, and return the set of path indices that
+/// were consumed as underlines (so the caller does not also emit them as
+/// [`Shape`] blocks — which would draw the underline twice).
+///
+/// PDF carries no font underline flag; an underline is a separately-painted thin
+/// rectangle/line below the glyphs. A run's box bottom (`y`) sits **below** its
+/// baseline by the font descent, while an underline sits just **under** the
+/// baseline — so the rule can be a hair above the box bottom. A path counts as a
+/// run's underline when it is a horizontal ruling whose `y` lands in the band
+/// `[box_bottom − 0.30·h, box_bottom + 0.22·h]` (under the baseline, not as high
+/// as a strikethrough at ~0.4–0.5·h) and overlaps at least 55 % of the run's
+/// width. A single drawn rule may underline several adjacent runs (a whole
+/// phrase), so it is not removed after the first match — but it is recorded once
+/// as consumed.
+pub(crate) fn mark_underlines(runs: &mut [ReconRun], vpaths: &[VectorPath]) -> Vec<usize> {
+    // Candidate horizontal rules: (y, x0, x1, path index).
+    let rules: Vec<(f64, f64, f64, usize)> = vpaths
+        .iter()
+        .filter_map(|vp| match ruling_orientation(vp) {
+            Some(Ruling::Horizontal { y, x0, x1 }) => Some((y, x0, x1, vp.index)),
+            _ => None,
+        })
+        .collect();
+    if rules.is_empty() {
+        return Vec::new();
+    }
+
+    let mut consumed = std::collections::BTreeSet::new();
+    for run in runs.iter_mut() {
+        if run.text.trim().is_empty() || run.w <= 0.0 {
+            continue;
+        }
+        // Band around the run box bottom (`y`): a little below, up to ~0.22·h
+        // above (the baseline sits above the box bottom by the descent; an
+        // underline rides just under the baseline). Stays clear of a
+        // strikethrough, which sits near mid-glyph (~0.4–0.5·h above the bottom).
+        let bottom = run.y;
+        let lo = bottom - run.h * 0.30;
+        let hi = bottom + run.h * 0.22;
+        let run_x0 = run.x;
+        let run_x1 = run.x + run.w;
+        for &(ry, rx0, rx1, idx) in &rules {
+            if ry < lo || ry > hi {
+                continue;
+            }
+            let overlap = (run_x1.min(rx1) - run_x0.max(rx0)).max(0.0);
+            if overlap >= run.w * 0.55 {
+                run.underline = true;
+                consumed.insert(idx);
+                break;
+            }
+        }
+    }
+    consumed.into_iter().collect()
+}
+
 /// Assemble all logical blocks for one page from its text runs, painted paths
 /// and images. The reading order is column-major (left band first, top→bottom
 /// within a band); each block keeps `frame = Some(rect)` for fidelity. Non-rule
@@ -255,7 +331,7 @@ pub(crate) enum Ruling {
 /// `/StructTreeRoot` walk and is used verbatim (the author tagged the document).
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_page(
-    text_runs: Vec<ReconRun>,
+    mut text_runs: Vec<ReconRun>,
     vpaths: &[VectorPath],
     image_refs: &[PlacedImageRef],
     geom: (f64, f64, f64, f64),
@@ -267,6 +343,11 @@ pub fn reconstruct_page(
         return blocks;
     }
 
+    // 0. Recover drawn underlines: flag runs sitting above a thin horizontal rule
+    //    and collect those rules' path indices so they aren't re-emitted as shapes.
+    let underline_paths: std::collections::BTreeSet<usize> =
+        mark_underlines(&mut text_runs, vpaths).into_iter().collect();
+
     // 1. Lines, then 2. reading-order columns over those lines.
     let lines = lines::group_into_lines(&text_runs);
     let body = body_font_size(&text_runs, 12.0);
@@ -276,7 +357,7 @@ pub fn reconstruct_page(
 
     // Ruling-line tables first, so the lines they cover are not also emitted as
     // prose. A table consumes the line indices that fall inside its grid.
-    let table_plan = tables::plan_tables(&lines, vpaths);
+    let table_plan = tables::plan_tables(&lines, vpaths, &underline_paths);
 
     for &line_idx in &order {
         if let Some(tbl) = table_plan.take_if_starts_at(line_idx) {
@@ -308,7 +389,7 @@ pub fn reconstruct_page(
     // ruling line not consumed by a table also survives as a shape so nothing is
     // silently dropped.
     for vp in vpaths {
-        if table_plan.uses_path(vp.index) {
+        if table_plan.uses_path(vp.index) || underline_paths.contains(&vp.index) {
             continue;
         }
         let Some(b) = vp.bounds else { continue };
@@ -472,6 +553,7 @@ mod tests {
             style: TextStyle::default(),
             rotation: 0.0,
             source_index: None,
+            underline: false,
         }
     }
 
@@ -756,5 +838,178 @@ mod tests {
         assert_eq!(doc.sections.len(), 1);
         assert_eq!(doc.sections[0].pages.len(), 1);
         assert!(page0_blocks(&doc).is_empty());
+    }
+
+    // ── underline recovery (drawn rule under a run) ──────────────────────────
+
+    /// A thin horizontal rule directly under a run's baseline flags it underlined
+    /// and is consumed (so it isn't also re-emitted as a shape).
+    #[test]
+    fn mark_underlines_flags_a_run_above_a_thin_horizontal_rule() {
+        use crate::content::vector::{PathSeg, VectorPath};
+        use crate::content::Bounds;
+        // A run at lower-left (72,700), 100 wide, 12 tall (baseline ≈ y=700).
+        let mut runs = vec![run("underlined", 72.0, 700.0, 12.0)];
+        runs[0].w = 100.0;
+        // A 0.6pt-tall rule just under the baseline, spanning the run width.
+        let rule = VectorPath {
+            index: 5,
+            bounds: Some(Bounds {
+                x: 72.0,
+                y: 698.4,
+                width: 100.0,
+                height: 0.6,
+            }),
+            segments: vec![PathSeg::Move(72.0, 698.7), PathSeg::Line(172.0, 698.7)],
+            fill: None,
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 0.6,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        };
+        let consumed = mark_underlines(&mut runs, &[rule]);
+        assert!(runs[0].underline, "run over a thin rule is underlined");
+        assert_eq!(consumed, vec![5], "the rule path is consumed, not drawn twice");
+    }
+
+    /// A rule far from any baseline (or not overlapping) leaves runs un-underlined.
+    #[test]
+    fn mark_underlines_ignores_unrelated_rules() {
+        use crate::content::vector::{PathSeg, VectorPath};
+        use crate::content::Bounds;
+        let mut runs = vec![run("plain", 72.0, 700.0, 12.0)];
+        runs[0].w = 100.0;
+        // A rule 200pt below the run — not an underline of it.
+        let rule = VectorPath {
+            index: 1,
+            bounds: Some(Bounds {
+                x: 72.0,
+                y: 500.0,
+                width: 100.0,
+                height: 0.6,
+            }),
+            segments: vec![PathSeg::Move(72.0, 500.0), PathSeg::Line(172.0, 500.0)],
+            fill: None,
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 0.6,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        };
+        let consumed = mark_underlines(&mut runs, &[rule]);
+        assert!(!runs[0].underline);
+        assert!(consumed.is_empty());
+    }
+
+    // ── end-to-end: `page_blocks` exposes the recognised structure (typed) ───
+
+    /// The SDK's `pageBlocks` (→ `Document::page_blocks`) must surface the
+    /// reconstruction so a thin editor can render it 1:1: a **bold heading** with
+    /// a level, body runs carrying **bold**, a **drawn underline** flagged on its
+    /// run, and a **ruled table** with rows of cells.
+    #[test]
+    fn page_blocks_expose_bold_heading_underline_and_table() {
+        let mut b = PdfBuilder::new();
+        let page = b.add_page(612.0, 792.0);
+        let black = [0.0, 0.0, 0.0];
+        let body = StdFont::Helvetica;
+        let bold = StdFont::HelveticaBold;
+
+        // A bold 24pt title (→ heading level 1 over a 12pt body). It is isolated
+        // by a wide gap above three tightly-spaced body lines, so the leading
+        // estimate reflects the body and the title breaks off as its own block.
+        b.text(page, 72.0, 70.0, 24.0, "Quarterly Report", bold, black);
+        // Body paragraph: three 12pt lines at a regular 16pt leading. The third is
+        // underlined by a thin rule drawn just under its baseline.
+        b.text(page, 72.0, 140.0, 12.0, "Plain opening line of body text.", body, black);
+        b.text(page, 72.0, 156.0, 12.0, "A second body line continues on.", body, black);
+        b.text(page, 72.0, 172.0, 12.0, "Underlined closing line here now.", body, black);
+        // Underline rule under the third line: builder baseline ≈ top + size*0.8,
+        // i.e. top-down 172 + 9.6 ≈ 181.6; draw a 0.6pt bar a hair below.
+        b.rect(page, 72.0, 182.2, 150.0, 0.6, None, Some(black));
+
+        // A 2×2 ruled table lower on the page.
+        for &y in &[300.0, 324.0, 348.0] {
+            b.rect(page, 72.0, y, 256.0, 0.6, None, Some(black));
+        }
+        for &x in &[72.0, 200.0, 328.0] {
+            b.rect(page, x, 300.0, 0.6, 48.0, None, Some(black));
+        }
+        b.text(page, 80.0, 306.0, 11.0, "Name", body, black);
+        b.text(page, 208.0, 306.0, 11.0, "Total", body, black);
+        b.text(page, 80.0, 330.0, 11.0, "Alice", body, black);
+        b.text(page, 208.0, 330.0, 11.0, "42", body, black);
+
+        let doc = open(b.finish());
+        let blocks = doc.page_blocks(1);
+        assert!(!blocks.is_empty(), "page_blocks returns the reconstructed blocks");
+
+        // 1) A heading with a recovered level.
+        let heading = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BK::Heading(h) => Some(h),
+                _ => None,
+            })
+            .expect("the large bold title is exposed as a Heading");
+        assert!(heading.level >= 1 && heading.level <= 6, "heading carries a level");
+        // Its run is bold (recovered from the BaseFont name).
+        let head_bold = first_run_style(&heading.para)
+            .map(|s| s.bold)
+            .unwrap_or(false);
+        assert!(head_bold, "the heading run is flagged bold");
+
+        // 2) Some paragraph run is flagged underlined (the drawn rule).
+        let any_underline = blocks.iter().any(|b| match &b.kind {
+            BK::Paragraph(p) => para_has_underline(p),
+            BK::Heading(h) => para_has_underline(&h.para),
+            _ => false,
+        });
+        assert!(any_underline, "the rule under the second line flags an underlined run");
+
+        // 3) A table with rows of cells whose content is reachable.
+        let table = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BK::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("the ruled grid is exposed as a Table");
+        assert_eq!(table.rows.len(), 2, "two body rows");
+        assert!(table.rows.iter().all(|r| r.cells.len() == 2), "two cells per row");
+        // Cells carry editable block content (a paragraph with a run).
+        let cell_text = cell_first_text(&table.rows[0].cells[0]);
+        assert!(!cell_text.is_empty(), "a cell exposes its text run");
+    }
+
+    /// First run's [`CharStyle`] of a paragraph, if any.
+    fn first_run_style(p: &crate::model::Paragraph) -> Option<&crate::model::CharStyle> {
+        p.runs.iter().find_map(|i| match i {
+            crate::model::Inline::Run(r) => Some(&r.style),
+            _ => None,
+        })
+    }
+
+    /// Whether any run in a paragraph is flagged underlined.
+    fn para_has_underline(p: &crate::model::Paragraph) -> bool {
+        p.runs.iter().any(|i| match i {
+            crate::model::Inline::Run(r) => r.style.underline,
+            _ => false,
+        })
+    }
+
+    /// The text of a table cell's first paragraph run.
+    fn cell_first_text(c: &crate::model::Cell) -> String {
+        c.blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BK::Paragraph(p) => p.runs.iter().find_map(|i| match i {
+                    crate::model::Inline::Run(r) => Some(r.text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }

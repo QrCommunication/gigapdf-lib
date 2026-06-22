@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 
 use super::lines::ReconLine;
-use super::{char_style, median, ruling_orientation, IdGen, Ruling};
+use super::{median, ruling_orientation, run_char_style, IdGen, Ruling};
 use crate::content::vector::VectorPath;
 use crate::model::{
     geom::Rotation, Block, BlockKind, BorderStyle, Cell, Paragraph, ParagraphStyle, Rect, Row,
@@ -75,7 +75,11 @@ impl TablePlan {
 /// Plan the page's tables from its lines and painted paths. Ruled tables take
 /// precedence; the borderless fallback runs over the lines no ruled table
 /// claimed.
-pub fn plan_tables(lines: &[ReconLine], vpaths: &[VectorPath]) -> TablePlan {
+pub fn plan_tables(
+    lines: &[ReconLine],
+    vpaths: &[VectorPath],
+    ignore_paths: &BTreeSet<usize>,
+) -> TablePlan {
     let mut plan = TablePlan::default();
     if lines.is_empty() {
         return plan;
@@ -86,7 +90,7 @@ pub fn plan_tables(lines: &[ReconLine], vpaths: &[VectorPath]) -> TablePlan {
     // rejected, its lines are left free so they flow back to the normal prose
     // pipeline (headings / paragraphs) instead of being swallowed by a giant,
     // mostly-empty grid. See [`passes_table_sanity`].
-    if let Some(t) = plan_ruled(lines, vpaths) {
+    if let Some(t) = plan_ruled(lines, vpaths, ignore_paths) {
         if passes_table_sanity(&t, lines) {
             plan.tables.push(t);
         }
@@ -222,7 +226,7 @@ pub fn build_table(
             }
             cell.push_str(t);
             if styles[r][c].is_none() {
-                styles[r][c] = Some(char_style(&run.style, run.size));
+                styles[r][c] = Some(run_char_style(run));
             }
         }
     }
@@ -331,12 +335,22 @@ fn row_of(rows: &[f64], y: f64) -> Option<usize> {
 
 /// Plan a ruled table from horizontal + vertical ruling lines. Needs ≥ 2 column
 /// edges and ≥ 2 row edges to form at least one cell.
-fn plan_ruled(lines: &[ReconLine], vpaths: &[VectorPath]) -> Option<PlannedTable> {
+fn plan_ruled(
+    lines: &[ReconLine],
+    vpaths: &[VectorPath],
+    ignore_paths: &BTreeSet<usize>,
+) -> Option<PlannedTable> {
     let mut h_rules: Vec<(f64, f64, f64)> = Vec::new(); // (y, x0, x1)
     let mut v_rules: Vec<(f64, f64, f64)> = Vec::new(); // (x, y0, y1)
     let mut used_paths: BTreeSet<usize> = BTreeSet::new();
 
     for vp in vpaths {
+        // Skip rules already claimed as text underlines — they must not be read
+        // as table grid edges (a drawn underline near a table would add a phantom
+        // row/column).
+        if ignore_paths.contains(&vp.index) {
+            continue;
+        }
         match ruling_orientation(vp) {
             Some(Ruling::Horizontal { y, x0, x1 }) => {
                 h_rules.push((y, x0, x1));
@@ -519,6 +533,7 @@ mod tests {
             style: TextStyle::default(),
             rotation: 0.0,
             source_index: None,
+            underline: false,
         }
     }
 
@@ -578,7 +593,7 @@ mod tests {
         for (i, p) in paths.iter_mut().enumerate() {
             p.index = i;
         }
-        let plan = plan_tables(&lines, &paths);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
         let tbl = plan.take_if_starts_at(0).expect("table at line 0");
         let mut ids = IdGen::default();
         let block = build_table(&tbl, &lines, &mut ids, Rect::new).unwrap();
@@ -616,7 +631,7 @@ mod tests {
             run("Third line of the body", 72.0, 672.0, 150.0),
         ];
         let lines = group_into_lines(&runs);
-        let plan = plan_tables(&lines, &[]);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
         assert!(plan.take_if_starts_at(0).is_none(), "prose stays prose");
     }
 
@@ -630,7 +645,7 @@ mod tests {
             run("9.99", 300.0, 684.0, 30.0),
         ];
         let lines = group_into_lines(&runs);
-        let plan = plan_tables(&lines, &[]);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
         let tbl = plan.take_if_starts_at(0).expect("borderless table");
         let mut ids = IdGen::default();
         let block = build_table(&tbl, &lines, &mut ids, Rect::new).unwrap();
@@ -667,7 +682,7 @@ mod tests {
             .map(|r| run("x", 55.0, 105.0 + r as f64 * 30.0, 8.0))
             .collect();
         let lines = group_into_lines(&runs);
-        let plan = plan_tables(&lines, &paths);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
         assert!(
             plan.take_if_starts_at(0).is_none(),
             "a sparse {}-column form grid must not become a table",
@@ -699,7 +714,7 @@ mod tests {
             run("F", 260.0, 102.0, 30.0),
         ];
         let lines = group_into_lines(&runs);
-        let plan = plan_tables(&lines, &paths);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
         let tbl = plan
             .take_if_starts_at(0)
             .expect("a dense compact grid stays a table");

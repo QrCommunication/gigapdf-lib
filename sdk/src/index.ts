@@ -1025,25 +1025,250 @@ export interface GigaCharStyle {
   valign: 'baseline' | 'super' | 'sub';
 }
 
-/** An inline node (tagged): a styled run, a line break, an image, or a link. */
-export type GigaInline =
-  | { t: 'run'; text: string; style: GigaCharStyle; source_index: number | null }
-  | { t: 'break' }
-  | { t: 'image'; [k: string]: unknown }
-  | { t: 'link'; [k: string]: unknown };
-
-/** A block payload (tagged by `t`); only the common shapes are spelled out. */
-export interface GigaBlockKind {
-  t: 'paragraph' | 'heading' | 'list' | 'table' | 'image' | 'shape' | 'textbox' | 'sheet' | 'slide';
-  /** The variant body — e.g. a paragraph carries `{ runs: GigaInline[], … }`. */
-  v?: unknown;
+/** An axis-aligned placement box, lower-left `(x,y)` + size, in PDF points. */
+export interface GigaRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
+
+/** A hyperlink destination (tagged; mirror of `model::LinkTarget`). */
+export type GigaLinkTarget =
+  | { t: 'url'; v: string }
+  | { t: 'page'; v: number };
+
+/**
+ * An inline (within-paragraph) node, tagged by `t` (mirror of `model::Inline`).
+ * `run` carries the styled text + its `source_index` back to the editable
+ * content-stream operator; `br` is a hard line break; `image` an inline image;
+ * `link` wraps children with a destination.
+ */
+export type GigaInline =
+  | { t: 'run'; v: GigaInlineRun }
+  | { t: 'br' }
+  | { t: 'image'; v: GigaImageRef }
+  | { t: 'link'; href: GigaLinkTarget; children: GigaInline[] };
+
+/** A styled span of text (mirror of `model::InlineRun`). */
+export interface GigaInlineRun {
+  text: string;
+  style: GigaCharStyle;
+  /** Index of the source content-stream run for in-place round-tripping, or `null`. */
+  source_index: number | null;
+}
+
+/** Paragraph-level formatting (mirror of `model::style::ParagraphStyle`). */
+export interface GigaParagraphStyle {
+  align: 'left' | 'center' | 'right' | 'justify';
+  space_before_pt: number;
+  space_after_pt: number;
+  indent_left_pt: number;
+  indent_right_pt: number;
+  /** First-line indent (positive) or hanging indent (negative), in points. */
+  first_line_pt: number;
+  /** Leading policy: font-natural, a size multiple, or a fixed point value. */
+  line_height:
+    | { t: 'normal' }
+    | { t: 'multiple'; v: number }
+    | { t: 'points'; v: number };
+}
+
+/** A paragraph: its own style, an optional named-style ref, and its inline runs. */
+export interface GigaParagraph {
+  style: GigaParagraphStyle;
+  /** Named style this paragraph derives from, if any. */
+  style_ref: string | null;
+  runs: GigaInline[];
+}
+
+/** A heading (`level` 1..=6) wrapping a paragraph (mirror of `model::Heading`). */
+export interface GigaHeading {
+  level: number;
+  para: GigaParagraph;
+}
+
+/** A list bullet/number style (tagged; mirror of `model::ListMarker`). */
+export type GigaListMarker =
+  | { t: 'bullet'; v: string }
+  | { t: 'decimal' }
+  | { t: 'lower_alpha' }
+  | { t: 'upper_alpha' }
+  | { t: 'lower_roman' }
+  | { t: 'upper_roman' };
+
+/** One list item: nested blocks at a given `level` (mirror of `model::ListItem`). */
+export interface GigaListItem {
+  blocks: GigaBlock[];
+  level: number;
+}
+
+/** An ordered or unordered list (mirror of `model::List`). */
+export interface GigaList {
+  ordered: boolean;
+  marker: GigaListMarker;
+  items: GigaListItem[];
+}
+
+/** A table cell: block content, span, and optional RGB shading (`model::Cell`). */
+export interface GigaTableCell {
+  blocks: GigaBlock[];
+  col_span: number;
+  row_span: number;
+  /** RGB `0..=1` background, or `null` for no shading. */
+  shading: [number, number, number] | null;
+}
+
+/** A table row: its cells and an optional fixed height in points (`model::Row`). */
+export interface GigaTableRow {
+  cells: GigaTableCell[];
+  height: number | null;
+}
+
+/** A table/cell border (mirror of `model::BorderStyle`). */
+export interface GigaBorderStyle {
+  width: number;
+  color: [number, number, number];
+}
+
+/** A table: rows of cells, explicit column widths, and a border (`model::Table`). */
+export interface GigaTable {
+  rows: GigaTableRow[];
+  col_widths: number[];
+  border: GigaBorderStyle;
+}
+
+/** A reference to an image blob in the document's resource table (`model::ImageRef`). */
+export interface GigaImageRef {
+  /** Content-hash key into `GigaDocument.resources.images`. */
+  resource: number;
+  alt: string | null;
+}
+
+/** A single vector path segment (tagged; mirror of `content::vector::PathSeg`). */
+export type GigaPathSeg =
+  | { t: 'm'; x: number; y: number }
+  | { t: 'l'; x: number; y: number }
+  | { t: 'c'; x1: number; y1: number; x2: number; y2: number; x: number; y: number }
+  | { t: 'z' };
+
+/** A vector shape: a path with fill/stroke styling (mirror of `model::Shape`). */
+export interface GigaShape {
+  segments: GigaPathSeg[];
+  /** RGB `0..=1` fill, or `null` when unfilled. */
+  fill: [number, number, number] | null;
+  /** RGB `0..=1` stroke, or `null` when unstroked. */
+  stroke: [number, number, number] | null;
+  stroke_width: number;
+  dash: number[];
+}
+
+/** A free-floating text box holding a list of blocks (mirror of `model::TextBox`). */
+export interface GigaTextBox {
+  blocks: GigaBlock[];
+}
+
+/** A typed spreadsheet cell (mirror of `model::SheetCell`). */
+export interface GigaSheetCell {
+  value: GigaCellValue;
+  number_format: string | null;
+  /** RGB `0..=1` cell fill, or `null` for none. */
+  fill: [number, number, number] | null;
+  style: GigaCharStyle;
+}
+
+/** One spreadsheet row (mirror of `model::SheetRow`). */
+export interface GigaSheetRow {
+  cells: GigaSheetCell[];
+}
+
+/** An inclusive merged-cell rectangle `(r0,c0)..=(r1,c1)`, zero-based. */
+export interface GigaMergeRange {
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+}
+
+/** A single named worksheet (mirror of `model::Sheet`). */
+export interface GigaSheet {
+  name: string;
+  rows: GigaSheetRow[];
+  merges: GigaMergeRange[];
+  col_widths: number[];
+}
+
+/** A block of spreadsheet content: one or more sheets (mirror of `model::SheetBlock`). */
+export interface GigaSheetBlock {
+  sheets: GigaSheet[];
+}
+
+/** A slide layout placeholder role (tagged; mirror of `model::PlaceholderRole`). */
+export type GigaPlaceholderRole =
+  | { t: 'title' }
+  | { t: 'subtitle' }
+  | { t: 'body' }
+  | { t: 'other'; v: string };
+
+/** A slide placeholder: a block tagged with its semantic role (`model::Placeholder`). */
+export interface GigaPlaceholder {
+  role: GigaPlaceholderRole;
+  block: GigaBlock;
+}
+
+/** Resolved page size + margins, in points (mirror of `model::geom::PageGeometry`). */
+export interface GigaPageGeometry {
+  width: number;
+  height: number;
+  margins: { top: number; right: number; bottom: number; left: number };
+}
+
+/** A single slide (mirror of `model::Slide`). */
+export interface GigaSlide {
+  geometry: GigaPageGeometry;
+  shapes: GigaBlock[];
+  placeholders: GigaPlaceholder[];
+  notes: GigaBlock[] | null;
+}
+
+/** A block of presentation content: an ordered list of slides (`model::SlideBlock`). */
+export interface GigaSlideBlock {
+  slides: GigaSlide[];
+}
+
+/**
+ * A block payload, **fully typed and discriminated by `t`** (mirror of
+ * `model::BlockKind`'s JSON). Narrow on `kind.t` to read the variant body in
+ * `kind.v` — e.g. a `paragraph` exposes `v.runs` (each `run` carrying
+ * `style.bold`/`style.italic`/`style.size_pt`/`style.color`), a `heading` its
+ * `v.level`, a `table` its `v.rows[].cells[]` (with `col_span`/`row_span`), and a
+ * `list` its `v.ordered` + `v.items`. This is what lets a thin editor render the
+ * recognised structure (bold, headings, tables, lists) 1:1.
+ */
+export type GigaBlockKind =
+  | { t: 'paragraph'; v: GigaParagraph }
+  | { t: 'heading'; v: GigaHeading }
+  | { t: 'list'; v: GigaList }
+  | { t: 'table'; v: GigaTable }
+  | { t: 'image'; v: GigaImageRef }
+  | { t: 'shape'; v: GigaShape }
+  | { t: 'textbox'; v: GigaTextBox }
+  | { t: 'sheet'; v: GigaSheetBlock }
+  | { t: 'slide'; v: GigaSlideBlock };
+
+/** Block rotation (tagged; mirror of `model::geom::Rotation`). */
+export type GigaRotation =
+  | { t: 'd0' }
+  | { t: 'd90' }
+  | { t: 'd180' }
+  | { t: 'd270' }
+  | { t: 'deg'; v: number };
 
 /** A block: a stable id, an optional placement frame + rotation, and its kind. */
 export interface GigaBlock {
   id: number;
-  frame: { x: number; y: number; w: number; h: number } | null;
-  rotation: { t: 'd0' | 'd90' | 'd180' | 'd270' | 'deg'; v?: number };
+  frame: GigaRect | null;
+  rotation: GigaRotation;
   kind: GigaBlockKind;
 }
 
@@ -1055,7 +1280,7 @@ export interface GigaPage {
 
 /** A section: one page geometry, optional running header/footer, and its pages. */
 export interface GigaSection {
-  geometry: { width: number; height: number; [k: string]: unknown };
+  geometry: GigaPageGeometry;
   header: GigaBlock[] | null;
   footer: GigaBlock[] | null;
   pages: GigaPage[];

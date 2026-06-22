@@ -151,6 +151,7 @@ mod tests {
             style: TextStyle::default(),
             rotation: 0.0,
             source_index: None,
+            underline: false,
         }
     }
 
