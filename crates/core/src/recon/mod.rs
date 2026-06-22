@@ -417,10 +417,13 @@ pub fn reconstruct_page(
             .collect();
     consumed_rule_paths.extend(mark_strikes(&mut text_runs, vpaths));
 
-    // 1. Lines, then 2. reading-order columns over those lines.
+    // 1. Lines, then 2. reading-order columns over those lines. The same column
+    //    layout also ranks non-line placeables (shapes, images) so they slot into
+    //    the reading order by region/column/Y instead of trailing all the text.
     let lines = lines::group_into_lines(&text_runs);
     let body = body_font_size(&text_runs, 12.0);
-    let order = columns::reading_order(&lines);
+    let layout = columns::column_layout(&lines);
+    let order = layout.order_lines(&lines);
 
     let mut blocks: Vec<Block> = Vec::new();
 
@@ -515,7 +518,41 @@ pub fn reconstruct_page(
         });
     }
 
+    // Interleave shapes/images into the reading order. Text and table blocks are
+    // already in reading order, so their ranks are monotonic; a *stable* sort by
+    // the column-aware rank keeps them in place while slotting each shape/image at
+    // its region/column/Y. Single-column pages keep their text order (band is
+    // always 0) and simply gain top→bottom placement of figures.
+    interleave_by_reading_order(&mut out, &layout, x0, y0, page_h);
+
     out
+}
+
+/// Stable-sort `blocks` (model **top-down** frames) into the page's reading order
+/// using `layout`. Each block's PDF-user-space `(centre_x, top)` is recovered
+/// from its top-down frame to query [`ColumnLayout::rank`]; a frameless block
+/// (none in practice post-resolution) sorts last so nothing is dropped.
+fn interleave_by_reading_order(
+    blocks: &mut [Block],
+    layout: &columns::ColumnLayout,
+    x0: f64,
+    y0: f64,
+    page_h: f64,
+) {
+    // Top-down frame → PDF-user-space rank key. `frame_top_down` maps a PDF box
+    // (lower-left `y`, height `h`) to top-down `y' = page_h - (y - y0) - h`; invert
+    // for the PDF top edge `y + h = page_h - y' + y0`, and `centre_x = x' + x0 +
+    // w/2`.
+    let key = |b: &Block| match b.frame {
+        Some(f) => {
+            let center_x = f.x + x0 + f.w / 2.0;
+            let top = page_h - f.y + y0;
+            (0u8, layout.rank(center_x, top))
+        }
+        // Frameless: trail (group `1` sorts after every framed block).
+        None => (1u8, layout.rank(f64::INFINITY, f64::NEG_INFINITY)),
+    };
+    blocks.sort_by_key(key);
 }
 
 /// Find a caption paragraph for an image at `image_frame` (model **top-down**
@@ -1706,5 +1743,84 @@ mod tests {
         )];
         assert!(take_caption_for(&mut blocks, &image_frame).is_none());
         assert_eq!(blocks.len(), 1);
+    }
+
+    // ── reading-order interleave of shapes (wave R7, objective #3) ────────────
+
+    /// A non-ruling shape (a filled box) sitting *between* two paragraphs by its Y
+    /// must be emitted between them in reading order, not appended after all the
+    /// text. Single-column page: text order is unchanged, the figure slots in.
+    #[test]
+    fn a_shape_between_two_paragraphs_is_interleaved_by_y() {
+        use crate::content::vector::{PathSeg, VectorPath};
+        use crate::content::Bounds;
+
+        // Two single-column paragraphs, a wide vertical gap between them; a filled
+        // box (not a thin rule → survives as a Shape) sits in that gap.
+        let runs = vec![
+            run("First paragraph line one.", 72.0, 700.0, 12.0),
+            run("First paragraph line two.", 72.0, 684.0, 12.0),
+            run("Second paragraph way down.", 72.0, 560.0, 12.0),
+            run("Second paragraph continues.", 72.0, 544.0, 12.0),
+        ];
+        // A 120×60 filled box centred in the gap (PDF user space y≈600..660).
+        let box_shape = VectorPath {
+            index: 0,
+            bounds: Some(Bounds {
+                x: 72.0,
+                y: 600.0,
+                width: 120.0,
+                height: 60.0,
+            }),
+            segments: vec![
+                PathSeg::Move(72.0, 600.0),
+                PathSeg::Line(192.0, 600.0),
+                PathSeg::Line(192.0, 660.0),
+                PathSeg::Line(72.0, 660.0),
+                PathSeg::Close,
+            ],
+            fill: Some([0.8, 0.8, 0.8]),
+            stroke: None,
+            stroke_width: 0.0,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        };
+
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_page(
+            runs,
+            std::slice::from_ref(&box_shape),
+            &[],
+            (0.0, 0.0, 612.0, 792.0),
+            &mut ids,
+            &[],
+            None,
+        );
+
+        // Expect three blocks: para, shape, para — in that vertical order.
+        let kinds: Vec<&str> = blocks
+            .iter()
+            .map(|b| match &b.kind {
+                BK::Paragraph(_) => "para",
+                BK::Shape(_) => "shape",
+                BK::Heading(_) => "heading",
+                BK::Image(_) => "image",
+                _ => "other",
+            })
+            .collect();
+        let shape_pos = kinds.iter().position(|&k| k == "shape");
+        let first_para = kinds.iter().position(|&k| k == "para");
+        let last_para = kinds.iter().rposition(|&k| k == "para");
+        assert!(
+            shape_pos.is_some(),
+            "the filled box survives as a Shape, got {kinds:?}"
+        );
+        let (shape_pos, first_para, last_para) =
+            (shape_pos.unwrap(), first_para.unwrap(), last_para.unwrap());
+        assert!(
+            first_para < shape_pos && shape_pos < last_para,
+            "the shape is read between the two paragraphs, got {kinds:?}"
+        );
     }
 }
