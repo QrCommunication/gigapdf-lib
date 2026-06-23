@@ -826,6 +826,73 @@ pub struct TextLayerRun {
     pub rotation_deg: f64,
 }
 
+/// Where an image watermark is anchored on a page, for
+/// [`ImageWatermarkOptions`]. The named corners place the image's bounding box
+/// flush to that corner of the (cropped) page; `Center` centres it. In every
+/// case the offsets in [`ImageWatermarkOptions`] then nudge the placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatermarkAnchor {
+    /// Centre of the page (the usual diagonal-stamp position).
+    #[default]
+    Center,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Placement options for [`Document::add_image_watermark`].
+///
+/// The image XObject is embedded once and stamped on the chosen pages. Sizing is
+/// driven by `width` (target width in points) — the height follows the image's
+/// own aspect ratio unless `height` is also given. Use [`Self::new`] then the
+/// builder setters, or construct the struct directly.
+#[derive(Debug, Clone)]
+pub struct ImageWatermarkOptions {
+    /// 1-based page numbers to stamp. Empty = every page.
+    pub pages: Vec<u32>,
+    /// Where on each page the image is anchored.
+    pub anchor: WatermarkAnchor,
+    /// Horizontal nudge in points (applied after anchoring; +x = rightward).
+    pub offset_x: f64,
+    /// Vertical nudge in points (+y = upward, PDF user space).
+    pub offset_y: f64,
+    /// Target width in points. `None` (or `<= 0`) uses the image's pixel width.
+    pub width: Option<f64>,
+    /// Target height in points. `None` keeps the source aspect ratio from `width`.
+    pub height: Option<f64>,
+    /// Counter-clockwise rotation in degrees, about the image centre.
+    pub rotation_deg: f64,
+    /// Fill/stroke alpha in `0..=1` (1 = opaque). Applied via an `/ExtGState`.
+    pub opacity: f64,
+    /// When `true`, repeat the image across the whole page in a grid (ignores
+    /// `anchor`; `offset_x`/`offset_y` become the gap between tiles).
+    pub tile: bool,
+}
+
+impl Default for ImageWatermarkOptions {
+    fn default() -> Self {
+        Self {
+            pages: Vec::new(),
+            anchor: WatermarkAnchor::Center,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            width: None,
+            height: None,
+            rotation_deg: 0.0,
+            opacity: 0.25,
+            tile: false,
+        }
+    }
+}
+
+impl ImageWatermarkOptions {
+    /// Default options: centred on every page, source pixel size, 25% opacity.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// One embedded font in a document (from [`Document::embedded_fonts`]): its
 /// `/BaseFont` name and embedded program format (`truetype` / `cff` / `type1`).
 /// Feed `base_font` to [`Document::extract_font_program`] to pull the bytes out
@@ -6393,12 +6460,33 @@ impl Document {
         height: f64,
         opacity: f64,
     ) -> Result<()> {
-        use content::image::{ImageColor, ImageFilter};
         let prep = content::image::prepare_image(data)
             .ok_or_else(|| EngineError::Missing("unsupported image (need PNG or JPEG)".into()))?;
+        let img_id = self.embed_image_xobject(&prep);
+
+        // Register the image in the page's /Resources /XObject and get its name.
+        let img_name =
+            self.register_page_resource(page_no, b"XObject", "GpImg", Object::Reference(img_id))?;
+
+        let ops = content::image_ops(&img_name, x, y, width, height);
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Insert a prepared raster as a PDF `/Image` XObject (plus its `/DeviceGray`
+    /// soft mask when the source carried alpha) and return the main image object
+    /// id. This is the single, shared image-embedding path: both
+    /// [`add_image`](Self::add_image) and
+    /// [`add_image_watermark`](Self::add_image_watermark) build their XObject here,
+    /// so the dictionary, colour space, filter, CMYK `/Decode` and `/SMask` wiring
+    /// live in exactly one place. The returned XObject is page-independent — a
+    /// caller can reference it from any number of pages (the watermark path embeds
+    /// once and references it on every target page).
+    fn embed_image_xobject(&mut self, prep: &content::image::PreparedImage) -> ObjectId {
+        use content::image::{ImageColor, ImageFilter};
 
         // PNG alpha → a /DeviceGray soft-mask image XObject referenced by /SMask.
-        let smask_ref = match prep.smask {
+        let smask_ref = match &prep.smask {
             Some(alpha) => {
                 let mut m = Dictionary::new();
                 m.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
@@ -6411,7 +6499,7 @@ impl Document {
                 m.set(b"Length".to_vec(), Object::Integer(alpha.len() as i64));
                 let id = (self.next_object_number(), 0u16);
                 self.objects
-                    .insert(id, Object::Stream(Stream::new(m, alpha)));
+                    .insert(id, Object::Stream(Stream::new(m, alpha.clone())));
                 Some(id)
             }
             None => None,
@@ -6461,15 +6549,8 @@ impl Document {
         dict.set(b"Length".to_vec(), Object::Integer(prep.data.len() as i64));
         let img_id = (self.next_object_number(), 0u16);
         self.objects
-            .insert(img_id, Object::Stream(Stream::new(dict, prep.data)));
-
-        // Register the image in the page's /Resources /XObject and get its name.
-        let img_name =
-            self.register_page_resource(page_no, b"XObject", "GpImg", Object::Reference(img_id))?;
-
-        let ops = content::image_ops(&img_name, x, y, width, height);
-        let ops = self.with_opacity(page_no, ops, opacity)?;
-        self.append_page_content(page_no, &ops)
+            .insert(img_id, Object::Stream(Stream::new(dict, prep.data.clone())));
+        img_id
     }
 
     /// Register `value` under a fresh name in a page's `/Resources /{category}`
@@ -7842,6 +7923,174 @@ impl Document {
             opacity,
             rotation_deg,
         )
+    }
+
+    /// Stamp an **image watermark** on one or more pages from raw image bytes.
+    ///
+    /// Accepts the same five raster formats the engine decodes — **PNG, JPEG,
+    /// WebP, GIF, AVIF** — coercing each to embeddable bytes through the shared
+    /// [`embeddable_image`](crate::convert::reverse::embeddable_image) path (so the
+    /// raster decoders and transcode logic are reused, not duplicated). The image
+    /// is embedded as a PDF `/Image` XObject **exactly once** (via the same
+    /// [`embed_image_xobject`](Self::embed_image_xobject) used by
+    /// [`add_image`](Self::add_image)) and then referenced from every target page,
+    /// so a multi-page watermark adds no per-page image copies.
+    ///
+    /// Placement follows [`ImageWatermarkOptions`]: target pages (empty = all),
+    /// anchor + offsets (or a repeating tile grid), target size (`width`, with the
+    /// height following the source aspect ratio unless given), rotation about the
+    /// image centre, and opacity (through an `/ExtGState`). Returns the number of
+    /// pages stamped.
+    pub fn add_image_watermark(
+        &mut self,
+        image_bytes: &[u8],
+        opts: &ImageWatermarkOptions,
+    ) -> Result<usize> {
+        // Reuse the conversion path's decoder/transcoder: any of PNG/JPEG/WebP/
+        // GIF/AVIF → bytes the image embedder accepts (PNG or JPEG) + pixel size.
+        let (embed, px_w, px_h) = crate::convert::reverse::embeddable_image(image_bytes)
+            .ok_or_else(|| {
+                EngineError::Missing("unsupported image (need PNG, JPEG, WebP, GIF or AVIF)".into())
+            })?;
+        let prep = content::image::prepare_image(&embed)
+            .ok_or_else(|| EngineError::Missing("could not prepare image for embedding".into()))?;
+
+        // Target draw size in points. `width` drives it; height keeps the source
+        // aspect ratio unless explicitly set. Fall back to the pixel size 1:1.
+        let aspect = if px_w > 0 {
+            f64::from(px_h) / f64::from(px_w)
+        } else {
+            1.0
+        };
+        let draw_w = match opts.width {
+            Some(w) if w > 0.0 => w,
+            _ => f64::from(px_w.max(1)),
+        };
+        let draw_h = match opts.height {
+            Some(h) if h > 0.0 => h,
+            _ => draw_w * aspect,
+        };
+        if draw_w <= 0.0 || draw_h <= 0.0 {
+            return Err(EngineError::Missing("watermark image has zero size".into()));
+        }
+
+        // Resolve target pages (1-based). Empty = every page; out-of-range skipped.
+        let total = self.page_count() as u32;
+        let targets: Vec<u32> = if opts.pages.is_empty() {
+            (1..=total).collect()
+        } else {
+            opts.pages
+                .iter()
+                .copied()
+                .filter(|&p| p >= 1 && p <= total)
+                .collect()
+        };
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        // Embed the image XObject ONCE; reference it from each target page.
+        let img_id = self.embed_image_xobject(&prep);
+
+        let mut stamped = 0usize;
+        for page_no in targets {
+            let img_name = self.register_page_resource(
+                page_no,
+                b"XObject",
+                "GpWmk",
+                Object::Reference(img_id),
+            )?;
+            let [x0, y0, x1, y1] = self.page_media_box(page_no)?;
+            let page_w = (x1 - x0).abs();
+            let page_h = (y1 - y0).abs();
+
+            let raw = if opts.tile {
+                Self::tile_image_ops(&img_name, x0, y0, page_w, page_h, draw_w, draw_h, opts)
+            } else {
+                let (cx, cy) = Self::anchor_center(
+                    opts.anchor, x0, y0, page_w, page_h, draw_w, draw_h, opts.offset_x,
+                    opts.offset_y,
+                );
+                content::image_ops_centered_rotated(
+                    &img_name,
+                    cx,
+                    cy,
+                    draw_w,
+                    draw_h,
+                    opts.rotation_deg,
+                )
+            };
+            let ops = self.with_opacity(page_no, raw, opts.opacity)?;
+            self.append_page_content(page_no, &ops)?;
+            stamped += 1;
+        }
+        Ok(stamped)
+    }
+
+    /// Centre point `(cx, cy)` at which a `draw_w × draw_h` image is anchored on a
+    /// page whose media box starts at `(x0, y0)` and is `page_w × page_h`, for the
+    /// given [`WatermarkAnchor`], plus the caller's `(offset_x, offset_y)` nudge.
+    /// Corner anchors inset the image's half-size so its bounding box sits flush
+    /// to that corner; `Center` uses the page centre.
+    #[allow(clippy::too_many_arguments)]
+    fn anchor_center(
+        anchor: WatermarkAnchor,
+        x0: f64,
+        y0: f64,
+        page_w: f64,
+        page_h: f64,
+        draw_w: f64,
+        draw_h: f64,
+        offset_x: f64,
+        offset_y: f64,
+    ) -> (f64, f64) {
+        let (hw, hh) = (draw_w / 2.0, draw_h / 2.0);
+        let (base_x, base_y) = match anchor {
+            WatermarkAnchor::Center => (x0 + page_w / 2.0, y0 + page_h / 2.0),
+            WatermarkAnchor::TopLeft => (x0 + hw, y0 + page_h - hh),
+            WatermarkAnchor::TopRight => (x0 + page_w - hw, y0 + page_h - hh),
+            WatermarkAnchor::BottomLeft => (x0 + hw, y0 + hh),
+            WatermarkAnchor::BottomRight => (x0 + page_w - hw, y0 + hh),
+        };
+        (base_x + offset_x, base_y + offset_y)
+    }
+
+    /// Content ops repeating the image across the whole page in a grid. The cell
+    /// pitch is `draw_w + offset_x` by `draw_h + offset_y` (offsets act as the gap
+    /// between tiles); each tile is drawn centred-and-rotated like the single
+    /// stamp. Concatenated into one `q … Q`-per-tile block.
+    #[allow(clippy::too_many_arguments)]
+    fn tile_image_ops(
+        img_name: &[u8],
+        x0: f64,
+        y0: f64,
+        page_w: f64,
+        page_h: f64,
+        draw_w: f64,
+        draw_h: f64,
+        opts: &ImageWatermarkOptions,
+    ) -> Vec<u8> {
+        let step_x = (draw_w + opts.offset_x).max(1.0);
+        let step_y = (draw_h + opts.offset_y).max(1.0);
+        // Cap the grid so a pathological tiny step can't explode the stream.
+        let cols = ((page_w / step_x).ceil() as i64 + 1).clamp(1, 200);
+        let rows = ((page_h / step_y).ceil() as i64 + 1).clamp(1, 200);
+        let mut out = Vec::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                let cx = x0 + step_x * (col as f64 + 0.5);
+                let cy = y0 + step_y * (row as f64 + 0.5);
+                out.extend_from_slice(&content::image_ops_centered_rotated(
+                    img_name,
+                    cx,
+                    cy,
+                    draw_w,
+                    draw_h,
+                    opts.rotation_deg,
+                ));
+            }
+        }
+        out
     }
 
     /// Add an invisible (text render mode 3) text layer to `page_no` in a SINGLE
@@ -18505,5 +18754,182 @@ mod tests {
 
         // Out-of-range page → empty, never panics.
         assert!(doc.page_blocks(999).is_empty());
+    }
+
+    // ─── image watermark ──────────────────────────────────────────────────────
+
+    /// A small opaque RGB PNG with a distinctive `w×h` so `page_images` can find
+    /// the embedded watermark XObject by its dimensions after a round-trip.
+    #[cfg(test)]
+    fn watermark_png(w: u32, h: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for i in 0..(w * h) {
+            // A few distinct opaque colours so the embed is verifiably lossless.
+            let r = (i * 37 % 256) as u8;
+            let g = (i * 59 % 256) as u8;
+            let b = (i * 17 % 256) as u8;
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+        crate::raster::png::encode_png(w, h, &rgba)
+    }
+
+    /// A blank multi-page PDF (A4 portrait) for watermark tests.
+    #[cfg(test)]
+    fn blank_pages_pdf(n: usize) -> Vec<u8> {
+        let mut b = crate::convert::build::PdfBuilder::new();
+        for _ in 0..n {
+            b.add_page(595.0, 842.0);
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn image_watermark_stamps_every_page_with_a_single_shared_xobject() {
+        let mut doc = Document::open(&blank_pages_pdf(3)).unwrap();
+        let png = watermark_png(3, 2);
+
+        let before = doc.object_count();
+        let opts = ImageWatermarkOptions {
+            width: Some(120.0),
+            opacity: 0.4, // < 1 ⇒ one ExtGState dict allocated per page
+            ..Default::default()
+        };
+        let stamped = doc.add_image_watermark(&png, &opts).unwrap();
+        assert_eq!(stamped, 3, "all three pages stamped");
+
+        // Single embed: the image XObject is allocated ONCE (1 object), plus one
+        // ExtGState dict per page (opacity < 1) ⇒ growth is exactly 1 + pages,
+        // NOT 3 separate image copies.
+        assert_eq!(
+            doc.object_count() - before,
+            1 + 3,
+            "image embedded once + one ExtGState per page"
+        );
+
+        // After a round-trip the 3×2 image is present (decodable) on every page.
+        let reopened = Document::open(&doc.save()).unwrap();
+        for page in 1..=3u32 {
+            let imgs = reopened.page_images(page);
+            assert!(
+                imgs.values().any(|im| im.width == 3 && im.height == 2),
+                "watermark image present on page {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_watermark_applies_opacity_and_respects_page_subset() {
+        let mut doc = Document::open(&blank_pages_pdf(3)).unwrap();
+        let png = watermark_png(4, 4);
+        let opts = ImageWatermarkOptions {
+            pages: vec![2],
+            width: Some(80.0),
+            opacity: 0.25,
+            ..Default::default()
+        };
+        assert_eq!(doc.add_image_watermark(&png, &opts).unwrap(), 1);
+
+        // Only page 2 carries the image + its opacity ExtGState.
+        let c2 = String::from_utf8_lossy(&doc.page_content(2).unwrap()).into_owned();
+        assert!(c2.contains(" Do"), "image drawn on page 2");
+        assert!(c2.contains(" gs"), "opacity via ExtGState on page 2");
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(
+            reopened.page_images(2).values().any(|im| im.width == 4),
+            "image on page 2"
+        );
+        assert!(
+            reopened.page_images(1).is_empty() && reopened.page_images(3).is_empty(),
+            "pages 1 and 3 untouched",
+        );
+    }
+
+    #[test]
+    fn image_watermark_rotation_and_corner_anchor_roundtrip() {
+        let mut doc = Document::open(&blank_pages_pdf(1)).unwrap();
+        let png = watermark_png(5, 3);
+        let opts = ImageWatermarkOptions {
+            anchor: WatermarkAnchor::BottomRight,
+            width: Some(100.0),
+            rotation_deg: 45.0,
+            opacity: 1.0, // fully opaque ⇒ no ExtGState wrapper
+            ..Default::default()
+        };
+        assert_eq!(doc.add_image_watermark(&png, &opts).unwrap(), 1);
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(content.contains(" cm"), "rotated/scaled CTM emitted");
+        assert!(content.contains(" Do"), "image painted");
+        assert!(!content.contains(" gs"), "no ExtGState when fully opaque");
+        // Round-trips and the image is present.
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(reopened.page_images(1).values().any(|im| im.width == 5));
+    }
+
+    #[test]
+    fn image_watermark_tiling_repeats_the_image() {
+        let mut doc = Document::open(&blank_pages_pdf(1)).unwrap();
+        let png = watermark_png(2, 2);
+        let opts = ImageWatermarkOptions {
+            width: Some(60.0),
+            height: Some(60.0),
+            tile: true,
+            opacity: 0.2,
+            ..Default::default()
+        };
+        assert_eq!(doc.add_image_watermark(&png, &opts).unwrap(), 1);
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        // A 595×842 page tiled at 60pt pitch ⇒ many `Do` operators (one per tile).
+        let tiles = content.matches(" Do").count();
+        assert!(tiles > 50, "tiling paints many copies (got {tiles})");
+    }
+
+    #[test]
+    fn image_watermark_accepts_a_jpeg_input() {
+        // The shared `embeddable_image` path also takes JPEG (embedded verbatim
+        // under /DCTDecode), proving format coverage beyond PNG.
+        let mut doc = Document::open(&blank_pages_pdf(1)).unwrap();
+        let rgba: Vec<u8> = (0..(8 * 8))
+            .flat_map(|i: u32| [(i * 3) as u8, (i * 5) as u8, (i * 7) as u8, 255])
+            .collect();
+        let jpeg = crate::raster::jpeg::encode_jpeg(8, 8, &rgba, 90);
+        let opts = ImageWatermarkOptions {
+            width: Some(100.0),
+            ..Default::default()
+        };
+        assert_eq!(doc.add_image_watermark(&jpeg, &opts).unwrap(), 1);
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(content.contains(" Do"), "jpeg watermark painted");
+        assert!(Document::open(&doc.save()).is_ok(), "round-trips cleanly");
+    }
+
+    #[test]
+    fn image_watermark_rejects_non_image_bytes() {
+        let mut doc = Document::open(&blank_pages_pdf(1)).unwrap();
+        let opts = ImageWatermarkOptions::default();
+        assert!(
+            doc.add_image_watermark(b"not an image", &opts).is_err(),
+            "garbage bytes are rejected, not silently embedded"
+        );
+    }
+
+    #[test]
+    fn text_watermark_still_works_after_image_watermark_refactor() {
+        // Non-regression: the existing text watermark path is unchanged.
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        doc.add_watermark(
+            1,
+            100.0,
+            400.0,
+            48.0,
+            "CONFIDENTIAL",
+            [0.5, 0.5, 0.5],
+            0.3,
+            45.0,
+        )
+        .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(content.contains("(CONFIDENTIAL) Tj"), "text watermark drawn");
+        assert!(content.contains(" gs"), "opacity via ExtGState");
+        assert!(Document::open(&doc.save()).is_ok());
     }
 }

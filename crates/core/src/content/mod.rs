@@ -2489,6 +2489,51 @@ pub fn image_ops(name: &[u8], x: f64, y: f64, w: f64, h: f64) -> Vec<u8> {
     out
 }
 
+/// Content-stream ops to draw image XObject `name` as a `w×h` rectangle whose
+/// **centre** sits at `(cx, cy)`, rotated `rotation_deg`° counter-clockwise about
+/// that centre. Used for image watermarks.
+///
+/// An image draws through the unit square, so the single concatenated CTM is
+/// `T(cx,cy) · R(θ) · S(w,h) · T(-0.5,-0.5)`: scale the unit square to `w×h`,
+/// shift it so its centre is at the origin, rotate, then translate to `(cx,cy)`.
+/// Pre-multiplied to the 2×3 form `[a b c d e f]`:
+/// `a = w·cos`, `b = w·sin`, `c = -h·sin`, `d = h·cos`,
+/// `e = cx - (w·cos - h·sin)/2`, `f = cy - (w·sin + h·cos)/2`.
+pub fn image_ops_centered_rotated(
+    name: &[u8],
+    cx: f64,
+    cy: f64,
+    w: f64,
+    h: f64,
+    rotation_deg: f64,
+) -> Vec<u8> {
+    let (sin, cos) = rotation_deg.to_radians().sin_cos();
+    let a = w * cos;
+    let b = w * sin;
+    let c = -h * sin;
+    let d = h * cos;
+    let e = cx - (a + c) / 2.0;
+    let f = cy - (b + d) / 2.0;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"q\n");
+    out.extend_from_slice(
+        format!(
+            "{} {} {} {} {} {} cm\n",
+            num(a),
+            num(b),
+            num(c),
+            num(d),
+            num(e),
+            num(f),
+        )
+        .as_bytes(),
+    );
+    out.push(b'/');
+    out.extend_from_slice(name);
+    out.extend_from_slice(b" Do\nQ\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

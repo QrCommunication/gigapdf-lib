@@ -2293,6 +2293,62 @@ export class GigaPdfDoc {
     );
   }
   /**
+   * Stamp an **image watermark** across pages from raw image bytes. Accepts the
+   * same five formats the engine decodes — **PNG, JPEG, WebP, GIF, AVIF**. The
+   * image is embedded **once** and referenced on every target page.
+   *
+   * `opts.pages` is a list of 1-based page numbers; omit it (or pass `[]`) to
+   * stamp every page. `opts.anchor` positions the image (`'center'` default, or a
+   * corner) and `opts.offsetX`/`offsetY` nudge it (in points; in `tile` mode they
+   * become the gaps between tiles). `opts.width`/`height` set the target size in
+   * points (height keeps the source aspect ratio when omitted). `opts.rotationDeg`
+   * rotates about the image centre and `opts.opacity` (0–1) sets the alpha.
+   * Returns `false` if the image can't be decoded.
+   */
+  addImageWatermark(
+    data: Uint8Array,
+    opts: {
+      pages?: number[];
+      anchor?: 'center' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+      offsetX?: number;
+      offsetY?: number;
+      width?: number;
+      height?: number;
+      rotationDeg?: number;
+      opacity?: number;
+      tile?: boolean;
+    } = {}
+  ): boolean {
+    const anchorTag = {
+      center: 0,
+      'top-left': 1,
+      'top-right': 2,
+      'bottom-left': 3,
+      'bottom-right': 4,
+    }[opts.anchor ?? 'center'];
+    const pages = opts.pages ?? [];
+    const call = (pp: number, pc: number) =>
+      this.g._withBytes(data, (p, l) =>
+        this.ex().gp_add_image_watermark(
+          this.h,
+          p,
+          l,
+          pp,
+          pc,
+          anchorTag,
+          opts.offsetX ?? 0,
+          opts.offsetY ?? 0,
+          opts.width ?? 0,
+          opts.height ?? 0,
+          opts.rotationDeg ?? 0,
+          opts.opacity ?? 0.25,
+          opts.tile ? 1 : 0
+        )
+      );
+    const rc = pages.length === 0 ? call(0, 0) : this.g._withU32(pages, (pp, pc) => call(pp, pc));
+    return rc === 0;
+  }
+  /**
    * Draw SVG markup on a page as **native vector paths** (crisp at any zoom, not
    * rasterized), fitting its `viewBox` into the box `(x, y, w, h)` in PDF points
    * (origin bottom-left). Supports shapes, `<path>`, groups, transforms and

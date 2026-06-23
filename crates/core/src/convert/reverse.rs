@@ -379,7 +379,12 @@ pub fn image_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
 ///   preserved for every PNG variant.
 /// * **GIF / WebP / AVIF** are decoded to RGBA and re-encoded as an RGBA PNG
 ///   (colour type 6), keeping any alpha channel intact for the soft-mask path.
-fn embeddable_image(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+///
+/// Exposed `pub(crate)` so the image-watermark path
+/// ([`Document::add_image_watermark`](crate::Document::add_image_watermark)) can
+/// accept the same five input formats this conversion does, without duplicating
+/// the format-detect/transcode logic or the raster decoders.
+pub(crate) fn embeddable_image(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     // PNG and JPEG are accepted by the embedder directly — read dimensions
     // from the header.
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {

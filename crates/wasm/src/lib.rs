@@ -1156,6 +1156,63 @@ pub extern "C" fn gp_add_image(
     })
 }
 
+/// Stamp an **image watermark** (PNG / JPEG / WebP / GIF / AVIF bytes at
+/// `data_ptr`, `data_len`) across pages. The image is embedded once and
+/// referenced on every target page.
+///
+/// `pages_ptr`/`pages_count` is a `u32` array of 1-based page numbers; pass a
+/// null pointer or `0` count to stamp **every** page. `anchor` is a tag:
+/// `0`=Center, `1`=TopLeft, `2`=TopRight, `3`=BottomLeft, `4`=BottomRight.
+/// `width`/`height` are target points; pass `<= 0` to use the source pixel size
+/// (`height <= 0` keeps the aspect ratio). `tile != 0` repeats the image in a
+/// grid (then `offset_x`/`offset_y` are the tile gaps). Returns `0` on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_image_watermark(
+    handle: *mut Document,
+    data_ptr: *const u8,
+    data_len: usize,
+    pages_ptr: *const u32,
+    pages_count: usize,
+    anchor: u32,
+    offset_x: f64,
+    offset_y: f64,
+    width: f64,
+    height: f64,
+    rotation_deg: f64,
+    opacity: f64,
+    tile: u32,
+) -> i32 {
+    if data_ptr.is_null() {
+        return -2;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    let pages = if pages_ptr.is_null() || pages_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(pages_ptr, pages_count) }.to_vec()
+    };
+    let anchor = match anchor {
+        1 => gigapdf_core::WatermarkAnchor::TopLeft,
+        2 => gigapdf_core::WatermarkAnchor::TopRight,
+        3 => gigapdf_core::WatermarkAnchor::BottomLeft,
+        4 => gigapdf_core::WatermarkAnchor::BottomRight,
+        _ => gigapdf_core::WatermarkAnchor::Center,
+    };
+    let opts = gigapdf_core::ImageWatermarkOptions {
+        pages,
+        anchor,
+        offset_x,
+        offset_y,
+        width: (width > 0.0).then_some(width),
+        height: (height > 0.0).then_some(height),
+        rotation_deg,
+        opacity,
+        tile: tile != 0,
+    };
+    edit(handle, |doc| doc.add_image_watermark(data, &opts).map(|_| ()))
+}
+
 /// Draw SVG markup (`src_ptr`, `src_len` UTF-8) on a page, fitting its viewBox
 /// into the box `(x, y, width, height)` as **native vector paths** (not
 /// rasterized). 0 on success; non-zero if the SVG can't be parsed.
