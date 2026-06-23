@@ -99,8 +99,8 @@ img{position:absolute}</style></head><body>",
 
 use crate::model::CellValue;
 use crate::model::{
-    Align, Block, BlockKind, Cell, CharStyle, Document, ImageRef, Inline, LinkTarget, List,
-    ListMarker, Paragraph, Shape, Sheet, SheetBlock, Slide, SlideBlock, Table,
+    Align, Block, BlockKind, Cell, CharStyle, CodeBlock, Document, ImageRef, Inline, LinkTarget,
+    List, ListMarker, Paragraph, Shape, Sheet, SheetBlock, Slide, SlideBlock, Table,
 };
 
 /// Convert a unified [`Document`] to **semantic, reflowable** HTML: headings
@@ -123,7 +123,10 @@ pub fn html_from_model(doc: &Document) -> String {
     html.push_str(
         "<style>body{font-family:sans-serif;max-width:50em;margin:2em auto;padding:0 1em}\
 table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.25em .5em}\
-img{max-width:100%}</style></head><body>",
+img{max-width:100%}\
+pre{font-family:monospace;background:#f2f2f2;border:1px solid #ccc;padding:.5em;white-space:pre;overflow:auto}\
+blockquote{margin:0 0 0 1em;padding-left:.75em;border-left:3px solid #ccc;color:#555}\
+hr{border:0;border-top:1px solid #999}</style></head><body>",
     );
     for section in &doc.sections {
         if let Some(header) = &section.header {
@@ -179,9 +182,28 @@ fn html_block(block: &Block, doc: &Document, out: &mut String) {
             html_blocks(&tb.blocks, doc, out);
             out.push_str("</div>");
         }
+        BlockKind::CodeBlock(cb) => html_code(cb, out),
+        BlockKind::Blockquote(bq) => {
+            out.push_str("<blockquote>");
+            html_blocks(&bq.blocks, doc, out);
+            out.push_str("</blockquote>");
+        }
+        BlockKind::HorizontalRule => out.push_str("<hr/>"),
         BlockKind::Sheet(sb) => html_sheet(sb, out),
         BlockKind::Slide(sb) => html_slides(sb, doc, out),
     }
+}
+
+/// A code block → `<pre><code>` (preformatted, monospaced via the document
+/// stylesheet), with an optional `language-*` class from the fence info-string.
+fn html_code(cb: &CodeBlock, out: &mut String) {
+    let class = match &cb.lang {
+        Some(l) if !l.trim().is_empty() => format!(" class=\"language-{}\"", attr_esc(l.trim())),
+        _ => String::new(),
+    };
+    out.push_str(&format!("<pre><code{class}>"));
+    esc(&cb.code, out);
+    out.push_str("</code></pre>");
 }
 
 /// A `style="…"` attribute for a paragraph's alignment (only when not the

@@ -19,11 +19,10 @@
 //! setext headings) are not specially handled — their source text flows through
 //! as plain paragraph content rather than being dropped.
 
-use crate::content::vector::PathSeg;
 use crate::convert::style::Generic;
 use crate::model::{
-    Block, BlockKind, Cell, CharStyle, Document, Heading, Inline, InlineRun, LinkTarget, List,
-    ListItem, ListMarker, Page, Paragraph, Rect, Row, Section, Shape, Table,
+    Block, BlockKind, Blockquote, Cell, CharStyle, CodeBlock, Document, Heading, Inline, InlineRun,
+    LinkTarget, List, ListItem, ListMarker, Page, Paragraph, Row, Section, Table,
 };
 
 /// Body font size used for paragraph runs (points). Mirrors the model→PDF
@@ -69,8 +68,10 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
         }
 
         // Fenced code block: ``` or ~~~ (≥3), captured verbatim until the fence
-        // closes (or EOF).
+        // closes (or EOF). The text after the opening fence is the info-string;
+        // its first word is the language hint.
         if let Some(fence) = code_fence(trimmed) {
+            let lang = fence_info_lang(trimmed, fence.0, fence.1);
             i += 1;
             let mut code = String::new();
             while i < lines.len() {
@@ -85,7 +86,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
                 code.push_str(l);
                 i += 1;
             }
-            out.push(code_block(&code));
+            out.push(code_block(lang, code));
             continue;
         }
 
@@ -113,7 +114,8 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
         }
 
         // Block quote: one or more consecutive `>` lines, recursively parsed and
-        // wrapped as left-indented paragraphs.
+        // wrapped in a semantic Blockquote (so nested constructs survive a
+        // round trip).
         if quote_prefix(raw).is_some() {
             let mut inner: Vec<&str> = Vec::new();
             while i < lines.len() {
@@ -128,10 +130,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
             }
             let owned: Vec<String> = inner.iter().map(|s| s.to_string()).collect();
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            for mut blk in parse_blocks(&refs) {
-                indent_block(&mut blk, 18.0);
-                out.push(blk);
-            }
+            out.push(blockquote_block(parse_blocks(&refs)));
             continue;
         }
 
@@ -205,48 +204,45 @@ fn heading_block(level: u8, text: &str) -> Block {
     }
 }
 
-/// A fenced-code-block [`Paragraph`]: monospace, each source line a [`LineBreak`]
-/// boundary so the text stays verbatim.
-fn code_block(code: &str) -> Block {
-    let mut runs = Vec::new();
-    for (idx, line) in code.split('\n').enumerate() {
-        if idx > 0 {
-            runs.push(Inline::LineBreak);
-        }
-        runs.push(Inline::Run(InlineRun {
-            text: line.to_string(),
-            style: mono_style(),
-            source_index: None,
-        }));
-    }
-    paragraph_block(runs)
-}
-
-/// A thin full-width horizontal rule, modelled as a 1pt-tall filled [`Shape`]
-/// across the page content width (frame in PDF points, top-left origin).
-fn rule_block() -> Block {
-    let geom = crate::model::PageGeometry::default();
-    let w = (geom.width - geom.margins.left - geom.margins.right).max(1.0);
+/// A fenced-code-block → a semantic [`CodeBlock`]: verbatim `code` with the
+/// optional language hint from the fence info-string.
+fn code_block(lang: Option<String>, code: String) -> Block {
     Block {
-        frame: Some(Rect::new(geom.margins.left, 0.0, w, 1.0)),
-        kind: BlockKind::Shape(Shape {
-            segments: vec![PathSeg::Move(0.0, 0.0), PathSeg::Line(w, 0.0)],
-            fill: None,
-            stroke: Some([0.6, 0.6, 0.6]),
-            stroke_width: 1.0,
-            dash: Vec::new(),
-        }),
+        kind: BlockKind::CodeBlock(CodeBlock { lang, code }),
         ..Block::default()
     }
 }
 
-/// Shift a block's left indent by `pt` points (used for block quotes). For flow
-/// paragraphs/headings this nudges `indent_left_pt`.
-fn indent_block(block: &mut Block, pt: f64) {
-    match &mut block.kind {
-        BlockKind::Paragraph(p) => p.style.indent_left_pt += pt,
-        BlockKind::Heading(h) => h.para.style.indent_left_pt += pt,
-        _ => {}
+/// A thematic break → a semantic [`BlockKind::HorizontalRule`].
+fn rule_block() -> Block {
+    Block {
+        kind: BlockKind::HorizontalRule,
+        ..Block::default()
+    }
+}
+
+/// The language hint of a fence info-string: the text after the opening fence
+/// run, first whitespace-delimited word, lower-cased. `None` when absent.
+fn fence_info_lang(trimmed: &str, fence_char: char, run_len: usize) -> Option<String> {
+    // Skip exactly the fence run, then read the info-string's first token.
+    let after: String = trimmed
+        .chars()
+        .skip_while(|&c| c == fence_char)
+        .collect::<String>();
+    let _ = run_len;
+    let token = after.split_whitespace().next()?;
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// Wrap a list of blocks in a semantic [`Blockquote`].
+fn blockquote_block(blocks: Vec<Block>) -> Block {
+    Block {
+        kind: BlockKind::Blockquote(Blockquote { blocks }),
+        ..Block::default()
     }
 }
 
@@ -815,31 +811,47 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_block_is_monospace_verbatim() {
-        let doc = md_to_model("```\nlet x = 1;\n**not bold**\n```");
-        let p = match &blocks(&doc)[0].kind {
-            BlockKind::Paragraph(p) => p,
-            other => panic!("expected paragraph, got {other:?}"),
+    fn fenced_code_block_is_a_code_block_verbatim() {
+        let doc = md_to_model("```rust\nlet x = 1;\n**not bold**\n```");
+        let cb = match &blocks(&doc)[0].kind {
+            BlockKind::CodeBlock(cb) => cb,
+            other => panic!("expected code block, got {other:?}"),
         };
-        // All text runs are monospace; markup inside is NOT interpreted.
-        assert!(p.runs.iter().all(
-            |i| matches!(i, Inline::Run(r) if matches!(r.style.generic, Generic::Mono))
-                || matches!(i, Inline::LineBreak)
-        ));
-        let mut s = String::new();
-        collect(&p.runs, &mut s);
-        assert!(s.contains("let x = 1;"));
-        assert!(s.contains("**not bold**"), "fence content is verbatim");
+        // The info-string language is captured.
+        assert_eq!(cb.lang.as_deref(), Some("rust"));
+        // Content is verbatim — markup inside is NOT interpreted.
+        assert_eq!(cb.code, "let x = 1;\n**not bold**");
     }
 
     #[test]
-    fn thematic_break_is_a_rule_shape() {
+    fn fenced_code_block_without_lang_has_none() {
+        let doc = md_to_model("```\nplain code\n```");
+        match &blocks(&doc)[0].kind {
+            BlockKind::CodeBlock(cb) => {
+                assert!(cb.lang.is_none());
+                assert_eq!(cb.code, "plain code");
+            }
+            other => panic!("expected code block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thematic_break_is_a_horizontal_rule() {
         let doc = md_to_model("above\n\n---\n\nbelow");
         let b = blocks(&doc);
         assert!(
-            b.iter().any(|blk| matches!(&blk.kind, BlockKind::Shape(_))),
-            "a rule shape exists"
+            b.iter()
+                .any(|blk| matches!(&blk.kind, BlockKind::HorizontalRule)),
+            "a horizontal rule exists"
         );
+        // `***` and `___` are thematic breaks too.
+        for src in ["***", "___", "- - -"] {
+            let d = md_to_model(src);
+            assert!(
+                matches!(&blocks(&d)[0].kind, BlockKind::HorizontalRule),
+                "`{src}` is a rule"
+            );
+        }
     }
 
     #[test]
@@ -870,15 +882,39 @@ mod tests {
     }
 
     #[test]
-    fn block_quote_indents_paragraph() {
-        let doc = md_to_model("> quoted line");
+    fn block_quote_is_a_blockquote() {
+        let doc = md_to_model("> quoted line\n> still quoted");
         match &blocks(&doc)[0].kind {
-            BlockKind::Paragraph(p) => {
-                assert_eq!(para_text(p), "quoted line");
-                assert!(p.style.indent_left_pt > 0.0, "quote is indented");
+            BlockKind::Blockquote(bq) => {
+                assert_eq!(bq.blocks.len(), 1, "the two lines join into one paragraph");
+                match &bq.blocks[0].kind {
+                    BlockKind::Paragraph(p) => {
+                        assert_eq!(para_text(p), "quoted line still quoted")
+                    }
+                    other => panic!("expected paragraph inside quote, got {other:?}"),
+                }
             }
-            other => panic!("expected paragraph, got {other:?}"),
+            other => panic!("expected blockquote, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nested_block_quote_round_trips_constructs() {
+        // A quote containing a heading and a code block keeps both as semantic
+        // children (not flattened to indented text).
+        let doc = md_to_model("> # Quoted Title\n>\n> ```\n> code()\n> ```");
+        let bq = match &blocks(&doc)[0].kind {
+            BlockKind::Blockquote(bq) => bq,
+            other => panic!("expected blockquote, got {other:?}"),
+        };
+        assert!(bq
+            .blocks
+            .iter()
+            .any(|b| matches!(&b.kind, BlockKind::Heading(_))));
+        assert!(bq
+            .blocks
+            .iter()
+            .any(|b| matches!(&b.kind, BlockKind::CodeBlock(_))));
     }
 
     #[test]
@@ -889,7 +925,7 @@ mod tests {
 
     #[test]
     fn realistic_document_block_kinds() {
-        let md = "# Title\n\nIntro paragraph with **bold** and a [link](http://x).\n\n## Items\n\n- first\n- second\n\n```\ncode();\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let md = "# Title\n\nIntro paragraph with **bold** and a [link](http://x).\n\n## Items\n\n- first\n- second\n\n```\ncode();\n```\n\n---\n\n> quoted\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n";
         let doc = md_to_model(md);
         let kinds: Vec<&str> = blocks(&doc)
             .iter()
@@ -898,6 +934,9 @@ mod tests {
                 BlockKind::Paragraph(_) => "paragraph",
                 BlockKind::List(_) => "list",
                 BlockKind::Table(_) => "table",
+                BlockKind::CodeBlock(_) => "code",
+                BlockKind::Blockquote(_) => "quote",
+                BlockKind::HorizontalRule => "rule",
                 BlockKind::Shape(_) => "shape",
                 _ => "other",
             })
@@ -905,12 +944,7 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                "heading",
-                "paragraph",
-                "heading",
-                "list",
-                "paragraph",
-                "table"
+                "heading", "paragraph", "heading", "list", "code", "rule", "quote", "table"
             ]
         );
     }

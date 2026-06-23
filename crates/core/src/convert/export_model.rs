@@ -22,9 +22,9 @@ use crate::convert::office::{
 use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
 use crate::model::{
-    Align, Block, BlockKind, BorderStyle, Cell, CharStyle, Document, Heading, ImageRef, Inline,
-    LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Section, Shape, Sheet, SheetBlock,
-    SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
+    Align, Block, BlockKind, Blockquote, BorderStyle, Cell, CharStyle, CodeBlock, Document, Heading,
+    ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Section, Shape,
+    Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
 };
 use crate::model::{CellValue, PlaceholderRole};
 
@@ -235,9 +235,51 @@ fn docx_block(block: &Block, ctx: &mut DocxCtx, out: &mut String) {
         BlockKind::Image(img) => out.push_str(&docx_image_para(img, ctx)),
         BlockKind::Shape(shape) => out.push_str(&docx_shape_para(shape, ctx)),
         BlockKind::TextBox(tb) => docx_textbox(tb, ctx, out),
+        BlockKind::CodeBlock(cb) => out.push_str(&docx_code(cb)),
+        BlockKind::Blockquote(bq) => docx_blockquote(bq, ctx, out),
+        BlockKind::HorizontalRule => out.push_str(docx_hr()),
         BlockKind::Sheet(sheet) => docx_sheet(sheet, ctx, out),
         BlockKind::Slide(slides) => docx_slides(slides, ctx, out),
     }
+}
+
+/// A code block → one shaded, monospaced `<w:p>` whose source lines are joined by
+/// `<w:br/>` so the layout stays verbatim (Word renders the run preformatted).
+fn docx_code(cb: &CodeBlock) -> String {
+    let mut runs = String::new();
+    for (i, line) in cb.code.split('\n').enumerate() {
+        if i > 0 {
+            runs.push_str("<w:r><w:br/></w:r>");
+        }
+        if !line.is_empty() {
+            let mut t = String::new();
+            esc(line, &mut t);
+            runs.push_str(&format!(
+                "<w:r><w:rPr><w:rFonts w:ascii=\"Courier New\" w:hAnsi=\"Courier New\" \
+w:cs=\"Courier New\"/><w:sz w:val=\"20\"/></w:rPr><w:t xml:space=\"preserve\">{t}</w:t></w:r>"
+            ));
+        }
+    }
+    // A light grey shading + a thin box border sets the block off as code.
+    format!(
+        "<w:p><w:pPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F2F2F2\"/>\
+<w:spacing w:after=\"0\"/></w:pPr>{runs}</w:p>"
+    )
+}
+
+/// A block quote → its inner blocks rendered with extra left indent, so the
+/// quotation reads as set off from the body. The indent is applied at the model
+/// level (cloning the blocks and shifting `indent_left_pt`) rather than by XML
+/// surgery, so nested structure (lists/tables/quotes) is preserved.
+fn docx_blockquote(bq: &Blockquote, ctx: &mut DocxCtx, out: &mut String) {
+    let indented: Vec<Block> = bq.blocks.iter().map(|b| indent_block_left(b, 24.0)).collect();
+    out.push_str(&docx_blocks(&indented, ctx));
+}
+
+/// A horizontal rule → an empty paragraph carrying only a bottom border.
+fn docx_hr() -> &'static str {
+    "<w:p><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" \
+w:color=\"999999\"/></w:pBdr></w:pPr></w:p>"
 }
 
 /// One paragraph. `style_id` (e.g. `Some("Heading1")`) emits a `w:pStyle`;
@@ -1926,6 +1968,13 @@ fn odt_block(block: &Block, ctx: &mut OdfCtx, out: &mut String) {
         BlockKind::Image(img) => out.push_str(&odt_image_para(img, ctx)),
         BlockKind::Shape(_) => {} // block shapes have no flow position in ODT text
         BlockKind::TextBox(tb) => out.push_str(&odt_blocks(&tb.blocks, ctx)),
+        BlockKind::CodeBlock(cb) => out.push_str(&odt_code(cb, ctx)),
+        BlockKind::Blockquote(bq) => {
+            let indented: Vec<Block> =
+                bq.blocks.iter().map(|b| indent_block_left(b, 24.0)).collect();
+            out.push_str(&odt_blocks(&indented, ctx));
+        }
+        BlockKind::HorizontalRule => out.push_str(&odt_hr(ctx)),
         BlockKind::Sheet(sheet) => {
             for s in &sheet.sheets {
                 out.push_str(&odt_table(&sheet_to_table(s), ctx));
@@ -1939,6 +1988,50 @@ fn odt_block(block: &Block, ctx: &mut OdfCtx, out: &mut String) {
             }
         }
     }
+}
+
+/// A code block → a preformatted, monospaced ODF paragraph (grey background + a
+/// thin box border), with source lines separated by `<text:line-break/>` so the
+/// verbatim layout survives.
+fn odt_code(cb: &CodeBlock, ctx: &mut OdfCtx) -> String {
+    let pid = ctx.next_style();
+    let pname = format!("Code{pid}");
+    ctx.auto.push_str(&format!(
+        "<style:style style:name=\"{pname}\" style:family=\"paragraph\">\
+<style:paragraph-properties fo:background-color=\"#f2f2f2\" \
+fo:border=\"0.5pt solid #cccccc\" fo:padding=\"3pt\"/>\
+<style:text-properties style:font-name=\"Courier New\" fo:font-family=\"'Courier New'\" \
+style:font-family-generic=\"modern\" fo:font-size=\"10pt\"/></style:style>"
+    ));
+    let sid = ctx.next_style();
+    let sname = format!("CodeT{sid}");
+    ctx.auto.push_str(&format!(
+        "<style:style style:name=\"{sname}\" style:family=\"text\">\
+<style:text-properties style:font-name=\"Courier New\" fo:font-family=\"'Courier New'\" \
+style:font-family-generic=\"modern\" fo:font-size=\"10pt\"/></style:style>"
+    ));
+    let mut runs = String::new();
+    for (i, line) in cb.code.split('\n').enumerate() {
+        if i > 0 {
+            runs.push_str("<text:line-break/>");
+        }
+        runs.push_str(&format!("<text:span text:style-name=\"{sname}\">"));
+        esc(line, &mut runs);
+        runs.push_str("</text:span>");
+    }
+    format!("<text:p text:style-name=\"{pname}\">{runs}</text:p>")
+}
+
+/// A horizontal rule → an empty paragraph carrying only a bottom border.
+fn odt_hr(ctx: &mut OdfCtx) -> String {
+    let pid = ctx.next_style();
+    let pname = format!("Hr{pid}");
+    ctx.auto.push_str(&format!(
+        "<style:style style:name=\"{pname}\" style:family=\"paragraph\">\
+<style:paragraph-properties fo:border-bottom=\"0.5pt solid #999999\" \
+fo:margin-top=\"6pt\" fo:margin-bottom=\"6pt\"/></style:style>"
+    ));
+    format!("<text:p text:style-name=\"{pname}\"/>")
 }
 
 /// One paragraph or heading. `tag` is `"p"` or `"h"`; `extra` adds attributes
@@ -2966,6 +3059,31 @@ fn cell_display(v: &CellValue) -> String {
     }
 }
 
+/// Clone `block`, shifting the left indent of its paragraph-like content by `pt`
+/// points (recursing through quotes/text boxes/list items/cells). Used to set a
+/// block quote off from the body without XML surgery.
+fn indent_block_left(block: &Block, pt: f64) -> Block {
+    let mut b = block.clone();
+    match &mut b.kind {
+        BlockKind::Paragraph(p) => p.style.indent_left_pt += pt,
+        BlockKind::Heading(h) => h.para.style.indent_left_pt += pt,
+        BlockKind::List(list) => {
+            for item in &mut list.items {
+                item.blocks = item.blocks.iter().map(|ib| indent_block_left(ib, pt)).collect();
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            tb.blocks = tb.blocks.iter().map(|ib| indent_block_left(ib, pt)).collect();
+        }
+        BlockKind::Blockquote(bq) => {
+            bq.blocks = bq.blocks.iter().map(|ib| indent_block_left(ib, pt)).collect();
+        }
+        // Code/rule/table/image/shape/sheet/slide keep their own geometry.
+        _ => {}
+    }
+    b
+}
+
 /// A plain single-run paragraph block carrying `text`.
 fn text_block(text: &str) -> Block {
     Block {
@@ -3031,6 +3149,25 @@ fn collect_paras(block: &Block, out: &mut Vec<Paragraph>) {
                 }
             }
         }
+        BlockKind::CodeBlock(cb) => {
+            // One monospaced paragraph per source line so the code text survives
+            // in a text-only frame.
+            for line in cb.code.split('\n') {
+                let mut p = plain_para(line);
+                if let Some(Inline::Run(r)) = p.runs.first_mut() {
+                    r.style.generic = crate::convert::style::Generic::Mono;
+                    r.style.size_pt = 10.0;
+                }
+                out.push(p);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            for b in &bq.blocks {
+                collect_paras(b, out);
+            }
+        }
+        // A rule carries no text.
+        BlockKind::HorizontalRule => {}
         BlockKind::Image(_) | BlockKind::Shape(_) => {}
         BlockKind::Slide(sb) => {
             for slide in &sb.slides {
@@ -3182,6 +3319,9 @@ impl<'a> MdWriter<'a> {
             }
             BlockKind::Shape(_) => {} // no Markdown representation for vector art
             BlockKind::TextBox(tb) => self.blocks(&tb.blocks, out),
+            BlockKind::CodeBlock(cb) => self.code_block(cb, out),
+            BlockKind::Blockquote(bq) => self.blockquote(bq, out),
+            BlockKind::HorizontalRule => md_rule(out),
             BlockKind::Sheet(sheet) => {
                 for s in &sheet.sheets {
                     self.table(&sheet_to_table(s), out);
@@ -3213,6 +3353,44 @@ impl<'a> MdWriter<'a> {
         // A heading must be a single line: fold any hard/soft breaks to spaces.
         out.push_str(text.replace('\n', " ").trim_end());
         out.push_str("\n\n");
+    }
+
+    /// A fenced code block: a backtick fence (lengthened past the longest internal
+    /// backtick run so the content can never close the fence), the optional
+    /// language info-string, then the verbatim code, then the closing fence.
+    fn code_block(&self, cb: &CodeBlock, out: &mut String) {
+        let fence_len = longest_backtick_run(&cb.code).saturating_add(1).max(3);
+        let fence: String = "`".repeat(fence_len);
+        out.push_str(&fence);
+        if let Some(lang) = &cb.lang {
+            // The info-string is a single token; keep it as-is (no newlines).
+            out.push_str(lang.replace(['\n', '\r', '`'], " ").trim());
+        }
+        out.push('\n');
+        out.push_str(&cb.code);
+        if !cb.code.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&fence);
+        out.push_str("\n\n");
+    }
+
+    /// A block quote: render the inner blocks to Markdown, then prefix every line
+    /// (including the blank separators) with `> ` so nested constructs survive.
+    fn blockquote(&self, bq: &Blockquote, out: &mut String) {
+        let mut inner = String::new();
+        self.blocks(&bq.blocks, &mut inner);
+        let inner = md_tidy(inner); // collapse the trailing newline noise
+        for line in inner.trim_end_matches('\n').split('\n') {
+            if line.is_empty() {
+                out.push('>');
+            } else {
+                out.push_str("> ");
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        out.push('\n');
     }
 
     fn paragraph(&self, p: &Paragraph, out: &mut String) {
@@ -3519,6 +3697,22 @@ fn md_rule(out: &mut String) {
         }
     }
     out.push_str("---\n\n");
+}
+
+/// The length of the longest consecutive run of backticks in `s` (0 if none) —
+/// used to size a code fence so the content can never accidentally close it.
+fn longest_backtick_run(s: &str) -> usize {
+    let mut best = 0usize;
+    let mut cur = 0usize;
+    for c in s.chars() {
+        if c == '`' {
+            cur += 1;
+            best = best.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    best
 }
 
 /// Emit one GFM table row (`| a | b |`) from already-rendered cells.
@@ -4123,6 +4317,26 @@ fn xhtml_block(block: &Block, doc: &Document, out: &mut String) {
             xhtml_blocks(&tb.blocks, doc, out);
             out.push_str("</div>");
         }
+        BlockKind::CodeBlock(cb) => {
+            // Preformatted code: <pre><code> keeps whitespace + a language class.
+            let class = match &cb.lang {
+                Some(l) if !l.trim().is_empty() => {
+                    let mut esc_lang = String::new();
+                    esc(l.trim(), &mut esc_lang);
+                    format!(" class=\"language-{esc_lang}\"")
+                }
+                _ => String::new(),
+            };
+            out.push_str(&format!("<pre><code{class}>"));
+            esc(&cb.code, out);
+            out.push_str("</code></pre>");
+        }
+        BlockKind::Blockquote(bq) => {
+            out.push_str("<blockquote>");
+            xhtml_blocks(&bq.blocks, doc, out);
+            out.push_str("</blockquote>");
+        }
+        BlockKind::HorizontalRule => out.push_str("<hr/>"),
         BlockKind::Sheet(sb) => {
             for s in &sb.sheets {
                 xhtml_sheet(s, out);
@@ -5830,5 +6044,204 @@ mod tests {
         assert!(md.contains("author: Ada\n"), "author key: {md}");
         assert!(md.contains("lang: en\n"), "lang key: {md}");
         assert!(md.contains("\n---\n\n"), "front-matter closes: {md}");
+    }
+
+    // ── CodeBlock / Blockquote / HorizontalRule ───────────────────────────────
+
+    fn code_blk(lang: Option<&str>, code: &str) -> Block {
+        Block {
+            kind: BlockKind::CodeBlock(crate::model::CodeBlock {
+                lang: lang.map(str::to_string),
+                code: code.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn quote_blk(blocks: Vec<Block>) -> Block {
+        Block {
+            kind: BlockKind::Blockquote(crate::model::Blockquote { blocks }),
+            ..Default::default()
+        }
+    }
+
+    fn rule_blk() -> Block {
+        Block {
+            kind: BlockKind::HorizontalRule,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn markdown_code_block_emits_fenced_block_with_lang() {
+        let md = markdown_from_model(&md_doc(vec![code_blk(Some("rust"), "fn main() {}")]));
+        assert!(md.contains("```rust\nfn main() {}\n```"), "fenced + lang: {md}");
+    }
+
+    #[test]
+    fn markdown_code_fence_lengthens_past_internal_backticks() {
+        // Content containing a ``` run must be wrapped in a longer fence.
+        let md = markdown_from_model(&md_doc(vec![code_blk(None, "a ``` b")]));
+        assert!(md.contains("````\na ``` b\n````"), "dynamic fence: {md}");
+    }
+
+    #[test]
+    fn markdown_blockquote_prefixes_every_line() {
+        let inner = vec![md_para(vec![run("quoted text")])];
+        let md = markdown_from_model(&md_doc(vec![quote_blk(inner)]));
+        assert!(md.contains("> quoted text"), "quoted line: {md}");
+    }
+
+    #[test]
+    fn markdown_horizontal_rule_emits_dash_break() {
+        let md = markdown_from_model(&md_doc(vec![
+            para("before"),
+            rule_blk(),
+            para("after"),
+        ]));
+        assert!(md.contains("\n---\n"), "thematic break: {md}");
+    }
+
+    #[test]
+    fn markdown_round_trips_code_quote_rule() {
+        // model → markdown → model must preserve the three new block kinds.
+        let original = md_doc(vec![
+            code_blk(Some("python"), "print('hi')\nx = 1"),
+            rule_blk(),
+            quote_blk(vec![md_para(vec![run("a quote")])]),
+        ]);
+        let md = markdown_from_model(&original);
+        let back = crate::convert::md_to_model(&md);
+        let b = &back.sections[0].pages[0].blocks;
+
+        // CodeBlock survives verbatim with its language.
+        let cb = b
+            .iter()
+            .find_map(|x| match &x.kind {
+                BlockKind::CodeBlock(cb) => Some(cb),
+                _ => None,
+            })
+            .expect("a code block round-trips");
+        assert_eq!(cb.lang.as_deref(), Some("python"));
+        assert_eq!(cb.code, "print('hi')\nx = 1");
+
+        // HorizontalRule survives.
+        assert!(
+            b.iter().any(|x| matches!(&x.kind, BlockKind::HorizontalRule)),
+            "a rule round-trips: {md}"
+        );
+
+        // Blockquote survives with its inner paragraph text.
+        let bq = b
+            .iter()
+            .find_map(|x| match &x.kind {
+                BlockKind::Blockquote(bq) => Some(bq),
+                _ => None,
+            })
+            .expect("a blockquote round-trips");
+        let text: String = bq
+            .blocks
+            .iter()
+            .flat_map(|ib| match &ib.kind {
+                BlockKind::Paragraph(p) => p
+                    .runs
+                    .iter()
+                    .filter_map(|r| match r {
+                        Inline::Run(run) => Some(run.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(text.contains("a quote"), "quote text survives: {text}");
+    }
+
+    #[test]
+    fn html_from_model_renders_code_quote_rule_tags() {
+        let doc = md_doc(vec![
+            code_blk(Some("rust"), "let x = 1;"),
+            rule_blk(),
+            quote_blk(vec![md_para(vec![run("cite")])]),
+        ]);
+        let html = crate::convert::web::html_from_model(&doc);
+        assert!(html.contains("<pre><code class=\"language-rust\">"), "code: {html}");
+        assert!(html.contains("let x = 1;"), "code text: {html}");
+        assert!(html.contains("<hr/>"), "rule: {html}");
+        assert!(html.contains("<blockquote>"), "quote open: {html}");
+        assert!(html.contains("cite"), "quote text: {html}");
+    }
+
+    #[test]
+    fn html_to_pdf_renders_code_quote_rule_without_panic() {
+        // The real HTML→PDF path: model → semantic HTML → the html render
+        // pipeline. It must produce a valid, non-trivial PDF for all three.
+        let doc = md_doc(vec![
+            code_blk(Some("rust"), "fn main() {\n    println!(\"hi\");\n}"),
+            rule_blk(),
+            quote_blk(vec![md_para(vec![run("a quotation")])]),
+        ]);
+        let html = crate::convert::web::html_from_model(&doc);
+        let pdf = crate::convert::reverse::html_to_pdf(&html);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+        assert!(pdf.len() > 500, "non-trivial PDF: {} bytes", pdf.len());
+    }
+
+    #[test]
+    fn pdf_from_model_lays_out_code_quote_rule() {
+        // The compat model→ConvPage→PDF path must place the code text and the
+        // rule shape (and not drop the quote's text).
+        let doc = md_doc(vec![
+            code_blk(None, "alpha\nbeta"),
+            quote_blk(vec![md_para(vec![run("quoted body")])]),
+            rule_blk(),
+        ]);
+        let pages: Vec<crate::convert::ConvPage> = (&doc).into();
+        let all_text: String = pages
+            .iter()
+            .flat_map(|p| p.texts.iter().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(all_text.contains("alpha"), "code line 1: {all_text}");
+        assert!(all_text.contains("beta"), "code line 2: {all_text}");
+        assert!(all_text.contains("quoted body"), "quote text: {all_text}");
+        let has_rule = pages.iter().any(|p| !p.shapes.is_empty());
+        assert!(has_rule, "the horizontal rule produced a shape");
+    }
+
+    #[test]
+    fn xhtml_export_renders_code_quote_rule() {
+        // EPUB chapters are XHTML; the three constructs must be valid elements.
+        let doc = md_doc(vec![
+            code_blk(Some("js"), "console.log(1)"),
+            rule_blk(),
+            quote_blk(vec![md_para(vec![run("epub quote")])]),
+        ]);
+        let mut out = String::new();
+        xhtml_blocks(&doc.sections[0].pages[0].blocks, &doc, &mut out);
+        assert!(out.contains("<pre><code class=\"language-js\">"), "code: {out}");
+        assert!(out.contains("console.log(1)"), "code text: {out}");
+        assert!(out.contains("<hr/>"), "rule: {out}");
+        assert!(out.contains("<blockquote>"), "quote: {out}");
+        assert!(out.contains("epub quote"), "quote text: {out}");
+    }
+
+    #[test]
+    fn docx_export_renders_code_quote_rule() {
+        let doc = md_doc(vec![
+            code_blk(None, "x = 1"),
+            rule_blk(),
+            quote_blk(vec![md_para(vec![run("docx quote")])]),
+        ]);
+        let bytes = docx_from_model(&doc);
+        let files = read_zip(&bytes);
+        let document = files
+            .get("word/document.xml")
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .expect("document.xml present");
+        assert!(document.contains("Courier New"), "code uses a mono font: {document}");
+        assert!(document.contains("x = 1"), "code text present");
+        assert!(document.contains("<w:pBdr>"), "rule emits a paragraph border");
+        assert!(document.contains("docx quote"), "quote text present");
     }
 }

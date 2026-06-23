@@ -29,8 +29,8 @@ use crate::content::vector::PathSeg;
 use crate::convert::style::{Generic, TextStyle};
 use crate::convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 use crate::model::{
-    Block, BlockKind, CharStyle, Document, Heading, ImageRef, Inline, LineHeight, List, ListMarker,
-    PageGeometry, Paragraph, Rect, Shape, Sheet, Slide, Table, TextBox,
+    Block, BlockKind, Blockquote, CharStyle, Document, Heading, ImageRef, Inline, LineHeight, List,
+    ListMarker, PageGeometry, Paragraph, Rect, Shape, Sheet, Slide, Table, TextBox,
 };
 
 /// Default column width (points) for grid cells whose sheet omits a width.
@@ -272,6 +272,12 @@ impl Flow {
             BlockKind::List(l) => self.flow_list(l, indent),
             BlockKind::Table(t) => self.flow_table(t, indent),
             BlockKind::TextBox(tb) => self.layout_blocks(&tb.blocks, indent),
+            BlockKind::CodeBlock(cb) => self.flow_code(cb, indent),
+            BlockKind::Blockquote(bq) => {
+                // A quote flows its blocks at a deeper left indent.
+                self.layout_blocks(&bq.blocks, indent + 18.0);
+            }
+            BlockKind::HorizontalRule => self.flow_rule(indent),
             BlockKind::Image(_) | BlockKind::Shape(_) => {
                 // No frame ⇒ no geometry to flow a raster/vector into; skipped in
                 // the compat fallback (kept by the structured exporters later).
@@ -281,6 +287,41 @@ impl Flow {
                 // level (one ConvPage per sheet/slide), never inside a flow.
             }
         }
+    }
+
+    /// Flow a code block: each source line emitted verbatim in a monospace style.
+    fn flow_code(&mut self, code: &crate::model::CodeBlock, indent: f64) {
+        let cs = CharStyle {
+            generic: Generic::Mono,
+            size_pt: 10.0,
+            ..CharStyle::default()
+        };
+        for line in code.code.split('\n') {
+            self.emit_line(indent, line, &cs, LineHeight::Normal);
+        }
+    }
+
+    /// Flow a horizontal rule: a thin full-width stroke at the current pen.
+    fn flow_rule(&mut self, indent: f64) {
+        self.ensure_room(MIN_LINE_HEIGHT);
+        let page = self.cur();
+        let x = self.left + indent;
+        let w = (self.bottom_right() - x).max(1.0);
+        let y = self.y + MIN_LINE_HEIGHT / 2.0;
+        self.pages[page].shapes.push(PlacedShape {
+            x,
+            y,
+            width: w,
+            height: 0.0,
+            segments: vec![PathSeg::Move(x, y), PathSeg::Line(x + w, y)],
+            fill: None,
+            stroke: Some([0.6, 0.6, 0.6]),
+            stroke_width: 1.0,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        });
+        self.y += MIN_LINE_HEIGHT;
     }
 
     fn flow_paragraph(&mut self, para: &Paragraph, indent: f64) {
@@ -378,6 +419,9 @@ impl Flow {
             BlockKind::TextBox(tb) => place_text_box(&mut self.pages[page], tb, frame),
             BlockKind::List(l) => place_list_box(&mut self.pages[page], l, frame),
             BlockKind::Table(t) => place_table_box(&mut self.pages[page], t, frame),
+            BlockKind::CodeBlock(cb) => place_code_box(&mut self.pages[page], cb, frame),
+            BlockKind::Blockquote(bq) => place_quote_box(&mut self.pages[page], bq, frame),
+            BlockKind::HorizontalRule => place_rule(&mut self.pages[page], frame),
             BlockKind::Sheet(_) | BlockKind::Slide(_) => {
                 // Page-replacing kinds are never nested as absolute boxes.
             }
@@ -645,6 +689,32 @@ fn place_blocks_at(
                 }
             }
             BlockKind::TextBox(tb) => place_blocks_at(page, &tb.blocks, x, y, width, indent),
+            BlockKind::Blockquote(bq) => {
+                place_blocks_at(page, &bq.blocks, x, y, width, indent + 18.0)
+            }
+            BlockKind::CodeBlock(cb) => {
+                let cs = CharStyle {
+                    generic: Generic::Mono,
+                    size_pt: 10.0,
+                    ..CharStyle::default()
+                };
+                let advance = line_advance(&cs, LineHeight::Normal);
+                for line in cb.code.split('\n') {
+                    if !line.is_empty() {
+                        page.texts.push(PlacedText {
+                            text: line.to_string(),
+                            x: x + indent,
+                            y: *y,
+                            width: (width - indent).max(0.0),
+                            height: effective_size(&cs),
+                            style: text_style(&cs),
+                        });
+                    }
+                    *y += advance;
+                }
+            }
+            // A horizontal rule has no flowable text in an absolute box.
+            BlockKind::HorizontalRule => {}
             _ => {}
         }
     }
@@ -757,8 +827,61 @@ fn place_block_on(page: &mut ConvPage, block: &Block) {
         BlockKind::TextBox(tb) => place_text_box(page, tb, frame),
         BlockKind::List(l) => place_list_box(page, l, frame),
         BlockKind::Table(t) => place_table_box(page, t, frame),
+        BlockKind::CodeBlock(cb) => place_code_box(page, cb, frame),
+        BlockKind::Blockquote(bq) => place_quote_box(page, bq, frame),
+        BlockKind::HorizontalRule => place_rule(page, frame),
         BlockKind::Sheet(_) | BlockKind::Slide(_) => {}
     }
+}
+
+/// Place a code block at `frame`: each line stacked verbatim in a monospace run.
+fn place_code_box(page: &mut ConvPage, code: &crate::model::CodeBlock, frame: Rect) {
+    let cs = CharStyle {
+        generic: Generic::Mono,
+        size_pt: 10.0,
+        ..CharStyle::default()
+    };
+    let mut y = frame.y;
+    let advance = line_advance(&cs, LineHeight::Normal);
+    for line in code.code.split('\n') {
+        if !line.is_empty() {
+            page.texts.push(PlacedText {
+                text: line.to_string(),
+                x: frame.x,
+                y,
+                width: frame.w,
+                height: effective_size(&cs),
+                style: text_style(&cs),
+            });
+        }
+        y += advance;
+    }
+}
+
+/// Place a block quote at `frame`: its blocks stacked from the top-left, nudged
+/// right so the quotation reads as set off from the surrounding flow.
+fn place_quote_box(page: &mut ConvPage, quote: &Blockquote, frame: Rect) {
+    let mut y = frame.y;
+    place_blocks_at(page, &quote.blocks, frame.x, &mut y, frame.w, 18.0);
+}
+
+/// Place a horizontal rule across the top of `frame` as a thin stroke.
+fn place_rule(page: &mut ConvPage, frame: Rect) {
+    let w = frame.w.max(1.0);
+    let y = frame.y;
+    page.shapes.push(PlacedShape {
+        x: frame.x,
+        y,
+        width: w,
+        height: 0.0,
+        segments: vec![PathSeg::Move(frame.x, y), PathSeg::Line(frame.x + w, y)],
+        fill: None,
+        stroke: Some([0.6, 0.6, 0.6]),
+        stroke_width: 1.0,
+        fill_alpha: 1.0,
+        stroke_alpha: 1.0,
+        dash: Vec::new(),
+    });
 }
 
 impl From<&Document> for Vec<ConvPage> {

@@ -517,6 +517,12 @@ fn collect_block_colors(block: &Block, colors: &mut Vec<[u8; 3]>) {
                 collect_block_colors(b, colors);
             }
         }
+        BlockKind::Blockquote(bq) => {
+            for b in &bq.blocks {
+                collect_block_colors(b, colors);
+            }
+        }
+        // Code blocks render in the default colour; rules carry none.
         _ => {}
     }
 }
@@ -595,6 +601,25 @@ fn rtf_block_from_model(block: &Block, colors: &[[u8; 3]], first: &mut bool, out
                     rtf_block_from_model(&ph.block, colors, first, out);
                 }
             }
+        }
+        BlockKind::CodeBlock(cb) => {
+            // One verbatim line per source line (preformatted text).
+            for line in cb.code.split('\n') {
+                rtf_plain_line(line, first, out);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            // Set the quote off with a left indent; render its blocks inside it.
+            rtf_par_sep(first, out);
+            out.push_str("{\\li360 ");
+            let mut inner_first = true;
+            rtf_blocks_from_model(&bq.blocks, colors, &mut inner_first, out);
+            out.push('}');
+        }
+        BlockKind::HorizontalRule => {
+            // A paragraph carrying a bottom border renders as a horizontal rule.
+            rtf_par_sep(first, out);
+            out.push_str("{\\pard\\brdrb\\brdrs\\brdrw10\\par}");
         }
         BlockKind::Image(_) | BlockKind::Shape(_) => {}
     }

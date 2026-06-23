@@ -17,7 +17,8 @@
 //! │                          └─ blocks: Vec<Block>
 //! │                                      └─ kind: BlockKind
 //! │                                          (Paragraph / Heading / List / Table /
-//! │                                           Image / Shape / TextBox / Sheet / Slide)
+//! │                                           Image / Shape / TextBox / Sheet / Slide /
+//! │                                           CodeBlock / Blockquote / HorizontalRule)
 //! ├─ outline:   Vec<OutlineNode>        (bookmarks tree → page index)
 //! └─ resources: ResourceTable           (content-addressed image blobs)
 //! ```
@@ -122,6 +123,14 @@ pub enum BlockKind {
     TextBox(TextBox),
     Sheet(sheet::SheetBlock),
     Slide(slide::SlideBlock),
+    /// A preformatted code block: verbatim text with an optional language hint
+    /// (the info-string of a Markdown fence). Rendered monospaced/preformatted.
+    CodeBlock(CodeBlock),
+    /// A block quotation: a nested block list, set off (indented + a left rule)
+    /// from the surrounding flow. Composes recursively like [`TextBox`].
+    Blockquote(Blockquote),
+    /// A thematic break (horizontal rule) — a semantic divider between blocks.
+    HorizontalRule,
 }
 
 impl Default for BlockKind {
@@ -262,6 +271,24 @@ pub struct Shape {
 /// tables…) so it composes with the rest of the model uniformly.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TextBox {
+    pub blocks: Vec<Block>,
+}
+
+/// A preformatted code block: a single string of source `code` (newlines kept
+/// verbatim) and an optional `lang` hint (e.g. `"rust"`), used to drive
+/// monospaced/preformatted rendering and the Markdown fence info-string.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CodeBlock {
+    /// The language identifier of the fence info-string, if any.
+    pub lang: Option<String>,
+    /// The verbatim block contents (literal newlines preserved).
+    pub code: String,
+}
+
+/// A block quotation: a nested list of blocks set off from the surrounding flow.
+/// Composes recursively (a quote may contain paragraphs, lists, nested quotes…).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Blockquote {
     pub blocks: Vec<Block>,
 }
 

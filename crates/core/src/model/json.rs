@@ -40,9 +40,9 @@ use crate::model::style::{
     Align, CharStyle, LineHeight, NamedStyle, ParagraphStyle, StyleId, StyleTable, VAlign,
 };
 use crate::model::{
-    Block, BlockId, BlockKind, BorderStyle, Cell, DocMeta, Document, Heading, ImageRef,
-    ImageResource, Inline, InlineRun, LinkTarget, List, ListItem, ListMarker, OutlineNode, Page,
-    Paragraph, ResourceTable, Row, Section, Shape, Table, TextBox,
+    Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, DocMeta, Document, Heading,
+    ImageRef, ImageResource, Inline, InlineRun, LinkTarget, List, ListItem, ListMarker, OutlineNode,
+    Page, Paragraph, ResourceTable, Row, Section, Shape, Table, TextBox,
 };
 
 /// Current envelope version. Bump on any incompatible layout change.
@@ -491,7 +491,36 @@ impl Writer {
                 self.key("v");
                 self.slide_block(sb);
             }
+            BlockKind::CodeBlock(cb) => {
+                self.k_str("t", "code");
+                self.key("v");
+                self.code_block(cb);
+            }
+            BlockKind::Blockquote(bq) => {
+                self.k_str("t", "blockquote");
+                self.key("v");
+                self.blockquote(bq);
+            }
+            BlockKind::HorizontalRule => self.k_str("t", "hr"),
         }
+        self.obj_close();
+    }
+
+    fn code_block(&mut self, cb: &CodeBlock) {
+        self.obj_open();
+        self.key("lang");
+        match &cb.lang {
+            Some(l) => self.str_val(l),
+            None => self.null(),
+        }
+        self.k_str("code", &cb.code);
+        self.obj_close();
+    }
+
+    fn blockquote(&mut self, bq: &Blockquote) {
+        self.obj_open();
+        self.key("blocks");
+        self.block_array(&bq.blocks);
         self.obj_close();
     }
 
@@ -1522,9 +1551,8 @@ impl<'a> Reader<'a> {
     fn block_kind(&mut self) -> Option<BlockKind> {
         // Capture the tag, then the raw value object/marker once seen. We buffer
         // the value parse by recording the tag first then dispatching on the
-        // "v" key. LineBreak-style tagless variants (image/heading…) all carry a
-        // "v", so a two-pass via stored closures isn't needed: collect tag and
-        // dispatch eagerly using a sentinel.
+        // "v" key. Most variants carry a "v"; the tagless `hr` (like the inline
+        // `br`) carries only "t" and is resolved from the tag after the object.
         let mut tag: Option<String> = None;
         let mut kind: Option<BlockKind> = None;
         self.object(|r, k| {
@@ -1542,6 +1570,8 @@ impl<'a> Reader<'a> {
                         "textbox" => BlockKind::TextBox(r.text_box()?),
                         "sheet" => BlockKind::Sheet(r.sheet_block()?),
                         "slide" => BlockKind::Slide(r.slide_block()?),
+                        "code" => BlockKind::CodeBlock(r.code_block()?),
+                        "blockquote" => BlockKind::Blockquote(r.blockquote()?),
                         _ => return None,
                     });
                 }
@@ -1549,7 +1579,37 @@ impl<'a> Reader<'a> {
             }
             Some(())
         })?;
-        kind
+        // Tagless variants resolve from the tag alone.
+        match (kind, tag.as_deref()) {
+            (Some(k), _) => Some(k),
+            (None, Some("hr")) => Some(BlockKind::HorizontalRule),
+            _ => None,
+        }
+    }
+
+    fn code_block(&mut self) -> Option<CodeBlock> {
+        let mut cb = CodeBlock::default();
+        self.object(|r, k| {
+            match k {
+                "lang" => cb.lang = r.opt_string()?,
+                "code" => cb.code = r.string()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(cb)
+    }
+
+    fn blockquote(&mut self) -> Option<Blockquote> {
+        let mut bq = Blockquote::default();
+        self.object(|r, k| {
+            match k {
+                "blocks" => bq.blocks = r.array(Reader::block)?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(bq)
     }
 
     fn paragraph(&mut self) -> Option<Paragraph> {
@@ -2503,6 +2563,49 @@ mod tests {
                         resource: 7,
                         alt: None,
                     }),
+                },
+                Block {
+                    id: BlockId(9),
+                    frame: None,
+                    rotation: Rotation::D0,
+                    kind: BlockKind::CodeBlock(crate::model::CodeBlock {
+                        lang: Some("rust".to_string()),
+                        code: "fn main() {\n    println!(\"héllo `~` ```\");\n}".to_string(),
+                    }),
+                },
+                Block {
+                    id: BlockId(10),
+                    frame: None,
+                    rotation: Rotation::D0,
+                    kind: BlockKind::Blockquote(crate::model::Blockquote {
+                        blocks: vec![
+                            Block {
+                                id: BlockId(1001),
+                                frame: None,
+                                rotation: Rotation::D0,
+                                kind: BlockKind::Paragraph(Paragraph {
+                                    runs: vec![Inline::Run(InlineRun {
+                                        text: "quoted line".to_string(),
+                                        style: CharStyle::default(),
+                                        source_index: None,
+                                    })],
+                                    ..Default::default()
+                                }),
+                            },
+                            Block {
+                                id: BlockId(1002),
+                                frame: None,
+                                rotation: Rotation::D0,
+                                kind: BlockKind::HorizontalRule,
+                            },
+                        ],
+                    }),
+                },
+                Block {
+                    id: BlockId(11),
+                    frame: None,
+                    rotation: Rotation::D0,
+                    kind: BlockKind::HorizontalRule,
                 },
             ],
             absolute: false,
