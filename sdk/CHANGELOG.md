@@ -4,6 +4,24 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.69.0] - 2026-06-23
+
+Image-watermark release: stamp a raster image across any range of pages, with
+the same ergonomics as the existing text watermark. The text watermark is
+unchanged.
+
+### Added
+
+- **Image watermark.** Stamp a raster image over pages —
+  `addImageWatermark` (SDK) / `add_image_watermark` (core) /
+  `gp_add_image_watermark` (FFI). Accepts **PNG / JPEG / WebP / GIF / AVIF**
+  source images and supports per-watermark **opacity**, **anchoring**
+  (center + four corners) with offsets, **rotation** (about the image center),
+  **scaling** to a target size (aspect-follow), and an optional **tiling** grid.
+  The image XObject is embedded **once** and referenced on each target page,
+  reusing the existing image-embed/raster-transcode pipeline. The text
+  watermark and `add_image` behavior are unchanged.
+
 ## [0.68.0] - 2026-06-23
 
 Format-reach + import/render fidelity release: the unified model now exports
