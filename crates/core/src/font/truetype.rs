@@ -48,6 +48,9 @@ pub struct TrueTypeFont {
     /// (drive pair kerning and ligature/standard substitutions when shaping).
     gpos: Option<(usize, usize)>,
     gsub: Option<(usize, usize)>,
+    /// `(offset, len)` of the `GDEF` table, if present (glyph classes + mark
+    /// attachment classes used by the shaper for mark positioning).
+    gdef: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +156,7 @@ impl TrueTypeFont {
         let sbix = tables.get(b"sbix").copied();
         let gpos = tables.get(b"GPOS").copied();
         let gsub = tables.get(b"GSUB").copied();
+        let gdef = tables.get(b"GDEF").copied();
 
         Some(TrueTypeFont {
             data,
@@ -168,6 +172,7 @@ impl TrueTypeFont {
             sbix,
             gpos,
             gsub,
+            gdef,
         })
     }
 
@@ -186,6 +191,12 @@ impl TrueTypeFont {
     /// present.
     pub(crate) fn gsub_range(&self) -> Option<(usize, usize)> {
         self.gsub
+    }
+
+    /// `(offset, len)` of the `GDEF` table (glyph & mark-attachment classes used
+    /// by the shaper for mark positioning), if present.
+    pub(crate) fn gdef_range(&self) -> Option<(usize, usize)> {
+        self.gdef
     }
 
     /// Parse the font's `sbix` bitmap-emoji table, if present (Apple colour
