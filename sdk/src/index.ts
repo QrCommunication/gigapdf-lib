@@ -2037,6 +2037,45 @@ export class GigaPdfDoc {
     );
   }
   /**
+   * Re-style **sub-ranges** of text run `index` on `page` in place — the
+   * by-character-run companion of {@link setPathStyle}. Each span sets the style
+   * of the `[start, end)` UTF-16 slice of the run's *decoded* text (bold / italic
+   * / underline / strike / colour / size); the run is split so the rest keeps its
+   * original style and **positioning is preserved** (the original glyph codes,
+   * including `TJ` kerning, are sliced and re-emitted — never re-encoded — and
+   * each styled slice is wrapped in `q … Q`). Spans may be given in any order and
+   * are clamped to the run's length.
+   *
+   * Notes on each field: `color` is `[r,g,b]` in `0..=1` (text fill); `sizePt`
+   * rescales the slice's font in the run's own text scale; `bold` is faux-bold
+   * (fill+stroke render mode) when no bold variant font is wired; `italic` is a
+   * no-op without an italic/oblique variant (a stream edit can't shear glyphs
+   * without disturbing advances); `underline`/`strike` draw a thin rule in page
+   * space. Returns `false` when `index` does not resolve to a top-level text run
+   * (e.g. it addresses form-XObject text), like {@link setPathStyle} for a
+   * non-matching element.
+   */
+  setTextRunStyle(
+    page: number,
+    index: number,
+    spans: Array<{
+      start: number;
+      end: number;
+      color?: [number, number, number];
+      sizePt?: number;
+      bold?: boolean;
+      italic?: boolean;
+      underline?: boolean;
+      strike?: boolean;
+    }>
+  ): boolean {
+    return (
+      this.g._withStr(JSON.stringify(spans), (p, l) =>
+        this.ex().gp_set_text_run_style_json(this.h, page, index, p, l)
+      ) === 0
+    );
+  }
+  /**
    * Set a constant opacity on element `index` on `page` — text, image **or**
    * shape — by registering an `/ExtGState` (`/ca` = `/CA` = `fillAlpha`, clamped
    * to `0..=1`) on the page and wrapping the element's op range in

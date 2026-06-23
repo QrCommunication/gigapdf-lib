@@ -2053,6 +2053,30 @@ impl Document {
         self.set_page_content(page_no, edited)
     }
 
+    /// Re-style sub-ranges of text run `index` on `page_no` in place: each
+    /// `(start, end, patch)` span sets the style of the `[start, end)` UTF-16
+    /// slice of the run's decoded text (colour / size / bold / italic / underline
+    /// / strike), splitting the run so the rest keeps its original style and
+    /// positioning is preserved. The symmetric, by-run companion of
+    /// [`set_path_style`](Self::set_path_style) for text — see
+    /// [`content::set_text_run_style`] for the split + emission detail.
+    ///
+    /// `Err` when `index` does not resolve to a top-level text run (e.g. it
+    /// addresses form-XObject text), which the WASM/SDK layer maps to `false`.
+    /// Bold/italic without a variant font are rendered best-effort (faux-bold via
+    /// stroke; italic is a no-op) — the page's own font decoders drive the split.
+    pub fn set_text_run_style(
+        &mut self,
+        page_no: u32,
+        index: usize,
+        spans: &[(usize, usize, content::TextStylePatch)],
+    ) -> Result<()> {
+        let content = self.page_content(page_no)?;
+        let decoders = self.page_font_decoders(page_no);
+        let edited = content::set_text_run_style(&content, index, spans, &decoders)?;
+        self.set_page_content(page_no, edited)
+    }
+
     /// If the `index`-th run on `page_no` is set in a Type0/Identity-H font,
     /// encode `new_text` to its 2-byte glyph ids (returned as `Hex` bytes) and
     /// record those gids for subsetting; otherwise `None` (the caller falls back
@@ -12805,6 +12829,44 @@ mod tests {
             after[0].fill,
             Some([0.0, 0.0, 1.0]),
             "fill restyled to blue"
+        );
+    }
+
+    #[test]
+    fn set_text_run_style_splits_a_run_by_index() {
+        // Drive the by-run text restyle end-to-end at the Document layer: split the
+        // single run "HELLO" so [0,2) turns red, keeping the run's text intact and
+        // the page re-parseable. Uses the text-run index (same as replace_text_run).
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_page_content(1, b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (HELLO) Tj ET\n".to_vec())
+            .unwrap();
+
+        let els = doc.page_text_elements(1);
+        let idx = els
+            .iter()
+            .find(|e| e.text == "HELLO")
+            .map(|e| e.index)
+            .expect("the run is addressable");
+
+        doc.set_text_run_style(
+            1,
+            idx,
+            &[(0, 2, content::TextStylePatch { color: Some([1.0, 0.0, 0.0]), ..Default::default() })],
+        )
+        .unwrap();
+
+        // Text is preserved (now shown as two runs "HE" + "LLO"), page still parses.
+        let runs = doc.page_text_runs(1).unwrap();
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "HELLO", "no glyphs lost by the split");
+        let s = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(s.contains("rg"), "a fill colour op was injected for the span");
+
+        // An index that does not resolve (only one run) is an error.
+        assert!(
+            doc.set_text_run_style(1, 99, &[(0, 1, content::TextStylePatch::default())]).is_err(),
+            "an out-of-range run index fails"
         );
     }
 

@@ -744,6 +744,416 @@ pub fn replace_text_run_encoded(
     Ok(encode_content(&operations))
 }
 
+/// One show "atom": a glyph code (1 byte for simple fonts, 2 for Identity-H/CID)
+/// or a `TJ` kerning adjustment (1000-em units). Splitting a run preserves these
+/// exactly, so positioning (advances + kerning) survives the split.
+#[derive(Debug, Clone)]
+enum ShowAtom {
+    /// One glyph's raw code bytes (as they appear on the wire) and the UTF-16
+    /// length of its decoded text (0 for a code that decodes to nothing).
+    Glyph { bytes: Vec<u8>, utf16: usize },
+    /// A `TJ` position adjustment between glyphs (positive moves left).
+    Kern(f64),
+}
+
+/// Split a text-show operation's operands into ordered [`ShowAtom`]s (glyph codes
+/// plus `TJ` kerns), using `decoder` to size each code (1 vs 2 bytes) and measure
+/// its decoded UTF-16 length. A simple show (`Tj`, the quote and double-quote
+/// next-line variants) yields only glyph atoms; a `TJ` array interleaves kerns.
+/// The `kind` of the first string operand is returned so re-emitted strings keep
+/// the same on-wire form (`Hex` for 2-byte CID, `Literal`/`Hex` as original).
+fn run_atoms(operands: &[Operation], pos: usize, decoder: &TextDecoder) -> (Vec<ShowAtom>, StringKind) {
+    let op = &operands[pos];
+    let mut atoms = Vec::new();
+    let mut kind = StringKind::Literal;
+    let mut first_string = true;
+    let push_string = |atoms: &mut Vec<ShowAtom>, bytes: &[u8], decoder: &TextDecoder| {
+        if decoder.two_byte {
+            let mut i = 0;
+            while i + 1 < bytes.len() {
+                let code = [bytes[i], bytes[i + 1]];
+                let utf16 = decoder.decode(&code).encode_utf16().count();
+                atoms.push(ShowAtom::Glyph { bytes: code.to_vec(), utf16 });
+                i += 2;
+            }
+        } else {
+            for &b in bytes {
+                let utf16 = decoder.decode(&[b]).encode_utf16().count();
+                atoms.push(ShowAtom::Glyph { bytes: vec![b], utf16 });
+            }
+        }
+    };
+    let handle_object = |atoms: &mut Vec<ShowAtom>, kind: &mut StringKind, first: &mut bool, obj: &Object| {
+        match obj {
+            Object::String(bytes, k) => {
+                if *first {
+                    *kind = *k;
+                    *first = false;
+                }
+                push_string(atoms, bytes, decoder);
+            }
+            Object::Integer(_) | Object::Real(_) => {
+                atoms.push(ShowAtom::Kern(obj.as_f64().unwrap_or(0.0)));
+            }
+            _ => {}
+        }
+    };
+    match op.operator.as_slice() {
+        b"\"" => {
+            // `aw ac string "` — only the third operand is the show string.
+            if let Some(s) = op.operands.get(2) {
+                handle_object(&mut atoms, &mut kind, &mut first_string, s);
+            }
+        }
+        b"Tj" | b"'" => {
+            if let Some(s) = op.operands.first() {
+                handle_object(&mut atoms, &mut kind, &mut first_string, s);
+            }
+        }
+        _ => {
+            // TJ: array of strings + numbers.
+            if let Some(Object::Array(items)) = op.operands.first() {
+                for item in items {
+                    handle_object(&mut atoms, &mut kind, &mut first_string, item);
+                }
+            }
+        }
+    }
+    (atoms, kind)
+}
+
+/// Emit a `TJ` (or single `Tj` when there is exactly one glyph string and no
+/// kern) showing `atoms`. Consecutive glyph atoms are merged into one string
+/// operand; kerns stay as numbers. The text position advances exactly as the
+/// original would for this slice.
+fn emit_atoms(atoms: &[ShowAtom], kind: StringKind) -> Operation {
+    let mut array: Vec<Object> = Vec::new();
+    let mut run_bytes: Vec<u8> = Vec::new();
+    let flush = |array: &mut Vec<Object>, run_bytes: &mut Vec<u8>| {
+        if !run_bytes.is_empty() {
+            array.push(Object::String(std::mem::take(run_bytes), kind));
+        }
+    };
+    for atom in atoms {
+        match atom {
+            ShowAtom::Glyph { bytes, .. } => run_bytes.extend_from_slice(bytes),
+            ShowAtom::Kern(n) => {
+                flush(&mut array, &mut run_bytes);
+                array.push(Object::Real(*n));
+            }
+        }
+    }
+    flush(&mut array, &mut run_bytes);
+    // A single string with no kern can be a plain `Tj`; otherwise `TJ`.
+    if array.len() == 1 {
+        if let Some(Object::String(_, _)) = array.first() {
+            return Operation { operator: b"Tj".to_vec(), operands: array };
+        }
+    }
+    Operation { operator: b"TJ".to_vec(), operands: vec![Object::Array(array)] }
+}
+
+/// A per-character-range style override for [`set_text_run_style`]. Every field
+/// is optional: `None` leaves that aspect at the run's inherited value, so a span
+/// changes only what it names. Mirrors the run-relevant subset of
+/// [`model::edit::StylePatch`](crate::model::StylePatch) (the SDK `GigaStylePatch`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextStylePatch {
+    /// Fill (non-stroking) colour `[r, g, b]`, `0.0..=1.0` per channel → `rg`.
+    pub color: Option<[f64; 3]>,
+    /// Font size in points → a `Tf <font> <size>` for the sub-run.
+    pub size_pt: Option<f64>,
+    /// Embolden the sub-run. When `font_swap` is set (a bold variant resource the
+    /// [`Document`](crate::Document) layer resolved) the font is swapped; otherwise
+    /// faux-bold via text render mode 2 (fill+stroke) with a hairline stroke.
+    pub bold: Option<bool>,
+    /// Italicise the sub-run. Honoured only via `font_swap` (an italic/oblique
+    /// variant); with no variant it is a documented no-op (a content-stream edit
+    /// cannot shear glyphs without disturbing the run's positioning).
+    pub italic: Option<bool>,
+    /// Underline the sub-run (a thin filled rule drawn just below the baseline).
+    pub underline: Option<bool>,
+    /// Strike-through the sub-run (a thin filled rule across the x-height).
+    pub strike: Option<bool>,
+    /// A bold/italic **variant font resource name** (the `Tf` operand, no leading
+    /// `/`) the [`Document`](crate::Document) layer registered/located for this
+    /// span. When set, `bold`/`italic` swap to it instead of faux-styling.
+    pub font_swap: Option<Vec<u8>>,
+}
+
+impl TextStylePatch {
+    /// True when a style operator would be emitted inline for this span (so its
+    /// sub-run must be wrapped in `q … Q`). A pure underline/strike patch returns
+    /// `false`: it draws page-space rules but shows the slice with its original
+    /// style, no inline state change.
+    fn emits_inline_state(&self) -> bool {
+        self.color.is_some()
+            || self.size_pt.is_some()
+            || self.font_swap.is_some()
+            || self.bold == Some(true)
+    }
+}
+
+/// The `Tf` font resource name **and** size operand in force for the `index`-th
+/// text run (the last `Tf` before it), or `None` for either if unset. The size is
+/// the raw text-space operand (not scaled by the CTM); [`set_text_run_style`]
+/// uses it to keep a requested point size in the run's own text scale.
+fn text_run_tf(operations: &[Operation], index: usize) -> (Option<Vec<u8>>, Option<f64>) {
+    let mut name: Option<Vec<u8>> = None;
+    let mut size: Option<f64> = None;
+    let mut seen = 0usize;
+    for op in operations {
+        if op.operator == b"Tf" {
+            if let Some(Object::Name(n)) = op.operands.first() {
+                name = Some(n.clone());
+            }
+            size = op.operands.get(1).and_then(Object::as_f64);
+        } else if is_text_show(&op.operator) {
+            if seen == index {
+                break;
+            }
+            seen += 1;
+        }
+    }
+    (name, size)
+}
+
+/// An operator with no operands.
+fn op0(operator: &[u8]) -> Operation {
+    Operation { operator: operator.to_vec(), operands: Vec::new() }
+}
+
+/// The `[start, end)` advance fractions of an atom slice within the whole run,
+/// using real glyph widths when the font carries them (an even split otherwise).
+/// Drives where an underline/strike rule sits within the run's page-space bounds.
+fn slice_fraction(atoms: &[ShowAtom], a: usize, b: usize, decoder: &TextDecoder) -> (f64, f64) {
+    // Advance of one atom in arbitrary units (real width, or 1.0 per glyph).
+    let adv = |atom: &ShowAtom| -> f64 {
+        match atom {
+            ShowAtom::Glyph { bytes, .. } => decoder.string_advance(bytes, 1000.0).unwrap_or(500.0),
+            ShowAtom::Kern(n) => -n, // TJ adjustment (positive moves left)
+        }
+    };
+    let total: f64 = atoms.iter().map(adv).sum::<f64>().max(f64::EPSILON);
+    let before: f64 = atoms[..a].iter().map(adv).sum();
+    let within: f64 = atoms[a..b].iter().map(adv).sum();
+    ((before / total).clamp(0.0, 1.0), ((before + within) / total).clamp(0.0, 1.0))
+}
+
+/// Push a thin filled rule (`re … f`) spanning `[frac_a, frac_b]` of `bounds`'
+/// width at vertical position `y_frac` of its height, in the run's fill colour
+/// (or black). Used for underline (`y_frac≈0.08`) and strike (`≈0.42`).
+trait PushRule {
+    fn push_rule(&mut self, bounds: Bounds, frac_a: f64, frac_b: f64, y_frac: f64, color: Option<[f64; 3]>);
+}
+impl PushRule for Vec<Operation> {
+    fn push_rule(&mut self, bounds: Bounds, frac_a: f64, frac_b: f64, y_frac: f64, color: Option<[f64; 3]>) {
+        let x0 = bounds.x + bounds.width * frac_a;
+        let w = bounds.width * (frac_b - frac_a);
+        if w <= 0.0 {
+            return;
+        }
+        let thickness = (bounds.height * 0.05).max(0.4);
+        let y = bounds.y + bounds.height * y_frac;
+        self.push(op0(b"q"));
+        let [r, g, b] = color.unwrap_or([0.0, 0.0, 0.0]);
+        self.push(rgb_op(b"rg", r, g, b));
+        self.push(Operation {
+            operator: b"re".to_vec(),
+            operands: vec![
+                Object::Real(x0),
+                Object::Real(y),
+                Object::Real(w),
+                Object::Real(thickness),
+            ],
+        });
+        self.push(op0(b"f"));
+        self.push(op0(b"Q"));
+    }
+}
+
+/// Re-style **sub-ranges** of the `index`-th text run in place, splitting it so
+/// each `[start, end)` UTF-16 span of the run's *decoded* text is shown with its
+/// own [`TextStylePatch`] while the rest keeps the original style. Positioning is
+/// preserved exactly: the run is partitioned at glyph-code boundaries (never
+/// re-encoded — the original code bytes, including `TJ` kerning, are sliced and
+/// re-emitted), and each styled sub-run is wrapped in `q … Q` so its colour / size
+/// / font overrides apply to that slice only and the **text matrix advance still
+/// carries across `Q`** (`Tm` is text-object state, not saved by `q`/`Q`). Spans
+/// are clamped to the run's UTF-16 length and may be given in any order; bytes
+/// outside every span keep the inherited style.
+///
+/// What each field emits for a styled slice (inside its `q … Q`):
+/// - `color` → `r g b rg` (text fill colour).
+/// - `size_pt` → `Tf <font> <size'>`, where `size'` rescales the run's own `Tf`
+///   operand by `size_pt / effective_pt` so the CTM relationship is preserved.
+/// - `bold` → swaps to `font_swap` when the [`Document`](crate::Document) layer
+///   supplied a bold variant; otherwise faux-bold via `2 Tr` (fill+stroke) + a
+///   hairline `w` proportional to the size.
+/// - `italic` → swaps to `font_swap` (an italic/oblique variant) when available;
+///   **no-op otherwise** (shearing glyphs in the stream would disturb advances).
+/// - `underline` / `strike` → a thin filled rule drawn in **page space** after the
+///   text block, spanning the slice's proportional sub-width (best-effort for
+///   rotated runs).
+///
+/// Returns `Err(Missing)` when `index` does not resolve to a top-level text run
+/// (e.g. it addresses form-XObject text), mirroring [`text_run_font_name`]'s
+/// contract for a non-matching index — the [`Document`](crate::Document) wrapper
+/// turns that into `false`.
+pub fn set_text_run_style(
+    content: &[u8],
+    index: usize,
+    spans: &[(usize, usize, TextStylePatch)],
+    decoders: &FontDecoders,
+) -> Result<Vec<u8>> {
+    let mut operations = parse_content(content)?;
+    // Locate the run; `Err` here is the "index doesn't resolve" contract.
+    let pos = nth_text_run(&operations, index)?;
+
+    // No spans ⇒ nothing to do (keep the content byte-for-byte).
+    if spans.is_empty() {
+        return Ok(content.to_vec());
+    }
+
+    // The decoder for the run's font (for code sizing + UTF-16 measurement).
+    let (tf_name, tf_size) = text_run_tf(&operations, index);
+    let winansi = TextDecoder::winansi();
+    let decoder = tf_name
+        .as_ref()
+        .and_then(|n| decoders.get(n))
+        .unwrap_or(&winansi);
+
+    let (atoms, kind) = run_atoms(&operations, pos, decoder);
+
+    // UTF-16 offset of each glyph atom's start, and the run's total length.
+    let mut starts: Vec<usize> = Vec::with_capacity(atoms.len());
+    let mut total_u16 = 0usize;
+    for atom in &atoms {
+        starts.push(total_u16);
+        if let ShowAtom::Glyph { utf16, .. } = atom {
+            total_u16 += utf16;
+        }
+    }
+
+    // Map a UTF-16 offset to its covering span's patch (last span wins on overlap).
+    let span_at = |offset: usize| -> Option<&TextStylePatch> {
+        let mut chosen: Option<&TextStylePatch> = None;
+        for (s, e, patch) in spans {
+            let (s, e) = (*s.min(&total_u16), *e.min(&total_u16));
+            if s < e && offset >= s && offset < e {
+                chosen = Some(patch); // later spans override earlier ones
+            }
+        }
+        chosen
+    };
+
+    // The run's page-space bounds and effective point size (for underline/strike
+    // rules and size rescaling), resolved from the same element view as the editor.
+    let run_element = elements_from_ops(&operations, decoders, &BTreeMap::new())
+        .into_iter()
+        .filter(|e| e.kind == ElementKind::Text && !e.nested)
+        .nth(index);
+    let run_bounds = run_element.as_ref().and_then(|e| e.bounds);
+    let effective_pt = run_element.as_ref().and_then(|e| e.font_size).filter(|s| *s > 0.0);
+
+    // Walk the atoms, grouping maximal runs that share the same style. Each group
+    // is re-emitted as one (optionally styled) show op.
+    let mut groups: Vec<(usize, usize, Option<TextStylePatch>)> = Vec::new();
+    let mut g_start = 0usize;
+    let mut g_style: Option<TextStylePatch> = span_at(starts.first().copied().unwrap_or(0)).cloned();
+    for (i, &offset) in starts.iter().enumerate().skip(1) {
+        let here = span_at(offset).cloned();
+        if here != g_style {
+            groups.push((g_start, i, g_style.take()));
+            g_start = i;
+            g_style = here;
+        }
+    }
+    if !atoms.is_empty() {
+        groups.push((g_start, atoms.len(), g_style));
+    }
+
+    // Build the replacement operation list for the single show op at `pos`.
+    let mut replacement: Vec<Operation> = Vec::new();
+    let mut underlines: Vec<Operation> = Vec::new();
+    for (a, b, style) in &groups {
+        let slice = &atoms[*a..*b];
+        let show = emit_atoms(slice, kind);
+        match style {
+            Some(patch)
+                if patch.emits_inline_state()
+                    || patch.underline == Some(true)
+                    || patch.strike == Some(true) =>
+            {
+                if patch.emits_inline_state() {
+                    replacement.push(op0(b"q"));
+                    // Font swap (bold/italic variant) or size change → Tf.
+                    let new_font = patch.font_swap.clone().or_else(|| tf_name.clone());
+                    let new_size = match (patch.size_pt, effective_pt, tf_size) {
+                        (Some(pt), Some(eff), Some(raw)) if eff > 0.0 => Some(raw * pt / eff),
+                        (Some(pt), _, _) => Some(pt), // no CTM scale info: take pt directly
+                        _ => None,
+                    };
+                    if patch.font_swap.is_some() || patch.size_pt.is_some() {
+                        if let Some(name) = new_font {
+                            replacement.push(Operation {
+                                operator: b"Tf".to_vec(),
+                                operands: vec![
+                                    Object::Name(name),
+                                    Object::Real(new_size.or(tf_size).unwrap_or(12.0)),
+                                ],
+                            });
+                        }
+                    }
+                    if let Some([r, g, b]) = patch.color {
+                        replacement.push(rgb_op(b"rg", r, g, b));
+                    }
+                    // Faux-bold (no variant): render mode 2 (fill+stroke) + a
+                    // hairline stroke (~3% of the size) to thicken the glyphs.
+                    if patch.bold == Some(true) && patch.font_swap.is_none() {
+                        let pt = patch.size_pt.or(effective_pt).unwrap_or(12.0);
+                        replacement.push(Operation {
+                            operator: b"Tr".to_vec(),
+                            operands: vec![Object::Integer(2)],
+                        });
+                        replacement.push(Operation {
+                            operator: b"w".to_vec(),
+                            operands: vec![Object::Real(pt * 0.03)],
+                        });
+                        if let Some([r, g, b]) = patch.color {
+                            // Match stroke colour to the requested fill.
+                            replacement.push(rgb_op(b"RG", r, g, b));
+                        }
+                    }
+                    replacement.push(show);
+                    replacement.push(op0(b"Q"));
+                } else {
+                    // Only underline/strike requested (no inline state change):
+                    // show the original-styled slice unwrapped.
+                    replacement.push(show);
+                }
+                // Page-space rules for this slice.
+                if let Some(bounds) = run_bounds {
+                    let (frac_a, frac_b) = slice_fraction(&atoms, *a, *b, decoder);
+                    if patch.underline == Some(true) {
+                        underlines.push_rule(bounds, frac_a, frac_b, 0.08, patch.color);
+                    }
+                    if patch.strike == Some(true) {
+                        underlines.push_rule(bounds, frac_a, frac_b, 0.42, patch.color);
+                    }
+                }
+            }
+            _ => replacement.push(show), // unstyled (or no-op italic-only) slice
+        }
+    }
+
+    // Splice: replace the single show op at `pos` with the group sequence.
+    operations.splice(pos..=pos, replacement);
+    // Append underline/strike rules at the very end (page space, outside BT…ET).
+    operations.extend(underlines);
+    Ok(encode_content(&operations))
+}
+
 /// The font **resource name** (the `Tf` operand, e.g. `b"GF7"`) in effect for
 /// the `index`-th text run, or `None` if no font was selected before it. Lets
 /// the [`Document`](crate::Document) layer resolve the run's font object and
@@ -2595,6 +3005,85 @@ BT /F 12 Tf (BODY) Tj ET";
             !String::from_utf8_lossy(&edited).contains("gs"),
             "no gs without alpha"
         );
+    }
+
+    #[test]
+    fn set_text_run_style_splits_run_into_styled_spans() {
+        // "ABCDE" → colour [0,2), size on [2,4), [4,5) untouched. The split must
+        // re-emit three shows: a red "AB", a resized "CD", and a plain "E", each
+        // styled span wrapped in q/Q, original glyphs preserved across the split.
+        let content = b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (ABCDE) Tj ET";
+        let spans = vec![
+            (0usize, 2usize, TextStylePatch { color: Some([1.0, 0.0, 0.0]), ..Default::default() }),
+            (2usize, 4usize, TextStylePatch { size_pt: Some(24.0), ..Default::default() }),
+        ];
+        let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        // The three sub-strings are present, in order.
+        let ab = s.find("(AB)").expect("first slice shown");
+        let cd = s.find("(CD)").expect("middle slice shown");
+        let e = s.find("(E)").expect("last slice shown");
+        assert!(ab < cd && cd < e, "slices keep their reading order");
+        // A fill colour op was injected for the first span, a Tf for the second.
+        assert!(s.contains("rg"), "colour op for span 1");
+        assert!(count(&edited, b"Tf") >= 2, "a Tf is emitted for the resized span");
+        // Styled spans are wrapped; the original single Tj is gone.
+        assert!(count(&edited, b"q") >= 2 && count(&edited, b"Q") >= 2, "styled spans wrapped");
+        // No text was lost: concatenated shown text still reads ABCDE.
+        let runs = extract_text_runs(&edited).unwrap();
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "ABCDE", "all glyphs preserved across the split");
+    }
+
+    #[test]
+    fn set_text_run_style_clamps_out_of_range_spans() {
+        // A span ending past the run length is clamped; styling still applies to
+        // the in-range portion and no panic occurs.
+        let content = b"BT /F1 12 Tf (HI) Tj ET";
+        let spans = vec![(0usize, 999usize, TextStylePatch { color: Some([0.0, 0.0, 1.0]), ..Default::default() })];
+        let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("(HI)"), "whole run styled, clamped to its length");
+        assert!(s.contains("rg"), "colour applied to the clamped span");
+    }
+
+    #[test]
+    fn set_text_run_style_on_unresolved_index_errors() {
+        // No text run at index 1 (only one run) → Err, mirroring the
+        // text-run-not-found contract for a non-matching index.
+        let content = b"BT /F1 12 Tf (only) Tj ET";
+        let result = set_text_run_style(content, 1, &[(0, 1, TextStylePatch::default())], &FontDecoders::new());
+        assert!(result.is_err(), "an index with no run must fail");
+    }
+
+    #[test]
+    fn set_text_run_style_emits_underline_rule() {
+        // An underline span draws a filled rule (re … f) appended after the text,
+        // in addition to showing the (unwrapped, style-free) slice.
+        let content = b"BT /F1 12 Tf 1 0 0 1 72 700 Tm (WORD) Tj ET";
+        let spans = vec![(0usize, 4usize, TextStylePatch { underline: Some(true), ..Default::default() })];
+        let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("(WORD)"), "text still shown");
+        assert!(count(&edited, b"re") >= 1 && count(&edited, b"f") >= 1, "an underline rule is drawn");
+    }
+
+    #[test]
+    fn set_text_run_style_faux_bold_uses_render_mode_two() {
+        // Bold with no variant font → faux-bold via `2 Tr` (fill+stroke).
+        let content = b"BT /F1 12 Tf (B) Tj ET";
+        let spans = vec![(0usize, 1usize, TextStylePatch { bold: Some(true), ..Default::default() })];
+        let edited = set_text_run_style(content, 0, &spans, &FontDecoders::new()).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("2 Tr"), "faux-bold sets text render mode 2");
+        assert!(s.contains("(B)"), "the glyph is still shown");
+    }
+
+    #[test]
+    fn set_text_run_style_empty_spans_is_noop() {
+        let content = b"BT /F1 12 Tf (X) Tj ET";
+        let edited = set_text_run_style(content, 0, &[], &FontDecoders::new()).unwrap();
+        assert_eq!(edited, content.to_vec(), "no spans leaves content byte-for-byte");
     }
 
     #[test]

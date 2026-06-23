@@ -753,6 +753,104 @@ pub extern "C" fn gp_set_path_style_json(
     edit(handle, |doc| doc.set_path_style(page, index, &style))
 }
 
+/// Re-style **sub-ranges** of text run `index` on `page` in place. `json_ptr`/
+/// `json_len` is a JSON **array** of span objects, each with integer `start`/`end`
+/// (UTF-16 offsets into the run's decoded text) and optional style keys: `color`
+/// (`[r,g,b]` in `0..=1`), `sizePt` (number), `bold`/`italic`/`underline`/`strike`
+/// (booleans). Each span sets the style of its `[start, end)` slice; the run is
+/// split so the rest keeps its original style and positioning is preserved. The
+/// by-character-run companion of [`gp_set_path_style_json`]. 0 on success; negative
+/// on error (incl. an index that does not resolve to a top-level text run → the SDK
+/// surfaces `false`).
+#[no_mangle]
+pub extern "C" fn gp_set_text_run_style_json(
+    handle: *mut Document,
+    page: u32,
+    index: usize,
+    json_ptr: *const u8,
+    json_len: usize,
+) -> i32 {
+    let json = unsafe { str_arg(json_ptr, json_len) };
+    let spans = parse_text_spans_json(json);
+    edit(handle, |doc| doc.set_text_run_style(page, index, &spans))
+}
+
+/// Parse a JSON array of `{start,end,color,sizePt,bold,italic,underline,strike}`
+/// span objects into `(start, end, TextStylePatch)` tuples. Std-only, tailored to
+/// this fixed shape (no third-party JSON): each top-level `{ … }` object is sliced
+/// out by brace matching and scanned with the existing key helpers. Objects
+/// missing `start`/`end` are skipped.
+fn parse_text_spans_json(json: &str) -> Vec<(usize, usize, gigapdf_core::content::TextStylePatch)> {
+    let mut out = Vec::new();
+    let bytes = json.as_bytes();
+    let mut i = 0;
+    // Walk top-level object boundaries inside the array, honouring nested braces
+    // (a `color` array has none, but be robust) and skipping string contents.
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let start_obj = i;
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut j = i;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if in_str {
+                if c == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    b'"' => in_str = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        let obj = &json[start_obj..=j.min(bytes.len() - 1)];
+        if let (Some(s), Some(e)) = (json_number(obj, "start"), json_number(obj, "end")) {
+            let patch = gigapdf_core::content::TextStylePatch {
+                color: json_rgb(obj, "color"),
+                size_pt: json_number(obj, "sizePt"),
+                bold: json_bool(obj, "bold"),
+                italic: json_bool(obj, "italic"),
+                underline: json_bool(obj, "underline"),
+                strike: json_bool(obj, "strike"),
+                font_swap: None,
+            };
+            out.push((s.max(0.0) as usize, e.max(0.0) as usize, patch));
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Read a JSON boolean value for `key` (`true`/`false`); `None` if absent.
+fn json_bool(json: &str, key: &str) -> Option<bool> {
+    let start = json_value_start(json, key)?;
+    let rest = json[start..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Set a constant opacity (`fill_alpha`, `0..=1`) on element `index` on `page`
 /// — text, image **or** shape — by registering an `/ExtGState` (`/ca` = `/CA` =
 /// `fill_alpha`) and wrapping the element's op range in `q /<gs> gs … Q`. This is
