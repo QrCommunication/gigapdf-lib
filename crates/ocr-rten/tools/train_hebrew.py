@@ -49,7 +49,16 @@ CH2IDX = {c: i + 1 for i, c in enumerate(CHARS)}  # +1: class 0 is blank
 WORDS = ("של את על לא כל זה הוא היא אני אתה הם אנחנו עם גם רק כי אם אבל או אז כאן שם מה מי "
          "איך למה כמה יום שנה זמן ילד אישה איש בית עיר מים אור חיים עבודה ספר מילה שלום תודה "
          "בוקר ערב לילה גדול קטן טוב רע חדש ישן ראשון שני שלישי מאה אלף שקל רחוב מספר טלפון "
-         "ישראל ירושלים תל אביב חיפה מדינה ממשלה חברה משפחה אהבה כסף שוק חנות מסעדה בית ספר").split()
+         "ישראל ירושלים תל אביב חיפה מדינה ממשלה חברה משפחה אהבה כסף שוק חנות מסעדה "
+         "בדיקה דוגמה מסמך קובץ תמונה דף עמוד שורה כותרת פסקה טקסט אות מילים משפט נושא "
+         "חשבונית קבלה תאריך סכום מחיר כמות פרטים שם כתובת דואר אלקטרוני אתר טופס חתימה "
+         "ראש ממשלה נשיא שר משרד עירייה בנק קופה רופא בית חולים תרופה מרשם בריאות "
+         "מורה תלמיד כיתה לימוד מבחן ציון תעודה אוניברסיטה מכללה קורס שיעור מחקר "
+         "מחשב טלפון מקלדת מסך תוכנה אפליקציה אינטרנט רשת קוד נתונים מידע מערכת שרת "
+         "ראשון שני שלישי רביעי חמישי שישי שביעי שמיני תשיעי עשירי ינואר פברואר מרץ אפריל מאי "
+         "צפון דרום מזרח מערב ימין שמאל מעלה מטה פנים חוץ קרוב רחוק מהר לאט "
+         "אדום כחול ירוק צהוב שחור לבן אפור כתום סגול ורוד חום כסף זהב").split()
+ALPHA_SEQ = HEBREW + DIGITS  # pool for random sequences (letter-level coverage)
 
 
 def render_line(text, fonts):
@@ -63,23 +72,33 @@ def render_line(text, fonts):
     # scale to height REC_H
     nw = max(1, round(REC_H * w / h))
     img = img.resize((nw, REC_H), Image.BILINEAR)
-    # light scan-like augmentation
-    if random.random() < 0.5:
-        img = img.rotate(random.uniform(-2, 2), expand=False, fillcolor=(255, 255, 255))
+    # light scan-like augmentation (kept gentle — heavy noise made the small model underfit)
+    if random.random() < 0.35:
+        img = img.rotate(random.uniform(-1.5, 1.5), expand=False, fillcolor=(255, 255, 255))
     arr = np.asarray(img, dtype=np.float32)
-    if random.random() < 0.5:
-        arr += np.random.normal(0, random.uniform(3, 14), arr.shape)
+    if random.random() < 0.35:
+        arr += np.random.normal(0, random.uniform(2, 7), arr.shape)
     arr = np.clip(arr, 0, 255)
     return arr, visual
 
 
 def sample_text():
-    n = random.randint(1, 6)
+    # 45% RANDOM letter sequences (forces letter-level recognition over word memorisation — the fix
+    # for v2's poor generalisation to unseen words), else real words + occasional digit/Latin runs.
+    if random.random() < 0.45:
+        parts = []
+        for _ in range(random.randint(1, 5)):
+            length = random.randint(1, 9)
+            parts.append("".join(random.choice(ALPHA_SEQ) for _ in range(length)))
+        return " ".join(parts)
+    n = random.randint(1, 7)
     parts = []
     for _ in range(n):
         r = random.random()
-        if r < 0.15:
-            parts.append("".join(random.choice(DIGITS) for _ in range(random.randint(1, 4))))
+        if r < 0.12:
+            parts.append("".join(random.choice(DIGITS) for _ in range(random.randint(1, 5))))
+        elif r < 0.18:
+            parts.append("".join(random.choice(LATIN) for _ in range(random.randint(2, 7))))
         else:
             parts.append(random.choice(WORDS))
     return " ".join(parts)
@@ -124,8 +143,8 @@ class CRNN(nn.Module):
             block(128, 256, (2, 1)),    # -> 6  x W/4   (height only)
             block(256, 256, (2, 1)),    # -> 3  x W/4
         )
-        self.rnn = nn.LSTM(256, 256, num_layers=2, bidirectional=True, batch_first=True)
-        self.fc = nn.Linear(512, n_cls)
+        self.rnn = nn.LSTM(256, 384, num_layers=2, bidirectional=True, batch_first=True)
+        self.fc = nn.Linear(768, n_cls)
 
     def forward(self, x):
         x = self.cnn(x)              # [B, 256, H', W']
@@ -151,7 +170,8 @@ def main():
     print(f"fonts={len(fonts)} classes={NUM_CLASSES} (blank=0, space={SPACE_CLASS})", flush=True)
 
     ds = HebrewLines(a.nlines, fonts)
-    dl = DataLoader(ds, batch_size=a.batch, shuffle=True, num_workers=a.workers, collate_fn=collate, drop_last=True)
+    dl = DataLoader(ds, batch_size=a.batch, shuffle=True, num_workers=a.workers, collate_fn=collate,
+                    drop_last=True, persistent_workers=a.workers > 0, prefetch_factor=4 if a.workers > 0 else None)
     model = CRNN(NUM_CLASSES)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
