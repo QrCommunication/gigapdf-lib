@@ -10,13 +10,18 @@
 //!
 //! Supported: `<svg viewBox width height>`, `<g>`, `<rect>` (incl. `rx`/`ry`
 //! rounded corners), `<circle>`, `<ellipse>`, `<line>`, `<polyline>`,
-//! `<polygon>`, `<path>` (the full `d` grammar via [`crate::content::svg_path`]);
-//! presentation attributes + inline `style`: `fill`, `stroke`, `stroke-width`,
-//! `opacity`, `fill-opacity`, `stroke-opacity` (`none` honoured); `transform`
+//! `<polygon>`, `<path>` (the full `d` grammar via [`crate::content::svg_path`]),
+//! and `<text>` / `<tspan>` (positioned, anchored, filled — glyph outlines are
+//! traced into vector paths via the bundled font, so SVG labels stay crisp like
+//! every other primitive); presentation attributes + inline `style`: `fill`,
+//! `stroke`, `stroke-width`, `opacity`, `fill-opacity`, `stroke-opacity`
+//! (`none` honoured); `transform`
 //! (`translate`/`scale`/`rotate`/`matrix`/`skewX`/`skewY`).
 
 use crate::content::svg_path::{parse as parse_path_d, Seg};
 use crate::content::Rgb;
+use crate::font::bundled::{self, Base14};
+use crate::font::truetype::TrueTypeFont;
 use crate::html::css::parse_color;
 use crate::html::dom::{self, Element, Node};
 
@@ -281,8 +286,263 @@ fn walk(nodes: &[Node], ctm: Mat, paint: Paint, grads: &Grads, out: &mut Vec<Pri
                 furl,
                 grads,
             ),
-            _ => {} // <defs>/<title>/<style>/text/… ignored
+            "text" => walk_text(e, ctm, paint, out),
+            _ => {} // <defs>/<title>/<style>/… ignored
         }
+    }
+}
+
+// ── text → vector glyph outlines ────────────────────────────────────────────────
+//
+// SVG `<text>` is rendered by tracing each glyph's outline (from the bundled
+// font) into filled vector subpaths in viewBox coordinates, then pushed as an
+// ordinary `Prim`. This means the whole downstream pipeline — fill colour,
+// opacity, gradient `fill="url(#…)"`, the PDF path emission in
+// `Document::draw_svg_image` — applies to text exactly as it does to shapes,
+// and text stays crisp at any zoom rather than being rasterized.
+
+/// Mutable cursor while laying out text along the baseline (viewBox coords).
+#[derive(Debug, Clone, Copy)]
+struct TextCursor {
+    x: f64,
+    y: f64,
+    font_size: f64,
+}
+
+/// SVG `text-anchor`: where the run's advance box sits relative to the start x.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Anchor {
+    Start,
+    Middle,
+    End,
+}
+
+/// The bundled fallback face, parsed once. SVG text has no host-provided fonts,
+/// so every family resolves to this metric-compatible sans (Liberation Sans).
+/// `None` only if the embedded program failed to parse (it doesn't).
+fn text_face() -> Option<&'static TrueTypeFont> {
+    bundled::bundled_program_for_base14(Base14::Sans)
+}
+
+/// Render a `<text>` element (and its `<tspan>` descendants) into glyph-outline
+/// primitives. The element's `transform` is already folded into `ctm` by the
+/// caller; `paint` carries the inherited fill/stroke.
+fn walk_text(e: &Element, ctm: Mat, paint: Paint, out: &mut Vec<Prim>) {
+    let Some(face) = text_face() else { return };
+    // Initial cursor from the element's own x/y (default 0), font-size from the
+    // cascade (default 16, the CSS initial value).
+    let mut cur = TextCursor {
+        x: attr_f(e, "x"),
+        y: attr_f(e, "y"),
+        font_size: font_size_of(e, 16.0),
+    };
+    render_text_node(e, ctm, paint, face, &mut cur, out);
+}
+
+/// Recursively lay out one text container (`<text>` or `<tspan>`): apply its
+/// position/style, then emit its direct text and recurse into nested `<tspan>`s.
+fn render_text_node(
+    e: &Element,
+    ctm: Mat,
+    parent_paint: Paint,
+    face: &TrueTypeFont,
+    cur: &mut TextCursor,
+    out: &mut Vec<Prim>,
+) {
+    // Absolute reposition (`x`/`y`) then relative shift (`dx`/`dy`).
+    if let Some(x) = e.attr("x").and_then(parse_len) {
+        cur.x = x;
+    }
+    if let Some(y) = e.attr("y").and_then(parse_len) {
+        cur.y = y;
+    }
+    cur.x += e.attr("dx").and_then(parse_len).unwrap_or(0.0);
+    cur.y += e.attr("dy").and_then(parse_len).unwrap_or(0.0);
+    cur.font_size = font_size_of(e, cur.font_size);
+
+    let paint = inherit_paint(e, parent_paint);
+    let anchor = anchor_of(e);
+
+    // `text-anchor` shifts the whole run governed by this element. Measure the
+    // total advance of this subtree's text and offset the start x accordingly.
+    if anchor != Anchor::Start {
+        let advance = measure_subtree(e, face, cur.font_size);
+        cur.x -= match anchor {
+            Anchor::Middle => advance / 2.0,
+            Anchor::End => advance,
+            Anchor::Start => 0.0,
+        };
+    }
+
+    for child in &e.children {
+        match child {
+            Node::Text(t) => emit_text(t, ctm, paint, face, cur, out),
+            Node::Element(c) if c.tag == "tspan" || c.tag == "text" => {
+                render_text_node(c, ctm, paint, face, cur, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Total advance width (viewBox units, at `font_size`) of the text directly in
+/// `e` plus all its `<tspan>` descendants — used to resolve `text-anchor`. A
+/// nested `<tspan>` that re-anchors or repositions itself is excluded (it forms
+/// its own anchored run, handled when reached).
+fn measure_subtree(e: &Element, face: &TrueTypeFont, font_size: f64) -> f64 {
+    let mut total = 0.0;
+    for child in &e.children {
+        match child {
+            Node::Text(t) => total += run_advance(t, face, font_size),
+            Node::Element(c) if c.tag == "tspan" => {
+                if reanchors(c) {
+                    continue;
+                }
+                let fs = font_size_of(c, font_size);
+                total += measure_subtree(c, face, fs);
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// True if a `<tspan>` starts its own anchored run (sets its own `x` or
+/// `text-anchor`), so the parent's anchor measurement must skip it.
+fn reanchors(e: &Element) -> bool {
+    e.attr("x").and_then(parse_len).is_some() || e.attr("text-anchor").is_some()
+}
+
+/// Advance width (viewBox units) of a literal string at `font_size`, summing the
+/// bundled face's per-glyph `hmtx` widths (whitespace collapsed like XML text).
+fn run_advance(text: &str, face: &TrueTypeFont, font_size: f64) -> f64 {
+    let upm = face.units_per_em().max(1.0);
+    let scale = font_size / upm;
+    let mut adv = 0.0;
+    for ch in normalize_text(text).chars() {
+        let gid = face.gid_for_unicode(ch as u32).unwrap_or(0);
+        adv += face.advance_width(gid) * scale;
+    }
+    adv
+}
+
+/// Trace a literal string's glyphs into outline subpaths at the cursor, then
+/// advance the cursor. Each glyph contour becomes `Move`+`Line…`+`Close` in
+/// viewBox space; the font's Y-up units are flipped to SVG's Y-down. The
+/// element's `ctm` is baked in, then the primitive is pushed (filled only —
+/// stroking text outlines is uncommon and skipped for clarity).
+fn emit_text(
+    text: &str,
+    ctm: Mat,
+    paint: Paint,
+    face: &TrueTypeFont,
+    cur: &mut TextCursor,
+    out: &mut Vec<Prim>,
+) {
+    let upm = face.units_per_em().max(1.0);
+    let scale = cur.font_size / upm;
+    let fill = paint.fill;
+    for ch in normalize_text(text).chars() {
+        let gid = face.gid_for_unicode(ch as u32).unwrap_or(0);
+        let advance = face.advance_width(gid) * scale;
+        // Skip drawing invisible glyphs (space, unmapped) but still advance.
+        if gid != 0 || ch == ' ' {
+            if let Some(rgb) = fill {
+                let segs = glyph_segs(face, gid, cur.x, cur.y, scale, &ctm);
+                if !segs.is_empty() {
+                    out.push(Prim {
+                        segs,
+                        fill: Some(Fill::Solid(rgb)),
+                        stroke: None,
+                        stroke_w: 0.0,
+                        fill_opacity: paint.fill_opacity,
+                        stroke_opacity: paint.stroke_opacity,
+                    });
+                }
+            }
+        }
+        cur.x += advance;
+    }
+}
+
+/// Build the transformed outline of one glyph: font-unit contours → viewBox
+/// coords at baseline `(bx, by)` with `scale` units/px (Y flipped from the
+/// font's Y-up to SVG's Y-down), then the group `ctm` applied.
+fn glyph_segs(face: &TrueTypeFont, gid: u16, bx: f64, by: f64, scale: f64, ctm: &Mat) -> Vec<Seg> {
+    let mut segs = Vec::new();
+    for contour in face.glyph_polygons(gid) {
+        if contour.len() < 2 {
+            continue;
+        }
+        let mut first = true;
+        for &(gx, gy) in &contour {
+            // Font units are Y-up; SVG is Y-down, so subtract the scaled Y.
+            let px = bx + gx * scale;
+            let py = by - gy * scale;
+            let (tx, ty) = ctm.apply(px, py);
+            if first {
+                segs.push(Seg::Move(tx, ty));
+                first = false;
+            } else {
+                segs.push(Seg::Line(tx, ty));
+            }
+        }
+        segs.push(Seg::Close);
+    }
+    segs
+}
+
+/// Collapse XML whitespace runs in text content to single spaces (SVG renders
+/// `<text>` with the default `xml:space` — runs of whitespace collapse).
+fn normalize_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+/// Resolve `font-size` for a text element from its attribute or inline `style`,
+/// falling back to the inherited value.
+fn font_size_of(e: &Element, inherited: f64) -> f64 {
+    if let Some(v) = e.attr("font-size").and_then(parse_len) {
+        return v;
+    }
+    if let Some(style) = e.attr("style") {
+        for (k, v) in parse_style(style) {
+            if k == "font-size" {
+                if let Some(s) = parse_len(&v) {
+                    return s;
+                }
+            }
+        }
+    }
+    inherited
+}
+
+/// Resolve `text-anchor` from the attribute or inline `style` (default `start`).
+fn anchor_of(e: &Element) -> Anchor {
+    let raw = e.attr("text-anchor").map(str::to_string).or_else(|| {
+        e.attr("style").and_then(|s| {
+            parse_style(s)
+                .into_iter()
+                .find(|(k, _)| k == "text-anchor")
+                .map(|(_, v)| v)
+        })
+    });
+    match raw.as_deref().map(str::trim) {
+        Some("middle") => Anchor::Middle,
+        Some("end") => Anchor::End,
+        _ => Anchor::Start,
     }
 }
 
@@ -1016,5 +1276,131 @@ mod tests {
     #[test]
     fn base64_decoder_basics() {
         assert_eq!(base64_decode("PHN2Zz4=").unwrap(), b"<svg>");
+    }
+
+    // ── <text> rendering ─────────────────────────────────────────────────────
+
+    /// Min/max X of a primitive's segment coordinates (after the CTM bake).
+    fn prim_x_range(p: &Prim) -> (f64, f64) {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for s in &p.segs {
+            let xs: &[f64] = match s {
+                Seg::Move(x, _) | Seg::Line(x, _) => &[*x][..],
+                Seg::Cubic(a, _, c, _, e, _) => &[*a, *c, *e][..],
+                Seg::Close => &[][..],
+            };
+            for &x in xs {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+        (lo, hi)
+    }
+
+    #[test]
+    fn text_traces_glyph_outlines_as_filled_paths() {
+        let svg = r##"<svg viewBox="0 0 200 50">
+            <text x="10" y="40" font-size="30" fill="#ff0000">Hi</text>
+        </svg>"##;
+        let img = parse_svg(svg).expect("text yields an image");
+        // Two visible letters → at least one filled primitive each, all red.
+        assert!(!img.prims.is_empty(), "glyphs produce primitives");
+        for p in &img.prims {
+            match p.fill {
+                Some(Fill::Solid(c)) => assert_eq!(c, [1.0, 0.0, 0.0], "text fill is red"),
+                _ => panic!("text primitive should be solid-filled"),
+            }
+            assert!(p.stroke.is_none(), "text is filled, not stroked");
+            // Glyph contours flatten to polylines: Moves/Lines/Close, no cubics.
+            assert!(
+                p.segs
+                    .iter()
+                    .any(|s| matches!(s, Seg::Line(..)) || matches!(s, Seg::Move(..))),
+                "glyph contour has line segments"
+            );
+            assert!(
+                !p.segs.iter().any(|s| matches!(s, Seg::Cubic(..))),
+                "TrueType contours arrive pre-flattened (no cubics)"
+            );
+        }
+        // Glyphs sit to the right of the start x (=10) and within the viewBox.
+        let (lo, hi) = img
+            .prims
+            .iter()
+            .map(prim_x_range)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), (a, b)| {
+                (l.min(a), h.max(b))
+            });
+        assert!(lo >= 9.0 && hi <= 200.0, "text laid out near x=10 (lo={lo} hi={hi})");
+    }
+
+    #[test]
+    fn text_anchor_middle_centers_the_run() {
+        // Same content, one start-anchored and one middle-anchored at the same x.
+        let start = parse_svg(
+            r#"<svg viewBox="0 0 200 50"><text x="100" y="30" font-size="20">ABC</text></svg>"#,
+        )
+        .unwrap();
+        let middle = parse_svg(
+            r#"<svg viewBox="0 0 200 50"><text x="100" y="30" font-size="20" text-anchor="middle">ABC</text></svg>"#,
+        )
+        .unwrap();
+        let min_x = |img: &SvgImage| {
+            img.prims
+                .iter()
+                .map(|p| prim_x_range(p).0)
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (sx, mx) = (min_x(&start), min_x(&middle));
+        // The middle-anchored run starts to the LEFT of the start-anchored one by
+        // ~half the run width (a few pt for "ABC" at 20px).
+        assert!(mx < sx - 5.0, "middle anchor shifts left (start={sx} middle={mx})");
+    }
+
+    #[test]
+    fn text_with_no_fill_draws_nothing() {
+        let svg =
+            r#"<svg viewBox="0 0 100 30"><text x="0" y="20" fill="none">x</text></svg>"#;
+        assert!(
+            parse_svg(svg).is_none(),
+            "fill:none text produces no primitives"
+        );
+    }
+
+    #[test]
+    fn tspan_repositions_within_text() {
+        let svg = r##"<svg viewBox="0 0 200 50">
+            <text x="10" y="40" font-size="20" fill="#000">
+                A<tspan dx="50">B</tspan>
+            </text>
+        </svg>"##;
+        let img = parse_svg(svg).expect("tspan text parses");
+        // The 'B' (after dx=50) must sit well to the right of the 'A'.
+        let xs: Vec<f64> = img.prims.iter().map(|p| prim_x_range(p).0).collect();
+        let max_x = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(max_x > 55.0, "tspan dx shifts the glyph right (max_x={max_x})");
+    }
+
+    #[test]
+    fn text_transform_is_baked_into_glyph_coords() {
+        // translate(100,0) shifts every glyph coordinate right by 100.
+        let plain = parse_svg(
+            r#"<svg viewBox="0 0 300 50"><text x="0" y="30" font-size="20">o</text></svg>"#,
+        )
+        .unwrap();
+        let shifted = parse_svg(
+            r#"<svg viewBox="0 0 300 50"><g transform="translate(100,0)"><text x="0" y="30" font-size="20">o</text></g></svg>"#,
+        )
+        .unwrap();
+        let lo = |img: &SvgImage| {
+            img.prims
+                .iter()
+                .map(|p| prim_x_range(p).0)
+                .fold(f64::INFINITY, f64::min)
+        };
+        assert!(
+            (lo(&shifted) - lo(&plain) - 100.0).abs() < 1.0,
+            "translate baked into glyph outline"
+        );
     }
 }
