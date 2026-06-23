@@ -1,0 +1,19 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts", "src/editor.ts", "src/viewer.ts"],
+  "out": "docs-api",
+  "name": "@qrcommunication/gigapdf-lib — SDK API reference",
+  "readme": "README.md",
+  "includeVersion": true,
+  "hideGenerator": false,
+  "navigationLinks": {
+    "GitHub": "https://github.com/QrCommunication/gigapdf-lib",
+    "npm": "https://www.npmjs.com/package/@qrcommunication/gigapdf-lib",
+    "Guides": "https://github.com/QrCommunication/gigapdf-lib/tree/main/docs"
+  },
+  "categorizeByGroup": true,
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "sort": ["source-order"],
+  "gitRevision": "main"
+}

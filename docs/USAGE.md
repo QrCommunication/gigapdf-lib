@@ -423,7 +423,7 @@ const prog = callBuffer((lp) => ex.gp_extract_font(handle, nm.ptr, nm.len, lp));
 
 // 8. Edit text in place — font-aware. A run in an embedded Type0/Identity-H face
 //    (TrueType or OpenType-CFF) is re-encoded through that font's char→glyph map.
-const repl = strArg("Réécrit dans la même police");
+const repl = strArg("Rewritten in the same font");
 ex.gp_replace_text(handle, 1, 0, repl.ptr, repl.len); // run #0 on page 1
 freeArg(repl);
 ```

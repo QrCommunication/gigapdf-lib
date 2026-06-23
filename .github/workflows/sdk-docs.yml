@@ -1,0 +1,64 @@
+name: SDK API docs (TypeDoc → Pages)
+
+# Builds the TypeScript SDK API reference with TypeDoc and publishes it to
+# GitHub Pages. TypeDoc reads sdk/src + sdk/tsconfig.json only (no wasm build),
+# so the job is fast. Pages source must be set to "GitHub Actions"
+# (Settings → Pages, or `gh api -X POST repos/<owner>/<repo>/pages -f build_type=workflow`).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sdk/src/**"
+      - "sdk/typedoc.json"
+      - "sdk/package.json"
+      - "sdk/README.md"
+      - ".github/workflows/sdk-docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent Pages deployment; don't cancel an in-flight one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate TypeDoc API reference
+        working-directory: sdk
+        run: pnpm run docs:api
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: sdk/docs-api
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

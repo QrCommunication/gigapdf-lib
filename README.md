@@ -10,6 +10,10 @@ standards-compliant signatures & crypto) and **Boa** (the JavaScript engine).
 The TypeScript SDK is published as **[`@qrcommunication/gigapdf-lib`](https://www.npmjs.com/package/@qrcommunication/gigapdf-lib)**
 (see [`sdk/`](sdk/)); the self-contained `.wasm` ships inside it.
 
+📖 **Full SDK API reference: <https://qrcommunication.github.io/gigapdf-lib/>** —
+auto-generated from the source with [TypeDoc](https://typedoc.org): every exported
+class, method, parameter, return type and model type, always current.
+
 > Copyright 2025 Rony Licha / QR Communication.
 > Licensed under the **PolyForm Noncommercial License 1.0.0** — see [`LICENSE`](LICENSE).
 > Required Notice: Copyright 2025 Rony Licha / QR Communication.
@@ -194,6 +198,7 @@ ex.gp_close(handle);
 
 | Doc | What's in it |
 |-----|--------------|
+| [**SDK API reference** (hosted)](https://qrcommunication.github.io/gigapdf-lib/) | **Auto-generated TypeDoc** — the complete, always-current API surface: every exported class, method, parameter, return type and model type (`Giga*`). |
 | [`docs/SDK.md`](docs/SDK.md) | **Complete TypeScript SDK reference** — every `GigaPdfEngine`/`GigaPdfDoc` method, grouped by domain, with parameters, returns and notes. |
 | [`docs/COOKBOOK.md`](docs/COOKBOOK.md) | **Task-oriented recipes** — redaction, styled text, headers/footers, conversions, OCR, forms, annotations, signing, encryption, and the editable model, each as a short runnable snippet. |
 | [`docs/USAGE.md`](docs/USAGE.md) | Host integration: the raw `extern "C"` buffer ABI plus a worked example for every feature area. |

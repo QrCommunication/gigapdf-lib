@@ -46,6 +46,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
+    "docs:api": "typedoc",
     "test": "vitest run",
     "clean": "rm -rf dist gigapdf.wasm",
     "prepublishOnly": "pnpm run build:wasm && pnpm run build"
@@ -80,6 +81,7 @@
   "devDependencies": {
     "@types/node": "^25.9.3",
     "tsup": "^8.5.1",
+    "typedoc": "^0.28.0",
     "typescript": "^6.0.3",
     "vitest": "^3.2.4"
   },
