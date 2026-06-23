@@ -4,6 +4,21 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.71.1] - 2026-06-23
+
+Documentation-only patch. No code changes — the WASM blob is byte-for-byte
+identical to 0.71.0.
+
+### Documentation
+
+- Complete overhaul of the SDK documentation for 0.71: API reference (signature
+  matrix for B / B-T / LTV signing, full ~263-method surface, removal of the
+  phantom OCR methods `doc.ocr` / `ocrText` / `extractText`), USAGE guide (the
+  four signing-signature levels + the host-fetch two-phase model + an SSRF note),
+  COOKBOOK (added `signTimestamped` / `signLtv` recipes and an image-watermark
+  recipe), plus the README and `sdk/README` (npm). No behavioural change — the
+  WASM is identical to 0.71.0.
+
 ## [0.71.0] - 2026-06-23
 
 Long-term validation release: PAdES-LTV builds on the B-T timestamped signatures
