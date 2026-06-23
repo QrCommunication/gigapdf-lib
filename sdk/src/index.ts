@@ -22,7 +22,7 @@ import { loadDefaultWasmBytes } from "./node-fs.js";
 // FFI boundary: the wasm exports are an untyped table of `gp_*` functions
 // (numbers in, numbers out) plus `memory`. `any` here is the documented FFI
 // exception — every public method below re-imposes precise types.
-type Exports = {
+export type Exports = {
   memory: WebAssembly.Memory;
   gp_alloc(len: number): number;
   gp_free(ptr: number, len: number): void;
@@ -1406,7 +1406,7 @@ export interface GigaSection {
 /**
  * A document outline (bookmark) entry — a label, a zero-based destination page,
  * and nested children (mirror of `model::OutlineNode`). Populated by
- * {@link GigaPdf.officeToModel}/reconstruction from the source's own bookmarks
+ * {@link GigaPdfEngine.officeToModel}/reconstruction from the source's own bookmarks
  * (PDF `/Outlines`) or, lacking those, from detected headings.
  */
 export interface GigaOutlineNode {
@@ -2271,7 +2271,7 @@ export class GigaPdfDoc {
    * stream, painted last); otherwise it is sent behind everything (moved to the
    * start, painted first). The moved range is re-wrapped in `q … Q` so it neither
    * inherits nor leaks graphics state. Works for text, image and shape elements.
-   * The element's index changes after the move — re-read {@link pageElements}.
+   * The element's index changes after the move — re-read {@link GigaPdfDoc.elements}.
    * Returns `false` if the page/index doesn't exist.
    */
   reorderElement(page: number, index: number, toFront: boolean): boolean {
@@ -2717,7 +2717,7 @@ export class GigaPdfDoc {
 
   /**
    * Rasterize a page to a PNG while **omitting** the given top-level element
-   * `indices` (from {@link pageElements}). Each excluded element paints nothing
+   * `indices` (from {@link GigaPdfDoc.elements}). Each excluded element paints nothing
    * — fills, strokes, shadings, images and text alike — while everything else
    * (including the non-text content of non-excluded elements) renders normally.
    * Use it to paint a background without specific elements and overlay live,
@@ -2962,7 +2962,7 @@ export class GigaPdfDoc {
        */
       flags?: Partial<PdfPermissions>;
       /**
-       * Raw signed 32-bit `/P` bitmask. Use {@link flags} for a readable API.
+       * Raw signed 32-bit `/P` bitmask. Use `flags` (above) for a readable API.
        * Defaults to all permissions granted when neither is given.
        */
       permissions?: number;

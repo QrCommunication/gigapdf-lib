@@ -23,7 +23,7 @@ const SVG_NS = "http://www.w3.org/2000/svg" as const;
 const PT_PER_MM = 72 / 25.4; // 1 mm in PDF points
 
 /** A page edge that carries an adjustable margin. */
-type Side = "top" | "right" | "bottom" | "left";
+export type Side = "top" | "right" | "bottom" | "left";
 
 export type EditTool =
   | "select"
