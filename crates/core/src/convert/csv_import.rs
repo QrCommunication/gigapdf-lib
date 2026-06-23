@@ -33,9 +33,7 @@ pub fn csv_to_model(bytes: &[u8]) -> Option<Document> {
     let records = parse_records(&text, delim);
     // Reject input with no real content: no records, or every record is just
     // empty field(s) (e.g. a few blank lines).
-    let has_content = records
-        .iter()
-        .any(|r| r.iter().any(|f| !f.is_empty()));
+    let has_content = records.iter().any(|r| r.iter().any(|f| !f.is_empty()));
     if !has_content {
         return None;
     }
@@ -153,7 +151,11 @@ fn parse_records(text: &str, delim: u8) -> Vec<Vec<String>> {
                 push_field(&mut field, &mut record);
                 records.push(std::mem::take(&mut record));
                 field_started = false;
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
             }
             b'\n' => {
                 push_field(&mut field, &mut record);
@@ -213,7 +215,10 @@ fn make_row(fields: &[String], ncols: usize, header: bool) -> Row {
             ..Cell::default()
         });
     }
-    Row { cells, height: None }
+    Row {
+        cells,
+        height: None,
+    }
 }
 
 /// A single-run paragraph for a cell; header runs are bold.

@@ -23,26 +23,19 @@
 const MAC_ROMAN_HIGH: [u16; 128] = [
     // 0x80–0x8F
     0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1, 0x00E0, 0x00E2, 0x00E4, 0x00E3,
-    0x00E5, 0x00E7, 0x00E9, 0x00E8,
-    // 0x90–0x9F
+    0x00E5, 0x00E7, 0x00E9, 0x00E8, // 0x90–0x9F
     0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3, 0x00F2, 0x00F4, 0x00F6, 0x00F5,
-    0x00FA, 0x00F9, 0x00FB, 0x00FC,
-    // 0xA0–0xAF
+    0x00FA, 0x00F9, 0x00FB, 0x00FC, // 0xA0–0xAF
     0x2020, 0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF, 0x00AE, 0x00A9, 0x2122, 0x00B4,
-    0x00A8, 0x2260, 0x00C6, 0x00D8,
-    // 0xB0–0xBF
+    0x00A8, 0x2260, 0x00C6, 0x00D8, // 0xB0–0xBF
     0x221E, 0x00B1, 0x2264, 0x2265, 0x00A5, 0x00B5, 0x2202, 0x2211, 0x220F, 0x03C0, 0x222B, 0x00AA,
-    0x00BA, 0x03A9, 0x00E6, 0x00F8,
-    // 0xC0–0xCF
+    0x00BA, 0x03A9, 0x00E6, 0x00F8, // 0xC0–0xCF
     0x00BF, 0x00A1, 0x00AC, 0x221A, 0x0192, 0x2248, 0x2206, 0x00AB, 0x00BB, 0x2026, 0x00A0, 0x00C0,
-    0x00C3, 0x00D5, 0x0152, 0x0153,
-    // 0xD0–0xDF
+    0x00C3, 0x00D5, 0x0152, 0x0153, // 0xD0–0xDF
     0x2013, 0x2014, 0x201C, 0x201D, 0x2018, 0x2019, 0x00F7, 0x25CA, 0x00FF, 0x0178, 0x2044, 0x20AC,
-    0x2039, 0x203A, 0xFB01, 0xFB02,
-    // 0xE0–0xEF
+    0x2039, 0x203A, 0xFB01, 0xFB02, // 0xE0–0xEF
     0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1, 0x00CB, 0x00C8, 0x00CD, 0x00CE,
-    0x00CF, 0x00CC, 0x00D3, 0x00D4,
-    // 0xF0–0xFF
+    0x00CF, 0x00CC, 0x00D3, 0x00D4, // 0xF0–0xFF
     0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC, 0x00AF, 0x02D8, 0x02D9, 0x02DA,
     0x00B8, 0x02DD, 0x02DB, 0x02C7,
 ];
@@ -292,7 +285,11 @@ pub fn glyph_name_to_unicode(raw: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    if let Some(&cp) = AGL_NAMES.iter().find(|&&(n, _)| n == name).map(|(_, cp)| cp) {
+    if let Some(&cp) = AGL_NAMES
+        .iter()
+        .find(|&&(n, _)| n == name)
+        .map(|(_, cp)| cp)
+    {
         return char::from_u32(cp as u32).map(|c| c.to_string());
     }
     // Subset-font glyph placeholder name `gNN` (e.g. `g49`): the producer named
@@ -338,35 +335,264 @@ pub fn mac_glyph_order_unicode(gid: u16) -> Option<String> {
 /// OpenType spec): the 258 standard glyph names, in the canonical order a
 /// `post` format-1 table and Mac-style subsetters assign. Index = glyph id.
 const MAC_GLYPH_ORDER: [&str; 258] = [
-    ".notdef", ".null", "nonmarkingreturn", "space", "exclam", "quotedbl", "numbersign", "dollar",
-    "percent", "ampersand", "quotesingle", "parenleft", "parenright", "asterisk", "plus", "comma",
-    "hyphen", "period", "slash", "zero", "one", "two", "three", "four", "five", "six", "seven",
-    "eight", "nine", "colon", "semicolon", "less", "equal", "greater", "question", "at", "A", "B",
-    "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U",
-    "V", "W", "X", "Y", "Z", "bracketleft", "backslash", "bracketright", "asciicircum", "underscore",
-    "grave", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
-    "r", "s", "t", "u", "v", "w", "x", "y", "z", "braceleft", "bar", "braceright", "asciitilde",
-    "Adieresis", "Aring", "Ccedilla", "Eacute", "Ntilde", "Odieresis", "Udieresis", "aacute",
-    "agrave", "acircumflex", "adieresis", "atilde", "aring", "ccedilla", "eacute", "egrave",
-    "ecircumflex", "edieresis", "iacute", "igrave", "icircumflex", "idieresis", "ntilde", "oacute",
-    "ograve", "ocircumflex", "odieresis", "otilde", "uacute", "ugrave", "ucircumflex", "udieresis",
-    "dagger", "degree", "cent", "sterling", "section", "bullet", "paragraph", "germandbls",
-    "registered", "copyright", "trademark", "acute", "dieresis", "notequal", "AE", "Oslash",
-    "infinity", "plusminus", "lessequal", "greaterequal", "yen", "mu", "partialdiff", "summation",
-    "product", "pi", "integral", "ordfeminine", "ordmasculine", "Omega", "ae", "oslash",
-    "questiondown", "exclamdown", "logicalnot", "radical", "florin", "approxequal", "Delta",
-    "guillemotleft", "guillemotright", "ellipsis", "nonbreakingspace", "Agrave", "Atilde", "Otilde",
-    "OE", "oe", "endash", "emdash", "quotedblleft", "quotedblright", "quoteleft", "quoteright",
-    "divide", "lozenge", "ydieresis", "Ydieresis", "fraction", "currency", "guilsinglleft",
-    "guilsinglright", "fi", "fl", "daggerdbl", "periodcentered", "quotesinglbase", "quotedblbase",
-    "perthousand", "Acircumflex", "Ecircumflex", "Aacute", "Edieresis", "Egrave", "Iacute",
-    "Icircumflex", "Idieresis", "Igrave", "Oacute", "Ocircumflex", "apple", "Ograve", "Uacute",
-    "Ucircumflex", "Ugrave", "dotlessi", "circumflex", "tilde", "macron", "breve", "dotaccent",
-    "ring", "cedilla", "hungarumlaut", "ogonek", "caron", "Lslash", "lslash", "Scaron", "scaron",
-    "Zcaron", "zcaron", "brokenbar", "Eth", "eth", "Yacute", "yacute", "Thorn", "thorn", "minus",
-    "multiply", "onesuperior", "twosuperior", "threesuperior", "onehalf", "onequarter",
-    "threequarters", "franc", "Gbreve", "gbreve", "Idotaccent", "Scedilla", "scedilla", "Cacute",
-    "cacute", "Ccaron", "ccaron", "dcroat",
+    ".notdef",
+    ".null",
+    "nonmarkingreturn",
+    "space",
+    "exclam",
+    "quotedbl",
+    "numbersign",
+    "dollar",
+    "percent",
+    "ampersand",
+    "quotesingle",
+    "parenleft",
+    "parenright",
+    "asterisk",
+    "plus",
+    "comma",
+    "hyphen",
+    "period",
+    "slash",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "colon",
+    "semicolon",
+    "less",
+    "equal",
+    "greater",
+    "question",
+    "at",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "bracketleft",
+    "backslash",
+    "bracketright",
+    "asciicircum",
+    "underscore",
+    "grave",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "braceleft",
+    "bar",
+    "braceright",
+    "asciitilde",
+    "Adieresis",
+    "Aring",
+    "Ccedilla",
+    "Eacute",
+    "Ntilde",
+    "Odieresis",
+    "Udieresis",
+    "aacute",
+    "agrave",
+    "acircumflex",
+    "adieresis",
+    "atilde",
+    "aring",
+    "ccedilla",
+    "eacute",
+    "egrave",
+    "ecircumflex",
+    "edieresis",
+    "iacute",
+    "igrave",
+    "icircumflex",
+    "idieresis",
+    "ntilde",
+    "oacute",
+    "ograve",
+    "ocircumflex",
+    "odieresis",
+    "otilde",
+    "uacute",
+    "ugrave",
+    "ucircumflex",
+    "udieresis",
+    "dagger",
+    "degree",
+    "cent",
+    "sterling",
+    "section",
+    "bullet",
+    "paragraph",
+    "germandbls",
+    "registered",
+    "copyright",
+    "trademark",
+    "acute",
+    "dieresis",
+    "notequal",
+    "AE",
+    "Oslash",
+    "infinity",
+    "plusminus",
+    "lessequal",
+    "greaterequal",
+    "yen",
+    "mu",
+    "partialdiff",
+    "summation",
+    "product",
+    "pi",
+    "integral",
+    "ordfeminine",
+    "ordmasculine",
+    "Omega",
+    "ae",
+    "oslash",
+    "questiondown",
+    "exclamdown",
+    "logicalnot",
+    "radical",
+    "florin",
+    "approxequal",
+    "Delta",
+    "guillemotleft",
+    "guillemotright",
+    "ellipsis",
+    "nonbreakingspace",
+    "Agrave",
+    "Atilde",
+    "Otilde",
+    "OE",
+    "oe",
+    "endash",
+    "emdash",
+    "quotedblleft",
+    "quotedblright",
+    "quoteleft",
+    "quoteright",
+    "divide",
+    "lozenge",
+    "ydieresis",
+    "Ydieresis",
+    "fraction",
+    "currency",
+    "guilsinglleft",
+    "guilsinglright",
+    "fi",
+    "fl",
+    "daggerdbl",
+    "periodcentered",
+    "quotesinglbase",
+    "quotedblbase",
+    "perthousand",
+    "Acircumflex",
+    "Ecircumflex",
+    "Aacute",
+    "Edieresis",
+    "Egrave",
+    "Iacute",
+    "Icircumflex",
+    "Idieresis",
+    "Igrave",
+    "Oacute",
+    "Ocircumflex",
+    "apple",
+    "Ograve",
+    "Uacute",
+    "Ucircumflex",
+    "Ugrave",
+    "dotlessi",
+    "circumflex",
+    "tilde",
+    "macron",
+    "breve",
+    "dotaccent",
+    "ring",
+    "cedilla",
+    "hungarumlaut",
+    "ogonek",
+    "caron",
+    "Lslash",
+    "lslash",
+    "Scaron",
+    "scaron",
+    "Zcaron",
+    "zcaron",
+    "brokenbar",
+    "Eth",
+    "eth",
+    "Yacute",
+    "yacute",
+    "Thorn",
+    "thorn",
+    "minus",
+    "multiply",
+    "onesuperior",
+    "twosuperior",
+    "threesuperior",
+    "onehalf",
+    "onequarter",
+    "threequarters",
+    "franc",
+    "Gbreve",
+    "gbreve",
+    "Idotaccent",
+    "Scedilla",
+    "scedilla",
+    "Cacute",
+    "cacute",
+    "Ccaron",
+    "ccaron",
+    "dcroat",
 ];
 
 /// Adobe glyph-name → Unicode for the named glyphs of the standard Latin
@@ -582,7 +808,10 @@ mod tests {
 
     #[test]
     fn glyph_names_resolve() {
-        assert_eq!(glyph_name_to_unicode("quoteright").as_deref(), Some("\u{2019}"));
+        assert_eq!(
+            glyph_name_to_unicode("quoteright").as_deref(),
+            Some("\u{2019}")
+        );
         assert_eq!(glyph_name_to_unicode("agrave").as_deref(), Some("à"));
         assert_eq!(glyph_name_to_unicode("eacute").as_deref(), Some("é"));
         assert_eq!(glyph_name_to_unicode("bullet").as_deref(), Some("\u{2022}"));
@@ -591,7 +820,10 @@ mod tests {
         assert_eq!(glyph_name_to_unicode("uni00E9").as_deref(), Some("é"));
         assert_eq!(glyph_name_to_unicode("A").as_deref(), Some("A"));
         // Subset prefix + suffix stripped.
-        assert_eq!(glyph_name_to_unicode("ABCDEF+agrave.sc").as_deref(), Some("à"));
+        assert_eq!(
+            glyph_name_to_unicode("ABCDEF+agrave.sc").as_deref(),
+            Some("à")
+        );
         // Unknown stylistic name → None.
         assert_eq!(glyph_name_to_unicode("foobar"), None);
     }
@@ -609,7 +841,7 @@ mod tests {
         assert_eq!(glyph_name_to_unicode("g3").as_deref(), Some(" ")); // space
         assert_eq!(glyph_name_to_unicode("g20").as_deref(), Some("1")); // one
         assert_eq!(glyph_name_to_unicode("g106").as_deref(), Some("à")); // agrave
-        // A real AGL name that merely starts with `g` must NOT be misread as `gNN`.
+                                                                         // A real AGL name that merely starts with `g` must NOT be misread as `gNN`.
         assert_eq!(glyph_name_to_unicode("grave").as_deref(), Some("`"));
         assert_eq!(glyph_name_to_unicode("guillemotleft").as_deref(), Some("«"));
         // Out-of-range index → not in the 258-name table → None (no panic).
@@ -631,9 +863,18 @@ mod tests {
 
     #[test]
     fn base_encoding_from_name() {
-        assert_eq!(BaseEncoding::from_name(b"WinAnsiEncoding"), Some(BaseEncoding::WinAnsi));
-        assert_eq!(BaseEncoding::from_name(b"MacRomanEncoding"), Some(BaseEncoding::MacRoman));
-        assert_eq!(BaseEncoding::from_name(b"StandardEncoding"), Some(BaseEncoding::Standard));
+        assert_eq!(
+            BaseEncoding::from_name(b"WinAnsiEncoding"),
+            Some(BaseEncoding::WinAnsi)
+        );
+        assert_eq!(
+            BaseEncoding::from_name(b"MacRomanEncoding"),
+            Some(BaseEncoding::MacRoman)
+        );
+        assert_eq!(
+            BaseEncoding::from_name(b"StandardEncoding"),
+            Some(BaseEncoding::Standard)
+        );
         assert_eq!(BaseEncoding::from_name(b"Identity-H"), None);
     }
 
@@ -645,7 +886,7 @@ mod tests {
         assert_eq!(zapf_dingbats_to_char(0x6C), Some('\u{25CF}')); // ●
         assert_eq!(zapf_dingbats_to_char(0x20), Some(' '));
         assert_eq!(zapf_dingbats_to_char(0x80), None); // undefined slot
-        // Routed through BaseEncoding too.
+                                                       // Routed through BaseEncoding too.
         assert_eq!(BaseEncoding::ZapfDingbats.to_char(0x34), Some('\u{2714}'));
     }
 

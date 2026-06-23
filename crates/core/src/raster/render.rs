@@ -19,12 +19,7 @@ use crate::object::Object;
 #[derive(Debug, Clone)]
 pub enum ShadingKind {
     /// Axial: the gradient runs along the segment `(x0,y0)→(x1,y1)`.
-    Axial {
-        x0: f64,
-        y0: f64,
-        x1: f64,
-        y1: f64,
-    },
+    Axial { x0: f64, y0: f64, x1: f64, y1: f64 },
     /// Radial: between circle `(x0,y0,r0)` and circle `(x1,y1,r1)`.
     Radial {
         x0: f64,
@@ -654,8 +649,8 @@ pub fn render_content_into_ctx(
                     state.fill_pattern = Some(name.clone());
                 } else {
                     state.fill_pattern = None;
-                    state.fill = resolve_set_color(ctx, state.fill_cs.as_deref(), &n)
-                        .unwrap_or(state.fill);
+                    state.fill =
+                        resolve_set_color(ctx, state.fill_cs.as_deref(), &n).unwrap_or(state.fill);
                 }
             }
             b"SC" | b"SCN" => {
@@ -1311,7 +1306,13 @@ fn paint_pattern_fill(
         // The pattern's matrix (already in `to_device` relative to the page base)
         // composes with `base`: shading space → page user space → device.
         shading.to_device = shading.to_device.then(base);
-        paint_shading(canvas, &shading, Some(&clip), global_alpha * state.fill_alpha, state.blend);
+        paint_shading(
+            canvas,
+            &shading,
+            Some(&clip),
+            global_alpha * state.fill_alpha,
+            state.blend,
+        );
         return;
     }
     if depth < crate::content::MAX_FORM_DEPTH {

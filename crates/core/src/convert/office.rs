@@ -2735,7 +2735,9 @@ mod tests {
 
     #[test]
     fn xml_balance_checker_is_sound() {
-        assert!(xml_is_balanced("<?xml version=\"1.0\"?><a><b/><c>x</c></a>"));
+        assert!(xml_is_balanced(
+            "<?xml version=\"1.0\"?><a><b/><c>x</c></a>"
+        ));
         assert!(xml_is_balanced("<ns:a xmlns:ns=\"u\"><ns:b/></ns:a>"));
         assert!(!xml_is_balanced("<a><b></a>"), "mis-nested");
         assert!(!xml_is_balanced("<a><b>"), "unclosed");
@@ -2813,11 +2815,14 @@ mod tests {
         // ODF places frames in points via num(): integers stay integral.
         // Box A at (72,100), Box B at (300,400) — distinct svg:x/svg:y.
         assert!(
-            content.contains("svg:x=\"72pt\" svg:y=\"100pt\" svg:width=\"144pt\" svg:height=\"12pt\""),
+            content
+                .contains("svg:x=\"72pt\" svg:y=\"100pt\" svg:width=\"144pt\" svg:height=\"12pt\""),
             "Box A frame at exact points: {content}"
         );
         assert!(
-            content.contains("svg:x=\"300pt\" svg:y=\"400pt\" svg:width=\"180pt\" svg:height=\"18pt\""),
+            content.contains(
+                "svg:x=\"300pt\" svg:y=\"400pt\" svg:width=\"180pt\" svg:height=\"18pt\""
+            ),
             "Box B frame at exact points — distinct from Box A"
         );
         // The framed rectangle at (130,560), 200×90 pt — a real draw:rect with
@@ -2827,7 +2832,9 @@ mod tests {
             "encadré is a real ODF rectangle"
         );
         assert!(
-            content.contains("svg:x=\"130pt\" svg:y=\"560pt\" svg:width=\"200pt\" svg:height=\"90pt\""),
+            content.contains(
+                "svg:x=\"130pt\" svg:y=\"560pt\" svg:width=\"200pt\" svg:height=\"90pt\""
+            ),
             "rectangle at exact points"
         );
         assert!(
@@ -2878,16 +2885,21 @@ mod tests {
         assert!(xml_is_balanced(&content), "ODT content XML is well-formed");
 
         assert!(
-            content.contains("svg:x=\"72pt\" svg:y=\"100pt\" svg:width=\"144pt\" svg:height=\"12pt\""),
+            content
+                .contains("svg:x=\"72pt\" svg:y=\"100pt\" svg:width=\"144pt\" svg:height=\"12pt\""),
             "Box A frame at exact points: {content}"
         );
         assert!(
-            content.contains("svg:x=\"300pt\" svg:y=\"400pt\" svg:width=\"180pt\" svg:height=\"18pt\""),
+            content.contains(
+                "svg:x=\"300pt\" svg:y=\"400pt\" svg:width=\"180pt\" svg:height=\"18pt\""
+            ),
             "Box B frame at exact points"
         );
         assert!(
             content.contains("<draw:rect ")
-                && content.contains("svg:x=\"130pt\" svg:y=\"560pt\" svg:width=\"200pt\" svg:height=\"90pt\""),
+                && content.contains(
+                    "svg:x=\"130pt\" svg:y=\"560pt\" svg:width=\"200pt\" svg:height=\"90pt\""
+                ),
             "encadré is a real ODF rectangle at exact points"
         );
         assert!(

@@ -48,23 +48,23 @@ pub(super) static ITX_SHIFT: [u8; 19] = [
 /// DCT across the rows. `inv_txfm_residual` therefore applies `types[1]` to rows
 /// and `types[0]` to columns.
 pub(super) static TX1D_TYPES: [[u8; 2]; 17] = [
-    [DCT_1D, DCT_1D],             // DCT_DCT
-    [ADST_1D, DCT_1D],            // ADST_DCT
-    [DCT_1D, ADST_1D],            // DCT_ADST
-    [ADST_1D, ADST_1D],           // ADST_ADST
-    [FLIPADST_1D, DCT_1D],        // FLIPADST_DCT
-    [DCT_1D, FLIPADST_1D],        // DCT_FLIPADST
-    [FLIPADST_1D, FLIPADST_1D],   // FLIPADST_FLIPADST
-    [ADST_1D, FLIPADST_1D],       // ADST_FLIPADST
-    [FLIPADST_1D, ADST_1D],       // FLIPADST_ADST
-    [IDENTITY_1D, IDENTITY_1D],   // IDTX
-    [DCT_1D, IDENTITY_1D],        // V_DCT
-    [IDENTITY_1D, DCT_1D],        // H_DCT
-    [ADST_1D, IDENTITY_1D],       // V_ADST
-    [IDENTITY_1D, ADST_1D],       // H_ADST
-    [FLIPADST_1D, IDENTITY_1D],   // V_FLIPADST
-    [IDENTITY_1D, FLIPADST_1D],   // H_FLIPADST
-    [DCT_1D, DCT_1D],             // WHT_WHT (handled separately)
+    [DCT_1D, DCT_1D],           // DCT_DCT
+    [ADST_1D, DCT_1D],          // ADST_DCT
+    [DCT_1D, ADST_1D],          // DCT_ADST
+    [ADST_1D, ADST_1D],         // ADST_ADST
+    [FLIPADST_1D, DCT_1D],      // FLIPADST_DCT
+    [DCT_1D, FLIPADST_1D],      // DCT_FLIPADST
+    [FLIPADST_1D, FLIPADST_1D], // FLIPADST_FLIPADST
+    [ADST_1D, FLIPADST_1D],     // ADST_FLIPADST
+    [FLIPADST_1D, ADST_1D],     // FLIPADST_ADST
+    [IDENTITY_1D, IDENTITY_1D], // IDTX
+    [DCT_1D, IDENTITY_1D],      // V_DCT
+    [IDENTITY_1D, DCT_1D],      // H_DCT
+    [ADST_1D, IDENTITY_1D],     // V_ADST
+    [IDENTITY_1D, ADST_1D],     // H_ADST
+    [FLIPADST_1D, IDENTITY_1D], // V_FLIPADST
+    [IDENTITY_1D, FLIPADST_1D], // H_FLIPADST
+    [DCT_1D, DCT_1D],           // WHT_WHT (handled separately)
 ];
 
 #[inline]
@@ -599,10 +599,38 @@ fn dct64(c: &mut [i32], s: usize, min: i32, max: i32) {
     t55a = ((t40 + t55) * 181 + 128) >> 8;
 
     let tt = [
-        c[0], c[2 * s], c[4 * s], c[6 * s], c[8 * s], c[10 * s], c[12 * s], c[14 * s],
-        c[16 * s], c[18 * s], c[20 * s], c[22 * s], c[24 * s], c[26 * s], c[28 * s], c[30 * s],
-        c[32 * s], c[34 * s], c[36 * s], c[38 * s], c[40 * s], c[42 * s], c[44 * s], c[46 * s],
-        c[48 * s], c[50 * s], c[52 * s], c[54 * s], c[56 * s], c[58 * s], c[60 * s], c[62 * s],
+        c[0],
+        c[2 * s],
+        c[4 * s],
+        c[6 * s],
+        c[8 * s],
+        c[10 * s],
+        c[12 * s],
+        c[14 * s],
+        c[16 * s],
+        c[18 * s],
+        c[20 * s],
+        c[22 * s],
+        c[24 * s],
+        c[26 * s],
+        c[28 * s],
+        c[30 * s],
+        c[32 * s],
+        c[34 * s],
+        c[36 * s],
+        c[38 * s],
+        c[40 * s],
+        c[42 * s],
+        c[44 * s],
+        c[46 * s],
+        c[48 * s],
+        c[50 * s],
+        c[52 * s],
+        c[54 * s],
+        c[56 * s],
+        c[58 * s],
+        c[60 * s],
+        c[62 * s],
     ];
     let hi = [
         t63a, t62, t61a, t60, t59a, t58, t57a, t56, t55a, t54, t53a, t52, t51a, t50, t49a, t48,
@@ -630,18 +658,21 @@ fn store_adst(c: &mut [i32], s: usize, out: &[i32], flip: bool) {
 
 fn adst4(c: &mut [i32], s: usize, _min: i32, _max: i32, flip: bool) {
     let (in0, in1, in2, in3) = (c[0], c[s], c[2 * s], c[3 * s]);
-    let o0 = ((1321 * in0 + (3803 - 4096) * in2 + (2482 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
-        >> 12)
-        + in2
-        + in3
-        + in1;
-    let o1 = (((2482 - 4096) * in0 - 1321 * in2 - (3803 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
-        >> 12)
-        + in0
-        - in3
-        + in1;
+    let o0 =
+        ((1321 * in0 + (3803 - 4096) * in2 + (2482 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
+            >> 12)
+            + in2
+            + in3
+            + in1;
+    let o1 =
+        (((2482 - 4096) * in0 - 1321 * in2 - (3803 - 4096) * in3 + (3344 - 4096) * in1 + 2048)
+            >> 12)
+            + in0
+            - in3
+            + in1;
     let o2 = (209 * (in0 - in2 + in3) + 128) >> 8;
-    let o3 = (((3803 - 4096) * in0 + (2482 - 4096) * in2 - 1321 * in3 - (3344 - 4096) * in1 + 2048)
+    let o3 = (((3803 - 4096) * in0 + (2482 - 4096) * in2 - 1321 * in3 - (3344 - 4096) * in1
+        + 2048)
         >> 12)
         + in0
         + in2
@@ -1011,7 +1042,10 @@ mod tests {
         cf[0] = 1000;
         let res = inv_txfm_residual(&mut cf, 1, txtp::DCT_DCT, 0); // 8×8
         assert_eq!(res.len(), 64);
-        assert!(res.iter().all(|&v| v == res[0]), "DC-only residual not flat");
+        assert!(
+            res.iter().all(|&v| v == res[0]),
+            "DC-only residual not flat"
+        );
         assert_eq!(cf[0], 0, "DC coefficient not cleared");
     }
 

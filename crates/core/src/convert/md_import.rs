@@ -105,11 +105,7 @@ fn parse_blocks(lines: &[&str]) -> Vec<Block> {
 
         // GFM pipe table: current line looks like a table row and the next is a
         // delimiter row (`---|:--:|...`).
-        if looks_like_table_row(raw)
-            && lines
-                .get(i + 1)
-                .is_some_and(|n| is_table_delimiter(n))
-        {
+        if looks_like_table_row(raw) && lines.get(i + 1).is_some_and(|n| is_table_delimiter(n)) {
             let (table, consumed) = parse_table(&lines[i..]);
             out.push(table);
             i += consumed;
@@ -455,11 +451,7 @@ fn looks_like_table_row(line: &str) -> bool {
 /// A GFM delimiter row: only `|`, `-`, `:` and spaces, and at least one `-`.
 fn is_table_delimiter(line: &str) -> bool {
     let t = line.trim();
-    !t.is_empty()
-        && t.contains('-')
-        && t
-            .chars()
-            .all(|c| matches!(c, '|' | '-' | ':' | ' '))
+    !t.is_empty() && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 // ── line classifiers ────────────────────────────────────────────────────────
@@ -830,11 +822,10 @@ mod tests {
             other => panic!("expected paragraph, got {other:?}"),
         };
         // All text runs are monospace; markup inside is NOT interpreted.
-        assert!(p
-            .runs
-            .iter()
-            .all(|i| matches!(i, Inline::Run(r) if matches!(r.style.generic, Generic::Mono))
-                || matches!(i, Inline::LineBreak)));
+        assert!(p.runs.iter().all(
+            |i| matches!(i, Inline::Run(r) if matches!(r.style.generic, Generic::Mono))
+                || matches!(i, Inline::LineBreak)
+        ));
         let mut s = String::new();
         collect(&p.runs, &mut s);
         assert!(s.contains("let x = 1;"));
@@ -846,8 +837,7 @@ mod tests {
         let doc = md_to_model("above\n\n---\n\nbelow");
         let b = blocks(&doc);
         assert!(
-            b.iter()
-                .any(|blk| matches!(&blk.kind, BlockKind::Shape(_))),
+            b.iter().any(|blk| matches!(&blk.kind, BlockKind::Shape(_))),
             "a rule shape exists"
         );
     }
@@ -914,7 +904,14 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec!["heading", "paragraph", "heading", "list", "paragraph", "table"]
+            vec![
+                "heading",
+                "paragraph",
+                "heading",
+                "list",
+                "paragraph",
+                "table"
+            ]
         );
     }
 }

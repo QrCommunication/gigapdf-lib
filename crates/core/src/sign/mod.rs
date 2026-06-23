@@ -11,11 +11,11 @@ pub mod der; // the definite-length DER reader the PKCS#12 importer uses
 pub mod pkcs12;
 
 use crate::crypto::rsa::RsaPrivateKey;
+use ::der::asn1::UtcTime;
+use ::der::{Decode, Encode};
 use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
 use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
-use ::der::asn1::UtcTime;
-use ::der::{Decode, Encode};
 use rsa::pkcs1v15::SigningKey;
 use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
@@ -94,15 +94,9 @@ impl Signer {
         let spki = SubjectPublicKeyInfoOwned::from_key(pub_key).ok()?;
         let signing_key = SigningKey::<Sha256>::new(key.inner().clone());
 
-        let builder = CertificateBuilder::new(
-            Profile::Root,
-            serial,
-            validity,
-            subject,
-            spki,
-            &signing_key,
-        )
-        .ok()?;
+        let builder =
+            CertificateBuilder::new(Profile::Root, serial, validity, subject, spki, &signing_key)
+                .ok()?;
         let cert: Certificate = builder.build().ok()?;
         let certificate = cert.to_der().ok()?;
 
@@ -141,14 +135,8 @@ fn build_detached_cms(key: &RsaPrivateKey, cert: Certificate, content: &[u8]) ->
         serial_number: cert.tbs_certificate.serial_number.clone(),
     });
 
-    let signer_info = SignerInfoBuilder::new(
-        &signing_key,
-        sid,
-        sha256_alg(),
-        &econtent,
-        Some(&digest),
-    )
-    .ok()?;
+    let signer_info =
+        SignerInfoBuilder::new(&signing_key, sid, sha256_alg(), &econtent, Some(&digest)).ok()?;
 
     let content_info = SignedDataBuilder::new(&econtent)
         .add_digest_algorithm(sha256_alg())
@@ -192,8 +180,14 @@ mod tests {
 
     fn test_signer() -> Signer {
         let randomness: Vec<u8> = (0..256).map(|i| (i * 53 + 7) as u8).collect();
-        Signer::generate("GigaPDF Signer", "260614000000Z", "360614000000Z", 1024, &randomness)
-            .expect("signer")
+        Signer::generate(
+            "GigaPDF Signer",
+            "260614000000Z",
+            "360614000000Z",
+            1024,
+            &randomness,
+        )
+        .expect("signer")
     }
 
     #[test]
@@ -201,7 +195,11 @@ mod tests {
         let signer = test_signer();
         let cert = signer.certificate();
         assert_eq!(cert[0], 0x30, "certificate is a SEQUENCE");
-        assert!(cert.len() > 200, "non-trivial certificate ({} bytes)", cert.len());
+        assert!(
+            cert.len() > 200,
+            "non-trivial certificate ({} bytes)",
+            cert.len()
+        );
         // It round-trips through the X.509 parser.
         assert!(Certificate::from_der(cert).is_ok());
     }

@@ -180,7 +180,9 @@ pub fn glyph_name_to_unicode_string(raw: &str) -> Option<String> {
     // AGL `uniXXXXYYYY…`: a run of 4-hex-digit BMP units (ligatures are encoded
     // this way too, e.g. `uni0066006900` is not valid — must be multiples of 4).
     if let Some(hex) = name.strip_prefix("uni") {
-        if hex.len() >= 4 && hex.len().is_multiple_of(4) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        if hex.len() >= 4
+            && hex.len().is_multiple_of(4)
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
         {
             let mut s = String::new();
             let mut ok = true;
@@ -418,7 +420,7 @@ fn build_name() -> Vec<u8> {
     t.extend_from_slice(&0u16.to_be_bytes()); // format 0
     t.extend_from_slice(&1u16.to_be_bytes()); // count
     t.extend_from_slice(&(6u16 + 12).to_be_bytes()); // stringOffset (header + 1 record)
-    // record
+                                                     // record
     t.extend_from_slice(&3u16.to_be_bytes()); // platformID
     t.extend_from_slice(&1u16.to_be_bytes()); // encodingID
     t.extend_from_slice(&0x0409u16.to_be_bytes()); // languageID
@@ -501,36 +503,145 @@ fn latin1_sid_unicode(sid: u16) -> Option<u32> {
 /// (SID 96..=228), split into chunks so each edit stays small.
 const LATIN1_CHUNK_LIST: &[&[(u16, u32)]] = &[L1_A, L1_B, L1_C, L1_D];
 const L1_A: &[(u16, u32)] = &[
-    (96, 0xA1), (97, 0xA2), (98, 0xA3), (99, 0x2044), (100, 0xA5), (101, 0x192),
-    (102, 0xA7), (103, 0xA4), (104, 0x27), (105, 0x201C), (106, 0xAB), (107, 0x2039),
-    (108, 0x203A), (109, 0xFB01), (110, 0xFB02), (111, 0x2013), (112, 0x2020), (113, 0x2021),
-    (114, 0xB7), (115, 0xB6), (116, 0x2022), (117, 0x201A), (118, 0x201E), (119, 0x201D),
-    (120, 0xBB), (121, 0x2026), (122, 0x2030), (123, 0xBF), (124, 0x60), (125, 0xB4),
-    (126, 0x2C6), (127, 0x2DC),
+    (96, 0xA1),
+    (97, 0xA2),
+    (98, 0xA3),
+    (99, 0x2044),
+    (100, 0xA5),
+    (101, 0x192),
+    (102, 0xA7),
+    (103, 0xA4),
+    (104, 0x27),
+    (105, 0x201C),
+    (106, 0xAB),
+    (107, 0x2039),
+    (108, 0x203A),
+    (109, 0xFB01),
+    (110, 0xFB02),
+    (111, 0x2013),
+    (112, 0x2020),
+    (113, 0x2021),
+    (114, 0xB7),
+    (115, 0xB6),
+    (116, 0x2022),
+    (117, 0x201A),
+    (118, 0x201E),
+    (119, 0x201D),
+    (120, 0xBB),
+    (121, 0x2026),
+    (122, 0x2030),
+    (123, 0xBF),
+    (124, 0x60),
+    (125, 0xB4),
+    (126, 0x2C6),
+    (127, 0x2DC),
 ];
 const L1_B: &[(u16, u32)] = &[
-    (128, 0xAF), (129, 0x2D8), (130, 0x2D9), (131, 0xA8), (132, 0x2DA), (133, 0xB8),
-    (134, 0x2DD), (135, 0x2DB), (136, 0x2C7), (137, 0x2014), (138, 0xC6), (139, 0xAA),
-    (140, 0x141), (141, 0xD8), (142, 0x152), (143, 0xBA), (144, 0xE6), (145, 0x131),
-    (146, 0x142), (147, 0xF8), (148, 0x153), (149, 0xDF), (150, 0xB9), (151, 0xAC),
-    (152, 0xB5), (153, 0x2122), (154, 0xD0), (155, 0xBD), (156, 0xB1), (157, 0xDE),
-    (158, 0xBC), (159, 0xF7), (160, 0xA6), (161, 0xB0), (162, 0xFE), (163, 0xBE),
-    (164, 0xB2), (165, 0xAE), (166, 0x2212), (167, 0xF0), (168, 0xD7), (169, 0xB3),
+    (128, 0xAF),
+    (129, 0x2D8),
+    (130, 0x2D9),
+    (131, 0xA8),
+    (132, 0x2DA),
+    (133, 0xB8),
+    (134, 0x2DD),
+    (135, 0x2DB),
+    (136, 0x2C7),
+    (137, 0x2014),
+    (138, 0xC6),
+    (139, 0xAA),
+    (140, 0x141),
+    (141, 0xD8),
+    (142, 0x152),
+    (143, 0xBA),
+    (144, 0xE6),
+    (145, 0x131),
+    (146, 0x142),
+    (147, 0xF8),
+    (148, 0x153),
+    (149, 0xDF),
+    (150, 0xB9),
+    (151, 0xAC),
+    (152, 0xB5),
+    (153, 0x2122),
+    (154, 0xD0),
+    (155, 0xBD),
+    (156, 0xB1),
+    (157, 0xDE),
+    (158, 0xBC),
+    (159, 0xF7),
+    (160, 0xA6),
+    (161, 0xB0),
+    (162, 0xFE),
+    (163, 0xBE),
+    (164, 0xB2),
+    (165, 0xAE),
+    (166, 0x2212),
+    (167, 0xF0),
+    (168, 0xD7),
+    (169, 0xB3),
     (170, 0xA9),
 ];
 const L1_C: &[(u16, u32)] = &[
-    (171, 0xC1), (172, 0xC2), (173, 0xC4), (174, 0xC0), (175, 0xC5), (176, 0xC3),
-    (177, 0xC7), (178, 0xC9), (179, 0xCA), (180, 0xCB), (181, 0xC8), (182, 0xCD),
-    (183, 0xCE), (184, 0xCF), (185, 0xCC), (186, 0xD1), (187, 0xD3), (188, 0xD4),
-    (189, 0xD6), (190, 0xD2), (191, 0xD5), (192, 0x160), (193, 0xDA), (194, 0xDB),
-    (195, 0xDC), (196, 0xD9), (197, 0xDD), (198, 0x178), (199, 0x17D),
+    (171, 0xC1),
+    (172, 0xC2),
+    (173, 0xC4),
+    (174, 0xC0),
+    (175, 0xC5),
+    (176, 0xC3),
+    (177, 0xC7),
+    (178, 0xC9),
+    (179, 0xCA),
+    (180, 0xCB),
+    (181, 0xC8),
+    (182, 0xCD),
+    (183, 0xCE),
+    (184, 0xCF),
+    (185, 0xCC),
+    (186, 0xD1),
+    (187, 0xD3),
+    (188, 0xD4),
+    (189, 0xD6),
+    (190, 0xD2),
+    (191, 0xD5),
+    (192, 0x160),
+    (193, 0xDA),
+    (194, 0xDB),
+    (195, 0xDC),
+    (196, 0xD9),
+    (197, 0xDD),
+    (198, 0x178),
+    (199, 0x17D),
 ];
 const L1_D: &[(u16, u32)] = &[
-    (200, 0xE1), (201, 0xE2), (202, 0xE4), (203, 0xE0), (204, 0xE5), (205, 0xE3),
-    (206, 0xE7), (207, 0xE9), (208, 0xEA), (209, 0xEB), (210, 0xE8), (211, 0xED),
-    (212, 0xEE), (213, 0xEF), (214, 0xEC), (215, 0xF1), (216, 0xF3), (217, 0xF4),
-    (218, 0xF6), (219, 0xF2), (220, 0xF5), (221, 0x161), (222, 0xFA), (223, 0xFB),
-    (224, 0xFC), (225, 0xF9), (226, 0xFD), (227, 0xFF), (228, 0x17E),
+    (200, 0xE1),
+    (201, 0xE2),
+    (202, 0xE4),
+    (203, 0xE0),
+    (204, 0xE5),
+    (205, 0xE3),
+    (206, 0xE7),
+    (207, 0xE9),
+    (208, 0xEA),
+    (209, 0xEB),
+    (210, 0xE8),
+    (211, 0xED),
+    (212, 0xEE),
+    (213, 0xEF),
+    (214, 0xEC),
+    (215, 0xF1),
+    (216, 0xF3),
+    (217, 0xF4),
+    (218, 0xF6),
+    (219, 0xF2),
+    (220, 0xF5),
+    (221, 0x161),
+    (222, 0xFA),
+    (223, 0xFB),
+    (224, 0xFC),
+    (225, 0xF9),
+    (226, 0xFD),
+    (227, 0xFF),
+    (228, 0x17E),
 ];
 
 #[cfg(test)]
@@ -558,12 +669,21 @@ mod tests {
         assert_eq!(glyph_name_to_unicode_string("f_l").as_deref(), Some("fl"));
         assert_eq!(glyph_name_to_unicode_string("f_i").as_deref(), Some("fi"));
         assert_eq!(glyph_name_to_unicode_string("f_f").as_deref(), Some("ff"));
-        assert_eq!(glyph_name_to_unicode_string("f_f_i").as_deref(), Some("ffi"));
+        assert_eq!(
+            glyph_name_to_unicode_string("f_f_i").as_deref(),
+            Some("ffi")
+        );
         assert_eq!(glyph_name_to_unicode_string("c_t").as_deref(), Some("ct"));
         // Component may itself be an accented single-char / uni name.
-        assert_eq!(glyph_name_to_unicode_string("uni0066_l").as_deref(), Some("fl"));
+        assert_eq!(
+            glyph_name_to_unicode_string("uni0066_l").as_deref(),
+            Some("fl")
+        );
         // Subset prefix + `.suffix` still stripped before the split.
-        assert_eq!(glyph_name_to_unicode_string("ABCDEF+f_l.alt").as_deref(), Some("fl"));
+        assert_eq!(
+            glyph_name_to_unicode_string("ABCDEF+f_l.alt").as_deref(),
+            Some("fl")
+        );
         // Malformed / opaque components are not a ligature.
         assert_eq!(glyph_name_to_unicode_string("f_"), None);
         assert_eq!(glyph_name_to_unicode_string("_l"), None);

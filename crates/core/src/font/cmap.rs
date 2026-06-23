@@ -101,7 +101,9 @@ impl ToUnicode {
         let mut max_code = 0u32;
         let mut ascii_entries = 0u32;
         for (&code, text) in &self.map {
-            let Some(scalar) = single_scalar(text) else { continue };
+            let Some(scalar) = single_scalar(text) else {
+                continue;
+            };
             min_code = min_code.min(code);
             max_code = max_code.max(code);
             if (0x20..=0x7E).contains(&scalar) {
@@ -565,7 +567,7 @@ mod tests {
         assert_eq!(cmap.decode(0x2d), Some("J")); // 0x2d + 0x1D = 0x4A
         assert_eq!(cmap.decode(0x0a), Some("'")); // quote slot recovered
         assert_eq!(cmap.decode(0x03), Some(" ")); // space recovered
-        // Existing entries untouched.
+                                                  // Existing entries untouched.
         assert_eq!(cmap.decode(0x24), Some("A"));
         assert_eq!(cmap.decode(0x44), Some("a"));
     }
@@ -574,7 +576,8 @@ mod tests {
     fn infer_ascii_gaps_borrows_document_delta_when_sparse() {
         // A near-empty CMap (only O,S) cannot self-calibrate, but borrows the
         // document-wide delta because its two entries are consistent with it.
-        let mut cmap = ToUnicode::parse(b"beginbfrange <0032> <0032> <004f> <0036> <0036> <0053> endbfrange");
+        let mut cmap =
+            ToUnicode::parse(b"beginbfrange <0032> <0032> <004f> <0036> <0036> <0053> endbfrange");
         cmap.infer_ascii_gaps(Some(0x1D));
         assert_eq!(cmap.decode(0x44), Some("a")); // recovered via doc delta
         assert_eq!(cmap.decode(0x2d), Some("J"));

@@ -146,7 +146,9 @@ impl HeaderFooterSpec {
                         }
                     }
                 }
-                "showOnFirstPage" | "show_on_first_page" => spec.show_on_first_page = p.boolean()?,
+                "showOnFirstPage" | "show_on_first_page" => {
+                    spec.show_on_first_page = p.boolean()?
+                }
                 "bandHeight" | "band_height" => spec.band_height = p.number()?,
                 _ => p.skip_value()?,
             }

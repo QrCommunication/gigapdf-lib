@@ -226,6 +226,14 @@ pub fn build_table(
     let mut grid: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
     // Remember a representative char style per (row,col) for the first run seen.
     let mut styles: Vec<Vec<Option<crate::model::CharStyle>>> = vec![vec![None; n_cols]; n_rows];
+    // Remember the FIRST run's `source_index` per (row,col). A cell concatenates
+    // several content-stream runs into one cell run, so only one index can be
+    // carried — the first non-nested run's index makes the cell addressable by
+    // the editor's flat `source_index` space (cell → table block, and cell →
+    // (row,col) by reverse lookup), without which a host can only address tables
+    // positionally. Nested-XObject runs (`source_index = None`) never overwrite a
+    // real index.
+    let mut src_grid: Vec<Vec<Option<usize>>> = vec![vec![None; n_cols]; n_rows];
 
     for &li in &table.covered_lines {
         let Some(line) = lines.get(li) else { continue };
@@ -246,6 +254,9 @@ pub fn build_table(
             cell.push_str(t);
             if styles[r][c].is_none() {
                 styles[r][c] = Some(run_char_style(run));
+            }
+            if src_grid[r][c].is_none() {
+                src_grid[r][c] = run.source_index;
             }
         }
     }
@@ -315,6 +326,9 @@ pub fn build_table(
                         if styles[r][c].is_none() {
                             styles[r][c] = styles[rr][cc].take();
                         }
+                        if src_grid[r][c].is_none() {
+                            src_grid[r][c] = src_grid[rr][cc].take();
+                        }
                     }
                 }
             }
@@ -337,6 +351,7 @@ pub fn build_table(
             // blank), so the grid shape is preserved rather than collapsed.
             let text = std::mem::take(&mut grid[r][c]);
             let style = styles[r][c].take();
+            let src = src_grid[r][c].take();
             let (cspan, rspan) = span[r][c];
             // Per-column alignment (borderless detection sets `Right` for numeric
             // columns); absent ⇒ left. A spanning cell takes its anchor column's
@@ -345,6 +360,7 @@ pub fn build_table(
             cells.push(make_cell_spanned(
                 text,
                 style,
+                src,
                 cspan as u16,
                 rspan as u16,
                 align,
@@ -388,10 +404,13 @@ pub fn build_table(
 /// Materialise one [`Cell`] holding `text` (one paragraph run) with the given
 /// spans. A 1×1 cell is the common case; `col_span`/`row_span` > 1 mark a merged
 /// region whose absorbed slots were dropped from their rows (the merge encoding
-/// the model and exporters expect).
+/// the model and exporters expect). `source_index` is the first content-stream
+/// run index seen in the cell (or `None` for an empty / nested-only cell), which
+/// makes the cell addressable by a host's flat `source_index` space.
 fn make_cell_spanned(
     text: String,
     style: Option<crate::model::CharStyle>,
+    source_index: Option<usize>,
     col_span: u16,
     row_span: u16,
     align: Align,
@@ -404,7 +423,7 @@ fn make_cell_spanned(
         vec![Inline::Run(InlineRun {
             text,
             style: style.unwrap_or_default(),
-            source_index: None,
+            source_index,
         })]
     };
     let para = Block {
@@ -1333,6 +1352,14 @@ mod tests {
         }
     }
 
+    /// `run` with an explicit content-stream `source_index` (for addressability).
+    fn run_src(text: &str, x: f64, y: f64, w: f64, source_index: usize) -> ReconRun {
+        ReconRun {
+            source_index: Some(source_index),
+            ..run(text, x, y, w)
+        }
+    }
+
     /// A horizontal ruling line as a thin filled rectangle path.
     fn hrule(y: f64, x0: f64, x1: f64) -> VectorPath {
         rect_path(x0, y - 0.25, x1 - x0, 0.5)
@@ -1416,6 +1443,88 @@ mod tests {
         assert!(t.border.width > 0.0);
         // The rule paths are marked used.
         assert!(plan.uses_path(0) && plan.uses_path(3));
+    }
+
+    #[test]
+    fn cell_runs_carry_the_first_source_index() {
+        // Same 2×2 ruled grid as above, but each cell's run carries a distinct
+        // content-stream `source_index`. The reconstructed cell run must surface
+        // that index so a host can address the cell by its flat run-index space.
+        let runs = vec![
+            run_src("Name", 60.0, 122.0, 40.0, 10),
+            run_src("Age", 160.0, 122.0, 30.0, 11),
+            run_src("Alice", 60.0, 102.0, 40.0, 12),
+            run_src("30", 160.0, 102.0, 20.0, 13),
+        ];
+        let lines = group_into_lines(&runs);
+        let mut paths = vec![
+            hrule(100.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(140.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("table at line 0");
+        let mut ids = IdGen::default();
+        let block = build_table(&tbl, &lines, &mut ids, Rect::new).unwrap();
+        let BlockKind::Table(t) = block.kind else {
+            panic!("expected table");
+        };
+        let cell_src = |c: &Cell| -> Option<usize> {
+            match &c.blocks[0].kind {
+                BlockKind::Paragraph(p) => match p.runs.first() {
+                    Some(crate::model::Inline::Run(r)) => r.source_index,
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        assert_eq!(cell_src(&t.rows[0].cells[0]), Some(10), "Name cell index");
+        assert_eq!(cell_src(&t.rows[0].cells[1]), Some(11), "Age cell index");
+        assert_eq!(cell_src(&t.rows[1].cells[0]), Some(12), "Alice cell index");
+        assert_eq!(cell_src(&t.rows[1].cells[1]), Some(13), "30 cell index");
+    }
+
+    #[test]
+    fn empty_cell_has_no_source_index() {
+        // A cell with no text run carries no `source_index` (stays addressable as
+        // an empty cell by its grid position, but has no flat run index).
+        let runs = vec![
+            run_src("Name", 60.0, 122.0, 40.0, 10),
+            // top-right cell intentionally left empty
+            run_src("Alice", 60.0, 102.0, 40.0, 12),
+            run_src("30", 160.0, 102.0, 20.0, 13),
+        ];
+        let lines = group_into_lines(&runs);
+        let mut paths = vec![
+            hrule(100.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(140.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("table at line 0");
+        let mut ids = IdGen::default();
+        let block = build_table(&tbl, &lines, &mut ids, Rect::new).unwrap();
+        let BlockKind::Table(t) = block.kind else {
+            panic!("expected table");
+        };
+        // Empty cell → empty runs → no index.
+        let empty = &t.rows[0].cells[1];
+        match &empty.blocks[0].kind {
+            BlockKind::Paragraph(p) => assert!(p.runs.is_empty(), "empty cell has no run"),
+            _ => panic!("expected paragraph"),
+        }
     }
 
     #[test]

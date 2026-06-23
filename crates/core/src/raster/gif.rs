@@ -92,7 +92,11 @@ fn read_table(d: &[u8], o: usize, n: usize) -> Option<Vec<[u8; 3]>> {
     if end > d.len() {
         return None;
     }
-    Some((0..n).map(|i| [d[o + i * 3], d[o + i * 3 + 1], d[o + i * 3 + 2]]).collect())
+    Some(
+        (0..n)
+            .map(|i| [d[o + i * 3], d[o + i * 3 + 1], d[o + i * 3 + 2]])
+            .collect(),
+    )
 }
 
 /// Advance past a label byte's chain of length-prefixed sub-blocks (ending in a
@@ -253,20 +257,20 @@ mod tests {
         g.extend_from_slice(&[2, 0, 2, 0]); // 2×2
         g.push(0x80 | 0x01); // GCT flag, size 2 → 4 colours
         g.extend_from_slice(&[0, 0]); // bg, aspect
-        // GCT: red, green, blue, white.
+                                      // GCT: red, green, blue, white.
         g.extend_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
         // Image descriptor.
         g.push(0x2C);
         g.extend_from_slice(&[0, 0, 0, 0, 2, 0, 2, 0, 0x00]); // pos 0,0 size 2×2, no LCT
-        // LZW: min code size 2 → clear=4, eoi=5; codes 0,1,2,3 then EOI.
+                                                              // LZW: min code size 2 → clear=4, eoi=5; codes 0,1,2,3 then EOI.
         let min = 2u8;
         let codes: Vec<(u16, u8)> = {
             // clear(4) @3bits, then literals 0,1,2,3, then EOI(5). Code size grows
             // to 4 once the dict reaches 8 entries (after adding 2 strings).
             let mut v = vec![(4u16, 3u8)]; // clear
-            // After clear: dict has 6 entries (0..3,clear,eoi), code_size=3.
-            // Emit 0 (size3), 1 (size3) → dict adds "01" (entry6) → size stays 3
-            //   until len==8. After 1: len=7. Emit 2 → adds "12" len=8 → size→4.
+                                           // After clear: dict has 6 entries (0..3,clear,eoi), code_size=3.
+                                           // Emit 0 (size3), 1 (size3) → dict adds "01" (entry6) → size stays 3
+                                           //   until len==8. After 1: len=7. Emit 2 → adds "12" len=8 → size→4.
             v.push((0, 3));
             v.push((1, 3));
             v.push((2, 3));

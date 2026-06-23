@@ -151,7 +151,11 @@ pub(super) fn adjust_strength(strength: i32, var: u32) -> i32 {
     if var == 0 {
         return 0;
     }
-    let i = if var >> 6 != 0 { ulog2((var >> 6) as i32).min(12) } else { 0 };
+    let i = if var >> 6 != 0 {
+        ulog2((var >> 6) as i32).min(12)
+    } else {
+        0
+    };
     (strength * (4 + i) + 8) >> 4
 }
 
@@ -244,7 +248,8 @@ fn cdef_padding(
     for y in h_i..y_end {
         let row = (y - h_i) as usize;
         for x in x_start..x_end {
-            tmp[idx(y, x)] = bottom[(boff as i32 + row as i32 * bstride as i32 + x) as usize] as i16;
+            tmp[idx(y, x)] =
+                bottom[(boff as i32 + row as i32 * bstride as i32 + x) as usize] as i16;
         }
     }
 }
@@ -417,7 +422,11 @@ mod tests {
 
         for (b, &(want_dir, want_var)) in blocks.iter().zip(CDEF_DIR_REF.iter()) {
             let (dir, var) = cdef_find_dir(b, 8);
-            assert_eq!((dir, var), (want_dir, want_var), "cdef_find_dir mismatch vs dav1d");
+            assert_eq!(
+                (dir, var),
+                (want_dir, want_var),
+                "cdef_find_dir mismatch vs dav1d"
+            );
         }
     }
 
@@ -457,11 +466,27 @@ mod tests {
             }
             let top: Vec<u8> = canvas[0..2 * cw].to_vec();
             let bottom: Vec<u8> = canvas[(2 + h) * cw..(4 + h) * cw].to_vec();
-            let left: Vec<[u8; 2]> =
-                (0..h).map(|y| [canvas[(2 + y) * cw], canvas[(2 + y) * cw + 1]]).collect();
+            let left: Vec<[u8; 2]> = (0..h)
+                .map(|y| [canvas[(2 + y) * cw], canvas[(2 + y) * cw + 1]])
+                .collect();
             cdef_filter_block(
-                &mut canvas, 2 * cw + 2, cw, &left, &top, 2, cw, &bottom, 2, cw, case.pri,
-                case.sec, case.dir, case.damping, w, h, 0b1111,
+                &mut canvas,
+                2 * cw + 2,
+                cw,
+                &left,
+                &top,
+                2,
+                cw,
+                &bottom,
+                2,
+                cw,
+                case.pri,
+                case.sec,
+                case.dir,
+                case.damping,
+                w,
+                h,
+                0b1111,
             );
             let mut got = Vec::with_capacity(w * h);
             for y in 0..h {

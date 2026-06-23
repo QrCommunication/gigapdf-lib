@@ -2077,9 +2077,10 @@ fn parse_ooxml_font_table(xml: &str) -> Vec<OoxmlFontRef> {
             Tok::Open(name, attrs, _) => match local(&name) {
                 "font" => current = attr(&attrs, "name").map(|s| s.to_string()),
                 tag @ ("embedRegular" | "embedBold" | "embedItalic" | "embedBoldItalic") => {
-                    if let (Some(fam), Some(id)) =
-                        (current.as_ref(), attr(&attrs, "id").or_else(|| attr(&attrs, "rid")))
-                    {
+                    if let (Some(fam), Some(id)) = (
+                        current.as_ref(),
+                        attr(&attrs, "id").or_else(|| attr(&attrs, "rid")),
+                    ) {
                         let (bold, italic) = match tag {
                             "embedBold" => (true, false),
                             "embedItalic" => (false, true),
@@ -2109,10 +2110,7 @@ fn parse_ooxml_font_table(xml: &str) -> Vec<OoxmlFontRef> {
 /// The de-obfuscation XOR key reverses this (see [`deobfuscate_odttf`]). Returns
 /// `None` unless exactly 32 hex digits are present.
 fn parse_guid(guid: &str) -> Option<[u8; 16]> {
-    let hex: Vec<u8> = guid
-        .bytes()
-        .filter(|b| b.is_ascii_hexdigit())
-        .collect();
+    let hex: Vec<u8> = guid.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
     if hex.len() != 32 {
         return None;
     }
@@ -2160,7 +2158,9 @@ fn odf_embedded_fonts(zip: &BTreeMap<String, Vec<u8>>) -> Vec<ProvidedFont> {
             continue;
         }
         for r in parse_odf_font_faces(&xml) {
-            let Some(raw) = zip.get(&r.href) else { continue };
+            let Some(raw) = zip.get(&r.href) else {
+                continue;
+            };
             let dedup = (r.family.to_ascii_lowercase(), r.bold, r.italic);
             if seen.contains(&dedup) {
                 continue;
@@ -2275,7 +2275,12 @@ fn odf_weight_is_bold(w: &str) -> bool {
 /// [`ProvidedFont`]. Accepts both glyf-TrueType and OpenType-CFF (`OTTO`) — the
 /// renderer embeds either — so a CFF-flavoured embedded face still renders with
 /// its real glyphs. Returns `None` for bytes that aren't a usable sfnt program.
-fn make_provided_font(family: &str, bold: bool, italic: bool, program: Vec<u8>) -> Option<ProvidedFont> {
+fn make_provided_font(
+    family: &str,
+    bold: bool,
+    italic: bool,
+    program: Vec<u8>,
+) -> Option<ProvidedFont> {
     let family = family.trim();
     if family.is_empty() {
         return None;
@@ -2381,10 +2386,29 @@ fn image_mime(name: &str) -> Option<&'static str> {
 /// Build an `<img src="data:…">` tag for a media zip entry, or `None` if absent
 /// or an unsupported format.
 fn img_tag(zip: &BTreeMap<String, Vec<u8>>, key: &str) -> Option<String> {
+    img_tag_sized(zip, key, None)
+}
+
+/// Like [`img_tag`] but stamps a `width`/`height` (points) on the `<img>` when a
+/// size is given. The HTML engine reads an inline image's box from these
+/// attributes (numeric = points), so without them an inline image falls back to
+/// a fixed default box instead of its real footprint. Used for DOCX drawings
+/// whose `wp:extent` declares the on-page size.
+fn img_tag_sized(
+    zip: &BTreeMap<String, Vec<u8>>,
+    key: &str,
+    size: Option<(f64, f64)>,
+) -> Option<String> {
     let mime = image_mime(key)?;
     let bytes = zip.get(key)?;
+    let dims = match size {
+        Some((w, h)) if w > 0.0 && h > 0.0 => {
+            format!(" width=\"{}\" height=\"{}\"", fmt_pt(w), fmt_pt(h))
+        }
+        _ => String::new(),
+    };
     Some(format!(
-        "<img src=\"data:{mime};base64,{}\">",
+        "<img src=\"data:{mime};base64,{}\"{dims}>",
         super::base64(bytes)
     ))
 }
@@ -2618,6 +2642,67 @@ struct ParaStyle {
     /// List indent level from `w:numPr/w:ilvl` (each level adds 36pt of
     /// `margin-left`, on top of any explicit `w:ind`).
     list_level: Option<u32>,
+    /// Per-side paragraph borders from `w:pPr/w:pBdr` (`[top, right, bottom,
+    /// left]`). Each present side becomes a `border-{side}` declaration so the
+    /// "encadré" (framed paragraph, e.g. a boxed invoice note) is drawn.
+    borders: [Option<BorderSide>; 4],
+    /// Paragraph shading colour from `w:pPr/w:shd@w:fill` (6-hex, no `#`) →
+    /// `background-color`. `auto`/missing leaves it `None`.
+    shading: Option<String>,
+}
+
+/// One side of a paragraph border (`w:pBdr/w:{top,left,bottom,right}`), reduced
+/// to what the HTML engine renders: a width in points (`w:sz`, eighths of a
+/// point) and an optional colour (`w:color`, 6-hex). `w:val` (the line style:
+/// `single`/`dashed`/…) is mapped to a CSS keyword purely for fidelity — the
+/// engine treats every visible border as solid — and `w:val="nil"`/`"none"`
+/// suppresses the side entirely.
+#[derive(Clone)]
+struct BorderSide {
+    /// Border width in points (from `w:sz`, eighths of a point).
+    width_pt: f64,
+    /// CSS line-style keyword mapped from `w:val` (default `solid`).
+    style: &'static str,
+    /// Border colour as 6-hex (no `#`), when `w:color` is a real value.
+    color: Option<String>,
+}
+
+/// Map an OOXML `w:pBdr` side (its attributes) to a [`BorderSide`], or `None`
+/// when the side is absent (`w:val="nil"`/`"none"`) or carries no width.
+/// `w:sz` is eighths of a point; a side with `w:sz="0"` but a real style still
+/// renders as a hairline (1px), matching Word.
+fn parse_border_side(attrs: &[(String, String)]) -> Option<BorderSide> {
+    let val = attr(attrs, "val").unwrap_or("single");
+    if matches!(val, "nil" | "none") {
+        return None;
+    }
+    // `w:sz` is in eighths of a point; clamp a zero/absent size up to a hairline
+    // so a declared-but-thin border is still visible.
+    let width_pt = attr(attrs, "sz")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|eighths| eighths / 8.0)
+        .filter(|w| *w > 0.0)
+        .unwrap_or(0.75);
+    let color = attr(attrs, "color")
+        .filter(|v| *v != "auto" && is_hex6(v))
+        .map(|v| v.to_ascii_uppercase());
+    Some(BorderSide {
+        width_pt,
+        style: border_val_to_css(val),
+        color,
+    })
+}
+
+/// Map a `w:pBdr` side's `w:val` line style to the nearest CSS border-style
+/// keyword. The HTML engine renders any visible border as solid, so this only
+/// affects the emitted markup's fidelity; unknown styles fall back to `solid`.
+fn border_val_to_css(val: &str) -> &'static str {
+    match val {
+        "dashed" | "dashSmallGap" | "dotDash" | "dotDotDash" => "dashed",
+        "dotted" => "dotted",
+        "double" | "thinThickThinSmallGap" | "thickThinSmallGap" | "triple" => "double",
+        _ => "solid",
+    }
 }
 
 /// A DOCX line-spacing value, mapped to the engine's `line-height`.
@@ -2682,6 +2767,29 @@ impl ParaStyle {
             Some(LineHeight::Multiple(m)) => css.push_str(&format!("line-height:{m};")),
             Some(LineHeight::Points(p)) => css.push_str(&format!("line-height:{p}pt;")),
             None => {}
+        }
+        // Paragraph shading (`w:shd@w:fill`) → a background fill behind the text.
+        if let Some(fill) = &self.shading {
+            css.push_str(&format!("background-color:#{fill};"));
+        }
+        // Per-side paragraph borders (`w:pBdr`) → `border-{side}` declarations,
+        // drawing the "encadré" around the text.
+        const SIDE_PROP: [&str; 4] = ["border-top", "border-right", "border-bottom", "border-left"];
+        let mut has_border = false;
+        for (i, side) in self.borders.iter().enumerate() {
+            if let Some(b) = side {
+                has_border = true;
+                css.push_str(&format!("{}:{}pt {}", SIDE_PROP[i], fmt_pt(b.width_pt), b.style));
+                if let Some(c) = &b.color {
+                    css.push_str(&format!(" #{c}"));
+                }
+                css.push(';');
+            }
+        }
+        // A small inset so the frame/shading doesn't crowd the glyphs (Word draws
+        // `w:pBdr`/`w:shd` with a default offset). Only when there's a box to inset.
+        if has_border || self.shading.is_some() {
+            css.push_str("padding:2pt;");
         }
         if css.is_empty() {
             String::new()
@@ -2868,7 +2976,9 @@ impl AnchorBox {
         match (self.off_x, self.align_h) {
             (Some(x), _) => css.push_str(&format!(";left:{}pt", fmt_pt(x))),
             (None, Some("right")) => css.push_str(";right:0pt"),
-            (None, Some("center")) => css.push_str(";left:0pt;right:0pt;margin-left:auto;margin-right:auto"),
+            (None, Some("center")) => {
+                css.push_str(";left:0pt;right:0pt;margin-left:auto;margin-right:auto")
+            }
             (None, Some(_)) => css.push_str(";left:0pt"), // "left"/inside/outside → left edge
             (None, None) => css.push_str(";left:0pt"),
         }
@@ -2917,11 +3027,17 @@ fn docx_drawing(x: &mut Xml, ctx: &DocxCtx) -> DrawingResult {
                 }
                 "positionH" => cur_axis = Some(true),
                 "positionV" => cur_axis = Some(false),
-                "align" => {} // value arrives as the element's text node
+                "align" => {}     // value arrives as the element's text node
                 "posOffset" => {} // value arrives as the element's text node
-                // A blip inside the drawing → embed the referenced image.
+                // A blip inside the drawing → embed the referenced image, sized
+                // to the drawing's `wp:extent` (read just above) so an inline
+                // image gets its real on-page footprint instead of a default box.
                 "blip" => {
-                    if let Some(tag) = blip_img(ctx, &attrs) {
+                    let size = match (anchor.w, anchor.h) {
+                        (Some(w), Some(h)) => Some((w, h)),
+                        _ => None,
+                    };
+                    if let Some(tag) = blip_img(ctx, &attrs, size) {
                         body.push_str(&tag);
                     }
                 }
@@ -2988,7 +3104,10 @@ fn docx_drawing(x: &mut Xml, ctx: &DocxCtx) -> DrawingResult {
         return DrawingResult::Empty;
     }
     if anchored {
-        DrawingResult::Float(format!("<div style=\"{}\">{body}</div>", anchor.abs_style()))
+        DrawingResult::Float(format!(
+            "<div style=\"{}\">{body}</div>",
+            anchor.abs_style()
+        ))
     } else {
         DrawingResult::Inline(body)
     }
@@ -2996,12 +3115,14 @@ fn docx_drawing(x: &mut Xml, ctx: &DocxCtx) -> DrawingResult {
 
 /// Resolve an `a:blip@r:embed`/`@r:link` to an `<img>` data-URI via the document
 /// relationships + media, or `None` when the target is missing/unsupported.
-fn blip_img(ctx: &DocxCtx, attrs: &[(String, String)]) -> Option<String> {
+/// `size` is the drawing's `wp:extent` (points) when known, so the inline image
+/// is laid out at its declared footprint rather than a default box.
+fn blip_img(ctx: &DocxCtx, attrs: &[(String, String)], size: Option<(f64, f64)>) -> Option<String> {
     let rid = attr(attrs, "embed").or_else(|| attr(attrs, "link"))?;
     ctx.rels
         .get(rid)
         .map(|t| resolve_target("word", t))
-        .and_then(|k| img_tag(ctx.zip, &k))
+        .and_then(|k| img_tag_sized(ctx.zip, &k, size))
 }
 
 /// Emit one `w:p` (already consumed its open tag) until `</w:p>`.
@@ -3014,6 +3135,7 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
     let mut num_ref = NumRef::default();
     let mut in_rpr = false; // inside <w:rPr> (run properties)
     let mut in_ppr = false; // inside <w:pPr> (paragraph properties)
+    let mut in_pbdr = false; // inside <w:pPr>/<w:pBdr> (paragraph borders)
     let mut depth = 0i32; // nesting of <w:r> runs (to scope rPr)
     let mut field_instr = String::new(); // accumulating <w:instrText>
     let mut in_instr = false;
@@ -3098,6 +3220,22 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                             .and_then(twips_to_pt)
                             .or(para.first_line_pt);
                     }
+                    // `w:pPr/w:pBdr` opens the per-side paragraph border group;
+                    // its `w:top`/`w:left`/`w:bottom`/`w:right` children carry the
+                    // width/style/colour of each side (the "encadré" frame).
+                    "pBdr" if in_ppr && !sc => in_pbdr = true,
+                    "top" if in_pbdr => para.borders[0] = parse_border_side(&attrs),
+                    "right" if in_pbdr => para.borders[1] = parse_border_side(&attrs),
+                    "bottom" if in_pbdr => para.borders[2] = parse_border_side(&attrs),
+                    "left" if in_pbdr => para.borders[3] = parse_border_side(&attrs),
+                    // `w:pPr/w:shd@w:fill` shades the paragraph background. Guard
+                    // against the run-mark `w:pPr/w:rPr/w:shd` (run shading) so only
+                    // the paragraph-level fill is taken.
+                    "shd" if in_ppr && !in_rpr => {
+                        para.shading = attr(&attrs, "fill")
+                            .filter(|v| *v != "auto" && is_hex6(v))
+                            .map(|v| v.to_ascii_uppercase());
+                    }
                     "r" if !sc => {
                         depth += 1;
                         run = RunStyle::default();
@@ -3150,8 +3288,9 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                         DrawingResult::Empty => {}
                     },
                     // Bare blip outside a `<w:drawing>` (legacy/VML) → inline image.
+                    // No `wp:extent` here, so the image keeps its default box.
                     "blip" => {
-                        if let Some(tag) = blip_img(ctx, &attrs) {
+                        if let Some(tag) = blip_img(ctx, &attrs, None) {
                             inner.push_str(&tag);
                         }
                     }
@@ -3163,6 +3302,7 @@ fn docx_paragraph(x: &mut Xml, ctx: &DocxCtx, out: &mut String, counters: &mut L
                 match ln {
                     "p" => break,
                     "pPr" => in_ppr = false,
+                    "pBdr" => in_pbdr = false,
                     "rPr" => in_rpr = false,
                     "instrText" => in_instr = false,
                     "r" => depth = (depth - 1).max(0),
@@ -4089,7 +4229,9 @@ fn xlsx_sheet_table(xml: &str, shared: &[String], styles: &XlsxStyles) -> String
                     cell_fmt = style_idx
                         .and_then(|i| styles.num_fmt(i))
                         .map(|(_, code)| code.clone());
-                    cell_css = style_idx.map(|i| styles.css(i).to_string()).unwrap_or_default();
+                    cell_css = style_idx
+                        .map(|i| styles.css(i).to_string())
+                        .unwrap_or_default();
                     if sc {
                         in_cell = false;
                     }
@@ -5220,9 +5362,8 @@ fn parse_pptx_theme(xml: &str) -> PptxTheme {
     // The colour-scheme slot we're currently inside (its `a:srgbClr`/`a:sysClr`
     // child carries the value).
     let mut cur_slot: Option<&'static str> = None;
-    let slot_name = |ln: &str| -> Option<&'static str> {
-        COLOR_SLOTS.iter().copied().find(|s| *s == ln)
-    };
+    let slot_name =
+        |ln: &str| -> Option<&'static str> { COLOR_SLOTS.iter().copied().find(|s| *s == ln) };
 
     while let Some(tok) = x.next() {
         match tok {
@@ -5557,7 +5698,11 @@ fn pptx_shape(
         return;
     }
     if have_xfrm && xfrm.is_placed() {
-        out.push_str(&format!("<div style=\"{}\">{}</div>", xfrm.abs_style(), body));
+        out.push_str(&format!(
+            "<div style=\"{}\">{}</div>",
+            xfrm.abs_style(),
+            body
+        ));
     } else {
         out.push_str(&body);
     }
@@ -6583,7 +6728,11 @@ fn ods_row(
                         })
                         .unwrap_or("");
                     let style = style_attr(css);
-                    let text = if sc { String::new() } else { ods_cell_text(x, ln) };
+                    let text = if sc {
+                        String::new()
+                    } else {
+                        ods_cell_text(x, ln)
+                    };
                     let trimmed = text.trim();
                     // Many identical *empty* trailing cells collapse to one.
                     let emit = if trimmed.is_empty() { rep.min(1) } else { rep };
@@ -7377,6 +7526,102 @@ mod tests {
         assert!(norm(&document.to_text()).contains("Before image"));
     }
 
+    #[test]
+    fn docx_paragraph_border_and_shading_emit_box() {
+        // A framed, shaded paragraph (the "encadré"): `w:pBdr` per-side borders +
+        // `w:shd` fill. `w:sz` is eighths of a point (24 → 3pt; 8 → 1pt).
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:pBdr>
+          <w:top w:val="single" w:sz="24" w:color="FF0000"/>
+          <w:left w:val="single" w:sz="8" w:color="00FF00"/>
+          <w:bottom w:val="dashed" w:sz="16" w:color="0000FF"/>
+          <w:right w:val="single" w:sz="8"/>
+        </w:pBdr>
+        <w:shd w:val="clear" w:fill="FFFF00"/>
+      </w:pPr>
+      <w:r><w:t>Boxed note</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+
+        // The intermediate HTML carries the per-side borders + the fill on the <p>.
+        let zip = crate::convert::zip::read_zip(&bytes);
+        let html = docx_body_html(&zip);
+        assert!(
+            html.contains("border-top:3pt solid #FF0000"),
+            "top border missing: {html}"
+        );
+        assert!(
+            html.contains("border-left:1pt solid #00FF00"),
+            "left border missing: {html}"
+        );
+        assert!(
+            html.contains("border-bottom:2pt dashed #0000FF"),
+            "bottom border missing: {html}"
+        );
+        // Colourless side: width + style, no `#…`.
+        assert!(
+            html.contains("border-right:1pt solid;"),
+            "right border missing: {html}"
+        );
+        assert!(
+            html.contains("background-color:#FFFF00"),
+            "shading missing: {html}"
+        );
+        assert!(html.contains("padding:2pt"), "inset missing: {html}");
+
+        // And the document still renders (the engine draws the frame + fill).
+        let pdf = office_to_pdf(&bytes).expect("docx converts");
+        let document = opens(&pdf);
+        assert!(document.page_count() >= 1);
+        assert!(norm(&document.to_text()).contains("Boxed note"));
+    }
+
+    #[test]
+    fn docx_inline_image_sized_from_extent() {
+        // An inline drawing with `wp:extent` (EMU): 914400 = 72pt, 457200 = 36pt.
+        // The emitted <img> must carry those as width/height (the engine reads an
+        // inline image's box from the attributes, not the bitmap's native size).
+        let doc = r#"<w:document xmlns:w="x" xmlns:wp="w" xmlns:a="y" xmlns:r="z">
+  <w:body>
+    <w:p><w:r><w:drawing>
+      <wp:inline>
+        <wp:extent cx="914400" cy="457200"/>
+        <a:graphic><a:graphicData><pic:pic xmlns:pic="p">
+          <pic:blipFill><a:blip r:embed="rId7"/></pic:blipFill>
+        </pic:pic></a:graphicData></a:graphic>
+      </wp:inline>
+    </w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId7" Type="image" Target="media/logo.png"/>
+</Relationships>"#;
+        let bytes = build_docx(doc, Some(rels), &[("word/media/logo.png", red_png())]);
+
+        let zip = crate::convert::zip::read_zip(&bytes);
+        let html = docx_body_html(&zip);
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "image missing: {html}"
+        );
+        assert!(
+            html.contains("width=\"72\""),
+            "extent width not applied: {html}"
+        );
+        assert!(
+            html.contains("height=\"36\""),
+            "extent height not applied: {html}"
+        );
+
+        let pdf = office_to_pdf(&bytes).expect("docx converts");
+        assert!(opens(&pdf).page_count() >= 1);
+    }
+
     // ── XLSX (round-trip via the exporter) ──
 
     #[test]
@@ -7575,7 +7820,10 @@ mod tests {
 
         // End-to-end PDF still carries the text.
         let mut z = ZipWriter::new();
-        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.spreadsheet");
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.spreadsheet",
+        );
         z.add_stored("content.xml", content.as_bytes());
         let pdf = office_to_pdf(&z.finish()).expect("ods converts");
         let text = norm(&opens(&pdf).to_text());
@@ -7790,7 +8038,10 @@ mod tests {
         assert!(html.contains("position:absolute"), "frame absolute: {html}");
         assert!(html.contains("left:50pt;top:100pt"), "frame coords: {html}");
         assert!(html.contains("<table>"), "renders a table: {html}");
-        assert!(html.contains("R1C1") && html.contains("R1C2"), "cells: {html}");
+        assert!(
+            html.contains("R1C1") && html.contains("R1C2"),
+            "cells: {html}"
+        );
         // The table markup is inside the absolute wrapper.
         let abs = html.find("position:absolute").unwrap();
         let tbl = html.find("<table>").unwrap();
@@ -8187,7 +8438,10 @@ mod tests {
             None,
             &[
                 ("word/fontTable.xml", font_table.into_bytes()),
-                ("word/_rels/fontTable.xml.rels", font_rels.as_bytes().to_vec()),
+                (
+                    "word/_rels/fontTable.xml.rels",
+                    font_rels.as_bytes().to_vec(),
+                ),
                 ("word/fonts/font1.odttf", obfuscated),
             ],
         )
@@ -8204,9 +8458,17 @@ mod tests {
         let zip = read_zip(&docx);
 
         let fonts = extract_embedded_fonts(&zip);
-        assert_eq!(fonts.len(), 1, "one embedded face extracted: {:?}", fonts.len());
+        assert_eq!(
+            fonts.len(),
+            1,
+            "one embedded face extracted: {:?}",
+            fonts.len()
+        );
         let f = &fonts[0];
-        assert_eq!(f.family, "Calibri", "raw family name preserved (matches HTML)");
+        assert_eq!(
+            f.family, "Calibri",
+            "raw family name preserved (matches HTML)"
+        );
         assert_eq!(f.weight, 400);
         assert!(!f.italic);
         // The bytes are a real, parseable font program (de-obfuscation worked).
@@ -8215,7 +8477,11 @@ mod tests {
             "the extracted, de-obfuscated bytes parse as a TrueType program"
         );
         // And they equal the original fixture (round-tripped through obfuscation).
-        assert_eq!(f.ttf, fixture_ttf(), "extracted face == the embedded original");
+        assert_eq!(
+            f.ttf,
+            fixture_ttf(),
+            "extracted face == the embedded original"
+        );
 
         // End-to-end: the rendered PDF embeds the document's OWN face. The run's
         // `font-family` is "Calibri", so the painter must use the extracted
@@ -8366,14 +8632,22 @@ mod tests {
         // Embedded Calibri/regular first (priority), then the two non-colliding
         // host faces; the colliding host Calibri/regular is dropped.
         assert_eq!(merged.len(), 3, "one collision dropped: {:?}", merged.len());
-        assert_eq!(merged[0].family, "Calibri", "embedded face stays first (wins)");
-        assert_eq!(merged[0].ttf, prog, "embedded bytes preserved, not the host's");
+        assert_eq!(
+            merged[0].family, "Calibri",
+            "embedded face stays first (wins)"
+        );
+        assert_eq!(
+            merged[0].ttf, prog,
+            "embedded bytes preserved, not the host's"
+        );
         assert!(
             merged.iter().any(|f| f.family == "Cambria"),
             "a referenced-but-unembedded host family is appended"
         );
         assert!(
-            merged.iter().any(|f| f.family == "Calibri" && f.weight == 700),
+            merged
+                .iter()
+                .any(|f| f.family == "Calibri" && f.weight == 700),
             "a host face with a different weight key is appended"
         );
         assert!(
@@ -8426,7 +8700,11 @@ mod tests {
         assert_eq!(fonts.len(), 1, "one ODF face extracted");
         assert_eq!(fonts[0].family, "MyEmbedded");
         assert_eq!(fonts[0].weight, 700, "fo:font-weight=bold → 700");
-        assert_eq!(fonts[0].ttf, fixture_ttf(), "plain ODF font bytes pass through");
+        assert_eq!(
+            fonts[0].ttf,
+            fixture_ttf(),
+            "plain ODF font bytes pass through"
+        );
     }
 
     #[test]
@@ -8435,7 +8713,10 @@ mod tests {
         // (it would otherwise poison the renderer's font book).
         assert!(make_provided_font("Bad", false, false, vec![0, 1, 2, 3, 4, 5]).is_none());
         assert!(!is_sfnt_font(b"not a font"));
-        assert!(is_sfnt_font(&fixture_ttf()), "the bundled fixture is a valid sfnt");
+        assert!(
+            is_sfnt_font(&fixture_ttf()),
+            "the bundled fixture is a valid sfnt"
+        );
     }
 
     #[test]
@@ -9330,7 +9611,10 @@ mod tests {
         let table = xlsx_sheet_table(sheet, &[], &s);
         assert!(table.contains("font-weight:bold"), "td bold: {table}");
         assert!(table.contains("color:#FF0000"), "td red: {table}");
-        assert!(table.contains("border:1px solid #000000"), "td border: {table}");
+        assert!(
+            table.contains("border:1px solid #000000"),
+            "td border: {table}"
+        );
         assert!(table.contains("text-align:center"), "td align: {table}");
         // The plain cell renders (it may carry only the default font, but no
         // bold/border/alignment from the fancy style).
@@ -9395,9 +9679,15 @@ mod tests {
             table.contains("<tr style=\"height:30pt\">"),
             "custom row height: {table}"
         );
-        assert!(table.contains("color:#4472C4"), "themed font on td: {table}");
+        assert!(
+            table.contains("color:#4472C4"),
+            "themed font on td: {table}"
+        );
         // The second row carries no height style.
-        assert!(table.contains("<tr><td>Normal</td></tr>"), "plain row: {table}");
+        assert!(
+            table.contains("<tr><td>Normal</td></tr>"),
+            "plain row: {table}"
+        );
     }
 
     #[test]
@@ -9500,7 +9790,11 @@ mod tests {
 
     /// Render a DOCX body that references media, so anchored-image markup
     /// (the absolute wrapper around an `<img>`) can be asserted on.
-    fn docx_html_with_media(document_xml: &str, rels_xml: &str, media: &[(&str, Vec<u8>)]) -> String {
+    fn docx_html_with_media(
+        document_xml: &str,
+        rels_xml: &str,
+        media: &[(&str, Vec<u8>)],
+    ) -> String {
         let mut zip: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (k, v) in media {
             zip.insert((*k).to_string(), v.clone());
@@ -9540,7 +9834,10 @@ mod tests {
           <Relationship Id="rId7" Type="image" Target="media/logo.png"/>
         </Relationships>"#;
         let html = docx_html_with_media(doc, rels, &[("word/media/logo.png", red_png())]);
-        assert!(html.contains("position:absolute"), "absolute wrapper: {html}");
+        assert!(
+            html.contains("position:absolute"),
+            "absolute wrapper: {html}"
+        );
         assert!(html.contains("left:72pt"), "left 72pt: {html}");
         assert!(html.contains("top:36pt"), "top 36pt: {html}");
         assert!(html.contains("width:144pt"), "extent w 144pt: {html}");
@@ -9553,7 +9850,10 @@ mod tests {
         let p_open = html.find("<p").unwrap();
         let abs = html.find("position:absolute").unwrap();
         let p_close = html.find("</p>").unwrap();
-        assert!(abs > p_close || abs < p_open, "float is a sibling of <p>: {html}");
+        assert!(
+            abs > p_close || abs < p_open,
+            "float is a sibling of <p>: {html}"
+        );
     }
 
     #[test]
@@ -9573,7 +9873,10 @@ mod tests {
             !html.contains("position:absolute"),
             "inline drawing must stay in flow: {html}"
         );
-        assert!(html.contains("<img src=\"data:image/png;base64,"), "inline img: {html}");
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "inline img: {html}"
+        );
     }
 
     #[test]
@@ -9599,7 +9902,10 @@ mod tests {
         assert!(html.contains("top:100pt"), "frame y=100pt: {html}");
         assert!(html.contains("width:200pt"), "extent w=200pt: {html}");
         assert!(html.contains("Boxed note"), "text box content kept: {html}");
-        assert!(html.contains("border:1px solid"), "rendered as a framed box: {html}");
+        assert!(
+            html.contains("border:1px solid"),
+            "rendered as a framed box: {html}"
+        );
     }
 
     #[test]
@@ -9620,8 +9926,14 @@ mod tests {
         </Relationships>"#;
         let html = docx_html_with_media(doc, rels, &[("word/media/c.png", red_png())]);
         assert!(html.contains("position:absolute"), "absolute: {html}");
-        assert!(html.contains("right:0pt"), "align right → right edge: {html}");
-        assert!(html.contains("bottom:0pt"), "align bottom → bottom edge: {html}");
+        assert!(
+            html.contains("right:0pt"),
+            "align right → right edge: {html}"
+        );
+        assert!(
+            html.contains("bottom:0pt"),
+            "align bottom → bottom edge: {html}"
+        );
     }
 
     #[test]
@@ -9645,7 +9957,10 @@ mod tests {
         let soft = docx_html(
             r#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>a</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>b</w:t></w:r></w:p></w:body></w:document>"#,
         );
-        assert!(soft.contains("<br>") && !soft.contains("page-break"), "soft break: {soft}");
+        assert!(
+            soft.contains("<br>") && !soft.contains("page-break"),
+            "soft break: {soft}"
+        );
     }
 
     #[test]
@@ -9712,7 +10027,10 @@ mod tests {
         );
         let text = norm(&document.to_text());
         assert!(text.contains("First page body"), "first page text: {text}");
-        assert!(text.contains("Second page body"), "second page text: {text}");
+        assert!(
+            text.contains("Second page body"),
+            "second page text: {text}"
+        );
     }
 
     #[test]

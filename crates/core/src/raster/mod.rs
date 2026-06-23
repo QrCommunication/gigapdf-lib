@@ -5,6 +5,7 @@
 //! [`Canvas`], which exports a spec-valid [`png`]. Text-glyph and image slices
 //! build on the same canvas and fill engine.
 
+pub mod avif;
 pub mod canvas;
 pub mod colorspace;
 pub mod gif;
@@ -12,7 +13,6 @@ pub mod jpeg;
 pub mod png;
 pub mod png_decode;
 pub mod render;
-pub mod avif;
 pub mod resize;
 pub mod vp8;
 pub mod webp;

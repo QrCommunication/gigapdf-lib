@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn empty_arrays_and_whitespace() {
         assert_eq!(from_json("[]").unwrap(), Vec::<Vec<Vec<String>>>::new());
-        assert_eq!(from_json("  [ [ [] ] ] ").unwrap(), vec![vec![Vec::<String>::new()]]);
+        assert_eq!(
+            from_json("  [ [ [] ] ] ").unwrap(),
+            vec![vec![Vec::<String>::new()]]
+        );
     }
 
     #[test]
@@ -190,7 +193,10 @@ mod tests {
             vec!["Page 1", "Sheet1", "café"]
         );
         assert_eq!(strings_from_json("[]").unwrap(), Vec::<String>::new());
-        assert!(strings_from_json(r#"["a",2]"#).is_none(), "numbers rejected");
+        assert!(
+            strings_from_json(r#"["a",2]"#).is_none(),
+            "numbers rejected"
+        );
     }
 
     #[test]

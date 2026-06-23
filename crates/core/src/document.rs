@@ -90,16 +90,56 @@ enum OperandPos {
 /// (`/OC /P0 BDC`) carry the name as the **last** operand keyed into
 /// `/Properties`; a non-name last operand (inline dict) is left alone.
 const RESOURCE_OPS: &[ResourceOp] = &[
-    ResourceOp { operator: b"Tf", category: b"Font", pos: OperandPos::First },
-    ResourceOp { operator: b"Do", category: b"XObject", pos: OperandPos::First },
-    ResourceOp { operator: b"gs", category: b"ExtGState", pos: OperandPos::First },
-    ResourceOp { operator: b"sh", category: b"Shading", pos: OperandPos::First },
-    ResourceOp { operator: b"cs", category: b"ColorSpace", pos: OperandPos::First },
-    ResourceOp { operator: b"CS", category: b"ColorSpace", pos: OperandPos::First },
-    ResourceOp { operator: b"scn", category: b"Pattern", pos: OperandPos::Last },
-    ResourceOp { operator: b"SCN", category: b"Pattern", pos: OperandPos::Last },
-    ResourceOp { operator: b"BDC", category: b"Properties", pos: OperandPos::Last },
-    ResourceOp { operator: b"DP", category: b"Properties", pos: OperandPos::Last },
+    ResourceOp {
+        operator: b"Tf",
+        category: b"Font",
+        pos: OperandPos::First,
+    },
+    ResourceOp {
+        operator: b"Do",
+        category: b"XObject",
+        pos: OperandPos::First,
+    },
+    ResourceOp {
+        operator: b"gs",
+        category: b"ExtGState",
+        pos: OperandPos::First,
+    },
+    ResourceOp {
+        operator: b"sh",
+        category: b"Shading",
+        pos: OperandPos::First,
+    },
+    ResourceOp {
+        operator: b"cs",
+        category: b"ColorSpace",
+        pos: OperandPos::First,
+    },
+    ResourceOp {
+        operator: b"CS",
+        category: b"ColorSpace",
+        pos: OperandPos::First,
+    },
+    ResourceOp {
+        operator: b"scn",
+        category: b"Pattern",
+        pos: OperandPos::Last,
+    },
+    ResourceOp {
+        operator: b"SCN",
+        category: b"Pattern",
+        pos: OperandPos::Last,
+    },
+    ResourceOp {
+        operator: b"BDC",
+        category: b"Properties",
+        pos: OperandPos::Last,
+    },
+    ResourceOp {
+        operator: b"DP",
+        category: b"Properties",
+        pos: OperandPos::Last,
+    },
 ];
 
 /// Per-category rename maps applied to a form body's resource-name operands when
@@ -115,7 +155,9 @@ impl Renames {
     /// The no-rename map (top-level page ops, or a form whose resources merged
     /// without any collision).
     fn identity() -> Self {
-        Self { by_category: BTreeMap::new() }
+        Self {
+            by_category: BTreeMap::new(),
+        }
     }
 
     fn is_identity(&self) -> bool {
@@ -123,7 +165,10 @@ impl Renames {
     }
 
     fn record(&mut self, category: &'static [u8], old: Vec<u8>, new: Vec<u8>) {
-        self.by_category.entry(category).or_default().insert(old, new);
+        self.by_category
+            .entry(category)
+            .or_default()
+            .insert(old, new);
     }
 
     /// Look up the rewritten name for `name` in `category`, if it was renamed.
@@ -138,7 +183,10 @@ impl Renames {
         if self.is_identity() {
             return op.clone();
         }
-        let Some(spec) = RESOURCE_OPS.iter().find(|s| s.operator == op.operator.as_slice()) else {
+        let Some(spec) = RESOURCE_OPS
+            .iter()
+            .find(|s| s.operator == op.operator.as_slice())
+        else {
             return op.clone();
         };
         let idx = match spec.pos {
@@ -154,7 +202,10 @@ impl Renames {
         };
         let mut operands = op.operands.clone();
         operands[idx] = Object::Name(new_name);
-        content::Operation { operator: op.operator.clone(), operands }
+        content::Operation {
+            operator: op.operator.clone(),
+            operands,
+        }
     }
 }
 
@@ -187,7 +238,10 @@ impl FlattenResources {
                 cats.insert(spec.category.to_vec(), sub.clone());
             }
         }
-        Self { cats, counter: BTreeMap::new() }
+        Self {
+            cats,
+            counter: BTreeMap::new(),
+        }
     }
 
     /// Reassemble the merged `/Resources` dictionary (preserving any keys the
@@ -267,7 +321,10 @@ impl FlattenResources {
 
 /// A zero-operand content operation (`q`, `Q`, …).
 fn op0(operator: &[u8]) -> content::Operation {
-    content::Operation { operator: operator.to_vec(), operands: Vec::new() }
+    content::Operation {
+        operator: operator.to_vec(),
+        operands: Vec::new(),
+    }
 }
 
 /// The appearance matrix that maps an annotation's appearance stream into its
@@ -424,7 +481,9 @@ fn cff_simple_code_unicode(
             let scalar = crate::font::winansi_to_char(code) as u32;
             unicode_to_gid.get(&scalar).copied()
         };
-        let Some(gid) = gid.filter(|&g| g != 0) else { continue };
+        let Some(gid) = gid.filter(|&g| g != 0) else {
+            continue;
+        };
         if let Some(text) = gid_unicode.get(&gid) {
             if !text.is_empty() {
                 map.insert(code, text.clone());
@@ -517,7 +576,11 @@ struct TextFieldStyle {
 
 impl Default for TextFieldStyle {
     fn default() -> Self {
-        TextFieldStyle { size: 0.0, color: [0.0, 0.0, 0.0], align: 0 }
+        TextFieldStyle {
+            size: 0.0,
+            color: [0.0, 0.0, 0.0],
+            align: 0,
+        }
     }
 }
 
@@ -562,7 +625,11 @@ fn parse_da_full(da: &str) -> (Option<String>, f64, [f64; 3]) {
         match tok {
             // `/Name <size> Tf` — operands right before `Tf`.
             "Tf" => {
-                if let Some(v) = i.checked_sub(1).and_then(|j| toks.get(j)).and_then(|s| num(s)) {
+                if let Some(v) = i
+                    .checked_sub(1)
+                    .and_then(|j| toks.get(j))
+                    .and_then(|s| num(s))
+                {
                     if v > 0.0 {
                         size = v;
                     }
@@ -578,7 +645,11 @@ fn parse_da_full(da: &str) -> (Option<String>, f64, [f64; 3]) {
             }
             // `<gray> g` — single grey component.
             "g" => {
-                if let Some(v) = i.checked_sub(1).and_then(|j| toks.get(j)).and_then(|s| num(s)) {
+                if let Some(v) = i
+                    .checked_sub(1)
+                    .and_then(|j| toks.get(j))
+                    .and_then(|s| num(s))
+                {
                     color = [v, v, v];
                 }
             }
@@ -1297,7 +1368,11 @@ impl Document {
         let Ok(page) = self.page_dict(page_no) else {
             return content::FontDecoders::new();
         };
-        match page.get(b"Resources").map(|o| self.resolve(o)).and_then(Object::as_dict) {
+        match page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        {
             Some(res) => self.font_decoders_for(res),
             None => content::FontDecoders::new(),
         }
@@ -1652,10 +1727,14 @@ impl Document {
         let mut agree = 0u32;
         let mut disagree = 0u32;
         for code in 0u16..=0x3FF {
-            let Some(mapped) = tu.decode(code as u32) else { continue };
+            let Some(mapped) = tu.decode(code as u32) else {
+                continue;
+            };
             // Only single-scalar entries are comparable to a single glyph name.
             let mut chars = mapped.chars();
-            let (Some(_), None) = (chars.next(), chars.next()) else { continue };
+            let (Some(_), None) = (chars.next(), chars.next()) else {
+                continue;
+            };
             match mac_glyph_order_unicode(code) {
                 Some(mac) if mac == mapped => agree += 1,
                 // A code the standard order doesn't name can't contradict; only a
@@ -1739,9 +1818,7 @@ impl Document {
             let Some(stream) = self.resolve(value).as_stream() else {
                 continue;
             };
-            if stream.dict.get(b"Subtype").and_then(Object::as_name)
-                != Some(b"Form".as_slice())
-            {
+            if stream.dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Form".as_slice()) {
                 continue;
             }
             let Ok(content) = decode_stream(stream) else {
@@ -1882,7 +1959,10 @@ impl Document {
             .and_then(|a| a.first())
             .map(|o| self.resolve(o))
             .and_then(Object::as_dict)?;
-        let dw = descendant.get(b"DW").and_then(Object::as_f64).unwrap_or(1000.0);
+        let dw = descendant
+            .get(b"DW")
+            .and_then(Object::as_f64)
+            .unwrap_or(1000.0);
         let mut map = BTreeMap::new();
         if let Some(w) = descendant
             .get(b"W")
@@ -1907,8 +1987,12 @@ impl Document {
                     }
                     i += 2;
                 } else if let (Some(c2), Some(wv)) = (
-                    w.get(i + 1).map(|o| self.resolve(o)).and_then(Object::as_i64),
-                    w.get(i + 2).map(|o| self.resolve(o)).and_then(Object::as_f64),
+                    w.get(i + 1)
+                        .map(|o| self.resolve(o))
+                        .and_then(Object::as_i64),
+                    w.get(i + 2)
+                        .map(|o| self.resolve(o))
+                        .and_then(Object::as_f64),
                 ) {
                     // Form: cFirst cLast w — every CID in the range gets `w`.
                     let (lo, hi) = (c.max(0) as u32, c2.max(0) as u32);
@@ -2309,7 +2393,11 @@ impl Document {
     /// Resolve image XObject `name` in `page_no`'s `/Resources /XObject` to
     /// `(format, encoded bytes, pixel width, pixel height)`. `None` when the
     /// name isn't an image XObject.
-    fn image_xobject_bytes(&self, page_no: u32, name: &[u8]) -> Option<(String, Vec<u8>, u32, u32)> {
+    fn image_xobject_bytes(
+        &self,
+        page_no: u32,
+        name: &[u8],
+    ) -> Option<(String, Vec<u8>, u32, u32)> {
         let page = self.page_dict(page_no).ok()?;
         let stream = page
             .get(b"Resources")
@@ -2325,8 +2413,16 @@ impl Document {
         if dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Image".as_slice()) {
             return None;
         }
-        let pw = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0).max(0) as u32;
-        let ph = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0).max(0) as u32;
+        let pw = dict
+            .get(b"Width")
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+            .max(0) as u32;
+        let ph = dict
+            .get(b"Height")
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+            .max(0) as u32;
         match self.first_filter(dict).as_deref() {
             Some(b"DCTDecode") => Some(("jpeg".to_string(), stream.raw.clone(), pw, ph)),
             Some(b"JPXDecode") => Some(("jp2".to_string(), stream.raw.clone(), pw, ph)),
@@ -2342,7 +2438,12 @@ impl Document {
     /// `None` when the colour space / bit depth isn't one we decode.
     fn image_to_png(&self, stream: &Stream) -> Option<Vec<u8>> {
         let dict = &stream.dict;
-        if dict.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap_or(8) != 8 {
+        if dict
+            .get(b"BitsPerComponent")
+            .and_then(Object::as_i64)
+            .unwrap_or(8)
+            != 8
+        {
             return None;
         }
         let components = match dict
@@ -2354,8 +2455,16 @@ impl Document {
             Some(b"DeviceGray") => 1,
             _ => return None,
         };
-        let width = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0).max(0) as usize;
-        let height = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0).max(0) as usize;
+        let width = dict
+            .get(b"Width")
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let height = dict
+            .get(b"Height")
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+            .max(0) as usize;
         let samples = decode_stream(stream).ok()?;
         if width == 0 || height == 0 || samples.len() < width * height * components {
             return None;
@@ -2381,7 +2490,11 @@ impl Document {
                 rgba.extend_from_slice(&[r, g, b, a]);
             }
         }
-        Some(crate::raster::png::encode_png(width as u32, height as u32, &rgba))
+        Some(crate::raster::png::encode_png(
+            width as u32,
+            height as u32,
+            &rgba,
+        ))
     }
 
     /// Every top-level placement matrix (unit square `[0,1]²` → page user space)
@@ -2411,7 +2524,8 @@ impl Document {
                 b"cm" => {
                     let n: Vec<f64> = op.operands.iter().filter_map(Object::as_f64).collect();
                     if n.len() == 6 {
-                        ctm = content::PageMatrix::new(n[0], n[1], n[2], n[3], n[4], n[5]).then(&ctm);
+                        ctm =
+                            content::PageMatrix::new(n[0], n[1], n[2], n[3], n[4], n[5]).then(&ctm);
                     }
                 }
                 b"Do" => {
@@ -2435,7 +2549,12 @@ impl Document {
     /// place as a Flate DeviceRGB PNG-filtered image — so the sensitive content is
     /// gone from the bytes, not merely hidden. Returns `true` when any pixel was
     /// overwritten. A shared XObject is edited once (every placement is affected).
-    fn overwrite_image_pixels(&mut self, page_no: u32, name: &[u8], rects: &[content::Bounds]) -> bool {
+    fn overwrite_image_pixels(
+        &mut self,
+        page_no: u32,
+        name: &[u8],
+        rects: &[content::Bounds],
+    ) -> bool {
         // Quick reject: does this image's placement box meet any rect at all?
         let placements = self.image_placements(page_no, name);
         if placements.is_empty() || rects.is_empty() {
@@ -2450,8 +2569,9 @@ impl Document {
         }
         let mut rgba = match format.as_str() {
             "png" => crate::raster::decode_png(&data).map(|d| (d.width, d.height, d.rgba)),
-            "jpeg" => crate::raster::jpeg::decode_jpeg(&data)
-                .map(|(w, h, rgb)| (w, h, rgb_to_rgba(&rgb))),
+            "jpeg" => {
+                crate::raster::jpeg::decode_jpeg(&data).map(|(w, h, rgb)| (w, h, rgb_to_rgba(&rgb)))
+            }
             _ => None,
         };
         let Some((dw, dh, ref mut pixels)) = rgba.as_mut().map(|(w, h, p)| (*w, *h, p)) else {
@@ -2513,7 +2633,8 @@ impl Document {
         dict.set(b"BitsPerComponent".to_vec(), Object::Integer(8));
         dict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
         dict.set(b"Length".to_vec(), Object::Integer(prep.data.len() as i64));
-        self.objects.insert(id, Object::Stream(Stream::new(dict, prep.data)));
+        self.objects
+            .insert(id, Object::Stream(Stream::new(dict, prep.data)));
         true
     }
 
@@ -2539,7 +2660,12 @@ impl Document {
         let Ok(page_id) = self.page_object_id(page_no) else {
             return 0;
         };
-        let Some(page) = self.objects.get(&page_id).and_then(Object::as_dict).cloned() else {
+        let Some(page) = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        else {
             return 0;
         };
         let items: Vec<Object> = match page.get(b"Annots") {
@@ -2647,7 +2773,10 @@ impl Document {
             if e.kind != content::ElementKind::Image {
                 continue;
             }
-            if !e.bounds.is_some_and(|b| regions.iter().any(|r| r.intersects(&b))) {
+            if !e
+                .bounds
+                .is_some_and(|b| regions.iter().any(|r| r.intersects(&b)))
+            {
                 continue;
             }
             let name = e.label.into_bytes();
@@ -2667,7 +2796,10 @@ impl Document {
             .page_elements(page_no)?
             .into_iter()
             .filter(|e| e.kind != content::ElementKind::Image)
-            .filter(|e| e.bounds.is_some_and(|b| regions.iter().any(|r| r.intersects(&b))))
+            .filter(|e| {
+                e.bounds
+                    .is_some_and(|b| regions.iter().any(|r| r.intersects(&b)))
+            })
             .map(|e| e.index)
             .collect();
         hits.sort_unstable_by(|a, b| b.cmp(a));
@@ -2842,9 +2974,7 @@ impl Document {
             }
             let (x0, y0, x1, y1) = (b.x, b.y, b.x + b.width, b.y + b.height);
             acc = Some(match acc {
-                Some((ax0, ay0, ax1, ay1)) => {
-                    (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1))
-                }
+                Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
                 None => (x0, y0, x1, y1),
             });
         }
@@ -3456,7 +3586,12 @@ impl Document {
             .map(|o| self.resolve(o))
             .and_then(Object::as_array)
             .map(|a| {
-                let f = |i: usize| matches!(a.get(i).map(|o| self.resolve(o)), Some(Object::Boolean(true)));
+                let f = |i: usize| {
+                    matches!(
+                        a.get(i).map(|o| self.resolve(o)),
+                        Some(Object::Boolean(true))
+                    )
+                };
                 [f(0), f(1)]
             })
             .unwrap_or([false, false]);
@@ -3555,7 +3690,11 @@ impl Document {
             b"ICCBased" => {
                 let stream = arr.get(1).map(|o| self.resolve(o))?;
                 let sdict = stream.as_stream().map(|s| &s.dict)?;
-                let n = sdict.get(b"N").and_then(Object::as_i64).unwrap_or(3).clamp(1, 4) as usize;
+                let n = sdict
+                    .get(b"N")
+                    .and_then(Object::as_i64)
+                    .unwrap_or(3)
+                    .clamp(1, 4) as usize;
                 let alternate = sdict
                     .get(b"Alternate")
                     .and_then(|a| self.resolve_color_space(a, depth + 1))
@@ -3581,7 +3720,11 @@ impl Document {
             }
             b"Indexed" | b"I" => {
                 let base = self.resolve_color_space(arr.get(1)?, depth + 1)?;
-                let hival = arr.get(2).map(|o| self.resolve(o)).and_then(|o| o.as_i64())?.max(0) as usize;
+                let hival = arr
+                    .get(2)
+                    .map(|o| self.resolve(o))
+                    .and_then(|o| o.as_i64())?
+                    .max(0) as usize;
                 let stride = base.components().max(1);
                 // The lookup is a byte string or a stream; each entry is one base
                 // component as a 0..=255 byte → normalised to 0..=1.
@@ -3614,7 +3757,10 @@ impl Document {
                 })
             }
             b"DeviceN" => {
-                let names = arr.get(1).map(|o| self.resolve(o)).and_then(Object::as_array)?;
+                let names = arr
+                    .get(1)
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_array)?;
                 let n = names.len().max(1);
                 let alternate = self.resolve_color_space(arr.get(2)?, depth + 1)?;
                 let tint = self.resolve(arr.get(3)?).clone();
@@ -3656,8 +3802,9 @@ impl Document {
         // Device-space names are resolved directly; everything else is a name in
         // this resources scope's `/ColorSpace` sub-dictionary.
         let cs = match name {
-            b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern" | b"G" | b"RGB"
-            | b"CMYK" => self.resolve_color_space(&Object::Name(name.to_vec()), 0)?,
+            b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern" | b"G" | b"RGB" | b"CMYK" => {
+                self.resolve_color_space(&Object::Name(name.to_vec()), 0)?
+            }
             _ => {
                 let (_, obj) = self.resource_entry(resources, b"ColorSpace", name)?;
                 self.resolve_color_space(obj, 0)?
@@ -3684,14 +3831,20 @@ impl Document {
         let Some(dict) = func.as_dict() else {
             return Vec::new();
         };
-        let ftype = dict.get(b"FunctionType").and_then(Object::as_i64).unwrap_or(-1);
+        let ftype = dict
+            .get(b"FunctionType")
+            .and_then(Object::as_i64)
+            .unwrap_or(-1);
         let domain = read_pair(self, dict, b"Domain").unwrap_or([0.0, 1.0]);
         let x = t.clamp(domain[0].min(domain[1]), domain[0].max(domain[1]));
         match ftype {
             2 => {
                 let c0 = read_vec(self, dict, b"C0").unwrap_or_else(|| vec![0.0]);
                 let c1 = read_vec(self, dict, b"C1").unwrap_or_else(|| vec![1.0]);
-                let nexp = dict.get(b"N").and_then(|o| self.resolve(o).as_f64()).unwrap_or(1.0);
+                let nexp = dict
+                    .get(b"N")
+                    .and_then(|o| self.resolve(o).as_f64())
+                    .unwrap_or(1.0);
                 let span = domain[1] - domain[0];
                 let xn = if span.abs() < 1e-12 {
                     0.0
@@ -3766,7 +3919,10 @@ impl Document {
             return Vec::new();
         }
         let n = size[0] as usize;
-        let bps = dict.get(b"BitsPerSample").and_then(Object::as_i64).unwrap_or(8);
+        let bps = dict
+            .get(b"BitsPerSample")
+            .and_then(Object::as_i64)
+            .unwrap_or(8);
         let range = read_vec(self, dict, b"Range").unwrap_or_default();
         if range.is_empty() || !range.len().is_multiple_of(2) {
             return Vec::new();
@@ -3818,7 +3974,10 @@ impl Document {
         let Some(dict) = func.as_dict() else {
             return Vec::new();
         };
-        let ftype = dict.get(b"FunctionType").and_then(Object::as_i64).unwrap_or(-1);
+        let ftype = dict
+            .get(b"FunctionType")
+            .and_then(Object::as_i64)
+            .unwrap_or(-1);
         match ftype {
             // Single-input analytic functions: drive them with the first tint.
             2 | 3 => self.eval_function(func, inputs.first().copied().unwrap_or(0.0)),
@@ -3850,9 +4009,16 @@ impl Document {
         // 1-D delegates to the interpolating scalar path for better quality.
         if m == 1 {
             let domain = read_pair(self, dict, b"Domain").unwrap_or([0.0, 1.0]);
-            return self.eval_sampled_function(func, inputs.first().copied().unwrap_or(0.0), domain);
+            return self.eval_sampled_function(
+                func,
+                inputs.first().copied().unwrap_or(0.0),
+                domain,
+            );
         }
-        let bps = dict.get(b"BitsPerSample").and_then(Object::as_i64).unwrap_or(8);
+        let bps = dict
+            .get(b"BitsPerSample")
+            .and_then(Object::as_i64)
+            .unwrap_or(8);
         let domain = read_vec(self, dict, b"Domain").unwrap_or_default();
         let range = read_vec(self, dict, b"Range").unwrap_or_default();
         if domain.len() < 2 * m || range.is_empty() || !range.len().is_multiple_of(2) {
@@ -3874,7 +4040,11 @@ impl Document {
                 encode.get(2 * i + 1).copied().unwrap_or((n - 1) as f64),
             );
             let span = d1 - d0;
-            let x = inputs.get(i).copied().unwrap_or(0.0).clamp(d0.min(d1), d0.max(d1));
+            let x = inputs
+                .get(i)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(d0.min(d1), d0.max(d1));
             let e = if span.abs() < 1e-12 {
                 e0
             } else {
@@ -3935,7 +4105,12 @@ impl Document {
         }
         let start = stack.len() - outs;
         (0..outs)
-            .map(|c| stack[start + c].clamp(range[2 * c].min(range[2 * c + 1]), range[2 * c].max(range[2 * c + 1])))
+            .map(|c| {
+                stack[start + c].clamp(
+                    range[2 * c].min(range[2 * c + 1]),
+                    range[2 * c].max(range[2 * c + 1]),
+                )
+            })
             .collect()
     }
 
@@ -3954,7 +4129,10 @@ impl Document {
     ) -> Option<crate::raster::render::ExtGStateParams> {
         let (_, obj) = self.resource_entry(resources, b"ExtGState", name)?;
         let gs = obj.as_dict()?;
-        let fill_alpha = gs.get(b"ca").map(|o| self.resolve(o)).and_then(|o| o.as_f64());
+        let fill_alpha = gs
+            .get(b"ca")
+            .map(|o| self.resolve(o))
+            .and_then(|o| o.as_f64());
         let blend = gs
             .get(b"BM")
             .map(|o| self.resolve(o))
@@ -4263,7 +4441,11 @@ impl Document {
             let page_h = (media[3] - media[1]).abs();
 
             // The tag-tree blocks (if any) only attach to the first page.
-            let page_tags = if page_no == 1 { tag_blocks.clone() } else { None };
+            let page_tags = if page_no == 1 {
+                tag_blocks.clone()
+            } else {
+                None
+            };
             // Single source of truth for per-page block assembly (shared with
             // [`page_blocks`](Self::page_blocks)): extract runs/paths/images and
             // run the reconstruction pipeline, recording image blobs into the
@@ -4462,7 +4644,9 @@ impl Document {
             }
             let Some(b) = element.bounds else { continue };
             let key = element.label.clone().into_bytes();
-            let Some(img) = images.get(&key) else { continue };
+            let Some(img) = images.get(&key) else {
+                continue;
+            };
             let png = crate::raster::png::encode_png(img.width, img.height, &img.rgba);
             let resource = Self::fnv1a(&png);
             if let Some(res) = resources.as_deref_mut() {
@@ -4812,7 +4996,16 @@ impl Document {
         for y in 0..h {
             let row_start_bit = y as u64 * row_bytes * 8;
             for x in 0..w {
-                out.push(self.sample_pixel_rgb(cs, samples, row_start_bit, x, n, bpc, &decode, indexed));
+                out.push(self.sample_pixel_rgb(
+                    cs,
+                    samples,
+                    row_start_bit,
+                    x,
+                    n,
+                    bpc,
+                    &decode,
+                    indexed,
+                ));
             }
         }
         Some(out)
@@ -5322,19 +5515,18 @@ impl Document {
                 continue;
             }
             // Type0 composites carry the descriptor on the descendant CIDFont.
-            let carrier = if dict.get(b"Subtype").and_then(Object::as_name)
-                == Some(b"Type0".as_slice())
-            {
-                dict.get(b"DescendantFonts")
-                    .map(|o| self.resolve(o))
-                    .and_then(Object::as_array)
-                    .and_then(|a| a.first())
-                    .map(|o| self.resolve(o))
-                    .and_then(Object::as_dict)
-                    .cloned()
-            } else {
-                Some(dict.clone())
-            };
+            let carrier =
+                if dict.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice()) {
+                    dict.get(b"DescendantFonts")
+                        .map(|o| self.resolve(o))
+                        .and_then(Object::as_array)
+                        .and_then(|a| a.first())
+                        .map(|o| self.resolve(o))
+                        .and_then(Object::as_dict)
+                        .cloned()
+                } else {
+                    Some(dict.clone())
+                };
             let Some(carrier) = carrier else {
                 continue;
             };
@@ -6985,7 +7177,16 @@ impl Document {
             let res_name = format!("GpStd{font_obj}").into_bytes();
             self.register_page_font(page_no, &res_name, (font_obj, 0))?;
             return self.draw_simple_text_run(
-                page_no, &res_name, x, y, size, text, color, opacity, rotation_deg, underline,
+                page_no,
+                &res_name,
+                x,
+                y,
+                size,
+                text,
+                color,
+                opacity,
+                rotation_deg,
+                underline,
                 strikethrough,
             );
         }
@@ -7069,7 +7270,17 @@ impl Document {
         // A base-14 reference handle carries no embedded program to shape with —
         // draw the plain simple-font run (identical to `add_text`).
         if self.base14_refs.contains_key(&font_obj) {
-            return self.add_text(page_no, x, y, size, text, font_obj, color, opacity, rotation_deg);
+            return self.add_text(
+                page_no,
+                x,
+                y,
+                size,
+                text,
+                font_obj,
+                color,
+                opacity,
+                rotation_deg,
+            );
         }
         let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
             EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
@@ -7077,7 +7288,17 @@ impl Document {
         let shaper = crate::font::shape::Shaper::new(&ttf);
         if shaper.is_empty() {
             // No layout tables → identical to the plain run (and cheaper).
-            return self.add_text(page_no, x, y, size, text, font_obj, color, opacity, rotation_deg);
+            return self.add_text(
+                page_no,
+                x,
+                y,
+                size,
+                text,
+                font_obj,
+                color,
+                opacity,
+                rotation_deg,
+            );
         }
         let upm = ttf.units_per_em().max(1.0);
         let raw: Vec<u16> = text
@@ -7287,7 +7508,16 @@ impl Document {
             .ok_or_else(|| EngineError::Unsupported(format!("not a base-14 font: {font_name}")))?;
         let res_name = self.ensure_standard_font(page_no, base)?;
         self.draw_simple_text_run(
-            page_no, &res_name, x, y, size, text, color, opacity, rotation_deg, underline,
+            page_no,
+            &res_name,
+            x,
+            y,
+            size,
+            text,
+            color,
+            opacity,
+            rotation_deg,
+            underline,
             strikethrough,
         )
     }
@@ -7386,7 +7616,17 @@ impl Document {
         opacity: f64,
         rotation_deg: f64,
     ) -> Result<()> {
-        self.add_text_standard(page_no, x, y, size, text, "Helvetica", color, opacity, rotation_deg)
+        self.add_text_standard(
+            page_no,
+            x,
+            y,
+            size,
+            text,
+            "Helvetica",
+            color,
+            opacity,
+            rotation_deg,
+        )
     }
 
     /// Add an invisible (text render mode 3) text layer to `page_no` in a SINGLE
@@ -8499,8 +8739,11 @@ impl Document {
             return Err(EngineError::PageNotFound(0));
         }
         let kept: BTreeSet<ObjectId> = selected.iter().copied().collect();
-        let dropped: BTreeSet<ObjectId> =
-            all.iter().copied().filter(|id| !kept.contains(id)).collect();
+        let dropped: BTreeSet<ObjectId> = all
+            .iter()
+            .copied()
+            .filter(|id| !kept.contains(id))
+            .collect();
         let mut clone = self.clone();
         clone.rebuild_page_tree(&selected)?;
         if !dropped.is_empty() {
@@ -8617,7 +8860,11 @@ impl Document {
                 .map(|arr| arr.iter().filter_map(Object::as_reference).collect())
                 .unwrap_or_default();
             for annot_id in annot_ids {
-                let Some(dict) = self.objects.get(&annot_id).and_then(Object::as_dict).cloned()
+                let Some(dict) = self
+                    .objects
+                    .get(&annot_id)
+                    .and_then(Object::as_dict)
+                    .cloned()
                 else {
                     continue;
                 };
@@ -8644,7 +8891,12 @@ impl Document {
         let Ok(catalog_id) = self.catalog_id() else {
             return;
         };
-        let Some(catalog) = self.objects.get(&catalog_id).and_then(Object::as_dict).cloned() else {
+        let Some(catalog) = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        else {
             return;
         };
         let Some(acro_obj) = catalog.get(b"AcroForm") else {
@@ -8653,10 +8905,12 @@ impl Document {
         // `/AcroForm` is stored inline in the catalog here, but may be an indirect
         // reference in third-party PDFs — handle both.
         let (acro_id, acro) = match acro_obj {
-            Object::Reference(id) => match self.objects.get(id).and_then(Object::as_dict).cloned() {
-                Some(d) => (Some(*id), d),
-                None => return,
-            },
+            Object::Reference(id) => {
+                match self.objects.get(id).and_then(Object::as_dict).cloned() {
+                    Some(d) => (Some(*id), d),
+                    None => return,
+                }
+            }
             other => match other.as_dict() {
                 Some(d) => (None, d.clone()),
                 None => return,
@@ -8699,7 +8953,12 @@ impl Document {
         dropped: &BTreeSet<ObjectId>,
         widget_page: &BTreeMap<ObjectId, ObjectId>,
     ) -> bool {
-        let Some(dict) = self.objects.get(&field_id).and_then(Object::as_dict).cloned() else {
+        let Some(dict) = self
+            .objects
+            .get(&field_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        else {
             return true;
         };
         if let Some(kids) = dict.get(b"Kids").and_then(Object::as_array) {
@@ -8732,7 +8991,12 @@ impl Document {
         let Ok(catalog_id) = self.catalog_id() else {
             return;
         };
-        let Some(catalog) = self.objects.get(&catalog_id).and_then(Object::as_dict).cloned() else {
+        let Some(catalog) = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        else {
             return;
         };
         let Some(dests_obj) = catalog.get(b"Dests") else {
@@ -8740,10 +9004,12 @@ impl Document {
         };
         // `/Dests` is usually an indirect reference, occasionally an inline dict.
         let (dict_id, mut dict) = match dests_obj {
-            Object::Reference(id) => match self.objects.get(id).and_then(Object::as_dict).cloned() {
-                Some(d) => (Some(*id), d),
-                None => return,
-            },
+            Object::Reference(id) => {
+                match self.objects.get(id).and_then(Object::as_dict).cloned() {
+                    Some(d) => (Some(*id), d),
+                    None => return,
+                }
+            }
             other => match other.as_dict() {
                 Some(d) => (None, d.clone()),
                 None => return,
@@ -9852,7 +10118,11 @@ impl Document {
     /// readable `/EF` embedded-file stream.
     fn filespec_to_attachment(&self, key: &[u8], value: &Object) -> Option<Attachment> {
         let spec = self.resolve(value).as_dict()?;
-        let text = |o: &Object| self.resolve(o).as_string().map(crate::font::decode_pdf_text);
+        let text = |o: &Object| {
+            self.resolve(o)
+                .as_string()
+                .map(crate::font::decode_pdf_text)
+        };
         let filename = spec
             .get(b"UF")
             .or_else(|| spec.get(b"F"))
@@ -9956,7 +10226,11 @@ impl Document {
                 .map(|o| self.resolve(o))
                 .and_then(Object::as_array)
                 .map(|a| {
-                    let c = |i: usize| a.get(i).and_then(|o| self.resolve(o).as_f64()).unwrap_or(0.0);
+                    let c = |i: usize| {
+                        a.get(i)
+                            .and_then(|o| self.resolve(o).as_f64())
+                            .unwrap_or(0.0)
+                    };
                     [c(0), c(1), c(2)]
                 })
                 .unwrap_or([0.0, 0.0, 0.0]);
@@ -10872,7 +11146,11 @@ impl Document {
     fn field_text_style(&self, field: &Dictionary) -> TextFieldStyle {
         let da = self.field_da(field);
         let (size, color) = parse_da(&da);
-        let align = field.get(b"Q").and_then(Object::as_i64).unwrap_or(0).clamp(0, 2) as u8;
+        let align = field
+            .get(b"Q")
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+            .clamp(0, 2) as u8;
         TextFieldStyle { size, color, align }
     }
 
@@ -11478,10 +11756,14 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
         // The `cs` operand is either a device-space name (resolved directly) or a
         // name keyed in this resources scope's `/ColorSpace` sub-dictionary.
         let cs = match name {
-            b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern" | b"G" | b"RGB"
-            | b"CMYK" => self.doc.resolve_color_space(&Object::Name(name.to_vec()), 0)?,
+            b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern" | b"G" | b"RGB" | b"CMYK" => {
+                self.doc
+                    .resolve_color_space(&Object::Name(name.to_vec()), 0)?
+            }
             _ => {
-                let (_, obj) = self.doc.resource_entry(&self.resources, b"ColorSpace", name)?;
+                let (_, obj) = self
+                    .doc
+                    .resource_entry(&self.resources, b"ColorSpace", name)?;
                 self.doc.resolve_color_space(obj, 0)?
             }
         };
@@ -11493,7 +11775,10 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
 /// element. `None` if the entry is absent, not an array, or has fewer than two
 /// numeric values. Used for function `/Domain` ranges.
 fn read_pair(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<[f64; 2]> {
-    let arr = dict.get(key).map(|o| doc.resolve(o)).and_then(Object::as_array)?;
+    let arr = dict
+        .get(key)
+        .map(|o| doc.resolve(o))
+        .and_then(Object::as_array)?;
     let v: Vec<f64> = arr.iter().filter_map(|o| doc.resolve(o).as_f64()).collect();
     (v.len() >= 2).then(|| [v[0], v[1]])
 }
@@ -11503,7 +11788,10 @@ fn read_pair(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<[f64; 2]> 
 /// yields `Some(vec![])`). Used for function `/C0`, `/C1`, `/Bounds`, `/Encode`,
 /// and a sampled function's `/Range`.
 fn read_vec(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<Vec<f64>> {
-    let arr = dict.get(key).map(|o| doc.resolve(o)).and_then(Object::as_array)?;
+    let arr = dict
+        .get(key)
+        .map(|o| doc.resolve(o))
+        .and_then(Object::as_array)?;
     Some(arr.iter().filter_map(|o| doc.resolve(o).as_f64()).collect())
 }
 
@@ -12258,11 +12546,14 @@ mod tests {
         assert_eq!(merged.get(&1u16).map(String::as_str), Some("A"));
         assert_eq!(merged.get(&2u16).map(String::as_str), Some("à"));
         // Either side alone passes through; both None → None.
-        let only = merge_cid_maps(None, Some({
-            let mut m = BTreeMap::new();
-            m.insert(0x6au16, "à".to_string());
-            m
-        }));
+        let only = merge_cid_maps(
+            None,
+            Some({
+                let mut m = BTreeMap::new();
+                m.insert(0x6au16, "à".to_string());
+                m
+            }),
+        );
         assert_eq!(only.unwrap().get(&0x6au16).map(String::as_str), Some("à"));
         assert!(merge_cid_maps(None, None).is_none());
     }
@@ -12438,7 +12729,12 @@ mod tests {
         );
 
         // Text + path survive intact: [text, image, path].
-        let kinds: Vec<_> = doc.page_elements(1).unwrap().iter().map(|e| e.kind.clone()).collect();
+        let kinds: Vec<_> = doc
+            .page_elements(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
         assert_eq!(
             kinds,
             vec![
@@ -12505,7 +12801,11 @@ mod tests {
         // The path is still there and now carries the blue fill.
         let after = doc.page_vector_paths(1).unwrap();
         assert_eq!(after.len(), 1);
-        assert_eq!(after[0].fill, Some([0.0, 0.0, 1.0]), "fill restyled to blue");
+        assert_eq!(
+            after[0].fill,
+            Some([0.0, 0.0, 1.0]),
+            "fill restyled to blue"
+        );
     }
 
     #[test]
@@ -12541,7 +12841,10 @@ mod tests {
         // (2) The page content now references that gstate via `gs`.
         let content = doc.page_content(1).unwrap();
         let s = String::from_utf8_lossy(&content);
-        assert!(s.contains(&format!("/{name} gs")), "gs op references the gstate");
+        assert!(
+            s.contains(&format!("/{name} gs")),
+            "gs op references the gstate"
+        );
 
         // The path's effective fill alpha is now 0.4 (walker resolves the gs).
         let paths = doc.page_vector_paths(1).unwrap();
@@ -12571,13 +12874,14 @@ mod tests {
         doc.set_element_opacity(1, img_index, 0.25).unwrap();
 
         let pairs = doc.page_gstate_alpha_pair(1);
-        assert!(!pairs.is_empty(), "ExtGState registered for the image opacity");
-        let has_quarter = pairs
-            .values()
-            .any(|(ca, ca_stroke)| {
-                ca.is_some_and(|v| (v - 0.25).abs() < 1e-9)
-                    && ca_stroke.is_some_and(|v| (v - 0.25).abs() < 1e-9)
-            });
+        assert!(
+            !pairs.is_empty(),
+            "ExtGState registered for the image opacity"
+        );
+        let has_quarter = pairs.values().any(|(ca, ca_stroke)| {
+            ca.is_some_and(|v| (v - 0.25).abs() < 1e-9)
+                && ca_stroke.is_some_and(|v| (v - 0.25).abs() < 1e-9)
+        });
         assert!(has_quarter, "an ExtGState carries /ca = /CA = 0.25");
 
         // The image's effective alpha is now 0.25 (the wrap reached the Do).
@@ -12618,13 +12922,24 @@ mod tests {
         assert!(re > tj, "front-most shape now painted after the text");
 
         // Stream still parses to two paths + one text run.
-        let kinds: Vec<_> = doc.page_elements(1).unwrap().iter().map(|e| e.kind.clone()).collect();
+        let kinds: Vec<_> = doc
+            .page_elements(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
         assert_eq!(
-            kinds.iter().filter(|k| **k == content::ElementKind::Path).count(),
+            kinds
+                .iter()
+                .filter(|k| **k == content::ElementKind::Path)
+                .count(),
             2
         );
         assert_eq!(
-            kinds.iter().filter(|k| **k == content::ElementKind::Text).count(),
+            kinds
+                .iter()
+                .filter(|k| **k == content::ElementKind::Text)
+                .count(),
             1
         );
     }
@@ -12685,7 +13000,12 @@ mod tests {
             .to_vec();
         doc.set_page_content(1, content).unwrap();
 
-        let kinds: Vec<_> = doc.page_elements(1).unwrap().iter().map(|e| e.kind.clone()).collect();
+        let kinds: Vec<_> = doc
+            .page_elements(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
         assert_eq!(
             kinds,
             vec![
@@ -13069,8 +13389,12 @@ mod tests {
             // `bounds` is [x, y, w, h] in top-left points; map to raster pixels.
             let x0 = (bounds[0] * scale).floor().max(0.0) as u32;
             let y0 = (bounds[1] * scale).floor().max(0.0) as u32;
-            let x1 = ((bounds[0] + bounds[2]) * scale).ceil().min(img.width as f64) as u32;
-            let y1 = ((bounds[1] + bounds[3]) * scale).ceil().min(img.height as f64) as u32;
+            let x1 = ((bounds[0] + bounds[2]) * scale)
+                .ceil()
+                .min(img.width as f64) as u32;
+            let y1 = ((bounds[1] + bounds[3]) * scale)
+                .ceil()
+                .min(img.height as f64) as u32;
             let mut ink = 0;
             for y in y0..y1 {
                 for x in x0..x1 {
@@ -13140,9 +13464,8 @@ mod tests {
 
         // Count embedded font programs before any edit.
         let before = doc.save();
-        let count = |hay: &[u8], needle: &[u8]| {
-            hay.windows(needle.len()).filter(|w| *w == needle).count()
-        };
+        let count =
+            |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).filter(|w| *w == needle).count();
         let ff_before = count(&before, b"FontFile");
 
         doc.set_text_field("name", "NO_NEW_FONT").unwrap();
@@ -13151,7 +13474,10 @@ mod tests {
 
         // The value is stored, the appearance references `/Helv`, and the value
         // is painted in the regenerated stream.
-        assert!(after.windows(11).any(|w| w == b"NO_NEW_FONT"), "value stored");
+        assert!(
+            after.windows(11).any(|w| w == b"NO_NEW_FONT"),
+            "value stored"
+        );
         // No engine-injected form font, and no new embedded font program.
         assert_eq!(
             count(&after, b"GpFormSans"),
@@ -13422,10 +13748,30 @@ mod tests {
     #[test]
     fn add_text_standard_draws_with_base14_fonts() {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
-        doc.add_text_standard(1, 100.0, 100.0, 14.0, "Bonjour", "Times-Bold", [0.0, 0.0, 0.0], 1.0, 0.0)
-            .unwrap();
-        doc.add_text_standard(1, 100.0, 80.0, 12.0, "Code", "Courier", [0.0, 0.0, 0.0], 1.0, 0.0)
-            .unwrap();
+        doc.add_text_standard(
+            1,
+            100.0,
+            100.0,
+            14.0,
+            "Bonjour",
+            "Times-Bold",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        doc.add_text_standard(
+            1,
+            100.0,
+            80.0,
+            12.0,
+            "Code",
+            "Courier",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
         // A name outside the base-14 set is rejected.
         assert!(doc
             .add_text_standard(1, 0.0, 0.0, 10.0, "x", "NotAFont", [0.0; 3], 1.0, 0.0)
@@ -13437,7 +13783,10 @@ mod tests {
         assert!(text.contains("Courier"), "Courier registered");
         // Two distinct standard fonts must get distinct resource names.
         assert!(text.contains("/GpStd"), "unique standard-font resources");
-        assert!(Document::open(&bytes).unwrap().page_count() >= 1, "re-opens");
+        assert!(
+            Document::open(&bytes).unwrap().page_count() >= 1,
+            "re-opens"
+        );
     }
 
     /// Count occurrences of the `re` rectangle operator (token-boundary aware) in
@@ -13451,7 +13800,17 @@ mod tests {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let before = doc.page_content(1).unwrap().len();
         doc.add_text_standard_styled(
-            1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, true, false,
+            1,
+            100.0,
+            700.0,
+            20.0,
+            "Hello",
+            "Helvetica",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+            true,
+            false,
         )
         .unwrap();
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
@@ -13473,7 +13832,17 @@ mod tests {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let before = doc.page_content(1).unwrap().len();
         doc.add_text_standard_styled(
-            1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, false, true,
+            1,
+            100.0,
+            700.0,
+            20.0,
+            "Hello",
+            "Helvetica",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+            false,
+            true,
         )
         .unwrap();
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
@@ -13492,15 +13861,35 @@ mod tests {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let before = doc.page_content(1).unwrap().len();
         doc.add_text_standard_styled(
-            1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, true, true,
+            1,
+            100.0,
+            700.0,
+            20.0,
+            "Hello",
+            "Helvetica",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+            true,
+            true,
         )
         .unwrap();
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
         let added = &content[before..];
         // Both rules in a single decoration block.
-        assert_eq!(count_re_ops(added), 2, "underline + strikethrough rectangles");
-        assert!(added.contains(&format!("0 {} ", content::num(-0.12 * 20.0))), "underline");
-        assert!(added.contains(&format!("0 {} ", content::num(0.26 * 20.0))), "strikethrough");
+        assert_eq!(
+            count_re_ops(added),
+            2,
+            "underline + strikethrough rectangles"
+        );
+        assert!(
+            added.contains(&format!("0 {} ", content::num(-0.12 * 20.0))),
+            "underline"
+        );
+        assert!(
+            added.contains(&format!("0 {} ", content::num(0.26 * 20.0))),
+            "strikethrough"
+        );
     }
 
     #[test]
@@ -13509,13 +13898,32 @@ mod tests {
         let mut styled = Document::open(&fixture("simple-text.pdf")).unwrap();
         styled
             .add_text_standard_styled(
-                1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0, false,
+                1,
+                100.0,
+                700.0,
+                20.0,
+                "Hello",
+                "Helvetica",
+                [0.0, 0.0, 0.0],
+                1.0,
+                0.0,
+                false,
                 false,
             )
             .unwrap();
         let mut plain = Document::open(&fixture("simple-text.pdf")).unwrap();
         plain
-            .add_text_standard(1, 100.0, 700.0, 20.0, "Hello", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0)
+            .add_text_standard(
+                1,
+                100.0,
+                700.0,
+                20.0,
+                "Hello",
+                "Helvetica",
+                [0.0, 0.0, 0.0],
+                1.0,
+                0.0,
+            )
             .unwrap();
         assert_eq!(
             styled.page_content(1).unwrap(),
@@ -13524,7 +13932,11 @@ mod tests {
         );
         // And neither emits a rectangle.
         let plain_str = String::from_utf8_lossy(&plain.page_content(1).unwrap()).into_owned();
-        assert_eq!(count_re_ops(&plain_str), 0, "no decoration rectangles when flags off");
+        assert_eq!(
+            count_re_ops(&plain_str),
+            0,
+            "no decoration rectangles when flags off"
+        );
     }
 
     #[test]
@@ -13536,14 +13948,28 @@ mod tests {
             .unwrap();
         let before = doc.page_content(1).unwrap().len();
         doc.add_text_styled(
-            1, 80.0, 650.0, 24.0, "Word", font, [0.0, 0.0, 0.0], 1.0, 0.0, true, true,
+            1,
+            80.0,
+            650.0,
+            24.0,
+            "Word",
+            font,
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+            true,
+            true,
         )
         .unwrap();
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
         let added = &content[before..];
         // The glyph run is shown, plus both decoration rules.
         assert!(added.contains("Tj"), "glyph run emitted");
-        assert_eq!(count_re_ops(added), 2, "underline + strikethrough on embedded run");
+        assert_eq!(
+            count_re_ops(added),
+            2,
+            "underline + strikethrough on embedded run"
+        );
         // Undecorated embedded run draws no rectangle.
         let mut plain = Document::open(&fixture("simple-text.pdf")).unwrap();
         let f2 = plain
@@ -13555,7 +13981,11 @@ mod tests {
             .unwrap();
         let plain_added =
             String::from_utf8_lossy(&plain.page_content(1).unwrap()).into_owned()[b2..].to_string();
-        assert_eq!(count_re_ops(&plain_added), 0, "no rectangle on undecorated embedded run");
+        assert_eq!(
+            count_re_ops(&plain_added),
+            0,
+            "no rectangle on undecorated embedded run"
+        );
     }
 
     /// Count `/FontFile`, `/FontFile2` and `/FontFile3` occurrences in raw PDF
@@ -13586,8 +14016,18 @@ mod tests {
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let font = doc.embed_font("Helvetica", &[]).unwrap();
         assert_ne!(font, 0, "base-14 reference handle allocated");
-        doc.add_text(1, 80.0, 700.0, 18.0, "Hello base-14", font, [0.0, 0.0, 0.0], 1.0, 0.0)
-            .unwrap();
+        doc.add_text(
+            1,
+            80.0,
+            700.0,
+            18.0,
+            "Hello base-14",
+            font,
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
         let pdf = doc.save();
 
         // No NEW font program added — the run references the standard font.
@@ -13602,7 +14042,10 @@ mod tests {
             "saved PDF references /Helvetica",
         );
         let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
-        assert!(content.contains("Tj"), "base-14 run emitted in page content");
+        assert!(
+            content.contains("Tj"),
+            "base-14 run emitted in page content"
+        );
         // Size stays close to baseline (no ~57 KB substitute subset baked in).
         assert!(
             pdf.len() < base_pdf.len() + 4_000,
@@ -13615,14 +14058,25 @@ mod tests {
     fn embed_font_custom_family_still_embeds_fontfile() {
         // Non-regression: a real custom face (a family `base14_kind` does NOT
         // recognise) is still subset + embedded — it carries a /FontFile.
-        let base_ff = count_font_files(&Document::open(&fixture("simple-text.pdf")).unwrap().save());
+        let base_ff =
+            count_font_files(&Document::open(&fixture("simple-text.pdf")).unwrap().save());
 
         let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
         let font = doc
             .embed_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
             .unwrap();
-        doc.add_text(1, 80.0, 650.0, 18.0, "Custom face", font, [0.0, 0.0, 0.0], 1.0, 0.0)
-            .unwrap();
+        doc.add_text(
+            1,
+            80.0,
+            650.0,
+            18.0,
+            "Custom face",
+            font,
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
         let pdf = doc.save();
 
         assert!(
@@ -13639,13 +14093,22 @@ mod tests {
         // Family + style hints (case-insensitive, anywhere in the string).
         assert_eq!(n("helvetica").as_deref(), Some(&b"Helvetica"[..]));
         assert_eq!(n("Helvetica-Bold").as_deref(), Some(&b"Helvetica-Bold"[..]));
-        assert_eq!(n("Arial Bold Italic").as_deref(), Some(&b"Helvetica-BoldOblique"[..]));
+        assert_eq!(
+            n("Arial Bold Italic").as_deref(),
+            Some(&b"Helvetica-BoldOblique"[..])
+        );
         assert_eq!(n("ArialMT").as_deref(), Some(&b"Helvetica"[..]));
         assert_eq!(n("Times New Roman").as_deref(), Some(&b"Times-Roman"[..]));
         assert_eq!(n("Times-Italic").as_deref(), Some(&b"Times-Italic"[..]));
-        assert_eq!(n("TimesNewRoman,BoldItalic").as_deref(), Some(&b"Times-BoldItalic"[..]));
+        assert_eq!(
+            n("TimesNewRoman,BoldItalic").as_deref(),
+            Some(&b"Times-BoldItalic"[..])
+        );
         assert_eq!(n("Courier").as_deref(), Some(&b"Courier"[..]));
-        assert_eq!(n("courier-boldoblique").as_deref(), Some(&b"Courier-BoldOblique"[..]));
+        assert_eq!(
+            n("courier-boldoblique").as_deref(),
+            Some(&b"Courier-BoldOblique"[..])
+        );
         assert_eq!(n("Symbol").as_deref(), Some(&b"Symbol"[..]));
         assert_eq!(n("ZapfDingbats").as_deref(), Some(&b"ZapfDingbats"[..]));
         // Real custom families are NOT base-14 → embedded path.
@@ -13666,7 +14129,11 @@ mod tests {
             "DejaVu TrueType is listed: {fonts:?}"
         );
         // Round-trip: the listed font can be pulled out and re-embedded.
-        let name = &fonts.iter().find(|f| f.format == "truetype").unwrap().base_font;
+        let name = &fonts
+            .iter()
+            .find(|f| f.format == "truetype")
+            .unwrap()
+            .base_font;
         let (program, format) = doc.extract_font_program(name).expect("extractable");
         assert_eq!(format, "truetype");
         assert!(!program.is_empty());
@@ -13736,10 +14203,11 @@ mod tests {
         // black and its bottom rows untouched — the sensitive sub-rectangle is
         // erased from the pixels while the rest of the scan survives.
         let mut doc = Document::open(&single_image_page([200, 30, 30])).unwrap(); // red fill
-        let removed = doc
-            .redact_pii(1, &[(0.0, 60.0, 100.0, 40.0)])
-            .unwrap();
-        assert_eq!(removed, 0, "no text/vector elements — only image pixels change");
+        let removed = doc.redact_pii(1, &[(0.0, 60.0, 100.0, 40.0)]).unwrap();
+        assert_eq!(
+            removed, 0,
+            "no text/vector elements — only image pixels change"
+        );
 
         // Pull the (re-encoded) image back out and decode it.
         let reopened = Document::open(&doc.save()).unwrap();
@@ -13807,7 +14275,11 @@ mod tests {
         //    centre — it must be black, not the white paper).
         let canvas = reopened.render_page_canvas(1, 1.0, false).unwrap();
         let mid = px(&canvas, canvas.width / 2, canvas.height / 2);
-        assert_eq!(mid, [0, 0, 0], "centre of the page is the black redaction cover, got {mid:?}");
+        assert_eq!(
+            mid,
+            [0, 0, 0],
+            "centre of the page is the black redaction cover, got {mid:?}"
+        );
     }
 
     #[test]
@@ -13829,7 +14301,10 @@ mod tests {
         assert_eq!(rgb(95, 50), [0, 0, 0], "bottom band redacted");
         // Middle row (page y ≈ 50, outside both bands) keeps original blue.
         let mid = rgb(50, 50);
-        assert!(mid[2] > 150 && mid[0] < 90, "middle band untouched, got {mid:?}");
+        assert!(
+            mid[2] > 150 && mid[0] < 90,
+            "middle band untouched, got {mid:?}"
+        );
     }
 
     #[test]
@@ -14317,8 +14792,7 @@ mod tests {
         //      broken charstring widths — otherwise the words collapse onto one
         //      another. The glyph run must span a wide horizontal extent.
         let doc = Document::open(&fixture("embedded-cff-base14.pdf")).unwrap();
-        let img = crate::raster::decode_png(&doc.render_page(1, 3.0).unwrap())
-            .expect("valid PNG");
+        let img = crate::raster::decode_png(&doc.render_page(1, 3.0).unwrap()).expect("valid PNG");
         let (w, h) = (img.width as usize, img.height as usize);
 
         // Per-row dark-pixel scan: count ink and find the title row's horizontal
@@ -14340,7 +14814,10 @@ mod tests {
 
         // Bug 1 guard: the glyphs draw at all (a substitute-routed subset CFF
         // would paint nothing).
-        assert!(dark > 2_000, "embedded base-14-named CFF glyphs draw ink ({dark} px)");
+        assert!(
+            dark > 2_000,
+            "embedded base-14-named CFF glyphs draw ink ({dark} px)"
+        );
 
         // Bug 2 guard: "DESERTS DE TRESS" with real /Widths advances (~225 PDF
         // pt at 24pt) spans well over 400 device px at scale 3. A collapsed
@@ -14577,15 +15054,29 @@ mod tests {
         }
         assert_eq!(doc.page_ids().unwrap().len(), 5);
         let style = form::FieldStyle::default();
-        doc.add_text_field(2, "fld", [50.0, 700.0, 300.0, 720.0], "", None, false, false, &style)
+        doc.add_text_field(
+            2,
+            "fld",
+            [50.0, 700.0, 300.0, 720.0],
+            "",
+            None,
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+        doc.add_goto_link(1, [50.0, 600.0, 200.0, 620.0], 5)
             .unwrap();
-        doc.add_goto_link(1, [50.0, 600.0, 200.0, 620.0], 5).unwrap();
         assert_eq!(doc.form_fields().unwrap().len(), 1);
 
         // Chunk A = pages 1-3: the field's page (2) is in-chunk → field survives;
         // the page-1 link targets page 5 (dropped) → neutralised, no orphan kept.
         let chunk_a = Document::open(&doc.extract_pages(&[1, 2, 3]).unwrap()).unwrap();
-        assert_eq!(chunk_a.page_ids().unwrap().len(), 3, "chunk A keeps 3 pages");
+        assert_eq!(
+            chunk_a.page_ids().unwrap().len(),
+            3,
+            "chunk A keeps 3 pages"
+        );
         assert_eq!(
             chunk_a.form_fields().unwrap().len(),
             1,
@@ -14594,7 +15085,11 @@ mod tests {
 
         // Chunk B = pages 4-5: the field lived on page 2 (out-of-chunk) → dropped.
         let chunk_b = Document::open(&doc.extract_pages(&[4, 5]).unwrap()).unwrap();
-        assert_eq!(chunk_b.page_ids().unwrap().len(), 2, "chunk B keeps 2 pages");
+        assert_eq!(
+            chunk_b.page_ids().unwrap().len(),
+            2,
+            "chunk B keeps 2 pages"
+        );
         assert!(
             chunk_b.form_fields().unwrap().is_empty(),
             "out-of-chunk field dropped from extraction"
@@ -14606,24 +15101,58 @@ mod tests {
         let pdf = crate::convert::reverse::txt_to_pdf("ocr host page");
         let mut doc = Document::open(&pdf).unwrap();
         let runs = vec![
-            TextLayerRun { x: 50.0, y: 700.0, size: 10.0, text: "café".into(), rotation_deg: 0.0 },
-            TextLayerRun { x: 50.0, y: 680.0, size: 10.0, text: "résumé".into(), rotation_deg: 0.0 },
+            TextLayerRun {
+                x: 50.0,
+                y: 700.0,
+                size: 10.0,
+                text: "café".into(),
+                rotation_deg: 0.0,
+            },
+            TextLayerRun {
+                x: 50.0,
+                y: 680.0,
+                size: 10.0,
+                text: "résumé".into(),
+                rotation_deg: 0.0,
+            },
             // Non-WinAnsi (CJK) now goes through the glyphless Type0 path instead
             // of being skipped.
-            TextLayerRun { x: 50.0, y: 660.0, size: 10.0, text: "日本語".into(), rotation_deg: 0.0 },
-            TextLayerRun { x: 50.0, y: 640.0, size: 10.0, text: String::new(), rotation_deg: 0.0 },
+            TextLayerRun {
+                x: 50.0,
+                y: 660.0,
+                size: 10.0,
+                text: "日本語".into(),
+                rotation_deg: 0.0,
+            },
+            TextLayerRun {
+                x: 50.0,
+                y: 640.0,
+                size: 10.0,
+                text: String::new(),
+                rotation_deg: 0.0,
+            },
         ];
         // Two WinAnsi + one Unicode run written; only the empty run is skipped.
         assert_eq!(doc.add_text_layer(1, &runs).unwrap(), 3);
-        assert_eq!(doc.add_text_layer(1, &[]).unwrap(), 0, "empty input is a no-op");
+        assert_eq!(
+            doc.add_text_layer(1, &[]).unwrap(),
+            0,
+            "empty input is a no-op"
+        );
 
         let saved = doc.save();
         let body = String::from_utf8_lossy(&saved);
         assert!(body.contains("3 Tr"), "invisible text render mode present");
         assert!(body.contains(" Tj"), "text-show operator present");
         assert!(body.contains("caf"), "the café run's glyphs were written");
-        assert!(body.contains("Type0"), "a Type0 font was embedded for the CJK run");
-        assert!(body.contains("Identity-H"), "the Type0 font uses Identity-H");
+        assert!(
+            body.contains("Type0"),
+            "a Type0 font was embedded for the CJK run"
+        );
+        assert!(
+            body.contains("Identity-H"),
+            "the Type0 font uses Identity-H"
+        );
         // The result re-opens as a valid single-page document.
         assert_eq!(Document::open(&saved).unwrap().page_ids().unwrap().len(), 1);
     }
@@ -14636,9 +15165,27 @@ mod tests {
         let pdf = crate::convert::reverse::txt_to_pdf("ocr host page");
         let mut doc = Document::open(&pdf).unwrap();
         let runs = vec![
-            TextLayerRun { x: 50.0, y: 700.0, size: 10.0, text: "Latin café".into(), rotation_deg: 0.0 },
-            TextLayerRun { x: 50.0, y: 680.0, size: 10.0, text: "Привет".into(), rotation_deg: 0.0 },
-            TextLayerRun { x: 50.0, y: 660.0, size: 10.0, text: "Ελληνικά".into(), rotation_deg: 0.0 },
+            TextLayerRun {
+                x: 50.0,
+                y: 700.0,
+                size: 10.0,
+                text: "Latin café".into(),
+                rotation_deg: 0.0,
+            },
+            TextLayerRun {
+                x: 50.0,
+                y: 680.0,
+                size: 10.0,
+                text: "Привет".into(),
+                rotation_deg: 0.0,
+            },
+            TextLayerRun {
+                x: 50.0,
+                y: 660.0,
+                size: 10.0,
+                text: "Ελληνικά".into(),
+                rotation_deg: 0.0,
+            },
         ];
         assert_eq!(doc.add_text_layer(1, &runs).unwrap(), 3);
 
@@ -14771,7 +15318,7 @@ mod tests {
 
         let mut head = vec![0u8; 54];
         head[18..20].copy_from_slice(&b16(1000)); // unitsPerEm
-        // indexToLocFormat @50 stays 0 (short loca).
+                                                  // indexToLocFormat @50 stays 0 (short loca).
 
         let mut maxp = vec![0u8; 6];
         let maxp_ver: u32 = if is_cff { 0x0000_5000 } else { 0x0001_0000 };
@@ -14928,8 +15475,12 @@ mod tests {
     fn named_dests_enumerates_name_tree() {
         let mut doc = blank_doc();
         let page_id = doc.page_object_id(1).unwrap();
-        let dest_array =
-            || Object::Array(vec![Object::Reference(page_id), Object::Name(b"Fit".to_vec())]);
+        let dest_array = || {
+            Object::Array(vec![
+                Object::Reference(page_id),
+                Object::Name(b"Fit".to_vec()),
+            ])
+        };
 
         // `chapter2` wraps its array in a `<< /D [...] >>` dictionary.
         let mut wrapper = Dictionary::new();
@@ -14974,12 +15525,19 @@ mod tests {
         let item_id = (base + 1, 0u16);
 
         let mut item = Dictionary::new();
-        item.set(b"Title", Object::String(b"Chapter 1".to_vec(), StringKind::Literal));
+        item.set(
+            b"Title",
+            Object::String(b"Chapter 1".to_vec(), StringKind::Literal),
+        );
         item.set(b"Parent", Object::Reference(outlines_id));
         item.set(b"F", Object::Integer(2)); // bold
         item.set(
             b"C",
-            Object::Array(vec![Object::Real(1.0), Object::Real(0.0), Object::Real(0.0)]),
+            Object::Array(vec![
+                Object::Real(1.0),
+                Object::Real(0.0),
+                Object::Real(0.0),
+            ]),
         );
         item.set(
             b"Dest",
@@ -14997,7 +15555,8 @@ mod tests {
         outlines.set(b"Type", Object::Name(b"Outlines".to_vec()));
         outlines.set(b"First", Object::Reference(item_id));
         outlines.set(b"Last", Object::Reference(item_id));
-        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        doc.objects
+            .insert(outlines_id, Object::Dictionary(outlines));
 
         let catalog_id = doc.catalog_id().unwrap();
         let mut catalog = doc
@@ -15046,7 +15605,10 @@ mod tests {
             ])
         };
         let mut chapter = Dictionary::new();
-        chapter.set(b"Title", Object::String(b"Chapter 1".to_vec(), StringKind::Literal));
+        chapter.set(
+            b"Title",
+            Object::String(b"Chapter 1".to_vec(), StringKind::Literal),
+        );
         chapter.set(b"Parent", Object::Reference(outlines_id));
         chapter.set(b"First", Object::Reference(section_id));
         chapter.set(b"Last", Object::Reference(section_id));
@@ -15054,7 +15616,10 @@ mod tests {
         doc.objects.insert(chapter_id, Object::Dictionary(chapter));
 
         let mut section = Dictionary::new();
-        section.set(b"Title", Object::String(b"Section 1.1".to_vec(), StringKind::Literal));
+        section.set(
+            b"Title",
+            Object::String(b"Section 1.1".to_vec(), StringKind::Literal),
+        );
         section.set(b"Parent", Object::Reference(chapter_id));
         section.set(b"Dest", dest());
         doc.objects.insert(section_id, Object::Dictionary(section));
@@ -15063,7 +15628,8 @@ mod tests {
         outlines.set(b"Type", Object::Name(b"Outlines".to_vec()));
         outlines.set(b"First", Object::Reference(chapter_id));
         outlines.set(b"Last", Object::Reference(chapter_id));
-        doc.objects.insert(outlines_id, Object::Dictionary(outlines));
+        doc.objects
+            .insert(outlines_id, Object::Dictionary(outlines));
 
         let catalog_id = doc.catalog_id().unwrap();
         let mut catalog = doc
@@ -15079,8 +15645,15 @@ mod tests {
         assert_eq!(model.outline.len(), 1, "one top-level chapter");
         let chapter = &model.outline[0];
         assert_eq!(chapter.title, "Chapter 1");
-        assert_eq!(chapter.page, 0, "1-based PDF dest page 1 → 0-based model page 0");
-        assert_eq!(chapter.children.len(), 1, "the section nests under the chapter");
+        assert_eq!(
+            chapter.page, 0,
+            "1-based PDF dest page 1 → 0-based model page 0"
+        );
+        assert_eq!(
+            chapter.children.len(),
+            1,
+            "the section nests under the chapter"
+        );
         assert_eq!(chapter.children[0].title, "Section 1.1");
     }
 
@@ -15097,7 +15670,8 @@ mod tests {
         let content = "BT /F0 24 Tf 72 740 Td (Chapter One) Tj ET\n\
                        BT /F0 12 Tf 72 600 Td (Body text that stays a paragraph.) Tj ET\n\
                        BT /F0 12 Tf 72 584 Td (A second body line follows it.) Tj ET\n";
-        doc.set_page_content(1, content.as_bytes().to_vec()).unwrap();
+        doc.set_page_content(1, content.as_bytes().to_vec())
+            .unwrap();
 
         let model = doc.reconstruct_model();
         // Sanity: the title really did promote to a heading.
@@ -15109,9 +15683,16 @@ mod tests {
             })
         });
         assert!(has_heading, "the 24pt line should promote to a Heading");
-        assert_eq!(model.outline.len(), 1, "the heading seeds one outline entry");
+        assert_eq!(
+            model.outline.len(),
+            1,
+            "the heading seeds one outline entry"
+        );
         assert_eq!(model.outline[0].title, "Chapter One");
-        assert_eq!(model.outline[0].page, 0, "heading on the first (index 0) page");
+        assert_eq!(
+            model.outline[0].page, 0,
+            "heading on the first (index 0) page"
+        );
     }
 
     /// #9: an image with a "Figure N: …" caption directly below it carries that
@@ -15203,7 +15784,11 @@ mod tests {
         let e = &els[0];
         assert_eq!(e.text, "Bold");
         assert_eq!(e.index, 0, "text-run index (feeds replace_text_run)");
-        assert!((e.font_size - 20.0).abs() < 1.5, "size ~20, got {}", e.font_size);
+        assert!(
+            (e.font_size - 20.0).abs() < 1.5,
+            "size ~20, got {}",
+            e.font_size
+        );
         assert!((e.x - 120.0).abs() < 3.0, "x ~120, got {}", e.x);
         assert!((e.y - 650.0).abs() < 15.0, "y ~650, got {}", e.y);
         assert!(
@@ -15213,7 +15798,11 @@ mod tests {
         );
         assert_eq!(e.font_family, "Helvetica", "/BaseFont family");
         assert!(e.bold, "Helvetica-Bold resolves bold");
-        assert!(e.rotation_deg.abs() < 0.5, "upright, got {}", e.rotation_deg);
+        assert!(
+            e.rotation_deg.abs() < 0.5,
+            "upright, got {}",
+            e.rotation_deg
+        );
     }
 
     #[test]
@@ -15222,8 +15811,18 @@ mod tests {
         // from the old 0.5-em estimate (4·0.5·20 = 40), so this pins that
         // base-14 fonts without /Widths now measure by real AFM advances.
         let mut doc = blank_doc();
-        doc.add_text_standard(1, 50.0, 700.0, 20.0, "WWWW", "Helvetica", [0.0, 0.0, 0.0], 1.0, 0.0)
-            .unwrap();
+        doc.add_text_standard(
+            1,
+            50.0,
+            700.0,
+            20.0,
+            "WWWW",
+            "Helvetica",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
         let els = doc.page_text_elements(1);
         assert_eq!(els.len(), 1);
         assert!(
@@ -15234,8 +15833,18 @@ mod tests {
 
         // Courier is monospace (600): "iiii" measures the same as "WWWW".
         let mut mono = blank_doc();
-        mono.add_text_standard(1, 50.0, 700.0, 20.0, "iiii", "Courier", [0.0, 0.0, 0.0], 1.0, 0.0)
-            .unwrap();
+        mono.add_text_standard(
+            1,
+            50.0,
+            700.0,
+            20.0,
+            "iiii",
+            "Courier",
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
         let mels = mono.page_text_elements(1);
         assert!(
             (mels[0].width - 48.0).abs() < 0.5,
@@ -15253,8 +15862,10 @@ mod tests {
         ];
         let png = crate::raster::png::encode_png(2, 2, &rgba);
         let jpeg = crate::raster::jpeg::encode_jpeg(2, 2, &rgba, 90);
-        doc.add_image(1, &png, 50.0, 600.0, 64.0, 64.0, 1.0).unwrap();
-        doc.add_image(1, &jpeg, 200.0, 400.0, 80.0, 80.0, 1.0).unwrap();
+        doc.add_image(1, &png, 50.0, 600.0, 64.0, 64.0, 1.0)
+            .unwrap();
+        doc.add_image(1, &jpeg, 200.0, 400.0, 80.0, 80.0, 1.0)
+            .unwrap();
 
         let imgs = doc.page_image_elements(1);
         assert_eq!(imgs.len(), 2, "two image elements");
@@ -15267,8 +15878,14 @@ mod tests {
             assert!((img.opacity - 1.0).abs() < 1e-9, "fully opaque");
         }
         let formats: Vec<&str> = imgs.iter().map(|i| i.format.as_str()).collect();
-        assert!(formats.contains(&"png"), "Flate image → png, got {formats:?}");
-        assert!(formats.contains(&"jpeg"), "DCTDecode image → jpeg, got {formats:?}");
+        assert!(
+            formats.contains(&"png"),
+            "Flate image → png, got {formats:?}"
+        );
+        assert!(
+            formats.contains(&"jpeg"),
+            "DCTDecode image → jpeg, got {formats:?}"
+        );
 
         // The PNG one re-decodes to the original RGB (lossless Flate round-trip).
         let png_el = imgs.iter().find(|i| i.format == "png").unwrap();
@@ -15291,9 +15908,12 @@ mod tests {
         // `add_image` with opacity < 1 wraps the draw in a `q … gs … Q` block
         // referencing an /ExtGState whose /ca the walker must surface.
         let mut doc = blank_doc();
-        let rgba = [255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255];
+        let rgba = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
         let png = crate::raster::png::encode_png(2, 2, &rgba);
-        doc.add_image(1, &png, 50.0, 600.0, 64.0, 64.0, 0.5).unwrap();
+        doc.add_image(1, &png, 50.0, 600.0, 64.0, 64.0, 0.5)
+            .unwrap();
 
         let imgs = doc.page_image_elements(1);
         assert_eq!(imgs.len(), 1, "one image element");
@@ -15360,16 +15980,28 @@ mod tests {
         let font = doc.embed_font("MyCff", &otf).unwrap();
 
         // The Type0 graph routes a CFF program to FontFile3/CIDFontType0.
-        let t0 = doc.objects.get(&(font, 0)).and_then(Object::as_dict).unwrap();
+        let t0 = doc
+            .objects
+            .get(&(font, 0))
+            .and_then(Object::as_dict)
+            .unwrap();
         assert_eq!(
             t0.get(b"Subtype").and_then(Object::as_name),
             Some(b"Type0".as_slice())
         );
-        let desc_ref = match &t0.get(b"DescendantFonts").and_then(Object::as_array).unwrap()[0] {
+        let desc_ref = match &t0
+            .get(b"DescendantFonts")
+            .and_then(Object::as_array)
+            .unwrap()[0]
+        {
             Object::Reference(id) => *id,
             _ => panic!("descendant is a reference"),
         };
-        let cid = doc.objects.get(&desc_ref).and_then(Object::as_dict).unwrap();
+        let cid = doc
+            .objects
+            .get(&desc_ref)
+            .and_then(Object::as_dict)
+            .unwrap();
         assert_eq!(
             cid.get(b"Subtype").and_then(Object::as_name),
             Some(b"CIDFontType0".as_slice()),
@@ -15389,7 +16021,11 @@ mod tests {
             Object::Reference(id) => *id,
             _ => panic!(),
         };
-        let ff = doc.objects.get(&ff_ref).and_then(Object::as_stream).unwrap();
+        let ff = doc
+            .objects
+            .get(&ff_ref)
+            .and_then(Object::as_stream)
+            .unwrap();
         assert_eq!(
             ff.dict.get(b"Subtype").and_then(Object::as_name),
             Some(b"OpenType".as_slice()),
@@ -15438,16 +16074,28 @@ mod tests {
         assert_ne!(font, 0, "non-zero Type0 object id");
 
         // The descendant is a CFF-flavoured CIDFontType0 (Type1 → CFF route).
-        let t0 = doc.objects.get(&(font, 0)).and_then(Object::as_dict).unwrap();
+        let t0 = doc
+            .objects
+            .get(&(font, 0))
+            .and_then(Object::as_dict)
+            .unwrap();
         assert_eq!(
             t0.get(b"Subtype").and_then(Object::as_name),
             Some(b"Type0".as_slice())
         );
-        let desc_ref = match &t0.get(b"DescendantFonts").and_then(Object::as_array).unwrap()[0] {
+        let desc_ref = match &t0
+            .get(b"DescendantFonts")
+            .and_then(Object::as_array)
+            .unwrap()[0]
+        {
             Object::Reference(id) => *id,
             _ => panic!("descendant is a reference"),
         };
-        let cid = doc.objects.get(&desc_ref).and_then(Object::as_dict).unwrap();
+        let cid = doc
+            .objects
+            .get(&desc_ref)
+            .and_then(Object::as_dict)
+            .unwrap();
         assert_eq!(
             cid.get(b"Subtype").and_then(Object::as_name),
             Some(b"CIDFontType0".as_slice()),
@@ -15543,7 +16191,9 @@ mod tests {
         }
         // Minimal (dummy) xref + trailer: open() locates objects by scanning and
         // the catalog via `trailer /Root`, so the offsets need not be accurate.
-        out.push_str("xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF");
+        out.push_str(
+            "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF",
+        );
         out.into_bytes()
     }
 
@@ -15569,7 +16219,10 @@ mod tests {
             ),
             (
                 4,
-                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
             ),
             (
                 5,
@@ -15581,7 +16234,10 @@ mod tests {
                     form_stream.len()
                 ),
             ),
-            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
         ])
     }
 
@@ -15594,7 +16250,10 @@ mod tests {
             .into_iter()
             .map(|r| r.text)
             .collect();
-        assert!(texts.iter().any(|t| t == "PAGE"), "top-level text present: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "PAGE"),
+            "top-level text present: {texts:?}"
+        );
         assert!(
             texts.iter().any(|t| t == "FORM"),
             "form-XObject text must be extracted via Do recursion: {texts:?}"
@@ -15606,24 +16265,41 @@ mod tests {
         let doc = Document::open(&form_xobject_fixture()).unwrap();
         let els = doc.page_text_elements(1);
 
-        let page = els.iter().find(|e| e.text == "PAGE").expect("top-level PAGE element");
+        let page = els
+            .iter()
+            .find(|e| e.text == "PAGE")
+            .expect("top-level PAGE element");
         // Top-level run keeps an editable text-run index (0 here, the first run).
         assert_eq!(page.index, 0, "top-level run index feeds replace_text_run");
         assert!((page.x - 50.0).abs() < 1.0, "PAGE x≈50, got {}", page.x);
 
-        let form = els.iter().find(|e| e.text == "FORM").expect("form-XObject FORM element");
+        let form = els
+            .iter()
+            .find(|e| e.text == "FORM")
+            .expect("form-XObject FORM element");
         // Page space = form unit → /Matrix(10,20) → cm(30,40) = translate(40,60).
         // Form baseline (5,5) → (45, 65); bounds.y is the descender (−0.2·12).
-        assert!((form.x - 45.0).abs() < 1.0, "FORM x≈45 (page space), got {}", form.x);
+        assert!(
+            (form.x - 45.0).abs() < 1.0,
+            "FORM x≈45 (page space), got {}",
+            form.x
+        );
         assert!(
             (form.y - 62.6).abs() < 2.5,
             "FORM y≈62.6 (page space, descender of baseline 65), got {}",
             form.y
         );
-        assert!(form.width > 0.0 && form.height > 0.0, "FORM has positive size");
+        assert!(
+            form.width > 0.0 && form.height > 0.0,
+            "FORM has positive size"
+        );
         // Form text is not editable in place → sentinel index, which
         // replace_text_run rejects rather than misrouting to a top-level run.
-        assert_eq!(form.index, usize::MAX, "form-XObject text carries the sentinel index");
+        assert_eq!(
+            form.index,
+            usize::MAX,
+            "form-XObject text carries the sentinel index"
+        );
         assert!(
             doc.clone().replace_text_run(1, form.index, "x").is_err(),
             "editing a form-XObject run is a safe no-op error, not a wrong-run edit"
@@ -15657,14 +16333,23 @@ mod tests {
                     form_stream.len()
                 ),
             ),
-            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
         ]);
         let doc = Document::open(&pdf).unwrap();
         // Must return (no infinite loop / panic) and surface the form text.
         let runs = doc.page_text_runs(1).unwrap();
-        assert!(runs.iter().any(|r| r.text == "LOOP"), "self-ref form text extracted once: {runs:?}");
+        assert!(
+            runs.iter().any(|r| r.text == "LOOP"),
+            "self-ref form text extracted once: {runs:?}"
+        );
         let els = doc.page_text_elements(1);
-        assert!(els.iter().any(|e| e.text == "LOOP"), "self-ref form text in elements");
+        assert!(
+            els.iter().any(|e| e.text == "LOOP"),
+            "self-ref form text in elements"
+        );
     }
 
     #[test]
@@ -15695,7 +16380,10 @@ mod tests {
                     a_stream.len()
                 ),
             ),
-            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
             (
                 7,
                 format!(
@@ -15709,8 +16397,14 @@ mod tests {
         let doc = Document::open(&pdf).unwrap();
         let runs = doc.page_text_runs(1).unwrap();
         // Both forms' text appears and extraction terminates (no hang/panic).
-        assert!(runs.iter().any(|r| r.text == "AAA"), "FmA text extracted: {runs:?}");
-        assert!(runs.iter().any(|r| r.text == "BBB"), "FmB text extracted: {runs:?}");
+        assert!(
+            runs.iter().any(|r| r.text == "AAA"),
+            "FmA text extracted: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.text == "BBB"),
+            "FmB text extracted: {runs:?}"
+        );
     }
 
     // ── form-XObject FLATTENING (`flatten_form_xobjects`) ────────────────────
@@ -15725,16 +16419,30 @@ mod tests {
         assert_eq!(n, 1, "exactly one form XObject inlined");
 
         let els = doc.page_text_elements(1);
-        let form = els.iter().find(|e| e.text == "FORM").expect("FORM still present after flatten");
-        assert_ne!(form.index, usize::MAX, "form text now carries a real, editable index");
+        let form = els
+            .iter()
+            .find(|e| e.text == "FORM")
+            .expect("FORM still present after flatten");
+        assert_ne!(
+            form.index,
+            usize::MAX,
+            "form text now carries a real, editable index"
+        );
         // Page space = form unit → /Matrix(10,20) → cm(30,40) = translate(40,60);
         // baseline (5,5) → (45,65). Position must survive the inlining `cm`.
-        assert!((form.x - 45.0).abs() < 1.0, "FORM x≈45 (page space) after flatten, got {}", form.x);
+        assert!(
+            (form.x - 45.0).abs() < 1.0,
+            "FORM x≈45 (page space) after flatten, got {}",
+            form.x
+        );
 
         // The new index drives replace_text_run end-to-end.
         doc.replace_text_run(1, form.index, "DONE").unwrap();
         let text = doc.to_text();
-        assert!(text.contains("DONE"), "edited form text via real index: {text:?}");
+        assert!(
+            text.contains("DONE"),
+            "edited form text via real index: {text:?}"
+        );
         assert!(!text.contains("FORM"), "old form text replaced");
         assert!(text.contains("PAGE"), "top-level text untouched");
 
@@ -15747,15 +16455,17 @@ mod tests {
             .and_then(Object::as_dict)
             .map(|x| x.contains(b"Fm0"))
             .unwrap_or(false);
-        assert!(!still_xobj, "inlined form /Fm0 dropped from page XObject resources");
+        assert!(
+            !still_xobj,
+            "inlined form /Fm0 dropped from page XObject resources"
+        );
     }
 
     /// A page that places the SAME form XObject TWICE, at two different `cm`
     /// translations. Each placement must inline its own copy (de-shared).
     fn form_placed_twice_fixture() -> Vec<u8> {
         // Draw /Fm0 once at translate(0,0) and once at translate(0,100).
-        let page_stream =
-            "q 1 0 0 1 0 0 cm /Fm0 Do Q\nq 1 0 0 1 0 100 cm /Fm0 Do Q";
+        let page_stream = "q 1 0 0 1 0 0 cm /Fm0 Do Q\nq 1 0 0 1 0 100 cm /Fm0 Do Q";
         let form_stream = "BT /F1 12 Tf 5 5 Td (DUP) Tj ET";
         raw_pdf(&[
             (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
@@ -15769,7 +16479,10 @@ mod tests {
             ),
             (
                 4,
-                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
             ),
             (
                 5,
@@ -15780,7 +16493,10 @@ mod tests {
                     form_stream.len()
                 ),
             ),
-            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
         ])
     }
 
@@ -15803,8 +16519,15 @@ mod tests {
         // Editing one copy must NOT change the other.
         let lower = dups.iter().min_by(|a, b| a.y.total_cmp(&b.y)).unwrap();
         doc.replace_text_run(1, lower.index, "ONE").unwrap();
-        let after: Vec<String> = doc.page_text_elements(1).into_iter().map(|e| e.text).collect();
-        assert!(after.iter().any(|t| t == "ONE"), "edited copy changed: {after:?}");
+        let after: Vec<String> = doc
+            .page_text_elements(1)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert!(
+            after.iter().any(|t| t == "ONE"),
+            "edited copy changed: {after:?}"
+        );
         assert!(
             after.iter().filter(|t| *t == "DUP").count() == 1,
             "the other copy is untouched (still 'DUP'): {after:?}"
@@ -15830,7 +16553,10 @@ mod tests {
             ),
             (
                 4,
-                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
             ),
             (
                 5,
@@ -15841,8 +16567,14 @@ mod tests {
                     form_stream.len()
                 ),
             ),
-            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
-            (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                7,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".into(),
+            ),
         ]);
         let mut doc = Document::open(&pdf).unwrap();
         assert_eq!(doc.flatten_form_xobjects(1).unwrap(), 1);
@@ -15872,7 +16604,10 @@ mod tests {
             .and_then(Object::as_dict)
             .map(|f| f.0.keys().cloned().collect())
             .unwrap_or_default();
-        assert!(font_names.contains(&b"F1".to_vec()), "page F1 kept: {font_names:?}");
+        assert!(
+            font_names.contains(&b"F1".to_vec()),
+            "page F1 kept: {font_names:?}"
+        );
         assert!(
             font_names.iter().any(|n| n.starts_with(b"F1_fx")),
             "colliding form font copied under a fresh name: {font_names:?}"
@@ -15913,7 +16648,10 @@ mod tests {
                     a_stream.len()
                 ),
             ),
-            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
             (
                 7,
                 format!(
@@ -15928,9 +16666,19 @@ mod tests {
         // FmA (1) + nested FmB (1) inlined.
         let n = doc.flatten_form_xobjects(1).unwrap();
         assert_eq!(n, 2, "outer + nested form both inlined");
-        let texts: Vec<String> = doc.page_text_elements(1).into_iter().map(|e| e.text).collect();
-        assert!(texts.iter().any(|t| t == "AOUT"), "outer form text inlined: {texts:?}");
-        assert!(texts.iter().any(|t| t == "BINNER"), "nested form text inlined: {texts:?}");
+        let texts: Vec<String> = doc
+            .page_text_elements(1)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "AOUT"),
+            "outer form text inlined: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "BINNER"),
+            "nested form text inlined: {texts:?}"
+        );
 
         // A self-referencing form must terminate without hanging or panicking.
         let loop_stream = "BT /F1 12 Tf 5 5 Td (LOOP) Tj ET\n/Fm0 Do";
@@ -15957,13 +16705,23 @@ mod tests {
                     loop_stream.len()
                 ),
             ),
-            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
         ]);
         let mut cdoc = Document::open(&cyc).unwrap();
         let cn = cdoc.flatten_form_xobjects(1).unwrap(); // must return, not hang
         assert!(cn >= 1, "self-ref form inlined at least once");
-        let ctexts: Vec<String> = cdoc.page_text_elements(1).into_iter().map(|e| e.text).collect();
-        assert!(ctexts.iter().any(|t| t == "LOOP"), "self-ref form text present once-ish: {ctexts:?}");
+        let ctexts: Vec<String> = cdoc
+            .page_text_elements(1)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert!(
+            ctexts.iter().any(|t| t == "LOOP"),
+            "self-ref form text present once-ish: {ctexts:?}"
+        );
     }
 
     #[test]
@@ -15988,7 +16746,10 @@ mod tests {
             ),
             (
                 4,
-                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
             ),
             (5, img_obj.into()),
         ]);
@@ -16026,7 +16787,10 @@ mod tests {
             ),
             (
                 4,
-                format!("<< /Length {} >> stream\n{page_stream}\nendstream", page_stream.len()),
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
             ),
         ];
         objects.extend(extra_objects.iter().cloned());
@@ -16065,7 +16829,11 @@ mod tests {
             "form square centre must be blue, got {c:?}"
         );
         // A corner outside the square stays white paper.
-        assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the form square is white");
+        assert_eq!(
+            px(&canvas, 5, 5),
+            [255, 255, 255],
+            "outside the form square is white"
+        );
     }
 
     /// Assemble a PDF from binary object bodies with a real cross-reference
@@ -16100,11 +16868,8 @@ mod tests {
 
     /// A `/FontFile3` (Type1C) stream object body wrapping the given CFF bytes.
     fn fontfile3_obj(cff: &[u8]) -> Vec<u8> {
-        let mut body = format!(
-            "<< /Length {} /Subtype /Type1C >>\nstream\n",
-            cff.len()
-        )
-        .into_bytes();
+        let mut body =
+            format!("<< /Length {} /Subtype /Type1C >>\nstream\n", cff.len()).into_bytes();
         body.extend_from_slice(cff);
         body.extend_from_slice(b"\nendstream");
         body
@@ -16155,8 +16920,7 @@ mod tests {
             let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
                          /Resources << /Font << /F0 8 0 R >> >> /Contents 4 0 R >>"
                 .to_vec();
-            let mut content =
-                format!("<< /Length {} >>\nstream\n", show.len()).into_bytes();
+            let mut content = format!("<< /Length {} >>\nstream\n", show.len()).into_bytes();
             content.extend_from_slice(&show);
             content.extend_from_slice(b"\nendstream");
             objects.push((3, page));
@@ -16203,7 +16967,10 @@ mod tests {
             // / solid fill would). Width/height of the inked box stays modest.
             let w = cols.last().unwrap() - cols.first().unwrap() + 1;
             let h = rows.last().unwrap() - rows.first().unwrap() + 1;
-            assert!(w >= 3 && h >= 3, "nested={nested}: glyph spans a 2-D region ({w}x{h})");
+            assert!(
+                w >= 3 && h >= 3,
+                "nested={nested}: glyph spans a 2-D region ({w}x{h})"
+            );
             assert!(
                 (dark as u32) < canvas.width * canvas.height / 2,
                 "nested={nested}: glyph is an outline, not a page-filling box"
@@ -16295,8 +17062,7 @@ mod tests {
                       /Resources << /XObject << /Im0 6 0 R >> >> /Contents 4 0 R >>"
                         .to_vec(),
                 ));
-                let mut content =
-                    format!("<< /Length {} >>\nstream\n", draw.len()).into_bytes();
+                let mut content = format!("<< /Length {} >>\nstream\n", draw.len()).into_bytes();
                 content.extend_from_slice(&draw);
                 content.extend_from_slice(b"\nendstream");
                 objects.push((4, content));
@@ -16341,11 +17107,7 @@ mod tests {
         // Clip to a 30×30 box (user 10..40), then fill the WHOLE page red. Only
         // the clipped region may receive ink — content outside the `W n` clip
         // must be absent (stay white).
-        let canvas = render_canvas(
-            "10 10 30 30 re W n 1 0 0 rg 0 0 100 100 re f",
-            "",
-            &[],
-        );
+        let canvas = render_canvas("10 10 30 30 re W n 1 0 0 rg 0 0 100 100 re f", "", &[]);
         // Inside the clip (user (25,25) → device (25, 75)) is red.
         let inside = px(&canvas, 25, 75);
         assert!(
@@ -16353,8 +17115,16 @@ mod tests {
             "inside the clip must be red, got {inside:?}"
         );
         // Outside the clip stays white despite the full-page fill.
-        assert_eq!(px(&canvas, 80, 20), [255, 255, 255], "outside the clip is unpainted");
-        assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the clip is unpainted");
+        assert_eq!(
+            px(&canvas, 80, 20),
+            [255, 255, 255],
+            "outside the clip is unpainted"
+        );
+        assert_eq!(
+            px(&canvas, 5, 5),
+            [255, 255, 255],
+            "outside the clip is unpainted"
+        );
     }
 
     #[test]
@@ -16401,8 +17171,14 @@ mod tests {
         // Sanity: with the default Normal blend the same overlay stays grey.
         let normal = render_canvas("0.5 g 0 0 100 100 re f 0.5 g 0 0 100 100 re f", "", &[]);
         let n = px(&normal, 50, 50);
-        assert!(n[0] > 110, "Normal-blend overlay stays mid-grey (~128), got {n:?}");
-        assert!(c[0] + 30 < n[0], "Multiply ({c:?}) must be darker than Normal ({n:?})");
+        assert!(
+            n[0] > 110,
+            "Normal-blend overlay stays mid-grey (~128), got {n:?}"
+        );
+        assert!(
+            c[0] + 30 < n[0],
+            "Multiply ({c:?}) must be darker than Normal ({n:?})"
+        );
     }
 
     #[test]
@@ -16438,7 +17214,11 @@ mod tests {
             "left half (mask=white) must show red, got {left:?}"
         );
         // Right half (mask alpha 0) is masked out → white paper.
-        assert_eq!(px(&canvas, 75, 50), [255, 255, 255], "right half (mask=black) is masked out");
+        assert_eq!(
+            px(&canvas, 75, 50),
+            [255, 255, 255],
+            "right half (mask=black) is masked out"
+        );
     }
 
     #[test]
@@ -16463,7 +17243,11 @@ mod tests {
             "shading-pattern fill must vary across x (left {left}, right {right})"
         );
         // Outside the filled path stays white paper.
-        assert_eq!(px(&canvas, 5, 5), [255, 255, 255], "outside the pattern-filled path is white");
+        assert_eq!(
+            px(&canvas, 5, 5),
+            [255, 255, 255],
+            "outside the pattern-filled path is white"
+        );
     }
 
     // ─── colour spaces (#67) + non-RGB images (#73) ──────────────────────────
@@ -16486,7 +17270,10 @@ mod tests {
         let page2 = "/Sep cs 0.5 scn 20 20 60 60 re f";
         let canvas2 = render_canvas(page2, resources, &[]);
         let g = px(&canvas2, 50, 50)[0];
-        assert!((100..=160).contains(&g), "half-tint must be ~mid-grey, got {g}");
+        assert!(
+            (100..=160).contains(&g),
+            "half-tint must be ~mid-grey, got {g}"
+        );
     }
 
     #[test]
@@ -16527,7 +17314,10 @@ mod tests {
         // Index 0 → red.
         let page0 = "/Idx cs 0 scn 20 20 60 60 re f";
         let c0 = px(&render_canvas(page0, resources, &[]), 50, 50);
-        assert!(c0[0] > 200 && c0[1] < 40, "Indexed index 0 must be red, got {c0:?}");
+        assert!(
+            c0[0] > 200 && c0[1] < 40,
+            "Indexed index 0 must be red, got {c0:?}"
+        );
     }
 
     #[test]
@@ -16539,7 +17329,10 @@ mod tests {
         let page = "/CSr cs 0 0 1 scn 20 20 60 60 re f";
         let canvas = render_canvas(page, resources, &[(7, icc.to_string())]);
         let c = px(&canvas, 50, 50);
-        assert!(c[2] > 200 && c[0] < 40 && c[1] < 40, "ICCBased N3 (0,0,1) must be blue, got {c:?}");
+        assert!(
+            c[2] > 200 && c[0] < 40 && c[1] < 40,
+            "ICCBased N3 (0,0,1) must be blue, got {c:?}"
+        );
     }
 
     /// Build a single-image PDF whose `/Im0` is drawn over a 60×60 box and render
@@ -16589,7 +17382,11 @@ mod tests {
             body.extend_from_slice(format!("{b:02X} ").as_bytes());
         }
         body.extend_from_slice(
-            format!("> ] /BitsPerComponent 8 /Length {} >>\nstream\n", samples.len()).as_bytes(),
+            format!(
+                "> ] /BitsPerComponent 8 /Length {} >>\nstream\n",
+                samples.len()
+            )
+            .as_bytes(),
         );
         body.extend_from_slice(&samples);
         body.extend_from_slice(b"\nendstream");
@@ -16597,8 +17394,14 @@ mod tests {
         // Device box spans x,y 20..80; left third red, right third blue.
         let left = px(&canvas, 30, 50);
         let right = px(&canvas, 70, 50);
-        assert!(left[0] > 200 && left[2] < 60, "Indexed image left half must be red, got {left:?}");
-        assert!(right[2] > 200 && right[0] < 60, "Indexed image right half must be blue, got {right:?}");
+        assert!(
+            left[0] > 200 && left[2] < 60,
+            "Indexed image left half must be red, got {left:?}"
+        );
+        assert!(
+            right[2] > 200 && right[0] < 60,
+            "Indexed image right half must be blue, got {right:?}"
+        );
     }
 
     #[test]
@@ -16682,8 +17485,14 @@ mod tests {
         let canvas = doc.render_page_canvas(1, 1.0, false).unwrap();
         let left = px(&canvas, 30, 50);
         let right = px(&canvas, 70, 50);
-        assert!(left[1] > 200 && left[0] < 60, "ICCBased N3 image left must be green, got {left:?}");
-        assert!(right[0] > 200 && right[1] < 60, "ICCBased N3 image right must be red, got {right:?}");
+        assert!(
+            left[1] > 200 && left[0] < 60,
+            "ICCBased N3 image left must be green, got {left:?}"
+        );
+        assert!(
+            right[0] > 200 && right[1] < 60,
+            "ICCBased N3 image right must be red, got {right:?}"
+        );
     }
 
     // ─── margins + running header/footer ─────────────────────────────────────
@@ -16843,17 +17652,25 @@ mod tests {
             .into_iter()
             .find(|e| e.text.contains("Foot 1"))
             .expect("footer text present on page 1");
-        assert!(hit.y < 36.0, "footer baseline y should be in the bottom band, got {}", hit.y);
+        assert!(
+            hit.y < 36.0,
+            "footer baseline y should be in the bottom band, got {}",
+            hit.y
+        );
         // remove_footers clears it; remove_headers must NOT touch the footer.
         let mut doc2 = reopened;
         doc2.remove_headers().unwrap();
         assert!(
-            doc2.page_text_elements(1).iter().any(|e| e.text.contains("Foot 1")),
+            doc2.page_text_elements(1)
+                .iter()
+                .any(|e| e.text.contains("Foot 1")),
             "remove_headers must leave footers intact"
         );
         doc2.remove_footers().unwrap();
         assert!(
-            doc2.page_text_elements(1).iter().all(|e| !e.text.contains("Foot 1")),
+            doc2.page_text_elements(1)
+                .iter()
+                .all(|e| !e.text.contains("Foot 1")),
             "remove_footers must strip the footer"
         );
     }
@@ -16869,10 +17686,16 @@ mod tests {
         })
         .unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
-        assert!(reopened.page_text_elements(1).iter().all(|e| !e.text.contains("R 1")));
+        assert!(reopened
+            .page_text_elements(1)
+            .iter()
+            .all(|e| !e.text.contains("R 1")));
         assert!(header_present(&reopened, 2, "R 2", h, 36.0));
         assert!(header_present(&reopened, 3, "R 3", h, 36.0));
-        assert!(reopened.page_text_elements(4).iter().all(|e| !e.text.contains("R 4")));
+        assert!(reopened
+            .page_text_elements(4)
+            .iter()
+            .all(|e| !e.text.contains("R 4")));
     }
 
     #[test]
@@ -16990,7 +17813,10 @@ mod tests {
         assert_eq!(paths.len(), 1, "the Separation-filled path must be emitted");
         let fill = paths[0].fill.expect("a fill colour");
         for (ch, v) in fill.iter().enumerate() {
-            assert!(*v < 1e-9, "Separation tint=1 → black, channel {ch} = {v} (got {fill:?})");
+            assert!(
+                *v < 1e-9,
+                "Separation tint=1 → black, channel {ch} = {v} (got {fill:?})"
+            );
         }
     }
 
@@ -17081,7 +17907,13 @@ mod tests {
                  /Resources << /Font << /F1 6 0 R /F2 9 0 R >> >> /Contents 4 0 R >>"
                     .into(),
             ),
-            (4, format!("<< /Length {} >> stream\n{content}\nendstream", content.len())),
+            (
+                4,
+                format!(
+                    "<< /Length {} >> stream\n{content}\nendstream",
+                    content.len()
+                ),
+            ),
             // F1: Type0 + descendant CIDFontType2, ToUnicode = obj 7. No FontFile,
             // so the embedded-cmap fallback is unavailable — recovery is via the
             // inferred affine offset alone (exactly the s1106 situation).
@@ -17091,7 +17923,13 @@ mod tests {
                  /Encoding /Identity-H /DescendantFonts [8 0 R] /ToUnicode 7 0 R >>"
                     .into(),
             ),
-            (7, format!("<< /Length {} >> stream\n{tounicode}\nendstream", tounicode.len())),
+            (
+                7,
+                format!(
+                    "<< /Length {} >> stream\n{tounicode}\nendstream",
+                    tounicode.len()
+                ),
+            ),
             (
                 8,
                 "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /AAAAAA+TimesNewRoman \
@@ -17150,7 +17988,10 @@ mod tests {
                  /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>"
                     .into(),
             ),
-            (4, format!("<< /Length {} >> stream\n{stream}\nendstream", stream.len())),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{stream}\nendstream", stream.len()),
+            ),
             (
                 6,
                 "<< /Type /Font /Subtype /TrueType /BaseFont /Helvetica \
@@ -17182,8 +18023,24 @@ mod tests {
         for _ in 0..2 {
             let page = b.add_page(612.0, 792.0);
             b.text(page, 72.0, 80.0, 24.0, "A Page Title", f, [0.0; 3]);
-            b.text(page, 72.0, 160.0, 12.0, "First body line of text here.", f, [0.0; 3]);
-            b.text(page, 72.0, 176.0, 12.0, "Second body line follows along.", f, [0.0; 3]);
+            b.text(
+                page,
+                72.0,
+                160.0,
+                12.0,
+                "First body line of text here.",
+                f,
+                [0.0; 3],
+            );
+            b.text(
+                page,
+                72.0,
+                176.0,
+                12.0,
+                "Second body line follows along.",
+                f,
+                [0.0; 3],
+            );
         }
         let doc = Document::open(&b.finish()).unwrap();
 
@@ -17204,21 +18061,31 @@ mod tests {
             let blocks = doc.page_blocks(page_no);
             // Each page reconstructs to a heading + a paragraph.
             assert!(
-                blocks.iter().any(|bl| matches!(bl.kind, BlockKind::Heading(_))),
+                blocks
+                    .iter()
+                    .any(|bl| matches!(bl.kind, BlockKind::Heading(_))),
                 "page {page_no} has a heading: {blocks:?}"
             );
             assert!(
-                blocks.iter().any(|bl| matches!(bl.kind, BlockKind::Paragraph(_))),
+                blocks
+                    .iter()
+                    .any(|bl| matches!(bl.kind, BlockKind::Paragraph(_))),
                 "page {page_no} has a paragraph"
             );
             // Frames are present (top-down) and text runs carry a source index.
-            assert!(blocks.iter().all(|bl| bl.frame.is_some()), "every block framed");
+            assert!(
+                blocks.iter().all(|bl| bl.frame.is_some()),
+                "every block framed"
+            );
 
             // Same block-kind sequence as reconstruct_model's matching page.
             let mp = model_pages.next().expect("a model page per source page");
             let want: Vec<String> = mp.blocks.iter().map(|bl| strip(&bl.kind)).collect();
             let got: Vec<String> = blocks.iter().map(|bl| strip(&bl.kind)).collect();
-            assert_eq!(got, want, "page {page_no} block kinds match reconstruct_model");
+            assert_eq!(
+                got, want,
+                "page {page_no} block kinds match reconstruct_model"
+            );
         }
 
         // Out-of-range page → empty, never panics.

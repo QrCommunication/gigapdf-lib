@@ -35,10 +35,10 @@ use super::der::{
 use crate::crypto::aes::aes_cbc_decrypt;
 use crate::crypto::des::des3_cbc_decrypt;
 use crate::crypto::hmac::{hmac_sha1, hmac_sha256};
-use crate::crypto::rc2::rc2_cbc_decrypt;
 use crate::crypto::kdf::{
     bmp_string, pbkdf2_hmac_sha1, pbkdf2_hmac_sha256, pkcs12_kdf_sha1, pkcs12_kdf_sha256,
 };
+use crate::crypto::rc2::rc2_cbc_decrypt;
 use crate::crypto::rsa::RsaPrivateKey;
 
 // ─── Object identifiers (RFC 7292 / 5208 / 8018) ─────────────────────────────
@@ -100,7 +100,10 @@ pub fn parse(pfx: &[u8], password: &str) -> Result<Pkcs12Identity, Pkcs12Error> 
         return Err(Malformed);
     }
     let mut explicit = ci.descend(TAG_CONTEXT_0).ok_or(Malformed)?;
-    let auth_safe = explicit.next_tag(TAG_OCTET_STRING).ok_or(Malformed)?.content;
+    let auth_safe = explicit
+        .next_tag(TAG_OCTET_STRING)
+        .ok_or(Malformed)?
+        .content;
 
     // macData (optional) — verify before trusting any decrypted content.
     if let Some(mac_data) = pfx_seq.read() {
@@ -190,8 +193,8 @@ fn decrypt_encrypted_data(body: &mut Reader, password: &str) -> Option<Vec<u8>> 
     let enc_data = body.next_tag(TAG_SEQUENCE)?;
     let mut ed = enc_data.reader();
     ed.next_tag(TAG_INTEGER)?; // version
-    // EncryptedContentInfo ::= SEQUENCE { contentType OID, contentEncryptionAlgorithm,
-    //                                     [0] IMPLICIT OCTET STRING encryptedContent }
+                               // EncryptedContentInfo ::= SEQUENCE { contentType OID, contentEncryptionAlgorithm,
+                               //                                     [0] IMPLICIT OCTET STRING encryptedContent }
     let eci = ed.next_tag(TAG_SEQUENCE)?;
     let mut e = eci.reader();
     e.next_tag(TAG_OID)?; // contentType (data)
@@ -475,13 +478,22 @@ mod tests {
 
     #[test]
     fn wrong_password_is_rejected_by_the_mac() {
-        assert!(matches!(parse(MODERN_P12, "wrong"), Err(Pkcs12Error::MacMismatch)));
-        assert!(matches!(parse(LEGACY_P12, "nope"), Err(Pkcs12Error::MacMismatch)));
+        assert!(matches!(
+            parse(MODERN_P12, "wrong"),
+            Err(Pkcs12Error::MacMismatch)
+        ));
+        assert!(matches!(
+            parse(LEGACY_P12, "nope"),
+            Err(Pkcs12Error::MacMismatch)
+        ));
     }
 
     #[test]
     fn garbage_is_malformed_not_a_panic() {
-        assert!(matches!(parse(b"not a pfx at all", PASSWORD), Err(Pkcs12Error::Malformed)));
+        assert!(matches!(
+            parse(b"not a pfx at all", PASSWORD),
+            Err(Pkcs12Error::Malformed)
+        ));
         assert!(matches!(
             parse(&[0x30, 0x03, 0x02, 0x01, 0x03], PASSWORD),
             Err(Pkcs12Error::Malformed)

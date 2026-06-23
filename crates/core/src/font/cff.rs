@@ -151,7 +151,8 @@ const N_STANDARD_STRINGS: usize = 391;
 // compile time, so each fragment stays small.
 const STD_A: &str = ".notdef space exclam quotedbl numbersign dollar percent ampersand quoteright parenleft parenright asterisk plus comma hyphen period slash zero one two three four five six seven eight nine colon semicolon less equal greater question at";
 const STD_B: &str = "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z bracketleft backslash bracketright asciicircum underscore quoteleft";
-const STD_C: &str = "a b c d e f g h i j k l m n o p q r s t u v w x y z braceleft bar braceright asciitilde";
+const STD_C: &str =
+    "a b c d e f g h i j k l m n o p q r s t u v w x y z braceleft bar braceright asciitilde";
 const STD_D: &str = "exclamdown cent sterling fraction yen florin section currency quotesingle quotedblleft guillemotleft guilsinglleft guilsinglright fi fl endash dagger daggerdbl periodcentered paragraph bullet quotesinglbase quotedblbase quotedblright guillemotright ellipsis perthousand questiondown grave acute circumflex tilde macron breve dotaccent dieresis ring cedilla hungarumlaut ogonek caron emdash";
 const STD_E: &str = "AE ordfeminine Lslash Oslash OE ordmasculine ae dotlessi lslash oslash oe germandbls onesuperior logicalnot mu trademark Eth onehalf plusminus Thorn onequarter divide brokenbar degree thorn threequarters twosuperior registered minus eth multiply threesuperior copyright";
 const STD_F: &str = "Aacute Acircumflex Adieresis Agrave Aring Atilde Ccedilla Eacute Ecircumflex Edieresis Egrave Iacute Icircumflex Idieresis Igrave Ntilde Oacute Ocircumflex Odieresis Ograve Otilde Scaron Uacute Ucircumflex Udieresis Ugrave Yacute Ydieresis Zcaron aacute acircumflex adieresis agrave aring atilde ccedilla eacute ecircumflex edieresis egrave iacute icircumflex idieresis igrave ntilde oacute ocircumflex odieresis ograve otilde scaron uacute ucircumflex udieresis ugrave yacute ydieresis zcaron";
@@ -280,10 +281,7 @@ impl CffFont {
         if gid == 0 {
             return 0;
         }
-        self.charset
-            .get(gid as usize)
-            .copied()
-            .unwrap_or(gid)
+        self.charset.get(gid as usize).copied().unwrap_or(gid)
     }
 
     /// Build a glyph-**name** → glyph-id map from the charset, so a simple
@@ -949,7 +947,11 @@ mod tests {
         let cff = CffFont::parse(&bytes).expect("hand-built CFF must parse");
         assert_eq!(cff.num_glyphs(), 2, ".notdef + A");
         assert!(!cff.is_cid(), "name-keyed");
-        assert_eq!(cff.sid_name(cff.gid_to_sid(1)), Some("A"), "gid 1 is named A");
+        assert_eq!(
+            cff.sid_name(cff.gid_to_sid(1)),
+            Some("A"),
+            "gid 1 is named A"
+        );
 
         // The fix's resolution maps: name "A" → gid 1, and Unicode U+0041 → gid 1.
         let n2g = cff.name_to_gid_map();

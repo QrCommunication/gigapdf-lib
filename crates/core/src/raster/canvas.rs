@@ -204,7 +204,14 @@ impl Canvas {
     /// mixed with the backdrop by the coverage `alpha` (the source is opaque, so
     /// the Porter-Duff result reduces to `lerp(backdrop, B, alpha)`).
     /// `mode == Normal` is plain source-over.
-    pub(crate) fn blend_mode(&mut self, x: i32, y: i32, color: [u8; 3], alpha: f64, mode: BlendMode) {
+    pub(crate) fn blend_mode(
+        &mut self,
+        x: i32,
+        y: i32,
+        color: [u8; 3],
+        alpha: f64,
+        mode: BlendMode,
+    ) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 || alpha <= 0.0 {
             return;
         }

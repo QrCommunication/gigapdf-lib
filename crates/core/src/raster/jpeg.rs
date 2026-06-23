@@ -326,8 +326,20 @@ pub fn encode_jpeg(width: u32, height: u32, rgba: &[u8], quality: u32) -> Vec<u8
             }
             for (blk, q, dc, dct, act) in [
                 (&mut yb, &lq, &mut dc_y, &tables.dc_luma, &tables.ac_luma),
-                (&mut cbb, &cq, &mut dc_cb, &tables.dc_chroma, &tables.ac_chroma),
-                (&mut crb, &cq, &mut dc_cr, &tables.dc_chroma, &tables.ac_chroma),
+                (
+                    &mut cbb,
+                    &cq,
+                    &mut dc_cb,
+                    &tables.dc_chroma,
+                    &tables.ac_chroma,
+                ),
+                (
+                    &mut crb,
+                    &cq,
+                    &mut dc_cr,
+                    &tables.dc_chroma,
+                    &tables.ac_chroma,
+                ),
             ] {
                 transform_2d(blk, dct_ii);
                 let mut coeffs = [0i32; 64];
@@ -347,7 +359,7 @@ pub fn encode_jpeg(width: u32, height: u32, rgba: &[u8], quality: u32) -> Vec<u8
 fn assemble(width: u32, height: u32, lq: &[u16; 64], cq: &[u16; 64], scan: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(scan.len() + 640);
     out.extend_from_slice(&[0xFF, 0xD8]); // SOI
-    // APP0 / JFIF.
+                                          // APP0 / JFIF.
     out.extend_from_slice(&[
         0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00,
         0x01, 0x00, 0x00,
@@ -361,7 +373,9 @@ fn assemble(width: u32, height: u32, lq: &[u16; 64], cq: &[u16; 64], scan: &[u8]
     }
     // SOF0 — baseline, 3 components, all 1×1 sampling (4:4:4).
     let (hb, wb) = (height.to_be_bytes(), width.to_be_bytes());
-    out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, hb[2], hb[3], wb[2], wb[3], 0x03]);
+    out.extend_from_slice(&[
+        0xFF, 0xC0, 0x00, 0x11, 0x08, hb[2], hb[3], wb[2], wb[3], 0x03,
+    ]);
     out.extend_from_slice(&[0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
     // DHT — four tables.
     for (class_id, bits, vals) in [
@@ -613,7 +627,9 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                     continue;
                 }
                 // Baseline: a single interleaved scan decodes the whole image.
-                return decode_scan(data, pos, width, height, &mut comps, &quant, &dc_tabs, &ac_tabs);
+                return decode_scan(
+                    data, pos, width, height, &mut comps, &quant, &dc_tabs, &ac_tabs,
+                );
             }
             0xD0..=0xD7 => continue, // standalone restart (shouldn't appear here)
             _ => {
@@ -1388,7 +1404,7 @@ mod tests {
         pad(&mut acw);
 
         let mut out: Vec<u8> = vec![0xFF, 0xD8]; // SOI
-        // DQT (all ones).
+                                                 // DQT (all ones).
         out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
         out.extend_from_slice(&[1u8; 64]);
         // SOF2 — progressive, 1 component, 1×1 sampling.
@@ -1442,4 +1458,3 @@ mod tests {
         assert!(decode_jpeg(&data).is_none());
     }
 }
-

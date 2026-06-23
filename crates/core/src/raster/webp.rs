@@ -208,8 +208,8 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
 /// Write one Huffman tree (the "normal", non-simple form) given symbol lengths.
 fn write_tree(w: &mut BitW, lengths: &[u8]) {
     w.write(0, 1); // not simple
-    // Code-length-code lengths: build a Huffman over the 19 length symbols of the
-    // run-length-encoded `lengths` stream.
+                   // Code-length-code lengths: build a Huffman over the 19 length symbols of the
+                   // run-length-encoded `lengths` stream.
     let rle = rle_lengths(lengths);
     let mut cl_freq = [0u32; 19];
     for &(s, _) in &rle {
@@ -511,10 +511,8 @@ pub fn decode_webp(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
             out[i * 4 + 2] = bb;
             out[i * 4 + 3] = aa;
             if cache_bits > 0 {
-                let argb = ((aa as u32) << 24)
-                    | ((rr as u32) << 16)
-                    | ((g as u32) << 8)
-                    | bb as u32;
+                let argb =
+                    ((aa as u32) << 24) | ((rr as u32) << 16) | ((g as u32) << 8) | bb as u32;
                 cache[((argb.wrapping_mul(0x1e35a7bd)) >> (32 - cache_bits)) as usize] = argb;
             }
             i += 1;

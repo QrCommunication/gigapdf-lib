@@ -156,9 +156,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// First index of `needle` at or after `from`.
@@ -185,7 +183,10 @@ fn parse_int_before(data: &[u8], end: usize) -> Option<(usize, usize)> {
     if j == num_end {
         return None;
     }
-    let n = std::str::from_utf8(data.get(j..num_end)?).ok()?.parse().ok()?;
+    let n = std::str::from_utf8(data.get(j..num_end)?)
+        .ok()?
+        .parse()
+        .ok()?;
     Some((n, j))
 }
 
@@ -316,7 +317,8 @@ fn parse_encoding(header: &[u8]) -> Vec<Option<String>> {
                 k += 1;
             }
             if code < 256 {
-                enc[code] = Some(String::from_utf8_lossy(header.get(ns..k).unwrap_or(b"")).into_owned());
+                enc[code] =
+                    Some(String::from_utf8_lossy(header.get(ns..k).unwrap_or(b"")).into_owned());
             }
         }
         j = k;
@@ -449,7 +451,9 @@ fn parse_charstrings(priv_data: &[u8], len_iv: usize) -> Vec<(String, Vec<u8>)> 
         return out;
     };
     // Skip to the `begin` that opens the dictionary body.
-    let body = find_from(priv_data, start, b"begin").map(|b| b + 5).unwrap_or(start);
+    let body = find_from(priv_data, start, b"begin")
+        .map(|b| b + 5)
+        .unwrap_or(start);
     let mut j = body;
     while let Some(slash) = find_from(priv_data, j, b"/") {
         // Read the glyph name token.
@@ -475,7 +479,10 @@ fn parse_charstrings(priv_data: &[u8], len_iv: usize) -> Vec<(String, Vec<u8>)> 
                     j = slash + 1;
                 }
                 // Avoid an infinite loop when the next slash is the same.
-                if find_from(priv_data, j, b"/").map(|p| p <= slash).unwrap_or(false) {
+                if find_from(priv_data, j, b"/")
+                    .map(|p| p <= slash)
+                    .unwrap_or(false)
+                {
                     j = slash + 1;
                 }
                 continue;
@@ -973,7 +980,8 @@ impl<'a> T1Interp<'a> {
         if self.flex_pts.len() < 7 {
             // Degenerate capture: fall back to a straight line to the last point.
             if let Some(&(ex, ey)) = self.flex_pts.last() {
-                self.builder.rlineto(ex - self.flex_start.0, ey - self.flex_start.1);
+                self.builder
+                    .rlineto(ex - self.flex_start.0, ey - self.flex_start.1);
                 self.x = ex;
                 self.y = ey;
             }
@@ -1053,9 +1061,7 @@ pub fn to_cff(font: &Type1Font) -> Option<Vec<u8>> {
     // nominalWidthX so per-glyph width deltas stay compact.
     let widths = collect_widths(font);
     let nominal_width = most_common(&widths).unwrap_or(0.0);
-    let default_width = notdef
-        .and_then(|_| widths.first().copied())
-        .unwrap_or(0.0);
+    let default_width = notdef.and_then(|_| widths.first().copied()).unwrap_or(0.0);
 
     // GID 0 = .notdef.
     let mut charstrings: Vec<Vec<u8>> = Vec::with_capacity(names.len() + 1);
@@ -1371,7 +1377,11 @@ fn assemble_cff(
         private_off as i32,
     );
     let top_index = write_index(&[top]);
-    debug_assert_eq!(top_index.len(), top_index_probe.len(), "Top DICT size stable");
+    debug_assert_eq!(
+        top_index.len(),
+        top_index_probe.len(),
+        "Top DICT size stable"
+    );
 
     let mut out = Vec::new();
     // Header: major=1, minor=0, hdrSize=4, offSize=1.
@@ -1395,7 +1405,8 @@ fn assemble_cff(
 // glyph named here gets the SID that `cff_to_otf::wrap` maps back to Unicode.
 const STD_A: &str = ".notdef space exclam quotedbl numbersign dollar percent ampersand quoteright parenleft parenright asterisk plus comma hyphen period slash zero one two three four five six seven eight nine colon semicolon less equal greater question at";
 const STD_B: &str = "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z bracketleft backslash bracketright asciicircum underscore quoteleft";
-const STD_C: &str = "a b c d e f g h i j k l m n o p q r s t u v w x y z braceleft bar braceright asciitilde";
+const STD_C: &str =
+    "a b c d e f g h i j k l m n o p q r s t u v w x y z braceleft bar braceright asciitilde";
 const STD_D: &str = "exclamdown cent sterling fraction yen florin section currency quotesingle quotedblleft guillemotleft guilsinglleft guilsinglright fi fl endash dagger daggerdbl periodcentered paragraph bullet quotesinglbase quotedblbase quotedblright guillemotright ellipsis perthousand questiondown grave acute circumflex tilde macron breve dotaccent dieresis ring cedilla hungarumlaut ogonek caron emdash";
 const STD_E: &str = "AE ordfeminine Lslash Oslash OE ordmasculine ae dotlessi lslash oslash oe germandbls onesuperior logicalnot mu trademark Eth onehalf plusminus Thorn onequarter divide brokenbar degree thorn threequarters twosuperior registered minus eth multiply threesuperior copyright";
 const STD_F: &str = "Aacute Acircumflex Adieresis Agrave Aring Atilde Ccedilla Eacute Ecircumflex Edieresis Egrave Iacute Icircumflex Idieresis Igrave Ntilde Oacute Ocircumflex Odieresis Ograve Otilde Scaron Uacute Ucircumflex Udieresis Ugrave Yacute Ydieresis Zcaron aacute acircumflex adieresis agrave aring atilde ccedilla eacute ecircumflex edieresis egrave iacute icircumflex idieresis igrave ntilde oacute ocircumflex odieresis ograve otilde scaron uacute ucircumflex udieresis ugrave yacute ydieresis zcaron";
@@ -1615,7 +1626,8 @@ mod tests {
         let font = parse_type1(&bytes).expect("parse");
         let cff = to_cff(&font).expect("to_cff");
         let otf = crate::font::cff_to_otf::wrap(&cff).expect("wrap to OTTO");
-        let metrics = crate::font::truetype::TrueTypeFont::parse_metrics(&otf).expect("parse_metrics");
+        let metrics =
+            crate::font::truetype::TrueTypeFont::parse_metrics(&otf).expect("parse_metrics");
         // 'A' must map to a glyph via the synthesised cmap.
         let gid = metrics.gid_for_unicode(0x41);
         assert!(gid.is_some(), "A (U+0041) resolves through the cmap");
@@ -1662,7 +1674,11 @@ mod tests {
                 panic!("failed to parse {path}");
             };
             assert!(!font.font_name.is_empty(), "{path}: font name");
-            assert!(font.glyphs.len() > 10, "{path}: {} glyphs", font.glyphs.len());
+            assert!(
+                font.glyphs.len() > 10,
+                "{path}: {} glyphs",
+                font.glyphs.len()
+            );
 
             let cff = to_cff(&font).unwrap_or_else(|| panic!("{path}: to_cff"));
             let parsed = crate::font::cff::CffFont::parse(&cff)
@@ -1684,8 +1700,7 @@ mod tests {
                 "{path}: A has contours"
             );
 
-            let otf = crate::font::cff_to_otf::wrap(&cff)
-                .unwrap_or_else(|| panic!("{path}: wrap"));
+            let otf = crate::font::cff_to_otf::wrap(&cff).unwrap_or_else(|| panic!("{path}: wrap"));
             let metrics = crate::font::truetype::TrueTypeFont::parse_metrics(&otf)
                 .unwrap_or_else(|| panic!("{path}: parse_metrics"));
             assert_eq!(

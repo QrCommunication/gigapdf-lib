@@ -100,7 +100,12 @@ fn be_n(d: &[u8], o: &mut usize, n: usize) -> Option<u64> {
 /// Find the byte range `[start, end)` of the first child box of `type tag`
 /// within `[off, end)`. Returns the box *payload* range (after the 8/16-byte
 /// header), and whether it is a FullBox-style container is left to the caller.
-pub(crate) fn find_box(d: &[u8], mut off: usize, end: usize, tag: &[u8; 4]) -> Option<(usize, usize)> {
+pub(crate) fn find_box(
+    d: &[u8],
+    mut off: usize,
+    end: usize,
+    tag: &[u8; 4],
+) -> Option<(usize, usize)> {
     while off + 8 <= end {
         let size = be32(d, off)? as usize;
         let typ = &d[off + 4..off + 8];
@@ -214,7 +219,8 @@ pub(crate) fn extract_av1_stream(avif: &[u8]) -> Option<Vec<u8>> {
     if item.length == 0 {
         return None;
     }
-    avif.get(item.offset..item.offset + item.length).map(|s| s.to_vec())
+    avif.get(item.offset..item.offset + item.length)
+        .map(|s| s.to_vec())
 }
 
 /// Decode an AVIF file to `(width, height, rgba)`. The container + OBU layer is
@@ -270,7 +276,13 @@ fn yuv_to_rgba(tile: &tile::Av1Tile, seq: &SequenceHeader, w: usize, h: usize) -
     let mut out = vec![0u8; w * h * 4];
 
     // Luma → full-range RGB level (shared by mono + the matrix path).
-    let lift = |yv: f32| if full { yv } else { (yv - 16.0) * (255.0 / 219.0) };
+    let lift = |yv: f32| {
+        if full {
+            yv
+        } else {
+            (yv - 16.0) * (255.0 / 219.0)
+        }
+    };
 
     if seq.mono_chrome {
         for py in 0..h {
@@ -561,7 +573,11 @@ pub(crate) fn parse_sequence_header(data: &[u8]) -> Option<SequenceHeader> {
     } else {
         8
     };
-    s.mono_chrome = if s.seq_profile == 1 { false } else { r.f(1) != 0 };
+    s.mono_chrome = if s.seq_profile == 1 {
+        false
+    } else {
+        r.f(1) != 0
+    };
     let color_description_present = r.f(1) != 0;
     let (cp, tc, mc) = if color_description_present {
         (r.f(8), r.f(8), r.f(8))
@@ -961,7 +977,11 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
     if h.using_qmatrix {
         h.qm_y = r.f(4);
         h.qm_u = r.f(4);
-        h.qm_v = if seq.separate_uv_delta_q { r.f(4) } else { h.qm_u };
+        h.qm_v = if seq.separate_uv_delta_q {
+            r.f(4)
+        } else {
+            h.qm_u
+        };
     }
 
     // segmentation_params() — primary_ref_frame == NONE ⇒ update_map/data = 1.
@@ -1091,7 +1111,8 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
             };
             let size0 = 256u32 >> (2 - lr_unit_shift);
             h.lr_unit_size[0] = size0;
-            let lr_uv_shift = if seq.subsampling_x != 0 && seq.subsampling_y != 0 && uses_chroma_lr {
+            let lr_uv_shift = if seq.subsampling_x != 0 && seq.subsampling_y != 0 && uses_chroma_lr
+            {
                 r.f(1)
             } else {
                 0
@@ -1246,8 +1267,14 @@ mod tests {
         let (w, h, rgba) = decode_avif(avif).expect("decode_avif returns pixels");
         assert_eq!((w, h), (32, 32));
         assert_eq!(rgba.len(), 32 * 32 * 4);
-        assert!(rgba.iter().skip(3).step_by(4).all(|&a| a == 255), "alpha not opaque");
-        assert!(rgba.chunks(4).any(|p| p[..3] != [0, 0, 0]), "image is all black");
+        assert!(
+            rgba.iter().skip(3).step_by(4).all(|&a| a == 255),
+            "alpha not opaque"
+        );
+        assert!(
+            rgba.chunks(4).any(|p| p[..3] != [0, 0, 0]),
+            "image is all black"
+        );
 
         // Independent cross-check against the I420 reference (Y 1024 + U/V 256
         // each), using BT.601 limited-range constants (the fixture's matrix).
@@ -1262,8 +1289,11 @@ mod tests {
         .unwrap();
         eprintln!(
             "[avif] mc={} range={} mono={} ss=({},{})",
-            seq.matrix_coefficients, seq.color_range, seq.mono_chrome,
-            seq.subsampling_x, seq.subsampling_y
+            seq.matrix_coefficients,
+            seq.color_range,
+            seq.mono_chrome,
+            seq.subsampling_x,
+            seq.subsampling_y
         );
         let full = seq.color_range != 0;
         let (kr, kb) = match seq.matrix_coefficients {
@@ -1281,10 +1311,16 @@ mod tests {
                 let cy = py >> seq.subsampling_y;
                 let u = (reference[1024 + cy * 16 + cx] as f32 - 128.0) * cscale;
                 let v = (reference[1024 + 256 + cy * 16 + cx] as f32 - 128.0) * cscale;
-                let yl = if full { y } else { (y - 16.0) * (255.0 / 219.0) };
+                let yl = if full {
+                    y
+                } else {
+                    (y - 16.0) * (255.0 / 219.0)
+                };
                 let exp = [
                     super::to_u8(yl + 2.0 * (1.0 - kr) * v),
-                    super::to_u8(yl - 2.0 * kb * (1.0 - kb) / kg * u - 2.0 * kr * (1.0 - kr) / kg * v),
+                    super::to_u8(
+                        yl - 2.0 * kb * (1.0 - kb) / kg * u - 2.0 * kr * (1.0 - kr) / kg * v,
+                    ),
                     super::to_u8(yl + 2.0 * (1.0 - kb) * u),
                 ];
                 let o = (py * 32 + px) * 4;

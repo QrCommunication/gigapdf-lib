@@ -79,18 +79,66 @@ pub(super) fn loop_filter(
         };
 
         if wd >= 16 && flat8out && flat8in {
-            set(-6, (p6 + p6 + p6 + p6 + p6 + p6 * 2 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + 8) >> 4);
-            set(-5, (p6 + p6 + p6 + p6 + p6 + p5 * 2 + p4 * 2 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + 8) >> 4);
-            set(-4, (p6 + p6 + p6 + p6 + p5 + p4 * 2 + p3 * 2 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4);
-            set(-3, (p6 + p6 + p6 + p5 + p4 + p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + 8) >> 4);
-            set(-2, (p6 + p6 + p5 + p4 + p3 + p2 * 2 + p1 * 2 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + 8) >> 4);
-            set(-1, (p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + 8) >> 4);
-            set(0, (p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + 8) >> 4);
-            set(1, (p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 + q2 * 2 + q3 + q4 + q5 + q6 + q6 + 8) >> 4);
-            set(2, (p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + q4 + q5 + q6 + q6 + q6 + 8) >> 4);
-            set(3, (p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 + q4 * 2 + q5 + q6 + q6 + q6 + q6 + 8) >> 4);
-            set(4, (p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 + q5 * 2 + q6 + q6 + q6 + q6 + q6 + 8) >> 4);
-            set(5, (p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 + q6 * 2 + q6 + q6 + q6 + q6 + q6 + 8) >> 4);
+            set(
+                -6,
+                (p6 + p6 + p6 + p6 + p6 + p6 * 2 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + 8)
+                    >> 4,
+            );
+            set(
+                -5,
+                (p6 + p6 + p6 + p6 + p6 + p5 * 2 + p4 * 2 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + 8)
+                    >> 4,
+            );
+            set(
+                -4,
+                (p6 + p6 + p6 + p6 + p5 + p4 * 2 + p3 * 2 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + 8)
+                    >> 4,
+            );
+            set(
+                -3,
+                (p6 + p6 + p6 + p5 + p4 + p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + 8)
+                    >> 4,
+            );
+            set(
+                -2,
+                (p6 + p6 + p5 + p4 + p3 + p2 * 2 + p1 * 2 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + 8)
+                    >> 4,
+            );
+            set(
+                -1,
+                (p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + 8)
+                    >> 4,
+            );
+            set(
+                0,
+                (p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + 8)
+                    >> 4,
+            );
+            set(
+                1,
+                (p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 + q2 * 2 + q3 + q4 + q5 + q6 + q6 + 8)
+                    >> 4,
+            );
+            set(
+                2,
+                (p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + q4 + q5 + q6 + q6 + q6 + 8)
+                    >> 4,
+            );
+            set(
+                3,
+                (p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 + q4 * 2 + q5 + q6 + q6 + q6 + q6 + 8)
+                    >> 4,
+            );
+            set(
+                4,
+                (p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 + q5 * 2 + q6 + q6 + q6 + q6 + q6 + 8)
+                    >> 4,
+            );
+            set(
+                5,
+                (p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 + q6 * 2 + q6 + q6 + q6 + q6 + q6 + 8)
+                    >> 4,
+            );
         } else if wd >= 8 && flat8in {
             set(-3, (p3 + p3 + p3 + 2 * p2 + p1 + p0 + q0 + 4) >> 3);
             set(-2, (p3 + p3 + p2 + 2 * p1 + p0 + q0 + q1 + 4) >> 3);
@@ -139,7 +187,10 @@ pub(super) struct FilterLut {
 /// Build the `FilterLut` for a given `filter_sharpness` (0..=7).
 pub(super) fn calc_eih(filter_sharpness: u32) -> FilterLut {
     let sharp = filter_sharpness as i32;
-    let mut lut = FilterLut { e: [0; 64], i: [0; 64] };
+    let mut lut = FilterLut {
+        e: [0; 64],
+        i: [0; 64],
+    };
     for level in 0..64i32 {
         let mut limit = level;
         if sharp > 0 {
@@ -202,10 +253,18 @@ mod tests {
         // Mirror the harness: 4 lines × 16 samples, edge between index 7 (p0) and
         // 8 (q0); `dst` at q0 of line 0 (pos = 8). stride_a = 16, stride_b = 1.
         let lines: [[u8; 16]; 4] = [
-            [30, 34, 38, 42, 46, 50, 54, 58, 92, 96, 100, 104, 108, 112, 116, 120],
-            [40, 40, 40, 40, 40, 40, 40, 40, 200, 200, 200, 200, 200, 200, 200, 200],
-            [70, 71, 72, 72, 73, 73, 74, 74, 78, 79, 79, 80, 81, 82, 82, 83],
-            [10, 90, 20, 130, 60, 15, 200, 64, 70, 240, 12, 180, 33, 99, 5, 150],
+            [
+                30, 34, 38, 42, 46, 50, 54, 58, 92, 96, 100, 104, 108, 112, 116, 120,
+            ],
+            [
+                40, 40, 40, 40, 40, 40, 40, 40, 200, 200, 200, 200, 200, 200, 200, 200,
+            ],
+            [
+                70, 71, 72, 72, 73, 73, 74, 74, 78, 79, 79, 80, 81, 82, 82, 83,
+            ],
+            [
+                10, 90, 20, 130, 60, 15, 200, 64, 70, 240, 12, 180, 33, 99, 5, 150,
+            ],
         ];
         let widths = [4i32, 6, 8, 16];
         let thr = [[64i32, 32, 16], [255, 64, 8], [120, 16, 4]];
@@ -246,7 +305,7 @@ mod tests {
         // No deltas → base (clamped).
         assert_eq!(lf_level(16, 0, 0, 99, false), 16);
         assert_eq!(lf_level(70, 0, 0, 0, false), 63); // base clamps to 63
-        // delta enabled, base<32 → +ref_delta0*1.
+                                                      // delta enabled, base<32 → +ref_delta0*1.
         assert_eq!(lf_level(16, 0, 0, 1, true), 17);
         // delta enabled, base>=32 → +ref_delta0*2 (sh=1).
         assert_eq!(lf_level(40, 0, 0, 1, true), 42);

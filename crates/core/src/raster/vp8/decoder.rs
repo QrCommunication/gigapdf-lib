@@ -6,10 +6,10 @@
 //! `loop_filter`.
 
 use super::{
-    Bool, AC_QUANT, BMODE_TREE, COEFF_BANDS, DC_QUANT, DEFAULT_COEFF_PROBS, B_DC_PRED, B_HE_PRED,
-    B_HD_PRED, B_LD_PRED, B_PRED, B_RD_PRED, B_TM_PRED, B_VE_PRED, B_VL_PRED, B_VR_PRED,
-    COEFF_UPDATE_PROBS, DC_PRED, H_PRED, KF_BMODE_PROBS, KF_UV_MODE_PROB, KF_UV_MODE_TREE,
-    KF_YMODE_PROB, KF_YMODE_TREE, TM_PRED, V_PRED, ZIGZAG,
+    Bool, AC_QUANT, BMODE_TREE, B_DC_PRED, B_HD_PRED, B_HE_PRED, B_LD_PRED, B_PRED, B_RD_PRED,
+    B_TM_PRED, B_VE_PRED, B_VL_PRED, B_VR_PRED, COEFF_BANDS, COEFF_UPDATE_PROBS, DC_PRED, DC_QUANT,
+    DEFAULT_COEFF_PROBS, H_PRED, KF_BMODE_PROBS, KF_UV_MODE_PROB, KF_UV_MODE_TREE, KF_YMODE_PROB,
+    KF_YMODE_TREE, TM_PRED, V_PRED, ZIGZAG,
 };
 
 /// Border pixels around each plane (matches dixie's VP8BORDERINPIXELS).
@@ -103,10 +103,10 @@ struct Planes {
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
-    ys: usize,  // luma stride
-    cs: usize,  // chroma stride
-    y0: usize,  // index of luma pixel (0,0)
-    c0: usize,  // index of chroma pixel (0,0)
+    ys: usize, // luma stride
+    cs: usize, // chroma stride
+    y0: usize, // index of luma pixel (0,0)
+    c0: usize, // index of chroma pixel (0,0)
 }
 
 fn decode_to_planes(body: &[u8]) -> Option<Planes> {
@@ -124,7 +124,8 @@ fn decode_to_planes(body: &[u8]) -> Option<Planes> {
     if body[3] != 0x9d || body[4] != 0x01 || body[5] != 0x2a {
         return None;
     }
-    let raw2 = body[6] as u32 | (body[7] as u32) << 8 | (body[8] as u32) << 16 | (body[9] as u32) << 24;
+    let raw2 =
+        body[6] as u32 | (body[7] as u32) << 8 | (body[8] as u32) << 16 | (body[9] as u32) << 24;
     let w = (raw2 & 0x3FFF) as usize;
     let h = ((raw2 >> 16) & 0x3FFF) as usize;
     if w == 0 || h == 0 {
@@ -241,7 +242,11 @@ fn decode_to_planes(body: &[u8]) -> Option<Planes> {
         }
     }
     let coeff_skip_enabled = bd.flag();
-    let coeff_skip_prob = if coeff_skip_enabled { bd.literal(8) as u8 } else { 0 };
+    let coeff_skip_prob = if coeff_skip_enabled {
+        bd.literal(8) as u8
+    } else {
+        0
+    };
 
     // dequant factors per segment
     let n_seg = if seg_enabled { 4 } else { 1 };
@@ -249,7 +254,11 @@ fn decode_to_planes(body: &[u8]) -> Option<Planes> {
     for (i, d) in dq.iter_mut().enumerate().take(n_seg) {
         let mut q = q_index;
         if seg_enabled {
-            q = if seg_abs { seg_quant[i] } else { q + seg_quant[i] };
+            q = if seg_abs {
+                seg_quant[i]
+            } else {
+                q + seg_quant[i]
+            };
         }
         d.y1[0] = dc_q(q + y1_dc_dq);
         d.y1[1] = ac_q(q);
@@ -347,11 +356,7 @@ fn read_kf_modes(b: &mut Bool, mb: &mut Mb, left: &mut [u8; 4], above: &mut [u8]
     if y_mode == B_PRED {
         for i in 0..16 {
             // above sub-block mode
-            let a = if i < 4 {
-                above_b[i]
-            } else {
-                mb.b_modes[i - 4]
-            };
+            let a = if i < 4 { above_b[i] } else { mb.b_modes[i - 4] };
             // left sub-block mode
             let l = if i & 3 == 0 {
                 left[i >> 2]
@@ -432,7 +437,15 @@ fn decode_mb_tokens(
         };
         let first = if typ == 0 { 1 } else { 0 };
         let t = left[LEFT_CTX[blk]] + above[ABOVE_CTX[blk]];
-        let nonzero = decode_block(b, &probs[typ], t as usize, first, dc, ac, &mut coeffs[blk * 16..blk * 16 + 16]);
+        let nonzero = decode_block(
+            b,
+            &probs[typ],
+            t as usize,
+            first,
+            dc,
+            ac,
+            &mut coeffs[blk * 16..blk * 16 + 16],
+        );
         any |= nonzero;
         let flag = nonzero as u8;
         left[LEFT_CTX[blk]] = flag;
@@ -613,7 +626,14 @@ fn idct_add(buf: &mut [u8], pos: usize, stride: usize, coeffs: &[i32]) {
 
 include!("predict.rs");
 
-fn reconstruct_mb(pl: &mut Planes, row: usize, col: usize, mb: &Mb, coeffs: &mut [i32], mb_cols: usize) {
+fn reconstruct_mb(
+    pl: &mut Planes,
+    row: usize,
+    col: usize,
+    mb: &Mb,
+    coeffs: &mut [i32],
+    mb_cols: usize,
+) {
     let ys = pl.ys;
     let cs = pl.cs;
     let yp = pl.y0 + row * 16 * ys + col * 16;
@@ -643,7 +663,12 @@ fn reconstruct_mb(pl: &mut Planes, row: usize, col: usize, mb: &Mb, coeffs: &mut
         for i in 0..16 {
             let bx = (i & 3) * 4;
             let by = (i >> 2) * 4;
-            idct_add(&mut pl.y, yp + by * ys + bx, ys, &coeffs[i * 16..i * 16 + 16]);
+            idct_add(
+                &mut pl.y,
+                yp + by * ys + bx,
+                ys,
+                &coeffs[i * 16..i * 16 + 16],
+            );
         }
     }
 
@@ -653,12 +678,22 @@ fn reconstruct_mb(pl: &mut Planes, row: usize, col: usize, mb: &Mb, coeffs: &mut
     for (j, blk) in (16..20).enumerate() {
         let bx = (j & 1) * 4;
         let by = (j >> 1) * 4;
-        idct_add(&mut pl.u, up + by * cs + bx, cs, &coeffs[blk * 16..blk * 16 + 16]);
+        idct_add(
+            &mut pl.u,
+            up + by * cs + bx,
+            cs,
+            &coeffs[blk * 16..blk * 16 + 16],
+        );
     }
     for (j, blk) in (20..24).enumerate() {
         let bx = (j & 1) * 4;
         let by = (j >> 1) * 4;
-        idct_add(&mut pl.v, vp + by * cs + bx, cs, &coeffs[blk * 16..blk * 16 + 16]);
+        idct_add(
+            &mut pl.v,
+            vp + by * cs + bx,
+            cs,
+            &coeffs[blk * 16..blk * 16 + 16],
+        );
     }
 
     // extend the right edge of the last column's bottom row by 4px (above-right
@@ -963,7 +998,10 @@ mod tests {
             }
             maxdiff = maxdiff.max(d);
         }
-        eprintln!("VP8 YUV vs ffmpeg: maxdiff={maxdiff} ndiff={ndiff}/{}", refyuv.len());
+        eprintln!(
+            "VP8 YUV vs ffmpeg: maxdiff={maxdiff} ndiff={ndiff}/{}",
+            refyuv.len()
+        );
         // Bit-exact against ffmpeg's libvpx decode (full pipeline incl. the
         // deblocking loop filter §15).
         assert_eq!(maxdiff, 0, "VP8 decode must match ffmpeg YUV bit-exact");

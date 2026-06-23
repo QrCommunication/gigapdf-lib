@@ -114,7 +114,10 @@ mod tests {
     #[test]
     fn rejects_bad_input() {
         assert!(resize_rgba(&[], 0, 0, 2, 2).is_empty());
-        assert!(resize_rgba(&[0; 3], 1, 1, 2, 2).is_empty(), "length mismatch");
+        assert!(
+            resize_rgba(&[0; 3], 1, 1, 2, 2).is_empty(),
+            "length mismatch"
+        );
     }
 
     #[test]

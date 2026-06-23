@@ -77,7 +77,8 @@ impl MeasureBook {
         let faces = fonts
             .iter()
             .filter_map(|f| {
-                Face::parse(&f.ttf).map(|face| (key(&f.family, weight_bold(f.weight), f.italic), face))
+                Face::parse(&f.ttf)
+                    .map(|face| (key(&f.family, weight_bold(f.weight), f.italic), face))
             })
             .collect();
         MeasureBook {
@@ -1163,20 +1164,18 @@ mod tests {
             };
             rect_ys(&s, 800.0)[0]
         };
-        assert!(ys[0] > under, "strike (PDF y {}) sits above underline ({under})", ys[0]);
+        assert!(
+            ys[0] > under,
+            "strike (PDF y {}) sits above underline ({under})",
+            ys[0]
+        );
     }
 
     #[test]
     fn s_tag_strikes_through_end_to_end() {
         // The UA sheet maps <s>/<strike>/<del> to line-through; a full render of
         // `<s>` must therefore emit a decoration rule (no panic, valid PDF).
-        let pdf = render(
-            "<p><s>gone</s></p>",
-            &[],
-            612.0,
-            792.0,
-            36.0,
-        );
+        let pdf = render("<p><s>gone</s></p>", &[], 612.0, 792.0, 36.0);
         assert!(pdf.starts_with(b"%PDF-"), "valid PDF for struck text");
     }
 }

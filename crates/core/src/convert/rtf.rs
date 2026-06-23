@@ -312,7 +312,7 @@ impl<'a> Parser<'a> {
                     self.push_char('\u{00A0}'); // non-breaking space
                     self.i += 2;
                 }
-                b'-' => self.i += 2,  // optional hyphen → drop
+                b'-' => self.i += 2, // optional hyphen → drop
                 b'_' => {
                     self.push_char('\u{2011}'); // non-breaking hyphen
                     self.i += 2;
@@ -471,7 +471,11 @@ impl<'a> Parser<'a> {
             }
             "u" => {
                 if let Some(n) = param {
-                    let code = if n < 0 { (n + 0x10000) as u32 } else { n as u32 };
+                    let code = if n < 0 {
+                        (n + 0x10000) as u32
+                    } else {
+                        n as u32
+                    };
                     if let Some(ch) = char::from_u32(code) {
                         self.push_char(ch);
                     }
@@ -490,8 +494,8 @@ impl<'a> Parser<'a> {
             }
             "stylesheet" | "info" | "pict" | "object" | "header" | "footer" | "footnote"
             | "annotation" | "fldinst" | "xmlns" | "themedata" | "colorschememapping"
-            | "datastore" | "latentstyles" | "listtable" | "listoverridetable"
-            | "generator" | "revtbl" | "rsidtbl" => {
+            | "datastore" | "latentstyles" | "listtable" | "listoverridetable" | "generator"
+            | "revtbl" | "rsidtbl" => {
                 self.skip = true;
             }
 
@@ -726,10 +730,16 @@ fn twips_to_pt(t: i32) -> f64 {
 fn para_html(p: &Parser, para: &Para, out: &mut String) {
     let mut style = String::from(align_css(para.align));
     if para.indent_left > 0 {
-        style.push_str(&format!("margin-left:{:.1}pt;", twips_to_pt(para.indent_left)));
+        style.push_str(&format!(
+            "margin-left:{:.1}pt;",
+            twips_to_pt(para.indent_left)
+        ));
     }
     if para.first_line != 0 {
-        style.push_str(&format!("text-indent:{:.1}pt;", twips_to_pt(para.first_line)));
+        style.push_str(&format!(
+            "text-indent:{:.1}pt;",
+            twips_to_pt(para.first_line)
+        ));
     }
     if style.is_empty() {
         out.push_str("<p>");
@@ -781,8 +791,7 @@ pub fn rtf_to_html(rtf: &str) -> String {
     // `fonts` / `colors` tables) alive, so we can borrow it for serialization.
     let blocks = parser.drive();
 
-    let mut html =
-        String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>");
+    let mut html = String::from("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>");
     for block in &blocks {
         match block {
             RtfBlock::Para(para) => para_html(&parser, para, &mut html),
@@ -865,7 +874,10 @@ mod tests {
         let rtf = r"{\rtf1\ansi \'80 \'93x\'94 \'85 \'97\par}";
         let html = rtf_to_html(rtf);
         assert!(html.contains('€'), "euro from \\'80: {html}");
-        assert!(html.contains('\u{201C}') && html.contains('\u{201D}'), "curly quotes: {html}");
+        assert!(
+            html.contains('\u{201C}') && html.contains('\u{201D}'),
+            "curly quotes: {html}"
+        );
         assert!(html.contains('…'), "ellipsis from \\'85: {html}");
         assert!(html.contains('—'), "em dash from \\'97: {html}");
     }
@@ -883,8 +895,14 @@ mod tests {
         let rtf = r"{\rtf1\ansi\trowd \cell A1\cell A2\row \trowd \cell B1\cell B2\row}";
         let html = rtf_to_html(rtf);
         assert!(html.contains("<table"), "table present: {html}");
-        assert!(html.contains("<tr>") && html.contains("<td"), "rows/cells: {html}");
-        assert!(html.contains("A1") && html.contains("B2"), "cell text: {html}");
+        assert!(
+            html.contains("<tr>") && html.contains("<td"),
+            "rows/cells: {html}"
+        );
+        assert!(
+            html.contains("A1") && html.contains("B2"),
+            "cell text: {html}"
+        );
         // Two rows → two <tr>.
         assert_eq!(html.matches("<tr>").count(), 2, "two rows: {html}");
     }
@@ -901,7 +919,8 @@ mod tests {
         // "post" should be plain text, not inside a bold span.
         let post_segment = &html[post..];
         assert!(
-            !post_segment.starts_with("</span>") || html[..post].matches("<span").count() == html[..post].matches("</span>").count(),
+            !post_segment.starts_with("</span>")
+                || html[..post].matches("<span").count() == html[..post].matches("</span>").count(),
             "post is not bold: {html}"
         );
     }

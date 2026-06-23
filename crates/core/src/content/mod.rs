@@ -406,7 +406,10 @@ fn is_hebrew_char(c: char) -> bool {
 /// This positional asymmetry is the signal used to tell the two orders apart.
 #[inline]
 fn is_hebrew_final_form(c: char) -> bool {
-    matches!(c, '\u{05DA}' | '\u{05DD}' | '\u{05DF}' | '\u{05E3}' | '\u{05E5}')
+    matches!(
+        c,
+        '\u{05DA}' | '\u{05DD}' | '\u{05DF}' | '\u{05E3}' | '\u{05E5}'
+    )
 }
 
 /// Decide whether a run's characters need flipping visual→logical, and if so
@@ -440,7 +443,10 @@ fn reorder_visual_rtl(text: &str) -> Option<String> {
     } else {
         // Arabic (no Hebrew): reverse when RTL strictly dominates the strong
         // characters of the run — i.e. a genuinely right-to-left run.
-        matches!(crate::text::run_direction(text), crate::text::Direction::Rtl)
+        matches!(
+            crate::text::run_direction(text),
+            crate::text::Direction::Rtl
+        )
     };
 
     should_reverse.then(|| text.chars().rev().collect())
@@ -537,7 +543,14 @@ pub fn extract_text_runs_resolved(
     depth: usize,
 ) -> Result<Vec<TextRun>> {
     let mut visited: BTreeSet<(u32, u16)> = BTreeSet::new();
-    let mut runs = text_runs_inner(content, fonts, initial_ctm, resolve_form, depth, &mut visited)?;
+    let mut runs = text_runs_inner(
+        content,
+        fonts,
+        initial_ctm,
+        resolve_form,
+        depth,
+        &mut visited,
+    )?;
     // Renumber so `index` is sequential over the whole (possibly flattened) list.
     for (i, run) in runs.iter_mut().enumerate() {
         run.index = i;
@@ -623,7 +636,11 @@ fn text_runs_inner(
                     index: runs.len(),
                     operator: operation.operator.clone(),
                     text: decode_operand_text(&operation.operands, current),
-                    op_position: if nested { NESTED_OP_POSITION } else { op_position },
+                    op_position: if nested {
+                        NESTED_OP_POSITION
+                    } else {
+                        op_position
+                    },
                 });
             }
             _ => {}
@@ -678,7 +695,12 @@ pub fn remove_text_run(content: &[u8], index: usize) -> Result<Vec<u8>> {
 /// Type0/Identity-H runs (2-byte glyph ids) must use
 /// [`replace_text_run_encoded`] with pre-encoded glyph bytes.
 pub fn replace_text_run(content: &[u8], index: usize, new_text: &str) -> Result<Vec<u8>> {
-    replace_text_run_encoded(content, index, encode_single_byte(new_text), StringKind::Literal)
+    replace_text_run_encoded(
+        content,
+        index,
+        encode_single_byte(new_text),
+        StringKind::Literal,
+    )
 }
 
 /// Replace the `index`-th text run's operand with **pre-encoded** bytes,
@@ -704,8 +726,16 @@ pub fn replace_text_run_encoded(
         b"Tj" | b"'" => operation.operands = vec![operand],
         // `"` is `aw ac string "` — preserve the spacing operands, swap the text.
         b"\"" => {
-            let aw = operation.operands.first().cloned().unwrap_or(Object::Integer(0));
-            let ac = operation.operands.get(1).cloned().unwrap_or(Object::Integer(0));
+            let aw = operation
+                .operands
+                .first()
+                .cloned()
+                .unwrap_or(Object::Integer(0));
+            let ac = operation
+                .operands
+                .get(1)
+                .cloned()
+                .unwrap_or(Object::Integer(0));
             operation.operands = vec![aw, ac, operand];
         }
         // TJ: collapse the positioned array to a single string.
@@ -1062,7 +1092,11 @@ fn elements_from_ops_resolved(
                 // gives the baseline rotation.
                 let m = tm.then(&ctm).0;
                 let scale_y = (m[2] * m[2] + m[3] * m[3]).sqrt();
-                let eff_size = if scale_y > 0.0 { font_size * scale_y } else { font_size };
+                let eff_size = if scale_y > 0.0 {
+                    font_size * scale_y
+                } else {
+                    font_size
+                };
                 let rot = m[1].atan2(m[0]).to_degrees();
                 elements.push(ContentElement {
                     index: 0,
@@ -2080,7 +2114,12 @@ mod tests {
             label: text.to_string(),
             op_start: 0,
             op_end: 0,
-            bounds: Some(Bounds { x, y: 100.0, width: w, height: 10.0 }),
+            bounds: Some(Bounds {
+                x,
+                y: 100.0,
+                width: w,
+                height: 10.0,
+            }),
             font: None,
             color: None,
             font_size: Some(10.0),
@@ -2113,7 +2152,12 @@ mod tests {
             label: text.to_string(),
             op_start: 0,
             op_end: 0,
-            bounds: Some(Bounds { x, y, width: w, height: 10.0 }),
+            bounds: Some(Bounds {
+                x,
+                y,
+                width: w,
+                height: 10.0,
+            }),
             font: None,
             color: None,
             font_size: Some(10.0),
@@ -2123,7 +2167,10 @@ mod tests {
         };
         // "ASSURES" at top (y=100.5, sorts first); "cerfa" just below (y=99.5,
         // within the 0.6×h tolerance) but at the left margin (x=10).
-        let els = [mk("ASSURES", 400.0, 100.5, 38.0), mk("cerfa", 10.0, 99.5, 30.0)];
+        let els = [
+            mk("ASSURES", 400.0, 100.5, 38.0),
+            mk("cerfa", 10.0, 99.5, 30.0),
+        ];
         let lines = group_lines(&els);
         assert_eq!(lines.len(), 1, "same row cluster");
         assert_eq!(lines[0].text, "ASSURES cerfa", "wrap is a word boundary");
@@ -2145,8 +2192,14 @@ mod tests {
         assert_eq!(texts.len(), 3, "Tj + two ' runs are all extracted");
         let ys: Vec<f64> = texts.iter().map(|e| e.bounds.unwrap().y).collect();
         // Same font size, so the baseline delta equals the 12-unit leading.
-        assert!((ys[0] - ys[1] - 12.0).abs() < 1e-6, "first ' moved down 12: {ys:?}");
-        assert!((ys[1] - ys[2] - 12.0).abs() < 1e-6, "second ' moved down 12: {ys:?}");
+        assert!(
+            (ys[0] - ys[1] - 12.0).abs() < 1e-6,
+            "first ' moved down 12: {ys:?}"
+        );
+        assert!(
+            (ys[1] - ys[2] - 12.0).abs() < 1e-6,
+            "second ' moved down 12: {ys:?}"
+        );
     }
 
     #[test]
@@ -2448,7 +2501,10 @@ BT /F 12 Tf (BODY) Tj ET";
         assert!(count(&edited, b"rg") >= 1, "fill colour op injected");
         assert_eq!(count(&edited, b"re"), 1, "original construction preserved");
         assert!(count(&edited, b"f") >= 1, "original paint preserved");
-        assert!(count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1, "wrapped");
+        assert!(
+            count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1,
+            "wrapped"
+        );
         let paths = vector::vector_paths_from_ops(
             &parse_content(&edited).unwrap(),
             &std::collections::BTreeMap::new(),
@@ -2471,7 +2527,10 @@ BT /F 12 Tf (BODY) Tj ET";
         };
         let edited = set_path_style(content, 0, &style, None).unwrap();
         assert!(count(&edited, b"RG") >= 1, "stroke colour injected");
-        assert!(count(&edited, b" w") >= 1 || count(&edited, b"3 w") >= 1, "width injected");
+        assert!(
+            count(&edited, b" w") >= 1 || count(&edited, b"3 w") >= 1,
+            "width injected"
+        );
         assert!(count(&edited, b" d") >= 1, "dash injected");
         let paths = vector::vector_paths_from_ops(
             &parse_content(&edited).unwrap(),
@@ -2509,12 +2568,18 @@ BT /F 12 Tf (BODY) Tj ET";
         };
         let edited = set_path_style(content, 0, &style, Some(b"GpGs0")).unwrap();
         let s = String::from_utf8_lossy(&edited);
-        assert!(s.contains("/GpGs0 gs"), "gs op for the named gstate injected");
+        assert!(
+            s.contains("/GpGs0 gs"),
+            "gs op for the named gstate injected"
+        );
         // gs must precede the fill colour op (declared-order injection).
         let gs_at = s.find("/GpGs0 gs").unwrap();
         let rg_at = s.find(" rg").or_else(|| s.find("rg")).unwrap();
         assert!(gs_at < rg_at, "gs comes before the colour op");
-        assert!(count(&edited, b"re") == 1 && count(&edited, b"f") >= 1, "path preserved");
+        assert!(
+            count(&edited, b"re") == 1 && count(&edited, b"f") >= 1,
+            "path preserved"
+        );
     }
 
     #[test]
@@ -2526,7 +2591,10 @@ BT /F 12 Tf (BODY) Tj ET";
             ..PathStyle::default()
         };
         let edited = set_path_style(content, 0, &style, Some(b"GpGs0")).unwrap();
-        assert!(!String::from_utf8_lossy(&edited).contains("gs"), "no gs without alpha");
+        assert!(
+            !String::from_utf8_lossy(&edited).contains("gs"),
+            "no gs without alpha"
+        );
     }
 
     #[test]
@@ -2569,8 +2637,14 @@ BT /F 12 Tf (BODY) Tj ET";
         // The first shape's geometry now trails the text show.
         let tj_at = s.find("(T) Tj").unwrap();
         let first_re_at = s.find("10 10 20 20 re").unwrap();
-        assert!(first_re_at > tj_at, "brought-to-front shape now painted last");
-        assert!(count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1, "re-wrapped");
+        assert!(
+            first_re_at > tj_at,
+            "brought-to-front shape now painted last"
+        );
+        assert!(
+            count(&edited, b"q") >= 1 && count(&edited, b"Q") >= 1,
+            "re-wrapped"
+        );
         // Stream still parses and the element set is unchanged in composition.
         let els = extract_elements(&edited).unwrap();
         assert_eq!(
@@ -2620,11 +2694,23 @@ BT /F 12 Tf (BODY) Tj ET";
         let content = b"1 0 0 rg 10 10 20 20 re f 0 0 1 rg 50 50 20 20 re f";
         let no_color = std::collections::BTreeMap::new();
         // Sanity: before the move the first path is red.
-        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color, &vector::NoNamedColors);
-        assert_eq!(before[0].fill, Some([1.0, 0.0, 0.0]), "first path starts red");
+        let before = vector::vector_paths_from_ops(
+            &parse_content(content).unwrap(),
+            &no_color,
+            &vector::NoNamedColors,
+        );
+        assert_eq!(
+            before[0].fill,
+            Some([1.0, 0.0, 0.0]),
+            "first path starts red"
+        );
 
         let edited = reorder_element(content, 0, true).unwrap();
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
+        let paths = vector::vector_paths_from_ops(
+            &parse_content(&edited).unwrap(),
+            &no_color,
+            &vector::NoNamedColors,
+        );
         assert_eq!(paths.len(), 2, "still two painted paths");
         // The moved (red) shape is now painted last → last in the path list.
         assert_eq!(
@@ -2648,8 +2734,16 @@ BT /F 12 Tf (BODY) Tj ET";
         let no_color = std::collections::BTreeMap::new();
 
         // Path index 1 is the dashed blue line (declared first → drawn first).
-        let before = vector::vector_paths_from_ops(&parse_content(content).unwrap(), &no_color, &vector::NoNamedColors);
-        assert_eq!(before[0].stroke, Some([0.0, 0.0, 1.0]), "first line starts blue");
+        let before = vector::vector_paths_from_ops(
+            &parse_content(content).unwrap(),
+            &no_color,
+            &vector::NoNamedColors,
+        );
+        assert_eq!(
+            before[0].stroke,
+            Some([0.0, 0.0, 1.0]),
+            "first line starts blue"
+        );
 
         let line_index = extract_elements(content)
             .unwrap()
@@ -2657,15 +2751,26 @@ BT /F 12 Tf (BODY) Tj ET";
             .position(|e| e.kind == ElementKind::Path)
             .unwrap();
         let edited = reorder_element(content, line_index, false).unwrap();
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
+        let paths = vector::vector_paths_from_ops(
+            &parse_content(&edited).unwrap(),
+            &no_color,
+            &vector::NoNamedColors,
+        );
         assert_eq!(paths.len(), 2, "still two painted paths");
         // Sent to back → painted first → first in the path list.
         let moved = &paths[0];
         assert_eq!(moved.stroke, Some([0.0, 0.0, 1.0]), "stroke stays blue");
-        assert!((moved.stroke_width - 3.0).abs() < 1e-9, "stroke width preserved");
+        assert!(
+            (moved.stroke_width - 3.0).abs() < 1e-9,
+            "stroke width preserved"
+        );
         assert_eq!(moved.dash, vec![4.0, 2.0], "dash preserved");
         // The red neighbour keeps its own stroke colour (not leaked to blue).
-        assert_eq!(paths[1].stroke, Some([1.0, 0.0, 0.0]), "neighbour stays red");
+        assert_eq!(
+            paths[1].stroke,
+            Some([1.0, 0.0, 0.0]),
+            "neighbour stays red"
+        );
     }
 
     #[test]
@@ -2675,7 +2780,11 @@ BT /F 12 Tf (BODY) Tj ET";
         let content = b"1 0 0 rg 10 10 20 20 re f 50 50 20 20 re f";
         let no_color = std::collections::BTreeMap::new();
         let edited = reorder_element(content, 0, true).unwrap();
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
+        let paths = vector::vector_paths_from_ops(
+            &parse_content(&edited).unwrap(),
+            &no_color,
+            &vector::NoNamedColors,
+        );
         assert_eq!(paths.len(), 2);
         // Both shapes must still be red.
         for p in &paths {
@@ -2696,7 +2805,10 @@ BT /F 12 Tf (BODY) Tj ET";
         let edited = reorder_element(content, text_index, false).unwrap();
         let s = String::from_utf8_lossy(&edited);
         // The captured fill colour and font are re-emitted before the moved run.
-        assert!(s.contains("0 1 0 rg"), "fill colour re-emitted for the text");
+        assert!(
+            s.contains("0 1 0 rg"),
+            "fill colour re-emitted for the text"
+        );
         assert!(s.contains("/F1 12 Tf"), "font re-emitted for the text");
         // The element's colour, as read back, is green.
         let text = extract_elements(&edited)
@@ -2704,7 +2816,11 @@ BT /F 12 Tf (BODY) Tj ET";
             .into_iter()
             .find(|e| e.kind == ElementKind::Text)
             .unwrap();
-        assert_eq!(text.color, Some([0.0, 1.0, 0.0]), "text keeps its green fill");
+        assert_eq!(
+            text.color,
+            Some([0.0, 1.0, 0.0]),
+            "text keeps its green fill"
+        );
         assert_eq!(text.font.as_deref(), Some("F1"), "text keeps its font");
     }
 
@@ -2719,10 +2835,22 @@ BT /F 12 Tf (BODY) Tj ET";
         let edited = reorder_element(content, 1, true).unwrap();
         let s = String::from_utf8_lossy(&edited);
         // Exactly one `rg` (the original scoped one) — none injected for the move.
-        assert_eq!(count(&edited, b"rg"), 1, "popped fill colour is not re-captured");
-        let paths = vector::vector_paths_from_ops(&parse_content(&edited).unwrap(), &no_color, &vector::NoNamedColors);
+        assert_eq!(
+            count(&edited, b"rg"),
+            1,
+            "popped fill colour is not re-captured"
+        );
+        let paths = vector::vector_paths_from_ops(
+            &parse_content(&edited).unwrap(),
+            &no_color,
+            &vector::NoNamedColors,
+        );
         // The moved shape (last painted) is default black.
-        assert_eq!(paths.last().unwrap().fill, Some([0.0, 0.0, 0.0]), "stays black");
+        assert_eq!(
+            paths.last().unwrap().fill,
+            Some([0.0, 0.0, 0.0]),
+            "stays black"
+        );
         let _ = s;
     }
 
@@ -2762,7 +2890,11 @@ BT /F 12 Tf (BODY) Tj ET";
             .find(|e| e.kind == ElementKind::Text)
             .expect("a text element");
         let c = text.color.expect("a resolved fill colour");
-        assert_ne!(c, [0.0, 0.0, 0.0], "named-space text must not fall back to black");
+        assert_ne!(
+            c,
+            [0.0, 0.0, 0.0],
+            "named-space text must not fall back to black"
+        );
         assert!(
             (c[2] - 0.4).abs() < 1e-9 && c[0] < 0.2 && c[1] < 0.2,
             "resolved Separation tint → deep blue, got {c:?}"
@@ -2779,7 +2911,11 @@ BT /F 12 Tf (BODY) Tj ET";
             .into_iter()
             .find(|e| e.kind == ElementKind::Text)
             .unwrap();
-        assert_eq!(text.color, Some([0.0, 0.0, 1.0]), "device rg keeps its blue");
+        assert_eq!(
+            text.color,
+            Some([0.0, 0.0, 1.0]),
+            "device rg keeps its blue"
+        );
     }
 
     /// An unresolvable named space falls back to `scn` arity inference (here a
@@ -2794,6 +2930,10 @@ BT /F 12 Tf (BODY) Tj ET";
             .into_iter()
             .find(|e| e.kind == ElementKind::Text)
             .unwrap();
-        assert_eq!(text.color, Some([0.0, 0.5, 1.0]), "3-comp scn → RGB by arity");
+        assert_eq!(
+            text.color,
+            Some([0.0, 0.5, 1.0]),
+            "3-comp scn → RGB by arity"
+        );
     }
 }

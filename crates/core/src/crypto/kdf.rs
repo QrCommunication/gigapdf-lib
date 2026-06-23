@@ -46,12 +46,26 @@ fn pbkdf2(
 
 /// PBKDF2 with HMAC-SHA-1 as the PRF.
 pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
-    pbkdf2(|p, m| hmac_sha1(p, m).to_vec(), 20, password, salt, iterations, dk_len)
+    pbkdf2(
+        |p, m| hmac_sha1(p, m).to_vec(),
+        20,
+        password,
+        salt,
+        iterations,
+        dk_len,
+    )
 }
 
 /// PBKDF2 with HMAC-SHA-256 as the PRF.
 pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
-    pbkdf2(|p, m| hmac_sha256(p, m).to_vec(), 32, password, salt, iterations, dk_len)
+    pbkdf2(
+        |p, m| hmac_sha256(p, m).to_vec(),
+        32,
+        password,
+        salt,
+        iterations,
+        dk_len,
+    )
 }
 
 // ─── PKCS#12 KDF (RFC 7292 Appendix B.2) ─────────────────────────────────────
@@ -118,8 +132,22 @@ pub fn pkcs12_kdf_sha1(id: u8, pass_bmp: &[u8], salt: &[u8], iterations: u32, n:
 }
 
 /// PKCS#12 KDF using SHA-256 (block size 64). `id`: 1 = key, 2 = IV, 3 = MAC.
-pub fn pkcs12_kdf_sha256(id: u8, pass_bmp: &[u8], salt: &[u8], iterations: u32, n: usize) -> Vec<u8> {
-    pkcs12_derive(|d| sha256(d).to_vec(), 64, id, pass_bmp, salt, iterations, n)
+pub fn pkcs12_kdf_sha256(
+    id: u8,
+    pass_bmp: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    n: usize,
+) -> Vec<u8> {
+    pkcs12_derive(
+        |d| sha256(d).to_vec(),
+        64,
+        id,
+        pass_bmp,
+        salt,
+        iterations,
+        n,
+    )
 }
 
 /// Encode `password` as a PKCS#12 BMPString: UTF-16BE code units followed by a
@@ -172,7 +200,7 @@ mod tests {
     #[test]
     fn bmp_string_encoding() {
         assert_eq!(hex(&bmp_string("")), "0000");
-        assert_eq!(hex(&bmp_string("ab")), "00610062" .to_owned() + "0000");
+        assert_eq!(hex(&bmp_string("ab")), "00610062".to_owned() + "0000");
     }
 
     #[test]

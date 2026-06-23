@@ -101,7 +101,8 @@ mod tests {
 
         let vk = VerifyingKey::<Sha256>::new(key.inner.to_public_key());
         let signature = Signature::try_from(sig.as_slice()).expect("sig parses");
-        vk.verify(msg, &signature).expect("RustCrypto verifies our signature");
+        vk.verify(msg, &signature)
+            .expect("RustCrypto verifies our signature");
     }
 
     #[test]

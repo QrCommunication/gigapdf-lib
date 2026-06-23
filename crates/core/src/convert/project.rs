@@ -317,7 +317,12 @@ impl Flow {
                 }
             } else {
                 // Empty item: still emit the marker so the structure is visible.
-                self.emit_line(item_indent, prefix.trim_end(), &CharStyle::default(), LineHeight::Normal);
+                self.emit_line(
+                    item_indent,
+                    prefix.trim_end(),
+                    &CharStyle::default(),
+                    LineHeight::Normal,
+                );
             }
             for block in blocks {
                 self.layout_block(block, item_indent);
@@ -581,7 +586,14 @@ fn place_table_box(page: &mut ConvPage, table: &Table, frame: Rect) {
 }
 
 /// Stack a list of text-bearing blocks downward from `(x, y)`, advancing `y`.
-fn place_blocks_at(page: &mut ConvPage, blocks: &[Block], x: f64, y: &mut f64, width: f64, indent: f64) {
+fn place_blocks_at(
+    page: &mut ConvPage,
+    blocks: &[Block],
+    x: f64,
+    y: &mut f64,
+    width: f64,
+    indent: f64,
+) {
     for block in blocks {
         match &block.kind {
             BlockKind::Paragraph(p) => {
@@ -650,7 +662,10 @@ fn sheet_page(sheet: &Sheet) -> ConvPage {
         .max()
         .unwrap_or(0)
         .max(sheet.col_widths.len());
-    let width: f64 = (0..n_cols).map(|c| column_width(&sheet.col_widths, c)).sum::<f64>() + 72.0;
+    let width: f64 = (0..n_cols)
+        .map(|c| column_width(&sheet.col_widths, c))
+        .sum::<f64>()
+        + 72.0;
     let height = (sheet.rows.len() as f64) * row_h + 72.0;
     let mut page = ConvPage {
         width: width.max(72.0),
@@ -731,7 +746,9 @@ fn slide_page(slide: &Slide) -> ConvPage {
 /// Place a single block on `page`, honouring its frame when present (slides give
 /// every shape a frame; a frameless one falls back to the page margin origin).
 fn place_block_on(page: &mut ConvPage, block: &Block) {
-    let frame = block.frame.unwrap_or(Rect::new(36.0, 36.0, page.width - 72.0, page.height - 72.0));
+    let frame = block
+        .frame
+        .unwrap_or(Rect::new(36.0, 36.0, page.width - 72.0, page.height - 72.0));
     match &block.kind {
         BlockKind::Image(img) => place_image(page, img, frame),
         BlockKind::Shape(shape) => place_shape(page, shape, frame),
@@ -830,7 +847,15 @@ pub fn pdf_from_model(doc: &Document) -> Vec<u8> {
             );
             let color = text.style.color.unwrap_or([0.0, 0.0, 0.0]);
             // `height` carries the run's font size (see `convert_pages`).
-            builder.text(idx, text.x, text.y, text.height.max(1.0), &text.text, font, color);
+            builder.text(
+                idx,
+                text.x,
+                text.y,
+                text.height.max(1.0),
+                &text.text,
+                font,
+                color,
+            );
         }
     }
     builder.finish()
@@ -883,10 +908,16 @@ mod tests {
             }),
             None,
         );
-        let body = block(BlockKind::Paragraph(paragraph("Some flowing body text.")), None);
+        let body = block(
+            BlockKind::Paragraph(paragraph("Some flowing body text.")),
+            None,
+        );
         let textbox = block(
             BlockKind::TextBox(TextBox {
-                blocks: vec![block(BlockKind::Paragraph(paragraph("Floating note")), None)],
+                blocks: vec![block(
+                    BlockKind::Paragraph(paragraph("Floating note")),
+                    None,
+                )],
             }),
             Some(Rect::new(300.0, 250.0, 180.0, 40.0)),
         );

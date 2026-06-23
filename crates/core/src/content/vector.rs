@@ -158,7 +158,11 @@ impl CsKind {
 /// Separation/DeviceN tint transform, honours ICCBased `/N`, Indexed palettes)
 /// and falling back to operand-count inference when the space is a device family
 /// or the resolver can't resolve the name.
-pub(crate) fn resolve_color(space: &CsKind, nums: &[f64], resolver: &dyn NamedColorResolver) -> Option<[f64; 3]> {
+pub(crate) fn resolve_color(
+    space: &CsKind,
+    nums: &[f64],
+    resolver: &dyn NamedColorResolver,
+) -> Option<[f64; 3]> {
     match space {
         CsKind::Device(s) => resolve_scn(*s, nums),
         CsKind::Named(name) => resolver

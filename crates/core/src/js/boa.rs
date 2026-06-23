@@ -482,7 +482,10 @@ mod tests {
         let out = run_inline_scripts(html);
         assert!(out.contains("r1=\"2\""), "child combinator `>`: {out}");
         assert!(out.contains("r2=\"P2\""), "adjacent sibling `+`: {out}");
-        assert!(out.contains("r3=\"S\""), "attribute selector `[a=v]`: {out}");
+        assert!(
+            out.contains("r3=\"S\""),
+            "attribute selector `[a=v]`: {out}"
+        );
         assert!(out.contains("r4=\"1\""), "descendant: {out}");
     }
 
@@ -499,6 +502,9 @@ mod tests {
         let html = "<body><span id=\"s\">_</span><script>globalThis.shared = 'hi'; throw new Error('x');</script>\
             <script>document.getElementById('s').textContent = globalThis.shared;</script></body>";
         let out = run_inline_scripts(html);
-        assert!(out.contains(">hi<"), "second script ran with shared global: {out}");
+        assert!(
+            out.contains(">hi<"),
+            "second script ran with shared global: {out}"
+        );
     }
 }

@@ -155,9 +155,16 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
     let mut offset = 0usize; // consumed bytes of `raw`
 
     if interlace == 0 {
-        decode_pass(&raw, &mut offset, &ctx, width, height, &mut rgba, width, |x, y| {
-            (x, y)
-        })?;
+        decode_pass(
+            &raw,
+            &mut offset,
+            &ctx,
+            width,
+            height,
+            &mut rgba,
+            width,
+            |x, y| (x, y),
+        )?;
     } else {
         // Adam7: 7 passes, each a sparse sub-image mapped onto the full grid.
         for &(x0, y0, dx, dy) in &ADAM7 {
@@ -166,9 +173,16 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
             if pw == 0 || ph == 0 {
                 continue;
             }
-            decode_pass(&raw, &mut offset, &ctx, pw, ph, &mut rgba, width, |px, py| {
-                (x0 + px * dx, y0 + py * dy)
-            })?;
+            decode_pass(
+                &raw,
+                &mut offset,
+                &ctx,
+                pw,
+                ph,
+                &mut rgba,
+                width,
+                |px, py| (x0 + px * dx, y0 + py * dy),
+            )?;
         }
     }
 
@@ -278,12 +292,12 @@ fn decode_pass(
                 0
             };
             let recon = match filter_type {
-                0 => src[i],                                  // None
-                1 => src[i].wrapping_add(left),               // Sub
-                2 => src[i].wrapping_add(above),              // Up
-                3 => src[i].wrapping_add(avg(left, above)),   // Average
+                0 => src[i],                                              // None
+                1 => src[i].wrapping_add(left),                           // Sub
+                2 => src[i].wrapping_add(above),                          // Up
+                3 => src[i].wrapping_add(avg(left, above)),               // Average
                 4 => src[i].wrapping_add(paeth(left, above, upper_left)), // Paeth
-                _ => return None,                             // unknown filter
+                _ => return None,                                         // unknown filter
             };
             unfiltered[dst_start + i] = recon;
         }
@@ -356,7 +370,7 @@ fn decode_pass(
 struct SampleReader<'a> {
     row: &'a [u8],
     depth: usize,
-    bit_pos: usize, // for depths < 8
+    bit_pos: usize,  // for depths < 8
     byte_pos: usize, // for depths 8 and 16
 }
 
@@ -399,9 +413,9 @@ impl<'a> SampleReader<'a> {
 /// Scale a raw sample value (range `0..=max_val`) to 8 bits.
 fn scale_to_u8(v: u16, max_val: u32) -> u8 {
     match max_val {
-        255 => v as u8,            // 8-bit: identity
-        65535 => (v >> 8) as u8,   // 16-bit: take the high byte
-        0 => 0,                    // unreachable (depth ≥ 1)
+        255 => v as u8,          // 8-bit: identity
+        65535 => (v >> 8) as u8, // 16-bit: take the high byte
+        0 => 0,                  // unreachable (depth ≥ 1)
         m => {
             // 1/2/4-bit: spread 0..=max_val across 0..=255.
             ((v as u32 * 255 + m / 2) / m) as u8
@@ -673,13 +687,19 @@ mod tests {
         let png = make_png(8, 8, 8, 6, 1, None, None, &idat);
         let img = decode_png(&png).expect("interlaced RGBA must decode");
         assert_eq!((img.width, img.height), (8, 8));
-        assert_eq!(img.rgba, baseline, "interlaced output matches non-interlaced");
+        assert_eq!(
+            img.rgba, baseline,
+            "interlaced output matches non-interlaced"
+        );
     }
 
     #[test]
     fn rejects_bad_depth_colour_combo() {
         // Colour type 3 (palette) at 16-bit is illegal per spec.
         let png = make_png(1, 1, 16, 3, 0, Some(&[0, 0, 0]), None, &[0, 0, 0]);
-        assert!(decode_png(&png).is_none(), "palette@16-bit must be rejected");
+        assert!(
+            decode_png(&png).is_none(),
+            "palette@16-bit must be rejected"
+        );
     }
 }
