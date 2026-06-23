@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.67.0] - 2026-06-23
+
+### Added
+
+- **Structured-editing ModelOps + permissions API exposed in the SDK.** New
+  `applyModelOps` variants: paragraph formatting (`setParagraphStyle` — align/indent/
+  spacing/line-height), lists (`setListLevel`/`setListMarker`/`setListOrdered`),
+  absolute block placement (`setBlockFrame`/`setBlockRotation`), and table styling
+  (`setCellShading`/`setRowHeight`/`setColWidth`/`setTableBorder`). Table structural
+  edits (`insertTableRow`/`deleteTableRow`/`insertTableColumn`/`deleteTableColumn`/
+  `setCellSpan` + sheet row/column ops) and `GigaPdfDoc` permission helpers
+  (`permissionsToP`/`decodePermissions`/`getPermissions` + `saveEncrypted({ flags })`)
+  are now callable from JS.
+
+### Changed
+
+- 8 PDF permission flags are functional: `/P` is computed from named flags per
+  ISO 32000-1 Table 22 (previously a cosmetic integer).
+
 ## [0.66.0] - 2026-06-23
 
 ### Added
