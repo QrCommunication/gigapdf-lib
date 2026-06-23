@@ -1230,6 +1230,7 @@ pub fn pptx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
             &theme,
             geom,
             &mut resources,
+            *n,
         ));
     }
 
@@ -1242,9 +1243,14 @@ pub fn pptx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     doc
 }
 
-/// Build one model [`Slide`] from a slide XML. Walks `p:sp` shapes (a paragraph
-/// list per shape, with its placeholder role) and `p:pic`/`a:blip` images.
-/// Mirrors [`pptx_slide`] but produces structured placeholders/shapes.
+/// Build one model [`Slide`] from a slide XML. Recursively walks the `p:spTree`,
+/// composing group (`p:grpSp`) transforms onto descendants, and lowers each
+/// shape (`p:sp`), picture (`p:pic`) and graphic frame (`p:graphicFrame` →
+/// table / chart / SmartArt) to a model [`Block`] carrying its absolute
+/// [`frame`](Block::frame)/[`rotation`](Block::rotation). Placeholder shapes
+/// (title/body/…) keep their semantic role and a placeholder whose own shape
+/// has no `a:xfrm` inherits geometry from the slide-layout → slide-master chain.
+/// `n` is the 1-based slide number (to locate the layout part for inheritance).
 fn pptx_slide_model(
     xml: &str,
     zip: &BTreeMap<String, Vec<u8>>,
@@ -1252,14 +1258,306 @@ fn pptx_slide_model(
     theme: &PptxTheme,
     geom: PageGeom,
     resources: &mut BTreeMap<u64, model::ImageResource>,
+    n: usize,
 ) -> Slide {
-    let mut placeholders: Vec<model::Placeholder> = Vec::new();
+    let inherit = PptxPlaceholderGeom::resolve(zip, rels, n);
+    let mut acc = PptxSlideAcc::default();
     let mut x = Xml::new(xml);
+    // Enter at the shape tree (skip the cSld/bg preamble); the recursive walker
+    // consumes `p:spTree`'s children and any nested groups.
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, _, sc) = &tok {
+            if local(name) == "spTree" && !sc {
+                pptx_walk_sptree(
+                    &mut x,
+                    zip,
+                    rels,
+                    theme,
+                    geom,
+                    resources,
+                    &inherit,
+                    IDENTITY_XFRM,
+                    &mut acc,
+                );
+                break;
+            }
+        }
+    }
 
-    // Per-shape scratch.
-    let mut in_shape = false;
-    let mut ph_role: Option<model::PlaceholderRole> = None;
+    Slide {
+        geometry: page_geometry(geom),
+        shapes: acc.shapes,
+        placeholders: acc.placeholders,
+        notes: None,
+    }
+}
+
+/// Accumulated slide content: semantic placeholders vs free-floating shapes.
+#[derive(Default)]
+struct PptxSlideAcc {
+    placeholders: Vec<model::Placeholder>,
+    shapes: Vec<Block>,
+}
+
+/// A group's accumulated child→parent transform: the absolute box the group is
+/// placed at (`off`/`ext`) plus the child coordinate space it declares
+/// (`chOff`/`chExt`). Child offsets/extents are mapped through this so a grouped
+/// shape lands at its real slide position. Composes for nested groups.
+#[derive(Clone, Copy)]
+struct GroupXfrm {
+    /// Group placement on the parent surface (points, top-left origin).
+    off_x: f64,
+    off_y: f64,
+    /// Group child coordinate-space origin (points).
+    ch_off_x: f64,
+    ch_off_y: f64,
+    /// Multiplicative scale child→parent (`ext/chExt`), `1.0` when undeclared.
+    scale_x: f64,
+    scale_y: f64,
+}
+
+/// The identity transform (top-level shapes are already in slide coordinates).
+const IDENTITY_XFRM: GroupXfrm = GroupXfrm {
+    off_x: 0.0,
+    off_y: 0.0,
+    ch_off_x: 0.0,
+    ch_off_y: 0.0,
+    scale_x: 1.0,
+    scale_y: 1.0,
+};
+
+impl GroupXfrm {
+    /// Map a child point `(x, y)` (in the current child coordinate space) to the
+    /// parent surface: subtract the child origin, scale, add the group offset.
+    fn point(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.off_x + (x - self.ch_off_x) * self.scale_x,
+            self.off_y + (y - self.ch_off_y) * self.scale_y,
+        )
+    }
+
+    /// Map a child extent (width/height) to parent units (scale only).
+    fn extent(&self, w: f64, h: f64) -> (f64, f64) {
+        (w * self.scale_x, h * self.scale_y)
+    }
+
+    /// Compose this transform with a nested group's own `a:xfrm` so its children
+    /// map straight to the outermost (slide) surface.
+    fn compose(&self, inner: &XfrmBox, in_ch_off: (f64, f64), in_ch_ext: (f64, f64)) -> GroupXfrm {
+        // Where the inner group sits on *our* surface, and how big.
+        let (px, py) = self.point(inner.x, inner.y);
+        let (pw, ph) = self.extent(inner.w, inner.h);
+        let (cox, coy) = in_ch_off;
+        let (cex, cey) = in_ch_ext;
+        let sx = if cex > 0.0 { pw / cex } else { self.scale_x };
+        let sy = if cey > 0.0 { ph / cey } else { self.scale_y };
+        GroupXfrm {
+            off_x: px,
+            off_y: py,
+            ch_off_x: cox,
+            ch_off_y: coy,
+            scale_x: sx,
+            scale_y: sy,
+        }
+    }
+}
+
+/// Convert a shape's local `a:xfrm` box, mapped through the active group
+/// transform `g`, into the model's lower-left-origin [`Rect`] (slide height
+/// `slide_h`) plus a [`Rotation`](model::Rotation). `None` rect when the box is
+/// degenerate (no usable `a:off`+`a:ext`) → caller falls back to flow / inherited
+/// geometry. OOXML rotation is clockwise (60000ths of a degree); the model's
+/// [`Rotation::Deg`] is counter-clockwise, so the sign is negated and the exact
+/// cardinal angles map to the first-class variants.
+fn xfrm_to_frame(
+    b: &XfrmBox,
+    g: &GroupXfrm,
+    slide_h: f64,
+) -> (Option<model::Rect>, crate::model::Rotation) {
+    let rotation = ooxml_rot_to_rotation(b.rot_deg);
+    if !b.is_placed() {
+        return (None, rotation);
+    }
+    let (x_top, y_top) = g.point(b.x, b.y);
+    let (w, h) = g.extent(b.w, b.h);
+    // Top-left (OOXML) → lower-left (model): flip Y about the slide height.
+    let rect = model::Rect::new(x_top, slide_h - (y_top + h), w, h);
+    (Some(rect), rotation)
+}
+
+/// Map an OOXML clockwise rotation (degrees) to the model's CCW [`Rotation`],
+/// snapping the exact quarter turns to the first-class cardinal variants.
+fn ooxml_rot_to_rotation(rot_cw_deg: f64) -> crate::model::Rotation {
+    use crate::model::Rotation;
+    // CW (OOXML) → CCW (model): negate, normalise to [0, 360).
+    let mut ccw = (-rot_cw_deg) % 360.0;
+    if ccw < 0.0 {
+        ccw += 360.0;
+    }
+    if ccw.abs() < 1e-6 || (ccw - 360.0).abs() < 1e-6 {
+        Rotation::D0
+    } else if (ccw - 90.0).abs() < 1e-6 {
+        Rotation::D90
+    } else if (ccw - 180.0).abs() < 1e-6 {
+        Rotation::D180
+    } else if (ccw - 270.0).abs() < 1e-6 {
+        Rotation::D270
+    } else {
+        Rotation::Deg(ccw)
+    }
+}
+
+/// Recursively walk a shape-tree body (`p:spTree` or a `p:grpSp` group; the open
+/// tag already consumed). Dispatches each child shape, descending into nested
+/// groups with their transform composed onto `g`, and stops at the matching
+/// `</p:spTree>` / `</p:grpSp>` (or EOF). Placeholder shapes go to
+/// `acc.placeholders`; everything else (incl. grouped content, charts, SmartArt)
+/// to `acc.shapes`.
+#[allow(clippy::too_many_arguments)]
+fn pptx_walk_sptree(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    geom: PageGeom,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+    inherit: &PptxPlaceholderGeom,
+    g: GroupXfrm,
+    acc: &mut PptxSlideAcc,
+) {
+    while let Some(tok) = x.next() {
+        match &tok {
+            Tok::Open(name, attrs, sc) if !sc => match local(name) {
+                "sp" => pptx_sp_model(x, theme, geom, inherit, &g, acc),
+                "pic" => pptx_pic_model(x, zip, rels, geom, resources, &g, acc),
+                "graphicFrame" => pptx_graphic_frame_model(x, zip, rels, theme, geom, &g, acc),
+                "grpSp" => {
+                    pptx_grp_sp_model(x, zip, rels, theme, geom, resources, inherit, &g, acc)
+                }
+                _ => {}
+            },
+            Tok::Close(name) if matches!(local(name), "spTree" | "grpSp") => break,
+            _ => {}
+        }
+    }
+}
+
+/// Walk a `p:grpSp` group (open consumed): read the group's own `p:grpSpPr/a:xfrm`
+/// (its placement *and* child coordinate space via `a:chOff`/`a:chExt`), compose
+/// it onto the inherited transform `g`, then recurse into the group body so each
+/// descendant lands at its true slide position.
+#[allow(clippy::too_many_arguments)]
+fn pptx_grp_sp_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    geom: PageGeom,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+    inherit: &PptxPlaceholderGeom,
+    g: &GroupXfrm,
+    acc: &mut PptxSlideAcc,
+) {
+    // The group transform appears as the FIRST a:xfrm (in p:grpSpPr); read it,
+    // then keep walking the same group body for its child shapes.
+    let mut composed = *g;
+    while let Some(tok) = x.next() {
+        match &tok {
+            Tok::Open(name, attrs, sc) => match local(name) {
+                "xfrm" if !sc => {
+                    let (b, ch_off, ch_ext) = parse_group_xfrm(x, attrs);
+                    composed = g.compose(&b, ch_off, ch_ext);
+                }
+                // Child shapes — same dispatch as the top-level tree.
+                "sp" if !sc => pptx_sp_model(x, theme, geom, inherit, &composed, acc),
+                "pic" if !sc => pptx_pic_model(x, zip, rels, geom, resources, &composed, acc),
+                "graphicFrame" if !sc => {
+                    pptx_graphic_frame_model(x, zip, rels, theme, geom, &composed, acc)
+                }
+                "grpSp" if !sc => pptx_grp_sp_model(
+                    x, zip, rels, theme, geom, resources, inherit, &composed, acc,
+                ),
+                _ => {}
+            },
+            Tok::Close(name) if local(name) == "grpSp" => break,
+            _ => {}
+        }
+    }
+}
+
+/// Read a group's `a:xfrm` (open consumed): its placement box (`a:off`/`a:ext`)
+/// plus the child coordinate space (`a:chOff`/`a:chExt`). Consumes up to
+/// `</a:xfrm>`. Returns `(box, (chOffX, chOffY), (chExtW, chExtH))` in points.
+fn parse_group_xfrm(
+    x: &mut Xml,
+    xfrm_attrs: &[(String, String)],
+) -> (XfrmBox, (f64, f64), (f64, f64)) {
+    let mut b = XfrmBox::default();
+    if let Some(r) = attr(xfrm_attrs, "rot").and_then(|v| v.trim().parse::<f64>().ok()) {
+        b.rot_deg = r / 60000.0;
+    }
+    let mut ch_off = (0.0, 0.0);
+    let mut ch_ext = (0.0, 0.0);
+    let mut have_off = false;
+    let mut have_ext = false;
+    let mut have_ch_off = false;
+    let mut have_ch_ext = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "off" if !have_off => {
+                    b.x = attr(&attrs, "x").and_then(emu_to_pt).unwrap_or(0.0);
+                    b.y = attr(&attrs, "y").and_then(emu_to_pt).unwrap_or(0.0);
+                    have_off = true;
+                }
+                "ext" if !have_ext => {
+                    b.w = attr(&attrs, "cx").and_then(emu_to_pt).unwrap_or(0.0);
+                    b.h = attr(&attrs, "cy").and_then(emu_to_pt).unwrap_or(0.0);
+                    have_ext = true;
+                }
+                "chOff" if !have_ch_off => {
+                    ch_off = (
+                        attr(&attrs, "x").and_then(emu_to_pt).unwrap_or(0.0),
+                        attr(&attrs, "y").and_then(emu_to_pt).unwrap_or(0.0),
+                    );
+                    have_ch_off = true;
+                }
+                "chExt" if !have_ch_ext => {
+                    ch_ext = (
+                        attr(&attrs, "cx").and_then(emu_to_pt).unwrap_or(0.0),
+                        attr(&attrs, "cy").and_then(emu_to_pt).unwrap_or(0.0),
+                    );
+                    have_ch_ext = true;
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "xfrm" => break,
+            _ => {}
+        }
+    }
+    (b, ch_off, ch_ext)
+}
+
+/// Lower one `p:sp` shape (open consumed): its placeholder role (`p:ph@type`),
+/// its own `a:xfrm` (→ absolute frame) and its `p:txBody` paragraphs (→ a
+/// [`TextBox`]). A placeholder with no own `a:xfrm` inherits geometry from the
+/// layout/master chain (`inherit`). Empty text boxes are dropped. Consumes the
+/// subtree up to `</p:sp>`.
+fn pptx_sp_model(
+    x: &mut Xml,
+    theme: &PptxTheme,
+    geom: PageGeom,
+    inherit: &PptxPlaceholderGeom,
+    g: &GroupXfrm,
+    acc: &mut PptxSlideAcc,
+) {
+    let mut ph: Option<PhKey> = None;
+    let mut have_ph = false;
+    let mut xfrm = XfrmBox::default();
+    let mut have_xfrm = false;
     let mut paras: Vec<Block> = Vec::new();
+
+    // Per-paragraph scratch.
     let mut para_runs: Vec<Inline> = Vec::new();
     let mut in_para = false;
     let mut run = RunStyle::default();
@@ -1269,19 +1567,13 @@ fn pptx_slide_model(
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => match local(&name) {
-                "sp" if !sc => {
-                    in_shape = true;
-                    ph_role = None;
-                    paras.clear();
-                }
                 "ph" => {
-                    // Placeholder role from p:ph@type (title/ctrTitle/subTitle/…).
-                    ph_role = Some(match attr(&attrs, "type") {
-                        Some("title") | Some("ctrTitle") => model::PlaceholderRole::Title,
-                        Some("subTitle") => model::PlaceholderRole::Subtitle,
-                        Some("body") | None => model::PlaceholderRole::Body,
-                        Some(other) => model::PlaceholderRole::Other(other.to_string()),
-                    });
+                    have_ph = true;
+                    ph = Some(PhKey::from_attrs(&attrs));
+                }
+                "xfrm" if !sc && !have_xfrm => {
+                    xfrm = parse_xfrm(x, &attrs);
+                    have_xfrm = true;
                 }
                 "p" if !sc => {
                     in_para = true;
@@ -1301,25 +1593,16 @@ fn pptx_slide_model(
                         }
                     }
                 }
+                "schemeClr" if in_rpr => {
+                    if let Some(c) = attr(&attrs, "val").and_then(|v| theme.resolve_scheme(v)) {
+                        run.color = Some(c);
+                    }
+                }
                 "latin" if in_rpr => {
                     run.font_family = attr(&attrs, "typeface").and_then(|t| theme.resolve(t));
                 }
                 "t" if !sc => in_text = true,
                 "br" => para_runs.push(Inline::LineBreak),
-                "blip" => {
-                    if let Some(rid) = attr(&attrs, "embed").or_else(|| attr(&attrs, "link")) {
-                        if let Some(img) = rels
-                            .get(rid)
-                            .map(|t| resolve_target("ppt", t))
-                            .and_then(|k| image_block(zip, &k, resources))
-                        {
-                            placeholders.push(model::Placeholder {
-                                role: model::PlaceholderRole::Other("picture".to_string()),
-                                block: img,
-                            });
-                        }
-                    }
-                }
                 _ => {}
             },
             Tok::Text(t) => {
@@ -1342,32 +1625,743 @@ fn pptx_slide_model(
                     }
                     in_para = false;
                 }
-                "sp" => {
-                    if in_shape && !paras.is_empty() {
-                        let block = Block {
-                            kind: BlockKind::TextBox(model::TextBox {
-                                blocks: std::mem::take(&mut paras),
-                            }),
+                "sp" => break,
+                _ => {}
+            },
+        }
+    }
+
+    if paras.is_empty() {
+        return;
+    }
+
+    // Geometry: the shape's own xfrm wins; otherwise a placeholder inherits from
+    // the layout/master chain by matching its `p:ph` key.
+    let (frame, rotation) = if have_xfrm && xfrm.is_placed() {
+        xfrm_to_frame(&xfrm, g, geom.h)
+    } else if have_ph {
+        match ph.as_ref().and_then(|k| inherit.lookup(k)) {
+            Some(b) => xfrm_to_frame(&b, g, geom.h),
+            None => (None, crate::model::Rotation::D0),
+        }
+    } else {
+        (None, crate::model::Rotation::D0)
+    };
+
+    let block = Block {
+        frame,
+        rotation,
+        kind: BlockKind::TextBox(model::TextBox { blocks: paras }),
+        ..Block::default()
+    };
+
+    if have_ph {
+        acc.placeholders.push(model::Placeholder {
+            role: ph.map(|k| k.role()).unwrap_or(model::PlaceholderRole::Body),
+            block,
+        });
+    } else {
+        acc.shapes.push(block);
+    }
+}
+
+/// Lower one `p:pic` picture (open consumed): its `a:xfrm` (→ frame) and embedded
+/// `a:blip` image. Consumes the subtree up to `</p:pic>`. The image lands in
+/// `acc.shapes` (a picture is not a semantic placeholder).
+fn pptx_pic_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    geom: PageGeom,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+    g: &GroupXfrm,
+    acc: &mut PptxSlideAcc,
+) {
+    let mut xfrm = XfrmBox::default();
+    let mut have_xfrm = false;
+    let mut img: Option<Block> = None;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "xfrm" if !sc && !have_xfrm => {
+                    xfrm = parse_xfrm(x, &attrs);
+                    have_xfrm = true;
+                }
+                "blip" if img.is_none() => {
+                    if let Some(rid) = attr(&attrs, "embed").or_else(|| attr(&attrs, "link")) {
+                        img = rels
+                            .get(rid)
+                            .map(|t| resolve_rel_part("ppt/slides", t))
+                            .and_then(|k| image_block(zip, &k, resources));
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "pic" => break,
+            _ => {}
+        }
+    }
+
+    if let Some(mut block) = img {
+        let (frame, rotation) = xfrm_to_frame(&xfrm, g, geom.h);
+        block.frame = frame;
+        block.rotation = rotation;
+        acc.shapes.push(block);
+    }
+}
+
+/// Lower one `p:graphicFrame` (open consumed): read its `p:xfrm` for placement,
+/// then dispatch on the `a:graphicData` payload — a native table (`a:tbl`), a
+/// chart (`c:chart`, resolved via rels → title + series as a [`Table`]) or
+/// SmartArt (`dgm:relIds`, resolved → node text as a [`List`]). The resulting
+/// block lands in `acc.shapes` with its absolute frame. Consumes up to
+/// `</p:graphicFrame>`.
+#[allow(clippy::too_many_arguments)]
+fn pptx_graphic_frame_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    geom: PageGeom,
+    g: &GroupXfrm,
+    acc: &mut PptxSlideAcc,
+) {
+    let mut xfrm = XfrmBox::default();
+    let mut have_xfrm = false;
+    let mut block: Option<Block> = None;
+
+    while let Some(tok) = x.next() {
+        match &tok {
+            Tok::Open(name, attrs, sc) => match local(name) {
+                "xfrm" if !sc && !have_xfrm => {
+                    xfrm = parse_xfrm(x, attrs);
+                    have_xfrm = true;
+                }
+                "tbl" if !sc && block.is_none() => {
+                    block = Some(Block {
+                        kind: BlockKind::Table(pptx_table_model(x, theme)),
+                        ..Block::default()
+                    });
+                }
+                // A chart reference: `<c:chart r:id="rIdN"/>`.
+                "chart" if block.is_none() => {
+                    if let Some(rid) = attr(attrs, "id") {
+                        block = pptx_chart_model(zip, rels, rid).map(|t| Block {
+                            kind: BlockKind::Table(t),
                             ..Block::default()
-                        };
-                        placeholders.push(model::Placeholder {
-                            role: ph_role.take().unwrap_or(model::PlaceholderRole::Body),
-                            block,
                         });
                     }
-                    in_shape = false;
+                }
+                // A SmartArt diagram: `<dgm:relIds r:dm="rIdN" …/>` → data part.
+                "relIds" if block.is_none() => {
+                    if let Some(rid) = attr(attrs, "dm") {
+                        block = pptx_smartart_model(zip, rels, rid).map(|list| Block {
+                            kind: BlockKind::List(list),
+                            ..Block::default()
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(name) == "graphicFrame" => break,
+            _ => {}
+        }
+    }
+
+    if let Some(mut block) = block {
+        let (frame, rotation) = xfrm_to_frame(&xfrm, g, geom.h);
+        block.frame = frame;
+        block.rotation = rotation;
+        acc.shapes.push(block);
+    } else {
+        // Unknown/unsupported graphic payload (e.g. an OLE object or a chart whose
+        // part is missing): surface a labelled placeholder paragraph rather than
+        // dropping the frame silently.
+        let (frame, rotation) = xfrm_to_frame(&xfrm, g, geom.h);
+        acc.shapes.push(Block {
+            frame,
+            rotation,
+            kind: BlockKind::TextBox(model::TextBox {
+                blocks: vec![text_paragraph_block("[graphic]".to_string())],
+            }),
+            ..Block::default()
+        });
+    }
+}
+
+/// A `p:ph` placeholder key: its semantic type and optional index (`@idx`), used
+/// both to derive the model role and to match the layout/master geometry.
+#[derive(Clone, PartialEq, Eq, Default)]
+struct PhKey {
+    ty: Option<String>,
+    idx: Option<String>,
+}
+
+impl PhKey {
+    fn from_attrs(attrs: &[(String, String)]) -> Self {
+        PhKey {
+            ty: attr(attrs, "type").map(|s| s.to_string()),
+            idx: attr(attrs, "idx").map(|s| s.to_string()),
+        }
+    }
+
+    /// The model placeholder role implied by `@type` (default `Body`).
+    fn role(&self) -> model::PlaceholderRole {
+        match self.ty.as_deref() {
+            Some("title") | Some("ctrTitle") => model::PlaceholderRole::Title,
+            Some("subTitle") => model::PlaceholderRole::Subtitle,
+            Some("body") | None => model::PlaceholderRole::Body,
+            Some(other) => model::PlaceholderRole::Other(other.to_string()),
+        }
+    }
+}
+
+/// Placeholder geometry inherited from the slide's layout → master chain, keyed
+/// by `p:ph` `@idx` (preferred — unique per layout) then by `@type`. Built once
+/// per slide; empty when the layout/master can't be resolved.
+#[derive(Default)]
+struct PptxPlaceholderGeom {
+    by_idx: BTreeMap<String, XfrmBox>,
+    by_type: BTreeMap<String, XfrmBox>,
+}
+
+impl PptxPlaceholderGeom {
+    /// Resolve the layout (`ppt/slides/_rels/slideN.xml.rels` → `slideLayout`)
+    /// then the master (`…/slideLayoutM.xml.rels` → `slideMaster`), collecting
+    /// each `p:sp`'s placeholder `a:xfrm`. Layout entries win over master ones.
+    fn resolve(
+        zip: &BTreeMap<String, Vec<u8>>,
+        rels: &BTreeMap<String, String>,
+        _n: usize,
+    ) -> Self {
+        let mut geom = PptxPlaceholderGeom::default();
+        // Slide → layout (the slide rels live in `ppt/slides/_rels`, so targets
+        // resolve relative to `ppt/slides`).
+        let Some(layout_key) = rels
+            .values()
+            .map(|t| resolve_rel_part("ppt/slides", t))
+            .find(|k| k.contains("slideLayout") && k.ends_with(".xml"))
+        else {
+            return geom;
+        };
+        // Master is reached through the *layout's* rels.
+        if let Some(master_xml) = layout_rels_master(zip, &layout_key) {
+            geom.collect(&master_xml); // master first (lower priority)
+        }
+        if let Some(bytes) = zip.get(&layout_key) {
+            geom.collect(&String::from_utf8_lossy(bytes)); // layout overrides
+        }
+        geom
+    }
+
+    /// Scan one layout/master XML, recording every placeholder shape's
+    /// `a:xfrm` under its `@idx` and `@type`.
+    fn collect(&mut self, xml: &str) {
+        let mut x = Xml::new(xml);
+        let mut cur: Option<PhKey> = None;
+        let mut in_sp = false;
+        while let Some(tok) = x.next() {
+            match &tok {
+                Tok::Open(name, attrs, sc) => match local(name) {
+                    "sp" if !sc => {
+                        in_sp = true;
+                        cur = None;
+                    }
+                    "ph" if in_sp => cur = Some(PhKey::from_attrs(attrs)),
+                    "xfrm" if in_sp && !sc => {
+                        let b = parse_xfrm(&mut x, attrs);
+                        if b.is_placed() {
+                            if let Some(k) = &cur {
+                                if let Some(idx) = &k.idx {
+                                    self.by_idx.insert(idx.clone(), b);
+                                }
+                                if let Some(ty) = &k.ty {
+                                    self.by_type.insert(ty.clone(), b);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Tok::Close(name) if local(name) == "sp" => in_sp = false,
+                _ => {}
+            }
+        }
+    }
+
+    /// Look up a placeholder's inherited box: by `@idx` first (most specific),
+    /// then by `@type`.
+    fn lookup(&self, key: &PhKey) -> Option<XfrmBox> {
+        key.idx
+            .as_ref()
+            .and_then(|i| self.by_idx.get(i))
+            .or_else(|| key.ty.as_ref().and_then(|t| self.by_type.get(t)))
+            .copied()
+    }
+}
+
+/// Resolve a slide-layout part's master XML via its sibling `_rels`
+/// (`…/slideLayouts/_rels/slideLayoutM.xml.rels` → `slideMaster`). `None` when
+/// the rels or master part is missing.
+fn layout_rels_master(zip: &BTreeMap<String, Vec<u8>>, layout_key: &str) -> Option<String> {
+    let rels_key = part_rels_key(layout_key);
+    let rels = parse_rels(&String::from_utf8_lossy(zip.get(&rels_key)?));
+    // Targets in the layout's rels resolve relative to the layout's directory.
+    let from_dir = layout_key.rsplit_once('/').map(|(d, _)| d).unwrap_or("ppt");
+    let master_key = rels
+        .values()
+        .map(|t| resolve_rel_part(from_dir, t))
+        .find(|k| k.contains("slideMaster") && k.ends_with(".xml"))?;
+    zip.get(&master_key)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+}
+
+/// The `_rels/<file>.rels` key for an OOXML part path (e.g.
+/// `ppt/slideLayouts/slideLayout1.xml` → `ppt/slideLayouts/_rels/slideLayout1.xml.rels`).
+fn part_rels_key(part: &str) -> String {
+    match part.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
+        None => format!("_rels/{part}.rels"),
+    }
+}
+
+/// Lower a PPTX `a:tbl` (open consumed) to a model [`Table`]: `a:tblGrid/a:gridCol@w`
+/// seeds `col_widths` (points); each `a:tr`→[`Row`], each `a:tc`→[`Cell`] with
+/// `@gridSpan`/`@rowSpan`→spans and `@hMerge`/`@vMerge` continuation cells folded
+/// into empty placeholders. Cell text reuses the slide paragraph grammar.
+fn pptx_table_model(x: &mut Xml, theme: &PptxTheme) -> Table {
+    let mut col_widths: Vec<f64> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut cur: Option<Vec<Cell>> = None;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == "gridCol" {
+                    if let Some(w) = attr(&attrs, "w").and_then(emu_to_pt) {
+                        if w > 0.0 {
+                            col_widths.push(w);
+                        }
+                    }
+                } else if ln == "tr" && !sc {
+                    cur = Some(Vec::new());
+                } else if ln == "tc" && !sc {
+                    let cell = pptx_table_cell_model(x, theme, &attrs);
+                    if let Some(row) = cur.as_mut() {
+                        for c in cell {
+                            row.push(c);
+                        }
+                    }
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if ln == "tr" {
+                    if let Some(cells) = cur.take() {
+                        rows.push(Row {
+                            cells,
+                            height: None,
+                        });
+                    }
+                } else if ln == "tbl" {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+
+    Table {
+        rows,
+        col_widths,
+        border: model::BorderStyle::default(),
+    }
+}
+
+/// Lower one PPTX `a:tc` cell (open consumed, attrs in `cell_attrs`) to model
+/// [`Cell`]s. `@gridSpan` widens the cell and pads the row with empty cells so
+/// the column count stays correct; `@rowSpan` sets `row_span`; an `@hMerge`
+/// continuation is dropped (covered to its left) and a `@vMerge` continuation
+/// becomes one empty cell. Consumes up to `</a:tc>`.
+fn pptx_table_cell_model(
+    x: &mut Xml,
+    theme: &PptxTheme,
+    cell_attrs: &[(String, String)],
+) -> Vec<Cell> {
+    let grid_span = attr(cell_attrs, "gridSpan")
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let row_span = attr(cell_attrs, "rowSpan")
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let h_merge = matches!(attr(cell_attrs, "hMerge"), Some("1") | Some("true"));
+    let v_merge = matches!(attr(cell_attrs, "vMerge"), Some("1") | Some("true"));
+
+    let mut paras: Vec<Block> = Vec::new();
+    let mut para_runs: Vec<Inline> = Vec::new();
+    let mut in_para = false;
+    let mut run = RunStyle::default();
+    let mut in_rpr = false;
+    let mut in_text = false;
+    let mut depth = 0i32; // <a:tc> nesting guard
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "tc" if !sc => depth += 1,
+                "p" if !sc => {
+                    in_para = true;
+                    para_runs = Vec::new();
+                }
+                "rPr" if !sc => {
+                    in_rpr = true;
+                    run = pptx_run_props(&attrs);
+                    if sc {
+                        in_rpr = false;
+                    }
+                }
+                "srgbClr" if in_rpr => {
+                    if let Some(v) = attr(&attrs, "val") {
+                        if is_hex6(v) {
+                            run.color = Some(v.to_ascii_uppercase());
+                        }
+                    }
+                }
+                "schemeClr" if in_rpr => {
+                    if let Some(c) = attr(&attrs, "val").and_then(|v| theme.resolve_scheme(v)) {
+                        run.color = Some(c);
+                    }
+                }
+                "latin" if in_rpr => {
+                    run.font_family = attr(&attrs, "typeface").and_then(|t| theme.resolve(t));
+                }
+                "t" if !sc => in_text = true,
+                "br" => para_runs.push(Inline::LineBreak),
+                _ => {}
+            },
+            Tok::Text(t) => {
+                if in_para && in_text && !t.is_empty() {
+                    push_run(&mut para_runs, &run, &t);
+                }
+            }
+            Tok::Close(name) => match local(&name) {
+                "t" => in_text = false,
+                "rPr" => in_rpr = false,
+                "p" => {
+                    if in_para && !para_runs.is_empty() {
+                        paras.push(Block {
+                            kind: BlockKind::Paragraph(Paragraph {
+                                runs: std::mem::take(&mut para_runs),
+                                ..Paragraph::default()
+                            }),
+                            ..Block::default()
+                        });
+                    }
+                    in_para = false;
+                }
+                "tc" => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
                 }
                 _ => {}
             },
         }
     }
 
-    Slide {
-        geometry: page_geometry(geom),
-        shapes: Vec::new(),
-        placeholders,
-        notes: None,
+    // Horizontal-merge continuation: covered by the cell spanning it — drop.
+    if h_merge {
+        return Vec::new();
     }
+    // Vertical-merge continuation: one empty cell to keep the column count.
+    if v_merge {
+        return vec![Cell::default()];
+    }
+
+    let mut cells = vec![Cell {
+        blocks: paras,
+        col_span: grid_span,
+        row_span,
+        shading: None,
+    }];
+    // Pad to `grid_span` physical columns (empty continuation cells).
+    for _ in 1..grid_span {
+        cells.push(Cell::default());
+    }
+    cells
+}
+
+/// Extract a chart referenced by `rid` (resolved via `rels` → `ppt/charts/chartN.xml`)
+/// into a model [`Table`]: header row = the category axis (blank corner + each
+/// category label); one row per series (series name + its values). `None` when
+/// the chart part is missing or carries no legible series. This keeps the chart's
+/// *data* editable instead of dropping it (a vector re-render is out of scope).
+fn pptx_chart_model(
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    rid: &str,
+) -> Option<Table> {
+    let key = resolve_rel_part("ppt/slides", rels.get(rid)?);
+    let xml = String::from_utf8_lossy(zip.get(&key)?);
+    let chart = parse_pptx_chart(&xml);
+    if chart.series.is_empty() && chart.title.is_none() {
+        return None;
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+
+    // Optional title as a single full-width-ish first row (one cell).
+    if let Some(title) = &chart.title {
+        if !title.is_empty() {
+            rows.push(Row {
+                cells: vec![chart_cell(title)],
+                height: None,
+            });
+        }
+    }
+
+    // Header: blank corner + categories (use the longest series' category list).
+    let categories = chart
+        .series
+        .iter()
+        .map(|s| s.categories.len())
+        .max()
+        .unwrap_or(0);
+    if categories > 0 {
+        let mut header = vec![Cell::default()];
+        // Pick the first non-empty category list.
+        let cats = chart
+            .series
+            .iter()
+            .map(|s| &s.categories)
+            .find(|c| !c.is_empty());
+        if let Some(cats) = cats {
+            for c in cats {
+                header.push(chart_cell(c));
+            }
+        }
+        rows.push(Row {
+            cells: header,
+            height: None,
+        });
+    }
+
+    // One row per series: name + values.
+    for s in &chart.series {
+        let mut cells = vec![chart_cell(&s.name)];
+        for v in &s.values {
+            cells.push(chart_cell(v));
+        }
+        rows.push(Row {
+            cells,
+            height: None,
+        });
+    }
+
+    if rows.is_empty() {
+        return None;
+    }
+    Some(Table {
+        rows,
+        col_widths: Vec::new(),
+        border: model::BorderStyle::default(),
+    })
+}
+
+/// A plain text [`Cell`] holding one default-styled paragraph (chart/SmartArt
+/// extraction).
+fn chart_cell(text: &str) -> Cell {
+    Cell {
+        blocks: vec![text_paragraph_block(text.to_string())],
+        ..Cell::default()
+    }
+}
+
+/// One extracted chart series: its name plus its category labels and values.
+#[derive(Default)]
+struct PptxChartSeries {
+    name: String,
+    categories: Vec<String>,
+    values: Vec<String>,
+}
+
+/// The legible content of a chart part: an optional title and its series.
+#[derive(Default)]
+struct PptxChart {
+    title: Option<String>,
+    series: Vec<PptxChartSeries>,
+}
+
+/// Parse a chart part (`c:chartSpace`) for its title and series. Series names,
+/// categories and values are read from the cached string/number references
+/// (`c:strRef/c:strCache` and `c:numRef/c:numCache` → `c:pt/c:v`) that every
+/// saved chart embeds, so no spreadsheet evaluation is needed. The title is read
+/// from `c:title` rich text (`a:t`) or its string cache.
+fn parse_pptx_chart(xml: &str) -> PptxChart {
+    let mut chart = PptxChart::default();
+    let mut x = Xml::new(xml);
+
+    // Context flags for the streaming walk.
+    let mut in_title = false;
+    let mut in_ser = false;
+    let mut ser: PptxChartSeries = PptxChartSeries::default();
+    // Which part of the series the current cache belongs to.
+    #[derive(PartialEq)]
+    enum Field {
+        None,
+        SerTx,
+        Cat,
+        Val,
+    }
+    let mut field = Field::None;
+    let mut in_v = false;
+    let mut v_buf = String::new();
+    let mut title_buf = String::new();
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _attrs, sc) => match local(&name) {
+                "title" if !sc => in_title = true,
+                "ser" if !sc => {
+                    in_ser = true;
+                    ser = PptxChartSeries::default();
+                }
+                "tx" if in_ser => field = Field::SerTx,
+                "cat" if in_ser => field = Field::Cat,
+                "val" if in_ser => field = Field::Val,
+                "v" if !sc => {
+                    in_v = true;
+                    v_buf.clear();
+                }
+                _ => {}
+            },
+            Tok::Text(t) => {
+                if in_v {
+                    v_buf.push_str(&t);
+                } else if in_title {
+                    // Title rich text (a:t) lands here too.
+                    title_buf.push_str(&t);
+                }
+            }
+            Tok::Close(name) => match local(&name) {
+                "v" => {
+                    in_v = false;
+                    let val = v_buf.trim().to_string();
+                    if !val.is_empty() {
+                        match field {
+                            Field::SerTx => {
+                                if ser.name.is_empty() {
+                                    ser.name = val;
+                                }
+                            }
+                            Field::Cat => ser.categories.push(val),
+                            Field::Val => ser.values.push(val),
+                            Field::None => {}
+                        }
+                    }
+                }
+                "tx" | "cat" | "val" => field = Field::None,
+                "ser" => {
+                    in_ser = false;
+                    chart.series.push(std::mem::take(&mut ser));
+                }
+                "title" => {
+                    in_title = false;
+                    let t = title_buf.trim();
+                    if !t.is_empty() && chart.title.is_none() {
+                        chart.title = Some(t.to_string());
+                    }
+                    title_buf.clear();
+                }
+                _ => {}
+            },
+        }
+    }
+    chart
+}
+
+/// Extract a SmartArt diagram's node text into a model [`List`]. `rid` is the
+/// `dgm:relIds@r:dm` data-model relationship (resolved via `rels` →
+/// `ppt/diagrams/dataN.xml`); each diagram point's text (`dgm:t` → `a:t`) becomes
+/// a bullet item. `None` when the data part is missing or empty — keeping the
+/// diagram's *text* rather than dropping it (rendering the diagram is out of
+/// scope).
+fn pptx_smartart_model(
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    rid: &str,
+) -> Option<List> {
+    let key = resolve_rel_part("ppt/slides", rels.get(rid)?);
+    let xml = String::from_utf8_lossy(zip.get(&key)?);
+    let items = parse_pptx_diagram_text(&xml);
+    if items.is_empty() {
+        return None;
+    }
+    Some(List {
+        ordered: false,
+        marker: ListMarker::Bullet('\u{2022}'),
+        items: items
+            .into_iter()
+            .map(|text| ListItem {
+                blocks: vec![text_paragraph_block(text)],
+                level: 0,
+            })
+            .collect(),
+    })
+}
+
+/// Collect a SmartArt data model's node texts. Each `dgm:pt` text body
+/// (`dgm:t`, a Drawing-ML text body) contributes one entry, with its paragraphs
+/// joined by spaces. Empty texts are skipped.
+fn parse_pptx_diagram_text(xml: &str) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    let mut x = Xml::new(xml);
+    let mut in_t = false; // inside a <dgm:t> text body
+    let mut in_text = false; // inside an <a:t>
+    let mut cur = String::new();
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, sc) => match local(&name) {
+                "t" if !sc => {
+                    // `dgm:t` opens a text body; `a:t` (nested) carries the runs.
+                    // Distinguish by depth: the outer `t` starts the body, the
+                    // inner `t` is the run text.
+                    if !in_t {
+                        in_t = true;
+                        cur.clear();
+                    } else {
+                        in_text = true;
+                    }
+                }
+                _ => {}
+            },
+            Tok::Text(s) => {
+                if in_t && in_text {
+                    cur.push_str(&s);
+                }
+            }
+            Tok::Close(name) => {
+                if local(&name) == "t" {
+                    if in_text {
+                        in_text = false;
+                    } else if in_t {
+                        in_t = false;
+                        let trimmed = cur.trim();
+                        if !trimmed.is_empty() {
+                            items.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    items
 }
 
 // ─────────────────────────────── ODF → model ──────────────────────────────────
@@ -2187,6 +3181,30 @@ fn resolve_target(base: &str, target: &str) -> String {
     } else {
         format!("{base}/{t}")
     }
+}
+
+/// Resolve a relationship `Target` against the **directory of the source part**
+/// (`from_dir`), following the OPC convention exactly: an absolute `/x` is taken
+/// from the package root, otherwise the target is appended to `from_dir` with
+/// each leading `../` popping one `from_dir` segment. This is correct for parts
+/// nested more than one level deep (e.g. a slide at `ppt/slides/slideN.xml`
+/// whose rels point at `../charts/chartN.xml` → `ppt/charts/chartN.xml`), which
+/// the package-root [`resolve_target`] mishandles.
+fn resolve_rel_part(from_dir: &str, target: &str) -> String {
+    if let Some(abs) = target.strip_prefix('/') {
+        return abs.to_string();
+    }
+    let mut segs: Vec<&str> = from_dir.split('/').filter(|s| !s.is_empty()).collect();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            other => segs.push(other),
+        }
+    }
+    segs.join("/")
 }
 
 // ════════════════════════ embedded-font extraction ════════════════════════════
@@ -10513,5 +11531,392 @@ mod tests {
         );
         // A literal cell carries no formula (regression guard).
         assert!(sheet.rows[0].cells[0].formula.is_none());
+    }
+
+    // ── PPTX → model (geometry / groups / charts / inheritance / SmartArt) ──
+
+    /// Build a single-slide PPTX zip with a 960×540pt slide size and the given
+    /// slide-XML body, returning the lowered [`Slide`].
+    fn pptx_model_slide(slide_xml: &str) -> Slide {
+        pptx_model_slide_parts(&[("ppt/slides/slide1.xml", slide_xml)], &[])
+    }
+
+    /// Build a PPTX zip from `(path, xml)` parts (the slide(s), layout/master,
+    /// charts, diagrams, …) plus `(path, bytes)` raw parts, and return the FIRST
+    /// slide of the lowered model.
+    fn pptx_model_slide_parts(parts: &[(&str, &str)], raw: &[(&str, &[u8])]) -> Slide {
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "ppt/presentation.xml",
+            br#"<p:presentation xmlns:p="p"><p:sldSz cx="12192000" cy="6858000"/></p:presentation>"#,
+        );
+        for (path, xml) in parts {
+            z.add_stored(path, xml.as_bytes());
+        }
+        for (path, bytes) in raw {
+            z.add_stored(path, bytes);
+        }
+        let pptx = z.finish();
+        let model = office_to_model(&pptx).expect("pptx → model");
+        match model.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Slide(sb) => sb.slides.into_iter().next().expect("one slide"),
+            other => panic!("expected a Slide block, got {other:?}"),
+        }
+    }
+
+    /// The concatenated plain text of a [`TextBox`]/paragraph block tree.
+    fn block_text(b: &Block) -> String {
+        fn walk(blocks: &[Block], out: &mut String) {
+            for b in blocks {
+                match &b.kind {
+                    BlockKind::Paragraph(p) | BlockKind::Heading(Heading { para: p, .. }) => {
+                        for r in &p.runs {
+                            if let Inline::Run(run) = r {
+                                out.push_str(&run.text);
+                            }
+                        }
+                        out.push(' ');
+                    }
+                    BlockKind::TextBox(tb) => walk(&tb.blocks, out),
+                    BlockKind::List(l) => {
+                        for it in &l.items {
+                            walk(&it.blocks, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut s = String::new();
+        walk(std::slice::from_ref(b), &mut s);
+        s.trim().to_string()
+    }
+
+    #[test]
+    fn pptx_model_shape_xfrm_becomes_frame_and_rotation() {
+        // off x=914400 (72pt) y=457200 (36pt); ext cx=1828800 (144pt) cy=914400
+        // (72pt); rot=5400000 (90° clockwise). A non-placeholder text box → a
+        // free shape carrying its lower-left-origin frame and CCW rotation.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp>
+                <p:spPr><a:xfrm rot="5400000"><a:off x="914400" y="457200"/><a:ext cx="1828800" cy="914400"/></a:xfrm></p:spPr>
+                <p:txBody><a:p><a:r><a:t>Free Box</a:t></a:r></a:p></p:txBody>
+              </p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1, "non-placeholder → free shape");
+        assert!(slide.placeholders.is_empty());
+        let s = &slide.shapes[0];
+        let f = s.frame.expect("frame set from a:xfrm");
+        assert!((f.x - 72.0).abs() < 1e-6, "x: {}", f.x);
+        // top-left y=36, h=72 → lower-left y = 540 - (36+72) = 432.
+        assert!((f.y - 432.0).abs() < 1e-6, "y: {}", f.y);
+        assert!((f.w - 144.0).abs() < 1e-6, "w: {}", f.w);
+        assert!((f.h - 72.0).abs() < 1e-6, "h: {}", f.h);
+        // 90° clockwise (OOXML) → 270° CCW (model).
+        assert_eq!(s.rotation, crate::model::Rotation::D270);
+        assert_eq!(block_text(s), "Free Box");
+    }
+
+    #[test]
+    fn pptx_model_grouped_shapes_descend_with_composed_transform() {
+        // A group placed at (100pt,100pt) with a 1:1 child coordinate space
+        // (chOff=0, chExt=ext) holds two shapes; their child offsets map straight
+        // to the slide surface, and BOTH appear (no silent drop of grouped
+        // content). One shape is itself a nested group.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:grpSp>
+                <p:grpSpPr><a:xfrm>
+                  <a:off x="1270000" y="1270000"/><a:ext cx="2540000" cy="2540000"/>
+                  <a:chOff x="0" y="0"/><a:chExt cx="2540000" cy="2540000"/>
+                </a:xfrm></p:grpSpPr>
+                <p:sp>
+                  <p:spPr><a:xfrm><a:off x="127000" y="127000"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                  <p:txBody><a:p><a:r><a:t>Grouped A</a:t></a:r></a:p></p:txBody>
+                </p:sp>
+                <p:grpSp>
+                  <p:grpSpPr><a:xfrm>
+                    <a:off x="0" y="0"/><a:ext cx="1270000" cy="1270000"/>
+                    <a:chOff x="0" y="0"/><a:chExt cx="1270000" cy="1270000"/>
+                  </a:xfrm></p:grpSpPr>
+                  <p:sp>
+                    <p:spPr><a:xfrm><a:off x="635000" y="635000"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                    <p:txBody><a:p><a:r><a:t>Nested B</a:t></a:r></a:p></p:txBody>
+                  </p:sp>
+                </p:grpSp>
+              </p:grpSp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 2, "both grouped shapes surface");
+        let texts: Vec<String> = slide.shapes.iter().map(block_text).collect();
+        assert!(texts.iter().any(|t| t == "Grouped A"), "A: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Nested B"), "B: {texts:?}");
+
+        // "Grouped A" at child (10pt,10pt) → group off (100,100) → (110,110)
+        // top-left; ext 50pt → lower-left y = 540 - (110 + 50) = 380.
+        let a = slide
+            .shapes
+            .iter()
+            .find(|s| block_text(s) == "Grouped A")
+            .unwrap();
+        let fa = a.frame.expect("grouped A has a frame");
+        assert!((fa.x - 110.0).abs() < 1e-6, "A.x: {}", fa.x);
+        assert!((fa.y - 380.0).abs() < 1e-6, "A.y: {}", fa.y);
+
+        // "Nested B": inner group at outer-child (0,0) → outer (100,100); inner is
+        // 1:1, B at (50pt,50pt) → (150,150) top-left; ext 50pt → y = 540-200 = 340.
+        let b = slide
+            .shapes
+            .iter()
+            .find(|s| block_text(s) == "Nested B")
+            .unwrap();
+        let fb = b.frame.expect("nested B has a frame");
+        assert!((fb.x - 150.0).abs() < 1e-6, "B.x: {}", fb.x);
+        assert!((fb.y - 340.0).abs() < 1e-6, "B.y: {}", fb.y);
+    }
+
+    #[test]
+    fn pptx_model_chart_becomes_table_of_series() {
+        // A graphicFrame referencing a chart part (via the slide rels) is lowered
+        // to a Table: title row, category header, then one row per series — the
+        // data stays editable instead of being dropped.
+        let chart = r#"<c:chartSpace xmlns:c="c" xmlns:a="a">
+          <c:chart>
+            <c:title><c:tx><c:rich><a:p><a:r><a:t>Quarterly Sales</a:t></a:r></a:p></c:rich></c:tx></c:title>
+            <c:plotArea>
+              <c:barChart>
+                <c:ser>
+                  <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Region A</c:v></c:pt></c:strCache></c:strRef></c:tx>
+                  <c:cat><c:strRef><c:strCache>
+                    <c:pt idx="0"><c:v>Q1</c:v></c:pt><c:pt idx="1"><c:v>Q2</c:v></c:pt>
+                  </c:strCache></c:strRef></c:cat>
+                  <c:val><c:numRef><c:numCache>
+                    <c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt>
+                  </c:numCache></c:numRef></c:val>
+                </c:ser>
+                <c:ser>
+                  <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Region B</c:v></c:pt></c:strCache></c:strRef></c:tx>
+                  <c:val><c:numRef><c:numCache>
+                    <c:pt idx="0"><c:v>30</c:v></c:pt><c:pt idx="1"><c:v>40</c:v></c:pt>
+                  </c:numCache></c:numRef></c:val>
+                </c:ser>
+              </c:barChart>
+            </c:plotArea>
+          </c:chart>
+        </c:chartSpace>"#;
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree>
+                      <p:graphicFrame>
+                        <p:xfrm><a:off x="635000" y="635000"/><a:ext cx="3810000" cy="2540000"/></p:xfrm>
+                        <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+                          <c:chart xmlns:c="c" r:id="rId1"/>
+                        </a:graphicData></a:graphic>
+                      </p:graphicFrame>
+                    </p:spTree></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/>
+                    </Relationships>"#,
+                ),
+                ("ppt/charts/chart1.xml", chart),
+            ],
+            &[],
+        );
+        assert_eq!(slide.shapes.len(), 1, "chart → one shape");
+        let table = match &slide.shapes[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected a Table, got {other:?}"),
+        };
+        // Frame placed from p:xfrm: off (50pt,50pt), ext (300pt,200pt) → y = 540-250 = 290.
+        let f = slide.shapes[0].frame.expect("chart frame");
+        assert!(
+            (f.x - 50.0).abs() < 1e-6 && (f.y - 290.0).abs() < 1e-6,
+            "frame: {f:?}"
+        );
+        // Flatten all cell text and assert the data is present.
+        let all: String = table
+            .rows
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .map(|c| {
+                block_text(&Block {
+                    kind: BlockKind::TextBox(model::TextBox {
+                        blocks: c.blocks.clone(),
+                    }),
+                    ..Block::default()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        for needle in [
+            "Quarterly Sales",
+            "Q1",
+            "Q2",
+            "Region A",
+            "Region B",
+            "10",
+            "20",
+            "30",
+            "40",
+        ] {
+            assert!(
+                all.contains(needle),
+                "chart data missing {needle:?} in: {all}"
+            );
+        }
+    }
+
+    #[test]
+    fn pptx_model_placeholder_inherits_layout_master_geometry() {
+        // A body placeholder with NO own a:xfrm inherits its box from the layout
+        // (matched by @idx); the layout in turn reaches the master via its rels.
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+                      <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+                        <p:spPr/>
+                        <p:txBody><a:p><a:r><a:t>Inherited Body</a:t></a:r></a:p></p:txBody>
+                      </p:sp>
+                    </p:spTree></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+                    </Relationships>"#,
+                ),
+                (
+                    "ppt/slideLayouts/slideLayout1.xml",
+                    r#"<p:sldLayout xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+                      <p:sp>
+                        <p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+                        <p:spPr><a:xfrm><a:off x="635000" y="2540000"/><a:ext cx="7620000" cy="2540000"/></a:xfrm></p:spPr>
+                      </p:sp>
+                    </p:spTree></p:cSld></p:sldLayout>"#,
+                ),
+                (
+                    "ppt/slideLayouts/_rels/slideLayout1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
+                    </Relationships>"#,
+                ),
+                (
+                    "ppt/slideMasters/slideMaster1.xml",
+                    r#"<p:sldMaster xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree/></p:cSld></p:sldMaster>"#,
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(slide.placeholders.len(), 1, "one body placeholder");
+        let ph = &slide.placeholders[0];
+        assert_eq!(ph.role, model::PlaceholderRole::Body);
+        let f = ph
+            .block
+            .frame
+            .expect("placeholder inherits a frame from the layout");
+        // layout off (50pt,200pt), ext (600pt,200pt) → lower-left y = 540-(200+200)=140.
+        assert!((f.x - 50.0).abs() < 1e-6, "x: {}", f.x);
+        assert!((f.y - 140.0).abs() < 1e-6, "y: {}", f.y);
+        assert!((f.w - 600.0).abs() < 1e-6, "w: {}", f.w);
+        assert!((f.h - 200.0).abs() < 1e-6, "h: {}", f.h);
+        assert_eq!(block_text(&ph.block), "Inherited Body");
+    }
+
+    #[test]
+    fn pptx_model_smartart_text_becomes_list() {
+        // A SmartArt graphicFrame (dgm:relIds → data model) surfaces each node's
+        // text as a bullet list, rather than being dropped silently.
+        let data = r#"<dgm:dataModel xmlns:dgm="dgm" xmlns:a="a">
+          <dgm:ptLst>
+            <dgm:pt modelId="1" type="node"><dgm:t><a:p><a:r><a:t>First Node</a:t></a:r></a:p></dgm:t></dgm:pt>
+            <dgm:pt modelId="2" type="node"><dgm:t><a:p><a:r><a:t>Second Node</a:t></a:r></a:p></dgm:t></dgm:pt>
+            <dgm:pt modelId="0" type="doc"><dgm:t><a:p><a:endParaRPr/></a:p></dgm:t></dgm:pt>
+          </dgm:ptLst>
+        </dgm:dataModel>"#;
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree>
+                      <p:graphicFrame>
+                        <p:xfrm><a:off x="0" y="0"/><a:ext cx="3810000" cy="2540000"/></p:xfrm>
+                        <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+                          <dgm:relIds xmlns:dgm="dgm" r:dm="rId1" r:lo="rId2" r:qs="rId3" r:cs="rId4"/>
+                        </a:graphicData></a:graphic>
+                      </p:graphicFrame>
+                    </p:spTree></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/>
+                    </Relationships>"#,
+                ),
+                ("ppt/diagrams/data1.xml", data),
+            ],
+            &[],
+        );
+        assert_eq!(slide.shapes.len(), 1, "SmartArt → one shape");
+        let list = match &slide.shapes[0].kind {
+            BlockKind::List(l) => l,
+            other => panic!("expected a List, got {other:?}"),
+        };
+        assert_eq!(
+            list.items.len(),
+            2,
+            "two node texts (the empty doc node is skipped)"
+        );
+        let texts: Vec<String> = list
+            .items
+            .iter()
+            .map(|it| {
+                block_text(&Block {
+                    kind: BlockKind::TextBox(model::TextBox {
+                        blocks: it.blocks.clone(),
+                    }),
+                    ..Block::default()
+                })
+            })
+            .collect();
+        assert_eq!(texts, vec!["First Node", "Second Node"]);
+    }
+
+    #[test]
+    fn pptx_model_graphic_frame_table_keeps_cells_and_frame() {
+        // A native a:tbl inside a graphicFrame becomes a model Table with the
+        // frame from p:xfrm (regression guard alongside the chart/SmartArt paths).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:graphicFrame>
+                <p:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></p:xfrm>
+                <a:graphic><a:graphicData>
+                  <a:tbl><a:tblGrid><a:gridCol w="1270000"/><a:gridCol w="1270000"/></a:tblGrid>
+                    <a:tr><a:tc><a:txBody><a:p><a:r><a:t>R1C1</a:t></a:r></a:p></a:txBody></a:tc>
+                    <a:tc><a:txBody><a:p><a:r><a:t>R1C2</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+                  </a:tbl>
+                </a:graphicData></a:graphic>
+              </p:graphicFrame>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        let table = match &slide.shapes[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected Table, got {other:?}"),
+        };
+        assert_eq!(table.col_widths.len(), 2, "two grid columns");
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].cells.len(), 2);
+        assert!(slide.shapes[0].frame.is_some(), "table frame from p:xfrm");
     }
 }
