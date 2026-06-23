@@ -70,12 +70,31 @@ struct Para {
     runs: Vec<Run>,
 }
 
-/// A top-level recovered block: a flowing paragraph or a table.
+/// A top-level recovered block: a flowing paragraph, a table, or an image.
 #[derive(Debug, Clone)]
 enum RtfBlock {
     Para(Para),
     /// Rows of cells; each cell is its own list of paragraphs.
     Table(Vec<Vec<Vec<Para>>>),
+    /// An embedded picture extracted from a `{\pict …}` group: the decoded raw
+    /// image bytes (PNG or JPEG), the IANA subtype ("png" / "jpeg"), and the
+    /// display size in CSS points (from `\picwgoal`/`\pichgoal`, else `\picw`/
+    /// `\pich`). Serialized as an `<img src="data:image/…;base64,…">` so the
+    /// HTML engine's existing image-embed path renders it.
+    Image(RtfPicture),
+}
+
+/// A recovered `\pict` image ready to emit as an HTML `data:` URI.
+#[derive(Debug, Clone)]
+struct RtfPicture {
+    /// Decoded raw image bytes (PNG or JPEG file content).
+    data: Vec<u8>,
+    /// IANA image subtype for the data URI: "png" or "jpeg".
+    subtype: &'static str,
+    /// Display width in CSS points.
+    width_pt: f64,
+    /// Display height in CSS points.
+    height_pt: f64,
 }
 
 /// A font-table entry: family name + a generic CSS family bucket.
@@ -492,7 +511,14 @@ impl<'a> Parser<'a> {
                 self.skip = true;
                 self.read_colortbl();
             }
-            "stylesheet" | "info" | "pict" | "object" | "header" | "footer" | "footnote"
+            "pict" => {
+                // Suppress the hex/binary picture data from leaking as body text
+                // (the main scanner re-reads these bytes with `skip` on), and
+                // extract the image — appended as an `RtfBlock::Image`.
+                self.skip = true;
+                self.read_pict();
+            }
+            "stylesheet" | "info" | "object" | "header" | "footer" | "footnote"
             | "annotation" | "fldinst" | "xmlns" | "themedata" | "colorschememapping"
             | "datastore" | "latentstyles" | "listtable" | "listoverridetable" | "generator"
             | "revtbl" | "rsidtbl" => {
@@ -641,6 +667,162 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a `{\pict …}` group and, for PNG/JPEG pictures, push an
+    /// [`RtfBlock::Image`]. Called right after the `\pict` control word; reads
+    /// ahead from `self.i` to the group close **without** advancing `self.i` —
+    /// the main loop re-scans the same bytes with `skip` on, suppressing the
+    /// hex payload from the body text (mirrors [`Self::read_fonttbl`]).
+    ///
+    /// Supported source encodings:
+    /// * **hex** (RTF default): pairs of hex digits in the group text.
+    /// * **`\bin<N>`**: not handled here — binary blobs can embed `{`/`}`/`\`
+    ///   bytes the byte-scanner would mis-read, so such pictures are skipped
+    ///   (the format is rare for PNG/JPEG, which ship hex-encoded).
+    ///
+    /// Supported formats: `\pngblip` (PNG) and `\jpegblip` (JPEG) are decoded
+    /// and embedded. `\dibitmap`/`\wbitmap` (DIB/BMP) and `\wmetafile`/`\emfblip`
+    /// (WMF/EMF) have no decoder/parser in this crate, so they are skipped.
+    fn read_pict(&mut self) {
+        let b = self.bytes;
+        let mut p = self.i; // just after "pict"
+        let mut depth = 0i32; // relative depth within the \pict group
+
+        // Picture metadata, gathered from the control words preceding the data.
+        let mut subtype: Option<&'static str> = None; // None until a known blip
+        let mut is_metafile = false; // \wmetafile / \emfblip / default WMF
+        let mut is_bitmap = false; // \dibitmap / \wbitmap (no decoder)
+        let mut has_bin = false; // \bin<N> binary payload present → skip
+        let (mut picw, mut pich) = (0i64, 0i64); // \picw / \pich (source units)
+        let (mut goalw, mut goalh) = (0i64, 0i64); // \picwgoal / \pichgoal (twips)
+        let (mut scalex, mut scaley) = (100i64, 100i64); // \picscalex / \picscaley (%)
+        let mut hex = String::new(); // collected hex digits of the payload
+
+        while p < b.len() {
+            match b[p] {
+                b'{' => {
+                    depth += 1;
+                    p += 1;
+                }
+                b'}' => {
+                    if depth == 0 {
+                        break; // close of the \pict group itself
+                    }
+                    depth -= 1;
+                    p += 1;
+                }
+                b'\\' => {
+                    let s = p + 1;
+                    let mut e = s;
+                    while e < b.len() && b[e].is_ascii_alphabetic() {
+                        e += 1;
+                    }
+                    let w = &self.src[s..e];
+                    let mut neg = false;
+                    let mut q = e;
+                    if q < b.len() && b[q] == b'-' {
+                        neg = true;
+                        q += 1;
+                    }
+                    let ns = q;
+                    while q < b.len() && b[q].is_ascii_digit() {
+                        q += 1;
+                    }
+                    let np: Option<i64> = self.src[ns..q]
+                        .parse()
+                        .ok()
+                        .map(|n: i64| if neg { -n } else { n });
+
+                    match w {
+                        "pngblip" => subtype = Some("png"),
+                        "jpegblip" => subtype = Some("jpeg"),
+                        "dibitmap" | "wbitmap" => is_bitmap = true,
+                        "wmetafile" | "emfblip" => is_metafile = true,
+                        "bin" => has_bin = true,
+                        "picw" => picw = np.unwrap_or(0),
+                        "pich" => pich = np.unwrap_or(0),
+                        "picwgoal" => goalw = np.unwrap_or(0),
+                        "pichgoal" => goalh = np.unwrap_or(0),
+                        "picscalex" => scalex = np.unwrap_or(100),
+                        "picscaley" => scaley = np.unwrap_or(100),
+                        _ => {}
+                    }
+                    // A single trailing space delimits the control word.
+                    if q < b.len() && b[q] == b' ' {
+                        q += 1;
+                    }
+                    p = q;
+                }
+                c => {
+                    // Picture data: hex digit pairs (the RTF default encoding).
+                    if depth == 0 && c.is_ascii_hexdigit() {
+                        hex.push(c as char);
+                    }
+                    p += 1;
+                }
+            }
+        }
+
+        // No usable raster: unknown/unsupported format, or binary payload we
+        // cannot safely slice from the scanned stream → drop the picture.
+        let subtype = match subtype {
+            Some(st) if !has_bin => st,
+            _ => {
+                // is_bitmap / is_metafile / has_bin are intentionally unhandled
+                // (documented limits); reading the flags keeps intent explicit.
+                let _ = (is_bitmap, is_metafile);
+                return;
+            }
+        };
+
+        let Some(data) = decode_hex(&hex) else {
+            return;
+        };
+        // Defend against truncated/garbage payloads: require the format's magic.
+        let ok = match subtype {
+            "png" => data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+            "jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
+            _ => false,
+        };
+        if !ok {
+            return;
+        }
+
+        // Display size: prefer the goal (twips → pt); else the source dimensions
+        // (also taken as twips) scaled by \picscale; else a sane default. RTF
+        // bitmap source units are nominally twips for metafiles and pixels for
+        // bitmaps, but goal is what the document author asked to display.
+        let scale_w = (scalex.max(1)) as f64 / 100.0;
+        let scale_h = (scaley.max(1)) as f64 / 100.0;
+        let width_pt = if goalw > 0 {
+            twips_to_pt(goalw as i32) * scale_w
+        } else if picw > 0 {
+            twips_to_pt(picw as i32) * scale_w
+        } else {
+            96.0
+        };
+        let height_pt = if goalh > 0 {
+            twips_to_pt(goalh as i32) * scale_h
+        } else if pich > 0 {
+            twips_to_pt(pich as i32) * scale_h
+        } else {
+            96.0
+        };
+
+        // Pictures sit inline in the source flow; flush any pending paragraph so
+        // the image lands in document order, then push it as its own block.
+        if self.cur_started || !self.cur.runs.is_empty() {
+            let para = std::mem::take(&mut self.cur);
+            self.cur_started = false;
+            self.blocks.push(RtfBlock::Para(para));
+        }
+        self.blocks.push(RtfBlock::Image(RtfPicture {
+            data,
+            subtype,
+            width_pt: width_pt.max(1.0),
+            height_pt: height_pt.max(1.0),
+        }));
+    }
+
     fn color_hex(&self, idx: usize) -> Option<String> {
         // Index 0 is the "auto" colour → inherit (no explicit colour).
         if idx == 0 {
@@ -727,6 +909,28 @@ fn twips_to_pt(t: i32) -> f64 {
     t as f64 / 20.0
 }
 
+/// Decode a string of hex digit pairs (a `\pict` payload) into raw bytes.
+/// Non-hex characters must already be filtered out by the caller; an odd final
+/// nibble is dropped. Returns `None` only when there is no data.
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    let digits = hex.as_bytes();
+    if digits.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    let mut iter = digits.chunks_exact(2);
+    for pair in &mut iter {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn para_html(p: &Parser, para: &Para, out: &mut String) {
     let mut style = String::from(align_css(para.align));
     if para.indent_left > 0 {
@@ -784,6 +988,19 @@ fn table_html(p: &Parser, rows: &[Vec<Vec<Para>>], out: &mut String) {
     out.push_str("</tbody></table>");
 }
 
+/// Serialize a recovered `\pict` image as an `<img>` with a base64 `data:` URI.
+/// The HTML engine decodes the data URI and embeds the PNG/JPEG into the PDF;
+/// `width`/`height` (HTML attributes, in points) drive its layout box.
+fn image_html(pic: &RtfPicture, out: &mut String) {
+    out.push_str(&format!(
+        "<p><img src=\"data:image/{};base64,{}\" width=\"{:.1}\" height=\"{:.1}\"></p>",
+        pic.subtype,
+        super::base64(&pic.data),
+        pic.width_pt,
+        pic.height_pt,
+    ));
+}
+
 /// Parse RTF and serialize it to styled HTML for the [`crate::html`] engine.
 pub fn rtf_to_html(rtf: &str) -> String {
     let mut parser = Parser::new(rtf);
@@ -796,6 +1013,7 @@ pub fn rtf_to_html(rtf: &str) -> String {
         match block {
             RtfBlock::Para(para) => para_html(&parser, para, &mut html),
             RtfBlock::Table(rows) => table_html(&parser, rows, &mut html),
+            RtfBlock::Image(pic) => image_html(pic, &mut html),
         }
     }
     html.push_str("</body></html>");
@@ -942,5 +1160,129 @@ mod tests {
         let html = rtf_to_html(rtf);
         assert!(html.contains("visible"), "{html}");
         assert!(!html.contains("secret"), "ignorable dest leaked: {html}");
+    }
+
+    // ───────────────────────── \pict image tests ───────────────────────────
+
+    /// Hex-encode bytes (uppercase, no separators) for an RTF `\pict` payload.
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02X}"));
+        }
+        s
+    }
+
+    #[test]
+    fn pngblip_pict_becomes_data_uri_img() {
+        // A real 2×2 PNG produced by the crate's own encoder.
+        let rgba = vec![0u8, 0, 255, 255, /*…*/ 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255];
+        let png = crate::raster::encode_png(2, 2, &rgba);
+        let expected_b64 = super::super::base64(&png);
+        // \picwgoal 1440 twips = 72pt ; \pichgoal 720 twips = 36pt.
+        let rtf = format!(
+            r"{{\rtf1\ansi before {{\pict\pngblip\picw100\pich100\picwgoal1440\pichgoal720 {}}}after\par}}",
+            hex_encode(&png)
+        );
+        let html = rtf_to_html(&rtf);
+
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "img data URI emitted: {html}"
+        );
+        assert!(
+            html.contains(&expected_b64),
+            "exact PNG base64 round-trips into the data URI"
+        );
+        assert!(
+            html.contains("width=\"72.0\"") && html.contains("height=\"36.0\""),
+            "goal dimensions (twips→pt) applied: {html}"
+        );
+        // Surrounding text is preserved and in order around the image.
+        let before = html.find("before").expect("before text");
+        let img = html.find("<img").expect("img tag");
+        let after = html.find("after").expect("after text");
+        assert!(before < img && img < after, "image lands in flow order: {html}");
+        // The raw hex payload must NOT leak as visible body text.
+        assert!(
+            !html.contains(&hex_encode(&png)),
+            "hex payload leaked into body: {html}"
+        );
+    }
+
+    #[test]
+    fn jpegblip_pict_becomes_jpeg_data_uri() {
+        // Minimal bytes carrying the JPEG SOI magic (the parser only checks the
+        // magic before emitting; the engine embeds JPEG verbatim downstream).
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let rtf = format!(
+            r"{{\rtf1\ansi {{\pict\jpegblip\picwgoal960\pichgoal960 {}}}\par}}",
+            hex_encode(&jpeg)
+        );
+        let html = rtf_to_html(&rtf);
+        assert!(
+            html.contains("<img src=\"data:image/jpeg;base64,"),
+            "jpeg data URI emitted: {html}"
+        );
+        assert!(
+            html.contains(&super::super::base64(&jpeg)),
+            "jpeg bytes base64-encoded into the URI"
+        );
+    }
+
+    #[test]
+    fn pict_falls_back_to_picw_pich_when_no_goal() {
+        let rgba = vec![10u8; 4];
+        let png = crate::raster::encode_png(1, 1, &rgba);
+        // No \picwgoal/\pichgoal → fall back to \picw/\pich (taken as twips):
+        // 2880 twips = 144pt.
+        let rtf = format!(
+            r"{{\rtf1\ansi {{\pict\pngblip\picw2880\pich2880 {}}}\par}}",
+            hex_encode(&png)
+        );
+        let html = rtf_to_html(&rtf);
+        assert!(
+            html.contains("width=\"144.0\"") && html.contains("height=\"144.0\""),
+            "picw/pich fallback dimensions: {html}"
+        );
+    }
+
+    #[test]
+    fn unsupported_metafile_and_bitmap_pictures_are_skipped() {
+        // WMF/EMF (vector metafiles) and DIB/BMP have no decoder → no <img>, and
+        // the hex must not leak. Surrounding text still renders.
+        for blip in ["wmetafile8", "emfblip", "dibitmap", "wbitmap"] {
+            let payload = "DEADBEEFCAFE0102";
+            let rtf = format!(
+                r"{{\rtf1\ansi keep {{\pict\{blip}\picwgoal500\pichgoal500 {payload}}}done\par}}"
+            );
+            let html = rtf_to_html(&rtf);
+            assert!(!html.contains("<img"), "{blip}: must not emit <img>: {html}");
+            assert!(
+                !html.contains(payload),
+                "{blip}: hex payload leaked: {html}"
+            );
+            assert!(
+                html.contains("keep") && html.contains("done"),
+                "{blip}: surrounding text preserved: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn pict_with_bin_payload_is_skipped() {
+        // \bin<N> binary payloads are not sliced from the scanned stream → no img.
+        let rtf = r"{\rtf1\ansi text {\pict\pngblip\bin4 ....}more\par}";
+        let html = rtf_to_html(rtf);
+        assert!(!html.contains("<img"), "binary pict skipped: {html}");
+        assert!(html.contains("text") && html.contains("more"), "{html}");
+    }
+
+    #[test]
+    fn corrupt_png_pict_is_dropped() {
+        // Hex that decodes but lacks the PNG magic → dropped, no <img>.
+        let rtf = r"{\rtf1\ansi {\pict\pngblip\picwgoal100\pichgoal100 0011223344}\par}";
+        let html = rtf_to_html(rtf);
+        assert!(!html.contains("<img"), "magic-less payload dropped: {html}");
     }
 }
