@@ -283,6 +283,19 @@ fn char_style_css(style: &CharStyle) -> String {
             css.push_str(&format!(";color:#{:02X}{:02X}{:02X}", q(r), q(g), q(b)));
         }
     }
+    // Run highlight / background (`w:highlight`/`w:shd`/`fo:background-color`):
+    // emit `background-color` so the HTML→PDF engine paints a filled rectangle
+    // behind the run. Any colour is honoured (a dark highlight is legitimate),
+    // unlike the near-black guard on the text colour above. `None` ⇒ nothing.
+    if let Some([r, g, b]) = style.background {
+        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        css.push_str(&format!(
+            ";background-color:#{:02X}{:02X}{:02X}",
+            q(r),
+            q(g),
+            q(b)
+        ));
+    }
     css.trim_start_matches(';').to_string()
 }
 
@@ -467,6 +480,7 @@ mod tests {
                     bold: true,
                     italic: false,
                     color: Some([1.0, 0.0, 0.0]),
+                    background: None,
                 },
             }],
             images: vec![PlacedImage {
@@ -487,6 +501,63 @@ mod tests {
         assert!(
             html.contains("data:image/png;base64,iVBORw=="),
             "image inlined as data URI"
+        );
+    }
+
+    #[test]
+    fn char_style_css_emits_run_background_color() {
+        // A run with a highlight emits `background-color` (any colour, including
+        // dark) so the HTML→PDF engine paints it behind the glyphs.
+        let lit = char_style_css(&CharStyle {
+            background: Some([1.0, 1.0, 0.0]),
+            ..CharStyle::default()
+        });
+        assert!(
+            lit.contains("background-color:#FFFF00"),
+            "yellow highlight in inline CSS: {lit}"
+        );
+
+        // A run without a background emits no `background-color` declaration.
+        let plain = char_style_css(&CharStyle {
+            color: Some([1.0, 0.0, 0.0]),
+            ..CharStyle::default()
+        });
+        assert!(
+            !plain.contains("background-color"),
+            "plain run carries no background: {plain}"
+        );
+    }
+
+    #[test]
+    fn html_from_model_renders_run_highlight() {
+        use crate::model::{InlineRun, Page, Paragraph, Section};
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Paragraph(Paragraph {
+                            runs: vec![Inline::Run(InlineRun {
+                                text: "lit".to_string(),
+                                style: CharStyle {
+                                    background: Some([1.0, 1.0, 0.0]),
+                                    ..CharStyle::default()
+                                },
+                                source_index: None,
+                            })],
+                            ..Paragraph::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains("background-color:#FFFF00") && html.contains("lit"),
+            "the highlighted run is emitted with its background: {html}"
         );
     }
 }

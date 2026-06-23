@@ -57,6 +57,7 @@ fn text_style(cs: &CharStyle) -> TextStyle {
         bold: cs.bold,
         italic: cs.italic,
         color: cs.color,
+        background: cs.background,
     }
 }
 
@@ -968,6 +969,22 @@ pub fn pdf_from_model(doc: &Document) -> Vec<u8> {
                 text.style.bold,
                 text.style.italic,
             );
+            // Highlight: paint the run's background as a filled rectangle BEHIND
+            // the glyphs (drawn first so the text sits on top). The box spans the
+            // run's measured width and one font-size of height — a word-processor
+            // text highlight (`w:highlight`/`fo:background-color`). Runs without a
+            // background skip this entirely, so existing output is unchanged.
+            if let Some(bg) = text.style.background {
+                builder.rect(
+                    idx,
+                    text.x,
+                    text.y,
+                    text.width.max(0.1),
+                    text.height.max(1.0),
+                    None,
+                    Some(bg),
+                );
+            }
             let color = text.style.color.unwrap_or([0.0, 0.0, 0.0]);
             // `height` carries the run's font size (see `convert_pages`).
             builder.text(
@@ -1177,6 +1194,81 @@ mod tests {
         assert!(
             runs.iter().any(|r| r.text.contains("Bridge")),
             "model text survives the round-trip"
+        );
+    }
+
+    /// A run paragraph carrying a highlight (`CharStyle.background`).
+    fn highlighted_paragraph(text: &str, bg: [f64; 3]) -> Paragraph {
+        Paragraph {
+            runs: vec![Inline::Run(InlineRun {
+                text: text.to_string(),
+                style: CharStyle {
+                    size_pt: 12.0,
+                    background: Some(bg),
+                    ..CharStyle::default()
+                },
+                source_index: None,
+            })],
+            ..Paragraph::default()
+        }
+    }
+
+    /// A highlighted run lowers to a `PlacedText` whose style carries the
+    /// background, and `pdf_from_model` paints that highlight as a filled
+    /// rectangle (the fill colour op) *before* the glyphs.
+    #[test]
+    fn highlighted_run_paints_background_rect() {
+        let doc = Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks: vec![block(
+                        BlockKind::Paragraph(highlighted_paragraph("HiLite", [1.0, 1.0, 0.0])),
+                        None,
+                    )],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+
+        // The lowering carries the background onto the PlacedText.
+        let pages: Vec<ConvPage> = (&doc).into();
+        let placed = pages[0]
+            .texts
+            .iter()
+            .find(|t| t.text == "HiLite")
+            .expect("highlighted run present");
+        assert_eq!(
+            placed.style.background,
+            Some([1.0, 1.0, 0.0]),
+            "background lowered onto the placed run"
+        );
+
+        // The PDF content paints the yellow fill (a `1 1 0 rg` + `re ... f`)
+        // before drawing the text — and a plain document carries no such fill.
+        let pdf = pdf_from_model(&doc);
+        let body = String::from_utf8_lossy(&pdf);
+        assert!(
+            body.contains("1 1 0 rg") && body.contains(" re\nf\n"),
+            "highlight emits a filled yellow rectangle"
+        );
+
+        let plain = pdf_from_model(&Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks: vec![block(BlockKind::Paragraph(paragraph("plain")), None)],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        });
+        assert!(
+            !String::from_utf8_lossy(&plain).contains("1 1 0 rg"),
+            "a plain run paints no highlight fill"
         );
     }
 }

@@ -1196,11 +1196,25 @@ impl Flow<'_> {
         out: &mut Vec<InlineItem>,
     ) {
         match node {
-            Node::Text(t) => out.push(InlineItem {
-                text: parent_style.text_transform.apply(t),
-                style: parent_style.clone(),
-                media: None,
-            }),
+            Node::Text(t) => {
+                // A bare text node has no box of its own: its highlight may only
+                // come from an enclosing *inline* element (`<mark>`, a styled
+                // `<span>`), never from a block-ish container — whose own
+                // `background` is painted as a box (`push_box_background`) and is a
+                // non-inherited property. So drop the container's background unless
+                // the immediate parent is a true inline element. This keeps inline
+                // highlights working while leaving block/cell backgrounds to their
+                // own box (no duplicate rect behind the text).
+                let mut style = parent_style.clone();
+                if parent_style.display != Display::Inline {
+                    style.background = None;
+                }
+                out.push(InlineItem {
+                    text: parent_style.text_transform.apply(t),
+                    style,
+                    media: None,
+                });
+            }
             Node::Element(e) => {
                 let st = self.style_of(e, parent_style, ancestors);
                 if st.display == Display::None {
@@ -1417,6 +1431,13 @@ impl Flow<'_> {
                     cx += iw + space_w;
                 }
                 None => {
+                    // Inline highlight: a run carrying its own `background`
+                    // (`<mark>`, or a span with `background-color`) paints a filled
+                    // rectangle behind the glyphs at z=0. `background` is a
+                    // non-inherited property reset on every child, so a block's
+                    // background never reaches here — only the run's own highlight
+                    // does, and adjacent highlighted words form a continuous band.
+                    push_run_highlight(&mut self.out, cx, *y, w);
                     // `vertical-align: super|sub` raises/lowers the run's baseline
                     // within the line (negative = up). Width/advance are unchanged.
                     self.out.push(Abs {
@@ -1514,6 +1535,8 @@ impl Flow<'_> {
                     cx_right = x - space_w;
                 }
                 None => {
+                    // Inline highlight behind the glyphs (see the LTR path).
+                    push_run_highlight(&mut self.out, x, *y, w);
                     self.out.push(Abs {
                         z: 1,
                         zi: 0,
@@ -3111,6 +3134,37 @@ impl Flow<'_> {
 
 fn default_line_height(style: &Style) -> f64 {
     style.font_size * style.line_height.max(1.0)
+}
+
+/// Push a text run's highlight rectangle behind its glyphs (z=0), when the run
+/// carries a `background` (e.g. `<mark>` or a span with `background-color`). The
+/// box spans the run's measured content width `word.w` and one line-box height,
+/// so consecutive highlighted words tile into a continuous band. A run without a
+/// background emits nothing, leaving the highlight-free output byte-for-byte
+/// unchanged. `background` is a non-inherited property, so a block ancestor's
+/// background never lands on a text run here — only the run's own highlight does.
+fn push_run_highlight(out: &mut Vec<Abs>, x: f64, y: f64, word: &Word) {
+    let Some(fill) = word.style.background else {
+        return;
+    };
+    let h = word.style.font_size * word.style.line_height.max(1.0);
+    out.push(Abs {
+        z: 0,
+        zi: 0,
+        frag: Fragment::Rect {
+            x,
+            y,
+            w: word.w.max(0.0),
+            h,
+            fill: Some(fill),
+            stroke: None,
+            stroke_w: 0.0,
+            opacity: word.style.opacity,
+            radius: [0.0; 4],
+            radius_v: [0.0; 4],
+            shadow: None,
+        },
+    });
 }
 
 /// Resolve a `grid-template-columns`/`-rows` track list into `cols` concrete
@@ -5469,6 +5523,49 @@ mod tests {
             .expect("a background rect");
         assert_eq!(bg.2, [0.0; 4], "no radius on a plain box");
         assert!(!bg.3, "no shadow on a plain box");
+    }
+
+    #[test]
+    fn mark_paints_an_inline_highlight_behind_the_text() {
+        // `<mark>` (UA `background:#ffff00`) and a span with `background-color`
+        // each paint a filled rect behind their glyphs; the text itself is still
+        // emitted. The rect sits at z=0 (before the z=1 text in paint order).
+        let layout = run(r#"<p><mark>hi</mark> <span style="background-color:#00ff00">x</span></p>"#);
+        let fills: Vec<[f64; 3]> = rect_decorations(&layout)
+            .into_iter()
+            .filter_map(|(fill, ..)| fill)
+            .collect();
+        assert!(
+            fills.contains(&[1.0, 1.0, 0.0]),
+            "yellow <mark> highlight rect present: {fills:?}"
+        );
+        assert!(
+            fills.contains(&[0.0, 1.0, 0.0]),
+            "green span highlight rect present: {fills:?}"
+        );
+        let texts: Vec<String> = layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t == "hi"), "the marked text is drawn");
+    }
+
+    #[test]
+    fn block_background_does_not_duplicate_behind_its_text() {
+        // A block's own `background` is a non-inherited box property: it must be
+        // painted exactly once (the box), never re-emitted as an inline highlight
+        // behind its direct text run. Guards the non-inheritance fix.
+        let layout = run(r#"<div style="background:#3366cc;padding:10pt">card</div>"#);
+        let blue = rect_decorations(&layout)
+            .into_iter()
+            .filter(|(fill, ..)| *fill == Some([0.2, 0.4, 0.8]))
+            .count();
+        assert_eq!(blue, 1, "exactly one blue rect (the box), no text duplicate");
     }
 
     #[test]

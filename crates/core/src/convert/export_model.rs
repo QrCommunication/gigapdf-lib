@@ -435,6 +435,16 @@ fn docx_rpr(style: &CharStyle) -> String {
     if let Some(c) = visible_color(style) {
         p.push_str(&format!("<w:color w:val=\"{c}\"/>"));
     }
+    // Run highlight / background → `w:shd@fill` (run shading), the inverse of the
+    // importer's `w:rPr/w:shd@fill` → `CharStyle.background` so a highlight
+    // round-trips through DOCX. Any colour is emitted (a dark highlight is valid);
+    // `None` ⇒ nothing, keeping plain runs unchanged.
+    if let Some(bg) = style.background {
+        p.push_str(&format!(
+            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{}\"/>",
+            hex(bg)
+        ));
+    }
     p.push_str(&format!(
         "<w:sz w:val=\"{}\"/>",
         (run_size(style) * 2.0).round().max(1.0) as i64
@@ -2350,6 +2360,13 @@ fn odf_span_style(name: &str, style: &CharStyle) -> String {
     }
     if let Some(c) = visible_color(style) {
         p.push_str(&format!(" fo:color=\"#{c}\""));
+    }
+    // Run highlight / background → `fo:background-color` on the text style, the
+    // inverse of the ODF importer's `fo:background-color` → `CharStyle.background`
+    // so a highlight round-trips through ODT. Any colour is emitted; `None` ⇒
+    // nothing, leaving plain runs unchanged.
+    if let Some(bg) = style.background {
+        p.push_str(&format!(" fo:background-color=\"#{}\"", hex(bg)));
     }
     p.push_str("/>");
     format!("<style:style style:name=\"{name}\" style:family=\"text\">{p}</style:style>")
@@ -4813,6 +4830,106 @@ mod tests {
         let doc = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
         assert!(doc.contains("<w:headerReference"));
         assert!(doc.contains("<w:footerReference"));
+    }
+
+    /// A paragraph whose single run carries a yellow highlight.
+    fn highlighted_para(text: &str, bg: [f64; 3]) -> Block {
+        Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: text.to_string(),
+                    style: CharStyle {
+                        background: Some(bg),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn doc_with(block: Block) -> Document {
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![block],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn docx_run_highlight_emits_w_shd_fill() {
+        // A run with `CharStyle.background` exports `<w:shd w:fill>` run shading;
+        // a plain run (no background) emits no run shading at all.
+        let bytes = docx_from_model(&doc_with(highlighted_para("lit", [1.0, 1.0, 0.0])));
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            xml.contains("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FFFF00\"/>"),
+            "yellow highlight → run shading: {xml}"
+        );
+
+        let plain = docx_from_model(&doc_with(para("plain")));
+        let plain_xml = String::from_utf8(entry(&plain, "word/document.xml").unwrap()).unwrap();
+        // The only `w:shd` baked into a plain doc is the code-block paragraph
+        // shading; a plain text run must carry none.
+        assert!(
+            !plain_xml.contains("w:shd"),
+            "plain run has no run shading: {plain_xml}"
+        );
+    }
+
+    #[test]
+    fn docx_highlight_round_trips_through_import() {
+        // Export a highlighted run to DOCX, re-import it, and confirm the model
+        // recovers the same background — the export/import are true inverses.
+        let bytes = docx_from_model(&doc_with(highlighted_para("marked", [0.0, 1.0, 0.0])));
+        let model = crate::convert::office_import::office_to_model(&bytes).expect("docx → model");
+        let run = model
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => p.runs.iter().find_map(|i| match i {
+                    Inline::Run(r) if r.text == "marked" => Some(r.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the 'marked' run survived the round-trip");
+        assert_eq!(
+            run.style.background,
+            Some([0.0, 1.0, 0.0]),
+            "green highlight round-trips through DOCX"
+        );
+    }
+
+    #[test]
+    fn odt_run_highlight_emits_fo_background_color() {
+        // A run with `CharStyle.background` exports `fo:background-color` on its
+        // text style; a plain run emits none.
+        let bytes = odt_from_model(&doc_with(highlighted_para("lit", [1.0, 1.0, 0.0])));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("fo:background-color=\"#FFFF00\""),
+            "yellow highlight → fo:background-color: {content}"
+        );
+
+        let plain = odt_from_model(&doc_with(para("plain")));
+        let plain_content = String::from_utf8(entry(&plain, "content.xml").unwrap()).unwrap();
+        // ODF code blocks carry a paragraph background; a plain text-run style
+        // must not. Check the run-level text style specifically stays clean by
+        // confirming no `fo:background-color` appears for this plain paragraph.
+        assert!(
+            !plain_content.contains("fo:background-color"),
+            "plain run has no run background: {plain_content}"
+        );
     }
 
     #[test]

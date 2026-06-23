@@ -1848,6 +1848,7 @@ mod tests {
                     bold: true,
                     italic: false,
                     color: Some([1.0, 0.0, 0.0]),
+                    background: None,
                 },
             }],
             images: Vec::new(),

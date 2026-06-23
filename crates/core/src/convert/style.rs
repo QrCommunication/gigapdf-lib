@@ -38,6 +38,10 @@ pub struct TextStyle {
     pub italic: bool,
     /// RGB fill colour `0..=1`, `None` = default black.
     pub color: Option<[f64; 3]>,
+    /// RGB text-highlight / run background `0..=1`, `None` = no highlight.
+    /// Painted as a filled rectangle behind the run (a word-processor highlight).
+    /// Default `None` keeps every existing run byte-for-byte unchanged.
+    pub background: Option<[f64; 3]>,
 }
 
 impl TextStyle {
@@ -121,6 +125,7 @@ pub fn parse_base_font(base_font: &str) -> TextStyle {
         bold,
         italic,
         color: None,
+        background: None,
     }
 }
 

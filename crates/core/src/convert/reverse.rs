@@ -536,7 +536,12 @@ fn collect_para_colors(para: &Paragraph, colors: &mut Vec<[u8; 3]>) {
 fn collect_inline_colors(inline: &Inline, colors: &mut Vec<[u8; 3]>) {
     match inline {
         Inline::Run(run) => {
-            if let Some(c) = rtf_run_color(&run.style) {
+            // Both the text colour (`\cf`) and the highlight colour (`\highlight`)
+            // reference the shared colour table, so register both.
+            for c in [rtf_run_color(&run.style), rtf_run_highlight(&run.style)]
+                .into_iter()
+                .flatten()
+            {
                 if !colors.contains(&c) {
                     colors.push(c);
                 }
@@ -560,6 +565,16 @@ fn rtf_run_color(style: &CharStyle) -> Option<[u8; 3]> {
         }
         _ => None,
     }
+}
+
+/// A run's highlight / background as an RGB byte triple, when set. Any colour is
+/// honoured (a dark highlight is valid), unlike the near-black guard on the text
+/// colour. `None` ⇒ the run carries no highlight.
+fn rtf_run_highlight(style: &CharStyle) -> Option<[u8; 3]> {
+    style.background.map(|[r, g, b]| {
+        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        [q(r), q(g), q(b)]
+    })
 }
 
 fn rtf_blocks_from_model(blocks: &[Block], colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
@@ -703,6 +718,14 @@ fn rtf_char_controls(style: &CharStyle, colors: &[[u8; 3]], force_bold: bool, ou
     if let Some(c) = rtf_run_color(style) {
         if let Some(idx) = colors.iter().position(|x| *x == c) {
             out.push_str(&format!("\\cf{}", idx + 1)); // 1-based (0 = default)
+        }
+    }
+    // Run highlight → `\highlightN` (N = 1-based colour-table index), the RTF
+    // text-highlight control word — the inverse of an importer's highlight read.
+    // Omitted entirely when the run has no background, so plain runs are unchanged.
+    if let Some(c) = rtf_run_highlight(style) {
+        if let Some(idx) = colors.iter().position(|x| *x == c) {
+            out.push_str(&format!("\\highlight{}", idx + 1));
         }
     }
     out.push(' ');
@@ -951,6 +974,71 @@ mod tests {
         assert_eq!(
             back,
             vec!["Café déjà".to_string(), "Second \\ {brace}".to_string()]
+        );
+    }
+
+    #[test]
+    fn rtf_from_model_emits_run_highlight() {
+        use crate::model::{InlineRun, Page, Section};
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Paragraph(Paragraph {
+                            runs: vec![Inline::Run(InlineRun {
+                                text: "lit".to_string(),
+                                style: CharStyle {
+                                    background: Some([1.0, 1.0, 0.0]),
+                                    ..CharStyle::default()
+                                },
+                                source_index: None,
+                            })],
+                            ..Paragraph::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let rtf = String::from_utf8(rtf_from_model(&doc)).unwrap();
+        // The highlight colour joins the colour table…
+        assert!(
+            rtf.contains("\\red255\\green255\\blue0;"),
+            "yellow registered in the colour table: {rtf}"
+        );
+        // …and the run references it via `\highlight` (1-based index).
+        assert!(
+            rtf.contains("\\highlight1"),
+            "run carries the highlight control word: {rtf}"
+        );
+
+        // A plain run emits no highlight at all.
+        let plain = String::from_utf8(rtf_from_model(&Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Paragraph(Paragraph {
+                            runs: vec![Inline::Run(InlineRun {
+                                text: "plain".to_string(),
+                                ..Default::default()
+                            })],
+                            ..Paragraph::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        }))
+        .unwrap();
+        assert!(
+            !plain.contains("\\highlight"),
+            "a plain run carries no highlight: {plain}"
         );
     }
 
