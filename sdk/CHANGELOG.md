@@ -4,6 +4,26 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.73.0] - 2026-06-24
+
+Print-production release: full read/write access to all five ISO 32000-1 page
+boundary boxes. Resolves
+[#6](https://github.com/qrcommunication/gigapdf-lib/issues/6).
+
+### Added
+
+- **`getPageBoxes(page)` / `setPageBox(page, kind, box)`.** Read and write the
+  five page boundary boxes (`media`/`crop`/`bleed`/`trim`/`art`, ISO 32000-1
+  §14.11.2). `getPageBoxes` returns each box as `[x0, y0, x1, y1]` (points) with
+  inheritance and the per-box default chain applied (CropBox→MediaBox;
+  Bleed/Trim/Art→CropBox), plus a `declared` map flagging which boxes are
+  explicitly present vs inherited/defaulted. `setPageBox` takes a box as
+  `{ x, y, w, h }` (origin + size), normalises it, and preserves the page's other
+  boxes — so a `/TrimBox`/`/BleedBox` survives a save→reopen round-trip. This is
+  the prerequisite for PDF/X export and commercial-print pipelines (imposition,
+  bleed, finished-size trimming).
+- **Types `PageBoxes`, `PageBoxKind`, and the `PAGE_BOX_KINDS` constant.**
+
 ## [0.72.0] - 2026-06-24
 
 Fidelity release focused on text extraction and AcroForm rendering on dense

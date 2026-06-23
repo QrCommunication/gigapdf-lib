@@ -885,6 +885,85 @@ pub struct TextLayerRun {
 /// [`ImageWatermarkOptions`]. The named corners place the image's bounding box
 /// flush to that corner of the (cropped) page; `Center` centres it. In every
 /// case the offsets in [`ImageWatermarkOptions`] then nudge the placement.
+/// One of the five page boundary boxes defined by ISO 32000-1 §14.11.2 (Table 30).
+///
+/// `MediaBox` is the only mandatory box (the physical sheet). The other four are
+/// optional and, when absent, inherit a default per the standard: `CropBox`
+/// defaults to the `MediaBox`; `BleedBox`, `TrimBox` and `ArtBox` each default to
+/// the `CropBox`. `MediaBox` and `CropBox` are also *inheritable* page attributes
+/// (they may be declared on an ancestor `/Pages` node); the production boxes are
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PageBox {
+    /// `/MediaBox` — the bounds of the physical medium.
+    Media,
+    /// `/CropBox` — the visible region a viewer clips to (defaults to `MediaBox`).
+    Crop,
+    /// `/BleedBox` — the clip region in a production environment, bleed included
+    /// (defaults to `CropBox`).
+    Bleed,
+    /// `/TrimBox` — the intended finished dimensions after trimming (defaults to
+    /// `CropBox`).
+    Trim,
+    /// `/ArtBox` — the extent of meaningful content, including potential
+    /// white space (defaults to `CropBox`).
+    Art,
+}
+
+impl PageBox {
+    /// The PDF dictionary key (`MediaBox`, `CropBox`, …) for this box.
+    pub fn key(self) -> &'static [u8] {
+        match self {
+            PageBox::Media => b"MediaBox",
+            PageBox::Crop => b"CropBox",
+            PageBox::Bleed => b"BleedBox",
+            PageBox::Trim => b"TrimBox",
+            PageBox::Art => b"ArtBox",
+        }
+    }
+}
+
+/// A page's five boundary boxes, each as `[x0, y0, x1, y1]` in user-space points.
+///
+/// Returned by [`Document::page_boxes`]. Every field is the **effective** box —
+/// inheritance and the ISO default chain are already applied, so e.g. `trim`
+/// equals the `crop` box when the page declares no `/TrimBox`. The values are
+/// reported verbatim (no clamping to their intersection with the media box), so a
+/// host can faithfully round-trip whatever the source file declared. `declared`
+/// records which boxes are *explicitly* present on the page dictionary, letting a
+/// host distinguish a real `/TrimBox` from one defaulted to the crop box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageBoxes {
+    /// `/MediaBox` (inherited if absent; defaults to US Letter `[0 0 612 792]`).
+    pub media: [f64; 4],
+    /// `/CropBox` (inherited if absent; defaults to the media box).
+    pub crop: [f64; 4],
+    /// `/BleedBox` (defaults to the crop box).
+    pub bleed: [f64; 4],
+    /// `/TrimBox` (defaults to the crop box).
+    pub trim: [f64; 4],
+    /// `/ArtBox` (defaults to the crop box).
+    pub art: [f64; 4],
+    /// Which of the five boxes are explicitly declared on the page dictionary
+    /// (vs. inherited from an ancestor or defaulted by the rules above).
+    pub declared: PageBoxesDeclared,
+}
+
+/// Flags marking which page boxes are explicitly declared (see [`PageBoxes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PageBoxesDeclared {
+    /// `/MediaBox` is present on the page dictionary itself (not just inherited).
+    pub media: bool,
+    /// `/CropBox` is present on the page dictionary itself.
+    pub crop: bool,
+    /// `/BleedBox` is present on the page dictionary.
+    pub bleed: bool,
+    /// `/TrimBox` is present on the page dictionary.
+    pub trim: bool,
+    /// `/ArtBox` is present on the page dictionary.
+    pub art: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WatermarkAnchor {
     /// Centre of the page (the usual diagonal-stamp position).
@@ -3355,6 +3434,114 @@ impl Document {
             }
         }
         self.read_media_box(page)
+    }
+
+    // ─── page boxes (Media/Crop/Bleed/Trim/Art) ──────────────────────────────
+
+    /// Parse a resolved `[x0 y0 x1 y1]` array object into a rectangle, or `None`
+    /// when it is not a 4-number array. Each element is resolved so an
+    /// (uncommon) indirect coordinate still reads correctly.
+    fn array_to_rect(&self, obj: &Object) -> Option<[f64; 4]> {
+        let arr = self.resolve(obj).as_array()?;
+        let nums: Vec<f64> = arr
+            .iter()
+            .filter_map(|o| self.resolve(o).as_f64())
+            .collect();
+        (nums.len() == 4).then(|| [nums[0], nums[1], nums[2], nums[3]])
+    }
+
+    /// Resolve an *inheritable* box (`/MediaBox` or `/CropBox`) by walking the
+    /// page → `/Parent` chain (ISO 32000-1 §7.7.3.4 — inheritable page
+    /// attributes). `None` if no node up the tree declares it. A depth guard
+    /// caps the walk so a malformed/cyclic `/Parent` chain cannot loop.
+    fn inherited_box(&self, page: &Dictionary, key: &[u8]) -> Option<[f64; 4]> {
+        let mut cur = page;
+        for _ in 0..64 {
+            if let Some(rect) = cur.get(key).and_then(|o| self.array_to_rect(o)) {
+                return Some(rect);
+            }
+            let parent = cur.get(b"Parent").and_then(Object::as_reference)?;
+            cur = self.objects.get(&parent).and_then(Object::as_dict)?;
+        }
+        None
+    }
+
+    /// All five page boundary boxes for the 1-based `page_no`, each as
+    /// `[x0, y0, x1, y1]` in user-space points, with ISO 32000-1 §14.11.2
+    /// inheritance and defaults applied. See [`PageBoxes`] for the exact
+    /// inheritance/default chain and the `declared` flags.
+    pub fn page_boxes(&self, page_no: u32) -> Result<PageBoxes> {
+        let page = self.page_dict(page_no)?;
+        // MediaBox & CropBox are inheritable; the production boxes are not.
+        let media = self
+            .inherited_box(page, b"MediaBox")
+            .unwrap_or([0.0, 0.0, 612.0, 792.0]);
+        let crop = self.inherited_box(page, b"CropBox").unwrap_or(media);
+        let local = |key: &[u8]| page.get(key).and_then(|o| self.array_to_rect(o));
+        let bleed = local(b"BleedBox").unwrap_or(crop);
+        let trim = local(b"TrimBox").unwrap_or(crop);
+        let art = local(b"ArtBox").unwrap_or(crop);
+        let declared = PageBoxesDeclared {
+            media: page.get(b"MediaBox").is_some(),
+            crop: page.get(b"CropBox").is_some(),
+            bleed: page.get(b"BleedBox").is_some(),
+            trim: page.get(b"TrimBox").is_some(),
+            art: page.get(b"ArtBox").is_some(),
+        };
+        Ok(PageBoxes {
+            media,
+            crop,
+            bleed,
+            trim,
+            art,
+            declared,
+        })
+    }
+
+    /// Set one of a page's boundary boxes to `rect` (`[x0, y0, x1, y1]`,
+    /// user-space points) on the 1-based `page_no`.
+    ///
+    /// The rectangle is normalised so `x0 < x1` and `y0 < y1` before writing.
+    /// Only the chosen key is replaced, so any sibling boxes the page already
+    /// declares are preserved — boxes are never silently dropped on save.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] if the rectangle is degenerate (zero or
+    /// negative area, or a non-finite coordinate); [`EngineError::PageNotFound`]
+    /// for a page number that does not exist.
+    pub fn set_page_box(&mut self, page_no: u32, kind: PageBox, rect: [f64; 4]) -> Result<()> {
+        if !rect.iter().all(|v| v.is_finite()) {
+            return Err(EngineError::InvalidArgument(format!(
+                "{kind:?} box has a non-finite coordinate"
+            )));
+        }
+        let x0 = rect[0].min(rect[2]);
+        let y0 = rect[1].min(rect[3]);
+        let x1 = rect[0].max(rect[2]);
+        let y1 = rect[1].max(rect[3]);
+        if x1 - x0 <= 0.0 || y1 - y0 <= 0.0 {
+            return Err(EngineError::InvalidArgument(format!(
+                "degenerate {kind:?} rectangle [{x0} {y0} {x1} {y1}] (zero area)"
+            )));
+        }
+        let id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+        page.set(
+            kind.key().to_vec(),
+            Object::Array(vec![
+                Object::Real(x0),
+                Object::Real(y0),
+                Object::Real(x1),
+                Object::Real(y1),
+            ]),
+        );
+        self.objects.insert(id, Object::Dictionary(page));
+        Ok(())
     }
 
     // ─── page margins ────────────────────────────────────────────────────────
@@ -17615,6 +17802,127 @@ mod tests {
         assert_eq!(mb, [0.0, 0.0, 200.0, 100.0]);
         let (w, h, _) = doc.page_info(1).unwrap();
         assert_eq!((w, h), (200.0, 100.0), "page_info size matches the box");
+    }
+
+    #[test]
+    fn page_boxes_default_chain_for_media_only_page() {
+        // A page with only a MediaBox: every other box defaults to it, and only
+        // `media` is declared.
+        let doc = blank_doc();
+        let b = doc.page_boxes(1).unwrap();
+        let mb = [0.0, 0.0, 612.0, 792.0];
+        assert_eq!(b.media, mb);
+        assert_eq!(b.crop, mb, "CropBox defaults to MediaBox");
+        assert_eq!(b.bleed, mb, "BleedBox defaults to CropBox(=Media)");
+        assert_eq!(b.trim, mb, "TrimBox defaults to CropBox(=Media)");
+        assert_eq!(b.art, mb, "ArtBox defaults to CropBox(=Media)");
+        assert!(b.declared.media);
+        assert!(
+            !b.declared.crop && !b.declared.bleed && !b.declared.trim && !b.declared.art,
+            "only MediaBox is explicitly declared",
+        );
+    }
+
+    #[test]
+    fn page_boxes_resolve_inheritance_and_per_box_defaults() {
+        // MediaBox declared on the /Pages node (inherited), CropBox + TrimBox on
+        // the page. Bleed/Art must default to the CropBox, not the MediaBox.
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 600 800] >>".into(),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /CropBox [10 10 590 790] \
+                 /TrimBox [20 20 580 780] >>"
+                    .into(),
+            ),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        let b = doc.page_boxes(1).unwrap();
+        assert_eq!(
+            b.media,
+            [0.0, 0.0, 600.0, 800.0],
+            "MediaBox inherited from /Pages"
+        );
+        assert_eq!(b.crop, [10.0, 10.0, 590.0, 790.0]);
+        assert_eq!(b.trim, [20.0, 20.0, 580.0, 780.0]);
+        assert_eq!(b.bleed, b.crop, "BleedBox defaults to CropBox");
+        assert_eq!(b.art, b.crop, "ArtBox defaults to CropBox");
+        assert!(!b.declared.media, "MediaBox is inherited, not on the page");
+        assert!(b.declared.crop && b.declared.trim);
+        assert!(!b.declared.bleed && !b.declared.art);
+    }
+
+    #[test]
+    fn set_page_box_writes_normalises_and_round_trips() {
+        let mut doc = blank_doc();
+        // Reversed coordinates must be normalised to x0<x1, y0<y1.
+        doc.set_page_box(1, PageBox::Trim, [603.0, 783.0, 9.0, 9.0])
+            .unwrap();
+        doc.set_page_box(1, PageBox::Bleed, [3.0, 3.0, 609.0, 789.0])
+            .unwrap();
+        doc.set_page_box(1, PageBox::Art, [12.0, 12.0, 600.0, 780.0])
+            .unwrap();
+        doc.set_page_box(1, PageBox::Crop, [6.0, 6.0, 606.0, 786.0])
+            .unwrap();
+
+        // Survives a save → reopen cycle (boxes live in the page dict).
+        let reopened = Document::open(&doc.save()).unwrap();
+        let b = reopened.page_boxes(1).unwrap();
+        assert_eq!(b.media, [0.0, 0.0, 612.0, 792.0], "MediaBox untouched");
+        assert_eq!(b.trim, [9.0, 9.0, 603.0, 783.0], "TrimBox normalised");
+        assert_eq!(b.bleed, [3.0, 3.0, 609.0, 789.0]);
+        assert_eq!(b.art, [12.0, 12.0, 600.0, 780.0]);
+        assert_eq!(b.crop, [6.0, 6.0, 606.0, 786.0]);
+        assert!(b.declared.trim && b.declared.bleed && b.declared.art && b.declared.crop);
+    }
+
+    #[test]
+    fn set_page_box_preserves_existing_sibling_boxes() {
+        // A page that already carries a BleedBox must keep it when we add a TrimBox.
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /BleedBox [5 5 195 195] >>"
+                    .into(),
+            ),
+        ]);
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_page_box(1, PageBox::Trim, [10.0, 10.0, 190.0, 190.0])
+            .unwrap();
+        let b = doc.page_boxes(1).unwrap();
+        assert_eq!(
+            b.bleed,
+            [5.0, 5.0, 195.0, 195.0],
+            "pre-existing BleedBox kept"
+        );
+        assert_eq!(b.trim, [10.0, 10.0, 190.0, 190.0], "new TrimBox written");
+    }
+
+    #[test]
+    fn set_page_box_rejects_degenerate_rectangles() {
+        let mut doc = blank_doc();
+        // Zero width.
+        assert!(matches!(
+            doc.set_page_box(1, PageBox::Trim, [10.0, 10.0, 10.0, 200.0]),
+            Err(EngineError::InvalidArgument(_))
+        ));
+        // Non-finite coordinate.
+        assert!(matches!(
+            doc.set_page_box(1, PageBox::Art, [0.0, 0.0, f64::NAN, 100.0]),
+            Err(EngineError::InvalidArgument(_))
+        ));
+        // Unknown page.
+        assert!(matches!(
+            doc.set_page_box(99, PageBox::Crop, [0.0, 0.0, 100.0, 100.0]),
+            Err(EngineError::PageNotFound(99))
+        ));
     }
 
     #[test]

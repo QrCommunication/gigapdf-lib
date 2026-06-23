@@ -7,6 +7,30 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.73.0] - 2026-06-24
+
+Print-production release: the engine now reads and writes **all five ISO 32000-1
+page boundary boxes** (MediaBox/CropBox/BleedBox/TrimBox/ArtBox), the prerequisite
+for PDF/X export and any commercial-print pipeline (imposition, bleed, finished-size
+trimming). Resolves [#6](https://github.com/qrcommunication/gigapdf-lib/issues/6).
+
+### Added
+
+- **Page boxes — full read/write (core + WASM + SDK).** `Document::page_boxes(page)`
+  returns a `PageBoxes` with every box (`media`/`crop`/`bleed`/`trim`/`art`) as
+  `[x0, y0, x1, y1]` points, with **ISO 32000-1 §14.11.2 inheritance and the per-box
+  default chain applied** (CropBox→MediaBox; Bleed/Trim/Art→CropBox; MediaBox &
+  CropBox inherited from an ancestor `/Pages` node), plus a `declared` set flagging
+  which boxes are explicitly on the page vs inherited/defaulted.
+  `Document::set_page_box(page, kind, [x0,y0,x1,y1])` writes one box, normalises the
+  rectangle (reversed corners accepted) and **preserves sibling boxes** — boxes are
+  no longer dropped on round-trip. Exposed as `gp_page_boxes_json` /
+  `gp_set_page_box` (WASM, `kind` 0=media 1=crop 2=bleed 3=trim 4=art) and
+  `doc.getPageBoxes(n)` / `doc.setPageBox(n, "trim", { x, y, w, h })` (SDK), with the
+  `PAGE_BOX_KINDS` / `PageBoxKind` / `PageBoxes` types.
+- **`EngineError::InvalidArgument`.** A new error variant for malformed caller
+  arguments (e.g. a degenerate page-box rectangle or an unknown enum discriminant).
+
 ## [0.68.0] - 2026-06-23
 
 Format-reach + import/render fidelity release: the unified model now exports

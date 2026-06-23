@@ -23,6 +23,9 @@ pub enum EngineError {
     PageNotFound(u32),
     /// A content-object index that does not exist on the page was requested.
     RunNotFound { index: usize, page: u32 },
+    /// A caller-supplied argument was malformed or out of range (e.g. a
+    /// degenerate page-box rectangle, or an unknown enum discriminant).
+    InvalidArgument(String),
 }
 
 impl EngineError {
@@ -49,6 +52,7 @@ impl fmt::Display for EngineError {
             EngineError::RunNotFound { index, page } => {
                 write!(f, "content object #{index} not found on page {page}")
             }
+            EngineError::InvalidArgument(why) => write!(f, "invalid argument: {why}"),
         }
     }
 }

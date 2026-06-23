@@ -1979,6 +1979,43 @@ export interface PageMargins {
   left: number;
 }
 
+/**
+ * The five page boundary boxes (ISO 32000-1 §14.11.2), in display/source order.
+ * Used as the `kind` selector for {@link GigaPdfDoc.setPageBox} and as the keys of
+ * {@link PageBoxes.declared}.
+ */
+export const PAGE_BOX_KINDS = ["media", "crop", "bleed", "trim", "art"] as const;
+
+/** One of the five page boundary boxes — see {@link PAGE_BOX_KINDS}. */
+export type PageBoxKind = (typeof PAGE_BOX_KINDS)[number];
+
+/**
+ * A page's five boundary boxes (see {@link GigaPdfDoc.getPageBoxes}). Each box is
+ * the **effective** rectangle `[x0, y0, x1, y1]` in user-space points, with ISO
+ * 32000-1 inheritance and the per-box default chain already applied — so `crop`
+ * equals `media` when no `/CropBox` is declared, and `bleed`/`trim`/`art` each
+ * fall back to `crop`. Values are reported verbatim (not clamped to their
+ * intersection with the media box), so the source file round-trips faithfully.
+ */
+export interface PageBoxes {
+  /** `/MediaBox` (inherited if absent; defaults to US Letter `[0, 0, 612, 792]`). */
+  media: [number, number, number, number];
+  /** `/CropBox` (inherited if absent; defaults to the media box). */
+  crop: [number, number, number, number];
+  /** `/BleedBox` (defaults to the crop box). */
+  bleed: [number, number, number, number];
+  /** `/TrimBox` (defaults to the crop box). */
+  trim: [number, number, number, number];
+  /** `/ArtBox` (defaults to the crop box). */
+  art: [number, number, number, number];
+  /**
+   * Which boxes are **explicitly declared** on the page dictionary (vs inherited
+   * from an ancestor `/Pages` node or defaulted by the rules above) — lets a host
+   * tell a real `/TrimBox` from one defaulted to the crop box.
+   */
+  declared: Record<PageBoxKind, boolean>;
+}
+
 /** Horizontal alignment of header/footer text within the printable width. */
 export type HeaderFooterAlign = "left" | "center" | "right";
 
@@ -2675,6 +2712,34 @@ export class GigaPdfDoc {
    */
   setPageMargins(page: number, m: PageMargins): boolean {
     return this.ex().gp_set_page_margins(this.h, page, m.top, m.right, m.bottom, m.left) === 0;
+  }
+
+  /**
+   * All five page boundary boxes (`media`/`crop`/`bleed`/`trim`/`art`) for the
+   * 1-based `page`, each as `[x0, y0, x1, y1]` in points, with ISO 32000-1
+   * inheritance and defaults applied. See {@link PageBoxes} for the exact
+   * default chain and the `declared` flags.
+   */
+  getPageBoxes(page: number): PageBoxes {
+    return this.g._json<PageBoxes>((o) => this.ex().gp_page_boxes_json(this.h, page, o));
+  }
+
+  /**
+   * Set one of a page's boundary boxes. `kind` is one of {@link PAGE_BOX_KINDS}
+   * and `box` is given as `{ x, y, w, h }` (origin + size, points); it is written
+   * as `[x, y, x+w, y+h]`, normalised so reversed sizes are accepted. Sibling
+   * boxes are preserved. Returns `true` on success, `false` for an unknown kind,
+   * a degenerate box (zero/negative area), or a bad page number.
+   *
+   * Setting `"trim"`/`"bleed"` is the prerequisite for PDF/X and commercial-print
+   * (imposition, bleed, finished-size) pipelines.
+   */
+  setPageBox(page: number, kind: PageBoxKind, box: Box): boolean {
+    const k = PAGE_BOX_KINDS.indexOf(kind);
+    if (k < 0) return false;
+    return (
+      this.ex().gp_set_page_box(this.h, page, k, box.x, box.y, box.x + box.w, box.y + box.h) === 0
+    );
   }
 
   /**

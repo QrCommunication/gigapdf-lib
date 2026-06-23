@@ -122,6 +122,23 @@ The unified-model lowering helpers (`officeToModel`, `htmlToModel`,
 | `extractPages(pages)` | `Uint8Array` | A new **self-contained** PDF with just `pages` (1-based) — cross-page links/AcroForm fields/named dests/outline entries to dropped pages are pruned. Powers *split*. |
 | `appendPages(otherPdf)` | `boolean` | Append every page of another PDF. Powers *merge*. |
 
+### Page boxes (Media / Crop / Bleed / Trim / Art)
+
+The five boundary boxes of ISO 32000-1 §14.11.2. `getPageBoxes` resolves the full
+**inheritance + default chain** (Crop→Media, Bleed/Trim/Art→Crop, and `/MediaBox`
+/`/CropBox` inherited from an ancestor `/Pages` node), so every box always reads as
+a concrete rectangle. `setPageBox` writes one box and **preserves the others** —
+nothing is silently dropped on save. Setting `trim`/`bleed` is the prerequisite for
+PDF/X and commercial-print pipelines (imposition, bleed, finished-size trimming).
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getPageBoxes(page)` | [`PageBoxes`](#pageboxes) | All five boxes as `[x0,y0,x1,y1]` (points), defaults/inheritance applied, plus `declared` flags marking which are explicitly on the page (vs inherited/defaulted). |
+| `setPageBox(page, kind, box)` | `boolean` | Set one box. `kind` is `"media" \| "crop" \| "bleed" \| "trim" \| "art"`; `box` is `{ x, y, w, h }` (origin + size, points), written as `[x, y, x+w, y+h]` and normalised. `false` on unknown kind / degenerate box / bad page. |
+
+<a id="pageboxes"></a>`PageBoxes = { media, crop, bleed, trim, art: [x0,y0,x1,y1], declared: { media, crop, bleed, trim, art: boolean } }`.
+The box constants live in `PAGE_BOX_KINDS` (`["media","crop","bleed","trim","art"]`).
+
 ### Margins & running header/footer
 
 Page margins and a baked running header/footer on an **existing** PDF (for an

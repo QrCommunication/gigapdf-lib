@@ -31,6 +31,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Redact a sensitive zone (PII)](#redact-a-sensitive-zone-pii) — *v0.52.4*
 - [Styled text: bold · underline · strikethrough · sub/superscript](#styled-text)
 - [Read & write running headers and footers](#headers-and-footers)
+- [Set print boxes (TrimBox / BleedBox) for prepress](#print-boxes) — *v0.73.0*
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
 - [Image → PDF (single & batch)](#image--pdf)
 - [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
@@ -200,6 +201,58 @@ text is drawn in standard Helvetica, so no font embedding is required.
 > header/footer in the page margins from HTML fragments — see
 > [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf) and
 > [`HTML-CSS.md` §1](HTML-CSS.md#1-page-setup).
+
+---
+
+<a id="print-boxes"></a>
+
+## Set print boxes (TrimBox / BleedBox) for prepress
+
+> **Available in v0.73.0.**
+
+A press-ready PDF carries more than a `MediaBox`. The five boxes of ISO 32000-1
+§14.11.2 tell the RIP where the **finished page** is (`TrimBox`), how far artwork
+**bleeds** past the trim (`BleedBox`), the **visible** area (`CropBox`) and the
+**meaningful art** (`ArtBox`). `getPageBoxes` reads all five — already resolving
+inheritance and the per-box default chain — and `setPageBox` writes one at a time
+without disturbing the others.
+
+Here we take an A4 page (595.28 × 841.89 pt) and add a standard **3 mm bleed**
+(8.504 pt) plus a `TrimBox` at the finished A4 size, growing the `MediaBox` so the
+bleed has somewhere to live:
+
+```ts
+const doc = giga.open(pdfBytes);
+
+const mm = (v: number) => (v * 72) / 25.4; // millimetres → points
+const bleed = mm(3); // 3 mm ≈ 8.504 pt
+const a4 = { w: 595.28, h: 841.89 };
+
+// Grow the sheet so the bleed is inside the media box, then place the boxes.
+doc.setPageBox(1, "media", { x: 0, y: 0, w: a4.w + 2 * bleed, h: a4.h + 2 * bleed });
+doc.setPageBox(1, "bleed", { x: 0, y: 0, w: a4.w + 2 * bleed, h: a4.h + 2 * bleed });
+doc.setPageBox(1, "trim", { x: bleed, y: bleed, w: a4.w, h: a4.h });
+
+const boxes = doc.getPageBoxes(1);
+//   → boxes.trim      = [8.50, 8.50, 603.78, 850.39]
+//     boxes.bleed     = [0, 0, 612.29, 858.90]
+//     boxes.declared  = { media: true, crop: false, bleed: true, trim: true, art: false }
+//   (crop/art were never set → they default to the media box on read)
+
+const out = doc.save(); // TrimBox/BleedBox survive the round-trip
+doc.close();
+```
+
+**Reading boxes back** — every field of `getPageBoxes` is always a concrete
+`[x0, y0, x1, y1]` rectangle: a box the page does not declare is resolved through
+the default chain (`CropBox`→`MediaBox`; `BleedBox`/`TrimBox`/`ArtBox`→`CropBox`)
+and inheritance (`MediaBox`/`CropBox` may come from an ancestor `/Pages` node). Use
+the `declared` flags to tell a *real* `TrimBox` from one defaulted to the crop box.
+
+> `setPageBox` rejects a degenerate rectangle (zero or negative area) and returns
+> `false`; reversed corners are accepted (the box is normalised so `x0 < x1`,
+> `y0 < y1`). Boxes are written verbatim — they are **not** clamped to their
+> intersection with the media box, so what you set is what later tools read.
 
 ---
 

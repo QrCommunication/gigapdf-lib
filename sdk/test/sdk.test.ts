@@ -226,6 +226,41 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("page boxes: read defaults, set trim/bleed, round-trip", () => {
+    const doc = giga.open(giga.txtToPdf("Boxes"));
+    doc.resizePage(1, 612, 792);
+
+    // A media-only page: every box defaults to the MediaBox; only media declared.
+    const before = doc.getPageBoxes(1);
+    expect(before.media).toEqual([0, 0, 612, 792]);
+    expect(before.trim).toEqual([0, 0, 612, 792]);
+    expect(before.declared).toMatchObject({
+      media: true,
+      crop: false,
+      trim: false,
+      bleed: false,
+      art: false,
+    });
+
+    // Set a 9pt finished-size TrimBox and a 3pt BleedBox (origin+size form).
+    expect(doc.setPageBox(1, "trim", { x: 9, y: 9, w: 594, h: 774 })).toBe(true);
+    expect(doc.setPageBox(1, "bleed", { x: 3, y: 3, w: 606, h: 786 })).toBe(true);
+    // Degenerate boxes are rejected.
+    expect(doc.setPageBox(1, "art", { x: 0, y: 0, w: 0, h: 100 })).toBe(false);
+
+    // Survives save → reopen (boxes live in the page dict).
+    const reopened = giga.open(doc.save());
+    const after = reopened.getPageBoxes(1);
+    expect(after.trim).toEqual([9, 9, 603, 783]);
+    expect(after.bleed).toEqual([3, 3, 609, 789]);
+    expect(after.declared.trim).toBe(true);
+    expect(after.declared.bleed).toBe(true);
+    // Art was never written → still defaults to the crop box (= media here).
+    expect(after.art).toEqual([0, 0, 612, 792]);
+    reopened.close();
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

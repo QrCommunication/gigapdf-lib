@@ -22,8 +22,8 @@ mod rng;
 
 use gigapdf_core::{
     Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
-    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, Permissions, SearchMatch,
-    TextLayerRun, TextLine, TextRun,
+    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox, Permissions,
+    SearchMatch, TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -2107,6 +2107,81 @@ pub extern "C" fn gp_set_page_margins(
         left,
     };
     edit(handle, |doc| doc.set_page_margins(page, m))
+}
+
+/// A page's five boundary boxes (ISO 32000-1 §14.11.2) as JSON. Each box is the
+/// effective rectangle `[x0,y0,x1,y1]` in points (inheritance + the per-box
+/// default chain applied), and `declared` flags which boxes are explicitly
+/// present on the page (vs inherited/defaulted):
+/// `{"media":[…],"crop":[…],"bleed":[…],"trim":[…],"art":[…],
+///   "declared":{"media":bool,"crop":bool,"bleed":bool,"trim":bool,"art":bool}}`.
+/// Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_page_boxes_json(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let fallback = "{\"media\":[0,0,0,0],\"crop\":[0,0,0,0],\"bleed\":[0,0,0,0],\
+        \"trim\":[0,0,0,0],\"art\":[0,0,0,0],\"declared\":{\"media\":false,\"crop\":false,\
+        \"bleed\":false,\"trim\":false,\"art\":false}}"
+        .to_string();
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => match doc.page_boxes(page) {
+            Ok(b) => {
+                let r = |v: [f64; 4]| format!("[{},{},{},{}]", v[0], v[1], v[2], v[3]);
+                let d = b.declared;
+                format!(
+                    "{{\"media\":{},\"crop\":{},\"bleed\":{},\"trim\":{},\"art\":{},\
+                     \"declared\":{{\"media\":{},\"crop\":{},\"bleed\":{},\"trim\":{},\"art\":{}}}}}",
+                    r(b.media),
+                    r(b.crop),
+                    r(b.bleed),
+                    r(b.trim),
+                    r(b.art),
+                    d.media,
+                    d.crop,
+                    d.bleed,
+                    d.trim,
+                    d.art,
+                )
+            }
+            Err(_) => fallback,
+        },
+        None => fallback,
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Set one of a page's boundary boxes to `[x0,y0,x1,y1]` (points). `kind` is
+/// `0`=media `1`=crop `2`=bleed `3`=trim `4`=art. The rectangle is normalised
+/// (so reversed corners are accepted) and sibling boxes are preserved. Returns
+/// `0` on success, `-1` null handle, `-3` invalid kind / degenerate box / bad page.
+#[no_mangle]
+pub extern "C" fn gp_set_page_box(
+    handle: *mut Document,
+    page: u32,
+    kind: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+) -> i32 {
+    edit(handle, |doc| {
+        let kind = match kind {
+            0 => PageBox::Media,
+            1 => PageBox::Crop,
+            2 => PageBox::Bleed,
+            3 => PageBox::Trim,
+            4 => PageBox::Art,
+            other => {
+                return Err(gigapdf_core::EngineError::InvalidArgument(format!(
+                    "unknown page-box kind {other} (expected 0..=4)"
+                )))
+            }
+        };
+        doc.set_page_box(page, kind, [x0, y0, x1, y1])
+    })
 }
 
 /// Bake a running **header** from a JSON spec (`text`, `align`, `fontSize`,
