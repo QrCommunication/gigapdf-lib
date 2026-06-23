@@ -1695,6 +1695,108 @@ export interface SignTsaOptions extends SignP12Options {
   /** Optional 8–16 random bytes echoed by the TSA (request/response correlation). */
   nonce?: Uint8Array;
 }
+
+/**
+ * Options for {@link GigaPdfDoc.signLtv} — a PAdES long-term validation
+ * signature: a B-T signature, then a `/DSS` (Document Security Store) carrying
+ * the certificate chain + OCSP/CRL revocation material the host fetched (B-LT),
+ * optionally finished with a document timestamp over the whole file (B-LTA).
+ *
+ * Extends {@link SignTsaOptions}: the B-T signature is produced exactly as
+ * {@link GigaPdfDoc.signTimestamped}, then the LTV material is added. The OCSP/CRL
+ * URLs come from the **certificates**, so the host fetches them — supply
+ * `revocationFetch`/`crlFetch` to add auth, proxies, or an SSRF allow-list (the
+ * engine only computes which URLs to fetch).
+ */
+export interface SignLtvOptions extends SignTsaOptions {
+  /**
+   * Add a B-LTA **document timestamp** over the whole file (DSS included) after
+   * the DSS. Requires a second TSA round trip. Default `false` (B-LT only).
+   */
+  archiveTimestamp?: boolean;
+  /**
+   * Override the OCSP round trip — receives the DER `OCSPRequest` and the
+   * responder URL, must resolve to the raw `OCSPResponse` bytes. When omitted,
+   * {@link defaultOcspPost} POSTs `application/ocsp-request` via `fetch`. Throw to
+   * skip an unreachable responder (the DSS is built from whatever succeeds).
+   */
+  revocationFetch?: (req: Uint8Array, url: string) => Promise<Uint8Array>;
+  /**
+   * Override the CRL fetch — receives the CRL distribution-point URL, must
+   * resolve to the raw `CertificateList` (CRL) bytes. When omitted,
+   * {@link defaultCrlGet} GETs the URL. Throw to skip an unreachable CRL.
+   */
+  crlFetch?: (url: string) => Promise<Uint8Array>;
+}
+
+/**
+ * Default OCSP round trip for {@link GigaPdfDoc.signLtv}: POST the DER
+ * `OCSPRequest` to `url` as `application/ocsp-request` and return the raw
+ * `OCSPResponse` body. No SSRF allow-listing — the URL comes from the
+ * certificate's AIA extension; pass `revocationFetch` to restrict it.
+ */
+export async function defaultOcspPost(req: Uint8Array, url: string): Promise<Uint8Array> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/ocsp-request" },
+    body: req as BodyInit,
+    redirect: "error",
+  });
+  if (!res.ok) {
+    throw new Error(`OCSP HTTP ${res.status}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+/**
+ * Default CRL fetch for {@link GigaPdfDoc.signLtv}: GET the `CertificateList`
+ * (CRL) from `url`. No SSRF allow-listing — the URL comes from the certificate's
+ * CRL-DP extension; pass `crlFetch` to restrict it.
+ */
+export async function defaultCrlGet(url: string): Promise<Uint8Array> {
+  const res = await fetch(url, { method: "GET", redirect: "error" });
+  if (!res.ok) {
+    throw new Error(`CRL HTTP ${res.status}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+/** Decode a lowercase/uppercase hex string into bytes (LTV targets carry binary
+ * fields — certificate DER, OCSP requests — as hex inside JSON). */
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length >> 1);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+
+/** Length-frame a list of byte blobs as `[u32 LE count]([u32 LE len][bytes])*`
+ * — the binary multi-blob form `gp_apply_dss` reads for certs/OCSPs/CRLs. */
+function frameBlobs(blobs: Uint8Array[]): Uint8Array {
+  let total = 4;
+  for (const b of blobs) total += 4 + b.length;
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, blobs.length, true);
+  let pos = 4;
+  for (const b of blobs) {
+    view.setUint32(pos, b.length, true);
+    pos += 4;
+    out.set(b, pos);
+    pos += b.length;
+  }
+  return out;
+}
+
+/** One certificate's LTV fetch plan, decoded from the `gp_ltv_targets` JSON. */
+interface LtvTarget {
+  certHex: string;
+  sources: Array<
+    | { kind: "ocsp"; url: string; requestHex: string }
+    | { kind: "crl"; url: string }
+  >;
+}
 /**
  * A markup annotation (rect corners in PDF user space, origin bottom-left).
  * Carries the common metadata plus the type-specific geometry a host editor
@@ -3047,6 +3149,171 @@ export class GigaPdfDoc {
     if (out.length === 0) {
       throw new Error(
         "timestamped signing failed: TSA response rejected or signature too large for the reserved space"
+      );
+    }
+    return out;
+  }
+
+  /**
+   * Sign with **long-term validation** material embedded (PAdES-B-LT, or B-LTA
+   * with `opts.archiveTimestamp`). Builds a B-T signature ({@link signTimestamped}),
+   * then fetches the certificate chain's revocation material (OCSP responses /
+   * CRLs, by URL **from the certificates** — the engine computes which URLs, the
+   * host fetches) and stores it in a `/DSS`, so the signature validates long after
+   * the certificates expire or are revoked. With `archiveTimestamp` a document
+   * timestamp over the whole file (DSS included) is added for renewable archival.
+   *
+   * `async`, multi-round-trip: one TSA POST for the B-T timestamp, one OCSP/CRL
+   * fetch per chain certificate, and (if `archiveTimestamp`) a second TSA POST.
+   * Unreachable responders are skipped — the DSS is built from whatever resolves;
+   * a self-signed identity (no AIA/CRL-DP) simply yields a `/DSS/Certs`-only store.
+   * Override `tsaFetch`/`revocationFetch`/`crlFetch` to add auth, proxies, or an
+   * SSRF allow-list. Throws on a fatal failure (bad identity, B-T signature, or a
+   * malformed PDF the DSS can't chain to).
+   */
+  async signLtv(opts: SignLtvOptions): Promise<Uint8Array> {
+    // 1. The B-T signature is the foundation (its /Contents holds the chain).
+    const signed = await this.signTimestamped(opts);
+
+    // 2. Ask the engine which validation material to fetch (per certificate).
+    const nonce = opts.nonce ?? new Uint8Array(0);
+    const targetsJson = this.withSignedPdf(signed, (pdfPtr, pdfLen) => {
+      const noncePtr = this.g._toWasm(nonce);
+      try {
+        return dec.decode(
+          this.g._buffer((o) =>
+            this.ex().gp_ltv_targets(pdfPtr, pdfLen, noncePtr, nonce.length, o)
+          )
+        );
+      } finally {
+        this.g._free(noncePtr, nonce.length);
+      }
+    });
+    const targets: LtvTarget[] = targetsJson ? JSON.parse(targetsJson) : [];
+
+    // 3. Host fetches: chain certs, plus OCSP/CRL per source (best-effort).
+    const certs: Uint8Array[] = [];
+    const ocsps: Uint8Array[] = [];
+    const crls: Uint8Array[] = [];
+    const ocspPost = opts.revocationFetch ?? defaultOcspPost;
+    const crlGet = opts.crlFetch ?? defaultCrlGet;
+    for (const target of targets) {
+      certs.push(hexToBytes(target.certHex));
+      for (const source of target.sources) {
+        try {
+          if (source.kind === "ocsp") {
+            ocsps.push(await ocspPost(hexToBytes(source.requestHex), source.url));
+          } else {
+            crls.push(await crlGet(source.url));
+          }
+        } catch {
+          // An unreachable responder is non-fatal: the DSS embeds what succeeds.
+        }
+      }
+    }
+
+    // 4. Embed the material in a /DSS (incremental update → B-LT).
+    let lt = this.applyDss(signed, certs, ocsps, crls);
+
+    // 5. Optional B-LTA: a document timestamp over the whole file (DSS included).
+    if (opts.archiveTimestamp) {
+      lt = await this.appendDocumentTimestamp(lt, opts);
+    }
+    return lt;
+  }
+
+  /** Run `fn` with `pdf` copied into wasm memory, freeing it afterwards. */
+  private withSignedPdf<T>(pdf: Uint8Array, fn: (ptr: number, len: number) => T): T {
+    const ptr = this.g._toWasm(pdf);
+    try {
+      return fn(ptr, pdf.length);
+    } finally {
+      this.g._free(ptr, pdf.length);
+    }
+  }
+
+  /** Add the `/DSS` to `signed` as an incremental update (B-LT). */
+  private applyDss(
+    signed: Uint8Array,
+    certs: Uint8Array[],
+    ocsps: Uint8Array[],
+    crls: Uint8Array[]
+  ): Uint8Array {
+    const certsBuf = frameBlobs(certs);
+    const ocspsBuf = frameBlobs(ocsps);
+    const crlsBuf = frameBlobs(crls);
+    const pdfPtr = this.g._toWasm(signed);
+    const cPtr = this.g._toWasm(certsBuf);
+    const oPtr = this.g._toWasm(ocspsBuf);
+    const rPtr = this.g._toWasm(crlsBuf);
+    let out: Uint8Array;
+    try {
+      out = this.g._buffer((res) =>
+        this.ex().gp_apply_dss(
+          pdfPtr,
+          signed.length,
+          cPtr,
+          certsBuf.length,
+          oPtr,
+          ocspsBuf.length,
+          rPtr,
+          crlsBuf.length,
+          res
+        )
+      );
+    } finally {
+      this.g._free(pdfPtr, signed.length);
+      this.g._free(cPtr, certsBuf.length);
+      this.g._free(oPtr, ocspsBuf.length);
+      this.g._free(rPtr, crlsBuf.length);
+    }
+    if (out.length === 0) {
+      throw new Error("LTV failed: could not add the /DSS to the signed PDF");
+    }
+    return out;
+  }
+
+  /** Append a document timestamp over the whole `pdf` (B-LTA), TSA round trip
+   * included. */
+  private async appendDocumentTimestamp(
+    pdf: Uint8Array,
+    opts: SignLtvOptions
+  ): Promise<Uint8Array> {
+    const nonce = opts.nonce ?? new Uint8Array(0);
+    // Phase 1: build the timestamp shell, get the request.
+    const pdfPtr = this.g._toWasm(pdf);
+    const noncePtr = this.g._toWasm(nonce);
+    let request: Uint8Array;
+    try {
+      request = this.g._buffer((o) =>
+        this.ex().gp_doc_timestamp_prepare(this.h, pdfPtr, pdf.length, noncePtr, nonce.length, o)
+      );
+    } finally {
+      this.g._free(pdfPtr, pdf.length);
+      this.g._free(noncePtr, nonce.length);
+    }
+    if (request.length === 0) {
+      throw new Error("LTV archive timestamp failed: could not build the timestamp request");
+    }
+
+    // Host round trip: POST the request to the TSA.
+    const response = opts.tsaFetch
+      ? await opts.tsaFetch(request, opts.tsaUrl)
+      : await defaultTsaPost(opts.tsaUrl, request);
+
+    // Phase 2: embed the token, finalize B-LTA.
+    const tokenPtr = this.g._toWasm(response);
+    let out: Uint8Array;
+    try {
+      out = this.g._buffer((o) =>
+        this.ex().gp_doc_timestamp_finish(this.h, tokenPtr, response.length, o)
+      );
+    } finally {
+      this.g._free(tokenPtr, response.length);
+    }
+    if (out.length === 0) {
+      throw new Error(
+        "LTV archive timestamp failed: TSA response rejected or token too large for the reserved space"
       );
     }
     return out;

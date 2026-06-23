@@ -48,6 +48,29 @@ pub struct Document {
     /// [`sign_finish_timestamped`](Document::sign_finish_timestamped) consumes it.
     /// `None` outside that window (cleared on finish).
     pending_timestamp: Option<PendingTimestampSignature>,
+    /// In-flight PAdES-B-LTA **document timestamp** suspended between its two ABI
+    /// calls: [`prepare_doc_timestamp`](Document::prepare_doc_timestamp) stashes
+    /// the incremental-update bytes whose `/Contents` (a bare RFC 3161 token) is
+    /// still empty, the host POSTs the request to the TSA, and
+    /// [`finish_doc_timestamp`](Document::finish_doc_timestamp) embeds the token.
+    /// `None` outside that window (cleared on finish).
+    pending_doc_timestamp: Option<PendingDocTimestamp>,
+}
+
+/// The frozen state of a PAdES-B-LTA document timestamp between Phase 1 (append
+/// the `ETSI.RFC3161` signature shell + emit the RFC 3161 request over the whole
+/// file's digest) and Phase 2 (embed the host-fetched token). Unlike a B-T
+/// signature timestamp, this has no CMS signer: its `/Contents` is the bare TSA
+/// token and its `MessageImprint` is over the document's `/ByteRange` digest.
+#[derive(Debug, Clone)]
+struct PendingDocTimestamp {
+    /// The incrementally-updated PDF with the timestamp signature's `/ByteRange`
+    /// patched and `/Contents` still a zero-filled hex placeholder.
+    bytes: Vec<u8>,
+    /// Byte index of the `<` opening the `/Contents` hex window.
+    lt: usize,
+    /// Byte index of the `>` closing the `/Contents` hex window.
+    gt: usize,
 }
 
 /// The frozen state of a PAdES-B-T signature between Phase 1 (build + emit the
@@ -1071,6 +1094,7 @@ impl Document {
             font_used_gids: BTreeMap::new(),
             base14_refs: BTreeMap::new(),
             pending_timestamp: None,
+            pending_doc_timestamp: None,
         })
     }
 
@@ -1368,6 +1392,183 @@ impl Document {
                 .ok_or_else(|| EngineError::Unsupported("PAdES-B-T CMS assembly failed".into()))?;
         let mut bytes = pending.bytes;
         fill_contents_window(&mut bytes, pending.lt, pending.gt, &cms)?;
+        Ok(bytes)
+    }
+
+    // ─── PAdES-LTV (B-LT / B-LTA) ──────────────────────────────────────────────
+
+    /// **LTV phase 1.** Compute the validation-material fetch plan for an
+    /// already-signed PDF: the certificate chain embedded in the signature's
+    /// `/Contents` (CMS), and, per certificate, the OCSP request(s) / CRL URL(s)
+    /// discovered from its AIA / CRL-DP extensions. The host fetches these (the
+    /// core has no network stack — same two-phase model as the TSA), then calls
+    /// [`apply_dss`](Self::apply_dss) with the results.
+    ///
+    /// `signed_pdf` is the output of a prior [`sign`](Self::sign) /
+    /// [`sign_p12`](Self::sign_p12) / [`sign_finish_timestamped`]. `nonce` is
+    /// optional host entropy threaded into each OCSP request. Returns an empty
+    /// plan if the PDF carries no recoverable signature certificate.
+    pub fn ltv_fetch_plan(
+        signed_pdf: &[u8],
+        nonce: Option<&[u8]>,
+    ) -> Vec<crate::sign::ltv::CertFetchPlan> {
+        let Some(cms) = extract_signature_cms(signed_pdf) else {
+            return Vec::new();
+        };
+        let chain = crate::sign::ltv::certificates_from_cms(&cms);
+        crate::sign::ltv::plan_chain(&chain, nonce)
+    }
+
+    /// **LTV phase 2 (B-LT).** Add a `/DSS` (Document Security Store) to an
+    /// already-signed PDF as an **incremental update** — the prior signature's
+    /// bytes are left byte-for-byte intact, so it stays valid — embedding the
+    /// validation material the host fetched:
+    ///  - `certs` → `/DSS/Certs` (the chain, DER),
+    ///  - `ocsps` → `/DSS/OCSPs` (OCSP responses, DER),
+    ///  - `crls`  → `/DSS/CRLs` (CRLs, DER),
+    ///  - a `/DSS/VRI/<hex SHA-1 of the signature `/Contents`>` entry pointing at
+    ///    that same material (kept for older validators).
+    ///
+    /// OCSP/CRL bytes are shape-validated (`ltv::parse_ocsp_response` /
+    /// `ltv::parse_crl`) before embedding; malformed entries are skipped rather
+    /// than corrupting the DSS. Returns the upgraded PDF (PAdES-B-LT), or an error
+    /// if `signed_pdf` has no catalog / xref the update can chain to.
+    pub fn apply_dss(
+        signed_pdf: &[u8],
+        certs: &[Vec<u8>],
+        ocsps: &[Vec<u8>],
+        crls: &[Vec<u8>],
+    ) -> Result<Vec<u8>> {
+        let prev_startxref = crate::serialize::last_startxref(signed_pdf)
+            .ok_or_else(|| EngineError::Missing("signed PDF has no startxref".into()))?;
+        let prev_size = crate::serialize::last_size(signed_pdf)
+            .ok_or_else(|| EngineError::Missing("signed PDF has no trailer /Size".into()))?;
+        let (catalog_id, catalog) = find_catalog(signed_pdf)
+            .ok_or_else(|| EngineError::Missing("signed PDF has no document catalog".into()))?;
+
+        // Validate the material we will embed (skip anything malformed).
+        let ocsp_der: Vec<Vec<u8>> = ocsps
+            .iter()
+            .filter_map(|o| crate::sign::ltv::parse_ocsp_response(o).map(|r| r.response_der))
+            .collect();
+        let crl_der: Vec<Vec<u8>> = crls
+            .iter()
+            .filter_map(|c| crate::sign::ltv::parse_crl(c))
+            .collect();
+
+        // Assign fresh object numbers above the existing high-water mark.
+        let mut next = prev_size;
+        let mut new_objects: Vec<(u32, u16, Object)> = Vec::new();
+
+        let mut cert_refs = Vec::with_capacity(certs.len());
+        for cert in certs {
+            let id = next;
+            next += 1;
+            new_objects.push((id, 0, der_stream(cert)));
+            cert_refs.push(Object::Reference((id, 0)));
+        }
+        let mut ocsp_refs = Vec::with_capacity(ocsp_der.len());
+        for ocsp in &ocsp_der {
+            let id = next;
+            next += 1;
+            new_objects.push((id, 0, der_stream(ocsp)));
+            ocsp_refs.push(Object::Reference((id, 0)));
+        }
+        let mut crl_refs = Vec::with_capacity(crl_der.len());
+        for crl in &crl_der {
+            let id = next;
+            next += 1;
+            new_objects.push((id, 0, der_stream(crl)));
+            crl_refs.push(Object::Reference((id, 0)));
+        }
+
+        // /VRI entry keyed by the signature's /Contents SHA-1 (PAdES convention),
+        // referencing the same material.
+        let mut dss = Dictionary::new();
+        if !cert_refs.is_empty() {
+            dss.set(b"Certs".to_vec(), Object::Array(cert_refs.clone()));
+        }
+        if !ocsp_refs.is_empty() {
+            dss.set(b"OCSPs".to_vec(), Object::Array(ocsp_refs.clone()));
+        }
+        if !crl_refs.is_empty() {
+            dss.set(b"CRLs".to_vec(), Object::Array(crl_refs.clone()));
+        }
+        if let Some(contents) = signature_contents_bytes(signed_pdf) {
+            let key = crate::sign::ltv::vri_key(&contents);
+            let mut vri_entry = Dictionary::new();
+            if !cert_refs.is_empty() {
+                vri_entry.set(b"Cert".to_vec(), Object::Array(cert_refs));
+            }
+            if !ocsp_refs.is_empty() {
+                vri_entry.set(b"OCSP".to_vec(), Object::Array(ocsp_refs));
+            }
+            if !crl_refs.is_empty() {
+                vri_entry.set(b"CRL".to_vec(), Object::Array(crl_refs));
+            }
+            let mut vri = Dictionary::new();
+            vri.set(key.into_bytes(), Object::Dictionary(vri_entry));
+            dss.set(b"VRI".to_vec(), Object::Dictionary(vri));
+        }
+
+        let dss_id = next;
+        next += 1;
+        new_objects.push((dss_id, 0, Object::Dictionary(dss)));
+
+        // Re-emit the catalog (same number/generation) with /DSS added.
+        let mut catalog = catalog;
+        catalog.set(b"DSS".to_vec(), Object::Reference((dss_id, 0)));
+        new_objects.push((catalog_id.0, catalog_id.1, Object::Dictionary(catalog)));
+
+        let size = next; // one past the highest number written
+        let root = Object::Reference(catalog_id);
+        Ok(crate::serialize::append_incremental_update(
+            signed_pdf,
+            &new_objects,
+            prev_startxref,
+            size,
+            root,
+            None,
+        ))
+    }
+
+    /// **B-LTA phase 1.** Append a PAdES **document timestamp** signature shell
+    /// (`/SubFilter ETSI.RFC3161`, an invisible signature whose `/Contents` will
+    /// be a bare RFC 3161 token) to `pdf` as an incremental update, and return the
+    /// `TimeStampReq` (DER) the host must POST to a TSA. The timestamp covers the
+    /// **whole file** (its `/ByteRange`), so applying this *after*
+    /// [`apply_dss`](Self::apply_dss) protects the DSS too. The partial update is
+    /// stashed until [`finish_doc_timestamp`](Self::finish_doc_timestamp).
+    ///
+    /// `nonce` is optional host entropy echoed by the TSA. Any previously pending
+    /// document timestamp is discarded.
+    pub fn prepare_doc_timestamp(&mut self, pdf: &[u8], nonce: Option<&[u8]>) -> Result<Vec<u8>> {
+        let (bytes, lt, gt, signed) = build_doc_timestamp_layout(pdf)?;
+        let imprint = crate::sign::timestamp::sha256_imprint(&signed);
+        let request = crate::sign::timestamp::build_request(&imprint, nonce);
+        self.pending_doc_timestamp = Some(PendingDocTimestamp { bytes, lt, gt });
+        Ok(request)
+    }
+
+    /// **B-LTA phase 2.** Embed the RFC 3161 timestamp the host fetched into the
+    /// pending document-timestamp `/Contents`, finalizing the PAdES-B-LTA PDF.
+    ///
+    /// For the `ETSI.RFC3161` subfilter the `/Contents` must be the **bare
+    /// `TimeStampToken` `ContentInfo`** — so `response` may be either the raw
+    /// `TimeStampResp` (the bare token is extracted, with the `PKIStatus` gate) or
+    /// an already-unwrapped token. Clears the pending state. Errors if none is
+    /// pending, the response is rejected/malformed, or the token overflows the
+    /// reserved `/Contents` space.
+    pub fn finish_doc_timestamp(&mut self, response: &[u8]) -> Result<Vec<u8>> {
+        let pending = self
+            .pending_doc_timestamp
+            .take()
+            .ok_or_else(|| EngineError::Missing("no pending document timestamp".into()))?;
+        let token = crate::sign::timestamp::parse_response(response).ok_or_else(|| {
+            EngineError::Unsupported("TSA response rejected or missing timestamp token".into())
+        })?;
+        let mut bytes = pending.bytes;
+        fill_contents_window(&mut bytes, pending.lt, pending.gt, &token.token_der)?;
         Ok(bytes)
     }
 
@@ -13082,6 +13283,12 @@ const CONTENTS_BYTES_LEGACY: usize = 8192;
 /// 32 KiB → 65536 hex chars, comfortably above a typical token+chain.
 const CONTENTS_BYTES_TIMESTAMPED: usize = 32768;
 
+/// `/Contents` reservation for a PAdES-B-LTA **document timestamp**
+/// (`ETSI.RFC3161`): the `/Contents` is a bare RFC 3161 `TimeStampToken`
+/// `ContentInfo` (TSA cert chain included), no CMS signer. 16 KiB → 32768 hex
+/// chars, above a typical FreeTSA/DigiCert token.
+const CONTENTS_BYTES_DOCTIMESTAMP: usize = 16384;
+
 /// Hex-fill the `/Contents` window `(lt, gt)` (the byte offsets of `<` and `>`)
 /// of an already-serialized, `/ByteRange`-patched PDF with `cms`, right-padding
 /// with `'0'`. Errors if the CMS overflows the reserved space — the classic
@@ -13102,6 +13309,255 @@ fn fill_contents_window(bytes: &mut [u8], lt: usize, gt: usize, cms: &[u8]) -> R
     }
     bytes[lt + 1..gt].copy_from_slice(hex.as_bytes());
     Ok(())
+}
+
+// ─── PAdES-LTV helpers (byte-level, operate on an already-signed PDF) ─────────
+
+/// A PDF Stream object holding `der` bytes verbatim (no filter) — the form a
+/// `/DSS` certificate / OCSP response / CRL is embedded as.
+fn der_stream(der: &[u8]) -> Object {
+    let mut dict = Dictionary::new();
+    dict.set(b"Length".to_vec(), Object::Integer(der.len() as i64));
+    Object::Stream(Stream::new(dict, der.to_vec()))
+}
+
+/// Decode the bytes inside the **last** signature `/Contents <…>` hex window of a
+/// signed PDF — the CMS `SignedData` (or RFC 3161 token) blob. Trailing zero
+/// padding (the unused reserved space) is stripped at the DER level by reading
+/// only the outer SEQUENCE's length. `None` if no signature `/Contents` is found.
+fn signature_contents_bytes(pdf: &[u8]) -> Option<Vec<u8>> {
+    let needle = b"/Contents <";
+    // Use the last occurrence (a document timestamp would add another later).
+    let start = pdf.windows(needle.len()).rposition(|w| w == needle)?;
+    let lt = start + needle.len() - 1; // index of '<'
+    let gt = pdf[lt..].iter().position(|&b| b == b'>').map(|p| lt + p)?;
+    let hex = &pdf[lt + 1..gt];
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        let hi = hex_val(pair[0])?;
+        let lo = hex_val(pair[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Some(trim_to_der(&bytes))
+}
+
+/// Same as [`signature_contents_bytes`] — the CMS blob of a signed PDF's
+/// signature, for chain extraction.
+fn extract_signature_cms(pdf: &[u8]) -> Option<Vec<u8>> {
+    signature_contents_bytes(pdf)
+}
+
+/// Trim a zero-padded DER blob to the outer SEQUENCE's actual length (tag +
+/// length header + content). Returns the input unchanged if it doesn't start with
+/// a definite-length SEQUENCE.
+fn trim_to_der(bytes: &[u8]) -> Vec<u8> {
+    let mut reader = crate::sign::der::Reader::new(bytes);
+    match reader.read_raw() {
+        Some((tlv, raw)) if tlv.tag == crate::sign::der::TAG_SEQUENCE => raw.to_vec(),
+        _ => bytes.to_vec(),
+    }
+}
+
+/// One hex digit → nibble.
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Re-scan a serialized PDF and return its document catalog `(id, dict)` — the
+/// `/Type /Catalog` object (preferring the one the trailer `/Root` references).
+/// Used by the LTV incremental updates, which work on already-signed bytes rather
+/// than the in-memory model.
+fn find_catalog(pdf: &[u8]) -> Option<(ObjectId, Dictionary)> {
+    let (objects, mut trailer) = scan(pdf);
+    recover_trailer_from_xref(&mut trailer, &objects);
+    if let Some(Object::Reference(id)) = trailer.get(b"Root") {
+        if let Some(Object::Dictionary(dict)) = objects.get(id) {
+            return Some((*id, dict.clone()));
+        }
+    }
+    for (id, object) in &objects {
+        if let Object::Dictionary(dict) = object {
+            if dict.get(b"Type").and_then(Object::as_name) == Some(b"Catalog".as_slice()) {
+                return Some((*id, dict.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Build the document-timestamp (`ETSI.RFC3161`) signature shell as an
+/// incremental update over a signed `pdf`: append a `/Sig` value dict, an
+/// invisible widget field, and re-emitted catalog/page so the timestamp is a
+/// real (if invisible) signature field — without touching the existing signed
+/// bytes. Patches the new `/ByteRange` over the whole file. Returns the bytes,
+/// the `<`/`>` offsets of the timestamp `/Contents`, and the signed range.
+fn build_doc_timestamp_layout(pdf: &[u8]) -> Result<(Vec<u8>, usize, usize, Vec<u8>)> {
+    let prev_startxref = crate::serialize::last_startxref(pdf)
+        .ok_or_else(|| EngineError::Missing("PDF has no startxref".into()))?;
+    let prev_size = crate::serialize::last_size(pdf)
+        .ok_or_else(|| EngineError::Missing("PDF has no trailer /Size".into()))?;
+    let (objects, trailer) = {
+        let (o, mut t) = scan(pdf);
+        recover_trailer_from_xref(&mut t, &o);
+        (o, t)
+    };
+    let (catalog_id, mut catalog) =
+        find_catalog(pdf).ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+
+    let mut next = prev_size;
+    let mut new_objects: Vec<(u32, u16, Object)> = Vec::new();
+
+    // 1. The timestamp's /Sig value dict (no /Name/Reason — a doc timestamp).
+    let sig_id = (next, 0u16);
+    next += 1;
+    let mut sig = Dictionary::new();
+    sig.set(b"Type".to_vec(), Object::Name(b"DocTimeStamp".to_vec()));
+    sig.set(b"Filter".to_vec(), Object::Name(b"Adobe.PPKLite".to_vec()));
+    sig.set(b"SubFilter".to_vec(), Object::Name(b"ETSI.RFC3161".to_vec()));
+    sig.set(
+        b"ByteRange".to_vec(),
+        Object::Array(vec![Object::Integer(9_999_999_999); 4]),
+    );
+    sig.set(
+        b"Contents".to_vec(),
+        Object::String(vec![0u8; CONTENTS_BYTES_DOCTIMESTAMP], StringKind::Hex),
+    );
+    new_objects.push((sig_id.0, sig_id.1, Object::Dictionary(sig)));
+
+    // 2. Invisible widget field linked to the value, on page 1.
+    let field_id = (next, 0u16);
+    next += 1;
+    let page_id = first_page_id(&objects, &catalog);
+    let mut field = Dictionary::new();
+    field.set(b"Type".to_vec(), Object::Name(b"Annot".to_vec()));
+    field.set(b"Subtype".to_vec(), Object::Name(b"Widget".to_vec()));
+    field.set(b"FT".to_vec(), Object::Name(b"Sig".to_vec()));
+    field.set(
+        b"T".to_vec(),
+        Object::String(b"Timestamp1".to_vec(), StringKind::Literal),
+    );
+    field.set(b"V".to_vec(), Object::Reference(sig_id));
+    field.set(b"Rect".to_vec(), annot::real_array(&[0.0, 0.0, 0.0, 0.0]));
+    field.set(b"F".to_vec(), Object::Integer(132)); // Print + Locked
+    if let Some(pid) = page_id {
+        field.set(b"P".to_vec(), Object::Reference(pid));
+    }
+    new_objects.push((field_id.0, field_id.1, Object::Dictionary(field)));
+
+    // 3. Re-emit the page (same id) with the widget appended to /Annots.
+    if let Some(pid) = page_id {
+        if let Some(Object::Dictionary(page)) = objects.get(&pid) {
+            let mut page = page.clone();
+            let mut annots = resolve_in(&objects, page.get(b"Annots"))
+                .and_then(Object::as_array)
+                .map(<[Object]>::to_vec)
+                .unwrap_or_default();
+            annots.push(Object::Reference(field_id));
+            page.set(b"Annots".to_vec(), Object::Array(annots));
+            new_objects.push((pid.0, pid.1, Object::Dictionary(page)));
+        }
+    }
+
+    // 4. Re-emit the catalog (same id) registering the field in the AcroForm.
+    let mut acroform = resolve_in(&objects, catalog.get(b"AcroForm"))
+        .and_then(Object::as_dict)
+        .cloned()
+        .unwrap_or_default();
+    let mut fields = resolve_in(&objects, acroform.get(b"Fields"))
+        .and_then(Object::as_array)
+        .map(<[Object]>::to_vec)
+        .unwrap_or_default();
+    fields.push(Object::Reference(field_id));
+    acroform.set(b"Fields".to_vec(), Object::Array(fields));
+    acroform.set(b"SigFlags".to_vec(), Object::Integer(3));
+    catalog.set(b"AcroForm".to_vec(), Object::Dictionary(acroform));
+    new_objects.push((catalog_id.0, catalog_id.1, Object::Dictionary(catalog)));
+
+    let size = next;
+    let root = Object::Reference(catalog_id);
+    let info = trailer.get(b"Info").cloned();
+    let mut bytes = crate::serialize::append_incremental_update(
+        pdf,
+        &new_objects,
+        prev_startxref,
+        size,
+        root,
+        info,
+    );
+
+    // Locate the timestamp /Contents window (the last one — it's what we appended).
+    let needle = b"/Contents <";
+    let start = bytes
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .ok_or_else(|| EngineError::Missing("doc-timestamp /Contents placeholder".into()))?;
+    let lt = start + needle.len() - 1;
+    let gt = bytes[lt..]
+        .iter()
+        .position(|&b| b == b'>')
+        .map(|p| lt + p)
+        .ok_or_else(|| EngineError::Missing("doc-timestamp /Contents end".into()))?;
+
+    let total = bytes.len();
+    let byte_range = [0usize, lt, gt + 1, total - (gt + 1)];
+
+    // Patch the timestamp's /ByteRange (the last one in the file).
+    let br_needle = b"/ByteRange [";
+    let br = bytes
+        .windows(br_needle.len())
+        .rposition(|w| w == br_needle)
+        .map(|p| p + br_needle.len())
+        .ok_or_else(|| EngineError::Missing("doc-timestamp /ByteRange".into()))?;
+    let mut p = br;
+    for (i, value) in byte_range.iter().enumerate() {
+        bytes[p..p + 10].copy_from_slice(format!("{value:010}").as_bytes());
+        p += 10 + usize::from(i < 3);
+    }
+
+    let mut signed = Vec::with_capacity(byte_range[1] + byte_range[3]);
+    signed.extend_from_slice(&bytes[0..lt]);
+    signed.extend_from_slice(&bytes[gt + 1..]);
+    Ok((bytes, lt, gt, signed))
+}
+
+/// Resolve an optional indirect reference against a parsed object map (one hop;
+/// LTV helpers work on freshly scanned bytes, not the live `Document::resolve`).
+fn resolve_in<'a>(objects: &'a BTreeMap<ObjectId, Object>, obj: Option<&'a Object>) -> Option<&'a Object> {
+    match obj {
+        Some(Object::Reference(id)) => objects.get(id),
+        other => other,
+    }
+}
+
+/// The object id of the first page (`/Pages /Kids[0]`) of a re-scanned PDF, for
+/// attaching the document-timestamp widget. `None` if the page tree can't be
+/// walked.
+fn first_page_id(objects: &BTreeMap<ObjectId, Object>, catalog: &Dictionary) -> Option<ObjectId> {
+    let pages = match resolve_in(objects, catalog.get(b"Pages")) {
+        Some(Object::Dictionary(d)) => d,
+        _ => return None,
+    };
+    let kids = resolve_in(objects, pages.get(b"Kids")).and_then(Object::as_array)?;
+    let mut current = kids.first()?;
+    for _ in 0..64 {
+        let id = current.as_reference()?;
+        let dict = objects.get(&id).and_then(Object::as_dict)?;
+        match dict.get(b"Type").and_then(Object::as_name) {
+            Some(t) if t == b"Page".as_slice() => return Some(id),
+            _ => {
+                // A /Pages node: descend into its first kid.
+                current = resolve_in(objects, dict.get(b"Kids"))
+                    .and_then(Object::as_array)
+                    .and_then(<[Object]>::first)?;
+            }
+        }
+    }
+    None
 }
 
 /// Expand a packed RGB buffer (3 bytes/pixel) to opaque RGBA (4 bytes/pixel).
@@ -19473,5 +19929,144 @@ mod tests {
         assert!(content.contains("(CONFIDENTIAL) Tj"), "text watermark drawn");
         assert!(content.contains(" gs"), "opacity via ExtGState");
         assert!(Document::open(&doc.save()).is_ok());
+    }
+
+    // ─── PAdES-LTV (B-LT / B-LTA) ──────────────────────────────────────────────
+
+    fn ltv_signer() -> crate::sign::Signer {
+        let randomness: Vec<u8> = (0..256).map(|i| (i * 31 + 11) as u8).collect();
+        crate::sign::Signer::generate(
+            "GigaPDF LTV",
+            "260101000000Z",
+            "360101000000Z",
+            1024,
+            &randomness,
+        )
+        .expect("signer")
+    }
+
+    /// A signed PDF (PAdES-B via the legacy `sign` path is enough — the DSS just
+    /// needs an embedded CMS to read the chain from).
+    fn signed_pdf() -> Vec<u8> {
+        let pdf = crate::convert::reverse::txt_to_pdf("ltv test document");
+        let mut doc = Document::open(&pdf).unwrap();
+        let signer = ltv_signer();
+        doc.sign(&signer, "LTV Signer", "archival", "D:20260101120000Z")
+            .expect("sign")
+    }
+
+    #[test]
+    fn ltv_fetch_plan_recovers_the_signature_chain() {
+        let pdf = signed_pdf();
+        let plans = Document::ltv_fetch_plan(&pdf, None);
+        assert_eq!(plans.len(), 1, "one embedded signer certificate");
+        // The self-signed cert advertises no OCSP/CRL, so no sources, but the
+        // cert DER itself is recovered for /DSS/Certs.
+        assert_eq!(plans[0].cert_der, ltv_signer().certificate());
+        assert!(plans[0].sources.is_empty());
+    }
+
+    #[test]
+    fn apply_dss_embeds_material_and_preserves_the_signature() {
+        let pdf = signed_pdf();
+        let original_len = pdf.len();
+
+        // Shape-valid stand-in OCSP response + CRL (the embedder validates shape).
+        let ocsp = crate::sign::der::sequence(&[
+            crate::sign::der::tlv(0x0A, &[0x00]), // responseStatus successful
+            crate::sign::der::context(0, &crate::sign::der::octet_string(b"basic")),
+        ]);
+        let crl = crate::sign::der::sequence(&[
+            crate::sign::der::sequence(&[crate::sign::der::integer_u32(1)]),
+            crate::sign::der::sequence(&[crate::sign::der::oid(&[1, 2, 840, 113549, 1, 1, 11])]),
+            crate::sign::der::bit_string(&[0xAB]),
+        ]);
+        let certs = vec![ltv_signer().certificate().to_vec()];
+
+        let lt = Document::apply_dss(&pdf, &certs, &[ocsp], &[crl]).expect("apply DSS");
+
+        // The original signed bytes are an untouched prefix (incremental update).
+        assert!(lt.len() > original_len, "DSS appended");
+        assert_eq!(&lt[..original_len], &pdf[..], "signed bytes byte-for-byte intact");
+
+        // The DSS dictionary with its three material arrays is present.
+        let text = String::from_utf8_lossy(&lt);
+        assert!(text.contains("/DSS"), "catalog references the DSS");
+        assert!(text.contains("/Certs"), "DSS carries /Certs");
+        assert!(text.contains("/OCSPs"), "DSS carries /OCSPs");
+        assert!(text.contains("/CRLs"), "DSS carries /CRLs");
+        assert!(text.contains("/VRI"), "DSS carries the /VRI map");
+
+        // The upgraded PDF still parses, and the catalog now has a /DSS ref.
+        let reopened = Document::open(&lt).expect("reopen B-LT PDF");
+        let catalog = reopened.catalog().expect("catalog");
+        assert!(catalog.get(b"DSS").is_some(), "catalog /DSS survives reparse");
+    }
+
+    #[test]
+    fn apply_dss_skips_malformed_material() {
+        let pdf = signed_pdf();
+        let certs = vec![ltv_signer().certificate().to_vec()];
+        // Garbage OCSP/CRL bytes must be dropped, not embedded.
+        let lt = Document::apply_dss(&pdf, &certs, &[vec![0xDE, 0xAD]], &[vec![0xBE, 0xEF]])
+            .expect("apply DSS");
+        let text = String::from_utf8_lossy(&lt);
+        assert!(text.contains("/Certs"), "valid certs still embedded");
+        assert!(!text.contains("/OCSPs"), "malformed OCSP dropped");
+        assert!(!text.contains("/CRLs"), "malformed CRL dropped");
+    }
+
+    #[test]
+    fn document_timestamp_two_phase_appends_over_the_whole_file() {
+        // Start from a B-LT PDF so the timestamp protects the DSS too (B-LTA).
+        let signed = signed_pdf();
+        let certs = vec![ltv_signer().certificate().to_vec()];
+        let blt = Document::apply_dss(&signed, &certs, &[], &[]).expect("apply DSS");
+        let blt_len = blt.len();
+
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("x")).unwrap();
+
+        // Phase 1: build the timestamp shell + request.
+        let request = doc
+            .prepare_doc_timestamp(&blt, Some(&[0x01, 0x02, 0x03, 0x04]))
+            .expect("prepare doc timestamp");
+        assert_eq!(request[0], 0x30, "TimeStampReq is DER");
+
+        // A stand-in RFC 3161 token (a ContentInfo-shaped SEQUENCE). The bytes
+        // come back verbatim in /Contents.
+        let token = crate::sign::der::sequence(&[
+            crate::sign::der::oid(&[1, 2, 840, 113549, 1, 7, 2]),
+            crate::sign::der::context(0, &crate::sign::der::octet_string(b"tst-token")),
+        ]);
+
+        // Phase 2: embed the token, finalize B-LTA.
+        let blta = doc.finish_doc_timestamp(&token).expect("finish doc timestamp");
+
+        // The B-LT bytes are an untouched prefix; the timestamp is appended.
+        assert!(blta.len() > blt_len, "doc timestamp appended");
+        assert_eq!(&blta[..blt_len], &blt[..], "B-LT bytes intact under the timestamp");
+
+        let text = String::from_utf8_lossy(&blta);
+        assert!(text.contains("/DocTimeStamp"), "document-timestamp /Type");
+        assert!(text.contains("ETSI.RFC3161"), "ETSI.RFC3161 subfilter");
+
+        // The token is embedded (hex-encoded) in the final /Contents window, and
+        // recovers byte-for-byte through the hex/DER-trim reader.
+        let token_hex: String = token.iter().map(|b| format!("{b:02X}")).collect();
+        assert!(text.contains(&token_hex), "TSA token hex present in /Contents");
+        assert_eq!(
+            signature_contents_bytes(&blta).as_deref(),
+            Some(token.as_slice()),
+            "token recovered verbatim from the timestamp /Contents"
+        );
+
+        // Still a valid PDF.
+        assert!(Document::open(&blta).is_ok(), "B-LTA PDF reopens");
+    }
+
+    #[test]
+    fn finish_doc_timestamp_without_prepare_errors() {
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("x")).unwrap();
+        assert!(doc.finish_doc_timestamp(b"token").is_err());
     }
 }

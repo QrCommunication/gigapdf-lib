@@ -429,6 +429,185 @@ pub extern "C" fn gp_sign_finish_tsa(
     }
 }
 
+// ─── PAdES-LTV (B-LT / B-LTA) ────────────────────────────────────────────────
+
+/// Append a lowercase-hex encoding of `bytes` to `out` (for binary fields carried
+/// inside the LTV targets JSON — OCSP requests, certificate DER).
+fn push_hex(bytes: &[u8], out: &mut String) {
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+}
+
+/// Split a length-framed buffer (`[u32 LE count]([u32 LE len][len bytes])*`) into
+/// its component blobs. Returns an empty vector on any framing inconsistency.
+fn read_framed(buf: &[u8]) -> Vec<Vec<u8>> {
+    if buf.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 4;
+    for _ in 0..count {
+        if pos + 4 > buf.len() {
+            return Vec::new();
+        }
+        let len = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        pos += 4;
+        if pos + len > buf.len() {
+            return Vec::new();
+        }
+        out.push(buf[pos..pos + len].to_vec());
+        pos += len;
+    }
+    out
+}
+
+/// **LTV phase 1.** Compute the validation-material fetch plan for an
+/// already-signed PDF `(pdf_ptr, pdf_len)` and return it as a JSON string the host
+/// uses to drive the OCSP/CRL fetches. Each chain certificate yields its hex DER
+/// and the revocation sources discovered from its extensions:
+///
+/// ```json
+/// [{"certHex":"30..","sources":[
+///     {"kind":"ocsp","url":"http://ocsp...","requestHex":"30.."},
+///     {"kind":"crl","url":"http://crl..."}]}]
+/// ```
+///
+/// `nonce` (optional host entropy) is threaded into each OCSP request. Buffer-
+/// returning (host frees); never null (an empty `[]` if no signature is found).
+#[no_mangle]
+pub extern "C" fn gp_ltv_targets(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    nonce_ptr: *const u8,
+    nonce_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    use gigapdf_core::sign::ltv::RevocationSource;
+    let pdf = unsafe { opt_slice(pdf_ptr, pdf_len) };
+    let nonce_bytes = unsafe { opt_slice(nonce_ptr, nonce_len) };
+    let nonce = if nonce_bytes.is_empty() {
+        None
+    } else {
+        Some(nonce_bytes)
+    };
+    let plans = Document::ltv_fetch_plan(pdf, nonce);
+
+    let mut s = String::from("[");
+    for (i, plan) in plans.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("{\"certHex\":\"");
+        push_hex(&plan.cert_der, &mut s);
+        s.push_str("\",\"sources\":[");
+        for (j, source) in plan.sources.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            match source {
+                RevocationSource::Ocsp { url, request } => {
+                    s.push_str("{\"kind\":\"ocsp\",\"url\":");
+                    json_escape(url, &mut s);
+                    s.push_str(",\"requestHex\":\"");
+                    push_hex(request, &mut s);
+                    s.push_str("\"}");
+                }
+                RevocationSource::Crl { url } => {
+                    s.push_str("{\"kind\":\"crl\",\"url\":");
+                    json_escape(url, &mut s);
+                    s.push('}');
+                }
+            }
+        }
+        s.push_str("]}");
+    }
+    s.push(']');
+    unsafe { bytes_into_host(s.into_bytes(), out_len) }
+}
+
+/// **LTV phase 2 (B-LT).** Add a `/DSS` to the signed PDF `(pdf_ptr, pdf_len)` as
+/// an incremental update, embedding the host-fetched validation material. Each of
+/// `certs`/`ocsps`/`crls` is a length-framed buffer
+/// (`[u32 count]([u32 len][bytes])*`). Returns the upgraded PDF (PAdES-B-LT).
+/// Buffer-returning (host frees); null on error.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_apply_dss(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    certs_ptr: *const u8,
+    certs_len: usize,
+    ocsps_ptr: *const u8,
+    ocsps_len: usize,
+    crls_ptr: *const u8,
+    crls_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let pdf = unsafe { opt_slice(pdf_ptr, pdf_len) };
+    let certs = read_framed(unsafe { opt_slice(certs_ptr, certs_len) });
+    let ocsps = read_framed(unsafe { opt_slice(ocsps_ptr, ocsps_len) });
+    let crls = read_framed(unsafe { opt_slice(crls_ptr, crls_len) });
+    match Document::apply_dss(pdf, &certs, &ocsps, &crls) {
+        Ok(out) => unsafe { bytes_into_host(out, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// **B-LTA phase 1.** Append an `ETSI.RFC3161` document-timestamp shell to
+/// `(pdf_ptr, pdf_len)` and return the RFC 3161 `TimeStampReq` (DER) the host must
+/// POST to a TSA. The partial update is stashed on `handle` until
+/// [`gp_doc_timestamp_finish`]. `nonce` is optional. Buffer-returning (host
+/// frees); null on error.
+#[no_mangle]
+pub extern "C" fn gp_doc_timestamp_prepare(
+    handle: *mut Document,
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    nonce_ptr: *const u8,
+    nonce_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let pdf = unsafe { opt_slice(pdf_ptr, pdf_len) };
+    let nonce_bytes = unsafe { opt_slice(nonce_ptr, nonce_len) };
+    let nonce = if nonce_bytes.is_empty() {
+        None
+    } else {
+        Some(nonce_bytes)
+    };
+    match doc.prepare_doc_timestamp(pdf, nonce) {
+        Ok(req) => unsafe { bytes_into_host(req, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// **B-LTA phase 2.** Embed the RFC 3161 `token` the host fetched into the pending
+/// document timestamp on `handle`, finalizing the PAdES-B-LTA PDF. Requires a
+/// prior [`gp_doc_timestamp_prepare`] on the same handle. Buffer-returning (host
+/// frees); null on error.
+#[no_mangle]
+pub extern "C" fn gp_doc_timestamp_finish(
+    handle: *mut Document,
+    token_ptr: *const u8,
+    token_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let token = unsafe { opt_slice(token_ptr, token_len) };
+    match doc.finish_doc_timestamp(token) {
+        Ok(pdf) => unsafe { bytes_into_host(pdf, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Release a document handle.
 #[no_mangle]
 pub extern "C" fn gp_close(handle: *mut Document) {

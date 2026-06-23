@@ -8,6 +8,7 @@
 //! signs *content*; it does not assert a CA-backed identity.
 
 pub mod der; // the definite-length DER reader the PKCS#12 importer uses
+pub mod ltv; // PAdES-LTV: OCSP/CRL fetch plan, DSS validation material
 pub mod pades; // PAdES signing-certificate-v2 ESS attribute
 pub mod pkcs12;
 pub mod timestamp; // RFC 3161 TimeStampReq build / TimeStampResp parse

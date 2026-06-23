@@ -94,6 +94,123 @@ pub fn to_pdf(objects: &BTreeMap<ObjectId, Object>, trailer: &Dictionary) -> Vec
     out
 }
 
+/// Append a PDF **incremental update** to an already-serialized `base` document
+/// (ISO 32000-1 §7.5.6): keep `base` byte-for-byte intact and write, after it, a
+/// fresh body of `new_objects` (each `(number, generation, object)`), a classic
+/// xref section listing only those objects, and a trailer whose `/Prev` chains to
+/// the document's previous `startxref`.
+///
+/// This is the mechanism PAdES-LTV needs: a `/DSS` (validation material) or a
+/// document timestamp can be added **without disturbing the bytes an existing
+/// signature's `/ByteRange` already covers** — the prior signature stays valid.
+///
+/// `prev_startxref` is the byte offset of the most recent xref in `base` (its
+/// `startxref` value); `size` is the new `/Size` (one past the highest object
+/// number in the whole file). `root`/`info` carry the (updated) `/Root` and
+/// `/Info` references for the trailer. The objects are written verbatim — callers
+/// pass fully-formed `Object`s (references already point at final numbers), so no
+/// renumbering happens here.
+pub fn append_incremental_update(
+    base: &[u8],
+    new_objects: &[(u32, u16, Object)],
+    prev_startxref: usize,
+    size: u32,
+    root: Object,
+    info: Option<Object>,
+) -> Vec<u8> {
+    let mut out = base.to_vec();
+    // A clean object boundary: most writers (and ours) end with `%%EOF\n`; a
+    // newline before the first appended object keeps tokens from fusing.
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+
+    // 1. Emit the new objects, recording offsets.
+    let mut offsets: Vec<(u32, u16, usize)> = Vec::with_capacity(new_objects.len());
+    for (number, generation, object) in new_objects {
+        offsets.push((*number, *generation, out.len()));
+        out.extend_from_slice(format!("{number} {generation} obj\n").as_bytes());
+        write_object(&mut out, object);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+
+    // 2. Classic xref with one subsection per contiguous run of object numbers
+    //    (an incremental update need not start at object 0).
+    let xref_offset = out.len();
+    out.extend_from_slice(b"xref\n");
+    let mut sorted = offsets.clone();
+    sorted.sort_by_key(|(n, _, _)| *n);
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i].0;
+        let mut j = i;
+        // Extend the run while object numbers stay consecutive.
+        while j + 1 < sorted.len() && sorted[j + 1].0 == sorted[j].0 + 1 {
+            j += 1;
+        }
+        let run_len = j - i + 1;
+        out.extend_from_slice(format!("{start} {run_len}\n").as_bytes());
+        for (_, generation, offset) in &sorted[i..=j] {
+            out.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        i = j + 1;
+    }
+
+    // 3. Trailer chaining to the previous xref via /Prev.
+    let mut trailer = Dictionary::new();
+    trailer.set(b"Size".to_vec(), Object::Integer(size as i64));
+    trailer.set(b"Root".to_vec(), root);
+    if let Some(info) = info {
+        trailer.set(b"Info".to_vec(), info);
+    }
+    trailer.set(b"Prev".to_vec(), Object::Integer(prev_startxref as i64));
+    out.extend_from_slice(b"trailer\n");
+    write_object(&mut out, &Object::Dictionary(trailer));
+    out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    out
+}
+
+/// Read the byte offset in the most recent `startxref` of a serialized PDF — the
+/// value an [`append_incremental_update`] must chain to via `/Prev`. Scans from
+/// the end for the last `startxref` keyword. `None` if absent or unparsable.
+pub fn last_startxref(pdf: &[u8]) -> Option<usize> {
+    let keyword = b"startxref";
+    let pos = pdf
+        .windows(keyword.len())
+        .rposition(|w| w == keyword)?;
+    let rest = &pdf[pos + keyword.len()..];
+    let digits: Vec<u8> = rest
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+/// Read the trailer `/Size` of a serialized PDF — the next free object number is
+/// this value (objects are numbered `1..Size-1`, with `0` the free-list head).
+/// Scans the last `trailer` dictionary for `/Size`. `None` if absent.
+pub fn last_size(pdf: &[u8]) -> Option<u32> {
+    let keyword = b"/Size";
+    let pos = pdf.windows(keyword.len()).rposition(|w| w == keyword)?;
+    let rest = &pdf[pos + keyword.len()..];
+    let digits: Vec<u8> = rest
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
 /// Like [`to_pdf`] but encrypts every object's strings and stream bytes with the
 /// Standard Security Handler, appending the `/Encrypt` dictionary (itself never
 /// encrypted) and an `/Encrypt` + `/ID` trailer.

@@ -1,9 +1,10 @@
 # DESIGN — Trusted Timestamps (RFC 3161), PAdES & LTV signatures
 
-> Status: **DESIGN / SCOPING** — for arbitration & greenlight. No code is changed
-> by this document.
+> Status: **P1 + P2 + P3 IMPLEMENTED** (B-T, PAdES-B default, B-LT/B-LTA LTV).
+> P1/P2 shipped in 0.70.0; **P3 (LTV) landed 2026-06-23** (this pass) — see
+> §C "Implemented" and the phase table.
 > Scope: `gigapdf-lib` (Rust → WASM, pure-`std` core + audited RustCrypto for crypto).
-> Author: design pass, 2026-06-23. Repo: `QrCommunication/gigapdf-lib` @ workspace `0.69.0`.
+> Author: design pass, 2026-06-23. Repo: `QrCommunication/gigapdf-lib` @ workspace `0.70.0`.
 
 ---
 
@@ -473,6 +474,56 @@ What the engine must gain for LTV:
 This is the largest chunk and is explicitly **P3** (gated on real demand for full
 LTA archival vs. "B-T is enough for our e-invoicing/eIDAS-advanced use case").
 
+### C.1 Implemented (2026-06-23) — what landed vs. what was deferred
+
+**Built (B-LT + B-LTA), M1 hand-roll, zero new deps:**
+
+- **Incremental-update writer** — `serialize::append_incremental_update(base,
+  new_objects, prev_startxref, size, root, info)` keeps `base` byte-for-byte and
+  appends a fresh body + xref (per-run subsections) + `/Prev`-chained trailer.
+  `serialize::last_startxref` / `last_size` read the chain point. This is the
+  mechanism that lets a `/DSS` and a document timestamp be added **without
+  invalidating the prior signature's `/ByteRange`** (verified by a test asserting
+  the signed bytes are an untouched prefix).
+- **`sign/ltv.rs`** (hand-rolled with `sign/der.rs`, no `x509-ocsp`/`tsp`):
+  - `certificate_extensions` + `ocsp_url` (AIA `id-ad-ocsp` → `[6]` URI) +
+    `crl_url` (CRL-DP, first HTTP(S) URI).
+  - `build_ocsp_request` (RFC 6960 `OCSPRequest`, SHA-1 `CertID` over issuer
+    DN/SPKI key + subject serial, optional nonce extension).
+  - `parse_ocsp_response` (`responseStatus` gate, embedded verbatim) and
+    `parse_crl` (`CertificateList` shape check, embedded verbatim).
+  - `certificates_from_cms` (pull the chain out of a signature's `/Contents`),
+    `plan_chain` (per-cert OCSP-first + CRL-fallback plan, cert *i* checked vs its
+    issuer *i+1*), `vri_key` (upper-hex SHA-1 of `/Contents`).
+- **`Document` API**: `ltv_fetch_plan` (phase 1 — emit fetch targets) ·
+  `apply_dss` (phase 2 — `/DSS` with `/Certs`,`/OCSPs`,`/CRLs`,`/VRI` as an
+  incremental update; malformed OCSP/CRL skipped) · `prepare_doc_timestamp` /
+  `finish_doc_timestamp` (B-LTA document timestamp, `ETSI.RFC3161`, two-phase,
+  `/Contents` = bare token extracted via `timestamp::parse_response`).
+- **WASM ABI**: `gp_ltv_targets` (JSON, hex-encoded binary) · `gp_apply_dss`
+  (length-framed cert/OCSP/CRL buffers) · `gp_doc_timestamp_prepare` /
+  `gp_doc_timestamp_finish`.
+- **SDK**: `signLtv(opts)` async — B-T → fetch OCSP/CRL per cert (best-effort;
+  unreachable responders skipped) → `/DSS` (B-LT) → optional document timestamp
+  (`archiveTimestamp` → B-LTA). `defaultOcspPost` / `defaultCrlGet` (host fetch,
+  overridable via `revocationFetch`/`crlFetch` for auth/SSRF allow-list).
+- **SSRF**: per design §A.3/§F, the OCSP/CRL URLs come from the **certificates'**
+  AIA/CRL-DP extensions and are **host-fetched**; the engine only computes which
+  URLs. The SDK defaults add `redirect: "error"` but **no allow-list** — a
+  consumer worried about a hostile cert (AIA → internal host) passes
+  `revocationFetch`/`crlFetch`/`tsaFetch` to enforce its own policy. Documented on
+  the option types.
+
+**Deferred (not needed for B-LT/B-LTA production):**
+
+- **Cryptographic *verification*** of the embedded OCSP/CRL/TSA tokens (signature
+  + chain validation) — this is a *consumer/validator* concern, a separate epic,
+  and is where `x509-ocsp` + `tsp` would earn their keep. The producer embeds the
+  material the host fetched (transport-trusted), exactly as P1 embeds the TSA
+  token.
+- **CRL freshness / `thisUpdate`/`nextUpdate` time checks** — the engine has no
+  clock; the embedded CRL's currency is a host/validator responsibility.
+
 ---
 
 ## D. TSA providers — survey & default choice
@@ -509,7 +560,7 @@ emits the request; the URL is a host/SDK argument.
 |-------|-------------|-----------|--------|
 | **P1 — TSA timestamp (B-T)** | `signTimestamped()` async SDK method; two-phase `gp_sign_prepare_tsa`/`gp_sign_finish_tsa`; TimeStampReq build (M1) + token embed as unsigned attr; works on top of self-signed **and** PKCS#12; PAdES-B signed attrs (signing-certificate-v2) + `ETSI.CAdES.detached` subfilter so the timestamped output is genuine PAdES-B-T; bigger/auto-sized `/Contents`. Tests: req DER shape, finish with a captured token fixture, end-to-end against FreeTSA behind the `tsaFetch` hook. | `sign/timestamp.rs` (req build/resp parse, M1), `sign/pades.rs` (ESS signing-cert-v2), `Document::sign_prepare_timestamped`/`sign_finish_timestamped` + pending state, 2 wasm ABI fns, SDK async method + `defaultTsaPost`, `/Contents` sizing. | **~M (4–6 dev-days)** |
 | **P2 — PAdES-B as default profile** | Profile flag on `sign`/`signP12` selecting `ETSI.CAdES.detached` + ESS attrs vs legacy `adbe.pkcs7.detached`; B-T = profile + P1 timestamp. (Largely folded into P1; this phase is the cleanup + the non-timestamped PAdES-B path + docs.) | Parameterize `sign_with` subfilter + attr set; SDK `SignProfile`. | **~S (1–2 dev-days)** |
-| **P3 — PAdES-LTV (B-LT / B-LTA)** | `/DSS` writer (incremental update) for cert chain + OCSP/CRL; host two-phase fetch of OCSP/CRL (compute AIA/CRL-DP URLs in core, host fetches); document timestamp (`ETSI.RFC3161`) reusing P1 plumbing for B-LTA; optional TSA-token verification. New deps: `x509-ocsp`, `x509-cert::crl` (+ maybe `tsp`). | `document.rs` DSS writer, `sign/ltv.rs` (chain/OCSP-URL discovery, response parse), doc-timestamp pass, SDK `upgradeToLtv()`. | **~L (8–12 dev-days)** |
+| **P3 — PAdES-LTV (B-LT / B-LTA)** ✅ **DONE (2026-06-23)** | `/DSS` writer (incremental update) for cert chain + OCSP/CRL; host two-phase fetch of OCSP/CRL (compute AIA/CRL-DP URLs in core, host fetches); document timestamp (`ETSI.RFC3161`) reusing P1 plumbing for B-LTA. **Decision: M1 hand-roll (no `x509-ocsp`/`tsp` dep)** — OCSP request/response + CRL shape + AIA/CRL-DP extraction done with the in-tree `sign/der.rs`, keeping the "two narrow crypto exceptions" posture (`cms` + `x509-cert`). | `serialize::append_incremental_update`/`last_startxref`/`last_size`; `sign/ltv.rs` (AIA/CRL-DP discovery, OCSP req build, OCSP/CRL parse, CMS chain extract, VRI key); `Document::ltv_fetch_plan`/`apply_dss`/`prepare_doc_timestamp`/`finish_doc_timestamp` + pending state; 4 wasm ABI fns (`gp_ltv_targets`/`gp_apply_dss`/`gp_doc_timestamp_prepare`/`gp_doc_timestamp_finish`); SDK `signLtv()` async + `defaultOcspPost`/`defaultCrlGet`. | **~L (8–12 dev-days)** |
 
 ### DECISIONS REQUIRED FROM THE USER
 
