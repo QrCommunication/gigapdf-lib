@@ -22,9 +22,9 @@ use crate::convert::office::{
 use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
 use crate::model::{
-    Align, Block, BlockKind, Cell, CharStyle, Document, Heading, ImageRef, Inline, LineHeight,
-    LinkTarget, List, ListMarker, Paragraph, Row, Shape, Sheet, SheetBlock, SheetCell, Slide,
-    SlideBlock, Table, TextBox,
+    Align, Block, BlockKind, BorderStyle, Cell, CharStyle, Document, Heading, ImageRef, Inline,
+    LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Shape, Sheet, SheetBlock, SheetCell,
+    Slide, SlideBlock, Table, TextBox, VAlign,
 };
 use crate::model::{CellValue, PlaceholderRole};
 
@@ -72,17 +72,21 @@ pub fn docx_from_model(doc: &Document) -> Vec<u8> {
 
     let body = docx_body(doc, &mut ctx);
 
-    let has_header = doc
+    // Render header/footer up front so any lists *inside* them register their
+    // markers before `numbering.xml` is generated (their `w:numId` must resolve).
+    let header_inner = doc
         .sections
         .first()
         .and_then(|s| s.header.as_ref())
-        .is_some();
-    let has_footer = doc
+        .map(|h| docx_blocks(h, &mut ctx));
+    let footer_inner = doc
         .sections
         .first()
         .and_then(|s| s.footer.as_ref())
-        .is_some();
-    let has_num = ctx.list_count > 0;
+        .map(|f| docx_blocks(f, &mut ctx));
+    let has_header = header_inner.is_some();
+    let has_footer = footer_inner.is_some();
+    let has_num = !ctx.list_markers.is_empty();
 
     zip.add_deflated(
         "[Content_Types].xml",
@@ -104,21 +108,19 @@ Target=\"word/document.xml\"/></Relationships>",
     if has_num {
         zip.add_deflated(
             "word/numbering.xml",
-            docx_numbering_xml(ctx.list_count).as_bytes(),
+            docx_numbering_xml(&ctx.list_markers).as_bytes(),
         );
     }
-    if let Some(header) = doc.sections.first().and_then(|s| s.header.as_ref()) {
-        let inner = docx_blocks(header, &mut ctx);
+    if let Some(inner) = &header_inner {
         zip.add_deflated(
             "word/header1.xml",
-            docx_hdrftr_xml("hdr", &inner).as_bytes(),
+            docx_hdrftr_xml("hdr", inner).as_bytes(),
         );
     }
-    if let Some(footer) = doc.sections.first().and_then(|s| s.footer.as_ref()) {
-        let inner = docx_blocks(footer, &mut ctx);
+    if let Some(inner) = &footer_inner {
         zip.add_deflated(
             "word/footer1.xml",
-            docx_hdrftr_xml("ftr", &inner).as_bytes(),
+            docx_hdrftr_xml("ftr", inner).as_bytes(),
         );
     }
     for (i, img) in ctx.images.iter().enumerate() {
@@ -132,8 +134,9 @@ Target=\"word/document.xml\"/></Relationships>",
 /// gets a distinct `w:numId`), and the document's resource table for image blobs.
 struct DocxCtx<'a> {
     images: Vec<Vec<u8>>,
-    /// Number of list *instances* emitted; also the next `w:numId`.
-    list_count: usize,
+    /// One marker per list *instance* emitted; its position + 1 is the list's
+    /// `w:numId`, and the marker drives the generated `numbering.xml` format.
+    list_markers: Vec<ListMarker>,
     /// Next unique drawing/object id.
     obj_id: usize,
     resources: &'a crate::model::ResourceTable,
@@ -143,7 +146,7 @@ impl<'a> DocxCtx<'a> {
     fn new(resources: &'a crate::model::ResourceTable) -> Self {
         DocxCtx {
             images: Vec::new(),
-            list_count: 0,
+            list_markers: Vec::new(),
             obj_id: 0,
             resources,
         }
@@ -382,6 +385,11 @@ fn docx_rpr(style: &CharStyle) -> String {
     if style.strike {
         p.push_str("<w:strike/>");
     }
+    match style.vertical_align {
+        VAlign::Super => p.push_str("<w:vertAlign w:val=\"superscript\"/>"),
+        VAlign::Sub => p.push_str("<w:vertAlign w:val=\"subscript\"/>"),
+        VAlign::Baseline => {}
+    }
     if let Some(c) = visible_color(style) {
         p.push_str(&format!("<w:color w:val=\"{c}\"/>"));
     }
@@ -396,8 +404,8 @@ fn docx_rpr(style: &CharStyle) -> String {
 /// Emit a [`List`] as a sequence of numbered paragraphs (one `w:numId` for the
 /// whole list). Nested block content inside an item keeps its own numbering.
 fn docx_list(list: &List, ctx: &mut DocxCtx, out: &mut String) {
-    ctx.list_count += 1;
-    let num_id = ctx.list_count;
+    ctx.list_markers.push(list.marker);
+    let num_id = ctx.list_markers.len();
     for item in &list.items {
         for (i, b) in item.blocks.iter().enumerate() {
             match &b.kind {
@@ -763,22 +771,26 @@ fn docx_styles_xml() -> String {
     s
 }
 
-/// numbering.xml with one abstract+concrete numbering per list instance. Each
-/// abstract num defines 9 levels alternating decimal so nested items number
-/// independently; the concrete `w:num` ids are `1..=count` (matching the
-/// `w:numId` written on paragraphs).
-fn docx_numbering_xml(count: usize) -> String {
+/// numbering.xml with one abstract+concrete numbering per list instance. The
+/// `markers` slice is one [`ListMarker`] per list; entry `i` drives the abstract
+/// num `i + 1` (matching the `w:numId` written on paragraphs). Every level of a
+/// given list shares that list's format (bullet char or ordinal style).
+fn docx_numbering_xml(markers: &[ListMarker]) -> String {
     let mut abstracts = String::new();
     let mut nums = String::new();
-    for n in 1..=count {
+    for (i, marker) in markers.iter().enumerate() {
+        let n = i + 1;
+        let (num_fmt, lvl_text_tmpl, bullet_font) = docx_list_format(*marker);
         let mut lvls = String::new();
         for lvl in 0..9 {
             let indent = twips(18.0 + 18.0 * lvl as f64);
+            // `%N` placeholders are 1-based on the level for ordered lists; the
+            // template is constant (the bullet char) for bullet lists.
+            let lvl_text = lvl_text_tmpl.replace("%N", &format!("%{}", lvl + 1));
             lvls.push_str(&format!(
-                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>\
-<w:lvlText w:val=\"%{one}.\"/><w:lvlJc w:val=\"left\"/>\
-<w:pPr><w:ind w:left=\"{indent}\" w:hanging=\"360\"/></w:pPr></w:lvl>",
-                one = lvl + 1,
+                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"{num_fmt}\"/>\
+<w:lvlText w:val=\"{lvl_text}\"/><w:lvlJc w:val=\"left\"/>\
+<w:pPr><w:ind w:left=\"{indent}\" w:hanging=\"360\"/></w:pPr>{bullet_font}</w:lvl>",
             ));
         }
         abstracts.push_str(&format!(
@@ -792,6 +804,27 @@ fn docx_numbering_xml(count: usize) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{abstracts}{nums}</w:numbering>"
     )
+}
+
+/// Map a [`ListMarker`] to its OOXML numbering shape:
+/// `(w:numFmt value, w:lvlText template, optional <w:rPr> bullet font)`.
+///
+/// The template uses the sentinel `%N`, replaced per level with `%<level>` for
+/// ordered lists; bullet lists embed the literal bullet character.
+fn docx_list_format(marker: ListMarker) -> (&'static str, String, &'static str) {
+    let bullet_font = "<w:rPr><w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/></w:rPr>";
+    match marker {
+        ListMarker::Decimal => ("decimal", "%N.".to_string(), ""),
+        ListMarker::LowerAlpha => ("lowerLetter", "%N.".to_string(), ""),
+        ListMarker::UpperAlpha => ("upperLetter", "%N.".to_string(), ""),
+        ListMarker::LowerRoman => ("lowerRoman", "%N.".to_string(), ""),
+        ListMarker::UpperRoman => ("upperRoman", "%N.".to_string(), ""),
+        ListMarker::Bullet(c) => {
+            let mut esc_c = String::new();
+            esc(&c.to_string(), &mut esc_c);
+            ("bullet", esc_c, bullet_font)
+        }
+    }
 }
 
 // ════════════════════════════════════ XLSX ════════════════════════════════════
@@ -846,67 +879,188 @@ Target=\"xl/workbook.xml\"/></Relationships>",
     zip.finish()
 }
 
-/// Accumulates `cellXfs` style records (numFmt + fill) and returns stable indices.
+/// A distinct font record (family/size/bold/italic/colour) for the `<fonts>`
+/// table. `size_pt` is stored as integer hundredths of a point so the key is
+/// hashable/comparable without `f64` issues.
+#[derive(Clone, PartialEq, Eq)]
+struct XlsxFont {
+    family: String,
+    size_centi: u32,
+    bold: bool,
+    italic: bool,
+    /// `RRGGBB` hex, or empty for the default (automatic/black).
+    color: String,
+}
+
+/// A horizontal alignment + wrap pairing for an `<alignment>` child.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct XlsxAlign {
+    /// `None` ⇒ general (no horizontal attribute emitted).
+    horizontal: Option<Align>,
+    wrap: bool,
+}
+
+impl XlsxAlign {
+    fn is_default(self) -> bool {
+        self.horizontal.is_none() && !self.wrap
+    }
+}
+
+/// A full `cellXfs` style record: number format, fill, font, border, alignment.
+#[derive(Clone, PartialEq, Eq)]
+struct XlsxXf {
+    num_fmt_id: u32,
+    fill_idx: usize,
+    font_idx: usize,
+    border_idx: usize,
+    align: XlsxAlign,
+}
+
+/// Accumulates `cellXfs` style records (numFmt + fill + font + border +
+/// alignment) and returns stable indices. Index 0 is always the default xf.
 struct XlsxStyler {
     /// Custom number-format codes → builtin/custom numFmtId (starts at 164).
     num_fmts: Vec<(u32, String)>,
     /// Fill colours (RRGGBB) → fill index (0 and 1 are reserved by spec).
     fills: Vec<String>,
-    /// Style records: `(numFmtId, fillIndex)` → cellXfs index.
-    xfs: Vec<(u32, usize)>,
+    /// Distinct fonts; index 0 is the default Calibri 11.
+    fonts: Vec<XlsxFont>,
+    /// Distinct borders (the model's single all-edge border per cell); index 0
+    /// is the empty/no-border border.
+    borders: Vec<BorderStyle>,
+    /// Style records keyed by their full tuple → cellXfs index.
+    xfs: Vec<XlsxXf>,
 }
 
 impl XlsxStyler {
     fn new() -> Self {
-        // cellXfs[0] is the default (no numFmt, fill 0).
+        // cellXfs[0] is the default (no numFmt, fill 0, font 0, border 0).
         XlsxStyler {
             num_fmts: Vec::new(),
             fills: Vec::new(),
-            xfs: vec![(0, 0)],
+            fonts: vec![XlsxFont {
+                family: "Calibri".to_string(),
+                size_centi: 1100,
+                bold: false,
+                italic: false,
+                color: String::new(),
+            }],
+            borders: vec![BorderStyle::default()],
+            xfs: vec![XlsxXf {
+                num_fmt_id: 0,
+                fill_idx: 0,
+                font_idx: 0,
+                border_idx: 0,
+                align: XlsxAlign::default(),
+            }],
         }
     }
 
-    /// Resolve a style index for an optional number format and fill colour.
-    fn style_for(&mut self, number_format: Option<&str>, fill: Option<[f64; 3]>) -> usize {
-        if number_format.is_none() && fill.is_none() {
-            return 0;
-        }
-        let num_fmt_id = match number_format {
+    /// Resolve (or create) the numFmtId for an optional number-format code.
+    fn num_fmt_id(&mut self, number_format: Option<&str>) -> u32 {
+        match number_format {
             None => 0,
-            Some(code) => {
-                let existing = self
-                    .num_fmts
-                    .iter()
-                    .find(|(_, c)| c == code)
-                    .map(|(id, _)| *id);
-                existing.unwrap_or_else(|| {
+            Some(code) => self
+                .num_fmts
+                .iter()
+                .find(|(_, c)| c == code)
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| {
                     let id = 164 + self.num_fmts.len() as u32;
                     self.num_fmts.push((id, code.to_string()));
                     id
-                })
-            }
-        };
-        let fill_idx = match fill {
+                }),
+        }
+    }
+
+    /// Resolve (or create) the fillId for an optional fill colour. Built-in
+    /// fills 0 (none) and 1 (gray125) precede the custom solids.
+    fn fill_id(&mut self, fill: Option<[f64; 3]>) -> usize {
+        match fill {
             None => 0,
             Some(rgb) => {
                 let hexc = hex(rgb);
-                let pos = self.fills.iter().position(|f| *f == hexc);
-                let local = pos.unwrap_or_else(|| {
-                    self.fills.push(hexc);
-                    self.fills.len() - 1
-                });
-                // Built-in fills 0 (none) and 1 (gray125) precede custom fills.
+                let local = self
+                    .fills
+                    .iter()
+                    .position(|f| *f == hexc)
+                    .unwrap_or_else(|| {
+                        self.fills.push(hexc);
+                        self.fills.len() - 1
+                    });
                 local + 2
             }
+        }
+    }
+
+    /// Resolve (or create) the fontId for a cell's character style. Returns 0
+    /// (the default Calibri 11) when the style carries no distinguishing trait.
+    fn font_id(&mut self, style: &CharStyle) -> usize {
+        let want = XlsxFont {
+            family: if style.family.is_empty() {
+                "Calibri".to_string()
+            } else {
+                style.family.clone()
+            },
+            size_centi: (run_size(style) * 100.0).round() as u32,
+            bold: style.bold,
+            italic: style.italic,
+            color: visible_color(style).unwrap_or_default(),
         };
-        if let Some(i) = self
-            .xfs
-            .iter()
-            .position(|&(n, f)| n == num_fmt_id && f == fill_idx)
-        {
+        if want == self.fonts[0] {
+            return 0;
+        }
+        if let Some(i) = self.fonts.iter().position(|f| *f == want) {
             return i;
         }
-        self.xfs.push((num_fmt_id, fill_idx));
+        self.fonts.push(want);
+        self.fonts.len() - 1
+    }
+
+    /// Resolve (or create) the borderId for an optional cell border. Returns 0
+    /// (no border) for `None` or a zero-width border.
+    fn border_id(&mut self, border: Option<BorderStyle>) -> usize {
+        match border {
+            Some(b) if b.width > 0.0 => {
+                if let Some(i) = self.borders.iter().position(|x| *x == b) {
+                    return i;
+                }
+                self.borders.push(b);
+                self.borders.len() - 1
+            }
+            _ => 0,
+        }
+    }
+
+    /// Resolve a `cellXfs` index for a sheet cell's full styling.
+    fn style_for(&mut self, cell: &SheetCell) -> usize {
+        let num_fmt_id = self.num_fmt_id(cell.number_format.as_deref());
+        let fill_idx = self.fill_id(cell.fill);
+        let font_idx = self.font_id(&cell.style);
+        let border_idx = self.border_id(cell.border);
+        let align = XlsxAlign {
+            horizontal: cell.align,
+            wrap: cell.wrap,
+        };
+        if num_fmt_id == 0
+            && fill_idx == 0
+            && font_idx == 0
+            && border_idx == 0
+            && align.is_default()
+        {
+            return 0;
+        }
+        let xf = XlsxXf {
+            num_fmt_id,
+            fill_idx,
+            font_idx,
+            border_idx,
+            align,
+        };
+        if let Some(i) = self.xfs.iter().position(|x| *x == xf) {
+            return i;
+        }
+        self.xfs.push(xf);
         self.xfs.len() - 1
     }
 
@@ -922,6 +1076,26 @@ impl XlsxStyler {
             num_fmts.push_str("</numFmts>");
         }
 
+        // Fonts: at least the default Calibri 11.
+        let mut fonts = String::new();
+        for f in &self.fonts {
+            let mut fam = String::new();
+            esc(&f.family, &mut fam);
+            let mut s = String::from("<font>");
+            if f.bold {
+                s.push_str("<b/>");
+            }
+            if f.italic {
+                s.push_str("<i/>");
+            }
+            s.push_str(&format!("<sz val=\"{}\"/>", num(f.size_centi as f64 / 100.0)));
+            if !f.color.is_empty() {
+                s.push_str(&format!("<color rgb=\"FF{}\"/>", f.color));
+            }
+            s.push_str(&format!("<name val=\"{fam}\"/></font>"));
+            fonts.push_str(&s);
+        }
+
         // Fills: 0 = none, 1 = gray125 (both spec-required), then custom solids.
         let mut fills = String::from(
             "<fill><patternFill patternType=\"none\"/></fill>\
@@ -934,20 +1108,69 @@ impl XlsxStyler {
         }
         let fill_count = 2 + self.fills.len();
 
+        // Borders: index 0 is the empty border; the rest are the model's single
+        // all-edge style applied to every side.
+        let mut borders = String::new();
+        for (i, b) in self.borders.iter().enumerate() {
+            if i == 0 {
+                borders.push_str("<border><left/><right/><top/><bottom/><diagonal/></border>");
+            } else {
+                let style = xlsx_border_style(b.width);
+                let color = format!("<color rgb=\"FF{}\"/>", hex(b.color));
+                let edge = format!("<{{e}} style=\"{style}\">{color}</{{e}}>");
+                let side = |e: &str| edge.replace("{e}", e);
+                borders.push_str(&format!(
+                    "<border>{}{}{}{}<diagonal/></border>",
+                    side("left"),
+                    side("right"),
+                    side("top"),
+                    side("bottom"),
+                ));
+            }
+        }
+        let border_count = self.borders.len();
+
         let mut xfs = String::new();
-        for &(num_fmt_id, fill_idx) in &self.xfs {
-            let apply_num = if num_fmt_id != 0 {
+        for xf in &self.xfs {
+            let apply_num = if xf.num_fmt_id != 0 {
                 " applyNumberFormat=\"1\""
             } else {
                 ""
             };
-            let apply_fill = if fill_idx != 0 {
+            let apply_fill = if xf.fill_idx != 0 {
                 " applyFill=\"1\""
             } else {
                 ""
             };
+            let apply_font = if xf.font_idx != 0 {
+                " applyFont=\"1\""
+            } else {
+                ""
+            };
+            let apply_border = if xf.border_idx != 0 {
+                " applyBorder=\"1\""
+            } else {
+                ""
+            };
+            let (apply_align, align_child) = if xf.align.is_default() {
+                (String::new(), String::new())
+            } else {
+                let mut a = String::from("<alignment");
+                if let Some(h) = xf.align.horizontal {
+                    a.push_str(&format!(" horizontal=\"{}\"", xlsx_align_attr(h)));
+                }
+                if xf.align.wrap {
+                    a.push_str(" wrapText=\"1\"");
+                }
+                a.push_str("/>");
+                (" applyAlignment=\"1\"".to_string(), a)
+            };
             xfs.push_str(&format!(
-                "<xf numFmtId=\"{num_fmt_id}\" fontId=\"0\" fillId=\"{fill_idx}\" borderId=\"0\" xfId=\"0\"{apply_num}{apply_fill}/>"
+                "<xf numFmtId=\"{nf}\" fontId=\"{fo}\" fillId=\"{fi}\" borderId=\"{bo}\" xfId=\"0\"{apply_num}{apply_font}{apply_fill}{apply_border}{apply_align}>{align_child}</xf>",
+                nf = xf.num_fmt_id,
+                fo = xf.font_idx,
+                fi = xf.fill_idx,
+                bo = xf.border_idx,
             ));
         }
 
@@ -955,15 +1178,38 @@ impl XlsxStyler {
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
 {num_fmts}\
-<fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>\
+<fonts count=\"{font_count}\">{fonts}</fonts>\
 <fills count=\"{fill_count}\">{fills}</fills>\
-<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>\
+<borders count=\"{border_count}\">{borders}</borders>\
 <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
 <cellXfs count=\"{xf_count}\">{xfs}</cellXfs>\
 <cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>\
 </styleSheet>",
+            font_count = self.fonts.len(),
             xf_count = self.xfs.len(),
         )
+    }
+}
+
+/// The OOXML `<alignment horizontal=...>` value for a model alignment. Justify
+/// maps to `justify`; the rest are the obvious literals.
+fn xlsx_align_attr(a: Align) -> &'static str {
+    match a {
+        Align::Left => "left",
+        Align::Center => "center",
+        Align::Right => "right",
+        Align::Justify => "justify",
+    }
+}
+
+/// The OOXML border line style for a point width (`thin`/`medium`/`thick`).
+fn xlsx_border_style(width: f64) -> &'static str {
+    if width >= 2.5 {
+        "thick"
+    } else if width >= 1.5 {
+        "medium"
+    } else {
+        "thin"
     }
 }
 
@@ -972,7 +1218,7 @@ fn xlsx_sheet_from_model(sheet: &Sheet, styler: &mut XlsxStyler) -> String {
     for (r, row) in sheet.rows.iter().enumerate() {
         let mut cells = String::new();
         for (c, cell) in row.cells.iter().enumerate() {
-            let s_idx = styler.style_for(cell.number_format.as_deref(), cell.fill);
+            let s_idx = styler.style_for(cell);
             let s_attr = if s_idx != 0 {
                 format!(" s=\"{s_idx}\"")
             } else {
@@ -1004,8 +1250,13 @@ fn xlsx_sheet_from_model(sheet: &Sheet, styler: &mut XlsxStyler) -> String {
                 }
             }
         }
-        if !cells.is_empty() {
-            data.push_str(&format!("<row r=\"{}\">{cells}</row>", r + 1));
+        // Emit the row when it has cells or carries an explicit height.
+        let row_attrs = match row.height {
+            Some(h) if h > 0.0 => format!(" ht=\"{}\" customHeight=\"1\"", num(h)),
+            _ => String::new(),
+        };
+        if !cells.is_empty() || !row_attrs.is_empty() {
+            data.push_str(&format!("<row r=\"{}\"{row_attrs}>{cells}</row>", r + 1));
         }
     }
 
@@ -1488,20 +1739,52 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
     let mut ctx = OdfCtx::new(&doc.resources);
     let body = odt_body(doc, &mut ctx);
 
+    // Render the first section's header/footer into their own auto-style buffer
+    // so the markup AND its styles land in styles.xml's master page (ODF keeps
+    // running header/footer styling separate from content.xml). Image counters
+    // continue from the body's so any header/footer pictures get unique names.
+    let mut hf_ctx = OdfCtx::new(&doc.resources);
+    hf_ctx.image_base = ctx.images.len();
+    let header_xml = doc
+        .sections
+        .first()
+        .and_then(|s| s.header.as_ref())
+        .map(|h| odt_blocks(h, &mut hf_ctx));
+    let footer_xml = doc
+        .sections
+        .first()
+        .and_then(|s| s.footer.as_ref())
+        .map(|f| odt_blocks(f, &mut hf_ctx));
+
     zip.add_deflated(
         "content.xml",
         odt_model_content(&ctx.auto, &body).as_bytes(),
     );
     zip.add_deflated(
         "styles.xml",
-        odf_text_styles_xml(geom.width, geom.height).as_bytes(),
+        odf_text_styles_xml(
+            geom.width,
+            geom.height,
+            geom.margins,
+            &hf_ctx.auto,
+            header_xml.as_deref(),
+            footer_xml.as_deref(),
+        )
+        .as_bytes(),
     );
+    let image_count = ctx.images.len() + hf_ctx.images.len();
     zip.add_deflated(
         "META-INF/manifest.xml",
-        odf_manifest("text", ctx.images.len()).as_bytes(),
+        odf_manifest("text", image_count).as_bytes(),
     );
     for (i, png) in ctx.images.iter().enumerate() {
         zip.add_deflated(&format!("Pictures/img{}.png", i + 1), png);
+    }
+    for (i, png) in hf_ctx.images.iter().enumerate() {
+        zip.add_deflated(
+            &format!("Pictures/img{}.png", ctx.images.len() + i + 1),
+            png,
+        );
     }
     zip.finish()
 }
@@ -1582,6 +1865,10 @@ pub fn odp_from_model(doc: &Document) -> Vec<u8> {
 struct OdfCtx<'a> {
     auto: String,
     images: Vec<Vec<u8>>,
+    /// Offset added to this context's local image indices when forming
+    /// `Pictures/imgN.png` names, so a secondary context (e.g. header/footer)
+    /// does not collide with the body's images. Default `0`.
+    image_base: usize,
     style_id: usize,
     resources: &'a crate::model::ResourceTable,
 }
@@ -1591,6 +1878,7 @@ impl<'a> OdfCtx<'a> {
         OdfCtx {
             auto: String::new(),
             images: Vec::new(),
+            image_base: 0,
             style_id: 0,
             resources,
         }
@@ -1606,19 +1894,13 @@ impl<'a> OdfCtx<'a> {
 }
 
 fn odt_body(doc: &Document, ctx: &mut OdfCtx) -> String {
+    // The first section's running header/footer become real `<style:header>`/
+    // `<style:footer>` in the master page (styles.xml), not inlined body text.
     let mut body = String::new();
-    // Header/footer flow at the top of the body (ODF running headers live in
-    // styles.xml; for reflowable text we prepend them as ordinary paragraphs).
-    if let Some(header) = doc.sections.first().and_then(|s| s.header.as_ref()) {
-        body.push_str(&odt_blocks(header, ctx));
-    }
     for section in &doc.sections {
         for page in &section.pages {
             body.push_str(&odt_blocks(&page.blocks, ctx));
         }
-    }
-    if let Some(footer) = doc.sections.first().and_then(|s| s.footer.as_ref()) {
-        body.push_str(&odt_blocks(footer, ctx));
     }
     body
 }
@@ -1803,7 +2085,7 @@ fn odt_image_para(img: &ImageRef, ctx: &mut OdfCtx) -> String {
         return "<text:p/>".to_string();
     }
     ctx.images.push(png);
-    let n = ctx.images.len();
+    let n = ctx.image_base + ctx.images.len();
     // An inline image anchored as a character inside its own paragraph.
     format!(
         "<text:p><draw:frame draw:style-name=\"frInl\" text:anchor-type=\"as-char\" \
@@ -1833,19 +2115,66 @@ xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
     )
 }
 
-fn odf_text_styles_xml(pw: f64, ph: f64) -> String {
+/// The ODT `styles.xml`: a page layout (size + margins), the header/footer
+/// automatic styles, and a master page that carries any `<style:header>`/
+/// `<style:footer>`. `hf_auto` is the automatic-style markup the header/footer
+/// paragraphs reference; `header`/`footer` are their rendered block XML.
+fn odf_text_styles_xml(
+    pw: f64,
+    ph: f64,
+    margins: crate::model::Margins,
+    hf_auto: &str,
+    header: Option<&str>,
+    footer: Option<&str>,
+) -> String {
     let orient = if ph >= pw { "portrait" } else { "landscape" };
+    // Page margins (omit zero edges so a default geometry stays clean).
+    let mut margin_attrs = String::new();
+    if margins.top > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-top=\"{}pt\"", num(margins.top)));
+    }
+    if margins.bottom > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-bottom=\"{}pt\"", num(margins.bottom)));
+    }
+    if margins.left > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-left=\"{}pt\"", num(margins.left)));
+    }
+    if margins.right > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-right=\"{}pt\"", num(margins.right)));
+    }
+    // Header/footer images (rendered via the hf context) reference `frInl`, so
+    // it must exist in this document's automatic styles too.
+    let frame_style = if hf_auto.contains("frInl") {
+        "<style:style style:name=\"frInl\" style:family=\"graphic\">\
+<style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\" style:vertical-pos=\"middle\" \
+style:vertical-rel=\"text\"/></style:style>"
+    } else {
+        ""
+    };
+    let header_xml = match header {
+        Some(h) => format!("<style:header>{h}</style:header>"),
+        None => String::new(),
+    };
+    let footer_xml = match footer {
+        Some(f) => format!("<style:footer>{f}</style:footer>"),
+        None => String::new(),
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <office:document-styles xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
 xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
+xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" \
+xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
+xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
+xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
+xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
 xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" office:version=\"1.3\">\
-<office:automatic-styles>\
+<office:automatic-styles>{frame_style}{hf_auto}\
 <style:page-layout style:name=\"pm1\">\
 <style:page-layout-properties fo:page-width=\"{w}pt\" fo:page-height=\"{h}pt\" \
-style:print-orientation=\"{o}\"/></style:page-layout></office:automatic-styles>\
+style:print-orientation=\"{o}\"{margin_attrs}/></style:page-layout></office:automatic-styles>\
 <office:master-styles>\
-<style:master-page style:name=\"Standard\" style:page-layout-name=\"pm1\"/>\
+<style:master-page style:name=\"Standard\" style:page-layout-name=\"pm1\">{header_xml}{footer_xml}</style:master-page>\
 </office:master-styles></office:document-styles>",
         w = num(pw),
         h = num(ph),
@@ -1995,25 +2324,40 @@ fn odf_manifest(kind: &str, image_count: usize) -> String {
 
 // ───────────────────────────── ODS (typed sheet) ─────────────────────────────
 
-/// A cell-style cache key: its fill colour (hex) and data-style name, each
-/// optional, identifying a unique `(fill, number format)` pairing.
-type CellStyleKey = (Option<String>, Option<String>);
+/// A cell-style cache key uniquely identifying a `(fill, number format, font,
+/// border, alignment, wrap)` combination so identical cells share one style.
+///
+/// Fields: fill hex, data-style name, font traits `(family, bold, italic,
+/// size_centi, color hex)`, border `(width_centi, color hex)`, horizontal
+/// alignment, wrap flag — all optional except the booleans.
+#[derive(Clone, PartialEq, Eq)]
+struct CellStyleKey {
+    fill: Option<String>,
+    data_style: Option<String>,
+    font: Option<(String, bool, bool, u32, String)>,
+    border: Option<(u32, String)>,
+    align: Option<Align>,
+    wrap: bool,
+}
 
 /// Accumulates ODS automatic styles: number-format data styles (`<number:*>`),
-/// and the table-cell styles that bind a fill colour and/or a data style. Cells
-/// reference a cell style via `table:style-name`; identical (fill, format) pairs
-/// share one style.
+/// the table-cell styles that bind fill/data-style/font/border/alignment, plus
+/// column and row styles. Cells reference a cell style via `table:style-name`;
+/// identical styling shares one style.
 #[derive(Default)]
 struct OdsStyler {
     /// `<number:number-style>` definitions, keyed by their ODF format code.
     data_styles: String,
-    /// `<style:style family="table-cell">` definitions + column styles.
+    /// `<style:style>` definitions for cell / column / row families.
     cell_styles: String,
     /// Format code → data-style name.
     fmts: Vec<(String, String)>,
-    /// (fill hex option, data-style name option) → cell-style name.
+    /// Cell-style key → cell-style name.
     cells: Vec<(CellStyleKey, String)>,
+    /// Row height (points, hundredths) → row-style name.
+    rows: Vec<(u32, String)>,
     next_col: usize,
+    next_row: usize,
 }
 
 impl OdsStyler {
@@ -2028,29 +2372,81 @@ impl OdsStyler {
         name
     }
 
-    /// The `table:style-name` value for a cell's fill + number format (or empty
-    /// when neither applies).
-    fn cell_style(&mut self, fill: Option<[f64; 3]>, number_format: Option<&str>) -> String {
-        if fill.is_none() && number_format.is_none() {
+    /// The `table:style-name` value for a cell's fill, number format, font,
+    /// border and alignment (or empty when the cell carries none of these).
+    fn cell_style(&mut self, cell: &SheetCell) -> String {
+        let fill = cell.fill.map(hex);
+        let data_style = cell.number_format.as_deref().map(|c| self.data_style(c));
+        let font = ods_font_key(&cell.style);
+        let border = cell
+            .border
+            .filter(|b| b.width > 0.0)
+            .map(|b| ((b.width * 100.0).round() as u32, hex(b.color)));
+        let key = CellStyleKey {
+            fill,
+            data_style,
+            font,
+            border,
+            align: cell.align,
+            wrap: cell.wrap,
+        };
+        if key.fill.is_none()
+            && key.data_style.is_none()
+            && key.font.is_none()
+            && key.border.is_none()
+            && key.align.is_none()
+            && !key.wrap
+        {
             return String::new();
         }
-        let fill_hex = fill.map(hex);
-        let data_name = number_format.map(|c| self.data_style(c));
-        let key = (fill_hex.clone(), data_name.clone());
         if let Some((_, name)) = self.cells.iter().find(|(k, _)| *k == key) {
             return format!(" table:style-name=\"{name}\"");
         }
         let name = format!("ce{}", self.cells.len());
-        let data_attr = match &data_name {
+        let data_attr = match &key.data_style {
             Some(d) => format!(" style:data-style-name=\"{d}\""),
             None => String::new(),
         };
-        let props = match &fill_hex {
-            Some(c) => format!("<style:table-cell-properties fo:background-color=\"#{c}\"/>"),
+
+        // table-cell-properties: fill, border, wrap.
+        let mut cell_props = String::new();
+        if let Some(c) = &key.fill {
+            cell_props.push_str(&format!(" fo:background-color=\"#{c}\""));
+        }
+        if let Some((w_centi, color)) = &key.border {
+            cell_props.push_str(&format!(
+                " fo:border=\"{w}pt solid #{color}\"",
+                w = num(*w_centi as f64 / 100.0),
+            ));
+        }
+        if key.wrap {
+            cell_props.push_str(" fo:wrap-option=\"wrap\"");
+        }
+        let cell_props_xml = if cell_props.is_empty() {
+            String::new()
+        } else {
+            format!("<style:table-cell-properties{cell_props}/>")
+        };
+
+        // paragraph-properties: horizontal alignment.
+        let para_props = match key.align {
+            Some(a) => format!(
+                "<style:paragraph-properties fo:text-align=\"{}\"/>",
+                odf_text_align(a)
+            ),
             None => String::new(),
         };
+
+        // text-properties: font family / weight / style / size / colour.
+        let text_props = match &key.font {
+            Some((family, bold, italic, size_centi, color)) => {
+                ods_text_props(family, *bold, *italic, *size_centi, color)
+            }
+            None => String::new(),
+        };
+
         self.cell_styles.push_str(&format!(
-            "<style:style style:name=\"{name}\" style:family=\"table-cell\"{data_attr}>{props}</style:style>"
+            "<style:style style:name=\"{name}\" style:family=\"table-cell\"{data_attr}>{cell_props_xml}{para_props}{text_props}</style:style>"
         ));
         self.cells.push((key, name.clone()));
         format!(" table:style-name=\"{name}\"")
@@ -2066,6 +2462,88 @@ impl OdsStyler {
             cw = num(width),
         ));
         name
+    }
+
+    /// A table-row style for an explicit height (points); returns its name.
+    /// Identical heights share one style.
+    fn row_style(&mut self, height: f64) -> String {
+        let key = (height * 100.0).round() as u32;
+        if let Some((_, name)) = self.rows.iter().find(|(k, _)| *k == key) {
+            return name.clone();
+        }
+        let name = format!("ro{}", self.next_row);
+        self.next_row += 1;
+        self.cell_styles.push_str(&format!(
+            "<style:style style:name=\"{name}\" style:family=\"table-row\">\
+<style:table-row-properties style:row-height=\"{rh}pt\" style:use-optimal-row-height=\"false\"/></style:style>",
+            rh = num(height),
+        ));
+        self.rows.push((key, name.clone()));
+        name
+    }
+}
+
+/// The font cache-key tuple for a char style, or `None` when it carries no
+/// distinguishing trait (empty family, default size, no bold/italic/colour).
+fn ods_font_key(style: &CharStyle) -> Option<(String, bool, bool, u32, String)> {
+    let color = visible_color(style).unwrap_or_default();
+    let has_size = style.size_pt > 0.0;
+    if style.family.is_empty()
+        && !style.bold
+        && !style.italic
+        && !has_size
+        && color.is_empty()
+    {
+        return None;
+    }
+    Some((
+        style.family.clone(),
+        style.bold,
+        style.italic,
+        (run_size(style) * 100.0).round() as u32,
+        color,
+    ))
+}
+
+/// `<style:text-properties>` for a cell font (family/weight/style/size/colour).
+fn ods_text_props(
+    family: &str,
+    bold: bool,
+    italic: bool,
+    size_centi: u32,
+    color: &str,
+) -> String {
+    let mut p = String::from("<style:text-properties");
+    if !family.is_empty() {
+        let mut fam = String::new();
+        esc(family, &mut fam);
+        p.push_str(&format!(" fo:font-family=\"{fam}\""));
+    }
+    if bold {
+        p.push_str(" fo:font-weight=\"bold\"");
+    }
+    if italic {
+        p.push_str(" fo:font-style=\"italic\"");
+    }
+    p.push_str(&format!(
+        " fo:font-size=\"{}pt\"",
+        num(size_centi as f64 / 100.0)
+    ));
+    if !color.is_empty() {
+        p.push_str(&format!(" fo:color=\"#{color}\""));
+    }
+    p.push_str("/>");
+    p
+}
+
+/// The ODF `fo:text-align` value for a model alignment (`end` for right,
+/// `justify` for justified).
+fn odf_text_align(a: Align) -> &'static str {
+    match a {
+        Align::Left => "start",
+        Align::Center => "center",
+        Align::Right => "end",
+        Align::Justify => "justify",
     }
 }
 
@@ -2089,14 +2567,65 @@ fn ods_number_style(name: &str, code: &str) -> String {
     )
 }
 
+/// The merge a cell at `(r, c)` participates in: an *anchor* (its top-left, with
+/// the row/column span) or a *covered* slot inside another cell's range.
+#[derive(Clone, Copy)]
+enum MergeSlot {
+    /// `(rows_spanned, cols_spanned)` — emitted on the anchor cell. At least one
+    /// is `> 1`.
+    Anchor(usize, usize),
+    /// This `(r, c)` is covered by an anchor above/left of it.
+    Covered,
+}
+
+/// Map each `(r, c)` touched by a [`MergeRange`] to its [`MergeSlot`]. ODS, like
+/// the table path, expresses merges as `number-{columns,rows}-spanned` on the
+/// anchor plus `<table:covered-table-cell/>` for the rest of the rectangle.
+fn ods_merge_slots(sheet: &Sheet) -> std::collections::BTreeMap<(usize, usize), MergeSlot> {
+    let mut slots = std::collections::BTreeMap::new();
+    for m in &sheet.merges {
+        let (r0, c0) = (m.r0.min(m.r1), m.c0.min(m.c1));
+        let (r1, c1) = (m.r0.max(m.r1), m.c0.max(m.c1));
+        let (rows, cols) = (r1 - r0 + 1, c1 - c0 + 1);
+        if rows <= 1 && cols <= 1 {
+            continue; // degenerate 1×1 "merge" — nothing to span.
+        }
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                let slot = if r == r0 && c == c0 {
+                    MergeSlot::Anchor(rows, cols)
+                } else {
+                    MergeSlot::Covered
+                };
+                slots.insert((r, c), slot);
+            }
+        }
+    }
+    slots
+}
+
 fn ods_sheet_from_model(sheet: &Sheet, styler: &mut OdsStyler) -> String {
     let mut nm = String::new();
     esc(&sheet.name, &mut nm);
+    let slots = ods_merge_slots(sheet);
     let mut rows = String::new();
-    for row in &sheet.rows {
-        rows.push_str("<table:table-row>");
-        for cell in &row.cells {
-            rows.push_str(&ods_cell_from_model(cell, styler));
+    for (r, row) in sheet.rows.iter().enumerate() {
+        let height_attr = match row.height {
+            Some(h) if h > 0.0 => {
+                let rn = styler.row_style(h);
+                format!(" table:style-name=\"{rn}\"")
+            }
+            _ => String::new(),
+        };
+        rows.push_str(&format!("<table:table-row{height_attr}>"));
+        for (c, cell) in row.cells.iter().enumerate() {
+            match slots.get(&(r, c)) {
+                Some(MergeSlot::Covered) => rows.push_str("<table:covered-table-cell/>"),
+                Some(MergeSlot::Anchor(rspan, cspan)) => {
+                    rows.push_str(&ods_cell_from_model(cell, Some((*rspan, *cspan)), styler))
+                }
+                None => rows.push_str(&ods_cell_from_model(cell, None, styler)),
+            }
         }
         rows.push_str("</table:table-row>");
     }
@@ -2117,17 +2646,33 @@ fn ods_sheet_from_model(sheet: &Sheet, styler: &mut OdsStyler) -> String {
     format!("<table:table table:name=\"{nm}\">{col_defs}{rows}</table:table>")
 }
 
-fn ods_cell_from_model(cell: &SheetCell, styler: &mut OdsStyler) -> String {
-    let style_attr = styler.cell_style(cell.fill, cell.number_format.as_deref());
+/// One ODS data cell. `span` is `Some((rows, cols))` when this cell anchors a
+/// merge (its `number-{rows,columns}-spanned` attributes), else `None`.
+fn ods_cell_from_model(
+    cell: &SheetCell,
+    span: Option<(usize, usize)>,
+    styler: &mut OdsStyler,
+) -> String {
+    let style_attr = styler.cell_style(cell);
+    let mut span_attr = String::new();
+    if let Some((rows, cols)) = span {
+        if cols > 1 {
+            span_attr.push_str(&format!(" table:number-columns-spanned=\"{cols}\""));
+        }
+        if rows > 1 {
+            span_attr.push_str(&format!(" table:number-rows-spanned=\"{rows}\""));
+        }
+    }
+    let attrs = format!("{style_attr}{span_attr}");
     match &cell.value {
-        CellValue::Empty => format!("<table:table-cell{style_attr}/>"),
+        CellValue::Empty => format!("<table:table-cell{attrs}/>"),
         CellValue::Number(n) => format!(
-            "<table:table-cell{style_attr} office:value-type=\"float\" office:value=\"{v}\"><text:p>{disp}</text:p></table:table-cell>",
+            "<table:table-cell{attrs} office:value-type=\"float\" office:value=\"{v}\"><text:p>{disp}</text:p></table:table-cell>",
             v = num(*n),
             disp = num(*n),
         ),
         CellValue::Bool(b) => format!(
-            "<table:table-cell{style_attr} office:value-type=\"boolean\" office:boolean-value=\"{bv}\"><text:p>{disp}</text:p></table:table-cell>",
+            "<table:table-cell{attrs} office:value-type=\"boolean\" office:boolean-value=\"{bv}\"><text:p>{disp}</text:p></table:table-cell>",
             bv = if *b { "true" } else { "false" },
             disp = if *b { "TRUE" } else { "FALSE" },
         ),
@@ -2135,7 +2680,7 @@ fn ods_cell_from_model(cell: &SheetCell, styler: &mut OdsStyler) -> String {
             let mut esc_t = String::new();
             esc(t, &mut esc_t);
             format!(
-                "<table:table-cell{style_attr} office:value-type=\"string\"><text:p>{esc_t}</text:p></table:table-cell>"
+                "<table:table-cell{attrs} office:value-type=\"string\"><text:p>{esc_t}</text:p></table:table-cell>"
             )
         }
     }
@@ -2798,6 +3343,7 @@ mod tests {
                                                 ..Default::default()
                                             },
                                         ],
+                                        ..Default::default()
                                     },
                                     SheetRow {
                                         cells: vec![SheetCell {
@@ -2805,6 +3351,7 @@ mod tests {
                                             fill: Some([1.0, 1.0, 0.0]),
                                             ..Default::default()
                                         }],
+                                        ..Default::default()
                                     },
                                 ],
                                 merges: vec![MergeRange {
@@ -2917,6 +3464,7 @@ mod tests {
                                         number_format: Some("0.00".to_string()),
                                         ..Default::default()
                                     }],
+                                    ..Default::default()
                                 }],
                                 merges: Vec::new(),
                                 col_widths: Vec::new(),
@@ -2992,5 +3540,388 @@ mod tests {
         assert!(s.contains("Title"));
         assert!(s.contains("\\par"), "paragraph breaks");
         assert!(s.contains("\\b"), "heading bold run");
+    }
+
+    // ── new exporter parity tests ──────────────────────────────────────────────
+
+    /// Wrap a single sheet into a one-page document.
+    fn sheet_doc(sheet: Sheet) -> Document {
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Sheet(SheetBlock {
+                            sheets: vec![sheet],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ods_export_emits_merges_as_spanned_and_covered_cells() {
+        // A 2×2 grid whose top row spans both columns.
+        let sheet = Sheet {
+            name: "M".to_string(),
+            rows: vec![
+                SheetRow {
+                    cells: vec![
+                        SheetCell {
+                            value: CellValue::Text("Title".to_string()),
+                            ..Default::default()
+                        },
+                        SheetCell {
+                            value: CellValue::Text("covered".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                SheetRow {
+                    cells: vec![
+                        SheetCell {
+                            value: CellValue::Number(1.0),
+                            ..Default::default()
+                        },
+                        SheetCell {
+                            value: CellValue::Number(2.0),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            merges: vec![MergeRange {
+                r0: 0,
+                c0: 0,
+                r1: 0,
+                c1: 1,
+            }],
+            col_widths: Vec::new(),
+        };
+        let bytes = ods_from_model(&sheet_doc(sheet));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("table:number-columns-spanned=\"2\""),
+            "anchor carries the column span: {content}"
+        );
+        assert!(
+            content.contains("<table:covered-table-cell/>"),
+            "the covered slot is emitted: {content}"
+        );
+    }
+
+    #[test]
+    fn ods_export_emits_rows_spanned_for_vertical_merge() {
+        // A 2×1 column merge (top-left spans two rows).
+        let sheet = Sheet {
+            name: "V".to_string(),
+            rows: vec![
+                SheetRow {
+                    cells: vec![SheetCell {
+                        value: CellValue::Text("tall".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                SheetRow {
+                    cells: vec![SheetCell {
+                        value: CellValue::Text("covered".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            merges: vec![MergeRange {
+                r0: 0,
+                c0: 0,
+                r1: 1,
+                c1: 0,
+            }],
+            col_widths: Vec::new(),
+        };
+        let bytes = ods_from_model(&sheet_doc(sheet));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("table:number-rows-spanned=\"2\""),
+            "anchor carries the row span: {content}"
+        );
+        assert!(
+            content.contains("<table:covered-table-cell/>"),
+            "second row's covered slot emitted: {content}"
+        );
+    }
+
+    /// A sheet with one fully-styled cell (bold red Arial 14, centered, bordered).
+    fn styled_sheet() -> Sheet {
+        Sheet {
+            name: "Styled".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("Hi".to_string()),
+                    style: CharStyle {
+                        family: "Arial".to_string(),
+                        size_pt: 14.0,
+                        bold: true,
+                        color: Some([0.8, 0.0, 0.0]),
+                        ..Default::default()
+                    },
+                    border: Some(BorderStyle {
+                        width: 1.0,
+                        color: [0.0, 0.0, 0.0],
+                    }),
+                    align: Some(Align::Center),
+                    wrap: true,
+                    ..Default::default()
+                }],
+                height: Some(20.0),
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn xlsx_styler_emits_font_color_border_alignment() {
+        let bytes = xlsx_from_model(&sheet_doc(styled_sheet()));
+        let styles = String::from_utf8(entry(&bytes, "xl/styles.xml").unwrap()).unwrap();
+        // A real font record (bold Arial 14) — not the hardcoded Calibri-only table.
+        assert!(styles.contains("<name val=\"Arial\"/>"), "font family: {styles}");
+        assert!(styles.contains("<b/>"), "bold font");
+        assert!(styles.contains("<sz val=\"14\"/>"), "14pt size");
+        assert!(styles.contains("rgb=\"FFCC0000\""), "red font colour");
+        // A border definition (the cell's all-edge style).
+        assert!(styles.contains("<left style="), "border edges defined");
+        // The alignment is carried on a cellXfs record.
+        assert!(
+            styles.contains("horizontal=\"center\"") && styles.contains("wrapText=\"1\""),
+            "alignment + wrap: {styles}"
+        );
+        // The row height landed on the worksheet row.
+        let sheet = String::from_utf8(entry(&bytes, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(sheet.contains("ht=\"20\""), "row height: {sheet}");
+        assert!(sheet.contains("customHeight=\"1\""), "custom height flag");
+    }
+
+    #[test]
+    fn ods_styler_emits_font_color_border_alignment() {
+        let bytes = ods_from_model(&sheet_doc(styled_sheet()));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("fo:font-family=\"Arial\""),
+            "font family: {content}"
+        );
+        assert!(content.contains("fo:font-weight=\"bold\""), "bold");
+        assert!(content.contains("fo:font-size=\"14pt\""), "14pt size");
+        assert!(content.contains("fo:color=\"#CC0000\""), "red colour");
+        assert!(content.contains("fo:border=\"1pt solid #000000\""), "border");
+        assert!(
+            content.contains("fo:text-align=\"center\""),
+            "center alignment"
+        );
+        assert!(content.contains("fo:wrap-option=\"wrap\""), "wrap option");
+        assert!(content.contains("style:row-height=\"20pt\""), "row height");
+    }
+
+    #[test]
+    fn round_trip_xlsx_to_model_to_ods_preserves_merges() {
+        // Build a sheet with a merge, export to XLSX, re-import to the model, and
+        // re-export to ODS — the merge must survive both directions.
+        let sheet = Sheet {
+            name: "RT".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![
+                    SheetCell {
+                        value: CellValue::Text("A".to_string()),
+                        ..Default::default()
+                    },
+                    SheetCell {
+                        value: CellValue::Text("B".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            merges: vec![MergeRange {
+                r0: 0,
+                c0: 0,
+                r1: 0,
+                c1: 1,
+            }],
+            col_widths: Vec::new(),
+        };
+        let xlsx = xlsx_from_model(&sheet_doc(sheet));
+        let zip = read_zip(&xlsx);
+        let model = crate::convert::office_import::xlsx_to_model(&zip);
+        // Sanity: the imported model carries the merge.
+        let imported = collect_sheets(&model);
+        assert_eq!(imported.len(), 1, "one sheet imported");
+        assert!(
+            !imported[0].merges.is_empty(),
+            "merge survived the XLSX round trip"
+        );
+        let ods = ods_from_model(&model);
+        let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("table:number-columns-spanned=\"2\""),
+            "merge re-exported to ODS as a spanned cell: {content}"
+        );
+        assert!(content.contains("<table:covered-table-cell/>"), "covered cell");
+    }
+
+    /// Build a one-page doc whose only block is the given list.
+    fn list_doc(list: List) -> Document {
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::List(list),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn one_item_list(ordered: bool, marker: ListMarker) -> List {
+        List {
+            ordered,
+            marker,
+            items: vec![ListItem {
+                blocks: vec![para("item")],
+                level: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn docx_numbering_honours_bullet_and_roman_markers() {
+        // A bullet list → bullet numFmt with the literal bullet char.
+        let bullet = docx_from_model(&list_doc(one_item_list(false, ListMarker::Bullet('▪'))));
+        let num = String::from_utf8(entry(&bullet, "word/numbering.xml").unwrap()).unwrap();
+        assert!(
+            num.contains("<w:numFmt w:val=\"bullet\"/>"),
+            "bullet list uses bullet format: {num}"
+        );
+        assert!(
+            num.contains("w:val=\"▪\""),
+            "bullet char carried through: {num}"
+        );
+
+        // A lower-roman ordered list → lowerRoman numFmt.
+        let roman = docx_from_model(&list_doc(one_item_list(true, ListMarker::LowerRoman)));
+        let num = String::from_utf8(entry(&roman, "word/numbering.xml").unwrap()).unwrap();
+        assert!(
+            num.contains("<w:numFmt w:val=\"lowerRoman\"/>"),
+            "roman list uses lowerRoman format: {num}"
+        );
+        // Regression guard: the old code hardcoded `decimal` for every list.
+        assert!(
+            !num.contains("<w:numFmt w:val=\"decimal\"/>"),
+            "a roman list must not fall back to decimal: {num}"
+        );
+    }
+
+    #[test]
+    fn docx_run_emits_vertical_align() {
+        let mut sup = sample_doc();
+        // Inject a superscript run into the first paragraph block (the heading
+        // is block 0; the paragraph "A paragraph." is block 1).
+        let para_block = &mut sup.sections[0].pages[0].blocks[1];
+        if let BlockKind::Paragraph(p) = &mut para_block.kind {
+            p.runs = vec![Inline::Run(InlineRun {
+                text: "x2".to_string(),
+                style: CharStyle {
+                    vertical_align: VAlign::Super,
+                    ..Default::default()
+                },
+                source_index: None,
+            })];
+        }
+        let bytes = docx_from_model(&sup);
+        let doc = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            doc.contains("<w:vertAlign w:val=\"superscript\"/>"),
+            "superscript run carries vertAlign: {doc}"
+        );
+    }
+
+    #[test]
+    fn odt_export_emits_page_margins_and_running_header_footer() {
+        let mut d = sample_doc();
+        d.sections[0].geometry.margins = crate::model::Margins {
+            top: 72.0,
+            right: 54.0,
+            bottom: 72.0,
+            left: 54.0,
+        };
+        d.sections[0].header = Some(vec![para("PAGE HEADER")]);
+        d.sections[0].footer = Some(vec![para("PAGE FOOTER")]);
+        let bytes = odt_from_model(&d);
+        let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("fo:margin-top=\"72pt\"") && styles.contains("fo:margin-left=\"54pt\""),
+            "page margins emitted: {styles}"
+        );
+        assert!(
+            styles.contains("<style:header>") && styles.contains("PAGE HEADER"),
+            "running header in master page: {styles}"
+        );
+        assert!(
+            styles.contains("<style:footer>") && styles.contains("PAGE FOOTER"),
+            "running footer in master page: {styles}"
+        );
+        // The header/footer must NOT be inlined into the body anymore.
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            !content.contains("PAGE HEADER"),
+            "header is not duplicated in the body: {content}"
+        );
+    }
+
+    #[test]
+    fn sheet_schema_additions_default_to_unchanged_output() {
+        // A plain cell with all new fields at their defaults must produce the same
+        // XLSX/ODS as before the schema grew (no font/border/align/height markup).
+        let plain = Sheet {
+            name: "Plain".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("v".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        };
+        let xlsx = xlsx_from_model(&sheet_doc(plain.clone()));
+        let styles = String::from_utf8(entry(&xlsx, "xl/styles.xml").unwrap()).unwrap();
+        // Default styler: a single Calibri-11 font, a single empty border, no alignment.
+        assert!(
+            styles.contains("<fonts count=\"1\">") && styles.contains("<name val=\"Calibri\"/>"),
+            "default font table unchanged: {styles}"
+        );
+        assert!(
+            styles.contains("<borders count=\"1\">"),
+            "default border table unchanged: {styles}"
+        );
+        assert!(!styles.contains("<alignment"), "no alignment for a plain cell");
+        let sheet = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(!sheet.contains("ht="), "no row height for a plain row");
+
+        let ods = ods_from_model(&sheet_doc(plain));
+        let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
+        assert!(!content.contains("fo:font-family"), "no font props by default");
+        assert!(!content.contains("fo:border"), "no border by default");
+        assert!(!content.contains("style:row-height"), "no row height by default");
     }
 }

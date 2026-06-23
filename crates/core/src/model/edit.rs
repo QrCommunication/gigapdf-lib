@@ -2412,6 +2412,7 @@ mod tests {
                             ..SheetCell::default()
                         })
                         .collect(),
+                    ..Default::default()
                 })
                 .collect(),
             merges: Vec::new(),

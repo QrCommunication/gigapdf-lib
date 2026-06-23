@@ -883,6 +883,7 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                                 number_format: cell_fmt.take(),
                                 fill: cell_bg.take(),
                                 style: CharStyle::default(),
+                                ..Default::default()
                             },
                         );
                     }
@@ -903,9 +904,15 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                             None => Vec::new(),
                         };
                         if rows.len() == row_idx {
-                            rows.push(SheetRow { cells });
+                            rows.push(SheetRow {
+                                cells,
+                                ..Default::default()
+                            });
                         } else {
-                            rows[row_idx] = SheetRow { cells };
+                            rows[row_idx] = SheetRow {
+                                cells,
+                                ..Default::default()
+                            };
                         }
                         row_open = false;
                     }
@@ -1457,6 +1464,7 @@ fn ods_table_model(x: &mut Xml) -> Vec<SheetRow> {
                     for _ in 0..emit {
                         rows.push(SheetRow {
                             cells: cells.clone(),
+                            ..Default::default()
                         });
                     }
                 }

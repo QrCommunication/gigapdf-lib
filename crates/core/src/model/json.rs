@@ -786,6 +786,11 @@ impl Writer {
             self.sheet_cell(c);
         }
         self.arr_close();
+        self.key("height");
+        match r.height {
+            Some(h) => self.f64(h),
+            None => self.null(),
+        }
         self.obj_close();
     }
 
@@ -801,6 +806,17 @@ impl Writer {
         self.k_opt_rgb("fill", &c.fill);
         self.key("style");
         self.char_style(&c.style);
+        self.key("border");
+        match &c.border {
+            Some(b) => self.border(b),
+            None => self.null(),
+        }
+        self.key("align");
+        match c.align {
+            Some(a) => self.str_val(align_tag(a)),
+            None => self.null(),
+        }
+        self.k_bool("wrap", c.wrap);
         self.obj_close();
     }
 
@@ -1761,6 +1777,16 @@ impl<'a> Reader<'a> {
         Some(b)
     }
 
+    /// `null` ⇒ `None`; an object ⇒ `Some(border)`.
+    fn opt_border(&mut self) -> Option<Option<BorderStyle>> {
+        if self.peek()? == b'n' {
+            self.null()?;
+            Some(None)
+        } else {
+            Some(Some(self.border()?))
+        }
+    }
+
     fn image_ref(&mut self) -> Option<ImageRef> {
         let mut i = ImageRef::default();
         self.object(|r, k| {
@@ -1860,6 +1886,14 @@ impl<'a> Reader<'a> {
         self.object(|r, k| {
             match k {
                 "cells" => row.cells = r.array(Reader::sheet_cell)?,
+                "height" => {
+                    row.height = if r.peek()? == b'n' {
+                        r.null()?;
+                        None
+                    } else {
+                        Some(r.number()?)
+                    };
+                }
                 _ => return None,
             }
             Some(())
@@ -1875,6 +1909,14 @@ impl<'a> Reader<'a> {
                 "number_format" => c.number_format = r.opt_string()?,
                 "fill" => c.fill = r.opt_rgb()?,
                 "style" => c.style = r.char_style()?,
+                "border" => c.border = r.opt_border()?,
+                "align" => {
+                    c.align = match r.opt_string()? {
+                        Some(s) => Some(parse_align(&s)?),
+                        None => None,
+                    };
+                }
+                "wrap" => c.wrap = r.bool()?,
                 _ => return None,
             }
             Some(())
@@ -2306,14 +2348,23 @@ mod tests {
                                     bold: true,
                                     ..Default::default()
                                 },
+                                border: Some(BorderStyle {
+                                    width: 1.0,
+                                    color: [0.2, 0.2, 0.2],
+                                }),
+                                align: Some(Align::Center),
+                                wrap: true,
                             },
                             SheetCell {
                                 value: CellValue::Number(1234.56),
                                 number_format: Some("0.00".to_string()),
                                 fill: None,
                                 style: CharStyle::default(),
+                                align: Some(Align::Right),
+                                ..Default::default()
                             },
                         ],
+                        height: Some(18.0),
                     },
                     SheetRow {
                         cells: vec![
@@ -2322,14 +2373,17 @@ mod tests {
                                 number_format: None,
                                 fill: None,
                                 style: CharStyle::default(),
+                                ..Default::default()
                             },
                             SheetCell {
                                 value: CellValue::Empty,
                                 number_format: None,
                                 fill: None,
                                 style: CharStyle::default(),
+                                ..Default::default()
                             },
                         ],
+                        height: None,
                     },
                 ],
                 merges: vec![MergeRange {

@@ -977,12 +977,14 @@ mod tests {
                         cell(CellValue::Text("Name".to_string())),
                         cell(CellValue::Text("Qty".to_string())),
                     ],
+                    ..Default::default()
                 },
                 SheetRow {
                     cells: vec![
                         cell(CellValue::Text("Widget".to_string())),
                         cell(CellValue::Number(42.0)),
                     ],
+                    ..Default::default()
                 },
             ],
             merges: Vec::new(),

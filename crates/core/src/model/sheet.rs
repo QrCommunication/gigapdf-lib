@@ -5,7 +5,8 @@
 //! editable counterpart of the XLSX/ODS reconstruction path — typed values, not
 //! a rasterised table.
 
-use crate::model::style::CharStyle;
+use crate::model::style::{Align, CharStyle};
+use crate::model::BorderStyle;
 
 /// A block of spreadsheet content: one or more named sheets.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -23,10 +24,12 @@ pub struct Sheet {
     pub col_widths: Vec<f64>,
 }
 
-/// One row of cells.
+/// One row of cells, with an optional fixed height (points).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SheetRow {
     pub cells: Vec<SheetCell>,
+    /// Fixed row height in points. `None` ⇒ the suite's default/auto height.
+    pub height: Option<f64>,
 }
 
 /// A single cell: a typed value plus optional number format, fill, and style.
@@ -38,6 +41,12 @@ pub struct SheetCell {
     /// RGB cell background, components `0.0..=1.0`. `None` = no fill.
     pub fill: Option<[f64; 3]>,
     pub style: CharStyle,
+    /// Cell border (all four edges). `None` ⇒ no border.
+    pub border: Option<BorderStyle>,
+    /// Horizontal text alignment. `None` ⇒ the suite's default (general).
+    pub align: Option<Align>,
+    /// Wrap text within the cell. `false` ⇒ no wrapping (default).
+    pub wrap: bool,
 }
 
 /// A cell's typed value.
