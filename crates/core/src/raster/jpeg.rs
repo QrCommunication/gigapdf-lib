@@ -1,16 +1,21 @@
-//! JPEG encoder (baseline) + decoder (baseline **and progressive**) — pure std,
-//! zero dependency.
+//! JPEG encoder (baseline) + decoder (baseline, **progressive**, and
+//! **arithmetic-coded**) — pure std, zero dependency.
 //!
 //! The **encoder** emits full-resolution 4:4:4 baseline JPEGs (no chroma
 //! subsampling) using the ISO/IEC 10918-1 Annex K example quantization and
 //! Huffman tables — enough to re-encode rendered previews/thumbnails. The
-//! **decoder** handles both baseline (SOF0) and progressive (SOF2) streams,
-//! including successive-approximation refinement, EOB runs, chroma subsampling
+//! **decoder** handles baseline (SOF0), progressive (SOF2), and **arithmetic**
+//! (SOF9 sequential, SOF10 progressive) streams — including
+//! successive-approximation refinement, EOB runs, chroma subsampling
 //! (nearest-neighbour upsample), and restart markers — the native replacement
-//! for a third-party image library's JPEG path. Arithmetic-coded JPEGs
-//! (SOF9/10/11) are unsupported and decode to `None` (the caller skips the
-//! image rather than blanking the page). Orthonormal float DCT-II / DCT-III
-//! (forward/inverse are an exact pair).
+//! for a third-party image library's JPEG path. Arithmetic decoding uses the
+//! ISO/IEC 10918-1 Annex MQ/QM-coder (identical to the ITU-T T.82/JBIG
+//! arithmetic coder, same `Qe` table) with the §F.1.4 DC/AC context models and
+//! optional DAC-marker conditioning. **Lossless** SOF3/SOF11 (spatial
+//! predictor, not DCT) and 12-bit extended-sequential-Huffman SOF1 remain
+//! unsupported and decode to `None` (the caller skips the image rather than
+//! blanking the page). Orthonormal float DCT-II / DCT-III (forward/inverse are
+//! an exact pair).
 
 use std::collections::HashMap;
 use std::f32::consts::PI;
@@ -497,6 +502,14 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut restart_interval = 0usize;
     // Progressive (SOF2) decode state, allocated when SOF2 is seen.
     let mut progressive: Option<Progressive> = None;
+    // True once an arithmetic SOF (SOF9 sequential, SOF10 progressive) is seen;
+    // SOS then dispatches to the MQ decoder instead of the Huffman path.
+    let mut arithmetic = false;
+    // DAC arithmetic conditioning (defaults applied when no DAC marker): per
+    // table-id `(L, U)` for DC (the 5-zone classification bounds) and `Kx` for
+    // AC (the magnitude-split context threshold).
+    let mut arith_dc: [ArithDcCond; 4] = [ArithDcCond::default(); 4];
+    let mut arith_ac: [ArithAcCond; 4] = [ArithAcCond::default(); 4];
 
     while pos + 4 <= data.len() {
         if data[pos] != 0xFF {
@@ -507,12 +520,19 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         pos += 2;
         match marker {
             0xD8 | 0xD9 => continue,
-            0xC0 | 0xC2 => {
-                // SOF0 (baseline) or SOF2 (progressive) — identical layout.
+            0xC0 | 0xC2 | 0xC9 | 0xCA => {
+                // SOF0 (baseline Huffman), SOF2 (progressive Huffman),
+                // SOF9 (extended-sequential arithmetic) or SOF10 (progressive
+                // arithmetic) — all share the same frame-header layout.
                 let l = be16(data, pos) as usize;
                 height = be16(data, pos + 3) as u32;
                 width = be16(data, pos + 5) as u32;
-                let n = data[pos + 7] as usize;
+                let n = *data.get(pos + 7).unwrap_or(&0) as usize;
+                // Bounds-check the component descriptors (3 bytes each); a
+                // truncated header aborts the decode rather than panicking.
+                if pos + 8 + n * 3 > data.len() {
+                    return None;
+                }
                 for i in 0..n {
                     let o = pos + 8 + i * 3;
                     comps.push(Component {
@@ -525,13 +545,44 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                         pred: 0,
                     });
                 }
-                if marker == 0xC2 {
-                    // A malformed progressive header aborts the decode.
+                arithmetic = marker == 0xC9 || marker == 0xCA;
+                if marker == 0xC2 || marker == 0xCA {
+                    // Progressive (Huffman or arithmetic): allocate the shared
+                    // coefficient store. A malformed header aborts the decode.
                     progressive = Some(Progressive::new(width, height, &comps)?);
                 }
                 pos += l;
             }
-            0xC1 | 0xC3 | 0xC9 | 0xCA | 0xCB => return None, // extended/lossless/arithmetic
+            // SOF1 (12-bit extended-sequential Huffman) and lossless SOF3/SOF11
+            // (spatial predictor, not DCT) remain unsupported.
+            0xC1 | 0xC3 | 0xCB => return None,
+            0xCC => {
+                // DAC — arithmetic conditioning tables (one byte `Tc<<4|Tb`
+                // selector + one `Cs` conditioning byte per entry).
+                let l = be16(data, pos) as usize;
+                let end = pos + l;
+                let mut o = pos + 2;
+                while o + 1 < end {
+                    let tc_tb = data[o];
+                    let cs = data[o + 1];
+                    o += 2;
+                    let idx = (tc_tb & 0x0F) as usize;
+                    if idx >= 4 {
+                        continue;
+                    }
+                    if tc_tb & 0x10 == 0 {
+                        // DC: low nibble = L (lower bound), high nibble = U.
+                        arith_dc[idx] = ArithDcCond {
+                            l: cs & 0x0F,
+                            u: cs >> 4,
+                        };
+                    } else {
+                        // AC: Kx threshold (1..=63).
+                        arith_ac[idx] = ArithAcCond { kx: cs };
+                    }
+                }
+                pos = end;
+            }
             0xC4 => {
                 let l = be16(data, pos) as usize;
                 let end = pos + l;
@@ -608,6 +659,33 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                 let se = *data.get(sp + 1).unwrap_or(&63);
                 let ah_al = *data.get(sp + 2).unwrap_or(&0);
                 pos += l;
+                if arithmetic {
+                    if let Some(prog) = progressive.as_mut() {
+                        // SOF10: arithmetic progressive — decode this scan into
+                        // the coefficient store via the MQ decoder, then
+                        // continue to the next marker.
+                        pos = prog.decode_scan_arith(
+                            data,
+                            pos,
+                            &comps,
+                            &arith_dc,
+                            &arith_ac,
+                            &scan_comps,
+                            ss,
+                            se,
+                            ah_al >> 4,
+                            ah_al & 0x0F,
+                            restart_interval,
+                        )?;
+                        continue;
+                    }
+                    // SOF9: arithmetic sequential — one interleaved scan decodes
+                    // the whole image.
+                    return decode_scan_arith(
+                        data, pos, width, height, &mut comps, &quant, &arith_dc, &arith_ac,
+                        restart_interval,
+                    );
+                }
                 if let Some(prog) = progressive.as_mut() {
                     // Progressive: decode this scan into the coefficient store,
                     // then continue to the next marker.
@@ -645,73 +723,47 @@ pub fn decode_jpeg(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     None
 }
 
+/// Place one already-IDCT'd, level-shifted 8×8 block (`block[i] + 128` gives the
+/// sample) into `plane`, replicating each sample over its `sx`×`sy` footprint on
+/// the luma grid (nearest-neighbour chroma upsample). `(bcol, brow)` are the
+/// block's position in this component's own 8×8 grid.
 #[allow(clippy::too_many_arguments)]
-fn decode_scan(
-    data: &[u8],
-    start: usize,
-    width: u32,
-    height: u32,
-    comps: &mut [Component],
-    quant: &[[u16; 64]; 4],
-    dc_tabs: &[HashMap<(u8, u16), u8>],
-    ac_tabs: &[HashMap<(u8, u16), u8>],
-) -> Option<(u32, u32, Vec<u8>)> {
-    if width == 0 || height == 0 || comps.is_empty() {
-        return None;
-    }
-    let hmax = comps.iter().map(|c| c.h).max()?.max(1) as usize;
-    let vmax = comps.iter().map(|c| c.v).max()?.max(1) as usize;
-    let mcu_w = 8 * hmax;
-    let mcu_h = 8 * vmax;
-    let mcus_x = (width as usize).div_ceil(mcu_w);
-    let mcus_y = (height as usize).div_ceil(mcu_h);
-
-    // Per-component full-resolution plane (already upsampled to width×height).
-    let mut planes: Vec<Vec<f32>> = comps
-        .iter()
-        .map(|_| vec![0f32; width as usize * height as usize])
-        .collect();
-
-    let mut br = BitReader::new(&data[start..]);
-    for my in 0..mcus_y {
-        for mx in 0..mcus_x {
-            for (ci, c) in comps.iter_mut().enumerate() {
-                for by in 0..c.v as usize {
-                    for bx in 0..c.h as usize {
-                        let mut block = [0f32; 64];
-                        decode_block(&mut br, c, quant, dc_tabs, ac_tabs, &mut block)?;
-                        // Place this 8×8 block into the component plane, scaling
-                        // its sample footprint to the luma grid (nearest-neighbour
-                        // chroma upsample).
-                        let sx = hmax / c.h as usize;
-                        let sy = vmax / c.v as usize;
-                        let ox = (mx * c.h as usize + bx) * 8;
-                        let oy = (my * c.v as usize + by) * 8;
-                        for r in 0..8 {
-                            for col in 0..8 {
-                                let val = block[r * 8 + col] + 128.0;
-                                for dy in 0..sy {
-                                    for dx in 0..sx {
-                                        let px = (ox + col) * sx + dx;
-                                        let py = (oy + r) * sy + dy;
-                                        if px < width as usize && py < height as usize {
-                                            planes[ci][py * width as usize + px] = val;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+fn place_block(
+    plane: &mut [f32],
+    block: &[f32; 64],
+    bcol: usize,
+    brow: usize,
+    sx: usize,
+    sy: usize,
+    width: usize,
+    height: usize,
+) {
+    let ox = bcol * 8;
+    let oy = brow * 8;
+    for r in 0..8 {
+        for col in 0..8 {
+            let val = block[r * 8 + col] + 128.0;
+            for dy in 0..sy {
+                for dx in 0..sx {
+                    let px = (ox + col) * sx + dx;
+                    let py = (oy + r) * sy + dy;
+                    if px < width && py < height {
+                        plane[py * width + px] = val;
                     }
                 }
             }
         }
     }
+}
 
-    // YCbCr (or grayscale) → RGBA.
-    let n = width as usize * height as usize;
+/// Convert per-component full-resolution `planes` (already upsampled to
+/// `width`×`height`) to RGBA: YCbCr→RGB for 3+ components, grayscale otherwise.
+fn planes_to_rgba(planes: &[Vec<f32>], width: usize, height: usize) -> Vec<u8> {
+    let n = width * height;
     let mut out = vec![0u8; n * 4];
+    let three = planes.len() >= 3;
     for i in 0..n {
-        let (r, g, b) = if comps.len() >= 3 {
+        let (r, g, b) = if three {
             let y = planes[0][i];
             let cb = planes[1][i] - 128.0;
             let cr = planes[2][i] - 128.0;
@@ -729,7 +781,60 @@ fn decode_scan(
         out[i * 4 + 2] = b.round().clamp(0.0, 255.0) as u8;
         out[i * 4 + 3] = 255;
     }
-    Some((width, height, out))
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_scan(
+    data: &[u8],
+    start: usize,
+    width: u32,
+    height: u32,
+    comps: &mut [Component],
+    quant: &[[u16; 64]; 4],
+    dc_tabs: &[HashMap<(u8, u16), u8>],
+    ac_tabs: &[HashMap<(u8, u16), u8>],
+) -> Option<(u32, u32, Vec<u8>)> {
+    if width == 0 || height == 0 || comps.is_empty() {
+        return None;
+    }
+    let (w, h) = (width as usize, height as usize);
+    let hmax = comps.iter().map(|c| c.h).max()?.max(1) as usize;
+    let vmax = comps.iter().map(|c| c.v).max()?.max(1) as usize;
+    let mcus_x = w.div_ceil(8 * hmax);
+    let mcus_y = h.div_ceil(8 * vmax);
+
+    // Per-component full-resolution plane (already upsampled to width×height).
+    let mut planes: Vec<Vec<f32>> = comps.iter().map(|_| vec![0f32; w * h]).collect();
+
+    let mut br = BitReader::new(&data[start..]);
+    for my in 0..mcus_y {
+        for mx in 0..mcus_x {
+            for (ci, c) in comps.iter_mut().enumerate() {
+                let (ch, cv) = (c.h as usize, c.v as usize);
+                let sx = hmax / ch;
+                let sy = vmax / cv;
+                for by in 0..cv {
+                    for bx in 0..ch {
+                        let mut block = [0f32; 64];
+                        decode_block(&mut br, c, quant, dc_tabs, ac_tabs, &mut block)?;
+                        place_block(
+                            &mut planes[ci],
+                            &block,
+                            mx * ch + bx,
+                            my * cv + by,
+                            sx,
+                            sy,
+                            w,
+                            h,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Some((width, height, planes_to_rgba(&planes, w, h)))
 }
 
 fn decode_block(
@@ -1060,6 +1165,248 @@ impl Progressive {
         Some(rd.seek_next_marker())
     }
 
+    /// Decode one **arithmetic** progressive scan (SOF10) into the coefficient
+    /// store, dispatching to the §G.2/§F.1.4 DC/AC first/refine procedures.
+    /// Statistics reset at scan start and each restart; the MQ decoder is
+    /// re-initialised at each RSTn. Returns the byte position of the next marker.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_scan_arith(
+        &mut self,
+        data: &[u8],
+        start: usize,
+        comps: &[Component],
+        arith_dc: &[ArithDcCond; 4],
+        arith_ac: &[ArithAcCond; 4],
+        scan_comps: &[usize],
+        ss: u8,
+        se: u8,
+        ah: u8,
+        al: u8,
+        restart_interval: usize,
+    ) -> Option<usize> {
+        if scan_comps.is_empty() {
+            return Some(start);
+        }
+        let mut mq = MqDecoder::new(data, start);
+        // Fresh statistics for this scan.
+        let mut dc_stats: Vec<ArithStats> = (0..4).map(|_| vec![0u8; 64]).collect();
+        let mut ac_stats: Vec<ArithStats> = (0..4).map(|_| vec![0u8; 256]).collect();
+        let mut sign_bin: ArithStats = vec![0u8; 1];
+        let mut dc_ctx = vec![0usize; self.comps.len()];
+        let mut preds = vec![0i32; self.comps.len()];
+
+        if ss == 0 {
+            // DC scan (may be interleaved across components, MCU order).
+            let interleaved = scan_comps.len() > 1;
+            let units = if interleaved {
+                self.mcus_x * self.mcus_y
+            } else {
+                let ci = scan_comps[0];
+                self.comps[ci].bx * self.comps[ci].by
+            };
+            let mut since_restart = 0usize;
+            for unit in 0..units {
+                if restart_interval > 0 && unit > 0 && since_restart == restart_interval {
+                    mq = arith_restart_reset(
+                        data,
+                        mq.bp,
+                        &mut dc_stats,
+                        &mut ac_stats,
+                        &mut sign_bin,
+                        &mut dc_ctx,
+                        &mut preds,
+                    )?;
+                    since_restart = 0;
+                }
+                since_restart += 1;
+                if interleaved {
+                    let (mx, my) = (unit % self.mcus_x, unit / self.mcus_x);
+                    for &ci in scan_comps {
+                        let (ch, cv) = (self.comps[ci].h, self.comps[ci].v);
+                        let bxw = self.comps[ci].bx;
+                        for by in 0..cv {
+                            for bx in 0..ch {
+                                let bi = (my * cv + by) * bxw + (mx * ch + bx);
+                                self.dc_block_arith(
+                                    &mut mq,
+                                    comps,
+                                    &mut dc_stats,
+                                    arith_dc,
+                                    &mut dc_ctx,
+                                    &mut preds,
+                                    ci,
+                                    bi,
+                                    ah,
+                                    al,
+                                )?;
+                            }
+                        }
+                    }
+                } else {
+                    let ci = scan_comps[0];
+                    self.dc_block_arith(
+                        &mut mq,
+                        comps,
+                        &mut dc_stats,
+                        arith_dc,
+                        &mut dc_ctx,
+                        &mut preds,
+                        ci,
+                        unit,
+                        ah,
+                        al,
+                    )?;
+                }
+            }
+        } else {
+            // AC scan — exactly one component over its own block grid.
+            let ci = scan_comps[0];
+            let units = self.comps[ci].bx * self.comps[ci].by;
+            let mut since_restart = 0usize;
+            for unit in 0..units {
+                if restart_interval > 0 && unit > 0 && since_restart == restart_interval {
+                    mq = arith_restart_reset(
+                        data,
+                        mq.bp,
+                        &mut dc_stats,
+                        &mut ac_stats,
+                        &mut sign_bin,
+                        &mut dc_ctx,
+                        &mut preds,
+                    )?;
+                    since_restart = 0;
+                }
+                since_restart += 1;
+                if ah == 0 {
+                    self.ac_first_arith(
+                        &mut mq, comps, &mut ac_stats, &mut sign_bin, arith_ac, ci, unit, ss, se, al,
+                    )?;
+                } else {
+                    self.ac_refine_arith(
+                        &mut mq, comps, &mut ac_stats, &mut sign_bin, ci, unit, ss, se, al,
+                    )?;
+                }
+            }
+        }
+        Some(resync_to_next_marker(data, mq.bp))
+    }
+
+    /// Arithmetic DC first-scan / refinement for one block (§G.2.1).
+    #[allow(clippy::too_many_arguments)]
+    fn dc_block_arith(
+        &mut self,
+        mq: &mut MqDecoder,
+        comps: &[Component],
+        dc_stats: &mut [ArithStats],
+        arith_dc: &[ArithDcCond; 4],
+        dc_ctx: &mut [usize],
+        preds: &mut [i32],
+        ci: usize,
+        bi: usize,
+        ah: u8,
+        al: u8,
+    ) -> Option<()> {
+        let tbl = comps[ci].dc_tab.min(3);
+        if ah == 0 {
+            let diff = arith_decode_dc(mq, &mut dc_stats[tbl], arith_dc[tbl], &mut dc_ctx[ci])?;
+            preds[ci] += diff;
+            self.comps[ci].coeffs.get_mut(bi)?[0] = preds[ci] << al;
+        } else {
+            // Refinement: one bit via the fixed bin (the DC table's bin 0 acts as
+            // the dedicated refinement context for this scan).
+            if mq.decode(&mut dc_stats[tbl], 0) == 1 {
+                self.comps[ci].coeffs.get_mut(bi)?[0] |= 1 << al;
+            }
+        }
+        Some(())
+    }
+
+    /// Arithmetic AC first-scan for a band `[ss, se]` of one block (§G.2.2,
+    /// Ah == 0).
+    #[allow(clippy::too_many_arguments)]
+    fn ac_first_arith(
+        &mut self,
+        mq: &mut MqDecoder,
+        comps: &[Component],
+        ac_stats: &mut [ArithStats],
+        sign_bin: &mut ArithStats,
+        arith_ac: &[ArithAcCond; 4],
+        ci: usize,
+        bi: usize,
+        ss: u8,
+        se: u8,
+        al: u8,
+    ) -> Option<()> {
+        let tbl = comps[ci].ac_tab.min(3);
+        let mut tmp = [0i32; 64];
+        arith_decode_ac(
+            mq,
+            &mut ac_stats[tbl],
+            sign_bin,
+            arith_ac[tbl],
+            &mut tmp,
+            ss as usize,
+            se as usize,
+            al,
+        )?;
+        // `arith_decode_ac` wrote natural-order; the store is zig-zag.
+        let block = self.comps[ci].coeffs.get_mut(bi)?;
+        for k in ss as usize..=se as usize {
+            block[k] = tmp[ZIGZAG[k]];
+        }
+        Some(())
+    }
+
+    /// Arithmetic AC refinement scan for a band `[ss, se]` of one block (§G.2.4).
+    #[allow(clippy::too_many_arguments)]
+    fn ac_refine_arith(
+        &mut self,
+        mq: &mut MqDecoder,
+        comps: &[Component],
+        ac_stats: &mut [ArithStats],
+        sign_bin: &mut ArithStats,
+        ci: usize,
+        bi: usize,
+        ss: u8,
+        se: u8,
+        al: u8,
+    ) -> Option<()> {
+        let tbl = comps[ci].ac_tab.min(3);
+        let p1 = 1i32 << al;
+        let m1 = -(1i32 << al);
+        let stats = &mut ac_stats[tbl];
+        let block = self.comps[ci].coeffs.get_mut(bi)?;
+        let mut k = ss as usize;
+        while k <= se as usize {
+            let st = 3 * (k - 1);
+            if mq.decode(stats, st) == 1 {
+                break; // EOB
+            }
+            loop {
+                let st_k = 3 * (k - 1);
+                if block[k] != 0 {
+                    // Already-nonzero: optional correction bit.
+                    if mq.decode(stats, st_k + 2) == 1 && (block[k] & p1) == 0 {
+                        block[k] += if block[k] >= 0 { p1 } else { m1 };
+                    }
+                    break;
+                } else {
+                    if mq.decode(stats, st_k + 1) == 1 {
+                        // Newly nonzero: sign then magnitude bit at this plane.
+                        block[k] = if mq.decode(sign_bin, 0) == 1 { m1 } else { p1 };
+                        break;
+                    }
+                    k += 1;
+                    if k > se as usize {
+                        return Some(());
+                    }
+                }
+            }
+            k += 1;
+        }
+        Some(())
+    }
+
     /// Decode/refine the DC coefficient of one block.
     #[allow(clippy::too_many_arguments)]
     fn dc_block(
@@ -1207,7 +1554,7 @@ impl Progressive {
     }
 
     /// Dequantize, inverse-DCT, upsample chroma, and colour-convert into RGBA.
-    fn finish(&self, comps: &[Component], quant: &[[u16; 64]; 4]) -> (u32, u32, Vec<u8>) {
+    fn finish(&self, _comps: &[Component], quant: &[[u16; 64]; 4]) -> (u32, u32, Vec<u8>) {
         let (w, h) = (self.width, self.height);
         let mut planes: Vec<Vec<f32>> = self.comps.iter().map(|_| vec![0f32; w * h]).collect();
         for (ci, pc) in self.comps.iter().enumerate() {
@@ -1217,60 +1564,546 @@ impl Progressive {
             for byk in 0..pc.by {
                 for bxk in 0..pc.bx {
                     let blk = &pc.coeffs[byk * pc.bx + bxk];
-                    // Dequantize + de-zigzag into natural order.
+                    // Dequantize + de-zigzag into natural order, then IDCT.
                     let mut nat = [0f32; 64];
                     for k in 0..64 {
                         nat[ZIGZAG[k]] = blk[k] as f32 * q[ZIGZAG[k]] as f32;
                     }
                     transform_2d(&mut nat, dct_iii);
-                    // Place the 8×8 block, scaling each sample to the luma grid.
-                    let ox = bxk * 8;
-                    let oy = byk * 8;
-                    for r in 0..8 {
-                        for c in 0..8 {
-                            let val = nat[r * 8 + c] + 128.0;
-                            for dy in 0..sy {
-                                for dx in 0..sx {
-                                    let px = (ox + c) * sx + dx;
-                                    let py = (oy + r) * sy + dy;
-                                    if px < w && py < h {
-                                        planes[ci][py * w + px] = val;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    place_block(&mut planes[ci], &nat, bxk, byk, sx, sy, w, h);
                 }
             }
         }
-        let n = w * h;
-        let mut out = vec![0u8; n * 4];
-        let three = comps.len() >= 3;
-        for i in 0..n {
-            let (r, g, b) = if three {
-                let y = planes[0][i];
-                let cb = planes[1][i] - 128.0;
-                let cr = planes[2][i] - 128.0;
-                (
-                    y + 1.402 * cr,
-                    y - 0.344_136 * cb - 0.714_136 * cr,
-                    y + 1.772 * cb,
-                )
-            } else {
-                let y = planes[0][i];
-                (y, y, y)
-            };
-            out[i * 4] = r.round().clamp(0.0, 255.0) as u8;
-            out[i * 4 + 1] = g.round().clamp(0.0, 255.0) as u8;
-            out[i * 4 + 2] = b.round().clamp(0.0, 255.0) as u8;
-            out[i * 4 + 3] = 255;
-        }
-        (w as u32, h as u32, out)
+        (w as u32, h as u32, planes_to_rgba(&planes, w, h))
     }
 }
 
 fn be16(d: &[u8], o: usize) -> u16 {
     ((*d.get(o).unwrap_or(&0) as u16) << 8) | *d.get(o + 1).unwrap_or(&0) as u16
+}
+
+// ── Arithmetic decoding (ISO/IEC 10918-1 Annex; MQ/QM-coder = ITU-T T.81/T.82) ─
+//
+// JPEG arithmetic coding uses the binary MQ arithmetic coder of the T.82/JBIG
+// family with the §F.1.4 DC/AC context models. The entropy stream is decoded by
+// `MqDecoder` (INITDEC/DECODE/RENORMD/BYTEIN per T.81 Figures D.16–E.19) feeding
+// per-component DC/AC statistics areas; the resulting coefficients flow into the
+// same dequant + IDCT + upsample + colour pipeline as the Huffman paths.
+
+/// One DAC DC conditioning entry: the `(L, U)` bounds that classify the previous
+/// block's DC difference into the 5 context zones (§F.1.4.4.1.2). Default L=0,
+/// U=1 (ISO 10918-1 §F.1.4.4.1.4) when no DAC marker is present.
+#[derive(Clone, Copy)]
+struct ArithDcCond {
+    l: u8,
+    u: u8,
+}
+
+impl Default for ArithDcCond {
+    fn default() -> Self {
+        ArithDcCond { l: 0, u: 1 }
+    }
+}
+
+/// One DAC AC conditioning entry: the `Kx` threshold splitting the AC magnitude
+/// context (§F.1.4.4.2). Default Kx=5 when no DAC marker is present.
+#[derive(Clone, Copy)]
+struct ArithAcCond {
+    kx: u8,
+}
+
+impl Default for ArithAcCond {
+    fn default() -> Self {
+        ArithAcCond { kx: 5 }
+    }
+}
+
+/// `Qe` probability-estimation state table (ISO/IEC 10918-1; identical to ITU-T
+/// T.82 Table E.1 / JPEG2000 Annex C): `(Qe, NMPS, NLPS, SWITCH)` per state.
+const QE: [(u32, u8, u8, u8); 47] = [
+    (0x5601, 1, 1, 1),
+    (0x3401, 2, 6, 0),
+    (0x1801, 3, 9, 0),
+    (0x0AC1, 4, 12, 0),
+    (0x0521, 5, 29, 0),
+    (0x0221, 38, 33, 0),
+    (0x5601, 7, 6, 1),
+    (0x5401, 8, 14, 0),
+    (0x4801, 9, 14, 0),
+    (0x3801, 10, 14, 0),
+    (0x3001, 11, 17, 0),
+    (0x2401, 12, 18, 0),
+    (0x1C01, 13, 20, 0),
+    (0x1601, 29, 21, 0),
+    (0x5601, 15, 14, 1),
+    (0x5401, 16, 14, 0),
+    (0x5101, 17, 15, 0),
+    (0x4801, 18, 16, 0),
+    (0x3801, 19, 17, 0),
+    (0x3401, 20, 18, 0),
+    (0x3001, 21, 19, 0),
+    (0x2801, 22, 19, 0),
+    (0x2401, 23, 20, 0),
+    (0x2201, 24, 21, 0),
+    (0x1C01, 25, 22, 0),
+    (0x1801, 26, 23, 0),
+    (0x1601, 27, 24, 0),
+    (0x1401, 28, 25, 0),
+    (0x1201, 29, 26, 0),
+    (0x1101, 30, 27, 0),
+    (0x0AC1, 31, 28, 0),
+    (0x09C1, 32, 29, 0),
+    (0x08A1, 33, 30, 0),
+    (0x0521, 34, 31, 0),
+    (0x0441, 35, 32, 0),
+    (0x02A1, 36, 33, 0),
+    (0x0221, 37, 34, 0),
+    (0x0141, 38, 35, 0),
+    (0x0111, 39, 36, 0),
+    (0x0085, 40, 37, 0),
+    (0x0049, 41, 38, 0),
+    (0x0025, 42, 39, 0),
+    (0x0015, 43, 40, 0),
+    (0x0009, 44, 41, 0),
+    (0x0005, 45, 42, 0),
+    (0x0001, 45, 43, 0),
+    (0x5601, 46, 46, 0),
+];
+
+/// A statistics area: one `(index, mps)` per context bin, packed as a single
+/// `u8` (low 7 bits = `Qe` state index 0..=46, bit 7 = MPS). All bins start at
+/// state 0, MPS 0 (ISO 10918-1 §F.1.4 initial conditioning).
+type ArithStats = Vec<u8>;
+
+#[inline]
+fn stat_index(s: u8) -> usize {
+    (s & 0x7F) as usize
+}
+#[inline]
+fn stat_mps(s: u8) -> u8 {
+    s >> 7
+}
+#[inline]
+fn pack_stat(index: u8, mps: u8) -> u8 {
+    (index & 0x7F) | (mps << 7)
+}
+
+/// MQ arithmetic decoder over the entropy-coded segment (T.81 software
+/// conventions: the code register `c` holds the comparison value in its high
+/// bits, `a` is the 16-bit sub-interval width).
+struct MqDecoder<'a> {
+    data: &'a [u8],
+    /// Index of the byte most recently loaded into `c` (BYTEIN tests `data[bp]`
+    /// to detect `0xFF` stuffing / markers).
+    bp: usize,
+    a: u32,
+    c: u32,
+    ct: i32,
+}
+
+impl<'a> MqDecoder<'a> {
+    /// INITDEC (T.81 Figure E.20): prime `c` from the first two bytes.
+    fn new(data: &'a [u8], start: usize) -> MqDecoder<'a> {
+        let mut d = MqDecoder {
+            data,
+            bp: start,
+            a: 0,
+            c: 0,
+            ct: 0,
+        };
+        let b0 = d.byte_at(d.bp);
+        d.c = (b0 as u32) << 16;
+        d.byte_in();
+        d.c <<= 7;
+        d.ct -= 7;
+        d.a = 0x8000;
+        d
+    }
+
+    #[inline]
+    fn byte_at(&self, i: usize) -> u8 {
+        *self.data.get(i).unwrap_or(&0xFF)
+    }
+
+    /// BYTEIN (T.81 Figure E.19): feed the next byte into `c`, honouring `0xFF`
+    /// stuffing and stopping (supplying `0xFF00`) at a real marker.
+    fn byte_in(&mut self) {
+        if self.byte_at(self.bp) == 0xFF {
+            let b1 = self.byte_at(self.bp + 1);
+            if b1 > 0x8F {
+                // Marker (≥ 0xFF90 — note 0xFF00 stuffing has b1 == 0x00): do
+                // not advance; supply 1-bits.
+                self.c += 0xFF00;
+                self.ct = 8;
+            } else {
+                self.bp += 1;
+                self.c += (b1 as u32) << 9;
+                self.ct = 7;
+            }
+        } else {
+            self.bp += 1;
+            self.c += (self.byte_at(self.bp) as u32) << 8;
+            self.ct = 8;
+        }
+    }
+
+    /// RENORMD (T.81 Figure E.18): shift `a`/`c` left until `a >= 0x8000`.
+    #[inline]
+    fn renorm(&mut self) {
+        loop {
+            if self.ct == 0 {
+                self.byte_in();
+            }
+            self.a <<= 1;
+            self.c <<= 1;
+            self.ct -= 1;
+            if self.a & 0x8000 != 0 {
+                break;
+            }
+        }
+    }
+
+    /// DECODE (T.81 Figure D.16, QM-coder convention with the LPS sub-interval
+    /// at the bottom): decode one binary decision against statistics bin `st`.
+    fn decode(&mut self, stats: &mut ArithStats, st: usize) -> u32 {
+        // Bounds-safe against corrupt streams that drive `st` out of range
+        // (`panic = "abort"` forbids a panic on malformed input).
+        let Some(slot) = stats.get_mut(st) else {
+            return 0;
+        };
+        let sv = *slot;
+        let index = stat_index(sv);
+        let mps = stat_mps(sv);
+        let (qe, nmps, nlps, switch) = QE[index];
+        self.a = self.a.wrapping_sub(qe);
+        let d;
+        if (self.c >> 16) < qe {
+            // LPS sub-interval (lower).  LPS_EXCHANGE + RENORMD (Figure D.19).
+            if self.a < qe {
+                d = mps;
+                *slot = pack_stat(nmps, mps);
+            } else {
+                d = 1 - mps;
+                let new_mps = if switch == 1 { 1 - mps } else { mps };
+                *slot = pack_stat(nlps, new_mps);
+            }
+            self.a = qe;
+            self.renorm();
+        } else {
+            self.c -= qe << 16;
+            if self.a & 0x8000 == 0 {
+                // MPS_EXCHANGE + RENORMD (Figure D.18).
+                if self.a < qe {
+                    d = 1 - mps;
+                    let new_mps = if switch == 1 { 1 - mps } else { mps };
+                    *slot = pack_stat(nlps, new_mps);
+                } else {
+                    d = mps;
+                    *slot = pack_stat(nmps, mps);
+                }
+                self.renorm();
+            } else {
+                d = mps;
+            }
+        }
+        d as u32
+    }
+}
+
+/// Decode one DC coefficient difference for component context `dc_ctx`
+/// (§F.1.4.4.1, Figures F.19–F.24). `stats` is this DC table's statistics area
+/// (≥ 49 bins). Returns the signed diff and updates `*dc_ctx` (the conditioning
+/// category carried to the next block of this component).
+fn arith_decode_dc(
+    mq: &mut MqDecoder,
+    stats: &mut ArithStats,
+    cond: ArithDcCond,
+    dc_ctx: &mut usize,
+) -> Option<i32> {
+    let base = *dc_ctx; // 0, 4, 8, 12, or 16
+    if mq.decode(stats, base) == 0 {
+        *dc_ctx = 0;
+        return Some(0);
+    }
+    // Non-zero: sign, then magnitude category, then magnitude low bits.
+    let sign = mq.decode(stats, base + 1); // 0 = positive, 1 = negative
+    // SP/SN entry bin: base+2 (positive) or base+3 (negative).
+    let mut st = base + 2 + sign as usize;
+    let mut m: i32 = mq.decode(stats, st) as i32;
+    if m != 0 {
+        // Magnitude category ladder uses the table-wide X bins at offset 20.
+        st = 20;
+        m = 1;
+        while mq.decode(stats, st) == 1 {
+            m <<= 1;
+            if m == 0x8000 {
+                return None; // overflow guard (corrupt stream)
+            }
+            st += 1;
+        }
+    }
+    // Establish the conditioning category for the NEXT block (§F.1.4.4.1.2).
+    let lower = (1i32 << cond.l) >> 1;
+    let upper = (1i32 << cond.u) >> 1;
+    *dc_ctx = if m < lower {
+        0
+    } else if m > upper {
+        12 + (sign as usize) * 4
+    } else {
+        4 + (sign as usize) * 4
+    };
+    // Decode the remaining magnitude bits (MSB already implied by `m`).
+    let mut v = m;
+    let mut bit = m >> 1;
+    while bit != 0 {
+        if mq.decode(stats, st) == 1 {
+            v |= bit;
+        }
+        bit >>= 1;
+    }
+    v += 1;
+    Some(if sign == 1 { -v } else { v })
+}
+
+/// Decode the AC coefficients of one block into `block` (natural-order, scaled
+/// by `1 << al`), §F.1.4.4.2 Figures F.15–F.18. `stats` is this AC table's
+/// statistics area (≥ 245 bins); `sign_bin` is the shared fixed-probability sign
+/// bin. Coefficients k = ss..=se in zig-zag are written.
+#[allow(clippy::too_many_arguments)]
+fn arith_decode_ac(
+    mq: &mut MqDecoder,
+    stats: &mut ArithStats,
+    sign_bin: &mut ArithStats,
+    cond: ArithAcCond,
+    block: &mut [i32; 64],
+    ss: usize,
+    se: usize,
+    al: u8,
+) -> Option<()> {
+    let mut k = ss;
+    while k <= se {
+        let base = 3 * (k - 1);
+        if mq.decode(stats, base) == 1 {
+            break; // EOB
+        }
+        // Advance over the zero run until a non-zero coefficient at position k.
+        loop {
+            if mq.decode(stats, base_of(k) + 1) == 1 {
+                break;
+            }
+            k += 1;
+            if k > se {
+                return Some(()); // ran past the band — done
+            }
+        }
+        let bk = base_of(k);
+        // Sign uses the fixed (non-adapting per spec, but harmless if it adapts)
+        // bin shared across the scan.
+        let sign = mq.decode(sign_bin, 0);
+        // Magnitude category: first bit at bk+2, then the size ladder.
+        let mut st = bk + 2;
+        let mut m: i32 = mq.decode(stats, st) as i32;
+        // `&&` short-circuits: the second magnitude decision is only consumed
+        // (and only mutates the MQ state) when the first bit was non-zero.
+        if m != 0 && mq.decode(stats, st) == 1 {
+            m = 2;
+            // Extension bins depend on whether k ≤ Kx.
+            st = if k <= cond.kx as usize { 189 } else { 217 };
+            while mq.decode(stats, st) == 1 {
+                m <<= 1;
+                if m == 0x8000 {
+                    return None; // overflow guard
+                }
+                st += 1;
+            }
+        }
+        let mut v = m;
+        let mut bit = m >> 1;
+        while bit != 0 {
+            if mq.decode(stats, st) == 1 {
+                v |= bit;
+            }
+            bit >>= 1;
+        }
+        v += 1;
+        let val = if sign == 1 { -v } else { v };
+        block[ZIGZAG[k]] = val << al;
+        k += 1;
+    }
+    Some(())
+}
+
+#[inline]
+fn base_of(k: usize) -> usize {
+    3 * (k - 1)
+}
+
+/// Arithmetic-sequential (SOF9) scan: mirrors [`decode_scan`] (MCU interleave,
+/// block placement, colour-convert) but decodes each block with the MQ coder and
+/// the §F.1.4 DC/AC context models. Honours restart intervals (statistics and DC
+/// predictors reset, MQ decoder re-initialised at each RSTn).
+#[allow(clippy::too_many_arguments)]
+fn decode_scan_arith(
+    data: &[u8],
+    start: usize,
+    width: u32,
+    height: u32,
+    comps: &mut [Component],
+    quant: &[[u16; 64]; 4],
+    arith_dc: &[ArithDcCond; 4],
+    arith_ac: &[ArithAcCond; 4],
+    restart_interval: usize,
+) -> Option<(u32, u32, Vec<u8>)> {
+    if width == 0 || height == 0 || comps.is_empty() {
+        return None;
+    }
+    let (w, h) = (width as usize, height as usize);
+    let hmax = comps.iter().map(|c| c.h).max()?.max(1) as usize;
+    let vmax = comps.iter().map(|c| c.v).max()?.max(1) as usize;
+    let mcus_x = w.div_ceil(8 * hmax);
+    let mcus_y = h.div_ceil(8 * vmax);
+
+    let mut planes: Vec<Vec<f32>> = comps.iter().map(|_| vec![0f32; w * h]).collect();
+
+    // Statistics areas (one DC + one AC per table id) and the shared sign bin.
+    let mut dc_stats: Vec<ArithStats> = (0..4).map(|_| vec![0u8; 64]).collect();
+    let mut ac_stats: Vec<ArithStats> = (0..4).map(|_| vec![0u8; 256]).collect();
+    let mut sign_bin: ArithStats = vec![0u8; 1];
+    let mut dc_ctx = vec![0usize; comps.len()];
+
+    let mut mq = MqDecoder::new(data, start);
+    let mut bp_marker = start; // tracked so we can resume the marker loop after
+    let mut since_restart = 0usize;
+    let total = mcus_x * mcus_y;
+    for mi in 0..total {
+        if restart_interval > 0 && mi > 0 && since_restart == restart_interval {
+            // Resync at the RSTn marker, reset entropy state.
+            let next = resync_restart(data, mq.bp)?;
+            mq = MqDecoder::new(data, next);
+            for s in dc_stats.iter_mut() {
+                s.iter_mut().for_each(|b| *b = 0);
+            }
+            for s in ac_stats.iter_mut() {
+                s.iter_mut().for_each(|b| *b = 0);
+            }
+            sign_bin[0] = 0;
+            comps.iter_mut().for_each(|c| c.pred = 0);
+            dc_ctx.iter_mut().for_each(|x| *x = 0);
+            since_restart = 0;
+        }
+        since_restart += 1;
+        let (mx, my) = (mi % mcus_x, mi / mcus_x);
+        for (ci, c) in comps.iter_mut().enumerate() {
+            let (ch, cv) = (c.h as usize, c.v as usize);
+            let sx = hmax / ch;
+            let sy = vmax / cv;
+            let dctab = c.dc_tab.min(3);
+            let actab = c.ac_tab.min(3);
+            for by in 0..cv {
+                for bx in 0..ch {
+                    let mut coeffs = [0i32; 64];
+                    let diff = arith_decode_dc(
+                        &mut mq,
+                        &mut dc_stats[dctab],
+                        arith_dc[dctab],
+                        &mut dc_ctx[ci],
+                    )?;
+                    c.pred += diff;
+                    coeffs[0] = c.pred;
+                    arith_decode_ac(
+                        &mut mq,
+                        &mut ac_stats[actab],
+                        &mut sign_bin,
+                        arith_ac[actab],
+                        &mut coeffs,
+                        1,
+                        63,
+                        0,
+                    )?;
+                    // Dequantize (natural order) + IDCT → spatial block.
+                    let q = &quant[c.quant.min(3)];
+                    let mut blk = [0f32; 64];
+                    for i in 0..64 {
+                        blk[i] = coeffs[i] as f32 * q[i] as f32;
+                    }
+                    transform_2d(&mut blk, dct_iii);
+                    place_block(&mut planes[ci], &blk, mx * ch + bx, my * cv + by, sx, sy, w, h);
+                }
+            }
+        }
+        bp_marker = mq.bp;
+    }
+    let _ = bp_marker;
+    Some((width, height, planes_to_rgba(&planes, w, h)))
+}
+
+/// Skip to and past the next restart marker (`FF D0..D7`) starting near `from`,
+/// returning the byte index just after it (for a fresh `MqDecoder`). `None` if
+/// no restart marker is found.
+fn resync_restart(data: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < data.len() {
+        if data[i] == 0xFF {
+            let m = data[i + 1];
+            if (0xD0..=0xD7).contains(&m) {
+                return Some(i + 2);
+            }
+            if m == 0x00 || m == 0xFF {
+                i += 1; // stuffed byte or fill — keep scanning
+                continue;
+            }
+            // Some other marker before a restart: give up gracefully.
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Advance from `from` to the next genuine marker (skipping stuffed `FF00`,
+/// fill `FFFF`, and restart `FF D0..D7` bytes that are part of the scan),
+/// returning its byte index so the caller's marker loop can resume.
+fn resync_to_next_marker(data: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i + 1 < data.len() {
+        if data[i] == 0xFF {
+            let m = data[i + 1];
+            if m == 0x00 || m == 0xFF || (0xD0..=0xD7).contains(&m) {
+                i += 1; // stuffed / fill / restart — part of the entropy scan
+                continue;
+            }
+            return i; // a real marker
+        }
+        i += 1;
+    }
+    i
+}
+
+/// At a restart boundary in an arithmetic scan: resync past the RSTn marker,
+/// zero all statistics + DC predictors, and return a fresh `MqDecoder` bound to
+/// the same `data` (kept as a free fn so its lifetime is tied to `data`, not to
+/// any enclosing `&mut MqDecoder`). `None` if no restart marker is found.
+#[allow(clippy::too_many_arguments)]
+fn arith_restart_reset<'a>(
+    data: &'a [u8],
+    from: usize,
+    dc_stats: &mut [ArithStats],
+    ac_stats: &mut [ArithStats],
+    sign_bin: &mut ArithStats,
+    dc_ctx: &mut [usize],
+    preds: &mut [i32],
+) -> Option<MqDecoder<'a>> {
+    let next = resync_restart(data, from)?;
+    for s in dc_stats.iter_mut() {
+        s.iter_mut().for_each(|b| *b = 0);
+    }
+    for s in ac_stats.iter_mut() {
+        s.iter_mut().for_each(|b| *b = 0);
+    }
+    sign_bin.iter_mut().for_each(|b| *b = 0);
+    dc_ctx.iter_mut().for_each(|x| *x = 0);
+    preds.iter_mut().for_each(|p| *p = 0);
+    Some(MqDecoder::new(data, next))
 }
 
 #[cfg(test)]
@@ -1448,13 +2281,464 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_coded_jpeg_is_rejected_gracefully() {
-        // An arithmetic-coded SOF (0xC9) must return None (not panic), so the
-        // caller skips the single image rather than blanking the page.
+    fn unsupported_sof_is_rejected_gracefully() {
+        // Lossless SOF3 (spatial predictor, not DCT) remains unsupported and
+        // must return None (not panic), so the caller skips the single image
+        // rather than blanking the page. SOF9/SOF10 arithmetic ARE now
+        // supported (covered by the round-trip tests below), so this targets a
+        // mode that is still unsupported.
         let mut data: Vec<u8> = vec![0xFF, 0xD8];
-        data.extend_from_slice(&[0xFF, 0xC9, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
+        data.extend_from_slice(&[0xFF, 0xC3, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
         data.extend_from_slice(&[0x01, 0x11, 0x00]);
         data.extend_from_slice(&[0xFF, 0xD9]);
         assert!(decode_jpeg(&data).is_none());
+
+        // A truncated / malformed arithmetic header must also fail gracefully.
+        let mut bad: Vec<u8> = vec![0xFF, 0xD8];
+        bad.extend_from_slice(&[0xFF, 0xC9, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
+        // Frame claims 1 component but the bytes are cut off before SOS/EOI.
+        assert!(decode_jpeg(&bad).is_none());
+    }
+
+    // ── Arithmetic (SOF9/SOF10) round-trip via an in-test MQ encoder ──────────
+    //
+    // No JPEG-arithmetic fixture is available, so we generate one: a minimal
+    // MQ **encoder** (the exact structural inverse of `MqDecoder`, sharing the
+    // `QE` table — T.81 QM-coder ENCODE/RENORME/BYTEOUT/FLUSH) plus the DC/AC
+    // arithmetic *encoders* mirroring `arith_decode_dc`/`arith_decode_ac`. If
+    // the decoder round-trips this encoder for several inputs, both are
+    // correct by symmetry.
+
+    /// Test-only MQ encoder — the exact inverse of [`MqDecoder`], producing the
+    /// canonical MQ byte stream (BYTEOUT/RENORME/FLUSH per the ISO/IEC 10918-1
+    /// Annex / JPEG2000 MQ-coder, OpenJPEG software conventions). `out[0]` is a
+    /// sentinel byte (stripped by `finish`) so the first BYTEOUT has a "previous
+    /// byte" to test for carry/stuffing; `bp` indexes the current output byte.
+    struct MqEncoder {
+        out: Vec<u8>,
+        a: u32,
+        c: u32,
+        ct: i32,
+        bp: usize,
+    }
+
+    impl MqEncoder {
+        fn new() -> MqEncoder {
+            // INITENC: A=0x8000, C=0, CT=12, sentinel byte at index 0.
+            MqEncoder {
+                out: vec![0u8],
+                a: 0x8000,
+                c: 0,
+                ct: 12,
+                bp: 0,
+            }
+        }
+
+        /// BYTEOUT: emit one byte (`c >> 19`, or `c >> 20` + 7-bit stuff after a
+        /// `0xFF`), propagating any carry into the previous byte.
+        fn byte_out(&mut self) {
+            if self.out[self.bp] == 0xFF {
+                self.out.push((self.c >> 20) as u8);
+                self.bp = self.out.len() - 1;
+                self.c &= 0xFFFFF;
+                self.ct = 7;
+            } else if self.c & 0x8000000 == 0 {
+                self.out.push((self.c >> 19) as u8);
+                self.bp = self.out.len() - 1;
+                self.c &= 0x7FFFF;
+                self.ct = 8;
+            } else {
+                self.out[self.bp] += 1; // carry into the previous byte
+                if self.out[self.bp] == 0xFF {
+                    self.c &= 0x7FFFFFF;
+                    self.out.push((self.c >> 20) as u8);
+                    self.bp = self.out.len() - 1;
+                    self.c &= 0xFFFFF;
+                    self.ct = 7;
+                } else {
+                    self.out.push((self.c >> 19) as u8);
+                    self.bp = self.out.len() - 1;
+                    self.c &= 0x7FFFF;
+                    self.ct = 8;
+                }
+            }
+        }
+
+        /// RENORME.
+        fn renorm(&mut self) {
+            loop {
+                if self.ct == 0 {
+                    self.byte_out();
+                }
+                self.a <<= 1;
+                self.c <<= 1;
+                self.ct -= 1;
+                if self.a & 0x8000 != 0 {
+                    break;
+                }
+            }
+        }
+
+        /// ENCODE(d) — the exact inverse of `MqDecoder::decode`, derived from its
+        /// LPS/MPS exchange branches (LPS sub-interval at the bottom).
+        fn encode(&mut self, stats: &mut ArithStats, st: usize, d: u32) {
+            let sv = stats[st];
+            let index = stat_index(sv);
+            let mps = stat_mps(sv);
+            let (qe, nmps, nlps, switch) = QE[index];
+            self.a = self.a.wrapping_sub(qe);
+            if d == mps as u32 {
+                if self.a & 0x8000 != 0 {
+                    self.c = self.c.wrapping_add(qe); // no renorm, upper interval
+                    return;
+                }
+                if self.a >= qe {
+                    self.c = self.c.wrapping_add(qe); // upper sub-interval
+                } else {
+                    self.a = qe; // conditional exchange → lower sub-interval
+                }
+                stats[st] = pack_stat(nmps, mps);
+                self.renorm();
+            } else {
+                if self.a & 0x8000 != 0 {
+                    self.a = qe; // lower sub-interval (A' ≥ 0x8000 ≥ Qe)
+                } else if self.a >= qe {
+                    self.a = qe; // lower sub-interval
+                } else {
+                    self.c = self.c.wrapping_add(qe); // conditional exchange → upper
+                }
+                let new_mps = if switch == 1 { 1 - mps } else { mps };
+                stats[st] = pack_stat(nlps, new_mps);
+                self.renorm();
+            }
+        }
+
+        /// FLUSH: set the remaining low bits and emit two final bytes; strip the
+        /// sentinel.
+        fn finish(mut self) -> Vec<u8> {
+            let tempc = self.c.wrapping_add(self.a);
+            self.c |= 0xFFFF;
+            if self.c >= tempc {
+                self.c -= 0x8000;
+            }
+            self.c <<= self.ct;
+            self.byte_out();
+            self.c <<= self.ct;
+            self.byte_out();
+            self.out.remove(0); // drop the sentinel
+            self.out
+        }
+    }
+
+    /// Encode a DC difference, the exact mirror of [`arith_decode_dc`]. The JPEG
+    /// arithmetic magnitude is binarised on `Sz = |diff| - 1`: the size category
+    /// `cat` is the bit-length of `Sz`, `m = 1 << (cat-1)` is its MSB weight
+    /// (`0` for |diff|==1), and the `cat-1` low bits of `Sz` follow MSB-first.
+    fn arith_encode_dc(
+        enc: &mut MqEncoder,
+        stats: &mut ArithStats,
+        cond: ArithDcCond,
+        dc_ctx: &mut usize,
+        diff: i32,
+    ) {
+        let base = *dc_ctx;
+        if diff == 0 {
+            enc.encode(stats, base, 0);
+            *dc_ctx = 0;
+            return;
+        }
+        enc.encode(stats, base, 1);
+        let sign = if diff < 0 { 1u32 } else { 0 };
+        enc.encode(stats, base + 1, sign);
+        let mag = diff.unsigned_abs() as i32;
+        let sz = mag - 1;
+        let mut st = base + 2 + sign as usize;
+        let (m, cat) = if sz == 0 {
+            enc.encode(stats, st, 0); // |diff| == 1
+            (0i32, 0u32)
+        } else {
+            enc.encode(stats, st, 1);
+            let cat = 32 - (sz as u32).leading_zeros(); // ≥ 1
+            // Size ladder at offset 20: (cat-1) ones then a zero brings the
+            // decoder's `m` (starting at 1) to 1 << (cat-1).
+            st = 20;
+            for _ in 0..(cat - 1) {
+                enc.encode(stats, st, 1);
+                st += 1;
+            }
+            enc.encode(stats, st, 0);
+            (1i32 << (cat - 1), cat)
+        };
+        // Next-block conditioning category (decoder classifies on `m`).
+        let lower = (1i32 << cond.l) >> 1;
+        let upper = (1i32 << cond.u) >> 1;
+        *dc_ctx = if m < lower {
+            0
+        } else if m > upper {
+            12 + (sign as usize) * 4
+        } else {
+            4 + (sign as usize) * 4
+        };
+        // Low magnitude bits of Sz below its MSB, MSB-first (re-using `st`).
+        if cat >= 2 {
+            let mut bit = 1i32 << (cat - 2);
+            while bit != 0 {
+                enc.encode(stats, st, ((sz & bit) != 0) as u32);
+                bit >>= 1;
+            }
+        }
+    }
+
+    /// Encode one block's AC band, mirror of [`arith_decode_ac`]. `coeffs` is in
+    /// natural order. EOB after the last nonzero in `[ss, se]`.
+    #[allow(clippy::too_many_arguments)]
+    fn arith_encode_ac(
+        enc: &mut MqEncoder,
+        stats: &mut ArithStats,
+        sign_bin: &mut ArithStats,
+        cond: ArithAcCond,
+        coeffs: &[i32; 64],
+        ss: usize,
+        se: usize,
+    ) {
+        // Last nonzero zig-zag index in the band.
+        let mut last = ss.saturating_sub(1);
+        for k in ss..=se {
+            if coeffs[ZIGZAG[k]] != 0 {
+                last = k;
+            }
+        }
+        let mut k = ss;
+        while k <= se {
+            if k > last {
+                enc.encode(stats, base_of(k), 1); // EOB
+                return;
+            }
+            enc.encode(stats, base_of(k), 0); // not EOB
+            // Advance over zeros: emit run-decision 0 for each zero, 1 at nonzero.
+            while coeffs[ZIGZAG[k]] == 0 {
+                enc.encode(stats, base_of(k) + 1, 0);
+                k += 1;
+            }
+            enc.encode(stats, base_of(k) + 1, 1);
+            let val = coeffs[ZIGZAG[k]];
+            let sign = if val < 0 { 1u32 } else { 0 };
+            enc.encode(sign_bin, 0, sign);
+            let mag = val.unsigned_abs() as i32;
+            let sz = mag - 1;
+            let st0 = base_of(k) + 2;
+            // [C] first magnitude decision at st0; magnitude binarised on `Sz`.
+            let (st, cat) = if sz == 0 {
+                enc.encode(stats, st0, 0); // |coef| == 1
+                (st0, 0u32)
+            } else {
+                enc.encode(stats, st0, 1);
+                let cat = 32 - (sz as u32).leading_zeros(); // ≥ 1
+                if cat == 1 {
+                    enc.encode(stats, st0, 0); // |coef| == 2, no extension ladder
+                    (st0, 1u32)
+                } else {
+                    enc.encode(stats, st0, 1); // second decision selects the ladder
+                    let mut st = if k <= cond.kx as usize { 189 } else { 217 };
+                    for _ in 0..(cat - 2) {
+                        enc.encode(stats, st, 1);
+                        st += 1;
+                    }
+                    enc.encode(stats, st, 0);
+                    (st, cat)
+                }
+            };
+            // Low magnitude bits of Sz below its MSB, MSB-first.
+            if cat >= 2 {
+                let mut bit = 1i32 << (cat - 2);
+                while bit != 0 {
+                    enc.encode(stats, st, ((sz & bit) != 0) as u32);
+                    bit >>= 1;
+                }
+            }
+            k += 1;
+        }
+    }
+
+    /// Assemble a one-block (8×8) grayscale **SOF9** (sequential arithmetic)
+    /// JPEG from the natural-order quantized coefficients `coeffs` (quant table
+    /// is all-ones, so they are also the dequantized coefficients fed to the
+    /// IDCT). Uses default conditioning (no DAC marker).
+    fn arith_seq_gray_8x8(coeffs: &[i32; 64]) -> Vec<u8> {
+        let mut enc = MqEncoder::new();
+        let mut dc_stats: ArithStats = vec![0u8; 64];
+        let mut ac_stats: ArithStats = vec![0u8; 256];
+        let mut sign_bin: ArithStats = vec![0u8; 1];
+        let mut dc_ctx = 0usize;
+        arith_encode_dc(
+            &mut enc,
+            &mut dc_stats,
+            ArithDcCond::default(),
+            &mut dc_ctx,
+            coeffs[0],
+        );
+        arith_encode_ac(
+            &mut enc,
+            &mut ac_stats,
+            &mut sign_bin,
+            ArithAcCond::default(),
+            coeffs,
+            1,
+            63,
+        );
+        let entropy = enc.finish();
+
+        let mut out: Vec<u8> = vec![0xFF, 0xD8]; // SOI
+        out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]); // DQT, all ones
+        out.extend_from_slice(&[1u8; 64]);
+        // SOF9 — extended sequential arithmetic, 1 component, 1×1 sampling.
+        out.extend_from_slice(&[0xFF, 0xC9, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
+        out.extend_from_slice(&[0x01, 0x11, 0x00]);
+        // SOS — 1 comp, DC/AC table ids 0, Ss=0 Se=63 Ah=Al=0.
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        out.extend_from_slice(&entropy);
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
+    /// Natural-order quantized coefficients of a constant `gray` 8×8 block
+    /// (all-ones quant), via the real forward DCT so the round-trip is exact bar
+    /// IDCT float rounding.
+    fn const_block_coeffs(gray: u8) -> [i32; 64] {
+        let c = gray as f32 - 128.0;
+        let mut blk = [c; 64];
+        transform_2d(&mut blk, dct_ii);
+        let mut q = [0i32; 64];
+        for i in 0..64 {
+            q[i] = blk[i].round() as i32;
+        }
+        q
+    }
+
+    #[test]
+    fn decodes_arithmetic_sequential_solid_gray() {
+        // Solid gray exercises the MQ decoder, the DC context model, and the
+        // AC EOB path (the whole band is zero AC ⇒ immediate EOB at k=1).
+        for &gray in &[160u8, 64, 200, 16] {
+            let coeffs = const_block_coeffs(gray);
+            let jpg = arith_seq_gray_8x8(&coeffs);
+            let (w, h, dec) = decode_jpeg(&jpg).expect("SOF9 solid gray decodes");
+            assert_eq!((w, h), (8, 8));
+            for px in dec.chunks_exact(4) {
+                assert!(
+                    (px[0] as i32 - gray as i32).abs() <= 3,
+                    "gray {gray}: got {}",
+                    px[0]
+                );
+                assert_eq!(px[3], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_arithmetic_sequential_with_ac() {
+        // A non-trivial block with several nonzero AC coefficients exercises the
+        // AC run/magnitude binarization (zero runs, magnitude categories, signs).
+        // Build a horizontal-gradient-like block in the spatial domain, forward
+        // DCT + quantize (all-ones), then round-trip.
+        let mut spatial = [0f32; 64];
+        for r in 0..8 {
+            for col in 0..8 {
+                // A ramp plus a little vertical variation → many AC terms.
+                spatial[r * 8 + col] = (col as f32 * 14.0 - 50.0) + (r as f32 * 4.0);
+            }
+        }
+        transform_2d(&mut spatial, dct_ii);
+        let mut coeffs = [0i32; 64];
+        for i in 0..64 {
+            coeffs[i] = spatial[i].round() as i32;
+        }
+        // Reconstruct the reference pixels the decoder should produce.
+        let mut ref_blk = [0f32; 64];
+        for i in 0..64 {
+            ref_blk[i] = coeffs[i] as f32;
+        }
+        transform_2d(&mut ref_blk, dct_iii);
+
+        let jpg = arith_seq_gray_8x8(&coeffs);
+        let (w, h, dec) = decode_jpeg(&jpg).expect("SOF9 AC block decodes");
+        assert_eq!((w, h), (8, 8));
+        for r in 0..8 {
+            for col in 0..8 {
+                let want = (ref_blk[r * 8 + col] + 128.0).round().clamp(0.0, 255.0) as i32;
+                let got = dec[(r * 8 + col) * 4] as i32;
+                assert!(
+                    (got - want).abs() <= 2,
+                    "pixel ({r},{col}): want {want}, got {got}"
+                );
+            }
+        }
+    }
+
+    /// Assemble a two-scan **SOF10** (progressive arithmetic) grayscale 8×8 JPEG
+    /// of a constant block: a DC scan (Ss=0,Se=0) then an AC scan (Ss=1,Se=63),
+    /// both Ah=Al=0. Exercises the progressive arithmetic DC-first + AC-first
+    /// paths and `Progressive::finish`.
+    fn arith_prog_gray_8x8(coeffs: &[i32; 64]) -> Vec<u8> {
+        // DC scan entropy.
+        let mut dc_enc = MqEncoder::new();
+        let mut dc_stats: ArithStats = vec![0u8; 64];
+        let mut dc_ctx = 0usize;
+        arith_encode_dc(
+            &mut dc_enc,
+            &mut dc_stats,
+            ArithDcCond::default(),
+            &mut dc_ctx,
+            coeffs[0],
+        );
+        let dc_entropy = dc_enc.finish();
+
+        // AC scan entropy (fresh statistics — each scan resets them).
+        let mut ac_enc = MqEncoder::new();
+        let mut ac_stats: ArithStats = vec![0u8; 256];
+        let mut sign_bin: ArithStats = vec![0u8; 1];
+        arith_encode_ac(
+            &mut ac_enc,
+            &mut ac_stats,
+            &mut sign_bin,
+            ArithAcCond::default(),
+            coeffs,
+            1,
+            63,
+        );
+        let ac_entropy = ac_enc.finish();
+
+        let mut out: Vec<u8> = vec![0xFF, 0xD8]; // SOI
+        out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]); // DQT, all ones
+        out.extend_from_slice(&[1u8; 64]);
+        // SOF10 — progressive arithmetic, 1 component, 1×1 sampling.
+        out.extend_from_slice(&[0xFF, 0xCA, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01]);
+        out.extend_from_slice(&[0x01, 0x11, 0x00]);
+        // SOS #1 — DC scan: Ss=0 Se=0 Ah=0 Al=0.
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&dc_entropy);
+        // SOS #2 — AC scan: Ss=1 Se=63 Ah=0 Al=0, AC table id 0.
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3F, 0x00]);
+        out.extend_from_slice(&ac_entropy);
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
+    #[test]
+    fn decodes_arithmetic_progressive_gray() {
+        for &gray in &[160u8, 72] {
+            let coeffs = const_block_coeffs(gray);
+            let jpg = arith_prog_gray_8x8(&coeffs);
+            let (w, h, dec) = decode_jpeg(&jpg).expect("SOF10 progressive decodes");
+            assert_eq!((w, h), (8, 8));
+            for px in dec.chunks_exact(4) {
+                assert!(
+                    (px[0] as i32 - gray as i32).abs() <= 3,
+                    "gray {gray}: got {}",
+                    px[0]
+                );
+                assert_eq!(px[3], 255);
+            }
+        }
     }
 }
