@@ -877,6 +877,24 @@ export class GigaPdfEngine {
       this._str((o) => this.ex.gp_model_to_rtf(p, l, o))
     );
   }
+  /** Raise a model to Markdown (decoded UTF-8 string). */
+  modelToMarkdown(model: GigaDocument): string {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._str((o) => this.ex.gp_model_to_md(p, l, o))
+    );
+  }
+  /** Raise a model to CSV (decoded UTF-8 string). */
+  modelToCsv(model: GigaDocument): string {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._str((o) => this.ex.gp_model_to_csv(p, l, o))
+    );
+  }
+  /** Raise a model to an EPUB e-book (`.epub`). */
+  modelToEpub(model: GigaDocument): Uint8Array {
+    return this._withStr(JSON.stringify(model), (p, l) =>
+      this._buffer((o) => this.ex.gp_model_to_epub(p, l, o))
+    );
+  }
 }
 
 /** Pack `HtmlResource[]` (host-fetched URLs) into the little-endian blob

@@ -2476,6 +2476,42 @@ pub extern "C" fn gp_model_to_rtf(
     })
 }
 
+/// Export a model (JSON) to Markdown (returned as UTF-8 string bytes).
+#[no_mangle]
+pub extern "C" fn gp_model_to_md(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::markdown_from_model(m).into_bytes()
+    })
+}
+
+/// Export a model (JSON) to CSV (returned as UTF-8 string bytes).
+#[no_mangle]
+pub extern "C" fn gp_model_to_csv(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::csv_from_model(m).into_bytes()
+    })
+}
+
+/// Export a model (JSON) to an EPUB e-book (`.epub`).
+#[no_mangle]
+pub extern "C" fn gp_model_to_epub(
+    model_ptr: *const u8,
+    model_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    model_export(model_ptr, model_len, out_len, |m| {
+        gigapdf_core::convert::export_model::epub_from_model(m)
+    })
+}
+
 /// Export a model (JSON) back to a PDF.
 #[no_mangle]
 pub extern "C" fn gp_model_to_pdf(
