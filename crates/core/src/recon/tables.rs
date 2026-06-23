@@ -234,6 +234,17 @@ pub fn build_table(
     // positionally. Nested-XObject runs (`source_index = None`) never overwrite a
     // real index.
     let mut src_grid: Vec<Vec<Option<usize>>> = vec![vec![None; n_cols]; n_rows];
+    // Per cell: the last run's right edge, height, and whether its raw text ended
+    // with whitespace — so the space between successive runs is synthesized
+    // **gap-aware**. A dense form draws one word across embedded fonts
+    // (`"ENFANT"`+`"S"` butting, gap ≈ 0) and must read `"ENFANTS"`, not
+    // `"ENFANT S"`. A real inter-word gap — or a wrap to the next line within the
+    // cell (a large negative gap) — still inserts a space. Because each run's text
+    // is trimmed before it is appended (cells join on geometry, not raw glyphs),
+    // the run's **own** leading/trailing space is honoured explicitly so a run
+    // that carried its space (e.g. `" L. 16"`) still separates from its
+    // predecessor even when the boxes butt (gap ≈ 0).
+    let mut cell_prev: Vec<Vec<Option<(f64, f64, bool)>>> = vec![vec![None; n_cols]; n_rows];
 
     for &li in &table.covered_lines {
         let Some(line) = lines.get(li) else { continue };
@@ -249,9 +260,27 @@ pub fn build_table(
             }
             let cell = &mut grid[r][c];
             if !cell.is_empty() {
-                cell.push(' ');
+                let space = match cell_prev[r][c] {
+                    Some((prev_right, prev_h, prev_trailing_ws)) => {
+                        // The trim dropped the original whitespace; a space is due
+                        // when either side carried one, or the gap is a real
+                        // inter-word gap (not a multi-font split-word butt).
+                        prev_trailing_ws
+                            || run.text.starts_with(char::is_whitespace)
+                            || !super::runs_join(prev_right, run.x, run.h.max(prev_h))
+                    }
+                    None => true,
+                };
+                if space {
+                    cell.push(' ');
+                }
             }
             cell.push_str(t);
+            cell_prev[r][c] = Some((
+                run.right(),
+                run.h,
+                run.text.ends_with(char::is_whitespace),
+            ));
             if styles[r][c].is_none() {
                 styles[r][c] = Some(run_char_style(run));
             }
@@ -1712,6 +1741,31 @@ mod tests {
             },
             _ => String::new(),
         }
+    }
+
+    #[test]
+    fn cell_text_joins_split_word_runs_gap_aware() {
+        // A CERFA title cell draws one word across several embedded fonts:
+        // "ENFANTS" = "ENFANT"+"S" butting (gap ≈ 0), "MINEURS" = "MINEUR"+"S"
+        // butting, with a real inter-word gap between the two words. The cell must
+        // read "ENFANTS MINEURS", never "ENFANT S MINEUR S". A single 1×1 ruled
+        // cell (columns x=50..350, rows y=100..140) holds the runs at y≈120.
+        let paths = vec![
+            hrule(140.0, 50.0, 350.0),
+            hrule(100.0, 50.0, 350.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(350.0, 100.0, 140.0),
+        ];
+        let runs = vec![
+            run("ENFANT", 60.0, 116.0, 40.0), // x 60..100
+            run("S", 100.0, 116.0, 6.0),       // butts → join → "ENFANTS"
+            run("MINEUR", 130.0, 116.0, 40.0), // gap 130-106 = 24 → space
+            run("S", 170.0, 116.0, 6.0),       // butts → join → "MINEURS"
+        ];
+        let rows = build_rows(&paths, &runs);
+        assert_eq!(rows.len(), 1, "one ruled band → one row");
+        assert_eq!(rows[0].cells.len(), 1, "one column → one cell");
+        assert_eq!(cell_text(&rows[0].cells[0]), "ENFANTS MINEURS");
     }
 
     #[test]

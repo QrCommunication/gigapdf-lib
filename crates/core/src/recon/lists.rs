@@ -309,6 +309,13 @@ fn paragraph_block(runs: Vec<Inline>, ids: &mut IdGen) -> Block {
 fn line_runs(line: &ReconLine, text: &str) -> Vec<Inline> {
     let mut runs: Vec<Inline> = Vec::new();
     let mut remaining = text;
+    // Right edge / height of the previously emitted run, plus whether its raw text
+    // ended with whitespace — to synthesize an inter-word space **gap-aware**: a
+    // dense form splits one word across embedded fonts (joining every run with a
+    // space would shred words), so a space is due only on a real inter-word gap
+    // or when a run carried its own leading/trailing whitespace (the per-run trim
+    // dropped it).
+    let mut prev: Option<(f64, f64, bool)> = None;
     for r in &line.runs {
         if remaining.is_empty() {
             break;
@@ -321,11 +328,24 @@ fn line_runs(line: &ReconLine, text: &str) -> Vec<Inline> {
         if take.is_empty() {
             continue;
         }
+        if let Some((prev_right, prev_h, prev_trailing_ws)) = prev {
+            if prev_trailing_ws
+                || r.text.starts_with(char::is_whitespace)
+                || !super::runs_join(prev_right, r.x, r.h.max(prev_h))
+            {
+                runs.push(Inline::Run(InlineRun {
+                    text: " ".to_string(),
+                    style: run_char_style(r),
+                    source_index: None,
+                }));
+            }
+        }
         runs.push(Inline::Run(InlineRun {
             text: take,
             style: run_char_style(r),
             source_index: r.source_index,
         }));
+        prev = Some((r.right(), r.h, r.text.ends_with(char::is_whitespace)));
     }
     runs
 }

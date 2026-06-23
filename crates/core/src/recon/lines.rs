@@ -24,22 +24,35 @@ pub struct ReconLine {
 }
 
 impl ReconLine {
-    /// The concatenated text of the line (runs joined by single spaces, unless a
-    /// run already ends/starts with whitespace).
+    /// The concatenated text of the line. Adjacent runs are joined **gap-aware**
+    /// (via [`runs_join`](super::runs_join)): a space is inserted only when the
+    /// horizontal gap to the previous run is a real inter-word space, not when a
+    /// word is split across fonts (`"ENFANT"`+`"S"` → `"ENFANTS"`, not
+    /// `"ENFANT S"`). A run already carrying leading/trailing whitespace keeps it
+    /// and is never double-spaced.
     pub fn text(&self) -> String {
         let mut s = String::new();
+        // Previous emitted run's right edge, height, and whether its raw text
+        // ended with whitespace. `None` before the first non-blank run.
+        let mut prev: Option<(f64, f64, bool)> = None;
         for run in &self.runs {
             let t = run.text.trim();
             if t.is_empty() {
                 continue;
             }
-            if !s.is_empty()
-                && !s.ends_with(char::is_whitespace)
-                && !run.text.starts_with(char::is_whitespace)
-            {
-                s.push(' ');
+            if let Some((prev_right, prev_h, prev_trailing_ws)) = prev {
+                // The trim dropped each run's own whitespace; a space is due when
+                // either side carried one, or the gap is a real inter-word gap
+                // (not a multi-font split-word butt at gap ≈ 0).
+                if prev_trailing_ws
+                    || run.text.starts_with(char::is_whitespace)
+                    || !super::runs_join(prev_right, run.x, run.h.max(prev_h))
+                {
+                    s.push(' ');
+                }
             }
             s.push_str(t);
+            prev = Some((run.right(), run.h, run.text.ends_with(char::is_whitespace)));
         }
         s
     }
@@ -206,5 +219,40 @@ mod tests {
     #[test]
     fn empty_input_yields_no_lines() {
         assert!(group_into_lines(&[]).is_empty());
+    }
+
+    // ── gap-aware spacing: multi-font words must not gain spurious spaces ──────
+
+    /// Build a run at an explicit X with a width chosen so the next run can butt
+    /// it (gap ≈ 0) or stand off it (real space). `w = len·size·0.5`.
+    fn at(text: &str, x: f64, size: f64) -> ReconRun {
+        let mut r = run(text, x, 700.0, size);
+        r.w = text.chars().count() as f64 * size * 0.5;
+        r
+    }
+
+    #[test]
+    fn split_word_runs_join_without_a_spurious_space() {
+        // A dense form draws "ENFANTS" as "ENFANT"+"S" from two embedded fonts
+        // (the "S" butts the previous run: gap ≈ 0). Likewise "MINEURS". A real
+        // inter-word gap separates the two words. Expect "ENFANTS MINEURS", never
+        // "ENFANT S MINEUR S".
+        let enfant = at("ENFANT", 72.0, 10.0); // x 72..102
+        let s1 = at("S", 102.0, 10.0); // butts → join → "ENFANTS"
+        let mineur = at("MINEUR", 130.0, 10.0); // gap 130-107 = 23 → space before
+        let s2 = at("S", 160.0, 10.0); // butts → join → "MINEURS"
+        let lines = group_into_lines(&[enfant, s1, mineur, s2]);
+        assert_eq!(lines.len(), 1, "one baseline band → one line");
+        assert_eq!(lines[0].text(), "ENFANTS MINEURS");
+    }
+
+    #[test]
+    fn a_real_inter_word_gap_keeps_its_space() {
+        // "DES" then "ENFANTS" with a clear gap must NOT fuse into "DESENFANTS".
+        let des = at("DES", 72.0, 10.0); // x 72..87
+        let enfants = at("ENFANTS", 110.0, 10.0); // gap 110-87 = 23 → space
+        let lines = group_into_lines(&[des, enfants]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "DES ENFANTS");
     }
 }

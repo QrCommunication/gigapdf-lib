@@ -127,10 +127,31 @@ pub(crate) fn build_paragraph_styled(
             runs.push(Inline::LineBreak);
         }
         let (line_base, line_size) = line_baseline_and_size(line);
+        // Right edge / height of the previous emitted run *on this line*, to
+        // decide a synthesized inter-word space. `None` at each line start (the
+        // `LineBreak` already separates lines).
+        let mut prev: Option<(f64, f64, &str)> = None;
         for r in &line.runs {
             let t = r.text.trim();
             if t.is_empty() {
                 continue;
+            }
+            // A dense form splits one word across embedded fonts ("ENFANT"+"S");
+            // joining every run with a space shreds words. Insert a space only
+            // when the horizontal gap to the previous run is a real inter-word
+            // gap (gap-aware, mirroring `content::group_lines`), and neither side
+            // already carries its own whitespace.
+            if let Some((prev_right, prev_h, prev_raw)) = prev {
+                if !prev_raw.ends_with(char::is_whitespace)
+                    && !r.text.starts_with(char::is_whitespace)
+                    && !super::runs_join(prev_right, r.x, r.h.max(prev_h))
+                {
+                    runs.push(Inline::Run(InlineRun {
+                        text: " ".to_string(),
+                        style: run_char_style(r),
+                        source_index: None,
+                    }));
+                }
             }
             let mut style = run_char_style(r);
             style.vertical_align = vertical_align_of(r, line_base, line_size);
@@ -147,6 +168,7 @@ pub(crate) fn build_paragraph_styled(
                 }),
                 None => runs.push(inline),
             }
+            prev = Some((r.right(), r.h, &r.text));
         }
     }
 
@@ -857,6 +879,50 @@ mod tests {
             matches!(children.first(), Some(Inline::Run(r)) if r.text.trim() == "click me"),
             "the link wraps the run it covers"
         );
+    }
+
+    // ── gap-aware spacing inside a paragraph (split-word multi-font runs) ─────
+
+    /// Flatten a paragraph's inline runs (incl. link children) into one string.
+    fn flatten(p: &Paragraph) -> String {
+        fn walk(inls: &[Inline], out: &mut String) {
+            for i in inls {
+                match i {
+                    Inline::Run(r) => out.push_str(&r.text),
+                    Inline::LineBreak => out.push(' '),
+                    Inline::Link { children, .. } => walk(children, out),
+                    Inline::Image(_) => {}
+                }
+            }
+        }
+        let mut s = String::new();
+        walk(&p.runs, &mut s);
+        s
+    }
+
+    #[test]
+    fn split_word_runs_get_no_spurious_space_but_real_gaps_keep_theirs() {
+        // A dense form splits one word across embedded fonts: "relatif" arrives as
+        // "rel"+"at"+"if" with each piece butting the previous (gap ≈ 0). A clear
+        // gap separates "relatif" from "au". Expect "relatif au", never
+        // "rel at if au" (and never "relatifau").
+        let rel = run("rel", 72.0, 700.0, 18.0); // x 72..90
+        let at = run("at", 90.0, 700.0, 12.0); // butts → join
+        let iff = run("if", 102.0, 700.0, 12.0); // butts → join → "relatif"
+        let au = run("au", 130.0, 700.0, 12.0); // gap 130-114 = 16 → space
+        let lines = lines_of(&[rel, at, iff, au]);
+        assert_eq!(lines.len(), 1, "one baseline band → one line");
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let ctx = ParaContext {
+            body: 12.0,
+            ..ParaContext::default()
+        };
+        let mut ids = IdGen::default();
+        let block = build_paragraph_styled(&refs, &ctx, &mut ids, Rect::new);
+        let BlockKind::Paragraph(p) = block.kind else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(flatten(&p), "relatif au");
     }
 
     #[test]

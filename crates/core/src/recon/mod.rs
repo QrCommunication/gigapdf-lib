@@ -92,6 +92,32 @@ impl ReconRun {
     }
 }
 
+/// Whether two horizontally-adjacent runs (on the same baseline band) join into
+/// one word **without** a synthesized space, given the previous run's right edge,
+/// the current run's left edge, and a representative line height.
+///
+/// A dense form interleaves several embedded fonts **per word** (a Type1 face for
+/// some glyphs, a CID face for others), so a single logical word arrives as
+/// several runs (`"ENFANT"` + `"S"`). Joining every adjacent run with a space
+/// shreds words (`"ENFANT S MINEUR S"`); never spacing fuses real words
+/// (`"DESENFANTS"`). The decision is therefore **gap-based**, mirroring the
+/// already-correct line builder in [`crate::content::group_lines`]:
+///
+///  - a tiny gap in a band around zero (`-0.5·h ..= 0.25·h`) is normal intra-word
+///    kerning or a glyph drawn from another font butting the previous one → join;
+///  - a clear positive gap is a real inter-word space → don't join;
+///  - a large negative gap means the run wrapped back to the left margin (a new
+///    visual line inside the same baseline-row cluster) → still a boundary, don't
+///    join (else a wrapped opener fuses onto the previous line's tail).
+///
+/// `prev_right`/`cur_x` are PDF user-space X (points); `height` is a positive
+/// representative font extent (the larger of the two runs' heights).
+pub(crate) fn runs_join(prev_right: f64, cur_x: f64, height: f64) -> bool {
+    let h = height.max(1.0);
+    let gap = cur_x - prev_right;
+    gap <= h * 0.25 && gap >= -h * 0.5
+}
+
 /// Median of a slice, robust to a few outliers in a way the mean is not. Empty
 /// → `fallback`. Mutates (sorts) the input for an in-place selection.
 pub(crate) fn median(values: &mut [f64], fallback: f64) -> f64 {
