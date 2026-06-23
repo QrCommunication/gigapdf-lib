@@ -33,11 +33,12 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Read & write running headers and footers](#headers-and-footers)
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
 - [Image → PDF (single & batch)](#image--pdf)
+- [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
 - [Merge multiple PDFs](#merge-multiple-pdfs)
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
 - [Fill and create form fields](#fill-and-create-form-fields)
 - [Annotate (highlight, note, ink, stamp)](#annotate)
-- [Sign with a PKCS#12 identity](#sign-with-a-pkcs12-identity)
+- [Sign a PDF (B · B-T · LTV)](#sign-a-pdf-b--b-t--ltv) — *B-T: v0.70.0 · LTV: v0.71.0*
 - [Encrypt with AES-256](#encrypt-with-aes-256)
 - [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
 - [Render a page without a specific element (live-overlay editing)](#render-a-page-without-a-specific-element-live-overlay-editing) — *v0.58.0*
@@ -298,6 +299,41 @@ const album = giga.mergePdfs(pages); // one PDF, one image per page
 
 ---
 
+## Stamp an image watermark
+
+> **Available in v0.69.0.** For a *text* watermark, draw rotated, faded text with
+> [`addStandardText`](#styled-text) (`opacity` + `rotationDeg`) on each page.
+
+`addImageWatermark(data, opts?)` stamps a raster image across pages — e.g. a logo
+or a "DRAFT" badge. The source is auto-detected (**PNG / JPEG / WebP / GIF /
+AVIF**), embedded **once** and referenced on every target page, so a 50-page
+watermark adds one image XObject, not fifty. It returns `false` if the bytes
+aren't a decodable image.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Centred, faded logo on every page (defaults: anchor "center", opacity 0.25).
+doc.addImageWatermark(logoPng, { width: 200 }); // height keeps aspect when omitted
+
+// …or a tiled, rotated badge on pages 1–3 only.
+doc.addImageWatermark(draftPng, {
+  pages: [1, 2, 3],        // 1-based; omit or [] = every page
+  anchor: "center",        // or a corner: "top-left" | "top-right" | "bottom-left" | "bottom-right"
+  width: 120,              // points; height follows aspect
+  rotationDeg: 45,         // rotate about the image centre
+  opacity: 0.15,
+  tile: true,              // repeat across the page…
+  offsetX: 40,             // …with these gaps between tiles (in non-tile mode: anchor nudge)
+  offsetY: 40,
+});
+
+const stamped = doc.save();
+doc.close();
+```
+
+---
+
 ## Merge multiple PDFs
 
 `mergePdfs` concatenates a list of PDFs into one, in order:
@@ -464,36 +500,131 @@ doc.close();
 
 ---
 
-## Sign with a PKCS#12 identity
+## Sign a PDF (B · B-T · LTV)
 
-Sign with a CA-issued / eIDAS certificate and its RSA key from a `.p12`/`.pfx`,
-imported natively (no node-forge / @signpdf). `signP12` **throws** a single
-generic error on a wrong password, malformed file, unsupported cipher, or missing
-certificate.
+Four PAdES levels, escalating in long-term assurance — all produce a CMS
+signature in a `/Sig` field over a `/ByteRange`-patched PDF, **entirely in-engine**
+(no node-forge / @signpdf / pdf-lib). `sign` / `signP12` are synchronous;
+`signTimestamped` / `signLtv` are **`async`** because they need network round
+trips, performed by the SDK through a **host-fetch two-phase model** (the WASM core
+has no network: the engine emits a request blob, the SDK does the HTTP, the engine
+embeds the response). All three of `signP12` / `signTimestamped` / `signLtv`
+**throw** a single generic `Error` on failure (anti-enumeration).
+
+| Level | Method | What it adds |
+|-------|--------|--------------|
+| **B** (self-signed) | `sign(fields, random, keyBits?)` | ephemeral digital ID, `adbe.pkcs7.detached` |
+| **B** (PKCS#12) | `signP12(p12, password, opts?)` | a real CA / eIDAS identity from a `.p12`/`.pfx` |
+| **B-T** | `signTimestamped(opts)` *(async)* | + an RFC 3161 **trusted timestamp** in the SignerInfo |
+| **B-LT / B-LTA** | `signLtv(opts)` *(async)* | B-T + a `/DSS` (cert chain + OCSP/CRL); B-LTA adds an archival `/DocTimeStamp` |
+
+### Level B — PKCS#12 or self-signed
 
 ```ts
 const doc = giga.open(pdfBytes);
 
+// (a) PKCS#12: a CA-issued / eIDAS cert + RSA key, imported natively.
 const signed = doc.signP12(p12Bytes, "p12-password", {
   name: "Jane Doe",
   reason: "I approve this document",
-  date: "D:20260619120000Z",   // /M — a PDF date string
+  date: "D:20260619120000Z",   // /M — a PDF date string (the engine has no clock)
   location: "Paris",
   contactInfo: "jane@example.com",
 });
+
+// (b) …or an ephemeral, self-signed digital ID (no certificate file).
+//     fields = "name\treason\tdate\tnotBefore\tnotAfter"; ≥ 256 host-entropy bytes.
+const fields = "Jane Doe\tApproved\tD:20260619120000Z\t260619000000Z\t360619000000Z";
+const ephemeral = doc.sign(fields, crypto.getRandomValues(new Uint8Array(256)));
+
 doc.close();
-// `signed` is the signed PDF bytes.
 ```
 
-For an **ephemeral, self-signed** digital ID instead (no certificate file), use
-`sign(fields, random, keyBits?)` with `fields =
-"name\treason\tdate\tnotBefore\tnotAfter"` and ≥ 256 host-entropy bytes:
+### Level B-T — trusted timestamp (PAdES-B-T)
+
+`signTimestamped` adds an **RFC 3161 timestamp** from a TSA (here FreeTSA), proving
+the signature existed at a verifiable time. By default the SDK POSTs the
+`TimeStampReq` via the exported `defaultTsaPost`. The signing identity is the
+`p12` + `password` when supplied, otherwise the self-signed path (`random` +
+`notBefore` / `notAfter`).
 
 ```ts
-const fields = "Jane Doe\tApproved\tD:20260619120000Z\t260619000000Z\t360619000000Z";
-const random = crypto.getRandomValues(new Uint8Array(256));
-const ephemeral = doc.sign(fields, random);
+import { defaultTsaPost } from "@qrcommunication/gigapdf-lib";
+
+const doc = giga.open(pdfBytes);
+
+const signed = await doc.signTimestamped({
+  p12: p12Bytes,
+  password: "p12-password",
+  name: "Jane Doe",
+  reason: "Approved",
+  date: "D:20260619120000Z",
+  tsaUrl: "https://freetsa.org/tsr",
+  // Default fetch (no allow-list) — fine for a trusted, hard-coded TSA URL:
+  tsaFetch: defaultTsaPost,
+});
+doc.close();
+// `signed` is the PAdES-B-T PDF bytes.
 ```
+
+> **SSRF — host-controlled fetch.** The TSA URL here is yours, so `defaultTsaPost`
+> is safe. If a URL ever comes from untrusted input, pass your own `tsaFetch` that
+> validates it first:
+>
+> ```ts
+> tsaFetch: async (req, url) => {
+>   assertAllowed(url);                       // your allow-list / proxy
+>   const r = await fetch(url, { method: "POST",
+>     headers: { "Content-Type": "application/timestamp-query" }, body: req });
+>   return new Uint8Array(await r.arrayBuffer());
+> },
+> ```
+
+### Level B-LT / B-LTA — long-term validation (PAdES-LTV)
+
+`signLtv` produces a B-T signature **and then embeds the validation material** — a
+`/DSS` (Document Security Store) carrying the certificate chain plus OCSP/CRL
+revocation responses — so the signature keeps verifying long after its
+certificates expire or are revoked. The engine computes *which* OCSP/CRL endpoints
+to query **from the certificates' AIA / CRL-DP extensions**; the SDK fetches them
+(unreachable responders are skipped). With `archiveTimestamp: true` it also adds a
+`/DocTimeStamp` over the whole updated file (**B-LTA**, the renewable archival
+anchor — a second TSA round trip).
+
+```ts
+import { defaultTsaPost, defaultOcspPost, defaultCrlGet } from "@qrcommunication/gigapdf-lib";
+
+const doc = giga.open(pdfBytes);
+
+const ltv = await doc.signLtv({
+  p12: p12Bytes,
+  password: "p12-password",
+  name: "Jane Doe",
+  reason: "Approved",
+  date: "D:20260619120000Z",
+  tsaUrl: "https://freetsa.org/tsr",
+  archiveTimestamp: true,           // false → B-LT; true → B-LTA (extra /DocTimeStamp)
+  // Default HTTP for TSA + OCSP + CRL (no allow-list — trusted endpoints only):
+  tsaFetch: defaultTsaPost,
+  revocationFetch: defaultOcspPost, // OCSP: POST application/ocsp-request
+  crlFetch: defaultCrlGet,          // CRL: GET the distribution point
+});
+doc.close();
+// `ltv` is the PAdES-B-LTA PDF bytes — long-term verifiable.
+```
+
+> **SSRF (NON-NEGOTIABLE for LTV).** Unlike the TSA URL, the **OCSP/CRL URLs are
+> read from the signing certificate**, so a malicious certificate could point them
+> at an internal host. The engine only computes *which* URLs to fetch — the host
+> decides *whether* to. A service that signs untrusted input MUST replace the
+> default `revocationFetch` / `crlFetch` with validating fetchers:
+>
+> ```ts
+> revocationFetch: async (req, url) => { assertPublicHttps(url); /* …POST… */ },
+> crlFetch:        async (url)      => { assertPublicHttps(url); /* …GET…  */ },
+> ```
+>
+> A self-signed identity (no AIA / CRL-DP) simply yields a `/DSS/Certs`-only store.
 
 ---
 

@@ -68,7 +68,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 | **Annotations** | Highlight, underline, strike-out, squiggly, free-text, square, line, ink, sticky note, stamp, link; rich read-back metadata; **flatten** |
 | **Forms (AcroForm)** | Text/checkbox/radio/combo/list/signature fields — **read · fill · create** (build widgets from scratch with appearance streams + `NeedAppearances`) |
 | **Pages** | Rotate, delete, move, extract, merge, resize, insert, copy; bookmarks/outline; metadata; embedded-file attachments |
-| **Security** | Encrypt/permissions, **self-signed digital signature** (RSA/X.509/CMS), **PKCS#12 signing** (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **true redaction** (delete from stream) + **`redactPii`** *(v0.52.4)* — irreversible redaction that also **erases image pixels** (safe on scans/OCR) under an opaque mark |
+| **Security** | Encrypt/permissions; **digital signatures at four PAdES levels** — **B** self-signed (RSA/X.509/CMS), **B** PKCS#12 (import a user `.p12`/`.pfx` natively — PBES2 AES + PBES1 3DES/RC2, MAC-verified — no node-forge/@signpdf), **B-T** RFC 3161 trusted timestamp, **B-LT / B-LTA** long-term validation (`/DSS` with the cert chain + OCSP/CRL revocation material, optional archival `/DocTimeStamp`) — the host fetches TSA/OCSP/CRL (pure-data two-phase, no network in the WASM core); **true redaction** (delete from stream) + **`redactPii`** *(v0.52.4)* — irreversible redaction that also **erases image pixels** (safe on scans/OCR) under an opaque mark |
 | **Render** | Rasterize a page to PNG (vector + TrueType/CFF glyphs + images + **OpenType shaping**: GPOS marks, GSUB contextual, Arabic joining), **without its text** (`renderPageNoText`) or **omitting specific elements** (`renderPageExcluding`) for live-overlay editing; **run highlight** (character background) painted across PDF/HTML/Office; **non-Device colorspaces** (Separation/ICCBased/Pattern fills) resolved; native image codecs — encode/decode PNG · JPEG · **WebP (incl. VP8L lossless)**, decode **GIF (multi-frame)** + **AVIF (AV1 intra, multi-tile)** + **SVG (incl. `<text>`)**; alpha-correct resize |
 | **Text intelligence** | Font-aware extraction, **structured text** (reading-order lines + boxes), **full-text search** with highlight boxes |
 | **OCR** | **`gigapdf-ocr-rten`** crate (host-side) — **PaddleOCR PP-OCR** (DBNet detect + SVTR/CRNN recognize) on **RTen**, a **pure-Rust ONNX runtime (no C++, no Tesseract)**. 13 printed languages incl. **Hebrew** (own model) + Arabic (RTL), CJK, Cyrillic, Devanagari, Tamil/Telugu/Kannada, Latin — with **automatic per-line script selection** — **plus opt-in Latin handwriting** (our own trained CRNN — IAM/RIMES/…). State-of-the-art (PaddleOCR beats Tesseract on most scripts) |
@@ -80,7 +80,7 @@ performs Google-Fonts downloads). Everything else is in the engine.
 | **Archival** | **PDF/A-2b** metadata (XMP + sRGB OutputIntent + ID) |
 | **Fonts** | Draw **and edit** real text in **every font source & any font file** — built-in **base-14 standard fonts** (no embedding), any family / **Google Font** (1951-family catalog + URL builder + **TrueType *and* OpenType-CFF embedding**: glyf→Type0/CIDFontType2+FontFile2, `.otf`/`OTTO`→Type0/CIDFontType0+FontFile3, Identity-H + full widths + ToUnicode), and the **document's own embedded faces** (`embeddedFonts` + `extractFont` → re-embed). `addText` **and** font-aware `replaceText` resolve any face's char→glyph map (`FontFile2`/`FontFile3`); needed-font detection |
 
-All of it is exercised by `cargo test` (**1198 tests**, all green, `clippy`
+All of it is exercised by `cargo test` (**1262 tests**, all green, `clippy`
 clean — image codecs validated bit-exact against reference decoders, e.g. AVIF
 vs `dav1d`), a Node WASM smoke test (end-to-end, all green), and **validated
 externally**: generated Office files (DOCX/PPTX/XLSX **and ODT/ODS/ODP**) open
@@ -170,9 +170,15 @@ let mut doc = Document::open(&bytes)?;
 let docx = doc.to_docx();            // PDF → editable Word
 let pdf  = gigapdf_core::convert::reverse::txt_to_pdf("Hello\nWorld"); // text → PDF
 doc.embed_truetype_font("Roboto", &ttf)?; // host-downloaded font
-let signed = doc.sign(&signer, "Me", "Approval", "D:20260614120000Z")?;
+let signed = doc.sign(&signer, "Me", "Approval", "D:20260614120000Z")?; // B (self-signed)
 let out = doc.save();
 ```
+
+> Signing comes in **four PAdES levels** — **B** (self-signed or PKCS#12), **B-T**
+> (RFC 3161 timestamp), and **B-LT / B-LTA** (long-term validation: `/DSS` +
+> OCSP/CRL, optional archival timestamp). From the SDK: `doc.signP12`,
+> `doc.signTimestamped`, `doc.signLtv` — see the
+> [signing recipes](docs/COOKBOOK.md#sign-a-pdf-b--b-t--ltv) in the Cookbook.
 
 ### Browser / Node (WebAssembly)
 

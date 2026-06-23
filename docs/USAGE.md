@@ -445,16 +445,94 @@ const enc = callBuffer((lp) =>
   ex.gp_save_encrypted(handle, pw.ptr, pw.len, owner.ptr, owner.len, id.ptr, id.len, kPtr, key.length, 2, -44, lp));
 freeArg(pw); freeArg(owner); freeArg(id); ex.gp_free(kPtr, key.length);
 
-// Self-signed digital signature — host supplies random bytes for key generation
-const fields = strArg("Signer\tReason\tD:20260614120000Z\t260614000000Z\t360614000000Z");
-const rand = crypto.getRandomValues(new Uint8Array(256));
-const rPtr = toWasm(rand);
-const signed = callBuffer((lp) => ex.gp_sign(handle, fields.ptr, fields.len, rPtr, rand.length, 512, lp));
-ex.gp_free(rPtr, rand.length); freeArg(fields);
-
 // PDF/A-2b archival metadata
 const pdfa = callBuffer((lp) => ex.gp_to_pdfa(handle, lp));
 ```
+
+### 9a. Digital signatures — four PAdES levels
+
+Every level produces a CMS signature in a `/Sig` field over a `/ByteRange`-patched
+PDF, **entirely in-engine** (no node-forge / @signpdf / pdf-lib). Two levels are a
+single synchronous call; **B-T** and **LTV** need network round trips, and since
+the WASM core has **no network**, they run a **pure-data two-phase flow**: the
+engine emits a request blob, *your host* performs the HTTP, then the engine
+embeds the response. Most hosts use the SDK (`signP12` / `signTimestamped` /
+`signLtv`, see [COOKBOOK.md](COOKBOOK.md#sign-a-pdf-b--b-t--ltv)); the raw ABI is
+below.
+
+```js
+// Level B — self-signed (ephemeral digital ID). Host supplies entropy for the
+// RSA keygen. fields = "name\treason\tdate\tnotBefore\tnotAfter".
+const fields = strArg("Signer\tReason\tD:20260614120000Z\t260614000000Z\t360614000000Z");
+const rand = crypto.getRandomValues(new Uint8Array(256));
+const rPtr = toWasm(rand);
+const signedB = callBuffer((lp) => ex.gp_sign(handle, fields.ptr, fields.len, rPtr, rand.length, 2048, lp));
+ex.gp_free(rPtr, rand.length); freeArg(fields);
+
+// Level B — PKCS#12 (a real CA/eIDAS .p12/.pfx, imported natively). Returns 0 on
+// a bad password / malformed file / unsupported cipher (anti-enumeration).
+const p12Ptr = toWasm(p12Bytes), pass = strArg("p12-password");
+const flds = strArg("Jane Doe\tApproved\tD:20260614120000Z");
+const signedP12 = callBuffer((lp) =>
+  ex.gp_sign_p12(handle, p12Ptr, p12Bytes.length, pass.ptr, pass.len, flds.ptr, flds.len, lp));
+ex.gp_free(p12Ptr, p12Bytes.length); freeArg(pass); freeArg(flds);
+```
+
+**B-T (timestamped, RFC 3161).** The engine builds the signature and returns a DER
+`TimeStampReq`; the host POSTs it to the TSA, then the engine embeds the returned
+`TimeStampResp` in the `id-aa-timeStampToken` unsigned attribute:
+
+```js
+// Phase 1: prepare → DER TimeStampReq. (Same p12+fields inputs as gp_sign_p12.)
+const req = callBuffer((lp) =>
+  ex.gp_sign_prepare_tsa(handle, p12Ptr, p12Bytes.length, pass.ptr, pass.len, flds.ptr, flds.len, lp));
+
+// Phase 2 (host HTTP): POST the request to the TSA — application/timestamp-query.
+const resp = new Uint8Array(await (await fetch("https://freetsa.org/tsr", {
+  method: "POST", headers: { "Content-Type": "application/timestamp-query" }, body: req,
+})).arrayBuffer());
+
+// Phase 3: embed the TimeStampResp → the B-T signed PDF.
+const tPtr = toWasm(resp);
+const signedBT = callBuffer((lp) => ex.gp_sign_finish_tsa(handle, tPtr, resp.length, lp));
+ex.gp_free(tPtr, resp.length);
+```
+
+**B-LT / B-LTA (long-term validation).** After a B-T signature, the engine reports
+which OCSP/CRL URLs to fetch — taken **from the signing certificate chain's AIA /
+CRL-DP extensions**. The host fetches each, the engine stamps a `/DSS` (Document
+Security Store: `/Certs` + `/OCSPs` + `/CRLs` + `/VRI`), and `archiveTimestamp`
+optionally adds a `/DocTimeStamp` over the whole file (B-LTA, renewable archival).
+
+```js
+// Start from a B-T signed PDF (the `signedBT` bytes above).
+const sigPtr = toWasm(signedBT);
+const nonce = strArg(""); // optional OCSP nonce
+const targetsJson = dec.decode(callBuffer((lp) =>
+  ex.gp_ltv_targets(sigPtr, signedBT.length, nonce.ptr, nonce.len, lp)));
+const targets = JSON.parse(targetsJson); // { ocsp: [{ url, req }], crl: [{ url }] }
+
+// Host HTTP: fetch each (skip unreachable — the /DSS is built from what resolves).
+//   ⚠ SSRF: these URLs come from the CERTIFICATE, so a malicious cert can point
+//   them at an internal host. A service exposing signing to untrusted input MUST
+//   allow-list every url before fetching.
+const ocsps = []; // raw OCSPResponse bytes, one per resolved target
+const crls  = []; // raw CertificateList (CRL) bytes, one per resolved target
+// …populate via your SSRF-gated fetch (POST application/ocsp-request / GET CRL)…
+
+const certs = strArg("[]"); // extra chain certs as needed
+const oP = toWasm(concatLenPrefixed(ocsps)), cP = toWasm(concatLenPrefixed(crls));
+const ltv = callBuffer((lp) =>
+  ex.gp_apply_dss(sigPtr, signedBT.length, certs.ptr, certs.len, oP, /*…*/, cP, /*…*/, lp));
+// Archival timestamp (B-LTA): gp_doc_timestamp_prepare → host POST to TSA →
+// gp_doc_timestamp_finish, exactly like the B-T two-phase TSA flow above.
+```
+
+> **SSRF (NON-NEGOTIABLE).** For B-T the TSA URL is host-chosen, but for **LTV the
+> OCSP/CRL URLs are derived from the certificate** — never fetch them blindly. The
+> engine only computes *which* URLs to fetch; the host decides *whether* to (and
+> must validate them against an allow-list / proxy / auth). The SDK's `tsaFetch` /
+> `revocationFetch` / `crlFetch` hooks exist for exactly this.
 
 ## 9b. Running headers & footers
 
