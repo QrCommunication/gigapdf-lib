@@ -453,6 +453,7 @@ fn char_style(style: &Style) -> CharStyle {
         underline: style.underline,
         strike: style.strike,
         color: Some(style.color),
+        background: None,
         vertical_align: crate::model::VAlign::Baseline,
     }
 }

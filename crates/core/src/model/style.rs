@@ -57,6 +57,10 @@ pub struct CharStyle {
     pub strike: bool,
     /// RGB fill colour, components `0.0..=1.0`. `None` = default (black).
     pub color: Option<[f64; 3]>,
+    /// RGB text-highlight / run background, components `0.0..=1.0`. `None` = no
+    /// highlight. Mirrors a word-processor's text highlight (`w:highlight`/
+    /// `w:shd` in DOCX, `fo:background-color` in ODF).
+    pub background: Option<[f64; 3]>,
     pub vertical_align: VAlign,
 }
 

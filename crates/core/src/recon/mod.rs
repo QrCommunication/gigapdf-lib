@@ -194,6 +194,7 @@ pub(crate) fn char_style(style: &TextStyle, size_pt: f64) -> CharStyle {
         underline: false,
         strike: false,
         color: style.style_color(),
+        background: None,
         vertical_align: crate::model::VAlign::Baseline,
     }
 }

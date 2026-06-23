@@ -36,6 +36,10 @@ pub struct SheetRow {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SheetCell {
     pub value: CellValue,
+    /// The cell's formula expression without the leading `=` (e.g. `"SUM(A1:A9)"`),
+    /// as authored in the source (`<f>` in XLSX). `None` ⇒ a literal cell. The
+    /// cached evaluated result is kept in [`value`](SheetCell::value) for display.
+    pub formula: Option<String>,
     /// Spreadsheet number format code (e.g. `"0.00"`, `"yyyy-mm-dd"`).
     pub number_format: Option<String>,
     /// RGB cell background, components `0.0..=1.0`. `None` = no fill.

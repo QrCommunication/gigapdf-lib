@@ -338,6 +338,7 @@ impl Writer {
         self.k_bool("underline", c.underline);
         self.k_bool("strike", c.strike);
         self.k_opt_rgb("color", &c.color);
+        self.k_opt_rgb("background", &c.background);
         self.k_str("valign", valign_tag(c.vertical_align));
         self.obj_close();
     }
@@ -827,6 +828,11 @@ impl Writer {
         self.obj_open();
         self.key("value");
         self.cell_value(&c.value);
+        self.key("formula");
+        match &c.formula {
+            Some(f) => self.str_val(f),
+            None => self.null(),
+        }
         self.key("number_format");
         match &c.number_format {
             Some(f) => self.str_val(f),
@@ -1406,6 +1412,7 @@ impl<'a> Reader<'a> {
                 "underline" => c.underline = r.bool()?,
                 "strike" => c.strike = r.bool()?,
                 "color" => c.color = r.opt_rgb()?,
+                "background" => c.background = r.opt_rgb()?,
                 "valign" => c.vertical_align = parse_valign(&r.string()?)?,
                 _ => return None,
             }
@@ -1966,6 +1973,7 @@ impl<'a> Reader<'a> {
         self.object(|r, k| {
             match k {
                 "value" => c.value = r.cell_value()?,
+                "formula" => c.formula = r.opt_string()?,
                 "number_format" => c.number_format = r.opt_string()?,
                 "fill" => c.fill = r.opt_rgb()?,
                 "style" => c.style = r.char_style()?,
@@ -2247,6 +2255,7 @@ mod tests {
                 underline: false,
                 strike: false,
                 color: None,
+                background: None,
                 vertical_align: VAlign::Baseline,
             },
             source_index: Some(0),
@@ -2262,6 +2271,7 @@ mod tests {
                 underline: true,
                 strike: true,
                 color: blue,
+                background: Some([1.0, 1.0, 0.0]),
                 vertical_align: VAlign::Super,
             },
             source_index: None,
@@ -2402,6 +2412,7 @@ mod tests {
                         cells: vec![
                             SheetCell {
                                 value: CellValue::Text("Name".to_string()),
+                                formula: None,
                                 number_format: None,
                                 fill: Some([0.8, 0.8, 1.0]),
                                 style: CharStyle {
@@ -2417,6 +2428,7 @@ mod tests {
                             },
                             SheetCell {
                                 value: CellValue::Number(1234.56),
+                                formula: Some("SUM(A1:A9)".to_string()),
                                 number_format: Some("0.00".to_string()),
                                 fill: None,
                                 style: CharStyle::default(),

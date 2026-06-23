@@ -235,6 +235,31 @@ fn hex_to_rgb_f64(s: &str) -> Option<[f64; 3]> {
     hex6_to_rgb(s).map(|[r, g, b]| [r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0])
 }
 
+/// Map a DOCX `w:highlight@val` named colour (ECMA-376 §17.18.40) to its 6-hex
+/// equivalent (no `#`). `none`/unknown ⇒ `None`. The 16 named highlight colours
+/// are fixed by the spec, so the mapping is exact and dependency-free.
+fn highlight_color(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "yellow" => "FFFF00",
+        "green" => "00FF00",
+        "cyan" => "00FFFF",
+        "magenta" => "FF00FF",
+        "blue" => "0000FF",
+        "red" => "FF0000",
+        "darkBlue" => "000080",
+        "darkCyan" => "008080",
+        "darkGreen" => "008000",
+        "darkMagenta" => "800080",
+        "darkRed" => "800000",
+        "darkYellow" => "808000",
+        "darkGray" => "808080",
+        "lightGray" => "C0C0C0",
+        "black" => "000000",
+        "white" => "FFFFFF",
+        _ => return None, // "none" and any unrecognised token ⇒ no highlight
+    })
+}
+
 /// Derive a [`CharStyle`] from a recovered [`RunStyle`]. The display family name
 /// is kept verbatim; the portable generic class is inferred by reusing
 /// [`super::style::parse_base_font`] (which classifies serif/sans/mono from a
@@ -253,8 +278,9 @@ fn run_char_style(run: &RunStyle) -> CharStyle {
         bold: run.bold,
         italic: run.italic,
         underline: run.underline,
-        strike: false,
+        strike: run.strike,
         color: run.color.as_deref().and_then(hex_to_rgb_f64),
+        background: run.highlight.as_deref().and_then(hex_to_rgb_f64),
         vertical_align: model::VAlign::Baseline,
     }
 }
@@ -334,8 +360,18 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 
     let mut blocks = Vec::new();
     let mut counters = ListCounters::default();
-    docx_walk_model(&mut Xml::new(&doc), &ctx, &mut blocks, &mut counters, None);
-    flow_document(blocks, page_geometry(geom))
+    let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
+    docx_walk_model(
+        &mut Xml::new(&doc),
+        &ctx,
+        &mut blocks,
+        &mut counters,
+        &mut resources,
+        None,
+    );
+    let mut document = flow_document(blocks, page_geometry(geom));
+    document.resources.images = resources;
+    document
 }
 
 /// Recursive DOCX model walker (mirrors [`docx_walk`]). Emits `w:p`→paragraph/
@@ -345,6 +381,7 @@ fn docx_walk_model(
     ctx: &DocxCtx,
     out: &mut Vec<Block>,
     counters: &mut ListCounters,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
     stop: Option<&str>,
 ) {
     while let Some(tok) = x.next() {
@@ -352,9 +389,9 @@ fn docx_walk_model(
             Tok::Open(name, _, sc) => {
                 let ln = local(&name);
                 if ln == "p" && !sc {
-                    docx_paragraph_model(x, ctx, out, counters);
+                    docx_paragraph_model(x, ctx, out, counters, resources);
                 } else if ln == "tbl" && !sc {
-                    let table = docx_table_model(x, ctx);
+                    let table = docx_table_model(x, ctx, resources);
                     out.push(Block {
                         kind: BlockKind::Table(table),
                         ..Block::default()
@@ -412,6 +449,7 @@ fn docx_paragraph_model(
     ctx: &DocxCtx,
     out: &mut Vec<Block>,
     counters: &mut ListCounters,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
 ) {
     let mut heading: Option<u8> = None;
     let mut style_id: Option<String> = None;
@@ -422,6 +460,9 @@ fn docx_paragraph_model(
     let mut in_rpr = false;
     let mut in_ppr = false;
     let mut depth = 0i32;
+    // Open `<w:hyperlink>`: runs pushed while set are collected here and wrapped
+    // in an `Inline::Link` on the matching close (DOCX hyperlinks don't nest).
+    let mut link: Option<DocxLink> = None;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -502,6 +543,27 @@ fn docx_paragraph_model(
                             run.underline = true;
                         }
                     }
+                    "strike" | "dstrike" if in_rpr => {
+                        run.strike = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
+                    "highlight" if in_rpr => {
+                        // `w:highlight@val` is a named colour (yellow/green/…);
+                        // map it to hex, dropping `none`/unknown tokens.
+                        run.highlight = attr(&attrs, "val")
+                            .and_then(highlight_color)
+                            .map(|h| h.to_string());
+                    }
+                    "shd" if in_rpr => {
+                        // Run shading `w:shd@fill` (6-hex). `auto`/missing ⇒ none.
+                        // Set only when `highlight` hasn't already claimed it.
+                        if run.highlight.is_none() {
+                            if let Some(v) = attr(&attrs, "fill") {
+                                if v != "auto" && is_hex6(v) {
+                                    run.highlight = Some(v.to_ascii_uppercase());
+                                }
+                            }
+                        }
+                    }
                     "sz" if in_rpr => {
                         run.size_half_pt = attr(&attrs, "val").and_then(|v| v.parse().ok());
                     }
@@ -512,8 +574,33 @@ fn docx_paragraph_model(
                             }
                         }
                     }
-                    "tab" => push_run(&mut runs, &run, " "),
-                    "br" | "cr" => runs.push(Inline::LineBreak),
+                    "tab" => push_run(active_inlines(&mut runs, &mut link), &run, " "),
+                    "br" | "cr" => active_inlines(&mut runs, &mut link).push(Inline::LineBreak),
+                    // A hyperlink wraps its runs and points at a relationship
+                    // (external URL via `r:id`) or an in-document `w:anchor`.
+                    "hyperlink" if !sc => {
+                        link = Some(DocxLink {
+                            href: docx_link_target(ctx, &attrs),
+                            children: Vec::new(),
+                        });
+                    }
+                    // A drawing/picture → an inline image. Reuse the same blip
+                    // resolution + resource interning as the HTML path; the image
+                    // joins the current run flow (inside the link when one is open).
+                    "drawing" | "pict" | "object" if !sc => {
+                        let tag = local(&name).to_string();
+                        if let Some(img) =
+                            docx_drawing_model(x, ctx, resources, &tag)
+                        {
+                            active_inlines(&mut runs, &mut link).push(img);
+                        }
+                    }
+                    // A bare `a:blip` outside a `<w:drawing>` (legacy/VML).
+                    "blip" => {
+                        if let Some(img) = blip_image_ref(ctx, &attrs, resources) {
+                            active_inlines(&mut runs, &mut link).push(Inline::Image(img));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -524,14 +611,36 @@ fn docx_paragraph_model(
                     "pPr" => in_ppr = false,
                     "rPr" => in_rpr = false,
                     "r" => depth = (depth - 1).max(0),
+                    "hyperlink" => {
+                        // Close the link: fold its collected children into one
+                        // `Inline::Link` appended to the top-level run flow.
+                        if let Some(l) = link.take() {
+                            if !l.children.is_empty() {
+                                runs.push(Inline::Link {
+                                    href: l.href,
+                                    children: l.children,
+                                });
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
             Tok::Text(t) => {
                 if depth > 0 && !t.is_empty() {
-                    push_run(&mut runs, &run, &t);
+                    push_run(active_inlines(&mut runs, &mut link), &run, &t);
                 }
             }
+        }
+    }
+    // A hyperlink left open at paragraph end (malformed input): flush its
+    // children so no text is lost.
+    if let Some(l) = link.take() {
+        if !l.children.is_empty() {
+            runs.push(Inline::Link {
+                href: l.href,
+                children: l.children,
+            });
         }
     }
 
@@ -583,6 +692,105 @@ fn docx_paragraph_model(
         kind,
         ..Block::default()
     });
+}
+
+/// An in-progress DOCX `<w:hyperlink>` while its runs are being collected: the
+/// resolved target plus the inline children gathered until `</w:hyperlink>`.
+struct DocxLink {
+    href: model::LinkTarget,
+    children: Vec<Inline>,
+}
+
+/// The inline buffer currently receiving runs: the open hyperlink's children
+/// when one is being built, else the paragraph's top-level run list. Lets text /
+/// images / breaks land inside a link without duplicating the push logic.
+fn active_inlines<'a>(runs: &'a mut Vec<Inline>, link: &'a mut Option<DocxLink>) -> &'a mut Vec<Inline> {
+    match link {
+        Some(l) => &mut l.children,
+        None => runs,
+    }
+}
+
+/// Resolve a `<w:hyperlink>` to a model [`LinkTarget`]: an external URL via the
+/// relationship `r:id` (the same `word/_rels` table the HTML/image path uses), or
+/// an in-document jump for `w:anchor` (kept as page 0 — the model addresses pages,
+/// not named bookmarks, so an internal anchor lands on the document start rather
+/// than being dropped). Missing/blank ⇒ an empty URL.
+fn docx_link_target(ctx: &DocxCtx, attrs: &[(String, String)]) -> model::LinkTarget {
+    if let Some(rid) = attr(attrs, "id").filter(|v| !v.trim().is_empty()) {
+        if let Some(target) = ctx.rels.get(rid) {
+            return model::LinkTarget::Url(target.clone());
+        }
+    }
+    if attr(attrs, "anchor").is_some_and(|a| !a.trim().is_empty()) {
+        // In-document anchor: the model jumps by page index, so target the start.
+        return model::LinkTarget::Page(0);
+    }
+    model::LinkTarget::Url(String::new())
+}
+
+/// Decode a supported image zip entry, intern its bytes in `resources` under a
+/// content-hash key, and return an [`ImageRef`] to it (the inline-flow counterpart
+/// of [`image_block`]). `None` for a missing or unsupported (vector/legacy) entry.
+fn image_ref(
+    zip: &BTreeMap<String, Vec<u8>>,
+    key: &str,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<model::ImageRef> {
+    let mime = image_mime(key)?;
+    let bytes = zip.get(key)?.clone();
+    let hash = fnv1a(&bytes);
+    let format = mime.rsplit('/').next().unwrap_or("png").to_string();
+    resources
+        .entry(hash)
+        .or_insert(model::ImageResource { bytes, format });
+    Some(model::ImageRef {
+        resource: hash,
+        alt: None,
+    })
+}
+
+/// Resolve an `a:blip@r:embed`/`@r:link` to an interned [`ImageRef`] via the
+/// document relationships + media (the model counterpart of [`blip_img`]).
+fn blip_image_ref(
+    ctx: &DocxCtx,
+    attrs: &[(String, String)],
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<model::ImageRef> {
+    let rid = attr(attrs, "embed").or_else(|| attr(attrs, "link"))?;
+    let key = resolve_target("word", ctx.rels.get(rid)?);
+    image_ref(ctx.zip, &key, resources)
+}
+
+/// Consume a `<w:drawing>`/`<w:pict>`/`<w:object>` subtree (its open tag already
+/// seen) up to its matching close and resolve it to an inline image. Mirrors
+/// [`docx_drawing`] but lowers to a model [`Inline::Image`]: only the first
+/// `a:blip` (the picture itself) is interned; floating/anchored geometry is not
+/// modelled inline (the image still joins the run flow). `stop` is the local name
+/// of the enclosing element so the right close ends the scan.
+fn docx_drawing_model(
+    x: &mut Xml,
+    ctx: &DocxCtx,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+    stop: &str,
+) -> Option<Inline> {
+    let mut image: Option<model::ImageRef> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => {
+                if local(&name) == "blip" && image.is_none() {
+                    image = blip_image_ref(ctx, &attrs, resources);
+                }
+            }
+            Tok::Close(name) => {
+                if local(&name) == stop {
+                    break;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    image.map(Inline::Image)
 }
 
 /// Fill each run's unset character attributes from the resolved named style
@@ -652,7 +860,11 @@ fn docx_list_marker(ctx: &DocxCtx, num_id: Option<u32>, level: u32) -> (bool, Li
 /// Emit one `w:tbl` (open already consumed) as a model [`Table`], honouring
 /// `w:tblGrid` column widths and `w:gridSpan`/`w:vMerge` cell merges via
 /// [`Cell::col_span`]/[`Cell::row_span`]. Mirrors [`docx_table`].
-fn docx_table_model(x: &mut Xml, ctx: &DocxCtx) -> Table {
+fn docx_table_model(
+    x: &mut Xml,
+    ctx: &DocxCtx,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Table {
     let mut col_widths: Vec<f64> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut cur_row: Option<Vec<Cell>> = None;
@@ -670,7 +882,7 @@ fn docx_table_model(x: &mut Xml, ctx: &DocxCtx) -> Table {
                 } else if ln == "tr" && !sc {
                     cur_row = Some(Vec::new());
                 } else if ln == "tc" && !sc {
-                    let cell = docx_cell_model(x, ctx);
+                    let cell = docx_cell_model(x, ctx, resources);
                     if let (Some(row), Some(cell)) = (cur_row.as_mut(), cell) {
                         row.push(cell);
                     }
@@ -703,7 +915,11 @@ fn docx_table_model(x: &mut Xml, ctx: &DocxCtx) -> Table {
 /// Emit one `w:tc` cell (open already consumed) as a model [`Cell`], or `None`
 /// for a vertical-merge continuation (covered by the restart cell above).
 /// `w:gridSpan`→`col_span`, `w:vMerge="restart"`→`row_span = 2`.
-fn docx_cell_model(x: &mut Xml, ctx: &DocxCtx) -> Option<Cell> {
+fn docx_cell_model(
+    x: &mut Xml,
+    ctx: &DocxCtx,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<Cell> {
     let mut span = CellSpan::default();
     let mut in_tcpr = false;
     let mut blocks: Vec<Block> = Vec::new();
@@ -724,9 +940,11 @@ fn docx_cell_model(x: &mut Xml, ctx: &DocxCtx) -> Option<Cell> {
                         Some("restart") => span.v_merge_restart = true,
                         _ => span.v_merge_continue = true,
                     },
-                    "p" if !sc => docx_paragraph_model(x, ctx, &mut blocks, &mut counters),
+                    "p" if !sc => {
+                        docx_paragraph_model(x, ctx, &mut blocks, &mut counters, resources)
+                    }
                     "tbl" if !sc => {
-                        let table = docx_table_model(x, ctx);
+                        let table = docx_table_model(x, ctx, resources);
                         blocks.push(Block {
                             kind: BlockKind::Table(table),
                             ..Block::default()
@@ -828,10 +1046,12 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
     let mut cell_col = 0usize;
     let mut cell_type = String::new();
     let mut cell_text = String::new();
+    let mut cell_formula = String::new();
     let mut cell_bg: Option<[f64; 3]> = None;
     let mut cell_fmt: Option<String> = None;
     let mut in_cell = false;
     let mut in_value = false;
+    let mut in_formula = false;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -849,6 +1069,7 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                 "c" if in_sheet_data => {
                     in_cell = true;
                     cell_text.clear();
+                    cell_formula.clear();
                     cell_type = attr(&attrs, "t").unwrap_or("n").to_string();
                     cell_col = attr(&attrs, "r").map(col_of_ref).unwrap_or(0);
                     let style_idx = attr(&attrs, "s").and_then(|v| v.trim().parse::<usize>().ok());
@@ -864,22 +1085,33 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                     }
                 }
                 "v" | "t" if in_cell => in_value = true,
+                // `<f>` carries the formula expression as its text body. A
+                // self-closing `<f .../>` (shared-formula reference) has no body.
+                "f" if in_cell && !sc => in_formula = true,
                 _ => {}
             },
             Tok::Text(t) => {
-                if in_cell && in_value {
+                if in_cell && in_formula {
+                    cell_formula.push_str(&t);
+                } else if in_cell && in_value {
                     cell_text.push_str(&t);
                 }
             }
             Tok::Close(name) => match local(&name) {
                 "v" | "t" => in_value = false,
+                "f" => in_formula = false,
                 "c" => {
                     if in_cell {
                         let value = xlsx_cell_value(&cell_type, cell_text.trim(), shared);
+                        let formula = {
+                            let f = cell_formula.trim();
+                            (!f.is_empty()).then(|| f.to_string())
+                        };
                         row_cells.insert(
                             cell_col,
                             SheetCell {
                                 value,
+                                formula,
                                 number_format: cell_fmt.take(),
                                 fill: cell_bg.take(),
                                 style: CharStyle::default(),
@@ -2589,6 +2821,13 @@ struct RunStyle {
     bold: bool,
     italic: bool,
     underline: bool,
+    /// Strike-through from `w:strike`/`w:dstrike` (DOCX) — single and double
+    /// strike collapse to one strike in the model.
+    strike: bool,
+    /// Text-highlight / run shading as 6-hex (no `#`): `w:highlight@val` (a named
+    /// colour, mapped to hex) or `w:shd@fill` (already hex). `None` ⇒ no
+    /// background. Surfaced as the model run's [`CharStyle::background`].
+    highlight: Option<String>,
     size_half_pt: Option<f64>,
     color: Option<String>,
     /// Typeface name from `w:rFonts@ascii` (DOCX) / `a:latin@typeface` (PPTX) /
@@ -10088,5 +10327,191 @@ mod tests {
         let pdf = office_to_pdf(&odt).expect("odt converts");
         let text = norm(&opens(&pdf).to_text());
         assert!(text.contains("Alpha") && text.contains("Beta"), "{text}");
+    }
+
+    // ── DOCX → editable model (images / hyperlinks / strike / highlight) ──
+
+    /// All inline runs/images/links across the first section's top-level
+    /// paragraphs (descends one level into list-item paragraphs), for assertions.
+    fn model_first_section_inlines(doc: &Document) -> Vec<Inline> {
+        let mut out = Vec::new();
+        let mut visit = |para: &Paragraph| out.extend(para.runs.iter().cloned());
+        for block in &doc.sections[0].pages[0].blocks {
+            match &block.kind {
+                BlockKind::Paragraph(p) => visit(p),
+                BlockKind::Heading(h) => visit(&h.para),
+                BlockKind::List(l) => {
+                    for item in &l.items {
+                        for b in &item.blocks {
+                            if let BlockKind::Paragraph(p) = &b.kind {
+                                visit(p);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn docx_model_inline_image_lands_in_resources() {
+        // A `<w:drawing><a:blip>` in the model path → an `Inline::Image` whose
+        // resource is interned in `Document.resources` (the editor sees the image).
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z">
+  <w:body>
+    <w:p><w:r><w:t>Before</w:t></w:r></w:p>
+    <w:p><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId5" Type="image" Target="media/pic.png"/>
+</Relationships>"#;
+        let bytes = build_docx(doc, Some(rels), &[("word/media/pic.png", red_png())]);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        // Exactly one image inline, and its resource blob is present.
+        let inlines = model_first_section_inlines(&model);
+        let img = inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("an Inline::Image in the model");
+        assert!(
+            model.resources.images.contains_key(&img.resource),
+            "image bytes interned in the resource table"
+        );
+        assert_eq!(model.resources.images[&img.resource].format, "png");
+        assert!(!model.resources.images[&img.resource].bytes.is_empty());
+    }
+
+    #[test]
+    fn docx_model_hyperlink_becomes_link() {
+        // `<w:hyperlink r:id>` → `Inline::Link` with the URL resolved from rels,
+        // wrapping the run text.
+        let doc = r#"<w:document xmlns:w="x" xmlns:r="z">
+  <w:body>
+    <w:p>
+      <w:r><w:t>see </w:t></w:r>
+      <w:hyperlink r:id="rId9"><w:r><w:t>our site</w:t></w:r></w:hyperlink>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId9" Type="hyperlink" Target="https://example.com/" TargetMode="External"/>
+</Relationships>"#;
+        let bytes = build_docx(doc, Some(rels), &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        let inlines = model_first_section_inlines(&model);
+        let (href, children) = inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Link { href, children } => Some((href.clone(), children.clone())),
+                _ => None,
+            })
+            .expect("an Inline::Link in the model");
+        assert_eq!(href, model::LinkTarget::Url("https://example.com/".to_string()));
+        let link_text: String = children
+            .iter()
+            .filter_map(|c| match c {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(link_text, "our site");
+    }
+
+    #[test]
+    fn docx_model_strike_and_highlight() {
+        // `<w:strike>` → CharStyle.strike; `<w:highlight w:val="yellow">` →
+        // CharStyle.background (the named colour mapped to RGB).
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:r><w:rPr><w:strike/><w:highlight w:val="yellow"/></w:rPr><w:t>marked</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        let run = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text == "marked" => Some(r),
+                _ => None,
+            })
+            .expect("the 'marked' run");
+        assert!(run.style.strike, "strike-through carried into the model");
+        assert_eq!(
+            run.style.background,
+            Some([1.0, 1.0, 0.0]),
+            "yellow highlight → RGB background"
+        );
+    }
+
+    #[test]
+    fn docx_model_run_shading_sets_background() {
+        // `<w:shd w:fill>` run shading also populates the model background.
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p><w:r><w:rPr><w:shd w:val="clear" w:fill="00FF00"/></w:rPr><w:t>shaded</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let run = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text == "shaded" => Some(r),
+                _ => None,
+            })
+            .expect("the 'shaded' run");
+        assert_eq!(run.style.background, Some([0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn xlsx_model_preserves_formula_with_cached_value() {
+        // A `<c><f>SUM(A1:A2)</f><v>30</v></c>` cell: the model keeps the formula
+        // expression AND the cached numeric result (the display value).
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "xl/workbook.xml",
+            br#"<workbook><sheets><sheet name="Calc" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        z.add_stored(
+            "xl/worksheets/sheet1.xml",
+            br#"<worksheet><sheetData>
+              <row r="1"><c r="A1"><v>10</v></c></row>
+              <row r="2"><c r="A2"><v>20</v></c></row>
+              <row r="3"><c r="A3"><f>SUM(A1:A2)</f><v>30</v></c></row>
+            </sheetData></worksheet>"#,
+        );
+        let xlsx = z.finish();
+        let model = office_to_model(&xlsx).expect("xlsx → model");
+
+        let sheet = match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Sheet(sb) => &sb.sheets[0],
+            other => panic!("expected a Sheet block, got {other:?}"),
+        };
+        // Row index 2 (A3), column 0.
+        let cell = &sheet.rows[2].cells[0];
+        assert_eq!(
+            cell.formula.as_deref(),
+            Some("SUM(A1:A2)"),
+            "formula expression preserved"
+        );
+        assert_eq!(
+            cell.value,
+            model::CellValue::Number(30.0),
+            "cached result kept as the display value"
+        );
+        // A literal cell carries no formula (regression guard).
+        assert!(sheet.rows[0].cells[0].formula.is_none());
     }
 }
