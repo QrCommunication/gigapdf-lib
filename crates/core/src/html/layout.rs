@@ -822,6 +822,73 @@ impl Flow<'_> {
         )
     }
 
+    /// If `el` is a Mermaid flowchart container, lay the diagram out within
+    /// `avail_w`, push its vector + label fragments at the block's origin, and
+    /// return the `y` past it (top margin + diagram + bottom margin). Returns
+    /// `None` when `el` isn't a renderable Mermaid block, so the caller renders
+    /// it normally.
+    fn try_mermaid_block(
+        &mut self,
+        el: &Element,
+        style: &Style,
+        x: f64,
+        avail_w: f64,
+        y: f64,
+    ) -> Option<f64> {
+        let diagram =
+            super::diagram::try_build(el, style, avail_w.max(1.0), self.m)?;
+
+        // Honour the block's own vertical margins; centre the diagram in the
+        // available width when it's narrower (mermaid renders centred).
+        let top = y + style.margin.top;
+        let dx = x + ((avail_w - diagram.width).max(0.0)) / 2.0;
+
+        // The vector geometry (boxes + edges + arrow-heads) as one Svg fragment.
+        self.out.push(Abs {
+            z: 1,
+            zi: 0,
+            frag: Fragment::Svg {
+                x: dx,
+                y: top,
+                w: diagram.width,
+                h: diagram.height,
+                image: diagram.image,
+            },
+        });
+
+        // Centred labels on top (node titles + edge labels). Each label centre
+        // `(cx, cy)` is diagram-local; convert to absolute and back off by half
+        // the measured text width / ascent so the run is visually centred.
+        for label in &diagram.labels {
+            let mut lstyle = style.clone();
+            lstyle.font_size = label.font_size;
+            lstyle.bold = label.bold;
+            lstyle.font_weight = if label.bold { 700 } else { 400 };
+            lstyle.italic = false;
+            lstyle.underline = false;
+            lstyle.strike = false;
+            lstyle.color = [0.13, 0.13, 0.13];
+            let tw = self.m.width(&label.text, &lstyle);
+            // Text is positioned at its top-left; the paint layer draws from the
+            // baseline at `y + 0.8·font_size`, so lift the box by ~0.8·fs to
+            // centre the glyphs on `cy`.
+            let lx = dx + label.cx - tw / 2.0;
+            let ly = top + label.cy - label.font_size * 0.8;
+            self.out.push(Abs {
+                z: 1,
+                zi: 0,
+                frag: Fragment::Text {
+                    x: lx,
+                    y: ly,
+                    style: lstyle,
+                    text: label.text.clone(),
+                },
+            });
+        }
+
+        Some(top + diagram.height + style.margin.bottom)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn block(
         &mut self,
@@ -836,6 +903,14 @@ impl Flow<'_> {
     ) -> f64 {
         if style.display == Display::None {
             return y;
+        }
+        // Mermaid flowchart blocks (`<pre class="mermaid">`, `<div class="mermaid">`,
+        // `<pre><code class="language-mermaid">`) render as native vector diagrams.
+        // If the block is a Mermaid container whose source parses as a flowchart,
+        // emit the diagram and consume the block; otherwise fall through and the
+        // block renders exactly as before.
+        if let Some(next_y) = self.try_mermaid_block(el, style, x, avail_w, y) {
+            return next_y;
         }
         if el.tag == "table" {
             return self.table(el, style, x, avail_w, y, ancestors);

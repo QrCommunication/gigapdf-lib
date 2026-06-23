@@ -14,6 +14,7 @@
 //! are progressively added; block, inline and table flow are supported.
 
 pub mod css;
+pub mod diagram;
 pub mod dom;
 pub mod layout;
 pub mod model;
