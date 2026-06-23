@@ -3099,6 +3099,595 @@ fn doc_image(doc: &Document, key: u64) -> Option<Vec<u8>> {
     doc.resources.images.get(&key).map(|r| r.bytes.clone())
 }
 
+// ════════════════════════════════ MARKDOWN ════════════════════════════════════
+
+/// Serialize a [`Document`] to **GitHub-Flavored Markdown** — the inverse of the
+/// CommonMark/GFM importer ([`super::md_import`]).
+///
+/// Unlike the office/HTML exporters this produces *flowing prose Markdown*, not a
+/// positioned layout: each [`Heading`] becomes an ATX heading (`#`..`######`),
+/// paragraphs become text blocks with inline emphasis (`**bold**`, `*italic*`,
+/// `` `code` ``, `~~strike~~`, `<sup>`/`<sub>`), [`List`]s render as nested
+/// ordered/unordered (and task) lists, and [`Table`]s become GFM pipe tables with
+/// an alignment row. Document metadata is emitted as an optional YAML
+/// front-matter block.
+///
+/// Constructs **without a Markdown representation** are handled best-effort:
+/// images are content-addressed in the model (no URL), so they are linked to a
+/// stable extracted-asset filename (`image-{key}.{ext}`); vector [`Shape`]s have
+/// no textual form and are skipped; embedded sheets render as GFM tables and
+/// slides flatten with `---` rules between them. Footnotes and explicit heading
+/// anchors have no corresponding model node and are therefore not emitted.
+pub fn markdown_from_model(doc: &Document) -> String {
+    let mut out = String::new();
+    md_front_matter(&doc.meta, &mut out);
+
+    let w = MdWriter::new(&doc.resources);
+
+    // Header → body pages (rule-separated) → footer, mirroring the other
+    // model walkers' top-to-bottom traversal.
+    if let Some(header) = doc.sections.first().and_then(|s| s.header.as_ref()) {
+        w.blocks(header, &mut out);
+    }
+    let mut first_page = true;
+    for section in &doc.sections {
+        for page in &section.pages {
+            if !first_page && !page.blocks.is_empty() {
+                md_rule(&mut out); // page boundary → thematic break
+            }
+            if !page.blocks.is_empty() {
+                first_page = false;
+            }
+            w.blocks(&page.blocks, &mut out);
+        }
+    }
+    if let Some(footer) = doc.sections.first().and_then(|s| s.footer.as_ref()) {
+        w.blocks(footer, &mut out);
+    }
+
+    // Collapse any run of >2 blank lines and guarantee a single trailing newline.
+    md_tidy(out)
+}
+
+/// Threads the resource table through the walk so image references can resolve
+/// their stored format tag (→ filename extension).
+struct MdWriter<'a> {
+    resources: &'a crate::model::ResourceTable,
+}
+
+impl<'a> MdWriter<'a> {
+    fn new(resources: &'a crate::model::ResourceTable) -> Self {
+        MdWriter { resources }
+    }
+
+    /// A flat block list, each block separated by one blank line.
+    fn blocks(&self, blocks: &[Block], out: &mut String) {
+        for b in blocks {
+            self.block(b, out);
+        }
+    }
+
+    fn block(&self, block: &Block, out: &mut String) {
+        match &block.kind {
+            BlockKind::Heading(h) => self.heading(h, out),
+            BlockKind::Paragraph(p) => self.paragraph(p, out),
+            BlockKind::List(list) => {
+                self.list(list, 0, out);
+                out.push('\n'); // blank line after the list
+            }
+            BlockKind::Table(table) => self.table(table, out),
+            BlockKind::Image(img) => {
+                out.push_str(&self.image_md(img));
+                out.push_str("\n\n");
+            }
+            BlockKind::Shape(_) => {} // no Markdown representation for vector art
+            BlockKind::TextBox(tb) => self.blocks(&tb.blocks, out),
+            BlockKind::Sheet(sheet) => {
+                for s in &sheet.sheets {
+                    self.table(&sheet_to_table(s), out);
+                }
+            }
+            BlockKind::Slide(slides) => {
+                for (i, slide) in slides.slides.iter().enumerate() {
+                    if i > 0 {
+                        md_rule(out);
+                    }
+                    for ph in &slide.placeholders {
+                        self.block(&ph.block, out);
+                    }
+                    for sh in &slide.shapes {
+                        self.block(sh, out);
+                    }
+                }
+            }
+        }
+    }
+
+    fn heading(&self, h: &Heading, out: &mut String) {
+        let level = h.level.clamp(1, 6) as usize;
+        for _ in 0..level {
+            out.push('#');
+        }
+        out.push(' ');
+        let text = self.inlines(&h.para.runs);
+        // A heading must be a single line: fold any hard/soft breaks to spaces.
+        out.push_str(text.replace('\n', " ").trim_end());
+        out.push_str("\n\n");
+    }
+
+    fn paragraph(&self, p: &Paragraph, out: &mut String) {
+        let text = self.inlines(&p.runs);
+        let trimmed = text.trim_matches(|c| c == ' ' || c == '\t');
+        if trimmed.is_empty() {
+            return; // an empty paragraph contributes no Markdown
+        }
+        out.push_str(trimmed);
+        out.push_str("\n\n");
+    }
+
+    /// Render a list at nesting `level` (0 = top). Each item's first paragraph
+    /// (or heading) carries the marker; remaining item blocks are indented
+    /// continuation, and nested lists recurse with `level + 1`.
+    fn list(&self, list: &List, level: usize, out: &mut String) {
+        let indent = "    ".repeat(level); // 4 spaces per nesting level
+        for (i, item) in list.items.iter().enumerate() {
+            let marker = if list.ordered {
+                format!("{}.", i + 1)
+            } else {
+                "-".to_string()
+            };
+
+            // Build the leading text line from the item's first paragraph-like
+            // block; a leading task checkbox (`- [ ]`/`- [x]`) is detected from a
+            // `[ ] `/`[x] ` prefix the importer leaves on the text.
+            let mut rest = &item.blocks[..];
+            let lead = match item.blocks.first() {
+                Some(b) => match &b.kind {
+                    BlockKind::Paragraph(p) => {
+                        rest = &item.blocks[1..];
+                        self.inlines(&p.runs)
+                    }
+                    BlockKind::Heading(h) => {
+                        rest = &item.blocks[1..];
+                        self.inlines(&h.para.runs)
+                    }
+                    _ => String::new(),
+                },
+                None => String::new(),
+            };
+            let lead = lead.replace('\n', " ");
+            let lead = lead.trim();
+
+            out.push_str(&indent);
+            out.push_str(&marker);
+            out.push(' ');
+            out.push_str(lead);
+            out.push('\n');
+
+            // Remaining blocks of the item.
+            for b in rest {
+                match &b.kind {
+                    BlockKind::List(nested) => self.list(nested, level + 1, out),
+                    BlockKind::Paragraph(p) => {
+                        let t = self.inlines(&p.runs);
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            out.push_str(&indent);
+                            out.push_str("    ");
+                            out.push_str(&t.replace('\n', " "));
+                            out.push('\n');
+                        }
+                    }
+                    BlockKind::Image(img) => {
+                        out.push_str(&indent);
+                        out.push_str("    ");
+                        out.push_str(&self.image_md(img));
+                        out.push('\n');
+                    }
+                    _ => {
+                        // Tables / sheets / text boxes inside an item: flatten to
+                        // indented text lines so their content survives.
+                        for para in block_to_paras(b) {
+                            let t = self.inlines(&para.runs);
+                            let t = t.trim();
+                            if !t.is_empty() {
+                                out.push_str(&indent);
+                                out.push_str("    ");
+                                out.push_str(&t.replace('\n', " "));
+                                out.push('\n');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A GFM pipe table. The first row is treated as the header; the alignment
+    /// row derives each column's alignment from the header cell's first
+    /// paragraph. `col_span > 1` is best-effort: the spanned text lands in its
+    /// first physical column and the covered columns are left blank.
+    fn table(&self, table: &Table, out: &mut String) {
+        if table.rows.is_empty() {
+            return;
+        }
+        let cols = table_col_count(table).max(1);
+
+        // Materialize each row into exactly `cols` rendered cells, honouring
+        // col_span by blanking the covered columns.
+        let mut grid: Vec<Vec<String>> = Vec::with_capacity(table.rows.len());
+        let mut aligns: Vec<Align> = vec![Align::Left; cols];
+        for (r, row) in table.rows.iter().enumerate() {
+            let mut line = vec![String::new(); cols];
+            let mut phys = 0usize;
+            for cell in &row.cells {
+                if phys >= cols {
+                    break;
+                }
+                line[phys] = self.cell_md(cell);
+                if r == 0 {
+                    aligns[phys] = cell_align(cell);
+                }
+                phys += (cell.col_span.max(1) as usize).max(1);
+            }
+            grid.push(line);
+        }
+
+        // Header row.
+        md_table_row(&grid[0], out);
+        // Alignment delimiter row.
+        out.push('|');
+        for a in &aligns {
+            out.push(' ');
+            out.push_str(match a {
+                Align::Left => ":---",
+                Align::Center => ":--:",
+                Align::Right => "---:",
+                Align::Justify => "----", // GFM has no justify; plain delimiter
+            });
+            out.push(' ');
+            out.push('|');
+        }
+        out.push('\n');
+        // Body rows.
+        for line in grid.iter().skip(1) {
+            md_table_row(line, out);
+        }
+        out.push('\n');
+    }
+
+    /// One table cell's inline content, with pipes escaped and newlines folded to
+    /// `<br>` (GFM cells cannot contain literal line breaks).
+    fn cell_md(&self, cell: &Cell) -> String {
+        let mut text = String::new();
+        let mut first = true;
+        for b in &cell.blocks {
+            for para in block_to_paras(b) {
+                let line = self.inlines(&para.runs);
+                let line = line.replace('\n', " ");
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if !first {
+                    text.push_str("<br>");
+                }
+                text.push_str(line);
+                first = false;
+            }
+        }
+        // `inlines()` already backslash-escapes `|` (via `md_escape`), so the
+        // cell text is pipe-safe without a second pass.
+        text
+    }
+
+    /// Render a sequence of inlines to Markdown text.
+    fn inlines(&self, runs: &[Inline]) -> String {
+        let mut s = String::new();
+        for r in runs {
+            self.inline(r, &mut s);
+        }
+        s
+    }
+
+    fn inline(&self, inline: &Inline, out: &mut String) {
+        match inline {
+            Inline::Run(run) => out.push_str(&styled_run(&run.text, &run.style)),
+            Inline::LineBreak => out.push_str("  \n"), // hard line break
+            Inline::Image(img) => out.push_str(&self.image_md(img)),
+            Inline::Link { href, children } => {
+                let text = self.inlines(children);
+                let label = if text.trim().is_empty() {
+                    // Degenerate link with no children: show the URL itself.
+                    match href {
+                        LinkTarget::Url(u) => md_escape(u),
+                        LinkTarget::Page(p) => format!("page {}", p + 1),
+                    }
+                } else {
+                    text
+                };
+                match href {
+                    LinkTarget::Url(url) if !url.is_empty() => {
+                        out.push('[');
+                        out.push_str(&label);
+                        out.push_str("](");
+                        out.push_str(&md_link_dest(url));
+                        out.push(')');
+                    }
+                    LinkTarget::Page(p) => {
+                        // Internal page jump → anchor convention.
+                        out.push('[');
+                        out.push_str(&label);
+                        out.push_str(&format!("](#page-{})", p + 1));
+                    }
+                    // Empty URL: emit the label as plain text.
+                    LinkTarget::Url(_) => out.push_str(&label),
+                }
+            }
+        }
+    }
+
+    /// `![alt](dest)` for a model image. The model stores content-addressed
+    /// blobs (no source URL), so the destination is a stable extracted-asset
+    /// filename derived from the resource key and its stored format tag.
+    fn image_md(&self, img: &ImageRef) -> String {
+        let ext = self
+            .resources
+            .images
+            .get(&img.resource)
+            .map(|r| r.format.as_str())
+            .filter(|f| !f.is_empty())
+            .unwrap_or("png");
+        let alt = img
+            .alt
+            .as_deref()
+            .map(md_escape)
+            .unwrap_or_default();
+        format!("![{}](image-{}.{})", alt, img.resource, ext)
+    }
+}
+
+/// Emit a YAML front-matter block from document metadata, when any field is set.
+fn md_front_matter(meta: &crate::model::DocMeta, out: &mut String) {
+    let has_any = meta.title.is_some()
+        || meta.author.is_some()
+        || meta.subject.is_some()
+        || !meta.keywords.is_empty()
+        || meta.lang.is_some();
+    if !has_any {
+        return;
+    }
+    out.push_str("---\n");
+    if let Some(t) = &meta.title {
+        out.push_str(&format!("title: {}\n", yaml_scalar(t)));
+    }
+    if let Some(a) = &meta.author {
+        out.push_str(&format!("author: {}\n", yaml_scalar(a)));
+    }
+    if let Some(s) = &meta.subject {
+        out.push_str(&format!("subject: {}\n", yaml_scalar(s)));
+    }
+    if !meta.keywords.is_empty() {
+        out.push_str("keywords:\n");
+        for k in &meta.keywords {
+            out.push_str(&format!("  - {}\n", yaml_scalar(k)));
+        }
+    }
+    if let Some(l) = &meta.lang {
+        out.push_str(&format!("lang: {}\n", yaml_scalar(l)));
+    }
+    out.push_str("---\n\n");
+}
+
+/// Quote a YAML scalar when it contains characters that would otherwise be
+/// mis-parsed (`:` `#`, leading/trailing space, or YAML indicators), using
+/// double quotes with `"`/`\` escaped.
+fn yaml_scalar(s: &str) -> String {
+    let needs_quote = s.is_empty()
+        || s.starts_with(' ')
+        || s.ends_with(' ')
+        || s.starts_with(['!', '&', '*', '?', '|', '>', '%', '@', '`', '"', '\'', '#', '-'])
+        || s.contains(": ")
+        || s.contains(" #")
+        || s.contains('\n')
+        || s.contains('\t');
+    if !needs_quote {
+        return s.to_string();
+    }
+    let mut q = String::with_capacity(s.len() + 2);
+    q.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => q.push_str("\\\""),
+            '\\' => q.push_str("\\\\"),
+            '\n' => q.push_str("\\n"),
+            '\t' => q.push_str("\\t"),
+            _ => q.push(c),
+        }
+    }
+    q.push('"');
+    q
+}
+
+/// A `---` thematic break on its own line, with surrounding blank lines.
+fn md_rule(out: &mut String) {
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        if out.ends_with('\n') {
+            out.push('\n');
+        } else {
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str("---\n\n");
+}
+
+/// Emit one GFM table row (`| a | b |`) from already-rendered cells.
+fn md_table_row(cells: &[String], out: &mut String) {
+    out.push('|');
+    for c in cells {
+        out.push(' ');
+        out.push_str(c);
+        out.push(' ');
+        out.push('|');
+    }
+    out.push('\n');
+}
+
+/// The alignment of a table cell, read from its first paragraph's style.
+fn cell_align(cell: &Cell) -> Align {
+    for b in &cell.blocks {
+        if let BlockKind::Paragraph(p) = &b.kind {
+            return p.style.align;
+        }
+        if let BlockKind::Heading(h) = &b.kind {
+            return h.para.style.align;
+        }
+    }
+    Align::Left
+}
+
+/// Wrap `text` (already content) in the emphasis markers implied by `style`.
+/// Nesting order outer→inner: strike, bold, italic, code; super/sub use inline
+/// HTML (valid in CommonMark). Empty text yields an empty string (no stray
+/// markers). Leading/trailing spaces are kept *outside* the markers so the
+/// emphasis renders (CommonMark forbids ` ** x **`).
+fn styled_run(text: &str, style: &CharStyle) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    // Split off surrounding whitespace so markers hug the visible text
+    // (CommonMark forbids ` ** x ** `). Byte offsets are taken from the ASCII
+    // whitespace run, so the `core` slice is always on a char boundary.
+    let lead_len = text.len() - text.trim_start().len();
+    let trail_len = text.len() - text.trim_end().len();
+    if lead_len + trail_len >= text.len() {
+        // All whitespace: emit verbatim (no markers, escaping unneeded for spaces).
+        return text.to_string();
+    }
+    let lead_ws = &text[..lead_len];
+    let trail_ws = &text[text.len() - trail_len..];
+    let core = &text[lead_len..text.len() - trail_len];
+
+    // Innermost: the text itself. A monospace run becomes a literal code span
+    // (its content is *not* backslash-escaped — backticks are handled by the
+    // fence length); otherwise super/sub use inline HTML and the text is
+    // CommonMark-escaped.
+    let mut body = if style.generic == crate::convert::style::Generic::Mono {
+        code_span(core)
+    } else if style.vertical_align == VAlign::Super {
+        format!("<sup>{}</sup>", md_escape(core))
+    } else if style.vertical_align == VAlign::Sub {
+        format!("<sub>{}</sub>", md_escape(core))
+    } else {
+        md_escape(core)
+    };
+
+    // Markdown has no portable colour; `style.color` is intentionally dropped.
+
+    if style.bold && style.italic {
+        body = format!("***{}***", body);
+    } else if style.bold {
+        body = format!("**{}**", body);
+    } else if style.italic {
+        body = format!("*{}*", body);
+    }
+    if style.strike {
+        body = format!("~~{}~~", body);
+    }
+    if style.underline {
+        // CommonMark has no underline; HTML <u> is the faithful representation.
+        body = format!("<u>{}</u>", body);
+    }
+    format!("{lead_ws}{body}{trail_ws}")
+}
+
+/// Wrap `text` in a code span, choosing a backtick fence longer than the longest
+/// backtick run inside, and padding with a space when the content starts/ends
+/// with a backtick (per CommonMark code-span rules).
+fn code_span(text: &str) -> String {
+    let mut longest = 0usize;
+    let mut cur = 0usize;
+    for c in text.chars() {
+        if c == '`' {
+            cur += 1;
+            longest = longest.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    let fence = "`".repeat(longest + 1);
+    let needs_pad =
+        text.starts_with('`') || text.ends_with('`') || (longest > 0 && text == "`".repeat(text.len()));
+    if needs_pad {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
+    }
+}
+
+/// Escape the CommonMark/GFM punctuation that would otherwise be interpreted as
+/// *inline* markup, plus pipes (for table safety). Backslash-escapes are honoured
+/// by every CommonMark parser.
+///
+/// Block-level markers (`#`, `-`, `+`, `.`, `>`) are **not** escaped here: they
+/// are only significant at the start of a line, and the paragraph/list/table
+/// writers fully control line starts. Escaping them mid-text would litter prose
+/// with ugly backslashes (e.g. `A paragraph\.`).
+fn md_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '!' | '|' | '<' | '~' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Encode a link destination: wrap in `<...>` when it contains spaces or control
+/// characters, otherwise percent-escape the few characters that break inline
+/// link syntax (`(` `)` ` `).
+fn md_link_dest(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    if url.contains(' ') || url.chars().any(|c| c.is_control()) {
+        // Angle-bracket form tolerates spaces; escape any literal `>`/`<`.
+        let inner = url.replace('<', "%3C").replace('>', "%3E");
+        return format!("<{}>", inner);
+    }
+    url.replace('(', "%28").replace(')', "%29")
+}
+
+/// Collapse runs of 3+ newlines into a blank-line separator and ensure the
+/// output ends with exactly one newline (empty input ⇒ empty output).
+fn md_tidy(s: String) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut newlines = 0usize;
+    for c in s.chars() {
+        if c == '\n' {
+            newlines += 1;
+            if newlines <= 2 {
+                out.push('\n');
+            }
+        } else {
+            newlines = 0;
+            out.push(c);
+        }
+    }
+    // Trim trailing blank lines, then guarantee a single terminating newline.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 // ═══════════════════════════════════ tests ═══════════════════════════════════
 
 #[cfg(test)]
