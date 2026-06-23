@@ -9,8 +9,8 @@
 //! is sliced into pages with backgrounds/borders split across page bands.
 
 use super::css::{
-    Align, AlignItems, Clear, Direction, Display, FloatSide, Justify, Len, Position, Style,
-    Stylesheet, TrackSize, VAlign,
+    Align, AlignItems, BorderStyle, Clear, Direction, Display, FloatSide, Justify, Len,
+    LinearGradient, Position, Style, Stylesheet, TrackSize, VAlign,
 };
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
@@ -45,6 +45,14 @@ pub enum Fragment {
         stroke_w: f64,
         /// `opacity` (0..=1) applied to the fill and stroke.
         opacity: f64,
+        /// `border-radius` corner radii `[tl, tr, br, bl]` in points. All `0`
+        /// (the common case) ⇒ the painter emits a plain rectangle, byte-for-byte
+        /// as before; any non-zero radius ⇒ the fill/stroke follow a rounded
+        /// contour (real Bézier corners).
+        radius: [f64; 4],
+        /// Optional drop shadow painted *behind* this rect (offset + reduced
+        /// alpha; no real blur). `None` ⇒ nothing extra is drawn.
+        shadow: Option<super::css::BoxShadow>,
     },
     Image {
         x: f64,
@@ -61,6 +69,36 @@ pub enum Fragment {
         w: f64,
         h: f64,
         image: SvgImage,
+    },
+    /// One styled border side, drawn by the paint layer according to its
+    /// [`BorderStyle`]: a `dashed`/`dotted` run of segments, a `double` pair of
+    /// thin lines. `(x, y, w, h)` is the side's *band* (top-down): a horizontal
+    /// side is a `w`-wide strip `h = width` tall; a vertical side is an `h`-tall
+    /// strip `w = width` wide. `Solid` sides never become this fragment — they
+    /// stay plain filled [`Fragment::Rect`]s, so existing output is byte-identical.
+    Border {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        /// `true` for top/bottom sides (run left→right), `false` for left/right
+        /// (run top→bottom). Tells the painter which way dashes march.
+        horizontal: bool,
+        width: f64,
+        color: [f64; 3],
+        style: BorderStyle,
+        opacity: f64,
+    },
+    /// A `linear-gradient` background filling the box `(x, y, w, h)` (top-down).
+    /// Painted as a true PDF axial shading clipped to the box. A box with no
+    /// gradient never produces this fragment, so the flat-fill path is unchanged.
+    Gradient {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        gradient: LinearGradient,
+        opacity: f64,
     },
 }
 
@@ -351,7 +389,9 @@ fn shift_fragment(frag: &mut Fragment, dx: f64, dy: f64) {
         Fragment::Text { x, y, .. }
         | Fragment::Rect { x, y, .. }
         | Fragment::Image { x, y, .. }
-        | Fragment::Svg { x, y, .. } => {
+        | Fragment::Svg { x, y, .. }
+        | Fragment::Border { x, y, .. }
+        | Fragment::Gradient { x, y, .. } => {
             *x += dx;
             *y += dy;
         }
@@ -365,7 +405,9 @@ fn fragment_outside(frag: &Fragment, x0: f64, y0: f64, x1: f64, y1: f64) -> bool
         Fragment::Text { x, y, style, .. } => (*x, *y, *x, *y + style.font_size),
         Fragment::Rect { x, y, w, h, .. }
         | Fragment::Image { x, y, w, h, .. }
-        | Fragment::Svg { x, y, w, h, .. } => (*x, *y, *x + *w, *y + *h),
+        | Fragment::Svg { x, y, w, h, .. }
+        | Fragment::Border { x, y, w, h, .. }
+        | Fragment::Gradient { x, y, w, h, .. } => (*x, *y, *x + *w, *y + *h),
     };
     // No overlap with the clip rect on either axis ⇒ fully outside.
     fx1 < x0 || fx0 > x1 || fy1 < y0 || fy0 > y1
@@ -1040,39 +1082,12 @@ impl Flow<'_> {
         }
 
         // Background + border behind the content (z=0). `visibility: hidden`
-        // suppresses the paint but the box still occupies its space. The
-        // background is a fill-only rect; borders are drawn per-side so
-        // `border-bottom`/`border-left` (etc.) keep their own width and colour.
-        let any_border = b.top + b.bottom + b.left + b.right > 0.0;
-        if !style.hidden && (style.background.is_some() || any_border) {
-            if style.background.is_some() {
-                self.out.push(Abs {
-                    z: 0,
-                    zi: 0,
-                    frag: Fragment::Rect {
-                        x: box_x,
-                        y: box_top,
-                        w: box_w,
-                        h: box_h,
-                        fill: style.background,
-                        stroke: None,
-                        stroke_w: 0.0,
-                        opacity: style.opacity,
-                    },
-                });
-            }
-            if any_border {
-                self.emit_border_edges(
-                    box_x,
-                    box_top,
-                    box_w,
-                    box_h,
-                    [b.top, b.right, b.bottom, b.left],
-                    &style.border_color_edges,
-                    style.opacity,
-                );
-            }
-        }
+        // suppresses the paint but the box still occupies its space. Borders are
+        // drawn per-side so `border-bottom`/`border-left` (etc.) keep their own
+        // width and colour; `border-radius`, `box-shadow`, `linear-gradient`
+        // backgrounds and `dashed`/`dotted`/`double` border styles are honoured
+        // by the shared decoration helper.
+        self.emit_box_decoration(style, box_x, box_top, box_w, box_h);
 
         box_top + box_h + m.bottom
     }
@@ -1642,6 +1657,7 @@ impl Flow<'_> {
             background: Option<[f64; 3]>,
             border_width: super::css::Edges,
             border_color_edges: [[f64; 3]; 4],
+            border_style_edges: [BorderStyle; 4],
             vertical_align: VAlign,
             opacity: f64,
         }
@@ -1701,6 +1717,7 @@ impl Flow<'_> {
                     background: cstyle.background,
                     border_width: bw,
                     border_color_edges: cstyle.border_color_edges,
+                    border_style_edges: cstyle.border_style_edges,
                     vertical_align: cstyle.vertical_align,
                     opacity: cstyle.opacity,
                 });
@@ -1781,6 +1798,8 @@ impl Flow<'_> {
                         stroke: None,
                         stroke_w: 0.0,
                         opacity: pl.opacity,
+                        radius: [0.0; 4],
+                        shadow: None,
                     },
                 });
             }
@@ -1791,6 +1810,7 @@ impl Flow<'_> {
             // / right) are drawn exactly once. Separate mode draws all four.
             let bw = &pl.border_width;
             let bc = &pl.border_color_edges;
+            let bs = &pl.border_style_edges;
             let reaches_last_col = pl.start + pl.col_span.max(1) >= ncols.max(1);
             let reaches_last_row = end_row >= n_rows;
             let sides = if collapse {
@@ -1803,17 +1823,162 @@ impl Flow<'_> {
             } else {
                 [bw.top, bw.right, bw.bottom, bw.left]
             };
-            self.emit_border_edges(cell_x, top, cw, cell_h, sides, bc, pl.opacity);
+            self.emit_border_edges(cell_x, top, cw, cell_h, sides, bc, bs, pl.opacity);
         }
 
         acc_y + style.margin.bottom
     }
 
-    /// Emit up to four per-side border rules for the box `(x, y, w, h)` as thin
-    /// filled rectangles (top-down). `widths`/`colors` are `[top, right, bottom,
-    /// left]`. Filled rects (rather than a single stroked rect) give exact
-    /// per-side placement, width and colour — the only way to honour
-    /// `border-bottom: 2pt` without also thickening the other three sides.
+    /// Emit a box's background at z=0: the solid `background` colour (when set)
+    /// as a filled rect, then any `linear-gradient` painted over it as a
+    /// [`Fragment::Gradient`] (CSS layers `background-image` above
+    /// `background-color`). A box with neither emits nothing — the flat-fill path
+    /// for ordinary boxes is unchanged. `radius`/`shadow` ride on the solid rect
+    /// so a rounded card with a shadow is drawn correctly; the gradient overlay
+    /// inherits the radius via its own clip.
+    #[allow(clippy::too_many_arguments)]
+    fn push_box_background(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        style: &Style,
+        radius: [f64; 4],
+        shadow: Option<super::css::BoxShadow>,
+    ) {
+        // When the box has a shadow but no solid fill, still emit a (fill-less)
+        // rect so the shadow is painted behind the box.
+        if style.background.is_some() || shadow.is_some() {
+            self.out.push(Abs {
+                z: 0,
+                zi: 0,
+                frag: Fragment::Rect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    fill: style.background,
+                    stroke: None,
+                    stroke_w: 0.0,
+                    opacity: style.opacity,
+                    radius,
+                    shadow,
+                },
+            });
+        }
+        if let Some(grad) = &style.background_gradient {
+            self.out.push(Abs {
+                z: 0,
+                zi: 0,
+                frag: Fragment::Gradient {
+                    x,
+                    y,
+                    w,
+                    h,
+                    gradient: grad.clone(),
+                    opacity: style.opacity,
+                },
+            });
+        }
+    }
+
+    /// Emit a block box's background + border decoration at z=0, honouring
+    /// `border-radius`, `box-shadow`, `linear-gradient` backgrounds and per-side
+    /// `dashed`/`dotted`/`double` border styles. Shared by the normal `block`
+    /// path and the multi-column block so both decorate identically.
+    ///
+    /// Behaviour is chosen to keep the square-corner, solid-border case
+    /// byte-for-byte unchanged:
+    /// * **No radius** ⇒ a plain fill rect for the background (plus a gradient
+    ///   overlay if any) and per-side border rules via [`emit_border_edges`]
+    ///   (the existing path; supports asymmetric `border-bottom: 2pt`,
+    ///   dashed/dotted/double sides, etc.).
+    /// * **Rounded + uniform solid border** (all four sides the same width &
+    ///   colour, all `Solid`, no gradient) ⇒ one rounded fill rect carrying the
+    ///   stroke, so background and border both follow the rounded contour.
+    /// * **Rounded + asymmetric/styled border** ⇒ a rounded fill rect for the
+    ///   background (correct), with the per-side borders still drawn via
+    ///   [`emit_border_edges`] as a documented best-effort (mixing rounded
+    ///   corners with differing/styled per-side borders is rare and has no clean
+    ///   rectangular decomposition).
+    fn emit_box_decoration(&mut self, style: &Style, x: f64, y: f64, w: f64, h: f64) {
+        if style.hidden {
+            return;
+        }
+        let b = &style.border_width;
+        let any_border = b.top + b.bottom + b.left + b.right > 0.0;
+        let any_bg = style.background.is_some() || style.background_gradient.is_some();
+        let radius = clamp_radius(style.border_radius, w, h);
+        let rounded = radius.iter().any(|r| *r > 0.0);
+        let shadow = style.box_shadow;
+        // Nothing to paint and no shadow ⇒ emit nothing (unchanged).
+        if !any_border && !any_bg && shadow.is_none() {
+            return;
+        }
+
+        // A rounded box can collapse the background + a uniform SOLID border into
+        // a single rounded fill+stroke rect (so both follow the contour). Only
+        // when there's no gradient overlay (which paints its own box).
+        let all_solid = style.border_style_edges.iter().all(|s| *s == BorderStyle::Solid);
+        let uniform_border = any_border
+            && all_solid
+            && (b.top - b.right).abs() < 1e-6
+            && (b.top - b.bottom).abs() < 1e-6
+            && (b.top - b.left).abs() < 1e-6
+            && {
+                let c = style.border_color_edges;
+                c[0] == c[1] && c[0] == c[2] && c[0] == c[3]
+            };
+
+        if rounded && uniform_border && style.background_gradient.is_none() {
+            // One rounded rect with both fill and stroke (carrying the shadow).
+            self.out.push(Abs {
+                z: 0,
+                zi: 0,
+                frag: Fragment::Rect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    fill: style.background,
+                    stroke: Some(style.border_color_edges[0]),
+                    stroke_w: b.top.max(0.0),
+                    opacity: style.opacity,
+                    radius,
+                    shadow,
+                },
+            });
+            return;
+        }
+
+        // Background (solid + gradient overlay), rounded when a radius is set,
+        // carrying the shadow on its solid rect.
+        self.push_box_background(x, y, w, h, style, radius, shadow);
+        if any_border {
+            // Per-side borders — solid sides are exact filled rects; styled sides
+            // become dash/dot/double bands. With a radius set this is the
+            // asymmetric/styled best-effort fallback (corners stay square).
+            self.emit_border_edges(
+                x,
+                y,
+                w,
+                h,
+                [b.top, b.right, b.bottom, b.left],
+                &style.border_color_edges,
+                &style.border_style_edges,
+                style.opacity,
+            );
+        }
+    }
+
+    /// Emit up to four per-side border rules for the box `(x, y, w, h)` (top-down).
+    /// `widths`/`colors`/`styles` are `[top, right, bottom, left]`. A `Solid` side
+    /// (the default) is a thin filled rectangle — exact per-side placement, width
+    /// and colour, the only way to honour `border-bottom: 2pt` without thickening
+    /// the other three sides — and is byte-identical to the pre-style behaviour.
+    /// A `Dashed`/`Dotted`/`Double` side becomes a [`Fragment::Border`] band the
+    /// paint layer expands into segments / parallel lines.
     #[allow(clippy::too_many_arguments)]
     fn emit_border_edges(
         &mut self,
@@ -1823,11 +1988,12 @@ impl Flow<'_> {
         h: f64,
         widths: [f64; 4],
         colors: &[[f64; 3]; 4],
+        styles: &[BorderStyle; 4],
         opacity: f64,
     ) {
-        // (rect x, y, w, h) for each present side; corners overlap so the frame
-        // joins cleanly (acceptable: same colour, opaque overlap).
-        let push = |out: &mut Vec<Abs>, rx: f64, ry: f64, rw: f64, rh: f64, c: [f64; 3]| {
+        // A `Solid` side: the legacy filled rectangle (corners overlap so the
+        // frame joins cleanly — acceptable: same colour, opaque overlap).
+        let push_solid = |out: &mut Vec<Abs>, rx: f64, ry: f64, rw: f64, rh: f64, c: [f64; 3]| {
             out.push(Abs {
                 z: 0,
                 zi: 0,
@@ -1840,21 +2006,67 @@ impl Flow<'_> {
                     stroke: None,
                     stroke_w: 0.0,
                     opacity,
+                    radius: [0.0; 4],
+                    shadow: None,
                 },
             });
         };
+        // A styled side: a band the painter turns into dashes / parallel lines.
+        #[allow(clippy::too_many_arguments)]
+        let push_styled = |out: &mut Vec<Abs>,
+                           rx: f64,
+                           ry: f64,
+                           rw: f64,
+                           rh: f64,
+                           c: [f64; 3],
+                           horizontal: bool,
+                           width: f64,
+                           style: BorderStyle| {
+            out.push(Abs {
+                z: 0,
+                zi: 0,
+                frag: Fragment::Border {
+                    x: rx,
+                    y: ry,
+                    w: rw,
+                    h: rh,
+                    horizontal,
+                    width,
+                    color: c,
+                    style,
+                    opacity,
+                },
+            });
+        };
+        // Dispatch one side to the solid or styled emitter by its style.
+        #[allow(clippy::too_many_arguments)]
+        let emit_side = |out: &mut Vec<Abs>,
+                         rx: f64,
+                         ry: f64,
+                         rw: f64,
+                         rh: f64,
+                         c: [f64; 3],
+                         horizontal: bool,
+                         width: f64,
+                         style: BorderStyle| {
+            match style {
+                BorderStyle::Solid => push_solid(out, rx, ry, rw, rh, c),
+                _ => push_styled(out, rx, ry, rw, rh, c, horizontal, width, style),
+            }
+        };
         let [wt, wr, wb, wl] = widths;
+        let [st, sr, sb, sl] = *styles;
         if wt > 0.0 {
-            push(&mut self.out, x, y, w, wt, colors[0]); // top
+            emit_side(&mut self.out, x, y, w, wt, colors[0], true, wt, st); // top
         }
         if wb > 0.0 {
-            push(&mut self.out, x, y + h - wb, w, wb, colors[2]); // bottom
+            emit_side(&mut self.out, x, y + h - wb, w, wb, colors[2], true, wb, sb); // bottom
         }
         if wl > 0.0 {
-            push(&mut self.out, x, y, wl, h, colors[3]); // left
+            emit_side(&mut self.out, x, y, wl, h, colors[3], false, wl, sl); // left
         }
         if wr > 0.0 {
-            push(&mut self.out, x + w - wr, y, wr, h, colors[1]); // right
+            emit_side(&mut self.out, x + w - wr, y, wr, h, colors[1], false, wr, sr); // right
         }
     }
 
@@ -2683,37 +2895,10 @@ impl Flow<'_> {
             box_h = box_h.max(mh);
         }
 
-        // Background + per-side borders behind the columns (z=0), like `block`.
-        let any_border = b.top + b.bottom + b.left + b.right > 0.0;
-        if !style.hidden && (style.background.is_some() || any_border) {
-            if style.background.is_some() {
-                self.out.push(Abs {
-                    z: 0,
-                    zi: 0,
-                    frag: Fragment::Rect {
-                        x: box_x,
-                        y: box_top,
-                        w: box_w,
-                        h: box_h,
-                        fill: style.background,
-                        stroke: None,
-                        stroke_w: 0.0,
-                        opacity: style.opacity,
-                    },
-                });
-            }
-            if any_border {
-                self.emit_border_edges(
-                    box_x,
-                    box_top,
-                    box_w,
-                    box_h,
-                    [b.top, b.right, b.bottom, b.left],
-                    &style.border_color_edges,
-                    style.opacity,
-                );
-            }
-        }
+        // Background + per-side borders behind the columns (z=0), like `block`
+        // (honours `border-radius` / `box-shadow` / gradients / styled borders
+        // via the shared helper).
+        self.emit_box_decoration(style, box_x, box_top, box_w, box_h);
 
         box_top + box_h + m.bottom
     }
@@ -2743,10 +2928,13 @@ impl Flow<'_> {
     }
 
     /// Paint a flex/grid item's background + border as a single rect spanning
-    /// its cell (z=0, behind the item's own content).
+    /// its cell (z=0, behind the item's own content). A `linear-gradient`
+    /// background is layered over the solid fill (same as `block` boxes), and a
+    /// rounded corner / drop shadow on the item ride on the rect.
     fn paint_item_box(&mut self, istyle: &Style, x: f64, y: f64, w: f64, h: f64) {
         let has_border = istyle.border_width.top > 0.0;
-        if istyle.background.is_some() || has_border {
+        let has_grad = istyle.background_gradient.is_some();
+        if istyle.background.is_some() || has_border || has_grad || istyle.box_shadow.is_some() {
             self.out.push(Abs {
                 z: 0,
                 zi: 0,
@@ -2763,8 +2951,27 @@ impl Flow<'_> {
                     },
                     stroke_w: istyle.border_width.top.max(0.0),
                     opacity: istyle.opacity,
+                    // Flex/grid item boxes paint a uniform stroked rect; honour a
+                    // rounded corner and drop shadow here too so a rounded flex
+                    // card is correct.
+                    radius: clamp_radius(istyle.border_radius, w, h.max(0.1)),
+                    shadow: istyle.box_shadow,
                 },
             });
+            if let Some(grad) = &istyle.background_gradient {
+                self.out.push(Abs {
+                    z: 0,
+                    zi: 0,
+                    frag: Fragment::Gradient {
+                        x,
+                        y,
+                        w,
+                        h: h.max(0.1),
+                        gradient: grad.clone(),
+                        opacity: istyle.opacity,
+                    },
+                });
+            }
         }
     }
 
@@ -3350,8 +3557,15 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                 stroke,
                 stroke_w,
                 opacity,
+                radius,
+                shadow,
             } => {
-                // Split the rect across the page bands it covers.
+                // Does this rect fit within a single page band? Only then can the
+                // rounded corners / shadow be carried faithfully; a rect that
+                // straddles a page boundary is sliced into plain rectangular bands
+                // (drawing half-arcs per band would be wrong), matching how the
+                // background/border already degrade across a page break.
+                let single_band = page_of(y) == page_of(y + h - 0.001);
                 let mut top = y;
                 let bottom = y + h;
                 while top < bottom {
@@ -3368,9 +3582,70 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                         stroke,
                         stroke_w,
                         opacity,
+                        radius: if single_band { radius } else { [0.0; 4] },
+                        shadow: if single_band { shadow } else { None },
                     });
                     top = seg_bottom + 0.001;
                 }
+            }
+            Fragment::Border {
+                x,
+                y,
+                w,
+                h,
+                horizontal,
+                width,
+                color,
+                style,
+                opacity,
+            } => {
+                // Split the side's band across the page bands it spans, exactly
+                // like `Rect`. The painter re-derives the dash run within each
+                // segment, so a tall dashed/dotted side breaks cleanly at a page
+                // boundary; a horizontal side never spans bands.
+                let mut top = y;
+                let bottom = y + h;
+                while top < bottom {
+                    let p = page_of(top);
+                    let band_bottom = top + (p as f64 + 1.0) * content_h;
+                    let seg_bottom = bottom.min(band_bottom);
+                    ensure(&mut pages, p);
+                    pages[p].push(Fragment::Border {
+                        x,
+                        y: local_y(top, p),
+                        w,
+                        h: (seg_bottom - top).max(0.1),
+                        horizontal,
+                        width,
+                        color,
+                        style,
+                        opacity,
+                    });
+                    top = seg_bottom + 0.001;
+                }
+            }
+            Fragment::Gradient {
+                x,
+                y,
+                w,
+                h,
+                gradient,
+                opacity,
+            } => {
+                // Placed whole on the page where its top sits (like images/SVG).
+                // A gradient box that straddles a page boundary is uncommon and
+                // splitting one faithfully needs the full-box extent on each band;
+                // single-page placement is the pragmatic, documented behaviour.
+                let p = page_of(y);
+                ensure(&mut pages, p);
+                pages[p].push(Fragment::Gradient {
+                    x,
+                    y: local_y(y, p),
+                    w,
+                    h,
+                    gradient,
+                    opacity,
+                });
             }
         }
     }
@@ -3378,6 +3653,37 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
         pages.push(Vec::new());
     }
     pages
+}
+
+/// Clamp `border-radius` corners `[tl, tr, br, bl]` so no corner exceeds half the
+/// box and adjacent radii on a side never overlap (CSS §"Corner overlap": if the
+/// radii on any side sum to more than that side's length, all radii scale down by
+/// the same factor). Negative radii are floored at `0`. A zero box yields zeros,
+/// so this is a no-op for the common square-corner case.
+fn clamp_radius(r: [f64; 4], w: f64, h: f64) -> [f64; 4] {
+    let mut r = [r[0].max(0.0), r[1].max(0.0), r[2].max(0.0), r[3].max(0.0)];
+    if w <= 0.0 || h <= 0.0 {
+        return [0.0; 4];
+    }
+    // Per-side sums: top = tl+tr, right = tr+br, bottom = br+bl, left = bl+tl.
+    let mut f = 1.0_f64;
+    let pairs = [
+        (r[0] + r[1], w), // top
+        (r[1] + r[2], h), // right
+        (r[2] + r[3], w), // bottom
+        (r[3] + r[0], h), // left
+    ];
+    for (sum, len) in pairs {
+        if sum > 0.0 && len > 0.0 {
+            f = f.min(len / sum);
+        }
+    }
+    if f < 1.0 {
+        for v in &mut r {
+            *v *= f;
+        }
+    }
+    r
 }
 
 /// A rough fallback metric (used for tests and when no embedded font matches):
@@ -4993,6 +5299,245 @@ mod tests {
             (first.0 - 36.0).abs() < 0.01,
             "LTR first run still starts at x=36 (got {})",
             first.0
+        );
+    }
+
+    // ── border-radius / box-shadow ──────────────────────────────────────────
+
+    /// All `Fragment::Rect` on page 0 as `(fill, stroke, radius, shadow_present)`.
+    #[allow(clippy::type_complexity)]
+    fn rect_decorations(
+        layout: &Layout,
+    ) -> Vec<(Option<[f64; 3]>, Option<[f64; 3]>, [f64; 4], bool)> {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Rect {
+                    fill,
+                    stroke,
+                    radius,
+                    shadow,
+                    ..
+                } => Some((*fill, *stroke, *radius, shadow.is_some())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn square_box_carries_zero_radius_and_no_shadow() {
+        // Guard: a plain background div is unchanged — fill rect, radius all-zero,
+        // no shadow (so the painter still takes the rectangular fast path).
+        let layout = run(r#"<div style="background:#eee;padding:10pt">hi</div>"#);
+        let rects = rect_decorations(&layout);
+        let bg = rects
+            .iter()
+            .find(|(fill, ..)| fill.is_some())
+            .expect("a background rect");
+        assert_eq!(bg.2, [0.0; 4], "no radius on a plain box");
+        assert!(!bg.3, "no shadow on a plain box");
+    }
+
+    #[test]
+    fn rounded_background_emits_rect_with_radius() {
+        let layout =
+            run(r#"<div style="background:#3366cc;border-radius:8pt;padding:10pt">card</div>"#);
+        let rects = rect_decorations(&layout);
+        let bg = rects
+            .iter()
+            .find(|(fill, ..)| *fill == Some([0.2, 0.4, 0.8]))
+            .expect("the blue background rect");
+        assert!(
+            bg.2.iter().all(|r| (*r - 8.0).abs() < 0.01),
+            "every corner is 8pt: {:?}",
+            bg.2
+        );
+    }
+
+    #[test]
+    fn uniform_border_plus_radius_makes_one_fill_and_stroke_rect() {
+        // A rounded card with a uniform 2pt border ⇒ a SINGLE rect carrying both
+        // fill and stroke + radius (not a separate fill rect + 4 border edges).
+        let layout = run(
+            r#"<div style="background:#ffffff;border:2pt solid #000000;border-radius:10pt;padding:8pt">x</div>"#,
+        );
+        let rects = rect_decorations(&layout);
+        let rounded: Vec<_> = rects
+            .iter()
+            .filter(|(_, _, radius, _)| radius.iter().any(|r| *r > 0.0))
+            .collect();
+        assert_eq!(rounded.len(), 1, "exactly one rounded decoration rect");
+        let (fill, stroke, radius, _) = rounded[0];
+        assert_eq!(*fill, Some([1.0, 1.0, 1.0]), "fill present");
+        assert_eq!(
+            *stroke,
+            Some([0.0, 0.0, 0.0]),
+            "uniform border ⇒ stroke present"
+        );
+        assert!(radius.iter().all(|r| (*r - 10.0).abs() < 0.01));
+        // No square per-side border rects were emitted alongside it.
+        let zero_radius_fills = rects
+            .iter()
+            .filter(|(fill, _, radius, _)| fill.is_some() && *radius == [0.0; 4])
+            .count();
+        assert_eq!(zero_radius_fills, 0, "no square fill/border rects remain");
+    }
+
+    #[test]
+    fn box_shadow_rides_on_the_background_rect() {
+        let layout = run(
+            r#"<div style="background:#eeeeee;box-shadow:3pt 3pt 4pt #000000;padding:10pt">x</div>"#,
+        );
+        let rects = rect_decorations(&layout);
+        assert!(
+            rects
+                .iter()
+                .any(|(fill, _, _, shadow)| fill.is_some() && *shadow),
+            "the background rect carries the shadow: {rects:?}"
+        );
+    }
+
+    #[test]
+    fn asymmetric_border_with_radius_rounds_background_only() {
+        // A radius + a thicker bottom border (asymmetric) ⇒ the background still
+        // rounds, but borders fall back to the square per-side path (documented
+        // best-effort). We assert a rounded fill rect exists AND square border
+        // edge rects also exist.
+        let layout = run(
+            r#"<div style="background:#ddeeff;border:1pt solid #000;border-bottom:4pt solid #f00;border-radius:6pt;padding:6pt">x</div>"#,
+        );
+        let rects = rect_decorations(&layout);
+        // Rounded background fill (no stroke on it — borders are separate here).
+        assert!(
+            rects.iter().any(|(fill, stroke, radius, _)| fill.is_some()
+                && stroke.is_none()
+                && radius.iter().any(|r| *r > 0.0)),
+            "rounded background fill present"
+        );
+        // At least one square red bottom border edge (radius zero).
+        let red = [1.0, 0.0, 0.0];
+        assert!(
+            rects
+                .iter()
+                .any(|(fill, _, radius, _)| *fill == Some(red) && *radius == [0.0; 4]),
+            "square red bottom-border edge present"
+        );
+    }
+
+    #[test]
+    fn clamp_radius_caps_oversized_corners() {
+        // A 100pt radius on a 40×20 box scales down so adjacent radii fit the side.
+        let r = clamp_radius([100.0, 100.0, 100.0, 100.0], 40.0, 20.0);
+        // Limiting side is the 20pt one: tl+tr ≤ 40 and tr+br ≤ 20 ⇒ each ≤ 10.
+        assert!(r.iter().all(|v| *v <= 10.0 + 1e-6), "clamped to ≤10: {r:?}");
+        assert!(r.iter().all(|v| *v > 0.0), "still positive: {r:?}");
+        // A modest radius that already fits is untouched.
+        assert_eq!(clamp_radius([4.0, 4.0, 4.0, 4.0], 100.0, 100.0), [4.0; 4]);
+        // Degenerate box ⇒ zeros.
+        assert_eq!(clamp_radius([5.0; 4], 0.0, 10.0), [0.0; 4]);
+        // Negatives floored.
+        assert_eq!(clamp_radius([-3.0, 0.0, 0.0, 0.0], 100.0, 100.0), [0.0; 4]);
+    }
+
+    // ── styled borders (dashed/dotted/double) / linear-gradient ──────────────
+
+    /// Page-0 `Fragment::Border` sides as `(horizontal, style)`.
+    fn border_sides(layout: &Layout) -> Vec<(bool, BorderStyle)> {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Border {
+                    horizontal, style, ..
+                } => Some((*horizontal, *style)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Count page-0 `Fragment::Gradient`s.
+    fn gradient_count(layout: &Layout) -> usize {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .filter(|f| matches!(f, Fragment::Gradient { .. }))
+            .count()
+    }
+
+    #[test]
+    fn solid_border_stays_plain_rects_no_border_fragment() {
+        // Guard: an all-solid border emits NO styled `Border` fragments — it stays
+        // the legacy filled-rect path, byte-identical to before.
+        let layout =
+            run(r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#);
+        assert!(
+            border_sides(&layout).is_empty(),
+            "a solid border emits no styled Border fragments"
+        );
+    }
+
+    #[test]
+    fn dashed_border_emits_styled_border_fragments() {
+        // A dashed border on all sides ⇒ four `Border` bands (the painter splits
+        // each into dash segments).
+        let layout =
+            run(r#"<div style="border:2pt dashed #000000;width:100pt;height:40pt"></div>"#);
+        let sides = border_sides(&layout);
+        assert_eq!(sides.len(), 4, "one Border band per dashed side: {sides:?}");
+        assert!(
+            sides.iter().all(|(_, s)| *s == BorderStyle::Dashed),
+            "every band is dashed"
+        );
+        // Top/bottom are horizontal; left/right vertical.
+        assert_eq!(sides.iter().filter(|(h, _)| *h).count(), 2, "2 horizontal");
+        assert_eq!(sides.iter().filter(|(h, _)| !*h).count(), 2, "2 vertical");
+    }
+
+    #[test]
+    fn one_dotted_side_emits_one_border_band() {
+        let layout = run(
+            r#"<div style="border-bottom:3pt dotted #000000;width:90pt;height:30pt"></div>"#,
+        );
+        let sides = border_sides(&layout);
+        assert_eq!(sides.len(), 1, "exactly one styled side");
+        assert_eq!(sides[0], (true, BorderStyle::Dotted), "horizontal dotted");
+    }
+
+    #[test]
+    fn linear_gradient_background_emits_a_gradient_fragment() {
+        let layout = run(
+            r#"<div style="background:linear-gradient(90deg,#ff0000,#0000ff);width:100pt;height:40pt"></div>"#,
+        );
+        assert_eq!(
+            gradient_count(&layout),
+            1,
+            "a gradient background emits one Gradient fragment"
+        );
+        // A pure gradient sets no solid background rect.
+        let solid_fills = rect_decorations(&layout)
+            .into_iter()
+            .filter(|(fill, ..)| fill.is_some())
+            .count();
+        assert_eq!(solid_fills, 0, "no solid fill rect for a gradient-only box");
+    }
+
+    #[test]
+    fn gradient_over_solid_color_emits_both() {
+        // `background-color` fallback + a gradient overlay ⇒ a solid rect AND a
+        // gradient fragment (CSS layers the image above the colour).
+        let layout = run(
+            r#"<div style="background-color:#112233;background-image:linear-gradient(red,blue);width:80pt;height:30pt"></div>"#,
+        );
+        assert_eq!(gradient_count(&layout), 1, "one gradient overlay");
+        assert!(
+            rect_decorations(&layout)
+                .iter()
+                .any(|(fill, ..)| *fill == Some([17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0])),
+            "the solid colour fallback rect is still present"
         );
     }
 }

@@ -7,11 +7,12 @@
 //! them and passes the bytes to [`render`], which embeds them and measures text
 //! with their true advance widths so the output is identical to the page.
 
+use crate::content::num;
 use crate::convert::build::PdfBuilder;
 use crate::document::Document;
 use crate::font::{bundled, catalog, google, shape::Shaper, truetype::TrueTypeFont};
 
-use super::css::{collect_style_css, Display, Style, Stylesheet};
+use super::css::{collect_style_css, BorderStyle, Display, LinearGradient, Style, Stylesheet};
 use super::dom::{self, Element, Node};
 use super::layout::{layout_document_framed, Fragment, Frame, Layout, Measure};
 use super::page::{substitute_tokens, Margins, RenderOptions};
@@ -412,6 +413,8 @@ fn layout_band(
             Fragment::Rect { y, h, .. } => y + h,
             Fragment::Image { y, h, .. } => y + h,
             Fragment::Svg { y, h, .. } => y + h,
+            Fragment::Border { y, h, .. } => y + h,
+            Fragment::Gradient { y, h, .. } => y + h,
         };
         m.max(bottom)
     });
@@ -438,6 +441,8 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 stroke,
                 stroke_w,
                 opacity,
+                radius,
+                shadow,
             } => Fragment::Rect {
                 x,
                 y: y + dy,
@@ -447,6 +452,8 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 stroke,
                 stroke_w,
                 opacity,
+                radius,
+                shadow,
             },
             Fragment::Image { x, y, w, h, src } => Fragment::Image {
                 x,
@@ -461,6 +468,42 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 w,
                 h,
                 image,
+            },
+            Fragment::Border {
+                x,
+                y,
+                w,
+                h,
+                horizontal,
+                width,
+                color,
+                style,
+                opacity,
+            } => Fragment::Border {
+                x,
+                y: y + dy,
+                w,
+                h,
+                horizontal,
+                width,
+                color,
+                style,
+                opacity,
+            },
+            Fragment::Gradient {
+                x,
+                y,
+                w,
+                h,
+                gradient,
+                opacity,
+            } => Fragment::Gradient {
+                x,
+                y: y + dy,
+                w,
+                h,
+                gradient,
+                opacity,
             },
         })
         .collect()
@@ -543,19 +586,51 @@ fn paint(
                     stroke,
                     stroke_w,
                     opacity,
+                    radius,
+                    shadow,
                 } => {
-                    // Top-down → PDF bottom-up (origin bottom-left).
-                    let _ = doc.add_rectangle(
-                        page,
-                        *x,
-                        page_h - y - h,
-                        *w,
-                        *h,
-                        stroke.filter(|_| *stroke_w > 0.0),
-                        *fill,
-                        stroke_w.max(0.0),
-                        *opacity,
-                    );
+                    let rounded = radius.iter().any(|r| *r > 0.0);
+
+                    // Drop shadow first (painted behind the box): an offset rect
+                    // grown by `spread`, in the shadow colour, dimmed by blur.
+                    if let Some(sh) = shadow {
+                        if !sh.inset {
+                            paint_box_shadow(doc, page, page_h, *x, *y, *w, *h, *radius, sh);
+                        }
+                    }
+
+                    let stroke_c = stroke.filter(|_| *stroke_w > 0.0);
+                    if !rounded {
+                        // Square corners — unchanged rectangular path (byte-for-byte
+                        // identical to the pre-radius behaviour).
+                        let _ = doc.add_rectangle(
+                            page,
+                            *x,
+                            page_h - y - h,
+                            *w,
+                            *h,
+                            stroke_c,
+                            *fill,
+                            stroke_w.max(0.0),
+                            *opacity,
+                        );
+                    } else {
+                        // Rounded box: emit a rounded-rect path whose fill (and, for
+                        // a uniform border, stroke) follow the rounded contour.
+                        // `add_path` maps SVG-(0,0)→(ox,oy) with Y flipped, so we
+                        // pass the path in top-down page coords and oy = page_h.
+                        let d = rounded_rect_path(*x, *y, *w, *h, *radius);
+                        let _ = doc.add_path(
+                            page,
+                            &d,
+                            0.0,
+                            page_h,
+                            stroke_c,
+                            *fill,
+                            stroke_w.max(0.0),
+                            *opacity,
+                        );
+                    }
                 }
                 Fragment::Text { x, y, style, text } => {
                     if style.hidden {
@@ -719,6 +794,32 @@ fn paint(
                     // Native vector — placed top-down → PDF bottom-up box.
                     let _ = doc.draw_svg_image(page, image, *x, page_h - y - h, *w, *h);
                 }
+                Fragment::Border {
+                    x,
+                    y,
+                    w,
+                    h,
+                    horizontal,
+                    width,
+                    color,
+                    style,
+                    opacity,
+                } => {
+                    paint_styled_border(
+                        doc, page, page_h, *x, *y, *w, *h, *horizontal, *width, *color, *style,
+                        *opacity,
+                    );
+                }
+                Fragment::Gradient {
+                    x,
+                    y,
+                    w,
+                    h,
+                    gradient,
+                    opacity,
+                } => {
+                    paint_linear_gradient(doc, page, page_h, *x, *y, *w, *h, gradient, *opacity);
+                }
             }
         }
     };
@@ -801,6 +902,362 @@ fn paint_text_decorations(
     if style.overline {
         draw(size * 0.02); // near the top of the em box
     }
+}
+
+/// Build an SVG path string for a rounded rectangle, in **top-down page coords**
+/// (x right, y downward — the same space as a [`Fragment::Rect`]). Designed to be
+/// drawn with [`crate::document::Document::add_path`] using `ox = 0, oy = page_h`,
+/// which flips Y so the path lands at `page_h - y`.
+///
+/// `radius` is `[top-left, top-right, bottom-right, bottom-left]` (already clamped
+/// by the layout). Each corner uses an SVG elliptical arc (`A`), which `add_path`
+/// expands to cubic Béziers — so the emitted content stream carries real `c`
+/// curve operators at every non-zero corner. A zero-radius corner degenerates to
+/// a straight `L` to the corner point, so a box with one rounded corner still
+/// renders correctly.
+fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: [f64; 4]) -> String {
+    let [tl, tr, br, bl] = radius;
+    // Path travels clockwise (SVG Y-down): start just right of the top-left
+    // corner, across the top edge, then each side + corner arc, and close.
+    // SVG arc `A rx ry x-rotation large-arc sweep ex ey`; sweep = 1 (clockwise).
+    let mut d = String::with_capacity(160);
+    d.push_str(&format!("M {} {} ", num(x + tl), num(y)));
+    // Top edge → top-right corner.
+    d.push_str(&format!("L {} {} ", num(x + w - tr), num(y)));
+    if tr > 0.0 {
+        d.push_str(&format!(
+            "A {} {} 0 0 1 {} {} ",
+            num(tr),
+            num(tr),
+            num(x + w),
+            num(y + tr)
+        ));
+    }
+    // Right edge → bottom-right corner.
+    d.push_str(&format!("L {} {} ", num(x + w), num(y + h - br)));
+    if br > 0.0 {
+        d.push_str(&format!(
+            "A {} {} 0 0 1 {} {} ",
+            num(br),
+            num(br),
+            num(x + w - br),
+            num(y + h)
+        ));
+    }
+    // Bottom edge → bottom-left corner.
+    d.push_str(&format!("L {} {} ", num(x + bl), num(y + h)));
+    if bl > 0.0 {
+        d.push_str(&format!(
+            "A {} {} 0 0 1 {} {} ",
+            num(bl),
+            num(bl),
+            num(x),
+            num(y + h - bl)
+        ));
+    }
+    // Left edge → top-left corner.
+    d.push_str(&format!("L {} {} ", num(x), num(y + tl)));
+    if tl > 0.0 {
+        d.push_str(&format!(
+            "A {} {} 0 0 1 {} {} ",
+            num(tl),
+            num(tl),
+            num(x + tl),
+            num(y)
+        ));
+    }
+    d.push('Z');
+    d
+}
+
+/// Paint an approximated `box-shadow` behind a box: a filled rectangle offset by
+/// `(dx, dy)` and grown by `spread` on every side, in the shadow colour, at a
+/// reduced alpha when `blur > 0`.
+///
+/// This is a deliberate approximation — there is **no real Gaussian blur** (the
+/// HTML paint layer has no blur/clip primitive). The alpha falloff (`1 / (1 +
+/// blur/8)`, capped) stands in for the soft edge a true blur would give, so a
+/// blurred shadow reads as a lighter offset block rather than a hard one. The
+/// shadow inherits the box's `radius` so a rounded card casts a rounded shadow.
+#[allow(clippy::too_many_arguments)]
+fn paint_box_shadow(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: [f64; 4],
+    sh: &super::css::BoxShadow,
+) {
+    // Grow by spread on each side; offset by (dx, dy) in top-down coords.
+    let sx = x - sh.spread + sh.dx;
+    let sy = y - sh.spread + sh.dy;
+    let sw = w + 2.0 * sh.spread;
+    let shh = h + 2.0 * sh.spread;
+    if sw <= 0.0 || shh <= 0.0 {
+        return; // a large negative spread can collapse the shadow — draw nothing
+    }
+    // Alpha approximation: opaque with no blur, lighter as blur grows.
+    let alpha = (1.0 / (1.0 + sh.blur / 8.0)).clamp(0.15, 1.0);
+    // Grow the corner radii by spread too (so the shadow's corners track the box).
+    let grow = |r: f64| if r > 0.0 { (r + sh.spread).max(0.0) } else { 0.0 };
+    let r = [
+        grow(radius[0]),
+        grow(radius[1]),
+        grow(radius[2]),
+        grow(radius[3]),
+    ];
+    if r.iter().any(|v| *v > 0.0) {
+        let d = rounded_rect_path(sx, sy, sw, shh, r);
+        let _ = doc.add_path(page, &d, 0.0, page_h, None, Some(sh.color), 0.0, alpha);
+    } else {
+        let _ = doc.add_rectangle(
+            page,
+            sx,
+            page_h - sy - shh,
+            sw,
+            shh,
+            None,
+            Some(sh.color),
+            0.0,
+            alpha,
+        );
+    }
+}
+
+/// Paint one `dashed`/`dotted`/`double` border side as filled rectangles, the
+/// same primitive every solid border already uses (so it composites and
+/// paginates identically). The band `(x, y, w, h)` is top-down: a `horizontal`
+/// side runs along `x` (length `w`, thickness `h`); a vertical side runs along
+/// `y` (length `h`, thickness `w`). `width` is the border width.
+///
+/// - **dashed**: dash ≈ 3×width, gap ≈ 2×width — a row of short bars.
+/// - **dotted**: dash = gap = width — square dots.
+/// - **double**: two thin lines (≈ width/3 each) at the band's two edges with a
+///   gap between, spanning the whole side.
+///
+/// A `Solid` side never reaches here (it stays a plain filled rect upstream).
+#[allow(clippy::too_many_arguments)]
+fn paint_styled_border(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    horizontal: bool,
+    width: f64,
+    color: [f64; 3],
+    style: BorderStyle,
+    opacity: f64,
+) {
+    if width <= 0.0 || w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    // Emit one top-down rect → PDF (origin bottom-left, Y-up).
+    let mut fill = |rx: f64, ry: f64, rw: f64, rh: f64| {
+        if rw > 0.0 && rh > 0.0 {
+            let _ = doc.add_rectangle(
+                page,
+                rx,
+                page_h - ry - rh,
+                rw,
+                rh,
+                None,
+                Some(color),
+                0.0,
+                opacity,
+            );
+        }
+    };
+
+    match style {
+        BorderStyle::Double => {
+            // Two parallel lines ≈ width/3 thick at the band's far edges.
+            let t = (width / 3.0).max(0.3);
+            if horizontal {
+                fill(x, y, w, t); // top line of the band
+                fill(x, y + h - t, w, t); // bottom line
+            } else {
+                fill(x, y, t, h); // left line of the band
+                fill(x + w - t, y, t, h); // right line
+            }
+        }
+        // Dashed / dotted: march filled bars along the side's long axis.
+        _ => {
+            let (dash, gap) = match style {
+                BorderStyle::Dotted => (width.max(0.3), width.max(0.3)),
+                _ => (width * 3.0, width * 2.0), // Dashed
+            };
+            let period = (dash + gap).max(0.1);
+            let length = if horizontal { w } else { h };
+            let mut pos = 0.0;
+            while pos < length - 0.01 {
+                let seg = dash.min(length - pos); // clip the final dash
+                if horizontal {
+                    fill(x + pos, y, seg, h);
+                } else {
+                    fill(x, y + pos, w, seg);
+                }
+                pos += period;
+            }
+        }
+    }
+}
+
+/// Paint a CSS `linear-gradient` filling the box `(x, y, w, h)` (top-down) as a
+/// **true PDF axial shading** clipped to the box.
+///
+/// The gradient is expressed as a one-rect [`crate::svg::SvgImage`] whose fill is
+/// an SVG linear gradient; [`Document::draw_svg_image`] then reuses the engine's
+/// existing axial-shading + tiling-pattern machinery (a `/ShadingType 2` with a
+/// sampled colour ramp), so no new PDF object plumbing is needed and the result
+/// is a real gradient, not a raster. Endpoints follow the CSS angle convention
+/// (`0deg` up, `90deg` right, clockwise); stops without a position are spread
+/// evenly between their positioned neighbours.
+#[allow(clippy::too_many_arguments)]
+fn paint_linear_gradient(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    grad: &LinearGradient,
+    opacity: f64,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let Some(img) = gradient_svg_image(grad, w, h, opacity.clamp(0.0, 1.0)) else {
+        return;
+    };
+    // The image's viewBox is [0,0,w,h]; place it on the PDF box (Y-flipped). The
+    // box opacity rides on the gradient stops' alpha (draw_svg_image folds the
+    // mean stop alpha into a transient ExtGState).
+    let _ = doc.draw_svg_image(page, &img, x, page_h - y - h, w, h);
+}
+
+/// Build a one-primitive [`crate::svg::SvgImage`] — a `w×h` rectangle filled with
+/// an axial SVG gradient — from a CSS [`LinearGradient`]. The viewBox is
+/// `[0,0,w,h]` (Y-down, matching SVG), so the caller maps it straight onto the
+/// PDF box. Gradient-line endpoints are derived from the CSS angle; `None` only
+/// if there are fewer than two stops (already guaranteed by the parser, but
+/// defensive). `alpha` (the box opacity, `0..=1`) is applied uniformly to every
+/// stop.
+fn gradient_svg_image(
+    grad: &LinearGradient,
+    w: f64,
+    h: f64,
+    alpha: f64,
+) -> Option<crate::svg::SvgImage> {
+    use crate::content::svg_path::Seg;
+    use crate::svg::{Fill, GradKind, GradStop, Gradient, Prim, SvgImage};
+
+    if grad.stops.len() < 2 {
+        return None;
+    }
+
+    // CSS angle (0 = up, clockwise) → gradient-line direction in SVG (Y-down)
+    // space: math direction is (sin θ, cos θ) with Y up, so Y-down flips cos.
+    let theta = grad.angle_deg.to_radians();
+    let (s, c) = (theta.sin(), theta.cos());
+    let dir = (s, -c); // unit vector, SVG Y-down
+                       // Line length so 0%/100% reach the box extent along the line.
+    let len = (w * s).abs() + (h * c).abs();
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let half = len / 2.0;
+    let (x1, y1) = (cx - dir.0 * half, cy - dir.1 * half); // first stop
+    let (x2, y2) = (cx + dir.0 * half, cy + dir.1 * half); // last stop
+
+    // Resolve stop positions: fill `None`s evenly between positioned neighbours
+    // (CSS default-placement), clamp to monotonic non-decreasing offsets.
+    let offsets = resolve_stop_offsets(grad);
+    let stops: Vec<GradStop> = grad
+        .stops
+        .iter()
+        .zip(offsets)
+        .map(|(st, off)| GradStop {
+            offset: off,
+            rgb: st.color,
+            alpha,
+        })
+        .collect();
+
+    // A closed rectangle path over the whole viewBox, filled with the gradient.
+    let segs = vec![
+        Seg::Move(0.0, 0.0),
+        Seg::Line(w, 0.0),
+        Seg::Line(w, h),
+        Seg::Line(0.0, h),
+        Seg::Close,
+    ];
+    let prim = Prim {
+        segs,
+        fill: Some(Fill::Gradient(Gradient {
+            kind: GradKind::Linear { x1, y1, x2, y2 },
+            stops,
+        })),
+        stroke: None,
+        stroke_w: 0.0,
+        fill_opacity: 1.0,
+        stroke_opacity: 1.0,
+    };
+    Some(SvgImage {
+        width: w,
+        height: h,
+        view_box: [0.0, 0.0, w, h],
+        prims: vec![prim],
+    })
+}
+
+/// Resolve each `linear-gradient` stop to a concrete `0..=1` offset: explicit
+/// positions are kept (clamped non-decreasing), and a run of `None` positions is
+/// spread evenly between the surrounding fixed offsets (CSS stop placement). The
+/// first/last default to 0 and 1 when unspecified.
+fn resolve_stop_offsets(grad: &LinearGradient) -> Vec<f64> {
+    let n = grad.stops.len();
+    // Seed with explicit positions; first→0, last→1 when absent.
+    let mut off: Vec<Option<f64>> = grad.stops.iter().map(|s| s.pos).collect();
+    if off[0].is_none() {
+        off[0] = Some(0.0);
+    }
+    if off[n - 1].is_none() {
+        off[n - 1] = Some(1.0);
+    }
+    // Interpolate each gap of unspecified stops between known anchors.
+    let mut out = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        if let Some(v) = off[i] {
+            out[i] = v;
+            i += 1;
+            continue;
+        }
+        // `i` is the first unknown after anchor `i-1`; find the next known `j`.
+        let lo = out[i - 1];
+        let mut j = i;
+        while j < n && off[j].is_none() {
+            j += 1;
+        }
+        let hi = off[j].unwrap_or(1.0);
+        let span = (j - (i - 1)) as f64;
+        for (k, slot) in (i..j).enumerate() {
+            out[slot] = lo + (hi - lo) * ((k + 1) as f64 / span);
+        }
+        i = j;
+    }
+    // Enforce monotonic non-decreasing offsets (a later smaller value clamps up).
+    for k in 1..n {
+        if out[k] < out[k - 1] {
+            out[k] = out[k - 1];
+        }
+    }
+    out
 }
 
 /// Resolve an `<img>` source to image bytes: a `data:` URI is decoded inline; any
@@ -1177,5 +1634,289 @@ mod tests {
         // `<s>` must therefore emit a decoration rule (no panic, valid PDF).
         let pdf = render("<p><s>gone</s></p>", &[], 612.0, 792.0, 36.0);
         assert!(pdf.starts_with(b"%PDF-"), "valid PDF for struck text");
+    }
+
+    // ── border-radius / box-shadow paint ────────────────────────────────────
+
+    /// Render `html` and return page-1's content stream as text (re-opening the
+    /// produced PDF), so tests can assert on the emitted PDF operators.
+    fn page1_content(html: &str) -> String {
+        let pdf = render(html, &[], 612.0, 792.0, 36.0);
+        let doc = Document::open(&pdf).expect("re-open rendered PDF");
+        String::from_utf8_lossy(&doc.page_content(1).expect("page content")).into_owned()
+    }
+
+    /// Count Bézier curve operators (`… c`) — present for any rounded corner.
+    fn count_curves(content: &str) -> usize {
+        content
+            .lines()
+            .filter(|l| l.trim_end().ends_with(" c"))
+            .count()
+    }
+
+    #[test]
+    fn rounded_box_emits_bezier_curves() {
+        // A rounded background must produce real Bézier corner arcs (`c` ops) —
+        // the rounded contour the fill follows. (PDF clipping `W n` is NOT used:
+        // the HTML paint layer has no clip primitive, so the fill itself follows
+        // the rounded path — see the module docs / box-decoration helper.)
+        let content = page1_content(
+            r#"<div style="background:#3366cc;border-radius:12pt;padding:10pt">x</div>"#,
+        );
+        assert!(
+            count_curves(&content) >= 4,
+            "≥4 Bézier corner arcs for the four rounded corners ({} found)\n{content}",
+            count_curves(&content)
+        );
+        // The fill colour is painted (the blue background) and the path is filled.
+        assert!(content.contains("0.2 0.4 0.8 rg"), "blue fill set");
+    }
+
+    #[test]
+    fn square_box_uses_rectangle_op_not_curves() {
+        // Guard: with no radius the background still paints via the `re` rectangle
+        // operator and emits NO Bézier corners (unchanged fast path).
+        let content = page1_content(r#"<div style="background:#3366cc;padding:10pt">x</div>"#);
+        assert!(
+            content.contains(" re"),
+            "square background uses the `re` rectangle op\n{content}"
+        );
+        assert_eq!(
+            count_curves(&content),
+            0,
+            "no Bézier corners for a square box\n{content}"
+        );
+    }
+
+    #[test]
+    fn box_shadow_paints_a_shadow_fill_before_the_box() {
+        // The shadow (red here, for a visible marker) must be filled BEFORE the
+        // box's own background (grey), so it sits behind it. We look for the red
+        // shadow fill appearing earlier in the stream than the grey box fill.
+        let content = page1_content(
+            r#"<div style="background:#cccccc;box-shadow:4pt 4pt 6pt #ff0000;padding:10pt">x</div>"#,
+        );
+        let red = content.find("1 0 0 rg");
+        let grey = content.find("0.8 0.8 0.8 rg");
+        assert!(red.is_some(), "shadow fill (red) is emitted\n{content}");
+        assert!(grey.is_some(), "box background (grey) is emitted");
+        assert!(
+            red.unwrap() < grey.unwrap(),
+            "shadow paints behind (before) the box background"
+        );
+    }
+
+    #[test]
+    fn rounded_box_with_shadow_renders_valid_pdf() {
+        // End-to-end smoke: a rounded card with a blurred drop shadow renders a
+        // valid, non-trivial PDF without panicking.
+        let pdf = render(
+            r#"<div style="background:#ffffff;border:2pt solid #334155;border-radius:14pt;box-shadow:0pt 6pt 12pt 2pt #00000040;padding:16pt">Card</div>"#,
+            &[],
+            612.0,
+            792.0,
+            36.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        assert!(pdf.len() > 400, "non-trivial output ({} bytes)", pdf.len());
+    }
+
+    // ── styled borders (dashed/dotted/double) / linear-gradient paint ────────
+
+    /// Count `re` (rectangle) path operators in a one-page render's content
+    /// stream — each border filled-rect / dash segment is one `re`.
+    fn rect_op_count(html: &str) -> usize {
+        let pdf = render(html, &[], 300.0, 200.0, 10.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        let doc = Document::open(&pdf).expect("re-open");
+        let content = String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
+        content.matches(" re").count()
+    }
+
+    #[test]
+    fn solid_border_stays_one_filled_rect_per_side() {
+        // The legacy path is unchanged: an all-four-sides solid border emits
+        // exactly four filled rectangles — never the styled-border segments.
+        let n =
+            rect_op_count(r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#);
+        assert_eq!(n, 4, "solid border = one filled rect per side (got {n})");
+    }
+
+    #[test]
+    fn dashed_border_emits_many_dash_segments() {
+        // A dashed border marches a row of short bars along each side, so it
+        // emits far MORE rectangles than the 4 a solid border would.
+        let dashed = rect_op_count(
+            r#"<div style="border:2pt dashed #000000;width:100pt;height:40pt"></div>"#,
+        );
+        let solid =
+            rect_op_count(r#"<div style="border:2pt solid #000000;width:100pt;height:40pt"></div>"#);
+        assert!(
+            dashed > solid * 3,
+            "dashed border splits into many segments (dashed={dashed} vs solid={solid})"
+        );
+    }
+
+    #[test]
+    fn dotted_border_dots_march_along_the_side() {
+        // A single 90pt dotted side at 3pt width: square dots with period
+        // = dash + gap = 2·width = 6pt ⇒ ~15 dots. Several, but bounded.
+        let n = rect_op_count(
+            r#"<div style="border-bottom:3pt dotted #000000;width:90pt;height:30pt"></div>"#,
+        );
+        assert!(
+            (8..=20).contains(&n),
+            "one dotted side ≈ a dozen square dots (got {n})"
+        );
+    }
+
+    #[test]
+    fn double_border_draws_two_parallel_lines() {
+        // A single `double` side renders as exactly two thin parallel rects.
+        let n = rect_op_count(
+            r#"<div style="border-top:6pt double #000000;width:90pt;height:30pt"></div>"#,
+        );
+        assert_eq!(n, 2, "double border = two parallel lines per side (got {n})");
+    }
+
+    #[test]
+    fn linear_gradient_background_emits_axial_shading() {
+        // A `linear-gradient` background paints a real PDF axial shading
+        // (`/ShadingType 2`), referenced from the page via a `/Pattern` fill.
+        let pdf = render(
+            r#"<div style="background:linear-gradient(90deg,#ff0000,#0000ff);width:100pt;height:40pt"></div>"#,
+            &[],
+            300.0,
+            200.0,
+            10.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        let raw = String::from_utf8_lossy(&pdf);
+        assert!(
+            raw.contains("/ShadingType"),
+            "an axial shading dictionary was written"
+        );
+        let doc = Document::open(&pdf).expect("re-open");
+        let content = String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
+        assert!(
+            content.contains("Pattern cs") && content.contains("scn"),
+            "the box fills with the shading pattern (content: {content:?})"
+        );
+    }
+
+    #[test]
+    fn gradient_geometry_maps_css_angle_to_endpoints() {
+        use crate::html::css::{GradientStop, LinearGradient};
+        use crate::svg::Fill;
+        let stops = vec![
+            GradientStop {
+                color: [1.0, 0.0, 0.0],
+                pos: None,
+            },
+            GradientStop {
+                color: [0.0, 0.0, 1.0],
+                pos: None,
+            },
+        ];
+        // `90deg` ≡ "to right": gradient line runs left→right across the box,
+        // centred vertically. Box 100×40 ⇒ start (0,20), end (100,20).
+        let img = gradient_svg_image(
+            &LinearGradient {
+                angle_deg: 90.0,
+                stops: stops.clone(),
+            },
+            100.0,
+            40.0,
+            1.0,
+        )
+        .expect("an image is built");
+        let prim = &img.prims[0];
+        let Some(Fill::Gradient(g)) = &prim.fill else {
+            panic!("the rect is gradient-filled");
+        };
+        match g.kind {
+            crate::svg::GradKind::Linear { x1, y1, x2, y2 } => {
+                assert!(
+                    (x1 - 0.0).abs() < 0.01 && (x2 - 100.0).abs() < 0.01,
+                    "x endpoints span the width ({x1}→{x2})"
+                );
+                assert!(
+                    (y1 - 20.0).abs() < 0.01 && (y2 - 20.0).abs() < 0.01,
+                    "y stays centred ({y1},{y2})"
+                );
+            }
+            _ => panic!("axial (linear) gradient"),
+        }
+        assert_eq!(g.stops.len(), 2, "both stops carried");
+        // First stop at 0, second at 1 (auto-placed ends).
+        assert!((g.stops[0].offset - 0.0).abs() < 0.01 && (g.stops[1].offset - 1.0).abs() < 0.01);
+
+        // `180deg` ≡ "to bottom" (the default): line runs top→bottom, centred
+        // horizontally. Box 100×40 ⇒ start (50,0), end (50,40) in SVG Y-down.
+        let img2 = gradient_svg_image(
+            &LinearGradient {
+                angle_deg: 180.0,
+                stops,
+            },
+            100.0,
+            40.0,
+            1.0,
+        )
+        .unwrap();
+        if let Some(Fill::Gradient(g2)) = &img2.prims[0].fill {
+            if let crate::svg::GradKind::Linear { x1, y1, x2, y2 } = g2.kind {
+                assert!(
+                    (x1 - 50.0).abs() < 0.01 && (x2 - 50.0).abs() < 0.01,
+                    "x centred ({x1},{x2})"
+                );
+                assert!(
+                    (y1 - 0.0).abs() < 0.01 && (y2 - 40.0).abs() < 0.01,
+                    "y spans top→bottom ({y1}→{y2})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gradient_stop_positions_auto_placed_between_anchors() {
+        // Three stops, middle one unpositioned ⇒ it lands midway (0.5).
+        use crate::html::css::{GradientStop, LinearGradient};
+        let g = LinearGradient {
+            angle_deg: 90.0,
+            stops: vec![
+                GradientStop {
+                    color: [1.0, 0.0, 0.0],
+                    pos: Some(0.0),
+                },
+                GradientStop {
+                    color: [0.0, 1.0, 0.0],
+                    pos: None,
+                },
+                GradientStop {
+                    color: [0.0, 0.0, 1.0],
+                    pos: Some(1.0),
+                },
+            ],
+        };
+        let offs = resolve_stop_offsets(&g);
+        assert_eq!(offs.len(), 3);
+        assert!(
+            (offs[1] - 0.5).abs() < 0.01,
+            "middle stop auto-placed at 0.5 (got {})",
+            offs[1]
+        );
+    }
+
+    #[test]
+    fn styled_borders_and_gradient_render_without_panic() {
+        // A box that combines a dashed border, a double side, and a gradient
+        // background must produce a valid, non-trivial PDF (the whole pipeline).
+        let html = r#"<div style="background:linear-gradient(45deg,#ffcc00,#cc00ff 80%);
+                                   border:3pt dashed #003366;
+                                   border-bottom:4pt double #ff0000;
+                                   width:160pt;height:80pt"></div>"#;
+        let pdf = render(html, &[], 300.0, 200.0, 12.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        assert!(pdf.len() > 400, "non-trivial output ({} bytes)", pdf.len());
     }
 }

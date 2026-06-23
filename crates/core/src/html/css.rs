@@ -164,6 +164,72 @@ impl Edges {
     }
 }
 
+/// How a border side's line is drawn. Only the line *style* — the width lives in
+/// [`Edges`] and the colour in `border_color_edges`. `Solid` keeps the legacy
+/// filled-rectangle rendering; the others change how the side is stroked. Any
+/// unrecognised `border-style` keyword falls back to `Solid` (tolerant parsing),
+/// so the visual is unchanged for every value we don't special-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderStyle {
+    /// A continuous line (the default; rendered as a filled rectangle, exactly
+    /// as before this style existed).
+    #[default]
+    Solid,
+    /// A row of dashes — long on/off segments along the side.
+    Dashed,
+    /// A row of dots — short square on/off segments (dash length ≈ width).
+    Dotted,
+    /// Two parallel thin lines with a gap between them.
+    Double,
+}
+
+/// A single `box-shadow` layer, resolved to points.
+///
+/// The paint layer approximates it **without a real Gaussian blur**: it fills an
+/// offset rectangle (`dx`, `dy`) grown by `spread` on every side, in `color`, at
+/// a reduced alpha when `blur > 0` (the alpha stands in for the soft falloff a
+/// true blur would give). `inset` shadows are parsed but not painted (the engine
+/// has no clip primitive in the HTML layer to confine an inner shadow), so an
+/// `inset` layer is recorded and skipped rather than drawn wrongly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxShadow {
+    /// Horizontal offset in points (positive → right).
+    pub dx: f64,
+    /// Vertical offset in points (positive → down).
+    pub dy: f64,
+    /// Blur radius in points. Not used as a true blur; drives the painted alpha.
+    pub blur: f64,
+    /// Spread distance in points (grows the shadow rect on every side).
+    pub spread: f64,
+    /// Shadow colour (RGB 0..=1); any alpha in the source colour is dropped.
+    pub color: [f64; 3],
+    /// `inset` keyword — recorded but not painted (no inner-shadow clip).
+    pub inset: bool,
+}
+
+/// A CSS `linear-gradient(...)` background. Stops carry an RGB colour and an
+/// optional position (`0.0..=1.0`); a `None` position is spread evenly between
+/// its positioned neighbours at paint time (CSS default-stop placement). The
+/// `angle_deg` follows the CSS convention: `0deg` points to the top, `90deg` to
+/// the right, increasing clockwise (`to right` ≡ `90deg`, `to bottom` ≡
+/// `180deg`). Only the linear form is modelled; radial/conic gradients are not
+/// parsed (the declaration is then ignored and any solid `background` stands).
+#[derive(Debug, Clone)]
+pub struct LinearGradient {
+    /// Gradient line direction in CSS degrees (`0` = upward, clockwise).
+    pub angle_deg: f64,
+    /// Colour stops in declaration order; `pos` is `0..=1` or `None`.
+    pub stops: Vec<GradientStop>,
+}
+
+/// One `linear-gradient` colour stop: an RGB colour and an optional position
+/// (`0.0..=1.0`, `None` = auto-placed).
+#[derive(Debug, Clone, Copy)]
+pub struct GradientStop {
+    pub color: [f64; 3],
+    pub pos: Option<f64>,
+}
+
 /// A fully-resolved computed style for one element.
 #[derive(Debug, Clone)]
 pub struct Style {
@@ -207,6 +273,17 @@ pub struct Style {
     /// longhands override an individual side, letting a cell stroke (say) only
     /// a coloured bottom rule.
     pub border_color_edges: [[f64; 3]; 4],
+    /// Per-side border line styles in `[top, right, bottom, left]` order. Each
+    /// side defaults to `Solid` (the legacy filled-rectangle rendering), so a
+    /// border without an explicit style — or with one we don't special-case —
+    /// looks exactly as it did before. `Dashed`/`Dotted`/`Double` change only
+    /// how that side is drawn, never its geometry. Not inherited.
+    pub border_style_edges: [BorderStyle; 4],
+    /// `background: linear-gradient(...)` / `background-image: linear-gradient(...)`.
+    /// When set it paints over (or in place of) the solid `background`. `None`
+    /// for the overwhelming majority of boxes, keeping the flat-fill path
+    /// untouched. Not inherited.
+    pub background_gradient: Option<LinearGradient>,
     /// `vertical-align` of table-cell content within its (taller) row box.
     pub vertical_align: VAlign,
     /// `border-collapse: collapse` — adjacent table-cell borders share a single
@@ -328,6 +405,16 @@ pub struct Style {
     /// during cascade from the *parent* em so a shrunk glyph still shifts by the
     /// surrounding text's scale. Not inherited.
     pub valign_shift: f64,
+    /// `border-radius` corner radii in points, `[top-left, top-right,
+    /// bottom-right, bottom-left]` (the CSS clockwise order). All `0` means
+    /// square corners — the default — and the box paints via the unchanged
+    /// rectangular path. Only the circular (single-value) radius per corner is
+    /// modelled; elliptical `h / v` pairs collapse to their horizontal value.
+    /// Not inherited.
+    pub border_radius: [f64; 4],
+    /// `box-shadow` (first/topmost layer only). `None` = no shadow. Painted as a
+    /// flat offset rectangle behind the box — see [`BoxShadow`]. Not inherited.
+    pub box_shadow: Option<BoxShadow>,
 }
 
 /// CSS `float` side.
@@ -458,6 +545,8 @@ impl Default for Style {
             border_width: Edges::default(),
             border_color: [0.0, 0.0, 0.0],
             border_color_edges: [[0.0, 0.0, 0.0]; 4],
+            border_style_edges: [BorderStyle::Solid; 4],
+            background_gradient: None,
             vertical_align: VAlign::Top,
             border_collapse: false,
             width: None,
@@ -506,6 +595,8 @@ impl Default for Style {
             clear: Clear::None,
             valign: VShift::Baseline,
             valign_shift: 0.0,
+            border_radius: [0.0; 4],
+            box_shadow: None,
         }
     }
 }
@@ -1199,6 +1290,9 @@ fn inherit(parent: &Style) -> Style {
         // Per-side colours reset to the (resolved) text colour like
         // `border-color`; longhands repaint individual sides during cascade.
         border_color_edges: [parent.color; 4],
+        // Border line style and background gradient are not inherited.
+        border_style_edges: [BorderStyle::Solid; 4],
+        background_gradient: None,
         // `vertical-align` is not inherited (resets to the initial value).
         vertical_align: VAlign::Top,
         // `border-collapse` IS inherited so it can be set once on the <table>
@@ -1253,6 +1347,9 @@ fn inherit(parent: &Style) -> Style {
         // `vertical-align` is not inherited; super/sub apply to the run only.
         valign: VShift::Baseline,
         valign_shift: 0.0,
+        // `border-radius` / `box-shadow` are box decorations — not inherited.
+        border_radius: [0.0; 4],
+        box_shadow: None,
     }
 }
 
@@ -1387,6 +1484,141 @@ fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
         }
     }
     None
+}
+
+/// Split `a, b, c, …` on every top-level comma (commas inside nested parens —
+/// e.g. an `rgb(…)` colour — stay with their part). Trimmed, empties dropped.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    out.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last);
+    }
+    out
+}
+
+/// Parse the inside of a `linear-gradient(...)` into a [`LinearGradient`].
+///
+/// Accepts an optional leading direction — an angle (`90deg`, `0.25turn`, a bare
+/// number treated as degrees) or a `to <side[ side]>` keyword — followed by two
+/// or more colour stops (`<color> [<pos>]`, where `<pos>` is a `%` or `0..1`
+/// number). Returns `None` unless at least two stops resolve, so a malformed or
+/// non-linear value leaves any solid `background` in place. Default direction is
+/// `180deg` (`to bottom`), per CSS.
+fn parse_linear_gradient(inner: &str, em: f64) -> Option<LinearGradient> {
+    let parts = split_top_level_commas(inner);
+    if parts.is_empty() {
+        return None;
+    }
+    // The first part is a direction only if it has no colour (a colour-less
+    // angle/keyword); otherwise every part is a stop and the angle defaults.
+    let (angle_deg, stop_parts): (f64, &[&str]) = match parse_gradient_direction(parts[0]) {
+        Some(a) => (a, &parts[1..]),
+        None => (180.0, &parts[..]),
+    };
+    let stops: Vec<GradientStop> = stop_parts
+        .iter()
+        .filter_map(|p| parse_gradient_stop(p, em))
+        .collect();
+    if stops.len() < 2 {
+        return None;
+    }
+    Some(LinearGradient { angle_deg, stops })
+}
+
+/// Parse a gradient direction token: a CSS angle (`Ndeg`/`Nturn`/`Nrad`/`Ngrad`
+/// or a bare number = degrees) or a `to <side>[ <side>]` keyword. Returns the
+/// angle in CSS degrees (`0` = up, clockwise), or `None` if it isn't a
+/// direction (i.e. it's the first colour stop).
+fn parse_gradient_direction(tok: &str) -> Option<f64> {
+    let t = tok.trim();
+    if let Some(sides) = t.strip_prefix("to ") {
+        return Some(side_keywords_to_angle(sides.trim()));
+    }
+    parse_gradient_angle(t)
+}
+
+/// Convert a CSS angle literal to degrees. Supports `deg`, `grad`, `rad`, `turn`
+/// and a bare number (degrees). `None` if it isn't a number-with-(optional)-unit.
+fn parse_gradient_angle(t: &str) -> Option<f64> {
+    let lower = t.to_ascii_lowercase();
+    for (unit, to_deg) in [
+        ("deg", 1.0),
+        ("grad", 0.9),                         // 400grad = 360deg
+        ("turn", 360.0),                       // 1turn = 360deg
+        ("rad", 180.0 / std::f64::consts::PI), // radians → degrees
+    ] {
+        if let Some(num) = lower.strip_suffix(unit) {
+            return num.trim().parse::<f64>().ok().map(|n| n * to_deg);
+        }
+    }
+    // A bare number is degrees; reject anything else (e.g. a colour name).
+    lower.parse::<f64>().ok()
+}
+
+/// `to right` ⇒ 90, `to bottom` ⇒ 180, `to left` ⇒ 270, `to top` ⇒ 0; the
+/// diagonal `to <v> <h>` corners use the 45° approximations CSS rounds to for a
+/// square box (good enough for our axial fill). Unknown ⇒ 180 (`to bottom`).
+fn side_keywords_to_angle(sides: &str) -> f64 {
+    let mut top = false;
+    let mut bottom = false;
+    let mut left = false;
+    let mut right = false;
+    for s in sides.split_whitespace() {
+        match s {
+            "top" => top = true,
+            "bottom" => bottom = true,
+            "left" => left = true,
+            "right" => right = true,
+            _ => {}
+        }
+    }
+    match (top, bottom, left, right) {
+        (true, _, false, false) => 0.0,
+        (_, true, false, false) => 180.0,
+        (false, false, false, true) => 90.0,
+        (false, false, true, false) => 270.0,
+        (true, _, _, true) => 45.0,  // to top right
+        (_, true, _, true) => 135.0, // to bottom right
+        (_, true, true, _) => 225.0, // to bottom left
+        (true, _, true, _) => 315.0, // to top left
+        _ => 180.0,
+    }
+}
+
+/// Parse one `<color> [<position>]` gradient stop. `<position>` is a `%` or a
+/// `0..1` number (other length units are ignored — the stop is then auto-placed).
+/// `None` if no colour parses.
+fn parse_gradient_stop(p: &str, _em: f64) -> Option<GradientStop> {
+    let mut color = None;
+    let mut pos = None;
+    for tok in p.split_whitespace() {
+        if let Some(pct) = tok.strip_suffix('%').and_then(|n| n.parse::<f64>().ok()) {
+            pos = Some((pct / 100.0).clamp(0.0, 1.0));
+        } else if let Some(c) = parse_color(tok) {
+            color = Some(c);
+        } else if let Ok(n) = tok.parse::<f64>() {
+            // A bare 0..1 number as a position (rare but valid in our subset).
+            pos = Some(n.clamp(0.0, 1.0));
+        }
+    }
+    color.map(|color| GradientStop { color, pos })
 }
 
 /// Parse the column count from a `columns` shorthand (`column-width ||
@@ -1896,8 +2128,20 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 style.color = c;
             }
         }
-        "background" | "background-color" => {
-            style.background = parse_color(v.split_whitespace().next().unwrap_or(v));
+        "background" | "background-color" | "background-image" => {
+            // A `linear-gradient(...)` (with or without the `background-image`
+            // longhand) is captured as a gradient that paints over the box; the
+            // solid `background` is left as-is so a `background-color` fallback
+            // declared alongside still shows where the gradient can't. Otherwise
+            // the value is a flat colour (first token of the `background`
+            // shorthand); `background-image` never sets a solid colour.
+            if let Some(g) = strip_func(v.trim(), "linear-gradient")
+                .and_then(|inner| parse_linear_gradient(inner, style.font_size))
+            {
+                style.background_gradient = Some(g);
+            } else if prop != "background-image" {
+                style.background = parse_color(v.split_whitespace().next().unwrap_or(v));
+            }
         }
         "font-size" => {
             if let Some(px) = parse_len_px(v, style.font_size) {
@@ -2026,17 +2270,23 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             // `border: 1px solid #ccc` — take first length + a colour if present.
             // A bare `border-width` carries only the length(s); `none`/`hidden`
             // zero the side(s).
-            let (w, c, vis) = parse_border_shorthand(v, style.font_size);
+            let (w, c, vis, s) = parse_border_shorthand(v, style.font_size);
             style.border_width = Edges::all(if vis { w } else { 0.0 });
             if let Some(c) = c {
                 style.border_color = c;
                 style.border_color_edges = [c; 4];
             }
+            // A `solid` keyword (or none at all) restores the default; the
+            // shorthand resets every side's style, matching CSS reset semantics.
+            style.border_style_edges = [s.unwrap_or(BorderStyle::Solid); 4];
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
-            let (w, c, vis) = parse_border_shorthand(v, style.font_size);
+            let (w, c, vis, s) = parse_border_shorthand(v, style.font_size);
             let i = border_side_index(prop);
             set_border_side(style, i, if vis { Some(w) } else { Some(0.0) }, c);
+            // The side shorthand also resets THIS side's style (to the given
+            // keyword, or `solid` when none was written).
+            style.border_style_edges[i] = s.unwrap_or(BorderStyle::Solid);
         }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             let i = border_side_index(prop);
@@ -2052,8 +2302,9 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 set_border_side(style, border_side_index(prop), None, Some(c));
             }
         }
-        // `border-style` longhands carry no geometry in our model, but `none`/
-        // `hidden` must suppress the rule even when a width is also declared.
+        // `border-style` longhands set the per-side line style. `none`/`hidden`
+        // still suppress the rule (zero width) even when a width is also
+        // declared; any other keyword sets the side's `BorderStyle`.
         "border-style"
         | "border-top-style"
         | "border-right-style"
@@ -2064,6 +2315,11 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                     "border-style" => style.border_width = Edges::default(),
                     _ => set_border_side(style, border_side_index(prop), Some(0.0), None),
                 }
+            } else if prop == "border-style" {
+                // 1–4 keywords, TRBL fill rules (like the box shorthands).
+                apply_border_style_shorthand(style, v);
+            } else if let Some(s) = parse_border_style_keyword(v.trim()) {
+                style.border_style_edges[border_side_index(prop)] = s;
             }
         }
         "vertical-align" => {
@@ -2097,6 +2353,20 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             };
         }
         "border-collapse" => style.border_collapse = v == "collapse",
+        "border-radius" => style.border_radius = parse_border_radius(v, style.font_size),
+        "border-top-left-radius" => {
+            style.border_radius[0] = parse_corner_radius(v, style.font_size);
+        }
+        "border-top-right-radius" => {
+            style.border_radius[1] = parse_corner_radius(v, style.font_size);
+        }
+        "border-bottom-right-radius" => {
+            style.border_radius[2] = parse_corner_radius(v, style.font_size);
+        }
+        "border-bottom-left-radius" => {
+            style.border_radius[3] = parse_corner_radius(v, style.font_size);
+        }
+        "box-shadow" => style.box_shadow = parse_box_shadow(v, style.font_size),
         "width" => style.width = parse_len(v, style.font_size),
         _ => {}
     }
@@ -2116,30 +2386,146 @@ fn border_side_index(prop: &str) -> usize {
 }
 
 /// Parse a `border` / `border-{side}` shorthand value into
-/// `(width_pt, colour?, visible)`. Width defaults to a hairline (1pt) when a
-/// style/colour is given without a length (matching the CSS `medium` initial
-/// width pragmatically); `none`/`hidden` set `visible = false`.
-fn parse_border_shorthand(v: &str, em: f64) -> (f64, Option<[f64; 3]>, bool) {
+/// `(width_pt, colour?, visible, style?)`. Width defaults to a hairline (1pt)
+/// when a style/colour is given without a length (matching the CSS `medium`
+/// initial width pragmatically); `none`/`hidden` set `visible = false`. The
+/// `style?` is the recognised line-style keyword (`solid`/`dashed`/`dotted`/
+/// `double`) when one appears, so `border: 1px dashed red` carries its dash.
+fn parse_border_shorthand(v: &str, em: f64) -> (f64, Option<[f64; 3]>, bool, Option<BorderStyle>) {
     let mut w = 1.0;
     let mut got_w = false;
     let mut color = None;
     let mut visible = true;
+    let mut style = None;
     for tok in v.split_whitespace() {
         if let Some(px) = parse_len_px(tok, em) {
             w = px;
             got_w = true;
         } else if matches!(tok, "none" | "hidden") {
             visible = false;
+        } else if let Some(s) = parse_border_style_keyword(tok) {
+            style = Some(s);
         } else if let Some(c) = parse_color(tok) {
             color = Some(c);
         }
-        // other style keywords (solid/dashed/dotted/double/…) carry no geometry
     }
     // `border: 0` (explicit zero length) keeps width 0 even though `visible`.
     if got_w && w <= 0.0 {
         visible = false;
     }
-    (w, color, visible)
+    (w, color, visible, style)
+}
+
+/// Map a `border-style` keyword to a [`BorderStyle`]. Only the styles we render
+/// distinctly map to a non-`Solid` value; every other recognised keyword
+/// (`groove`/`ridge`/`inset`/`outset`/`solid`) renders solid, and an unknown
+/// token returns `None` (not a style keyword at all). `none`/`hidden` are
+/// handled by the width path, not here.
+fn parse_border_style_keyword(tok: &str) -> Option<BorderStyle> {
+    match tok {
+        "dashed" => Some(BorderStyle::Dashed),
+        "dotted" => Some(BorderStyle::Dotted),
+        "double" => Some(BorderStyle::Double),
+        "solid" | "groove" | "ridge" | "inset" | "outset" => Some(BorderStyle::Solid),
+        _ => None,
+    }
+}
+
+/// `border-style` shorthand: 1–4 keywords applied TRBL with the CSS shorthand
+/// fill rules. Unknown keywords fall back to `Solid`. A `none`/`hidden` value is
+/// handled by the caller (it zeroes the width); this only sets line styles.
+fn apply_border_style_shorthand(style: &mut Style, v: &str) {
+    let kinds: Vec<BorderStyle> = v
+        .split_whitespace()
+        .map(|t| parse_border_style_keyword(t).unwrap_or(BorderStyle::Solid))
+        .collect();
+    style.border_style_edges = match kinds.as_slice() {
+        [a] => [*a, *a, *a, *a],
+        [a, b] => [*a, *b, *a, *b],
+        [a, b, c] => [*a, *b, *c, *b],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        _ => return,
+    };
+}
+
+/// Parse the `border-radius` shorthand into `[top-left, top-right, bottom-right,
+/// bottom-left]` (CSS clockwise order), in points.
+///
+/// Supports the 1–4 value forms (`r` / `tl-tr-bl tr-bl` … per CSS) and the
+/// elliptical `h… / v…` syntax — the vertical radii are dropped (only circular
+/// corners are modelled), so `10px / 20px` keeps the 10px horizontal radius.
+/// Percentages resolve against the font-size here (no box size is available at
+/// parse time); unparseable tokens fall back to `0`, never panicking.
+fn parse_border_radius(v: &str, em: f64) -> [f64; 4] {
+    // Elliptical form `horizontal / vertical` — keep the horizontal radii only.
+    let h_part = v.split('/').next().unwrap_or(v);
+    let vals: Vec<f64> = h_part
+        .split_whitespace()
+        .map(|t| parse_len_px(t, em).unwrap_or(0.0).max(0.0))
+        .collect();
+    match vals.as_slice() {
+        // CSS fill rules for 1–4 values (TL, TR, BR, BL):
+        [a] => [*a, *a, *a, *a],
+        [a, b] => [*a, *b, *a, *b],
+        [a, b, c] => [*a, *b, *c, *b],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        _ => [0.0; 4],
+    }
+}
+
+/// Parse a single corner-radius longhand (e.g. `border-top-left-radius`). Takes
+/// the first (horizontal) value of a possible `h v` pair; `0` on failure.
+fn parse_corner_radius(v: &str, em: f64) -> f64 {
+    v.split_whitespace()
+        .next()
+        .and_then(|t| parse_len_px(t, em))
+        .unwrap_or(0.0)
+        .max(0.0)
+}
+
+/// Parse a `box-shadow` value into its first layer (topmost). `none` (or an
+/// unparseable value) yields `None`.
+///
+/// Grammar handled: `[inset] <dx> <dy> [blur] [spread] [color]` in any order for
+/// the keyword/colour, with the lengths in their canonical order. Only the first
+/// comma-separated layer is kept (the topmost one a browser paints last); extra
+/// layers are ignored rather than mis-stacked. A missing colour defaults to a
+/// translucent-looking black (the paint layer already dims by `blur`).
+fn parse_box_shadow(v: &str, em: f64) -> Option<BoxShadow> {
+    let v = resolve_var(v);
+    let first = v.split(',').next().unwrap_or(&v).trim();
+    if first.is_empty() || first.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut inset = false;
+    let mut color: Option<[f64; 3]> = None;
+    let mut lengths: Vec<f64> = Vec::new();
+    for tok in first.split_whitespace() {
+        if tok.eq_ignore_ascii_case("inset") {
+            inset = true;
+        } else if let Some(px) = parse_len_px(tok, em) {
+            lengths.push(px);
+        } else if let Some(c) = parse_color(tok) {
+            color = Some(c);
+        }
+        // unknown keywords are skipped (tolerant parsing)
+    }
+    // Need at least the two offsets to place a shadow.
+    if lengths.len() < 2 {
+        return None;
+    }
+    let dx = lengths[0];
+    let dy = lengths[1];
+    let blur = lengths.get(2).copied().unwrap_or(0.0).max(0.0);
+    let spread = lengths.get(3).copied().unwrap_or(0.0);
+    Some(BoxShadow {
+        dx,
+        dy,
+        blur,
+        spread,
+        color: color.unwrap_or([0.0, 0.0, 0.0]),
+        inset,
+    })
 }
 
 /// Set one side's border width and/or colour, keeping `border_color` (the
@@ -2812,6 +3198,213 @@ mod tests {
         // width then style:none → side suppressed (CSS: a none side has no rule).
         let s = inline_style("border-bottom-width:4pt;border-bottom-style:none");
         assert_eq!(s.border_width.bottom, 0.0);
+    }
+
+    // ── border-radius / box-shadow ──────────────────────────────────────────
+
+    #[test]
+    fn border_radius_defaults_to_square() {
+        // No `border-radius` ⇒ all corners zero (the unchanged rectangular path).
+        let s = inline_style("background:#eee");
+        assert_eq!(s.border_radius, [0.0; 4]);
+        assert!(s.box_shadow.is_none());
+    }
+
+    #[test]
+    fn border_radius_single_value_applies_to_all_corners() {
+        // `8pt` → every corner 8pt. (TL, TR, BR, BL).
+        let s = inline_style("border-radius:8pt");
+        assert_eq!(s.border_radius, [8.0, 8.0, 8.0, 8.0]);
+        // px converts at 0.75pt/px: 16px → 12pt.
+        let s = inline_style("border-radius:16px");
+        assert_eq!(s.border_radius, [12.0, 12.0, 12.0, 12.0]);
+    }
+
+    #[test]
+    fn border_radius_fill_rules_match_css() {
+        // 2 values: TL/BR = a, TR/BL = b.
+        let s = inline_style("border-radius:10pt 20pt");
+        assert_eq!(s.border_radius, [10.0, 20.0, 10.0, 20.0]);
+        // 3 values: TL=a, TR/BL=b, BR=c.
+        let s = inline_style("border-radius:1pt 2pt 3pt");
+        assert_eq!(s.border_radius, [1.0, 2.0, 3.0, 2.0]);
+        // 4 values: TL, TR, BR, BL verbatim.
+        let s = inline_style("border-radius:1pt 2pt 3pt 4pt");
+        assert_eq!(s.border_radius, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn border_radius_elliptical_keeps_horizontal_radii() {
+        // `h / v` form: only the horizontal radii are modelled (circular corners).
+        let s = inline_style("border-radius:10pt 20pt / 5pt 6pt");
+        assert_eq!(s.border_radius, [10.0, 20.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn border_radius_corner_longhands_set_one_corner_each() {
+        let s = inline_style(
+            "border-top-left-radius:1pt;border-top-right-radius:2pt;\
+             border-bottom-right-radius:3pt;border-bottom-left-radius:4pt",
+        );
+        assert_eq!(s.border_radius, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn box_shadow_parses_offsets_blur_spread_color() {
+        let s = inline_style("box-shadow:2pt 3pt 4pt 1pt #ff0000");
+        let sh = s.box_shadow.expect("a shadow");
+        assert_eq!(sh.dx, 2.0);
+        assert_eq!(sh.dy, 3.0);
+        assert_eq!(sh.blur, 4.0);
+        assert_eq!(sh.spread, 1.0);
+        assert_eq!(sh.color, [1.0, 0.0, 0.0]);
+        assert!(!sh.inset);
+    }
+
+    #[test]
+    fn box_shadow_minimal_two_offsets_only() {
+        // Just the required two offsets ⇒ blur/spread default 0, colour black.
+        let s = inline_style("box-shadow:4pt 4pt");
+        let sh = s.box_shadow.expect("a shadow");
+        assert_eq!((sh.dx, sh.dy, sh.blur, sh.spread), (4.0, 4.0, 0.0, 0.0));
+        assert_eq!(sh.color, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn box_shadow_inset_and_colour_in_any_order() {
+        // `inset` keyword + leading colour are both tolerated.
+        let s = inline_style("box-shadow:inset #00ff00 1pt 2pt 3pt");
+        let sh = s.box_shadow.expect("a shadow");
+        assert!(sh.inset);
+        assert_eq!(sh.color, [0.0, 1.0, 0.0]);
+        assert_eq!((sh.dx, sh.dy, sh.blur), (1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn box_shadow_none_and_garbage_yield_none() {
+        assert!(inline_style("box-shadow:none").box_shadow.is_none());
+        // A single offset is not enough to place a shadow.
+        assert!(inline_style("box-shadow:5pt").box_shadow.is_none());
+    }
+
+    #[test]
+    fn box_shadow_keeps_only_first_layer() {
+        // Two comma-separated layers: only the first (topmost) is kept.
+        let s = inline_style("box-shadow:1pt 1pt #ff0000, 9pt 9pt #0000ff");
+        let sh = s.box_shadow.expect("a shadow");
+        assert_eq!((sh.dx, sh.dy), (1.0, 1.0));
+        assert_eq!(sh.color, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn border_radius_and_box_shadow_are_not_inherited() {
+        // A parent radius/shadow must not leak to a child element.
+        let nodes = parse(
+            r#"<div style="border-radius:10pt;box-shadow:2pt 2pt #000"><span>x</span></div>"#,
+        );
+        let sheet = Stylesheet::new("");
+        let div = match &nodes[0] {
+            super::super::dom::Node::Element(e) => e,
+            _ => panic!("div"),
+        };
+        let parent = sheet.computed(div, &Style::default(), &[]);
+        assert_eq!(parent.border_radius, [10.0; 4], "parent keeps its radius");
+        assert!(parent.box_shadow.is_some());
+        let span = match &div.children[0] {
+            super::super::dom::Node::Element(e) => e,
+            _ => panic!("span"),
+        };
+        let child = sheet.computed(span, &parent, &[div]);
+        assert_eq!(child.border_radius, [0.0; 4], "radius is not inherited");
+        assert!(child.box_shadow.is_none(), "shadow is not inherited");
+    }
+
+    // ── border-style (dashed/dotted/double) / linear-gradient ────────────────
+
+    #[test]
+    fn border_shorthand_captures_dashed_style() {
+        // `border: 1px dashed red` carries width, colour AND the dash style on
+        // all four sides; the default stays solid for an unstyled border.
+        let s = inline_style("border:2pt dashed #ff0000");
+        assert_eq!(s.border_width.top, 2.0);
+        assert_eq!(s.border_color_edges, [[1.0, 0.0, 0.0]; 4]);
+        assert_eq!(s.border_style_edges, [BorderStyle::Dashed; 4]);
+
+        // A solid (or styleless) border is — and stays — Solid.
+        let plain = inline_style("border:1pt solid #000000");
+        assert_eq!(plain.border_style_edges, [BorderStyle::Solid; 4]);
+    }
+
+    #[test]
+    fn per_side_border_styles_parse() {
+        // Longhand and side-shorthand each set just their own side's style.
+        let s = inline_style(
+            "border:1pt solid #000000;border-bottom:1pt dotted #000000;border-left-style:double",
+        );
+        assert_eq!(s.border_style_edges[0], BorderStyle::Solid, "top stays solid");
+        assert_eq!(s.border_style_edges[2], BorderStyle::Dotted, "bottom dotted");
+        assert_eq!(s.border_style_edges[3], BorderStyle::Double, "left double");
+    }
+
+    #[test]
+    fn border_style_shorthand_is_trbl() {
+        // `border-style: dashed dotted` → top/bottom dashed, right/left dotted.
+        let s = inline_style("border:1pt solid #000000;border-style:dashed dotted");
+        assert_eq!(s.border_style_edges[0], BorderStyle::Dashed, "top");
+        assert_eq!(s.border_style_edges[1], BorderStyle::Dotted, "right");
+        assert_eq!(s.border_style_edges[2], BorderStyle::Dashed, "bottom = top");
+        assert_eq!(s.border_style_edges[3], BorderStyle::Dotted, "left = right");
+    }
+
+    #[test]
+    fn unknown_border_style_falls_back_to_solid() {
+        // `groove` (and any value we don't render distinctly) stays Solid.
+        let s = inline_style("border:1pt groove #000000");
+        assert_eq!(s.border_style_edges, [BorderStyle::Solid; 4]);
+    }
+
+    #[test]
+    fn linear_gradient_parses_angle_and_stops() {
+        let s = inline_style("background:linear-gradient(90deg, #ff0000, #0000ff)");
+        let g = s.background_gradient.as_ref().expect("a gradient parsed");
+        assert!((g.angle_deg - 90.0).abs() < 0.01, "90deg angle");
+        assert_eq!(g.stops.len(), 2, "two stops");
+        assert_eq!(g.stops[0].color, [1.0, 0.0, 0.0]);
+        assert_eq!(g.stops[1].color, [0.0, 0.0, 1.0]);
+        // A gradient does not set a solid background colour.
+        assert!(s.background.is_none(), "solid background left unset");
+    }
+
+    #[test]
+    fn linear_gradient_to_side_keyword_and_positions() {
+        // `to right` ≡ 90deg; a `%` position is captured per stop.
+        let s = inline_style("background-image:linear-gradient(to right, red 10%, blue 90%)");
+        let g = s.background_gradient.as_ref().expect("gradient");
+        assert!((g.angle_deg - 90.0).abs() < 0.01, "to right = 90deg");
+        assert_eq!(g.stops[0].pos, Some(0.10));
+        assert_eq!(g.stops[1].pos, Some(0.90));
+    }
+
+    #[test]
+    fn linear_gradient_default_direction_is_to_bottom() {
+        // No leading direction ⇒ CSS default 180deg (to bottom).
+        let s = inline_style("background:linear-gradient(red, blue)");
+        let g = s.background_gradient.as_ref().expect("gradient");
+        assert!((g.angle_deg - 180.0).abs() < 0.01, "default 180deg");
+        assert_eq!(g.stops.len(), 2);
+    }
+
+    #[test]
+    fn malformed_gradient_leaves_solid_background_intact() {
+        // A one-stop (invalid) gradient is ignored; a separately declared solid
+        // colour still applies (gradient parsing never clobbers it).
+        let s = inline_style("background:#112233;background-image:linear-gradient(red)");
+        assert!(s.background_gradient.is_none(), "one-stop gradient rejected");
+        let bg = s.background.expect("solid background preserved");
+        assert!(
+            approx(bg, [17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0]),
+            "got {bg:?}"
+        );
     }
 
     #[test]
