@@ -1864,6 +1864,27 @@ export interface FieldInfo {
   required: boolean;
   multiline: boolean;
   fillable: boolean;
+  /**
+   * Whether this is a **comb** text field (`/Ff` bit 25): the value is laid out
+   * one character per equally-spaced cell across {@link maxLen} cells (SSN, dates
+   * and reference numbers on official forms). A host reproducing the field's
+   * original spacing must honour this — the cells can't be inferred from the
+   * value alone.
+   */
+  comb: boolean;
+  /** Text alignment from `/Q` (AcroForm default applied): 0 = left, 1 = centre, 2 = right. */
+  quadding: number;
+  /**
+   * Font resource name from the field's `/DA` default appearance (e.g. `"Helv"`,
+   * `"ZaDb"`), resolved against the AcroForm; absent when no `Tf` is present.
+   */
+  daFont?: string;
+  /** Font size in points from the `/DA` (`0` = auto-size), AcroForm default applied. */
+  daSize: number;
+  /**
+   * `/MaxLen` for text fields; for a comb field this is the number of
+   * equally-spaced cells the value is drawn into.
+   */
   maxLen?: number;
   /** 1-based page the widget sits on (from its `/P`); absent if it has no widget. */
   page?: number;
@@ -2707,9 +2728,11 @@ export class GigaPdfDoc {
   /**
    * Rasterize a page to a PNG **without the page content stream's text** — glyphs
    * are suppressed while gradients, shadings, images, vectors and patterns are
-   * preserved. Annotation/widget appearances are still painted in full. Use this
-   * to paint a text-free raster background the editor can overlay real, editable
-   * text on top of.
+   * preserved. Form-field **widget** appearances are omitted (the editor re-shows
+   * their values as an editable overlay, so baking them in would double every
+   * field); other annotation appearances (stamps, highlights, ink) are still
+   * painted. Use this to paint a text-free raster background the editor can
+   * overlay real, editable text on top of.
    */
   renderPageNoText(page: number, scale = 1): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_render_page_no_text(this.h, page, scale, o));
@@ -2722,8 +2745,10 @@ export class GigaPdfDoc {
    * (including the non-text content of non-excluded elements) renders normally.
    * Use it to paint a background without specific elements and overlay live,
    * editable versions on top. Generalises {@link renderPageNoText} (which
-   * suppresses *all* text). An empty `indices` renders the full page; unknown
-   * indices are ignored.
+   * suppresses *all* text). Like {@link renderPageNoText}, form-field **widget**
+   * appearances are omitted (the editor re-shows them as an editable overlay);
+   * other annotation appearances are painted. An empty `indices` renders the full
+   * page; unknown indices are ignored.
    */
   renderPageExcluding(page: number, indices: number[], scale = 1): Uint8Array {
     return this.g._buffer((o) =>

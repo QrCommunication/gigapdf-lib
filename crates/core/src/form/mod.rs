@@ -94,8 +94,25 @@ pub struct FormField {
     pub flags: u32,
     /// Selectable options: choice display strings, or button export states.
     pub options: Vec<String>,
-    /// `/MaxLen` for text fields, if present.
+    /// `/MaxLen` for text fields, if present. For a comb field this is the
+    /// number of equally-spaced cells the value is laid out into.
     pub max_len: Option<u32>,
+    /// Whether this is a **comb** text field (`/Ff` bit 25): the value is drawn
+    /// one character per equally-spaced cell across `max_len` cells (SSN, dates,
+    /// reference numbers on official forms). A host reproducing the field's
+    /// original spacing must honour this — the cells can't be inferred from the
+    /// value alone.
+    pub comb: bool,
+    /// Text alignment from `/Q` (falling back to the AcroForm default): 0 = left,
+    /// 1 = centre, 2 = right.
+    pub quadding: u8,
+    /// Font resource name from the field's `/DA` default appearance (e.g. `Helv`,
+    /// `ZaDb`), resolved against the AcroForm when the field has none. `None`
+    /// when no `Tf` operand is present.
+    pub da_font: Option<String>,
+    /// Font size in points from the `/DA` (`0.0` = auto-size). Falls back to the
+    /// AcroForm's `/DA` when the field carries none.
+    pub da_size: f64,
     /// 1-based page number of the field's first widget (from its `/P`), if known.
     pub page: Option<u32>,
     /// First widget bounds `[x, y, width, height]` in **top-left** origin
@@ -137,6 +154,11 @@ impl FormField {
     /// Whether a text field hides its value (password).
     pub fn is_password(&self) -> bool {
         self.field_type == "Tx" && self.flags & flags::PASSWORD != 0
+    }
+
+    /// Whether a text field is a **comb** (one character per `/MaxLen` cell).
+    pub fn is_comb(&self) -> bool {
+        self.field_type == "Tx" && self.flags & flags::COMB != 0
     }
 
     /// Whether a combo box lets the user type a custom value.

@@ -2201,10 +2201,11 @@ pub extern "C" fn gp_render_page(
 
 /// Rasterize a page to a PNG at `scale` device pixels per PDF point **without**
 /// the page content stream's text (glyphs from `Tj`/`'`/`"`/`TJ` are suppressed);
-/// gradients, shadings, images, vectors and patterns are preserved. Annotation
-/// appearances are still painted in full. Lets the editor lay real, editable text
-/// over a text-free raster background. Buffer-returning (host frees); null on
-/// error.
+/// gradients, shadings, images, vectors and patterns are preserved. Form-field
+/// **widget** appearances are omitted (the editor re-shows their values as an
+/// editable overlay, so baking them would double every field); other annotation
+/// appearances are still painted. Lets the editor lay real, editable text over a
+/// text-free raster background. Buffer-returning (host frees); null on error.
 #[no_mangle]
 pub extern "C" fn gp_render_page_no_text(
     handle: *const Document,
@@ -2224,8 +2225,11 @@ pub extern "C" fn gp_render_page_no_text(
 /// Rasterize `page` to a PNG at `scale` while **omitting** the top-level element
 /// indices in `indices_ptr`/`indices_len` (a `u32` array). Each excluded element
 /// paints nothing (fills/strokes/shadings/images/text); everything else renders
-/// normally. Lets the host paint a background without specific elements and
-/// overlay live editable versions. Buffer-returning (host frees); null on error.
+/// normally. Like `gp_render_page_no_text`, form-field **widget** appearances are
+/// omitted (the editor re-shows them as an editable overlay); other annotation
+/// appearances are painted. Lets the host paint a background without specific
+/// elements and overlay live editable versions. Buffer-returning (host frees);
+/// null on error.
 #[no_mangle]
 pub extern "C" fn gp_render_page_excluding(
     handle: *const Document,
@@ -4375,14 +4379,21 @@ fn fields_json(fields: &[FormField]) -> String {
         out.push_str(",\"type\":");
         json_escape(&field.field_type, &mut out);
         out.push_str(&format!(
-            ",\"kind\":\"{}\",\"flags\":{},\"readOnly\":{},\"required\":{},\"multiline\":{},\"fillable\":{}",
+            ",\"kind\":\"{}\",\"flags\":{},\"readOnly\":{},\"required\":{},\"multiline\":{},\"fillable\":{},\"comb\":{},\"quadding\":{},\"daSize\":{}",
             field_kind_str(field.kind()),
             field.flags,
             field.is_read_only(),
             field.is_required(),
             field.is_multiline(),
             field.is_fillable(),
+            field.comb,
+            field.quadding,
+            field.da_size,
         ));
+        if let Some(font) = &field.da_font {
+            out.push_str(",\"daFont\":");
+            json_escape(font, &mut out);
+        }
         if let Some(max) = field.max_len {
             out.push_str(&format!(",\"maxLen\":{max}"));
         }

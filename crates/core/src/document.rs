@@ -3690,12 +3690,16 @@ impl Document {
     /// are preserved untouched. This produces a text-free background the editor
     /// can overlay real, editable text on top of.
     ///
-    /// Note: annotation/widget appearance streams (`/AP /N`) are still painted
-    /// in full — their text is intentionally **not** suppressed — so form fields
-    /// and other widget appearances remain unaffected. Only the page's own
-    /// content-stream text is removed.
+    /// Form-field **widget** appearances (`/Subtype /Widget`, `/AP /N`) are
+    /// **omitted** from this background: their filled values would otherwise be
+    /// baked into the raster *and* re-shown by the editable overlay, doubling
+    /// every field. Non-widget annotation appearances (stamps, highlights, ink)
+    /// are still painted in full. Only the page's own content-stream text and the
+    /// widget appearances are removed.
     pub fn render_page_no_text(&self, page_no: u32, scale: f64) -> Result<Vec<u8>> {
-        Ok(self.render_page_canvas(page_no, scale, true)?.to_png())
+        Ok(self
+            .render_page_canvas_ex(page_no, scale, true, &[], false)?
+            .to_png())
     }
 
     /// Rasterize a page to a PNG at `scale` device pixels per PDF point while
@@ -3708,8 +3712,11 @@ impl Document {
     ///
     /// Generalises [`render_page_no_text`](Self::render_page_no_text) (which
     /// suppresses *all* text); `render_page_no_text` is unchanged. Unknown indices
-    /// are ignored; an empty `indices` renders the full page. Annotation/widget
-    /// appearances are always painted in full.
+    /// are ignored; an empty `indices` renders the full page. Like
+    /// [`render_page_no_text`](Self::render_page_no_text), form-field **widget**
+    /// appearances are omitted (the editor re-shows them as an editable overlay);
+    /// non-widget annotation appearances (stamps, highlights, ink) are painted in
+    /// full.
     pub fn render_page_excluding(
         &self,
         page_no: u32,
@@ -3717,7 +3724,7 @@ impl Document {
         scale: f64,
     ) -> Result<Vec<u8>> {
         Ok(self
-            .render_page_canvas_ex(page_no, scale, false, indices)?
+            .render_page_canvas_ex(page_no, scale, false, indices, false)?
             .to_png())
     }
 
@@ -3741,17 +3748,17 @@ impl Document {
     }
 
     /// Rasterize a page to an RGBA [`Canvas`](crate::raster::Canvas) at `scale`
-    /// device pixels per point. Shared by `render_page`, `render_page_no_text`
-    /// and `ocr_page`. When `skip_text` is true the page content stream's text is
-    /// suppressed (see [`Document::render_page_no_text`]); annotation appearances
-    /// are always rendered in full.
+    /// device pixels per point. Shared by `render_page` and OCR. When `skip_text`
+    /// is true the page content stream's text is suppressed (see
+    /// [`Document::render_page_no_text`]); annotation **and** widget appearances
+    /// are always rendered in full (the complete-page rendering path).
     fn render_page_canvas(
         &self,
         page_no: u32,
         scale: f64,
         skip_text: bool,
     ) -> Result<crate::raster::Canvas> {
-        self.render_page_canvas_ex(page_no, scale, skip_text, &[])
+        self.render_page_canvas_ex(page_no, scale, skip_text, &[], true)
     }
 
     /// Like [`render_page_canvas`](Self::render_page_canvas) but also suppresses
@@ -3761,12 +3768,19 @@ impl Document {
     /// the non-text content of non-excluded elements) still renders. Backs
     /// [`render_page_excluding`](Self::render_page_excluding); generalises the
     /// `skip_text` background.
+    ///
+    /// When `widget_appearances` is false, form-field **widget** appearances
+    /// (`/Subtype /Widget`) are omitted from the painted annotations — the
+    /// editor-background path uses this so filled field values aren't baked into
+    /// the raster (they would double up with the editable overlay). Non-widget
+    /// annotations are always painted regardless.
     fn render_page_canvas_ex(
         &self,
         page_no: u32,
         scale: f64,
         skip_text: bool,
         excluded_indices: &[usize],
+        widget_appearances: bool,
     ) -> Result<crate::raster::Canvas> {
         let media_box = self.read_media_box(self.page_dict(page_no)?);
         let [x0, y0, x1, y1] = media_box;
@@ -3806,10 +3820,11 @@ impl Document {
         );
         // Paint annotation appearances (`/AP /N`) over the page content, the way
         // every viewer does: page content is the body, annotations layer on top.
-        // We deliberately render annotation appearances in full even when
-        // `skip_text` is set — only the PAGE content-stream text is suppressed,
-        // so form/widget appearances stay intact for the editor overlay.
-        self.render_annotation_appearances(page_no, &mut canvas, base);
+        // Page content-stream text is suppressed by `skip_text`; widget (form
+        // field) appearances are suppressed by `!widget_appearances` so the
+        // editor background carries neither the field text nor a duplicate of the
+        // overlay.
+        self.render_annotation_appearances(page_no, &mut canvas, base, widget_appearances);
         Ok(canvas)
     }
 
@@ -3824,11 +3839,17 @@ impl Document {
     /// transform (ISO 32000-1 §12.5.5) and rasterize the form through the shared
     /// content renderer. Annotations without an appearance are skipped. `/CA`
     /// (non-stroking opacity) scales the paint.
+    ///
+    /// When `widget_appearances` is false, annotations with `/Subtype /Widget`
+    /// (form fields) are skipped entirely — used by the editor-background render
+    /// so filled field values aren't baked into the raster underneath the
+    /// editable overlay.
     fn render_annotation_appearances(
         &self,
         page_no: u32,
         canvas: &mut crate::raster::Canvas,
         base: content::PageMatrix,
+        widget_appearances: bool,
     ) {
         let Ok(page) = self.page_dict(page_no) else {
             return;
@@ -3841,6 +3862,13 @@ impl Document {
             let Some(dict) = self.resolve(item).as_dict() else {
                 continue;
             };
+            // Skip form-field widgets when the caller asked for a widget-free
+            // background (the editor re-shows their values as an editable layer).
+            if !widget_appearances
+                && dict.get(b"Subtype").and_then(Object::as_name) == Some(b"Widget".as_slice())
+            {
+                continue;
+            }
             // Skip Hidden (bit 2 → value 2) and NoView (bit 6 → value 32).
             let flags = dict.get(b"F").and_then(Object::as_i64).unwrap_or(0);
             if flags & 0b10 != 0 || flags & 0b10_0000 != 0 {
@@ -11819,6 +11847,16 @@ impl Document {
             .and_then(Object::as_i64)
             .filter(|n| *n >= 0)
             .map(|n| n as u32);
+        let comb = field_type == "Tx" && flags & form::flags::COMB != 0;
+        // `/DA` font + size (field's own, else AcroForm default — ISO 32000-1
+        // §12.7.3.3); `/Q` quadding, falling back to the AcroForm `/Q`.
+        let (da_font, da_size, _) = parse_da_full(&self.field_da(dict));
+        let quadding = dict
+            .get(b"Q")
+            .and_then(Object::as_i64)
+            .or_else(|| self.acroform_default_quadding())
+            .unwrap_or(0)
+            .clamp(0, 2) as u8;
         let options = match field_type.as_str() {
             "Ch" => self
                 .choice_options(dict)
@@ -11852,9 +11890,25 @@ impl Document {
             flags,
             options,
             max_len,
+            comb,
+            quadding,
+            da_font,
+            da_size,
             page,
             bounds,
         });
+    }
+
+    /// The AcroForm's default `/Q` quadding (inherited by fields that omit their
+    /// own), if the catalog declares one. Clamped to `0..=2` at the call site.
+    fn acroform_default_quadding(&self) -> Option<i64> {
+        self.catalog()
+            .ok()?
+            .get(b"AcroForm")
+            .map(|o| self.resolve(o))?
+            .as_dict()?
+            .get(b"Q")
+            .and_then(Object::as_i64)
     }
 
     /// A widget's page number (1-based, from `/P`) and top-left bounds
@@ -16528,6 +16582,105 @@ mod tests {
             saved.windows(16).any(|w| w == b"/NeedAppearances"),
             "NeedAppearances set"
         );
+    }
+
+    #[test]
+    fn no_text_background_omits_filled_widget_appearances() {
+        // A filled text-field widget paints its value + border as an `/AP /N`.
+        // The editor background (`render_page_no_text` / `render_page_excluding`)
+        // must NOT bake those widget pixels — they'd double up with the editable
+        // overlay the host lays on top. The full render keeps them.
+        let pdf = crate::convert::reverse::txt_to_pdf("widget host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default(); // black border + black text
+        doc.add_text_field(
+            1,
+            "lastname",
+            [50.0, 700.0, 300.0, 720.0],
+            "Belolo",
+            None,
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+        let doc = Document::open(&doc.save()).unwrap();
+
+        let count_nonwhite = |png: &[u8]| -> usize {
+            crate::raster::decode_png(png)
+                .expect("valid PNG")
+                .rgba
+                .chunks_exact(4)
+                .filter(|px| px[0] != 255 || px[1] != 255 || px[2] != 255)
+                .count()
+        };
+
+        let full = count_nonwhite(&doc.render_page(1, 2.0).unwrap());
+        let no_text = count_nonwhite(&doc.render_page_no_text(1, 2.0).unwrap());
+        let excluding = count_nonwhite(&doc.render_page_excluding(1, &[], 2.0).unwrap());
+
+        assert!(
+            full > 0,
+            "full render paints the widget (border + value): {full} px"
+        );
+        assert!(
+            no_text < full,
+            "no-text background drops the widget ink ({no_text} px) vs full ({full} px)"
+        );
+        assert!(
+            excluding < full,
+            "excluding background also drops the widget ink ({excluding} px) vs full ({full} px)"
+        );
+    }
+
+    #[test]
+    fn extracts_comb_text_field_format() {
+        // A comb field (`/Ff` bit 25 + `/MaxLen`) lays its value out one char per
+        // cell; the host needs `comb`, `max_len` and `quadding` to reproduce the
+        // original spacing — they can't be inferred from the value. Build a comb
+        // text field, then read its format back.
+        let pdf = crate::convert::reverse::txt_to_pdf("comb host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default();
+        doc.add_text_field(
+            1,
+            "ssn",
+            [50.0, 700.0, 300.0, 720.0],
+            "123456789012345",
+            Some(15),
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+
+        // Promote it to a centred comb by OR-ing the COMB flag and setting `/Q`.
+        let id = doc.find_field_id("ssn").expect("ssn field registered");
+        if let Some(Object::Dictionary(field)) = doc.objects.get(&id).cloned().as_mut() {
+            let ff = field.get(b"Ff").and_then(Object::as_i64).unwrap_or(0)
+                | i64::from(form::flags::COMB);
+            field.set(b"Ff", Object::Integer(ff));
+            field.set(b"Q", Object::Integer(1)); // centre
+            doc.objects.insert(id, Object::Dictionary(field.clone()));
+        } else {
+            panic!("ssn field is a dictionary");
+        }
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let field = reopened
+            .form_fields()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "ssn")
+            .expect("ssn field present after round-trip");
+
+        assert!(field.comb, "comb flag detected: flags={:#x}", field.flags);
+        assert!(field.is_comb(), "is_comb() agrees with the flag");
+        assert_eq!(field.max_len, Some(15), "MaxLen = number of comb cells");
+        assert_eq!(field.quadding, 1, "/Q centre alignment surfaced");
+        // Default style → `/DA` is `/Helv 0 Tf …` (0 = auto-size).
+        assert_eq!(field.da_font.as_deref(), Some("Helv"), "DA font name");
+        assert_eq!(field.da_size, 0.0, "DA auto-size (0)");
     }
 
     #[test]
