@@ -4,6 +4,38 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.72.0] - 2026-06-24
+
+Fidelity release focused on text extraction and AcroForm rendering on dense
+government forms (CERFA). The public API is additive — existing behaviour is
+unchanged except where noted as a fix.
+
+### Added
+
+- **`FormField` now surfaces its text-formatting metadata.** Each field exposes
+  `comb` (the `/Ff` comb flag for fixed-pitch character cells), `quadding` (the
+  `/Q` justification: 0 left, 1 centre, 2 right), and the default-appearance font
+  and size parsed from the field's `/DA` string as `daFont` / `daSize`. This lets
+  a host reproduce a field's intended layout (combed cells, alignment, font
+  metrics) without re-parsing the appearance stream.
+
+### Fixed
+
+- **Spurious in-word spaces during text extraction.** A new gap-aware
+  `runs_join` helper now drives all four reconstruction paths (lines,
+  paragraphs, lists, tables): a word split across several font runs no longer
+  emits a phantom space at each run boundary (e.g. `ENFANT S` is reassembled as
+  `ENFANTS`). Spacing is decided from the real inter-run gap, not the mere fact
+  that the text changed font.
+- **Form-field appearances double-rendered behind the editable text.** A
+  `widget_appearances` flag makes `renderPageNoText` / `renderPageExcluding`
+  omit the `/AP` appearance streams of AcroForm widgets, so a filled field's
+  baked-in value no longer shows through underneath the live, editable overlay.
+- **Borderless prose misdetected as a table.** A `line_has_gutter` guard now
+  requires a real inter-cell gutter before promoting a borderless block to a
+  table: a two-run-per-line prose notice is kept as prose, while genuine tables
+  (wide column gutters) are still recognised.
+
 ## [0.71.1] - 2026-06-23
 
 Documentation-only patch. No code changes — the WASM blob is byte-for-byte
