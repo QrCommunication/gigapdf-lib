@@ -509,6 +509,93 @@ impl Interp<'_> {
         self.y = p3.1;
     }
 
+    /// flex (12 35): 13 args (dx1 dy1 dx2 dy2 dx3 dy3 dx4 dy4 dx5 dy5 dx6 dy6
+    /// fd) → two cubic curves. `fd` (flex depth) only affects hinting and is
+    /// ignored for outline rendering.
+    fn flex(&mut self) {
+        let s = &self.stack;
+        if s.len() < 12 {
+            return;
+        }
+        let (a, b) = (s[0], s[1]);
+        let (c, d) = (s[2], s[3]);
+        let (e, f) = (s[4], s[5]);
+        let (g, h) = (s[6], s[7]);
+        let (k, l) = (s[8], s[9]);
+        let (m, n) = (s[10], s[11]);
+        self.curveto(a, b, c, d, e, f);
+        self.curveto(g, h, k, l, m, n);
+    }
+
+    /// hflex (12 34): 7 args (dx1 dx2 dy2 dx3 dx4 dx5 dx6). The two curves keep
+    /// the start/end on the same y; only the inner points carry the vertical
+    /// excursion `dy2`, undone by `-dy2` on the second curve's mid point.
+    fn hflex(&mut self) {
+        let s = &self.stack;
+        if s.len() < 7 {
+            return;
+        }
+        let dx1 = s[0];
+        let dx2 = s[1];
+        let dy2 = s[2];
+        let dx3 = s[3];
+        let dx4 = s[4];
+        let dx5 = s[5];
+        let dx6 = s[6];
+        self.curveto(dx1, 0.0, dx2, dy2, dx3, 0.0);
+        self.curveto(dx4, 0.0, dx5, -dy2, dx6, 0.0);
+    }
+
+    /// hflex1 (12 36): 9 args (dx1 dy1 dx2 dy2 dx3 dx4 dx5 dy5 dx6). Start and
+    /// end share the same y; the final dy closes the vertical loop:
+    /// -(dy1 + dy2 + dy5).
+    fn hflex1(&mut self) {
+        let s = &self.stack;
+        if s.len() < 9 {
+            return;
+        }
+        let dx1 = s[0];
+        let dy1 = s[1];
+        let dx2 = s[2];
+        let dy2 = s[3];
+        let dx3 = s[4];
+        let dx4 = s[5];
+        let dx5 = s[6];
+        let dy5 = s[7];
+        let dx6 = s[8];
+        self.curveto(dx1, dy1, dx2, dy2, dx3, 0.0);
+        self.curveto(dx4, 0.0, dx5, dy5, dx6, -(dy1 + dy2 + dy5));
+    }
+
+    /// flex1 (12 37): 11 args (dx1 dy1 dx2 dy2 dx3 dy3 dx4 dy4 dx5 dy5 d6). The
+    /// last point closes on the dominant axis: if the total |dx| > |dy| the
+    /// final point is (d6, -dy_total), else (-dx_total, d6).
+    fn flex1(&mut self) {
+        let s = &self.stack;
+        if s.len() < 11 {
+            return;
+        }
+        let dx1 = s[0];
+        let dy1 = s[1];
+        let dx2 = s[2];
+        let dy2 = s[3];
+        let dx3 = s[4];
+        let dy3 = s[5];
+        let dx4 = s[6];
+        let dy4 = s[7];
+        let dx5 = s[8];
+        let dy5 = s[9];
+        let d6 = s[10];
+        let dx = dx1 + dx2 + dx3 + dx4 + dx5;
+        let dy = dy1 + dy2 + dy3 + dy4 + dy5;
+        self.curveto(dx1, dy1, dx2, dy2, dx3, dy3);
+        if dx.abs() > dy.abs() {
+            self.curveto(dx4, dy4, dx5, dy5, d6, -dy);
+        } else {
+            self.curveto(dx4, dy4, dx5, dy5, -dx, d6);
+        }
+    }
+
     fn exec(&mut self, code: &[u8], depth: usize) -> bool {
         if depth > 10 {
             return true;
@@ -728,7 +815,16 @@ impl Interp<'_> {
                     i += 4;
                 }
                 12 => {
-                    i += 1; // escape operators (flex etc.) — skip, clear operands
+                    // Escape: the operator is a second byte (b1).
+                    let b1 = *code.get(i).unwrap_or(&0);
+                    i += 1;
+                    match b1 {
+                        34 => self.hflex(),
+                        35 => self.flex(),
+                        36 => self.hflex1(),
+                        37 => self.flex1(),
+                        _ => {} // other 12-x operators (arithmetic/deprecated): ignore.
+                    }
                     self.stack.clear();
                 }
                 _ => self.stack.clear(),
@@ -933,6 +1029,172 @@ mod tests {
         assert_eq!(c[0], (100.0, 100.0), "moveto");
         assert_eq!(c[1], (150.0, 100.0), "rlineto +50x");
         assert_eq!(c[2], (150.0, 150.0), "rlineto +50y");
+    }
+
+    /// Build a fresh interpreter for charstring-level unit tests.
+    fn interp() -> Interp<'static> {
+        Interp {
+            stack: Vec::new(),
+            x: 0.0,
+            y: 0.0,
+            contours: Vec::new(),
+            current: Vec::new(),
+            n_stems: 0,
+            width: None,
+            have_width: true, // skip width-stripping in flex unit tests
+            gsubrs: &[],
+            lsubrs: &[],
+            default_width: 0.0,
+        }
+    }
+
+    /// Run flex with explicit operands and return the emitted contour points
+    /// (after the leading moveto vertex).
+    fn run_flex(operands: &[f64], op12: u8) -> Vec<(f64, f64)> {
+        let mut it = interp();
+        // Seed a start point so the curve has somewhere to begin.
+        it.current.push((0.0, 0.0));
+        it.stack = operands.to_vec();
+        it.exec(&[12, op12], 0);
+        it.current
+    }
+
+    /// Reference cubic flattening matching Interp::curveto (8 steps), used to
+    /// derive the EXPECTED points independently from absolute control points.
+    fn flatten(start: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64)) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        const STEPS: usize = 8;
+        for i in 1..=STEPS {
+            let t = i as f64 / STEPS as f64;
+            let mt = 1.0 - t;
+            let x = mt * mt * mt * start.0
+                + 3.0 * mt * mt * t * p1.0
+                + 3.0 * mt * t * t * p2.0
+                + t * t * t * p3.0;
+            let y = mt * mt * mt * start.1
+                + 3.0 * mt * mt * t * p1.1
+                + 3.0 * mt * t * t * p2.1
+                + t * t * t * p3.1;
+            out.push((x, y));
+        }
+        out
+    }
+
+    fn approx_eq(a: &[(f64, f64)], b: &[(f64, f64)]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(p, q)| (p.0 - q.0).abs() < 1e-6 && (p.1 - q.1).abs() < 1e-6)
+    }
+
+    #[test]
+    fn flex_emits_two_cubic_curves() {
+        // flex (12 35): two curves with explicit relative deltas; fd ignored.
+        let ops = [10.0, 0.0, 20.0, 30.0, 10.0, 0.0, 10.0, 0.0, 20.0, -30.0, 10.0, 0.0, 50.0];
+        let pts = run_flex(&ops, 35);
+        // Curve 1 absolute control points from start (0,0).
+        let c1 = flatten((0.0, 0.0), (10.0, 0.0), (30.0, 30.0), (40.0, 30.0));
+        // Curve 2 begins at end of curve 1 (40,30).
+        let c2 = flatten((40.0, 30.0), (50.0, 30.0), (70.0, 0.0), (80.0, 0.0));
+        let mut expected = vec![(0.0, 0.0)];
+        expected.extend(c1);
+        expected.extend(c2);
+        assert!(approx_eq(&pts, &expected), "flex points\n got {pts:?}\n exp {expected:?}");
+        // End point must be exactly (80, 0): start + total dx, y returned to 0.
+        assert_eq!(*pts.last().unwrap(), (80.0, 0.0));
+    }
+
+    #[test]
+    fn hflex_keeps_endpoints_on_baseline() {
+        // hflex (12 34): dx1 dx2 dy2 dx3 dx4 dx5 dx6
+        let ops = [10.0, 20.0, 15.0, 10.0, 10.0, 20.0, 10.0];
+        let pts = run_flex(&ops, 34);
+        let c1 = flatten((0.0, 0.0), (10.0, 0.0), (30.0, 15.0), (40.0, 15.0));
+        let c2 = flatten((40.0, 15.0), (50.0, 15.0), (70.0, 0.0), (80.0, 0.0));
+        let mut expected = vec![(0.0, 0.0)];
+        expected.extend(c1);
+        expected.extend(c2);
+        assert!(approx_eq(&pts, &expected), "hflex points");
+        // Endpoint returns to baseline y = 0.
+        assert!((pts.last().unwrap().1).abs() < 1e-9, "hflex ends on y=0");
+    }
+
+    #[test]
+    fn hflex1_closes_vertical_loop() {
+        // hflex1 (12 36): dx1 dy1 dx2 dy2 dx3 dx4 dx5 dy5 dx6
+        let ops = [10.0, 5.0, 20.0, 10.0, 10.0, 10.0, 20.0, -8.0, 10.0];
+        let pts = run_flex(&ops, 36);
+        // dy_close = -(5 + 10 + (-8)) = -7  → end y = 0.
+        let c1 = flatten((0.0, 0.0), (10.0, 5.0), (30.0, 15.0), (40.0, 15.0));
+        let c2 = flatten((40.0, 15.0), (50.0, 15.0), (70.0, 7.0), (80.0, 0.0));
+        let mut expected = vec![(0.0, 0.0)];
+        expected.extend(c1);
+        expected.extend(c2);
+        assert!(approx_eq(&pts, &expected), "hflex1 points\n got {pts:?}\n exp {expected:?}");
+        assert!((pts.last().unwrap().1).abs() < 1e-9, "hflex1 ends on starting y");
+    }
+
+    #[test]
+    fn flex1_closes_on_dominant_axis() {
+        // flex1 (12 37): horizontal-dominant case → last point = (d6, -dy_total).
+        // dx_total = 10+20+10+10+20 = 70, dy_total = 0+10+0+0+(-10) = 0 → |dx|>|dy|.
+        let ops = [10.0, 0.0, 20.0, 10.0, 10.0, 0.0, 10.0, 0.0, 20.0, -10.0, 10.0];
+        let pts = run_flex(&ops, 37);
+        let c1 = flatten((0.0, 0.0), (10.0, 0.0), (30.0, 10.0), (40.0, 10.0));
+        // last delta = (d6=10, -dy_total=0) → from (50,10) by (50,? ) ... compute:
+        // p4 = (40+10,10+0)=(50,10); p5=(50+20,10-10)=(70,0); p6=(70+10,0+0)=(80,0)
+        let c2 = flatten((40.0, 10.0), (50.0, 10.0), (70.0, 0.0), (80.0, 0.0));
+        let mut expected = vec![(0.0, 0.0)];
+        expected.extend(c1);
+        expected.extend(c2);
+        assert!(approx_eq(&pts, &expected), "flex1 points\n got {pts:?}\n exp {expected:?}");
+        assert_eq!(*pts.last().unwrap(), (80.0, 0.0));
+    }
+
+    #[test]
+    fn flex1_vertical_dominant_branch() {
+        // Vertical-dominant: dx_total small, dy_total large → last = (-dx_total, d6).
+        // dx_total = 0+5+0+0+(-5) = 0, dy_total = 10+20+10+10+20 = 70 → |dy|>|dx|.
+        let ops = [0.0, 10.0, 5.0, 20.0, 0.0, 10.0, 0.0, 10.0, -5.0, 20.0, 12.0];
+        let pts = run_flex(&ops, 37);
+        let c1 = flatten((0.0, 0.0), (0.0, 10.0), (5.0, 30.0), (5.0, 40.0));
+        // p4 = (5+dx4, 40+dy4) = (5, 50); p5 = (5+dx5, 50+dy5) = (0, 70);
+        // last delta = (-dx_total=0, d6=12) → p6 = (0, 82).
+        let c2 = flatten((5.0, 40.0), (5.0, 50.0), (0.0, 70.0), (0.0, 82.0));
+        let mut expected = vec![(0.0, 0.0)];
+        expected.extend(c1);
+        expected.extend(c2);
+        assert!(approx_eq(&pts, &expected), "flex1 vertical points\n got {pts:?}\n exp {expected:?}");
+        assert_eq!(*pts.last().unwrap(), (0.0, 82.0));
+    }
+
+    #[test]
+    fn non_flex_charstring_unaffected() {
+        // Regression: a glyph with rrcurveto (no flex) must still flatten to the
+        // same point count and endpoint as before the flex change.
+        let n = |v: i32| (v + 139) as u8;
+        let cs = vec![
+            n(0),
+            n(0),
+            21, // rmoveto to (0,0)
+            n(10),
+            n(20),
+            n(30),
+            n(40),
+            n(50),
+            n(0),
+            8,  // rrcurveto: one cubic
+            14, // endchar
+        ];
+        let mut it = interp();
+        it.exec(&cs, 0);
+        it.finish_contour();
+        assert_eq!(it.contours.len(), 1);
+        let c = &it.contours[0];
+        // 1 moveto vertex + 8 flattening steps.
+        assert_eq!(c.len(), 9, "rrcurveto unaffected by flex addition");
+        // Endpoint = (0+10+30+50, 0+20+40+0) = (90, 60).
+        assert_eq!(*c.last().unwrap(), (90.0, 60.0));
     }
 
     #[test]
