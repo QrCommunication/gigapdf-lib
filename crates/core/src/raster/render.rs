@@ -13,9 +13,27 @@ use crate::font::cmap::TextDecoder;
 use crate::font::GlyphSource;
 use crate::object::Object;
 
-/// The shape of a PDF shading (ISO 32000-1 §8.7.4.5): an axial (type 2) or radial
-/// (type 3) gradient. Coordinates are in the shading's own space; the renderer
-/// maps device pixels back into this space to evaluate the gradient parameter `t`.
+/// One vertex of a mesh-shading triangle: a position in the shading's own
+/// coordinate space plus its already-resolved device-RGB colour. The colour is
+/// baked at parse time (the `/ColorSpace` / `/Function` is evaluated by the
+/// document, exactly like the axial/radial ramp) so the rasterizer stays free of
+/// the object graph and only interpolates.
+#[derive(Debug, Clone, Copy)]
+pub struct MeshVertex {
+    /// X in shading space.
+    pub x: f64,
+    /// Y in shading space.
+    pub y: f64,
+    /// Resolved device-RGB colour at this vertex.
+    pub color: [u8; 3],
+}
+
+/// The shape of a PDF shading (ISO 32000-1 §8.7.4.5): an axial (type 2) gradient,
+/// a radial (type 3) gradient, or a mesh (types 4–7) reduced to a list of
+/// Gouraud-shaded triangles. Coordinates are in the shading's own space; for
+/// axial/radial the renderer maps device pixels back into this space to evaluate
+/// the gradient parameter `t`, while a mesh maps each triangle *forward* to
+/// device space and barycentric-interpolates the per-vertex colours.
 #[derive(Debug, Clone)]
 pub enum ShadingKind {
     /// Axial: the gradient runs along the segment `(x0,y0)→(x1,y1)`.
@@ -29,6 +47,12 @@ pub enum ShadingKind {
         y1: f64,
         r1: f64,
     },
+    /// Mesh (types 4–7): a flat list of Gouraud triangles. Free-form (4) and
+    /// lattice (5) Gouraud meshes contribute their triangles directly; Coons (6)
+    /// and tensor (7) patches are subdivided into a triangle grid by the parser.
+    /// Each triple of [`MeshVertex`] is one triangle (`triangles.len()` is a
+    /// multiple of 3).
+    Mesh { triangles: Vec<MeshVertex> },
 }
 
 /// A resolved shading ready to paint: its geometry, a pre-sampled 256-entry RGB
@@ -1223,6 +1247,9 @@ fn shading_param(kind: &ShadingKind, x: f64, y: f64, extend: [bool; 2]) -> (f64,
                 None => (0.0, false),
             }
         }
+        // Mesh shadings are painted triangle-by-triangle (forward-mapped), never
+        // through this per-pixel inverse-map parameterisation.
+        ShadingKind::Mesh { .. } => (0.0, false),
     }
 }
 
@@ -1250,6 +1277,13 @@ fn paint_shading(
     global_alpha: f64,
     blend: BlendMode,
 ) {
+    // Mesh shadings (types 4–7) are painted by forward-mapping each Gouraud
+    // triangle to device space and barycentric-interpolating its colours, so they
+    // take a separate path from the axial/radial per-pixel inverse map.
+    if let ShadingKind::Mesh { triangles } = &shading.kind {
+        paint_mesh(canvas, triangles, &shading.to_device, clip, global_alpha, blend);
+        return;
+    }
     let Some(inv) = invert(&shading.to_device) else {
         return;
     };
@@ -1269,6 +1303,91 @@ fn paint_shading(
                 continue;
             }
             let color = shading.color_at(t);
+            canvas.blend_mode(px, py, color, cov * global_alpha, blend);
+        }
+    }
+}
+
+/// Paint a mesh shading: forward-map every Gouraud triangle from shading space to
+/// device pixels and fill it with barycentric-interpolated vertex colours, honouring
+/// the clip coverage and global/blend compositing. Triangles are taken three vertices
+/// at a time (Coons/tensor patches have already been tessellated by the parser).
+fn paint_mesh(
+    canvas: &mut Canvas,
+    triangles: &[MeshVertex],
+    to_device: &Matrix,
+    clip: Option<&ClipMask>,
+    global_alpha: f64,
+    blend: BlendMode,
+) {
+    for tri in triangles.chunks_exact(3) {
+        // Map the three vertices into device space; their colours travel unchanged.
+        let p: [(f64, f64); 3] = [
+            to_device.apply(tri[0].x, tri[0].y),
+            to_device.apply(tri[1].x, tri[1].y),
+            to_device.apply(tri[2].x, tri[2].y),
+        ];
+        fill_gouraud_triangle(canvas, &p, tri, clip, global_alpha, blend);
+    }
+}
+
+/// Fill one device-space triangle `p[0..3]` (with the matching `verts` colours)
+/// using barycentric interpolation. Pixels whose centre lies inside the triangle
+/// are blended with the interpolated colour scaled by the clip coverage. A
+/// degenerate (zero-area) triangle paints nothing.
+fn fill_gouraud_triangle(
+    canvas: &mut Canvas,
+    p: &[(f64, f64); 3],
+    verts: &[MeshVertex],
+    clip: Option<&ClipMask>,
+    global_alpha: f64,
+    blend: BlendMode,
+) {
+    // Signed area ×2 (the barycentric denominator). Near-zero ⇒ no fill.
+    let (ax, ay) = p[0];
+    let (bx, by) = p[1];
+    let (cx, cy) = p[2];
+    let denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    if denom.abs() < 1e-9 {
+        return;
+    }
+    let inv_denom = 1.0 / denom;
+    // Device-pixel bounding box of the triangle, clamped to the canvas.
+    let min_x = ax.min(bx).min(cx).floor().max(0.0) as i32;
+    let max_x = ax.max(bx).max(cx).ceil().min(canvas.width as f64) as i32;
+    let min_y = ay.min(by).min(cy).floor().max(0.0) as i32;
+    let max_y = ay.max(by).max(cy).ceil().min(canvas.height as f64) as i32;
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            let cov = match clip {
+                Some(c) => c.at(px, py),
+                None => 1.0,
+            };
+            if cov <= 0.0 {
+                continue;
+            }
+            let sx = px as f64 + 0.5;
+            let sy = py as f64 + 0.5;
+            // Barycentric weights of the pixel centre w.r.t. the triangle.
+            let w0 = ((by - cy) * (sx - cx) + (cx - bx) * (sy - cy)) * inv_denom;
+            let w1 = ((cy - ay) * (sx - cx) + (ax - cx) * (sy - cy)) * inv_denom;
+            let w2 = 1.0 - w0 - w1;
+            // A small epsilon admits edge/shared-vertex pixels so neighbouring
+            // triangles tile without leaving background-coloured seams.
+            const EPS: f64 = -1e-6;
+            if w0 < EPS || w1 < EPS || w2 < EPS {
+                continue;
+            }
+            let lerp = |i: usize| {
+                w0 * verts[0].color[i] as f64
+                    + w1 * verts[1].color[i] as f64
+                    + w2 * verts[2].color[i] as f64
+            };
+            let color = [
+                lerp(0).round().clamp(0.0, 255.0) as u8,
+                lerp(1).round().clamp(0.0, 255.0) as u8,
+                lerp(2).round().clamp(0.0, 255.0) as u8,
+            ];
             canvas.blend_mode(px, py, color, cov * global_alpha, blend);
         }
     }

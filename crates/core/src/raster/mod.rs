@@ -10,6 +10,7 @@ pub mod canvas;
 pub mod colorspace;
 pub mod gif;
 pub mod jpeg;
+pub mod mesh;
 pub mod png;
 pub mod png_decode;
 pub mod render;

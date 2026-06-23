@@ -3773,11 +3773,18 @@ impl Document {
     /// shadings (types 4–7) return `None`.
     fn read_shading(
         &self,
-        dict: &Dictionary,
+        obj: &Object,
         pattern_matrix: Option<content::PageMatrix>,
     ) -> Option<crate::raster::render::Shading> {
         use crate::raster::render::{Shading, ShadingKind};
+        let dict = obj.as_dict()?;
         let stype = dict.get(b"ShadingType").and_then(Object::as_i64)?;
+        // Mesh shadings (types 4–7) carry their geometry in the stream body, not a
+        // `/Coords` array — handle them separately. They reduce to a triangle list
+        // with per-vertex colours already resolved.
+        if (4..=7).contains(&stype) {
+            return self.read_mesh_shading(obj, stype, pattern_matrix);
+        }
         let coords: Vec<f64> = dict
             .get(b"Coords")
             .map(|o| self.resolve(o))
@@ -3800,7 +3807,7 @@ impl Document {
                 y1: coords[4],
                 r1: coords[5],
             },
-            _ => return None, // unsupported / mesh shading
+            _ => return None, // unsupported shading type
         };
         let extend = dict
             .get(b"Extend")
@@ -3841,6 +3848,94 @@ impl Document {
             kind,
             ramp,
             extend,
+            to_device: pattern_matrix.unwrap_or(content::PageMatrix::IDENTITY),
+        })
+    }
+
+    /// Read a mesh shading (ISO 32000-1 §8.7.4.5.5–8, types 4–7) into a
+    /// [`Shading`](crate::raster::render::Shading) whose `kind` is a flat Gouraud
+    /// triangle list (`ramp` is empty — mesh colours live per-vertex). The shading
+    /// is a *stream*: its packed vertex/patch data is decoded by
+    /// [`raster::mesh::decode_mesh`](crate::raster::mesh::decode_mesh), with this
+    /// method supplying the `/ColorSpace` + optional `/Function` colour resolution.
+    /// `None` if the stream can't be decoded or required bit-width keys are missing.
+    fn read_mesh_shading(
+        &self,
+        obj: &Object,
+        stype: i64,
+        pattern_matrix: Option<content::PageMatrix>,
+    ) -> Option<crate::raster::render::Shading> {
+        use crate::raster::mesh::{decode_mesh, MeshParams};
+        use crate::raster::render::{Shading, ShadingKind};
+        let stream = obj.as_stream()?;
+        let dict = &stream.dict;
+        let data = decode_stream(stream).ok()?;
+
+        let bits_per_coord = dict.get(b"BitsPerCoordinate").and_then(Object::as_i64)? as u32;
+        let bits_per_comp = dict.get(b"BitsPerComponent").and_then(Object::as_i64)? as u32;
+        // Type 5 (lattice) has no flags; the others require `/BitsPerFlag`.
+        let bits_per_flag = dict
+            .get(b"BitsPerFlag")
+            .and_then(Object::as_i64)
+            .unwrap_or(0) as u32;
+        let decode: Vec<f64> = dict
+            .get(b"Decode")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)?
+            .iter()
+            .filter_map(|o| self.resolve(o).as_f64())
+            .collect();
+
+        // Resolve the colour space; a mesh shading's `/ColorSpace` is normally an
+        // inline device name or array (DeviceRGB/Gray/CMYK, ICCBased, Separation…).
+        let cs = dict
+            .get(b"ColorSpace")
+            .and_then(|o| self.resolve_color_space(o, 0))?;
+        // When a `/Function` is present each vertex carries a single parametric
+        // value (mapped through the function into the colour space); otherwise it
+        // carries one value per colour-space component.
+        let func = dict.get(b"Function").map(|o| self.resolve(o).clone());
+        let n_color = if func.is_some() { 1 } else { cs.components() };
+
+        // `/VerticesPerRow` (type 5 only).
+        let vertices_per_row = dict
+            .get(b"VerticesPerRow")
+            .and_then(Object::as_i64)
+            .unwrap_or(0)
+            .max(0) as usize;
+
+        let params = MeshParams {
+            shading_type: stype,
+            bits_per_coord,
+            bits_per_comp,
+            bits_per_flag,
+            decode,
+            n_color,
+            vertices_per_row,
+        };
+
+        // Colour closure: map the decoded per-vertex components to device RGB.
+        // `self` is the [`TintEval`] for Separation/DeviceN tints; with a
+        // `/Function` the single value is first run through it into the colour
+        // space's components.
+        let color = |comps: &[f64]| -> [u8; 3] {
+            match &func {
+                Some(f) => {
+                    let out = self.eval_function_multi(f, comps);
+                    cs.to_rgb(&out, self)
+                }
+                None => cs.to_rgb(comps, self),
+            }
+        };
+
+        let triangles = decode_mesh(&data, &params, color);
+        if triangles.is_empty() {
+            return None;
+        }
+        Some(Shading {
+            kind: ShadingKind::Mesh { triangles },
+            ramp: Vec::new(),
+            extend: [false, false],
             to_device: pattern_matrix.unwrap_or(content::PageMatrix::IDENTITY),
         })
     }
@@ -4077,31 +4172,37 @@ impl Document {
         match dict.get(b"PatternType").and_then(Object::as_i64) {
             Some(2) => {
                 let shading = dict.get(b"Shading").map(|o| self.resolve(o))?;
-                self.shading_representative_color_f(shading.as_dict()?)
+                self.shading_representative_color_f(shading)
             }
             Some(1) => self.tiling_representative_color_f(obj, resources, depth),
             _ => None,
         }
     }
 
-    /// A representative device-RGB colour (`0..=1`) for a shading dictionary: the
+    /// A representative device-RGB colour (`0..=1`) for a shading object: the
     /// midpoint of the rasterizer's axial/radial ramp, or — for a mesh shading
     /// (types 4–7) — the `/Function` sampled at its domain midpoint. Used to give
     /// a shading-pattern fill a flat stand-in in the shape layer.
-    fn shading_representative_color_f(&self, dict: &Dictionary) -> Option<[f64; 3]> {
+    fn shading_representative_color_f(&self, shading: &Object) -> Option<[f64; 3]> {
+        let dict = shading.as_dict()?;
         // Axial (2) / radial (3): reuse the exact ramp the rasterizer builds and
-        // take its middle entry — a stable, representative gradient colour.
-        if let Some(sh) = self.read_shading(dict, None) {
-            let mid = sh.ramp.get(sh.ramp.len() / 2).copied()?;
-            return Some([
-                mid[0] as f64 / 255.0,
-                mid[1] as f64 / 255.0,
-                mid[2] as f64 / 255.0,
-            ]);
+        // take its middle entry — a stable, representative gradient colour. A mesh
+        // shading produces a triangle list with an empty ramp, so skip this path
+        // and fall through to the `/Function` midpoint below.
+        if let Some(sh) = self.read_shading(shading, None) {
+            if !sh.ramp.is_empty() {
+                let mid = sh.ramp[sh.ramp.len() / 2];
+                return Some([
+                    mid[0] as f64 / 255.0,
+                    mid[1] as f64 / 255.0,
+                    mid[2] as f64 / 255.0,
+                ]);
+            }
         }
-        // Mesh shadings (types 4–7) carry their colours in a data stream the
-        // rasterizer doesn't decode; when a parametric `/Function` is present,
-        // sample it at the domain midpoint for a faithful representative colour.
+        // Mesh shadings (types 4–7) carry their colours in a data stream; when a
+        // parametric `/Function` is present, sample it at the domain midpoint for a
+        // faithful representative colour. (When there is no `/Function`, the colours
+        // live per-vertex in the stream and no single flat stand-in is derived.)
         let func = dict.get(b"Function").map(|o| self.resolve(o))?;
         let domain = self
             .resolve(dict.get(b"Domain")?)
@@ -12271,8 +12372,10 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
     }
 
     fn shading(&self, name: &[u8]) -> Option<crate::raster::render::Shading> {
+        // `resource_entry` already resolves the object (a mesh shading is a stream,
+        // axial/radial a dict — `read_shading` handles both).
         let (_, obj) = self.doc.resource_entry(&self.resources, b"Shading", name)?;
-        self.doc.read_shading(obj.as_dict()?, None)
+        self.doc.read_shading(obj, None)
     }
 
     fn pattern_shading(&self, name: &[u8]) -> Option<crate::raster::render::Shading> {
@@ -12284,7 +12387,7 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
         }
         let shading = dict.get(b"Shading").map(|o| self.doc.resolve(o))?;
         let matrix = self.doc.form_matrix(dict);
-        self.doc.read_shading(shading.as_dict()?, Some(matrix))
+        self.doc.read_shading(shading, Some(matrix))
     }
 
     fn tiling_pattern(&self, name: &[u8]) -> Option<crate::raster::render::FormXObject<'_>> {
@@ -18011,6 +18114,186 @@ mod tests {
         assert!(
             right as i32 - left as i32 > 100,
             "gradient must vary across x (left {left}, right {right})"
+        );
+    }
+
+    /// Append `value` as `n` big-endian, MSB-first bits to `out` at bit cursor
+    /// `*bit` — the packing a mesh-shading stream uses (mirror of the decoder's
+    /// `BitReader`). Test-only helper for the mesh fixtures below.
+    fn push_bits(out: &mut Vec<u8>, bit: &mut usize, value: u32, n: u32) {
+        for i in (0..n).rev() {
+            let b = ((value >> i) & 1) as u8;
+            let byte = *bit >> 3;
+            if byte >= out.len() {
+                out.push(0);
+            }
+            let shift = 7 - (*bit & 7);
+            out[byte] |= b << shift;
+            *bit += 1;
+        }
+    }
+
+    /// Build a stream-object body (`<<dict>>\nstream\n<bytes>\nendstream`) with an
+    /// accurate `/Length`, for the binary-safe [`raw_pdf_binary`] builder. `dict`
+    /// is the dictionary *contents* (without the surrounding `<< >>` length entry,
+    /// which is appended here). Test-only helper for the mesh fixtures.
+    fn stream_obj_body(dict_inner: &str, data: &[u8]) -> Vec<u8> {
+        let mut body =
+            format!("<< {dict_inner} /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+
+    #[test]
+    fn free_form_mesh_shading_paints_interpolated_triangle() {
+        // A single free-form (type-4) Gouraud triangle in DeviceRGB, no /Function.
+        // Vertices (user space, identity CTM; base flips y so device_y = 100−user_y):
+        //   v0 (10,10) black   → device (10,90)
+        //   v1 (90,10) white   → device (90,90)
+        //   v2 (10,90) red     → device (10,10)
+        // The painted region must vary in colour (Gouraud), be dark near v0, light
+        // near v1, and leave the page white well OUTSIDE the triangle.
+        let mut data = Vec::new();
+        let mut bit = 0usize;
+        // Decode [0 100 0 100  0 1 0 1 0 1] → 8-bit raw 0..255 maps coord 0..100,
+        // each colour component 0..1.
+        let coord = |v: f64| (v / 100.0 * 255.0).round() as u32;
+        let verts: [(f64, f64, [u32; 3]); 3] = [
+            (10.0, 10.0, [0, 0, 0]),       // black
+            (90.0, 10.0, [255, 255, 255]), // white
+            (10.0, 90.0, [255, 0, 0]),     // red
+        ];
+        for (x, y, rgb) in verts {
+            push_bits(&mut data, &mut bit, 0, 8); // edge flag 0
+            push_bits(&mut data, &mut bit, coord(x), 8);
+            push_bits(&mut data, &mut bit, coord(y), 8);
+            for c in rgb {
+                push_bits(&mut data, &mut bit, c, 8);
+            }
+        }
+
+        let shading_inner = "/ShadingType 4 /ColorSpace /DeviceRGB \
+             /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 \
+             /Decode [0 100 0 100 0 1 0 1 0 1]";
+        let objects = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Resources << /Shading << /Sh0 5 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, stream_obj_body("", b"q 0 0 100 100 re W n /Sh0 sh Q")),
+            (5, stream_obj_body(shading_inner, &data)),
+        ];
+        let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        let canvas = doc.render_page_canvas(1, 1.0, false).unwrap();
+
+        // Near v0 (black, device ~10,90).
+        let near_black = px(&canvas, 14, 86);
+        // Near v1 (white, device ~90,90).
+        let near_white = px(&canvas, 86, 86);
+        // Near v2 (red, device ~10,10).
+        let near_red = px(&canvas, 14, 14);
+        // Well outside the triangle (top-right corner) stays white paper.
+        let outside = px(&canvas, 90, 10);
+
+        assert!(
+            near_black[0] < 90 && near_black[1] < 90 && near_black[2] < 90,
+            "near the black vertex must be dark, got {near_black:?}"
+        );
+        assert!(
+            near_white[0] > 180 && near_white[1] > 180 && near_white[2] > 180,
+            "near the white vertex must be light, got {near_white:?}"
+        );
+        assert!(
+            near_red[0] > 150 && near_red[1] < 110 && near_red[2] < 110,
+            "near the red vertex must be reddish, got {near_red:?}"
+        );
+        assert_eq!(
+            outside,
+            [255, 255, 255],
+            "outside the triangle the page stays white, got {outside:?}"
+        );
+        // Gouraud, not flat: the three sampled corners must differ from each other.
+        assert!(
+            near_black != near_white && near_white != near_red && near_black != near_red,
+            "mesh must interpolate (corners differ): {near_black:?} {near_white:?} {near_red:?}"
+        );
+    }
+
+    #[test]
+    fn coons_mesh_shading_paints_inside_patch() {
+        // A single flag-0 Coons (type-6) patch filling the page square, DeviceRGB,
+        // no /Function. The 4 corners are black / white / red / blue; the patch
+        // interior must be painted (non-white) and vary across it.
+        let mut data = Vec::new();
+        let mut bit = 0usize;
+        let coord = |v: f64| (v / 100.0 * 255.0).round() as u32;
+        push_bits(&mut data, &mut bit, 0, 8); // flag 0 (new patch)
+                                              // 12 boundary control points tracing the page square (corners at the four
+                                              // multiples-of-3 indices), counter-clockwise from (0,0).
+        let pts = [
+            (0.0, 0.0),
+            (0.0, 33.0),
+            (0.0, 67.0),
+            (0.0, 100.0),
+            (33.0, 100.0),
+            (67.0, 100.0),
+            (100.0, 100.0),
+            (100.0, 67.0),
+            (100.0, 33.0),
+            (100.0, 0.0),
+            (67.0, 0.0),
+            (33.0, 0.0),
+        ];
+        for (x, y) in pts {
+            push_bits(&mut data, &mut bit, coord(x), 8);
+            push_bits(&mut data, &mut bit, coord(y), 8);
+        }
+        // 4 corner colours c1..c4: black, white, red, blue.
+        let cols = [[0, 0, 0], [255, 255, 255], [255, 0, 0], [0, 0, 255]];
+        for rgb in cols {
+            for c in rgb {
+                push_bits(&mut data, &mut bit, c as u32, 8);
+            }
+        }
+
+        let shading_inner = "/ShadingType 6 /ColorSpace /DeviceRGB \
+             /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 \
+             /Decode [0 100 0 100 0 1 0 1 0 1]";
+        let objects = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Resources << /Shading << /Sh0 5 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, stream_obj_body("", b"q 0 0 100 100 re W n /Sh0 sh Q")),
+            (5, stream_obj_body(shading_inner, &data)),
+        ];
+        let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        let canvas = doc.render_page_canvas(1, 1.0, false).unwrap();
+
+        // The patch covers the whole page: the centre must be painted (non-white).
+        let center = px(&canvas, 50, 50);
+        assert_ne!(
+            center,
+            [255, 255, 255],
+            "Coons patch interior must be painted, got {center:?}"
+        );
+        // Corners differ in colour → the surface interpolates rather than flat-fills.
+        // Device y is flipped: user (0,0) black → device (~,99); user (100,100)
+        // red/whatever maps near the top. Sample two far-apart interior points.
+        let a = px(&canvas, 12, 88);
+        let b = px(&canvas, 88, 12);
+        assert!(
+            a != b,
+            "Coons patch must vary across the surface, got {a:?} vs {b:?}"
         );
     }
 
