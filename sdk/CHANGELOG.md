@@ -4,6 +4,62 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.68.0] - 2026-06-23
+
+Format-reach + import/render fidelity release: the unified model now exports
+**Markdown / CSV / EPUB** end to end, Office/ODF import preserves far more
+structure, the HTML→PDF renderer gains the remaining common CSS, and several
+image-codec and rendering bugs are fixed.
+
+### Added
+
+- **Markdown / CSV / EPUB model export.** The unified editable model can now be
+  raised to **Markdown** (`modelToMd`), **CSV** (RFC 4180, `modelToCsv`) and
+  **EPUB 3** (`modelToEpub`), alongside the existing
+  `modelTo{Docx,Xlsx,Pptx,Odt,Ods,Odp,Pdf,Html,Rtf}` targets (ABI
+  `gp_model_to_{md,csv,epub}`).
+- **Complete Markdown modelling.** `CodeBlock`, `Blockquote` and
+  `HorizontalRule` are first-class in the model — full Markdown round-trip
+  (headings, runs, links, images, nested lists, GFM tables, code blocks,
+  block-quotes, horizontal rules, footnotes, front-matter) rendered and exported
+  consistently across formats.
+- **Office / ODF import fidelity.** DOCX/XLSX/PPTX and **ODF (`.odt`/`.ods`/
+  `.odp`)** import now preserves **images, hyperlinks, strikethrough,
+  highlighting, spreadsheet formulas, grouped shapes, charts, SmartArt text and
+  master/layout (theme) inheritance**.
+- **HTML / CSS → PDF — remaining common CSS.** **Radial** and **conic**
+  gradients, **`font-weight` 100–900**, **`box-shadow`** (blur), **elliptical
+  `border-radius`**, dashed/dotted borders, **`linear-gradient`** and
+  **`position: sticky`**.
+- **OpenType text shaping.** GPOS mark positioning, GSUB contextual, script
+  selection and Arabic joining (complex scripts only; Latin unchanged).
+- **Image codecs.** SVG `<text>` rendering and GIF multi-frame decoding.
+- **Run highlight.** Character-level `background` is painted and emitted across
+  HTML, PDF and Office output.
+- **`setTextRunStyle`.** Run-level style bake exposed in the SDK.
+- **Mermaid flowchart renderer** in the HTML engine (`graph TD/LR`, node shapes,
+  typed edges + arrowheads, Sugiyama layout → PDF vectors).
+
+### Fixed
+
+- **AVIF multi-tile decode — corrupt images > 9.4 MP.** Multi-tile AVIFs were
+  decoded as a single tile, garbling pixels. The AV1 spec forces multi-tile
+  above ~9.4 MP, so essentially every modern phone/camera AVIF was silently
+  corrupted. Each tile is now decoded independently; single-tile and existing
+  fixtures are byte-for-byte unchanged (validated bit-exact vs `dav1d`).
+- **WebP lossless (VP8L)** — lossless transforms + meta-Huffman now decode real
+  `cwebp`/libwebp lossless images correctly.
+
+### Changed
+
+- **Non-Device colorspaces** — Pattern fills and `Separation`/`ICCBased` colours
+  in content streams are unified through the raster colour resolver (consistent
+  with the rasterizer) instead of a device-default fallback.
+- **Docs honesty** — README corrected to **near-zero-dependency** (hand-written
+  PDF/render/conversion core; **RustCrypto** for crypto/signatures; **Boa** for
+  JS — the earlier from-scratch JS engine is gone), **1198 tests** (was 284), and
+  `.wasm` **~5.6 MB** (was ~540 KB, before Boa was bundled).
+
 ## [0.67.0] - 2026-06-23
 
 ### Added
