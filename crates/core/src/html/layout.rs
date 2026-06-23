@@ -9,8 +9,8 @@
 //! is sliced into pages with backgrounds/borders split across page bands.
 
 use super::css::{
-    Align, AlignItems, BorderStyle, Clear, Direction, Display, FloatSide, Justify, Len,
-    LinearGradient, Position, Style, Stylesheet, TrackSize, VAlign,
+    Align, AlignItems, BorderStyle, Clear, CssGradient, Direction, Display, FloatSide, Justify,
+    Len, Position, Style, Stylesheet, TrackSize, VAlign,
 };
 use super::dom::{Element, Node};
 use crate::svg::SvgImage;
@@ -45,13 +45,17 @@ pub enum Fragment {
         stroke_w: f64,
         /// `opacity` (0..=1) applied to the fill and stroke.
         opacity: f64,
-        /// `border-radius` corner radii `[tl, tr, br, bl]` in points. All `0`
-        /// (the common case) ⇒ the painter emits a plain rectangle, byte-for-byte
-        /// as before; any non-zero radius ⇒ the fill/stroke follow a rounded
-        /// contour (real Bézier corners).
+        /// `border-radius` **horizontal** corner radii `[tl, tr, br, bl]` in
+        /// points. All `0` (the common case) ⇒ the painter emits a plain
+        /// rectangle, byte-for-byte as before; any non-zero radius ⇒ the
+        /// fill/stroke follow a rounded contour (real Bézier corners).
         radius: [f64; 4],
-        /// Optional drop shadow painted *behind* this rect (offset + reduced
-        /// alpha; no real blur). `None` ⇒ nothing extra is drawn.
+        /// `border-radius` **vertical** corner radii `[tl, tr, br, bl]` in points.
+        /// Equal to `radius` for circular corners (the default); differing values
+        /// give elliptical corners. Ignored when `radius` is all-zero.
+        radius_v: [f64; 4],
+        /// Optional drop shadow painted *behind* this rect (offset + blur).
+        /// `None` ⇒ nothing extra is drawn.
         shadow: Option<super::css::BoxShadow>,
     },
     Image {
@@ -89,15 +93,16 @@ pub enum Fragment {
         style: BorderStyle,
         opacity: f64,
     },
-    /// A `linear-gradient` background filling the box `(x, y, w, h)` (top-down).
-    /// Painted as a true PDF axial shading clipped to the box. A box with no
-    /// gradient never produces this fragment, so the flat-fill path is unchanged.
+    /// A CSS gradient background filling the box `(x, y, w, h)` (top-down):
+    /// `linear`/`radial` as a true PDF shading clipped to the box, `conic` as a
+    /// fan of flat-coloured vector sectors. A box with no gradient never produces
+    /// this fragment, so the flat-fill path is unchanged.
     Gradient {
         x: f64,
         y: f64,
         w: f64,
         h: f64,
-        gradient: LinearGradient,
+        gradient: CssGradient,
         opacity: f64,
     },
 }
@@ -182,6 +187,7 @@ pub fn layout_document_framed(
         bottom: frame.bottom,
         page_cb,
         cb: page_cb,
+        flow_cb: page_cb,
         floats: FloatCtx::default(),
     };
     // Find <body> if present, else lay out the whole forest.
@@ -316,6 +322,12 @@ struct Flow<'a> {
     /// positioned ancestor's content box). Saved/restored around positioned
     /// blocks.
     cb: Cb,
+    /// The **enclosing block container's** content box (the nearest block
+    /// ancestor, positioned or not). Used to clamp `position: sticky` offsets so
+    /// a sticky box can't leave its parent — the static, scroll-free model. Every
+    /// `block` updates this to its own content box around its children (its height
+    /// taken from a declared `height`/`min-height`, else the remaining page band).
+    flow_cb: Cb,
     /// Floats active in the current block container (narrow inline lines that
     /// overlap their vertical band). Saved/restored per container.
     floats: FloatCtx,
@@ -649,8 +661,14 @@ impl Flow<'_> {
                     // `page-break-inside: avoid` — if the block straddled a page
                     // boundary yet fits within one page, discard it and re-lay
                     // from the next page top so it stays intact.
+                    // Both `relative` and `sticky` lay out in flow and are then
+                    // shifted by `inset`, so neither should be re-laid by the
+                    // `page-break-inside: avoid` reflow (which is for in-flow
+                    // boxes that haven't been offset yet).
+                    let in_flow_offset =
+                        matches!(st.position, Position::Relative | Position::Sticky);
                     if st.page_break_inside_avoid
-                        && st.position != Position::Relative
+                        && !in_flow_offset
                         && self.crosses_page_break(y_before, y)
                     {
                         let height = y - y_before;
@@ -668,6 +686,15 @@ impl Flow<'_> {
                     }
                     if st.position == Position::Relative {
                         let (dx, dy) = self.relative_offset(&st, avail_w);
+                        self.translate_range(start, dx, dy);
+                    } else if st.position == Position::Sticky {
+                        // `sticky` ≈ `relative`, but the offset is clamped so the
+                        // box never leaves its containing block (the static,
+                        // scroll-free approximation). Bound the shift by how far
+                        // the box's edges may move within `self.cb`.
+                        let (dx, dy) = self.relative_offset(&st, avail_w);
+                        let (dx, dy) =
+                            self.clamp_sticky_offset(dx, dy, x, y_before, avail_w, y - y_before);
                         self.translate_range(start, dx, dy);
                     }
                     if st.z_index != 0 {
@@ -715,6 +742,44 @@ impl Flow<'_> {
             _ => 0.0,
         };
         (dx, dy)
+    }
+
+    /// Clamp a `position: sticky` shift `(dx, dy)` so the box — laid out at
+    /// `(box_x, box_y)` with size `box_w × box_h` (`box_w` = `avail_w`) — stays
+    /// inside its containing block `self.cb` after translation. This is the
+    /// static, scroll-free model of stickiness: the box may shift up to where its
+    /// edge meets the container edge, then no further. With a box that already
+    /// fills (or overflows) the container on an axis, the clamp pins that axis to
+    /// `0` (no room to move), exactly like a sticky element with nowhere to go.
+    fn clamp_sticky_offset(
+        &self,
+        dx: f64,
+        dy: f64,
+        box_x: f64,
+        box_y: f64,
+        box_w: f64,
+        box_h: f64,
+    ) -> (f64, f64) {
+        // Clamp against the enclosing block container (`flow_cb`), the nearest
+        // block ancestor — that is the box a static-page sticky element may not
+        // escape. Per axis, clamp the requested shift `d` so the box
+        // `[bstart, bend]` stays within `[cstart, cend]`: the shift that hugs the
+        // start edge is `cstart - bstart` (≤ 0, the box starts inside) and the one
+        // that hugs the end edge is `cend - bend`. If the box is bigger than the
+        // container the two cross over → no slack, pin to 0.
+        let cb = self.flow_cb;
+        let clamp_axis = |d: f64, bstart: f64, bend: f64, cstart: f64, cend: f64| -> f64 {
+            let min_d = cstart - bstart;
+            let max_d = cend - bend;
+            if min_d > max_d {
+                0.0
+            } else {
+                d.clamp(min_d, max_d)
+            }
+        };
+        let cdx = clamp_axis(dx, box_x, box_x + box_w, cb.x, cb.x + cb.w);
+        let cdy = clamp_axis(dy, box_y, box_y + box_h, cb.y, cb.y + cb.h);
+        (cdx, cdy)
     }
 
     /// Place an out-of-flow `position: absolute|fixed` element: lay its subtree
@@ -1050,6 +1115,19 @@ impl Flow<'_> {
                 h: style.min_height.unwrap_or(self.cb.h),
             };
         }
+        // This block is the enclosing block container for its children: record
+        // its content box so a `position: sticky` child clamps within it. Height
+        // comes from a declared `height`/`min-height`, else the remaining page
+        // band from the content top down to the page bottom.
+        let saved_flow_cb = self.flow_cb;
+        self.flow_cb = Cb {
+            x: content_x,
+            y: cy,
+            w: content_w,
+            h: style
+                .min_height
+                .unwrap_or((self.page_h - self.bottom - cy).max(1.0)),
+        };
         let children_start = self.out.len();
         cy = self.block_children(
             &el.children,
@@ -1059,6 +1137,7 @@ impl Flow<'_> {
             cy,
             &new_ancestors,
         );
+        self.flow_cb = saved_flow_cb;
 
         cy += p.bottom + b.bottom;
         let mut box_h = (cy - box_top).max(0.1);
@@ -1799,6 +1878,7 @@ impl Flow<'_> {
                         stroke_w: 0.0,
                         opacity: pl.opacity,
                         radius: [0.0; 4],
+                        radius_v: [0.0; 4],
                         shadow: None,
                     },
                 });
@@ -1836,6 +1916,43 @@ impl Flow<'_> {
     /// for ordinary boxes is unchanged. `radius`/`shadow` ride on the solid rect
     /// so a rounded card with a shadow is drawn correctly; the gradient overlay
     /// inherits the radius via its own clip.
+    /// Emit one shadow-only rect per *extra* `box-shadow` layer (the 2nd…Nth),
+    /// each carrying just its shadow (no fill/stroke), behind the box. They are
+    /// pushed deepest-first so the earlier-listed layer paints on top (CSS
+    /// back-to-front order). No-op when there are no extra layers, so the common
+    /// single-shadow path is untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn push_extra_shadow_layers(
+        &mut self,
+        style: &Style,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        radius: [f64; 4],
+        radius_v: [f64; 4],
+    ) {
+        for layer in style.box_shadow_extra.iter().rev() {
+            self.out.push(Abs {
+                z: 0,
+                zi: 0,
+                frag: Fragment::Rect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    fill: None,
+                    stroke: None,
+                    stroke_w: 0.0,
+                    opacity: style.opacity,
+                    radius,
+                    radius_v,
+                    shadow: Some(*layer),
+                },
+            });
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn push_box_background(
         &mut self,
@@ -1845,6 +1962,7 @@ impl Flow<'_> {
         h: f64,
         style: &Style,
         radius: [f64; 4],
+        radius_v: [f64; 4],
         shadow: Option<super::css::BoxShadow>,
     ) {
         // When the box has a shadow but no solid fill, still emit a (fill-less)
@@ -1863,6 +1981,7 @@ impl Flow<'_> {
                     stroke_w: 0.0,
                     opacity: style.opacity,
                     radius,
+                    radius_v,
                     shadow,
                 },
             });
@@ -1910,12 +2029,19 @@ impl Flow<'_> {
         let any_border = b.top + b.bottom + b.left + b.right > 0.0;
         let any_bg = style.background.is_some() || style.background_gradient.is_some();
         let radius = clamp_radius(style.border_radius, w, h);
-        let rounded = radius.iter().any(|r| *r > 0.0);
+        let radius_v = clamp_radius(style.border_radius_v, w, h);
+        let rounded = radius.iter().any(|r| *r > 0.0) || radius_v.iter().any(|r| *r > 0.0);
         let shadow = style.box_shadow;
         // Nothing to paint and no shadow ⇒ emit nothing (unchanged).
-        if !any_border && !any_bg && shadow.is_none() {
+        if !any_border && !any_bg && shadow.is_none() && style.box_shadow_extra.is_empty() {
             return;
         }
+
+        // Extra `box-shadow` layers (2nd…Nth) paint *behind* the topmost one (CSS
+        // back-to-front): emit a shadow-only rect per layer first, so they stack
+        // under the box. The topmost layer rides on the background/uniform rect
+        // below (keeping the single-shadow path unchanged).
+        self.push_extra_shadow_layers(style, x, y, w, h, radius, radius_v);
 
         // A rounded box can collapse the background + a uniform SOLID border into
         // a single rounded fill+stroke rect (so both follow the contour). Only
@@ -1946,6 +2072,7 @@ impl Flow<'_> {
                     stroke_w: b.top.max(0.0),
                     opacity: style.opacity,
                     radius,
+                    radius_v,
                     shadow,
                 },
             });
@@ -1954,7 +2081,7 @@ impl Flow<'_> {
 
         // Background (solid + gradient overlay), rounded when a radius is set,
         // carrying the shadow on its solid rect.
-        self.push_box_background(x, y, w, h, style, radius, shadow);
+        self.push_box_background(x, y, w, h, style, radius, radius_v, shadow);
         if any_border {
             // Per-side borders — solid sides are exact filled rects; styled sides
             // become dash/dot/double bands. With a radius set this is the
@@ -2007,6 +2134,7 @@ impl Flow<'_> {
                     stroke_w: 0.0,
                     opacity,
                     radius: [0.0; 4],
+                    radius_v: [0.0; 4],
                     shadow: None,
                 },
             });
@@ -2955,6 +3083,7 @@ impl Flow<'_> {
                     // rounded corner and drop shadow here too so a rounded flex
                     // card is correct.
                     radius: clamp_radius(istyle.border_radius, w, h.max(0.1)),
+                    radius_v: clamp_radius(istyle.border_radius_v, w, h.max(0.1)),
                     shadow: istyle.box_shadow,
                 },
             });
@@ -3558,6 +3687,7 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                 stroke_w,
                 opacity,
                 radius,
+                radius_v,
                 shadow,
             } => {
                 // Does this rect fit within a single page band? Only then can the
@@ -3583,6 +3713,7 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                         stroke_w,
                         opacity,
                         radius: if single_band { radius } else { [0.0; 4] },
+                        radius_v: if single_band { radius_v } else { [0.0; 4] },
                         shadow: if single_band { shadow } else { None },
                     });
                     top = seg_bottom + 0.001;
@@ -5538,6 +5669,153 @@ mod tests {
                 .iter()
                 .any(|(fill, ..)| *fill == Some([17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0])),
             "the solid colour fallback rect is still present"
+        );
+    }
+
+    #[test]
+    fn radial_gradient_background_emits_a_gradient_fragment() {
+        let layout = run(
+            r#"<div style="background:radial-gradient(#ff0000,#0000ff);width:100pt;height:40pt"></div>"#,
+        );
+        assert_eq!(gradient_count(&layout), 1, "radial emits one Gradient");
+    }
+
+    #[test]
+    fn conic_gradient_background_emits_a_gradient_fragment() {
+        let layout = run(
+            r#"<div style="background:conic-gradient(from 0deg,#ff0000,#00ff00,#0000ff);width:60pt;height:60pt"></div>"#,
+        );
+        assert_eq!(gradient_count(&layout), 1, "conic emits one Gradient");
+    }
+
+    // ── elliptical border-radius / multi-layer box-shadow / sticky ───────────
+
+    /// Page-0 `Fragment::Rect` decorations including the vertical radii and
+    /// whether a shadow rides on each: `(fill, radius_h, radius_v, shadow)`.
+    #[allow(clippy::type_complexity)]
+    fn rect_radii(layout: &Layout) -> Vec<(Option<[f64; 3]>, [f64; 4], [f64; 4], bool)> {
+        layout
+            .pages
+            .iter()
+            .flatten()
+            .filter_map(|f| match f {
+                Fragment::Rect {
+                    fill,
+                    radius,
+                    radius_v,
+                    shadow,
+                    ..
+                } => Some((*fill, *radius, *radius_v, shadow.is_some())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn elliptical_radius_reaches_the_background_rect() {
+        // `border-radius: 12pt / 4pt` ⇒ the decoration rect carries distinct
+        // horizontal (12) and vertical (4) radii.
+        let layout = run(
+            r#"<div style="background:#3366cc;border-radius:12pt / 4pt;padding:6pt">x</div>"#,
+        );
+        let bg = rect_radii(&layout)
+            .into_iter()
+            .find(|(fill, ..)| *fill == Some([0.2, 0.4, 0.8]))
+            .expect("the blue rounded rect");
+        assert!(bg.1.iter().all(|r| (*r - 12.0).abs() < 0.01), "h=12: {:?}", bg.1);
+        assert!(bg.2.iter().all(|r| (*r - 4.0).abs() < 0.01), "v=4: {:?}", bg.2);
+    }
+
+    #[test]
+    fn circular_radius_keeps_h_equal_v_on_the_rect() {
+        // Guard: a plain circular radius keeps `radius == radius_v` (the painter's
+        // byte-identical circular path).
+        let layout =
+            run(r#"<div style="background:#3366cc;border-radius:8pt;padding:6pt">x</div>"#);
+        let bg = rect_radii(&layout)
+            .into_iter()
+            .find(|(fill, ..)| *fill == Some([0.2, 0.4, 0.8]))
+            .expect("the blue rounded rect");
+        assert_eq!(bg.1, bg.2, "circular corners: h == v");
+        assert!(bg.1.iter().all(|r| (*r - 8.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn multi_layer_box_shadow_emits_one_extra_shadow_rect() {
+        // Two shadow layers ⇒ the topmost rides on the background rect AND one
+        // extra shadow-only rect (fill-less, shadow present) is emitted behind it.
+        let layout = run(
+            r#"<div style="background:#eeeeee;box-shadow:1pt 1pt 2pt #000000, 5pt 5pt 8pt #888888;padding:8pt">x</div>"#,
+        );
+        let rects = rect_radii(&layout);
+        // Background rect with the topmost shadow.
+        assert!(
+            rects.iter().any(|(fill, _, _, shadow)| fill.is_some() && *shadow),
+            "background rect carries the topmost shadow"
+        );
+        // Exactly one extra shadow-only rect (no fill, shadow present).
+        let extra = rects
+            .iter()
+            .filter(|(fill, _, _, shadow)| fill.is_none() && *shadow)
+            .count();
+        assert_eq!(extra, 1, "one extra shadow-only rect for the 2nd layer");
+    }
+
+    #[test]
+    fn single_box_shadow_emits_no_extra_shadow_rect() {
+        // Guard: a single shadow rides on the background rect with NO extra
+        // shadow-only rect — the common path is unchanged.
+        let layout = run(
+            r#"<div style="background:#eeeeee;box-shadow:3pt 3pt 4pt #000000;padding:8pt">x</div>"#,
+        );
+        let extra = rect_radii(&layout)
+            .iter()
+            .filter(|(fill, _, _, shadow)| fill.is_none() && *shadow)
+            .count();
+        assert_eq!(extra, 0, "no extra shadow-only rect for a single shadow");
+    }
+
+    #[test]
+    fn sticky_offset_is_clamped_to_the_containing_block() {
+        // A sticky child asked to shift far down is clamped so it can't leave its
+        // parent's content box. The parent is a fixed-height container; the child
+        // requests `top: 9999pt` (way past the container). After clamping the
+        // child's text must remain within the parent's content band, i.e. its
+        // top stays ≤ the parent's content bottom.
+        let html = r#"<div style="height:60pt;padding:0">
+            <p style="position:sticky;top:9999pt;margin:0">sticky</p>
+        </div>"#;
+        let layout = run(html);
+        let sticky_y = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "sticky")
+            .map(|(_, y, _)| y)
+            .expect("the sticky run");
+        // The container starts at the top margin (36) and is 60pt tall, so its
+        // content bottom is ≈ 96. The clamp must keep the run inside that band —
+        // it certainly must NOT have flown ~9999pt down.
+        assert!(
+            sticky_y < 100.0,
+            "sticky shift clamped within the container (y={sticky_y}, not ~9999)"
+        );
+        assert!(sticky_y >= 36.0, "still within/after the container top (y={sticky_y})");
+    }
+
+    #[test]
+    fn sticky_with_room_applies_the_offset() {
+        // With slack inside the container, a modest sticky offset DOES move the
+        // box (it behaves like relative until it hits the container edge).
+        let base = run(
+            r#"<div style="height:200pt"><p style="margin:0">x</p></div>"#,
+        );
+        let shifted = run(
+            r#"<div style="height:200pt"><p style="position:sticky;top:20pt;margin:0">x</p></div>"#,
+        );
+        let y0 = text_xy(&base).into_iter().find(|(_, _, s)| s == "x").unwrap().1;
+        let y1 = text_xy(&shifted).into_iter().find(|(_, _, s)| s == "x").unwrap().1;
+        assert!(
+            (y1 - y0 - 20.0).abs() < 0.5,
+            "sticky with room shifts by ~20pt (y0={y0}, y1={y1})"
         );
     }
 }

@@ -12,7 +12,10 @@ use crate::convert::build::PdfBuilder;
 use crate::document::Document;
 use crate::font::{bundled, catalog, google, shape::Shaper, truetype::TrueTypeFont};
 
-use super::css::{collect_style_css, BorderStyle, Display, LinearGradient, Style, Stylesheet};
+use super::css::{
+    collect_style_css, BorderStyle, ConicGradient, CssGradient, Display, LinearGradient,
+    RadialGradient, Style, Stylesheet,
+};
 use super::dom::{self, Element, Node};
 use super::layout::{layout_document_framed, Fragment, Frame, Layout, Measure};
 use super::page::{substitute_tokens, Margins, RenderOptions};
@@ -118,12 +121,10 @@ impl Measure for MeasureBook {
     fn width(&self, text: &str, style: &Style) -> f64 {
         if let Some(face) = self.resolve_face(style) {
             let w = shaped_run_width(&face.ttf, &face.shaper, text, style.font_size);
-            let boldish = if style.bold && !style_has_bold_face(self, style) {
-                1.03
-            } else {
-                1.0
-            };
-            w * boldish
+            // Synthetic-bold widening when no provided face matches the requested
+            // weight band, graduated by the numeric `font-weight` (heavier ⇒
+            // wider). A face that already supplies the bold variant needs none.
+            w * synthetic_bold_factor(style, style_has_bold_face(self, style))
         } else {
             // Neither a provided nor the bundled face is available — rough
             // estimate (should not happen in practice).
@@ -131,6 +132,27 @@ impl Measure for MeasureBook {
             text.chars().count() as f64 * style.font_size * per
         }
     }
+}
+
+/// Advance-width multiplier emulating heavier `font-weight` when no real bold
+/// face is available, graduated across the 100–900 scale.
+///
+/// * weight ≤ 500 (regular and lighter) ⇒ `1.0` (no widening — there is no
+///   "thinning" of a regular face, and a lighter request renders as regular).
+/// * weight ≥ 600 with a **real** bold face provided ⇒ `1.0` (the bold glyphs
+///   already carry the extra width).
+/// * weight 600–700 with **no** bold face ⇒ exactly `1.03` (byte-identical to the
+///   previous single bold factor, so ordinary `font-weight: bold` is unchanged).
+/// * weight > 700 with **no** bold face ⇒ widening graduated from `1.03` at 700 up
+///   to ~`1.06` at 900, so `900` reads heavier than `700` even on a regular-only
+///   family. Kept deliberately gentle to avoid visibly mis-spacing text.
+fn synthetic_bold_factor(style: &Style, has_bold_face: bool) -> f64 {
+    if style.font_weight < 600 || has_bold_face {
+        return 1.0;
+    }
+    // 600–700 → 1.03 (unchanged); 700–900 → 1.03…1.06.
+    let t = ((style.font_weight as f64 - 700.0) / 200.0).clamp(0.0, 1.0);
+    1.03 + 0.03 * t
 }
 
 /// Advance of a text run in points, **shaped**: characters are mapped to glyph
@@ -442,6 +464,7 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 stroke_w,
                 opacity,
                 radius,
+                radius_v,
                 shadow,
             } => Fragment::Rect {
                 x,
@@ -453,6 +476,7 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 stroke_w,
                 opacity,
                 radius,
+                radius_v,
                 shadow,
             },
             Fragment::Image { x, y, w, h, src } => Fragment::Image {
@@ -587,15 +611,20 @@ fn paint(
                     stroke_w,
                     opacity,
                     radius,
+                    radius_v,
                     shadow,
                 } => {
-                    let rounded = radius.iter().any(|r| *r > 0.0);
+                    let rounded = radius.iter().any(|r| *r > 0.0)
+                        || radius_v.iter().any(|r| *r > 0.0);
 
                     // Drop shadow first (painted behind the box): an offset rect
-                    // grown by `spread`, in the shadow colour, dimmed by blur.
+                    // grown by `spread`, in the shadow colour, with a soft blurred
+                    // edge. Tracks the box's (possibly elliptical) corners.
                     if let Some(sh) = shadow {
                         if !sh.inset {
-                            paint_box_shadow(doc, page, page_h, *x, *y, *w, *h, *radius, sh);
+                            paint_box_shadow(
+                                doc, page, page_h, *x, *y, *w, *h, *radius, *radius_v, sh,
+                            );
                         }
                     }
 
@@ -619,7 +648,7 @@ fn paint(
                         // a uniform border, stroke) follow the rounded contour.
                         // `add_path` maps SVG-(0,0)→(ox,oy) with Y flipped, so we
                         // pass the path in top-down page coords and oy = page_h.
-                        let d = rounded_rect_path(*x, *y, *w, *h, *radius);
+                        let d = rounded_rect_path(*x, *y, *w, *h, *radius, *radius_v);
                         let _ = doc.add_path(
                             page,
                             &d,
@@ -818,7 +847,7 @@ fn paint(
                     gradient,
                     opacity,
                 } => {
-                    paint_linear_gradient(doc, page, page_h, *x, *y, *w, *h, gradient, *opacity);
+                    paint_css_gradient(doc, page, page_h, *x, *y, *w, *h, gradient, *opacity);
                 }
             }
         }
@@ -909,60 +938,74 @@ fn paint_text_decorations(
 /// drawn with [`crate::document::Document::add_path`] using `ox = 0, oy = page_h`,
 /// which flips Y so the path lands at `page_h - y`.
 ///
-/// `radius` is `[top-left, top-right, bottom-right, bottom-left]` (already clamped
-/// by the layout). Each corner uses an SVG elliptical arc (`A`), which `add_path`
+/// `radius` / `radius_v` are the per-corner **horizontal** and **vertical** radii
+/// `[top-left, top-right, bottom-right, bottom-left]` (already clamped by the
+/// layout). Each corner uses an SVG elliptical arc (`A rx ry …`), which `add_path`
 /// expands to cubic Béziers — so the emitted content stream carries real `c`
-/// curve operators at every non-zero corner. A zero-radius corner degenerates to
-/// a straight `L` to the corner point, so a box with one rounded corner still
-/// renders correctly.
-fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: [f64; 4]) -> String {
-    let [tl, tr, br, bl] = radius;
+/// curve operators at every non-zero corner. When a corner's `rx == ry` (the
+/// circular default, where `radius_v` mirrors `radius`) the emitted arc is
+/// byte-identical to the previous circular-only path. A corner whose horizontal
+/// **or** vertical radius is zero degenerates to a straight `L` to the corner
+/// point, so a box with one rounded corner still renders correctly.
+fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: [f64; 4], radius_v: [f64; 4]) -> String {
+    let [tlh, trh, brh, blh] = radius;
+    let [tlv, trv, brv, blv] = radius_v;
+    // A corner is rounded only when BOTH its radii are positive.
+    let on = |a: f64, b: f64| a > 0.0 && b > 0.0;
     // Path travels clockwise (SVG Y-down): start just right of the top-left
     // corner, across the top edge, then each side + corner arc, and close.
     // SVG arc `A rx ry x-rotation large-arc sweep ex ey`; sweep = 1 (clockwise).
-    let mut d = String::with_capacity(160);
-    d.push_str(&format!("M {} {} ", num(x + tl), num(y)));
+    let mut d = String::with_capacity(200);
+    let tl_x = if on(tlh, tlv) { tlh } else { 0.0 };
+    d.push_str(&format!("M {} {} ", num(x + tl_x), num(y)));
     // Top edge → top-right corner.
-    d.push_str(&format!("L {} {} ", num(x + w - tr), num(y)));
-    if tr > 0.0 {
+    let tr_x = if on(trh, trv) { trh } else { 0.0 };
+    let tr_y = if on(trh, trv) { trv } else { 0.0 };
+    d.push_str(&format!("L {} {} ", num(x + w - tr_x), num(y)));
+    if on(trh, trv) {
         d.push_str(&format!(
             "A {} {} 0 0 1 {} {} ",
-            num(tr),
-            num(tr),
+            num(trh),
+            num(trv),
             num(x + w),
-            num(y + tr)
+            num(y + tr_y)
         ));
     }
     // Right edge → bottom-right corner.
-    d.push_str(&format!("L {} {} ", num(x + w), num(y + h - br)));
-    if br > 0.0 {
+    let br_x = if on(brh, brv) { brh } else { 0.0 };
+    let br_y = if on(brh, brv) { brv } else { 0.0 };
+    d.push_str(&format!("L {} {} ", num(x + w), num(y + h - br_y)));
+    if on(brh, brv) {
         d.push_str(&format!(
             "A {} {} 0 0 1 {} {} ",
-            num(br),
-            num(br),
-            num(x + w - br),
+            num(brh),
+            num(brv),
+            num(x + w - br_x),
             num(y + h)
         ));
     }
     // Bottom edge → bottom-left corner.
-    d.push_str(&format!("L {} {} ", num(x + bl), num(y + h)));
-    if bl > 0.0 {
+    let bl_x = if on(blh, blv) { blh } else { 0.0 };
+    let bl_y = if on(blh, blv) { blv } else { 0.0 };
+    d.push_str(&format!("L {} {} ", num(x + bl_x), num(y + h)));
+    if on(blh, blv) {
         d.push_str(&format!(
             "A {} {} 0 0 1 {} {} ",
-            num(bl),
-            num(bl),
+            num(blh),
+            num(blv),
             num(x),
-            num(y + h - bl)
+            num(y + h - bl_y)
         ));
     }
     // Left edge → top-left corner.
-    d.push_str(&format!("L {} {} ", num(x), num(y + tl)));
-    if tl > 0.0 {
+    let tl_y = if on(tlh, tlv) { tlv } else { 0.0 };
+    d.push_str(&format!("L {} {} ", num(x), num(y + tl_y)));
+    if on(tlh, tlv) {
         d.push_str(&format!(
             "A {} {} 0 0 1 {} {} ",
-            num(tl),
-            num(tl),
-            num(x + tl),
+            num(tlh),
+            num(tlv),
+            num(x + tl_x),
             num(y)
         ));
     }
@@ -970,15 +1013,18 @@ fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: [f64; 4]) -> String
     d
 }
 
-/// Paint an approximated `box-shadow` behind a box: a filled rectangle offset by
-/// `(dx, dy)` and grown by `spread` on every side, in the shadow colour, at a
-/// reduced alpha when `blur > 0`.
+/// Paint a `box-shadow` behind a box: the box offset by `(dx, dy)` and grown by
+/// `spread` on every side, in the shadow colour, tracking the box's (possibly
+/// elliptical) corners.
 ///
-/// This is a deliberate approximation — there is **no real Gaussian blur** (the
-/// HTML paint layer has no blur/clip primitive). The alpha falloff (`1 / (1 +
-/// blur/8)`, capped) stands in for the soft edge a true blur would give, so a
-/// blurred shadow reads as a lighter offset block rather than a hard one. The
-/// shadow inherits the box's `radius` so a rounded card casts a rounded shadow.
+/// With **`blur == 0`** this is a single hard filled rect/rounded-path —
+/// byte-for-byte the previous behaviour. With **`blur > 0`** a soft edge is built
+/// without any blur/clip primitive: an opaque inner core (the spread box shrunk
+/// by ~half the blur) plus a stack of concentric rings expanding outward to the
+/// full blur radius, each a low-alpha rect whose overlaps accumulate into a
+/// roughly-Gaussian falloff (a multi-pass box-blur approximation). The summed
+/// peak alpha is held near the legacy single-rect value so existing blurred
+/// shadows don't suddenly darken.
 #[allow(clippy::too_many_arguments)]
 fn paint_box_shadow(
     doc: &mut Document,
@@ -989,9 +1035,10 @@ fn paint_box_shadow(
     w: f64,
     h: f64,
     radius: [f64; 4],
+    radius_v: [f64; 4],
     sh: &super::css::BoxShadow,
 ) {
-    // Grow by spread on each side; offset by (dx, dy) in top-down coords.
+    // Base shadow box: grow by spread on each side, offset by (dx, dy) (top-down).
     let sx = x - sh.spread + sh.dx;
     let sy = y - sh.spread + sh.dy;
     let sw = w + 2.0 * sh.spread;
@@ -999,31 +1046,95 @@ fn paint_box_shadow(
     if sw <= 0.0 || shh <= 0.0 {
         return; // a large negative spread can collapse the shadow — draw nothing
     }
-    // Alpha approximation: opaque with no blur, lighter as blur grows.
-    let alpha = (1.0 / (1.0 + sh.blur / 8.0)).clamp(0.15, 1.0);
-    // Grow the corner radii by spread too (so the shadow's corners track the box).
-    let grow = |r: f64| if r > 0.0 { (r + sh.spread).max(0.0) } else { 0.0 };
-    let r = [
-        grow(radius[0]),
-        grow(radius[1]),
-        grow(radius[2]),
-        grow(radius[3]),
-    ];
-    if r.iter().any(|v| *v > 0.0) {
-        let d = rounded_rect_path(sx, sy, sw, shh, r);
-        let _ = doc.add_path(page, &d, 0.0, page_h, None, Some(sh.color), 0.0, alpha);
-    } else {
-        let _ = doc.add_rectangle(
-            page,
-            sx,
-            page_h - sy - shh,
-            sw,
-            shh,
-            None,
-            Some(sh.color),
-            0.0,
-            alpha,
-        );
+    // Grow the corner radii by spread so the shadow's corners track the box.
+    let grow = |arr: [f64; 4]| {
+        [
+            if arr[0] > 0.0 { (arr[0] + sh.spread).max(0.0) } else { 0.0 },
+            if arr[1] > 0.0 { (arr[1] + sh.spread).max(0.0) } else { 0.0 },
+            if arr[2] > 0.0 { (arr[2] + sh.spread).max(0.0) } else { 0.0 },
+            if arr[3] > 0.0 { (arr[3] + sh.spread).max(0.0) } else { 0.0 },
+        ]
+    };
+    let rh = grow(radius);
+    let rv = grow(radius_v);
+
+    // Emit one filled (rounded or square) shadow box at a given offset rect.
+    let mut fill_box = |bx: f64, by: f64, bw: f64, bh: f64, rh: [f64; 4], rv: [f64; 4], a: f64| {
+        if bw <= 0.0 || bh <= 0.0 {
+            return;
+        }
+        if rh.iter().any(|v| *v > 0.0) || rv.iter().any(|v| *v > 0.0) {
+            let d = rounded_rect_path(bx, by, bw, bh, rh, rv);
+            let _ = doc.add_path(page, &d, 0.0, page_h, None, Some(sh.color), 0.0, a);
+        } else {
+            let _ = doc.add_rectangle(
+                page,
+                bx,
+                page_h - by - bh,
+                bw,
+                bh,
+                None,
+                Some(sh.color),
+                0.0,
+                a,
+            );
+        }
+    };
+
+    if sh.blur <= 0.0 {
+        // Hard shadow — unchanged single box at the legacy alpha (1.0).
+        fill_box(sx, sy, sw, shh, rh, rv, 1.0);
+        return;
+    }
+
+    // Soft shadow. The blur fans out ~½·blur each side of the spread edge, so the
+    // umbra (fully-opaque core) shrinks by ½·blur and the penumbra extends ½·blur
+    // outward. Keep the peak ≈ the legacy dimmed alpha so we don't darken.
+    let reach = sh.blur * 0.5;
+    let peak = (1.0 / (1.0 + sh.blur / 8.0)).clamp(0.15, 1.0);
+
+    // Opaque-ish core (the spread box shrunk by `reach`, never past its centre).
+    let core_inset = reach.min(sw / 2.0 - 0.5).min(shh / 2.0 - 0.5).max(0.0);
+    let core_r = |r: [f64; 4]| {
+        [
+            (r[0] - core_inset).max(0.0),
+            (r[1] - core_inset).max(0.0),
+            (r[2] - core_inset).max(0.0),
+            (r[3] - core_inset).max(0.0),
+        ]
+    };
+    fill_box(
+        sx + core_inset,
+        sy + core_inset,
+        sw - 2.0 * core_inset,
+        shh - 2.0 * core_inset,
+        core_r(rh),
+        core_r(rv),
+        peak,
+    );
+
+    // Penumbra rings: RINGS nested boxes from the core out to core+2·reach, each
+    // at a small alpha. Overlaps accumulate to a smooth falloff. Per-ring alpha is
+    // sized so the stack peaks near `peak` rather than summing far above it.
+    const RINGS: usize = 6;
+    let ring_alpha = (peak / RINGS as f64).clamp(0.02, 0.5);
+    for i in 1..=RINGS {
+        // Each ring grows the spread box outward toward the full penumbra; the
+        // outermost (i = RINGS) reaches `+reach` past the spread edge.
+        let grow_amt = (i as f64 / RINGS as f64) * reach;
+        let bx = sx - grow_amt;
+        let by = sy - grow_amt;
+        let bw = sw + 2.0 * grow_amt;
+        let bh = shh + 2.0 * grow_amt;
+        let ring_r = |r: [f64; 4]| {
+            [
+                if r[0] > 0.0 { r[0] + grow_amt } else { 0.0 },
+                if r[1] > 0.0 { r[1] + grow_amt } else { 0.0 },
+                if r[2] > 0.0 { r[2] + grow_amt } else { 0.0 },
+                if r[3] > 0.0 { r[3] + grow_amt } else { 0.0 },
+            ]
+        };
+        fill_box(bx, by, bw, bh, ring_r(rh), ring_r(rv), ring_alpha);
     }
 }
 
@@ -1108,6 +1219,254 @@ fn paint_styled_border(
     }
 }
 
+/// Paint any CSS gradient background filling the box `(x, y, w, h)` (top-down),
+/// dispatching by kind: `linear`/`radial` go through the engine's PDF shading
+/// machinery (a real gradient, not a raster), `conic` is approximated by a fan of
+/// flat-coloured vector sectors. A zero-area box draws nothing.
+#[allow(clippy::too_many_arguments)]
+fn paint_css_gradient(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    grad: &CssGradient,
+    opacity: f64,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    match grad {
+        CssGradient::Linear(g) => paint_linear_gradient(doc, page, page_h, x, y, w, h, g, opacity),
+        CssGradient::Radial(g) => paint_radial_gradient(doc, page, page_h, x, y, w, h, g, opacity),
+        CssGradient::Conic(g) => paint_conic_gradient(doc, page, page_h, x, y, w, h, g, opacity),
+    }
+}
+
+/// Paint a CSS `radial-gradient` filling the box `(x, y, w, h)` (top-down) as a
+/// **true PDF radial shading** clipped to the box, reusing the SVG layer's
+/// `GradKind::Radial` (`/ShadingType 3`). The centre and end radius come from the
+/// parsed fractions; the colour ramp runs centre→edge.
+#[allow(clippy::too_many_arguments)]
+fn paint_radial_gradient(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    grad: &RadialGradient,
+    opacity: f64,
+) {
+    let Some(img) = radial_gradient_svg_image(grad, w, h, opacity.clamp(0.0, 1.0)) else {
+        return;
+    };
+    let _ = doc.draw_svg_image(page, &img, x, page_h - y - h, w, h);
+}
+
+/// Paint a CSS `conic-gradient` filling the box `(x, y, w, h)` (top-down) as a
+/// fan of flat-coloured triangular sectors radiating from the centre. There is no
+/// native PDF conic shading, so this vector approximation samples the angular
+/// colour ramp at a fine step; the sectors over-cover the box (their outer radius
+/// reaches the farthest corner) and the SVG is clipped to the box on placement.
+#[allow(clippy::too_many_arguments)]
+fn paint_conic_gradient(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    grad: &ConicGradient,
+    opacity: f64,
+) {
+    let Some(img) = conic_gradient_svg_image(grad, w, h, opacity.clamp(0.0, 1.0)) else {
+        return;
+    };
+    let _ = doc.draw_svg_image(page, &img, x, page_h - y - h, w, h);
+}
+
+/// Build a one-primitive [`crate::svg::SvgImage`] — a `w×h` rectangle filled with
+/// an SVG **radial** gradient — from a CSS [`RadialGradient`]. The centre
+/// `(cx, cy)` and radius `r` are resolved from the box dimensions (`cx`/`cy` are
+/// fractions of `w`/`h`; `r` is a fraction of `min(w,h)/2`). `None` if there are
+/// fewer than two stops.
+fn radial_gradient_svg_image(
+    grad: &RadialGradient,
+    w: f64,
+    h: f64,
+    alpha: f64,
+) -> Option<crate::svg::SvgImage> {
+    use crate::content::svg_path::Seg;
+    use crate::svg::{Fill, GradKind, GradStop, Gradient, Prim, SvgImage};
+
+    if grad.stops.len() < 2 {
+        return None;
+    }
+    let cx = grad.cx * w;
+    let cy = grad.cy * h;
+    let r = (grad.r * (w.min(h) / 2.0)).max(1e-3);
+
+    let offsets = resolve_stop_offsets(&grad.stops);
+    let stops: Vec<GradStop> = grad
+        .stops
+        .iter()
+        .zip(offsets)
+        .map(|(st, off)| GradStop {
+            offset: off,
+            rgb: st.color,
+            alpha,
+        })
+        .collect();
+
+    let segs = vec![
+        Seg::Move(0.0, 0.0),
+        Seg::Line(w, 0.0),
+        Seg::Line(w, h),
+        Seg::Line(0.0, h),
+        Seg::Close,
+    ];
+    let prim = Prim {
+        segs,
+        fill: Some(Fill::Gradient(Gradient {
+            kind: GradKind::Radial {
+                cx,
+                cy,
+                r,
+                fx: cx,
+                fy: cy,
+            },
+            stops,
+        })),
+        stroke: None,
+        stroke_w: 0.0,
+        fill_opacity: 1.0,
+        stroke_opacity: 1.0,
+    };
+    Some(SvgImage {
+        width: w,
+        height: h,
+        view_box: [0.0, 0.0, w, h],
+        prims: vec![prim],
+    })
+}
+
+/// Build a multi-primitive [`crate::svg::SvgImage`] approximating a CSS
+/// `conic-gradient`: a fan of flat-coloured triangular sectors around the centre
+/// `(cx, cy)` (fractions of the box), each spanning a small angle and coloured by
+/// sampling the angular ramp at its mid-angle. The sectors reach past the box
+/// corners (radius = the farthest corner distance) so the whole box is covered;
+/// placement clips the SVG to the box. `None` if there are fewer than two stops.
+fn conic_gradient_svg_image(
+    grad: &ConicGradient,
+    w: f64,
+    h: f64,
+    alpha: f64,
+) -> Option<crate::svg::SvgImage> {
+    use crate::content::svg_path::Seg;
+    use crate::svg::{Fill, Prim, SvgImage};
+
+    if grad.stops.len() < 2 {
+        return None;
+    }
+    let cx = grad.cx * w;
+    let cy = grad.cy * h;
+    // Cover to the farthest corner so no box area is left unpainted.
+    let far = |px: f64, py: f64| ((cx - px).powi(2) + (cy - py).powi(2)).sqrt();
+    let radius = far(0.0, 0.0)
+        .max(far(w, 0.0))
+        .max(far(w, h))
+        .max(far(0.0, h))
+        + 1.0;
+
+    let offsets = resolve_stop_offsets(&grad.stops);
+    // Enough sectors that the flat-fill banding is invisible at print scale.
+    const SECTORS: usize = 180;
+    let mut prims: Vec<Prim> = Vec::with_capacity(SECTORS);
+    let step = 1.0 / SECTORS as f64;
+    for i in 0..SECTORS {
+        let t0 = i as f64 * step;
+        let t1 = (i + 1) as f64 * step;
+        let tmid = (t0 + t1) * 0.5;
+        let rgb = sample_ramp(&grad.stops, &offsets, tmid);
+        // CSS conic: `0` points up and sweeps clockwise. Convert the turn fraction
+        // to an SVG-(Y-down) angle measured from the +Y-up "north", clockwise.
+        let a0 = conic_angle(grad.from_deg, t0);
+        let a1 = conic_angle(grad.from_deg, t1);
+        let (s0, c0) = a0.sin_cos();
+        let (s1, c1) = a1.sin_cos();
+        // Sector triangle centre → arc edge at t0 → arc edge at t1 (flat fill; the
+        // arc chord is negligible at 2°/sector).
+        let segs = vec![
+            Seg::Move(cx, cy),
+            Seg::Line(cx + radius * s0, cy - radius * c0),
+            Seg::Line(cx + radius * s1, cy - radius * c1),
+            Seg::Close,
+        ];
+        prims.push(Prim {
+            segs,
+            fill: Some(Fill::Solid(rgb)),
+            stroke: None,
+            stroke_w: 0.0,
+            fill_opacity: alpha,
+            stroke_opacity: 1.0,
+        });
+    }
+    Some(SvgImage {
+        width: w,
+        height: h,
+        view_box: [0.0, 0.0, w, h],
+        prims,
+    })
+}
+
+/// Angle (radians) of a conic-gradient sample at turn-fraction `t`, given the CSS
+/// `from` start angle in degrees (`0` = up, clockwise). The returned angle is the
+/// clockwise rotation from the upward axis, so a caller using `(sin, -cos)` lands
+/// the point in SVG Y-down space.
+fn conic_angle(from_deg: f64, t: f64) -> f64 {
+    (from_deg + t * 360.0).to_radians()
+}
+
+/// Sample a gradient colour ramp (stops + their resolved `0..=1` offsets) at
+/// position `t`, linearly interpolating between the bracketing stops. Clamps to
+/// the end colours outside the stop range.
+fn sample_ramp(
+    stops: &[super::css::GradientStop],
+    offsets: &[f64],
+    t: f64,
+) -> [f64; 3] {
+    if stops.is_empty() {
+        return [0.0, 0.0, 0.0];
+    }
+    if t <= offsets[0] {
+        return stops[0].color;
+    }
+    let last = stops.len() - 1;
+    if t >= offsets[last] {
+        return stops[last].color;
+    }
+    for i in 0..last {
+        let (a, b) = (offsets[i], offsets[i + 1]);
+        if t >= a && t <= b {
+            let span = (b - a).max(1e-9);
+            let f = ((t - a) / span).clamp(0.0, 1.0);
+            let ca = stops[i].color;
+            let cb = stops[i + 1].color;
+            return [
+                ca[0] + (cb[0] - ca[0]) * f,
+                ca[1] + (cb[1] - ca[1]) * f,
+                ca[2] + (cb[2] - ca[2]) * f,
+            ];
+        }
+    }
+    stops[last].color
+}
+
 /// Paint a CSS `linear-gradient` filling the box `(x, y, w, h)` (top-down) as a
 /// **true PDF axial shading** clipped to the box.
 ///
@@ -1176,7 +1535,7 @@ fn gradient_svg_image(
 
     // Resolve stop positions: fill `None`s evenly between positioned neighbours
     // (CSS default-placement), clamp to monotonic non-decreasing offsets.
-    let offsets = resolve_stop_offsets(grad);
+    let offsets = resolve_stop_offsets(&grad.stops);
     let stops: Vec<GradStop> = grad
         .stops
         .iter()
@@ -1215,14 +1574,15 @@ fn gradient_svg_image(
     })
 }
 
-/// Resolve each `linear-gradient` stop to a concrete `0..=1` offset: explicit
-/// positions are kept (clamped non-decreasing), and a run of `None` positions is
-/// spread evenly between the surrounding fixed offsets (CSS stop placement). The
-/// first/last default to 0 and 1 when unspecified.
-fn resolve_stop_offsets(grad: &LinearGradient) -> Vec<f64> {
-    let n = grad.stops.len();
+/// Resolve each gradient stop to a concrete `0..=1` offset: explicit positions
+/// are kept (clamped non-decreasing), and a run of `None` positions is spread
+/// evenly between the surrounding fixed offsets (CSS stop placement). The
+/// first/last default to 0 and 1 when unspecified. Shared by linear / radial /
+/// conic — they all place stops along a normalised `0..=1` axis.
+fn resolve_stop_offsets(stops: &[super::css::GradientStop]) -> Vec<f64> {
+    let n = stops.len();
     // Seed with explicit positions; first→0, last→1 when absent.
-    let mut off: Vec<Option<f64>> = grad.stops.iter().map(|s| s.pos).collect();
+    let mut off: Vec<Option<f64>> = stops.iter().map(|s| s.pos).collect();
     if off[0].is_none() {
         off[0] = Some(0.0);
     }
@@ -1898,7 +2258,7 @@ mod tests {
                 },
             ],
         };
-        let offs = resolve_stop_offsets(&g);
+        let offs = resolve_stop_offsets(&g.stops);
         assert_eq!(offs.len(), 3);
         assert!(
             (offs[1] - 0.5).abs() < 0.01,
@@ -1918,5 +2278,113 @@ mod tests {
         let pdf = render(html, &[], 300.0, 200.0, 12.0);
         assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
         assert!(pdf.len() > 400, "non-trivial output ({} bytes)", pdf.len());
+    }
+
+    #[test]
+    fn radial_gradient_renders_a_valid_pdf() {
+        let html = r#"<div style="background:radial-gradient(circle at 30% 40%, #ffcc00, #cc00ff);
+                                   width:160pt;height:80pt"></div>"#;
+        let pdf = render(html, &[], 300.0, 200.0, 12.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        assert!(pdf.len() > 400, "non-trivial output ({} bytes)", pdf.len());
+    }
+
+    #[test]
+    fn conic_gradient_renders_a_valid_pdf() {
+        let html = r#"<div style="background:conic-gradient(from 45deg at 50% 50%,
+                                   #ff0000, #00ff00, #0000ff, #ff0000);
+                                   width:80pt;height:80pt"></div>"#;
+        let pdf = render(html, &[], 300.0, 200.0, 12.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        // The sector fan adds many path prims, so the stream is sizeable.
+        assert!(pdf.len() > 600, "non-trivial conic output ({} bytes)", pdf.len());
+    }
+
+    #[test]
+    fn rounded_rect_path_circular_is_unchanged_and_elliptical_differs() {
+        // Circular (h == v): the emitted arcs use equal rx/ry (the pre-existing
+        // path), so a 10pt corner shows "A 10 10".
+        let circ = rounded_rect_path(0.0, 0.0, 100.0, 60.0, [10.0; 4], [10.0; 4]);
+        assert!(circ.contains("A 10 10"), "circular arc rx==ry: {circ}");
+        // Elliptical (h != v): a 10×4 corner emits "A 10 4".
+        let ell = rounded_rect_path(0.0, 0.0, 100.0, 60.0, [10.0; 4], [4.0; 4]);
+        assert!(ell.contains("A 10 4"), "elliptical arc rx!=ry: {ell}");
+        // Both are valid closed paths.
+        assert!(circ.trim_end().ends_with('Z') && ell.trim_end().ends_with('Z'));
+    }
+
+    #[test]
+    fn elliptical_rounded_box_renders_a_valid_pdf() {
+        let html = r#"<div style="background:#3366cc;border-radius:20pt / 8pt;
+                                   width:120pt;height:60pt">x</div>"#;
+        let pdf = render(html, &[], 300.0, 200.0, 12.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        assert!(pdf.len() > 400, "non-trivial output ({} bytes)", pdf.len());
+    }
+
+    #[test]
+    fn blurred_box_shadow_renders_and_adds_content_vs_hard_shadow() {
+        // A blurred shadow (soft rings) must produce a strictly larger content
+        // stream than the same shadow with zero blur (single hard rect), proving
+        // the soft-edge rings are actually emitted.
+        let hard = render(
+            r#"<div style="background:#ffffff;box-shadow:4pt 4pt 0pt #000000;padding:10pt">x</div>"#,
+            &[],
+            200.0,
+            120.0,
+            12.0,
+        );
+        let soft = render(
+            r#"<div style="background:#ffffff;box-shadow:4pt 4pt 12pt #000000;padding:10pt">x</div>"#,
+            &[],
+            200.0,
+            120.0,
+            12.0,
+        );
+        assert!(hard.starts_with(b"%PDF-") && soft.starts_with(b"%PDF-"));
+        assert!(
+            soft.len() > hard.len(),
+            "blurred shadow emits more content than a hard one (soft={}, hard={})",
+            soft.len(),
+            hard.len()
+        );
+    }
+
+    #[test]
+    fn multi_layer_box_shadow_renders_a_valid_pdf() {
+        let pdf = render(
+            r#"<div style="background:#fff;box-shadow:1pt 1pt 3pt #000, 6pt 6pt 12pt #444;padding:10pt">x</div>"#,
+            &[],
+            220.0,
+            140.0,
+            12.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        assert!(pdf.len() > 400, "non-trivial output ({} bytes)", pdf.len());
+    }
+
+    #[test]
+    fn synthetic_bold_factor_grades_by_weight() {
+        let make = |w: u16| Style {
+            font_weight: w,
+            bold: w >= 600,
+            ..Style::default()
+        };
+        // No bold face available → graduated widening.
+        // Light/regular: never widened.
+        assert_eq!(synthetic_bold_factor(&make(100), false), 1.0);
+        assert_eq!(synthetic_bold_factor(&make(400), false), 1.0);
+        assert_eq!(synthetic_bold_factor(&make(500), false), 1.0);
+        // Canonical bold (600/700) is exactly 1.03 — unchanged from the legacy
+        // single factor.
+        assert!((synthetic_bold_factor(&make(600), false) - 1.03).abs() < 1e-9);
+        assert!((synthetic_bold_factor(&make(700), false) - 1.03).abs() < 1e-9);
+        // Heavier weights widen further, monotonically, up to ~1.06 at 900.
+        let w800 = synthetic_bold_factor(&make(800), false);
+        let w900 = synthetic_bold_factor(&make(900), false);
+        assert!(w800 > 1.03 && w900 > w800, "800<900 widening: {w800} {w900}");
+        assert!((w900 - 1.06).abs() < 1e-9, "900 → 1.06, got {w900}");
+        // A real bold face suppresses synthetic widening entirely.
+        assert_eq!(synthetic_bold_factor(&make(900), true), 1.0);
     }
 }

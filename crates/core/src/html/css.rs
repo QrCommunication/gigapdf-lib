@@ -128,6 +128,14 @@ pub enum Position {
     Absolute,
     /// `fixed` — removed from flow, positioned against the page box.
     Fixed,
+    /// `sticky` — laid out in flow like `relative`, then offset by `inset`, but
+    /// the shift is **clamped to the containing block** so the box never leaves
+    /// its parent's content box. On a statically-paginated PDF there is no
+    /// scrolling viewport to stick to, so this is the faithful static
+    /// approximation: a `relative` shift bounded by the container (documented
+    /// limitation — true scroll-sticky behaviour is not modelled). Still
+    /// occupies its normal space.
+    Sticky,
 }
 
 /// CSS `align-items` / `align-self` cross-axis alignment (basic flex).
@@ -185,11 +193,12 @@ pub enum BorderStyle {
 
 /// A single `box-shadow` layer, resolved to points.
 ///
-/// The paint layer approximates it **without a real Gaussian blur**: it fills an
-/// offset rectangle (`dx`, `dy`) grown by `spread` on every side, in `color`, at
-/// a reduced alpha when `blur > 0` (the alpha stands in for the soft falloff a
-/// true blur would give). `inset` shadows are parsed but not painted (the engine
-/// has no clip primitive in the HTML layer to confine an inner shadow), so an
+/// The paint layer offsets the box by `(dx, dy)`, grows it by `spread` on every
+/// side, and fills it in `color`. When `blur > 0` it renders a **soft edge** by
+/// stacking concentric rings of decreasing alpha out to the blur radius (a
+/// multi-pass box-blur approximation of a Gaussian falloff — a true blurred drop
+/// shadow, not just a dimmed block). `inset` shadows are parsed but not painted
+/// (the HTML layer has no clip primitive to confine an inner shadow), so an
 /// `inset` layer is recorded and skipped rather than drawn wrongly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoxShadow {
@@ -197,7 +206,8 @@ pub struct BoxShadow {
     pub dx: f64,
     /// Vertical offset in points (positive → down).
     pub dy: f64,
-    /// Blur radius in points. Not used as a true blur; drives the painted alpha.
+    /// Blur radius in points. Drives the width of the soft edge (and, at `0`,
+    /// gives a hard offset rectangle).
     pub blur: f64,
     /// Spread distance in points (grows the shadow rect on every side).
     pub spread: f64,
@@ -212,8 +222,7 @@ pub struct BoxShadow {
 /// its positioned neighbours at paint time (CSS default-stop placement). The
 /// `angle_deg` follows the CSS convention: `0deg` points to the top, `90deg` to
 /// the right, increasing clockwise (`to right` ≡ `90deg`, `to bottom` ≡
-/// `180deg`). Only the linear form is modelled; radial/conic gradients are not
-/// parsed (the declaration is then ignored and any solid `background` stands).
+/// `180deg`).
 #[derive(Debug, Clone)]
 pub struct LinearGradient {
     /// Gradient line direction in CSS degrees (`0` = upward, clockwise).
@@ -222,8 +231,57 @@ pub struct LinearGradient {
     pub stops: Vec<GradientStop>,
 }
 
-/// One `linear-gradient` colour stop: an RGB colour and an optional position
-/// (`0.0..=1.0`, `None` = auto-placed).
+/// A CSS `radial-gradient(...)` background. Modelled as a circle centred at
+/// `(cx, cy)` (fractions of the box, `0..=1`) reaching radius `r` (a fraction of
+/// the box's smaller half-extent — `0.5` ≈ the `closest-side` of a square). The
+/// colour ramp runs from the centre (`offset 0`) outward to `r` (`offset 1`).
+/// Elliptical sizing and the `farthest-corner`/explicit-length forms collapse to
+/// this circular approximation (good enough for a background fill); the stops use
+/// the same auto-placement rules as the linear case.
+#[derive(Debug, Clone)]
+pub struct RadialGradient {
+    /// Centre X as a fraction of the box width (`0..=1`, `0.5` = middle).
+    pub cx: f64,
+    /// Centre Y as a fraction of the box height (`0..=1`, `0.5` = middle).
+    pub cy: f64,
+    /// End radius as a fraction of `min(w, h) / 2` (`1.0` ≈ closest-side).
+    pub r: f64,
+    /// Colour stops, centre→edge.
+    pub stops: Vec<GradientStop>,
+}
+
+/// A CSS `conic-gradient(...)` background: colour sweeps **angularly** around the
+/// centre `(cx, cy)` (fractions of the box), starting at `from_deg` (CSS: `0deg`
+/// points up, increasing clockwise) and wrapping once. There is no native PDF
+/// shading for a conic sweep, so the paint layer approximates it with a fan of
+/// flat-coloured triangular sectors (a vector approximation — no raster); enough
+/// sectors that the banding is invisible at print resolution. Stop positions are
+/// fractions of the full turn (`0..=1`), auto-placed like the other gradients.
+#[derive(Debug, Clone)]
+pub struct ConicGradient {
+    /// Centre X as a fraction of the box width (`0..=1`).
+    pub cx: f64,
+    /// Centre Y as a fraction of the box height (`0..=1`).
+    pub cy: f64,
+    /// Sweep start angle in CSS degrees (`0` = up, clockwise).
+    pub from_deg: f64,
+    /// Colour stops around the turn; `pos` is a `0..=1` fraction of the turn.
+    pub stops: Vec<GradientStop>,
+}
+
+/// A CSS gradient background in any of the three shapes the engine paints. The
+/// `Linear` arm is the original [`LinearGradient`] and its paint path is
+/// unchanged (byte-for-byte) — `Radial`/`Conic` are additive. Carried by
+/// `Style::background_gradient` and `Fragment::Gradient`.
+#[derive(Debug, Clone)]
+pub enum CssGradient {
+    Linear(LinearGradient),
+    Radial(RadialGradient),
+    Conic(ConicGradient),
+}
+
+/// One gradient colour stop: an RGB colour and an optional position
+/// (`0.0..=1.0`, `None` = auto-placed). Shared by linear / radial / conic.
 #[derive(Debug, Clone, Copy)]
 pub struct GradientStop {
     pub color: [f64; 3],
@@ -279,11 +337,11 @@ pub struct Style {
     /// looks exactly as it did before. `Dashed`/`Dotted`/`Double` change only
     /// how that side is drawn, never its geometry. Not inherited.
     pub border_style_edges: [BorderStyle; 4],
-    /// `background: linear-gradient(...)` / `background-image: linear-gradient(...)`.
-    /// When set it paints over (or in place of) the solid `background`. `None`
-    /// for the overwhelming majority of boxes, keeping the flat-fill path
-    /// untouched. Not inherited.
-    pub background_gradient: Option<LinearGradient>,
+    /// `background[-image]: linear-gradient(...) | radial-gradient(...) |
+    /// conic-gradient(...)`. When set it paints over (or in place of) the solid
+    /// `background`. `None` for the overwhelming majority of boxes, keeping the
+    /// flat-fill path untouched. Not inherited.
+    pub background_gradient: Option<CssGradient>,
     /// `vertical-align` of table-cell content within its (taller) row box.
     pub vertical_align: VAlign,
     /// `border-collapse: collapse` — adjacent table-cell borders share a single
@@ -405,16 +463,27 @@ pub struct Style {
     /// during cascade from the *parent* em so a shrunk glyph still shifts by the
     /// surrounding text's scale. Not inherited.
     pub valign_shift: f64,
-    /// `border-radius` corner radii in points, `[top-left, top-right,
-    /// bottom-right, bottom-left]` (the CSS clockwise order). All `0` means
-    /// square corners — the default — and the box paints via the unchanged
-    /// rectangular path. Only the circular (single-value) radius per corner is
-    /// modelled; elliptical `h / v` pairs collapse to their horizontal value.
-    /// Not inherited.
+    /// `border-radius` **horizontal** corner radii in points, `[top-left,
+    /// top-right, bottom-right, bottom-left]` (the CSS clockwise order). All `0`
+    /// means square corners — the default — and the box paints via the unchanged
+    /// rectangular path. Not inherited.
     pub border_radius: [f64; 4],
-    /// `box-shadow` (first/topmost layer only). `None` = no shadow. Painted as a
-    /// flat offset rectangle behind the box — see [`BoxShadow`]. Not inherited.
+    /// `border-radius` **vertical** corner radii in points, same corner order as
+    /// [`Style::border_radius`]. Each entry defaults to its horizontal
+    /// counterpart, so a circular `border-radius: 8pt` keeps `h == v` and paints
+    /// exactly as before; the elliptical `a b c d / e f g h` form fills these
+    /// with the vertical radii so each corner is an `h × v` arc. Not inherited.
+    pub border_radius_v: [f64; 4],
+    /// `box-shadow` first (topmost) layer. `None` = no shadow. Painted as a
+    /// blurred offset rectangle behind the box — see [`BoxShadow`]. Kept as the
+    /// single-layer field so the common one-shadow path is byte-identical. Not
+    /// inherited.
     pub box_shadow: Option<BoxShadow>,
+    /// Additional `box-shadow` layers (the 2nd…Nth, in source order). CSS paints
+    /// shadow layers back-to-front — the first listed sits on top — so these are
+    /// painted *behind* `box_shadow`. Empty for a single (or absent) shadow,
+    /// keeping the one-layer path unchanged. Not inherited.
+    pub box_shadow_extra: Vec<BoxShadow>,
 }
 
 /// CSS `float` side.
@@ -596,7 +665,9 @@ impl Default for Style {
             valign: VShift::Baseline,
             valign_shift: 0.0,
             border_radius: [0.0; 4],
+            border_radius_v: [0.0; 4],
             box_shadow: None,
+            box_shadow_extra: Vec::new(),
         }
     }
 }
@@ -1349,7 +1420,9 @@ fn inherit(parent: &Style) -> Style {
         valign_shift: 0.0,
         // `border-radius` / `box-shadow` are box decorations — not inherited.
         border_radius: [0.0; 4],
+        border_radius_v: [0.0; 4],
         box_shadow: None,
+        box_shadow_extra: Vec::new(),
     }
 }
 
@@ -1511,6 +1584,206 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
         out.push(last);
     }
     out
+}
+
+/// Parse a `background[-image]` value that *is* a gradient function into a
+/// [`CssGradient`]. Recognises `linear-gradient(...)`, `radial-gradient(...)` and
+/// `conic-gradient(...)` (and their `repeating-*` aliases, treated as the
+/// non-repeating form — the ramp still fills the box). Returns `None` for any
+/// other value (a flat colour, an `url(...)`, an unknown function), leaving the
+/// caller's solid-colour path in charge. The leading `var(...)` is resolved once
+/// so a gradient stored in a custom-property fallback is still seen.
+fn parse_css_gradient(v: &str, em: f64) -> Option<CssGradient> {
+    let v = resolve_var(v);
+    let v = v.trim();
+    // Accept the `repeating-` prefix by stripping it: we render the single ramp.
+    let bare = v.strip_prefix("repeating-").unwrap_or(v);
+    if let Some(inner) = strip_func(bare, "linear-gradient") {
+        return parse_linear_gradient(inner, em).map(CssGradient::Linear);
+    }
+    if let Some(inner) = strip_func(bare, "radial-gradient") {
+        return parse_radial_gradient(inner, em).map(CssGradient::Radial);
+    }
+    if let Some(inner) = strip_func(bare, "conic-gradient") {
+        return parse_conic_gradient(inner, em).map(CssGradient::Conic);
+    }
+    None
+}
+
+/// Parse the inside of a `radial-gradient(...)` into a [`RadialGradient`].
+///
+/// The optional leading configuration (`<shape> <size> [at <position>]`) is read
+/// only for its `at <position>` (centre, defaulting to the box centre) and a
+/// `closest-side`/`farthest-corner`/etc. *size keyword*, which scales the end
+/// radius fraction; explicit lengths/ellipse axes collapse to a circle. Whatever
+/// remains are `<color> [<pos>]` stops (centre→edge). Returns `None` unless ≥ 2
+/// stops resolve, leaving any solid `background` in place.
+fn parse_radial_gradient(inner: &str, em: f64) -> Option<RadialGradient> {
+    let parts = split_top_level_commas(inner);
+    if parts.is_empty() {
+        return None;
+    }
+    // First part is a config (not a stop) only if it carries no colour: it then
+    // holds the shape/size/position keywords. Otherwise every part is a stop.
+    let first_is_config = parse_color_in(parts[0]).is_none() && is_radial_config(parts[0]);
+    let (cx, cy, r, stop_parts): (f64, f64, f64, &[&str]) = if first_is_config {
+        let (cx, cy) = parse_at_position(parts[0]);
+        (cx, cy, radial_size_fraction(parts[0]), &parts[1..])
+    } else {
+        (0.5, 0.5, 1.0, &parts[..])
+    };
+    let stops: Vec<GradientStop> = stop_parts
+        .iter()
+        .filter_map(|p| parse_gradient_stop(p, em))
+        .collect();
+    if stops.len() < 2 {
+        return None;
+    }
+    Some(RadialGradient { cx, cy, r, stops })
+}
+
+/// Parse the inside of a `conic-gradient(...)` into a [`ConicGradient`].
+///
+/// The optional leading `[from <angle>] [at <position>]` sets the sweep start
+/// angle (CSS `0deg` = up, clockwise; default `0`) and centre (default box
+/// centre). The remaining parts are `<color> [<pos>]` stops where `<pos>` is a
+/// `%`/`0..1` fraction of the full turn (angular positions in `deg`/`turn` are
+/// also accepted and normalised to a fraction). Returns `None` unless ≥ 2 stops
+/// resolve.
+fn parse_conic_gradient(inner: &str, em: f64) -> Option<ConicGradient> {
+    let parts = split_top_level_commas(inner);
+    if parts.is_empty() {
+        return None;
+    }
+    let first_is_config = parse_color_in(parts[0]).is_none() && is_conic_config(parts[0]);
+    let (cx, cy, from_deg, stop_parts): (f64, f64, f64, &[&str]) = if first_is_config {
+        let (cx, cy) = parse_at_position(parts[0]);
+        (cx, cy, parse_from_angle(parts[0]), &parts[1..])
+    } else {
+        (0.5, 0.5, 0.0, &parts[..])
+    };
+    let stops: Vec<GradientStop> = stop_parts
+        .iter()
+        .filter_map(|p| parse_conic_stop(p, em))
+        .collect();
+    if stops.len() < 2 {
+        return None;
+    }
+    Some(ConicGradient {
+        cx,
+        cy,
+        from_deg,
+        stops,
+    })
+}
+
+/// True if `part` looks like a `radial-gradient` configuration token group
+/// (shape/size/position keywords) rather than a colour stop.
+fn is_radial_config(part: &str) -> bool {
+    let p = part.trim().to_ascii_lowercase();
+    p.starts_with("at ")
+        || p.starts_with("circle")
+        || p.starts_with("ellipse")
+        || p.contains("closest-side")
+        || p.contains("closest-corner")
+        || p.contains("farthest-side")
+        || p.contains("farthest-corner")
+}
+
+/// True if `part` looks like a `conic-gradient` configuration token group
+/// (`from <angle>` and/or `at <position>`).
+fn is_conic_config(part: &str) -> bool {
+    let p = part.trim().to_ascii_lowercase();
+    p.starts_with("from ") || p.starts_with("at ")
+}
+
+/// Map a radial size keyword to an end-radius fraction of `min(w,h)/2`.
+///
+/// In this circular model only `farthest-corner` reaches measurably past the
+/// nearer side — `≈√2` (a square's corner) — so it gets the extended fraction.
+/// Every other keyword (`closest-side` — the CSS default for circles —
+/// `closest-corner`, `farthest-side`) and the absent/unknown case stop at the
+/// nearer side (`1.0`); modelling their small ellipse-dependent differences isn't
+/// worth it for a background fill.
+fn radial_size_fraction(part: &str) -> f64 {
+    if part.to_ascii_lowercase().contains("farthest-corner") {
+        std::f64::consts::SQRT_2
+    } else {
+        1.0
+    }
+}
+
+/// Read an `at <position>` clause into centre fractions `(cx, cy)` of the box
+/// (`0..=1`). Supports the keyword corners/edges (`top`/`left`/`center`/…) and
+/// percentage pairs (`at 25% 75%`). Defaults to the box centre `(0.5, 0.5)`.
+fn parse_at_position(part: &str) -> (f64, f64) {
+    let lower = part.to_ascii_lowercase();
+    let Some(after) = lower.split("at ").nth(1) else {
+        return (0.5, 0.5);
+    };
+    let mut cx = 0.5;
+    let mut cy = 0.5;
+    let mut pct_axis = 0; // first % → x, second % → y
+    for tok in after.split_whitespace() {
+        match tok {
+            "left" => cx = 0.0,
+            "right" => cx = 1.0,
+            "top" => cy = 0.0,
+            "bottom" => cy = 1.0,
+            "center" | "centre" => {}
+            _ => {
+                if let Some(pc) = tok.strip_suffix('%').and_then(|n| n.parse::<f64>().ok()) {
+                    let f = (pc / 100.0).clamp(0.0, 1.0);
+                    if pct_axis == 0 {
+                        cx = f;
+                        pct_axis = 1;
+                    } else {
+                        cy = f;
+                    }
+                }
+            }
+        }
+    }
+    (cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0))
+}
+
+/// Read the `from <angle>` of a conic config into CSS degrees (0 = up,
+/// clockwise). Absent/unparseable ⇒ `0.0`.
+fn parse_from_angle(part: &str) -> f64 {
+    let lower = part.to_ascii_lowercase();
+    lower
+        .split("from ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(parse_gradient_angle)
+        .unwrap_or(0.0)
+}
+
+/// Is there a parseable colour anywhere in `part`? Used to tell a leading
+/// configuration group (no colour) from the first colour stop.
+fn parse_color_in(part: &str) -> Option<[f64; 3]> {
+    part.split_whitespace().find_map(parse_color)
+}
+
+/// Parse one conic `<color> [<angular-pos>]` stop. The position may be a `%` /
+/// bare `0..1` (a fraction of the turn) or an angle (`deg`/`turn`) which is
+/// normalised to a `0..1` fraction. `None` if no colour parses.
+fn parse_conic_stop(p: &str, _em: f64) -> Option<GradientStop> {
+    let mut color = None;
+    let mut pos = None;
+    for tok in p.split_whitespace() {
+        if let Some(pct) = tok.strip_suffix('%').and_then(|n| n.parse::<f64>().ok()) {
+            pos = Some((pct / 100.0).clamp(0.0, 1.0));
+        } else if let Some(c) = parse_color(tok) {
+            color = Some(c);
+        } else if let Some(deg) = parse_gradient_angle(tok) {
+            // An explicit angle stop → fraction of the full turn.
+            pos = Some((deg / 360.0).rem_euclid(1.0));
+        } else if let Ok(n) = tok.parse::<f64>() {
+            pos = Some(n.clamp(0.0, 1.0));
+        }
+    }
+    color.map(|color| GradientStop { color, pos })
 }
 
 /// Parse the inside of a `linear-gradient(...)` into a [`LinearGradient`].
@@ -2071,7 +2344,9 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 "relative" => Position::Relative,
                 "absolute" => Position::Absolute,
                 "fixed" => Position::Fixed,
-                "sticky" => Position::Relative, // approximated as relative
+                // `sticky` keeps its own scheme now: in-flow like relative, but
+                // its `inset` shift is clamped to the containing block at layout.
+                "sticky" => Position::Sticky,
                 _ => Position::Static,
             };
         }
@@ -2129,15 +2404,13 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             }
         }
         "background" | "background-color" | "background-image" => {
-            // A `linear-gradient(...)` (with or without the `background-image`
-            // longhand) is captured as a gradient that paints over the box; the
-            // solid `background` is left as-is so a `background-color` fallback
-            // declared alongside still shows where the gradient can't. Otherwise
-            // the value is a flat colour (first token of the `background`
-            // shorthand); `background-image` never sets a solid colour.
-            if let Some(g) = strip_func(v.trim(), "linear-gradient")
-                .and_then(|inner| parse_linear_gradient(inner, style.font_size))
-            {
+            // A `linear-`/`radial-`/`conic-gradient(...)` (with or without the
+            // `background-image` longhand) is captured as a gradient that paints
+            // over the box; the solid `background` is left as-is so a
+            // `background-color` fallback declared alongside still shows where the
+            // gradient can't. Otherwise the value is a flat colour (first token of
+            // the `background` shorthand); `background-image` never sets a colour.
+            if let Some(g) = parse_css_gradient(v.trim(), style.font_size) {
                 style.background_gradient = Some(g);
             } else if prop != "background-image" {
                 style.background = parse_color(v.split_whitespace().next().unwrap_or(v));
@@ -2353,20 +2626,26 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             };
         }
         "border-collapse" => style.border_collapse = v == "collapse",
-        "border-radius" => style.border_radius = parse_border_radius(v, style.font_size),
-        "border-top-left-radius" => {
-            style.border_radius[0] = parse_corner_radius(v, style.font_size);
+        "border-radius" => {
+            let (h, vert) = parse_border_radius(v, style.font_size);
+            style.border_radius = h;
+            style.border_radius_v = vert;
         }
-        "border-top-right-radius" => {
-            style.border_radius[1] = parse_corner_radius(v, style.font_size);
+        "border-top-left-radius" => set_corner_radius(style, 0, v),
+        "border-top-right-radius" => set_corner_radius(style, 1, v),
+        "border-bottom-right-radius" => set_corner_radius(style, 2, v),
+        "border-bottom-left-radius" => set_corner_radius(style, 3, v),
+        "box-shadow" => {
+            let mut layers = parse_box_shadows(v, style.font_size);
+            // First layer is the topmost (single-layer path unchanged); the rest
+            // paint behind it. `none`/unparseable ⇒ no shadow at all.
+            style.box_shadow = if layers.is_empty() {
+                None
+            } else {
+                Some(layers.remove(0))
+            };
+            style.box_shadow_extra = layers;
         }
-        "border-bottom-right-radius" => {
-            style.border_radius[2] = parse_corner_radius(v, style.font_size);
-        }
-        "border-bottom-left-radius" => {
-            style.border_radius[3] = parse_corner_radius(v, style.font_size);
-        }
-        "box-shadow" => style.box_shadow = parse_box_shadow(v, style.font_size),
         "width" => style.width = parse_len(v, style.font_size),
         _ => {}
     }
@@ -2448,23 +2727,38 @@ fn apply_border_style_shorthand(style: &mut Style, v: &str) {
     };
 }
 
-/// Parse the `border-radius` shorthand into `[top-left, top-right, bottom-right,
-/// bottom-left]` (CSS clockwise order), in points.
+/// Parse the `border-radius` shorthand into `(horizontal, vertical)` corner
+/// radii, each `[top-left, top-right, bottom-right, bottom-left]` (CSS clockwise
+/// order), in points.
 ///
-/// Supports the 1–4 value forms (`r` / `tl-tr-bl tr-bl` … per CSS) and the
-/// elliptical `h… / v…` syntax — the vertical radii are dropped (only circular
-/// corners are modelled), so `10px / 20px` keeps the 10px horizontal radius.
-/// Percentages resolve against the font-size here (no box size is available at
-/// parse time); unparseable tokens fall back to `0`, never panicking.
-fn parse_border_radius(v: &str, em: f64) -> [f64; 4] {
-    // Elliptical form `horizontal / vertical` — keep the horizontal radii only.
-    let h_part = v.split('/').next().unwrap_or(v);
-    let vals: Vec<f64> = h_part
+/// Supports the 1–4 value forms (`r` / `tl-tr-bl tr-bl` … per CSS) **and** the
+/// elliptical `a b c d / e f g h` syntax: the part before `/` fills the
+/// horizontal radii and the part after fills the vertical radii (each with the
+/// same 1–4 fill rules). With no `/` the box is circular and the vertical radii
+/// equal the horizontal ones, so a plain `border-radius: 8pt` is byte-identical
+/// to before. Percentages resolve against the font-size here (no box size is
+/// available at parse time); unparseable tokens fall back to `0`, never panicking.
+fn parse_border_radius(v: &str, em: f64) -> ([f64; 4], [f64; 4]) {
+    let mut it = v.splitn(2, '/');
+    let h_part = it.next().unwrap_or(v);
+    let h = fill_radius_quad(h_part, em);
+    // Elliptical form: a `/ v…` part overrides the vertical radii; otherwise the
+    // vertical radii mirror the horizontal ones (circular corners).
+    let vert = match it.next() {
+        Some(v_part) if !v_part.trim().is_empty() => fill_radius_quad(v_part, em),
+        _ => h,
+    };
+    (h, vert)
+}
+
+/// Expand a 1–4 length list into a `[TL, TR, BR, BL]` quad with the CSS
+/// `border-radius` fill rules. Unparseable/empty ⇒ all zeros.
+fn fill_radius_quad(part: &str, em: f64) -> [f64; 4] {
+    let vals: Vec<f64> = part
         .split_whitespace()
         .map(|t| parse_len_px(t, em).unwrap_or(0.0).max(0.0))
         .collect();
     match vals.as_slice() {
-        // CSS fill rules for 1–4 values (TL, TR, BR, BL):
         [a] => [*a, *a, *a, *a],
         [a, b] => [*a, *b, *a, *b],
         [a, b, c] => [*a, *b, *c, *b],
@@ -2473,34 +2767,59 @@ fn parse_border_radius(v: &str, em: f64) -> [f64; 4] {
     }
 }
 
-/// Parse a single corner-radius longhand (e.g. `border-top-left-radius`). Takes
-/// the first (horizontal) value of a possible `h v` pair; `0` on failure.
-fn parse_corner_radius(v: &str, em: f64) -> f64 {
-    v.split_whitespace()
+/// Parse a single corner-radius longhand (e.g. `border-top-left-radius`) into its
+/// `(horizontal, vertical)` radii. A lone value is circular (`h == v`); an `h v`
+/// pair gives an elliptical corner. `(0, 0)` on failure.
+fn parse_corner_radius(v: &str, em: f64) -> (f64, f64) {
+    let mut it = v.split_whitespace();
+    let h = it
         .next()
         .and_then(|t| parse_len_px(t, em))
         .unwrap_or(0.0)
-        .max(0.0)
+        .max(0.0);
+    let vert = it.next().and_then(|t| parse_len_px(t, em)).unwrap_or(h).max(0.0);
+    (h, vert)
 }
 
-/// Parse a `box-shadow` value into its first layer (topmost). `none` (or an
-/// unparseable value) yields `None`.
+/// Apply a corner-radius longhand to corner `i` (`0=TL,1=TR,2=BR,3=BL`), setting
+/// both the horizontal and vertical radii for that corner.
+fn set_corner_radius(style: &mut Style, i: usize, v: &str) {
+    let (h, vert) = parse_corner_radius(v, style.font_size);
+    style.border_radius[i] = h;
+    style.border_radius_v[i] = vert;
+}
+
+/// Parse a `box-shadow` value into all its layers, in source order (first layer
+/// = topmost). `none` (or a value with no usable layer) yields an empty vec.
 ///
-/// Grammar handled: `[inset] <dx> <dy> [blur] [spread] [color]` in any order for
-/// the keyword/colour, with the lengths in their canonical order. Only the first
-/// comma-separated layer is kept (the topmost one a browser paints last); extra
-/// layers are ignored rather than mis-stacked. A missing colour defaults to a
-/// translucent-looking black (the paint layer already dims by `blur`).
-fn parse_box_shadow(v: &str, em: f64) -> Option<BoxShadow> {
+/// Comma-separated layers are split at the **top level** (commas inside an
+/// `rgb()/rgba()/hsl()` colour stay with their layer), each then parsed by
+/// [`parse_box_shadow_layer`]. A layer that doesn't carry the two required
+/// offsets is dropped rather than mis-placed.
+fn parse_box_shadows(v: &str, em: f64) -> Vec<BoxShadow> {
     let v = resolve_var(v);
-    let first = v.split(',').next().unwrap_or(&v).trim();
-    if first.is_empty() || first.eq_ignore_ascii_case("none") {
+    if v.trim().eq_ignore_ascii_case("none") || v.trim().is_empty() {
+        return Vec::new();
+    }
+    split_top_level_commas(&v)
+        .iter()
+        .filter_map(|layer| parse_box_shadow_layer(layer, em))
+        .collect()
+}
+
+/// Parse one `box-shadow` layer: `[inset] <dx> <dy> [blur] [spread] [color]` with
+/// the `inset` keyword/colour in any order and the lengths in canonical order. A
+/// missing colour defaults to black (the paint layer dims by `blur`). `None` if
+/// fewer than the two offset lengths are present.
+fn parse_box_shadow_layer(layer: &str, em: f64) -> Option<BoxShadow> {
+    let layer = layer.trim();
+    if layer.is_empty() || layer.eq_ignore_ascii_case("none") {
         return None;
     }
     let mut inset = false;
     let mut color: Option<[f64; 3]> = None;
     let mut lengths: Vec<f64> = Vec::new();
-    for tok in first.split_whitespace() {
+    for tok in layer.split_whitespace() {
         if tok.eq_ignore_ascii_case("inset") {
             inset = true;
         } else if let Some(px) = parse_len_px(tok, em) {
@@ -3162,6 +3481,15 @@ mod tests {
         s
     }
 
+    /// Extract the [`LinearGradient`] from a style's background gradient (panics
+    /// if it is absent or a different kind) — keeps the gradient tests terse.
+    fn as_linear(s: &Style) -> &LinearGradient {
+        match s.background_gradient.as_ref().expect("a gradient parsed") {
+            CssGradient::Linear(g) => g,
+            other => panic!("expected a linear gradient, got {other:?}"),
+        }
+    }
+
     #[test]
     fn per_side_border_widths_and_colors_parse() {
         let s = inline_style(
@@ -3366,7 +3694,7 @@ mod tests {
     #[test]
     fn linear_gradient_parses_angle_and_stops() {
         let s = inline_style("background:linear-gradient(90deg, #ff0000, #0000ff)");
-        let g = s.background_gradient.as_ref().expect("a gradient parsed");
+        let g = as_linear(&s);
         assert!((g.angle_deg - 90.0).abs() < 0.01, "90deg angle");
         assert_eq!(g.stops.len(), 2, "two stops");
         assert_eq!(g.stops[0].color, [1.0, 0.0, 0.0]);
@@ -3379,7 +3707,7 @@ mod tests {
     fn linear_gradient_to_side_keyword_and_positions() {
         // `to right` ≡ 90deg; a `%` position is captured per stop.
         let s = inline_style("background-image:linear-gradient(to right, red 10%, blue 90%)");
-        let g = s.background_gradient.as_ref().expect("gradient");
+        let g = as_linear(&s);
         assert!((g.angle_deg - 90.0).abs() < 0.01, "to right = 90deg");
         assert_eq!(g.stops[0].pos, Some(0.10));
         assert_eq!(g.stops[1].pos, Some(0.90));
@@ -3389,7 +3717,7 @@ mod tests {
     fn linear_gradient_default_direction_is_to_bottom() {
         // No leading direction ⇒ CSS default 180deg (to bottom).
         let s = inline_style("background:linear-gradient(red, blue)");
-        let g = s.background_gradient.as_ref().expect("gradient");
+        let g = as_linear(&s);
         assert!((g.angle_deg - 180.0).abs() < 0.01, "default 180deg");
         assert_eq!(g.stops.len(), 2);
     }
@@ -3405,6 +3733,139 @@ mod tests {
             approx(bg, [17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0]),
             "got {bg:?}"
         );
+    }
+
+    #[test]
+    fn radial_gradient_parses_center_and_stops() {
+        // Default circle, centred; two stops centre→edge.
+        let s = inline_style("background:radial-gradient(#ff0000, #0000ff)");
+        match s.background_gradient.as_ref().expect("radial gradient") {
+            CssGradient::Radial(g) => {
+                assert!((g.cx - 0.5).abs() < 1e-9 && (g.cy - 0.5).abs() < 1e-9, "centred");
+                assert_eq!(g.stops.len(), 2);
+                assert_eq!(g.stops[0].color, [1.0, 0.0, 0.0]);
+                assert_eq!(g.stops[1].color, [0.0, 0.0, 1.0]);
+            }
+            other => panic!("expected radial, got {other:?}"),
+        }
+        assert!(s.background.is_none(), "gradient leaves solid background unset");
+    }
+
+    #[test]
+    fn radial_gradient_at_position_and_size_keyword() {
+        // `circle farthest-corner at 25% 75%` → centre (0.25,0.75), r ≈ √2.
+        let s = inline_style(
+            "background:radial-gradient(circle farthest-corner at 25% 75%, red, blue)",
+        );
+        match s.background_gradient.as_ref().expect("radial") {
+            CssGradient::Radial(g) => {
+                assert!((g.cx - 0.25).abs() < 1e-9, "cx={}", g.cx);
+                assert!((g.cy - 0.75).abs() < 1e-9, "cy={}", g.cy);
+                assert!(
+                    (g.r - std::f64::consts::SQRT_2).abs() < 1e-9,
+                    "farthest-corner radius fraction, got {}",
+                    g.r
+                );
+            }
+            other => panic!("expected radial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conic_gradient_parses_from_angle_and_stops() {
+        let s = inline_style("background:conic-gradient(from 90deg at 50% 50%, red, lime, blue)");
+        match s.background_gradient.as_ref().expect("conic") {
+            CssGradient::Conic(g) => {
+                assert!((g.from_deg - 90.0).abs() < 1e-9, "from 90deg, got {}", g.from_deg);
+                assert!((g.cx - 0.5).abs() < 1e-9 && (g.cy - 0.5).abs() < 1e-9);
+                assert_eq!(g.stops.len(), 3);
+            }
+            other => panic!("expected conic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conic_gradient_default_from_is_zero() {
+        let s = inline_style("background:conic-gradient(#000000, #ffffff)");
+        match s.background_gradient.as_ref().expect("conic") {
+            CssGradient::Conic(g) => {
+                assert!((g.from_deg).abs() < 1e-9, "default from 0deg");
+                assert!((g.cx - 0.5).abs() < 1e-9, "default centred");
+            }
+            other => panic!("expected conic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linear_gradient_still_byte_identical_after_generalisation() {
+        // Regression guard: the linear path must keep producing a `Linear` arm
+        // with the same angle/stops it always has (no accidental re-routing).
+        let s = inline_style("background:linear-gradient(45deg, red, blue)");
+        let g = as_linear(&s);
+        assert!((g.angle_deg - 45.0).abs() < 1e-9);
+        assert_eq!(g.stops.len(), 2);
+    }
+
+    #[test]
+    fn elliptical_border_radius_keeps_horizontal_and_vertical() {
+        // `a b c d / e f g h` — horizontal radii from the first list, vertical
+        // from the second (each with TRBL fill rules).
+        let s = inline_style("border-radius:10pt 20pt 30pt 40pt / 5pt 6pt 7pt 8pt");
+        assert_eq!(s.border_radius, [10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(s.border_radius_v, [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn circular_border_radius_mirrors_h_into_v() {
+        // No `/` ⇒ vertical radii equal the horizontal ones (circular corners).
+        let s = inline_style("border-radius:8pt");
+        assert_eq!(s.border_radius, [8.0; 4]);
+        assert_eq!(s.border_radius_v, [8.0; 4], "circular: v mirrors h");
+    }
+
+    #[test]
+    fn elliptical_corner_longhand_takes_h_v_pair() {
+        let s = inline_style("border-top-left-radius:12pt 4pt");
+        assert_eq!(s.border_radius[0], 12.0);
+        assert_eq!(s.border_radius_v[0], 4.0);
+        // A lone value is circular for that corner.
+        let s2 = inline_style("border-bottom-right-radius:9pt");
+        assert_eq!(s2.border_radius[2], 9.0);
+        assert_eq!(s2.border_radius_v[2], 9.0);
+    }
+
+    #[test]
+    fn box_shadow_keeps_all_layers() {
+        // Two layers: the first is the topmost (kept in `box_shadow`), the second
+        // (and any more) land in `box_shadow_extra`, in source order.
+        let s = inline_style("box-shadow:1pt 1pt 2pt #ff0000, 4pt 4pt 8pt 1pt #0000ff");
+        let top = s.box_shadow.expect("first layer");
+        assert_eq!((top.dx, top.dy, top.blur), (1.0, 1.0, 2.0));
+        assert_eq!(top.color, [1.0, 0.0, 0.0]);
+        assert_eq!(s.box_shadow_extra.len(), 1, "one extra layer");
+        let extra = s.box_shadow_extra[0];
+        assert_eq!((extra.dx, extra.dy, extra.blur, extra.spread), (4.0, 4.0, 8.0, 1.0));
+        assert_eq!(extra.color, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn single_box_shadow_has_no_extra_layers() {
+        // The common one-shadow case keeps `box_shadow_extra` empty (unchanged).
+        let s = inline_style("box-shadow:2pt 3pt 4pt #000000");
+        assert!(s.box_shadow.is_some());
+        assert!(s.box_shadow_extra.is_empty());
+        // `none` clears everything.
+        let n = inline_style("box-shadow:none");
+        assert!(n.box_shadow.is_none() && n.box_shadow_extra.is_empty());
+    }
+
+    #[test]
+    fn position_sticky_parses_as_sticky() {
+        assert_eq!(inline_style("position:sticky").position, Position::Sticky);
+        // The other schemes are unchanged.
+        assert_eq!(inline_style("position:relative").position, Position::Relative);
+        assert_eq!(inline_style("position:fixed").position, Position::Fixed);
+        assert_eq!(inline_style("position:static").position, Position::Static);
     }
 
     #[test]
