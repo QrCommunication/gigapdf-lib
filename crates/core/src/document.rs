@@ -2178,6 +2178,7 @@ impl Document {
         let resolver = PageColorResolver {
             doc: self,
             resources: self.page_resources(page_no),
+            pattern_depth: 0,
         };
         content::extract_elements_resolved_with_colors(
             &content,
@@ -2258,6 +2259,7 @@ impl Document {
         let resolver = PageColorResolver {
             doc: self,
             resources: self.page_resources(page_no),
+            pattern_depth: 0,
         };
         let mut paths =
             content::vector::vector_paths_from_ops_with_pos(&operations, &gstate, &resolver);
@@ -3823,6 +3825,14 @@ impl Document {
         name: &[u8],
         comps: &[f64],
     ) -> Option<[f64; 3]> {
+        // A component-less `scn` (`/Pattern cs … /P0 scn`) carries only a pattern
+        // name: there is no flat colour to resolve here — defer to the pattern
+        // resolver (which yields the gradient/tile's representative colour). A
+        // bare `/Pattern` space converts only the (absent) underlying base, so it
+        // would otherwise collapse to black and mask the pattern.
+        if comps.is_empty() {
+            return None;
+        }
         // Device-space names are resolved directly; everything else is a name in
         // this resources scope's `/ColorSpace` sub-dictionary.
         let cs = match name {
@@ -3835,6 +3845,119 @@ impl Document {
             }
         };
         Some(cs.to_rgb_f(comps, self))
+    }
+
+    /// Resolve a `/Pattern` resource `name` (a `… /P0 scn` operand) to a single
+    /// **representative** device-RGB colour (`0..=1`), so the vector-shape
+    /// extractor stores a faithful flat stand-in for a fill that can't be a flat
+    /// colour — instead of keeping the previous path's colour (the visible bug).
+    ///
+    /// - **Shading pattern** (PatternType 2): the gradient's *mid* colour — the
+    ///   midpoint of the same 256-entry ramp the rasterizer samples (axial/radial),
+    ///   or, for a mesh shading (types 4–7, which the rasterizer doesn't paint),
+    ///   the shading `/Function` sampled at its domain midpoint.
+    /// - **Tiling pattern** (PatternType 1): the first concrete fill/stroke colour
+    ///   painted by the tile's content stream (its dominant ink), best-effort.
+    ///
+    /// `None` when the name isn't a `/Pattern` resource or no colour can be
+    /// derived — the extractor then leaves the colour unchanged.
+    ///
+    /// `depth` bounds pattern-in-pattern nesting (a tiling pattern's tile may
+    /// itself reference a pattern), so a malformed self-reference can't recurse
+    /// forever; page-level callers pass `0`.
+    pub(crate) fn resolve_pattern_color_f(
+        &self,
+        resources: &Dictionary,
+        name: &[u8],
+        depth: usize,
+    ) -> Option<[f64; 3]> {
+        if depth > 4 {
+            return None; // pattern-in-pattern nesting too deep / cyclic
+        }
+        let (_, obj) = self.resource_entry(resources, b"Pattern", name)?;
+        let dict = match obj {
+            Object::Stream(s) => &s.dict, // tiling patterns are content streams
+            other => other.as_dict()?,
+        };
+        match dict.get(b"PatternType").and_then(Object::as_i64) {
+            Some(2) => {
+                let shading = dict.get(b"Shading").map(|o| self.resolve(o))?;
+                self.shading_representative_color_f(shading.as_dict()?)
+            }
+            Some(1) => self.tiling_representative_color_f(obj, resources, depth),
+            _ => None,
+        }
+    }
+
+    /// A representative device-RGB colour (`0..=1`) for a shading dictionary: the
+    /// midpoint of the rasterizer's axial/radial ramp, or — for a mesh shading
+    /// (types 4–7) — the `/Function` sampled at its domain midpoint. Used to give
+    /// a shading-pattern fill a flat stand-in in the shape layer.
+    fn shading_representative_color_f(&self, dict: &Dictionary) -> Option<[f64; 3]> {
+        // Axial (2) / radial (3): reuse the exact ramp the rasterizer builds and
+        // take its middle entry — a stable, representative gradient colour.
+        if let Some(sh) = self.read_shading(dict, None) {
+            let mid = sh.ramp.get(sh.ramp.len() / 2).copied()?;
+            return Some([
+                mid[0] as f64 / 255.0,
+                mid[1] as f64 / 255.0,
+                mid[2] as f64 / 255.0,
+            ]);
+        }
+        // Mesh shadings (types 4–7) carry their colours in a data stream the
+        // rasterizer doesn't decode; when a parametric `/Function` is present,
+        // sample it at the domain midpoint for a faithful representative colour.
+        let func = dict.get(b"Function").map(|o| self.resolve(o))?;
+        let domain = self
+            .resolve(dict.get(b"Domain")?)
+            .as_array()
+            .and_then(|a| {
+                let v: Vec<f64> = a.iter().filter_map(|o| self.resolve(o).as_f64()).collect();
+                (v.len() >= 2).then(|| [v[0], v[1]])
+            })
+            .unwrap_or([0.0, 1.0]);
+        let mid = (domain[0] + domain[1]) * 0.5;
+        let rgb = self.sample_function_rgb(func, mid);
+        Some([
+            rgb[0] as f64 / 255.0,
+            rgb[1] as f64 / 255.0,
+            rgb[2] as f64 / 255.0,
+        ])
+    }
+
+    /// A representative device-RGB colour (`0..=1`) for a tiling pattern: the
+    /// first concrete fill/stroke colour painted by the tile's content stream
+    /// (its dominant ink), resolving the tile's own `/Resources` colour spaces.
+    /// `None` for an uncoloured tile that sets no colour (e.g. a stencil mask).
+    fn tiling_representative_color_f(
+        &self,
+        pattern: &Object,
+        parent_resources: &Dictionary,
+        depth: usize,
+    ) -> Option<[f64; 3]> {
+        let stream = pattern.as_stream()?;
+        let content = decode_stream(stream).ok()?;
+        let ops = content::parse_content(&content).ok()?;
+        // A tile's own `/Resources`, else (per ISO 32000-1) the pattern's parent.
+        let resources = stream
+            .dict
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_else(|| parent_resources.clone());
+        // `depth + 1`: a pattern referenced from inside this tile resolves one
+        // level deeper, so the depth guard terminates a cyclic reference.
+        let resolver = PageColorResolver {
+            doc: self,
+            resources,
+            pattern_depth: depth + 1,
+        };
+        // Reuse the shape extractor: the first painted path's fill (else stroke)
+        // is the tile's dominant ink.
+        let paths =
+            content::vector::vector_paths_from_ops(&ops, &BTreeMap::new(), &resolver);
+        paths.iter().find_map(|p| p.fill.or(p.stroke))
     }
 
     /// Evaluate a PDF function object at scalar input `t`, returning its output
@@ -12249,11 +12372,20 @@ impl crate::raster::colorspace::TintEval for Document {
 struct PageColorResolver<'a> {
     doc: &'a Document,
     resources: Dictionary,
+    /// Pattern-nesting depth: 0 at the page level, incremented when resolving a
+    /// tiling pattern's tile (whose content may reference further patterns), so a
+    /// cyclic `/Pattern` reference can't recurse forever.
+    pattern_depth: usize,
 }
 
 impl crate::content::vector::NamedColorResolver for PageColorResolver<'_> {
     fn resolve(&self, name: &[u8], comps: &[f64]) -> Option<[f64; 3]> {
         self.doc.resolve_named_color_f(&self.resources, name, comps)
+    }
+
+    fn resolve_pattern(&self, name: &[u8]) -> Option<[f64; 3]> {
+        self.doc
+            .resolve_pattern_color_f(&self.resources, name, self.pattern_depth)
     }
 }
 
@@ -18088,6 +18220,67 @@ mod tests {
         assert!(
             fill[0] < 1e-9 && (fill[1] - 1.0).abs() < 1e-9 && (fill[2] - 1.0).abs() < 1e-9,
             "ICCBased N=4 cyan → (0,1,1), got {fill:?}"
+        );
+    }
+
+    #[test]
+    fn vector_fill_resolves_shading_pattern_to_mid_gradient_colour() {
+        // `/P1` is a shading pattern (PatternType 2) over an axial shading whose
+        // type-2 function ramps DeviceRGB black `[0 0 0]` → blue `[0 0 1]`. A
+        // `/Pattern cs /P1 scn … f` can't be a flat fill, so the shape layer must
+        // store the gradient's MID colour ≈ (0,0,0.5) — NOT the previous red.
+        let resources = "/Pattern << /P1 << /PatternType 2 /Shading \
+             << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+                /Function << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [0 0 1] /N 1 >> \
+                /Extend [true true] >> >> >>";
+        let paths = vector_paths_with_resources(
+            "1 0 0 rg /Pattern cs /P1 scn 20 20 60 60 re f",
+            resources,
+        );
+        assert_eq!(paths.len(), 1, "the pattern-filled path must be emitted");
+        let fill = paths[0].fill.expect("a representative fill colour");
+        assert!(
+            fill[0] < 1e-9 && fill[1] < 1e-9 && (fill[2] - 0.5).abs() < 0.05,
+            "shading-pattern fill = mid gradient ≈ (0,0,0.5), not previous red, got {fill:?}"
+        );
+    }
+
+    #[test]
+    fn vector_fill_resolves_tiling_pattern_to_its_dominant_ink() {
+        // `/P1` is a tiling pattern (PatternType 1) whose tile paints a green
+        // rectangle. `/Pattern cs /P1 scn … f` must store the tile's dominant ink
+        // (green), not the previous red — exercising the content-stream sampler.
+        let tile = "0 1 0 rg 0 0 10 10 re f"; // green fill inside the tile
+        let objects: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (4, {
+                let s = "1 0 0 rg /Pattern cs /P1 scn 20 20 60 60 re f";
+                format!("<< /Length {} >> stream\n{s}\nendstream", s.len())
+            }),
+            // The tiling pattern is itself a content-stream object.
+            (5, {
+                format!(
+                    "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                     /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << >> \
+                     /Length {} >> stream\n{tile}\nendstream",
+                    tile.len()
+                )
+            }),
+        ];
+        let doc = Document::open(&raw_pdf(&objects)).unwrap();
+        let paths = doc.page_vector_paths(1).unwrap();
+        assert_eq!(paths.len(), 1);
+        let fill = paths[0].fill.unwrap();
+        assert!(
+            fill[0] < 1e-9 && (fill[1] - 1.0).abs() < 1e-9 && fill[2] < 1e-9,
+            "tiling-pattern fill = tile's green ink, not previous red, got {fill:?}"
         );
     }
 

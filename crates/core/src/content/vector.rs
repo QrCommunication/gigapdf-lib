@@ -67,6 +67,20 @@ pub struct VectorPath {
 pub trait NamedColorResolver {
     /// Resolve the named space `name` and convert `comps` to device RGB `0..=1`.
     fn resolve(&self, name: &[u8], comps: &[f64]) -> Option<[f64; 3]>;
+
+    /// Resolve a `/Pattern` `scn`/`SCN` operand (the pattern resource `name`,
+    /// e.g. `/P0`) to a single **representative** device-RGB colour (`0..=1`):
+    /// for a shading pattern (PatternType 2) the gradient's mid colour, for a
+    /// tiling pattern (PatternType 1) a colour sampled from the tile content.
+    ///
+    /// A shape extractor can't paint a gradient/tile into a flat `fill`, so this
+    /// yields a faithful flat stand-in instead of leaving the *previous* path's
+    /// colour in effect (the visible bug when `/Pn scn` carries no numeric
+    /// component). The default returns `None` (callers without a document, and
+    /// tests) — the fill then stays unchanged, the pre-existing behaviour.
+    fn resolve_pattern(&self, _name: &[u8]) -> Option<[f64; 3]> {
+        None
+    }
 }
 
 /// A resolver that resolves nothing — every named space falls back to operand-
@@ -208,6 +222,15 @@ fn nums(op: &Operation) -> Vec<f64> {
             _ => None,
         })
         .collect()
+}
+
+/// The pattern resource name in a `/Pattern`-space `scn`/`SCN` (`… /P0 scn`):
+/// the last operand when it is a `Name`. `None` for a purely numeric `scn`.
+fn pattern_operand(op: &Operation) -> Option<&[u8]> {
+    match op.operands.last() {
+        Some(Object::Name(name)) => Some(name),
+        _ => None,
+    }
 }
 
 fn is_paint(op: &[u8]) -> bool {
@@ -363,15 +386,22 @@ pub fn vector_paths_from_ops_with_pos(
                 }
             }
             // Set colour in the current space (`scn`/`SCN`). A trailing pattern
-            // name (non-numeric) is ignored by `nums`; pattern-only paints leave
-            // the colour unchanged.
+            // name (`/P0`) is ignored by `nums`; for such a `/Pattern` paint the
+            // resolver maps the pattern to a representative flat colour, so the
+            // shape no longer keeps the *previous* path's colour.
             b"scn" | b"sc" => {
                 if let Some(rgb) = resolve_color(&st.fill_space, &n, resolver) {
+                    st.fill = rgb;
+                } else if let Some(rgb) = pattern_operand(op).and_then(|p| resolver.resolve_pattern(p))
+                {
                     st.fill = rgb;
                 }
             }
             b"SCN" | b"SC" => {
                 if let Some(rgb) = resolve_color(&st.stroke_space, &n, resolver) {
+                    st.stroke = rgb;
+                } else if let Some(rgb) = pattern_operand(op).and_then(|p| resolver.resolve_pattern(p))
+                {
                     st.stroke = rgb;
                 }
             }
@@ -576,9 +606,56 @@ mod tests {
 
     #[test]
     fn pattern_scn_without_components_keeps_previous_colour() {
-        // `1 0 0 rg` then a component-less `/P0 scn` (pattern): the fill stays red
-        // rather than being cleared.
+        // `1 0 0 rg` then a component-less `/P0 scn` (pattern): with no resolver
+        // for patterns (`NoNamedColors`), the fill stays red rather than being
+        // cleared — the documented best-effort fallback.
         let p = paths(b"1 0 0 rg /Pattern cs /P0 scn 0 0 10 10 re f");
+        assert_eq!(p[0].fill, Some([1.0, 0.0, 0.0]));
+    }
+
+    /// A resolver that knows one pattern (`/P0` → green) and nothing else, to
+    /// exercise the `resolve_pattern` seam without a document.
+    #[derive(Debug)]
+    struct GreenPattern;
+    impl NamedColorResolver for GreenPattern {
+        fn resolve(&self, _name: &[u8], _comps: &[f64]) -> Option<[f64; 3]> {
+            None
+        }
+        fn resolve_pattern(&self, name: &[u8]) -> Option<[f64; 3]> {
+            (name == b"P0").then_some([0.0, 1.0, 0.0])
+        }
+    }
+
+    fn paths_with(content: &[u8], resolver: &dyn NamedColorResolver) -> Vec<VectorPath> {
+        let ops = parse_content(content).unwrap();
+        vector_paths_from_ops(&ops, &BTreeMap::new(), resolver)
+    }
+
+    #[test]
+    fn pattern_fill_resolves_to_representative_colour_not_previous() {
+        // `1 0 0 rg` (red) then `/Pattern cs /P0 scn`: the resolver maps the
+        // pattern to its representative green, so the fill is GREEN — not the
+        // stale red, the visible bug this seam fixes.
+        let p = paths_with(b"1 0 0 rg /Pattern cs /P0 scn 0 0 10 10 re f", &GreenPattern);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].fill, Some([0.0, 1.0, 0.0]), "pattern fill ≠ previous red");
+    }
+
+    #[test]
+    fn pattern_stroke_resolves_to_representative_colour() {
+        // Same on the stroke side via `/Pattern CS /P0 SCN`.
+        let p = paths_with(
+            b"0 0 1 RG /Pattern CS /P0 SCN 1 w 0 0 m 50 0 l S",
+            &GreenPattern,
+        );
+        assert_eq!(p[0].stroke, Some([0.0, 1.0, 0.0]));
+        assert_eq!(p[0].fill, None);
+    }
+
+    #[test]
+    fn unknown_pattern_keeps_previous_colour() {
+        // An unknown pattern name the resolver can't map leaves the fill as-is.
+        let p = paths_with(b"1 0 0 rg /Pattern cs /PX scn 0 0 10 10 re f", &GreenPattern);
         assert_eq!(p[0].fill, Some([1.0, 0.0, 0.0]));
     }
 }
