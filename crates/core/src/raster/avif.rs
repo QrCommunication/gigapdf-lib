@@ -244,10 +244,10 @@ pub fn decode_avif(avif: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
     let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
     let mut tile = tile::Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+    // Decodes every tile (single- or multi-tile) and applies the in-loop filters
+    // (deblock, CDEF, loop restoration) over the frame. Film-grain synthesis (a
+    // display-time effect) is the one documented gap.
     tile.decode();
-    // NOTE: in-loop filters (deblock, CDEF, loop-restoration, film-grain) are not
-    // yet applied — fine for the still-picture fixture (its YUV reference is the
-    // raw intra reconstruction), a documented gap for arbitrary AVIFs.
     let (w, h) = (fh.frame_width as usize, fh.frame_height as usize);
     let rgba = yuv_to_rgba(&tile, &seq, w, h);
     Some((fh.frame_width, fh.frame_height, rgba))
@@ -655,6 +655,14 @@ pub(crate) struct FrameHeader {
     pub superres_denom: u32,
     pub tile_cols_log2: u32,
     pub tile_rows_log2: u32,
+    /// Superblock-column start of each tile (length `tile_cols + 1`; the last
+    /// entry is `sb_cols`). Empty until `tile_info()` fills it.
+    pub tile_col_starts_sb: Vec<u32>,
+    /// Superblock-row start of each tile (length `tile_rows + 1`; the last entry
+    /// is `sb_rows`).
+    pub tile_row_starts_sb: Vec<u32>,
+    /// Bytes used by each `tile_size_minus_1` field in the tile group (1..=4).
+    pub tile_size_bytes: u32,
     pub base_q_idx: u32,
     pub delta_q_y_dc: i32,
     pub delta_q_u_dc: i32,
@@ -915,6 +923,10 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
     let max_log2_tile_rows = tile_log2(1, sb_rows.min(64));
     let min_log2_tiles = min_log2_tile_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
     let uniform = r.f(1) != 0;
+    // Superblock-column / -row start of each tile, terminated by `sb_cols`/
+    // `sb_rows` (AV1 `MiColStarts`/`MiRowStarts`, expressed in superblocks).
+    let mut col_starts = vec![0u32];
+    let mut row_starts = vec![0u32];
     if uniform {
         h.tile_cols_log2 = min_log2_tile_cols;
         while h.tile_cols_log2 < max_log2_tile_cols {
@@ -923,6 +935,13 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
             } else {
                 break;
             }
+        }
+        // Uniform spacing: ceil(sb_cols / TileCols) superblocks per tile.
+        let tile_width_sb = (sb_cols + (1 << h.tile_cols_log2) - 1) >> h.tile_cols_log2;
+        let mut start_sb = 0u32;
+        while start_sb < sb_cols {
+            start_sb += tile_width_sb;
+            col_starts.push(start_sb.min(sb_cols));
         }
         let min_log2_tile_rows = min_log2_tiles.saturating_sub(h.tile_cols_log2);
         h.tile_rows_log2 = min_log2_tile_rows;
@@ -933,6 +952,12 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
                 break;
             }
         }
+        let tile_height_sb = (sb_rows + (1 << h.tile_rows_log2) - 1) >> h.tile_rows_log2;
+        let mut start_sb = 0u32;
+        while start_sb < sb_rows {
+            start_sb += tile_height_sb;
+            row_starts.push(start_sb.min(sb_rows));
+        }
     } else {
         // Non-uniform tiling (rare for AVIF): widths/heights coded as ns().
         let mut start_sb = 0u32;
@@ -940,6 +965,7 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
         while start_sb < sb_cols {
             let max_width = (sb_cols - start_sb).min(max_tile_width_sb);
             start_sb += ns(&mut r, max_width) + 1;
+            col_starts.push(start_sb.min(sb_cols));
             cols += 1;
         }
         h.tile_cols_log2 = tile_log2(1, cols);
@@ -949,13 +975,17 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
         while start_sb < sb_rows {
             let max_height = (sb_rows - start_sb).min(max_tile_height_sb);
             start_sb += ns(&mut r, max_height) + 1;
+            row_starts.push(start_sb.min(sb_rows));
             rows += 1;
         }
         h.tile_rows_log2 = tile_log2(1, rows);
     }
+    h.tile_col_starts_sb = col_starts;
+    h.tile_row_starts_sb = row_starts;
+    h.tile_size_bytes = 4; // default when a single tile carries no size field
     if h.tile_cols_log2 > 0 || h.tile_rows_log2 > 0 {
         let _context_update_tile_id = r.f(h.tile_rows_log2 + h.tile_cols_log2);
-        let _tile_size_bytes_minus_1 = r.f(2);
+        h.tile_size_bytes = r.f(2) + 1; // tile_size_bytes_minus_1 + 1
     }
 
     // quantization_params() (AV1 §5.9.12)
@@ -1142,6 +1172,88 @@ pub(crate) fn parse_frame_header(seq: &SequenceHeader, data: &[u8]) -> Option<Fr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode `avif` and return `(frame header, max per-plane diff vs the dav1d
+    /// I420/I400 reference)`. Bit-exact when the diff is 0. Shared by the
+    /// multi-tile regression tests.
+    fn decode_and_diff(avif: &[u8], reference: &[u8]) -> (FrameHeader, i32) {
+        let stream = extract_av1_stream(avif).unwrap();
+        let obus = split_obus(&stream).unwrap();
+        let seq = parse_sequence_header(
+            obus.iter().find(|o| o.kind == OBU_SEQUENCE_HEADER).unwrap().data,
+        )
+        .unwrap();
+        let frame = obus
+            .iter()
+            .find(|o| o.kind == OBU_FRAME || o.kind == OBU_FRAME_HEADER)
+            .unwrap();
+        let fh = parse_frame_header(&seq, frame.data).unwrap();
+        let off = tile::tile_data_offset(fh.header_bits);
+        let mi_cols = 2 * ((fh.frame_width + 7) >> 3);
+        let mi_rows = 2 * ((fh.frame_height + 7) >> 3);
+        let mut t = tile::Av1Tile::new(&frame.data[off..], mi_cols, mi_rows, &seq, &fh);
+        t.decode();
+        let nplanes = if seq.mono_chrome { 1 } else { 3 };
+        let mut maxd = 0i32;
+        let mut refoff = 0usize;
+        for p in 0..nplanes {
+            let (buf, pw, ph) = t.plane(p);
+            for i in 0..pw * ph {
+                maxd = maxd.max((buf[i] as i32 - reference[refoff + i] as i32).abs());
+            }
+            refoff += pw * ph;
+        }
+        (fh, maxd)
+    }
+
+    /// Multi-tile AVIF decode (§5.11.1): a 128×128 4:2:0 still split into a 2×2
+    /// tile grid by libaom. The spec FORCES multi-tile on any picture above
+    /// 4096×2304 px (≈9.4 MP — every phone photo), so this path is mandatory for
+    /// real-world AVIFs. Each tile is an independent entropy + prediction unit
+    /// (own coded byte range, fresh CDFs, no cross-tile neighbours); the planes
+    /// are shared and the in-loop filters run once over the frame. Bit-exact vs
+    /// the dav1d I420 reference proves the tile-group byte parse, the per-tile
+    /// `Msac`/CDF reset, the tile-bounded partition geometry, and the
+    /// tile-boundary intra-prediction availability — across all three planes.
+    #[test]
+    fn multitile_2x2_matches_dav1d() {
+        let avif = include_bytes!("fixtures/av1_mt2x2.avif");
+        let reference = include_bytes!("fixtures/av1_mt2x2_ref.yuv");
+        let (fh, maxd) = decode_and_diff(avif, reference);
+        assert!(
+            fh.tile_cols_log2 > 0 && fh.tile_rows_log2 > 0,
+            "fixture must be a 2×2 tile grid (got cols_log2={} rows_log2={})",
+            fh.tile_cols_log2,
+            fh.tile_rows_log2
+        );
+        assert_eq!(maxd, 0, "multi-tile 4:2:0 decode diverges from dav1d");
+        // The public entry point must also drive the multi-tile path end-to-end.
+        let (w, h, rgba) = decode_avif(avif).expect("decode_avif returns pixels");
+        assert_eq!((w, h), (128, 128));
+        assert_eq!(rgba.len(), 128 * 128 * 4);
+    }
+
+    /// Multi-tile MONOCHROME decode with the loop filter ON: a 128×128 grayscale
+    /// still in a 2×2 tile grid. Complements the 4:2:0 case by validating that
+    /// the deblocking loop filter (a frame-level pass) is bit-exact across tile
+    /// seams — the tiles decode independently but the filter must blend their
+    /// shared plane boundary exactly as dav1d does.
+    #[test]
+    fn multitile_monochrome_deblock_matches_dav1d() {
+        let avif = include_bytes!("fixtures/av1_mtmono.avif");
+        let reference = include_bytes!("fixtures/av1_mtmono_ref.yuv");
+        let (fh, maxd) = decode_and_diff(avif, reference);
+        assert!(
+            fh.tile_cols_log2 > 0 || fh.tile_rows_log2 > 0,
+            "fixture must be multi-tile"
+        );
+        assert_ne!(
+            (fh.loop_filter_level[0], fh.loop_filter_level[1]),
+            (0, 0),
+            "fixture must exercise the loop filter across tile seams"
+        );
+        assert_eq!(maxd, 0, "multi-tile monochrome deblock diverges from dav1d");
+    }
 
     #[test]
     fn avif_container_extracts_av1_obus() {

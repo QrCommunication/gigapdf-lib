@@ -988,12 +988,6 @@ pub(crate) fn tile_data_offset(header_bits: usize) -> usize {
     header_bits.div_ceil(8)
 }
 
-/// AV1 intra tile decoder: walks the superblock partition tree, decoding each
-/// node's partition symbol from the `Msac` (full symbol for interior nodes, the
-/// gather-probability binary at frame edges) and recursing to coding blocks. The
-/// per-block leaf decode (intra mode, coefficients, reconstruction) is layered
-/// on in follow-up iterations; for now `decode_block` is a counting stub, so the
-/// recursion + entropy wiring are exercised but pixels are not yet produced.
 /// A decoded palette for one plane of one block: the colour table plus the
 /// per-pixel index map (`bw*bh`, row-major, stride `bw`). `reconstruct_tx`
 /// reads `colours[idx[(py-py0+yy)*bw + (px-px0+xx)]]` as the prediction.
@@ -1115,6 +1109,33 @@ pub(crate) struct Av1Tile<'a> {
     /// used as the cross-stripe + frame-edge halo source so loop restoration is
     /// bit-exact even when CDEF altered the boundary rows (§7.17.6).
     lr_pre_cdef: [Vec<u8>; 3],
+    /// The whole tile-group payload (all tiles, after the byte-aligned frame
+    /// header). Each tile re-slices its own bytes here and opens a fresh `Msac`.
+    tile_data: &'a [u8],
+    /// `fh.disable_cdf_update` — re-applied when a per-tile `Msac` is opened.
+    disable_cdf_update: bool,
+    /// `qcat_for(base_q_idx)` — the coefficient-CDF set, re-applied per tile.
+    qcat: usize,
+    /// MI column/row END of the tile currently being decoded (exclusive). A tile
+    /// boundary behaves like a frame edge for partition decisions (`decode_sb`).
+    /// Defaults to the full frame (single-tile path).
+    tile_mi_col_end: u32,
+    tile_mi_row_end: u32,
+    /// MI column/row START of the tile currently being decoded. Intra prediction
+    /// must not read pixels from the tile above/left, so these mark where the
+    /// "frame edge" is for neighbour availability. Defaults to `0` (single tile).
+    tile_mi_col_start: u32,
+    tile_mi_row_start: u32,
+    /// Superblock-column / -row starts of every tile (terminated by `sb_cols` /
+    /// `sb_rows`). A single tile is `[0, sb_cols]` / `[0, sb_rows]`.
+    tile_col_starts_sb: Vec<u32>,
+    tile_row_starts_sb: Vec<u32>,
+    /// Bytes per `tile_size_minus_1` field in the tile group (multi-tile only).
+    tile_size_bytes: u32,
+    /// `log2(TileCols)` + `log2(TileRows)` — the bit width of `tg_start`/`tg_end`
+    /// in the `tile_group_obu` header (only read when those are present).
+    tile_cols_log2: u32,
+    tile_rows_log2: u32,
 }
 
 /// CDEF availability flags for a `w × h` block at `(bx, by)` in a `pw × ph`
@@ -1343,6 +1364,31 @@ impl<'a> Av1Tile<'a> {
             lr_active: !(fh.all_lossless || fh.allow_intrabc)
                 && (0..num_planes).any(|i| fh.lr_type[i] != 0),
             lr_pre_cdef: [Vec::new(), Vec::new(), Vec::new()],
+            tile_data: tile_bytes,
+            disable_cdf_update: fh.disable_cdf_update,
+            qcat: qcat_for(fh.base_q_idx),
+            // Single-tile default: the only tile spans the whole frame.
+            tile_mi_col_end: mi_cols,
+            tile_mi_row_end: mi_rows,
+            tile_mi_col_start: 0,
+            tile_mi_row_start: 0,
+            // Tile SB starts from the frame header; fall back to a single tile
+            // spanning the frame when absent (e.g. hand-built test headers).
+            tile_col_starts_sb: if fh.tile_col_starts_sb.len() >= 2 {
+                fh.tile_col_starts_sb.clone()
+            } else {
+                let sb4 = if seq.use_128x128_superblock { 32 } else { 16 };
+                vec![0, mi_cols.div_ceil(sb4)]
+            },
+            tile_row_starts_sb: if fh.tile_row_starts_sb.len() >= 2 {
+                fh.tile_row_starts_sb.clone()
+            } else {
+                let sb4 = if seq.use_128x128_superblock { 32 } else { 16 };
+                vec![0, mi_rows.div_ceil(sb4)]
+            },
+            tile_size_bytes: fh.tile_size_bytes.clamp(1, 4),
+            tile_cols_log2: fh.tile_cols_log2,
+            tile_rows_log2: fh.tile_rows_log2,
         }
     }
 
@@ -1366,31 +1412,121 @@ impl<'a> Av1Tile<'a> {
         let cdef_rows = (self.geom.mi_rows as usize + 15) >> 4;
         self.cdef_idx = vec![-1i8; self.cdef_cols * cdef_rows];
         let sb4: u32 = if self.sb_bl == BL_128X128 { 32 } else { 16 };
-        let mut row = 0;
-        while row < self.geom.mi_rows {
-            // Reset the left neighbour contexts at the start of each SB row.
-            self.left_partition = [0u8; 16];
-            self.left_mode = [mode::DC_PRED; 32];
-            self.left_uvmode = [mode::DC_PRED; 32];
-            self.left_skip = [0u8; 32];
-            self.left_tx = [-1i8; 32];
-            self.left_pal_sz = [[0u8; 32]; 2];
-            self.left_pal_col = [[[0u8; 8]; 32]; 2];
-            self.left_lcoef = [0x40u8; 32];
-            self.left_ccoef = [[0x40u8; 32]; 2];
-            let mut col = 0;
-            while col < self.geom.mi_cols {
-                // Loop-restoration params are interleaved with the SB stream
-                // (§5.11.5): read the LR units starting in this superblock before
-                // its partition/coefficients.
-                if self.lr_active {
-                    self.read_lr(row, col, sb4);
+
+        // Tile grid. Each tile is an independent entropy + prediction unit
+        // (§5.11.1): its own coded byte range, fresh `Msac` + adaptive CDFs, and
+        // above/left neighbour contexts that do not cross tile boundaries. The
+        // tiles share the frame's plane buffers; the in-loop filters (deblock,
+        // CDEF, loop restoration) run once over the whole frame afterwards.
+        let tcols = self.tile_col_starts_sb.len().saturating_sub(1);
+        let trows = self.tile_row_starts_sb.len().saturating_sub(1);
+        let single_tile = tcols <= 1 && trows <= 1;
+
+        // Byte offset of the next tile's data within `tile_data`. For multi-tile
+        // each tile (except the last) is prefixed by a `tile_size_bytes` LE size.
+        let total_tiles = tcols.max(1) * trows.max(1);
+        let mut tile_idx = 0usize;
+        // `tile_group_obu` header (§5.11.1), present only when NumTiles > 1: a
+        // `tile_start_and_end_present_flag` bit, optionally `tg_start`/`tg_end`,
+        // then `byte_alignment()`. `tile_data` begins at this header; advance
+        // `byte_pos` past it (and its byte padding) to the first tile's size.
+        let mut byte_pos = if single_tile || self.tile_data.is_empty() {
+            0
+        } else {
+            let mut bit = 0usize; // bit cursor within tile_data, MSB-first
+            let read_bit = |data: &[u8], b: &mut usize| -> u32 {
+                let byte = data.get(*b >> 3).copied().unwrap_or(0);
+                let v = (byte >> (7 - (*b & 7))) & 1;
+                *b += 1;
+                v as u32
+            };
+            let present = read_bit(self.tile_data, &mut bit);
+            if present != 0 && total_tiles > 1 {
+                let tile_bits = self.tile_cols_log2 + self.tile_rows_log2;
+                for _ in 0..(2 * tile_bits) {
+                    read_bit(self.tile_data, &mut bit);
                 }
-                self.decode_sb(row, col, self.sb_bl);
-                col += sb4;
             }
-            row += sb4;
+            bit.div_ceil(8) // byte_alignment()
+        };
+
+        for tr in 0..trows.max(1) {
+            let row_start = self.tile_row_starts_sb[tr.min(self.tile_row_starts_sb.len() - 1)];
+            let row_end = self.tile_row_starts_sb[(tr + 1).min(self.tile_row_starts_sb.len() - 1)];
+            for tc in 0..tcols.max(1) {
+                let col_start = self.tile_col_starts_sb[tc.min(self.tile_col_starts_sb.len() - 1)];
+                let col_end =
+                    self.tile_col_starts_sb[(tc + 1).min(self.tile_col_starts_sb.len() - 1)];
+
+                // Tile MI bounds (a tile edge acts like a frame edge).
+                self.tile_mi_col_start = col_start * sb4;
+                self.tile_mi_row_start = row_start * sb4;
+                self.tile_mi_col_end = (col_end * sb4).min(self.geom.mi_cols);
+                self.tile_mi_row_end = (row_end * sb4).min(self.geom.mi_rows);
+
+                if !single_tile {
+                    // Open this tile's coded bytes. The last tile in the group
+                    // consumes the remaining bytes; the others carry a size field.
+                    let is_last = tile_idx + 1 == total_tiles;
+                    let tile_bytes = if is_last {
+                        &self.tile_data[byte_pos.min(self.tile_data.len())..]
+                    } else {
+                        let tsb = self.tile_size_bytes as usize;
+                        if byte_pos + tsb > self.tile_data.len() {
+                            return; // truncated stream — stop cleanly
+                        }
+                        let mut size = 0usize;
+                        for k in 0..tsb {
+                            size |= (self.tile_data[byte_pos + k] as usize) << (8 * k);
+                        }
+                        size += 1; // tile_size_minus_1
+                        let data_start = byte_pos + tsb;
+                        let data_end = data_start + size;
+                        if data_end > self.tile_data.len() {
+                            return; // truncated stream — stop cleanly
+                        }
+                        byte_pos = data_end;
+                        &self.tile_data[data_start..data_end]
+                    };
+                    // Fresh entropy decoder + adaptive CDFs for this tile.
+                    self.msac = Msac::new(tile_bytes, self.disable_cdf_update);
+                    self.cdf = Cdf::new(self.qcat);
+                }
+
+                // Reset the above neighbour contexts at the tile's left boundary.
+                self.reset_above_context();
+                // Per-plane subexp restoration taps reset at the tile start.
+                self.lr_ref = [lr::LrRef::default(); 3];
+
+                let mut row = row_start * sb4;
+                while row < self.tile_mi_row_end {
+                    // Reset the left neighbour contexts at the start of each SB row.
+                    self.left_partition = [0u8; 16];
+                    self.left_mode = [mode::DC_PRED; 32];
+                    self.left_uvmode = [mode::DC_PRED; 32];
+                    self.left_skip = [0u8; 32];
+                    self.left_tx = [-1i8; 32];
+                    self.left_pal_sz = [[0u8; 32]; 2];
+                    self.left_pal_col = [[[0u8; 8]; 32]; 2];
+                    self.left_lcoef = [0x40u8; 32];
+                    self.left_ccoef = [[0x40u8; 32]; 2];
+                    let mut col = col_start * sb4;
+                    while col < self.tile_mi_col_end {
+                        // Loop-restoration params are interleaved with the SB
+                        // stream (§5.11.5): read the LR units starting in this
+                        // superblock before its partition/coefficients.
+                        if self.lr_active {
+                            self.read_lr(row, col, sb4);
+                        }
+                        self.decode_sb(row, col, self.sb_bl);
+                        col += sb4;
+                    }
+                    row += sb4;
+                }
+                tile_idx += 1;
+            }
         }
+
         self.apply_deblock();
         // Snapshot the post-deblock / pre-CDEF planes so loop restoration can read
         // the stripe + frame-edge halo from them (§7.17.6). CDEF then runs in place.
@@ -1402,6 +1538,42 @@ impl<'a> Av1Tile<'a> {
         }
         self.apply_cdef();
         self.apply_lr();
+    }
+
+    /// Reset the above neighbour contexts to their tile-start defaults. AV1 tiles
+    /// are independent: a tile must not predict from / read entropy context of the
+    /// tile above. (The full-width arrays are reset wholesale; only the columns in
+    /// the active tile are ever read before being overwritten.)
+    fn reset_above_context(&mut self) {
+        for v in self.above_partition.iter_mut() {
+            *v = 0;
+        }
+        for v in self.above_mode.iter_mut() {
+            *v = mode::DC_PRED;
+        }
+        for v in self.above_uvmode.iter_mut() {
+            *v = mode::DC_PRED;
+        }
+        for v in self.above_skip.iter_mut() {
+            *v = 0;
+        }
+        for v in self.above_tx.iter_mut() {
+            *v = -1;
+        }
+        for pl in 0..2 {
+            for v in self.above_pal_sz[pl].iter_mut() {
+                *v = 0;
+            }
+            for v in self.above_pal_col[pl].iter_mut() {
+                *v = [0u8; 8];
+            }
+            for v in self.above_ccoef[pl].iter_mut() {
+                *v = 0x40;
+            }
+        }
+        for v in self.above_lcoef.iter_mut() {
+            *v = 0x40;
+        }
     }
 
     /// Read the restoration-unit params (`read_lr`, §5.11.5) for the superblock at
@@ -2522,8 +2694,10 @@ impl<'a> Av1Tile<'a> {
     /// the caller writes back across the tx's above/left context span. Mirrors a
     /// single `decode_coefs` invocation in dav1d's `read_coef_blocks` walk.
     /// `a_off`/`l_off` are the neighbour-context offsets (absolute column above,
-    /// within-superblock row left). Segment 0 only for now (fixture has
-    /// segmentation off, matching `decode_block`).
+    /// within-superblock row left). Always segment 0: `decode_block` does not read
+    /// a per-block `segment_id`, so this is correct only when segmentation is off
+    /// — which libaom/avifenc leave off for still pictures (a documented gap for
+    /// the rare segmented AVIF).
     #[allow(clippy::too_many_arguments)]
     fn decode_tx_block(
         &mut self,
@@ -2649,8 +2823,19 @@ impl<'a> Av1Tile<'a> {
     ) {
         let pw = self.plane_w[plane];
         let ph = self.plane_h[plane];
-        let have_top = py > 0;
-        let have_left = px > 0;
+        // Intra prediction stops at the TILE boundary: a tile must not read
+        // reconstructed pixels from the tile above/left (they belong to an
+        // independent entropy unit). For a single tile these origins are 0, so
+        // availability collapses to the frame edge.
+        let (ss_x, ss_y) = if plane == 0 {
+            (0u32, 0u32)
+        } else {
+            (self.subsampling_x as u32, self.subsampling_y as u32)
+        };
+        let tile_px0 = (self.tile_mi_col_start as usize * 4) >> ss_x;
+        let tile_py0 = (self.tile_mi_row_start as usize * 4) >> ss_y;
+        let have_top = py > tile_py0;
+        let have_left = px > tile_px0;
         // Assemble top/left/topleft edges with dav1d's availability fills
         // (`prepare_intra_edges`): extend past the frame edge with the last
         // in-frame sample; substitute the neighbouring row/col or 127/129/128
@@ -3067,12 +3252,17 @@ impl<'a> Av1Tile<'a> {
     }
 
     fn decode_sb(&mut self, mi_row: u32, mi_col: u32, bl: u8) {
-        if mi_row >= self.geom.mi_rows || mi_col >= self.geom.mi_cols {
+        // Partition geometry is bounded by the TILE edge (== frame edge for a
+        // single tile): a tile boundary forces the same edge-partition handling
+        // as the picture boundary (§5.11.4 `hasRows`/`hasCols`).
+        let mi_rows = self.tile_mi_row_end;
+        let mi_cols = self.tile_mi_col_end;
+        if mi_row >= mi_rows || mi_col >= mi_cols {
             return;
         }
         let hbs = 16u32 >> bl;
-        let has_rows = mi_row + hbs < self.geom.mi_rows;
-        let has_cols = mi_col + hbs < self.geom.mi_cols;
+        let has_rows = mi_row + hbs < mi_rows;
+        let has_cols = mi_col + hbs < mi_cols;
         let case = match (has_rows, has_cols) {
             (true, true) => PartCase::Both,
             (true, false) => PartCase::RowsOnly,
@@ -3102,13 +3292,13 @@ impl<'a> Av1Tile<'a> {
             part::SPLIT => {
                 if bl == BL_8X8 {
                     self.decode_block(r, c, bs::BS_4X4);
-                    if c + 1 < self.geom.mi_cols {
+                    if c + 1 < mi_cols {
                         self.decode_block(r, c + 1, bs::BS_4X4);
                     }
-                    if r + 1 < self.geom.mi_rows {
+                    if r + 1 < mi_rows {
                         self.decode_block(r + 1, c, bs::BS_4X4);
                     }
-                    if r + 1 < self.geom.mi_rows && c + 1 < self.geom.mi_cols {
+                    if r + 1 < mi_rows && c + 1 < mi_cols {
                         self.decode_block(r + 1, c + 1, bs::BS_4X4);
                     }
                 } else {
@@ -3143,7 +3333,7 @@ impl<'a> Av1Tile<'a> {
                 self.decode_block(r, c, sub[0]);
                 self.decode_block(r + q, c, sub[0]);
                 self.decode_block(r + 2 * q, c, sub[0]);
-                if r + 3 * q < self.geom.mi_rows {
+                if r + 3 * q < mi_rows {
                     self.decode_block(r + 3 * q, c, sub[0]);
                 }
             }
@@ -3152,7 +3342,7 @@ impl<'a> Av1Tile<'a> {
                 self.decode_block(r, c, sub[0]);
                 self.decode_block(r, c + q, sub[0]);
                 self.decode_block(r, c + 2 * q, sub[0]);
-                if c + 3 * q < self.geom.mi_cols {
+                if c + 3 * q < mi_cols {
                     self.decode_block(r, c + 3 * q, sub[0]);
                 }
             }
