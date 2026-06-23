@@ -41,6 +41,38 @@ pub struct Document {
     /// substitute program, exactly as the AcroForm `/AP` regeneration references
     /// `/Helv` (see `build_text_field_appearance`). Keeps the saved PDF small.
     base14_refs: BTreeMap<u32, Vec<u8>>,
+    /// In-flight PAdES-B-T signature suspended between the two timestamp ABI
+    /// calls: [`sign_prepare_timestamped`](Document::sign_prepare_timestamped)
+    /// stashes the serialized-but-unfilled signature here, the host POSTs the
+    /// RFC 3161 request to the TSA, and
+    /// [`sign_finish_timestamped`](Document::sign_finish_timestamped) consumes it.
+    /// `None` outside that window (cleared on finish).
+    pending_timestamp: Option<PendingTimestampSignature>,
+}
+
+/// The frozen state of a PAdES-B-T signature between Phase 1 (build + emit the
+/// RFC 3161 request) and Phase 2 (embed the host-fetched timestamp token).
+///
+/// It holds the *exact* serialized PDF and byte offsets Phase 1 produced, plus
+/// the signer identity, so Phase 2 finalizes precisely the signature Phase 1
+/// timestamped — only adding the unsigned timestamp attribute. Nothing here is
+/// re-derived in Phase 2.
+#[derive(Debug, Clone)]
+struct PendingTimestampSignature {
+    /// The serialized PDF with `/ByteRange` already patched and `/Contents` still
+    /// a zero-filled hex placeholder.
+    bytes: Vec<u8>,
+    /// Byte index of the `<` opening the `/Contents` hex window.
+    lt: usize,
+    /// Byte index of the `>` closing the `/Contents` hex window.
+    gt: usize,
+    /// The signed byte range (everything except the `/Contents` hex) — the CMS
+    /// covers exactly these bytes.
+    signed: Vec<u8>,
+    /// The signer's RSA private key.
+    key: crate::crypto::rsa::RsaPrivateKey,
+    /// The signer's DER certificate.
+    cert_der: Vec<u8>,
 }
 
 /// A full-text search hit: the page, the matching line's text, and its bounding
@@ -1038,6 +1070,7 @@ impl Document {
             trailer,
             font_used_gids: BTreeMap::new(),
             base14_refs: BTreeMap::new(),
+            pending_timestamp: None,
         })
     }
 
@@ -1053,9 +1086,16 @@ impl Document {
         reason: &str,
         date: &str,
     ) -> Result<Vec<u8>> {
-        self.sign_with(name, reason, date, "", "", |signed| {
-            signer.detached_cms(signed)
-        })
+        self.sign_with(
+            name,
+            reason,
+            date,
+            "",
+            "",
+            crate::sign::SubFilter::AdbePkcs7Detached,
+            CONTENTS_BYTES_LEGACY,
+            |signed| signer.detached_cms(signed),
+        )
     }
 
     /// Digitally sign the document with a user-supplied identity imported from a
@@ -1085,14 +1125,23 @@ impl Document {
             EngineError::Unsupported("certificate issuer/serial unreadable".into())
         })?;
         let key = identity.key.clone();
-        self.sign_with(name, reason, date, location, contact_info, move |signed| {
-            crate::sign::detached_cms_external(&key, &cert, signed).unwrap_or_default()
-        })
+        self.sign_with(
+            name,
+            reason,
+            date,
+            location,
+            contact_info,
+            crate::sign::SubFilter::AdbePkcs7Detached,
+            CONTENTS_BYTES_LEGACY,
+            move |signed| crate::sign::detached_cms_external(&key, &cert, signed).unwrap_or_default(),
+        )
     }
 
-    /// Shared `adbe.pkcs7.detached` embedding: builds the signature dictionary
-    /// and invisible widget, serializes, patches `/ByteRange`, then fills
-    /// `/Contents` with the CMS produced by `build_cms` over the signed bytes.
+    /// Shared signature embedding: builds the signature dictionary and invisible
+    /// widget with the given `subfilter`, reserving `contents_bytes` for the CMS,
+    /// serializes, patches `/ByteRange`, then fills `/Contents` with the CMS
+    /// produced by `build_cms` over the signed bytes.
+    #[allow(clippy::too_many_arguments)]
     fn sign_with(
         &mut self,
         name: &str,
@@ -1100,9 +1149,34 @@ impl Document {
         date: &str,
         location: &str,
         contact_info: &str,
+        subfilter: crate::sign::SubFilter,
+        contents_bytes: usize,
         build_cms: impl FnOnce(&[u8]) -> Vec<u8>,
     ) -> Result<Vec<u8>> {
-        const CONTENTS_BYTES: usize = 8192; // room for the CMS (hex = 16384 chars)
+        let (mut bytes, lt, gt, signed) =
+            self.build_signature_layout(name, reason, date, location, contact_info, subfilter, contents_bytes)?;
+        let cms = build_cms(&signed);
+        fill_contents_window(&mut bytes, lt, gt, &cms)?;
+        Ok(bytes)
+    }
+
+    /// Build the signature dictionary, widget and AcroForm entry, serialize, and
+    /// patch `/ByteRange` — stopping just before `/Contents` is filled. Returns
+    /// the serialized bytes, the `<`/`>` offsets of the `/Contents` hex window,
+    /// and the signed byte range (everything outside that window). This is the
+    /// shared front half of both the synchronous [`sign_with`](Self::sign_with)
+    /// and the two-phase timestamp flow.
+    #[allow(clippy::too_many_arguments)]
+    fn build_signature_layout(
+        &mut self,
+        name: &str,
+        reason: &str,
+        date: &str,
+        location: &str,
+        contact_info: &str,
+        subfilter: crate::sign::SubFilter,
+        contents_bytes: usize,
+    ) -> Result<(Vec<u8>, usize, usize, Vec<u8>)> {
         let lit = |s: &str| Object::String(crate::font::encode_pdf_text(s), StringKind::Literal);
 
         // 1. Signature value dictionary with fixed-width placeholders.
@@ -1112,7 +1186,7 @@ impl Document {
         sig.set(b"Filter".to_vec(), Object::Name(b"Adobe.PPKLite".to_vec()));
         sig.set(
             b"SubFilter".to_vec(),
-            Object::Name(b"adbe.pkcs7.detached".to_vec()),
+            Object::Name(subfilter.name().to_vec()),
         );
         sig.set(b"Name".to_vec(), lit(name));
         sig.set(b"Reason".to_vec(), lit(reason));
@@ -1131,7 +1205,7 @@ impl Document {
         );
         sig.set(
             b"Contents".to_vec(),
-            Object::String(vec![0u8; CONTENTS_BYTES], StringKind::Hex),
+            Object::String(vec![0u8; contents_bytes], StringKind::Hex),
         );
         self.objects.insert(sig_id, Object::Dictionary(sig));
 
@@ -1195,7 +1269,7 @@ impl Document {
         catalog.set(b"AcroForm".to_vec(), Object::Dictionary(acroform));
         self.objects.insert(catalog_id, Object::Dictionary(catalog));
 
-        // 4. Serialize, then patch /ByteRange and fill /Contents with the CMS.
+        // 4. Serialize, then patch /ByteRange.
         let mut bytes = self.save();
         // The signature's /Contents is the only one written as a hex string
         // (`/Contents <…>`); a page's /Contents is an indirect reference.
@@ -1220,26 +1294,80 @@ impl Document {
             p += 10 + usize::from(i < 3); // 10 digits, then a separator space
         }
 
-        // Hash everything except the /Contents hex, build the CMS, hex-fill it.
+        // The signed range = everything except the /Contents hex window.
         let mut signed = Vec::with_capacity(byte_range[1] + byte_range[3]);
         signed.extend_from_slice(&bytes[0..lt]);
         signed.extend_from_slice(&bytes[gt + 1..]);
-        let cms = build_cms(&signed);
 
-        let capacity = gt - (lt + 1); // hex digit slots between < and >
-        let mut hex = String::with_capacity(capacity);
-        for byte in &cms {
-            hex.push_str(&format!("{byte:02X}"));
-        }
-        if hex.len() > capacity {
-            return Err(EngineError::Unsupported(
-                "signature too large for the reserved /Contents space".into(),
-            ));
-        }
-        while hex.len() < capacity {
-            hex.push('0');
-        }
-        bytes[lt + 1..gt].copy_from_slice(hex.as_bytes());
+        Ok((bytes, lt, gt, signed))
+    }
+
+    /// Phase 1 of a PAdES-B-T signature. Builds the signature (PAdES-B signed
+    /// attributes incl. `signing-certificate-v2`, `ETSI.CAdES.detached`
+    /// subfilter), computes its signature value, and returns the RFC 3161
+    /// `TimeStampReq` (DER) the host must POST to a TSA. The partial signature is
+    /// stashed in the document until [`sign_finish_timestamped`] consumes it.
+    ///
+    /// `key`/`cert_der` are the signing identity (a freshly generated
+    /// self-signed signer's, or an imported PKCS#12's). `nonce` is optional
+    /// host-supplied entropy echoed by the TSA. Any previously pending timestamp
+    /// is discarded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_prepare_timestamped(
+        &mut self,
+        key: &crate::crypto::rsa::RsaPrivateKey,
+        cert_der: &[u8],
+        name: &str,
+        reason: &str,
+        date: &str,
+        location: &str,
+        contact_info: &str,
+        nonce: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let (bytes, lt, gt, signed) = self.build_signature_layout(
+            name,
+            reason,
+            date,
+            location,
+            contact_info,
+            crate::sign::SubFilter::EtsiCAdESDetached,
+            CONTENTS_BYTES_TIMESTAMPED,
+        )?;
+
+        // Sign over the real byte range and build the RFC 3161 request from the
+        // resulting (deterministic) signature value.
+        let signature_value = crate::sign::pades_signature_value(key, cert_der, &signed)
+            .ok_or_else(|| EngineError::Unsupported("PAdES signature failed".into()))?;
+        let imprint = crate::sign::timestamp::sha256_imprint(&signature_value);
+        let request = crate::sign::timestamp::build_request(&imprint, nonce);
+
+        self.pending_timestamp = Some(PendingTimestampSignature {
+            bytes,
+            lt,
+            gt,
+            signed,
+            key: key.clone(),
+            cert_der: cert_der.to_vec(),
+        });
+        Ok(request)
+    }
+
+    /// Phase 2 of a PAdES-B-T signature. Consumes the timestamp `token` the host
+    /// extracted from the TSA's `TimeStampResp`, embeds it as the SignerInfo's
+    /// `id-aa-timeStampToken` unsigned attribute (no re-signing — the signature
+    /// computed in Phase 1 is unchanged), fills `/Contents`, and returns the
+    /// signed PDF (PAdES-B-T). Clears the pending state. Errors if no timestamp
+    /// is pending, or the CMS overflows the reserved `/Contents` space.
+    pub fn sign_finish_timestamped(&mut self, token: &[u8]) -> Result<Vec<u8>> {
+        let pending = self
+            .pending_timestamp
+            .take()
+            .ok_or_else(|| EngineError::Missing("no pending timestamped signature".into()))?;
+        let cms =
+            crate::sign::build_pades_cms(&pending.key, &pending.cert_der, &pending.signed, Some(token))
+                .ok_or_else(|| EngineError::Unsupported("PAdES-B-T CMS assembly failed".into()))?;
+        let mut bytes = pending.bytes;
+        fill_contents_window(&mut bytes, pending.lt, pending.gt, &cms)?;
         Ok(bytes)
     }
 
@@ -12842,6 +12970,37 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// `/Contents` reservation for a legacy `adbe.pkcs7.detached` CMS (self-signed
+/// cert + signed attrs): 8 KiB → 16384 hex chars.
+const CONTENTS_BYTES_LEGACY: usize = 8192;
+
+/// `/Contents` reservation for a PAdES-B-T CMS: the signed CMS **plus** an
+/// RFC 3161 timestamp token (the TSA certificate chain inflates it materially).
+/// 32 KiB → 65536 hex chars, comfortably above a typical token+chain.
+const CONTENTS_BYTES_TIMESTAMPED: usize = 32768;
+
+/// Hex-fill the `/Contents` window `(lt, gt)` (the byte offsets of `<` and `>`)
+/// of an already-serialized, `/ByteRange`-patched PDF with `cms`, right-padding
+/// with `'0'`. Errors if the CMS overflows the reserved space — the classic
+/// PAdES footgun the timestamped path guards against with a generous reservation.
+fn fill_contents_window(bytes: &mut [u8], lt: usize, gt: usize, cms: &[u8]) -> Result<()> {
+    let capacity = gt - (lt + 1); // hex digit slots between < and >
+    let mut hex = String::with_capacity(capacity);
+    for byte in cms {
+        hex.push_str(&format!("{byte:02X}"));
+    }
+    if hex.len() > capacity {
+        return Err(EngineError::Unsupported(
+            "signature too large for the reserved /Contents space".into(),
+        ));
+    }
+    while hex.len() < capacity {
+        hex.push('0');
+    }
+    bytes[lt + 1..gt].copy_from_slice(hex.as_bytes());
+    Ok(())
+}
+
 /// Expand a packed RGB buffer (3 bytes/pixel) to opaque RGBA (4 bytes/pixel).
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
@@ -14253,6 +14412,106 @@ mod tests {
             text.contains(&cert_hex),
             "imported certificate embedded in the signature"
         );
+        assert!(Document::open(&signed).unwrap().page_count() >= 1);
+    }
+
+    #[test]
+    fn signs_a_document_with_a_pades_b_t_timestamp() {
+        use crate::sign::{der, timestamp};
+
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let randomness: Vec<u8> = (0..256).map(|i| (i * 31 + 11) as u8).collect();
+        let signer = crate::sign::Signer::generate(
+            "GigaPDF Tester",
+            "260614000000Z",
+            "360614000000Z",
+            512,
+            &randomness,
+        )
+        .unwrap();
+
+        // Phase 1: build the signature + the RFC 3161 request to POST.
+        let request = doc
+            .sign_prepare_timestamped(
+                signer.key(),
+                signer.certificate(),
+                "GigaPDF Tester",
+                "Approval",
+                "D:20260614120000Z",
+                "Paris",
+                "tester@example.com",
+                Some(&[0x11, 0x22, 0x33, 0x44]),
+            )
+            .unwrap();
+        // The request is a well-formed TimeStampReq carrying a SHA-256 imprint.
+        assert_eq!(request[0], 0x30, "TimeStampReq is a SEQUENCE");
+        {
+            let mut top = der::Reader::new(&request);
+            let mut inner = top.descend(der::TAG_SEQUENCE).expect("seq");
+            assert_eq!(
+                inner.next_tag(der::TAG_INTEGER).expect("version").content,
+                &[0x01]
+            );
+        }
+
+        // Simulate the TSA: a token is a real CMS ContentInfo (here produced by a
+        // second self-signed signer, standing in for the TSA), wrapped in a
+        // granted TimeStampResp.
+        let tsa = crate::sign::Signer::generate(
+            "Mock TSA",
+            "260101000000Z",
+            "360101000000Z",
+            512,
+            &(0..256).map(|i| (i * 7 + 3) as u8).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let token_content_info = tsa.detached_cms(b"TSTInfo stand-in");
+        let resp = der::sequence(&[
+            der::sequence(&[der::integer_u32(0)]), // PKIStatusInfo { granted }
+            token_content_info.clone(),
+        ]);
+        let parsed = timestamp::parse_response(&resp).expect("granted token");
+        assert_eq!(parsed.status, 0);
+
+        // Phase 2: embed the token, finalize the PDF.
+        let signed = doc.sign_finish_timestamped(&parsed.token_der).unwrap();
+
+        assert_eq!(&signed[0..5], b"%PDF-", "valid PDF header");
+        let text = String::from_utf8_lossy(&signed);
+        assert!(
+            text.contains("ETSI.CAdES.detached"),
+            "PAdES subfilter, not the legacy one"
+        );
+        assert!(
+            !text.contains("adbe.pkcs7.detached"),
+            "legacy subfilter absent"
+        );
+        assert!(
+            !signed.windows(10).any(|w| w == b"9999999999"),
+            "ByteRange placeholders patched"
+        );
+
+        // The /Contents CMS (uppercase hex) embeds the id-aa-timeStampToken OID
+        // (1.2.840.113549.1.9.16.2.14) and the signing-certificate-v2 OID
+        // (1.2.840.113549.1.9.16.2.47).
+        let tst_oid_hex: String = der::oid(&[1, 2, 840, 113549, 1, 9, 16, 2, 14])
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        let scv2_oid_hex: String = der::oid(&[1, 2, 840, 113549, 1, 9, 16, 2, 47])
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        assert!(text.contains(&tst_oid_hex), "id-aa-timeStampToken embedded");
+        assert!(
+            text.contains(&scv2_oid_hex),
+            "signing-certificate-v2 embedded"
+        );
+
+        // The pending state was consumed: a second finish fails.
+        assert!(doc.sign_finish_timestamped(&parsed.token_der).is_err());
+
+        // The signed file still parses.
         assert!(Document::open(&signed).unwrap().page_count() >= 1);
     }
 

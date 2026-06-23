@@ -13,6 +13,55 @@ const EMBEDDED_FONTS_PDF = new Uint8Array(
   readFileSync(new URL("../../fixtures/embedded-fonts.pdf", import.meta.url))
 );
 
+// ── tiny DER helpers for the timestamp test (build a mock TimeStampResp) ──────
+function derLen(len: number): number[] {
+  if (len < 0x80) return [len];
+  const bytes: number[] = [];
+  let n = len;
+  while (n > 0) {
+    bytes.unshift(n & 0xff);
+    n >>= 8;
+  }
+  return [0x80 | bytes.length, ...bytes];
+}
+function derTlv(tag: number, content: number[] | Uint8Array): Uint8Array {
+  const body = Array.from(content);
+  return new Uint8Array([tag, ...derLen(body.length), ...body]);
+}
+function derInt(value: number): Uint8Array {
+  return derTlv(0x02, [value]); // small non-negative integers only
+}
+function derSeq(members: Uint8Array[]): Uint8Array {
+  const body: number[] = [];
+  for (const m of members) body.push(...m);
+  return derTlv(0x30, body);
+}
+
+/** Recover the exact CMS `ContentInfo` DER from a signed PDF's `/Contents <hex>`
+ *  window, trimming the `00` right-padding by reading the outer SEQUENCE length. */
+function extractContentsCms(pdf: Uint8Array): Uint8Array {
+  const text = new TextDecoder("latin1").decode(pdf);
+  const lt = text.indexOf("/Contents <");
+  const start = lt + "/Contents <".length;
+  const gt = text.indexOf(">", start);
+  const hex = text.slice(start, gt);
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  // Outer DER: tag (0x30) + length octets → total length, dropping padding.
+  if (bytes[0] !== 0x30) throw new Error("not a SEQUENCE");
+  let lenLen = 1;
+  let len = bytes[1];
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | bytes[2 + i];
+    lenLen = 1 + n;
+  }
+  return bytes.slice(0, 1 + lenLen + len);
+}
+
 // Exercises the typed wrappers against the real bundled .wasm (loadDefault reads
 // gigapdf.wasm produced by `pnpm build:wasm`). Catches wrapper-level bugs the
 // engine smoke test can't (e.g. argument-arity / flag mistakes).
@@ -243,6 +292,64 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(() => doc.signP12(MODERN_P12, "wrong", { reason: "R" })).toThrow(
       /PKCS#12 signing failed/
     );
+    doc.close();
+  });
+
+  it("signs with a PAdES-B-T timestamp via the two-phase TSA flow", async () => {
+    // Extract a genuine CMS ContentInfo from a p12-signed PDF — it stands in as
+    // the TSA's TimeStampToken so the round trip needs no network.
+    const probe = giga.open(giga.txtToPdf("probe"));
+    const probeSigned = probe.signP12(MODERN_P12, "gigapdf", { reason: "R" });
+    probe.close();
+    const cms = extractContentsCms(probeSigned);
+
+    // A granted TimeStampResp ::= SEQUENCE { PKIStatusInfo{INTEGER 0}, token }.
+    const statusInfo = derSeq([derInt(0)]);
+    const tsaResponse = derSeq([statusInfo, cms]);
+
+    let capturedReq: Uint8Array | undefined;
+    const doc = giga.open(giga.txtToPdf("Timestamp me"));
+    const signed = await doc.signTimestamped({
+      random: crypto.getRandomValues(new Uint8Array(256)),
+      notBefore: "260101000000Z",
+      notAfter: "360101000000Z",
+      name: "Tester",
+      reason: "Approval",
+      date: "D:20260616120000Z",
+      tsaUrl: "https://tsa.example/never-hit",
+      nonce: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+      tsaFetch: async (req) => {
+        capturedReq = req;
+        return tsaResponse;
+      },
+    });
+
+    // Phase 1 handed our mock fetch a well-formed TimeStampReq SEQUENCE.
+    expect(capturedReq).toBeDefined();
+    expect(capturedReq![0]).toBe(0x30);
+    // Phase 2 produced a PAdES PDF carrying the ETSI subfilter, not the legacy one.
+    expect(new TextDecoder().decode(signed.slice(0, 5))).toBe("%PDF-");
+    const text = new TextDecoder().decode(signed);
+    expect(text.includes("ETSI.CAdES.detached")).toBe(true);
+    expect(text.includes("adbe.pkcs7.detached")).toBe(false);
+    const reopened = giga.open(signed);
+    expect(reopened.pageCount()).toBe(1);
+    reopened.close();
+    doc.close();
+  });
+
+  it("rejects a malformed TSA token in the finish phase", async () => {
+    const doc = giga.open(giga.txtToPdf("bad token"));
+    await expect(
+      doc.signTimestamped({
+        random: crypto.getRandomValues(new Uint8Array(256)),
+        notBefore: "260101000000Z",
+        notAfter: "360101000000Z",
+        reason: "R",
+        tsaUrl: "https://tsa.example/never-hit",
+        tsaFetch: async () => new Uint8Array([0x00, 0x01, 0x02]), // not a TimeStampResp
+      })
+    ).rejects.toThrow(/timestamped signing failed/);
     doc.close();
   });
 

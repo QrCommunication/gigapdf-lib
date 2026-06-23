@@ -897,6 +897,28 @@ export class GigaPdfEngine {
   }
 }
 
+/**
+ * Default TSA round trip for {@link GigaPdfDoc.signTimestamped}: POST the
+ * RFC 3161 `TimeStampReq` to `url` as `application/timestamp-query` and return
+ * the raw `TimeStampResp` (`application/timestamp-reply`) body. Works in both
+ * Node and the browser via the global `fetch`.
+ *
+ * No SSRF allow-listing is performed here — the URL is host-supplied. Consumers
+ * that need to restrict it should pass their own `tsaFetch`.
+ */
+export async function defaultTsaPost(url: string, req: Uint8Array): Promise<Uint8Array> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/timestamp-query" },
+    body: req as BodyInit,
+    redirect: "error",
+  });
+  if (!res.ok) {
+    throw new Error(`TSA HTTP ${res.status}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
 /** Pack `HtmlResource[]` (host-fetched URLs) into the little-endian blob
  * `gp_html_render_opts` expects: `u32 count`, then per entry `u32 url_len, url,
  * u32 data_len, data`. */
@@ -1636,6 +1658,42 @@ export interface SignP12Options {
   location?: string;
   /** `/ContactInfo` — how to reach the signer. */
   contactInfo?: string;
+}
+/**
+ * Options for {@link GigaPdfDoc.signTimestamped} — a PAdES-B-T signature with an
+ * RFC 3161 trusted timestamp embedded in the SignerInfo (`ETSI.CAdES.detached`
+ * subfilter, `signing-certificate-v2` signed attribute, `id-aa-timeStampToken`
+ * unsigned attribute).
+ *
+ * The signing identity is either an imported PKCS#12 (`p12` + `password`) or, if
+ * `p12` is omitted, a freshly generated self-signed digital ID (`random` +
+ * `notBefore`/`notAfter`).
+ */
+export interface SignTsaOptions extends SignP12Options {
+  /** TSA endpoint URL, e.g. `"https://freetsa.org/tsr"`. */
+  tsaUrl: string;
+  /**
+   * Optional override for the TSA round trip — lets the host add auth headers,
+   * proxies, retries, **and apply its own SSRF allow-list** (the engine only
+   * emits the request; the URL is host-supplied). Receives the `TimeStampReq`
+   * DER and the URL, must resolve to the raw `TimeStampResp` bytes. When omitted,
+   * {@link defaultTsaPost} POSTs `application/timestamp-query` via `fetch`.
+   */
+  tsaFetch?: (req: Uint8Array, url: string) => Promise<Uint8Array>;
+  /** PKCS#12 identity bytes. Omit to sign with a generated self-signed ID. */
+  p12?: Uint8Array;
+  /** PKCS#12 passphrase. */
+  password?: string;
+  /** Self-signed path: ≥ 256 bytes from `crypto.getRandomValues`. */
+  random?: Uint8Array;
+  /** Self-signed path: RSA modulus size in bits (default 2048). */
+  keyBits?: number;
+  /** Self-signed path: certificate `notBefore`, UTCTime `YYMMDDHHMMSSZ`. */
+  notBefore?: string;
+  /** Self-signed path: certificate `notAfter`, UTCTime `YYMMDDHHMMSSZ`. */
+  notAfter?: string;
+  /** Optional 8–16 random bytes echoed by the TSA (request/response correlation). */
+  nonce?: Uint8Array;
 }
 /**
  * A markup annotation (rect corners in PDF user space, origin bottom-left).
@@ -2893,6 +2951,102 @@ export class GigaPdfDoc {
     if (out.length === 0) {
       throw new Error(
         "PKCS#12 signing failed: invalid certificate, password, or unsupported file"
+      );
+    }
+    return out;
+  }
+  /**
+   * Sign with an embedded **RFC 3161 trusted timestamp** (PAdES-B-T). Unlike
+   * {@link sign}/{@link signP12} this is `async`: the timestamp requires a
+   * network round trip to a TSA, so the method runs the engine's two-phase flow
+   * — build the signature → POST the `TimeStampReq` to the TSA → embed the
+   * returned token — with the HTTP in between.
+   *
+   * The signing identity is `opts.p12` (+ `opts.password`) when supplied, else a
+   * generated self-signed digital ID from `opts.random` (+ `notBefore`/
+   * `notAfter`). `opts.tsaUrl` is the TSA endpoint (e.g. FreeTSA
+   * `https://freetsa.org/tsr`); pass `opts.tsaFetch` to customise the request
+   * (auth, proxy, SSRF allow-list). Throws a single generic error on any failure
+   * (bad identity, TSA HTTP error, malformed response, or signature too large).
+   */
+  async signTimestamped(opts: SignTsaOptions): Promise<Uint8Array> {
+    const usingP12 = opts.p12 != null && opts.p12.length > 0;
+    if (!usingP12 && (opts.random == null || opts.random.length < 256)) {
+      throw new Error(
+        "signTimestamped: self-signed path needs `random` ≥ 256 bytes (or pass a `p12`)"
+      );
+    }
+    const fields = [
+      opts.name ?? "",
+      opts.reason ?? "",
+      opts.date ?? "",
+      opts.location ?? "",
+      opts.contactInfo ?? "",
+      opts.notBefore ?? "",
+      opts.notAfter ?? "",
+    ].join("\t");
+
+    const rand = opts.random ?? new Uint8Array(0);
+    const p12 = opts.p12 ?? new Uint8Array(0);
+    const nonce = opts.nonce ?? new Uint8Array(0);
+    const keyBits = opts.keyBits ?? 2048;
+
+    // Phase 1: build the signature, get the TimeStampReq to POST.
+    const rPtr = this.g._toWasm(rand);
+    const p12Ptr = this.g._toWasm(p12);
+    const noncePtr = this.g._toWasm(nonce);
+    let request: Uint8Array;
+    try {
+      request = this.g._withStr(opts.password ?? "", (pwP, pwL) =>
+        this.g._withStr(fields, (fP, fL) =>
+          this.g._buffer((o) =>
+            this.ex().gp_sign_prepare_tsa(
+              this.h,
+              fP,
+              fL,
+              rPtr,
+              rand.length,
+              keyBits,
+              p12Ptr,
+              p12.length,
+              pwP,
+              pwL,
+              noncePtr,
+              nonce.length,
+              o
+            )
+          )
+        )
+      );
+    } finally {
+      this.g._free(rPtr, rand.length);
+      this.g._free(p12Ptr, p12.length);
+      this.g._free(noncePtr, nonce.length);
+    }
+    if (request.length === 0) {
+      throw new Error(
+        "timestamped signing failed: invalid identity or could not build the timestamp request"
+      );
+    }
+
+    // Host round trip: POST the request to the TSA, read the response.
+    const response = opts.tsaFetch
+      ? await opts.tsaFetch(request, opts.tsaUrl)
+      : await defaultTsaPost(opts.tsaUrl, request);
+
+    // Phase 2: embed the timestamp token, finalize the signed PDF.
+    const tokenPtr = this.g._toWasm(response);
+    let out: Uint8Array;
+    try {
+      out = this.g._buffer((o) =>
+        this.ex().gp_sign_finish_tsa(this.h, tokenPtr, response.length, o)
+      );
+    } finally {
+      this.g._free(tokenPtr, response.length);
+    }
+    if (out.length === 0) {
+      throw new Error(
+        "timestamped signing failed: TSA response rejected or signature too large for the reserved space"
       );
     }
     return out;

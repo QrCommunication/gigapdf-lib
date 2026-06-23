@@ -318,6 +318,117 @@ pub extern "C" fn gp_sign_p12(
     }
 }
 
+/// Phase 1 of a PAdES-B-T (RFC 3161 timestamped) signature: build the signature
+/// and return the `TimeStampReq` DER the host must POST to a TSA. The partial
+/// signature is stashed on the document until [`gp_sign_finish_tsa`].
+///
+/// `fields` is seven tab-separated UTF-8 values:
+/// `name\treason\tdate\tlocation\tcontactInfo\tnotBefore\tnotAfter` (`date` a PDF
+/// date string `D:YYYYMMDDHHMMSSZ`; `notBefore`/`notAfter` UTCTime
+/// `YYMMDDHHMMSSZ`, used only by the self-signed path). When `p12_len > 0` the
+/// signing identity is imported from the PKCS#12 `(p12, password)` (a CA-issued /
+/// eIDAS certificate); otherwise a fresh self-signed digital ID is generated from
+/// `(rand, bits)`. `nonce` is optional host entropy echoed by the TSA (empty →
+/// none). Buffer-returning (host frees); null on error.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_sign_prepare_tsa(
+    handle: *mut Document,
+    fields_ptr: *const u8,
+    fields_len: usize,
+    rand_ptr: *const u8,
+    rand_len: usize,
+    bits: usize,
+    p12_ptr: *const u8,
+    p12_len: usize,
+    password_ptr: *const u8,
+    password_len: usize,
+    nonce_ptr: *const u8,
+    nonce_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let fields = unsafe { str_arg(fields_ptr, fields_len) };
+    let parts: Vec<&str> = fields.split('\t').collect();
+    if parts.len() < 3 {
+        return std::ptr::null_mut();
+    }
+    let name = parts[0];
+    let reason = parts[1];
+    let date = parts[2];
+    let location = parts.get(3).copied().unwrap_or("");
+    let contact = parts.get(4).copied().unwrap_or("");
+    let not_before = parts.get(5).copied().unwrap_or("");
+    let not_after = parts.get(6).copied().unwrap_or("");
+
+    let nonce_bytes = unsafe { opt_slice(nonce_ptr, nonce_len) };
+    let nonce = if nonce_bytes.is_empty() {
+        None
+    } else {
+        Some(nonce_bytes)
+    };
+
+    // Resolve the signing identity: imported PKCS#12, or a fresh self-signed ID.
+    let (key, cert_der) = if p12_len > 0 {
+        let p12 = unsafe { opt_slice(p12_ptr, p12_len) };
+        let password = unsafe { str_arg(password_ptr, password_len) };
+        let identity = match gigapdf_core::sign::pkcs12::parse(p12, password) {
+            Ok(id) => id,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let cert = match identity.certificates.first() {
+            Some(c) => c.clone(),
+            None => return std::ptr::null_mut(),
+        };
+        (identity.key, cert)
+    } else {
+        if not_before.is_empty() || not_after.is_empty() {
+            return std::ptr::null_mut();
+        }
+        let rand = unsafe { opt_slice(rand_ptr, rand_len) };
+        let signer =
+            match gigapdf_core::sign::Signer::generate(name, not_before, not_after, bits, rand) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+        (signer.key().clone(), signer.certificate().to_vec())
+    };
+
+    match doc.sign_prepare_timestamped(
+        &key, &cert_der, name, reason, date, location, contact, nonce,
+    ) {
+        Ok(req) => unsafe { bytes_into_host(req, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Phase 2 of a PAdES-B-T signature: embed the RFC 3161 timestamp `token` (the
+/// raw `TimeStampToken` `ContentInfo` the host extracted from the TSA reply) as
+/// the SignerInfo's unsigned attribute and finalize the signed PDF. Requires a
+/// prior [`gp_sign_prepare_tsa`] on the same handle. Buffer-returning (host
+/// frees); null on error (no pending signature, or the CMS overflows
+/// `/Contents`).
+#[no_mangle]
+pub extern "C" fn gp_sign_finish_tsa(
+    handle: *mut Document,
+    token_ptr: *const u8,
+    token_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let token = unsafe { opt_slice(token_ptr, token_len) };
+    match doc.sign_finish_timestamped(token) {
+        Ok(pdf) => unsafe { bytes_into_host(pdf, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Release a document handle.
 #[no_mangle]
 pub extern "C" fn gp_close(handle: *mut Document) {
@@ -1253,6 +1364,15 @@ unsafe fn str_arg<'a>(ptr: *const u8, len: usize) -> &'a str {
         return "";
     }
     std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).unwrap_or("")
+}
+
+/// A byte slice from a `(ptr, len)` pair, or empty when the pointer is null.
+unsafe fn opt_slice<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, len)
+    }
 }
 
 /// All form fields as a JSON array. Host frees the returned buffer.
