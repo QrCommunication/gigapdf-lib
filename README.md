@@ -204,6 +204,7 @@ ex.gp_close(handle);
 | [`docs/USAGE.md`](docs/USAGE.md) | Host integration: the raw `extern "C"` buffer ABI plus a worked example for every feature area. |
 | [`docs/API.md`](docs/API.md) | The Rust ↔ WASM ABI mapping (every `gp_*` export and its Rust method). |
 | [`docs/HTML-CSS.md`](docs/HTML-CSS.md) | The **exhaustive** list of supported HTML elements, CSS properties, units, colours, selectors and JS in the HTML→PDF renderer. |
+| [`docs/CONVERSIONS.md`](docs/CONVERSIONS.md) | **Per-format conversion fidelity** — what each PDF ↔ Office/HTML/RTF/Markdown/CSV/EPUB import & export preserves vs drops, plus the PDF→model reconstruction limits. |
 | [`docs/INSTALL.md`](docs/INSTALL.md) | Install, build-from-source, and Next.js (`output: "standalone"`) wiring. |
 
 ## Build
