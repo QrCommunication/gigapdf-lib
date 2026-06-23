@@ -4,12 +4,14 @@ gigapdf-lib renders **HTML + CSS + JavaScript to PDF with no headless browser**
 (no Chromium, no Playwright). The renderer is a real — if pragmatic —
 implementation of the CSS visual formatting model written in Rust: an HTML
 parser, a cascading stylesheet engine, a box-tree layout (block / inline / table
-/ flex / grid), pagination, and a painter that sets text in **embedded Google
-fonts** (real glyphs and metrics).
+/ flex / grid / multi-column / float / positioned), pagination, and a painter
+that sets text in **embedded Google fonts** (real glyphs and metrics) and draws
+backgrounds, gradients, rounded borders and shadows as native PDF graphics.
 
-This page is the **exhaustive** list of what the renderer understands, so you
-know exactly what you can author. Anything not listed is ignored gracefully
-(unknown properties/elements don't break the render).
+This page is the **exhaustive, code-grounded** list of what the renderer
+understands, including the precise limitations of partially-supported features,
+so you know exactly what you can author. Anything not listed is ignored
+gracefully (unknown properties/elements don't break the render).
 
 > **How to call it** — two phases (host does the network I/O):
 > ```ts
@@ -99,8 +101,9 @@ each with bold weight and proportional top/bottom margins.
 
 ### Inline text & phrasing
 `span`, `a` (blue + underlined), `b` / `strong` (bold), `i` / `em` (italic),
-`u` (underline), `small` (10pt), `code` / `kbd` / `samp` (monospace),
-`br` (line break). Any other inline element flows as plain inline text.
+`u` / `ins` (underline), `s` / `strike` / `del` (line-through), `sup` / `sub`
+(super/subscript), `mark` (highlight), `small` (10pt), `code` / `kbd` / `samp`
+(monospace), `br` (line break). Any other inline element flows as plain inline text.
 
 ### Pre-formatted
 `pre` — block, **`white-space: pre`** (whitespace and newlines preserved),
@@ -108,16 +111,18 @@ monospace.
 
 ### Lists
 `ul` / `ol` — block, 30pt left padding, 8pt top/bottom margin.
-`li` — `display: list-item`; gets a **marker**:
+`li` — `display: list-item`; gets a **marker** (overridable with
+[`list-style-type`](#list-markers)):
 
 - inside `<ul>` → a bullet `•`,
 - inside `<ol>` → an incrementing number `1.`, `2.`, …
 
 ### Tables
 `table` (`display: table`), `tr` (`table-row`), `td` / `th` (`table-cell`,
-2pt padding, 1pt grey border). `th` is bold. `thead` / `tbody` / `tfoot` are
-traversed transparently. Cells are laid **side-by-side**, equal width; each row's
-height is its tallest cell.
+2pt padding, 1pt grey border). `th` is bold and centred. `thead` / `tbody` /
+`tfoot` are traversed transparently. Cells are laid **side-by-side**, equal
+width; each row's height is its tallest cell. `border-collapse: collapse`
+(the UA default for `<table>`) draws shared interior rules once.
 
 ### Images & SVG
 `<img src width height>` — an **inline box** sized by the `width` / `height`
@@ -140,6 +145,10 @@ inheritance) rendered as native PDF axial/radial shadings. Size the box with the
 (falls back to a solid fill), `filter`, `<text>`, `<use>`, and COLRv1 gradient
 glyphs.
 
+> Note: `<img>` (the element) is the way to place a raster picture. The CSS
+> `background-image: url(...)` property is **not** rasterized — see
+> [backgrounds](#backgrounds).
+
 ### Page breaks
 `<pagebreak></pagebreak>` (or `<div class="page-break">`) starts the following
 content on a new page — see [page-break CSS](#page-breaks).
@@ -156,46 +165,78 @@ content on a new page — see [page-break CSS](#page-breaks).
 Author CSS in a `<style>` block or with inline `style="…"`. The cascade is
 honoured: **user-agent < `<style>` rules (by specificity, then source order) <
 inline `style`**. Inheritance works for the inherited properties below.
+`var()` (custom properties) and `calc(+ − …)` are resolved in length contexts.
 
 ### Box model
 
 | Property | Values | Notes |
 |----------|--------|-------|
-| `margin` | 1–4 lengths | CSS shorthand order (all / v h / t h b / t r b l) |
-| `margin-top/-right/-bottom/-left` | length | |
+| `margin` | 1–4 lengths | shorthand order (all / v h / t h b / t r b l); `margin: auto` left/right centres a block of explicit `width` |
+| `margin-top/-right/-bottom/-left` | length / `auto` | |
 | `padding` | 1–4 lengths | same shorthand as `margin` |
 | `padding-top/-right/-bottom/-left` | length | |
-| `border` / `border-width` | `1px solid #ccc` | the **width** (length) and **colour** are read; line style is always solid |
-| `border-color` | [colour](#colours) | |
 | `width` | length or `%` | `%` is relative to the containing block |
 | `min-width` / `max-width` | length or `%` | clamp the resolved box width |
 | `height` / `min-height` | length | minimum box height — content can still grow it |
 | `box-sizing` | `content-box` (default), `border-box` | `border-box` makes `width` include padding + border |
 
-### Display & layout
+### Borders
 
-| Property | Values |
-|----------|--------|
-| `display` | `block`, `inline`, `inline-block`, `list-item`, `table`, `table-row`, `table-cell`, `flex`, `inline-flex`, `grid`, `inline-grid`, `none` |
-| `float` | `left` / `right` (approximated as `inline-block`), `none` |
+| Property | Values | Notes |
+|----------|--------|-------|
+| `border` / `border-<side>` / `border-width` / `border-<side>-width` | `1px solid #ccc` | width, colour and style are read **per side** |
+| `border-color` / `border-<side>-color` | [colour](#colours) | independent per edge |
+| `border-style` / `border-<side>-style` | `solid`, `dashed`, `dotted`, `double` | `groove`/`ridge`/`inset`/`outset` fall back to `dashed` |
+| `border-radius` (+ `border-<corner>-radius`) | 1–4 lengths, optional `/` for **elliptical** radii (`rx / ry`) | rounds the background fill and **uniform** borders. Caveats: child content is **not clipped** to the curve; a *per-side styled* border stays square |
+| `border-collapse` | `collapse`, `separate` | on a `<table>`: shared interior rules drawn once |
+
+### Display & positioning
+
+| Property | Values | Notes |
+|----------|--------|-------|
+| `display` | `block`, `inline`, `inline-block`, `list-item`, `table`, `table-row`, `table-cell`, `flex`, `inline-flex`, `grid`, `inline-grid`, `none` | |
+| `float` | `left`, `right`, `none` | the box leaves flow and **inline** content wraps beside it. Caveats: shrink-to-fit width ≈ ⅓ of the line when none is given; block-level siblings do **not** wrap beside a float |
+| `clear` | `left`, `right`, `both`, `none` | drop below earlier floats |
+| `position` | `static`, `relative`, `absolute`, `fixed`, `sticky` | `relative` shifts by `inset`; `absolute` is placed by `inset` against the nearest positioned ancestor; `fixed` against the page box; `sticky` is treated as `relative` (no scroll model) |
+| `top` / `right` / `bottom` / `left` | length or `%` | offsets for positioned boxes (`%` of the containing block) |
+| `z-index` | integer | paint order among positioned boxes |
+| `overflow` | `visible`, `hidden`, `clip` | **fragment-level** culling only — a box fully outside its container is dropped; partially-overlapping content is **not** pixel-clipped |
+| `opacity` | `0`–`1` | alpha on the element's background, borders and text (inherited) |
+| `visibility` | `visible`, `hidden` | `hidden` keeps the box's space but paints nothing |
 
 ### Flexbox
 
 | Property | Values | Notes |
 |----------|--------|-------|
-| `flex-direction` | `row` (default), `column` | |
-| `justify-content` | `flex-start`/`start`, `center`, `flex-end`/`end`/`right`, `space-between`, `space-around`/`space-evenly` | main-axis distribution (row only) |
-| `flex-grow` | number | per-item growth weight |
-| `flex` | `<grow> [shrink] [basis]`, `none`, `auto`, `initial` | only the **grow** factor is read |
-
-Items default to equal columns; `flex-grow` gives proportional widths. Cross-axis
-sizing is `stretch`. Not modelled: wrap, `align-items`, `order`, `flex-shrink`.
+| `flex-direction` | `row` (default), `column` | `row-reverse` / `column-reverse` are treated as the forward axis |
+| `flex-wrap` | `nowrap`, `wrap` | wraps onto new lines (row axis) |
+| `justify-content` | `flex-start`/`start`, `center`, `flex-end`/`end`, `space-between`, `space-around` | main-axis distribution; `space-evenly` behaves as `space-around` |
+| `align-items` / `align-self` | `stretch` (default), `flex-start`, `center`, `flex-end` | cross-axis alignment |
+| `order` | integer | reorders items before layout |
+| `flex-grow` | number | growth weight |
+| `flex-shrink` | number | shrink weight (**row axis only**) |
+| `flex-basis` | length / `auto` | initial main size (**row axis only**) |
+| `flex` | `<grow> [shrink] [basis]`, `none`, `auto`, `initial` | shorthand for the three above |
+| `gap` / `row-gap` / `column-gap` | length | spacing between items |
 
 ### Grid
 
 | Property | Values | Notes |
 |----------|--------|-------|
-| `grid-template-columns` | a track list (`1fr 1fr 200px`) or `repeat(N, …)` | only the **column count** matters; children fill equal-width cells, wrapping every N |
+| `grid-template-columns` | track list — `px`, `%`, `fr`, `auto`, `minmax()`, `repeat(N, …)` | fully resolved to real column widths |
+| `grid-template-rows` | track list | **only fixed `pt` row heights are honoured**; `fr`/`%`/`auto` rows fall back to content height |
+| `grid-column` / `grid-row` (+ `-start` / `-end`) | `N`, `N / M`, `span N` | numeric line placement and spanning |
+| `gap` / `row-gap` / `column-gap` / `grid-gap` | length | gutters |
+
+> Named areas (`grid-template-areas`, `grid-area: name`) and named grid lines
+> are **not** parsed — use numeric line placement.
+
+### Multi-column
+
+| Property | Values | Notes |
+|----------|--------|-------|
+| `column-count` | integer | flow content splits into N height-balanced columns |
+| `column-gap` | length | gutter between columns (default 1em) |
 
 ### Typography (inherited)
 
@@ -203,28 +244,39 @@ sizing is `stretch`. Not modelled: wrap, `align-items`, `order`, `flex-shrink`.
 |----------|--------|-------|
 | `color` | [colour](#colours) | text colour |
 | `font-size` | length or `%` | `%`/`em` relative to the parent size |
-| `font-weight` | `bold`, `bolder`, `600`–`900` → bold; anything else → normal | |
+| `font-weight` | `bold`/`bolder`/`600`–`900` → bold; else normal | the numeric weight is preserved on the run |
 | `font-style` | `italic` / `oblique` → italic; else normal | |
-| `font-family` | family list | first family wins; `serif`/`Times`/`Georgia` pick a serif, `monospace`/`Courier`/`mono`/`Consol*` pick a mono — see [fonts](#fonts) |
+| `font-family` | family list | first family wins; generics map to bundled faces — see [fonts](#fonts) |
+| `font` | shorthand | size / line-height / family are parsed |
 | `text-align` | `left`, `center`, `right`, `justify` | |
-| `text-decoration` / `text-decoration-line` | any of `underline`, `line-through`, `overline` (space-separated) | drawn as thin rules over the run |
-| `text-transform` | `uppercase`, `lowercase`, `capitalize`, `none` | cases the rendered text |
-| `text-indent` | length or `%` | indents **and** shortens the first line of a block |
+| `text-decoration` / `text-decoration-line` | any of `underline`, `line-through`, `overline` (space-separated) | thin rules over the run |
+| `text-transform` | `uppercase`, `lowercase`, `capitalize`, `none` | |
+| `text-indent` | length or `%` | indents the first line of a block |
+| `letter-spacing` | length | extra space between characters |
+| `word-spacing` | length | extra space between words |
 | `line-height` | unitless multiplier, length, or `%` | |
+| `vertical-align` | `super`, `sub`, length (inline); `top`, `middle`, `bottom` (table cells) | |
+| `direction` | `ltr` (default), `rtl` | line-level reordering + right alignment; no mixed/bidirectional reflow |
 | `white-space` | `pre*` preserves whitespace/newlines; else collapses | |
+
+<a id="list-markers"></a>
+### Lists
+
+| Property | Values | Notes |
+|----------|--------|-------|
+| `list-style-type` / `list-style` | `disc`, `circle`, `square`, `decimal`, `lower-alpha`/`lower-latin`, `upper-alpha`/`upper-latin`, `lower-roman`, `upper-roman`, `none` | the `<li>` marker drawn in the left gutter |
 
 ### Backgrounds
 
 | Property | Values | Notes |
 |----------|--------|-------|
-| `background` / `background-color` | [colour](#colours) | solid fill only (first token of `background` is read; no images/gradients) |
+| `background` / `background-color` | [colour](#colours) | solid fill |
+| `background` / `background-image` | `linear-gradient(…)` | **real PDF axial shading** — angle + all colour stops |
+| `background` / `background-image` | `radial-gradient(…)` | **real PDF radial shading** — all stops |
+| `background` / `background-image` | `conic-gradient(…)` | approximated by 180 flat sectors (slight banding); stops honoured |
 
-### Visibility & opacity
-
-| Property | Values | Notes |
-|----------|--------|-------|
-| `visibility` | `visible` (default), `hidden` | `hidden` keeps the box's space but paints nothing |
-| `opacity` | `0`–`1` | alpha applied to the element's background, border and text rules (inherited) |
+> `background-image: url(…)` (a raster image) is **ignored** — place pictures with
+> the `<img>` element instead.
 
 ### Page breaks
 
@@ -232,6 +284,13 @@ sizing is `stretch`. Not modelled: wrap, `align-items`, `order`, `flex-shrink`.
 |----------|--------|--------|
 | `page-break-before` / `break-before` | `always`, `page`, `left`, `right`, `recto`, `verso` | start this block on a new page |
 | `page-break-after` / `break-after` | same | start the **next** content on a new page |
+| `page-break-inside` / `break-inside` | `avoid` | try to keep the block on a single page |
+
+### Shadows
+
+| Property | Values | Notes |
+|----------|--------|-------|
+| `box-shadow` | `<dx> <dy> [blur] [spread] <colour>`, comma-separated for **multiple** layers | offset, colour and spread are exact; **blur is an approximation** (a 6-ring soft edge, not a Gaussian); **`inset` shadows are dropped** |
 
 ---
 
@@ -245,20 +304,26 @@ Resolved to PDF points. `1px = 0.75pt` (the 96dpi convention), `1pt = 1pt`.
 | `pt` | points (1:1) |
 | `em` | × current font-size |
 | `rem` | × 12pt (root font-size) |
-| `%` | of the font-size (for `font-size`/`line-height`) or the container (for `width`) |
+| `vw` / `vh` | % of the content-band width / height |
+| `%` | of the font-size (for `font-size`/`line-height`) or the containing block (for box sizes) |
+| `calc(…)` | `+ − * /` over the units above |
 | *(unitless)* | treated as `px` |
+
+> Not supported: `cm`, `mm`, `in`, `pc`, `q`, `ex`, `ch`.
 
 ---
 
 ## 5. Colours
 
-| Form | Example |
-|------|---------|
-| Hex (3 or 6 digits) | `#0a0`, `#00aa00` |
-| `rgb()` | `rgb(0, 170, 0)` |
-| Named | `black`, `white`, `red`, `green`, `lime`, `blue`, `gray`/`grey`, `silver`, `lightgray`/`lightgrey`, `navy`, `orange`, `yellow`, `purple`, `teal`, `maroon`, `transparent` |
+| Form | Examples | Notes |
+|------|----------|-------|
+| Hex | `#0a0`, `#00aa00`, `#0a0f`, `#00aa00ff` | 3/4/6/8 digits; the **alpha channel is parsed then dropped** (colours are opaque — use [`opacity`](#display--positioning) for transparency) |
+| `rgb()` / `rgba()` | `rgb(0 170 0)`, `rgba(0,170,0,.5)` | comma- or space-separated, `/`-alpha; alpha dropped |
+| `hsl()` / `hsla()` | `hsl(120 100% 33%)` | converted to RGB; alpha dropped |
+| Named | the ~139 CSS named colours (`rebeccapurple`, `tomato`, `slategray`, …) + `transparent` | |
 
-`transparent` (and any unrecognised colour) leaves the property unset.
+`transparent` (and any unrecognised colour, including `currentColor`) leaves the
+property unset — the fill/border is simply not drawn.
 
 ---
 
@@ -267,12 +332,20 @@ Resolved to PDF points. `1px = 0.75pt` (the 96dpi convention), `1pt = 1pt`.
 Two selector engines, for two jobs:
 
 ### Stylesheet selectors (in `<style>` rules)
-`type` (`p`), `.class`, `#id`, the universal `*`, the **descendant** combinator
-(`nav a`), and grouping (`h1, h2, h3`). Multiple compounds combine
-(`ul.menu li`). Specificity follows CSS (id > class > type); inline `style` wins.
+- **Simple**: `type` (`p`), `.class` (combine for AND: `ul.menu`), `#id`,
+  the universal `*`, and attribute presence/equality `[attr]`, `[attr=value]`
+  / `[attr="value"]`.
+- **Combinators**: descendant (`nav a`), child `>` (`ul > li`), adjacent
+  sibling `+` (`h2 + p`), general sibling `~` (`h2 ~ p`).
+- **Selector lists**: `h1, h2, h3`.
+- The cascade follows **specificity** (id > class > type), then source order;
+  inline `style` always wins.
 
-> Child/sibling/attribute combinators (`>`, `+`, `~`, `[attr]`) are **not** used
-> by the stylesheet cascade — author those rules with descendant/class selectors.
+> Limitations: the attribute *operators* `~= ^= $= *= |=` are treated as bare
+> presence (not enforced). **Pseudo-classes / pseudo-elements** (`:hover`,
+> `:first-child`, `::before`, …) are **not** supported — the `:` part is skipped,
+> so `li:first-child` matches every `li`. `@media` blocks survive (their rules
+> apply) but the media query itself is **not** evaluated.
 
 ### `document.querySelector(All)` selectors (in JavaScript)
 The DOM API supports the richer set: `>` (child), `+` (adjacent sibling),
@@ -332,21 +405,26 @@ By design the sandbox has **no network and no real timers**. See the
 ## 9. Not supported (use these instead)
 
 The renderer targets **document/report layout**, not full web-app CSS. The
-following are intentionally out of scope and are ignored:
+following are out of scope; unknown properties and elements never error — they're
+simply skipped — so a richer stylesheet degrades gracefully to the supported
+subset.
 
-- **Positioning**: `position: absolute/relative/fixed/sticky`, `top/left/z-index`
-  → use normal flow, tables, flex, or grid.
-- **Flex/grid extras**: wrap, `align-items`/`align-self`, `order`, `flex-shrink`,
-  named grid lines/areas, `gap` → use margins/padding and column counts.
-- **Visual effects**: `box-shadow`, `border-radius`, `transform`, `filter`,
-  gradients, background images → use solid `background`/`border`.
-- **Sizing**: `overflow` clipping, `aspect-ratio`, `max-height` → the box grows
-  with its content (`width`, `min/max-width`, `height`/`min-height` and
-  `box-sizing` **are** supported — see [box model](#box-model)).
-- **Typography extras**: `letter-spacing`, `text-shadow`, `@font-face` (fonts
-  come from the Google-fonts pipeline), multi-column.
-- **Media/at-rules**: `@media`, `@page`, `@import`, CSS variables (`var()`),
-  `calc()`.
-
-Unknown properties and elements never error — they're simply skipped — so a
-richer stylesheet degrades gracefully to the supported subset.
+- **Layout/sizing**: `aspect-ratio`, real `overflow` pixel-clipping (only
+  whole-fragment culling — see [overflow](#display--positioning)), a true scroll
+  model for `position: sticky`. `grid-template-areas` / named grid lines and
+  `grid-template-rows` with `fr`/`%`/`auto` (use fixed `pt` rows or numeric
+  placement). `flex-shrink` / `flex-basis` on the **column** axis,
+  `flex-direction: row-reverse` / `column-reverse`, `justify-content: space-evenly`.
+- **Visual effects**: `transform`, `filter`, `text-shadow`, `box-shadow: inset`
+  and true Gaussian blur, `background-image: url()` raster (use `<img>`),
+  CSS tiling patterns. (Gradients, rounded corners and offset/spread shadows
+  **are** supported — see [backgrounds](#backgrounds) and [shadows](#shadows).)
+- **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
+  full bidirectional/mixed-script reordering (only line-level `direction: rtl`),
+  colour **alpha** in colour values (parsed but dropped — use `opacity`).
+- **Selectors**: pseudo-classes / pseudo-elements (`:hover`, `:first-child`,
+  `::before`), attribute *operators* (`~= ^= $= *= |=`) in stylesheets.
+- **At-rules / values**: `@media` query evaluation, `@page`, `@import`.
+  (`var()` custom properties and `calc()` **are** supported in length contexts.)
+- **Units**: `cm`, `mm`, `in`, `pc`, `q`, `ex`, `ch` (use `pt`, `px`, `em`,
+  `rem`, `%`, `vw`/`vh`).
