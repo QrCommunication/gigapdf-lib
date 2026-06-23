@@ -1848,6 +1848,64 @@ fn is_cursive_script(script: [u8; 4]) -> bool {
     matches!(&script, b"arab" | b"syrc" | b"mong" | b"nko " | b"rohg" | b"adlm")
 }
 
+/// Pick the OpenType script tag a text run should be **complex-shaped** under, or
+/// `None` when the run is plain Latin/simple and the fast path suffices.
+///
+/// This is the strict gate that keeps the [`ComplexShaper`] dormant for ordinary
+/// office/document text: it returns `Some(tag)` only when the run actually holds
+/// characters that need cursive joining (Arabic-family scripts) or GPOS mark
+/// positioning (any combining diacritic), and `Some(b"hebr")` for Hebrew (which
+/// uses GPOS mark/precomposed positioning for its points). A run of Latin letters
+/// with no combining marks returns `None`, so the caller renders it byte-for-byte
+/// as before. The first triggering character wins (a run is overwhelmingly one
+/// script), and cursive scripts take priority over a bare combining mark.
+pub fn detect_complex_script(text: &str) -> Option<[u8; 4]> {
+    let mut has_mark = false;
+    for c in text.chars() {
+        let u = c as u32;
+        // Cursive (joining) scripts — these need init/medi/fina/isol shaping.
+        if let Some(tag) = cursive_script_of(u) {
+            return Some(tag);
+        }
+        // Hebrew letters/points: positioned via GPOS, no joining.
+        if (0x0590..=0x05FF).contains(&u) || (0xFB1D..=0xFB4F).contains(&u) {
+            return Some(*b"hebr");
+        }
+        // Any combining mark anywhere in the run means GPOS mark positioning is
+        // worth running (e.g. Latin base + U+0301). Remember it, but keep scanning
+        // in case a cursive/Hebrew character appears and should win.
+        if is_combining_mark(u) {
+            has_mark = true;
+        }
+    }
+    // A run that is otherwise Latin/simple but carries a combining diacritic is
+    // shaped under `latn` so mark-to-base GPOS can pull the mark onto its base.
+    has_mark.then_some(*b"latn")
+}
+
+/// The OpenType cursive-script tag a Unicode scalar belongs to (the Arabic-family
+/// blocks we run joining for), or `None`. Combining marks inside these blocks are
+/// handled by `is_combining_mark`/joining as Transparent, so this only fires on
+/// the joining letters themselves and Tatweel.
+fn cursive_script_of(u: u32) -> Option<[u8; 4]> {
+    match u {
+        // Arabic + Arabic Supplement + Arabic Extended-A + presentation forms.
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF
+        | 0xFE70..=0xFEFF => Some(*b"arab"),
+        // Syriac.
+        0x0700..=0x074F => Some(*b"syrc"),
+        // Thaana.
+        0x0780..=0x07BF => Some(*b"thaa"),
+        // NKo.
+        0x07C0..=0x07FF => Some(*b"nko "),
+        // Mongolian.
+        0x1800..=0x18AF => Some(*b"mong"),
+        // Adlam.
+        0x1E900..=0x1E95F => Some(*b"adlm"),
+        _ => None,
+    }
+}
+
 /// Arabic joining type of a Unicode scalar, from the Unicode joining classes
 /// (the subset that matters for shaping). Marks (combining) are Transparent.
 fn joining_type(u: u32) -> Join {
@@ -2512,6 +2570,33 @@ mod tests {
         assert_eq!(joining_type(0x0640), Join::Causing);
         assert_eq!(joining_type(0x0020), Join::Isolated);
         assert_eq!(joining_type(0x064E), Join::Transparent);
+    }
+
+    #[test]
+    fn detect_complex_script_gates_strictly() {
+        // Plain Latin / simple text → no complex shaping (fast path preserved).
+        assert_eq!(detect_complex_script("Hello, World!"), None);
+        assert_eq!(detect_complex_script(""), None);
+        assert_eq!(detect_complex_script("café"), None); // precomposed é, no mark
+        assert_eq!(detect_complex_script("123 €$"), None);
+        // A combining diacritic on a Latin base → shape under `latn` for GPOS
+        // mark-to-base attachment.
+        assert_eq!(detect_complex_script("e\u{0301}"), Some(*b"latn")); // e + acute
+        assert_eq!(detect_complex_script("a\u{0308}o"), Some(*b"latn")); // a + diaeresis
+        // Arabic (and presentation forms) → `arab`, even mixed with Latin.
+        assert_eq!(detect_complex_script("\u{0628}\u{0627}"), Some(*b"arab")); // beh alef
+        assert_eq!(detect_complex_script("ab \u{0645}"), Some(*b"arab")); // meem in a run
+        // Hebrew → `hebr`.
+        assert_eq!(detect_complex_script("\u{05E9}\u{05DC}"), Some(*b"hebr"));
+        // Cursive scripts win over a bare combining mark earlier in scan order
+        // is irrelevant (first triggering char wins): a leading mark + Arabic still
+        // resolves to the script of whichever fires first — here the mark sets the
+        // flag but Arabic returns immediately.
+        assert_eq!(detect_complex_script("\u{0301}\u{0628}"), Some(*b"arab"));
+        // Syriac / Thaana / NKo map to their tags.
+        assert_eq!(detect_complex_script("\u{0710}"), Some(*b"syrc"));
+        assert_eq!(detect_complex_script("\u{0780}"), Some(*b"thaa"));
+        assert_eq!(detect_complex_script("\u{07C1}"), Some(*b"nko "));
     }
 
     #[test]

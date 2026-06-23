@@ -796,6 +796,22 @@ fn paint(
                                 0.0,
                             );
                         }
+                    } else if crate::font::shape::detect_complex_script(trimmed).is_some() {
+                        // Arabic-family joining, Hebrew, or any combining diacritic:
+                        // draw the run shaped so GPOS mark attachment / cursive forms
+                        // take effect. Latin/simple runs skip this and keep the plain
+                        // `add_text` path (byte-identical output).
+                        let _ = doc.add_text_shaped(
+                            page,
+                            *x,
+                            baseline,
+                            style.font_size,
+                            trimmed,
+                            id,
+                            style.color,
+                            1.0,
+                            0.0,
+                        );
                     } else {
                         let _ = doc.add_text(
                             page,

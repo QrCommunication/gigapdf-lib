@@ -7309,46 +7309,73 @@ impl Document {
         let ttf = self.embedded_truetype(font_obj).ok_or_else(|| {
             EngineError::Unsupported("font_obj is not an embedded TrueType font".into())
         })?;
-        let shaper = crate::font::shape::Shaper::new(&ttf);
-        if shaper.is_empty() {
-            // No layout tables → identical to the plain run (and cheaper).
-            return self.add_text(
-                page_no,
-                x,
-                y,
-                size,
-                text,
-                font_obj,
-                color,
-                opacity,
-                rotation_deg,
-            );
-        }
         let upm = ttf.units_per_em().max(1.0);
         let raw: Vec<u16> = text
             .chars()
             .map(|c| ttf.gid_for_unicode(c as u32).unwrap_or(0))
             .collect();
-        let gids = shaper.substitute(&raw);
 
-        // Build a TJ array: glyph hex strings separated by kern adjustments.
-        // PDF TJ numbers are in thousandths of an em and SUBTRACT from the
-        // advance (positive → move left), so a GPOS x-advance of `k` font units
-        // becomes the TJ number `-(k · 1000 / upm)`.
-        let used = self.font_used_gids.entry(font_obj).or_default();
-        let mut tj = String::from("[<");
-        for (i, &g) in gids.iter().enumerate() {
-            used.insert(g);
-            tj.push_str(&format!("{g:04X}"));
-            if i + 1 < gids.len() {
-                let k = shaper.kern(g, gids[i + 1]);
-                if k != 0 {
-                    let adj = -(k as f64) * 1000.0 / upm;
-                    tj.push_str(&format!("> {} <", content::num(adj)));
-                }
+        // Complex-script gate FIRST (before the Latin fast-path's emptiness check):
+        // Arabic-family joining, Hebrew, or any run carrying a combining diacritic
+        // goes through the positioned `ComplexShaper` (GPOS mark attachment + GSUB
+        // contextual/joining), which yields per-glyph x/y offsets emitted as `Td`
+        // placements. This must run ahead of `Shaper::is_empty` because a face whose
+        // only layout is GPOS marks / GSUB-contextual (no Latin ligatures/kern) makes
+        // the fast-path `Shaper` empty yet still needs complex shaping.
+        let complex_tj = match crate::font::shape::detect_complex_script(text) {
+            Some(script) if !raw.is_empty() => {
+                crate::font::shape::ComplexShaper::new(&ttf).map(|cs| {
+                    let unicodes: Vec<u32> = text.chars().map(|c| c as u32).collect();
+                    let advance = |g: u16| ttf.advance_width(g).round() as i32;
+                    let shaped = cs.shape(&raw, &unicodes, script, &advance);
+                    self.shaped_glyph_ops(font_obj, &shaped, upm, size)
+                })
             }
-        }
-        tj.push_str(">] TJ");
+            _ => None,
+        };
+
+        let tj = match complex_tj {
+            Some(ops) => ops,
+            None => {
+                // Not a complex run (or the face has no layout tables to shape with).
+                let shaper = crate::font::shape::Shaper::new(&ttf);
+                if shaper.is_empty() {
+                    // No layout tables → identical to the plain run (and cheaper).
+                    return self.add_text(
+                        page_no,
+                        x,
+                        y,
+                        size,
+                        text,
+                        font_obj,
+                        color,
+                        opacity,
+                        rotation_deg,
+                    );
+                }
+                // Latin / simple fast path: GSUB single+ligature substitution, then a
+                // TJ array of glyph hex strings separated by kern adjustments. PDF TJ
+                // numbers are in thousandths of an em and SUBTRACT from the advance
+                // (positive → move left), so a GPOS x-advance of `k` font units becomes
+                // the TJ number `-(k · 1000 / upm)`.
+                let gids = shaper.substitute(&raw);
+                let used = self.font_used_gids.entry(font_obj).or_default();
+                let mut tj = String::from("[<");
+                for (i, &g) in gids.iter().enumerate() {
+                    used.insert(g);
+                    tj.push_str(&format!("{g:04X}"));
+                    if i + 1 < gids.len() {
+                        let k = shaper.kern(g, gids[i + 1]);
+                        if k != 0 {
+                            let adj = -(k as f64) * 1000.0 / upm;
+                            tj.push_str(&format!("> {} <", content::num(adj)));
+                        }
+                    }
+                }
+                tj.push_str(">] TJ");
+                tj
+            }
+        };
 
         let res_name = format!("GF{font_obj}");
         let (sin, cos) = rotation_deg.to_radians().sin_cos();
@@ -7373,6 +7400,47 @@ impl Document {
         self.set_page_content(page_no, content)?;
         self.register_page_font(page_no, res_name.as_bytes(), (font_obj, 0))?;
         Ok(())
+    }
+
+    /// Build the content-stream operators (to sit inside a `BT`/`ET` block) for a
+    /// positioned complex-script run: each [`ShapedGlyph`] is placed with `Td`
+    /// using its x/y offsets so marks ride on their base, and the pen advances by
+    /// `x_advance`. Offsets/advances are font units → points via `size / upm`. The
+    /// drawn glyph ids are recorded so they end up in the subset.
+    fn shaped_glyph_ops(
+        &mut self,
+        font_obj: u32,
+        shaped: &[crate::font::shape::ShapedGlyph],
+        upm: f64,
+        size: f64,
+    ) -> String {
+        let used = self.font_used_gids.entry(font_obj).or_default();
+        let to_pts = size / upm;
+        // `Td` deltas are relative to the *previous* line-matrix origin (the start of
+        // the run is the `Tm` origin), independent of `Tj` advances — so we track the
+        // cumulative Td position and emit the difference each glyph.
+        let mut cur_x = 0.0f64;
+        let mut cur_y = 0.0f64;
+        // Pen position along the baseline (text space), advanced only by `x_advance`.
+        let mut pen_x = 0.0f64;
+        let mut out = String::new();
+        for g in shaped {
+            used.insert(g.gid);
+            let target_x = pen_x + g.x_offset as f64 * to_pts;
+            let target_y = g.y_offset as f64 * to_pts;
+            let dx = target_x - cur_x;
+            let dy = target_y - cur_y;
+            out.push_str(&format!(
+                "{} {} Td <{:04X}> Tj\n",
+                content::num(dx),
+                content::num(dy),
+                g.gid
+            ));
+            cur_x = target_x;
+            cur_y = target_y;
+            pen_x += g.x_advance as f64 * to_pts;
+        }
+        out
     }
 
     /// The PostScript name of a base-14 standard font, or `None` if `name` is
@@ -14048,6 +14116,98 @@ mod tests {
             0,
             "no rectangle on undecorated embedded run"
         );
+    }
+
+    #[test]
+    fn shaped_glyph_ops_places_mark_with_td_offsets() {
+        // The render emitter for the complex path: a base glyph (advance 500, no
+        // offset) followed by an attached mark (advance 0, x_offset -250, y_offset
+        // 700) must be drawn as two `Tj`, with the mark moved onto the base by `Td`
+        // using the GPOS offsets scaled font-units → points (size / upm = 0.01).
+        use crate::font::shape::ShapedGlyph;
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let font = doc
+            .embed_truetype_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
+            .unwrap();
+        let shaped = [
+            ShapedGlyph {
+                gid: 0x10,
+                x_advance: 500,
+                x_offset: 0,
+                y_offset: 0,
+                cluster: 0,
+            },
+            ShapedGlyph {
+                gid: 0x20,
+                x_advance: 0,
+                x_offset: -250,
+                y_offset: 700,
+                cluster: 1,
+            },
+        ];
+        // upm 1000, size 10 → scale 0.01. The base sits at the origin and advances
+        // the pen by 500·0.01 = 5pt. The mark carries no advance; its GPOS x_offset
+        // (-250) is measured from that post-base pen, so its absolute x is
+        // 5 + (-250·0.01) = 2.5pt and y is 700·0.01 = 7pt — i.e. its anchor lands on
+        // the base anchor (base anchor 300fu = 3pt, mark anchor 50fu = 0.5pt →
+        // 3 - 0.5 = 2.5pt). This is exactly the GPOS mark-to-base attachment.
+        let ops = doc.shaped_glyph_ops(font, &shaped, 1000.0, 10.0);
+        assert_eq!(ops.matches("Tj").count(), 2, "one Tj per shaped glyph");
+        assert!(ops.contains("0 0 Td <0010> Tj"), "base at origin: {ops}");
+        assert!(
+            ops.contains("2.5 7 Td <0020> Tj"),
+            "mark anchored onto base via Td x/y offsets: {ops}"
+        );
+        // Both glyph ids are recorded for subsetting.
+        let used = doc.font_used_gids.get(&font).unwrap();
+        assert!(used.contains(&0x10) && used.contains(&0x20));
+    }
+
+    #[test]
+    fn shaped_glyph_ops_advances_pen_between_glyphs() {
+        // Two ordinary glyphs (no offsets) advance the pen by their x_advance, so
+        // the second glyph's `Td` lands at the first glyph's advance (font-units →
+        // points): 600·(20/1000) = 12.
+        use crate::font::shape::ShapedGlyph;
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let font = doc
+            .embed_truetype_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
+            .unwrap();
+        let shaped = [
+            ShapedGlyph { gid: 1, x_advance: 600, x_offset: 0, y_offset: 0, cluster: 0 },
+            ShapedGlyph { gid: 2, x_advance: 600, x_offset: 0, y_offset: 0, cluster: 1 },
+        ];
+        let ops = doc.shaped_glyph_ops(font, &shaped, 1000.0, 20.0);
+        assert!(ops.contains("0 0 Td <0001> Tj"), "first glyph at origin: {ops}");
+        assert!(ops.contains("12 0 Td <0002> Tj"), "pen advanced 12pt: {ops}");
+    }
+
+    #[test]
+    fn add_text_shaped_combining_run_falls_back_gracefully_without_layout() {
+        // The bundled face carries no GSUB/GPOS, so even a combining-mark run has
+        // nothing to position — `add_text_shaped` must degrade to a plain drawn run
+        // (no panic), exactly like `add_text`. The positioned path is unit-tested
+        // above and in `ComplexShaper`; it only activates for faces with layout
+        // tables (a `ComplexShaper` exists).
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let font = doc
+            .embed_truetype_font("Liberation Sans", crate::font::bundled::FALLBACK_TTF)
+            .unwrap();
+        let before = doc.page_content(1).unwrap().len();
+        doc.add_text_shaped(
+            1,
+            80.0,
+            650.0,
+            24.0,
+            "e\u{0301}",
+            font,
+            [0.0, 0.0, 0.0],
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(content[before..].contains("Tj"), "run still drawn");
     }
 
     /// Count `/FontFile`, `/FontFile2` and `/FontFile3` occurrences in raw PDF
