@@ -2375,6 +2375,7 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     styles.extend(odf_text_styles(&content));
     let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
     let mut blocks = Vec::new();
+    let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
     odf_walk_model(
         &mut Xml::new(&content),
         zip,
@@ -2382,12 +2383,16 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         &mut blocks,
         None,
         None,
+        &mut resources,
     );
-    flow_document(blocks, page_geometry(geom))
+    let mut doc = flow_document(blocks, page_geometry(geom));
+    doc.resources.images = resources;
+    doc
 }
 
 /// Recursive ODF model walker (mirrors [`odf_walk`]). Handles `text:h`,
 /// `text:p`, `text:list` (each item → list-item paragraph) and `table:table`.
+#[allow(clippy::too_many_arguments)]
 fn odf_walk_model(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
@@ -2395,6 +2400,7 @@ fn odf_walk_model(
     out: &mut Vec<Block>,
     stop: Option<&str>,
     list_level: Option<u32>,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
 ) {
     while let Some(tok) = x.next() {
         match tok {
@@ -2406,7 +2412,7 @@ fn odf_walk_model(
                             .and_then(|v| v.parse::<u8>().ok())
                             .unwrap_or(1)
                             .clamp(1, 6);
-                        let runs = odf_inline_model(x, styles, "h");
+                        let runs = odf_inline_model(x, zip, styles, "h", resources);
                         if !runs.is_empty() {
                             out.push(Block {
                                 kind: BlockKind::Heading(Heading {
@@ -2421,7 +2427,7 @@ fn odf_walk_model(
                         }
                     }
                     "p" if !sc => {
-                        let runs = odf_inline_model(x, styles, "p");
+                        let runs = odf_inline_model(x, zip, styles, "p", resources);
                         if runs.is_empty() && list_level.is_none() {
                             out.push(Block::default()); // preserve blank line spacing
                             continue;
@@ -2453,10 +2459,10 @@ fn odf_walk_model(
                     }
                     "list" if !sc => {
                         let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
-                        odf_walk_model(x, zip, styles, out, Some("list"), next);
+                        odf_walk_model(x, zip, styles, out, Some("list"), next, resources);
                     }
                     "table" if !sc => {
-                        let table = odf_table_model(x, zip, styles);
+                        let table = odf_table_model(x, zip, styles, resources);
                         out.push(Block {
                             kind: BlockKind::Table(table),
                             ..Block::default()
@@ -2477,11 +2483,23 @@ fn odf_walk_model(
 
 /// Collect an ODF block's inline content as model [`Inline`] runs, honouring
 /// `text:span` styles (parsed from the style map into [`CharStyle`]),
-/// `text:tab`/`text:s`/`text:line-break`. Mirrors [`odf_inline`].
-fn odf_inline_model(x: &mut Xml, styles: &BTreeMap<String, String>, block: &str) -> Vec<Inline> {
+/// `text:tab`/`text:s`/`text:line-break`, `text:a` hyperlinks (→ [`Inline::Link`])
+/// and inline `draw:frame`/`draw:image` (→ [`Inline::Image`], bytes interned in
+/// `resources`). Mirrors [`odf_inline`].
+fn odf_inline_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    block: &str,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Vec<Inline> {
     let mut runs: Vec<Inline> = Vec::new();
     // Stack of span char-styles (closed in order).
     let mut span_stack: Vec<CharStyle> = Vec::new();
+    // The currently open `text:a` hyperlink, if any; its runs are buffered here
+    // and flushed as an `Inline::Link` on the matching close. ODF anchors do not
+    // nest, so a single slot suffices (a nested `text:a` simply replaces it).
+    let mut link: Option<DocxLink> = None;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
@@ -2494,29 +2512,82 @@ fn odf_inline_model(x: &mut Xml, styles: &BTreeMap<String, String>, block: &str)
                             .unwrap_or_default();
                         span_stack.push(odf_css_char_style(&css));
                     }
-                    "tab" => odf_push(&mut runs, &span_stack, " "),
-                    "line-break" => runs.push(Inline::LineBreak),
+                    // `text:a` hyperlink: open a link buffer carrying the resolved
+                    // target (`xlink:href`); its inner runs land in `children`.
+                    "a" if !sc => {
+                        link = Some(DocxLink {
+                            href: odf_link_target(&attrs),
+                            children: Vec::new(),
+                        });
+                    }
+                    "tab" => odf_push(active_inlines(&mut runs, &mut link), &span_stack, " "),
+                    "line-break" => active_inlines(&mut runs, &mut link).push(Inline::LineBreak),
                     "s" => {
                         let n = attr(&attrs, "c")
                             .and_then(|v| v.parse::<usize>().ok())
                             .unwrap_or(1);
-                        odf_push(&mut runs, &span_stack, &" ".repeat(n));
+                        odf_push(
+                            active_inlines(&mut runs, &mut link),
+                            &span_stack,
+                            &" ".repeat(n),
+                        );
+                    }
+                    // An inline picture: `draw:image@xlink:href` (often wrapped in
+                    // a `draw:frame`). Intern the bytes and emit an `Inline::Image`.
+                    "image" if attr(&attrs, "href").is_some() => {
+                        if let Some(href) = attr(&attrs, "href") {
+                            let key = href.trim_start_matches('/').to_string();
+                            if let Some(img) = image_ref(zip, &key, resources) {
+                                active_inlines(&mut runs, &mut link).push(Inline::Image(img));
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
-            Tok::Text(t) => odf_push(&mut runs, &span_stack, &t),
+            Tok::Text(t) => odf_push(active_inlines(&mut runs, &mut link), &span_stack, &t),
             Tok::Close(name) => {
                 let ln = local(&name);
                 if ln == "span" {
                     span_stack.pop();
+                } else if ln == "a" {
+                    // Flush the hyperlink (drop empties) into the run flow.
+                    if let Some(l) = link.take() {
+                        if !l.children.is_empty() {
+                            runs.push(Inline::Link {
+                                href: l.href,
+                                children: l.children,
+                            });
+                        }
+                    }
                 } else if ln == block {
                     break;
                 }
             }
         }
     }
+    // A hyperlink left open at block end (malformed input): flush it.
+    if let Some(l) = link.take() {
+        if !l.children.is_empty() {
+            runs.push(Inline::Link {
+                href: l.href,
+                children: l.children,
+            });
+        }
+    }
     runs
+}
+
+/// Resolve an ODF `text:a` to a model [`LinkTarget`]: an external URL from
+/// `xlink:href`. A purely in-document reference (`#bookmark`/`#frame`) has no page
+/// the model can address by index, so it lands on the document start (page 0),
+/// matching the DOCX anchor behaviour; a blank href ⇒ an empty URL.
+fn odf_link_target(attrs: &[(String, String)]) -> model::LinkTarget {
+    match attr(attrs, "href").map(str::trim) {
+        Some(h) if h.starts_with('#') => model::LinkTarget::Page(0),
+        Some(h) if !h.is_empty() => model::LinkTarget::Url(decode(h)),
+        _ => model::LinkTarget::Url(String::new()),
+    }
 }
 
 /// Append `text` as an [`InlineRun`] carrying the innermost open span style
@@ -2553,7 +2624,9 @@ fn odf_css_char_style(css: &str) -> CharStyle {
             "font-weight" if v == "bold" => style.bold = true,
             "font-style" if v == "italic" => style.italic = true,
             "text-decoration" if v.contains("underline") => style.underline = true,
+            "text-decoration" if v.contains("line-through") => style.strike = true,
             "color" => style.color = hex_to_rgb_f64(v.trim_start_matches('#')),
+            "background-color" => style.background = hex_to_rgb_f64(v.trim_start_matches('#')),
             "font-size" => {
                 if let Some(pt) = v
                     .strip_suffix("pt")
@@ -2581,6 +2654,7 @@ fn odf_table_model(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Table {
     let mut rows: Vec<Row> = Vec::new();
     let mut cur_row: Option<Vec<Cell>> = None;
@@ -2597,7 +2671,15 @@ fn odf_table_model(
                         .unwrap_or(1)
                         .min(64);
                     let mut blocks = Vec::new();
-                    odf_walk_model(x, zip, styles, &mut blocks, Some("table-cell"), None);
+                    odf_walk_model(
+                        x,
+                        zip,
+                        styles,
+                        &mut blocks,
+                        Some("table-cell"),
+                        None,
+                        resources,
+                    );
                     if let Some(row) = cur_row.as_mut() {
                         for _ in 0..repeat {
                             row.push(Cell {
@@ -2682,11 +2764,12 @@ fn ods_table_model(x: &mut Xml) -> Vec<SheetRow> {
                         .unwrap_or(1)
                         .min(64);
                     let cells = ods_row_model(x);
-                    let emit = if cells.iter().all(|c| c.value == model::CellValue::Empty) {
-                        rep.min(1)
-                    } else {
-                        rep
-                    };
+                    // Collapse a run of fully-blank rows to one — but a row holding
+                    // any formula carries content even with blank cached results.
+                    let blank = cells
+                        .iter()
+                        .all(|c| c.value == model::CellValue::Empty && c.formula.is_none());
+                    let emit = if blank { rep.min(1) } else { rep };
                     for _ in 0..emit {
                         rows.push(SheetRow {
                             cells: cells.clone(),
@@ -2707,8 +2790,10 @@ fn ods_table_model(x: &mut Xml) -> Vec<SheetRow> {
 }
 
 /// Collect one `table:table-row`'s typed cells (open already consumed), reusing
-/// [`ods_cell_text`] for the displayed value and classifying it as a number when
-/// it parses, else text.
+/// [`ods_cell_text`] for the displayed value, classifying it as a number when it
+/// parses (preferring `office:value` for typed numeric cells), and capturing a
+/// `table:formula` (→ [`SheetCell::formula`], the displayed value kept as the
+/// cached result).
 fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
     let mut cells: Vec<SheetCell> = Vec::new();
     while let Some(tok) = x.next() {
@@ -2720,16 +2805,32 @@ fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
                         .min(64);
+                    // `table:formula` (e.g. `of:=SUM([.A1:.A9])`) → the authored
+                    // expression without its namespace prefix and leading `=`.
+                    let formula = attr(&attrs, "formula").and_then(odf_formula_expr);
+                    // Typed numeric cells carry the canonical value in
+                    // `office:value` — prefer it over the (possibly locale-
+                    // formatted) display text for correct number typing.
+                    let typed_num = matches!(
+                        attr(&attrs, "value-type"),
+                        Some("float") | Some("percentage") | Some("currency")
+                    )
+                    .then(|| attr(&attrs, "value").and_then(|v| v.trim().parse::<f64>().ok()))
+                    .flatten();
                     let text = ods_cell_text(x, ln);
                     let trimmed = text.trim();
-                    let value = if trimmed.is_empty() {
+                    let value = if let Some(n) = typed_num {
+                        model::CellValue::Number(n)
+                    } else if trimmed.is_empty() {
                         model::CellValue::Empty
                     } else if let Ok(n) = trimmed.parse::<f64>() {
                         model::CellValue::Number(n)
                     } else {
                         model::CellValue::Text(trimmed.to_string())
                     };
-                    let emit = if value == model::CellValue::Empty {
+                    // A formula cell is meaningful even when its cached result is
+                    // blank, so emit it (don't collapse to a single empty).
+                    let emit = if value == model::CellValue::Empty && formula.is_none() {
                         rep.min(1)
                     } else {
                         rep
@@ -2737,6 +2838,7 @@ fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
                     for _ in 0..emit {
                         cells.push(SheetCell {
                             value: value.clone(),
+                            formula: formula.clone(),
                             ..SheetCell::default()
                         });
                     }
@@ -2785,9 +2887,12 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     doc
 }
 
-/// Emit one `draw:page` (open consumed) as a model [`Slide`]: its paragraphs as
-/// body placeholders, its images as image-shape placeholders. Mirrors
-/// [`odp_page`].
+/// Emit one `draw:page` (open consumed) as a model [`Slide`]. Bare `text:p`
+/// children become body placeholders and bare `draw:image` become picture
+/// placeholders (the legacy flow layout). Positioned `draw:frame`s become
+/// absolutely-placed shapes in [`Slide::shapes`] (geometry from `svg:x/y/
+/// width/height`), and `draw:g` groups are descended recursively, the group's
+/// own `svg:x/y` composed onto the children's positions. Mirrors [`odp_page`].
 fn odp_page_model(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
@@ -2796,13 +2901,35 @@ fn odp_page_model(
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Slide {
     let mut placeholders: Vec<model::Placeholder> = Vec::new();
+    let mut shapes: Vec<Block> = Vec::new();
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
                 match ln {
+                    // A positioned frame → an absolutely-placed shape (consumes its
+                    // subtree). A frame without a usable box falls through to the
+                    // flow branches below so its inner content is still captured.
+                    "frame" if !sc && odp_frame_box(&attrs).is_some() => {
+                        let bx = odp_frame_box(&attrs).unwrap();
+                        odp_frame_model(x, zip, styles, geom, (0.0, 0.0), bx, resources, &mut shapes);
+                    }
+                    // A group: descend, composing the group's own offset.
+                    "g" if !sc => {
+                        let (gx, gy) = odp_group_offset(&attrs);
+                        odp_group_model(
+                            x,
+                            zip,
+                            styles,
+                            geom,
+                            (gx, gy),
+                            resources,
+                            &mut shapes,
+                            &mut placeholders,
+                        );
+                    }
                     "p" if !sc => {
-                        let runs = odf_inline_model(x, styles, "p");
+                        let runs = odf_inline_model(x, zip, styles, "p", resources);
                         if !runs.is_empty() {
                             placeholders.push(model::Placeholder {
                                 role: model::PlaceholderRole::Body,
@@ -2840,9 +2967,169 @@ fn odp_page_model(
     }
     Slide {
         geometry: page_geometry(geom),
-        shapes: Vec::new(),
+        shapes,
         placeholders,
         notes: None,
+    }
+}
+
+/// A `draw:g` group's own placement offset in points: `(svg:x, svg:y)` (each
+/// defaulting to `0`). ODF nests absolute child positions inside an optionally
+/// translated group; this offset is added to descendant frame origins so a
+/// grouped shape lands at its true slide position. (A `draw:transform` matrix on
+/// the group, when present, is not decomposed — only the transl/offset is honoured,
+/// the zero-dependency pragmatic choice.)
+fn odp_group_offset(attrs: &[(String, String)]) -> (f64, f64) {
+    let x = attr(attrs, "x").and_then(parse_odf_pt).unwrap_or(0.0);
+    let y = attr(attrs, "y").and_then(parse_odf_pt).unwrap_or(0.0);
+    (x, y)
+}
+
+/// Walk a `draw:g` group body (open consumed; `off` = the accumulated parent
+/// offset including this group's own). Positioned frames become shapes (their
+/// origin shifted by `off`); nested groups recurse with their offset composed
+/// additively; bare paragraphs/images still surface as placeholders. Stops at the
+/// matching `</draw:g>` (or EOF).
+#[allow(clippy::too_many_arguments)]
+fn odp_group_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    geom: PageGeom,
+    off: (f64, f64),
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+    shapes: &mut Vec<Block>,
+    placeholders: &mut Vec<model::Placeholder>,
+) {
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "frame" if !sc && odp_frame_box(&attrs).is_some() => {
+                        let bx = odp_frame_box(&attrs).unwrap();
+                        odp_frame_model(x, zip, styles, geom, off, bx, resources, shapes);
+                    }
+                    "g" if !sc => {
+                        let (gx, gy) = odp_group_offset(&attrs);
+                        odp_group_model(
+                            x,
+                            zip,
+                            styles,
+                            geom,
+                            (off.0 + gx, off.1 + gy),
+                            resources,
+                            shapes,
+                            placeholders,
+                        );
+                    }
+                    "p" if !sc => {
+                        let runs = odf_inline_model(x, zip, styles, "p", resources);
+                        if !runs.is_empty() {
+                            placeholders.push(model::Placeholder {
+                                role: model::PlaceholderRole::Body,
+                                block: Block {
+                                    kind: BlockKind::Paragraph(Paragraph {
+                                        runs,
+                                        ..Paragraph::default()
+                                    }),
+                                    ..Block::default()
+                                },
+                            });
+                        }
+                    }
+                    "image" if sc => {
+                        if let Some(href) = attr(&attrs, "href") {
+                            let key = href.trim_start_matches('/').to_string();
+                            if let Some(img) = image_block(zip, &key, resources) {
+                                placeholders.push(model::Placeholder {
+                                    role: model::PlaceholderRole::Other("picture".to_string()),
+                                    block: img,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) if local(&name) == "g" => break,
+            _ => {}
+        }
+    }
+}
+
+/// Lower one positioned `draw:frame` (open consumed; `bx` = its `(x, y, w, h)`
+/// page box in points, `off` = the enclosing group offset) to a shape [`Block`]
+/// in `shapes`, with a lower-left-origin [`Rect`] frame. The frame body — a
+/// `draw:text-box` of paragraphs, or a `draw:image` — chooses the block kind:
+/// a single image ⇒ [`BlockKind::Image`]; otherwise a [`BlockKind::TextBox`]
+/// holding the captured blocks. An empty frame is dropped. Consumes up to
+/// `</draw:frame>`.
+#[allow(clippy::too_many_arguments)]
+fn odp_frame_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    geom: PageGeom,
+    off: (f64, f64),
+    bx: (f64, f64, f64, f64),
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+    shapes: &mut Vec<Block>,
+) {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut image: Option<model::ImageRef> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                match ln {
+                    "p" if !sc => {
+                        let runs = odf_inline_model(x, zip, styles, "p", resources);
+                        if !runs.is_empty() {
+                            blocks.push(Block {
+                                kind: BlockKind::Paragraph(Paragraph {
+                                    runs,
+                                    ..Paragraph::default()
+                                }),
+                                ..Block::default()
+                            });
+                        }
+                    }
+                    "image" if image.is_none() => {
+                        if let Some(href) = attr(&attrs, "href") {
+                            let key = href.trim_start_matches('/').to_string();
+                            image = image_ref(zip, &key, resources);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) if local(&name) == "frame" => break,
+            _ => {}
+        }
+    }
+
+    let (fx, fy, fw, fh) = bx;
+    // Top-left (ODF, offset by the enclosing group) → lower-left (model).
+    let top_x = fx + off.0;
+    let top_y = fy + off.1;
+    let rect = model::Rect::new(top_x, (geom.h - (top_y + fh)).max(0.0), fw, fh);
+
+    let kind = if !blocks.is_empty() {
+        // A text frame: a text box of the captured editable blocks. (An image
+        // alongside text is rare for a placeholder frame; the text runs win.)
+        Some(BlockKind::TextBox(model::TextBox { blocks }))
+    } else {
+        // No text: a pure picture frame becomes an image block; an empty frame
+        // is dropped.
+        image.map(BlockKind::Image)
+    };
+    if let Some(kind) = kind {
+        shapes.push(Block {
+            frame: Some(rect),
+            kind,
+            ..Block::default()
+        });
     }
 }
 
@@ -7291,6 +7578,27 @@ fn odf_text_styles(xml: &str) -> BTreeMap<String, String> {
                                 css.push_str("text-decoration:underline;");
                             }
                         }
+                        // `style:text-line-through-style`/`-type` (≠ none) ⇒
+                        // strikethrough. ODF carries it as its own property, not a
+                        // CSS `text-decoration`; emit a `line-through` token the
+                        // model char-style parser recognises.
+                        if odf_line_through_set(&attrs) {
+                            css.push_str("text-decoration:line-through;");
+                        }
+                        // `fo:background-color` on a text style ⇒ run highlight
+                        // (`CharStyle.background`). `transparent`/`none` ⇒ none.
+                        if let Some(bg) = attr(&attrs, "background-color") {
+                            let b = bg.trim();
+                            if !matches!(b, "transparent" | "none" | "") {
+                                let hex = b.trim_start_matches('#');
+                                if is_hex6(hex) {
+                                    css.push_str(&format!(
+                                        "background-color:#{};",
+                                        hex.to_ascii_uppercase()
+                                    ));
+                                }
+                            }
+                        }
                         if let Some(sz) = attr(&attrs, "font-size") {
                             if let Some(pt) = parse_odf_pt(sz) {
                                 css.push_str(&format!("font-size:{pt}pt;"));
@@ -7320,6 +7628,17 @@ fn odf_text_styles(xml: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// True when an ODF text style declares an active strikethrough:
+/// `style:text-line-through-style` (the primary property) ≠ `none`, or, when that
+/// is absent, `style:text-line-through-type` ≠ `none`. Either being present and
+/// non-`none` marks the run as struck through.
+fn odf_line_through_set(attrs: &[(String, String)]) -> bool {
+    let style = attr(attrs, "text-line-through-style");
+    let kind = attr(attrs, "text-line-through-type");
+    matches!(style, Some(s) if !s.eq_ignore_ascii_case("none"))
+        || (style.is_none() && matches!(kind, Some(k) if !k.eq_ignore_ascii_case("none")))
 }
 
 /// Read the first `style:page-layout-properties` from an ODF part —
@@ -7359,6 +7678,23 @@ fn odf_page_geom(xml: &str, fallback: PageGeom) -> PageGeom {
         }
     }
     geom
+}
+
+/// Normalise an ODF `table:formula` to a bare expression: strip the OpenFormula
+/// namespace prefix (`of:` / any `prefix:` before the `=`) and the leading `=`,
+/// trim, and drop empties. `of:=SUM([.A1:.A9])` ⇒ `SUM([.A1:.A9])`. The OpenFormula
+/// cell-reference syntax (`[.A1]`) is preserved verbatim — the model stores the
+/// authored expression, not a translated one.
+fn odf_formula_expr(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    // A leading `namespace:` qualifier precedes the `=` in ODF (`of:=…`,
+    // `oooc:=…`). Strip it only when it sits before the first `=`.
+    let body = match (s.find(':'), s.find('=')) {
+        (Some(c), Some(e)) if c < e => &s[c + 1..],
+        _ => s,
+    };
+    let expr = body.strip_prefix('=').unwrap_or(body).trim();
+    (!expr.is_empty()).then(|| expr.to_string())
 }
 
 /// Parse an ODF length like `12pt`, `0.5cm`, `14px` to points (best effort).
@@ -11490,6 +11826,272 @@ mod tests {
             })
             .expect("the 'shaded' run");
         assert_eq!(run.style.background, Some([0.0, 1.0, 0.0]));
+    }
+
+    // ── ODF → model (links / strike / highlight / inline images / formulas / groups) ──
+
+    /// Build an ODT zip from a `content.xml` body and optional `(path, bytes)`
+    /// media parts, returning the lowered [`Document`].
+    fn odt_model(content: &str, media: &[(&str, Vec<u8>)]) -> Document {
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
+        z.add_stored("content.xml", content.as_bytes());
+        for (path, bytes) in media {
+            z.add_stored(path, bytes);
+        }
+        office_to_model(&z.finish()).expect("odt → model")
+    }
+
+    #[test]
+    fn odt_model_hyperlink_becomes_link() {
+        // `<text:a xlink:href>` → `Inline::Link` (external URL) wrapping its runs.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:xlink="xl">
+  <office:body><office:text>
+    <text:p>see <text:a xlink:href="https://example.com/">our site</text:a> now</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        let (href, children) = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Link { href, children } => Some((href, children)),
+                _ => None,
+            })
+            .expect("an Inline::Link in the model");
+        assert_eq!(
+            href,
+            model::LinkTarget::Url("https://example.com/".to_string())
+        );
+        let link_text: String = children
+            .iter()
+            .filter_map(|c| match c {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(link_text, "our site");
+    }
+
+    #[test]
+    fn odt_model_internal_anchor_link_targets_document_start() {
+        // A `#bookmark` reference has no model-addressable page → page 0 (matches
+        // the DOCX `w:anchor` behaviour), and never drops the link.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:xlink="xl">
+  <office:body><office:text>
+    <text:p><text:a xlink:href="#Section2">jump</text:a></text:p>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let href = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Link { href, .. } => Some(href),
+                _ => None,
+            })
+            .expect("an Inline::Link");
+        assert_eq!(href, model::LinkTarget::Page(0));
+    }
+
+    #[test]
+    fn odt_model_strike_and_highlight_from_span_style() {
+        // `style:text-line-through-style` ≠ none → CharStyle.strike;
+        // `fo:background-color` on the text style → CharStyle.background.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:style style:name="T1" style:family="text">
+      <style:text-properties style:text-line-through-style="solid" fo:background-color="#00FF00"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:p>x <text:span text:style-name="T1">marked</text:span> y</text:p>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let run = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text == "marked" => Some(r),
+                _ => None,
+            })
+            .expect("the 'marked' run");
+        assert!(run.style.strike, "line-through carried into the model");
+        assert_eq!(
+            run.style.background,
+            Some([0.0, 1.0, 0.0]),
+            "fo:background-color → RGB highlight"
+        );
+        // A run outside the span keeps the defaults (regression guard).
+        let plain = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text.trim() == "x" => Some(r),
+                _ => None,
+            })
+            .expect("the leading run");
+        assert!(!plain.style.strike && plain.style.background.is_none());
+    }
+
+    #[test]
+    fn odt_model_inline_image_lands_in_resources() {
+        // `<draw:frame><draw:image xlink:href>` inside a paragraph → an
+        // `Inline::Image` whose bytes are interned in `Document.resources`.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:draw="d" xmlns:xlink="xl">
+  <office:body><office:text>
+    <text:p>pic <draw:frame><draw:image xlink:href="Pictures/p.png"/></draw:frame></text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[("Pictures/p.png", red_png())]);
+        let img = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Image(r) => Some(r),
+                _ => None,
+            })
+            .expect("an Inline::Image in the model");
+        assert!(
+            model.resources.images.contains_key(&img.resource),
+            "image bytes interned in the resource table"
+        );
+        assert_eq!(model.resources.images[&img.resource].format, "png");
+    }
+
+    #[test]
+    fn ods_model_preserves_formula_with_cached_value() {
+        // `table:formula="of:=SUM([.A1:.A2])"` + `office:value="30"`: the model
+        // keeps the bare expression AND the cached numeric result.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t">
+  <office:body><office:spreadsheet>
+    <table:table table:name="Calc">
+      <table:table-row><table:table-cell office:value-type="float" office:value="10"><text:p>10</text:p></table:table-cell></table:table-row>
+      <table:table-row><table:table-cell office:value-type="float" office:value="20"><text:p>20</text:p></table:table-cell></table:table-row>
+      <table:table-row><table:table-cell table:formula="of:=SUM([.A1:.A2])" office:value-type="float" office:value="30"><text:p>30</text:p></table:table-cell></table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.spreadsheet",
+        );
+        z.add_stored("content.xml", content.as_bytes());
+        let model = office_to_model(&z.finish()).expect("ods → model");
+
+        let sheet = match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Sheet(sb) => &sb.sheets[0],
+            other => panic!("expected a Sheet block, got {other:?}"),
+        };
+        let cell = &sheet.rows[2].cells[0];
+        assert_eq!(
+            cell.formula.as_deref(),
+            Some("SUM([.A1:.A2])"),
+            "of: prefix and leading = stripped"
+        );
+        assert_eq!(cell.value, model::CellValue::Number(30.0));
+        // A literal cell carries no formula (regression guard).
+        assert!(sheet.rows[0].cells[0].formula.is_none());
+    }
+
+    /// Build a one-page ODP (`width`×`height` cm slide) from a `draw:page` body and
+    /// optional media, returning its lowered [`Slide`].
+    fn odp_model_slide(page_body: &str, media: &[(&str, Vec<u8>)]) -> Slide {
+        let content = format!(
+            r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t" xmlns:svg="sv" xmlns:xlink="xl" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:page-layout style:name="PL"><style:page-layout-properties fo:page-width="25.4cm" fo:page-height="19.05cm" fo:margin="0cm"/></style:page-layout>
+  </office:automatic-styles>
+  <office:body><office:presentation>
+    <draw:page draw:name="p1">{page_body}</draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#
+        );
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.presentation",
+        );
+        z.add_stored("content.xml", content.as_bytes());
+        for (path, bytes) in media {
+            z.add_stored(path, bytes);
+        }
+        let model = office_to_model(&z.finish()).expect("odp → model");
+        match model.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Slide(sb) => sb.slides.into_iter().next().expect("one slide"),
+            other => panic!("expected a Slide block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn odp_model_positioned_frame_becomes_shape_with_geometry() {
+        // A positioned `draw:frame` (svg:x=2cm, y=1cm, w=8cm, h=3cm) holding a
+        // text box → a free shape carrying its lower-left-origin frame. Slide is
+        // 25.4×19.05cm = 720×540pt; 1cm = 28.3464567pt.
+        let slide = odp_model_slide(
+            r#"<draw:frame svg:x="2cm" svg:y="1cm" svg:width="8cm" svg:height="3cm">
+                 <draw:text-box><text:p>Boxed</text:p></draw:text-box>
+               </draw:frame>"#,
+            &[],
+        );
+        assert_eq!(slide.shapes.len(), 1, "positioned frame → free shape");
+        let s = &slide.shapes[0];
+        let f = s.frame.expect("frame set from svg geometry");
+        let cm = 28.3464567;
+        assert!((f.x - 2.0 * cm).abs() < 1e-3, "x: {}", f.x);
+        assert!((f.w - 8.0 * cm).abs() < 1e-3, "w: {}", f.w);
+        assert!((f.h - 3.0 * cm).abs() < 1e-3, "h: {}", f.h);
+        // top y=1cm, h=3cm → lower-left y = 540 - (1+3)cm.
+        let exp_y = 540.0 - (1.0 + 3.0) * cm;
+        assert!((f.y - exp_y).abs() < 1e-3, "y: {} exp {}", f.y, exp_y);
+        assert_eq!(block_text(s), "Boxed");
+    }
+
+    #[test]
+    fn odp_model_frame_image_becomes_image_shape() {
+        // A positioned frame wrapping a `draw:image` → an image shape, the bytes
+        // interned in the document resources.
+        let slide = odp_model_slide(
+            r#"<draw:frame svg:x="1cm" svg:y="1cm" svg:width="4cm" svg:height="4cm">
+                 <draw:image xlink:href="Pictures/x.png"/>
+               </draw:frame>"#,
+            &[("Pictures/x.png", red_png())],
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        let s = &slide.shapes[0];
+        assert!(s.frame.is_some(), "image shape positioned");
+        assert!(
+            matches!(s.kind, BlockKind::Image(_)),
+            "pure picture frame → Image block, got {:?}",
+            s.kind
+        );
+    }
+
+    #[test]
+    fn odp_model_group_composes_child_frame_positions() {
+        // A `draw:g` group translated to (10cm, 5cm) holds a frame at child
+        // (1cm,1cm); the child's slide position is the group offset + its own.
+        // BOTH a directly-placed frame and the grouped one appear (no drop).
+        let slide = odp_model_slide(
+            r#"<draw:frame svg:x="0cm" svg:y="0cm" svg:width="2cm" svg:height="2cm">
+                 <draw:text-box><text:p>Top</text:p></draw:text-box>
+               </draw:frame>
+               <draw:g svg:x="10cm" svg:y="5cm">
+                 <draw:frame svg:x="1cm" svg:y="1cm" svg:width="3cm" svg:height="3cm">
+                   <draw:text-box><text:p>Grouped</text:p></draw:text-box>
+                 </draw:frame>
+               </draw:g>"#,
+            &[],
+        );
+        assert_eq!(slide.shapes.len(), 2, "ungrouped + grouped both present");
+        let cm = 28.3464567;
+        let grouped = slide
+            .shapes
+            .iter()
+            .find(|s| block_text(s) == "Grouped")
+            .expect("the grouped shape");
+        let f = grouped.frame.expect("grouped frame");
+        // x = (10 + 1)cm; top y = (5 + 1)cm, h = 3cm → lower-left = 540 - (6+3)cm.
+        assert!((f.x - 11.0 * cm).abs() < 1e-3, "x: {}", f.x);
+        let exp_y = 540.0 - (6.0 + 3.0) * cm;
+        assert!((f.y - exp_y).abs() < 1e-3, "y: {} exp {}", f.y, exp_y);
     }
 
     #[test]
