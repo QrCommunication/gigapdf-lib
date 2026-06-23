@@ -23,8 +23,8 @@ use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
 use crate::model::{
     Align, Block, BlockKind, BorderStyle, Cell, CharStyle, Document, Heading, ImageRef, Inline,
-    LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Shape, Sheet, SheetBlock, SheetCell,
-    Slide, SlideBlock, Table, TextBox, VAlign,
+    LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Section, Shape, Sheet, SheetBlock,
+    SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
 };
 use crate::model::{CellValue, PlaceholderRole};
 
@@ -3688,6 +3688,767 @@ fn md_tidy(s: String) -> String {
     out
 }
 
+// ════════════════════════════════════ CSV ════════════════════════════════════
+
+/// Serialize a [`Document`] to **RFC 4180** CSV text.
+///
+/// Each [`Sheet`] (from every `Block::Sheet`) becomes a block of CSV rows —
+/// one line per [`SheetRow`](crate::model::SheetRow), cells joined by `,`, lines
+/// terminated by `\r\n`. When the document has **no** spreadsheet content, the
+/// document's flowing [`Table`]s are used instead, with each cell reduced to its
+/// plain text.
+///
+/// Multiple sheets/tables are concatenated into a single CSV stream. Each one
+/// is preceded by an RFC-4180-quotable comment row naming it (`# Sheet: <name>`
+/// or `# Table N`) and separated from the previous block by a blank line, so a
+/// human reader can tell the boundaries apart while a lenient parser still sees
+/// well-formed records. A document with neither sheets nor tables yields an
+/// empty string.
+pub fn csv_from_model(doc: &Document) -> String {
+    let sheets = collect_sheets(doc);
+    if !sheets.is_empty() {
+        return csv_from_sheets(&sheets);
+    }
+    let tables = collect_tables(doc);
+    if !tables.is_empty() {
+        return csv_from_tables(&tables);
+    }
+    String::new()
+}
+
+/// Quote a single field per RFC 4180: wrap in `"…"` (doubling any embedded `"`)
+/// only when the field contains a comma, quote, CR or LF; otherwise emit it raw.
+fn csv_field(field: &str) -> String {
+    let needs_quote = field
+        .chars()
+        .any(|c| c == ',' || c == '"' || c == '\r' || c == '\n');
+    if !needs_quote {
+        return field.to_string();
+    }
+    let mut out = String::with_capacity(field.len() + 2);
+    out.push('"');
+    for ch in field.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// Join one record's already-stringified fields with `,` and the RFC-4180 CRLF
+/// terminator.
+fn csv_record(fields: &[String]) -> String {
+    let mut line: String = fields
+        .iter()
+        .map(|f| csv_field(f))
+        .collect::<Vec<_>>()
+        .join(",");
+    line.push_str("\r\n");
+    line
+}
+
+fn csv_from_sheets(sheets: &[Sheet]) -> String {
+    let mut out = String::new();
+    for (i, sheet) in sheets.iter().enumerate() {
+        if i > 0 {
+            // Blank record separating consecutive sheets.
+            out.push_str("\r\n");
+        }
+        // A naming comment row; the whole field is quoted if it contains a comma.
+        let label = if sheet.name.is_empty() {
+            format!("# Sheet {}", i + 1)
+        } else {
+            format!("# Sheet: {}", sheet.name)
+        };
+        out.push_str(&csv_record(&[label]));
+        for row in &sheet.rows {
+            let fields: Vec<String> = row.cells.iter().map(|c| cell_display(&c.value)).collect();
+            out.push_str(&csv_record(&fields));
+        }
+    }
+    out
+}
+
+fn csv_from_tables(tables: &[Table]) -> String {
+    let mut out = String::new();
+    for (i, table) in tables.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\r\n");
+        }
+        out.push_str(&csv_record(&[format!("# Table {}", i + 1)]));
+        for row in &table.rows {
+            let fields: Vec<String> = row.cells.iter().map(cell_plain_text).collect();
+            out.push_str(&csv_record(&fields));
+        }
+    }
+    out
+}
+
+/// A table cell's plain text: every paragraph the cell flattens to, joined by a
+/// single space (a CSV field is one logical line, so embedded paragraph breaks
+/// are collapsed rather than emitting raw newlines).
+fn cell_plain_text(cell: &Cell) -> String {
+    let mut paras: Vec<Paragraph> = Vec::new();
+    for b in &cell.blocks {
+        collect_paras(b, &mut paras);
+    }
+    paras
+        .iter()
+        .map(para_plain_text)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A paragraph's plain text: the concatenation of its run texts (links recurse
+/// into their children); non-text inlines contribute nothing.
+fn para_plain_text(para: &Paragraph) -> String {
+    let mut out = String::new();
+    inlines_plain_text(&para.runs, &mut out);
+    out
+}
+
+fn inlines_plain_text(runs: &[Inline], out: &mut String) {
+    for r in runs {
+        match r {
+            Inline::Run(run) => out.push_str(&run.text),
+            Inline::Link { children, .. } => inlines_plain_text(children, out),
+            Inline::LineBreak => out.push(' '),
+            Inline::Image(_) => {}
+        }
+    }
+}
+
+/// Collect every flowing [`Table`] from a document's `Block::Table` blocks (in
+/// document order across all pages), descending into text boxes, lists, and the
+/// cells of outer tables.
+fn collect_tables(doc: &Document) -> Vec<Table> {
+    let mut out = Vec::new();
+    for section in &doc.sections {
+        for page in &section.pages {
+            for block in &page.blocks {
+                collect_tables_block(block, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn collect_tables_block(block: &Block, out: &mut Vec<Table>) {
+    match &block.kind {
+        BlockKind::Table(table) => {
+            out.push(table.clone());
+            // Nested tables inside cells are emitted after their parent.
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for b in &cell.blocks {
+                        collect_tables_block(b, out);
+                    }
+                }
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            for b in &tb.blocks {
+                collect_tables_block(b, out);
+            }
+        }
+        BlockKind::List(list) => {
+            for item in &list.items {
+                for b in &item.blocks {
+                    collect_tables_block(b, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ════════════════════════════════════ EPUB ═══════════════════════════════════
+
+/// Serialize a [`Document`] to a valid **EPUB 3** publication (a ZIP container).
+///
+/// Layout (the `mimetype` part is **stored uncompressed and written first**, as
+/// the OCF spec requires so readers can sniff the format from the archive head):
+///
+/// ```text
+/// mimetype                      (application/epub+zip, stored)
+/// META-INF/container.xml        (points at the OPF)
+/// OEBPS/content.opf             (metadata from DocMeta + manifest + spine)
+/// OEBPS/nav.xhtml               (EPUB 3 navigation document)
+/// OEBPS/toc.ncx                 (EPUB 2 NCX, for back-compat)
+/// OEBPS/text-N.xhtml            (one reflowable chapter per Section)
+/// OEBPS/images/img-<key>.<ext>  (each ResourceTable image, embedded once)
+/// ```
+///
+/// Each [`Section`] becomes one XHTML chapter built from its blocks
+/// (headings/paragraphs/lists/tables/sheets/images/shapes) as strict,
+/// well-formed XHTML; images are referenced by relative path and declared in the
+/// manifest with their real media-type. The document always has at least one
+/// spine item (an empty chapter is emitted for an empty document) so the result
+/// is spec-valid.
+pub fn epub_from_model(doc: &Document) -> Vec<u8> {
+    let mut zip = ZipWriter::new();
+
+    // 1. mimetype — MUST be first and stored (uncompressed).
+    zip.add_stored("mimetype", b"application/epub+zip");
+
+    // 2. OCF container pointing at the package document.
+    zip.add_deflated("META-INF/container.xml", EPUB_CONTAINER_XML.as_bytes());
+
+    // 3. Build chapters (one per section; guarantee at least one).
+    let chapters = epub_chapters(doc);
+
+    // 4. Embedded images, sorted by key for deterministic output.
+    let images = epub_images(doc);
+
+    // 5. Package document, navigation, NCX.
+    let opf = epub_opf(doc, &chapters, &images);
+    let nav = epub_nav(doc, &chapters);
+    let ncx = epub_ncx(doc, &chapters);
+    zip.add_deflated("OEBPS/content.opf", opf.as_bytes());
+    zip.add_deflated("OEBPS/nav.xhtml", nav.as_bytes());
+    zip.add_deflated("OEBPS/toc.ncx", ncx.as_bytes());
+
+    // 6. Chapter XHTML files.
+    for ch in &chapters {
+        zip.add_deflated(&format!("OEBPS/{}", ch.file), ch.xhtml.as_bytes());
+    }
+
+    // 7. Image blobs (already-compressed formats → stored).
+    for img in &images {
+        zip.add_stored(&format!("OEBPS/{}", img.path), &img.bytes);
+    }
+
+    zip.finish()
+}
+
+const EPUB_CONTAINER_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\
+<rootfiles>\
+<rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/>\
+</rootfiles></container>";
+
+/// A built chapter: its OPF item id, its file name (relative to `OEBPS/`), the
+/// title used for the table of contents, and the rendered XHTML.
+struct EpubChapter {
+    id: String,
+    file: String,
+    title: String,
+    xhtml: String,
+}
+
+/// A resolved image for embedding: OPF item id, path (relative to `OEBPS/`),
+/// media-type, and bytes.
+struct EpubImage {
+    id: String,
+    path: String,
+    media_type: String,
+    bytes: Vec<u8>,
+}
+
+/// Map an [`ImageResource`](crate::model::ImageResource) format tag to its
+/// `(media-type, file extension)`.
+fn epub_image_mime(format: &str) -> (&'static str, &'static str) {
+    match format.to_ascii_lowercase().as_str() {
+        "jpeg" | "jpg" => ("image/jpeg", "jpg"),
+        "gif" => ("image/gif", "gif"),
+        "webp" => ("image/webp", "webp"),
+        "svg" => ("image/svg+xml", "svg"),
+        _ => ("image/png", "png"),
+    }
+}
+
+fn epub_images(doc: &Document) -> Vec<EpubImage> {
+    // `ResourceTable::images` is a BTreeMap, so iteration is already key-ordered.
+    doc.resources
+        .images
+        .iter()
+        .map(|(key, res)| {
+            let (media_type, ext) = epub_image_mime(&res.format);
+            EpubImage {
+                id: format!("img-{key}"),
+                path: format!("images/img-{key}.{ext}"),
+                media_type: media_type.to_string(),
+                bytes: res.bytes.clone(),
+            }
+        })
+        .collect()
+}
+
+/// One chapter per section. A chapter title is the first heading's text, else
+/// `"Section N"`. An empty document still yields a single empty chapter so the
+/// spine is never empty.
+fn epub_chapters(doc: &Document) -> Vec<EpubChapter> {
+    let mut chapters = Vec::new();
+    for (i, section) in doc.sections.iter().enumerate() {
+        let n = i + 1;
+        let title = section_title(section).unwrap_or_else(|| format!("Section {n}"));
+        let xhtml = epub_chapter_xhtml(doc, section, &title);
+        chapters.push(EpubChapter {
+            id: format!("chap-{n}"),
+            file: format!("text-{n}.xhtml"),
+            title,
+            xhtml,
+        });
+    }
+    if chapters.is_empty() {
+        let title = doc
+            .meta
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Document".to_string());
+        let xhtml = epub_empty_chapter_xhtml(doc, &title);
+        chapters.push(EpubChapter {
+            id: "chap-1".to_string(),
+            file: "text-1.xhtml".to_string(),
+            title,
+            xhtml,
+        });
+    }
+    chapters
+}
+
+/// The text of a section's first heading block, if any (used as a chapter title).
+fn section_title(section: &Section) -> Option<String> {
+    for page in &section.pages {
+        for block in &page.blocks {
+            if let BlockKind::Heading(h) = &block.kind {
+                let t = para_plain_text(&h.para);
+                if !t.trim().is_empty() {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The BCP-47 language for the publication: the document's, else `"en"`.
+fn epub_lang(doc: &Document) -> String {
+    doc.meta
+        .lang
+        .clone()
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| "en".to_string())
+}
+
+/// XHTML document scaffold shared by all chapters: a strict XHTML5 skeleton with
+/// the EPUB namespace, the publication language, and the chapter `title`. `body`
+/// is the already-escaped serialized block content.
+fn epub_xhtml_doc(lang: &str, title: &str, body: &str) -> String {
+    let mut t = String::new();
+    esc(title, &mut t);
+    let lang_attr = {
+        let mut s = String::new();
+        esc(lang, &mut s);
+        s
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE html>\n\
+<html xmlns=\"http://www.w3.org/1999/xhtml\" \
+xmlns:epub=\"http://www.idpf.org/2007/ops\" \
+xml:lang=\"{lang_attr}\" lang=\"{lang_attr}\">\
+<head><meta charset=\"utf-8\"/><title>{t}</title></head>\
+<body>{body}</body></html>"
+    )
+}
+
+fn epub_empty_chapter_xhtml(doc: &Document, title: &str) -> String {
+    let lang = epub_lang(doc);
+    let mut body = String::from("<h1>");
+    esc(title, &mut body);
+    body.push_str("</h1>");
+    epub_xhtml_doc(&lang, title, &body)
+}
+
+fn epub_chapter_xhtml(doc: &Document, section: &Section, title: &str) -> String {
+    let lang = epub_lang(doc);
+    let mut body = String::new();
+    if let Some(header) = &section.header {
+        body.push_str("<header>");
+        xhtml_blocks(header, doc, &mut body);
+        body.push_str("</header>");
+    }
+    for page in &section.pages {
+        xhtml_blocks(&page.blocks, doc, &mut body);
+    }
+    if let Some(footer) = &section.footer {
+        body.push_str("<footer>");
+        xhtml_blocks(footer, doc, &mut body);
+        body.push_str("</footer>");
+    }
+    if body.is_empty() {
+        body.push_str("<h1>");
+        esc(title, &mut body);
+        body.push_str("</h1>");
+    }
+    epub_xhtml_doc(&lang, title, &body)
+}
+
+// ───────────────────────── model → strict XHTML (EPUB) ──────────────────────
+
+fn xhtml_blocks(blocks: &[Block], doc: &Document, out: &mut String) {
+    for b in blocks {
+        xhtml_block(b, doc, out);
+    }
+}
+
+fn xhtml_block(block: &Block, doc: &Document, out: &mut String) {
+    match &block.kind {
+        BlockKind::Paragraph(p) => {
+            out.push_str(&format!("<p{}>", xhtml_align_attr(p)));
+            xhtml_inlines(&p.runs, doc, out);
+            out.push_str("</p>");
+        }
+        BlockKind::Heading(h) => {
+            let lvl = h.level.clamp(1, 6);
+            out.push_str(&format!("<h{lvl}{}>", xhtml_align_attr(&h.para)));
+            xhtml_inlines(&h.para.runs, doc, out);
+            out.push_str(&format!("</h{lvl}>"));
+        }
+        BlockKind::List(list) => xhtml_list(list, doc, out),
+        BlockKind::Table(table) => xhtml_table(table, doc, out),
+        BlockKind::Image(img) => {
+            out.push_str("<p>");
+            xhtml_image(img, doc, out);
+            out.push_str("</p>");
+        }
+        BlockKind::Shape(shape) => xhtml_shape(shape, out),
+        BlockKind::TextBox(tb) => {
+            out.push_str("<div>");
+            xhtml_blocks(&tb.blocks, doc, out);
+            out.push_str("</div>");
+        }
+        BlockKind::Sheet(sb) => {
+            for s in &sb.sheets {
+                xhtml_sheet(s, out);
+            }
+        }
+        BlockKind::Slide(sb) => {
+            for slide in &sb.slides {
+                out.push_str("<section>");
+                for ph in &slide.placeholders {
+                    xhtml_block(&ph.block, doc, out);
+                }
+                out.push_str("</section>");
+            }
+        }
+    }
+}
+
+/// A `style="text-align:…"` attribute when the paragraph alignment is not the
+/// default (left), else empty.
+fn xhtml_align_attr(p: &Paragraph) -> String {
+    match p.style.align {
+        Align::Left => String::new(),
+        Align::Center => " style=\"text-align:center\"".to_string(),
+        Align::Right => " style=\"text-align:right\"".to_string(),
+        Align::Justify => " style=\"text-align:justify\"".to_string(),
+    }
+}
+
+fn xhtml_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
+    for r in runs {
+        match r {
+            Inline::Run(run) => {
+                if run.text.is_empty() {
+                    continue;
+                }
+                let style = xhtml_char_css(&run.style);
+                if style.is_empty() {
+                    esc(&run.text, out);
+                } else {
+                    out.push_str("<span style=\"");
+                    esc(&style, out);
+                    out.push_str("\">");
+                    esc(&run.text, out);
+                    out.push_str("</span>");
+                }
+            }
+            Inline::LineBreak => out.push_str("<br/>"),
+            Inline::Image(img) => xhtml_image(img, doc, out),
+            Inline::Link { href, children } => {
+                let target = match href {
+                    LinkTarget::Url(u) => u.clone(),
+                    LinkTarget::Page(p) => format!("#page{p}"),
+                };
+                out.push_str("<a href=\"");
+                esc(&target, out);
+                out.push_str("\">");
+                xhtml_inlines(children, doc, out);
+                out.push_str("</a>");
+            }
+        }
+    }
+}
+
+/// Inline CSS for a [`CharStyle`] (the result is XML-escaped by the caller when
+/// emitted into an attribute).
+fn xhtml_char_css(style: &CharStyle) -> String {
+    let mut css = String::new();
+    if !style.family.is_empty() {
+        css.push_str(&format!("font-family:'{}'", style.family));
+    }
+    if style.size_pt > 0.0 {
+        if !css.is_empty() {
+            css.push(';');
+        }
+        css.push_str(&format!("font-size:{}pt", num(style.size_pt)));
+    }
+    if style.bold {
+        css.push_str(";font-weight:bold");
+    }
+    if style.italic {
+        css.push_str(";font-style:italic");
+    }
+    let mut decos = Vec::new();
+    if style.underline {
+        decos.push("underline");
+    }
+    if style.strike {
+        decos.push("line-through");
+    }
+    if !decos.is_empty() {
+        css.push_str(&format!(";text-decoration:{}", decos.join(" ")));
+    }
+    if let Some(c) = visible_color(style) {
+        css.push_str(&format!(";color:#{c}"));
+    }
+    css.trim_start_matches(';').to_string()
+}
+
+fn xhtml_list(list: &List, doc: &Document, out: &mut String) {
+    let tag = if list.ordered { "ol" } else { "ul" };
+    let type_attr = if list.ordered {
+        match list.marker {
+            ListMarker::LowerAlpha => " type=\"a\"",
+            ListMarker::UpperAlpha => " type=\"A\"",
+            ListMarker::LowerRoman => " type=\"i\"",
+            ListMarker::UpperRoman => " type=\"I\"",
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    out.push_str(&format!("<{tag}{type_attr}>"));
+    for item in &list.items {
+        out.push_str("<li>");
+        xhtml_blocks(&item.blocks, doc, out);
+        out.push_str("</li>");
+    }
+    out.push_str(&format!("</{tag}>"));
+}
+
+fn xhtml_table(table: &Table, doc: &Document, out: &mut String) {
+    out.push_str("<table>");
+    for row in &table.rows {
+        out.push_str("<tr>");
+        for cell in &row.cells {
+            let mut attrs = String::new();
+            if cell.col_span > 1 {
+                attrs.push_str(&format!(" colspan=\"{}\"", cell.col_span));
+            }
+            if cell.row_span > 1 {
+                attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
+            }
+            if let Some(rgb) = cell.shading {
+                attrs.push_str(&format!(" style=\"background-color:#{}\"", hex(rgb)));
+            }
+            out.push_str(&format!("<td{attrs}>"));
+            xhtml_blocks(&cell.blocks, doc, out);
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</table>");
+}
+
+fn xhtml_sheet(sheet: &Sheet, out: &mut String) {
+    out.push_str("<table>");
+    for row in &sheet.rows {
+        out.push_str("<tr>");
+        for cell in &row.cells {
+            let style = match cell.fill {
+                Some(rgb) => format!(" style=\"background-color:#{}\"", hex(rgb)),
+                None => String::new(),
+            };
+            out.push_str(&format!("<td{style}>"));
+            esc(&cell_display(&cell.value), out);
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</table>");
+}
+
+/// An image as a relative-path `<img/>` referencing its embedded OEBPS file.
+/// Resources absent from the table (or that resolve to no path) contribute
+/// nothing, so a dangling reference never produces a broken element.
+fn xhtml_image(img: &ImageRef, doc: &Document, out: &mut String) {
+    let Some(res) = doc.resources.images.get(&img.resource) else {
+        return;
+    };
+    let (_, ext) = epub_image_mime(&res.format);
+    let path = format!("images/img-{}.{ext}", img.resource);
+    let mut alt = String::new();
+    esc(img.alt.as_deref().unwrap_or(""), &mut alt);
+    out.push_str(&format!("<img src=\"{path}\" alt=\"{alt}\"/>"));
+}
+
+fn xhtml_shape(shape: &Shape, out: &mut String) {
+    // A reflowable document can't position a vector path; emit a small box that
+    // carries the fill colour so the shape isn't silently lost.
+    let mut style =
+        String::from("display:inline-block;width:1em;height:1em;border:1px solid #888");
+    if let Some(rgb) = shape.fill {
+        style.push_str(&format!(";background:#{}", hex(rgb)));
+    }
+    out.push_str(&format!("<span style=\"{style}\"></span>"));
+}
+
+// ──────────────────────── OPF / nav / NCX (EPUB metadata) ────────────────────
+
+fn epub_opf(doc: &Document, chapters: &[EpubChapter], images: &[EpubImage]) -> String {
+    let lang = epub_lang(doc);
+    // A stable, deterministic identifier (no clock/UUID source in the engine).
+    let ident = "urn:gigapdf:document";
+
+    let mut meta = String::new();
+    {
+        let title = doc
+            .meta
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Document".to_string());
+        meta.push_str("<dc:identifier id=\"pub-id\">");
+        esc(ident, &mut meta);
+        meta.push_str("</dc:identifier>");
+        meta.push_str("<dc:title>");
+        esc(&title, &mut meta);
+        meta.push_str("</dc:title>");
+        meta.push_str("<dc:language>");
+        esc(&lang, &mut meta);
+        meta.push_str("</dc:language>");
+        if let Some(author) = doc.meta.author.as_ref().filter(|a| !a.is_empty()) {
+            meta.push_str("<dc:creator>");
+            esc(author, &mut meta);
+            meta.push_str("</dc:creator>");
+        }
+        if let Some(subject) = doc.meta.subject.as_ref().filter(|s| !s.is_empty()) {
+            meta.push_str("<dc:subject>");
+            esc(subject, &mut meta);
+            meta.push_str("</dc:subject>");
+        }
+        for kw in &doc.meta.keywords {
+            if kw.is_empty() {
+                continue;
+            }
+            meta.push_str("<dc:subject>");
+            esc(kw, &mut meta);
+            meta.push_str("</dc:subject>");
+        }
+        // EPUB 3 requires a dcterms:modified; a fixed epoch keeps output stable.
+        meta.push_str("<meta property=\"dcterms:modified\">1980-01-01T00:00:00Z</meta>");
+    }
+
+    let mut manifest = String::new();
+    manifest.push_str(
+        "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>",
+    );
+    manifest
+        .push_str("<item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>");
+    for ch in chapters {
+        manifest.push_str(&format!(
+            "<item id=\"{}\" href=\"{}\" media-type=\"application/xhtml+xml\"/>",
+            ch.id, ch.file
+        ));
+    }
+    for img in images {
+        manifest.push_str(&format!(
+            "<item id=\"{}\" href=\"{}\" media-type=\"{}\"/>",
+            img.id, img.path, img.media_type
+        ));
+    }
+
+    let mut spine = String::new();
+    for ch in chapters {
+        spine.push_str(&format!("<itemref idref=\"{}\"/>", ch.id));
+    }
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" \
+unique-identifier=\"pub-id\" xml:lang=\"{lang}\">\
+<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">{meta}</metadata>\
+<manifest>{manifest}</manifest>\
+<spine toc=\"ncx\">{spine}</spine>\
+</package>",
+        lang = {
+            let mut s = String::new();
+            esc(&lang, &mut s);
+            s
+        }
+    )
+}
+
+fn epub_nav(doc: &Document, chapters: &[EpubChapter]) -> String {
+    let lang = epub_lang(doc);
+    let mut list = String::new();
+    for ch in chapters {
+        list.push_str("<li><a href=\"");
+        esc(&ch.file, &mut list);
+        list.push_str("\">");
+        esc(&ch.title, &mut list);
+        list.push_str("</a></li>");
+    }
+    let body =
+        format!("<nav epub:type=\"toc\" id=\"toc\"><h1>Table of Contents</h1><ol>{list}</ol></nav>");
+    epub_xhtml_doc(&lang, "Table of Contents", &body)
+}
+
+fn epub_ncx(doc: &Document, chapters: &[EpubChapter]) -> String {
+    let lang = epub_lang(doc);
+    let title = doc
+        .meta
+        .title
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "Document".to_string());
+    let mut nav_points = String::new();
+    for (i, ch) in chapters.iter().enumerate() {
+        let order = i + 1;
+        nav_points.push_str(&format!(
+            "<navPoint id=\"nav-{order}\" playOrder=\"{order}\"><navLabel><text>"
+        ));
+        esc(&ch.title, &mut nav_points);
+        nav_points.push_str("</text></navLabel><content src=\"");
+        esc(&ch.file, &mut nav_points);
+        nav_points.push_str("\"/></navPoint>");
+    }
+    let mut title_esc = String::new();
+    esc(&title, &mut title_esc);
+    let mut lang_esc = String::new();
+    esc(&lang, &mut lang_esc);
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\" xml:lang=\"{lang_esc}\">\
+<head>\
+<meta name=\"dtb:uid\" content=\"urn:gigapdf:document\"/>\
+<meta name=\"dtb:depth\" content=\"1\"/>\
+<meta name=\"dtb:totalPageCount\" content=\"0\"/>\
+<meta name=\"dtb:maxPageNumber\" content=\"0\"/>\
+</head>\
+<docTitle><text>{title_esc}</text></docTitle>\
+<navMap>{nav_points}</navMap>\
+</ncx>"
+    )
+}
+
 // ═══════════════════════════════════ tests ═══════════════════════════════════
 
 #[cfg(test)]
@@ -4512,5 +5273,562 @@ mod tests {
         assert!(!content.contains("fo:font-family"), "no font props by default");
         assert!(!content.contains("fo:border"), "no border by default");
         assert!(!content.contains("style:row-height"), "no row height by default");
+    }
+
+    // ─────────────────────────────── CSV ───────────────────────────────
+
+    /// Build a one-sheet document from rows of `&str` cells (text values).
+    fn csv_sheet_doc(name: &str, rows: &[&[&str]]) -> Document {
+        let sheet = Sheet {
+            name: name.to_string(),
+            rows: rows
+                .iter()
+                .map(|r| SheetRow {
+                    cells: r
+                        .iter()
+                        .map(|c| SheetCell {
+                            value: CellValue::Text((*c).to_string()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    height: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Sheet(SheetBlock {
+                            sheets: vec![sheet],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn csv_quotes_fields_with_special_characters() {
+        // A comma, a quote, and a newline each force RFC-4180 quoting; a plain
+        // field stays raw.
+        let doc = csv_sheet_doc("", &[&["plain", "a,b", "she said \"hi\"", "line1\nline2"]]);
+        let csv = csv_from_model(&doc);
+        // Whole stream: header comment row (no name → "# Sheet 1"), then the one
+        // data record. The embedded LF stays *literal inside the quoted field*
+        // (RFC 4180 §2.6) — it is NOT a record separator — so only the trailing
+        // CRLF terminates the record.
+        assert_eq!(
+            csv,
+            "# Sheet 1\r\nplain,\"a,b\",\"she said \"\"hi\"\"\",\"line1\nline2\"\r\n"
+        );
+        // The record-terminating CRLF must be present.
+        assert!(csv.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn csv_uses_crlf_and_typed_values() {
+        let sheet = Sheet {
+            name: "Data".to_string(),
+            rows: vec![
+                SheetRow {
+                    cells: vec![
+                        SheetCell {
+                            value: CellValue::Text("Label".to_string()),
+                            ..Default::default()
+                        },
+                        SheetCell {
+                            value: CellValue::Number(42.5),
+                            ..Default::default()
+                        },
+                    ],
+                    height: None,
+                },
+                SheetRow {
+                    cells: vec![
+                        SheetCell {
+                            value: CellValue::Bool(true),
+                            ..Default::default()
+                        },
+                        SheetCell {
+                            value: CellValue::Empty,
+                            ..Default::default()
+                        },
+                    ],
+                    height: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Sheet(SheetBlock {
+                            sheets: vec![sheet],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let csv = csv_from_model(&doc);
+        assert_eq!(
+            csv, "# Sheet: Data\r\nLabel,42.5\r\nTRUE,\r\n",
+            "named comment, typed values, trailing empty cell, CRLF"
+        );
+    }
+
+    #[test]
+    fn csv_separates_multiple_sheets_with_blank_line() {
+        let mut doc = csv_sheet_doc("First", &[&["a", "b"]]);
+        // Append a second sheet block.
+        let second = Sheet {
+            name: "Second".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("c".to_string()),
+                    ..Default::default()
+                }],
+                height: None,
+            }],
+            ..Default::default()
+        };
+        doc.sections[0].pages[0].blocks.push(Block {
+            kind: BlockKind::Sheet(SheetBlock {
+                sheets: vec![second],
+            }),
+            ..Default::default()
+        });
+        let csv = csv_from_model(&doc);
+        assert_eq!(
+            csv, "# Sheet: First\r\na,b\r\n\r\n# Sheet: Second\r\nc\r\n",
+            "blank record between sheets, each with a naming comment"
+        );
+    }
+
+    #[test]
+    fn csv_falls_back_to_tables_when_no_sheets() {
+        // sample_doc() has no Sheet but a 2×2 table (with a spanning cell).
+        let csv = csv_from_model(&sample_doc());
+        assert!(csv.starts_with("# Table 1\r\n"), "table-fallback header");
+        assert!(csv.contains("spanning\r\n"), "spanning cell row");
+        assert!(csv.contains("a,b\r\n"), "second table row");
+        // No spreadsheet present, so no sheet comment leaked in.
+        assert!(!csv.contains("# Sheet"));
+    }
+
+    #[test]
+    fn csv_is_empty_without_sheets_or_tables() {
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![para("just prose")],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(csv_from_model(&doc), "");
+    }
+
+    // ────────────────────────────── EPUB ───────────────────────────────
+
+    /// Name and compression method (0 = stored, 8 = deflated) of the first local
+    /// file header in a ZIP archive.
+    fn first_entry(zip: &[u8]) -> (String, u16) {
+        assert_eq!(&zip[0..4], &[0x50, 0x4b, 0x03, 0x04], "local file header");
+        let method = u16::from_le_bytes([zip[8], zip[9]]);
+        let nlen = u16::from_le_bytes([zip[26], zip[27]]) as usize;
+        let name = String::from_utf8_lossy(&zip[30..30 + nlen]).to_string();
+        (name, method)
+    }
+
+    #[test]
+    fn epub_mimetype_is_first_and_stored() {
+        let bytes = epub_from_model(&sample_doc());
+        assert_eq!(&bytes[..2], b"PK", "valid zip");
+        let (name, method) = first_entry(&bytes);
+        assert_eq!(name, "mimetype", "mimetype is the first entry");
+        assert_eq!(method, 0, "mimetype is stored, never deflated");
+        assert_eq!(
+            entry(&bytes, "mimetype").as_deref(),
+            Some(&b"application/epub+zip"[..])
+        );
+    }
+
+    #[test]
+    fn epub_has_container_opf_and_chapter() {
+        let mut doc = sample_doc();
+        doc.meta.title = Some("My Book".to_string());
+        doc.meta.author = Some("Ada".to_string());
+        doc.meta.lang = Some("fr".to_string());
+        let bytes = epub_from_model(&doc);
+
+        // OCF container points at the package document.
+        let container =
+            String::from_utf8(entry(&bytes, "META-INF/container.xml").unwrap()).unwrap();
+        assert!(container.contains("full-path=\"OEBPS/content.opf\""));
+
+        // Package document carries the DocMeta and a spine.
+        let opf = String::from_utf8(entry(&bytes, "OEBPS/content.opf").unwrap()).unwrap();
+        assert!(opf.contains("<dc:title>My Book</dc:title>"));
+        assert!(opf.contains("<dc:creator>Ada</dc:creator>"));
+        assert!(opf.contains("<dc:language>fr</dc:language>"));
+        assert!(opf.contains("<itemref idref=\"chap-1\"/>"), "spine item");
+        assert!(opf.contains("properties=\"nav\""), "nav declared");
+
+        // At least one chapter XHTML, well-formed and carrying the content.
+        let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
+        assert!(chap.starts_with("<?xml version=\"1.0\""), "XML declaration");
+        assert!(chap.contains("http://www.w3.org/1999/xhtml"), "XHTML ns");
+        assert!(chap.contains("<h1>Title</h1>"), "heading rendered");
+        assert!(chap.contains("A paragraph."), "paragraph text");
+        assert!(chap.contains("<td colspan=\"2\">"), "spanning table cell");
+
+        // Navigation document and NCX present.
+        assert!(entry(&bytes, "OEBPS/nav.xhtml").is_some());
+        assert!(entry(&bytes, "OEBPS/toc.ncx").is_some());
+    }
+
+    #[test]
+    fn epub_embeds_images_and_declares_them() {
+        // A document whose single paragraph carries an inline PNG image.
+        let mut resources = crate::model::ResourceTable::default();
+        let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+        resources.images.insert(
+            7,
+            crate::model::ImageResource {
+                bytes: png.clone(),
+                format: "png".to_string(),
+            },
+        );
+        let img_para = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Image(ImageRef {
+                    resource: 7,
+                    alt: Some("a logo".to_string()),
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![img_para],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            resources,
+            ..Default::default()
+        };
+        let bytes = epub_from_model(&doc);
+
+        // Blob embedded at the deterministic path with its original bytes.
+        assert_eq!(
+            entry(&bytes, "OEBPS/images/img-7.png").as_deref(),
+            Some(png.as_slice())
+        );
+        // Declared in the manifest with the right media-type…
+        let opf = String::from_utf8(entry(&bytes, "OEBPS/content.opf").unwrap()).unwrap();
+        assert!(opf.contains("href=\"images/img-7.png\""));
+        assert!(opf.contains("media-type=\"image/png\""));
+        // …and referenced from the chapter by relative path.
+        let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
+        assert!(chap.contains("<img src=\"images/img-7.png\" alt=\"a logo\"/>"));
+    }
+
+    #[test]
+    fn epub_empty_document_still_has_one_spine_item() {
+        let bytes = epub_from_model(&Document::default());
+        let opf = String::from_utf8(entry(&bytes, "OEBPS/content.opf").unwrap()).unwrap();
+        assert!(
+            opf.contains("<itemref idref=\"chap-1\"/>"),
+            "non-empty spine even for an empty model"
+        );
+        assert!(entry(&bytes, "OEBPS/text-1.xhtml").is_some());
+    }
+
+    // ───────────────────────────── Markdown ─────────────────────────────
+
+    /// One inline run carrying an explicit character style.
+    fn styled(text: &str, style: CharStyle) -> Inline {
+        Inline::Run(InlineRun {
+            text: text.to_string(),
+            style,
+            ..Default::default()
+        })
+    }
+
+    /// A single-page document holding exactly the given blocks (no metadata).
+    fn md_doc(blocks: Vec<Block>) -> Document {
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks,
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A heading block at `level` with a single plain run.
+    fn md_heading(level: u8, text: &str) -> Block {
+        Block {
+            kind: BlockKind::Heading(Heading {
+                level,
+                para: Paragraph {
+                    runs: vec![run(text)],
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A paragraph block from raw inline runs.
+    fn md_para(runs: Vec<Inline>) -> Block {
+        Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn markdown_empty_document_is_empty_string() {
+        assert_eq!(markdown_from_model(&Document::default()), "");
+    }
+
+    #[test]
+    fn markdown_headings_render_levels_one_to_six() {
+        let blocks = (1u8..=6).map(|l| md_heading(l, "T")).collect();
+        let md = markdown_from_model(&md_doc(blocks));
+        assert!(md.contains("# T\n"), "h1");
+        assert!(md.contains("## T\n"), "h2");
+        assert!(md.contains("### T\n"), "h3");
+        assert!(md.contains("#### T\n"), "h4");
+        assert!(md.contains("##### T\n"), "h5");
+        assert!(md.contains("###### T\n"), "h6");
+    }
+
+    #[test]
+    fn markdown_renders_run_emphasis() {
+        let bold = CharStyle {
+            bold: true,
+            ..Default::default()
+        };
+        let ital = CharStyle {
+            italic: true,
+            ..Default::default()
+        };
+        let bold_ital = CharStyle {
+            bold: true,
+            italic: true,
+            ..Default::default()
+        };
+        let strike = CharStyle {
+            strike: true,
+            ..Default::default()
+        };
+        let mono = CharStyle {
+            generic: crate::convert::style::Generic::Mono,
+            ..Default::default()
+        };
+        let md = markdown_from_model(&md_doc(vec![md_para(vec![
+            styled("b", bold),
+            run(" "),
+            styled("i", ital),
+            run(" "),
+            styled("bi", bold_ital),
+            run(" "),
+            styled("s", strike),
+            run(" "),
+            styled("code", mono),
+        ])]));
+        assert!(md.contains("**b**"), "bold: {md}");
+        assert!(md.contains("*i*"), "italic: {md}");
+        assert!(md.contains("***bi***"), "bold+italic: {md}");
+        assert!(md.contains("~~s~~"), "strikethrough: {md}");
+        assert!(md.contains("`code`"), "monospace → code span: {md}");
+    }
+
+    #[test]
+    fn markdown_renders_links_and_images() {
+        let url_link = Inline::Link {
+            href: LinkTarget::Url("https://example.com".to_string()),
+            children: vec![run("site")],
+        };
+        let page_link = Inline::Link {
+            href: LinkTarget::Page(2),
+            children: vec![run("see")],
+        };
+        let mut resources = crate::model::ResourceTable::default();
+        resources.images.insert(
+            5,
+            crate::model::ImageResource {
+                bytes: vec![1, 2, 3],
+                format: "png".to_string(),
+            },
+        );
+        let img = Inline::Image(ImageRef {
+            resource: 5,
+            alt: Some("alt".to_string()),
+        });
+        let mut doc =
+            md_doc(vec![md_para(vec![url_link, run(" "), page_link, run(" "), img])]);
+        doc.resources = resources;
+        let md = markdown_from_model(&doc);
+        assert!(md.contains("[site](https://example.com)"), "url link: {md}");
+        // LinkTarget::Page(2) is zero-based → human page 3.
+        assert!(md.contains("[see](#page-3)"), "internal page link: {md}");
+        assert!(md.contains("![alt](image-5.png)"), "image: {md}");
+    }
+
+    #[test]
+    fn markdown_renders_nested_ordered_and_unordered_lists() {
+        let nested = Block {
+            kind: BlockKind::List(List {
+                ordered: false,
+                marker: ListMarker::Bullet('•'),
+                items: vec![ListItem {
+                    blocks: vec![para("sub")],
+                    level: 1,
+                }],
+            }),
+            ..Default::default()
+        };
+        let outer = Block {
+            kind: BlockKind::List(List {
+                ordered: true,
+                marker: ListMarker::Decimal,
+                items: vec![
+                    ListItem {
+                        blocks: vec![para("one"), nested],
+                        level: 0,
+                    },
+                    ListItem {
+                        blocks: vec![para("two")],
+                        level: 0,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let md = markdown_from_model(&md_doc(vec![outer]));
+        assert!(md.contains("1. one\n"), "ordered marker: {md}");
+        assert!(md.contains("2. two\n"), "second ordered item: {md}");
+        // Nested list is indented four spaces and uses the bullet marker.
+        assert!(md.contains("\n    - sub\n"), "nested indented bullet: {md}");
+    }
+
+    #[test]
+    fn markdown_renders_gfm_table_with_alignment_row() {
+        // A 2-column table whose header cells are centre- and right-aligned.
+        let hdr = |text: &str, align: Align| Cell {
+            blocks: vec![Block {
+                kind: BlockKind::Paragraph(Paragraph {
+                    runs: vec![run(text)],
+                    style: crate::model::ParagraphStyle {
+                        align,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![
+                    Row {
+                        cells: vec![hdr("H1", Align::Center), hdr("H2", Align::Right)],
+                        height: None,
+                    },
+                    Row {
+                        cells: vec![
+                            Cell {
+                                blocks: vec![para("a")],
+                                ..Default::default()
+                            },
+                            Cell {
+                                blocks: vec![para("b")],
+                                ..Default::default()
+                            },
+                        ],
+                        height: None,
+                    },
+                ],
+                col_widths: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let md = markdown_from_model(&md_doc(vec![table]));
+        assert!(md.contains("| H1 | H2 |\n"), "header row: {md}");
+        assert!(md.contains("| :--: | ---: |\n"), "alignment row: {md}");
+        assert!(md.contains("| a | b |\n"), "body row: {md}");
+    }
+
+    #[test]
+    fn markdown_inserts_thematic_break_between_pages() {
+        // Two pages, each with content → a `---` page boundary between them.
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![
+                    Page {
+                        blocks: vec![para("page one")],
+                        absolute: false,
+                    },
+                    Page {
+                        blocks: vec![para("page two")],
+                        absolute: false,
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let md = markdown_from_model(&doc);
+        assert!(md.contains("page one"), "first page: {md}");
+        assert!(md.contains("page two"), "second page: {md}");
+        assert!(md.contains("\n---\n"), "thematic break between pages: {md}");
+    }
+
+    #[test]
+    fn markdown_escapes_inline_punctuation() {
+        // `*` `_` `[` would be inline markup if unescaped.
+        let md = markdown_from_model(&md_doc(vec![para("a*b_c[d")]));
+        assert!(md.contains("a\\*b\\_c\\[d"), "escaped punctuation: {md}");
+    }
+
+    #[test]
+    fn markdown_emits_front_matter_from_metadata() {
+        let mut doc = md_doc(vec![para("body")]);
+        doc.meta.title = Some("My Title".to_string());
+        doc.meta.author = Some("Ada".to_string());
+        doc.meta.lang = Some("en".to_string());
+        let md = markdown_from_model(&doc);
+        assert!(md.starts_with("---\n"), "front-matter opens: {md}");
+        assert!(md.contains("title: My Title\n"), "title key: {md}");
+        assert!(md.contains("author: Ada\n"), "author key: {md}");
+        assert!(md.contains("lang: en\n"), "lang key: {md}");
+        assert!(md.contains("\n---\n\n"), "front-matter closes: {md}");
     }
 }
