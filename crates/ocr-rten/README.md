@@ -13,8 +13,9 @@ Run **`tools/fetch_models.sh [out_dir]`** to download the shared **DBNet detecto
 recognizers from `deepghs/paddleocr` (Hugging Face) and convert each ONNX → `.rten`
 (`pip install rten-convert`). Two models we provide ourselves:
 
-- **Hebrew** (`hebrew/`) — our trained CRNN (`tools/train_hebrew.py` → ONNX → `rten-convert`);
-  PaddleOCR ships none.
+- **Hebrew** (`hebrew/`) — our trained CRNN; PaddleOCR ships none. Pre-trained weights on Hugging Face:
+  **[`ronylicha/gigapdf-ocr-hebrew`](https://huggingface.co/ronylicha/gigapdf-ocr-hebrew)** (`model.rten`
+  + `dict.txt`), or retrain with `tools/train_hebrew.py` → ONNX → `rten-convert`.
 - **Handwriting** (`latin_hw/`) — our trained CRNN (`tools/train_handwriting.py`, real IAM/RIMES/…
   via `hw_datasets` + synthetic; standard `nn.LSTM` → **dynamic-width** ONNX → `rten-convert`).
   Grayscale H32 `Gray32` profile, **opt-in** via `recognize_page_handwriting` / `..._with(img, "latin_hw")`.

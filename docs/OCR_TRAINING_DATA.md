@@ -35,18 +35,24 @@ so a compact CRNN+CTC trains well on synthetic data. Trainer: **`crates/ocr-rten
 
 - **Fonts:** ~10 Hebrew typefaces (Noto Serif/Rashi Hebrew, David Libre, Frank Ruhl Libre, Heebo,
   Rubik, Assistant, Secular One, Suez One) — variety for generalization.
-- **Text:** procedurally generated lines from a built-in list of common Hebrew words + digits/Latin
-  for mixed content; light scan-like augmentation (rotation, gaussian noise).
+- **Text — letter-level, not word-level (critical):** **45% of lines are random Hebrew letter/digit
+  sequences**, the rest a broad Hebrew word list + digits + occasional Latin runs; light scan-like
+  augmentation (small rotation, gaussian noise). The random-sequence fraction is what makes the model
+  learn **letters in every context** rather than memorizing a fixed vocabulary — an earlier revision
+  trained only on a ~60-word list and failed on unseen words (e.g. `בדיקה`); the current model reads
+  unseen words correctly.
 - **RTL:** labels are in **visual** order via `python-bidi` `get_display` (logical → visual), so the
   CTC model learns the left-to-right glyph order; the engine reverses the output back to logical at
   inference (`rtl: true`). Digits/Latin embedded in RTL are ordered by the BiDi algorithm.
-- **Charlist:** aligned exactly with `OcrEngine` (`[blank] + chars + [space]`); emitted as
-  `ocr_hebrew.dict.txt`.
-- **Output:** CRNN (conv → BiLSTM → CTC) exported to ONNX (legacy exporter, `dynamo=False`) →
+- **Charlist:** aligned exactly with `OcrEngine` (`[blank] + chars + [space]`, 107 chars → 109 classes);
+  emitted as `ocr_hebrew.dict.txt`.
+- **Output:** CRNN (conv → BiLSTM 384 → CTC) exported to ONNX (legacy exporter, `dynamo=False`) →
   `rten-convert` → `.rten`. Same input convention as PaddleOCR recognizers (RGB, H=48,
   `(px/255−0.5)/0.5`, `[1,3,48,W]`) so it slots into the shared pipeline.
-- **Run:** `python train_hebrew.py --fonts ~/hebrew_fonts --out models/ocr_hebrew --nlines 20000 --epochs 20`.
+- **Run:** `python train_hebrew.py --fonts ~/hebrew_fonts --out models/ocr_hebrew --nlines 50000 --epochs 30`.
   Drop the resulting `.rten` + dict into `<models_dir>/hebrew/{model.rten,dict.txt}`.
+- **Pre-trained weights:** published on Hugging Face — **`ronylicha/gigapdf-ocr-hebrew`** (`model.onnx`
+  + `model.rten` + `dict.txt`); pull from there instead of retraining.
 
 ## 3. Handwriting (`latin_hw`) — our own trained CRNN
 
