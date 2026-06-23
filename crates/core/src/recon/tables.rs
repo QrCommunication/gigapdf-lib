@@ -1191,8 +1191,55 @@ fn column_of_run(
     best.map(|(i, _)| i)
 }
 
+/// Whether a line shows a real **inter-cell gutter** — an empty horizontal band
+/// at least `gutter_min` wide between two of its runs — and is therefore a
+/// plausible table *row* rather than a wrapped line of prose.
+///
+/// The trap this guards against (CERFA-style notices): full-measure prose whose
+/// content stream emits **two `Tj` per visual line** (e.g. a line broken as
+/// `[x=45 … 346]` + `[x=364 … 544]`). Each line then has a run on the left margin
+/// **and** a run reaching the right margin, so [`detect_columns`] sees a "Left"
+/// column at the margin and a "Right" column at the page edge, and every prose
+/// line "hits ≥ 2 columns" — promoting the paragraph to a bogus 2-column table.
+/// But those two runs are *horizontally continuous* (the second resumes a few
+/// points after the first ends): there is no empty gutter between them. A genuine
+/// table row, by contrast, separates its cells with a visible blank band (the
+/// CERFA fixtures' real tables show 62–174 pt gutters; the prose lines show ≤ 18).
+///
+/// Runs are merged into maximal occupied intervals first (so overlapping/stacked
+/// runs — common in dense legal footers — collapse instead of faking a gutter),
+/// then the widest hole between consecutive intervals is tested against
+/// `gutter_min`. A single run (or fully-continuous text) has no hole ⇒ no gutter.
+fn line_has_gutter(line: &ReconLine, gutter_min: f64) -> bool {
+    // Occupied X-intervals of the non-blank runs, left→right.
+    let mut spans: Vec<(f64, f64)> = line
+        .runs
+        .iter()
+        .filter(|r| !r.text.trim().is_empty() && r.w > 0.0)
+        .map(|r| (r.x, r.x + r.w))
+        .collect();
+    if spans.len() < 2 {
+        return false;
+    }
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+    // Merge overlapping/touching spans, tracking the widest gap opened between two
+    // merged (i.e. genuinely separated) occupied bands.
+    let mut max_gap = 0.0f64;
+    let mut cur_hi = spans[0].1;
+    for &(lo, hi) in &spans[1..] {
+        if lo > cur_hi {
+            max_gap = max_gap.max(lo - cur_hi);
+            cur_hi = hi;
+        } else {
+            cur_hi = cur_hi.max(hi);
+        }
+    }
+    max_gap >= gutter_min
+}
+
 /// Plan **all** borderless tables among the free lines. Candidate tabular rows
-/// (those hitting ≥ 2 columns) are first segmented into vertical regions separated
+/// (those hitting ≥ 2 columns **and** showing a real inter-cell gutter, see
+/// [`line_has_gutter`]) are first segmented into vertical regions separated
 /// by a band of prose (a large baseline gap); each region is then built into its
 /// own grid with **region-local**, alignment-aware columns (see [`detect_columns`]),
 /// so two stacked lists with different column layouts are not fused into one
@@ -1220,6 +1267,10 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
     }
     let h_med = median(&mut heights, 10.0);
     let col_gap = (h_med * 2.0).max(16.0);
+    // Minimum empty band that separates two cells of a real table row. Wider than
+    // any inter-word space in wrapped prose, narrower than a table's column gutter
+    // (CERFA fixtures: prose lines ≤ 18 pt, real-table gutters ≥ 62 pt).
+    let gutter_min = (h_med * 2.5).max(20.0);
     let global_columns = detect_columns(&edges, col_gap);
     if global_columns.len() < 2 {
         return Vec::new(); // single column ⇒ prose, not a table
@@ -1234,7 +1285,10 @@ fn plan_borderless_all(lines: &[ReconLine], free: &[usize]) -> Vec<PlannedTable>
                 hit.insert(c);
             }
         }
-        if hit.len() >= 2 {
+        // A tabular row both hits ≥ 2 columns AND shows a real gutter between
+        // cells — the latter rejects full-measure prose whose lines reach both
+        // margins (two runs per line) but flow continuously across the middle.
+        if hit.len() >= 2 && line_has_gutter(&lines[i], gutter_min) {
             row_lines.push(i);
         }
     }
@@ -1297,7 +1351,10 @@ fn build_borderless_region(
     if columns.len() < 2 {
         return None;
     }
-    // Keep only rows that hit ≥ 2 of the region's own columns.
+    // Same gutter floor as the global pass (see [`plan_borderless_all`]): a row
+    // must separate its cells with a real blank band, not merely reach two margins.
+    let gutter_min = (h_med * 2.5).max(20.0);
+    // Keep only rows that hit ≥ 2 of the region's own columns AND show a gutter.
     let mut row_lines: Vec<usize> = Vec::new();
     for &i in region {
         let mut hit: BTreeSet<usize> = BTreeSet::new();
@@ -1307,7 +1364,7 @@ fn build_borderless_region(
                 hit.insert(c);
             }
         }
-        if hit.len() >= 2 {
+        if hit.len() >= 2 && line_has_gutter(&lines[i], gutter_min) {
             row_lines.push(i);
         }
     }
@@ -2399,6 +2456,135 @@ mod tests {
         );
         // Borderless ⇒ no widened border.
         assert_eq!(table.border.width, 0.0);
+    }
+
+    // ── prose-notice (full-measure prose, two runs per line) vs real table rows ──
+    //
+    // Captured from CERFA s3705 page 1. The notice prose has a content stream that
+    // emits two `Tj` per visual line: a left run on the margin and a right run that
+    // reaches the right margin. [`detect_columns`] then sees a Left column (margin)
+    // and a Right column (page edge), and every line "hits ≥ 2 columns" — but the
+    // two runs are horizontally continuous (no empty gutter between them), so it is
+    // a wrapped paragraph, not a table row. [`line_has_gutter`] makes the call.
+
+    /// A run spanning `[x, x1]` on baseline `y`, 12 pt — the geometry the
+    /// borderless detector reads (left/right edges + height).
+    fn span(text: &str, x: f64, y: f64, x1: f64) -> ReconRun {
+        ReconRun {
+            text: text.to_string(),
+            x,
+            y,
+            w: x1 - x,
+            h: 12.0,
+            size: 12.0,
+            style: TextStyle::default(),
+            rotation: 0.0,
+            source_index: None,
+            underline: false,
+            strike: false,
+        }
+    }
+
+    #[test]
+    fn cerfa_prose_notice_two_runs_per_line_is_not_a_table() {
+        // CERFA s3705 block-8 geometry: five wrapped notice lines, each split into a
+        // left run (margin ≈ x45) and a right run reaching ≈ x550. The runs of each
+        // line are continuous (inter-run gaps ≤ 18 pt), so there is no real gutter
+        // and the paragraph must NOT be promoted to a borderless table.
+        let runs = vec![
+            span("Si vous relevez du regime", 45.0, 731.0, 428.0),
+            span("r detache depuis la France", 428.0, 731.0, 532.0),
+            span("ou retraite, vous devez", 44.0, 720.0, 346.0),
+            span("s et ceux des membres", 364.0, 720.0, 544.0),
+            span("devez fournir les informations", 45.0, 710.0, 261.0),
+            span("lieu de residence en France", 265.0, 710.0, 555.0),
+            span("- soit le formulaire S1", 45.0, 686.0, 445.0),
+            span("si vous etes ressortissant", 450.0, 686.0, 551.0),
+            span("- soit le", 45.0, 662.0, 77.0),
+            span("ertificat d'assujettissement", 77.0, 662.0, 450.0),
+            span("la France par un accord", 454.0, 662.0, 550.0),
+        ];
+        let lines = group_into_lines(&runs);
+        // No ruling lines → only the borderless path can fire. It must not.
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+        assert!(
+            (0..lines.len()).all(|i| plan.take_if_starts_at(i).is_none()),
+            "full-measure prose split into two runs per line stays prose, not a table"
+        );
+        assert!(
+            borderless_table(&lines).is_none(),
+            "no borderless table is built from the notice prose"
+        );
+    }
+
+    #[test]
+    fn two_runs_per_line_with_a_real_gutter_is_still_a_table() {
+        // The guard must not reject a genuine two-column borderless table whose rows
+        // also carry two runs each — here a left label and a right value separated
+        // by a wide blank gutter (label ends ≈ x120, value starts ≈ x300 ⇒ 180 pt
+        // gutter, far above the prose floor). This stays a 2-column table.
+        let runs = vec![
+            span("Product name", 72.0, 700.0, 150.0),
+            span("Unit price", 300.0, 700.0, 360.0),
+            span("Widget assembly", 72.0, 684.0, 160.0),
+            span("12,50", 300.0, 684.0, 330.0),
+            span("Bolt pack", 72.0, 668.0, 130.0),
+            span("3,75", 300.0, 668.0, 326.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines)
+            .expect("two columns with a real gutter remain a borderless table");
+        assert_eq!(table.rows.len(), 3, "header + two data rows");
+        for row in &table.rows {
+            assert_eq!(row.cells.len(), 2, "two cells per row (label + value)");
+        }
+        assert_eq!(cell_text(&table.rows[1].cells[0]), "Widget assembly");
+        assert_eq!(cell_text(&table.rows[1].cells[1]), "12,50");
+    }
+
+    #[test]
+    fn line_has_gutter_separates_prose_rows_from_table_rows() {
+        // gutter floor = 2.5 × 12 pt body = 30 pt (the value the borderless planner
+        // uses for this fixture height).
+        let gutter_min = 30.0;
+
+        // Prose row (CERFA notice y=720): two continuous runs, inter-run gap 18 pt.
+        let prose = group_into_lines(&[
+            span("ou retraite, vous devez", 44.0, 720.0, 346.0),
+            span("s et ceux des membres", 364.0, 720.0, 544.0),
+        ]);
+        assert_eq!(prose.len(), 1, "one baseline band");
+        assert!(
+            !line_has_gutter(&prose[0], gutter_min),
+            "continuous wrapped prose has no inter-cell gutter"
+        );
+
+        // Real table row (CERFA NOM/PRENOM y=592): left cell ends ≈ x263, right cell
+        // starts ≈ x338 ⇒ a 75 pt blank gutter.
+        let table_row = group_into_lines(&[
+            span("NOM :", 44.0, 592.0, 73.0),
+            span("...............", 77.0, 592.0, 263.0),
+            span("NOM :", 338.0, 592.0, 367.0),
+            span("...............", 371.0, 592.0, 557.0),
+        ]);
+        assert_eq!(table_row.len(), 1);
+        assert!(
+            line_has_gutter(&table_row[0], gutter_min),
+            "a real two-column row shows a wide blank gutter"
+        );
+
+        // Dense footer with stacked/overlapping runs must NOT fake a gutter: the
+        // merged occupied band is continuous, so the largest hole is tiny.
+        let footer = group_into_lines(&[
+            span("La loi rend passible", 30.0, 38.0, 440.0),
+            span("'obtenir", 372.0, 38.0, 392.0), // overlaps the previous run
+            span("e obtenir communication", 445.0, 38.0, 551.0), // 5 pt after x440
+        ]);
+        assert_eq!(footer.len(), 1);
+        assert!(
+            !line_has_gutter(&footer[0], gutter_min),
+            "overlapping footer runs collapse to one band — no spurious gutter"
+        );
     }
 
     #[test]
