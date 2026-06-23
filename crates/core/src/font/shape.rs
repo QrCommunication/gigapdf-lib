@@ -11,24 +11,32 @@
 //!   ordinary office/document text.
 //!
 //! * **Complex path** ([`Shaper::shape`]): a positioned shaper that selects the
-//!   right **script** (latn/arab/hebr…) and applies, in order, the script's
-//!   substitution features — including **GSUB contextual / chaining contextual**
-//!   (types 5/6) and, for cursive scripts, **Arabic joining** (`init`/`medi`/
-//!   `fina`/`isol`) — then GPOS **pair kerning** (types 2/9) and **mark
-//!   positioning**: mark-to-base (4), mark-to-ligature (5) and mark-to-mark (6).
-//!   It returns [`ShapedGlyph`]s carrying per-glyph x/y placement offsets and
-//!   advances, so diacritics sit on their base and cursive scripts render in
-//!   contextual forms. Marks are identified via `GDEF`.
+//!   right **script** (latn/arab/hebr/Indic…) and applies, in order, the
+//!   script's substitution features — including **GSUB single** (1), **multiple**
+//!   (2, 1→N), **alternate** (3, first alternate), **contextual / chaining
+//!   contextual** (5/6) and **reverse-chaining single** (8, right-to-left) — and,
+//!   for cursive scripts, **Arabic joining** (`init`/`medi`/`fina`/`isol`). For
+//!   Indic scripts it runs the **syllable reordering** machine (pre-base matras
+//!   moved before the base, reph moved to the syllable end) and the Indic feature
+//!   pipeline. Then GPOS: **pair kerning** (2/9), **cursive attachment** (3) and
+//!   **mark positioning** — mark-to-base (4), mark-to-ligature (5) and
+//!   mark-to-mark (6). It returns [`ShapedGlyph`]s carrying per-glyph x/y
+//!   placement offsets and advances, so diacritics sit on their base, cursive
+//!   scripts render in contextual forms, and Indic clusters are visually ordered.
+//!   Marks are identified via `GDEF`.
 //!
 //! Everything is parsed directly from the font's `GSUB`/`GPOS`/`GDEF` bytes
 //! (exposed by [`TrueTypeFont`]); no new tokenizer, no allocation of the whole
 //! table, and every offset read is bounds-checked (a malformed table degrades
 //! to a no-op rather than panicking).
 //!
-//! Documented limits (assumed): full Indic/Khmer/Myanmar reordering (the
-//! HarfBuzz-style syllable machine) is **out of scope** — only substitution,
-//! joining and positioning that need no glyph reordering are performed. GSUB
-//! reverse-chaining (type 8) and GPOS cursive attachment (type 3) are no-ops.
+//! Documented limits (assumed): the Indic reordering follows the Indic2/USE
+//! model for the common Brahmi-derived scripts (Devanagari, Bengali, Gujarati,
+//! Gurmukhi, Oriya, Tamil, Telugu, Kannada, Malayalam). Khmer and Myanmar (whose
+//! syllable structure diverges) are **not reordered** — they fall back to the
+//! substitution/positioning path without the matra/reph machine. The reordering
+//! is gated strictly to detected Indic scripts, so Latin/Arabic/Hebrew runs are
+//! byte-for-byte unchanged.
 
 use super::truetype::TrueTypeFont;
 
@@ -756,6 +764,16 @@ impl ComplexShaper {
             })
             .collect();
 
+        let indic = is_indic_script(script);
+
+        // Indic syllable reordering happens BEFORE GSUB: the matra/reph moves are
+        // logical-order rearrangements the shaping features then consume. The fast
+        // path never reaches here (the gate keeps Latin/Arabic out), so this only
+        // touches genuine Indic runs.
+        if indic {
+            reorder_indic(unicodes, &mut buf);
+        }
+
         // ── GSUB ─────────────────────────────────────────────────────────────
         if let Some(gsub_base) = self.gsub {
             let gsub = Gsub {
@@ -768,13 +786,21 @@ impl ComplexShaper {
             if is_cursive_script(script) {
                 self.apply_arabic_joining(&gsub, script, unicodes, &mut buf);
             }
-            // Standard substitution features in a sensible order. ccmp first
-            // (compose marks), then ligatures, then contextual.
-            let features: [[u8; 4]; 6] =
-                [*b"ccmp", *b"rlig", *b"liga", *b"clig", *b"calt", *b"locl"];
-            let lookups = self.feature_lookups(d, gsub_base, script, &features);
+            // Feature set + order depends on the script. Indic uses the standard
+            // Indic2 pipeline (shaping features then presentation features); other
+            // scripts use the general set (ccmp → ligatures → contextual).
+            let lookups = if indic {
+                self.feature_lookups(d, gsub_base, script, INDIC_GSUB_FEATURES)
+            } else {
+                const GENERAL: &[[u8; 4]] =
+                    &[*b"ccmp", *b"rlig", *b"liga", *b"clig", *b"calt", *b"locl"];
+                self.feature_lookups(d, gsub_base, script, GENERAL)
+            };
             for lk in lookups {
-                self.apply_gsub_lookup(&gsub, lk, 0, &mut buf);
+                // Vec-based application so GSUB type 2 (multiple substitution,
+                // 1→N) can grow the run; all other types delegate to the slice
+                // path unchanged.
+                self.apply_gsub_lookup_vec(&gsub, lk, &mut buf);
             }
         }
 
@@ -785,7 +811,8 @@ impl ComplexShaper {
 
         // ── GPOS ─────────────────────────────────────────────────────────────
         if let Some(gpos) = self.gpos {
-            let features: [[u8; 4]; 3] = [*b"kern", *b"mark", *b"mkmk"];
+            let features: [[u8; 4]; 5] =
+                [*b"dist", *b"kern", *b"curs", *b"mark", *b"mkmk"];
             let lookups = self.feature_lookups(d, gpos, script, &features);
             for lk in lookups {
                 self.apply_gpos_lookup(d, lk, &mut buf);
@@ -969,6 +996,68 @@ impl ComplexShaper {
     // bundled into a [`Gsub`] context so each method carries one borrow instead
     // of two scalars, and a recursion `depth` guards nested SubstLookupRecords.
 
+    /// Top-level GSUB lookup application on the **growable** buffer. The only
+    /// substitution that changes the run length is type 2 (multiple, 1→N), which
+    /// cannot be expressed on a fixed slice; it is handled here by rebuilding the
+    /// `Vec`. Every other lookup type leaves the length fixed and is applied
+    /// through the slice path ([`Self::apply_gsub_lookup`]) unchanged — so nested
+    /// contextual lookups keep their exact previous behaviour.
+    fn apply_gsub_lookup_vec(&self, g: &Gsub, lookup_off: usize, buf: &mut Vec<ShapedGlyph>) {
+        let d = g.d;
+        let lookup_type = be16(d, lookup_off);
+        let subtable_count = be16(d, lookup_off + 4) as usize;
+        // Multiple substitution (direct type 2, or a type-7 extension wrapping
+        // type 2) grows the run and is applied subtable-by-subtable on the Vec.
+        // Everything else is length-preserving and goes through the slice path.
+        for st in 0..subtable_count {
+            let sub_off = lookup_off + be16(d, lookup_off + 6 + st * 2) as usize;
+            let (eff_type, eff_off) = if lookup_type == 7 && be16(d, sub_off) == 1 {
+                (be16(d, sub_off + 2), sub_off + be32(d, sub_off + 4) as usize)
+            } else {
+                (lookup_type, sub_off)
+            };
+            if eff_type == 2 {
+                self.apply_multiple_subst(d, eff_off, buf);
+            } else {
+                self.apply_gsub_subtable(g, lookup_type, sub_off, 0, buf.as_mut_slice());
+            }
+        }
+    }
+
+    /// Apply one MultipleSubstFormat1 subtable to the growable buffer.
+    fn apply_multiple_subst(&self, d: &[u8], off: usize, buf: &mut Vec<ShapedGlyph>) {
+        if be16(d, off) != 1 {
+            return; // only format 1 is defined
+        }
+        let coverage_off = off + be16(d, off + 2) as usize;
+        let seq_count = be16(d, off + 4) as usize;
+        let mut out: Vec<ShapedGlyph> = Vec::with_capacity(buf.len());
+        for gl in buf.iter() {
+            match coverage_index(d, coverage_off, gl.gid) {
+                Some(ci) if (ci as usize) < seq_count => {
+                    let seq_off = off + be16(d, off + 6 + ci as usize * 2) as usize;
+                    let glyph_count = be16(d, seq_off) as usize;
+                    // Expand into `glyph_count` glyphs, all sharing the cluster of
+                    // the source glyph. The first keeps the source advance/offset;
+                    // the rest start at zero (advances are reseeded from hmtx after
+                    // GSUB, so only offsets matter, and they are not yet set here).
+                    for k in 0..glyph_count {
+                        out.push(ShapedGlyph {
+                            gid: be16(d, seq_off + 2 + k * 2),
+                            x_advance: 0,
+                            x_offset: 0,
+                            y_offset: 0,
+                            cluster: gl.cluster,
+                        });
+                    }
+                }
+                // Not covered (or out-of-range index) → keep the glyph as-is.
+                _ => out.push(*gl),
+            }
+        }
+        *buf = out;
+    }
+
     fn apply_gsub_lookup(&self, g: &Gsub, lookup_off: usize, depth: u8, buf: &mut [ShapedGlyph]) {
         if depth > 8 {
             return;
@@ -992,8 +1081,10 @@ impl ComplexShaper {
     ) {
         match lookup_type {
             1 => self.apply_single_subst(g.d, sub_off, buf),
+            3 => self.apply_alternate_subst(g.d, sub_off, buf),
             5 => self.apply_context_subst(g, sub_off, depth, buf),
             6 => self.apply_chain_context_subst(g, sub_off, depth, buf),
+            8 => self.apply_reverse_chain_subst(g, sub_off, buf),
             7 => {
                 if be16(g.d, sub_off) == 1 {
                     let real_type = be16(g.d, sub_off + 2);
@@ -1003,9 +1094,103 @@ impl ComplexShaper {
                     }
                 }
             }
-            // Types 4 (ligature) and 2/3 reorder/merge glyphs, which the slice
-            // buffer cannot express; the Latin path handles ligatures.
+            // Type 4 (ligature) merges glyphs, and type 2 (multiple) grows the
+            // run — neither fits the fixed slice. Ligatures are handled by the
+            // Latin path; multiple substitution is applied at the top level on the
+            // growable buffer (see `apply_gsub_lookup_vec`).
             _ => {}
+        }
+    }
+
+    /// Apply a GSUB alternate substitution (type 3) on the slice: each covered
+    /// glyph is replaced by the **first** alternate of its set. Without a feature
+    /// selector to pick a specific alternate (e.g. `aalt`/`salt` user choice), the
+    /// default rendering takes alternate[0], matching how a plain text engine
+    /// resolves `aalt`/stylistic sets it is not steering.
+    fn apply_alternate_subst(&self, d: &[u8], off: usize, buf: &mut [ShapedGlyph]) {
+        if be16(d, off) != 1 {
+            return; // only format 1 is defined
+        }
+        let coverage_off = off + be16(d, off + 2) as usize;
+        let set_count = be16(d, off + 4) as usize;
+        for g in buf.iter_mut() {
+            if let Some(ci) = coverage_index(d, coverage_off, g.gid) {
+                let ci = ci as usize;
+                if ci < set_count {
+                    let set_off = off + be16(d, off + 6 + ci * 2) as usize;
+                    let glyph_count = be16(d, set_off) as usize;
+                    if glyph_count > 0 {
+                        g.gid = be16(d, set_off + 2); // alternate[0]
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply a GSUB reverse-chaining single substitution (type 8, format 1):
+    /// like a chaining single substitution but applied **right-to-left** and with
+    /// the substitution glyph supplied inline (one per input-coverage index). Used
+    /// by some scripts (and a few Latin fonts) where a glyph's final form depends
+    /// on the glyph that follows it.
+    fn apply_reverse_chain_subst(&self, g: &Gsub, off: usize, buf: &mut [ShapedGlyph]) {
+        let d = g.d;
+        if be16(d, off) != 1 {
+            return;
+        }
+        let mut p = off + 2;
+        let input_cov = off + be16(d, p) as usize;
+        p += 2;
+        let back_count = be16(d, p) as usize;
+        p += 2;
+        let back_covs_off = p;
+        p += back_count * 2;
+        let look_count = be16(d, p) as usize;
+        p += 2;
+        let look_covs_off = p;
+        p += look_count * 2;
+        let glyph_count = be16(d, p) as usize;
+        let subst_off = p + 2;
+        // Process positions from last to first (reverse chaining is applied in
+        // reverse text order, so a just-substituted glyph cannot retrigger a match
+        // to its right).
+        let n = buf.len();
+        for i in (0..n).rev() {
+            let ci = match coverage_index(d, input_cov, buf[i].gid) {
+                Some(c) => c as usize,
+                None => continue,
+            };
+            if ci >= glyph_count {
+                continue;
+            }
+            // Backtrack coverages are in reverse text order (closest first).
+            let mut ok = true;
+            for k in 0..back_count {
+                let cov = off + be16(d, back_covs_off + k * 2) as usize;
+                match i.checked_sub(k + 1).and_then(|j| buf.get(j)) {
+                    Some(gl) if coverage_contains(d, cov, gl.gid) => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            for k in 0..look_count {
+                let cov = off + be16(d, look_covs_off + k * 2) as usize;
+                match buf.get(i + 1 + k) {
+                    Some(gl) if coverage_contains(d, cov, gl.gid) => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            buf[i].gid = be16(d, subst_off + ci * 2);
         }
     }
 
@@ -1473,6 +1658,7 @@ impl ComplexShaper {
     ) {
         match lookup_type {
             2 => self.apply_pair_pos(d, sub_off, buf),
+            3 => self.apply_cursive_attach(d, sub_off, buf),
             4 => self.apply_mark_to_base(d, sub_off, buf),
             5 => self.apply_mark_to_ligature(d, sub_off, buf),
             6 => self.apply_mark_to_mark(d, sub_off, buf),
@@ -1487,6 +1673,57 @@ impl ComplexShaper {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// GPOS cursive attachment (type 3): connect adjacent glyphs by aligning the
+    /// **exit** anchor of the earlier glyph with the **entry** anchor of the next,
+    /// so cursive scripts (and some calligraphic Latin/Indic) flow continuously.
+    /// We shift the following glyph vertically to meet the exit anchor and fold the
+    /// horizontal gap into the earlier glyph's advance (the simple left-to-right
+    /// model; right-to-left baseline chains are uncommon in the faces we target).
+    fn apply_cursive_attach(&self, d: &[u8], off: usize, buf: &mut [ShapedGlyph]) {
+        if be16(d, off) != 1 {
+            return; // only format 1 is defined
+        }
+        let coverage_off = off + be16(d, off + 2) as usize;
+        let entry_exit_count = be16(d, off + 4) as usize;
+        // EntryExitRecord[i] = (entryAnchorOffset(2), exitAnchorOffset(2)).
+        let records_off = off + 6;
+        let entry_exit = |gid: u16| -> Option<(Option<Anchor>, Option<Anchor>)> {
+            let ci = coverage_index(d, coverage_off, gid)? as usize;
+            if ci >= entry_exit_count {
+                return None;
+            }
+            let rec = records_off + ci * 4;
+            let entry_rel = be16(d, rec);
+            let exit_rel = be16(d, rec + 2);
+            let entry = (entry_rel != 0)
+                .then(|| parse_anchor(d, off + entry_rel as usize))
+                .flatten();
+            let exit = (exit_rel != 0)
+                .then(|| parse_anchor(d, off + exit_rel as usize))
+                .flatten();
+            Some((entry, exit))
+        };
+        let mut i = 0;
+        while i + 1 < buf.len() {
+            // Exit anchor of glyph i and entry anchor of glyph i+1 must both exist.
+            let exit = entry_exit(buf[i].gid).and_then(|(_, e)| e);
+            let entry = entry_exit(buf[i + 1].gid).and_then(|(en, _)| en);
+            if let (Some(exit), Some(entry)) = (exit, entry) {
+                // Align baselines: raise/lower the next glyph so its entry y meets
+                // the current glyph's exit y (relative to their offsets so chains
+                // accumulate).
+                let exit_y = buf[i].y_offset + exit.y as i32;
+                buf[i + 1].y_offset = exit_y - entry.y as i32;
+                // Close the horizontal gap: the current glyph's advance becomes the
+                // distance from its origin to the exit anchor (the next glyph then
+                // begins where the exit point is), minus the next glyph's entry x.
+                let adv = exit.x as i32 + buf[i].x_offset - entry.x as i32;
+                buf[i].x_advance = adv;
+            }
+            i += 1;
         }
     }
 
@@ -1867,6 +2104,12 @@ pub fn detect_complex_script(text: &str) -> Option<[u8; 4]> {
         if let Some(tag) = cursive_script_of(u) {
             return Some(tag);
         }
+        // Indic (Brahmi-derived) scripts — these need syllable reordering. Checked
+        // before the combining-mark flag because Indic matras ARE combining marks
+        // and must route to the Indic tag (not `latn`).
+        if let Some(tag) = indic_script_of(u) {
+            return Some(tag);
+        }
         // Hebrew letters/points: positioned via GPOS, no joining.
         if (0x0590..=0x05FF).contains(&u) || (0xFB1D..=0xFB4F).contains(&u) {
             return Some(*b"hebr");
@@ -1949,6 +2192,276 @@ fn is_combining_mark(u: u32) -> bool {
         | 0x20D0..=0x20FF // Combining Diacritical Marks for Symbols
         | 0xFE20..=0xFE2F // Combining Half Marks
     )
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Indic (Brahmi-derived) syllable reordering — the core of complex shaping for
+//  Devanagari and the related scripts. The nine scripts below share the
+//  Devanagari block layout (independent vowels, consonants, nukta, matras and
+//  virama at the same relative offsets), so one classifier keyed on the low byte
+//  drives them all, with per-script overrides for which matras render pre-base.
+//
+//  The reordering runs on the *logical* glyph buffer before GSUB. At that point
+//  every glyph still corresponds 1:1 to its source character (no substitution has
+//  happened), so moving glyphs is the same as moving characters. Two moves matter
+//  for legibility, following the Indic2/USE model:
+//
+//   * a **reph** (an initial `Ra + Halant`) is lifted off the front of the
+//     syllable and reinserted at its end (the default "after post-base" reph
+//     position used by Devanagari and most Indic2 scripts);
+//   * **pre-base matras** (e.g. Devanagari U+093F "i"), stored after the base
+//     consonant but drawn before it, are moved to just before the base.
+//
+//  Khmer/Myanmar are intentionally excluded (their syllable structure differs):
+//  `is_indic_script` returns false for them, so they take the substitution path
+//  without this machine. See the module-level limits note.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The GSUB feature pipeline for Indic scripts, in application order: the Indic2
+/// shaping features (`nukt`…`cjct`) that form conjuncts/half-forms/reph, then the
+/// presentation features (`pres`…`calt`) that finalise the cluster. Applied via
+/// the same lookup resolver as the general path.
+const INDIC_GSUB_FEATURES: &[[u8; 4]] = &[
+    // Localised forms first (a font may swap to language-specific glyphs).
+    *b"locl", *b"ccmp", // Mandatory Indic shaping features (conjunct formation, reph/half forms).
+    *b"nukt", *b"akhn", *b"rphf", *b"rkrf", *b"pref", *b"blwf", *b"abvf", *b"half", *b"pstf",
+    *b"vatu", *b"cjct", // Presentation features.
+    *b"pres", *b"abvs", *b"blws", *b"psts", *b"haln", *b"calt", *b"liga", *b"clig",
+];
+
+/// Whether an OpenType script tag is one of the Indic (Brahmi-derived) scripts we
+/// run the syllable-reordering machine for.
+fn is_indic_script(script: [u8; 4]) -> bool {
+    matches!(
+        &script,
+        b"dev2" | b"bng2" | b"gur2" | b"gjr2" | b"ory2" | b"tml2" | b"tel2" | b"knd2" | b"mlm2"
+    )
+}
+
+/// The base codepoint of the Unicode block a scalar belongs to, when it is one of
+/// the nine Indic scripts we handle (Devanagari … Malayalam), else `None`. Each
+/// block is 0x80 wide and starts on a 0x80 boundary.
+fn indic_block_base(u: u32) -> Option<u32> {
+    match u {
+        0x0900..=0x097F => Some(0x0900), // Devanagari
+        0x0980..=0x09FF => Some(0x0980), // Bengali
+        0x0A00..=0x0A7F => Some(0x0A00), // Gurmukhi
+        0x0A80..=0x0AFF => Some(0x0A80), // Gujarati
+        0x0B00..=0x0B7F => Some(0x0B00), // Oriya
+        0x0B80..=0x0BFF => Some(0x0B80), // Tamil
+        0x0C00..=0x0C7F => Some(0x0C00), // Telugu
+        0x0C80..=0x0CFF => Some(0x0C80), // Kannada
+        0x0D00..=0x0D7F => Some(0x0D00), // Malayalam
+        _ => None,
+    }
+}
+
+/// The Indic OpenType (v2) script tag for a Unicode scalar, or `None`. The v2
+/// tags (`dev2`, `bng2`, …) select the Indic2 shaping model in modern fonts.
+fn indic_script_of(u: u32) -> Option<[u8; 4]> {
+    match indic_block_base(u)? {
+        0x0900 => Some(*b"dev2"),
+        0x0980 => Some(*b"bng2"),
+        0x0A00 => Some(*b"gur2"),
+        0x0A80 => Some(*b"gjr2"),
+        0x0B00 => Some(*b"ory2"),
+        0x0B80 => Some(*b"tml2"),
+        0x0C00 => Some(*b"tel2"),
+        0x0C80 => Some(*b"knd2"),
+        0x0D00 => Some(*b"mlm2"),
+        _ => None,
+    }
+}
+
+/// Indic syllabic category of a character (the subset that drives reordering).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndicCat {
+    /// Consonant (a potential base).
+    Consonant,
+    /// Independent vowel (also a base; never reordered).
+    Vowel,
+    /// Virama / halant.
+    Halant,
+    /// Nukta (a consonant modifier; stays attached to its consonant).
+    Nukta,
+    /// Dependent vowel sign (matra) rendered before the base.
+    MatraPre,
+    /// Dependent vowel sign rendered above/below/after the base.
+    MatraOther,
+    /// Other combining sign (anusvara, candrabindu, visarga, vedic, ZWJ/ZWNJ…).
+    Other,
+    /// Not part of an Indic syllable (Latin, space, punctuation, digit…).
+    NonIndic,
+}
+
+/// Classify a character into its [`IndicCat`]. Keyed on the offset within the
+/// script block (shared Devanagari layout) plus a per-script set of pre-base
+/// matras. Characters outside the nine blocks are `NonIndic`.
+fn indic_category(u: u32) -> IndicCat {
+    let base = match indic_block_base(u) {
+        Some(b) => b,
+        None => return IndicCat::NonIndic,
+    };
+    let off = u - base;
+    // Virama / halant sits at offset 0x4D in every block.
+    if off == 0x4D {
+        return IndicCat::Halant;
+    }
+    // Nukta at 0x3C.
+    if off == 0x3C {
+        return IndicCat::Nukta;
+    }
+    // Dependent vowel signs (matras) occupy 0x3E..=0x4C (plus a couple of
+    // script-specific extras in 0x62/0x63 and the Tamil/Malayalam 0x57 au-length
+    // mark). Independent vowels 0x04..=0x14, consonants 0x15..=0x3B (incl. some
+    // additional consonants up to 0x39, and 0x58..=0x5F extra consonants).
+    if is_indic_pre_base_matra(u) {
+        return IndicCat::MatraPre;
+    }
+    if (0x3E..=0x4C).contains(&off) || off == 0x57 || off == 0x62 || off == 0x63 {
+        return IndicCat::MatraOther;
+    }
+    if (0x05..=0x14).contains(&off) {
+        return IndicCat::Vowel;
+    }
+    if (0x15..=0x3B).contains(&off) || (0x58..=0x5F).contains(&off) {
+        return IndicCat::Consonant;
+    }
+    IndicCat::Other
+}
+
+/// Whether `u` is a pre-base (left-side) matra for its script — these are stored
+/// after the base consonant in logical order but drawn before it. The set is
+/// per-script (Telugu/Kannada have none; their matras are above/post).
+fn is_indic_pre_base_matra(u: u32) -> bool {
+    matches!(u,
+        0x093F                       // Devanagari I
+        | 0x09BF | 0x09C7 | 0x09C8   // Bengali I, E, AI
+        | 0x0A3F                     // Gurmukhi I
+        | 0x0ABF                     // Gujarati I
+        | 0x0B47                     // Oriya E
+        | 0x0BC6 | 0x0BC7 | 0x0BC8   // Tamil E, EE, AI
+        | 0x0D46 | 0x0D47 | 0x0D48   // Malayalam E, EE, AI
+    )
+}
+
+/// Reorder each Indic syllable in `buf` in place: move a leading reph to the end
+/// of its syllable and pull pre-base matras in front of the base consonant. `buf`
+/// is in logical glyph order and `unicodes` are the matching source scalars
+/// (same length and order as the run originally fed to [`ComplexShaper::shape`]).
+///
+/// Only runs for Indic scripts (the caller gates this), and only the Indic-script
+/// characters inside the run are touched; embedded non-Indic glyphs (spaces,
+/// digits) act as syllable separators and stay put.
+fn reorder_indic(unicodes: &[u32], buf: &mut [ShapedGlyph]) {
+    // Guard the rare case where the glyph buffer length diverged from the source
+    // (it should not at this stage, but multiple substitution etc. never runs
+    // before reordering, so 1:1 holds — bail safely if not).
+    if unicodes.len() != buf.len() {
+        return;
+    }
+    let cats: Vec<IndicCat> = unicodes.iter().map(|&u| indic_category(u)).collect();
+    let n = buf.len();
+    let mut i = 0;
+    while i < n {
+        // Skip non-Indic runs (separators between syllables).
+        if cats[i] == IndicCat::NonIndic {
+            i += 1;
+            continue;
+        }
+        // A syllable spans from `i` up to (but excluding) the next NonIndic char.
+        let mut end = i;
+        while end < n && cats[end] != IndicCat::NonIndic {
+            end += 1;
+        }
+        reorder_syllable(unicodes, &cats, buf, i, end);
+        i = end;
+    }
+}
+
+/// Reorder a single syllable `buf[start..end]` (all Indic characters). Identifies
+/// the base consonant, moves a leading reph (`Ra + Halant`) to the syllable end,
+/// and moves pre-base matras to just before the base.
+fn reorder_syllable(
+    unicodes: &[u32],
+    cats: &[IndicCat],
+    buf: &mut [ShapedGlyph],
+    start: usize,
+    end: usize,
+) {
+    if end <= start + 1 {
+        return; // single glyph: nothing to reorder
+    }
+
+    // ── Reph detection: syllable begins with Ra + Halant, and the syllable has
+    // more after it (so the Ra is a reph, not a standalone Ra+virama cluster).
+    let ra = indic_ra(unicodes[start]);
+    let has_reph = ra
+        && cats.get(start + 1) == Some(&IndicCat::Halant)
+        && end > start + 2;
+    // The portion to reorder excludes a detected reph from base-finding (the reph
+    // is repositioned separately at the end).
+    let body_start = if has_reph { start + 2 } else { start };
+
+    // ── Base consonant: the LAST consonant in the body that is not followed by a
+    // halant beginning a further conjunct — simplified to the last consonant in
+    // the body before the first post-base matra/other. This matches Devanagari
+    // for the common (non-conjunct and trailing-conjunct) cases.
+    let mut base: Option<usize> = None;
+    for (j, c) in cats.iter().enumerate().take(end).skip(body_start) {
+        if matches!(c, IndicCat::Consonant | IndicCat::Vowel) {
+            base = Some(j);
+        }
+    }
+    let base = match base {
+        Some(b) => b,
+        // No consonant/vowel base (e.g. a lone matra) → only reph handling, which
+        // also needs a base; nothing sensible to do.
+        None => return,
+    };
+
+    // `base` is consumed implicitly: emitting every non-pre-matra glyph in logical
+    // order keeps the base (and any conjunct consonants) where they belong; only
+    // the pre-base matras and a reph are lifted out around it.
+    let _ = base;
+
+    // Snapshot the glyphs so we can rebuild the syllable in visual order.
+    let original: Vec<ShapedGlyph> = buf[start..end].to_vec();
+    let cat_slice = &cats[start..end];
+
+    let mut visual: Vec<ShapedGlyph> = Vec::with_capacity(original.len());
+
+    // 1. Pre-base matras, in their logical order, go first — drawn to the left of
+    //    the consonant cluster (Devanagari "i" spans the whole base cluster).
+    for (k, c) in cat_slice.iter().enumerate() {
+        if *c == IndicCat::MatraPre {
+            visual.push(original[k]);
+        }
+    }
+    // 2. The consonant cluster, base, post-base matras and signs follow in their
+    //    original logical order — EXCEPT the pre-base matras already emitted and a
+    //    detected reph's leading Ra+Halant (emitted last).
+    let reph_skip = if has_reph { 2 } else { 0 }; // first two slice indices
+    for (k, c) in cat_slice.iter().enumerate() {
+        if *c == IndicCat::MatraPre || (has_reph && k < reph_skip) {
+            continue;
+        }
+        visual.push(original[k]);
+    }
+    // 3. A detected reph (Ra + Halant) is appended at the syllable end.
+    if has_reph {
+        visual.push(original[0]);
+        visual.push(original[1]);
+    }
+
+    debug_assert_eq!(visual.len(), original.len());
+    buf[start..end].copy_from_slice(&visual);
+}
+
+/// Whether `u` is the consonant Ra for its Indic script (offset 0x30 in every
+/// block we handle) — the consonant that forms a reph when followed by halant.
+fn indic_ra(u: u32) -> bool {
+    matches!(indic_block_base(u), Some(base) if u - base == 0x30)
 }
 
 #[cfg(test)]
@@ -2618,5 +3131,494 @@ mod tests {
             let adv = |_g: u16| 500;
             let _ = cs.shape(&[1, 2, 3], &[1, 2, 3], *b"latn", &adv);
         }
+    }
+
+    // ── new lookups (GSUB 2/3/8, GPOS 3) + Indic reordering ───────────────────
+
+    // GSUB type 2 (multiple substitution) under `latn`/`ccmp`: glyph `from`
+    // decomposes into the sequence `seq`. Single subtable, format 1.
+    fn gsub_multiple_format1(from: u16, seq: &[u16]) -> Vec<u8> {
+        let mut b = Vec::new();
+        let m = seq.len() as u16;
+        let script_list_off = 10u16;
+        let script_table_off = script_list_off + 2 + 6;
+        let langsys_off = script_table_off + 4;
+        let feature_list_off = langsys_off + 8;
+        let feature_off = feature_list_off + 8;
+        let lookup_list_off = feature_off + 6;
+        let lookup_off = lookup_list_off + 4;
+        // MultipleSubstFormat1: format(2)+coverageOff(2)+seqCount(2)+seqOffsets[1](2)=8
+        let multi_off = lookup_off + 8;
+        let coverage_off = multi_off + 8;
+        // Coverage fmt1 = 6 bytes.
+        let seq_off = coverage_off + 6;
+        // Sequence: glyphCount(2)+glyphs(m*2).
+
+        b.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        b.extend_from_slice(&script_list_off.to_be_bytes());
+        b.extend_from_slice(&feature_list_off.to_be_bytes());
+        b.extend_from_slice(&lookup_list_off.to_be_bytes());
+        // ScriptList (latn)
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"latn");
+        b.extend_from_slice(&(script_table_off - script_list_off).to_be_bytes());
+        b.extend_from_slice(&(langsys_off - script_table_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        // FeatureList: ccmp
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"ccmp");
+        b.extend_from_slice(&(feature_off - feature_list_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        // LookupList
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(lookup_off - lookup_list_off).to_be_bytes());
+        // Lookup (type 2)
+        b.extend_from_slice(&2u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(multi_off - lookup_off).to_be_bytes());
+        // MultipleSubstFormat1
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(coverage_off - multi_off).to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes()); // sequenceCount
+        b.extend_from_slice(&(seq_off - multi_off).to_be_bytes());
+        // Coverage fmt1
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&from.to_be_bytes());
+        // Sequence
+        b.extend_from_slice(&m.to_be_bytes());
+        for &g in seq {
+            b.extend_from_slice(&g.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn complex_gsub_multiple_substitution_grows_run() {
+        // glyph 7 decomposes into [70, 71, 72].
+        let gsub = gsub_multiple_format1(7, &[70, 71, 72]);
+        let font = font_with_layout(b"GSUB", gsub);
+        let ttf = TrueTypeFont::parse_metrics(&font).expect("font parses");
+        let cs = ComplexShaper::new(&ttf).expect("has layout");
+        let adv = |_g: u16| 500;
+        // Run [5, 7, 9] → [5, 70, 71, 72, 9]; cluster of the new glyphs is the
+        // source glyph's cluster (1).
+        let out = cs.shape(&[5, 7, 9], &[b'a' as u32, b'b' as u32, b'c' as u32], *b"latn", &adv);
+        let gids: Vec<u16> = out.iter().map(|g| g.gid).collect();
+        assert_eq!(gids, vec![5, 70, 71, 72, 9], "multiple subst expanded the run");
+        assert_eq!(out[1].cluster, 1);
+        assert_eq!(out[3].cluster, 1, "expanded glyphs share the source cluster");
+        // Advances were reseeded from hmtx for every glyph (including the new ones).
+        assert!(out.iter().all(|g| g.x_advance == 500));
+    }
+
+    // GSUB type 3 (alternate) under `latn`/`aalt`: glyph `from` has alternates
+    // `alts`; the default rendering picks alternates[0].
+    fn gsub_alternate_format1(from: u16, alts: &[u16]) -> Vec<u8> {
+        let mut b = Vec::new();
+        let m = alts.len() as u16;
+        let script_list_off = 10u16;
+        let script_table_off = script_list_off + 2 + 6;
+        let langsys_off = script_table_off + 4;
+        let feature_list_off = langsys_off + 8;
+        let feature_off = feature_list_off + 8;
+        let lookup_list_off = feature_off + 6;
+        let lookup_off = lookup_list_off + 4;
+        // AlternateSubstFormat1: format(2)+coverageOff(2)+altSetCount(2)+altSetOffsets[1](2)=8
+        let alt_off = lookup_off + 8;
+        let coverage_off = alt_off + 8;
+        let altset_off = coverage_off + 6;
+        // AlternateSet: glyphCount(2)+glyphs(m*2).
+
+        b.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        b.extend_from_slice(&script_list_off.to_be_bytes());
+        b.extend_from_slice(&feature_list_off.to_be_bytes());
+        b.extend_from_slice(&lookup_list_off.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"latn");
+        b.extend_from_slice(&(script_table_off - script_list_off).to_be_bytes());
+        b.extend_from_slice(&(langsys_off - script_table_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        // FeatureList: calt (so the standard feature set picks it up)
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"calt");
+        b.extend_from_slice(&(feature_off - feature_list_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(lookup_off - lookup_list_off).to_be_bytes());
+        // Lookup (type 3)
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(alt_off - lookup_off).to_be_bytes());
+        // AlternateSubstFormat1
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(coverage_off - alt_off).to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes()); // alternateSetCount
+        b.extend_from_slice(&(altset_off - alt_off).to_be_bytes());
+        // Coverage fmt1
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&from.to_be_bytes());
+        // AlternateSet
+        b.extend_from_slice(&m.to_be_bytes());
+        for &g in alts {
+            b.extend_from_slice(&g.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn complex_gsub_alternate_picks_first() {
+        // glyph 8 has alternates [180, 181]; default → 180.
+        let gsub = gsub_alternate_format1(8, &[180, 181]);
+        let font = font_with_layout(b"GSUB", gsub);
+        let ttf = TrueTypeFont::parse_metrics(&font).expect("font parses");
+        let cs = ComplexShaper::new(&ttf).expect("has layout");
+        let adv = |_g: u16| 500;
+        let out = cs.shape(&[8, 9], &[b'a' as u32, b'b' as u32], *b"latn", &adv);
+        assert_eq!(out[0].gid, 180, "alternate[0] selected");
+        assert_eq!(out[1].gid, 9, "uncovered glyph untouched");
+    }
+
+    // GSUB type 8 (reverse chaining single) under `latn`/`calt`: glyph `from`
+    // becomes `to` when immediately followed (lookahead) by `look`. No backtrack.
+    fn gsub_reverse_chain(from: u16, to: u16, look: u16) -> Vec<u8> {
+        let mut b = Vec::new();
+        let script_list_off = 10u16;
+        let script_table_off = script_list_off + 2 + 6;
+        let langsys_off = script_table_off + 4;
+        let feature_list_off = langsys_off + 8;
+        let feature_off = feature_list_off + 8;
+        let lookup_list_off = feature_off + 6;
+        let lookup_off = lookup_list_off + 4;
+        // ReverseChainSingleSubstFormat1:
+        //  format(2)=1, coverageOff(2),
+        //  backtrackCount(2)=0,
+        //  lookaheadCount(2)=1, lookaheadCoverage[1](2),
+        //  glyphCount(2)=1, substituteGlyphIDs[1](2)
+        //  = 2+2 + 2 + 2+2 + 2+2 = 14 bytes
+        let rcs_off = lookup_off + 8;
+        let input_cov_off = rcs_off + 14;
+        let look_cov_off = input_cov_off + 6;
+
+        b.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        b.extend_from_slice(&script_list_off.to_be_bytes());
+        b.extend_from_slice(&feature_list_off.to_be_bytes());
+        b.extend_from_slice(&lookup_list_off.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"latn");
+        b.extend_from_slice(&(script_table_off - script_list_off).to_be_bytes());
+        b.extend_from_slice(&(langsys_off - script_table_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"calt");
+        b.extend_from_slice(&(feature_off - feature_list_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(lookup_off - lookup_list_off).to_be_bytes());
+        // Lookup (type 8)
+        b.extend_from_slice(&8u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(rcs_off - lookup_off).to_be_bytes());
+        // ReverseChainSingleSubstFormat1
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(input_cov_off - rcs_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes()); // backtrackGlyphCount
+        b.extend_from_slice(&1u16.to_be_bytes()); // lookaheadGlyphCount
+        b.extend_from_slice(&(look_cov_off - rcs_off).to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes()); // glyphCount
+        b.extend_from_slice(&to.to_be_bytes()); // substitute[0]
+        // input coverage
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&from.to_be_bytes());
+        // lookahead coverage
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&look.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn complex_gsub_reverse_chain_substitutes() {
+        // 40 → 140 when followed by 41.
+        let gsub = gsub_reverse_chain(40, 140, 41);
+        let font = font_with_layout(b"GSUB", gsub);
+        let ttf = TrueTypeFont::parse_metrics(&font).expect("font parses");
+        let cs = ComplexShaper::new(&ttf).expect("has layout");
+        let adv = |_g: u16| 500;
+        let out = cs.shape(&[40, 41], &[b'a' as u32, b'b' as u32], *b"latn", &adv);
+        assert_eq!(out[0].gid, 140, "reverse-chain fired with lookahead present");
+        assert_eq!(out[1].gid, 41);
+        // Without the lookahead glyph → no substitution.
+        let out2 = cs.shape(&[40, 42], &[b'a' as u32, b'c' as u32], *b"latn", &adv);
+        assert_eq!(out2[0].gid, 40, "no lookahead → unchanged");
+    }
+
+    // GPOS type 3 (cursive) under `latn`/`curs`: glyph 50 has an exit anchor at
+    // (400, 100); glyph 51 has an entry anchor at (0, 30). Connecting them aligns
+    // 51's entry y to 50's exit y and folds the gap into 50's advance.
+    fn gpos_cursive() -> Vec<u8> {
+        let mut b = Vec::new();
+        let script_list_off = 10u16;
+        let script_table_off = script_list_off + 2 + 6;
+        let langsys_off = script_table_off + 4;
+        let feature_list_off = langsys_off + 8;
+        let feature_off = feature_list_off + 8;
+        let lookup_list_off = feature_off + 6;
+        let lookup_off = lookup_list_off + 4;
+        // CursivePosFormat1: format(2)=1, coverageOff(2), entryExitCount(2)=2,
+        //  EntryExitRecord[2] = (entryOff(2),exitOff(2)) ×2 = 8
+        //  = 2+2+2 + 8 = 14 bytes
+        let curs_off = lookup_off + 8;
+        let coverage_off = curs_off + 14;
+        // Coverage fmt1 with 2 glyphs = 2+2 + 2*2 = 8 bytes.
+        let anchors_off = coverage_off + 8;
+        // Four anchors, each fmt1 = 6 bytes. We only define exit(50) and entry(51).
+        // Layout: glyph50 entry(none, off 0), glyph50 exit(anchorA),
+        //         glyph51 entry(anchorB), glyph51 exit(none, off 0).
+        let anchor_a_off = anchors_off; // glyph50 exit
+        let anchor_b_off = anchor_a_off + 6; // glyph51 entry
+
+        b.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        b.extend_from_slice(&script_list_off.to_be_bytes());
+        b.extend_from_slice(&feature_list_off.to_be_bytes());
+        b.extend_from_slice(&lookup_list_off.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"latn");
+        b.extend_from_slice(&(script_table_off - script_list_off).to_be_bytes());
+        b.extend_from_slice(&(langsys_off - script_table_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        // FeatureList: curs
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(b"curs");
+        b.extend_from_slice(&(feature_off - feature_list_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        // LookupList
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(lookup_off - lookup_list_off).to_be_bytes());
+        // Lookup (type 3 cursive)
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(curs_off - lookup_off).to_be_bytes());
+        // CursivePosFormat1
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(coverage_off - curs_off).to_be_bytes());
+        b.extend_from_slice(&2u16.to_be_bytes()); // entryExitCount
+        // EntryExitRecord[0] for glyph 50: entry=none, exit=anchorA
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&(anchor_a_off - curs_off).to_be_bytes());
+        // EntryExitRecord[1] for glyph 51: entry=anchorB, exit=none
+        b.extend_from_slice(&(anchor_b_off - curs_off).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        // Coverage fmt1: glyphs 50, 51
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&2u16.to_be_bytes());
+        b.extend_from_slice(&50u16.to_be_bytes());
+        b.extend_from_slice(&51u16.to_be_bytes());
+        // anchorA (glyph50 exit) = (400, 100)
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&400i16.to_be_bytes());
+        b.extend_from_slice(&100i16.to_be_bytes());
+        // anchorB (glyph51 entry) = (0, 30)
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0i16.to_be_bytes());
+        b.extend_from_slice(&30i16.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn complex_gpos_cursive_attaches() {
+        let gpos = gpos_cursive();
+        let font = font_with_layout(b"GPOS", gpos);
+        let ttf = TrueTypeFont::parse_metrics(&font).expect("font parses");
+        let cs = ComplexShaper::new(&ttf).expect("has layout");
+        let adv = |_g: u16| 500;
+        let out = cs.shape(&[50, 51], &[b'a' as u32, b'b' as u32], *b"latn", &adv);
+        // glyph 51 entry y (30) aligns to glyph 50 exit y (100): y_offset = 100-30.
+        assert_eq!(out[1].y_offset, 70, "next glyph baseline shifted to exit anchor");
+        // glyph 50 advance becomes exit.x (400) - entry.x (0) = 400.
+        assert_eq!(out[0].x_advance, 400, "advance closed to the exit anchor");
+    }
+
+    // ── Indic reordering ──────────────────────────────────────────────────────
+
+    // Build a positioned buffer straight from unicodes (1:1, the pre-GSUB state),
+    // using the codepoint as a stand-in glyph id so reordering is observable by
+    // glyph id == original character.
+    fn indic_buf(unicodes: &[u32]) -> Vec<ShapedGlyph> {
+        unicodes
+            .iter()
+            .enumerate()
+            .map(|(i, &u)| ShapedGlyph {
+                gid: u as u16,
+                x_advance: 0,
+                x_offset: 0,
+                y_offset: 0,
+                cluster: i,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn indic_category_classifies_devanagari() {
+        assert_eq!(indic_category(0x0915), IndicCat::Consonant); // KA
+        assert_eq!(indic_category(0x0905), IndicCat::Vowel); // A (independent)
+        assert_eq!(indic_category(0x094D), IndicCat::Halant); // virama
+        assert_eq!(indic_category(0x093C), IndicCat::Nukta); // nukta
+        assert_eq!(indic_category(0x093F), IndicCat::MatraPre); // I (pre-base)
+        assert_eq!(indic_category(0x093E), IndicCat::MatraOther); // AA (post)
+        assert_eq!(indic_category(0x0902), IndicCat::Other); // anusvara
+        assert_eq!(indic_category(b'A' as u32), IndicCat::NonIndic);
+        assert!(indic_ra(0x0930), "Devanagari RA detected");
+        assert!(!indic_ra(0x0915));
+    }
+
+    #[test]
+    fn indic_reorder_moves_pre_base_matra_before_base() {
+        // Devanagari "कि" = KA(0915) + I-matra(093F). Logical order is consonant
+        // then matra; the pre-base "i" matra must render BEFORE the consonant.
+        let uni = [0x0915u32, 0x093F];
+        let mut buf = indic_buf(&uni);
+        reorder_indic(&uni, &mut buf);
+        let gids: Vec<u16> = buf.iter().map(|g| g.gid).collect();
+        assert_eq!(
+            gids,
+            vec![0x093F, 0x0915],
+            "pre-base matra moved before the base consonant"
+        );
+    }
+
+    #[test]
+    fn indic_reorder_moves_reph_to_syllable_end() {
+        // "र्क" = RA(0930) + virama(094D) + KA(0915). The initial Ra+virama forms
+        // a reph that repositions to the end of the syllable.
+        let uni = [0x0930u32, 0x094D, 0x0915];
+        let mut buf = indic_buf(&uni);
+        reorder_indic(&uni, &mut buf);
+        let gids: Vec<u16> = buf.iter().map(|g| g.gid).collect();
+        assert_eq!(
+            gids,
+            vec![0x0915, 0x0930, 0x094D],
+            "reph (Ra+virama) moved after the base"
+        );
+    }
+
+    #[test]
+    fn indic_reorder_reph_and_pre_base_matra_together() {
+        // "र्कि" = RA + virama + KA + I-matra. The "i" matra goes to the very
+        // front; the reph goes to the very end; the base KA sits between.
+        let uni = [0x0930u32, 0x094D, 0x0915, 0x093F];
+        let mut buf = indic_buf(&uni);
+        reorder_indic(&uni, &mut buf);
+        let gids: Vec<u16> = buf.iter().map(|g| g.gid).collect();
+        assert_eq!(
+            gids,
+            vec![0x093F, 0x0915, 0x0930, 0x094D],
+            "matra first, base, then reph last"
+        );
+    }
+
+    #[test]
+    fn indic_reorder_leaves_simple_syllable_and_separators() {
+        // A lone consonant and word separators (space) are untouched.
+        let uni = [0x0915u32, 0x0020, 0x0916];
+        let mut buf = indic_buf(&uni);
+        reorder_indic(&uni, &mut buf);
+        let gids: Vec<u16> = buf.iter().map(|g| g.gid).collect();
+        assert_eq!(gids, vec![0x0915, 0x0020, 0x0916], "no reorder without a matra/reph");
+    }
+
+    #[test]
+    fn indic_reorder_is_noop_on_non_indic() {
+        // Latin text fed to the reorderer must be byte-identical (defence in depth:
+        // the caller already gates this, but the machine must self-guard too).
+        let uni: Vec<u32> = "Hello".chars().map(|c| c as u32).collect();
+        let mut buf = indic_buf(&uni);
+        let before = buf.clone();
+        reorder_indic(&uni, &mut buf);
+        assert_eq!(buf, before, "Latin run unchanged by the Indic reorderer");
+    }
+
+    #[test]
+    fn detect_complex_script_routes_indic() {
+        // Devanagari / Tamil / Telugu route to their v2 tags…
+        assert_eq!(detect_complex_script("\u{0915}\u{093F}"), Some(*b"dev2"));
+        assert_eq!(detect_complex_script("\u{0B95}"), Some(*b"tml2"));
+        assert_eq!(detect_complex_script("\u{0C15}"), Some(*b"tel2"));
+        assert_eq!(detect_complex_script("\u{0995}"), Some(*b"bng2")); // Bengali
+        // …and an Indic matra (a combining mark) must NOT fall through to `latn`.
+        assert_eq!(detect_complex_script("\u{093F}"), Some(*b"dev2"));
+        // Latin stays on the fast path (byte-identical guarantee for plain text).
+        assert_eq!(detect_complex_script("Hello"), None);
+        assert_eq!(detect_complex_script("résumé"), None);
+        assert!(is_indic_script(*b"dev2"));
+        assert!(!is_indic_script(*b"latn"));
+        // Khmer/Myanmar are deliberately not Indic-reordered here.
+        assert_eq!(detect_complex_script("\u{1780}"), None, "Khmer not reordered");
+    }
+
+    #[test]
+    fn indic_shape_applies_reordering_then_gsub() {
+        // End-to-end: a `dev2`/`pres` single subst maps the (reordered) base KA
+        // glyph 0x0915 → 0x2915. Feeding "कि" the reorderer puts the matra first,
+        // then GSUB substitutes the base. Proves reordering + Indic feature
+        // pipeline run together for an Indic script.
+        let gsub = gsub_single_format2(b"dev2", b"pres", &[0x0915], &[0x2915]);
+        let font = font_with_layout(b"GSUB", gsub);
+        let ttf = TrueTypeFont::parse_metrics(&font).expect("font parses");
+        let cs = ComplexShaper::new(&ttf).expect("has layout");
+        let adv = |_g: u16| 500;
+        let uni = [0x0915u32, 0x093F];
+        let out = cs.shape(&[0x0915, 0x093F], &uni, *b"dev2", &adv);
+        let gids: Vec<u16> = out.iter().map(|g| g.gid).collect();
+        assert_eq!(
+            gids,
+            vec![0x093F, 0x2915],
+            "matra reordered to front, base substituted by the pres feature"
+        );
+    }
+
+    #[test]
+    fn latin_path_unaffected_by_new_features() {
+        // The Latin fast path (Shaper, not ComplexShaper) must be byte-identical:
+        // a ligature + kern font still substitutes/kerns exactly as before, and a
+        // plain Latin string never enters complex shaping.
+        let gsub = gsub_with_liga(10, 11, 99);
+        let font = font_with_layout(b"GSUB", gsub);
+        let ttf = TrueTypeFont::parse_metrics(&font).expect("font parses");
+        let shaper = Shaper::new(&ttf);
+        assert_eq!(shaper.substitute(&[10, 11]), vec![99]);
+        assert_eq!(shaper.substitute(&[5, 10, 11, 7]), vec![5, 99, 7]);
+        // Arabic still detected as `arab` (joining path), unchanged by Indic work.
+        assert_eq!(detect_complex_script("\u{0628}\u{0627}"), Some(*b"arab"));
     }
 }
