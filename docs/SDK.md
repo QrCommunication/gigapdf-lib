@@ -39,7 +39,7 @@ try {
 | **Bytes** | `Uint8Array` in and out. PDFs, fonts, images, exports are all bytes. |
 | **Booleans** | edit methods return `true` on success, `false` on a bad page/arg. |
 | **Memory** | every `Uint8Array` you pass is copied into/out of wasm and freed for you. |
-| **Errors** | the engine never throws across the boundary; failures are `false`/`null`/`[]`. (`signP12` is the one exception — it throws a generic error.) |
+| **Errors** | the engine never throws across the boundary; failures are `false`/`null`/`[]`. The signing methods are the exception — `signP12` / `signTimestamped` / `signLtv` throw a generic `Error` on failure, and `saveEncrypted` throws if AES-256 is requested without Web Crypto or a `keySeed`. |
 
 ---
 
@@ -63,7 +63,9 @@ try {
 | `txtToPdf(text)` | `Uint8Array` | Render plain text to a fresh single-/multi-page PDF (standard Helvetica, word-wrapped). |
 | `htmlToPdf(html)` / `htmlRender(html, fonts, w, h, margin)` | `Uint8Array` | Render HTML+CSS to PDF with the **native** engine (no browser). See [HTML-CSS.md](HTML-CSS.md). |
 | `rtfToPdf(rtf)` | `Uint8Array` | Render RTF to PDF. |
-| `officeToPdf(office)` | `Uint8Array` | Convert an Office/ODF file (docx/xlsx/pptx/doc/xls/ppt/odt/ods/odp) to PDF; format auto-detected by magic bytes. |
+| `officeToPdf(office)` | `Uint8Array` | Convert an Office/ODF file (docx/xlsx/pptx/doc/xls/ppt/odt/ods/odp) to PDF; format auto-detected by magic bytes. Faces the container embeds itself are de-obfuscated and used; families it only *references* fall back to a bundled face (use the two-phase variant below for an exact match). |
+| `officeNeededFonts(office)` | `HtmlFontRequest[] \| null` | **Phase 1** for an exact Office render: the Google/system fonts the container **references but doesn't embed** (e.g. Calibri). Download each `url` → TTF and pass them to `officeToPdfWith`. `null` if not a recognized Office container; `[]` if none are needed. |
+| `officeToPdfWith(office, fonts?)` | `Uint8Array` | **Phase 2**: render an Office container to PDF with the host-fetched `fonts` embedded, so referenced-but-not-embedded families lay out with the right metrics (e.g. Carlito for Calibri). The container's own embedded faces win on conflict, so `fonts = []` yields exactly `officeToPdf`'s output. |
 | `imageToPdf(image)` | `Uint8Array` | Wrap a raster image in a single A4-page PDF (centred, shrink-to-fit, never upscaled). Format auto-detected: **PNG, JPEG, GIF, WebP, AVIF** (GIF/WebP/AVIF transcoded to PNG before embed; PNG keeps every color-type & bit-depth, Adam7 interlacing and transparency via `/SMask`). Empty `Uint8Array` for an unrecognized format. |
 | `mergePdfs(pdfs)` | `Uint8Array` | Concatenate a list of PDFs into one (sequential `appendPages` under the hood). `0` inputs → empty; `1` → returned unchanged; `N` → merged. |
 | `gridsToXlsx(grids, sheetNames?)` / `gridsToOds(grids, sheetNames?)` | `Uint8Array` | Write a host-built grid (`pages[rows][cells]`, `string[][][]`) to an `.xlsx`/`.ods` workbook — one sheet per page — with the native writer. Supply your own table reconstruction and emit Office output with **no third-party library**. `sheetNames` (index-aligned) overrides the default `Page <n>` titles. |
@@ -146,6 +148,7 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 |--------|---------|-------------|
 | `textRuns(page)` | `TextRunInfo[]` | Raw content-stream text runs (operator + text), in draw order. |
 | `structuredText(page)` | `TextLine[]` | Lines with bounding boxes (`x,y,w,h` + text) — for selection / extraction. |
+| `pageBlocks(page)` | `GigaBlock[]` | The **layout blocks** of one page — its structural reconstruction (paragraphs, headings, lists, tables, shapes, images) in reading order, each `GigaBlock` keeping a top-down `frame` and every text run its `source_index` back to the editable content-stream operator. The **per-page** counterpart of `toModel()` (which reconstructs the whole document at once): a continuous / lazily-virtualized editor calls this one page at a time. Out-of-range page → `[]`. |
 | `elements(page)` | `Element[]` | All content elements (text/image/path) with kind + bounds — the editor scene graph. |
 | `textElements(page)` | `TextElementInfo[]` | **Rich** per-run text for an editor: text + bounds (user space) + resolved `fontFamily`/`bold`/`italic` + `fontSize` + RGB `color` + `rotation`. `index` is the text-run index for `replaceText` — extract, render and edit from one model. |
 | `imageElements(page)` | `ImageElementInfo[]` | Image placements for an editor: `{ index, x, y, width, height, format, pixelWidth, pixelHeight, data, rotation, opacity }`. Bounds user space; `format` `jpeg`/`png`/`jp2`/`unknown`; `data` is the embeddable encoded bytes (JPEG/JP2 passthrough, Flate/raw RGB·Gray re-encoded to PNG); `rotation` (deg) and `opacity` (`/ca`) come from the placement CTM + `/ExtGState`. The native replacement for a reader's image extraction. |
@@ -163,6 +166,7 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 | `transformElement(page, index, m)` | `boolean` | Apply a full affine transform to an element in place. `m = [a, b, c, d, e, f]` is a PDF matrix (scale / rotate / shear / translate); it **generalises** `moveElement` (whose matrix is the pure translate `[1,0,0,1,dx,dy]`) to move + resize + rotate in one call. Non-destructive: the element is wrapped in `q  a b c d e f cm  …  Q`, so its internal coordinates are never rewritten — it works identically for text, images and shapes. `false` if the page/element doesn't exist. |
 | `reorderElement(page, index, toFront)` | `boolean` | Change the paint (z) order of an element. `toFront = true` moves its op range to the **end** of the content stream (painted last → on top); `false` moves it to the **start** (painted first → behind everything). The moved range is re-wrapped in `q … Q` with the element's effective graphics state (fill/stroke colour, line width, dash and, for text, font) re-emitted inside it, so it renders identically at its new position and does not leak state onto neighbours; works for text, images and shapes. **The element's index changes after the move — re-read `pageElements`.** `false` if the page/element doesn't exist. |
 | `setPathStyle(page, index, style)` | `boolean` | Re-style a **path** element in place (returns `false` for a non-path index). `style = { fill?, stroke?, strokeWidth?, fillAlpha?, strokeAlpha?, dash? }`; colours are RGB `[r,g,b]` in `0..=1`, `dash` is the PDF dash array (`[]` = solid). The path's op range is wrapped in `q … Q` and, for each provided field, an override operator is injected before the paint op: `fill`→`r g b rg`, `stroke`→`r g b RG`, `strokeWidth`→`w`, `dash`→`[…] 0 d`; omitted fields keep the inherited state. **`fillAlpha`/`strokeAlpha` (`0..=1`) are applied** — an `/ExtGState` carrying `/ca`/`/CA` is registered on the page and a `/<gs> gs` is injected into the path's `q … Q` wrap, so the alpha applies to that path run only. (For non-path elements such as images, use `setElementOpacity`.) |
+| `setTextRunStyle(page, index, spans)` | `boolean` | Re-style **sub-ranges** of a **text** run in place — the by-character companion of `setPathStyle`. Each span sets the style of the `[start, end)` UTF-16 slice of the run's *decoded* text; `spans = [{ start, end, color?, sizePt?, bold?, italic?, underline?, strike? }]` (`color` is `[r,g,b]` in `0..=1`). The run is split so the rest keeps its style, and **positioning is preserved** — the original glyph codes (incl. `TJ` kerning) are sliced and re-emitted, never re-encoded, each styled slice wrapped in `q … Q`. `bold` is faux-bold (fill+stroke) when no bold variant is wired; `italic` is a no-op without an italic variant. Spans may be in any order and are clamped. `false` if `index` isn't a top-level text run. |
 | `setElementOpacity(page, index, fillAlpha)` | `boolean` | Set one constant opacity (`fillAlpha`, clamped `0..=1`) on **any** element — text, image **or** shape — by registering an `/ExtGState` (`/ca` = `/CA` = `fillAlpha`, auto-named `GpGs<n>`) on the page and wrapping the element's op range in `q /<gs> gs … Q`. This is how you set an **image**'s alpha in place; shapes may also use `setPathStyle`'s `fillAlpha`/`strokeAlpha` (same `/ExtGState` mechanism, but those let you set fill and stroke alpha independently, whereas this uses one value for both). `false` if the page/index doesn't exist. |
 | `duplicateElement(page, index)` | `boolean` | Clone an element. |
 
@@ -175,6 +179,7 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 | `addWatermark(page, x, y, size, text, rgb?, opacity?, rotationDeg?)` | `boolean` | Standard-Helvetica watermark (thin wrapper over `addStandardText`). |
 | `addTextLayer(page, runs)` | `number` | Stamp an invisible (render-mode 3) text layer — e.g. a searchable OCR layer; one content append. Each run is `{ x, y, size, text, rotation? }`. Returns runs written. |
 | `addImage(page, data, x, y, w, h, opacity?)` | `boolean` | Embed a PNG/JPEG as an image XObject in the box `(x,y,w,h)`. |
+| `addImageWatermark(data, opts?)` | `boolean` | Stamp an **image watermark** across pages from raw bytes — decodes **PNG/JPEG/WebP/GIF/AVIF**, embeds it **once** and references it on every target page. `opts = { pages?, anchor?, offsetX?, offsetY?, width?, height?, rotationDeg?, opacity?, tile? }`: `pages` is 1-based (omit/`[]` = every page); `anchor` is `'center'` (default) or a corner; `offsetX`/`offsetY` nudge it (in `tile` mode they are the gaps between tiles); `width`/`height` set the size in points (height keeps aspect when omitted); `rotationDeg` rotates about the centre; `opacity` (0–1, default 0.25). `false` if the image can't be decoded. |
 | `addRectangle(page, x, y, w, h, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Vector rectangle. `stroke`/`fill` are `0xRRGGBB` or `null`. |
 | `addEllipse(page, cx, cy, rx, ry, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Vector ellipse (Bézier). |
 | `addPolygon(page, points, close, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Polyline/polygon from a flat `[x0,y0,x1,y1,…]` list. |
@@ -248,7 +253,8 @@ Three ways to draw real, selectable text — **no host font files required**:
 | `addRadioGroup(page, name, options, opts?)` | `boolean` | Create a radio group; `options = [{ export, rect }]`. |
 | `addComboBox(page, name, options, opts?)` | `boolean` | Create a dropdown; `opts = { selected, editable, style }`. |
 | `addListBox(page, name, options, opts?)` | `boolean` | Create a list box; `opts = { selected, multi, style }`. |
-| `flattenForm()` | `number` | Bake all fields into static page content. |
+| `flattenForm()` | `number` | Bake every **AcroForm** field widget across all pages into page content and drop `/AcroForm` — the document is no longer fillable (`fields()` then returns `[]`). Returns the number of widgets baked. |
+| `flattenFormXObjects(page)` | `number` | Inline & **de-share** a page's form XObjects (`/Subtype /Form` invoked via `Do`) into its content stream, so their text/graphics become **ordinary editable page content** with real text-run indices — the enabler for editing invoice/template text in place via `replaceText`/`moveElement`/`removeElement` instead of a redact+add overlay. Image XObjects are untouched. Distinct from `flattenForm` (which flattens **interactive AcroForm fields**). Returns the number of form XObjects inlined. |
 
 Every created widget gets a real `/AP` appearance stream and the form is flagged
 `NeedAppearances`. `FieldStyle = { fontSize, color, border, background, borderWidth }`.
@@ -302,17 +308,31 @@ for a universal editor that edits every format the same way. See the
 | `doc.toModel()` | `GigaPdfDoc` | `GigaDocument` | Lower this PDF into the unified model. |
 | `officeToModel(office)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower an Office/ODF file (auto-detected); `null` if not a recognised container. |
 | `htmlToModel(html)` | `GigaPdfEngine` | `GigaDocument` | Lower an HTML string into the model. |
+| `mdToModel(md)` | `GigaPdfEngine` | `GigaDocument` | Lower a Markdown string (CommonMark-ish: headings, lists, GFM tables, fenced code, emphasis/links) into the model. |
+| `csvToModel(csv)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower a CSV file (UTF-8 bytes, RFC 4180, auto `,`/`;`/tab/`\|` delimiter) into the model as a single editable table; `null` if no parseable fields. |
 | `applyModelOps(model, ops)` | `GigaPdfEngine` | `GigaDocument` | Apply a batch of [`ModelOp`](#types) edits (run in order; out-of-range addresses are no-ops, so a partial batch never throws). |
-| `modelToDocx / modelToXlsx / modelToPptx / modelToOdt / modelToOds / modelToOdp / modelToPdf(model)` | `GigaPdfEngine` | `Uint8Array` | Raise the model to each binary target. |
-| `modelToHtml(model)` / `modelToRtf(model)` | `GigaPdfEngine` | `string` | Raise the model to HTML / RTF text. |
+| `modelToDocx / modelToXlsx / modelToPptx / modelToOdt / modelToOds / modelToOdp / modelToPdf / modelToEpub(model)` | `GigaPdfEngine` | `Uint8Array` | Raise the model to each binary target (`modelToEpub` emits an `.epub` e-book). |
+| `modelToHtml / modelToRtf / modelToMarkdown / modelToCsv(model)` | `GigaPdfEngine` | `string` | Raise the model to HTML / RTF / Markdown / CSV text. |
 
-A `ModelOp` addresses a block by `[section, page, index]` (zero-based). The
-ops: `setRunText`, `restyleRun`, `insertRun`, `deleteRun`, `insertBlock`,
-`deleteBlock`, `moveBlock`, `setBlockText`, `restyleBlock`, `setCellText`,
-`setSheetCell`. A run's character style (`GigaCharStyle`) carries `bold`,
-`italic`, `underline`, `strike`, `color`, `size_pt`, and `valign`
-(`"baseline" | "super" | "sub"` — sub/superscript), so decorations and offset
-baselines survive a round-trip.
+A `ModelOp` addresses a block by `[section, page, index]` (zero-based). The full
+op set:
+
+- **Runs:** `setRunText`, `restyleRun`, `insertRun`, `deleteRun`.
+- **Blocks:** `insertBlock`, `deleteBlock`, `moveBlock`, `setBlockText`,
+  `restyleBlock`, `setBlockFrame`, `setBlockRotation`.
+- **Paragraph:** `setParagraphStyle` (a `GigaParaPatch`: `align`, `indent_left`,
+  `indent_right`, `first_line`, `space_before`, `space_after`, `line_height`).
+- **Lists:** `setListLevel`, `setListMarker`, `setListOrdered`.
+- **Tables:** `setCellText`, `insertTableRow`, `deleteTableRow`,
+  `insertTableColumn`, `deleteTableColumn`, `setCellSpan`, `setCellShading`,
+  `setRowHeight`, `setColWidth`, `setTableBorder` (structural edits keep
+  `col_widths` + spans coherent).
+- **Spreadsheets:** `setSheetCell`, `insertSheetRow`, `deleteSheetRow`,
+  `insertSheetColumn`, `deleteSheetColumn` (shift cells and re-map merge ranges).
+
+A run's character style (`GigaCharStyle`) carries `bold`, `italic`, `underline`,
+`strike`, `color`, `size_pt`, and `valign` (`"baseline" | "super" | "sub"` —
+sub/superscript), so decorations and offset baselines survive a round-trip.
 
 ### Render
 
@@ -337,7 +357,7 @@ it runs **PaddleOCR PP-OCR** models through **RTen** (a pure-Rust ONNX runtime, 
 whose weights are far heavier than the lean ~540 KB WASM core. Run it host-side (a service/binary)
 and expose it as an endpoint; this WASM SDK provides the **text-layer** side (`addTextLayer`) so a
 host can stamp recognized words back onto the PDF to make a scan searchable. For PDFs that already
-carry text, prefer the SDK's `extractText` / `structuredText` / `search` (exact, no OCR needed).
+carry text, prefer the SDK's `toText` / `structuredText` / `search` (exact, no OCR needed).
 
 **Engine:** shared **DBNet** detector + per-language **SVTR/CRNN + CTC** recognizers, with automatic
 per-line **script selection** (each line routed to the highest-confidence printed recognizer — no
@@ -370,14 +390,112 @@ Models are fetched/converted at deploy (`tools/fetch_models.sh`); see
 
 ### Security
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `saveEncrypted(password, fileId, opts?)` | `Uint8Array` | Encrypt (RC4-128 / AES-128 / AES-256); `opts = { ownerPassword, permissions, keySeed }`. The host supplies the file id and key seed (the wasm has no RNG). |
-| `sign(fields, random, keyBits?)` | `Uint8Array` | Self-signed `adbe.pkcs7.detached` signature (an ephemeral digital ID); `fields = "name\treason\tdate\tnotBefore\tnotAfter"`, `random` ≥ 256 host bytes. |
-| `signP12(p12, password, opts?)` | `Uint8Array` | Sign with a **user PKCS#12** identity (CA/eIDAS cert + RSA key), imported natively. `opts = { name, reason, date, location, contactInfo }`. **Throws** a generic error on a bad password/file/cipher (anti-enumeration). |
+#### Encryption & permissions
+
+| Method | Class | Returns | Description |
+|--------|-------|---------|-------------|
+| `saveEncrypted(password, fileId, opts?)` | `GigaPdfDoc` | `Uint8Array` | Encrypt with the PDF Standard Security Handler — **default AES-256 (R6)**, or `"rc4"` (RC4-128) / `"aes128"`. `opts = { ownerPassword?, algorithm?, flags?, permissions?, keySeed? }`. `flags` (a `Partial<PdfPermissions>`) is the readable way to set the eight access permissions; `permissions` is the raw signed-32-bit `/P` (overridden by `flags`). For AES-256 a secret 32-byte key is taken from `keySeed` or generated with Web Crypto (RC4/AES-128 derive it from the password). |
+| `permissionsToP(flags?)` | `GigaPdfEngine` | `number` | Pack eight `PdfPermissions` flags (omitted = granted) into a signed 32-bit `/P` value (ISO 32000-1 Table 22). Feed to `saveEncrypted` via `opts.permissions`. |
+| `decodePermissions(p)` | `GigaPdfEngine` | `PdfPermissions` | Decode a `/P` bitmask into the eight named booleans (`true` = granted). |
+| `getPermissions(pdf)` | `GigaPdfEngine` | `PdfPermissions` | Read a PDF's access permissions **without decrypting** it (an unencrypted document grants everything). |
+
+`PdfPermissions = { print, modify, copy, annotate, fillForms, accessibility,
+assemble, printHighRes }` (all `boolean`).
+
+#### Digital signatures
+
+Four levels, escalating in long-term assurance. All produce a CMS signature in a
+`/Sig` field over a `/ByteRange`-patched PDF, **entirely in-engine** (no
+node-forge / @signpdf / pdf-lib). `sign`/`signP12` are synchronous; the
+timestamped/LTV methods are **`async`** because they need network round trips.
+
+| Method | Returns | Level | Description |
+|--------|---------|-------|-------------|
+| `sign(fields, random, keyBits?)` | `Uint8Array` | **B** (self-signed) | Self-signed `adbe.pkcs7.detached` signature (an ephemeral digital ID). `fields = "name\treason\tdate\tnotBefore\tnotAfter"`, `random` ≥ 256 host bytes, `keyBits` RSA modulus (default 2048). |
+| `signP12(p12, password, opts?)` | `Uint8Array` | **B** (PKCS#12) | Sign with a **user PKCS#12** identity (CA/eIDAS cert + RSA key), imported natively. `opts = { name?, reason?, date?, location?, contactInfo? }` (`SignP12Options`). **Throws** a generic error on a bad password/file/cipher (anti-enumeration). |
+| `signTimestamped(opts)` | `Promise<Uint8Array>` | **B-T** (PAdES) | B signature **+ an RFC 3161 trusted timestamp** embedded in the SignerInfo (`ETSI.CAdES.detached`, `signing-certificate-v2`, `id-aa-timeStampToken`). `opts` is `SignTsaOptions`. |
+| `signLtv(opts)` | `Promise<Uint8Array>` | **B-LT / B-LTA** (PAdES-LTV) | B-T **+ a `/DSS`** (Document Security Store) carrying the certificate chain and OCSP/CRL revocation material, so the signature validates long after the certs expire/revoke. With `opts.archiveTimestamp` a `/DocTimeStamp` over the whole file is added (**B-LTA**, renewable archival). `opts` is `SignLtvOptions`. |
 
 `signP12` imports PBES2 (PBKDF2 + AES) and PBES1 (3DES, RC2-40) bags and verifies
-the integrity MAC — entirely in-engine, no node-forge / @signpdf / pdf-lib.
+the integrity MAC.
+
+##### `SignTsaOptions` (B-T) — extends `SignP12Options`
+
+```ts
+interface SignTsaOptions extends SignP12Options {
+  tsaUrl: string;                         // TSA endpoint, e.g. "https://freetsa.org/tsr"
+  tsaFetch?: (req: Uint8Array, url: string) => Promise<Uint8Array>;
+  p12?: Uint8Array;                       // PKCS#12 identity; omit → self-signed path
+  password?: string;                      // PKCS#12 passphrase
+  random?: Uint8Array;                    // self-signed path: ≥ 256 random bytes
+  keyBits?: number;                       // self-signed path: RSA bits (default 2048)
+  notBefore?: string;                     // self-signed cert notBefore (UTCTime YYMMDDHHMMSSZ)
+  notAfter?: string;                      // self-signed cert notAfter
+  nonce?: Uint8Array;                     // optional 8–16 bytes echoed by the TSA
+}
+```
+
+The signing identity is **`p12` + `password`** when supplied, otherwise a
+freshly-generated self-signed digital ID (`random` + `notBefore`/`notAfter`).
+
+##### `SignLtvOptions` (B-LT / B-LTA) — extends `SignTsaOptions`
+
+```ts
+interface SignLtvOptions extends SignTsaOptions {
+  archiveTimestamp?: boolean;             // add the B-LTA /DocTimeStamp (2nd TSA round trip). default false (B-LT)
+  revocationFetch?: (req: Uint8Array, url: string) => Promise<Uint8Array>; // OCSP override
+  crlFetch?: (url: string) => Promise<Uint8Array>;                         // CRL override
+}
+```
+
+##### Host-fetch model (2 phases)
+
+The WASM core has no network. The signing methods run a two-phase flow with the
+HTTP **in between**, handled by the SDK:
+
+1. **B-T** — the engine builds the signature and returns the DER `TimeStampReq`;
+   the SDK POSTs it to `tsaUrl` and embeds the returned `TimeStampResp`.
+2. **LTV** — after the B-T signature, the engine reports which OCSP/CRL URLs to
+   fetch (taken **from the certificates' AIA / CRL-DP extensions**); the SDK
+   fetches each (unreachable responders are skipped — the `/DSS` is built from
+   whatever resolves) and stores the material. A self-signed identity (no
+   AIA/CRL-DP) simply yields a `/DSS/Certs`-only store.
+
+The default HTTP helpers are exported and overridable:
+
+| Function | Default behaviour |
+|----------|-------------------|
+| `defaultTsaPost(url, req)` | POST `application/timestamp-query` → raw `TimeStampResp`. |
+| `defaultOcspPost(req, url)` | POST `application/ocsp-request` → raw `OCSPResponse`. |
+| `defaultCrlGet(url)` | GET the URL → raw `CertificateList` (CRL). |
+
+> **SSRF note.** OCSP/CRL/TSA URLs are **host-supplied** — for LTV they come from
+> the certificate extensions, so a malicious certificate could point them at an
+> internal host. The default helpers do **no allow-listing** (they set
+> `redirect: "error"` only). A service exposing signing to untrusted input MUST
+> validate these URLs: pass `tsaFetch` / `revocationFetch` / `crlFetch` to inject
+> an allow-list, auth headers or a proxy. The engine only computes *which* URLs
+> to fetch; the host decides whether to.
+
+```ts
+// B-T with a PKCS#12 identity and FreeTSA, host-controlled fetch (allow-list):
+const signed = await doc.signTimestamped({
+  p12, password, name: "Jane Doe", reason: "Approved",
+  date: "D:20260616120000Z",
+  tsaUrl: "https://freetsa.org/tsr",
+  tsaFetch: async (req, url) => {           // host SSRF gate + auth
+    assertAllowed(url);
+    const r = await fetch(url, { method: "POST",
+      headers: { "Content-Type": "application/timestamp-query" }, body: req });
+    return new Uint8Array(await r.arrayBuffer());
+  },
+});
+
+// B-LTA: B-T + DSS (OCSP/CRL) + a document timestamp over the whole file.
+const ltv = await doc.signLtv({
+  p12, password, tsaUrl: "https://freetsa.org/tsr", archiveTimestamp: true,
+});
+```
 
 ---
 
@@ -389,15 +507,24 @@ All result/option shapes are exported interfaces — import them for typed code:
 import type {
   FontInfo, EmbeddedFont, PageInfo, PageMargins, HeaderFooterSpec, HeaderFooterAlign,
   TextLine, TextRunInfo, Element, TextElementInfo, DocumentLanguage,
-  ImageElementInfo, VectorPathInfo, PathSegment,
-  SearchHit, AnnotationInfo, FieldInfo, FieldStyle, RadioOption,
+  ImageElementInfo, VectorPathInfo, PathSegment, PdfPermissions,
+  SearchHit, AnnotationInfo, FieldInfo, FieldKind, FieldStyle, RadioOption,
   LinkInfo, LayerInfo, OutlineEntry, NamedDest, Attachment, XlsxSheet, DecodedImage,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
-  HtmlMargins, SignP12Options,
+  HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,
   // unified editable model:
-  GigaDocument, GigaSection, GigaPage, GigaBlock, GigaInline, GigaCharStyle,
-  GigaGeneric, GigaBlockAddr, GigaStylePatch, GigaCellValue, ModelOp,
+  GigaDocument, GigaSection, GigaPage, GigaBlock, GigaBlockKind, GigaInline,
+  GigaCharStyle, GigaParagraphStyle, GigaGeneric, GigaBlockAddr, GigaStylePatch,
+  GigaParaPatch, GigaCellValue, GigaOutlineNode, ModelOp,
 } from "@qrcommunication/gigapdf-lib";
+```
+
+The three signing HTTP helpers are also exported (as runtime functions, for use
+as `SignTsaOptions.tsaFetch` / `SignLtvOptions.revocationFetch` / `crlFetch`
+overrides or directly):
+
+```ts
+import { defaultTsaPost, defaultOcspPost, defaultCrlGet } from "@qrcommunication/gigapdf-lib";
 ```
 
 See also: [COOKBOOK.md](COOKBOOK.md) (task-oriented recipes), [USAGE.md](USAGE.md)

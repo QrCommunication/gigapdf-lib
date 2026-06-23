@@ -45,6 +45,7 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `transform_element(page,i,[a,b,c,d,e,f])` (affine generalisation of `move_element`; wraps the element in `q a b c d e f cm … Q` — move/resize/rotate, non-destructive, same for text/image/path) | `gp_transform_element(handle,page,i,a,b,c,d,e,f)` · SDK `transformElement(page,i,m)` |
 | `reorder_element(page,i,to_front)` (native z-order: splices the element's op range to the end (`to_front=true` → on top) or start (behind), re-wrapped in `q … Q` with the element's effective graphics state — fill/stroke colour, line width, dash, font — re-emitted inside it so it keeps its appearance; text/image/path. The unified index changes after the splice — re-read elements) | `gp_reorder_element(handle,page,i,to_front)` · SDK `reorderElement(page,i,toFront)` |
 | `set_path_style(page,i,&PathStyle)` (path elements only; wraps the op range in `q … Q` and injects override ops before the paint: `fill`→`rg`, `stroke`→`RG`, `strokeWidth`→`w`, `dash`→`d`. `fillAlpha`/`strokeAlpha` **applied** via a page `/ExtGState` `/ca`/`/CA` + `/<gs> gs` in the wrap) | `gp_set_path_style_json(handle,page,i,json_ptr,json_len)` · SDK `setPathStyle(page,i,style)`; `PathStyle = {fill?,stroke?:[r,g,b] 0..=1, strokeWidth?, fillAlpha?, strokeAlpha?, dash?:number[]}` |
+| `set_text_run_style(page,i,&[Span])` (per-character-run restyle of text element `i`: each span sets the style of the `[start,end)` UTF-16 slice — bold/italic/underline/strike/colour/sizePt; the run is split so the rest keeps its style and the **original glyph codes/`TJ` kerning are sliced & re-emitted, not re-encoded**, so positioning is preserved; each styled slice wrapped in `q … Q`) | `gp_set_text_run_style_json(handle,page,i,json_ptr,json_len)` · SDK `setTextRunStyle(page,i,spans)`; `Span = {start,end,color?:[r,g,b], sizePt?, bold?, italic?, underline?, strike?}` |
 | `set_element_opacity(page,i,fill_alpha)` (constant opacity on **any** element — text/image/shape; registers `/ExtGState` `/ca`=`/CA`=`fill_alpha` (`0..=1`, auto-named `GpGs<n>`) + `/<gs> gs` in a `q … Q` wrap. The image-alpha path; shapes may instead use `set_path_style` for independent fill/stroke alpha) | `gp_set_element_opacity(handle,page,i,fill_alpha)` · SDK `setElementOpacity(page,i,fillAlpha)` |
 | `duplicate_element(page,i)` | `gp_duplicate_element(handle,page,i)` |
 | `add_rectangle(page,x,y,w,h,stroke,fill,lw,opacity)` | `gp_add_rectangle(...)` |
@@ -53,7 +54,9 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `add_polygon(page,&pts,close,stroke,fill,lw,opacity)` | `gp_add_polygon(...)` |
 | `add_path(page,svg,ox,oy,stroke,fill,lw,opacity)` (SVG path, Y-flipped) | `gp_add_path(...)` |
 | `add_image(page,&data,x,y,w,h,opacity)` (PNG/JPEG, alpha) | `gp_add_image(...)` |
+| `add_image_watermark(&data,&pages,anchor,dx,dy,w,h,rot,opacity,tile)` (decode PNG/JPEG/WebP/GIF/AVIF once, reference on every target page; anchor/offset/size/rotate/opacity, optional tiling) | `gp_add_image_watermark(handle,data*,pages*,anchor,dx,dy,w,h,rot,opacity,tile)` · SDK `addImageWatermark(data,opts)` |
 | `add_svg(page,src,x,y,w,h)` (full SVG → **native vector**, fits viewBox to the box) | `gp_add_svg(...)` · SDK `addSvg` |
+| `flatten_form_xobjects(page) -> usize` (inline & **de-share** page form XObjects so their text becomes ordinary editable runs — distinct from `flatten_form`, which flattens AcroForm fields) | `gp_flatten_form_xobjects(handle,page)` · SDK `flattenFormXObjects` |
 
 ## Fonts & real text
 
@@ -142,17 +145,39 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | Rust | WASM |
 |------|------|
 | `redact_region(page,x,y,w,h,cover:Option<[f64;3]>) -> usize` (text only; image left intact) | `gp_redact_region(handle,page,x,y,w,h,cover_rgb,has_cover)` · SDK `redact` |
-| `redact_pii(page,&[rect], …)` *(v0.52.4)* — **irreversible**: remove text **+ erase image pixels** (safe on scans/OCR) under an opaque mark | (ABI added in v0.52.4) · SDK `redactPii(page, rects)` |
-| `sign(&Signer,name,reason,date) -> Result<Vec<u8>>` | `gp_sign(handle,fieldsptr,fieldslen,randptr,randlen,key_bits,outlen)` |
-| `sign_p12(&Pkcs12Identity,name,reason,date,location,contact)` | `gp_sign_p12(handle,p12*,pass*,fields*,outlen)` |
-| `sign::pkcs12::parse(pfx,password) -> Pkcs12Identity` | (via `gp_sign_p12`) |
-| `save_encrypted(...)` | `gp_save_encrypted(...)` |
+| `redact_pii(page,&[rect], …)` *(v0.52.4)* — **irreversible**: remove text **+ erase image pixels** (safe on scans/OCR) under an opaque mark | `gp_redact_pii(handle,page,rects_ptr,rects_count,cover_rgb,has_cover)` · SDK `redactPii(page, rects)` |
+| `save_encrypted(...)` (default **AES-256 R6**) | `gp_save_encrypted(...)` |
+| `permissions_to_p(8 flags) -> i32` / `permissions_from_p(p) -> 8 flags` (ISO 32000-1 Table 22) | `gp_permissions_to_p(…)` / `gp_permissions_from_p(p,outlen)` · SDK `permissionsToP`/`decodePermissions`/`getPermissions` |
 
-`Signer` is built from host-supplied randomness; `sign` produces a self-signed
-`adbe.pkcs7.detached` CMS signature with a `/ByteRange`-patched PDF. `sign_p12`
-signs with a **user-supplied identity** imported natively from a PKCS#12
-(`.p12`/`.pfx`) — PBES2 (PBKDF2 + AES) and PBES1 (3DES, RC2-40) bags, integrity
-MAC verified — with **no third-party crypto** (all in `crate::crypto`).
+### Digital signatures
+
+Four signature levels, increasing in long-term assurance. All produce a CMS
+(`SignedData`) embedded in a `/Sig` field, with a `/ByteRange`-patched PDF and
+**no third-party crypto** (everything in `crate::crypto`/`crate::sign`).
+
+| Level | Rust | WASM | SDK | Network |
+|-------|------|------|-----|---------|
+| **B (self-signed)** — ephemeral digital ID, `adbe.pkcs7.detached` | `sign(&Signer,name,reason,date)` | `gp_sign(handle,fields*,rand*,key_bits,outlen)` | `sign(fields, random, keyBits?)` | none |
+| **B (PKCS#12)** — user CA/eIDAS identity, `adbe.pkcs7.detached` | `sign_p12(&Pkcs12Identity, …)` | `gp_sign_p12(handle,p12*,pass*,fields*,outlen)` | `signP12(p12, password, opts?)` | none |
+| **B-T (PAdES)** — RFC 3161 trusted timestamp in the SignerInfo (`ETSI.CAdES.detached`, `signing-certificate-v2`, `id-aa-timeStampToken`) | `sign_prepare_tsa(…)` → host POST → `sign_finish_tsa(token)` | `gp_sign_prepare_tsa(…)` / `gp_sign_finish_tsa(handle,token*,outlen)` | `signTimestamped(opts)` *(async)* | 1× TSA |
+| **B-LT / B-LTA (PAdES-LTV)** — B-T + `/DSS` (`/Certs`+`/OCSPs`+`/CRLs`+`/VRI`); B-LTA adds a `/DocTimeStamp` over the whole file | `ltv_targets(pdf,nonce)` → host OCSP/CRL fetch → `apply_dss(pdf,certs,ocsps,crls)`; archive: `doc_timestamp_prepare` → host POST → `doc_timestamp_finish` | `gp_ltv_targets(pdf*,nonce*,outlen)` / `gp_apply_dss(pdf*,certs*,ocsps*,crls*,outlen)` / `gp_doc_timestamp_prepare(handle,pdf*,nonce*,outlen)` / `gp_doc_timestamp_finish(handle,token*,outlen)` | `signLtv(opts)` *(async)* | 1× TSA + 1 OCSP/CRL per cert (+ 1× TSA if archive) |
+
+- `Signer` is built from host-supplied randomness; the self-signed `sign`
+  produces a self-signed `adbe.pkcs7.detached` CMS signature.
+- `sign_p12` signs with a **user-supplied identity** imported natively from a
+  PKCS#12 (`.p12`/`.pfx`) — PBES2 (PBKDF2 + AES) and PBES1 (3DES, RC2-40) bags,
+  integrity MAC verified.
+- **Host-fetch model (2 phases).** Timestamping/LTV require HTTP the WASM core
+  can't perform, so the engine emits the request bytes and the host POSTs them:
+  `gp_sign_prepare_tsa` returns the DER `TimeStampReq` → host POSTs it to the TSA
+  (`application/timestamp-query`) → `gp_sign_finish_tsa` embeds the
+  `TimeStampResp`. LTV adds `gp_ltv_targets` (which OCSP/CRL URLs to fetch, taken
+  **from the certificates' AIA / CRL-DP**) → host fetches → `gp_apply_dss`. The
+  SDK's `signTimestamped`/`signLtv` orchestrate this with the global `fetch`.
+- **SSRF note.** OCSP/CRL/TSA URLs are **host-supplied** (from the certificate
+  extensions for LTV); the engine performs no allow-listing. A host that exposes
+  signing to untrusted input MUST validate these URLs — pass
+  `tsaFetch`/`revocationFetch`/`crlFetch` to inject an allow-list, auth or proxy.
 
 ## Render
 
@@ -201,6 +226,7 @@ residual Z1/Z3 edge-filter gap remains), and the lossless WHT path at `q ≤ 20`
 | Rust | WASM | Notes |
 |------|------|-------|
 | `structured_text(page) -> Vec<TextLine>` | `gp_structured_text_json(handle,page,outlen)` | reading-order lines + bounds |
+| `page_blocks(page) -> Vec<Block>` | `gp_page_blocks_json(handle,page,outlen)` | **per-page** structural reconstruction (paragraphs/headings/lists/tables/shapes/images) in reading order; each text run keeps its `source_index` back to the editable operator. The streaming counterpart of `from_pdf`/`toModel` for a virtualized editor · SDK `pageBlocks` |
 | `search(query,case_insensitive) -> Vec<SearchMatch>` | `gp_search_json(handle,ptr,len,ci,outlen)` | match lines + highlight boxes |
 | _(OCR removed from core/WASM)_ | — | OCR is host-side: **`gigapdf-ocr-rten`** crate (PaddleOCR PP-OCR on pure-Rust RTen, 13 langs + auto script selection). See [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md) |
 
@@ -241,6 +267,8 @@ PDF user space) / `recognize_page(&img)`. For pages that already carry a text la
 | `rtf_to_pdf(&str)` | `gp_rtf_to_pdf(ptr,len,outlen)` |
 | `office_to_pdf(&[u8]) -> Option<Vec<u8>>` | `gp_office_to_pdf(ptr,len,outlen)` (auto-detect docx/odt/odp/pptx/xlsx/ods) |
 | `docx_to_pdf / odt_to_pdf / odp_to_pdf / pptx_to_pdf / xlsx_to_pdf / ods_to_pdf` | via `gp_office_to_pdf` |
+| `office_needed_fonts(&[u8]) -> Option<Vec<FontRequest>>` (phase 1: families the container **references but doesn't embed** — host fetches each `url`→TTF) | `gp_office_needed_fonts(ptr,len,outlen)` · SDK `officeNeededFonts` |
+| `office_to_pdf_with_fonts(&[u8],&[ProvidedFont]) -> Vec<u8>` (phase 2: render with the host-fetched fonts embedded; the container's own embedded faces win on conflict) | `gp_office_to_pdf_with_fonts(office*,fonts*,outlen)` · SDK `officeToPdfWith` |
 | `image_to_pdf(&[u8]) -> Option<Vec<u8>>` | `gp_image_to_pdf(ptr,len,outlen)` (auto-detect **PNG/JPEG/GIF/WebP/AVIF**; one A4 page, image centred & shrink-to-fit, never upscaled; GIF/WebP/AVIF transcoded to PNG before embed; PNG covers every color-type 0/2/3/4/6, bit-depths 1/2/4/8/16, Adam7 interlacing, transparency via `/SMask`. `null`/empty if the format is unrecognized) |
 
 ### Unified editable model (lower / edit / raise)
@@ -254,9 +282,11 @@ format into it, edit with `ModelOp`s, raise to any format — see
 | `Document::from_pdf(&doc) -> model::Document` | `gp_model_from_pdf(handle,outlen)` | `doc.toModel()` |
 | `model::from_office(&[u8]) -> Option<Document>` | `gp_model_from_office(ptr,len,outlen)` | `officeToModel` |
 | `model::from_html(&str) -> Document` | `gp_model_from_html(ptr,len,outlen)` | `htmlToModel` |
+| `model::from_md(&str) -> Document` (CommonMark-ish: headings, lists, GFM tables, fenced code) | `gp_model_from_md(ptr,len,outlen)` | `mdToModel` |
+| `model::from_csv(&[u8]) -> Option<Document>` (RFC 4180; auto `,`/`;`/tab/`|` delimiter → one editable table) | `gp_model_from_csv(ptr,len,outlen)` | `csvToModel` |
 | `model.apply_ops(&[ModelOp]) -> Document` | `gp_model_apply_ops(modelptr,modellen,opsptr,opslen,outlen)` | `applyModelOps` |
-| `model.to_{docx,xlsx,pptx,odt,ods,odp,pdf}() -> Vec<u8>` | `gp_model_to_{docx,xlsx,pptx,odt,ods,odp,pdf}(ptr,len,outlen)` | `modelTo{Docx,…}` |
-| `model.to_{html,rtf}() -> String` | `gp_model_to_{html,rtf}(ptr,len,outlen)` | `modelToHtml` / `modelToRtf` |
+| `model.to_{docx,xlsx,pptx,odt,ods,odp,pdf,epub}() -> Vec<u8>` | `gp_model_to_{docx,xlsx,pptx,odt,ods,odp,pdf,epub}(ptr,len,outlen)` | `modelTo{Docx,…,Epub}` |
+| `model.to_{html,rtf,md,csv}() -> String` | `gp_model_to_{html,rtf,md,csv}(ptr,len,outlen)` | `modelToHtml` / `modelToRtf` / `modelToMarkdown` / `modelToCsv` |
 
 All model functions take/return the model's JSON envelope as a string. A
 `ModelOp` addresses a block by `[section, page, index]` (zero-based); ops run in

@@ -1,9 +1,12 @@
 # @qrcommunication/gigapdf-lib
 
 TypeScript SDK for **gigapdf-lib** — a zero-dependency Rust→WASM PDF engine.
-Read, edit, render, OCR, search, sign, encrypt, fill forms, annotate, and convert
-PDFs ↔ Office/HTML/RTF. The engine `.wasm` is self-contained: **no third-party
-runtime dependencies**.
+Read, edit, render, search, **sign** (self-signed · PKCS#12 · PAdES-B-T timestamped
+· PAdES-LTV), encrypt, fill & build forms, annotate, redact, and convert PDFs ↔
+Office/HTML/RTF/Markdown/CSV — plus a native HTML/CSS→PDF renderer with a built-in
+JavaScript engine, and a unified editable model that lowers/raises every format.
+The engine `.wasm` is self-contained: **no third-party runtime dependencies**.
+(OCR is a separate host-side native crate, `gigapdf-ocr-rten`.)
 
 ## Install
 
@@ -28,7 +31,7 @@ const doc = giga.open(pdfBytes); // Uint8Array
 // Read
 const lines = doc.structuredText(1); // [{ text, x, y, w, h }]
 const hits = doc.search("invoice"); // [{ page, text, x, y, w, h }]
-const words = doc.ocr(1, 2); // OCR a scanned page at 2× scale
+const text = doc.toText(); // whole-document plain text (exact, no OCR)
 
 // Edit (operates on the real content stream — no cosmetic overlay)
 doc.replaceText(1, 0, "New value");
@@ -171,8 +174,29 @@ const signed2 = doc.signP12(p12Bytes, "p12-password", {
   date: "D:20260618120000Z",
   location: "Paris",
 });
+
+// (c) PAdES-B-T — add an RFC 3161 trusted timestamp (async: one TSA round trip).
+//     Identity is the p12 above, or a self-signed id (random + notBefore/notAfter).
+const timestamped = await doc.signTimestamped({
+  p12: p12Bytes, password: "p12-password", name: "Jane Doe",
+  tsaUrl: "https://freetsa.org/tsr",
+  // tsaFetch: custom fetch (auth / proxy / SSRF allow-list — recommended in prod)
+});
+
+// (d) PAdES-LTV — B-T plus a /DSS (chain + OCSP/CRL the host fetches), so the
+//     signature validates long-term. archiveTimestamp adds a B-LTA doc timestamp.
+const ltv = await doc.signLtv({
+  p12: p12Bytes, password: "p12-password",
+  tsaUrl: "https://freetsa.org/tsr", archiveTimestamp: true,
+  // revocationFetch / crlFetch: override the OCSP/CRL HTTP (SSRF allow-list)
+});
 doc.close();
 ```
+
+> Timestamping and LTV need network the WASM core can't perform, so the engine
+> emits the request bytes and the SDK does the HTTP. The OCSP/CRL/TSA URLs are
+> **host-supplied** (LTV URLs come from the certificates) — in production pass
+> `tsaFetch` / `revocationFetch` / `crlFetch` to apply your own SSRF allow-list.
 
 ### Annotate, then flatten
 
@@ -210,14 +234,23 @@ const pdf = giga.htmlRender(html, fonts, 595, 842, 36);  // A4 in points, 36pt m
 // giga.htmlRenderWith(html, fonts, { pageSize: "A4", header, footer });
 ```
 
-### Make a scanned PDF searchable (OCR → invisible text layer)
+### Make a scanned PDF searchable (host OCR → invisible text layer)
+
+OCR itself runs **host-side** — it lives in the separate native crate
+`gigapdf-ocr-rten` (PaddleOCR PP-OCR on a pure-Rust runtime), whose model weights
+are far heavier than the lean WASM core. This SDK provides the **text-layer**
+side: `addTextLayer` stamps recognized words back onto the page so the scan
+becomes selectable & searchable. (For PDFs that already carry text, use
+`toText`/`structuredText`/`search` — exact, no OCR needed.)
 
 ```ts
 const doc = giga.open(scannedPdf);
 const scale = 2;                                  // rasterise at 2× = 144 dpi for OCR
 for (let page = 1; page <= doc.pageCount(); page++) {
   const { height } = doc.pageInfo(page);
-  const words = doc.ocr(page, scale);             // OcrWord[] in raster pixels (top-left)
+  const png = doc.renderPage(page, scale);        // raster the page for your OCR service…
+  const words = await ocrService(png);            // … your host OCR → [{ x, y, w, h, text }]
+                                                  //    boxes in raster pixels (top-left)
   // Map each word box back to PDF user space (bottom-left, Y up) and stamp an
   // invisible (render-mode 3) text layer — selectable & searchable, pixel-aligned.
   doc.addTextLayer(page, words.map((w) => ({
@@ -269,15 +302,18 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
 - **`GigaPdfEngine`** — `load`/`loadDefault`, `open`/`openEncrypted`,
   `txtToPdf`/`htmlToPdf`/`rtfToPdf`/`officeToPdf`/`imageToPdf` (PNG/JPEG/GIF/WebP/AVIF → A4 page),
   `mergePdfs` (concatenate many PDFs), `fontCatalog`/`fontRequestUrl`/`parseCssFontUrl`.
-- **`GigaPdfDoc`** — text intelligence (`textRuns`, `structuredText`, `search`,
-  `ocr`, `ocrText`, `elements`, `elementAt`), editing (`replaceText`,
+- **`GigaPdfDoc`** — text intelligence (`textRuns`, `structuredText`,
+  `pageBlocks`, `search`, `toText`, `elements`, `elementAt`, `documentLanguage`),
+  editing (`replaceText`, `setTextRunStyle` (per-character restyle),
   `removeElement`, `moveElement`, `transformElement` (full affine — move + resize
   + rotate in place), `reorderElement` (native z-order — bring to front / send to
   back), `setPathStyle` (in-place vector restyle: fill/stroke/width/dash + **real
   opacity**), `setElementOpacity` (constant opacity on any element — text/image/shape),
-  `duplicateElement`, `redact`), vector drawing
+  `duplicateElement`, `redact`, `redactPii` (irreversible — erases image pixels)),
+  vector drawing
   (`addRectangle`, `drawLine`, `addEllipse`, `addPolygon`, `addPath` (SVG path),
-  `addImage` (PNG/JPEG, alpha + opacity)), pages (`rotatePage`, `deletePage`,
+  `addImage` (PNG/JPEG, alpha + opacity), `addImageWatermark` (stamp an image
+  across pages), `addSvg` (native vector)), pages (`rotatePage`, `deletePage`,
   `movePage`, `appendPages`, `extractPages`, `resizePage`, `addPage`, `copyPage`,
   `pageInfo`),
   `renderPage` (and `renderPageNoText` — a text-free background for editors that
@@ -287,12 +323,14 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   fonts (base-14 `addStandardText`, embed **any** TrueType/OpenType
   via `embedFont`/`addText`, font-aware editing `replaceText`,
   the document's own faces `embeddedFonts`/`extractFont`, `neededFonts`),
-  conversions (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`, plus
-  engine-level `gridsToXlsx`/`gridsToOds` to emit Office output from a
-  host-built table grid), security
-  (`saveEncrypted`, self-signed `sign`, **PKCS#12** `signP12`), metadata
-  (`getMetadata`, `setMetadata`), embedded files (`attachments` — extract every
-  `/EmbeddedFiles` entry with its decoded bytes), annotations (`addSquare`,
+  conversions (`toText/Html/Docx/Pptx/Odp/Odt/Xlsx/Ods/Rtf/PdfA`, `toModel` for
+  the unified editable model, plus engine-level `gridsToXlsx`/`gridsToOds` to
+  emit Office output from a host-built table grid), security
+  (`saveEncrypted` (AES-256 R6) + `permissionsToP`/`getPermissions`; **digital
+  signatures**: self-signed `sign`, **PKCS#12** `signP12`, **PAdES-B-T** timestamped
+  `signTimestamped` (RFC 3161 TSA), **PAdES-LTV** `signLtv` (DSS + OCSP/CRL, B-LT/B-LTA)),
+  metadata (`getMetadata`, `setMetadata`), embedded files (`attachments` — extract
+  every `/EmbeddedFiles` entry with its decoded bytes), annotations (`addSquare`,
   `addHighlight`, `addLineAnnotation`, `addFreeText`, `addUnderline`,
   `addStrikeOut`, `addInk`, `addStamp`, `annotations`, `removeAnnotation`,
   `flattenAnnotations`), links (`links`, `addUriLink`, `addGotoLink`, named
@@ -300,7 +338,9 @@ Or call `GigaPdfEngine.load(bytes)` with bytes you read yourself.
   (`outline`, `setOutline`), forms — read/fill (`fields`, `setTextField`,
   `setCheckbox`, `setRadio`, `setChoice`) **and create**
   (`addTextField`, `addCheckbox`, `addRadioGroup`, `addComboBox`, `addListBox`,
-  each with an optional `FieldStyle`), and optional-content layers (`layers`,
+  each with an optional `FieldStyle`) plus `flattenForm` / `flattenFormXObjects`,
+  margins & running header/footer (`pageMargins`/`setPageMargins`,
+  `setHeader`/`setFooter`/`headerFooter`), and optional-content layers (`layers`,
   `addLayer`, `setLayerVisibility`, `setLayerLocked`, `removeLayer`).
 - **HTML rendering engine** (on `GigaPdfEngine`) — `htmlNeededFonts(html)`
   returns the Google fonts to download (phase 1); `htmlRender(html, fonts,
