@@ -4,6 +4,53 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.70.0] - 2026-06-23
+
+Fidelity + standards release: advanced (PAdES-B-T) timestamped signatures,
+richer shading and JPEG decoding at the rasteriser, complex-script text shaping
+for Indic writing systems, CFF flex curves, and RTF image import. The public API
+is additive — existing behaviour is unchanged.
+
+### Added
+
+- **PAdES-B-T trusted timestamps (RFC 3161).** New SDK
+  `GigaPdfDoc.signTimestamped()` (async) embeds an RFC 3161 timestamp token in
+  the SignerInfo for an *advanced*-level PAdES-B-T signature — `ETSI.CAdES.detached`
+  subfilter, `signing-certificate-v2` (ESS) signed attribute, and the
+  `id-aa-timeStampToken` unsigned attribute. Uses the engine's pure-data
+  two-phase TSA flow (core emits the `TimeStampReq`, host POSTs it, core embeds
+  the returned token) since the WASM core has no network stack; `tsaFetch` lets
+  the host add auth/proxy/retries **and apply its own SSRF allow-list**, and the
+  exported `defaultTsaPost` POSTs `application/timestamp-query` via `fetch`
+  (e.g. FreeTSA). Signs with an imported PKCS#12 or a freshly generated
+  self-signed identity.
+- **Mesh shadings at the rasteriser.** Free-form (type 4), lattice (type 5),
+  Coons (type 6) and tensor (type 7) shadings are now rendered as Gouraud
+  triangles (pure, zero-dep decoder; Coons/tensor patches tessellated per
+  ISO 32000-1 §8.7.4.5.7), with per-vertex colour resolved through
+  `Separation`/`DeviceN`/`ICCBased`/`CMYK`/`Gray`. Axial (2) and radial (3)
+  shadings are unchanged.
+- **Arithmetic-coded JPEG decoding.** SOF9 (sequential) and SOF10 (progressive)
+  JPEGs now decode via a hand-rolled ISO/IEC 10918-1 Annex MQ arithmetic decoder
+  with the F.1.4 DC/AC context models and `DAC` conditioning. Baseline/Huffman
+  paths are unchanged; lossless (SOF3/SOF11) and 12-bit Huffman (SOF1) remain
+  gracefully unsupported.
+- **Indic complex-script shaping.** A syllabic reordering machine for the
+  Brahmi-derived scripts (Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil,
+  Telugu, Kannada, Malayalam) — reph and pre-base matra reordering — plus the
+  missing OpenType lookups: GSUB 2 (multiple), GSUB 3 (alternate), GSUB 8
+  (reverse chaining single) and GPOS 3 (cursive attachment). Latin and the
+  existing contextual paths are unchanged.
+- **CFF/Type2 flex operators.** The Type2 charstring interpreter now implements
+  the four flex operators (`flex`, `flex1`, `hflex`, `hflex1`, Adobe TN #5177),
+  each emitting two cubic curves — CFF glyphs using flex no longer drop or
+  mis-render contour segments.
+- **RTF image import.** RTF import parses the `\pict` group, extracting
+  `\pngblip`/`\jpegblip` payloads as `<img src="data:image/…;base64,…">`
+  (display size recovered from `\picwgoal`/`\pichgoal`), reusing the HTML
+  engine's image-embed pipeline. DIB/BMP, WMF/EMF and binary `\bin` payloads are
+  skipped (documented limits), guarded by a PNG/JPEG magic-byte check.
+
 ## [0.69.0] - 2026-06-23
 
 Image-watermark release: stamp a raster image across any range of pages, with
