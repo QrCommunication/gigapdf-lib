@@ -131,6 +131,7 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `append_pages_from(&[u8])` | `gp_append_pages(handle,ptr,len)` |
 | `page_margins(page)` / `set_page_margins(page,t,r,b,l)` | `gp_page_margins(handle,page,outlen) / gp_set_page_margins(handle,page,t,r,b,l)` |
 | `page_boxes(page) -> PageBoxes` / `set_page_box(page,kind,[x0,y0,x1,y1])` (all five ISO 32000-1 boxes: Media/Crop/Bleed/Trim/Art; inheritance + per-box defaults applied on read; siblings preserved on write) | `gp_page_boxes_json(handle,page,outlen) / gp_set_page_box(handle,page,kind,x0,y0,x1,y1)` (`kind` 0=media 1=crop 2=bleed 3=trim 4=art) |
+| `page_labels() -> Vec<PageLabelRange>` / `set_page_labels(&[PageLabelRange])` (`/PageLabels` number tree, ISO 32000-1 §12.4.2; empty slice clears) and `page_label(page) -> String` (resolved viewer label, e.g. `iv`, `A-3`) | `gp_page_labels_json(handle,outlen)` → `[{startPage,style,prefix,startNumber}]` / `gp_set_page_labels(handle,ptr,len)` (lines `startPage⇥style⇥startNumber⇥prefix`, style `D r R a A` or `-`) / `gp_page_label(handle,page,outlen)` |
 | `set_header(spec)` / `set_footer(spec)` (JSON `HeaderFooterSpec`, `{{page}}`/`{{pages}}` tokens) | `gp_set_header(handle,ptr,len) / gp_set_footer(handle,ptr,len)` |
 | `remove_headers()` / `remove_footers()` / `header_footer()` (reader) | `gp_remove_headers / gp_remove_footers / gp_header_footer(handle,outlen)` |
 | `add_uri_link(page,rect,uri)` / `add_goto_link(page,rect,target)` | `gp_add_uri_link / gp_add_goto_link` |
@@ -358,6 +359,7 @@ Google fonts**, so the host fetches fonts in two phases.
 - `Link { kind: uri|page, uri, page, rect }`, `OutlineItem { title, page, level }`
 - `HeaderFooterSpec { text, align, font_size, color, page_range, show_on_first_page, band_height }`
 - `PageBox` (enum `Media|Crop|Bleed|Trim|Art`) and `PageBoxes { media, crop, bleed, trim, art: [f64;4], declared: PageBoxesDeclared { media, crop, bleed, trim, art: bool } }` — every rectangle is the **effective** box (ISO 32000-1 §14.11.2 inheritance + the per-box default chain applied: Crop→Media, Bleed/Trim/Art→Crop), reported verbatim; `declared` flags which boxes are explicitly on the page dictionary vs inherited/defaulted
+- `PageLabelStyle` (enum `Decimal|RomanLower|RomanUpper|AlphaLower|AlphaUpper|None`) and `PageLabelRange { start_page (1-based), style, prefix: String, start_number }` — one entry per `/PageLabels` range (ISO 32000-1 §12.4.2). `page_label(n)` formats the displayed string (roman/letter sequences, prefix, `St` offset), falling back to the decimal page number outside any range
 - `model::{Document, Section, Page, Block, Inline, CharStyle, CellValue, ModelOp, BlockAddr, StylePatch}`
 - `convert::{ConvPage, PlacedText, PlacedImage, PlacedShape, TextStyle, Generic}`
 

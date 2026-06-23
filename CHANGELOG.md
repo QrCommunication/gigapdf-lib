@@ -7,6 +7,27 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.74.0] - 2026-06-24
+
+Adds **page labels** (`/PageLabels`) — reading, authoring and resolving the
+page-numbering schemes (roman front matter, prefixed appendices, …) that viewers
+show in the page navigator. Resolves
+[#8](https://github.com/qrcommunication/gigapdf-lib/issues/8).
+
+### Added
+
+- **Page labels — read/write + resolve (core + WASM + SDK).**
+  `Document::page_labels()` reads the `/PageLabels` number tree (ISO 32000-1
+  §12.4.2; traverses `/Nums` leaves and `/Kids` intermediates) into a sorted
+  `Vec<PageLabelRange>` (`start_page` 1-based, `style`, `prefix`, `start_number`);
+  `Document::set_page_labels(&[…])` writes a flat-`/Nums` tree (an empty slice
+  clears `/PageLabels`); `Document::page_label(page)` formats the viewer-visible
+  string (decimal, lower/upper roman, the repeating `a…z, aa…` letter scheme,
+  with prefix and `/St` offset), falling back to the decimal page number outside
+  any range. Exposed as `gp_page_labels_json` / `gp_set_page_labels` /
+  `gp_page_label` (WASM) and `doc.getPageLabels()` / `doc.setPageLabels([…])` /
+  `doc.pageLabel(n)` (SDK), with the `PageLabelRange` / `PageLabelStyle` types.
+
 ## [0.73.0] - 2026-06-24
 
 Print-production release: the engine now reads and writes **all five ISO 32000-1

@@ -32,6 +32,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Styled text: bold · underline · strikethrough · sub/superscript](#styled-text)
 - [Read & write running headers and footers](#headers-and-footers)
 - [Set print boxes (TrimBox / BleedBox) for prepress](#print-boxes) — *v0.73.0*
+- [Number pages with labels (roman front matter, prefixes)](#page-labels) — *v0.74.0*
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
 - [Image → PDF (single & batch)](#image--pdf)
 - [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
@@ -253,6 +254,58 @@ the `declared` flags to tell a *real* `TrimBox` from one defaulted to the crop b
 > `false`; reversed corners are accepted (the box is normalised so `x0 < x1`,
 > `y0 < y1`). Boxes are written verbatim — they are **not** clamped to their
 > intersection with the media box, so what you set is what later tools read.
+
+---
+
+<a id="page-labels"></a>
+
+## Number pages with labels (roman front matter, prefixes)
+
+> **Available in v0.74.0.**
+
+Page labels (`/PageLabels`, ISO 32000-1 §12.4.2) let a document number its pages with
+schemes other than `1, 2, 3…` — lowercase roman for front matter, decimal for the
+body, a prefixed scheme like `A-1, A-2` for an appendix. Viewers show these in the
+page navigator, and they are dropped on a naïve edit, so re-authoring them after a
+merge/insert is essential for books, reports and legal documents.
+
+Here we label a report: cover + TOC in lowercase roman (`i, ii, iii`), the body from
+page 3 in decimal restarting at 1, and an appendix from page 20 as `A-1, A-2, …`:
+
+```ts
+const doc = giga.open(pdfBytes);
+
+doc.setPageLabels([
+  { startPage: 1, style: "romanLower", prefix: "", startNumber: 1 }, // i, ii
+  { startPage: 3, style: "decimal", prefix: "", startNumber: 1 }, // 1, 2, 3…
+  { startPage: 20, style: "decimal", prefix: "A-", startNumber: 1 }, // A-1, A-2…
+]);
+
+// Resolve the viewer-visible string for any page:
+doc.pageLabel(1); //  "i"
+doc.pageLabel(2); //  "ii"
+doc.pageLabel(3); //  "1"
+doc.pageLabel(20); // "A-1"
+doc.pageLabel(21); // "A-2"
+
+// Read the ranges back (sorted by startPage):
+const labels = doc.getPageLabels();
+//   → [ { startPage: 1,  style: "romanLower", prefix: "",   startNumber: 1 },
+//       { startPage: 3,  style: "decimal",    prefix: "",   startNumber: 1 },
+//       { startPage: 20, style: "decimal",    prefix: "A-", startNumber: 1 } ]
+
+const out = doc.save(); // labels survive the round-trip
+doc.close();
+```
+
+The `style` is one of `decimal`, `romanLower`, `romanUpper`, `alphaLower`
+(`a…z, aa…zz, aaa…`), `alphaUpper`, or `none` (the `prefix` alone, with no number).
+A range runs until the next one begins; `pageLabel(n)` falls back to the decimal page
+number for any page before the first range, or when the document has no labels at all.
+
+> Pass an **empty array** to `setPageLabels([])` to strip all page labels (the page
+> navigator reverts to `1, 2, 3…`). Setting labels replaces the whole `/PageLabels`
+> tree, so include every range you want each time — it is not a merge.
 
 ---
 

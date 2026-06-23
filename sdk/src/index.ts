@@ -2016,6 +2016,47 @@ export interface PageBoxes {
   declared: Record<PageBoxKind, boolean>;
 }
 
+/**
+ * The numbering style of a page-label range (ISO 32000-1 §12.4.2):
+ * `decimal` (1,2,3…), `romanLower` (i,ii,iii…), `romanUpper` (I,II,III…),
+ * `alphaLower` (a…z,aa…), `alphaUpper` (A…Z,AA…), or `none` (the prefix alone,
+ * with no numeric portion).
+ */
+export type PageLabelStyle =
+  | "decimal"
+  | "romanLower"
+  | "romanUpper"
+  | "alphaLower"
+  | "alphaUpper"
+  | "none";
+
+/** Maps a {@link PageLabelStyle} to the single-letter token the engine expects. */
+const PAGE_LABEL_STYLE_TOKEN: Record<PageLabelStyle, string> = {
+  decimal: "D",
+  romanLower: "r",
+  romanUpper: "R",
+  alphaLower: "a",
+  alphaUpper: "A",
+  none: "-",
+};
+
+/**
+ * One page-label range (ISO 32000-1 §12.4.2). From {@link startPage} onward (until
+ * the next range, or the end of the document), pages are labelled {@link prefix}
+ * followed by the {@link style}-formatted number counting up from
+ * {@link startNumber}.
+ */
+export interface PageLabelRange {
+  /** 1-based page number where this labelling range begins. */
+  startPage: number;
+  /** The numbering style of the numeric portion. */
+  style: PageLabelStyle;
+  /** A label prefix prepended to every page in the range (may be empty). */
+  prefix: string;
+  /** The value the range's first page is numbered with (≥ 1; default 1). */
+  startNumber: number;
+}
+
 /** Horizontal alignment of header/footer text within the printable width. */
 export type HeaderFooterAlign = "left" | "center" | "right";
 
@@ -2740,6 +2781,48 @@ export class GigaPdfDoc {
     return (
       this.ex().gp_set_page_box(this.h, page, k, box.x, box.y, box.x + box.w, box.y + box.h) === 0
     );
+  }
+
+  /**
+   * The document's page-label ranges (`/PageLabels`, ISO 32000-1 §12.4.2), sorted
+   * by `startPage` (1-based). Empty when the document declares no page labels.
+   */
+  getPageLabels(): PageLabelRange[] {
+    return this.g._json<PageLabelRange[]>((o) => this.ex().gp_page_labels_json(this.h, o));
+  }
+
+  /**
+   * Replace the document's page labels. Pass an **empty** array to remove all
+   * labels. Ranges are sorted by `startPage` and collapsed to one entry per page
+   * (last wins). Returns `true` on success.
+   *
+   * @example
+   * // Front matter in lowercase roman, body in decimal, appendix "A-1, A-2…".
+   * doc.setPageLabels([
+   *   { startPage: 1, style: "romanLower", prefix: "", startNumber: 1 },
+   *   { startPage: 5, style: "decimal",    prefix: "", startNumber: 1 },
+   *   { startPage: 20, style: "decimal",   prefix: "A-", startNumber: 1 },
+   * ]);
+   */
+  setPageLabels(ranges: PageLabelRange[]): boolean {
+    const text = ranges
+      .map(
+        (r) =>
+          `${r.startPage}\t${PAGE_LABEL_STYLE_TOKEN[r.style] ?? "-"}\t${r.startNumber ?? 1}\t${
+            r.prefix ?? ""
+          }`
+      )
+      .join("\n");
+    return this.g._withOptStr(text, (p, l) => this.ex().gp_set_page_labels(this.h, p, l)) === 0;
+  }
+
+  /**
+   * The viewer-visible label string for the 1-based `page` (e.g. `"iv"`, `"A-3"`),
+   * resolving the applicable `/PageLabels` range; the decimal page number when no
+   * range applies (including a document with no page labels).
+   */
+  pageLabel(page: number): string {
+    return this.g._str((o) => this.ex().gp_page_label(this.h, page, o));
   }
 
   /**

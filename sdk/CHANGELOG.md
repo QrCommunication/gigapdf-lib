@@ -4,6 +4,22 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.74.0] - 2026-06-24
+
+Page labels (`/PageLabels`). Resolves
+[#8](https://github.com/qrcommunication/gigapdf-lib/issues/8).
+
+### Added
+
+- **`getPageLabels()` / `setPageLabels(ranges)` / `pageLabel(page)`.** Read,
+  author and resolve page-numbering labels (ISO 32000-1 §12.4.2) — front matter
+  in roman numerals, an appendix as `A-1, A-2`, etc. `getPageLabels` returns the
+  ranges sorted by `startPage` (1-based); `setPageLabels` replaces them (an empty
+  array clears all labels); `pageLabel` returns the viewer-visible string for a
+  page (e.g. `"iv"`, `"A-3"`), falling back to the decimal page number outside any
+  range. Labels survive a save→reopen round-trip. New `PageLabelRange` /
+  `PageLabelStyle` types.
+
 ## [0.73.0] - 2026-06-24
 
 Print-production release: full read/write access to all five ISO 32000-1 page

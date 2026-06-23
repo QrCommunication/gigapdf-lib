@@ -59,7 +59,8 @@ pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, Text
 pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
     Attachment, Document, EmbeddedFontInfo, ImageElementInfo, ImageWatermarkOptions, PageBox,
-    PageBoxes, PageBoxesDeclared, SearchMatch, TextElementInfo, TextLayerRun, WatermarkAnchor,
+    PageBoxes, PageBoxesDeclared, PageLabelRange, PageLabelStyle, SearchMatch, TextElementInfo,
+    TextLayerRun, WatermarkAnchor,
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FormField};

@@ -964,6 +964,128 @@ pub struct PageBoxesDeclared {
     pub art: bool,
 }
 
+/// The numbering style of a page-label range (ISO 32000-1 §12.4.2, Table 159 —
+/// the `/S` entry of a label dictionary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PageLabelStyle {
+    /// `/S /D` — decimal arabic numerals (`1, 2, 3, …`).
+    #[default]
+    Decimal,
+    /// `/S /r` — lowercase roman numerals (`i, ii, iii, …`).
+    RomanLower,
+    /// `/S /R` — uppercase roman numerals (`I, II, III, …`).
+    RomanUpper,
+    /// `/S /a` — lowercase letters (`a … z, aa … zz, …`).
+    AlphaLower,
+    /// `/S /A` — uppercase letters (`A … Z, AA … ZZ, …`).
+    AlphaUpper,
+    /// No `/S` — the label is the prefix alone (no numeric portion).
+    None,
+}
+
+impl PageLabelStyle {
+    /// The PDF `/S` name for this style, or `None` for the prefix-only style.
+    pub fn pdf_name(self) -> Option<&'static [u8]> {
+        match self {
+            PageLabelStyle::Decimal => Some(b"D"),
+            PageLabelStyle::RomanLower => Some(b"r"),
+            PageLabelStyle::RomanUpper => Some(b"R"),
+            PageLabelStyle::AlphaLower => Some(b"a"),
+            PageLabelStyle::AlphaUpper => Some(b"A"),
+            PageLabelStyle::None => Option::None,
+        }
+    }
+
+    /// Parse a PDF `/S` name into a style (unknown / absent → prefix-only).
+    fn from_pdf_name(name: Option<&[u8]>) -> Self {
+        match name {
+            Some(b"D") => PageLabelStyle::Decimal,
+            Some(b"r") => PageLabelStyle::RomanLower,
+            Some(b"R") => PageLabelStyle::RomanUpper,
+            Some(b"a") => PageLabelStyle::AlphaLower,
+            Some(b"A") => PageLabelStyle::AlphaUpper,
+            _ => PageLabelStyle::None,
+        }
+    }
+
+    /// Format `value` in this style (no prefix). Prefix-only style yields `""`.
+    fn format(self, value: u32) -> String {
+        match self {
+            PageLabelStyle::Decimal => value.to_string(),
+            PageLabelStyle::RomanLower => roman_numeral(value, false),
+            PageLabelStyle::RomanUpper => roman_numeral(value, true),
+            PageLabelStyle::AlphaLower => alpha_label(value, false),
+            PageLabelStyle::AlphaUpper => alpha_label(value, true),
+            PageLabelStyle::None => String::new(),
+        }
+    }
+}
+
+/// One page-label range (ISO 32000-1 §12.4.2): from [`start_page`](Self::start_page)
+/// onward (until the next range, or the end of the document), pages are labelled
+/// `prefix` followed by the `style`-formatted number counting up from
+/// [`start_number`](Self::start_number).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageLabelRange {
+    /// 1-based page number where this labelling range begins.
+    pub start_page: u32,
+    /// The numbering style of the numeric portion.
+    pub style: PageLabelStyle,
+    /// A label prefix prepended to every page in the range (may be empty).
+    pub prefix: String,
+    /// The value the range's first page is numbered with (`/St`; ≥ 1, default 1).
+    pub start_number: u32,
+}
+
+/// Format `value` as a roman numeral. `upper` selects `IVXLCDM` vs `ivxlcdm`.
+/// `0` yields an empty string (roman has no zero); values above 3999 simply
+/// repeat `M`.
+fn roman_numeral(value: u32, upper: bool) -> String {
+    if value == 0 {
+        return String::new();
+    }
+    const TABLE: [(u32, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut n = value;
+    let mut s = String::new();
+    for (v, sym) in TABLE {
+        while n >= v {
+            s.push_str(sym);
+            n -= v;
+        }
+    }
+    if upper {
+        s
+    } else {
+        s.to_ascii_lowercase()
+    }
+}
+
+/// Format `value` as a page-label letter sequence (ISO 32000-1: `a..z`, then
+/// `aa..zz`, then `aaa..`). `upper` selects `A..` vs `a..`. `0` yields `""`.
+fn alpha_label(value: u32, upper: bool) -> String {
+    if value == 0 {
+        return String::new();
+    }
+    let base = if upper { b'A' } else { b'a' };
+    let idx = ((value - 1) % 26) as u8;
+    let count = ((value - 1) / 26 + 1) as usize;
+    ((base + idx) as char).to_string().repeat(count)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WatermarkAnchor {
     /// Centre of the page (the usual diagonal-stamp position).
@@ -3542,6 +3664,169 @@ impl Document {
         );
         self.objects.insert(id, Object::Dictionary(page));
         Ok(())
+    }
+
+    // ─── page labels (/PageLabels, ISO 32000-1 §12.4.2) ──────────────────────
+
+    /// Walk a number tree (`/Nums` leaves + `/Kids` intermediates) collecting
+    /// every `(integer key, value)` pair. Mirrors [`Self::collect_name_tree`].
+    fn collect_number_tree(&self, node: &Object, depth: usize, out: &mut Vec<(i64, Object)>) {
+        if depth > 32 {
+            return; // defend against a cyclic /Kids chain
+        }
+        let Some(dict) = self.resolve(node).as_dict() else {
+            return;
+        };
+        if let Some(nums) = dict
+            .get(b"Nums")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            let mut i = 0;
+            while i + 1 < nums.len() {
+                if let Some(key) = self.resolve(&nums[i]).as_i64() {
+                    out.push((key, self.resolve(&nums[i + 1]).clone()));
+                }
+                i += 2;
+            }
+        }
+        if let Some(kids) = dict
+            .get(b"Kids")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            for kid in kids {
+                self.collect_number_tree(kid, depth + 1, out);
+            }
+        }
+    }
+
+    /// The document's page-label ranges (`/PageLabels`, ISO 32000-1 §12.4.2),
+    /// sorted by [`start_page`](PageLabelRange::start_page) (1-based). Empty when
+    /// the document declares no page labels. The number-tree keys are 0-based
+    /// page indices in the file; they are surfaced here as 1-based page numbers
+    /// to match the rest of the API.
+    pub fn page_labels(&self) -> Vec<PageLabelRange> {
+        let Ok(catalog) = self.catalog() else {
+            return Vec::new();
+        };
+        let Some(tree) = catalog.get(b"PageLabels") else {
+            return Vec::new();
+        };
+        let mut nums = Vec::new();
+        self.collect_number_tree(tree, 0, &mut nums);
+        nums.sort_by_key(|(key, _)| *key);
+        let mut out = Vec::new();
+        for (key, value) in nums {
+            if key < 0 {
+                continue;
+            }
+            let Some(dict) = self.resolve(&value).as_dict() else {
+                continue;
+            };
+            let style = PageLabelStyle::from_pdf_name(dict.get(b"S").and_then(Object::as_name));
+            let prefix = dict
+                .get(b"P")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_string)
+                .map(crate::font::decode_pdf_text)
+                .unwrap_or_default();
+            let start_number = dict
+                .get(b"St")
+                .and_then(Object::as_i64)
+                .filter(|n| *n >= 1)
+                .unwrap_or(1) as u32;
+            out.push(PageLabelRange {
+                start_page: key as u32 + 1,
+                style,
+                prefix,
+                start_number,
+            });
+        }
+        out
+    }
+
+    /// Replace the document's `/PageLabels` with `ranges`, written as a single
+    /// flat-`/Nums` number tree (ISO 32000-1 §12.4.2). An **empty** slice removes
+    /// `/PageLabels` entirely. Ranges are sorted by `start_page` and collapsed so
+    /// at most one entry exists per page key (the last range for a key wins). A
+    /// `start_page < 1` is clamped to page 1, and `start_number < 1` to 1.
+    pub fn set_page_labels(&mut self, ranges: &[PageLabelRange]) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+
+        if ranges.is_empty() {
+            catalog.remove(b"PageLabels");
+            self.objects.insert(catalog_id, Object::Dictionary(catalog));
+            return Ok(());
+        }
+
+        let mut sorted: Vec<&PageLabelRange> = ranges.iter().collect();
+        sorted.sort_by_key(|r| r.start_page.max(1));
+
+        let mut nums: Vec<Object> = Vec::new();
+        let mut last_key: Option<i64> = None;
+        for r in sorted {
+            let key = r.start_page.max(1) as i64 - 1; // 0-based number-tree key
+            let mut label = Dictionary::new();
+            if let Some(name) = r.style.pdf_name() {
+                label.set(b"S".to_vec(), Object::Name(name.to_vec()));
+            }
+            if !r.prefix.is_empty() {
+                label.set(
+                    b"P".to_vec(),
+                    Object::String(crate::font::encode_pdf_text(&r.prefix), StringKind::Literal),
+                );
+            }
+            let start_number = r.start_number.max(1);
+            if start_number != 1 {
+                label.set(b"St".to_vec(), Object::Integer(start_number as i64));
+            }
+            if last_key == Some(key) {
+                // Same key as the previous range → overwrite its value.
+                let n = nums.len();
+                nums[n - 1] = Object::Dictionary(label);
+            } else {
+                nums.push(Object::Integer(key));
+                nums.push(Object::Dictionary(label));
+                last_key = Some(key);
+            }
+        }
+
+        let mut tree = Dictionary::new();
+        tree.set(b"Nums".to_vec(), Object::Array(nums));
+        catalog.set(b"PageLabels".to_vec(), Object::Dictionary(tree));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// The viewer-visible label string for the 1-based `page_no` (e.g. `"iv"`,
+    /// `"A-3"`), resolving the applicable `/PageLabels` range. Falls back to the
+    /// decimal page number when the page is covered by no range (including a
+    /// document with no `/PageLabels` at all).
+    pub fn page_label(&self, page_no: u32) -> String {
+        if page_no == 0 {
+            return String::new();
+        }
+        let ranges = self.page_labels();
+        // The applicable range is the one with the greatest start_page ≤ page_no.
+        let applicable = ranges
+            .iter()
+            .filter(|r| r.start_page <= page_no)
+            .max_by_key(|r| r.start_page);
+        match applicable {
+            Some(r) => {
+                let offset = page_no - r.start_page;
+                let value = r.start_number.saturating_add(offset);
+                format!("{}{}", r.prefix, r.style.format(value))
+            }
+            None => page_no.to_string(),
+        }
     }
 
     // ─── page margins ────────────────────────────────────────────────────────
@@ -17923,6 +18208,98 @@ mod tests {
             doc.set_page_box(99, PageBox::Crop, [0.0, 0.0, 100.0, 100.0]),
             Err(EngineError::PageNotFound(99))
         ));
+    }
+
+    #[test]
+    fn roman_and_alpha_label_formatting() {
+        assert_eq!(roman_numeral(1, false), "i");
+        assert_eq!(roman_numeral(4, true), "IV");
+        assert_eq!(roman_numeral(2026, true), "MMXXVI");
+        assert_eq!(roman_numeral(0, true), "", "roman has no zero");
+        // ISO 32000-1 repeating-letter scheme: 26→z, 27→aa, 53→aaa.
+        assert_eq!(alpha_label(1, false), "a");
+        assert_eq!(alpha_label(26, false), "z");
+        assert_eq!(alpha_label(27, false), "aa");
+        assert_eq!(alpha_label(28, true), "BB");
+        assert_eq!(alpha_label(53, false), "aaa");
+    }
+
+    #[test]
+    fn page_labels_read_from_number_tree() {
+        // Front matter in lowercase roman, body in decimal starting at 1.
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /PageLabels 5 0 R >>".into(),
+            ),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>".into(),
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R >>".into()),
+            (
+                5,
+                "<< /Nums [0 << /S /r >> 4 << /S /D /St 1 >> 10 << /S /D /P (A-) /St 1 >>] >>"
+                    .into(),
+            ),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        let labels = doc.page_labels();
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0].start_page, 1);
+        assert_eq!(labels[0].style, PageLabelStyle::RomanLower);
+        assert_eq!(labels[1].start_page, 5);
+        assert_eq!(labels[1].style, PageLabelStyle::Decimal);
+        assert_eq!(labels[2].start_page, 11);
+        assert_eq!(labels[2].prefix, "A-");
+
+        // Resolved viewer strings: page 1→"i", 4→"iv", 5→"1", 11→"A-1", 12→"A-2".
+        assert_eq!(doc.page_label(1), "i");
+        assert_eq!(doc.page_label(4), "iv");
+        assert_eq!(doc.page_label(5), "1");
+        assert_eq!(doc.page_label(11), "A-1");
+        assert_eq!(doc.page_label(12), "A-2");
+    }
+
+    #[test]
+    fn set_page_labels_round_trips_and_clears() {
+        let mut doc = blank_doc();
+        // No labels yet → page_label falls back to the decimal page number.
+        assert!(doc.page_labels().is_empty());
+        assert_eq!(doc.page_label(1), "1");
+
+        doc.set_page_labels(&[
+            PageLabelRange {
+                start_page: 1,
+                style: PageLabelStyle::RomanUpper,
+                prefix: String::new(),
+                start_number: 1,
+            },
+            PageLabelRange {
+                start_page: 3,
+                style: PageLabelStyle::Decimal,
+                prefix: "P-".into(),
+                start_number: 5,
+            },
+        ])
+        .unwrap();
+
+        // Survives save → reopen.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let labels = reopened.page_labels();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].style, PageLabelStyle::RomanUpper);
+        assert_eq!(labels[1].prefix, "P-");
+        assert_eq!(labels[1].start_number, 5);
+        assert_eq!(reopened.page_label(2), "II");
+        assert_eq!(reopened.page_label(3), "P-5");
+        assert_eq!(reopened.page_label(4), "P-6");
+
+        // Empty slice removes /PageLabels entirely.
+        let mut doc2 = reopened;
+        doc2.set_page_labels(&[]).unwrap();
+        assert!(doc2.page_labels().is_empty());
+        assert_eq!(doc2.page_label(2), "2", "back to decimal fallback");
     }
 
     #[test]

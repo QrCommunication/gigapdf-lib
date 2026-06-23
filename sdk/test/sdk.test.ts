@@ -261,6 +261,40 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("page labels: set roman/decimal/prefixed ranges, resolve, round-trip, clear", () => {
+    const doc = giga.open(giga.txtToPdf("Labels"));
+    // No labels yet → pageLabel falls back to the decimal page number.
+    expect(doc.getPageLabels()).toEqual([]);
+    expect(doc.pageLabel(1)).toBe("1");
+
+    expect(
+      doc.setPageLabels([
+        { startPage: 1, style: "romanLower", prefix: "", startNumber: 1 },
+        { startPage: 3, style: "decimal", prefix: "A-", startNumber: 1 },
+      ])
+    ).toBe(true);
+
+    // Survives save → reopen.
+    const reopened = giga.open(doc.save());
+    const labels = reopened.getPageLabels();
+    expect(labels).toEqual([
+      { startPage: 1, style: "romanLower", prefix: "", startNumber: 1 },
+      { startPage: 3, style: "decimal", prefix: "A-", startNumber: 1 },
+    ]);
+    // Resolved viewer strings.
+    expect(reopened.pageLabel(1)).toBe("i");
+    expect(reopened.pageLabel(2)).toBe("ii");
+    expect(reopened.pageLabel(3)).toBe("A-1");
+    expect(reopened.pageLabel(4)).toBe("A-2");
+
+    // Empty array clears all labels → back to decimal fallback.
+    expect(reopened.setPageLabels([])).toBe(true);
+    expect(reopened.getPageLabels()).toEqual([]);
+    expect(reopened.pageLabel(3)).toBe("3");
+    reopened.close();
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

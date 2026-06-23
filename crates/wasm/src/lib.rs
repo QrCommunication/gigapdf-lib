@@ -22,8 +22,8 @@ mod rng;
 
 use gigapdf_core::{
     Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
-    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox, Permissions,
-    SearchMatch, TextLayerRun, TextLine, TextRun,
+    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox, PageLabelRange,
+    PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -2182,6 +2182,114 @@ pub extern "C" fn gp_set_page_box(
         };
         doc.set_page_box(page, kind, [x0, y0, x1, y1])
     })
+}
+
+/// The friendly JSON style token for a page-label style (matches the SDK enum).
+fn page_label_style_str(style: PageLabelStyle) -> &'static str {
+    match style {
+        PageLabelStyle::Decimal => "decimal",
+        PageLabelStyle::RomanLower => "romanLower",
+        PageLabelStyle::RomanUpper => "romanUpper",
+        PageLabelStyle::AlphaLower => "alphaLower",
+        PageLabelStyle::AlphaUpper => "alphaUpper",
+        PageLabelStyle::None => "none",
+    }
+}
+
+/// Parse a single-letter `/S` style token from the line-delimited set format
+/// (`D`/`r`/`R`/`a`/`A`; anything else, e.g. `-`, means prefix-only).
+fn page_label_style_from_token(tok: &str) -> PageLabelStyle {
+    match tok {
+        "D" => PageLabelStyle::Decimal,
+        "r" => PageLabelStyle::RomanLower,
+        "R" => PageLabelStyle::RomanUpper,
+        "a" => PageLabelStyle::AlphaLower,
+        "A" => PageLabelStyle::AlphaUpper,
+        _ => PageLabelStyle::None,
+    }
+}
+
+/// All page-label ranges (ISO 32000-1 §12.4.2) as JSON
+/// `[{"startPage":n,"style":"decimal","prefix":"…","startNumber":k}]` (`startPage`
+/// 1-based). Empty array when the document declares no `/PageLabels`. The `style`
+/// is one of `decimal`/`romanLower`/`romanUpper`/`alphaLower`/`alphaUpper`/`none`.
+/// Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_page_labels_json(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let mut s = String::from("[");
+            for (i, r) in doc.page_labels().iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!(
+                    "{{\"startPage\":{},\"style\":\"{}\",\"prefix\":",
+                    r.start_page,
+                    page_label_style_str(r.style)
+                ));
+                json_escape(&r.prefix, &mut s);
+                s.push_str(&format!(",\"startNumber\":{}}}", r.start_number));
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Replace the document's page labels from a newline-delimited spec — one range
+/// per line as `startPage<TAB>style<TAB>startNumber<TAB>prefix` (style one of
+/// `D r R a A`, or `-`/empty for prefix-only; `startPage` 1-based). An **empty**
+/// buffer clears all page labels. Returns `0` on success, `<0` on error.
+#[no_mangle]
+pub extern "C" fn gp_set_page_labels(
+    handle: *mut Document,
+    text_ptr: *const u8,
+    text_len: usize,
+) -> i32 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    let mut ranges: Vec<PageLabelRange> = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(4, '\t');
+        let start_page = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        let style = page_label_style_from_token(parts.next().unwrap_or("-"));
+        let start_number = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        let prefix = parts.next().unwrap_or("").to_string();
+        ranges.push(PageLabelRange {
+            start_page,
+            style,
+            prefix,
+            start_number,
+        });
+    }
+    edit(handle, |doc| doc.set_page_labels(&ranges))
+}
+
+/// The viewer-visible label string for the 1-based `page` (e.g. `iv`, `A-3`),
+/// resolving the applicable `/PageLabels` range; the decimal page number when no
+/// range applies. Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_page_label(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let label = match unsafe { handle.as_ref() } {
+        Some(doc) => doc.page_label(page),
+        None => String::new(),
+    };
+    unsafe { bytes_into_host(label.into_bytes(), out_len) }
 }
 
 /// Bake a running **header** from a JSON spec (`text`, `align`, `fontSize`,

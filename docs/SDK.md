@@ -139,6 +139,25 @@ PDF/X and commercial-print pipelines (imposition, bleed, finished-size trimming)
 <a id="pageboxes"></a>`PageBoxes = { media, crop, bleed, trim, art: [x0,y0,x1,y1], declared: { media, crop, bleed, trim, art: boolean } }`.
 The box constants live in `PAGE_BOX_KINDS` (`["media","crop","bleed","trim","art"]`).
 
+### Page labels (`/PageLabels`)
+
+Documents can number pages with schemes other than `1, 2, 3…` — front matter in
+lowercase roman (`i, ii, iii`), the body in decimal, appendices as `A-1, A-2`, etc.
+(ISO 32000-1 §12.4.2). Viewers show these in the page navigator, so dropping them on
+edit is a visible regression. `getPageLabels`/`setPageLabels` read and author the
+ranges; `pageLabel(n)` resolves the actual displayed string for a page.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getPageLabels()` | [`PageLabelRange`](#pagelabelrange)`[]` | Every label range, sorted by `startPage` (1-based). Empty when the document has no `/PageLabels`. |
+| `setPageLabels(ranges)` | `boolean` | Replace all page labels. An **empty array clears** them. Ranges are sorted by `startPage` and collapsed to one entry per page (last wins). |
+| `pageLabel(page)` | `string` | The viewer-visible label for the 1-based `page` (e.g. `"iv"`, `"A-3"`); the decimal page number when no range applies. |
+
+<a id="pagelabelrange"></a>`PageLabelRange = { startPage, style, prefix, startNumber }`, where
+`style` is `"decimal" | "romanLower" | "romanUpper" | "alphaLower" | "alphaUpper" | "none"`
+(`none` = the prefix alone, no number), `prefix` is prepended to every page in the
+range, and `startNumber` (≥ 1, default 1) is the value the range's first page gets.
+
 ### Margins & running header/footer
 
 Page margins and a baked running header/footer on an **existing** PDF (for an
