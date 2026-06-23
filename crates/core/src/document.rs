@@ -1376,20 +1376,39 @@ impl Document {
         Ok(request)
     }
 
-    /// Phase 2 of a PAdES-B-T signature. Consumes the timestamp `token` the host
-    /// extracted from the TSA's `TimeStampResp`, embeds it as the SignerInfo's
+    /// Phase 2 of a PAdES-B-T signature. Consumes the TSA's reply, embeds the
+    /// **bare** `TimeStampToken` (a CMS `ContentInfo`) as the SignerInfo's
     /// `id-aa-timeStampToken` unsigned attribute (no re-signing — the signature
     /// computed in Phase 1 is unchanged), fills `/Contents`, and returns the
     /// signed PDF (PAdES-B-T). Clears the pending state. Errors if no timestamp
-    /// is pending, or the CMS overflows the reserved `/Contents` space.
-    pub fn sign_finish_timestamped(&mut self, token: &[u8]) -> Result<Vec<u8>> {
+    /// is pending, the TSA reply is not granted / carries no token, or the CMS
+    /// overflows the reserved `/Contents` space.
+    ///
+    /// `reply` may be either the raw RFC 3161 `TimeStampResp`
+    /// (`SEQUENCE { PKIStatusInfo, TimeStampToken }`) returned by the TSA — the
+    /// usual case — or an already-unwrapped bare `TimeStampToken` `ContentInfo`.
+    /// Both are normalized here via [`timestamp::parse_response`] so that the
+    /// unsigned attribute always carries the bare token, never the
+    /// `PKIStatusInfo`-led response (RFC 3161 §3.3.2 / ETSI EN 319 122). This
+    /// mirrors the B-LTA document-timestamp path
+    /// ([`finish_doc_timestamp`](Self::finish_doc_timestamp)).
+    pub fn sign_finish_timestamped(&mut self, reply: &[u8]) -> Result<Vec<u8>> {
         let pending = self
             .pending_timestamp
             .take()
             .ok_or_else(|| EngineError::Missing("no pending timestamped signature".into()))?;
-        let cms =
-            crate::sign::build_pades_cms(&pending.key, &pending.cert_der, &pending.signed, Some(token))
-                .ok_or_else(|| EngineError::Unsupported("PAdES-B-T CMS assembly failed".into()))?;
+        // Normalize to the bare TimeStampToken: a raw TimeStampResp is unwrapped
+        // (its PKIStatusInfo gate is checked), and a bare token is passed through.
+        let token = crate::sign::timestamp::parse_response(reply).ok_or_else(|| {
+            EngineError::Unsupported("TSA reply not granted or carried no timestamp token".into())
+        })?;
+        let cms = crate::sign::build_pades_cms(
+            &pending.key,
+            &pending.cert_der,
+            &pending.signed,
+            Some(&token.token_der),
+        )
+        .ok_or_else(|| EngineError::Unsupported("PAdES-B-T CMS assembly failed".into()))?;
         let mut bytes = pending.bytes;
         fill_contents_window(&mut bytes, pending.lt, pending.gt, &cms)?;
         Ok(bytes)
@@ -15072,6 +15091,95 @@ mod tests {
 
         // The signed file still parses.
         assert!(Document::open(&signed).unwrap().page_count() >= 1);
+    }
+
+    /// Regression: `sign_finish_timestamped` must embed the **bare**
+    /// `TimeStampToken` (a CMS `ContentInfo`) in `id-aa-timeStampToken`, NOT the
+    /// raw `TimeStampResp` (`SEQUENCE { PKIStatusInfo, TimeStampToken }`). The SDK
+    /// hands the engine the whole TSA reply verbatim, so the unwrap must happen
+    /// here (RFC 3161 §3.3.2 / ETSI EN 319 122). Feeds the RAW response and proves
+    /// the attribute value is a ContentInfo, never a PKIStatusInfo-led response.
+    #[test]
+    fn b_t_embeds_bare_timestamp_token_not_response() {
+        use crate::sign::der;
+
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let signer = crate::sign::Signer::generate(
+            "Signer",
+            "260101000000Z",
+            "360101000000Z",
+            1024,
+            &(0..256).map(|i| (i * 5 + 1) as u8).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let _request = doc
+            .sign_prepare_timestamped(
+                signer.key(),
+                signer.certificate(),
+                "Signer",
+                "test",
+                "D:20260614120000Z",
+                "Paris",
+                "tester@example.com",
+                None,
+            )
+            .unwrap();
+
+        // Mock TSA token (a real ContentInfo) wrapped in a granted TimeStampResp.
+        let tsa = crate::sign::Signer::generate(
+            "Mock TSA",
+            "260101000000Z",
+            "360101000000Z",
+            512,
+            &(0..256).map(|i| (i * 9 + 2) as u8).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let token_content_info = tsa.detached_cms(b"TSTInfo stand-in");
+        let resp = der::sequence(&[
+            der::sequence(&[der::integer_u32(0)]), // PKIStatusInfo { granted }
+            token_content_info.clone(),
+        ]);
+
+        // Feed the RAW TimeStampResp — exactly what the SDK forwards.
+        let signed = doc.sign_finish_timestamped(&resp).unwrap();
+
+        let cms = extract_signature_cms(&signed).expect("signature CMS present");
+        assert!(
+            cms.windows(token_content_info.len())
+                .any(|w| w == token_content_info.as_slice()),
+            "the bare TimeStampToken ContentInfo must be embedded"
+        );
+        assert!(
+            !cms.windows(resp.len()).any(|w| w == resp.as_slice()),
+            "the TimeStampResp wrapper must NOT be embedded verbatim"
+        );
+
+        // Locate id-aa-timeStampToken (1.2.840.113549.1.9.16.2.14), then walk the
+        // unsigned Attribute: SEQUENCE { OID, SET { value } }. The value must be a
+        // ContentInfo (SEQUENCE whose first member is an OID), never a
+        // PKIStatusInfo-led TimeStampResp (first member an INTEGER-bearing SEQ).
+        let tst_oid = der::oid(&[1, 2, 840, 113549, 1, 9, 16, 2, 14]);
+        let oid_at = (0..cms.len())
+            .find(|&i| cms[i..].starts_with(&tst_oid))
+            .expect("id-aa-timeStampToken OID found in CMS");
+        // After the OID TLV comes the SET (0x31) of attribute values.
+        let mut after_oid = der::Reader::new(&cms[oid_at..]);
+        let _oid_tlv = after_oid.read_raw().expect("OID tlv");
+        let mut set_reader = after_oid.descend(der::TAG_SET).expect("attribute SET");
+        let (value, _raw) = set_reader.read_raw().expect("attribute value");
+        assert_eq!(
+            value.tag,
+            der::TAG_SEQUENCE,
+            "id-aa-timeStampToken value is a ContentInfo SEQUENCE"
+        );
+        let mut value_reader = value.reader();
+        let (first, _) = value_reader.read_raw().expect("ContentInfo first member");
+        assert_eq!(
+            first.tag,
+            der::TAG_OID,
+            "first member of the embedded token must be the ContentInfo OID \
+             (signedData), not a PKIStatusInfo — proves the TimeStampResp was unwrapped"
+        );
     }
 
     #[test]

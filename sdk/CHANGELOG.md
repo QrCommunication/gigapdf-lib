@@ -4,6 +4,40 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.71.0] - 2026-06-23
+
+Long-term validation release: PAdES-LTV builds on the B-T timestamped signatures
+from 0.70 by embedding the validation material (certificate chain + revocation
+responses) so a signature keeps verifying long after its certificates expire or
+are revoked. The public API is additive — existing behaviour is unchanged.
+
+### Added
+
+- **PAdES-LTV (B-LT / B-LTA).** New SDK `GigaPdfDoc.signLtv()` (async) produces a
+  long-term-validation signature: it first builds a B-T signature
+  (`signTimestamped`), then embeds a Document Security Store (`/DSS` with
+  `/Certs`, `/OCSPs`, `/CRLs`, and per-signature `/VRI`) carrying the revocation
+  material for the certificate chain (B-LT). With `archiveTimestamp` it also adds
+  a `/DocTimeStamp` document timestamp (`ETSI.RFC3161` subfilter) over the whole
+  updated file for B-LTA, refreshing the long-term trust anchor. The engine
+  computes *which* OCSP/CRL endpoints to query from the certificates' AIA / CRL-DP
+  extensions; the host fetches them (the WASM core has no network stack, same
+  pure-data two-phase model as the TSA). OCSP requests follow RFC 6960; CRLs are
+  parsed as `CertificateList`. The exported `defaultOcspPost` and `defaultCrlGet`
+  perform the round trips via `fetch`, and the `revocationFetch` / `crlFetch`
+  hooks let the host add auth/proxy/retries **and apply its own SSRF allow-list**.
+
+### Fixed
+
+- **B-T `id-aa-timeStampToken` now carries the bare `TimeStampToken`.**
+  `signFinishTimestamped` / `signTimestamped` previously embedded the TSA's raw
+  `TimeStampResp` (`SEQUENCE { PKIStatusInfo, TimeStampToken }`) verbatim in the
+  `id-aa-timeStampToken` unsigned attribute. The engine now unwraps the response
+  to the bare `TimeStampToken` (a CMS `ContentInfo`) before embedding it — as
+  required by RFC 3161 §3.3.2 / ETSI EN 319 122 — matching the B-LTA
+  document-timestamp path. Both a raw `TimeStampResp` and an already-unwrapped
+  token are accepted (the `PKIStatusInfo` gate is still enforced).
+
 ## [0.70.0] - 2026-06-23
 
 Fidelity + standards release: advanced (PAdES-B-T) timestamped signatures,

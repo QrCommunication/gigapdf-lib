@@ -405,12 +405,15 @@ pub extern "C" fn gp_sign_prepare_tsa(
     }
 }
 
-/// Phase 2 of a PAdES-B-T signature: embed the RFC 3161 timestamp `token` (the
-/// raw `TimeStampToken` `ContentInfo` the host extracted from the TSA reply) as
-/// the SignerInfo's unsigned attribute and finalize the signed PDF. Requires a
-/// prior [`gp_sign_prepare_tsa`] on the same handle. Buffer-returning (host
-/// frees); null on error (no pending signature, or the CMS overflows
-/// `/Contents`).
+/// Phase 2 of a PAdES-B-T signature: embed the RFC 3161 timestamp from the TSA
+/// reply `token` as the SignerInfo's unsigned attribute and finalize the signed
+/// PDF. `token` may be the raw `TimeStampResp` returned by the TSA (the usual
+/// case — its `PKIStatusInfo` is checked and the bare `TimeStampToken` is
+/// extracted) or an already-unwrapped `TimeStampToken` `ContentInfo`; either way
+/// the bare token is what lands in `id-aa-timeStampToken`. Requires a prior
+/// [`gp_sign_prepare_tsa`] on the same handle. Buffer-returning (host frees);
+/// null on error (no pending signature, reply not granted / no token, or the CMS
+/// overflows `/Contents`).
 #[no_mangle]
 pub extern "C" fn gp_sign_finish_tsa(
     handle: *mut Document,
