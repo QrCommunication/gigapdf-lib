@@ -20255,7 +20255,7 @@ mod tests {
 
         // AES-128 public-key encryption.
         let enc = original
-            .encrypt_for_recipients(&[cert.clone()], -44, false, true, &seed, &rng_seed)
+            .encrypt_for_recipients(std::slice::from_ref(&cert), -44, false, true, &seed, &rng_seed)
             .unwrap();
         assert!(
             String::from_utf8_lossy(&enc).contains("/Adobe.PubSec"),
@@ -20294,7 +20294,7 @@ mod tests {
 
         // AES-256 public-key encryption round-trips too.
         let enc3 = original
-            .encrypt_for_recipients(&[cert.clone()], -44, true, true, &seed, &rng_seed)
+            .encrypt_for_recipients(std::slice::from_ref(&cert), -44, true, true, &seed, &rng_seed)
             .unwrap();
         let opened3 = Document::open_with_private_key(&enc3, &cert, &key).unwrap();
         let got3: String = opened3

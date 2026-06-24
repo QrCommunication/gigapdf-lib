@@ -14709,7 +14709,7 @@ mod tests {
         // Unit-level checks of the `draw:transform` value parser.
         assert_eq!(
             odp_transform_rotate_rad("rotate(1.5707963267948966) translate(2cm 3cm)"),
-            Some(1.5707963267948966)
+            Some(std::f64::consts::FRAC_PI_2)
         );
         assert_eq!(
             odp_transform_translate("rotate(0.5) translate(2cm 3cm)"),
