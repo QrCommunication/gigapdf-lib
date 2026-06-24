@@ -26,6 +26,7 @@ pub mod rtf;
 pub mod srgb_icc;
 pub mod style;
 pub mod table;
+pub mod tagged;
 pub mod web;
 pub mod zip;
 

@@ -3349,7 +3349,9 @@ fn parse_pdfa_level(tag: &str) -> gigapdf_core::convert::pdfa::PdfaLevel {
     use gigapdf_core::convert::pdfa::PdfaLevel;
     match tag.trim().trim_start_matches("pdfa-") {
         "1b" => PdfaLevel::Pdfa1b,
+        "1a" => PdfaLevel::Pdfa1a,
         "2u" => PdfaLevel::Pdfa2u,
+        "2a" => PdfaLevel::Pdfa2a,
         "3b" => PdfaLevel::Pdfa3b,
         _ => PdfaLevel::Pdfa2b,
     }

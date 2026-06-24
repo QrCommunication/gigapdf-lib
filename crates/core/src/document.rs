@@ -6566,6 +6566,46 @@ impl Document {
             b"OutputIntents",
             Object::Array(vec![Object::Dictionary(oi)]),
         );
+
+        // Level A (Tagged PDF): build the logical structure tree + marked content
+        // over the working clone, then flag the catalog (`/StructTreeRoot`,
+        // `/MarkInfo`, `/Lang`). `build_struct_tree` re-emits each page's content
+        // stream with balanced `BDC`/`EMC` marked content (rendering-neutral) and
+        // inserts the structure objects. If the document has no reconstructable
+        // structure it returns `None` and we ship the level-B/U baseline (which
+        // still validates one conformance level down — never a regression).
+        if level.is_tagged() {
+            // Allocate structure objects after the metadata/ICC objects already
+            // reserved above (icc_id is the current max).
+            let first_free = icc_id.0 + 1;
+            if let Some(built) =
+                crate::convert::tagged::build_struct_tree(self, &mut objects, first_free)
+            {
+                catalog.set(
+                    b"StructTreeRoot",
+                    Object::Reference(built.struct_tree_root_id),
+                );
+                let mut mark_info = Dictionary::new();
+                mark_info.set(b"Marked", Object::Boolean(true));
+                catalog.set(b"MarkInfo", Object::Dictionary(mark_info));
+                // A level-A file must declare a natural language. Use the
+                // document's own `/Lang` if present, else the detected language,
+                // else a sensible default (`en` — a valid BCP-47 tag, never
+                // empty, which PDF/UA/veraPDF accept for level A).
+                if !catalog.contains(b"Lang") {
+                    let lang = self
+                        .document_language()
+                        .lang
+                        .unwrap_or_else(|| "en".to_string());
+                    catalog.set(
+                        b"Lang",
+                        Object::String(lang.into_bytes(), Literal),
+                    );
+                }
+                let _ = built.next_free;
+            }
+        }
+
         objects.insert(catalog_id, Object::Dictionary(catalog));
 
         // PDF/A requires a trailer /ID. Derive one deterministically.

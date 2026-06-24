@@ -12,26 +12,36 @@ use crate::object::{Object, ObjectId};
 
 /// PDF/A conformance level selectable on [`Document::to_pdfa`](crate::Document::to_pdfa).
 ///
-/// Only the **level B** ("basic", visual reproduction) and **level U**
-/// ("Unicode") flavours are modelled — level A ("accessible", tagged PDF) is out
-/// of scope because this engine does not emit a logical structure tree.
+/// All three conformance flavours are modelled: **level B** ("basic", visual
+/// reproduction), **level U** ("Unicode": B + every glyph `/ToUnicode`-mapped)
+/// and **level A** ("accessible": a *Tagged PDF* — B/U + a logical structure
+/// tree with marked content, ISO 19005-1 §6.8 / 19005-2 §6.8). Level A is built
+/// by [`super::tagged`] from the structure the engine reconstructs.
 ///
-/// | Variant | ISO standard | PDF base | XMP `part`/`conformance` | veraPDF flavour |
-/// |---------|--------------|----------|--------------------------|-----------------|
-/// | [`Pdfa1b`](Self::Pdfa1b) | 19005-1 | 1.4 | `1` / `B` | `1b` |
-/// | [`Pdfa2b`](Self::Pdfa2b) | 19005-2 | 1.7 | `2` / `B` | `2b` |
-/// | [`Pdfa2u`](Self::Pdfa2u) | 19005-2 | 1.7 | `2` / `U` | `2u` |
-/// | [`Pdfa3b`](Self::Pdfa3b) | 19005-3 | 1.7 | `3` / `B` | `3b` |
+/// | Variant | ISO standard | PDF base | XMP `part`/`conformance` | veraPDF flavour | Tagged |
+/// |---------|--------------|----------|--------------------------|-----------------|--------|
+/// | [`Pdfa1b`](Self::Pdfa1b) | 19005-1 | 1.4 | `1` / `B` | `1b` | no |
+/// | [`Pdfa1a`](Self::Pdfa1a) | 19005-1 | 1.4 | `1` / `A` | `1a` | yes |
+/// | [`Pdfa2b`](Self::Pdfa2b) | 19005-2 | 1.7 | `2` / `B` | `2b` | no |
+/// | [`Pdfa2u`](Self::Pdfa2u) | 19005-2 | 1.7 | `2` / `U` | `2u` | no |
+/// | [`Pdfa2a`](Self::Pdfa2a) | 19005-2 | 1.7 | `2` / `A` | `2a` | yes |
+/// | [`Pdfa3b`](Self::Pdfa3b) | 19005-3 | 1.7 | `3` / `B` | `3b` | no |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PdfaLevel {
     /// PDF/A-1b — ISO 19005-1, based on PDF 1.4 (classic xref, no object streams).
     Pdfa1b,
+    /// PDF/A-1a — ISO 19005-1 **Tagged PDF** (level A): 1b + a logical structure
+    /// tree, marked content and Unicode mapping. Built by [`super::tagged`].
+    Pdfa1a,
     /// PDF/A-2b — ISO 19005-2, based on PDF 1.7. The historical default.
     #[default]
     Pdfa2b,
     /// PDF/A-2u — like 2b but additionally requires every glyph to be Unicode-
     /// mapped (a `/ToUnicode` CMap on each font). See [`Document::to_pdfa`].
     Pdfa2u,
+    /// PDF/A-2a — ISO 19005-2 **Tagged PDF** (level A): 2u + a logical structure
+    /// tree and marked content. Built by [`super::tagged`].
+    Pdfa2a,
     /// PDF/A-3b — ISO 19005-3, based on PDF 1.7; permits embedded file
     /// attachments (`/AF`).
     Pdfa3b,
@@ -41,26 +51,34 @@ impl PdfaLevel {
     /// XMP `pdfaid:part` digit (`1`, `2`, `3`).
     fn part(self) -> u8 {
         match self {
-            PdfaLevel::Pdfa1b => 1,
-            PdfaLevel::Pdfa2b | PdfaLevel::Pdfa2u => 2,
+            PdfaLevel::Pdfa1b | PdfaLevel::Pdfa1a => 1,
+            PdfaLevel::Pdfa2b | PdfaLevel::Pdfa2u | PdfaLevel::Pdfa2a => 2,
             PdfaLevel::Pdfa3b => 3,
         }
     }
 
-    /// XMP `pdfaid:conformance` letter (`B` or `U`).
+    /// XMP `pdfaid:conformance` letter (`A`, `B` or `U`).
     fn conformance(self) -> char {
         match self {
+            PdfaLevel::Pdfa1a | PdfaLevel::Pdfa2a => 'A',
             PdfaLevel::Pdfa2u => 'U',
             _ => 'B',
         }
     }
 
+    /// Whether this is a **level A** flavour — a Tagged PDF requiring a logical
+    /// structure tree, marked content and a `/MarkInfo` flag (built by
+    /// [`super::tagged`]).
+    pub(crate) fn is_tagged(self) -> bool {
+        matches!(self, PdfaLevel::Pdfa1a | PdfaLevel::Pdfa2a)
+    }
+
     /// The file-header bytes the level mandates: PDF/A-1 is built on PDF 1.4,
     /// every later part on PDF 1.7. ISO 19005-1 §6.1.2 requires the header to
-    /// declare 1.4 (or lower); a `%PDF-1.7` header would fail veraPDF for 1b.
+    /// declare 1.4 (or lower); a `%PDF-1.7` header would fail veraPDF for 1b/1a.
     pub(crate) fn header(self) -> &'static [u8] {
         match self {
-            PdfaLevel::Pdfa1b => b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n",
+            PdfaLevel::Pdfa1b | PdfaLevel::Pdfa1a => b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n",
             _ => b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n",
         }
     }
