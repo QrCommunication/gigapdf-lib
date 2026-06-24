@@ -41,14 +41,13 @@ pub struct ProvidedFont {
     pub ttf: Vec<u8>,
 }
 
+/// Phase-1 fetch-dedup key: `(family lc, bold, italic)`. The *fetch* list only
+/// distinguishes regular vs bold (it maps to Google-Fonts 400/700 downloads); the
+/// finer per-weight selection happens at render time against the provided faces.
 type Key = (String, bool, bool);
 
 fn key(family: &str, bold: bool, italic: bool) -> Key {
     (family.to_ascii_lowercase(), bold, italic)
-}
-
-fn weight_bold(w: u16) -> bool {
-    w >= 600
 }
 
 // ─── font resolution + measurement ────────────────────────────────────────────
@@ -68,9 +67,19 @@ impl Face {
     }
 }
 
+/// One parsed host-provided face, carrying the **exact** numeric weight (not a
+/// binary bold bit) so the CSS weight-matching algorithm can pick between
+/// per-weight instances of the same family (e.g. 300/400/500/700).
+struct ProvidedFace {
+    family: String, // ASCII-lowercased family
+    weight: u16,    // exact CSS weight (1–1000)
+    italic: bool,
+    face: Face,
+}
+
 /// Parsed faces used for line-breaking before any PDF object exists.
 struct MeasureBook {
-    faces: Vec<(Key, Face)>,
+    faces: Vec<ProvidedFace>,
     /// Bundled last-resort face (Liberation Sans), parsed once. Used for real
     /// metrics whenever no host-provided face matches a run, so offline /
     /// unknown-family text still lays out with true advance widths instead of a
@@ -83,8 +92,12 @@ impl MeasureBook {
         let faces = fonts
             .iter()
             .filter_map(|f| {
-                Face::parse(&f.ttf)
-                    .map(|face| (key(&f.family, weight_bold(f.weight), f.italic), face))
+                Face::parse(&f.ttf).map(|face| ProvidedFace {
+                    family: f.family.to_ascii_lowercase(),
+                    weight: f.weight,
+                    italic: f.italic,
+                    face,
+                })
             })
             .collect();
         MeasureBook {
@@ -93,24 +106,46 @@ impl MeasureBook {
         }
     }
 
-    /// Nearest *host-provided* face (font + shaper) for a style: exact
-    /// (family,bold,italic) → same family → any provided face. `None` when no
-    /// font was provided at all (the caller then falls back to the bundled face).
-    fn provided(&self, style: &Style) -> Option<&Face> {
+    /// The nearest *host-provided* face for a style, plus the exact weight of the
+    /// face that won, applying the CSS font-matching weight algorithm: among
+    /// same-family + same-italic faces, the closest weight per [`weight_pref`];
+    /// then same-family any italic; then any provided face. `None` when no font
+    /// was provided at all (the caller then falls back to the bundled face).
+    fn provided_match(&self, style: &Style) -> Option<(&Face, u16)> {
         let fam = style.font_family.to_ascii_lowercase();
+        let want = style.font_weight;
+        // 1. Same family + same italic: pick the best weight.
         self.faces
             .iter()
-            .find(|(k, _)| k.0 == fam && k.1 == style.bold && k.2 == style.italic)
-            .or_else(|| self.faces.iter().find(|(k, _)| k.0 == fam))
+            .filter(|f| f.family == fam && f.italic == style.italic)
+            .min_by_key(|f| weight_pref(f.weight, want))
+            // 2. Same family, ignore italic: still honour weight matching.
+            .or_else(|| {
+                self.faces
+                    .iter()
+                    .filter(|f| f.family == fam)
+                    .min_by_key(|f| weight_pref(f.weight, want))
+            })
+            // 3. Any provided face at all (last resort before the bundled font).
             .or_else(|| self.faces.first())
-            .map(|(_, f)| f)
+            .map(|f| (&f.face, f.weight))
+    }
+
+    /// The face (font + shaper) to *measure and draw* a run with, plus the weight
+    /// of the matched provided face (used to grade synthetic faux-bold). A
+    /// host-provided face wins (online path); otherwise the bundled fallback,
+    /// reported at the run's requested weight so no synthetic widening is added on
+    /// top of it. `None` only if even the bundled font failed to parse.
+    fn resolve_face_weight(&self, style: &Style) -> Option<(&Face, u16)> {
+        self.provided_match(style)
+            .or_else(|| self.fallback.as_ref().map(|f| (f, style.font_weight)))
     }
 
     /// The face (font + shaper) to *measure and draw* a run with: a host-provided
     /// face when one exists (online path), otherwise the bundled fallback. `None`
     /// only if even the bundled font failed to parse.
     fn resolve_face(&self, style: &Style) -> Option<&Face> {
-        self.provided(style).or(self.fallback.as_ref())
+        self.resolve_face_weight(style).map(|(f, _)| f)
     }
 
     /// The TrueType program to measure and draw a run with (provided or bundled).
@@ -121,12 +156,13 @@ impl MeasureBook {
 
 impl Measure for MeasureBook {
     fn width(&self, text: &str, style: &Style) -> f64 {
-        if let Some(face) = self.resolve_face(style) {
+        if let Some((face, matched_weight)) = self.resolve_face_weight(style) {
             let w = shaped_run_width(&face.ttf, &face.shaper, text, style.font_size);
-            // Synthetic-bold widening when no provided face matches the requested
-            // weight band, graduated by the numeric `font-weight` (heavier ⇒
-            // wider). A face that already supplies the bold variant needs none.
-            w * synthetic_bold_factor(style, style_has_bold_face(self, style))
+            // Synthetic-bold widening graded by how much heavier the requested
+            // weight is than the face that actually matched: a request served by a
+            // real same-or-heavier face needs none; the lighter the matched face,
+            // the more it widens (e.g. 700 onto a 400-only family).
+            w * synthetic_bold_factor(style.font_weight, matched_weight)
         } else {
             // Neither a provided nor the bundled face is available — rough
             // estimate (should not happen in practice).
@@ -136,25 +172,29 @@ impl Measure for MeasureBook {
     }
 }
 
-/// Advance-width multiplier emulating heavier `font-weight` when no real bold
-/// face is available, graduated across the 100–900 scale.
+/// Advance-width multiplier emulating a heavier `font-weight` than the face that
+/// was actually matched, graded by the **gap** `requested − matched`.
 ///
-/// * weight ≤ 500 (regular and lighter) ⇒ `1.0` (no widening — there is no
-///   "thinning" of a regular face, and a lighter request renders as regular).
-/// * weight ≥ 600 with a **real** bold face provided ⇒ `1.0` (the bold glyphs
-///   already carry the extra width).
-/// * weight 600–700 with **no** bold face ⇒ exactly `1.03` (byte-identical to the
-///   previous single bold factor, so ordinary `font-weight: bold` is unchanged).
-/// * weight > 700 with **no** bold face ⇒ widening graduated from `1.03` at 700 up
-///   to ~`1.06` at 900, so `900` reads heavier than `700` even on a regular-only
-///   family. Kept deliberately gentle to avoid visibly mis-spacing text.
-fn synthetic_bold_factor(style: &Style, has_bold_face: bool) -> f64 {
-    if style.font_weight < 600 || has_bold_face {
+/// `requested` is the run's CSS weight; `matched` is the weight of the
+/// host-provided (or bundled) face the painter resolved. The widening only kicks
+/// in when the matched face is *lighter* than requested — a request served by a
+/// real same-or-heavier face carries its extra width in the glyphs themselves and
+/// needs none.
+///
+/// Calibration (kept gentle to avoid visibly mis-spacing text), expressed as
+/// `1.0 + 0.03 · (gap / 300)` capped at +0.06:
+/// * `gap ≤ 0` (matched ≥ requested) ⇒ `1.0`.
+/// * `font-weight: bold` (700) onto a regular-only family ⇒ gap 300 ⇒ exactly
+///   `1.03` — byte-identical to the previous single bold factor.
+/// * `900` onto a 400-only family ⇒ gap 500, clamped ⇒ `1.06`, so `900` reads
+///   heavier than `700`.
+fn synthetic_bold_factor(requested: u16, matched: u16) -> f64 {
+    let gap = requested.saturating_sub(matched) as f64;
+    if gap <= 0.0 {
         return 1.0;
     }
-    // 600–700 → 1.03 (unchanged); 700–900 → 1.03…1.06.
-    let t = ((style.font_weight as f64 - 700.0) / 200.0).clamp(0.0, 1.0);
-    1.03 + 0.03 * t
+    // 1.0 + 0.03·(gap/300), capped at +0.06 (reached by gap ≥ 600).
+    (1.0 + 0.03 * (gap / 300.0)).min(1.06)
 }
 
 /// Advance of a text run in points, **shaped**: characters are mapped to glyph
@@ -183,9 +223,41 @@ fn shaped_run_width(ttf: &TrueTypeFont, shaper: &Shaper, text: &str, font_size: 
     units / upm * font_size
 }
 
-fn style_has_bold_face(book: &MeasureBook, style: &Style) -> bool {
-    let fam = style.font_family.to_ascii_lowercase();
-    book.faces.iter().any(|(k, _)| k.0 == fam && k.1)
+/// Ordering key implementing the CSS Fonts §font-matching **weight** algorithm:
+/// smaller tuple = better candidate for the desired weight `want`. Feed it to
+/// `min_by_key` over the same-family candidate faces.
+///
+/// The first element is the priority **band** (0 = best); the second is the
+/// in-band tie-breaker (the weight distance, so the closest face within a band
+/// wins). Per the spec, for a desired weight `want`:
+/// * `want ∈ [400, 500]`: faces in `[want, 500]` ascending, then `< want`
+///   descending, then `> 500` ascending.
+/// * `want < 400`: faces `≤ want` descending, then `> want` ascending.
+/// * `want > 500`: faces `≥ want` ascending, then `< want` descending.
+fn weight_pref(face: u16, want: u16) -> (u8, u16) {
+    let dist = face.abs_diff(want);
+    if (400..=500).contains(&want) {
+        if face >= want && face <= 500 {
+            (0, dist) // within [want, 500], nearest first
+        } else if face < want {
+            (1, dist) // lighter than want, nearest (largest) first
+        } else {
+            (2, dist) // heavier than 500, nearest first
+        }
+    } else if want < 400 {
+        if face <= want {
+            (0, dist) // at-or-below want, nearest (heaviest) first
+        } else {
+            (1, dist) // above want, nearest first
+        }
+    } else {
+        // want > 500
+        if face >= want {
+            (0, dist) // at-or-above want, nearest first
+        } else {
+            (1, dist) // below want, nearest (heaviest) first
+        }
+    }
 }
 
 // ─── needed fonts (phase 1) ───────────────────────────────────────────────────
@@ -575,21 +647,32 @@ fn paint(
     }
     let mut doc = Document::open(&b.finish()).ok()?;
 
-    // Embed every provided font once; remember its object id by face key.
-    let mut objs: Vec<(Key, u32)> = Vec::new();
+    // Embed every provided font once; remember its object id with the face's
+    // exact (family, weight, italic) so distinct per-weight instances of one
+    // family embed as distinct font objects and stay individually selectable.
+    let mut objs: Vec<(String, u16, bool, u32)> = Vec::new();
     for f in fonts {
         if let Ok(id) = doc.embed_truetype_font(&f.family, &f.ttf) {
-            objs.push((key(&f.family, weight_bold(f.weight), f.italic), id));
+            objs.push((f.family.to_ascii_lowercase(), f.weight, f.italic, id));
         }
     }
-    // Resolve a run to a *provided* font object id (no fallback).
-    let resolve_provided = |objs: &[(Key, u32)], style: &Style| -> Option<u32> {
+    // Resolve a run to a *provided* font object id (no fallback), using the same
+    // CSS nearest-weight matching as the measurer so painting picks the very face
+    // the layout measured: same family + same italic, closest weight per
+    // `weight_pref`; then same family any italic; then any provided face.
+    let resolve_provided = |objs: &[(String, u16, bool, u32)], style: &Style| -> Option<u32> {
         let fam = style.font_family.to_ascii_lowercase();
+        let want = style.font_weight;
         objs.iter()
-            .find(|(k, _)| k.0 == fam && k.1 == style.bold && k.2 == style.italic)
-            .or_else(|| objs.iter().find(|(k, _)| k.0 == fam))
+            .filter(|(f, _, it, _)| *f == fam && *it == style.italic)
+            .min_by_key(|(_, w, _, _)| weight_pref(*w, want))
+            .or_else(|| {
+                objs.iter()
+                    .filter(|(f, _, _, _)| *f == fam)
+                    .min_by_key(|(_, w, _, _)| weight_pref(*w, want))
+            })
             .or_else(|| objs.first())
-            .map(|(_, id)| *id)
+            .map(|(_, _, _, id)| *id)
     };
     // Embed the bundled last-resort face only when some painted text run has no
     // matching provided font — so runs render real, selectable glyphs offline /
@@ -2105,7 +2188,11 @@ mod tests {
             ..Style::default()
         };
         let chosen = book.face(&style).expect("a face is chosen");
-        let provided_face = &book.provided(&style).expect("the provided face exists").ttf;
+        let provided_face = &book
+            .provided_match(&style)
+            .expect("the provided face exists")
+            .0
+            .ttf;
         assert!(
             std::ptr::eq(chosen, provided_face),
             "the provided face is used, not the bundled fallback"
@@ -2765,26 +2852,166 @@ mod tests {
 
     #[test]
     fn synthetic_bold_factor_grades_by_weight() {
-        let make = |w: u16| Style {
+        // Now graded by the GAP between the requested weight and the weight of the
+        // face that actually matched: `1.0 + 0.03·(gap/300)`, capped at +0.06.
+
+        // Matched face is same-or-heavier than requested → no widening, whatever
+        // the requested weight (a real face carries its own width).
+        assert_eq!(synthetic_bold_factor(100, 400), 1.0);
+        assert_eq!(synthetic_bold_factor(400, 400), 1.0);
+        assert_eq!(synthetic_bold_factor(500, 700), 1.0);
+        assert_eq!(synthetic_bold_factor(900, 900), 1.0, "real bold face → 1.0");
+        // Canonical `font-weight: bold` (700) served by a regular-only family
+        // (matched 400, gap 300) is exactly 1.03 — unchanged from the legacy factor.
+        assert!((synthetic_bold_factor(700, 400) - 1.03).abs() < 1e-9);
+        // Heavier requests onto the same regular face widen further, monotonically.
+        let w800 = synthetic_bold_factor(800, 400); // gap 400
+        let w900 = synthetic_bold_factor(900, 400); // gap 500
+        assert!(
+            w800 > 1.03 && w900 > w800,
+            "800<900 widening: {w800} {w900}"
+        );
+        // Gap is capped at +0.06 (reached by gap ≥ 600).
+        assert!(
+            (synthetic_bold_factor(900, 300) - 1.06).abs() < 1e-9,
+            "cap +0.06"
+        );
+        assert!(
+            (synthetic_bold_factor(900, 100) - 1.06).abs() < 1e-9,
+            "gap 800 stays clamped at +0.06"
+        );
+    }
+
+    #[test]
+    fn weight_pref_implements_css_font_matching() {
+        // Pick the best of a candidate set per `weight_pref` via the same
+        // `min_by_key` the resolver uses.
+        let best = |want: u16, faces: &[u16]| -> u16 {
+            *faces.iter().min_by_key(|&&f| weight_pref(f, want)).unwrap()
+        };
+        let set = [100, 300, 400, 500, 700, 900];
+        // 400 → exact 400.
+        assert_eq!(best(400, &set), 400);
+        // 500 → exact 500.
+        assert_eq!(best(500, &set), 500);
+        // 450 ∈ [400,500]: ascend within [450,500] first → 500, not 400.
+        assert_eq!(best(450, &[100, 300, 400, 500, 700]), 500);
+        // 400 with only {300,700}: in [400,500] none ≥400≤500, so lighter (<400)
+        // wins over heavier (>500) → 300, NOT 700 (the classic 400→{300,700} case).
+        assert_eq!(best(400, &[300, 700]), 300);
+        // 500 with only {300,700}: same band rule → 300 wins over 700.
+        assert_eq!(best(500, &[300, 700]), 300);
+        // <400 (300): at-or-below want descends → 300 itself; else nearest above.
+        assert_eq!(best(300, &set), 300);
+        assert_eq!(best(200, &[100, 400, 700]), 100, "≤want (100) beats >want");
+        // >500 (700): at-or-above ascends → 700; (600 not present) nearest above.
+        assert_eq!(best(700, &set), 700);
+        assert_eq!(best(600, &[400, 700, 900]), 700, "≥want nearest (700) wins");
+        assert_eq!(
+            best(800, &[300, 400, 700]),
+            700,
+            ">500 falls to heaviest below"
+        );
+    }
+
+    /// Resolve a run at `weight` (family `Multi`) against `book` and return the
+    /// exact weight of the provided face that matched — the probe used to prove
+    /// per-weight faces no longer collide on a binary bold bit.
+    fn matched_weight_for(book: &MeasureBook, weight: u16) -> u16 {
+        let style = Style {
+            font_family: "Multi".into(),
+            font_size: 12.0,
+            font_weight: weight,
+            bold: weight >= 600,
+            ..Style::default()
+        };
+        book.provided_match(&style)
+            .expect("a provided face matches")
+            .1
+    }
+
+    #[test]
+    fn nearest_weight_picks_the_right_provided_face() {
+        let face = |w: u16| ProvidedFont {
+            family: "Multi".into(),
+            weight: w,
+            italic: false,
+            ttf: bundled::FALLBACK_TTF.to_vec(),
+        };
+        // Same family provided at 300, 400 and 700 — distinct weights that used to
+        // collide under the binary bold key (400 and 500 → same bucket).
+        let book = MeasureBook::new(&[face(300), face(400), face(700)]);
+
+        // Each request lands on the CSS-correct face.
+        assert_eq!(matched_weight_for(&book, 300), 300, "300 → 300");
+        assert_eq!(matched_weight_for(&book, 400), 400, "400 → 400");
+        // 500 ∈ [400,500]: ascend within [500,500]…none, so the in-[want,500]
+        // band is empty → fall to lighter (<500) nearest = 400, NOT the 700 face.
+        assert_eq!(matched_weight_for(&book, 500), 400, "500 → 400 (not 700)");
+        assert_eq!(matched_weight_for(&book, 700), 700, "700 → 700");
+        // A heavier-than-any request snaps to the heaviest available face.
+        assert_eq!(matched_weight_for(&book, 900), 700, "900 → 700 (heaviest)");
+        // A lighter-than-any request snaps to the lightest available face.
+        assert_eq!(matched_weight_for(&book, 100), 300, "100 → 300 (lightest)");
+    }
+
+    #[test]
+    fn distinct_weights_embed_distinct_font_object_ids() {
+        // Two same-family faces at 400 and 700 must embed as two distinct font
+        // objects, and a run at each weight must resolve to its own object id —
+        // i.e. the per-weight faces are individually selectable, not collapsed.
+        let face = |w: u16| ProvidedFont {
+            family: "Multi".into(),
+            weight: w,
+            italic: false,
+            ttf: bundled::FALLBACK_TTF.to_vec(),
+        };
+        let fonts = [face(400), face(700)];
+
+        let mut b = PdfBuilder::new();
+        b.add_page(612.0, 792.0);
+        let mut doc = Document::open(&b.finish()).expect("open");
+
+        // Mirror the painter's embed + resolve so the test exercises the real path.
+        let mut objs: Vec<(String, u16, bool, u32)> = Vec::new();
+        for f in &fonts {
+            let id = doc
+                .embed_truetype_font(&f.family, &f.ttf)
+                .expect("embed face");
+            objs.push((f.family.to_ascii_lowercase(), f.weight, f.italic, id));
+        }
+        let resolve = |objs: &[(String, u16, bool, u32)], style: &Style| -> Option<u32> {
+            let fam = style.font_family.to_ascii_lowercase();
+            let want = style.font_weight;
+            objs.iter()
+                .filter(|(f, _, it, _)| *f == fam && *it == style.italic)
+                .min_by_key(|(_, w, _, _)| weight_pref(*w, want))
+                .or_else(|| {
+                    objs.iter()
+                        .filter(|(f, _, _, _)| *f == fam)
+                        .min_by_key(|(_, w, _, _)| weight_pref(*w, want))
+                })
+                .or_else(|| objs.first())
+                .map(|(_, _, _, id)| *id)
+        };
+
+        assert_eq!(objs.len(), 2, "two faces → two embedded font objects");
+        assert_ne!(objs[0].3, objs[1].3, "distinct object ids per weight");
+
+        let st = |w: u16| Style {
+            font_family: "Multi".into(),
+            font_size: 12.0,
             font_weight: w,
             bold: w >= 600,
             ..Style::default()
         };
-        // No bold face available → graduated widening.
-        // Light/regular: never widened.
-        assert_eq!(synthetic_bold_factor(&make(100), false), 1.0);
-        assert_eq!(synthetic_bold_factor(&make(400), false), 1.0);
-        assert_eq!(synthetic_bold_factor(&make(500), false), 1.0);
-        // Canonical bold (600/700) is exactly 1.03 — unchanged from the legacy
-        // single factor.
-        assert!((synthetic_bold_factor(&make(600), false) - 1.03).abs() < 1e-9);
-        assert!((synthetic_bold_factor(&make(700), false) - 1.03).abs() < 1e-9);
-        // Heavier weights widen further, monotonically, up to ~1.06 at 900.
-        let w800 = synthetic_bold_factor(&make(800), false);
-        let w900 = synthetic_bold_factor(&make(900), false);
-        assert!(w800 > 1.03 && w900 > w800, "800<900 widening: {w800} {w900}");
-        assert!((w900 - 1.06).abs() < 1e-9, "900 → 1.06, got {w900}");
-        // A real bold face suppresses synthetic widening entirely.
-        assert_eq!(synthetic_bold_factor(&make(900), true), 1.0);
+        let id_400 = resolve(&objs, &st(400)).expect("400 resolves");
+        let id_700 = resolve(&objs, &st(700)).expect("700 resolves");
+        assert_ne!(
+            id_400, id_700,
+            "font-weight:400 and :700 select different embedded objects"
+        );
+        // 500 falls to the 400 face (the regular), not the 700 one.
+        assert_eq!(resolve(&objs, &st(500)), Some(id_400), "500 → 400 object");
     }
 }
