@@ -7,6 +7,34 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.81.0] - 2026-06-24
+
+Compact output — **object streams** + a **cross-reference stream** (PDF 1.5+,
+ISO 32000-1 §7.5.7/§7.5.8). The serializer previously only wrote the classic
+PDF 1.4 structure. Resolves
+[#10](https://github.com/qrcommunication/gigapdf-lib/issues/10) (linearization
+excepted — see notes).
+
+### Added
+
+- **`serialize::to_pdf_compressed(objects, trailer, use_object_streams)`** — packs
+  every non-stream object into Flate-compressed `/Type /ObjStm` object streams
+  (type-2 cross-reference entries) and writes a `/Type /XRef` cross-reference
+  stream (`/W [1 4 2]`). With `use_object_streams = false` it writes the xref as a
+  stream while keeping classic object bodies. Stream objects always stay direct.
+- **`Document::save_optimized(object_streams, xref_streams)`** — the compact save
+  path (uncompressed streams are Flate-compressed first, like `save_compressed`).
+  `gp_save_optimized` / `doc.saveOptimized({ objectStreams, xrefStreams })`.
+- Factored the shared `Document::flate_streams()` helper out of `save_compressed`.
+
+### Notes
+
+- **Conformance-validated**: both modes pass `qpdf --check` ("No syntax or stream
+  encoding errors found") and a `qpdf --qdf` decompression round-trip — an
+  independent authoritative validator, not just the engine's own parser.
+- **Linearization** (Fast Web View, ISO 32000-1 Annex F) is a separate byte-layout
+  optimization and is **not** produced here.
+
 ## [0.80.0] - 2026-06-24
 
 Signature **verification** and **DocMDP certification** (ISO 32000-1 §12.8) — the

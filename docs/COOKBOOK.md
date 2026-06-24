@@ -39,6 +39,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Image → PDF (single & batch)](#image--pdf)
 - [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
 - [Merge multiple PDFs](#merge-multiple-pdfs)
+- [Compact output (object streams + cross-reference stream)](#compact-output-object-streams--cross-reference-stream) — *v0.81.0*
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
 - [Fill and create form fields](#fill-and-create-form-fields)
 - [Annotate (highlight, note, ink, stamp)](#annotate)
@@ -567,6 +568,30 @@ for (const extra of [second, third]) doc.appendPages(extra);
 const merged = doc.saveCompressed();
 doc.close();
 ```
+
+---
+
+## Compact output (object streams + cross-reference stream)
+
+Three serializers, in increasing compactness. `saveOptimized` packs every
+non-stream object into compressed `/ObjStm`s and writes a `/XRef` cross-reference
+stream (PDF 1.5+) — the smallest output, accepted by every modern reader.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+const plain   = doc.save();            // classic, uncompressed — easiest to debug
+const flated  = doc.saveCompressed();  // streams Flate-compressed, classic xref table
+const compact = doc.saveOptimized();   // object streams + xref stream (smallest)
+
+// Fine-grained: an xref stream but classic object bodies (no /ObjStm).
+const xrefOnly = doc.saveOptimized({ objectStreams: false });
+
+doc.close();
+```
+
+> Note: linearization ("Fast Web View", ISO 32000-1 Annex F) is a separate
+> byte-layout optimization and is **not** produced here.
 
 ---
 

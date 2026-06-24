@@ -94,6 +94,185 @@ pub fn to_pdf(objects: &BTreeMap<ObjectId, Object>, trailer: &Dictionary) -> Vec
     out
 }
 
+/// Append `width` big-endian bytes of `value` (the cross-reference-stream field
+/// encoding, ISO 32000-1 §7.5.8.3).
+fn push_field(out: &mut Vec<u8>, value: u64, width: usize) {
+    let bytes = value.to_be_bytes();
+    out.extend_from_slice(&bytes[8 - width..]);
+}
+
+/// Serialize with PDF 1.5+ **object streams** + a **cross-reference stream**
+/// (ISO 32000-1 §7.5.7 / §7.5.8) for a more compact file. When
+/// `use_object_streams` is set, every non-stream object is packed into a
+/// Flate-compressed `/Type /ObjStm` (type-2 xref entries); otherwise only the
+/// cross-reference is written as a stream (all objects stay type-1). Stream
+/// objects can never live in an object stream and are always written directly.
+/// Linearization (Annex F / Fast Web View) is **not** performed here.
+pub fn to_pdf_compressed(
+    objects: &BTreeMap<ObjectId, Object>,
+    trailer: &Dictionary,
+    use_object_streams: bool,
+) -> Vec<u8> {
+    use crate::filters::deflate::flate_encode;
+
+    // 1. Select + renumber 1..N (same selection as `to_pdf`; old ObjStm/XRef are
+    //    dropped — fresh ones are written below).
+    let mut ids: Vec<ObjectId> = objects
+        .iter()
+        .filter(|(_, obj)| !is_obsolete(obj))
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    let mut remap: BTreeMap<ObjectId, u32> = BTreeMap::new();
+    for (index, id) in ids.iter().enumerate() {
+        remap.insert(*id, index as u32 + 1);
+    }
+    let n = ids.len() as u32;
+
+    // 2. Partition: stream objects (type-1) vs compressible non-stream objects.
+    let mut top_level: Vec<u32> = Vec::new();
+    let mut compressible: Vec<u32> = Vec::new();
+    for id in &ids {
+        let num = remap[id];
+        if !use_object_streams || objects[id].as_stream().is_some() {
+            top_level.push(num);
+        } else {
+            compressible.push(num);
+        }
+    }
+
+    // 3. Group compressible objects into object streams; assign their numbers
+    //    (n+1…) and the cross-reference stream's number (last).
+    const PER_STM: usize = 200;
+    let stm_groups: Vec<&[u32]> = compressible.chunks(PER_STM).collect();
+    let num_stms = stm_groups.len() as u32;
+    let xref_num = n + num_stms + 1;
+
+    /// Where a renumbered object lives, for its xref entry.
+    enum Loc {
+        Offset(usize),
+        InStream { stm: u32, idx: u32 },
+    }
+    let mut loc: BTreeMap<u32, Loc> = BTreeMap::new();
+
+    // 4. Header + the directly-written (stream) objects.
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n");
+    for &num in &top_level {
+        let id = ids[(num - 1) as usize];
+        let remapped = remap_refs(&objects[&id], &remap);
+        loc.insert(num, Loc::Offset(out.len()));
+        out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        write_object(&mut out, &remapped);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+
+    // 5. Object streams: a header of `N` `(objnum offset)` pairs, then the packed
+    //    object bodies starting at `/First`, all Flate-compressed.
+    for (group_index, group) in stm_groups.iter().enumerate() {
+        let stm_num = n + 1 + group_index as u32;
+        let mut header = String::new();
+        let mut body: Vec<u8> = Vec::new();
+        for (idx, &member) in group.iter().enumerate() {
+            let id = ids[(member - 1) as usize];
+            let remapped = remap_refs(&objects[&id], &remap);
+            header.push_str(&format!("{member} {} ", body.len()));
+            write_object(&mut body, &remapped);
+            body.push(b'\n');
+            loc.insert(
+                member,
+                Loc::InStream {
+                    stm: stm_num,
+                    idx: idx as u32,
+                },
+            );
+        }
+        let mut decoded = header.into_bytes();
+        let first = decoded.len();
+        decoded.extend_from_slice(&body);
+        let compressed = flate_encode(&decoded);
+
+        let mut dict = Dictionary::new();
+        dict.set(b"Type".to_vec(), Object::Name(b"ObjStm".to_vec()));
+        dict.set(b"N".to_vec(), Object::Integer(group.len() as i64));
+        dict.set(b"First".to_vec(), Object::Integer(first as i64));
+        dict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+        dict.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
+        loc.insert(stm_num, Loc::Offset(out.len()));
+        out.extend_from_slice(format!("{stm_num} 0 obj\n").as_bytes());
+        write_dict(&mut out, &dict);
+        out.extend_from_slice(b"\nstream\n");
+        out.extend_from_slice(&compressed);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    // 6. The cross-reference stream. Fields are `[1 4 2]` bytes: type, then
+    //    offset / object-stream number, then generation / index-in-stream.
+    let xref_offset = out.len();
+    loc.insert(xref_num, Loc::Offset(xref_offset));
+    let size = xref_num + 1;
+    let (w1, w2, w3) = (1usize, 4usize, 2usize);
+    let mut xref_data: Vec<u8> = Vec::with_capacity(size as usize * (w1 + w2 + w3));
+    // Object 0 — the head of the free list.
+    push_field(&mut xref_data, 0, w1);
+    push_field(&mut xref_data, 0, w2);
+    push_field(&mut xref_data, 65535, w3);
+    for num in 1..=xref_num {
+        match loc.get(&num) {
+            Some(Loc::Offset(off)) => {
+                push_field(&mut xref_data, 1, w1);
+                push_field(&mut xref_data, *off as u64, w2);
+                push_field(&mut xref_data, 0, w3);
+            }
+            Some(Loc::InStream { stm, idx }) => {
+                push_field(&mut xref_data, 2, w1);
+                push_field(&mut xref_data, *stm as u64, w2);
+                push_field(&mut xref_data, *idx as u64, w3);
+            }
+            None => {
+                push_field(&mut xref_data, 0, w1);
+                push_field(&mut xref_data, 0, w2);
+                push_field(&mut xref_data, 0, w3);
+            }
+        }
+    }
+    let xref_compressed = flate_encode(&xref_data);
+
+    let mut xdict = Dictionary::new();
+    xdict.set(b"Type".to_vec(), Object::Name(b"XRef".to_vec()));
+    xdict.set(b"Size".to_vec(), Object::Integer(size as i64));
+    if let Some(root) = trailer.get(b"Root") {
+        xdict.set(b"Root".to_vec(), remap_refs(root, &remap));
+    }
+    if let Some(info) = trailer.get(b"Info") {
+        xdict.set(b"Info".to_vec(), remap_refs(info, &remap));
+    }
+    if let Some(id) = trailer.get(b"ID") {
+        xdict.set(b"ID".to_vec(), id.clone());
+    }
+    xdict.set(
+        b"W".to_vec(),
+        Object::Array(vec![
+            Object::Integer(w1 as i64),
+            Object::Integer(w2 as i64),
+            Object::Integer(w3 as i64),
+        ]),
+    );
+    xdict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+    xdict.set(
+        b"Length".to_vec(),
+        Object::Integer(xref_compressed.len() as i64),
+    );
+    out.extend_from_slice(format!("{xref_num} 0 obj\n").as_bytes());
+    write_dict(&mut out, &xdict);
+    out.extend_from_slice(b"\nstream\n");
+    out.extend_from_slice(&xref_compressed);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    out
+}
+
 /// Append a PDF **incremental update** to an already-serialized `base` document
 /// (ISO 32000-1 §7.5.6): keep `base` byte-for-byte intact and write, after it, a
 /// fresh body of `new_objects` (each `(number, generation, object)`), a classic

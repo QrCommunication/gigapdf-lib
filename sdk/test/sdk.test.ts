@@ -495,6 +495,30 @@ describe("@qrcommunication/gigapdf-lib", () => {
     c.close();
   });
 
+  it("saveOptimized: object streams + cross-reference stream round-trip", () => {
+    const doc = giga.open(giga.txtToPdf("Compact me — object streams and xref streams."));
+
+    const compact = doc.saveOptimized(); // object streams + xref stream
+    const xrefOnly = doc.saveOptimized({ objectStreams: false });
+    doc.close();
+
+    const s = new TextDecoder("latin1").decode(compact);
+    expect(s).toContain("/ObjStm");
+    expect(s).toContain("/XRef");
+    expect(s).not.toContain("\nxref\n");
+
+    const x = new TextDecoder("latin1").decode(xrefOnly);
+    expect(x).toContain("/XRef");
+    expect(x).not.toContain("/ObjStm");
+
+    // Both reopen cleanly with the page intact.
+    for (const bytes of [compact, xrefOnly]) {
+      const r = giga.open(bytes);
+      expect(r.pageCount()).toBe(1);
+      r.close();
+    }
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

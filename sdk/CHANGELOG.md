@@ -4,6 +4,23 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.81.0] - 2026-06-24
+
+Compact output — object streams + cross-reference stream. Resolves
+[#10](https://github.com/qrcommunication/gigapdf-lib/issues/10) (linearization
+excepted).
+
+### Added
+
+- **`saveOptimized(opts?)`.** Serialize with PDF 1.5+ **object streams**
+  (`/ObjStm`) + a **cross-reference stream** (`/XRef`) — the most compact output.
+  `opts = { objectStreams?, xrefStreams? }` (both default `true`; `objectStreams`
+  implies `xrefStreams`). Streams are Flate-compressed first, like
+  `saveCompressed`.
+
+Both modes are validated with `qpdf --check`. Linearization (Fast Web View) is
+not performed.
+
 ## [0.80.0] - 2026-06-24
 
 Signature verification + DocMDP certification. Resolves

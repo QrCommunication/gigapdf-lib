@@ -2279,6 +2279,22 @@ export class GigaPdfDoc {
     return this.g._buffer((o) => this.ex().gp_save_compressed(this.h, o));
   }
 
+  /**
+   * Serialize with PDF 1.5+ **object streams** + a **cross-reference stream**
+   * (ISO 32000-1 §7.5.7 / §7.5.8) — the most compact output. `objectStreams`
+   * (default `true`) packs non-stream objects into compressed `/ObjStm`s (needs
+   * the xref stream); `xrefStreams` (default `true`) writes a `/XRef` stream.
+   * Uncompressed streams are Flate-compressed first, like {@link saveCompressed}.
+   * Linearization (Fast Web View) is not performed.
+   */
+  saveOptimized(opts: { objectStreams?: boolean; xrefStreams?: boolean } = {}): Uint8Array {
+    const obj = opts.objectStreams ?? true;
+    const xref = opts.xrefStreams ?? true;
+    return this.g._buffer((o) =>
+      this.ex().gp_save_optimized(this.h, obj ? 1 : 0, xref ? 1 : 0, o)
+    );
+  }
+
   // text intelligence
   textRuns(page: number): TextRunInfo[] {
     return this.g._json((o) => this.ex().gp_text_runs_json(this.h, page, o));

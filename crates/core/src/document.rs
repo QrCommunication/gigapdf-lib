@@ -6738,6 +6738,13 @@ impl Document {
     /// Already-filtered streams are left as-is (never double-compressed); a
     /// stream is only replaced when compression actually shrinks it.
     pub fn save_compressed(&self) -> Vec<u8> {
+        crate::serialize::to_pdf(&self.flate_streams(), &self.trailer)
+    }
+
+    /// The object map with every uncompressed stream Flate-compressed (and
+    /// embedded fonts subset) — the shared front half of [`save_compressed`] and
+    /// [`save_optimized`].
+    fn flate_streams(&self) -> BTreeMap<ObjectId, Object> {
         let mut objects = self.objects.clone();
         self.subset_embedded_fonts(&mut objects);
         for object in objects.values_mut() {
@@ -6757,7 +6764,26 @@ impl Document {
                 }
             }
         }
-        crate::serialize::to_pdf(&objects, &self.trailer)
+        objects
+    }
+
+    /// Serialize with PDF 1.5+ **object streams** + a **cross-reference stream**
+    /// (ISO 32000-1 §7.5.7 / §7.5.8) — the most compact output. `object_streams`
+    /// packs every non-stream object into compressed `/Type /ObjStm` streams
+    /// (this needs the xref stream, so it implies `xref_streams`); `xref_streams`
+    /// alone writes a `/Type /XRef` cross-reference stream with classic object
+    /// bodies. Uncompressed streams are Flate-compressed first (like
+    /// [`save_compressed`](Self::save_compressed)); both flags `false` is exactly
+    /// `save_compressed`. Linearization (Annex F / Fast Web View) is not done.
+    pub fn save_optimized(&self, object_streams: bool, xref_streams: bool) -> Vec<u8> {
+        let objects = self.flate_streams();
+        if object_streams {
+            crate::serialize::to_pdf_compressed(&objects, &self.trailer, true)
+        } else if xref_streams {
+            crate::serialize::to_pdf_compressed(&objects, &self.trailer, false)
+        } else {
+            crate::serialize::to_pdf(&objects, &self.trailer)
+        }
     }
 
     /// Reading-order text lines of a page (structured text): each line's text
@@ -17967,6 +17993,55 @@ mod tests {
             Document::open(&encrypted).is_err(),
             "wrong password must be rejected"
         );
+    }
+
+    #[test]
+    fn save_optimized_round_trips_through_object_and_xref_streams() {
+        let original = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let want: String = original
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert!(!want.is_empty());
+
+        // Object streams + cross-reference stream — the most compact layout.
+        let compact = original.save_optimized(true, true);
+        let text = String::from_utf8_lossy(&compact);
+        assert!(text.contains("/ObjStm"), "uses object streams");
+        assert!(text.contains("/XRef"), "uses a cross-reference stream");
+        assert!(
+            !text.contains("\nxref\n"),
+            "no classic cross-reference table"
+        );
+
+        let reopened = Document::open(&compact).unwrap();
+        assert_eq!(reopened.page_count(), original.page_count());
+        let got: String = reopened
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(got, want, "text survives the object-stream round-trip");
+
+        // Cross-reference stream only (classic object bodies, no /ObjStm).
+        let xref_only = original.save_optimized(false, true);
+        let t2 = String::from_utf8_lossy(&xref_only);
+        assert!(t2.contains("/XRef"), "xref stream present");
+        assert!(
+            !t2.contains("/ObjStm"),
+            "no object streams in xref-only mode"
+        );
+        let reopened2 = Document::open(&xref_only).unwrap();
+        let got2: String = reopened2
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(got2, want, "text survives the xref-stream round-trip");
     }
 
     #[test]

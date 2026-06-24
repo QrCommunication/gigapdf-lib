@@ -105,8 +105,9 @@ The unified-model lowering helpers (`officeToModel`, `htmlToModel`,
 |--------|---------|-------------|
 | <a id="close"></a>`close()` | `void` | Free the wasm document handle. **Call once.** Using the doc after is undefined; closing twice corrupts the shared heap. |
 | `pageCount()` | `number` | Number of pages. |
-| `save()` | `Uint8Array` | Serialize to PDF bytes (plain, uncompressed object structure — easiest to grep/debug). |
-| `saveCompressed()` | `Uint8Array` | Serialize packing objects into Flate object streams (smaller output). |
+| `save()` | `Uint8Array` | Serialize to PDF bytes (plain, uncompressed streams + classic xref table — easiest to grep/debug). |
+| `saveCompressed()` | `Uint8Array` | Serialize with every uncompressed stream Flate-compressed (still a classic xref table). |
+| `saveOptimized(opts?)` | `Uint8Array` | Serialize with PDF 1.5+ **object streams** (`/ObjStm`) + a **cross-reference stream** (`/XRef`) — the most compact output (ISO 32000-1 §7.5.7/§7.5.8). `opts = { objectStreams?, xrefStreams? }` (both default `true`; `objectStreams` implies `xrefStreams`). Streams are Flate-compressed first. Linearization (Fast Web View) is not performed. |
 | `pageInfo(page)` | `PageInfo` | `{ width, height, rotation, mediaBox }` — MediaBox size (unrotated), the `/Rotate` flag, and the raw `/MediaBox` `[x0,y0,x1,y1]` (preserves the box origin). |
 
 ### Pages

@@ -2868,6 +2868,29 @@ pub extern "C" fn gp_save_compressed(handle: *const Document, out_len: *mut usiz
     }
 }
 
+/// Serialize with PDF 1.5+ object streams + a cross-reference stream (ISO 32000-1
+/// §7.5.7/§7.5.8) — the most compact output. `object_streams != 0` packs
+/// non-stream objects into `/ObjStm`s (implies a cross-reference stream);
+/// `xref_streams != 0` alone writes a `/XRef` stream with classic object bodies.
+/// Both `0` ⇒ `gp_save_compressed`. Linearization is not performed.
+#[no_mangle]
+pub extern "C" fn gp_save_optimized(
+    handle: *const Document,
+    object_streams: i32,
+    xref_streams: i32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => unsafe {
+            bytes_into_host(
+                doc.save_optimized(object_streams != 0, xref_streams != 0),
+                out_len,
+            )
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Extract the document's text (UTF-8, form-feed between pages).
 #[no_mangle]
 pub extern "C" fn gp_to_text(handle: *const Document, out_len: *mut usize) -> *mut u8 {

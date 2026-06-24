@@ -21,8 +21,9 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 |------|------|-------|
 | `Document::open(&[u8]) -> Result<Document>` | `gp_open(ptr,len) -> handle` | 0/Err on failure |
 | `Document::open_with_password(&[u8],&[u8])` | `gp_open_encrypted(ptr,len,pw,pwlen)` | decrypts |
-| `doc.save() -> Vec<u8>` | `gp_save(handle,outlen)` | renumbering serializer |
-| `doc.save_compressed()` | `gp_save_compressed(handle,outlen)` | Flate uncompressed streams |
+| `doc.save() -> Vec<u8>` | `gp_save(handle,outlen)` | renumbering serializer (classic xref table) |
+| `doc.save_compressed()` | `gp_save_compressed(handle,outlen)` | Flate uncompressed streams (classic xref table) |
+| `doc.save_optimized(object_streams,xref_streams)` | `gp_save_optimized(handle,object_streams,xref_streams,outlen)` | PDF 1.5+ **object streams** (`/ObjStm`) + **cross-reference stream** (`/XRef`), ISO 32000-1 §7.5.7/§7.5.8 — the most compact output; `object_streams` implies `xref_streams`. Linearization (Fast Web View, Annex F) is **not** done |
 | `doc.save_encrypted(pw,owner,id0,key,algo,perms)` | `gp_save_encrypted(handle,pw,pwlen,owner,ownerlen,id,idlen,key,keylen,algo,perms,outlen)` | algo 0=RC4-128, 1=AES-128, 2=AES-256; `key`=secret host randomness (AES-256) |
 | — | `gp_close(handle)` | free the document |
 | — | `gp_alloc(len)` / `gp_free(ptr,len)` | linear-memory management |
