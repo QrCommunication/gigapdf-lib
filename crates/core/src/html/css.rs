@@ -786,9 +786,29 @@ pub struct GridAreaRect {
 #[derive(Debug, Clone)]
 struct AttrCond {
     name: String,
-    /// `Some(v)` for `[attr=v]` (exact match); `None` for bare `[attr]`
+    /// `Some(v)` for `[attr=v]`/`[attr^=v]`/… ; `None` for bare `[attr]`
     /// (presence only). Values are stored as written (case-sensitive).
     value: Option<String>,
+    /// How `value` is matched against the attribute (ignored when `value` is
+    /// `None`).
+    op: AttrOp,
+}
+
+/// CSS attribute-selector operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttrOp {
+    /// `[a=v]` — exact match.
+    Exact,
+    /// `[a^=v]` — the value starts with `v`.
+    Prefix,
+    /// `[a$=v]` — the value ends with `v`.
+    Suffix,
+    /// `[a*=v]` — the value contains `v`.
+    Substring,
+    /// `[a~=v]` — `v` is one of the whitespace-separated words.
+    Word,
+    /// `[a|=v]` — the value equals `v` or starts with `v-`.
+    DashPrefix,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -894,10 +914,8 @@ fn parse_compound(s: &str) -> Compound {
                 c.id = Some(s[start..i].to_string());
             }
             b'[' => {
-                // `[attr]` or `[attr=value]` / `[attr="value"]`. Other operators
-                // (`~=`, `^=`, …) are not modelled: we keep the bare-name
-                // presence test, which is a safe over-match (better than dropping
-                // the rule).
+                // `[attr]`, `[attr=value]`, or an operator form `[attr^=v]` /
+                // `$=` / `*=` / `~=` / `|=` (quotes optional).
                 i += 1;
                 let inner_start = i;
                 while i < bytes.len() && bytes[i] != b']' {
@@ -907,16 +925,26 @@ fn parse_compound(s: &str) -> Compound {
                 if i < bytes.len() {
                     i += 1; // consume ']'
                 }
-                if let Some((name, val)) = inner.split_once('=') {
-                    let name = name.trim_end_matches(['~', '^', '$', '*', '|']).trim();
+                if let Some((lhs, val)) = inner.split_once('=') {
+                    // The byte just before `=` may be an operator.
+                    let (name, op) = match lhs.as_bytes().last() {
+                        Some(b'~') => (&lhs[..lhs.len() - 1], AttrOp::Word),
+                        Some(b'^') => (&lhs[..lhs.len() - 1], AttrOp::Prefix),
+                        Some(b'$') => (&lhs[..lhs.len() - 1], AttrOp::Suffix),
+                        Some(b'*') => (&lhs[..lhs.len() - 1], AttrOp::Substring),
+                        Some(b'|') => (&lhs[..lhs.len() - 1], AttrOp::DashPrefix),
+                        _ => (lhs, AttrOp::Exact),
+                    };
                     c.attrs.push(AttrCond {
-                        name: name.to_ascii_lowercase(),
+                        name: name.trim().to_ascii_lowercase(),
                         value: Some(val.trim().trim_matches(['"', '\'']).to_string()),
+                        op,
                     });
                 } else if !inner.trim().is_empty() {
                     c.attrs.push(AttrCond {
                         name: inner.trim().to_ascii_lowercase(),
                         value: None,
+                        op: AttrOp::Exact,
                     });
                 }
             }
@@ -1116,9 +1144,22 @@ fn tokenize_selector(s: &str) -> Vec<SelTok> {
             toks.push(SelTok::Compound(std::mem::take(cur)));
         }
     };
+    // Bracket/paren depth: combinators and whitespace only separate compounds at
+    // depth 0, so `[class~=b]` / `:nth-child(2n + 1)` keep their `~`/spaces.
+    let mut depth = 0i32;
     for ch in s.chars() {
         match ch {
-            '>' | '+' | '~' => {
+            '[' | '(' => {
+                depth += 1;
+                cur.push(ch);
+                prev_ws = false;
+            }
+            ']' | ')' => {
+                depth = (depth - 1).max(0);
+                cur.push(ch);
+                prev_ws = false;
+            }
+            '>' | '+' | '~' if depth == 0 => {
                 flush(&mut cur, &mut toks);
                 // Replace a trailing descendant (from surrounding whitespace)
                 // with the explicit combinator.
@@ -1132,7 +1173,7 @@ fn tokenize_selector(s: &str) -> Vec<SelTok> {
                 }));
                 prev_ws = false;
             }
-            c if c.is_whitespace() => {
+            c if c.is_whitespace() && depth == 0 => {
                 flush(&mut cur, &mut toks);
                 prev_ws = true;
             }
@@ -1392,7 +1433,7 @@ fn matches(compound: &Compound, el: &Element) -> bool {
             None => return false,
             Some(actual) => {
                 if let Some(want) = &cond.value {
-                    if actual != want.as_str() {
+                    if !attr_value_matches(actual, want, cond.op) {
                         return false;
                     }
                 }
@@ -1400,6 +1441,20 @@ fn matches(compound: &Compound, el: &Element) -> bool {
         }
     }
     true
+}
+
+/// Match an attribute's `actual` value against a selector's `want` per its
+/// operator. The substring/prefix/suffix forms never match an empty `want`
+/// (per CSS Selectors §6.3).
+fn attr_value_matches(actual: &str, want: &str, op: AttrOp) -> bool {
+    match op {
+        AttrOp::Exact => actual == want,
+        AttrOp::Prefix => !want.is_empty() && actual.starts_with(want),
+        AttrOp::Suffix => !want.is_empty() && actual.ends_with(want),
+        AttrOp::Substring => !want.is_empty() && actual.contains(want),
+        AttrOp::Word => actual.split_whitespace().any(|w| w == want),
+        AttrOp::DashPrefix => actual == want || actual.starts_with(&format!("{want}-")),
+    }
 }
 
 /// Preceding element siblings of `el` (source order) given its parent's
@@ -5013,6 +5068,32 @@ mod tests {
         );
         assert!(parse_transform("none", 16.0).is_none());
         assert!(parse_transform("", 16.0).is_none());
+    }
+
+    #[test]
+    fn attribute_operator_selectors_match_in_the_cascade() {
+        // Each operator selects the <p> by its attribute, colouring it red.
+        let cases = [
+            ("[class^=btn]", "class=\"btn-x\""),     // prefix
+            ("[data-x$=ary]", "data-x=\"primary\""), // suffix
+            ("[data-x*=im]", "data-x=\"primary\""),  // substring
+            ("[class~=b]", "class=\"a b c\""),       // word in a list
+            ("[lang|=en]", "lang=\"en-US\""),        // dash-prefix
+        ];
+        for (sel, attr) in cases {
+            let html = format!("<style>{sel}{{color:red}}</style><p {attr}>x</p>");
+            assert_eq!(color_of_first(&html, "p"), RED, "{sel} should match {attr}");
+        }
+        // Negatives: the operator must NOT over-match.
+        let neg = color_of_first(
+            "<style>p{color:black}[class^=btn]{color:red}</style><p class=\"nav\">x</p>",
+            "p",
+        );
+        assert_eq!(
+            neg,
+            [0.0, 0.0, 0.0],
+            "prefix that doesn't match leaves p black"
+        );
     }
 
     #[test]

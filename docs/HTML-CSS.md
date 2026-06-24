@@ -366,8 +366,9 @@ Two selector engines, for two jobs:
 - The cascade follows **specificity** (id > class > type), then source order;
   inline `style` always wins.
 
-> Limitations: the attribute *operators* `~= ^= $= *= |=` are treated as bare
-> presence (not enforced). **Structural pseudo-classes** — `:first-child`,
+> Attribute selectors `[attr]`, `[attr=v]`, and the operators
+> `[attr^=v]` / `$=` / `*=` / `~=` / `|=` **are** enforced in the cascade (quotes
+> optional). **Structural pseudo-classes** — `:first-child`,
 > `:last-child`, `:only-child`, `:nth-child(an+b | odd | even)` — **are** matched
 > by sibling position (and add specificity like a class). **Dynamic** pseudo-classes
 > (`:hover`, `:focus`, …) still apply unconditionally (no interaction in a static
@@ -451,10 +452,10 @@ subset.
   [transforms](#transforms), [backgrounds](#backgrounds) and [shadows](#shadows).)
 - **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
   full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
-- **Selectors**: pseudo-elements (`::before`/`::after`, not generated) and
-  attribute *operators* (`~= ^= $= *= |=`, treated as presence) in stylesheets.
-  (Structural pseudo-classes `:first-child`/`:last-child`/`:only-child`/
-  `:nth-child()` **are** supported — see [selectors](#selectors).)
+- **Selectors**: pseudo-elements (`::before`/`::after`, not generated) in
+  stylesheets. (Structural pseudo-classes `:first-child`/`:last-child`/
+  `:only-child`/`:nth-child()` **and** attribute operators
+  `[attr^=v]`/`$=`/`*=`/`~=`/`|=` **are** supported — see [selectors](#selectors).)
 - **At-rules / values**: `@page`, `@import` (`@media` queries **are** evaluated —
   media type + width features).
   (`var()` custom properties and `calc()` **are** supported in length contexts.)
