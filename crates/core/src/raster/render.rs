@@ -198,6 +198,10 @@ pub struct RenderFont {
     pub decoder: TextDecoder,
     /// Composite (Type0) font: 2-byte codes, glyph id taken as the CID.
     pub two_byte: bool,
+    /// Composite-font `/Encoding` CMap mapping a 2-byte code → CID (a predefined
+    /// CJK CMap or an embedded CMap stream). `None` ⇒ Identity-H (code == CID),
+    /// the common case. Applied before `cid_to_gid` resolves CID → glyph id.
+    pub code_to_cid: Option<crate::font::cmap::Cmap>,
     /// Simple-font character-code → glyph-id map, resolved from the PDF
     /// `/Encoding` (base + `/Differences`) against the program's own charset.
     /// Primary glyph-selection path for simple fonts whose program has no usable
@@ -1120,29 +1124,39 @@ fn show_text(
         let code_bytes = &bytes[i..i + consumed];
         i += consumed;
 
+        // Composite-font CID for this code: map code → CID through the `/Encoding`
+        // CMap when it isn't `Identity-H` (a predefined CJK or embedded CMap), else
+        // the code *is* the CID. This CID keys both the `/W` width table and the
+        // `/CIDToGIDMap` glyph lookup below. (Unused for simple fonts.)
+        let cid = match &font.code_to_cid {
+            Some(cmap) => cmap.cid(code as u16).unwrap_or(code as u16) as u32,
+            None => code,
+        };
+
         // Authoritative pen advance from the PDF width table (`/Widths` keyed by
-        // code for simple fonts, `/W`+`/DW` keyed by CID for composite ones — the
-        // `code` here is exactly that key). ISO 32000-1 §9.2.4 makes these widths
-        // the displacement of record; the embedded program's own metric is only a
-        // fallback, and a subset CFF that omits the charstring width operand can
-        // otherwise report 0 and collapse whole words. `None` → no width table →
-        // use the program's `advance_width` (filled below), else the 0.5-em guess.
+        // code for simple fonts, `/W`+`/DW` keyed by **CID** for composite ones).
+        // ISO 32000-1 §9.2.4 makes these widths the displacement of record; the
+        // embedded program's own metric is only a fallback, and a subset CFF that
+        // omits the charstring width operand can otherwise report 0 and collapse
+        // whole words. `None` → no width table → use the program's `advance_width`
+        // (filled below), else the 0.5-em guess.
+        let width_key = if font.two_byte { cid } else { code };
         let dict_advance = font
             .decoder
             .widths
             .as_ref()
-            .map(|w| w.advance(code) * size / 1000.0);
+            .map(|w| w.advance(width_key) * size / 1000.0);
 
         let mut advance = dict_advance.unwrap_or(size * 0.5); // fallback width
         if let Some(ttf) = &font.program {
             let upem = ttf.units_per_em();
             let gid = if font.two_byte {
-                // Composite font: the 2-byte code is the CID. Map CID → glyph id
-                // through a non-identity `/CIDToGIDMap` when present, else the
-                // CID is the glyph id directly (the Identity case).
+                // Composite font: map CID → glyph id through a non-identity
+                // `/CIDToGIDMap` when present, else the CID is the glyph id
+                // directly (the Identity case).
                 match &font.cid_to_gid {
-                    Some(map) => map.get(code as usize).copied().unwrap_or(0),
-                    None => code as u16,
+                    Some(map) => map.get(cid as usize).copied().unwrap_or(0),
+                    None => cid as u16,
                 }
             } else if let Some(gid) = font
                 .code_to_gid

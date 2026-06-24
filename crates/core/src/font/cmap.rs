@@ -322,6 +322,241 @@ fn utf16be_to_scalar(bytes: &[u8]) -> Option<u32> {
     }
 }
 
+/// A composite-font `/Encoding` CMap mapping character **codes** to **CIDs**
+/// (ISO 32000-1 §9.7.5). A Type0 font's text-show bytes are split into codes by
+/// the CMap's `codespacerange`s, then each code resolves to a CID via its
+/// `cidrange`/`cidchar` entries. The CID is *not* the glyph id: a non-Identity
+/// `/CIDToGIDMap` then maps CID → glyph id (`/W` widths are likewise keyed by
+/// CID). `Identity-H`/`Identity-V` are the trivial code == CID case and need no
+/// CMap at all (the decoder's `code_to_cid` stays `None`).
+///
+/// Only the **2-byte** code path is modelled: every predefined CMap a Type0
+/// `/Encoding` actually uses in the wild for whole-document text is 2-byte
+/// (`UniGB-UCS2-H`, `UniJIS-UCS2-H`, `UniKS-UCS2-H`, `GBK-EUC-H`, the UTF16
+/// families, …). Mixed 1/2-byte CMaps (`*-RKSJ-*` Shift-JIS) keep only their
+/// 2-byte ranges — the single-byte ASCII half is deferred (it would need the
+/// content layer's atom splitter to vary code length, out of read-fidelity
+/// scope) — so their CJK glyphs still resolve while ASCII falls back to the
+/// raw-code path.
+#[derive(Debug, Clone, Default)]
+pub struct Cmap {
+    /// `[lo, hi]` ranges of 2-byte codes the CMap defines (its `codespacerange`).
+    /// Empty ⇒ assume the whole 2-byte space (a stream that omitted the block).
+    codespace: Vec<(u16, u16)>,
+    /// Single `code → CID` assignments (`cidchar`), highest precedence.
+    singles: BTreeMap<u16, u16>,
+    /// `[lo, hi] → first_cid` contiguous spans (`cidrange`); CID is
+    /// `first_cid + (code - lo)`.
+    ranges: Vec<(u16, u16, u16)>,
+}
+
+impl Cmap {
+    /// Parse a decoded embedded `/Encoding` CMap stream (the `begincodespacerange`
+    /// / `begincidrange` / `begincidchar` blocks). Lexed with the shared [`Lexer`]
+    /// — no new tokenizer, zero dependencies. Unknown constructs are skipped (a
+    /// partial map still beats treating the raw code as the CID).
+    pub fn parse(data: &[u8]) -> Self {
+        let mut lexer = Lexer::new(data);
+        let mut tokens = Vec::new();
+        while let Ok(token) = lexer.next_token() {
+            if matches!(token, Token::Eof) {
+                break;
+            }
+            tokens.push(token);
+        }
+
+        let mut cmap = Cmap::default();
+        let mut i = 0;
+        while i < tokens.len() {
+            match &tokens[i] {
+                Token::Keyword(k) if k == b"begincodespacerange" => {
+                    i = cmap.parse_codespace(&tokens, i + 1);
+                }
+                Token::Keyword(k) if k == b"begincidrange" => {
+                    i = cmap.parse_cidrange(&tokens, i + 1);
+                }
+                Token::Keyword(k) if k == b"begincidchar" => {
+                    i = cmap.parse_cidchar(&tokens, i + 1);
+                }
+                _ => i += 1,
+            }
+        }
+        cmap
+    }
+
+    /// Build a CMap for a **predefined** `/Encoding` name (ISO 32000-1 §9.7.5.2).
+    /// `Identity-H`/`Identity-V` ⇒ `None` (code == CID, no remapping needed). The
+    /// recognised CJK families map their whole 2-byte codespace identically
+    /// (code == CID over the codespace): the predefined Adobe CMaps assign a
+    /// distinct CID per code, and without the bundled Adobe CMap resources the
+    /// faithful, reversible choice is identity over the byte codespace — it keeps
+    /// the per-code `/W` widths and the `/CIDToGIDMap` indexing correct, which is
+    /// what read fidelity needs. `None` for an unrecognised name ⇒ caller falls
+    /// back to the raw-code path.
+    pub fn predefined(name: &[u8]) -> Option<Self> {
+        // Identity is the no-op case — signalled by `None` so the decoder keeps
+        // its zero-overhead raw-code path.
+        if name == b"Identity-H" || name == b"Identity-V" || name == b"Identity" {
+            return None;
+        }
+        // Every supported predefined CMap here is 2-byte; map its full codespace
+        // identically. `None` for a name we don't recognise.
+        let two_byte = matches!(
+            name,
+            b"UniGB-UCS2-H"
+                | b"UniGB-UCS2-V"
+                | b"UniGB-UTF16-H"
+                | b"UniGB-UTF16-V"
+                | b"GBK-EUC-H"
+                | b"GBK-EUC-V"
+                | b"GBK2K-H"
+                | b"GBK2K-V"
+                | b"GBpc-EUC-H"
+                | b"GBpc-EUC-V"
+                | b"UniCNS-UCS2-H"
+                | b"UniCNS-UCS2-V"
+                | b"UniCNS-UTF16-H"
+                | b"UniCNS-UTF16-V"
+                | b"B5pc-H"
+                | b"B5pc-V"
+                | b"ETen-B5-H"
+                | b"ETen-B5-V"
+                | b"UniJIS-UCS2-H"
+                | b"UniJIS-UCS2-V"
+                | b"UniJIS-UCS2-HW-H"
+                | b"UniJIS-UCS2-HW-V"
+                | b"UniJIS-UTF16-H"
+                | b"UniJIS-UTF16-V"
+                | b"90ms-RKSJ-H"
+                | b"90ms-RKSJ-V"
+                | b"90pv-RKSJ-H"
+                | b"Ext-RKSJ-H"
+                | b"Ext-RKSJ-V"
+                | b"UniKS-UCS2-H"
+                | b"UniKS-UCS2-V"
+                | b"UniKS-UTF16-H"
+                | b"UniKS-UTF16-V"
+                | b"KSC-EUC-H"
+                | b"KSC-EUC-V"
+                | b"KSCms-UHC-H"
+                | b"KSCms-UHC-V"
+        );
+        two_byte.then(|| Cmap {
+            codespace: vec![(0x0000, 0xFFFF)],
+            singles: BTreeMap::new(),
+            // Identity over the whole 2-byte codespace: CID == code.
+            ranges: vec![(0x0000, 0xFFFF, 0x0000)],
+        })
+    }
+
+    /// Whether `code` falls inside one of the CMap's 2-byte `codespacerange`s.
+    /// An empty codespace (a stream that omitted the block) admits every code.
+    pub fn in_codespace(&self, code: u16) -> bool {
+        self.codespace.is_empty()
+            || self
+                .codespace
+                .iter()
+                .any(|&(lo, hi)| code >= lo && code <= hi)
+    }
+
+    /// The CID for a 2-byte `code`: a `cidchar` single wins, then the first
+    /// covering `cidrange`. `None` ⇒ the CMap maps this code nowhere (the caller
+    /// then leaves the code unresolved rather than inventing a glyph).
+    pub fn cid(&self, code: u16) -> Option<u16> {
+        if let Some(&cid) = self.singles.get(&code) {
+            return Some(cid);
+        }
+        for &(lo, hi, first) in &self.ranges {
+            if code >= lo && code <= hi {
+                return Some(first.wrapping_add(code - lo));
+            }
+        }
+        None
+    }
+
+    /// `<lo> <hi>` codespace pairs until `endcodespacerange`. Only 2-byte ranges
+    /// are kept (the modelled path); other widths are skipped.
+    fn parse_codespace(&mut self, tokens: &[Token], mut i: usize) -> usize {
+        while i < tokens.len() {
+            if matches!(&tokens[i], Token::Keyword(k) if k == b"endcodespacerange") {
+                return i + 1;
+            }
+            if let (Some(Token::HexString(lo)), Some(Token::HexString(hi))) =
+                (tokens.get(i), tokens.get(i + 1))
+            {
+                if let (Some(lo), Some(hi)) = (hex_u16(lo), hex_u16(hi)) {
+                    if hi >= lo {
+                        self.codespace.push((lo, hi));
+                    }
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        i
+    }
+
+    /// `<lo> <hi> <cid|int>` triples until `endcidrange`. The CID target may be a
+    /// hex string or an integer.
+    fn parse_cidrange(&mut self, tokens: &[Token], mut i: usize) -> usize {
+        while i < tokens.len() {
+            if matches!(&tokens[i], Token::Keyword(k) if k == b"endcidrange") {
+                return i + 1;
+            }
+            let lo = tokens.get(i).and_then(token_u16);
+            let hi = tokens.get(i + 1).and_then(token_u16);
+            let cid = tokens.get(i + 2).and_then(token_u16);
+            if let (Some(lo), Some(hi), Some(cid)) = (lo, hi, cid) {
+                if hi >= lo {
+                    self.ranges.push((lo, hi, cid));
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        i
+    }
+
+    /// `<code> <cid|int>` pairs until `endcidchar`.
+    fn parse_cidchar(&mut self, tokens: &[Token], mut i: usize) -> usize {
+        while i < tokens.len() {
+            if matches!(&tokens[i], Token::Keyword(k) if k == b"endcidchar") {
+                return i + 1;
+            }
+            let code = tokens.get(i).and_then(token_u16);
+            let cid = tokens.get(i + 1).and_then(token_u16);
+            if let (Some(code), Some(cid)) = (code, cid) {
+                self.singles.insert(code, cid);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        i
+    }
+}
+
+/// A 1–2 byte big-endian hex string as a `u16` (`<0041>` → `0x41`). `None` for an
+/// empty or over-wide string (a >2-byte code is outside the modelled path).
+fn hex_u16(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() || bytes.len() > 2 {
+        return None;
+    }
+    Some(bytes.iter().fold(0u16, |acc, &b| (acc << 8) | b as u16))
+}
+
+/// A CMap operand as a `u16`: either a hex string (`<0041>`) or a plain integer
+/// (CIDs are written as integers in `cidrange`/`cidchar`). `None` when neither.
+fn token_u16(token: &Token) -> Option<u16> {
+    match token {
+        Token::HexString(bytes) => hex_u16(bytes),
+        Token::Integer(n) => u16::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
 /// Decodes the bytes of a text-show operand to Unicode for one font.
 #[derive(Debug, Clone, Default)]
 pub struct TextDecoder {
@@ -339,6 +574,17 @@ pub struct TextDecoder {
     /// (no tofu) where there's no `/ToUnicode` to consult **or where a partial
     /// `/ToUnicode` omits some codes** (subset fonts routinely do).
     pub cid_to_unicode: Option<std::collections::BTreeMap<u16, String>>,
+    /// For a composite (Type0) font whose `/Encoding` is **not** `Identity-H`: a
+    /// CMap mapping the 2-byte character **code** to a **CID** (predefined CJK
+    /// CMap or embedded CMap stream). `None` ⇒ Identity (code == CID), the common
+    /// case — and the existing zero-overhead path. Applied *before* `cid_to_gid`
+    /// and the `/W` width lookup, both of which are keyed by CID.
+    pub code_to_cid: Option<Cmap>,
+    /// For a composite font with a non-Identity `/CIDToGIDMap` stream: CID →
+    /// glyph-id (the stream is 2 bytes per CID, indexed by CID). `None` ⇒ Identity
+    /// (CID == glyph id). Resolves the glyph id that `cid_to_unicode` is keyed by,
+    /// so text extracts correctly even when the font reorders glyphs.
+    pub cid_to_gid: Option<std::vec::Vec<u16>>,
     /// For a **simple** (single-byte, non-CID) font: a character-code → Unicode
     /// map resolved from the font's base `/Encoding`
     /// (`WinAnsiEncoding`/`MacRomanEncoding`/`StandardEncoding`/the font's
@@ -386,8 +632,10 @@ impl TextDecoder {
         if self.two_byte {
             let mut i = 0;
             while i + 1 < bytes.len() {
-                let code = ((bytes[i] as u32) << 8) | bytes[i + 1] as u32;
-                units += widths.advance(code);
+                let code = ((bytes[i] as u16) << 8) | bytes[i + 1] as u16;
+                // `/W`/`/DW` are keyed by **CID**, not the raw code: map the code
+                // through the `/Encoding` CMap first (Identity ⇒ CID == code).
+                units += widths.advance(self.code_to_cid_id(code) as u32);
                 i += 2;
             }
         } else {
@@ -437,16 +685,45 @@ impl TextDecoder {
         }
     }
 
-    /// Unicode for one 2-byte composite code: `/ToUnicode` first, then the
-    /// embedded-cmap fallback (Identity-H ⇒ code == glyph id). `None` ⇒ unmapped.
+    /// Unicode for one 2-byte composite code: `/ToUnicode` first (keyed by the raw
+    /// code, as the CMap is), then the embedded-program fallback keyed by **glyph
+    /// id**. The glyph id is recovered code → CID (`/Encoding` CMap; Identity ⇒
+    /// code == CID) → glyph id (`/CIDToGIDMap`; Identity ⇒ CID == glyph id), so a
+    /// predefined CJK CMap and/or a reordering `/CIDToGIDMap` resolve to the same
+    /// glyph the rasterizer draws. `None` ⇒ no source maps the code.
     fn decode_two_byte(&self, code: u16) -> Option<&str> {
         if let Some(text) = self.to_unicode.as_ref().and_then(|c| c.decode(code as u32)) {
             return Some(text);
         }
+        let gid = self.code_to_gid_id(code);
         self.cid_to_unicode
             .as_ref()
-            .and_then(|m| m.get(&code))
+            .and_then(|m| m.get(&gid))
             .map(String::as_str)
+    }
+
+    /// Map a 2-byte character code to its CID through the `/Encoding` CMap. With
+    /// no CMap (Identity-H) the CID is the code itself. A code outside the CMap's
+    /// codespace or unmapped by it falls back to the raw code (a conservative
+    /// best-effort that preserves the Identity behaviour for the predefined
+    /// CMaps' identity codespace).
+    fn code_to_cid_id(&self, code: u16) -> u16 {
+        match &self.code_to_cid {
+            Some(cmap) => cmap.cid(code).unwrap_or(code),
+            None => code,
+        }
+    }
+
+    /// Map a 2-byte character code to a glyph id: code → CID (`/Encoding` CMap) →
+    /// glyph id (non-Identity `/CIDToGIDMap`). Either step is identity when its
+    /// table is absent. A CID past the end of the `/CIDToGIDMap` ⇒ glyph 0
+    /// (`.notdef`), exactly as the rasterizer treats it.
+    fn code_to_gid_id(&self, code: u16) -> u16 {
+        let cid = self.code_to_cid_id(code);
+        match &self.cid_to_gid {
+            Some(map) => map.get(cid as usize).copied().unwrap_or(0),
+            None => cid,
+        }
     }
 
     /// Append the Unicode for one single-byte simple-font code: `/ToUnicode`,
@@ -517,6 +794,8 @@ mod tests {
             to_unicode: Some(cmap),
             widths: None,
             cid_to_unicode: None,
+            code_to_cid: None,
+            cid_to_gid: None,
             simple_encoding: None,
         };
         // One 2-byte code 0x0041 → 'É'.
@@ -533,6 +812,8 @@ mod tests {
             to_unicode: None,
             widths: Some(CodeWidths::new(map, 500.0)),
             cid_to_unicode: None,
+            code_to_cid: None,
+            cid_to_gid: None,
             simple_encoding: None,
         };
         // "AB?" → 600 + 700 + 500 (default) = 1800 units × 12/1000 = 21.6 pt.
@@ -618,6 +899,8 @@ mod tests {
             to_unicode: None,
             widths: None,
             cid_to_unicode: None,
+            code_to_cid: None,
+            cid_to_gid: None,
             simple_encoding: Some(enc),
         };
         assert_eq!(dec.decode(&[0x88, 0xD5, 0x41, b'e']), "à\u{2019}àe");
@@ -636,6 +919,8 @@ mod tests {
             to_unicode: None,
             widths: None,
             cid_to_unicode: None,
+            code_to_cid: None,
+            cid_to_gid: None,
             simple_encoding: Some(enc),
         };
         // 0x18 → nothing (sentinel, not WinAnsi 'N'/control), 0x41 → 'A',
@@ -652,6 +937,8 @@ mod tests {
             to_unicode: None,
             widths: None,
             cid_to_unicode: None,
+            code_to_cid: None,
+            cid_to_gid: None,
             simple_encoding: None,
         };
         // 0x02..0x08 (controls) drop; 'A'..'C' pass through.
@@ -669,6 +956,8 @@ mod tests {
             to_unicode: Some(to),
             widths: None,
             cid_to_unicode: Some(cid),
+            code_to_cid: None,
+            cid_to_gid: None,
             simple_encoding: None,
         };
         // 0x0041 → A (ToUnicode), 0x0042 → B (cid fallback), 0x0043 → no source
@@ -688,6 +977,8 @@ mod tests {
             to_unicode: Some(to),
             widths: None,
             cid_to_unicode: None,
+            code_to_cid: None,
+            cid_to_gid: None,
             simple_encoding: None,
         };
         // 0x0003 → space (mapped); the Hebrew CIDs 0x02A2/0x02A4 map nowhere ⇒
@@ -695,5 +986,111 @@ mod tests {
         let out = dec.decode(&[0x00, 0x03, 0x02, 0xA2, 0x02, 0xA4]);
         assert_eq!(out, " ");
         assert!(!out.contains('\u{FFFD}'));
+    }
+
+    // ── predefined / embedded `/Encoding` CMaps (code → CID) — issue #46 ────────
+
+    #[test]
+    fn cmap_parses_embedded_codespace_cidrange_and_cidchar() {
+        // A minimal embedded CMap: 2-byte codespace, one cidrange, one cidchar.
+        let cmap = Cmap::parse(
+            b"1 begincodespacerange <0000> <ffff> endcodespacerange \
+              1 begincidrange <0020> <0022> 10 endcidrange \
+              1 begincidchar <0041> 99 endcidchar",
+        );
+        // Range <0020>..<0022> → CIDs 10,11,12 (first_cid + offset).
+        assert_eq!(cmap.cid(0x0020), Some(10));
+        assert_eq!(cmap.cid(0x0021), Some(11));
+        assert_eq!(cmap.cid(0x0022), Some(12));
+        // Single cidchar wins for its exact code.
+        assert_eq!(cmap.cid(0x0041), Some(99));
+        // A code mapped by nothing ⇒ None (caller leaves it unresolved).
+        assert_eq!(cmap.cid(0x0030), None);
+        // The codespace covers the whole 2-byte plane here.
+        assert!(cmap.in_codespace(0x1234));
+    }
+
+    #[test]
+    fn cmap_cidchar_overrides_overlapping_cidrange() {
+        // When a code is covered by both a range and a char, the char wins.
+        let cmap = Cmap::parse(
+            b"begincidrange <0000> <00ff> 0 endcidrange \
+              begincidchar <0041> 500 endcidchar",
+        );
+        assert_eq!(cmap.cid(0x0040), Some(0x40)); // range: identity here
+        assert_eq!(cmap.cid(0x0041), Some(500)); // char override
+    }
+
+    #[test]
+    fn cmap_cidrange_accepts_integer_cid_target() {
+        // `cidrange` CID targets are commonly written as integers, not hex.
+        let cmap = Cmap::parse(b"begincidrange <8140> <8142> 633 endcidrange");
+        assert_eq!(cmap.cid(0x8140), Some(633));
+        assert_eq!(cmap.cid(0x8142), Some(635));
+    }
+
+    #[test]
+    fn cmap_predefined_identity_is_none_and_cjk_is_identity_codespace() {
+        // Identity-H/-V need no CMap (code == CID): signalled by None.
+        assert!(Cmap::predefined(b"Identity-H").is_none());
+        assert!(Cmap::predefined(b"Identity-V").is_none());
+        // A recognised CJK family maps its full 2-byte codespace identically.
+        let gb = Cmap::predefined(b"UniGB-UCS2-H").expect("known predefined CMap");
+        assert_eq!(gb.cid(0x4E00), Some(0x4E00));
+        assert_eq!(gb.cid(0x0041), Some(0x0041));
+        assert!(Cmap::predefined(b"UniJIS-UCS2-H").is_some());
+        assert!(Cmap::predefined(b"UniKS-UCS2-H").is_some());
+        assert!(Cmap::predefined(b"GBK-EUC-H").is_some());
+        // An unknown name ⇒ None (caller falls back to the raw-code path).
+        assert!(Cmap::predefined(b"NoSuch-CMap-H").is_none());
+    }
+
+    #[test]
+    fn composite_decoder_resolves_code_through_cmap_and_cidtogidmap() {
+        // End-to-end issue #46 path: a predefined-style `/Encoding` CMap maps the
+        // 2-byte code → CID, a non-identity `/CIDToGIDMap` maps CID → glyph id, and
+        // the glyph-id-keyed embedded-cmap fallback yields the Unicode.
+        //
+        //   code 0x0005 --CMap--> CID 3 --CIDToGIDMap--> GID 7 --cid_to_unicode--> "好"
+        let code_to_cid = Cmap::parse(b"begincidchar <0005> 3 endcidchar");
+        // CIDToGIDMap stream is 2 bytes per CID, indexed by CID: CID 3 → GID 7.
+        let cid_to_gid = vec![0u16, 0, 0, 7];
+        let mut gid_unicode = std::collections::BTreeMap::new();
+        gid_unicode.insert(7u16, "好".to_string());
+        // CID-keyed widths (`/W`): CID 3 → 1000 units.
+        let mut widths = std::collections::BTreeMap::new();
+        widths.insert(3u32, 1000.0);
+        let dec = TextDecoder {
+            two_byte: true,
+            to_unicode: None,
+            widths: Some(CodeWidths::new(widths, 500.0)),
+            cid_to_unicode: Some(gid_unicode),
+            code_to_cid: Some(code_to_cid),
+            cid_to_gid: Some(cid_to_gid),
+            simple_encoding: None,
+        };
+        // Text extraction walks code → CID → GID → Unicode.
+        assert_eq!(dec.decode(&[0x00, 0x05]), "好");
+        // Width is looked up by CID (3 → 1000), not the raw code (which would miss
+        // and yield the 500 default): 1000 units × 12/1000 = 12.0 pt.
+        assert_eq!(dec.string_advance(&[0x00, 0x05], 12.0), Some(12.0));
+    }
+
+    #[test]
+    fn composite_decoder_identity_cmap_keeps_code_equals_cid_equals_gid() {
+        // No `/Encoding` CMap and no `/CIDToGIDMap` (the Identity-H common case):
+        // the 2-byte code is used directly as the glyph id, unchanged behaviour.
+        let mut gid_unicode = std::collections::BTreeMap::new();
+        gid_unicode.insert(0x0042u16, "B".to_string());
+        let dec = TextDecoder {
+            two_byte: true,
+            to_unicode: None,
+            widths: None,
+            cid_to_unicode: Some(gid_unicode),
+            code_to_cid: None,
+            cid_to_gid: None,
+            simple_encoding: None,
+        };
+        assert_eq!(dec.decode(&[0x00, 0x42]), "B");
     }
 }

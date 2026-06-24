@@ -2836,6 +2836,21 @@ impl Document {
             } else {
                 None
             };
+            // For a composite font whose `/Encoding` is **not** `Identity-H`,
+            // resolve code → CID through its CMap (predefined CJK name or an
+            // embedded CMap stream) and CID → glyph id through a non-Identity
+            // `/CIDToGIDMap`. Both are `None` for the Identity case (code == CID ==
+            // glyph id), preserving the existing path with zero overhead. The
+            // decoder applies them before the glyph-id-keyed `cid_to_unicode`
+            // lookup and the CID-keyed `/W` width lookup.
+            let (code_to_cid, cid_to_gid) = if two_byte {
+                (
+                    self.composite_code_to_cid(font),
+                    self.composite_cid_to_gid(font, None),
+                )
+            } else {
+                (None, None)
+            };
             // For a simple (single-byte) font, resolve its base `/Encoding` +
             // `/Differences` to a code → Unicode map (via the Adobe Glyph List),
             // the spec route for simple fonts without `/ToUnicode`. Correct for
@@ -2857,6 +2872,8 @@ impl Document {
                     to_unicode,
                     widths,
                     cid_to_unicode,
+                    code_to_cid,
+                    cid_to_gid,
                     simple_encoding,
                 },
             );
@@ -3034,13 +3051,10 @@ impl Document {
             .and_then(Object::as_array)?
             .first()?;
         let cid = self.resolve(desc).as_dict()?;
-        // Identity-H only: a non-identity CIDToGIDMap would break the code==gid
-        // assumption the cmap reverse-map relies on.
-        if let Some(map) = cid.get(b"CIDToGIDMap").map(|o| self.resolve(o)) {
-            if map.as_name() != Some(b"Identity".as_slice()) {
-                return None;
-            }
-        }
+        // This map is keyed by **glyph id**. The decoder resolves code → CID
+        // (`/Encoding` CMap) → glyph id (`/CIDToGIDMap`) before looking a code up
+        // here, so it stays valid for a non-Identity `/CIDToGIDMap` (and for a
+        // predefined CJK `/Encoding`) — no need to bail on those.
         let fd = cid
             .get(b"FontDescriptor")
             .map(|o| self.resolve(o))
@@ -3091,24 +3105,15 @@ impl Document {
     /// hypothesis is unverifiable, so it is **not** applied (conservative).
     fn cid_mac_glyph_order_unicode(
         &self,
-        font: &Dictionary,
+        _font: &Dictionary,
         to_unicode: Option<&crate::font::cmap::ToUnicode>,
     ) -> Option<std::collections::BTreeMap<u16, String>> {
         use crate::font::encoding::mac_glyph_order_unicode;
 
-        // Identity ordering only: a non-identity `/CIDToGIDMap` breaks the
-        // gid == standard-order-index assumption.
-        let desc = font
-            .get(b"DescendantFonts")
-            .map(|o| self.resolve(o))
-            .and_then(Object::as_array)?
-            .first()?;
-        let cid = self.resolve(desc).as_dict()?;
-        if let Some(map) = cid.get(b"CIDToGIDMap").map(|o| self.resolve(o)) {
-            if map.as_name() != Some(b"Identity".as_slice()) {
-                return None;
-            }
-        }
+        // This map is keyed by **glyph id** (the standard-Mac-order index). The
+        // decoder resolves code → CID → glyph id (honouring any non-Identity
+        // `/CIDToGIDMap`) before looking up here, so the gid == standard-order
+        // assumption holds regardless of the `/CIDToGIDMap` form.
 
         // Confirm the ordering against the font's own `/ToUnicode`: among the
         // codes the standard order *names* (and the CMap maps to a single
@@ -7615,6 +7620,14 @@ impl Document {
             } else {
                 (self.simple_code_to_gid(font, program.as_ref()), None)
             };
+            // Composite fonts whose `/Encoding` is a predefined CJK CMap (or an
+            // embedded CMap) need code → CID before the CID → glyph-id step below;
+            // `None` ⇒ Identity-H (code == CID), the common case.
+            let code_to_cid = if two_byte {
+                self.composite_code_to_cid(font)
+            } else {
+                None
+            };
             // A base-14 substitute has no embedded charset/`code_to_gid`, so its
             // glyphs are found via `code → Unicode → cmap`. Build the simple
             // `/Encoding` (+`/Differences`) map so accented Latin and remapped
@@ -7651,9 +7664,15 @@ impl Document {
                         // Rasterising uses the glyph id directly; no cmap-derived
                         // Unicode fallback is required for drawing.
                         cid_to_unicode: None,
+                        // The decoder carries the CMap/`/CIDToGIDMap` so its CID-
+                        // keyed `string_advance` (width measurement) stays correct
+                        // for predefined-CMap / reordered composite fonts.
+                        code_to_cid: code_to_cid.clone(),
+                        cid_to_gid: cid_to_gid.clone(),
                         simple_encoding,
                     },
                     two_byte,
+                    code_to_cid,
                     code_to_gid,
                     cid_to_gid,
                     // Outline (TrueType/CFF/base-14) fonts carry no Type3 payload.
@@ -7727,9 +7746,14 @@ impl Document {
                 to_unicode: None,
                 widths,
                 cid_to_unicode: None,
+                // Type3 is a simple font (content-stream glyph procs keyed by
+                // code): no composite `/Encoding` CMap, no `/CIDToGIDMap`.
+                code_to_cid: None,
+                cid_to_gid: None,
                 simple_encoding: None,
             },
             two_byte: false,
+            code_to_cid: None,
             code_to_gid: None,
             cid_to_gid: None,
             type3: Some(crate::raster::render::Type3Glyphs {
@@ -7866,6 +7890,27 @@ impl Document {
                 .map(|c| u16::from_be_bytes([c[0], c[1]]))
                 .collect(),
         )
+    }
+
+    /// A composite (Type0) font's `/Encoding` CMap mapping character codes → CIDs
+    /// (ISO 32000-1 §9.7.5), or `None` for the Identity case (`Identity-H`/
+    /// `Identity-V`, where code == CID and no remapping is needed — the common
+    /// case kept on the zero-overhead path).
+    ///
+    /// The `/Encoding` is either a **name** — a predefined CMap built in via
+    /// [`crate::font::cmap::Cmap::predefined`] (the common CJK families:
+    /// `UniGB-UCS2-H`, `UniJIS-UCS2-H`, `UniKS-UCS2-H`, `GBK-EUC-H`, …) — or a
+    /// **stream**, an embedded CMap parsed with [`crate::font::cmap::Cmap::parse`].
+    /// An unrecognised predefined name yields `None` (best-effort: the raw code is
+    /// then used as the CID), never a hard failure.
+    fn composite_code_to_cid(&self, font: &Dictionary) -> Option<crate::font::cmap::Cmap> {
+        let encoding = font.get(b"Encoding").map(|o| self.resolve(o))?;
+        if let Some(name) = encoding.as_name() {
+            return crate::font::cmap::Cmap::predefined(name);
+        }
+        let stream = encoding.as_stream()?;
+        let bytes = decode_stream(stream).ok()?;
+        Some(crate::font::cmap::Cmap::parse(&bytes))
     }
 
     /// Extract and parse the embedded glyph program of a font, descending into
@@ -17252,6 +17297,55 @@ mod tests {
         );
         assert_eq!(only.unwrap().get(&0x6au16).map(String::as_str), Some("à"));
         assert!(merge_cid_maps(None, None).is_none());
+    }
+
+    /// Hand-built Type0 font dict with a predefined `/Encoding` name and a
+    /// non-Identity `/CIDToGIDMap` stream (issue #46): the helpers must resolve
+    /// code → CID (CMap) and CID → glyph id (stream), with all values inline so
+    /// `resolve` returns them directly.
+    #[test]
+    fn composite_encoding_and_cidtogidmap_helpers_resolve_cid_and_gid() {
+        let doc = Document::open(&fixture("simple.pdf")).unwrap();
+
+        // Descendant CIDFont with a 2-byte-per-CID `/CIDToGIDMap` stream:
+        // CID 0→GID 0, 1→0, 2→0, 3→7 (big-endian, 8 bytes).
+        let mut cid_font = Dictionary::new();
+        cid_font.set(b"Type".to_vec(), Object::Name(b"Font".to_vec()));
+        cid_font.set(b"Subtype".to_vec(), Object::Name(b"CIDFontType2".to_vec()));
+        let gid_bytes = vec![0u8, 0, 0, 0, 0, 0, 0, 7];
+        cid_font.set(
+            b"CIDToGIDMap".to_vec(),
+            Object::Stream(Stream::new(Dictionary::new(), gid_bytes)),
+        );
+
+        let mut font = Dictionary::new();
+        font.set(b"Type".to_vec(), Object::Name(b"Font".to_vec()));
+        font.set(b"Subtype".to_vec(), Object::Name(b"Type0".to_vec()));
+        font.set(b"Encoding".to_vec(), Object::Name(b"UniGB-UCS2-H".to_vec()));
+        font.set(
+            b"DescendantFonts".to_vec(),
+            Object::Array(vec![Object::Dictionary(cid_font)]),
+        );
+
+        // Predefined CJK `/Encoding` ⇒ a CMap whose codespace is identity (CID ==
+        // code over the 2-byte plane).
+        let cmap = doc
+            .composite_code_to_cid(&font)
+            .expect("predefined UniGB-UCS2-H CMap");
+        assert_eq!(cmap.cid(0x4E2D), Some(0x4E2D));
+
+        // The non-Identity `/CIDToGIDMap` stream parses to a CID → glyph-id table.
+        let cid_to_gid = doc
+            .composite_cid_to_gid(&font, None)
+            .expect("CIDToGIDMap stream");
+        assert_eq!(cid_to_gid.get(3).copied(), Some(7));
+        assert_eq!(cid_to_gid.first().copied(), Some(0));
+
+        // Identity-H ⇒ no CMap (the zero-overhead common case).
+        let mut id_font = Dictionary::new();
+        id_font.set(b"Subtype".to_vec(), Object::Name(b"Type0".to_vec()));
+        id_font.set(b"Encoding".to_vec(), Object::Name(b"Identity-H".to_vec()));
+        assert!(doc.composite_code_to_cid(&id_font).is_none());
     }
 
     #[test]
