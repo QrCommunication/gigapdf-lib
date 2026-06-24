@@ -2645,6 +2645,33 @@ pub extern "C" fn gp_append_pages(
     }
 }
 
+/// Append a **subset** of another PDF's pages (`other_ptr`/`other_len`) to this
+/// one — the `count` 1-based page numbers in the `u32` array at `pages_ptr`, in
+/// order. Out-of-range numbers are skipped; an empty selection is an error.
+/// 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_append_pages_subset(
+    handle: *mut Document,
+    other_ptr: *const u8,
+    other_len: usize,
+    pages_ptr: *const u32,
+    count: usize,
+) -> i32 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return -1,
+    };
+    if other_ptr.is_null() || pages_ptr.is_null() {
+        return -2;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(other_ptr, other_len) };
+    let pages = unsafe { std::slice::from_raw_parts(pages_ptr, count) };
+    match doc.append_pages_from_subset(bytes, pages) {
+        Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
 /// Add an invisible (render mode 3) Helvetica OCR text layer to `page` from a
 /// packed run buffer. Each run is `x,y,size,rotation` (4 × f64 little-endian),
 /// then a `u32` little-endian text length and that many UTF-8 bytes. Returns

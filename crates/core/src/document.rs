@@ -12425,11 +12425,37 @@ impl Document {
     pub fn append_pages_from(&mut self, other_pdf: &[u8]) -> Result<()> {
         let other = Document::open(other_pdf)?;
         let other_pages = other.page_ids()?;
+        self.append_pages_deep(&other, &other_pages)
+    }
 
-        // Objects reachable from the other document's pages.
+    /// Append a **subset** of another PDF's pages, by 1-based page numbers, in
+    /// the order given (ISO 32000-1 §7.7.3). Each selected page keeps its
+    /// content, resources, annotations and box geometry — only the chosen pages
+    /// (and the objects they reach) are deep-copied in. Numbers out of range are
+    /// skipped; duplicates are honoured (the page is imported once per request).
+    /// Errors with [`EngineError::PageNotFound`] if nothing selectable remains.
+    pub fn append_pages_from_subset(&mut self, other_pdf: &[u8], pages: &[u32]) -> Result<()> {
+        let other = Document::open(other_pdf)?;
+        let all = other.page_ids()?;
+        let selected: Vec<ObjectId> = pages
+            .iter()
+            .filter_map(|&p| all.get(p.saturating_sub(1) as usize).copied())
+            .collect();
+        if selected.is_empty() {
+            return Err(EngineError::PageNotFound(0));
+        }
+        self.append_pages_deep(&other, &selected)
+    }
+
+    /// Deep-copy `pages` (object ids in `other`, in attach order) into this
+    /// document and link them under the catalog `/Pages` tree. Shared by
+    /// [`Self::append_pages_from`] (all pages) and
+    /// [`Self::append_pages_from_subset`] (a page-range selection).
+    fn append_pages_deep(&mut self, other: &Document, pages: &[ObjectId]) -> Result<()> {
+        // Objects reachable from the selected pages.
         let mut reachable: Vec<ObjectId> = Vec::new();
         let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
-        let mut stack = other_pages.clone();
+        let mut stack = pages.to_vec();
         while let Some(id) = stack.pop() {
             if !seen.insert(id) {
                 continue;
@@ -12475,7 +12501,7 @@ impl Document {
             .and_then(Object::as_i64)
             .unwrap_or(kids.len() as i64);
 
-        for &page in &other_pages {
+        for &page in pages {
             let new_page = map[&page];
             kids.push(Object::Reference(new_page));
             if let Some(mut page_dict) = self
@@ -12491,7 +12517,7 @@ impl Document {
         root.set(b"Kids".to_vec(), Object::Array(kids));
         root.set(
             b"Count".to_vec(),
-            Object::Integer(count + other_pages.len() as i64),
+            Object::Integer(count + pages.len() as i64),
         );
         self.objects.insert(root_id, Object::Dictionary(root));
         Ok(())
@@ -18114,6 +18140,77 @@ mod tests {
         doc.append_pages_from(&other).unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
         assert_eq!(reopened.page_count(), before + other_count, "pages merged");
+    }
+
+    #[test]
+    fn appends_a_page_range_selection_from_another_pdf() {
+        // `multi-page.pdf` has 5 pages; each page's text reads "Page N of 5".
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let before = doc.page_count();
+        let other = fixture("multi-page.pdf");
+
+        // Bring in only pages 2 and 4 of the source, in that order.
+        doc.append_pages_from_subset(&other, &[2, 4]).unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert_eq!(
+            reopened.page_count(),
+            before + 2,
+            "only the two selected pages were appended"
+        );
+
+        // The two appended pages are the last two; their distinctive marks survive…
+        let page_text = |n: u32| -> String {
+            reopened
+                .page_text_runs(n)
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.text.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let appended_a = page_text(before as u32 + 1);
+        let appended_b = page_text(before as u32 + 2);
+        assert!(
+            appended_a.contains("Page 2 of 5"),
+            "first appended page kept its content: {appended_a:?}"
+        );
+        assert!(
+            appended_b.contains("Page 4 of 5"),
+            "second appended page kept its content: {appended_b:?}"
+        );
+
+        // …and the unselected source pages were NOT imported.
+        let all_text: String = (1..=reopened.page_count() as u32).map(page_text).collect();
+        assert!(
+            !all_text.contains("Page 1 of 5"),
+            "unselected page 1 was not imported"
+        );
+        assert!(
+            !all_text.contains("Page 3 of 5"),
+            "unselected page 3 was not imported"
+        );
+        assert!(
+            !all_text.contains("Page 5 of 5"),
+            "unselected page 5 was not imported"
+        );
+    }
+
+    #[test]
+    fn append_page_range_rejects_an_all_out_of_range_selection() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let before = doc.page_count();
+        let other = fixture("multi-page.pdf");
+        // `multi-page.pdf` has 5 pages — 6 and 99 are both past the end. As with
+        // `extract_pages`, out-of-range 1-based numbers are dropped, so the
+        // selection is empty and the call is rejected.
+        assert!(doc.append_pages_from_subset(&other, &[6, 99]).is_err());
+        // The destination is untouched after the rejected call.
+        assert_eq!(
+            doc.page_count(),
+            before,
+            "no pages appended on empty selection"
+        );
     }
 
     #[test]

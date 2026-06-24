@@ -657,12 +657,32 @@ const merged = giga.mergePdfs([first, second, third]);
 // 0 inputs → empty; 1 → returned unchanged; N → pages appended sequentially
 ```
 
+### Merge with page-range selection
+
+Each input can also be a `MergePart` `{ pdf, pages? }` whose `pages` picks
+**1-based** page numbers (in the order you give) — so you can take only some
+pages of a source, reorder them, or repeat one, all in a single call (ISO
+32000-1 §7.7.3). Whole-PDF and selected inputs mix freely; each selected page
+keeps its content, resources, annotations and box geometry:
+
+```ts
+const merged = giga.mergePdfs([
+  cover,                         // every page of the cover
+  { pdf: report, pages: [3, 5, 6, 7] }, // only pages 3 and 5–7 of the report
+  { pdf: appendix, pages: [2] }, // just page 2 of the appendix
+]);
+// Out-of-range page numbers are skipped; a part whose selection is entirely
+// out of range contributes nothing.
+```
+
 For finer control (e.g. interleaving with edits) append page-by-page on an open
-document instead:
+document instead. `appendPages` takes the same optional `pages` selection — omit
+it to append every page:
 
 ```ts
 const doc = giga.open(first);
-for (const extra of [second, third]) doc.appendPages(extra);
+doc.appendPages(second);             // all of `second`
+doc.appendPages(third, [1, 4, 5]);   // only pages 1, 4 and 5 of `third`
 const merged = doc.saveCompressed();
 doc.close();
 ```

@@ -67,7 +67,7 @@ try {
 | `officeNeededFonts(office)` | `HtmlFontRequest[] \| null` | **Phase 1** for an exact Office render: the Google/system fonts the container **references but doesn't embed** (e.g. Calibri). Download each `url` → TTF and pass them to `officeToPdfWith`. `null` if not a recognized Office container; `[]` if none are needed. |
 | `officeToPdfWith(office, fonts?)` | `Uint8Array` | **Phase 2**: render an Office container to PDF with the host-fetched `fonts` embedded, so referenced-but-not-embedded families lay out with the right metrics (e.g. Carlito for Calibri). The container's own embedded faces win on conflict, so `fonts = []` yields exactly `officeToPdf`'s output. |
 | `imageToPdf(image)` | `Uint8Array` | Wrap a raster image in a single A4-page PDF (centred, shrink-to-fit, never upscaled). Format auto-detected: **PNG, JPEG, GIF, WebP, AVIF** (GIF/WebP/AVIF transcoded to PNG before embed; PNG keeps every color-type & bit-depth, Adam7 interlacing and transparency via `/SMask`). Empty `Uint8Array` for an unrecognized format. |
-| `mergePdfs(pdfs)` | `Uint8Array` | Concatenate a list of PDFs into one (sequential `appendPages` under the hood). `0` inputs → empty; `1` → returned unchanged; `N` → merged. |
+| `mergePdfs(parts)` | `Uint8Array` | Concatenate a list of sources into one (sequential `appendPages` under the hood). Each entry is either raw `Uint8Array` bytes (every page) or a `MergePart` `{ pdf, pages? }` selecting 1-based page numbers — so the two forms can be mixed (e.g. `[whole, { pdf: b, pages: [1, 3] }]`). `0` inputs → empty; a single whole PDF (no `pages`) → returned unchanged; otherwise → merged. |
 | `gridsToXlsx(grids, sheetNames?)` / `gridsToOds(grids, sheetNames?)` | `Uint8Array` | Write a host-built grid (`pages[rows][cells]`, `string[][][]`) to an `.xlsx`/`.ods` workbook — one sheet per page — with the native writer. Supply your own table reconstruction and emit Office output with **no third-party library**. `sheetNames` (index-aligned) overrides the default `Page <n>` titles. |
 | `xlsxToGrids(xlsx)` | `XlsxSheet[]` | Read an `.xlsx` back into `{ name, rows: string[][] }` sheets (the inverse of `gridsToXlsx`/`toXlsx`). Decodes inline strings, shared strings (`sharedStrings.xml`) and plain values. `[]` for non-xlsx input. |
 
@@ -121,7 +121,7 @@ The unified-model lowering helpers (`officeToModel`, `htmlToModel`,
 | `rotatePage(page, degrees)` | `boolean` | Add `degrees` (90/180/270) to the page's `/Rotate`. |
 | `resizePage(page, width, height)` | `boolean` | Set the page MediaBox to `width`×`height` points. |
 | `extractPages(pages)` | `Uint8Array` | A new **self-contained** PDF with just `pages` (1-based) — cross-page links/AcroForm fields/named dests/outline entries to dropped pages are pruned. Powers *split*. |
-| `appendPages(otherPdf)` | `boolean` | Append every page of another PDF. Powers *merge*. |
+| `appendPages(otherPdf, pages?)` | `boolean` | Append pages of another PDF. With no `pages`, appends **every** page (powers *merge*). With `pages` — 1-based page numbers, in the order given — appends only that **selection** (ISO 32000-1 §7.7.3), each page keeping its content, resources, annotations and box geometry. Out-of-range numbers are skipped; an empty/all-out-of-range selection returns `false`. |
 
 ### Page boxes (Media / Crop / Bleed / Trim / Art)
 
@@ -593,6 +593,7 @@ import type {
   LinkInfo, LayerInfo, OutlineEntry, ViewerPreferences, PageLayout, PageMode,
   NamedDest, Action, Destination, Bookmark,
   SignatureInfo, SignatureReport, GradientSpec, GradientStop, Color, Attachment, XlsxSheet, DecodedImage,
+  MergePart,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,
   // unified editable model:

@@ -146,7 +146,8 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `rotate_page(page,deg)` / `delete_page(page)` / `move_page(from,to)` | `gp_rotate_page / gp_delete_page / gp_move_page` |
 | `resize_page(page,w,h)` / `add_page(w,h,after)` / `copy_page(page)` / `page_info(page)` | `gp_resize_page / gp_add_page / gp_copy_page / gp_page_info_json` |
 | `extract_pages(&[u32]) -> Vec<u8>` | `gp_extract_pages(handle,ptr,count,outlen)` |
-| `append_pages_from(&[u8])` | `gp_append_pages(handle,ptr,len)` |
+| `append_pages_from(&[u8])` (append every page) | `gp_append_pages(handle,ptr,len)` |
+| `append_pages_from_subset(&[u8], &[u32])` (append only the given 1-based pages, in order; out-of-range skipped; empty selection errors) | `gp_append_pages_subset(handle,ptr,len,pagesptr,count)` |
 | `page_margins(page)` / `set_page_margins(page,t,r,b,l)` | `gp_page_margins(handle,page,outlen) / gp_set_page_margins(handle,page,t,r,b,l)` |
 | `page_boxes(page) -> PageBoxes` / `set_page_box(page,kind,[x0,y0,x1,y1])` (all five ISO 32000-1 boxes: Media/Crop/Bleed/Trim/Art; inheritance + per-box defaults applied on read; siblings preserved on write) | `gp_page_boxes_json(handle,page,outlen) / gp_set_page_box(handle,page,kind,x0,y0,x1,y1)` (`kind` 0=media 1=crop 2=bleed 3=trim 4=art) |
 | `page_labels() -> Vec<PageLabelRange>` / `set_page_labels(&[PageLabelRange])` (`/PageLabels` number tree, ISO 32000-1 §12.4.2; empty slice clears) and `page_label(page) -> String` (resolved viewer label, e.g. `iv`, `A-3`) | `gp_page_labels_json(handle,outlen)` → `[{startPage,style,prefix,startNumber}]` / `gp_set_page_labels(handle,ptr,len)` (lines `startPage⇥style⇥startNumber⇥prefix`, style `D r R a A` or `-`) / `gp_page_label(handle,page,outlen)` |

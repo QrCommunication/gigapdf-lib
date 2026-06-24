@@ -74,6 +74,13 @@ const ALL_PERMISSIONS: PdfPermissions = {
 // auto script selection + Hebrew). The WASM SDK no longer ships a client-side recognizer; hosts
 // call the OCR service/binary directly. The legacy `.gpocr` model-loading API was removed.
 
+/**
+ * One source in a {@link GigaPdfEngine.mergePdfs} call. `pdf` is the source
+ * bytes; the optional `pages` selects 1-based page numbers (in the given order)
+ * to bring in — omit it to append every page.
+ */
+export type MergePart = { pdf: Uint8Array; pages?: number[] };
+
 /** Loaded engine module. Create documents with {@link open} / {@link openEncrypted}. */
 export class GigaPdfEngine {
   private constructor(private readonly ex: Exports) {}
@@ -444,19 +451,37 @@ export class GigaPdfEngine {
     );
   }
   /**
-   * Merge several PDFs into one by appending their pages in order. Returns an
-   * empty document for an empty list, or the single input unchanged for a list
-   * of one. Each subsequent PDF is appended onto the first via
+   * Merge several PDFs into one by appending their pages in order. Each input is
+   * either raw bytes (every page) or a {@link MergePart} `{ pdf, pages? }` that
+   * selects 1-based page numbers (ISO 32000-1 §7.7.3) — so the two forms can be
+   * mixed (e.g. `[whole, { pdf: b, pages: [1, 3] }]`). Returns an empty document
+   * for an empty list, or — when the only input is a whole PDF (no `pages`) —
+   * that input unchanged. Each subsequent part is appended onto the first via
    * {@link GigaPdfDoc.appendPages}; the merged bytes are returned and the working
    * document is closed.
    */
-  mergePdfs(pdfs: Uint8Array[]): Uint8Array {
-    if (pdfs.length === 0) return new Uint8Array(0);
-    if (pdfs.length === 1) return pdfs[0]!;
-    const base = this.open(pdfs[0]!);
+  mergePdfs(parts: (Uint8Array | MergePart)[]): Uint8Array {
+    if (parts.length === 0) return new Uint8Array(0);
+    const part = (p: Uint8Array | MergePart): MergePart =>
+      p instanceof Uint8Array ? { pdf: p } : p;
+    const first = part(parts[0]!);
+    if (parts.length === 1 && first.pages === undefined) return first.pdf;
+    // Seed the working document from the first part — reducing it to just its
+    // selected pages first, so a page-range on the first source is honoured too.
+    let seed = first.pdf;
+    if (first.pages !== undefined) {
+      const head = this.open(first.pdf);
+      try {
+        seed = head.extractPages(first.pages);
+      } finally {
+        head.close();
+      }
+    }
+    const base = this.open(seed);
     try {
-      for (let i = 1; i < pdfs.length; i++) {
-        base.appendPages(pdfs[i]!);
+      for (let i = 1; i < parts.length; i++) {
+        const p = part(parts[i]!);
+        base.appendPages(p.pdf, p.pages);
       }
       return base.save();
     } finally {
@@ -3126,8 +3151,25 @@ export class GigaPdfDoc {
   movePage(from: number, to: number): boolean {
     return this.ex().gp_move_page(this.h, from, to) === 0;
   }
-  appendPages(otherPdf: Uint8Array): boolean {
-    return this.g._withBytes(otherPdf, (p, l) => this.ex().gp_append_pages(this.h, p, l)) === 0;
+  /**
+   * Append pages of another PDF onto this document. With no `pages`, every page
+   * is appended (powers *merge*). With `pages` — 1-based page numbers, in the
+   * order given — only that selection is brought in (ISO 32000-1 §7.7.3), each
+   * page keeping its content, resources, annotations and box geometry. Numbers
+   * out of range are skipped; an empty/all-out-of-range selection returns
+   * `false`.
+   */
+  appendPages(otherPdf: Uint8Array, pages?: number[]): boolean {
+    if (pages === undefined) {
+      return this.g._withBytes(otherPdf, (p, l) => this.ex().gp_append_pages(this.h, p, l)) === 0;
+    }
+    return (
+      this.g._withBytes(otherPdf, (bp, bl) =>
+        this.g._withU32(pages, (pp, pc) =>
+          this.ex().gp_append_pages_subset(this.h, bp, bl, pp, pc)
+        )
+      ) === 0
+    );
   }
   /**
    * Add an invisible (text render mode 3) standard-Helvetica text layer to
