@@ -28,14 +28,31 @@ pub struct MeshVertex {
     pub color: [u8; 3],
 }
 
-/// The shape of a PDF shading (ISO 32000-1 §8.7.4.5): an axial (type 2) gradient,
-/// a radial (type 3) gradient, or a mesh (types 4–7) reduced to a list of
-/// Gouraud-shaded triangles. Coordinates are in the shading's own space; for
-/// axial/radial the renderer maps device pixels back into this space to evaluate
-/// the gradient parameter `t`, while a mesh maps each triangle *forward* to
-/// device space and barycentric-interpolates the per-vertex colours.
+/// The shape of a PDF shading (ISO 32000-1 §8.7.4.5): a function-based (type 1)
+/// shading, an axial (type 2) gradient, a radial (type 3) gradient, or a mesh
+/// (types 4–7) reduced to a list of Gouraud-shaded triangles. Coordinates are in
+/// the shading's own space; for function-based/axial/radial the renderer maps
+/// device pixels back into this space to evaluate the colour, while a mesh maps
+/// each triangle *forward* to device space and barycentric-interpolates the
+/// per-vertex colours.
 #[derive(Debug, Clone)]
 pub enum ShadingKind {
+    /// Function-based (type 1): a 2-in→N-out `/Function` colours each point of a
+    /// 2-D `/Domain`. The colour grid is pre-sampled into [`Shading::func_grid`]
+    /// (a `grid_w × grid_h` lattice over the domain); `inv_matrix` maps a point
+    /// in the shading's target coordinate space back into domain space (the
+    /// inverse of the shading's `/Matrix`). A point outside the domain is not
+    /// painted.
+    Function {
+        /// `/Domain` `[x0 x1 y0 y1]` in domain space.
+        domain: [f64; 4],
+        /// Columns of the pre-sampled colour grid (x axis of the domain).
+        grid_w: usize,
+        /// Rows of the pre-sampled colour grid (y axis of the domain).
+        grid_h: usize,
+        /// Shading-target space → domain space (inverse of `/Matrix`).
+        inv_matrix: Matrix,
+    },
     /// Axial: the gradient runs along the segment `(x0,y0)→(x1,y1)`.
     Axial { x0: f64, y0: f64, x1: f64, y1: f64 },
     /// Radial: between circle `(x0,y0,r0)` and circle `(x1,y1,r1)`.
@@ -62,8 +79,13 @@ pub enum ShadingKind {
 pub struct Shading {
     /// Gradient geometry, in shading space.
     pub kind: ShadingKind,
-    /// 256 RGB triples sampled across the colour function (`t = i/255`).
+    /// 256 RGB triples sampled across the colour function (`t = i/255`). Used by
+    /// axial/radial; empty for function-based (type 1, see `func_grid`) and mesh.
     pub ramp: Vec<[u8; 3]>,
+    /// Pre-sampled `grid_w × grid_h` RGB colour grid over the 2-D `/Domain` of a
+    /// function-based (type 1) shading, row-major (`y * grid_w + x`). Empty for
+    /// every other shading kind.
+    pub func_grid: Vec<[u8; 3]>,
     /// `[extend_start, extend_end]` — paint beyond `t<0` / `t>1`.
     pub extend: [bool; 2],
     /// Maps shading space → device pixels (composed by the caller).
@@ -1418,9 +1440,10 @@ fn shading_param(kind: &ShadingKind, x: f64, y: f64, extend: [bool; 2]) -> (f64,
                 None => (0.0, false),
             }
         }
-        // Mesh shadings are painted triangle-by-triangle (forward-mapped), never
-        // through this per-pixel inverse-map parameterisation.
-        ShadingKind::Mesh { .. } => (0.0, false),
+        // Mesh shadings are painted triangle-by-triangle (forward-mapped), and
+        // function-based shadings sample a 2-D colour grid directly; neither uses
+        // this 1-D gradient-parameter inverse map.
+        ShadingKind::Mesh { .. } | ShadingKind::Function { .. } => (0.0, false),
     }
 }
 
@@ -1458,6 +1481,30 @@ fn paint_shading(
     let Some(inv) = invert(&shading.to_device) else {
         return;
     };
+    // Function-based shadings (type 1) also inverse-map each pixel into the
+    // shading's space, but then index the pre-sampled 2-D `/Domain` colour grid
+    // instead of evaluating a 1-D gradient parameter.
+    if let ShadingKind::Function {
+        domain,
+        grid_w,
+        grid_h,
+        inv_matrix,
+    } = &shading.kind
+    {
+        paint_function(
+            canvas,
+            &shading.func_grid,
+            *domain,
+            *grid_w,
+            *grid_h,
+            &inv,
+            inv_matrix,
+            clip,
+            global_alpha,
+            blend,
+        );
+        return;
+    }
     let (x0, y0, x1, y1) = clip_bounds(clip, canvas.width, canvas.height);
     for py in y0..y1 {
         for px in x0..x1 {
@@ -1474,6 +1521,70 @@ fn paint_shading(
                 continue;
             }
             let color = shading.color_at(t);
+            canvas.blend_mode(px, py, color, cov * global_alpha, blend);
+        }
+    }
+}
+
+/// Paint a function-based (type 1) shading. For each device pixel admitted by
+/// `clip`, map it back into the shading's target space (`dev_inv`), then into the
+/// function's domain space (`inv_matrix` = inverse of `/Matrix`). Pixels whose
+/// domain point lies inside `domain` are coloured from the pre-sampled `grid`
+/// (`grid_w × grid_h`, row-major) and blended; points outside the domain are
+/// left untouched. The grid lookup is nearest-cell — a cheap, deterministic
+/// stand-in for re-evaluating the `/Function` per pixel.
+#[allow(clippy::too_many_arguments)]
+fn paint_function(
+    canvas: &mut Canvas,
+    grid: &[[u8; 3]],
+    domain: [f64; 4],
+    grid_w: usize,
+    grid_h: usize,
+    dev_inv: &Matrix,
+    inv_matrix: &Matrix,
+    clip: Option<&ClipMask>,
+    global_alpha: f64,
+    blend: BlendMode,
+) {
+    let [dx0, dx1, dy0, dy1] = domain;
+    let span_x = dx1 - dx0;
+    let span_y = dy1 - dy0;
+    if grid_w == 0 || grid_h == 0 || grid.len() < grid_w * grid_h {
+        return;
+    }
+    let (x0, y0, x1, y1) = clip_bounds(clip, canvas.width, canvas.height);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let cov = match clip {
+                Some(c) => c.at(px, py),
+                None => 1.0,
+            };
+            if cov <= 0.0 {
+                continue;
+            }
+            // Device → shading-target space → domain space.
+            let (sx, sy) = dev_inv.apply(px as f64 + 0.5, py as f64 + 0.5);
+            let (u, v) = inv_matrix.apply(sx, sy);
+            // Reject points outside the (possibly reversed) domain rectangle.
+            if u < dx0.min(dx1) || u > dx0.max(dx1) || v < dy0.min(dy1) || v > dy0.max(dy1) {
+                continue;
+            }
+            // Map the domain point to a nearest grid cell.
+            let fx = if span_x.abs() < 1e-12 {
+                0.0
+            } else {
+                (u - dx0) / span_x
+            };
+            let fy = if span_y.abs() < 1e-12 {
+                0.0
+            } else {
+                (v - dy0) / span_y
+            };
+            let gx =
+                ((fx * (grid_w - 1) as f64).round() as i64).clamp(0, grid_w as i64 - 1) as usize;
+            let gy =
+                ((fy * (grid_h - 1) as f64).round() as i64).clamp(0, grid_h as i64 - 1) as usize;
+            let color = grid[gy * grid_w + gx];
             canvas.blend_mode(px, py, color, cov * global_alpha, blend);
         }
     }

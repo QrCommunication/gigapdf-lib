@@ -5282,6 +5282,12 @@ impl Document {
         use crate::raster::render::{Shading, ShadingKind};
         let dict = obj.as_dict()?;
         let stype = dict.get(b"ShadingType").and_then(Object::as_i64)?;
+        // Function-based (type 1) shadings have no `/Coords`; a 2-in→N-out
+        // `/Function` colours each point of a 2-D `/Domain`. Pre-sample the domain
+        // into a colour grid.
+        if stype == 1 {
+            return self.read_function_shading(dict, pattern_matrix);
+        }
         // Mesh shadings (types 4–7) carry their geometry in the stream body, not a
         // `/Coords` array — handle them separately. They reduce to a triangle list
         // with per-vertex colours already resolved.
@@ -5350,7 +5356,82 @@ impl Document {
         Some(Shading {
             kind,
             ramp,
+            func_grid: Vec::new(),
             extend,
+            to_device: pattern_matrix.unwrap_or(content::PageMatrix::IDENTITY),
+        })
+    }
+
+    /// Read a function-based (type 1) shading (ISO 32000-1 §8.7.4.5.2) into a
+    /// [`Shading`](crate::raster::render::Shading). A 2-in→N-out `/Function` maps
+    /// each `(x, y)` of the 2-D `/Domain` `[x0 x1 y0 y1]` (default `[0 1 0 1]`) to a
+    /// colour in `/ColorSpace`; the shading's `/Matrix` (default identity) maps
+    /// domain space into the shading's target coordinate space. The colour is
+    /// pre-sampled into a `GRID × GRID` lattice over the domain (the renderer then
+    /// inverse-maps each device pixel into domain space and looks the grid up), and
+    /// the inverse of `/Matrix` is baked in so the hot path stays division-free.
+    /// `None` if `/Function`, `/ColorSpace`, or a non-invertible `/Matrix` is bad.
+    fn read_function_shading(
+        &self,
+        dict: &Dictionary,
+        pattern_matrix: Option<content::PageMatrix>,
+    ) -> Option<crate::raster::render::Shading> {
+        use crate::raster::render::{Shading, ShadingKind};
+
+        // Sampling resolution of the 2-D colour grid (cells per axis). 64×64 = 4096
+        // samples is a good fidelity/cost trade-off for a smoothly-varying 2-in
+        // function at page resolution (matches the spirit of the 256-entry 1-D ramp
+        // axial/radial use, extended to two dimensions).
+        const GRID: usize = 64;
+
+        // `/Domain [x0 x1 y0 y1]`, default the unit square.
+        let domain: [f64; 4] = dict
+            .get(b"Domain")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .and_then(|a| {
+                let v: Vec<f64> = a.iter().filter_map(|o| self.resolve(o).as_f64()).collect();
+                (v.len() >= 4).then(|| [v[0], v[1], v[2], v[3]])
+            })
+            .unwrap_or([0.0, 1.0, 0.0, 1.0]);
+
+        // `/Matrix` (domain space → shading-target space), default identity. The
+        // renderer needs its inverse to map target-space pixels back into the
+        // domain, so invert here and bail if it is degenerate.
+        let matrix = self.form_matrix(dict);
+        let inv_matrix = invert_matrix(&matrix)?;
+
+        // `/Function`: a 2-input function (single object or array of single-output
+        // functions). Resolve the colour space to turn its outputs into RGB.
+        let func = dict.get(b"Function").map(|o| self.resolve(o).clone())?;
+        let cs = dict
+            .get(b"ColorSpace")
+            .and_then(|o| self.resolve_color_space(o, 0))?;
+
+        // Map a grid index (`0..GRID`) to its domain coordinate on axis `[lo, hi]`.
+        let denom = (GRID - 1).max(1) as f64;
+        let at = |i: usize, lo: f64, hi: f64| lo + (i as f64 / denom) * (hi - lo);
+        // Pre-sample the colour grid over the domain (row-major, y outer / x inner).
+        let mut func_grid: Vec<[u8; 3]> = Vec::with_capacity(GRID * GRID);
+        for gy in 0..GRID {
+            let y = at(gy, domain[2], domain[3]);
+            for gx in 0..GRID {
+                let x = at(gx, domain[0], domain[1]);
+                let out = self.eval_function_multi(&func, &[x, y]);
+                func_grid.push(cs.to_rgb(&out, self));
+            }
+        }
+
+        Some(Shading {
+            kind: ShadingKind::Function {
+                domain,
+                grid_w: GRID,
+                grid_h: GRID,
+                inv_matrix,
+            },
+            ramp: Vec::new(),
+            func_grid,
+            extend: [false, false],
             to_device: pattern_matrix.unwrap_or(content::PageMatrix::IDENTITY),
         })
     }
@@ -5438,6 +5519,7 @@ impl Document {
         Some(Shading {
             kind: ShadingKind::Mesh { triangles },
             ramp: Vec::new(),
+            func_grid: Vec::new(),
             extend: [false, false],
             to_device: pattern_matrix.unwrap_or(content::PageMatrix::IDENTITY),
         })
@@ -5722,23 +5804,30 @@ impl Document {
     }
 
     /// A representative device-RGB colour (`0..=1`) for a shading object: the
-    /// midpoint of the rasterizer's axial/radial ramp, or — for a mesh shading
-    /// (types 4–7) — the `/Function` sampled at its domain midpoint. Used to give
-    /// a shading-pattern fill a flat stand-in in the shape layer.
+    /// midpoint of the rasterizer's axial/radial ramp, the centre of a
+    /// function-based (type 1) shading's pre-sampled colour grid, or — for a mesh
+    /// shading (types 4–7) — the `/Function` sampled at its domain midpoint. Used
+    /// to give a shading-pattern fill a flat stand-in in the shape layer.
     fn shading_representative_color_f(&self, shading: &Object) -> Option<[f64; 3]> {
         let dict = shading.as_dict()?;
+        let to_rgb_f = |c: [u8; 3]| {
+            [
+                c[0] as f64 / 255.0,
+                c[1] as f64 / 255.0,
+                c[2] as f64 / 255.0,
+            ]
+        };
         // Axial (2) / radial (3): reuse the exact ramp the rasterizer builds and
-        // take its middle entry — a stable, representative gradient colour. A mesh
-        // shading produces a triangle list with an empty ramp, so skip this path
-        // and fall through to the `/Function` midpoint below.
+        // take its middle entry — a stable, representative gradient colour.
+        // Function-based (type 1) shadings have an empty ramp but a 2-D colour grid;
+        // take its centre cell. A mesh shading has neither, so fall through to the
+        // `/Function` midpoint below.
         if let Some(sh) = self.read_shading(shading, None) {
             if !sh.ramp.is_empty() {
-                let mid = sh.ramp[sh.ramp.len() / 2];
-                return Some([
-                    mid[0] as f64 / 255.0,
-                    mid[1] as f64 / 255.0,
-                    mid[2] as f64 / 255.0,
-                ]);
+                return Some(to_rgb_f(sh.ramp[sh.ramp.len() / 2]));
+            }
+            if !sh.func_grid.is_empty() {
+                return Some(to_rgb_f(sh.func_grid[sh.func_grid.len() / 2]));
             }
         }
         // Mesh shadings (types 4–7) carry their colours in a data stream; when a
@@ -16276,6 +16365,25 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
     }
 }
 
+/// Invert a 2-D affine `[a b c d e f]` (PDF row-vector convention). `None` when
+/// the linear part is singular (determinant ≈ 0). Used to map a function-based
+/// shading's target-space pixels back into its `/Domain` (inverse of `/Matrix`).
+fn invert_matrix(m: &content::PageMatrix) -> Option<content::PageMatrix> {
+    let [a, b, c, d, e, f] = m.0;
+    let det = a * d - b * c;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let ia = d * inv;
+    let ib = -b * inv;
+    let ic = -c * inv;
+    let id = a * inv;
+    let ie = -(e * ia + f * ic);
+    let if_ = -(e * ib + f * id);
+    Some(content::PageMatrix::new(ia, ib, ic, id, ie, if_))
+}
+
 /// Read a two-element numeric array entry (`key`) from `dict`, resolving each
 /// element. `None` if the entry is absent, not an array, or has fewer than two
 /// numeric values. Used for function `/Domain` ranges.
@@ -24043,6 +24151,80 @@ mod tests {
         assert!(
             right as i32 - left as i32 > 100,
             "gradient must vary across x (left {left}, right {right})"
+        );
+    }
+
+    /// Build a type-4 (PostScript calculator) function stream object body with an
+    /// accurate `/Length`. `body` is the calculator program *including* its
+    /// surrounding `{ }`.
+    fn ps_function_obj(domain: &str, range: &str, body: &str) -> String {
+        format!(
+            "<< /FunctionType 4 /Domain [{domain}] /Range [{range}] /Length {} >>\nstream\n{body}\nendstream",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn function_based_shading_varies_in_both_axes() {
+        // A function-based (type 1) shading over the domain [0 100 0 100] with an
+        // identity /Matrix, painted with `sh` across a full-page clip. The 2-in→3-out
+        // PostScript /Function maps (x, y) → RGB (R = x/100, G = y/100, B = 0). With
+        // the page base flipping y (device_y = 100 − user_y) the colour must vary
+        // along BOTH device axes — a 2-D gradient, not a 1-D ramp.
+        let shading = "<< /ShadingType 1 /ColorSpace /DeviceRGB \
+                       /Domain [0 100 0 100] /Function 6 0 R >>";
+        // Stack starts [x y]; { 100 div exch 100 div exch 0 } → [x/100 y/100 0].
+        let func = ps_function_obj(
+            "0 100 0 100",
+            "0 1 0 1 0 1",
+            "{ 100 div exch 100 div exch 0 }",
+        );
+        let canvas = render_canvas(
+            "q 0 0 100 100 re W n /Sh0 sh Q",
+            "/Shading << /Sh0 5 0 R >>",
+            &[(5, shading.into()), (6, func)],
+        );
+        // Device (10,10) → user (10, 90): R≈10/100, G≈90/100.
+        let top_left = px(&canvas, 10, 10);
+        // Device (90,90) → user (90, 10): R≈90/100, G≈10/100.
+        let bottom_right = px(&canvas, 90, 90);
+        // R grows with user-x (left→right): top_left low R, bottom_right high R.
+        assert!(top_left[0] < 80, "top-left R ≈ 25, got {top_left:?}");
+        assert!(bottom_right[0] > 180, "bottom-right R ≈ 229, got {bottom_right:?}");
+        // G grows with user-y (bottom→top in user space = top→bottom in device):
+        // top_left (user y=90) high G, bottom_right (user y=10) low G.
+        assert!(top_left[1] > 180, "top-left G ≈ 229, got {top_left:?}");
+        assert!(bottom_right[1] < 80, "bottom-right G ≈ 25, got {bottom_right:?}");
+        // Blue is identically zero across the domain.
+        assert!(top_left[2] < 20 && bottom_right[2] < 20, "B ≈ 0 everywhere");
+    }
+
+    #[test]
+    fn function_based_shading_respects_domain_bounds() {
+        // The /Domain restricts the painted region to the lower-left user quadrant
+        // [0 50 0 50]; a constant-red /Function fills it. Pixels whose user point is
+        // outside the domain must stay white (unpainted) — the renderer rejects
+        // out-of-domain points rather than clamping them to the grid edge.
+        let shading = "<< /ShadingType 1 /ColorSpace /DeviceRGB \
+                       /Domain [0 50 0 50] /Function 6 0 R >>";
+        // Ignore the inputs; always emit red [1 0 0]. Stack [x y] → { pop pop 1 0 0 }.
+        let func = ps_function_obj("0 50 0 50", "0 1 0 1 0 1", "{ pop pop 1 0 0 }");
+        let canvas = render_canvas(
+            "q 0 0 100 100 re W n /Sh0 sh Q",
+            "/Shading << /Sh0 5 0 R >>",
+            &[(5, shading.into()), (6, func)],
+        );
+        // Inside the domain: user (25,25) → device (25, 75) is red.
+        let inside = px(&canvas, 25, 75);
+        assert!(
+            inside[0] > 200 && inside[1] < 40 && inside[2] < 40,
+            "inside the domain must be red, got {inside:?}"
+        );
+        // Outside the domain (user x=80, y=80) → device (80, 20) stays white.
+        assert_eq!(
+            px(&canvas, 80, 20),
+            [255, 255, 255],
+            "outside the domain is unpainted"
         );
     }
 
