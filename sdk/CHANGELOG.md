@@ -44,6 +44,14 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.89.0] - 2026-06-24
+
+PDF-read fidelity (no SDK signature change): FlateDecode/LZW `/DecodeParms`
+predictors (TIFF 2, PNG 10–15) for image **and** xref/object streams
+([#57](https://github.com/qrcommunication/gigapdf-lib/issues/57)); CalGray/CalRGB
+gamma + matrix + white-point colour conversion, ICCBased `/N` fallback corrected
+([#58](https://github.com/qrcommunication/gigapdf-lib/issues/58)).
+
 ## [0.88.1] - 2026-06-24
 
 HTML/CSS renderer: `box-shadow: inset` is now painted (a clipped shadow frame

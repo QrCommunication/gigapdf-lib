@@ -7,6 +7,25 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.89.0] - 2026-06-24
+
+PDF-read fidelity. Two independent fixes implemented in parallel
+([#57](https://github.com/qrcommunication/gigapdf-lib/issues/57),
+[#58](https://github.com/qrcommunication/gigapdf-lib/issues/58)).
+
+### Added
+
+- **`/DecodeParms` predictors for FlateDecode/LZWDecode** (TIFF Predictor 2 and
+  PNG predictors 10–15), applied in the shared `decode_stream` so both image
+  streams and cross-reference / object streams (`/Type /XRef`, `/ObjStm`)
+  de-predict correctly. Honours `/Predictor`, `/Columns`, `/Colors`,
+  `/BitsPerComponent`; lenient on sub-byte TIFF widths. ([#57](https://github.com/qrcommunication/gigapdf-lib/issues/57))
+- **CalGray / CalRGB colour** now applies `/Gamma`, the CalRGB `/Matrix` →
+  CIE-XYZ map and a dependency-free Bradford white-point→D65 + XYZ→sRGB
+  conversion (identity matrix takes a fast linear-sRGB path); ICCBased keeps its
+  `/N` (or `/Alternate`) device fallback, read correctly from the profile stream
+  dict. Improves text, vector and image colour at one seam. ([#58](https://github.com/qrcommunication/gigapdf-lib/issues/58))
+
 ## [0.88.1] - 2026-06-24
 
 HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item B).
