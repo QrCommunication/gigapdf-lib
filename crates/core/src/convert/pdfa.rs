@@ -1,13 +1,70 @@
 //! PDF/A metadata (XMP packet) for the archival export.
 //!
 //! [`Document::to_pdfa`](crate::Document::to_pdfa) adds the structural pieces of
-//! PDF/A-2b conformance — this XMP identification packet plus an sRGB
-//! OutputIntent (see [`super::srgb_icc`]). Full conformance additionally
-//! requires every font embedded; that's documented on `to_pdfa`.
+//! PDF/A conformance — this XMP identification packet plus an sRGB
+//! OutputIntent (see [`super::srgb_icc`]). The exact conformance level is chosen
+//! by [`PdfaLevel`]. Full conformance additionally requires every font embedded;
+//! that's documented on `to_pdfa`.
 
 use std::collections::BTreeMap;
 
 use crate::object::{Object, ObjectId};
+
+/// PDF/A conformance level selectable on [`Document::to_pdfa`](crate::Document::to_pdfa).
+///
+/// Only the **level B** ("basic", visual reproduction) and **level U**
+/// ("Unicode") flavours are modelled — level A ("accessible", tagged PDF) is out
+/// of scope because this engine does not emit a logical structure tree.
+///
+/// | Variant | ISO standard | PDF base | XMP `part`/`conformance` | veraPDF flavour |
+/// |---------|--------------|----------|--------------------------|-----------------|
+/// | [`Pdfa1b`](Self::Pdfa1b) | 19005-1 | 1.4 | `1` / `B` | `1b` |
+/// | [`Pdfa2b`](Self::Pdfa2b) | 19005-2 | 1.7 | `2` / `B` | `2b` |
+/// | [`Pdfa2u`](Self::Pdfa2u) | 19005-2 | 1.7 | `2` / `U` | `2u` |
+/// | [`Pdfa3b`](Self::Pdfa3b) | 19005-3 | 1.7 | `3` / `B` | `3b` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PdfaLevel {
+    /// PDF/A-1b — ISO 19005-1, based on PDF 1.4 (classic xref, no object streams).
+    Pdfa1b,
+    /// PDF/A-2b — ISO 19005-2, based on PDF 1.7. The historical default.
+    #[default]
+    Pdfa2b,
+    /// PDF/A-2u — like 2b but additionally requires every glyph to be Unicode-
+    /// mapped (a `/ToUnicode` CMap on each font). See [`Document::to_pdfa`].
+    Pdfa2u,
+    /// PDF/A-3b — ISO 19005-3, based on PDF 1.7; permits embedded file
+    /// attachments (`/AF`).
+    Pdfa3b,
+}
+
+impl PdfaLevel {
+    /// XMP `pdfaid:part` digit (`1`, `2`, `3`).
+    fn part(self) -> u8 {
+        match self {
+            PdfaLevel::Pdfa1b => 1,
+            PdfaLevel::Pdfa2b | PdfaLevel::Pdfa2u => 2,
+            PdfaLevel::Pdfa3b => 3,
+        }
+    }
+
+    /// XMP `pdfaid:conformance` letter (`B` or `U`).
+    fn conformance(self) -> char {
+        match self {
+            PdfaLevel::Pdfa2u => 'U',
+            _ => 'B',
+        }
+    }
+
+    /// The file-header bytes the level mandates: PDF/A-1 is built on PDF 1.4,
+    /// every later part on PDF 1.7. ISO 19005-1 §6.1.2 requires the header to
+    /// declare 1.4 (or lower); a `%PDF-1.7` header would fail veraPDF for 1b.
+    pub(crate) fn header(self) -> &'static [u8] {
+        match self {
+            PdfaLevel::Pdfa1b => b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n",
+            _ => b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n",
+        }
+    }
+}
 
 /// Strip the graphics-state / appearance constructs that ISO 19005-2 forbids,
 /// in-place over an object map (operate on `Document::to_pdfa`'s working clone,
@@ -86,20 +143,21 @@ pub(crate) fn xml_escape(text: &str, out: &mut String) {
     }
 }
 
-/// Build the XMP metadata packet identifying the file as PDF/A-2b, with a Dublin
-/// Core title and a PDF producer.
-pub fn xmp_metadata(title: &str, producer: &str) -> Vec<u8> {
+/// Build the XMP metadata packet identifying the file at the requested
+/// [`PdfaLevel`], with a Dublin Core title and a PDF producer.
+pub fn xmp_metadata(level: PdfaLevel, title: &str, producer: &str) -> Vec<u8> {
     let (mut t, mut p) = (String::new(), String::new());
     xml_escape(title, &mut t);
     xml_escape(producer, &mut p);
+    let (part, conformance) = (level.part(), level.conformance());
     // The leading BOM + fixed packet id are part of the XMP convention.
     let xmp = format!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
 <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
   <rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">\n\
-   <pdfaid:part>2</pdfaid:part>\n\
-   <pdfaid:conformance>B</pdfaid:conformance>\n\
+   <pdfaid:part>{part}</pdfaid:part>\n\
+   <pdfaid:conformance>{conformance}</pdfaid:conformance>\n\
   </rdf:Description>\n\
   <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n\
    <dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">{t}</rdf:li></rdf:Alt></dc:title>\n\
@@ -120,12 +178,40 @@ mod tests {
 
     #[test]
     fn xmp_identifies_pdfa_2b() {
-        let xmp = String::from_utf8(xmp_metadata("My <Title>", "GigaPDF")).unwrap();
+        let xmp = String::from_utf8(xmp_metadata(PdfaLevel::Pdfa2b, "My <Title>", "GigaPDF")).unwrap();
         assert!(xmp.contains("<pdfaid:part>2</pdfaid:part>"));
         assert!(xmp.contains("<pdfaid:conformance>B</pdfaid:conformance>"));
         assert!(xmp.contains("My &lt;Title&gt;"), "title escaped");
         assert!(xmp.starts_with("<?xpacket begin"));
         assert!(xmp.trim_end().ends_with("<?xpacket end=\"w\"?>"));
+    }
+
+    /// Each [`PdfaLevel`] emits the matching `pdfaid:part`/`conformance` pair and
+    /// the file header its ISO part mandates (PDF/A-1 → 1.4, others → 1.7).
+    #[test]
+    fn xmp_and_header_match_every_level() {
+        for (level, part, conf, header) in [
+            (PdfaLevel::Pdfa1b, "1", "B", &b"%PDF-1.4"[..]),
+            (PdfaLevel::Pdfa2b, "2", "B", &b"%PDF-1.7"[..]),
+            (PdfaLevel::Pdfa2u, "2", "U", &b"%PDF-1.7"[..]),
+            (PdfaLevel::Pdfa3b, "3", "B", &b"%PDF-1.7"[..]),
+        ] {
+            let xmp = String::from_utf8(xmp_metadata(level, "t", "p")).unwrap();
+            assert!(
+                xmp.contains(&format!("<pdfaid:part>{part}</pdfaid:part>")),
+                "{level:?} part"
+            );
+            assert!(
+                xmp.contains(&format!("<pdfaid:conformance>{conf}</pdfaid:conformance>")),
+                "{level:?} conformance"
+            );
+            assert!(level.header().starts_with(header), "{level:?} header");
+        }
+    }
+
+    #[test]
+    fn default_level_is_2b() {
+        assert_eq!(PdfaLevel::default(), PdfaLevel::Pdfa2b);
     }
 
     use crate::object::{Dictionary, Stream};

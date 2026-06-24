@@ -3479,8 +3479,25 @@ export class GigaPdfDoc {
   toRtf(): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_to_rtf(this.h, o));
   }
-  toPdfA(): Uint8Array {
-    return this.g._buffer((o) => this.ex().gp_to_pdfa(this.h, o));
+  /**
+   * Re-serialize the document as **PDF/A** (archival).
+   *
+   * `level` selects the conformance flavour (default `"pdfa-2b"`):
+   * - `"pdfa-1b"` — ISO 19005-1, based on PDF 1.4.
+   * - `"pdfa-2b"` — ISO 19005-2 (default).
+   * - `"pdfa-2u"` — like 2b but requires every glyph Unicode-mapped (a
+   *   `/ToUnicode` CMap on each font); only validator-clean when the source
+   *   fonts already carry one — otherwise prefer `"pdfa-2b"`.
+   * - `"pdfa-3b"` — ISO 19005-3; permits embedded file attachments.
+   *
+   * Full conformance also requires every font embedded — this method does not
+   * embed missing fonts (see the Rust `to_pdfa_level` docs). Level A (tagged
+   * PDF) is not supported.
+   */
+  toPdfA(level: "pdfa-1b" | "pdfa-2b" | "pdfa-2u" | "pdfa-3b" = "pdfa-2b"): Uint8Array {
+    return this.g._withStr(level, (p, l) =>
+      this.g._buffer((o) => this.ex().gp_to_pdfa(this.h, p, l, o)),
+    );
   }
 
   // security

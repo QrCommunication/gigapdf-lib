@@ -39,6 +39,18 @@ fn is_obsolete(object: &Object) -> bool {
 
 /// Serialize the object map + trailer into a complete PDF byte stream.
 pub fn to_pdf(objects: &BTreeMap<ObjectId, Object>, trailer: &Dictionary) -> Vec<u8> {
+    to_pdf_with_header(objects, trailer, b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n")
+}
+
+/// Classic-xref serializer with a caller-chosen file-header line. Identical to
+/// [`to_pdf`] in every other respect; only the leading `%PDF-1.n` banner differs.
+/// Used by PDF/A export, where ISO 19005-1 (PDF/A-1) requires a 1.4 header while
+/// later parts use 1.7. `header` must include the binary-comment second line.
+pub fn to_pdf_with_header(
+    objects: &BTreeMap<ObjectId, Object>,
+    trailer: &Dictionary,
+    header: &[u8],
+) -> Vec<u8> {
     // 1. Select and order the objects to keep.
     let mut ids: Vec<ObjectId> = objects
         .iter()
@@ -55,7 +67,7 @@ pub fn to_pdf(objects: &BTreeMap<ObjectId, Object>, trailer: &Dictionary) -> Vec
 
     // 3. Emit header + objects, recording byte offsets for the xref.
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+    out.extend_from_slice(header);
 
     let count = ids.len() as u32;
     let mut offsets = vec![0usize; count as usize + 1];

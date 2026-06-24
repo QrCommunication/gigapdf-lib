@@ -3342,11 +3342,34 @@ pub extern "C" fn gp_to_rtf(handle: *const Document, out_len: *mut usize) -> *mu
     }
 }
 
-/// Re-serialize with PDF/A-2b archival metadata (XMP + sRGB OutputIntent + ID).
+/// Map a level tag (`"pdfa-1b"`, `"pdfa-2b"`, `"pdfa-2u"`, `"pdfa-3b"`; bare
+/// `"1b"`/`"2b"`/`"2u"`/`"3b"` also accepted) to a [`PdfaLevel`]. Empty or
+/// unrecognized → the default `Pdfa2b`, so an absent argument is back-compatible.
+fn parse_pdfa_level(tag: &str) -> gigapdf_core::convert::pdfa::PdfaLevel {
+    use gigapdf_core::convert::pdfa::PdfaLevel;
+    match tag.trim().trim_start_matches("pdfa-") {
+        "1b" => PdfaLevel::Pdfa1b,
+        "2u" => PdfaLevel::Pdfa2u,
+        "3b" => PdfaLevel::Pdfa3b,
+        _ => PdfaLevel::Pdfa2b,
+    }
+}
+
+/// Re-serialize with PDF/A archival metadata (XMP + sRGB OutputIntent + ID) at
+/// the level named by `(level_ptr, level_len)`. See [`parse_pdfa_level`] for the
+/// accepted tags; an empty argument defaults to PDF/A-2b.
 #[no_mangle]
-pub extern "C" fn gp_to_pdfa(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+pub extern "C" fn gp_to_pdfa(
+    handle: *const Document,
+    level_ptr: *const u8,
+    level_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
     match unsafe { handle.as_ref() } {
-        Some(doc) => unsafe { bytes_into_host(doc.to_pdfa(), out_len) },
+        Some(doc) => {
+            let level = parse_pdfa_level(unsafe { str_arg(level_ptr, level_len) });
+            unsafe { bytes_into_host(doc.to_pdfa_level(level), out_len) }
+        }
         None => std::ptr::null_mut(),
     }
 }

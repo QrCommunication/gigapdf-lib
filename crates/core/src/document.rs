@@ -6478,14 +6478,34 @@ impl Document {
         crate::convert::reverse::to_rtf(&paragraphs)
     }
 
-    /// Re-serialize the document for PDF/A-2b archival output. This adds the
-    /// structural metadata — an XMP identification packet, an sRGB `OutputIntent`
-    /// (embedded ICC profile) and a trailer `/ID` (ISO 19005-2 §6.1.3) — and
-    /// normalises the graphics-state / appearance constructs the standard forbids:
-    /// it strips `/TR` from `ExtGState` (§6.2.5), drops any incomplete `/CIDSet`
-    /// from CID-font descriptors (§6.2.11.4.2) and reduces annotation `/AP`
+    /// Re-serialize the document as PDF/A, at the **default level PDF/A-2b**.
+    ///
+    /// Kept for backward compatibility; equivalent to
+    /// [`to_pdfa_level(PdfaLevel::Pdfa2b)`](Self::to_pdfa_level).
+    pub fn to_pdfa(&self) -> Vec<u8> {
+        self.to_pdfa_level(crate::convert::pdfa::PdfaLevel::Pdfa2b)
+    }
+
+    /// Re-serialize the document for PDF/A archival output at the requested
+    /// [`PdfaLevel`](crate::convert::pdfa::PdfaLevel). This adds the structural
+    /// metadata — an XMP identification packet (carrying the level's
+    /// `part`/`conformance`), an sRGB `OutputIntent` (embedded ICC profile) and a
+    /// trailer `/ID` (ISO 19005 §6.1.3) — emits the file header the level mandates
+    /// (PDF/A-1 → `%PDF-1.4`, later parts → `%PDF-1.7`), and normalises the
+    /// graphics-state / appearance constructs every part forbids: it strips `/TR`
+    /// from `ExtGState` (§6.2.5/6.2.4), drops any incomplete `/CIDSet` from
+    /// CID-font descriptors (§6.2.11.4.2) and reduces annotation `/AP`
     /// dictionaries to their `/N` entry (§6.3.3). These removals never change the
     /// rendered page.
+    ///
+    /// **Level notes:**
+    /// * **1b / 2b / 3b** (conformance *B*, "basic"): faithful visual
+    ///   reproduction. PDF/A-3 additionally permits embedded file attachments
+    ///   (`/AF`), which the sanitiser leaves intact.
+    /// * **2u** (conformance *U*): like 2b but every glyph must be Unicode-mapped
+    ///   — every font needs a `/ToUnicode` CMap. This method does **not**
+    ///   synthesise missing `/ToUnicode` maps, so a 2u claim is only validator-
+    ///   clean when the source fonts already carry them; otherwise prefer 2b.
     ///
     /// **Note:** full PDF/A conformance also requires *every* font to be embedded
     /// (§6.2.11.4.1). This method does **not** embed missing fonts — there is no
@@ -6495,7 +6515,7 @@ impl Document {
     /// first via [`needed_fonts`](Self::needed_fonts) +
     /// [`embed_truetype_font`](Self::embed_truetype_font) with the correct font
     /// bytes.
-    pub fn to_pdfa(&self) -> Vec<u8> {
+    pub fn to_pdfa_level(&self, level: crate::convert::pdfa::PdfaLevel) -> Vec<u8> {
         use crate::object::StringKind::{Hex, Literal};
         let Ok(catalog_id) = self.catalog_id() else {
             return self.save();
@@ -6507,7 +6527,7 @@ impl Document {
         let icc_id = (meta_id.0 + 1, 0u16);
 
         // XMP metadata stream (must stay uncompressed for PDF/A).
-        let xmp = crate::convert::pdfa::xmp_metadata("GigaPDF Document", "GigaPDF Engine");
+        let xmp = crate::convert::pdfa::xmp_metadata(level, "GigaPDF Document", "GigaPDF Engine");
         let mut mdict = Dictionary::new();
         mdict.set(b"Type", annot::name(b"Metadata"));
         mdict.set(b"Subtype", annot::name(b"XML"));
@@ -6556,12 +6576,14 @@ impl Document {
             trailer.set(b"ID", Object::Array(vec![id.clone(), id]));
         }
 
-        // Normalise graphics-state / appearance constructs that ISO 19005-2
+        // Normalise graphics-state / appearance constructs every PDF/A part
         // forbids (ExtGState /TR, incomplete /CIDSet, /AP alternates). Operates
         // on the working clone — render output is unchanged.
         crate::convert::pdfa::sanitize_objects(&mut objects);
 
-        crate::serialize::to_pdf(&objects, &trailer)
+        // Emit with the file header the level requires (1.4 for PDF/A-1, 1.7
+        // otherwise) — classic xref, no object streams, for every level.
+        crate::serialize::to_pdf_with_header(&objects, &trailer, level.header())
     }
 
     /// Per-page reconstructed table grids and floating shapes (shared by the
@@ -16275,6 +16297,50 @@ mod tests {
         // And it must still be a readable, single-page PDF.
         let reopened = Document::open(&pdfa).unwrap();
         assert!(reopened.page_count() >= 1);
+    }
+
+    #[test]
+    fn to_pdfa_default_matches_2b() {
+        // Back-compat: the no-arg `to_pdfa()` must be byte-identical to the
+        // explicit 2b level (deterministic /ID seed makes this stable).
+        let pdf = crate::convert::reverse::txt_to_pdf("default level");
+        let doc = Document::open(&pdf).unwrap();
+        assert_eq!(
+            doc.to_pdfa(),
+            doc.to_pdfa_level(crate::convert::pdfa::PdfaLevel::Pdfa2b)
+        );
+    }
+
+    #[test]
+    fn to_pdfa_level_emits_correct_header_and_xmp() {
+        use crate::convert::pdfa::PdfaLevel;
+        let pdf = crate::convert::reverse::txt_to_pdf("level matrix");
+        let doc = Document::open(&pdf).unwrap();
+        for (level, header, part, conf) in [
+            (PdfaLevel::Pdfa1b, &b"%PDF-1.4"[..], "1", "B"),
+            (PdfaLevel::Pdfa2b, &b"%PDF-1.7"[..], "2", "B"),
+            (PdfaLevel::Pdfa2u, &b"%PDF-1.7"[..], "2", "U"),
+            (PdfaLevel::Pdfa3b, &b"%PDF-1.7"[..], "3", "B"),
+        ] {
+            let out = doc.to_pdfa_level(level);
+            assert!(out.starts_with(header), "{level:?} file header");
+            assert!(
+                has_op(&out, format!("<pdfaid:part>{part}</pdfaid:part>").as_bytes()),
+                "{level:?} XMP part"
+            );
+            assert!(
+                has_op(
+                    &out,
+                    format!("<pdfaid:conformance>{conf}</pdfaid:conformance>").as_bytes()
+                ),
+                "{level:?} XMP conformance"
+            );
+            assert!(has_op(&out, b"/ID"), "{level:?} trailer /ID");
+            assert!(
+                Document::open(&out).unwrap().page_count() >= 1,
+                "{level:?} reopen"
+            );
+        }
     }
 
     #[test]
