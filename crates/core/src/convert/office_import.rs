@@ -2955,12 +2955,21 @@ fn odf_table_model(
 }
 
 /// ODS → [`Document`] with one [`BlockKind::Sheet`]; each `table:table` becomes a
-/// model [`Sheet`] of typed text cells (ODF spreadsheets carry the displayed
-/// value as `text:p`). Reuses the ODF walker for cell text.
+/// model [`Sheet`] of typed cells carrying per-cell number format / fill / font /
+/// border / alignment / wrap, plus per-column widths, per-row heights and merge
+/// ranges (`table:number-columns/rows-spanned`). ODF spreadsheets carry the
+/// displayed value as `text:p`. Reuses the ODF style maps shared with the render
+/// path; an automatic style in `content.xml` overrides a same-named one in
+/// `styles.xml`.
 pub fn ods_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     let content = part(zip, "content.xml");
     let styles_xml = part(zip, "styles.xml");
     let geom = odf_geom(&styles_xml, &content, PageGeom::tabular_default());
+
+    // Resolved style tables, named (styles.xml) then automatic (content.xml wins).
+    let mut props = OdsStyleTables::default();
+    props.absorb(&styles_xml);
+    props.absorb(&content);
 
     let mut sheets: Vec<Sheet> = Vec::new();
     let mut x = Xml::new(&content);
@@ -2968,13 +2977,7 @@ pub fn ods_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         if let Tok::Open(name, attrs, sc) = &tok {
             if local(name) == "table" && !sc {
                 let sheet_name = attr(attrs, "name").unwrap_or("Sheet").to_string();
-                let rows = ods_table_model(&mut x);
-                sheets.push(Sheet {
-                    name: sheet_name,
-                    rows,
-                    merges: Vec::new(),
-                    col_widths: Vec::new(),
-                });
+                sheets.push(ods_sheet_model(&mut x, sheet_name, &props));
             }
         }
     }
@@ -2986,30 +2989,70 @@ pub fn ods_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     flow_document(vec![block], page_geometry(geom))
 }
 
-/// Emit one ODS `table:table` (open consumed) as [`SheetRow`]s of typed cells,
-/// expanding repeated rows/columns (cap 64). Mirrors [`ods_table`]/[`ods_row`].
-fn ods_table_model(x: &mut Xml) -> Vec<SheetRow> {
+/// Build one model [`Sheet`] from a `table:table` (its open already consumed):
+/// expand repeated rows/columns (cap 64), resolve each cell's style (cell own →
+/// row default → column default) into typed number format / fill / font / border
+/// / alignment / wrap, collect per-column widths and per-row heights, and turn
+/// `table:number-columns/rows-spanned` into [`MergeRange`]s. Mirrors the spans /
+/// repeat / collapse rules of [`ods_table`]/[`ods_row`].
+fn ods_sheet_model(x: &mut Xml, name: String, props: &OdsStyleTables) -> Sheet {
     let mut rows: Vec<SheetRow> = Vec::new();
+    let mut merges: Vec<model::MergeRange> = Vec::new();
+    let mut col_widths: Vec<f64> = Vec::new();
+    // Per-column default cell-style name, expanded over `number-columns-repeated`.
+    let mut col_defaults: Vec<Option<String>> = Vec::new();
+
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "table-row" && !sc {
+                if ln == "table-column" {
+                    // Both `<table:table-column .../>` and an open form land here.
+                    let rep = attr(&attrs, "number-columns-repeated")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .min(1024);
+                    let width = attr(&attrs, "style-name").and_then(|s| props.col_widths.get(s));
+                    let def = attr(&attrs, "default-cell-style-name").map(str::to_string);
+                    for _ in 0..rep {
+                        col_widths.push(width.copied().unwrap_or(0.0));
+                        col_defaults.push(def.clone());
+                    }
+                } else if ln == "table-row" && !sc {
                     let rep = attr(&attrs, "number-rows-repeated")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
                         .min(64);
-                    let cells = ods_row_model(x);
+                    let height = attr(&attrs, "style-name").and_then(|s| props.row_heights.get(s));
+                    let row_default = attr(&attrs, "default-cell-style-name");
+                    let base_row = rows.len();
+                    let (cells, spans) = ods_row_model(x, props, &col_defaults, row_default);
                     // Collapse a run of fully-blank rows to one — but a row holding
                     // any formula carries content even with blank cached results.
                     let blank = cells
                         .iter()
                         .all(|c| c.value == model::CellValue::Empty && c.formula.is_none());
                     let emit = if blank { rep.min(1) } else { rep };
+                    let height = height.copied().filter(|h| *h > 0.0);
                     for _ in 0..emit {
                         rows.push(SheetRow {
                             cells: cells.clone(),
-                            ..Default::default()
+                            height,
+                        });
+                    }
+                    // A row span anchors at this row; when the row is repeated a
+                    // distinct multi-row span is ambiguous, so clamp it to one row.
+                    for (c0, cspan, rspan) in spans {
+                        let r1 = if emit == 1 {
+                            base_row + rspan.saturating_sub(1)
+                        } else {
+                            base_row
+                        };
+                        merges.push(model::MergeRange {
+                            r0: base_row,
+                            c0,
+                            r1,
+                            c1: c0 + cspan.saturating_sub(1),
                         });
                     }
                 }
@@ -3022,21 +3065,43 @@ fn ods_table_model(x: &mut Xml) -> Vec<SheetRow> {
             Tok::Text(_) => {}
         }
     }
-    rows
+
+    // Trim trailing zero (default) column widths so the field stays empty when no
+    // explicit widths were authored, matching the XLSX path's `Vec::new()`.
+    while matches!(col_widths.last(), Some(w) if *w == 0.0) {
+        col_widths.pop();
+    }
+
+    Sheet {
+        name,
+        rows,
+        merges,
+        col_widths,
+    }
 }
 
-/// Collect one `table:table-row`'s typed cells (open already consumed), reusing
-/// [`ods_cell_text`] for the displayed value, classifying it as a number when it
-/// parses (preferring `office:value` for typed numeric cells), and capturing a
-/// `table:formula` (→ [`SheetCell::formula`], the displayed value kept as the
-/// cached result).
-fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
+/// Collect one `table:table-row`'s typed cells (open already consumed) plus its
+/// merge spans. Reuses [`ods_cell_text`] for the displayed value, classifying it
+/// as a number when it parses (preferring `office:value` for typed numeric
+/// cells), captures a `table:formula` (→ [`SheetCell::formula`]), resolves the
+/// cell's style (own → row default → column default) into number format / fill /
+/// font / border / alignment / wrap, and records `(col, colspan, rowspan)` for
+/// any `table:number-columns/rows-spanned` anchor. `covered-table-cell`s (merge
+/// fillers) keep their slot but carry no span.
+fn ods_row_model(
+    x: &mut Xml,
+    props: &OdsStyleTables,
+    col_defaults: &[Option<String>],
+    row_default: Option<&str>,
+) -> (Vec<SheetCell>, Vec<(usize, usize, usize)>) {
     let mut cells: Vec<SheetCell> = Vec::new();
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if (ln == "table-cell" || ln == "covered-table-cell") && !sc {
+                let is_cell = ln == "table-cell" || ln == "covered-table-cell";
+                if is_cell && !sc {
                     let rep = attr(&attrs, "number-columns-repeated")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
@@ -3053,9 +3118,35 @@ fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
                     )
                     .then(|| attr(&attrs, "value").and_then(|v| v.trim().parse::<f64>().ok()))
                     .flatten();
+                    // Resolve style by precedence: cell own → row default → column
+                    // default (by the current physical column index).
+                    let style_name = attr(&attrs, "style-name")
+                        .map(str::to_string)
+                        .or_else(|| row_default.map(str::to_string))
+                        .or_else(|| col_defaults.get(cells.len()).and_then(|d| d.clone()));
+                    let look = style_name.as_deref().and_then(|s| props.cells.get(s));
+                    let mut cell = SheetCell::default();
+                    if let Some(p) = look {
+                        cell.style = p.char_.clone();
+                        cell.fill = p.fill;
+                        cell.border = p.border;
+                        cell.align = p.align;
+                        cell.wrap = p.wrap;
+                        cell.number_format = p.number_format.clone();
+                    }
+                    // `table:number-{columns,rows}-spanned` define a merge anchor.
+                    let cspan = attr(&attrs, "number-columns-spanned")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|n| *n > 1);
+                    let rspan = attr(&attrs, "number-rows-spanned")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|n| *n > 1);
+                    if cspan.is_some() || rspan.is_some() {
+                        spans.push((cells.len(), cspan.unwrap_or(1), rspan.unwrap_or(1)));
+                    }
                     let text = ods_cell_text(x, ln);
                     let trimmed = text.trim();
-                    let value = if let Some(n) = typed_num {
+                    cell.value = if let Some(n) = typed_num {
                         model::CellValue::Number(n)
                     } else if trimmed.is_empty() {
                         model::CellValue::Empty
@@ -3064,21 +3155,17 @@ fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
                     } else {
                         model::CellValue::Text(trimmed.to_string())
                     };
-                    // A formula cell is meaningful even when its cached result is
-                    // blank, so emit it (don't collapse to a single empty).
-                    let emit = if value == model::CellValue::Empty && formula.is_none() {
-                        rep.min(1)
-                    } else {
-                        rep
-                    };
+                    cell.formula = formula;
+                    // A formula or styled cell is meaningful even when blank, so
+                    // emit each repeat (don't collapse a styled run to one).
+                    let meaningful = cell.value != model::CellValue::Empty
+                        || cell.formula.is_some()
+                        || look.is_some();
+                    let emit = if meaningful { rep } else { rep.min(1) };
                     for _ in 0..emit {
-                        cells.push(SheetCell {
-                            value: value.clone(),
-                            formula: formula.clone(),
-                            ..SheetCell::default()
-                        });
+                        cells.push(cell.clone());
                     }
-                } else if (ln == "table-cell" || ln == "covered-table-cell") && sc {
+                } else if is_cell && sc {
                     cells.push(SheetCell::default());
                 }
             }
@@ -3090,7 +3177,7 @@ fn ods_row_model(x: &mut Xml) -> Vec<SheetCell> {
             Tok::Text(_) => {}
         }
     }
-    cells
+    (cells, spans)
 }
 
 /// ODP → [`Document`] with one [`BlockKind::Slide`]; each `draw:page` → a
@@ -8308,6 +8395,299 @@ fn odf_row_heights(xml: &str) -> BTreeMap<String, f64> {
     map
 }
 
+/// Typed cell formatting recovered from an ODF `style:style` (cell family),
+/// mirroring the [`SheetCell`] style fields the XLSX model path fills.
+#[derive(Debug, Clone, Default)]
+struct OdsCellProps {
+    char_: CharStyle,
+    fill: Option<[f64; 3]>,
+    border: Option<model::BorderStyle>,
+    align: Option<model::Align>,
+    wrap: bool,
+    number_format: Option<String>,
+}
+
+/// Resolved ODS style tables for the typed model path: column widths, row
+/// heights, and per-style cell formatting (number format / fill / font / border /
+/// alignment / wrap). [`absorb`](OdsStyleTables::absorb) folds one ODF part in;
+/// call it on `styles.xml` then `content.xml` so automatic styles override the
+/// named ones (later insert wins).
+#[derive(Debug, Default)]
+struct OdsStyleTables {
+    col_widths: BTreeMap<String, f64>,
+    row_heights: BTreeMap<String, f64>,
+    cells: BTreeMap<String, OdsCellProps>,
+}
+
+impl OdsStyleTables {
+    /// Fold one ODF part's column/row/cell styles into the tables (later parts
+    /// override earlier ones for same-named styles).
+    fn absorb(&mut self, xml: &str) {
+        for (k, v) in odf_column_widths(xml) {
+            self.col_widths.insert(k, v);
+        }
+        for (k, v) in odf_row_heights(xml) {
+            self.row_heights.insert(k, v);
+        }
+        let data_styles = odf_data_styles(xml);
+        for (k, v) in odf_cell_props(xml, &data_styles) {
+            self.cells.insert(k, v);
+        }
+    }
+}
+
+/// Build a `cell-style-name → `[`OdsCellProps`]` map from one ODF part: each
+/// `style:style` (cell family) contributes its `style:text-properties` (font,
+/// colour, size, weight/italic/underline/strike → [`CharStyle`]),
+/// `style:table-cell-properties` (`fo:background-color` → fill, collapsed
+/// `fo:border*` → [`BorderStyle`], `fo:wrap-option=wrap` → wrap),
+/// `style:paragraph-properties` (`fo:text-align` → [`Align`]), and the
+/// number-format code resolved from `@style:data-style-name` against
+/// `data_styles`. A style adding nothing at all is omitted.
+fn odf_cell_props(
+    xml: &str,
+    data_styles: &BTreeMap<String, String>,
+) -> BTreeMap<String, OdsCellProps> {
+    let mut map: BTreeMap<String, OdsCellProps> = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur: Option<(String, OdsCellProps, bool)> = None; // (name, props, any)
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "style" => {
+                    // Only cell-family (or untyped) styles describe cell boxes.
+                    let fam = attr(&attrs, "family");
+                    if matches!(fam, None | Some("table-cell")) {
+                        let nm = attr(&attrs, "name").map(str::to_string);
+                        let mut props = OdsCellProps::default();
+                        let mut any = false;
+                        if let Some(code) = attr(&attrs, "data-style-name")
+                            .and_then(|d| data_styles.get(d))
+                            .cloned()
+                        {
+                            props.number_format = Some(code);
+                            any = true;
+                        }
+                        // A self-closing `<style:style …/>` (e.g. data-style only,
+                        // no property children) has no matching close: record now.
+                        if sc {
+                            if let (Some(n), true) = (nm, any) {
+                                map.insert(n, props);
+                            }
+                            cur = None;
+                        } else {
+                            cur = nm.map(|n| (n, props, any));
+                        }
+                    } else {
+                        cur = None;
+                    }
+                }
+                "text-properties" => {
+                    if let Some((_, props, any)) = cur.as_mut() {
+                        let css = odf_text_props_css(&attrs);
+                        if !css.is_empty() {
+                            props.char_ = odf_css_char_style(&css);
+                            *any = true;
+                        }
+                    }
+                }
+                "table-cell-properties" => {
+                    if let Some((_, props, any)) = cur.as_mut() {
+                        if let Some(c) = odf_cell_fill(&attrs) {
+                            props.fill = Some(c);
+                            *any = true;
+                        }
+                        if let Some(b) = odf_cell_border(&attrs) {
+                            props.border = Some(b);
+                            *any = true;
+                        }
+                        if odf_cell_wrap(&attrs) {
+                            props.wrap = true;
+                            *any = true;
+                        }
+                    }
+                }
+                "paragraph-properties" => {
+                    if let Some((_, props, any)) = cur.as_mut() {
+                        if let Some(a) = attr(&attrs, "text-align").and_then(odf_align) {
+                            props.align = Some(a);
+                            *any = true;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    if let Some((nm, props, any)) = cur.take() {
+                        if any {
+                            map.insert(nm, props);
+                        }
+                    }
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
+/// `fo:background-color` of a `style:table-cell-properties` → typed RGB fill.
+/// `transparent`/`none`/malformed ⇒ `None`.
+fn odf_cell_fill(attrs: &[(String, String)]) -> Option<[f64; 3]> {
+    let b = attr(attrs, "background-color")?.trim();
+    if matches!(b, "transparent" | "none" | "") {
+        return None;
+    }
+    hex_to_rgb_f64(b.trim_start_matches('#'))
+}
+
+/// Collapse an ODF cell's per-edge borders to one [`BorderStyle`]: prefer the
+/// uniform `fo:border`, else the first styled edge. Parses the CSS-like
+/// `<width> <style> <color>` shorthand (width via [`parse_odf_pt`], colour via a
+/// trailing `#RRGGBB`); a `none`/zero-width border yields `None`.
+fn odf_cell_border(attrs: &[(String, String)]) -> Option<model::BorderStyle> {
+    let spec = attr(attrs, "border")
+        .or_else(|| {
+            ["border-top", "border-right", "border-bottom", "border-left"]
+                .iter()
+                .find_map(|k| attr(attrs, k))
+        })?
+        .trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut width = 0.0_f64;
+    let mut color = [0.0_f64; 3];
+    for tok in spec.split_whitespace() {
+        if let Some(c) = tok.strip_prefix('#').filter(|h| is_hex6(h)) {
+            if let Some(rgb) = hex_to_rgb_f64(c) {
+                color = rgb;
+            }
+        } else if let Some(w) = parse_odf_pt(tok) {
+            // The `solid`/`double`/… style keyword has no numeric value, so only
+            // a real length sets the width.
+            if w > 0.0 {
+                width = w;
+            }
+        }
+    }
+    (width > 0.0).then_some(model::BorderStyle { width, color })
+}
+
+/// True when a `style:table-cell-properties` requests text wrapping
+/// (`fo:wrap-option="wrap"`).
+fn odf_cell_wrap(attrs: &[(String, String)]) -> bool {
+    attr(attrs, "wrap-option") == Some("wrap")
+}
+
+/// Map an ODF `fo:text-align` value to a model [`Align`]. ODF uses the CSS
+/// keywords plus the bidi `start`/`end` (resolved LTR). Unknown ⇒ `None`.
+fn odf_align(v: &str) -> Option<model::Align> {
+    match v.trim() {
+        "start" | "left" => Some(model::Align::Left),
+        "center" => Some(model::Align::Center),
+        "end" | "right" => Some(model::Align::Right),
+        "justify" => Some(model::Align::Justify),
+        _ => None,
+    }
+}
+
+/// The kind of an ODF `number:*-style`, used to finish its format code.
+#[derive(Debug, Clone, Copy)]
+enum DataStyleKind {
+    Number,
+    Percentage,
+    Currency,
+}
+
+/// Build a `data-style-name → spreadsheet-format-code` map from one ODF part.
+/// Reconstructs a `0.00` / `#,##0` / `0%` / `$#,##0.00` style code from the
+/// `number:number` / `number:currency-symbol` / `number:percentage` children of
+/// each numeric `number:*-style`. Best-effort: only the common numeric, percent
+/// and currency forms are reconstructed; date/time styles (whose field pattern we
+/// don't rebuild) are omitted, leaving such cells unformatted.
+fn odf_data_styles(xml: &str) -> BTreeMap<String, String> {
+    let mut map: BTreeMap<String, String> = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur: Option<(String, DataStyleKind, String)> = None; // (name, kind, code)
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => {
+                let ln = local(&name);
+                match ln {
+                    "number-style" | "percentage-style" | "currency-style" => {
+                        let nm = attr(&attrs, "name").map(str::to_string);
+                        let kind = match ln {
+                            "percentage-style" => DataStyleKind::Percentage,
+                            "currency-style" => DataStyleKind::Currency,
+                            _ => DataStyleKind::Number,
+                        };
+                        cur = nm.map(|n| (n, kind, String::new()));
+                    }
+                    "number" => {
+                        if let Some((_, _, code)) = cur.as_mut() {
+                            let dec = attr(&attrs, "decimal-places")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0)
+                                .min(20);
+                            let group = attr(&attrs, "grouping") == Some("true");
+                            code.push_str(if group { "#,##0" } else { "0" });
+                            if dec > 0 {
+                                code.push('.');
+                                for _ in 0..dec {
+                                    code.push('0');
+                                }
+                            }
+                        }
+                    }
+                    "currency-symbol" => {
+                        // A leading symbol prefixes the number part (best effort:
+                        // emit a `$` when no numeric child has run yet).
+                        if let Some((_, _, code)) = cur.as_mut() {
+                            if !code.contains(['#', '0']) {
+                                code.push('$');
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Close(name) => {
+                if matches!(
+                    local(&name),
+                    "number-style" | "percentage-style" | "currency-style"
+                ) {
+                    if let Some((nm, kind, mut code)) = cur.take() {
+                        match kind {
+                            DataStyleKind::Percentage => {
+                                if code.is_empty() {
+                                    code.push('0');
+                                }
+                                code.push('%');
+                            }
+                            DataStyleKind::Currency => {
+                                if !code.contains('$') {
+                                    code.insert(0, '$');
+                                }
+                                if !code.contains(['#', '0']) {
+                                    code.push_str("#,##0.00");
+                                }
+                            }
+                            DataStyleKind::Number => {}
+                        }
+                        if !code.is_empty() {
+                            map.insert(nm, code);
+                        }
+                    }
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
 /// Handle a `table:table-column` token inside an ODF table: append `<col>`
 /// entries (honouring `table:number-columns-repeated`, cap 64) carrying the
 /// resolved width (when the column style declares one) into `pending`.
@@ -12399,6 +12779,230 @@ mod tests {
         assert_eq!(cell.value, model::CellValue::Number(30.0));
         // A literal cell carries no formula (regression guard).
         assert!(sheet.rows[0].cells[0].formula.is_none());
+    }
+
+    /// Zip a `content.xml` (+ optional `styles.xml`) ODS and lower it to its first
+    /// model [`Sheet`].
+    fn ods_sheet(content: &str, styles_xml: Option<&str>) -> Sheet {
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.spreadsheet",
+        );
+        z.add_stored("content.xml", content.as_bytes());
+        if let Some(s) = styles_xml {
+            z.add_stored("styles.xml", s.as_bytes());
+        }
+        let model = office_to_model(&z.finish()).expect("ods → model");
+        match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Sheet(sb) => sb.sheets[0].clone(),
+            other => panic!("expected a Sheet block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ods_model_resolves_per_cell_style_and_number_format() {
+        // `ce1` = bold + red + Arial 12 + thin black border + yellow fill +
+        // centred, with a 2-decimal grouped number format `N2`. The styled cell
+        // must carry every typed field; the plain cell stays default.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st" xmlns:fo="fo" xmlns:number="nb">
+  <office:automatic-styles>
+    <number:number-style style:name="N2">
+      <number:number number:decimal-places="2" number:grouping="true"/>
+    </number:number-style>
+    <style:style style:name="ce1" style:family="table-cell" style:data-style-name="N2">
+      <style:table-cell-properties fo:border="0.75pt solid #000000" fo:background-color="#FFFF00"/>
+      <style:text-properties fo:font-weight="bold" fo:color="#FF0000" fo:font-size="12pt" style:font-name="Arial"/>
+      <style:paragraph-properties fo:text-align="center"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="Sheet1">
+      <table:table-row>
+        <table:table-cell table:style-name="ce1" office:value-type="float" office:value="1234.5"><text:p>1,234.50</text:p></table:table-cell>
+        <table:table-cell><text:p>Plain</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"##;
+        let sheet = ods_sheet(content, None);
+        let styled = &sheet.rows[0].cells[0];
+        // Value typed from office:value (not the locale-formatted display text).
+        assert_eq!(styled.value, model::CellValue::Number(1234.5));
+        // Number format reconstructed from the number:number-style.
+        assert_eq!(styled.number_format.as_deref(), Some("#,##0.00"));
+        // Font (text-properties) → CharStyle.
+        assert!(styled.style.bold, "bold");
+        assert_eq!(styled.style.color, Some([1.0, 0.0, 0.0]), "red");
+        assert!((styled.style.size_pt - 12.0).abs() < 1e-6, "12pt");
+        assert_eq!(styled.style.family, "Arial");
+        // Fill, border, alignment.
+        assert_eq!(styled.fill, Some([1.0, 1.0, 0.0]), "yellow fill");
+        let b = styled.border.expect("border set");
+        assert!((b.width - 0.75).abs() < 1e-6, "border width: {}", b.width);
+        assert_eq!(b.color, [0.0, 0.0, 0.0], "black border");
+        assert_eq!(styled.align, Some(model::Align::Center));
+        // The plain cell carries no styling at all (regression guard).
+        let plain = &sheet.rows[0].cells[1];
+        assert_eq!(plain.value, model::CellValue::Text("Plain".into()));
+        assert!(plain.number_format.is_none() && plain.fill.is_none());
+        assert!(plain.border.is_none() && plain.align.is_none());
+        assert_eq!(plain.style, CharStyle::default());
+    }
+
+    #[test]
+    fn ods_model_number_format_percentage_and_currency() {
+        // A percentage style → `0.00%`; a currency style → `$#,##0.00`.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st" xmlns:fo="fo" xmlns:number="nb">
+  <office:automatic-styles>
+    <number:percentage-style style:name="P2">
+      <number:number number:decimal-places="2"/>
+      <number:text>%</number:text>
+    </number:percentage-style>
+    <number:currency-style style:name="C0">
+      <number:currency-symbol>$</number:currency-symbol>
+      <number:number number:decimal-places="2" number:grouping="true"/>
+    </number:currency-style>
+    <style:style style:name="cP" style:family="table-cell" style:data-style-name="P2"/>
+    <style:style style:name="cC" style:family="table-cell" style:data-style-name="C0"/>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="S">
+      <table:table-row>
+        <table:table-cell table:style-name="cP" office:value-type="percentage" office:value="0.5"><text:p>50%</text:p></table:table-cell>
+        <table:table-cell table:style-name="cC" office:value-type="currency" office:value="9"><text:p>$9.00</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"##;
+        let sheet = ods_sheet(content, None);
+        assert_eq!(
+            sheet.rows[0].cells[0].number_format.as_deref(),
+            Some("0.00%")
+        );
+        assert_eq!(
+            sheet.rows[0].cells[1].number_format.as_deref(),
+            Some("$#,##0.00")
+        );
+    }
+
+    #[test]
+    fn ods_model_spanned_cells_become_merge_ranges() {
+        // A 2×2 anchor (`number-columns/rows-spanned="2"`) + the covered fillers.
+        // The model records one MergeRange (0,0)..=(1,1).
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t">
+  <office:body><office:spreadsheet>
+    <table:table table:name="M">
+      <table:table-row>
+        <table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="2"><text:p>Merged</text:p></table:table-cell>
+        <table:covered-table-cell/>
+      </table:table-row>
+      <table:table-row>
+        <table:covered-table-cell/>
+        <table:covered-table-cell/>
+      </table:table-row>
+      <table:table-row>
+        <table:table-cell><text:p>After</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+        let sheet = ods_sheet(content, None);
+        assert_eq!(sheet.merges.len(), 1, "one merge range: {:?}", sheet.merges);
+        assert_eq!(
+            sheet.merges[0],
+            model::MergeRange {
+                r0: 0,
+                c0: 0,
+                r1: 1,
+                c1: 1
+            }
+        );
+        // The anchor keeps its text; the covered slot is present but empty.
+        assert_eq!(
+            sheet.rows[0].cells[0].value,
+            model::CellValue::Text("Merged".into())
+        );
+        assert_eq!(sheet.rows[0].cells[1].value, model::CellValue::Empty);
+        assert_eq!(
+            sheet.rows[2].cells[0].value,
+            model::CellValue::Text("After".into())
+        );
+    }
+
+    #[test]
+    fn ods_model_column_widths_and_row_heights() {
+        // Two column styles (3cm, 1.5cm) and a 24pt row → col_widths + row height.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st">
+  <office:automatic-styles>
+    <style:style style:name="co1" style:family="table-column">
+      <style:table-column-properties style:column-width="3cm"/>
+    </style:style>
+    <style:style style:name="co2" style:family="table-column">
+      <style:table-column-properties style:column-width="1.5cm"/>
+    </style:style>
+    <style:style style:name="ro1" style:family="table-row">
+      <style:table-row-properties style:row-height="24pt"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="Sz">
+      <table:table-column table:style-name="co1"/>
+      <table:table-column table:style-name="co2"/>
+      <table:table-row table:style-name="ro1">
+        <table:table-cell><text:p>A</text:p></table:table-cell>
+        <table:table-cell><text:p>B</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+        let sheet = ods_sheet(content, None);
+        let cm = 28.3464567;
+        assert_eq!(sheet.col_widths.len(), 2, "two column widths");
+        assert!((sheet.col_widths[0] - 3.0 * cm).abs() < 1e-3, "col0 3cm");
+        assert!((sheet.col_widths[1] - 1.5 * cm).abs() < 1e-3, "col1 1.5cm");
+        assert_eq!(sheet.rows[0].height, Some(24.0), "row height 24pt");
+    }
+
+    #[test]
+    fn ods_model_inherits_column_default_style_and_wrap() {
+        // A column default cell style (bold + wrap) reaches a cell without its own
+        // style; a cell with its own style overrides; the named style lives in
+        // styles.xml while the row sits in content.xml.
+        let styles_xml = r#"<office:document-styles xmlns:office="o" xmlns:style="st" xmlns:fo="fo">
+  <office:styles>
+    <style:style style:name="ceWrap" style:family="table-cell">
+      <style:table-cell-properties style:wrap-option="wrap"/>
+      <style:text-properties fo:font-weight="bold"/>
+    </style:style>
+  </office:styles>
+</office:document-styles>"#;
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st" xmlns:fo="fo">
+  <office:automatic-styles>
+    <style:style style:name="ceItalic" style:family="table-cell">
+      <style:text-properties fo:font-style="italic"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="Inh">
+      <table:table-column table:default-cell-style-name="ceWrap"/>
+      <table:table-row>
+        <table:table-cell><text:p>Inherited</text:p></table:table-cell>
+        <table:table-cell table:style-name="ceItalic"><text:p>Own</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+        let sheet = ods_sheet(content, Some(styles_xml));
+        // Column default reaches cell 0 (bold + wrap, from styles.xml).
+        assert!(sheet.rows[0].cells[0].style.bold, "inherited bold");
+        assert!(sheet.rows[0].cells[0].wrap, "inherited wrap");
+        // Cell 1's own style wins (italic, not the column default's bold).
+        assert!(sheet.rows[0].cells[1].style.italic, "own italic");
+        assert!(
+            !sheet.rows[0].cells[1].style.bold,
+            "own style overrides default"
+        );
     }
 
     /// Build a one-page ODP (`width`×`height` cm slide) from a `draw:page` body and
