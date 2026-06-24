@@ -7,6 +7,28 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.90.0] - 2026-06-24
+
+PDF-read & Office-import fidelity. Two independent fixes implemented in parallel
+([#41](https://github.com/qrcommunication/gigapdf-lib/issues/41),
+[#44](https://github.com/qrcommunication/gigapdf-lib/issues/44)).
+
+### Added
+
+- **Image `/ImageMask` and `/Mask`.** A 1-bpc `/ImageMask` stencil now paints the
+  current fill colour through its unmasked bits (honouring `/Decode`); a `/Mask`
+  **explicit** stencil stream is resampled and folded into the base image's alpha;
+  a `/Mask` **colour-key** array (`[min max …]`) makes matching raw samples
+  transparent. All compose through the engine's existing coverage-alpha path.
+  ([#41](https://github.com/qrcommunication/gigapdf-lib/issues/41))
+- **XLSX import fidelity.** The spreadsheet importer now carries per-cell styling
+  (font, fill, border, alignment, wrap from `cellXfs`), preserves number/date
+  format codes (builtin + custom `<numFmts>`) for serial→display formatting,
+  expands shared formulas (`<f t="shared">` followers via relative-ref
+  translation), and attaches cell hyperlinks (external + in-workbook). Workbook
+  `<definedName>` ranges remain unsupported.
+  ([#44](https://github.com/qrcommunication/gigapdf-lib/issues/44))
+
 ## [0.89.0] - 2026-06-24
 
 PDF-read fidelity. Two independent fixes implemented in parallel

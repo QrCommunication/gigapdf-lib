@@ -44,6 +44,14 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.90.0] - 2026-06-24
+
+PDF-read & Office-import fidelity (no SDK signature change): image `/ImageMask`
+stencils + `/Mask` (explicit & colour-key) now render
+([#41](https://github.com/qrcommunication/gigapdf-lib/issues/41)); XLSX import
+gains per-cell styling, number/date formats, shared formulas and hyperlinks
+([#44](https://github.com/qrcommunication/gigapdf-lib/issues/44)).
+
 ## [0.89.0] - 2026-06-24
 
 PDF-read fidelity (no SDK signature change): FlateDecode/LZW `/DecodeParms`
