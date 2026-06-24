@@ -221,6 +221,11 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 | `addEllipse(page, cx, cy, rx, ry, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Vector ellipse (Bézier). |
 | `addPolygon(page, points, close, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Polyline/polygon from a flat `[x0,y0,x1,y1,…]` list. |
 | `addGradient(page, spec)` | `boolean` | Paint a **linear** or **radial** gradient over `spec.rect`. `spec = { kind: "linear"\|"radial", coords, stops, rect, extend?, opacity? }` — `coords` is `[x0,y0,x1,y1]` (linear) or `[x0,y0,r0,x1,y1,r1]` (radial); `stops` is ≥ 2 `{ offset (0…1), rgb }`. Rendered as a shading pattern (ISO 32000-1 §8.7.4/§8.7.3). `false` for < 2 stops. |
+| `addFilledRectangle(page, rect, color, opacity?)` | `boolean` | Fill a rectangle (`{x,y,w,h}`) with `color` in **any** colour space (see `Color` — CMYK, spot `Separation`, gray, ICC). Press-ready counterpart of `addRectangle`. |
+| `addFilledPolygon(page, points, color, opacity?)` | `boolean` | Fill a polygon (flat `[x0,y0,…]`, ≥ 3 vertices, auto-closed) with `color` in any colour space. `false` for < 3 vertices. |
+| `addTextColor(page, x, y, size, text, font, color, opts?)` | `boolean` | Draw a base-14 text run in any colour space. `opts = { opacity?, rotation?, underline?, strikethrough? }`. |
+| `setOverprint(page, fill, stroke, mode?)` | `boolean` | Turn overprint on/off for subsequent content (`/op`, `/OP`, `/OPM`; `mode` `0`=independent colorants, `1`=non-erasing, default `1`). Prepress trapping. |
+| `addOutputIntent(profile, condition)` | `boolean` | Add a document **OutputIntent** embedding the ICC `profile` (`Uint8Array`; `/N` read from it). `condition` = output-condition id (e.g. `"Coated FOGRA39"`). Decoupled from PDF/A. |
 | `addPath(page, svgPath, ox, oy, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Draw an SVG `<path d="…">` anchored at `(ox,oy)` (Y-flipped, `pdf-lib` convention). |
 | `drawLine(page, x1, y1, x2, y2, rgb?, lineWidth?, opacity?)` | `boolean` | Straight line. |
 | `addSvg(page, svg, x, y, w, h)` | `boolean` | Render SVG markup as **native vector paths** fitting its `viewBox` into `(x,y,w,h)`. |
@@ -578,7 +583,7 @@ import type {
   ImageElementInfo, VectorPathInfo, PathSegment, PdfPermissions,
   SearchHit, AnnotationInfo, FieldInfo, FieldKind, FieldStyle, RadioOption,
   LinkInfo, LayerInfo, OutlineEntry, NamedDest, Action, Destination, Bookmark,
-  SignatureInfo, SignatureReport, GradientSpec, GradientStop, Attachment, XlsxSheet, DecodedImage,
+  SignatureInfo, SignatureReport, GradientSpec, GradientStop, Color, Attachment, XlsxSheet, DecodedImage,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,
   // unified editable model:

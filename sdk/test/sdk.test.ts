@@ -568,6 +568,65 @@ describe("@qrcommunication/gigapdf-lib", () => {
     r.close();
   });
 
+  it("CMYK/spot/gray/ICC fills + text colour + overprint + output intent", () => {
+    const doc = giga.open(giga.txtToPdf("Colour"));
+
+    expect(
+      doc.addFilledRectangle(
+        1,
+        { x: 40, y: 700, w: 200, h: 40 },
+        { space: "cmyk", c: 0.1, m: 0.8, y: 0.9, k: 0 }
+      )
+    ).toBe(true);
+    expect(
+      doc.addFilledRectangle(
+        1,
+        { x: 40, y: 650, w: 200, h: 40 },
+        { space: "separation", name: "PANTONE 285 C", tint: 1, cmyk: [0.9, 0.5, 0, 0] }
+      )
+    ).toBe(true);
+    expect(
+      doc.addFilledPolygon(1, [40, 500, 240, 500, 140, 600], { space: "gray", gray: 0.5 })
+    ).toBe(true);
+    expect(
+      doc.addTextColor(1, 40, 470, 18, "CMYK text", "Helvetica", {
+        space: "cmyk",
+        c: 0,
+        m: 1,
+        y: 1,
+        k: 0,
+      }, { underline: true })
+    ).toBe(true);
+
+    const fakeIcc = new Uint8Array(132);
+    expect(
+      doc.addFilledRectangle(
+        1,
+        { x: 40, y: 420, w: 80, h: 30 },
+        { space: "icc", components: [0.2, 0.4, 0.6], profile: fakeIcc }
+      )
+    ).toBe(true);
+    expect(doc.setOverprint(1, true, false, 1)).toBe(true);
+    expect(doc.addOutputIntent(fakeIcc, "Coated FOGRA39")).toBe(true);
+
+    // Fewer than three vertices is rejected.
+    expect(doc.addFilledPolygon(1, [0, 0, 1, 1], { space: "gray", gray: 0 })).toBe(false);
+
+    const bytes = doc.save();
+    doc.close();
+    const s = new TextDecoder("latin1").decode(bytes);
+    expect(s).toContain(" k\n");
+    expect(s).toContain("/Separation");
+    expect(s).toContain("0.5 g");
+    expect(s).toContain("/ICCBased");
+    expect(s).toContain("/OutputIntent");
+    expect(s).toContain("/OPM");
+
+    const r = giga.open(bytes);
+    expect(r.pageCount()).toBe(1);
+    r.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

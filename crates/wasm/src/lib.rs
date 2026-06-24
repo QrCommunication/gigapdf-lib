@@ -21,7 +21,7 @@
 mod rng;
 
 use gigapdf_core::{
-    Action, AfRelationship, Annotation, Bookmark, ContentElement, Document, ElementKind,
+    Action, AfRelationship, Annotation, Bookmark, Color, ContentElement, Document, ElementKind,
     EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec, GradientStop,
     HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox,
     PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
@@ -1579,6 +1579,199 @@ pub extern "C" fn gp_add_gradient(
         opacity,
     };
     edit(handle, |doc| doc.add_gradient(page, &spec))
+}
+
+/// Decode a colour passed across the ABI. `kind`: `0` RGB (`comps=[r,g,b]`), `1`
+/// CMYK (`[c,m,y,k]`), `2` gray (`[v]`), `3` Separation (`comps=[tint,c,m,y,k]`,
+/// `name` = spot name), `4` ICCBased (`comps` = components, `profile` = ICC bytes).
+fn decode_color(kind: i32, comps: &[f64], name: &str, profile: &[u8]) -> Option<Color> {
+    Some(match kind {
+        0 if comps.len() >= 3 => Color::Rgb([comps[0], comps[1], comps[2]]),
+        1 if comps.len() >= 4 => Color::Cmyk([comps[0], comps[1], comps[2], comps[3]]),
+        2 if !comps.is_empty() => Color::Gray(comps[0]),
+        3 if comps.len() >= 5 => Color::Separation {
+            name: name.to_string(),
+            tint: comps[0],
+            cmyk: [comps[1], comps[2], comps[3], comps[4]],
+        },
+        4 if !comps.is_empty() && !profile.is_empty() => Color::IccBased {
+            components: comps.to_vec(),
+            profile: profile.to_vec(),
+        },
+        _ => return None,
+    })
+}
+
+/// Read a colour's three ABI buffers (`comps` f64 array, `name` UTF-8, `profile`
+/// bytes) into a [`Color`]. Any pointer may be null when unused for that `kind`.
+unsafe fn color_arg(
+    kind: i32,
+    comps_ptr: *const f64,
+    comps_count: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    profile_ptr: *const u8,
+    profile_len: usize,
+) -> Option<Color> {
+    let comps: &[f64] = if comps_ptr.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(comps_ptr, comps_count)
+    };
+    let name = if name_ptr.is_null() {
+        ""
+    } else {
+        str_arg(name_ptr, name_len)
+    };
+    let profile: &[u8] = if profile_ptr.is_null() {
+        &[]
+    } else {
+        std::slice::from_raw_parts(profile_ptr, profile_len)
+    };
+    decode_color(kind, comps, name, profile)
+}
+
+/// Fill a rectangle `[x,y,w,h]` with a colour in any space (see [`color_arg`] for
+/// the colour encoding). `0` success, `-2` bad colour args, `-1` null handle.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_filled_rectangle(
+    handle: *mut Document,
+    page: u32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    kind: i32,
+    comps_ptr: *const f64,
+    comps_count: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    profile_ptr: *const u8,
+    profile_len: usize,
+    opacity: f64,
+) -> i32 {
+    let color = match unsafe {
+        color_arg(kind, comps_ptr, comps_count, name_ptr, name_len, profile_ptr, profile_len)
+    } {
+        Some(c) => c,
+        None => return -2,
+    };
+    edit(handle, |doc| doc.add_filled_rectangle(page, [x, y, w, h], &color, opacity))
+}
+
+/// Fill a polygon through flat `[x0,y0,…]` `points` with a colour in any space.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_filled_polygon(
+    handle: *mut Document,
+    page: u32,
+    points_ptr: *const f64,
+    points_count: usize,
+    kind: i32,
+    comps_ptr: *const f64,
+    comps_count: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    profile_ptr: *const u8,
+    profile_len: usize,
+    opacity: f64,
+) -> i32 {
+    let points: &[f64] = if points_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(points_ptr, points_count) }
+    };
+    let color = match unsafe {
+        color_arg(kind, comps_ptr, comps_count, name_ptr, name_len, profile_ptr, profile_len)
+    } {
+        Some(c) => c,
+        None => return -2,
+    };
+    edit(handle, |doc| doc.add_filled_polygon(page, points, &color, opacity))
+}
+
+/// Draw a base-14 text run in any colour space. `font` is the base-14 name.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_text_color(
+    handle: *mut Document,
+    page: u32,
+    x: f64,
+    y: f64,
+    size: f64,
+    text_ptr: *const u8,
+    text_len: usize,
+    font_ptr: *const u8,
+    font_len: usize,
+    kind: i32,
+    comps_ptr: *const f64,
+    comps_count: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    profile_ptr: *const u8,
+    profile_len: usize,
+    opacity: f64,
+    rotation_deg: f64,
+    underline: i32,
+    strikethrough: i32,
+) -> i32 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    let font = unsafe { str_arg(font_ptr, font_len) };
+    let color = match unsafe {
+        color_arg(kind, comps_ptr, comps_count, name_ptr, name_len, profile_ptr, profile_len)
+    } {
+        Some(c) => c,
+        None => return -2,
+    };
+    edit(handle, |doc| {
+        doc.add_text_color(
+            page,
+            x,
+            y,
+            size,
+            text,
+            font,
+            &color,
+            opacity,
+            rotation_deg,
+            underline != 0,
+            strikethrough != 0,
+        )
+    })
+}
+
+/// Turn overprint on/off for subsequent content on `page` (`/op`, `/OP`, `/OPM`).
+#[no_mangle]
+pub extern "C" fn gp_set_overprint(
+    handle: *mut Document,
+    page: u32,
+    fill: i32,
+    stroke: i32,
+    mode: u32,
+) -> i32 {
+    edit(handle, |doc| {
+        doc.set_overprint(page, fill != 0, stroke != 0, mode as u8)
+    })
+}
+
+/// Add a document-level OutputIntent embedding the ICC `profile` (`/N` read from
+/// the profile), with `condition` as the output-condition identifier.
+#[no_mangle]
+pub extern "C" fn gp_add_output_intent(
+    handle: *mut Document,
+    profile_ptr: *const u8,
+    profile_len: usize,
+    condition_ptr: *const u8,
+    condition_len: usize,
+) -> i32 {
+    let profile: &[u8] = if profile_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(profile_ptr, profile_len) }
+    };
+    let condition = unsafe { str_arg(condition_ptr, condition_len) };
+    edit(handle, |doc| doc.add_output_intent(profile, condition))
 }
 
 /// Draw a polyline/polygon through flat `[x0,y0,x1,y1,…]` points (`points_ptr`,

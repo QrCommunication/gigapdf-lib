@@ -4,6 +4,27 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.83.0] - 2026-06-24
+
+Press-ready colour authoring. Resolves
+[#11](https://github.com/qrcommunication/gigapdf-lib/issues/11) (CMYK / spot /
+ICC OutputIntent / overprint).
+
+### Added
+
+- **`Color`** union type — `{ space: "rgb", rgb }` · `{ space: "cmyk", c,m,y,k }`
+  · `{ space: "gray", gray }` · `{ space: "separation", name, tint, cmyk }` ·
+  `{ space: "icc", components, profile }`. CMYK/gray/tint components are `0`…`1`.
+- **`addFilledRectangle(page, rect, color, opacity?)`** and
+  **`addFilledPolygon(page, points, color, opacity?)`** — fill shapes in any
+  colour space.
+- **`addTextColor(page, x, y, size, text, font, color, opts?)`** — base-14 text
+  in any colour space (`opts = { opacity?, rotation?, underline?, strikethrough? }`).
+- **`setOverprint(page, fill, stroke, mode?)`** — prepress overprint (`/op`,
+  `/OP`, `/OPM`).
+- **`addOutputIntent(profile, condition)`** — embed an ICC profile as a document
+  OutputIntent (`/S /GTS_PDFX`), decoupled from PDF/A.
+
 ## [0.82.0] - 2026-06-24
 
 Gradient authoring. Resolves

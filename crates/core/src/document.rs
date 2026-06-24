@@ -1370,6 +1370,32 @@ pub struct GradientSpec {
     pub opacity: f64,
 }
 
+/// A fill/stroke colour in any of the authored colour spaces (ISO 32000-1 §8.6).
+/// `Cmyk`/`Gray` enable press-ready output; `Separation` is a spot/ink channel
+/// (with its `DeviceCMYK` tint approximation); `IccBased` embeds an ICC profile.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Color {
+    /// `DeviceRGB` — components `0.0..=1.0`.
+    Rgb([f64; 3]),
+    /// `DeviceCMYK` — components `0.0..=1.0`.
+    Cmyk([f64; 4]),
+    /// `DeviceGray` — `0.0` black … `1.0` white.
+    Gray(f64),
+    /// A `Separation` (spot ink) — a `name` (e.g. `PANTONE 285 C`), a `tint`
+    /// (`0.0..=1.0`) and the full-tint `cmyk` the tint transform interpolates to.
+    Separation {
+        name: String,
+        tint: f64,
+        cmyk: [f64; 4],
+    },
+    /// An `ICCBased` colour — `components` (one per profile channel) and the raw
+    /// ICC `profile` bytes (its `/N` is taken from `components.len()`).
+    IccBased {
+        components: Vec<f64>,
+        profile: Vec<u8>,
+    },
+}
+
 /// One outline bookmark for [`Document::set_bookmarks`]: a `title`, a nesting
 /// `level` (0 = top), and an optional [`Action`] (a destination jump or any other
 /// action). A `None` action makes a plain, non-clickable heading.
@@ -7667,6 +7693,173 @@ impl Document {
         Object::Dictionary(f)
     }
 
+    /// The content-stream operators that set the current **fill** (`fill = true`)
+    /// or **stroke** colour to `color`, in its colour space (ISO 32000-1 §8.6).
+    /// For `Separation`/`IccBased` the colour space is registered in the page's
+    /// `/Resources /ColorSpace`; the returned bytes end with a newline.
+    fn color_ops(&mut self, page_no: u32, color: &Color, fill: bool) -> Result<Vec<u8>> {
+        let mut ops = Vec::new();
+        match color {
+            Color::Rgb([r, g, b]) => ops.extend_from_slice(
+                format!(
+                    "{} {} {} {}\n",
+                    content::num(*r),
+                    content::num(*g),
+                    content::num(*b),
+                    if fill { "rg" } else { "RG" }
+                )
+                .as_bytes(),
+            ),
+            Color::Cmyk([c, m, y, k]) => ops.extend_from_slice(
+                format!(
+                    "{} {} {} {} {}\n",
+                    content::num(*c),
+                    content::num(*m),
+                    content::num(*y),
+                    content::num(*k),
+                    if fill { "k" } else { "K" }
+                )
+                .as_bytes(),
+            ),
+            Color::Gray(v) => ops.extend_from_slice(
+                format!("{} {}\n", content::num(*v), if fill { "g" } else { "G" }).as_bytes(),
+            ),
+            Color::Separation { name, tint, cmyk } => {
+                let cs = Self::separation_cs(name, *cmyk);
+                let res = self.register_page_resource(page_no, b"ColorSpace", "CS", cs)?;
+                ops.push(b'/');
+                ops.extend_from_slice(&res);
+                ops.extend_from_slice(if fill { b" cs\n" } else { b" CS\n" });
+                ops.extend_from_slice(
+                    format!(
+                        "{} {}\n",
+                        content::num(*tint),
+                        if fill { "scn" } else { "SCN" }
+                    )
+                    .as_bytes(),
+                );
+            }
+            Color::IccBased {
+                components,
+                profile,
+            } => {
+                let cs = self.iccbased_cs(profile, components.len());
+                let res = self.register_page_resource(page_no, b"ColorSpace", "CS", cs)?;
+                ops.push(b'/');
+                ops.extend_from_slice(&res);
+                ops.extend_from_slice(if fill { b" cs\n" } else { b" CS\n" });
+                for c in components {
+                    ops.extend_from_slice(format!("{} ", content::num(*c)).as_bytes());
+                }
+                ops.extend_from_slice(if fill { b"scn\n" } else { b"SCN\n" });
+            }
+        }
+        Ok(ops)
+    }
+
+    /// A `Separation` colour-space array `[/Separation /name /DeviceCMYK tint]`,
+    /// where the tint transform is a type-2 function interpolating `0` → `cmyk`.
+    fn separation_cs(name: &str, cmyk: [f64; 4]) -> Object {
+        let mut f = Dictionary::new();
+        f.set(b"FunctionType".to_vec(), Object::Integer(2));
+        f.set(b"Domain".to_vec(), annot::real_array(&[0.0, 1.0]));
+        f.set(b"C0".to_vec(), annot::real_array(&[0.0, 0.0, 0.0, 0.0]));
+        f.set(b"C1".to_vec(), annot::real_array(&cmyk));
+        f.set(b"N".to_vec(), Object::Integer(1));
+        Object::Array(vec![
+            annot::name(b"Separation"),
+            annot::name(name.as_bytes()),
+            annot::name(b"DeviceCMYK"),
+            Object::Dictionary(f),
+        ])
+    }
+
+    /// An `ICCBased` colour-space array `[/ICCBased <stream>]`, embedding the
+    /// (Flate-compressed) ICC `profile` with `/N = n` components.
+    fn iccbased_cs(&mut self, profile: &[u8], n: usize) -> Object {
+        let compressed = crate::filters::deflate::flate_encode(profile);
+        let mut d = Dictionary::new();
+        d.set(b"N".to_vec(), Object::Integer(n as i64));
+        d.set(b"Filter".to_vec(), annot::name(b"FlateDecode"));
+        d.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
+        let id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(id, Object::Stream(Stream::new(d, compressed)));
+        Object::Array(vec![annot::name(b"ICCBased"), Object::Reference(id)])
+    }
+
+    /// Fill a rectangle with `fill` in **any** colour space — the press-ready
+    /// counterpart of [`add_rectangle`](Self::add_rectangle) (DeviceCMYK, spot
+    /// `Separation`, gray, ICC). `rect` is `[x, y, w, h]`.
+    pub fn add_filled_rectangle(
+        &mut self,
+        page_no: u32,
+        rect: [f64; 4],
+        fill: &Color,
+        opacity: f64,
+    ) -> Result<()> {
+        let color_ops = self.color_ops(page_no, fill, true)?;
+        let [x, y, w, h] = rect;
+        let mut ops = Vec::new();
+        ops.extend_from_slice(b"q\n");
+        ops.extend_from_slice(&color_ops);
+        ops.extend_from_slice(
+            format!(
+                "{} {} {} {} re\nf\nQ\n",
+                content::num(x),
+                content::num(y),
+                content::num(w),
+                content::num(h)
+            )
+            .as_bytes(),
+        );
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Fill a polygon through `points` (flat `[x0, y0, x1, y1, …]`, ≥ 3 vertices)
+    /// with `fill` in **any** colour space. The path is closed automatically.
+    pub fn add_filled_polygon(
+        &mut self,
+        page_no: u32,
+        points: &[f64],
+        fill: &Color,
+        opacity: f64,
+    ) -> Result<()> {
+        if points.len() < 6 || !points.len().is_multiple_of(2) {
+            return Err(EngineError::InvalidArgument(
+                "a filled polygon needs at least three (x, y) vertices".into(),
+            ));
+        }
+        let color_ops = self.color_ops(page_no, fill, true)?;
+        let mut ops = Vec::new();
+        ops.extend_from_slice(b"q\n");
+        ops.extend_from_slice(&color_ops);
+        ops.extend_from_slice(
+            format!(
+                "{} {} m\n",
+                content::num(points[0]),
+                content::num(points[1])
+            )
+            .as_bytes(),
+        );
+        let mut i = 2;
+        while i + 1 < points.len() {
+            ops.extend_from_slice(
+                format!(
+                    "{} {} l\n",
+                    content::num(points[i]),
+                    content::num(points[i + 1])
+                )
+                .as_bytes(),
+            );
+            i += 2;
+        }
+        ops.extend_from_slice(b"h\nf\nQ\n");
+        let ops = self.with_opacity(page_no, ops, opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
     /// Draw a polyline / polygon through `points` (flat `[x0, y0, x1, y1, …]`
     /// pairs) on a page. `close` joins the last vertex to the first. Colours
     /// are RGB in `0.0..=1.0`; pass `None` to skip stroke or fill.
@@ -9033,7 +9226,7 @@ impl Document {
         y: f64,
         run_width: f64,
         size: f64,
-        color: [f64; 3],
+        color_ops: &[u8],
         rotation_deg: f64,
         underline: bool,
         strikethrough: bool,
@@ -9043,12 +9236,10 @@ impl Document {
         }
         let (sin, cos) = rotation_deg.to_radians().sin_cos();
         let mut out = b"q\n".to_vec();
+        out.extend_from_slice(color_ops);
         out.extend_from_slice(
             format!(
-                "{r} {g} {b} rg\n{ma} {mb} {mc} {md} {x} {y} cm\n",
-                r = content::num(color[0]),
-                g = content::num(color[1]),
-                b = content::num(color[2]),
+                "{ma} {mb} {mc} {md} {x} {y} cm\n",
                 ma = content::num(cos),
                 mb = content::num(sin),
                 mc = content::num(-sin),
@@ -9149,6 +9340,13 @@ impl Document {
         if self.base14_refs.contains_key(&font_obj) {
             let res_name = format!("GpStd{font_obj}").into_bytes();
             self.register_page_font(page_no, &res_name, (font_obj, 0))?;
+            let color_ops = format!(
+                "{} {} {} rg\n",
+                content::num(color[0]),
+                content::num(color[1]),
+                content::num(color[2])
+            )
+            .into_bytes();
             return self.draw_simple_text_run(
                 page_no,
                 &res_name,
@@ -9156,7 +9354,7 @@ impl Document {
                 y,
                 size,
                 text,
-                color,
+                &color_ops,
                 opacity,
                 rotation_deg,
                 underline,
@@ -9200,12 +9398,19 @@ impl Document {
         .into_bytes();
         // Decoration rides in the same rotated frame, painted after the glyphs and
         // under the same opacity envelope.
+        let dec_color = format!(
+            "{} {} {} rg\n",
+            content::num(color[0]),
+            content::num(color[1]),
+            content::num(color[2])
+        )
+        .into_bytes();
         inner.extend_from_slice(&Self::decoration_ops(
             x,
             y,
             run_width,
             size,
-            color,
+            &dec_color,
             rotation_deg,
             underline,
             strikethrough,
@@ -9548,6 +9753,13 @@ impl Document {
         let base = Self::standard_base14(font_name)
             .ok_or_else(|| EngineError::Unsupported(format!("not a base-14 font: {font_name}")))?;
         let res_name = self.ensure_standard_font(page_no, base)?;
+        let color_ops = format!(
+            "{} {} {} rg\n",
+            content::num(color[0]),
+            content::num(color[1]),
+            content::num(color[2])
+        )
+        .into_bytes();
         self.draw_simple_text_run(
             page_no,
             &res_name,
@@ -9555,7 +9767,46 @@ impl Document {
             y,
             size,
             text,
-            color,
+            &color_ops,
+            opacity,
+            rotation_deg,
+            underline,
+            strikethrough,
+        )
+    }
+
+    /// Draw a base-14 (`Helvetica`/`Times`/`Courier`/`Symbol`/`ZapfDingbats`)
+    /// text run in **any** colour space — the press-ready counterpart of
+    /// [`add_text_standard`](Self::add_text_standard). `fill` may be CMYK, gray, a
+    /// spot `Separation` or ICC. `underline`/`strikethrough` paint in the same
+    /// colour.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_color(
+        &mut self,
+        page_no: u32,
+        x: f64,
+        y: f64,
+        size: f64,
+        text: &str,
+        font_name: &str,
+        fill: &Color,
+        opacity: f64,
+        rotation_deg: f64,
+        underline: bool,
+        strikethrough: bool,
+    ) -> Result<()> {
+        let base = Self::standard_base14(font_name)
+            .ok_or_else(|| EngineError::Unsupported(format!("not a base-14 font: {font_name}")))?;
+        let res_name = self.ensure_standard_font(page_no, base)?;
+        let color_ops = self.color_ops(page_no, fill, true)?;
+        self.draw_simple_text_run(
+            page_no,
+            &res_name,
+            x,
+            y,
+            size,
+            text,
+            &color_ops,
             opacity,
             rotation_deg,
             underline,
@@ -9579,7 +9830,7 @@ impl Document {
         y: f64,
         size: f64,
         text: &str,
-        color: [f64; 3],
+        color_ops: &[u8],
         opacity: f64,
         rotation_deg: f64,
         underline: bool,
@@ -9589,15 +9840,8 @@ impl Document {
 
         let mut inner: Vec<u8> = Vec::new();
         inner.extend_from_slice(b"q\n");
-        inner.extend_from_slice(
-            format!(
-                "{} {} {} rg\nBT\n/",
-                content::num(color[0]),
-                content::num(color[1]),
-                content::num(color[2]),
-            )
-            .as_bytes(),
-        );
+        inner.extend_from_slice(color_ops);
+        inner.extend_from_slice(b"BT\n/");
         inner.extend_from_slice(res_name);
         inner.extend_from_slice(format!(" {} Tf\n", content::num(size)).as_bytes());
         // Text matrix carries the rotation: [cos sin -sin cos x y].
@@ -9629,7 +9873,7 @@ impl Document {
             y,
             run_width,
             size,
-            color,
+            color_ops,
             rotation_deg,
             underline,
             strikethrough,
@@ -9639,6 +9883,84 @@ impl Document {
         let mut content = self.page_content(page_no)?;
         content.extend_from_slice(&ops);
         self.set_page_content(page_no, content)?;
+        Ok(())
+    }
+
+    /// Turn **overprint** on (or off) for content drawn **after** this call on
+    /// `page_no` (ISO 32000-1 §8.6.7). Registers an `/ExtGState` with `/op` (fill
+    /// overprint), `/OP` (stroke overprint) and `/OPM` (`0` = each colorant
+    /// independently, `1` = zero components don't erase) and appends `/GS gs`.
+    /// Essential for prepress black-overprint / trapping.
+    pub fn set_overprint(
+        &mut self,
+        page_no: u32,
+        fill: bool,
+        stroke: bool,
+        mode: u8,
+    ) -> Result<()> {
+        let mut gs = Dictionary::new();
+        gs.set(b"Type".to_vec(), annot::name(b"ExtGState"));
+        gs.set(b"op".to_vec(), Object::Boolean(fill));
+        gs.set(b"OP".to_vec(), Object::Boolean(stroke));
+        gs.set(
+            b"OPM".to_vec(),
+            Object::Integer(if mode == 0 { 0 } else { 1 }),
+        );
+        let name =
+            self.register_page_resource(page_no, b"ExtGState", "OPGS", Object::Dictionary(gs))?;
+        let mut ops = Vec::new();
+        ops.push(b'/');
+        ops.extend_from_slice(&name);
+        ops.extend_from_slice(b" gs\n");
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Add a document-level **OutputIntent** (ISO 32000-1 §8.6.3) embedding the
+    /// ICC `profile` (its `/N` is read from the profile's data-colour-space
+    /// signature — GRAY/RGB/CMYK), with `/S /GTS_PDFX` for prepress. Decoupled
+    /// from the PDF/A path; appended to the catalog `/OutputIntents` (coexists
+    /// with any existing one).
+    pub fn add_output_intent(&mut self, profile: &[u8], output_condition: &str) -> Result<()> {
+        let n = match profile.get(16..20) {
+            Some(b"GRAY") => 1,
+            Some(b"CMYK") => 4,
+            _ => 3, // RGB / Lab / fallback
+        };
+        let compressed = crate::filters::deflate::flate_encode(profile);
+        let mut idict = Dictionary::new();
+        idict.set(b"N".to_vec(), Object::Integer(n));
+        idict.set(b"Filter".to_vec(), annot::name(b"FlateDecode"));
+        idict.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
+        let icc_id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(icc_id, Object::Stream(Stream::new(idict, compressed)));
+
+        let mut oi = Dictionary::new();
+        oi.set(b"Type".to_vec(), annot::name(b"OutputIntent"));
+        oi.set(b"S".to_vec(), annot::name(b"GTS_PDFX"));
+        oi.set(
+            b"OutputConditionIdentifier".to_vec(),
+            pdf_text(output_condition),
+        );
+        oi.set(b"Info".to_vec(), pdf_text(output_condition));
+        oi.set(b"DestOutputProfile".to_vec(), Object::Reference(icc_id));
+
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let mut intents = catalog
+            .get(b"OutputIntents")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        intents.push(Object::Dictionary(oi));
+        catalog.set(b"OutputIntents".to_vec(), Object::Array(intents));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
         Ok(())
     }
 
@@ -18282,6 +18604,81 @@ mod tests {
                     opacity: 1.0,
                 },
             )
+            .is_err());
+    }
+
+    #[test]
+    fn cmyk_spot_gray_icc_fills_text_overprint_and_output_intent() {
+        let mut doc = blank_doc();
+        doc.add_filled_rectangle(
+            1,
+            [40.0, 700.0, 200.0, 40.0],
+            &Color::Cmyk([0.1, 0.8, 0.9, 0.0]),
+            1.0,
+        )
+        .unwrap();
+        doc.add_filled_rectangle(
+            1,
+            [40.0, 650.0, 200.0, 40.0],
+            &Color::Separation {
+                name: "PANTONE 285 C".into(),
+                tint: 1.0,
+                cmyk: [0.9, 0.5, 0.0, 0.0],
+            },
+            1.0,
+        )
+        .unwrap();
+        doc.add_filled_polygon(
+            1,
+            &[40.0, 500.0, 240.0, 500.0, 140.0, 600.0],
+            &Color::Gray(0.5),
+            1.0,
+        )
+        .unwrap();
+        doc.add_text_color(
+            1,
+            40.0,
+            470.0,
+            18.0,
+            "CMYK text",
+            "Helvetica",
+            &Color::Cmyk([0.0, 1.0, 1.0, 0.0]),
+            1.0,
+            0.0,
+            true,
+            false,
+        )
+        .unwrap();
+        doc.add_filled_rectangle(
+            1,
+            [40.0, 420.0, 80.0, 30.0],
+            &Color::IccBased {
+                components: vec![0.2, 0.4, 0.6],
+                profile: crate::convert::srgb_icc::SRGB_ICC.to_vec(),
+            },
+            1.0,
+        )
+        .unwrap();
+        doc.set_overprint(1, true, false, 1).unwrap();
+        doc.add_output_intent(crate::convert::srgb_icc::SRGB_ICC, "Coated FOGRA39")
+            .unwrap();
+
+        let bytes = doc.save();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains(" k\n"), "DeviceCMYK fill op (c m y k k)");
+        assert!(s.contains("/Separation"), "spot colour space");
+        assert!(s.contains("0.5 g"), "DeviceGray fill op");
+        assert!(s.contains("/ICCBased"), "ICCBased colour space");
+        assert!(s.contains("scn"), "separation/ICC paint op");
+        assert!(s.contains("/OutputIntent"), "output intent present");
+        assert!(s.contains("/OPM"), "overprint ExtGState present");
+
+        let reopened = Document::open(&bytes).unwrap();
+        assert_eq!(reopened.page_count(), 1);
+
+        // A polygon with fewer than three vertices is rejected.
+        assert!(doc
+            .add_filled_polygon(1, &[0.0, 0.0, 1.0, 1.0], &Color::Gray(0.0), 1.0)
             .is_err());
     }
 

@@ -7,6 +7,42 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.83.0] - 2026-06-24
+
+Press-ready **colour authoring** — fills and text are no longer limited to
+DeviceRGB. Resolves
+[#11](https://github.com/qrcommunication/gigapdf-lib/issues/11) (CMYK / spot
+(`Separation`) / ICC `OutputIntent` / overprint).
+
+### Added
+
+- **`Color`** enum — `Rgb` · `Cmyk` · `Gray` · `Separation { name, tint, cmyk }`
+  (a spot ink with its `DeviceCMYK` tint transform) · `IccBased { components,
+  profile }` (ISO 32000-1 §8.6).
+- **`Document::add_filled_rectangle(page, [x,y,w,h], &Color, opacity)`** and
+  **`add_filled_polygon(page, &points, &Color, opacity)`** — fill shapes in any
+  colour space (a `Separation`/`ICCBased` colour registers its colour-space
+  resource on the page).
+- **`add_text_color(page, x, y, size, text, font, &Color, …)`** — base-14 text in
+  any colour space (the text-drawing core was refactored to take colour-setting
+  operators, so RGB text is unchanged).
+- **`set_overprint(page, fill, stroke, mode)`** — an `/ExtGState` with `/op`,
+  `/OP`, `/OPM` for prepress trapping (ISO 32000-1 §8.6.7).
+- **`add_output_intent(&profile, condition)`** — a document `OutputIntent`
+  (`/S /GTS_PDFX`) embedding an ICC profile, decoupled from the PDF/A path; `/N`
+  is read from the profile's data-colour-space signature.
+- `gp_add_filled_rectangle` / `gp_add_filled_polygon` / `gp_add_text_color` /
+  `gp_set_overprint` / `gp_add_output_intent`; SDK `addFilledRectangle` /
+  `addFilledPolygon` / `addTextColor` / `setOverprint` / `addOutputIntent` + a
+  `Color` union type.
+
+### Notes
+
+- CMYK/Separation/ICC fills + the OutputIntent pass `qpdf --check` (clean).
+- Existing `add_rectangle`/`add_ellipse`/`add_polygon`/`add_text*` keep their RGB
+  signatures (no breaking change); the new `*_color`/`*_filled_*` methods are the
+  any-colour-space path.
+
 ## [0.82.0] - 2026-06-24
 
 Gradient **authoring** — the rasterizer could already render shadings, but there

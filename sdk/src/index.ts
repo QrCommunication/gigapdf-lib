@@ -2241,6 +2241,25 @@ export interface GradientSpec {
   opacity?: number;
 }
 
+/**
+ * A fill colour in any authored colour space (ISO 32000-1 §8.6), for
+ * {@link GigaPdfDoc.addFilledRectangle}/{@link GigaPdfDoc.addFilledPolygon}/
+ * {@link GigaPdfDoc.addTextColor}. `cmyk`/`gray` are press-ready; `separation`
+ * is a spot ink (with its `DeviceCMYK` tint approximation); `icc` embeds a
+ * profile. CMYK/gray/tint components are `0`…`1`; `rgb` is packed `0xRRGGBB`.
+ */
+export type Color =
+  | { space: "rgb"; rgb: number }
+  | { space: "cmyk"; c: number; m: number; y: number; k: number }
+  | { space: "gray"; gray: number }
+  | {
+      space: "separation";
+      name: string;
+      tint: number;
+      cmyk: [number, number, number, number];
+    }
+  | { space: "icc"; components: number[]; profile: Uint8Array };
+
 /** Visual styling for a newly-created form field. */
 export interface FieldStyle {
   /** Text size in points; `0` (default) auto-sizes to the field box. */
@@ -2667,6 +2686,148 @@ export class GigaPdfDoc {
               r.x, r.y, r.w, r.h, es ? 1 : 0, ee ? 1 : 0, opacity
             )
           )
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Encode a {@link Color} into the ABI's `(kind, comps, name, profile)` buffers
+   * and invoke `fn` with the resulting pointers. Internal.
+   */
+  private _color<T>(
+    color: Color,
+    fn: (
+      kind: number,
+      compsPtr: number,
+      compsCount: number,
+      namePtr: number,
+      nameLen: number,
+      profPtr: number,
+      profLen: number
+    ) => T
+  ): T {
+    let kind: number;
+    let comps: number[];
+    let name = "";
+    let profile: Uint8Array | null = null;
+    switch (color.space) {
+      case "cmyk":
+        kind = 1;
+        comps = [color.c, color.m, color.y, color.k];
+        break;
+      case "gray":
+        kind = 2;
+        comps = [color.gray];
+        break;
+      case "separation":
+        kind = 3;
+        comps = [color.tint, ...color.cmyk];
+        name = color.name;
+        break;
+      case "icc":
+        kind = 4;
+        comps = color.components;
+        profile = color.profile;
+        break;
+      default: {
+        const c = RGB(color.rgb);
+        kind = 0;
+        comps = [((c >> 16) & 0xff) / 255, ((c >> 8) & 0xff) / 255, (c & 0xff) / 255];
+      }
+    }
+    return this.g._withF64(comps, (cp, cc) =>
+      this.g._withOptStr(name, (np, nl) =>
+        profile
+          ? this.g._withBytes(profile, (pp, pl) => fn(kind, cp, cc, np, nl, pp, pl))
+          : fn(kind, cp, cc, np, nl, 0, 0)
+      )
+    );
+  }
+
+  /**
+   * Fill a rectangle with `color` in **any** colour space — the press-ready
+   * counterpart of {@link addRectangle} (CMYK, spot `Separation`, gray, ICC).
+   *
+   * @example
+   * doc.addFilledRectangle(1, { x: 40, y: 700, w: 200, h: 40 },
+   *   { space: "cmyk", c: 0.1, m: 0.8, y: 0.9, k: 0 });
+   */
+  addFilledRectangle(page: number, rect: Box, color: Color, opacity = 1): boolean {
+    return (
+      this._color(color, (kind, cp, cc, np, nl, pp, pl) =>
+        this.ex().gp_add_filled_rectangle(
+          this.h, page, rect.x, rect.y, rect.w, rect.h, kind, cp, cc, np, nl, pp, pl, opacity
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Fill a polygon through flat `[x0,y0,x1,y1,…]` `points` (≥ 3 vertices) with
+   * `color` in any colour space. The path is closed automatically.
+   */
+  addFilledPolygon(page: number, points: number[], color: Color, opacity = 1): boolean {
+    return (
+      this.g._withF64(points, (ptsPtr, ptsCount) =>
+        this._color(color, (kind, cp, cc, np, nl, pp, pl) =>
+          this.ex().gp_add_filled_polygon(
+            this.h, page, ptsPtr, ptsCount, kind, cp, cc, np, nl, pp, pl, opacity
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Draw a base-14 text run in **any** colour space — the press-ready
+   * counterpart of {@link addTextStandard}. `font` is a base-14 family
+   * (`Helvetica`, `Times-Roman`, `Courier`, …).
+   */
+  addTextColor(
+    page: number,
+    x: number,
+    y: number,
+    size: number,
+    text: string,
+    font: string,
+    color: Color,
+    opts: { opacity?: number; rotation?: number; underline?: boolean; strikethrough?: boolean } = {}
+  ): boolean {
+    const { opacity = 1, rotation = 0, underline = false, strikethrough = false } = opts;
+    return (
+      this.g._withStr(text, (tp, tl) =>
+        this.g._withStr(font, (fp, fl) =>
+          this._color(color, (kind, cp, cc, np, nl, pp, pl) =>
+            this.ex().gp_add_text_color(
+              this.h, page, x, y, size, tp, tl, fp, fl, kind, cp, cc, np, nl, pp, pl,
+              opacity, rotation, underline ? 1 : 0, strikethrough ? 1 : 0
+            )
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Turn **overprint** on/off for content drawn **after** this call (`/op` fill,
+   * `/OP` stroke, `/OPM` mode — `0` independent colorants, `1` non-erasing).
+   * Essential for prepress black-overprint / trapping.
+   */
+  setOverprint(page: number, fill: boolean, stroke: boolean, mode = 1): boolean {
+    return this.ex().gp_set_overprint(this.h, page, fill ? 1 : 0, stroke ? 1 : 0, mode) === 0;
+  }
+
+  /**
+   * Add a document-level **OutputIntent** embedding the ICC `profile` (its `/N`
+   * is read from the profile), with `condition` as the output-condition
+   * identifier (e.g. `"Coated FOGRA39"`). Decoupled from the PDF/A path.
+   */
+  addOutputIntent(profile: Uint8Array, condition: string): boolean {
+    return (
+      this.g._withBytes(profile, (pp, pl) =>
+        this.g._withStr(condition, (cp, cl) =>
+          this.ex().gp_add_output_intent(this.h, pp, pl, cp, cl)
         )
       ) === 0
     );

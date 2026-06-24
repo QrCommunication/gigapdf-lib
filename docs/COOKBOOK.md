@@ -31,6 +31,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Redact a sensitive zone (PII)](#redact-a-sensitive-zone-pii) — *v0.52.4*
 - [Styled text: bold · underline · strikethrough · sub/superscript](#styled-text)
 - [Gradient fills (linear & radial)](#gradient-fills-linear--radial) — *v0.82.0*
+- [Press-ready colour: CMYK, spot inks, overprint & output intent](#press-ready-colour-cmyk-spot-inks-overprint--output-intent) — *v0.83.0*
 - [Read & write running headers and footers](#headers-and-footers)
 - [Set print boxes (TrimBox / BleedBox) for prepress](#print-boxes) — *v0.73.0*
 - [Number pages with labels (roman front matter, prefixes)](#page-labels) — *v0.74.0*
@@ -204,6 +205,56 @@ doc.close();
 
 > Tiling patterns, blend-mode authoring (`/BM`) and transparency groups are not
 > covered here — only gradient fills.
+
+---
+
+## Press-ready colour: CMYK, spot inks, overprint & output intent
+
+Authoring fills are no longer limited to DeviceRGB. `addFilledRectangle`,
+`addFilledPolygon` and `addTextColor` accept a `Color` in any colour space —
+`DeviceCMYK`, `DeviceGray`, a spot `Separation` ink, or an embedded ICC profile
+(`ICCBased`). `setOverprint` enables prepress trapping, and `addOutputIntent`
+attaches the ICC characterisation of the target press.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// A process-CMYK colour block (c, m, y, k are 0…1).
+doc.addFilledRectangle(
+  1,
+  { x: 72, y: 700, w: 200, h: 40 },
+  { space: "cmyk", c: 0.1, m: 0.85, y: 0.9, k: 0 }
+);
+
+// A spot ink — its tint transform interpolates toward `cmyk` at full tint.
+doc.addFilledRectangle(
+  1,
+  { x: 300, y: 700, w: 200, h: 40 },
+  { space: "separation", name: "PANTONE 285 C", tint: 1, cmyk: [0.9, 0.5, 0, 0] }
+);
+
+// Black text set to overprint (so it traps over the colour beneath it).
+doc.setOverprint(1, /* fill */ true, /* stroke */ false, /* mode */ 1);
+doc.addTextColor(1, 72, 660, 18, "Overprinting black", "Helvetica", {
+  space: "cmyk", c: 0, m: 0, y: 0, k: 1,
+});
+
+// A grey polygon and an ICC-tagged fill.
+doc.addFilledPolygon(1, [72, 500, 272, 500, 172, 600], { space: "gray", gray: 0.5 });
+doc.addFilledRectangle(1, { x: 72, y: 440, w: 80, h: 40 }, {
+  space: "icc", components: [0.2, 0.4, 0.6], profile: iccProfileBytes,
+});
+
+// Tell the press which condition the document is prepared for.
+doc.addOutputIntent(iccProfileBytes, "Coated FOGRA39");
+
+const out = doc.save();
+doc.close();
+```
+
+> `rgb` colours are packed `0xRRGGBB`; all other components are `0…1`. Overprint
+> only affects content drawn **after** the `setOverprint` call. ICC profile bytes
+> are a `Uint8Array` (e.g. read from a `.icc` file).
 
 ---
 
