@@ -1605,8 +1605,10 @@ fn conic_gradient_svg_image(
         + 1.0;
 
     let offsets = resolve_stop_offsets(&grad.stops);
-    // Enough sectors that the flat-fill banding is invisible at print scale.
-    const SECTORS: usize = 180;
+    // One sector per degree: the flat-fill steps are below visual acuity at any
+    // print resolution (PDF has no native conic shading, so this fan is the
+    // ceiling — finer steps only grow the content stream with no visible gain).
+    const SECTORS: usize = 360;
     let mut prims: Vec<Prim> = Vec::with_capacity(SECTORS);
     let step = 1.0 / SECTORS as f64;
     for i in 0..SECTORS {

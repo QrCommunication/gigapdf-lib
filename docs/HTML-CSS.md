@@ -278,7 +278,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `background` / `background-color` | [colour](#colours) | solid fill |
 | `background` / `background-image` | `linear-gradient(…)` | **real PDF axial shading** — angle + all colour stops |
 | `background` / `background-image` | `radial-gradient(…)` | **real PDF radial shading** — all stops |
-| `background` / `background-image` | `conic-gradient(…)` | approximated by 180 flat sectors (slight banding); stops honoured |
+| `background` / `background-image` | `conic-gradient(…)` | a fan of **360** flat 1°-sectors (steps below visual acuity at print resolution — PDF has no native conic shading); stops honoured |
 
 > `background-image: url(…)` (a raster image) **is** painted — it fills the box
 > behind the content (a `data:` URI decodes inline; an external URL is fetched by
