@@ -25,6 +25,118 @@ use crate::font::truetype::TrueTypeFont;
 use crate::html::css::parse_color;
 use crate::html::dom::{self, Element, Node};
 
+mod filter;
+
+// SVG **filter effects** (`filter="url(#…)"`). Implemented as a self-contained
+// raster pipeline in [`filter`]: an element's primitives are rasterized into the
+// filter region, the `fe*` primitive graph runs, and the result is returned as a
+// straight-alpha RGBA [`filter::Raster`] ready to composite back in place.
+//
+// Engine-internal API (no WASM/SDK surface). The PDF-emission seam — placing the
+// returned raster as an image XObject — lives in the page painter / document
+// image path ([`crate::document::Document::add_image`]), which owns the only
+// `&mut Document` and the `Prim`/`SvgImage` value types this module feeds. From
+// here the work is fully testable at the raster level; wiring the one call into
+// that painter is the single remaining integration step. Until then these
+// `pub(crate)` entry points are reachable only from tests, hence `dead_code`.
+#[allow(unused_imports)]
+pub(crate) use filter::{render_filter, Raster as FilterRaster};
+
+/// Apply the filter `#id` (from `svg_src`'s `<filter>` defs) to the first
+/// element that references it, returning the filtered RGBA raster plus the
+/// user-space rectangle `[x, y, w, h]` it covers (for back-compositing).
+///
+/// `device_scale` is the raster resolution in device pixels per user unit. Used
+/// by the HTML/SVG painter to realize `filter` effects; `None` if the id is
+/// unknown or the filtered element has no drawable geometry.
+#[allow(dead_code)]
+pub(crate) fn apply_filter(
+    svg_src: &str,
+    id: &str,
+    device_scale: f64,
+) -> Option<(FilterRaster, [f64; 4])> {
+    let img = parse_svg(svg_src)?;
+    let nodes = dom::parse(svg_src);
+    let svg = find_svg(&nodes)?;
+    let mut filters = filter::Filters::new();
+    filter::collect_filters(&svg.children, &mut filters);
+    // Gather the primitives of the element that references this filter. We
+    // re-walk collecting only that subtree's prims (in viewBox space).
+    let prims = filtered_subtree_prims(svg, id)?;
+    let prims = if prims.is_empty() { img.prims } else { prims };
+    render_filter(id, &prims, &filters, device_scale)
+}
+
+/// Collect the primitives produced by the first element whose `filter` attribute
+/// references `#id` (its whole subtree, with transforms baked into viewBox
+/// space). Empty when no such element is found. Builds the same gradient / id /
+/// pattern registries `from_element` does so `<use>`, gradients and patterns
+/// resolve inside the filtered subtree exactly as in normal rendering.
+#[allow(dead_code)]
+fn filtered_subtree_prims(svg: &Element, id: &str) -> Option<Vec<Prim>> {
+    let mut grads = Grads::new();
+    collect_gradients(&svg.children, &mut grads);
+    let mut ids: std::collections::HashMap<&str, &Node> = std::collections::HashMap::new();
+    collect_ids(&svg.children, &mut ids);
+    let mut pats = Pats::new();
+    collect_patterns(&svg.children, &mut pats);
+    let mut out = Vec::new();
+    find_filtered(
+        &svg.children,
+        Mat::identity(),
+        Paint::root(),
+        &ids,
+        &grads,
+        &pats,
+        id,
+        &mut out,
+    );
+    Some(out)
+}
+
+/// Recursive search for the element referencing filter `#id`. `ancestor_ctm` is
+/// the transform of all *enclosing* groups (not the element's own). On a match,
+/// `walk` is invoked on that single node from `ancestor_ctm` (depth 0), so it
+/// re-applies the element's own `transform` exactly once. Returns `true` once
+/// matched.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn find_filtered<'a>(
+    nodes: &'a [Node],
+    ancestor_ctm: Mat,
+    paint: Paint,
+    ids: &std::collections::HashMap<&'a str, &'a Node>,
+    grads: &Grads,
+    pats: &Pats,
+    id: &str,
+    out: &mut Vec<Prim>,
+) -> bool {
+    for n in nodes {
+        let Node::Element(e) = n else { continue };
+        let inherited = inherit_paint(e, paint);
+        if filter::filter_url(e).as_deref() == Some(id) {
+            walk(
+                std::slice::from_ref(n),
+                ancestor_ctm,
+                paint,
+                ids,
+                grads,
+                pats,
+                out,
+                0,
+            );
+            return true;
+        }
+        let child_ctm = match e.attr("transform") {
+            Some(t) => ancestor_ctm.then(&parse_transform(t)),
+            None => ancestor_ctm,
+        };
+        if find_filtered(&e.children, child_ctm, inherited, ids, grads, pats, id, out) {
+            return true;
+        }
+    }
+    false
+}
+
 /// A 2×3 affine `[a b c d e f]` mapping `(x,y) → (a·x+c·y+e, b·x+d·y+f)`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Mat {
@@ -2495,5 +2607,51 @@ mod tests {
             }
         }
         false
+    }
+
+    // ── filter effects (end-to-end through `apply_filter`) ────────────────────
+
+    #[test]
+    fn apply_filter_runs_named_filter_on_referencing_element() {
+        // A red rect references a Gaussian-blur filter; the public entry parses
+        // the markup, isolates the filtered element's prims, runs the pipeline,
+        // and returns a blurred raster covering the (expanded) filter region.
+        let svg = r##"<svg viewBox="0 0 80 80">
+            <filter id="blur" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="3"/>
+            </filter>
+            <rect x="20" y="20" width="40" height="40" fill="#ff0000" filter="url(#blur)"/>
+        </svg>"##;
+        let (raster, region) = apply_filter(svg, "blur", 1.0).expect("filter applied");
+        // Region encloses the rect's bbox (20,20)..(60,60) with the -20%/140% pad.
+        assert!(
+            region[0] < 20.0 && region[1] < 20.0,
+            "region origin pads the bbox"
+        );
+        assert!(
+            region[2] >= 40.0 && region[3] >= 40.0,
+            "region spans at least the bbox"
+        );
+        // Center stays mostly opaque; the blur produces partial-alpha falloff
+        // somewhere (soft edge). (Index the `pub(crate)` RGBA buffer directly.)
+        let alpha_at = |x: usize, y: usize| raster.px[(y * raster.w + x) * 4 + 3];
+        let center_a = alpha_at(raster.w / 2, raster.h / 2);
+        assert!(center_a > 0.7, "blurred fill stays mostly opaque at center");
+        let has_falloff = (0..raster.w * raster.h)
+            .map(|p| raster.px[p * 4 + 3])
+            .any(|a| a > 0.05 && a < 0.95);
+        assert!(
+            has_falloff,
+            "Gaussian blur yields a soft, partial-alpha edge"
+        );
+    }
+
+    #[test]
+    fn apply_filter_unknown_id_is_none() {
+        let svg = r##"<svg viewBox="0 0 10 10"><rect width="10" height="10" fill="#000"/></svg>"##;
+        assert!(
+            apply_filter(svg, "missing", 1.0).is_none(),
+            "unknown filter id → None"
+        );
     }
 }
