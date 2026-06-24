@@ -25,6 +25,10 @@ pub struct Slide {
     pub placeholders: Vec<Placeholder>,
     /// Speaker notes, as document blocks.
     pub notes: Option<Vec<Block>>,
+    /// Full-slide background fill colour as RGB `0.0..=1.0`, when the source set
+    /// a solid (or first-stop gradient) page fill — PPTX `p:bg`/`p:bgPr`/`p:bgRef`
+    /// or ODP `draw:page` (page or master) fill. `None` leaves the slide white.
+    pub background: Option<[f64; 3]>,
 }
 
 /// A layout placeholder: a [`Block`] tagged with its semantic [`PlaceholderRole`].

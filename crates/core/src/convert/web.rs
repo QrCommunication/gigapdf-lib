@@ -449,6 +449,20 @@ fn html_slides(slides: &SlideBlock, doc: &Document, out: &mut String) {
 
 fn html_slide(slide: &Slide, doc: &Document, out: &mut String) {
     out.push_str("<section>");
+    // Slide background fill (`Slide::background`): a full-coverage,
+    // absolutely-positioned backdrop `<div>` emitted first so it paints behind the
+    // slide content. Sized to the slide geometry; the engine clips any overflow.
+    if let Some([r, g, b]) = slide.background {
+        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        out.push_str(&format!(
+            "<div style=\"position:absolute;left:0;top:0;width:{:.0}pt;height:{:.0}pt;background:#{:02X}{:02X}{:02X}\"></div>",
+            slide.geometry.width,
+            slide.geometry.height,
+            q(r),
+            q(g),
+            q(b)
+        ));
+    }
     for ph in &slide.placeholders {
         html_block(&ph.block, doc, out);
     }
@@ -558,6 +572,51 @@ mod tests {
         assert!(
             html.contains("background-color:#FFFF00") && html.contains("lit"),
             "the highlighted run is emitted with its background: {html}"
+        );
+    }
+
+    #[test]
+    fn html_from_model_paints_slide_background() {
+        // A `Slide::background` (#51) becomes a full-coverage absolutely-positioned
+        // backdrop `<div>` inside the slide `<section>`, so a coloured deck no
+        // longer renders white. Slide geometry 720×540pt.
+        use crate::model::{Page, PageGeometry, Section, Slide, SlideBlock};
+        let slide = Slide {
+            geometry: PageGeometry {
+                width: 720.0,
+                height: 540.0,
+                ..PageGeometry::default()
+            },
+            background: Some([0.125, 0.305, 0.474]), // ≈ #204E79
+            ..Slide::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains("position:absolute"),
+            "backdrop positioned: {html}"
+        );
+        assert!(
+            html.contains("width:720pt") && html.contains("height:540pt"),
+            "covers slide: {html}"
+        );
+        assert!(
+            html.contains("background:#204E79"),
+            "fill colour painted: {html}"
         );
     }
 }

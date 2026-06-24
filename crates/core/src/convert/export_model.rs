@@ -3219,6 +3219,7 @@ fn collect_slides(doc: &Document) -> Vec<Slide> {
                     block: body_block,
                 }],
                 notes: None,
+                background: None,
             });
         }
     }
@@ -5294,6 +5295,7 @@ mod tests {
                 block: para("Slide title"),
             }],
             notes: None,
+            background: None,
         };
         let doc = Document {
             sections: vec![Section {
@@ -5393,6 +5395,7 @@ mod tests {
                 block: para("Body text"),
             }],
             notes: None,
+            background: None,
         };
         let doc = Document {
             sections: vec![Section {
@@ -6620,6 +6623,7 @@ mod tests {
                 block: para("T"),
             }],
             notes: None,
+            background: None,
         };
         Document {
             meta: meta_doc().meta,

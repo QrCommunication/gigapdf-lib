@@ -918,6 +918,7 @@ impl Writer {
         self.arr_close();
         self.key("notes");
         self.opt_blocks(&s.notes);
+        self.k_opt_rgb("background", &s.background);
         self.obj_close();
     }
 
@@ -2060,6 +2061,7 @@ impl<'a> Reader<'a> {
                 "shapes" => s.shapes = r.array(Reader::block)?,
                 "placeholders" => s.placeholders = r.array(Reader::placeholder)?,
                 "notes" => s.notes = r.opt_blocks()?,
+                "background" => s.background = r.opt_rgb()?,
                 _ => return None,
             }
             Some(())
@@ -2527,6 +2529,7 @@ mod tests {
                     rotation: Rotation::D0,
                     kind: BlockKind::Paragraph(Paragraph::default()),
                 }]),
+                background: Some([0.125, 0.219, 0.392]),
             }],
         };
 

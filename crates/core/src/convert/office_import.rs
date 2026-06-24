@@ -1661,24 +1661,30 @@ fn pptx_slide_model(
 ) -> Slide {
     let inherit = PptxPlaceholderGeom::resolve(zip, rels, n);
     let mut acc = PptxSlideAcc::default();
+    let mut background: Option<[f64; 3]> = None;
     let mut x = Xml::new(xml);
-    // Enter at the shape tree (skip the cSld/bg preamble); the recursive walker
-    // consumes `p:spTree`'s children and any nested groups.
+    // Read the slide background fill (`p:bg`, in the `p:cSld` preamble) then enter
+    // the shape tree; the recursive walker consumes `p:spTree`'s children and any
+    // nested groups. `p:bg` always precedes `p:spTree` in `p:cSld`.
     while let Some(tok) = x.next() {
         if let Tok::Open(name, _, sc) = &tok {
-            if local(name) == "spTree" && !sc {
-                pptx_walk_sptree(
-                    &mut x,
-                    zip,
-                    rels,
-                    theme,
-                    geom,
-                    resources,
-                    &inherit,
-                    IDENTITY_XFRM,
-                    &mut acc,
-                );
-                break;
+            match local(name) {
+                "bg" if !sc => background = pptx_bg_color(&mut x, theme),
+                "spTree" if !sc => {
+                    pptx_walk_sptree(
+                        &mut x,
+                        zip,
+                        rels,
+                        theme,
+                        geom,
+                        resources,
+                        &inherit,
+                        IDENTITY_XFRM,
+                        &mut acc,
+                    );
+                    break;
+                }
+                _ => {}
             }
         }
     }
@@ -1688,7 +1694,41 @@ fn pptx_slide_model(
         shapes: acc.shapes,
         placeholders: acc.placeholders,
         notes: None,
+        background,
     }
+}
+
+/// Resolve a slide background `p:bg` (open consumed) to a single RGB fill colour
+/// for [`Slide::background`]. Handles the three forms that carry a concrete
+/// colour: an explicit `p:bgPr/a:solidFill`, the **first stop** of a
+/// `p:bgPr/a:gradFill` (the dominant visible colour), and a theme `p:bgRef`
+/// whose own `a:srgbClr`/`a:schemeClr` colour overrides the indexed style. The
+/// first `a:srgbClr`/`a:schemeClr` found inside the `p:bg` wins (which is the
+/// first gradient stop, or the sole solid colour). Picture/tile/blip fills are
+/// out of scope (→ `None`). Consumes up to `</p:bg>`.
+fn pptx_bg_color(x: &mut Xml, theme: &PptxTheme) -> Option<[f64; 3]> {
+    let mut color: Option<[f64; 3]> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "srgbClr" if color.is_none() => {
+                    color = attr(&attrs, "val")
+                        .filter(|v| is_hex6(v))
+                        .and_then(hex_to_rgb_f64);
+                }
+                "schemeClr" if color.is_none() => {
+                    color = attr(&attrs, "val")
+                        .and_then(|v| theme.resolve_scheme(v))
+                        .as_deref()
+                        .and_then(hex_to_rgb_f64);
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "bg" => break,
+            _ => {}
+        }
+    }
+    color
 }
 
 /// Accumulated slide content: semantic placeholders vs free-floating shapes.
@@ -3758,13 +3798,28 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     styles.extend(odf_text_styles(&content));
     let geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
 
+    // Drawing-page fill colours (`styles.xml` + `content.xml`) and master-page →
+    // drawing-page-style links, so each `draw:page` can resolve its background
+    // from its own `draw:style-name`, falling back to its master page.
+    let mut page_fills = odf_drawing_page_fills(&styles_xml);
+    page_fills.extend(odf_drawing_page_fills(&content));
+    let master_styles = odf_master_page_styles(&styles_xml);
+
     let mut slides: Vec<Slide> = Vec::new();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
     let mut x = Xml::new(&content);
     while let Some(tok) = x.next() {
-        if let Tok::Open(name, _, sc) = &tok {
+        if let Tok::Open(name, attrs, sc) = &tok {
             if local(name) == "page" && !sc {
-                slides.push(odp_page_model(&mut x, zip, &styles, geom, &mut resources));
+                let background = odp_page_background(attrs, &page_fills, &master_styles);
+                slides.push(odp_page_model(
+                    &mut x,
+                    zip,
+                    &styles,
+                    geom,
+                    background,
+                    &mut resources,
+                ));
             }
         }
     }
@@ -3783,12 +3838,14 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 /// placeholders (the legacy flow layout). Positioned `draw:frame`s become
 /// absolutely-placed shapes in [`Slide::shapes`] (geometry from `svg:x/y/
 /// width/height`), and `draw:g` groups are descended recursively, the group's
-/// own `svg:x/y` composed onto the children's positions. Mirrors [`odp_page`].
+/// own `svg:x/y` composed onto the children's positions. `background` is the
+/// resolved page/master fill (computed by the caller). Mirrors [`odp_page`].
 fn odp_page_model(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
     geom: PageGeom,
+    background: Option<[f64; 3]>,
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Slide {
     let mut placeholders: Vec<model::Placeholder> = Vec::new();
@@ -3881,6 +3938,7 @@ fn odp_page_model(
         shapes,
         placeholders,
         notes: None,
+        background,
     }
 }
 
@@ -8877,6 +8935,99 @@ fn odf_text_styles(xml: &str) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// Build a `drawing-page-style-name → background RGB` map from an ODF part
+/// (`styles.xml` or `content.xml`). Reads each `style:style` of family
+/// `drawing-page` whose `style:drawing-page-properties` declares a solid fill
+/// (`draw:fill="solid"` — or omitted but with a colour present — and a 6-hex
+/// `draw:fill-color`). `draw:fill="none"`/`bitmap`/`gradient`/`hatch` are skipped
+/// (gradient/bitmap page fills are deferred — they reference a named fill style).
+fn odf_drawing_page_fills(xml: &str) -> BTreeMap<String, [f64; 3]> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    // The current `style:style`: its name plus whether it is family `drawing-page`
+    // (only those carry a page background fill).
+    let mut cur_name: Option<String> = None;
+    let mut is_page_family = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => {
+                    cur_name = attr(&attrs, "name").map(str::to_string);
+                    is_page_family = attr(&attrs, "family") == Some("drawing-page");
+                }
+                "drawing-page-properties" => {
+                    if let Some(nm) = cur_name.clone() {
+                        if is_page_family {
+                            if let Some(rgb) = odf_solid_fill_rgb(&attrs) {
+                                map.insert(nm, rgb);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "style" => {
+                cur_name = None;
+                is_page_family = false;
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+/// Resolve a `style:drawing-page-properties`' solid fill to an RGB colour: the
+/// `draw:fill-color` (6-hex) when `draw:fill` is `solid` (or absent — LibreOffice
+/// often omits it while still setting a colour). Any other `draw:fill`
+/// (`none`/`gradient`/`bitmap`/`hatch`) yields `None`.
+fn odf_solid_fill_rgb(attrs: &[(String, String)]) -> Option<[f64; 3]> {
+    match attr(attrs, "fill") {
+        Some("solid") | None => {}
+        _ => return None,
+    }
+    let raw = attr(attrs, "fill-color")?.trim().trim_start_matches('#');
+    if is_hex6(raw) {
+        hex_to_rgb_f64(raw)
+    } else {
+        None
+    }
+}
+
+/// Build a `master-page-name → drawing-page-style-name` map from an ODF part
+/// (`styles.xml`). Each `style:master-page` names a `draw:style-name` carrying
+/// its page background; a `draw:page` without its own fill inherits this.
+fn odf_master_page_styles(xml: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == "master-page" {
+                if let (Some(nm), Some(sty)) = (attr(&attrs, "name"), attr(&attrs, "style-name")) {
+                    map.insert(nm.to_string(), sty.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Resolve a `draw:page`'s background from its open-tag attributes: its own
+/// `draw:style-name` fill first, else its `draw:master-page-name`'s master
+/// drawing-page-style fill. `None` when neither resolves to a solid colour.
+fn odp_page_background(
+    page_attrs: &[(String, String)],
+    page_fills: &BTreeMap<String, [f64; 3]>,
+    master_styles: &BTreeMap<String, String>,
+) -> Option<[f64; 3]> {
+    if let Some(rgb) = attr(page_attrs, "style-name").and_then(|s| page_fills.get(s)) {
+        return Some(*rgb);
+    }
+    attr(page_attrs, "master-page-name")
+        .and_then(|m| master_styles.get(m))
+        .and_then(|s| page_fills.get(s))
+        .copied()
 }
 
 /// True when an ODF text style declares an active strikethrough:
@@ -15380,5 +15531,182 @@ mod tests {
             "single flip leaves rotation unchanged"
         );
         assert!(slide.shapes[0].frame.is_some(), "frame still placed");
+    }
+
+    // ── #51: slide/page background fill (PPTX p:bg, ODP draw:page) ──
+
+    /// Approximate equality for an RGB triple against an expected `#RRGGBB`.
+    fn assert_bg(actual: Option<[f64; 3]>, hex: &str) {
+        let exp = hex_to_rgb_f64(hex).expect("valid expected hex");
+        let got = actual.expect("slide background present");
+        for i in 0..3 {
+            assert!(
+                (got[i] - exp[i]).abs() < 1e-6,
+                "channel {i}: got {got:?} exp {exp:?} (#{hex})"
+            );
+        }
+    }
+
+    #[test]
+    fn pptx_model_slide_background_solid_srgb_reaches_model() {
+        // A `p:cSld/p:bg/p:bgPr/a:solidFill/a:srgbClr` full-slide fill lands in
+        // `Slide::background` as RGB (not dropped as it was before #51).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld>
+              <p:bg><p:bgPr><a:solidFill><a:srgbClr val="203864"/></a:solidFill></p:bgPr></p:bg>
+              <p:spTree>
+                <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm></p:spPr>
+                  <p:txBody><a:p><a:r><a:t>On colour</a:t></a:r></a:p></p:txBody></p:sp>
+              </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_bg(slide.background, "203864");
+        assert_eq!(slide.shapes.len(), 1, "shapes still parsed alongside bg");
+    }
+
+    #[test]
+    fn pptx_model_slide_background_scheme_colour_resolves_via_theme() {
+        // A `a:schemeClr val="accent1"` background resolves through the theme's
+        // colour scheme (accent1 = 4472C4 here).
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld>
+                      <p:bg><p:bgPr><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></p:bgPr></p:bg>
+                      <p:spTree/></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/theme/theme1.xml",
+                    r#"<a:theme xmlns:a="a"><a:themeElements><a:clrScheme name="X">
+                      <a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+                      <a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+                      <a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+                      <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+                      <a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+                      <a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+                      </a:clrScheme></a:themeElements></a:theme>"#,
+                ),
+            ],
+            &[],
+        );
+        assert_bg(slide.background, "4472C4");
+    }
+
+    #[test]
+    fn pptx_model_slide_background_gradient_takes_first_stop() {
+        // A gradient page fill keeps the first stop's colour as the dominant
+        // visible background (image/tile fills remain out of scope → None).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld>
+              <p:bg><p:bgPr><a:gradFill><a:gsLst>
+                <a:gs pos="0"><a:srgbClr val="112233"/></a:gs>
+                <a:gs pos="100000"><a:srgbClr val="FFFFFF"/></a:gs>
+              </a:gsLst></a:gradFill></p:bgPr></p:bg>
+              <p:spTree/></p:cSld></p:sld>"#,
+        );
+        assert_bg(slide.background, "112233");
+    }
+
+    #[test]
+    fn pptx_model_picture_background_yields_none() {
+        // A blip (picture) page fill carries no resolvable colour → background None
+        // (so the slide is not tinted by a stray colour).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld>
+              <p:bg><p:bgPr><a:blipFill><a:blip r:embed="rId9"/></a:blipFill></p:bgPr></p:bg>
+              <p:spTree/></p:cSld></p:sld>"#,
+        );
+        assert!(slide.background.is_none(), "picture fill → no colour");
+    }
+
+    /// Build an ODP whose single `draw:page` has `draw:style-name`/
+    /// `draw:master-page-name` attrs, with the given `styles.xml` `<office:styles>`
+    /// body and `<office:master-styles>` body. Returns the first lowered slide.
+    fn odp_model_slide_styled(page_attrs: &str, styles_body: &str, master_body: &str) -> Slide {
+        let content = format!(
+            r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t" xmlns:svg="sv" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:page-layout style:name="PL"><style:page-layout-properties fo:page-width="25.4cm" fo:page-height="19.05cm" fo:margin="0cm"/></style:page-layout>
+  </office:automatic-styles>
+  <office:body><office:presentation>
+    <draw:page draw:name="p1" {page_attrs}><text:p>Slide body</text:p></draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#
+        );
+        let styles = format!(
+            r#"<office:document-styles xmlns:office="o" xmlns:draw="d" xmlns:style="s" xmlns:fo="f">
+  <office:styles>{styles_body}</office:styles>
+  <office:master-styles>{master_body}</office:master-styles>
+</office:document-styles>"#
+        );
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.presentation",
+        );
+        z.add_stored("content.xml", content.as_bytes());
+        z.add_stored("styles.xml", styles.as_bytes());
+        let model = office_to_model(&z.finish()).expect("odp → model");
+        match model.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Slide(sb) => sb.slides.into_iter().next().expect("one slide"),
+            other => panic!("expected a Slide block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn odp_model_page_solid_fill_reaches_model() {
+        // A `draw:page` whose own `draw:style-name` (family drawing-page) declares
+        // `draw:fill="solid"` + `draw:fill-color` → that colour in Slide::background.
+        let slide = odp_model_slide_styled(
+            r#"draw:style-name="dp1""#,
+            r##"<style:style style:name="dp1" style:family="drawing-page">
+                 <style:drawing-page-properties draw:fill="solid" draw:fill-color="#1F4E79"/>
+               </style:style>"##,
+            "",
+        );
+        assert_bg(slide.background, "1F4E79");
+    }
+
+    #[test]
+    fn odp_model_page_inherits_master_background() {
+        // A `draw:page` with NO own fill, only a `draw:master-page-name`, inherits
+        // the master page's drawing-page-style fill colour.
+        let slide = odp_model_slide_styled(
+            r#"draw:master-page-name="Default""#,
+            r##"<style:style style:name="dpMaster" style:family="drawing-page">
+                 <style:drawing-page-properties draw:fill="solid" draw:fill-color="#C00000"/>
+               </style:style>"##,
+            r#"<style:master-page style:name="Default" draw:style-name="dpMaster"/>"#,
+        );
+        assert_bg(slide.background, "C00000");
+    }
+
+    #[test]
+    fn odp_model_page_own_fill_overrides_master() {
+        // The page's own `draw:style-name` fill wins over its master's.
+        let slide = odp_model_slide_styled(
+            r#"draw:style-name="dpPage" draw:master-page-name="Default""#,
+            r##"<style:style style:name="dpPage" style:family="drawing-page">
+                 <style:drawing-page-properties draw:fill="solid" draw:fill-color="#00B050"/>
+               </style:style>
+               <style:style style:name="dpMaster" style:family="drawing-page">
+                 <style:drawing-page-properties draw:fill="solid" draw:fill-color="#C00000"/>
+               </style:style>"##,
+            r#"<style:master-page style:name="Default" draw:style-name="dpMaster"/>"#,
+        );
+        assert_bg(slide.background, "00B050");
+    }
+
+    #[test]
+    fn odp_model_page_fill_none_yields_no_background() {
+        // `draw:fill="none"` (an explicitly empty page) leaves the slide white.
+        let slide = odp_model_slide_styled(
+            r#"draw:style-name="dpNone""#,
+            r##"<style:style style:name="dpNone" style:family="drawing-page">
+                 <style:drawing-page-properties draw:fill="none" draw:fill-color="#1F4E79"/>
+               </style:style>"##,
+            "",
+        );
+        assert!(slide.background.is_none(), "fill=none → no background");
     }
 }
