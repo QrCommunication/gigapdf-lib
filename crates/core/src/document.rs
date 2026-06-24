@@ -1325,6 +1325,51 @@ impl AfRelationship {
 /// Returned by `Document::embedded_files_state` for every attachment mutation.
 type EmbeddedFilesState = (Option<ObjectId>, Dictionary, Vec<(Vec<u8>, Object)>);
 
+/// One colour stop of a [`GradientSpec`] — an `offset` in `0.0..=1.0` along the
+/// gradient axis and an RGB `color` (components `0.0..=1.0`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    /// Position along the axis, `0.0` (start) … `1.0` (end).
+    pub offset: f64,
+    /// The colour at this stop (RGB, `0.0..=1.0`).
+    pub color: [f64; 3],
+}
+
+/// The geometry of a gradient (ISO 32000-1 §8.7.4.5): an **axial** (linear, type 2)
+/// gradient between two points, or a **radial** (type 3) gradient between two
+/// circles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GradientKind {
+    /// Axial gradient along the segment `(x0, y0) → (x1, y1)`.
+    Linear { x0: f64, y0: f64, x1: f64, y1: f64 },
+    /// Radial gradient between circle `(x0, y0, r0)` and circle `(x1, y1, r1)`.
+    Radial {
+        x0: f64,
+        y0: f64,
+        r0: f64,
+        x1: f64,
+        y1: f64,
+        r1: f64,
+    },
+}
+
+/// A gradient fill for [`Document::add_gradient`]: a [`GradientKind`] geometry,
+/// at least two colour `stops`, the `rect` `[x, y, w, h]` to paint, whether to
+/// `extend` the gradient past its ends, and a fill `opacity`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradientSpec {
+    /// Axial or radial geometry.
+    pub kind: GradientKind,
+    /// Colour stops (≥ 2; sorted by offset on use).
+    pub stops: Vec<GradientStop>,
+    /// The rectangle `[x, y, width, height]` filled with the gradient.
+    pub rect: [f64; 4],
+    /// Extend the gradient before the first / after the last stop (`/Extend`).
+    pub extend: (bool, bool),
+    /// Fill opacity, `0.0..=1.0` (`1.0` = opaque).
+    pub opacity: f64,
+}
+
 /// One outline bookmark for [`Document::set_bookmarks`]: a `title`, a nesting
 /// `level` (0 = top), and an optional [`Action`] (a destination jump or any other
 /// action). A `None` action makes a plain, non-clickable heading.
@@ -7488,6 +7533,122 @@ impl Document {
         let ops = content::ellipse_ops(cx, cy, rx, ry, stroke, fill, line_width);
         let ops = self.with_opacity(page_no, ops, opacity)?;
         self.append_page_content(page_no, &ops)
+    }
+
+    /// Paint a linear or radial **gradient** (ISO 32000-1 §8.7.4 shading,
+    /// §8.7.3 pattern) over `spec.rect` on `page_no`. The colour stops become a
+    /// PDF interpolation function (a type-2 exponential for two stops, a type-3
+    /// stitching function for more); the shading is registered as a
+    /// `PatternType 2` shading pattern and the rectangle is filled with it.
+    /// DeviceRGB colour space; stop offsets are taken in `0.0..=1.0`.
+    pub fn add_gradient(&mut self, page_no: u32, spec: &GradientSpec) -> Result<()> {
+        if spec.stops.len() < 2 {
+            return Err(EngineError::InvalidArgument(
+                "a gradient needs at least two colour stops".into(),
+            ));
+        }
+        let mut stops = spec.stops.clone();
+        stops.sort_by(|a, b| {
+            a.offset
+                .partial_cmp(&b.offset)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 1. Colour interpolation function + shading dictionary.
+        let mut shading = Dictionary::new();
+        shading.set(b"ColorSpace".to_vec(), annot::name(b"DeviceRGB"));
+        shading.set(b"Function".to_vec(), Self::gradient_function(&stops));
+        shading.set(
+            b"Extend".to_vec(),
+            Object::Array(vec![
+                Object::Boolean(spec.extend.0),
+                Object::Boolean(spec.extend.1),
+            ]),
+        );
+        match spec.kind {
+            GradientKind::Linear { x0, y0, x1, y1 } => {
+                shading.set(b"ShadingType".to_vec(), Object::Integer(2));
+                shading.set(b"Coords".to_vec(), annot::real_array(&[x0, y0, x1, y1]));
+            }
+            GradientKind::Radial {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+            } => {
+                shading.set(b"ShadingType".to_vec(), Object::Integer(3));
+                shading.set(
+                    b"Coords".to_vec(),
+                    annot::real_array(&[x0, y0, r0, x1, y1, r1]),
+                );
+            }
+        }
+
+        // 2. A PatternType 2 (shading) pattern in the page's /Pattern resources.
+        let mut pattern = Dictionary::new();
+        pattern.set(b"Type".to_vec(), annot::name(b"Pattern"));
+        pattern.set(b"PatternType".to_vec(), Object::Integer(2));
+        pattern.set(b"Shading".to_vec(), Object::Dictionary(shading));
+        let name =
+            self.register_page_resource(page_no, b"Pattern", "Gr", Object::Dictionary(pattern))?;
+
+        // 3. Fill the rectangle with the pattern.
+        let [x, y, w, h] = spec.rect;
+        let mut ops = Vec::new();
+        ops.extend_from_slice(b"q\n/Pattern cs\n/");
+        ops.extend_from_slice(&name);
+        ops.extend_from_slice(b" scn\n");
+        ops.extend_from_slice(
+            format!(
+                "{} {} {} {} re\n",
+                content::num(x),
+                content::num(y),
+                content::num(w),
+                content::num(h)
+            )
+            .as_bytes(),
+        );
+        ops.extend_from_slice(b"f\nQ\n");
+        let ops = self.with_opacity(page_no, ops, spec.opacity)?;
+        self.append_page_content(page_no, &ops)
+    }
+
+    /// Build the colour interpolation function for a gradient's (sorted) stops:
+    /// a type-2 exponential for exactly two stops, else a type-3 stitching
+    /// function over `[0, 1]` whose `/Bounds` are the interior stop offsets.
+    fn gradient_function(stops: &[GradientStop]) -> Object {
+        let exp2 = |c0: [f64; 3], c1: [f64; 3]| -> Object {
+            let mut f = Dictionary::new();
+            f.set(b"FunctionType".to_vec(), Object::Integer(2));
+            f.set(b"Domain".to_vec(), annot::real_array(&[0.0, 1.0]));
+            f.set(b"C0".to_vec(), annot::real_array(&c0));
+            f.set(b"C1".to_vec(), annot::real_array(&c1));
+            f.set(b"N".to_vec(), Object::Integer(1));
+            Object::Dictionary(f)
+        };
+        if stops.len() == 2 {
+            return exp2(stops[0].color, stops[1].color);
+        }
+        let mut funcs = Vec::new();
+        let mut bounds = Vec::new();
+        let mut encode = Vec::new();
+        for i in 0..stops.len() - 1 {
+            funcs.push(exp2(stops[i].color, stops[i + 1].color));
+            if i > 0 {
+                bounds.push(Object::Real(stops[i].offset.clamp(0.0, 1.0)));
+            }
+            encode.push(Object::Real(0.0));
+            encode.push(Object::Real(1.0));
+        }
+        let mut f = Dictionary::new();
+        f.set(b"FunctionType".to_vec(), Object::Integer(3));
+        f.set(b"Domain".to_vec(), annot::real_array(&[0.0, 1.0]));
+        f.set(b"Functions".to_vec(), Object::Array(funcs));
+        f.set(b"Bounds".to_vec(), Object::Array(bounds));
+        f.set(b"Encode".to_vec(), Object::Array(encode));
+        Object::Dictionary(f)
     }
 
     /// Draw a polyline / polygon through `points` (flat `[x0, y0, x1, y1, …]`
@@ -17993,6 +18154,104 @@ mod tests {
             Document::open(&encrypted).is_err(),
             "wrong password must be rejected"
         );
+    }
+
+    #[test]
+    fn add_gradient_paints_linear_and_radial_and_round_trips() {
+        let mut doc = blank_doc();
+        doc.add_gradient(
+            1,
+            &GradientSpec {
+                kind: GradientKind::Linear {
+                    x0: 50.0,
+                    y0: 50.0,
+                    x1: 250.0,
+                    y1: 50.0,
+                },
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: [1.0, 0.0, 0.0],
+                    },
+                    GradientStop {
+                        offset: 0.5,
+                        color: [0.0, 1.0, 0.0],
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: [0.0, 0.0, 1.0],
+                    },
+                ],
+                rect: [50.0, 40.0, 200.0, 60.0],
+                extend: (true, true),
+                opacity: 1.0,
+            },
+        )
+        .unwrap();
+        doc.add_gradient(
+            1,
+            &GradientSpec {
+                kind: GradientKind::Radial {
+                    x0: 150.0,
+                    y0: 200.0,
+                    r0: 0.0,
+                    x1: 150.0,
+                    y1: 200.0,
+                    r1: 80.0,
+                },
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: [1.0, 1.0, 1.0],
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: [0.2, 0.2, 0.8],
+                    },
+                ],
+                rect: [70.0, 120.0, 160.0, 160.0],
+                extend: (true, true),
+                opacity: 0.9,
+            },
+        )
+        .unwrap();
+
+        let bytes = doc.save();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("/ShadingType 2"), "axial shading written");
+        assert!(s.contains("/ShadingType 3"), "radial shading written");
+        assert!(s.contains("/PatternType 2"), "shading pattern written");
+        assert!(s.contains("/Pattern cs"), "pattern colour space selected");
+
+        let reopened = Document::open(&bytes).unwrap();
+        assert_eq!(reopened.page_count(), 1);
+        let content = String::from_utf8_lossy(&reopened.page_content(1).unwrap()).into_owned();
+        assert!(
+            content.contains("scn"),
+            "pattern fill op present after reopen"
+        );
+
+        // Fewer than two stops is rejected.
+        assert!(doc
+            .add_gradient(
+                1,
+                &GradientSpec {
+                    kind: GradientKind::Linear {
+                        x0: 0.0,
+                        y0: 0.0,
+                        x1: 1.0,
+                        y1: 0.0,
+                    },
+                    stops: vec![GradientStop {
+                        offset: 0.0,
+                        color: [0.0, 0.0, 0.0],
+                    }],
+                    rect: [0.0, 0.0, 1.0, 1.0],
+                    extend: (false, false),
+                    opacity: 1.0,
+                },
+            )
+            .is_err());
     }
 
     #[test]

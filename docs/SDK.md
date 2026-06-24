@@ -220,6 +220,7 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 | `addRectangle(page, x, y, w, h, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Vector rectangle. `stroke`/`fill` are `0xRRGGBB` or `null`. |
 | `addEllipse(page, cx, cy, rx, ry, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Vector ellipse (Bézier). |
 | `addPolygon(page, points, close, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Polyline/polygon from a flat `[x0,y0,x1,y1,…]` list. |
+| `addGradient(page, spec)` | `boolean` | Paint a **linear** or **radial** gradient over `spec.rect`. `spec = { kind: "linear"\|"radial", coords, stops, rect, extend?, opacity? }` — `coords` is `[x0,y0,x1,y1]` (linear) or `[x0,y0,r0,x1,y1,r1]` (radial); `stops` is ≥ 2 `{ offset (0…1), rgb }`. Rendered as a shading pattern (ISO 32000-1 §8.7.4/§8.7.3). `false` for < 2 stops. |
 | `addPath(page, svgPath, ox, oy, stroke?, fill?, lineWidth?, opacity?)` | `boolean` | Draw an SVG `<path d="…">` anchored at `(ox,oy)` (Y-flipped, `pdf-lib` convention). |
 | `drawLine(page, x1, y1, x2, y2, rgb?, lineWidth?, opacity?)` | `boolean` | Straight line. |
 | `addSvg(page, svg, x, y, w, h)` | `boolean` | Render SVG markup as **native vector paths** fitting its `viewBox` into `(x,y,w,h)`. |
@@ -577,7 +578,7 @@ import type {
   ImageElementInfo, VectorPathInfo, PathSegment, PdfPermissions,
   SearchHit, AnnotationInfo, FieldInfo, FieldKind, FieldStyle, RadioOption,
   LinkInfo, LayerInfo, OutlineEntry, NamedDest, Action, Destination, Bookmark,
-  SignatureInfo, SignatureReport, Attachment, XlsxSheet, DecodedImage,
+  SignatureInfo, SignatureReport, GradientSpec, GradientStop, Attachment, XlsxSheet, DecodedImage,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,
   // unified editable model:

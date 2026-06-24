@@ -7,6 +7,32 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.82.0] - 2026-06-24
+
+Gradient **authoring** — the rasterizer could already render shadings, but there
+was no API to *produce* them. Resolves
+[#12](https://github.com/qrcommunication/gigapdf-lib/issues/12) (gradients; tiling
+patterns / blend-mode authoring deferred — see notes).
+
+### Added
+
+- **`Document::add_gradient(page, &GradientSpec)`** — paints a **linear** (axial,
+  shading type 2) or **radial** (type 3) gradient over a rectangle, as a
+  `PatternType 2` shading pattern (ISO 32000-1 §8.7.4 / §8.7.3). The colour stops
+  compile to a PDF interpolation function (a type-2 exponential for two stops, a
+  type-3 stitching function for more). New `GradientSpec` / `GradientKind` /
+  `GradientStop` types.
+- `gp_add_gradient` (kind + flat coords + parallel stop offset/colour arrays) /
+  `doc.addGradient(page, { kind, coords, stops, rect, extend?, opacity? })`.
+
+### Notes
+
+- The produced shading patterns + PDF functions pass `qpdf --check` ("No syntax or
+  stream encoding errors found").
+- **Tiling patterns** (PatternType 1), **blend-mode authoring** (`/BM`, `/CA`),
+  transparency-group authoring and the renderer's four non-separable blend modes
+  are deferred — only gradient fills ship here.
+
 ## [0.81.0] - 2026-06-24
 
 Compact output — **object streams** + a **cross-reference stream** (PDF 1.5+,

@@ -4,6 +4,21 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.82.0] - 2026-06-24
+
+Gradient authoring. Resolves
+[#12](https://github.com/qrcommunication/gigapdf-lib/issues/12) (gradients;
+tiling patterns / blend modes deferred).
+
+### Added
+
+- **`addGradient(page, spec)`.** Paint a **linear** or **radial** gradient over a
+  rectangle. `spec = { kind: "linear" | "radial", coords, stops, rect, extend?,
+  opacity? }` — `coords` is `[x0,y0,x1,y1]` (linear) or `[x0,y0,r0,x1,y1,r1]`
+  (radial); `stops` is ≥ 2 `{ offset, rgb }`. Rendered as a shading pattern (ISO
+  32000-1 §8.7.4/§8.7.3); the stops compile to a PDF interpolation function.
+- New exported types **`GradientSpec`** and **`GradientStop`**.
+
 ## [0.81.0] - 2026-06-24
 
 Compact output — object streams + cross-reference stream. Resolves

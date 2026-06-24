@@ -2217,6 +2217,30 @@ export interface HeaderFooterSpec {
 
 const RGB = (rgb: number) => rgb & 0xffffff;
 
+/** One colour stop of a {@link GradientSpec}. */
+export interface GradientStop {
+  /** Position along the gradient axis, `0`…`1`. */
+  offset: number;
+  /** Colour, packed `0xRRGGBB`. */
+  rgb: number;
+}
+
+/** A gradient fill for {@link GigaPdfDoc.addGradient}. */
+export interface GradientSpec {
+  /** Axial (`"linear"`) or radial geometry. */
+  kind: "linear" | "radial";
+  /** `[x0,y0,x1,y1]` for `"linear"`, `[x0,y0,r0,x1,y1,r1]` for `"radial"`. */
+  coords: number[];
+  /** At least two colour stops. */
+  stops: GradientStop[];
+  /** The rectangle `{ x, y, w, h }` filled with the gradient. */
+  rect: Box;
+  /** Extend before the first / after the last stop (`/Extend`; default `[true, true]`). */
+  extend?: [boolean, boolean];
+  /** Fill opacity `0`…`1` (default `1`). */
+  opacity?: number;
+}
+
 /** Visual styling for a newly-created form field. */
 export interface FieldStyle {
   /** Text size in points; `0` (default) auto-sizes to the field box. */
@@ -2609,6 +2633,41 @@ export class GigaPdfDoc {
         fill === null ? 0 : 1,
         lineWidth,
         opacity
+      ) === 0
+    );
+  }
+
+  /**
+   * Paint a **linear** or **radial** gradient over `rect` on `page` (ISO 32000-1
+   * §8.7.4 shading + §8.7.3 pattern). `coords` is `[x0,y0,x1,y1]` for `"linear"`
+   * or `[x0,y0,r0,x1,y1,r1]` for `"radial"`; `stops` is ≥ 2 colour stops
+   * (`offset` 0…1, `rgb` packed `0xRRGGBB`). `extend` (default `[true,true]`)
+   * sets `/Extend`; `opacity` (default `1`) is the fill alpha.
+   *
+   * @example
+   * doc.addGradient(1, {
+   *   kind: "linear", coords: [50, 50, 250, 50],
+   *   stops: [{ offset: 0, rgb: 0xff0000 }, { offset: 1, rgb: 0x0000ff }],
+   *   rect: { x: 50, y: 40, w: 200, h: 60 },
+   * });
+   */
+  addGradient(page: number, spec: GradientSpec): boolean {
+    const kind = spec.kind === "radial" ? 1 : 0;
+    const offsets = spec.stops.map((s) => s.offset);
+    const colors = spec.stops.map((s) => RGB(s.rgb));
+    const [es, ee] = spec.extend ?? [true, true];
+    const opacity = spec.opacity ?? 1;
+    const r = spec.rect;
+    return (
+      this.g._withF64(spec.coords, (cp, cc) =>
+        this.g._withF64(offsets, (op, _oc) =>
+          this.g._withU32(colors, (clp, _clc) =>
+            this.ex().gp_add_gradient(
+              this.h, page, kind, cp, cc, op, clp, offsets.length,
+              r.x, r.y, r.w, r.h, es ? 1 : 0, ee ? 1 : 0, opacity
+            )
+          )
+        )
       ) === 0
     );
   }

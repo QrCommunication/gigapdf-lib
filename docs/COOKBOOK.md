@@ -30,6 +30,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 
 - [Redact a sensitive zone (PII)](#redact-a-sensitive-zone-pii) — *v0.52.4*
 - [Styled text: bold · underline · strikethrough · sub/superscript](#styled-text)
+- [Gradient fills (linear & radial)](#gradient-fills-linear--radial) — *v0.82.0*
 - [Read & write running headers and footers](#headers-and-footers)
 - [Set print boxes (TrimBox / BleedBox) for prepress](#print-boxes) — *v0.73.0*
 - [Number pages with labels (roman front matter, prefixes)](#page-labels) — *v0.74.0*
@@ -160,6 +161,49 @@ const edited = giga.applyModelOps(model, [
 > Decorations (`underline`/`strike`) are also first-class fields on the model's
 > `GigaCharStyle`, so the same styling survives a PDF → model → DOCX round-trip,
 > not just a freshly-drawn run.
+
+---
+
+## Gradient fills (linear & radial)
+
+`addGradient` paints a multi-stop linear or radial gradient over a rectangle — a
+shading (type 2/3) rendered through a `PatternType 2` shading pattern, with the
+colour stops compiled to a PDF interpolation function. RGB; `rgb` is `0xRRGGBB`.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Linear: a left-to-right red → green → blue band.
+doc.addGradient(1, {
+  kind: "linear",
+  coords: [72, 700, 522, 700], // [x0, y0, x1, y1] — the gradient axis
+  stops: [
+    { offset: 0,   rgb: 0xff0000 },
+    { offset: 0.5, rgb: 0x00cc00 },
+    { offset: 1,   rgb: 0x0000ff },
+  ],
+  rect: { x: 72, y: 680, w: 450, h: 40 },
+});
+
+// Radial: a soft spotlight (inner circle r0=0 → outer circle r1=120).
+doc.addGradient(1, {
+  kind: "radial",
+  coords: [300, 400, 0, 300, 400, 120], // [x0,y0,r0, x1,y1,r1]
+  stops: [
+    { offset: 0, rgb: 0xffffff },
+    { offset: 1, rgb: 0x1133aa },
+  ],
+  rect: { x: 180, y: 280, w: 240, h: 240 },
+  extend: [true, true],
+  opacity: 0.9,
+});
+
+const out = doc.save();
+doc.close();
+```
+
+> Tiling patterns, blend-mode authoring (`/BM`) and transparency groups are not
+> covered here — only gradient fills.
 
 ---
 

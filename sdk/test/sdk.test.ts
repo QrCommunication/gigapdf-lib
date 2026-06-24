@@ -519,6 +519,55 @@ describe("@qrcommunication/gigapdf-lib", () => {
     }
   });
 
+  it("addGradient: linear + radial shading patterns round-trip", () => {
+    const doc = giga.open(giga.txtToPdf("Gradient"));
+
+    expect(
+      doc.addGradient(1, {
+        kind: "linear",
+        coords: [50, 50, 250, 50],
+        stops: [
+          { offset: 0, rgb: 0xff0000 },
+          { offset: 0.5, rgb: 0x00ff00 },
+          { offset: 1, rgb: 0x0000ff },
+        ],
+        rect: { x: 50, y: 40, w: 200, h: 60 },
+      })
+    ).toBe(true);
+    expect(
+      doc.addGradient(1, {
+        kind: "radial",
+        coords: [150, 200, 0, 150, 200, 80],
+        stops: [
+          { offset: 0, rgb: 0xffffff },
+          { offset: 1, rgb: 0x3333cc },
+        ],
+        rect: { x: 70, y: 120, w: 160, h: 160 },
+        opacity: 0.9,
+      })
+    ).toBe(true);
+    // Fewer than two stops is rejected.
+    expect(
+      doc.addGradient(1, {
+        kind: "linear",
+        coords: [0, 0, 1, 0],
+        stops: [{ offset: 0, rgb: 0 }],
+        rect: { x: 0, y: 0, w: 1, h: 1 },
+      })
+    ).toBe(false);
+
+    const bytes = doc.save();
+    doc.close();
+    const s = new TextDecoder("latin1").decode(bytes);
+    expect(s).toContain("/ShadingType 2");
+    expect(s).toContain("/ShadingType 3");
+    expect(s).toContain("/PatternType 2");
+
+    const r = giga.open(bytes);
+    expect(r.pageCount()).toBe(1);
+    r.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

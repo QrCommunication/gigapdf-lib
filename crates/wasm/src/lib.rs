@@ -22,9 +22,9 @@ mod rng;
 
 use gigapdf_core::{
     Action, AfRelationship, Annotation, Bookmark, ContentElement, Document, ElementKind,
-    EmbeddedFontInfo, FieldKind, FormField, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget,
-    Margins, OutlineItem, PageBox, PageLabelRange, PageLabelStyle, Permissions, SearchMatch,
-    TextLayerRun, TextLine, TextRun,
+    EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec, GradientStop,
+    HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox,
+    PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -1500,6 +1500,85 @@ pub extern "C" fn gp_add_ellipse(
     edit(handle, |doc| {
         doc.add_ellipse(page, cx, cy, rx, ry, stroke, fill, line_width, opacity)
     })
+}
+
+/// Paint a gradient over `[rx,ry,rw,rh]` on `page`. `kind` is `0` linear (coords
+/// `[x0,y0,x1,y1]`) or `1` radial (coords `[x0,y0,r0,x1,y1,r1]`). `offsets` (f64)
+/// and `colors` (packed `0xRRGGBB`) are parallel arrays of `stops_count` colour
+/// stops. `extend_start`/`extend_end` flag `/Extend`. `0` on success, `-2` bad
+/// args, `-1` null handle.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_gradient(
+    handle: *mut Document,
+    page: u32,
+    kind: i32,
+    coords_ptr: *const f64,
+    coords_count: usize,
+    offsets_ptr: *const f64,
+    colors_ptr: *const u32,
+    stops_count: usize,
+    rx: f64,
+    ry: f64,
+    rw: f64,
+    rh: f64,
+    extend_start: i32,
+    extend_end: i32,
+    opacity: f64,
+) -> i32 {
+    let coords: &[f64] = if coords_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(coords_ptr, coords_count) }
+    };
+    let offsets: &[f64] = if offsets_ptr.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(offsets_ptr, stops_count) }
+    };
+    let colors = unsafe {
+        if colors_ptr.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(colors_ptr, stops_count)
+        }
+    };
+    if offsets.len() != colors.len() || offsets.len() < 2 {
+        return -2;
+    }
+    let kind = match kind {
+        1 if coords.len() >= 6 => GradientKind::Radial {
+            x0: coords[0],
+            y0: coords[1],
+            r0: coords[2],
+            x1: coords[3],
+            y1: coords[4],
+            r1: coords[5],
+        },
+        0 if coords.len() >= 4 => GradientKind::Linear {
+            x0: coords[0],
+            y0: coords[1],
+            x1: coords[2],
+            y1: coords[3],
+        },
+        _ => return -2,
+    };
+    let stops: Vec<GradientStop> = offsets
+        .iter()
+        .zip(colors.iter())
+        .map(|(&offset, &rgb)| GradientStop {
+            offset,
+            color: unpack_rgb(rgb),
+        })
+        .collect();
+    let spec = GradientSpec {
+        kind,
+        stops,
+        rect: [rx, ry, rw, rh],
+        extend: (extend_start != 0, extend_end != 0),
+        opacity,
+    };
+    edit(handle, |doc| doc.add_gradient(page, &spec))
 }
 
 /// Draw a polyline/polygon through flat `[x0,y0,x1,y1,…]` points (`points_ptr`,

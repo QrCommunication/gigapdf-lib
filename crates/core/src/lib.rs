@@ -60,10 +60,10 @@ pub use annot::Annotation;
 pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, TextRun};
 pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
-    AfRelationship, Attachment, Bookmark, Document, EmbeddedFontInfo, ImageElementInfo,
-    ImageWatermarkOptions, InfoFields, PageBox, PageBoxes, PageBoxesDeclared, PageLabelRange,
-    PageLabelStyle, SearchMatch, SignatureInfo, SignatureReport, TextElementInfo, TextLayerRun,
-    WatermarkAnchor,
+    AfRelationship, Attachment, Bookmark, Document, EmbeddedFontInfo, GradientKind, GradientSpec,
+    GradientStop, ImageElementInfo, ImageWatermarkOptions, InfoFields, PageBox, PageBoxes,
+    PageBoxesDeclared, PageLabelRange, PageLabelStyle, SearchMatch, SignatureInfo, SignatureReport,
+    TextElementInfo, TextLayerRun, WatermarkAnchor,
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FieldTrigger, FormField};
