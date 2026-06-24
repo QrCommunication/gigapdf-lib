@@ -48,6 +48,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Navigation: links, bookmarks & open-action](#navigation-links-bookmarks--open-action) — *full action model: v0.78.0*
 - [Sign a PDF (B · B-T · LTV · certify · verify)](#sign-a-pdf-b--b-t--ltv) — *B-T: v0.70.0 · LTV: v0.71.0 · verify + DocMDP: v0.80.0*
 - [Encrypt with AES-256](#encrypt-with-aes-256)
+- [Change a password, drop encryption, or encrypt to a certificate](#change-a-password-drop-encryption-or-encrypt-to-a-certificate) — *v0.84.0*
 - [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
 - [Render a page without a specific element (live-overlay editing)](#render-a-page-without-a-specific-element-live-overlay-editing) — *v0.58.0*
 - [Round-trip the unified editable model](#round-trip-the-unified-editable-model)
@@ -1095,6 +1096,47 @@ const reopened = giga.openEncrypted(locked, "user-pw"); // null on wrong passwor
 reopened?.close();
 const info = giga.encryptionInfo(locked); // { encrypted, permissions, version, revision }
 ```
+
+---
+
+## Change a password, drop encryption, or encrypt to a certificate
+
+Beyond setting a password at save time, you can **re-key** or **decrypt** an
+already-open document, or encrypt to **X.509 recipients** so no shared password
+is needed at all (ISO 32000-1 §7.6).
+
+```ts
+// Rotate the passwords on an existing protected file.
+const locked = giga.openEncrypted(encryptedBytes, "old-user")!;
+const rekeyed = locked.changePasswords("new-user", "doc-001", {
+  ownerPassword: "new-owner",
+  // encryptMetadata: false,   // optionally leave the XMP metadata in the clear
+});
+// The old password no longer opens `rekeyed`; "new-user" does.
+
+// Remove protection entirely → a plaintext PDF.
+const plaintext = locked.removeEncryption();
+locked.close();
+```
+
+**Public-key (certificate) encryption** — encrypt to one or more recipients;
+only a holder of a recipient private key can open it:
+
+```ts
+const doc = giga.open(pdfBytes);
+// `cert` is a DER X.509 certificate (e.g. from a colleague's .cer file).
+const sealed = doc.encryptForRecipients([cert], { aes256: true });
+doc.close();
+
+// The recipient opens it with their certificate + PKCS#1 RSA private key.
+const opened = giga.openWithPrivateKey(sealed, cert, privateKeyDer);
+// `giga.open(sealed)` / `openEncrypted` cannot open it — there is no password.
+opened?.close();
+```
+
+> `seed`/`rngSeed` default to Web Crypto randomness; pass them explicitly in a
+> non-browser host without `globalThis.crypto`. Multiple recipients: pass several
+> certificates — `encryptForRecipients([alice, bob], …)`.
 
 ---
 

@@ -292,6 +292,27 @@ export class GigaPdfEngine {
   }
 
   /**
+   * Open a **public-key (certificate) encrypted** PDF (`/Filter /Adobe.PubSec`,
+   * ISO 32000-1 §7.6.5) with a recipient's DER `certificate` + PKCS#1 RSA
+   * `privateKey`. `null` if this key is not a recipient. Counterpart of
+   * {@link GigaPdfDoc.encryptForRecipients}.
+   */
+  openWithPrivateKey(
+    pdf: Uint8Array,
+    certificate: Uint8Array,
+    privateKey: Uint8Array
+  ): GigaPdfDoc | null {
+    const cP = this._toWasm(certificate);
+    const kP = this._toWasm(privateKey);
+    const handle = this._withBytes(pdf, (p, l) =>
+      this.ex.gp_open_with_private_key(p, l, cP, certificate.length, kP, privateKey.length)
+    );
+    this._free(cP, certificate.length);
+    this._free(kP, privateKey.length);
+    return handle === 0 ? null : new GigaPdfDoc(this, handle);
+  }
+
+  /**
    * Inspect a PDF's encryption **without decrypting it** (no password needed):
    * whether it has an `/Encrypt` dictionary, plus its `/P` permission bitmask
    * and handler version/revision (`0` when not encrypted).
@@ -2217,6 +2238,19 @@ export interface HeaderFooterSpec {
 
 const RGB = (rgb: number) => rgb & 0xffffff;
 
+/** `n` bytes of Web Crypto randomness (for encryption seeds; the engine has none). */
+function cryptoRandom(n: number): Uint8Array {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (!c?.getRandomValues) {
+    throw new Error(
+      "this operation needs Web Crypto (globalThis.crypto.getRandomValues) or an explicit seed"
+    );
+  }
+  const out = new Uint8Array(n);
+  c.getRandomValues(out);
+  return out;
+}
+
 /** One colour stop of a {@link GradientSpec}. */
 export interface GradientStop {
   /** Position along the gradient axis, `0`…`1`. */
@@ -3588,6 +3622,118 @@ export class GigaPdfDoc {
       )
     );
   }
+
+  /**
+   * Re-encrypt an already-opened (decrypted) document with **new** passwords,
+   * discarding the prior encryption (ISO 32000-1 §7.6). Opening with the old
+   * password is what authorises the change. Mirrors {@link saveEncrypted} plus
+   * `encryptMetadata` (when `false`, the metadata stream is left in the clear).
+   */
+  changePasswords(
+    newPassword: string,
+    fileId: string,
+    opts: {
+      ownerPassword?: string;
+      algorithm?: "rc4" | "aes128" | "aes256";
+      flags?: Partial<PdfPermissions>;
+      permissions?: number;
+      keySeed?: Uint8Array;
+      encryptMetadata?: boolean;
+    } = {}
+  ): Uint8Array {
+    const algo = opts.algorithm ?? "aes256";
+    const algoCode = algo === "rc4" ? 0 : algo === "aes128" ? 1 : 2;
+    const permissions =
+      opts.flags !== undefined
+        ? this.g.permissionsToP(opts.flags)
+        : opts.permissions ?? this.g.permissionsToP();
+    let key = opts.keySeed ?? new Uint8Array(0);
+    if (algoCode === 2 && key.length < 32) {
+      key = cryptoRandom(32);
+    }
+    const encMeta = opts.encryptMetadata ?? true;
+    return this.g._withStr(newPassword, (pwP, pwL) =>
+      this.g._withOptStr(opts.ownerPassword, (oP, oL) =>
+        this.g._withStr(fileId, (idP, idL) =>
+          this.g._withBytes(key, (kP, kL) =>
+            this.g._buffer((o) =>
+              this.ex().gp_change_passwords(
+                this.h, pwP, pwL, oP, oL, idP, idL, kP, kL, algoCode, permissions,
+                encMeta ? 1 : 0, o
+              )
+            )
+          )
+        )
+      )
+    );
+  }
+
+  /**
+   * Strip encryption from an already-opened (decrypted) document, returning a
+   * **plaintext** PDF. The document must have been opened with a valid password.
+   */
+  removeEncryption(): Uint8Array {
+    return this.g._buffer((o) => this.ex().gp_remove_encryption(this.h, o));
+  }
+
+  /**
+   * Encrypt the document to one or more **X.509 recipients** (public-key /
+   * certificate security, ISO 32000-1 §7.6.5, `/Filter /Adobe.PubSec`): only a
+   * holder of a recipient private key can open it — no shared password.
+   * `certificates` are DER X.509 certs. `seed`/`rngSeed` default to Web Crypto
+   * randomness. Open the result with {@link GigaPdfEngine.openWithPrivateKey}.
+   */
+  encryptForRecipients(
+    certificates: Uint8Array[],
+    opts: {
+      flags?: Partial<PdfPermissions>;
+      permissions?: number;
+      aes256?: boolean;
+      encryptMetadata?: boolean;
+      seed?: Uint8Array;
+      rngSeed?: Uint8Array;
+    } = {}
+  ): Uint8Array {
+    if (certificates.length === 0) {
+      throw new Error("encryptForRecipients needs at least one recipient certificate");
+    }
+    const total = certificates.reduce((n, c) => n + c.length, 0);
+    const blob = new Uint8Array(total);
+    const lens: number[] = [];
+    let off = 0;
+    for (const c of certificates) {
+      blob.set(c, off);
+      off += c.length;
+      lens.push(c.length);
+    }
+    const permissions =
+      opts.flags !== undefined
+        ? this.g.permissionsToP(opts.flags)
+        : opts.permissions ?? this.g.permissionsToP();
+    const aes256 = opts.aes256 ?? true;
+    const encMeta = opts.encryptMetadata ?? true;
+    const seed = opts.seed ?? cryptoRandom(20);
+    const rng = opts.rngSeed ?? cryptoRandom(32);
+    const out = this.g._withBytes(blob, (cP, cL) =>
+      this.g._withU32(lens, (lP, lC) =>
+        this.g._withBytes(seed, (sP, sL) =>
+          this.g._withBytes(rng, (rP, rL) =>
+            this.g._buffer((o) =>
+              this.ex().gp_encrypt_for_recipients(
+                this.h, cP, cL, lP, lC, permissions, aes256 ? 1 : 0, encMeta ? 1 : 0,
+                sP, sL, rP, rL, o
+              )
+            )
+          )
+        )
+      )
+    );
+    if (out.length === 0) {
+      throw new Error("encryptForRecipients failed (invalid recipient certificate?)");
+    }
+    return out;
+  }
+
   /** Self-signed digital signature. `random` ≥ 256 bytes from crypto.getRandomValues. */
   sign(fields: string, random: Uint8Array, keyBits = 2048): Uint8Array {
     const rPtr = this.g._toWasm(random);

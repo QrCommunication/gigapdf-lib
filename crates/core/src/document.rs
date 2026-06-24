@@ -1643,6 +1643,30 @@ impl Document {
         })
     }
 
+    /// Open a **public-key (certificate) encrypted** document (`/Filter
+    /// /Adobe.PubSec`, ISO 32000-1 §7.6.5) with a recipient's `cert_der` (DER
+    /// X.509) and `key_der` (PKCS#1 RSA private key). The seed is recovered from
+    /// the CMS-enveloped recipient list, then objects are decrypted as for the
+    /// standard handler. Counterpart of
+    /// [`encrypt_for_recipients`](Self::encrypt_for_recipients).
+    pub fn open_with_private_key(bytes: &[u8], cert_der: &[u8], key_der: &[u8]) -> Result<Self> {
+        let (mut objects, mut trailer) = scan(bytes);
+        if objects.is_empty() {
+            return Err(EngineError::parse(0, "no PDF objects found"));
+        }
+        recover_trailer_from_xref(&mut trailer, &objects);
+        decrypt_objects_pubsec(&mut objects, &trailer, cert_der, key_der)?;
+        extract_object_streams(&mut objects);
+        Ok(Self {
+            objects,
+            trailer,
+            font_used_gids: BTreeMap::new(),
+            base14_refs: BTreeMap::new(),
+            pending_timestamp: None,
+            pending_doc_timestamp: None,
+        })
+    }
+
     /// Digitally sign the document with an engine-managed signer, producing a
     /// signed PDF (`adbe.pkcs7.detached`). The signer carries a self-signed
     /// certificate (an ephemeral "digital ID", like Adobe's self-signed IDs):
@@ -2355,11 +2379,55 @@ impl Document {
         algorithm: i32,
         permissions: i32,
     ) -> Vec<u8> {
+        self.save_encrypted_ex(
+            user_password,
+            owner_password,
+            id0,
+            file_key,
+            algorithm,
+            permissions,
+            true,
+        )
+    }
+
+    /// Like [`save_encrypted`](Self::save_encrypted) but also controls
+    /// `/EncryptMetadata`: when `false`, the document's metadata stream is left
+    /// in the clear (ISO 32000-1 §7.6.3.2) — the file key derivation folds in the
+    /// flag for RC4/AESV2.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_encrypted_ex(
+        &self,
+        user_password: &[u8],
+        owner_password: &[u8],
+        id0: &[u8],
+        file_key: &[u8],
+        algorithm: i32,
+        permissions: i32,
+        encrypt_metadata: bool,
+    ) -> Vec<u8> {
         use crate::security::Security;
         let (security, encrypt_dict) = match algorithm {
-            1 => Security::new_aes_v2(user_password, owner_password, id0, permissions),
-            2 => Security::new_aes_v3(user_password, owner_password, file_key, permissions, true),
-            _ => Security::new_rc4(user_password, owner_password, id0, permissions),
+            1 => Security::new_aes_v2(
+                user_password,
+                owner_password,
+                id0,
+                permissions,
+                encrypt_metadata,
+            ),
+            2 => Security::new_aes_v3(
+                user_password,
+                owner_password,
+                file_key,
+                permissions,
+                encrypt_metadata,
+            ),
+            _ => Security::new_rc4(
+                user_password,
+                owner_password,
+                id0,
+                permissions,
+                encrypt_metadata,
+            ),
         };
         crate::serialize::to_pdf_encrypted(
             &self.objects,
@@ -2368,6 +2436,111 @@ impl Document {
             &encrypt_dict,
             id0,
         )
+    }
+
+    /// Objects + trailer with any inherited `/Encrypt` stripped (the dict object
+    /// dropped, the trailer key removed). An already-opened document carries its
+    /// (now-decrypted-in-memory) objects plus the original `/Encrypt`; clearing it
+    /// lets the result re-serialize as a fresh plaintext or re-encrypted file.
+    fn without_encryption(&self) -> (BTreeMap<ObjectId, Object>, Dictionary) {
+        let mut objects = self.objects.clone();
+        let mut trailer = self.trailer.clone();
+        if let Some(id) = trailer.get(b"Encrypt").and_then(Object::as_reference) {
+            objects.remove(&id);
+        }
+        trailer.remove(b"Encrypt");
+        (objects, trailer)
+    }
+
+    /// Remove encryption from an already-opened (decrypted) document, serializing
+    /// it as a **plaintext** PDF. The document must have been opened with a valid
+    /// password — opening is what authorises the removal.
+    pub fn remove_encryption(&self) -> Vec<u8> {
+        let (objects, trailer) = self.without_encryption();
+        crate::serialize::to_pdf(&objects, &trailer)
+    }
+
+    /// Re-encrypt an already-opened (decrypted) document with **new** passwords,
+    /// discarding the prior `/Encrypt`. `algorithm`: `0` RC4-128, `1` AES-128,
+    /// `2` AES-256 (`file_key` = 32-byte host randomness for AES-256). Opening
+    /// with the old password is what authorises the change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn change_passwords(
+        &self,
+        new_user_password: &[u8],
+        new_owner_password: &[u8],
+        id0: &[u8],
+        file_key: &[u8],
+        algorithm: i32,
+        permissions: i32,
+        encrypt_metadata: bool,
+    ) -> Vec<u8> {
+        use crate::security::Security;
+        let (objects, trailer) = self.without_encryption();
+        let (security, encrypt_dict) = match algorithm {
+            1 => Security::new_aes_v2(
+                new_user_password,
+                new_owner_password,
+                id0,
+                permissions,
+                encrypt_metadata,
+            ),
+            2 => Security::new_aes_v3(
+                new_user_password,
+                new_owner_password,
+                file_key,
+                permissions,
+                encrypt_metadata,
+            ),
+            _ => Security::new_rc4(
+                new_user_password,
+                new_owner_password,
+                id0,
+                permissions,
+                encrypt_metadata,
+            ),
+        };
+        crate::serialize::to_pdf_encrypted(&objects, &trailer, &security, &encrypt_dict, id0)
+    }
+
+    /// Encrypt the document to one or more **X.509 recipients** (public-key /
+    /// certificate security, ISO 32000-1 §7.6.5, `/Filter /Adobe.PubSec`). Only a
+    /// holder of a recipient private key can open the result — no shared password.
+    /// `cert_ders` are DER X.509 certificates; `aes256` picks AESV3 over AESV2;
+    /// `seed20` (≥ 20 bytes) and `rng_seed` (≥ 32 bytes) are host randomness (the
+    /// engine has no RNG). Counterpart of [`open_with_private_key`](Self::open_with_private_key).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encrypt_for_recipients(
+        &self,
+        cert_ders: &[Vec<u8>],
+        permissions: i32,
+        aes256: bool,
+        encrypt_metadata: bool,
+        seed20: &[u8],
+        rng_seed: &[u8],
+    ) -> Result<Vec<u8>> {
+        let (security, encrypt_dict) = crate::security::pubsec::encrypt_for_recipients(
+            cert_ders,
+            permissions,
+            encrypt_metadata,
+            aes256,
+            seed20,
+            rng_seed,
+        )
+        .ok_or_else(|| {
+            EngineError::InvalidArgument(
+                "public-key encryption: invalid recipient certificate or insufficient randomness"
+                    .into(),
+            )
+        })?;
+        let (objects, trailer) = self.without_encryption();
+        Ok(crate::serialize::to_pdf_encrypted(
+            &objects,
+            &trailer,
+            &security,
+            &encrypt_dict,
+            b"",
+        ))
     }
 
     /// Number of objects parsed (diagnostic).
@@ -15717,6 +15890,49 @@ fn decrypt_objects(
     Ok(())
 }
 
+/// Decrypt a public-key-encrypted document in place using a recipient's
+/// certificate + private key (ISO 32000-1 §7.6.5). Mirrors [`decrypt_objects`]
+/// but recovers the file key from the CMS-enveloped `/Recipients` rather than a
+/// password.
+fn decrypt_objects_pubsec(
+    objects: &mut BTreeMap<ObjectId, Object>,
+    trailer: &Dictionary,
+    cert_der: &[u8],
+    key_der: &[u8],
+) -> Result<()> {
+    let Some(encrypt_ref) = trailer.get(b"Encrypt").and_then(Object::as_reference) else {
+        return Ok(()); // not encrypted
+    };
+    let Some(encrypt_dict) = objects.get(&encrypt_ref).and_then(Object::as_dict).cloned() else {
+        return Ok(());
+    };
+    let Some(security) = crate::security::pubsec::open_pubsec(&encrypt_dict, cert_der, key_der)
+    else {
+        return Err(EngineError::Unsupported(
+            "public-key PDF: key is not a recipient or unsupported handler".into(),
+        ));
+    };
+    let ids: Vec<ObjectId> = objects.keys().copied().collect();
+    for id in ids {
+        if id == encrypt_ref {
+            continue;
+        }
+        let is_xref = objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"Type"))
+            .and_then(Object::as_name)
+            == Some(b"XRef".as_slice());
+        if is_xref {
+            continue;
+        }
+        if let Some(obj) = objects.remove(&id) {
+            objects.insert(id, decrypt_in_object(obj, id.0, id.1, &security));
+        }
+    }
+    Ok(())
+}
+
 fn decrypt_in_object(
     object: Object,
     num: u32,
@@ -18613,6 +18829,146 @@ mod tests {
             Document::open(&encrypted).is_err(),
             "wrong password must be rejected"
         );
+    }
+
+    #[test]
+    fn change_passwords_and_remove_encryption_round_trip() {
+        let original = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let want: String = original
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert!(!want.is_empty());
+
+        let enc =
+            original.save_encrypted(b"old-user", b"old-owner", b"id-bytes-0001234", b"", 0, -44);
+        let opened = Document::open_with_password(&enc, b"old-user").unwrap();
+
+        // Change passwords (re-encrypt) — the old /Encrypt is discarded.
+        let reenc = opened.change_passwords(
+            b"new-user",
+            b"new-owner",
+            b"id-bytes-0001234",
+            b"",
+            0,
+            -44,
+            true,
+        );
+        assert!(
+            Document::open_with_password(&reenc, b"old-user").is_err(),
+            "old password rejected after change"
+        );
+        let reopened = Document::open_with_password(&reenc, b"new-user").unwrap();
+        let got: String = reopened
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(got, want, "text survives re-encryption");
+
+        // Remove encryption — plaintext, opens with no password.
+        let plain = opened.remove_encryption();
+        let plain_doc = Document::open(&plain).unwrap();
+        let got2: String = plain_doc
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(got2, want, "text survives decryption");
+
+        // /EncryptMetadata = false (AES-128) round-trips and emits the flag.
+        let enc_nm =
+            original.save_encrypted_ex(b"u", b"o", b"id-bytes-0001234", b"", 1, -44, false);
+        assert!(
+            String::from_utf8_lossy(&enc_nm).contains("/EncryptMetadata"),
+            "EncryptMetadata flag emitted"
+        );
+        assert!(
+            Document::open_with_password(&enc_nm, b"u").is_ok(),
+            "metadata-unencrypted AES-128 still opens"
+        );
+    }
+
+    #[test]
+    fn pubsec_encrypt_open_round_trip() {
+        let original = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let want: String = original
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert!(!want.is_empty());
+
+        let randomness: Vec<u8> = (0..256).map(|i| (i * 53 + 7) as u8).collect();
+        let recipient = crate::sign::Signer::generate(
+            "Recipient",
+            "260101000000Z",
+            "320101000000Z",
+            2048,
+            &randomness,
+        )
+        .unwrap();
+        let cert = recipient.certificate().to_vec();
+        let key = recipient.key().to_pkcs1_der().unwrap();
+        let seed: Vec<u8> = (0..20).map(|i| (i * 7 + 1) as u8).collect();
+        let rng_seed: Vec<u8> = (0..48).map(|i| (i * 11 + 3) as u8).collect();
+
+        // AES-128 public-key encryption.
+        let enc = original
+            .encrypt_for_recipients(&[cert.clone()], -44, false, true, &seed, &rng_seed)
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&enc).contains("/Adobe.PubSec"),
+            "public-key handler written"
+        );
+        // No password can open it (it is not a standard-handler file).
+        assert!(Document::open(&enc).is_err());
+        // The recipient's private key recovers the exact text.
+        let opened = Document::open_with_private_key(&enc, &cert, &key).unwrap();
+        let got: String = opened
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(got, want, "recipient decrypts the document");
+
+        // A stranger's key is rejected.
+        let stranger = crate::sign::Signer::generate(
+            "Stranger",
+            "260101000000Z",
+            "320101000000Z",
+            2048,
+            &(0..256).map(|i| (i * 29 + 5) as u8).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        assert!(
+            Document::open_with_private_key(
+                &enc,
+                stranger.certificate(),
+                &stranger.key().to_pkcs1_der().unwrap()
+            )
+            .is_err(),
+            "a non-recipient key cannot open the file"
+        );
+
+        // AES-256 public-key encryption round-trips too.
+        let enc3 = original
+            .encrypt_for_recipients(&[cert.clone()], -44, true, true, &seed, &rng_seed)
+            .unwrap();
+        let opened3 = Document::open_with_private_key(&enc3, &cert, &key).unwrap();
+        let got3: String = opened3
+            .page_text_runs(1)
+            .unwrap()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect();
+        assert_eq!(got3, want, "AES-256 recipient decrypts the document");
     }
 
     #[test]

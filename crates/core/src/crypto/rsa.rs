@@ -50,6 +50,16 @@ impl RsaPrivateKey {
         Some(RsaPrivateKey { inner, modulus_len })
     }
 
+    /// Encode the key as a PKCS#1 `RSAPrivateKey` DER (the inverse of
+    /// [`from_pkcs1_der`](Self::from_pkcs1_der)).
+    pub fn to_pkcs1_der(&self) -> Option<Vec<u8>> {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        self.inner
+            .to_pkcs1_der()
+            .ok()
+            .map(|d| d.as_bytes().to_vec())
+    }
+
     /// Rebuild from `(n, e, d)` big-endian magnitudes, recovering the CRT
     /// factors. `None` if the components are inconsistent.
     pub fn from_components(n_be: &[u8], e_be: &[u8], d_be: &[u8]) -> Option<RsaPrivateKey> {

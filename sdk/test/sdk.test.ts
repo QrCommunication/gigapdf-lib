@@ -3,6 +3,13 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { GigaPdfEngine } from "../src/index";
 import type { GigaBlock, GigaInline } from "../src/index";
 
+// A throwaway self-signed RSA recipient (DER X.509 cert + PKCS#1 private key),
+// generated in-engine, for the public-key (PubSec) encryption round-trip.
+const PUBSEC_CERT_B64 =
+  "MIIC/zCCAeegAwIBAgIBATANBgkqhkiG9w0BAQsFADAhMR8wHQYDVQQDDBZHaWdhUERGIFRlc3QgUmVjaXBpZW50MB4XDTI2MDEwMTAwMDAwMFoXDTMyMDEwMTAwMDAwMFowITEfMB0GA1UEAwwWR2lnYVBERiBUZXN0IFJlY2lwaWVudDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANGs3qV9R+2MHm12LTs7A2Y5FxayJ0tgYyV79wX7r0AUtahyVN0hMGvEM27jgy6bBBO10ZvFYUsRJSwkllMbCYtojUsvVg+X6RtbyWIkEQp0AcRnhTpBysSLH/5B6cl4zUnR/35UqO7x+pMeCaX33VcGC59OLqdm1oWpo8s3PQmxjsOPwW4bU+kvy5np4dhIoPS9190EoGnWhgx6NWrop1E1+EPZg3PWojbrNuJFglUosqScHQYvYjg+3dKHlrkG7xGXp9eHEUmYA0PqR/btka6iaOh6wbIb3QRSjpX0l+v9Fyk1nOduDMgMJbqVl8/Q+ImP+5lWabU/AQcke76eraMCAwEAAaNCMEAwHQYDVR0OBBYEFA88wxgR+OCDj6rntHudre6BYkT/MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQBR2rg4lOhelpkx3X9yv1m42XMJkMGrWZd/obvSh2ZWYIOfIyfXXZxz4HpiJk+up6v1uvXRwKq6pxSpNKHX/i+RF5qcAQy+r47gXp0ajEwaeO7XQw19SsEXxAagSh7kgPJAJYgzd5LsazWyfTaWwl3tuyrr+I1AdT6f/ty4Sfspkeb3iQt0YJGrixHPnZJMG0VnhJJdJHV5SZLzczj9zcaiho67mvnv+X6DmKsISdKw04PW+bIqoK4PupRZd+2/328buyj891j7Q7YRauziGMkwYzRwz5hXpQ3oYfF2vP5fee1Xa+olN3vZKN3T1Zuhc9mh9k8VSkQtaKw9oGWtbeiO";
+const PUBSEC_KEY_B64 =
+  "MIIEpAIBAAKCAQEA0azepX1H7YwebXYtOzsDZjkXFrInS2BjJXv3BfuvQBS1qHJU3SEwa8QzbuODLpsEE7XRm8VhSxElLCSWUxsJi2iNSy9WD5fpG1vJYiQRCnQBxGeFOkHKxIsf/kHpyXjNSdH/flSo7vH6kx4JpffdVwYLn04up2bWhamjyzc9CbGOw4/BbhtT6S/Lmenh2Eig9L3X3QSgadaGDHo1auinUTX4Q9mDc9aiNus24kWCVSiypJwdBi9iOD7d0oeWuQbvEZen14cRSZgDQ+pH9u2RrqJo6HrBshvdBFKOlfSX6/0XKTWc524MyAwlupWXz9D4iY/7mVZptT8BByR7vp6towIDAQABAoIBAQC0t9C2xkJGhix7oA3gLT8CzlYOI8Mmfo818aC5sXIdQzxHUTO/3ClF2TeTbdjVRJrA+kcNgZQYBVEKuQYv3u/dDmIp2UTN79rkz7nFMtzVK6OSSr9TtP01ZcxPczQziEE4TR1vHzzzpfCY+JzMRdSqevVtew9PDZ38WnhoYNXlEWqgTqSDFxneRUgkfeSUUb2TXabg2bcMjMpUzTKqmdbu3DSczsLPPq6RMFnCuxExURvjDaIsx67KUsQHn9VpcvMuO4ZCTg7b9kAV8uwK7PuJ81PjlHzZftlGdF6BLF86oQhCqcETSZ0O7LyV5NZthkA25laru0K+RiYstUpKg47RAoGBAPZTVspuRlsbuY1h4smOGp5H70yNKUh57ZVzwNXRN/IjNjFLDuYSDNpm9NN6gA4TVmKdWpKFxt+v+diWlhLYMOUAHxPT878rkHGbnULhOlGNkGW0qsoVku/C+yGsbH6WA/Wzvhac+7MgJYuwnXHtDkvJYt/EuAz8YAEVyDnDFN01AoGBANnpCIydNxsF068WU661hogmOaVE/sagvCP+Dgtixu9sSst9gyCRae1yjUHq1fXa7rkwvGaNFvYXd734PltPaJYay3xypYsofmHXyJniHHmAVMMPX2NUla0197Gz1NWodMV1a+fMddjxH0zq/ZNzvTgnG07/Yj8OoeezhuHSSbJ3AoGBAK2qMg2EU8wWLurT8W2C55diRf9loo57kBqHQpQ87kGju6hjL7zbSv6MCd4zhqbl0UizgdC9ymmYiwC9ok7k5wv82uxCyZ2lXDAMs4Icgt5OfViHWMYjEbZCdIXYJ6HTqDUJJWKSCQ7QAkiLG2Xf6O1brX7wFYbqQ9FgBwtaU5JlAoGAH0c6yew7H67bbrNWuaomsF5EQfvAUkR6HPR3kZzRD0bNCZ5vdvpIaSPbMM4DfjG5uG1Nba7sz9AYiPUcBkFEst8PvEI8jtf2JBc0HRp+mdYY1JLdT0Wx4lXvwtscPrraYAl1vqTzeXtK0eCdG1AupeO/ILy5nnF8PeTgBIQJvgsCgYAVM+Pp2sitOL7Sx+ASRYPetTNFNxd6075a6Kp+ZIYEE0bfnUIAZruG1fGGYn/zthEjTCV4p46sWdB3OlAEtAwkwMlmIbzZFtAYIOQNRLA/4qLE3gYtN/2aKhIosZZSQqRn4hyGLVrWMjqNDMoQA/dK9zoRcsxoJWHKL/EGqJy2+A==";
+
 // Real OpenSSL-3 PKCS#12 (PBES2/AES + HMAC-SHA256), password "gigapdf".
 const MODERN_P12 = new Uint8Array(
   readFileSync(new URL("../../crates/core/src/sign/fixtures/modern.p12", import.meta.url))
@@ -625,6 +632,48 @@ describe("@qrcommunication/gigapdf-lib", () => {
     const r = giga.open(bytes);
     expect(r.pageCount()).toBe(1);
     r.close();
+  });
+
+  it("changePasswords + removeEncryption + public-key (PubSec) round-trip", () => {
+    // Password change / removal on an already-opened document (no cert needed).
+    const doc = giga.open(giga.txtToPdf("Confidential"));
+    const enc = doc.saveEncrypted("old-user", "id0000000000", { ownerPassword: "old-owner" });
+    doc.close();
+    const opened = giga.openEncrypted(enc, "old-user")!;
+    expect(opened).not.toBeNull();
+
+    const reenc = opened.changePasswords("new-user", "id0000000000", {
+      ownerPassword: "new-owner",
+    });
+    expect(giga.openEncrypted(reenc, "old-user")).toBeNull();
+    const reopened = giga.openEncrypted(reenc, "new-user")!;
+    expect(reopened.pageCount()).toBe(1);
+    reopened.close();
+
+    const plain = opened.removeEncryption();
+    const plainDoc = giga.open(plain);
+    expect(plainDoc.pageCount()).toBe(1);
+    plainDoc.close();
+    opened.close();
+
+    // Public-key encryption to an X.509 recipient (a fixture self-signed cert).
+    const cert = new Uint8Array(Buffer.from(PUBSEC_CERT_B64, "base64"));
+    const key = new Uint8Array(Buffer.from(PUBSEC_KEY_B64, "base64"));
+    const d2 = giga.open(giga.txtToPdf("For recipient eyes only"));
+    const pub = d2.encryptForRecipients([cert]);
+    d2.close();
+    expect(new TextDecoder("latin1").decode(pub)).toContain("/Adobe.PubSec");
+    // No password opens it; only the recipient private key does.
+    expect(() => giga.open(pub)).toThrow();
+    const recipientDoc = giga.openWithPrivateKey(pub, cert, key);
+    expect(recipientDoc).not.toBeNull();
+    expect(recipientDoc!.pageCount()).toBe(1);
+    recipientDoc!.close();
+
+    // No recipients is rejected.
+    const d3 = giga.open(giga.txtToPdf("x"));
+    expect(() => d3.encryptForRecipients([])).toThrow();
+    d3.close();
   });
 
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {

@@ -7,6 +7,40 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.84.0] - 2026-06-24
+
+Security: **public-key (certificate) encryption** + **password management**.
+Resolves [#17](https://github.com/qrcommunication/gigapdf-lib/issues/17).
+
+### Added
+
+- **`Document::encrypt_for_recipients(&[cert_der], perms, aes256, encrypt_metadata,
+  seed, rng)`** — public-key (certificate) security (`/Filter /Adobe.PubSec`,
+  `/SubFilter /adbe.pkcs7.s5`, ISO 32000-1 §7.6.5): a random seed is wrapped per
+  X.509 recipient in a CMS `EnvelopedData` (RSA key transport), the file key is
+  `Hash(seed || recipients)`, and objects are AESV2/AESV3-encrypted. Only a
+  recipient private key can open the file — no shared password.
+- **`Document::open_with_private_key(bytes, cert_der, key_der)`** — the read
+  counterpart: recovers the seed from the recipient list and decrypts.
+- **`Document::change_passwords(…)`** and **`remove_encryption()`** — re-key or
+  decrypt an already-opened document.
+- **`Document::save_encrypted_ex(…, encrypt_metadata)`** — exposes
+  `/EncryptMetadata` for RC4/AESV2/AESV3 (folded into the file-key derivation).
+- `RsaPrivateKey::to_pkcs1_der`. WASM `gp_encrypt_for_recipients` /
+  `gp_open_with_private_key` / `gp_change_passwords` / `gp_remove_encryption`; SDK
+  `encryptForRecipients` / `openWithPrivateKey` / `changePasswords` /
+  `removeEncryption`.
+
+### Notes
+
+- Built on the same RustCrypto `cms`/`x509-cert`/`rsa` primitives as the signing
+  stack; no new dependency. The engine has no RNG, so public-key encryption takes
+  host randomness (`seed` ≥ 20 B, `rng_seed` ≥ 32 B); the SDK fills these from Web
+  Crypto by default.
+- Verified by a full in-engine round-trip (encrypt to a self-signed recipient →
+  open with its private key; a stranger's key is rejected) for both AES-128 and
+  AES-256.
+
 ## [0.83.0] - 2026-06-24
 
 Press-ready **colour authoring** — fills and text are no longer limited to

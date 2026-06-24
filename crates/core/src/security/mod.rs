@@ -9,6 +9,8 @@
 use crate::crypto::{aes_cbc_decrypt, aes_cbc_encrypt, md5, rc4, sha256, sha384, sha512};
 use crate::object::{Dictionary, Object};
 
+pub mod pubsec;
+
 /// The 32-byte password padding string (Algorithm 2, step a).
 const PAD: [u8; 32] = [
     0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
@@ -405,12 +407,21 @@ impl Security {
         owner_password: &[u8],
         id0: &[u8],
         permissions: i32,
+        encrypt_metadata: bool,
     ) -> (Security, Dictionary) {
         let key_len = 16usize;
         let r = 3i32;
 
         let o = compute_legacy_o(owner_password, user_password, key_len);
-        let key = legacy_file_key(&o, permissions, id0, key_len, r, true, user_password);
+        let key = legacy_file_key(
+            &o,
+            permissions,
+            id0,
+            key_len,
+            r,
+            encrypt_metadata,
+            user_password,
+        );
         let u = compute_legacy_u(&key, id0);
 
         let mut dict = Dictionary::new();
@@ -419,6 +430,9 @@ impl Security {
         dict.set(b"R".to_vec(), Object::Integer(r as i64));
         dict.set(b"Length".to_vec(), Object::Integer((key_len * 8) as i64));
         dict.set(b"P".to_vec(), Object::Integer(permissions as i64));
+        if !encrypt_metadata {
+            dict.set(b"EncryptMetadata".to_vec(), Object::Boolean(false));
+        }
         dict.set(
             b"O".to_vec(),
             Object::String(o, crate::object::StringKind::Literal),
@@ -446,12 +460,21 @@ impl Security {
         owner_password: &[u8],
         id0: &[u8],
         permissions: i32,
+        encrypt_metadata: bool,
     ) -> (Security, Dictionary) {
         let key_len = 16usize;
         let r = 4i32;
 
         let o = compute_legacy_o(owner_password, user_password, key_len);
-        let key = legacy_file_key(&o, permissions, id0, key_len, r, true, user_password);
+        let key = legacy_file_key(
+            &o,
+            permissions,
+            id0,
+            key_len,
+            r,
+            encrypt_metadata,
+            user_password,
+        );
         let u = compute_legacy_u(&key, id0);
 
         // /CF << /StdCF << /CFM /AESV2 /Length 16 /AuthEvent /DocOpen >> >>
@@ -471,6 +494,9 @@ impl Security {
         dict.set(b"StmF".to_vec(), Object::Name(b"StdCF".to_vec()));
         dict.set(b"StrF".to_vec(), Object::Name(b"StdCF".to_vec()));
         dict.set(b"P".to_vec(), Object::Integer(permissions as i64));
+        if !encrypt_metadata {
+            dict.set(b"EncryptMetadata".to_vec(), Object::Boolean(false));
+        }
         dict.set(
             b"O".to_vec(),
             Object::String(o, crate::object::StringKind::Literal),
@@ -679,7 +705,7 @@ mod tests {
 
     #[test]
     fn builds_rc4_encrypt_dictionary() {
-        let (sec, dict) = Security::new_rc4(b"hunter2", b"owner-pw", b"file-id-0000", -44);
+        let (sec, dict) = Security::new_rc4(b"hunter2", b"owner-pw", b"file-id-0000", -44, true);
         assert_eq!(
             dict.get(b"Filter").and_then(Object::as_name),
             Some(b"Standard".as_slice())
@@ -693,7 +719,7 @@ mod tests {
     #[test]
     fn builds_aesv2_encrypt_dictionary_round_trip() {
         let id0 = b"file-id-0123456789ab";
-        let (sec, dict) = Security::new_aes_v2(b"user-pw", b"owner-pw", id0, -44);
+        let (sec, dict) = Security::new_aes_v2(b"user-pw", b"owner-pw", id0, -44, true);
         assert_eq!(dict.get(b"V").and_then(Object::as_i64), Some(4));
         assert_eq!(dict.get(b"R").and_then(Object::as_i64), Some(4));
 

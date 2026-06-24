@@ -44,6 +44,24 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.84.0] - 2026-06-24
+
+Public-key (certificate) encryption + password management. Resolves
+[#17](https://github.com/qrcommunication/gigapdf-lib/issues/17).
+
+### Added
+
+- **`doc.encryptForRecipients(certificates, opts?)`** — encrypt to one or more
+  X.509 recipients (`/Filter /Adobe.PubSec`); only a recipient private key opens
+  it. `certificates` are DER certs; `opts = { flags?, permissions?, aes256?,
+  encryptMetadata?, seed?, rngSeed? }` (`seed`/`rngSeed` default to Web Crypto).
+- **`engine.openWithPrivateKey(pdf, certificate, privateKey)`** — open a
+  public-key-encrypted PDF with a DER cert + PKCS#1 RSA key (`null` if not a
+  recipient).
+- **`doc.changePasswords(newPassword, fileId, opts?)`** — re-encrypt an opened
+  document with new passwords (`opts` adds `encryptMetadata?`).
+- **`doc.removeEncryption()`** — strip encryption → plaintext PDF.
+
 ## [0.83.0] - 2026-06-24
 
 Press-ready colour authoring. Resolves

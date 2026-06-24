@@ -158,6 +158,148 @@ pub extern "C" fn gp_save_encrypted(
     }
 }
 
+/// Re-encrypt an already-opened (decrypted) document with NEW passwords, also
+/// controlling `/EncryptMetadata`. `algorithm`: `0` RC4, `1` AES-128, `2`
+/// AES-256 (`key` = host randomness for AES-256). Buffer-returning (host frees).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_change_passwords(
+    handle: *const Document,
+    pw_ptr: *const u8,
+    pw_len: usize,
+    owner_ptr: *const u8,
+    owner_len: usize,
+    id_ptr: *const u8,
+    id_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+    algorithm: i32,
+    permissions: i32,
+    encrypt_metadata: i32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let password = unsafe { str_arg(pw_ptr, pw_len) };
+            let owner = unsafe { str_arg(owner_ptr, owner_len) };
+            let id = unsafe {
+                if id_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(id_ptr, id_len)
+                }
+            };
+            let key = unsafe {
+                if key_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(key_ptr, key_len)
+                }
+            };
+            let pdf = doc.change_passwords(
+                password.as_bytes(),
+                owner.as_bytes(),
+                id,
+                key,
+                algorithm,
+                permissions,
+                encrypt_metadata != 0,
+            );
+            unsafe { bytes_into_host(pdf, out_len) }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Strip encryption from an already-opened (decrypted) document, returning a
+/// plaintext PDF. Buffer-returning (host frees).
+#[no_mangle]
+pub extern "C" fn gp_remove_encryption(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => unsafe { bytes_into_host(doc.remove_encryption(), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Encrypt the document to X.509 recipients (public-key / `/Adobe.PubSec`).
+/// `certs` is the recipient DER certificates concatenated; `lens` (a `u32`
+/// array of `lens_count` entries) gives each one's byte length. `aes256` picks
+/// AESV3; `seed` (≥ 20 bytes) and `rng` (≥ 32 bytes) are host randomness.
+/// Buffer-returning (host frees); null on bad args.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_encrypt_for_recipients(
+    handle: *const Document,
+    certs_ptr: *const u8,
+    certs_len: usize,
+    lens_ptr: *const u32,
+    lens_count: usize,
+    permissions: i32,
+    aes256: i32,
+    encrypt_metadata: i32,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    rng_ptr: *const u8,
+    rng_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let Some(doc) = (unsafe { handle.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    if certs_ptr.is_null() || lens_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let blob = unsafe { std::slice::from_raw_parts(certs_ptr, certs_len) };
+    let lens = unsafe { std::slice::from_raw_parts(lens_ptr, lens_count) };
+    let mut certs: Vec<Vec<u8>> = Vec::with_capacity(lens_count);
+    let mut offset = 0usize;
+    for &len in lens {
+        let len = len as usize;
+        if offset + len > blob.len() {
+            return std::ptr::null_mut();
+        }
+        certs.push(blob[offset..offset + len].to_vec());
+        offset += len;
+    }
+    let seed = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
+    let rng = unsafe { std::slice::from_raw_parts(rng_ptr, rng_len) };
+    match doc.encrypt_for_recipients(
+        &certs,
+        permissions,
+        aes256 != 0,
+        encrypt_metadata != 0,
+        seed,
+        rng,
+    ) {
+        Ok(pdf) => unsafe { bytes_into_host(pdf, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Open a public-key (certificate) encrypted PDF with a recipient's DER `cert`
+/// and PKCS#1 RSA private `key`. Returns a document handle, or null if the key
+/// is not a recipient.
+#[no_mangle]
+pub extern "C" fn gp_open_with_private_key(
+    ptr: *const u8,
+    len: usize,
+    cert_ptr: *const u8,
+    cert_len: usize,
+    key_ptr: *const u8,
+    key_len: usize,
+) -> *mut Document {
+    if ptr.is_null() || cert_ptr.is_null() || key_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let cert = unsafe { std::slice::from_raw_parts(cert_ptr, cert_len) };
+    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    match Document::open_with_private_key(bytes, cert, key) {
+        Ok(doc) => Box::into_raw(Box::new(doc)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Inspect a PDF's encryption WITHOUT decrypting it (no password needed).
 /// Returns a JSON buffer `{"encrypted":bool,"permissions":int,"version":int,
 /// "revision":int}`. Buffer-returning (host frees); null on a null input.

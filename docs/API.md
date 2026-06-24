@@ -25,6 +25,11 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `doc.save_compressed()` | `gp_save_compressed(handle,outlen)` | Flate uncompressed streams (classic xref table) |
 | `doc.save_optimized(object_streams,xref_streams)` | `gp_save_optimized(handle,object_streams,xref_streams,outlen)` | PDF 1.5+ **object streams** (`/ObjStm`) + **cross-reference stream** (`/XRef`), ISO 32000-1 §7.5.7/§7.5.8 — the most compact output; `object_streams` implies `xref_streams`. Linearization (Fast Web View, Annex F) is **not** done |
 | `doc.save_encrypted(pw,owner,id0,key,algo,perms)` | `gp_save_encrypted(handle,pw,pwlen,owner,ownerlen,id,idlen,key,keylen,algo,perms,outlen)` | algo 0=RC4-128, 1=AES-128, 2=AES-256; `key`=secret host randomness (AES-256) |
+| `doc.save_encrypted_ex(pw,owner,id0,key,algo,perms,encrypt_metadata)` | (via `gp_change_passwords`) | as `save_encrypted` but also controls `/EncryptMetadata` (ISO 32000-1 §7.6.3.2) |
+| `doc.change_passwords(user,owner,id0,key,algo,perms,encrypt_metadata)` | `gp_change_passwords(handle,user,userlen,owner,ownerlen,id,idlen,key,keylen,algo,perms,encrypt_metadata,outlen)` | re-encrypt an opened doc with new passwords (discards the prior `/Encrypt`) |
+| `doc.remove_encryption() -> Vec<u8>` | `gp_remove_encryption(handle,outlen)` | strip encryption → plaintext PDF |
+| `doc.encrypt_for_recipients(&[cert_der],perms,aes256,encrypt_metadata,seed20,rng_seed)` | `gp_encrypt_for_recipients(handle,certs,certslen,lens,lenscount,perms,aes256,encrypt_metadata,seed,seedlen,rng,rnglen,outlen)` | **public-key** (certificate) encryption, `/Filter /Adobe.PubSec` — CMS-enveloped seed per X.509 recipient (ISO 32000-1 §7.6.5); `seed20`≥20B + `rng_seed`≥32B host randomness |
+| `Document::open_with_private_key(&[u8],cert_der,key_der)` | `gp_open_with_private_key(ptr,len,cert,certlen,key,keylen)` | open a public-key-encrypted PDF with a recipient DER cert + PKCS#1 RSA key |
 | — | `gp_close(handle)` | free the document |
 | — | `gp_alloc(len)` / `gp_free(ptr,len)` | linear-memory management |
 | `doc.page_count() -> usize` | `gp_page_count(handle)` | |
