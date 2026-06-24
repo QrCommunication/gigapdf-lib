@@ -7,6 +7,32 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.92.0] - 2026-06-24
+
+PDF-read, Office-import and catalog-authoring. Three independent fixes
+implemented in parallel
+([#42](https://github.com/qrcommunication/gigapdf-lib/issues/42),
+[#52](https://github.com/qrcommunication/gigapdf-lib/issues/52),
+[#63](https://github.com/qrcommunication/gigapdf-lib/issues/63)).
+
+### Added
+
+- **`setViewerPreferences()` / `setPageLayout()` / `setPageMode()`** author the
+  document catalog's reading/UX hints (ISO 32000-1 §12.2): `/ViewerPreferences`
+  (`HideToolbar`/`HideMenubar`/`HideWindowUI`/`FitWindow`/`CenterWindow`/
+  `DisplayDocTitle` tri-state booleans + `/Direction`), `/PageLayout`, `/PageMode`.
+  ([#63](https://github.com/qrcommunication/gigapdf-lib/issues/63))
+- **Type3 fonts.** Glyphs defined as `/CharProcs` content streams now render —
+  each shown code runs its glyph procedure through the engine's content-stream
+  interpreter under `FontMatrix · textMatrix`, reusing the page/form machinery
+  (fills, strokes, clips, nested forms); `d0`/`d1` accepted; width via `/Widths`
+  through the `/FontMatrix`. ([#42](https://github.com/qrcommunication/gigapdf-lib/issues/42))
+- **ODT import fidelity.** Paragraph styling (`fo:text-align`, margins/indents,
+  `fo:text-indent`, `fo:line-height` with parent-style inheritance), footnotes/
+  endnotes (`text:note`) inlined at the reference, body text boxes
+  (`draw:text-box`), and table column widths + cell shading.
+  ([#52](https://github.com/qrcommunication/gigapdf-lib/issues/52))
+
 ## [0.91.0] - 2026-06-24
 
 PDF-read & Office-import fidelity. Two independent fixes implemented in parallel

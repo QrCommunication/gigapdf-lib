@@ -44,6 +44,25 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.92.0] - 2026-06-24
+
+### Added
+
+- **`setViewerPreferences(prefs)` / `setPageLayout(layout)` / `setPageMode(mode)`**
+  author the catalog reading/UX hints. `ViewerPreferences` = optional
+  `hideToolbar`/`hideMenubar`/`hideWindowUI`/`fitWindow`/`centerWindow`/
+  `displayDocTitle` (omit = leave untouched) + `direction` (`'L2R'`/`'R2L'`);
+  `PageLayout` ∈ SinglePage/OneColumn/TwoColumn{Left,Right}/TwoPage{Left,Right};
+  `PageMode` ∈ UseNone/UseOutlines/UseThumbs/FullScreen/UseOC/UseAttachments.
+  ([#63](https://github.com/qrcommunication/gigapdf-lib/issues/63))
+
+### Fixed (read/import, no SDK signature change)
+
+- Type3 `/CharProcs` glyphs now render
+  ([#42](https://github.com/qrcommunication/gigapdf-lib/issues/42)); ODT import
+  gains paragraph styling, footnotes, body text boxes, table sizing/shading
+  ([#52](https://github.com/qrcommunication/gigapdf-lib/issues/52)).
+
 ## [0.91.0] - 2026-06-24
 
 PDF-read & Office-import fidelity (no SDK signature change): `LZWDecode`,
