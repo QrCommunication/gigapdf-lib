@@ -7,6 +7,29 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.91.0] - 2026-06-24
+
+PDF-read & Office-import fidelity. Two independent fixes implemented in parallel
+([#33](https://github.com/qrcommunication/gigapdf-lib/issues/33),
+[#45](https://github.com/qrcommunication/gigapdf-lib/issues/45)).
+
+### Added
+
+- **Stream filters `LZWDecode` / `ASCII85Decode` / `ASCIIHexDecode` /
+  `RunLengthDecode`.** All four classic PDF filters are decoded in-house and
+  dispatched through the shared `decode_stream`, which now walks the `/Filter`
+  array with its parallel `/DecodeParms` (so chains like
+  `[/ASCII85Decode /FlateDecode]` and per-filter predictors decode correctly).
+  `/F`/`/DP` abbreviations and LZW `/EarlyChange` honoured.
+  ([#33](https://github.com/qrcommunication/gigapdf-lib/issues/33))
+- **ODS import fidelity.** The OpenDocument-spreadsheet importer now resolves
+  per-cell styling (font, fill, border, alignment, wrap), reconstructs
+  number/percent/currency format codes from `<number:*-style>`, applies
+  cell→row→column style precedence, and emits `table:number-columns/rows-spanned`
+  merges plus column widths and row heights. (Date/time data-style patterns and
+  vertical-align remain unmapped.)
+  ([#45](https://github.com/qrcommunication/gigapdf-lib/issues/45))
+
 ## [0.90.0] - 2026-06-24
 
 PDF-read & Office-import fidelity. Two independent fixes implemented in parallel
