@@ -13,6 +13,7 @@
 //! script-driven content is rendered — no headless browser. CSS flexbox/grid
 //! are progressively added; block, inline and table flow are supported.
 
+pub mod bidi;
 pub mod css;
 pub mod diagram;
 pub mod dom;

@@ -8,6 +8,7 @@
 //! fonts). Lists get markers, tables lay cells side-by-side, and the whole flow
 //! is sliced into pages with backgrounds/borders split across page bands.
 
+use super::bidi;
 use super::css::{
     Align, AlignItems, BorderStyle, Clear, CssGradient, Direction, Display, FloatSide, Justify,
     Len, Position, Style, Stylesheet, TrackSize, VAlign,
@@ -1598,13 +1599,16 @@ impl Flow<'_> {
     ///
     /// `dir` is the inline base direction. With [`Direction::Ltr`] (the default,
     /// and the only value reachable for any existing document) the original
-    /// left-to-right placement runs verbatim. With [`Direction::Rtl`] the same
-    /// words — still in logical order — are placed from the right edge leftward:
-    /// the first logical box sits flush right and each subsequent box advances to
-    /// its left. The glyphs inside a run keep the order the font produced (the PDF
-    /// text object draws them from the box's left corner), which is correct for a
-    /// purely-RTL run; mixed-direction reordering (the full bidi algorithm) is out
-    /// of scope.
+    /// left-to-right placement runs verbatim — the word slice is the identity
+    /// order, so output is byte-identical. With [`Direction::Rtl`] the line's
+    /// word boxes are first reordered into **visual order** by the Unicode
+    /// Bidirectional Algorithm ([`bidi::reorder`], UAX #9): the base level is RTL,
+    /// so a pure-RTL line is fully mirrored, but an embedded Latin word or a
+    /// number run keeps its own (LTR) sub-order instead of being naively
+    /// reversed. The visually-ordered boxes are then placed left-to-right from a
+    /// start `x` that encodes the resolved alignment (the RTL default hugs the
+    /// right edge). The glyphs *inside* a box keep the order the font/shaper
+    /// produced; intra-word bidi splitting is out of scope (see [`bidi`]).
     #[allow(clippy::too_many_arguments)]
     fn emit_line(
         &mut self,
@@ -1630,8 +1634,19 @@ impl Flow<'_> {
         let align = align.resolve(dir);
         let extra = (line_avail - line_w).max(0.0);
 
-        if dir == Direction::Rtl {
-            self.emit_line_rtl(line, y, last, line_x, line_avail, align, space_w, extra);
+        // Reorder the line's word boxes into visual order via the Unicode bidi
+        // algorithm (rule L2) at the paragraph base level. For a pure-LTR line at
+        // base 0 this is the identity, so we fall through to the original
+        // verbatim placement and keep byte-identical output; an RTL base, or an
+        // LTR line carrying an embedded RTL run, yields a real reordering that we
+        // place via the shared visual placer.
+        let base = if dir == Direction::Rtl { 1 } else { 0 };
+        let texts: Vec<&str> = line.iter().map(|w| w.text.as_str()).collect();
+        let order = bidi::reorder(&texts, base);
+        let identity = order.iter().enumerate().all(|(i, &j)| i == j);
+        if dir == Direction::Rtl || !identity {
+            let visual: Vec<&Word> = order.iter().map(|&i| line[i]).collect();
+            self.place_line_visual(&visual, y, last, line_x, align, space_w, extra);
             *y += line_h;
             return;
         }
@@ -1711,97 +1726,96 @@ impl Flow<'_> {
         *y += line_h;
     }
 
-    /// Place one already-broken line right-to-left. Words stay in logical order;
-    /// `cx_right` tracks the right edge of the next box and walks leftward. Each
-    /// box is emitted at `cx_right - content_width` (its physical left corner),
-    /// then `cx_right` recedes by the box's advance (content + trailing space, plus
-    /// `word-spacing`/justification at a real inter-word space). The starting right
-    /// edge encodes the resolved alignment, mirroring the LTR `cx` computation.
+    /// Place one already-broken line whose word boxes are **already in visual
+    /// order** (the bidi reorder ran in [`emit_line`]). Placement is always
+    /// left-to-right from a start `cx` that encodes the resolved *physical*
+    /// alignment, so it serves both an RTL line (default `Right` ⇒ the block
+    /// hugs the right edge) and an LTR line that carries a reordered RTL run.
+    ///
+    /// `line` holds the boxes in visual (left→right) order; `extra` is the line's
+    /// slack (`line_avail - content`). The per-box trailing inter-word advance
+    /// (space + `word-spacing`, plus the justification gap) is added between
+    /// visually adjacent boxes; the last box draws no trailing space.
     #[allow(clippy::too_many_arguments)]
-    fn emit_line_rtl(
+    fn place_line_visual(
         &mut self,
         line: &[&Word],
         y: &f64,
         last: bool,
         line_x: f64,
-        line_avail: f64,
         align: Align,
         space_w: f64,
         extra: f64,
     ) {
-        let right = line_x + line_avail;
-        // The right edge of the line's content block. `Right` (the RTL default)
-        // hugs the trailing/right edge; `Left` pushes the block to the leading/left
-        // edge so its right side sits `extra` in from the right; `Center` splits.
-        // `Justify` keeps the block flush right and spreads the slack into gaps.
-        let (mut cx_right, gap_extra) = match align {
-            Align::Right | Align::Justify => (right, 0.0),
-            Align::Left => (right - extra, 0.0),
-            Align::Center => (right - extra / 2.0, 0.0),
-            Align::Start | Align::End => (right, 0.0),
+        // Start x of the first visual box, mirroring the LTR `cx` computation so
+        // the geometry is identical for the same resolved alignment: `Left`/
+        // `Justify` start at the leading edge, `Right` shifts the block right by
+        // the full slack, `Center` by half. `Justify` then spreads the slack into
+        // the inter-word gaps (non-last lines only).
+        let mut cx = match align {
+            Align::Left | Align::Justify => line_x,
+            Align::Right => line_x + extra,
+            Align::Center => line_x + extra / 2.0,
+            // `Start`/`End` are resolved to physical edges before this call.
+            Align::Start | Align::End => line_x,
         };
         let gap_extra = if matches!(align, Align::Justify) && !last {
-            let gaps = line.iter().filter(|w| w.space_after).count().max(1);
+            let gaps = line.len().saturating_sub(1).max(1);
             extra / gaps as f64
         } else {
-            gap_extra
+            0.0
         };
-        for w in line.iter() {
-            // The visible content width placed for this box (text run or media);
-            // the trailing inter-word space is advance-only, not drawn.
-            let content = match &w.media {
-                Some(m) => m.width(),
-                None => w.w,
-            };
-            let x = cx_right - content;
+        let last_idx = line.len().saturating_sub(1);
+        for (i, w) in line.iter().enumerate() {
+            let is_last = i == last_idx;
             match &w.media {
                 Some(Media::Raster(iw, ih, src)) => {
                     self.out.push(Abs {
                         z: 1,
                         zi: 0,
                         frag: Fragment::Image {
-                            x,
+                            x: cx,
                             y: *y,
                             w: *iw,
                             h: *ih,
                             src: src.clone(),
                         },
                     });
-                    cx_right = x - space_w;
+                    cx += iw + if is_last { 0.0 } else { space_w };
                 }
                 Some(Media::Svg(iw, ih, image)) => {
                     self.out.push(Abs {
                         z: 1,
                         zi: 0,
                         frag: Fragment::Svg {
-                            x,
+                            x: cx,
                             y: *y,
                             w: *iw,
                             h: *ih,
                             image: image.clone(),
                         },
                     });
-                    cx_right = x - space_w;
+                    cx += iw + if is_last { 0.0 } else { space_w };
                 }
                 None => {
                     // Inline highlight behind the glyphs (see the LTR path).
-                    push_run_highlight(&mut self.out, x, *y, w);
+                    push_run_highlight(&mut self.out, cx, *y, w);
                     self.out.push(Abs {
                         z: 1,
                         zi: 0,
                         frag: Fragment::Text {
-                            x,
+                            x: cx,
                             y: *y + w.style.valign_shift,
                             w: w.w,
                             style: w.style.clone(),
                             text: w.text.clone(),
                         },
                     });
-                    cx_right = x
-                        - if w.space_after {
-                            space_w + gap_extra + w.style.word_spacing
-                        } else {
+                    cx += w.w
+                        + if is_last {
                             0.0
+                        } else {
+                            space_w + gap_extra + w.style.word_spacing
                         };
                 }
             }
@@ -6138,15 +6152,17 @@ mod tests {
 
     #[test]
     fn rtl_inline_boxes_run_right_to_left() {
-        // Two adjacent inline spans in logical order AAA then BBB. In RTL the first
-        // logical box sits at the right, the next advances to its left, so
-        // x(AAA) > x(BBB). The LTR control keeps source order: x(AAA) < x(BBB).
-        let rtl = run(r#"<p dir="rtl"><span>AAA</span><span>BBB</span></p>"#);
-        let a = run_x(&rtl, "AAA");
-        let b = run_x(&rtl, "BBB");
+        // Two adjacent RTL (Hebrew) inline spans, logical order ALEF-word then
+        // BET-word. Under the bidi reorder the first logical RTL box lands at the
+        // right and the next to its left, so x(first) > x(second). (Latin words
+        // would instead stay LTR — see `rtl_latin_words_keep_ltr_order`.) The LTR
+        // control keeps source order: x(AAA) < x(BBB).
+        let rtl = run(r#"<p dir="rtl"><span>אלף</span><span>בית</span></p>"#);
+        let a = run_x(&rtl, "אלף");
+        let b = run_x(&rtl, "בית");
         assert!(
             a > b,
-            "RTL lays the first logical box (AAA) to the right of the next (BBB) (a={a}, b={b})"
+            "RTL lays the first logical box to the right of the next (a={a}, b={b})"
         );
 
         let ltr = run(r#"<p><span>AAA</span><span>BBB</span></p>"#);
@@ -6249,6 +6265,120 @@ mod tests {
             (first.0 - 36.0).abs() < 0.01,
             "LTR first run still starts at x=36 (got {})",
             first.0
+        );
+    }
+
+    // ── Unicode bidi (UAX #9) line-level reordering ─────────────────────────
+
+    #[test]
+    fn bidi_pure_rtl_line_reverses_word_order() {
+        // Three Arabic words in source order W1 W2 W3. The base is RTL, so the
+        // whole line mirrors: the first logical word lands rightmost, the last
+        // leftmost → x(W1) > x(W2) > x(W3).
+        let layout = run(r#"<p dir="rtl">مرحبا بالعالم اليوم</p>"#);
+        let x1 = run_x(&layout, "مرحبا");
+        let x2 = run_x(&layout, "بالعالم");
+        let x3 = run_x(&layout, "اليوم");
+        assert!(
+            x1 > x2 && x2 > x3,
+            "pure-RTL line places logical order right-to-left (x1={x1}, x2={x2}, x3={x3})"
+        );
+    }
+
+    #[test]
+    fn bidi_rtl_with_embedded_latin_word_keeps_it_between_runs() {
+        // RTL line with an embedded Latin word: "Arabic ABC Arabic". The Arabic
+        // runs mirror (first logical word rightmost) but the Latin word stays at
+        // its own level, landing between them — not naively reversed to an edge.
+        let layout = run(r#"<p dir="rtl">مرحبا ABC جميل</p>"#);
+        let a1 = run_x(&layout, "مرحبا");
+        let lat = run_x(&layout, "ABC");
+        let a2 = run_x(&layout, "جميل");
+        assert!(
+            a1 > lat && lat > a2,
+            "embedded Latin word sits between the mirrored Arabic runs (a1={a1}, ABC={lat}, a2={a2})"
+        );
+    }
+
+    #[test]
+    fn bidi_rtl_with_two_latin_words_keeps_their_ltr_order() {
+        // Two adjacent Latin words inside an RTL line read left-to-right among
+        // themselves (their level-2 sub-run is reversed back by L2), even though
+        // the surrounding Arabic is mirrored: x(ONE) < x(TWO).
+        let layout = run(r#"<p dir="rtl">عرب ONE TWO نص</p>"#);
+        let one = run_x(&layout, "ONE");
+        let two = run_x(&layout, "TWO");
+        let a_first = run_x(&layout, "عرب");
+        let a_last = run_x(&layout, "نص");
+        assert!(
+            one < two,
+            "embedded Latin words read LTR (ONE={one}, TWO={two})"
+        );
+        assert!(
+            a_first > two && a_last < one,
+            "Arabic frames the Latin run, first logical word rightmost (first={a_first}, last={a_last})"
+        );
+    }
+
+    #[test]
+    fn bidi_rtl_with_european_numbers_read_ltr() {
+        // European numbers in an RTL line resolve to an LTR sub-level (W/I rules),
+        // so two number tokens keep ascending left-to-right order: x(12) < x(34).
+        let layout = run(r#"<p dir="rtl">عرب 12 34 نص</p>"#);
+        let n1 = run_x(&layout, "12");
+        let n2 = run_x(&layout, "34");
+        assert!(
+            n1 < n2,
+            "numbers read left-to-right inside RTL (12={n1}, 34={n2})"
+        );
+    }
+
+    #[test]
+    fn bidi_ltr_base_with_embedded_hebrew_reverses_only_hebrew() {
+        // LTR paragraph with an embedded Hebrew pair: "the H1 H2 end". The Latin
+        // words keep their order; the two Hebrew words form an RTL sub-run that
+        // reverses among themselves → x(the) < x(H2) < x(H1) < x(end).
+        let layout = run(r#"<p>the שלום עולם end</p>"#);
+        let the = run_x(&layout, "the");
+        let h1 = run_x(&layout, "שלום");
+        let h2 = run_x(&layout, "עולם");
+        let end = run_x(&layout, "end");
+        assert!(
+            the < h2 && h2 < h1 && h1 < end,
+            "only the Hebrew sub-run reverses (the={the}, H1={h1}, H2={h2}, end={end})"
+        );
+    }
+
+    #[test]
+    fn bidi_rtl_latin_only_stays_ltr_and_right_aligned() {
+        // A line of only Latin words inside an RTL block reads left-to-right
+        // (no odd level present ⇒ no reversal) but is right-aligned: AAA stays
+        // left of BBB, and the block hugs the right edge.
+        let layout = run(r#"<p dir="rtl">AAA BBB</p>"#);
+        let a = run_x(&layout, "AAA");
+        let b = run_x(&layout, "BBB");
+        assert!(a < b, "Latin-only RTL keeps source order (AAA={a}, BBB={b})");
+        // Right-aligned: BBB's right edge ≈ 576. BBB = 3 glyphs × 8pt = 24pt wide
+        // ⇒ its left corner ≈ 552, far past the left content edge (36).
+        assert!(
+            b > 36.0 + 400.0,
+            "Latin-only RTL block is right-aligned (BBB={b})"
+        );
+    }
+
+    #[test]
+    fn bidi_neutral_between_opposite_strongs_takes_base_direction() {
+        // LTR base: "abc / שלום" — the slash token is a neutral flanked by L
+        // (left) and R (right). N2 resolves it to the base (LTR) direction, so it
+        // stays with the Latin side: x(abc) < x(/) and the Hebrew word follows to
+        // the right of the slash.
+        let layout = run(r#"<p>abc / שלום</p>"#);
+        let abc = run_x(&layout, "abc");
+        let slash = run_x(&layout, "/");
+        let heb = run_x(&layout, "שלום");
+        assert!(
+            abc < slash && slash < heb,
+            "neutral takes base (LTR) direction between opposite strongs (abc={abc}, /={slash}, heb={heb})"
         );
     }
 
