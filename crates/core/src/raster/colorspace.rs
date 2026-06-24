@@ -7,11 +7,13 @@
 //! transform, which is delegated through the [`TintEval`] callback (the document
 //! owns the PDF function evaluator and we must not duplicate it).
 //!
-//! Special / device-dependent spaces are mapped to their device equivalents
-//! (CalRGB→RGB, CalGray→Gray, ICCBased→its `/N`-implied device space or
-//! `/Alternate`). A full colour-management module (ICC profiles, white-point
-//! adaptation beyond the cheap Lab→sRGB path) is intentionally out of scope: the
-//! device fallback is visually faithful for the page-rasterizer use case.
+//! CIE-calibrated spaces apply what is cheap and dependency-free: `CalGray`
+//! decodes its `/Gamma`, `CalRGB` applies per-channel `/Gamma` then the
+//! `/Matrix` + white-point-adapted XYZ→sRGB, and `Lab` runs the Lab→sRGB path.
+//! `ICCBased` is *not* parsed — it behaves as its `/N`-implied device space
+//! (1/3/4) or its explicit `/Alternate`. A full colour-management module (ICC
+//! profile parsing, a calibrated CMM) is intentionally out of scope: these
+//! approximations are visually faithful for the page-rasterizer use case.
 
 use crate::object::Object;
 
@@ -44,6 +46,24 @@ pub enum ColorSpace {
         white: [f64; 3],
         /// `/Range` `[amin amax bmin bmax]` (default `[-100 100 -100 100]`).
         range: [f64; 4],
+    },
+    /// `/CalGray` (ISO 32000-1 §8.6.5.2): a single component decoded by the
+    /// `/Gamma` transfer (`A^gamma`) to an achromatic luminance. 1 input.
+    CalGray {
+        /// `/Gamma` exponent (default `1.0`).
+        gamma: f64,
+    },
+    /// `/CalRGB` (ISO 32000-1 §8.6.5.3): per-channel `/Gamma` then the `/Matrix`
+    /// (CIE `XYZ = M · [A^GA, B^GB, C^GC]`) and white-point-adapted XYZ→sRGB.
+    /// 3 inputs.
+    CalRgb {
+        /// `/Gamma` `[GA GB GC]` per-channel exponents (default `[1,1,1]`).
+        gamma: [f64; 3],
+        /// `/Matrix` (column-major `[XA YA ZA XB YB ZB XC YC ZC]`) mapping the
+        /// gamma-decoded components to CIE XYZ (default identity).
+        matrix: [f64; 9],
+        /// `/WhitePoint` `[Xw Yw Zw]` of the calibration white (D65 default).
+        white: [f64; 3],
     },
     /// `/ICCBased`: behaves like its `/N`-implied device space (1/3/4) or, when
     /// present, an explicit `/Alternate` space.
@@ -85,6 +105,8 @@ impl ColorSpace {
             ColorSpace::DeviceRgb => 3,
             ColorSpace::DeviceCmyk => 4,
             ColorSpace::Lab { .. } => 3,
+            ColorSpace::CalGray { .. } => 1,
+            ColorSpace::CalRgb { .. } => 3,
             ColorSpace::Icc { n, .. } => *n,
             ColorSpace::Indexed { .. } => 1,
             ColorSpace::Separation { n, .. } => *n,
@@ -118,6 +140,12 @@ impl ColorSpace {
             ColorSpace::DeviceRgb => [g(0), g(1), g(2)],
             ColorSpace::DeviceCmyk => cmyk(g(0), g(1), g(2), g(3)),
             ColorSpace::Lab { white, range } => lab_to_rgb(g(0), g(1), g(2), *white, *range),
+            ColorSpace::CalGray { gamma } => cal_gray_to_rgb(g(0), *gamma),
+            ColorSpace::CalRgb {
+                gamma,
+                matrix,
+                white,
+            } => cal_rgb_to_rgb(g(0), g(1), g(2), *gamma, *matrix, *white),
             ColorSpace::Icc { n, alternate } => match alternate {
                 Some(alt) => alt.to_rgb_f(comps, eval),
                 None => device_by_n(*n, comps),
@@ -203,6 +231,94 @@ fn lab_to_rgb(l: f64, a_in: f64, b_in: f64, white: [f64; 3], range: [f64; 4]) ->
     [gamma(rl), gamma(gl), gamma(bl)]
 }
 
+/// `/CalGray` (ISO 32000-1 §8.6.5.2) → device grey: decode the single component
+/// through the `/Gamma` transfer (`A^gamma`) into an achromatic luminance, used
+/// directly as the grey value (a calibrated CMM is out of scope — applying the
+/// gamma is the faithful, dependency-free improvement over the old `A`-as-grey
+/// mapping). `gamma <= 0` is treated as `1.0` (identity).
+fn cal_gray_to_rgb(a: f64, gamma: f64) -> [f64; 3] {
+    let a = a.clamp(0.0, 1.0);
+    let g = if gamma > 0.0 { gamma } else { 1.0 };
+    let l = a.powf(g);
+    [l, l, l]
+}
+
+/// `/CalRGB` (ISO 32000-1 §8.6.5.3) → sRGB: decode each component through its
+/// `/Gamma`, map the result to CIE XYZ via `/Matrix` (`XYZ = M · [A',B',C']`,
+/// column-major), Bradford-adapt the calibration white point to D65, then apply
+/// the linear-XYZ→sRGB matrix + transfer. When `/Matrix` is the identity (its
+/// default) the gamma-decoded components are already treated as linear sRGB, so
+/// only the sRGB companding is applied — the visually-faithful fast path.
+fn cal_rgb_to_rgb(
+    a: f64,
+    b: f64,
+    c: f64,
+    gammas: [f64; 3],
+    matrix: [f64; 9],
+    white: [f64; 3],
+) -> [f64; 3] {
+    let dec = |v: f64, g: f64| {
+        let v = v.clamp(0.0, 1.0);
+        if g > 0.0 {
+            v.powf(g)
+        } else {
+            v
+        }
+    };
+    let (ad, bd, cd) = (dec(a, gammas[0]), dec(b, gammas[1]), dec(c, gammas[2]));
+    if matrix == IDENTITY_MATRIX {
+        // Identity matrix: the decoded components are linear sRGB already.
+        return [gamma(ad), gamma(bd), gamma(cd)];
+    }
+    // XYZ = M · [A', B', C'] with M stored column-major [XA YA ZA XB YB ZB XC YC ZC].
+    let x = matrix[0] * ad + matrix[3] * bd + matrix[6] * cd;
+    let y = matrix[1] * ad + matrix[4] * bd + matrix[7] * cd;
+    let z = matrix[2] * ad + matrix[5] * bd + matrix[8] * cd;
+    let [xa, ya, za] = bradford_adapt_to_d65(x, y, z, white);
+    // XYZ (D65) → linear sRGB (IEC 61966-2.1 matrix).
+    let rl = 3.2406255 * xa - 1.5372080 * ya - 0.4986286 * za;
+    let gl = -0.9689307 * xa + 1.8757561 * ya + 0.0415175 * za;
+    let bl = 0.0557101 * xa - 0.2040211 * ya + 1.0569959 * za;
+    [gamma(rl), gamma(gl), gamma(bl)]
+}
+
+/// The default (`/Matrix` absent) `/CalRGB` matrix: identity, column-major.
+const IDENTITY_MATRIX: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+/// Bradford chromatic adaptation of an XYZ triple from a source white point to
+/// D65. Cone responses are scaled by the white-point ratio in LMS space, the
+/// standard cheap CMM-free adaptation; a near-D65 source is effectively a
+/// no-op. A degenerate (non-positive `Yw`) white point is left unadapted.
+fn bradford_adapt_to_d65(x: f64, y: f64, z: f64, white: [f64; 3]) -> [f64; 3] {
+    const D65: [f64; 3] = [0.95047, 1.0, 1.08883];
+    if white[1] <= 0.0 {
+        return [x, y, z];
+    }
+    // Bradford forward matrix (XYZ → LMS).
+    let to_lms = |x: f64, y: f64, z: f64| {
+        [
+            0.8951 * x + 0.2664 * y - 0.1614 * z,
+            -0.7502 * x + 1.7135 * y + 0.0367 * z,
+            0.0389 * x - 0.0685 * y + 1.0296 * z,
+        ]
+    };
+    let src = to_lms(white[0], white[1], white[2]);
+    let dst = to_lms(D65[0], D65[1], D65[2]);
+    let [l, m, s] = to_lms(x, y, z);
+    let ratio = |d: f64, s: f64| if s != 0.0 { d / s } else { 1.0 };
+    let (lp, mp, sp) = (
+        l * ratio(dst[0], src[0]),
+        m * ratio(dst[1], src[1]),
+        s * ratio(dst[2], src[2]),
+    );
+    // Bradford inverse matrix (LMS → XYZ).
+    [
+        0.9869929 * lp - 0.1470543 * mp + 0.1599627 * sp,
+        0.4323053 * lp + 0.5183603 * mp + 0.0492912 * sp,
+        -0.0085287 * lp + 0.0400428 * mp + 0.9684867 * sp,
+    ]
+}
+
 /// Linear → sRGB transfer (companding).
 fn gamma(c: f64) -> f64 {
     let c = c.clamp(0.0, 1.0);
@@ -263,6 +379,91 @@ mod tests {
             alternate: None,
         };
         assert_eq!(cs.to_rgb(&[0.0, 1.0, 0.0], &NoTint), [0, 255, 0]);
+    }
+
+    #[test]
+    fn cal_gray_applies_gamma() {
+        // Gamma 1.0 is the identity: 0.5 → grey 128.
+        let id = ColorSpace::CalGray { gamma: 1.0 };
+        assert_eq!(id.to_rgb(&[0.5], &NoTint), [128, 128, 128]);
+        // Gamma 2.2 darkens the midtone: 0.5^2.2 ≈ 0.2176 → ~55.
+        let g22 = ColorSpace::CalGray { gamma: 2.2 };
+        let v = g22.to_rgb(&[0.5], &NoTint)[0];
+        assert!(
+            (50..=60).contains(&v),
+            "0.5^2.2 grey should be ~55, got {v}"
+        );
+        // Endpoints are fixed points of any positive gamma.
+        assert_eq!(g22.to_rgb(&[0.0], &NoTint), [0, 0, 0]);
+        assert_eq!(g22.to_rgb(&[1.0], &NoTint), [255, 255, 255]);
+    }
+
+    #[test]
+    fn cal_rgb_identity_matrix_is_srgb_with_gamma() {
+        // Identity matrix + gamma 1: components are linear sRGB, so the sRGB
+        // transfer expands 0.5 to ~188 (matches the Lab/CMYK companding path).
+        let cs = ColorSpace::CalRgb {
+            gamma: [1.0, 1.0, 1.0],
+            matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            white: [0.95047, 1.0, 1.08883],
+        };
+        let mid = cs.to_rgb(&[0.5, 0.5, 0.5], &NoTint);
+        assert!(
+            (185..=192).contains(&mid[0]) && mid[0] == mid[1] && mid[1] == mid[2],
+            "linear 0.5 → sRGB ~188 grey, got {mid:?}"
+        );
+        // Pure primaries stay saturated and ordered (red channel dominates red).
+        let red = cs.to_rgb(&[1.0, 0.0, 0.0], &NoTint);
+        assert_eq!(red, [255, 0, 0]);
+    }
+
+    #[test]
+    fn cal_rgb_gamma_darkens_before_transfer() {
+        // Per-channel gamma 2.2 on the green channel decodes 0.5→0.2176 (linear)
+        // before sRGB companding, so green ends up darker than the identity case.
+        let plain = ColorSpace::CalRgb {
+            gamma: [1.0, 1.0, 1.0],
+            matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            white: [0.95047, 1.0, 1.08883],
+        };
+        let gamma = ColorSpace::CalRgb {
+            gamma: [2.2, 2.2, 2.2],
+            matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            white: [0.95047, 1.0, 1.08883],
+        };
+        let g_plain = plain.to_rgb(&[0.5, 0.5, 0.5], &NoTint)[1];
+        let g_gamma = gamma.to_rgb(&[0.5, 0.5, 0.5], &NoTint)[1];
+        assert!(
+            g_gamma < g_plain,
+            "gamma 2.2 must darken 0.5 ({g_gamma}) vs identity ({g_plain})"
+        );
+    }
+
+    #[test]
+    fn cal_rgb_matrix_maps_through_xyz() {
+        // A `/Matrix` mapping the green component onto the D65 white point: input
+        // (0,1,0) → XYZ = D65 → near-white sRGB (matrix path, not the identity
+        // fast path). Confirms the XYZ→sRGB pipeline runs and stays achromatic.
+        let cs = ColorSpace::CalRgb {
+            gamma: [1.0, 1.0, 1.0],
+            matrix: [
+                0.0, 0.0, 0.0, // A column
+                0.95047, 1.0, 1.08883, // B column = D65 white
+                0.0, 0.0, 0.0, // C column
+            ],
+            white: [0.95047, 1.0, 1.08883],
+        };
+        let [r, g, b] = cs.to_rgb(&[0.0, 1.0, 0.0], &NoTint);
+        assert!(
+            r > 240 && g > 240 && b > 240,
+            "B→D65 white must render near-white, got [{r}, {g}, {b}]"
+        );
+        // The component spread is tiny (achromatic), proving adaptation balanced.
+        let spread = r.max(g).max(b) - r.min(g).min(b);
+        assert!(
+            spread <= 6,
+            "white point should be near-neutral, spread {spread}"
+        );
     }
 
     #[test]

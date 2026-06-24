@@ -5435,10 +5435,13 @@ impl Document {
 
     /// Resolve a PDF colour-space object (ISO 32000-1 §8.6) into a self-contained
     /// [`ColorSpace`](crate::raster::colorspace::ColorSpace). Handles the device
-    /// names, `/ICCBased`, `/Indexed`, `/Separation`, `/DeviceN`, `/Lab`,
-    /// `/CalRGB`, `/CalGray`, and `/Pattern` (mapped to its underlying space, or
-    /// `DeviceGray` for an uncoloured pattern). `depth` guards against cyclic
-    /// `/Alternate`/`base` chains. `None` when the object isn't a colour space.
+    /// names, `/ICCBased` (honouring the stream `/N` and `/Alternate`), `/Indexed`,
+    /// `/Separation`, `/DeviceN`, `/Lab`, `/CalRGB` and `/CalGray` (honouring
+    /// `/Gamma`/`/Matrix`/`/WhitePoint`), and `/Pattern` (mapped to its underlying
+    /// space, or `DeviceGray` for an uncoloured pattern). `depth` guards against
+    /// cyclic `/Alternate`/`base` chains. `None` when the object isn't a colour
+    /// space. A *bare* `/CalRGB`/`/CalGray` name (no params dict) maps to its
+    /// device equivalent — there are no calibration parameters to apply.
     fn resolve_color_space(
         &self,
         obj: &Object,
@@ -5478,8 +5481,44 @@ impl Document {
                     .map(Box::new);
                 Some(ColorSpace::Icc { n, alternate })
             }
-            b"CalGray" => Some(ColorSpace::DeviceGray),
-            b"CalRGB" => Some(ColorSpace::DeviceRgb),
+            b"CalGray" => {
+                // `[/CalGray <<params>>]`: honour `/Gamma` (`A^gamma`). A missing
+                // params dict (or `/Gamma`) leaves the identity, i.e. device grey.
+                let pdict = arr.get(1).map(|o| self.resolve(o));
+                let gamma = pdict
+                    .as_ref()
+                    .and_then(|o| o.as_dict())
+                    .and_then(|d| d.get(b"Gamma").map(|o| self.resolve(o)))
+                    .and_then(|o| o.as_f64())
+                    .unwrap_or(1.0);
+                Some(ColorSpace::CalGray { gamma })
+            }
+            b"CalRGB" => {
+                // `[/CalRGB <<params>>]`: honour `/Gamma`, `/Matrix`, `/WhitePoint`.
+                // Defaults (gamma 1, identity matrix, D65 white) reduce to sRGB.
+                let pdict = arr.get(1).map(|o| self.resolve(o));
+                let pdict = pdict.as_ref().and_then(|o| o.as_dict());
+                let gamma = pdict
+                    .and_then(|d| read_vec(self, d, b"Gamma"))
+                    .filter(|v| v.len() >= 3)
+                    .map(|v| [v[0], v[1], v[2]])
+                    .unwrap_or([1.0, 1.0, 1.0]);
+                let matrix = pdict
+                    .and_then(|d| read_vec(self, d, b"Matrix"))
+                    .filter(|v| v.len() >= 9)
+                    .map(|v| [v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]])
+                    .unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+                let white = pdict
+                    .and_then(|d| read_vec(self, d, b"WhitePoint"))
+                    .filter(|v| v.len() >= 3)
+                    .map(|v| [v[0], v[1], v[2]])
+                    .unwrap_or([0.95047, 1.0, 1.08883]);
+                Some(ColorSpace::CalRgb {
+                    gamma,
+                    matrix,
+                    white,
+                })
+            }
             b"Lab" => {
                 let params = arr.get(1).map(|o| self.resolve(o));
                 let pdict = params.as_ref().and_then(|o| o.as_dict());
@@ -23314,6 +23353,34 @@ mod tests {
         assert!(
             c[2] > 200 && c[0] < 40 && c[1] < 40,
             "ICCBased N3 (0,0,1) must be blue, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn cal_gray_fill_applies_gamma() {
+        // `/CalGray` with `/Gamma 2.2`: filling 0.5 must paint a darker grey than
+        // a plain DeviceGray 0.5 (128) because the gamma decode is now applied.
+        let resources = "/ColorSpace << /Cg [ /CalGray << /WhitePoint [1 1 1] /Gamma 2.2 >> ] >>";
+        let page = "/Cg cs 0.5 scn 20 20 60 60 re f";
+        let canvas = render_canvas(page, resources, &[]);
+        let c = px(&canvas, 50, 50);
+        assert!(
+            c[0] == c[1] && c[1] == c[2] && c[0] < 90,
+            "CalGray gamma 2.2 of 0.5 must be a dark neutral grey, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn cal_rgb_identity_fill_renders_color() {
+        // `/CalRGB` with default gamma/matrix: filling (0,0,1) stays blue (the
+        // identity-matrix fast path treats components as linear sRGB primaries).
+        let resources = "/ColorSpace << /Cr [ /CalRGB << /WhitePoint [0.9505 1 1.089] >> ] >>";
+        let page = "/Cr cs 0 0 1 scn 20 20 60 60 re f";
+        let canvas = render_canvas(page, resources, &[]);
+        let c = px(&canvas, 50, 50);
+        assert!(
+            c[2] > 200 && c[0] < 40 && c[1] < 40,
+            "CalRGB (0,0,1) must be blue, got {c:?}"
         );
     }
 
