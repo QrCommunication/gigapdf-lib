@@ -146,8 +146,8 @@ inheritance) rendered as native PDF axial/radial shadings. Size the box with the
 `<svg>` `width`/`height` (or its viewBox). Not drawn: tiling `<pattern>`
 (falls back to a solid fill), `filter`, and COLRv1 gradient glyphs.
 
-> Note: `<img>` (the element) is the way to place a raster picture. The CSS
-> `background-image: url(...)` property is **not** rasterized — see
+> Note: both `<img>` (the element) and CSS `background-image: url(...)` place a
+> raster picture (the latter fills the box behind the content) — see
 > [backgrounds](#backgrounds).
 
 ### Page breaks
@@ -280,8 +280,10 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `background` / `background-image` | `radial-gradient(…)` | **real PDF radial shading** — all stops |
 | `background` / `background-image` | `conic-gradient(…)` | approximated by 180 flat sectors (slight banding); stops honoured |
 
-> `background-image: url(…)` (a raster image) is **ignored** — place pictures with
-> the `<img>` element instead.
+> `background-image: url(…)` (a raster image) **is** painted — it fills the box
+> behind the content (a `data:` URI decodes inline; an external URL is fetched by
+> the host, like `<img>`). `background-repeat`/`-position`/`-size` are not yet
+> modelled (the image stretches to fill the box).
 
 ### Page breaks
 
@@ -445,12 +447,13 @@ subset.
 - **Layout/sizing**: a true scroll model for `position: sticky`. Named grid
   **lines** (use numeric placement or named **areas** — `grid-template-areas`
   **is** supported, see [grid](#grid)).
-- **Visual effects**: `filter`, true Gaussian blur, `background-image: url()`
-  raster (use `<img>`), CSS tiling patterns. (Gradients, rounded corners,
-  offset/spread/**inset** box-shadows, **`text-shadow`**, and **`transform`**
-  **are** supported — `transform` maps to a PDF `cm` matrix; `text-shadow`
-  re-draws the glyphs offset in the shadow colour, with blur approximated. See
-  [transforms](#transforms), [backgrounds](#backgrounds) and [shadows](#shadows).)
+- **Visual effects**: `filter`, true Gaussian blur, CSS tiling patterns.
+  (Gradients, rounded corners, offset/spread/**inset** box-shadows,
+  **`text-shadow`**, **`transform`**, and **`background-image: url()`** **are**
+  supported — `transform` maps to a PDF `cm` matrix; `text-shadow` re-draws the
+  glyphs offset in the shadow colour, with blur approximated; `background-image`
+  fills the box (no repeat/position/size). See [transforms](#transforms),
+  [backgrounds](#backgrounds) and [shadows](#shadows).)
 - **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
   full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
 - **Selectors**: pseudo-elements (`::before`/`::after`, not generated) in

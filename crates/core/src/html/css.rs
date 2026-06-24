@@ -371,6 +371,10 @@ pub struct Style {
     /// `background`. `None` for the overwhelming majority of boxes, keeping the
     /// flat-fill path untouched. Not inherited.
     pub background_gradient: Option<CssGradient>,
+    /// `background-image: url(...)` — the raster source (a `data:` URI or an
+    /// external URL the host pre-downloads). Painted to fill the box behind its
+    /// content. Not inherited.
+    pub background_image: Option<String>,
     /// `vertical-align` of table-cell content within its (taller) row box.
     pub vertical_align: VAlign,
     /// `border-collapse: collapse` — adjacent table-cell borders share a single
@@ -676,6 +680,7 @@ impl Default for Style {
             border_color_edges: [[0.0, 0.0, 0.0]; 4],
             border_style_edges: [BorderStyle::Solid; 4],
             background_gradient: None,
+            background_image: None,
             vertical_align: VAlign::Top,
             border_collapse: false,
             width: None,
@@ -1392,20 +1397,35 @@ fn strip_comments(css: &str) -> String {
     out
 }
 
-/// Parse `prop: value; …` into pairs.
+/// Parse `prop: value; …` into pairs. Splits on `;` at paren depth 0, so a
+/// `url(data:image/png;base64,…)` value (whose `;` is *inside* the function) is
+/// not torn in half.
 pub fn parse_decls(body: &str) -> Vec<(String, String)> {
-    body.split(';')
-        .filter_map(|d| {
-            let (k, v) = d.split_once(':')?;
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let push = |seg: &str, out: &mut Vec<(String, String)>| {
+        if let Some((k, v)) = seg.split_once(':') {
             let k = k.trim().to_ascii_lowercase();
             let v = v.trim().to_string();
-            if k.is_empty() || v.is_empty() {
-                None
-            } else {
-                Some((k, v))
+            if !k.is_empty() && !v.is_empty() {
+                out.push((k, v));
             }
-        })
-        .collect()
+        }
+    };
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ';' if depth == 0 => {
+                push(&body[start..i], &mut out);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push(&body[start..], &mut out);
+    out
 }
 
 // ─── cascade ──────────────────────────────────────────────────────────────
@@ -1702,6 +1722,7 @@ fn inherit(parent: &Style) -> Style {
         // Border line style and background gradient are not inherited.
         border_style_edges: [BorderStyle::Solid; 4],
         background_gradient: None,
+        background_image: None,
         // `vertical-align` is not inherited (resets to the initial value).
         vertical_align: VAlign::Top,
         // `border-collapse` IS inherited so it can be set once on the <table>
@@ -1994,6 +2015,17 @@ fn parse_css_gradient(v: &str, em: f64) -> Option<CssGradient> {
         return parse_conic_gradient(inner, em).map(CssGradient::Conic);
     }
     None
+}
+
+/// Extract the source from the first `url(...)` token in a value (quotes
+/// optional). `None` when there is no `url(...)`. base64 `data:` URIs and plain
+/// URLs contain no `)`, so the first `)` closes the function.
+pub(crate) fn extract_css_url(v: &str) -> Option<String> {
+    let lower = v.to_ascii_lowercase();
+    let open = lower.find("url(")? + 4;
+    let close = v[open..].find(')')? + open;
+    let inner = v[open..close].trim().trim_matches(['"', '\'']).trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 /// Parse the inside of a `radial-gradient(...)` into a [`RadialGradient`].
@@ -2851,6 +2883,12 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                     }
                     None => style.background = None,
                 }
+            }
+            // `url(...)` raster source. `background-color` never carries one; the
+            // `background` shorthand and `background-image` set (or, with no url,
+            // reset) it.
+            if prop != "background-color" {
+                style.background_image = extract_css_url(v);
             }
         }
         "font-size" => {
@@ -5094,6 +5132,26 @@ mod tests {
             [0.0, 0.0, 0.0],
             "prefix that doesn't match leaves p black"
         );
+    }
+
+    #[test]
+    fn background_image_url_is_captured() {
+        let s = inline_style("background-image:url(data:image/png;base64,AAAA)");
+        assert_eq!(
+            s.background_image.as_deref(),
+            Some("data:image/png;base64,AAAA")
+        );
+        // In the `background` shorthand too (quotes optional); the colour still parses.
+        let sh = inline_style("background:red url('http://x/y.png')");
+        assert_eq!(sh.background_image.as_deref(), Some("http://x/y.png"));
+        assert_eq!(sh.background, Some([1.0, 0.0, 0.0]));
+        // `background-color` never carries an image; gradients/none set no image.
+        assert!(inline_style("background-color:blue")
+            .background_image
+            .is_none());
+        assert!(inline_style("background-image:linear-gradient(red, blue)")
+            .background_image
+            .is_none());
     }
 
     #[test]

@@ -2208,7 +2208,9 @@ impl Flow<'_> {
         }
         let b = &style.border_width;
         let any_border = b.top + b.bottom + b.left + b.right > 0.0;
-        let any_bg = style.background.is_some() || style.background_gradient.is_some();
+        let any_bg = style.background.is_some()
+            || style.background_gradient.is_some()
+            || style.background_image.is_some();
         let radius = clamp_radius(style.border_radius, w, h);
         let radius_v = clamp_radius(style.border_radius_v, w, h);
         let rounded = radius.iter().any(|r| *r > 0.0) || radius_v.iter().any(|r| *r > 0.0);
@@ -2285,6 +2287,23 @@ impl Flow<'_> {
                 &style.border_style_edges,
                 (style.opacity * style.border_color_alpha).clamp(0.0, 1.0),
             );
+        }
+
+        // `background-image: url(...)` — a raster fill over the background colour,
+        // behind the content (z=0, pushed last so it sits above the colour). Fills
+        // the box; `background-size`/`-position`/`-repeat` are not yet modelled.
+        if let Some(src) = &style.background_image {
+            self.out.push(Abs {
+                z: 0,
+                zi: 0,
+                frag: Fragment::Image {
+                    x,
+                    y,
+                    w,
+                    h,
+                    src: src.clone(),
+                },
+            });
         }
     }
 

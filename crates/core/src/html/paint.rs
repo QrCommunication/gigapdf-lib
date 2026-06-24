@@ -288,6 +288,13 @@ fn collect_image_urls(nodes: &[Node], out: &mut Vec<String>) {
                     }
                 }
             }
+            // `background-image: url(...)` in an inline `style` is an external image
+            // too (a class-rule background still needs the cascade — not walked here).
+            if let Some(u) = e.attr("style").and_then(super::css::extract_css_url) {
+                if !u.starts_with("data:") && !out.iter().any(|x| x == &u) {
+                    out.push(u);
+                }
+            }
             collect_image_urls(&e.children, out);
         }
     }
