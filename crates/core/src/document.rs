@@ -9118,6 +9118,29 @@ impl Document {
             }
             self.append_page_content(page_no, &ops)?;
         }
+
+        // Filtered subtrees: each is a straight-alpha RGBA raster covering a
+        // viewBox-space region rectangle. Map that rectangle through the SAME
+        // viewBox→page transform `map` the primitives use, then place it via the
+        // shared image path (PNG → /DeviceRGB image + /DeviceGray /SMask).
+        for r in &img.rasters {
+            if r.pw == 0 || r.ph == 0 || r.rgba.len() < (r.pw as usize) * (r.ph as usize) * 4 {
+                continue;
+            }
+            // Region corners in PDF space: top-left and bottom-right (the map
+            // flips Y, so the region's top maps above its bottom).
+            let (px0, py_top) = map(r.x, r.y);
+            let (px1, py_bot) = map(r.x + r.w, r.y + r.h);
+            let pw = (px1 - px0).abs();
+            let ph = (py_top - py_bot).abs();
+            if pw <= 0.0 || ph <= 0.0 {
+                continue;
+            }
+            let png = crate::raster::png::encode_png(r.pw, r.ph, &r.rgba);
+            // Bottom-left origin for `add_image`; the image XObject is upright
+            // with row 0 (region top) at the top of the box.
+            self.add_image(page_no, &png, px0.min(px1), py_bot.min(py_top), pw, ph, 1.0)?;
+        }
         Ok(())
     }
 
@@ -19022,6 +19045,66 @@ mod tests {
             .expect("2x2 image XObject present after round-trip");
         // PNG → Flate /DeviceRGB embed is lossless: the samples must match.
         assert_eq!(embedded.rgba, rgba, "round-tripped pixels match the source");
+    }
+
+    #[test]
+    fn draw_svg_image_emits_filtered_raster_as_image_with_smask() {
+        // An SVG whose only content is a blur-filtered rect: `draw_svg_image`
+        // must place the filtered raster as an /Image XObject (a `Do` op) whose
+        // soft edge is carried by a /DeviceGray /SMask.
+        let svg = r##"<svg viewBox="0 0 80 80">
+            <filter id="blur" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="3"/>
+            </filter>
+            <rect x="20" y="20" width="40" height="40" fill="#ff0000" filter="url(#blur)"/>
+        </svg>"##;
+        let img = crate::svg::parse_svg(svg).expect("filtered SVG parses");
+        assert!(
+            img.prims.is_empty() && img.rasters.len() == 1,
+            "the filter produced one raster and no vector prims"
+        );
+
+        let pdf = crate::convert::reverse::txt_to_pdf("svg filter host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.draw_svg_image(1, &img, 100.0, 100.0, 160.0, 160.0)
+            .unwrap();
+
+        // The page content references an image XObject via a `Do` operator.
+        let content = doc.page_content(1).unwrap();
+        let do_count = content
+            .windows(3)
+            .filter(|w| w == b"Do\n" || *w == b"Do ")
+            .count();
+        assert!(
+            do_count >= 1,
+            "the filtered raster is drawn with a `Do` op (found {do_count})"
+        );
+
+        // An image XObject carrying a /SMask was emitted for the soft alpha.
+        let has_image_with_smask = doc.objects.values().any(|o| {
+            if let Object::Stream(s) = o {
+                let is_image = s
+                    .dict
+                    .get(b"Subtype")
+                    .and_then(Object::as_name)
+                    .map(|n| n == b"Image")
+                    .unwrap_or(false);
+                is_image && s.dict.get(b"SMask").is_some()
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_image_with_smask,
+            "the filtered raster is embedded as an /Image with an alpha /SMask"
+        );
+
+        // It survives a save/reopen round-trip as an image element on the page.
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(
+            !reopened.page_image_elements(1).is_empty(),
+            "the filtered raster persists as an image element after round-trip"
+        );
     }
 
     #[test]

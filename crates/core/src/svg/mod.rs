@@ -28,18 +28,12 @@ use crate::html::dom::{self, Element, Node};
 mod filter;
 
 // SVG **filter effects** (`filter="url(#…)"`). Implemented as a self-contained
-// raster pipeline in [`filter`]: an element's primitives are rasterized into the
-// filter region, the `fe*` primitive graph runs, and the result is returned as a
-// straight-alpha RGBA [`filter::Raster`] ready to composite back in place.
-//
-// Engine-internal API (no WASM/SDK surface). The PDF-emission seam — placing the
-// returned raster as an image XObject — lives in the page painter / document
-// image path ([`crate::document::Document::add_image`]), which owns the only
-// `&mut Document` and the `Prim`/`SvgImage` value types this module feeds. From
-// here the work is fully testable at the raster level; wiring the one call into
-// that painter is the single remaining integration step. Until then these
-// `pub(crate)` entry points are reachable only from tests, hence `dead_code`.
-#[allow(unused_imports)]
+// raster pipeline in [`filter`]: a filtered element's primitives are rasterized
+// into the filter region, the `fe*` primitive graph runs, and the result is a
+// straight-alpha RGBA [`filter::Raster`]. The [`walk`] realizes each filtered
+// subtree into an [`SvgRaster`] on [`SvgImage::rasters`]; the PDF-emission seam —
+// placing that raster as an image XObject — lives in
+// [`crate::document::Document::draw_svg_image`].
 pub(crate) use filter::{render_filter, Raster as FilterRaster};
 
 /// Apply the filter `#id` (from `svg_src`'s `<filter>` defs) to the first
@@ -114,6 +108,10 @@ fn find_filtered<'a>(
         let Node::Element(e) = n else { continue };
         let inherited = inherit_paint(e, paint);
         if filter::filter_url(e).as_deref() == Some(id) {
+            // Collect the filtered element's own prims (empty filter set so the
+            // walk does not re-enter the filter branch on the same element).
+            let empty = filter::Filters::new();
+            let mut raster_sink = Vec::new();
             walk(
                 std::slice::from_ref(n),
                 ancestor_ctm,
@@ -121,7 +119,9 @@ fn find_filtered<'a>(
                 ids,
                 grads,
                 pats,
+                &empty,
                 out,
+                &mut raster_sink,
                 0,
             );
             return true;
@@ -328,6 +328,26 @@ pub struct Prim {
     pub(crate) stroke_opacity: f64,
 }
 
+/// A filtered subtree realized as a straight-alpha RGBA raster, positioned by the
+/// filter region rectangle in viewBox user-space. [`Document::draw_svg_image`]
+/// maps `(x, y, w, h)` through the same viewBox→page transform the vector
+/// primitives use and emits it as an `/Image` (+ `/SMask`) XObject.
+#[derive(Debug, Clone)]
+pub(crate) struct SvgRaster {
+    /// Top-left of the region in viewBox coordinates (Y-down, like the prims).
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    /// Region size in viewBox user units.
+    pub(crate) w: f64,
+    pub(crate) h: f64,
+    /// `pw*ph*4` bytes, row-major top-to-bottom, straight (non-premultiplied)
+    /// alpha — the layout [`crate::raster::png::encode_png`] consumes.
+    pub(crate) rgba: Vec<u8>,
+    /// Raster pixel dimensions (`rgba.len() == pw * ph * 4`).
+    pub(crate) pw: u32,
+    pub(crate) ph: u32,
+}
+
 /// A parsed SVG ready to place onto a page (see `Document::draw_svg_image`).
 #[derive(Debug, Clone)]
 pub struct SvgImage {
@@ -338,6 +358,28 @@ pub struct SvgImage {
     /// `[min_x, min_y, w, h]` user-space box the primitives live in.
     pub(crate) view_box: [f64; 4],
     pub(crate) prims: Vec<Prim>,
+    /// Filtered subtrees, rasterized in viewBox space — drawn after `prims`.
+    pub(crate) rasters: Vec<SvgRaster>,
+}
+
+/// Convert a filter-engine [`FilterRaster`] (f32 straight-alpha) plus its
+/// user-space region rectangle `[x, y, w, h]` into an [`SvgRaster`] (8-bit RGBA).
+fn raster_to_svg(raster: &FilterRaster, rect: [f64; 4]) -> SvgRaster {
+    let mut rgba = Vec::with_capacity(raster.px.len());
+    for px in raster.px.chunks_exact(4) {
+        for &c in px {
+            rgba.push((c.clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    SvgRaster {
+        x: rect[0],
+        y: rect[1],
+        w: rect[2],
+        h: rect[3],
+        rgba,
+        pw: raster.w as u32,
+        ph: raster.h as u32,
+    }
 }
 
 /// Parse SVG markup. Returns `None` if there's no `<svg>` or it has no drawable
@@ -364,7 +406,10 @@ pub fn from_element(svg: &Element) -> Option<SvgImage> {
     collect_ids(&svg.children, &mut ids);
     let mut pats = Pats::new();
     collect_patterns(&svg.children, &mut pats);
+    let mut filters = filter::Filters::new();
+    filter::collect_filters(&svg.children, &mut filters);
     let mut prims = Vec::new();
+    let mut rasters = Vec::new();
     walk(
         &svg.children,
         Mat::identity(),
@@ -372,10 +417,12 @@ pub fn from_element(svg: &Element) -> Option<SvgImage> {
         &ids,
         &grads,
         &pats,
+        &filters,
         &mut prims,
+        &mut rasters,
         0,
     );
-    if prims.is_empty() {
+    if prims.is_empty() && rasters.is_empty() {
         return None;
     }
     Some(SvgImage {
@@ -383,6 +430,7 @@ pub fn from_element(svg: &Element) -> Option<SvgImage> {
         height,
         view_box,
         prims,
+        rasters,
     })
 }
 
@@ -408,11 +456,29 @@ fn walk(
     ids: &std::collections::HashMap<&str, &Node>,
     grads: &Grads,
     pats: &Pats,
+    filters: &filter::Filters,
     out: &mut Vec<Prim>,
+    rasters: &mut Vec<SvgRaster>,
     depth: u8,
 ) {
     for n in nodes {
         let Node::Element(e) = n else { continue };
+        // `filter="url(#id)"`: realize this element's whole subtree through the
+        // raster filter pipeline and emit a positioned [`SvgRaster`] instead of
+        // its normal vector primitives. The subtree is collected with the same
+        // `ctm`/`paint` it would render at (its own `transform` is applied by the
+        // nested `walk`), passing an *empty* filter set so the nested walk does
+        // not re-enter this branch for the same element.
+        if let Some(fid) = filter::filter_url(e) {
+            if filters.contains_key(&fid) {
+                if let Some(raster) =
+                    filtered_raster(n, ctm, paint, ids, grads, pats, filters, &fid, depth)
+                {
+                    rasters.push(raster);
+                }
+                continue;
+            }
+        }
         let ctm = match e.attr("transform") {
             Some(t) => ctm.then(&parse_transform(t)),
             None => ctm,
@@ -421,7 +487,18 @@ fn walk(
         let furl = fill_url(e);
         let furl = furl.as_deref();
         match e.tag.as_str() {
-            "g" | "a" | "svg" => walk(&e.children, ctm, paint, ids, grads, pats, out, depth),
+            "g" | "a" | "svg" => walk(
+                &e.children,
+                ctm,
+                paint,
+                ids,
+                grads,
+                pats,
+                filters,
+                out,
+                rasters,
+                depth,
+            ),
             "rect" => push(out, rect_segs(e), ctm, paint, furl, ids, grads, pats, depth),
             "circle" => {
                 let r = attr_f(e, "r");
@@ -507,7 +584,9 @@ fn walk(
                             ids,
                             grads,
                             pats,
+                            filters,
                             out,
+                            rasters,
                             depth + 1,
                         );
                     }
@@ -516,6 +595,53 @@ fn walk(
             _ => {} // <defs>/<title>/<style>/… ignored
         }
     }
+}
+
+/// Realize the subtree of the filtered element `n` (which carries
+/// `filter="url(#fid)"`) into a positioned [`SvgRaster`].
+///
+/// The element's own primitives are collected in viewBox space (its `transform`
+/// re-applied by the nested [`walk`], started at the enclosing `ctm` — exactly
+/// like rendering it normally), then handed to [`render_filter`] over the named
+/// `<filter>`. The nested walk is given an **empty** filter set so it does not
+/// recurse back into the filter branch for the same element; `<use>`, gradients
+/// and patterns inside the subtree still resolve through the shared registries.
+/// `None` when the subtree has no drawable geometry or the region is degenerate.
+#[allow(clippy::too_many_arguments)]
+fn filtered_raster(
+    n: &Node,
+    ctm: Mat,
+    paint: Paint,
+    ids: &std::collections::HashMap<&str, &Node>,
+    grads: &Grads,
+    pats: &Pats,
+    filters: &filter::Filters,
+    fid: &str,
+    depth: u8,
+) -> Option<SvgRaster> {
+    let mut sub_prims = Vec::new();
+    let mut sub_rasters = Vec::new();
+    let empty = filter::Filters::new();
+    walk(
+        std::slice::from_ref(n),
+        ctm,
+        paint,
+        ids,
+        grads,
+        pats,
+        &empty,
+        &mut sub_prims,
+        &mut sub_rasters,
+        depth,
+    );
+    if sub_prims.is_empty() {
+        return None;
+    }
+    // Device resolution: 1 raster pixel per viewBox user unit. The placed image
+    // is stretched to the region's PDF rectangle in `draw_svg_image`, and the
+    // region size itself is clamped inside the filter engine.
+    let (raster, rect) = render_filter(fid, &sub_prims, filters, 1.0)?;
+    Some(raster_to_svg(&raster, rect))
 }
 
 // ── text → vector glyph outlines ────────────────────────────────────────────────
@@ -1499,6 +1625,10 @@ fn build_tile_content(
     // full pattern registry is threaded so a child `fill="url(#inner)"` resolves
     // (nested patterns); the `depth` guard (in `push`) breaks pattern cycles.
     let mut content = Vec::new();
+    // Pattern content has no filter context threaded here; a `filter` inside a
+    // tile degrades to its plain vector prims (empty filter set).
+    let no_filters = filter::Filters::new();
+    let mut raster_sink = Vec::new();
     walk(
         &pat.children,
         content_mat,
@@ -1506,7 +1636,9 @@ fn build_tile_content(
         ids,
         grads,
         pats,
+        &no_filters,
         &mut content,
+        &mut raster_sink,
         depth.saturating_add(1),
     );
     content
@@ -2653,5 +2785,81 @@ mod tests {
             apply_filter(svg, "missing", 1.0).is_none(),
             "unknown filter id → None"
         );
+    }
+
+    #[test]
+    fn from_element_emits_a_raster_for_a_blurred_rect_and_drops_its_prim() {
+        // A single rect referencing a blur filter: `from_element` realizes it as
+        // a positioned raster and emits NO vector primitive for it.
+        let svg = r##"<svg viewBox="0 0 80 80">
+            <filter id="blur" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="3"/>
+            </filter>
+            <rect x="20" y="20" width="40" height="40" fill="#ff0000" filter="url(#blur)"/>
+        </svg>"##;
+        let img = parse_svg(svg).expect("filtered rect yields an SvgImage");
+        assert!(
+            img.prims.is_empty(),
+            "the filtered rect's vector prim is replaced by the raster ({} prims)",
+            img.prims.len()
+        );
+        assert_eq!(img.rasters.len(), 1, "exactly one filtered raster");
+        let r = &img.rasters[0];
+        assert!(r.pw > 0 && r.ph > 0, "raster has pixels");
+        assert_eq!(
+            r.rgba.len(),
+            (r.pw as usize) * (r.ph as usize) * 4,
+            "rgba length matches pw*ph*4"
+        );
+        // The region pads the rect's (20,20)..(60,60) bbox by -20%/140%.
+        assert!(
+            r.x < 20.0 && r.y < 20.0 && r.w >= 40.0 && r.h >= 40.0,
+            "region rect surrounds the rect bbox (x={}, y={}, w={}, h={})",
+            r.x,
+            r.y,
+            r.w,
+            r.h
+        );
+        // The blur leaves a soft, partial-alpha edge somewhere in the raster.
+        let has_falloff = r.rgba.chunks_exact(4).any(|p| p[3] > 12 && p[3] < 243);
+        assert!(has_falloff, "the blurred raster has a partial-alpha edge");
+    }
+
+    #[test]
+    fn from_element_emits_a_raster_for_fedropshadow() {
+        let svg = r##"<svg viewBox="0 0 80 80">
+            <filter id="ds" x="-50%" y="-50%" width="200%" height="200%">
+                <feDropShadow dx="6" dy="6" stdDeviation="2" flood-color="#000000"/>
+            </filter>
+            <rect x="20" y="20" width="30" height="30" fill="#00aa00" filter="url(#ds)"/>
+        </svg>"##;
+        let img = parse_svg(svg).expect("drop-shadowed rect yields an SvgImage");
+        assert!(img.prims.is_empty(), "no vector prim for the filtered rect");
+        assert_eq!(img.rasters.len(), 1, "one drop-shadow raster");
+        let r = &img.rasters[0];
+        // The shadow is an offset, blurred dark copy under the green source, so
+        // the raster carries both opaque-ish and translucent pixels.
+        let opaque = r.rgba.chunks_exact(4).any(|p| p[3] > 200);
+        let translucent = r.rgba.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 200);
+        assert!(
+            opaque && translucent,
+            "drop-shadow raster mixes the source and a faded shadow"
+        );
+    }
+
+    #[test]
+    fn unfiltered_element_is_unchanged_no_rasters() {
+        // The very same rect WITHOUT a filter renders as a vector prim and emits
+        // no raster — the filter path is inert when no `filter` is referenced.
+        let svg = r##"<svg viewBox="0 0 80 80">
+            <rect x="20" y="20" width="40" height="40" fill="#ff0000"/>
+        </svg>"##;
+        let img = parse_svg(svg).expect("plain rect parses");
+        assert!(img.rasters.is_empty(), "no filter → no rasters");
+        assert_eq!(img.prims.len(), 1, "the rect is a normal vector prim");
+        match img.prims[0].fill {
+            Some(Fill::Solid(c)) => assert_eq!(c, [1.0, 0.0, 0.0]),
+            _ => panic!("rect keeps its solid red fill"),
+        }
     }
 }

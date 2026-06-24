@@ -2140,6 +2140,7 @@ fn radial_gradient_svg_image(
         height: h,
         view_box: [0.0, 0.0, w, h],
         prims: vec![prim],
+        rasters: Vec::new(),
     })
 }
 
@@ -2211,6 +2212,7 @@ fn conic_gradient_svg_image(
         height: h,
         view_box: [0.0, 0.0, w, h],
         prims,
+        rasters: Vec::new(),
     })
 }
 
@@ -2361,6 +2363,7 @@ fn gradient_svg_image(
         height: h,
         view_box: [0.0, 0.0, w, h],
         prims: vec![prim],
+        rasters: Vec::new(),
     })
 }
 

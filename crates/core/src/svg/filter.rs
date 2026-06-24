@@ -22,11 +22,11 @@
 //! Integration note: this module is the complete raster filter engine. Its
 //! `pub(crate)` entry points ([`render_filter`], [`collect_filters`],
 //! [`filter_url`], [`apply_filter`](super::apply_filter)) are consumed by the
-//! page painter / document image path when realizing `filter="url(#…)"`. That
-//! wire-up lives in the frozen painter (the only holder of `&mut Document` and
-//! the `Prim`/`SvgImage` value types), so until it is added the engine is
-//! reachable only through tests — hence `#![allow(dead_code)]` here.
-#![allow(dead_code)]
+//! SVG walk ([`super::from_element`]) and the document image path when realizing
+//! `filter="url(#…)"`: a filtered element's subtree primitives are rasterized
+//! into the filter region, the `fe*` graph runs, and the resulting raster is
+//! carried on [`super::SvgImage::rasters`] and emitted as an image XObject by
+//! [`crate::document::Document::draw_svg_image`].
 
 use crate::content::svg_path::Seg;
 use crate::html::css::parse_color;
@@ -74,19 +74,6 @@ impl Raster {
         self.px[i + 1] = c[1];
         self.px[i + 2] = c[2];
         self.px[i + 3] = c[3];
-    }
-
-    /// Mean alpha across the whole raster — handy for tests / sanity checks.
-    #[cfg(test)]
-    pub(crate) fn mean_alpha(&self) -> f32 {
-        if self.px.is_empty() {
-            return 0.0;
-        }
-        let n = (self.w * self.h) as f32;
-        (0..self.w * self.h)
-            .map(|p| self.px[p * 4 + 3])
-            .sum::<f32>()
-            / n
     }
 }
 
@@ -1717,47 +1704,6 @@ fn parse_xy(v: Option<&str>, dflt: f64) -> (f64, f64) {
         0 => (dflt, dflt),
         1 => (list[0], list[0]),
         _ => (list[0], list[1]),
-    }
-}
-
-// ── back-composite onto an existing canvas (RGB-over-white) ──────────────────────
-
-/// Composite a filtered `raster` (straight alpha) over an RGB canvas at the
-/// device rectangle `(ox, oy)` top-left, scaling with nearest sampling. The
-/// canvas is RGB (opaque), matching the engine's [`crate::raster::Canvas`].
-/// Returned values overwrite in place. (Provided for callers that rasterize the
-/// whole SVG; the vector PDF path composites differently.)
-#[cfg(test)]
-pub(crate) fn composite_over_rgb(
-    raster: &Raster,
-    canvas_rgb: &mut [u8],
-    canvas_w: usize,
-    ox: i64,
-    oy: i64,
-) {
-    for y in 0..raster.h {
-        for x in 0..raster.w {
-            let p = raster.get(x as i64, y as i64);
-            let a = p[3];
-            if a <= 0.0 {
-                continue;
-            }
-            let cx = ox + x as i64;
-            let cy = oy + y as i64;
-            if cx < 0 || cy < 0 {
-                continue;
-            }
-            let (cx, cy) = (cx as usize, cy as usize);
-            let idx = (cy * canvas_w + cx) * 3;
-            if idx + 2 >= canvas_rgb.len() {
-                continue;
-            }
-            for c in 0..3 {
-                let dst = canvas_rgb[idx + c] as f32 / 255.0;
-                let v = p[c] * a + dst * (1.0 - a);
-                canvas_rgb[idx + c] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-            }
-        }
     }
 }
 
