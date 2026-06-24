@@ -2822,14 +2822,22 @@ impl Flow<'_> {
             (start, (end - start).max(1.0))
         };
 
-        // Explicit row-track heights (if any), indexed by row; `None` = auto
-        // (sized to the tallest cell). `auto`/`fr` rows resolve to auto here
-        // (no fixed height), matching the content-sized default.
+        // The grid's definite content-box height (its row track region), if the
+        // container has an explicit `height`. `fr`/`%` rows need it; without it
+        // they fall back to content (`auto`), the correct auto-height behaviour.
+        let avail_row_h = style
+            .height
+            .map(|h| (h - b.top - b.bottom - p.top - p.bottom).max(0.0));
+
+        // Explicit row-track height for row `r`, or `None` = auto (sized to the
+        // tallest cell). `pt` is fixed; `%` resolves against the container's
+        // definite height; `auto`/`fr` resolve to auto here (`fr` is distributed
+        // in a later pass once the auto rows' content heights are known).
         let row_track_h = |r: usize| -> Option<f64> {
-            style
-                .grid_template_rows
-                .get(r)
-                .and_then(track_fixed_height)
+            match style.grid_template_rows.get(r)? {
+                TrackSize::Percent(pct) => avail_row_h.map(|a| a * pct / 100.0),
+                t => track_fixed_height(t),
+            }
         };
 
         // Lay each row's cells out, tracking the tallest cell so the whole row
@@ -2838,8 +2846,12 @@ impl Flow<'_> {
         // size their row directly.
         let mut row_tops = vec![y_cursor; row_count];
         let mut row_bottoms = vec![y_cursor; row_count];
+        // `self.out` index at which each row's single-row-cell fragments begin —
+        // so a later `fr` pass can shift a whole row's content when the row grows.
+        let mut row_out_start = vec![self.out.len(); row_count];
         // First pass: place content for single-row cells, sizing each row.
         for r in 0..row_count {
+            row_out_start[r] = self.out.len();
             let row_top = if r == 0 {
                 y_cursor
             } else {
@@ -2866,9 +2878,14 @@ impl Flow<'_> {
             }
             row_bottoms[r] = row_bottom.max(row_top);
         }
+        // End of the last row's single-row fragments (spanning cells append after).
+        let span_start = self.out.len();
         // Second pass: row-spanning cells. Lay them out within their first row's
         // top; if their content overflows the spanned rows, grow the last row so
         // the grid still contains them (and shift later rows down).
+        // `(out range, first row)` per spanning cell, so the `fr` pass can shift
+        // them with their first row.
+        let mut span_ranges: Vec<(usize, usize, usize)> = Vec::new();
         for cell in placement.iter().filter(|p| p.row_span > 1) {
             let it = items[cell.item];
             let istyle = self.style_of(it, style, &na);
@@ -2877,6 +2894,7 @@ impl Flow<'_> {
             let ib = &istyle.border_width;
             let (cx, cw) = span_x(cell.col, cell.col_span);
             let top = row_tops[cell.row];
+            let span_out_start = self.out.len();
             let cy = self.block_children(
                 &it.children,
                 &istyle,
@@ -2885,6 +2903,7 @@ impl Flow<'_> {
                 top + ip.top + ib.top,
                 &nca,
             );
+            span_ranges.push((span_out_start, self.out.len(), cell.row));
             let needed = cy + ip.bottom + ib.bottom;
             let last_row = (cell.row + cell.row_span - 1).min(row_count - 1);
             if needed > row_bottoms[last_row] {
@@ -2893,6 +2912,54 @@ impl Flow<'_> {
                 for r in last_row..row_count {
                     row_tops[r] += if r == last_row { 0.0 } else { grow };
                     row_bottoms[r] += grow;
+                }
+            }
+        }
+
+        // `fr` rows: distribute the grid's leftover *definite* height across the
+        // `fr`-sized rows. The auto rows' content heights are known now, so the
+        // free space is `avail − every non-fr row − gaps`. Growing an `fr` row
+        // shifts every following row — and its already-placed content — down by
+        // the accumulated extra height. No definite `avail` ⇒ no `fr` distribution
+        // (those rows kept their content height above, the auto-grid default).
+        if let Some(avail) = avail_row_h {
+            let fr_factor = |r: usize| match style.grid_template_rows.get(r) {
+                Some(TrackSize::Fr(f)) if *f > 0.0 => *f,
+                _ => 0.0,
+            };
+            let fr_sum: f64 = (0..row_count).map(fr_factor).sum();
+            if fr_sum > 0.0 {
+                let gaps = gap_row * row_count.saturating_sub(1) as f64;
+                let non_fr: f64 = (0..row_count)
+                    .filter(|&r| fr_factor(r) == 0.0)
+                    .map(|r| row_bottoms[r] - row_tops[r])
+                    .sum();
+                let free = (avail - non_fr - gaps).max(0.0);
+                let mut shift = 0.0;
+                for r in 0..row_count {
+                    let content_h = row_bottoms[r] - row_tops[r];
+                    // `fr` rows take their share but never shrink below content.
+                    let new_h = if fr_factor(r) > 0.0 {
+                        (free * fr_factor(r) / fr_sum).max(content_h)
+                    } else {
+                        content_h
+                    };
+                    if shift != 0.0 {
+                        let end = row_out_start.get(r + 1).copied().unwrap_or(span_start);
+                        for i in row_out_start[r]..end {
+                            shift_fragment(&mut self.out[i].frag, 0.0, shift);
+                        }
+                        for &(s, e, row) in &span_ranges {
+                            if row == r {
+                                for i in s..e {
+                                    shift_fragment(&mut self.out[i].frag, 0.0, shift);
+                                }
+                            }
+                        }
+                    }
+                    row_tops[r] += shift;
+                    row_bottoms[r] = row_tops[r] + new_h;
+                    shift += new_h - content_h;
                 }
             }
         }
@@ -5333,6 +5400,34 @@ mod tests {
         assert!(
             yf > ya + 60.0,
             "explicit 100pt first row pushes R2 well below the auto layout (fixed={yf}, auto={ya})"
+        );
+    }
+
+    #[test]
+    fn grid_fr_rows_split_a_definite_height() {
+        // A 400pt-tall grid with `1fr 3fr` rows: row 1 = 100pt, row 2 = 300pt, so
+        // R2's content sits ~100pt (the 1fr row) below R1's.
+        let layout = run(
+            r#"<div style="display:grid;height:400pt;grid-template-columns:1fr;grid-template-rows:1fr 3fr"><div>R1</div><div>R2</div></div>"#,
+        );
+        let gap = cell_y(&layout, "R2") - cell_y(&layout, "R1");
+        assert!(
+            (gap - 100.0).abs() < 12.0,
+            "1fr row ≈ 100pt of the 400pt grid (R2 is {gap}pt below R1)"
+        );
+    }
+
+    #[test]
+    fn grid_percent_rows_resolve_against_definite_height() {
+        // `25% auto` rows in a 400pt grid: the first row is 100pt, so R2 sits
+        // ~100pt below R1. `%` rows need the container's definite height.
+        let layout = run(
+            r#"<div style="display:grid;height:400pt;grid-template-columns:1fr;grid-template-rows:25% auto"><div>R1</div><div>R2</div></div>"#,
+        );
+        let gap = cell_y(&layout, "R2") - cell_y(&layout, "R1");
+        assert!(
+            (gap - 100.0).abs() < 12.0,
+            "25% row ≈ 100pt of the 400pt grid (R2 is {gap}pt below R1)"
         );
     }
 

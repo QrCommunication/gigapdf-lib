@@ -7,6 +7,19 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.86.1] - 2026-06-24
+
+HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).
+
+### Added
+
+- **`grid-template-rows` with `%` and `fr`** (previously only fixed `pt` rows were
+  honoured). `%` rows resolve against the grid's definite `height`; `fr` rows share
+  the leftover space after the fixed / `%` / `auto` rows and gaps, growing the rows
+  (and shifting their already-placed content) to fill the container. With no
+  definite grid height `%`/`fr` fall back to content sizing — the correct
+  auto-height behaviour. `auto` and `minmax()` unchanged.
+
 ## [0.86.0] - 2026-06-24
 
 HTML/CSS renderer — real `overflow` clipping ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).

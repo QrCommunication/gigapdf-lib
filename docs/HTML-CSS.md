@@ -225,7 +225,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | Property | Values | Notes |
 |----------|--------|-------|
 | `grid-template-columns` | track list — `px`, `%`, `fr`, `auto`, `minmax()`, `repeat(N, …)` | fully resolved to real column widths |
-| `grid-template-rows` | track list | **only fixed `pt` row heights are honoured**; `fr`/`%`/`auto` rows fall back to content height |
+| `grid-template-rows` | track list — `pt`, `%`, `fr`, `auto`, `minmax()` | `pt` fixed; `auto` sizes to the tallest cell; `%` and `fr` resolve against the grid's **definite `height`** (`%` = that fraction, `fr` shares the leftover) — with no definite height they fall back to content, the correct auto-height behaviour |
 | `grid-column` / `grid-row` (+ `-start` / `-end`) | `N`, `N / M`, `span N` | numeric line placement and spanning |
 | `gap` / `row-gap` / `column-gap` / `grid-gap` | length | gutters |
 
@@ -417,9 +417,8 @@ simply skipped — so a richer stylesheet degrades gracefully to the supported
 subset.
 
 - **Layout/sizing**: `aspect-ratio`, a true scroll model for `position: sticky`.
-  `grid-template-areas` / named grid lines and `grid-template-rows` with
-  `fr`/`%`/`auto` (use fixed `pt` rows or numeric placement). `flex-shrink` /
-  `flex-basis` on the **column** axis.
+  `grid-template-areas` / named grid lines (use numeric placement). `flex-shrink`
+  / `flex-basis` on the **column** axis.
 - **Visual effects**: `transform`, `filter`, `text-shadow`, `box-shadow: inset`
   and true Gaussian blur, `background-image: url()` raster (use `<img>`),
   CSS tiling patterns. (Gradients, rounded corners and offset/spread shadows
