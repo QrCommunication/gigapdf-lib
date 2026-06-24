@@ -200,7 +200,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `display` | `block`, `inline`, `inline-block`, `list-item`, `table`, `table-row`, `table-cell`, `flex`, `inline-flex`, `grid`, `inline-grid`, `none` | |
 | `float` | `left`, `right`, `none` | the box leaves flow and **inline** content wraps beside it. Caveats: shrink-to-fit width ≈ ⅓ of the line when none is given; block-level siblings do **not** wrap beside a float |
 | `clear` | `left`, `right`, `both`, `none` | drop below earlier floats |
-| `position` | `static`, `relative`, `absolute`, `fixed`, `sticky` | `relative` shifts by `inset`; `absolute` is placed by `inset` against the nearest positioned ancestor; `fixed` against the page box; `sticky` is treated as `relative` (no scroll model) |
+| `position` | `static`, `relative`, `absolute`, `fixed`, `sticky` | `relative` shifts by `inset`; `absolute` is placed by `inset` against the nearest positioned ancestor; `fixed` against the page box; `sticky` resolves to `relative` — per CSS, sticky needs a **scrolling** containing block, and paged/print output has none, so this is the correct behaviour for print |
 | `top` / `right` / `bottom` / `left` | length or `%` | offsets for positioned boxes (`%` of the containing block) |
 | `z-index` | integer | paint order among positioned boxes |
 | `overflow` | `visible`, `hidden`, `clip` | `hidden`/`clip` emit a **real PDF clip** (`q … W n … Q`): fragments fully outside the padding box are dropped, those straddling an edge are pixel-clipped to it (text, images, backgrounds, gradients — text runs carry their advance width). A **`border-radius`** box clips to the **rounded** contour (a bezier clip path). Nested clipping boxes intersect |
@@ -444,9 +444,8 @@ following are out of scope; unknown properties and elements never error — they
 simply skipped — so a richer stylesheet degrades gracefully to the supported
 subset.
 
-- **Layout/sizing**: a true scroll model for `position: sticky`. Named grid
-  **lines** (use numeric placement or named **areas** — `grid-template-areas`
-  **is** supported, see [grid](#grid)).
+- **Layout/sizing**: named grid **lines** (use numeric placement or named
+  **areas** — `grid-template-areas` **is** supported, see [grid](#grid)).
 - **Visual effects**: `filter`, true Gaussian blur, CSS tiling patterns.
   (Gradients, rounded corners, offset/spread/**inset** box-shadows,
   **`text-shadow`**, **`transform`**, and **`background-image: url()`** **are**
