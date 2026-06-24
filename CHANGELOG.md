@@ -7,6 +7,16 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.85.3] - 2026-06-24
+
+HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).
+
+### Fixed
+
+- **`justify-content: space-evenly`** now distributes `n + 1` equal gaps (one
+  before each item and one after the last) instead of being aliased to
+  `space-around` (which puts half-size gaps at the ends). New `Justify::SpaceEvenly`.
+
 ## [0.85.2] - 2026-06-24
 
 HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item C).

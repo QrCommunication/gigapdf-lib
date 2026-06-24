@@ -584,6 +584,7 @@ pub enum Justify {
     End,
     SpaceBetween,
     SpaceAround,
+    SpaceEvenly,
 }
 
 impl Default for Style {
@@ -2212,7 +2213,8 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
                 "center" => Justify::Center,
                 "flex-end" | "end" | "right" => Justify::End,
                 "space-between" => Justify::SpaceBetween,
-                "space-around" | "space-evenly" => Justify::SpaceAround,
+                "space-around" => Justify::SpaceAround,
+                "space-evenly" => Justify::SpaceEvenly,
                 _ => Justify::Start,
             };
         }

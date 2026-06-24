@@ -44,6 +44,12 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.85.3] - 2026-06-24
+
+HTML/CSS renderer: `justify-content: space-evenly` now uses `n + 1` equal gaps
+(was aliased to `space-around`) in the HTML→PDF path
+([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) item A). No API change.
+
 ## [0.85.2] - 2026-06-24
 
 HTML/CSS renderer: `currentColor` now resolves to the element's cascaded `color`

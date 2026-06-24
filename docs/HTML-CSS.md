@@ -210,7 +210,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 |----------|--------|-------|
 | `flex-direction` | `row` (default), `column` | `row-reverse` / `column-reverse` are treated as the forward axis |
 | `flex-wrap` | `nowrap`, `wrap` | wraps onto new lines (row axis) |
-| `justify-content` | `flex-start`/`start`, `center`, `flex-end`/`end`, `space-between`, `space-around` | main-axis distribution; `space-evenly` behaves as `space-around` |
+| `justify-content` | `flex-start`/`start`, `center`, `flex-end`/`end`, `space-between`, `space-around`, `space-evenly` | main-axis distribution (`space-evenly` = `n + 1` equal gaps) |
 | `align-items` / `align-self` | `stretch` (default), `flex-start`, `center`, `flex-end` | cross-axis alignment |
 | `order` | integer | reorders items before layout |
 | `flex-grow` | number | growth weight |
@@ -420,7 +420,7 @@ subset.
   model for `position: sticky`. `grid-template-areas` / named grid lines and
   `grid-template-rows` with `fr`/`%`/`auto` (use fixed `pt` rows or numeric
   placement). `flex-shrink` / `flex-basis` on the **column** axis,
-  `flex-direction: row-reverse` / `column-reverse`, `justify-content: space-evenly`.
+  `flex-direction: row-reverse` / `column-reverse`.
 - **Visual effects**: `transform`, `filter`, `text-shadow`, `box-shadow: inset`
   and true Gaussian blur, `background-image: url()` raster (use `<img>`),
   CSS tiling patterns. (Gradients, rounded corners and offset/spread shadows

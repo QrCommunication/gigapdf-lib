@@ -3341,6 +3341,12 @@ fn justify_offsets(j: Justify, free: f64, n: usize) -> (f64, f64) {
         Justify::End => (free, 0.0),
         Justify::SpaceBetween => (0.0, if n > 1 { free / (n - 1) as f64 } else { 0.0 }),
         Justify::SpaceAround => (free / (2.0 * n as f64), free / n as f64),
+        // Equal gaps everywhere — `n + 1` of them (one before each item, one
+        // after the last), so leading == inter-item gap.
+        Justify::SpaceEvenly => {
+            let gap = free / (n + 1) as f64;
+            (gap, gap)
+        }
     }
 }
 
@@ -5316,6 +5322,25 @@ mod tests {
         let b = cell_x(&layout, "B");
         assert!((a - 36.0).abs() < 4.0, "A pinned to the left ({a})");
         assert!(b > 36.0 + 400.0, "B pushed to the right edge ({b})");
+    }
+
+    #[test]
+    fn flex_justify_content_space_evenly_uses_equal_gaps() {
+        // space-evenly distributes `n + 1` EQUAL gaps: the leading gap (before the
+        // first item) equals the gap between items — unlike space-around, which
+        // puts half-size gaps at the two ends.
+        let layout = run(
+            r#"<div style="display:flex;justify-content:space-evenly"><div style="flex:0 0 100pt">A</div><div style="flex:0 0 100pt">B</div></div>"#,
+        );
+        let a = cell_x(&layout, "A");
+        let b = cell_x(&layout, "B");
+        let left_gap = a - 36.0; // before A (content band starts ~36pt)
+        let mid_gap = b - (a + 100.0); // between A's right edge and B (A is 100pt wide)
+        assert!(left_gap > 50.0, "non-trivial leading gap ({left_gap})");
+        assert!(
+            (left_gap - mid_gap).abs() < 5.0,
+            "equal gaps: leading {left_gap} vs inter-item {mid_gap}"
+        );
     }
 
     #[test]
