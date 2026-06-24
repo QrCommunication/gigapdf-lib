@@ -55,6 +55,152 @@ fn run_size(style: &CharStyle) -> f64 {
     }
 }
 
+// ─────────────────────────── document properties (meta) ───────────────────────────
+
+/// Application name stamped into OOXML `docProps/app.xml` and ODF
+/// `meta:generator`.
+const META_GENERATOR: &str = "GigaPDF";
+
+/// OOXML `docProps/core.xml` (`cp:coreProperties`, ECMA-376 Part 2 §11) from the
+/// model metadata. Absent fields are omitted (never fabricated). `dc:title` /
+/// `dc:creator` / `dc:subject` / `cp:keywords` map directly; `dc:language`
+/// carries the BCP-47 tag when set.
+fn ooxml_core_props(meta: &crate::model::DocMeta) -> String {
+    let mut body = String::new();
+    if let Some(title) = meta.title.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(title, &mut v);
+        body.push_str(&format!("<dc:title>{v}</dc:title>"));
+    }
+    if let Some(author) = meta.author.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(author, &mut v);
+        body.push_str(&format!("<dc:creator>{v}</dc:creator>"));
+    }
+    if let Some(subject) = meta.subject.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(subject, &mut v);
+        body.push_str(&format!("<dc:subject>{v}</dc:subject>"));
+    }
+    if !meta.keywords.is_empty() {
+        let mut v = String::new();
+        esc(&meta.keywords.join(", "), &mut v);
+        body.push_str(&format!("<cp:keywords>{v}</cp:keywords>"));
+    }
+    if let Some(lang) = meta.lang.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(lang, &mut v);
+        body.push_str(&format!("<dc:language>{v}</dc:language>"));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+xmlns:dcterms=\"http://purl.org/dc/terms/\" \
+xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" \
+xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">{body}</cp:coreProperties>"
+    )
+}
+
+/// OOXML `docProps/app.xml` (extended properties, ECMA-376 Part 1 §15.2.12.2):
+/// just the generating application — there is no per-document data to fabricate.
+fn ooxml_app_props() -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" \
+xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">\
+<Application>{META_GENERATOR}</Application></Properties>"
+    )
+}
+
+/// `[Content_Types].xml` Overrides for the two `docProps` parts (shared by every
+/// OOXML package).
+const OOXML_DOCPROPS_OVERRIDES: &str = "<Override PartName=\"/docProps/core.xml\" \
+ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>\
+<Override PartName=\"/docProps/app.xml\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>";
+
+/// Package-root `_rels/.rels` Relationships for the two `docProps` parts (the
+/// `officeDocument` relationship is supplied per format by the caller).
+const OOXML_DOCPROPS_RELS: &str = "<Relationship Id=\"rIdCore\" \
+Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" \
+Target=\"docProps/core.xml\"/>\
+<Relationship Id=\"rIdApp\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" \
+Target=\"docProps/app.xml\"/>";
+
+/// ODF `meta.xml` (`office:document-meta` → `office:meta`, ISO 26300 §3/§4) from
+/// the model metadata. Absent fields are omitted. Mirrors the OOXML core part:
+/// `dc:title` / `dc:creator` / `dc:subject` / `meta:keyword` / `dc:language`.
+fn odf_meta_xml(meta: &crate::model::DocMeta) -> String {
+    let mut body = format!("<meta:generator>{META_GENERATOR}</meta:generator>");
+    if let Some(title) = meta.title.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(title, &mut v);
+        body.push_str(&format!("<dc:title>{v}</dc:title>"));
+    }
+    if let Some(subject) = meta.subject.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(subject, &mut v);
+        body.push_str(&format!("<dc:subject>{v}</dc:subject>"));
+    }
+    if let Some(author) = meta.author.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(author, &mut v);
+        body.push_str(&format!("<dc:creator>{v}</dc:creator>"));
+    }
+    if let Some(lang) = meta.lang.as_deref().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(lang, &mut v);
+        body.push_str(&format!("<dc:language>{v}</dc:language>"));
+    }
+    for kw in &meta.keywords {
+        if kw.is_empty() {
+            continue;
+        }
+        let mut v = String::new();
+        esc(kw, &mut v);
+        body.push_str(&format!("<meta:keyword>{v}</meta:keyword>"));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<office:document-meta xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
+xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\" \
+xmlns:dc=\"http://purl.org/dc/elements/1.1/\" office:version=\"1.3\">\
+<office:meta>{body}</office:meta></office:document-meta>"
+    )
+}
+
+/// ODF `<style:default-style>` carrying the document default language, for
+/// `styles.xml`'s `office:styles` block (ISO 26300 §16.2). Splits a BCP-47 tag
+/// into `fo:language` + `fo:country` (`fr-FR` → `fr` / `FR`). Empty when no
+/// language is set, so a language-less document emits nothing.
+fn odf_default_lang_styles(meta: &crate::model::DocMeta) -> String {
+    let Some(tag) = meta.lang.as_deref().filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    let mut parts = tag.split(['-', '_']);
+    let lang = parts.next().unwrap_or("");
+    let mut attrs = String::new();
+    if !lang.is_empty() {
+        let mut v = String::new();
+        esc(lang, &mut v);
+        attrs.push_str(&format!(" fo:language=\"{v}\""));
+    }
+    if let Some(country) = parts.next().filter(|s| !s.is_empty()) {
+        let mut v = String::new();
+        esc(country, &mut v);
+        attrs.push_str(&format!(" fo:country=\"{v}\""));
+    }
+    if attrs.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<office:styles><style:default-style style:family=\"paragraph\">\
+<style:text-properties{attrs}/></style:default-style></office:styles>"
+    )
+}
+
 // ════════════════════════════════════ DOCX ════════════════════════════════════
 
 /// Serialize a [`Document`] to a **flowing** Word document (`.docx`).
@@ -94,17 +240,25 @@ pub fn docx_from_model(doc: &Document) -> Vec<u8> {
     );
     zip.add_deflated(
         "_rels/.rels",
-        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" \
-Target=\"word/document.xml\"/></Relationships>",
+Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
+        )
+        .as_bytes(),
     );
+    zip.add_deflated("docProps/core.xml", ooxml_core_props(&doc.meta).as_bytes());
+    zip.add_deflated("docProps/app.xml", ooxml_app_props().as_bytes());
     zip.add_deflated("word/document.xml", body.as_bytes());
     zip.add_deflated(
         "word/_rels/document.xml.rels",
         docx_rels(ctx.images.len(), has_num, has_header, has_footer).as_bytes(),
     );
-    zip.add_deflated("word/styles.xml", docx_styles_xml().as_bytes());
+    zip.add_deflated(
+        "word/styles.xml",
+        docx_styles_xml(doc.meta.lang.as_deref()).as_bytes(),
+    );
     if has_num {
         zip.add_deflated(
             "word/numbering.xml",
@@ -762,7 +916,7 @@ ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.foo
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
 <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
-<Default Extension=\"xml\" ContentType=\"application/xml\"/>{png}{overrides}</Types>"
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>{png}{overrides}{OOXML_DOCPROPS_OVERRIDES}</Types>"
     )
 }
 
@@ -801,11 +955,23 @@ Target=\"media/image{n}.png\"/>",
 }
 
 /// Minimal styles.xml defining `Normal` + `Heading1`..`Heading6` with outline
-/// levels, so heading paragraphs are recognised as such.
-fn docx_styles_xml() -> String {
-    let mut s = String::from(
+/// levels, so heading paragraphs are recognised as such. When the document
+/// carries a language tag, a `w:docDefaults` default-run language is emitted
+/// (ECMA-376 §17.7.5.7) so spell-check / hyphenation pick the right language.
+fn docx_styles_xml(lang: Option<&str>) -> String {
+    let defaults = match lang.filter(|s| !s.is_empty()) {
+        Some(tag) => {
+            let mut v = String::new();
+            esc(tag, &mut v);
+            format!(
+                "<w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val=\"{v}\"/></w:rPr></w:rPrDefault></w:docDefaults>"
+            )
+        }
+        None => String::new(),
+    };
+    let mut s = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{defaults}\
 <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/></w:style>",
     );
     let sizes = [32, 26, 24, 22, 20, 18]; // half-points: H1=16pt … H6=9pt
@@ -907,11 +1073,16 @@ pub fn xlsx_from_model(doc: &Document) -> Vec<u8> {
     );
     zip.add_deflated(
         "_rels/.rels",
-        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" \
-Target=\"xl/workbook.xml\"/></Relationships>",
+Target=\"xl/workbook.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
+        )
+        .as_bytes(),
     );
+    zip.add_deflated("docProps/core.xml", ooxml_core_props(&doc.meta).as_bytes());
+    zip.add_deflated("docProps/app.xml", ooxml_app_props().as_bytes());
     zip.add_deflated(
         "xl/workbook.xml",
         xlsx_model_workbook(count, &names).as_bytes(),
@@ -1383,6 +1554,7 @@ ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksh
             i + 1
         ));
     }
+    s.push_str(OOXML_DOCPROPS_OVERRIDES);
     s.push_str("</Types>");
     s
 }
@@ -1460,11 +1632,16 @@ pub fn pptx_from_model(doc: &Document) -> Vec<u8> {
     );
     zip.add_deflated(
         "_rels/.rels",
-        b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" \
-Target=\"ppt/presentation.xml\"/></Relationships>",
+Target=\"ppt/presentation.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
+        )
+        .as_bytes(),
     );
+    zip.add_deflated("docProps/core.xml", ooxml_core_props(&doc.meta).as_bytes());
+    zip.add_deflated("docProps/app.xml", ooxml_app_props().as_bytes());
     zip.add_deflated(
         "ppt/presentation.xml",
         pptx_model_presentation(slide_xmls.len(), sw, sh).as_bytes(),
@@ -1715,6 +1892,7 @@ ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide
             i + 1
         ));
     }
+    s.push_str(OOXML_DOCPROPS_OVERRIDES);
     s.push_str("</Types>");
     s
 }
@@ -1821,9 +1999,11 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
             &hf_ctx.auto,
             header_xml.as_deref(),
             footer_xml.as_deref(),
+            &odf_default_lang_styles(&doc.meta),
         )
         .as_bytes(),
     );
+    zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
     let image_count = ctx.images.len() + hf_ctx.images.len();
     zip.add_deflated(
         "META-INF/manifest.xml",
@@ -1869,15 +2049,31 @@ pub fn ods_from_model(doc: &Document) -> Vec<u8> {
     );
     zip.add_deflated(
         "styles.xml",
-        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<office:document-styles xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
-office:version=\"1.3\"></office:document-styles>",
+        ods_styles_xml(&odf_default_lang_styles(&doc.meta)).as_bytes(),
     );
+    zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
     zip.add_deflated(
         "META-INF/manifest.xml",
         odf_manifest("spreadsheet", 0).as_bytes(),
     );
     zip.finish()
+}
+
+/// ODS `styles.xml`: an otherwise-empty `office:document-styles`, optionally
+/// carrying the document default-language `style:default-style` (ISO 26300
+/// §16.2). The `style:` namespace is declared only when the block is present.
+fn ods_styles_xml(default_styles: &str) -> String {
+    let style_ns = if default_styles.is_empty() {
+        ""
+    } else {
+        " xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
+xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\""
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<office:document-styles xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\"{style_ns} \
+office:version=\"1.3\">{default_styles}</office:document-styles>"
+    )
 }
 
 /// Serialize a [`Document`]'s slides to an OpenDocument Presentation (`.odp`):
@@ -1901,7 +2097,11 @@ pub fn odp_from_model(doc: &Document) -> Vec<u8> {
         "content.xml",
         odp_model_content(&ctx.auto, &body).as_bytes(),
     );
-    zip.add_deflated("styles.xml", odp_styles_xml_model(pw, ph).as_bytes());
+    zip.add_deflated(
+        "styles.xml",
+        odp_styles_xml_model(pw, ph, &odf_default_lang_styles(&doc.meta)).as_bytes(),
+    );
+    zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
     zip.add_deflated(
         "META-INF/manifest.xml",
         odf_manifest("presentation", ctx.images.len()).as_bytes(),
@@ -2229,6 +2429,7 @@ fn odf_text_styles_xml(
     hf_auto: &str,
     header: Option<&str>,
     footer: Option<&str>,
+    default_styles: &str,
 ) -> String {
     let orient = if ph >= pw { "portrait" } else { "landscape" };
     // Page margins (omit zero edges so a default geometry stays clean).
@@ -2275,7 +2476,7 @@ xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" office:
 <office:automatic-styles>{frame_style}{hf_auto}\
 <style:page-layout style:name=\"pm1\">\
 <style:page-layout-properties fo:page-width=\"{w}pt\" fo:page-height=\"{h}pt\" \
-style:print-orientation=\"{o}\"{margin_attrs}/></style:page-layout></office:automatic-styles>\
+style:print-orientation=\"{o}\"{margin_attrs}/></style:page-layout></office:automatic-styles>{default_styles}\
 <office:master-styles>\
 <style:master-page style:name=\"Standard\" style:page-layout-name=\"pm1\">{header_xml}{footer_xml}</style:master-page>\
 </office:master-styles></office:document-styles>",
@@ -2420,7 +2621,8 @@ fn odf_manifest(kind: &str, image_count: usize) -> String {
 <manifest:manifest xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\" manifest:version=\"1.3\">\
 <manifest:file-entry manifest:full-path=\"/\" manifest:version=\"1.3\" manifest:media-type=\"{media}\"/>\
 <manifest:file-entry manifest:full-path=\"content.xml\" manifest:media-type=\"text/xml\"/>\
-<manifest:file-entry manifest:full-path=\"styles.xml\" manifest:media-type=\"text/xml\"/>"
+<manifest:file-entry manifest:full-path=\"styles.xml\" manifest:media-type=\"text/xml\"/>\
+<manifest:file-entry manifest:full-path=\"meta.xml\" manifest:media-type=\"text/xml\"/>"
     );
     for i in 0..image_count {
         s.push_str(&format!(
@@ -2931,7 +3133,7 @@ xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
     )
 }
 
-fn odp_styles_xml_model(pw: f64, ph: f64) -> String {
+fn odp_styles_xml_model(pw: f64, ph: f64, default_styles: &str) -> String {
     let orient = if ph >= pw { "portrait" } else { "landscape" };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -2942,7 +3144,7 @@ xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" office:version=
 <office:automatic-styles>\
 <style:page-layout style:name=\"pm1\">\
 <style:page-layout-properties fo:page-width=\"{w}pt\" fo:page-height=\"{h}pt\" \
-style:print-orientation=\"{o}\"/></style:page-layout></office:automatic-styles>\
+style:print-orientation=\"{o}\"/></style:page-layout></office:automatic-styles>{default_styles}\
 <office:master-styles>\
 <style:master-page style:name=\"Default\" style:page-layout-name=\"pm1\"/>\
 </office:master-styles></office:document-styles>",
@@ -6360,5 +6562,260 @@ mod tests {
         assert!(document.contains("x = 1"), "code text present");
         assert!(document.contains("<w:pBdr>"), "rule emits a paragraph border");
         assert!(document.contains("docx quote"), "quote text present");
+    }
+
+    // ── document properties (metadata + language) ───────────────────────────────
+
+    /// A one-paragraph document with full metadata + a `fr-FR` language tag.
+    fn meta_doc() -> Document {
+        Document {
+            meta: crate::model::DocMeta {
+                title: Some("My <Title>".to_string()),
+                author: Some("Jane Doe".to_string()),
+                subject: Some("Quarterly".to_string()),
+                keywords: vec!["alpha".to_string(), "beta".to_string()],
+                lang: Some("fr-FR".to_string()),
+            },
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![para("Body.")],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A sheet document carrying the same metadata (for XLSX/ODS).
+    fn meta_sheet_doc() -> Document {
+        let mut doc = sheet_doc(Sheet {
+            name: "S".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("x".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        });
+        doc.meta = meta_doc().meta;
+        doc
+    }
+
+    /// A slide document carrying the same metadata (for PPTX/ODP).
+    fn meta_slide_doc() -> Document {
+        use crate::model::{Placeholder, PlaceholderRole, Slide, SlideBlock};
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+            },
+            shapes: Vec::new(),
+            placeholders: vec![Placeholder {
+                role: PlaceholderRole::Title,
+                block: para("T"),
+            }],
+            notes: None,
+        };
+        Document {
+            meta: meta_doc().meta,
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Assert an OOXML package wires both docProps parts through
+    /// `[Content_Types].xml` + `_rels/.rels`, and that `core.xml` carries the
+    /// model metadata (with XML escaping).
+    fn assert_ooxml_docprops(bytes: &[u8]) {
+        let core = String::from_utf8(entry(bytes, "docProps/core.xml").unwrap()).unwrap();
+        assert!(
+            core.contains("<dc:title>My &lt;Title&gt;</dc:title>"),
+            "title escaped: {core}"
+        );
+        assert!(
+            core.contains("<dc:creator>Jane Doe</dc:creator>"),
+            "creator: {core}"
+        );
+        assert!(
+            core.contains("<dc:subject>Quarterly</dc:subject>"),
+            "subject: {core}"
+        );
+        assert!(
+            core.contains("<cp:keywords>alpha, beta</cp:keywords>"),
+            "keywords: {core}"
+        );
+        assert!(
+            core.contains("<dc:language>fr-FR</dc:language>"),
+            "language: {core}"
+        );
+
+        let app = String::from_utf8(entry(bytes, "docProps/app.xml").unwrap()).unwrap();
+        assert!(
+            app.contains("<Application>GigaPDF</Application>"),
+            "app name: {app}"
+        );
+
+        let ct = String::from_utf8(entry(bytes, "[Content_Types].xml").unwrap()).unwrap();
+        assert!(
+            ct.contains("PartName=\"/docProps/core.xml\""),
+            "core override declared: {ct}"
+        );
+        assert!(
+            ct.contains("PartName=\"/docProps/app.xml\""),
+            "app override declared: {ct}"
+        );
+
+        let rels = String::from_utf8(entry(bytes, "_rels/.rels").unwrap()).unwrap();
+        assert!(
+            rels.contains("Target=\"docProps/core.xml\""),
+            "core relationship present: {rels}"
+        );
+        assert!(
+            rels.contains("relationships/metadata/core-properties"),
+            "core-properties rel type: {rels}"
+        );
+        assert!(
+            rels.contains("Target=\"docProps/app.xml\""),
+            "app relationship present: {rels}"
+        );
+    }
+
+    #[test]
+    fn docx_export_emits_core_props_and_default_language() {
+        let bytes = docx_from_model(&meta_doc());
+        assert_ooxml_docprops(&bytes);
+        // Default-run language wired into styles.xml.
+        let styles = String::from_utf8(entry(&bytes, "word/styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("<w:docDefaults><w:rPrDefault><w:rPr><w:lang w:val=\"fr-FR\"/>"),
+            "default language: {styles}"
+        );
+    }
+
+    #[test]
+    fn xlsx_export_emits_core_props() {
+        let bytes = xlsx_from_model(&meta_sheet_doc());
+        assert_ooxml_docprops(&bytes);
+    }
+
+    #[test]
+    fn pptx_export_emits_core_props() {
+        let bytes = pptx_from_model(&meta_slide_doc());
+        assert_ooxml_docprops(&bytes);
+    }
+
+    /// Assert an ODF package emits `meta.xml` with the model metadata, lists it
+    /// in the manifest, and sets the default-style language in `styles.xml`.
+    fn assert_odf_meta(bytes: &[u8]) {
+        let meta = String::from_utf8(entry(bytes, "meta.xml").unwrap()).unwrap();
+        assert!(
+            meta.contains("<dc:title>My &lt;Title&gt;</dc:title>"),
+            "title escaped: {meta}"
+        );
+        assert!(
+            meta.contains("<dc:creator>Jane Doe</dc:creator>"),
+            "creator: {meta}"
+        );
+        assert!(
+            meta.contains("<dc:subject>Quarterly</dc:subject>"),
+            "subject: {meta}"
+        );
+        assert!(
+            meta.contains("<dc:language>fr-FR</dc:language>"),
+            "language: {meta}"
+        );
+        assert!(
+            meta.contains("<meta:keyword>alpha</meta:keyword>"),
+            "keyword alpha: {meta}"
+        );
+        assert!(
+            meta.contains("<meta:keyword>beta</meta:keyword>"),
+            "keyword beta: {meta}"
+        );
+        assert!(
+            meta.contains("<meta:generator>GigaPDF</meta:generator>"),
+            "generator: {meta}"
+        );
+
+        let manifest =
+            String::from_utf8(entry(bytes, "META-INF/manifest.xml").unwrap()).unwrap();
+        assert!(
+            manifest.contains("manifest:full-path=\"meta.xml\""),
+            "meta.xml in manifest: {manifest}"
+        );
+
+        let styles = String::from_utf8(entry(bytes, "styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("<style:default-style style:family=\"paragraph\">"),
+            "default-style present: {styles}"
+        );
+        assert!(
+            styles.contains("fo:language=\"fr\"") && styles.contains("fo:country=\"FR\""),
+            "fo:language/country split from BCP-47: {styles}"
+        );
+    }
+
+    #[test]
+    fn odt_export_emits_meta_and_default_language() {
+        assert_odf_meta(&odt_from_model(&meta_doc()));
+    }
+
+    #[test]
+    fn ods_export_emits_meta_and_default_language() {
+        assert_odf_meta(&ods_from_model(&meta_sheet_doc()));
+    }
+
+    #[test]
+    fn odp_export_emits_meta_and_default_language() {
+        assert_odf_meta(&odp_from_model(&meta_slide_doc()));
+    }
+
+    #[test]
+    fn export_omits_absent_metadata_fields() {
+        // A document with no metadata must not fabricate any field, and the ODF
+        // default-style language block must be absent entirely.
+        let doc = sample_doc();
+        let docx = docx_from_model(&doc);
+        let core = String::from_utf8(entry(&docx, "docProps/core.xml").unwrap()).unwrap();
+        assert!(!core.contains("<dc:title>"), "no title fabricated: {core}");
+        assert!(
+            !core.contains("<dc:creator>"),
+            "no creator fabricated: {core}"
+        );
+        assert!(
+            !core.contains("<dc:language>"),
+            "no language fabricated: {core}"
+        );
+        let styles = String::from_utf8(entry(&docx, "word/styles.xml").unwrap()).unwrap();
+        assert!(
+            !styles.contains("<w:docDefaults>"),
+            "no default lang: {styles}"
+        );
+
+        let odt = odt_from_model(&doc);
+        let meta = String::from_utf8(entry(&odt, "meta.xml").unwrap()).unwrap();
+        assert!(!meta.contains("<dc:title>"), "ODF no title: {meta}");
+        assert!(!meta.contains("<dc:language>"), "ODF no language: {meta}");
+        let odt_styles = String::from_utf8(entry(&odt, "styles.xml").unwrap()).unwrap();
+        assert!(
+            !odt_styles.contains("<style:default-style"),
+            "ODF no default-style when language absent: {odt_styles}"
+        );
     }
 }
