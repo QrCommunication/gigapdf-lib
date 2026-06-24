@@ -80,6 +80,43 @@ pub enum FieldKind {
     Unknown,
 }
 
+/// A field's JavaScript trigger (`/AA` additional-actions entry, ISO 32000-1
+/// §12.6.3 / Table 197) — the event that runs the script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldTrigger {
+    /// `K` — a keystroke in the field (input filtering / masks).
+    Keystroke,
+    /// `F` — format the value for display.
+    Format,
+    /// `V` — validate the value on change.
+    Validate,
+    /// `C` — recalculate the value (computed totals; ordered by `/CO`).
+    Calculate,
+}
+
+impl FieldTrigger {
+    /// The `/AA` dictionary key for this trigger.
+    pub fn pdf_key(self) -> &'static [u8] {
+        match self {
+            FieldTrigger::Keystroke => b"K",
+            FieldTrigger::Format => b"F",
+            FieldTrigger::Validate => b"V",
+            FieldTrigger::Calculate => b"C",
+        }
+    }
+
+    /// Parse the SDK's trigger name (`keystroke`/`format`/`validate`/`calculate`).
+    pub fn from_name(s: &str) -> Option<FieldTrigger> {
+        match s {
+            "keystroke" | "K" | "k" => Some(FieldTrigger::Keystroke),
+            "format" | "F" => Some(FieldTrigger::Format),
+            "validate" | "V" => Some(FieldTrigger::Validate),
+            "calculate" | "C" | "c" => Some(FieldTrigger::Calculate),
+            _ => None,
+        }
+    }
+}
+
 /// A terminal form field with its type, value, flags and (for buttons/choices)
 /// the set of selectable options.
 #[derive(Debug, Clone)]

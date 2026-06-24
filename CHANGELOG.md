@@ -7,6 +7,37 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.79.0] - 2026-06-24
+
+Closes the interactive-forms gaps (ISO 32000-1 §12.7): signature fields,
+field-level JavaScript, calculation order, field deletion and appearance
+regeneration. Resolves
+[#15](https://github.com/qrcommunication/gigapdf-lib/issues/15).
+
+### Added
+
+- **`Document::add_signature_field(page, name, rect, &style)`.** Lay out a
+  *visible* signature field (`/FT /Sig`) the PAdES signing stack can target, and
+  flag the AcroForm `/SigFlags`. `gp_add_signature_field` / `doc.addSignatureField`.
+- **`Document::set_field_action(name, FieldTrigger, js)`.** Field-level
+  JavaScript in a field's `/AA` for the `Keystroke` (`K`), `Format` (`F`),
+  `Validate` (`V`) and `Calculate` (`C`) triggers — input masks, formatting,
+  validation and computed values. `gp_set_field_script` / `doc.setFieldScript`.
+- **`Document::set_calculation_order(&[name])`.** The AcroForm `/CO` calculation
+  order. `gp_set_calculation_order` / `doc.setCalculationOrder`.
+- **`Document::remove_field(name)`.** Delete a field from `/Fields`, `/CO` and
+  every page's `/Annots`. `gp_remove_field` / `doc.removeField`.
+- **`Document::regenerate_field_appearance(name)`.** Rebuild a field's `/AP` from
+  its current value and style (text / choice / checkbox) after a programmatic
+  value change. `gp_regenerate_field_appearance` / `doc.regenerateFieldAppearance`.
+- New `form::FieldTrigger` enum (with `pdf_key` / `from_name`).
+
+### Notes
+
+- Hierarchical fields (`/Kids`, dotted names), per-field `/DR` font resources and
+  XFA remain out of scope (XFA intentionally). `regenerate_field_appearance`
+  returns `false` for a `/Kids` parent (e.g. a radio group).
+
 ## [0.78.0] - 2026-06-24
 
 A single, shared **action & destination model** (ISO 32000-1 §12.6 / §12.3.2)

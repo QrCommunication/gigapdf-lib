@@ -115,6 +115,9 @@ Three complementary ways to draw real, selectable text — no host font files ne
 | `add_radio_group(page,name,&[(export,rect)],selected,&style)` | `gp_add_radio_group(handle,page,name*,exports*,rects*,selected*,style…)` |
 | `add_combo_box(page,name,rect,&options,selected,editable,&style)` | `gp_add_combo_box(handle,page,name*,rect…,options*,selected*,editable,style…)` |
 | `add_list_box(page,name,rect,&options,selected,multi,&style)` | `gp_add_list_box(handle,page,name*,rect…,options*,selected*,multi,style…)` |
+| `add_signature_field(page,name,rect,&style)` (visible `/FT /Sig` widget for the signing pipeline; sets `/SigFlags`) | `gp_add_signature_field(handle,page,name*,rect…,style…)` |
+| `set_field_action(name,FieldTrigger,js)` (field-level JS in `/AA`: `Keystroke`=K / `Format`=F / `Validate`=V / `Calculate`=C) | `gp_set_field_script(handle,name*,trigger*,js*)` (`1`/`0`/`-2`) |
+| `set_calculation_order(&[name])` (AcroForm `/CO`) / `remove_field(name) -> bool` / `regenerate_field_appearance(name) -> bool` (rebuild `/AP` for text/choice/checkbox) | `gp_set_calculation_order(handle,names*)` / `gp_remove_field(handle,name*)` / `gp_regenerate_field_appearance(handle,name*)` |
 
 `FieldStyle { font_size, color, border, background, border_width }` controls the
 new field's appearance. In the WASM ABI it is passed as the 7 trailing scalars
@@ -362,7 +365,7 @@ Google fonts**, so the host fetches fonts in two phases.
 - `ContentElement { index, kind: Text|Image|Path, label, bounds, font, color }`
 - `TextRun { index, operator, text, op_position }`
 - `TextElementInfo { index, text, bounds, font_family, bold, italic, size, color, rotation, direction }`
-- `FormField { name, field_type, value, flags, options, max_len }`
+- `FormField { name, field_type, value, flags, options, max_len }`, `FieldKind` (enum `Text|Checkbox|Radio|PushButton|ComboBox|ListBox|Signature|Unknown`), and `FieldTrigger` (enum `Keystroke|Format|Validate|Calculate` — the `/AA` JavaScript event; `FieldTrigger::from_name` parses the SDK's lowercase name)
 - `Link { kind: uri|page, uri, page, rect }`, `OutlineItem { title, page, level }`, `Bookmark { title, level, action: Option<Action> }`
 - `Action` (ISO 32000-1 §12.6) and `Destination` (§12.3.2) — the navigation model. `Action::from_json` accepts a tagged object: `{"type":"goto","dest":<Destination>}`, `{"type":"gotoR","file":"…","dest":<Destination>}`, `{"type":"uri","uri":"…"}`, `{"type":"named","action":"nextPage|prevPage|firstPage|lastPage"}`, `{"type":"launch","file":"…"}`, `{"type":"javascript","js":"…"}`, `{"type":"submitForm","url":"…"}`, `{"type":"resetForm"}`. A `Destination` is `{"fit":"xyz","page":N,"left"?,"top"?,"zoom"?}` or `fit` ∈ `fit|fitH|fitV|fitR|fitB|fitBH|fitBV` (with `top`/`left`/`rect` as the mode needs), or `{"fit":"named","name":"…"}`. `page` is 1-based; `GoToR` encodes it as a 0-based integer for the remote file
 - `HeaderFooterSpec { text, align, font_size, color, page_range, show_on_first_page, band_height }`

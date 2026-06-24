@@ -669,6 +669,30 @@ doc.addTextField(1, "iban", [50, 510, 250, 528], "", {
   style: { fontSize: 11, color: 0x102030, border: 0x888888, background: 0xf5f5f5 },
 });
 
+// A visible signature field for the signing pipeline (sets /SigFlags).
+doc.addSignatureField(1, "approval", [380, 60, 560, 120]);
+
+// Make it an *interactive* form: a computed total + input validation, with an
+// explicit calculation order.
+doc.addTextField(1, "qty", [50, 480, 150, 498], "1");
+doc.addTextField(1, "price", [50, 450, 150, 468], "10");
+doc.addTextField(1, "total", [50, 420, 150, 438], "");
+doc.setFieldScript("qty", "keystroke", "if (event.willCommit) AFNumber_Keystroke(0,0,0,0,'',true);");
+doc.setFieldScript(
+  "total",
+  "calculate",
+  "event.value = Number(this.getField('qty').value) * Number(this.getField('price').value);"
+);
+doc.setFieldScript("total", "format", "AFNumber_Format(2,0,0,0,'€ ',true);");
+doc.setCalculationOrder(["total"]); // recompute order when fields change
+
+// Edit a value programmatically, then rebuild its appearance.
+doc.setTextField("price", "12");
+doc.regenerateFieldAppearance("price");
+
+// Drop a field entirely (from /Fields, /CO and the page annotations).
+doc.removeField("skills");
+
 const fields = doc.fields(); // read them back: name + kind + value + options + bounds
 // doc.flattenForm();        // bake every widget into static content (no longer fillable)
 

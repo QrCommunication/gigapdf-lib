@@ -426,6 +426,33 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("forms: signature field, field script, calc order, remove & regenerate", () => {
+    const doc = giga.open(giga.txtToPdf("form host"));
+
+    expect(doc.addSignatureField(1, "sig1", [400, 60, 560, 120])).toBe(true);
+    expect(doc.fields().some((f) => f.name === "sig1" && f.kind === "signature")).toBe(true);
+
+    doc.addTextField(1, "a", [50, 700, 150, 718], "2");
+    doc.addTextField(1, "total", [50, 670, 150, 688], "");
+    expect(doc.setFieldScript("total", "calculate", "event.value = 2;")).toBe(true);
+    expect(doc.setFieldScript("nope", "format", "x")).toBe(false);
+    expect(doc.setCalculationOrder(["total"])).toBe(true);
+
+    expect(doc.removeField("a")).toBe(true);
+    expect(doc.removeField("a")).toBe(false);
+    expect(doc.fields().some((f) => f.name === "a")).toBe(false);
+
+    expect(doc.regenerateFieldAppearance("total")).toBe(true);
+    expect(doc.regenerateFieldAppearance("missing")).toBe(false);
+
+    const reopened = giga.open(doc.save());
+    const names = reopened.fields().map((f) => f.name);
+    expect(names).toContain("total");
+    expect(names).not.toContain("a");
+    reopened.close();
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

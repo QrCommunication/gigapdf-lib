@@ -4331,4 +4331,80 @@ export class GigaPdfDoc {
       ) === 0
     );
   }
+
+  /**
+   * Create a **visible signature field** (`/FT /Sig`) over `rect` — an empty
+   * widget the signing pipeline can later target — and flag the AcroForm
+   * `/SigFlags`. Returns `true` on success.
+   */
+  addSignatureField(
+    page: number,
+    name: string,
+    rect: [number, number, number, number],
+    opts: { style?: FieldStyle } = {}
+  ): boolean {
+    const st = styleArgs(opts.style);
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.ex().gp_add_signature_field(
+          this.h, page, nP, nL, rect[0], rect[1], rect[2], rect[3], ...st
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Attach field-level JavaScript to a field's `/AA` for the given `trigger`
+   * (`"keystroke"` filters input, `"format"` formats display, `"validate"`
+   * checks on change, `"calculate"` recomputes — ordered by
+   * {@link setCalculationOrder}). Returns `true` if set, `false` if no field has
+   * that name.
+   */
+  setFieldScript(
+    name: string,
+    trigger: "keystroke" | "format" | "validate" | "calculate",
+    js: string
+  ): boolean {
+    return (
+      this.g._withStr(name, (nP, nL) =>
+        this.g._withStr(trigger, (tP, tL) =>
+          this.g._withStr(js, (jP, jL) =>
+            this.ex().gp_set_field_script(this.h, nP, nL, tP, tL, jP, jL)
+          )
+        )
+      ) === 1
+    );
+  }
+
+  /**
+   * Set the AcroForm calculation order (`/CO`) — the sequence in which fields
+   * with a `calculate` script recompute. Unknown names are skipped.
+   */
+  setCalculationOrder(names: string[]): boolean {
+    return (
+      this.g._withOptStr(names.join("\n"), (p, l) =>
+        this.ex().gp_set_calculation_order(this.h, p, l)
+      ) === 0
+    );
+  }
+
+  /**
+   * Delete a form field by name (removed from `/Fields`, `/CO` and every page's
+   * annotations). Returns `true` if a field was removed.
+   */
+  removeField(name: string): boolean {
+    return this.g._withStr(name, (p, l) => this.ex().gp_remove_field(this.h, p, l)) === 1;
+  }
+
+  /**
+   * Rebuild a field's appearance from its current value/style — call after
+   * changing a field's value programmatically. Returns `true` if regenerated
+   * (`false` for an unknown name or a kind that can't be regenerated alone, e.g.
+   * a radio parent with kids).
+   */
+  regenerateFieldAppearance(name: string): boolean {
+    return (
+      this.g._withStr(name, (p, l) => this.ex().gp_regenerate_field_appearance(this.h, p, l)) === 1
+    );
+  }
 }

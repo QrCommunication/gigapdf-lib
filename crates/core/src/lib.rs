@@ -65,7 +65,7 @@ pub use document::{
     PageLabelStyle, SearchMatch, TextElementInfo, TextLayerRun, WatermarkAnchor,
 };
 pub use error::{EngineError, Result};
-pub use form::{FieldKind, FormField};
+pub use form::{FieldKind, FieldTrigger, FormField};
 pub use headerfooter::{Align, HeaderFooter, HeaderFooterSpec, Margins};
 pub use lexer::{Lexer, Token};
 pub use link::{Link, LinkTarget};

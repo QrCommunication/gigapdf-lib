@@ -4,6 +4,24 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.79.0] - 2026-06-24
+
+Interactive-form completeness: signature fields, field JavaScript, calculation
+order, field deletion and appearance regeneration. Resolves
+[#15](https://github.com/qrcommunication/gigapdf-lib/issues/15).
+
+### Added
+
+- **`addSignatureField(page, name, rect, opts?)`.** A visible signature field
+  (`/FT /Sig`) the signing pipeline can target; sets the AcroForm `/SigFlags`.
+- **`setFieldScript(name, trigger, js)`.** Field-level JavaScript on a field's
+  `/AA` — `trigger ∈ "keystroke" | "format" | "validate" | "calculate"` (input
+  masks, formatting, validation, computed totals).
+- **`setCalculationOrder(names)`.** The AcroForm `/CO` recalculation order.
+- **`removeField(name)`.** Delete a field (from `/Fields`, `/CO` and page annots).
+- **`regenerateFieldAppearance(name)`.** Rebuild a field's appearance after a
+  programmatic value change (text / choice / checkbox).
+
 ## [0.78.0] - 2026-06-24
 
 Full action & destination navigation model. Resolves

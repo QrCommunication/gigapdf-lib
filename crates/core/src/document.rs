@@ -11499,6 +11499,331 @@ impl Document {
         self.register_field(page_id, field_id)
     }
 
+    /// Add a **digital-signature field** (`/FT /Sig`) — an empty, *visible*
+    /// signature widget the PAdES signing pipeline can later target. Lays out a
+    /// placeholder appearance (the field's border box) and flags the AcroForm
+    /// with `/SigFlags 3`.
+    pub fn add_signature_field(
+        &mut self,
+        page: u32,
+        name: &str,
+        rect: [f64; 4],
+        style: &form::FieldStyle,
+    ) -> Result<()> {
+        let da = form::da_string(style);
+        let helv_id = self.ensure_acroform(&da)?;
+        let page_id = self.page_object_id(page)?;
+        let (w, h) = ((rect[2] - rect[0]).abs(), (rect[3] - rect[1]).abs());
+
+        let ap_id = self.make_form_xobject(form::empty_appearance(style, w, h), w, h, helv_id);
+        let mut ap = Dictionary::new();
+        ap.set(b"N", Object::Reference(ap_id));
+
+        let mut field = Dictionary::new();
+        field.set(b"FT", annot::name(b"Sig"));
+        field.set(b"T", pdf_text(name));
+        if let Some(mk) = form::mk_dict(style) {
+            field.set(b"MK", Object::Dictionary(mk));
+        }
+        field.set(b"Type", annot::name(b"Annot"));
+        field.set(b"Subtype", annot::name(b"Widget"));
+        field.set(b"Rect", annot::real_array(&rect));
+        field.set(b"F", Object::Integer(4)); // Print
+        field.set(b"P", Object::Reference(page_id));
+        field.set(b"AP", Object::Dictionary(ap));
+
+        let field_id = (self.next_object_number(), 0u16);
+        self.objects.insert(field_id, Object::Dictionary(field));
+        self.register_field(page_id, field_id)?;
+        // The document now contains a signature field.
+        self.acroform_update(|acro| acro.set(b"SigFlags", Object::Integer(3)))
+    }
+
+    /// Attach field-level **JavaScript** to a field's `/AA` additional-actions
+    /// dictionary for the given [`FieldTrigger`] (keystroke / format / validate /
+    /// calculate). Returns `false` if no field has that `/T` name.
+    pub fn set_field_action(
+        &mut self,
+        name: &str,
+        trigger: form::FieldTrigger,
+        js: &str,
+    ) -> Result<bool> {
+        let Some(field_id) = self.field_ref_by_name(name) else {
+            return Ok(false);
+        };
+        let mut field = self
+            .objects
+            .get(&field_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Content("form field object".into()))?;
+        let action = Action::JavaScript(js.to_string()).build_dict(&|_| Object::Null);
+        let mut aa = field
+            .get(b"AA")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        aa.set(trigger.pdf_key().to_vec(), Object::Dictionary(action));
+        field.set(b"AA", Object::Dictionary(aa));
+        self.objects.insert(field_id, Object::Dictionary(field));
+        Ok(true)
+    }
+
+    /// Set the AcroForm **calculation order** (`/CO`) — the sequence in which
+    /// fields with a `Calculate` action recompute. Unknown names are skipped.
+    pub fn set_calculation_order(&mut self, names: &[&str]) -> Result<()> {
+        let refs: Vec<Object> = names
+            .iter()
+            .filter_map(|n| self.field_ref_by_name(n))
+            .map(Object::Reference)
+            .collect();
+        self.acroform_update(|acro| acro.set(b"CO", Object::Array(refs)))
+    }
+
+    /// Delete a form field by `/T` name: drop it from the AcroForm `/Fields` and
+    /// `/CO`, detach its widget from every page `/Annots`, and remove the object.
+    /// Returns `false` if no field has that name.
+    pub fn remove_field(&mut self, name: &str) -> Result<bool> {
+        let Some(field_id) = self.field_ref_by_name(name) else {
+            return Ok(false);
+        };
+        self.acroform_update(|acro| {
+            for key in [b"Fields".as_slice(), b"CO".as_slice()] {
+                if let Some(arr) = acro
+                    .get(key)
+                    .and_then(Object::as_array)
+                    .map(<[Object]>::to_vec)
+                {
+                    let kept: Vec<Object> = arr
+                        .into_iter()
+                        .filter(|o| o.as_reference() != Some(field_id))
+                        .collect();
+                    acro.set(key.to_vec(), Object::Array(kept));
+                }
+            }
+        })?;
+        self.detach_annot_from_pages(field_id);
+        self.objects.remove(&field_id);
+        Ok(true)
+    }
+
+    /// Rebuild a field's `/AP` appearance from its current value and style — for
+    /// the merged single-widget kinds (text, choice, checkbox). Use after
+    /// changing a field's `/V` programmatically. Returns `false` for an unknown
+    /// name or a kind whose appearance can't be regenerated alone (e.g. a radio
+    /// parent with `/Kids`).
+    pub fn regenerate_field_appearance(&mut self, name: &str) -> Result<bool> {
+        let Some(field_id) = self.field_ref_by_name(name) else {
+            return Ok(false);
+        };
+        let field = self
+            .objects
+            .get(&field_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Content("form field object".into()))?;
+        // A parent field with /Kids is multi-widget — out of scope here.
+        if field.get(b"Kids").is_some() {
+            return Ok(false);
+        }
+        let ft = field
+            .get(b"FT")
+            .and_then(Object::as_name)
+            .map(<[u8]>::to_vec);
+        let rect = self.read_rect(&field);
+        let (w, h) = ((rect[2] - rect[0]).abs(), (rect[3] - rect[1]).abs());
+        let style = self.field_style_from_dict(&field);
+        let da = form::da_string(&style);
+        let helv_id = self.ensure_acroform(&da)?;
+
+        let mut field = field;
+        match ft.as_deref() {
+            Some(b"Tx") | Some(b"Ch") => {
+                let value = field
+                    .get(b"V")
+                    .map(|o| self.resolve(o))
+                    .and_then(|o| match o {
+                        Object::String(b, _) => Some(String::from_utf8_lossy(b).into_owned()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let ap_id = self.make_form_xobject(
+                    form::text_appearance(&value, &style, w, h),
+                    w,
+                    h,
+                    helv_id,
+                );
+                let mut ap = Dictionary::new();
+                ap.set(b"N", Object::Reference(ap_id));
+                field.set(b"AP", Object::Dictionary(ap));
+            }
+            Some(b"Btn") => {
+                // Checkbox: rebuild the on/off appearance pair, preserve the
+                // on-state name (the non-Off key of the existing /AP /N).
+                let on = self
+                    .objects
+                    .get(&field_id)
+                    .and_then(Object::as_dict)
+                    .and_then(|d| d.get(b"AP"))
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+                    .and_then(|ap| ap.get(b"N").map(|o| self.resolve(o)))
+                    .and_then(Object::as_dict)
+                    .and_then(|n| {
+                        n.0.keys()
+                            .find(|k| k.as_slice() != b"Off")
+                            .map(|k| k.to_vec())
+                    })
+                    .unwrap_or_else(|| b"On".to_vec());
+                let on_id =
+                    self.make_form_xobject(form::check_appearance(&style, w, h), w, h, helv_id);
+                let off_id =
+                    self.make_form_xobject(form::empty_appearance(&style, w, h), w, h, helv_id);
+                let mut n = Dictionary::new();
+                n.set(on.clone(), Object::Reference(on_id));
+                n.set(b"Off", Object::Reference(off_id));
+                let mut ap = Dictionary::new();
+                ap.set(b"N", Object::Dictionary(n));
+                field.set(b"AP", Object::Dictionary(ap));
+                // Keep /AS consistent with /V (the selected state).
+                let state = match field.get(b"V").and_then(Object::as_name) {
+                    Some(v) if v != b"Off" => on,
+                    _ => b"Off".to_vec(),
+                };
+                field.set(b"AS", Object::Name(state));
+            }
+            _ => return Ok(false),
+        }
+        self.objects.insert(field_id, Object::Dictionary(field));
+        Ok(true)
+    }
+
+    /// Find a top-level AcroForm field object by its `/T` name (compared against
+    /// the same encoding [`pdf_text`] produces).
+    fn field_ref_by_name(&self, name: &str) -> Option<ObjectId> {
+        let want = match pdf_text(name) {
+            Object::String(b, _) => b,
+            _ => return None,
+        };
+        let acro = self
+            .resolve(self.catalog().ok()?.get(b"AcroForm")?)
+            .as_dict()?;
+        let fields = self.resolve(acro.get(b"Fields")?).as_array()?;
+        let ids: Vec<ObjectId> = fields.iter().filter_map(Object::as_reference).collect();
+        for id in ids {
+            if let Some(t) = self
+                .objects
+                .get(&id)
+                .and_then(Object::as_dict)
+                .and_then(|d| d.get(b"T"))
+            {
+                if let Object::String(b, _) = self.resolve(t) {
+                    if *b == want {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Mutate the catalog's `/AcroForm` dictionary in place (creating it if
+    /// absent), re-inlining it on the catalog.
+    fn acroform_update(&mut self, f: impl FnOnce(&mut Dictionary)) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let mut acro = catalog
+            .get(b"AcroForm")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        f(&mut acro);
+        catalog.set(b"AcroForm", Object::Dictionary(acro));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Remove an annotation reference from every page's `/Annots`.
+    fn detach_annot_from_pages(&mut self, annot_id: ObjectId) {
+        for page_no in 1..=self.page_count() as u32 {
+            let Ok(page_id) = self.page_object_id(page_no) else {
+                continue;
+            };
+            let Some(mut page) = self
+                .objects
+                .get(&page_id)
+                .and_then(Object::as_dict)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(annots) = page
+                .get(b"Annots")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_array)
+                .map(<[Object]>::to_vec)
+            else {
+                continue;
+            };
+            if annots.iter().any(|o| o.as_reference() == Some(annot_id)) {
+                let kept: Vec<Object> = annots
+                    .into_iter()
+                    .filter(|o| o.as_reference() != Some(annot_id))
+                    .collect();
+                page.set(b"Annots", Object::Array(kept));
+                self.objects.insert(page_id, Object::Dictionary(page));
+            }
+        }
+    }
+
+    /// Best-effort reconstruction of a [`form::FieldStyle`] from a widget dict's
+    /// `/DA` (font size + colour) and `/MK` (border + background) — so an
+    /// appearance can be regenerated to match the field's stored look.
+    fn field_style_from_dict(&self, field: &Dictionary) -> form::FieldStyle {
+        fn rgb3(obj: Option<&Object>) -> Option<[f64; 3]> {
+            let arr = obj?.as_array()?;
+            let c: Vec<f64> = arr.iter().filter_map(Object::as_f64).collect();
+            (c.len() == 3).then(|| [c[0], c[1], c[2]])
+        }
+        let mut style = form::FieldStyle::default();
+        if let Some(Object::String(da, _)) = field.get(b"DA").map(|o| self.resolve(o)) {
+            let da = String::from_utf8_lossy(da);
+            let toks: Vec<&str> = da.split_whitespace().collect();
+            if let Some(i) = toks.iter().position(|&t| t == "Tf") {
+                if let Some(sz) = i.checked_sub(1).and_then(|j| toks[j].parse::<f64>().ok()) {
+                    style.font_size = sz;
+                }
+            }
+            if let Some(i) = toks.iter().position(|&t| t == "rg") {
+                if i >= 3 {
+                    let c: Vec<f64> = toks[i - 3..i]
+                        .iter()
+                        .filter_map(|t| t.parse().ok())
+                        .collect();
+                    if c.len() == 3 {
+                        style.color = [c[0], c[1], c[2]];
+                    }
+                }
+            }
+        }
+        if let Some(mk) = field
+            .get(b"MK")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        {
+            style.border = rgb3(mk.get(b"BC").map(|o| self.resolve(o))).or(style.border);
+            style.background = rgb3(mk.get(b"BG").map(|o| self.resolve(o)));
+        }
+        style
+    }
+
     // ─── destinations, hyperlinks & outline ──────────────────────────────────
 
     /// Object id of the document catalog (the `/Root`).
@@ -17828,6 +18153,101 @@ mod tests {
                 "{fixture_name}: no replacement chars, got {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn signature_field_js_actions_calc_order_remove_and_regenerate() {
+        let pdf = crate::convert::reverse::txt_to_pdf("form host page");
+        let mut doc = Document::open(&pdf).unwrap();
+        let style = form::FieldStyle::default();
+
+        // A visible signature field flags the AcroForm /SigFlags.
+        doc.add_signature_field(1, "sig1", [400.0, 60.0, 560.0, 120.0], &style)
+            .unwrap();
+        let sigs: Vec<_> = doc
+            .form_fields()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.kind() == form::FieldKind::Signature)
+            .collect();
+        assert_eq!(sigs.len(), 1, "signature field created");
+        {
+            let acro = doc
+                .resolve(doc.catalog().unwrap().get(b"AcroForm").unwrap())
+                .as_dict()
+                .unwrap();
+            assert_eq!(
+                acro.get(b"SigFlags").and_then(Object::as_f64),
+                Some(3.0),
+                "/SigFlags set"
+            );
+        }
+
+        // Two text fields with a calculation: total = sum, formatted on display.
+        doc.add_text_field(
+            1,
+            "a",
+            [50.0, 700.0, 150.0, 718.0],
+            "2",
+            None,
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+        doc.add_text_field(
+            1,
+            "total",
+            [50.0, 670.0, 150.0, 688.0],
+            "",
+            None,
+            false,
+            false,
+            &style,
+        )
+        .unwrap();
+        assert!(doc
+            .set_field_action(
+                "total",
+                form::FieldTrigger::Calculate,
+                "event.value = this.getField('a').value;",
+            )
+            .unwrap());
+        assert!(!doc
+            .set_field_action("nope", form::FieldTrigger::Format, "x")
+            .unwrap());
+        doc.set_calculation_order(&["total"]).unwrap();
+
+        // remove_field drops it from /Fields and the page /Annots.
+        assert!(doc.remove_field("a").unwrap());
+        assert!(!doc.remove_field("a").unwrap(), "gone the second time");
+        assert!(doc.form_fields().unwrap().iter().all(|f| f.name != "a"));
+
+        // regenerate_field_appearance rebuilds /AP for a value change.
+        assert!(doc.regenerate_field_appearance("total").unwrap());
+        assert!(!doc.regenerate_field_appearance("missing").unwrap());
+
+        // Round-trips: /CO and /SigFlags survive a save/open; "total" stays,
+        // "a" stays removed.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let names: Vec<String> = reopened
+            .form_fields()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "total"), "total survives reparse");
+        assert!(!names.iter().any(|n| n == "a"), "removed field stays gone");
+        let acro = reopened
+            .resolve(reopened.catalog().unwrap().get(b"AcroForm").unwrap())
+            .as_dict()
+            .unwrap();
+        assert!(acro.get(b"CO").is_some(), "/CO survives reparse");
+        assert_eq!(
+            acro.get(b"SigFlags").and_then(Object::as_f64),
+            Some(3.0),
+            "/SigFlags survives reparse"
+        );
     }
 
     #[test]

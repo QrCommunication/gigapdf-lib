@@ -294,6 +294,11 @@ Three ways to draw real, selectable text — **no host font files required**:
 | `addRadioGroup(page, name, options, opts?)` | `boolean` | Create a radio group; `options = [{ export, rect }]`. |
 | `addComboBox(page, name, options, opts?)` | `boolean` | Create a dropdown; `opts = { selected, editable, style }`. |
 | `addListBox(page, name, options, opts?)` | `boolean` | Create a list box; `opts = { selected, multi, style }`. |
+| `addSignatureField(page, name, rect, opts?)` | `boolean` | Create a **visible signature field** (`/FT /Sig`) the signing pipeline can target; sets the AcroForm `/SigFlags`. `opts = { style }`. |
+| `setFieldScript(name, trigger, js)` | `boolean` | Attach field-level JavaScript to a field's `/AA` — `trigger ∈ "keystroke" \| "format" \| "validate" \| "calculate"`. `false` if no field has that name. |
+| `setCalculationOrder(names)` | `boolean` | Set the AcroForm `/CO` — the order in which `calculate` scripts recompute (unknown names skipped). |
+| `removeField(name)` | `boolean` | Delete a field (from `/Fields`, `/CO` and every page's annotations). `false` if not found. |
+| `regenerateFieldAppearance(name)` | `boolean` | Rebuild a field's `/AP` from its current value/style (text/choice/checkbox) — call after changing a value. `false` for unknown names or kinds that can't be rebuilt alone (e.g. a radio parent). |
 | `flattenForm()` | `number` | Bake every **AcroForm** field widget across all pages into page content and drop `/AcroForm` — the document is no longer fillable (`fields()` then returns `[]`). Returns the number of widgets baked. |
 | `flattenFormXObjects(page)` | `number` | Inline & **de-share** a page's form XObjects (`/Subtype /Form` invoked via `Do`) into its content stream, so their text/graphics become **ordinary editable page content** with real text-run indices — the enabler for editing invoice/template text in place via `replaceText`/`moveElement`/`removeElement` instead of a redact+add overlay. Image XObjects are untouched. Distinct from `flattenForm` (which flattens **interactive AcroForm fields**). Returns the number of form XObjects inlined. |
 

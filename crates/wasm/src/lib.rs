@@ -1919,6 +1919,120 @@ pub extern "C" fn gp_add_list_box(
     })
 }
 
+/// Create a **visible signature field** (`/FT /Sig`) over `[x0,y0,x1,y1]` and set
+/// the AcroForm `/SigFlags`. Style params mirror the other field creators. `0` on
+/// success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_signature_field(
+    handle: *mut Document,
+    page: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    font_size: f64,
+    color_rgb: u32,
+    border_rgb: u32,
+    has_border: i32,
+    bg_rgb: u32,
+    has_bg: i32,
+    border_width: f64,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let style = make_field_style(
+        font_size,
+        color_rgb,
+        border_rgb,
+        has_border,
+        bg_rgb,
+        has_bg,
+        border_width,
+    );
+    edit(handle, |doc| {
+        doc.add_signature_field(page, name, [x0, y0, x1, y1], &style)
+    })
+}
+
+/// Attach field-level JavaScript to a field's `/AA`. `trigger` is one of
+/// `keystroke`/`format`/`validate`/`calculate`. Returns `1` if set, `0` if no
+/// field has that name, `-1` null handle, `-2` unknown trigger.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_set_field_script(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    trigger_ptr: *const u8,
+    trigger_len: usize,
+    js_ptr: *const u8,
+    js_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let trigger = unsafe { str_arg(trigger_ptr, trigger_len) };
+    let js = unsafe { str_arg(js_ptr, js_len) };
+    let Some(trigger) = gigapdf_core::form::FieldTrigger::from_name(trigger) else {
+        return -2;
+    };
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.set_field_action(name, trigger, js) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
+/// Set the AcroForm calculation order (`/CO`). `names` is newline-separated field
+/// names (unknown ones skipped). `0` on success.
+#[no_mangle]
+pub extern "C" fn gp_set_calculation_order(
+    handle: *mut Document,
+    names_ptr: *const u8,
+    names_len: usize,
+) -> i32 {
+    let text = unsafe { str_arg(names_ptr, names_len) };
+    let names: Vec<&str> = text.split('\n').filter(|s| !s.is_empty()).collect();
+    edit(handle, |doc| doc.set_calculation_order(&names))
+}
+
+/// Delete a form field by name. Returns `1` if removed, `0` if not found, `-1`
+/// null handle.
+#[no_mangle]
+pub extern "C" fn gp_remove_field(handle: *mut Document, name_ptr: *const u8, name_len: usize) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.remove_field(name) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
+/// Rebuild a field's `/AP` appearance from its current value/style. Returns `1`
+/// if regenerated, `0` if unknown/unsupported kind, `-1` null handle.
+#[no_mangle]
+pub extern "C" fn gp_regenerate_field_appearance(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.regenerate_field_appearance(name) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
 fn unpack_rgb(packed: u32) -> [f64; 3] {
     [
         ((packed >> 16) & 0xFF) as f64 / 255.0,
