@@ -235,6 +235,141 @@ fn hex_to_rgb_f64(s: &str) -> Option<[f64; 3]> {
     hex6_to_rgb(s).map(|[r, g, b]| [r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0])
 }
 
+/// Format an RGB triple (`0.0..=1.0`, clamped) as an uppercase `RRGGBB` string.
+fn rgb_to_hex6(rgb: [f64; 3]) -> String {
+    let c = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("{:02X}{:02X}{:02X}", c(rgb[0]), c(rgb[1]), c(rgb[2]))
+}
+
+/// Convert an OOXML `a:hslClr` (`@hue` in 60000ths of a degree, `@sat`/`@lum` in
+/// thousandths of a percent) to an uppercase `RRGGBB` string.
+fn hsl_attrs_to_hex6(attrs: &[(String, String)]) -> Option<String> {
+    let hue = attr(attrs, "hue").and_then(|v| v.trim().parse::<f64>().ok())? / 60000.0;
+    let sat = attr(attrs, "sat").and_then(|v| v.trim().parse::<f64>().ok())? / 100_000.0;
+    let lum = attr(attrs, "lum").and_then(|v| v.trim().parse::<f64>().ok())? / 100_000.0;
+    Some(rgb_to_hex6(hsl_to_rgb(
+        hue.rem_euclid(360.0),
+        sat.clamp(0.0, 1.0),
+        lum.clamp(0.0, 1.0),
+    )))
+}
+
+/// HSL (`hue` degrees `0..360`, `sat`/`lum` `0.0..=1.0`) → RGB `0.0..=1.0`.
+fn hsl_to_rgb(hue: f64, sat: f64, lum: f64) -> [f64; 3] {
+    let c = (1.0 - (2.0 * lum - 1.0).abs()) * sat;
+    let h = hue / 60.0;
+    let x = c * (1.0 - (h.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = lum - c / 2.0;
+    [r1 + m, g1 + m, b1 + m]
+}
+
+/// Apply the OOXML colour-transform modifiers accumulated for one fill colour to
+/// a base `RRGGBB`, returning the modulated `RRGGBB`. `lum_mod` scales each
+/// channel and `lum_off` adds a flat offset (both fractions of full scale);
+/// `shade` darkens toward black and `tint` lightens toward white (PowerPoint's
+/// straight-RGB approximation — exact enough for run/cell colour fidelity without
+/// a full linear-RGB round-trip). `None`/empty modifiers leave the base intact.
+fn apply_color_mods(
+    base: &str,
+    lum_mod: Option<f64>,
+    lum_off: Option<f64>,
+    shade: Option<f64>,
+    tint: Option<f64>,
+) -> Option<String> {
+    let mut rgb = hex_to_rgb_f64(base)?;
+    if let Some(m) = lum_mod {
+        rgb = rgb.map(|c| c * m);
+    }
+    if let Some(o) = lum_off {
+        rgb = rgb.map(|c| c + o);
+    }
+    if let Some(s) = shade {
+        rgb = rgb.map(|c| c * s);
+    }
+    if let Some(t) = tint {
+        rgb = rgb.map(|c| c + (1.0 - c) * t);
+    }
+    Some(rgb_to_hex6(rgb))
+}
+
+/// The unresolved base of an OOXML fill colour: a literal `RRGGBB` (from
+/// `a:srgbClr`/`a:hslClr`/`a:sysClr`) or a theme scheme slot name (`a:schemeClr@val`,
+/// resolved against a [`PptxTheme`] only at [`finish`](PptxFillColor::finish_with)
+/// time, where the theme is in scope).
+enum PptxColorBase {
+    Hex(String),
+    Scheme(String),
+}
+
+/// Accumulates one OOXML fill colour while a `<a:solidFill>` / first `<a:gradFill>`
+/// gradient stop is being walked: the (unresolved) base colour plus any
+/// `a:lumMod`/`a:lumOff`/`a:shade`/`a:tint` child modifiers, folded together on
+/// [`finish_with`](PptxFillColor::finish_with). The *first* base colour seen wins,
+/// so a gradient's first stop is captured as a solid fallback.
+#[derive(Default)]
+struct PptxFillColor {
+    base: Option<PptxColorBase>,
+    lum_mod: Option<f64>,
+    lum_off: Option<f64>,
+    shade: Option<f64>,
+    tint: Option<f64>,
+}
+
+impl PptxFillColor {
+    /// Record a base colour from an `a:srgbClr`/`a:schemeClr`/`a:hslClr`/`a:sysClr`
+    /// open tag (scheme slots kept raw, resolved on finish); the first one wins.
+    fn set_base(&mut self, local_name: &str, attrs: &[(String, String)]) {
+        if self.base.is_some() {
+            return;
+        }
+        self.base = match local_name {
+            "srgbClr" => attr(attrs, "val")
+                .filter(|v| is_hex6(v))
+                .map(|v| PptxColorBase::Hex(v.to_ascii_uppercase())),
+            "schemeClr" => attr(attrs, "val").map(|v| PptxColorBase::Scheme(v.to_string())),
+            "hslClr" => hsl_attrs_to_hex6(attrs).map(PptxColorBase::Hex),
+            "sysClr" => attr(attrs, "lastClr")
+                .filter(|v| is_hex6(v))
+                .map(|v| PptxColorBase::Hex(v.to_ascii_uppercase())),
+            _ => None,
+        };
+    }
+
+    /// Record an `a:lumMod`/`a:lumOff`/`a:shade`/`a:tint` modifier (`@val` in
+    /// thousandths of a percent) attached to the current base colour.
+    fn set_mod(&mut self, local_name: &str, attrs: &[(String, String)]) {
+        let Some(v) = attr(attrs, "val").and_then(|v| v.trim().parse::<f64>().ok()) else {
+            return;
+        };
+        let frac = v / 100_000.0;
+        match local_name {
+            "lumMod" => self.lum_mod = Some(frac),
+            "lumOff" => self.lum_off = Some(frac),
+            "shade" => self.shade = Some(frac),
+            "tint" => self.tint = Some(frac),
+            _ => {}
+        }
+    }
+
+    /// Resolve the base (a scheme slot through `theme`) and fold the modifiers into
+    /// a final `RRGGBB`, or `None` when no usable base colour was captured.
+    fn finish_with(self, theme: &PptxTheme) -> Option<String> {
+        let base = match self.base? {
+            PptxColorBase::Hex(h) => h,
+            PptxColorBase::Scheme(slot) => theme.resolve_scheme(&slot)?,
+        };
+        apply_color_mods(&base, self.lum_mod, self.lum_off, self.shade, self.tint).or(Some(base))
+    }
+}
+
 /// Map a DOCX `w:highlight@val` named colour (ECMA-376 §17.18.40) to its 6-hex
 /// equivalent (no `#`). `none`/unknown ⇒ `None`. The 16 named highlight colours
 /// are fixed by the spec, so the mapping is exact and dependency-free.
@@ -841,6 +976,34 @@ fn push_run(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
         style,
         source_index: None,
     }));
+}
+
+/// Append `text` to `runs`, honouring the run's optional [`hyperlink`](RunStyle::hyperlink):
+/// a hyperlinked run becomes an [`Inline::Link`] (coalesced with a preceding link
+/// to the same URL so a multi-run anchor stays one node); a plain run defers to
+/// [`push_run`]. Used by the PPTX slide/table paths where `a:hlinkClick` lives on
+/// the run (`a:rPr`), not a wrapping element.
+fn push_run_maybe_linked(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
+    let Some(url) = run.hyperlink.as_deref() else {
+        push_run(runs, run, text);
+        return;
+    };
+    let href = model::LinkTarget::Url(url.to_string());
+    let style = run_char_style(run);
+    if let Some(Inline::Link { href: h, children }) = runs.last_mut() {
+        if *h == href {
+            push_run(children, run, text);
+            return;
+        }
+    }
+    runs.push(Inline::Link {
+        href,
+        children: vec![Inline::Run(InlineRun {
+            text: text.to_string(),
+            style,
+            source_index: None,
+        })],
+    });
 }
 
 /// Resolve a DOCX list paragraph's `(ordered, marker)` for the model: the
@@ -1605,12 +1768,24 @@ impl GroupXfrm {
 /// geometry. OOXML rotation is clockwise (60000ths of a degree); the model's
 /// [`Rotation::Deg`] is counter-clockwise, so the sign is negated and the exact
 /// cardinal angles map to the first-class variants.
+///
+/// Mirroring: the model carries a rotation but no reflection, so a combined
+/// `@flipH` **and** `@flipV` (a point reflection = a 180° turn) is folded into the
+/// rotation; a single-axis flip is a genuine reflection that the rotation cannot
+/// express and is dropped (the box's absolute placement is still preserved).
 fn xfrm_to_frame(
     b: &XfrmBox,
     g: &GroupXfrm,
     slide_h: f64,
 ) -> (Option<model::Rect>, crate::model::Rotation) {
-    let rotation = ooxml_rot_to_rotation(b.rot_deg);
+    // flipH ^ flipV alone is an unrepresentable reflection (ignored); flipH & flipV
+    // together equal a 180° turn, folded onto the OOXML rotation before mapping.
+    let rot_cw = if b.flip_h && b.flip_v {
+        b.rot_deg + 180.0
+    } else {
+        b.rot_deg
+    };
+    let rotation = ooxml_rot_to_rotation(rot_cw);
     if !b.is_placed() {
         return (None, rotation);
     }
@@ -1664,7 +1839,7 @@ fn pptx_walk_sptree(
     while let Some(tok) = x.next() {
         match &tok {
             Tok::Open(name, attrs, sc) if !sc => match local(name) {
-                "sp" => pptx_sp_model(x, theme, geom, inherit, &g, acc),
+                "sp" => pptx_sp_model(x, rels, theme, geom, inherit, &g, acc),
                 "pic" => pptx_pic_model(x, zip, rels, geom, resources, &g, acc),
                 "graphicFrame" => pptx_graphic_frame_model(x, zip, rels, theme, geom, &g, acc),
                 "grpSp" => {
@@ -1705,7 +1880,7 @@ fn pptx_grp_sp_model(
                     composed = g.compose(&b, ch_off, ch_ext);
                 }
                 // Child shapes — same dispatch as the top-level tree.
-                "sp" if !sc => pptx_sp_model(x, theme, geom, inherit, &composed, acc),
+                "sp" if !sc => pptx_sp_model(x, rels, theme, geom, inherit, &composed, acc),
                 "pic" if !sc => pptx_pic_model(x, zip, rels, geom, resources, &composed, acc),
                 "graphicFrame" if !sc => {
                     pptx_graphic_frame_model(x, zip, rels, theme, geom, &composed, acc)
@@ -1781,6 +1956,7 @@ fn parse_group_xfrm(
 /// subtree up to `</p:sp>`.
 fn pptx_sp_model(
     x: &mut Xml,
+    rels: &BTreeMap<String, String>,
     theme: &PptxTheme,
     geom: PageGeom,
     inherit: &PptxPlaceholderGeom,
@@ -1797,7 +1973,7 @@ fn pptx_sp_model(
     let mut para_runs: Vec<Inline> = Vec::new();
     let mut in_para = false;
     let mut run = RunStyle::default();
-    let mut in_rpr = false;
+    let mut rpr = PptxRunPr::default();
     let mut in_text = false;
 
     while let Some(tok) = x.next() {
@@ -1815,40 +1991,29 @@ fn pptx_sp_model(
                     in_para = true;
                     para_runs = Vec::new();
                 }
-                "rPr" if !sc => {
-                    in_rpr = true;
-                    run = pptx_run_props(&attrs);
-                    if sc {
-                        in_rpr = false;
-                    }
-                }
-                "srgbClr" if in_rpr => {
-                    if let Some(v) = attr(&attrs, "val") {
-                        if is_hex6(v) {
-                            run.color = Some(v.to_ascii_uppercase());
-                        }
-                    }
-                }
-                "schemeClr" if in_rpr => {
-                    if let Some(c) = attr(&attrs, "val").and_then(|v| theme.resolve_scheme(v)) {
-                        run.color = Some(c);
-                    }
-                }
-                "latin" if in_rpr => {
-                    run.font_family = attr(&attrs, "typeface").and_then(|t| theme.resolve(t));
-                }
                 "t" if !sc => in_text = true,
                 "br" => para_runs.push(Inline::LineBreak),
+                "rPr" => {
+                    run = pptx_run_props(&attrs);
+                    rpr = PptxRunPr::open();
+                    // A self-closing `<a:rPr/>` carries no colour/link children.
+                    if sc {
+                        rpr.close(&mut run, theme, rels);
+                    }
+                }
+                // Any other tag inside an open `a:rPr` (colour / latin / hlink).
+                ln if rpr.active => rpr.on_open(ln, &attrs),
                 _ => {}
             },
             Tok::Text(t) => {
                 if in_para && in_text && !t.is_empty() {
-                    push_run(&mut para_runs, &run, &t);
+                    push_run_maybe_linked(&mut para_runs, &run, &t);
                 }
             }
             Tok::Close(name) => match local(&name) {
                 "t" => in_text = false,
-                "rPr" => in_rpr = false,
+                // Inside an open `a:rPr`: update fill nesting; fold on `</a:rPr>`.
+                ln if rpr.active && rpr.on_close(ln) => rpr.close(&mut run, theme, rels),
                 "p" => {
                     if in_para && !para_runs.is_empty() {
                         paras.push(Block {
@@ -1976,7 +2141,7 @@ fn pptx_graphic_frame_model(
                 }
                 "tbl" if !sc && block.is_none() => {
                     block = Some(Block {
-                        kind: BlockKind::Table(pptx_table_model(x, theme)),
+                        kind: BlockKind::Table(pptx_table_model(x, rels, theme)),
                         ..Block::default()
                     });
                 }
@@ -2165,11 +2330,16 @@ fn part_rels_key(part: &str) -> String {
 /// Lower a PPTX `a:tbl` (open consumed) to a model [`Table`]: `a:tblGrid/a:gridCol@w`
 /// seeds `col_widths` (points); each `a:tr`→[`Row`], each `a:tc`→[`Cell`] with
 /// `@gridSpan`/`@rowSpan`→spans and `@hMerge`/`@vMerge` continuation cells folded
-/// into empty placeholders. Cell text reuses the slide paragraph grammar.
-fn pptx_table_model(x: &mut Xml, theme: &PptxTheme) -> Table {
+/// into empty placeholders. Cell `a:tcPr/a:solidFill` → [`Cell::shading`] and
+/// `a:hlinkClick` runs → [`Inline::Link`]. The model carries one table-wide
+/// [`BorderStyle`], so the first cell edge (`a:lnL/R/T/B`) that declares a width
+/// seeds it. Cell text reuses the slide paragraph grammar.
+fn pptx_table_model(x: &mut Xml, rels: &BTreeMap<String, String>, theme: &PptxTheme) -> Table {
     let mut col_widths: Vec<f64> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut cur: Option<Vec<Cell>> = None;
+    // The model has a single table-wide border; the first declared cell edge wins.
+    let mut border: Option<model::BorderStyle> = None;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -2184,9 +2354,12 @@ fn pptx_table_model(x: &mut Xml, theme: &PptxTheme) -> Table {
                 } else if ln == "tr" && !sc {
                     cur = Some(Vec::new());
                 } else if ln == "tc" && !sc {
-                    let cell = pptx_table_cell_model(x, theme, &attrs);
+                    let out = pptx_table_cell_model(x, rels, theme, &attrs);
+                    if border.is_none() {
+                        border = out.border;
+                    }
                     if let Some(row) = cur.as_mut() {
-                        for c in cell {
+                        for c in out.cells {
                             row.push(c);
                         }
                     }
@@ -2212,20 +2385,32 @@ fn pptx_table_model(x: &mut Xml, theme: &PptxTheme) -> Table {
     Table {
         rows,
         col_widths,
-        border: model::BorderStyle::default(),
+        border: border.unwrap_or_default(),
     }
 }
 
-/// Lower one PPTX `a:tc` cell (open consumed, attrs in `cell_attrs`) to model
-/// [`Cell`]s. `@gridSpan` widens the cell and pads the row with empty cells so
-/// the column count stays correct; `@rowSpan` sets `row_span`; an `@hMerge`
+/// One lowered PPTX `a:tc`: the model cell(s) it expands to (one, plus padding for
+/// `@gridSpan`) and the border style it declared (`a:lnL/R/T/B`), surfaced to the
+/// table so the model's single table-wide [`BorderStyle`] can be seeded.
+struct PptxCellOut {
+    cells: Vec<Cell>,
+    border: Option<model::BorderStyle>,
+}
+
+/// Lower one PPTX `a:tc` cell (open consumed, attrs in `cell_attrs`) to a
+/// [`PptxCellOut`]. `@gridSpan` widens the cell and pads the row with empty cells
+/// so the column count stays correct; `@rowSpan` sets `row_span`; an `@hMerge`
 /// continuation is dropped (covered to its left) and a `@vMerge` continuation
-/// becomes one empty cell. Consumes up to `</a:tc>`.
+/// becomes one empty cell. The cell's `a:tcPr/a:solidFill` becomes
+/// [`Cell::shading`], its first `a:lnL/R/T/B` edge becomes the surfaced
+/// [`BorderStyle`], and run `a:hlinkClick`s become [`Inline::Link`]s. Consumes up
+/// to `</a:tc>`.
 fn pptx_table_cell_model(
     x: &mut Xml,
+    rels: &BTreeMap<String, String>,
     theme: &PptxTheme,
     cell_attrs: &[(String, String)],
-) -> Vec<Cell> {
+) -> PptxCellOut {
     let grid_span = attr(cell_attrs, "gridSpan")
         .and_then(|v| v.trim().parse::<u16>().ok())
         .unwrap_or(1)
@@ -2241,9 +2426,12 @@ fn pptx_table_cell_model(
     let mut para_runs: Vec<Inline> = Vec::new();
     let mut in_para = false;
     let mut run = RunStyle::default();
-    let mut in_rpr = false;
+    let mut rpr = PptxRunPr::default();
     let mut in_text = false;
-    let mut depth = 0i32; // <a:tc> nesting guard
+    // Cell-properties scratch: the `a:tcPr/a:solidFill` (fill) and `a:lnL/R/T/B`
+    // (border) live here, kept distinct from run fills (`a:rPr`).
+    let mut tc_pr = PptxCellPr::default();
+    let mut depth = 0i32; // `a:tc` nesting guard
 
     while let Some(tok) = x.next() {
         match tok {
@@ -2253,40 +2441,28 @@ fn pptx_table_cell_model(
                     in_para = true;
                     para_runs = Vec::new();
                 }
-                "rPr" if !sc => {
-                    in_rpr = true;
-                    run = pptx_run_props(&attrs);
-                    if sc {
-                        in_rpr = false;
-                    }
-                }
-                "srgbClr" if in_rpr => {
-                    if let Some(v) = attr(&attrs, "val") {
-                        if is_hex6(v) {
-                            run.color = Some(v.to_ascii_uppercase());
-                        }
-                    }
-                }
-                "schemeClr" if in_rpr => {
-                    if let Some(c) = attr(&attrs, "val").and_then(|v| theme.resolve_scheme(v)) {
-                        run.color = Some(c);
-                    }
-                }
-                "latin" if in_rpr => {
-                    run.font_family = attr(&attrs, "typeface").and_then(|t| theme.resolve(t));
-                }
                 "t" if !sc => in_text = true,
                 "br" => para_runs.push(Inline::LineBreak),
-                _ => {}
+                "rPr" => {
+                    run = pptx_run_props(&attrs);
+                    rpr = PptxRunPr::open();
+                    if sc {
+                        rpr.close(&mut run, theme, rels);
+                    }
+                }
+                // Run-property children (colour / latin / hlink) take priority over
+                // cell-property parsing so a run fill is never read as the cell fill.
+                ln if rpr.active => rpr.on_open(ln, &attrs),
+                ln => tc_pr.on_open(ln, &attrs),
             },
             Tok::Text(t) => {
                 if in_para && in_text && !t.is_empty() {
-                    push_run(&mut para_runs, &run, &t);
+                    push_run_maybe_linked(&mut para_runs, &run, &t);
                 }
             }
             Tok::Close(name) => match local(&name) {
                 "t" => in_text = false,
-                "rPr" => in_rpr = false,
+                ln if rpr.active && rpr.on_close(ln) => rpr.close(&mut run, theme, rels),
                 "p" => {
                     if in_para && !para_runs.is_empty() {
                         paras.push(Block {
@@ -2305,31 +2481,132 @@ fn pptx_table_cell_model(
                     }
                     depth -= 1;
                 }
-                _ => {}
+                ln => tc_pr.on_close(ln),
             },
         }
     }
 
+    let (fill, border) = tc_pr.finish(theme);
+
     // Horizontal-merge continuation: covered by the cell spanning it — drop.
     if h_merge {
-        return Vec::new();
+        return PptxCellOut {
+            cells: Vec::new(),
+            border,
+        };
     }
     // Vertical-merge continuation: one empty cell to keep the column count.
     if v_merge {
-        return vec![Cell::default()];
+        return PptxCellOut {
+            cells: vec![Cell::default()],
+            border,
+        };
     }
 
     let mut cells = vec![Cell {
         blocks: paras,
         col_span: grid_span,
         row_span,
-        shading: None,
+        shading: fill,
     }];
     // Pad to `grid_span` physical columns (empty continuation cells).
     for _ in 1..grid_span {
         cells.push(Cell::default());
     }
-    cells
+    PptxCellOut { cells, border }
+}
+
+/// Streaming state for a PPTX `a:tcPr` cell-properties subtree: the cell fill
+/// (`a:solidFill`, kept distinct from a border line's own fill) and the first
+/// declared border edge (`a:lnL/R/T/B`, with its `@w` width and `a:solidFill`
+/// colour). The model carries one fill per cell and one border per table, so only
+/// the first of each is retained. Colours are resolved (scheme slots through the
+/// theme) at [`finish`](PptxCellPr::finish) time.
+#[derive(Default)]
+struct PptxCellPr {
+    /// True while inside a border line element (`a:lnL/R/T/B`) — its nested
+    /// `a:solidFill` is a *border* colour, not the cell fill.
+    in_line: bool,
+    /// The current border line's stroke width (points), from `a:ln@w` (EMU).
+    line_w: Option<f64>,
+    /// The current border line's colour accumulator.
+    line_color: PptxFillColor,
+    /// The first border edge's `(width, colour)` once a line closes.
+    border: Option<(f64, PptxFillColor)>,
+    /// True while inside the cell's own `a:solidFill` (a direct `a:tcPr` child).
+    in_cell_fill: bool,
+    /// The cell fill colour accumulator.
+    cell_fill: PptxFillColor,
+}
+
+impl PptxCellPr {
+    /// Handle an open tag inside the `a:tc` (outside any `a:rPr`). Enters border
+    /// lines and the cell fill, and routes colour bases/modifiers to whichever is
+    /// active (a border line's fill shadows the cell fill while open).
+    fn on_open(&mut self, ln: &str, attrs: &[(String, String)]) {
+        match ln {
+            "lnL" | "lnR" | "lnT" | "lnB" => {
+                self.in_line = true;
+                self.line_w = attr(attrs, "w").and_then(emu_to_pt);
+                self.line_color = PptxFillColor::default();
+            }
+            "solidFill" if self.in_line => {} // colours below land in line_color
+            "solidFill" => self.in_cell_fill = true,
+            "srgbClr" | "schemeClr" | "hslClr" | "sysClr" => {
+                if self.in_line {
+                    self.line_color.set_base(ln, attrs);
+                } else if self.in_cell_fill {
+                    self.cell_fill.set_base(ln, attrs);
+                }
+            }
+            "lumMod" | "lumOff" | "shade" | "tint" => {
+                if self.in_line {
+                    self.line_color.set_mod(ln, attrs);
+                } else if self.in_cell_fill {
+                    self.cell_fill.set_mod(ln, attrs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a close tag inside the `a:tc`: completing a border line records the
+    /// first edge (width + colour accumulator); closing the cell fill leaves the
+    /// accumulator for [`finish`](PptxCellPr::finish).
+    fn on_close(&mut self, ln: &str) {
+        match ln {
+            "lnL" | "lnR" | "lnT" | "lnB" => {
+                if self.border.is_none() {
+                    if let Some(w) = self.line_w.filter(|w| *w > 0.0) {
+                        self.border = Some((w, std::mem::take(&mut self.line_color)));
+                    }
+                }
+                self.in_line = false;
+            }
+            "solidFill" => self.in_cell_fill = false,
+            _ => {}
+        }
+    }
+
+    /// Resolve the cell fill and border colours through `theme`, returning
+    /// `(cell fill RGB, table border)`. A border with no resolvable colour falls
+    /// back to black.
+    fn finish(self, theme: &PptxTheme) -> (Option<[f64; 3]>, Option<model::BorderStyle>) {
+        let fill = self
+            .cell_fill
+            .finish_with(theme)
+            .as_deref()
+            .and_then(hex_to_rgb_f64);
+        let border = self.border.map(|(width, color)| {
+            let color = color
+                .finish_with(theme)
+                .as_deref()
+                .and_then(hex_to_rgb_f64)
+                .unwrap_or([0.0, 0.0, 0.0]);
+            model::BorderStyle { width, color }
+        });
+        (fill, border)
+    }
 }
 
 /// Extract a chart referenced by `rid` (resolved via `rels` → `ppt/charts/chartN.xml`)
@@ -4759,6 +5036,10 @@ struct RunStyle {
     /// `fo:font-name` (ODF). Surfaced as `font-family` so the host two-phase
     /// font fetch embeds the real face and the layout uses its true metrics.
     font_family: Option<String>,
+    /// Hyperlink target URL for the run (PPTX `a:hlinkClick@r:id` resolved through
+    /// the slide rels). `None` ⇒ a plain run; `Some` ⇒ wrapped in an
+    /// [`Inline::Link`] when pushed. Only consulted by the PPTX model path.
+    hyperlink: Option<String>,
 }
 
 impl RunStyle {
@@ -8141,6 +8422,98 @@ fn pptx_content_paragraph(x: &mut Xml, theme: &PptxTheme, out: &mut String) {
     }
     if !para.trim().is_empty() {
         out.push_str(&format!("<p>{}</p>", para.trim()));
+    }
+}
+
+/// Streaming state for one PPTX `a:rPr` run-properties subtree: the run's fill
+/// colour (the `a:solidFill`, or — as a graceful fallback — the FIRST stop of an
+/// `a:gradFill`), its `a:latin` typeface, and its `a:hlinkClick` target. A child
+/// `a:srgbClr`/`a:schemeClr` is only taken when it belongs to a text *fill*
+/// (`active_fill`), so a text outline's colour (`a:ln`) is never mistaken for the
+/// run colour. The folded result lands in the caller's [`RunStyle`] on close.
+#[derive(Default)]
+struct PptxRunPr {
+    /// True while inside an `a:rPr` (the caller routes child tokens to us).
+    active: bool,
+    /// True while inside the run's `a:solidFill` or the first `a:gradFill` stop.
+    in_fill: bool,
+    /// True once a `gradFill`'s first `a:gs` stop has been consumed (later stops
+    /// are ignored — only the first becomes the solid fallback).
+    grad_stop_done: bool,
+    fill: PptxFillColor,
+    /// Typeface from `a:latin@typeface` (resolved through the theme on close).
+    latin: Option<String>,
+    /// Hyperlink relationship id from `a:hlinkClick@r:id` (resolved on close).
+    hlink_rid: Option<String>,
+}
+
+impl PptxRunPr {
+    /// Begin collecting an `a:rPr` subtree.
+    fn open() -> Self {
+        PptxRunPr {
+            active: true,
+            ..PptxRunPr::default()
+        }
+    }
+
+    /// Handle an open tag inside the `a:rPr`. Enters a text `a:solidFill` or the
+    /// first `a:gradFill` stop, records colour bases/modifiers while in a fill,
+    /// and captures `a:latin` / `a:hlinkClick` at the run level.
+    fn on_open(&mut self, ln: &str, attrs: &[(String, String)]) {
+        match ln {
+            "solidFill" => self.in_fill = true,
+            // A gradient: capture the first stop's colour as a solid fallback.
+            "gs" if !self.grad_stop_done => self.in_fill = true,
+            "srgbClr" | "schemeClr" | "hslClr" | "sysClr" if self.in_fill => {
+                self.fill.set_base(ln, attrs);
+            }
+            "lumMod" | "lumOff" | "shade" | "tint" if self.in_fill => self.fill.set_mod(ln, attrs),
+            "latin" => {
+                self.latin = attr(attrs, "typeface").map(|t| t.to_string());
+            }
+            "hlinkClick" => {
+                self.hlink_rid = attr(attrs, "id")
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| v.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a close tag inside the `a:rPr`; returns `true` when it closes the
+    /// `a:rPr` itself (the caller then folds the result via [`close`](Self::close)).
+    fn on_close(&mut self, ln: &str) -> bool {
+        match ln {
+            "solidFill" => {
+                self.in_fill = false;
+                false
+            }
+            "gs" => {
+                if self.in_fill {
+                    self.grad_stop_done = true;
+                }
+                self.in_fill = false;
+                false
+            }
+            "rPr" => true,
+            _ => false,
+        }
+    }
+
+    /// Fold the collected colour / typeface / hyperlink into `run` and reset.
+    fn close(&mut self, run: &mut RunStyle, theme: &PptxTheme, rels: &BTreeMap<String, String>) {
+        let collected = std::mem::take(self);
+        if let Some(color) = collected.fill.finish_with(theme) {
+            run.color = Some(color);
+        }
+        if let Some(t) = collected.latin {
+            run.font_family = theme.resolve(&t);
+        }
+        if let Some(rid) = collected.hlink_rid {
+            if let Some(url) = rels.get(&rid).filter(|u| !u.trim().is_empty()) {
+                run.hyperlink = Some(url.clone());
+            }
+        }
     }
 }
 
@@ -14444,5 +14817,197 @@ mod tests {
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[0].cells.len(), 2);
         assert!(slide.shapes[0].frame.is_some(), "table frame from p:xfrm");
+    }
+
+    // ── #47: run hyperlinks, table cell fill/borders, theme colours, mirror ──
+
+    /// The first run of the first paragraph block in a TextBox shape.
+    fn first_textbox_runs(b: &Block) -> &[Inline] {
+        let tb = match &b.kind {
+            BlockKind::TextBox(tb) => tb,
+            other => panic!("expected a TextBox, got {other:?}"),
+        };
+        match &tb.blocks[0].kind {
+            BlockKind::Paragraph(p) => &p.runs,
+            other => panic!("expected a Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pptx_model_run_hyperlink_becomes_inline_link() {
+        // `a:hlinkClick@r:id` on a run resolves through the slide rels to an
+        // external URL and wraps the run in an `Inline::Link` (instead of being
+        // dropped). A second, plain run stays a bare `Inline::Run`.
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree>
+                      <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                        <p:txBody><a:p>
+                          <a:r><a:rPr><a:hlinkClick r:id="rId1"/></a:rPr><a:t>Visit</a:t></a:r>
+                          <a:r><a:rPr/><a:t> plain</a:t></a:r>
+                        </a:p></p:txBody></p:sp>
+                    </p:spTree></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/docs" TargetMode="External"/>
+                    </Relationships>"#,
+                ),
+            ],
+            &[],
+        );
+        let runs = first_textbox_runs(&slide.shapes[0]);
+        let link = runs
+            .iter()
+            .find_map(|i| match i {
+                Inline::Link { href, children } => Some((href, children)),
+                _ => None,
+            })
+            .expect("a hyperlink run → Inline::Link");
+        assert_eq!(
+            *link.0,
+            model::LinkTarget::Url("https://example.com/docs".to_string())
+        );
+        let linked_text: String = link
+            .1
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(linked_text, "Visit", "anchor text inside the link");
+        // The plain run is NOT swallowed into the link.
+        assert!(
+            runs.iter()
+                .any(|i| matches!(i, Inline::Run(r) if r.text == " plain")),
+            "plain run stays bare: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn pptx_model_table_cell_fill_and_border_are_read() {
+        // `a:tc/a:tcPr/a:solidFill` → Cell.shading; the first `a:lnL/R/T/B` edge
+        // (width + colour) → the model's single table-wide BorderStyle.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:graphicFrame>
+                <p:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></p:xfrm>
+                <a:graphic><a:graphicData>
+                  <a:tbl><a:tblGrid><a:gridCol w="1270000"/></a:tblGrid>
+                    <a:tr><a:tc>
+                      <a:txBody><a:p><a:r><a:t>Filled</a:t></a:r></a:p></a:txBody>
+                      <a:tcPr>
+                        <a:lnL w="12700"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:lnL>
+                        <a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>
+                      </a:tcPr>
+                    </a:tc></a:tr>
+                  </a:tbl>
+                </a:graphicData></a:graphic>
+              </p:graphicFrame>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let table = match &slide.shapes[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected Table, got {other:?}"),
+        };
+        // Cell fill 00FF00 → green shading.
+        assert_eq!(
+            table.rows[0].cells[0].shading,
+            Some([0.0, 1.0, 0.0]),
+            "cell solidFill → shading"
+        );
+        // Border 1pt (12700 EMU) red, taken from a:lnL (not the cell fill).
+        assert!((table.border.width - 1.0).abs() < 1e-6, "border 1pt");
+        assert_eq!(table.border.color, [1.0, 0.0, 0.0], "border red from lnL");
+    }
+
+    #[test]
+    fn pptx_model_run_scheme_colour_with_tint_resolves() {
+        // `a:schemeClr val="accent1"` resolves through the theme, and a
+        // `lumMod`/`lumOff` tint modulates it (40% luminance + 60% offset of the
+        // pure-blue accent ⇒ a lighter blue, no longer the raw accent or black).
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/theme/theme1.xml",
+                    r#"<a:theme xmlns:a="a"><a:themeElements><a:clrScheme name="Office">
+                      <a:dk1><a:srgbClr val="000000"/></a:dk1>
+                      <a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+                      <a:accent1><a:srgbClr val="0000FF"/></a:accent1>
+                    </a:clrScheme></a:themeElements></a:theme>"#,
+                ),
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+                      <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                        <p:txBody><a:p><a:r>
+                          <a:rPr><a:solidFill><a:schemeClr val="accent1"><a:lumMod val="40000"/><a:lumOff val="60000"/></a:schemeClr></a:solidFill></a:rPr>
+                          <a:t>Tinted</a:t>
+                        </a:r></a:p></p:txBody></p:sp>
+                    </p:spTree></p:cSld></p:sld>"#,
+                ),
+            ],
+            &[],
+        );
+        let runs = first_textbox_runs(&slide.shapes[0]);
+        let color = runs
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) => r.style.color,
+                _ => None,
+            })
+            .expect("run colour set");
+        // Base 0000FF → lumMod 0.4 → [0,0,0.4]; lumOff +0.6 → [0.6,0.6,1.0].
+        assert!((color[0] - 0.6).abs() < 0.01, "R tint: {color:?}");
+        assert!((color[1] - 0.6).abs() < 0.01, "G tint: {color:?}");
+        assert!((color[2] - 1.0).abs() < 0.01, "B tint: {color:?}");
+    }
+
+    #[test]
+    fn pptx_model_double_flip_folds_into_rotation() {
+        // flipH AND flipV together = a 180° point reflection; with no `@rot` the
+        // model rotation becomes D180 (a single-axis flip, an unrepresentable
+        // reflection, would leave it D0 — covered separately below).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp>
+                <p:spPr><a:xfrm flipH="1" flipV="1"><a:off x="127000" y="127000"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                <p:txBody><a:p><a:r><a:t>Mirrored</a:t></a:r></a:p></p:txBody>
+              </p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        assert_eq!(
+            slide.shapes[0].rotation,
+            crate::model::Rotation::D180,
+            "flipH+flipV → 180° rotation"
+        );
+        assert!(slide.shapes[0].frame.is_some(), "frame still placed");
+    }
+
+    #[test]
+    fn pptx_model_single_flip_keeps_frame_without_reflection() {
+        // A single-axis flip is a reflection the model's rotation cannot express;
+        // it is dropped, but the box's absolute placement is still preserved (not
+        // dropped to flow).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp>
+                <p:spPr><a:xfrm flipH="1"><a:off x="127000" y="127000"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                <p:txBody><a:p><a:r><a:t>Flipped</a:t></a:r></a:p></p:txBody>
+              </p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        assert_eq!(
+            slide.shapes[0].rotation,
+            crate::model::Rotation::D0,
+            "single flip leaves rotation unchanged"
+        );
+        assert!(slide.shapes[0].frame.is_some(), "frame still placed");
     }
 }
