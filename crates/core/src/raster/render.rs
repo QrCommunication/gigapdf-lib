@@ -221,6 +221,11 @@ pub struct RenderImage {
     pub height: u32,
     /// `width*height*4` RGBA bytes.
     pub rgba: Vec<u8>,
+    /// `/ImageMask true`: a 1-bit stencil. The RGB samples are ignored and the
+    /// *current fill colour* of the graphics state is painted through the
+    /// unmasked pixels (their alpha is the stencil coverage). `false` for an
+    /// ordinary image whose own RGB is painted.
+    pub stencil: bool,
 }
 
 /// Per-page image XObjects, keyed by resource name (as used by `Do`).
@@ -232,7 +237,9 @@ pub type RenderImages = BTreeMap<Vec<u8>, RenderImage>;
 /// `global_alpha` (`0.0..=1.0`) scales the image's own per-pixel alpha — used to
 /// honour an annotation appearance's `/CA` opacity. An optional `clip` (active
 /// `W` clip ∩ soft mask) further modulates each pixel, and `blend` selects the
-/// compositing mode.
+/// compositing mode. For an `/ImageMask` stencil (`image.stencil`), `fill` is the
+/// current fill colour painted through the unmasked pixels (the texel RGB is
+/// ignored); for an ordinary image `fill` is unused.
 #[allow(clippy::too_many_arguments)]
 fn blit_image_clipped(
     canvas: &mut Canvas,
@@ -242,6 +249,7 @@ fn blit_image_clipped(
     global_alpha: f64,
     clip: Option<&ClipMask>,
     blend: BlendMode,
+    fill: [u8; 3],
 ) {
     if image.width == 0 || image.height == 0 {
         return;
@@ -293,7 +301,13 @@ fn blit_image_clipped(
             // Image row 0 is the top of the image, which is v = 1.
             let row = (((1.0 - v) * h as f64) as usize).min(h - 1);
             let idx = (row * w + col) * 4;
-            let color = [image.rgba[idx], image.rgba[idx + 1], image.rgba[idx + 2]];
+            // A stencil mask paints the current fill colour through its unmasked
+            // pixels; an ordinary image paints its own RGB texel.
+            let color = if image.stencil {
+                fill
+            } else {
+                [image.rgba[idx], image.rgba[idx + 1], image.rgba[idx + 2]]
+            };
             let mut alpha = image.rgba[idx + 3] as f64 / 255.0 * global_alpha;
             if let Some(cmask) = clip {
                 alpha *= cmask.at(px, py);
@@ -822,6 +836,7 @@ pub fn render_content_into_ctx(
                             global_alpha * state.fill_alpha,
                             clip.as_ref(),
                             state.blend,
+                            state.fill,
                         );
                     } else if depth < crate::content::MAX_FORM_DEPTH {
                         if let Some(form) = ctx.form_xobject(name) {
@@ -1526,6 +1541,7 @@ mod tests {
                 255, 0, 0, 255, 0, 255, 0, 255, // top row
                 0, 0, 255, 255, 255, 255, 255, 255, // bottom row
             ],
+            stencil: false,
         };
         let mut images = RenderImages::new();
         images.insert(b"Im0".to_vec(), image);
@@ -1545,6 +1561,52 @@ mod tests {
         assert_eq!(at(10, 10), [255, 0, 0], "top-left texel is red");
         assert_eq!(at(90, 90), [255, 255, 255], "bottom-right texel is white");
         assert_eq!(at(90, 10), [0, 255, 0], "top-right texel is green");
+    }
+
+    #[test]
+    fn stencil_image_paints_fill_colour_through_alpha() {
+        // A 2×2 stencil (`stencil: true`): top-left opaque (alpha 255), the rest
+        // transparent (alpha 0). The RGB samples are placeholders — the painted
+        // pixel must take the *current fill colour* (set blue via `rg`), and the
+        // transparent pixels must stay white paper.
+        let image = RenderImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                0, 0, 0, 255, 0, 0, 0, 0, // top row: paint, skip
+                0, 0, 0, 0, 0, 0, 0, 0, // bottom row: skip, skip
+            ],
+            stencil: true,
+        };
+        let mut images = RenderImages::new();
+        images.insert(b"Im0".to_vec(), image);
+        let canvas = render_content(
+            b"0 0 1 rg 100 0 0 100 0 0 cm /Im0 Do",
+            100,
+            100,
+            Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 100.0),
+            &RenderFonts::new(),
+            &images,
+        );
+        let at = |x: usize, y: usize| {
+            let i = (y * 100 + x) * 4;
+            [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]
+        };
+        assert_eq!(
+            at(25, 25),
+            [0, 0, 255],
+            "painted stencil pixel is the fill blue"
+        );
+        assert_eq!(
+            at(75, 25),
+            [255, 255, 255],
+            "transparent stencil pixel stays white"
+        );
+        assert_eq!(
+            at(75, 75),
+            [255, 255, 255],
+            "transparent stencil pixel stays white"
+        );
     }
 
     #[test]

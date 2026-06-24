@@ -110,6 +110,14 @@ impl Object {
         }
     }
 
+    /// Boolean value if this is an [`Object::Boolean`].
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Object::Boolean(b) => Some(*b),
+            _ => None,
+        }
+    }
+
     /// Borrow the stream if this is an [`Object::Stream`].
     pub fn as_stream(&self) -> Option<&Stream> {
         match self {

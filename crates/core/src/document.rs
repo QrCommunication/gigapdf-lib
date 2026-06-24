@@ -6995,11 +6995,43 @@ impl Document {
             }
             let (w, h) = (width as usize, height as usize);
             let filter = self.first_filter(dict);
+            // An `/ImageMask true` XObject is a 1-bit stencil: it has no colour
+            // space and paints the *current fill colour* through its unmasked
+            // pixels. Decode it into an alpha-only image (RGB is a placeholder)
+            // tagged `stencil`, so the rasterizer substitutes the fill colour at
+            // `Do` time.
+            if dict
+                .get(b"ImageMask")
+                .and_then(Object::as_bool)
+                .unwrap_or(false)
+            {
+                if let Some(alpha) = self.decode_stencil_alpha(stream, dict, w, h) {
+                    let mut rgba = Vec::with_capacity(w * h * 4);
+                    for a in alpha {
+                        rgba.extend_from_slice(&[0, 0, 0, a]);
+                    }
+                    out.insert(
+                        name.clone(),
+                        crate::raster::render::RenderImage {
+                            width: width as u32,
+                            height: height as u32,
+                            rgba,
+                            stencil: true,
+                        },
+                    );
+                }
+                continue;
+            }
             // Decode the image's RGB samples (one `[r, g, b]` triple per pixel,
             // row-major). A baseline JPEG (`/DCTDecode`) is decoded by the
             // built-in JPEG decoder from the raw (still-DCT-coded) stream bytes;
             // everything else is an uncompressed/Flate sample grid whose
             // component layout the `/ColorSpace` describes.
+            // A colour-key `/Mask [min0 max0 …]` makes pixels whose *raw* samples
+            // all fall in the given per-component ranges transparent; it is keyed
+            // on the integer samples, so it is computed alongside the (non-JPEG)
+            // sample decode where they are available. `None` = no colour key.
+            let mut color_key: Option<Vec<bool>> = None;
             let rgb: Vec<[u8; 3]> = if filter.as_deref() == Some(b"DCTDecode") {
                 let Some((jw, jh, jrgba)) = crate::raster::jpeg::decode_jpeg(&stream.raw) else {
                     continue; // progressive/arithmetic/malformed — not yet decoded
@@ -7030,6 +7062,7 @@ impl Document {
                 let Ok(samples) = decode_stream(stream) else {
                     continue;
                 };
+                color_key = self.color_key_mask(dict, &samples, w, h, &cs, bpc);
                 match self.image_samples_to_rgb(&cs, &samples, w, h, bpc, dict) {
                     Some(rgb) => rgb,
                     None => continue,
@@ -7039,13 +7072,15 @@ impl Document {
             // is how PNG transparency (and a JPEG photo's soft cut-out) survives
             // embedding. Sampled nearest-neighbour so a soft mask of a different
             // size still maps (identity when the dimensions match, the common
-            // case).
+            // case). An explicit `/Mask` (a 1-bit `/ImageMask` stream) is the hard
+            // 1-bit counterpart: its set bits hide the base image.
             let smask = self.decode_gray_smask(dict);
+            let explicit_mask = self.decode_explicit_mask(dict);
             let mut rgba = Vec::with_capacity(w * h * 4);
             for y in 0..h {
                 for x in 0..w {
                     let [r, g, b] = rgb[y * w + x];
-                    let a = match &smask {
+                    let mut a = match &smask {
                         Some((sw, sh, alpha)) => {
                             let sx = if *sw == w { x } else { x * *sw / w };
                             let sy = if *sh == h { y } else { y * *sh / h };
@@ -7053,6 +7088,18 @@ impl Document {
                         }
                         None => 255,
                     };
+                    if let Some((mw, mh, hidden)) = &explicit_mask {
+                        let mx = if *mw == w { x } else { x * *mw / w };
+                        let my = if *mh == h { y } else { y * *mh / h };
+                        if hidden.get(my * *mw + mx).copied().unwrap_or(false) {
+                            a = 0;
+                        }
+                    }
+                    if let Some(key) = &color_key {
+                        if key.get(y * w + x).copied().unwrap_or(false) {
+                            a = 0;
+                        }
+                    }
                     rgba.extend_from_slice(&[r, g, b, a]);
                 }
             }
@@ -7062,6 +7109,7 @@ impl Document {
                     width: width as u32,
                     height: height as u32,
                     rgba,
+                    stencil: false,
                 },
             );
         }
@@ -7192,6 +7240,142 @@ impl Document {
             return None;
         }
         Some((sw, sh, samples))
+    }
+
+    /// Decode an `/ImageMask true` stencil (the `stream`, `dict`, `w × h`) into a
+    /// per-pixel alpha buffer: `255` where the stencil *paints* and `0` where it
+    /// is masked out. Per PDF §8.9.6.2 the default `/Decode [0 1]` paints the
+    /// fill colour where the 1-bit sample is **0**; `/Decode [1 0]` inverts that.
+    /// Scanlines are padded to a byte boundary. `None` on a short or undecodable
+    /// stream (e.g. a JPEG-coded mask).
+    fn decode_stencil_alpha(
+        &self,
+        stream: &Stream,
+        dict: &Dictionary,
+        w: usize,
+        h: usize,
+    ) -> Option<Vec<u8>> {
+        if matches!(
+            self.first_filter(dict).as_deref(),
+            Some(b"DCTDecode") | Some(b"JPXDecode")
+        ) {
+            return None;
+        }
+        let samples = decode_stream(stream).ok()?;
+        let row_bytes = (w as u64).div_ceil(8);
+        if row_bytes * h as u64 > samples.len() as u64 {
+            return None;
+        }
+        // `/Decode [1 0]` flips the convention: bit 1 (not 0) becomes the painted
+        // value. Default (absent or `[0 1]`): bit 0 paints.
+        let decode = read_vec(self, dict, b"Decode").unwrap_or_default();
+        let invert = decode.len() >= 2 && decode[0] > decode[1];
+        let mut alpha = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let row_start_bit = y as u64 * row_bytes * 8;
+            for x in 0..w {
+                let bit = read_bits(&samples, row_start_bit + x as u64, 1) == 1;
+                let paint = if invert { bit } else { !bit };
+                alpha.push(if paint { 255 } else { 0 });
+            }
+        }
+        Some(alpha)
+    }
+
+    /// Decode an explicit `/Mask` (a 1-bit `/ImageMask` stream that hides part of
+    /// the *base* image) into `(width, height, hidden)` where `hidden[i] == true`
+    /// means the corresponding pixel is masked out (made transparent). Per PDF
+    /// §8.9.6.3 a mask sample of **1** hides under the default `/Decode [0 1]`;
+    /// `/Decode [1 0]` inverts. `None` when `/Mask` is absent, is a colour-key
+    /// array, or is an undecodable stream.
+    fn decode_explicit_mask(&self, dict: &Dictionary) -> Option<(usize, usize, Vec<bool>)> {
+        let stream = dict.get(b"Mask").map(|o| self.resolve(o))?.as_stream()?;
+        let md = &stream.dict;
+        if !md
+            .get(b"ImageMask")
+            .and_then(Object::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let mw = md.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
+        let mh = md.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
+        if mw <= 0 || mh <= 0 {
+            return None;
+        }
+        if matches!(
+            self.first_filter(md).as_deref(),
+            Some(b"DCTDecode") | Some(b"JPXDecode")
+        ) {
+            return None;
+        }
+        let samples = decode_stream(stream).ok()?;
+        let (mw, mh) = (mw as usize, mh as usize);
+        let row_bytes = (mw as u64).div_ceil(8);
+        if row_bytes * mh as u64 > samples.len() as u64 {
+            return None;
+        }
+        let decode = read_vec(self, md, b"Decode").unwrap_or_default();
+        let invert = decode.len() >= 2 && decode[0] > decode[1];
+        let mut hidden = Vec::with_capacity(mw * mh);
+        for y in 0..mh {
+            let row_start_bit = y as u64 * row_bytes * 8;
+            for x in 0..mw {
+                let bit = read_bits(&samples, row_start_bit + x as u64, 1) == 1;
+                // Default: bit 1 hides. `/Decode [1 0]`: bit 0 hides.
+                hidden.push(if invert { !bit } else { bit });
+            }
+        }
+        Some((mw, mh, hidden))
+    }
+
+    /// Build a colour-key transparency map from a `/Mask [min0 max0 …]` array: a
+    /// per-pixel `true` where every component's *raw* integer sample lies within
+    /// its `[min, max]` range (PDF §8.9.6.4). `samples` is the decoded sample grid
+    /// (`bpc` bits/component, scanlines byte-padded) in colour space `cs`. `None`
+    /// when `/Mask` is not such an array, its arity is wrong, or the data is too
+    /// short.
+    fn color_key_mask(
+        &self,
+        dict: &Dictionary,
+        samples: &[u8],
+        w: usize,
+        h: usize,
+        cs: &crate::raster::colorspace::ColorSpace,
+        bpc: u32,
+    ) -> Option<Vec<bool>> {
+        let arr = dict.get(b"Mask").map(|o| self.resolve(o))?;
+        let arr = arr.as_array()?;
+        let ranges: Vec<i64> = arr
+            .iter()
+            .filter_map(|o| self.resolve(o).as_i64())
+            .collect();
+        let n = cs.components().max(1);
+        if ranges.len() < 2 * n {
+            return None;
+        }
+        let row_bits = (w * n * bpc as usize) as u64;
+        let row_bytes = row_bits.div_ceil(8);
+        if row_bytes * h as u64 > samples.len() as u64 {
+            return None;
+        }
+        let mut key = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let row_start_bit = y as u64 * row_bytes * 8;
+            for x in 0..w {
+                let mut masked = true;
+                for c in 0..n {
+                    let bit = row_start_bit + ((x * n + c) as u64 * bpc as u64);
+                    let raw = read_bits(samples, bit, bpc) as i64;
+                    if raw < ranges[2 * c] || raw > ranges[2 * c + 1] {
+                        masked = false;
+                        break;
+                    }
+                }
+                key.push(masked);
+            }
+        }
+        Some(key)
     }
 
     /// Serialize the document, Flate-compressing every uncompressed stream.
@@ -24516,5 +24700,170 @@ mod tests {
     fn finish_doc_timestamp_without_prepare_errors() {
         let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("x")).unwrap();
         assert!(doc.finish_doc_timestamp(b"token").is_err());
+    }
+
+    // ── image XObject masks: /ImageMask stencil + /Mask (colour-key & explicit) ──
+
+    /// Render a 100×100 page that draws one image XObject (object 5) over the
+    /// whole page via `cm 100 0 0 100 0 0 /Im0 Do`, prefixed by `pre` (e.g. a
+    /// fill-colour operator). `body` is the body of object 5 (dict + stream),
+    /// `extra` adds further objects (e.g. an explicit /Mask stream). The image
+    /// fills the unit square, so a 2×2 image maps device (25,25)/(75,25)/(25,75)/
+    /// (75,75) to its top-left/top-right/bottom-left/bottom-right texels.
+    fn render_masked_image_canvas(
+        pre: &str,
+        body: Vec<u8>,
+        extra: &[(u32, Vec<u8>)],
+    ) -> crate::raster::Canvas {
+        let content = format!("{pre} 100 0 0 100 0 0 cm /Im0 Do");
+        let mut page_content = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        page_content.extend_from_slice(content.as_bytes());
+        page_content.extend_from_slice(b"\nendstream");
+        let mut objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                  /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
+                    .to_vec(),
+            ),
+            (4, page_content),
+            (5, body),
+        ];
+        objects.extend(extra.iter().cloned());
+        let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        doc.render_page_canvas(1, 1.0, false).unwrap()
+    }
+
+    /// Body of an image XObject: `dict` (without `/Length`) + a binary `data`
+    /// stream. `/Length` is appended so the parser reads the exact bytes.
+    fn image_obj(dict: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+
+    #[test]
+    fn image_mask_stencil_paints_current_fill_colour() {
+        // 2×2 `/ImageMask true` stencil. Default `/Decode [0 1]`: a sample **0**
+        // paints. Row 0 = bits [0,1] (0x40), row 1 = bits [1,1] (0xC0): only the
+        // top-left pixel is painted. The page sets fill blue before `Do`, so the
+        // painted pixel must be blue and the masked pixels stay white paper.
+        let img = image_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ImageMask true /BitsPerComponent 1",
+            &[0x40, 0xC0],
+        );
+        let canvas = render_masked_image_canvas("0 0 1 rg", img, &[]);
+        let blue = px(&canvas, 25, 25);
+        assert!(
+            blue[2] > 200 && blue[0] < 60 && blue[1] < 60,
+            "top-left stencil pixel painted with the fill colour (blue), got {blue:?}"
+        );
+        assert_eq!(
+            px(&canvas, 75, 25),
+            [255, 255, 255],
+            "masked stencil pixel (top-right) stays white"
+        );
+        assert_eq!(
+            px(&canvas, 75, 75),
+            [255, 255, 255],
+            "masked stencil pixel (bottom-right) stays white"
+        );
+    }
+
+    #[test]
+    fn image_mask_stencil_decode_inverts_painted_bits() {
+        // Same bytes as above, but `/Decode [1 0]` flips the convention: now a
+        // sample **1** paints. So the three masked pixels paint and the top-left
+        // (bit 0) is the only transparent one.
+        let img = image_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ImageMask true /BitsPerComponent 1 /Decode [1 0]",
+            &[0x40, 0xC0],
+        );
+        let canvas = render_masked_image_canvas("1 0 0 rg", img, &[]);
+        assert_eq!(
+            px(&canvas, 25, 25),
+            [255, 255, 255],
+            "bit-0 pixel is transparent under /Decode [1 0]"
+        );
+        let red = px(&canvas, 75, 75);
+        assert!(
+            red[0] > 200 && red[1] < 60 && red[2] < 60,
+            "bit-1 pixel painted with the fill colour (red), got {red:?}"
+        );
+    }
+
+    #[test]
+    fn color_key_mask_makes_matching_colour_transparent() {
+        // 2×2 8-bit DeviceRGB: red, green / blue, white. `/Mask [255 255 0 0 0 0]`
+        // keys out pure red (R=255, G=0, B=0) only. The red texel becomes
+        // transparent (white paper shows), the others keep their colour.
+        let data = [
+            255, 0, 0, 0, 255, 0, // top row: red, green
+            0, 0, 255, 255, 255, 255, // bottom row: blue, white
+        ];
+        let img = image_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask [255 255 0 0 0 0]",
+            &data,
+        );
+        let canvas = render_masked_image_canvas("", img, &[]);
+        assert_eq!(
+            px(&canvas, 25, 25),
+            [255, 255, 255],
+            "keyed-out red texel is transparent (white paper)"
+        );
+        let green = px(&canvas, 75, 25);
+        assert!(
+            green[1] > 200 && green[0] < 60 && green[2] < 60,
+            "green texel keeps its colour, got {green:?}"
+        );
+        let blue = px(&canvas, 25, 75);
+        assert!(
+            blue[2] > 200 && blue[0] < 60 && blue[1] < 60,
+            "blue texel keeps its colour, got {blue:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_mask_hides_base_image_pixels() {
+        // Base 2×2 DeviceRGB image, all blue. An explicit `/Mask` (object 6) is a
+        // 2×2 1-bit `/ImageMask`: default `/Decode [0 1]` → a sample **1** hides.
+        // Row 0 = bits [0,1] (0x40) hides the top-right; row 1 = bits [0,0] (0x00)
+        // hides nothing. So top-right shows white paper, the rest stay blue.
+        let base = [
+            0, 0, 255, 0, 0, 255, // top row
+            0, 0, 255, 0, 0, 255, // bottom row
+        ];
+        let img = image_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask 6 0 R",
+            &base,
+        );
+        let mask = image_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ImageMask true /BitsPerComponent 1",
+            &[0x40, 0x00],
+        );
+        let canvas = render_masked_image_canvas("", img, &[(6, mask)]);
+        assert_eq!(
+            px(&canvas, 75, 25),
+            [255, 255, 255],
+            "masked-out top-right base pixel is transparent (white paper)"
+        );
+        let blue = px(&canvas, 25, 25);
+        assert!(
+            blue[2] > 200 && blue[0] < 60 && blue[1] < 60,
+            "unmasked top-left base pixel stays blue, got {blue:?}"
+        );
+        let blue2 = px(&canvas, 75, 75);
+        assert!(
+            blue2[2] > 200 && blue2[0] < 60 && blue2[1] < 60,
+            "unmasked bottom-right base pixel stays blue, got {blue2:?}"
+        );
     }
 }
