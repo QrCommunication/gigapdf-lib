@@ -225,6 +225,19 @@ pub struct BoxShadow {
     pub inset: bool,
 }
 
+/// A CSS `text-shadow` layer: an offset (`dx`, `dy`) copy of the glyphs in
+/// `color` (with `alpha`). `blur` is approximated at paint time (a small spread
+/// of extra offset passes, not a true Gaussian). `text-shadow` inherits, so this
+/// rides on the inherited `Style` fields.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextShadow {
+    pub dx: f64,
+    pub dy: f64,
+    pub blur: f64,
+    pub color: [f64; 3],
+    pub alpha: f64,
+}
+
 /// A CSS `linear-gradient(...)` background. Stops carry an RGB colour and an
 /// optional position (`0.0..=1.0`); a `None` position is spread evenly between
 /// its positioned neighbours at paint time (CSS default-stop placement). The
@@ -512,6 +525,8 @@ pub struct Style {
     /// painted *behind* `box_shadow`. Empty for a single (or absent) shadow,
     /// keeping the one-layer path unchanged. Not inherited.
     pub box_shadow_extra: Vec<BoxShadow>,
+    /// `text-shadow` layers (first = topmost). Inherited like `color`.
+    pub text_shadows: Vec<TextShadow>,
 }
 
 /// CSS `float` side.
@@ -703,6 +718,7 @@ impl Default for Style {
             border_radius_v: [0.0; 4],
             box_shadow: None,
             box_shadow_extra: Vec::new(),
+            text_shadows: Vec::new(),
         }
     }
 }
@@ -1665,6 +1681,8 @@ fn inherit(parent: &Style) -> Style {
         border_radius_v: [0.0; 4],
         box_shadow: None,
         box_shadow_extra: Vec::new(),
+        // `text-shadow` IS inherited (unlike box decorations above).
+        text_shadows: parent.text_shadows.clone(),
     }
 }
 
@@ -2937,6 +2955,7 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             };
             style.box_shadow_extra = layers;
         }
+        "text-shadow" => style.text_shadows = parse_text_shadows(v, style.font_size, style.color),
         "width" => style.width = parse_len(v, style.font_size),
         _ => {}
     }
@@ -3147,6 +3166,51 @@ fn parse_box_shadow_layer(layer: &str, em: f64) -> Option<BoxShadow> {
         spread,
         color: color.unwrap_or([0.0, 0.0, 0.0]),
         inset,
+    })
+}
+
+/// Parse `text-shadow: <dx> <dy> [blur] [color]` layers (comma-separated, first =
+/// topmost). The colour may come first or last; a missing colour falls back to
+/// `current` (the element's own text colour). `none`/empty ⇒ no shadows.
+fn parse_text_shadows(v: &str, em: f64, current: [f64; 3]) -> Vec<TextShadow> {
+    let v = resolve_var(v);
+    if v.trim().eq_ignore_ascii_case("none") || v.trim().is_empty() {
+        return Vec::new();
+    }
+    split_top_level_commas(&v)
+        .iter()
+        .filter_map(|layer| parse_text_shadow_layer(layer, em, current))
+        .collect()
+}
+
+/// One `text-shadow` layer: needs the two offset lengths; an optional third is
+/// the blur radius. Colour (with alpha) may sit before or after the lengths.
+fn parse_text_shadow_layer(layer: &str, em: f64, current: [f64; 3]) -> Option<TextShadow> {
+    let layer = layer.trim();
+    if layer.is_empty() || layer.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut color: Option<[f64; 3]> = None;
+    let mut alpha = 1.0;
+    let mut lengths: Vec<f64> = Vec::new();
+    // Collapse spaces inside parens so `rgba(0, 0, 0, .5)` survives tokenising.
+    for tok in collapse_paren_spaces(layer).split_whitespace() {
+        if let Some(px) = parse_len_px(tok, em) {
+            lengths.push(px);
+        } else if let Some((c, a)) = parse_color_alpha(tok) {
+            color = Some(c);
+            alpha = a;
+        }
+    }
+    if lengths.len() < 2 {
+        return None;
+    }
+    Some(TextShadow {
+        dx: lengths[0],
+        dy: lengths[1],
+        blur: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+        color: color.unwrap_or(current),
+        alpha,
     })
 }
 

@@ -719,6 +719,25 @@ fn paint(
                             // standard font so text still renders — picked from the
                             // run's serif/mono + bold/italic, mapped to WinAnsi.
                             let base14 = base14_for(style);
+                            for sh in style.text_shadows.iter().rev() {
+                                let a = (style.opacity * sh.alpha).clamp(0.0, 1.0);
+                                for (ox, oy, sc) in text_shadow_passes(sh.blur) {
+                                    if sc <= 0.0 {
+                                        continue;
+                                    }
+                                    let _ = doc.add_text_standard(
+                                        page,
+                                        *x + sh.dx + ox,
+                                        baseline - sh.dy + oy,
+                                        style.font_size,
+                                        trimmed,
+                                        base14,
+                                        sh.color,
+                                        a * sc,
+                                        0.0,
+                                    );
+                                }
+                            }
                             let _ = doc.add_text_standard(
                                 page,
                                 *x,
@@ -735,6 +754,28 @@ fn paint(
                             continue;
                         }
                     };
+
+                    // text-shadow: offset silhouettes painted UNDER the run (in
+                    // reverse so the first listed shadow ends up on top).
+                    for sh in style.text_shadows.iter().rev() {
+                        let a = (style.opacity * sh.alpha).clamp(0.0, 1.0);
+                        for (ox, oy, sc) in text_shadow_passes(sh.blur) {
+                            if sc <= 0.0 {
+                                continue;
+                            }
+                            let _ = doc.add_text(
+                                page,
+                                *x + sh.dx + ox,
+                                baseline - sh.dy + oy,
+                                style.font_size,
+                                trimmed,
+                                id,
+                                sh.color,
+                                a * sc,
+                                0.0,
+                            );
+                        }
+                    }
 
                     // Colour-emoji fast path: when the resolved face has COLR/CPAL
                     // tables and this run holds a colour glyph, draw those glyphs as
@@ -1247,6 +1288,30 @@ fn paint_inset_box_shadow(
     band(x, ht, hl - x, hb - ht); // left
     band(hr, ht, x + w - hr, hb - ht); // right
     let _ = doc.restore_graphics(page);
+}
+
+/// Offset/opacity passes for one `text-shadow`, relative to its `(dx, dy)`. With
+/// `blur == 0` it's a single hard silhouette; with `blur > 0` a centre pass plus
+/// four offset passes at low alpha approximate a soft cloud (a cheap blur — not a
+/// true Gaussian — matching the `box-shadow` blur approximation policy).
+fn text_shadow_passes(blur: f64) -> [(f64, f64, f64); 5] {
+    if blur <= 0.0 {
+        return [
+            (0.0, 0.0, 1.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+        ];
+    }
+    let r = blur * 0.5;
+    [
+        (0.0, 0.0, 0.42),
+        (r, 0.0, 0.145),
+        (-r, 0.0, 0.145),
+        (0.0, r, 0.145),
+        (0.0, -r, 0.145),
+    ]
 }
 
 /// Paint one `dashed`/`dotted`/`double` border side as filled rectangles, the
@@ -2252,6 +2317,27 @@ mod tests {
             !none.contains("1 0 0 rg"),
             "no shadow ⇒ no shadow colour\n{none}"
         );
+    }
+
+    #[test]
+    fn text_shadow_paints_an_offset_coloured_copy() {
+        // The shadow re-draws the glyphs in the shadow colour, under the run.
+        let content =
+            page1_content(r#"<p style="color:#000000;text-shadow:2pt 2pt #ff0000">Hi</p>"#);
+        assert!(
+            content.contains("1 0 0 rg"),
+            "text-shadow paints its colour\n{content}"
+        );
+        // It inherits, so a shadow on a parent reaches the child's text.
+        let inherited =
+            page1_content(r#"<div style="text-shadow:1pt 1pt #ff0000"><p>Hi</p></div>"#);
+        assert!(
+            inherited.contains("1 0 0 rg"),
+            "text-shadow inherits to descendants\n{inherited}"
+        );
+        // No shadow ⇒ no red.
+        let none = page1_content(r#"<p style="color:#000000">Hi</p>"#);
+        assert!(!none.contains("1 0 0 rg"), "no shadow ⇒ no red\n{none}");
     }
 
     #[test]

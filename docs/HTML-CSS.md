@@ -293,6 +293,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | Property | Values | Notes |
 |----------|--------|-------|
 | `box-shadow` | `[inset] <dx> <dy> [blur] [spread] <colour>`, comma-separated for **multiple** layers | offset, colour and spread are exact; **blur is an approximation** (a 6-ring soft edge, not a Gaussian); **`inset`** paints a clipped shadow frame inside the box (recessed look), blur likewise approximated |
+| `text-shadow` | `<dx> <dy> [blur] <colour>`, comma-separated for **multiple** layers; colour first or last; `rgba()` alpha honoured | **inherited** (like `color`); each layer re-draws the glyphs offset in the shadow colour under the text (first layer on top); offset and colour are exact, **blur is approximated** (a small spread of low-alpha passes, not a Gaussian) |
 
 ---
 
@@ -429,10 +430,12 @@ subset.
 
 - **Layout/sizing**: a true scroll model for `position: sticky`.
   `grid-template-areas` / named grid lines (use numeric placement).
-- **Visual effects**: `transform`, `filter`, `text-shadow`, true Gaussian blur,
+- **Visual effects**: `transform`, `filter`, true Gaussian blur,
   `background-image: url()` raster (use `<img>`), CSS tiling patterns. (Gradients,
-  rounded corners, and offset/spread/**inset** shadows **are** supported — see
-  [backgrounds](#backgrounds) and [shadows](#shadows).)
+  rounded corners, offset/spread/**inset** box-shadows, and **`text-shadow`**
+  **are** supported — `text-shadow` re-draws the glyphs offset in the shadow
+  colour, with blur approximated; see [backgrounds](#backgrounds) and
+  [shadows](#shadows).)
 - **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
   full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
 - **Selectors**: pseudo-elements (`::before`/`::after`, not generated) and
