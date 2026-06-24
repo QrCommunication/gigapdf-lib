@@ -354,9 +354,13 @@ Two selector engines, for two jobs:
   inline `style` always wins.
 
 > Limitations: the attribute *operators* `~= ^= $= *= |=` are treated as bare
-> presence (not enforced). **Pseudo-classes / pseudo-elements** (`:hover`,
-> `:first-child`, `::before`, …) are **not** supported — the `:` part is skipped,
-> so `li:first-child` matches every `li`. `@media` queries **are** evaluated: the
+> presence (not enforced). **Structural pseudo-classes** — `:first-child`,
+> `:last-child`, `:only-child`, `:nth-child(an+b | odd | even)` — **are** matched
+> by sibling position (and add specificity like a class). **Dynamic** pseudo-classes
+> (`:hover`, `:focus`, …) still apply unconditionally (no interaction in a static
+> render), and **pseudo-elements** (`::before`/`::after`) are **not** generated —
+> such a rule matches nothing rather than leaking onto the real element.
+> `@media` queries **are** evaluated: the
 > media type (`print`/`screen`/`all`, with `only`/`not`) and the width features
 > (`min-width`/`max-width`/`width`) match against the page width; features we
 > don't model keep their rules rather than dropping them.
@@ -431,8 +435,10 @@ subset.
   [backgrounds](#backgrounds) and [shadows](#shadows).)
 - **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
   full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
-- **Selectors**: pseudo-classes / pseudo-elements (`:hover`, `:first-child`,
-  `::before`), attribute *operators* (`~= ^= $= *= |=`) in stylesheets.
+- **Selectors**: pseudo-elements (`::before`/`::after`, not generated) and
+  attribute *operators* (`~= ^= $= *= |=`, treated as presence) in stylesheets.
+  (Structural pseudo-classes `:first-child`/`:last-child`/`:only-child`/
+  `:nth-child()` **are** supported — see [selectors](#selectors).)
 - **At-rules / values**: `@page`, `@import` (`@media` queries **are** evaluated —
   media type + width features).
   (`var()` custom properties and `calc()` **are** supported in length contexts.)

@@ -754,6 +754,28 @@ struct Compound {
     id: Option<String>,
     /// `[attr]` / `[attr=val]` conditions (all must hold).
     attrs: Vec<AttrCond>,
+    /// Structural pseudo-classes (`:first-child`, `:nth-child(…)`, …) — all must
+    /// hold. Dynamic / unrecognised pseudo-classes (`:hover`, …) are not stored,
+    /// so they keep over-matching (the rule still applies) as before.
+    pseudo: Vec<PseudoClass>,
+    /// `true` if the compound carries a pseudo-**element** (`::before`/`::after`).
+    /// We don't generate pseudo-elements, so such a compound never matches a real
+    /// element (rather than wrongly styling the element itself).
+    pseudo_element: bool,
+}
+
+/// A structural pseudo-class we can evaluate against the DOM tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // names mirror the CSS `:*-child` pseudo-classes
+enum PseudoClass {
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    /// `nth-child(an + b)`, 1-based among element siblings.
+    NthChild {
+        a: i32,
+        b: i32,
+    },
 }
 
 /// How a compound relates to the one before it in the selector chain.
@@ -854,10 +876,128 @@ fn parse_compound(s: &str) -> Compound {
                     });
                 }
             }
+            b':' => {
+                i += 1;
+                // `::name` is a pseudo-element — flag it and skip the name.
+                if i < bytes.len() && bytes[i] == b':' {
+                    i += 1;
+                    c.pseudo_element = true;
+                }
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-') {
+                    i += 1;
+                }
+                let name = s[start..i].to_ascii_lowercase();
+                // Optional functional `(arg)`, e.g. `nth-child(2n + 1)`.
+                let mut arg = "";
+                if i < bytes.len() && bytes[i] == b'(' {
+                    i += 1;
+                    let astart = i;
+                    while i < bytes.len() && bytes[i] != b')' {
+                        i += 1;
+                    }
+                    arg = &s[astart..i];
+                    if i < bytes.len() {
+                        i += 1; // consume ')'
+                    }
+                }
+                // Pseudo-elements never match a real element. Structural
+                // pseudo-classes are recorded; dynamic / unknown ones (`:hover`)
+                // are ignored, so the rule keeps over-matching as before.
+                if !c.pseudo_element {
+                    if let Some(p) = parse_pseudo_class(&name, arg) {
+                        c.pseudo.push(p);
+                    }
+                }
+            }
             _ => i += 1,
         }
     }
     c
+}
+
+/// Map a structural pseudo-class name (+ functional argument) to a [`PseudoClass`].
+/// Returns `None` for dynamic or unrecognised pseudo-classes (`:hover`, `:focus`,
+/// `:not(…)`, …) so callers leave them as over-matches.
+fn parse_pseudo_class(name: &str, arg: &str) -> Option<PseudoClass> {
+    match name {
+        "first-child" => Some(PseudoClass::FirstChild),
+        "last-child" => Some(PseudoClass::LastChild),
+        "only-child" => Some(PseudoClass::OnlyChild),
+        "nth-child" => parse_nth(arg).map(|(a, b)| PseudoClass::NthChild { a, b }),
+        _ => None,
+    }
+}
+
+/// Parse an `nth-child` argument into `(a, b)` for the `an + b` form. Accepts
+/// `odd`, `even`, a bare integer (`3` → `0n + 3`), and the general `2n`, `n`,
+/// `-n + 3`, `2n + 1` shapes. Returns `None` if it can't be parsed.
+fn parse_nth(arg: &str) -> Option<(i32, i32)> {
+    let s = arg.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    if let Some(npos) = s.find('n') {
+        let a = match s[..npos].trim() {
+            "" | "+" => 1,
+            "-" => -1,
+            x => x.parse::<i32>().ok()?,
+        };
+        let b_str: String = s[npos + 1..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let b = if b_str.is_empty() {
+            0
+        } else {
+            b_str.parse::<i32>().ok()?
+        };
+        Some((a, b))
+    } else {
+        s.parse::<i32>().ok().map(|b| (0, b))
+    }
+}
+
+/// Does `el` satisfy a compound's pseudo constraints? A pseudo-element compound
+/// never matches a real element; structural pseudo-classes are evaluated against
+/// `el`'s position among its parent's element children. With no parent (the root)
+/// the structural tests pass, so a rule is never dropped on a top-level element.
+fn pseudo_ok(compound: &Compound, el: &Element, parent: Option<&Element>) -> bool {
+    if compound.pseudo_element {
+        return false;
+    }
+    if compound.pseudo.is_empty() {
+        return true;
+    }
+    let Some(parent) = parent else { return true };
+    let siblings: Vec<&Element> = parent
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            Node::Element(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    let count = siblings.len();
+    let Some(pos) = siblings.iter().position(|e| std::ptr::eq(*e, el)) else {
+        return true; // `el` not found under `parent` — don't drop the rule
+    };
+    let idx = (pos + 1) as i32; // 1-based
+    compound.pseudo.iter().all(|p| match p {
+        PseudoClass::FirstChild => idx == 1,
+        PseudoClass::LastChild => idx as usize == count,
+        PseudoClass::OnlyChild => count == 1,
+        PseudoClass::NthChild { a, b } => {
+            if *a == 0 {
+                idx == *b
+            } else {
+                let diff = idx - *b;
+                diff % *a == 0 && diff / *a >= 0
+            }
+        }
+    })
 }
 
 fn parse_selector(s: &str) -> Option<Selector> {
@@ -881,14 +1021,18 @@ fn parse_selector(s: &str) -> Option<Selector> {
     if src.is_empty() {
         return None;
     }
-    // Specificity: ids*100 + (classes + attrs)*10 + tags. Combinators add none.
+    // Specificity: ids*100 + (classes + attrs + pseudo-classes)*10 + (tags +
+    // pseudo-elements). Combinators add none.
     let mut spec = 0u32;
     for (_, p) in &src {
         if p.id.is_some() {
             spec += 100;
         }
-        spec += 10 * (p.classes.len() + p.attrs.len()) as u32;
+        spec += 10 * (p.classes.len() + p.attrs.len() + p.pseudo.len()) as u32;
         if p.tag.is_some() {
+            spec += 1;
+        }
+        if p.pseudo_element {
             spec += 1;
         }
     }
@@ -1237,11 +1381,11 @@ fn preceding_siblings<'a>(el: &Element, parent: &'a Element) -> Vec<&'a Element>
 /// later part's combinator describes how it relates to the part before it.
 fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -> bool {
     let parts = &selector.parts;
-    // parts[0] always matches the element itself.
-    if !matches(&parts[0].1, el) {
+    let parent = ancestors.last().copied();
+    // parts[0] always matches the element itself (incl. its pseudo-classes).
+    if !matches(&parts[0].1, el) || !pseudo_ok(&parts[0].1, el, parent) {
         return false;
     }
-    let parent = ancestors.last().copied();
     // `cur` tracks the element currently anchored; `ai` the next ancestor index
     // available for descendant/child hops (ancestors are root-first).
     let mut cur: &Element = el;
@@ -1256,7 +1400,12 @@ fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -
                 }
                 ai -= 1;
                 let p = ancestors[ai];
-                if !matches(compound, p) {
+                let p_parent = if ai > 0 {
+                    Some(ancestors[ai - 1])
+                } else {
+                    None
+                };
+                if !matches(compound, p) || !pseudo_ok(compound, p, p_parent) {
                     return false;
                 }
                 cur = p;
@@ -1265,7 +1414,14 @@ fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -
                 let mut found = false;
                 while ai > 0 {
                     ai -= 1;
-                    if matches(compound, ancestors[ai]) {
+                    let p_parent = if ai > 0 {
+                        Some(ancestors[ai - 1])
+                    } else {
+                        None
+                    };
+                    if matches(compound, ancestors[ai])
+                        && pseudo_ok(compound, ancestors[ai], p_parent)
+                    {
                         found = true;
                         break;
                     }
@@ -1282,7 +1438,7 @@ fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -
                 };
                 let prev = preceding_siblings(cur, par);
                 match prev.last() {
-                    Some(p) if matches(compound, p) => cur = p,
+                    Some(p) if matches(compound, p) && pseudo_ok(compound, p, Some(par)) => cur = p,
                     _ => return false,
                 }
             }
@@ -1291,7 +1447,11 @@ fn selector_matches(selector: &Selector, el: &Element, ancestors: &[&Element]) -
                     return false;
                 };
                 let prev = preceding_siblings(cur, par);
-                match prev.iter().rev().find(|p| matches(compound, p)) {
+                match prev
+                    .iter()
+                    .rev()
+                    .find(|p| matches(compound, p) && pseudo_ok(compound, p, Some(par)))
+                {
                     Some(p) => cur = p,
                     None => return false,
                 }
@@ -4278,6 +4438,101 @@ mod tests {
         let mut out = None;
         walk(&nodes, &sheet, &Style::default(), &mut Vec::new(), tag, &mut out);
         out.expect("target element not found")
+    }
+
+    /// Computed `color` of every `tag` element, in document order.
+    fn colors_of(html: &str, tag: &str) -> Vec<[f64; 3]> {
+        let nodes = parse(html);
+        let sheet = Stylesheet::new(&collect_style_css(&nodes));
+        fn walk<'a>(
+            nodes: &'a [Node],
+            sheet: &Stylesheet,
+            parent: &Style,
+            chain: &mut Vec<&'a Element>,
+            target: &str,
+            out: &mut Vec<[f64; 3]>,
+        ) {
+            for n in nodes {
+                if let Node::Element(e) = n {
+                    let st = sheet.computed(e, parent, chain);
+                    if e.tag == target {
+                        out.push(st.color);
+                    }
+                    chain.push(e);
+                    walk(&e.children, sheet, &st, chain, target, out);
+                    chain.pop();
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(
+            &nodes,
+            &sheet,
+            &Style::default(),
+            &mut Vec::new(),
+            tag,
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn structural_pseudo_classes_select_by_sibling_position() {
+        // first-child / nth-child / last-child each pick ONE li, not every li.
+        let html = "<style>li{color:#000000} \
+                    li:first-child{color:#ff0000} \
+                    li:nth-child(2){color:#00ff00} \
+                    li:last-child{color:#0000ff}</style>\
+                    <ul><li>a</li><li>b</li><li>c</li></ul>";
+        let cols = colors_of(html, "li");
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0], [1.0, 0.0, 0.0], "1st li is :first-child → red");
+        assert_eq!(cols[1], [0.0, 1.0, 0.0], "2nd li is :nth-child(2) → green");
+        assert_eq!(cols[2], [0.0, 0.0, 1.0], "3rd li is :last-child → blue");
+    }
+
+    #[test]
+    fn nth_child_formula_and_only_child() {
+        // nth-child(odd) hits positions 1 and 3; :only-child needs a lone child.
+        let odd = "<style>li{color:#000000} li:nth-child(odd){color:#ff0000}</style>\
+                   <ul><li>a</li><li>b</li><li>c</li></ul>";
+        let cols = colors_of(odd, "li");
+        assert_eq!(cols[0], [1.0, 0.0, 0.0], "pos 1 is odd");
+        assert_eq!(cols[1], [0.0, 0.0, 0.0], "pos 2 is even → unstyled");
+        assert_eq!(cols[2], [1.0, 0.0, 0.0], "pos 3 is odd");
+        let only = "<style>li{color:#000000} li:only-child{color:#ff0000}</style>\
+                    <ul><li>solo</li></ul>";
+        assert_eq!(
+            colors_of(only, "li")[0],
+            [1.0, 0.0, 0.0],
+            "lone li is :only-child"
+        );
+        let not_only = "<style>li{color:#000000} li:only-child{color:#ff0000}</style>\
+                        <ul><li>a</li><li>b</li></ul>";
+        assert_eq!(
+            colors_of(not_only, "li")[0],
+            [0.0, 0.0, 0.0],
+            "two li → not :only-child"
+        );
+    }
+
+    #[test]
+    fn pseudo_element_selector_does_not_style_the_real_element() {
+        // We don't generate ::before/::after boxes, so such a rule must NOT leak
+        // onto the element itself (it used to, via the skipped `:`).
+        let html = "<style>p{color:#000000} p::before{color:#ff0000}</style><p>x</p>";
+        assert_eq!(
+            colors_of(html, "p")[0],
+            [0.0, 0.0, 0.0],
+            "::before leaves <p> unstyled"
+        );
+        // A dynamic pseudo-class we don't model still applies (over-match kept).
+        let hover = "<style>a{color:#000000} a:hover{color:#ff0000}</style><a>x</a>";
+        assert_eq!(
+            colors_of(hover, "a")[0],
+            [1.0, 0.0, 0.0],
+            ":hover kept as over-match"
+        );
     }
 
     const RED: [f64; 3] = [1.0, 0.0, 0.0];
