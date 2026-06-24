@@ -135,15 +135,16 @@ Inline **`<svg>`** is supported too and drawn as native vector paths — never
 rasterized. Supported: the shapes `rect` (incl. `rx`/`ry` rounded corners),
 `circle`, `ellipse`, `line`, `polyline`, `polygon`; `<path>` (the full `d`
 grammar — `M/L/H/V/C/S/Q/T/A/Z`, with **`A` arcs converted exactly** to Béziers);
-`<g>` grouping; `transform` (`translate`/`scale`/`rotate`/`matrix`/`skewX`/`skewY`);
+`<g>` grouping; `<text>` (traced to filled glyph outlines from the bundled font);
+`<use href="#id">` (renders the referenced subtree, offset by `x`/`y`, with a
+recursion guard); `transform` (`translate`/`scale`/`rotate`/`matrix`/`skewX`/`skewY`);
 `viewBox`; `fill`, `stroke`, `stroke-width`, `opacity`, `fill-opacity`,
 `stroke-opacity` (`none` honoured); and **gradients** —
 `<linearGradient>` / `<radialGradient>` (with `<stop>` colours, `gradientUnits`
 `objectBoundingBox`/`userSpaceOnUse`, `gradientTransform`, and `href`
 inheritance) rendered as native PDF axial/radial shadings. Size the box with the
 `<svg>` `width`/`height` (or its viewBox). Not drawn: tiling `<pattern>`
-(falls back to a solid fill), `filter`, `<text>`, `<use>`, and COLRv1 gradient
-glyphs.
+(falls back to a solid fill), `filter`, and COLRv1 gradient glyphs.
 
 > Note: `<img>` (the element) is the way to place a raster picture. The CSS
 > `background-image: url(...)` property is **not** rasterized — see

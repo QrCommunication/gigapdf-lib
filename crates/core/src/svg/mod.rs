@@ -205,13 +205,17 @@ pub fn from_element(svg: &Element) -> Option<SvgImage> {
 
     let mut grads = Grads::new();
     collect_gradients(&svg.children, &mut grads);
+    let mut ids: std::collections::HashMap<&str, &Node> = std::collections::HashMap::new();
+    collect_ids(&svg.children, &mut ids);
     let mut prims = Vec::new();
     walk(
         &svg.children,
         Mat::identity(),
         Paint::root(),
+        &ids,
         &grads,
         &mut prims,
+        0,
     );
     if prims.is_empty() {
         return None;
@@ -238,7 +242,16 @@ fn find_svg(nodes: &[Node]) -> Option<&Element> {
     None
 }
 
-fn walk(nodes: &[Node], ctm: Mat, paint: Paint, grads: &Grads, out: &mut Vec<Prim>) {
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    nodes: &[Node],
+    ctm: Mat,
+    paint: Paint,
+    ids: &std::collections::HashMap<&str, &Node>,
+    grads: &Grads,
+    out: &mut Vec<Prim>,
+    depth: u8,
+) {
     for n in nodes {
         let Node::Element(e) = n else { continue };
         let ctm = match e.attr("transform") {
@@ -249,7 +262,7 @@ fn walk(nodes: &[Node], ctm: Mat, paint: Paint, grads: &Grads, out: &mut Vec<Pri
         let furl = fill_url(e);
         let furl = furl.as_deref();
         match e.tag.as_str() {
-            "g" | "a" | "svg" => walk(&e.children, ctm, paint, grads, out),
+            "g" | "a" | "svg" => walk(&e.children, ctm, paint, ids, grads, out, depth),
             "rect" => push(out, rect_segs(e), ctm, paint, furl, grads),
             "circle" => {
                 let r = attr_f(e, "r");
@@ -287,6 +300,30 @@ fn walk(nodes: &[Node], ctm: Mat, paint: Paint, grads: &Grads, out: &mut Vec<Pri
                 grads,
             ),
             "text" => walk_text(e, ctm, paint, out),
+            "use" => {
+                // `<use href="#id" x y>` renders the referenced subtree, offset by
+                // (x, y); the target then applies its own transform/paint. The
+                // depth guard breaks cyclic references.
+                let href = e
+                    .attr("href")
+                    .or_else(|| e.attr("xlink:href"))
+                    .unwrap_or("");
+                let id = href.trim().strip_prefix('#').unwrap_or("");
+                if depth < 8 {
+                    if let Some(target) = ids.get(id) {
+                        let ctm_u = ctm.then(&Mat::translate(attr_f(e, "x"), attr_f(e, "y")));
+                        walk(
+                            std::slice::from_ref(*target),
+                            ctm_u,
+                            paint,
+                            ids,
+                            grads,
+                            out,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
             _ => {} // <defs>/<title>/<style>/… ignored
         }
     }
@@ -833,6 +870,19 @@ fn collect_gradients(nodes: &[Node], out: &mut Grads) {
     }
 }
 
+/// Map every element with an `id` to its `Node`, so `<use href="#id">` can render
+/// the referenced subtree (re-entering [`walk`], which applies the target's own
+/// transform/paint). First definition wins (ids are unique).
+fn collect_ids<'a>(nodes: &'a [Node], out: &mut std::collections::HashMap<&'a str, &'a Node>) {
+    for n in nodes {
+        let Node::Element(e) = n else { continue };
+        if let Some(id) = e.attr("id") {
+            out.entry(id).or_insert(n);
+        }
+        collect_ids(&e.children, out);
+    }
+}
+
 fn parse_raw_grad(e: &Element) -> RawGrad {
     let coord = |name: &str| e.attr(name).and_then(parse_grad_coord);
     RawGrad {
@@ -1212,6 +1262,35 @@ mod tests {
             circ.fill.is_none() && circ.stroke.is_some(),
             "circle stroked, not filled"
         );
+    }
+
+    #[test]
+    fn use_element_renders_a_referenced_shape() {
+        // A rect parked in <defs> is invisible until `<use>`d.
+        let with_use = r##"<svg viewBox="0 0 100 100">
+            <defs><rect id="r" width="10" height="10" fill="#ff0000"/></defs>
+            <use href="#r" x="5" y="5"/>
+        </svg>"##;
+        let img = parse_svg(with_use).expect("use renders the referenced rect");
+        assert_eq!(img.prims.len(), 1, "the <use> brings in the defs'd rect");
+        match img.prims[0].fill {
+            Some(Fill::Solid(c)) => assert_eq!(c, [1.0, 0.0, 0.0]),
+            _ => panic!("referenced rect keeps its red fill"),
+        }
+        // Without the <use>, a defs-only rect draws nothing.
+        let defs_only = r##"<svg viewBox="0 0 100 100"><defs><rect id="r" width="10" height="10"/></defs></svg>"##;
+        assert!(
+            parse_svg(defs_only).is_none(),
+            "a defs-only rect renders nothing"
+        );
+    }
+
+    #[test]
+    fn svg_text_traces_glyph_outlines() {
+        // `<text>` is rendered as filled vector glyph subpaths.
+        let svg = r##"<svg viewBox="0 0 100 100"><text x="10" y="30" font-size="20" fill="#000000">Hi</text></svg>"##;
+        let img = parse_svg(svg).expect("text renders");
+        assert!(!img.prims.is_empty(), "SVG <text> traces glyph outlines");
     }
 
     #[test]
