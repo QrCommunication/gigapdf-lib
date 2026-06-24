@@ -44,6 +44,12 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.85.4] - 2026-06-24
+
+HTML/CSS renderer: `flex-direction: row-reverse` / `column-reverse` now run the
+main axis from the far end (were collapsed to the forward axis) in the HTML→PDF
+path ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) item A). No API change.
+
 ## [0.85.3] - 2026-06-24
 
 HTML/CSS renderer: `justify-content: space-evenly` now uses `n + 1` equal gaps

@@ -2337,6 +2337,12 @@ impl Flow<'_> {
         }
         // `order` reorders items for layout (stable; ties keep document order).
         items.sort_by_key(|e| self.style_of(e, style, &na).order);
+        // `row-reverse` / `column-reverse` run the main axis from the far end:
+        // reversing the placement order achieves that for every downstream axis
+        // / wrap / justify-content path.
+        if style.flex_reverse {
+            items.reverse();
+        }
 
         let content_x = x + m.left + b.left + p.left;
         let content_w = (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
@@ -5340,6 +5346,27 @@ mod tests {
         assert!(
             (left_gap - mid_gap).abs() < 5.0,
             "equal gaps: leading {left_gap} vs inter-item {mid_gap}"
+        );
+    }
+
+    #[test]
+    fn flex_direction_row_reverse_swaps_item_order() {
+        // row-reverse runs the main axis right-to-left, so the first DOM item (A)
+        // is placed at the far (right) end — to the RIGHT of the second item (B).
+        let layout = run(
+            r#"<div style="display:flex;flex-direction:row-reverse"><div style="flex:0 0 100pt">A</div><div style="flex:0 0 100pt">B</div></div>"#,
+        );
+        assert!(
+            cell_x(&layout, "A") > cell_x(&layout, "B"),
+            "row-reverse puts A right of B"
+        );
+        // A forward row keeps A left of B (guards against reversing everything).
+        let fwd = run(
+            r#"<div style="display:flex"><div style="flex:0 0 100pt">A</div><div style="flex:0 0 100pt">B</div></div>"#,
+        );
+        assert!(
+            cell_x(&fwd, "A") < cell_x(&fwd, "B"),
+            "forward row keeps A left of B"
         );
     }
 

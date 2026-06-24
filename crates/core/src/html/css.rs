@@ -363,6 +363,9 @@ pub struct Style {
     pub page_break_inside_avoid: bool,
     /// `flex-direction: column` (else row).
     pub flex_column: bool,
+    /// `flex-direction: row-reverse` / `column-reverse` — items run from the
+    /// far end of the main axis toward the start.
+    pub flex_reverse: bool,
     /// `justify-content` along the main axis.
     pub justify: Justify,
     /// `flex` / `flex-grow` factor (a flex item's share of free space).
@@ -626,6 +629,7 @@ impl Default for Style {
             page_break_after: false,
             page_break_inside_avoid: false,
             flex_column: false,
+            flex_reverse: false,
             justify: Justify::Start,
             flex_grow: 0.0,
             flex_shrink: 1.0,
@@ -1375,6 +1379,7 @@ fn inherit(parent: &Style) -> Style {
         page_break_after: false,
         page_break_inside_avoid: false,
         flex_column: false,
+        flex_reverse: false,
         justify: Justify::Start,
         flex_grow: 0.0,
         flex_shrink: 1.0,
@@ -2205,8 +2210,8 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             }
         }
         "flex-direction" => {
-            // Only the axis matters for our basic flex: row (default) vs column.
             style.flex_column = v.starts_with("column");
+            style.flex_reverse = v.ends_with("-reverse");
         }
         "justify-content" => {
             style.justify = match v {
@@ -2334,8 +2339,16 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             // `flex-flow: <direction> || <wrap>` shorthand.
             for tok in v.split_whitespace() {
                 match tok {
-                    "column" | "column-reverse" => style.flex_column = true,
-                    "row" | "row-reverse" => style.flex_column = false,
+                    "column" => style.flex_column = true,
+                    "column-reverse" => {
+                        style.flex_column = true;
+                        style.flex_reverse = true;
+                    }
+                    "row" => style.flex_column = false,
+                    "row-reverse" => {
+                        style.flex_column = false;
+                        style.flex_reverse = true;
+                    }
                     "wrap" | "wrap-reverse" => style.flex_wrap = true,
                     "nowrap" => style.flex_wrap = false,
                     _ => {}

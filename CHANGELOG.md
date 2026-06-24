@@ -7,6 +7,17 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.85.4] - 2026-06-24
+
+HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).
+
+### Added
+
+- **`flex-direction: row-reverse` / `column-reverse`** now run the main axis from
+  the far end (the items are reversed after the `order` sort) instead of
+  collapsing to the forward axis. New `Style::flex_reverse`, parsed from both the
+  `flex-direction` longhand and the `flex-flow` shorthand.
+
 ## [0.85.3] - 2026-06-24
 
 HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).
