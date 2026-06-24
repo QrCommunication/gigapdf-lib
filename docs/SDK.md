@@ -271,7 +271,12 @@ Three ways to draw real, selectable text — **no host font files required**:
 | `addTextNote(page, rect, rgb, meta?, icon?, open?)` | `boolean` | Sticky note at `rect = [x0,y0,x1,y1]`; `meta = { contents, author, id, date }`, `icon` (e.g. `"Note"`, `"Comment"`), `open` initial popup state. |
 | `addInk(page, points, rgb?, lineWidth?)` | `boolean` | Freehand ink path from a flat point list. |
 | `addStamp(page, x0, y0, x1, y1, label, rgb?)` | `boolean` | Rubber-stamp annotation. |
+| `addCircleAnnotation(page, x0, y0, x1, y1, stroke?, fill?, lineWidth?)` | `boolean` | Ellipse (`/Circle`) inscribed in the rectangle; `stroke`/`fill` are `0xRRGGBB` or `null`. |
+| `addPolygonAnnotation(page, points, stroke?, fill?, lineWidth?)` | `boolean` | Closed `/Polygon` through a flat `[x0,y0,x1,y1,…]` vertex list. |
+| `addPolylineAnnotation(page, points, rgb?, lineWidth?)` | `boolean` | Open `/PolyLine` through a flat vertex list. |
+| `addCaretAnnotation(page, x0, y0, x1, y1, rgb?)` | `boolean` | `/Caret` insertion mark (a small upward wedge). |
 | `addMarkupAnnotation(…)` | `boolean` | Generic markup with shared reviewer metadata. |
+| `regenerateAppearance(page, index)` | `boolean` | Rebuild the 0-based annotation's `/AP` appearance from its geometry after editing its colour/border/geometry. `false` for subtypes that can't be reconstructed (FreeText/Stamp/Text/Link). |
 | `removeAnnotation(page, index)` | `boolean` | Delete an annotation. |
 | `flattenAnnotations(page)` | `number` | Bake annotation appearances into page content (non-interactive). |
 

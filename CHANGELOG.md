@@ -7,6 +7,34 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.77.0] - 2026-06-24
+
+Adds the missing geometric annotation subtypes and appearance regeneration.
+Resolves [#13](https://github.com/qrcommunication/gigapdf-lib/issues/13).
+
+### Added
+
+- **Circle / Polygon / PolyLine / Caret annotations (core + WASM + SDK).**
+  `add_circle_annotation`, `add_polygon_annotation`, `add_polyline_annotation` and
+  `add_caret_annotation` create the geometric annotation subtypes with border
+  width and interior colour (`/IC`), each with a generated `/AP` appearance stream.
+  Exposed as `gp_add_circle_annot` / `gp_add_polygon_annot` /
+  `gp_add_polyline_annot` / `gp_add_caret_annot` (WASM) and
+  `doc.addCircleAnnotation` / `addPolygonAnnotation` / `addPolylineAnnotation` /
+  `addCaretAnnotation` (SDK).
+- **`regenerate_appearance(page, index)`.** Rebuild an existing annotation's
+  `/AP /N` appearance from its stored geometry/style (after editing its colour,
+  border or geometry), leaving every other key untouched — for Square, Circle,
+  Line, Polygon, PolyLine, Highlight, Underline, StrikeOut, Ink and Caret.
+  `gp_regenerate_appearance` / `doc.regenerateAppearance`.
+
+### Notes
+
+- Annotation **actions** (`/A`) are deferred to the action-model issue (#14);
+  Sound/Screen/RichMedia subtypes remain out of scope (low priority). A **text
+  watermark** already shipped as `add_watermark` / `doc.addWatermark` (positioned,
+  with colour/opacity/rotation), so no new watermark API was added.
+
 ## [0.76.0] - 2026-06-24
 
 General document metadata: read/write the catalog `/Metadata` **XMP** packet and

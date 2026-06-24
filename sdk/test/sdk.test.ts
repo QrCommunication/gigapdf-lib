@@ -365,6 +365,32 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("annotations: circle/polygon/polyline/caret, regenerate appearance, text watermark", () => {
+    const doc = giga.open(giga.txtToPdf("Annots"));
+
+    expect(doc.addCircleAnnotation(1, 50, 50, 150, 120, 0xff0000, 0xffff00, 2)).toBe(true);
+    expect(doc.addPolygonAnnotation(1, [200, 200, 260, 200, 230, 260], 0x0000ff, null, 1.5)).toBe(true);
+    expect(doc.addPolylineAnnotation(1, [300, 300, 350, 320, 400, 300], 0x008000, 1)).toBe(true);
+    expect(doc.addCaretAnnotation(1, 120, 400, 132, 414, 0x333333)).toBe(true);
+
+    const subtypes = doc.annotations(1).map((a) => a.subtype);
+    expect(subtypes).toContain("Circle");
+    expect(subtypes).toContain("Polygon");
+    expect(subtypes).toContain("PolyLine");
+    expect(subtypes).toContain("Caret");
+
+    // Regenerate the first (Circle) annotation's appearance; FreeText is unsupported.
+    expect(doc.regenerateAppearance(1, 0)).toBe(true);
+    doc.addFreeText(1, 10, 10, 100, 30, "note");
+    const ftIndex = doc.annotations(1).length - 1;
+    expect(doc.regenerateAppearance(1, ftIndex)).toBe(false);
+
+    const reopened = giga.open(doc.save());
+    expect(reopened.annotations(1).map((a) => a.subtype)).toContain("Circle");
+    reopened.close();
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

@@ -692,8 +692,15 @@ doc.addTextNote(1, [300, 700, 318, 718], 0xff0000, {
   date: "D:20260619120000Z",
 }, "Comment", false);
 doc.addSquare(1, 60, 680, 264, 712, 0xff0000, null); // red stroke, no fill
+doc.addCircleAnnotation(1, 300, 600, 380, 660, 0x0066cc, 0xcce5ff, 2); // stroked + filled ellipse
+doc.addPolygonAnnotation(1, [100, 480, 160, 480, 130, 540], 0x008000, null, 1.5); // closed triangle
+doc.addPolylineAnnotation(1, [200, 480, 240, 510, 280, 480], 0x884400, 1.5); // open path
+doc.addCaretAnnotation(1, 420, 690, 432, 704, 0x333333); // insertion mark
 doc.addInk(1, [80, 600, 120, 620, 160, 590], 0x0000ff, 2); // freehand polyline
 doc.addStamp(1, 60, 540, 180, 568, "APPROVED", 0xc00000);
+
+// Edit an annotation's colour, then rebuild its baked /AP so every viewer shows it:
+doc.regenerateAppearance(1, 0); // 0-based index in the page's annotation list
 
 // A wrapped (multi-quad) highlight with metadata:
 doc.addMarkupAnnotation(

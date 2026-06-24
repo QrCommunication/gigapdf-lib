@@ -4128,6 +4128,105 @@ pub extern "C" fn gp_add_stamp(
     })
 }
 
+/// Add a Circle (ellipse) annotation inscribed in `[x0,y0,x1,y1]`. `stroke_rgb`
+/// (border, `/C`) and `fill_rgb` (interior, `/IC`) are packed `0xRRGGBB`, each
+/// gated by its `has_*` flag. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_circle_annot(
+    handle: *mut Document,
+    page: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    stroke_rgb: u32,
+    has_stroke: i32,
+    fill_rgb: u32,
+    has_fill: i32,
+    line_width: f64,
+) -> i32 {
+    let stroke = (has_stroke != 0).then(|| unpack_rgb(stroke_rgb));
+    let fill = (has_fill != 0).then(|| unpack_rgb(fill_rgb));
+    edit(handle, |doc| {
+        doc.add_circle_annotation(page, [x0, y0, x1, y1], stroke, fill, line_width)
+    })
+}
+
+/// Add a Polygon annotation through `coords` (flat `f64` `x,y` pairs;
+/// `coord_count` = twice the vertex count). `stroke_rgb`/`fill_rgb` packed
+/// `0xRRGGBB`, gated by `has_*`. 0 on success, `-2` bad input.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_polygon_annot(
+    handle: *mut Document,
+    page: u32,
+    coords_ptr: *const f64,
+    coord_count: usize,
+    stroke_rgb: u32,
+    has_stroke: i32,
+    fill_rgb: u32,
+    has_fill: i32,
+    line_width: f64,
+) -> i32 {
+    if coords_ptr.is_null() || coord_count < 4 {
+        return -2;
+    }
+    let coords = unsafe { std::slice::from_raw_parts(coords_ptr, coord_count) };
+    let verts: Vec<(f64, f64)> = coords.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+    let stroke = (has_stroke != 0).then(|| unpack_rgb(stroke_rgb));
+    let fill = (has_fill != 0).then(|| unpack_rgb(fill_rgb));
+    edit(handle, |doc| {
+        doc.add_polygon_annotation(page, &verts, stroke, fill, line_width)
+    })
+}
+
+/// Add a PolyLine annotation through `coords` (flat `f64` `x,y` pairs). `rgb`
+/// packed `0xRRGGBB`. 0 on success, `-2` bad input.
+#[no_mangle]
+pub extern "C" fn gp_add_polyline_annot(
+    handle: *mut Document,
+    page: u32,
+    coords_ptr: *const f64,
+    coord_count: usize,
+    rgb: u32,
+    line_width: f64,
+) -> i32 {
+    if coords_ptr.is_null() || coord_count < 4 {
+        return -2;
+    }
+    let coords = unsafe { std::slice::from_raw_parts(coords_ptr, coord_count) };
+    let verts: Vec<(f64, f64)> = coords.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+    edit(handle, |doc| {
+        doc.add_polyline_annotation(page, &verts, unpack_rgb(rgb), line_width)
+    })
+}
+
+/// Add a Caret annotation (a small upward wedge) in `[x0,y0,x1,y1]`. `rgb` packed
+/// `0xRRGGBB`. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_add_caret_annot(
+    handle: *mut Document,
+    page: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    rgb: u32,
+) -> i32 {
+    edit(handle, |doc| {
+        doc.add_caret_annotation(page, [x0, y0, x1, y1], unpack_rgb(rgb))
+    })
+}
+
+/// Regenerate the appearance (`/AP /N`) of the 0-based `index` annotation on
+/// `page` from its stored geometry. 0 on success, `-1` null handle, `-3` bad
+/// index or a subtype whose appearance can't be reconstructed.
+#[no_mangle]
+pub extern "C" fn gp_regenerate_appearance(handle: *mut Document, page: u32, index: usize) -> i32 {
+    edit(handle, |doc| doc.regenerate_appearance(page, index))
+}
+
 /// Flatten a page's annotations into its content (bake appearances, drop
 /// markup). Returns the number baked, or a negative error code.
 #[no_mangle]

@@ -8035,6 +8035,120 @@ impl Document {
         self.add_annotation(page_no, annot::square(rect, stroke, fill, line_width))
     }
 
+    /// Add a Circle (ellipse) annotation — the ellipse inscribed in `rect`, with
+    /// an optional `stroke` border (`/C`) and `fill` interior (`/IC`).
+    pub fn add_circle_annotation(
+        &mut self,
+        page_no: u32,
+        rect: [f64; 4],
+        stroke: Option<[f64; 3]>,
+        fill: Option<[f64; 3]>,
+        line_width: f64,
+    ) -> Result<()> {
+        self.add_annotation(page_no, annot::circle(rect, stroke, fill, line_width))
+    }
+
+    /// Add a Polygon annotation — a closed shape through `vertices`
+    /// (`(x, y)` points, PDF user space), with optional `stroke`/`fill`.
+    pub fn add_polygon_annotation(
+        &mut self,
+        page_no: u32,
+        vertices: &[(f64, f64)],
+        stroke: Option<[f64; 3]>,
+        fill: Option<[f64; 3]>,
+        line_width: f64,
+    ) -> Result<()> {
+        self.add_annotation(page_no, annot::polygon(vertices, stroke, fill, line_width))
+    }
+
+    /// Add a PolyLine annotation — an open path through `vertices`.
+    pub fn add_polyline_annotation(
+        &mut self,
+        page_no: u32,
+        vertices: &[(f64, f64)],
+        color: [f64; 3],
+        line_width: f64,
+    ) -> Result<()> {
+        self.add_annotation(page_no, annot::polyline(vertices, color, line_width))
+    }
+
+    /// Add a Caret annotation — a small filled upward wedge in `rect` marking an
+    /// insertion point.
+    pub fn add_caret_annotation(
+        &mut self,
+        page_no: u32,
+        rect: [f64; 4],
+        color: [f64; 3],
+    ) -> Result<()> {
+        self.add_annotation(page_no, annot::caret(rect, color))
+    }
+
+    /// Regenerate the appearance stream (`/AP /N`) of an existing annotation —
+    /// the 0-based `annot_index` in the page `/Annots` — from its stored geometry
+    /// and style, leaving every other key of the annotation untouched. Use this
+    /// after editing an annotation's colour, border or geometry so viewers that
+    /// honour `/AP` (rather than re-deriving it) show the change.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] for a bad index; [`EngineError::Unsupported`]
+    /// for a subtype whose appearance cannot be reconstructed from the dictionary
+    /// (e.g. FreeText, Stamp, Text, Link — see [`annot::rebuild`]).
+    pub fn regenerate_appearance(&mut self, page_no: u32, annot_index: usize) -> Result<()> {
+        let page = self.page_dict(page_no)?;
+        let items = page
+            .get(b"Annots")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        let annot_ref = items
+            .get(annot_index)
+            .and_then(Object::as_reference)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!(
+                    "no annotation #{annot_index} on page {page_no}"
+                ))
+            })?;
+        let dict = self
+            .objects
+            .get(&annot_ref)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::InvalidArgument("annotation is not a dictionary".into()))?;
+        let built = annot::rebuild(&dict).ok_or_else(|| {
+            let subtype = dict
+                .get(b"Subtype")
+                .and_then(Object::as_name)
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .unwrap_or_else(|| "?".into());
+            EngineError::Unsupported(format!("appearance regeneration for /{subtype} annotation"))
+        })?;
+
+        let rect = self.read_rect(&dict);
+        let appearance_id = (self.next_object_number(), 0u16);
+        let mut form = Dictionary::new();
+        form.set(b"Type".to_vec(), annot::name(b"XObject"));
+        form.set(b"Subtype".to_vec(), annot::name(b"Form"));
+        form.set(b"BBox".to_vec(), annot::real_array(&rect));
+        form.set(b"Resources".to_vec(), Object::Dictionary(built.resources));
+        form.set(
+            b"Length".to_vec(),
+            Object::Integer(built.appearance.len() as i64),
+        );
+        self.objects.insert(
+            appearance_id,
+            Object::Stream(Stream::new(form, built.appearance)),
+        );
+
+        // Replace only /AP /N on the existing annotation dict.
+        let mut updated = dict;
+        let mut ap = Dictionary::new();
+        ap.set(b"N".to_vec(), Object::Reference(appearance_id));
+        updated.set(b"AP".to_vec(), Object::Dictionary(ap));
+        self.objects.insert(annot_ref, Object::Dictionary(updated));
+        Ok(())
+    }
+
     /// Add a Highlight annotation (translucent colour over the rectangle).
     pub fn add_highlight(&mut self, page_no: u32, rect: [f64; 4], color: [f64; 3]) -> Result<()> {
         self.add_annotation(page_no, annot::highlight(rect, color))
@@ -19137,6 +19251,109 @@ mod tests {
         // XMP also reflects both (merged) values.
         let xmp = String::from_utf8(doc.xmp().unwrap()).unwrap();
         assert!(xmp.contains("Second") && xmp.contains("Alice"));
+    }
+
+    #[test]
+    fn new_annotation_subtypes_create_with_appearances() {
+        let mut doc = blank_doc();
+        doc.add_circle_annotation(
+            1,
+            [50.0, 50.0, 150.0, 120.0],
+            Some([1.0, 0.0, 0.0]),
+            Some([1.0, 1.0, 0.0]),
+            2.0,
+        )
+        .unwrap();
+        doc.add_polygon_annotation(
+            1,
+            &[(200.0, 200.0), (260.0, 200.0), (230.0, 260.0)],
+            Some([0.0, 0.0, 1.0]),
+            None,
+            1.5,
+        )
+        .unwrap();
+        doc.add_polyline_annotation(
+            1,
+            &[(300.0, 300.0), (350.0, 320.0), (400.0, 300.0)],
+            [0.0, 0.5, 0.0],
+            1.0,
+        )
+        .unwrap();
+        doc.add_caret_annotation(1, [120.0, 400.0, 132.0, 414.0], [0.2, 0.2, 0.2])
+            .unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let annots = reopened.page_annotations(1).unwrap();
+        let subtypes: Vec<&str> = annots.iter().map(|a| a.subtype.as_str()).collect();
+        assert!(subtypes.contains(&"Circle"));
+        assert!(subtypes.contains(&"Polygon"));
+        assert!(subtypes.contains(&"PolyLine"));
+        assert!(subtypes.contains(&"Caret"));
+        // Every created annotation carries an /AP appearance.
+        let page = reopened.page_dict(1).unwrap();
+        let refs = page
+            .get(b"Annots")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap();
+        for r in &refs {
+            let d = reopened.resolve(r).as_dict().unwrap();
+            assert!(
+                d.get(b"AP").is_some(),
+                "annotation has an appearance stream"
+            );
+        }
+    }
+
+    #[test]
+    fn regenerate_appearance_rebuilds_ap_for_geometric_annots() {
+        let mut doc = blank_doc();
+        doc.add_square_annotation(
+            1,
+            [40.0, 40.0, 140.0, 100.0],
+            Some([1.0, 0.0, 0.0]),
+            None,
+            2.0,
+        )
+        .unwrap();
+        // Capture the current /AP /N object reference.
+        let ap_ref = |doc: &Document| -> ObjectId {
+            let page = doc.page_dict(1).unwrap();
+            let r = page
+                .get(b"Annots")
+                .map(|o| doc.resolve(o))
+                .and_then(Object::as_array)
+                .unwrap()[0]
+                .clone();
+            doc.resolve(&r)
+                .as_dict()
+                .unwrap()
+                .get(b"AP")
+                .and_then(Object::as_dict)
+                .unwrap()
+                .get(b"N")
+                .and_then(Object::as_reference)
+                .unwrap()
+        };
+        let before = ap_ref(&doc);
+        doc.regenerate_appearance(1, 0).unwrap();
+        let after = ap_ref(&doc);
+        assert_ne!(before, after, "a fresh appearance object is written");
+
+        // A subtype we don't reconstruct (FreeText) reports Unsupported.
+        doc.add_free_text(1, [10.0, 10.0, 100.0, 30.0], "hi", 12.0, [0.0, 0.0, 0.0])
+            .unwrap();
+        let free_text_index = doc.page_annotations(1).unwrap().len() - 1;
+        assert!(matches!(
+            doc.regenerate_appearance(1, free_text_index),
+            Err(EngineError::Unsupported(_))
+        ));
+        // A bad index is an InvalidArgument.
+        assert!(matches!(
+            doc.regenerate_appearance(1, 99),
+            Err(EngineError::InvalidArgument(_))
+        ));
     }
 
     #[test]

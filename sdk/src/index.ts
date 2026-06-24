@@ -3780,6 +3780,98 @@ export class GigaPdfDoc {
       ) === 0
     );
   }
+
+  /**
+   * Add a `/Circle` (ellipse) annotation inscribed in `[x0,y0,x1,y1]`. `stroke`
+   * (border) and `fill` (interior) are packed `0xRRGGBB` numbers, or `null` to
+   * omit. Returns `true` on success.
+   */
+  addCircleAnnotation(
+    page: number,
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+    stroke: number | null = 0,
+    fill: number | null = null,
+    lineWidth = 1
+  ): boolean {
+    return (
+      this.ex().gp_add_circle_annot(
+        this.h,
+        page,
+        x0,
+        y0,
+        x1,
+        y1,
+        RGB(stroke ?? 0),
+        stroke === null ? 0 : 1,
+        RGB(fill ?? 0),
+        fill === null ? 0 : 1,
+        lineWidth
+      ) === 0
+    );
+  }
+
+  /**
+   * Add a `/Polygon` annotation — a closed shape through `points` (a flat
+   * `[x0, y0, x1, y1, …]` array, PDF user space), with optional `stroke`/`fill`
+   * (`0xRRGGBB` or `null`). Returns `true` on success.
+   */
+  addPolygonAnnotation(
+    page: number,
+    points: number[],
+    stroke: number | null = 0,
+    fill: number | null = null,
+    lineWidth = 1
+  ): boolean {
+    return (
+      this.g._withF64(points, (p, c) =>
+        this.ex().gp_add_polygon_annot(
+          this.h,
+          page,
+          p,
+          c,
+          RGB(stroke ?? 0),
+          stroke === null ? 0 : 1,
+          RGB(fill ?? 0),
+          fill === null ? 0 : 1,
+          lineWidth
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Add a `/PolyLine` annotation — an open path through `points` (a flat
+   * `[x0, y0, x1, y1, …]` array). `rgb` is packed `0xRRGGBB`.
+   */
+  addPolylineAnnotation(page: number, points: number[], rgb = 0, lineWidth = 1): boolean {
+    return (
+      this.g._withF64(points, (p, c) =>
+        this.ex().gp_add_polyline_annot(this.h, page, p, c, RGB(rgb), lineWidth)
+      ) === 0
+    );
+  }
+
+  /**
+   * Add a `/Caret` annotation — a small upward wedge in `[x0,y0,x1,y1]` marking
+   * an insertion point. `rgb` is packed `0xRRGGBB`.
+   */
+  addCaretAnnotation(page: number, x0: number, y0: number, x1: number, y1: number, rgb = 0): boolean {
+    return this.ex().gp_add_caret_annot(this.h, page, x0, y0, x1, y1, RGB(rgb)) === 0;
+  }
+
+  /**
+   * Regenerate the appearance stream (`/AP /N`) of the 0-based `index`
+   * annotation on `page` from its stored geometry, after editing its colour,
+   * border or geometry. Returns `true` on success, `false` for a bad index or a
+   * subtype whose appearance can't be reconstructed (FreeText/Stamp/Text/Link).
+   */
+  regenerateAppearance(page: number, index: number): boolean {
+    return this.ex().gp_regenerate_appearance(this.h, page, index) === 0;
+  }
+
   flattenAnnotations(page: number): number {
     return this.ex().gp_flatten_annotations(this.h, page);
   }

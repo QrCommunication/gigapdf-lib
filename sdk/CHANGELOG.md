@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.77.0] - 2026-06-24
+
+Geometric annotation subtypes + appearance regeneration. Resolves
+[#13](https://github.com/qrcommunication/gigapdf-lib/issues/13).
+
+### Added
+
+- **`addCircleAnnotation` / `addPolygonAnnotation` / `addPolylineAnnotation` /
+  `addCaretAnnotation`.** The missing geometric annotation subtypes (`/Circle`,
+  `/Polygon`, `/PolyLine`, `/Caret`), with border width and interior colour, each
+  rendered via a generated `/AP` appearance stream.
+- **`regenerateAppearance(page, index)`.** Rebuild an existing annotation's baked
+  appearance after editing its colour/border/geometry (Square, Circle, Line,
+  Polygon, PolyLine, Highlight, Underline, StrikeOut, Ink, Caret); `false` for
+  subtypes that can't be reconstructed (FreeText/Stamp/Text/Link).
+
+A text watermark already exists as `addWatermark`, so no new watermark method was
+added.
+
 ## [0.76.0] - 2026-06-24
 
 General document metadata (XMP + typed Info, kept in sync). Resolves

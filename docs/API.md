@@ -101,7 +101,10 @@ Three complementary ways to draw real, selectable text — no host font files ne
 | `add_highlight/underline/strike_out(page,rect,rgb)` | `gp_add_highlight/_underline/_strike_out` |
 | `add_free_text(page,rect,text,size,rgb)` | `gp_add_free_text(...)` |
 | `add_square_annotation/add_line_annotation` | `gp_add_square/gp_add_line` |
+| `add_circle_annotation(page,rect,stroke?,fill?,lw)` / `add_caret_annotation(page,rect,rgb)` | `gp_add_circle_annot / gp_add_caret_annot` |
+| `add_polygon_annotation(page,verts,stroke?,fill?,lw)` / `add_polyline_annotation(page,verts,rgb,lw)` (closed / open path through `(x,y)` vertices) | `gp_add_polygon_annot / gp_add_polyline_annot` (flat `f64` coords) |
 | `add_ink(page,paths,rgb,lw)` / `add_stamp` | `gp_add_ink / gp_add_stamp` |
+| `regenerate_appearance(page,index)` (rebuild an existing annotation's `/AP /N` from its geometry — Square/Circle/Line/Polygon/PolyLine/Highlight/Underline/StrikeOut/Ink/Caret) | `gp_regenerate_appearance(handle,page,index)` |
 | `page_annotations(page)` (rich: author/subject/dates/colour/opacity/quadPoints/inkList/stamp name/link target) | `gp_annotations_json(handle,page,outlen)` |
 | `remove_annotation(page,i)` | `gp_remove_annotation(handle,page,i)` |
 | `flatten_annotations(page) -> usize` | `gp_flatten_annotations(handle,page)` |

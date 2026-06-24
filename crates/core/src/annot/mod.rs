@@ -114,6 +114,139 @@ pub(crate) fn square(
     }
 }
 
+/// Circle (ellipse) annotation — the ellipse inscribed in `rect`.
+pub(crate) fn circle(
+    rect: [f64; 4],
+    stroke: Option<[f64; 3]>,
+    fill: Option<[f64; 3]>,
+    line_width: f64,
+) -> Built {
+    let mut dict = Dictionary::new();
+    dict.set(b"Subtype".to_vec(), name(b"Circle"));
+    dict.set(b"Rect".to_vec(), real_array(&rect));
+    if let Some(c) = stroke {
+        dict.set(b"C".to_vec(), real_array(&c));
+    }
+    if let Some(c) = fill {
+        dict.set(b"IC".to_vec(), real_array(&c));
+    }
+    dict.set(b"BS".to_vec(), border_style(line_width));
+
+    let [x0, y0, x1, y1] = rect;
+    let inset = line_width / 2.0;
+    let cx = (x0 + x1) / 2.0;
+    let cy = (y0 + y1) / 2.0;
+    let rx = ((x1 - x0).abs() / 2.0 - inset).max(0.0);
+    let ry = ((y1 - y0).abs() / 2.0 - inset).max(0.0);
+    let appearance = content::ellipse_ops(cx, cy, rx, ry, stroke, fill, line_width);
+    Built {
+        dict,
+        appearance,
+        resources: Dictionary::new(),
+    }
+}
+
+/// The axis-aligned bounding box of `vertices` padded by `margin`.
+fn vertices_rect(vertices: &[(f64, f64)], margin: f64) -> [f64; 4] {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &(x, y) in vertices {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    if !min_x.is_finite() {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    [
+        min_x - margin,
+        min_y - margin,
+        max_x + margin,
+        max_y + margin,
+    ]
+}
+
+/// `/Vertices` flat array `[x0 y0 x1 y1 …]` for Polygon/PolyLine.
+fn vertices_array(vertices: &[(f64, f64)]) -> Object {
+    Object::Array(
+        vertices
+            .iter()
+            .flat_map(|&(x, y)| [Object::Real(x), Object::Real(y)])
+            .collect(),
+    )
+}
+
+/// Polygon annotation — a closed shape through `vertices` (ISO 32000-1 §12.5.6.9).
+pub(crate) fn polygon(
+    vertices: &[(f64, f64)],
+    stroke: Option<[f64; 3]>,
+    fill: Option<[f64; 3]>,
+    line_width: f64,
+) -> Built {
+    let mut dict = Dictionary::new();
+    dict.set(b"Subtype".to_vec(), name(b"Polygon"));
+    dict.set(
+        b"Rect".to_vec(),
+        real_array(&vertices_rect(vertices, line_width.max(1.0))),
+    );
+    dict.set(b"Vertices".to_vec(), vertices_array(vertices));
+    if let Some(c) = stroke {
+        dict.set(b"C".to_vec(), real_array(&c));
+    }
+    if let Some(c) = fill {
+        dict.set(b"IC".to_vec(), real_array(&c));
+    }
+    dict.set(b"BS".to_vec(), border_style(line_width));
+    let appearance = content::polygon_ops(vertices, true, stroke, fill, line_width);
+    Built {
+        dict,
+        appearance,
+        resources: Dictionary::new(),
+    }
+}
+
+/// PolyLine annotation — an open path through `vertices` (ISO 32000-1 §12.5.6.9).
+pub(crate) fn polyline(vertices: &[(f64, f64)], color: [f64; 3], line_width: f64) -> Built {
+    let mut dict = Dictionary::new();
+    dict.set(b"Subtype".to_vec(), name(b"PolyLine"));
+    dict.set(
+        b"Rect".to_vec(),
+        real_array(&vertices_rect(vertices, line_width.max(1.0))),
+    );
+    dict.set(b"Vertices".to_vec(), vertices_array(vertices));
+    dict.set(b"C".to_vec(), real_array(&color));
+    dict.set(b"BS".to_vec(), border_style(line_width));
+    let appearance = content::polygon_ops(vertices, false, Some(color), None, line_width);
+    Built {
+        dict,
+        appearance,
+        resources: Dictionary::new(),
+    }
+}
+
+/// Caret annotation — a small filled upward wedge marking an insertion point
+/// (ISO 32000-1 §12.5.6.11).
+pub(crate) fn caret(rect: [f64; 4], color: [f64; 3]) -> Built {
+    let mut dict = Dictionary::new();
+    dict.set(b"Subtype".to_vec(), name(b"Caret"));
+    dict.set(b"Rect".to_vec(), real_array(&rect));
+    dict.set(b"C".to_vec(), real_array(&color));
+
+    let [x0, y0, x1, y1] = rect;
+    // An upward triangle filling the rect: base along the bottom, apex centred top.
+    let apex = ((x0 + x1) / 2.0, y1);
+    let tri = [(x0, y0), (x1, y0), apex];
+    let appearance = content::polygon_ops(&tri, true, None, Some(color), 0.0);
+    Built {
+        dict,
+        appearance,
+        resources: Dictionary::new(),
+    }
+}
+
 /// Highlight annotation — a translucent colour fill over the rectangle.
 pub(crate) fn highlight(rect: [f64; 4], color: [f64; 3]) -> Built {
     let mut dict = Dictionary::new();
@@ -398,4 +531,136 @@ pub(crate) fn stamp(rect: [f64; 4], label: &str, color: [f64; 3]) -> Built {
         appearance,
         resources,
     }
+}
+
+// ─── appearance regeneration ─────────────────────────────────────────────────
+
+/// Read a colour array (`/C`, `/IC`) as RGB: 1 value = gray, 3 = RGB, 4 = CMYK
+/// (naive conversion). `None` when absent or not a number array.
+fn read_rgb(dict: &Dictionary, key: &[u8]) -> Option<[f64; 3]> {
+    let nums: Vec<f64> = dict
+        .get(key)
+        .and_then(Object::as_array)?
+        .iter()
+        .filter_map(Object::as_f64)
+        .collect();
+    match nums.len() {
+        1 => Some([nums[0], nums[0], nums[0]]),
+        3 => Some([nums[0], nums[1], nums[2]]),
+        4 => {
+            let k = nums[3];
+            Some([
+                (1.0 - nums[0]) * (1.0 - k),
+                (1.0 - nums[1]) * (1.0 - k),
+                (1.0 - nums[2]) * (1.0 - k),
+            ])
+        }
+        _ => None,
+    }
+}
+
+/// Read a 4-number rectangle array.
+fn read_rect4(dict: &Dictionary, key: &[u8]) -> Option<[f64; 4]> {
+    let nums: Vec<f64> = dict
+        .get(key)
+        .and_then(Object::as_array)?
+        .iter()
+        .filter_map(Object::as_f64)
+        .collect();
+    (nums.len() == 4).then(|| [nums[0], nums[1], nums[2], nums[3]])
+}
+
+/// Read a flat `[x y x y …]` array into `(x, y)` pairs.
+fn read_points(dict: &Dictionary, key: &[u8]) -> Vec<(f64, f64)> {
+    let Some(arr) = dict.get(key).and_then(Object::as_array) else {
+        return Vec::new();
+    };
+    let nums: Vec<f64> = arr.iter().filter_map(Object::as_f64).collect();
+    nums.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+}
+
+/// The annotation's border width (`/BS /W`), defaulting to `1.0`.
+fn read_line_width(dict: &Dictionary) -> f64 {
+    dict.get(b"BS")
+        .and_then(Object::as_dict)
+        .and_then(|bs| bs.get(b"W"))
+        .and_then(Object::as_f64)
+        .unwrap_or(1.0)
+}
+
+/// Rebuild the appearance ([`Built`]) of an existing annotation from its stored
+/// geometry, for [`Document::regenerate_appearance`]. Supports the geometric and
+/// text-markup subtypes the engine authors (Square, Circle, Line, Polygon,
+/// PolyLine, Highlight, Underline, StrikeOut, Ink, Caret). Returns `None` for
+/// subtypes whose appearance cannot be reconstructed from the dictionary alone
+/// (e.g. FreeText, Stamp, Text, Link).
+pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
+    let subtype = dict.get(b"Subtype").and_then(Object::as_name)?.to_vec();
+    let rect = read_rect4(dict, b"Rect").unwrap_or([0.0, 0.0, 0.0, 0.0]);
+    let stroke = read_rgb(dict, b"C");
+    let fill = read_rgb(dict, b"IC");
+    let lw = read_line_width(dict);
+    let black = [0.0, 0.0, 0.0];
+    Some(match subtype.as_slice() {
+        b"Square" => square(rect, stroke, fill, lw),
+        b"Circle" => circle(rect, stroke, fill, lw),
+        b"Highlight" => highlight(rect, stroke.unwrap_or([1.0, 1.0, 0.0])),
+        b"Underline" => underline(rect, stroke.unwrap_or(black)),
+        b"StrikeOut" => strike_out(rect, stroke.unwrap_or(black)),
+        b"Caret" => caret(rect, stroke.unwrap_or(black)),
+        b"Line" => {
+            let l = read_points(dict, b"L");
+            if l.len() < 2 {
+                return None;
+            }
+            let arrow = dict
+                .get(b"LE")
+                .and_then(Object::as_array)
+                .is_some_and(|le| {
+                    le.iter()
+                        .any(|o| o.as_name() == Some(b"OpenArrow".as_slice()))
+                });
+            line(
+                l[0].0,
+                l[0].1,
+                l[1].0,
+                l[1].1,
+                stroke.unwrap_or(black),
+                lw,
+                arrow,
+            )
+        }
+        b"Polygon" => {
+            let v = read_points(dict, b"Vertices");
+            if v.len() < 2 {
+                return None;
+            }
+            polygon(&v, stroke, fill, lw)
+        }
+        b"PolyLine" => {
+            let v = read_points(dict, b"Vertices");
+            if v.len() < 2 {
+                return None;
+            }
+            polyline(&v, stroke.unwrap_or(black), lw)
+        }
+        b"Ink" => {
+            let paths: Vec<Vec<(f64, f64)>> = dict
+                .get(b"InkList")
+                .and_then(Object::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Object::as_array)
+                        .map(|stroke_path| {
+                            let nums: Vec<f64> =
+                                stroke_path.iter().filter_map(Object::as_f64).collect();
+                            nums.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ink(&paths, stroke.unwrap_or(black), lw)
+        }
+        _ => return None,
+    })
 }
