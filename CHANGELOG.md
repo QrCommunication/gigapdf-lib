@@ -7,6 +7,18 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.87.2] - 2026-06-24
+
+HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item C).
+
+### Added
+
+- **3-D `border-style`s** — `inset`, `outset`, `groove`, `ridge` (previously they
+  rendered as flat `solid`). The top/left and bottom/right sides take a darker or
+  lighter shade of the colour to fake depth: `inset`/`outset` shade each side as
+  one tone; `groove`/`ridge` split each side into an outer and inner half-width
+  band with opposite tones (a carved groove / raised ridge).
+
 ## [0.87.1] - 2026-06-24
 
 HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).

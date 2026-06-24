@@ -189,6 +189,14 @@ pub enum BorderStyle {
     Dotted,
     /// Two parallel thin lines with a gap between them.
     Double,
+    /// 3-D bevels — top/left edges and bottom/right edges take a darker or
+    /// lighter shade of the colour to fake depth. `Inset`/`Outset` shade each
+    /// side as one tone; `Groove`/`Ridge` split each side into an outer and inner
+    /// half with opposite tones (a carved groove / raised ridge).
+    Inset,
+    Outset,
+    Groove,
+    Ridge,
 }
 
 /// A single `box-shadow` layer, resolved to points.
@@ -2795,7 +2803,11 @@ fn parse_border_style_keyword(tok: &str) -> Option<BorderStyle> {
         "dashed" => Some(BorderStyle::Dashed),
         "dotted" => Some(BorderStyle::Dotted),
         "double" => Some(BorderStyle::Double),
-        "solid" | "groove" | "ridge" | "inset" | "outset" => Some(BorderStyle::Solid),
+        "inset" => Some(BorderStyle::Inset),
+        "outset" => Some(BorderStyle::Outset),
+        "groove" => Some(BorderStyle::Groove),
+        "ridge" => Some(BorderStyle::Ridge),
+        "solid" => Some(BorderStyle::Solid),
         _ => None,
     }
 }
@@ -3887,9 +3899,12 @@ mod tests {
 
     #[test]
     fn unknown_border_style_falls_back_to_solid() {
-        // `groove` (and any value we don't render distinctly) stays Solid.
-        let s = inline_style("border:1pt groove #000000");
-        assert_eq!(s.border_style_edges, [BorderStyle::Solid; 4]);
+        // `groove` now maps to its 3-D bevel style; a value we don't recognise at
+        // all (`wavy`) still falls back to Solid.
+        let groove = inline_style("border:1pt groove #000000");
+        assert_eq!(groove.border_style_edges, [BorderStyle::Groove; 4]);
+        let unknown = inline_style("border:1pt wavy #000000");
+        assert_eq!(unknown.border_style_edges, [BorderStyle::Solid; 4]);
     }
 
     #[test]

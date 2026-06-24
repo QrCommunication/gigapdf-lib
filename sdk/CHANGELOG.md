@@ -44,6 +44,12 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.87.2] - 2026-06-24
+
+HTML/CSS renderer: 3-D `border-style`s `inset`/`outset`/`groove`/`ridge` now shade
+the sides for depth instead of rendering flat `solid`. HTML→PDF path only — no SDK
+signature change ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) item C).
+
 ## [0.87.1] - 2026-06-24
 
 HTML/CSS renderer: `aspect-ratio` now derives a block's height from its width

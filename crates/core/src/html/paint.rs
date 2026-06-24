@@ -2149,6 +2149,33 @@ mod tests {
     }
 
     #[test]
+    fn inset_border_shades_sides_for_depth() {
+        // An `inset` border draws the top/left sides darker and the bottom/right
+        // sides lighter than the base colour to fake depth — so two distinct
+        // shades of `#888` (0.533) appear: darken≈0.293 and lighten≈0.743.
+        let content =
+            page1_content(r#"<div style="border:10pt inset #888888;padding:8pt">x</div>"#);
+        assert!(
+            content.contains("0.29"),
+            "inset top/left darkened\n{content}"
+        );
+        assert!(
+            content.contains("0.74"),
+            "inset bottom/right lightened\n{content}"
+        );
+        // A plain `solid` border keeps the one flat colour (0.533 → "0.53").
+        let solid = page1_content(r#"<div style="border:10pt solid #888888;padding:8pt">x</div>"#);
+        assert!(
+            solid.contains("0.53"),
+            "solid border keeps one tone\n{solid}"
+        );
+        assert!(
+            !solid.contains("0.29"),
+            "solid border is not bevelled\n{solid}"
+        );
+    }
+
+    #[test]
     fn square_box_uses_rectangle_op_not_curves() {
         // Guard: with no radius the background still paints via the `re` rectangle
         // operator and emits NO Bézier corners (unchanged fast path).

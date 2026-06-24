@@ -495,6 +495,16 @@ pub(crate) fn fragment_bbox(frag: &Fragment) -> (f64, f64, f64, f64) {
     }
 }
 
+/// A darker shade of `c` for the shadowed side of a 3-D bevel border.
+fn darken(c: [f64; 3]) -> [f64; 3] {
+    c.map(|v| v * 0.55)
+}
+
+/// A lighter shade of `c` for the lit side of a 3-D bevel border.
+fn lighten(c: [f64; 3]) -> [f64; 3] {
+    c.map(|v| v + (1.0 - v) * 0.45)
+}
+
 /// An atomic inline item for line breaking.
 /// Inline replaced content laid out as a box on the line: a raster image
 /// (`w, h, src`) or a vector SVG (`w, h, image`).
@@ -2293,7 +2303,8 @@ impl Flow<'_> {
                 },
             });
         };
-        // Dispatch one side to the solid or styled emitter by its style.
+        // Dispatch one side to the solid / styled / 3-D bevel emitter. `near` is
+        // true for the top and left sides (the ones lit dark for `inset`).
         #[allow(clippy::too_many_arguments)]
         let emit_side = |out: &mut Vec<Abs>,
                          rx: f64,
@@ -2303,25 +2314,88 @@ impl Flow<'_> {
                          c: [f64; 3],
                          horizontal: bool,
                          width: f64,
-                         style: BorderStyle| {
+                         style: BorderStyle,
+                         near: bool| {
             match style {
                 BorderStyle::Solid => push_solid(out, rx, ry, rw, rh, c),
+                BorderStyle::Inset | BorderStyle::Outset => {
+                    // One tone per side: lit when raised==near (outset top/left,
+                    // inset bottom/right), shadowed otherwise.
+                    let raised = matches!(style, BorderStyle::Outset);
+                    let shade = if raised == near {
+                        lighten(c)
+                    } else {
+                        darken(c)
+                    };
+                    push_solid(out, rx, ry, rw, rh, shade);
+                }
+                BorderStyle::Groove | BorderStyle::Ridge => {
+                    // Two half-width bands with opposite tones. The "outer" half is
+                    // at rx/ry on a near side (top/left), the far half otherwise.
+                    let ridge = matches!(style, BorderStyle::Ridge);
+                    let outer_lit = ridge == near;
+                    let oc = if outer_lit { lighten(c) } else { darken(c) };
+                    let ic = if outer_lit { darken(c) } else { lighten(c) };
+                    if horizontal {
+                        let half = rh / 2.0;
+                        let (oy, iy) = if near {
+                            (ry, ry + half)
+                        } else {
+                            (ry + half, ry)
+                        };
+                        push_solid(out, rx, oy, rw, half, oc);
+                        push_solid(out, rx, iy, rw, half, ic);
+                    } else {
+                        let half = rw / 2.0;
+                        let (ox, ix) = if near {
+                            (rx, rx + half)
+                        } else {
+                            (rx + half, rx)
+                        };
+                        push_solid(out, ox, ry, half, rh, oc);
+                        push_solid(out, ix, ry, half, rh, ic);
+                    }
+                }
                 _ => push_styled(out, rx, ry, rw, rh, c, horizontal, width, style),
             }
         };
         let [wt, wr, wb, wl] = widths;
         let [st, sr, sb, sl] = *styles;
+        // `near` (top + left) selects the dark side for `inset`. TRBL colour
+        // indices: top=0, right=1, bottom=2, left=3.
         if wt > 0.0 {
-            emit_side(&mut self.out, x, y, w, wt, colors[0], true, wt, st); // top
+            emit_side(&mut self.out, x, y, w, wt, colors[0], true, wt, st, true);
         }
         if wb > 0.0 {
-            emit_side(&mut self.out, x, y + h - wb, w, wb, colors[2], true, wb, sb); // bottom
+            emit_side(
+                &mut self.out,
+                x,
+                y + h - wb,
+                w,
+                wb,
+                colors[2],
+                true,
+                wb,
+                sb,
+                false,
+            );
         }
         if wl > 0.0 {
-            emit_side(&mut self.out, x, y, wl, h, colors[3], false, wl, sl); // left
+            emit_side(&mut self.out, x, y, wl, h, colors[3], false, wl, sl, true);
         }
         if wr > 0.0 {
-            emit_side(&mut self.out, x + w - wr, y, wr, h, colors[1], false, wr, sr); // right
+            emit_side(
+                &mut self.out,
+                x + w - wr,
+                y,
+                wr,
+                h,
+                colors[1],
+                false,
+                wr,
+                sr,
+                false,
+            );
         }
     }
 

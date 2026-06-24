@@ -188,7 +188,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 |----------|--------|-------|
 | `border` / `border-<side>` / `border-width` / `border-<side>-width` | `1px solid #ccc` | width, colour and style are read **per side** |
 | `border-color` / `border-<side>-color` | [colour](#colours) | independent per edge |
-| `border-style` / `border-<side>-style` | `solid`, `dashed`, `dotted`, `double` | `groove`/`ridge`/`inset`/`outset` fall back to `dashed` |
+| `border-style` / `border-<side>-style` | `solid`, `dashed`, `dotted`, `double`, `inset`, `outset`, `groove`, `ridge` | the 3-D styles shade the top/left vs bottom/right sides darker/lighter to fake depth (`groove`/`ridge` split each side into two half-width tones) |
 | `border-radius` (+ `border-<corner>-radius`) | 1–4 lengths, optional `/` for **elliptical** radii (`rx / ry`) | rounds the background fill and **uniform** borders. Caveats: child content is **not clipped** to the curve; a *per-side styled* border stays square |
 | `border-collapse` | `collapse`, `separate` | on a `<table>`: shared interior rules drawn once |
 
