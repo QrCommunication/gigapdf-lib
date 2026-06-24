@@ -2012,6 +2012,27 @@ pub extern "C" fn gp_add_image(
     })
 }
 
+/// Replace the pixels of the existing image element `index` on `page` **in place**
+/// with a fresh raster (PNG or JPEG bytes at `data_ptr`, `data_len`). `index` is
+/// the unified element index from [`gp_image_elements_json`]; the image's object
+/// number, every `/Do` reference and its placement matrix are preserved — only the
+/// stream bytes and image dictionary change. 0 on success; `-3` when `index` isn't
+/// a top-level image or the bytes aren't decodable PNG/JPEG.
+#[no_mangle]
+pub extern "C" fn gp_replace_image(
+    handle: *mut Document,
+    page: u32,
+    index: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> i32 {
+    if data_ptr.is_null() {
+        return -2;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    edit(handle, |doc| doc.replace_image(page, index, data))
+}
+
 /// Stamp an **image watermark** (PNG / JPEG / WebP / GIF / AVIF bytes at
 /// `data_ptr`, `data_len`) across pages. The image is embedded once and
 /// referenced on every target page.

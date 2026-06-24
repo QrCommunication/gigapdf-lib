@@ -9040,6 +9040,53 @@ impl Document {
         self.append_page_content(page_no, &ops)
     }
 
+    /// Replace the pixels of an **existing image XObject in place** (ISO 32000-1
+    /// §8.9): swap a logo/photo while keeping every reference to it intact. `index`
+    /// is the unified element index of an image on `page_no` — exactly the value
+    /// reported by [`page_image_elements`](Self::page_image_elements) (and accepted
+    /// by [`remove_element`](Self::remove_element)/[`transform_element`](Self::transform_element)).
+    ///
+    /// `data` is a fresh raster (PNG or JPEG); it is re-encoded through the same
+    /// embedding path as [`add_image`](Self::add_image) (PNG → `/FlateDecode`
+    /// DeviceRGB/DeviceGray with alpha carried in a fresh `/SMask`; JPEG →
+    /// `/DCTDecode` passthrough, Adobe-CMYK `/Decode` flip), and the result is
+    /// written **over the same object number**. The image's resource name, every
+    /// `/Do` invocation, and the placement matrix (`cm`) — hence position, scale,
+    /// rotation and clip — are therefore untouched: only the stream bytes and the
+    /// image dictionary (`/Width`, `/Height`, `/ColorSpace`, `/BitsPerComponent`,
+    /// `/Filter`) change. The new raster need not match the old pixel dimensions;
+    /// it is drawn into the same box, so a differently-proportioned replacement is
+    /// stretched to fit (transform the element first if you need to re-fit it).
+    ///
+    /// `Err` if `page_no`/`index` doesn't resolve to a **top-level** image element,
+    /// or if `data` isn't a decodable PNG/JPEG.
+    pub fn replace_image(&mut self, page_no: u32, index: usize, data: &[u8]) -> Result<()> {
+        // Resolve the element index to the image's XObject resource name, using the
+        // SAME top-level element list the index addresses (skip nested form-XObject
+        // content, which isn't editable by top-level index). This keeps the
+        // identifier consistent with `page_image_elements`/`imageElements`.
+        let name = self
+            .page_elements(page_no)?
+            .into_iter()
+            .find(|e| e.index == index && e.kind == content::ElementKind::Image && !e.nested)
+            .map(|e| e.label.into_bytes())
+            .ok_or_else(|| EngineError::Missing("no image element at index".into()))?;
+        // The backing object id must stay fixed so all `/Do` references keep
+        // resolving to it.
+        let id = self.xobject_id(page_no, &name).ok_or_else(|| {
+            EngineError::Missing("image XObject is not an indirect object".into())
+        })?;
+        let prep = content::image::prepare_image(data)
+            .ok_or_else(|| EngineError::Missing("unsupported image (need PNG or JPEG)".into()))?;
+        // Re-encode and overwrite the stream at the existing id: same object number,
+        // new image dict + bytes. The old `/SMask`/palette is dropped — the
+        // re-encoded stream is self-describing (a fresh `/SMask` is wired when the
+        // new raster carries alpha).
+        let stream = self.build_image_xobject_stream(&prep);
+        self.objects.insert(id, Object::Stream(stream));
+        Ok(())
+    }
+
     /// Insert a prepared raster as a PDF `/Image` XObject (plus its `/DeviceGray`
     /// soft mask when the source carried alpha) and return the main image object
     /// id. This is the single, shared image-embedding path: both
@@ -9050,6 +9097,20 @@ impl Document {
     /// caller can reference it from any number of pages (the watermark path embeds
     /// once and references it on every target page).
     fn embed_image_xobject(&mut self, prep: &content::image::PreparedImage) -> ObjectId {
+        let stream = self.build_image_xobject_stream(prep);
+        let img_id = (self.next_object_number(), 0u16);
+        self.objects.insert(img_id, Object::Stream(stream));
+        img_id
+    }
+
+    /// Build the main `/Image` XObject [`Stream`] for a prepared raster — the
+    /// dictionary (colour space, `/BitsPerComponent`, `/Filter`, CMYK `/Decode`)
+    /// plus its encoded bytes — allocating the `/DeviceGray` soft-mask sub-object
+    /// and wiring `/SMask` when the source carried alpha. The single place this
+    /// wiring lives: [`embed_image_xobject`](Self::embed_image_xobject) inserts it
+    /// at a fresh id, while [`replace_image`](Self::replace_image) inserts it over
+    /// an existing image object's id (so every `/Do` reference is preserved).
+    fn build_image_xobject_stream(&mut self, prep: &content::image::PreparedImage) -> Stream {
         use content::image::{ImageColor, ImageFilter};
 
         // PNG alpha → a /DeviceGray soft-mask image XObject referenced by /SMask.
@@ -9114,10 +9175,7 @@ impl Document {
             dict.set(b"SMask".to_vec(), Object::Reference(id));
         }
         dict.set(b"Length".to_vec(), Object::Integer(prep.data.len() as i64));
-        let img_id = (self.next_object_number(), 0u16);
-        self.objects
-            .insert(img_id, Object::Stream(Stream::new(dict, prep.data.clone())));
-        img_id
+        Stream::new(dict, prep.data.clone())
     }
 
     /// Register `value` under a fresh name in a page's `/Resources /{category}`
@@ -17604,6 +17662,118 @@ mod tests {
             "2nd image must move right: was {before_x}, now {}",
             after[1].x
         );
+    }
+
+    #[test]
+    fn replace_image_swaps_pixels_in_place_keeping_object_id_and_do_reference() {
+        let (mut doc, _im0, im1) = page_with_text_image_path_image();
+
+        // The 2nd image (unified index 3) is a 20×20 DCTDecode (jpeg) XObject.
+        let imgs = doc.page_image_elements(1);
+        let target = imgs[1].index; // 3
+        assert_eq!(target, 3);
+        assert_eq!((imgs[1].pixel_width, imgs[1].pixel_height), (20, 20));
+        assert_eq!(imgs[1].format, "jpeg");
+
+        // Capture, BEFORE the swap: the backing object id, the old stream bytes,
+        // and the content stream's placement of this image (`cm … /name Do`).
+        let id_before = doc.xobject_id(1, &im1).expect("indirect XObject");
+        let bytes_before = match doc.objects.get(&id_before) {
+            Some(Object::Stream(s)) => s.raw.clone(),
+            _ => panic!("expected an image stream"),
+        };
+        let content_before = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        let do_op = format!("/{} Do", String::from_utf8_lossy(&im1));
+        let placement = "q 30 0 0 30 300 200 cm"; // the 2nd image's CTM, from the fixture
+        assert!(content_before.contains(&do_op));
+        assert!(content_before.contains(placement));
+
+        // Replace it with a fresh raster of DIFFERENT format AND dimensions: a 32×16
+        // opaque PNG → re-encoded to a FlateDecode DeviceRGB stream.
+        let rgba = vec![0x80u8; 32 * 16 * 4];
+        let png = crate::raster::png::encode_png(32, 16, &rgba);
+        doc.replace_image(1, target, &png).unwrap();
+
+        // The object NUMBER is unchanged — every `/Do` keeps resolving to it.
+        let id_after = doc.xobject_id(1, &im1).expect("indirect XObject");
+        assert_eq!(
+            id_after, id_before,
+            "object id (and number) must be preserved"
+        );
+
+        // The image dict + stream were rewritten: new dimensions, new filter, new
+        // bytes.
+        let after = doc.page_image_elements(1);
+        assert_eq!(after.len(), 2, "still two images");
+        assert_eq!(
+            (after[1].pixel_width, after[1].pixel_height),
+            (32, 16),
+            "/Width and /Height now reflect the new raster"
+        );
+        let stream_after = match doc.objects.get(&id_after) {
+            Some(Object::Stream(s)) => s,
+            _ => panic!("expected an image stream"),
+        };
+        assert_eq!(
+            stream_after.dict.get(b"Filter").and_then(Object::as_name),
+            Some(b"FlateDecode".as_slice()),
+            "DCTDecode jpeg replaced by a FlateDecode (PNG-derived) stream"
+        );
+        assert_eq!(
+            stream_after.dict.get(b"Width").and_then(Object::as_i64),
+            Some(32)
+        );
+        assert_eq!(
+            stream_after.dict.get(b"Height").and_then(Object::as_i64),
+            Some(16)
+        );
+        assert_ne!(stream_after.raw, bytes_before, "stream bytes changed");
+
+        // The placement (`cm`) and the `/Do` reference are byte-for-byte unchanged:
+        // only the pixels were swapped.
+        let content_after = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert_eq!(
+            content_after, content_before,
+            "content stream (every /Do + cm) is untouched by replace_image"
+        );
+
+        // The OTHER image (unified index 1) is untouched.
+        assert_eq!(after[0].index, 1);
+        assert_eq!((after[0].pixel_width, after[0].pixel_height), (10, 10));
+
+        // The whole element model still parses as [text, image, path, image].
+        let kinds: Vec<_> = doc
+            .page_elements(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                content::ElementKind::Text,
+                content::ElementKind::Image,
+                content::ElementKind::Path,
+                content::ElementKind::Image,
+            ],
+        );
+    }
+
+    #[test]
+    fn replace_image_rejects_non_image_index_and_bad_bytes() {
+        let (mut doc, _im0, _im1) = page_with_text_image_path_image();
+        // Index 0 is the text element, index 2 is the path — neither is an image.
+        assert!(doc
+            .replace_image(1, 0, &[0xFFu8, 0xD8, 0xFF, 0xD9])
+            .is_err());
+        assert!(doc
+            .replace_image(1, 2, &[0xFFu8, 0xD8, 0xFF, 0xD9])
+            .is_err());
+        // A valid image index but undecodable bytes is also rejected.
+        assert!(doc.replace_image(1, 3, b"not an image").is_err());
+        // And the document is unchanged: the targeted image still reads as 20×20.
+        let imgs = doc.page_image_elements(1);
+        assert_eq!((imgs[1].pixel_width, imgs[1].pixel_height), (20, 20));
     }
 
     #[test]

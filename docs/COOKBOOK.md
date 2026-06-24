@@ -1229,6 +1229,40 @@ const out = doc.save();
 doc.close();
 ```
 
+### Swap an image's pixels in place with `replaceImage`
+
+To change a logo or a photo **without** disturbing its placement, replace the
+existing image XObject's bytes instead of deleting and re-adding it.
+`replaceImage(page, index, data)` (ISO 32000-1 §8.9) re-encodes the new **PNG or
+JPEG** through the same path as `addImage` and rewrites the stream **over the same
+object number** — so the image keeps its object id, **every `/Do` invocation, and
+its position / scale / rotation / clip matrix**. Only the stream bytes and the
+image dictionary (`/Width`, `/Height`, `/ColorSpace`, `/BitsPerComponent`,
+`/Filter`) change.
+
+A delete-then-`addImage` instead loses the original placement (and any `/SMask` /
+clip): the new image lands wherever `addImage` puts it. `replaceImage` is the
+in-place swap.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Identify the image to swap by its unified element index — the same `index`
+// reported by imageElements (and used by transformElement / removeElement).
+const img = doc.imageElements(1)[0];
+
+// Replace its pixels with a new raster. The image stays exactly where it was —
+// same box, same rotation, same clip — only the picture changes.
+const ok = doc.replaceImage(1, img.index, newLogoPngOrJpeg); // false if not an image / undecodable
+
+// The new raster need not match the old pixel size: it is stretched into the
+// existing box. To re-fit a differently-proportioned image, transform it after:
+// doc.transformElement(1, img.index, [/* scale/translate to taste */]);
+
+const out = doc.save();
+doc.close();
+```
+
 ### Restyle a vector path with `setPathStyle`
 
 `setPathStyle(page, index, style)` re-styles a **path** element in place — it

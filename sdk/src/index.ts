@@ -3028,6 +3028,29 @@ export class GigaPdfDoc {
     );
   }
   /**
+   * Replace the pixels of an **existing image XObject in place** — swap a logo or
+   * photo while every reference to it stays intact (ISO 32000-1 §8.9). `index` is
+   * the **unified element index** of an image on `page`, exactly the `index`
+   * reported by {@link imageElements} (and accepted by {@link removeElement} /
+   * {@link transformElement}); `data` is a fresh PNG or JPEG.
+   *
+   * Unlike a delete-then-re-add, the image keeps its object number, **every `/Do`
+   * placement, and its position / scale / rotation / clip matrix** — only the
+   * stream bytes and the image dictionary (`/Width`, `/Height`, `/ColorSpace`,
+   * `/BitsPerComponent`, `/Filter`) are rewritten. The new raster is re-encoded
+   * through the same path as {@link addImage} (PNG alpha → a fresh `/SMask`; JPEG
+   * → `/DCTDecode` passthrough). It need not match the old pixel size — it is
+   * drawn into the same box (transform the element first to re-fit it).
+   *
+   * Returns `false` if `page`/`index` doesn't resolve to a top-level image, or the
+   * bytes aren't a decodable PNG/JPEG.
+   */
+  replaceImage(page: number, index: number, data: Uint8Array): boolean {
+    return (
+      this.g._withBytes(data, (p, l) => this.ex().gp_replace_image(this.h, page, index, p, l)) === 0
+    );
+  }
+  /**
    * Stamp an **image watermark** across pages from raw image bytes. Accepts the
    * same five formats the engine decodes — **PNG, JPEG, WebP, GIF, AVIF**. The
    * image is embedded **once** and referenced on every target page.
