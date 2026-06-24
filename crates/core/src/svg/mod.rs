@@ -78,6 +78,23 @@ impl Mat {
     fn scale_hint(&self) -> f64 {
         (self.a * self.d - self.b * self.c).abs().sqrt().max(1e-6)
     }
+    /// Inverse affine, or `None` when (near-)singular. Used to map output-space
+    /// points back into a (possibly rotated/skewed) pattern lattice.
+    fn inverse(&self) -> Option<Mat> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let inv = 1.0 / det;
+        Some(Mat {
+            a: self.d * inv,
+            b: -self.b * inv,
+            c: -self.c * inv,
+            d: self.a * inv,
+            e: (self.c * self.f - self.d * self.e) * inv,
+            f: (self.b * self.e - self.a * self.f) * inv,
+        })
+    }
 }
 
 /// Inherited paint state while walking the SVG tree.
@@ -179,6 +196,10 @@ struct RawPattern {
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    /// `patternTransform` (matrix/translate/scale/rotate/skew), in user space —
+    /// applied to the tile lattice so tiles can be rotated/skewed, not just
+    /// axis-aligned. `None` ⇔ identity.
+    transform: Option<Mat>,
     children: Vec<Node>,
 }
 
@@ -661,13 +682,16 @@ fn push(
     let segs: Vec<Seg> = segs.iter().map(|s| transform_seg(s, &ctm)).collect();
 
     // A `fill="url(#id)"` may reference a `<pattern>`: tile its child content
-    // across this shape's bounding box (clipped to the bbox), then optionally
-    // stroke the shape outline. Falls back to the inherited solid fill if the
-    // pattern can't be resolved (empty / cyclic / zero tile).
+    // across this shape, clipped to the shape's actual outline (the contour,
+    // even-odd), then optionally stroke the outline. Falls back to the inherited
+    // solid fill if the pattern can't be resolved (empty / cyclic / zero tile).
+    // `depth` breaks pattern cycles (a pattern that, directly or via nesting,
+    // references itself).
     if let Some(id) = fill_url {
-        if pats.contains_key(id) {
+        if pats.contains_key(id) && depth < MAX_PATTERN_DEPTH {
             let bbox = segs_bbox(&segs);
-            let tiled = resolve_pattern(id, pats, ids, grads, bbox, &ctm, depth);
+            let shape = shape_outline(&segs);
+            let tiled = resolve_pattern(id, pats, ids, grads, &shape, bbox, &ctm, depth);
             if let Some(tiles) = tiled {
                 out.extend(tiles);
                 if let Some(stroke) = paint.stroke {
@@ -1146,6 +1170,7 @@ fn parse_raw_pattern(e: &Element) -> RawPattern {
         y: e.attr("y").and_then(parse_grad_coord),
         width: e.attr("width").and_then(parse_grad_coord),
         height: e.attr("height").and_then(parse_grad_coord),
+        transform: e.attr("patterntransform").map(parse_transform),
         children: e.children.clone(),
     }
 }
@@ -1163,6 +1188,7 @@ fn resolve_pattern(
     pats: &Pats,
     ids: &std::collections::HashMap<&str, &Node>,
     grads: &Grads,
+    shape: &[Vec<(f64, f64)>],
     bbox: [f64; 4],
     ctm: &Mat,
     depth: u8,
@@ -1180,6 +1206,7 @@ fn resolve_pattern(
                 pat.width = pat.width.or(parent.width);
                 pat.height = pat.height.or(parent.height);
                 pat.view_box = pat.view_box.or(parent.view_box);
+                pat.transform = pat.transform.or(parent.transform);
             }
         }
     }
@@ -1192,12 +1219,10 @@ fn resolve_pattern(
     if bw <= 0.0 || bh <= 0.0 {
         return None;
     }
-    // The CTM's mean scale maps userSpaceOnUse lengths into output space. Pattern
-    // grids that involve rotation/skew in the CTM are tiled axis-aligned in output
-    // space (a documented simplification — see the module limitations).
+    // The CTM's mean scale maps userSpaceOnUse lengths into output space.
     let s = ctm.scale_hint();
 
-    // Tile size + origin, both in output space.
+    // Tile size + origin in output space (before any patternTransform).
     let (tw, th, ox, oy) = if pat.pattern_units_obb {
         (
             pat.width.unwrap_or(0.0) * bw,
@@ -1218,51 +1243,80 @@ fn resolve_pattern(
         return None;
     }
 
-    // Cap the grid so a tiny tile over a huge bbox can't explode the primitive
-    // count; the visible difference past a few thousand cells is nil.
+    // `patternTransform` acts on the pattern's user space; conjugate it into output
+    // space (`pto = ctm ∘ PT ∘ ctm⁻¹`) so it composes with the already-output-space
+    // tile lattice. Tiles then rotate/skew with `PT` instead of staying axis-aligned.
+    let pto = match pat.transform {
+        Some(pt) => match ctm.inverse() {
+            Some(inv) => ctm.then(&pt).then(&inv),
+            None => Mat::identity(),
+        },
+        None => Mat::identity(),
+    };
+
+    // Which integer cells (i, j) of the un-transformed lattice can cover the bbox?
+    // Map the four bbox corners back through `pto` into lattice space, then read off
+    // the (col, row) index span. Without `pto` this reduces to the old AABB walk.
+    let pto_inv = pto.inverse().unwrap_or_else(Mat::identity);
+    let corners = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)];
+    let (mut lo_c, mut hi_c, mut lo_r, mut hi_r) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (cx, cy) in corners {
+        let (lx, ly) = pto_inv.apply(cx, cy);
+        let c = (lx - ox) / tw;
+        let r = (ly - oy) / th;
+        lo_c = lo_c.min(c);
+        hi_c = hi_c.max(c);
+        lo_r = lo_r.min(r);
+        hi_r = hi_r.max(r);
+    }
+    let start_col = lo_c.floor() as i64 - 1;
+    let end_col = hi_c.ceil() as i64 + 1;
+    let start_row = lo_r.floor() as i64 - 1;
+    let end_row = hi_r.ceil() as i64 + 1;
+
+    // Cap the grid so a tiny tile over a huge bbox can't explode the primitive count.
     const MAX_CELLS: usize = 20_000;
-    let nx = (bw / tw).ceil() as i64 + 1;
-    let ny = (bh / th).ceil() as i64 + 1;
-    if nx <= 0 || ny <= 0 || (nx as usize).saturating_mul(ny as usize) > MAX_CELLS {
+    let ncols = (end_col - start_col + 1).max(0) as usize;
+    let nrows = (end_row - start_row + 1).max(0) as usize;
+    if ncols == 0 || nrows == 0 || ncols.saturating_mul(nrows) > MAX_CELLS {
         return None;
     }
 
     // Build the un-positioned tile content once (output-space, single tile at the
     // grid origin). The tile cell is `[ox, oy] … [ox+tw, oy+th]`.
-    let content = build_tile_content(&pat, tw, th, s, ox, oy, ids, grads, depth);
+    let content = build_tile_content(&pat, tw, th, s, ox, oy, ids, grads, pats, depth);
     if content.is_empty() {
         return None;
     }
 
-    // Lay the cell out across the bbox, snapping the first cell so the bbox start
-    // is covered, and clip every emitted primitive to (cell ∩ bbox).
-    let start_col = ((minx - ox) / tw).floor() as i64;
-    let start_row = ((miny - oy) / th).floor() as i64;
+    // Lay each cell out, transform its content by `pto ∘ translate(dx, dy)`, then
+    // clip to the shape's actual outline (the contour, even-odd) ∩ the transformed
+    // cell quad. Falling back to the bbox keeps a degenerate/empty outline working.
     let mut tiles: Vec<Prim> = Vec::new();
-    for row in 0..ny {
-        let cell_oy = oy + (start_row + row) as f64 * th;
-        if cell_oy >= maxy || cell_oy + th <= miny {
-            continue;
-        }
-        for col in 0..nx {
-            let cell_ox = ox + (start_col + col) as f64 * tw;
-            if cell_ox >= maxx || cell_ox + tw <= minx {
-                continue;
-            }
-            // Clip rectangle = this cell ∩ the shape bbox.
-            let clip = [
-                cell_ox.max(minx),
-                cell_oy.max(miny),
-                (cell_ox + tw).min(maxx),
-                (cell_oy + th).min(maxy),
+    for row in start_row..=end_row {
+        for col in start_col..=end_col {
+            let cell_dx = col as f64 * tw;
+            let cell_dy = row as f64 * th;
+            // The transformed cell quad (for an inexpensive bbox reject + a convex
+            // pre-clip window).
+            let quad = [
+                pto.apply(ox + cell_dx, oy + cell_dy),
+                pto.apply(ox + cell_dx + tw, oy + cell_dy),
+                pto.apply(ox + cell_dx + tw, oy + cell_dy + th),
+                pto.apply(ox + cell_dx, oy + cell_dy + th),
             ];
-            if clip[2] - clip[0] <= 1e-6 || clip[3] - clip[1] <= 1e-6 {
-                continue;
+            let qb = poly_bbox(&quad);
+            if qb[2] < minx || qb[0] > maxx || qb[3] < miny || qb[1] > maxy {
+                continue; // cell entirely outside the shape bbox
             }
-            let dx = cell_ox - ox;
-            let dy = cell_oy - oy;
+            let place = pto.then(&Mat::translate(cell_dx, cell_dy));
             for tc in &content {
-                if let Some(clipped) = clip_prim_to_rect(tc, dx, dy, clip) {
+                if let Some(clipped) = clip_prim_to_shape(tc, &place, &quad, shape, bbox) {
                     tiles.push(clipped);
                 }
             }
@@ -1288,6 +1342,7 @@ fn build_tile_content(
     oy: f64,
     ids: &std::collections::HashMap<&str, &Node>,
     grads: &Grads,
+    pats: &Pats,
     depth: u8,
 ) -> Vec<Prim> {
     // Content transform: map a child's local coords into output space at the tile
@@ -1328,7 +1383,9 @@ fn build_tile_content(
     };
 
     // The pattern's children inherit only their own paint (SVG: pattern content
-    // does not inherit from the referencing element), starting from initial.
+    // does not inherit from the referencing element), starting from initial. The
+    // full pattern registry is threaded so a child `fill="url(#inner)"` resolves
+    // (nested patterns); the `depth` guard (in `push`) breaks pattern cycles.
     let mut content = Vec::new();
     walk(
         &pat.children,
@@ -1336,35 +1393,99 @@ fn build_tile_content(
         Paint::root(),
         ids,
         grads,
-        &Pats::new(), // nested <pattern> inside a pattern is not resolved (deferred)
+        pats,
         &mut content,
         depth.saturating_add(1),
     );
     content
 }
 
-/// Clip a tile primitive (translated by `dx,dy`) to the axis-aligned rectangle
-/// `clip = [x0, y0, x1, y1]` (output space). Cubics are flattened to polylines
-/// and clipped with Sutherland–Hodgman; returns `None` if nothing survives.
-fn clip_prim_to_rect(p: &Prim, dx: f64, dy: f64, clip: [f64; 4]) -> Option<Prim> {
+/// Maximum nesting depth for pattern resolution (a pattern whose content
+/// references another pattern, etc.). Also the cycle guard for self-reference.
+const MAX_PATTERN_DEPTH: u8 = 6;
+
+/// Flatten a shape's transformed segments into one polygon per subpath (output
+/// space). These polygons are the shape's true outline, used to clip pattern
+/// tiles to the contour (even-odd) rather than just the bounding box.
+fn shape_outline(segs: &[Seg]) -> Vec<Vec<(f64, f64)>> {
+    split_subpaths(segs)
+        .iter()
+        .map(|sub| flatten_subpath(sub, 0.0, 0.0))
+        .filter(|poly| poly.len() >= 3)
+        .collect()
+}
+
+/// Axis-aligned bbox `[min_x, min_y, max_x, max_y]` of a point list.
+fn poly_bbox(poly: &[(f64, f64)]) -> [f64; 4] {
+    let (mut nx, mut ny, mut xx, mut xy) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in poly {
+        nx = nx.min(x);
+        ny = ny.min(y);
+        xx = xx.max(x);
+        xy = xy.max(y);
+    }
+    if nx > xx {
+        [0.0, 0.0, 0.0, 0.0]
+    } else {
+        [nx, ny, xx, xy]
+    }
+}
+
+/// Clip a tile primitive to (the transformed cell quad) ∩ (the shape contour).
+/// Each tile subpath is flattened, placed via `place`, clipped to the convex
+/// `quad` (Sutherland–Hodgman), then intersected with the shape outline via
+/// [`clip_tile_to_shape`]. Empty `shape` falls back to the `bbox` rectangle so a
+/// degenerate outline still tiles. Returns `None` if nothing survives.
+fn clip_prim_to_shape(
+    p: &Prim,
+    place: &Mat,
+    quad: &[(f64, f64); 4],
+    shape: &[Vec<(f64, f64)>],
+    bbox: [f64; 4],
+) -> Option<Prim> {
     let mut out_segs: Vec<Seg> = Vec::new();
     let mut any = false;
     for sub in split_subpaths(&p.segs) {
-        // Flatten this subpath to a polygon in output space (with the cell offset).
-        let poly: Vec<(f64, f64)> = flatten_subpath(&sub, dx, dy);
-        if poly.len() < 2 {
+        // Flatten this subpath (local, at the grid origin) and place it.
+        let mut poly: Vec<(f64, f64)> = flatten_subpath(&sub, 0.0, 0.0)
+            .into_iter()
+            .map(|(x, y)| place.apply(x, y))
+            .collect();
+        if poly.len() < 3 {
             continue;
         }
-        let clipped = clip_polygon(&poly, clip);
-        if clipped.len() < 2 {
+        // Clip to the (convex) transformed cell quad so a single tile never bleeds
+        // into its neighbours.
+        poly = clip_polygon_convex(&poly, quad);
+        if poly.len() < 3 {
             continue;
         }
-        out_segs.push(Seg::Move(clipped[0].0, clipped[0].1));
-        for pt in &clipped[1..] {
-            out_segs.push(Seg::Line(pt.0, pt.1));
+        // Then intersect with the shape's actual contour.
+        let pieces = if shape.is_empty() {
+            let [x0, y0, x1, y1] = bbox;
+            vec![clip_polygon(&poly, [x0, y0, x1, y1])]
+                .into_iter()
+                .filter(|pc| pc.len() >= 3)
+                .collect::<Vec<_>>()
+        } else {
+            clip_tile_to_shape(&poly, shape, bbox)
+        };
+        for piece in pieces {
+            if piece.len() < 3 {
+                continue;
+            }
+            out_segs.push(Seg::Move(piece[0].0, piece[0].1));
+            for pt in &piece[1..] {
+                out_segs.push(Seg::Line(pt.0, pt.1));
+            }
+            out_segs.push(Seg::Close);
+            any = true;
         }
-        out_segs.push(Seg::Close);
-        any = true;
     }
     if !any {
         return None;
@@ -1377,6 +1498,137 @@ fn clip_prim_to_rect(p: &Prim, dx: f64, dy: f64, clip: [f64; 4]) -> Option<Prim>
         fill_opacity: p.fill_opacity,
         stroke_opacity: p.stroke_opacity,
     })
+}
+
+/// Sutherland–Hodgman clip of a polygon against a **convex** polygon window
+/// given as an ordered vertex list (used for the transformed cell quad, which is
+/// always convex). Returns the clipped vertices (possibly empty).
+fn clip_polygon_convex(poly: &[(f64, f64)], window: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let m = window.len();
+    if m < 3 {
+        return poly.to_vec();
+    }
+    // Orientation sign of the window (CCW vs CW) so "inside" is consistent.
+    let area2: f64 = (0..m)
+        .map(|i| {
+            let (x1, y1) = window[i];
+            let (x2, y2) = window[(i + 1) % m];
+            x1 * y2 - x2 * y1
+        })
+        .sum();
+    let ccw = area2 >= 0.0;
+    let side = |a: (f64, f64), b: (f64, f64), p: (f64, f64)| -> f64 {
+        // > 0 ⇒ left of a→b.
+        let v = (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+        if ccw {
+            v
+        } else {
+            -v
+        }
+    };
+    let intersect = |a: (f64, f64), b: (f64, f64), e0: (f64, f64), e1: (f64, f64)| -> (f64, f64) {
+        let r = (b.0 - a.0, b.1 - a.1);
+        let sgmt = (e1.0 - e0.0, e1.1 - e0.1);
+        let denom = r.0 * sgmt.1 - r.1 * sgmt.0;
+        if denom.abs() < 1e-12 {
+            return b;
+        }
+        let t = ((e0.0 - a.0) * sgmt.1 - (e0.1 - a.1) * sgmt.0) / denom;
+        (a.0 + t * r.0, a.1 + t * r.1)
+    };
+    let mut out = poly.to_vec();
+    for i in 0..m {
+        if out.len() < 3 {
+            return Vec::new();
+        }
+        let e0 = window[i];
+        let e1 = window[(i + 1) % m];
+        let input = std::mem::take(&mut out);
+        let n = input.len();
+        for k in 0..n {
+            let cur = input[k];
+            let prev = input[(k + n - 1) % n];
+            let cur_in = side(e0, e1, cur) >= -1e-9;
+            let prev_in = side(e0, e1, prev) >= -1e-9;
+            if cur_in {
+                if !prev_in {
+                    out.push(intersect(prev, cur, e0, e1));
+                }
+                out.push(cur);
+            } else if prev_in {
+                out.push(intersect(prev, cur, e0, e1));
+            }
+        }
+    }
+    out
+}
+
+/// Clip one (already cell-quad-clipped) tile subpath `tile` to the shape's actual
+/// outline, returning the inside pieces. This is what makes a pattern fill respect
+/// a `<circle>`/`<ellipse>`/`<path>`/`<polygon>` *contour* instead of just its
+/// bounding box.
+///
+/// The tile is convex in the overwhelming majority of cases (a pattern's child
+/// shapes are convex, and clipping a convex polygon to the convex cell quad keeps
+/// it convex). When it is convex we clip **each shape contour against the tile**
+/// (a convex window) with Sutherland–Hodgman — exact for an arbitrary (incl.
+/// concave) shape contour, so `tile ∩ shape` is computed correctly with no leakage
+/// into concave notches. A rare concave tile (e.g. a star glyph in the pattern)
+/// falls back to the bbox-rectangle clip (no worse than before contour clipping).
+fn clip_tile_to_shape(
+    tile: &[(f64, f64)],
+    shape: &[Vec<(f64, f64)>],
+    bbox: [f64; 4],
+) -> Vec<Vec<(f64, f64)>> {
+    if tile.len() < 3 {
+        return Vec::new();
+    }
+    if !is_convex(tile) {
+        // Concave tile content: keep the simple bbox clip (correctness-preserving
+        // fallback; contour-accurate clipping of a concave tile is not attempted).
+        let [x0, y0, x1, y1] = bbox;
+        let pc = clip_polygon(tile, [x0, y0, x1, y1]);
+        return if pc.len() >= 3 { vec![pc] } else { Vec::new() };
+    }
+    // Convex tile ⇒ clip every shape contour against it. Each result is the part of
+    // that contour's interior lying inside the tile; their union is `tile ∩ shape`.
+    let mut pieces: Vec<Vec<(f64, f64)>> = Vec::new();
+    for contour in shape {
+        if contour.len() < 3 {
+            continue;
+        }
+        let pc = clip_polygon_convex(contour, tile);
+        if pc.len() >= 3 {
+            pieces.push(pc);
+        }
+    }
+    pieces
+}
+
+/// Is the polygon convex? (All cross-products of consecutive edges share a sign,
+/// allowing near-collinear zeros.) Picks the exact convex-window clip path.
+fn is_convex(poly: &[(f64, f64)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut sign = 0i8;
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        let c = poly[(i + 2) % n];
+        let cross = (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0);
+        if cross.abs() < 1e-9 {
+            continue; // collinear vertex — ignore
+        }
+        let s = if cross > 0.0 { 1 } else { -1 };
+        if sign == 0 {
+            sign = s;
+        } else if s != sign {
+            return false;
+        }
+    }
+    true
 }
 
 /// Split a segment list into subpaths (each starting at a `Move`).
@@ -2063,5 +2315,185 @@ mod tests {
             img.prims[0].fill.is_some() && img.prims[0].stroke.is_some(),
             "fallback keeps inherited fill and the stroke"
         );
+    }
+
+    #[test]
+    fn pattern_clips_to_circle_contour_not_bbox() {
+        // A circle (r=20 at 50,50) filled with a fine 4×4 userSpaceOnUse pattern.
+        // Tiles must be clipped to the CIRCLE, never leaking into the bbox corners
+        // (e.g. near (30,30) — inside the bbox but outside the disc).
+        let svg = r##"<svg viewBox="0 0 100 100"><defs>
+            <pattern id="p" patternUnits="userSpaceOnUse" width="4" height="4">
+                <rect x="0" y="0" width="4" height="4" fill="#00aa00"/>
+            </pattern></defs>
+            <circle cx="50" cy="50" r="20" fill="url(#p)"/></svg>"##;
+        let img = parse_svg(svg).expect("pattern-filled circle parses");
+        assert!(img.prims.len() > 1, "the circle tiles into many cells");
+        // Every emitted tile vertex must lie inside the disc (a small tolerance
+        // covers the polyline flattening of the circle outline).
+        let r = 20.0_f64;
+        let tol = 0.75_f64; // outline is flattened; allow a sub-pixel slack
+        let mut max_d = 0.0_f64;
+        for p in &img.prims {
+            for s in &p.segs {
+                if let Seg::Move(x, y) | Seg::Line(x, y) = s {
+                    let d = ((x - 50.0).powi(2) + (y - 50.0).powi(2)).sqrt();
+                    max_d = max_d.max(d);
+                    assert!(
+                        d <= r + tol,
+                        "tile vertex ({x:.2},{y:.2}) leaks outside the circle (d={d:.3} > {})",
+                        r + tol
+                    );
+                }
+            }
+        }
+        // Sanity: tiling actually reaches close to the rim (not a tiny blob).
+        assert!(
+            max_d > r * 0.7,
+            "tiles cover most of the disc (max_d={max_d:.2})"
+        );
+        // A bbox-only clip would have placed vertices out at the corners (~(30,30)
+        // → d≈28). The contour clip keeps everything within ~20.
+        assert!(
+            max_d < r + tol,
+            "no vertex sits in a bbox corner outside the disc (max_d={max_d:.2})"
+        );
+    }
+
+    #[test]
+    fn pattern_transform_rotates_the_tile_grid() {
+        // `patternTransform="rotate(30)"` rotates the tile lattice: emitted tile
+        // edges are no longer all axis-aligned. The un-transformed control (below)
+        // produces only axis-aligned edges.
+        let rotated = r##"<svg viewBox="0 0 60 60"><defs>
+            <pattern id="p" patternUnits="userSpaceOnUse" width="10" height="10"
+                     patternTransform="rotate(30)">
+                <rect x="0" y="0" width="10" height="10" fill="#3366cc"/>
+            </pattern></defs>
+            <rect x="0" y="0" width="60" height="60" fill="url(#p)"/></svg>"##;
+        let img = parse_svg(rotated).expect("patternTransform pattern parses");
+        assert!(img.prims.len() > 1, "rotated pattern still tiles");
+        assert!(
+            has_oblique_edge(&img),
+            "rotate(30) yields oblique (non-axis-aligned) tile edges"
+        );
+
+        // Control: identical pattern WITHOUT patternTransform → axis-aligned only.
+        let upright = r##"<svg viewBox="0 0 60 60"><defs>
+            <pattern id="p" patternUnits="userSpaceOnUse" width="10" height="10">
+                <rect x="0" y="0" width="10" height="10" fill="#3366cc"/>
+            </pattern></defs>
+            <rect x="0" y="0" width="60" height="60" fill="url(#p)"/></svg>"##;
+        let up = parse_svg(upright).expect("upright pattern parses");
+        assert!(
+            !has_oblique_edge(&up),
+            "an un-transformed grid of axis-aligned rects has only axis-aligned edges"
+        );
+    }
+
+    #[test]
+    fn nested_pattern_inside_pattern_tiles() {
+        // The OUTER pattern's tile child is itself filled by url(#inner): the inner
+        // pattern must resolve and paint, so the inner colour appears in the output.
+        let svg = r##"<svg viewBox="0 0 40 40"><defs>
+            <pattern id="inner" patternUnits="userSpaceOnUse" width="5" height="5">
+                <rect x="0" y="0" width="5" height="5" fill="#ff0000"/>
+            </pattern>
+            <pattern id="outer" patternUnits="userSpaceOnUse" width="20" height="20">
+                <rect x="0" y="0" width="20" height="20" fill="url(#inner)"/>
+            </pattern></defs>
+            <rect x="0" y="0" width="40" height="40" fill="url(#outer)"/></svg>"##;
+        let img = parse_svg(svg).expect("nested pattern parses");
+        assert!(img.prims.len() > 1, "nested pattern tiles");
+        // The inner pattern's red must have been resolved (not a flat fallback).
+        let has_red = img
+            .prims
+            .iter()
+            .any(|p| matches!(p.fill, Some(Fill::Solid(c)) if c == [1.0, 0.0, 0.0]));
+        assert!(
+            has_red,
+            "the inner pattern resolves and paints red tiles inside the outer tiles"
+        );
+        // Every tile is the inner red (the outer tile has no other paint).
+        for p in &img.prims {
+            if let Some(Fill::Solid(c)) = p.fill {
+                assert_eq!(c, [1.0, 0.0, 0.0], "every nested tile is the inner red");
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_self_reference_is_bounded() {
+        // A pattern whose tile references ITSELF must not recurse forever; the
+        // depth guard breaks the cycle and the parse terminates (with a fallback).
+        let svg = r##"<svg viewBox="0 0 30 30"><defs>
+            <pattern id="p" patternUnits="userSpaceOnUse" width="10" height="10">
+                <rect x="0" y="0" width="10" height="10" fill="url(#p)"/>
+            </pattern></defs>
+            <rect x="0" y="0" width="30" height="30" fill="url(#p)" stroke="#000"/></svg>"##;
+        // The assertion is simply that this returns (no stack overflow / hang).
+        let _ = parse_svg(svg);
+    }
+
+    #[test]
+    fn tile_gradient_keeps_per_stop_alpha() {
+        // A pattern tile filled by a gradient with a semi-transparent stop: the
+        // tiled primitives must carry that per-stop alpha (alpha < 1) on the
+        // gradient fill, so the renderer makes the tile semi-transparent rather
+        // than treating it as opaque.
+        let svg = r##"<svg viewBox="0 0 40 20"><defs>
+            <linearGradient id="g">
+                <stop offset="0" stop-color="#ff0000" stop-opacity="1"/>
+                <stop offset="1" stop-color="#0000ff" stop-opacity="0.3"/>
+            </linearGradient>
+            <pattern id="p" patternUnits="userSpaceOnUse" width="20" height="20">
+                <rect x="0" y="0" width="20" height="20" fill="url(#g)"/>
+            </pattern></defs>
+            <rect x="0" y="0" width="40" height="20" fill="url(#p)"/></svg>"##;
+        let img = parse_svg(svg).expect("gradient-in-pattern parses");
+        assert!(img.prims.len() > 1, "the gradient pattern tiles");
+        // At least one tile carries a gradient fill whose stops include alpha<1.
+        let semi = img.prims.iter().any(|p| match &p.fill {
+            Some(Fill::Gradient(g)) => g.stops.iter().any(|s| s.alpha < 0.999),
+            _ => false,
+        });
+        assert!(
+            semi,
+            "tiled gradient preserves the 0.3 stop alpha (per-stop, not flattened away)"
+        );
+        // And the fully-opaque stop is preserved too (not clamped to the min).
+        let has_opaque_stop = img.prims.iter().any(|p| match &p.fill {
+            Some(Fill::Gradient(g)) => g.stops.iter().any(|s| s.alpha > 0.999),
+            _ => false,
+        });
+        assert!(has_opaque_stop, "the opaque stop is also preserved");
+    }
+
+    /// True if any primitive has a segment edge that is neither horizontal nor
+    /// vertical (i.e. the tile grid is rotated/skewed).
+    fn has_oblique_edge(img: &SvgImage) -> bool {
+        for p in &img.prims {
+            let mut prev: Option<(f64, f64)> = None;
+            for s in &p.segs {
+                let pt = match s {
+                    Seg::Move(x, y) | Seg::Line(x, y) => Some((*x, *y)),
+                    _ => None,
+                };
+                if let (Some(a), Some(b)) = (prev, pt) {
+                    let dx = (b.0 - a.0).abs();
+                    let dy = (b.1 - a.1).abs();
+                    if dx > 1e-3 && dy > 1e-3 {
+                        return true;
+                    }
+                }
+                if let Some(q) = pt {
+                    prev = Some(q);
+                }
+                if matches!(s, Seg::Move(..)) {
+                    prev = pt;
+                }
+            }
+        }
+        false
     }
 }
