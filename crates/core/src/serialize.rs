@@ -87,6 +87,12 @@ pub fn to_pdf(objects: &BTreeMap<ObjectId, Object>, trailer: &Dictionary) -> Vec
     if let Some(info) = trailer.get(b"Info") {
         trailer_out.set(b"Info".to_vec(), remap_refs(info, &remap));
     }
+    // The file identifier is required for PDF/A (ISO 19005-2 §6.1.3) and is a
+    // pair of byte strings, not references — preserve it verbatim. (The compact
+    // writer `to_pdf_compressed` keeps it the same way.)
+    if let Some(id) = trailer.get(b"ID") {
+        trailer_out.set(b"ID".to_vec(), remap_refs(id, &remap));
+    }
     out.extend_from_slice(b"trailer\n");
     write_object(&mut out, &Object::Dictionary(trailer_out));
     out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
