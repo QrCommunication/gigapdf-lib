@@ -421,6 +421,13 @@ pub struct Style {
     pub grid_col_span: usize,
     /// `grid-row: span N` — the item spans `N` rows (1 = no span). Not inherited.
     pub grid_row_span: usize,
+    /// `grid-template-areas` named areas declared on a grid container. Empty when
+    /// none. Not inherited.
+    pub grid_template_areas: Vec<GridAreaRect>,
+    /// `grid-area: <name>` on a grid item — resolved against the parent's
+    /// `grid_template_areas` at placement time. `None` for the numeric/default
+    /// placement. Not inherited.
+    pub grid_area_name: Option<String>,
     // ── decorations / visibility (inherited) ──
     /// `text-decoration: line-through` — struck-through text.
     pub strike: bool,
@@ -682,6 +689,8 @@ impl Default for Style {
             grid_template_rows: Vec::new(),
             grid_col_span: 1,
             grid_row_span: 1,
+            grid_template_areas: Vec::new(),
+            grid_area_name: None,
             strike: false,
             overline: false,
             hidden: false,
@@ -750,6 +759,18 @@ pub enum TrackSize {
     /// `minmax(min, max)` — clamp the resolved size between two track sizings.
     /// Boxed to keep the enum small (recursive variant).
     MinMax(Box<TrackSize>, Box<TrackSize>),
+}
+
+/// One named area from `grid-template-areas`: the bounding rectangle (0-based
+/// row/column origin + spans) of all cells carrying that name. A child with
+/// `grid-area: <name>` is placed into this rectangle.
+#[derive(Debug, Clone)]
+pub struct GridAreaRect {
+    pub name: String,
+    pub row: usize,
+    pub col: usize,
+    pub row_span: usize,
+    pub col_span: usize,
 }
 
 // ─── selectors ──────────────────────────────────────────────────────────────
@@ -1639,6 +1660,9 @@ fn inherit(parent: &Style) -> Style {
         grid_template_rows: Vec::new(),
         grid_col_span: 1,
         grid_row_span: 1,
+        // `grid-template-areas` / `grid-area` are not inherited (per-element).
+        grid_template_areas: Vec::new(),
+        grid_area_name: None,
         // Inherited:
         strike: parent.strike,
         overline: parent.overline,
@@ -1722,6 +1746,44 @@ fn parse_track_list(v: &str, em: f64) -> Vec<TrackSize> {
             }
         }
         out.push(parse_track_size(&tok, em));
+    }
+    out
+}
+
+/// Parse `grid-template-areas: "a a b" "a a c" …` into the bounding rectangle of
+/// each named area (CSS requires areas to be rectangular; we take the min/max
+/// row+col of each name's cells). `.` marks an empty cell and is skipped.
+fn parse_grid_template_areas(v: &str) -> Vec<GridAreaRect> {
+    // Each quoted string is one row of area-name tokens. CSS allows single OR
+    // double quotes; normalise to one delimiter before splitting.
+    let normalised = v.replace('\'', "\"");
+    let rows: Vec<Vec<&str>> = normalised
+        .split('"')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1) // odd segments are inside quotes
+        .map(|(_, s)| s.split_whitespace().collect::<Vec<_>>())
+        .filter(|r: &Vec<&str>| !r.is_empty())
+        .collect();
+    let mut out: Vec<GridAreaRect> = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, name) in row.iter().enumerate() {
+            if *name == "." {
+                continue;
+            }
+            if let Some(a) = out.iter_mut().find(|a| a.name == *name) {
+                // Rows/cols are scanned in increasing order, so grow the span.
+                a.row_span = (r + 1 - a.row).max(a.row_span);
+                a.col_span = (c + 1 - a.col).max(a.col_span);
+            } else {
+                out.push(GridAreaRect {
+                    name: name.to_string(),
+                    row: r,
+                    col: c,
+                    row_span: 1,
+                    col_span: 1,
+                });
+            }
+        }
     }
     out
 }
@@ -2504,6 +2566,9 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             style.grid_rows = tracks.len();
             style.grid_template_rows = tracks;
         }
+        "grid-template-areas" => {
+            style.grid_template_areas = parse_grid_template_areas(v);
+        }
         "gap" | "grid-gap" => {
             // `gap: <row> [col]` — one value sets both, two split row/col.
             let parts: Vec<f64> = v
@@ -2563,6 +2628,21 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             style.grid_row_span = span;
         }
         "grid-area" => {
+            // A single identifier names a `grid-template-areas` area (resolved at
+            // placement against the parent grid); otherwise it is the numeric line
+            // form below.
+            let t = v.trim();
+            let is_name = !t.contains('/')
+                && !t.eq_ignore_ascii_case("auto")
+                && !t.starts_with("span")
+                && t.parse::<usize>().is_err()
+                && t.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            if is_name {
+                style.grid_area_name = Some(t.to_string());
+                return;
+            }
             // `grid-area: <row-start> / <col-start> [/ <row-end> / <col-end>]`.
             // Resolve start lines from the first two components, and a span from
             // an end component when it is a `span N` or a numeric end line.

@@ -2957,7 +2957,15 @@ impl Flow<'_> {
             return y + style.margin.bottom;
         }
 
-        let cols = style.grid_columns.max(1);
+        // Column count: the track list, widened to fit any `grid-template-areas`
+        // (so areas declared without explicit columns still get enough columns).
+        let area_cols = style
+            .grid_template_areas
+            .iter()
+            .map(|a| a.col + a.col_span)
+            .max()
+            .unwrap_or(0);
+        let cols = style.grid_columns.max(area_cols).max(1);
         let content_x = x + m.left + b.left + p.left;
         let content_w = (avail_w - m.left - m.right - b.left - b.right - p.left - p.right).max(1.0);
         let y_cursor = y + b.top + p.top;
@@ -3185,7 +3193,16 @@ impl Flow<'_> {
         let mut out = Vec::with_capacity(items.len());
 
         for (i, it) in items.iter().enumerate() {
-            let istyle = self.style_of(it, style, na);
+            let mut istyle = self.style_of(it, style, na);
+            // `grid-area: <name>` → place into the parent's named template area.
+            if let Some(name) = istyle.grid_area_name.clone() {
+                if let Some(a) = style.grid_template_areas.iter().find(|a| a.name == name) {
+                    istyle.grid_col_start = a.col + 1; // template areas are 0-based
+                    istyle.grid_row_start = a.row + 1;
+                    istyle.grid_col_span = a.col_span;
+                    istyle.grid_row_span = a.row_span;
+                }
+            }
             // Column span clamped so the cell never runs past the last column.
             let col_span = istyle.grid_col_span.max(1).min(cols);
             let row_span = istyle.grid_row_span.max(1);
@@ -5116,6 +5133,34 @@ mod tests {
             "grid-row:2 places 'Late' below 'Early' (early={early:?}, late={late:?})"
         );
         assert!((late.0 - early.0).abs() < 1.0, "both in column 1 (same x)");
+    }
+
+    #[test]
+    fn grid_template_areas_place_items_by_name() {
+        // Areas "a a b" / "a a c": `a` is the left 2×2 block, `b` top-right,
+        // `c` bottom-right. Items are listed out of order to prove name-placement.
+        let layout = run(
+            "<div style=\"display:grid;grid-template-columns:1fr 1fr 1fr;\
+                         grid-template-areas:'a a b' 'a a c'\">\
+               <div style=\"grid-area:b\">B</div>\
+               <div style=\"grid-area:a\">A</div>\
+               <div style=\"grid-area:c\">C</div>\
+             </div>",
+        );
+        let t = text_xy(&layout);
+        let a = t.iter().find(|(_, _, s)| s == "A").unwrap();
+        let b = t.iter().find(|(_, _, s)| s == "B").unwrap();
+        let c = t.iter().find(|(_, _, s)| s == "C").unwrap();
+        // `b`/`c` sit in the right column → right of `a`'s left column.
+        assert!(
+            b.0 > a.0,
+            "B (area b) right of A (area a) (a={a:?}, b={b:?})"
+        );
+        assert!(c.0 > a.0, "C (area c) right of A (a={a:?}, c={c:?})");
+        assert!((b.0 - c.0).abs() < 1.0, "B and C share the right column");
+        // `c` is one row below `b`; `a` starts on the top row with `b`.
+        assert!(c.1 > b.1, "C (row 2) below B (row 1) (b={b:?}, c={c:?})");
+        assert!((a.1 - b.1).abs() < 1.0, "A and B start on the top row");
     }
 
     // ── clear (CSS clear: left | right | both) ──

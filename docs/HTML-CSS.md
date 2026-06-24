@@ -228,10 +228,12 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `grid-template-columns` | track list — `px`, `%`, `fr`, `auto`, `minmax()`, `repeat(N, …)` | fully resolved to real column widths |
 | `grid-template-rows` | track list — `pt`, `%`, `fr`, `auto`, `minmax()` | `pt` fixed; `auto` sizes to the tallest cell; `%` and `fr` resolve against the grid's **definite `height`** (`%` = that fraction, `fr` shares the leftover) — with no definite height they fall back to content, the correct auto-height behaviour |
 | `grid-column` / `grid-row` (+ `-start` / `-end`) | `N`, `N / M`, `span N` | numeric line placement and spanning |
+| `grid-template-areas` | quoted rows of area names (`"a a b" "a a c"`, `'…'` too; `.` = empty cell) | each name's cells form its rectangle; the column count widens to fit the areas |
+| `grid-area` | `<name>` or `<row> / <col> / <row-end> / <col-end>` | a name places the item into the matching `grid-template-areas` rectangle; the numeric line form sets start lines + spans |
 | `gap` / `row-gap` / `column-gap` / `grid-gap` | length | gutters |
 
-> Named areas (`grid-template-areas`, `grid-area: name`) and named grid lines
-> are **not** parsed — use numeric line placement.
+> Named grid **lines** (`[col-start] 1fr …`, `grid-column: col-start`) are **not**
+> parsed — use numeric line placement or named **areas**.
 
 ### Multi-column
 
@@ -428,8 +430,9 @@ following are out of scope; unknown properties and elements never error — they
 simply skipped — so a richer stylesheet degrades gracefully to the supported
 subset.
 
-- **Layout/sizing**: a true scroll model for `position: sticky`.
-  `grid-template-areas` / named grid lines (use numeric placement).
+- **Layout/sizing**: a true scroll model for `position: sticky`. Named grid
+  **lines** (use numeric placement or named **areas** — `grid-template-areas`
+  **is** supported, see [grid](#grid)).
 - **Visual effects**: `transform`, `filter`, true Gaussian blur,
   `background-image: url()` raster (use `<img>`), CSS tiling patterns. (Gradients,
   rounded corners, offset/spread/**inset** box-shadows, and **`text-shadow`**
