@@ -9194,6 +9194,19 @@ impl Document {
         self.append_page_content(page_no, ops.as_bytes())
     }
 
+    /// Append a rounded/freeform clip: `q\n<path>\nW n\n` from SVG path data `d`
+    /// (anchored at `(ox, oy)`, Y flipped). Pair with [`Self::restore_graphics`].
+    /// Lets the HTML paint layer clip `overflow: hidden` content to a rounded box.
+    /// Falls back to no clip (a bare `q`) when the path is empty, so the balancing
+    /// `Q` still matches.
+    pub fn push_clip_svg_path(&mut self, page_no: u32, d: &str, ox: f64, oy: f64) -> Result<()> {
+        let ops = content::svg_path::svg_path_clip_ops(d, ox, oy);
+        if ops.is_empty() {
+            return self.append_page_content(page_no, b"q\n");
+        }
+        self.append_page_content(page_no, &ops)
+    }
+
     /// Append `Q` (restore graphics state) — undo a prior [`Self::push_clip_rect`].
     pub fn restore_graphics(&mut self, page_no: u32) -> Result<()> {
         self.append_page_content(page_no, b"Q\n")

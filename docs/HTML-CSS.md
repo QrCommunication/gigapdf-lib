@@ -190,7 +190,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `border` / `border-<side>` / `border-width` / `border-<side>-width` | `1px solid #ccc` | width, colour and style are read **per side** |
 | `border-color` / `border-<side>-color` | [colour](#colours) | independent per edge |
 | `border-style` / `border-<side>-style` | `solid`, `dashed`, `dotted`, `double`, `inset`, `outset`, `groove`, `ridge` | the 3-D styles shade the top/left vs bottom/right sides darker/lighter to fake depth (`groove`/`ridge` split each side into two half-width tones) |
-| `border-radius` (+ `border-<corner>-radius`) | 1–4 lengths, optional `/` for **elliptical** radii (`rx / ry`) | rounds the background fill and **uniform** borders. Caveats: child content is **not clipped** to the curve; a *per-side styled* border stays square |
+| `border-radius` (+ `border-<corner>-radius`) | 1–4 lengths, optional `/` for **elliptical** radii (`rx / ry`) | rounds the background fill and **uniform** borders; under `overflow: hidden`/`clip` child content **is** clipped to the rounded contour. Caveat: a *per-side styled* (dashed/dotted/double) border stays square |
 | `border-collapse` | `collapse`, `separate` | on a `<table>`: shared interior rules drawn once |
 
 ### Display & positioning
@@ -203,7 +203,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `position` | `static`, `relative`, `absolute`, `fixed`, `sticky` | `relative` shifts by `inset`; `absolute` is placed by `inset` against the nearest positioned ancestor; `fixed` against the page box; `sticky` is treated as `relative` (no scroll model) |
 | `top` / `right` / `bottom` / `left` | length or `%` | offsets for positioned boxes (`%` of the containing block) |
 | `z-index` | integer | paint order among positioned boxes |
-| `overflow` | `visible`, `hidden`, `clip` | `hidden`/`clip` emit a **real PDF clip** (`q … re W n … Q`): fragments fully outside the padding box are dropped, those straddling an edge are pixel-clipped to it (text, images, backgrounds, gradients — text runs carry their advance width). Nested clipping boxes intersect |
+| `overflow` | `visible`, `hidden`, `clip` | `hidden`/`clip` emit a **real PDF clip** (`q … W n … Q`): fragments fully outside the padding box are dropped, those straddling an edge are pixel-clipped to it (text, images, backgrounds, gradients — text runs carry their advance width). A **`border-radius`** box clips to the **rounded** contour (a bezier clip path). Nested clipping boxes intersect |
 | `opacity` | `0`–`1` | alpha on the element's background, borders and text (inherited) |
 | `visibility` | `visible`, `hidden` | `hidden` keeps the box's space but paints nothing |
 

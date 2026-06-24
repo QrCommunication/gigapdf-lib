@@ -110,12 +110,16 @@ pub enum Fragment {
         gradient: CssGradient,
         opacity: f64,
     },
-    /// `inner` clipped to `rect` (`[x, y, w, h]`, top-down) — the painter wraps
-    /// it in `q … re W n … Q`, so content straddling an `overflow: hidden|clip`
-    /// box edge is actually cut (ISO 32000-1 §8.5.4). Nesting (`Clipped` inside
-    /// `Clipped`) intersects the clips.
+    /// `inner` clipped to `rect` (`[x, y, w, h]`, top-down) — the painter wraps it
+    /// in `q … W n … Q`, so content straddling an `overflow: hidden|clip` box edge
+    /// is actually cut (ISO 32000-1 §8.5.4). `radius`/`radius_v` are the box's
+    /// corner radii (`[tl, tr, br, bl]`, all `0` for a plain rectangular clip): a
+    /// non-zero corner makes the painter clip to the **rounded** contour. Nesting
+    /// (`Clipped` inside `Clipped`) intersects the clips.
     Clipped {
         rect: [f64; 4],
+        radius: [f64; 4],
+        radius_v: [f64; 4],
         inner: Box<Fragment>,
     },
     /// `inner` painted under a CSS `transform`: `matrix` is the affine
@@ -421,7 +425,7 @@ impl Flow<'_> {
     /// Drop fragments at `self.out[start..]` that fall entirely outside the clip
     /// `rect` (a pragmatic `overflow: hidden|clip` — whole fragments are culled
     /// rather than pixel-clipped, since the paint layer has no clip primitive).
-    fn clip_range(&mut self, start: usize, rect: Cb) {
+    fn clip_range(&mut self, start: usize, rect: Cb, radius: [f64; 4], radius_v: [f64; 4]) {
         let rx0 = rect.x;
         let ry0 = rect.y;
         let rx1 = rect.x + rect.w;
@@ -443,6 +447,8 @@ impl Flow<'_> {
                 let inner = std::mem::replace(&mut self.out[i].frag, Fragment::placeholder());
                 self.out[i].frag = Fragment::Clipped {
                     rect: clip,
+                    radius,
+                    radius_v,
                     inner: Box::new(inner),
                 };
                 i += 1;
@@ -478,9 +484,10 @@ pub(crate) fn shift_fragment(frag: &mut Fragment, dx: f64, dy: f64) {
             *x += dx;
             *y += dy;
         }
-        Fragment::Clipped { rect, inner } => {
+        Fragment::Clipped { rect, inner, .. } => {
             // Move both the clip window and the clipped content together, so a
-            // relatively-positioned subtree keeps its clip aligned.
+            // relatively-positioned subtree keeps its clip aligned (the corner
+            // radii are size-relative, so they don't shift).
             rect[0] += dx;
             rect[1] += dy;
             shift_fragment(inner, dx, dy);
@@ -1289,7 +1296,18 @@ impl Flow<'_> {
                 w: (box_w - b.left - b.right).max(0.0),
                 h: (box_h - b.top - b.bottom).max(0.0),
             };
-            self.clip_range(children_start, clip);
+            // A rounded box clips its content to the curve. Clamp the corner radii
+            // to the clip box; all-zero ⇒ the painter keeps the rectangular clip.
+            let clampr = |r: [f64; 4]| {
+                let m = (clip.w.min(clip.h) / 2.0).max(0.0);
+                r.map(|v| v.clamp(0.0, m))
+            };
+            self.clip_range(
+                children_start,
+                clip,
+                clampr(style.border_radius),
+                clampr(style.border_radius_v),
+            );
         }
         if establishes_cb {
             self.cb = saved_cb;
@@ -4254,14 +4272,24 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                     opacity,
                 });
             }
-            Fragment::Clipped { rect, inner } => {
+            Fragment::Clipped {
+                rect,
+                radius,
+                radius_v,
+                inner,
+            } => {
                 // Like Text/Image: the clipped content keeps to one page band
                 // (assigned by its top); move the clip window and content into
                 // that page's local coordinates together.
                 let (_, fy0, _, _) = fragment_bbox(&inner);
                 let p = page_of(fy0);
                 ensure(&mut pages, p);
-                let mut moved = Fragment::Clipped { rect, inner };
+                let mut moved = Fragment::Clipped {
+                    rect,
+                    radius,
+                    radius_v,
+                    inner,
+                };
                 shift_fragment(&mut moved, 0.0, local_y(fy0, p) - fy0);
                 pages[p].push(moved);
             }

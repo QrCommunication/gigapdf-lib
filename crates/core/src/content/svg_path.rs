@@ -89,6 +89,49 @@ pub fn svg_path_ops(
     out
 }
 
+/// Translate SVG path data `d` into a PDF **clip** path: `q\n<path>\nW n\n`,
+/// anchored so the SVG origin maps to `(ox, oy)` with the Y axis flipped. The
+/// caller balances it with a later `Q` (`restore_graphics`). Empty `Vec` when the
+/// path has no drawable segment (the caller then skips the clip).
+pub fn svg_path_clip_ops(d: &str, ox: f64, oy: f64) -> Vec<u8> {
+    let segs = parse(d);
+    if !segs
+        .iter()
+        .any(|s| matches!(s, Seg::Line(..) | Seg::Cubic(..)))
+    {
+        return Vec::new();
+    }
+    let tx = |x: f64| ox + x;
+    let ty = |y: f64| oy - y;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"q\n");
+    for seg in &segs {
+        match *seg {
+            Seg::Move(x, y) => {
+                out.extend_from_slice(format!("{} {} m\n", num(tx(x)), num(ty(y))).as_bytes())
+            }
+            Seg::Line(x, y) => {
+                out.extend_from_slice(format!("{} {} l\n", num(tx(x)), num(ty(y))).as_bytes())
+            }
+            Seg::Cubic(x1, y1, x2, y2, x3, y3) => out.extend_from_slice(
+                format!(
+                    "{} {} {} {} {} {} c\n",
+                    num(tx(x1)),
+                    num(ty(y1)),
+                    num(tx(x2)),
+                    num(ty(y2)),
+                    num(tx(x3)),
+                    num(ty(y3))
+                )
+                .as_bytes(),
+            ),
+            Seg::Close => out.extend_from_slice(b"h\n"),
+        }
+    }
+    out.extend_from_slice(b"W n\n");
+    out
+}
+
 /// Tolerant SVG-path tokenizer/parser → resolved segments. Never panics on
 /// malformed input: it stops as soon as a required number can't be read.
 pub(crate) fn parse(d: &str) -> Vec<Seg> {

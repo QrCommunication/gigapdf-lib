@@ -633,14 +633,30 @@ fn paint(
             let mut real = frag;
             loop {
                 match real {
-                    Fragment::Clipped { rect, inner } => {
-                        let _ = doc.push_clip_rect(
-                            page,
-                            rect[0],
-                            page_h - rect[1] - rect[3],
-                            rect[2],
-                            rect[3],
-                        );
+                    Fragment::Clipped {
+                        rect,
+                        radius,
+                        radius_v,
+                        inner,
+                    } => {
+                        let rounded =
+                            radius.iter().any(|r| *r > 0.0) || radius_v.iter().any(|r| *r > 0.0);
+                        if rounded {
+                            // Clip to the rounded contour (same path the box fill
+                            // uses; SVG-(0,0)→(0, page_h) with Y flipped).
+                            let d = rounded_rect_path(
+                                rect[0], rect[1], rect[2], rect[3], *radius, *radius_v,
+                            );
+                            let _ = doc.push_clip_svg_path(page, &d, 0.0, page_h);
+                        } else {
+                            let _ = doc.push_clip_rect(
+                                page,
+                                rect[0],
+                                page_h - rect[1] - rect[3],
+                                rect[2],
+                                rect[3],
+                            );
+                        }
                         depth += 1;
                         real = inner;
                     }
@@ -2390,6 +2406,28 @@ mod tests {
         let none =
             page1_content(r#"<div style="width:50pt;height:30pt;background:#ff0000">x</div>"#);
         assert!(!none.contains(" cm"), "no transform ⇒ no cm\n{none}");
+    }
+
+    #[test]
+    fn rounded_overflow_hidden_clips_to_the_curve() {
+        // A rounded box with overflow:hidden + a full-bleed child clips to the
+        // curve: the clip path carries bezier `c` ops, not a plain `re W n`.
+        let rounded = page1_content(
+            r#"<div style="width:60pt;height:40pt;border-radius:12pt;overflow:hidden"><div style="width:200pt;height:200pt;background:#ff0000"></div></div>"#,
+        );
+        assert!(rounded.contains("W n"), "a clip is emitted\n{rounded}");
+        assert!(
+            rounded.contains(" c\n"),
+            "the rounded clip uses bezier curves\n{rounded}"
+        );
+        // A NON-rounded overflow:hidden box keeps the rectangular `re W n` clip.
+        let square = page1_content(
+            r#"<div style="width:60pt;height:40pt;overflow:hidden"><div style="width:200pt;height:200pt;background:#ff0000"></div></div>"#,
+        );
+        assert!(
+            square.contains("re\nW n"),
+            "square clip stays a rectangle\n{square}"
+        );
     }
 
     #[test]
