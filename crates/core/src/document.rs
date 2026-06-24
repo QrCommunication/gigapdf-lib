@@ -1181,6 +1181,44 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
+/// The relationship an **associated file** (`/AF`) bears to the document content
+/// (ISO 32000-2 §14.13 / PDF/A-3, Table 408 — the filespec `/AFRelationship`).
+/// Hybrid e-invoices (Factur-X, ZUGFeRD, Order-X) embed their XML payload with
+/// [`Alternative`](Self::Alternative).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AfRelationship {
+    /// `Source` — the file is the original source material for the document.
+    Source,
+    /// `Data` — data (e.g. a spreadsheet) used to generate the visual content.
+    Data,
+    /// `Alternative` — an alternative representation (Factur-X / ZUGFeRD invoice XML).
+    Alternative,
+    /// `Supplement` — a supplemental representation of the document content.
+    Supplement,
+    /// `Unspecified` — no defined relationship (the default).
+    #[default]
+    Unspecified,
+}
+
+impl AfRelationship {
+    /// The PDF `/AFRelationship` name for this relationship.
+    pub fn pdf_name(self) -> &'static [u8] {
+        match self {
+            AfRelationship::Source => b"Source",
+            AfRelationship::Data => b"Data",
+            AfRelationship::Alternative => b"Alternative",
+            AfRelationship::Supplement => b"Supplement",
+            AfRelationship::Unspecified => b"Unspecified",
+        }
+    }
+}
+
+/// The mutable state of the catalog's `/Names /EmbeddedFiles` tree: where the
+/// `/Names` dict lives (`Some(id)` if indirect, else inline in the catalog), the
+/// cloned `/Names` dict, and the flattened `(key, raw filespec value)` entries.
+/// Returned by `Document::embedded_files_state` for every attachment mutation.
+type EmbeddedFilesState = (Option<ObjectId>, Dictionary, Vec<(Vec<u8>, Object)>);
+
 /// One text element from [`Document::page_text_elements`]: the decoded text plus
 /// everything a host editor needs to recreate the run — its bounding box (page
 /// user space, origin bottom-left), the resolved `/BaseFont` family and
@@ -11574,6 +11612,332 @@ impl Document {
         })
     }
 
+    // ─── embedded file attachments — write (ISO 32000-1 §7.11) ───────────────
+
+    /// Collect every `(key, raw value)` pair of a name tree, **preserving the
+    /// raw value** (typically an indirect reference) so existing entries can be
+    /// rewritten without dereferencing them. The read-side
+    /// [`collect_name_tree`](Self::collect_name_tree) resolves values instead.
+    fn collect_name_tree_raw(&self, node: &Object, depth: usize, out: &mut Vec<(Vec<u8>, Object)>) {
+        if depth > 32 {
+            return;
+        }
+        let Some(dict) = self.resolve(node).as_dict() else {
+            return;
+        };
+        if let Some(names) = dict
+            .get(b"Names")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            let mut i = 0;
+            while i + 1 < names.len() {
+                if let Some(key) = self.resolve(&names[i]).as_string() {
+                    out.push((key.to_vec(), names[i + 1].clone()));
+                }
+                i += 2;
+            }
+        }
+        if let Some(kids) = dict
+            .get(b"Kids")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            for kid in kids {
+                self.collect_name_tree_raw(kid, depth + 1, out);
+            }
+        }
+    }
+
+    /// The `/Names` dict (cloned, creating an empty one if absent), where it
+    /// lives (`Some(id)` if indirect, else inline in the catalog), and the
+    /// flattened `/EmbeddedFiles` entries — the read step shared by every
+    /// attachment mutation.
+    fn embedded_files_state(&self) -> Result<EmbeddedFilesState> {
+        let catalog_id = self.catalog_id()?;
+        let catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let names_ref = catalog.get(b"Names").and_then(Object::as_reference);
+        let names_dict = match names_ref {
+            Some(id) => self
+                .objects
+                .get(&id)
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_default(),
+            None => catalog
+                .get(b"Names")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let mut entries = Vec::new();
+        if let Some(ef) = names_dict
+            .get(b"EmbeddedFiles")
+            .map(|o| self.resolve(o).clone())
+        {
+            self.collect_name_tree_raw(&ef, 0, &mut entries);
+        }
+        Ok((names_ref, names_dict, entries))
+    }
+
+    /// Write `entries` back as a single flat, key-sorted `/EmbeddedFiles` leaf in
+    /// `names_dict`, then store `names_dict` where it belongs (its indirect object
+    /// if `names_ref`, else inline in the catalog). Sibling `/Names` subtrees
+    /// (`/Dests`, `/JavaScript`, …) are preserved.
+    fn write_embedded_files(
+        &mut self,
+        names_ref: Option<ObjectId>,
+        mut names_dict: Dictionary,
+        mut entries: Vec<(Vec<u8>, Object)>,
+    ) -> Result<()> {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut arr = Vec::with_capacity(entries.len() * 2);
+        for (key, value) in entries {
+            arr.push(Object::String(key, StringKind::Literal));
+            arr.push(value);
+        }
+        let mut tree = Dictionary::new();
+        tree.set(b"Names".to_vec(), Object::Array(arr));
+        names_dict.set(b"EmbeddedFiles".to_vec(), Object::Dictionary(tree));
+        match names_ref {
+            Some(id) => {
+                self.objects.insert(id, Object::Dictionary(names_dict));
+            }
+            None => {
+                let catalog_id = self.catalog_id()?;
+                let mut catalog = self
+                    .objects
+                    .get(&catalog_id)
+                    .and_then(Object::as_dict)
+                    .cloned()
+                    .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+                catalog.set(b"Names".to_vec(), Object::Dictionary(names_dict));
+                self.objects.insert(catalog_id, Object::Dictionary(catalog));
+            }
+        }
+        Ok(())
+    }
+
+    /// Append `spec_id` to the catalog's `/AF` (associated files) array, creating
+    /// it if absent. Idempotent — a filespec already listed is not duplicated.
+    fn add_to_catalog_af(&mut self, spec_id: ObjectId) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let mut af = catalog
+            .get(b"AF")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        if !af.iter().any(|o| o.as_reference() == Some(spec_id)) {
+            af.push(Object::Reference(spec_id));
+        }
+        catalog.set(b"AF".to_vec(), Object::Array(af));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Embed `bytes` as a document-level file attachment named `name`. Shared by
+    /// [`add_attachment`](Self::add_attachment) and
+    /// [`add_associated_file`](Self::add_associated_file); when `relationship` is
+    /// `Some`, the filespec gets an `/AFRelationship` and is linked from the
+    /// catalog `/AF` array (the PDF/A-3 hybrid-document mechanism).
+    fn embed_file(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        mime: Option<&str>,
+        description: Option<&str>,
+        relationship: Option<AfRelationship>,
+    ) -> Result<()> {
+        if name.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "attachment name must not be empty".into(),
+            ));
+        }
+
+        // 1. The embedded-file stream (FlateDecode-compressed).
+        let compressed = crate::filters::deflate::flate_encode(bytes);
+        let mut sdict = Dictionary::new();
+        sdict.set(b"Type".to_vec(), annot::name(b"EmbeddedFile"));
+        if let Some(m) = mime {
+            // A MIME type is stored as a name; the serializer escapes the `/`.
+            sdict.set(b"Subtype".to_vec(), annot::name(m.as_bytes()));
+        }
+        sdict.set(b"Filter".to_vec(), annot::name(b"FlateDecode"));
+        let mut params = Dictionary::new();
+        params.set(b"Size".to_vec(), Object::Integer(bytes.len() as i64));
+        sdict.set(b"Params".to_vec(), Object::Dictionary(params));
+        sdict.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
+        let stream_id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(stream_id, Object::Stream(Stream::new(sdict, compressed)));
+
+        // 2. The filespec dictionary referencing that stream.
+        let mut spec = Dictionary::new();
+        spec.set(b"Type".to_vec(), annot::name(b"Filespec"));
+        spec.set(b"F".to_vec(), pdf_text(name));
+        spec.set(b"UF".to_vec(), pdf_text(name));
+        if let Some(d) = description {
+            spec.set(b"Desc".to_vec(), pdf_text(d));
+        }
+        let mut ef = Dictionary::new();
+        ef.set(b"F".to_vec(), Object::Reference(stream_id));
+        ef.set(b"UF".to_vec(), Object::Reference(stream_id));
+        spec.set(b"EF".to_vec(), Object::Dictionary(ef));
+        if let Some(rel) = relationship {
+            spec.set(b"AFRelationship".to_vec(), annot::name(rel.pdf_name()));
+        }
+        let spec_id = (self.next_object_number(), 0u16);
+        self.objects.insert(spec_id, Object::Dictionary(spec));
+
+        // 3. Insert into /Names /EmbeddedFiles (replacing any same-named entry).
+        let (names_ref, names_dict, mut entries) = self.embedded_files_state()?;
+        entries.retain(|(k, _)| k.as_slice() != name.as_bytes());
+        entries.push((name.as_bytes().to_vec(), Object::Reference(spec_id)));
+        self.write_embedded_files(names_ref, names_dict, entries)?;
+
+        // 4. Link from the catalog /AF array for associated (PDF/A-3) files.
+        if relationship.is_some() {
+            self.add_to_catalog_af(spec_id)?;
+        }
+        Ok(())
+    }
+
+    /// Embed `bytes` as a document-level file attachment named `name`
+    /// (`/Names /EmbeddedFiles`, ISO 32000-1 §7.11.4). `mime` sets the embedded
+    /// stream `/Subtype` (e.g. `"application/pdf"`); `description` sets `/Desc`.
+    /// Re-using a `name` **replaces** that attachment. The bytes are stored
+    /// FlateDecode-compressed.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] if `name` is empty.
+    pub fn add_attachment(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        mime: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<()> {
+        self.embed_file(name, bytes, mime, description, None)
+    }
+
+    /// Embed `bytes` as an **associated file** (`/AF`) named `name` with the
+    /// given [`AfRelationship`] — the mechanism PDF/A-3 hybrid invoices
+    /// (Factur-X, ZUGFeRD, Order-X) use to carry their XML payload
+    /// ([`AfRelationship::Alternative`]). The file is added to
+    /// `/Names /EmbeddedFiles` (so it is also a normal attachment) and linked
+    /// from the catalog `/AF` array, and its filespec carries `/AFRelationship`.
+    pub fn add_associated_file(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        mime: Option<&str>,
+        description: Option<&str>,
+        relationship: AfRelationship,
+    ) -> Result<()> {
+        self.embed_file(name, bytes, mime, description, Some(relationship))
+    }
+
+    /// Remove the document-level attachment named `name`, dropping it from
+    /// `/Names /EmbeddedFiles` and (if present) the catalog `/AF` array. Returns
+    /// `true` if an attachment was removed, `false` if none had that name. The
+    /// embedded-file stream object is left in place (it becomes unreferenced and
+    /// is dropped on the next rewrite).
+    pub fn remove_attachment(&mut self, name: &str) -> Result<bool> {
+        let (names_ref, names_dict, mut entries) = self.embedded_files_state()?;
+        let removed_spec = entries
+            .iter()
+            .find(|(k, _)| k.as_slice() == name.as_bytes())
+            .and_then(|(_, v)| v.as_reference());
+        let before = entries.len();
+        entries.retain(|(k, _)| k.as_slice() != name.as_bytes());
+        if entries.len() == before {
+            return Ok(false);
+        }
+        self.write_embedded_files(names_ref, names_dict, entries)?;
+        if let Some(spec_id) = removed_spec {
+            self.remove_from_catalog_af(spec_id)?;
+        }
+        Ok(true)
+    }
+
+    /// Drop `spec_id` from the catalog `/AF` array (no-op if absent or empty).
+    fn remove_from_catalog_af(&mut self, spec_id: ObjectId) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let Some(af) = catalog
+            .get(b"AF")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+        else {
+            return Ok(());
+        };
+        let kept: Vec<Object> = af
+            .into_iter()
+            .filter(|o| o.as_reference() != Some(spec_id))
+            .collect();
+        if kept.is_empty() {
+            catalog.remove(b"AF");
+        } else {
+            catalog.set(b"AF".to_vec(), Object::Array(kept));
+        }
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Add a page-anchored **FileAttachment** annotation (ISO 32000-1 §12.5.6.15)
+    /// over `rect` on the 1-based `page_no`, pointing at the already-embedded
+    /// attachment `name` (add it first with [`add_attachment`](Self::add_attachment)).
+    /// `icon` is the visual marker — one of `"PushPin"` (default), `"Paperclip"`,
+    /// `"Graph"` or `"Tag"`.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] if no attachment named `name` exists.
+    pub fn add_file_attachment_annot(
+        &mut self,
+        page_no: u32,
+        rect: [f64; 4],
+        name: &str,
+        icon: Option<&str>,
+    ) -> Result<()> {
+        let (_, _, entries) = self.embedded_files_state()?;
+        let spec = entries
+            .iter()
+            .find(|(k, _)| k.as_slice() == name.as_bytes())
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("no attachment named {name:?} to anchor"))
+            })?;
+        let mut dict = Dictionary::new();
+        dict.set(b"Type".to_vec(), annot::name(b"Annot"));
+        dict.set(b"Subtype".to_vec(), annot::name(b"FileAttachment"));
+        dict.set(b"Rect".to_vec(), annot::real_array(&rect));
+        dict.set(b"FS".to_vec(), spec);
+        dict.set(
+            b"Name".to_vec(),
+            annot::name(icon.unwrap_or("PushPin").as_bytes()),
+        );
+        dict.set(b"Contents".to_vec(), pdf_text(name));
+        self.append_annotation_dict(page_no, dict)
+    }
+
     /// Add an internal hyperlink over `rect` that jumps to the **named
     /// destination** `dest_name` (define it with [`add_named_dest`]). Unlike
     /// [`add_goto_link`](Self::add_goto_link) (an explicit page reference), this
@@ -18300,6 +18664,118 @@ mod tests {
         doc2.set_page_labels(&[]).unwrap();
         assert!(doc2.page_labels().is_empty());
         assert_eq!(doc2.page_label(2), "2", "back to decimal fallback");
+    }
+
+    #[test]
+    fn add_attachment_round_trips_through_the_name_tree() {
+        let mut doc = blank_doc();
+        doc.add_attachment(
+            "notes.txt",
+            b"hello world",
+            Some("text/plain"),
+            Some("My notes"),
+        )
+        .unwrap();
+        // The read side (already shipped) sees it after a save → reopen.
+        let reopened = Document::open(&doc.save()).unwrap();
+        let atts = reopened.attachments();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "notes.txt");
+        assert_eq!(atts[0].filename, "notes.txt");
+        assert_eq!(atts[0].mime.as_deref(), Some("text/plain"));
+        assert_eq!(atts[0].description.as_deref(), Some("My notes"));
+        assert_eq!(
+            atts[0].data, b"hello world",
+            "FlateDecode round-trips the bytes"
+        );
+    }
+
+    #[test]
+    fn add_attachment_replaces_same_name_and_remove_works() {
+        let mut doc = blank_doc();
+        doc.add_attachment("a.txt", b"v1", None, None).unwrap();
+        doc.add_attachment("b.txt", b"bbb", None, None).unwrap();
+        doc.add_attachment("a.txt", b"v2", None, None).unwrap(); // replace, not duplicate
+        let atts = doc.attachments();
+        assert_eq!(atts.len(), 2);
+        assert_eq!(atts.iter().find(|x| x.name == "a.txt").unwrap().data, b"v2");
+
+        assert!(doc.remove_attachment("a.txt").unwrap());
+        assert!(
+            !doc.remove_attachment("a.txt").unwrap(),
+            "second remove is a no-op"
+        );
+        let atts = doc.attachments();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "b.txt");
+    }
+
+    #[test]
+    fn add_associated_file_links_af_and_relationship() {
+        let mut doc = blank_doc();
+        let xml = br#"<?xml version="1.0"?><Invoice/>"#;
+        doc.add_associated_file(
+            "factur-x.xml",
+            xml,
+            Some("text/xml"),
+            Some("Factur-X"),
+            AfRelationship::Alternative,
+        )
+        .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        // It is a normal attachment too.
+        let atts = reopened.attachments();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "factur-x.xml");
+        assert_eq!(atts[0].data.as_slice(), xml);
+        // The catalog /AF lists the filespec, which carries /AFRelationship.
+        let catalog = reopened.catalog().unwrap();
+        let af = catalog
+            .get(b"AF")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_array)
+            .expect("/AF present");
+        assert_eq!(af.len(), 1);
+        let spec = reopened.resolve(&af[0]).as_dict().expect("filespec");
+        assert_eq!(
+            spec.get(b"AFRelationship").and_then(Object::as_name),
+            Some(b"Alternative".as_slice())
+        );
+    }
+
+    #[test]
+    fn file_attachment_annot_anchors_existing_file() {
+        let mut doc = blank_doc();
+        doc.add_attachment("data.bin", b"\x00\x01\x02", None, None)
+            .unwrap();
+        doc.add_file_attachment_annot(1, [10.0, 10.0, 30.0, 30.0], "data.bin", Some("Paperclip"))
+            .unwrap();
+        // Anchoring an unknown attachment is rejected.
+        assert!(matches!(
+            doc.add_file_attachment_annot(1, [0.0, 0.0, 10.0, 10.0], "missing", None),
+            Err(EngineError::InvalidArgument(_))
+        ));
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let page = reopened.page_dict(1).unwrap();
+        let annots = page
+            .get(b"Annots")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_array)
+            .expect("/Annots");
+        let fa = annots
+            .iter()
+            .map(|o| reopened.resolve(o))
+            .filter_map(Object::as_dict)
+            .find(|d| {
+                d.get(b"Subtype").and_then(Object::as_name) == Some(b"FileAttachment".as_slice())
+            })
+            .expect("FileAttachment annotation present");
+        assert!(fa.get(b"FS").is_some(), "annot references the filespec");
+        assert_eq!(
+            fa.get(b"Name").and_then(Object::as_name),
+            Some(b"Paperclip".as_slice())
+        );
     }
 
     #[test]

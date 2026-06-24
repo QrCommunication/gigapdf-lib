@@ -1943,6 +1943,34 @@ export interface Attachment {
   /** The decoded (filters applied) file bytes. */
   data: Uint8Array;
 }
+
+/**
+ * The relationship an **associated file** (`/AF`) bears to the document (ISO
+ * 32000-2 / PDF/A-3). Hybrid e-invoices (Factur-X, ZUGFeRD, Order-X) embed their
+ * XML payload as `"alternative"`.
+ */
+export type AfRelationship = "source" | "data" | "alternative" | "supplement" | "unspecified";
+
+/** Maps an {@link AfRelationship} to the discriminant the engine expects. */
+const AF_RELATIONSHIP_CODE: Record<AfRelationship, number> = {
+  source: 0,
+  data: 1,
+  alternative: 2,
+  supplement: 3,
+  unspecified: 4,
+};
+
+/** Options for embedding a file attachment (see {@link GigaPdfDoc.addAttachment}). */
+export interface AttachmentOptions {
+  /** The embedded stream `/Subtype` MIME type (e.g. `"application/pdf"`). */
+  mime?: string;
+  /** A human-readable description (`/Desc`). */
+  description?: string;
+}
+
+/** The visual marker of a {@link GigaPdfDoc.addFileAttachmentAnnot} annotation. */
+export type FileAttachmentIcon = "PushPin" | "Paperclip" | "Graph" | "Tag";
+
 /** One sheet read back from an `.xlsx` by {@link GigaPdfEngine.xlsxToGrids}. */
 export interface XlsxSheet {
   name: string;
@@ -3767,6 +3795,95 @@ export class GigaPdfDoc {
       data: this.g._fromBase64(dataBase64),
     }));
   }
+
+  /**
+   * Embed `bytes` as a document-level file attachment named `name`
+   * (`/Names /EmbeddedFiles`, ISO 32000-1 §7.11.4). Re-using a `name` **replaces**
+   * that attachment; the bytes are stored FlateDecode-compressed. Returns `true`
+   * on success (`false` e.g. for an empty name).
+   */
+  addAttachment(name: string, bytes: Uint8Array, opts: AttachmentOptions = {}): boolean {
+    return (
+      this.g._withStr(name, (np, nl) =>
+        this.g._withBytes(bytes, (bp, bl) =>
+          this.g._withOptStr(opts.mime ?? "", (mp, ml) =>
+            this.g._withOptStr(opts.description ?? "", (dp, dl) =>
+              this.ex().gp_add_attachment(this.h, np, nl, bp, bl, mp, ml, dp, dl)
+            )
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Embed `bytes` as an **associated file** (`/AF`, PDF/A-3) named `name` with the
+   * given {@link AfRelationship} — the mechanism Factur-X / ZUGFeRD / Order-X use
+   * to carry their invoice XML (`"alternative"`). The file is also a normal
+   * attachment, is linked from the catalog `/AF` array, and its filespec carries
+   * `/AFRelationship`. Returns `true` on success.
+   */
+  addAssociatedFile(
+    name: string,
+    bytes: Uint8Array,
+    relationship: AfRelationship,
+    opts: AttachmentOptions = {}
+  ): boolean {
+    const rel = AF_RELATIONSHIP_CODE[relationship] ?? AF_RELATIONSHIP_CODE.unspecified;
+    return (
+      this.g._withStr(name, (np, nl) =>
+        this.g._withBytes(bytes, (bp, bl) =>
+          this.g._withOptStr(opts.mime ?? "", (mp, ml) =>
+            this.g._withOptStr(opts.description ?? "", (dp, dl) =>
+              this.ex().gp_add_associated_file(this.h, np, nl, bp, bl, mp, ml, dp, dl, rel)
+            )
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Remove the attachment named `name` (from `/Names /EmbeddedFiles` and, if
+   * present, the catalog `/AF` array). Returns `true` if one was removed, `false`
+   * if no attachment had that name.
+   */
+  removeAttachment(name: string): boolean {
+    return this.g._withStr(name, (p, l) => this.ex().gp_remove_attachment(this.h, p, l)) === 1;
+  }
+
+  /**
+   * Add a page-anchored **FileAttachment** annotation over `rect` on the 1-based
+   * `page`, pointing at the already-embedded attachment `name` (add it first with
+   * {@link addAttachment}). `icon` is the visual marker (default `"PushPin"`).
+   * Returns `true` on success (`false` if no such attachment exists).
+   */
+  addFileAttachmentAnnot(
+    page: number,
+    rect: Box,
+    name: string,
+    icon: FileAttachmentIcon = "PushPin"
+  ): boolean {
+    return (
+      this.g._withStr(name, (np, nl) =>
+        this.g._withOptStr(icon, (ip, il) =>
+          this.ex().gp_add_file_attachment_annot(
+            this.h,
+            page,
+            rect.x,
+            rect.y,
+            rect.x + rect.w,
+            rect.y + rect.h,
+            np,
+            nl,
+            ip,
+            il
+          )
+        )
+      ) === 0
+    );
+  }
+
   /**
    * Add an internal hyperlink over a rectangle that jumps to the named
    * destination `name` (define it with {@link addNamedDest}). Unlike

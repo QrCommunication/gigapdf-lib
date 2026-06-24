@@ -7,6 +7,30 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.75.0] - 2026-06-24
+
+Embedded file attachments become **writable** — add/replace/remove document-level
+files, anchor `FileAttachment` annotations, and link **associated files** (`/AF`,
+PDF/A-3) for hybrid e-invoices (Factur-X / ZUGFeRD / Order-X). Resolves
+[#9](https://github.com/qrcommunication/gigapdf-lib/issues/9).
+
+### Added
+
+- **Attachment write API (core + WASM + SDK).** `Document::add_attachment(name,
+  bytes, mime, desc)` embeds a file in `/Names /EmbeddedFiles` (FlateDecode-
+  compressed; re-using a name replaces it); `Document::remove_attachment(name)`
+  drops it (and its `/AF` link), returning whether one was removed;
+  `Document::add_associated_file(name, bytes, mime, desc, relationship)` adds the
+  file as an **associated file** — its filespec carries `/AFRelationship` and is
+  linked from the catalog `/AF` array (the Factur-X/ZUGFeRD invoice-XML mechanism);
+  `Document::add_file_attachment_annot(page, rect, name, icon)` anchors a visible
+  `FileAttachment` annotation to an embedded file. Exposed as `gp_add_attachment` /
+  `gp_add_associated_file` / `gp_remove_attachment` / `gp_add_file_attachment_annot`
+  (WASM) and `doc.addAttachment` / `doc.addAssociatedFile` / `doc.removeAttachment`
+  / `doc.addFileAttachmentAnnot` (SDK), with the new `AfRelationship` type. Sibling
+  `/Names` subtrees (`/Dests`, `/JavaScript`, …) are preserved when the embedded-
+  files tree is rewritten.
+
 ## [0.74.0] - 2026-06-24
 
 Adds **page labels** (`/PageLabels`) — reading, authoring and resolving the

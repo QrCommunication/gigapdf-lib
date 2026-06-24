@@ -295,6 +295,46 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("attachments: add, replace, associated-file (/AF), annot, remove, round-trip", () => {
+    const enc = new TextEncoder();
+    const doc = giga.open(giga.txtToPdf("Attach"));
+
+    // Add → read back (the reader already existed; this exercises the writer).
+    expect(
+      doc.addAttachment("notes.txt", enc.encode("hello world"), {
+        mime: "text/plain",
+        description: "My notes",
+      })
+    ).toBe(true);
+    // Associated file for a Factur-X-style hybrid invoice.
+    expect(
+      doc.addAssociatedFile("factur-x.xml", enc.encode("<Invoice/>"), "alternative", {
+        mime: "text/xml",
+      })
+    ).toBe(true);
+    // Anchor a visible FileAttachment annotation to the embedded file.
+    expect(
+      doc.addFileAttachmentAnnot(1, { x: 20, y: 20, w: 16, h: 16 }, "notes.txt", "Paperclip")
+    ).toBe(true);
+    // Anchoring a missing attachment fails.
+    expect(doc.addFileAttachmentAnnot(1, { x: 0, y: 0, w: 8, h: 8 }, "nope")).toBe(false);
+
+    const reopened = giga.open(doc.save());
+    const atts = reopened.attachments().sort((a, b) => a.name.localeCompare(b.name));
+    expect(atts.map((a) => a.name)).toEqual(["factur-x.xml", "notes.txt"]);
+    const notes = atts.find((a) => a.name === "notes.txt")!;
+    expect(new TextDecoder().decode(notes.data)).toBe("hello world");
+    expect(notes.mime).toBe("text/plain");
+    expect(notes.description).toBe("My notes");
+
+    // Remove one → the other survives; removing again is a no-op.
+    expect(reopened.removeAttachment("notes.txt")).toBe(true);
+    expect(reopened.removeAttachment("notes.txt")).toBe(false);
+    expect(reopened.attachments().map((a) => a.name)).toEqual(["factur-x.xml"]);
+    reopened.close();
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

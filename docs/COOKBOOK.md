@@ -33,6 +33,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Read & write running headers and footers](#headers-and-footers)
 - [Set print boxes (TrimBox / BleedBox) for prepress](#print-boxes) — *v0.73.0*
 - [Number pages with labels (roman front matter, prefixes)](#page-labels) — *v0.74.0*
+- [Embed file attachments (+ Factur-X / ZUGFeRD `/AF`)](#attachments) — *v0.75.0*
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
 - [Image → PDF (single & batch)](#image--pdf)
 - [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
@@ -306,6 +307,58 @@ number for any page before the first range, or when the document has no labels a
 > Pass an **empty array** to `setPageLabels([])` to strip all page labels (the page
 > navigator reverts to `1, 2, 3…`). Setting labels replaces the whole `/PageLabels`
 > tree, so include every range you want each time — it is not a merge.
+
+---
+
+<a id="attachments"></a>
+
+## Embed file attachments (+ Factur-X / ZUGFeRD `/AF`)
+
+> **Available in v0.75.0.** The read side (`attachments()`) shipped earlier.
+
+A PDF can carry **embedded files** in its `/Names /EmbeddedFiles` name tree (ISO
+32000-1 §7.11) — the "carry the source inside the PDF" pattern, and the backbone of
+hybrid **e-invoices**: Factur-X / ZUGFeRD / Order-X embed a structured XML invoice
+inside a human-readable PDF/A-3, linking it through the catalog `/AF` (associated
+files) array with an `/AFRelationship` of `Alternative`.
+
+```ts
+const doc = giga.open(pdfBytes);
+const enc = new TextEncoder();
+
+// A plain attachment (e.g. the source spreadsheet), replaceable by name.
+doc.addAttachment("source.csv", enc.encode("a,b\n1,2\n"), {
+  mime: "text/csv",
+  description: "Source data",
+});
+
+// A Factur-X invoice payload as an ASSOCIATED file (PDF/A-3 /AF).
+const xml = enc.encode('<?xml version="1.0"?><rsm:CrossIndustryInvoice .../>');
+doc.addAssociatedFile("factur-x.xml", xml, "alternative", { mime: "text/xml" });
+
+// Optionally anchor a visible paperclip on page 1 that opens the CSV.
+doc.addFileAttachmentAnnot(1, { x: 36, y: 760, w: 16, h: 16 }, "source.csv", "Paperclip");
+
+const out = doc.save();
+doc.close();
+```
+
+Read them back (this part already existed) with `attachments()`:
+
+```ts
+const files = giga.open(out).attachments();
+//   → [ { name: "factur-x.xml", mime: "text/xml", data: Uint8Array, … },
+//       { name: "source.csv",   mime: "text/csv", data: Uint8Array, … } ]
+```
+
+Re-using a `name` in `addAttachment` **replaces** that attachment; `removeAttachment(name)`
+drops it (and its `/AF` link), returning `false` if nothing matched. Attachment bytes
+are stored FlateDecode-compressed.
+
+> For a **fully conformant** Factur-X / ZUGFeRD file you still need the surrounding
+> PDF/A-3 conformance (output intent, XMP with the Factur-X extension schema). This
+> recipe provides the embedding + `/AF` linkage — the part the engine owns — so the
+> XML travels with the document and is discoverable via `/AF` and the name tree.
 
 ---
 

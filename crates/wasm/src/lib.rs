@@ -21,9 +21,9 @@
 mod rng;
 
 use gigapdf_core::{
-    Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField,
-    HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox, PageLabelRange,
-    PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
+    AfRelationship, Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind,
+    FormField, HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox,
+    PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -4330,6 +4330,107 @@ pub extern "C" fn gp_attachments_json(handle: *const Document, out_len: *mut usi
         None => "[]".to_string(),
     };
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Embed `bytes` as a document-level file attachment named `name`
+/// (`/Names /EmbeddedFiles`). `mime` and `desc` are optional (empty = omitted);
+/// re-using a `name` replaces that attachment. Returns `0` on success, `-1` null
+/// handle, `-3` on error (e.g. empty name).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_attachment(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    mime_ptr: *const u8,
+    mime_len: usize,
+    desc_ptr: *const u8,
+    desc_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let bytes = unsafe { opt_slice(bytes_ptr, bytes_len) };
+    let mime = unsafe { opt_str_arg(mime_ptr, mime_len) };
+    let desc = unsafe { opt_str_arg(desc_ptr, desc_len) };
+    edit(handle, |doc| doc.add_attachment(name, bytes, mime, desc))
+}
+
+/// Embed `bytes` as an **associated file** (`/AF`, PDF/A-3 — Factur-X/ZUGFeRD).
+/// Like [`gp_add_attachment`] plus `relationship`: `0`=source `1`=data
+/// `2`=alternative `3`=supplement `4`=unspecified. Returns `0`/`-1`/`-3`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_associated_file(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    mime_ptr: *const u8,
+    mime_len: usize,
+    desc_ptr: *const u8,
+    desc_len: usize,
+    relationship: u32,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let bytes = unsafe { opt_slice(bytes_ptr, bytes_len) };
+    let mime = unsafe { opt_str_arg(mime_ptr, mime_len) };
+    let desc = unsafe { opt_str_arg(desc_ptr, desc_len) };
+    edit(handle, |doc| {
+        let rel = match relationship {
+            0 => AfRelationship::Source,
+            1 => AfRelationship::Data,
+            2 => AfRelationship::Alternative,
+            3 => AfRelationship::Supplement,
+            _ => AfRelationship::Unspecified,
+        };
+        doc.add_associated_file(name, bytes, mime, desc, rel)
+    })
+}
+
+/// Remove the attachment named `name`. Returns `1` if one was removed, `0` if no
+/// attachment had that name, `-1` null handle, `-3` on error.
+#[no_mangle]
+pub extern "C" fn gp_remove_attachment(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.remove_attachment(name) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
+/// Add a page-anchored **FileAttachment** annotation over `[x0,y0,x1,y1]` on the
+/// 1-based `page`, pointing at the already-embedded attachment `name`. `icon` is
+/// optional (`PushPin` default; `Paperclip`/`Graph`/`Tag`). Returns `0`/`-1`/`-3`
+/// (`-3` if no such attachment).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_file_attachment_annot(
+    handle: *mut Document,
+    page: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    name_ptr: *const u8,
+    name_len: usize,
+    icon_ptr: *const u8,
+    icon_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let icon = unsafe { opt_str_arg(icon_ptr, icon_len) };
+    edit(handle, |doc| {
+        doc.add_file_attachment_annot(page, [x0, y0, x1, y1], name, icon)
+    })
 }
 
 /// Add an internal hyperlink over a rectangle that jumps to the named

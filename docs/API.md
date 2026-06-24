@@ -141,6 +141,7 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `set_outline(&[(title,page,level)])` / `outline_items()` | `gp_set_outline(handle,ptr,len) / gp_outline_json` |
 | `get_metadata(key)` / `set_metadata(key,val)` | `gp_get_metadata / gp_set_metadata` |
 | `attachments() -> Vec<Attachment>` (embedded files from `/Names /EmbeddedFiles`) | `gp_attachments_json(handle,outlen)` → `[{name,filename,mime,description,creationDate,modDate,dataBase64}]` |
+| `add_attachment(name,bytes,mime?,desc?)` / `add_associated_file(name,bytes,mime?,desc?,rel)` (`/AF` PDF/A-3 — Factur-X/ZUGFeRD) / `remove_attachment(name) -> bool` / `add_file_attachment_annot(page,rect,name,icon?)` | `gp_add_attachment(handle,nameptr,namelen,bytesptr,byteslen,mimeptr,mimelen,descptr,desclen)` / `gp_add_associated_file(…,rel)` (`rel` 0=source 1=data 2=alternative 3=supplement 4=unspecified) / `gp_remove_attachment(handle,nameptr,namelen)` (1=removed 0=absent) / `gp_add_file_attachment_annot(handle,page,x0,y0,x1,y1,nameptr,namelen,iconptr,iconlen)` |
 
 ## Security
 
@@ -360,6 +361,7 @@ Google fonts**, so the host fetches fonts in two phases.
 - `HeaderFooterSpec { text, align, font_size, color, page_range, show_on_first_page, band_height }`
 - `PageBox` (enum `Media|Crop|Bleed|Trim|Art`) and `PageBoxes { media, crop, bleed, trim, art: [f64;4], declared: PageBoxesDeclared { media, crop, bleed, trim, art: bool } }` — every rectangle is the **effective** box (ISO 32000-1 §14.11.2 inheritance + the per-box default chain applied: Crop→Media, Bleed/Trim/Art→Crop), reported verbatim; `declared` flags which boxes are explicitly on the page dictionary vs inherited/defaulted
 - `PageLabelStyle` (enum `Decimal|RomanLower|RomanUpper|AlphaLower|AlphaUpper|None`) and `PageLabelRange { start_page (1-based), style, prefix: String, start_number }` — one entry per `/PageLabels` range (ISO 32000-1 §12.4.2). `page_label(n)` formats the displayed string (roman/letter sequences, prefix, `St` offset), falling back to the decimal page number outside any range
+- `Attachment { name, filename, mime, description, creation_date, mod_date, data }` (read) and `AfRelationship` (enum `Source|Data|Alternative|Supplement|Unspecified`, the filespec `/AFRelationship` for `/AF` associated files) — write via `add_attachment`/`add_associated_file`/`remove_attachment`/`add_file_attachment_annot`
 - `model::{Document, Section, Page, Block, Inline, CharStyle, CellValue, ModelOp, BlockAddr, StylePatch}`
 - `convert::{ConvPage, PlacedText, PlacedImage, PlacedShape, TextStyle, Generic}`
 

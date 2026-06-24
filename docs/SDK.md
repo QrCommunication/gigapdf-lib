@@ -313,6 +313,10 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `setOutline(entries)` | `boolean` | Replace the bookmark tree. |
 | `getMetadata(key)` / `setMetadata(key, value)` | `string` / `boolean` | Read/write an Info-dictionary entry (`Title`, `Author`, …). |
 | `attachments()` | `Attachment[]` | Extract every embedded file from the `/Names /EmbeddedFiles` name tree: `{ name, filename, mime, description, creationDate, modDate, data }` where `data` is the decoded bytes. The native replacement for a reader's `getAttachments()`. |
+| `addAttachment(name, bytes, opts?)` | `boolean` | Embed a document-level file (`/Names /EmbeddedFiles`). `opts` is `{ mime?, description? }`; re-using a `name` **replaces** it. Bytes are stored FlateDecode-compressed. |
+| `addAssociatedFile(name, bytes, relationship, opts?)` | `boolean` | Embed an **associated file** (`/AF`, PDF/A-3) — the Factur-X / ZUGFeRD / Order-X invoice-XML mechanism. `relationship` is `"source" \| "data" \| "alternative" \| "supplement" \| "unspecified"` (invoices use `"alternative"`); the filespec gets `/AFRelationship` and is linked from the catalog `/AF`. |
+| `removeAttachment(name)` | `boolean` | Remove an attachment (and its `/AF` link). `true` if one was removed, `false` if none had that name. |
+| `addFileAttachmentAnnot(page, rect, name, icon?)` | `boolean` | Anchor a visible **FileAttachment** annotation (ISO 32000-1 §12.5.6.15) over `rect` (`{ x, y, w, h }`) pointing at the already-embedded `name`. `icon` ∈ `"PushPin"` (default) / `"Paperclip"` / `"Graph"` / `"Tag"`. |
 
 ### Conversions (PDF → X)
 

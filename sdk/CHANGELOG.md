@@ -4,6 +4,23 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.75.0] - 2026-06-24
+
+Writable file attachments + Factur-X / ZUGFeRD `/AF`. Resolves
+[#9](https://github.com/qrcommunication/gigapdf-lib/issues/9).
+
+### Added
+
+- **`addAttachment` / `addAssociatedFile` / `removeAttachment` /
+  `addFileAttachmentAnnot`.** Embed, replace and remove document-level file
+  attachments (`/Names /EmbeddedFiles`), anchor a visible `FileAttachment`
+  annotation, and link **associated files** (`/AF`, PDF/A-3) — the mechanism
+  hybrid e-invoices (Factur-X / ZUGFeRD / Order-X) use to carry their invoice XML
+  (`addAssociatedFile(name, bytes, "alternative", …)`). Attachment bytes are stored
+  FlateDecode-compressed; re-using a name replaces it. New `AfRelationship`,
+  `AttachmentOptions` and `FileAttachmentIcon` types. The read side
+  (`attachments()`) is unchanged.
+
 ## [0.74.0] - 2026-06-24
 
 Page labels (`/PageLabels`). Resolves
