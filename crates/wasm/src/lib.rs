@@ -22,8 +22,9 @@ mod rng;
 
 use gigapdf_core::{
     AfRelationship, Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind,
-    FormField, HeaderFooterSpec, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox,
-    PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
+    FormField, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem,
+    PageBox, PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine,
+    TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -4200,6 +4201,36 @@ pub extern "C" fn gp_get_metadata(
         None => String::new(),
     };
     unsafe { bytes_into_host(value.into_bytes(), out_len) }
+}
+
+/// The document's XMP metadata packet (catalog `/Metadata`, decoded) as raw
+/// bytes; an **empty** buffer when the document has no XMP. Host frees.
+#[no_mangle]
+pub extern "C" fn gp_get_xmp(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let xmp = match unsafe { handle.as_ref() } {
+        Some(doc) => doc.xmp().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    unsafe { bytes_into_host(xmp, out_len) }
+}
+
+/// Replace (or create) the document's XMP metadata stream (catalog `/Metadata`,
+/// stored uncompressed). Returns `0` on success, `-1` null handle, `-3` on error.
+#[no_mangle]
+pub extern "C" fn gp_set_xmp(handle: *mut Document, ptr: *const u8, len: usize) -> i32 {
+    let bytes = unsafe { opt_slice(ptr, len) };
+    edit(handle, |doc| doc.set_xmp(bytes))
+}
+
+/// Set the standard document-information fields from a JSON object
+/// (`{title?,author?,subject?,keywords?,creator?,producer?,creationDate?,modDate?}`),
+/// writing **both** the `/Info` dictionary and a synced XMP `/Metadata` stream.
+/// Absent keys are left unchanged (a partial update). Returns `0`/`-1`/`-3`.
+#[no_mangle]
+pub extern "C" fn gp_set_info_json(handle: *mut Document, ptr: *const u8, len: usize) -> i32 {
+    let json = unsafe { str_arg(ptr, len) };
+    let fields = InfoFields::from_json(json);
+    edit(handle, |doc| doc.set_info(&fields))
 }
 
 // ─── hyperlinks ──────────────────────────────────────────────────────────────

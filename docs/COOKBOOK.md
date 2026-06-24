@@ -34,6 +34,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Set print boxes (TrimBox / BleedBox) for prepress](#print-boxes) — *v0.73.0*
 - [Number pages with labels (roman front matter, prefixes)](#page-labels) — *v0.74.0*
 - [Embed file attachments (+ Factur-X / ZUGFeRD `/AF`)](#attachments) — *v0.75.0*
+- [Set document metadata (Info + XMP, kept in sync)](#metadata) — *v0.76.0*
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
 - [Image → PDF (single & batch)](#image--pdf)
 - [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
@@ -359,6 +360,60 @@ are stored FlateDecode-compressed.
 > PDF/A-3 conformance (output intent, XMP with the Factur-X extension schema). This
 > recipe provides the embedding + `/AF` linkage — the part the engine owns — so the
 > XML travels with the document and is discoverable via `/AF` and the name tree.
+
+---
+
+<a id="metadata"></a>
+
+## Set document metadata (Info + XMP, kept in sync)
+
+> **Available in v0.76.0.**
+
+A PDF stores document metadata in **two** places: the legacy `/Info` dictionary
+(`/Title`, `/Author`, …) and the catalog `/Metadata` **XMP** packet (RDF/XML, the
+form modern readers, search indexers and DAM systems consult — ISO 32000-2
+deprecates `/Info` in favour of it). Keeping them consistent is the classic
+"two sources of truth" trap. `setInfo` writes **both** from one typed object:
+
+```ts
+const doc = giga.open(pdfBytes);
+
+doc.setInfo({
+  title: "Annual Report 2026",
+  author: "Ada Lovelace",
+  subject: "Financial results",
+  keywords: "finance, annual, 2026",
+  creator: "GigaPDF",
+  creationDate: "D:20260624153000+02'00'", // PDF date string
+});
+
+// setInfo is a PARTIAL update — this changes only the title, author is preserved:
+doc.setInfo({ title: "Annual Report 2026 (final)" });
+
+const out = doc.save();
+doc.close();
+```
+
+The XMP packet is regenerated to match, mapping each field to its standard
+namespace (`dc:title`, `dc:creator`, `dc:description`, `pdf:Keywords`,
+`xmp:CreatorTool`, `pdf:Producer`, `xmp:CreateDate` / `xmp:ModifyDate`), with PDF
+dates converted to ISO 8601.
+
+Read metadata back, or take full control of the raw XMP:
+
+```ts
+const reopened = giga.open(out);
+reopened.getMetadata("Title");           // "Annual Report 2026 (final)"  (from /Info)
+const xmp = reopened.getXmp();            // Uint8Array of the RDF/XML packet, or null
+
+// Replace the whole XMP packet with your own (e.g. a custom schema):
+reopened.setXmp(`<?xpacket begin="﻿"?>…your RDF…<?xpacket end="w"?>`);
+```
+
+> `setMetadata(key, value)` still exists for a **single** `/Info` entry, but it
+> does **not** touch the XMP — prefer `setInfo` so the two never drift. `setXmp`
+> writes the `/Metadata` stream verbatim (uncompressed), overriding whatever
+> `setInfo` generated.
 
 ---
 

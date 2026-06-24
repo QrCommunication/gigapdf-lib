@@ -7,6 +7,31 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.76.0] - 2026-06-24
+
+General document metadata: read/write the catalog `/Metadata` **XMP** packet and
+set the typed Info-dictionary fields, keeping `/Info` and XMP in sync. Resolves
+[#7](https://github.com/qrcommunication/gigapdf-lib/issues/7).
+
+### Added
+
+- **XMP + typed Info metadata (core + WASM + SDK).** `Document::xmp()` reads the
+  catalog `/Metadata` XMP packet (decoded) and `Document::set_xmp(&[u8])`
+  replaces/creates it (stored uncompressed). `Document::set_info(&InfoFields)`
+  writes the standard fields (Title/Author/Subject/Keywords/Creator/Producer/
+  CreationDate/ModDate) to **both** the `/Info` dictionary **and** a regenerated
+  XMP packet (`dc:`/`xmp:`/`pdf:` namespaces, PDF dates → ISO 8601), as a partial
+  merge; `Document::info_fields()` reads them back, and `InfoFields::from_json`
+  parses the SDK object. Exposed as `gp_get_xmp` / `gp_set_xmp` /
+  `gp_set_info_json` (WASM) and `doc.getXmp()` / `doc.setXmp()` / `doc.setInfo()`
+  (SDK), with the new `InfoFields` type. The existing single-key
+  `set_metadata(key, value)` is unchanged (Info only).
+
+### Changed
+
+- The internal JSON object reader (`ObjReader`) is now `pub(crate)` so metadata
+  (and future config parsers) can reuse it instead of duplicating a parser.
+
 ## [0.75.0] - 2026-06-24
 
 Embedded file attachments become **writable** — add/replace/remove document-level

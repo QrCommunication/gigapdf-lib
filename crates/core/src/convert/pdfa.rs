@@ -5,7 +5,7 @@
 //! OutputIntent (see [`super::srgb_icc`]). Full conformance additionally
 //! requires every font embedded; that's documented on `to_pdfa`.
 
-fn xml_escape(text: &str, out: &mut String) {
+pub(crate) fn xml_escape(text: &str, out: &mut String) {
     for ch in text.chars() {
         match ch {
             '&' => out.push_str("&amp;"),

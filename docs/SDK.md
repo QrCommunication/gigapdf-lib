@@ -311,12 +311,21 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `removeLayer(id)` | `boolean` | Delete a layer. |
 | `outline()` | `OutlineEntry[]` | The flattened bookmark list: `{ title, level, page?, bold?, italic?, color?, destKind?, x?, y?, zoom? }` — nesting depth, destination page + `/XYZ` position/zoom, and `/F`+`/C` label style. Rebuild the tree from `level`. |
 | `setOutline(entries)` | `boolean` | Replace the bookmark tree. |
-| `getMetadata(key)` / `setMetadata(key, value)` | `string` / `boolean` | Read/write an Info-dictionary entry (`Title`, `Author`, …). |
+| `getMetadata(key)` / `setMetadata(key, value)` | `string` / `boolean` | Read/write a **single** Info-dictionary entry (`Title`, `Author`, …) — touches only `/Info`. |
+| `setInfo(fields)` | `boolean` | Set the typed [`InfoFields`](#infofields) (`{ title?, author?, subject?, keywords?, creator?, producer?, creationDate?, modDate? }`), writing **both** `/Info` and a synced XMP `/Metadata` packet. **Partial update** — omitted fields are left unchanged. The cure for the "two sources of truth" drift between Info and XMP. |
+| `getXmp()` / `setXmp(xmp)` | `Uint8Array \| null` / `boolean` | Read / replace the catalog `/Metadata` XMP packet (raw bytes; `setXmp` also accepts a UTF-8 string). `getXmp` is `null` when the document has no XMP. |
 | `attachments()` | `Attachment[]` | Extract every embedded file from the `/Names /EmbeddedFiles` name tree: `{ name, filename, mime, description, creationDate, modDate, data }` where `data` is the decoded bytes. The native replacement for a reader's `getAttachments()`. |
 | `addAttachment(name, bytes, opts?)` | `boolean` | Embed a document-level file (`/Names /EmbeddedFiles`). `opts` is `{ mime?, description? }`; re-using a `name` **replaces** it. Bytes are stored FlateDecode-compressed. |
 | `addAssociatedFile(name, bytes, relationship, opts?)` | `boolean` | Embed an **associated file** (`/AF`, PDF/A-3) — the Factur-X / ZUGFeRD / Order-X invoice-XML mechanism. `relationship` is `"source" \| "data" \| "alternative" \| "supplement" \| "unspecified"` (invoices use `"alternative"`); the filespec gets `/AFRelationship` and is linked from the catalog `/AF`. |
 | `removeAttachment(name)` | `boolean` | Remove an attachment (and its `/AF` link). `true` if one was removed, `false` if none had that name. |
 | `addFileAttachmentAnnot(page, rect, name, icon?)` | `boolean` | Anchor a visible **FileAttachment** annotation (ISO 32000-1 §12.5.6.15) over `rect` (`{ x, y, w, h }`) pointing at the already-embedded `name`. `icon` ∈ `"PushPin"` (default) / `"Paperclip"` / `"Graph"` / `"Tag"`. |
+
+<a id="infofields"></a>`InfoFields = { title?, author?, subject?, keywords?, creator?, producer?, creationDate?, modDate? }`
+— the standard document-information fields. `setInfo` maps them to both `/Info`
+(`/Title`, `/Author`, …) and XMP (`dc:title`, `dc:creator`, `dc:description`,
+`pdf:Keywords`, `xmp:CreatorTool`, `pdf:Producer`, `xmp:CreateDate`/`ModifyDate`).
+Dates are PDF date strings (`"D:YYYYMMDDHHmmSS+HH'mm'"`), converted to ISO 8601 in
+the XMP.
 
 ### Conversions (PDF → X)
 

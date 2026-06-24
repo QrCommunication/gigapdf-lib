@@ -464,6 +464,111 @@ fn pdf_text(s: &str) -> Object {
     Object::String(crate::font::encode_pdf_text(s), StringKind::Literal)
 }
 
+/// Convert a PDF date string (`D:YYYYMMDDHHmmSSOHH'mm'`, ISO 32000-1 §7.9.4) to an
+/// XMP/ISO-8601 timestamp (`YYYY-MM-DDThh:mm:ss±hh:mm`). Returns `None` if the
+/// year is missing or non-numeric; all parts after the year are optional and
+/// default to the start of the period (`01`/`00`).
+fn pdf_date_to_iso8601(s: &str) -> Option<String> {
+    let s = s.strip_prefix("D:").unwrap_or(s);
+    let b = s.as_bytes();
+    let part = |start: usize, len: usize, default: &'static str| -> String {
+        if b.len() >= start + len && b[start..start + len].iter().all(u8::is_ascii_digit) {
+            s[start..start + len].to_string()
+        } else {
+            default.to_string()
+        }
+    };
+    if !(b.len() >= 4 && b[0..4].iter().all(u8::is_ascii_digit)) {
+        return None;
+    }
+    let year = &s[0..4];
+    let (month, day) = (part(4, 2, "01"), part(6, 2, "01"));
+    let (hh, mm, ss) = (part(8, 2, "00"), part(10, 2, "00"), part(12, 2, "00"));
+    let tz = match b.get(14) {
+        Some(b'Z') => "Z".to_string(),
+        Some(c @ (b'+' | b'-')) => {
+            format!("{}{}:{}", *c as char, part(15, 2, "00"), part(18, 2, "00"))
+        }
+        _ => String::new(),
+    };
+    Some(format!("{year}-{month}-{day}T{hh}:{mm}:{ss}{tz}"))
+}
+
+/// Build a general XMP metadata packet from the standard document-information
+/// fields (the `dc:`, `xmp:` and `pdf:` namespaces). Only the present fields are
+/// emitted; dates are converted to ISO 8601 (skipped if unparseable).
+fn info_to_xmp(f: &InfoFields) -> Vec<u8> {
+    use crate::convert::pdfa::xml_escape;
+    let esc = |s: &str| {
+        let mut o = String::new();
+        xml_escape(s, &mut o);
+        o
+    };
+
+    let mut dc = String::new();
+    if let Some(t) = &f.title {
+        dc.push_str(&format!(
+            "\n   <dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:title>",
+            esc(t)
+        ));
+    }
+    if let Some(a) = &f.author {
+        dc.push_str(&format!(
+            "\n   <dc:creator><rdf:Seq><rdf:li>{}</rdf:li></rdf:Seq></dc:creator>",
+            esc(a)
+        ));
+    }
+    if let Some(s) = &f.subject {
+        dc.push_str(&format!(
+            "\n   <dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:description>",
+            esc(s)
+        ));
+    }
+
+    let mut xmp_ns = String::new();
+    if let Some(c) = &f.creator {
+        xmp_ns.push_str(&format!(
+            "\n   <xmp:CreatorTool>{}</xmp:CreatorTool>",
+            esc(c)
+        ));
+    }
+    if let Some(d) = f.creation_date.as_deref().and_then(pdf_date_to_iso8601) {
+        xmp_ns.push_str(&format!("\n   <xmp:CreateDate>{d}</xmp:CreateDate>"));
+    }
+    if let Some(d) = f.mod_date.as_deref().and_then(pdf_date_to_iso8601) {
+        xmp_ns.push_str(&format!("\n   <xmp:ModifyDate>{d}</xmp:ModifyDate>"));
+    }
+
+    let mut pdf_ns = String::new();
+    if let Some(p) = &f.producer {
+        pdf_ns.push_str(&format!("\n   <pdf:Producer>{}</pdf:Producer>", esc(p)));
+    }
+    if let Some(k) = &f.keywords {
+        pdf_ns.push_str(&format!("\n   <pdf:Keywords>{}</pdf:Keywords>", esc(k)));
+    }
+
+    let block = |ns_attr: &str, body: &str| -> String {
+        if body.is_empty() {
+            String::new()
+        } else {
+            format!("\n  <rdf:Description rdf:about=\"\" {ns_attr}>{body}\n  </rdf:Description>")
+        }
+    };
+
+    let xmp = format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
+ <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">{}{}{}\n\
+ </rdf:RDF>\n\
+</x:xmpmeta>\n\
+<?xpacket end=\"w\"?>",
+        block("xmlns:dc=\"http://purl.org/dc/elements/1.1/\"", &dc),
+        block("xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"", &xmp_ns),
+        block("xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\"", &pdf_ns),
+    );
+    xmp.into_bytes()
+}
+
 /// Normalise a PDF font name for fuzzy matching: drop a leading `/`, strip a
 /// 6-uppercase-letter subset prefix (`ABCDEF+`), then keep only lowercased
 /// alphanumerics. `"HXBDOG+OCRB10PitchBT-Regular"` → `"ocrb10pitchbtregular"`,
@@ -1218,6 +1323,77 @@ impl AfRelationship {
 /// cloned `/Names` dict, and the flattened `(key, raw filespec value)` entries.
 /// Returned by `Document::embedded_files_state` for every attachment mutation.
 type EmbeddedFilesState = (Option<ObjectId>, Dictionary, Vec<(Vec<u8>, Object)>);
+
+/// The standard document-information fields (ISO 32000-1 §14.3.3, Table 317),
+/// shared by the `/Info` dictionary and the XMP `/Metadata` packet. Used by
+/// [`Document::info_fields`] (read) and [`Document::set_info`] (write, which keeps
+/// the Info dict and XMP in sync). Each field is `None` when absent; on
+/// [`set_info`](Document::set_info) a `None` field leaves the existing value
+/// untouched (a partial update), while `Some(value)` overwrites it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InfoFields {
+    /// `/Title` — the document's title (`dc:title`).
+    pub title: Option<String>,
+    /// `/Author` — the name of the person who created the document (`dc:creator`).
+    pub author: Option<String>,
+    /// `/Subject` — the subject of the document (`dc:description`).
+    pub subject: Option<String>,
+    /// `/Keywords` — keywords associated with the document (`pdf:Keywords`).
+    pub keywords: Option<String>,
+    /// `/Creator` — the application that created the original document
+    /// (`xmp:CreatorTool`).
+    pub creator: Option<String>,
+    /// `/Producer` — the application that produced the PDF (`pdf:Producer`).
+    pub producer: Option<String>,
+    /// `/CreationDate` — a PDF date string `D:YYYYMMDDHHmmSS…` (`xmp:CreateDate`).
+    pub creation_date: Option<String>,
+    /// `/ModDate` — a PDF date string `D:YYYYMMDDHHmmSS…` (`xmp:ModifyDate`).
+    pub mod_date: Option<String>,
+}
+
+impl InfoFields {
+    /// Parse `InfoFields` from a JSON object. Recognised keys: `title`, `author`,
+    /// `subject`, `keywords`, `creator`, `producer`, `creationDate`/`creation_date`,
+    /// `modDate`/`mod_date` (all optional string values); unknown keys are ignored
+    /// and absent fields stay `None`.
+    pub fn from_json(s: &str) -> InfoFields {
+        let mut f = InfoFields::default();
+        let mut p = crate::headerfooter::ObjReader::new(s);
+        let _ = p.object(|p, key| {
+            match key {
+                "title" => f.title = Some(p.string()?),
+                "author" => f.author = Some(p.string()?),
+                "subject" => f.subject = Some(p.string()?),
+                "keywords" => f.keywords = Some(p.string()?),
+                "creator" => f.creator = Some(p.string()?),
+                "producer" => f.producer = Some(p.string()?),
+                "creationDate" | "creation_date" => f.creation_date = Some(p.string()?),
+                "modDate" | "mod_date" => f.mod_date = Some(p.string()?),
+                _ => p.skip_value()?,
+            }
+            Some(())
+        });
+        f
+    }
+
+    /// Overlay `other`'s set fields onto `self` (a partial update — `None` fields
+    /// in `other` leave `self` unchanged).
+    fn overlay(&mut self, other: &InfoFields) {
+        let merge = |dst: &mut Option<String>, src: &Option<String>| {
+            if src.is_some() {
+                *dst = src.clone();
+            }
+        };
+        merge(&mut self.title, &other.title);
+        merge(&mut self.author, &other.author);
+        merge(&mut self.subject, &other.subject);
+        merge(&mut self.keywords, &other.keywords);
+        merge(&mut self.creator, &other.creator);
+        merge(&mut self.producer, &other.producer);
+        merge(&mut self.creation_date, &other.creation_date);
+        merge(&mut self.mod_date, &other.mod_date);
+    }
+}
 
 /// One text element from [`Document::page_text_elements`]: the decoded text plus
 /// everything a host editor needs to recreate the run — its bounding box (page
@@ -10674,6 +10850,105 @@ impl Document {
         }
     }
 
+    // ─── XMP metadata + typed Info fields (ISO 32000-1 §14.3) ─────────────────
+
+    /// The document's XMP metadata packet — the catalog `/Metadata` stream
+    /// (ISO 32000-1 §14.3.2), decoded (filters applied). `None` when the document
+    /// carries no `/Metadata` stream. The bytes are the raw XMP/RDF XML.
+    pub fn xmp(&self) -> Option<Vec<u8>> {
+        let stream = self
+            .catalog()
+            .ok()?
+            .get(b"Metadata")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)?;
+        crate::filters::decode_stream(stream).ok()
+    }
+
+    /// Replace (or create) the document's XMP metadata — the catalog `/Metadata`
+    /// stream. The bytes are stored **uncompressed** (`/Type /Metadata
+    /// /Subtype /XML`), as readers and indexers expect to scan XMP from the raw
+    /// file. Re-uses the existing `/Metadata` object if there is one.
+    pub fn set_xmp(&mut self, xmp: &[u8]) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        let meta_id = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .and_then(|c| c.get(b"Metadata"))
+            .and_then(Object::as_reference)
+            .unwrap_or_else(|| (self.next_object_number(), 0u16));
+        let mut mdict = Dictionary::new();
+        mdict.set(b"Type".to_vec(), annot::name(b"Metadata"));
+        mdict.set(b"Subtype".to_vec(), annot::name(b"XML"));
+        mdict.set(b"Length".to_vec(), Object::Integer(xmp.len() as i64));
+        self.objects
+            .insert(meta_id, Object::Stream(Stream::new(mdict, xmp.to_vec())));
+
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        catalog.set(b"Metadata".to_vec(), Object::Reference(meta_id));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// The standard Info-dictionary fields ([`InfoFields`]) as currently stored
+    /// in `/Info` (each `None` when absent).
+    pub fn info_fields(&self) -> InfoFields {
+        InfoFields {
+            title: self.get_metadata("Title"),
+            author: self.get_metadata("Author"),
+            subject: self.get_metadata("Subject"),
+            keywords: self.get_metadata("Keywords"),
+            creator: self.get_metadata("Creator"),
+            producer: self.get_metadata("Producer"),
+            creation_date: self.get_metadata("CreationDate"),
+            mod_date: self.get_metadata("ModDate"),
+        }
+    }
+
+    /// Set the standard document-information fields, writing **both** the `/Info`
+    /// dictionary and the XMP `/Metadata` stream so the two never drift (ISO
+    /// 32000-2 deprecates the Info dict in favour of XMP, but real-world readers
+    /// still consult both). `fields` is a **partial** update — a `None` field
+    /// keeps the current value; a `Some(value)` overwrites it. The regenerated XMP
+    /// reflects the merged result (`dc:`, `xmp:` and `pdf:` namespaces).
+    pub fn set_info(&mut self, fields: &InfoFields) -> Result<()> {
+        let mut merged = self.info_fields();
+        merged.overlay(fields);
+
+        // 1. Write the /Info dictionary.
+        let id = self.info_dict_id();
+        let mut info = self
+            .objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let put = |info: &mut Dictionary, key: &[u8], value: &Option<String>| {
+            if let Some(v) = value {
+                info.set(key.to_vec(), pdf_text(v));
+            }
+        };
+        put(&mut info, b"Title", &merged.title);
+        put(&mut info, b"Author", &merged.author);
+        put(&mut info, b"Subject", &merged.subject);
+        put(&mut info, b"Keywords", &merged.keywords);
+        put(&mut info, b"Creator", &merged.creator);
+        put(&mut info, b"Producer", &merged.producer);
+        put(&mut info, b"CreationDate", &merged.creation_date);
+        put(&mut info, b"ModDate", &merged.mod_date);
+        self.objects.insert(id, Object::Dictionary(info));
+
+        // 2. Regenerate the XMP packet from the merged fields.
+        let xmp = info_to_xmp(&merged);
+        self.set_xmp(&xmp)
+    }
+
     // ─── form field creation (AcroForm, ISO 32000-1 §12.7) ───────────────────
 
     /// Ensure the catalog has an `/AcroForm` carrying a Helvetica in
@@ -18776,6 +19051,92 @@ mod tests {
             fa.get(b"Name").and_then(Object::as_name),
             Some(b"Paperclip".as_slice())
         );
+    }
+
+    #[test]
+    fn pdf_date_converts_to_iso8601() {
+        assert_eq!(
+            pdf_date_to_iso8601("D:20260624153000+02'00'").as_deref(),
+            Some("2026-06-24T15:30:00+02:00")
+        );
+        assert_eq!(
+            pdf_date_to_iso8601("D:20260101000000Z").as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        // Truncated forms default the missing parts.
+        assert_eq!(
+            pdf_date_to_iso8601("D:202606").as_deref(),
+            Some("2026-06-01T00:00:00")
+        );
+        assert_eq!(pdf_date_to_iso8601("garbage"), None);
+    }
+
+    #[test]
+    fn set_xmp_round_trips_and_is_none_when_absent() {
+        let mut doc = blank_doc();
+        assert!(doc.xmp().is_none(), "no /Metadata on a fresh document");
+        let packet = b"<?xpacket?><x:xmpmeta>custom</x:xmpmeta>";
+        doc.set_xmp(packet).unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert_eq!(reopened.xmp().as_deref(), Some(packet.as_slice()));
+        // Re-using the same /Metadata object on a second set.
+        let mut doc2 = reopened;
+        doc2.set_xmp(b"<x>v2</x>").unwrap();
+        assert_eq!(doc2.xmp().as_deref(), Some(b"<x>v2</x>".as_slice()));
+    }
+
+    #[test]
+    fn set_info_writes_info_dict_and_synced_xmp() {
+        let mut doc = blank_doc();
+        doc.set_info(&InfoFields {
+            title: Some("Quarterly Report".into()),
+            author: Some("Ada Lovelace".into()),
+            keywords: Some("finance, q3".into()),
+            creation_date: Some("D:20260624153000+02'00'".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        // Info dict.
+        let fields = reopened.info_fields();
+        assert_eq!(fields.title.as_deref(), Some("Quarterly Report"));
+        assert_eq!(fields.author.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(fields.keywords.as_deref(), Some("finance, q3"));
+        // XMP packet reflects the same values.
+        let xmp = String::from_utf8(reopened.xmp().expect("XMP written")).unwrap();
+        assert!(xmp.contains("<dc:title>"));
+        assert!(xmp.contains("Quarterly Report"));
+        assert!(xmp.contains("<rdf:li>Ada Lovelace</rdf:li>"));
+        assert!(xmp.contains("<pdf:Keywords>finance, q3</pdf:Keywords>"));
+        assert!(xmp.contains("<xmp:CreateDate>2026-06-24T15:30:00+02:00</xmp:CreateDate>"));
+    }
+
+    #[test]
+    fn set_info_is_a_partial_merge() {
+        let mut doc = blank_doc();
+        doc.set_info(&InfoFields {
+            title: Some("First".into()),
+            author: Some("Alice".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        // A second call updates only the title; the author is preserved.
+        doc.set_info(&InfoFields {
+            title: Some("Second".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let f = doc.info_fields();
+        assert_eq!(f.title.as_deref(), Some("Second"));
+        assert_eq!(
+            f.author.as_deref(),
+            Some("Alice"),
+            "untouched field preserved"
+        );
+        // XMP also reflects both (merged) values.
+        let xmp = String::from_utf8(doc.xmp().unwrap()).unwrap();
+        assert!(xmp.contains("Second") && xmp.contains("Alice"));
     }
 
     #[test]

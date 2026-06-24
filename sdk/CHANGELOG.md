@@ -4,6 +4,22 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.76.0] - 2026-06-24
+
+General document metadata (XMP + typed Info, kept in sync). Resolves
+[#7](https://github.com/qrcommunication/gigapdf-lib/issues/7).
+
+### Added
+
+- **`setInfo(fields)` / `getXmp()` / `setXmp(xmp)`.** `setInfo` writes the typed
+  document-information fields (`{ title?, author?, subject?, keywords?, creator?,
+  producer?, creationDate?, modDate? }`) to **both** the `/Info` dictionary and a
+  synced XMP `/Metadata` packet — a partial update (omitted fields are left
+  unchanged), curing the classic Info-vs-XMP "two sources of truth" drift.
+  `getXmp`/`setXmp` read and replace the raw XMP packet (bytes or string). New
+  `InfoFields` type. The single-key `setMetadata(key, value)` is unchanged (it
+  touches only `/Info`).
+
 ## [0.75.0] - 2026-06-24
 
 Writable file attachments + Factur-X / ZUGFeRD `/AF`. Resolves

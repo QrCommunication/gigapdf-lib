@@ -335,6 +335,36 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("metadata: setInfo writes Info + synced XMP, getXmp/setXmp round-trip", () => {
+    const doc = giga.open(giga.txtToPdf("Meta"));
+    expect(doc.getXmp()).toBeNull();
+
+    expect(
+      doc.setInfo({ title: "Annual Report", author: "Ada Lovelace", keywords: "finance, 2026" })
+    ).toBe(true);
+
+    const reopened = giga.open(doc.save());
+    // Info dict (via the existing single-key reader).
+    expect(reopened.getMetadata("Title")).toBe("Annual Report");
+    expect(reopened.getMetadata("Author")).toBe("Ada Lovelace");
+    // XMP packet reflects the same values.
+    const xmp = new TextDecoder().decode(reopened.getXmp()!);
+    expect(xmp).toContain("<dc:title>");
+    expect(xmp).toContain("Annual Report");
+    expect(xmp).toContain("<rdf:li>Ada Lovelace</rdf:li>");
+
+    // Partial update: change only the title, author preserved.
+    reopened.setInfo({ title: "Revised Report" });
+    expect(reopened.getMetadata("Title")).toBe("Revised Report");
+    expect(reopened.getMetadata("Author")).toBe("Ada Lovelace");
+
+    // Raw XMP override round-trips.
+    reopened.setXmp("<?xpacket?><x:xmpmeta>custom</x:xmpmeta>");
+    expect(new TextDecoder().decode(reopened.getXmp()!)).toContain("custom");
+    reopened.close();
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

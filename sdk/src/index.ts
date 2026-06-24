@@ -1971,6 +1971,32 @@ export interface AttachmentOptions {
 /** The visual marker of a {@link GigaPdfDoc.addFileAttachmentAnnot} annotation. */
 export type FileAttachmentIcon = "PushPin" | "Paperclip" | "Graph" | "Tag";
 
+/**
+ * The standard document-information fields (ISO 32000-1 §14.3.3), shared by the
+ * `/Info` dictionary and the XMP `/Metadata` packet. Passed to
+ * {@link GigaPdfDoc.setInfo}, which writes both and keeps them in sync. Every
+ * field is optional; on `setInfo` an omitted field is left unchanged (a partial
+ * update). Dates are PDF date strings (`"D:YYYYMMDDHHmmSS+HH'mm'"`).
+ */
+export interface InfoFields {
+  /** `/Title` → `dc:title`. */
+  title?: string;
+  /** `/Author` → `dc:creator`. */
+  author?: string;
+  /** `/Subject` → `dc:description`. */
+  subject?: string;
+  /** `/Keywords` → `pdf:Keywords`. */
+  keywords?: string;
+  /** `/Creator` (authoring app) → `xmp:CreatorTool`. */
+  creator?: string;
+  /** `/Producer` (PDF producer) → `pdf:Producer`. */
+  producer?: string;
+  /** `/CreationDate` (PDF date string) → `xmp:CreateDate`. */
+  creationDate?: string;
+  /** `/ModDate` (PDF date string) → `xmp:ModifyDate`. */
+  modDate?: string;
+}
+
 /** One sheet read back from an `.xlsx` by {@link GigaPdfEngine.xlsxToGrids}. */
 export interface XlsxSheet {
   name: string;
@@ -3526,11 +3552,51 @@ export class GigaPdfDoc {
       this.g._str((o) => this.ex().gp_get_metadata(this.h, p, l, o))
     );
   }
-  /** Set an Info-dictionary entry (e.g. "Title", "Author"). */
+  /**
+   * Set a **single** Info-dictionary entry (e.g. `"Title"`, `"Author"`). This
+   * touches only `/Info`; use {@link setInfo} to update the typed fields and keep
+   * the XMP `/Metadata` packet in sync.
+   */
   setMetadata(key: string, value: string): boolean {
     return (
       this.g._withStr(key, (kP, kL) =>
         this.g._withStr(value, (vP, vL) => this.ex().gp_set_metadata(this.h, kP, kL, vP, vL))
+      ) === 0
+    );
+  }
+
+  /**
+   * The document's XMP metadata packet (catalog `/Metadata`, ISO 32000-1 §14.3.2)
+   * as raw bytes, or `null` when the document carries no XMP.
+   */
+  getXmp(): Uint8Array | null {
+    const bytes = this.g._buffer((o) => this.ex().gp_get_xmp(this.h, o));
+    return bytes.length === 0 ? null : bytes;
+  }
+
+  /**
+   * Replace (or create) the document's XMP metadata stream (catalog `/Metadata`,
+   * stored uncompressed). Accepts a UTF-8 string or raw bytes. Returns `true` on
+   * success.
+   */
+  setXmp(xmp: Uint8Array | string): boolean {
+    const bytes = typeof xmp === "string" ? new TextEncoder().encode(xmp) : xmp;
+    return this.g._withBytes(bytes, (p, l) => this.ex().gp_set_xmp(this.h, p, l)) === 0;
+  }
+
+  /**
+   * Set the standard document-information fields, writing **both** the `/Info`
+   * dictionary and a synced XMP `/Metadata` packet so the two never drift. This is
+   * a **partial** update — only the fields you provide are changed; omit a field
+   * to leave it untouched. Returns `true` on success.
+   *
+   * @example
+   * doc.setInfo({ title: "Annual Report", author: "Ada Lovelace", keywords: "finance, 2026" });
+   */
+  setInfo(fields: InfoFields): boolean {
+    return (
+      this.g._withStr(JSON.stringify(fields), (p, l) =>
+        this.ex().gp_set_info_json(this.h, p, l)
       ) === 0
     );
   }

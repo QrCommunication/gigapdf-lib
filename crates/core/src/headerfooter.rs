@@ -258,13 +258,15 @@ impl HeaderFooter {
 /// booleans, `null`, and number arrays. Object/array *values* it does not need
 /// are skipped structurally. Zero-dependency, in the same spirit as
 /// [`convert::grids`](crate::convert)'s `Reader`.
-struct ObjReader<'a> {
+/// A minimal, zero-dependency JSON reader for small config objects. `pub(crate)`
+/// so other features (e.g. `InfoFields::from_json`) can reuse it.
+pub(crate) struct ObjReader<'a> {
     b: &'a [u8],
     i: usize,
 }
 
 impl<'a> ObjReader<'a> {
-    fn new(s: &'a str) -> Self {
+    pub(crate) fn new(s: &'a str) -> Self {
         Self {
             b: s.as_bytes(),
             i: 0,
@@ -297,7 +299,10 @@ impl<'a> ObjReader<'a> {
 
     /// `{ "key": value (, "key": value)* }` — invokes `member(self, key)` for
     /// each pair, which must consume exactly that pair's value.
-    fn object(&mut self, mut member: impl FnMut(&mut Self, &str) -> Option<()>) -> Option<()> {
+    pub(crate) fn object(
+        &mut self,
+        mut member: impl FnMut(&mut Self, &str) -> Option<()>,
+    ) -> Option<()> {
         self.eat(b'{')?;
         if self.peek()? == b'}' {
             self.i += 1;
@@ -320,7 +325,7 @@ impl<'a> ObjReader<'a> {
 
     /// A JSON string. Standard escapes (`\" \\ \/ \n \r \t \b \f \uXXXX`,
     /// surrogate pairs) are decoded; UTF-8 bytes pass through.
-    fn string(&mut self) -> Option<String> {
+    pub(crate) fn string(&mut self) -> Option<String> {
         self.eat(b'"')?;
         let mut buf: Vec<u8> = Vec::new();
         loop {
@@ -458,7 +463,7 @@ impl<'a> ObjReader<'a> {
 
     /// Consume and discard the value at the cursor (any JSON value), so unknown
     /// object keys don't abort the parse.
-    fn skip_value(&mut self) -> Option<()> {
+    pub(crate) fn skip_value(&mut self) -> Option<()> {
         match self.peek()? {
             b'"' => {
                 self.string()?;
