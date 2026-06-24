@@ -3801,9 +3801,20 @@ fn odp_page_model(
                     // A positioned frame → an absolutely-placed shape (consumes its
                     // subtree). A frame without a usable box falls through to the
                     // flow branches below so its inner content is still captured.
-                    "frame" if !sc && odp_frame_box(&attrs).is_some() => {
-                        let bx = odp_frame_box(&attrs).unwrap();
-                        odp_frame_model(x, zip, styles, geom, (0.0, 0.0), bx, resources, &mut shapes);
+                    "frame" if !sc && odp_frame_box_xf(&attrs).is_some() => {
+                        let bx = odp_frame_box_xf(&attrs).unwrap();
+                        odp_frame_model(
+                            x,
+                            zip,
+                            styles,
+                            geom,
+                            (0.0, 0.0),
+                            bx,
+                            &attrs,
+                            resources,
+                            &mut shapes,
+                            &mut placeholders,
+                        );
                     }
                     // A group: descend, composing the group's own offset.
                     "g" if !sc => {
@@ -3820,12 +3831,14 @@ fn odp_page_model(
                         );
                     }
                     "p" if !sc => {
+                        let role =
+                            odp_placeholder_role(&attrs).unwrap_or(model::PlaceholderRole::Body);
                         let ctx = OdfModelCtx::styles_only(zip, styles);
                         let mut anchored: Vec<Block> = Vec::new();
                         let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
                         if !runs.is_empty() {
                             placeholders.push(model::Placeholder {
-                                role: model::PlaceholderRole::Body,
+                                role,
                                 block: Block {
                                     kind: BlockKind::Paragraph(Paragraph {
                                         runs,
@@ -3839,9 +3852,14 @@ fn odp_page_model(
                     "image" if sc => {
                         if let Some(href) = attr(&attrs, "href") {
                             let key = href.trim_start_matches('/').to_string();
-                            if let Some(img) = image_block(zip, &key, resources) {
+                            if let Some(mut img) = image_block(zip, &key, resources) {
+                                if let BlockKind::Image(ir) = &mut img.kind {
+                                    ir.alt = odp_frame_alt(None, None, &attrs);
+                                }
                                 placeholders.push(model::Placeholder {
-                                    role: model::PlaceholderRole::Other("picture".to_string()),
+                                    role: odp_placeholder_role(&attrs).unwrap_or_else(|| {
+                                        model::PlaceholderRole::Other("picture".to_string())
+                                    }),
                                     block: img,
                                 });
                             }
@@ -3899,9 +3917,20 @@ fn odp_group_model(
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
                 match ln {
-                    "frame" if !sc && odp_frame_box(&attrs).is_some() => {
-                        let bx = odp_frame_box(&attrs).unwrap();
-                        odp_frame_model(x, zip, styles, geom, off, bx, resources, shapes);
+                    "frame" if !sc && odp_frame_box_xf(&attrs).is_some() => {
+                        let bx = odp_frame_box_xf(&attrs).unwrap();
+                        odp_frame_model(
+                            x,
+                            zip,
+                            styles,
+                            geom,
+                            off,
+                            bx,
+                            &attrs,
+                            resources,
+                            shapes,
+                            placeholders,
+                        );
                     }
                     "g" if !sc => {
                         let (gx, gy) = odp_group_offset(&attrs);
@@ -3917,12 +3946,14 @@ fn odp_group_model(
                         );
                     }
                     "p" if !sc => {
+                        let role =
+                            odp_placeholder_role(&attrs).unwrap_or(model::PlaceholderRole::Body);
                         let ctx = OdfModelCtx::styles_only(zip, styles);
                         let mut anchored: Vec<Block> = Vec::new();
                         let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
                         if !runs.is_empty() {
                             placeholders.push(model::Placeholder {
-                                role: model::PlaceholderRole::Body,
+                                role,
                                 block: Block {
                                     kind: BlockKind::Paragraph(Paragraph {
                                         runs,
@@ -3936,9 +3967,14 @@ fn odp_group_model(
                     "image" if sc => {
                         if let Some(href) = attr(&attrs, "href") {
                             let key = href.trim_start_matches('/').to_string();
-                            if let Some(img) = image_block(zip, &key, resources) {
+                            if let Some(mut img) = image_block(zip, &key, resources) {
+                                if let BlockKind::Image(ir) = &mut img.kind {
+                                    ir.alt = odp_frame_alt(None, None, &attrs);
+                                }
                                 placeholders.push(model::Placeholder {
-                                    role: model::PlaceholderRole::Other("picture".to_string()),
+                                    role: odp_placeholder_role(&attrs).unwrap_or_else(|| {
+                                        model::PlaceholderRole::Other("picture".to_string())
+                                    }),
                                     block: img,
                                 });
                             }
@@ -3954,12 +3990,16 @@ fn odp_group_model(
 }
 
 /// Lower one positioned `draw:frame` (open consumed; `bx` = its `(x, y, w, h)`
-/// page box in points, `off` = the enclosing group offset) to a shape [`Block`]
-/// in `shapes`, with a lower-left-origin [`Rect`] frame. The frame body — a
-/// `draw:text-box` of paragraphs, or a `draw:image` — chooses the block kind:
-/// a single image ⇒ [`BlockKind::Image`]; otherwise a [`BlockKind::TextBox`]
-/// holding the captured blocks. An empty frame is dropped. Consumes up to
-/// `</draw:frame>`.
+/// page box in points, `off` = the enclosing group offset). The block carries a
+/// lower-left-origin [`Rect`] frame and the CCW rotation parsed from the frame's
+/// [`draw:transform`](odp_transform_rotation). The frame body — a `draw:text-box`
+/// of paragraphs, or a `draw:image` — chooses the block kind: a single image ⇒
+/// [`BlockKind::Image`] (its `alt` taken from the frame's
+/// `svg:title`/`svg:desc`/`draw:name`); otherwise a [`BlockKind::TextBox`]. A
+/// **text** frame tagged with `presentation:class` is emitted as a semantic
+/// [`model::Placeholder`] (mirroring the PPTX `p:ph` path); everything else lands
+/// in `shapes` (a picture is not a placeholder). An empty frame is dropped.
+/// Consumes up to `</draw:frame>`.
 #[allow(clippy::too_many_arguments)]
 fn odp_frame_model(
     x: &mut Xml,
@@ -3968,11 +4008,15 @@ fn odp_frame_model(
     geom: PageGeom,
     off: (f64, f64),
     bx: (f64, f64, f64, f64),
+    frame_attrs: &[(String, String)],
     resources: &mut BTreeMap<u64, model::ImageResource>,
     shapes: &mut Vec<Block>,
+    placeholders: &mut Vec<model::Placeholder>,
 ) {
     let mut blocks: Vec<Block> = Vec::new();
     let mut image: Option<model::ImageRef> = None;
+    let mut title: Option<String> = None;
+    let mut desc: Option<String> = None;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
@@ -3992,6 +4036,10 @@ fn odp_frame_model(
                             });
                         }
                     }
+                    // Accessible alt text: `svg:title`/`svg:desc` carry their text
+                    // as a single child node; capture it for `ImageRef::alt`.
+                    "title" if !sc && title.is_none() => title = Some(xml_text_until(x, "title")),
+                    "desc" if !sc && desc.is_none() => desc = Some(xml_text_until(x, "desc")),
                     "image" if image.is_none() => {
                         if let Some(href) = attr(&attrs, "href") {
                             let key = href.trim_start_matches('/').to_string();
@@ -4011,20 +4059,31 @@ fn odp_frame_model(
     let top_x = fx + off.0;
     let top_y = fy + off.1;
     let rect = model::Rect::new(top_x, (geom.h - (top_y + fh)).max(0.0), fw, fh);
+    let rotation = odp_transform_rotation(frame_attrs);
 
-    let kind = if !blocks.is_empty() {
+    if !blocks.is_empty() {
         // A text frame: a text box of the captured editable blocks. (An image
         // alongside text is rare for a placeholder frame; the text runs win.)
-        Some(BlockKind::TextBox(model::TextBox { blocks }))
-    } else {
-        // No text: a pure picture frame becomes an image block; an empty frame
-        // is dropped.
-        image.map(BlockKind::Image)
-    };
-    if let Some(kind) = kind {
+        let block = Block {
+            frame: Some(rect),
+            rotation,
+            kind: BlockKind::TextBox(model::TextBox { blocks }),
+            ..Block::default()
+        };
+        // A `presentation:class` makes this a semantic placeholder (title/body/…);
+        // otherwise it is a free text shape.
+        match odp_placeholder_role(frame_attrs) {
+            Some(role) => placeholders.push(model::Placeholder { role, block }),
+            None => shapes.push(block),
+        }
+    } else if let Some(mut img) = image {
+        // No text: a pure picture frame becomes an image block (carrying any alt
+        // text); an empty frame is dropped.
+        img.alt = odp_frame_alt(title, desc, frame_attrs);
         shapes.push(Block {
             frame: Some(rect),
-            kind,
+            rotation,
+            kind: BlockKind::Image(img),
             ..Block::default()
         });
     }
@@ -4330,6 +4389,29 @@ fn attr<'b>(attrs: &'b [(String, String)], local_name: &str) -> Option<&'b str> 
         .iter()
         .find(|(k, _)| local(k).eq_ignore_ascii_case(local_name))
         .map(|(_, v)| v.as_str())
+}
+
+/// Concatenate the text content of the currently-open element (its open tag
+/// already consumed) up to its matching close `</…>` (local name `tag`),
+/// skipping any markup in between. Nested same-name opens are tracked so the
+/// close that ends the right element is found.
+fn xml_text_until(x: &mut Xml, tag: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 1usize;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, sc) if !sc && local(&name) == tag => depth += 1,
+            Tok::Close(name) if local(&name) == tag => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            Tok::Text(t) => out.push_str(&t),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Decode XML entities — delegates to the shared decoder in [`super::reverse`].
@@ -10176,6 +10258,140 @@ fn odp_frame_box(attrs: &[(String, String)]) -> Option<(f64, f64, f64, f64)> {
     Some((x, y, w, h))
 }
 
+/// The frame box of a `draw:frame` that may be positioned solely through a
+/// `draw:transform` (LibreOffice emits rotated frames as `rotate(θ) translate(x y)`
+/// and omits `svg:x`/`svg:y`). Returns `(x, y, w, h)` in points: the origin is
+/// `svg:x`/`svg:y` when present, else the `translate(…)` component of
+/// `draw:transform`; a non-zero `svg:width`/`svg:height` is always required.
+fn odp_frame_box_xf(attrs: &[(String, String)]) -> Option<(f64, f64, f64, f64)> {
+    if let Some(bx) = odp_frame_box(attrs) {
+        return Some(bx);
+    }
+    let w = attr(attrs, "width").and_then(parse_odf_pt)?;
+    let h = attr(attrs, "height").and_then(parse_odf_pt)?;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let (tx, ty) = attr(attrs, "transform").and_then(odp_transform_translate)?;
+    // The transform places the frame's lower-left corner (ODF text origin, Y up);
+    // the model box is top-left/Y-down, so the top is `ty - h`.
+    Some((tx, ty - h, w, h))
+}
+
+/// Parse the `rotate(<angle>)` of a `draw:transform` into the model's CCW
+/// [`Rotation`]. ODF angles are **radians, counter-clockwise** (§19.228) — the
+/// same orientation as [`crate::model::Rotation`], so we only convert rad→deg and
+/// snap the exact quarter turns. No `rotate` (or only translate/scale) ⇒ `D0`.
+fn odp_transform_rotation(attrs: &[(String, String)]) -> crate::model::Rotation {
+    use crate::model::Rotation;
+    let Some(rad) = attr(attrs, "transform").and_then(odp_transform_rotate_rad) else {
+        return Rotation::D0;
+    };
+    let mut deg = rad.to_degrees() % 360.0;
+    if deg < 0.0 {
+        deg += 360.0;
+    }
+    if deg.abs() < 1e-6 || (deg - 360.0).abs() < 1e-6 {
+        Rotation::D0
+    } else if (deg - 90.0).abs() < 1e-6 {
+        Rotation::D90
+    } else if (deg - 180.0).abs() < 1e-6 {
+        Rotation::D180
+    } else if (deg - 270.0).abs() < 1e-6 {
+        Rotation::D270
+    } else {
+        Rotation::Deg(deg)
+    }
+}
+
+/// Extract the `rotate(<rad>)` angle (radians) from a `draw:transform` value list,
+/// e.g. `"rotate(0.5235987756) translate(2cm 3cm)"`. `None` if absent/malformed.
+fn odp_transform_rotate_rad(transform: &str) -> Option<f64> {
+    odp_transform_fn_args(transform, "rotate")?
+        .first()
+        .and_then(|a| a.trim().parse::<f64>().ok())
+}
+
+/// Extract the `translate(<x> <y>)` offset (points) from a `draw:transform`. The
+/// two args are ODF lengths separated by whitespace and/or a comma. `None` if no
+/// `translate(…)` is present or its components are not parseable lengths.
+fn odp_transform_translate(transform: &str) -> Option<(f64, f64)> {
+    let args = odp_transform_fn_args(transform, "translate")?;
+    let x = args.first().and_then(|a| parse_odf_pt(a))?;
+    let y = args.get(1).and_then(|a| parse_odf_pt(a))?;
+    Some((x, y))
+}
+
+/// Pull the whitespace/comma-separated argument list of the first `name(…)`
+/// function in a `draw:transform` value (e.g. `translate` → `["2cm", "3cm"]`).
+/// `None` if the named function is not present.
+fn odp_transform_fn_args(transform: &str, name: &str) -> Option<Vec<String>> {
+    let mut rest = transform;
+    while let Some(open) = rest.find('(') {
+        let head = rest[..open].trim_start();
+        // The function name is the token ending right before the '(' — match it
+        // exactly so `rotate` does not also catch a hypothetical `xrotate`.
+        let fname = head
+            .rsplit(|c: char| c.is_whitespace() || c == ')')
+            .next()?;
+        let close = rest[open + 1..].find(')')? + open + 1;
+        let body = &rest[open + 1..close];
+        if fname == name {
+            return Some(
+                body.split([' ', '\t', '\n', '\r', ','])
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
+        }
+        rest = &rest[close + 1..];
+    }
+    None
+}
+
+/// Map a `presentation:class` value to the portable [`PlaceholderRole`]. ODF
+/// presentation classes (`title`, `subtitle`, `outline`, `text`, `notes`,
+/// `page-number`, …) collapse onto the model's first-class roles where they have
+/// an equivalent, otherwise [`PlaceholderRole::Other`] keeps the original token.
+/// `None` ⇒ the element carried no `presentation:class`.
+fn odp_placeholder_role(attrs: &[(String, String)]) -> Option<crate::model::PlaceholderRole> {
+    use crate::model::PlaceholderRole;
+    let class = attr(attrs, "class")?.trim();
+    Some(match class {
+        "title" | "ctrTitle" => PlaceholderRole::Title,
+        "subtitle" => PlaceholderRole::Subtitle,
+        "outline" | "text" | "body" | "subtitle-text" => PlaceholderRole::Body,
+        other => PlaceholderRole::Other(other.to_string()),
+    })
+}
+
+/// Read a `draw:frame`'s accessible alt text: the text of its `svg:title` or
+/// `svg:desc` child (title preferred), falling back to the `xlink:title` then
+/// `draw:name` attribute. `None` if nothing descriptive is present. Used to fill
+/// [`crate::model::ImageRef::alt`] for picture frames.
+fn odp_frame_alt(
+    title: Option<String>,
+    desc: Option<String>,
+    attrs: &[(String, String)],
+) -> Option<String> {
+    let pick = |s: Option<String>| {
+        s.filter(|t| !t.trim().is_empty())
+            .map(|t| t.trim().to_string())
+    };
+    pick(title)
+        .or_else(|| pick(desc))
+        .or_else(|| {
+            attr(attrs, "title")
+                .map(str::to_string)
+                .filter(|t| !t.trim().is_empty())
+        })
+        .or_else(|| {
+            attr(attrs, "name")
+                .map(str::to_string)
+                .filter(|t| !t.trim().is_empty())
+        })
+}
+
 /// Render a positioned `draw:frame` (open consumed; `bx` = its page box) as an
 /// absolutely-positioned `<div>`. The body is the frame's `draw:text-box`
 /// paragraphs and `draw:image`s. Consumes the subtree up to `</draw:frame>`.
@@ -14199,6 +14415,161 @@ mod tests {
         assert!((f.x - 11.0 * cm).abs() < 1e-3, "x: {}", f.x);
         let exp_y = 540.0 - (6.0 + 3.0) * cm;
         assert!((f.y - exp_y).abs() < 1e-3, "y: {} exp {}", f.y, exp_y);
+    }
+
+    #[test]
+    fn odp_model_frame_transform_rotation_into_block() {
+        // `draw:transform="rotate(<rad>)"` on a positioned frame folds into the
+        // model's CCW `Block.rotation`. ODF angles are radians CCW; 90° = π/2 and
+        // snaps to the first-class `D90`.
+        let slide = odp_model_slide(
+            r#"<draw:frame svg:x="2cm" svg:y="1cm" svg:width="8cm" svg:height="3cm"
+                          draw:transform="rotate(1.5707963267948966)">
+                 <draw:text-box><text:p>Tilted</text:p></draw:text-box>
+               </draw:frame>"#,
+            &[],
+        );
+        assert_eq!(slide.shapes.len(), 1, "no presentation:class → free shape");
+        assert_eq!(slide.shapes[0].rotation, crate::model::Rotation::D90);
+        assert_eq!(block_text(&slide.shapes[0]), "Tilted");
+    }
+
+    #[test]
+    fn odp_model_frame_transform_arbitrary_angle_and_translate_origin() {
+        // A frame positioned solely through `draw:transform` (no svg:x/y), as
+        // LibreOffice emits rotated frames: `rotate(0.785…) translate(4cm 8cm)`.
+        // 0.7853981633974483 rad = 45° → free-form `Deg(45)`; the translate's
+        // lower-left origin (Y up) becomes the model box top-left (Y down).
+        let slide = odp_model_slide(
+            r#"<draw:frame svg:width="6cm" svg:height="2cm"
+                          draw:transform="rotate(0.7853981633974483) translate(4cm 8cm)">
+                 <draw:text-box><text:p>Skewed</text:p></draw:text-box>
+               </draw:frame>"#,
+            &[],
+        );
+        assert_eq!(slide.shapes.len(), 1, "transform-only frame still placed");
+        let s = &slide.shapes[0];
+        match s.rotation {
+            crate::model::Rotation::Deg(d) => assert!((d - 45.0).abs() < 1e-6, "deg: {d}"),
+            other => panic!("expected Deg(45), got {other:?}"),
+        }
+        let f = s.frame.expect("frame from transform translate");
+        let cm = 28.3464567;
+        // translate x → box x; translate y is the LL origin (Y up): top = 8cm - 2cm,
+        // lower-left model y = 540 - (top + h) = 540 - 8cm.
+        assert!((f.x - 4.0 * cm).abs() < 1e-3, "x: {}", f.x);
+        let exp_y = 540.0 - 8.0 * cm;
+        assert!((f.y - exp_y).abs() < 1e-3, "y: {} exp {}", f.y, exp_y);
+        assert_eq!(block_text(s), "Skewed");
+    }
+
+    #[test]
+    fn odp_model_presentation_class_maps_placeholder_roles() {
+        // `presentation:class` on positioned text frames maps to the model's
+        // semantic `PlaceholderRole`: title→Title, subtitle→Subtitle, outline→Body,
+        // and an unknown class is preserved verbatim as `Other`.
+        let slide = odp_model_slide(
+            r#"<draw:frame presentation:class="title" svg:x="1cm" svg:y="1cm" svg:width="20cm" svg:height="3cm">
+                 <draw:text-box><text:p>The Title</text:p></draw:text-box>
+               </draw:frame>
+               <draw:frame presentation:class="subtitle" svg:x="1cm" svg:y="5cm" svg:width="20cm" svg:height="2cm">
+                 <draw:text-box><text:p>The Subtitle</text:p></draw:text-box>
+               </draw:frame>
+               <draw:frame presentation:class="outline" svg:x="1cm" svg:y="8cm" svg:width="20cm" svg:height="6cm">
+                 <draw:text-box><text:p>Bullet</text:p></draw:text-box>
+               </draw:frame>
+               <draw:frame presentation:class="footer" svg:x="1cm" svg:y="17cm" svg:width="20cm" svg:height="1cm">
+                 <draw:text-box><text:p>Footer text</text:p></draw:text-box>
+               </draw:frame>"#,
+            &[],
+        );
+        // Text frames with a presentation:class become placeholders, not shapes.
+        assert!(
+            slide.shapes.is_empty(),
+            "classed text frames → placeholders"
+        );
+        let role_of = |txt: &str| {
+            slide
+                .placeholders
+                .iter()
+                .find(|p| block_text(&p.block) == txt)
+                .map(|p| p.role.clone())
+                .unwrap_or_else(|| panic!("no placeholder {txt:?}"))
+        };
+        assert_eq!(role_of("The Title"), model::PlaceholderRole::Title);
+        assert_eq!(role_of("The Subtitle"), model::PlaceholderRole::Subtitle);
+        assert_eq!(role_of("Bullet"), model::PlaceholderRole::Body);
+        assert_eq!(
+            role_of("Footer text"),
+            model::PlaceholderRole::Other("footer".to_string())
+        );
+    }
+
+    #[test]
+    fn odp_model_bare_paragraph_presentation_class_maps_role() {
+        // A bare `text:p` under the page carrying `presentation:class` is tagged
+        // with that role (not the default Body).
+        let slide = odp_model_slide(
+            r#"<text:p presentation:class="title">Bare Title</text:p>"#,
+            &[],
+        );
+        assert_eq!(slide.placeholders.len(), 1);
+        assert_eq!(slide.placeholders[0].role, model::PlaceholderRole::Title);
+        assert_eq!(block_text(&slide.placeholders[0].block), "Bare Title");
+    }
+
+    #[test]
+    fn odp_model_image_alt_from_svg_title_desc() {
+        // `svg:title` (preferred) supplies the picture frame's `ImageRef.alt`.
+        let slide = odp_model_slide(
+            r#"<draw:frame svg:x="1cm" svg:y="1cm" svg:width="4cm" svg:height="4cm">
+                 <svg:title>A red square</svg:title>
+                 <svg:desc>Longer description</svg:desc>
+                 <draw:image xlink:href="Pictures/x.png"/>
+               </draw:frame>"#,
+            &[("Pictures/x.png", red_png())],
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        match &slide.shapes[0].kind {
+            BlockKind::Image(ir) => {
+                assert_eq!(ir.alt.as_deref(), Some("A red square"), "svg:title wins");
+            }
+            other => panic!("expected an Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn odp_model_image_alt_falls_back_to_draw_name() {
+        // With no svg:title/desc, the frame's `draw:name` is used as alt text.
+        let slide = odp_model_slide(
+            r#"<draw:frame draw:name="Logo" svg:x="1cm" svg:y="1cm" svg:width="4cm" svg:height="4cm">
+                 <draw:image xlink:href="Pictures/x.png"/>
+               </draw:frame>"#,
+            &[("Pictures/x.png", red_png())],
+        );
+        match &slide.shapes[0].kind {
+            BlockKind::Image(ir) => assert_eq!(ir.alt.as_deref(), Some("Logo")),
+            other => panic!("expected an Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn odp_transform_helpers_parse_rotate_and_translate() {
+        // Unit-level checks of the `draw:transform` value parser.
+        assert_eq!(
+            odp_transform_rotate_rad("rotate(1.5707963267948966) translate(2cm 3cm)"),
+            Some(1.5707963267948966)
+        );
+        assert_eq!(
+            odp_transform_translate("rotate(0.5) translate(2cm 3cm)"),
+            Some((2.0 * 28.3464567, 3.0 * 28.3464567))
+        );
+        // No rotate present → D0; only a translate present → no angle.
+        assert_eq!(
+            odp_transform_rotation(&[("draw:transform".into(), "translate(1cm 2cm)".into())]),
+            crate::model::Rotation::D0
+        );
+        assert!(odp_transform_rotate_rad("translate(1cm 2cm)").is_none());
     }
 
     #[test]
