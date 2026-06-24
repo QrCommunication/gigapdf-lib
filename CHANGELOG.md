@@ -7,6 +7,21 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.88.0] - 2026-06-24
+
+HTML/CSS renderer — column-axis flex sizing ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).
+
+### Added
+
+- **`flex-basis` / `flex-grow` / `flex-shrink` on the column axis.** A
+  `flex-direction: column` container now flexes item **heights**: `flex-basis`
+  (or a definite `height`) sets an item's main size; with a definite container
+  `height`, `flex-grow` distributes the leftover and `flex-shrink × basis` absorbs
+  overflow — exactly as the row axis already did for widths. `flex_column_axis`
+  became a two-pass layout (measure content → re-flex heights → reposition),
+  preserving the existing content-sized + `justify-content` behaviour when no
+  flex sizing applies.
+
 ## [0.87.2] - 2026-06-24
 
 HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item C).

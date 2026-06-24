@@ -2777,16 +2777,34 @@ impl Flow<'_> {
         na: &[&Element],
     ) -> f64 {
         let gap = style.gap_row;
+        // The container's available main-axis (height) extent, if definite — the
+        // basis for `flex-grow`/`flex-shrink` and `%` `flex-basis` on this axis.
+        let avail_main = style.height.or(style.min_height);
+
+        // Pass 1: lay each item's content out at its natural (content-stacked)
+        // position, recording the metrics needed to re-flex its main size.
+        struct ColItem {
+            range: (usize, usize),
+            natural_top: f64,
+            content_h: f64,
+            box_x: f64,
+            box_w: f64,
+            margin_top: f64,
+            margin_bottom: f64,
+            grow: f64,
+            shrink: f64,
+            basis: Option<f64>,
+            istyle: Style,
+        }
+        let mut cols: Vec<ColItem> = Vec::with_capacity(items.len());
         let mut y = row_top;
-        // Per-item fragment ranges so we can redistribute for justify-content.
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(items.len());
         for (i, it) in items.iter().enumerate() {
             if i > 0 {
                 y += gap;
             }
             let istyle = self.style_of(it, style, na);
             let nca = push_ancestor(na, it);
-            let im = &istyle.margin;
+            let im = istyle.margin;
             let ip = &istyle.padding;
             let ib = &istyle.border_width;
             y += im.top;
@@ -2819,40 +2837,90 @@ impl Flow<'_> {
                 &istyle,
                 content_x + im.left + dx + ib.left + ip.left,
                 inner_w,
-                y + ip.top + ib.top,
+                item_top + ip.top + ib.top,
                 &nca,
             );
-            let item_bottom = cy + ip.bottom + ib.bottom;
-            self.paint_item_box(
-                &istyle,
-                content_x + im.left + dx,
-                item_top,
+            let content_h = (cy + ip.bottom + ib.bottom - item_top).max(0.0);
+            // The main-axis basis: `flex-basis`, else a definite `height`. `%`
+            // resolves against the container's definite height (else content).
+            let basis = match istyle.flex_basis {
+                Some(Len::Pt(v)) => Some(v.max(0.0)),
+                Some(Len::Percent(pc)) => {
+                    Some(avail_main.map(|a| a * pc / 100.0).unwrap_or(content_h))
+                }
+                None => istyle.height,
+            };
+            cols.push(ColItem {
+                range: (start, self.out.len()),
+                natural_top: item_top,
+                content_h,
+                box_x: content_x + im.left + dx,
                 box_w,
-                item_bottom - item_top,
-            );
-            ranges.push((start, self.out.len()));
-            y = item_bottom + im.bottom;
+                margin_top: im.top,
+                margin_bottom: im.bottom,
+                grow: istyle.flex_grow.max(0.0),
+                shrink: istyle.flex_shrink.max(0.0),
+                basis,
+                istyle,
+            });
+            y = item_top + content_h + im.bottom;
         }
 
-        // Block-axis `justify-content`: only meaningful with an explicit
-        // container height that exceeds the content. Distribute the free space.
-        if let Some(h) = style.height.or(style.min_height) {
-            let used = y - row_top;
-            let free = h - used;
-            if free > 0.01 && !items.is_empty() {
-                let (offset, item_gap) = justify_offsets(style.justify, free, items.len());
-                for (i, (s, e)) in ranges.iter().enumerate() {
-                    let dy = offset + item_gap * i as f64;
-                    if dy.abs() > f64::EPSILON {
-                        for a in &mut self.out[*s..*e] {
-                            shift_fragment(&mut a.frag, 0.0, dy);
-                        }
-                    }
+        // Resolve each item's final main-axis height: its basis (or content),
+        // then distribute the container's leftover height by `flex-grow`, or
+        // shrink it back by `flex-shrink × basis` when the items overflow. Any
+        // height the items don't absorb is left for `justify-content`.
+        let n = cols.len();
+        let mut heights: Vec<f64> = cols
+            .iter()
+            .map(|c| c.basis.unwrap_or(c.content_h).max(0.0))
+            .collect();
+        let mut leftover_for_justify = 0.0;
+        if let Some(avail) = avail_main {
+            let gaps = gap * n.saturating_sub(1) as f64;
+            let margins: f64 = cols.iter().map(|c| c.margin_top + c.margin_bottom).sum();
+            let free = avail - heights.iter().sum::<f64>() - gaps - margins;
+            let total_grow: f64 = cols.iter().map(|c| c.grow).sum();
+            if free > 0.01 && total_grow > 0.0 {
+                for (h, c) in heights.iter_mut().zip(&cols) {
+                    *h += free * c.grow / total_grow;
                 }
-                return row_top + h;
+            } else if free < -0.01 {
+                let shrinks: Vec<f64> = cols.iter().map(|c| c.shrink).collect();
+                shrink_to_fit(&mut heights, &shrinks, -free);
+                leftover_for_justify =
+                    (avail - heights.iter().sum::<f64>() - gaps - margins).max(0.0);
+            } else {
+                leftover_for_justify = free.max(0.0);
             }
         }
-        y
+
+        // Pass 2: stack the items at their resolved heights — shifting each one's
+        // already-placed content to its final top — and paint the item box.
+        let (j_offset, j_gap) = if n > 0 {
+            justify_offsets(style.justify, leftover_for_justify, n)
+        } else {
+            (0.0, 0.0)
+        };
+        let mut cursor = row_top + j_offset;
+        for (i, c) in cols.iter().enumerate() {
+            if i > 0 {
+                cursor += gap + j_gap;
+            }
+            cursor += c.margin_top;
+            let final_top = cursor;
+            let dy = final_top - c.natural_top;
+            if dy.abs() > f64::EPSILON {
+                for a in &mut self.out[c.range.0..c.range.1] {
+                    shift_fragment(&mut a.frag, 0.0, dy);
+                }
+            }
+            self.paint_item_box(&c.istyle, c.box_x, final_top, c.box_w, heights[i]);
+            cursor = final_top + heights[i] + c.margin_bottom;
+        }
+        // A definite-height container fills its height; otherwise the bottom is
+        // wherever the (content-sized) items end.
+        avail_main.map(|a| row_top + a).unwrap_or(cursor)
     }
 
     /// A CSS grid (`grid-template-columns`/`-rows`). Column widths come from the
@@ -4944,6 +5012,37 @@ mod tests {
         assert!(
             bot.1 > top.1 && (bot.0 - top.0).abs() < 1.0,
             "column flex stacks 'Bot' below 'Top' at the same x (top={top:?}, bot={bot:?})"
+        );
+    }
+
+    #[test]
+    fn flex_column_basis_sets_item_height() {
+        // In a column flex, `flex-basis` sets the item's main (vertical) size, so a
+        // 100pt-basis item pushes the next item ~100pt down (vs ~1 line of content).
+        let basis = run(
+            r#"<div style="display:flex;flex-direction:column"><div style="flex-basis:100pt">A</div><div>B</div></div>"#,
+        );
+        let plain = run(
+            r#"<div style="display:flex;flex-direction:column"><div>A</div><div>B</div></div>"#,
+        );
+        let pushed = cell_y(&basis, "B") - cell_y(&plain, "B");
+        assert!(
+            pushed > 60.0,
+            "flex-basis 100pt makes A ~100pt tall ({pushed}pt)"
+        );
+    }
+
+    #[test]
+    fn flex_column_grow_fills_definite_height() {
+        // A 300pt-tall column flex with one grow item: the grow item absorbs the
+        // free height, pushing the second item toward the bottom of the container.
+        let grow = run(
+            r#"<div style="display:flex;flex-direction:column;height:300pt"><div style="flex-grow:1">A</div><div>B</div></div>"#,
+        );
+        let yb = cell_y(&grow, "B");
+        assert!(
+            yb > 36.0 + 200.0,
+            "grow item expands so B sits near the 300pt container's bottom (yb={yb})"
         );
     }
 

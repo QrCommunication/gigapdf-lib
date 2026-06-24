@@ -215,9 +215,9 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `justify-content` | `flex-start`/`start`, `center`, `flex-end`/`end`, `space-between`, `space-around`, `space-evenly` | main-axis distribution (`space-evenly` = `n + 1` equal gaps) |
 | `align-items` / `align-self` | `stretch` (default), `flex-start`, `center`, `flex-end` | cross-axis alignment |
 | `order` | integer | reorders items before layout |
-| `flex-grow` | number | growth weight |
-| `flex-shrink` | number | shrink weight (**row axis only**) |
-| `flex-basis` | length / `auto` | initial main size (**row axis only**) |
+| `flex-grow` | number | growth weight (both axes) |
+| `flex-shrink` | number | shrink weight; on the column axis it needs a definite container `height` to shrink against |
+| `flex-basis` | length / `auto` | initial main size — on the **column** axis it (or a definite `height`) sets the item's height |
 | `flex` | `<grow> [shrink] [basis]`, `none`, `auto`, `initial` | shorthand for the three above |
 | `gap` / `row-gap` / `column-gap` | length | spacing between items |
 
@@ -422,8 +422,7 @@ simply skipped — so a richer stylesheet degrades gracefully to the supported
 subset.
 
 - **Layout/sizing**: a true scroll model for `position: sticky`.
-  `grid-template-areas` / named grid lines (use numeric placement). `flex-shrink`
-  / `flex-basis` on the **column** axis.
+  `grid-template-areas` / named grid lines (use numeric placement).
 - **Visual effects**: `transform`, `filter`, `text-shadow`, `box-shadow: inset`
   and true Gaussian blur, `background-image: url()` raster (use `<img>`),
   CSS tiling patterns. (Gradients, rounded corners and offset/spread shadows
