@@ -51,6 +51,9 @@ pub struct SheetCell {
     pub align: Option<Align>,
     /// Wrap text within the cell. `false` ⇒ no wrapping (default).
     pub wrap: bool,
+    /// Cell hyperlink target (an external URL, or an in-workbook `#Sheet!A1`
+    /// location). `None` ⇒ no link.
+    pub hyperlink: Option<String>,
 }
 
 /// A cell's typed value.

@@ -1012,7 +1012,12 @@ pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
             .get(idx)
             .cloned()
             .unwrap_or_else(|| format!("Sheet {n}"));
-        sheets.push(xlsx_sheet_model(name, xml, &shared, &styles));
+        // Worksheet relationships resolve `<hyperlink r:id>` targets to URLs.
+        let rels = zip
+            .get(&format!("xl/worksheets/_rels/sheet{n}.xml.rels"))
+            .map(|b| parse_rels(&String::from_utf8_lossy(b)))
+            .unwrap_or_default();
+        sheets.push(xlsx_sheet_model(name, xml, &shared, &styles, &rels));
     }
 
     let block = Block {
@@ -1025,8 +1030,15 @@ pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 /// Build one model [`Sheet`] from a worksheet XML, reusing [`parse_merges`] and
 /// the cell type/format/fill resolution from [`xlsx_sheet_table`] — but storing
 /// typed [`CellValue`]s (`Number`/`Text`/`Bool`/`Empty`), per-cell
-/// `number_format` and fill, plus the merge ranges.
-fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxStyles) -> Sheet {
+/// `number_format`, fill, font/border/alignment (from `styles`), expanded
+/// shared formulas, cell hyperlinks (resolved via `rels`), plus the merge ranges.
+fn xlsx_sheet_model(
+    name: String,
+    xml: &str,
+    shared: &[String],
+    styles: &XlsxStyles,
+    rels: &BTreeMap<String, String>,
+) -> Sheet {
     // Reuse the worksheet merge parser; map the engine's tuple form to the
     // model's `MergeRange` struct (0-based inclusive corners).
     let merges: Vec<model::MergeRange> = parse_merges(xml)
@@ -1049,9 +1061,18 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
     let mut cell_formula = String::new();
     let mut cell_bg: Option<[f64; 3]> = None;
     let mut cell_fmt: Option<String> = None;
+    let mut cell_style: CellFmt = CellFmt::default();
     let mut in_cell = false;
     let mut in_value = false;
     let mut in_formula = false;
+    // The current `<f>`'s shared-group index and whether it is a `t="shared"`
+    // follower (empty body to be expanded from its master).
+    let mut f_shared_si: Option<u32> = None;
+    let mut f_is_shared_follower = false;
+    // Shared-formula masters: `si` → (master formula, anchor row, anchor col).
+    let mut shared_masters: BTreeMap<u32, (String, usize, usize)> = BTreeMap::new();
+    // Cell hyperlinks (`<hyperlinks>` after `<sheetData>`): (row, col) → target.
+    let mut hyperlinks: BTreeMap<(usize, usize), String> = BTreeMap::new();
 
     while let Some(tok) = x.next() {
         match tok {
@@ -1070,6 +1091,8 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                     in_cell = true;
                     cell_text.clear();
                     cell_formula.clear();
+                    f_shared_si = None;
+                    f_is_shared_follower = false;
                     cell_type = attr(&attrs, "t").unwrap_or("n").to_string();
                     cell_col = attr(&attrs, "r").map(col_of_ref).unwrap_or(0);
                     let style_idx = attr(&attrs, "s").and_then(|v| v.trim().parse::<usize>().ok());
@@ -1080,14 +1103,35 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                     cell_fmt = style_idx
                         .and_then(|i| styles.num_fmt(i))
                         .map(|(_, code)| code.clone());
+                    cell_style = style_idx
+                        .and_then(|i| styles.fmt(i))
+                        .cloned()
+                        .unwrap_or_default();
                     if sc {
                         in_cell = false;
                     }
                 }
                 "v" | "t" if in_cell => in_value = true,
-                // `<f>` carries the formula expression as its text body. A
-                // self-closing `<f .../>` (shared-formula reference) has no body.
-                "f" if in_cell && !sc => in_formula = true,
+                // `<f>` carries the formula expression as its text body. A shared
+                // master (`t="shared"` with a body) seeds the group; a self-
+                // closing follower (`t="shared"`, no body) is expanded from it.
+                "f" if in_cell => {
+                    f_shared_si = attr(&attrs, "si").and_then(|v| v.trim().parse::<u32>().ok());
+                    f_is_shared_follower = attr(&attrs, "t") == Some("shared");
+                    if !sc {
+                        in_formula = true;
+                    }
+                }
+                // `<hyperlink>` lives in a `<hyperlinks>` block after sheetData;
+                // record each `ref`'s target (external via rels `r:id`, else a
+                // `#` in-workbook `location`).
+                "hyperlink" if !in_sheet_data => {
+                    if let Some(cell_ref) = attr(&attrs, "ref") {
+                        if let Some(target) = hyperlink_target(&attrs, rels) {
+                            hyperlinks.insert(cell_ref_to_rc(cell_ref), target);
+                        }
+                    }
+                }
                 _ => {}
             },
             Tok::Text(t) => {
@@ -1103,10 +1147,14 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                 "c" => {
                     if in_cell {
                         let value = xlsx_cell_value(&cell_type, cell_text.trim(), shared);
-                        let formula = {
-                            let f = cell_formula.trim();
-                            (!f.is_empty()).then(|| f.to_string())
-                        };
+                        let formula = resolve_cell_formula(
+                            cell_formula.trim(),
+                            f_shared_si,
+                            f_is_shared_follower,
+                            cell_col,
+                            row_idx,
+                            &mut shared_masters,
+                        );
                         row_cells.insert(
                             cell_col,
                             SheetCell {
@@ -1114,10 +1162,14 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
                                 formula,
                                 number_format: cell_fmt.take(),
                                 fill: cell_bg.take(),
-                                style: CharStyle::default(),
+                                style: cell_style.style.clone(),
+                                border: cell_style.border,
+                                align: cell_style.align,
+                                wrap: cell_style.wrap,
                                 ..Default::default()
                             },
                         );
+                        cell_style = CellFmt::default();
                     }
                     in_cell = false;
                 }
@@ -1155,12 +1207,196 @@ fn xlsx_sheet_model(name: String, xml: &str, shared: &[String], styles: &XlsxSty
         }
     }
 
+    // Apply collected hyperlinks onto their cells (growing the grid if a link
+    // points at a cell with no value).
+    for ((r, c), target) in hyperlinks {
+        if rows.len() <= r {
+            rows.resize(r + 1, SheetRow::default());
+        }
+        let cells = &mut rows[r].cells;
+        if cells.len() <= c {
+            cells.resize(c + 1, SheetCell::default());
+        }
+        cells[c].hyperlink = Some(target);
+    }
+
     Sheet {
         name,
         rows,
         merges,
         col_widths: Vec::new(),
     }
+}
+
+/// Resolve a cell's `<f>` into the stored formula expression, expanding shared
+/// formulas. A master (`shared` with a body, or any plain body) is recorded in
+/// `masters` under its `si` with its anchor `(col, row)` and returned verbatim.
+/// A shared follower (empty body) is rebuilt from its master by translating the
+/// master's relative cell references by the row/column delta. Returns `None` for
+/// a literal cell (no formula, no resolvable master).
+fn resolve_cell_formula(
+    body: &str,
+    si: Option<u32>,
+    is_shared_follower: bool,
+    col: usize,
+    row: usize,
+    masters: &mut BTreeMap<u32, (String, usize, usize)>,
+) -> Option<String> {
+    if !body.is_empty() {
+        // A formula with a body. If it carries a shared `si`, it is the group's
+        // master: remember it (with its anchor) so followers can be expanded.
+        if let Some(si) = si {
+            masters
+                .entry(si)
+                .or_insert_with(|| (body.to_string(), col, row));
+        }
+        return Some(body.to_string());
+    }
+    // Empty body: a shared follower. Expand from the master if we have it.
+    if is_shared_follower {
+        if let Some(si) = si {
+            if let Some((master, anchor_col, anchor_row)) = masters.get(&si) {
+                let dc = col as isize - *anchor_col as isize;
+                let dr = row as isize - *anchor_row as isize;
+                return Some(translate_formula_refs(master, dc, dr));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a `<hyperlink>`'s target: an external URL from the worksheet rels via
+/// `r:id`, else an in-workbook `#location` (e.g. `#Sheet2!A1`). `None` when the
+/// link resolves to nothing.
+fn hyperlink_target(attrs: &[(String, String)], rels: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(id) = attr(attrs, "id") {
+        if let Some(t) = rels.get(id) {
+            return Some(t.clone());
+        }
+    }
+    attr(attrs, "location").map(|loc| format!("#{loc}"))
+}
+
+/// Split a cell reference like `"B3"` / `"AB12"` into 0-based `(row, col)`.
+/// Anything past the alphabetic prefix is the 1-based row; a missing/0 row maps
+/// to row 0.
+fn cell_ref_to_rc(r: &str) -> (usize, usize) {
+    let col = col_of_ref(r);
+    let row = r
+        .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+        .parse::<usize>()
+        .ok()
+        .map(|n| n.saturating_sub(1))
+        .unwrap_or(0);
+    (row, col)
+}
+
+/// Translate every **relative** A1 cell reference in a formula expression by
+/// `(dc, dr)` columns/rows. `$`-anchored components (absolute column and/or row)
+/// are left unchanged, matching Excel's shared-formula expansion. References
+/// inside a sheet qualifier (`Sheet1!A1`) and ranges (`A1:B2`) are handled token
+/// by token; out-of-range results clamp to the first row/column.
+fn translate_formula_refs(formula: &str, dc: isize, dr: isize) -> String {
+    let bytes = formula.as_bytes();
+    let mut out = String::with_capacity(formula.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // A reference token begins with an optional `$` then a letter. To avoid
+        // misreading function names (`SUM`) or sheet names, only treat a run as
+        // a cell ref when it has the shape [$]?LETTERS[$]?DIGITS and is not the
+        // tail of an identifier (preceded by a letter/digit/`_`/`!`/`.`/`'`).
+        let c = bytes[i];
+        let prev_ident = i > 0 && {
+            let p = bytes[i - 1];
+            p.is_ascii_alphanumeric() || matches!(p, b'_' | b'!' | b'.' | b'\'')
+        };
+        if (c == b'$' || c.is_ascii_alphabetic()) && !prev_ident {
+            if let Some((end, col_abs, col, row_abs, row)) = parse_a1_ref(bytes, i) {
+                let new_col = if col_abs {
+                    col
+                } else {
+                    (col as isize + dc).max(0) as usize
+                };
+                let new_row = if row_abs {
+                    row
+                } else {
+                    (row as isize + dr).max(0) as usize
+                };
+                if col_abs {
+                    out.push('$');
+                }
+                out.push_str(&col_to_letters(new_col));
+                if row_abs {
+                    out.push('$');
+                }
+                out.push_str(&(new_row + 1).to_string());
+                i = end;
+                continue;
+            }
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+/// Parse an A1 cell reference starting at `start` in `bytes`, returning
+/// `(end_index, col_absolute, col0, row_absolute, row0)` on success — where the
+/// column/row are 0-based and the `*_absolute` flags mark a leading `$`. `None`
+/// when the run is not a `[$]?LETTERS[$]?DIGITS` cell reference.
+fn parse_a1_ref(bytes: &[u8], start: usize) -> Option<(usize, bool, usize, bool, usize)> {
+    let mut i = start;
+    let col_abs = bytes.get(i) == Some(&b'$');
+    if col_abs {
+        i += 1;
+    }
+    let letters_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let letters_end = i;
+    if letters_end == letters_start {
+        return None;
+    }
+    let row_abs = bytes.get(i) == Some(&b'$');
+    if row_abs {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return None;
+    }
+    // The token must not run into a further identifier char (`A1B` is a name).
+    if let Some(&n) = bytes.get(i) {
+        if n.is_ascii_alphabetic() || n == b'_' {
+            return None;
+        }
+    }
+    let letters = std::str::from_utf8(&bytes[letters_start..letters_end]).ok()?;
+    let col0 = col_of_ref(letters);
+    let row0 = std::str::from_utf8(&bytes[digits_start..i])
+        .ok()?
+        .parse::<usize>()
+        .ok()?
+        .checked_sub(1)?;
+    Some((i, col_abs, col0, row_abs, row0))
+}
+
+/// Convert a 0-based column index to its A1 letters (`0`→`A`, `26`→`AA`).
+fn col_to_letters(mut col: usize) -> String {
+    let mut s = Vec::new();
+    loop {
+        s.push(b'A' + (col % 26) as u8);
+        if col < 26 {
+            break;
+        }
+        col = col / 26 - 1;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap_or_default()
 }
 
 /// Resolve one XLSX cell's typed value: shared-string index (`t="s"`),
@@ -5895,7 +6131,24 @@ struct XlsxStyles {
     num_fmts: Vec<Option<(u32, String)>>,
     /// cellXfs index → combined CSS declarations (font + border + alignment),
     /// already terminated with `;`. Empty string when the style adds nothing.
+    /// This is the HTML/render path; the editable-model path uses [`fmts`].
     css: Vec<String>,
+    /// cellXfs index → structured per-cell formatting (font/border/alignment),
+    /// for the typed editable-model path ([`xlsx_sheet_model`]).
+    fmts: Vec<CellFmt>,
+}
+
+/// Structured (non-fill, non-numFmt) formatting resolved for one `cellXfs`
+/// index, mirroring the CSS produced for the HTML path but as typed model
+/// values: the referenced font as a [`CharStyle`] delta, the collapsed cell
+/// [`model::BorderStyle`], and the `xf`'s `<alignment>` (`horizontal` → align,
+/// `wrapText` → [`wrap`](CellFmt::wrap)).
+#[derive(Default, Clone)]
+struct CellFmt {
+    style: CharStyle,
+    border: Option<model::BorderStyle>,
+    align: Option<MAlign>,
+    wrap: bool,
 }
 
 impl XlsxStyles {
@@ -5908,6 +6161,10 @@ impl XlsxStyles {
     /// Non-fill CSS for a cellXfs index (`""` when none / out of range).
     fn css(&self, idx: usize) -> &str {
         self.css.get(idx).map(String::as_str).unwrap_or("")
+    }
+    /// Structured font/border/alignment for a cellXfs index (`None` out of range).
+    fn fmt(&self, idx: usize) -> Option<&CellFmt> {
+        self.fmts.get(idx)
     }
 }
 
@@ -5975,21 +6232,27 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
         }
     }
 
-    // Pass 1b: fontId → CSS, borderId → CSS (ordered lists of `<font>`/`<border>`).
+    // Pass 1b: fontId → CSS, borderId → CSS (ordered lists of `<font>`/`<border>`),
+    // plus their typed counterparts for the editable-model path.
     let font_css = parse_xlsx_fonts(xml, theme);
     let border_css = parse_xlsx_borders(xml, theme);
+    let font_struct = parse_xlsx_fonts_struct(xml, theme);
+    let border_struct = parse_xlsx_borders_struct(xml, theme);
 
     // Pass 2: cellXfs order → (fillId → colour, numFmtId → format code, combined
-    // non-fill CSS from fontId + borderId + the xf's own `<alignment>`).
+    // non-fill CSS from fontId + borderId + the xf's own `<alignment>`, and the
+    // same resolved structurally as a `CellFmt`).
     let mut fills: Vec<Option<String>> = Vec::new();
     let mut num_fmts: Vec<Option<(u32, String)>> = Vec::new();
     let mut css: Vec<String> = Vec::new();
+    let mut fmts: Vec<CellFmt> = Vec::new();
     {
         let mut x = Xml::new(xml);
         let mut in_cellxfs = false;
         // The xf currently being assembled (open, not yet closed): its combined
-        // CSS so a child `<alignment>` can append to it before we push.
+        // CSS and `CellFmt` so a child `<alignment>` can append before we push.
         let mut cur_css: Option<String> = None;
+        let mut cur_fmt: Option<CellFmt> = None;
         while let Some(tok) = x.next() {
             match tok {
                 Tok::Open(name, attrs, sc) => match local(&name) {
@@ -6021,16 +6284,37 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                         {
                             c.push_str(b);
                         }
+                        // The typed counterpart: clone the referenced font /
+                        // border (the `<alignment>` child fills in align/wrap).
+                        let mut cf = CellFmt {
+                            style: attr(&attrs, "fontId")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .and_then(|i| font_struct.get(i))
+                                .cloned()
+                                .unwrap_or_default(),
+                            ..CellFmt::default()
+                        };
+                        cf.border = attr(&attrs, "borderId")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .and_then(|i| border_struct.get(i))
+                            .and_then(|b| *b);
                         if sc {
                             // Self-closing xf: no `<alignment>` child possible.
                             css.push(c);
+                            fmts.push(cf);
                         } else {
                             cur_css = Some(c);
+                            cur_fmt = Some(cf);
                         }
                     }
                     "alignment" if in_cellxfs => {
                         if let Some(c) = cur_css.as_mut() {
                             c.push_str(&xlsx_alignment_css(&attrs));
+                        }
+                        if let Some(cf) = cur_fmt.as_mut() {
+                            let (align, wrap) = xlsx_alignment_struct(&attrs);
+                            cf.align = align;
+                            cf.wrap = wrap;
                         }
                     }
                     _ => {}
@@ -6039,6 +6323,9 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                     "xf" if in_cellxfs => {
                         if let Some(c) = cur_css.take() {
                             css.push(c);
+                        }
+                        if let Some(cf) = cur_fmt.take() {
+                            fmts.push(cf);
                         }
                     }
                     "cellXfs" => in_cellxfs = false,
@@ -6052,6 +6339,7 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
         fills,
         num_fmts,
         css,
+        fmts,
     }
 }
 
@@ -6173,6 +6461,128 @@ fn parse_xlsx_borders(xml: &str, theme: &XlsxTheme) -> Vec<Option<String>> {
         }
     }
     out
+}
+
+/// Map `xl/styles.xml`'s `<fonts>` list to per-`fontId` [`CharStyle`] deltas, the
+/// typed counterpart of [`parse_xlsx_fonts`] for the editable-model path: `<b>`→
+/// `bold`, `<i>`→`italic`, `<u>`→`underline`, `<sz val>`→`size_pt`, `<color>`→
+/// `color` (rgb/theme+tint/indexed via [`xlsx_color`]), `<name val>`→`family`.
+/// One entry per font, index-aligned with `fontId` (self-closing `<font/>` ⇒ a
+/// default style).
+fn parse_xlsx_fonts_struct(xml: &str, theme: &XlsxTheme) -> Vec<CharStyle> {
+    let mut out: Vec<CharStyle> = Vec::new();
+    let mut x = Xml::new(xml);
+    let mut in_fonts = false;
+    let mut cur = CharStyle::default();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "fonts" => in_fonts = true,
+                "font" if in_fonts && sc => out.push(CharStyle::default()),
+                _ if in_fonts => match local(&name) {
+                    "b" if xlsx_bool_attr(&attrs) => cur.bold = true,
+                    "i" if xlsx_bool_attr(&attrs) => cur.italic = true,
+                    "u" if attr(&attrs, "val") != Some("none") => cur.underline = true,
+                    "sz" => {
+                        if let Some(pt) =
+                            attr(&attrs, "val").and_then(|v| v.trim().parse::<f64>().ok())
+                        {
+                            cur.size_pt = pt;
+                        }
+                    }
+                    "color" => {
+                        if let Some(rgb) = xlsx_color(&attrs, theme)
+                            .as_deref()
+                            .and_then(hex_to_rgb_f64)
+                        {
+                            cur.color = Some(rgb);
+                        }
+                    }
+                    "name" | "rFont" => {
+                        if let Some(fam) = attr(&attrs, "val") {
+                            cur.family = fam.to_string();
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "font" if in_fonts => out.push(std::mem::take(&mut cur)),
+                "fonts" => in_fonts = false,
+                _ => {}
+            },
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Map `xl/styles.xml`'s `<borders>` list to per-`borderId` [`model::BorderStyle`],
+/// the typed counterpart of [`parse_xlsx_borders`]: the heaviest non-`none` edge
+/// sets the width (px), the first edge colour the colour (defaulting to black).
+/// `None` when no edge is styled. Index-aligned with `borderId`.
+fn parse_xlsx_borders_struct(xml: &str, theme: &XlsxTheme) -> Vec<Option<model::BorderStyle>> {
+    let mut out: Vec<Option<model::BorderStyle>> = Vec::new();
+    let mut x = Xml::new(xml);
+    let mut in_borders = false;
+    let mut width = 0.0f64;
+    let mut color: Option<[f64; 3]> = None;
+    let mut in_edge = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "borders" => in_borders = true,
+                "border" if in_borders && sc => out.push(None),
+                "left" | "right" | "top" | "bottom" | "diagonal" if in_borders => {
+                    in_edge = true;
+                    if let Some(w) = border_style_width(attr(&attrs, "style")) {
+                        width = width.max(w);
+                    }
+                }
+                "color" if in_borders && in_edge => {
+                    if color.is_none() {
+                        color = xlsx_color(&attrs, theme)
+                            .as_deref()
+                            .and_then(hex_to_rgb_f64);
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "left" | "right" | "top" | "bottom" | "diagonal" if in_borders => in_edge = false,
+                "border" if in_borders => {
+                    out.push((width > 0.0).then(|| model::BorderStyle {
+                        width,
+                        color: color.unwrap_or([0.0, 0.0, 0.0]),
+                    }));
+                    width = 0.0;
+                    color = None;
+                    in_edge = false;
+                }
+                "borders" => in_borders = false,
+                _ => {}
+            },
+            Tok::Text(_) => {}
+        }
+    }
+    out
+}
+
+/// Resolve an `xf`'s `<alignment>` to `(Option<Align>, wrap)` for the typed
+/// model path: `@horizontal` → [`MAlign`] (`center`/`centerContinuous`→Center,
+/// `right`→Right, `justify`/`distributed`/`fill`→Justify, `left`→Left; unknown
+/// ⇒ `None`), and `@wrapText` → bool.
+fn xlsx_alignment_struct(attrs: &[(String, String)]) -> (Option<MAlign>, bool) {
+    let align = match attr(attrs, "horizontal") {
+        Some("left") => Some(MAlign::Left),
+        Some("center") | Some("centerContinuous") => Some(MAlign::Center),
+        Some("right") => Some(MAlign::Right),
+        Some("justify") | Some("distributed") | Some("fill") => Some(MAlign::Justify),
+        _ => None,
+    };
+    let wrap = matches!(attr(attrs, "wrapText"), Some("1") | Some("true"));
+    (align, wrap)
 }
 
 /// Width in CSS px for an XLSX border line `style` (`thin`/`medium`/`thick`/
@@ -12133,6 +12543,196 @@ mod tests {
         );
         // A literal cell carries no formula (regression guard).
         assert!(sheet.rows[0].cells[0].formula.is_none());
+    }
+
+    /// Build an XLSX from a `styles.xml` + `sheet1.xml` body (+ optional worksheet
+    /// rels) and return the lowered first [`Sheet`] of the editable model.
+    fn xlsx_model_sheet(styles: &str, sheet: &str, sheet_rels: Option<&str>) -> model::Sheet {
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "xl/workbook.xml",
+            br#"<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        if !styles.is_empty() {
+            z.add_stored("xl/styles.xml", styles.as_bytes());
+        }
+        z.add_stored("xl/worksheets/sheet1.xml", sheet.as_bytes());
+        if let Some(rels) = sheet_rels {
+            z.add_stored("xl/worksheets/_rels/sheet1.xml.rels", rels.as_bytes());
+        }
+        let model = office_to_model(&z.finish()).expect("xlsx → model");
+        match model.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Sheet(sb) => sb.sheets.into_iter().next().expect("one sheet"),
+            other => panic!("expected a Sheet block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xlsx_model_reads_per_cell_font_border_alignment_wrap() {
+        // fontId 1 = bold-italic-underline red Arial 14; borderId 1 = thin box;
+        // the xf centres + wraps. The imported cell must carry all of them as
+        // typed model values (style/border/align/wrap), not just CSS.
+        let styles = r#"<styleSheet>
+          <fonts count="2">
+            <font><sz val="11"/><name val="Calibri"/></font>
+            <font><b/><i/><u/><sz val="14"/><color rgb="FFFF0000"/><name val="Arial"/></font>
+          </fonts>
+          <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+          <borders count="2">
+            <border><left/><right/><top/><bottom/></border>
+            <border>
+              <left style="thin"><color rgb="FF000000"/></left>
+              <bottom style="thin"><color rgb="FF000000"/></bottom>
+            </border>
+          </borders>
+          <cellXfs count="2">
+            <xf fontId="0" borderId="0"/>
+            <xf fontId="1" borderId="1" applyFont="1" applyBorder="1" applyAlignment="1">
+              <alignment horizontal="center" wrapText="1"/>
+            </xf>
+          </cellXfs>
+        </styleSheet>"#;
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="0" t="inlineStr"><is><t>Plain</t></is></c>
+            <c r="B1" s="1" t="inlineStr"><is><t>Fancy</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet(styles, sheet, None);
+
+        // Plain cell: default style, no border/align/wrap.
+        let plain = &s.rows[0].cells[0];
+        assert!(plain.border.is_none(), "plain no border");
+        assert_eq!(plain.align, None, "plain general align");
+        assert!(!plain.wrap, "plain no wrap");
+        assert!(!plain.style.bold, "plain not bold");
+
+        // Fancy cell carries the full typed styling.
+        let fancy = &s.rows[0].cells[1];
+        assert!(fancy.style.bold, "bold");
+        assert!(fancy.style.italic, "italic");
+        assert!(fancy.style.underline, "underline");
+        assert_eq!(fancy.style.family, "Arial", "family");
+        assert!((fancy.style.size_pt - 14.0).abs() < 1e-6, "size");
+        assert_eq!(fancy.style.color, Some([1.0, 0.0, 0.0]), "red font");
+        let border = fancy.border.expect("border set");
+        assert!(border.width > 0.0, "border width: {}", border.width);
+        assert_eq!(fancy.align, Some(MAlign::Center), "centered");
+        assert!(fancy.wrap, "wrapped");
+    }
+
+    #[test]
+    fn xlsx_model_expands_shared_formulas() {
+        // C1 is the shared master `A1+B1` (si=0); C2/C3 are followers with empty
+        // bodies. Each follower's formula is rebuilt with row-translated refs.
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1"><v>1</v></c><c r="B1"><v>2</v></c>
+            <c r="C1"><f t="shared" ref="C1:C3" si="0">A1+B1</f><v>3</v></c>
+          </row>
+          <row r="2">
+            <c r="A2"><v>4</v></c><c r="B2"><v>5</v></c>
+            <c r="C2"><f t="shared" si="0"/><v>9</v></c>
+          </row>
+          <row r="3">
+            <c r="A3"><v>7</v></c><c r="B3"><v>8</v></c>
+            <c r="C3"><f t="shared" si="0"/><v>15</v></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet("", sheet, None);
+        assert_eq!(
+            s.rows[0].cells[2].formula.as_deref(),
+            Some("A1+B1"),
+            "master"
+        );
+        assert_eq!(
+            s.rows[1].cells[2].formula.as_deref(),
+            Some("A2+B2"),
+            "follower row 2 translated"
+        );
+        assert_eq!(
+            s.rows[2].cells[2].formula.as_deref(),
+            Some("A3+B3"),
+            "follower row 3 translated"
+        );
+        // Cached results are still kept as the display values.
+        assert_eq!(s.rows[1].cells[2].value, model::CellValue::Number(9.0));
+    }
+
+    #[test]
+    fn xlsx_model_reads_cell_hyperlinks() {
+        // A1 → external URL (via rels r:id); B1 → in-workbook `#Sheet1!A1`.
+        let sheet = r#"<worksheet>
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="inlineStr"><is><t>site</t></is></c>
+              <c r="B1" t="inlineStr"><is><t>jump</t></is></c>
+            </row>
+          </sheetData>
+          <hyperlinks>
+            <hyperlink ref="A1" r:id="rId1"/>
+            <hyperlink ref="B1" location="Sheet1!A1"/>
+          </hyperlinks>
+        </worksheet>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://.../hyperlink" Target="https://example.com/" TargetMode="External"/>
+        </Relationships>"#;
+        let s = xlsx_model_sheet("", sheet, Some(rels));
+        assert_eq!(
+            s.rows[0].cells[0].hyperlink.as_deref(),
+            Some("https://example.com/"),
+            "external link"
+        );
+        assert_eq!(
+            s.rows[0].cells[1].hyperlink.as_deref(),
+            Some("#Sheet1!A1"),
+            "in-workbook link"
+        );
+    }
+
+    #[test]
+    fn xlsx_model_keeps_date_number_format_code() {
+        // A date cell (numFmtId 14 → `mm-dd-yy`) keeps its format code on the
+        // model so re-export re-applies a date format; the serial is the value.
+        let styles = r#"<styleSheet>
+          <fonts count="1"><font/></fonts>
+          <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+          <borders count="1"><border/></borders>
+          <cellXfs count="2">
+            <xf/>
+            <xf numFmtId="14" applyNumberFormat="1"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1"><c r="A1" s="1"><v>45000</v></c></row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet(styles, sheet, None);
+        let cell = &s.rows[0].cells[0];
+        assert_eq!(
+            cell.number_format.as_deref(),
+            Some("mm-dd-yy"),
+            "date fmt code"
+        );
+        assert_eq!(
+            cell.value,
+            model::CellValue::Number(45000.0),
+            "serial value"
+        );
+    }
+
+    #[test]
+    fn translate_formula_refs_relative_and_absolute() {
+        // Relative refs shift by (dc, dr); `$`-anchored components stay put.
+        assert_eq!(translate_formula_refs("A1+B1", 0, 1), "A2+B2");
+        assert_eq!(translate_formula_refs("A1+B1", 2, 0), "C1+D1");
+        assert_eq!(translate_formula_refs("$A$1+B2", 1, 1), "$A$1+C3");
+        assert_eq!(translate_formula_refs("$A1+A$1", 1, 1), "$A2+B$1");
+        // Function names and ranges survive; only the cell refs move.
+        assert_eq!(translate_formula_refs("SUM(A1:A3)", 1, 0), "SUM(B1:B3)");
+        assert_eq!(col_to_letters(0), "A");
+        assert_eq!(col_to_letters(26), "AA");
+        assert_eq!(col_to_letters(27), "AB");
     }
 
     // ── PPTX → model (geometry / groups / charts / inheritance / SmartArt) ──

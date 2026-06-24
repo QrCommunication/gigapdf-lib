@@ -852,6 +852,11 @@ impl Writer {
             None => self.null(),
         }
         self.k_bool("wrap", c.wrap);
+        self.key("hyperlink");
+        match &c.hyperlink {
+            Some(h) => self.str_val(h),
+            None => self.null(),
+        }
         self.obj_close();
     }
 
@@ -1985,6 +1990,7 @@ impl<'a> Reader<'a> {
                     };
                 }
                 "wrap" => c.wrap = r.bool()?,
+                "hyperlink" => c.hyperlink = r.opt_string()?,
                 _ => return None,
             }
             Some(())
@@ -2425,6 +2431,7 @@ mod tests {
                                 }),
                                 align: Some(Align::Center),
                                 wrap: true,
+                                hyperlink: Some("https://example.com/".to_string()),
                             },
                             SheetCell {
                                 value: CellValue::Number(1234.56),
