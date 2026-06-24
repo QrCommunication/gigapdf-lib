@@ -685,6 +685,19 @@ impl Flow<'_> {
         // inside it don't leak into sibling/parent containers.
         let saved_floats = std::mem::take(&mut self.floats);
 
+        // `position: sticky` boxes, replayed once this container's page span is
+        // known (bottom of this fn). Each entry is (fragment template, start index
+        // in `self.out`, natural top, target page-local Y of the box top when
+        // stuck, sticks-to-bottom?, clamp dx, clamp dy). A single-page block uses
+        // the static clamp; a multi-page block becomes a running header (`top`) or
+        // footer (`bottom`) repeated at that edge on every page it spans (paged
+        // output has no scroll).
+        type StickyBox = (Vec<Abs>, usize, f64, f64, bool, f64, f64);
+        let mut pending_stickies: Vec<StickyBox> = Vec::new();
+        // The container's own content top (this fn's entry `y`), so a bottom-sticky
+        // footer knows the first page of the block it must repeat across.
+        let container_top = y;
+
         let mut inline_run: Vec<&Node> = Vec::new();
         // `<ol start="N">` makes the first item count from N (default 1), so the
         // pre-increment counter starts at N-1. Plain lists count from 1.
@@ -819,14 +832,39 @@ impl Flow<'_> {
                         let (dx, dy) = self.relative_offset(&st, avail_w);
                         self.translate_range(start, dx, dy);
                     } else if st.position == Position::Sticky {
-                        // `sticky` ≈ `relative`, but the offset is clamped so the
-                        // box never leaves its containing block (the static,
-                        // scroll-free approximation). Bound the shift by how far
-                        // the box's edges may move within `self.cb`.
+                        // Compute the static clamped offset (used as-is for a
+                        // single-page block) and the stuck edge (used for a
+                        // multi-page running header/footer). The choice needs the
+                        // container's page span, so defer both to the replay below.
                         let (dx, dy) = self.relative_offset(&st, avail_w);
                         let (dx, dy) =
                             self.clamp_sticky_offset(dx, dy, x, y_before, avail_w, y - y_before);
-                        self.translate_range(start, dx, dy);
+                        let content_h = (self.page_h - self.top - self.bottom).max(1.0);
+                        let height = y - y_before;
+                        let resolve = |len: Len| match len {
+                            Len::Pt(p) => p,
+                            Len::Percent(pc) => content_h * pc / 100.0,
+                        };
+                        let stuck = if let Some(t) = st.inset[0] {
+                            Some((self.top + resolve(t), false))
+                        } else {
+                            st.inset[2]
+                                .map(|b| ((self.page_h - self.bottom) - resolve(b) - height, true))
+                        };
+                        match stuck {
+                            Some((local_top, is_bottom)) => pending_stickies.push((
+                                self.out[start..].to_vec(),
+                                start,
+                                y_before,
+                                local_top,
+                                is_bottom,
+                                dx,
+                                dy,
+                            )),
+                            // No top/bottom edge (e.g. a horizontal-only sticky):
+                            // nothing to repeat, just apply the static clamp now.
+                            None => self.translate_range(start, dx, dy),
+                        }
                     }
                     if st.z_index != 0 {
                         self.stamp_z(start, st.z_index);
@@ -849,6 +887,55 @@ impl Flow<'_> {
         // Clear past any floats that extend below the in-flow content, so the
         // container fully contains its floats (matches `overflow`/clearfix).
         y = y.max(self.floats.max_bottom());
+
+        // Replay `position: sticky` running headers: now that this containing
+        // block's bottom (`y`) is known, a top-sticky box whose span crosses page
+        // boundaries is re-emitted at `self.top + offset` on each page after the
+        // one it naturally sits on, up to the container's last page. The in-flow
+        // space stays reserved (the box already advanced `y`); only paint repeats.
+        if !pending_stickies.is_empty() {
+            let top = self.top;
+            let content_h = (self.page_h - top - self.bottom).max(1.0);
+            let page_at = |yy: f64| ((yy - top).max(0.0) / content_h) as usize;
+            let cb_first = page_at(container_top);
+            let cb_last = page_at(y);
+            for (template, start, natural_top, local_top, is_bottom, dx, dy) in &pending_stickies {
+                let n = (*start + template.len()).min(self.out.len());
+                if cb_first == cb_last {
+                    // Single-page containing block: the static clamped offset
+                    // (byte-identical to the pre-running-header behaviour).
+                    for frag in self.out[*start..n].iter_mut() {
+                        shift_fragment(&mut frag.frag, *dx, *dy);
+                    }
+                    continue;
+                }
+                // Multi-page block ⇒ running header/footer. Place the box at its
+                // stuck edge on every page the block spans: a `top` box on its
+                // natural page and each one AFTER, a `bottom` (footer) box on its
+                // natural page and each one BEFORE.
+                let np = page_at(*natural_top);
+                let (lo, hi) = if *is_bottom {
+                    (cb_first, np)
+                } else {
+                    (np, cb_last)
+                };
+                for p in lo..=hi {
+                    let shift = (*local_top + p as f64 * content_h) - *natural_top;
+                    if p == np {
+                        // Reposition the in-flow fragments onto the stuck edge.
+                        for frag in self.out[*start..n].iter_mut() {
+                            shift_fragment(&mut frag.frag, 0.0, shift);
+                        }
+                    } else {
+                        for abs in template {
+                            let mut clone = abs.clone();
+                            shift_fragment(&mut clone.frag, 0.0, shift);
+                            self.out.push(clone);
+                        }
+                    }
+                }
+            }
+        }
 
         self.floats = saved_floats;
         y
@@ -4436,6 +4523,65 @@ mod tests {
             .iter()
             .any(|f| matches!(f, Fragment::Text { text, .. } if text == "b"));
         assert!(b_on_p2, "content after <pagebreak> is on page 2");
+    }
+
+    #[test]
+    fn sticky_header_repeats_on_each_page_of_its_container() {
+        // A `position: sticky; top: 0` header inside a container taller than one
+        // page reappears at the top of every page the container spans — the
+        // paged-media running-header model (there is no scroll to stick against).
+        let hdr_count = |layout: &Layout, needle: &str| -> Vec<usize> {
+            layout
+                .pages
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .filter(
+                            |f| matches!(f, Fragment::Text { text, .. } if text.contains(needle)),
+                        )
+                        .count()
+                })
+                .collect()
+        };
+        let sticky = run(&format!(
+            r#"<div><h2 style="position:sticky;top:0">STICKYHDR</h2>{}</div>"#,
+            "<p>line</p>".repeat(120)
+        ));
+        assert!(
+            sticky.pages.len() >= 2,
+            "container spans pages ({})",
+            sticky.pages.len()
+        );
+        let per_page = hdr_count(&sticky, "STICKYHDR");
+        assert!(per_page[0] >= 1, "sticky header on page 1 ({per_page:?})");
+        assert!(
+            per_page[1] >= 1,
+            "sticky header repeats on page 2 ({per_page:?})"
+        );
+
+        // A non-sticky header appears exactly once (only on its natural page).
+        let plain = run(&format!(
+            r#"<div><h2>PLAINHDR</h2>{}</div>"#,
+            "<p>line</p>".repeat(120)
+        ));
+        let plain_pp = hdr_count(&plain, "PLAINHDR");
+        let total: usize = plain_pp.iter().sum();
+        assert_eq!(total, 1, "non-sticky header appears once ({plain_pp:?})");
+
+        // A `bottom: 0` sticky footer at the END of the container reappears at the
+        // bottom of every EARLIER page it spans (running footer), plus its natural
+        // last page.
+        let footer = run(&format!(
+            r#"<div>{}<div style="position:sticky;bottom:0">FOOTERMK</div></div>"#,
+            "<p>line</p>".repeat(120)
+        ));
+        let fp = hdr_count(&footer, "FOOTERMK");
+        assert!(fp.len() >= 2, "footer container spans pages ({fp:?})");
+        assert!(fp[0] >= 1, "footer repeats on the first page ({fp:?})");
+        assert!(
+            fp[fp.len() - 1] >= 1,
+            "footer is on its natural last page ({fp:?})"
+        );
     }
 
     #[test]
