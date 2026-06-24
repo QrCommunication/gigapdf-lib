@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::action::Action;
 use crate::annot::{self, Annotation};
 use crate::content::{self, ContentElement, TextRun};
 use crate::error::{EngineError, Result};
@@ -1323,6 +1324,20 @@ impl AfRelationship {
 /// cloned `/Names` dict, and the flattened `(key, raw filespec value)` entries.
 /// Returned by `Document::embedded_files_state` for every attachment mutation.
 type EmbeddedFilesState = (Option<ObjectId>, Dictionary, Vec<(Vec<u8>, Object)>);
+
+/// One outline bookmark for [`Document::set_bookmarks`]: a `title`, a nesting
+/// `level` (0 = top), and an optional [`Action`] (a destination jump or any other
+/// action). A `None` action makes a plain, non-clickable heading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bookmark {
+    /// The bookmark label.
+    pub title: String,
+    /// Nesting depth (0 = top level); deeper consecutive items become children.
+    pub level: usize,
+    /// What activating the bookmark does (a `GoTo` destination becomes a `/Dest`;
+    /// any other action becomes an `/A`). `None` = no target.
+    pub action: Option<Action>,
+}
 
 /// The standard document-information fields (ISO 32000-1 §14.3.3, Table 317),
 /// shared by the `/Info` dictionary and the XMP `/Metadata` packet. Used by
@@ -11801,6 +11816,96 @@ impl Document {
         self.append_annotation_dict(page_no, dict)
     }
 
+    /// The page-reference resolver for building a **local** `/Dest` array: maps a
+    /// 1-based page number to its object reference (or `Null` if out of range).
+    fn dest_page_resolver(&self) -> impl Fn(u32) -> Object + '_ {
+        move |p: u32| {
+            self.page_object_id(p)
+                .map(Object::Reference)
+                .unwrap_or(Object::Null)
+        }
+    }
+
+    /// Add a `/Link` annotation over `rect` carrying any [`Action`] — the full
+    /// action & destination model (ISO 32000-1 §12.6): GoTo with every fit mode,
+    /// GoToR (remote), URI, Named navigation, Launch, JavaScript, SubmitForm,
+    /// ResetForm. The link is borderless (a zero-width `/Border`).
+    pub fn add_link(&mut self, page_no: u32, rect: [f64; 4], action: &Action) -> Result<()> {
+        let dict_obj = {
+            let resolve = self.dest_page_resolver();
+            Object::Dictionary(action.build_dict(&resolve))
+        };
+        let mut dict = Self::base_link_dict(rect);
+        dict.set(b"A".to_vec(), dict_obj);
+        self.append_annotation_dict(page_no, dict)
+    }
+
+    /// Set the document's `/OpenAction` — the [`Action`] performed when the file
+    /// is opened (e.g. jump to a destination, or run JavaScript).
+    pub fn set_open_action(&mut self, action: &Action) -> Result<()> {
+        let action_obj = {
+            let resolve = self.dest_page_resolver();
+            Object::Dictionary(action.build_dict(&resolve))
+        };
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        catalog.set(b"OpenAction".to_vec(), action_obj);
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Remove the `link_index`-th `/Link` annotation on the 1-based `page_no`
+    /// (links counted in `/Annots` order, ignoring non-link annotations). Returns
+    /// `true` if one was removed, `false` if the page has fewer links.
+    pub fn remove_link(&mut self, page_no: u32, link_index: usize) -> Result<bool> {
+        let page_id = self.page_object_id(page_no)?;
+        let mut items = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .and_then(|p| p.get(b"Annots"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(<[Object]>::to_vec)
+            .unwrap_or_default();
+        // The index in `items` of the `link_index`-th Link-subtype annotation.
+        let mut seen = 0;
+        let mut target: Option<usize> = None;
+        for (i, item) in items.iter().enumerate() {
+            let is_link = self
+                .resolve(item)
+                .as_dict()
+                .and_then(|d| d.get(b"Subtype"))
+                .and_then(Object::as_name)
+                == Some(b"Link".as_slice());
+            if is_link {
+                if seen == link_index {
+                    target = Some(i);
+                    break;
+                }
+                seen += 1;
+            }
+        }
+        let Some(i) = target else {
+            return Ok(false);
+        };
+        items.remove(i);
+        let mut page = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+        page.set(b"Annots".to_vec(), Object::Array(items));
+        self.objects.insert(page_id, Object::Dictionary(page));
+        Ok(true)
+    }
+
     /// Register a **named destination** `name` → `target_page` (a whole-page
     /// `/Fit` view) in the catalog's `/Dests` dictionary, creating it if needed.
     /// Links and outline items can then jump by name via
@@ -12421,8 +12526,27 @@ impl Document {
     }
 
     /// Replace the entire document outline from a flat `(title, page, level)`
-    /// list (pre-order; `level` 0 = top). An empty list clears the outline.
+    /// list (pre-order; `level` 0 = top). An empty list clears the outline. A thin
+    /// adapter over [`set_bookmarks`](Self::set_bookmarks): each `page` becomes a
+    /// `/Fit` GoTo destination.
     pub fn set_outline(&mut self, items: &[(String, Option<u32>, usize)]) -> Result<()> {
+        let bookmarks: Vec<Bookmark> = items
+            .iter()
+            .map(|(title, page, level)| Bookmark {
+                title: title.clone(),
+                level: *level,
+                action: page.map(|p| Action::GoTo(crate::action::Destination::Fit { page: p })),
+            })
+            .collect();
+        self.set_bookmarks(&bookmarks)
+    }
+
+    /// Replace the entire document outline from a flat list of [`Bookmark`]s
+    /// (pre-order; `level` 0 = top, deeper consecutive items nest as children).
+    /// Each bookmark may carry any [`Action`] — a `GoTo` destination is written as
+    /// `/Dest`, any other action as an `/A` action dictionary. An empty list
+    /// clears the outline.
+    pub fn set_bookmarks(&mut self, items: &[Bookmark]) -> Result<()> {
         let catalog_id = self.catalog_id()?;
         if items.is_empty() {
             if let Some(mut catalog) = self
@@ -12452,9 +12576,9 @@ impl Document {
         let mut stack: Vec<usize> = Vec::new();
 
         for i in 0..items.len() {
-            let level = items[i].2;
+            let level = items[i].level;
             while let Some(&top) = stack.last() {
-                if items[top].2 >= level {
+                if items[top].level >= level {
                     stack.pop();
                 } else {
                     break;
@@ -12474,19 +12598,22 @@ impl Document {
 
         // Number of descendants of item `i` = contiguous block of deeper levels.
         let subtree_size = |i: usize| -> usize {
-            let level = items[i].2;
+            let level = items[i].level;
             items[i + 1..]
                 .iter()
-                .take_while(|(_, _, l)| *l > level)
+                .take_while(|b| b.level > level)
                 .count()
         };
 
-        for (i, (title, page, _)) in items.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             let id = item_ids[i];
             let mut dict = Dictionary::new();
             dict.set(
                 b"Title".to_vec(),
-                Object::String(crate::font::encode_pdf_text(title), StringKind::Literal),
+                Object::String(
+                    crate::font::encode_pdf_text(&item.title),
+                    StringKind::Literal,
+                ),
             );
             dict.set(b"Parent".to_vec(), Object::Reference(parent[i]));
             if let Some(prev) = prev_idx[i] {
@@ -12506,12 +12633,24 @@ impl Document {
                 // Positive: the item is open, showing all its descendants.
                 dict.set(b"Count".to_vec(), Object::Integer(descendants as i64));
             }
-            if let Some(p) = page {
-                if let Ok(target_id) = self.page_object_id(*p) {
-                    dict.set(
-                        b"Dest".to_vec(),
-                        Object::Array(vec![Object::Reference(target_id), annot::name(b"Fit")]),
-                    );
+            // A GoTo destination is written as `/Dest` (the outline convention);
+            // any other action becomes an `/A` action dictionary.
+            if let Some(action) = &item.action {
+                let resolve = |p: u32| {
+                    self.page_object_id(p)
+                        .map(Object::Reference)
+                        .unwrap_or(Object::Null)
+                };
+                match action {
+                    Action::GoTo(dest) => {
+                        dict.set(b"Dest".to_vec(), dest.build_d_value(&resolve));
+                    }
+                    other => {
+                        dict.set(
+                            b"A".to_vec(),
+                            Object::Dictionary(other.build_dict(&resolve)),
+                        );
+                    }
                 }
             }
             self.objects.insert(id, Object::Dictionary(dict));
@@ -19354,6 +19493,96 @@ mod tests {
             doc.regenerate_appearance(1, 99),
             Err(EngineError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn add_link_writes_action_and_remove_link_drops_it() {
+        let mut doc = blank_doc();
+        doc.add_page(612.0, 792.0, 1).unwrap(); // a page 2 to jump to
+
+        // A URI link and a GoTo-XYZ link on page 1.
+        doc.add_link(
+            1,
+            [10.0, 10.0, 100.0, 30.0],
+            &Action::Uri("https://x.test".into()),
+        )
+        .unwrap();
+        doc.add_link(
+            1,
+            [10.0, 40.0, 100.0, 60.0],
+            &Action::GoTo(crate::action::Destination::Xyz {
+                page: 2,
+                left: None,
+                top: Some(700.0),
+                zoom: Some(2.0),
+            }),
+        )
+        .unwrap();
+        // A non-link annotation must not be touched by remove_link.
+        doc.add_square_annotation(
+            1,
+            [200.0, 200.0, 260.0, 240.0],
+            Some([1.0, 0.0, 0.0]),
+            None,
+            1.0,
+        )
+        .unwrap();
+
+        // Both links resolve through the link reader.
+        let links = doc.page_links(1).unwrap();
+        assert!(links
+            .iter()
+            .any(|l| l.target == LinkTarget::Uri("https://x.test".into())));
+        assert!(links.iter().any(|l| l.target == LinkTarget::Page(2)));
+
+        // remove_link drops the first link only; the square survives.
+        assert!(doc.remove_link(1, 0).unwrap());
+        let links = doc.page_links(1).unwrap();
+        assert_eq!(links.len(), 1, "one link left");
+        assert!(links.iter().any(|l| l.target == LinkTarget::Page(2)));
+        let annots = doc.page_annotations(1).unwrap();
+        assert!(
+            annots.iter().any(|a| a.subtype == "Square"),
+            "non-link annotation preserved"
+        );
+        // Removing past the end is a no-op.
+        assert!(!doc.remove_link(1, 5).unwrap());
+    }
+
+    #[test]
+    fn set_open_action_and_set_bookmarks_with_actions() {
+        let mut doc = blank_doc();
+        doc.set_open_action(&Action::JavaScript("app.alert('hi')".into()))
+            .unwrap();
+        let catalog = doc.catalog().unwrap();
+        let oa = catalog
+            .get(b"OpenAction")
+            .and_then(Object::as_dict)
+            .expect("/OpenAction");
+        assert_eq!(
+            oa.get(b"S").and_then(Object::as_name),
+            Some(b"JavaScript".as_slice())
+        );
+
+        // Bookmarks carrying a GoTo destination (→ /Dest) and a URI (→ /A).
+        doc.set_bookmarks(&[
+            Bookmark {
+                title: "Cover".into(),
+                level: 0,
+                action: Some(Action::GoTo(crate::action::Destination::Fit { page: 1 })),
+            },
+            Bookmark {
+                title: "Website".into(),
+                level: 0,
+                action: Some(Action::Uri("https://x.test".into())),
+            },
+        ])
+        .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let items = reopened.outline_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Cover");
+        assert_eq!(items[1].title, "Website");
     }
 
     #[test]

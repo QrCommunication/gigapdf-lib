@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.78.0] - 2026-06-24
+
+Full action & destination navigation model. Resolves
+[#14](https://github.com/qrcommunication/gigapdf-lib/issues/14).
+
+### Added
+
+- **`addLink(page, rect, action)`.** A link over `rect` carrying any `Action` —
+  `goto` (with every fit mode: `xyz`/`fit`/`fitH`/`fitV`/`fitR`/`fitB`/`fitBH`/
+  `fitBV`/`named`), `gotoR` (remote file), `uri`, `named` viewer navigation,
+  `launch`, `javascript`, `submitForm`, `resetForm`.
+- **`setOpenAction(action)`.** Set the document `/OpenAction` performed on open.
+- **`removeLink(page, linkIndex)`.** Delete the *n*-th `/Link` annotation on a
+  page (other annotations untouched).
+- **`setBookmarks(bookmarks)`.** Replace the outline with `Bookmark[]`
+  (`{title, level, action?}`) — bookmarks can carry any action (a `goto` becomes
+  a `/Dest`, anything else an `/A`).
+- New exported types: **`Action`**, **`Destination`**, **`Bookmark`**.
+
 ## [0.77.0] - 2026-06-24
 
 Geometric annotation subtypes + appearance regeneration. Resolves

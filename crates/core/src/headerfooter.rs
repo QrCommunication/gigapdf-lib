@@ -283,7 +283,7 @@ impl<'a> ObjReader<'a> {
         }
     }
 
-    fn peek(&mut self) -> Option<u8> {
+    pub(crate) fn peek(&mut self) -> Option<u8> {
         self.ws();
         self.b.get(self.i).copied()
     }
@@ -393,7 +393,7 @@ impl<'a> ObjReader<'a> {
     }
 
     /// A JSON number (integer or float, incl. sign / exponent).
-    fn number(&mut self) -> Option<f64> {
+    pub(crate) fn number(&mut self) -> Option<f64> {
         self.ws();
         let start = self.i;
         while self.i < self.b.len() {
@@ -412,7 +412,7 @@ impl<'a> ObjReader<'a> {
     }
 
     /// `[ number (, number)* ]`.
-    fn number_array(&mut self) -> Option<Vec<f64>> {
+    pub(crate) fn number_array(&mut self) -> Option<Vec<f64>> {
         self.eat(b'[')?;
         let mut out = Vec::new();
         if self.peek()? == b']' {

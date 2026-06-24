@@ -21,10 +21,10 @@
 mod rng;
 
 use gigapdf_core::{
-    AfRelationship, Annotation, ContentElement, Document, ElementKind, EmbeddedFontInfo, FieldKind,
-    FormField, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem,
-    PageBox, PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine,
-    TextRun,
+    Action, AfRelationship, Annotation, Bookmark, ContentElement, Document, ElementKind,
+    EmbeddedFontInfo, FieldKind, FormField, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget,
+    Margins, OutlineItem, PageBox, PageLabelRange, PageLabelStyle, Permissions, SearchMatch,
+    TextLayerRun, TextLine, TextRun,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -4621,6 +4621,88 @@ pub extern "C" fn gp_set_outline(
         items.push((title, page, level));
     }
     edit(handle, |doc| doc.set_outline(&items))
+}
+
+/// Add a `/Link` annotation over `[x0,y0,x1,y1]` carrying the action described by
+/// the JSON `action` (see `Action::from_json` — `{type, dest?, uri?, file?, …}`).
+/// Returns `0` on success, `-1` null handle, `-2` malformed action, `-3` error.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_add_link(
+    handle: *mut Document,
+    page: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    action_ptr: *const u8,
+    action_len: usize,
+) -> i32 {
+    let json = unsafe { str_arg(action_ptr, action_len) };
+    let Some(action) = Action::from_json(json) else {
+        return -2;
+    };
+    edit(handle, |doc| doc.add_link(page, [x0, y0, x1, y1], &action))
+}
+
+/// Set the document `/OpenAction` from a JSON action (see `gp_add_link`).
+/// `0` success, `-1` null handle, `-2` malformed action, `-3` error.
+#[no_mangle]
+pub extern "C" fn gp_set_open_action(
+    handle: *mut Document,
+    action_ptr: *const u8,
+    action_len: usize,
+) -> i32 {
+    let json = unsafe { str_arg(action_ptr, action_len) };
+    let Some(action) = Action::from_json(json) else {
+        return -2;
+    };
+    edit(handle, |doc| doc.set_open_action(&action))
+}
+
+/// Remove the `link_index`-th `/Link` annotation on `page` (links counted in
+/// `/Annots` order). Returns `1` if one was removed, `0` if none, `-1` null handle.
+#[no_mangle]
+pub extern "C" fn gp_remove_link(handle: *mut Document, page: u32, link_index: usize) -> i32 {
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.remove_link(page, link_index) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
+/// Replace the outline with bookmarks that may carry actions. `text` is one
+/// bookmark per line, `level<TAB>title<TAB>actionJson` (the action field may be
+/// empty for a plain heading; a `GoTo` action becomes `/Dest`). An empty buffer
+/// clears the outline. `0` on success, `<0` on error.
+#[no_mangle]
+pub extern "C" fn gp_set_bookmarks(handle: *mut Document, text_ptr: *const u8, text_len: usize) -> i32 {
+    let text = unsafe { str_arg(text_ptr, text_len) };
+    let mut items: Vec<Bookmark> = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let level = parts
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let title = parts.next().unwrap_or("").to_string();
+        let action = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .and_then(Action::from_json);
+        items.push(Bookmark {
+            title,
+            level,
+            action,
+        });
+    }
+    edit(handle, |doc| doc.set_bookmarks(&items))
 }
 
 // ─── optional content (layers / OCG) ─────────────────────────────────────────

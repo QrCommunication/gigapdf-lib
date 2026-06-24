@@ -138,10 +138,12 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `set_header(spec)` / `set_footer(spec)` (JSON `HeaderFooterSpec`, `{{page}}`/`{{pages}}` tokens) | `gp_set_header(handle,ptr,len) / gp_set_footer(handle,ptr,len)` |
 | `remove_headers()` / `remove_footers()` / `header_footer()` (reader) | `gp_remove_headers / gp_remove_footers / gp_header_footer(handle,outlen)` |
 | `add_uri_link(page,rect,uri)` / `add_goto_link(page,rect,target)` | `gp_add_uri_link / gp_add_goto_link` |
+| `add_link(page,rect,&Action)` (any action: GoTo with every fit mode, GoToR, URI, Named, Launch, JavaScript, SubmitForm, ResetForm — `Action::from_json`) | `gp_add_link(handle,page,x0,y0,x1,y1,actionptr,actionlen)` (JSON action; `-2` malformed) |
+| `set_open_action(&Action)` (document `/OpenAction`) / `remove_link(page,index) -> bool` | `gp_set_open_action(handle,ptr,len)` / `gp_remove_link(handle,page,index)` (`1`/`0`/`-1`) |
 | `add_named_dest(name,target)` / `named_dests() -> Vec<(String,u32)>` | `gp_add_named_dest(handle,nameptr,namelen,target) / gp_named_dests_json(handle,outlen)` |
 | `add_goto_link_named(page,rect,name)` (jumps to a `/Dest /name`; split-safe) | `gp_add_goto_link_named(handle,page,x0,y0,x1,y1,nameptr,namelen)` |
 | `page_links(page)` | `gp_links_json(handle,page,outlen)` |
-| `set_outline(&[(title,page,level)])` / `outline_items()` | `gp_set_outline(handle,ptr,len) / gp_outline_json` |
+| `set_outline(&[(title,page,level)])` / `set_bookmarks(&[Bookmark])` (bookmarks carrying any `Action`) / `outline_items()` | `gp_set_outline(handle,ptr,len)` / `gp_set_bookmarks(handle,ptr,len)` (lines `level⇥title⇥actionJson`) / `gp_outline_json` |
 | `get_metadata(key)` / `set_metadata(key,val)` | `gp_get_metadata / gp_set_metadata` |
 | `xmp() -> Option<Vec<u8>>` / `set_xmp(&[u8])` (catalog `/Metadata` XMP packet) and `info_fields() -> InfoFields` / `set_info(&InfoFields)` (typed Info-dict fields; `set_info` writes **both** `/Info` and a synced XMP packet, partial-merge) | `gp_get_xmp(handle,outlen)` / `gp_set_xmp(handle,ptr,len)` / `gp_set_info_json(handle,ptr,len)` (`{title?,author?,subject?,keywords?,creator?,producer?,creationDate?,modDate?}`) |
 | `attachments() -> Vec<Attachment>` (embedded files from `/Names /EmbeddedFiles`) | `gp_attachments_json(handle,outlen)` → `[{name,filename,mime,description,creationDate,modDate,dataBase64}]` |
@@ -361,7 +363,8 @@ Google fonts**, so the host fetches fonts in two phases.
 - `TextRun { index, operator, text, op_position }`
 - `TextElementInfo { index, text, bounds, font_family, bold, italic, size, color, rotation, direction }`
 - `FormField { name, field_type, value, flags, options, max_len }`
-- `Link { kind: uri|page, uri, page, rect }`, `OutlineItem { title, page, level }`
+- `Link { kind: uri|page, uri, page, rect }`, `OutlineItem { title, page, level }`, `Bookmark { title, level, action: Option<Action> }`
+- `Action` (ISO 32000-1 §12.6) and `Destination` (§12.3.2) — the navigation model. `Action::from_json` accepts a tagged object: `{"type":"goto","dest":<Destination>}`, `{"type":"gotoR","file":"…","dest":<Destination>}`, `{"type":"uri","uri":"…"}`, `{"type":"named","action":"nextPage|prevPage|firstPage|lastPage"}`, `{"type":"launch","file":"…"}`, `{"type":"javascript","js":"…"}`, `{"type":"submitForm","url":"…"}`, `{"type":"resetForm"}`. A `Destination` is `{"fit":"xyz","page":N,"left"?,"top"?,"zoom"?}` or `fit` ∈ `fit|fitH|fitV|fitR|fitB|fitBH|fitBV` (with `top`/`left`/`rect` as the mode needs), or `{"fit":"named","name":"…"}`. `page` is 1-based; `GoToR` encodes it as a 0-based integer for the remote file
 - `HeaderFooterSpec { text, align, font_size, color, page_range, show_on_first_page, band_height }`
 - `PageBox` (enum `Media|Crop|Bleed|Trim|Art`) and `PageBoxes { media, crop, bleed, trim, art: [f64;4], declared: PageBoxesDeclared { media, crop, bleed, trim, art: bool } }` — every rectangle is the **effective** box (ISO 32000-1 §14.11.2 inheritance + the per-box default chain applied: Crop→Media, Bleed/Trim/Art→Crop), reported verbatim; `declared` flags which boxes are explicitly on the page dictionary vs inherited/defaulted
 - `PageLabelStyle` (enum `Decimal|RomanLower|RomanUpper|AlphaLower|AlphaUpper|None`) and `PageLabelRange { start_page (1-based), style, prefix: String, start_number }` — one entry per `/PageLabels` range (ISO 32000-1 §12.4.2). `page_label(n)` formats the displayed string (roman/letter sequences, prefix, `St` offset), falling back to the decimal page number outside any range

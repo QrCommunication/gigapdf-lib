@@ -1897,6 +1897,46 @@ export interface FieldInfo {
   value: string;
   options: string[];
 }
+/**
+ * A view destination (ISO 32000-1 §12.3.2). `page` is 1-based; optional
+ * coordinates are in the target page's user space (omit to leave unchanged).
+ */
+export type Destination =
+  | { fit: "xyz"; page: number; left?: number; top?: number; zoom?: number }
+  | { fit: "fit"; page: number }
+  | { fit: "fitH"; page: number; top?: number }
+  | { fit: "fitV"; page: number; left?: number }
+  | { fit: "fitR"; page: number; rect: [number, number, number, number] }
+  | { fit: "fitB"; page: number }
+  | { fit: "fitBH"; page: number; top?: number }
+  | { fit: "fitBV"; page: number; left?: number }
+  | { fit: "named"; name: string };
+
+/**
+ * A PDF action (ISO 32000-1 §12.6) usable on a link, the document open-action,
+ * or an outline bookmark — passed to {@link GigaPdfDoc.addLink} /
+ * {@link GigaPdfDoc.setOpenAction} / {@link GigaPdfDoc.setBookmarks}.
+ */
+export type Action =
+  | { type: "goto"; dest: Destination }
+  | { type: "gotoR"; file: string; dest: Destination }
+  | { type: "uri"; uri: string }
+  | { type: "named"; action: "nextPage" | "prevPage" | "firstPage" | "lastPage" }
+  | { type: "launch"; file: string }
+  | { type: "javascript"; js: string }
+  | { type: "submitForm"; url: string }
+  | { type: "resetForm" };
+
+/** One outline bookmark for {@link GigaPdfDoc.setBookmarks}. */
+export interface Bookmark {
+  /** The bookmark label. */
+  title: string;
+  /** Nesting depth (0 = top); deeper consecutive items become children. */
+  level: number;
+  /** What clicking the bookmark does (a `goto` becomes `/Dest`, else `/A`). */
+  action?: Action;
+}
+
 /** One outline (bookmark) entry; `level` is the nesting depth (0 = top). */
 export interface OutlineEntry {
   level: number;
@@ -4089,6 +4129,56 @@ export class GigaPdfDoc {
   setOutline(entries: OutlineEntry[]): boolean {
     const text = entries.map((e) => `${e.level}\t${e.page ?? 0}\t${e.title}`).join("\n");
     return this.g._withStr(text, (p, l) => this.ex().gp_set_outline(this.h, p, l)) === 0;
+  }
+
+  /**
+   * Add a `/Link` annotation over `rect` (`{ x, y, w, h }`) carrying any
+   * {@link Action} — the full action & destination model (GoTo with every fit
+   * mode, GoToR, URI, Named navigation, Launch, JavaScript, SubmitForm,
+   * ResetForm). Returns `true` on success (`false` for a malformed action).
+   *
+   * @example
+   * doc.addLink(1, { x: 72, y: 700, w: 120, h: 16 },
+   *   { type: "goto", dest: { fit: "xyz", page: 4, top: 720, zoom: 1.5 } });
+   */
+  addLink(page: number, rect: Box, action: Action): boolean {
+    return (
+      this.g._withStr(JSON.stringify(action), (p, l) =>
+        this.ex().gp_add_link(this.h, page, rect.x, rect.y, rect.x + rect.w, rect.y + rect.h, p, l)
+      ) === 0
+    );
+  }
+
+  /**
+   * Set the document `/OpenAction` — the {@link Action} performed when the file
+   * is opened. Returns `true` on success.
+   */
+  setOpenAction(action: Action): boolean {
+    return (
+      this.g._withStr(JSON.stringify(action), (p, l) =>
+        this.ex().gp_set_open_action(this.h, p, l)
+      ) === 0
+    );
+  }
+
+  /**
+   * Remove the `linkIndex`-th `/Link` annotation on `page` (links counted in
+   * order, ignoring non-link annotations). Returns `true` if one was removed.
+   */
+  removeLink(page: number, linkIndex: number): boolean {
+    return this.ex().gp_remove_link(this.h, page, linkIndex) === 1;
+  }
+
+  /**
+   * Replace the outline with {@link Bookmark}s that may carry actions (a `goto`
+   * action becomes a `/Dest`, any other action an `/A`). An empty array clears
+   * the outline. Returns `true` on success.
+   */
+  setBookmarks(bookmarks: Bookmark[]): boolean {
+    const text = bookmarks
+      .map((b) => `${b.level}\t${b.title}\t${b.action ? JSON.stringify(b.action) : ""}`)
+      .join("\n");
+    return this.g._withOptStr(text, (p, l) => this.ex().gp_set_bookmarks(this.h, p, l)) === 0;
   }
 
   // interactive forms (AcroForm)

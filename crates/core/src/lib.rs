@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod action;
 pub mod annot;
 pub mod content;
 pub mod convert;
@@ -54,11 +55,12 @@ pub mod sign;
 pub mod svg;
 pub mod text;
 
+pub use action::{Action, Destination, NamedAction};
 pub use annot::Annotation;
 pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, TextRun};
 pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
-    AfRelationship, Attachment, Document, EmbeddedFontInfo, ImageElementInfo,
+    AfRelationship, Attachment, Bookmark, Document, EmbeddedFontInfo, ImageElementInfo,
     ImageWatermarkOptions, InfoFields, PageBox, PageBoxes, PageBoxesDeclared, PageLabelRange,
     PageLabelStyle, SearchMatch, TextElementInfo, TextLayerRun, WatermarkAnchor,
 };

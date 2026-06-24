@@ -7,6 +7,39 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.78.0] - 2026-06-24
+
+A single, shared **action & destination model** (ISO 32000-1 §12.6 / §12.3.2)
+reused by links, the document open-action and outline bookmarks. Resolves
+[#14](https://github.com/qrcommunication/gigapdf-lib/issues/14).
+
+### Added
+
+- **`Action` and `Destination` model (`crates/core/src/action`).** An `Action`
+  enum — `GoTo`, `GoToR` (remote), `Uri`, `Named` (NextPage/PrevPage/FirstPage/
+  LastPage), `Launch`, `JavaScript`, `SubmitForm`, `ResetForm` — and a
+  `Destination` enum with **every** fit mode (`XYZ`, `Fit`, `FitH`, `FitV`,
+  `FitR`, `FitB`, `FitBH`, `FitBV`, plus named destinations). `Action::from_json`
+  parses the SDK's tagged-object shape; `build_dict` emits the PDF `/A` dictionary
+  (and the `/D` array/name).
+- **`Document::add_link(page, rect, &Action)`.** A general link carrying any
+  action and any destination fit mode (previously links were URI- and
+  page-jump-only). `gp_add_link` / `doc.addLink`.
+- **`Document::set_open_action(&Action)`.** The document `/OpenAction`, performed
+  when the file is opened. `gp_set_open_action` / `doc.setOpenAction`.
+- **`Document::remove_link(page, index)`.** Remove the *n*-th `/Link` annotation
+  on a page (links counted in order, other annotations untouched).
+  `gp_remove_link` / `doc.removeLink`.
+- **`Document::set_bookmarks(&[Bookmark])`.** Replace the outline with bookmarks
+  that carry **any** `Action` (a `GoTo` becomes a `/Dest`, anything else an
+  `/A`). `gp_set_bookmarks` / `doc.setBookmarks`. `set_outline` now delegates to
+  it (each `page` → a `/Fit` GoTo), so its behaviour is unchanged.
+
+### Notes
+
+- Form-field widget actions are deferred to the forms issue (#15); they reuse
+  this same `Action` model.
+
 ## [0.77.0] - 2026-06-24
 
 Adds the missing geometric annotation subtypes and appearance regeneration.

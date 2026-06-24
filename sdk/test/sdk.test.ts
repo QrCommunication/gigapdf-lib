@@ -391,6 +391,41 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("actions: addLink (uri/goto), setOpenAction, removeLink, setBookmarks", () => {
+    const doc = giga.open(giga.txtToPdf("Actions"));
+    doc.addPage(612, 792, 1); // page 2
+
+    expect(doc.addLink(1, { x: 10, y: 10, w: 90, h: 16 }, { type: "uri", uri: "https://x.test" })).toBe(true);
+    expect(
+      doc.addLink(1, { x: 10, y: 40, w: 90, h: 16 }, { type: "goto", dest: { fit: "xyz", page: 2, top: 700, zoom: 2 } })
+    ).toBe(true);
+    // A malformed action is rejected.
+    // @ts-expect-error intentionally invalid action shape
+    expect(doc.addLink(1, { x: 0, y: 0, w: 8, h: 8 }, { type: "nope" })).toBe(false);
+
+    const links = doc.links(1);
+    expect(links.some((l) => l.uri === "https://x.test")).toBe(true);
+    expect(links.some((l) => l.page === 2)).toBe(true);
+
+    // remove the first link; one remains.
+    expect(doc.removeLink(1, 0)).toBe(true);
+    expect(doc.links(1).length).toBe(1);
+
+    // OpenAction + bookmarks with actions.
+    expect(doc.setOpenAction({ type: "named", action: "firstPage" })).toBe(true);
+    expect(
+      doc.setBookmarks([
+        { title: "Cover", level: 0, action: { type: "goto", dest: { fit: "fit", page: 1 } } },
+        { title: "Site", level: 0, action: { type: "uri", uri: "https://x.test" } },
+      ])
+    ).toBe(true);
+
+    const reopened = giga.open(doc.save());
+    expect(reopened.outline().map((e) => e.title)).toEqual(["Cover", "Site"]);
+    reopened.close();
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

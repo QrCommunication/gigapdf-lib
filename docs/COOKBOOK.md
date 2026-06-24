@@ -42,6 +42,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
 - [Fill and create form fields](#fill-and-create-form-fields)
 - [Annotate (highlight, note, ink, stamp)](#annotate)
+- [Navigation: links, bookmarks & open-action](#navigation-links-bookmarks--open-action) — *full action model: v0.78.0*
 - [Sign a PDF (B · B-T · LTV)](#sign-a-pdf-b--b-t--ltv) — *B-T: v0.70.0 · LTV: v0.71.0*
 - [Encrypt with AES-256](#encrypt-with-aes-256)
 - [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
@@ -714,6 +715,50 @@ doc.addMarkupAnnotation(
 
 const all = doc.annotations(1); // read back, with author/date/colour/quadPoints/inkList…
 // doc.flattenAnnotations(1);   // bake appearances into page content (non-interactive)
+
+const out = doc.save();
+doc.close();
+```
+
+---
+
+## Navigation: links, bookmarks & open-action
+
+The full ISO 32000-1 action & destination model — links and bookmarks accept
+**any** `Action` (`goto` with every fit mode, `gotoR`, `uri`, `named`
+navigation, `launch`, `javascript`, `submitForm`, `resetForm`), and the document
+can carry an `/OpenAction` performed when it opens.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// A clickable rect that jumps to page 4, scrolled so y=720 sits at the top, 150% zoom.
+doc.addLink(1, { x: 72, y: 700, w: 180, h: 16 }, {
+  type: "goto",
+  dest: { fit: "xyz", page: 4, top: 720, zoom: 1.5 },
+});
+
+// An external URL, and a "fit the whole page" jump to a sibling document.
+doc.addLink(1, { x: 72, y: 676, w: 180, h: 16 }, { type: "uri", uri: "https://giga-pdf.com" });
+doc.addLink(1, { x: 72, y: 652, w: 180, h: 16 }, {
+  type: "gotoR",
+  file: "appendix.pdf",
+  dest: { fit: "fit", page: 1 },
+});
+
+// Open the file on its last page (a Named viewer action).
+doc.setOpenAction({ type: "named", action: "lastPage" });
+
+// Bookmarks that carry actions: a destination (→ /Dest) and a URL (→ /A).
+doc.setBookmarks([
+  { title: "Cover", level: 0, action: { type: "goto", dest: { fit: "fit", page: 1 } } },
+  { title: "Chapter 1", level: 0, action: { type: "goto", dest: { fit: "fitH", page: 2, top: 780 } } },
+  { title: "  Section 1.1", level: 1, action: { type: "goto", dest: { fit: "xyz", page: 3 } } },
+  { title: "Project site", level: 0, action: { type: "uri", uri: "https://giga-pdf.com" } },
+]);
+
+// Remove the first link on page 1 (links counted in order, other annotations ignored).
+doc.removeLink(1, 0);
 
 const out = doc.save();
 doc.close();

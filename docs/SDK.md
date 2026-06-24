@@ -307,6 +307,9 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `links(page)` | `LinkInfo[]` | Hyperlinks with `{ x0,y0,x1,y1, kind: "uri"\|"page"\|"unknown", uri?, page? }`. |
 | `addUriLink(page, x0, y0, x1, y1, uri)` | `boolean` | External URL link over a rect. |
 | `addGotoLink(page, x0, y0, x1, y1, targetPage)` | `boolean` | Internal "jump to page" link (explicit page reference). |
+| `addLink(page, rect, action)` | `boolean` | Link over `rect` (`{x,y,w,h}`) carrying any `Action` — the full model: `goto` (every fit mode), `gotoR`, `uri`, `named` navigation, `launch`, `javascript`, `submitForm`, `resetForm`. `false` if the action is malformed. |
+| `setOpenAction(action)` | `boolean` | Set the document `/OpenAction` (performed on open) from an `Action`. |
+| `removeLink(page, linkIndex)` | `boolean` | Remove the `linkIndex`-th `/Link` annotation on the page (links counted in order, ignoring other annotations). |
 | `addNamedDest(name, targetPage)` | `boolean` | Register a named destination `name` → page (a `/Fit` view) in the catalog `/Dests`. Resolves through the catalog, so it survives split/extract while its page is kept. |
 | `namedDests()` | `NamedDest[]` | The catalog's named destinations as `{ name, page }` pairs — from both the inline `/Dests` dictionary **and** the PDF 1.2+ `/Names /Dests` name tree (parity with a reader's `getDestinations()`). |
 | `addGotoLinkNamed(page, x0, y0, x1, y1, name)` | `boolean` | Internal link that jumps to a **named** destination (`/Dest /name`) — the retargetable, split-safe alternative to `addGotoLink`. |
@@ -315,7 +318,8 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `setLayerVisibility(id, visible)` / `setLayerLocked(id, locked)` | `boolean` | Toggle a layer. |
 | `removeLayer(id)` | `boolean` | Delete a layer. |
 | `outline()` | `OutlineEntry[]` | The flattened bookmark list: `{ title, level, page?, bold?, italic?, color?, destKind?, x?, y?, zoom? }` — nesting depth, destination page + `/XYZ` position/zoom, and `/F`+`/C` label style. Rebuild the tree from `level`. |
-| `setOutline(entries)` | `boolean` | Replace the bookmark tree. |
+| `setOutline(entries)` | `boolean` | Replace the bookmark tree (`{level, page?, title}` per entry — a `/Fit` page jump). |
+| `setBookmarks(bookmarks)` | `boolean` | Replace the bookmark tree with `Bookmark[]` (`{title, level, action?}`) — bookmarks can carry **any** `Action` (a `goto` becomes a `/Dest`, anything else an `/A`). Empty array clears the outline. |
 | `getMetadata(key)` / `setMetadata(key, value)` | `string` / `boolean` | Read/write a **single** Info-dictionary entry (`Title`, `Author`, …) — touches only `/Info`. |
 | `setInfo(fields)` | `boolean` | Set the typed [`InfoFields`](#infofields) (`{ title?, author?, subject?, keywords?, creator?, producer?, creationDate?, modDate? }`), writing **both** `/Info` and a synced XMP `/Metadata` packet. **Partial update** — omitted fields are left unchanged. The cure for the "two sources of truth" drift between Info and XMP. |
 | `getXmp()` / `setXmp(xmp)` | `Uint8Array \| null` / `boolean` | Read / replace the catalog `/Metadata` XMP packet (raw bytes; `setXmp` also accepts a UTF-8 string). `getXmp` is `null` when the document has no XMP. |
@@ -563,7 +567,8 @@ import type {
   TextLine, TextRunInfo, Element, TextElementInfo, DocumentLanguage,
   ImageElementInfo, VectorPathInfo, PathSegment, PdfPermissions,
   SearchHit, AnnotationInfo, FieldInfo, FieldKind, FieldStyle, RadioOption,
-  LinkInfo, LayerInfo, OutlineEntry, NamedDest, Attachment, XlsxSheet, DecodedImage,
+  LinkInfo, LayerInfo, OutlineEntry, NamedDest, Action, Destination, Bookmark,
+  Attachment, XlsxSheet, DecodedImage,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,
   // unified editable model:
