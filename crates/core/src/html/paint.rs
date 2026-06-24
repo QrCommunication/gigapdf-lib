@@ -702,6 +702,9 @@ fn paint(
                     }
                     // Baseline ≈ top + ascent (0.8·size), flipped.
                     let baseline = page_h - (y + style.font_size * 0.8);
+                    // Fold the colour's alpha (`rgba`/`hsla`/`#rgba`) into the
+                    // element opacity for this run.
+                    let text_opacity = (style.opacity * style.color_alpha).clamp(0.0, 1.0);
                     let id = match resolve(style) {
                         Some(id) => id,
                         None => {
@@ -718,7 +721,7 @@ fn paint(
                                 trimmed,
                                 base14,
                                 style.color,
-                                style.opacity,
+                                text_opacity,
                                 0.0,
                             );
                             let w = book.width(trimmed, style);
@@ -774,7 +777,7 @@ fn paint(
                                             &seg,
                                             id,
                                             style.color,
-                                            1.0,
+                                            text_opacity,
                                             0.0,
                                         );
                                         seg.clear();
@@ -823,7 +826,7 @@ fn paint(
                                 &seg,
                                 id,
                                 style.color,
-                                1.0,
+                                text_opacity,
                                 0.0,
                             );
                         }
@@ -840,7 +843,7 @@ fn paint(
                             trimmed,
                             id,
                             style.color,
-                            1.0,
+                            text_opacity,
                             0.0,
                         );
                     } else {
@@ -852,7 +855,7 @@ fn paint(
                             trimmed,
                             id,
                             style.color,
-                            1.0,
+                            text_opacity,
                             0.0,
                         );
                     }
@@ -971,7 +974,7 @@ fn paint_text_decorations(
             None,
             Some(style.color),
             0.0,
-            style.opacity,
+            (style.opacity * style.color_alpha).clamp(0.0, 1.0),
         );
     };
     if style.underline {
@@ -2124,6 +2127,24 @@ mod tests {
         assert!(
             !unclipped.contains("W n"),
             "no overflow ⇒ no clip\n{unclipped}"
+        );
+    }
+
+    #[test]
+    fn rgba_colour_applies_alpha_via_extgstate() {
+        // A semi-transparent background folds its alpha into the fill opacity,
+        // which the painter realises with an `/ExtGState … gs`. An opaque colour
+        // uses none — so the `gs` is the alpha, not an always-on artifact.
+        let translucent =
+            page1_content(r#"<div style="background:rgba(0,0,0,0.5);padding:10pt">x</div>"#);
+        assert!(
+            translucent.contains(" gs"),
+            "rgba background sets an opacity ExtGState\n{translucent}"
+        );
+        let opaque = page1_content(r#"<div style="background:rgb(0,0,0);padding:10pt">x</div>"#);
+        assert!(
+            !opaque.contains(" gs"),
+            "opaque background uses no ExtGState\n{opaque}"
         );
     }
 

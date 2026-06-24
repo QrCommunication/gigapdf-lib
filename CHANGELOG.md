@@ -7,6 +7,25 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.87.0] - 2026-06-24
+
+HTML/CSS renderer — colour alpha ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item C).
+
+### Added
+
+- **Colour alpha is now applied** instead of parsed-then-dropped. `rgba()`,
+  `hsla()`, `#rgba` and `#rrggbbaa` carry their alpha through to the paint: it is
+  folded into the opacity of whatever the colour paints — text, background,
+  border, rounded box and table cell — and composes with the element `opacity`.
+  New public `parse_color_alpha()` returns `(rgb, alpha)`; `parse_color()` stays a
+  thin wrapper that drops the alpha.
+
+### Fixed
+
+- A function colour with **internal spaces** (`rgba(0, 0, 0, .5)`,
+  `hsl(0 100% 50%)`) is now parsed in the `background` and `border` shorthands
+  (the whitespace tokeniser previously split it mid-function and dropped it).
+
 ## [0.86.1] - 2026-06-24
 
 HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).

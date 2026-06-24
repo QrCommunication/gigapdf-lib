@@ -1835,8 +1835,10 @@ impl Flow<'_> {
             /// padding.top).
             pad_top: f64,
             background: Option<[f64; 3]>,
+            background_alpha: f64,
             border_width: super::css::Edges,
             border_color_edges: [[f64; 3]; 4],
+            border_color_alpha: f64,
             border_style_edges: [BorderStyle; 4],
             vertical_align: VAlign,
             opacity: f64,
@@ -1895,8 +1897,10 @@ impl Flow<'_> {
                     prov_content_top: content_top,
                     pad_top: p.top,
                     background: cstyle.background,
+                    background_alpha: cstyle.background_alpha,
                     border_width: bw,
                     border_color_edges: cstyle.border_color_edges,
+                    border_color_alpha: cstyle.border_color_alpha,
                     border_style_edges: cstyle.border_style_edges,
                     vertical_align: cstyle.vertical_align,
                     opacity: cstyle.opacity,
@@ -1977,7 +1981,7 @@ impl Flow<'_> {
                         fill: Some(fill),
                         stroke: None,
                         stroke_w: 0.0,
-                        opacity: pl.opacity,
+                        opacity: (pl.opacity * pl.background_alpha).clamp(0.0, 1.0),
                         radius: [0.0; 4],
                         radius_v: [0.0; 4],
                         shadow: None,
@@ -2004,7 +2008,16 @@ impl Flow<'_> {
             } else {
                 [bw.top, bw.right, bw.bottom, bw.left]
             };
-            self.emit_border_edges(cell_x, top, cw, cell_h, sides, bc, bs, pl.opacity);
+            self.emit_border_edges(
+                cell_x,
+                top,
+                cw,
+                cell_h,
+                sides,
+                bc,
+                bs,
+                (pl.opacity * pl.border_color_alpha).clamp(0.0, 1.0),
+            );
         }
 
         acc_y + style.margin.bottom
@@ -2080,7 +2093,7 @@ impl Flow<'_> {
                     fill: style.background,
                     stroke: None,
                     stroke_w: 0.0,
-                    opacity: style.opacity,
+                    opacity: (style.opacity * style.background_alpha).clamp(0.0, 1.0),
                     radius,
                     radius_v,
                     shadow,
@@ -2171,7 +2184,15 @@ impl Flow<'_> {
                     fill: style.background,
                     stroke: Some(style.border_color_edges[0]),
                     stroke_w: b.top.max(0.0),
-                    opacity: style.opacity,
+                    // One opacity covers both fill and stroke: take the
+                    // background's alpha when there is a fill, else the border's.
+                    opacity: (style.opacity
+                        * if style.background.is_some() {
+                            style.background_alpha
+                        } else {
+                            style.border_color_alpha
+                        })
+                    .clamp(0.0, 1.0),
                     radius,
                     radius_v,
                     shadow,
@@ -2195,7 +2216,7 @@ impl Flow<'_> {
                 [b.top, b.right, b.bottom, b.left],
                 &style.border_color_edges,
                 &style.border_style_edges,
-                style.opacity,
+                (style.opacity * style.border_color_alpha).clamp(0.0, 1.0),
             );
         }
     }

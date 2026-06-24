@@ -323,9 +323,13 @@ Resolved to PDF points. `1px = 0.75pt` (the 96dpi convention), `1pt = 1pt`.
 
 | Form | Examples | Notes |
 |------|----------|-------|
-| Hex | `#0a0`, `#00aa00`, `#0a0f`, `#00aa00ff` | 3/4/6/8 digits; the **alpha channel is parsed then dropped** (colours are opaque — use [`opacity`](#display--positioning) for transparency) |
-| `rgb()` / `rgba()` | `rgb(0 170 0)`, `rgba(0,170,0,.5)` | comma- or space-separated, `/`-alpha; alpha dropped |
-| `hsl()` / `hsla()` | `hsl(120 100% 33%)` | converted to RGB; alpha dropped |
+| Hex | `#0a0`, `#00aa00`, `#0a0f`, `#00aa00ff` | 3/4/6/8 digits; the **alpha** (4-/8-digit) is applied — folded into the fill/text/border opacity |
+| `rgb()` / `rgba()` | `rgb(0 170 0)`, `rgba(0, 170, 0, .5)` | comma- or space-separated, `/`-alpha; the alpha is **applied** (the colour's transparency) |
+| `hsl()` / `hsla()` | `hsl(120 100% 33%)`, `hsla(120, 100%, 33%, .5)` | converted to RGB; the alpha is **applied** |
+
+> A colour's alpha is multiplied into the opacity of whatever it paints (text,
+> background, border, table cell). It composes with the element's
+> [`opacity`](#display--positioning).
 | Named | the ~139 CSS named colours (`rebeccapurple`, `tomato`, `slategray`, …) + `transparent` | |
 | `currentColor` | `border-color: currentColor`, `border: 1px solid currentColor`, `background: currentColor` | resolves to the element's cascaded `color` (case-insensitive) |
 
@@ -424,8 +428,7 @@ subset.
   CSS tiling patterns. (Gradients, rounded corners and offset/spread shadows
   **are** supported — see [backgrounds](#backgrounds) and [shadows](#shadows).)
 - **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
-  full bidirectional/mixed-script reordering (only line-level `direction: rtl`),
-  colour **alpha** in colour values (parsed but dropped — use `opacity`).
+  full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
 - **Selectors**: pseudo-classes / pseudo-elements (`:hover`, `:first-child`,
   `::before`), attribute *operators* (`~= ^= $= *= |=`) in stylesheets.
 - **At-rules / values**: `@media` query evaluation, `@page`, `@import`.

@@ -293,7 +293,12 @@ pub struct GradientStop {
 pub struct Style {
     pub display: Display,
     pub color: [f64; 3],
+    /// Alpha of `color` (0..=1) from an `rgba()`/`hsla()`/`#rgba` text colour;
+    /// folded into the text's paint opacity. Inherited, like `color`.
+    pub color_alpha: f64,
     pub background: Option<[f64; 3]>,
+    /// Alpha of `background` (0..=1); folded into the background fill's opacity.
+    pub background_alpha: f64,
     pub font_size: f64,
     pub font_family: String,
     pub generic_serif: bool,
@@ -326,6 +331,9 @@ pub struct Style {
     /// the block/flex/grid uniform-border paths; per-side colours live in
     /// `border_color_edges`.
     pub border_color: [f64; 3],
+    /// Alpha of the border colour (0..=1) from an `rgba()`/`hsla()`/`#rgba`;
+    /// folded into the border's paint opacity (applied to every side).
+    pub border_color_alpha: f64,
     /// Per-side border colours in `[top, right, bottom, left]` order. Each side
     /// defaults to `border_color`; the `border-{top,right,bottom,left}[-color]`
     /// longhands override an individual side, letting a cell stroke (say) only
@@ -600,7 +608,9 @@ impl Default for Style {
         Style {
             display: Display::Inline,
             color: [0.0, 0.0, 0.0],
+            color_alpha: 1.0,
             background: None,
+            background_alpha: 1.0,
             font_size: 16.0,
             font_family: String::new(),
             generic_serif: false,
@@ -622,6 +632,7 @@ impl Default for Style {
             padding: Edges::default(),
             border_width: Edges::default(),
             border_color: [0.0, 0.0, 0.0],
+            border_color_alpha: 1.0,
             border_color_edges: [[0.0, 0.0, 0.0]; 4],
             border_style_edges: [BorderStyle::Solid; 4],
             background_gradient: None,
@@ -1345,6 +1356,7 @@ fn inherit(parent: &Style) -> Style {
     Style {
         // Inherited:
         color: parent.color,
+        color_alpha: parent.color_alpha,
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),
         generic_serif: parent.generic_serif,
@@ -1363,12 +1375,14 @@ fn inherit(parent: &Style) -> Style {
         // Reset:
         display: Display::Inline,
         background: None,
+        background_alpha: 1.0,
         margin: Edges::default(),
         margin_left_auto: false,
         margin_right_auto: false,
         padding: Edges::default(),
         border_width: Edges::default(),
         border_color: parent.color,
+        border_color_alpha: 1.0,
         // Per-side colours reset to the (resolved) text colour like
         // `border-color`; longhands repaint individual sides during cascade.
         border_color_edges: [parent.color; 4],
@@ -2433,8 +2447,9 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             };
         }
         "color" => {
-            if let Some(c) = parse_color(v) {
+            if let Some((c, a)) = parse_color_alpha(v) {
                 style.color = c;
+                style.color_alpha = a;
             }
         }
         "background" | "background-color" | "background-image" => {
@@ -2447,7 +2462,18 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             if let Some(g) = parse_css_gradient(v.trim(), style.font_size) {
                 style.background_gradient = Some(g);
             } else if prop != "background-image" {
-                style.background = parse_color(v.split_whitespace().next().unwrap_or(v));
+                // Try the whole value first so a function colour with internal
+                // spaces (`rgba(0, 0, 0, .4)`, `hsl(0 100% 50%)`) parses; fall back
+                // to the first token for the `background` shorthand (`red url(…)`).
+                let candidate = parse_color_alpha(v.trim())
+                    .or_else(|| parse_color_alpha(v.split_whitespace().next().unwrap_or(v)));
+                match candidate {
+                    Some((c, a)) => {
+                        style.background = Some(c);
+                        style.background_alpha = a;
+                    }
+                    None => style.background = None,
+                }
             }
         }
         "font-size" => {
@@ -2584,9 +2610,10 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             // zero the side(s).
             let (w, c, vis, s) = parse_border_shorthand(v, style.font_size, style.color);
             style.border_width = Edges::all(if vis { w } else { 0.0 });
-            if let Some(c) = c {
+            if let Some((c, a)) = c {
                 style.border_color = c;
                 style.border_color_edges = [c; 4];
+                style.border_color_alpha = a;
             }
             // A `solid` keyword (or none at all) restores the default; the
             // shorthand resets every side's style, matching CSS reset semantics.
@@ -2595,7 +2622,15 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
             let (w, c, vis, s) = parse_border_shorthand(v, style.font_size, style.color);
             let i = border_side_index(prop);
-            set_border_side(style, i, if vis { Some(w) } else { Some(0.0) }, c);
+            if let Some((_, a)) = c {
+                style.border_color_alpha = a;
+            }
+            set_border_side(
+                style,
+                i,
+                if vis { Some(w) } else { Some(0.0) },
+                c.map(|(rgb, _)| rgb),
+            );
             // The side shorthand also resets THIS side's style (to the given
             // keyword, or `solid` when none was written).
             style.border_style_edges[i] = s.unwrap_or(BorderStyle::Solid);
@@ -2610,8 +2645,9 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             apply_border_color_shorthand(style, v);
         }
         "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
-            if let Some(c) = parse_color(v) {
+            if let Some((c, a)) = parse_color_alpha(v) {
                 set_border_side(style, border_side_index(prop), None, Some(c));
+                style.border_color_alpha = a;
             }
         }
         // `border-style` longhands set the per-side line style. `none`/`hidden`
@@ -2709,17 +2745,19 @@ fn border_side_index(prop: &str) -> usize {
 /// initial width pragmatically); `none`/`hidden` set `visible = false`. The
 /// `style?` is the recognised line-style keyword (`solid`/`dashed`/`dotted`/
 /// `double`) when one appears, so `border: 1px dashed red` carries its dash.
+#[allow(clippy::type_complexity)] // (width, Option<(rgb, alpha)>, visible, style)
 fn parse_border_shorthand(
     v: &str,
     em: f64,
     current: [f64; 3],
-) -> (f64, Option<[f64; 3]>, bool, Option<BorderStyle>) {
+) -> (f64, Option<([f64; 3], f64)>, bool, Option<BorderStyle>) {
     let mut w = 1.0;
     let mut got_w = false;
-    let mut color = None;
+    let mut color: Option<([f64; 3], f64)> = None;
     let mut visible = true;
     let mut style = None;
-    for tok in v.split_whitespace() {
+    let collapsed = collapse_paren_spaces(v);
+    for tok in collapsed.split_whitespace() {
         if let Some(px) = parse_len_px(tok, em) {
             w = px;
             got_w = true;
@@ -2728,9 +2766,9 @@ fn parse_border_shorthand(
         } else if let Some(s) = parse_border_style_keyword(tok) {
             style = Some(s);
         } else if tok.eq_ignore_ascii_case("currentcolor") {
-            color = Some(current);
-        } else if let Some(c) = parse_color(tok) {
-            color = Some(c);
+            color = Some((current, 1.0));
+        } else if let Some(ca) = parse_color_alpha(tok) {
+            color = Some(ca);
         }
     }
     // `border: 0` (explicit zero length) keeps width 0 even though `visible`.
@@ -2912,7 +2950,12 @@ fn set_border_side(style: &mut Style, i: usize, width: Option<f64>, color: Optio
 /// `border-color` shorthand: 1–4 colours applied TRBL (with the CSS
 /// shorthand fill rules), painting every per-side colour.
 fn apply_border_color_shorthand(style: &mut Style, v: &str) {
-    let cols: Vec<[f64; 3]> = v.split_whitespace().filter_map(parse_color).collect();
+    let collapsed = collapse_paren_spaces(v);
+    let parsed: Vec<([f64; 3], f64)> = collapsed
+        .split_whitespace()
+        .filter_map(parse_color_alpha)
+        .collect();
+    let cols: Vec<[f64; 3]> = parsed.iter().map(|(c, _)| *c).collect();
     let edges = match cols.as_slice() {
         [a] => [*a, *a, *a, *a],
         [a, b] => [*a, *b, *a, *b],
@@ -2922,6 +2965,11 @@ fn apply_border_color_shorthand(style: &mut Style, v: &str) {
     };
     style.border_color_edges = edges;
     style.border_color = edges[0];
+    // The border emit applies one opacity to every side, so take the first
+    // colour's alpha as the uniform border alpha.
+    if let Some((_, a)) = parsed.first() {
+        style.border_color_alpha = *a;
+    }
 }
 
 fn parse_edges(v: &str, em: f64) -> Edges {
@@ -3100,6 +3148,13 @@ fn parse_len(v: &str, em: f64) -> Option<Len> {
 
 /// Parse `#rgb`, `#rrggbb`, `rgb(…)` and the common named colours.
 pub fn parse_color(v: &str) -> Option<[f64; 3]> {
+    parse_color_alpha(v).map(|(rgb, _)| rgb)
+}
+
+/// Parse a CSS colour into `(rgb, alpha)` — channels and alpha all 0..=1. Handles
+/// `#rgb[a]` / `#rrggbb[aa]`, `rgb()/rgba()`, `hsl()/hsla()` and the named
+/// colours; a missing alpha defaults to fully opaque (`1.0`).
+pub fn parse_color_alpha(v: &str) -> Option<([f64; 3], f64)> {
     let v = v.trim().to_ascii_lowercase();
     if let Some(hex) = v.strip_prefix('#') {
         // `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`. The alpha nibble/byte is
@@ -3119,14 +3174,14 @@ pub fn parse_color(v: &str) -> Option<[f64; 3]> {
             ),
             _ => return None,
         };
-        // For the 4-/8-digit forms, validate the alpha component too (so a
-        // malformed `#12345` still returns None rather than a half-parsed RGB).
-        if hex.len() == 4 {
-            u8::from_str_radix(&hex[3..4].repeat(2), 16).ok()?;
-        } else if hex.len() == 8 {
-            u8::from_str_radix(&hex[6..8], 16).ok()?;
-        }
-        return Some([r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0]);
+        // The 4-/8-digit forms carry an alpha nibble/byte (else fully opaque); a
+        // malformed alpha (`#12345`) discards the whole colour (returns None).
+        let a = match hex.len() {
+            4 => u8::from_str_radix(&hex[3..4].repeat(2), 16).ok()? as f64 / 255.0,
+            8 => u8::from_str_radix(&hex[6..8], 16).ok()? as f64 / 255.0,
+            _ => 1.0,
+        };
+        return Some(([r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0], a));
     }
     // `rgb()` / `rgba()` — comma- or space-separated; the alpha (4th value, or
     // after a `/`) is ignored but the colour is still returned.
@@ -3135,14 +3190,20 @@ pub fn parse_color(v: &str) -> Option<[f64; 3]> {
         .or_else(|| v.strip_prefix("rgb("))
         .and_then(|s| s.strip_suffix(')'))
     {
-        let nums: Vec<f64> = inner
-            .replace('/', " ")
+        let normalized = inner.replace('/', " ");
+        let raw: Vec<&str> = normalized
             .split([',', ' '])
-            .filter(|t| !t.trim().is_empty())
-            .filter_map(|n| parse_rgb_component(n.trim()))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
             .collect();
-        if nums.len() >= 3 {
-            return Some([nums[0], nums[1], nums[2]]);
+        let rgb: Vec<f64> = raw
+            .iter()
+            .take(3)
+            .filter_map(|n| parse_rgb_component(n))
+            .collect();
+        if rgb.len() == 3 {
+            let a = raw.get(3).and_then(|t| parse_alpha(t)).unwrap_or(1.0);
+            return Some(([rgb[0], rgb[1], rgb[2]], a));
         }
         return None;
     }
@@ -3163,11 +3224,12 @@ pub fn parse_color(v: &str) -> Option<[f64; 3]> {
             let h = parse_angle_deg(parts[0])?;
             let s = parse_percent_unit(parts[1])?;
             let l = parse_percent_unit(parts[2])?;
-            return Some(hsl_to_rgb(h, s, l));
+            let a = parts.get(3).and_then(|t| parse_alpha(t)).unwrap_or(1.0);
+            return Some((hsl_to_rgb(h, s, l), a));
         }
         return None;
     }
-    named_color(&v)
+    named_color(&v).map(|rgb| (rgb, 1.0))
 }
 
 /// One `rgb()` channel → 0..=1. Accepts `0-255` integers/floats and `%`.
@@ -3176,6 +3238,43 @@ fn parse_rgb_component(t: &str) -> Option<f64> {
         return p.trim().parse::<f64>().ok().map(|n| (n / 100.0).clamp(0.0, 1.0));
     }
     t.parse::<f64>().ok().map(|n| (n / 255.0).clamp(0.0, 1.0))
+}
+
+/// An alpha component (`rgba`/`hsla` 4th value, or `/`-alpha) → 0..=1. Accepts a
+/// `0..1` number or a percentage. Unlike a colour channel it is **not** divided
+/// by 255 (CSS alpha is already a fraction).
+fn parse_alpha(t: &str) -> Option<f64> {
+    if let Some(p) = t.strip_suffix('%') {
+        return p
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n / 100.0).clamp(0.0, 1.0));
+    }
+    t.parse::<f64>().ok().map(|n| n.clamp(0.0, 1.0))
+}
+
+/// Drop whitespace **inside** parentheses so a whitespace tokeniser keeps a
+/// function colour (`rgba(0, 0, 0, .5)`, `hsl(0 100% 50%)`) as one token. Spaces
+/// outside parens (the real shorthand separators) are preserved.
+fn collapse_paren_spaces(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut depth = 0i32;
+    for c in v.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' => {
+                depth = (depth - 1).max(0);
+                out.push(c);
+            }
+            c if depth > 0 && c.is_whitespace() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// An HSL hue angle in degrees (bare number or `deg`), normalised to [0,360).
@@ -4623,6 +4722,53 @@ mod tests {
             s3.background,
             Some([0.0, 1.0, 0.0]),
             "background follows color"
+        );
+    }
+
+    #[test]
+    fn colour_alpha_is_parsed_from_every_form() {
+        let approx = |x: f64, y: f64| (x - y).abs() < 1e-6;
+        // rgba / hsla 4th value (0..1), `#rgba` nibble, `#rrggbbaa` byte.
+        let (_, a) = parse_color_alpha("rgba(255, 0, 0, 0.5)").unwrap();
+        assert!(approx(a, 0.5), "rgba alpha");
+        let (_, a) = parse_color_alpha("hsla(0, 100%, 50%, 0.25)").unwrap();
+        assert!(approx(a, 0.25), "hsla alpha");
+        let (_, a) = parse_color_alpha("#00000080").unwrap();
+        assert!(approx((a * 255.0).round(), 128.0), "#rrggbbaa alpha (0x80)");
+        let (rgb, a) = parse_color_alpha("#0f08").unwrap();
+        assert_eq!(rgb, [0.0, 1.0, 0.0], "#rgba rgb");
+        assert!(approx(a, 0x88 as f64 / 255.0), "#rgba alpha nibble");
+        // Opaque forms default to alpha 1.0; `parse_color` still drops it.
+        assert!(
+            approx(parse_color_alpha("#0a0").unwrap().1, 1.0),
+            "opaque hex"
+        );
+        assert_eq!(
+            parse_color("rgba(1,2,3,0.5)"),
+            Some([1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0])
+        );
+    }
+
+    #[test]
+    fn colour_alpha_folds_into_the_right_style_field() {
+        let approx = |x: f64, y: f64| (x - y).abs() < 1e-6;
+        let mut bg = Style::default();
+        apply_one(&mut bg, "background", "rgba(0, 0, 0, 0.4)");
+        assert!(approx(bg.background_alpha, 0.4), "background-alpha");
+        let mut text = Style::default();
+        apply_one(&mut text, "color", "rgba(0, 0, 0, 0.3)");
+        assert!(approx(text.color_alpha, 0.3), "color-alpha");
+        let mut bd = Style::default();
+        apply_one(&mut bd, "border", "1px solid rgba(0, 0, 0, 0.6)");
+        assert!(
+            approx(bd.border_color_alpha, 0.6),
+            "border-alpha (shorthand)"
+        );
+        let mut bc = Style::default();
+        apply_one(&mut bc, "border-color", "rgba(0, 0, 0, 0.7)");
+        assert!(
+            approx(bc.border_color_alpha, 0.7),
+            "border-alpha (border-color)"
         );
     }
 }
