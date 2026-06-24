@@ -7,6 +7,17 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.88.1] - 2026-06-24
+
+HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item B).
+
+### Added
+
+- **`box-shadow: inset`** is now painted (it was parsed then dropped). The inner
+  area — the box inset by `spread + blur` and shifted by the offset — is left
+  clear and the surrounding frame is filled with the shadow colour, clipped to
+  the box, so it reads as recessed. Blur is approximated like the outset path.
+
 ## [0.88.0] - 2026-06-24
 
 HTML/CSS renderer — column-axis flex sizing ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).

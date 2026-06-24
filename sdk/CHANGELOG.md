@@ -44,6 +44,12 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.88.1] - 2026-06-24
+
+HTML/CSS renderer: `box-shadow: inset` is now painted (a clipped shadow frame
+inside the box) instead of dropped. HTML→PDF path only — no SDK signature change
+([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) item B).
+
 ## [0.88.0] - 2026-06-24
 
 HTML/CSS renderer: `flex-basis` / `flex-grow` / `flex-shrink` now apply on the

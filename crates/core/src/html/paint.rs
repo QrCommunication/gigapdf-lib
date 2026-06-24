@@ -689,6 +689,12 @@ fn paint(
                             *opacity,
                         );
                     }
+                    // Inset shadow paints INSIDE the box, over the background.
+                    if let Some(sh) = shadow {
+                        if sh.inset {
+                            paint_inset_box_shadow(doc, page, page_h, *x, *y, *w, *h, sh);
+                        }
+                    }
                 }
                 Fragment::Text {
                     x, y, style, text, ..
@@ -1191,6 +1197,56 @@ fn paint_box_shadow(
         };
         fill_box(bx, by, bw, bh, ring_r(rh), ring_r(rv), ring_alpha);
     }
+}
+
+/// Paint an `inset` `box-shadow`: a shadow-coloured frame *inside* the box so it
+/// looks recessed. The unshadowed inner area is the box inset by `spread + blur`
+/// on every side and shifted by the offset `(dx, dy)`; the frame between it and
+/// the box edge is filled with the shadow colour, clipped to the box. Like the
+/// outset path, blur is approximated (a single soft frame, not a Gaussian).
+#[allow(clippy::too_many_arguments)]
+fn paint_inset_box_shadow(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    sh: &super::css::BoxShadow,
+) {
+    let reach = (sh.spread + sh.blur).max(0.0);
+    if reach <= 0.0 && sh.dx == 0.0 && sh.dy == 0.0 {
+        return; // nothing to draw — no spread, blur or offset
+    }
+    // Inner unshadowed rect: box inset by `reach`, then shifted by the offset,
+    // clamped inside the box.
+    let hl = (x + reach + sh.dx).clamp(x, x + w);
+    let ht = (y + reach + sh.dy).clamp(y, y + h);
+    let hr = (x + w - reach + sh.dx).clamp(hl, x + w);
+    let hb = (y + h - reach + sh.dy).clamp(ht, y + h);
+    // Clip to the box so the frame never bleeds past its edges.
+    let _ = doc.push_clip_rect(page, x, page_h - y - h, w, h);
+    let mut band = |bx: f64, by: f64, bw: f64, bh: f64| {
+        if bw > 0.01 && bh > 0.01 {
+            let _ = doc.add_rectangle(
+                page,
+                bx,
+                page_h - by - bh,
+                bw,
+                bh,
+                None,
+                Some(sh.color),
+                0.0,
+                1.0,
+            );
+        }
+    };
+    band(x, y, w, ht - y); // top
+    band(x, hb, w, y + h - hb); // bottom
+    band(x, ht, hl - x, hb - ht); // left
+    band(hr, ht, x + w - hr, hb - ht); // right
+    let _ = doc.restore_graphics(page);
 }
 
 /// Paint one `dashed`/`dotted`/`double` border side as filled rectangles, the
@@ -2172,6 +2228,29 @@ mod tests {
         assert!(
             !solid.contains("0.29"),
             "solid border is not bevelled\n{solid}"
+        );
+    }
+
+    #[test]
+    fn inset_box_shadow_paints_a_clipped_frame_inside_the_box() {
+        // An `inset` box-shadow draws a shadow-coloured frame INSIDE the box,
+        // clipped to it — so the red shadow fill and a `W n` clip both appear.
+        let content = page1_content(
+            r#"<div style="background:#ffffff;box-shadow:inset 0 0 8pt #ff0000;padding:10pt">x</div>"#,
+        );
+        assert!(
+            content.contains("1 0 0 rg"),
+            "inset shadow paints its colour\n{content}"
+        );
+        assert!(
+            content.contains("W n"),
+            "inset shadow is clipped to the box\n{content}"
+        );
+        // No shadow ⇒ the red fill never appears (control).
+        let none = page1_content(r#"<div style="background:#ffffff;padding:10pt">x</div>"#);
+        assert!(
+            !none.contains("1 0 0 rg"),
+            "no shadow ⇒ no shadow colour\n{none}"
         );
     }
 

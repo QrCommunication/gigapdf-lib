@@ -205,9 +205,9 @@ pub enum BorderStyle {
 /// side, and fills it in `color`. When `blur > 0` it renders a **soft edge** by
 /// stacking concentric rings of decreasing alpha out to the blur radius (a
 /// multi-pass box-blur approximation of a Gaussian falloff — a true blurred drop
-/// shadow, not just a dimmed block). `inset` shadows are parsed but not painted
-/// (the HTML layer has no clip primitive to confine an inner shadow), so an
-/// `inset` layer is recorded and skipped rather than drawn wrongly.
+/// shadow, not just a dimmed block). An `inset` shadow is instead painted as a
+/// shadow-coloured frame *inside* the box (offset + `spread + blur` reach),
+/// clipped to the box so it reads as recessed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoxShadow {
     /// Horizontal offset in points (positive → right).
@@ -221,7 +221,7 @@ pub struct BoxShadow {
     pub spread: f64,
     /// Shadow colour (RGB 0..=1); any alpha in the source colour is dropped.
     pub color: [f64; 3],
-    /// `inset` keyword — recorded but not painted (no inner-shadow clip).
+    /// `inset` keyword — painted as a clipped inner frame (recessed look).
     pub inset: bool,
 }
 
