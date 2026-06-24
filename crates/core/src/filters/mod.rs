@@ -6,25 +6,46 @@
 
 pub mod deflate;
 pub mod inflate;
+pub mod predictor;
 
 use crate::error::{EngineError, Result};
-use crate::object::{Object, Stream};
+use crate::object::{Dictionary, Object, Stream};
 
 /// Decode a stream's bytes by applying its `/Filter` chain in order.
 ///
-/// A stream with no `/Filter` is returned verbatim. `/DecodeParms` (e.g. PNG
-/// predictors) are not yet applied — content streams don't use them; xref/image
-/// streams that do are handled elsewhere.
+/// A stream with no `/Filter` is returned verbatim. After each filter that
+/// carries a `/DecodeParms` (or `/DP`) dict with a `/Predictor` ≥ 2, the TIFF/PNG
+/// predictor is reversed (ISO 32000-1 §7.4.4.4) — required for PNG-predicted
+/// images and `/Type /XRef` streams.
 pub fn decode_stream(stream: &Stream) -> Result<Vec<u8>> {
     let filters = filter_names(stream);
     if filters.is_empty() {
         return Ok(stream.raw.clone());
     }
     let mut data = stream.raw.clone();
-    for name in filters {
-        data = apply_filter(&name, &data)?;
+    for (i, name) in filters.iter().enumerate() {
+        data = apply_filter(name, &data)?;
+        if let Some(params) = decode_parms(stream, i) {
+            data = predictor::apply_predictor(params, &data)?;
+        }
     }
     Ok(data)
+}
+
+/// The `/DecodeParms` (or abbreviated `/DP`) dictionary for the filter at index
+/// `i` in the `/Filter` chain. The value is either a single dict (used by the
+/// single filter) or an array of dicts parallel to `/Filter`; entries may be
+/// null when a filter takes no parameters.
+fn decode_parms(stream: &Stream, i: usize) -> Option<&Dictionary> {
+    let parms = stream
+        .dict
+        .get(b"DecodeParms")
+        .or_else(|| stream.dict.get(b"DP"))?;
+    match parms {
+        Object::Dictionary(dict) => Some(dict),
+        Object::Array(items) => items.get(i).and_then(Object::as_dict),
+        _ => None,
+    }
 }
 
 /// The ordered list of filter names on a stream (`/Filter` may be a single name
