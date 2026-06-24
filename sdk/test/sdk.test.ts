@@ -219,6 +219,44 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("authors catalog UX hints (ViewerPreferences, PageLayout, PageMode)", () => {
+    const doc = giga.open(giga.txtToPdf("Catalog hints"));
+    expect(
+      doc.setViewerPreferences({
+        hideToolbar: true,
+        fitWindow: true,
+        displayDocTitle: true,
+        direction: "R2L",
+      })
+    ).toBe(true);
+    expect(doc.setPageLayout("TwoColumnLeft")).toBe(true);
+    expect(doc.setPageMode("UseOutlines")).toBe(true);
+
+    const out = doc.save();
+    const text = new TextDecoder("latin1").decode(out);
+    expect(text).toContain("/ViewerPreferences");
+    expect(text).toContain("/HideToolbar true");
+    expect(text).toContain("/FitWindow true");
+    expect(text).toContain("/DisplayDocTitle true");
+    expect(text).toContain("/Direction /R2L");
+    expect(text).toContain("/PageLayout /TwoColumnLeft");
+    expect(text).toContain("/PageMode /UseOutlines");
+
+    // Invalid names/direction are rejected (false), no exception.
+    expect(doc.setPageLayout("ThreeColumn" as never)).toBe(false);
+    expect(doc.setPageMode("UseLayers" as never)).toBe(false);
+
+    // `null` removes the names again; it round-trips through open().
+    const reopened = giga.open(out);
+    expect(reopened.setPageLayout(null)).toBe(true);
+    expect(reopened.setPageMode(null)).toBe(true);
+    const cleaned = new TextDecoder("latin1").decode(reopened.save());
+    expect(cleaned).not.toContain("/PageLayout");
+    expect(cleaned).not.toContain("/PageMode");
+    reopened.close();
+    doc.close();
+  });
+
   it("page ops: resize, add blank, copy", () => {
     const doc = giga.open(giga.txtToPdf("Page ops"));
     expect(doc.pageCount()).toBe(1);

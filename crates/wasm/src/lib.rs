@@ -25,6 +25,7 @@ use gigapdf_core::{
     EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec, GradientStop,
     HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox,
     PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
+    ViewerPreferences,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -5426,6 +5427,74 @@ pub extern "C" fn gp_set_bookmarks(handle: *mut Document, text_ptr: *const u8, t
         });
     }
     edit(handle, |doc| doc.set_bookmarks(&items))
+}
+
+// ─── viewer preferences / page layout / page mode (catalog UX hints) ──────────
+
+/// Map a tri-state flag to `Option<bool>`: `<0` = leave unchanged (`None`),
+/// `0` = `Some(false)`, `>0` = `Some(true)`.
+fn tri_bool(flag: i32) -> Option<bool> {
+    match flag {
+        n if n < 0 => None,
+        0 => Some(false),
+        _ => Some(true),
+    }
+}
+
+/// Set the catalog `/ViewerPreferences`. Each boolean flag is tri-state:
+/// `<0` leaves the key unchanged, `0` clears it to false, `>0` sets it true.
+/// `direction` is `"L2R"`/`"R2L"` (empty buffer = leave unchanged). 0 on
+/// success, non-zero on an invalid direction.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_set_viewer_preferences(
+    handle: *mut Document,
+    hide_toolbar: i32,
+    hide_menubar: i32,
+    hide_window_ui: i32,
+    fit_window: i32,
+    center_window: i32,
+    display_doc_title: i32,
+    direction_ptr: *const u8,
+    direction_len: usize,
+) -> i32 {
+    let direction = unsafe { str_arg(direction_ptr, direction_len) };
+    let prefs = ViewerPreferences {
+        hide_toolbar: tri_bool(hide_toolbar),
+        hide_menubar: tri_bool(hide_menubar),
+        hide_window_ui: tri_bool(hide_window_ui),
+        fit_window: tri_bool(fit_window),
+        center_window: tri_bool(center_window),
+        display_doc_title: tri_bool(display_doc_title),
+        direction: (!direction.is_empty()).then(|| direction.to_string()),
+    };
+    edit(handle, |doc| doc.set_viewer_preferences(&prefs))
+}
+
+/// Set the catalog `/PageLayout` name (e.g. `TwoColumnLeft`). An empty buffer
+/// removes the key. 0 on success, non-zero on an unknown name.
+#[no_mangle]
+pub extern "C" fn gp_set_page_layout(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let layout = (!name.is_empty()).then_some(name);
+    edit(handle, |doc| doc.set_page_layout(layout))
+}
+
+/// Set the catalog `/PageMode` name (e.g. `UseOutlines`). An empty buffer
+/// removes the key. 0 on success, non-zero on an unknown name.
+#[no_mangle]
+pub extern "C" fn gp_set_page_mode(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let mode = (!name.is_empty()).then_some(name);
+    edit(handle, |doc| doc.set_page_mode(mode))
 }
 
 // ─── optional content (layers / OCG) ─────────────────────────────────────────

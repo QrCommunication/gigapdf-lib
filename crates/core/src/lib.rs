@@ -63,7 +63,7 @@ pub use document::{
     AfRelationship, Attachment, Bookmark, Color, Document, EmbeddedFontInfo, GradientKind,
     GradientSpec, GradientStop, ImageElementInfo, ImageWatermarkOptions, InfoFields, PageBox,
     PageBoxes, PageBoxesDeclared, PageLabelRange, PageLabelStyle, SearchMatch, SignatureInfo,
-    SignatureReport, TextElementInfo, TextLayerRun, WatermarkAnchor,
+    SignatureReport, TextElementInfo, TextLayerRun, ViewerPreferences, WatermarkAnchor,
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FieldTrigger, FormField};

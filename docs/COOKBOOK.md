@@ -53,6 +53,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
 - [Render a page without a specific element (live-overlay editing)](#render-a-page-without-a-specific-element-live-overlay-editing) — *v0.58.0*
 - [Round-trip the unified editable model](#round-trip-the-unified-editable-model)
+- [Set how the document opens (ViewerPreferences · PageLayout · PageMode)](#set-how-the-document-opens-viewerpreferences--pagelayout--pagemode)
 
 ---
 
@@ -1373,6 +1374,65 @@ const fromHtml   = giga.htmlToModel("<h1>Hi</h1><p>Body</p>");
 
 The model carries `meta` (title/author/…), `styles`, `outline` and `resources`
 opaquely, so a round-trip preserves what your ops don't touch.
+
+---
+
+## Set how the document opens (ViewerPreferences · PageLayout · PageMode)
+
+These three catalog entries are *reading hints* a conforming viewer honours when
+it first opens the file — they don't change a single page, only the UX. Use them
+for a presentation (full screen), a magazine (two-up spread), a portfolio
+(attachments panel), or a kiosk (chrome-less window).
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// /ViewerPreferences (ISO 32000-1 §12.2) — every field is optional; an omitted
+// field is left untouched, a boolean sets the key. `direction` is "L2R" | "R2L".
+doc.setViewerPreferences({
+  hideToolbar: true,     // chrome-less reading
+  hideMenubar: true,
+  fitWindow: true,       // size the window to the first page
+  centerWindow: true,
+  displayDocTitle: true, // show the doc title, not the file name, in the title bar
+});
+
+// /PageLayout — how pages are arranged on screen.
+doc.setPageLayout("TwoPageLeft");   // a magazine-style spread, first page on the left
+
+// /PageMode — which panel (if any) the reader opens with.
+doc.setPageMode("UseOutlines");     // open with the bookmarks panel showing
+
+const out = doc.save();
+doc.close();
+```
+
+Right-to-left scripts (Arabic, Hebrew) set the dominant reading order so spreads
+and page navigation flow the correct way:
+
+```ts
+doc.setViewerPreferences({ direction: "R2L" });
+doc.setPageLayout("TwoPageRight");
+```
+
+To clear a hint, pass `null` to `setPageLayout` / `setPageMode`; for
+`/ViewerPreferences`, set the relevant flags to `false` (when the dictionary ends
+up empty it's removed entirely). Each setter returns `false` (without throwing)
+on an unknown name or an invalid `direction`, so a bad value is a no-op:
+
+```ts
+doc.setPageLayout(null);                       // remove /PageLayout
+doc.setPageMode(null);                         // remove /PageMode
+doc.setViewerPreferences({ hideToolbar: false }); // unset chrome-less reading
+
+doc.setPageMode("UseLayers" as never);         // → false (unknown name, no change)
+```
+
+> The names are exactly the ISO 32000-1 enumerations:
+> `PageLayout` = `SinglePage` · `OneColumn` · `TwoColumnLeft` · `TwoColumnRight`
+> · `TwoPageLeft` · `TwoPageRight`; `PageMode` = `UseNone` · `UseOutlines` ·
+> `UseThumbs` · `FullScreen` · `UseOC` · `UseAttachments`. They are typed unions
+> in the SDK, so your editor autocompletes them.
 
 ---
 

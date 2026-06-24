@@ -335,6 +335,9 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `getMetadata(key)` / `setMetadata(key, value)` | `string` / `boolean` | Read/write a **single** Info-dictionary entry (`Title`, `Author`, …) — touches only `/Info`. |
 | `setInfo(fields)` | `boolean` | Set the typed [`InfoFields`](#infofields) (`{ title?, author?, subject?, keywords?, creator?, producer?, creationDate?, modDate? }`), writing **both** `/Info` and a synced XMP `/Metadata` packet. **Partial update** — omitted fields are left unchanged. The cure for the "two sources of truth" drift between Info and XMP. |
 | `getXmp()` / `setXmp(xmp)` | `Uint8Array \| null` / `boolean` | Read / replace the catalog `/Metadata` XMP packet (raw bytes; `setXmp` also accepts a UTF-8 string). `getXmp` is `null` when the document has no XMP. |
+| `setViewerPreferences(prefs)` | `boolean` | Write the catalog `/ViewerPreferences` (ISO 32000-1 §12.2) from a `ViewerPreferences` object — `hideToolbar?`, `hideMenubar?`, `hideWindowUI?`, `fitWindow?`, `centerWindow?`, `displayDocTitle?` (omitted = leave unchanged) and `direction?` (`"L2R"`/`"R2L"`). An emptied dictionary is removed. `false` on an invalid `direction`. |
+| `setPageLayout(layout)` | `boolean` | Set the catalog `/PageLayout` (how pages are arranged): a `PageLayout` (`"SinglePage"` \| `"OneColumn"` \| `"TwoColumnLeft"` \| `"TwoColumnRight"` \| `"TwoPageLeft"` \| `"TwoPageRight"`), or `null` to remove the key. `false` on an unknown name. |
+| `setPageMode(mode)` | `boolean` | Set the catalog `/PageMode` (which panel opens): a `PageMode` (`"UseNone"` \| `"UseOutlines"` \| `"UseThumbs"` \| `"FullScreen"` \| `"UseOC"` \| `"UseAttachments"`), or `null` to remove the key. `false` on an unknown name. |
 | `attachments()` | `Attachment[]` | Extract every embedded file from the `/Names /EmbeddedFiles` name tree: `{ name, filename, mime, description, creationDate, modDate, data }` where `data` is the decoded bytes. The native replacement for a reader's `getAttachments()`. |
 | `addAttachment(name, bytes, opts?)` | `boolean` | Embed a document-level file (`/Names /EmbeddedFiles`). `opts` is `{ mime?, description? }`; re-using a `name` **replaces** it. Bytes are stored FlateDecode-compressed. |
 | `addAssociatedFile(name, bytes, relationship, opts?)` | `boolean` | Embed an **associated file** (`/AF`, PDF/A-3) — the Factur-X / ZUGFeRD / Order-X invoice-XML mechanism. `relationship` is `"source" \| "data" \| "alternative" \| "supplement" \| "unspecified"` (invoices use `"alternative"`); the filespec gets `/AFRelationship` and is linked from the catalog `/AF`. |
@@ -587,7 +590,8 @@ import type {
   TextLine, TextRunInfo, Element, TextElementInfo, DocumentLanguage,
   ImageElementInfo, VectorPathInfo, PathSegment, PdfPermissions,
   SearchHit, AnnotationInfo, FieldInfo, FieldKind, FieldStyle, RadioOption,
-  LinkInfo, LayerInfo, OutlineEntry, NamedDest, Action, Destination, Bookmark,
+  LinkInfo, LayerInfo, OutlineEntry, ViewerPreferences, PageLayout, PageMode,
+  NamedDest, Action, Destination, Bookmark,
   SignatureInfo, SignatureReport, GradientSpec, GradientStop, Color, Attachment, XlsxSheet, DecodedImage,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,

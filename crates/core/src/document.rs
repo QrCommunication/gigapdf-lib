@@ -1273,6 +1273,43 @@ impl ImageWatermarkOptions {
     }
 }
 
+/// Authoring options for the catalog `/ViewerPreferences` dictionary
+/// (ISO 32000-1 §12.2, Table 150) — hints a conforming reader honours when it
+/// first opens the document.
+///
+/// Every field is a tri-state [`Option`]: `Some(value)` writes (or overwrites)
+/// the corresponding key, `None` leaves whatever the document already had
+/// untouched. Build with [`Self::new`] or construct the struct directly, then
+/// feed it to [`Document::set_viewer_preferences`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewerPreferences {
+    /// `/HideToolbar` — hide the reader's tool bars.
+    pub hide_toolbar: Option<bool>,
+    /// `/HideMenubar` — hide the reader's menu bar.
+    pub hide_menubar: Option<bool>,
+    /// `/HideWindowUI` — hide UI elements (scroll bars, navigation controls),
+    /// leaving only the page contents.
+    pub hide_window_ui: Option<bool>,
+    /// `/FitWindow` — resize the document's window to fit the first page.
+    pub fit_window: Option<bool>,
+    /// `/CenterWindow` — position the document's window in the centre of the
+    /// screen.
+    pub center_window: Option<bool>,
+    /// `/DisplayDocTitle` — show the document title (from the `/Info /Title` or
+    /// XMP metadata) in the window title bar rather than the file name.
+    pub display_doc_title: Option<bool>,
+    /// `/Direction` — the predominant reading order for text: `"L2R"`
+    /// (left-to-right) or `"R2L"` (right-to-left). Any other value is rejected.
+    pub direction: Option<String>,
+}
+
+impl ViewerPreferences {
+    /// An empty set of preferences (every field `None` = leave unchanged).
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// One embedded font in a document (from [`Document::embedded_fonts`]): its
 /// `/BaseFont` name and embedded program format (`truetype` / `cff` / `type1`).
 /// Feed `base_font` to [`Document::extract_font_program`] to pull the bytes out
@@ -14479,6 +14516,135 @@ impl Document {
         Ok(())
     }
 
+    // ─── viewer preferences / page layout / page mode (catalog UX hints) ──────
+
+    /// Write the catalog `/ViewerPreferences` dictionary (ISO 32000-1 §12.2).
+    ///
+    /// Each [`Some`] field in `prefs` sets (or overwrites) the matching boolean
+    /// key; each [`None`] leaves an existing value untouched. `direction` accepts
+    /// only `"L2R"` or `"R2L"` (case-sensitive). If, after applying the changes,
+    /// the dictionary is empty, the `/ViewerPreferences` key is removed entirely.
+    pub fn set_viewer_preferences(&mut self, prefs: &ViewerPreferences) -> Result<()> {
+        // Validate the reading direction up front so an invalid value is a no-op.
+        let direction = match prefs.direction.as_deref() {
+            None => None,
+            Some("L2R") => Some(b"L2R".as_slice()),
+            Some("R2L") => Some(b"R2L".as_slice()),
+            Some(other) => {
+                return Err(EngineError::Unsupported(format!(
+                    "viewer preference /Direction must be L2R or R2L, got {other:?}"
+                )));
+            }
+        };
+
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?
+            .clone();
+
+        let mut vp = catalog
+            .get(b"ViewerPreferences")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut apply_bool = |key: &[u8], value: Option<bool>| {
+            if let Some(v) = value {
+                vp.set(key.to_vec(), Object::Boolean(v));
+            }
+        };
+        apply_bool(b"HideToolbar", prefs.hide_toolbar);
+        apply_bool(b"HideMenubar", prefs.hide_menubar);
+        apply_bool(b"HideWindowUI", prefs.hide_window_ui);
+        apply_bool(b"FitWindow", prefs.fit_window);
+        apply_bool(b"CenterWindow", prefs.center_window);
+        apply_bool(b"DisplayDocTitle", prefs.display_doc_title);
+        if let Some(dir) = direction {
+            vp.set(b"Direction".to_vec(), annot::name(dir));
+        }
+
+        if vp.is_empty() {
+            catalog.remove(b"ViewerPreferences");
+        } else {
+            catalog.set(b"ViewerPreferences".to_vec(), Object::Dictionary(vp));
+        }
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Set the catalog `/PageLayout` name (ISO 32000-1 §7.7.2, Table 28): how
+    /// the reader arranges pages on screen.
+    ///
+    /// Accepts `SinglePage`, `OneColumn`, `TwoColumnLeft`, `TwoColumnRight`,
+    /// `TwoPageLeft`, or `TwoPageRight`. `None` removes the key (reader falls
+    /// back to its `SinglePage` default).
+    pub fn set_page_layout(&mut self, layout: Option<&str>) -> Result<()> {
+        const VALID: [&str; 6] = [
+            "SinglePage",
+            "OneColumn",
+            "TwoColumnLeft",
+            "TwoColumnRight",
+            "TwoPageLeft",
+            "TwoPageRight",
+        ];
+        self.set_catalog_name(b"PageLayout", layout, &VALID)
+    }
+
+    /// Set the catalog `/PageMode` name (ISO 32000-1 §7.7.2, Table 28): which
+    /// panel (if any) the reader shows when the document opens.
+    ///
+    /// Accepts `UseNone`, `UseOutlines`, `UseThumbs`, `FullScreen`, `UseOC`, or
+    /// `UseAttachments`. `None` removes the key (reader falls back to its
+    /// `UseNone` default).
+    pub fn set_page_mode(&mut self, mode: Option<&str>) -> Result<()> {
+        const VALID: [&str; 6] = [
+            "UseNone",
+            "UseOutlines",
+            "UseThumbs",
+            "FullScreen",
+            "UseOC",
+            "UseAttachments",
+        ];
+        self.set_catalog_name(b"PageMode", mode, &VALID)
+    }
+
+    /// Shared helper for the `/PageLayout` and `/PageMode` catalog names: write
+    /// `value` (validated against `allowed`) or, when `None`, remove `key`.
+    fn set_catalog_name(
+        &mut self,
+        key: &[u8],
+        value: Option<&str>,
+        allowed: &[&str],
+    ) -> Result<()> {
+        if let Some(v) = value {
+            if !allowed.contains(&v) {
+                let what = String::from_utf8_lossy(key);
+                return Err(EngineError::Unsupported(format!(
+                    "/{what} must be one of {allowed:?}, got {v:?}"
+                )));
+            }
+        }
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?
+            .clone();
+        match value {
+            Some(v) => catalog.set(key.to_vec(), annot::name(v.as_bytes())),
+            None => {
+                catalog.remove(key);
+            }
+        }
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
     // ─── optional content (layers / OCG) ─────────────────────────────────────
 
     /// The document's optional-content layers (PDF OCGs), ordered as in the
@@ -25040,6 +25206,81 @@ mod tests {
     }
 
     #[test]
+    fn set_viewer_preferences_writes_the_catalog_dict() {
+        let pdf = crate::convert::reverse::txt_to_pdf("viewer prefs");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_viewer_preferences(&ViewerPreferences {
+            hide_toolbar: Some(true),
+            hide_menubar: Some(true),
+            fit_window: Some(true),
+            display_doc_title: Some(true),
+            center_window: Some(false),
+            direction: Some("R2L".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // The catalog carries a /ViewerPreferences with each requested key.
+        let bytes = doc.save();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/ViewerPreferences"), "VP dict present");
+        assert!(text.contains("/HideToolbar true"), "HideToolbar set");
+        assert!(text.contains("/HideMenubar true"), "HideMenubar set");
+        assert!(text.contains("/FitWindow true"), "FitWindow set");
+        assert!(
+            text.contains("/DisplayDocTitle true"),
+            "DisplayDocTitle set"
+        );
+        assert!(
+            text.contains("/CenterWindow false"),
+            "CenterWindow cleared to false"
+        );
+        assert!(text.contains("/Direction /R2L"), "Direction name set");
+
+        // The dict survives a save/open round-trip and reads back as a dict.
+        let reopened = Document::open(&bytes).unwrap();
+        let vp = reopened
+            .catalog()
+            .unwrap()
+            .get(b"ViewerPreferences")
+            .map(|o| reopened.resolve(o))
+            .and_then(|o| o.as_dict().cloned())
+            .expect("ViewerPreferences is a dictionary");
+        assert_eq!(vp.get(b"HideToolbar"), Some(&Object::Boolean(true)));
+    }
+
+    #[test]
+    fn set_viewer_preferences_leaves_untouched_fields_and_can_clear() {
+        let pdf = crate::convert::reverse::txt_to_pdf("vp merge");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_viewer_preferences(&ViewerPreferences {
+            hide_toolbar: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        // A second call with all-None must NOT erase the prior key.
+        doc.set_viewer_preferences(&ViewerPreferences::default())
+            .unwrap();
+        let bytes = doc.save();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/HideToolbar true"), "prior key preserved");
+
+        // Clearing the only key empties the dict → /ViewerPreferences removed.
+        doc.set_viewer_preferences(&ViewerPreferences {
+            hide_toolbar: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        let bytes = doc.save();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/HideToolbar false"), "key flipped to false");
+        assert!(
+            text.contains("/ViewerPreferences"),
+            "dict still present (non-empty)"
+        );
+    }
+
+    #[test]
     fn image_mask_stencil_decode_inverts_painted_bits() {
         // Same bytes as above, but `/Decode [1 0]` flips the convention: now a
         // sample **1** paints. So the three masked pixels paint and the top-left
@@ -25130,5 +25371,73 @@ mod tests {
             blue2[2] > 200 && blue2[0] < 60 && blue2[1] < 60,
             "unmasked bottom-right base pixel stays blue, got {blue2:?}"
         );
+    }
+
+    #[test]
+    fn set_viewer_preferences_rejects_a_bad_direction() {
+        let pdf = crate::convert::reverse::txt_to_pdf("bad dir");
+        let mut doc = Document::open(&pdf).unwrap();
+        let err = doc
+            .set_viewer_preferences(&ViewerPreferences {
+                direction: Some("ltr".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)));
+        // The invalid call is a no-op: no /ViewerPreferences written.
+        let bytes = doc.save();
+        assert!(!String::from_utf8_lossy(&bytes).contains("/ViewerPreferences"));
+    }
+
+    #[test]
+    fn set_page_layout_and_page_mode_write_catalog_names() {
+        let pdf = crate::convert::reverse::txt_to_pdf("layout + mode");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_page_layout(Some("TwoColumnLeft")).unwrap();
+        doc.set_page_mode(Some("UseOutlines")).unwrap();
+
+        let bytes = doc.save();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("/PageLayout /TwoColumnLeft"),
+            "PageLayout name"
+        );
+        assert!(text.contains("/PageMode /UseOutlines"), "PageMode name");
+
+        // Round-trips, then None removes the keys again.
+        let mut reopened = Document::open(&bytes).unwrap();
+        assert_eq!(
+            reopened
+                .catalog()
+                .unwrap()
+                .get(b"PageMode")
+                .and_then(Object::as_name),
+            Some(b"UseOutlines".as_slice())
+        );
+        reopened.set_page_layout(None).unwrap();
+        reopened.set_page_mode(None).unwrap();
+        let bytes = reopened.save();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("/PageLayout"), "PageLayout removed");
+        assert!(!text.contains("/PageMode"), "PageMode removed");
+    }
+
+    #[test]
+    fn set_page_layout_and_page_mode_reject_unknown_names() {
+        let pdf = crate::convert::reverse::txt_to_pdf("bad names");
+        let mut doc = Document::open(&pdf).unwrap();
+        assert!(matches!(
+            doc.set_page_layout(Some("ThreeColumn")).unwrap_err(),
+            EngineError::Unsupported(_)
+        ));
+        assert!(matches!(
+            doc.set_page_mode(Some("UseLayers")).unwrap_err(),
+            EngineError::Unsupported(_)
+        ));
+        // Both invalid calls were no-ops.
+        let bytes = doc.save();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("/PageLayout"));
+        assert!(!text.contains("/PageMode"));
     }
 }

@@ -2016,6 +2016,55 @@ export interface OutlineEntry {
   /** `/XYZ` magnification. */
   zoom?: number;
 }
+/**
+ * How a reader arranges pages on screen — the catalog `/PageLayout` name
+ * (ISO 32000-1 §7.7.2). Passed to {@link GigaPdfDoc.setPageLayout}.
+ */
+export type PageLayout =
+  | 'SinglePage'
+  | 'OneColumn'
+  | 'TwoColumnLeft'
+  | 'TwoColumnRight'
+  | 'TwoPageLeft'
+  | 'TwoPageRight';
+
+/**
+ * Which panel (if any) a reader shows on open — the catalog `/PageMode` name
+ * (ISO 32000-1 §7.7.2). Passed to {@link GigaPdfDoc.setPageMode}.
+ */
+export type PageMode =
+  | 'UseNone'
+  | 'UseOutlines'
+  | 'UseThumbs'
+  | 'FullScreen'
+  | 'UseOC'
+  | 'UseAttachments';
+
+/**
+ * Authoring options for the catalog `/ViewerPreferences` dictionary
+ * (ISO 32000-1 §12.2) — UX hints a reader honours when it opens the document.
+ *
+ * Every field is optional: an omitted (or `undefined`) field leaves whatever
+ * the document already had untouched; a boolean sets the corresponding key.
+ * Passed to {@link GigaPdfDoc.setViewerPreferences}.
+ */
+export interface ViewerPreferences {
+  /** `/HideToolbar` — hide the reader's tool bars. */
+  hideToolbar?: boolean;
+  /** `/HideMenubar` — hide the reader's menu bar. */
+  hideMenubar?: boolean;
+  /** `/HideWindowUI` — hide scroll bars / navigation controls, page only. */
+  hideWindowUI?: boolean;
+  /** `/FitWindow` — resize the window to fit the first page. */
+  fitWindow?: boolean;
+  /** `/CenterWindow` — centre the document window on screen. */
+  centerWindow?: boolean;
+  /** `/DisplayDocTitle` — show the doc title (not the file name) in the title bar. */
+  displayDocTitle?: boolean;
+  /** `/Direction` — predominant reading order: `"L2R"` or `"R2L"`. */
+  direction?: 'L2R' | 'R2L';
+}
+
 /** A named destination from {@link GigaPdfDoc.namedDests}: a name → page anchor. */
 export interface NamedDest {
   name: string;
@@ -4681,6 +4730,40 @@ export class GigaPdfDoc {
       .map((b) => `${b.level}\t${b.title}\t${b.action ? JSON.stringify(b.action) : ""}`)
       .join("\n");
     return this.g._withOptStr(text, (p, l) => this.ex().gp_set_bookmarks(this.h, p, l)) === 0;
+  }
+
+  // catalog reading / UX hints (ViewerPreferences, PageLayout, PageMode)
+  /**
+   * Write the catalog `/ViewerPreferences` (ISO 32000-1 §12.2). Each omitted
+   * field is left unchanged; a boolean sets the key. After applying, an empty
+   * dictionary is removed. Returns `false` on an invalid `direction`.
+   */
+  setViewerPreferences(prefs: ViewerPreferences): boolean {
+    // -1 = leave unchanged, 0 = false, 1 = true.
+    const tri = (v: boolean | undefined): number => (v === undefined ? -1 : v ? 1 : 0);
+    return (
+      this.g._withStr(prefs.direction ?? "", (dP, dL) =>
+        this.ex().gp_set_viewer_preferences(
+          this.h,
+          tri(prefs.hideToolbar),
+          tri(prefs.hideMenubar),
+          tri(prefs.hideWindowUI),
+          tri(prefs.fitWindow),
+          tri(prefs.centerWindow),
+          tri(prefs.displayDocTitle),
+          dP,
+          dL
+        )
+      ) === 0
+    );
+  }
+  /** Set the catalog `/PageLayout`. `null` removes the key. Returns `false` on an unknown name. */
+  setPageLayout(layout: PageLayout | null): boolean {
+    return this.g._withStr(layout ?? "", (p, l) => this.ex().gp_set_page_layout(this.h, p, l)) === 0;
+  }
+  /** Set the catalog `/PageMode`. `null` removes the key. Returns `false` on an unknown name. */
+  setPageMode(mode: PageMode | null): boolean {
+    return this.g._withStr(mode ?? "", (p, l) => this.ex().gp_set_page_mode(this.h, p, l)) === 0;
   }
 
   // interactive forms (AcroForm)
