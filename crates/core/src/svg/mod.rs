@@ -162,6 +162,28 @@ struct RawGrad {
 
 type Grads = std::collections::BTreeMap<String, RawGrad>;
 
+/// A `<pattern>` tile definition as written, before resolution to a target shape.
+///
+/// `pattern_units` controls how `x`/`y`/`width`/`height` are read: the default
+/// `objectBoundingBox` treats them as fractions of the filled shape's bounding
+/// box, `userSpaceOnUse` as plain user-space lengths. `content_user_space`
+/// (`patternContentUnits`, default `userSpaceOnUse`) controls the child geometry:
+/// when it is `objectBoundingBox` the children are scaled by the bbox size.
+#[derive(Debug, Clone)]
+struct RawPattern {
+    pattern_units_obb: bool,  // patternUnits = objectBoundingBox (default true)
+    content_user_space: bool, // patternContentUnits = userSpaceOnUse (default true)
+    href: Option<String>,
+    view_box: Option<[f64; 4]>,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+    children: Vec<Node>,
+}
+
+type Pats = std::collections::BTreeMap<String, RawPattern>;
+
 /// One drawable primitive: path segments in viewBox coordinates plus its paint.
 #[derive(Debug, Clone)]
 pub struct Prim {
@@ -207,6 +229,8 @@ pub fn from_element(svg: &Element) -> Option<SvgImage> {
     collect_gradients(&svg.children, &mut grads);
     let mut ids: std::collections::HashMap<&str, &Node> = std::collections::HashMap::new();
     collect_ids(&svg.children, &mut ids);
+    let mut pats = Pats::new();
+    collect_patterns(&svg.children, &mut pats);
     let mut prims = Vec::new();
     walk(
         &svg.children,
@@ -214,6 +238,7 @@ pub fn from_element(svg: &Element) -> Option<SvgImage> {
         Paint::root(),
         &ids,
         &grads,
+        &pats,
         &mut prims,
         0,
     );
@@ -249,6 +274,7 @@ fn walk(
     paint: Paint,
     ids: &std::collections::HashMap<&str, &Node>,
     grads: &Grads,
+    pats: &Pats,
     out: &mut Vec<Prim>,
     depth: u8,
 ) {
@@ -262,8 +288,8 @@ fn walk(
         let furl = fill_url(e);
         let furl = furl.as_deref();
         match e.tag.as_str() {
-            "g" | "a" | "svg" => walk(&e.children, ctm, paint, ids, grads, out, depth),
-            "rect" => push(out, rect_segs(e), ctm, paint, furl, grads),
+            "g" | "a" | "svg" => walk(&e.children, ctm, paint, ids, grads, pats, out, depth),
+            "rect" => push(out, rect_segs(e), ctm, paint, furl, ids, grads, pats, depth),
             "circle" => {
                 let r = attr_f(e, "r");
                 push(
@@ -272,7 +298,10 @@ fn walk(
                     ctm,
                     paint,
                     furl,
+                    ids,
                     grads,
+                    pats,
+                    depth,
                 );
             }
             "ellipse" => push(
@@ -286,18 +315,44 @@ fn walk(
                 ctm,
                 paint,
                 furl,
+                ids,
                 grads,
+                pats,
+                depth,
             ),
-            "line" => push(out, line_segs(e), ctm, paint, furl, grads),
-            "polyline" => push(out, poly_segs(e, false), ctm, paint, furl, grads),
-            "polygon" => push(out, poly_segs(e, true), ctm, paint, furl, grads),
+            "line" => push(out, line_segs(e), ctm, paint, furl, ids, grads, pats, depth),
+            "polyline" => push(
+                out,
+                poly_segs(e, false),
+                ctm,
+                paint,
+                furl,
+                ids,
+                grads,
+                pats,
+                depth,
+            ),
+            "polygon" => push(
+                out,
+                poly_segs(e, true),
+                ctm,
+                paint,
+                furl,
+                ids,
+                grads,
+                pats,
+                depth,
+            ),
             "path" => push(
                 out,
                 e.attr("d").map(parse_path_d).unwrap_or_default(),
                 ctm,
                 paint,
                 furl,
+                ids,
                 grads,
+                pats,
+                depth,
             ),
             "text" => walk_text(e, ctm, paint, out),
             "use" => {
@@ -318,6 +373,7 @@ fn walk(
                             paint,
                             ids,
                             grads,
+                            pats,
                             out,
                             depth + 1,
                         );
@@ -584,20 +640,52 @@ fn anchor_of(e: &Element) -> Anchor {
 }
 
 /// Bake the transform into the segments and record the primitive (skipping the
-/// invisible: empty geometry, or no fill and no stroke). `fill_url` is a gradient
-/// id from `fill="url(#id)"`, resolved against `grads`.
+/// invisible: empty geometry, or no fill and no stroke). `fill_url` is a paint
+/// server id from `fill="url(#id)"`, resolved against `grads` (gradients) or
+/// `pats` (`<pattern>` tiles).
+#[allow(clippy::too_many_arguments)]
 fn push(
     out: &mut Vec<Prim>,
     segs: Vec<Seg>,
     ctm: Mat,
     paint: Paint,
     fill_url: Option<&str>,
+    ids: &std::collections::HashMap<&str, &Node>,
     grads: &Grads,
+    pats: &Pats,
+    depth: u8,
 ) {
     if segs.is_empty() {
         return;
     }
     let segs: Vec<Seg> = segs.iter().map(|s| transform_seg(s, &ctm)).collect();
+
+    // A `fill="url(#id)"` may reference a `<pattern>`: tile its child content
+    // across this shape's bounding box (clipped to the bbox), then optionally
+    // stroke the shape outline. Falls back to the inherited solid fill if the
+    // pattern can't be resolved (empty / cyclic / zero tile).
+    if let Some(id) = fill_url {
+        if pats.contains_key(id) {
+            let bbox = segs_bbox(&segs);
+            let tiled = resolve_pattern(id, pats, ids, grads, bbox, &ctm, depth);
+            if let Some(tiles) = tiled {
+                out.extend(tiles);
+                if let Some(stroke) = paint.stroke {
+                    out.push(Prim {
+                        segs,
+                        fill: None,
+                        stroke: Some(stroke),
+                        stroke_w: paint.stroke_w * ctm.scale_hint(),
+                        fill_opacity: paint.fill_opacity,
+                        stroke_opacity: paint.stroke_opacity,
+                    });
+                }
+                return;
+            }
+            // Unresolved pattern → fall through to a plain fill below.
+        }
+    }
+
     let fill = match fill_url {
         Some(id) => resolve_gradient(id, grads, segs_bbox(&segs), &ctm)
             .map(Fill::Gradient)
@@ -1020,6 +1108,382 @@ fn resolve_gradient(id: &str, grads: &Grads, bbox: [f64; 4], ctm: &Mat) -> Optio
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Some(Gradient { kind, stops })
+}
+
+// ── patterns (tiling) ───────────────────────────────────────────────────────────
+
+fn collect_patterns(nodes: &[Node], out: &mut Pats) {
+    for n in nodes {
+        let Node::Element(e) = n else { continue };
+        if e.tag == "pattern" {
+            if let Some(id) = e.attr("id") {
+                out.insert(id.to_string(), parse_raw_pattern(e));
+            }
+        }
+        collect_patterns(&e.children, out);
+    }
+}
+
+/// `patternUnits` / `patternContentUnits` enum: true ⇔ `objectBoundingBox`.
+fn units_is_obb(v: Option<&str>, default_obb: bool) -> bool {
+    match v.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("objectBoundingBox") => true,
+        Some(s) if s.eq_ignore_ascii_case("userSpaceOnUse") => false,
+        _ => default_obb,
+    }
+}
+
+fn parse_raw_pattern(e: &Element) -> RawPattern {
+    RawPattern {
+        pattern_units_obb: units_is_obb(e.attr("patternunits"), true),
+        content_user_space: !units_is_obb(e.attr("patterncontentunits"), false),
+        href: e
+            .attr("href")
+            .or_else(|| e.attr("xlink:href"))
+            .map(|h| h.trim().trim_start_matches('#').to_string()),
+        view_box: e.attr("viewbox").and_then(parse_view_box),
+        x: e.attr("x").and_then(parse_grad_coord),
+        y: e.attr("y").and_then(parse_grad_coord),
+        width: e.attr("width").and_then(parse_grad_coord),
+        height: e.attr("height").and_then(parse_grad_coord),
+        children: e.children.clone(),
+    }
+}
+
+/// Resolve a `<pattern>` reference into a list of clipped, tiled primitives that
+/// cover the target shape's bounding box `bbox` (in output / CTM-baked space).
+///
+/// `bbox` is `[min_x, min_y, max_x, max_y]`. `objectBoundingBox` tile geometry is
+/// sized as a fraction of the bbox; `userSpaceOnUse` uses plain lengths scaled by
+/// the CTM. One level of `href` inheritance fills in missing geometry/children.
+/// Returns `None` if the tile is degenerate or the pattern paints nothing.
+#[allow(clippy::too_many_arguments)]
+fn resolve_pattern(
+    id: &str,
+    pats: &Pats,
+    ids: &std::collections::HashMap<&str, &Node>,
+    grads: &Grads,
+    bbox: [f64; 4],
+    ctm: &Mat,
+    depth: u8,
+) -> Option<Vec<Prim>> {
+    let mut pat = pats.get(id)?.clone();
+    // One level of href inheritance (children + tile geometry + viewBox).
+    if let Some(href) = pat.href.clone() {
+        if href != id {
+            if let Some(parent) = pats.get(&href) {
+                if pat.children.is_empty() {
+                    pat.children = parent.children.clone();
+                }
+                pat.x = pat.x.or(parent.x);
+                pat.y = pat.y.or(parent.y);
+                pat.width = pat.width.or(parent.width);
+                pat.height = pat.height.or(parent.height);
+                pat.view_box = pat.view_box.or(parent.view_box);
+            }
+        }
+    }
+    if pat.children.is_empty() {
+        return None;
+    }
+
+    let [minx, miny, maxx, maxy] = bbox;
+    let (bw, bh) = (maxx - minx, maxy - miny);
+    if bw <= 0.0 || bh <= 0.0 {
+        return None;
+    }
+    // The CTM's mean scale maps userSpaceOnUse lengths into output space. Pattern
+    // grids that involve rotation/skew in the CTM are tiled axis-aligned in output
+    // space (a documented simplification — see the module limitations).
+    let s = ctm.scale_hint();
+
+    // Tile size + origin, both in output space.
+    let (tw, th, ox, oy) = if pat.pattern_units_obb {
+        (
+            pat.width.unwrap_or(0.0) * bw,
+            pat.height.unwrap_or(0.0) * bh,
+            minx + pat.x.unwrap_or(0.0) * bw,
+            miny + pat.y.unwrap_or(0.0) * bh,
+        )
+    } else {
+        let (ox, oy) = ctm.apply(pat.x.unwrap_or(0.0), pat.y.unwrap_or(0.0));
+        (
+            pat.width.unwrap_or(0.0) * s,
+            pat.height.unwrap_or(0.0) * s,
+            ox,
+            oy,
+        )
+    };
+    if tw <= 1e-6 || th <= 1e-6 {
+        return None;
+    }
+
+    // Cap the grid so a tiny tile over a huge bbox can't explode the primitive
+    // count; the visible difference past a few thousand cells is nil.
+    const MAX_CELLS: usize = 20_000;
+    let nx = (bw / tw).ceil() as i64 + 1;
+    let ny = (bh / th).ceil() as i64 + 1;
+    if nx <= 0 || ny <= 0 || (nx as usize).saturating_mul(ny as usize) > MAX_CELLS {
+        return None;
+    }
+
+    // Build the un-positioned tile content once (output-space, single tile at the
+    // grid origin). The tile cell is `[ox, oy] … [ox+tw, oy+th]`.
+    let content = build_tile_content(&pat, tw, th, s, ox, oy, ids, grads, depth);
+    if content.is_empty() {
+        return None;
+    }
+
+    // Lay the cell out across the bbox, snapping the first cell so the bbox start
+    // is covered, and clip every emitted primitive to (cell ∩ bbox).
+    let start_col = ((minx - ox) / tw).floor() as i64;
+    let start_row = ((miny - oy) / th).floor() as i64;
+    let mut tiles: Vec<Prim> = Vec::new();
+    for row in 0..ny {
+        let cell_oy = oy + (start_row + row) as f64 * th;
+        if cell_oy >= maxy || cell_oy + th <= miny {
+            continue;
+        }
+        for col in 0..nx {
+            let cell_ox = ox + (start_col + col) as f64 * tw;
+            if cell_ox >= maxx || cell_ox + tw <= minx {
+                continue;
+            }
+            // Clip rectangle = this cell ∩ the shape bbox.
+            let clip = [
+                cell_ox.max(minx),
+                cell_oy.max(miny),
+                (cell_ox + tw).min(maxx),
+                (cell_oy + th).min(maxy),
+            ];
+            if clip[2] - clip[0] <= 1e-6 || clip[3] - clip[1] <= 1e-6 {
+                continue;
+            }
+            let dx = cell_ox - ox;
+            let dy = cell_oy - oy;
+            for tc in &content {
+                if let Some(clipped) = clip_prim_to_rect(tc, dx, dy, clip) {
+                    tiles.push(clipped);
+                }
+            }
+        }
+    }
+    if tiles.is_empty() {
+        None
+    } else {
+        Some(tiles)
+    }
+}
+
+/// Walk a pattern's child content into primitives placed at the grid origin
+/// `(ox, oy)` in output space. `s` is the CTM scale; `tw`/`th` the tile size.
+/// `patternContentUnits=objectBoundingBox` scales child coords by the tile size.
+#[allow(clippy::too_many_arguments)]
+fn build_tile_content(
+    pat: &RawPattern,
+    tw: f64,
+    th: f64,
+    s: f64,
+    ox: f64,
+    oy: f64,
+    ids: &std::collections::HashMap<&str, &Node>,
+    grads: &Grads,
+    depth: u8,
+) -> Vec<Prim> {
+    // Content transform: map a child's local coords into output space at the tile
+    // origin. `viewBox` (if present) maps the box onto the tile size; otherwise
+    // userSpaceOnUse content scales by the CTM and objectBoundingBox by tile size.
+    let content_mat = if let Some([vx, vy, vw, vh]) = pat.view_box {
+        if vw > 0.0 && vh > 0.0 {
+            Mat::translate(ox, oy).then(&Mat {
+                a: tw / vw,
+                b: 0.0,
+                c: 0.0,
+                d: th / vh,
+                e: -vx * tw / vw,
+                f: -vy * th / vh,
+            })
+        } else {
+            Mat::translate(ox, oy)
+        }
+    } else if pat.content_user_space {
+        Mat::translate(ox, oy).then(&Mat {
+            a: s,
+            b: 0.0,
+            c: 0.0,
+            d: s,
+            e: 0.0,
+            f: 0.0,
+        })
+    } else {
+        // objectBoundingBox content: fractions of the tile size.
+        Mat::translate(ox, oy).then(&Mat {
+            a: tw,
+            b: 0.0,
+            c: 0.0,
+            d: th,
+            e: 0.0,
+            f: 0.0,
+        })
+    };
+
+    // The pattern's children inherit only their own paint (SVG: pattern content
+    // does not inherit from the referencing element), starting from initial.
+    let mut content = Vec::new();
+    walk(
+        &pat.children,
+        content_mat,
+        Paint::root(),
+        ids,
+        grads,
+        &Pats::new(), // nested <pattern> inside a pattern is not resolved (deferred)
+        &mut content,
+        depth.saturating_add(1),
+    );
+    content
+}
+
+/// Clip a tile primitive (translated by `dx,dy`) to the axis-aligned rectangle
+/// `clip = [x0, y0, x1, y1]` (output space). Cubics are flattened to polylines
+/// and clipped with Sutherland–Hodgman; returns `None` if nothing survives.
+fn clip_prim_to_rect(p: &Prim, dx: f64, dy: f64, clip: [f64; 4]) -> Option<Prim> {
+    let mut out_segs: Vec<Seg> = Vec::new();
+    let mut any = false;
+    for sub in split_subpaths(&p.segs) {
+        // Flatten this subpath to a polygon in output space (with the cell offset).
+        let poly: Vec<(f64, f64)> = flatten_subpath(&sub, dx, dy);
+        if poly.len() < 2 {
+            continue;
+        }
+        let clipped = clip_polygon(&poly, clip);
+        if clipped.len() < 2 {
+            continue;
+        }
+        out_segs.push(Seg::Move(clipped[0].0, clipped[0].1));
+        for pt in &clipped[1..] {
+            out_segs.push(Seg::Line(pt.0, pt.1));
+        }
+        out_segs.push(Seg::Close);
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    Some(Prim {
+        segs: out_segs,
+        fill: p.fill.clone(),
+        stroke: p.stroke,
+        stroke_w: p.stroke_w,
+        fill_opacity: p.fill_opacity,
+        stroke_opacity: p.stroke_opacity,
+    })
+}
+
+/// Split a segment list into subpaths (each starting at a `Move`).
+fn split_subpaths(segs: &[Seg]) -> Vec<Vec<Seg>> {
+    let mut subs: Vec<Vec<Seg>> = Vec::new();
+    for s in segs {
+        match s {
+            Seg::Move(..) => subs.push(vec![*s]),
+            other => {
+                if let Some(last) = subs.last_mut() {
+                    last.push(*other);
+                }
+            }
+        }
+    }
+    subs
+}
+
+/// Flatten one subpath (cubics subdivided) into a polyline, applying the cell
+/// offset `(dx, dy)`. `Close` is implicit (the polygon clipper treats it closed).
+fn flatten_subpath(sub: &[Seg], dx: f64, dy: f64) -> Vec<(f64, f64)> {
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    let mut cur = (0.0, 0.0);
+    for s in sub {
+        match *s {
+            Seg::Move(x, y) => {
+                cur = (x + dx, y + dy);
+                pts.push(cur);
+            }
+            Seg::Line(x, y) => {
+                cur = (x + dx, y + dy);
+                pts.push(cur);
+            }
+            Seg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                let p0 = cur;
+                let p1 = (x1 + dx, y1 + dy);
+                let p2 = (x2 + dx, y2 + dy);
+                let p3 = (x3 + dx, y3 + dy);
+                const STEPS: usize = 12;
+                for k in 1..=STEPS {
+                    let t = k as f64 / STEPS as f64;
+                    pts.push(cubic_at(p0, p1, p2, p3, t));
+                }
+                cur = p3;
+            }
+            Seg::Close => {}
+        }
+    }
+    pts
+}
+
+fn cubic_at(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64) -> (f64, f64) {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    (
+        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
+        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
+    )
+}
+
+/// Sutherland–Hodgman clip of a closed polygon against an axis-aligned rectangle
+/// `[x0, y0, x1, y1]`. Returns the clipped polygon's vertices (possibly empty).
+fn clip_polygon(poly: &[(f64, f64)], rect: [f64; 4]) -> Vec<(f64, f64)> {
+    let [x0, y0, x1, y1] = rect;
+    // Each edge: keep the side that is inside. `inside`/`intersect` per edge.
+    let edges: [(u8, f64); 4] = [(0, x0), (1, x1), (2, y0), (3, y1)];
+    let mut out: Vec<(f64, f64)> = poly.to_vec();
+    for (which, val) in edges {
+        if out.len() < 2 {
+            return Vec::new();
+        }
+        let input = std::mem::take(&mut out);
+        let inside = |p: &(f64, f64)| match which {
+            0 => p.0 >= val, // left edge: x >= x0
+            1 => p.0 <= val, // right edge: x <= x1
+            2 => p.1 >= val, // bottom edge: y >= y0
+            _ => p.1 <= val, // top edge: y <= y1
+        };
+        let intersect = |a: &(f64, f64), b: &(f64, f64)| -> (f64, f64) {
+            match which {
+                0 | 1 => {
+                    let t = (val - a.0) / (b.0 - a.0);
+                    (val, a.1 + t * (b.1 - a.1))
+                }
+                _ => {
+                    let t = (val - a.1) / (b.1 - a.1);
+                    (a.0 + t * (b.0 - a.0), val)
+                }
+            }
+        };
+        let n = input.len();
+        for i in 0..n {
+            let cur = input[i];
+            let prev = input[(i + n - 1) % n];
+            let cur_in = inside(&cur);
+            let prev_in = inside(&prev);
+            if cur_in {
+                if !prev_in {
+                    out.push(intersect(&prev, &cur));
+                }
+                out.push(cur);
+            } else if prev_in {
+                out.push(intersect(&prev, &cur));
+            }
+        }
+    }
+    out
 }
 
 fn parse_style(s: &str) -> Vec<(String, String)> {
@@ -1480,6 +1944,124 @@ mod tests {
         assert!(
             (lo(&shifted) - lo(&plain) - 100.0).abs() < 1.0,
             "translate baked into glyph outline"
+        );
+    }
+
+    // ── <pattern> tiling ──────────────────────────────────────────────────────
+
+    /// Distinct integer cell origins (rounded min-x, min-y) the primitives sit
+    /// at — a proxy for "how many tiles were laid down".
+    fn distinct_cell_origins(img: &SvgImage) -> usize {
+        let mut origins: Vec<(i64, i64)> = img
+            .prims
+            .iter()
+            .map(|p| {
+                let (mut lo_x, mut lo_y) = (f64::INFINITY, f64::INFINITY);
+                for s in &p.segs {
+                    if let Seg::Move(x, y) | Seg::Line(x, y) = s {
+                        lo_x = lo_x.min(*x);
+                        lo_y = lo_y.min(*y);
+                    }
+                }
+                (lo_x.round() as i64, lo_y.round() as i64)
+            })
+            .collect();
+        origins.sort_unstable();
+        origins.dedup();
+        origins.len()
+    }
+
+    #[test]
+    fn pattern_userspace_tiles_across_shape() {
+        // A 40×20 rect filled by a 10×10 userSpaceOnUse pattern whose single child
+        // fills the whole cell green → 4 cols × 2 rows = 8 tiles, each a clipped
+        // green rect. The flat fallback would have produced a SINGLE primitive.
+        let svg = r##"<svg viewBox="0 0 40 20"><defs>
+            <pattern id="p" patternUnits="userSpaceOnUse" width="10" height="10">
+                <rect x="0" y="0" width="10" height="10" fill="#00ff00"/>
+            </pattern></defs>
+            <rect x="0" y="0" width="40" height="20" fill="url(#p)"/></svg>"##;
+        let img = parse_svg(svg).expect("pattern-filled rect parses");
+        assert!(
+            img.prims.len() > 1,
+            "tiling emits several primitives, not a flat fallback (got {})",
+            img.prims.len()
+        );
+        // Every tile is a solid green fill (the cell's own paint, not the shape's).
+        for p in &img.prims {
+            match p.fill {
+                Some(Fill::Solid(c)) => assert_eq!(c, [0.0, 1.0, 0.0], "tile is green"),
+                _ => panic!("each tile should be solid-filled"),
+            }
+        }
+        // The tiles sit at multiple distinct cell origins covering the 40×20 box.
+        assert!(
+            distinct_cell_origins(&img) >= 4,
+            "content repeats across distinct cells (origins={})",
+            distinct_cell_origins(&img)
+        );
+        // All tile geometry stays within the shape's bbox (clipped to it).
+        for p in &img.prims {
+            for s in &p.segs {
+                if let Seg::Move(x, y) | Seg::Line(x, y) = s {
+                    assert!(
+                        *x >= -0.01 && *x <= 40.01 && *y >= -0.01 && *y <= 20.01,
+                        "tile clipped to bbox (x={x} y={y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_object_bounding_box_default_units() {
+        // Default patternUnits=objectBoundingBox: width/height are fractions of the
+        // shape bbox. 0.25×0.5 over a 40×20 rect → 10×10 tiles → 4×2 grid again.
+        let svg = r##"<svg viewBox="0 0 40 20"><defs>
+            <pattern id="p" width="0.25" height="0.5" patternContentUnits="objectBoundingBox">
+                <rect x="0" y="0" width="0.25" height="0.5" fill="#0000ff"/>
+            </pattern></defs>
+            <rect x="0" y="0" width="40" height="20" fill="url(#p)"/></svg>"##;
+        let img = parse_svg(svg).expect("objectBoundingBox pattern parses");
+        assert!(
+            img.prims.len() > 1,
+            "objectBoundingBox pattern tiles (got {})",
+            img.prims.len()
+        );
+        assert!(
+            distinct_cell_origins(&img) >= 4,
+            "obb tiles repeat across cells (origins={})",
+            distinct_cell_origins(&img)
+        );
+    }
+
+    #[test]
+    fn solid_fill_unchanged_control() {
+        // Control: a plain solid fill is still exactly one primitive, one fill.
+        let svg = r##"<svg viewBox="0 0 40 20">
+            <rect x="0" y="0" width="40" height="20" fill="#ff0000"/></svg>"##;
+        let img = parse_svg(svg).expect("solid rect parses");
+        assert_eq!(img.prims.len(), 1, "solid fill is a single primitive");
+        match img.prims[0].fill {
+            Some(Fill::Solid(c)) => assert_eq!(c, [1.0, 0.0, 0.0], "solid stays red"),
+            _ => panic!("control rect should be a solid fill"),
+        }
+    }
+
+    #[test]
+    fn empty_pattern_falls_back_to_solid_fill() {
+        // A pattern with no drawable children can't tile → the inherited solid
+        // fill paints the shape (one primitive), never an empty result.
+        let svg = r##"<svg viewBox="0 0 20 20"><defs>
+            <pattern id="p" patternUnits="userSpaceOnUse" width="5" height="5"></pattern>
+            </defs>
+            <rect x="0" y="0" width="20" height="20" fill="url(#p)" stroke="#000"/></svg>"##;
+        let img = parse_svg(svg).expect("empty pattern falls back");
+        // Fallback path: the rect keeps its (default black) fill + the stroke.
+        assert_eq!(img.prims.len(), 1, "fallback is the single shape primitive");
+        assert!(
+            img.prims[0].fill.is_some() && img.prims[0].stroke.is_some(),
+            "fallback keeps inherited fill and the stroke"
         );
     }
 }
