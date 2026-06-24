@@ -12,6 +12,7 @@ pub mod ltv; // PAdES-LTV: OCSP/CRL fetch plan, DSS validation material
 pub mod pades; // PAdES signing-certificate-v2 ESS attribute
 pub mod pkcs12;
 pub mod timestamp; // RFC 3161 TimeStampReq build / TimeStampResp parse
+pub mod verify; // PDF signature verification: detached CMS digest + signature check
 
 use crate::crypto::rsa::RsaPrivateKey;
 use ::der::asn1::{Any, SetOfVec, UtcTime};

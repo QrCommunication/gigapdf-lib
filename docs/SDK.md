@@ -478,6 +478,9 @@ timestamped/LTV methods are **`async`** because they need network round trips.
 | `signP12(p12, password, opts?)` | `Uint8Array` | **B** (PKCS#12) | Sign with a **user PKCS#12** identity (CA/eIDAS cert + RSA key), imported natively. `opts = { name?, reason?, date?, location?, contactInfo? }` (`SignP12Options`). **Throws** a generic error on a bad password/file/cipher (anti-enumeration). |
 | `signTimestamped(opts)` | `Promise<Uint8Array>` | **B-T** (PAdES) | B signature **+ an RFC 3161 trusted timestamp** embedded in the SignerInfo (`ETSI.CAdES.detached`, `signing-certificate-v2`, `id-aa-timeStampToken`). `opts` is `SignTsaOptions`. |
 | `signLtv(opts)` | `Promise<Uint8Array>` | **B-LT / B-LTA** (PAdES-LTV) | B-T **+ a `/DSS`** (Document Security Store) carrying the certificate chain and OCSP/CRL revocation material, so the signature validates long after the certs expire/revoke. With `opts.archiveTimestamp` a `/DocTimeStamp` over the whole file is added (**B-LTA**, renewable archival). `opts` is `SignLtvOptions`. |
+| `certify(fields, random, docmdpLevel, keyBits?)` | `Uint8Array` | **Certify** (DocMDP) | Like `sign` but **certifies** the document: writes `/Perms /DocMDP` and a `/Reference` transform declaring which later changes are allowed — `docmdpLevel` is `1` (no changes), `2` (form-fill + sign) or `3` (also annotate). |
+| `signatures()` | `SignatureInfo[]` | — | List every signature (`/Sig` field) with `{ fieldName, signerName, reason, location, date, subFilter, byteRange }`. Reads the parsed model; for validity call `verifySignatures`. |
+| `verifySignatures(pdfBytes)` | `SignatureReport[]` | — | **Verify** each signature against the **original bytes** (`pdfBytes` = what you opened): `{ fieldName, byteRangeOk, digestOk, signatureOk, coversWholeDocument, signerCommonName, certCount, algorithm }`. `digestOk` = content integrity (ByteRange SHA-256 vs CMS `messageDigest`); `signatureOk` = the RSA SignerInfo signature; `coversWholeDocument` = nothing appended after. RSA + SHA-256 only. |
 
 `signP12` imports PBES2 (PBKDF2 + AES) and PBES1 (3DES, RC2-40) bags and verifies
 the integrity MAC.
@@ -573,7 +576,7 @@ import type {
   ImageElementInfo, VectorPathInfo, PathSegment, PdfPermissions,
   SearchHit, AnnotationInfo, FieldInfo, FieldKind, FieldStyle, RadioOption,
   LinkInfo, LayerInfo, OutlineEntry, NamedDest, Action, Destination, Bookmark,
-  Attachment, XlsxSheet, DecodedImage,
+  SignatureInfo, SignatureReport, Attachment, XlsxSheet, DecodedImage,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,
   // unified editable model:

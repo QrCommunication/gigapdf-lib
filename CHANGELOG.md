@@ -7,6 +7,39 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.80.0] - 2026-06-24
+
+Signature **verification** and **DocMDP certification** (ISO 32000-1 §12.8) — the
+signing stack could produce signatures but not check them. Resolves
+[#16](https://github.com/qrcommunication/gigapdf-lib/issues/16).
+
+### Added
+
+- **`crates/core/src/sign/verify.rs`** — a detached-CMS verifier built on the
+  existing RustCrypto `cms`/`x509-cert`/`rsa` stack: recompute the `/ByteRange`
+  SHA-256, check the CMS `messageDigest`, and validate the SignerInfo RSA
+  signature under the signer certificate's key (trimming the `/Contents`
+  zero-padding to the actual DER element first).
+- **`Document::signatures() -> Vec<SignatureInfo>`** — list every `/Sig` field's
+  `/V` with its metadata and `/ByteRange`. `gp_signatures_json` / `doc.signatures`.
+- **`Document::verify_signatures(&pdf_bytes) -> Vec<SignatureReport>`** — verify
+  each signature against the original bytes: `byte_range_ok`, `digest_ok`
+  (integrity), `signature_ok`, `covers_whole_document`, signer CN, cert count,
+  algorithm. `gp_verify_signatures` / `doc.verifySignatures`.
+- **`Document::sign_certify(&Signer, name, reason, date, docmdp_p)`** — produce a
+  **certified** PDF: a certifying signature plus the catalog `/Perms /DocMDP` and
+  a `/Reference` DocMDP transform with the permission level (1 = no changes,
+  2 = fill + sign, 3 = also annotate). `gp_sign_certify` / `doc.certify`.
+
+### Notes
+
+- **RSA + SHA-256** (what this engine produces) is verified; other algorithms are
+  reported as `unsupported`. Live OCSP/CRL revocation checking, full
+  chain-to-trusted-root validation, FieldMDP field-locking and ECDSA are out of
+  scope (they need a trust store / network / clock the engine doesn't have).
+  Verification needs the **original file bytes** (the `Document` doesn't retain
+  them).
+
 ## [0.79.0] - 2026-06-24
 
 Closes the interactive-forms gaps (ISO 32000-1 §12.7): signature fields,

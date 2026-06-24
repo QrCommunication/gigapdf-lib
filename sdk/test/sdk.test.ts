@@ -453,6 +453,48 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("signatures: sign, list, verify (digest + signature), detect append, certify", () => {
+    const rand = new Uint8Array(256).map((_, i) => (i * 53 + 7) & 0xff);
+    const fields = "Jane\tApproval\tD:20260614120000Z\t260101000000Z\t360101000000Z";
+
+    const doc = giga.open(giga.txtToPdf("sign me"));
+    const signed = doc.sign(fields, rand, 1024);
+    doc.close();
+
+    const v = giga.open(signed);
+    const sigs = v.signatures();
+    expect(sigs.length).toBe(1);
+    expect(sigs[0].signerName).toBe("Jane");
+    expect(sigs[0].subFilter).toBe("adbe.pkcs7.detached");
+
+    const ok = v.verifySignatures(signed);
+    expect(ok[0].digestOk).toBe(true);
+    expect(ok[0].signatureOk).toBe(true);
+    expect(ok[0].coversWholeDocument).toBe(true);
+    expect(ok[0].algorithm).toBe("RSA+SHA-256");
+    expect(ok[0].certCount).toBeGreaterThanOrEqual(1);
+
+    // Appending bytes ⇒ no longer whole-document coverage.
+    const appended = new Uint8Array(signed.length + 5);
+    appended.set(signed);
+    appended.set([10, 37, 120, 10, 10], signed.length);
+    expect(v.verifySignatures(appended)[0].coversWholeDocument).toBe(false);
+    v.close();
+
+    // Certify (DocMDP level 2) — still verifies.
+    const doc2 = giga.open(giga.txtToPdf("certify me"));
+    const certified = doc2.certify(
+      "Cert\tI certify\tD:20260624000000Z\t260101000000Z\t360101000000Z",
+      rand,
+      2,
+      1024
+    );
+    doc2.close();
+    const c = giga.open(certified);
+    expect(c.verifySignatures(certified)[0].signatureOk).toBe(true);
+    c.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

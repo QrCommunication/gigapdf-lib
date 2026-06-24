@@ -43,7 +43,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Fill and create form fields](#fill-and-create-form-fields)
 - [Annotate (highlight, note, ink, stamp)](#annotate)
 - [Navigation: links, bookmarks & open-action](#navigation-links-bookmarks--open-action) — *full action model: v0.78.0*
-- [Sign a PDF (B · B-T · LTV)](#sign-a-pdf-b--b-t--ltv) — *B-T: v0.70.0 · LTV: v0.71.0*
+- [Sign a PDF (B · B-T · LTV · certify · verify)](#sign-a-pdf-b--b-t--ltv) — *B-T: v0.70.0 · LTV: v0.71.0 · verify + DocMDP: v0.80.0*
 - [Encrypt with AES-256](#encrypt-with-aes-256)
 - [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
 - [Render a page without a specific element (live-overlay editing)](#render-a-page-without-a-specific-element-live-overlay-editing) — *v0.58.0*
@@ -826,6 +826,42 @@ const signed = doc.signP12(p12Bytes, "p12-password", {
 //     fields = "name\treason\tdate\tnotBefore\tnotAfter"; ≥ 256 host-entropy bytes.
 const fields = "Jane Doe\tApproved\tD:20260619120000Z\t260619000000Z\t360619000000Z";
 const ephemeral = doc.sign(fields, crypto.getRandomValues(new Uint8Array(256)));
+
+doc.close();
+```
+
+### Certify (DocMDP) — lock down later changes
+
+```ts
+const doc = giga.open(pdfBytes);
+const fields = "Approver\tI certify this document\tD:20260624000000Z\t260101000000Z\t360101000000Z";
+// docmdpLevel: 1 = no changes · 2 = form-fill + sign · 3 = also annotate
+const certified = doc.certify(fields, crypto.getRandomValues(new Uint8Array(256)), 2);
+doc.close();
+```
+
+### Verify signatures
+
+Verification runs against the **original bytes** you opened (the document doesn't
+retain them). It recomputes the `/ByteRange` digest, checks the CMS
+`messageDigest`, and validates the RSA SignerInfo signature.
+
+```ts
+const bytes = signedPdfBytes;           // the exact bytes you opened
+const doc = giga.open(bytes);
+
+for (const s of doc.signatures()) {
+  console.log(s.fieldName, s.signerName, s.subFilter);
+}
+
+for (const r of doc.verifySignatures(bytes)) {
+  const valid = r.byteRangeOk && r.digestOk && r.signatureOk;
+  console.log(
+    `${r.fieldName}: ${valid ? "VALID" : "INVALID"} ` +
+    `(${r.algorithm}, CN=${r.signerCommonName ?? "?"}, ` +
+    `covers whole file: ${r.coversWholeDocument})`
+  );
+}
 
 doc.close();
 ```

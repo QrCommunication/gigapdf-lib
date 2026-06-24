@@ -271,6 +271,137 @@ pub extern "C" fn gp_sign(
     }
 }
 
+/// **Certify** the document (DocMDP). Like `gp_sign` plus `docmdp_p` (`1`/`2`/`3`
+/// — the permitted-changes level): writes the `/Reference` DocMDP transform and
+/// the catalog `/Perms /DocMDP`. Buffer-returning; null on error.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_sign_certify(
+    handle: *mut Document,
+    fields_ptr: *const u8,
+    fields_len: usize,
+    rand_ptr: *const u8,
+    rand_len: usize,
+    bits: usize,
+    docmdp_p: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return std::ptr::null_mut(),
+    };
+    let fields = unsafe { str_arg(fields_ptr, fields_len) };
+    let parts: Vec<&str> = fields.split('\t').collect();
+    if parts.len() < 5 {
+        return std::ptr::null_mut();
+    }
+    let rand = unsafe {
+        if rand_ptr.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(rand_ptr, rand_len)
+        }
+    };
+    let signer =
+        match gigapdf_core::sign::Signer::generate(parts[0], parts[3], parts[4], bits, rand) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+    match doc.sign_certify(&signer, parts[0], parts[1], parts[2], docmdp_p as u8) {
+        Ok(pdf) => unsafe { bytes_into_host(pdf, out_len) },
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Every signature on the document as a JSON array
+/// `[{fieldName,signerName,reason,location,date,subFilter,byteRange:[a,b,c,d]}]`
+/// (string fields `null` when absent). Reads the parsed model; for cryptographic
+/// validity call `gp_verify_signatures`. Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_signatures_json(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            // `json_escape` emits the surrounding quotes itself.
+            let opt = |v: Option<&str>, out: &mut String| match v {
+                Some(s) => json_escape(s, out),
+                None => out.push_str("null"),
+            };
+            let mut s = String::from("[");
+            for (i, sig) in doc.signatures().iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"fieldName\":");
+                opt(Some(&sig.field_name), &mut s);
+                s.push_str(",\"signerName\":");
+                opt(sig.signer_name.as_deref(), &mut s);
+                s.push_str(",\"reason\":");
+                opt(sig.reason.as_deref(), &mut s);
+                s.push_str(",\"location\":");
+                opt(sig.location.as_deref(), &mut s);
+                s.push_str(",\"date\":");
+                opt(sig.date.as_deref(), &mut s);
+                s.push_str(",\"subFilter\":");
+                opt(sig.sub_filter.as_deref(), &mut s);
+                let [a, b, c, d] = sig.byte_range;
+                s.push_str(&format!(",\"byteRange\":[{a},{b},{c},{d}]}}"));
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
+/// Cryptographically verify every signature against `pdf` (the bytes the document
+/// was opened from). JSON array
+/// `[{fieldName,byteRangeOk,digestOk,signatureOk,coversWholeDocument,signerCommonName,certCount,algorithm}]`.
+/// Host frees the buffer.
+#[no_mangle]
+pub extern "C" fn gp_verify_signatures(
+    handle: *const Document,
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let pdf = unsafe {
+                if pdf_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(pdf_ptr, pdf_len)
+                }
+            };
+            let mut s = String::from("[");
+            for (i, r) in doc.verify_signatures(pdf).iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"fieldName\":");
+                json_escape(&r.field_name, &mut s);
+                s.push_str(&format!(
+                    ",\"byteRangeOk\":{},\"digestOk\":{},\"signatureOk\":{},\"coversWholeDocument\":{},",
+                    r.byte_range_ok, r.digest_ok, r.signature_ok, r.covers_whole_document
+                ));
+                s.push_str("\"signerCommonName\":");
+                match r.signer_common_name.as_deref() {
+                    Some(cn) => json_escape(cn, &mut s),
+                    None => s.push_str("null"),
+                }
+                s.push_str(&format!(",\"certCount\":{},\"algorithm\":", r.cert_count));
+                json_escape(&r.algorithm, &mut s);
+                s.push('}');
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Digitally sign the document with an identity imported from a PKCS#12
 /// (`.p12`/`.pfx`) file — a CA-issued / eIDAS certificate and its RSA key.
 /// `p12` is the raw file; `password` its passphrase (UTF-8); `fields` is five

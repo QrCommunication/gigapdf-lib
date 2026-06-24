@@ -1339,6 +1339,50 @@ pub struct Bookmark {
     pub action: Option<Action>,
 }
 
+/// One signature found on the document (a `/Sig` field's `/V`), with its
+/// human-readable metadata and `/ByteRange` (ISO 32000-1 §12.8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignatureInfo {
+    /// The signature field's fully-qualified `/T` name.
+    pub field_name: String,
+    /// The signer name (`/Name` in the signature dict), if present.
+    pub signer_name: Option<String>,
+    /// The stated reason (`/Reason`).
+    pub reason: Option<String>,
+    /// The stated location (`/Location`).
+    pub location: Option<String>,
+    /// The signing date string (`/M`, e.g. `D:20260624…`).
+    pub date: Option<String>,
+    /// The `/SubFilter` (e.g. `adbe.pkcs7.detached`, `ETSI.CAdES.detached`).
+    pub sub_filter: Option<String>,
+    /// The `/ByteRange` `[a, b, c, d]` the signature covers (the `/Contents` hex
+    /// window is the `(a+b, c)` gap).
+    pub byte_range: [i64; 4],
+}
+
+/// The result of cryptographically verifying one signature against the original
+/// PDF bytes (ISO 32000-1 §12.8.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignatureReport {
+    /// The signature field's `/T` name.
+    pub field_name: String,
+    /// The `/ByteRange` is well-formed and within the file bounds.
+    pub byte_range_ok: bool,
+    /// The CMS `messageDigest` equals SHA-256 of the covered bytes (integrity).
+    pub digest_ok: bool,
+    /// The SignerInfo signature validates under the signer certificate's key.
+    pub signature_ok: bool,
+    /// The `/ByteRange` covers the **whole** current file (no appended changes
+    /// after the signature — i.e. nothing was added since it was applied).
+    pub covers_whole_document: bool,
+    /// The signer certificate's Common Name, if present.
+    pub signer_common_name: Option<String>,
+    /// Number of certificates embedded in the CMS.
+    pub cert_count: usize,
+    /// The recognised signature algorithm (`RSA+SHA-256`) or an unsupported note.
+    pub algorithm: String,
+}
+
 /// The standard document-information fields (ISO 32000-1 §14.3.3, Table 317),
 /// shared by the `/Info` dictionary and the XMP `/Metadata` packet. Used by
 /// [`Document::info_fields`] (read) and [`Document::set_info`] (write, which keeps
@@ -1591,6 +1635,141 @@ impl Document {
         )
     }
 
+    /// List every signature on the document — each signature field's `/V`
+    /// dictionary with its metadata and `/ByteRange` (ISO 32000-1 §12.8). Reads
+    /// the parsed model only; cryptographic checks are done by
+    /// [`verify_signatures`](Self::verify_signatures).
+    pub fn signatures(&self) -> Vec<SignatureInfo> {
+        self.signature_values()
+            .into_iter()
+            .map(|(field_name, sig)| SignatureInfo {
+                field_name,
+                signer_name: self.sig_text(&sig, b"Name"),
+                reason: self.sig_text(&sig, b"Reason"),
+                location: self.sig_text(&sig, b"Location"),
+                date: self.sig_text(&sig, b"M"),
+                sub_filter: sig
+                    .get(b"SubFilter")
+                    .and_then(Object::as_name)
+                    .map(|n| String::from_utf8_lossy(n).into_owned()),
+                byte_range: self.sig_byte_range(&sig),
+            })
+            .collect()
+    }
+
+    /// Cryptographically verify every signature against the **original** PDF
+    /// bytes (the bytes this document was opened from). For each signature:
+    /// recompute the `/ByteRange` SHA-256, check the CMS `messageDigest`, validate
+    /// the SignerInfo signature, and report whether the signature covers the whole
+    /// current file. RSA + SHA-256 is verified; other algorithms are flagged.
+    pub fn verify_signatures(&self, pdf_bytes: &[u8]) -> Vec<SignatureReport> {
+        self.signature_values()
+            .into_iter()
+            .map(|(field_name, sig)| self.verify_one(&field_name, &sig, pdf_bytes))
+            .collect()
+    }
+
+    fn verify_one(&self, field_name: &str, sig: &Dictionary, pdf_bytes: &[u8]) -> SignatureReport {
+        let [a, b, c, d] = self.sig_byte_range(sig);
+        let mut report = SignatureReport {
+            field_name: field_name.to_string(),
+            byte_range_ok: false,
+            digest_ok: false,
+            signature_ok: false,
+            covers_whole_document: false,
+            signer_common_name: None,
+            cert_count: 0,
+            algorithm: "unknown".into(),
+        };
+        let len = pdf_bytes.len() as i64;
+        // A well-formed signature covers from the start of the file, skips the
+        // /Contents window, and stays within bounds.
+        if a != 0 || b < 0 || d < 0 || a + b > c || c + d > len {
+            return report;
+        }
+        report.byte_range_ok = true;
+        report.covers_whole_document = c + d == len;
+        let mut content = Vec::with_capacity((b + d) as usize);
+        content.extend_from_slice(&pdf_bytes[a as usize..(a + b) as usize]);
+        content.extend_from_slice(&pdf_bytes[c as usize..(c + d) as usize]);
+        let Some(cms) = sig.get(b"Contents").and_then(|o| match self.resolve(o) {
+            Object::String(bytes, _) => Some(bytes.clone()),
+            _ => None,
+        }) else {
+            return report;
+        };
+        let v = crate::sign::verify::verify_detached_cms(&cms, &content);
+        report.digest_ok = v.digest_ok;
+        report.signature_ok = v.signature_ok;
+        report.cert_count = v.cert_count;
+        report.signer_common_name = v.signer_common_name;
+        report.algorithm = v.algorithm;
+        report
+    }
+
+    /// `(field_name, signature /V dict)` for every signature field on the form.
+    fn signature_values(&self) -> Vec<(String, Dictionary)> {
+        let mut out = Vec::new();
+        let Some(acro) = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"AcroForm"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        else {
+            return out;
+        };
+        let Some(fields) = acro
+            .get(b"Fields")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        else {
+            return out;
+        };
+        let field_ids: Vec<ObjectId> = fields.iter().filter_map(Object::as_reference).collect();
+        for id in field_ids {
+            let Some(field) = self.objects.get(&id).and_then(Object::as_dict) else {
+                continue;
+            };
+            if field.get(b"FT").and_then(Object::as_name) != Some(b"Sig".as_slice()) {
+                continue;
+            }
+            let name = match field.get(b"T").map(|o| self.resolve(o)) {
+                Some(Object::String(b, _)) => crate::font::decode_pdf_text(b),
+                _ => String::new(),
+            };
+            if let Some(sig) = field
+                .get(b"V")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+            {
+                out.push((name, sig.clone()));
+            }
+        }
+        out
+    }
+
+    fn sig_text(&self, sig: &Dictionary, key: &[u8]) -> Option<String> {
+        match sig.get(key).map(|o| self.resolve(o)) {
+            Some(Object::String(b, _)) => Some(crate::font::decode_pdf_text(b)),
+            _ => None,
+        }
+    }
+
+    fn sig_byte_range(&self, sig: &Dictionary) -> [i64; 4] {
+        let mut br = [0i64; 4];
+        if let Some(arr) = sig
+            .get(b"ByteRange")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            for (i, o) in arr.iter().take(4).enumerate() {
+                br[i] = self.resolve(o).as_f64().map(|f| f as i64).unwrap_or(0);
+            }
+        }
+        br
+    }
+
     /// Shared signature embedding: builds the signature dictionary and invisible
     /// widget with the given `subfilter`, reserving `contents_bytes` for the CMS,
     /// serializes, patches `/ByteRange`, then fills `/Contents` with the CMS
@@ -1607,9 +1786,46 @@ impl Document {
         contents_bytes: usize,
         build_cms: impl FnOnce(&[u8]) -> Vec<u8>,
     ) -> Result<Vec<u8>> {
-        let (mut bytes, lt, gt, signed) =
-            self.build_signature_layout(name, reason, date, location, contact_info, subfilter, contents_bytes)?;
+        let (mut bytes, lt, gt, signed) = self.build_signature_layout(
+            name,
+            reason,
+            date,
+            location,
+            contact_info,
+            subfilter,
+            contents_bytes,
+            None,
+        )?;
         let cms = build_cms(&signed);
+        fill_contents_window(&mut bytes, lt, gt, &cms)?;
+        Ok(bytes)
+    }
+
+    /// **Certify** the document (DocMDP, ISO 32000-1 §12.8.2.2): a signature that
+    /// also declares which later changes are permitted — `docmdp_p` is `1` (no
+    /// changes allowed), `2` (form-filling and signing only) or `3` (also
+    /// annotations). Writes the `/Reference` DocMDP transform on the signature and
+    /// the catalog `/Perms /DocMDP`. Otherwise like [`sign`](Self::sign).
+    pub fn sign_certify(
+        &mut self,
+        signer: &crate::sign::Signer,
+        name: &str,
+        reason: &str,
+        date: &str,
+        docmdp_p: u8,
+    ) -> Result<Vec<u8>> {
+        let p = docmdp_p.clamp(1, 3);
+        let (mut bytes, lt, gt, signed) = self.build_signature_layout(
+            name,
+            reason,
+            date,
+            "",
+            "",
+            crate::sign::SubFilter::AdbePkcs7Detached,
+            CONTENTS_BYTES_LEGACY,
+            Some(p),
+        )?;
+        let cms = signer.detached_cms(&signed);
         fill_contents_window(&mut bytes, lt, gt, &cms)?;
         Ok(bytes)
     }
@@ -1630,6 +1846,7 @@ impl Document {
         contact_info: &str,
         subfilter: crate::sign::SubFilter,
         contents_bytes: usize,
+        docmdp: Option<u8>,
     ) -> Result<(Vec<u8>, usize, usize, Vec<u8>)> {
         let lit = |s: &str| Object::String(crate::font::encode_pdf_text(s), StringKind::Literal);
 
@@ -1661,6 +1878,27 @@ impl Document {
             b"Contents".to_vec(),
             Object::String(vec![0u8; contents_bytes], StringKind::Hex),
         );
+        // DocMDP certification: a /Reference SigRef with the DocMDP transform and
+        // the permission level P (1 = no changes, 2 = form-fill + sign, 3 = also
+        // annotate). Paired with the catalog /Perms below.
+        if let Some(p) = docmdp {
+            let mut tp = Dictionary::new();
+            tp.set(b"Type".to_vec(), Object::Name(b"TransformParams".to_vec()));
+            tp.set(b"P".to_vec(), Object::Integer(i64::from(p)));
+            tp.set(b"V".to_vec(), Object::Name(b"1.2".to_vec()));
+            let mut sigref = Dictionary::new();
+            sigref.set(b"Type".to_vec(), Object::Name(b"SigRef".to_vec()));
+            sigref.set(
+                b"TransformMethod".to_vec(),
+                Object::Name(b"DocMDP".to_vec()),
+            );
+            sigref.set(b"TransformParams".to_vec(), Object::Dictionary(tp));
+            sigref.set(b"DigestMethod".to_vec(), Object::Name(b"SHA256".to_vec()));
+            sig.set(
+                b"Reference".to_vec(),
+                Object::Array(vec![Object::Dictionary(sigref)]),
+            );
+        }
         self.objects.insert(sig_id, Object::Dictionary(sig));
 
         // 2. Signature field = invisible widget on page 1, linked to the value.
@@ -1721,6 +1959,17 @@ impl Document {
         acroform.set(b"Fields".to_vec(), Object::Array(fields));
         acroform.set(b"SigFlags".to_vec(), Object::Integer(3));
         catalog.set(b"AcroForm".to_vec(), Object::Dictionary(acroform));
+        // DocMDP: the catalog /Perms /DocMDP points at the certifying signature.
+        if docmdp.is_some() {
+            let mut perms = catalog
+                .get(b"Perms")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_default();
+            perms.set(b"DocMDP".to_vec(), Object::Reference(sig_id));
+            catalog.set(b"Perms".to_vec(), Object::Dictionary(perms));
+        }
         self.objects.insert(catalog_id, Object::Dictionary(catalog));
 
         // 4. Serialize, then patch /ByteRange.
@@ -1786,6 +2035,7 @@ impl Document {
             contact_info,
             crate::sign::SubFilter::EtsiCAdESDetached,
             CONTENTS_BYTES_TIMESTAMPED,
+            None,
         )?;
 
         // Sign over the real byte range and build the RFC 3161 request from the
@@ -16699,6 +16949,116 @@ mod tests {
         // The signed file still parses as a structurally valid PDF.
         let reopened = Document::open(&signed).unwrap();
         assert!(reopened.page_count() >= 1, "signed PDF re-opens");
+    }
+
+    #[test]
+    fn verifies_its_own_signature_and_detects_tampering() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let randomness: Vec<u8> = (0..256).map(|i| (i * 53 + 7) as u8).collect();
+        let signer = crate::sign::Signer::generate(
+            "CN Tester",
+            "260614000000Z",
+            "360614000000Z",
+            1024,
+            &randomness,
+        )
+        .unwrap();
+        let signed = doc
+            .sign(&signer, "Jane Signer", "Approval", "D:20260614120000Z")
+            .unwrap();
+
+        let reopened = Document::open(&signed).unwrap();
+
+        // signatures() lists the embedded signature with its metadata.
+        let sigs = reopened.signatures();
+        assert_eq!(sigs.len(), 1, "one signature listed");
+        assert_eq!(sigs[0].signer_name.as_deref(), Some("Jane Signer"));
+        assert_eq!(sigs[0].reason.as_deref(), Some("Approval"));
+        assert_eq!(sigs[0].sub_filter.as_deref(), Some("adbe.pkcs7.detached"));
+        assert!(sigs[0].byte_range[1] > 0, "ByteRange has a real length");
+
+        // verify_signatures() validates against the original bytes.
+        let ok = reopened.verify_signatures(&signed);
+        assert_eq!(ok.len(), 1);
+        assert!(ok[0].byte_range_ok, "byte range well-formed");
+        assert!(ok[0].digest_ok, "messageDigest matches the covered bytes");
+        assert!(ok[0].signature_ok, "RSA signature validates");
+        assert!(ok[0].covers_whole_document, "covers the whole file");
+        assert_eq!(ok[0].algorithm, "RSA+SHA-256");
+        assert!(ok[0].cert_count >= 1, "embeds the signer certificate");
+        assert_eq!(ok[0].signer_common_name.as_deref(), Some("CN Tester"));
+
+        // Tampering a covered byte breaks the digest (signature over signedAttrs
+        // is still intact, but the content no longer hashes to messageDigest).
+        let mut tampered = signed.clone();
+        tampered[60] ^= 0xFF;
+        let bad = reopened.verify_signatures(&tampered);
+        assert!(!bad[0].digest_ok, "tampered content fails the digest check");
+
+        // Appending bytes after the signature => it no longer covers the file.
+        let mut appended = signed.clone();
+        appended.extend_from_slice(b"\n% trailing change\n");
+        let cov = reopened.verify_signatures(&appended);
+        assert!(
+            !cov[0].covers_whole_document,
+            "appended bytes are outside the ByteRange"
+        );
+        assert!(cov[0].digest_ok, "the covered region is still intact");
+    }
+
+    #[test]
+    fn certifies_a_document_with_docmdp() {
+        let mut doc = Document::open(&fixture("simple-text.pdf")).unwrap();
+        let randomness: Vec<u8> = (0..256).map(|i| (i * 17 + 3) as u8).collect();
+        let signer = crate::sign::Signer::generate(
+            "Certifier",
+            "260101000000Z",
+            "360101000000Z",
+            1024,
+            &randomness,
+        )
+        .unwrap();
+        let signed = doc
+            .sign_certify(
+                &signer,
+                "Certifier",
+                "I certify this",
+                "D:20260624000000Z",
+                2,
+            )
+            .unwrap();
+
+        let reopened = Document::open(&signed).unwrap();
+        // The catalog carries /Perms /DocMDP → the certifying signature.
+        let catalog = reopened.catalog().unwrap();
+        let perms = catalog
+            .get(b"Perms")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Perms present");
+        assert!(perms.get(b"DocMDP").is_some(), "/Perms /DocMDP set");
+        // The signature dict has a DocMDP /Reference with the permission level.
+        let sig = reopened
+            .resolve(perms.get(b"DocMDP").unwrap())
+            .as_dict()
+            .unwrap();
+        let sigref = reopened
+            .resolve(sig.get(b"Reference").unwrap())
+            .as_array()
+            .and_then(|a| a.first())
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Reference SigRef");
+        assert_eq!(
+            sigref.get(b"TransformMethod").and_then(Object::as_name),
+            Some(b"DocMDP".as_slice())
+        );
+        // And it still verifies cryptographically.
+        let rep = reopened.verify_signatures(&signed);
+        assert!(
+            rep[0].digest_ok && rep[0].signature_ok,
+            "certified sig verifies"
+        );
     }
 
     #[test]

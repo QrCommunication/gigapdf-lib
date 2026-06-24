@@ -62,7 +62,8 @@ pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
     AfRelationship, Attachment, Bookmark, Document, EmbeddedFontInfo, ImageElementInfo,
     ImageWatermarkOptions, InfoFields, PageBox, PageBoxes, PageBoxesDeclared, PageLabelRange,
-    PageLabelStyle, SearchMatch, TextElementInfo, TextLayerRun, WatermarkAnchor,
+    PageLabelStyle, SearchMatch, SignatureInfo, SignatureReport, TextElementInfo, TextLayerRun,
+    WatermarkAnchor,
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FieldTrigger, FormField};

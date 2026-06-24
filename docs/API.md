@@ -173,6 +173,23 @@ Four signature levels, increasing in long-term assurance. All produce a CMS
 | **B (PKCS#12)** — user CA/eIDAS identity, `adbe.pkcs7.detached` | `sign_p12(&Pkcs12Identity, …)` | `gp_sign_p12(handle,p12*,pass*,fields*,outlen)` | `signP12(p12, password, opts?)` | none |
 | **B-T (PAdES)** — RFC 3161 trusted timestamp in the SignerInfo (`ETSI.CAdES.detached`, `signing-certificate-v2`, `id-aa-timeStampToken`) | `sign_prepare_tsa(…)` → host POST → `sign_finish_tsa(token)` | `gp_sign_prepare_tsa(…)` / `gp_sign_finish_tsa(handle,token*,outlen)` | `signTimestamped(opts)` *(async)* | 1× TSA |
 | **B-LT / B-LTA (PAdES-LTV)** — B-T + `/DSS` (`/Certs`+`/OCSPs`+`/CRLs`+`/VRI`); B-LTA adds a `/DocTimeStamp` over the whole file | `ltv_targets(pdf,nonce)` → host OCSP/CRL fetch → `apply_dss(pdf,certs,ocsps,crls)`; archive: `doc_timestamp_prepare` → host POST → `doc_timestamp_finish` | `gp_ltv_targets(pdf*,nonce*,outlen)` / `gp_apply_dss(pdf*,certs*,ocsps*,crls*,outlen)` / `gp_doc_timestamp_prepare(handle,pdf*,nonce*,outlen)` / `gp_doc_timestamp_finish(handle,token*,outlen)` | `signLtv(opts)` *(async)* | 1× TSA + 1 OCSP/CRL per cert (+ 1× TSA if archive) |
+| **Certify (DocMDP)** — a certifying signature + `/Perms /DocMDP` and a `/Reference` transform; `docmdp_p` = 1 (no changes) / 2 (fill+sign) / 3 (also annotate) | `sign_certify(&Signer,name,reason,date,docmdp_p)` | `gp_sign_certify(handle,fields*,rand*,key_bits,docmdp_p,outlen)` | `certify(fields, random, docmdpLevel, keyBits?)` | none |
+
+**Verification** (ISO 32000-1 §12.8.1) — the inverse of the signing stack:
+
+| Rust | WASM | SDK |
+|------|------|-----|
+| `signatures() -> Vec<SignatureInfo>` (list `/Sig` fields: name/reason/location/date/subFilter/byteRange) | `gp_signatures_json(handle,outlen)` | `signatures()` |
+| `verify_signatures(&pdf_bytes) -> Vec<SignatureReport>` (per signature: ByteRange digest, CMS `messageDigest`, RSA SignerInfo signature, whole-file coverage, signer CN) | `gp_verify_signatures(handle,pdf*,outlen)` | `verifySignatures(pdfBytes)` |
+
+Verification recomputes the SHA-256 over the `/ByteRange` and checks it against the
+embedded CMS `messageDigest` (`digestOk`), then validates the SignerInfo RSA
+signature under the signer certificate's key (`signatureOk`); `coversWholeDocument`
+flags whether anything was appended after the signature. **RSA + SHA-256** (what
+this engine produces) is verified; other algorithms are reported `unsupported`.
+Verification needs the **original file bytes** (the `Document` doesn't retain
+them) — pass the same bytes you opened. Live OCSP/CRL revocation, full
+chain-to-trusted-root and ECDSA are out of scope.
 
 - `Signer` is built from host-supplied randomness; the self-signed `sign`
   produces a self-signed `adbe.pkcs7.detached` CMS signature.
@@ -366,6 +383,7 @@ Google fonts**, so the host fetches fonts in two phases.
 - `TextRun { index, operator, text, op_position }`
 - `TextElementInfo { index, text, bounds, font_family, bold, italic, size, color, rotation, direction }`
 - `FormField { name, field_type, value, flags, options, max_len }`, `FieldKind` (enum `Text|Checkbox|Radio|PushButton|ComboBox|ListBox|Signature|Unknown`), and `FieldTrigger` (enum `Keystroke|Format|Validate|Calculate` — the `/AA` JavaScript event; `FieldTrigger::from_name` parses the SDK's lowercase name)
+- `SignatureInfo { field_name, signer_name, reason, location, date, sub_filter, byte_range: [i64;4] }` (listing) and `SignatureReport { field_name, byte_range_ok, digest_ok, signature_ok, covers_whole_document, signer_common_name, cert_count, algorithm }` (verification verdict, ISO 32000-1 §12.8.1)
 - `Link { kind: uri|page, uri, page, rect }`, `OutlineItem { title, page, level }`, `Bookmark { title, level, action: Option<Action> }`
 - `Action` (ISO 32000-1 §12.6) and `Destination` (§12.3.2) — the navigation model. `Action::from_json` accepts a tagged object: `{"type":"goto","dest":<Destination>}`, `{"type":"gotoR","file":"…","dest":<Destination>}`, `{"type":"uri","uri":"…"}`, `{"type":"named","action":"nextPage|prevPage|firstPage|lastPage"}`, `{"type":"launch","file":"…"}`, `{"type":"javascript","js":"…"}`, `{"type":"submitForm","url":"…"}`, `{"type":"resetForm"}`. A `Destination` is `{"fit":"xyz","page":N,"left"?,"top"?,"zoom"?}` or `fit` ∈ `fit|fitH|fitV|fitR|fitB|fitBH|fitBV` (with `top`/`left`/`rect` as the mode needs), or `{"fit":"named","name":"…"}`. `page` is 1-based; `GoToR` encodes it as a 0-based integer for the remote file
 - `HeaderFooterSpec { text, align, font_size, color, page_range, show_on_first_page, band_height }`

@@ -4,6 +4,25 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.80.0] - 2026-06-24
+
+Signature verification + DocMDP certification. Resolves
+[#16](https://github.com/qrcommunication/gigapdf-lib/issues/16).
+
+### Added
+
+- **`signatures()`.** List every signature (`/Sig` field) with `{ fieldName,
+  signerName, reason, location, date, subFilter, byteRange }`.
+- **`verifySignatures(pdfBytes)`.** Cryptographically verify each signature
+  against the **original bytes** — `{ byteRangeOk, digestOk, signatureOk,
+  coversWholeDocument, signerCommonName, certCount, algorithm }`. `digestOk` is
+  content integrity (ByteRange SHA-256 vs CMS `messageDigest`); `signatureOk` is
+  the RSA SignerInfo signature. RSA + SHA-256 only.
+- **`certify(fields, random, docmdpLevel, keyBits?)`.** Certify the document
+  (DocMDP) — writes `/Perms /DocMDP` + a `/Reference` transform; `docmdpLevel` is
+  `1` (no changes), `2` (form-fill + sign) or `3` (also annotate).
+- New exported types **`SignatureInfo`** and **`SignatureReport`**.
+
 ## [0.79.0] - 2026-06-24
 
 Interactive-form completeness: signature fields, field JavaScript, calculation

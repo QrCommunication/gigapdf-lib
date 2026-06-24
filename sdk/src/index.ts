@@ -1855,6 +1855,44 @@ export type FieldKind =
   | "signature"
   | "unknown";
 /** An AcroForm field with its flags and (for choices) options. */
+/** One signature on the document (a `/Sig` field's `/V`), from {@link GigaPdfDoc.signatures}. */
+export interface SignatureInfo {
+  /** The signature field's `/T` name. */
+  fieldName: string;
+  /** The signer name (`/Name`), or `null`. */
+  signerName: string | null;
+  /** The stated reason (`/Reason`), or `null`. */
+  reason: string | null;
+  /** The stated location (`/Location`), or `null`. */
+  location: string | null;
+  /** The signing date string (`/M`, e.g. `D:20260624…`), or `null`. */
+  date: string | null;
+  /** The `/SubFilter` (e.g. `adbe.pkcs7.detached`), or `null`. */
+  subFilter: string | null;
+  /** The `/ByteRange` `[a, b, c, d]` the signature covers. */
+  byteRange: [number, number, number, number];
+}
+
+/** The cryptographic verdict for one signature, from {@link GigaPdfDoc.verifySignatures}. */
+export interface SignatureReport {
+  /** The signature field's `/T` name. */
+  fieldName: string;
+  /** The `/ByteRange` is well-formed and within the file bounds. */
+  byteRangeOk: boolean;
+  /** The CMS `messageDigest` equals SHA-256 of the covered bytes (integrity). */
+  digestOk: boolean;
+  /** The SignerInfo signature validates under the signer certificate's key. */
+  signatureOk: boolean;
+  /** The signature covers the **whole** current file (nothing appended after it). */
+  coversWholeDocument: boolean;
+  /** The signer certificate's Common Name, or `null`. */
+  signerCommonName: string | null;
+  /** Number of certificates embedded in the CMS. */
+  certCount: number;
+  /** The recognised signature algorithm (`RSA+SHA-256`) or an unsupported note. */
+  algorithm: string;
+}
+
 export interface FieldInfo {
   name: string;
   type: string;
@@ -3290,6 +3328,44 @@ export class GigaPdfDoc {
     );
     this.g._free(rPtr, random.length);
     return out;
+  }
+
+  /**
+   * **Certify** the document (DocMDP) — like {@link sign} but also declares which
+   * later changes are allowed: `docmdpLevel` is `1` (no changes), `2` (form-fill
+   * + sign) or `3` (also annotate). `fields` is the same tab-separated string as
+   * {@link sign} (`name⇥reason⇥date⇥notBefore⇥notAfter`).
+   */
+  certify(fields: string, random: Uint8Array, docmdpLevel: 1 | 2 | 3, keyBits = 2048): Uint8Array {
+    const rPtr = this.g._toWasm(random);
+    const out = this.g._withStr(fields, (fP, fL) =>
+      this.g._buffer((o) =>
+        this.ex().gp_sign_certify(this.h, fP, fL, rPtr, random.length, keyBits, docmdpLevel, o)
+      )
+    );
+    this.g._free(rPtr, random.length);
+    return out;
+  }
+
+  /**
+   * List every signature on the document (each `/Sig` field's `/V`) with its
+   * metadata and `/ByteRange`. For cryptographic validity call
+   * {@link verifySignatures}.
+   */
+  signatures(): SignatureInfo[] {
+    return this.g._json((o) => this.ex().gp_signatures_json(this.h, o));
+  }
+
+  /**
+   * Cryptographically verify every signature against `pdf` — the **original
+   * bytes** this document was opened from. Each report carries `byteRangeOk`,
+   * `digestOk` (content integrity), `signatureOk` (the RSA signature),
+   * `coversWholeDocument`, the signer CN, and the algorithm.
+   */
+  verifySignatures(pdf: Uint8Array): SignatureReport[] {
+    return this.g._withBytes(pdf, (p, l) =>
+      this.g._json((o) => this.ex().gp_verify_signatures(this.h, p, l, o))
+    );
   }
   /**
    * Sign with a PKCS#12 (`.p12`/`.pfx`) identity — a CA-issued / eIDAS
