@@ -2602,20 +2602,78 @@ fn parse_pptx_diagram_text(xml: &str) -> Vec<String> {
 
 // ─────────────────────────────── ODF → model ──────────────────────────────────
 
+/// The resolved style tables an ODT/ODP model walk needs, bundled so the
+/// recursive helpers take one immutable context instead of four loose maps
+/// (mirrors the [`DocxCtx`] pattern). `resources` and the output vector stay
+/// separate (they are `&mut`).
+struct OdfModelCtx<'a> {
+    zip: &'a BTreeMap<String, Vec<u8>>,
+    /// `text:span` style name → CSS text-properties (run styling).
+    styles: &'a BTreeMap<String, String>,
+    /// Paragraph style name → resolved `fo:*` paragraph formatting.
+    para_styles: &'a BTreeMap<String, OdfParaProps>,
+    /// Column style name → width (points), for table `col_widths`.
+    cols: &'a BTreeMap<String, f64>,
+    /// Cell style name → `fo:background-color` RGB, for cell shading.
+    cell_bg: &'a BTreeMap<String, [f64; 3]>,
+}
+
+impl OdfModelCtx<'_> {
+    /// A context with only the run-style map populated (the others empty) — used
+    /// by the ODP slide path, which needs inline run styling but not paragraph
+    /// formatting, table widths, or cell shading.
+    fn styles_only<'a>(
+        zip: &'a BTreeMap<String, Vec<u8>>,
+        styles: &'a BTreeMap<String, String>,
+    ) -> OdfModelCtx<'a> {
+        // Borrow process-wide empty maps so the context carries real references.
+        static EMPTY_PARA: std::sync::OnceLock<BTreeMap<String, OdfParaProps>> =
+            std::sync::OnceLock::new();
+        static EMPTY_COLS: std::sync::OnceLock<BTreeMap<String, f64>> = std::sync::OnceLock::new();
+        static EMPTY_BG: std::sync::OnceLock<BTreeMap<String, [f64; 3]>> =
+            std::sync::OnceLock::new();
+        OdfModelCtx {
+            zip,
+            styles,
+            para_styles: EMPTY_PARA.get_or_init(BTreeMap::new),
+            cols: EMPTY_COLS.get_or_init(BTreeMap::new),
+            cell_bg: EMPTY_BG.get_or_init(BTreeMap::new),
+        }
+    }
+}
+
 /// ODT → [`Document`]: `text:h`→heading, `text:p`→paragraph, `text:list`→list,
-/// `table:table`→table. Reuses the ODF text-style and column-width parsers.
+/// `table:table`→table. Reuses the ODF text-style, paragraph-style and
+/// column-width parsers; `fo:*` paragraph formatting, footnotes (`text:note`)
+/// and body text boxes (`draw:text-box`) are lowered onto the model.
 pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     let content = part(zip, "content.xml");
     let styles_xml = part(zip, "styles.xml");
     let mut styles = odf_text_styles(&styles_xml);
     styles.extend(odf_text_styles(&content));
+    // Paragraph-level formatting (`fo:*` align/indent/spacing) keyed by style
+    // name, parent chains resolved. Automatic styles (content.xml) win over the
+    // named styles (styles.xml) on a name clash.
+    let mut para_styles = odf_para_styles(&styles_xml);
+    para_styles.extend(odf_para_styles(&content));
+    // Column widths and cell-background shading for tables.
+    let mut cols = odf_column_widths(&styles_xml);
+    cols.extend(odf_column_widths(&content));
+    let mut cell_bg = odf_cell_backgrounds(&styles_xml);
+    cell_bg.extend(odf_cell_backgrounds(&content));
     let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
+    let ctx = OdfModelCtx {
+        zip,
+        styles: &styles,
+        para_styles: &para_styles,
+        cols: &cols,
+        cell_bg: &cell_bg,
+    };
     let mut blocks = Vec::new();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
     odf_walk_model(
         &mut Xml::new(&content),
-        zip,
-        &styles,
+        &ctx,
         &mut blocks,
         None,
         None,
@@ -2627,12 +2685,13 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 }
 
 /// Recursive ODF model walker (mirrors [`odf_walk`]). Handles `text:h`,
-/// `text:p`, `text:list` (each item → list-item paragraph) and `table:table`.
-#[allow(clippy::too_many_arguments)]
+/// `text:p`, `text:list` (each item → list-item paragraph), `table:table` and a
+/// body-anchored `draw:frame`/`draw:text-box` (→ [`BlockKind::TextBox`]). The
+/// context's paragraph-style map (resolved from `text:style-name`) lowers `fo:*`
+/// paragraph formatting onto each paragraph/heading.
 fn odf_walk_model(
     x: &mut Xml,
-    zip: &BTreeMap<String, Vec<u8>>,
-    styles: &BTreeMap<String, String>,
+    ctx: &OdfModelCtx,
     out: &mut Vec<Block>,
     stop: Option<&str>,
     list_level: Option<u32>,
@@ -2644,16 +2703,21 @@ fn odf_walk_model(
                 let ln = local(&name);
                 match ln {
                     "h" if !sc => {
+                        let style = odf_paragraph_style(&attrs, ctx.para_styles, list_level);
                         let lvl = attr(&attrs, "outline-level")
                             .and_then(|v| v.parse::<u8>().ok())
                             .unwrap_or(1)
                             .clamp(1, 6);
-                        let runs = odf_inline_model(x, zip, styles, "h", resources);
+                        // Text boxes anchored in the heading flush as sibling
+                        // blocks after it (mirrors the paragraph case).
+                        let mut anchored: Vec<Block> = Vec::new();
+                        let runs = odf_inline_model(x, ctx, "h", resources, &mut anchored);
                         if !runs.is_empty() {
                             out.push(Block {
                                 kind: BlockKind::Heading(Heading {
                                     level: lvl,
                                     para: Paragraph {
+                                        style,
                                         runs,
                                         ..Paragraph::default()
                                     },
@@ -2661,14 +2725,25 @@ fn odf_walk_model(
                                 ..Block::default()
                             });
                         }
+                        out.append(&mut anchored);
                     }
                     "p" if !sc => {
-                        let runs = odf_inline_model(x, zip, styles, "p", resources);
+                        let style = odf_paragraph_style(&attrs, ctx.para_styles, list_level);
+                        // A frame anchored in this paragraph (`draw:frame` →
+                        // `draw:text-box`) is captured here and emitted as a
+                        // sibling block right after the paragraph.
+                        let mut anchored: Vec<Block> = Vec::new();
+                        let runs = odf_inline_model(x, ctx, "p", resources, &mut anchored);
                         if runs.is_empty() && list_level.is_none() {
-                            out.push(Block::default()); // preserve blank line spacing
+                            if anchored.is_empty() {
+                                out.push(Block::default()); // preserve blank line spacing
+                            } else {
+                                out.append(&mut anchored);
+                            }
                             continue;
                         }
                         let paragraph = Paragraph {
+                            style,
                             runs,
                             ..Paragraph::default()
                         };
@@ -2692,13 +2767,27 @@ fn odf_walk_model(
                                 ..Block::default()
                             }),
                         }
+                        out.append(&mut anchored);
                     }
+                    // A body-level `draw:frame` (sibling to paragraphs): a text
+                    // box → a text-box block, a picture → an image block.
+                    "frame" if !sc => match odf_frame_content(x, ctx, resources) {
+                        OdfFrameContent::TextBox(blocks) => out.push(Block {
+                            kind: BlockKind::TextBox(model::TextBox { blocks }),
+                            ..Block::default()
+                        }),
+                        OdfFrameContent::Image(img) => out.push(Block {
+                            kind: BlockKind::Image(img),
+                            ..Block::default()
+                        }),
+                        OdfFrameContent::Empty => {}
+                    },
                     "list" if !sc => {
                         let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
-                        odf_walk_model(x, zip, styles, out, Some("list"), next, resources);
+                        odf_walk_model(x, ctx, out, Some("list"), next, resources);
                     }
                     "table" if !sc => {
-                        let table = odf_table_model(x, zip, styles, resources);
+                        let table = odf_table_model(x, ctx, resources);
                         out.push(Block {
                             kind: BlockKind::Table(table),
                             ..Block::default()
@@ -2717,17 +2806,85 @@ fn odf_walk_model(
     }
 }
 
+/// Resolve a paragraph/heading's `text:style-name` to a model [`ParagraphStyle`]
+/// via `para_styles` (parent chains already flattened), stacking the list indent
+/// for the current `list_level`. An unknown/absent style still picks up the list
+/// indent so list items keep their nesting offset.
+fn odf_paragraph_style(
+    attrs: &[(String, String)],
+    para_styles: &BTreeMap<String, OdfParaProps>,
+    list_level: Option<u32>,
+) -> ParagraphStyle {
+    attr(attrs, "style-name")
+        .and_then(|n| para_styles.get(n))
+        .cloned()
+        .unwrap_or_default()
+        .to_paragraph_style(list_level)
+}
+
+/// The resolved content of a `draw:frame`: a text box (its captured blocks), a
+/// single picture, or nothing usable.
+enum OdfFrameContent {
+    TextBox(Vec<Block>),
+    Image(model::ImageRef),
+    Empty,
+}
+
+/// Read one `draw:frame` (open already consumed) up to its matching
+/// `</draw:frame>`, returning its content. A `draw:text-box` wins (its inner
+/// `text:p`/`text:h`/`text:list`/`table:table` become the box's blocks); else the
+/// first usable `draw:image` is interned as a picture. `draw:frame` is otherwise
+/// transparent, so this preserves the prior inline-image behaviour while adding
+/// text-box capture.
+fn odf_frame_content(
+    x: &mut Xml,
+    ctx: &OdfModelCtx,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> OdfFrameContent {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut found_box = false;
+    let mut image: Option<model::ImageRef> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == "text-box" && !sc {
+                    found_box = true;
+                    odf_walk_model(x, ctx, &mut blocks, Some("text-box"), None, resources);
+                } else if ln == "image" && image.is_none() {
+                    if let Some(href) = attr(&attrs, "href") {
+                        let key = href.trim_start_matches('/').to_string();
+                        image = image_ref(ctx.zip, &key, resources);
+                    }
+                }
+            }
+            Tok::Close(name) if local(&name) == "frame" => break,
+            _ => {}
+        }
+    }
+    if found_box && !blocks.is_empty() {
+        OdfFrameContent::TextBox(blocks)
+    } else if let Some(img) = image {
+        OdfFrameContent::Image(img)
+    } else {
+        OdfFrameContent::Empty
+    }
+}
+
 /// Collect an ODF block's inline content as model [`Inline`] runs, honouring
 /// `text:span` styles (parsed from the style map into [`CharStyle`]),
-/// `text:tab`/`text:s`/`text:line-break`, `text:a` hyperlinks (→ [`Inline::Link`])
-/// and inline `draw:frame`/`draw:image` (→ [`Inline::Image`], bytes interned in
-/// `resources`). Mirrors [`odf_inline`].
+/// `text:tab`/`text:s`/`text:line-break`, `text:a` hyperlinks (→ [`Inline::Link`]),
+/// `text:note` footnotes/endnotes (citation marker + body text inlined) and
+/// inline `draw:frame`/`draw:image` (→ [`Inline::Image`], bytes interned in
+/// `resources`). A `draw:frame` wrapping a `draw:text-box` (a paragraph-anchored
+/// text box) is captured and appended to `out_blocks` as a sibling block.
+/// Mirrors [`odf_inline`].
 fn odf_inline_model(
     x: &mut Xml,
-    zip: &BTreeMap<String, Vec<u8>>,
-    styles: &BTreeMap<String, String>,
+    ctx: &OdfModelCtx,
     block: &str,
     resources: &mut BTreeMap<u64, model::ImageResource>,
+    out_blocks: &mut Vec<Block>,
 ) -> Vec<Inline> {
     let mut runs: Vec<Inline> = Vec::new();
     // Stack of span char-styles (closed in order).
@@ -2743,7 +2900,7 @@ fn odf_inline_model(
                 match ln {
                     "span" if !sc => {
                         let css = attr(&attrs, "style-name")
-                            .and_then(|n| styles.get(n))
+                            .and_then(|n| ctx.styles.get(n))
                             .cloned()
                             .unwrap_or_default();
                         span_stack.push(odf_css_char_style(&css));
@@ -2755,6 +2912,15 @@ fn odf_inline_model(
                             href: odf_link_target(&attrs),
                             children: Vec::new(),
                         });
+                    }
+                    // A footnote/endnote: inline its citation marker followed by
+                    // the note body text so neither is lost (the body lives inside
+                    // the note element, right at the reference point).
+                    "note" if !sc => {
+                        let note = odf_note_inline(x, ctx);
+                        for inline in note {
+                            active_inlines(&mut runs, &mut link).push(inline);
+                        }
                     }
                     "tab" => odf_push(active_inlines(&mut runs, &mut link), &span_stack, " "),
                     "line-break" => active_inlines(&mut runs, &mut link).push(Inline::LineBreak),
@@ -2768,12 +2934,25 @@ fn odf_inline_model(
                             &" ".repeat(n),
                         );
                     }
-                    // An inline picture: `draw:image@xlink:href` (often wrapped in
-                    // a `draw:frame`). Intern the bytes and emit an `Inline::Image`.
+                    // A `draw:frame`: a paragraph-anchored text box flushes as a
+                    // sibling block; a picture frame emits an inline image (so the
+                    // image keeps its place in the run flow).
+                    "frame" if !sc => match odf_frame_content(x, ctx, resources) {
+                        OdfFrameContent::TextBox(blocks) => out_blocks.push(Block {
+                            kind: BlockKind::TextBox(model::TextBox { blocks }),
+                            ..Block::default()
+                        }),
+                        OdfFrameContent::Image(img) => {
+                            active_inlines(&mut runs, &mut link).push(Inline::Image(img));
+                        }
+                        OdfFrameContent::Empty => {}
+                    },
+                    // An inline picture not wrapped in a frame: `draw:image
+                    // @xlink:href`. Intern the bytes and emit an `Inline::Image`.
                     "image" if attr(&attrs, "href").is_some() => {
                         if let Some(href) = attr(&attrs, "href") {
                             let key = href.trim_start_matches('/').to_string();
-                            if let Some(img) = image_ref(zip, &key, resources) {
+                            if let Some(img) = image_ref(ctx.zip, &key, resources) {
                                 active_inlines(&mut runs, &mut link).push(Inline::Image(img));
                             }
                         }
@@ -2812,6 +2991,101 @@ fn odf_inline_model(
         }
     }
     runs
+}
+
+/// Collect a `text:note` (open already consumed) as inline runs: the
+/// `text:note-citation` text rendered as a superscript marker, then the
+/// `text:note-body` paragraphs' text (paragraphs joined by a space). Consumes up
+/// to the matching `</text:note>`. Span styling inside the body is flattened to
+/// plain text (the note is surfaced as a parenthetical, not a styled subtree).
+fn odf_note_inline(x: &mut Xml, ctx: &OdfModelCtx) -> Vec<Inline> {
+    let mut citation = String::new();
+    let mut body = String::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, sc) => {
+                let ln = local(&name);
+                if ln == "note-citation" && !sc {
+                    citation = odf_text_only(x, "note-citation");
+                } else if ln == "note-body" && !sc {
+                    // Walk the body into throwaway blocks, then flatten to text.
+                    let mut blocks: Vec<Block> = Vec::new();
+                    let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
+                    odf_walk_model(x, ctx, &mut blocks, Some("note-body"), None, &mut resources);
+                    body = inline_blocks_text(&blocks);
+                }
+            }
+            Tok::Close(name) if local(&name) == "note" => break,
+            _ => {}
+        }
+    }
+    let mut out: Vec<Inline> = Vec::new();
+    let citation = citation.trim();
+    if !citation.is_empty() {
+        out.push(Inline::Run(InlineRun {
+            text: citation.to_string(),
+            style: CharStyle {
+                vertical_align: model::style::VAlign::Super,
+                ..CharStyle::default()
+            },
+            source_index: None,
+        }));
+    }
+    let body = body.trim();
+    if !body.is_empty() {
+        // A leading space separates the note body from the citation marker / the
+        // surrounding text so the inlined note reads cleanly.
+        out.push(Inline::Run(InlineRun {
+            text: format!(" {body}"),
+            ..InlineRun::default()
+        }));
+    }
+    out
+}
+
+/// The concatenated plain text of a block list (paragraph/heading runs joined,
+/// paragraphs separated by a single space), trimmed. Used to flatten a footnote
+/// body to inline text.
+fn inline_blocks_text(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        match &b.kind {
+            BlockKind::Paragraph(p) | BlockKind::Heading(Heading { para: p, .. }) => {
+                for r in &p.runs {
+                    if let Inline::Run(run) = r {
+                        out.push_str(&run.text);
+                    }
+                }
+                out.push(' ');
+            }
+            BlockKind::List(l) => {
+                for it in &l.items {
+                    let inner = inline_blocks_text(&it.blocks);
+                    if !inner.is_empty() {
+                        out.push_str(&inner);
+                        out.push(' ');
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Collect only the text content of an element (open already consumed) until its
+/// matching close `</…stop>`, ignoring any child markup. Used for simple
+/// text-only ODF elements such as `text:note-citation`.
+fn odf_text_only(x: &mut Xml, stop: &str) -> String {
+    let mut out = String::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Text(t) => out.push_str(&t),
+            Tok::Close(name) if local(&name) == stop => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Resolve an ODF `text:a` to a model [`LinkTarget`]: an external URL from
@@ -2885,41 +3159,53 @@ fn odf_css_char_style(css: &str) -> CharStyle {
 }
 
 /// Emit one ODF `table:table` (open already consumed) as a model [`Table`],
-/// expanding `table:number-columns-repeated` (cap 64). Mirrors [`odf_table`].
+/// expanding `table:number-columns-repeated` (cap 64). Column widths come from
+/// the `table:table-column` declarations (resolved via the context's `cols`,
+/// style-name → width(pt)) and each cell's `fo:background-color` shading from
+/// `cell_bg` (style-name → RGB). Mirrors [`odf_table`].
 fn odf_table_model(
     x: &mut Xml,
-    zip: &BTreeMap<String, Vec<u8>>,
-    styles: &BTreeMap<String, String>,
+    ctx: &OdfModelCtx,
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Table {
     let mut rows: Vec<Row> = Vec::new();
     let mut cur_row: Option<Vec<Cell>> = None;
+    // Grid-column widths, expanded over `table:number-columns-repeated`.
+    let mut col_widths: Vec<f64> = Vec::new();
 
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "table-row" && !sc {
+                if ln == "table-column" {
+                    let repeat = attr(&attrs, "number-columns-repeated")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .min(64);
+                    let width = attr(&attrs, "style-name")
+                        .and_then(|n| ctx.cols.get(n))
+                        .copied()
+                        .unwrap_or(0.0);
+                    for _ in 0..repeat {
+                        col_widths.push(width);
+                    }
+                } else if ln == "table-row" && !sc {
                     cur_row = Some(Vec::new());
                 } else if ln == "table-cell" && !sc {
                     let repeat = attr(&attrs, "number-columns-repeated")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
                         .min(64);
+                    let shading = attr(&attrs, "style-name")
+                        .and_then(|n| ctx.cell_bg.get(n))
+                        .copied();
                     let mut blocks = Vec::new();
-                    odf_walk_model(
-                        x,
-                        zip,
-                        styles,
-                        &mut blocks,
-                        Some("table-cell"),
-                        None,
-                        resources,
-                    );
+                    odf_walk_model(x, ctx, &mut blocks, Some("table-cell"), None, resources);
                     if let Some(row) = cur_row.as_mut() {
                         for _ in 0..repeat {
                             row.push(Cell {
                                 blocks: blocks.clone(),
+                                shading,
                                 ..Cell::default()
                             });
                         }
@@ -2947,9 +3233,14 @@ fn odf_table_model(
         }
     }
 
+    // Only carry widths through when at least one column declared a real width
+    // (a table with no `style:column-width` keeps the auto-layout default).
+    if !col_widths.iter().any(|w| *w > 0.0) {
+        col_widths.clear();
+    }
     Table {
         rows,
-        col_widths: Vec::new(),
+        col_widths,
         border: model::BorderStyle::default(),
     }
 }
@@ -3252,7 +3543,9 @@ fn odp_page_model(
                         );
                     }
                     "p" if !sc => {
-                        let runs = odf_inline_model(x, zip, styles, "p", resources);
+                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        let mut anchored: Vec<Block> = Vec::new();
+                        let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
                         if !runs.is_empty() {
                             placeholders.push(model::Placeholder {
                                 role: model::PlaceholderRole::Body,
@@ -3347,7 +3640,9 @@ fn odp_group_model(
                         );
                     }
                     "p" if !sc => {
-                        let runs = odf_inline_model(x, zip, styles, "p", resources);
+                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        let mut anchored: Vec<Block> = Vec::new();
+                        let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
                         if !runs.is_empty() {
                             placeholders.push(model::Placeholder {
                                 role: model::PlaceholderRole::Body,
@@ -3407,7 +3702,9 @@ fn odp_frame_model(
                 let ln = local(&name);
                 match ln {
                     "p" if !sc => {
-                        let runs = odf_inline_model(x, zip, styles, "p", resources);
+                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        let mut anchored: Vec<Block> = Vec::new();
+                        let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
                         if !runs.is_empty() {
                             blocks.push(Block {
                                 kind: BlockKind::Paragraph(Paragraph {
@@ -8138,6 +8435,218 @@ fn odf_line_through_set(attrs: &[(String, String)]) -> bool {
         || (style.is_none() && matches!(kind, Some(k) if !k.eq_ignore_ascii_case("none")))
 }
 
+/// Paragraph-level formatting collected from a `style:paragraph-properties`
+/// element. Every field is optional so a child style only overrides what it
+/// names; `parent` chains to the `style:parent-style-name` (resolved by
+/// [`odf_para_styles`]). Distances are points (ODF lengths via [`parse_odf_pt`]).
+#[derive(Default, Clone)]
+struct OdfParaProps {
+    parent: Option<String>,
+    /// `fo:text-align` (`start`/`end`/`center`/`justify`) → model [`MAlign`].
+    align: Option<MAlign>,
+    /// `fo:margin-top` (space above) in points.
+    space_before_pt: Option<f64>,
+    /// `fo:margin-bottom` (space below) in points.
+    space_after_pt: Option<f64>,
+    /// `fo:margin-left` in points.
+    indent_left_pt: Option<f64>,
+    /// `fo:margin-right` in points.
+    indent_right_pt: Option<f64>,
+    /// `fo:text-indent` (first-line indent; may be negative for a hanging
+    /// indent) in points.
+    first_line_pt: Option<f64>,
+    /// `fo:line-height`: a `%` value → a unitless multiple, a length → fixed
+    /// points (a bare number is treated as a length, per ODF).
+    line_height: Option<MLineHeight>,
+}
+
+impl OdfParaProps {
+    /// Fold a parent style's properties under this one: a field set on `self`
+    /// (the more-derived style) wins; the parent fills the gaps. `parent` is
+    /// taken from `self` (a style references at most one parent).
+    fn inherit(&mut self, base: &OdfParaProps) {
+        self.align = self.align.or(base.align);
+        self.space_before_pt = self.space_before_pt.or(base.space_before_pt);
+        self.space_after_pt = self.space_after_pt.or(base.space_after_pt);
+        self.indent_left_pt = self.indent_left_pt.or(base.indent_left_pt);
+        self.indent_right_pt = self.indent_right_pt.or(base.indent_right_pt);
+        self.first_line_pt = self.first_line_pt.or(base.first_line_pt);
+        self.line_height = self.line_height.or(base.line_height);
+    }
+
+    /// Lower to a model [`ParagraphStyle`], stacking a list indent (each level
+    /// adds [`LIST_LEVEL_INDENT_PT`], mirroring [`para_style_model`]) on top of
+    /// any explicit left margin. Unset fields fall back to the model defaults.
+    fn to_paragraph_style(&self, list_level: Option<u32>) -> ParagraphStyle {
+        let list_indent = list_level
+            .map(|lvl| (lvl as f64 + 1.0) * LIST_LEVEL_INDENT_PT)
+            .unwrap_or(0.0);
+        ParagraphStyle {
+            align: self.align.unwrap_or(MAlign::Left),
+            space_before_pt: self.space_before_pt.unwrap_or(0.0),
+            space_after_pt: self.space_after_pt.unwrap_or(0.0),
+            indent_left_pt: self.indent_left_pt.unwrap_or(0.0) + list_indent,
+            indent_right_pt: self.indent_right_pt.unwrap_or(0.0),
+            first_line_pt: self.first_line_pt.unwrap_or(0.0),
+            line_height: self.line_height.unwrap_or(MLineHeight::Normal),
+        }
+    }
+}
+
+/// Map an ODF `fo:text-align` value (`start`/`end`/`center`/`justify`, plus the
+/// `left`/`right` synonyms seen in the wild) to a model [`MAlign`]. ODF is
+/// writing-direction aware (`start`/`end`); LTR is assumed (the engine has no
+/// RTL flow), so `start`→left and `end`→right.
+fn odf_text_align(v: &str) -> Option<MAlign> {
+    match v.trim() {
+        "center" => Some(MAlign::Center),
+        "end" | "right" => Some(MAlign::Right),
+        "justify" => Some(MAlign::Justify),
+        "start" | "left" => Some(MAlign::Left),
+        _ => None,
+    }
+}
+
+/// Parse an ODF `fo:line-height`: a `%` value is a unitless multiple of the font
+/// size (`150%` → `1.5`); any length (`14pt`, `0.5cm`, or a bare number treated
+/// as a length per ODF) is a fixed leading in points. `normal` (or anything
+/// unrecognised) ⇒ `None` (the model default leading).
+fn odf_line_height(v: &str) -> Option<MLineHeight> {
+    let v = v.trim();
+    if let Some(pct) = v.strip_suffix('%') {
+        return pct
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|p| *p > 0.0)
+            .map(|p| MLineHeight::Multiple(p / 100.0));
+    }
+    if v.eq_ignore_ascii_case("normal") {
+        return None;
+    }
+    parse_odf_pt(v)
+        .filter(|p| *p > 0.0)
+        .map(MLineHeight::Points)
+}
+
+/// Build a `paragraph-style-name → resolved [`ParagraphStyle`] source` map from
+/// an ODF part: each `style:style` (any family — paragraph styles carry the
+/// `fo:*` formatting, but ODF also lets a cell/graphic style hold one) with a
+/// `style:paragraph-properties` child. `style:parent-style-name` chains are
+/// resolved so a derived style inherits its base's formatting. Empty entries
+/// (no formatting and no parent) are omitted. Mirrors [`odf_text_styles`].
+fn odf_para_styles(xml: &str) -> BTreeMap<String, OdfParaProps> {
+    let mut raw: BTreeMap<String, OdfParaProps> = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    let mut cur = OdfParaProps::default();
+    let mut seen = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => {
+                    cur_name = attr(&attrs, "name").map(|s| s.to_string());
+                    cur = OdfParaProps {
+                        parent: attr(&attrs, "parent-style-name").map(|s| s.to_string()),
+                        ..OdfParaProps::default()
+                    };
+                    seen = cur.parent.is_some();
+                }
+                "paragraph-properties" => {
+                    if cur_name.is_some() {
+                        seen = true;
+                        if let Some(a) = attr(&attrs, "text-align").and_then(odf_text_align) {
+                            cur.align = Some(a);
+                        }
+                        if let Some(v) = attr(&attrs, "margin-top").and_then(parse_odf_pt) {
+                            cur.space_before_pt = Some(v.max(0.0));
+                        }
+                        if let Some(v) = attr(&attrs, "margin-bottom").and_then(parse_odf_pt) {
+                            cur.space_after_pt = Some(v.max(0.0));
+                        }
+                        if let Some(v) = attr(&attrs, "margin-left").and_then(parse_odf_pt) {
+                            cur.indent_left_pt = Some(v);
+                        }
+                        if let Some(v) = attr(&attrs, "margin-right").and_then(parse_odf_pt) {
+                            cur.indent_right_pt = Some(v);
+                        }
+                        if let Some(v) = attr(&attrs, "text-indent").and_then(parse_odf_pt) {
+                            cur.first_line_pt = Some(v);
+                        }
+                        if let Some(lh) = attr(&attrs, "line-height").and_then(odf_line_height) {
+                            cur.line_height = Some(lh);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    if let Some(nm) = cur_name.take() {
+                        if seen {
+                            raw.insert(nm, std::mem::take(&mut cur));
+                        }
+                    }
+                    cur = OdfParaProps::default();
+                    seen = false;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    // Flatten parent chains so a lookup needs no further resolution. The chain is
+    // bounded (cap 16) to ignore any pathological cycle in malformed input.
+    let mut resolved: BTreeMap<String, OdfParaProps> = BTreeMap::new();
+    for (name, props) in &raw {
+        let mut acc = props.clone();
+        let mut parent = props.parent.clone();
+        for _ in 0..16 {
+            let Some(p) = parent else { break };
+            let Some(base) = raw.get(&p) else { break };
+            acc.inherit(base);
+            parent = base.parent.clone();
+        }
+        resolved.insert(name.clone(), acc);
+    }
+    resolved
+}
+
+/// Build a `cell-style-name → background RGB` map from an ODF part: each
+/// `style:style` (a table-cell style) whose `style:table-cell-properties` carries
+/// a real `fo:background-color` (6-hex; `transparent`/`none` ignored). Used to
+/// lower ODT table cell shading onto the model. Mirrors [`odf_column_widths`].
+fn odf_cell_backgrounds(xml: &str) -> BTreeMap<String, [f64; 3]> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => cur_name = attr(&attrs, "name").map(|s| s.to_string()),
+                "table-cell-properties" => {
+                    if let Some(nm) = &cur_name {
+                        if let Some(rgb) = attr(&attrs, "background-color")
+                            .map(str::trim)
+                            .filter(|b| !matches!(*b, "transparent" | "none" | ""))
+                            .and_then(|b| hex_to_rgb_f64(b.trim_start_matches('#')))
+                        {
+                            map.insert(nm.clone(), rgb);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    cur_name = None;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
 /// Read the first `style:page-layout-properties` from an ODF part —
 /// `fo:page-width`/`fo:page-height` and `fo:margin-*` (with `fo:margin`
 /// shorthand) — into a [`PageGeom`], using `fallback` for anything absent. ODF
@@ -12743,6 +13252,217 @@ mod tests {
             "image bytes interned in the resource table"
         );
         assert_eq!(model.resources.images[&img.resource].format, "png");
+    }
+
+    /// The first paragraph/heading block's [`ParagraphStyle`] (text boxes expose
+    /// their first paragraph's), for the ODT paragraph-formatting tests.
+    fn first_para_style(doc: &Document) -> ParagraphStyle {
+        fn find(blocks: &[Block]) -> Option<ParagraphStyle> {
+            for b in blocks {
+                match &b.kind {
+                    BlockKind::Paragraph(p) => return Some(p.style.clone()),
+                    BlockKind::Heading(h) => return Some(h.para.style.clone()),
+                    BlockKind::TextBox(tb) => {
+                        if let Some(s) = find(&tb.blocks) {
+                            return Some(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        find(&doc.sections[0].pages[0].blocks).expect("a paragraph/heading block")
+    }
+
+    #[test]
+    fn odt_model_paragraph_style_alignment_spacing_indent() {
+        // `text:p@text:style-name` → a `style:paragraph-properties` with
+        // `fo:text-align`/`fo:margin-*`/`fo:text-indent` lowers onto the model
+        // paragraph's `ParagraphStyle` (ODF lengths converted to points).
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:style style:name="P1" style:family="paragraph">
+      <style:paragraph-properties fo:text-align="center" fo:margin-top="0.5cm" fo:margin-bottom="6pt" fo:margin-left="1cm" fo:text-indent="0.25in"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:p text:style-name="P1">Centered</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let style = first_para_style(&odt_model(content, &[]));
+        assert_eq!(style.align, model::style::Align::Center);
+        assert!(
+            (style.space_before_pt - 14.1732).abs() < 0.01,
+            "0.5cm → ~14.17pt (got {})",
+            style.space_before_pt
+        );
+        assert!((style.space_after_pt - 6.0).abs() < 0.001);
+        assert!(
+            (style.indent_left_pt - 28.3465).abs() < 0.01,
+            "1cm → ~28.35pt (got {})",
+            style.indent_left_pt
+        );
+        assert!(
+            (style.first_line_pt - 18.0).abs() < 0.001,
+            "0.25in → 18pt (got {})",
+            style.first_line_pt
+        );
+    }
+
+    #[test]
+    fn odt_model_paragraph_line_height_percent_and_justify() {
+        // `fo:line-height="150%"` → a unitless multiple (1.5); `fo:text-align`
+        // `justify` → justified.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:style style:name="P1" style:family="paragraph">
+      <style:paragraph-properties fo:text-align="justify" fo:line-height="150%"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:p text:style-name="P1">Body</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let style = first_para_style(&odt_model(content, &[]));
+        assert_eq!(style.align, model::style::Align::Justify);
+        assert_eq!(style.line_height, model::style::LineHeight::Multiple(1.5));
+    }
+
+    #[test]
+    fn odt_model_paragraph_style_inherits_from_parent() {
+        // A derived style fills its gaps from `style:parent-style-name`: the
+        // child sets only the alignment, the parent supplies the left margin.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s" xmlns:fo="f">
+  <office:styles>
+    <style:style style:name="Base" style:family="paragraph">
+      <style:paragraph-properties fo:margin-left="2cm"/>
+    </style:style>
+  </office:styles>
+  <office:automatic-styles>
+    <style:style style:name="P1" style:family="paragraph" style:parent-style-name="Base">
+      <style:paragraph-properties fo:text-align="end"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:p text:style-name="P1">Derived</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let style = first_para_style(&odt_model(content, &[]));
+        assert_eq!(style.align, model::style::Align::Right, "child override");
+        assert!(
+            (style.indent_left_pt - 56.6929).abs() < 0.01,
+            "2cm inherited from the parent (got {})",
+            style.indent_left_pt
+        );
+    }
+
+    #[test]
+    fn odt_model_footnote_text_and_citation_inlined() {
+        // A `text:note` (footnote) inlines its citation marker and body text at
+        // the reference point so neither is dropped.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:p>Claim<text:note text:note-class="footnote"><text:note-citation>1</text:note-citation><text:note-body><text:p>The source.</text:p></text:note-body></text:note> stands.</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        let text: String = model_first_section_inlines(&model)
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains('1'), "citation marker kept: {text:?}");
+        assert!(text.contains("The source."), "note body kept: {text:?}");
+        assert!(text.contains("Claim"), "host text kept: {text:?}");
+        // The citation marker is surfaced as a superscript run.
+        let super_run = model_first_section_inlines(&model).into_iter().any(|i| {
+            matches!(i, Inline::Run(r)
+                if r.text == "1" && r.style.vertical_align == model::style::VAlign::Super)
+        });
+        assert!(super_run, "citation rendered as a superscript run");
+    }
+
+    #[test]
+    fn odt_model_body_text_box_becomes_textbox_block() {
+        // A body `draw:frame`/`draw:text-box` → a `BlockKind::TextBox` carrying
+        // its inner paragraphs, whether anchored in a paragraph or a sibling.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:draw="d">
+  <office:body><office:text>
+    <text:p>Lead<draw:frame><draw:text-box><text:p>Boxed note</text:p></draw:text-box></draw:frame></text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        let tb = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::TextBox(_)))
+            .expect("a TextBox block from the draw:text-box");
+        assert_eq!(block_text(tb), "Boxed note");
+        // The host paragraph's own text is still present as a sibling block.
+        let para_text: String = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.kind, BlockKind::Paragraph(_)))
+            .map(block_text)
+            .collect();
+        assert!(
+            para_text.contains("Lead"),
+            "host paragraph kept: {para_text:?}"
+        );
+    }
+
+    #[test]
+    fn odt_model_table_column_widths_and_cell_shading() {
+        // `table:table-column@table:style-name` → `style:column-width` fills the
+        // table's `col_widths`; a cell style's `fo:background-color` → the cell's
+        // shading.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:table="tb" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:style style:name="co1" style:family="table-column">
+      <style:table-column-properties style:column-width="3cm"/>
+    </style:style>
+    <style:style style:name="co2" style:family="table-column">
+      <style:table-column-properties style:column-width="5cm"/>
+    </style:style>
+    <style:style style:name="ceShade" style:family="table-cell">
+      <style:table-cell-properties fo:background-color="#FF0000"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <table:table>
+      <table:table-column table:style-name="co1"/>
+      <table:table-column table:style-name="co2"/>
+      <table:table-row>
+        <table:table-cell table:style-name="ceShade"><text:p>A</text:p></table:table-cell>
+        <table:table-cell><text:p>B</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let table = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a Table block");
+        assert_eq!(table.col_widths.len(), 2, "both columns sized");
+        assert!(
+            (table.col_widths[0] - 85.0394).abs() < 0.01,
+            "3cm → ~85.04pt"
+        );
+        assert!(
+            (table.col_widths[1] - 141.7323).abs() < 0.01,
+            "5cm → ~141.73pt"
+        );
+        let shaded = &table.rows[0].cells[0].shading;
+        assert_eq!(*shaded, Some([1.0, 0.0, 0.0]), "first cell shaded red");
+        assert_eq!(table.rows[0].cells[1].shading, None, "second cell unshaded");
     }
 
     #[test]
