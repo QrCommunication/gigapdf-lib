@@ -664,3 +664,276 @@ pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
         _ => return None,
     })
 }
+
+// ── default-appearance synthesis (rendering an annotation that has no /AP) ──
+//
+// ISO 32000-1 §12.5.5: a conforming reader that finds an annotation without an
+// appearance stream synthesises a default appearance from the annotation dict.
+// The functions below build that appearance as content-stream bytes **in page
+// user space** (bottom-left origin) — they are mapped straight onto the page
+// with the page matrix (no BBox→Rect appearance transform, since the geometry is
+// computed directly against `/Rect`/`/QuadPoints`). They are append-only paint
+// helpers; none mutate document state. They mirror the create-side appearance
+// generators above so a synthesised look matches the engine's own annotations.
+
+/// A `/Resources` dictionary exposing a non-embedded Helvetica as `/Helv` — the
+/// font a synthesised text appearance (FreeText / Stamp) references. The
+/// rasterizer draws it through the base-14 substitution in `render_fonts_for`.
+pub(crate) fn helv_resources() -> Dictionary {
+    let mut helv = Dictionary::new();
+    helv.set(b"Type".to_vec(), name(b"Font"));
+    helv.set(b"Subtype".to_vec(), name(b"Type1"));
+    helv.set(b"BaseFont".to_vec(), name(b"Helvetica"));
+    let mut fonts = Dictionary::new();
+    fonts.set(b"Helv".to_vec(), Object::Dictionary(helv));
+    let mut resources = Dictionary::new();
+    resources.set(b"Font".to_vec(), Object::Dictionary(fonts));
+    resources
+}
+
+/// Append a `(text)` string-literal operand (WinAnsi-encoded, parens/backslash
+/// escaped) to a content stream being built.
+fn push_text_literal(out: &mut Vec<u8>, text: &str) {
+    out.push(b'(');
+    for &byte in &crate::font::encode_winansi(text) {
+        if matches!(byte, b'(' | b')' | b'\\') {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    out.push(b')');
+}
+
+/// Synthesised FreeText appearance: paint `text` inside `rect` in the `/DA`
+/// colour at `font_size`, honouring `/Q` quadding (0 left, 1 centre, 2 right).
+/// Lines are split on `\n` / `\r` and stacked from the top of the rect. Returns
+/// the page-space content bytes and the `/Helv` resources the text needs.
+pub(crate) fn free_text_default(
+    rect: [f64; 4],
+    text: &str,
+    font_size: f64,
+    color: [f64; 3],
+    quadding: u8,
+) -> (Vec<u8>, Dictionary) {
+    let [x0, y0, x1, y1] = rect;
+    let [r, g, b] = color;
+    let size = if font_size > 0.0 { font_size } else { 12.0 };
+    let leading = size * 1.15;
+    let pad = 2.0;
+    let box_w = (x1 - x0 - 2.0 * pad).max(0.0);
+    // Approximate Helvetica advance for crude horizontal placement.
+    let char_w = size * 0.5;
+
+    let mut out = Vec::new();
+    if text.trim().is_empty() {
+        return (out, helv_resources());
+    }
+    out.extend_from_slice(b"q\nBT\n");
+    out.extend_from_slice(format!("/Helv {} Tf\n", num(size)).as_bytes());
+    out.extend_from_slice(format!("{} {} {} rg\n", num(r), num(g), num(b)).as_bytes());
+
+    let mut baseline = y1 - pad - size;
+    for line in text.split(['\n', '\r']) {
+        // Stop once we run past the bottom of the box (still emit at least one).
+        if baseline < y0 - size {
+            break;
+        }
+        let text_w = line.chars().count() as f64 * char_w;
+        let tx = match quadding {
+            1 => x0 + pad + ((box_w - text_w) / 2.0).max(0.0), // centre
+            2 => x1 - pad - text_w.min(box_w),                 // right
+            _ => x0 + pad,                                     // left (default)
+        };
+        out.extend_from_slice(format!("1 0 0 1 {} {} Tm\n", num(tx), num(baseline)).as_bytes());
+        push_text_literal(&mut out, line);
+        out.extend_from_slice(b" Tj\n");
+        baseline -= leading;
+    }
+    out.extend_from_slice(b"ET\nQ\n");
+    (out, helv_resources())
+}
+
+/// Synthesised Squiggly appearance: a wavy underline in `color` along each quad
+/// of `quad_points` (8 values per quad, ISO order UL UR LL LR). When
+/// `quad_points` is empty the whole `rect` is treated as one span. The wave is a
+/// stroked zigzag near the baseline — more faithful than a flat rule.
+pub(crate) fn squiggly_default(rect: [f64; 4], quad_points: &[f64], color: [f64; 3]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let [r, g, b] = color;
+    out.extend_from_slice(b"q\n");
+    out.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+
+    // Collect spans as (x_left, x_right, y_bottom, y_top) in user space.
+    let mut spans: Vec<(f64, f64, f64, f64)> = Vec::new();
+    if quad_points.len() >= 8 {
+        for q in quad_points.chunks_exact(8) {
+            let xs = [q[0], q[2], q[4], q[6]];
+            let ys = [q[1], q[3], q[5], q[7]];
+            let xl = xs.iter().copied().fold(f64::INFINITY, f64::min);
+            let xr = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let yb = ys.iter().copied().fold(f64::INFINITY, f64::min);
+            let yt = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            spans.push((xl, xr, yb, yt));
+        }
+    } else {
+        spans.push((rect[0], rect[2], rect[1], rect[3]));
+    }
+
+    for (xl, xr, yb, yt) in spans {
+        let h = (yt - yb).max(1.0);
+        let line_w = (h * 0.06).max(0.75);
+        let amp = (h * 0.06).clamp(0.6, 2.0); // wave amplitude
+        let base = yb + h * 0.08; // sit near the baseline
+        let period = (amp * 4.0).max(3.0);
+        out.extend_from_slice(format!("{} w\n", num(line_w)).as_bytes());
+        out.extend_from_slice(b"1 J\n1 j\n"); // round caps/joins
+        out.extend_from_slice(format!("{} {} m\n", num(xl), num(base)).as_bytes());
+        let mut x = xl;
+        let mut up = true;
+        while x < xr {
+            let nx = (x + period / 2.0).min(xr);
+            let y = if up { base + amp } else { base - amp };
+            out.extend_from_slice(format!("{} {} l\n", num(nx), num(y)).as_bytes());
+            x = nx;
+            up = !up;
+        }
+        out.extend_from_slice(b"S\n");
+    }
+    out.extend_from_slice(b"Q\n");
+    out
+}
+
+/// Synthesised Link appearance: the border rectangle around `rect`, drawn only
+/// when an effective border width `> 0` is given (`/Border` element 3 or `/BS
+/// /W`). Links are otherwise invisible. `color` is the `/C` border colour
+/// (defaults to black at the call site when `/C` is absent).
+pub(crate) fn link_border_default(rect: [f64; 4], width: f64, color: [f64; 3]) -> Vec<u8> {
+    if width <= 0.0 {
+        return Vec::new();
+    }
+    let [x0, y0, x1, y1] = rect;
+    let inset = width / 2.0;
+    content::rectangle_ops(
+        x0 + inset,
+        y0 + inset,
+        (x1 - x0 - width).max(0.0),
+        (y1 - y0 - width).max(0.0),
+        Some(color),
+        None,
+        width,
+    )
+}
+
+/// Synthesised Text (sticky-note) appearance: a small note icon at the
+/// **top-left** of `rect` — a filled badge with a folded corner and three
+/// "text" rules — in `color` (defaults to yellow at the call site). Independent
+/// of the rect size (a comment marker, ~18pt square), like a reader's note pin.
+pub(crate) fn text_note_default(rect: [f64; 4], color: [f64; 3]) -> Vec<u8> {
+    let [r, g, b] = color;
+    let x = rect[0].min(rect[2]);
+    let top = rect[1].max(rect[3]);
+    let s = 18.0_f64; // icon size in points
+    let y = top - s; // grow downward from the top-left corner
+    let fold = s * 0.3;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"q\n");
+    // Filled body (page corner) + dark outline.
+    out.extend_from_slice(format!("{} {} {} rg\n", num(r), num(g), num(b)).as_bytes());
+    out.extend_from_slice(b"0 0 0 RG\n0.6 w\n");
+    out.extend_from_slice(format!("{} {} m\n", num(x), num(y)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(x), num(y + s)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(x + s), num(y + s)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(x + s), num(y + fold)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(x + s - fold), num(y)).as_bytes());
+    out.extend_from_slice(b"h\nB\n"); // close, fill + stroke
+                                      // Folded corner triangle.
+    out.extend_from_slice(format!("{} {} m\n", num(x + s - fold), num(y)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(x + s - fold), num(y + fold)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(x + s), num(y + fold)).as_bytes());
+    out.extend_from_slice(b"S\n");
+    // Three short "text" rules.
+    let mut ry = y + s - s * 0.32;
+    for _ in 0..3 {
+        out.extend_from_slice(format!("{} {} m\n", num(x + s * 0.2), num(ry)).as_bytes());
+        out.extend_from_slice(format!("{} {} l\n", num(x + s * 0.8), num(ry)).as_bytes());
+        out.extend_from_slice(b"S\n");
+        ry -= s * 0.22;
+    }
+    out.extend_from_slice(b"Q\n");
+    out
+}
+
+/// Synthesised FileAttachment appearance: a paperclip-like icon at the
+/// **top-left** of `rect` in `color` (defaults to a muted grey at the call
+/// site). Size-independent (~18pt), like a reader's attachment marker.
+pub(crate) fn file_attachment_default(rect: [f64; 4], color: [f64; 3]) -> Vec<u8> {
+    let [r, g, b] = color;
+    let x = rect[0].min(rect[2]);
+    let top = rect[1].max(rect[3]);
+    let s = 18.0_f64;
+    let y = top - s;
+
+    // Paperclip: an outer rounded "U" and an inner shorter "U", drawn as two
+    // nested rounded rectangles' open loops (approximated with straight legs).
+    let cx = x + s * 0.5;
+    let half_out = s * 0.22;
+    let half_in = s * 0.12;
+    let bottom = y + s * 0.18;
+    let outer_top = y + s * 0.82;
+    let inner_top = y + s * 0.62;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"q\n");
+    out.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+    out.extend_from_slice(format!("{} w\n", num((s * 0.08).max(0.8))).as_bytes());
+    out.extend_from_slice(b"1 J\n1 j\n");
+    // Outer loop (open at the top).
+    out.extend_from_slice(format!("{} {} m\n", num(cx - half_out), num(outer_top)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx - half_out), num(bottom)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx + half_out), num(bottom)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx + half_out), num(outer_top)).as_bytes());
+    out.extend_from_slice(b"S\n");
+    // Inner loop (shorter, open at the bottom).
+    out.extend_from_slice(format!("{} {} m\n", num(cx - half_in), num(y + s * 0.95)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx - half_in), num(inner_top)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx + half_in), num(inner_top)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx + half_in), num(y + s * 0.95)).as_bytes());
+    out.extend_from_slice(b"S\n");
+    out.extend_from_slice(b"Q\n");
+    out
+}
+
+/// Synthesised Stamp appearance: a labelled, bordered box filling `rect`, the
+/// label taken from `/Name`. Reuses the create-side look (`stamp`) so a
+/// synthesised stamp matches an engine-authored one. Returns the page-space
+/// content bytes and the `/Helv` resources.
+pub(crate) fn stamp_default(rect: [f64; 4], label: &str, color: [f64; 3]) -> (Vec<u8>, Dictionary) {
+    let [x0, y0, x1, y1] = rect;
+    let [r, g, b] = color;
+    let width = (x1 - x0).abs();
+    let height = (y1 - y0).abs();
+    let line_width = (height * 0.06).clamp(1.0, 3.0);
+    let font_size = (height * 0.5).clamp(8.0, 24.0);
+    let mut out = content::rectangle_ops(
+        x0 + line_width,
+        y0 + line_width,
+        width - 2.0 * line_width,
+        height - 2.0 * line_width,
+        Some(color),
+        None,
+        line_width,
+    );
+    if !label.is_empty() {
+        let text_width = label.chars().count() as f64 * font_size * 0.5;
+        let tx = x0 + ((width - text_width) / 2.0).max(line_width + 2.0);
+        let ty = y0 + (height - font_size) / 2.0 + font_size * 0.2;
+        out.extend_from_slice(b"BT\n");
+        out.extend_from_slice(format!("/Helv {} Tf\n", num(font_size)).as_bytes());
+        out.extend_from_slice(format!("{} {} {} rg\n", num(r), num(g), num(b)).as_bytes());
+        out.extend_from_slice(format!("{} {} Td\n", num(tx), num(ty)).as_bytes());
+        push_text_literal(&mut out, label);
+        out.extend_from_slice(b" Tj\nET\n");
+    }
+    (out, helv_resources())
+}

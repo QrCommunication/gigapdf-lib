@@ -5130,7 +5130,10 @@ impl Document {
                 continue;
             }
             let Some(form_id) = self.annotation_appearance_id(dict) else {
-                continue; // No appearance to draw.
+                // No `/AP /N`: synthesise a default appearance from the dict
+                // (ISO 32000-1 §12.5.5) so the annotation still draws.
+                self.render_synthesized_appearance(dict, canvas, base);
+                continue;
             };
             let Some(stream) = self.objects.get(&form_id).and_then(Object::as_stream) else {
                 continue;
@@ -5176,6 +5179,161 @@ impl Document {
                 &[],
             );
         }
+    }
+
+    /// Synthesize and paint a default appearance for an annotation that has no
+    /// `/AP /N`, the way a conforming reader does (ISO 32000-1 §12.5.5).
+    /// Supported `/Subtype`s: FreeText (the `/Contents` text in the `/DA`
+    /// font/size/colour, `/Q`-quadded, inside `/Rect`), Squiggly (a wavy
+    /// underline along `/QuadPoints` in `/C`), Link (the `/Border`/`/BS`
+    /// rectangle when its width > 0), Text (a note icon), FileAttachment (a
+    /// paperclip icon) and Stamp (a labelled box from `/Name`). Other subtypes
+    /// draw nothing (matching the prior behaviour). The synthesised content is
+    /// produced directly in page user space, so it maps onto the page with
+    /// `base` alone — no BBox→Rect appearance transform.
+    fn render_synthesized_appearance(
+        &self,
+        dict: &Dictionary,
+        canvas: &mut crate::raster::Canvas,
+        base: content::PageMatrix,
+    ) {
+        let subtype = match dict.get(b"Subtype").and_then(Object::as_name) {
+            Some(s) => s.to_vec(),
+            None => return,
+        };
+        let rect = self.normalized_rect(self.read_rect(dict));
+        // Degenerate rect → nothing meaningful to draw.
+        if (rect[2] - rect[0]).abs() < 1e-6 && (rect[3] - rect[1]).abs() < 1e-6 {
+            return;
+        }
+        let c = self.annotation_rgb(dict);
+        let rgb3 = |fallback: [f64; 3]| -> [f64; 3] {
+            if c.len() == 3 {
+                [c[0], c[1], c[2]]
+            } else {
+                fallback
+            }
+        };
+
+        // Build the page-space content bytes + (for text) the `/Helv` resources.
+        let (appearance, resources): (Vec<u8>, Dictionary) = match subtype.as_slice() {
+            b"FreeText" => {
+                let text = match dict.get(b"Contents").map(|o| self.resolve(o)) {
+                    Some(Object::String(bytes, _)) => crate::font::decode_pdf_text(bytes),
+                    _ => String::new(),
+                };
+                let da = self.field_da(dict);
+                let (size, da_color) = parse_da(&da);
+                // `/Q` quadding (0 left, 1 centre, 2 right).
+                let quadding = dict
+                    .get(b"Q")
+                    .and_then(Object::as_i64)
+                    .unwrap_or(0)
+                    .clamp(0, 2) as u8;
+                let color = if c.len() == 3 {
+                    [c[0], c[1], c[2]]
+                } else {
+                    da_color
+                };
+                annot::free_text_default(rect, &text, size, color, quadding)
+            }
+            b"Squiggly" => {
+                let quad = self.read_num_array(dict, b"QuadPoints");
+                let color = rgb3([0.0, 0.0, 0.0]);
+                (
+                    annot::squiggly_default(rect, &quad, color),
+                    Dictionary::new(),
+                )
+            }
+            b"Link" => {
+                let width = self.annotation_border_width(dict);
+                let color = rgb3([0.0, 0.0, 0.0]);
+                (
+                    annot::link_border_default(rect, width, color),
+                    Dictionary::new(),
+                )
+            }
+            b"Text" => {
+                let color = rgb3([1.0, 0.85, 0.2]); // sticky-note yellow
+                (annot::text_note_default(rect, color), Dictionary::new())
+            }
+            b"FileAttachment" => {
+                let color = rgb3([0.45, 0.45, 0.45]); // muted grey clip
+                (
+                    annot::file_attachment_default(rect, color),
+                    Dictionary::new(),
+                )
+            }
+            b"Stamp" => {
+                let label = match dict.get(b"Name").map(|o| self.resolve(o)) {
+                    Some(Object::Name(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+                    Some(Object::String(bytes, _)) => crate::font::decode_pdf_text(bytes),
+                    _ => String::new(),
+                };
+                let color = rgb3([1.0, 0.0, 0.0]); // stamp red
+                annot::stamp_default(rect, &label, color)
+            }
+            _ => return,
+        };
+        if appearance.is_empty() {
+            return; // e.g. a borderless Link — nothing to paint.
+        }
+
+        let alpha = dict
+            .get(b"CA")
+            .map(|o| self.resolve(o))
+            .and_then(|o| o.as_f64())
+            .unwrap_or(1.0);
+        let fonts = self.render_fonts_for(&resources);
+        let images = self.images_for(&resources);
+        let ctx = PageResourceCtx::new(self, resources, canvas.width, canvas.height, base);
+        // The synthesised content is already in page user space → map with `base`.
+        crate::raster::render_content_into_ctx(
+            canvas,
+            &appearance,
+            base,
+            &fonts,
+            &images,
+            alpha,
+            &ctx,
+            0,
+            None,
+            false,
+            &[],
+        );
+    }
+
+    /// The effective border width of an annotation (for synthesising a Link
+    /// frame): `/BS /W` if present, else `/Border` element 3 (`[h v w …]`), else
+    /// the spec default `1.0`. ISO 32000-1 §8.4.3 / §12.5.4.
+    fn annotation_border_width(&self, dict: &Dictionary) -> f64 {
+        if let Some(bs) = dict
+            .get(b"BS")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        {
+            if let Some(w) = bs
+                .get(b"W")
+                .map(|o| self.resolve(o))
+                .and_then(|o| o.as_f64())
+            {
+                return w.max(0.0);
+            }
+        }
+        if let Some(border) = dict
+            .get(b"Border")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            if let Some(w) = border
+                .get(2)
+                .map(|o| self.resolve(o))
+                .and_then(|o| o.as_f64())
+            {
+                return w.max(0.0);
+            }
+        }
+        1.0
     }
 
     /// A page's `/Resources` dictionary (empty when absent).
@@ -20571,6 +20729,261 @@ mod tests {
             nonwhite_in(&png, 0, 0, 200, 200),
             0,
             "hidden annotation must not be painted"
+        );
+    }
+
+    // ── synthesized default appearances (annotation with no /AP /N, #55) ──
+
+    /// Attach a raw annotation dict (built from `(key, Object)` entries) to page
+    /// 1's `/Annots`, returning the document. The dict carries **no** `/AP`, so
+    /// the renderer must synthesise a default appearance.
+    fn attach_annot_no_ap(doc: &mut Document, entries: Vec<(&[u8], Object)>) {
+        let mut annot = Dictionary::new();
+        annot.set(b"Type".to_vec(), Object::Name(b"Annot".to_vec()));
+        for (k, v) in entries {
+            annot.set(k.to_vec(), v);
+        }
+        let annot_id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(annot_id, Object::Dictionary(annot));
+        let page_id = doc.page_object_id(1).unwrap();
+        let mut page = doc
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+        let mut items = match page.get(b"Annots") {
+            Some(o) => doc
+                .resolve(o)
+                .as_array()
+                .map(<[Object]>::to_vec)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        items.push(Object::Reference(annot_id));
+        page.set(b"Annots".to_vec(), Object::Array(items));
+        doc.objects.insert(page_id, Object::Dictionary(page));
+    }
+
+    fn rect_obj(rect: [f64; 4]) -> Object {
+        Object::Array(rect.iter().map(|&v| Object::Real(v)).collect())
+    }
+
+    #[test]
+    fn synthesizes_freetext_appearance_without_ap() {
+        // A FreeText annotation with `/Contents` + `/DA` but no `/AP`: the
+        // renderer must paint the text inside the rect.
+        let mut doc = blank_200();
+        attach_annot_no_ap(
+            &mut doc,
+            vec![
+                (b"Subtype", Object::Name(b"FreeText".to_vec())),
+                (b"Rect", rect_obj([40.0, 120.0, 180.0, 160.0])),
+                (
+                    b"Contents",
+                    Object::String(b"Hello".to_vec(), StringKind::Literal),
+                ),
+                (
+                    b"DA",
+                    Object::String(b"/Helv 14 Tf 1 0 0 rg".to_vec(), StringKind::Literal),
+                ),
+            ],
+        );
+        let png = doc.render_page(1, 1.0).unwrap();
+        // Rect [40 120 180 160] in a 200-tall page → device rows ~40..80.
+        assert!(
+            nonwhite_in(&png, 40, 35, 180, 85) > 30,
+            "FreeText text must be synthesised and painted"
+        );
+    }
+
+    #[test]
+    fn synthesizes_squiggly_underline_without_ap() {
+        // A Squiggly markup with `/QuadPoints` but no `/AP`: a wavy rule appears
+        // near the bottom of the quad.
+        let mut doc = blank_200();
+        // One quad over user rect x:40..160, y:100..118 (UL UR LL LR order).
+        let quad = [40.0, 118.0, 160.0, 118.0, 40.0, 100.0, 160.0, 100.0];
+        attach_annot_no_ap(
+            &mut doc,
+            vec![
+                (b"Subtype", Object::Name(b"Squiggly".to_vec())),
+                (b"Rect", rect_obj([40.0, 100.0, 160.0, 118.0])),
+                (
+                    b"C",
+                    Object::Array(vec![
+                        Object::Real(1.0),
+                        Object::Real(0.0),
+                        Object::Real(0.0),
+                    ]),
+                ),
+                (
+                    b"QuadPoints",
+                    Object::Array(quad.iter().map(|&v| Object::Real(v)).collect()),
+                ),
+            ],
+        );
+        let png = doc.render_page(1, 1.0).unwrap();
+        // Baseline ~user y 101 → device row ~99; check a band near the bottom.
+        assert!(
+            nonwhite_in(&png, 40, 92, 160, 106) > 20,
+            "Squiggly wavy underline must be synthesised"
+        );
+    }
+
+    #[test]
+    fn synthesizes_link_border_only_when_width_positive() {
+        // A Link with a visible border (`/Border [0 0 2]`) draws a frame; a Link
+        // with width 0 stays invisible.
+        let mut visible = blank_200();
+        attach_annot_no_ap(
+            &mut visible,
+            vec![
+                (b"Subtype", Object::Name(b"Link".to_vec())),
+                (b"Rect", rect_obj([50.0, 50.0, 150.0, 100.0])),
+                (
+                    b"Border",
+                    Object::Array(vec![
+                        Object::Real(0.0),
+                        Object::Real(0.0),
+                        Object::Real(2.0),
+                    ]),
+                ),
+            ],
+        );
+        let png = visible.render_page(1, 1.0).unwrap();
+        assert!(
+            nonwhite_in(&png, 45, 95, 155, 155) > 50,
+            "Link border (width 2) must be drawn"
+        );
+
+        let mut invisible = blank_200();
+        attach_annot_no_ap(
+            &mut invisible,
+            vec![
+                (b"Subtype", Object::Name(b"Link".to_vec())),
+                (b"Rect", rect_obj([50.0, 50.0, 150.0, 100.0])),
+                (
+                    b"Border",
+                    Object::Array(vec![
+                        Object::Real(0.0),
+                        Object::Real(0.0),
+                        Object::Real(0.0),
+                    ]),
+                ),
+            ],
+        );
+        let png0 = invisible.render_page(1, 1.0).unwrap();
+        assert_eq!(
+            nonwhite_in(&png0, 0, 0, 200, 200),
+            0,
+            "Link with border width 0 must stay invisible"
+        );
+    }
+
+    #[test]
+    fn synthesizes_text_note_icon_without_ap() {
+        let mut doc = blank_200();
+        attach_annot_no_ap(
+            &mut doc,
+            vec![
+                (b"Subtype", Object::Name(b"Text".to_vec())),
+                (b"Rect", rect_obj([60.0, 140.0, 80.0, 160.0])),
+                (
+                    b"Contents",
+                    Object::String(b"a note".to_vec(), StringKind::Literal),
+                ),
+            ],
+        );
+        let png = doc.render_page(1, 1.0).unwrap();
+        // Icon anchored at the top-left of the rect (user y≈160 → device row≈40).
+        assert!(
+            nonwhite_in(&png, 55, 38, 85, 65) > 30,
+            "Text note icon must be synthesised"
+        );
+    }
+
+    #[test]
+    fn synthesizes_file_attachment_icon_without_ap() {
+        let mut doc = blank_200();
+        attach_annot_no_ap(
+            &mut doc,
+            vec![
+                (b"Subtype", Object::Name(b"FileAttachment".to_vec())),
+                (b"Rect", rect_obj([100.0, 100.0, 120.0, 120.0])),
+            ],
+        );
+        let png = doc.render_page(1, 1.0).unwrap();
+        // Clip icon at the top-left of the rect (user y≈120 → device row≈80).
+        assert!(
+            nonwhite_in(&png, 95, 78, 125, 105) > 10,
+            "FileAttachment paperclip icon must be synthesised"
+        );
+    }
+
+    #[test]
+    fn synthesizes_stamp_box_from_name_without_ap() {
+        let mut doc = blank_200();
+        attach_annot_no_ap(
+            &mut doc,
+            vec![
+                (b"Subtype", Object::Name(b"Stamp".to_vec())),
+                (b"Rect", rect_obj([40.0, 70.0, 170.0, 120.0])),
+                (b"Name", Object::Name(b"Approved".to_vec())),
+            ],
+        );
+        let png = doc.render_page(1, 1.0).unwrap();
+        // Rect maps to device rows ~80..130; box border + label appear.
+        assert!(
+            nonwhite_in(&png, 35, 75, 175, 135) > 200,
+            "Stamp box + label must be synthesised from /Name"
+        );
+    }
+
+    #[test]
+    fn unknown_subtype_without_ap_draws_nothing() {
+        // A Polygon (not in the synthesised set) with no /AP stays blank — the
+        // synthesis path must not invent ink for unsupported subtypes.
+        let mut doc = blank_200();
+        attach_annot_no_ap(
+            &mut doc,
+            vec![
+                (b"Subtype", Object::Name(b"Polygon".to_vec())),
+                (b"Rect", rect_obj([40.0, 40.0, 160.0, 160.0])),
+            ],
+        );
+        let png = doc.render_page(1, 1.0).unwrap();
+        assert_eq!(
+            nonwhite_in(&png, 0, 0, 200, 200),
+            0,
+            "unsupported subtype without /AP draws nothing"
+        );
+    }
+
+    #[test]
+    fn annotation_with_ap_is_unchanged_by_synthesis() {
+        // A Square WITH its own `/AP /N` must render exactly as before — the
+        // synthesis path is never taken when an appearance exists. Compare the
+        // raster to a control rendered the same way.
+        let build = || {
+            let mut doc = blank_200();
+            doc.add_square_annotation(
+                1,
+                [50.0, 50.0, 150.0, 150.0],
+                None,
+                Some([1.0, 0.0, 0.0]),
+                2.0,
+            )
+            .unwrap();
+            doc.render_page(1, 1.0).unwrap()
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a, b, "an /AP-bearing annotation renders deterministically");
+        // And it actually paints its own appearance (red frame), not a synthesised one.
+        assert!(
+            nonwhite_in(&a, 45, 45, 155, 155) > 100,
+            "Square /AP appearance is painted"
         );
     }
 
