@@ -7,6 +7,17 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.87.1] - 2026-06-24
+
+HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).
+
+### Added
+
+- **`aspect-ratio`** (`16/9`, `1.5`, `auto 16/9`). When a block has no definite
+  `height`, its height is derived from the resolved width as `width / ratio`
+  (taller content then overflows, and is clipped under `overflow: hidden`).
+  `min-height` still applies as a floor.
+
 ## [0.87.0] - 2026-06-24
 
 HTML/CSS renderer — colour alpha ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item C).

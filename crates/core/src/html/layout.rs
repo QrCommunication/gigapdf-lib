@@ -1214,9 +1214,14 @@ impl Flow<'_> {
 
         cy += p.bottom + b.bottom;
         // A definite `height` caps the box (content overflows — and is clipped
-        // under `overflow: hidden`); without it the box grows to its content.
-        // `min-height` is only a floor on whichever applies.
-        let mut box_h = style.height.unwrap_or((cy - box_top).max(0.1));
+        // under `overflow: hidden`). Failing that, `aspect-ratio` derives the
+        // height from the resolved width (`box_w / ratio`); otherwise the box
+        // grows to its content. `min-height` is only a floor on whichever applies.
+        let mut box_h = match (style.height, style.aspect_ratio) {
+            (Some(h), _) => h,
+            (None, Some(ratio)) if ratio > 0.0 => (box_w / ratio).max(0.1),
+            _ => (cy - box_top).max(0.1),
+        };
         if let Some(mh) = style.min_height {
             box_h = box_h.max(mh);
         }
@@ -5449,6 +5454,19 @@ mod tests {
         assert!(
             (gap - 100.0).abs() < 12.0,
             "25% row ≈ 100pt of the 400pt grid (R2 is {gap}pt below R1)"
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_derives_height_from_width() {
+        // A 200pt-wide box with `aspect-ratio: 2/1` is 100pt tall, so a sibling
+        // below it starts ~100pt down — far below the content-sized box (~1 line).
+        let ar = run(r#"<div style="width:200pt;aspect-ratio:2/1">A</div><div>B</div>"#);
+        let plain = run(r#"<div style="width:200pt">A</div><div>B</div>"#);
+        let pushed = cell_y(&ar, "B") - cell_y(&plain, "B");
+        assert!(
+            pushed > 60.0,
+            "aspect-ratio box (~100pt tall) pushes B well below the plain box ({pushed}pt)"
         );
     }
 

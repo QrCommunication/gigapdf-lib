@@ -179,6 +179,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `min-width` / `max-width` | length or `%` | clamp the resolved box width |
 | `height` | length | **definite** box height — taller content overflows (and is clipped under `overflow: hidden`); floored by `min-height` |
 | `min-height` | length | a floor only — the box still grows with its content |
+| `aspect-ratio` | `<w> / <h>` or a number (`16/9`, `1.5`, `auto 16/9`) | when no definite `height` is set, the height is derived as `width / ratio` (taller content then overflows) |
 | `box-sizing` | `content-box` (default), `border-box` | `border-box` makes `width` include padding + border |
 
 ### Borders
@@ -420,7 +421,7 @@ following are out of scope; unknown properties and elements never error — they
 simply skipped — so a richer stylesheet degrades gracefully to the supported
 subset.
 
-- **Layout/sizing**: `aspect-ratio`, a true scroll model for `position: sticky`.
+- **Layout/sizing**: a true scroll model for `position: sticky`.
   `grid-template-areas` / named grid lines (use numeric placement). `flex-shrink`
   / `flex-basis` on the **column** axis.
 - **Visual effects**: `transform`, `filter`, `text-shadow`, `box-shadow: inset`

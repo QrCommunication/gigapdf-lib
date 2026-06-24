@@ -424,6 +424,10 @@ pub struct Style {
     /// box does **not** grow past it: taller content overflows (and is clipped
     /// when `overflow: hidden|clip`). Floored by `min_height` when both are set.
     pub height: Option<f64>,
+    /// `aspect-ratio` as `width / height` (e.g. `16/9` → `1.777…`). When set and
+    /// no definite `height` is given, the block's height is derived as
+    /// `box_width / aspect_ratio`. `None` ⇒ height comes from content.
+    pub aspect_ratio: Option<f64>,
     /// `box-sizing: border-box` — `width` includes padding + border.
     pub border_box: bool,
     // ── positioning (not inherited) ──
@@ -665,6 +669,7 @@ impl Default for Style {
             max_width: None,
             min_height: None,
             height: None,
+            aspect_ratio: None,
             border_box: false,
             position: Position::Static,
             inset: [None; 4],
@@ -1424,6 +1429,7 @@ fn inherit(parent: &Style) -> Style {
         max_width: None,
         min_height: None,
         height: None,
+        aspect_ratio: None,
         border_box: false,
         position: Position::Static,
         inset: [None; 4],
@@ -2546,6 +2552,7 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             // flooring it like `min-height`.
             style.height = parse_len_px(v, style.font_size);
         }
+        "aspect-ratio" => style.aspect_ratio = parse_aspect_ratio(v),
         "box-sizing" => style.border_box = v == "border-box",
         "text-transform" => {
             style.text_transform = match v {
@@ -2969,6 +2976,23 @@ fn apply_border_color_shorthand(style: &mut Style, v: &str) {
     // colour's alpha as the uniform border alpha.
     if let Some((_, a)) = parsed.first() {
         style.border_color_alpha = *a;
+    }
+}
+
+/// Parse `aspect-ratio` to a `width / height` factor: `16 / 9` → `1.777…`, a bare
+/// `1.5` → `1.5`. The `auto` keyword (e.g. `auto 16/9`) is ignored — the ratio is
+/// still used. `None` when no positive ratio is present.
+fn parse_aspect_ratio(v: &str) -> Option<f64> {
+    let cleaned = v.to_ascii_lowercase().replace("auto", " ");
+    let nums: Vec<f64> = cleaned
+        .split('/')
+        .flat_map(|s| s.split_whitespace())
+        .filter_map(|t| t.parse::<f64>().ok())
+        .collect();
+    match nums.as_slice() {
+        [w] if *w > 0.0 => Some(*w),
+        [w, h] if *w > 0.0 && *h > 0.0 => Some(w / h),
+        _ => None,
     }
 }
 
