@@ -472,6 +472,11 @@ pub struct Style {
     pub z_index: i32,
     /// `overflow: hidden|clip|scroll|auto` — clip descendants to this box.
     pub overflow_clip: bool,
+    /// `display: flow-root` — establish a new block formatting context (so
+    /// floats inside don't escape to siblings, and the box contains its floats)
+    /// without any clipping. `overflow` non-visible establishes a BFC too, but
+    /// via [`Self::overflow_clip`]; this flag is the clip-free trigger.
+    pub establishes_bfc: bool,
     // ── flex extras (not inherited) ──
     /// `flex-wrap: wrap|wrap-reverse` — allow flex lines to wrap.
     pub flex_wrap: bool,
@@ -718,6 +723,7 @@ impl Default for Style {
             inset: [None; 4],
             z_index: 0,
             overflow_clip: false,
+            establishes_bfc: false,
             flex_wrap: false,
             align_items: AlignItems::Stretch,
             align_self: None,
@@ -1767,6 +1773,7 @@ fn inherit(parent: &Style) -> Style {
         inset: [None; 4],
         z_index: 0,
         overflow_clip: false,
+        establishes_bfc: false,
         flex_wrap: false,
         align_items: AlignItems::Stretch,
         align_self: None,
@@ -2608,6 +2615,9 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
     };
     match prop {
         "display" => {
+            // `display: flow-root` is a plain block that *establishes a BFC*
+            // (contains its floats, doesn't leak them to siblings).
+            style.establishes_bfc = v == "flow-root";
             style.display = match v {
                 "none" => Display::None,
                 "inline" => Display::Inline,

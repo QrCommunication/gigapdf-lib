@@ -244,7 +244,8 @@ pub fn layout_document_framed(
         ..Style::default()
     };
     let mut y = frame.top;
-    y = flow.block_children(roots, &root_style, frame.left, content_w, y, &[]);
+    // The page (root) is the top-level block formatting context.
+    y = flow.block_children(roots, &root_style, frame.left, content_w, y, &[], true);
     let _ = y;
 
     Layout {
@@ -350,6 +351,31 @@ impl FloatCtx {
             .map(|f| f.bottom)
             .fold(0.0_f64, f64::max)
     }
+}
+
+/// Whether a block with style `st` establishes a **new block formatting
+/// context** — i.e. its float context is isolated from the surrounding flow:
+/// floats placed inside it neither escape to following siblings nor are its own
+/// line boxes shortened by ancestor floats; it also fully contains its floats.
+///
+/// Per CSS this is the case for: a non-`visible` `overflow`, `display: flow-root`,
+/// a float, an out-of-flow positioned box, and the formatting-root displays
+/// (`table`/`flex`/`grid`, and a multi-column block) — the last group already
+/// lays out through their own routines, but we still report them here so the
+/// predicate is a single source of truth. As a pragmatic extension we also treat
+/// any non-`static` positioned block as a BFC: `relative`/`sticky` shift their
+/// fragments *after* layout, so isolating their internal floats avoids leaking
+/// pre-shift float geometry into siblings.
+fn establishes_bfc(st: &Style) -> bool {
+    st.overflow_clip
+        || st.establishes_bfc
+        || st.float != FloatSide::None
+        || st.position != Position::Static
+        || st.column_count > 1
+        || matches!(
+            st.display,
+            Display::Table | Display::TableRow | Display::Flex | Display::Grid
+        )
 }
 
 struct Flow<'a> {
@@ -557,6 +583,49 @@ fn lighten(c: [f64; 3]) -> [f64; 3] {
     c.map(|v| v + (1.0 - v) * 0.45)
 }
 
+/// The rightmost x reached by a fragment's bounding box (its `x + width`),
+/// using `m` to measure the advance of a [`Fragment::Text`] run (which stores
+/// only its origin `x`, not its width). Used to measure a float's intrinsic
+/// (max-content) width: the widest right edge among the fragments produced when
+/// the content is laid out at a very large available width.
+fn fragment_right(frag: &Fragment, m: &dyn Measure) -> f64 {
+    match frag {
+        Fragment::Text { x, style, text, .. } => *x + m.width(text, style),
+        Fragment::Rect { x, w, .. }
+        | Fragment::Image { x, w, .. }
+        | Fragment::Svg { x, w, .. }
+        | Fragment::Border { x, w, .. }
+        | Fragment::Gradient { x, w, .. } => *x + *w,
+        // Decoration wrappers: the inner fragment carries the geometry. A clip
+        // only cuts (it doesn't move content), and the float max-content path
+        // never wraps its content in these — recurse for an exhaustive, sensible
+        // bound. (`Transformed` ignores the affine here; transformed content is
+        // not part of intrinsic float sizing.)
+        Fragment::Clipped { inner, .. } | Fragment::Transformed { inner, .. } => {
+            fragment_right(inner, m)
+        }
+    }
+}
+
+/// Whether `el` is a replaced element (`<img>` / `<svg>`): its box is sized from
+/// an intrinsic width, not from laying out child content. A replaced float keeps
+/// its intrinsic width rather than shrink-to-fit measuring (it has no text run
+/// to measure).
+fn is_replaced(el: &Element) -> bool {
+    el.tag == "img" || el.tag == "svg"
+}
+
+/// The intrinsic width (points) of a replaced element's box: its `width`
+/// attribute if present, else the conventional 64pt fallback used by the inline
+/// replaced path. (Matches `collect_inline`'s default so a floated `<img>` is
+/// sized exactly as the inline one.)
+fn intrinsic_replaced_width(el: &Element) -> f64 {
+    el.attr("width")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|w| *w > 0.0)
+        .unwrap_or(64.0)
+}
+
 /// An atomic inline item for line breaking.
 /// Inline replaced content laid out as a box on the line: a raster image
 /// (`w, h, src`) or a vector SVG (`w, h, image`).
@@ -673,6 +742,7 @@ impl Flow<'_> {
     /// Lay out the children of a block container, partitioning runs of
     /// inline-level content into inline formatting contexts. Returns the bottom
     /// `y`.
+    #[allow(clippy::too_many_arguments)]
     fn block_children(
         &mut self,
         children: &[Node],
@@ -681,10 +751,21 @@ impl Flow<'_> {
         avail_w: f64,
         mut y: f64,
         ancestors: &[&Element],
+        // Whether the *container* whose children these are establishes a new
+        // block formatting context. When `true`, floats are isolated to this
+        // container (a fresh context, and the container clears past its floats at
+        // the end). When `false` (a plain in-flow block container), floats are
+        // shared with the parent context: floats placed here flow up to following
+        // siblings, and the container does NOT clear past them.
+        container_is_bfc: bool,
     ) -> f64 {
-        // Each block container establishes a fresh float context: floats placed
-        // inside it don't leak into sibling/parent containers.
-        let saved_floats = std::mem::take(&mut self.floats);
+        // A BFC container starts a fresh float context (restored on exit) so its
+        // floats don't leak; a non-BFC container shares the inherited one.
+        let saved_floats = if container_is_bfc {
+            std::mem::take(&mut self.floats)
+        } else {
+            FloatCtx::default()
+        };
 
         // `position: sticky` boxes, replayed once this container's page span is
         // known (bottom of this fn). Each entry is (fragment template, start index
@@ -802,7 +883,10 @@ impl Flow<'_> {
                     // fragments by `inset` (its normal space is preserved).
                     let mut start = self.out.len();
                     let y_before = y;
-                    y = self.block(e, &st, parent_style, x, avail_w, y, ancestors, list_index);
+                    let child_bfc = establishes_bfc(&st);
+                    y = self.block_in_flow(
+                        e, &st, parent_style, x, avail_w, y, ancestors, list_index, child_bfc,
+                    );
                     // `page-break-inside: avoid` — if the block straddled a page
                     // boundary yet fits within one page, discard it and re-lay
                     // from the next page top so it stays intact.
@@ -823,8 +907,9 @@ impl Flow<'_> {
                             let moved = self.break_to_next_page(y_before);
                             if moved > y_before {
                                 start = self.out.len();
-                                y = self.block(
-                                    e, &st, parent_style, x, avail_w, moved, ancestors, list_index,
+                                y = self.block_in_flow(
+                                    e, &st, parent_style, x, avail_w, moved, ancestors,
+                                    list_index, child_bfc,
                                 );
                             }
                         }
@@ -885,15 +970,21 @@ impl Flow<'_> {
         if !inline_run.is_empty() {
             y = self.inline_context_f(&inline_run, parent_style, x, avail_w, y, ancestors);
         }
-        // Clear past any floats that extend below the in-flow content, so the
-        // container fully contains its floats (matches `overflow`/clearfix).
-        y = y.max(self.floats.max_bottom());
+        // A BFC container fully contains its floats: clear past any that extend
+        // below the in-flow content (matches `overflow`/clearfix). A non-BFC
+        // container does NOT clear — the floats it placed overflow into the
+        // parent's following siblings (their context is shared, restored below).
+        // This runs BEFORE the sticky replay so the latter sees the final `y`.
+        if container_is_bfc {
+            y = y.max(self.floats.max_bottom());
+        }
 
         // Replay `position: sticky` running headers: now that this containing
         // block's bottom (`y`) is known, a top-sticky box whose span crosses page
         // boundaries is re-emitted at `self.top + offset` on each page after the
         // one it naturally sits on, up to the container's last page. The in-flow
         // space stays reserved (the box already advanced `y`); only paint repeats.
+        // (Independent of the float context — runs for BFC and non-BFC alike.)
         if !pending_stickies.is_empty() {
             let top = self.top;
             let content_h = (self.page_h - top - self.bottom).max(1.0);
@@ -938,8 +1029,65 @@ impl Flow<'_> {
             }
         }
 
-        self.floats = saved_floats;
+        // Restore the parent's float context for a BFC container. A non-BFC
+        // container leaves `self.floats` as-is so the floats it placed remain
+        // visible to the parent's following siblings.
+        if container_is_bfc {
+            self.floats = saved_floats;
+        }
         y
+    }
+
+    /// Lay out one in-flow block child, narrowing its box beside any float that
+    /// overlaps its top so the block's background/border/content sit *beside* the
+    /// float (then full width below it, since the float's band ends there).
+    ///
+    /// `child_bfc` is [`establishes_bfc`] for the child. The interaction with
+    /// floats differs by case, and both avoid shifting text twice:
+    /// - **BFC child** (`overflow`, `flow-root`, positioned, table/flex/grid…):
+    ///   `block` lays its children in an isolated float context, so the ancestor
+    ///   floats never reach its line boxes — narrowing the box alone is enough.
+    /// - **non-BFC child** (a plain in-flow block): its `block_children` *shares*
+    ///   `self.floats`, so its lines would re-subtract the same float inset
+    ///   (double-narrowing). We suppress that by removing the ancestor floats for
+    ///   the duration of the child's layout, then restore them and re-append any
+    ///   floats the child itself placed (so those still flow to later siblings).
+    #[allow(clippy::too_many_arguments)]
+    fn block_in_flow(
+        &mut self,
+        e: &Element,
+        st: &Style,
+        parent_style: &Style,
+        x: f64,
+        avail_w: f64,
+        y: f64,
+        ancestors: &[&Element],
+        list_index: usize,
+        child_bfc: bool,
+    ) -> f64 {
+        // Inset from floats overlapping the block's top edge. A 1pt probe band
+        // matches the inline line-level model (a line touching the float's band
+        // is affected); the box is narrowed by however much float sits at `y`.
+        let (l_in, r_in) = self.floats.insets(y, 1.0);
+        let bx = x + l_in;
+        let bw = (avail_w - l_in - r_in).max(1.0);
+
+        if child_bfc || (l_in == 0.0 && r_in == 0.0) {
+            // BFC child (self-isolating) or no float to wrap beside: lay out
+            // normally at the (possibly narrowed) geometry; nothing to suppress.
+            return self.block(e, st, parent_style, bx, bw, y, ancestors, list_index);
+        }
+
+        // Non-BFC child beside a float: lift the ancestor floats so the child's
+        // shared-context lines aren't narrowed again, lay it out, then restore.
+        let suppressed = std::mem::take(&mut self.floats);
+        let out_y = self.block(e, st, parent_style, bx, bw, y, ancestors, list_index);
+        // Any floats the child placed (it shares the context, so they landed in
+        // `self.floats`) must survive into the parent's following siblings.
+        let inner = std::mem::take(&mut self.floats);
+        self.floats = suppressed;
+        self.floats.boxes.extend(inner.boxes);
+        out_y
     }
 
     /// `position: relative` offset in points from `top`/`left` (falling back to
@@ -1080,14 +1228,29 @@ impl Flow<'_> {
         ancestors: &[&Element],
     ) {
         let left = st.float == FloatSide::Left;
-        // Width: explicit `width` else a third of the line (a pragmatic
-        // shrink-to-fit that keeps room for the wrapping text).
+        // A float lays out as a block in its own formatting context (so its
+        // content doesn't wrap around ancestor floats and it contains its own).
+        let bstyle = Style {
+            display: Display::Block,
+            float: FloatSide::None,
+            position: Position::Static,
+            establishes_bfc: true,
+            ..st.clone()
+        };
+
+        // Width resolution. An explicit `width` wins. A replaced float
+        // (`<img>`/`<svg>`) uses its intrinsic width (its `width` attribute, or
+        // the same 64pt default as the inline path) — its content has no
+        // measurable text run. Otherwise the float is **shrink-to-fit**: it sizes
+        // to its content's max-content width, clamped to the available width.
         let box_w = match st.width {
             Some(Len::Pt(w)) => w,
             Some(Len::Percent(pc)) => avail_w * pc / 100.0,
-            None => (avail_w / 3.0).max(1.0),
+            None if is_replaced(el) => intrinsic_replaced_width(el),
+            None => self.measure_float_max_content(el, &bstyle, x, y, ancestors, avail_w),
         }
-        .min(avail_w);
+        .min(avail_w)
+        .max(1.0);
 
         // Existing same-side floats overlapping `y` stack inward.
         let (l_in, r_in) = self.floats.insets(y, 1.0);
@@ -1098,12 +1261,6 @@ impl Flow<'_> {
         };
 
         let start = self.out.len();
-        let bstyle = Style {
-            display: Display::Block,
-            float: FloatSide::None,
-            position: Position::Static,
-            ..st.clone()
-        };
         let bottom_y = self.block(el, &bstyle, st, box_x, box_w, y, ancestors, 0);
 
         if st.z_index != 0 {
@@ -1115,6 +1272,58 @@ impl Flow<'_> {
             bottom: bottom_y.max(y + 0.1),
             width: box_w,
         });
+    }
+
+    /// Intrinsic **max-content** width of a (non-replaced) float's content, for
+    /// shrink-to-fit sizing. Lays the float's block content out into `self.out`
+    /// at a very large available width (so nothing wraps), measures the widest
+    /// fragment right edge relative to the layout origin `x`, then **discards**
+    /// those fragments (truncating `self.out` back to the saved length). The
+    /// returned width is unclamped; the caller clamps it to the available width.
+    ///
+    /// The throwaway pass runs at the float's real `y` and origin `x` so the
+    /// measured extent is content-relative; the box's `position`/`float` are
+    /// already neutralised in `bstyle`, and `bstyle` establishes a BFC so this
+    /// pass also runs in an isolated float context.
+    fn measure_float_max_content(
+        &mut self,
+        el: &Element,
+        bstyle: &Style,
+        x: f64,
+        y: f64,
+        ancestors: &[&Element],
+        avail_w: f64,
+    ) -> f64 {
+        // A band wide enough that intrinsic content never wraps. Bounded so a
+        // pathological style can't overflow arithmetic.
+        const HUGE_W: f64 = 1.0e6;
+        let probe = self.out.len();
+        // Lay the content out at the origin with effectively-infinite width.
+        self.block(el, bstyle, bstyle, x, HUGE_W, y, ancestors, 0);
+        // Widest right edge among the **content** fragments (text / images),
+        // minus the origin. Box decorations (background fills, borders, gradients)
+        // are skipped: laid at the huge band, a block's own full-width background
+        // would otherwise read as the max-content width. Content fragments start
+        // at the inner content edge (`x + border-left + padding-left`), so their
+        // extent already accounts for the left padding/border.
+        let content_right = self.out[probe..]
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.frag,
+                    Fragment::Text { .. } | Fragment::Image { .. } | Fragment::Svg { .. }
+                )
+            })
+            .map(|a| fragment_right(&a.frag, self.m))
+            .fold(x, f64::max);
+        // Discard the throwaway fragments; the real layout re-runs at the
+        // clamped width. (A float establishes a BFC, so no float was registered
+        // on `self.floats` by this pass.)
+        self.out.truncate(probe);
+        // The used box width adds the right padding/border (the left side is
+        // already in `content_right`).
+        let box_w = (content_right - x) + bstyle.padding.right + bstyle.border_width.right;
+        box_w.clamp(1.0, avail_w.max(1.0)).min(HUGE_W)
     }
 
     /// Lay out an inline run, applying the active floats so lines wrap around
@@ -1358,6 +1567,10 @@ impl Flow<'_> {
             content_w,
             cy,
             &new_ancestors,
+            // Whether this block isolates its children's floats. A plain in-flow
+            // block does not (its floats flow to the parent's following siblings
+            // and reach this block's own line boxes); a BFC block does.
+            establishes_bfc(style),
         );
         self.flow_cb = saved_flow_cb;
 
@@ -2062,6 +2275,7 @@ impl Flow<'_> {
                     (cw - p.left - p.right).max(1.0),
                     content_top,
                     &nca,
+                    true, // each column is its own block formatting context
                 );
                 let frag_hi = self.out.len();
                 cy += p.bottom;
@@ -2919,6 +3133,7 @@ impl Flow<'_> {
                 (ws[i] - ip.left - ip.right - ib.left - ib.right).max(1.0),
                 row_top + ip.top + ib.top,
                 &nca,
+                true, // a flex item establishes a block formatting context
             );
             let item_h = (cy + ip.bottom + ib.bottom - row_top).max(0.0);
             heights.push(item_h);
@@ -3029,6 +3244,7 @@ impl Flow<'_> {
                 inner_w,
                 item_top + ip.top + ib.top,
                 &nca,
+                true, // a grid item establishes a block formatting context
             );
             let content_h = (cy + ip.bottom + ib.bottom - item_top).max(0.0);
             // The main-axis basis: `flex-basis`, else a definite `height`. `%`
@@ -3239,6 +3455,7 @@ impl Flow<'_> {
                     (cw - ip.left - ip.right - ib.left - ib.right).max(1.0),
                     row_top + ip.top + ib.top,
                     &nca,
+                    true, // a table cell establishes a block formatting context
                 );
                 row_bottom = row_bottom.max(cy + ip.bottom + ib.bottom);
             }
@@ -3268,6 +3485,7 @@ impl Flow<'_> {
                 (cw - ip.left - ip.right - ib.left - ib.right).max(1.0),
                 top + ip.top + ib.top,
                 &nca,
+                true, // a table cell establishes a block formatting context
             );
             span_ranges.push((span_out_start, self.out.len(), cell.row));
             let needed = cy + ip.bottom + ib.bottom;
@@ -5502,6 +5720,133 @@ mod tests {
             "clear:both drops below a right float (cleared={}, baseline={})",
             y_of(&cleared),
             y_of(&not_cleared)
+        );
+    }
+
+    // Smallest background rect with a fill within `tol` of `want` (the float box
+    // in the float tests carries a distinctive fill so we can read its width/x).
+    fn smallest_filled_rect(layout: &Layout, want: [f64; 3]) -> (f64, f64, f64, f64) {
+        let tol = 0.05;
+        rects(layout)
+            .into_iter()
+            .filter(|(.., fill)| {
+                fill.is_some_and(|c| (0..3).all(|i| (c[i] - want[i]).abs() < tol))
+            })
+            .map(|(x, y, w, h, _)| (x, y, w, h))
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+            .expect("a background rect with the wanted fill")
+    }
+
+    #[test]
+    fn float_without_width_shrinks_to_content() {
+        // A `float:left` with no explicit `width` must size to its content's
+        // max-content width, NOT the legacy `avail_w / 3` (= 540/3 = 180pt).
+        // "Hi" is 2 chars ≈ 2 × 8pt = 16pt under AverageMeasure (16pt / 0.5em).
+        // A grey background makes the float's own box rect findable.
+        let layout = run(
+            r#"<div style="float:left;background:#cccccc">Hi</div><p>beside the float</p>"#,
+        );
+        let (_, _, fw, _) = smallest_filled_rect(&layout, [0.8, 0.8, 0.8]);
+        assert!(
+            fw > 8.0 && fw < 80.0,
+            "shrink-to-fit float sizes to its ~16pt content, not avail/3=180 ({fw})"
+        );
+        // The text that wraps beside it therefore starts close to the left edge
+        // (content origin 36 + ~16 float), far left of the old 36 + 180.
+        let beside_x = text_xy(&layout)
+            .into_iter()
+            .find(|(_, _, s)| s == "beside")
+            .expect("the wrapping word")
+            .0;
+        assert!(
+            beside_x < 120.0,
+            "text wraps just past the narrow float, not past a 180pt box ({beside_x})"
+        );
+    }
+
+    #[test]
+    fn float_uses_intrinsic_width_for_replaced() {
+        // A floated `<img width=40>` keeps its intrinsic 40pt width (replaced
+        // content is not shrink-to-fit measured). With explicit `width=120` it
+        // reserves a wider band. We read the band width through where the wrapping
+        // text starts (content origin 36 + the float width).
+        let narrow = run(
+            r#"<img src="a.png" width="40" height="20" style="float:left"><p>beside</p>"#,
+        );
+        let wide = run(
+            r#"<img src="a.png" width="120" height="20" style="float:left"><p>beside</p>"#,
+        );
+        let beside_x = |l: &Layout| {
+            text_xy(l)
+                .into_iter()
+                .find(|(_, _, s)| s == "beside")
+                .expect("the wrapping word")
+                .0
+        };
+        let xn = beside_x(&narrow);
+        let xw = beside_x(&wide);
+        assert!(
+            (xn - (36.0 + 40.0)).abs() < 6.0,
+            "text wraps past the intrinsic 40pt image float (≈76, got {xn})"
+        );
+        assert!(
+            (xw - (36.0 + 120.0)).abs() < 6.0,
+            "a wider replaced float reserves its intrinsic 120pt (≈156, got {xw})"
+        );
+    }
+
+    #[test]
+    fn block_sibling_wraps_beside_a_float_then_clears_below() {
+        // A left float (80pt) followed by a normal block, then a `clear:left`
+        // block. The middle block's *box* must sit beside the float (x shifted
+        // right by ~80, width reduced); the cleared block drops below the float.
+        let layout = run(
+            r#"<div>
+                 <div style="float:left;width:80pt">F</div>
+                 <div style="background:#eeeeee">B</div>
+                 <div style="clear:left;background:#cccccc">C</div>
+               </div>"#,
+        );
+        // Content origin is the 36pt page margin.
+        let (bx, by, bw, _) = smallest_filled_rect(&layout, [0.9333, 0.9333, 0.9333]);
+        assert!(
+            (bx - (36.0 + 80.0)).abs() < 4.0,
+            "block sibling B starts beside the 80pt float (x≈116, got {bx})"
+        );
+        assert!(
+            bw < 540.0 - 70.0,
+            "block sibling B's width is reduced by the float inset ({bw})"
+        );
+        let (_, cy, ..) = smallest_filled_rect(&layout, [0.8, 0.8, 0.8]);
+        assert!(
+            cy > by + 5.0,
+            "the clear:left block C drops below the float, under B (cy={cy}, by={by})"
+        );
+    }
+
+    #[test]
+    fn float_affects_next_in_flow_sibling_container_but_not_a_bfc() {
+        // (c) A float inside an in-flow block container still narrows a *following
+        // sibling container's* content (same formatting context). But when the
+        // float's container is a NEW block formatting context (`overflow:hidden`),
+        // the float is contained and the sibling is full width.
+        let shared = run(
+            r#"<div><div style="float:left;width:80pt">F</div></div>
+               <p style="background:#eeeeee">After</p>"#,
+        );
+        let bfc = run(
+            r#"<div style="overflow:hidden"><div style="float:left;width:80pt">F</div></div>
+               <p style="background:#eeeeee">After</p>"#,
+        );
+        let x_shared = smallest_filled_rect(&shared, [0.9333, 0.9333, 0.9333]).0;
+        let x_bfc = smallest_filled_rect(&bfc, [0.9333, 0.9333, 0.9333]).0;
+        assert!(
+            x_shared > 36.0 + 40.0,
+            "float persists to the next in-flow sibling, shifting 'After' right ({x_shared})"
+        );
+        assert!(
+            (x_bfc - 36.0).abs() < 4.0,
+            "an overflow:hidden BFC contains the float, so 'After' is full width ({x_bfc})"
         );
     }
 
