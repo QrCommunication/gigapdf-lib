@@ -17,7 +17,9 @@ use super::css::{
     RadialGradient, Style, Stylesheet,
 };
 use super::dom::{self, Element, Node};
-use super::layout::{layout_document_framed, Fragment, Frame, Layout, Measure};
+use super::layout::{
+    fragment_bbox, layout_document_framed, shift_fragment, Fragment, Frame, Layout, Measure,
+};
 use super::page::{substitute_tokens, Margins, RenderOptions};
 
 /// A font the host must download (resolved against the Google-Fonts catalogue).
@@ -437,6 +439,7 @@ fn layout_band(
             Fragment::Svg { y, h, .. } => y + h,
             Fragment::Border { y, h, .. } => y + h,
             Fragment::Gradient { y, h, .. } => y + h,
+            Fragment::Clipped { inner, .. } => fragment_bbox(inner).3,
         };
         m.max(bottom)
     });
@@ -448,9 +451,16 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
     frags
         .into_iter()
         .map(|f| match f {
-            Fragment::Text { x, y, style, text } => Fragment::Text {
+            Fragment::Text {
+                x,
+                y,
+                w,
+                style,
+                text,
+            } => Fragment::Text {
                 x,
                 y: y + dy,
+                w,
                 style,
                 text,
             },
@@ -529,6 +539,12 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 gradient,
                 opacity,
             },
+            clipped @ Fragment::Clipped { .. } => {
+                // Move the clip window and its content together.
+                let mut moved = clipped;
+                shift_fragment(&mut moved, 0.0, dy);
+                moved
+            }
         })
         .collect()
 }
@@ -600,7 +616,20 @@ fn paint(
     // Paint one fragment list onto a page (shared by body, header and footer).
     let paint_frags = |doc: &mut Document, page: u32, frags: &[Fragment]| {
         for frag in frags {
-            match frag {
+            // Unwrap nested `Clipped` layers: emit one `q … re W n` per clip
+            // (flip Y to PDF user-space), paint the inner fragment, then balance
+            // with one `Q` per clip. Nested clips intersect — `overflow` boxes
+            // nest. A bare fragment leaves `clips` empty ⇒ byte-identical output.
+            let mut clips: Vec<[f64; 4]> = Vec::new();
+            let mut real = frag;
+            while let Fragment::Clipped { rect, inner } = real {
+                clips.push(*rect);
+                real = inner;
+            }
+            for r in &clips {
+                let _ = doc.push_clip_rect(page, r[0], page_h - r[1] - r[3], r[2], r[3]);
+            }
+            match real {
                 Fragment::Rect {
                     x,
                     y,
@@ -661,7 +690,9 @@ fn paint(
                         );
                     }
                 }
-                Fragment::Text { x, y, style, text } => {
+                Fragment::Text {
+                    x, y, style, text, ..
+                } => {
                     if style.hidden {
                         continue; // `visibility: hidden` — occupies space, no ink
                     }
@@ -865,6 +896,11 @@ fn paint(
                 } => {
                     paint_css_gradient(doc, page, page_h, *x, *y, *w, *h, gradient, *opacity);
                 }
+                // Unwrapped above into `clips` + `real`; never a `Clipped` here.
+                Fragment::Clipped { .. } => {}
+            }
+            for _ in &clips {
+                let _ = doc.restore_graphics(page);
             }
         }
     };
@@ -2033,9 +2069,10 @@ mod tests {
     #[test]
     fn rounded_box_emits_bezier_curves() {
         // A rounded background must produce real Bézier corner arcs (`c` ops) —
-        // the rounded contour the fill follows. (PDF clipping `W n` is NOT used:
-        // the HTML paint layer has no clip primitive, so the fill itself follows
-        // the rounded path — see the module docs / box-decoration helper.)
+        // the rounded contour the fill follows. (A rounded *fill* follows the
+        // path itself rather than a `W n` clip; the `W n` clip primitive is used
+        // only to realise `overflow: hidden|clip` — see the box-decoration helper
+        // and `overflow_hidden_emits_a_real_clip_for_straddling_content`.)
         let content = page1_content(
             r#"<div style="background:#3366cc;border-radius:12pt;padding:10pt">x</div>"#,
         );
@@ -2046,6 +2083,48 @@ mod tests {
         );
         // The fill colour is painted (the blue background) and the path is filled.
         assert!(content.contains("0.2 0.4 0.8 rg"), "blue fill set");
+    }
+
+    #[test]
+    fn overflow_hidden_emits_a_real_clip_for_straddling_content() {
+        // Every `overflow: hidden` box whose content straddles an edge must emit a
+        // real `q … re W n … Q` clip. Three independent overflow vectors:
+
+        // (1) Horizontal — a child wider than the box (explicit `width`).
+        let horizontal = page1_content(
+            r#"<div style="overflow:hidden;width:50pt"><div style="width:300pt;height:30pt;background:#888888"></div></div>"#,
+        );
+        assert!(
+            horizontal.contains("W n"),
+            "horizontal overflow clips\n{horizontal}"
+        );
+
+        // (2) Vertical — a definite `height` shorter than the content. `height` is
+        // now definite (caps the box), not a min-height that would just grow it.
+        let vertical = page1_content(
+            r#"<div style="overflow:hidden;height:20pt"><div style="height:200pt;background:#888888">x</div></div>"#,
+        );
+        assert!(
+            vertical.contains("W n"),
+            "vertical overflow clips\n{vertical}"
+        );
+
+        // (3) Text — a no-wrap run wider than the box. Text runs now carry a real
+        // advance width, so an overflowing run registers as straddling.
+        let text = page1_content(
+            r#"<div style="overflow:hidden;width:30pt;white-space:nowrap">wwwwwwwwwwwwwwwwwwww</div>"#,
+        );
+        assert!(text.contains("W n"), "text overflow clips\n{text}");
+
+        // Control — the horizontal box WITHOUT overflow:hidden emits no clip, so
+        // the `W n` above is the overflow clip, not an always-on artifact.
+        let unclipped = page1_content(
+            r#"<div style="width:50pt"><div style="width:300pt;height:30pt;background:#888888"></div></div>"#,
+        );
+        assert!(
+            !unclipped.contains("W n"),
+            "no overflow ⇒ no clip\n{unclipped}"
+        );
     }
 
     #[test]

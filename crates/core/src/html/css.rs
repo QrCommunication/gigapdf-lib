@@ -409,8 +409,13 @@ pub struct Style {
     /// `min-width` / `max-width` clamps on the box width.
     pub min_width: Option<Len>,
     pub max_width: Option<Len>,
-    /// `height` / `min-height` — a minimum block height in points.
+    /// `min-height` — a minimum block height in points (the box still grows
+    /// with content; this is only a floor).
     pub min_height: Option<f64>,
+    /// `height` — a *definite* block height in points. Unlike `min-height` the
+    /// box does **not** grow past it: taller content overflows (and is clipped
+    /// when `overflow: hidden|clip`). Floored by `min_height` when both are set.
+    pub height: Option<f64>,
     /// `box-sizing: border-box` — `width` includes padding + border.
     pub border_box: bool,
     // ── positioning (not inherited) ──
@@ -648,6 +653,7 @@ impl Default for Style {
             min_width: None,
             max_width: None,
             min_height: None,
+            height: None,
             border_box: false,
             position: Position::Static,
             inset: [None; 4],
@@ -1403,6 +1409,7 @@ fn inherit(parent: &Style) -> Style {
         min_width: None,
         max_width: None,
         min_height: None,
+        height: None,
         border_box: false,
         position: Position::Static,
         inset: [None; 4],
@@ -2505,8 +2512,13 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
         }
         "min-width" => style.min_width = parse_len(v, style.font_size),
         "max-width" => style.max_width = parse_len(v, style.font_size),
-        "height" | "min-height" => {
+        "min-height" => {
             style.min_height = parse_len_px(v, style.font_size);
+        }
+        "height" => {
+            // Definite height: caps the box (content overflows) rather than just
+            // flooring it like `min-height`.
+            style.height = parse_len_px(v, style.font_size);
         }
         "box-sizing" => style.border_box = v == "border-box",
         "text-transform" => {

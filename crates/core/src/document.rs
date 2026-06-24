@@ -8768,6 +8768,28 @@ impl Document {
         self.set_page_content(page_no, content)
     }
 
+    /// Append a rectangular clip to the page: `q` (save graphics state) + the
+    /// rectangle + `W n` (intersect the clip path, no fill). Pair with
+    /// [`Self::restore_graphics`] after the clipped content. `(x, y, w, h)` are
+    /// PDF user-space (bottom-up) — the caller flips from top-down. This lets the
+    /// HTML paint layer realise `overflow: hidden|clip` as a real clip
+    /// (ISO 32000-1 §8.5.4), so content straddling the box edge is actually cut.
+    pub fn push_clip_rect(&mut self, page_no: u32, x: f64, y: f64, w: f64, h: f64) -> Result<()> {
+        let ops = format!(
+            "q\n{} {} {} {} re\nW n\n",
+            content::num(x),
+            content::num(y),
+            content::num(w),
+            content::num(h),
+        );
+        self.append_page_content(page_no, ops.as_bytes())
+    }
+
+    /// Append `Q` (restore graphics state) — undo a prior [`Self::push_clip_rect`].
+    pub fn restore_graphics(&mut self, page_no: u32) -> Result<()> {
+        self.append_page_content(page_no, b"Q\n")
+    }
+
     /// Wrap `ops` in a `q /Gs gs … Q` block applying `opacity` (fill + stroke
     /// alpha) through an `/ExtGState`, or return `ops` unchanged when fully
     /// opaque. The outer graphics-state nesting lets the alpha reach the inner

@@ -32,6 +32,11 @@ pub enum Fragment {
     Text {
         x: f64,
         y: f64,
+        /// Measured advance width of the run in points. Gives the run a real
+        /// horizontal extent so `overflow: hidden|clip` can cut text that
+        /// straddles a box edge (without it a run would be a zero-width point and
+        /// never register as overflowing).
+        w: f64,
         style: Style,
         text: String,
     },
@@ -105,6 +110,34 @@ pub enum Fragment {
         gradient: CssGradient,
         opacity: f64,
     },
+    /// `inner` clipped to `rect` (`[x, y, w, h]`, top-down) — the painter wraps
+    /// it in `q … re W n … Q`, so content straddling an `overflow: hidden|clip`
+    /// box edge is actually cut (ISO 32000-1 §8.5.4). Nesting (`Clipped` inside
+    /// `Clipped`) intersects the clips.
+    Clipped {
+        rect: [f64; 4],
+        inner: Box<Fragment>,
+    },
+}
+
+impl Fragment {
+    /// A throwaway zero-area fragment, used only as a `mem::replace` placeholder
+    /// while re-wrapping a fragment in [`Fragment::Clipped`] (never painted).
+    fn placeholder() -> Fragment {
+        Fragment::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+            fill: None,
+            stroke: None,
+            stroke_w: 0.0,
+            opacity: 0.0,
+            radius: [0.0; 4],
+            radius_v: [0.0; 4],
+            shadow: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -384,11 +417,25 @@ impl Flow<'_> {
         let ry0 = rect.y;
         let rx1 = rect.x + rect.w;
         let ry1 = rect.y + rect.h;
+        let clip = [rect.x, rect.y, rect.w, rect.h];
         let mut i = start;
         while i < self.out.len() {
-            if fragment_outside(&self.out[i].frag, rx0, ry0, rx1, ry1) {
+            let frag = &self.out[i].frag;
+            if fragment_outside(frag, rx0, ry0, rx1, ry1) {
+                // Fully outside the box ⇒ drop it (cheaper than clipping to empty).
                 self.out.remove(i);
+            } else if fragment_inside(frag, rx0, ry0, rx1, ry1) {
+                // Fully inside ⇒ no clip needed; leave the bytes untouched.
+                i += 1;
             } else {
+                // Straddles an edge ⇒ wrap in `Clipped` so the painter emits a
+                // real `W n` clip. Wrapping an already-`Clipped` fragment nests
+                // the clips, which the painter intersects (handles nested boxes).
+                let inner = std::mem::replace(&mut self.out[i].frag, Fragment::placeholder());
+                self.out[i].frag = Fragment::Clipped {
+                    rect: clip,
+                    inner: Box::new(inner),
+                };
                 i += 1;
             }
         }
@@ -396,7 +443,7 @@ impl Flow<'_> {
 }
 
 /// Translate one fragment by `(dx, dy)` in place.
-fn shift_fragment(frag: &mut Fragment, dx: f64, dy: f64) {
+pub(crate) fn shift_fragment(frag: &mut Fragment, dx: f64, dy: f64) {
     match frag {
         Fragment::Text { x, y, .. }
         | Fragment::Rect { x, y, .. }
@@ -407,22 +454,45 @@ fn shift_fragment(frag: &mut Fragment, dx: f64, dy: f64) {
             *x += dx;
             *y += dy;
         }
+        Fragment::Clipped { rect, inner } => {
+            // Move both the clip window and the clipped content together, so a
+            // relatively-positioned subtree keeps its clip aligned.
+            rect[0] += dx;
+            rect[1] += dy;
+            shift_fragment(inner, dx, dy);
+        }
     }
 }
 
 /// True if a fragment's bounding box lies entirely outside `[x0,x1)×[y0,y1)`.
 /// Text height is approximated from its font size.
 fn fragment_outside(frag: &Fragment, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
-    let (fx0, fy0, fx1, fy1) = match frag {
-        Fragment::Text { x, y, style, .. } => (*x, *y, *x, *y + style.font_size),
+    let (fx0, fy0, fx1, fy1) = fragment_bbox(frag);
+    // No overlap with the clip rect on either axis ⇒ fully outside.
+    fx1 < x0 || fx0 > x1 || fy1 < y0 || fy0 > y1
+}
+
+/// True when `frag` lies entirely within the rect — such a fragment needs no
+/// real clip (it is already inside the `overflow` box), so `clip_range` leaves
+/// it bare and only wraps the ones straddling an edge.
+fn fragment_inside(frag: &Fragment, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    let (fx0, fy0, fx1, fy1) = fragment_bbox(frag);
+    fx0 >= x0 && fx1 <= x1 && fy0 >= y0 && fy1 <= y1
+}
+
+/// The fragment's axis-aligned bounding box `(x0, y0, x1, y1)` in top-down
+/// points. A `Text` run is a thin vertical extent (the existing convention); a
+/// `Clipped` fragment reports its inner box (the clip only shrinks it).
+pub(crate) fn fragment_bbox(frag: &Fragment) -> (f64, f64, f64, f64) {
+    match frag {
+        Fragment::Text { x, y, w, style, .. } => (*x, *y, *x + *w, *y + style.font_size),
         Fragment::Rect { x, y, w, h, .. }
         | Fragment::Image { x, y, w, h, .. }
         | Fragment::Svg { x, y, w, h, .. }
         | Fragment::Border { x, y, w, h, .. }
         | Fragment::Gradient { x, y, w, h, .. } => (*x, *y, *x + *w, *y + *h),
-    };
-    // No overlap with the clip rect on either axis ⇒ fully outside.
-    fx1 < x0 || fx0 > x1 || fy1 < y0 || fy0 > y1
+        Fragment::Clipped { inner, .. } => fragment_bbox(inner),
+    }
 }
 
 /// An atomic inline item for line breaking.
@@ -987,6 +1057,7 @@ impl Flow<'_> {
                 frag: Fragment::Text {
                     x: lx,
                     y: ly,
+                    w: tw,
                     style: lstyle,
                     text: label.text.clone(),
                 },
@@ -1095,6 +1166,7 @@ impl Flow<'_> {
                     frag: Fragment::Text {
                         x: content_x - mw - 4.0,
                         y: cy,
+                        w: mw,
                         style: mstyle,
                         text: marker,
                     },
@@ -1112,7 +1184,7 @@ impl Flow<'_> {
                 x: content_x,
                 y: cy,
                 w: content_w,
-                h: style.min_height.unwrap_or(self.cb.h),
+                h: style.height.or(style.min_height).unwrap_or(self.cb.h),
             };
         }
         // This block is the enclosing block container for its children: record
@@ -1125,7 +1197,8 @@ impl Flow<'_> {
             y: cy,
             w: content_w,
             h: style
-                .min_height
+                .height
+                .or(style.min_height)
                 .unwrap_or((self.page_h - self.bottom - cy).max(1.0)),
         };
         let children_start = self.out.len();
@@ -1140,9 +1213,12 @@ impl Flow<'_> {
         self.flow_cb = saved_flow_cb;
 
         cy += p.bottom + b.bottom;
-        let mut box_h = (cy - box_top).max(0.1);
+        // A definite `height` caps the box (content overflows — and is clipped
+        // under `overflow: hidden`); without it the box grows to its content.
+        // `min-height` is only a floor on whichever applies.
+        let mut box_h = style.height.unwrap_or((cy - box_top).max(0.1));
         if let Some(mh) = style.min_height {
-            box_h = box_h.max(mh); // `height` / `min-height`
+            box_h = box_h.max(mh);
         }
 
         // `overflow: hidden|clip` — cull descendant fragments outside the
@@ -1446,6 +1522,7 @@ impl Flow<'_> {
                         frag: Fragment::Text {
                             x: cx,
                             y: *y + w.style.valign_shift,
+                            w: w.w,
                             style: w.style.clone(),
                             text: w.text.clone(),
                         },
@@ -1543,6 +1620,7 @@ impl Flow<'_> {
                         frag: Fragment::Text {
                             x,
                             y: *y + w.style.valign_shift,
+                            w: w.w,
                             style: w.style.clone(),
                             text: w.text.clone(),
                         },
@@ -2658,7 +2736,7 @@ impl Flow<'_> {
 
         // Block-axis `justify-content`: only meaningful with an explicit
         // container height that exceeds the content. Distribute the free space.
-        if let Some(h) = style.min_height {
+        if let Some(h) = style.height.or(style.min_height) {
             let used = y - row_top;
             let free = h - used;
             if free > 0.01 && !items.is_empty() {
@@ -3047,7 +3125,9 @@ impl Flow<'_> {
             max_bottom = max_bottom.max(col_y);
         }
 
-        let mut box_h = (max_bottom + p.bottom + b.bottom - box_top).max(0.1);
+        let mut box_h = style
+            .height
+            .unwrap_or((max_bottom + p.bottom + b.bottom - box_top).max(0.1));
         if let Some(mh) = style.min_height {
             box_h = box_h.max(mh);
         }
@@ -3711,12 +3791,19 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
 
     for a in frags {
         match a.frag {
-            Fragment::Text { x, y, style, text } => {
+            Fragment::Text {
+                x,
+                y,
+                w,
+                style,
+                text,
+            } => {
                 let p = page_of(y);
                 ensure(&mut pages, p);
                 pages[p].push(Fragment::Text {
                     x,
                     y: local_y(y, p),
+                    w,
                     style,
                     text,
                 });
@@ -3843,6 +3930,17 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                     gradient,
                     opacity,
                 });
+            }
+            Fragment::Clipped { rect, inner } => {
+                // Like Text/Image: the clipped content keeps to one page band
+                // (assigned by its top); move the clip window and content into
+                // that page's local coordinates together.
+                let (_, fy0, _, _) = fragment_bbox(&inner);
+                let p = page_of(fy0);
+                ensure(&mut pages, p);
+                let mut moved = Fragment::Clipped { rect, inner };
+                shift_fragment(&mut moved, 0.0, local_y(fy0, p) - fy0);
+                pages[p].push(moved);
             }
         }
     }

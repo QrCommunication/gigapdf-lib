@@ -44,6 +44,15 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.86.0] - 2026-06-24
+
+HTML/CSS renderer: `overflow: hidden`/`clip` now emit a **real PDF clip** (text,
+images, backgrounds, gradients straddling an edge are pixel-clipped; nested boxes
+intersect). `height` is now a **definite** height (content overflows + is clipped)
+instead of a `min-height` alias; text runs carry their width so overflowing text
+is clipped too. HTML→PDF path only — no SDK signature change
+([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) item A).
+
 ## [0.85.4] - 2026-06-24
 
 HTML/CSS renderer: `flex-direction: row-reverse` / `column-reverse` now run the

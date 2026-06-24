@@ -7,6 +7,25 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.86.0] - 2026-06-24
+
+HTML/CSS renderer — real `overflow` clipping ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).
+
+### Added
+
+- **`overflow: hidden` / `clip` now emit a real PDF clip** (`q … re W n … Q`)
+  instead of whole-fragment culling only. Content straddling a box edge — text,
+  images, backgrounds, gradients — is pixel-clipped to the padding box; nested
+  clipping boxes intersect. New `Fragment::Clipped` carries the clip through
+  pagination and band offsetting; new public `Document::push_clip_rect` /
+  `Document::restore_graphics` emit the clip ops.
+- **Definite `height`.** `height` is now a definite box height (taller content
+  overflows, and is clipped under `overflow: hidden`) rather than an alias of
+  `min-height`. `min-height` remains a pure floor; both compose.
+- **Text runs carry their advance width** (`Fragment::Text.w`), so horizontally
+  overflowing text registers as straddling and is clipped (previously a run was a
+  zero-width point and never clipped).
+
 ## [0.85.4] - 2026-06-24
 
 HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item A).

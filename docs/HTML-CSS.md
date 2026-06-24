@@ -177,7 +177,8 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `padding-top/-right/-bottom/-left` | length | |
 | `width` | length or `%` | `%` is relative to the containing block |
 | `min-width` / `max-width` | length or `%` | clamp the resolved box width |
-| `height` / `min-height` | length | minimum box height — content can still grow it |
+| `height` | length | **definite** box height — taller content overflows (and is clipped under `overflow: hidden`); floored by `min-height` |
+| `min-height` | length | a floor only — the box still grows with its content |
 | `box-sizing` | `content-box` (default), `border-box` | `border-box` makes `width` include padding + border |
 
 ### Borders
@@ -200,7 +201,7 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `position` | `static`, `relative`, `absolute`, `fixed`, `sticky` | `relative` shifts by `inset`; `absolute` is placed by `inset` against the nearest positioned ancestor; `fixed` against the page box; `sticky` is treated as `relative` (no scroll model) |
 | `top` / `right` / `bottom` / `left` | length or `%` | offsets for positioned boxes (`%` of the containing block) |
 | `z-index` | integer | paint order among positioned boxes |
-| `overflow` | `visible`, `hidden`, `clip` | **fragment-level** culling only — a box fully outside its container is dropped; partially-overlapping content is **not** pixel-clipped |
+| `overflow` | `visible`, `hidden`, `clip` | `hidden`/`clip` emit a **real PDF clip** (`q … re W n … Q`): fragments fully outside the padding box are dropped, those straddling an edge are pixel-clipped to it (text, images, backgrounds, gradients — text runs carry their advance width). Nested clipping boxes intersect |
 | `opacity` | `0`–`1` | alpha on the element's background, borders and text (inherited) |
 | `visibility` | `visible`, `hidden` | `hidden` keeps the box's space but paints nothing |
 
@@ -415,11 +416,10 @@ following are out of scope; unknown properties and elements never error — they
 simply skipped — so a richer stylesheet degrades gracefully to the supported
 subset.
 
-- **Layout/sizing**: `aspect-ratio`, real `overflow` pixel-clipping (only
-  whole-fragment culling — see [overflow](#display--positioning)), a true scroll
-  model for `position: sticky`. `grid-template-areas` / named grid lines and
-  `grid-template-rows` with `fr`/`%`/`auto` (use fixed `pt` rows or numeric
-  placement). `flex-shrink` / `flex-basis` on the **column** axis.
+- **Layout/sizing**: `aspect-ratio`, a true scroll model for `position: sticky`.
+  `grid-template-areas` / named grid lines and `grid-template-rows` with
+  `fr`/`%`/`auto` (use fixed `pt` rows or numeric placement). `flex-shrink` /
+  `flex-basis` on the **column** axis.
 - **Visual effects**: `transform`, `filter`, `text-shadow`, `box-shadow: inset`
   and true Gaussian blur, `background-image: url()` raster (use `<img>`),
   CSS tiling patterns. (Gradients, rounded corners and offset/spread shadows
