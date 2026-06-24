@@ -6452,12 +6452,23 @@ impl Document {
         crate::convert::reverse::to_rtf(&paragraphs)
     }
 
-    /// Re-serialize the document with PDF/A-2b archival metadata: an XMP
-    /// identification packet, an sRGB `OutputIntent` (embedded ICC profile) and a
-    /// trailer `/ID`. **Note:** full PDF/A conformance also requires every font to
-    /// be embedded; embed non-embedded fonts via [`needed_fonts`](Self::needed_fonts)
-    /// and [`embed_truetype_font`](Self::embed_truetype_font) first for a
-    /// validator-clean result.
+    /// Re-serialize the document for PDF/A-2b archival output. This adds the
+    /// structural metadata — an XMP identification packet, an sRGB `OutputIntent`
+    /// (embedded ICC profile) and a trailer `/ID` (ISO 19005-2 §6.1.3) — and
+    /// normalises the graphics-state / appearance constructs the standard forbids:
+    /// it strips `/TR` from `ExtGState` (§6.2.5), drops any incomplete `/CIDSet`
+    /// from CID-font descriptors (§6.2.11.4.2) and reduces annotation `/AP`
+    /// dictionaries to their `/N` entry (§6.3.3). These removals never change the
+    /// rendered page.
+    ///
+    /// **Note:** full PDF/A conformance also requires *every* font to be embedded
+    /// (§6.2.11.4.1). This method does **not** embed missing fonts — there is no
+    /// safe way to embed a font whose program is absent without altering the
+    /// glyphs shown (e.g. a CID-keyed font with an `Identity` `CIDToGIDMap`). For
+    /// a validator-clean result on a document with non-embedded fonts, embed them
+    /// first via [`needed_fonts`](Self::needed_fonts) +
+    /// [`embed_truetype_font`](Self::embed_truetype_font) with the correct font
+    /// bytes.
     pub fn to_pdfa(&self) -> Vec<u8> {
         use crate::object::StringKind::{Hex, Literal};
         let Ok(catalog_id) = self.catalog_id() else {
@@ -6518,6 +6529,11 @@ impl Document {
             let id = Object::String(digest, Hex);
             trailer.set(b"ID", Object::Array(vec![id.clone(), id]));
         }
+
+        // Normalise graphics-state / appearance constructs that ISO 19005-2
+        // forbids (ExtGState /TR, incomplete /CIDSet, /AP alternates). Operates
+        // on the working clone — render output is unchanged.
+        crate::convert::pdfa::sanitize_objects(&mut objects);
 
         crate::serialize::to_pdf(&objects, &trailer)
     }
@@ -15922,6 +15938,21 @@ mod tests {
 
     fn has_op(content: &[u8], op: &[u8]) -> bool {
         content.windows(op.len()).any(|w| w == op)
+    }
+
+    #[test]
+    fn to_pdfa_preserves_trailer_id() {
+        // Regression: `to_pdfa` sets a trailer /ID (required by PDF/A §6.1.3),
+        // but the classic serializer must carry it through — it previously
+        // rebuilt the trailer and dropped /ID, failing veraPDF 6.1.3-1.
+        let pdf = crate::convert::reverse::txt_to_pdf("pdfa id test");
+        let doc = Document::open(&pdf).unwrap();
+        let pdfa = doc.to_pdfa();
+        // The serialized trailer must contain a non-empty /ID array.
+        assert!(has_op(&pdfa, b"/ID"), "PDF/A output must carry a trailer /ID");
+        // And it must still be a readable, single-page PDF.
+        let reopened = Document::open(&pdfa).unwrap();
+        assert!(reopened.page_count() >= 1);
     }
 
     #[test]
