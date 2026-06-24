@@ -1,0 +1,13 @@
+# Python deps for the conformance gate's validate.py (vendored from the
+# document-format-conformance skill). Only the two libraries validate.py
+# actually imports — kept minimal so the CI venv installs fast and reliably.
+#
+#   pikepdf  → second-opinion PDF parser (libqpdf bindings), ISO 32000.
+#   lxml     → XML well-formedness of OPC (.docx/.xlsx/.pptx) and ODF parts,
+#              plus optional XSD/RelaxNG schema validation.
+#
+# PDF/A validation itself is performed by veraPDF (a standalone Java tool, not a
+# Python package) and structural PDF integrity by the qpdf CLI — both installed
+# by run.sh, not from here.
+pikepdf>=9
+lxml>=5

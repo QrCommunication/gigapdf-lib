@@ -1,0 +1,78 @@
+name: Conformance
+
+# Document-format conformance gate: builds the SDK + WASM, generates fixtures
+# from the native engine (PDF, PDF/A 1b/2b/2u/3b, DOCX/XLSX/PPTX, ODT/ODS/ODP)
+# and validates each with REFERENCE validators (veraPDF / qpdf / structural
+# OPC+ODF). Fails if any conformance level regresses — so the engine's archival
+# and Office output never silently drifts out of spec.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  conformance:
+    name: Document conformance (veraPDF / qpdf / OPC / ODF)
+    runs-on: [self-hosted, linux, x64, hetzner, qrcom]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build WASM
+        run: bash sdk/scripts/build-wasm.sh
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: sdk/pnpm-lock.yaml
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: pnpm install --frozen-lockfile
+
+      - name: Build SDK
+        working-directory: sdk
+        run: pnpm build
+
+      - name: Setup Python (for vendored validators)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # qpdf (PDF structure) + xmllint (XML/XSD/RelaxNG) + a JRE for veraPDF.
+      # veraPDF itself is installed headless by run.sh (~/.local/share/verapdf),
+      # mirroring the document-format-conformance skill's installer.
+      - name: Install conformance validators (qpdf, xmllint, JRE)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qpdf libxml2-utils default-jre unzip curl
+
+      - name: Run conformance gate
+        # run.sh: generates fixtures from the SDK, then gates each via
+        # validate.py. Exit 0 only when ALL fixtures are conformant; exit 1 on a
+        # non-conformant fixture; exit 2 if a validator is missing (never passes
+        # vacuously). The vendored validators under scripts/conformance/validators
+        # make this self-contained even when the skill is not on the runner.
+        run: bash scripts/conformance/run.sh
+
+      - name: Upload conformance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-reports
+          path: scripts/conformance/fixtures/*.report.json
+          retention-days: 30
+          if-no-files-found: ignore

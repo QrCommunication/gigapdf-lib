@@ -1,0 +1,14 @@
+# Generated fixtures + validation reports (produced by run.sh / gen-fixtures.mjs).
+fixtures/
+
+# Local Python venv for the vendored validators (created by run.sh fallback path).
+.venv/
+__pycache__/
+*.pyc
+
+# Vendored reference schemas are large and license-restricted — fetched manually
+# per README, never committed. Schema validation is opt-in once these exist.
+schemas/
+
+# NOTE: validators/*.py and validators/requirements.txt ARE committed (the gate's
+# self-contained reference validators). They are intentionally not ignored.
