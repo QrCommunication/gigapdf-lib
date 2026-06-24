@@ -4,6 +4,36 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+PDF/A conformance — the engine's archival export is now validated against
+[veraPDF](https://verapdf.org/) (ISO 19005). A selectable conformance level plus
+two fixes that close the gaps the validator surfaced.
+
+### Added
+
+- **Selectable PDF/A conformance level.** `toPdfA(level?)` accepts `"pdfa-1b"` ·
+  `"pdfa-2b"` (default, backward-compatible) · `"pdfa-2u"` · `"pdfa-3b"`; core
+  `to_pdfa_level(level)` + `PdfaLevel` enum. Level **1b** emits a `%PDF-1.4`
+  header (ISO 19005-1), the others `%PDF-1.7`; **2u** keeps every glyph mapped to
+  Unicode (`/ToUnicode`); **3b** permits embedded files (`/AF`). All four pass
+  veraPDF (`isCompliant = true`).
+- **Conformance CI gate** (`conformance.yml`). Generates fixtures from the SDK
+  and validates them against reference validators only — veraPDF for PDF/A (×4
+  levels), qpdf for PDF, structural OPC/ODF checks for the Office/ODF exports —
+  failing the build on any regression.
+
+### Fixed
+
+- **PDF/A-2b trailer `/ID`** (ISO 19005-2 cl. 6.1.3). `to_pdfa` set a
+  deterministic `/ID`, but `serialize::to_pdf` rebuilt the trailer and dropped
+  it; the classic serializer now preserves `/ID`, matching the compressed and
+  encrypted serializers.
+- **PDF/A appearance & graphics-state sanitization.** On PDF/A export, annotation
+  appearance dictionaries are reduced to `/N` only (cl. 6.3.3), the `/TR`
+  transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
+  `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
+
 ## [0.83.0] - 2026-06-24
 
 Press-ready colour authoring. Resolves
