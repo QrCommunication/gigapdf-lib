@@ -773,9 +773,11 @@ fn paint(
                     let rounded = radius.iter().any(|r| *r > 0.0)
                         || radius_v.iter().any(|r| *r > 0.0);
 
-                    // Drop shadow first (painted behind the box): an offset rect
-                    // grown by `spread`, in the shadow colour, with a soft blurred
-                    // edge. Tracks the box's (possibly elliptical) corners.
+                    // Outset drop shadow first (painted behind the box): the box
+                    // grown by `spread`, offset by `(dx, dy)`, in the shadow colour
+                    // with a true Gaussian blurred edge. Tracks the box's (possibly
+                    // elliptical) corners. Inset shadows are drawn AFTER the fill,
+                    // below, so the box background doesn't cover them.
                     if let Some(sh) = shadow {
                         if !sh.inset {
                             paint_box_shadow(
@@ -816,10 +818,19 @@ fn paint(
                             *opacity,
                         );
                     }
-                    // Inset shadow paints INSIDE the box, over the background.
+                    // Inset shadow last (over the background, under any content). A
+                    // sharp (zero-blur) inset stays a crisp vector frame clipped to
+                    // the box (cheap, recessed look); a blurred inset goes through
+                    // the true Gaussian raster feather, confined to the box interior.
                     if let Some(sh) = shadow {
                         if sh.inset {
-                            paint_inset_box_shadow(doc, page, page_h, *x, *y, *w, *h, sh);
+                            if sh.blur > 0.0 {
+                                paint_box_shadow(
+                                    doc, page, page_h, *x, *y, *w, *h, *radius, *radius_v, sh,
+                                );
+                            } else {
+                                paint_inset_box_shadow(doc, page, page_h, *x, *y, *w, *h, sh);
+                            }
                         }
                     }
                 }
@@ -1243,18 +1254,24 @@ fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: [f64; 4], radius_v:
     d
 }
 
-/// Paint a `box-shadow` behind a box: the box offset by `(dx, dy)` and grown by
-/// `spread` on every side, in the shadow colour, tracking the box's (possibly
-/// elliptical) corners.
+/// Paint a `box-shadow` behind (outset) or inside (inset) a box.
 ///
 /// With **`blur == 0`** this is a single hard filled rect/rounded-path —
-/// byte-for-byte the previous behaviour. With **`blur > 0`** a soft edge is built
-/// without any blur/clip primitive: an opaque inner core (the spread box shrunk
-/// by ~half the blur) plus a stack of concentric rings expanding outward to the
-/// full blur radius, each a low-alpha rect whose overlaps accumulate into a
-/// roughly-Gaussian falloff (a multi-pass box-blur approximation). The summed
-/// peak alpha is held near the legacy single-rect value so existing blurred
-/// shadows don't suddenly darken.
+/// byte-for-byte the previous outset behaviour (kept as the fast path). With
+/// **`blur > 0`** the shadow is a **true Gaussian feather**: the shadow shape
+/// (the box's rounded-rect outline grown by `spread` and offset by `(dx, dy)`)
+/// is rasterised into a single-channel coverage buffer at device resolution,
+/// blurred with a real separable Gaussian (three successive box blurs, sigma =
+/// `blur / 2` per the CSS spec), then placed behind the box as a PDF image whose
+/// constant shadow colour is masked by the blurred alpha (an `/SMask`, wired by
+/// [`Document::add_image`]). The raster is padded by ~3·sigma on every side so
+/// the blur tails fit, and the shape is antialiased so even a zero-spread square
+/// shadow feathers cleanly.
+///
+/// `inset` shadows render the **complement inside the box** (the inner band the
+/// inset offset/spread leaves dark), blurred and clipped to the box interior, so
+/// the soft edge stays within the element — no clip primitive needed because the
+/// coverage buffer itself is confined to the box rectangle.
 #[allow(clippy::too_many_arguments)]
 fn paint_box_shadow(
     doc: &mut Document,
@@ -1268,7 +1285,46 @@ fn paint_box_shadow(
     radius_v: [f64; 4],
     sh: &super::css::BoxShadow,
 ) {
-    // Base shadow box: grow by spread on each side, offset by (dx, dy) (top-down).
+    if sh.blur <= 0.0 && !sh.inset {
+        // Hard outset shadow — unchanged single box at the legacy alpha (1.0): the
+        // box grown by `spread`, offset by `(dx, dy)`, corners tracking the box.
+        paint_hard_outset_shadow(doc, page, page_h, x, y, w, h, radius, radius_v, sh);
+        return;
+    }
+
+    // Soft (or inset) shadow → rasterise a Gaussian-feathered coverage buffer and
+    // place it as a colour-image masked by that alpha. `shadow::box_shadow_png`
+    // returns the device PNG plus the top-down placement rect in points.
+    if let Some(img) = shadow::box_shadow_png(x, y, w, h, radius, radius_v, sh) {
+        // `add_image` takes a PDF bottom-left origin; flip the top-down rect.
+        let _ = doc.add_image(
+            page,
+            &img.png,
+            img.x,
+            page_h - img.y - img.h,
+            img.w,
+            img.h,
+            1.0,
+        );
+    }
+}
+
+/// Emit the legacy hard outset shadow: the box grown by `spread` on every side,
+/// offset by `(dx, dy)`, filled in the shadow colour at full alpha — a square
+/// `re` fill or a rounded-rect path, byte-identical to the pre-Gaussian output.
+#[allow(clippy::too_many_arguments)]
+fn paint_hard_outset_shadow(
+    doc: &mut Document,
+    page: u32,
+    page_h: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: [f64; 4],
+    radius_v: [f64; 4],
+    sh: &super::css::BoxShadow,
+) {
     let sx = x - sh.spread + sh.dx;
     let sy = y - sh.spread + sh.dy;
     let sw = w + 2.0 * sh.spread;
@@ -1287,84 +1343,463 @@ fn paint_box_shadow(
     };
     let rh = grow(radius);
     let rv = grow(radius_v);
+    if rh.iter().any(|v| *v > 0.0) || rv.iter().any(|v| *v > 0.0) {
+        let d = rounded_rect_path(sx, sy, sw, shh, rh, rv);
+        let _ = doc.add_path(page, &d, 0.0, page_h, None, Some(sh.color), 0.0, 1.0);
+    } else {
+        let _ = doc.add_rectangle(
+            page,
+            sx,
+            page_h - sy - shh,
+            sw,
+            shh,
+            None,
+            Some(sh.color),
+            0.0,
+            1.0,
+        );
+    }
+}
 
-    // Emit one filled (rounded or square) shadow box at a given offset rect.
-    let mut fill_box = |bx: f64, by: f64, bw: f64, bh: f64, rh: [f64; 4], rv: [f64; 4], a: f64| {
-        if bw <= 0.0 || bh <= 0.0 {
-            return;
-        }
-        if rh.iter().any(|v| *v > 0.0) || rv.iter().any(|v| *v > 0.0) {
-            let d = rounded_rect_path(bx, by, bw, bh, rh, rv);
-            let _ = doc.add_path(page, &d, 0.0, page_h, None, Some(sh.color), 0.0, a);
-        } else {
-            let _ = doc.add_rectangle(
-                page,
-                bx,
-                page_h - by - bh,
-                bw,
-                bh,
-                None,
-                Some(sh.color),
-                0.0,
-                a,
-            );
-        }
-    };
+/// True Gaussian `box-shadow` feather, rasterised and embedded as a PDF
+/// soft-masked image.
+///
+/// The shadow shape (a rounded rectangle) is sampled into a single-channel
+/// coverage buffer at device resolution, blurred with a real separable Gaussian
+/// (approximated by three successive box blurs — Wronski, *Fast Almost-Gaussian
+/// Filtering* — accurate to <3% of an exact kernel), then exposed as an RGBA PNG
+/// whose colour is constant (the shadow colour) and whose alpha is the blurred
+/// coverage scaled by the shadow's own opacity. The PNG's alpha becomes a PDF
+/// `/SMask` via the engine's existing [`Document::add_image`] path, so the result
+/// is a genuinely blurred drop shadow — not a stack of vector rings.
+///
+/// Zero blur is handled by the caller's fast vector path; this module only runs
+/// for blurred (or inset) shadows.
+mod shadow {
+    use super::super::css::BoxShadow;
 
-    if sh.blur <= 0.0 {
-        // Hard shadow — unchanged single box at the legacy alpha (1.0).
-        fill_box(sx, sy, sw, shh, rh, rv, 1.0);
-        return;
+    /// Device pixels per CSS point for the shadow raster. Shadows are diffuse, so
+    /// 2 px/pt keeps the soft edge crisp at print scale while bounding buffer size
+    /// (a 200×100 pt shadow → ~400×200 px before padding).
+    const SCALE: f64 = 2.0;
+
+    /// CSS maps the `box-shadow` blur radius to a Gaussian `stdDev ≈ blur / 2`.
+    const SIGMA_PER_BLUR: f64 = 0.5;
+
+    /// Pad the raster by this many sigmas on every side so the Gaussian tail (which
+    /// is ~0 beyond 3σ) is fully captured rather than clipped at the buffer edge.
+    const TAIL_SIGMAS: f64 = 3.0;
+
+    /// Upper bound on a raster dimension (device px). A pathological blur/spread is
+    /// clamped rather than allocating an unbounded buffer.
+    const MAX_DIM: usize = 4096;
+
+    /// A finished shadow raster plus its placement, in **top-down points** (the
+    /// same space as a [`super::super::layout::Fragment::Rect`]). The caller flips
+    /// `y` for the PDF bottom-left origin.
+    pub(super) struct ShadowImage {
+        pub png: Vec<u8>,
+        pub x: f64,
+        pub y: f64,
+        pub w: f64,
+        pub h: f64,
     }
 
-    // Soft shadow. The blur fans out ~½·blur each side of the spread edge, so the
-    // umbra (fully-opaque core) shrinks by ½·blur and the penumbra extends ½·blur
-    // outward. Keep the peak ≈ the legacy dimmed alpha so we don't darken.
-    let reach = sh.blur * 0.5;
-    let peak = (1.0 / (1.0 + sh.blur / 8.0)).clamp(0.15, 1.0);
+    /// Build the Gaussian-feathered shadow image for box `(x, y, w, h)` (top-down
+    /// points) with the given per-corner radii and shadow spec. Returns `None`
+    /// when the shadow has no visible area (e.g. spread collapses it, or the box
+    /// is degenerate) so the caller emits nothing.
+    pub(super) fn box_shadow_png(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        radius: [f64; 4],
+        radius_v: [f64; 4],
+        sh: &BoxShadow,
+    ) -> Option<ShadowImage> {
+        let sigma = (sh.blur * SIGMA_PER_BLUR).max(0.0);
+        if sh.inset {
+            inset_shadow_png(x, y, w, h, radius, radius_v, sh, sigma)
+        } else {
+            outset_shadow_png(x, y, w, h, radius, radius_v, sh, sigma)
+        }
+    }
 
-    // Opaque-ish core (the spread box shrunk by `reach`, never past its centre).
-    let core_inset = reach.min(sw / 2.0 - 0.5).min(shh / 2.0 - 0.5).max(0.0);
-    let core_r = |r: [f64; 4]| {
-        [
-            (r[0] - core_inset).max(0.0),
-            (r[1] - core_inset).max(0.0),
-            (r[2] - core_inset).max(0.0),
-            (r[3] - core_inset).max(0.0),
-        ]
-    };
-    fill_box(
-        sx + core_inset,
-        sy + core_inset,
-        sw - 2.0 * core_inset,
-        shh - 2.0 * core_inset,
-        core_r(rh),
-        core_r(rv),
-        peak,
-    );
+    /// Outset shadow: rasterise the spread+offset rounded rect, blur it, and place
+    /// the (padded) buffer behind the box.
+    #[allow(clippy::too_many_arguments)]
+    fn outset_shadow_png(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        radius: [f64; 4],
+        radius_v: [f64; 4],
+        sh: &BoxShadow,
+        sigma: f64,
+    ) -> Option<ShadowImage> {
+        // Shadow rect in points: grow by spread, offset by (dx, dy).
+        let sx = x - sh.spread + sh.dx;
+        let sy = y - sh.spread + sh.dy;
+        let sw = w + 2.0 * sh.spread;
+        let shh = h + 2.0 * sh.spread;
+        if sw <= 0.0 || shh <= 0.0 {
+            return None;
+        }
+        let rh = grow_radii(radius, sh.spread);
+        let rv = grow_radii(radius_v, sh.spread);
 
-    // Penumbra rings: RINGS nested boxes from the core out to core+2·reach, each
-    // at a small alpha. Overlaps accumulate to a smooth falloff. Per-ring alpha is
-    // sized so the stack peaks near `peak` rather than summing far above it.
-    const RINGS: usize = 6;
-    let ring_alpha = (peak / RINGS as f64).clamp(0.02, 0.5);
-    for i in 1..=RINGS {
-        // Each ring grows the spread box outward toward the full penumbra; the
-        // outermost (i = RINGS) reaches `+reach` past the spread edge.
-        let grow_amt = (i as f64 / RINGS as f64) * reach;
-        let bx = sx - grow_amt;
-        let by = sy - grow_amt;
-        let bw = sw + 2.0 * grow_amt;
-        let bh = shh + 2.0 * grow_amt;
-        let ring_r = |r: [f64; 4]| {
-            [
-                if r[0] > 0.0 { r[0] + grow_amt } else { 0.0 },
-                if r[1] > 0.0 { r[1] + grow_amt } else { 0.0 },
-                if r[2] > 0.0 { r[2] + grow_amt } else { 0.0 },
-                if r[3] > 0.0 { r[3] + grow_amt } else { 0.0 },
-            ]
+        // Pad the buffer outward so the blur tail fits.
+        let pad = (sigma * TAIL_SIGMAS).ceil().max(0.0);
+        let ox = sx - pad; // top-left of the raster, in points
+        let oy = sy - pad;
+        let total_w = sw + 2.0 * pad;
+        let total_h = shh + 2.0 * pad;
+        let (dw, dh) = device_dims(total_w, total_h)?;
+
+        // Coverage = the rounded rect, with its top-left at (pad, pad) inside the
+        // raster (device px). Sample with antialiasing so the edge feathers.
+        let mut cov = vec![0.0_f32; dw * dh];
+        rasterize_rounded_rect(
+            &mut cov,
+            dw,
+            dh,
+            pad * SCALE,
+            pad * SCALE,
+            sw * SCALE,
+            shh * SCALE,
+            rh,
+            rv,
+        );
+        gaussian_blur(&mut cov, dw, dh, sigma * SCALE);
+
+        Some(ShadowImage {
+            png: encode_shadow(&cov, dw, dh, sh.color),
+            x: ox,
+            y: oy,
+            w: total_w,
+            h: total_h,
+        })
+    }
+
+    /// Inset shadow: the dark band is the area inside the box NOT covered by the
+    /// rounded rect shrunk by `spread` and offset by `(dx, dy)`. Rasterise that
+    /// complement, blur it, then keep only the part inside the box (a hard
+    /// clip-to-interior multiply) so the soft edge never leaks outside.
+    #[allow(clippy::too_many_arguments)]
+    fn inset_shadow_png(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        radius: [f64; 4],
+        radius_v: [f64; 4],
+        sh: &BoxShadow,
+        sigma: f64,
+    ) -> Option<ShadowImage> {
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        // The raster covers exactly the box; the inner light hole is the box shrunk
+        // by spread and shifted by (dx, dy).
+        let (dw, dh) = device_dims(w, h)?;
+        let inner_x = (sh.spread + sh.dx) * SCALE;
+        let inner_y = (sh.spread + sh.dy) * SCALE;
+        let inner_w = (w - 2.0 * sh.spread) * SCALE;
+        let inner_h = (h - 2.0 * sh.spread) * SCALE;
+        let rh = grow_radii(radius, -sh.spread);
+        let rv = grow_radii(radius_v, -sh.spread);
+
+        // Inner-hole coverage (the lit region), blurred so its edge is soft.
+        let mut hole = vec![0.0_f32; dw * dh];
+        if inner_w > 0.0 && inner_h > 0.0 {
+            rasterize_rounded_rect(
+                &mut hole, dw, dh, inner_x, inner_y, inner_w, inner_h, rh, rv,
+            );
+        }
+        gaussian_blur(&mut hole, dw, dh, sigma * SCALE);
+
+        // Box mask (sharp box interior, AA edge) — the clip that confines the inset.
+        let mut clip = vec![0.0_f32; dw * dh];
+        rasterize_rounded_rect(
+            &mut clip,
+            dw,
+            dh,
+            0.0,
+            0.0,
+            w * SCALE,
+            h * SCALE,
+            radius,
+            radius_v,
+        );
+
+        // Inset coverage = inside-the-box AND outside-the-(blurred)-hole.
+        let mut cov = vec![0.0_f32; dw * dh];
+        for i in 0..cov.len() {
+            cov[i] = clip[i] * (1.0 - hole[i]).clamp(0.0, 1.0);
+        }
+
+        Some(ShadowImage {
+            png: encode_shadow(&cov, dw, dh, sh.color),
+            x,
+            y,
+            w,
+            h,
+        })
+    }
+
+    /// Grow each non-zero corner radius by `by` (clamped at 0). A zero radius stays
+    /// a sharp corner; `by` may be negative (inset shrink).
+    fn grow_radii(arr: [f64; 4], by: f64) -> [f64; 4] {
+        let g = |r: f64| if r > 0.0 { (r + by).max(0.0) } else { 0.0 };
+        [g(arr[0]), g(arr[1]), g(arr[2]), g(arr[3])]
+    }
+
+    /// Device buffer dimensions for a points rect, clamped to [`MAX_DIM`]. `None`
+    /// if either axis rounds to zero.
+    fn device_dims(w_pt: f64, h_pt: f64) -> Option<(usize, usize)> {
+        let dw = ((w_pt * SCALE).round() as usize).clamp(0, MAX_DIM);
+        let dh = ((h_pt * SCALE).round() as usize).clamp(0, MAX_DIM);
+        if dw == 0 || dh == 0 {
+            None
+        } else {
+            Some((dw, dh))
+        }
+    }
+
+    /// Antialiased coverage of a rounded rectangle into `cov` (row-major, `w×h`).
+    /// The rect spans `[rx, rx+rw) × [ry, ry+rh)` in device px with per-corner
+    /// horizontal/vertical radii `rh`/`rv` (already in device px-equivalent points,
+    /// scaled by the caller). Coverage is `1` deep inside, ramps across a 1-px edge
+    /// band, and `0` outside — so the blur input is smooth, not stair-stepped.
+    #[allow(clippy::too_many_arguments)]
+    fn rasterize_rounded_rect(
+        cov: &mut [f32],
+        w: usize,
+        h: usize,
+        rx: f64,
+        ry: f64,
+        rw: f64,
+        rh: f64,
+        radius: [f64; 4],
+        radius_v: [f64; 4],
+    ) {
+        if rw <= 0.0 || rh <= 0.0 {
+            return;
+        }
+        // Per-corner radii in device px, clamped so opposite corners never overlap.
+        let sx = SCALE;
+        let max_rx = rw / 2.0;
+        let max_ry = rh / 2.0;
+        let clamp_pair = |hr: f64, vr: f64| -> (f64, f64) {
+            (
+                (hr * sx).min(max_rx).max(0.0),
+                (vr * sx).min(max_ry).max(0.0),
+            )
         };
-        fill_box(bx, by, bw, bh, ring_r(rh), ring_r(rv), ring_alpha);
+        let (tlh, tlv) = clamp_pair(radius[0], radius_v[0]);
+        let (trh, trv) = clamp_pair(radius[1], radius_v[1]);
+        let (brh, brv) = clamp_pair(radius[2], radius_v[2]);
+        let (blh, blv) = clamp_pair(radius[3], radius_v[3]);
+
+        let x0 = rx;
+        let y0 = ry;
+        let x1 = rx + rw;
+        let y1 = ry + rh;
+        // Only scan the rows/cols the rect can touch.
+        let cx0 = x0.floor().max(0.0) as usize;
+        let cy0 = y0.floor().max(0.0) as usize;
+        let cx1 = (x1.ceil() as usize).min(w);
+        let cy1 = (y1.ceil() as usize).min(h);
+
+        for py in cy0..cy1 {
+            let yc = py as f64 + 0.5; // pixel centre
+            for px in cx0..cx1 {
+                let xc = px as f64 + 0.5;
+                // Signed distance to the rounded-rect boundary (negative = inside),
+                // built from the nearest corner ellipse or the straight edges.
+                let d = rounded_rect_signed_distance(
+                    xc,
+                    yc,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    (tlh, tlv),
+                    (trh, trv),
+                    (brh, brv),
+                    (blh, blv),
+                );
+                // 1-px wide antialiased edge: coverage 1 at d≤-0.5, 0 at d≥0.5.
+                let c = (0.5 - d).clamp(0.0, 1.0) as f32;
+                if c > 0.0 {
+                    cov[py * w + px] = c;
+                }
+            }
+        }
+    }
+
+    /// Signed distance (device px) from point `(x, y)` to the boundary of the
+    /// rounded rect `[x0,x1]×[y0,y1]`, negative inside. In a corner quadrant the
+    /// distance is to that corner's ellipse; elsewhere it is the usual axis-aligned
+    /// box distance. Each corner pair is `(horizontal_radius, vertical_radius)` in
+    /// the order top-left, top-right, bottom-right, bottom-left.
+    #[allow(clippy::too_many_arguments)]
+    fn rounded_rect_signed_distance(
+        x: f64,
+        y: f64,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        tl: (f64, f64),
+        tr: (f64, f64),
+        br: (f64, f64),
+        bl: (f64, f64),
+    ) -> f64 {
+        // Pick the corner whose rounded region this point falls in (if any).
+        let corner = if x < x0 + tl.0 && y < y0 + tl.1 {
+            Some((x0 + tl.0, y0 + tl.1, tl.0, tl.1)) // centre + radii
+        } else if x > x1 - tr.0 && y < y0 + tr.1 {
+            Some((x1 - tr.0, y0 + tr.1, tr.0, tr.1))
+        } else if x > x1 - br.0 && y > y1 - br.1 {
+            Some((x1 - br.0, y1 - br.1, br.0, br.1))
+        } else if x < x0 + bl.0 && y > y1 - bl.1 {
+            Some((x0 + bl.0, y1 - bl.1, bl.0, bl.1))
+        } else {
+            None
+        };
+
+        if let Some((cx, cy, rxr, ryr)) = corner {
+            if rxr > 0.0 && ryr > 0.0 {
+                // Distance to the ellipse, approximated in normalised space then
+                // scaled back by the local radius (exact on circles, close on mild
+                // ellipses — ample for a diffuse shadow edge).
+                let nx = (x - cx) / rxr;
+                let ny = (y - cy) / ryr;
+                let nd = (nx * nx + ny * ny).sqrt();
+                let scale = (rxr + ryr) * 0.5;
+                return (nd - 1.0) * scale;
+            }
+        }
+        // Axis-aligned box signed distance.
+        let dx = (x0 - x).max(x - x1);
+        let dy = (y0 - y).max(y - y1);
+        if dx <= 0.0 && dy <= 0.0 {
+            dx.max(dy) // inside: negative, nearest edge
+        } else {
+            let ox = dx.max(0.0);
+            let oy = dy.max(0.0);
+            (ox * ox + oy * oy).sqrt()
+        }
+    }
+
+    /// In-place separable Gaussian blur of an alpha buffer (`w×h`, row-major) via
+    /// three successive box blurs whose combined response approximates a true
+    /// Gaussian of standard deviation `sigma` (device px). Below ~0.5 px the blur
+    /// is a no-op (nothing visible to spread).
+    pub(super) fn gaussian_blur(buf: &mut [f32], w: usize, h: usize, sigma: f64) {
+        if sigma < 0.5 || w == 0 || h == 0 {
+            return;
+        }
+        let radii = box_blur_radii(sigma);
+        let mut tmp = vec![0.0_f32; buf.len()];
+        for r in radii {
+            if r == 0 {
+                continue;
+            }
+            box_blur_horizontal(buf, &mut tmp, w, h, r);
+            box_blur_vertical(&tmp, buf, w, h, r);
+        }
+    }
+
+    /// Three box-blur radii whose convolution matches a Gaussian of std-dev
+    /// `sigma`, per Wronski's *Fast Almost-Gaussian Filtering*. The "ideal" box
+    /// width `wi = sqrt(12σ²/n + 1)` is split into `n` integer boxes (here `n = 3`)
+    /// — some of width `wl`, the rest `wl+2` — so their averaged variance equals
+    /// `σ²`. Returned as per-pass half-widths (a box of width `2r+1`).
+    pub(super) fn box_blur_radii(sigma: f64) -> [usize; 3] {
+        const N: f64 = 3.0;
+        let wi = (12.0 * sigma * sigma / N + 1.0).sqrt();
+        // Largest odd integer ≤ wi (box widths must be odd to stay centred).
+        let mut wl = wi.floor() as i64;
+        if wl % 2 == 0 {
+            wl -= 1;
+        }
+        let wl = wl.max(1);
+        let wu = wl + 2;
+        // Count `m` of the smaller boxes that best preserves the target variance
+        // (Wronski's closed form; depends only on the smaller width `wl`).
+        let wlf = wl as f64;
+        let m_ideal =
+            (12.0 * sigma * sigma - N * wlf * wlf - 4.0 * N * wlf - 3.0 * N) / (-4.0 * wlf - 4.0);
+        let m = m_ideal.round().clamp(0.0, N) as usize;
+        let mut out = [0usize; 3];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let width = if i < m { wl } else { wu };
+            *slot = ((width - 1) / 2) as usize; // half-width
+        }
+        out
+    }
+
+    /// One horizontal box blur (window `2r+1`) from `src` into `dst`, edges clamped
+    /// (the border pixel is repeated), via a sliding running sum — O(w·h).
+    fn box_blur_horizontal(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+        let win = (2 * r + 1) as f32;
+        for y in 0..h {
+            let row = y * w;
+            // Seed the window: sum over [-r, r] with clamped indices.
+            let mut sum = 0.0_f32;
+            for k in 0..=(2 * r) {
+                let idx = k as isize - r as isize; // -r..=r relative to x=0
+                let cx = idx.clamp(0, w as isize - 1) as usize;
+                sum += src[row + cx];
+            }
+            for x in 0..w {
+                dst[row + x] = sum / win;
+                // Slide: drop the leftmost, add the next-right (both clamped).
+                let drop_i = (x as isize - r as isize).clamp(0, w as isize - 1) as usize;
+                let add_i = (x as isize + r as isize + 1).clamp(0, w as isize - 1) as usize;
+                sum += src[row + add_i] - src[row + drop_i];
+            }
+        }
+    }
+
+    /// One vertical box blur (window `2r+1`) from `src` into `dst`, edges clamped,
+    /// via a sliding running sum — O(w·h).
+    fn box_blur_vertical(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+        let win = (2 * r + 1) as f32;
+        for x in 0..w {
+            let mut sum = 0.0_f32;
+            for k in 0..=(2 * r) {
+                let idx = k as isize - r as isize;
+                let cy = idx.clamp(0, h as isize - 1) as usize;
+                sum += src[cy * w + x];
+            }
+            for y in 0..h {
+                dst[y * w + x] = sum / win;
+                let drop_i = (y as isize - r as isize).clamp(0, h as isize - 1) as usize;
+                let add_i = (y as isize + r as isize + 1).clamp(0, h as isize - 1) as usize;
+                sum += src[add_i * w + x] - src[drop_i * w + x];
+            }
+        }
+    }
+
+    /// Encode an alpha-coverage buffer as an RGBA PNG: every pixel carries the
+    /// constant shadow `colour`, with alpha = `round(coverage·255)`. The engine's
+    /// image path lifts this alpha into a `/DeviceGray` `/SMask`, so the placed
+    /// image paints the shadow colour faded by the Gaussian coverage.
+    fn encode_shadow(cov: &[f32], w: usize, h: usize, color: [f64; 3]) -> Vec<u8> {
+        let r = (color[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+        let g = (color[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+        let b = (color[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for &c in cov.iter().take(w * h) {
+            let a = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+        crate::raster::png::encode_png(w as u32, h as u32, &rgba)
     }
 }
 
@@ -2432,10 +2867,12 @@ mod tests {
 
     #[test]
     fn inset_box_shadow_paints_a_clipped_frame_inside_the_box() {
-        // An `inset` box-shadow draws a shadow-coloured frame INSIDE the box,
-        // clipped to it — so the red shadow fill and a `W n` clip both appear.
+        // A SHARP (zero-blur) `inset` box-shadow draws a shadow-coloured frame
+        // INSIDE the box, clipped to it — so the red shadow fill and a `W n` clip
+        // both appear (the crisp vector path; blurred insets go through the
+        // Gaussian raster feather instead — see `inset_box_shadow_renders_inside_the_box`).
         let content = page1_content(
-            r#"<div style="background:#ffffff;box-shadow:inset 0 0 8pt #ff0000;padding:10pt">x</div>"#,
+            r#"<div style="background:#ffffff;box-shadow:inset 4pt 4pt 0 #ff0000;padding:10pt">x</div>"#,
         );
         assert!(
             content.contains("1 0 0 rg"),
@@ -2537,11 +2974,13 @@ mod tests {
 
     #[test]
     fn box_shadow_paints_a_shadow_fill_before_the_box() {
-        // The shadow (red here, for a visible marker) must be filled BEFORE the
-        // box's own background (grey), so it sits behind it. We look for the red
-        // shadow fill appearing earlier in the stream than the grey box fill.
+        // A crisp (zero-blur) shadow stays a vector fill and must be painted BEFORE
+        // the box's own background (grey), so it sits behind it. We look for the red
+        // shadow fill appearing earlier in the stream than the grey box fill. (The
+        // blurred path is a raster image, covered separately — see
+        // `blurred_box_shadow_emits_a_softmasked_image`.)
         let content = page1_content(
-            r#"<div style="background:#cccccc;box-shadow:4pt 4pt 6pt #ff0000;padding:10pt">x</div>"#,
+            r#"<div style="background:#cccccc;box-shadow:4pt 4pt 0pt #ff0000;padding:10pt">x</div>"#,
         );
         let red = content.find("1 0 0 rg");
         let grey = content.find("0.8 0.8 0.8 rg");
@@ -2848,6 +3287,148 @@ mod tests {
         );
         assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
         assert!(pdf.len() > 400, "non-trivial output ({} bytes)", pdf.len());
+    }
+
+    // ── true Gaussian box-shadow (raster soft-mask) ──────────────────────────
+
+    #[test]
+    fn blurred_box_shadow_emits_a_softmasked_image() {
+        // A blurred shadow is now a real raster feather: an /Image XObject masked
+        // by a /DeviceGray /SMask (the blurred alpha), drawn (`Do`) behind the box.
+        let pdf = render(
+            r#"<div style="background:#ffffff;box-shadow:4pt 4pt 12pt #000000;padding:10pt">x</div>"#,
+            &[],
+            200.0,
+            120.0,
+            12.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        let raw = String::from_utf8_lossy(&pdf);
+        assert!(
+            raw.contains("/Subtype /Image"),
+            "the blurred shadow embeds an image XObject"
+        );
+        assert!(
+            raw.contains("/SMask"),
+            "the shadow image carries a soft mask (the Gaussian alpha)"
+        );
+        let doc = Document::open(&pdf).expect("re-open");
+        let content =
+            String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
+        assert!(
+            content.contains(" Do"),
+            "the shadow image is painted via a `Do` op\n{content}"
+        );
+    }
+
+    #[test]
+    fn zero_blur_box_shadow_stays_a_crisp_vector_fill() {
+        // A zero-blur shadow keeps the fast vector path: a plain filled rect, NO
+        // raster image (byte-cheap, sharp edge).
+        let pdf = render(
+            r#"<div style="background:#ffffff;box-shadow:4pt 4pt 0pt #ff0000;padding:10pt">x</div>"#,
+            &[],
+            200.0,
+            120.0,
+            12.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        let raw = String::from_utf8_lossy(&pdf);
+        assert!(
+            !raw.contains("/Subtype /Image"),
+            "a sharp (zero-blur) shadow does NOT rasterise to an image"
+        );
+        let doc = Document::open(&pdf).expect("re-open");
+        let content =
+            String::from_utf8_lossy(&doc.page_content(1).expect("content")).to_string();
+        assert!(
+            content.contains("1 0 0 rg") && content.contains(" re"),
+            "the crisp shadow is a red filled rectangle\n{content}"
+        );
+    }
+
+    #[test]
+    fn inset_box_shadow_renders_inside_the_box() {
+        // An inset shadow now paints (it was previously skipped): a feathered band
+        // confined to the box interior — embedded as a soft-masked image whose
+        // placement box equals the element box.
+        let pdf = render(
+            r#"<div style="background:#ffffff;box-shadow:inset 0pt 0pt 8pt #000000;width:120pt;height:60pt"></div>"#,
+            &[],
+            220.0,
+            140.0,
+            12.0,
+        );
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF");
+        let raw = String::from_utf8_lossy(&pdf);
+        assert!(
+            raw.contains("/Subtype /Image") && raw.contains("/SMask"),
+            "the inset shadow embeds a soft-masked image"
+        );
+    }
+
+    #[test]
+    fn gaussian_blur_falls_off_smoothly_from_centre_to_edge() {
+        // Blur a single fully-covered pixel and check the response is a smooth,
+        // monotonically-decreasing bump centred on it (a Gaussian-like kernel),
+        // not a flat box or a hard ring.
+        let w = 81usize;
+        let h = 81usize;
+        let mut buf = vec![0.0_f32; w * h];
+        buf[40 * w + 40] = 1.0; // central impulse
+        shadow::gaussian_blur(&mut buf, w, h, 6.0);
+
+        let centre = buf[40 * w + 40];
+        // Sample outward along the +x axis from the centre.
+        let samples: Vec<f32> = (0..=30).map(|d| buf[40 * w + (40 + d)]).collect();
+        assert!(centre > 0.0, "impulse spreads to a positive peak ({centre})");
+        // Peak is at the centre and the profile never increases moving outward.
+        for win in samples.windows(2) {
+            assert!(
+                win[1] <= win[0] + 1e-7,
+                "blur response is monotonically non-increasing outward ({win:?})"
+            );
+        }
+        // Far tail has effectively decayed (3σ ≈ 18 px out → near zero).
+        assert!(
+            samples[28] < centre * 0.05,
+            "the Gaussian tail decays toward zero (tail={}, centre={centre})",
+            samples[28]
+        );
+        // Half-maximum radius of a Gaussian is σ·sqrt(2·ln2) ≈ 1.1774·σ ≈ 7.06 px.
+        let half = centre * 0.5;
+        let hm_radius = samples
+            .iter()
+            .position(|&v| v <= half)
+            .expect("profile crosses half-max within the sampled range");
+        assert!(
+            (5..=10).contains(&hm_radius),
+            "half-max radius ≈ 1.18σ (~7 px for σ=6), got {hm_radius}"
+        );
+    }
+
+    #[test]
+    fn box_blur_radii_match_target_gaussian_variance() {
+        // The three box-blur passes must reproduce the variance of the target
+        // Gaussian: the summed variance of boxes of width (2r+1) is
+        // Σ ((2r+1)² − 1)/12, which should be within a box-quantisation step of σ².
+        for &sigma in &[2.0_f64, 4.0, 6.0, 10.0] {
+            let radii = shadow::box_blur_radii(sigma);
+            let var: f64 = radii
+                .iter()
+                .map(|&r| {
+                    let width = (2 * r + 1) as f64;
+                    (width * width - 1.0) / 12.0
+                })
+                .sum();
+            let target = sigma * sigma;
+            assert!(
+                (var - target).abs() <= target * 0.25 + 1.0,
+                "3 box blurs approximate σ²={target} (got variance {var}) for σ={sigma}"
+            );
+        }
+        // σ below the visible floor yields all-zero radii (no-op blur).
+        assert_eq!(shadow::box_blur_radii(0.0), [0, 0, 0]);
     }
 
     #[test]
