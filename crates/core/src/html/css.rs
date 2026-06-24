@@ -2176,6 +2176,18 @@ fn parse_align_items(v: &str) -> AlignItems {
 
 fn apply_one(style: &mut Style, prop: &str, value: &str) {
     let v = value.trim();
+    // `currentColor` resolves to the element's own (already-cascaded) colour, so
+    // a bare `border-color: currentColor` / `background: currentColor` / … picks
+    // up `color`. Substitute it as an `rgb(...)` literal before parsing. (The
+    // `color` property itself is a no-op: `style.color` is the inherited value.)
+    let resolved_current;
+    let v = if v.eq_ignore_ascii_case("currentcolor") {
+        let [r, g, b] = style.color;
+        resolved_current = format!("rgb({},{},{})", r * 255.0, g * 255.0, b * 255.0);
+        resolved_current.as_str()
+    } else {
+        v
+    };
     match prop {
         "display" => {
             style.display = match v {
@@ -2543,7 +2555,7 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             // `border: 1px solid #ccc` — take first length + a colour if present.
             // A bare `border-width` carries only the length(s); `none`/`hidden`
             // zero the side(s).
-            let (w, c, vis, s) = parse_border_shorthand(v, style.font_size);
+            let (w, c, vis, s) = parse_border_shorthand(v, style.font_size, style.color);
             style.border_width = Edges::all(if vis { w } else { 0.0 });
             if let Some(c) = c {
                 style.border_color = c;
@@ -2554,7 +2566,7 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             style.border_style_edges = [s.unwrap_or(BorderStyle::Solid); 4];
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
-            let (w, c, vis, s) = parse_border_shorthand(v, style.font_size);
+            let (w, c, vis, s) = parse_border_shorthand(v, style.font_size, style.color);
             let i = border_side_index(prop);
             set_border_side(style, i, if vis { Some(w) } else { Some(0.0) }, c);
             // The side shorthand also resets THIS side's style (to the given
@@ -2670,7 +2682,11 @@ fn border_side_index(prop: &str) -> usize {
 /// initial width pragmatically); `none`/`hidden` set `visible = false`. The
 /// `style?` is the recognised line-style keyword (`solid`/`dashed`/`dotted`/
 /// `double`) when one appears, so `border: 1px dashed red` carries its dash.
-fn parse_border_shorthand(v: &str, em: f64) -> (f64, Option<[f64; 3]>, bool, Option<BorderStyle>) {
+fn parse_border_shorthand(
+    v: &str,
+    em: f64,
+    current: [f64; 3],
+) -> (f64, Option<[f64; 3]>, bool, Option<BorderStyle>) {
     let mut w = 1.0;
     let mut got_w = false;
     let mut color = None;
@@ -2684,6 +2700,8 @@ fn parse_border_shorthand(v: &str, em: f64) -> (f64, Option<[f64; 3]>, bool, Opt
             visible = false;
         } else if let Some(s) = parse_border_style_keyword(tok) {
             style = Some(s);
+        } else if tok.eq_ignore_ascii_case("currentcolor") {
+            color = Some(current);
         } else if let Some(c) = parse_color(tok) {
             color = Some(c);
         }
@@ -4546,5 +4564,38 @@ mod tests {
         }
         // A keyword that merely ends in a unit ("thin") is not a length.
         assert!(parse_len_px("thin", 10.0).is_none());
+    }
+
+    #[test]
+    fn current_color_resolves_to_the_element_color() {
+        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3);
+
+        // `border-color: currentColor` picks up the cascaded `color`.
+        let mut style = Style::default();
+        apply_one(&mut style, "color", "rgb(20, 120, 220)");
+        apply_one(&mut style, "border-color", "currentColor");
+        assert!(
+            close(style.border_color, style.color),
+            "border-color follows color"
+        );
+
+        // …and as a sub-token of the `border` shorthand.
+        let mut s2 = Style::default();
+        apply_one(&mut s2, "color", "rgb(200, 60, 10)");
+        apply_one(&mut s2, "border", "2px solid currentColor");
+        assert!(
+            close(s2.border_color, s2.color),
+            "border shorthand currentColor"
+        );
+
+        // `background: currentColor` too (case-insensitive).
+        let mut s3 = Style::default();
+        apply_one(&mut s3, "color", "rgb(0, 255, 0)");
+        apply_one(&mut s3, "background", "CurrentColor");
+        assert_eq!(
+            s3.background,
+            Some([0.0, 1.0, 0.0]),
+            "background follows color"
+        );
     }
 }

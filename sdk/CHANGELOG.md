@@ -44,6 +44,12 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.85.2] - 2026-06-24
+
+HTML/CSS renderer: `currentColor` now resolves to the element's cascaded `color`
+(borders, background, and the `border` shorthand) in the HTML→PDF path
+([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) item C). No API change.
+
 ## [0.85.1] - 2026-06-24
 
 HTML/CSS renderer: absolute & relative CSS length units — `cm`, `mm`, `in`, `pc`,

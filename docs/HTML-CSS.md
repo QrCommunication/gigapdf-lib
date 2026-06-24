@@ -326,9 +326,10 @@ Resolved to PDF points. `1px = 0.75pt` (the 96dpi convention), `1pt = 1pt`.
 | `rgb()` / `rgba()` | `rgb(0 170 0)`, `rgba(0,170,0,.5)` | comma- or space-separated, `/`-alpha; alpha dropped |
 | `hsl()` / `hsla()` | `hsl(120 100% 33%)` | converted to RGB; alpha dropped |
 | Named | the ~139 CSS named colours (`rebeccapurple`, `tomato`, `slategray`, …) + `transparent` | |
+| `currentColor` | `border-color: currentColor`, `border: 1px solid currentColor`, `background: currentColor` | resolves to the element's cascaded `color` (case-insensitive) |
 
-`transparent` (and any unrecognised colour, including `currentColor`) leaves the
-property unset — the fill/border is simply not drawn.
+`transparent` (and any unrecognised colour) leaves the property unset — the
+fill/border is simply not drawn.
 
 ---
 
