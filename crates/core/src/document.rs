@@ -9323,6 +9323,210 @@ impl Document {
         Ok(true)
     }
 
+    /// Draw a **COLR v1 colour glyph** (gradient/transformed paint graph) at the
+    /// baseline origin `(x, baseline)` for text `size`. Each flattened layer
+    /// fills its glyph outline — clipped to the glyph contour — with a solid
+    /// CPAL colour or a real PDF axial/radial **shading** (reusing the engine's
+    /// gradient machinery). Returns the glyph advance in points. A glyph that
+    /// isn't a v1 base glyph draws nothing (returns its advance) so callers can
+    /// fall back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_colrv1_glyph(
+        &mut self,
+        page_no: u32,
+        face: &crate::font::truetype::TrueTypeFont,
+        colors: &crate::font::color::Colrv1,
+        base_gid: u16,
+        x: f64,
+        baseline: f64,
+        size: f64,
+        fg: [f64; 3],
+    ) -> Result<f64> {
+        use crate::content::num;
+        use crate::font::color::PaintFill;
+        let upm = face.units_per_em().max(1.0);
+        let s = size / upm;
+        let advance = face.advance_width(base_gid) * s;
+        let Some(layers) = colors.layers(base_gid) else {
+            return Ok(advance);
+        };
+        // Map a font-unit point through a layer's affine `t`, then to PDF page
+        // space (Y-up; glyph y=0 sits on `baseline`). Font outlines are already
+        // Y-up like PDF, so no flip.
+        for layer in layers {
+            let contours = face.glyph_polygons(layer.gid);
+            if contours.is_empty() {
+                continue;
+            }
+            let t = layer.transform;
+            let to_page = |fx: f64, fy: f64| -> (f64, f64) {
+                let tx = t.a * fx + t.c * fy + t.e;
+                let ty = t.b * fx + t.d * fy + t.f;
+                (x + tx * s, baseline + ty * s)
+            };
+            // The clip path = the (transformed) glyph contour.
+            let mut clip: Vec<u8> = Vec::new();
+            for contour in &contours {
+                if contour.len() < 2 {
+                    continue;
+                }
+                let (fx, fy) = contour[0];
+                let (u, v) = to_page(fx, fy);
+                clip.extend_from_slice(format!("{} {} m\n", num(u), num(v)).as_bytes());
+                for &(fx, fy) in &contour[1..] {
+                    let (u, v) = to_page(fx, fy);
+                    clip.extend_from_slice(format!("{} {} l\n", num(u), num(v)).as_bytes());
+                }
+                clip.extend_from_slice(b"h\n");
+            }
+            if clip.is_empty() {
+                continue;
+            }
+            let (bx0, by0, bx1, by1) = clip_bounds(&contours, to_page);
+
+            // Build the layer's fill ops (a balanced `q … Q`) and its uniform
+            // opacity (gradients fold stop alpha into the fill alpha).
+            let (fill_ops, opacity): (Vec<u8>, f64) = match &layer.fill {
+                PaintFill::Solid {
+                    rgb,
+                    alpha,
+                    use_foreground,
+                } => {
+                    let c = if *use_foreground { fg } else { *rgb };
+                    let mut ops: Vec<u8> = b"q\n".to_vec();
+                    ops.extend_from_slice(&clip);
+                    ops.extend_from_slice(
+                        format!("{} {} {} rg\nf\nQ\n", num(c[0]), num(c[1]), num(c[2])).as_bytes(),
+                    );
+                    (ops, *alpha)
+                }
+                PaintFill::Linear { .. } | PaintFill::Radial { .. } => {
+                    // Build an SVG-style gradient in font units (the `p2`
+                    // rotation is modelled by `colrv1_to_svg_gradient`), then
+                    // register it as a PDF shading pattern via the existing
+                    // machinery, mapping its coords to the page through `t`.
+                    let grad = colrv1_to_svg_gradient(&layer.fill, fg);
+                    let det = (t.a * t.d - t.b * t.c).abs();
+                    let rscale = s * det.sqrt().max(1e-6);
+                    let alpha = colrv1_fill_alpha(&layer.fill);
+                    match self.register_svg_shading(page_no, &grad, to_page, rscale)? {
+                        Some(name) => {
+                            let mut ops: Vec<u8> = b"q\n".to_vec();
+                            ops.extend_from_slice(&clip);
+                            ops.extend_from_slice(b"W n\n"); // clip to the glyph contour
+                            ops.extend_from_slice(b"/Pattern cs\n/");
+                            ops.extend_from_slice(&name);
+                            ops.extend_from_slice(b" scn\n");
+                            ops.extend_from_slice(
+                                format!(
+                                    "{} {} {} {} re\nf\nQ\n",
+                                    num(bx0),
+                                    num(by0),
+                                    num(bx1 - bx0),
+                                    num(by1 - by0)
+                                )
+                                .as_bytes(),
+                            );
+                            (ops, alpha)
+                        }
+                        None => continue,
+                    }
+                }
+                PaintFill::Sweep {
+                    center,
+                    start_angle,
+                    end_angle,
+                    stops,
+                } => {
+                    // No native PDF conic shading: paint a fan of flat-coloured
+                    // sectors about the centre (same approach as CSS
+                    // `conic-gradient`), clipped to the glyph contour.
+                    let ops = colrv1_sweep_ops(
+                        &clip,
+                        (bx0, by0, bx1, by1),
+                        *center,
+                        *start_angle,
+                        *end_angle,
+                        stops,
+                        fg,
+                        to_page,
+                    );
+                    (ops, 1.0)
+                }
+            };
+
+            // Apply the COLRv1 composite blend mode (a PDF `/BM` ExtGState),
+            // then the uniform fill opacity.
+            let ops = self.with_blend(page_no, fill_ops, layer.blend)?;
+            let ops = self.with_opacity(page_no, ops, opacity)?;
+            self.append_page_content(page_no, &ops)?;
+        }
+        Ok(advance)
+    }
+
+    /// Wrap `ops` in a transient `/ExtGState` carrying the `/BM` blend mode, so
+    /// the layer composites onto the backdrop with the COLRv1 composite mode.
+    /// `Normal` returns `ops` unchanged (plain source-over).
+    fn with_blend(
+        &mut self,
+        page_no: u32,
+        ops: Vec<u8>,
+        blend: crate::font::color::BlendName,
+    ) -> Result<Vec<u8>> {
+        use crate::font::color::BlendName;
+        if blend == BlendName::Normal {
+            return Ok(ops);
+        }
+        let mut gs = Dictionary::new();
+        gs.set(b"Type".to_vec(), Object::Name(b"ExtGState".to_vec()));
+        gs.set(b"BM".to_vec(), Object::Name(blend.pdf_name().to_vec()));
+        let name =
+            self.register_page_resource(page_no, b"ExtGState", "GpBm", Object::Dictionary(gs))?;
+        let mut out = b"q\n/".to_vec();
+        out.extend_from_slice(&name);
+        out.extend_from_slice(b" gs\n");
+        out.extend_from_slice(&ops);
+        out.extend_from_slice(b"Q\n");
+        Ok(out)
+    }
+
+    /// Draw a Google `CBDT`/`CBLC` colour-bitmap glyph as a PNG on the baseline
+    /// at `(x, baseline)` for text `size`. Returns `true` if a PNG bitmap was
+    /// placed (so the caller can fall back otherwise). Mirrors the `sbix` path.
+    pub fn draw_cbdt_glyph(
+        &mut self,
+        page_no: u32,
+        face: &crate::font::truetype::TrueTypeFont,
+        gid: u16,
+        x: f64,
+        baseline: f64,
+        size: f64,
+    ) -> Result<bool> {
+        let Some(cb) = face.cbdt_glyphs() else {
+            return Ok(false);
+        };
+        let Some(cblc) = face.cblc_bytes() else {
+            return Ok(false);
+        };
+        let Some(g) = cb.glyph(cblc, gid) else {
+            return Ok(false);
+        };
+        // Bearings are pixels at the strike ppem → points; the bitmap covers
+        // roughly the em box, so place a `size × size` image. `bearing_y` is the
+        // top of the bitmap, so drop by `size` to sit on the baseline.
+        let scale = size / g.ppem.max(1.0);
+        let _ = self.add_image(
+            page_no,
+            &g.png,
+            x + g.bearing_x * scale,
+            baseline + g.bearing_y * scale - size,
+            size,
+            size,
+            1.0,
+        );
+        Ok(true)
+    }
+
     /// Embed a raster image (PNG or JPEG) on a page and draw it at `(x, y)` with
     /// size `(width, height)` in PDF user space (origin bottom-left). `opacity`
     /// in `0.0..=1.0` sets fill alpha via a transient `/ExtGState`. PNG alpha is
@@ -17184,6 +17388,221 @@ fn sample_svg_gradient(stops: &[crate::svg::GradStop], t: f64) -> [u8; 3] {
     to8(last.rgb)
 }
 
+/// Convert a COLRv1 gradient [`PaintFill`] (font-unit coords) to an
+/// [`crate::svg::Gradient`] so the existing axial/radial shading machinery can
+/// render it. Foreground-indexed stops resolve to `fg`.
+///
+/// For a linear gradient the COLRv1 `p2` "rotation" reference controls the angle
+/// of the iso-colour lines (per OpenType §COLR): the effective gradient
+/// endpoint is `p1` projected onto the line through `p0` whose direction is
+/// perpendicular to `(p2 − p0)`. When `p2` is perpendicular to `(p1 − p0)` this
+/// reduces to the plain `p0 → p1` axis; otherwise the gradient is rotated.
+fn colrv1_to_svg_gradient(
+    fill: &crate::font::color::PaintFill,
+    fg: [f64; 3],
+) -> crate::svg::Gradient {
+    use crate::font::color::PaintFill;
+    use crate::svg::{GradKind, GradStop, Gradient};
+    let conv = |s: &crate::font::color::Colrv1Stop| GradStop {
+        offset: s.offset.clamp(0.0, 1.0),
+        rgb: if s.use_foreground { fg } else { s.rgb },
+        alpha: s.alpha,
+    };
+    match fill {
+        PaintFill::Linear { p0, p1, p2, stops } => {
+            let (x2, y2) = colrv1_linear_effective_p1(*p0, *p1, *p2);
+            Gradient {
+                kind: GradKind::Linear {
+                    x1: p0.0,
+                    y1: p0.1,
+                    x2,
+                    y2,
+                },
+                stops: stops.iter().map(conv).collect(),
+            }
+        }
+        PaintFill::Radial {
+            c1, r1, c0, stops, ..
+        } => Gradient {
+            // PDF type-3 radial models one end circle + a focal point; use the
+            // larger circle `(c1, r1)` as the outer circle and `c0` as the focus.
+            kind: GradKind::Radial {
+                cx: c1.0,
+                cy: c1.1,
+                r: *r1,
+                fx: c0.0,
+                fy: c0.1,
+            },
+            stops: stops.iter().map(conv).collect(),
+        },
+        PaintFill::Solid { .. } | PaintFill::Sweep { .. } => Gradient {
+            kind: GradKind::Linear {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 0.0,
+            },
+            stops: Vec::new(),
+        },
+    }
+}
+
+/// The effective axial endpoint for a COLRv1 linear gradient with rotation
+/// reference `p2`: `p1` projected onto the line through `p0` perpendicular to
+/// `(p2 − p0)`. Degenerate `p2` (coincident with `p0`) falls back to `p1`.
+fn colrv1_linear_effective_p1(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64)) -> (f64, f64) {
+    let rx = p2.0 - p0.0;
+    let ry = p2.1 - p0.1;
+    let rlen = (rx * rx + ry * ry).sqrt();
+    if rlen < 1e-9 {
+        return p1; // no rotation reference → plain p0→p1
+    }
+    // Unit vector perpendicular to (p2 − p0): the gradient direction.
+    let nx = -ry / rlen;
+    let ny = rx / rlen;
+    let dx = p1.0 - p0.0;
+    let dy = p1.1 - p0.1;
+    let proj = dx * nx + dy * ny;
+    (p0.0 + proj * nx, p0.1 + proj * ny)
+}
+
+/// The representative uniform opacity for a COLRv1 gradient fill — the mean of
+/// its stops' alphas (a true per-stop soft mask would need a mask group; the
+/// shading itself is painted opaque and the box alpha approximates it). Solid
+/// and sweep fills carry their own alpha and return `1.0` here.
+fn colrv1_fill_alpha(fill: &crate::font::color::PaintFill) -> f64 {
+    use crate::font::color::PaintFill;
+    let stops = match fill {
+        PaintFill::Linear { stops, .. } | PaintFill::Radial { stops, .. } => stops,
+        _ => return 1.0,
+    };
+    if stops.is_empty() {
+        return 1.0;
+    }
+    let sum: f64 = stops.iter().map(|s| s.alpha).sum();
+    (sum / stops.len() as f64).clamp(0.0, 1.0)
+}
+
+/// Build the PDF content for a COLRv1 **sweep** (conic) gradient: a fan of
+/// flat-coloured triangular sectors about `center`, clipped to the glyph
+/// contour (`clip` path), covering the contour's page-space bbox. One sector per
+/// degree of the swept arc — the flat-fill steps are below visual acuity at any
+/// print resolution, the same ceiling the CSS `conic-gradient` renderer uses.
+#[allow(clippy::too_many_arguments)]
+fn colrv1_sweep_ops(
+    clip: &[u8],
+    bbox: (f64, f64, f64, f64),
+    center: (f64, f64),
+    start_angle: f64,
+    end_angle: f64,
+    stops: &[crate::font::color::Colrv1Stop],
+    fg: [f64; 3],
+    to_page: impl Fn(f64, f64) -> (f64, f64),
+) -> Vec<u8> {
+    use crate::content::num;
+    let (pcx, pcy) = to_page(center.0, center.1);
+    let (bx0, by0, bx1, by1) = bbox;
+    // Radius that covers the whole bbox from the (page-space) centre.
+    let far = |x: f64, y: f64| ((pcx - x).powi(2) + (pcy - y).powi(2)).sqrt();
+    let radius = far(bx0, by0)
+        .max(far(bx1, by0))
+        .max(far(bx1, by1))
+        .max(far(bx0, by1))
+        + 1.0;
+
+    let mut ops: Vec<u8> = b"q\n".to_vec();
+    ops.extend_from_slice(clip);
+    ops.extend_from_slice(b"W n\n"); // clip to the glyph contour
+
+    // Sweep from start_angle to end_angle (CCW). A full turn when they coincide.
+    let mut sweep = end_angle - start_angle;
+    if sweep.abs() < 1e-9 {
+        sweep = std::f64::consts::TAU;
+    }
+    let sectors = (sweep.abs().to_degrees().ceil() as usize).clamp(1, 360);
+    let step = sweep / sectors as f64;
+    for i in 0..sectors {
+        let a0 = start_angle + step * i as f64;
+        let a1 = start_angle + step * (i + 1) as f64;
+        // Sample the ramp at the sector midpoint's angular fraction.
+        let t = (i as f64 + 0.5) / sectors as f64;
+        let c = colrv1_sample_stops(stops, t, fg);
+        // Sector centre → arc edge at a0 → arc edge at a1 (flat fill).
+        ops.extend_from_slice(
+            format!(
+                "{} {} {} rg\n{} {} m\n{} {} l\n{} {} l\nh\nf\n",
+                num(c[0]),
+                num(c[1]),
+                num(c[2]),
+                num(pcx),
+                num(pcy),
+                num(pcx + radius * a0.cos()),
+                num(pcy + radius * a0.sin()),
+                num(pcx + radius * a1.cos()),
+                num(pcy + radius * a1.sin()),
+            )
+            .as_bytes(),
+        );
+    }
+    ops.extend_from_slice(b"Q\n");
+    ops
+}
+
+/// Sample a COLRv1 stop ramp at position `t ∈ [0,1]`, linearly interpolating the
+/// bracketing stops' colours and clamping outside the range. Foreground stops
+/// resolve to `fg`.
+fn colrv1_sample_stops(stops: &[crate::font::color::Colrv1Stop], t: f64, fg: [f64; 3]) -> [f64; 3] {
+    let color = |s: &crate::font::color::Colrv1Stop| if s.use_foreground { fg } else { s.rgb };
+    let Some(first) = stops.first() else {
+        return fg;
+    };
+    let last = &stops[stops.len() - 1];
+    if t <= first.offset {
+        return color(first);
+    }
+    if t >= last.offset {
+        return color(last);
+    }
+    for w in stops.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if t >= a.offset && t <= b.offset {
+            let span = (b.offset - a.offset).max(1e-9);
+            let f = ((t - a.offset) / span).clamp(0.0, 1.0);
+            let ca = color(a);
+            let cb = color(b);
+            return [
+                ca[0] + (cb[0] - ca[0]) * f,
+                ca[1] + (cb[1] - ca[1]) * f,
+                ca[2] + (cb[2] - ca[2]) * f,
+            ];
+        }
+    }
+    color(last)
+}
+
+/// The page-space axis-aligned bounding box `(x0, y0, x1, y1)` of glyph
+/// `contours` (font units) after mapping each point through `to_page`.
+fn clip_bounds(
+    contours: &[Vec<(f64, f64)>],
+    to_page: impl Fn(f64, f64) -> (f64, f64),
+) -> (f64, f64, f64, f64) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for c in contours {
+        for &(fx, fy) in c {
+            let (u, v) = to_page(fx, fy);
+            x0 = x0.min(u);
+            y0 = y0.min(v);
+            x1 = x1.max(u);
+            y1 = y1.max(v);
+        }
+    }
+    if x0 > x1 || y0 > y1 {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        (x0, y0, x1, y1)
+    }
+}
+
 /// First index of `needle` within `haystack`.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
@@ -21225,6 +21644,269 @@ mod tests {
         assert!(
             content.contains("1 0 0 rg") && content.contains("\nf\n"),
             "colour layer filled in red"
+        );
+    }
+
+    #[test]
+    fn draw_colrv1_glyph_emits_solid_and_shading_layers() {
+        use crate::font::truetype::TrueTypeFont;
+        use crate::font::GlyphSource;
+        // A real embedded TrueType face for genuine glyph outlines.
+        let src = Document::open(&fixture("embedded-fonts.pdf")).unwrap();
+        let page = src.page_dict(1).unwrap();
+        let fonts = page
+            .get(b"Resources")
+            .map(|o| src.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|r| r.get(b"Font"))
+            .map(|o| src.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("page has a Font dict");
+        let face: TrueTypeFont = fonts
+            .0
+            .values()
+            .find_map(|v| match src.font_program(src.resolve(v).as_dict()?)? {
+                GlyphSource::TrueType(f) => Some(f),
+                _ => None,
+            })
+            .expect("an embedded TrueType face");
+        let gid = (1..face.num_glyphs())
+            .find(|&g| !face.glyph_polygons(g).is_empty())
+            .expect("a glyph with an outline");
+
+        // A minimal COLR v1: base `gid` → PaintColrLayers of [PaintGlyph(gid)→
+        // PaintSolid(palette 0 = red), PaintGlyph(gid)→PaintLinearGradient
+        // (palette 1 → palette 2)]. Layout mirrors the color.rs unit fixture
+        // (v1 header = 34 bytes), parameterised by the real `gid`.
+        let g = gid.to_be_bytes();
+        let one = 0x4000u16.to_be_bytes(); // 1.0 in F2Dot14
+        let mut colr: Vec<u8> = Vec::new();
+        colr.extend_from_slice(&[0, 1, 0, 0]); // version 1, numBaseGlyphRecords 0
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // v0 offsets/count = 0
+        colr.extend_from_slice(&[0, 0, 0, 34]); // baseGlyphListOffset
+        colr.extend_from_slice(&[0, 0, 0, 50]); // layerListOffset
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // clip/var/store = 0
+        colr.extend_from_slice(&[0, 0, 0, 1]); // BaseGlyphList: 1 record
+        colr.extend_from_slice(&[g[0], g[1], 0, 0, 0, 10]); // base gid → paint @44
+        colr.extend_from_slice(&[1, 2, 0, 0, 0, 0]); // PaintColrLayers (2 layers)
+        colr.extend_from_slice(&[0, 0, 0, 2]); // LayerList: 2 layers
+        colr.extend_from_slice(&[0, 0, 0, 12]); // layer[0] → @62
+        colr.extend_from_slice(&[0, 0, 0, 23]); // layer[1] → @73
+        colr.extend_from_slice(&[10, 0, 0, 6, g[0], g[1]]); // PaintGlyph #0 → @68
+        colr.extend_from_slice(&[2, 0, 0]); // PaintSolid: palette 0
+        colr.extend_from_slice(&one);
+        colr.extend_from_slice(&[10, 0, 0, 6, g[0], g[1]]); // PaintGlyph #1 → @79
+        colr.extend_from_slice(&[4, 0, 0, 16]); // PaintLinearGradient → colorLine @95
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 100]); // p0/p1/p2
+        colr.extend_from_slice(&[0, 0, 2]); // ColorLine: 2 stops
+        colr.extend_from_slice(&[0, 0, 0, 1]); // stop0: offset 0, palette 1
+        colr.extend_from_slice(&one);
+        colr.extend_from_slice(&one); // stop1: offset 1.0
+        colr.extend_from_slice(&[0, 2]); // palette 2
+        colr.extend_from_slice(&one);
+
+        let mut cpal = vec![0, 0, 0, 3, 0, 1, 0, 3, 0, 0, 0, 14, 0, 0];
+        cpal.extend_from_slice(&[0, 0, 255, 255]); // 0 = red
+        cpal.extend_from_slice(&[0, 255, 0, 255]); // 1 = green
+        cpal.extend_from_slice(&[255, 0, 0, 255]); // 2 = blue
+        let colors = crate::font::color::Colrv1::parse(&colr, &cpal).expect("v1 parsed");
+
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("colrv1 host")).unwrap();
+        let adv = doc
+            .draw_colrv1_glyph(1, &face, &colors, gid, 100.0, 100.0, 40.0, [0.0, 0.0, 0.0])
+            .unwrap();
+        assert!(adv > 0.0, "advance returned for pen movement");
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        // Layer 0 is a flat red fill; layer 1 is a real PDF shading pattern.
+        assert!(content.contains("1 0 0 rg"), "solid red layer: {content}");
+        assert!(
+            content.contains("/Pattern cs") && content.contains(" scn"),
+            "gradient layer painted via a shading pattern: {content}"
+        );
+        assert!(
+            content.contains("W n"),
+            "gradient clipped to the glyph contour"
+        );
+        // The shading + function objects serialize into a valid PDF.
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(reopened.page_count() >= 1);
+    }
+
+    /// Pull the first embedded TrueType face + an outline glyph from the
+    /// `embedded-fonts.pdf` fixture (shared by the COLRv1 render tests).
+    fn colrv1_test_face() -> (crate::font::truetype::TrueTypeFont, u16) {
+        use crate::font::truetype::TrueTypeFont;
+        use crate::font::GlyphSource;
+        let src = Document::open(&fixture("embedded-fonts.pdf")).unwrap();
+        let page = src.page_dict(1).unwrap();
+        let fonts = page
+            .get(b"Resources")
+            .map(|o| src.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|r| r.get(b"Font"))
+            .map(|o| src.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("page has a Font dict");
+        let face: TrueTypeFont = fonts
+            .0
+            .values()
+            .find_map(|v| match src.font_program(src.resolve(v).as_dict()?)? {
+                GlyphSource::TrueType(f) => Some(f),
+                _ => None,
+            })
+            .expect("an embedded TrueType face");
+        let gid = (1..face.num_glyphs())
+            .find(|&g| !face.glyph_polygons(g).is_empty())
+            .expect("a glyph with an outline");
+        (face, gid)
+    }
+
+    #[test]
+    fn draw_colrv1_sweep_emits_sector_fan() {
+        let (face, gid) = colrv1_test_face();
+        let g = gid.to_be_bytes();
+        let one = 0x4000u16.to_be_bytes();
+        // base gid → PaintGlyph(gid) → PaintSweepGradient(0°→180°, red→green→blue).
+        let mut colr: Vec<u8> = vec![0, 1, 0, 0];
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // v0 fields
+        colr.extend_from_slice(&[0, 0, 0, 34]); // baseGlyphListOffset
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // layerList/clip = 0
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // varIdxMap/varStore = 0
+        colr.extend_from_slice(&[0, 0, 0, 1, g[0], g[1], 0, 0, 0, 10]); // BaseGlyphList @34
+        colr.extend_from_slice(&[10, 0, 0, 6, g[0], g[1]]); // PaintGlyph @44 → @50
+        colr.extend_from_slice(&[8, 0, 0, 12, 0, 0, 0, 0, 0, 0]); // PaintSweepGradient @50
+        colr.extend_from_slice(&one); // endAngle 1.0 (×180° = 180° sweep); ColorLine @62
+        colr.extend_from_slice(&[0, 0, 3]); // ColorLine: 3 stops red/green/blue
+        colr.extend_from_slice(&[0, 0, 0, 0]); // stop0 red @0.0
+        colr.extend_from_slice(&one);
+        colr.extend_from_slice(&0x2000u16.to_be_bytes()); // stop1 @0.5
+        colr.extend_from_slice(&[0, 1]); // palette 1 (green)
+        colr.extend_from_slice(&one);
+        colr.extend_from_slice(&one); // stop2 @1.0
+        colr.extend_from_slice(&[0, 2]); // palette 2 (blue)
+        colr.extend_from_slice(&one);
+
+        let mut cpal = vec![0, 0, 0, 3, 0, 1, 0, 3, 0, 0, 0, 14, 0, 0];
+        cpal.extend_from_slice(&[0, 0, 255, 255]); // 0 red
+        cpal.extend_from_slice(&[0, 255, 0, 255]); // 1 green
+        cpal.extend_from_slice(&[255, 0, 0, 255]); // 2 blue
+        let colors = crate::font::color::Colrv1::parse(&colr, &cpal).expect("v1 parsed");
+
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("sweep host")).unwrap();
+        doc.draw_colrv1_glyph(1, &face, &colors, gid, 100.0, 100.0, 40.0, [0.0, 0.0, 0.0])
+            .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        assert!(
+            content.contains("W n"),
+            "sweep clipped to the glyph contour"
+        );
+        // A fan emits many flat-coloured sector fills (one `rg` per sector), and
+        // the colours vary across the sweep (red → green → blue ramp).
+        let rg_lines: Vec<&str> = content.lines().filter(|l| l.ends_with(" rg")).collect();
+        assert!(
+            rg_lines.len() > 50,
+            "sector fan emits many fills, got {}",
+            rg_lines.len()
+        );
+        let unique: std::collections::BTreeSet<&str> = rg_lines.iter().copied().collect();
+        assert!(
+            unique.len() > 20,
+            "sweep ramps through many distinct colours, got {}",
+            unique.len()
+        );
+        // The ramp produces both red-dominant and blue-dominant sectors.
+        let rgb = |l: &str| -> Option<[f64; 3]> {
+            let p: Vec<f64> = l
+                .trim_end_matches(" rg")
+                .split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            (p.len() == 3).then(|| [p[0], p[1], p[2]])
+        };
+        let red_dominant = rg_lines
+            .iter()
+            .filter_map(|l| rgb(l))
+            .any(|c| c[0] > 0.8 && c[2] < 0.2);
+        let blue_dominant = rg_lines
+            .iter()
+            .filter_map(|l| rgb(l))
+            .any(|c| c[2] > 0.8 && c[0] < 0.2);
+        assert!(red_dominant, "a red-dominant sector near the sweep start");
+        assert!(blue_dominant, "a blue-dominant sector near the sweep end");
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert!(reopened.page_count() >= 1);
+    }
+
+    #[test]
+    fn draw_colrv1_composite_emits_blend_extgstate() {
+        let (face, gid) = colrv1_test_face();
+        let g = gid.to_be_bytes();
+        let one = 0x4000u16.to_be_bytes();
+        // base gid → PaintComposite(SCREEN) of two solid glyph layers.
+        let mut colr: Vec<u8> = vec![0, 1, 0, 0];
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        colr.extend_from_slice(&[0, 0, 0, 34]); // baseGlyphListOffset
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        colr.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        colr.extend_from_slice(&[0, 0, 0, 1, g[0], g[1], 0, 0, 0, 10]); // BaseGlyphList @34
+        colr.extend_from_slice(&[32, 0, 0, 11, 9, 0, 0, 17]); // PaintComposite @44: src→55 SCREEN backdrop→61
+        colr.extend_from_slice(&[0, 0, 0]); // pad → @55
+        colr.extend_from_slice(&[10, 0, 0, 12, g[0], g[1]]); // src PaintGlyph @55 → solid @67
+        colr.extend_from_slice(&[10, 0, 0, 11, g[0], g[1]]); // backdrop PaintGlyph @61 → solid @72
+        colr.extend_from_slice(&[2, 0, 1]); // src PaintSolid @67 palette 1
+        colr.extend_from_slice(&one);
+        colr.extend_from_slice(&[2, 0, 0]); // backdrop PaintSolid @72 palette 0
+        colr.extend_from_slice(&one);
+
+        let mut cpal = vec![0, 0, 0, 2, 0, 1, 0, 2, 0, 0, 0, 14, 0, 0];
+        cpal.extend_from_slice(&[0, 0, 255, 255]); // 0 red
+        cpal.extend_from_slice(&[0, 255, 0, 255]); // 1 green
+        let colors = crate::font::color::Colrv1::parse(&colr, &cpal).expect("v1 parsed");
+
+        let mut doc =
+            Document::open(&crate::convert::reverse::txt_to_pdf("composite host")).unwrap();
+        doc.draw_colrv1_glyph(1, &face, &colors, gid, 100.0, 100.0, 40.0, [0.0, 0.0, 0.0])
+            .unwrap();
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        // Both solids drawn; the source layer references a blend ExtGState.
+        assert!(content.contains("1 0 0 rg"), "backdrop red drawn");
+        assert!(content.contains("0 1 0 rg"), "source green drawn");
+        assert!(content.contains("GpBm"), "blend ExtGState applied via gs");
+        // The saved PDF carries the `/BM /Screen` ExtGState resource.
+        let saved = doc.save();
+        let blob = String::from_utf8_lossy(&saved);
+        assert!(
+            blob.contains("/BM /Screen") || blob.contains("/BM/Screen"),
+            "Screen blend mode serialized into an ExtGState"
+        );
+        assert!(Document::open(&saved).unwrap().page_count() >= 1);
+    }
+
+    #[test]
+    fn colrv1_linear_p2_rotates_the_axis() {
+        // p0=(0,0), p1=(100,0); with p2=(0,100) the rotation reference is
+        // perpendicular to p0→p1, so the effective axis is unchanged.
+        let e = colrv1_linear_effective_p1((0.0, 0.0), (100.0, 0.0), (0.0, 100.0));
+        assert!(
+            (e.0 - 100.0).abs() < 1e-6 && e.1.abs() < 1e-6,
+            "perp p2 ⇒ p1 unchanged: {e:?}"
+        );
+
+        // With p2=(100,0) (collinear with p0→p1), the gradient direction is
+        // perpendicular to it (the +Y axis), so p1 projects onto y: (0, 0).
+        let e2 = colrv1_linear_effective_p1((0.0, 0.0), (100.0, 0.0), (100.0, 0.0));
+        assert!(
+            e2.0.abs() < 1e-6 && e2.1.abs() < 1e-6,
+            "collinear p2 ⇒ projected to 0: {e2:?}"
+        );
+
+        // A 45° rotation reference rotates the axis: p2=(100,100) ⇒ the gradient
+        // direction is perpendicular to (1,1); projecting (100,0) lands on the
+        // (1,-1) diagonal → (50, -50). (The line is what matters, not the sign.)
+        let e3 = colrv1_linear_effective_p1((0.0, 0.0), (100.0, 0.0), (100.0, 100.0));
+        assert!(
+            (e3.0 - 50.0).abs() < 1e-6 && (e3.1 + 50.0).abs() < 1e-6,
+            "45° p2 rotates the axis onto the (1,-1) diagonal: {e3:?}"
         );
     }
 

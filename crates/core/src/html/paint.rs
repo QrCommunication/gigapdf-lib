@@ -915,26 +915,48 @@ fn paint(
                         }
                     }
 
-                    // Colour-emoji fast path: when the resolved face has COLR/CPAL
-                    // tables and this run holds a colour glyph, draw those glyphs as
-                    // native vector layers and the rest as ordinary text.
+                    // Colour-emoji fast path: when the resolved face has a colour
+                    // table (COLR v1 gradients, COLR v0 layers, `sbix` or
+                    // `CBDT`/`CBLC` bitmaps) and this run holds a colour glyph,
+                    // draw those glyphs in colour and the rest as ordinary text.
                     let face = book.face(style);
-                    let colors = face.and_then(|f| f.color_glyphs()); // COLR/CPAL
+                    let colrv1 = face.and_then(|f| f.colrv1_glyphs()); // COLR v1 paint graph
+                    let colors = face.and_then(|f| f.color_glyphs()); // COLR v0 / CPAL
                     let sbix = face.and_then(|f| f.sbix_glyphs()); // Apple bitmap emoji
-                                                                   // Classify a char: `Some((gid, is_colr))` for a colour glyph —
-                                                                   // `is_colr=false` is an sbix bitmap; `None` is ordinary text.
+                    let cbdt = face.and_then(|f| f.cbdt_glyphs()); // Google bitmap emoji
+                                                                   // How a colour glyph is drawn (highest fidelity first).
+                    #[derive(Clone, Copy)]
+                    enum ColorKind {
+                        Colrv1,
+                        Colrv0,
+                        Sbix,
+                        Cbdt,
+                    }
                     let classify = |f: &crate::font::truetype::TrueTypeFont,
                                     ch: char|
-                     -> Option<(u16, bool)> {
+                     -> Option<(u16, ColorKind)> {
                         let g = f.gid_for_unicode(ch as u32)?;
-                        if colors
+                        if colrv1
                             .as_ref()
                             .map(|c| c.layers(g).is_some())
                             .unwrap_or(false)
                         {
-                            Some((g, true))
+                            Some((g, ColorKind::Colrv1))
+                        } else if colors
+                            .as_ref()
+                            .map(|c| c.layers(g).is_some())
+                            .unwrap_or(false)
+                        {
+                            Some((g, ColorKind::Colrv0))
                         } else if sbix.as_ref().map(|s| s.glyph(g).is_some()).unwrap_or(false) {
-                            Some((g, false))
+                            Some((g, ColorKind::Sbix))
+                        } else if cbdt
+                            .as_ref()
+                            .zip(face.and_then(|f| f.cblc_bytes()))
+                            .map(|(c, cblc)| c.glyph(cblc, g).is_some())
+                            .unwrap_or(false)
+                        {
+                            Some((g, ColorKind::Cbdt))
                         } else {
                             None
                         }
@@ -952,7 +974,7 @@ fn paint(
                         for ch in trimmed.chars() {
                             let cw = book.width(&ch.to_string(), style);
                             match classify(face, ch) {
-                                Some((g, is_colr)) => {
+                                Some((g, kind)) => {
                                     if !seg.is_empty() {
                                         let _ = doc.add_text(
                                             page,
@@ -967,28 +989,55 @@ fn paint(
                                         );
                                         seg.clear();
                                     }
-                                    if is_colr {
-                                        if let Some(c) = colors.as_ref() {
-                                            let _ = doc.draw_color_glyph(
+                                    match kind {
+                                        ColorKind::Colrv1 => {
+                                            if let Some(c) = colrv1.as_ref() {
+                                                let _ = doc.draw_colrv1_glyph(
+                                                    page,
+                                                    face,
+                                                    c,
+                                                    g,
+                                                    pen,
+                                                    baseline,
+                                                    style.font_size,
+                                                    style.color,
+                                                );
+                                            }
+                                        }
+                                        ColorKind::Colrv0 => {
+                                            if let Some(c) = colors.as_ref() {
+                                                let _ = doc.draw_color_glyph(
+                                                    page,
+                                                    face,
+                                                    c,
+                                                    g,
+                                                    pen,
+                                                    baseline,
+                                                    style.font_size,
+                                                    style.color,
+                                                );
+                                            }
+                                        }
+                                        ColorKind::Sbix => {
+                                            let _ = doc.draw_sbix_glyph(
                                                 page,
                                                 face,
-                                                c,
                                                 g,
                                                 pen,
                                                 baseline,
                                                 style.font_size,
-                                                style.color,
                                             );
                                         }
-                                    } else {
-                                        let _ = doc.draw_sbix_glyph(
-                                            page,
-                                            face,
-                                            g,
-                                            pen,
-                                            baseline,
-                                            style.font_size,
-                                        );
+                                        ColorKind::Cbdt => {
+                                            let _ = doc.draw_cbdt_glyph(
+                                                page,
+                                                face,
+                                                g,
+                                                pen,
+                                                baseline,
+                                                style.font_size,
+                                            );
+                                        }
                                     }
                                     pen += cw;
                                     seg_x = pen;

@@ -44,6 +44,10 @@ pub struct TrueTypeFont {
     cpal: Option<(usize, usize)>,
     /// `(offset, len)` of the `sbix` bitmap-emoji table, if present.
     sbix: Option<(usize, usize)>,
+    /// `(offset, len)` of the `CBLC` / `CBDT` colour-bitmap tables (Google
+    /// colour emoji), if present.
+    cblc: Option<(usize, usize)>,
+    cbdt: Option<(usize, usize)>,
     /// `(offset, len)` of the `GPOS` / `GSUB` OpenType-Layout tables, if present
     /// (drive pair kerning and ligature/standard substitutions when shaping).
     gpos: Option<(usize, usize)>,
@@ -154,6 +158,8 @@ impl TrueTypeFont {
         let colr = tables.get(b"COLR").copied();
         let cpal = tables.get(b"CPAL").copied();
         let sbix = tables.get(b"sbix").copied();
+        let cblc = tables.get(b"CBLC").copied();
+        let cbdt = tables.get(b"CBDT").copied();
         let gpos = tables.get(b"GPOS").copied();
         let gsub = tables.get(b"GSUB").copied();
         let gdef = tables.get(b"GDEF").copied();
@@ -170,6 +176,8 @@ impl TrueTypeFont {
             colr,
             cpal,
             sbix,
+            cblc,
+            cbdt,
             gpos,
             gsub,
             gdef,
@@ -214,6 +222,33 @@ impl TrueTypeFont {
         let colr = self.data.get(co..co + cl)?;
         let cpal = self.data.get(po..po + pl)?;
         super::color::ColorGlyphs::parse(colr, cpal)
+    }
+
+    /// Parse the font's COLR **v1** paint graph (gradient colour glyphs), if the
+    /// `COLR` table is version 1. `None` for v0-only or non-colour fonts.
+    pub fn colrv1_glyphs(&self) -> Option<super::color::Colrv1> {
+        let (co, cl) = self.colr?;
+        let (po, pl) = self.cpal?;
+        let colr = self.data.get(co..co + cl)?;
+        let cpal = self.data.get(po..po + pl)?;
+        super::color::Colrv1::parse(colr, cpal)
+    }
+
+    /// Parse the font's `CBLC`/`CBDT` colour-bitmap tables (Google colour
+    /// emoji), if present. `None` for ordinary fonts.
+    pub fn cbdt_glyphs(&self) -> Option<super::color::Cbdt> {
+        let (lo, ll) = self.cblc?;
+        let (do_, dl) = self.cbdt?;
+        let cblc = self.data.get(lo..lo + ll)?;
+        let cbdt = self.data.get(do_..do_ + dl)?;
+        super::color::Cbdt::parse(cblc, cbdt)
+    }
+
+    /// The raw `CBLC` table bytes (the index `Cbdt::glyph` reads against), if
+    /// present.
+    pub fn cblc_bytes(&self) -> Option<&[u8]> {
+        let (lo, ll) = self.cblc?;
+        self.data.get(lo..lo + ll)
     }
 
     /// Font design units per em (the outline coordinate scale).
