@@ -465,6 +465,24 @@ fn pdf_text(s: &str) -> Object {
     Object::String(crate::font::encode_pdf_text(s), StringKind::Literal)
 }
 
+/// A minimal XMP packet declaring **PDF/UA-1** conformance (ISO 14289-1):
+/// `pdfuaid:part = 1`. Used by [`Document::to_tagged`] when `pdf_ua` is set.
+fn pdf_ua_xmp() -> Vec<u8> {
+    concat!(
+        "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n",
+        " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
+        "  <rdf:Description rdf:about=\"\" xmlns:pdfuaid=\"http://www.aiim.org/pdfua/ns/id/\">\n",
+        "   <pdfuaid:part>1</pdfuaid:part>\n",
+        "  </rdf:Description>\n",
+        " </rdf:RDF>\n",
+        "</x:xmpmeta>\n",
+        "<?xpacket end=\"w\"?>"
+    )
+    .as_bytes()
+    .to_vec()
+}
+
 /// Convert a PDF date string (`D:YYYYMMDDHHmmSSOHH'mm'`, ISO 32000-1 §7.9.4) to an
 /// XMP/ISO-8601 timestamp (`YYYY-MM-DDThh:mm:ss±hh:mm`). Returns `None` if the
 /// year is missing or non-numeric; all parts after the year are optional and
@@ -6797,6 +6815,87 @@ impl Document {
         // Emit with the file header the level requires (1.4 for PDF/A-1, 1.7
         // otherwise) — classic xref, no object streams, for every level.
         crate::serialize::to_pdf_with_header(&objects, &trailer, level.header())
+    }
+
+    /// Author a **tagged (accessible) PDF** — a logical-structure tree the way
+    /// PDF/A level A does, but **without** forcing PDF/A (no OutputIntent / ICC /
+    /// `pdfaid` metadata). Builds a `/StructTreeRoot` (`P`/`H1`–`H6`/`Table`/`L`/
+    /// `Figure` …) with marked content (`/MCID`), `/MarkInfo /Marked true`, a
+    /// `/Lang`, an (empty) `/RoleMap`, and `/Alt` on every `Figure`. When `pdf_ua`
+    /// is set it also stamps the **PDF/UA-1** identifier (ISO 14289) in XMP. If the
+    /// document has no reconstructable structure the plain (untagged) PDF is
+    /// returned. ISO 32000-1 §14.7/§14.8.
+    pub fn to_tagged(&self, pdf_ua: bool) -> Vec<u8> {
+        let mut objects = self.objects.clone();
+        let trailer = self.trailer.clone();
+        let first_free = objects.keys().map(|(n, _)| *n).max().unwrap_or(0) + 1;
+
+        let Some(built) = crate::convert::tagged::build_struct_tree(self, &mut objects, first_free)
+        else {
+            return crate::serialize::to_pdf(&objects, &trailer);
+        };
+
+        // Post-process the struct tree (without touching the shared builder):
+        // give every `/Figure` a non-empty `/Alt` (PDF/UA requires it) and attach
+        // an (empty) `/RoleMap` to the root — every role we emit is already a
+        // standard structure type, so the map is intentionally empty.
+        for obj in objects.values_mut() {
+            let Some(dict) = obj.as_dict() else { continue };
+            if dict.get(b"Type").and_then(Object::as_name) != Some(b"StructElem".as_slice()) {
+                continue;
+            }
+            if dict.get(b"S").and_then(Object::as_name) == Some(b"Figure".as_slice())
+                && !dict.contains(b"Alt")
+            {
+                let mut updated = dict.clone();
+                updated.set(b"Alt".to_vec(), pdf_text("Figure"));
+                *obj = Object::Dictionary(updated);
+            }
+        }
+        if let Some(Object::Dictionary(root)) = objects.get_mut(&built.struct_tree_root_id) {
+            if !root.contains(b"RoleMap") {
+                root.set(b"RoleMap".to_vec(), Object::Dictionary(Dictionary::new()));
+            }
+        }
+
+        // Flag the catalog (Root via the trailer).
+        if let Some(catalog_id) = trailer.get(b"Root").and_then(Object::as_reference) {
+            let mut catalog = objects
+                .get(&catalog_id)
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_default();
+            catalog.set(
+                b"StructTreeRoot".to_vec(),
+                Object::Reference(built.struct_tree_root_id),
+            );
+            let mut mark_info = Dictionary::new();
+            mark_info.set(b"Marked".to_vec(), Object::Boolean(true));
+            catalog.set(b"MarkInfo".to_vec(), Object::Dictionary(mark_info));
+            if !catalog.contains(b"Lang") {
+                let lang = self
+                    .document_language()
+                    .lang
+                    .unwrap_or_else(|| "en".to_string());
+                catalog.set(
+                    b"Lang".to_vec(),
+                    Object::String(lang.into_bytes(), crate::object::StringKind::Literal),
+                );
+            }
+            if pdf_ua {
+                let xmp = pdf_ua_xmp();
+                let mut mdict = Dictionary::new();
+                mdict.set(b"Type".to_vec(), annot::name(b"Metadata"));
+                mdict.set(b"Subtype".to_vec(), annot::name(b"XML"));
+                mdict.set(b"Length".to_vec(), Object::Integer(xmp.len() as i64));
+                let meta_id = (built.next_free, 0u16);
+                objects.insert(meta_id, Object::Stream(Stream::new(mdict, xmp)));
+                catalog.set(b"Metadata".to_vec(), Object::Reference(meta_id));
+            }
+            objects.insert(catalog_id, Object::Dictionary(catalog));
+        }
+
+        crate::serialize::to_pdf(&objects, &trailer)
     }
 
     /// Per-page reconstructed table grids and floating shapes (shared by the
@@ -18969,6 +19068,33 @@ mod tests {
             .map(|r| r.text.clone())
             .collect();
         assert_eq!(got3, want, "AES-256 recipient decrypts the document");
+    }
+
+    #[test]
+    fn to_tagged_emits_struct_tree_role_map_and_pdf_ua_id() {
+        let html = "<h1>Accessible Title</h1><p>A paragraph of body text to tag.</p>\
+                    <p>Another paragraph with more words.</p>";
+        let src = crate::convert::reverse::html_to_pdf(html);
+        let doc = Document::open(&src).unwrap();
+
+        let tagged = doc.to_tagged(true);
+        let s = String::from_utf8_lossy(&tagged);
+        assert!(s.contains("/StructTreeRoot"), "struct tree root");
+        assert!(s.contains("/MarkInfo"), "mark info");
+        assert!(s.contains("/Marked true"), "marked true");
+        assert!(s.contains("/Lang"), "document language");
+        assert!(s.contains("/RoleMap"), "role map");
+        assert!(s.contains("pdfuaid:part>1"), "PDF/UA-1 identifier");
+        // Tagged, but NOT forced into PDF/A (no pdfaid metadata).
+        assert!(!s.contains("pdfaid"), "not PDF/A");
+        let reopened = Document::open(&tagged).unwrap();
+        assert!(reopened.page_count() >= 1, "tagged PDF round-trips");
+
+        // Without `pdf_ua`: still tagged, but no PDF/UA identifier.
+        let plain = doc.to_tagged(false);
+        let p = String::from_utf8_lossy(&plain);
+        assert!(p.contains("/StructTreeRoot"), "still tagged");
+        assert!(!p.contains("pdfuaid"), "no UA id when pdf_ua = false");
     }
 
     #[test]

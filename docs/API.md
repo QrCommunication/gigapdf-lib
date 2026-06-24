@@ -298,6 +298,7 @@ PDF user space) / `recognize_page(&img)`. For pages that already carry a text la
 | `convert::office::xlsx_to_grids(&bytes) -> Vec<(String,Vec<Vec<String>>)>` (inverse; inline + shared strings) | `gp_xlsx_to_grids(ptr,len,outlen)` (JSON `[{name,rows}]`) · SDK `xlsxToGrids` | read an `.xlsx` back into per-sheet name + rows grids |
 | `to_rtf() -> Vec<u8>` | `gp_to_rtf(handle,outlen)` | RTF |
 | `to_pdfa() -> Vec<u8>` | `gp_to_pdfa(handle,outlen)` | PDF/A-2b metadata |
+| `to_tagged(pdf_ua) -> Vec<u8>` | `gp_to_tagged(handle,pdf_ua,outlen)` | **tagged (accessible) PDF** — `/StructTreeRoot` + marked content + `/MarkInfo` + `/Lang` + `/RoleMap` + `/Alt` on figures, **without** PDF/A (ISO 32000-1 §14.7/§14.8). `pdf_ua` stamps the PDF/UA-1 identifier (ISO 14289) |
 
 ### X → PDF (reverse, stateless)
 

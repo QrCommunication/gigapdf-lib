@@ -47,6 +47,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Annotate (highlight, note, ink, stamp)](#annotate)
 - [Navigation: links, bookmarks & open-action](#navigation-links-bookmarks--open-action) — *full action model: v0.78.0*
 - [Sign a PDF (B · B-T · LTV · certify · verify)](#sign-a-pdf-b--b-t--ltv) — *B-T: v0.70.0 · LTV: v0.71.0 · verify + DocMDP: v0.80.0*
+- [Author a tagged (accessible) PDF](#author-a-tagged-accessible-pdf) — *v0.85.0*
 - [Encrypt with AES-256](#encrypt-with-aes-256)
 - [Change a password, drop encryption, or encrypt to a certificate](#change-a-password-drop-encryption-or-encrypt-to-a-certificate) — *v0.84.0*
 - [Move, resize, restyle, fade & reorder existing elements in place](#move-resize--restyle-existing-elements-in-place) — *opacity & z-order: v0.58.0*
@@ -1072,6 +1073,39 @@ doc.close();
 > ```
 >
 > A self-signed identity (no AIA / CRL-DP) simply yields a `/DSS/Certs`-only store.
+
+---
+
+## Author a tagged (accessible) PDF
+
+`toTagged` emits a logical-structure tree (`/StructTreeRoot`) the same way PDF/A
+level A does — headings, paragraphs, tables, lists and figures become
+`/StructElem`s with marked content (`/MCID`) — but **without** forcing the file
+into PDF/A. The catalog gains `/MarkInfo /Marked true`, a `/Lang`, a `/RoleMap`
+and `/Alt` on every figure. Pass `{ pdfUa: true }` to also declare **PDF/UA-1**
+(ISO 14289) in XMP.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// A plain tagged PDF (accessible structure, not PDF/A).
+const tagged = doc.toTagged();
+
+// …or one that also carries the PDF/UA-1 conformance identifier.
+const ua = doc.toTagged({ pdfUa: true });
+
+doc.close();
+```
+
+The structure is derived from the engine's reconstruction (the same model behind
+`toDocx`/`toHtml`), so documents produced by the HTML→PDF and Office→PDF
+pipelines tag well. If a document has no reconstructable structure, the plain
+(untagged) PDF is returned unchanged.
+
+> Figures receive a non-empty `/Alt` placeholder so the output is structurally
+> PDF/UA-valid; **meaningful** alternate text still requires author input (a
+> per-figure alt-text API is future work). For full archival + accessibility,
+> `toPdfA("pdfa-2a")` produces a PDF/A-2a (level A) file with the same tree.
 
 ---
 

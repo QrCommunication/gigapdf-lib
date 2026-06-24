@@ -676,6 +676,30 @@ describe("@qrcommunication/gigapdf-lib", () => {
     d3.close();
   });
 
+  it("toTagged: accessible structure tree + PDF/UA-1 identifier", () => {
+    const src = giga.htmlToPdf(
+      "<h1>Accessible Title</h1><p>Body paragraph to tag.</p><p>More text here.</p>"
+    );
+    const doc = giga.open(src);
+
+    const tagged = doc.toTagged({ pdfUa: true });
+    const s = new TextDecoder("latin1").decode(tagged);
+    expect(s).toContain("/StructTreeRoot");
+    expect(s).toContain("/MarkInfo");
+    expect(s).toContain("/RoleMap");
+    expect(s).toContain("pdfuaid:part>1");
+    expect(s).not.toContain("pdfaid"); // tagged, but not forced into PDF/A
+    const reopened = giga.open(tagged);
+    expect(reopened.pageCount()).toBeGreaterThanOrEqual(1);
+    reopened.close();
+
+    // Without pdfUa: still tagged, no PDF/UA identifier.
+    const plain = new TextDecoder("latin1").decode(doc.toTagged());
+    expect(plain).toContain("/StructTreeRoot");
+    expect(plain).not.toContain("pdfuaid");
+    doc.close();
+  });
+
   it("draws shapes (line, ellipse, polygon, svg path) and embeds an image", () => {
     const doc = giga.open(giga.txtToPdf("Shapes"));
     expect(doc.drawLine(1, 10, 10, 100, 100, 0x0000ff, 2)).toBe(true);

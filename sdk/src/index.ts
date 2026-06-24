@@ -3549,6 +3549,18 @@ export class GigaPdfDoc {
     );
   }
 
+  /**
+   * Author a **tagged (accessible) PDF** — a `/StructTreeRoot` logical-structure
+   * tree (`P`/`H1`–`H6`/`Table`/`L`/`Figure` …) with marked content, `/MarkInfo`,
+   * `/Lang`, `/RoleMap` and `/Alt` on figures — **without** forcing PDF/A. Pass
+   * `{ pdfUa: true }` to also stamp the PDF/UA-1 identifier (ISO 14289). If the
+   * document has no reconstructable structure the plain PDF is returned.
+   * ISO 32000-1 §14.7/§14.8.
+   */
+  toTagged(opts: { pdfUa?: boolean } = {}): Uint8Array {
+    return this.g._buffer((o) => this.ex().gp_to_tagged(this.h, opts.pdfUa ? 1 : 0, o));
+  }
+
   // security
   /**
    * Serialize the document encrypted with the PDF Standard Security Handler.

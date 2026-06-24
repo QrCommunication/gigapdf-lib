@@ -364,6 +364,7 @@ reconstructed tables for spreadsheets) — not a rasterised image.
 | `toXlsx()` / `toOds()` | Excel / OpenDocument Spreadsheet |
 | `toRtf()` | Rich Text Format |
 | `toPdfA()` | PDF/A-2b archival PDF |
+| `toTagged({ pdfUa? })` | tagged (accessible) PDF — `/StructTreeRoot` + marked content + `/MarkInfo`/`/Lang`/`/RoleMap`/`/Alt`, without PDF/A; `pdfUa` adds the PDF/UA-1 identifier |
 
 ### The unified editable model
 

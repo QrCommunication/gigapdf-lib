@@ -7,6 +7,30 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.85.0] - 2026-06-24
+
+Accessibility: **standalone tagged-PDF / PDF-UA authoring**. Resolves
+[#18](https://github.com/qrcommunication/gigapdf-lib/issues/18).
+
+### Added
+
+- **`Document::to_tagged(pdf_ua)`** — author a tagged (accessible) PDF: a
+  `/StructTreeRoot` logical-structure tree (`P`/`H1`–`H6`/`Table`/`TR`/`TH`/`TD`/
+  `L`/`LI`/`Figure`) with marked content (`/MCID`), `/MarkInfo /Marked true`,
+  `/Lang`, an (empty) `/RoleMap`, and `/Alt` on every `Figure` — **without**
+  forcing PDF/A (no OutputIntent / ICC / `pdfaid`). `pdf_ua` stamps the PDF/UA-1
+  identifier (ISO 14289) in XMP. ISO 32000-1 §14.7/§14.8.
+- WASM `gp_to_tagged`; SDK `doc.toTagged({ pdfUa? })`.
+
+### Notes
+
+- Reuses the structure builder added for PDF/A level A (`convert/tagged.rs`); the
+  standalone path post-processes the tree (figure `/Alt`, `/RoleMap`) without
+  altering the PDF/A output. Figures get a non-empty `/Alt` placeholder so the
+  file is structurally PDF/UA-valid — meaningful alternate text still requires
+  author input (a per-figure alt-text API is future work). For archival +
+  accessibility together, `to_pdfa_level(Pdfa2a)` emits the same tree as PDF/A-2a.
+
 ## [0.84.0] - 2026-06-24
 
 Security: **public-key (certificate) encryption** + **password management**.

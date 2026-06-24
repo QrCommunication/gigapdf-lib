@@ -914,6 +914,22 @@ pub extern "C" fn gp_save(handle: *mut Document, out_len: *mut usize) -> *mut u8
     }
 }
 
+/// Author a **tagged (accessible) PDF** — `/StructTreeRoot` + marked content,
+/// `/MarkInfo`, `/Lang`, `/RoleMap`, `/Alt` on figures — without forcing PDF/A.
+/// `pdf_ua` (non-zero) also stamps the PDF/UA-1 identifier (ISO 14289) in XMP.
+/// Buffer-returning (host frees); null on error.
+#[no_mangle]
+pub extern "C" fn gp_to_tagged(
+    handle: *const Document,
+    pdf_ua: i32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => unsafe { bytes_into_host(doc.to_tagged(pdf_ua != 0), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 // ─── content queries (JSON) ──────────────────────────────────────────────────
 
 /// Text runs of a page as a JSON array. Host frees the returned buffer.

@@ -44,6 +44,18 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.85.0] - 2026-06-24
+
+Standalone tagged-PDF / PDF-UA authoring. Resolves
+[#18](https://github.com/qrcommunication/gigapdf-lib/issues/18).
+
+### Added
+
+- **`doc.toTagged({ pdfUa? })`** — author a tagged (accessible) PDF: a
+  `/StructTreeRoot` logical-structure tree with marked content, `/MarkInfo`,
+  `/Lang`, `/RoleMap` and `/Alt` on figures, **without** forcing PDF/A. `pdfUa`
+  adds the PDF/UA-1 identifier (ISO 14289).
+
 ## [0.84.0] - 2026-06-24
 
 Public-key (certificate) encryption + password management. Resolves
