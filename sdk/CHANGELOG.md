@@ -44,6 +44,23 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.93.0] - 2026-06-24
+
+### Added
+
+- **`appendPages(otherPdf, pages?)`** appends selected source pages (1-based; omit
+  for all); **`mergePdfs(parts)`** now accepts `(Uint8Array | { pdf, pages? })[]`,
+  with the new exported `MergePart` type, for page-range merges.
+  ([#61](https://github.com/qrcommunication/gigapdf-lib/issues/61))
+
+### Fixed (read/import, no SDK signature change)
+
+- Type0 CJK composite fonts (predefined/embedded CMaps + non-Identity
+  `/CIDToGIDMap`) now decode/render correctly
+  ([#46](https://github.com/qrcommunication/gigapdf-lib/issues/46)); PPTX import
+  gains run hyperlinks, table cell fill/borders, theme-colour resolution, and
+  mirror ([#47](https://github.com/qrcommunication/gigapdf-lib/issues/47)).
+
 ## [0.92.0] - 2026-06-24
 
 ### Added

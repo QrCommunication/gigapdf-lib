@@ -7,6 +7,29 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.93.0] - 2026-06-24
+
+PDF-read, Office-import and PDF-edit. Three independent fixes implemented in
+parallel ([#46](https://github.com/qrcommunication/gigapdf-lib/issues/46),
+[#47](https://github.com/qrcommunication/gigapdf-lib/issues/47),
+[#61](https://github.com/qrcommunication/gigapdf-lib/issues/61)).
+
+### Added
+
+- **`appendPages(otherPdf, pages?)` / `mergePdfs([... | {pdf, pages?}])`** — merge
+  or append with **page-range selection**: pass 1-based page numbers to bring in
+  only those source pages (content, resources, annotations and box geometry deep-
+  copy unchanged); omit for all pages. ([#61](https://github.com/qrcommunication/gigapdf-lib/issues/61))
+- **Type0 CJK fonts.** Predefined CMaps (Identity-H/V, the `Uni*-UCS2` families,
+  and 2-byte legacy `GBK`/`B5`/`KSC`/RKSJ codespaces) and **embedded CMap
+  streams** now decode code→CID, and a non-Identity `/CIDToGIDMap` resolves
+  CID→GID, so composite-font text extracts and renders with correct glyphs and
+  CID-keyed widths. ([#46](https://github.com/qrcommunication/gigapdf-lib/issues/46))
+- **PPTX import fidelity.** Run hyperlinks, table cell fill + borders,
+  theme/scheme colour resolution (`a:schemeClr` + `lumMod`/`lumOff`/`shade`/`tint`,
+  `hslClr`/`sysClr`), first-stop gradient fallback, and 180° (double) shape mirror.
+  ([#47](https://github.com/qrcommunication/gigapdf-lib/issues/47))
+
 ## [0.92.0] - 2026-06-24
 
 PDF-read, Office-import and catalog-authoring. Three independent fixes
