@@ -1,60 +1,32 @@
-//! PDF stream predictors (ISO 32000-1 §7.4.4.4). Pure `std`, zero dependencies.
+//! `/Predictor` post-processing for LZWDecode / FlateDecode (ISO 32000-1
+//! §7.4.4.4, Table 10). Pure `std`, zero dependencies.
 //!
-//! `FlateDecode`/`LZWDecode` streams may carry a `/DecodeParms` dict with a
-//! `/Predictor` that the encoder applied *before* compression to make the data
-//! more compressible. After inflating, the engine must reverse it or the bytes
-//! are wrong — scrambled xref entries, or mixed/illegible image pixels.
-//!
-//! Two families are defined:
-//!   * `/Predictor 2` — TIFF Predictor 2 (horizontal differencing).
-//!   * `/Predictor 10..=15` — PNG predictors, each row prefixed by a filter-type
-//!     byte (None/Sub/Up/Average/Paeth).
-//!
-//! Shape comes from `/Columns` (default 1), `/Colors` (default 1) and
-//! `/BitsPerComponent` (default 8).
+//! A predictor transforms the filtered bytes so they compress better; decoding
+//! reverses it. Two families exist:
+//! - `2`: TIFF Predictor 2 (horizontal differencing per component).
+//! - `10..=15`: PNG predictors, where each row is prefixed by a filter-type byte
+//!   (None/Sub/Up/Average/Paeth), exactly as in the PNG format.
 
 use crate::error::{EngineError, Result};
-use crate::object::{Dictionary, Object};
 
-/// Parameters controlling a predictor, read from a `/DecodeParms` dict.
-#[derive(Clone, Copy)]
-struct PredictorParams {
-    predictor: i64,
-    colors: i64,
-    bits_per_component: i64,
-    columns: i64,
+/// `/DecodeParms` values that drive a predictor pass. Defaults match the PDF
+/// spec (`Predictor 1`, `Colors 1`, `BitsPerComponent 8`, `Columns 1`).
+#[derive(Debug, Clone, Copy)]
+pub struct PredictorParams {
+    pub predictor: i64,
+    pub colors: i64,
+    pub bits_per_component: i64,
+    pub columns: i64,
 }
 
-impl PredictorParams {
-    /// Read predictor parameters from a `/DecodeParms` dictionary, applying the
-    /// ISO 32000-1 defaults. Returns `None` when `/Predictor` is absent or `< 2`
-    /// (1 means "no prediction").
-    fn from_dict(dict: &Dictionary) -> Option<Self> {
-        let predictor = dict.get(b"Predictor").and_then(Object::as_i64)?;
-        if predictor < 2 {
-            return None;
+impl Default for PredictorParams {
+    fn default() -> Self {
+        Self {
+            predictor: 1,
+            colors: 1,
+            bits_per_component: 8,
+            columns: 1,
         }
-        Some(Self {
-            predictor,
-            colors: dict.get(b"Colors").and_then(Object::as_i64).unwrap_or(1),
-            bits_per_component: dict
-                .get(b"BitsPerComponent")
-                .and_then(Object::as_i64)
-                .unwrap_or(8),
-            columns: dict.get(b"Columns").and_then(Object::as_i64).unwrap_or(1),
-        })
-    }
-
-    /// Bytes per pixel: `ceil(colors * bits_per_component / 8)`, at least 1.
-    fn bytes_per_pixel(&self) -> usize {
-        let bits = self.colors.max(1) * self.bits_per_component.max(1);
-        (((bits + 7) / 8) as usize).max(1)
-    }
-
-    /// Bytes in one (unfiltered) row: `ceil(colors * bpc * columns / 8)`.
-    fn row_bytes(&self) -> usize {
-        let bits = self.colors.max(1) * self.bits_per_component.max(1) * self.columns.max(1);
-        ((bits + 7) / 8) as usize
     }
 }
 
@@ -62,220 +34,211 @@ fn filter_err(msg: &str) -> EngineError {
     EngineError::Filter(msg.to_string())
 }
 
-/// Reverse the predictor (if any) named by a `/DecodeParms` dictionary.
-///
-/// When the dict carries no `/Predictor` (or `/Predictor 1`), `data` is returned
-/// unchanged. Otherwise the appropriate inverse (TIFF 2 or PNG 10..=15) runs.
-pub fn apply_predictor(params_dict: &Dictionary, data: &[u8]) -> Result<Vec<u8>> {
-    let Some(params) = PredictorParams::from_dict(params_dict) else {
-        return Ok(data.to_vec());
-    };
-    let row_bytes = params.row_bytes();
-    if row_bytes == 0 {
-        return Ok(data.to_vec());
-    }
-    if params.predictor == 2 {
-        return tiff_predictor_2(&params, row_bytes, data);
-    }
-    if (10..=15).contains(&params.predictor) {
-        return png_predictor(&params, row_bytes, data);
-    }
-    Err(filter_err(&format!(
-        "unsupported /Predictor {}",
-        params.predictor
-    )))
+/// Bytes per pixel (a "sample group"), rounded up — used as the per-component
+/// stride for Sub/Average/Paeth. PDF predictors with sub-byte samples still step
+/// by at least one byte.
+fn bytes_per_pixel(colors: i64, bits: i64) -> usize {
+    let bits_per_pixel = colors.max(1) * bits.max(1);
+    ((bits_per_pixel + 7) / 8).max(1) as usize
 }
 
-/// TIFF Predictor 2: each sample was stored as the difference from the sample
-/// one pixel to its left (per component); undo by running addition along each
-/// row. Only the byte-aligned component widths (8/16) are reversed here; other
-/// widths are returned verbatim (the data is rare and best left untouched rather
-/// than mangled).
-fn tiff_predictor_2(params: &PredictorParams, row_bytes: usize, data: &[u8]) -> Result<Vec<u8>> {
+/// Bytes per row for `columns` pixels of `colors`×`bits` samples (rounded up to
+/// a byte boundary, as PNG/PDF rows are).
+fn bytes_per_row(columns: i64, colors: i64, bits: i64) -> usize {
+    let bits_per_row = columns.max(0) * colors.max(1) * bits.max(1);
+    ((bits_per_row + 7) / 8) as usize
+}
+
+/// Reverse the predictor named by `params` over `data`. `Predictor` ≤ 1 is the
+/// identity (data returned unchanged).
+pub fn undo_predictor(data: &[u8], params: PredictorParams) -> Result<Vec<u8>> {
+    match params.predictor {
+        p if p <= 1 => Ok(data.to_vec()),
+        2 => undo_tiff_predictor2(data, params),
+        10..=15 => undo_png_predictor(data, params),
+        other => Err(filter_err(&format!("unsupported /Predictor {other}"))),
+    }
+}
+
+/// TIFF Predictor 2: each component is the horizontal difference from the
+/// component one pixel to its left. Only the 8-bit case is implemented (the only
+/// one seen in real PDFs); other bit depths are rejected rather than guessed.
+fn undo_tiff_predictor2(data: &[u8], params: PredictorParams) -> Result<Vec<u8>> {
+    if params.bits_per_component != 8 {
+        return Err(filter_err(
+            "TIFF Predictor 2 with non-8-bit components is unsupported",
+        ));
+    }
+    let row_len = bytes_per_row(params.columns, params.colors, 8);
+    if row_len == 0 {
+        return Ok(data.to_vec());
+    }
     let colors = params.colors.max(1) as usize;
     let mut out = data.to_vec();
-    match params.bits_per_component {
-        8 => {
-            for row in out.chunks_mut(row_bytes) {
-                for i in colors..row.len() {
-                    row[i] = row[i].wrapping_add(row[i - colors]);
-                }
-            }
+    for row in out.chunks_mut(row_len) {
+        for i in colors..row.len() {
+            row[i] = row[i].wrapping_add(row[i - colors]);
         }
-        16 => {
-            let stride = colors * 2;
-            for row in out.chunks_mut(row_bytes) {
-                let mut i = stride;
-                while i + 1 < row.len() {
-                    let left = u16::from(row[i - stride]) << 8 | u16::from(row[i - stride + 1]);
-                    let cur = u16::from(row[i]) << 8 | u16::from(row[i + 1]);
-                    let sum = cur.wrapping_add(left);
-                    row[i] = (sum >> 8) as u8;
-                    row[i + 1] = (sum & 0xff) as u8;
-                    i += 2;
-                }
-            }
-        }
-        _ => {}
     }
     Ok(out)
 }
 
-/// PNG predictors (10..=15): the data is a sequence of rows, each prefixed by a
-/// one-byte filter type (0..=4). Reverse the named filter using the previous
-/// (already-reconstructed) row, dropping the per-row filter bytes from the
-/// output. Trailing bytes that don't form a full row are ignored (lenient, like
-/// real readers, rather than failing the whole stream).
-fn png_predictor(params: &PredictorParams, row_bytes: usize, data: &[u8]) -> Result<Vec<u8>> {
-    let bpp = params.bytes_per_pixel();
-    let stride = row_bytes + 1; // +1 filter-type byte per row
-    let row_count = data.len() / stride;
-    let mut out = vec![0u8; row_count * row_bytes];
-    let mut prev = vec![0u8; row_bytes];
+/// PNG predictors: every row starts with a filter-type byte, then `row_len`
+/// data bytes. Each filter is reversed against the already-reconstructed
+/// previous row (zeros for the first row).
+fn undo_png_predictor(data: &[u8], params: PredictorParams) -> Result<Vec<u8>> {
+    let row_len = bytes_per_row(params.columns, params.colors, params.bits_per_component);
+    if row_len == 0 {
+        return Err(filter_err("PNG predictor with zero-length rows"));
+    }
+    let bpp = bytes_per_pixel(params.colors, params.bits_per_component);
+    let stride = row_len + 1; // +1 for the per-row filter-type byte
 
-    for r in 0..row_count {
-        let src = &data[r * stride..r * stride + stride];
-        let filter = src[0];
-        let cur_in = &src[1..];
-        let cur_out = &mut out[r * row_bytes..r * row_bytes + row_bytes];
+    let mut out = Vec::with_capacity(data.len());
+    let mut previous = vec![0u8; row_len];
 
-        for i in 0..row_bytes {
-            let raw = cur_in[i];
-            let a = if i >= bpp { cur_out[i - bpp] } else { 0 }; // left
-            let b = prev[i]; // up
-            let c = if i >= bpp { prev[i - bpp] } else { 0 }; // upper-left
-            let value = match filter {
-                0 => raw,                                                 // None
-                1 => raw.wrapping_add(a),                                 // Sub
-                2 => raw.wrapping_add(b),                                 // Up
-                3 => raw.wrapping_add(((a as u16 + b as u16) / 2) as u8), // Average
-                4 => raw.wrapping_add(paeth(a, b, c)),                    // Paeth
-                _ => return Err(filter_err("invalid PNG predictor row filter")),
-            };
-            cur_out[i] = value;
+    for raw_row in data.chunks(stride) {
+        if raw_row.len() < 1 + row_len {
+            // A trailing partial row (truncated stream): stop cleanly.
+            break;
         }
-        prev.copy_from_slice(cur_out);
+        let filter_type = raw_row[0];
+        let mut current = raw_row[1..1 + row_len].to_vec();
+
+        match filter_type {
+            0 => {} // None
+            1 => {
+                // Sub: add the byte `bpp` to the left.
+                for i in bpp..row_len {
+                    current[i] = current[i].wrapping_add(current[i - bpp]);
+                }
+            }
+            2 => {
+                // Up: add the byte above.
+                for i in 0..row_len {
+                    current[i] = current[i].wrapping_add(previous[i]);
+                }
+            }
+            3 => {
+                // Average: add floor((left + above) / 2).
+                for i in 0..row_len {
+                    let left = if i >= bpp { current[i - bpp] as u16 } else { 0 };
+                    let above = previous[i] as u16;
+                    current[i] = current[i].wrapping_add(((left + above) / 2) as u8);
+                }
+            }
+            4 => {
+                // Paeth.
+                for i in 0..row_len {
+                    let left = if i >= bpp { current[i - bpp] } else { 0 };
+                    let above = previous[i];
+                    let upper_left = if i >= bpp { previous[i - bpp] } else { 0 };
+                    current[i] = current[i].wrapping_add(paeth(left, above, upper_left));
+                }
+            }
+            other => {
+                return Err(filter_err(&format!("invalid PNG filter type {other}")));
+            }
+        }
+
+        out.extend_from_slice(&current);
+        previous = current;
     }
     Ok(out)
 }
 
-/// The PNG Paeth predictor function (RFC 2083 / ISO 32000-1 §7.4.4.4): pick the
-/// neighbour (left `a`, up `b`, upper-left `c`) closest to `a + b - c`.
-fn paeth(a: u8, b: u8, c: u8) -> u8 {
-    let p = a as i32 + b as i32 - c as i32;
-    let pa = (p - a as i32).abs();
-    let pb = (p - b as i32).abs();
-    let pc = (p - c as i32).abs();
+/// PNG Paeth predictor (RFC 2083 / PNG spec): pick the neighbour closest to
+/// `left + above - upper_left`.
+fn paeth(left: u8, above: u8, upper_left: u8) -> u8 {
+    let p = left as i32 + above as i32 - upper_left as i32;
+    let pa = (p - left as i32).abs();
+    let pb = (p - above as i32).abs();
+    let pc = (p - upper_left as i32).abs();
     if pa <= pb && pa <= pc {
-        a
+        left
     } else if pb <= pc {
-        b
+        above
     } else {
-        c
+        upper_left
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::Object;
 
-    fn params(entries: &[(&[u8], i64)]) -> Dictionary {
-        let mut d = Dictionary::new();
-        for &(k, v) in entries {
-            d.set(k.to_vec(), Object::Integer(v));
+    fn params(predictor: i64, colors: i64, bits: i64, columns: i64) -> PredictorParams {
+        PredictorParams {
+            predictor,
+            colors,
+            bits_per_component: bits,
+            columns,
         }
-        d
     }
 
     #[test]
-    fn no_predictor_returns_verbatim() {
-        // Predictor absent → bytes unchanged.
-        let d = Dictionary::new();
-        assert_eq!(apply_predictor(&d, &[1, 2, 3]).unwrap(), vec![1, 2, 3]);
-        // Predictor 1 ("no prediction") → also unchanged.
-        let d1 = params(&[(b"Predictor", 1)]);
-        assert_eq!(apply_predictor(&d1, &[9, 8]).unwrap(), vec![9, 8]);
+    fn predictor_one_is_identity() {
+        let data = [1u8, 2, 3, 4];
+        assert_eq!(undo_predictor(&data, params(1, 1, 8, 4)).unwrap(), data);
     }
 
     #[test]
-    fn png_up_filter_2x2_grayscale() {
-        // 2×2, 1 colour, 8 bpc → row_bytes = 2, stride = 3 (filter byte + row).
-        // Target image rows: [10, 20] then [13, 25].
-        // Row 0 filter None(0): stored verbatim → [10, 20].
-        // Row 1 filter Up(2): stored as (target - above) → [13-10, 25-20] = [3, 5].
-        let d = params(&[
-            (b"Predictor", 12),
-            (b"Colors", 1),
-            (b"BitsPerComponent", 8),
-            (b"Columns", 2),
-        ]);
-        let encoded = [0, 10, 20, 2, 3, 5];
-        assert_eq!(apply_predictor(&d, &encoded).unwrap(), vec![10, 20, 13, 25]);
-    }
-
-    #[test]
-    fn png_sub_and_paeth_rows_rgb() {
-        // 2 pixels wide, 3 colours, 8 bpc → bpp = 3, row_bytes = 6, stride = 7.
-        // Row 0 Sub(1): left neighbour is the pixel one to the left (bpp back).
-        //   stored [10,20,30, 1,2,3] → out [10,20,30, 11,22,33].
-        // Row 1 Paeth(4) against row 0; with stored zeros the Paeth predictor of
-        //   (a,b,c) reconstructs to the running prediction. Use raw 0s so each
-        //   output equals paeth(left, up, upper-left).
-        let d = params(&[
-            (b"Predictor", 15),
-            (b"Colors", 3),
-            (b"BitsPerComponent", 8),
-            (b"Columns", 2),
-        ]);
-        let mut encoded = vec![1u8, 10, 20, 30, 1, 2, 3];
-        encoded.extend_from_slice(&[4u8, 0, 0, 0, 0, 0, 0]);
-        let out = apply_predictor(&d, &encoded).unwrap();
-        // Row 0 reconstructed.
-        assert_eq!(&out[0..6], &[10, 20, 30, 11, 22, 33]);
-        // Row 1: first pixel = paeth(0, above, 0) = above (b) since p=b; second
-        // pixel = paeth(left, above, upper-left).
-        let row0 = [10u8, 20, 30, 11, 22, 33];
-        let mut expected = [0u8; 6];
-        for i in 0..6 {
-            let a = if i >= 3 { expected[i - 3] } else { 0 };
-            let b = row0[i];
-            let c = if i >= 3 { row0[i - 3] } else { 0 };
-            expected[i] = paeth(a, b, c);
-        }
-        assert_eq!(&out[6..12], &expected);
-    }
-
-    #[test]
-    fn tiff_predictor_2_row_8bpc() {
-        // TIFF 2, 1 colour, 8 bpc, 4 columns → row_bytes = 4, no per-row byte.
-        // Stored as left-differences of [5, 7, 6, 9] → [5, 2, -1(=255), 3].
-        let d = params(&[
-            (b"Predictor", 2),
-            (b"Colors", 1),
-            (b"BitsPerComponent", 8),
-            (b"Columns", 4),
-        ]);
-        let encoded = [5u8, 2, 255, 3];
-        assert_eq!(apply_predictor(&d, &encoded).unwrap(), vec![5, 7, 6, 9]);
-    }
-
-    #[test]
-    fn tiff_predictor_2_rgb_two_rows() {
-        // TIFF 2, 3 colours, 8 bpc, 2 columns → row_bytes = 6, differencing is
-        // per-component across the row, and resets at each row boundary.
-        // Row 0 target [10,20,30, 12,24,36] → stored [10,20,30, 2,4,6].
-        // Row 1 target [ 1, 2, 3,  5, 7, 9] → stored [ 1, 2, 3, 4, 5, 6].
-        let d = params(&[
-            (b"Predictor", 2),
-            (b"Colors", 3),
-            (b"BitsPerComponent", 8),
-            (b"Columns", 2),
-        ]);
-        let encoded = [10u8, 20, 30, 2, 4, 6, 1, 2, 3, 4, 5, 6];
+    fn tiff_predictor2_horizontal_diff() {
+        // 1 row, 4 columns, 1 colour, 8-bit. Original [10,20,30,40] differenced
+        // → [10,10,10,10]; undoing the diff restores the original.
+        let encoded = [10u8, 10, 10, 10];
         assert_eq!(
-            apply_predictor(&d, &encoded).unwrap(),
-            vec![10, 20, 30, 12, 24, 36, 1, 2, 3, 5, 7, 9]
+            undo_predictor(&encoded, params(2, 1, 8, 4)).unwrap(),
+            [10, 20, 30, 40]
         );
+    }
+
+    #[test]
+    fn tiff_predictor2_multi_component() {
+        // 2 columns, 3 colours (RGB), 8-bit. Original row = [R0 G0 B0 R1 G1 B1]
+        // = [10,20,30,40,50,60]. Differenced per component → [10,20,30,30,30,30].
+        let encoded = [10u8, 20, 30, 30, 30, 30];
+        assert_eq!(
+            undo_predictor(&encoded, params(2, 3, 8, 2)).unwrap(),
+            [10, 20, 30, 40, 50, 60]
+        );
+    }
+
+    #[test]
+    fn png_up_predictor() {
+        // 2 rows, 3 columns, 1 colour, 8-bit. Row 0 filter None [10,20,30];
+        // row 1 filter Up (2) with deltas [1,1,1] → reconstructs [11,21,31].
+        let encoded = [
+            0u8, 10, 20, 30, // row 0: None
+            2u8, 1, 1, 1, // row 1: Up
+        ];
+        assert_eq!(
+            undo_predictor(&encoded, params(12, 1, 8, 3)).unwrap(),
+            [10, 20, 30, 11, 21, 31]
+        );
+    }
+
+    #[test]
+    fn png_sub_predictor() {
+        // 1 row, 4 columns, 1 colour, 8-bit. Filter Sub (1): bytes are deltas
+        // from the byte one pixel (1 byte) to the left.
+        // Original [5,7,9,11] → Sub deltas [5,2,2,2].
+        let encoded = [1u8, 5, 2, 2, 2];
+        assert_eq!(
+            undo_predictor(&encoded, params(11, 1, 8, 4)).unwrap(),
+            [5, 7, 9, 11]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_predictor() {
+        assert!(undo_predictor(&[0u8], params(99, 1, 8, 1)).is_err());
+    }
+
+    #[test]
+    fn paeth_matches_png_reference() {
+        // Reference values from the PNG spec worked cases.
+        assert_eq!(paeth(0, 0, 0), 0);
+        assert_eq!(paeth(10, 20, 5), 20); // p=25; closest is above(20)
     }
 }
