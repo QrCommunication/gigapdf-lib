@@ -1478,6 +1478,480 @@ const STD_ENC_HIGH: &[(u8, &str)] = &[
     (0xCF, "caron"),
 ];
 
+// ── Type 1 → glyph outlines (rasterizer feed) ───────────────────────────────
+//
+// `to_cff` transcodes Type 1 → Type 2 for *embedding*; rendering instead reads
+// the charstrings directly. A second interpreter (`T1Outline`) walks the same
+// Type 1 stack machine as `T1Interp` but emits **flattened contours** (the same
+// `Vec<Vec<(f64, f64)>>` shape `cff::CffFont`/`truetype::TrueTypeFont` produce),
+// so the rasterizer's outline-fill path draws Type 1 glyphs exactly like CFF and
+// TrueType ones. Cubics are flattened with the same 8-step granularity the CFF
+// interpreter uses, keeping all three glyph sources visually consistent.
+
+/// Interpret a Type 1 charstring into flattened glyph contours (font units).
+/// Mirrors [`T1Interp`]'s opcode handling (`hsbw`/`sbw`, move/line/curve,
+/// `callsubr`, flex + hint-replacement OtherSubrs, `div`, `setcurrentpoint`)
+/// but builds contours instead of a Type 2 byte stream; `seac` composites are
+/// stitched by the caller.
+struct T1Outline<'a> {
+    stack: Vec<f64>,
+    ps_stack: Vec<f64>,
+    x: f64,
+    y: f64,
+    subrs: &'a [Vec<u8>],
+    contours: Vec<Vec<(f64, f64)>>,
+    current: Vec<(f64, f64)>,
+    width: f64,
+    flex_pts: Vec<(f64, f64)>,
+    in_flex: bool,
+    flex_start: (f64, f64),
+    seac: Option<SeacRequest>,
+    done: bool,
+}
+
+impl<'a> T1Outline<'a> {
+    fn new(subrs: &'a [Vec<u8>]) -> T1Outline<'a> {
+        T1Outline {
+            stack: Vec::new(),
+            ps_stack: Vec::new(),
+            x: 0.0,
+            y: 0.0,
+            subrs,
+            contours: Vec::new(),
+            current: Vec::new(),
+            width: 0.0,
+            flex_pts: Vec::new(),
+            in_flex: false,
+            flex_start: (0.0, 0.0),
+            seac: None,
+            done: false,
+        }
+    }
+
+    /// Close the contour in progress (`closepath` / new `moveto` / `endchar`).
+    /// Contours of fewer than two vertices carry no area and are dropped.
+    fn finish_contour(&mut self) {
+        if self.current.len() >= 2 {
+            self.contours.push(std::mem::take(&mut self.current));
+        } else {
+            self.current.clear();
+        }
+    }
+
+    fn moveto(&mut self, dx: f64, dy: f64) {
+        if self.in_flex {
+            // Collect the 7 flex reference/control points without drawing.
+            self.x += dx;
+            self.y += dy;
+            self.flex_pts.push((self.x, self.y));
+            return;
+        }
+        self.finish_contour();
+        self.x += dx;
+        self.y += dy;
+        self.current.push((self.x, self.y));
+    }
+
+    fn lineto(&mut self, dx: f64, dy: f64) {
+        self.x += dx;
+        self.y += dy;
+        self.current.push((self.x, self.y));
+    }
+
+    /// Flatten a relative cubic Bézier into line segments (8 steps, matching the
+    /// CFF interpreter), appending the on-curve points to the current contour.
+    fn curveto(&mut self, d: [f64; 6]) {
+        let p0 = (self.x, self.y);
+        let p1 = (p0.0 + d[0], p0.1 + d[1]);
+        let p2 = (p1.0 + d[2], p1.1 + d[3]);
+        let p3 = (p2.0 + d[4], p2.1 + d[5]);
+        const STEPS: usize = 8;
+        for i in 1..=STEPS {
+            let t = i as f64 / STEPS as f64;
+            let mt = 1.0 - t;
+            let x = mt * mt * mt * p0.0
+                + 3.0 * mt * mt * t * p1.0
+                + 3.0 * mt * t * t * p2.0
+                + t * t * t * p3.0;
+            let y = mt * mt * mt * p0.1
+                + 3.0 * mt * mt * t * p1.1
+                + 3.0 * mt * t * t * p2.1
+                + t * t * t * p3.1;
+            self.current.push((x, y));
+        }
+        self.x = p3.0;
+        self.y = p3.1;
+    }
+
+    /// Execute a Type 1 charstring (inlining subrs). `depth` guards recursion.
+    fn exec(&mut self, code: &[u8], depth: usize) {
+        if depth > 30 || self.done {
+            return;
+        }
+        let mut i = 0;
+        while i < code.len() {
+            if self.done {
+                return;
+            }
+            let b = code[i];
+            i += 1;
+            match b {
+                13 => {
+                    // hsbw: sbx wx → side bearing + glyph width.
+                    let sbx = self.stack.first().copied().unwrap_or(0.0);
+                    self.width = self.stack.get(1).copied().unwrap_or(0.0);
+                    self.x = sbx;
+                    self.y = 0.0;
+                    self.stack.clear();
+                }
+                9 => {
+                    // closepath: end the current subpath (the fill closes it too).
+                    self.finish_contour();
+                    self.stack.clear();
+                }
+                21 => {
+                    let dy = self.stack.pop().unwrap_or(0.0);
+                    let dx = self.stack.pop().unwrap_or(0.0);
+                    self.moveto(dx, dy);
+                    self.stack.clear();
+                }
+                22 => {
+                    let dx = self.stack.pop().unwrap_or(0.0);
+                    self.moveto(dx, 0.0);
+                    self.stack.clear();
+                }
+                4 => {
+                    let dy = self.stack.pop().unwrap_or(0.0);
+                    self.moveto(0.0, dy);
+                    self.stack.clear();
+                }
+                5 => {
+                    let dy = self.stack.get(1).copied().unwrap_or(0.0);
+                    let dx = self.stack.first().copied().unwrap_or(0.0);
+                    self.lineto(dx, dy);
+                    self.stack.clear();
+                }
+                6 => {
+                    let dx = self.stack.first().copied().unwrap_or(0.0);
+                    self.lineto(dx, 0.0);
+                    self.stack.clear();
+                }
+                7 => {
+                    let dy = self.stack.first().copied().unwrap_or(0.0);
+                    self.lineto(0.0, dy);
+                    self.stack.clear();
+                }
+                8 => {
+                    let s = self.take6();
+                    self.curveto(s);
+                    self.stack.clear();
+                }
+                30 => {
+                    // vhcurveto: dy1 dx2 dy2 dx3 → (0 dy1 dx2 dy2 dx3 0)
+                    let a = self.stack.first().copied().unwrap_or(0.0);
+                    let b2 = self.stack.get(1).copied().unwrap_or(0.0);
+                    let c = self.stack.get(2).copied().unwrap_or(0.0);
+                    let d = self.stack.get(3).copied().unwrap_or(0.0);
+                    self.curveto([0.0, a, b2, c, d, 0.0]);
+                    self.stack.clear();
+                }
+                31 => {
+                    // hvcurveto: dx1 dx2 dy2 dy3 → (dx1 0 dx2 dy2 0 dy3)
+                    let a = self.stack.first().copied().unwrap_or(0.0);
+                    let b2 = self.stack.get(1).copied().unwrap_or(0.0);
+                    let c = self.stack.get(2).copied().unwrap_or(0.0);
+                    let d = self.stack.get(3).copied().unwrap_or(0.0);
+                    self.curveto([a, 0.0, b2, c, 0.0, d]);
+                    self.stack.clear();
+                }
+                1 | 3 => {
+                    // hstem / vstem: hints carry no outline; drop the operands.
+                    self.stack.clear();
+                }
+                10 => {
+                    // callsubr: index (no bias in Type 1).
+                    if let Some(idx) = self.stack.pop() {
+                        let n = idx.round() as i64;
+                        if n >= 0 {
+                            if let Some(sub) = self.subrs.get(n as usize).cloned() {
+                                self.exec(&sub, depth + 1);
+                            }
+                        }
+                    }
+                }
+                11 => return, // return from subr.
+                14 => {
+                    // endchar: close the final subpath and stop.
+                    self.finish_contour();
+                    self.done = true;
+                    return;
+                }
+                12 => {
+                    let b1 = code.get(i).copied().unwrap_or(0);
+                    i += 1;
+                    self.exec_escape(b1);
+                }
+                28 => {
+                    let hi = code.get(i).copied().unwrap_or(0);
+                    let lo = code.get(i + 1).copied().unwrap_or(0);
+                    i += 2;
+                    self.stack.push(i16::from_be_bytes([hi, lo]) as f64);
+                }
+                32..=246 => self.stack.push(b as f64 - 139.0),
+                247..=250 => {
+                    let b1 = code.get(i).copied().unwrap_or(0) as f64;
+                    i += 1;
+                    self.stack.push((b as f64 - 247.0) * 256.0 + b1 + 108.0);
+                }
+                251..=254 => {
+                    let b1 = code.get(i).copied().unwrap_or(0) as f64;
+                    i += 1;
+                    self.stack.push(-(b as f64 - 251.0) * 256.0 - b1 - 108.0);
+                }
+                255 => {
+                    // 32-bit integer (Type 1 uses plain i32, not 16.16 Fixed).
+                    let v = i32::from_be_bytes([
+                        code.get(i).copied().unwrap_or(0),
+                        code.get(i + 1).copied().unwrap_or(0),
+                        code.get(i + 2).copied().unwrap_or(0),
+                        code.get(i + 3).copied().unwrap_or(0),
+                    ]);
+                    i += 4;
+                    self.stack.push(v as f64);
+                }
+                _ => self.stack.clear(),
+            }
+        }
+    }
+
+    fn exec_escape(&mut self, op: u8) {
+        match op {
+            0 => self.stack.clear(),     // dotsection
+            1 | 2 => self.stack.clear(), // vstem3 / hstem3 (no outline)
+            6 => {
+                // seac: asb adx ady bchar achar → accent composition request.
+                let asb = self.stack.first().copied().unwrap_or(0.0);
+                let adx = self.stack.get(1).copied().unwrap_or(0.0);
+                let ady = self.stack.get(2).copied().unwrap_or(0.0);
+                let bchar = self.stack.get(3).copied().unwrap_or(0.0) as u8;
+                let achar = self.stack.get(4).copied().unwrap_or(0.0) as u8;
+                // The accent is shifted to (adx − asb + accent.sbx, ady); the
+                // accent's own `hsbw` re-anchors x to its sbx, so passing
+                // `adx − asb` here lands it correctly once its sbx is applied.
+                self.seac = Some((adx - asb, ady, bchar, achar));
+                self.finish_contour();
+                self.done = true;
+                self.stack.clear();
+            }
+            7 => {
+                // sbw: sbx sby wx wy
+                let sbx = self.stack.first().copied().unwrap_or(0.0);
+                self.y = self.stack.get(1).copied().unwrap_or(0.0);
+                self.width = self.stack.get(2).copied().unwrap_or(0.0);
+                self.x = sbx;
+                self.stack.clear();
+            }
+            12 => {
+                // div: a b → a/b
+                let b = self.stack.pop().unwrap_or(1.0);
+                let a = self.stack.pop().unwrap_or(0.0);
+                self.stack.push(if b != 0.0 { a / b } else { 0.0 });
+            }
+            16 => self.call_othersubr(),
+            17 => {
+                // pop: move one value from the PS stack to the operand stack.
+                if let Some(v) = self.ps_stack.pop() {
+                    self.stack.push(v);
+                }
+            }
+            33 => {
+                // setcurrentpoint: x y — re-anchors the current point.
+                self.y = self.stack.get(1).copied().unwrap_or(self.y);
+                self.x = self.stack.first().copied().unwrap_or(self.x);
+                self.stack.clear();
+            }
+            _ => self.stack.clear(),
+        }
+    }
+
+    /// OtherSubrs protocol (`<args…> n othersubr# callothersubr`): flex (0/1/2)
+    /// and hint replacement (3); unknown subrs echo their arguments to the PS
+    /// stack for the following `pop`s. Same behaviour as [`T1Interp`].
+    fn call_othersubr(&mut self) {
+        let subr = self.stack.pop().unwrap_or(0.0).round() as i64;
+        let n = self.stack.pop().unwrap_or(0.0).round().max(0.0) as usize;
+        let mut args = Vec::with_capacity(n);
+        for _ in 0..n {
+            args.push(self.stack.pop().unwrap_or(0.0));
+        }
+        args.reverse();
+        match subr {
+            1 => {
+                // Start flex: subsequent rmovetos collect points, none drawn.
+                self.in_flex = true;
+                self.flex_start = (self.x, self.y);
+                self.flex_pts.clear();
+            }
+            0 => {
+                // End flex: emit two cubics from the collected points.
+                self.in_flex = false;
+                self.emit_flex();
+                self.ps_stack.push(self.y);
+                self.ps_stack.push(self.x);
+            }
+            2 => {
+                // Flex add-point: no-op (captured via rmoveto already).
+            }
+            3 => {
+                // Hint replacement: push back the subr# for the trailing `pop`.
+                self.ps_stack.push(args.last().copied().unwrap_or(3.0));
+            }
+            _ => {
+                for v in args {
+                    self.ps_stack.push(v);
+                }
+            }
+        }
+    }
+
+    /// Emit the two Béziers of a flex from the 7 collected absolute points
+    /// (point 0 is the reference, ignored; 1..=3 and 4..=6 are the curves).
+    fn emit_flex(&mut self) {
+        if self.flex_pts.len() < 7 {
+            // Degenerate capture: fall back to a straight line to the last point.
+            if let Some(&(ex, ey)) = self.flex_pts.last() {
+                self.lineto(ex - self.x, ey - self.y);
+            }
+            self.flex_pts.clear();
+            return;
+        }
+        let p = self.flex_pts.clone();
+        let start = self.flex_start;
+        self.x = start.0;
+        self.y = start.1;
+        self.curveto([
+            p[1].0 - start.0,
+            p[1].1 - start.1,
+            p[2].0 - p[1].0,
+            p[2].1 - p[1].1,
+            p[3].0 - p[2].0,
+            p[3].1 - p[2].1,
+        ]);
+        self.curveto([
+            p[4].0 - p[3].0,
+            p[4].1 - p[3].1,
+            p[5].0 - p[4].0,
+            p[5].1 - p[4].1,
+            p[6].0 - p[5].0,
+            p[6].1 - p[5].1,
+        ]);
+        self.flex_pts.clear();
+    }
+
+    fn take6(&mut self) -> [f64; 6] {
+        let mut s = [0.0; 6];
+        for (k, slot) in s.iter_mut().enumerate() {
+            *slot = self.stack.get(k).copied().unwrap_or(0.0);
+        }
+        s
+    }
+}
+
+/// Flatten one Type 1 glyph (by charstring) into contours plus its advance
+/// width, resolving a `seac` accent composite by stitching the base and accent
+/// glyphs (looked up by StandardEncoding code). `glyph_for_std_code` maps a
+/// StandardEncoding code to its charstring so the recursion can find them.
+fn outline_charstring(
+    charstring: &[u8],
+    subrs: &[Vec<u8>],
+    glyph_for_std_code: &dyn Fn(u8) -> Option<Vec<u8>>,
+    depth: usize,
+) -> (Vec<Vec<(f64, f64)>>, f64) {
+    let mut interp = T1Outline::new(subrs);
+    interp.exec(charstring, 0);
+    interp.finish_contour();
+    let width = interp.width;
+    let mut contours = interp.contours;
+    // `seac`: overlay the accent glyph (shifted) on the base glyph. Guard the
+    // recursion so a malformed self-referential composite can't loop forever.
+    if let Some((adx, ady, bchar, achar)) = interp.seac {
+        if depth < 4 {
+            if let Some(base_cs) = glyph_for_std_code(bchar) {
+                let (base, _) = outline_charstring(&base_cs, subrs, glyph_for_std_code, depth + 1);
+                contours = base;
+            }
+            if let Some(acc_cs) = glyph_for_std_code(achar) {
+                let (acc, _) = outline_charstring(&acc_cs, subrs, glyph_for_std_code, depth + 1);
+                for contour in acc {
+                    contours.push(contour.iter().map(|&(x, y)| (x + adx, y + ady)).collect());
+                }
+            }
+        }
+    }
+    (contours, width)
+}
+
+impl Type1Font {
+    /// Font design units per em (from `/FontMatrix`; 1000 by default). Mirrors
+    /// the [`crate::font::GlyphSource`] interface so the rasterizer can treat a
+    /// Type 1 program like a TrueType/CFF one.
+    pub fn units_per_em(&self) -> f64 {
+        self.units_per_em
+    }
+
+    /// Number of glyphs (charstrings) in the font.
+    pub fn num_glyphs(&self) -> u16 {
+        self.glyphs.len().min(u16::MAX as usize) as u16
+    }
+
+    /// Build a glyph-**name** → glyph-id map (id = index into `glyphs`). The
+    /// PDF layer resolves a simple font's `/Encoding` against this, exactly as
+    /// it does against a CFF charset.
+    pub fn name_to_gid_map(&self) -> std::collections::BTreeMap<String, u16> {
+        let mut map = std::collections::BTreeMap::new();
+        for (gid, (name, _)) in self.glyphs.iter().enumerate() {
+            if gid > u16::MAX as usize {
+                break;
+            }
+            // First definition wins (mirrors the charset order other sources use).
+            map.entry(name.clone()).or_insert(gid as u16);
+        }
+        map
+    }
+
+    /// Flattened contours (font units) for glyph `gid`, resolving `seac`
+    /// composites. Out-of-range ids yield no contours.
+    pub fn glyph_polygons(&self, gid: u16) -> Vec<Vec<(f64, f64)>> {
+        let Some((_, charstring)) = self.glyphs.get(gid as usize) else {
+            return Vec::new();
+        };
+        let lookup = |code: u8| self.charstring_for_std_code(code);
+        outline_charstring(charstring, &self.subrs, &lookup, 0).0
+    }
+
+    /// Advance width (font units) for glyph `gid`, read from its `hsbw`/`sbw`.
+    /// Falls back to half an em for an unknown id (matching the other sources).
+    pub fn advance_width(&self, gid: u16) -> f64 {
+        match self.glyphs.get(gid as usize) {
+            Some((_, charstring)) => {
+                let lookup = |code: u8| self.charstring_for_std_code(code);
+                outline_charstring(charstring, &self.subrs, &lookup, 0).1
+            }
+            None => self.units_per_em * 0.5,
+        }
+    }
+
+    /// The charstring of the glyph named by StandardEncoding `code`, used to
+    /// resolve `seac` base/accent components.
+    fn charstring_for_std_code(&self, code: u8) -> Option<Vec<u8>> {
+        let name = standard_encoding_name(code)?;
+        self.glyphs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, cs)| cs.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1645,6 +2119,340 @@ mod tests {
         let enc = encrypt(plain, 4330, &[9, 9, 9, 9]);
         let dec = decrypt(&enc, 4330, 4);
         assert_eq!(&dec, plain);
+    }
+
+    // ── Type 1 → glyph outline interpreter ──────────────────────────────────
+
+    /// Reference cubic flattening (8 steps), independent of the interpreter, to
+    /// derive the expected on-curve points from absolute control points.
+    fn flatten_ref(
+        p0: (f64, f64),
+        p1: (f64, f64),
+        p2: (f64, f64),
+        p3: (f64, f64),
+    ) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        for i in 1..=8usize {
+            let t = i as f64 / 8.0;
+            let mt = 1.0 - t;
+            let x = mt * mt * mt * p0.0
+                + 3.0 * mt * mt * t * p1.0
+                + 3.0 * mt * t * t * p2.0
+                + t * t * t * p3.0;
+            let y = mt * mt * mt * p0.1
+                + 3.0 * mt * mt * t * p1.1
+                + 3.0 * mt * t * t * p2.1
+                + t * t * t * p3.1;
+            out.push((x, y));
+        }
+        out
+    }
+
+    /// The `cs_letter` box charstring (move + three lines) flattens to exactly
+    /// the four box corners, with the width read from `hsbw`.
+    #[test]
+    fn outline_traces_box_contour() {
+        let cs = cs_letter();
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        let none = |_code: u8| None;
+        let (contours, width) = outline_charstring(&cs, &no_subrs, &none, 0);
+        assert_eq!(width, 600.0, "advance width from hsbw");
+        assert_eq!(contours.len(), 1, "single contour");
+        // hsbw sbx=50 → x=50; rmoveto 100 0 → (150,0); +300,0; +0,700; -300,0.
+        assert_eq!(
+            contours[0],
+            vec![(150.0, 0.0), (450.0, 0.0), (450.0, 700.0), (150.0, 700.0)],
+            "box corners in glyph space"
+        );
+    }
+
+    /// `rrcurveto` is flattened with the same 8-step granularity as CFF, and the
+    /// contour ends exactly at the curve's final on-curve point.
+    #[test]
+    fn outline_flattens_rrcurveto() {
+        let mut cs = Vec::new();
+        t1_num(&mut cs, 0); // sbx
+        t1_num(&mut cs, 1000); // wx
+        cs.push(13); // hsbw → x=0,y=0
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 0);
+        cs.push(21); // rmoveto 0 0 → (0,0)
+        for d in [0, 100, 100, 100, 100, 0] {
+            t1_num(&mut cs, d);
+        }
+        cs.push(8); // rrcurveto → p1=(0,100) p2=(100,200) p3=(200,200)
+        cs.push(14); // endchar
+
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        let none = |_code: u8| None;
+        let (contours, _) = outline_charstring(&cs, &no_subrs, &none, 0);
+        assert_eq!(contours.len(), 1);
+        let mut expected = vec![(0.0, 0.0)];
+        expected.extend(flatten_ref(
+            (0.0, 0.0),
+            (0.0, 100.0),
+            (100.0, 200.0),
+            (200.0, 200.0),
+        ));
+        assert_eq!(contours[0].len(), expected.len());
+        for (got, exp) in contours[0].iter().zip(&expected) {
+            assert!(
+                (got.0 - exp.0).abs() < 1e-9 && (got.1 - exp.1).abs() < 1e-9,
+                "point {got:?} != {exp:?}"
+            );
+        }
+        assert_eq!(
+            *contours[0].last().unwrap(),
+            (200.0, 200.0),
+            "curve endpoint"
+        );
+    }
+
+    /// `seac` stitches the base glyph plus the accent glyph translated by the
+    /// requested offset (resolved through `glyph_for_std_code`).
+    #[test]
+    fn outline_resolves_seac_composite() {
+        // Base: a unit square at (0,0)–(100,100) via hsbw/rmoveto/lines.
+        let mut base = Vec::new();
+        for d in [0, 700] {
+            t1_num(&mut base, d);
+        }
+        base.push(13); // hsbw 0 700
+        for (op, args) in [
+            (21u8, [0, 0].as_slice()), // rmoveto 0 0
+            (5, &[100, 0]),            // rlineto 100 0
+            (5, &[0, 100]),            // rlineto 0 100
+            (5, &[-100, 0]),           // rlineto -100 0
+        ] {
+            for &a in args {
+                t1_num(&mut base, a);
+            }
+            base.push(op);
+        }
+        base.push(14); // endchar
+
+        // Accent: a tiny square at the origin (same shape, smaller).
+        let mut accent = Vec::new();
+        for d in [0, 300] {
+            t1_num(&mut accent, d);
+        }
+        accent.push(13); // hsbw 0 300
+        for (op, args) in [
+            (21u8, [0, 0].as_slice()),
+            (5, &[40, 0]),
+            (5, &[0, 40]),
+            (5, &[-40, 0]),
+        ] {
+            for &a in args {
+                t1_num(&mut accent, a);
+            }
+            accent.push(op);
+        }
+        accent.push(14);
+        // Composite: `asb adx ady bchar achar seac`. bchar='A' (65), achar='B'
+        // (66). asb=0, so the accent shift is (adx, ady) = (200, 500).
+        let mut comp = Vec::new();
+        for d in [0, 700] {
+            t1_num(&mut comp, d);
+        }
+        comp.push(13); // hsbw 0 700 (seac's leading hsbw)
+        for d in [0, 200, 500, 65, 66] {
+            t1_num(&mut comp, d);
+        }
+        comp.push(12);
+        comp.push(6); // seac
+
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        let base_cs = base.clone();
+        let accent_cs = accent.clone();
+        let lookup = move |code: u8| match code {
+            65 => Some(base_cs.clone()),   // 'A'
+            66 => Some(accent_cs.clone()), // 'B'
+            _ => None,
+        };
+        let (contours, _) = outline_charstring(&comp, &no_subrs, &lookup, 0);
+        assert_eq!(contours.len(), 2, "base + accent contours");
+        // Base unchanged.
+        assert_eq!(
+            contours[0],
+            vec![(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+        );
+        // Accent translated by (200, 500).
+        assert_eq!(
+            contours[1],
+            vec![
+                (200.0, 500.0),
+                (240.0, 500.0),
+                (240.0, 540.0),
+                (200.0, 540.0)
+            ]
+        );
+    }
+
+    /// End-to-end through [`parse_type1`] + [`GlyphSource`]: the parsed synthetic
+    /// font exposes `A`'s box outline and width via the rasterizer's interface.
+    #[test]
+    fn glyph_source_type1_exposes_outline_and_width() {
+        let bytes = synthetic_type1();
+        let font = parse_type1(&bytes).expect("parse");
+        let source = crate::font::GlyphSource::Type1(font);
+        assert_eq!(source.units_per_em(), 1000.0);
+        // Resolve 'A' by name through the name→gid map (the PDF /Encoding path).
+        let names = source.as_type1().unwrap().name_to_gid_map();
+        let a_gid = *names.get("A").expect("A present");
+        let polys = source.glyph_polygons(a_gid);
+        assert_eq!(
+            polys,
+            vec![vec![
+                (150.0, 0.0),
+                (450.0, 0.0),
+                (450.0, 700.0),
+                (150.0, 700.0)
+            ]]
+        );
+        assert_eq!(source.advance_width(a_gid), 600.0);
+        // `.notdef` is an empty (zero-area) glyph: no contours.
+        let notdef_gid = *names.get(".notdef").expect("notdef present");
+        assert!(source.glyph_polygons(notdef_gid).is_empty());
+    }
+
+    /// The Type 1 box outline drives the same fill engine the rasterizer uses:
+    /// fill the contour and assert ink lands inside the box and nowhere outside.
+    #[test]
+    fn type1_outline_fills_device_pixels() {
+        let bytes = synthetic_type1();
+        let font = parse_type1(&bytes).expect("parse");
+        let source = crate::font::GlyphSource::Type1(font);
+        let a_gid = *source
+            .as_type1()
+            .unwrap()
+            .name_to_gid_map()
+            .get("A")
+            .unwrap();
+        let upem = source.units_per_em();
+
+        // Place the glyph at a known scale on a small canvas (font y-up → device
+        // y-down): box spans x∈[150,450], y∈[0,700] in glyph units.
+        let scale = 0.1; // 1000-upem font → 100 px/em.
+        let height = 80u32;
+        let mut canvas = crate::raster::canvas::Canvas::new(64, height);
+        let mut edges = Vec::new();
+        for poly in source.glyph_polygons(a_gid) {
+            for k in 0..poly.len() {
+                let (gx0, gy0) = poly[k];
+                let (gx1, gy1) = poly[(k + 1) % poly.len()];
+                // Glyph units → device pixels, flipping y.
+                let to_dev = |gx: f64, gy: f64| (gx * scale, height as f64 - gy * scale);
+                let (x0, y0) = to_dev(gx0, gy0);
+                let (x1, y1) = to_dev(gx1, gy1);
+                edges.push(crate::raster::canvas::Edge { x0, y0, x1, y1 });
+            }
+        }
+        canvas.fill(&edges, [0, 0, 0], false);
+        let _ = upem; // upem documented; scale chosen to fit the canvas.
+
+        let px = |x: u32, y: u32| {
+            let i = ((y * canvas.width + x) * 4) as usize;
+            [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]
+        };
+        // Centre of the box: glyph (300, 350) → device (30, 80-35=45). Inked.
+        assert_eq!(px(30, 45), [0, 0, 0], "box interior is filled");
+        // Left of the box (glyph x<150 → device x<15): untouched white.
+        assert_eq!(px(5, 45), [255, 255, 255], "left of box stays white");
+        // Above the box (glyph y>700 → device y<10): untouched white.
+        assert_eq!(px(30, 3), [255, 255, 255], "above box stays white");
+    }
+
+    /// End-to-end: a real PDF whose page draws `A` in a simple Type 1 font with
+    /// an embedded `/FontFile` renders glyph ink — exercising the full
+    /// `font_program` → `simple_code_to_gid` → `show_text` rasterizer path.
+    #[test]
+    fn render_page_draws_embedded_type1_glyph() {
+        let font = synthetic_type1();
+        // The content stream: draw `A` (code 0x41) at 60pt near the page bottom.
+        let content = b"BT /F1 60 Tf 40 40 Td (A) Tj ET";
+
+        // Assemble a minimal one-page PDF. Object 6 is the Type 1 `/FontFile`
+        // stream (the raw font program); the descriptor + simple font reference
+        // it with WinAnsiEncoding so code 0x41 → glyph name `A`.
+        let mut pdf: Vec<u8> = Vec::new();
+        let mut offsets = [0usize; 8];
+        macro_rules! obj {
+            ($n:expr, $body:expr) => {{
+                offsets[$n] = pdf.len();
+                pdf.extend_from_slice(format!("{} 0 obj\n", $n).as_bytes());
+                pdf.extend_from_slice($body);
+                pdf.extend_from_slice(b"\nendobj\n");
+            }};
+        }
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        obj!(1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        obj!(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        obj!(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 120] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        );
+        obj!(
+            4,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /TestFont \
+              /FirstChar 65 /LastChar 65 /Widths [600] \
+              /Encoding /WinAnsiEncoding /FontDescriptor 7 0 R >>"
+        );
+        // Content stream object.
+        {
+            offsets[5] = pdf.len();
+            pdf.extend_from_slice(b"5 0 obj\n");
+            pdf.extend_from_slice(format!("<< /Length {} >>\nstream\n", content.len()).as_bytes());
+            pdf.extend_from_slice(content);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+        // FontFile stream object (raw Type 1 program).
+        {
+            offsets[6] = pdf.len();
+            pdf.extend_from_slice(b"6 0 obj\n");
+            pdf.extend_from_slice(
+                format!(
+                    "<< /Length {} /Length1 {} /Length2 0 /Length3 0 >>\nstream\n",
+                    font.len(),
+                    font.len()
+                )
+                .as_bytes(),
+            );
+            pdf.extend_from_slice(&font);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        }
+        // FontDescriptor (object 7, defined after so it can sit anywhere).
+        obj!(
+            7,
+            b"<< /Type /FontDescriptor /FontName /TestFont /Flags 4 \
+              /FontBBox [0 -200 700 800] /ItalicAngle 0 /Ascent 800 \
+              /Descent -200 /CapHeight 700 /StemV 80 /FontFile 6 0 R >>"
+        );
+        // xref + trailer.
+        let xref_pos = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for off in offsets.iter().skip(1) {
+            pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+                xref_pos
+            )
+            .as_bytes(),
+        );
+
+        let doc = crate::Document::open(&pdf).expect("minimal PDF parses");
+        let png = doc.render_page(1, 2.0).expect("renders");
+        let img = crate::raster::decode_png(&png).expect("valid PNG");
+        // The `A` box must paint dark ink somewhere on the page.
+        let dark = img
+            .rgba
+            .chunks_exact(4)
+            .filter(|px| px[0] < 128 && px[1] < 128 && px[2] < 128)
+            .count();
+        assert!(dark > 0, "embedded Type 1 glyph painted {dark} dark pixels");
     }
 
     /// System Type 1 fixtures (best-effort: skipped silently when absent, but

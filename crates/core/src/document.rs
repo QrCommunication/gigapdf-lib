@@ -7787,15 +7787,21 @@ impl Document {
     /// (ISO 32000-1 §9.6.6) and is the *only* way to draw a subset CFF font,
     /// whose program ships no Unicode `cmap` (so `gid_for_unicode` can't help).
     ///
-    /// Built only for CFF programs — TrueType simple fonts already resolve via
-    /// their embedded `cmap` on the code→Unicode path, so we leave them be to
+    /// Built for CFF and Type 1 programs — TrueType simple fonts already resolve
+    /// via their embedded `cmap` on the code→Unicode path, so we leave them be to
     /// avoid disturbing that working route. Returns `None` when nothing maps.
     fn simple_code_to_gid(
         &self,
         font: &Dictionary,
         program: Option<&crate::font::GlyphSource>,
     ) -> Option<BTreeMap<u32, u16>> {
-        let cff = program?.as_cff()?;
+        let program = program?;
+        // Type 1 (`/FontFile`): map `code → glyph name → gid` against the font's
+        // own charstring names, exactly as the CFF path maps against its charset.
+        if let Some(t1) = program.as_type1() {
+            return self.simple_code_to_gid_type1(font, t1);
+        }
+        let cff = program.as_cff()?;
         let name_to_gid = cff.name_to_gid_map();
         // GID lookup by Unicode scalar, derived from the CFF charset via the same
         // SID→Unicode logic that drives `/ToUnicode` synthesis — so it knows the
@@ -7815,6 +7821,55 @@ impl Document {
                 // Base encoding: the code's Unicode scalar (WinAnsi covers the
                 // simple-Latin fonts that embed CFF), resolved through the
                 // charset's Unicode map.
+                let scalar = crate::font::winansi_to_char(code as u8) as u32;
+                unicode_to_gid.get(&scalar).copied()
+            };
+            if let Some(gid) = gid {
+                if gid != 0 {
+                    map.insert(code, gid);
+                }
+            }
+        }
+        (!map.is_empty()).then_some(map)
+    }
+
+    /// Build a simple Type 1 (`/FontFile`) font's `code → glyph id` map by
+    /// resolving its PDF `/Encoding` against the font's own charstring names —
+    /// the Type 1 counterpart of [`simple_code_to_gid`]'s CFF path. Resolution
+    /// order per ISO 32000-1 §9.6.6: an explicit `/Differences` name wins, then
+    /// the font's **built-in** `/Encoding` (parsed from the Type 1 program),
+    /// then the WinAnsi base scalar via the names' Unicode. Returns `None` when
+    /// nothing maps.
+    fn simple_code_to_gid_type1(
+        &self,
+        font: &Dictionary,
+        t1: &crate::font::type1::Type1Font,
+    ) -> Option<BTreeMap<u32, u16>> {
+        let name_to_gid = t1.name_to_gid_map();
+        // Unicode → gid derived from the font's own glyph names, so a WinAnsi
+        // code with no matching literal name still resolves (e.g. `space`).
+        let mut unicode_to_gid: BTreeMap<u32, u16> = BTreeMap::new();
+        for (name, &gid) in &name_to_gid {
+            if let Some(s) = crate::font::cff_to_otf::glyph_name_to_unicode_string(name) {
+                let mut chars = s.chars();
+                if let (Some(c), None) = (chars.next(), chars.next()) {
+                    unicode_to_gid.entry(c as u32).or_insert(gid);
+                }
+            }
+        }
+        let differences = self.encoding_differences(font);
+
+        let mut map = BTreeMap::new();
+        for code in 0u32..=255 {
+            let name = differences.get(&(code as u8)).cloned().or_else(|| {
+                // Built-in Type 1 `/Encoding` (StandardEncoding or a custom
+                // `dup … put` array) is the authoritative base for the font.
+                t1.encoding.get(code as usize).and_then(Clone::clone)
+            });
+            let gid = if let Some(name) = name {
+                gid_for_glyph_name(&name, &name_to_gid, &unicode_to_gid)
+            } else {
+                // Last resort: the code's WinAnsi scalar via the names' Unicode.
                 let scalar = crate::font::winansi_to_char(code as u8) as u32;
                 unicode_to_gid.get(&scalar).copied()
             };
@@ -7915,7 +7970,8 @@ impl Document {
 
     /// Extract and parse the embedded glyph program of a font, descending into
     /// the CIDFont for a Type0 font. `/FontFile2` is TrueType; `/FontFile3` is
-    /// CFF/OpenType (tried as both). Type1 (`/FontFile`) is not yet rasterized.
+    /// CFF/OpenType (tried as both); `/FontFile` is a raw Type 1 program, whose
+    /// `eexec`-decrypted charstrings are interpreted directly into outlines.
     fn font_program(&self, font: &Dictionary) -> Option<crate::font::GlyphSource> {
         let carrier = if font.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice())
         {
@@ -7944,6 +8000,14 @@ impl Document {
             }
             if let Some(ttf) = crate::font::truetype::TrueTypeFont::parse(&bytes) {
                 return Some(crate::font::GlyphSource::TrueType(ttf));
+            }
+        }
+        // Legacy Type 1 (`/FontFile`): `.pfa`/`.pfb`-style eexec program. Parse
+        // its charstrings so the rasterizer can draw the glyph outlines directly
+        // (the simple-font `/Encoding` → name → gid map is built separately).
+        if let Some(bytes) = self.font_file_bytes(descriptor, b"FontFile") {
+            if let Some(t1) = crate::font::type1::parse_type1(&bytes) {
+                return Some(crate::font::GlyphSource::Type1(t1));
             }
         }
         None

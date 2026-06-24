@@ -27,6 +27,9 @@ pub enum GlyphSource {
     TrueType(truetype::TrueTypeFont),
     /// A CFF / Type2 program.
     Cff(cff::CffFont),
+    /// A raw Type 1 (`/FontFile`) program: its `eexec`-decrypted charstrings are
+    /// interpreted directly into outlines (see [`type1::Type1Font`]).
+    Type1(type1::Type1Font),
 }
 
 impl GlyphSource {
@@ -35,6 +38,7 @@ impl GlyphSource {
         match self {
             GlyphSource::TrueType(f) => f.units_per_em(),
             GlyphSource::Cff(f) => f.units_per_em(),
+            GlyphSource::Type1(f) => f.units_per_em(),
         }
     }
 
@@ -43,6 +47,7 @@ impl GlyphSource {
         match self {
             GlyphSource::TrueType(f) => f.advance_width(gid),
             GlyphSource::Cff(f) => f.advance_width(gid),
+            GlyphSource::Type1(f) => f.advance_width(gid),
         }
     }
 
@@ -51,16 +56,17 @@ impl GlyphSource {
         match self {
             GlyphSource::TrueType(f) => f.glyph_polygons(gid),
             GlyphSource::Cff(f) => f.glyph_polygons(gid),
+            GlyphSource::Type1(f) => f.glyph_polygons(gid),
         }
     }
 
-    /// Map a Unicode scalar to a glyph id (TrueType cmap only; CFF returns
-    /// `None`, as CFF simple fonts map via the PDF encoding/charset and CFF
-    /// composite fonts use the code as the glyph id directly).
+    /// Map a Unicode scalar to a glyph id (TrueType cmap only; CFF and Type 1
+    /// return `None`, as their simple fonts map via the PDF encoding/charset and
+    /// composite CFF uses the code as the glyph id directly).
     pub fn gid_for_unicode(&self, cp: u32) -> Option<u16> {
         match self {
             GlyphSource::TrueType(f) => f.gid_for_unicode(cp),
-            GlyphSource::Cff(_) => None,
+            GlyphSource::Cff(_) | GlyphSource::Type1(_) => None,
         }
     }
 
@@ -69,7 +75,17 @@ impl GlyphSource {
     pub fn as_cff(&self) -> Option<&cff::CffFont> {
         match self {
             GlyphSource::Cff(f) => Some(f),
-            GlyphSource::TrueType(_) => None,
+            GlyphSource::TrueType(_) | GlyphSource::Type1(_) => None,
+        }
+    }
+
+    /// The Type 1 program, if this source is one. Lets the PDF layer resolve a
+    /// simple font's `/Encoding` against the Type 1 charstring names
+    /// (`code → name → gid`), the same way `as_cff` drives the CFF charset path.
+    pub fn as_type1(&self) -> Option<&type1::Type1Font> {
+        match self {
+            GlyphSource::Type1(f) => Some(f),
+            GlyphSource::TrueType(_) | GlyphSource::Cff(_) => None,
         }
     }
 }
