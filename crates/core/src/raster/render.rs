@@ -207,6 +207,33 @@ pub struct RenderFont {
     /// Composite-font CID → glyph-id map from a non-identity `/CIDToGIDMap`
     /// stream. `None` means identity (CID is the glyph id), the common case.
     pub cid_to_gid: Option<Vec<u16>>,
+    /// `/Type3` font payload: each glyph is a PDF content stream in `/CharProcs`,
+    /// drawn under `/FontMatrix`. `Some` only for Type3 fonts, which carry no
+    /// `program`; [`show_text`] then executes the per-code glyph procedure
+    /// instead of filling an outline. `None` for all other font types.
+    pub type3: Option<Type3Glyphs>,
+}
+
+/// A `/Type3` font's drawable glyph descriptions (ISO 32000-1 §9.6.5). Unlike
+/// every other font kind, a Type3 glyph is **not** an outline in an embedded
+/// program: it's a small PDF content stream (`/CharProcs`) positioned by the
+/// font's `/FontMatrix` and selected by `/Encoding` `/Differences`. The fields
+/// are fully owned (no document borrow) so a [`RenderFont`] stays `'static` and
+/// `Clone`; [`show_text`] runs each proc through the same content-stream
+/// rasterizer used for page content and form XObjects.
+#[derive(Debug, Clone)]
+pub struct Type3Glyphs {
+    /// The font's `/FontMatrix` `[a b c d e f]` (glyph space → text space).
+    pub font_matrix: [f64; 6],
+    /// Character code → decoded `/CharProcs` content stream. A code absent here
+    /// (no `/Differences` entry, or a name with no matching proc) draws nothing
+    /// but still advances by its `/Widths` entry.
+    pub char_procs: BTreeMap<u32, Vec<u8>>,
+    /// Fonts of the font's `/Resources` (a glyph proc may set `Tf` and show
+    /// nested text). Empty when the font declares no `/Resources /Font`.
+    pub fonts: RenderFonts,
+    /// Images of the font's `/Resources` (a glyph proc may `Do` an image).
+    pub images: RenderImages,
 }
 
 /// Per-page render fonts, keyed by font resource name (as used by `Tf`).
@@ -907,6 +934,8 @@ pub fn render_content_into_ctx(
                             state.paint_clip().as_ref(),
                             state.blend,
                             bytes,
+                            ctx,
+                            depth,
                         );
                     }
                 }
@@ -932,6 +961,8 @@ pub fn render_content_into_ctx(
                                     clip.as_ref(),
                                     state.blend,
                                     bytes,
+                                    ctx,
+                                    depth,
                                 );
                             }
                         } else if let Some(adj) = item.as_f64() {
@@ -1033,6 +1064,8 @@ fn draw_form(
 /// fill the outline, advancing the text matrix by the glyph's width.
 /// `global_alpha` scales the fill coverage (annotation `/CA` opacity); `clip`
 /// modulates per pixel (active `W` clip ∩ soft mask) and `blend` selects the mode.
+/// `ctx`/`depth` are forwarded to the content-stream rasterizer for `/Type3`
+/// glyph procedures (whose marks may invoke nested form/shading resources).
 #[allow(clippy::too_many_arguments)]
 fn show_text(
     canvas: &mut Canvas,
@@ -1049,7 +1082,34 @@ fn show_text(
     clip: Option<&ClipMask>,
     blend: BlendMode,
     bytes: &[u8],
+    ctx: &dyn ResourceCtx,
+    depth: usize,
 ) {
+    // `/Type3` fonts draw each glyph as a content stream, not an outline — split
+    // off to the dedicated path that executes the `/CharProcs` procedure under
+    // `FontMatrix · Tm · CTM · base`.
+    if let Some(type3) = &font.type3 {
+        show_text_type3(
+            canvas,
+            font,
+            type3,
+            size,
+            tm,
+            ctm,
+            base,
+            fill,
+            char_spacing,
+            word_spacing,
+            h_scale,
+            global_alpha,
+            clip,
+            blend,
+            bytes,
+            ctx,
+            depth,
+        );
+        return;
+    }
     let mut i = 0;
     while i < bytes.len() {
         let (code, consumed): (u32, usize) = if font.two_byte && i + 1 < bytes.len() {
@@ -1145,6 +1205,88 @@ fn show_text(
 
         let mut step = advance + char_spacing;
         if consumed == 1 && code == 32 {
+            step += word_spacing;
+        }
+        *tm = Matrix::translate(step * h_scale, 0.0).then(tm);
+    }
+}
+
+/// Draw a `/Type3` text-show string (ISO 32000-1 §9.6.5). Each character code is
+/// a glyph whose description is a PDF content stream in `/CharProcs`, drawn in
+/// **glyph space** mapped to text space by the font's `/FontMatrix`. For each
+/// code we compose the glyph render matrix
+/// `FontMatrix · scale(fontSize·h_scale, fontSize) · Tm · CTM` and run the proc
+/// through the same content-stream rasterizer used for page content and form
+/// XObjects (so its fills, strokes, colours, images and even nested text all
+/// honour the engine's full machinery). `d0`/`d1` glyph-metric operators set the
+/// width/bbox and are no-ops for painting (the interpreter simply ignores the
+/// unknown operators). The pen advances by the `/Widths` value transformed
+/// through the `/FontMatrix` into text space — never the fixed 1000-unit divisor
+/// the outline path uses, because a Type3 `/FontMatrix` is arbitrary.
+#[allow(clippy::too_many_arguments)]
+fn show_text_type3(
+    canvas: &mut Canvas,
+    font: &RenderFont,
+    type3: &Type3Glyphs,
+    size: f64,
+    tm: &mut Matrix,
+    ctm: &Matrix,
+    base: &Matrix,
+    _fill: [u8; 3],
+    char_spacing: f64,
+    word_spacing: f64,
+    h_scale: f64,
+    global_alpha: f64,
+    clip: Option<&ClipMask>,
+    blend: BlendMode,
+    bytes: &[u8],
+    ctx: &dyn ResourceCtx,
+    depth: usize,
+) {
+    let _ = blend; // glyph procs carry their own blend state; nothing to seed.
+    let fm = Matrix(type3.font_matrix);
+    // The width table for a Type3 font holds raw glyph-space advances; convert to
+    // text space via the FontMatrix linear part (`(w,0)` displacement), then by
+    // the font size. Falls back to half-em in text space when no `/Widths`.
+    let width_table = font.decoder.widths.as_ref();
+    for &byte in bytes {
+        let code = byte as u32;
+
+        // Glyph-space advance → text-space x displacement. `FontMatrix·(w,0)`
+        // gives the per-glyph vector in text space; we take its magnitude in the
+        // text x direction (a) since text advances horizontally.
+        let glyph_w = width_table.map(|w| w.advance(code));
+        let advance = match glyph_w {
+            Some(w) => fm.0[0] * w * size,
+            None => size * 0.5,
+        };
+
+        if let Some(content) = type3.char_procs.get(&code) {
+            // Glyph space → text space (FontMatrix), scaled by the font size and
+            // horizontal scaling, then through the text matrix and CTM. The proc
+            // is rendered with this composition as its `base` (user→device map),
+            // intersecting the active clip so the glyph stays inside any W clip.
+            let glyph_to_text = fm.then(&Matrix::new(size * h_scale, 0.0, 0.0, size, 0.0, 0.0));
+            let glyph_base = glyph_to_text.then(tm).then(ctm).then(base);
+            if depth < crate::content::MAX_FORM_DEPTH {
+                render_content_into_ctx(
+                    canvas,
+                    content,
+                    glyph_base,
+                    &type3.fonts,
+                    &type3.images,
+                    global_alpha,
+                    ctx,
+                    depth + 1,
+                    clip,
+                    false,
+                    &[],
+                );
+            }
+        }
+
+        let mut step = advance + char_spacing;
+        if code == 32 {
             step += word_spacing;
         }
         *tm = Matrix::translate(step * h_scale, 0.0).then(tm);

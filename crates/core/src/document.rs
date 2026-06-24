@@ -7523,6 +7523,15 @@ impl Document {
             let Some(font) = self.resolve(value).as_dict() else {
                 continue;
             };
+            // A `/Type3` font has no embedded glyph program: each glyph is a PDF
+            // content stream in `/CharProcs`, drawn under `/FontMatrix`. Build its
+            // dedicated render payload and skip the outline-font logic below.
+            if font.get(b"Subtype").and_then(Object::as_name) == Some(b"Type3".as_slice()) {
+                if let Some(rf) = self.build_type3_render_font(font) {
+                    out.insert(name.clone(), rf);
+                }
+                continue;
+            }
             let two_byte =
                 font.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice());
             let to_unicode = font
@@ -7610,10 +7619,105 @@ impl Document {
                     two_byte,
                     code_to_gid,
                     cid_to_gid,
+                    // Outline (TrueType/CFF/base-14) fonts carry no Type3 payload.
+                    type3: None,
                 },
             );
         }
         out
+    }
+
+    /// Build the [`raster::RenderFont`] for a `/Type3` font (ISO 32000-1 §9.6.5):
+    /// its `/FontMatrix`, the per-code decoded `/CharProcs` content streams
+    /// (selected through `/Encoding` `/Differences`), and the font's own
+    /// `/Resources` fonts/images (a glyph proc may set `Tf` or `Do` an image).
+    /// `/Widths` holds raw glyph-space advances; the rasterizer transforms them
+    /// through `/FontMatrix`, so they are stored unscaled. Returns `None` when the
+    /// font has no usable `/CharProcs`.
+    fn build_type3_render_font(
+        &self,
+        font: &Dictionary,
+    ) -> Option<crate::raster::render::RenderFont> {
+        // `/FontMatrix` maps glyph space → text space (typically [0.001 …]).
+        // Default to the 1000-unit em if absent, matching the common case.
+        let font_matrix = self.type3_font_matrix(font);
+
+        // `/CharProcs` is a dictionary of glyph-name → content-stream. Resolve
+        // each used code's glyph name via `/Encoding` `/Differences`, then decode
+        // that name's proc stream. Codes with no name or no matching proc are
+        // simply absent (they draw nothing but still advance by `/Widths`).
+        let char_procs_dict = font
+            .get(b"CharProcs")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()?;
+        let differences = self.encoding_differences(font);
+        let mut char_procs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for (&code, glyph_name) in &differences {
+            let Some(stream) = char_procs_dict
+                .get(glyph_name.as_bytes())
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_stream)
+            else {
+                continue;
+            };
+            if let Ok(content) = decode_stream(stream) {
+                char_procs.insert(code as u32, content);
+            }
+        }
+        if char_procs.is_empty() {
+            return None;
+        }
+
+        // The font's `/Resources` (glyph procs reference fonts/images here).
+        let resources = font
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let fonts = self.render_fonts_for(&resources);
+        let images = self.images_for(&resources);
+
+        // Raw glyph-space `/Widths` (no 1000-unit scaling — the FontMatrix is the
+        // glyph→text map and is applied by the rasterizer).
+        let widths = self.simple_font_widths(font);
+
+        Some(crate::raster::render::RenderFont {
+            program: None,
+            decoder: crate::font::cmap::TextDecoder {
+                two_byte: false,
+                to_unicode: None,
+                widths,
+                cid_to_unicode: None,
+                simple_encoding: None,
+            },
+            two_byte: false,
+            code_to_gid: None,
+            cid_to_gid: None,
+            type3: Some(crate::raster::render::Type3Glyphs {
+                font_matrix,
+                char_procs,
+                fonts,
+                images,
+            }),
+        })
+    }
+
+    /// Read a `/Type3` font's `/FontMatrix` `[a b c d e f]`, defaulting to the
+    /// 1000-unit em `[0.001 0 0 0.001 0 0]` when absent or malformed.
+    fn type3_font_matrix(&self, font: &Dictionary) -> [f64; 6] {
+        font.get(b"FontMatrix")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| self.resolve(o).as_f64())
+                    .collect::<Vec<f64>>()
+            })
+            .filter(|v| v.len() == 6)
+            .map(|v| [v[0], v[1], v[2], v[3], v[4], v[5]])
+            .unwrap_or([0.001, 0.0, 0.0, 0.001, 0.0, 0.0])
     }
 
     /// Build a simple font's `code → glyph id` map by resolving its PDF
@@ -22429,6 +22533,150 @@ mod tests {
         assert!(
             runs.iter().any(|r| r.text == "BBB"),
             "FmB text extracted: {runs:?}"
+        );
+    }
+
+    // ── Type3 font glyph procedures (`/CharProcs`) ───────────────────────────
+
+    /// A one-page PDF whose only mark is a glyph from a `/Type3` font. The font's
+    /// single glyph (`/sq`, code 97) is a content stream that fills the unit
+    /// square `[0 0 1000 1000]` in glyph space; with `/FontMatrix [0.001 …]` and
+    /// font size 10 that is a 10×10 user-space square drawn at the text origin
+    /// `(50,50)`. On a 100×100 page rendered at scale 1.0 (y-flip
+    /// `base = [1 0 0 −1 0 100]`) the square lands in device rows 40..50, cols
+    /// 50..60. Black ink (`d0` colored glyph, no colour set → default black).
+    fn type3_rect_fixture() -> Vec<u8> {
+        // Glyph proc: `d0` sets the (advance) width, then fill the unit square.
+        let glyph_proc = "1000 0 d0\n0 0 1000 1000 re\nf";
+        // Page content: select the Type3 font at size 10, move to (50,50), show
+        // code 97 ('a'), which maps via /Differences to the /sq glyph.
+        let page_stream = "BT /F1 10 Tf 50 50 Td (a) Tj ET";
+        raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
+            ),
+            (
+                5,
+                "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                 /FontMatrix [0.001 0 0 0.001 0 0] \
+                 /CharProcs 6 0 R \
+                 /Encoding << /Type /Encoding /Differences [97 /sq] >> \
+                 /FirstChar 97 /LastChar 97 /Widths [1000] >>"
+                    .into(),
+            ),
+            (6, "<< /sq 7 0 R >>".into()),
+            (
+                7,
+                format!(
+                    "<< /Length {} >> stream\n{glyph_proc}\nendstream",
+                    glyph_proc.len()
+                ),
+            ),
+        ])
+    }
+
+    #[test]
+    fn renders_type3_charproc_glyph_as_device_pixels() {
+        let doc = Document::open(&type3_rect_fixture()).unwrap();
+        let png = doc.render_page(1, 1.0).unwrap();
+        let img = crate::raster::decode_png(&png).expect("valid PNG");
+        assert_eq!((img.width, img.height), (100, 100), "page is 100×100 px");
+
+        let at = |x: u32, y: u32| -> [u8; 3] {
+            let i = ((y * img.width + x) * 4) as usize;
+            [img.rgba[i], img.rgba[i + 1], img.rgba[i + 2]]
+        };
+        let is_dark = |p: [u8; 3]| p[0] < 80 && p[1] < 80 && p[2] < 80;
+
+        // Centre of the expected glyph square (device col 55, row 45) is black ink
+        // painted by the /CharProcs stream — the whole point of Type3 rendering.
+        assert!(
+            is_dark(at(55, 45)),
+            "Type3 glyph fills the square centre, got {:?}",
+            at(55, 45)
+        );
+        // A few interior samples to confirm the square is solid, not a hairline.
+        for &(x, y) in &[(51, 41), (58, 48), (53, 47)] {
+            assert!(
+                is_dark(at(x, y)),
+                "Type3 glyph square is filled at ({x},{y}), got {:?}",
+                at(x, y)
+            );
+        }
+        // Far from the glyph (top-left corner) stays white background — the proc
+        // is positioned by FontMatrix·Tm, not splattered across the page.
+        let bg = at(5, 5);
+        assert!(
+            bg[0] > 200 && bg[1] > 200 && bg[2] > 200,
+            "page background away from the glyph is white, got {bg:?}"
+        );
+        // And below the square (device row 70, well outside rows 40..50) is white.
+        let below = at(55, 70);
+        assert!(
+            below[0] > 200 && below[1] > 200 && below[2] > 200,
+            "no ink outside the glyph square, got {below:?}"
+        );
+    }
+
+    #[test]
+    fn type3_glyph_absent_charproc_paints_nothing_but_advances() {
+        // A Type3 string with a code that has NO /CharProcs entry must render a
+        // blank page (no panic, no stray ink) — the missing glyph is skipped while
+        // the pen still advances. Code 98 ('b') is not in /Differences.
+        let page_stream = "BT /F1 10 Tf 50 50 Td (b) Tj ET";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
+            ),
+            (
+                5,
+                "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                 /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R \
+                 /Encoding << /Type /Encoding /Differences [97 /sq] >> \
+                 /FirstChar 97 /LastChar 98 /Widths [1000 1000] >>"
+                    .into(),
+            ),
+            (6, "<< /sq 7 0 R >>".into()),
+            (7, {
+                let s = "1000 0 d0\n0 0 1000 1000 re\nf";
+                format!("<< /Length {} >> stream\n{s}\nendstream", s.len())
+            }),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        let png = doc.render_page(1, 1.0).unwrap();
+        let img = crate::raster::decode_png(&png).expect("valid PNG");
+        let painted = img
+            .rgba
+            .chunks_exact(4)
+            .filter(|px| px[0] != 255 || px[1] != 255 || px[2] != 255)
+            .count();
+        assert_eq!(
+            painted, 0,
+            "an unmapped Type3 code paints no ink ({painted} non-white px)"
         );
     }
 
