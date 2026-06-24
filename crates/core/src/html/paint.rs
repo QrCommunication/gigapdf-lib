@@ -348,7 +348,7 @@ pub fn render_with(html: &str, fonts: &[ProvidedFont], opts: &RenderOptions) -> 
     // Run inline <script>s first so script-driven DOM mutations are rendered.
     let body_html = crate::js::run_inline_scripts(html);
     let nodes = dom::parse(&body_html);
-    let sheet = Stylesheet::new(&collect_style_css(&nodes));
+    let sheet = Stylesheet::with_viewport(&collect_style_css(&nodes), Some(opts.page_w / 0.75));
     let book = MeasureBook::new(fonts);
     let frame = Frame {
         page_w: opts.page_w,
@@ -420,7 +420,7 @@ fn layout_band(
     right: f64,
 ) -> (Vec<Fragment>, f64) {
     let nodes = dom::parse(html);
-    let sheet = Stylesheet::new(&collect_style_css(&nodes));
+    let sheet = Stylesheet::with_viewport(&collect_style_css(&nodes), Some(page_w / 0.75));
     let frame = Frame {
         page_w,
         page_h: 1.0e6,

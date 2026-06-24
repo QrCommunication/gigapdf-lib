@@ -966,11 +966,12 @@ fn tokenize_selector(s: &str) -> Vec<SelTok> {
     toks
 }
 
-/// Parse a stylesheet body into rules.
-fn parse_rules(css: &str, order_base: usize) -> Vec<Rule> {
+/// Parse a stylesheet body into rules. `viewport_px` is the page width in CSS px
+/// (when known), used to evaluate `@media` feature queries.
+fn parse_rules(css: &str, order_base: usize, viewport_px: Option<f64>) -> Vec<Rule> {
     let css = strip_comments(css);
     let mut rules = Vec::new();
-    parse_rules_into(&css, order_base, &mut rules);
+    parse_rules_into(&css, order_base, &mut rules, viewport_px);
     rules
 }
 
@@ -978,7 +979,12 @@ fn parse_rules(css: &str, order_base: usize) -> Vec<Rule> {
 /// returns the next source order to use. Splitting this out lets a conditional
 /// group rule (`@media print { … }`) recurse on its body while preserving the
 /// global source order across nested and top-level rules.
-fn parse_rules_into(css: &str, order_base: usize, out: &mut Vec<Rule>) -> usize {
+fn parse_rules_into(
+    css: &str,
+    order_base: usize,
+    out: &mut Vec<Rule>,
+    viewport_px: Option<f64>,
+) -> usize {
     let mut rest = css;
     let mut order = order_base;
     while let Some(brace) = rest.find('{') {
@@ -1002,8 +1008,8 @@ fn parse_rules_into(css: &str, order_base: usize, out: &mut Vec<Rule>) -> usize 
                 .find(|c: char| c.is_whitespace() || c == '{')
                 .unwrap_or(query.len());
             if query[..name_end].eq_ignore_ascii_case("media") {
-                if media_query_applies(query[name_end..].trim()) {
-                    order = parse_rules_into(body, order, out);
+                if media_query_applies(query[name_end..].trim(), viewport_px) {
+                    order = parse_rules_into(body, order, out, viewport_px);
                 } else {
                     order += 1;
                 }
@@ -1055,41 +1061,67 @@ fn take_balanced_block(after: &str) -> Option<(&str, usize)> {
 /// (CSS media query lists are a logical OR). Feature queries we can't evaluate
 /// (`(max-width: …)`) are treated as applying for the matched media type so a
 /// stylesheet's intended print rules aren't silently dropped.
-fn media_query_applies(query: &str) -> bool {
+fn media_query_applies(query: &str, viewport_px: Option<f64>) -> bool {
     let q = query.trim();
     if q.is_empty() {
         return true; // bare `@media { … }` — always-on group.
     }
-    q.split(',').any(|component| {
-        let c = component.trim();
-        // A query that opens directly on a feature (`(max-width: …)`) has an
-        // implicit `all` media type → applies (we can't evaluate the feature, so
-        // we don't drop the author's intended rules).
-        if c.starts_with('(') {
-            return true;
+    // A comma-separated query list is a logical OR.
+    q.split(',')
+        .any(|component| media_component_applies(component.trim(), viewport_px))
+}
+
+/// One comma component: an optional leading media type (with an `only`/`not`
+/// modifier) ANDed with zero or more `(feature)` queries. The media type decides
+/// print vs screen; the feature queries (`min-width`/`max-width`/`width`) are
+/// evaluated against the page viewport width when it is known.
+fn media_component_applies(c: &str, viewport_px: Option<f64>) -> bool {
+    let lower = c.to_ascii_lowercase();
+    let (negate, body) = if let Some(rest) = lower.strip_prefix("not ") {
+        (true, rest)
+    } else if let Some(rest) = lower.strip_prefix("only ") {
+        (false, rest)
+    } else {
+        (false, lower.as_str())
+    };
+    let mut type_ok = true;
+    let mut features_ok = true;
+    for (i, part) in body.split(" and ").map(str::trim).enumerate() {
+        if part.starts_with('(') {
+            features_ok &= media_feature_applies(part, viewport_px);
+        } else if i == 0 && !part.is_empty() {
+            // Leading media type — `print`/`all` target paged PDF; others don't.
+            type_ok = matches!(part, "print" | "all");
         }
-        // The leading media type is the first whitespace-delimited token.
-        let media_type = c.split_whitespace().next().unwrap_or("");
-        match media_type.to_ascii_lowercase().as_str() {
-            "print" | "all" => true,
-            // `only print`, `not screen` modifiers: honour the common form where
-            // the media type after `only`/`not` decides.
-            "only" | "not" => {
-                let next = c
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if media_type.eq_ignore_ascii_case("not") {
-                    // `not screen` ⇒ applies to print; `not print` ⇒ does not.
-                    !matches!(next.as_str(), "print" | "all")
-                } else {
-                    matches!(next.as_str(), "print" | "all")
-                }
-            }
-            _ => false, // `screen`, `speech`, and anything else: not for print.
-        }
-    })
+    }
+    let matched = type_ok && features_ok;
+    if negate {
+        !matched
+    } else {
+        matched
+    }
+}
+
+/// Evaluate a single `(min-width: …)` / `(max-width: …)` / `(width: …)` feature
+/// against the viewport width in CSS px. An unknown feature — or no viewport —
+/// returns `true`, so the author's intended rules aren't silently dropped.
+fn media_feature_applies(feat: &str, viewport_px: Option<f64>) -> bool {
+    let Some(vp) = viewport_px else { return true };
+    let inner = feat.trim_start_matches('(').trim_end_matches(')');
+    let Some((name, val)) = inner.split_once(':') else {
+        return true;
+    };
+    // `parse_len_px` yields points; an `em` here is the initial 16px font (12pt).
+    // Convert points → CSS px (÷ 0.75) to compare with the px viewport.
+    let Some(px) = parse_len_px(val.trim(), 12.0).map(|pt| pt / 0.75) else {
+        return true;
+    };
+    match name.trim() {
+        "min-width" => vp >= px,
+        "max-width" => vp <= px,
+        "width" => (vp - px).abs() < 0.5,
+        _ => true, // height / orientation / etc. — only the page width is modelled
+    }
 }
 
 /// Scan `@font-face { font-family: <name>; … }` blocks and return the declared
@@ -1298,10 +1330,19 @@ pub struct Stylesheet {
 }
 
 impl Stylesheet {
-    /// Build from the author CSS collected from `<style>` blocks.
+    /// Build from the author CSS collected from `<style>` blocks. `@media`
+    /// feature queries (`min-width`/`max-width`) can't be evaluated without a
+    /// page width, so they all apply; use [`Stylesheet::with_viewport`] when the
+    /// render width is known.
     pub fn new(author_css: &str) -> Stylesheet {
-        let mut rules = parse_rules(UA_CSS, 0);
-        rules.extend(parse_rules(author_css, 100_000));
+        Stylesheet::with_viewport(author_css, None)
+    }
+
+    /// Build with the page viewport width in CSS px, so `@media (min-width: …)` /
+    /// `(max-width: …)` queries are evaluated against it.
+    pub fn with_viewport(author_css: &str, viewport_px: Option<f64>) -> Stylesheet {
+        let mut rules = parse_rules(UA_CSS, 0, viewport_px);
+        rules.extend(parse_rules(author_css, 100_000, viewport_px));
         Stylesheet {
             rules,
             font_faces: collect_font_faces(author_css),
@@ -4385,23 +4426,54 @@ mod tests {
     #[test]
     fn media_query_applies_selects_print() {
         // Print and the universal/empty queries apply; screen-only does not.
-        assert!(media_query_applies("print"));
-        assert!(media_query_applies("all"));
-        assert!(media_query_applies(""), "bare @media is always-on");
-        assert!(!media_query_applies("screen"));
-        assert!(!media_query_applies("speech"));
+        assert!(media_query_applies("print", None));
+        assert!(media_query_applies("all", None));
+        assert!(media_query_applies("", None), "bare @media is always-on");
+        assert!(!media_query_applies("screen", None));
+        assert!(!media_query_applies("speech", None));
         // Comma list is an OR: applies if ANY component matches.
-        assert!(media_query_applies("screen, print"));
-        assert!(!media_query_applies("screen, speech"));
+        assert!(media_query_applies("screen, print", None));
+        assert!(!media_query_applies("screen, speech", None));
         // `only print` / `not screen` modifiers resolve to print.
-        assert!(media_query_applies("only print"));
-        assert!(media_query_applies("not screen"));
-        assert!(!media_query_applies("not print"));
-        assert!(!media_query_applies("only screen"));
-        // A feature-only query has an implicit `all` → applies (can't evaluate
-        // the feature, so we keep the author's intended rules).
-        assert!(media_query_applies("(max-width: 600px)"));
-        assert!(media_query_applies("print and (color)"));
+        assert!(media_query_applies("only print", None));
+        assert!(media_query_applies("not screen", None));
+        assert!(!media_query_applies("not print", None));
+        assert!(!media_query_applies("only screen", None));
+        // Without a viewport, a feature-only query applies (we keep the rules).
+        assert!(media_query_applies("(max-width: 600px)", None));
+        assert!(media_query_applies("print and (color)", None));
+    }
+
+    #[test]
+    fn media_feature_queries_evaluate_against_the_viewport() {
+        // 816 ≈ a US-Letter page width in CSS px (612pt ÷ 0.75). Width features
+        // compare against this page viewport.
+        let wide = Some(816.0);
+        assert!(
+            media_query_applies("(min-width: 600px)", wide),
+            "816 >= 600"
+        );
+        assert!(
+            !media_query_applies("(max-width: 600px)", wide),
+            "816 > 600"
+        );
+        assert!(
+            media_query_applies("(max-width: 600px)", Some(400.0)),
+            "400 <= 600"
+        );
+        // Media type AND feature must BOTH hold.
+        assert!(media_query_applies("print and (min-width: 600px)", wide));
+        assert!(
+            !media_query_applies("print and (max-width: 600px)", wide),
+            "feature fails"
+        );
+        assert!(
+            !media_query_applies("screen and (min-width: 600px)", wide),
+            "type fails"
+        );
+        // Unknown feature / no viewport ⇒ applies (rules not dropped).
+        assert!(media_query_applies("(orientation: landscape)", wide));
+        assert!(media_query_applies("(min-width: 9999px)", None));
     }
 
     #[test]

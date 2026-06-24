@@ -356,8 +356,10 @@ Two selector engines, for two jobs:
 > Limitations: the attribute *operators* `~= ^= $= *= |=` are treated as bare
 > presence (not enforced). **Pseudo-classes / pseudo-elements** (`:hover`,
 > `:first-child`, `::before`, …) are **not** supported — the `:` part is skipped,
-> so `li:first-child` matches every `li`. `@media` blocks survive (their rules
-> apply) but the media query itself is **not** evaluated.
+> so `li:first-child` matches every `li`. `@media` queries **are** evaluated: the
+> media type (`print`/`screen`/`all`, with `only`/`not`) and the width features
+> (`min-width`/`max-width`/`width`) match against the page width; features we
+> don't model keep their rules rather than dropping them.
 
 ### `document.querySelector(All)` selectors (in JavaScript)
 The DOM API supports the richer set: `>` (child), `+` (adjacent sibling),
@@ -431,7 +433,8 @@ subset.
   full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
 - **Selectors**: pseudo-classes / pseudo-elements (`:hover`, `:first-child`,
   `::before`), attribute *operators* (`~= ^= $= *= |=`) in stylesheets.
-- **At-rules / values**: `@media` query evaluation, `@page`, `@import`.
+- **At-rules / values**: `@page`, `@import` (`@media` queries **are** evaluated —
+  media type + width features).
   (`var()` custom properties and `calc()` **are** supported in length contexts.)
 - **Units**: `cm`, `mm`, `in`, `pc`, `q`, `ex`, `ch` (use `pt`, `px`, `em`,
   `rem`, `%`, `vw`/`vh`).
