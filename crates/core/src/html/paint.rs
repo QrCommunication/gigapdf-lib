@@ -440,6 +440,7 @@ fn layout_band(
             Fragment::Border { y, h, .. } => y + h,
             Fragment::Gradient { y, h, .. } => y + h,
             Fragment::Clipped { inner, .. } => fragment_bbox(inner).3,
+            Fragment::Transformed { .. } => fragment_bbox(f).3,
         };
         m.max(bottom)
     });
@@ -539,9 +540,9 @@ fn offset_fragments(frags: Vec<Fragment>, dy: f64) -> Vec<Fragment> {
                 gradient,
                 opacity,
             },
-            clipped @ Fragment::Clipped { .. } => {
-                // Move the clip window and its content together.
-                let mut moved = clipped;
+            wrapped @ (Fragment::Clipped { .. } | Fragment::Transformed { .. }) => {
+                // Move the clip/transform window and its content together.
+                let mut moved = wrapped;
                 shift_fragment(&mut moved, 0.0, dy);
                 moved
             }
@@ -616,18 +617,38 @@ fn paint(
     // Paint one fragment list onto a page (shared by body, header and footer).
     let paint_frags = |doc: &mut Document, page: u32, frags: &[Fragment]| {
         for frag in frags {
-            // Unwrap nested `Clipped` layers: emit one `q … re W n` per clip
-            // (flip Y to PDF user-space), paint the inner fragment, then balance
-            // with one `Q` per clip. Nested clips intersect — `overflow` boxes
-            // nest. A bare fragment leaves `clips` empty ⇒ byte-identical output.
-            let mut clips: Vec<[f64; 4]> = Vec::new();
+            // Unwrap nested `Clipped` / `Transformed` layers: emit one graphics-
+            // state op per layer — a `q … re W n` clip or a `q … cm` transform
+            // (both flipped from top-down CSS to PDF user space) — paint the inner
+            // fragment, then balance with one `Q` per layer. Layers nest in source
+            // order. A bare fragment leaves `depth = 0` ⇒ byte-identical output.
+            let mut depth = 0usize;
             let mut real = frag;
-            while let Fragment::Clipped { rect, inner } = real {
-                clips.push(*rect);
-                real = inner;
-            }
-            for r in &clips {
-                let _ = doc.push_clip_rect(page, r[0], page_h - r[1] - r[3], r[2], r[3]);
+            loop {
+                match real {
+                    Fragment::Clipped { rect, inner } => {
+                        let _ = doc.push_clip_rect(
+                            page,
+                            rect[0],
+                            page_h - rect[1] - rect[3],
+                            rect[2],
+                            rect[3],
+                        );
+                        depth += 1;
+                        real = inner;
+                    }
+                    Fragment::Transformed { matrix, inner } => {
+                        // CSS (top-down) affine → PDF (bottom-up) `cm`: conjugate by
+                        // the page Y-flip `F = [1,0,0,-1,0,H]` (`F·M·F`). Nesting
+                        // composes because the inner `F·F` cancels.
+                        let [a, b, c, d, e, f] = *matrix;
+                        let cm = [a, -b, -c, d, c * page_h + e, page_h * (1.0 - d) - f];
+                        let _ = doc.push_transform(page, cm);
+                        depth += 1;
+                        real = inner;
+                    }
+                    _ => break,
+                }
             }
             match real {
                 Fragment::Rect {
@@ -946,10 +967,11 @@ fn paint(
                 } => {
                     paint_css_gradient(doc, page, page_h, *x, *y, *w, *h, gradient, *opacity);
                 }
-                // Unwrapped above into `clips` + `real`; never a `Clipped` here.
-                Fragment::Clipped { .. } => {}
+                // Unwrapped above into graphics-state layers + `real`; the wrapper
+                // variants never reach the inner match.
+                Fragment::Clipped { .. } | Fragment::Transformed { .. } => {}
             }
-            for _ in &clips {
+            for _ in 0..depth {
                 let _ = doc.restore_graphics(page);
             }
         }
@@ -2338,6 +2360,29 @@ mod tests {
         // No shadow ⇒ no red.
         let none = page1_content(r#"<p style="color:#000000">Hi</p>"#);
         assert!(!none.contains("1 0 0 rg"), "no shadow ⇒ no red\n{none}");
+    }
+
+    #[test]
+    fn transform_emits_a_y_flipped_cm_matrix() {
+        // `translate(20pt, 10pt)` commutes with the origin shift, so the CSS matrix
+        // is [1,0,0,1,20,10]; the page Y-flip turns it into `1 0 0 1 20 -10 cm`.
+        let content = page1_content(
+            r#"<div style="transform:translate(20pt,10pt);width:50pt;height:30pt;background:#ff0000">x</div>"#,
+        );
+        assert!(
+            content.contains("1 0 0 1 20 -10 cm"),
+            "translate → Y-flipped cm\n{content}"
+        );
+        // A rotate emits a non-identity 2×2 (here `0 -1 1 0` for 90°).
+        let rot = page1_content(
+            r#"<div style="transform:rotate(90deg);width:40pt;height:40pt;background:#ff0000">x</div>"#,
+        );
+        assert!(rot.contains(" cm"), "rotate emits a cm\n{rot}");
+        assert!(rot.contains("0 -1 1 0"), "rotate(90°) 2×2 part\n{rot}");
+        // No transform ⇒ no cm op at all (the page has no images here).
+        let none =
+            page1_content(r#"<div style="width:50pt;height:30pt;background:#ff0000">x</div>"#);
+        assert!(!none.contains(" cm"), "no transform ⇒ no cm\n{none}");
     }
 
     #[test]

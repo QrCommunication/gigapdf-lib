@@ -9117,6 +9117,23 @@ impl Document {
         self.append_page_content(page_no, b"Q\n")
     }
 
+    /// Append `q` (save graphics state) + a `cm` concatenate-matrix, so subsequent
+    /// content is drawn under the affine `[a, b, c, d, e, f]` in PDF user space.
+    /// Pair with [`Self::restore_graphics`]. Lets the HTML paint layer realise a
+    /// CSS `transform` (ISO 32000-1 §8.3.4).
+    pub fn push_transform(&mut self, page_no: u32, m: [f64; 6]) -> Result<()> {
+        let ops = format!(
+            "q\n{} {} {} {} {} {} cm\n",
+            content::num(m[0]),
+            content::num(m[1]),
+            content::num(m[2]),
+            content::num(m[3]),
+            content::num(m[4]),
+            content::num(m[5]),
+        );
+        self.append_page_content(page_no, ops.as_bytes())
+    }
+
     /// Wrap `ops` in a `q /Gs gs … Q` block applying `opacity` (fill + stroke
     /// alpha) through an `/ExtGState`, or return `ops` unchanged when fully
     /// opaque. The outer graphics-state nesting lets the alpha reach the inner

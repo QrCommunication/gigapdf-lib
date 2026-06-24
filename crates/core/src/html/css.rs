@@ -534,6 +534,12 @@ pub struct Style {
     pub box_shadow_extra: Vec<BoxShadow>,
     /// `text-shadow` layers (first = topmost). Inherited like `color`.
     pub text_shadows: Vec<TextShadow>,
+    /// `transform` — the composed affine matrix `[a, b, c, d, e, f]` of the
+    /// `translate`/`rotate`/`scale`/`skew`/`matrix` functions, in CSS (top-down)
+    /// user units **before** the transform-origin shift (the paint layer applies
+    /// the origin = box centre and the page Y-flip). `None` = no transform. Not
+    /// inherited.
+    pub transform: Option<[f64; 6]>,
 }
 
 /// CSS `float` side.
@@ -728,6 +734,7 @@ impl Default for Style {
             box_shadow: None,
             box_shadow_extra: Vec::new(),
             text_shadows: Vec::new(),
+            transform: None,
         }
     }
 }
@@ -1707,6 +1714,8 @@ fn inherit(parent: &Style) -> Style {
         box_shadow_extra: Vec::new(),
         // `text-shadow` IS inherited (unlike box decorations above).
         text_shadows: parent.text_shadows.clone(),
+        // `transform` is not inherited (each element transforms independently).
+        transform: None,
     }
 }
 
@@ -3036,6 +3045,7 @@ fn apply_one(style: &mut Style, prop: &str, value: &str) {
             style.box_shadow_extra = layers;
         }
         "text-shadow" => style.text_shadows = parse_text_shadows(v, style.font_size, style.color),
+        "transform" => style.transform = parse_transform(v, style.font_size),
         "width" => style.width = parse_len(v, style.font_size),
         _ => {}
     }
@@ -3292,6 +3302,110 @@ fn parse_text_shadow_layer(layer: &str, em: f64, current: [f64; 3]) -> Option<Te
         color: color.unwrap_or(current),
         alpha,
     })
+}
+
+/// Multiply two affine matrices `[a, b, c, d, e, f]` (a point `(x, y)` maps to
+/// `(a·x + c·y + e, b·x + d·y + f)`): returns `m1 · m2` (apply `m2` first).
+fn mat_mul(m1: [f64; 6], m2: [f64; 6]) -> [f64; 6] {
+    let [a1, b1, c1, d1, e1, f1] = m1;
+    let [a2, b2, c2, d2, e2, f2] = m2;
+    [
+        a1 * a2 + c1 * b2,
+        b1 * a2 + d1 * b2,
+        a1 * c2 + c1 * d2,
+        b1 * c2 + d1 * d2,
+        a1 * e2 + c1 * f2 + e1,
+        b1 * e2 + d1 * f2 + f1,
+    ]
+}
+
+/// Parse `transform: <function>+` into the composed affine matrix (CSS user
+/// units, top-down, before the transform-origin shift). Functions compose
+/// left-to-right (the leftmost is applied last to a point). `None` for
+/// `none`/empty/unparsable.
+fn parse_transform(v: &str, em: f64) -> Option<[f64; 6]> {
+    let v = resolve_var(v);
+    let t = v.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut m = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]; // identity
+    let mut any = false;
+    let mut rest = t;
+    while let Some(open) = rest.find('(') {
+        let name = rest[..open]
+            .trim()
+            .trim_start_matches(|c: char| !c.is_ascii_alphabetic())
+            .to_ascii_lowercase();
+        let Some(close) = rest[open + 1..].find(')') else {
+            break;
+        };
+        let args = &rest[open + 1..open + 1 + close];
+        if let Some(fm) = transform_function(&name, args, em) {
+            m = mat_mul(m, fm);
+            any = true;
+        }
+        rest = &rest[open + 1 + close + 1..];
+    }
+    any.then_some(m)
+}
+
+/// Build the affine matrix for one `transform` function (`translate`, `rotate`,
+/// `scale`, `skew`, `matrix`, and their axis variants). `None` if its arguments
+/// don't parse.
+fn transform_function(name: &str, args: &str, em: f64) -> Option<[f64; 6]> {
+    let nums: Vec<&str> = args
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let len = |s: &str| parse_len_px(s, em);
+    let num = |s: &str| s.parse::<f64>().ok();
+    let rad = |s: &str| parse_gradient_angle(s).map(f64::to_radians);
+    match name {
+        "translate" => {
+            let tx = len(nums.first()?)?;
+            let ty = nums.get(1).and_then(|s| len(s)).unwrap_or(0.0);
+            Some([1.0, 0.0, 0.0, 1.0, tx, ty])
+        }
+        "translatex" => Some([1.0, 0.0, 0.0, 1.0, len(nums.first()?)?, 0.0]),
+        "translatey" => Some([1.0, 0.0, 0.0, 1.0, 0.0, len(nums.first()?)?]),
+        "scale" => {
+            let sx = num(nums.first()?)?;
+            let sy = nums.get(1).and_then(|s| num(s)).unwrap_or(sx);
+            Some([sx, 0.0, 0.0, sy, 0.0, 0.0])
+        }
+        "scalex" => Some([num(nums.first()?)?, 0.0, 0.0, 1.0, 0.0, 0.0]),
+        "scaley" => Some([1.0, 0.0, 0.0, num(nums.first()?)?, 0.0, 0.0]),
+        "rotate" => {
+            let r = rad(nums.first()?)?;
+            Some([r.cos(), r.sin(), -r.sin(), r.cos(), 0.0, 0.0])
+        }
+        "skew" => {
+            let ax = rad(nums.first()?)?;
+            let ay = nums.get(1).and_then(|s| rad(s)).unwrap_or(0.0);
+            Some([1.0, ay.tan(), ax.tan(), 1.0, 0.0, 0.0])
+        }
+        "skewx" => Some([1.0, 0.0, rad(nums.first()?)?.tan(), 1.0, 0.0, 0.0]),
+        "skewy" => Some([1.0, rad(nums.first()?)?.tan(), 0.0, 1.0, 0.0, 0.0]),
+        "matrix" => {
+            if nums.len() < 6 {
+                return None;
+            }
+            let p: Vec<f64> = nums.iter().take(6).map(|s| num(s)).collect::<Option<_>>()?;
+            Some([p[0], p[1], p[2], p[3], p[4], p[5]])
+        }
+        _ => None,
+    }
+}
+
+/// Fold a transform-origin `(ox, oy)` into a raw transform matrix:
+/// `T(ox, oy) · raw · T(-ox, -oy)`, so the transform pivots about `(ox, oy)`
+/// (CSS user space). The paint layer then applies the page Y-flip.
+pub(crate) fn transform_about_origin(raw: [f64; 6], ox: f64, oy: f64) -> [f64; 6] {
+    let pos = [1.0, 0.0, 0.0, 1.0, ox, oy];
+    let neg = [1.0, 0.0, 0.0, 1.0, -ox, -oy];
+    mat_mul(mat_mul(pos, raw), neg)
 }
 
 /// Set one side's border width and/or colour, keeping `border_color` (the
@@ -4873,6 +4987,32 @@ mod tests {
         // Unknown feature / no viewport ⇒ applies (rules not dropped).
         assert!(media_query_applies("(orientation: landscape)", wide));
         assert!(media_query_applies("(min-width: 9999px)", None));
+    }
+
+    #[test]
+    fn transform_parses_each_function() {
+        // translate lengths resolve to points (px · 0.75).
+        let t = parse_transform("translate(8px, 16px)", 16.0).unwrap();
+        assert!((t[4] - 6.0).abs() < 1e-6 && (t[5] - 12.0).abs() < 1e-6);
+        // scale / rotate / matrix.
+        assert_eq!(
+            parse_transform("scale(2, 3)", 16.0).unwrap(),
+            [2.0, 0.0, 0.0, 3.0, 0.0, 0.0]
+        );
+        let r = parse_transform("rotate(90deg)", 16.0).unwrap();
+        assert!(r[0].abs() < 1e-9 && (r[1] - 1.0).abs() < 1e-9 && (r[2] + 1.0).abs() < 1e-9);
+        assert_eq!(
+            parse_transform("matrix(1, 0, 0, 1, 5, 6)", 16.0).unwrap(),
+            [1.0, 0.0, 0.0, 1.0, 5.0, 6.0]
+        );
+        // Compose left-to-right: `scale(2) translate(10pt,0)` applies translate
+        // first, so a point (0,0) → (10,0) → scaled → (20,0): e = 20.
+        assert_eq!(
+            parse_transform("scale(2) translate(10pt, 0)", 16.0).unwrap()[4],
+            20.0
+        );
+        assert!(parse_transform("none", 16.0).is_none());
+        assert!(parse_transform("", 16.0).is_none());
     }
 
     #[test]

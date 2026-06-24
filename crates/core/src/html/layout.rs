@@ -118,6 +118,15 @@ pub enum Fragment {
         rect: [f64; 4],
         inner: Box<Fragment>,
     },
+    /// `inner` painted under a CSS `transform`: `matrix` is the affine
+    /// `[a, b, c, d, e, f]` in **CSS (top-down) user space**, with the
+    /// transform-origin already folded in. The painter conjugates it with the
+    /// page Y-flip to a PDF-space `cm` and wraps the inner in `q … cm … Q`.
+    /// Nesting composes (outer × inner).
+    Transformed {
+        matrix: [f64; 6],
+        inner: Box<Fragment>,
+    },
 }
 
 impl Fragment {
@@ -440,6 +449,21 @@ impl Flow<'_> {
             }
         }
     }
+
+    /// Wrap every fragment at `self.out[start..]` in a [`Fragment::Transformed`]
+    /// carrying `matrix` (a CSS-space affine with the transform-origin already
+    /// folded in). Called after an element's box + children are emitted, so its
+    /// whole subtree transforms together; nesting composes via the painter's
+    /// `q … cm` stacking.
+    fn transform_range(&mut self, start: usize, matrix: [f64; 6]) {
+        for a in &mut self.out[start..] {
+            let inner = std::mem::replace(&mut a.frag, Fragment::placeholder());
+            a.frag = Fragment::Transformed {
+                matrix,
+                inner: Box::new(inner),
+            };
+        }
+    }
 }
 
 /// Translate one fragment by `(dx, dy)` in place.
@@ -459,6 +483,15 @@ pub(crate) fn shift_fragment(frag: &mut Fragment, dx: f64, dy: f64) {
             // relatively-positioned subtree keeps its clip aligned.
             rect[0] += dx;
             rect[1] += dy;
+            shift_fragment(inner, dx, dy);
+        }
+        Fragment::Transformed { matrix, inner } => {
+            // The inner moves by (dx, dy); conjugate the matrix by that same shift
+            // (`M' = T(d)·M·T(-d)`) so the transform-origin moves with it and the
+            // visual result is exactly the old one translated by (dx, dy).
+            let [a, b, c, d, _, _] = *matrix;
+            matrix[4] += dx - (a * dx + c * dy);
+            matrix[5] += dy - (b * dx + d * dy);
             shift_fragment(inner, dx, dy);
         }
     }
@@ -492,6 +525,17 @@ pub(crate) fn fragment_bbox(frag: &Fragment) -> (f64, f64, f64, f64) {
         | Fragment::Border { x, y, w, h, .. }
         | Fragment::Gradient { x, y, w, h, .. } => (*x, *y, *x + *w, *y + *h),
         Fragment::Clipped { inner, .. } => fragment_bbox(inner),
+        Fragment::Transformed { matrix, inner } => {
+            // AABB of the inner box's four corners mapped through the matrix.
+            let (x0, y0, x1, y1) = fragment_bbox(inner);
+            let [a, b, c, d, e, f] = *matrix;
+            let pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+            let xs = pts.map(|(x, y)| a * x + c * y + e);
+            let ys = pts.map(|(x, y)| b * x + d * y + f);
+            let min = |v: [f64; 4]| v.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = |v: [f64; 4]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            (min(xs), min(ys), max(xs), max(ys))
+        }
     }
 }
 
@@ -1258,6 +1302,14 @@ impl Flow<'_> {
         // backgrounds and `dashed`/`dotted`/`double` border styles are honoured
         // by the shared decoration helper.
         self.emit_box_decoration(style, box_x, box_top, box_w, box_h);
+
+        // CSS `transform`: wrap this element's whole subtree (box + children) in a
+        // `Transformed` fragment, pivoting about the border-box centre.
+        if let Some(raw) = style.transform {
+            let tm =
+                super::css::transform_about_origin(raw, box_x + box_w / 2.0, box_top + box_h / 2.0);
+            self.transform_range(children_start, tm);
+        }
 
         box_top + box_h + m.bottom
     }
@@ -4191,6 +4243,24 @@ fn paginate(mut frags: Vec<Abs>, page_h: f64, top: f64, bottom: f64) -> Vec<Vec<
                 let p = page_of(fy0);
                 ensure(&mut pages, p);
                 let mut moved = Fragment::Clipped { rect, inner };
+                shift_fragment(&mut moved, 0.0, local_y(fy0, p) - fy0);
+                pages[p].push(moved);
+            }
+            Fragment::Transformed { matrix, inner } => {
+                // Assign by the TRANSFORMED box's top, then move into that page's
+                // local band (`shift_fragment` conjugates the matrix to match).
+                let (ix0, iy0, ix1, iy1) = fragment_bbox(&inner);
+                let [_, b, _, d, _, f] = matrix;
+                let ys = [
+                    b * ix0 + d * iy0 + f,
+                    b * ix1 + d * iy0 + f,
+                    b * ix1 + d * iy1 + f,
+                    b * ix0 + d * iy1 + f,
+                ];
+                let fy0 = ys.iter().copied().fold(f64::INFINITY, f64::min);
+                let p = page_of(fy0);
+                ensure(&mut pages, p);
+                let mut moved = Fragment::Transformed { matrix, inner };
                 shift_fragment(&mut moved, 0.0, local_y(fy0, p) - fy0);
                 pages[p].push(moved);
             }

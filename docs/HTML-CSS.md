@@ -297,6 +297,16 @@ inline `style`**. Inheritance works for the inherited properties below.
 | `box-shadow` | `[inset] <dx> <dy> [blur] [spread] <colour>`, comma-separated for **multiple** layers | offset, colour and spread are exact; **blur is an approximation** (a 6-ring soft edge, not a Gaussian); **`inset`** paints a clipped shadow frame inside the box (recessed look), blur likewise approximated |
 | `text-shadow` | `<dx> <dy> [blur] <colour>`, comma-separated for **multiple** layers; colour first or last; `rgba()` alpha honoured | **inherited** (like `color`); each layer re-draws the glyphs offset in the shadow colour under the text (first layer on top); offset and colour are exact, **blur is approximated** (a small spread of low-alpha passes, not a Gaussian) |
 
+### Transforms
+
+| Property | Values | Notes |
+|----------|--------|-------|
+| `transform` | `translate[X\|Y]()`, `scale[X\|Y]()`, `rotate()`, `skew[X\|Y]()`, `matrix()` — space-separated, composed left-to-right | the composed affine maps to a real PDF `cm` matrix wrapping the element's whole subtree (box + descendants). Lengths in `translate()` resolve like any other (`px → pt`); angles accept `deg`/`rad`/`turn`. Nested transforms compose; the transform pivots about the **border-box centre** (the default `transform-origin`) |
+
+> `transform-origin` (a non-default pivot) is not yet parsed — the pivot is always
+> the box centre. `perspective` and 3-D transforms are not modelled (the PDF
+> imaging model is 2-D affine).
+
 ---
 
 ## 4. Length units
@@ -433,12 +443,12 @@ subset.
 - **Layout/sizing**: a true scroll model for `position: sticky`. Named grid
   **lines** (use numeric placement or named **areas** — `grid-template-areas`
   **is** supported, see [grid](#grid)).
-- **Visual effects**: `transform`, `filter`, true Gaussian blur,
-  `background-image: url()` raster (use `<img>`), CSS tiling patterns. (Gradients,
-  rounded corners, offset/spread/**inset** box-shadows, and **`text-shadow`**
-  **are** supported — `text-shadow` re-draws the glyphs offset in the shadow
-  colour, with blur approximated; see [backgrounds](#backgrounds) and
-  [shadows](#shadows).)
+- **Visual effects**: `filter`, true Gaussian blur, `background-image: url()`
+  raster (use `<img>`), CSS tiling patterns. (Gradients, rounded corners,
+  offset/spread/**inset** box-shadows, **`text-shadow`**, and **`transform`**
+  **are** supported — `transform` maps to a PDF `cm` matrix; `text-shadow`
+  re-draws the glyphs offset in the shadow colour, with blur approximated. See
+  [transforms](#transforms), [backgrounds](#backgrounds) and [shadows](#shadows).)
 - **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
   full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
 - **Selectors**: pseudo-elements (`::before`/`::after`, not generated) and
