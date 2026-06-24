@@ -302,14 +302,19 @@ Resolved to PDF points. `1px = 0.75pt` (the 96dpi convention), `1pt = 1pt`.
 |------|---------|
 | `px` | × 0.75 → pt |
 | `pt` | points (1:1) |
+| `in` | inches — × 72pt |
+| `cm` / `mm` | × 72/2.54 and × 72/25.4 (anchored at `1in = 72pt`) |
+| `pc` | picas — × 12pt |
+| `q` | quarter-millimetres — × 72/101.6 |
 | `em` | × current font-size |
 | `rem` | × 12pt (root font-size) |
+| `ex` / `ch` | × 0.5 × current font-size (approximation — no per-font metrics) |
 | `vw` / `vh` | % of the content-band width / height |
 | `%` | of the font-size (for `font-size`/`line-height`) or the containing block (for box sizes) |
 | `calc(…)` | `+ − * /` over the units above |
 | *(unitless)* | treated as `px` |
 
-> Not supported: `cm`, `mm`, `in`, `pc`, `q`, `ex`, `ch`.
+> `ex`/`ch` use the 0.5em approximation rather than true font x-height / `0`-advance.
 
 ---
 

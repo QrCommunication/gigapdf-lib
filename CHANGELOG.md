@@ -7,6 +7,17 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.85.1] - 2026-06-24
+
+HTML/CSS renderer fidelity ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) roadmap, item E).
+
+### Added
+
+- **Absolute & relative CSS length units** in the HTML→PDF renderer: `cm`, `mm`,
+  `in`, `pc`, `q` (anchored at `1in = 72pt`) and `ex`/`ch` (0.5em approximation).
+  Resolved by `parse_len_px`; a single `LENGTH_UNITS` table keeps unit detection
+  (flex-basis / font-size) in lock-step with resolution.
+
 ## [0.85.0] - 2026-06-24
 
 Accessibility: **standalone tagged-PDF / PDF-UA authoring**. Resolves

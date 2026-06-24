@@ -2009,7 +2009,7 @@ fn apply_flex_shorthand(style: &mut Style, v: &str) {
             basis = None;
             basis_seen = true;
         } else if tok.ends_with('%')
-            || ["px", "pt", "rem", "em", "vw", "vh"]
+            || LENGTH_UNITS
                 .iter()
                 .any(|u| tok.len() > u.len() && tok.ends_with(u))
         {
@@ -2155,7 +2155,7 @@ fn font_size_px(t: &str, em: f64) -> Option<f64> {
     // valid font-size and must not pivot the shorthand. Limit to the units
     // `parse_len_px` resolves so detection and resolution stay in lock-step.
     let has_unit = t.ends_with('%')
-        || ["px", "pt", "rem", "em", "vw", "vh"]
+        || LENGTH_UNITS
             .iter()
             .any(|u| t.len() > u.len() && t.ends_with(u));
     if !has_unit {
@@ -2965,8 +2965,18 @@ fn parse_calc_px(v: &str, em: f64) -> Option<f64> {
     None
 }
 
-/// Parse a length to absolute points (1px ≈ 0.75pt at 96dpi), resolving `em`,
-/// `rem`, `vw`/`vh` (reference viewport) and a basic `calc()`/`var()`.
+/// CSS length units [`parse_len_px`] resolves — kept in **lock-step** with the
+/// unit detection in flex-basis / font-size parsing (`%` is handled separately).
+/// Absolute: `px`/`pt`/`cm`/`mm`/`in`/`pc`/`q`; font-relative: `em`/`rem`/`ex`/
+/// `ch`; viewport: `vw`/`vh`.
+const LENGTH_UNITS: [&str; 13] = [
+    "px", "pt", "rem", "em", "vw", "vh", "cm", "mm", "in", "pc", "ex", "ch", "q",
+];
+
+/// Parse a length to absolute points (1px ≈ 0.75pt at 96dpi), resolving the
+/// absolute units (`cm`/`mm`/`in`/`pc`/`q` via 1in = 72pt), `em`/`rem`/`ex`/`ch`
+/// (font-relative; `ex`/`ch` ≈ 0.5em), `vw`/`vh` (reference viewport) and a basic
+/// `calc()`/`var()`.
 fn parse_len_px(v: &str, em: f64) -> Option<f64> {
     let resolved = resolve_var(v);
     let v = resolved.trim();
@@ -2998,6 +3008,29 @@ fn parse_len_px(v: &str, em: f64) -> Option<f64> {
             .parse::<f64>()
             .ok()
             .map(|p| VIEWPORT_H_PT * p / 100.0);
+    }
+    // Absolute physical units, anchored at 1in = 72pt (= 96px).
+    if let Some(n) = v.strip_suffix("cm") {
+        return n.trim().parse::<f64>().ok().map(|p| p * 72.0 / 2.54);
+    }
+    if let Some(n) = v.strip_suffix("mm") {
+        return n.trim().parse::<f64>().ok().map(|p| p * 72.0 / 25.4);
+    }
+    if let Some(n) = v.strip_suffix("in") {
+        return n.trim().parse::<f64>().ok().map(|p| p * 72.0);
+    }
+    if let Some(n) = v.strip_suffix("pc") {
+        return n.trim().parse::<f64>().ok().map(|p| p * 12.0);
+    }
+    // `ex`/`ch` have no font metrics here → the common 0.5em approximation.
+    if let Some(n) = v.strip_suffix("ex") {
+        return n.trim().parse::<f64>().ok().map(|p| p * em * 0.5);
+    }
+    if let Some(n) = v.strip_suffix("ch") {
+        return n.trim().parse::<f64>().ok().map(|p| p * em * 0.5);
+    }
+    if let Some(n) = v.strip_suffix('q') {
+        return n.trim().parse::<f64>().ok().map(|p| p * 72.0 / 101.6);
     }
     if let Some(n) = v.strip_suffix('%') {
         // Percent of font size only makes sense for line-height/font-size here.
@@ -4488,5 +4521,30 @@ mod tests {
         assert!(child.flex_basis.is_none(), "flex-basis resets to auto");
         assert_eq!(child.grid_col_span, 1, "grid span resets to 1");
         assert!(child.grid_template_columns.is_empty(), "track list resets");
+    }
+
+    #[test]
+    fn absolute_and_relative_length_units_resolve_to_points() {
+        // 1in = 72pt; cm/mm/pc/q derive from it; ex/ch ≈ 0.5em (em = 10pt here).
+        // Last two confirm the existing units are unchanged.
+        for (input, expected) in [
+            ("1in", 72.0),
+            ("2.54cm", 72.0),
+            ("25.4mm", 72.0),
+            ("1pc", 12.0),
+            ("40q", 72.0 / 2.54), // 40q = 1cm
+            ("2ex", 10.0),
+            ("2ch", 10.0),
+            ("96px", 72.0),
+            ("10pt", 10.0),
+        ] {
+            let got = parse_len_px(input, 10.0).unwrap();
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "{input} → {got} (want {expected})"
+            );
+        }
+        // A keyword that merely ends in a unit ("thin") is not a length.
+        assert!(parse_len_px("thin", 10.0).is_none());
     }
 }
