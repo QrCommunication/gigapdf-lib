@@ -13,15 +13,25 @@ two fixes that close the gaps the validator surfaced.
 ### Added
 
 - **Selectable PDF/A conformance level.** `toPdfA(level?)` accepts `"pdfa-1b"` ·
-  `"pdfa-2b"` (default, backward-compatible) · `"pdfa-2u"` · `"pdfa-3b"`; core
-  `to_pdfa_level(level)` + `PdfaLevel` enum. Level **1b** emits a `%PDF-1.4`
-  header (ISO 19005-1), the others `%PDF-1.7`; **2u** keeps every glyph mapped to
-  Unicode (`/ToUnicode`); **3b** permits embedded files (`/AF`). All four pass
-  veraPDF (`isCompliant = true`).
+  `"pdfa-1a"` · `"pdfa-2b"` (default, backward-compatible) · `"pdfa-2u"` ·
+  `"pdfa-2a"` · `"pdfa-3b"`; core `to_pdfa_level(level)` + `PdfaLevel` enum.
+  Levels **1b/1a** emit a `%PDF-1.4` header (ISO 19005-1), the others `%PDF-1.7`;
+  **2u** keeps every glyph mapped to Unicode (`/ToUnicode`); **3b** permits
+  embedded files (`/AF`); **1a/2a** are level A (Tagged PDF, see below). All six
+  pass veraPDF (`isCompliant = true`).
+- **Tagged PDF — level A conformance (`pdfa-1a`, `pdfa-2a`).** ISO 19005 level A
+  adds the logical-structure tree the engine already infers. On a level-A export
+  the catalog gains `/MarkInfo << /Marked true >>`, `/Lang`, and a `/StructTreeRoot`
+  whose tree is derived from the document structure (`Document` → `P` / `H1`…`H6`
+  / `Table` / `TR` / `TH` / `TD` / `L` / `LI` / `LBody` / `Figure`), backed by a
+  `/ParentTree`. Content is marked up in the page streams — each tagged run wrapped
+  as `/<role> << /MCID n >> BDC … EMC`, non-tagged marks emitted as `/Artifact` —
+  so the structure is render-neutral (pixels are identical to the untagged
+  export). Validated `isCompliant = true` against veraPDF for **both** 2a and 1a.
 - **Conformance CI gate** (`conformance.yml`). Generates fixtures from the SDK
-  and validates them against reference validators only — veraPDF for PDF/A (×4
-  levels), qpdf for PDF, structural OPC/ODF checks for the Office/ODF exports —
-  failing the build on any regression.
+  and validates them against reference validators only — veraPDF for PDF/A (the
+  six levels), qpdf for PDF, structural OPC/ODF checks for the Office/ODF exports
+  — failing the build on any regression.
 
 ### Fixed
 

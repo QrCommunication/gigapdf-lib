@@ -3,8 +3,9 @@
 #
 # Generates fixtures from the SDK (native engine output) and validates each with
 # REFERENCE validators — never a home-grown parser:
-#   • PDF      → qpdf --check          (ISO 32000 structural integrity)
-#   • PDF/A    → veraPDF -f 1b|2b|2u|3b (ISO 19005, archival profiles)
+#   • PDF      → qpdf --check                   (ISO 32000 structural integrity)
+#   • PDF/A    → veraPDF -f 1b|1a|2b|2u|2a|3b    (ISO 19005, archival profiles —
+#                                                 incl. level A / Tagged PDF: 1a, 2a)
 #   • Office   → OPC invariants         (ECMA-376 / ISO 29500: [Content_Types],
 #                                        _rels, relation targets, XML well-formed)
 #   • ODF      → ODF invariants         (ISO 26300: mimetype-first/STORED,
@@ -192,10 +193,12 @@ main() {
   say "validating fixtures…"
   # PDF (structural)
   gate "sample.pdf"          "PDF (qpdf)"
-  # PDF/A — veraPDF, four conformance levels
+  # PDF/A — veraPDF, six conformance levels (incl. level A / Tagged PDF: 1a, 2a)
   gate "sample.pdfa-1b.pdf"  "PDF/A-1b (veraPDF)" --pdfa 1b
+  gate "sample.pdfa-1a.pdf"  "PDF/A-1a (veraPDF)" --pdfa 1a
   gate "sample.pdfa-2b.pdf"  "PDF/A-2b (veraPDF)" --pdfa 2b
   gate "sample.pdfa-2u.pdf"  "PDF/A-2u (veraPDF)" --pdfa 2u
+  gate "sample.pdfa-2a.pdf"  "PDF/A-2a (veraPDF)" --pdfa 2a
   gate "sample.pdfa-3b.pdf"  "PDF/A-3b (veraPDF)" --pdfa 3b
   # Office (OPC structural, + XSD if vendored)
   gate "sample.docx"         "DOCX (OPC)"  "${xsd_arg[@]}"

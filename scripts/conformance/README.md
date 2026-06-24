@@ -11,8 +11,10 @@ never a home-grown parser:
 |---|---|---|---|
 | `sample.pdf` | PDF | **qpdf** `--check` (+ pikepdf 2nd opinion) | ISO 32000 |
 | `sample.pdfa-1b.pdf` | PDF/A-1b | **veraPDF** `-f 1b` | ISO 19005-1 |
+| `sample.pdfa-1a.pdf` | PDF/A-1a | **veraPDF** `-f 1a` | ISO 19005-1 (Tagged, level A) |
 | `sample.pdfa-2b.pdf` | PDF/A-2b | **veraPDF** `-f 2b` | ISO 19005-2 |
 | `sample.pdfa-2u.pdf` | PDF/A-2u | **veraPDF** `-f 2u` | ISO 19005-2 (Unicode) |
+| `sample.pdfa-2a.pdf` | PDF/A-2a | **veraPDF** `-f 2a` | ISO 19005-2 (Tagged, level A) |
 | `sample.pdfa-3b.pdf` | PDF/A-3b | **veraPDF** `-f 3b` | ISO 19005-3 |
 | `sample.docx` | OOXML | OPC structural (+ optional XSD) | ECMA-376 / ISO 29500 |
 | `sample.xlsx` | OOXML | OPC structural (+ optional XSD) | ECMA-376 / ISO 29500 |

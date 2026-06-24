@@ -10,8 +10,10 @@
 // Output (default ./fixtures, override with $OUT_DIR or argv[2]):
 //   sample.pdf            native HTML+CSS→PDF (engine.htmlToPdf)
 //   sample.pdfa-1b.pdf    ISO 19005-1  (doc.toPdfA "pdfa-1b")
+//   sample.pdfa-1a.pdf    ISO 19005-1a (Tagged PDF, level A)
 //   sample.pdfa-2b.pdf    ISO 19005-2  (default)
 //   sample.pdfa-2u.pdf    ISO 19005-2u (Unicode-mapped glyphs)
+//   sample.pdfa-2a.pdf    ISO 19005-2a (Tagged PDF, level A)
 //   sample.pdfa-3b.pdf    ISO 19005-3  (allows attachments)
 //   sample.docx/.xlsx/.pptx   ECMA-376 / ISO 29500 (OPC)
 //   sample.odt/.ods/.odp      ISO 26300 (ODF)
@@ -27,8 +29,10 @@ const OUT = resolve(process.argv[2] || process.env.OUT_DIR || join(HERE, "fixtur
 
 // Self-contained HTML test page: prose, a heading, a table, a list and an inline
 // image (data URI). Embeds a Unicode-mappable Latin font implicitly via the
-// engine's built-in base-14 so 2u can map every glyph. Kept intentionally simple
-// and printable to keep the PDF/A conformance bar reachable.
+// engine's built-in base-14 so 2u can map every glyph; its block/heading/table
+// structure also drives the StructTreeRoot the level-A (1a/2a) profiles require.
+// Kept intentionally simple and printable to keep the PDF/A conformance bar
+// reachable.
 const SAMPLE_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -49,7 +53,7 @@ const SAMPLE_HTML = `<!DOCTYPE html>
 <body>
   <h1>Document Conformance Fixture</h1>
   <p>This page is rendered by the native gigapdf-lib HTML+CSS engine and exported
-     to PDF, PDF/A (1b, 2b, 2u, 3b) and the Office / OpenDocument formats. It is
+     to PDF, PDF/A (1b, 1a, 2b, 2u, 2a, 3b) and the Office / OpenDocument formats. It is
      validated by veraPDF, qpdf and structural OPC/ODF checks in CI so that every
      conformance level the engine claims is proven on every push.</p>
 
@@ -80,8 +84,10 @@ const SAMPLE_HTML = `<!DOCTYPE html>
 function deriveFixtures(engine, doc) {
   return [
     ["sample.pdfa-1b.pdf", () => doc.toPdfA("pdfa-1b")],
+    ["sample.pdfa-1a.pdf", () => doc.toPdfA("pdfa-1a")],
     ["sample.pdfa-2b.pdf", () => doc.toPdfA("pdfa-2b")],
     ["sample.pdfa-2u.pdf", () => doc.toPdfA("pdfa-2u")],
+    ["sample.pdfa-2a.pdf", () => doc.toPdfA("pdfa-2a")],
     ["sample.pdfa-3b.pdf", () => doc.toPdfA("pdfa-3b")],
     ["sample.docx", () => doc.toDocx()],
     ["sample.xlsx", () => doc.toXlsx()],
