@@ -44,6 +44,27 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.97.0] - 2026-06-25
+
+Engine improvements only — no new SDK methods; existing conversion/render/read
+methods get markedly higher fidelity.
+
+### Improved
+
+- **JPEG 2000 (`JPXDecode`) images** now render and extract (a from-scratch
+  decoder wired into the image pipeline) — the third hand-written image codec
+  after CCITTFax and JBIG2. ([#35](https://github.com/qrcommunication/gigapdf-lib/issues/35))
+- **`toPdfA` is now veraPDF-validated conformant** — every font embedded (or
+  metric-matched-substituted), encryption + JavaScript stripped, metadata from
+  the document. ([#4](https://github.com/qrcommunication/gigapdf-lib/issues/4))
+- **Conversion fidelity** advanced across the open roadmaps: PDF→model recon
+  (FontDescriptor bold/italic, robust columns/lines, table spans/sparse/rotated,
+  tagged `/ColSpan`/`/ListNumbering`/`/Pg`/`/BBox`); Office import (DOCX symbols/
+  text-boxes/field-codes, footnotes, PPTX/ODP autoshapes, ODT lists/spans);
+  Office export (standard CSV, Markdown colour/shapes, PPTX para formatting, run
+  images, hyperlinks, ODT nested lists/borders); RTF/text model-aware export;
+  CSV typed-cell import.
+
 ## [0.96.0] - 2026-06-25
 
 PDF linearization + from-scratch bilevel codecs, plus a broad conversion-fidelity

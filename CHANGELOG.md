@@ -7,6 +7,55 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.97.0] - 2026-06-25
+
+The third from-scratch image codec — **JPEG 2000** — lands and is wired into the
+render/extract pipeline, **PDF/A export is now veraPDF-validated conformant**, and
+a second broad pass over the conversion-fidelity roadmaps
+([#2](https://github.com/qrcommunication/gigapdf-lib/issues/2)/[#3](https://github.com/qrcommunication/gigapdf-lib/issues/3)/[#4](https://github.com/qrcommunication/gigapdf-lib/issues/4)/[#5](https://github.com/qrcommunication/gigapdf-lib/issues/5),
+which stay open for their long tails).
+
+### Added — PDF reading
+
+- **JPEG 2000 (`JPXDecode`) decoder, from scratch** (no third-party codec): JP2
+  box container + raw codestream, all markers, tier-2 packet decoding (tag-trees,
+  all five progression orders), tier-1 EBCOT, inverse 5/3 + 9/7 DWT, inverse
+  multi-component transform — **wired into the image pipeline** so JPEG 2000
+  images (and their `/SMask`s) render and extract. Completes the set of
+  hand-written image codecs (CCITTFax · JBIG2 · JPEG2000).
+  ([#35](https://github.com/qrcommunication/gigapdf-lib/issues/35))
+
+### Fixed — PDF/A is now genuinely conformant
+
+- `toPdfA` now **embeds every font** — substituting a bundled metric-compatible
+  standard face (flags + widths matched, `/ToUnicode` kept) for any face the
+  source only references by name — **strips forbidden constructs** (encryption,
+  document JavaScript) and sources **metadata from the document** (`/Info` + XMP
+  agree). Validated **PASS, 0 failed rules by veraPDF** (1b + 2b), closing the
+  former false-conformance gap.
+  ([#4](https://github.com/qrcommunication/gigapdf-lib/issues/4))
+
+### Improved — conversion fidelity (roadmap second pass)
+
+- **PDF → model reconstruction** ([#5](https://github.com/qrcommunication/gigapdf-lib/issues/5)):
+  bold/italic from the `/FontDescriptor` (not just the font name); multi-column
+  detection robust to full-width lines; centroid line-grouping (superscripts no
+  longer split off); table detection handles borderless merged spans, large/sparse
+  and rotated tables; the tagged path honours `/ColSpan`/`/RowSpan`,
+  `/ListNumbering`, `/Pg` page and `/BBox` geometry.
+- **Office import** ([#3](https://github.com/qrcommunication/gigapdf-lib/issues/3),
+  [#37](https://github.com/qrcommunication/gigapdf-lib/issues/37)): DOCX symbol
+  runs, text boxes and field codes; footnotes/endnotes; text-less PPTX/ODP
+  autoshapes (fill/line/geometry); ODT ordered lists + table cell spans.
+- **Office export** ([#2](https://github.com/qrcommunication/gigapdf-lib/issues/2)):
+  standard multi-sheet CSV; Markdown run colour + shapes (inline HTML/SVG); PPTX
+  paragraph formatting; ODT/PPTX run images; PPTX/ODP external hyperlinks; ODT
+  nested lists + table borders.
+- **Other formats** ([#4](https://github.com/qrcommunication/gigapdf-lib/issues/4)):
+  RTF and plain-text export are model-tree-aware (aligned tables, list markers,
+  styled RTF) for tagged/imported docs; CSV import infers typed cells
+  (number/bool/date) with conservative text guards.
+
 ## [0.96.0] - 2026-06-25
 
 Two headline features close — **PDF linearization** and **from-scratch bilevel
