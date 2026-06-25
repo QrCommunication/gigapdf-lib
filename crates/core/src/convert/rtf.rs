@@ -83,8 +83,11 @@ enum RtfBlock {
     /// An embedded picture extracted from a `{\pict …}` group: the decoded raw
     /// image bytes (PNG or JPEG), the IANA subtype ("png" / "jpeg"), and the
     /// display size in CSS points (from `\picwgoal`/`\pichgoal`, else `\picw`/
-    /// `\pich`). Serialized as an `<img src="data:image/…;base64,…">` so the
-    /// HTML engine's existing image-embed path renders it.
+    /// `\pich`). Web-native blips (`\pngblip`/`\jpegblip`) are kept verbatim;
+    /// `\wmetafile`/`\emfblip` (WMF/EMF) and `\dibitmap`/`\wbitmap` (DIB/BMP)
+    /// are decoded to RGBA by the in-house metafile/DIB decoders and re-encoded
+    /// to PNG. Serialized as an `<img src="data:image/…;base64,…">` so the HTML
+    /// engine's existing image-embed path renders it.
     Image(RtfPicture),
 }
 
@@ -99,6 +102,23 @@ struct RtfPicture {
     width_pt: f64,
     /// Display height in CSS points.
     height_pt: f64,
+}
+
+/// How a `\pict` payload must be decoded, selected by its blip control word.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PictKind {
+    /// No recognized blip control word yet → skip the picture.
+    Unknown,
+    /// `\pngblip` — PNG bytes, embedded verbatim.
+    Png,
+    /// `\jpegblip` — JPEG bytes, embedded verbatim.
+    Jpeg,
+    /// `\wmetafile` — Windows Metafile, rasterized then re-encoded to PNG.
+    Wmf,
+    /// `\emfblip` — Enhanced Metafile, rasterized then re-encoded to PNG.
+    Emf,
+    /// `\dibitmap` / `\wbitmap` — packed DIB, decoded then re-encoded to PNG.
+    Dib,
 }
 
 /// A font-table entry: family name + a generic CSS family bucket.
@@ -163,6 +183,10 @@ struct Parser<'a> {
     skip: bool,
     /// `\ucN`: count of fallback bytes to skip after each `\uN`.
     uc: i64,
+    /// `\binN`: count of raw payload bytes the scanner must skip *verbatim* after
+    /// the control word (they may embed `{`/`}`/`\`). Set by [`Self::apply_control`],
+    /// consumed by [`Self::control`] right after it advances past the word.
+    bin_skip: usize,
 
     fonts: Vec<FontEntry>,
     colors: Vec<[u8; 3]>,
@@ -206,6 +230,7 @@ impl<'a> Parser<'a> {
             par: ParaState::default(),
             skip: false,
             uc: 1,
+            bin_skip: 0,
             fonts: Vec::new(),
             colors: Vec::new(),
             blocks: Vec::new(),
@@ -430,6 +455,13 @@ impl<'a> Parser<'a> {
         }
         self.i = k;
 
+        // `\binN`: jump the scanner past the N raw payload bytes verbatim so an
+        // arbitrary `{`/`}`/`\` inside them is never mis-read as RTF structure.
+        if self.bin_skip > 0 {
+            self.i = self.i.saturating_add(self.bin_skip).min(b.len());
+            self.bin_skip = 0;
+        }
+
         // Skip `\ucN` fallback bytes that follow a `\uN`.
         for _ in 0..fallback_skip {
             if self.i >= b.len() {
@@ -565,6 +597,14 @@ impl<'a> Parser<'a> {
                 // extract the image — appended as an `RtfBlock::Image`.
                 self.skip = true;
                 self.read_pict();
+            }
+            "bin" => {
+                // `\binN`: the next N bytes are a raw binary blob (picture data,
+                // object data, …), NOT control text. Signal [`Self::control`] to
+                // jump the scanner past them verbatim — their bytes may otherwise
+                // be mis-read as `{`/`}`/`\` structure. `read_pict` has already
+                // captured them for any picture; here we only skip them.
+                self.bin_skip = param.unwrap_or(0).max(0) as usize;
             }
             // ── hyperlinks (`\field`) ──
             "field" => {} // container; its \fldinst / \fldrslt sub-groups carry the data
@@ -733,35 +773,42 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a `{\pict …}` group and, for PNG/JPEG pictures, push an
-    /// [`RtfBlock::Image`]. Called right after the `\pict` control word; reads
-    /// ahead from `self.i` to the group close **without** advancing `self.i` —
-    /// the main loop re-scans the same bytes with `skip` on, suppressing the
-    /// hex payload from the body text (mirrors [`Self::read_fonttbl`]).
+    /// Parse a `{\pict …}` group and, for every decodable blip, push an
+    /// [`RtfBlock::Image`]. Called right after the `\pict` control word; scans
+    /// ahead from `self.i` to the group close **without** moving `self.i` — the
+    /// main loop re-scans the same bytes with `skip` on, suppressing the payload
+    /// from the body text (mirrors [`Self::read_fonttbl`]). The `\bin<N>` binary
+    /// form is made safe by [`Self::apply_control`] skipping its N raw bytes on
+    /// that re-scan (the bytes may embed `{`/`}`/`\` that would otherwise be
+    /// mis-read as structure); here we only capture them for decoding.
     ///
     /// Supported source encodings:
     /// * **hex** (RTF default): pairs of hex digits in the group text.
-    /// * **`\bin<N>`**: not handled here — binary blobs can embed `{`/`}`/`\`
-    ///   bytes the byte-scanner would mis-read, so such pictures are skipped
-    ///   (the format is rare for PNG/JPEG, which ship hex-encoded).
+    /// * **`\bin<N>`**: the *N raw bytes* immediately after the delimiter are the
+    ///   payload (any blip type may use it). Captured verbatim.
     ///
-    /// Supported formats: `\pngblip` (PNG) and `\jpegblip` (JPEG) are decoded
-    /// and embedded. `\dibitmap`/`\wbitmap` (DIB/BMP) and `\wmetafile`/`\emfblip`
-    /// (WMF/EMF) have no decoder/parser in this crate, so they are skipped.
+    /// Supported formats — all decoded to real images:
+    /// * `\pngblip` / `\jpegblip` — kept verbatim (already web-native).
+    /// * `\wmetafile` / `\emfblip` — WMF/EMF, rasterized by the in-house
+    ///   [`metafile`](super::metafile) decoder and re-encoded to PNG.
+    /// * `\dibitmap` / `\wbitmap` — packed DIB, decoded by [`decode_dib`] and
+    ///   re-encoded to PNG.
+    ///
+    /// Genuinely-undecodable payloads (unknown blip, corrupt/truncated bytes) are
+    /// skipped cleanly: no `<img>`, no panic, no leaked payload bytes.
     fn read_pict(&mut self) {
         let b = self.bytes;
-        let mut p = self.i; // just after "pict"
+        let mut p = self.i; // at the `\` of `\pict`
         let mut depth = 0i32; // relative depth within the \pict group
 
         // Picture metadata, gathered from the control words preceding the data.
         let mut subtype: Option<&'static str> = None; // None until a known blip
-        let mut is_metafile = false; // \wmetafile / \emfblip / default WMF
-        let mut is_bitmap = false; // \dibitmap / \wbitmap (no decoder)
-        let mut has_bin = false; // \bin<N> binary payload present → skip
+        let mut kind = PictKind::Unknown; // how to decode the payload
         let (mut picw, mut pich) = (0i64, 0i64); // \picw / \pich (source units)
         let (mut goalw, mut goalh) = (0i64, 0i64); // \picwgoal / \pichgoal (twips)
         let (mut scalex, mut scaley) = (100i64, 100i64); // \picscalex / \picscaley (%)
         let mut hex = String::new(); // collected hex digits of the payload
+        let mut bin: Option<Vec<u8>> = None; // raw bytes from a `\bin<N>` payload
 
         while p < b.len() {
             match b[p] {
@@ -799,11 +846,17 @@ impl<'a> Parser<'a> {
                         .map(|n: i64| if neg { -n } else { n });
 
                     match w {
-                        "pngblip" => subtype = Some("png"),
-                        "jpegblip" => subtype = Some("jpeg"),
-                        "dibitmap" | "wbitmap" => is_bitmap = true,
-                        "wmetafile" | "emfblip" => is_metafile = true,
-                        "bin" => has_bin = true,
+                        "pngblip" => {
+                            subtype = Some("png");
+                            kind = PictKind::Png;
+                        }
+                        "jpegblip" => {
+                            subtype = Some("jpeg");
+                            kind = PictKind::Jpeg;
+                        }
+                        "dibitmap" | "wbitmap" => kind = PictKind::Dib,
+                        "wmetafile" => kind = PictKind::Wmf,
+                        "emfblip" => kind = PictKind::Emf,
                         "picw" => picw = np.unwrap_or(0),
                         "pich" => pich = np.unwrap_or(0),
                         "picwgoal" => goalw = np.unwrap_or(0),
@@ -815,6 +868,15 @@ impl<'a> Parser<'a> {
                     // A single trailing space delimits the control word.
                     if q < b.len() && b[q] == b' ' {
                         q += 1;
+                    }
+                    // `\bin<N>`: the next N bytes are the raw (non-hex) payload.
+                    // Capture them and jump past, so their arbitrary bytes never
+                    // reach the structural scanner.
+                    if w == "bin" {
+                        let n = np.unwrap_or(0).max(0) as usize;
+                        let end = q.saturating_add(n).min(b.len());
+                        bin = Some(b[q..end].to_vec());
+                        q = end;
                     }
                     p = q;
                 }
@@ -828,30 +890,46 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // No usable raster: unknown/unsupported format, or binary payload we
-        // cannot safely slice from the scanned stream → drop the picture.
-        let subtype = match subtype {
-            Some(st) if !has_bin => st,
-            _ => {
-                // is_bitmap / is_metafile / has_bin are intentionally unhandled
-                // (documented limits); reading the flags keeps intent explicit.
-                let _ = (is_bitmap, is_metafile);
+        // The encoded payload bytes: `\bin` raw form takes precedence over hex.
+        let raw: Option<Vec<u8>> = match bin {
+            Some(bytes) if !bytes.is_empty() => Some(bytes),
+            _ => decode_hex(&hex),
+        };
+        let Some(raw) = raw else {
+            return;
+        };
+
+        // Decode to final image bytes (re-encoding vector/bitmap forms to PNG).
+        let (data, subtype): (Vec<u8>, &'static str) = match kind {
+            PictKind::Png => {
+                if !raw.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+                    return;
+                }
+                (raw, "png")
+            }
+            PictKind::Jpeg => {
+                if !raw.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                    return;
+                }
+                (raw, "jpeg")
+            }
+            PictKind::Wmf => match metafile_to_png(super::metafile::decode_wmf(&raw)) {
+                Some(png) => (png, "png"),
+                None => return,
+            },
+            PictKind::Emf => match metafile_to_png(super::metafile::decode_emf(&raw)) {
+                Some(png) => (png, "png"),
+                None => return,
+            },
+            PictKind::Dib => match decode_dib(&raw) {
+                Some((w, h, rgba)) => (crate::raster::encode_png(w, h, &rgba), "png"),
+                None => return,
+            },
+            PictKind::Unknown => {
+                let _ = subtype; // no recognized blip control word
                 return;
             }
         };
-
-        let Some(data) = decode_hex(&hex) else {
-            return;
-        };
-        // Defend against truncated/garbage payloads: require the format's magic.
-        let ok = match subtype {
-            "png" => data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
-            "jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
-            _ => false,
-        };
-        if !ok {
-            return;
-        }
 
         // Display size: prefer the goal (twips → pt); else the source dimensions
         // (also taken as twips) scaled by \picscale; else a sane default. RTF
@@ -1029,6 +1107,147 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     } else {
         Some(out)
     }
+}
+
+/// Re-encode a decoded metafile raster (from the in-house WMF/EMF decoder) to a
+/// PNG, or `None` if decoding failed or produced an empty raster.
+fn metafile_to_png(raster: Option<super::metafile::MetafileRaster>) -> Option<Vec<u8>> {
+    let r = raster?;
+    if r.width == 0 || r.height == 0 || r.rgba.len() < (r.width as usize) * (r.height as usize) * 4
+    {
+        return None;
+    }
+    Some(crate::raster::encode_png(r.width, r.height, &r.rgba))
+}
+
+/// Decode a **packed DIB** — a `BITMAPINFOHEADER` (≥40 bytes) followed by its
+/// palette (for ≤8 bpp) and pixel bits — to top-down RGBA8 `(width, height,
+/// rgba)`. This is exactly the payload an RTF `\dibitmap` (and the older
+/// `\wbitmap`, in practice a packed DIB) carries. Supports the common
+/// uncompressed `BI_RGB` depths (1/4/8/24/32 bpp); compressed (RLE/bitfields)
+/// or malformed input returns `None`. Self-contained; never panics.
+fn decode_dib(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let rd_u16 =
+        |o: usize| -> Option<u16> { data.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]])) };
+    let rd_u32 = |o: usize| -> Option<u32> {
+        data.get(o..o + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let rd_i32 = |o: usize| -> Option<i32> {
+        data.get(o..o + 4)
+            .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+
+    let header_size = rd_u32(0)? as usize;
+    // Modern BITMAPINFOHEADER family only (≥40); reject the rare 12-byte core form.
+    if header_size < 40 || header_size > data.len() {
+        return None;
+    }
+    let width = rd_i32(4)?;
+    let height_raw = rd_i32(8)?;
+    let bit_count = rd_u16(14)? as u32;
+    let compression = rd_u32(16)?;
+    // Only uncompressed BI_RGB; bound dimensions to keep allocation sane.
+    if compression != 0 || width <= 0 || width > (1 << 16) {
+        return None;
+    }
+    let top_down = height_raw < 0;
+    let height = height_raw.unsigned_abs();
+    if height == 0 || height > (1 << 16) {
+        return None;
+    }
+    let (w, h) = (width as u32, height);
+
+    // Palette (BGRA quads) for indexed depths.
+    let mut clr_used = rd_u32(32).unwrap_or(0);
+    if clr_used == 0 && bit_count <= 8 {
+        clr_used = 1u32 << bit_count;
+    }
+    let palette_len = if bit_count <= 8 { clr_used as usize } else { 0 };
+    let mut palette: Vec<[u8; 3]> = Vec::with_capacity(palette_len);
+    for i in 0..palette_len {
+        let o = header_size + i * 4;
+        // Truncated palette → pad black so indices stay valid.
+        match data.get(o..o + 4) {
+            Some(q) => palette.push([q[2], q[1], q[0]]),
+            None => palette.push([0, 0, 0]),
+        }
+    }
+
+    let bits_off = header_size + palette_len * 4;
+    let bits = data.get(bits_off..)?;
+
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    let mut store = |x: u32, row: u32, rgb: [u8; 3]| {
+        // Rows are bottom-up unless `top_down`; flip to top-down storage.
+        let y = if top_down { row } else { h - 1 - row };
+        if x < w && y < h {
+            let i = ((y * w + x) * 4) as usize;
+            out[i] = rgb[0];
+            out[i + 1] = rgb[1];
+            out[i + 2] = rgb[2];
+            out[i + 3] = 255;
+        }
+    };
+
+    // Each row is padded up to a 4-byte boundary.
+    let row_bytes = ((w as usize) * bit_count as usize).div_ceil(32) * 4;
+    match bit_count {
+        1 | 4 | 8 => {
+            for row in 0..h {
+                let ro = (row as usize) * row_bytes;
+                let line = match bits.get(ro..ro + row_bytes) {
+                    Some(l) => l,
+                    None => break,
+                };
+                for x in 0..w {
+                    let bit_pos = (x as usize) * bit_count as usize;
+                    let idx = match bit_count {
+                        8 => line[bit_pos / 8] as usize,
+                        4 => {
+                            let byte = line[bit_pos / 8];
+                            if x & 1 == 0 {
+                                (byte >> 4) as usize
+                            } else {
+                                (byte & 0x0F) as usize
+                            }
+                        }
+                        _ => {
+                            let byte = line[bit_pos / 8];
+                            ((byte >> (7 - (bit_pos & 7))) & 1) as usize
+                        }
+                    };
+                    store(x, row, *palette.get(idx).unwrap_or(&[0, 0, 0]));
+                }
+            }
+        }
+        24 => {
+            for row in 0..h {
+                let ro = (row as usize) * row_bytes;
+                if bits.get(ro..ro + row_bytes).is_none() {
+                    break;
+                }
+                for x in 0..w {
+                    let p = ro + (x as usize) * 3;
+                    store(x, row, [bits[p + 2], bits[p + 1], bits[p]]);
+                }
+            }
+        }
+        32 => {
+            for row in 0..h {
+                let ro = (row as usize) * row_bytes;
+                if bits.get(ro..ro + row_bytes).is_none() {
+                    break;
+                }
+                for x in 0..w {
+                    let p = ro + (x as usize) * 4;
+                    store(x, row, [bits[p + 2], bits[p + 1], bits[p]]);
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some((w, h, out))
 }
 
 fn para_html(p: &Parser, para: &Para, out: &mut String) {
@@ -1583,16 +1802,20 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_metafile_and_bitmap_pictures_are_skipped() {
-        // WMF/EMF (vector metafiles) and DIB/BMP have no decoder → no <img>, and
-        // the hex must not leak. Surrounding text still renders.
+    fn undecodable_metafile_and_bitmap_pictures_are_skipped() {
+        // WMF/EMF and DIB/BMP blips ARE decoded now — but a payload the decoder
+        // rejects (here: random bytes that are neither a metafile nor a DIB)
+        // yields no <img>, no leaked hex, and leaves surrounding text intact.
         for blip in ["wmetafile8", "emfblip", "dibitmap", "wbitmap"] {
             let payload = "DEADBEEFCAFE0102";
             let rtf = format!(
                 r"{{\rtf1\ansi keep {{\pict\{blip}\picwgoal500\pichgoal500 {payload}}}done\par}}"
             );
             let html = rtf_to_html(&rtf);
-            assert!(!html.contains("<img"), "{blip}: must not emit <img>: {html}");
+            assert!(
+                !html.contains("<img"),
+                "{blip}: must not emit <img>: {html}"
+            );
             assert!(
                 !html.contains(payload),
                 "{blip}: hex payload leaked: {html}"
@@ -1605,11 +1828,16 @@ mod tests {
     }
 
     #[test]
-    fn pict_with_bin_payload_is_skipped() {
-        // \bin<N> binary payloads are not sliced from the scanned stream → no img.
+    fn pict_with_bin_payload_carrying_invalid_magic_is_skipped() {
+        // A `\bin<N>` payload is now read (its N raw bytes are captured), but a
+        // `\pngblip` whose bytes lack the PNG magic is dropped — and the binary
+        // bytes are skipped by the scanner so surrounding text survives.
         let rtf = r"{\rtf1\ansi text {\pict\pngblip\bin4 ....}more\par}";
         let html = rtf_to_html(rtf);
-        assert!(!html.contains("<img"), "binary pict skipped: {html}");
+        assert!(
+            !html.contains("<img"),
+            "invalid-magic binary pict skipped: {html}"
+        );
         assert!(html.contains("text") && html.contains("more"), "{html}");
     }
 
@@ -1619,6 +1847,366 @@ mod tests {
         let rtf = r"{\rtf1\ansi {\pict\pngblip\picwgoal100\pichgoal100 0011223344}\par}";
         let html = rtf_to_html(rtf);
         assert!(!html.contains("<img"), "magic-less payload dropped: {html}");
+    }
+
+    // ───────────── WMF / EMF / DIB / \bin picture decoding (#4) ──────────────
+
+    /// Build a tiny **placeable WMF** that fills a blue polygon on a 100×100
+    /// logical canvas (same record shapes the metafile module's own tests use).
+    fn tiny_wmf() -> Vec<u8> {
+        fn pu16(v: &mut Vec<u8>, x: u16) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn pu32(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn rec(out: &mut Vec<u8>, func: u16, params: &[u16]) {
+            pu32(out, 3 + params.len() as u32);
+            pu16(out, func);
+            for p in params {
+                pu16(out, *p);
+            }
+        }
+        let blue = {
+            let c = 255u32 << 16; // COLORREF 0x00bbggrr → blue
+            [(c & 0xFFFF) as u16, (c >> 16) as u16]
+        };
+        let mut recs = Vec::new();
+        rec(&mut recs, 0x020B, &[0, 0]); // SetWindowOrg
+        rec(&mut recs, 0x020C, &[100, 100]); // SetWindowExt 100×100
+        rec(&mut recs, 0x02FC, &[0, blue[0], blue[1], 0]); // CreateBrushIndirect (blue)
+        rec(&mut recs, 0x012D, &[0]); // SelectObject(brush)
+        rec(&mut recs, 0x0324, &[4, 20, 20, 80, 20, 80, 80, 20, 80]); // Polygon (square)
+        rec(&mut recs, 0x0000, &[]); // EOF
+
+        let mut v = Vec::new();
+        pu32(&mut v, 0x9AC6_CDD7); // placeable key
+        pu16(&mut v, 0); // hmf
+        for c in [0i16, 0, 100, 100] {
+            pu16(&mut v, c as u16); // bbox
+        }
+        pu16(&mut v, 100); // inch
+        pu32(&mut v, 0); // reserved
+        pu16(&mut v, 0); // checksum
+        pu16(&mut v, 1); // mtType
+        pu16(&mut v, 9); // mtHeaderSize
+        pu16(&mut v, 0x0300);
+        pu32(&mut v, 0);
+        pu16(&mut v, 4);
+        pu32(&mut v, 0);
+        pu16(&mut v, 0);
+        v.extend_from_slice(&recs);
+        v
+    }
+
+    /// Build a tiny **EMF** that fills a blue ellipse on a 60×60 device canvas.
+    fn tiny_emf() -> Vec<u8> {
+        fn pu16(v: &mut Vec<u8>, x: u16) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn pu32(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn pi32(v: &mut Vec<u8>, x: i32) {
+            v.extend_from_slice(&(x as u32).to_le_bytes());
+        }
+        fn emr(out: &mut Vec<u8>, itype: u32, body: &[u8]) {
+            let mut body = body.to_vec();
+            while !body.len().is_multiple_of(4) {
+                body.push(0);
+            }
+            pu32(out, itype);
+            pu32(out, 8 + body.len() as u32);
+            out.extend_from_slice(&body);
+        }
+        let (w, h) = (60i32, 60i32);
+        let mut recs = Vec::new();
+        // EMR_CREATEBRUSHINDIRECT (handle 1, solid blue), then SelectObject(1).
+        let mut br = Vec::new();
+        pu32(&mut br, 1);
+        pu32(&mut br, 0); // BS_SOLID
+        pu32(&mut br, 0x00FF_0000); // COLORREF blue
+        pu32(&mut br, 0);
+        emr(&mut recs, 39, &br);
+        let mut sel = Vec::new();
+        pu32(&mut sel, 1);
+        emr(&mut recs, 37, &sel);
+        // EMR_ELLIPSE box (10,10)-(50,50).
+        let mut el = Vec::new();
+        for c in [10i32, 10, 50, 50] {
+            pi32(&mut el, c);
+        }
+        emr(&mut recs, 42, &el);
+        emr(&mut recs, 14, &[0, 0, 0, 0]); // EOF
+
+        let mut header = Vec::new();
+        for c in [0i32, 0, w - 1, h - 1] {
+            pi32(&mut header, c); // rclBounds
+        }
+        for c in [0i32, 0, w * 26, h * 26] {
+            pi32(&mut header, c); // rclFrame
+        }
+        pu32(&mut header, 0x464D_4520); // " EMF"
+        pu32(&mut header, 0x0001_0000); // version
+        pu32(&mut header, 0); // nBytes
+        pu32(&mut header, 0); // nRecords
+        pu16(&mut header, 0); // nHandles
+        pu16(&mut header, 0); // sReserved
+        pu32(&mut header, 0); // nDescription
+        pu32(&mut header, 0); // offDescription
+        pu32(&mut header, 0); // nPalEntries
+        for c in [w, h, w, h] {
+            pi32(&mut header, c); // szlDevice + szlMillimeters
+        }
+        let mut v = Vec::new();
+        pu32(&mut v, 1); // EMR_HEADER
+        pu32(&mut v, 8 + header.len() as u32);
+        v.extend_from_slice(&header);
+        v.extend_from_slice(&recs);
+        v
+    }
+
+    /// Build a 2×2 24-bpp packed DIB (BITMAPINFOHEADER + bottom-up rows):
+    /// TL red, TR green, BL blue, BR white.
+    fn tiny_dib() -> Vec<u8> {
+        fn pu16(v: &mut Vec<u8>, x: u16) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn pu32(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn pi32(v: &mut Vec<u8>, x: i32) {
+            v.extend_from_slice(&(x as u32).to_le_bytes());
+        }
+        let mut d = Vec::new();
+        pu32(&mut d, 40); // biSize
+        pi32(&mut d, 2); // biWidth
+        pi32(&mut d, 2); // biHeight (bottom-up)
+        pu16(&mut d, 1); // biPlanes
+        pu16(&mut d, 24); // biBitCount
+        pu32(&mut d, 0); // BI_RGB
+        pu32(&mut d, 0); // biSizeImage
+        pi32(&mut d, 0);
+        pi32(&mut d, 0);
+        pu32(&mut d, 0);
+        pu32(&mut d, 0);
+        // Bottom row (BL blue, BR white), B,G,R, row padded to 4 bytes.
+        d.extend_from_slice(&[255, 0, 0, 255, 255, 255, 0, 0]);
+        // Top row (TL red, TR green).
+        d.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
+        d
+    }
+
+    /// Decode the PNG interned by `rtf_to_model` for the first image block and
+    /// assert it carries at least one non-transparent pixel.
+    fn assert_interned_png_has_pixels(doc: &Document) {
+        let img = blocks(doc)
+            .iter()
+            .find_map(|blk| match &blk.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("a BlockKind::Image");
+        let res = doc
+            .resources
+            .images
+            .get(&img.resource)
+            .expect("image bytes interned");
+        assert_eq!(res.format, "png", "re-encoded to PNG");
+        let decoded = crate::raster::decode_png(&res.bytes).expect("interned PNG decodes");
+        assert!(decoded.width > 0 && decoded.height > 0, "non-empty raster");
+        let painted = decoded.rgba.chunks_exact(4).any(|px| px[3] > 0);
+        assert!(painted, "decoded PNG must have a painted (opaque) pixel");
+    }
+
+    #[test]
+    fn wmetafile_pict_decodes_to_png_image() {
+        let wmf = tiny_wmf();
+        // Sanity: the metafile decoder itself produces a painted raster.
+        let raster = super::super::metafile::decode_wmf(&wmf).expect("wmf decodes");
+        assert!(
+            raster.rgba.chunks_exact(4).any(|p| p[3] > 0),
+            "wmf has pixels"
+        );
+
+        let rtf = format!(
+            r"{{\rtf1\ansi a {{\pict\wmetafile8\picwgoal1440\pichgoal1440 {}}}b\par}}",
+            hex_encode(&wmf)
+        );
+        let html = rtf_to_html(&rtf);
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "WMF re-encoded to a PNG data URI: {html}"
+        );
+        let (a, img, b) = (
+            html.find('a').unwrap(),
+            html.find("<img").expect("img"),
+            html.rfind('b').unwrap(),
+        );
+        assert!(a < img && img < b, "image lands in flow order");
+        assert_interned_png_has_pixels(&rtf_to_model(&rtf));
+    }
+
+    #[test]
+    fn emfblip_pict_decodes_to_png_image() {
+        let emf = tiny_emf();
+        let rtf = format!(
+            r"{{\rtf1\ansi {{\pict\emfblip\picwgoal960\pichgoal960 {}}}\par}}",
+            hex_encode(&emf)
+        );
+        let html = rtf_to_html(&rtf);
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "EMF re-encoded to a PNG data URI: {html}"
+        );
+        assert_interned_png_has_pixels(&rtf_to_model(&rtf));
+    }
+
+    #[test]
+    fn dibitmap_pict_decodes_to_png_image() {
+        let dib = tiny_dib();
+        let rtf = format!(
+            r"{{\rtf1\ansi {{\pict\dibitmap0\picwgoal720\pichgoal720 {}}}\par}}",
+            hex_encode(&dib)
+        );
+        let html = rtf_to_html(&rtf);
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "DIB re-encoded to a PNG data URI: {html}"
+        );
+        // The interned PNG must round-trip to the DIB's actual colours.
+        let doc = rtf_to_model(&rtf);
+        assert_interned_png_has_pixels(&doc);
+        let img = blocks(&doc)
+            .iter()
+            .find_map(|blk| match &blk.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .unwrap();
+        let png = &doc.resources.images.get(&img.resource).unwrap().bytes;
+        let dec = crate::raster::decode_png(png).expect("png decodes");
+        assert_eq!((dec.width, dec.height), (2, 2), "2×2 DIB preserved");
+        // Top-left pixel is red (DIB stored bottom-up; decoder flips to top-down).
+        let tl = &dec.rgba[0..4];
+        assert!(
+            tl[0] > 200 && tl[1] < 80 && tl[2] < 80 && tl[3] == 255,
+            "DIB top-left should be opaque red, got {tl:?}"
+        );
+    }
+
+    #[test]
+    fn pict_with_bin_form_blip_becomes_image() {
+        // `\binN` carries the picture as N RAW bytes (not hex). The parser's API
+        // is `&str` (the crate forbids unsafe), so the blob must be valid UTF-8;
+        // we use a packed DIB whose every byte is < 0x80 AND that deliberately
+        // embeds the structural bytes `{` (0x7B), `}` (0x7D), `\` (0x5C) plus NUL
+        // — exactly what a naive scanner would mis-read. A correct `\bin` reader
+        // captures the N bytes verbatim and jumps the scanner past them.
+        //
+        // 2×2 24-bpp DIB, bottom-up; pixel BGR triples chosen to contain the
+        // structural bytes: BL=(0x7B,0x5C,0x7D), BR=(0x10,0x20,0x30),
+        // TL=(0x40,0x50,0x60), TR=(0x01,0x02,0x03).
+        let mut dib: Vec<u8> = Vec::new();
+        // BITMAPINFOHEADER (all small ints / zeros → valid UTF-8).
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&2i32.to_le_bytes()); // width
+        dib.extend_from_slice(&2i32.to_le_bytes()); // height (bottom-up)
+        dib.extend_from_slice(&1u16.to_le_bytes()); // planes
+        dib.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        dib.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        dib.extend_from_slice(&[0u8; 20]); // remaining header fields (zeros)
+
+        // Pixel rows are bottom-up; BGR triples, each row padded to 4 bytes.
+        // Bottom row: BL then BR.
+        dib.extend_from_slice(&[0x7B, 0x5C, 0x7D, 0x10, 0x20, 0x30, 0x00, 0x00]);
+        // Top row: TL then TR.
+        dib.extend_from_slice(&[0x40, 0x50, 0x60, 0x01, 0x02, 0x03, 0x00, 0x00]);
+        assert!(dib.iter().all(|&b| b < 0x80), "DIB must be valid UTF-8");
+        assert!(
+            dib.contains(&b'{') && dib.contains(&b'}') && dib.contains(&b'\\'),
+            "DIB must embed the structural bytes the scanner could mis-read"
+        );
+
+        // Assemble the RTF at the byte level, then validate it is real UTF-8.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(br"{\rtf1\ansi text {\pict\dibitmap0\bin");
+        bytes.extend_from_slice(dib.len().to_string().as_bytes());
+        bytes.push(b' '); // single delimiter space before the raw bytes
+        bytes.extend_from_slice(&dib); // N raw bytes
+        bytes.extend_from_slice(br"}more\par}");
+        let rtf = String::from_utf8(bytes).expect("DIB blob keeps the RTF valid UTF-8");
+
+        let html = rtf_to_html(&rtf);
+        assert!(
+            html.contains("<img src=\"data:image/png;base64,"),
+            "bin-form DIB decodes + re-encodes to an <img>: {html}"
+        );
+        assert!(
+            html.contains("text") && html.contains("more"),
+            "surrounding text survives the raw `{{`/`}}`/`\\` bytes: {html}"
+        );
+
+        // The interned PNG round-trips to the DIB's top-left colour (0x60,0x50,0x40).
+        let doc = rtf_to_model(&rtf);
+        assert_interned_png_has_pixels(&doc);
+        let img = blocks(&doc)
+            .iter()
+            .find_map(|blk| match &blk.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .unwrap();
+        let dec =
+            crate::raster::decode_png(&doc.resources.images.get(&img.resource).unwrap().bytes)
+                .expect("png decodes");
+        assert_eq!((dec.width, dec.height), (2, 2));
+        assert_eq!(
+            &dec.rgba[0..4],
+            &[0x60, 0x50, 0x40, 255],
+            "TL pixel R,G,B,A"
+        );
+    }
+
+    #[test]
+    fn malformed_metafile_blip_is_skipped_without_panic() {
+        // A `\wmetafile` blip whose payload is NOT a metafile: skipped cleanly,
+        // no panic, and the rest of the document (text + a following table) is
+        // intact.
+        let rtf = concat!(
+            r"{\rtf1\ansi keep ",
+            r"{\pict\wmetafile8\picwgoal500\pichgoal500 00FF00FF00FF}",
+            r"after\par",
+            r"\trowd \cell X1\cell X2\row}",
+        );
+        let html = rtf_to_html(rtf);
+        assert!(
+            !html.contains("<img"),
+            "undecodable metafile → no img: {html}"
+        );
+        assert!(
+            html.contains("keep") && html.contains("after"),
+            "text intact: {html}"
+        );
+        assert!(
+            html.contains("X1") && html.contains("X2"),
+            "table after still parses: {html}"
+        );
+
+        // The model path must also survive (no panic) and keep the table.
+        let doc = rtf_to_model(rtf);
+        assert!(
+            blocks(&doc)
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Table(_))),
+            "table block preserved in model"
+        );
+        assert!(
+            !blocks(&doc)
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Image(_))),
+            "no image block from the undecodable metafile"
+        );
     }
 
     // ──────────────────────── rich RTF → model (#4) ─────────────────────────

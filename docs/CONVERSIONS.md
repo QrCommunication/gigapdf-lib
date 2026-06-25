@@ -39,8 +39,8 @@ PDF → X:  PDF ──► model ──► file  (pdf.toDocx() etc. — reconstru
 | **DOC / XLS / PPT** (legacy OLE2) | **Text only** | flat plain text (largest stream, UTF‑16/ASCII) | **everything else** — styling, tables, sheets, slides, images, structure. A real binary reader is needed (tracked) |
 | **Markdown** | Good | ATX **and setext** headings, bold/italic/**strikethrough `~~`**/code, **inline `[t](url)` + reference `[t][ref]`/collapsed `[t][]`/shortcut `[t]` links** (resolved against `[ref]: url "title"` defs), **footnote refs `[^id]` → the `[^id]: …` body**, **inline images `![alt](url "title")`** (`Inline::Image` keyed by URL hash + alt, mirroring the HTML importer — local/`data:`/external all keep the reference), ordered/unordered nested lists, **GFM task-lists `- [ ]`/`- [x]`** (leading `☐`/`☑` glyph), GFM tables, fenced code, blockquotes, HR, **inline HTML phrasing tags** (`<b>`/`<strong>`, `<i>`/`<em>`, `<code>`, `<u>`, `<s>`/`<del>`, `<a href>`, `<br>`) **+ character references** (`&amp;`, `&#233;`…) | task-list state is a glyph (no boolean checkbox slot on `ListItem`); footnotes resolve inline (no separate footnote section/backref); inline HTML limited to the common phrasing tags (unknown tags drop, text kept); image bytes are not fetched/interned (URL reference only, as in HTML) |
 | **CSV** | Full | quoting/escaping (RFC 4180), embedded delimiters/newlines, BOM, delimiter auto-detect, ragged rows padded; **lowered to a typed `SheetBlock`** (the same typed-cell model as XLSX/ODS, not a text-only layout table) with **per-cell type inference**: a body cell becomes `CellValue::Number` (optionally signed, fraction, decimal exponent `1e5`), `CellValue::Bool` (`true`/`false`, any case incl. `TRUE`/`FALSE`), or a date/datetime (ISO `YYYY-MM-DD`[`THH:MM[:SS]`], space or `T` separator → an Excel-style serial number + a `yyyy-mm-dd`[` hh:mm:ss`] `number_format`); the header row stays verbatim `CellValue::Text`. **Conservative guards** keep ambiguous tokens as text — leading-zero numerics (`01234` ZIP), digit runs > 15 (card/account IDs that would lose `f64` precision), sign/separator-laden tokens (`+1-555-0100` phone), and out-of-range or non-ISO dates (`06/25/2026`, `2026-13-01`, non-leap `2023-02-29`) are never coerced | multi-sheet (CSV has none); percentage/currency (no `%`/`$` parsing — `CellValue` has no such variant and the XLSX path carries these only via number-format metadata absent from raw CSV) |
-| **RTF → PDF** | Rich | full char/para formatting, fonts, colours, tables, PNG/JPEG pictures, `\field` hyperlinks (`HYPERLINK "url"` → `<a href>`) | WMF/EMF/BMP pictures, nested tables |
-| **RTF → model** | Rich | run-level char styling (bold/italic/underline/strike, `\cf` colour, `\fs` size, `\f` font family + serif/sans/mono generic, super/sub), paragraph alignment/indents, tables (`\trowd`/`\cell`/`\row` → `BlockKind::Table`), PNG/JPEG `\pict` images (**bytes interned** into `Document.resources.images`), `\field` hyperlinks (`HYPERLINK "url"` → `Inline::Link`) — routed through the **same rich parser** as RTF→PDF (no text-only fallback) | WMF/EMF/BMP & `\bin` pictures (no decoder), nested tables, list ordering/nesting (lowered as plain paragraphs) |
+| **RTF → PDF** | Rich | full char/para formatting, fonts, colours, tables, pictures — **PNG/JPEG** kept verbatim and **WMF/EMF (`\wmetafile`/`\emfblip`) + DIB/BMP (`\dibitmap`/`\wbitmap`)** decoded by the in-house metafile/DIB decoders and **re-encoded to PNG**; both hex and **`\bin<N>` binary** payloads; `\field` hyperlinks (`HYPERLINK "url"` → `<a href>`) | nested tables |
+| **RTF → model** | Rich | run-level char styling (bold/italic/underline/strike, `\cf` colour, `\fs` size, `\f` font family + serif/sans/mono generic, super/sub), paragraph alignment/indents, tables (`\trowd`/`\cell`/`\row` → `BlockKind::Table`), `\pict` images (**bytes interned** into `Document.resources.images`) — **PNG/JPEG** verbatim, **WMF/EMF (`\wmetafile`/`\emfblip`)** rasterized by `convert::metafile` and **DIB/BMP (`\dibitmap`/`\wbitmap`)** decoded in-house, both **re-encoded to PNG**; both hex and **`\bin<N>` binary** payloads, `\field` hyperlinks (`HYPERLINK "url"` → `Inline::Link`) — routed through the **same rich parser** as RTF→PDF (no text-only fallback) | nested tables, list ordering/nesting (lowered as plain paragraphs) |
 | **HTML** | — | see [HTML-CSS.md](HTML-CSS.md) for the full HTML/CSS feature surface | — |
 
 > **Flat (single-file) ODF** — `.fodt` / `.fods` / `.fodp` / `.fodg` are also
@@ -269,11 +269,14 @@ pen/brush, the fill rule (`SetPolyFillMode`) and the paint state
 render as a reasonable advance/box strip (text is secondary; no font shaping
 here), and genuinely-rare records (palette management, escapes, EMF GDI+ comment
 blocks, ROP2 ops other than copy) are skipped safely. Public API:
-`decode_wmf`/`decode_emf`/`decode_metafile` (sniffing). **Wiring into
-`office_import` (Office EMF/WMF embedded images, [#3](../../issues/3)) and `rtf`
-(RTF WMF/EMF pictures, [#4](../../issues/4)) is a separate follow-up** — this is
-the decoder + its public API only; the RTF/Office "WMF/EMF … (no decoder)"
-limitations above still hold until that wiring lands.
+`decode_wmf`/`decode_emf`/`decode_metafile` (sniffing). **The RTF importer is now
+wired to it** ([#4](../../issues/4)): a `{\pict\wmetafile…}`/`{\pict\emfblip…}` is
+rasterized through `decode_wmf`/`decode_emf` and a `{\pict\dibitmap…}`/`{\pict\wbitmap…}`
+through an in-house packed-DIB decoder, each **re-encoded to PNG** via
+`raster::encode_png` before interning — covering both the hex and the `\bin<N>`
+binary payload forms. **Wiring into `office_import` (Office EMF/WMF embedded images,
+[#3](../../issues/3)) is still a separate follow-up**; the Office "WMF/EMF … (no
+decoder)" limitation holds until that lands.
 
 **Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
 (Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`
