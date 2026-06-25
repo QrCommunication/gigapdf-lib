@@ -2092,23 +2092,133 @@ fn docx_link_target(ctx: &DocxCtx, attrs: &[(String, String)]) -> model::LinkTar
     model::LinkTarget::Url(String::new())
 }
 
+/// The interned form of an embedded media part: either the original blob kept
+/// verbatim under its true format tag, or a metafile rasterized to PNG.
+enum MediaIntern {
+    /// Keep the bytes as-is; the `&str` is the [`model::ImageResource::format`]
+    /// tag (`"png"`, `"jpeg"`, `"webp"`, `"gif"`, `"bmp"`, `"tiff"`, `"svg"`).
+    Keep(&'static str),
+    /// A WMF/EMF metafile: re-encode the decoded RGBA raster to PNG and intern
+    /// that (the model/render/export side carries no metafile rasterizer, so the
+    /// picture only survives as a bitmap).
+    MetafileToPng,
+}
+
+/// Classify an embedded media blob from its **magic bytes** first (robust against
+/// a wrong/assumed extension — the cause of mislabeled resources), then its
+/// filename extension as a fallback. Returns how to intern it, or `None` for an
+/// unrecognized blob.
+///
+/// Raster + SVG blobs are kept verbatim under their true tag (the OOXML/ODF
+/// export side maps each via `office_image_format`, and the renderer decodes
+/// PNG/JPEG/WebP/GIF natively); WMF/EMF are flagged for PNG rasterization.
+fn classify_media(name: &str, bytes: &[u8]) -> Option<MediaIntern> {
+    // ── Magic bytes (authoritative) ─────────────────────────────────────────
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some(MediaIntern::Keep("png"));
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(MediaIntern::Keep("jpeg"));
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some(MediaIntern::Keep("webp"));
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some(MediaIntern::Keep("gif"));
+    }
+    if bytes.starts_with(b"BM") {
+        return Some(MediaIntern::Keep("bmp"));
+    }
+    // TIFF: little-endian (`II*\0`) or big-endian (`MM\0*`) byte-order mark.
+    if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    {
+        return Some(MediaIntern::Keep("tiff"));
+    }
+    // WMF placeable key / EMF " EMF" signature: a metafile to rasterize. The
+    // metafile decoder re-sniffs (incl. bare WMF headers) before committing.
+    if bytes.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A])
+        || (bytes.len() >= 44
+            && &bytes[40..44] == b" EMF"
+            && bytes.get(0..4) == Some(&[1, 0, 0, 0]))
+    {
+        return Some(MediaIntern::MetafileToPng);
+    }
+    // SVG is text (`<svg …>` or an XML prolog containing `<svg`); sniff a prefix.
+    if is_svg_bytes(bytes) {
+        return Some(MediaIntern::Keep("svg"));
+    }
+    // ── Extension fallback (for the rare blob whose magic we don't match) ────
+    let lower = name.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "png" => Some(MediaIntern::Keep("png")),
+        "jpg" | "jpeg" => Some(MediaIntern::Keep("jpeg")),
+        "webp" => Some(MediaIntern::Keep("webp")),
+        "gif" => Some(MediaIntern::Keep("gif")),
+        "bmp" | "dib" => Some(MediaIntern::Keep("bmp")),
+        "tif" | "tiff" => Some(MediaIntern::Keep("tiff")),
+        "svg" => Some(MediaIntern::Keep("svg")),
+        "wmf" | "emf" | "emz" | "wmz" => Some(MediaIntern::MetafileToPng),
+        _ => None,
+    }
+}
+
+/// Heuristic SVG sniff: scan the first non-whitespace bytes for an opening `<svg`
+/// (possibly after an `<?xml …?>` prolog / `<!-- … -->` comment / DOCTYPE), which
+/// is enough to tell an SVG part from another XML payload. Caps the scan so a
+/// large non-SVG blob isn't walked end-to-end.
+fn is_svg_bytes(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(1024)];
+    // Skip a UTF-8 BOM if present.
+    let head = head.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(head);
+    let text = String::from_utf8_lossy(head);
+    let trimmed = text.trim_start();
+    (trimmed.starts_with('<') || trimmed.is_empty()) && text.contains("<svg")
+}
+
+/// Intern an embedded media zip entry into `resources` under a content-hash key,
+/// returning that key. Raster/SVG blobs are stored verbatim with their detected
+/// format tag (sniffed from the bytes, not assumed from the extension); WMF/EMF
+/// metafiles are rasterized and re-encoded to PNG so the picture survives into
+/// the model/render/export (which carry no metafile rasterizer). `None` for a
+/// missing, unrecognized, or undecodable entry. Identical bytes hash identically,
+/// so a reused picture is stored once.
+fn intern_media(
+    zip: &BTreeMap<String, Vec<u8>>,
+    key: &str,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<u64> {
+    let raw = zip.get(key)?;
+    let (bytes, format): (Vec<u8>, &'static str) = match classify_media(key, raw)? {
+        MediaIntern::Keep(fmt) => (raw.clone(), fmt),
+        MediaIntern::MetafileToPng => {
+            let r = crate::convert::metafile::decode_metafile(raw)?;
+            (
+                crate::raster::png::encode_png(r.width, r.height, &r.rgba),
+                "png",
+            )
+        }
+    };
+    let hash = fnv1a(&bytes);
+    resources.entry(hash).or_insert(model::ImageResource {
+        bytes,
+        format: format.to_string(),
+    });
+    Some(hash)
+}
+
 /// Decode a supported image zip entry, intern its bytes in `resources` under a
 /// content-hash key, and return an [`ImageRef`] to it (the inline-flow counterpart
-/// of [`image_block`]). `None` for a missing or unsupported (vector/legacy) entry.
+/// of [`image_block`]). `None` for a missing or unsupported entry. WMF/EMF are
+/// rasterized to PNG and other formats kept under their true tag — see
+/// [`intern_media`].
 fn image_ref(
     zip: &BTreeMap<String, Vec<u8>>,
     key: &str,
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Option<model::ImageRef> {
-    let mime = image_mime(key)?;
-    let bytes = zip.get(key)?.clone();
-    let hash = fnv1a(&bytes);
-    let format = mime.rsplit('/').next().unwrap_or("png").to_string();
-    resources
-        .entry(hash)
-        .or_insert(model::ImageResource { bytes, format });
     Some(model::ImageRef {
-        resource: hash,
+        resource: intern_media(zip, key, resources)?,
         alt: None,
     })
 }
@@ -7021,24 +7131,18 @@ fn text_paragraph_block(text: String) -> Block {
 }
 
 /// Decode a supported image zip entry, register its bytes in `resources` under a
-/// content-hash key, and return an [`BlockKind::Image`] block referencing that
-/// key. `None` for a missing or unsupported (vector/legacy) entry. Identical
+/// content-hash key, and return a [`BlockKind::Image`] block referencing that
+/// key. `None` for a missing or unsupported entry. WMF/EMF are rasterized to PNG
+/// and other formats kept under their true tag — see [`intern_media`]. Identical
 /// bytes hash identically, so a reused picture is stored once.
 fn image_block(
     zip: &BTreeMap<String, Vec<u8>>,
     key: &str,
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Option<Block> {
-    let mime = image_mime(key)?;
-    let bytes = zip.get(key)?.clone();
-    let hash = fnv1a(&bytes);
-    let format = mime.rsplit('/').next().unwrap_or("png").to_string();
-    resources
-        .entry(hash)
-        .or_insert(model::ImageResource { bytes, format });
     Some(Block {
         kind: BlockKind::Image(model::ImageRef {
-            resource: hash,
+            resource: intern_media(zip, key, resources)?,
             alt: None,
         }),
         ..Block::default()
@@ -18057,6 +18161,232 @@ mod tests {
         );
         assert_eq!(model.resources.images[&img.resource].format, "png");
         assert!(!model.resources.images[&img.resource].bytes.is_empty());
+    }
+
+    // ── embedded media format coverage (issue #3) ──────────────────────────
+
+    /// A minimal **placeable WMF** (`0x9AC6CDD7` key + a `METAHEADER` + one EOF
+    /// record) with a 0..100 × 0..100 logical bbox at 100 units/inch — enough for
+    /// [`crate::convert::metafile::decode_metafile`] to produce a ~96² raster.
+    fn placeable_wmf_min() -> Vec<u8> {
+        fn pu16(v: &mut Vec<u8>, x: u16) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn pi16(v: &mut Vec<u8>, x: i16) {
+            v.extend_from_slice(&(x as u16).to_le_bytes());
+        }
+        fn pu32(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        let mut v = Vec::new();
+        // APMHEADER: key, hmf, bbox (l,t,r,b), inch, reserved, checksum.
+        pu32(&mut v, 0x9AC6_CDD7);
+        pu16(&mut v, 0);
+        pi16(&mut v, 0);
+        pi16(&mut v, 0);
+        pi16(&mut v, 100);
+        pi16(&mut v, 100);
+        pu16(&mut v, 100);
+        pu32(&mut v, 0);
+        pu16(&mut v, 0);
+        // METAHEADER (9 words): type, headerSize, version, size, numObjects,
+        // maxRecord, numMembers.
+        pu16(&mut v, 1);
+        pu16(&mut v, 9);
+        pu16(&mut v, 0x0300);
+        pu32(&mut v, 0);
+        pu16(&mut v, 0);
+        pu32(&mut v, 0);
+        pu16(&mut v, 0);
+        // META_EOF record: size = 3 words, function = 0x0000.
+        pu32(&mut v, 3);
+        pu16(&mut v, 0x0000);
+        v
+    }
+
+    /// A tiny but structurally-valid GIF89a (1×1, no real pixel data needed — the
+    /// importer keeps the bytes verbatim, only the `GIF89a` magic is read).
+    fn tiny_gif() -> Vec<u8> {
+        b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec()
+    }
+
+    /// A tiny `BM`-magic BMP blob (header bytes only — kept verbatim, the importer
+    /// never decodes it).
+    fn tiny_bmp() -> Vec<u8> {
+        let mut v = b"BM".to_vec();
+        v.extend_from_slice(&[0; 60]); // padding to a plausible header length
+        v
+    }
+
+    /// A 2×2 red JPEG via the engine's own encoder (a real, decodable blob).
+    fn red_jpeg() -> Vec<u8> {
+        let rgba = [255u8, 0, 0, 255].repeat(4);
+        crate::raster::jpeg::encode_jpeg(2, 2, &rgba, 80)
+    }
+
+    #[test]
+    fn docx_model_embedded_wmf_is_rasterized_to_png() {
+        // A WMF embedded picture must survive into the model — the engine has no
+        // metafile rasterizer downstream, so `intern_media` decodes it and
+        // re-encodes the raster to PNG (issue #3).
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z">
+  <w:body>
+    <w:p><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId5" Type="image" Target="media/diagram.wmf"/>
+</Relationships>"#;
+        let bytes = build_docx(
+            doc,
+            Some(rels),
+            &[("word/media/diagram.wmf", placeable_wmf_min())],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        let img = model_first_section_inlines(&model)
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("an Inline::Image for the WMF");
+        let res = &model.resources.images[&img.resource];
+        // Interned as PNG (not "wmf"), with real PNG bytes (signature present).
+        assert_eq!(res.format, "png", "WMF must be rasterized + tagged png");
+        assert!(
+            res.bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+            "interned blob is a PNG"
+        );
+    }
+
+    #[test]
+    fn pptx_model_embedded_wmf_is_rasterized_to_png() {
+        // Same path through PPTX: a slide picture pointing at a WMF media part.
+        let slide = r#"<p:sld xmlns:p="p" xmlns:a="a" xmlns:r="r">
+  <p:cSld><p:spTree>
+    <p:pic><p:blipFill><a:blip r:embed="rId2"/></p:blipFill></p:pic>
+  </p:spTree></p:cSld>
+</p:sld>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId2" Type="image" Target="../media/image1.wmf"/>
+</Relationships>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored("ppt/slides/slide1.xml", slide.as_bytes());
+        z.add_stored("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes());
+        z.add_stored("ppt/media/image1.wmf", &placeable_wmf_min());
+        let bytes = z.finish();
+        let model = pptx_to_model(&read_zip(&bytes));
+
+        let res = model
+            .resources
+            .images
+            .values()
+            .next()
+            .expect("the WMF interned as a resource");
+        assert_eq!(res.format, "png", "PPTX WMF rasterized + tagged png");
+        assert!(res.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn docx_model_embedded_gif_and_bmp_keep_their_format() {
+        // GIF/BMP are not decoded here, but must be interned with the *correct*
+        // format tag (not the old hardcoded "png") so the export side preserves
+        // them (issue #3).
+        for (target, media, want) in [
+            ("media/a.gif", ("word/media/a.gif", tiny_gif()), "gif"),
+            ("media/p.bmp", ("word/media/p.bmp", tiny_bmp()), "bmp"),
+        ] {
+            let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z">
+  <w:body><w:p><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p></w:body>
+</w:document>"#;
+            let rels = format!(
+                r#"<Relationships xmlns="x"><Relationship Id="rId5" Type="image" Target="{target}"/></Relationships>"#
+            );
+            let raw = media.1.clone();
+            let bytes = build_docx(doc, Some(&rels), &[media]);
+            let model = office_to_model(&bytes).expect("docx → model");
+
+            let img = model_first_section_inlines(&model)
+                .iter()
+                .find_map(|i| match i {
+                    Inline::Image(r) => Some(r.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("an Inline::Image for {want}"));
+            let res = &model.resources.images[&img.resource];
+            assert_eq!(res.format, want, "{want} must keep its format tag");
+            assert_eq!(res.bytes, raw, "{want} bytes kept verbatim (not decoded)");
+        }
+    }
+
+    #[test]
+    fn docx_model_embedded_jpeg_is_tagged_jpeg_not_png() {
+        // A normal non-PNG raster must be tagged from its bytes — proves the
+        // format is detected, not hardcoded to "png".
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z">
+  <w:body><w:p><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p></w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId5" Type="image" Target="media/photo.jpeg"/>
+</Relationships>"#;
+        let jpeg = red_jpeg();
+        let bytes = build_docx(doc, Some(rels), &[("word/media/photo.jpeg", jpeg.clone())]);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        let img = model_first_section_inlines(&model)
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("an Inline::Image for the JPEG");
+        let res = &model.resources.images[&img.resource];
+        assert_eq!(res.format, "jpeg");
+        assert_eq!(res.bytes, jpeg, "JPEG bytes kept verbatim");
+    }
+
+    #[test]
+    fn media_intern_classifies_by_magic_bytes() {
+        // Magic-byte sniffing is authoritative and corrects a wrong extension.
+        let png = red_png();
+        assert!(matches!(
+            classify_media("x.png", &png),
+            Some(MediaIntern::Keep("png"))
+        ));
+        // A GIF blob mislabeled `.png` is still classified as gif (the bug fix).
+        assert!(matches!(
+            classify_media("mislabeled.png", &tiny_gif()),
+            Some(MediaIntern::Keep("gif"))
+        ));
+        assert!(matches!(
+            classify_media("x.bmp", &tiny_bmp()),
+            Some(MediaIntern::Keep("bmp"))
+        ));
+        assert!(matches!(
+            classify_media("x.jpg", &red_jpeg()),
+            Some(MediaIntern::Keep("jpeg"))
+        ));
+        // SVG sniffed from its text content.
+        let svg = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>"#;
+        assert!(matches!(
+            classify_media("x.svg", svg),
+            Some(MediaIntern::Keep("svg"))
+        ));
+        // WMF/EMF flagged for rasterization.
+        assert!(matches!(
+            classify_media("x.wmf", &placeable_wmf_min()),
+            Some(MediaIntern::MetafileToPng)
+        ));
+        // A bare `.emf` extension with no recognizable magic still routes to the
+        // metafile path (the decoder re-sniffs and may reject).
+        assert!(matches!(
+            classify_media("x.emf", b"not really an emf"),
+            Some(MediaIntern::MetafileToPng)
+        ));
+        // Unknown blob ⇒ None (dropped, as before).
+        assert!(classify_media("x.dat", b"\x00\x01\x02\x03random").is_none());
     }
 
     #[test]
