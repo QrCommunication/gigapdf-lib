@@ -381,6 +381,8 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `addDocumentJavascript(name, script)` | `boolean` | Install a **document-level JavaScript** in the catalog `/Names /JavaScript` name tree (ISO 32000-1 §7.7.3.4 + §12.6.4.16): a named `<< /S /JavaScript /JS … >>` action. Viewers run document-level scripts in **name (lexical) order** on open — where form calculation/validation helper libraries live. Re-using a `name` **replaces** it; long sources are stored as a FlateDecode stream; sibling `/Names` subtrees (`/EmbeddedFiles`, `/Dests`, …) are preserved. `false` on an empty name. |
 | `documentJavascripts()` | `DocumentJavascript[]` | The document-level scripts as `{ name, script }` in name (lexical) order (decodes both a literal `/JS` string and a `/JS` stream). |
 | `removeDocumentJavascript(name)` | `boolean` | Remove a document-level JavaScript from `/Names /JavaScript`. `true` if one was removed, `false` if none had that name. |
+| `setCollection(config)` | `boolean` | Mark the document a **portfolio** / embedded-file collection by writing the catalog `/Collection` (ISO 32000-1 §7.11.6 §12.3.5). Embed the files first (`addAttachment`); this adds only the presentation layer. `config` is a `CollectionConfig` `{ view?, schema?, sort?, defaultFile?, items? }`: `view` ∈ `"details"`/`"tile"`/`"hidden"`; each `schema` column is `{ key, name?, subtype?, order?, visible? }` (`subtype` ∈ `"text"`/`"date"`/`"number"` user values + `"filename"`/`"description"`/`"size"`/`"creationDate"`/`"modDate"` viewer-derived); `sort` is `{ field, ascending? }`; `items` populate each file's `/CI` column values (keyed by schema `key`). Empty/omitted schema still produces a valid `/Collection`; calling again **replaces** it. |
+| `collection()` | `CollectionConfig \| null` | Read the portfolio config back from `/Collection` (the reader side of `setCollection`): the `view`, the `schema` columns (sorted by order), the `sort`, the `defaultFile`, and each file's `/CI` `values`. `null` when the document is not a portfolio. |
 
 <a id="infofields"></a>`InfoFields = { title?, author?, subject?, keywords?, creator?, producer?, creationDate?, modDate? }`
 — the standard document-information fields. `setInfo` maps them to both `/Info`
@@ -631,6 +633,7 @@ import type {
   LinkInfo, LayerInfo, OutlineEntry, ViewerPreferences, PageLayout, PageMode,
   NamedDest, Action, Destination, Bookmark,
   SignatureInfo, SignatureReport, GradientSpec, GradientStop, Color, Attachment, XlsxSheet, DecodedImage,
+  CollectionConfig, CollectionField, CollectionItem, CollectionView, CollectionFieldSubtype,
   MergePart,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,
   HtmlMargins, SignP12Options, SignTsaOptions, SignLtvOptions,

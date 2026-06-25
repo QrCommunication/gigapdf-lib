@@ -37,6 +37,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Number pages with labels (roman front matter, prefixes)](#page-labels) — *v0.74.0*
 - [Kiosk slideshow: page transitions & auto-advance (`/Trans` + `/Dur`)](#page-transitions) — *v0.95.0*
 - [Embed file attachments (+ Factur-X / ZUGFeRD `/AF`)](#attachments) — *v0.75.0*
+- [Bundle invoices as a PDF portfolio (`/Collection`)](#collection-portfolio) — *v0.95.0*
 - [Set document metadata (Info + XMP, kept in sync)](#metadata) — *v0.76.0*
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
 - [Image → PDF (single & batch)](#image--pdf)
@@ -540,6 +541,94 @@ are stored FlateDecode-compressed.
 > PDF/A-3 conformance (output intent, XMP with the Factur-X extension schema). This
 > recipe provides the embedding + `/AF` linkage — the part the engine owns — so the
 > XML travels with the document and is discoverable via `/AF` and the name tree.
+
+---
+
+<a id="collection-portfolio"></a>
+
+## Bundle invoices as a PDF portfolio (`/Collection`)
+
+> **Available in v0.95.0.** Builds on the embedded-files plumbing above.
+
+A **PDF portfolio** (a.k.a. a *collection* or *package*, ISO 32000-1 §7.11.6 §12.3.5)
+presents a document's embedded files as a navigable, sortable list — a cover sheet
+plus an attachments panel with **columns**. It's the right container when you want to
+ship many files as one PDF (a month of invoices, a bid package, a case file) and have
+the viewer show them in a table with a description, a date, an amount, etc.
+
+The files themselves still live in `/Names /EmbeddedFiles` (so embed them first with
+`addAttachment`); `setCollection` only adds the **presentation layer** — the catalog
+`/Collection` dictionary with its `/View`, column `/Schema`, `/Sort` and the
+initially-selected file, plus a per-file `/CI` carrying each file's column values.
+
+```ts
+const enc = new TextEncoder();
+
+// 1. Start from a cover page and embed the invoices.
+const doc = giga.open(giga.txtToPdf("Acme Corp — January 2026 invoices"));
+const invoices = [
+  { name: "INV-001.pdf", customer: "Globex",   total: "1240.00", date: "D:20260103" },
+  { name: "INV-002.pdf", customer: "Initech",  total: "890.50",  date: "D:20260118" },
+  { name: "INV-003.pdf", customer: "Umbrella",  total: "3120.00", date: "D:20260129" },
+];
+for (const inv of invoices) {
+  // (here the bytes would be each rendered invoice PDF)
+  doc.addAttachment(inv.name, enc.encode(`%PDF invoice ${inv.name}`), {
+    mime: "application/pdf",
+    description: `Invoice for ${inv.customer}`,
+  });
+}
+
+// 2. Turn it into a portfolio: a details view with four columns, sorted by date.
+doc.setCollection({
+  view: "details", // a multi-column list ("tile" = a grid of file tiles)
+  schema: [
+    { key: "customer", subtype: "text",     name: "Customer", order: 0 },
+    { key: "total",    subtype: "number",   name: "Total (€)", order: 1 },
+    { key: "issued",   subtype: "date",     name: "Issued",   order: 2 },
+    { key: "file",     subtype: "filename", name: "File",     order: 3 }, // viewer-derived
+  ],
+  sort: { field: "issued", ascending: true },
+  defaultFile: "INV-001.pdf", // selected when the portfolio opens
+  items: invoices.map((inv) => ({
+    file: inv.name,
+    values: { customer: inv.customer, total: inv.total, issued: inv.date },
+  })),
+});
+
+const out = doc.save();
+doc.close();
+```
+
+Opened in a portfolio-aware viewer (Acrobat, PDF.js portfolios), `out` shows the cover
+page plus the three invoices as rows under **Customer · Total (€) · Issued · File**,
+sorted by issue date, with `INV-001.pdf` selected.
+
+Read the configuration back — handy to reflect existing document state in an editor:
+
+```ts
+const coll = giga.open(out).collection();
+//   → { view: "details",
+//       schema: [ { key: "customer", subtype: "text", name: "Customer", order: 0 }, … ],
+//       sort: { field: "issued", ascending: true },
+//       defaultFile: "INV-001.pdf",
+//       items: [ { file: "INV-001.pdf", values: { customer: "Globex", total: "1240", issued: "D:20260103" } }, … ] }
+if (coll === null) {
+  // not a portfolio (no /Collection)
+}
+```
+
+Notes:
+
+- **Column kinds.** `"text"` / `"date"` / `"number"` are **user** columns — their value
+  comes from each file's `items[].values` (written as the filespec `/CI`). The rest —
+  `"filename"`, `"description"`, `"size"`, `"creationDate"`, `"modDate"` — are
+  **synthetic**: the viewer derives them from the file itself, so they need no value.
+- Re-calling `setCollection` **replaces** the whole `/Collection` (and rewrites each
+  `/CI`). An **empty/omitted `schema`** still produces a valid `/Collection` — useful to
+  just flag the document as a portfolio and let the viewer show its default columns.
+- A number value is stored as a numeric `/CI` entry; a date value is a PDF date string
+  (`D:YYYYMMDD…`), the same format `creationDate`/`modDate` use elsewhere.
 
 ---
 

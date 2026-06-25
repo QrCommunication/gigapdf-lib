@@ -21,12 +21,12 @@
 mod rng;
 
 use gigapdf_core::{
-    Action, AfRelationship, Annotation, Bookmark, Color, ContentElement, Document, ElementKind,
-    EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec, GradientStop,
-    HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox,
-    PageLabelRange, PageLabelStyle, PageTransition, Permissions, SearchMatch, TextLayerRun,
-    TextLine, TextRun, TransitionDimension, TransitionDirection, TransitionMotion, TransitionStyle,
-    ViewerPreferences,
+    Action, AfRelationship, Annotation, Bookmark, CollectionConfig, Color, ContentElement,
+    Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec,
+    GradientStop, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem,
+    PageBox, PageLabelRange, PageLabelStyle, PageTransition, Permissions, SearchMatch,
+    TextLayerRun, TextLine, TextRun, TransitionDimension, TransitionDirection, TransitionMotion,
+    TransitionStyle, ViewerPreferences,
 };
 
 // ─── raw memory management ───────────────────────────────────────────────────
@@ -5632,6 +5632,45 @@ pub extern "C" fn gp_remove_attachment(
         },
         None => -1,
     }
+}
+
+/// Mark the document as an embedded-file **portfolio** / collection by writing
+/// the catalog `/Collection` (ISO 32000-1 §7.11.6) from a JSON config. The files
+/// must already be embedded (`gp_add_attachment`). `json` is a
+/// [`CollectionConfig`] object:
+/// `{view, schema:[{key,name?,subtype?,order?,visible?}], sort:{field,ascending?}|null,
+///   defaultFile?|null, items:[{file,values:{key:val,…}}]}` —
+/// `view` ∈ `details`/`tile`/`hidden`; field `subtype` ∈
+/// `text`/`date`/`number`/`filename`/`description`/`size`/`creationDate`/`modDate`.
+/// Per-file `values` populate each file's `/CI`. Returns `0` on success, `-1`
+/// null handle, `-2` on malformed JSON, `-3` on a write error.
+#[no_mangle]
+pub extern "C" fn gp_set_collection_json(
+    handle: *mut Document,
+    json_ptr: *const u8,
+    json_len: usize,
+) -> i32 {
+    let json = unsafe { str_arg(json_ptr, json_len) };
+    let Some(cfg) = CollectionConfig::from_json(json) else {
+        return -2;
+    };
+    edit(handle, |doc| doc.set_collection(&cfg))
+}
+
+/// The document's portfolio configuration as a JSON [`CollectionConfig`] object
+/// (the same shape [`gp_set_collection_json`] accepts), or the JSON literal
+/// `null` when the document is not a portfolio (no `/Collection`). Host frees the
+/// returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_collection_json(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => match doc.collection() {
+            Some(cfg) => cfg.to_json(),
+            None => "null".to_string(),
+        },
+        None => "null".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
 /// Install a **document-level JavaScript** under the catalog `/Names /JavaScript`

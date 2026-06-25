@@ -200,8 +200,9 @@ impl HeaderFooterSpec {
 }
 
 /// Append a JSON-escaped string literal (`"…"`) to `out`. Same escaping as the
-/// crate's other JSON emitters (`model::json`, the WASM layer).
-fn json_escape(s: &str, out: &mut String) {
+/// crate's other JSON emitters (`model::json`, the WASM layer). `pub(crate)` so
+/// other features (e.g. `CollectionConfig::to_json`) reuse the same escaping.
+pub(crate) fn json_escape(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -315,6 +316,29 @@ impl<'a> ObjReader<'a> {
             match self.peek()? {
                 b',' => self.i += 1,
                 b'}' => {
+                    self.i += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// `[ value (, value)* ]` — invokes `element(self)` for each item, which must
+    /// consume exactly that element's value. The structural counterpart of
+    /// [`object`](Self::object) for parsing arrays of non-number values
+    /// (e.g. an array of objects).
+    pub(crate) fn array(&mut self, mut element: impl FnMut(&mut Self) -> Option<()>) -> Option<()> {
+        self.eat(b'[')?;
+        if self.peek()? == b']' {
+            self.i += 1;
+            return Some(());
+        }
+        loop {
+            element(self)?;
+            match self.peek()? {
+                b',' => self.i += 1,
+                b']' => {
                     self.i += 1;
                     return Some(());
                 }

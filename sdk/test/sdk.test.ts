@@ -450,6 +450,43 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("collection (/Collection): portfolio view/schema/sort + per-file CI round-trip", () => {
+    const enc = new TextEncoder();
+    const doc = giga.open(giga.txtToPdf("Portfolio"));
+
+    // Bundle two invoices as embedded files…
+    doc.addAttachment("inv-001.pdf", enc.encode("%PDF-001"), { mime: "application/pdf" });
+    doc.addAttachment("inv-002.pdf", enc.encode("%PDF-002"), { mime: "application/pdf" });
+    // …then present them as a tile-view portfolio with a 2-column schema + sort.
+    expect(
+      doc.setCollection({
+        view: "tile",
+        schema: [
+          { key: "name", subtype: "filename", name: "File", order: 0 },
+          { key: "desc", subtype: "text", name: "Description", order: 1 },
+        ],
+        sort: { field: "desc", ascending: true },
+        defaultFile: "inv-001.pdf",
+        items: [{ file: "inv-001.pdf", values: { desc: "Acme — January" } }],
+      })
+    ).toBe(true);
+    // A non-portfolio document reads back null.
+    expect(giga.open(giga.txtToPdf("Plain")).collection()).toBeNull();
+
+    const reopened = giga.open(doc.save());
+    const coll = reopened.collection()!;
+    expect(coll).not.toBeNull();
+    expect(coll.view).toBe("tile");
+    expect(coll.defaultFile).toBe("inv-001.pdf");
+    expect(coll.sort).toEqual({ field: "desc", ascending: true });
+    expect(coll.schema!.map((f) => f.key)).toEqual(["name", "desc"]);
+    expect(coll.schema!.find((f) => f.key === "desc")!.name).toBe("Description");
+    // The per-file /CI column value round-trips.
+    expect(coll.items).toEqual([{ file: "inv-001.pdf", values: { desc: "Acme — January" } }]);
+    reopened.close();
+    doc.close();
+  });
+
   it("metadata: setInfo writes Info + synced XMP, getXmp/setXmp round-trip", () => {
     const doc = giga.open(giga.txtToPdf("Meta"));
     expect(doc.getXmp()).toBeNull();

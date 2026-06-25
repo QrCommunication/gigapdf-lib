@@ -1720,6 +1720,386 @@ impl AfRelationship {
     }
 }
 
+/// How a PDF **portfolio** presents its embedded-file collection in the catalog
+/// `/Collection` `/View` (ISO 32000-1 §7.11.6, Table 43). Selects the initial
+/// navigator the viewer shows for the attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CollectionView {
+    /// `D` — details mode: a multi-column list (the schema columns), one row per
+    /// embedded file. The default.
+    #[default]
+    Details,
+    /// `T` — tile mode: a grid of file thumbnails/icons.
+    Tile,
+    /// `H` — hidden: the navigator is initially hidden (the document opens to its
+    /// cover page / regular content, the portfolio panel collapsed).
+    Hidden,
+}
+
+impl CollectionView {
+    /// The PDF `/View` name for this navigator (`D` / `T` / `H`).
+    pub fn pdf_name(self) -> &'static [u8] {
+        match self {
+            CollectionView::Details => b"D",
+            CollectionView::Tile => b"T",
+            CollectionView::Hidden => b"H",
+        }
+    }
+
+    /// Parse a `/View` token, tolerant of the spelled-out forms a host may pass
+    /// (`details` / `tile`/`tiles` / `hidden`); unknown ⇒ [`Details`](Self::Details).
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim() {
+            "T" | "t" | "tile" | "tiles" | "Tile" => CollectionView::Tile,
+            "H" | "h" | "hidden" | "Hidden" => CollectionView::Hidden,
+            _ => CollectionView::Details,
+        }
+    }
+}
+
+/// The data type of a portfolio schema column — the `/CollectionField`
+/// `/Subtype` (ISO 32000-1 §7.11.6, Table 44). The first three are
+/// **user-defined** values supplied per file via `/CI`; the rest are
+/// **synthetic** columns the viewer derives from each filespec (the filename,
+/// description, embedded-stream size and dates), so they need no `/CI` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CollectionFieldSubtype {
+    /// `S` — a user text string field (value carried per file in `/CI`).
+    #[default]
+    Text,
+    /// `D` — a user date field, a PDF date string `D:YYYYMMDD…` carried in `/CI`.
+    Date,
+    /// `N` — a user number field (value carried per file in `/CI`).
+    Number,
+    /// `F` — the file's name (`/F`/`/UF`), derived by the viewer.
+    Filename,
+    /// `Desc` — the filespec `/Desc` description, derived by the viewer.
+    Desc,
+    /// `Size` — the embedded-file size in bytes, derived by the viewer.
+    Size,
+    /// `CreationDate` — the embedded `/Params /CreationDate`, derived.
+    CreationDate,
+    /// `ModDate` — the embedded `/Params /ModDate`, derived.
+    ModDate,
+}
+
+impl CollectionFieldSubtype {
+    /// The PDF `/Subtype` name for this column kind.
+    pub fn pdf_name(self) -> &'static [u8] {
+        match self {
+            CollectionFieldSubtype::Text => b"S",
+            CollectionFieldSubtype::Date => b"D",
+            CollectionFieldSubtype::Number => b"N",
+            CollectionFieldSubtype::Filename => b"F",
+            CollectionFieldSubtype::Desc => b"Desc",
+            CollectionFieldSubtype::Size => b"Size",
+            CollectionFieldSubtype::CreationDate => b"CreationDate",
+            CollectionFieldSubtype::ModDate => b"ModDate",
+        }
+    }
+
+    /// `true` for the user-defined subtypes (`S`/`D`/`N`) whose value is supplied
+    /// per file through a `/CI` (collection-item) entry; `false` for the
+    /// viewer-derived synthetic columns.
+    pub fn is_user_value(self) -> bool {
+        matches!(
+            self,
+            CollectionFieldSubtype::Text
+                | CollectionFieldSubtype::Date
+                | CollectionFieldSubtype::Number
+        )
+    }
+
+    /// Parse a `/Subtype` token (case-insensitive on the synthetic spellings),
+    /// tolerant of friendly aliases (`text`/`string`, `number`, `filename`,
+    /// `description`); unknown ⇒ [`Text`](Self::Text).
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim() {
+            "D" | "date" | "Date" => CollectionFieldSubtype::Date,
+            "N" | "number" | "Number" | "num" => CollectionFieldSubtype::Number,
+            "F" | "filename" | "Filename" | "file" => CollectionFieldSubtype::Filename,
+            "Desc" | "desc" | "description" | "Description" => CollectionFieldSubtype::Desc,
+            "Size" | "size" => CollectionFieldSubtype::Size,
+            "CreationDate" | "creationDate" | "creation_date" => {
+                CollectionFieldSubtype::CreationDate
+            }
+            "ModDate" | "modDate" | "mod_date" => CollectionFieldSubtype::ModDate,
+            _ => CollectionFieldSubtype::Text,
+        }
+    }
+}
+
+/// One column of a portfolio schema — a `/CollectionField` dictionary
+/// (ISO 32000-1 §7.11.6). `key` is the schema dictionary key it is stored under
+/// (and the key a per-file [`CollectionItem`] value matches); `name` is the
+/// human column header (`/N`); `subtype` is the data type (`/Subtype`); `order`
+/// is the relative column position (`/O`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionField {
+    /// The schema dictionary key (e.g. `desc`, `invoiceTotal`). Must be non-empty;
+    /// per-file values reference this key.
+    pub key: String,
+    /// The displayed column header (`/N`). Defaults to `key` when left empty.
+    pub name: String,
+    /// The column data type (`/Subtype`).
+    pub subtype: CollectionFieldSubtype,
+    /// The relative ordering (`/O`); columns are shown in ascending `order`.
+    pub order: i64,
+    /// `/V` — whether the column is initially visible (`true` when `None`).
+    pub visible: Option<bool>,
+}
+
+impl CollectionField {
+    /// A text column with the given schema `key` and display `name`, ordered at
+    /// `order`. The most common builder; tweak [`subtype`](Self::subtype) for
+    /// non-text columns.
+    pub fn text(key: impl Into<String>, name: impl Into<String>, order: i64) -> Self {
+        Self {
+            key: key.into(),
+            name: name.into(),
+            subtype: CollectionFieldSubtype::Text,
+            order,
+            visible: None,
+        }
+    }
+}
+
+/// The per-file portfolio metadata for one embedded file — the `/CI`
+/// (collection item) values. `file` names the embedded file (its
+/// `/EmbeddedFiles` key); `values` maps schema field `key`s to their string
+/// value (numbers are passed as their decimal text, dates as PDF date strings).
+/// Only user-defined columns (`S`/`D`/`N`) need values; synthetic columns are
+/// derived by the viewer.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CollectionItem {
+    /// The embedded-file name (a key in `/Names /EmbeddedFiles`) this metadata
+    /// belongs to.
+    pub file: String,
+    /// Schema-field `key` → value (as a string; numeric fields parse it as a
+    /// number, others store it as a text/date string).
+    pub values: Vec<(String, String)>,
+}
+
+/// Configuration for a PDF **portfolio** / embedded-file collection — what
+/// [`Document::set_collection`](Document::set_collection) writes into the catalog
+/// `/Collection` (ISO 32000-1 §7.11.6, §12.3.5). Marks the document as a
+/// portfolio and configures its presentation: the initial [`view`](Self::view),
+/// the [`schema`](Self::schema) columns, the [`sort`](Self::sort) order, the
+/// [`default_file`](Self::default_file) shown first, and per-file column
+/// [`items`](Self::items).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CollectionConfig {
+    /// `/View` — the initial navigator (details / tiles / hidden).
+    pub view: CollectionView,
+    /// `/Schema` — the columns, in declaration order. May be empty (a valid,
+    /// minimal `/Collection` with no schema).
+    pub schema: Vec<CollectionField>,
+    /// `/Sort` — `(field key, ascending)`. `None` leaves `/Sort` unset.
+    pub sort: Option<(String, bool)>,
+    /// `/D` — the embedded-file name initially selected. `None` leaves it unset.
+    pub default_file: Option<String>,
+    /// Per-file `/CI` metadata populating the schema columns. Files without an
+    /// entry simply have no `/CI`.
+    pub items: Vec<CollectionItem>,
+}
+
+impl CollectionConfig {
+    /// Parse a [`CollectionConfig`] from a JSON object — the shape the WASM /
+    /// SDK layer passes through. Recognised keys (all optional, absent ⇒
+    /// default):
+    /// - `view` — `"details"` | `"tile"` | `"hidden"` (or `D`/`T`/`H`)
+    /// - `schema` — array of `{ key, name?, subtype?, order?, visible? }`
+    /// - `sort` — `{ field, ascending? }` (or `null`)
+    /// - `defaultFile`/`default_file` — string (or `null`)
+    /// - `items` — array of `{ file, values: { key: value, … } }`, values being
+    ///   strings or numbers.
+    ///
+    /// Returns `None` on malformed JSON, so a host gets a clear error instead of
+    /// a silently-wrong portfolio.
+    pub fn from_json(s: &str) -> Option<Self> {
+        let mut cfg = CollectionConfig::default();
+        let mut p = crate::headerfooter::ObjReader::new(s);
+        p.object(|p, key| {
+            match key {
+                "view" => cfg.view = CollectionView::from_str_lossy(&p.string()?),
+                "schema" => {
+                    let mut fields = Vec::new();
+                    p.array(|p| {
+                        let mut f = CollectionField {
+                            key: String::new(),
+                            name: String::new(),
+                            subtype: CollectionFieldSubtype::Text,
+                            order: fields.len() as i64,
+                            visible: None,
+                        };
+                        p.object(|p, fk| {
+                            match fk {
+                                "key" => f.key = p.string()?,
+                                "name" => f.name = p.string()?,
+                                "subtype" => {
+                                    f.subtype =
+                                        CollectionFieldSubtype::from_str_lossy(&p.string()?);
+                                }
+                                "order" => f.order = p.number()? as i64,
+                                "visible" => {
+                                    f.visible = Some(matches!(p.peek()?, b't'));
+                                    p.skip_value()?;
+                                }
+                                _ => p.skip_value()?,
+                            }
+                            Some(())
+                        })?;
+                        if f.name.is_empty() {
+                            f.name = f.key.clone();
+                        }
+                        fields.push(f);
+                        Some(())
+                    })?;
+                    cfg.schema = fields;
+                }
+                "sort" => {
+                    if p.peek()? == b'n' {
+                        p.skip_value()?;
+                        cfg.sort = None;
+                    } else {
+                        let mut field = String::new();
+                        let mut ascending = true;
+                        p.object(|p, sk| {
+                            match sk {
+                                "field" => field = p.string()?,
+                                "ascending" => {
+                                    ascending = matches!(p.peek()?, b't');
+                                    p.skip_value()?;
+                                }
+                                _ => p.skip_value()?,
+                            }
+                            Some(())
+                        })?;
+                        cfg.sort = Some((field, ascending));
+                    }
+                }
+                "defaultFile" | "default_file" => {
+                    if p.peek()? == b'n' {
+                        p.skip_value()?;
+                        cfg.default_file = None;
+                    } else {
+                        cfg.default_file = Some(p.string()?);
+                    }
+                }
+                "items" => {
+                    let mut items = Vec::new();
+                    p.array(|p| {
+                        let mut item = CollectionItem::default();
+                        p.object(|p, ik| {
+                            match ik {
+                                "file" => item.file = p.string()?,
+                                "values" => {
+                                    p.object(|p, vk| {
+                                        let v = if p.peek()? == b'"' {
+                                            p.string()?
+                                        } else {
+                                            crate::content::num(p.number()?)
+                                        };
+                                        item.values.push((vk.to_string(), v));
+                                        Some(())
+                                    })?;
+                                }
+                                _ => p.skip_value()?,
+                            }
+                            Some(())
+                        })?;
+                        items.push(item);
+                        Some(())
+                    })?;
+                    cfg.items = items;
+                }
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        Some(cfg)
+    }
+
+    /// Serialise to a JSON object with the same keys [`from_json`](Self::from_json)
+    /// reads (`view`, `schema`, `sort`, `defaultFile`, `items`), so
+    /// `from_json(cfg.to_json())` round-trips. Hand-rolled, zero-dependency; the
+    /// shape consumed by the SDK reader. Field `subtype`/`view` use the friendly
+    /// spellings (`text`/`date`/`number`/`filename`/…, `details`/`tile`/`hidden`).
+    pub fn to_json(&self) -> String {
+        use crate::headerfooter::json_escape;
+        let view_str = match self.view {
+            CollectionView::Details => "details",
+            CollectionView::Tile => "tile",
+            CollectionView::Hidden => "hidden",
+        };
+        let subtype_str = |s: CollectionFieldSubtype| match s {
+            CollectionFieldSubtype::Text => "text",
+            CollectionFieldSubtype::Date => "date",
+            CollectionFieldSubtype::Number => "number",
+            CollectionFieldSubtype::Filename => "filename",
+            CollectionFieldSubtype::Desc => "description",
+            CollectionFieldSubtype::Size => "size",
+            CollectionFieldSubtype::CreationDate => "creationDate",
+            CollectionFieldSubtype::ModDate => "modDate",
+        };
+        let mut out = String::from("{\"view\":");
+        json_escape(view_str, &mut out);
+        out.push_str(",\"schema\":[");
+        for (i, f) in self.schema.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"key\":");
+            json_escape(&f.key, &mut out);
+            out.push_str(",\"name\":");
+            json_escape(&f.name, &mut out);
+            out.push_str(",\"subtype\":");
+            json_escape(subtype_str(f.subtype), &mut out);
+            out.push_str(&format!(",\"order\":{}", f.order));
+            if let Some(v) = f.visible {
+                out.push_str(&format!(",\"visible\":{v}"));
+            }
+            out.push('}');
+        }
+        out.push(']');
+        match &self.sort {
+            Some((field, ascending)) => {
+                out.push_str(",\"sort\":{\"field\":");
+                json_escape(field, &mut out);
+                out.push_str(&format!(",\"ascending\":{ascending}}}"));
+            }
+            None => out.push_str(",\"sort\":null"),
+        }
+        match &self.default_file {
+            Some(d) => {
+                out.push_str(",\"defaultFile\":");
+                json_escape(d, &mut out);
+            }
+            None => out.push_str(",\"defaultFile\":null"),
+        }
+        out.push_str(",\"items\":[");
+        for (i, item) in self.items.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"file\":");
+            json_escape(&item.file, &mut out);
+            out.push_str(",\"values\":{");
+            for (j, (k, v)) in item.values.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                json_escape(k, &mut out);
+                out.push(':');
+                json_escape(v, &mut out);
+            }
+            out.push_str("}}");
+        }
+        out.push_str("]}");
+        out
+    }
+}
+
 /// The mutable state of the catalog's `/Names /EmbeddedFiles` tree: where the
 /// `/Names` dict lives (`Some(id)` if indirect, else inline in the catalog), the
 /// cloned `/Names` dict, and the flattened `(key, raw filespec value)` entries.
@@ -16185,6 +16565,323 @@ impl Document {
         out
     }
 
+    // ─── embedded-file collections / portfolio (ISO 32000-1 §7.11.6) ──────────
+
+    /// Mark this document as a **portfolio** and configure how its embedded files
+    /// are presented, by writing the catalog `/Collection` dictionary
+    /// (ISO 32000-1 §7.11.6, §12.3.5). Builds on the existing embedded-files
+    /// plumbing — the files themselves live in `/Names /EmbeddedFiles` (add them
+    /// first with [`add_attachment`](Self::add_attachment) /
+    /// [`add_associated_file`](Self::add_associated_file)); this only adds the
+    /// presentation layer.
+    ///
+    /// From `cfg` it writes:
+    /// - `/View` — the initial navigator ([`CollectionView`]);
+    /// - `/Schema` — a `/CollectionField` per [`CollectionField`] column (its
+    ///   `/Subtype`, display `/N`, ordering `/O`, optional `/V`);
+    /// - `/Sort` — a `/CollectionSort` (`/S` field name + `/A` ascending) when
+    ///   [`sort`](CollectionConfig::sort) is set;
+    /// - `/D` — the initially-selected file when
+    ///   [`default_file`](CollectionConfig::default_file) is set.
+    ///
+    /// For each [`CollectionItem`] it attaches a `/CI` (collection item) dict to
+    /// the matching embedded file's filespec, carrying that file's user-column
+    /// values (text/number/date per the schema field's subtype). Items whose
+    /// `file` is not an embedded file, and values whose key is not a user-defined
+    /// (`S`/`D`/`N`) schema column, are skipped. An empty schema still produces a
+    /// valid `/Collection`. Calling again **replaces** the previous configuration.
+    ///
+    /// # Errors
+    /// [`EngineError::Missing`] if the document has no catalog.
+    pub fn set_collection(&mut self, cfg: &CollectionConfig) -> Result<()> {
+        // 1. Build the /Collection dictionary.
+        let mut coll = Dictionary::new();
+        coll.set(b"Type".to_vec(), annot::name(b"Collection"));
+        coll.set(b"View".to_vec(), annot::name(cfg.view.pdf_name()));
+
+        // 1a. /Schema — a dict of /CollectionField entries, keyed by field key.
+        if !cfg.schema.is_empty() {
+            let mut schema = Dictionary::new();
+            schema.set(b"Type".to_vec(), annot::name(b"CollectionSchema"));
+            for field in &cfg.schema {
+                if field.key.is_empty() {
+                    continue;
+                }
+                let mut fd = Dictionary::new();
+                fd.set(b"Type".to_vec(), annot::name(b"CollectionField"));
+                fd.set(b"Subtype".to_vec(), annot::name(field.subtype.pdf_name()));
+                let display = if field.name.is_empty() {
+                    &field.key
+                } else {
+                    &field.name
+                };
+                fd.set(b"N".to_vec(), pdf_text(display));
+                fd.set(b"O".to_vec(), Object::Integer(field.order));
+                if let Some(v) = field.visible {
+                    fd.set(b"V".to_vec(), Object::Boolean(v));
+                }
+                schema.set(field.key.as_bytes().to_vec(), Object::Dictionary(fd));
+            }
+            coll.set(b"Schema".to_vec(), Object::Dictionary(schema));
+        }
+
+        // 1b. /Sort — a /CollectionSort dict (field name + ascending flag).
+        if let Some((field, ascending)) = &cfg.sort {
+            if !field.is_empty() {
+                let mut sort = Dictionary::new();
+                sort.set(b"Type".to_vec(), annot::name(b"CollectionSort"));
+                sort.set(b"S".to_vec(), annot::name(field.as_bytes()));
+                sort.set(b"A".to_vec(), Object::Boolean(*ascending));
+                coll.set(b"Sort".to_vec(), Object::Dictionary(sort));
+            }
+        }
+
+        // 1c. /D — the initially-selected embedded file.
+        if let Some(default) = &cfg.default_file {
+            if !default.is_empty() {
+                coll.set(b"D".to_vec(), pdf_text(default));
+            }
+        }
+
+        // 2. Install /Collection in the catalog.
+        let catalog_id = self.catalog_id()?;
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        catalog.set(b"Collection".to_vec(), Object::Dictionary(coll));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+
+        // 3. Per-file /CI (collection-item) values. Only user-defined subtypes
+        //    (S/D/N) carry a per-file value; map each schema key to its subtype.
+        let user_fields: Vec<(String, CollectionFieldSubtype)> = cfg
+            .schema
+            .iter()
+            .filter(|f| !f.key.is_empty() && f.subtype.is_user_value())
+            .map(|f| (f.key.clone(), f.subtype))
+            .collect();
+        for item in &cfg.items {
+            self.set_collection_item(&item.file, &item.values, &user_fields)?;
+        }
+        Ok(())
+    }
+
+    /// Attach (or replace) the `/CI` collection-item dict on the embedded file
+    /// named `file`, from `values` (schema-key → string) interpreted through the
+    /// `user_fields` subtypes. No-op if `file` is not an embedded file. Promotes
+    /// an inline filespec to an indirect object so it can carry `/CI`.
+    fn set_collection_item(
+        &mut self,
+        file: &str,
+        values: &[(String, String)],
+        user_fields: &[(String, CollectionFieldSubtype)],
+    ) -> Result<()> {
+        let (names_ref, names_dict, mut entries) = self.embedded_files_state()?;
+        let Some(idx) = entries
+            .iter()
+            .position(|(k, _)| k.as_slice() == file.as_bytes())
+        else {
+            return Ok(());
+        };
+
+        // Build the /CI dict from the user-defined columns only.
+        let mut ci = Dictionary::new();
+        for (key, raw) in values {
+            let Some((_, subtype)) = user_fields.iter().find(|(k, _)| k == key) else {
+                continue; // not a user-defined schema column
+            };
+            let value = match subtype {
+                CollectionFieldSubtype::Number => match raw.trim().parse::<f64>() {
+                    Ok(n) if n.fract() == 0.0 && n.abs() < 9e15 => Object::Integer(n as i64),
+                    Ok(n) => Object::Real(n),
+                    Err(_) => continue,
+                },
+                // Text and Date are both stored as PDF (text) strings.
+                _ => pdf_text(raw),
+            };
+            ci.set(key.as_bytes().to_vec(), value);
+        }
+
+        // Resolve the filespec object so we can set its /CI. If the name-tree
+        // value is an indirect reference, mutate that object in place; otherwise
+        // promote the inline filespec to a fresh indirect object.
+        match entries[idx].1.as_reference() {
+            Some(spec_id) => {
+                if let Some(spec) = self
+                    .objects
+                    .get(&spec_id)
+                    .and_then(Object::as_dict)
+                    .cloned()
+                {
+                    let mut spec = spec;
+                    if ci.is_empty() {
+                        spec.remove(b"CI");
+                    } else {
+                        spec.set(b"CI".to_vec(), Object::Dictionary(ci));
+                    }
+                    self.objects.insert(spec_id, Object::Dictionary(spec));
+                }
+                // Indirect entries need no name-tree rewrite.
+                Ok(())
+            }
+            None => {
+                let mut spec = self
+                    .resolve(&entries[idx].1)
+                    .as_dict()
+                    .cloned()
+                    .unwrap_or_default();
+                if !ci.is_empty() {
+                    spec.set(b"CI".to_vec(), Object::Dictionary(ci));
+                }
+                let spec_id = (self.next_object_number(), 0u16);
+                self.objects.insert(spec_id, Object::Dictionary(spec));
+                entries[idx].1 = Object::Reference(spec_id);
+                self.write_embedded_files(names_ref, names_dict, entries)
+            }
+        }
+    }
+
+    /// Read this document's portfolio configuration back from the catalog
+    /// `/Collection` — the reader counterpart of
+    /// [`set_collection`](Self::set_collection). Returns `None` when the document
+    /// is not a portfolio (no `/Collection`). The recovered [`CollectionConfig`]
+    /// carries the `/View`, the `/Schema` columns (sorted by `/O`), the `/Sort`,
+    /// the `/D` default file, and each embedded file's `/CI` user-column values.
+    pub fn collection(&self) -> Option<CollectionConfig> {
+        let catalog = self
+            .objects
+            .get(&self.catalog_id().ok()?)
+            .and_then(Object::as_dict)?;
+        let coll = catalog.get(b"Collection").map(|o| self.resolve(o))?;
+        let coll = coll.as_dict()?;
+
+        let view = coll
+            .get(b"View")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_name)
+            .map(|n| CollectionView::from_str_lossy(&String::from_utf8_lossy(n)))
+            .unwrap_or_default();
+
+        let mut schema = Vec::new();
+        if let Some(sch) = coll
+            .get(b"Schema")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        {
+            for (key, value) in &sch.0 {
+                if key.as_slice() == b"Type" {
+                    continue;
+                }
+                let Some(fd) = self.resolve(value).as_dict() else {
+                    continue;
+                };
+                let subtype = fd
+                    .get(b"Subtype")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_name)
+                    .map(|n| CollectionFieldSubtype::from_str_lossy(&String::from_utf8_lossy(n)))
+                    .unwrap_or_default();
+                let name = fd
+                    .get(b"N")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_string)
+                    .map(crate::font::decode_pdf_text)
+                    .unwrap_or_default();
+                let order = fd
+                    .get(b"O")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_i64)
+                    .unwrap_or(0);
+                let visible = fd
+                    .get(b"V")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_bool);
+                schema.push(CollectionField {
+                    key: String::from_utf8_lossy(key).into_owned(),
+                    name,
+                    subtype,
+                    order,
+                    visible,
+                });
+            }
+            schema.sort_by_key(|f| f.order);
+        }
+
+        let sort = coll
+            .get(b"Sort")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|s| {
+                let field = s.get(b"S").map(|o| self.resolve(o)).and_then(|o| match o {
+                    Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+                    Object::Array(a) => a
+                        .first()
+                        .and_then(Object::as_name)
+                        .map(|n| String::from_utf8_lossy(n).into_owned()),
+                    _ => None,
+                })?;
+                let ascending = s
+                    .get(b"A")
+                    .map(|o| self.resolve(o))
+                    .and_then(|o| match o {
+                        Object::Boolean(b) => Some(*b),
+                        Object::Array(a) => a.first().and_then(Object::as_bool),
+                        _ => None,
+                    })
+                    .unwrap_or(true);
+                Some((field, ascending))
+            });
+
+        let default_file = coll
+            .get(b"D")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_string)
+            .map(crate::font::decode_pdf_text);
+
+        // Per-file /CI values from each embedded filespec.
+        let mut items = Vec::new();
+        if let Ok((_, _, entries)) = self.embedded_files_state() {
+            for (key, value) in entries {
+                let Some(spec) = self.resolve(&value).as_dict() else {
+                    continue;
+                };
+                let Some(ci) = spec
+                    .get(b"CI")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+                else {
+                    continue;
+                };
+                let mut vals = Vec::new();
+                for (fk, fv) in &ci.0 {
+                    let v = match self.resolve(fv) {
+                        Object::String(b, _) => crate::font::decode_pdf_text(b),
+                        Object::Integer(n) => n.to_string(),
+                        Object::Real(r) => crate::content::num(*r),
+                        _ => continue,
+                    };
+                    vals.push((String::from_utf8_lossy(fk).into_owned(), v));
+                }
+                if !vals.is_empty() {
+                    items.push(CollectionItem {
+                        file: String::from_utf8_lossy(&key).into_owned(),
+                        values: vals,
+                    });
+                }
+            }
+        }
+
+        Some(CollectionConfig {
+            view,
+            schema,
+            sort,
+            default_file,
+            items,
+        })
+    }
+
     /// Add an internal hyperlink over `rect` that jumps to the **named
     /// destination** `dest_name` (define it with [`add_named_dest`]). Unlike
     /// [`add_goto_link`](Self::add_goto_link) (an explicit page reference), this
@@ -26862,6 +27559,284 @@ mod tests {
             fa.get(b"Name").and_then(Object::as_name),
             Some(b"Paperclip".as_slice())
         );
+    }
+
+    #[test]
+    fn set_collection_writes_view_schema_sort_default_and_per_file_ci() {
+        let mut doc = blank_doc();
+        // Two embedded invoices, one carrying a description column value.
+        doc.add_attachment("inv-001.pdf", b"%PDF-001", Some("application/pdf"), None)
+            .unwrap();
+        doc.add_attachment("inv-002.pdf", b"%PDF-002", Some("application/pdf"), None)
+            .unwrap();
+
+        let cfg = CollectionConfig {
+            view: CollectionView::Tile,
+            schema: vec![
+                CollectionField::text("name", "File", 0),
+                CollectionField {
+                    key: "desc".into(),
+                    name: "Description".into(),
+                    subtype: CollectionFieldSubtype::Text,
+                    order: 1,
+                    visible: None,
+                },
+            ],
+            sort: Some(("desc".into(), true)),
+            default_file: Some("inv-001.pdf".into()),
+            items: vec![CollectionItem {
+                file: "inv-001.pdf".into(),
+                values: vec![("desc".into(), "Acme — January".into())],
+            }],
+        };
+        doc.set_collection(&cfg).unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let catalog = reopened.catalog().unwrap();
+        let coll = catalog
+            .get(b"Collection")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Collection present in catalog");
+
+        // /View /T (tile)
+        assert_eq!(
+            coll.get(b"View").and_then(Object::as_name),
+            Some(b"T".as_slice())
+        );
+        // /D (default selected file)
+        assert_eq!(
+            coll.get(b"D").and_then(Object::as_string),
+            Some(b"inv-001.pdf".as_slice())
+        );
+        // /Schema with two /CollectionField entries (filename + description text).
+        let schema = coll
+            .get(b"Schema")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Schema dict");
+        let desc = schema
+            .get(b"desc")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("desc field");
+        assert_eq!(
+            desc.get(b"Subtype").and_then(Object::as_name),
+            Some(b"S".as_slice()),
+            "text column subtype /S"
+        );
+        assert_eq!(
+            desc.get(b"N").and_then(Object::as_string),
+            Some(b"Description".as_slice()),
+            "column header"
+        );
+        assert_eq!(desc.get(b"O").and_then(Object::as_i64), Some(1));
+        assert!(schema.get(b"name").is_some(), "filename column present");
+        // /Sort << /S /desc /A true >>
+        let sort = coll
+            .get(b"Sort")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Sort dict");
+        assert_eq!(
+            sort.get(b"S").and_then(Object::as_name),
+            Some(b"desc".as_slice())
+        );
+        assert_eq!(sort.get(b"A").and_then(Object::as_bool), Some(true));
+
+        // The embedded file inv-001.pdf gains a /CI with its column value.
+        let (_, _, entries) = reopened.embedded_files_state().unwrap();
+        let inv1 = entries
+            .iter()
+            .find(|(k, _)| k.as_slice() == b"inv-001.pdf")
+            .map(|(_, v)| reopened.resolve(v))
+            .and_then(Object::as_dict)
+            .expect("inv-001 filespec");
+        let ci = inv1
+            .get(b"CI")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/CI on inv-001");
+        // The /CI value is a (PDFDocEncoded) text string; decode to compare.
+        assert_eq!(
+            ci.get(b"desc")
+                .and_then(Object::as_string)
+                .map(crate::font::decode_pdf_text)
+                .as_deref(),
+            Some("Acme — January")
+        );
+        // inv-002 had no item → no /CI.
+        let inv2 = entries
+            .iter()
+            .find(|(k, _)| k.as_slice() == b"inv-002.pdf")
+            .map(|(_, v)| reopened.resolve(v))
+            .and_then(Object::as_dict)
+            .expect("inv-002 filespec");
+        assert!(inv2.get(b"CI").is_none(), "no /CI without an item");
+
+        // The high-level reader round-trips the whole configuration.
+        let back = reopened.collection().expect("portfolio recovered");
+        assert_eq!(back.view, CollectionView::Tile);
+        assert_eq!(back.schema.len(), 2);
+        assert_eq!(back.schema[0].key, "name");
+        assert_eq!(back.schema[1].key, "desc");
+        assert_eq!(back.schema[1].name, "Description");
+        assert_eq!(back.sort, Some(("desc".to_string(), true)));
+        assert_eq!(back.default_file.as_deref(), Some("inv-001.pdf"));
+        assert_eq!(back.items.len(), 1);
+        assert_eq!(back.items[0].file, "inv-001.pdf");
+        assert_eq!(
+            back.items[0].values,
+            vec![("desc".to_string(), "Acme — January".to_string())]
+        );
+    }
+
+    #[test]
+    fn set_collection_number_field_ci_is_numeric_and_replaces() {
+        let mut doc = blank_doc();
+        doc.add_attachment("a.pdf", b"%PDF-a", None, None).unwrap();
+        let mut cfg = CollectionConfig {
+            view: CollectionView::Details,
+            schema: vec![CollectionField {
+                key: "total".into(),
+                name: "Total".into(),
+                subtype: CollectionFieldSubtype::Number,
+                order: 0,
+                visible: Some(true),
+            }],
+            sort: None,
+            default_file: None,
+            items: vec![CollectionItem {
+                file: "a.pdf".into(),
+                values: vec![("total".into(), "1234.5".into())],
+            }],
+        };
+        doc.set_collection(&cfg).unwrap();
+        // A /CI number is a numeric object, not a string.
+        {
+            let (_, _, entries) = doc.embedded_files_state().unwrap();
+            let ci = entries
+                .iter()
+                .find(|(k, _)| k.as_slice() == b"a.pdf")
+                .map(|(_, v)| doc.resolve(v).clone())
+                .and_then(|o| o.as_dict().and_then(|d| d.get(b"CI")).cloned())
+                .and_then(|o| doc.resolve(&o).as_dict().cloned())
+                .expect("/CI");
+            assert!(
+                matches!(ci.get(b"total"), Some(Object::Real(_))),
+                "numeric /CI value, got {:?}",
+                ci.get(b"total")
+            );
+        }
+
+        // Re-running set_collection replaces (not duplicates) the /Collection and /CI.
+        cfg.view = CollectionView::Tile;
+        cfg.items[0].values = vec![("total".into(), "99".into())];
+        doc.set_collection(&cfg).unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let coll = reopened
+            .catalog()
+            .unwrap()
+            .get(b"Collection")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            coll.get(b"View").and_then(Object::as_name),
+            Some(b"T".as_slice()),
+            "view replaced"
+        );
+        let back = reopened.collection().unwrap();
+        assert_eq!(back.items.len(), 1);
+        assert_eq!(
+            back.items[0].values,
+            vec![("total".to_string(), "99".to_string())],
+            "integer /CI value recovered"
+        );
+    }
+
+    #[test]
+    fn set_collection_empty_schema_still_valid() {
+        let mut doc = blank_doc();
+        let cfg = CollectionConfig::default(); // Details view, no schema/sort/default/items.
+        doc.set_collection(&cfg).unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let coll = reopened
+            .catalog()
+            .unwrap()
+            .get(b"Collection")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .expect("/Collection present even with empty schema");
+        assert_eq!(
+            coll.get(b"View").and_then(Object::as_name),
+            Some(b"D".as_slice()),
+            "defaults to details view"
+        );
+        assert!(coll.get(b"Schema").is_none(), "no /Schema when empty");
+        assert!(coll.get(b"Sort").is_none());
+        assert!(coll.get(b"D").is_none());
+        // Reader returns a portfolio with no columns.
+        let back = reopened.collection().expect("portfolio recovered");
+        assert_eq!(back.view, CollectionView::Details);
+        assert!(back.schema.is_empty());
+        assert_eq!(back.sort, None);
+        assert_eq!(back.default_file, None);
+        assert!(back.items.is_empty());
+        // A non-portfolio document yields None.
+        assert!(blank_doc().collection().is_none());
+    }
+
+    #[test]
+    fn collection_config_from_json_parses_full_object() {
+        let json = r#"{
+            "view": "tile",
+            "schema": [
+                {"key": "name", "subtype": "filename", "name": "File", "order": 0},
+                {"key": "desc", "subtype": "text", "name": "Description", "order": 1, "visible": false},
+                {"key": "total", "subtype": "number", "name": "Total", "order": 2}
+            ],
+            "sort": {"field": "desc", "ascending": true},
+            "defaultFile": "inv-001.pdf",
+            "items": [
+                {"file": "inv-001.pdf", "values": {"desc": "Acme", "total": 1234.5}}
+            ]
+        }"#;
+        let cfg = CollectionConfig::from_json(json).expect("parses");
+        assert_eq!(cfg.view, CollectionView::Tile);
+        assert_eq!(cfg.schema.len(), 3);
+        assert_eq!(cfg.schema[0].subtype, CollectionFieldSubtype::Filename);
+        assert_eq!(cfg.schema[1].subtype, CollectionFieldSubtype::Text);
+        assert_eq!(cfg.schema[1].visible, Some(false));
+        assert_eq!(cfg.schema[2].subtype, CollectionFieldSubtype::Number);
+        assert_eq!(cfg.sort, Some(("desc".to_string(), true)));
+        assert_eq!(cfg.default_file.as_deref(), Some("inv-001.pdf"));
+        assert_eq!(cfg.items.len(), 1);
+        assert_eq!(cfg.items[0].file, "inv-001.pdf");
+        assert_eq!(
+            cfg.items[0].values,
+            vec![
+                ("desc".to_string(), "Acme".to_string()),
+                ("total".to_string(), "1234.5".to_string()),
+            ]
+        );
+
+        // Defaults + null sort/default; unknown keys ignored.
+        let cfg2 =
+            CollectionConfig::from_json(r#"{"sort":null,"defaultFile":null,"extra":1}"#).unwrap();
+        assert_eq!(cfg2.view, CollectionView::Details);
+        assert!(cfg2.schema.is_empty());
+        assert_eq!(cfg2.sort, None);
+        assert_eq!(cfg2.default_file, None);
+
+        // to_json round-trips back through from_json.
+        let round = CollectionConfig::from_json(&cfg.to_json()).expect("to_json round-trips");
+        assert_eq!(round, cfg);
+
+        // Garbage is rejected (host gets a clear error).
+        assert!(CollectionConfig::from_json("not json").is_none());
     }
 
     #[test]

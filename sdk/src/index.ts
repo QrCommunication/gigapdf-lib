@@ -2155,6 +2155,77 @@ export interface AttachmentOptions {
 export type FileAttachmentIcon = "PushPin" | "Paperclip" | "Graph" | "Tag";
 
 /**
+ * The initial navigator a PDF **portfolio** shows for its embedded files
+ * (`/Collection /View`, ISO 32000-1 §7.11.6): `"details"` (a multi-column list),
+ * `"tile"` (a grid of file tiles), or `"hidden"` (the navigator starts
+ * collapsed). See {@link GigaPdfDoc.setCollection}.
+ */
+export type CollectionView = "details" | "tile" | "hidden";
+
+/**
+ * The data type of a portfolio schema column (`/CollectionField /Subtype`). The
+ * first three are **user-defined** values supplied per file via
+ * {@link CollectionItem.values}; the rest are **synthetic** columns the viewer
+ * derives from each file (its name, description, size, dates) and need no value.
+ */
+export type CollectionFieldSubtype =
+  | "text"
+  | "date"
+  | "number"
+  | "filename"
+  | "description"
+  | "size"
+  | "creationDate"
+  | "modDate";
+
+/** One column of a portfolio schema (a `/CollectionField`). */
+export interface CollectionField {
+  /** The schema key; per-file {@link CollectionItem.values} reference it. */
+  key: string;
+  /** The displayed column header (`/N`). Defaults to `key` when omitted. */
+  name?: string;
+  /** The column data type (`/Subtype`). Defaults to `"text"`. */
+  subtype?: CollectionFieldSubtype;
+  /** The relative ordering (`/O`); columns are shown in ascending order. */
+  order?: number;
+  /** `/V` — whether the column is initially visible (default `true`). */
+  visible?: boolean;
+}
+
+/**
+ * Per-file portfolio metadata — the `/CI` (collection item) values for one
+ * embedded file, keyed by schema field {@link CollectionField.key}. Values are
+ * strings (numeric columns parse the string as a number; date columns expect a
+ * PDF date string `"D:YYYYMMDD…"`). Only user-defined columns
+ * (`text`/`date`/`number`) carry a value.
+ */
+export interface CollectionItem {
+  /** The embedded-file name (a key from {@link GigaPdfDoc.attachments}). */
+  file: string;
+  /** Schema-field `key` → value. */
+  values: Record<string, string | number>;
+}
+
+/**
+ * Configuration for a PDF **portfolio** / embedded-file collection — what
+ * {@link GigaPdfDoc.setCollection} writes into the catalog `/Collection`
+ * (ISO 32000-1 §7.11.6, §12.3.5). Marks the document as a portfolio and
+ * configures its presentation.
+ */
+export interface CollectionConfig {
+  /** `/View` — the initial navigator. Defaults to `"details"`. */
+  view?: CollectionView;
+  /** `/Schema` — the columns, in declaration order. May be empty/omitted. */
+  schema?: CollectionField[];
+  /** `/Sort` — the column to sort on and direction. Omit/`null` to leave unset. */
+  sort?: { field: string; ascending?: boolean } | null;
+  /** `/D` — the embedded-file name initially selected. Omit/`null` to leave unset. */
+  defaultFile?: string | null;
+  /** Per-file `/CI` metadata populating the schema columns. */
+  items?: CollectionItem[];
+}
+
+/**
  * The standard document-information fields (ISO 32000-1 §14.3.3), shared by the
  * `/Info` dictionary and the XMP `/Metadata` packet. Passed to
  * {@link GigaPdfDoc.setInfo}, which writes both and keeps them in sync. Every
@@ -4921,6 +4992,40 @@ export class GigaPdfDoc {
    */
   removeAttachment(name: string): boolean {
     return this.g._withStr(name, (p, l) => this.ex().gp_remove_attachment(this.h, p, l)) === 1;
+  }
+
+  /**
+   * Mark this document as an embedded-file **portfolio** and configure how its
+   * attachments are presented, by writing the catalog `/Collection`
+   * (ISO 32000-1 §7.11.6, §12.3.5). The files must already be embedded (add them
+   * first with {@link addAttachment} / {@link addAssociatedFile}); this only adds
+   * the presentation layer: the initial {@link CollectionConfig.view view}, the
+   * {@link CollectionConfig.schema schema} columns, the
+   * {@link CollectionConfig.sort sort} order, the
+   * {@link CollectionConfig.defaultFile default file}, and per-file
+   * {@link CollectionConfig.items column values} (each written as a `/CI` on the
+   * matching file's filespec). An empty/omitted schema still produces a valid
+   * `/Collection`. Calling again **replaces** the previous configuration. Returns
+   * `true` on success (`false` on a malformed config or write error).
+   */
+  setCollection(config: CollectionConfig): boolean {
+    return (
+      this.g._withStr(JSON.stringify(config), (p, l) =>
+        this.ex().gp_set_collection_json(this.h, p, l)
+      ) === 0
+    );
+  }
+
+  /**
+   * Read this document's portfolio configuration back from the catalog
+   * `/Collection` — the reader counterpart of {@link setCollection}. Returns
+   * `null` when the document is not a portfolio. The recovered
+   * {@link CollectionConfig} carries the `view`, the `schema` columns (sorted by
+   * order), the `sort`, the `defaultFile`, and each embedded file's `/CI` column
+   * `values`.
+   */
+  collection(): CollectionConfig | null {
+    return this.g._json<CollectionConfig | null>((o) => this.ex().gp_collection_json(this.h, o));
   }
 
   /**
