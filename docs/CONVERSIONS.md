@@ -157,19 +157,33 @@ explicit `/Mask`, or a soft `/SMask`):
   `a0`/`a1`/`b1`/`b2` changing-element algorithm, and `/Columns`, `/Rows`,
   `/BlackIs1`, `/EncodedByteAlign`, `/EndOfLine`, `/EndOfBlock` (RTC/EOFB) are
   honoured.
-- **`/JBIG2Decode`** — the embedded-in-PDF profile: the segment-header parser, the
-  MQ arithmetic decoder (Annex E `Qe` table + INITDEC/DECODE/RENORMD/BYTEIN), the
-  integer arithmetic decoders (`IADH`/`IADW`/`IAEX`/`IADT`/`IAFS`/`IADS`/`IAIT` +
-  the `IAID` symbol-id coder), and the **generic region** (GB templates 0-3 with
-  `TPGDON` typical prediction, plus an MMR mode that reuses the CCITT G4 core),
-  **symbol dictionary** and **text region** segments — composited onto the page
-  bitmap with the segment combination operator. An inline `/JBIG2Globals` stream
-  in `/DecodeParms` is honoured. **Precise gaps:** generic *refinement* regions
-  (§6.3), *halftone* regions / pattern dictionaries (§6.6), Huffman-coded (vs
-  arithmetic) symbol dictionaries/text regions, and a `/JBIG2Globals` supplied as
-  an *indirect reference* (the filter layer resolves only an inline globals
-  stream; page-stream segments still decode) — an unsupported segment is skipped
-  (its region left blank) rather than aborting the page.
+- **`/JBIG2Decode`** — the embedded-in-PDF profile, with **full ITU-T T.88 segment
+  coverage**: the segment-header parser, the MQ arithmetic decoder (Annex E `Qe`
+  table + INITDEC/DECODE/RENORMD/BYTEIN), the integer arithmetic decoders
+  (`IADH`/`IADW`/`IAEX`/`IADT`/`IAFS`/`IADS`/`IAIT`/`IARI`/`IARDX`/`IARDY` + the
+  `IAID` symbol-id coder), and every region/dictionary segment type:
+  - **generic region** (§6.2) — GB templates 0-3 with `TPGDON` typical prediction,
+    plus an MMR mode that reuses the CCITT G4 core;
+  - **generic refinement region** (§6.3) — GR templates 0 & 1 with `TPGRON`
+    typical prediction, refining the page area in place;
+  - **symbol dictionary** (§6.5) — arithmetic *and* Huffman coding, plain generic
+    symbols *and* refinement/aggregate (`REFAGG`) symbols (single-symbol refinement
+    and the aggregate text-region case);
+  - **text region** (§6.4) — arithmetic *and* Huffman coding (the run-code-built
+    symbol-ID table + the standard Annex B tables), with per-symbol refinement
+    (`SBREFINE`/`IARI`), reference-corner and transposition handling;
+  - **pattern dictionary** (§6.7) + **halftone region** (§6.6) — the collective
+    pattern bitmap, the grayscale image decoded as Gray-coded generic-region
+    bitplanes (§C.5), and grid placement with the combination operator;
+  - the standard Huffman tables **B.1–B.15** and **custom table segments**
+    (§7.4.13, run-code-built) — all composited onto the page bitmap with the
+    segment combination operator (OR/AND/XOR/XNOR/REPLACE).
+
+  An inline `/JBIG2Globals` stream in `/DecodeParms` is honoured. **Precise gap:**
+  a `/JBIG2Globals` supplied as an *indirect reference* (the filter layer resolves
+  only an inline globals stream; page-stream segments still decode). A
+  genuinely-unknown segment type is skipped (its region left blank) rather than
+  aborting the page.
 
 **Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
 (Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`

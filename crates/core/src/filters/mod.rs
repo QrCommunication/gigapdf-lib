@@ -16,6 +16,7 @@ pub mod ccitt;
 pub mod deflate;
 pub mod inflate;
 pub mod jbig2;
+mod jbig2_huffman;
 pub mod lzw;
 pub mod predictor;
 pub mod runlength;
