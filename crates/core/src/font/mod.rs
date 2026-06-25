@@ -4,6 +4,7 @@
 //! and covers the vast majority of office documents. CID/Type0 (2-byte) and
 //! `/ToUnicode` CMap handling live in [`cmap`], built on top of this.
 
+pub mod afm;
 pub mod bundled;
 pub mod catalog;
 pub mod cff;

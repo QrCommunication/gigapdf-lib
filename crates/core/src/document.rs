@@ -1118,7 +1118,7 @@ fn base14_to_base_encoding(
 /// stream evaluates). Unparsed `/DA`s leave the defaults (no font, size 0 =
 /// auto, black). The font name is what the regenerated appearance's `Tf` and its
 /// `/Resources /Font` key must use, so it resolves against the AcroForm `/DR`.
-fn parse_da_full(da: &str) -> (Option<String>, f64, [f64; 3]) {
+pub(crate) fn parse_da_full(da: &str) -> (Option<String>, f64, [f64; 3]) {
     let toks: Vec<&str> = da.split_whitespace().collect();
     let mut font: Option<String> = None;
     let mut size = 0.0f64;
@@ -6390,10 +6390,12 @@ impl Document {
     /// font/size/colour, `/Q`-quadded, inside `/Rect`), Squiggly (a wavy
     /// underline along `/QuadPoints` in `/C`), Link (the `/Border`/`/BS`
     /// rectangle when its width > 0), Text (a note icon), FileAttachment (a
-    /// paperclip icon) and Stamp (a labelled box from `/Name`). Other subtypes
-    /// draw nothing (matching the prior behaviour). The synthesised content is
-    /// produced directly in page user space, so it maps onto the page with
-    /// `base` alone — no BBox→Rect appearance transform.
+    /// paperclip icon), Stamp (a labelled box from `/Name`), Redact (the marked
+    /// box from `/C`+`/IC`) and the media placeholders 3D / RichMedia / Movie /
+    /// Sound (a framed type icon). Other subtypes draw nothing (matching the
+    /// prior behaviour). The synthesised content is produced directly in page
+    /// user space, so it maps onto the page with `base` alone — no BBox→Rect
+    /// appearance transform.
     fn render_synthesized_appearance(
         &self,
         dict: &Dictionary,
@@ -6426,7 +6428,7 @@ impl Document {
                     _ => String::new(),
                 };
                 let da = self.field_da(dict);
-                let (size, da_color) = parse_da(&da);
+                let (da_font, size, da_color) = parse_da_full(&da);
                 // `/Q` quadding (0 left, 1 centre, 2 right).
                 let quadding = dict
                     .get(b"Q")
@@ -6438,7 +6440,8 @@ impl Document {
                 } else {
                     da_color
                 };
-                annot::free_text_default(rect, &text, size, color, quadding)
+                let font = da_font.unwrap_or_else(|| "Helv".to_string());
+                annot::free_text_default(rect, &text, size, color, quadding, &font)
             }
             b"Squiggly" => {
                 let quad = self.read_num_array(dict, b"QuadPoints");
@@ -6476,6 +6479,24 @@ impl Document {
                 let color = rgb3([1.0, 0.0, 0.0]); // stamp red
                 annot::stamp_default(rect, &label, color)
             }
+            b"Redact" => {
+                let outline = rgb3([1.0, 0.0, 0.0]); // redaction red
+                let ic = self.read_num_array(dict, b"IC");
+                let fill = (ic.len() == 3).then(|| [ic[0], ic[1], ic[2]]);
+                (annot::redaction_default(rect, outline, fill), Dictionary::new())
+            }
+            b"3D" => (
+                annot::annot_3d_default(rect, rgb3([0.2, 0.2, 0.2])),
+                Dictionary::new(),
+            ),
+            b"RichMedia" | b"Movie" => (
+                annot::media_play_default(rect, rgb3([0.2, 0.2, 0.2])),
+                Dictionary::new(),
+            ),
+            b"Sound" => (
+                annot::sound_default(rect, rgb3([0.2, 0.2, 0.2])),
+                Dictionary::new(),
+            ),
             _ => return,
         };
         if appearance.is_empty() {
@@ -12139,8 +12160,9 @@ impl Document {
     ///
     /// # Errors
     /// [`EngineError::InvalidArgument`] for a bad index; [`EngineError::Unsupported`]
-    /// for a subtype whose appearance cannot be reconstructed from the dictionary
-    /// (e.g. FreeText, Stamp, Text, Link — see [`annot::rebuild`]).
+    /// for a subtype with no drawable appearance of its own (e.g. Popup, Widget,
+    /// Screen — see [`annot::rebuild`], which covers the geometric, text-markup,
+    /// text/icon and media subtypes).
     pub fn regenerate_appearance(&mut self, page_no: u32, annot_index: usize) -> Result<()> {
         let page = self.page_dict(page_no)?;
         let items = page
@@ -29917,14 +29939,28 @@ mod tests {
         let after = ap_ref(&doc);
         assert_ne!(before, after, "a fresh appearance object is written");
 
-        // A subtype we don't reconstruct (FreeText) reports Unsupported.
+        // FreeText now reconstructs its appearance (synthesised from
+        // /Contents+/DA+/Q) — it is no longer Unsupported.
         doc.add_free_text(1, [10.0, 10.0, 100.0, 30.0], "hi", 12.0, [0.0, 0.0, 0.0])
             .unwrap();
         let free_text_index = doc.page_annotations(1).unwrap().len() - 1;
-        assert!(matches!(
-            doc.regenerate_appearance(1, free_text_index),
-            Err(EngineError::Unsupported(_))
-        ));
+        doc.regenerate_appearance(1, free_text_index).unwrap();
+        let has_ap = {
+            let page = doc.page_dict(1).unwrap();
+            let annots = page
+                .get(b"Annots")
+                .map(|o| doc.resolve(o))
+                .and_then(Object::as_array)
+                .unwrap();
+            doc.resolve(&annots[free_text_index])
+                .as_dict()
+                .unwrap()
+                .get(b"AP")
+                .and_then(Object::as_dict)
+                .and_then(|ap| ap.get(b"N"))
+                .is_some()
+        };
+        assert!(has_ap, "FreeText annotation gains an /AP after regeneration");
         // A bad index is an InvalidArgument.
         assert!(matches!(
             doc.regenerate_appearance(1, 99),

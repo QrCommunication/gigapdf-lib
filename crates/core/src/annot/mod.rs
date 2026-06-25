@@ -408,7 +408,51 @@ pub(crate) fn strike_out(rect: [f64; 4], color: [f64; 3]) -> Built {
     }
 }
 
-/// Ink (freehand) annotation from one or more polylines.
+/// Append a smoothed open curve through `pts` to `out`: one `m` then cubic `c`
+/// segments following a uniform Catmull-Rom spline converted to Bézier — each
+/// segment's controls are `P[i] + (P[i+1]-P[i-1])/6` and `P[i+1] - (P[i+2]-P[i])/6`
+/// (endpoints duplicated). Degenerate inputs fall back to straight geometry: zero
+/// points draw nothing, one point a lone `m` (a round-capped dot), two points a
+/// single `l`.
+fn push_smoothed_path(out: &mut Vec<u8>, pts: &[(f64, f64)]) {
+    match pts.len() {
+        0 => {}
+        1 => {
+            out.extend_from_slice(format!("{} {} m\n", num(pts[0].0), num(pts[0].1)).as_bytes());
+        }
+        2 => {
+            out.extend_from_slice(format!("{} {} m\n", num(pts[0].0), num(pts[0].1)).as_bytes());
+            out.extend_from_slice(format!("{} {} l\n", num(pts[1].0), num(pts[1].1)).as_bytes());
+        }
+        n => {
+            out.extend_from_slice(format!("{} {} m\n", num(pts[0].0), num(pts[0].1)).as_bytes());
+            for i in 0..n - 1 {
+                let p0 = pts[i.saturating_sub(1)];
+                let p1 = pts[i];
+                let p2 = pts[i + 1];
+                let p3 = pts[(i + 2).min(n - 1)];
+                let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
+                let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0);
+                out.extend_from_slice(
+                    format!(
+                        "{} {} {} {} {} {} c\n",
+                        num(c1.0),
+                        num(c1.1),
+                        num(c2.0),
+                        num(c2.1),
+                        num(p2.0),
+                        num(p2.1)
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    }
+}
+
+/// Ink (freehand) annotation from one or more polylines. Each stroke is smoothed
+/// into a Catmull-Rom → Bézier curve (see [`push_smoothed_path`]) so the freehand
+/// path renders as a fluid line rather than a faceted polyline.
 pub(crate) fn ink(paths: &[Vec<(f64, f64)>], color: [f64; 3], line_width: f64) -> Built {
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
@@ -462,14 +506,11 @@ pub(crate) fn ink(paths: &[Vec<(f64, f64)>], color: [f64; 3], line_width: f64) -
     appearance.extend_from_slice(format!("{} w\n", num(line_width)).as_bytes());
     appearance.extend_from_slice(b"1 J\n1 j\n"); // round caps and joins
     for path in paths {
-        let mut points = path.iter();
-        if let Some(&(x, y)) = points.next() {
-            appearance.extend_from_slice(format!("{} {} m\n", num(x), num(y)).as_bytes());
-            for &(x, y) in points {
-                appearance.extend_from_slice(format!("{} {} l\n", num(x), num(y)).as_bytes());
-            }
-            appearance.extend_from_slice(b"S\n");
+        if path.is_empty() {
+            continue;
         }
+        push_smoothed_path(&mut appearance, path);
+        appearance.extend_from_slice(b"S\n");
     }
     appearance.extend_from_slice(b"Q\n");
     Built {
@@ -479,14 +520,64 @@ pub(crate) fn ink(paths: &[Vec<(f64, f64)>], color: [f64; 3], line_width: f64) -
     }
 }
 
-/// Rubber-stamp annotation — a labelled, bordered box.
+/// Derive a Stamp `/Name` token from a human `label`. Matching is
+/// case-insensitive and ignores whitespace, so "not approved" → `/NotApproved`.
+/// Recognised names are the PDF standard stamps (ISO 32000-1 Table 181) plus the
+/// common dynamic / sign-here ones. An unrecognised label keeps its own
+/// characters (whitespace stripped) as a clean, self-describing custom token; the
+/// [`name`] serializer hex-escapes any byte that is not a bare `/Name` character,
+/// so even a Unicode label yields a valid token. An empty label falls back to the
+/// historical default, `Draft`.
+pub(crate) fn stamp_name_for_label(label: &str) -> Vec<u8> {
+    const STANDARD: &[&str] = &[
+        "Approved",
+        "Experimental",
+        "NotApproved",
+        "AsIs",
+        "Expired",
+        "NotForPublicRelease",
+        "Confidential",
+        "Final",
+        "Sold",
+        "Departmental",
+        "ForComment",
+        "TopSecret",
+        "Draft",
+        "ForPublicRelease",
+        "Completed",
+        "Void",
+        "PreliminaryResults",
+        "InformationOnly",
+        "Witness",
+        "SignHere",
+        "InitialHere",
+    ];
+    let key: String = label
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if let Some(&std) = STANDARD.iter().find(|s| s.to_ascii_lowercase() == key) {
+        return std.as_bytes().to_vec();
+    }
+    let custom: String = label.chars().filter(|c| !c.is_whitespace()).collect();
+    if custom.is_empty() {
+        b"Draft".to_vec()
+    } else {
+        custom.into_bytes()
+    }
+}
+
+/// Rubber-stamp annotation — a labelled, bordered box. The `/Name` is derived
+/// from `label` (a standard stamp name when recognised, else a clean custom
+/// token — see [`stamp_name_for_label`]).
 pub(crate) fn stamp(rect: [f64; 4], label: &str, color: [f64; 3]) -> Built {
     let [x0, y0, x1, y1] = rect;
     let [r, g, b] = color;
     let mut dict = Dictionary::new();
     dict.set(b"Subtype".to_vec(), name(b"Stamp"));
     dict.set(b"Rect".to_vec(), real_array(&rect));
-    dict.set(b"Name".to_vec(), name(b"Draft"));
+    dict.set(b"Name".to_vec(), name(&stamp_name_for_label(label)));
     dict.set(b"C".to_vec(), real_array(&color));
 
     let width = x1 - x0;
@@ -588,12 +679,66 @@ fn read_line_width(dict: &Dictionary) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// The annotation's effective border width for a frame: `/BS /W`, else `/Border`
+/// element 3, defaulting to `1.0` (the PDF default border). Used for Link frames.
+fn read_border_width(dict: &Dictionary) -> f64 {
+    if let Some(w) = dict
+        .get(b"BS")
+        .and_then(Object::as_dict)
+        .and_then(|bs| bs.get(b"W"))
+        .and_then(Object::as_f64)
+    {
+        return w.max(0.0);
+    }
+    if let Some(w) = dict
+        .get(b"Border")
+        .and_then(Object::as_array)
+        .and_then(|b| b.get(2))
+        .and_then(Object::as_f64)
+    {
+        return w.max(0.0);
+    }
+    1.0
+}
+
+/// Read a PDF text-string value (e.g. `/Contents`), decoded per ISO 32000-1
+/// §7.9.2.2 (UTF-16BE with BOM, else WinAnsi). Empty when absent or not a string.
+fn read_text(dict: &Dictionary, key: &[u8]) -> String {
+    match dict.get(key) {
+        Some(Object::String(bytes, _)) => crate::font::decode_pdf_text(bytes),
+        _ => String::new(),
+    }
+}
+
+/// Read a flat `[x y …]` number array (e.g. `/QuadPoints`), empty when absent.
+fn read_flat_nums(dict: &Dictionary, key: &[u8]) -> Vec<f64> {
+    dict.get(key)
+        .and_then(Object::as_array)
+        .map(|a| a.iter().filter_map(Object::as_f64).collect())
+        .unwrap_or_default()
+}
+
+/// Wrap synthesised appearance bytes + resources into a [`Built`] for
+/// [`rebuild`]. The dictionary is left empty because the only caller
+/// ([`crate::document::Document::regenerate_appearance`]) keeps the original
+/// annotation dictionary and only swaps its `/AP /N`.
+fn built_from_appearance(appearance: Vec<u8>, resources: Dictionary) -> Built {
+    Built {
+        dict: Dictionary::new(),
+        appearance,
+        resources,
+    }
+}
+
 /// Rebuild the appearance ([`Built`]) of an existing annotation from its stored
-/// geometry, for [`Document::regenerate_appearance`]. Supports the geometric and
+/// dictionary, for [`Document::regenerate_appearance`]. Covers the geometric and
 /// text-markup subtypes the engine authors (Square, Circle, Line, Polygon,
-/// PolyLine, Highlight, Underline, StrikeOut, Ink, Caret). Returns `None` for
-/// subtypes whose appearance cannot be reconstructed from the dictionary alone
-/// (e.g. FreeText, Stamp, Text, Link).
+/// PolyLine, Highlight, Underline, StrikeOut, Squiggly, Ink, Caret), the
+/// text/icon subtypes synthesised from the dictionary (FreeText from
+/// `/Contents`+`/DA`+`/Q`, Stamp from `/Name`, Text and FileAttachment icons,
+/// Link border) and the media placeholders (Redact, 3D, RichMedia, Movie, Sound).
+/// Returns `None` only for subtypes with no drawable appearance of their own
+/// (e.g. Popup, Widget, Screen).
 pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
     let subtype = dict.get(b"Subtype").and_then(Object::as_name)?.to_vec();
     let rect = read_rect4(dict, b"Rect").unwrap_or([0.0, 0.0, 0.0, 0.0]);
@@ -661,6 +806,63 @@ pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
                 .unwrap_or_default();
             ink(&paths, stroke.unwrap_or(black), lw)
         }
+        b"FreeText" => {
+            let text = read_text(dict, b"Contents");
+            let da = match dict.get(b"DA") {
+                Some(Object::String(bytes, _)) => String::from_utf8_lossy(bytes).into_owned(),
+                _ => String::new(),
+            };
+            let (da_font, size, da_color) = crate::document::parse_da_full(&da);
+            let quadding = dict
+                .get(b"Q")
+                .and_then(Object::as_i64)
+                .unwrap_or(0)
+                .clamp(0, 2) as u8;
+            // FreeText text colour: `/C` when present, else the `/DA` colour.
+            let color = stroke.unwrap_or(da_color);
+            let font = da_font.unwrap_or_else(|| "Helv".to_string());
+            let (appearance, resources) = free_text_default(rect, &text, size, color, quadding, &font);
+            built_from_appearance(appearance, resources)
+        }
+        b"Stamp" => {
+            let label = match dict.get(b"Name") {
+                Some(Object::Name(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+                Some(Object::String(bytes, _)) => crate::font::decode_pdf_text(bytes),
+                _ => String::new(),
+            };
+            let (appearance, resources) = stamp_default(rect, &label, stroke.unwrap_or([1.0, 0.0, 0.0]));
+            built_from_appearance(appearance, resources)
+        }
+        b"Text" => built_from_appearance(
+            text_note_default(rect, stroke.unwrap_or([1.0, 0.85, 0.2])),
+            Dictionary::new(),
+        ),
+        b"FileAttachment" => built_from_appearance(
+            file_attachment_default(rect, stroke.unwrap_or([0.45, 0.45, 0.45])),
+            Dictionary::new(),
+        ),
+        b"Link" => built_from_appearance(
+            link_border_default(rect, read_border_width(dict), stroke.unwrap_or(black)),
+            Dictionary::new(),
+        ),
+        b"Squiggly" => built_from_appearance(
+            squiggly_default(rect, &read_flat_nums(dict, b"QuadPoints"), stroke.unwrap_or(black)),
+            Dictionary::new(),
+        ),
+        b"Redact" => built_from_appearance(
+            redaction_default(rect, stroke.unwrap_or([1.0, 0.0, 0.0]), fill),
+            Dictionary::new(),
+        ),
+        b"3D" => {
+            built_from_appearance(annot_3d_default(rect, stroke.unwrap_or(black)), Dictionary::new())
+        }
+        b"RichMedia" | b"Movie" => built_from_appearance(
+            media_play_default(rect, stroke.unwrap_or(black)),
+            Dictionary::new(),
+        ),
+        b"Sound" => {
+            built_from_appearance(sound_default(rect, stroke.unwrap_or(black)), Dictionary::new())
+        }
         _ => return None,
     })
 }
@@ -676,19 +878,29 @@ pub(crate) fn rebuild(dict: &Dictionary) -> Option<Built> {
 // helpers; none mutate document state. They mirror the create-side appearance
 // generators above so a synthesised look matches the engine's own annotations.
 
-/// A `/Resources` dictionary exposing a non-embedded Helvetica as `/Helv` — the
-/// font a synthesised text appearance (FreeText / Stamp) references. The
-/// rasterizer draws it through the base-14 substitution in `render_fonts_for`.
-pub(crate) fn helv_resources() -> Dictionary {
-    let mut helv = Dictionary::new();
-    helv.set(b"Type".to_vec(), name(b"Font"));
-    helv.set(b"Subtype".to_vec(), name(b"Type1"));
-    helv.set(b"BaseFont".to_vec(), name(b"Helvetica"));
+/// A `/Resources` dictionary exposing a non-embedded standard-14 `base_font`
+/// (e.g. `Helvetica`, `Times-Roman`, `Courier`) under the resource name `/Helv`
+/// — the name a synthesised text appearance's `Tf` operator uses. Keeping the
+/// resource name fixed while varying `/BaseFont` lets the appearance reference the
+/// same face it was measured with, so a conforming viewer draws the run at the
+/// spacing we computed. The rasterizer maps the base-14 name to a bundled
+/// substitute in `render_fonts_for`.
+pub(crate) fn base14_font_resources(base_font: &str) -> Dictionary {
+    let mut font = Dictionary::new();
+    font.set(b"Type".to_vec(), name(b"Font"));
+    font.set(b"Subtype".to_vec(), name(b"Type1"));
+    font.set(b"BaseFont".to_vec(), name(base_font.as_bytes()));
     let mut fonts = Dictionary::new();
-    fonts.set(b"Helv".to_vec(), Object::Dictionary(helv));
+    fonts.set(b"Helv".to_vec(), Object::Dictionary(font));
     let mut resources = Dictionary::new();
     resources.set(b"Font".to_vec(), Object::Dictionary(fonts));
     resources
+}
+
+/// A `/Resources` dictionary exposing a non-embedded Helvetica as `/Helv` — the
+/// default font a synthesised text appearance (FreeText / Stamp) references.
+pub(crate) fn helv_resources() -> Dictionary {
+    base14_font_resources("Helvetica")
 }
 
 /// Append a `(text)` string-literal operand (WinAnsi-encoded, parens/backslash
@@ -705,15 +917,20 @@ fn push_text_literal(out: &mut Vec<u8>, text: &str) {
 }
 
 /// Synthesised FreeText appearance: paint `text` inside `rect` in the `/DA`
-/// colour at `font_size`, honouring `/Q` quadding (0 left, 1 centre, 2 right).
-/// Lines are split on `\n` / `\r` and stacked from the top of the rect. Returns
-/// the page-space content bytes and the `/Helv` resources the text needs.
+/// colour at `font_size` with the `/DA` `font` (a base-14 / AcroForm font name
+/// such as `Helv`, `TiBo`, `Cour`), honouring `/Q` quadding (0 left, 1 centre,
+/// 2 right). Centre / right alignment uses the **real per-glyph advances** of
+/// that font (its Core-14 AFM metrics), so a line is placed at its true width
+/// rather than a character-count estimate. Lines split on `\n` / `\r` and stack
+/// from the top of the rect. Returns the page-space content bytes and the
+/// resources (a `/Helv` resource whose `/BaseFont` matches the measured font).
 pub(crate) fn free_text_default(
     rect: [f64; 4],
     text: &str,
     font_size: f64,
     color: [f64; 3],
     quadding: u8,
+    font: &str,
 ) -> (Vec<u8>, Dictionary) {
     let [x0, y0, x1, y1] = rect;
     let [r, g, b] = color;
@@ -721,12 +938,11 @@ pub(crate) fn free_text_default(
     let leading = size * 1.15;
     let pad = 2.0;
     let box_w = (x1 - x0 - 2.0 * pad).max(0.0);
-    // Approximate Helvetica advance for crude horizontal placement.
-    let char_w = size * 0.5;
+    let resources = base14_font_resources(crate::font::afm::base_font_name(font));
 
     let mut out = Vec::new();
     if text.trim().is_empty() {
-        return (out, helv_resources());
+        return (out, resources);
     }
     out.extend_from_slice(b"q\nBT\n");
     out.extend_from_slice(format!("/Helv {} Tf\n", num(size)).as_bytes());
@@ -738,7 +954,8 @@ pub(crate) fn free_text_default(
         if baseline < y0 - size {
             break;
         }
-        let text_w = line.chars().count() as f64 * char_w;
+        // True width of the line in the /DA font (Core-14 AFM advances).
+        let text_w = crate::font::afm::measure_winansi(font, line, size);
         let tx = match quadding {
             1 => x0 + pad + ((box_w - text_w) / 2.0).max(0.0), // centre
             2 => x1 - pad - text_w.min(box_w),                 // right
@@ -750,13 +967,14 @@ pub(crate) fn free_text_default(
         baseline -= leading;
     }
     out.extend_from_slice(b"ET\nQ\n");
-    (out, helv_resources())
+    (out, resources)
 }
 
 /// Synthesised Squiggly appearance: a wavy underline in `color` along each quad
 /// of `quad_points` (8 values per quad, ISO order UL UR LL LR). When
 /// `quad_points` is empty the whole `rect` is treated as one span. The wave is a
-/// stroked zigzag near the baseline — more faithful than a flat rule.
+/// smooth **sinusoid** near the baseline — each half-wavelength is a cubic Bézier
+/// hump (alternating up/down), not a faceted zigzag.
 pub(crate) fn squiggly_default(rect: [f64; 4], quad_points: &[f64], color: [f64; 3]) -> Vec<u8> {
     let mut out = Vec::new();
     let [r, g, b] = color;
@@ -784,18 +1002,35 @@ pub(crate) fn squiggly_default(rect: [f64; 4], quad_points: &[f64], color: [f64;
         let line_w = (h * 0.06).max(0.75);
         let amp = (h * 0.06).clamp(0.6, 2.0); // wave amplitude
         let base = yb + h * 0.08; // sit near the baseline
-        let period = (amp * 4.0).max(3.0);
+        let half = (amp * 3.0).max(2.0); // half wavelength (one hump)
         out.extend_from_slice(format!("{} w\n", num(line_w)).as_bytes());
         out.extend_from_slice(b"1 J\n1 j\n"); // round caps/joins
         out.extend_from_slice(format!("{} {} m\n", num(xl), num(base)).as_bytes());
         let mut x = xl;
-        let mut up = true;
-        while x < xr {
-            let nx = (x + period / 2.0).min(xr);
-            let y = if up { base + amp } else { base - amp };
-            out.extend_from_slice(format!("{} {} l\n", num(nx), num(y)).as_bytes());
-            x = nx;
-            up = !up;
+        let mut sign = 1.0f64;
+        // Each hump is a cubic Bézier; control height 4/3·amp makes the curve
+        // peak at exactly `amp` mid-segment, approximating a sine arch. A short
+        // trailing hump scales its height by its width so it never overshoots.
+        while x < xr - 1e-6 {
+            let seg = half.min(xr - x);
+            let ctrl = sign * (4.0 / 3.0) * amp * (seg / half).clamp(0.0, 1.0);
+            let cx1 = x + seg / 3.0;
+            let cx2 = x + 2.0 * seg / 3.0;
+            let xe = x + seg;
+            out.extend_from_slice(
+                format!(
+                    "{} {} {} {} {} {} c\n",
+                    num(cx1),
+                    num(base + ctrl),
+                    num(cx2),
+                    num(base + ctrl),
+                    num(xe),
+                    num(base)
+                )
+                .as_bytes(),
+            );
+            x = xe;
+            sign = -sign;
         }
         out.extend_from_slice(b"S\n");
     }
@@ -904,6 +1139,171 @@ pub(crate) fn file_attachment_default(rect: [f64; 4], color: [f64; 3]) -> Vec<u8
     out
 }
 
+/// Synthesised Redact appearance (`/Subtype /Redact`): the marked region as a
+/// bordered box — the `/C` outline `color` (default red at the call site) with an
+/// optional `fill` (the `/IC` interior colour the content is replaced with). This
+/// is the *marking* look a reviewer sees before the redaction is applied, so the
+/// region is clearly visible.
+pub(crate) fn redaction_default(
+    rect: [f64; 4],
+    color: [f64; 3],
+    fill: Option<[f64; 3]>,
+) -> Vec<u8> {
+    let x0 = rect[0].min(rect[2]);
+    let y0 = rect[1].min(rect[3]);
+    let w = (rect[2] - rect[0]).abs();
+    let h = (rect[3] - rect[1]).abs();
+    let lw = (w.min(h) * 0.04).clamp(0.75, 2.0);
+    content::rectangle_ops(
+        x0 + lw / 2.0,
+        y0 + lw / 2.0,
+        (w - lw).max(0.0),
+        (h - lw).max(0.0),
+        Some(color),
+        fill,
+        lw,
+    )
+}
+
+/// Draw a bordered placeholder frame (in `color`) for a media annotation into
+/// `out` and return `(cx, cy, r)`: the rect centre and a quarter of its shorter
+/// side — the radius the type icon is sized to.
+fn push_media_frame(out: &mut Vec<u8>, rect: [f64; 4], color: [f64; 3]) -> (f64, f64, f64) {
+    let x0 = rect[0].min(rect[2]);
+    let y0 = rect[1].min(rect[3]);
+    let w = (rect[2] - rect[0]).abs();
+    let h = (rect[3] - rect[1]).abs();
+    let lw = (w.min(h) * 0.04).clamp(0.75, 2.0);
+    out.extend_from_slice(&content::rectangle_ops(
+        x0 + lw / 2.0,
+        y0 + lw / 2.0,
+        (w - lw).max(0.0),
+        (h - lw).max(0.0),
+        Some(color),
+        None,
+        lw,
+    ));
+    (x0 + w / 2.0, y0 + h / 2.0, w.min(h) * 0.25)
+}
+
+/// Synthesised placeholder appearance for a playable-media annotation (Movie /
+/// RichMedia / Screen): a bordered frame with a centred filled play triangle in
+/// `color`, so the annotation has a visible marker without its real asset.
+pub(crate) fn media_play_default(rect: [f64; 4], color: [f64; 3]) -> Vec<u8> {
+    let [r, g, b] = color;
+    let mut out = Vec::new();
+    let (cx, cy, rad) = push_media_frame(&mut out, rect, color);
+    let t = rad * 0.7;
+    out.extend_from_slice(b"q\n");
+    out.extend_from_slice(format!("{} {} {} rg\n", num(r), num(g), num(b)).as_bytes());
+    out.extend_from_slice(format!("{} {} m\n", num(cx - t * 0.5), num(cy + t)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx - t * 0.5), num(cy - t)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(cx + t), num(cy)).as_bytes());
+    out.extend_from_slice(b"h\nf\nQ\n");
+    out
+}
+
+/// Synthesised placeholder appearance for a 3D annotation: a bordered frame with
+/// a small wireframe cube in `color`.
+pub(crate) fn annot_3d_default(rect: [f64; 4], color: [f64; 3]) -> Vec<u8> {
+    let [r, g, b] = color;
+    let mut out = Vec::new();
+    let (cx, cy, rad) = push_media_frame(&mut out, rect, color);
+    let a = rad * 0.85; // front face side
+    let d = rad * 0.55; // depth offset
+    let fx0 = cx - (a + d) / 2.0;
+    let fy0 = cy - (a + d) / 2.0;
+    let lw = (rad * 0.12).max(0.6);
+    out.extend_from_slice(b"q\n");
+    out.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+    out.extend_from_slice(format!("{} w\n1 j\n", num(lw)).as_bytes());
+    // Front and back squares.
+    out.extend_from_slice(
+        format!("{} {} {} {} re\nS\n", num(fx0), num(fy0), num(a), num(a)).as_bytes(),
+    );
+    out.extend_from_slice(
+        format!(
+            "{} {} {} {} re\nS\n",
+            num(fx0 + d),
+            num(fy0 + d),
+            num(a),
+            num(a)
+        )
+        .as_bytes(),
+    );
+    // Connect the four pairs of front/back corners.
+    for &(dx, dy) in &[(0.0, 0.0), (a, 0.0), (0.0, a), (a, a)] {
+        out.extend_from_slice(format!("{} {} m\n", num(fx0 + dx), num(fy0 + dy)).as_bytes());
+        out.extend_from_slice(
+            format!("{} {} l\nS\n", num(fx0 + dx + d), num(fy0 + dy + d)).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b"Q\n");
+    out
+}
+
+/// Synthesised placeholder appearance for a Sound annotation: a bordered frame
+/// with a small filled speaker and two sound-wave arcs in `color`.
+pub(crate) fn sound_default(rect: [f64; 4], color: [f64; 3]) -> Vec<u8> {
+    let [r, g, b] = color;
+    let mut out = Vec::new();
+    let (cx, cy, rad) = push_media_frame(&mut out, rect, color);
+    let s = rad * 0.8;
+    let bx = cx - s;
+    out.extend_from_slice(b"q\n");
+    out.extend_from_slice(format!("{} {} {} rg\n", num(r), num(g), num(b)).as_bytes());
+    out.extend_from_slice(format!("{} {} {} RG\n", num(r), num(g), num(b)).as_bytes());
+    out.extend_from_slice(format!("{} w\n1 J\n1 j\n", num((rad * 0.12).max(0.6))).as_bytes());
+    // Speaker body (square) + cone (trapezoid), filled.
+    out.extend_from_slice(
+        format!(
+            "{} {} {} {} re\nf\n",
+            num(bx),
+            num(cy - s * 0.35),
+            num(s * 0.5),
+            num(s * 0.7)
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(format!("{} {} m\n", num(bx + s * 0.5), num(cy - s * 0.35)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(bx + s), num(cy - s * 0.8)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(bx + s), num(cy + s * 0.8)).as_bytes());
+    out.extend_from_slice(format!("{} {} l\n", num(bx + s * 0.5), num(cy + s * 0.35)).as_bytes());
+    out.extend_from_slice(b"h\nf\n");
+    // Two sound-wave arcs to the right, as cubic Béziers.
+    let wx = cx + s * 0.1;
+    out.extend_from_slice(format!("{} {} m\n", num(wx), num(cy - s * 0.5)).as_bytes());
+    out.extend_from_slice(
+        format!(
+            "{} {} {} {} {} {} c\n",
+            num(wx + s * 0.5),
+            num(cy - s * 0.25),
+            num(wx + s * 0.5),
+            num(cy + s * 0.25),
+            num(wx),
+            num(cy + s * 0.5)
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(b"S\n");
+    out.extend_from_slice(format!("{} {} m\n", num(wx + s * 0.45), num(cy - s * 0.8)).as_bytes());
+    out.extend_from_slice(
+        format!(
+            "{} {} {} {} {} {} c\n",
+            num(wx + s * 1.1),
+            num(cy - s * 0.4),
+            num(wx + s * 1.1),
+            num(cy + s * 0.4),
+            num(wx + s * 0.45),
+            num(cy + s * 0.8)
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(b"S\n");
+    out.extend_from_slice(b"Q\n");
+    out
+}
+
 /// Synthesised Stamp appearance: a labelled, bordered box filling `rect`, the
 /// label taken from `/Name`. Reuses the create-side look (`stamp`) so a
 /// synthesised stamp matches an engine-authored one. Returns the page-space
@@ -936,4 +1336,224 @@ pub(crate) fn stamp_default(rect: [f64; 4], label: &str, color: [f64; 3]) -> (Ve
         out.extend_from_slice(b" Tj\nET\n");
     }
     (out, helv_resources())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(bytes: Vec<u8>) -> String {
+        String::from_utf8(bytes).unwrap()
+    }
+
+    // ── sub-item 1: Stamp /Name from label ──────────────────────────────────
+
+    #[test]
+    fn stamp_name_maps_standard_labels_case_and_space_insensitive() {
+        assert_eq!(stamp_name_for_label("Approved"), b"Approved");
+        assert_eq!(stamp_name_for_label("not approved"), b"NotApproved");
+        assert_eq!(stamp_name_for_label("FOR COMMENT"), b"ForComment");
+        assert_eq!(stamp_name_for_label("Top  Secret"), b"TopSecret");
+        assert_eq!(stamp_name_for_label("sign here"), b"SignHere");
+        assert_eq!(stamp_name_for_label("preliminary results"), b"PreliminaryResults");
+    }
+
+    #[test]
+    fn stamp_name_custom_label_is_a_clean_token() {
+        assert_eq!(stamp_name_for_label("My Custom Mark"), b"MyCustomMark");
+        // Empty / whitespace-only falls back to the historical default.
+        assert_eq!(stamp_name_for_label(""), b"Draft");
+        assert_eq!(stamp_name_for_label("   "), b"Draft");
+    }
+
+    #[test]
+    fn stamp_sets_name_from_label() {
+        let built = stamp([0.0, 0.0, 100.0, 40.0], "Confidential", [1.0, 0.0, 0.0]);
+        assert_eq!(
+            built.dict.get(b"Name").and_then(Object::as_name),
+            Some(b"Confidential".as_slice())
+        );
+        let custom = stamp([0.0, 0.0, 100.0, 40.0], "Paid In Full", [1.0, 0.0, 0.0]);
+        assert_eq!(
+            custom.dict.get(b"Name").and_then(Object::as_name),
+            Some(b"PaidInFull".as_slice())
+        );
+    }
+
+    // ── sub-item 2: FreeText quadding via real /DA advances ──────────────────
+
+    #[test]
+    fn free_text_centre_uses_real_advances() {
+        let rect = [0.0, 0.0, 200.0, 50.0];
+        let (bytes, _res) = free_text_default(rect, "Hi", 12.0, [0.0, 0.0, 0.0], 1, "Helv");
+        let out = s(bytes);
+        let box_w = 200.0 - 4.0; // rect width − 2·pad
+        let measure = crate::font::afm::measure_winansi("Helv", "Hi", 12.0);
+        let expected_tx = 2.0 + (box_w - measure) / 2.0;
+        let needle = format!("1 0 0 1 {} ", num(expected_tx));
+        assert!(
+            out.contains(&needle),
+            "centred FreeText must place text at its real width.\nneedle: {needle}\ngot:\n{out}"
+        );
+        // The real width is well under the old crude estimate (2 * 12 * 0.5 = 12).
+        assert!(measure < 12.0);
+    }
+
+    #[test]
+    fn free_text_resources_basefont_matches_da_font() {
+        let basefont = |font: &str| -> Vec<u8> {
+            let (_b, res) = free_text_default([0.0, 0.0, 80.0, 20.0], "x", 12.0, [0.0; 3], 0, font);
+            res.get(b"Font")
+                .and_then(Object::as_dict)
+                .and_then(|f| f.get(b"Helv"))
+                .and_then(Object::as_dict)
+                .and_then(|h| h.get(b"BaseFont"))
+                .and_then(Object::as_name)
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(basefont("Helv"), b"Helvetica");
+        assert_eq!(basefont("TiBo"), b"Times-Bold");
+        assert_eq!(basefont("Cour"), b"Courier");
+    }
+
+    // ── sub-item 3: Ink Catmull-Rom → Bézier smoothing ──────────────────────
+
+    #[test]
+    fn ink_smooths_three_plus_points_into_beziers() {
+        let built = ink(
+            &[vec![(0.0, 0.0), (10.0, 10.0), (20.0, 0.0), (30.0, 10.0)]],
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        let out = s(built.appearance);
+        assert!(out.contains(" c\n"), "≥3-point ink must use cubic Béziers:\n{out}");
+        assert!(!out.contains(" l\n"), "smoothed ink must not emit straight segments");
+    }
+
+    #[test]
+    fn ink_degenerate_paths_fall_back_to_straight_geometry() {
+        // 2 points → a single straight line, no curve.
+        let two = s(ink(&[vec![(0.0, 0.0), (10.0, 10.0)]], [0.0; 3], 2.0).appearance);
+        assert!(two.contains(" l\n") && !two.contains(" c\n"));
+        // 1 point → a lone move (round-capped dot), neither line nor curve.
+        let one = s(ink(&[vec![(5.0, 5.0)]], [0.0; 3], 2.0).appearance);
+        assert!(one.contains("m\n") && one.contains("S\n"));
+        assert!(!one.contains(" l\n") && !one.contains(" c\n"));
+    }
+
+    // ── sub-item 4: Squiggly sinusoid ───────────────────────────────────────
+
+    #[test]
+    fn squiggly_is_a_sinusoid_not_a_zigzag() {
+        let out = s(squiggly_default([0.0, 0.0, 120.0, 12.0], &[], [0.0, 0.0, 0.0]));
+        assert!(out.contains(" c\n"), "squiggly must use Bézier curves:\n{out}");
+        // A zigzag would draw straight `l` segments; a sinusoid never does.
+        assert!(!out.contains(" l\n"), "squiggly must not be a faceted zigzag");
+    }
+
+    // ── sub-item 6: Redaction + media placeholders ──────────────────────────
+
+    #[test]
+    fn redaction_draws_a_box() {
+        let out = s(redaction_default([0.0, 0.0, 50.0, 20.0], [1.0, 0.0, 0.0], None));
+        assert!(out.contains(" re\n"), "redaction must outline a rectangle");
+        // With an interior colour it fills then strokes.
+        let filled = s(redaction_default(
+            [0.0, 0.0, 50.0, 20.0],
+            [1.0, 0.0, 0.0],
+            Some([0.0, 0.0, 0.0]),
+        ));
+        assert!(filled.contains("B\n"));
+    }
+
+    #[test]
+    fn media_placeholders_draw_frame_and_icon() {
+        for bytes in [
+            annot_3d_default([0.0, 0.0, 60.0, 60.0], [0.2; 3]),
+            media_play_default([0.0, 0.0, 60.0, 60.0], [0.2; 3]),
+            sound_default([0.0, 0.0, 60.0, 60.0], [0.2; 3]),
+        ] {
+            let out = s(bytes);
+            assert!(out.contains(" re\n"), "media placeholder draws a frame:\n{out}");
+        }
+    }
+
+    // ── sub-item 5: rebuild dispatch ─────────────────────────────────────────
+
+    fn rebuilt(subtype: &[u8], extra: impl FnOnce(&mut Dictionary)) -> Option<Built> {
+        let mut d = Dictionary::new();
+        d.set(b"Subtype".to_vec(), name(subtype));
+        d.set(b"Rect".to_vec(), real_array(&[0.0, 0.0, 100.0, 40.0]));
+        extra(&mut d);
+        rebuild(&d)
+    }
+
+    #[test]
+    fn rebuild_dispatches_freetext_with_da_resources() {
+        let built = rebuilt(b"FreeText", |d| {
+            d.set(b"Contents".to_vec(), literal("Hello"));
+            d.set(b"DA".to_vec(), literal("/TiBo 12 Tf 0 0 0 rg"));
+            d.set(b"Q".to_vec(), Object::Integer(1));
+        })
+        .expect("FreeText rebuilds");
+        assert!(!built.appearance.is_empty());
+        let basefont = built
+            .resources
+            .get(b"Font")
+            .and_then(Object::as_dict)
+            .and_then(|f| f.get(b"Helv"))
+            .and_then(Object::as_dict)
+            .and_then(|h| h.get(b"BaseFont"))
+            .and_then(Object::as_name)
+            .unwrap();
+        assert_eq!(basefont, b"Times-Bold", "FreeText AP references the /DA font");
+    }
+
+    #[test]
+    fn rebuild_dispatches_stamp_from_name() {
+        let built = rebuilt(b"Stamp", |d| {
+            d.set(b"Name".to_vec(), name(b"Confidential"));
+        })
+        .expect("Stamp rebuilds");
+        assert!(s(built.appearance).contains("Confidential"));
+    }
+
+    #[test]
+    fn rebuild_dispatches_redact_with_interior_colour() {
+        let built = rebuilt(b"Redact", |d| {
+            d.set(b"C".to_vec(), real_array(&[1.0, 0.0, 0.0]));
+            d.set(b"IC".to_vec(), real_array(&[0.0, 0.0, 0.0]));
+        })
+        .expect("Redact rebuilds");
+        assert!(s(built.appearance).contains(" re\n"));
+    }
+
+    #[test]
+    fn rebuild_dispatches_all_supported_icon_subtypes() {
+        for sub in [
+            b"Text".as_slice(),
+            b"Link",
+            b"Squiggly",
+            b"FileAttachment",
+            b"3D",
+            b"RichMedia",
+            b"Movie",
+            b"Sound",
+        ] {
+            let built = rebuilt(sub, |_| {})
+                .unwrap_or_else(|| panic!("{} should rebuild", String::from_utf8_lossy(sub)));
+            assert!(
+                !built.appearance.is_empty(),
+                "{} produces a non-empty appearance",
+                String::from_utf8_lossy(sub)
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_returns_none_for_appearanceless_subtypes() {
+        assert!(rebuilt(b"Popup", |_| {}).is_none());
+        assert!(rebuilt(b"Widget", |_| {}).is_none());
+    }
 }
