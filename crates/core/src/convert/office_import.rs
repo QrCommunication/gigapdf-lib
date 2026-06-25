@@ -786,6 +786,9 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     let mut document = flow_document_pages(pages.finish(), page_geometry(geom));
     document.resources.images = resources;
     document.outline = outline.finish();
+    // Lower `word/styles.xml`'s named paragraph styles into the model's style
+    // table so each paragraph's `style_ref` (set from `w:pStyle`) resolves.
+    document.styles = styles.to_style_table();
     document.meta = ooxml_doc_meta(zip);
     document
 }
@@ -3559,6 +3562,10 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     let mut doc = flow_document(blocks, page_geometry(geom));
     doc.resources.images = resources;
     doc.outline = outline.finish();
+    // Lower `styles.xml`'s `office:styles` paragraph styles into the model's
+    // style table so each paragraph's `style_ref` (set from `text:style-name`)
+    // resolves to a present `NamedStyle`.
+    doc.styles = odf_named_styles(&styles_xml);
     doc.meta = odf_doc_meta(zip);
     doc
 }
@@ -3584,6 +3591,9 @@ fn odf_walk_model(
                 match ln {
                     "h" if !sc => {
                         let style = odf_paragraph_style(&attrs, ctx.para_styles, list_level);
+                        // `text:style-name` → `style_ref` (resolves into the model
+                        // style table built from `office:styles`).
+                        let style_ref = odf_style_ref(&attrs);
                         // `text:outline-level` is 1-based (`1`=top); the model
                         // heading level clamps to 1..6, but the *outline* keeps
                         // the full 0-based depth (`level-1`).
@@ -3606,8 +3616,8 @@ fn odf_walk_model(
                                     level: lvl,
                                     para: Paragraph {
                                         style,
+                                        style_ref,
                                         runs,
-                                        ..Paragraph::default()
                                     },
                                 }),
                                 ..Block::default()
@@ -3617,6 +3627,9 @@ fn odf_walk_model(
                     }
                     "p" if !sc => {
                         let style = odf_paragraph_style(&attrs, ctx.para_styles, list_level);
+                        // `text:style-name` → `style_ref` (resolves into the model
+                        // style table built from `office:styles`).
+                        let style_ref = odf_style_ref(&attrs);
                         // A frame anchored in this paragraph (`draw:frame` →
                         // `draw:text-box`) is captured here and emitted as a
                         // sibling block right after the paragraph.
@@ -3632,8 +3645,8 @@ fn odf_walk_model(
                         }
                         let paragraph = Paragraph {
                             style,
+                            style_ref,
                             runs,
-                            ..Paragraph::default()
                         };
                         match list_level {
                             Some(level) => out.push(Block {
@@ -3708,6 +3721,19 @@ fn odf_paragraph_style(
         .cloned()
         .unwrap_or_default()
         .to_paragraph_style(list_level)
+}
+
+/// A paragraph/heading's `text:style-name` as a model [`StyleId`] for
+/// `Paragraph.style_ref` — the source style reference (named style or, for a
+/// paragraph carrying direct overrides, its automatic style). Resolution against
+/// the model style table is best-effort: a named style is present (built by
+/// [`odf_named_styles`]); an automatic style (declared in `content.xml`) records
+/// the reference without a table entry, mirroring the DOCX `w:pStyle` behaviour.
+/// Absent/empty ⇒ `None`.
+fn odf_style_ref(attrs: &[(String, String)]) -> Option<model::StyleId> {
+    attr(attrs, "style-name")
+        .filter(|n| !n.is_empty())
+        .map(|n| model::StyleId(n.to_string()))
 }
 
 /// The resolved content of a `draw:frame`: a text box (its captured blocks), a
@@ -6902,6 +6928,21 @@ impl DocxStyle {
     }
 }
 
+/// The unresolved identity + own formatting of one `w:style` from
+/// `word/styles.xml`, kept so the named-style **table** can be lowered into
+/// [`Document.styles`](crate::model::Document::styles) without the `basedOn`
+/// flattening that [`DocxStyles::by_id`] applies (the model keeps the
+/// inheritance edge explicitly via [`NamedStyle::based_on`]).
+#[derive(Default, Clone)]
+struct DocxRawStyle {
+    /// `w:style@w:type` (`paragraph`/`character`/`table`/`numbering`).
+    kind: Option<String>,
+    /// `w:basedOn@w:val` — the parent style id (→ [`NamedStyle::based_on`]).
+    based_on: Option<String>,
+    /// The style's **own** `w:pPr`/`w:rPr` formatting (not basedOn-flattened).
+    own: DocxStyle,
+}
+
 /// Resolved DOCX styles: per-style-id formatting with `w:basedOn` chains already
 /// flattened, plus the document defaults (`w:docDefaults`). Built once per
 /// document from `word/styles.xml`.
@@ -6912,6 +6953,11 @@ struct DocxStyles {
     defaults: DocxStyle,
     /// styleId → fully-resolved (basedOn-flattened) formatting.
     by_id: BTreeMap<String, DocxStyle>,
+    /// styleId → unresolved identity + own formatting, in document order, for
+    /// lowering the named-style **table** (`Document.styles`) with `based_on`
+    /// edges intact. Distinct from [`by_id`](DocxStyles::by_id), which is
+    /// flattened for inline paragraph resolution.
+    raw: BTreeMap<String, DocxRawStyle>,
 }
 
 impl DocxStyles {
@@ -6926,20 +6972,109 @@ impl DocxStyles {
         s.fill_from(&self.defaults);
         s
     }
+
+    /// Lower the parsed `w:style` entries into the model's [`StyleTable`] so each
+    /// paragraph's `style_ref` (set from `w:pStyle`) resolves to a present
+    /// [`NamedStyle`]. Only **paragraph** styles are lowered (the model's named
+    /// styles are paragraph+character defaults; `character`/`table`/`numbering`
+    /// styles have no paragraph identity to host and are skipped). Each style's
+    /// **own** `w:pPr`/`w:rPr` is lowered with the same field mappings as direct
+    /// paragraph/run formatting (alignment/spacing/indent/line-height + font/
+    /// size/bold/italic/underline/colour); `w:basedOn` becomes
+    /// [`NamedStyle::based_on`] (the edge is kept, not flattened, so the model
+    /// can resolve inheritance itself). `w:name` (the human display name) has no
+    /// model slot — the [`StyleId`] key carries the machine id — so it is not
+    /// retained.
+    fn to_style_table(&self) -> model::StyleTable {
+        let mut named = BTreeMap::new();
+        for (id, raw) in &self.raw {
+            // Default `w:type` is `paragraph` (ECMA-376 §17.7.4.17), so a missing
+            // `w:type` is treated as a paragraph style.
+            let is_para = raw
+                .kind
+                .as_deref()
+                .map(|k| k == "paragraph")
+                .unwrap_or(true);
+            if !is_para {
+                continue;
+            }
+            named.insert(
+                model::StyleId(id.clone()),
+                model::NamedStyle {
+                    para: docx_style_to_paragraph(&raw.own),
+                    char_: docx_style_to_char(&raw.own),
+                    based_on: raw.based_on.clone().map(model::StyleId),
+                },
+            );
+        }
+        model::StyleTable { named }
+    }
+}
+
+/// Lower a [`DocxStyle`]'s paragraph (`w:pPr`) properties to a model
+/// [`ParagraphStyle`], mirroring [`para_style_model`] (no list-indent: a named
+/// style is not a list context). Unset fields fall back to the model defaults.
+fn docx_style_to_paragraph(s: &DocxStyle) -> ParagraphStyle {
+    ParagraphStyle {
+        align: match s.align {
+            Some("center") => MAlign::Center,
+            Some("right") => MAlign::Right,
+            Some("justify") => MAlign::Justify,
+            _ => MAlign::Left,
+        },
+        space_before_pt: s.space_before_pt.unwrap_or(0.0),
+        space_after_pt: s.space_after_pt.unwrap_or(0.0),
+        indent_left_pt: s.indent_left_pt.unwrap_or(0.0),
+        indent_right_pt: s.indent_right_pt.unwrap_or(0.0),
+        first_line_pt: s.first_line_pt.unwrap_or(0.0),
+        // `DocxStyle::line_height` is the local importer enum; map it to the
+        // model's, exactly as [`para_style_model`].
+        line_height: match s.line_height {
+            Some(LineHeight::Multiple(m)) => MLineHeight::Multiple(m),
+            Some(LineHeight::Points(p)) => MLineHeight::Points(p),
+            None => MLineHeight::Normal,
+        },
+    }
+}
+
+/// Lower a [`DocxStyle`]'s run (`w:rPr`) properties to a model [`CharStyle`],
+/// using the same field mappings as [`apply_named_run_defaults`]
+/// (`w:sz` half-points → points, `w:color` hex → RGB, `w:rFonts` → family +
+/// portable [`Generic`](super::style::Generic) class). Unset fields fall back to
+/// the [`CharStyle`] defaults.
+fn docx_style_to_char(s: &DocxStyle) -> CharStyle {
+    let mut c = CharStyle {
+        bold: s.bold == Some(true),
+        italic: s.italic == Some(true),
+        underline: s.underline == Some(true),
+        size_pt: s.size_half_pt.map(|h| h / 2.0).unwrap_or(0.0),
+        color: s.color.as_deref().and_then(hex_to_rgb_f64),
+        ..CharStyle::default()
+    };
+    if let Some(fam) = &s.font_family {
+        c.generic = super::style::parse_base_font(fam).generic;
+        c.family = fam.clone();
+    }
+    c
 }
 
 /// Parse `word/styles.xml` into a [`DocxStyles`]: read each `w:style`'s direct
 /// `w:rPr`/`w:pPr` and `w:basedOn`, then flatten the inheritance chains so each
 /// id maps to its fully-resolved formatting. `w:docDefaults` seeds the baseline.
 fn parse_docx_styles(xml: &str) -> DocxStyles {
-    // Raw, pre-resolution data per style id: (basedOn, own props).
+    // Raw, pre-resolution data per style id: (basedOn, own props). Used to
+    // flatten the inline-resolution table `by_id`.
     let mut raw: BTreeMap<String, (Option<String>, DocxStyle)> = BTreeMap::new();
+    // Identity + own props per style id, for the model style table (kept with
+    // `basedOn` edges, not flattened).
+    let mut raw_styles: BTreeMap<String, DocxRawStyle> = BTreeMap::new();
     let mut defaults = DocxStyle::default();
 
     let mut x = Xml::new(xml);
     // Walk state.
     let mut cur_id: Option<String> = None;
     let mut cur_based: Option<String> = None;
+    let mut cur_kind: Option<String> = None; // <w:style w:type>
     let mut cur = DocxStyle::default();
     let mut in_style = false;
     let mut in_defaults = false; // inside <w:docDefaults>
@@ -7018,6 +7153,7 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
                     "style" if !sc && !in_defaults => {
                         in_style = true;
                         cur_id = attr(&attrs, "styleId").map(|s| s.to_string());
+                        cur_kind = attr(&attrs, "type").map(|s| s.to_string());
                         cur_based = None;
                         cur = DocxStyle::default();
                     }
@@ -7044,7 +7180,19 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
                 "docDefaults" => in_defaults = false,
                 "style" if in_style => {
                     if let Some(id) = cur_id.take() {
-                        raw.insert(id, (cur_based.take(), std::mem::take(&mut cur)));
+                        let based = cur_based.take();
+                        let own = std::mem::take(&mut cur);
+                        // Keep the identity + own props for the model style table
+                        // (basedOn kept, not flattened).
+                        raw_styles.insert(
+                            id.clone(),
+                            DocxRawStyle {
+                                kind: cur_kind.take(),
+                                based_on: based.clone(),
+                                own: own.clone(),
+                            },
+                        );
+                        raw.insert(id, (based, own));
                     }
                     in_style = false;
                 }
@@ -7079,7 +7227,11 @@ fn parse_docx_styles(xml: &str) -> DocxStyles {
         by_id.insert(id.clone(), resolved);
     }
 
-    DocxStyles { defaults, by_id }
+    DocxStyles {
+        defaults,
+        by_id,
+        raw: raw_styles,
+    }
 }
 
 // ─────────────────────── DOCX list numbering (numbering.xml) ───────────────────
@@ -9553,6 +9705,71 @@ fn pptx_table_cell(
 
 // ════════════════════════════════════ ODF ═════════════════════════════════════
 
+/// Lower a `style:text-properties` element's attributes to a CSS declaration
+/// string the **model** char-style parser ([`odf_css_char_style`]) understands:
+/// `fo:font-weight`/`-style`/`-color`/`-size`, `style:text-underline-style`,
+/// `style:text-line-through-*` (→ strikethrough), `fo:background-color` (run
+/// highlight) and `fo:font-name`/`style:font-name`. Shared by [`odf_text_styles`]
+/// (run styling) and [`odf_named_styles`] (named-style table char defaults) so
+/// the mapping lives in one place. Distinct from [`odf_text_props_css`], which
+/// targets the WYSIWYG HTML render path and omits strike/highlight. An empty
+/// string means no recognised properties.
+fn odf_text_props_char_css(attrs: &[(String, String)]) -> String {
+    let mut css = String::new();
+    if let Some(w) = attr(attrs, "font-weight") {
+        if w == "bold" {
+            css.push_str("font-weight:bold;");
+        }
+    }
+    if let Some(s) = attr(attrs, "font-style") {
+        if s == "italic" || s == "oblique" {
+            css.push_str("font-style:italic;");
+        }
+    }
+    if let Some(c) = attr(attrs, "color") {
+        let hex = c.trim_start_matches('#');
+        if is_hex6(hex) {
+            css.push_str(&format!("color:#{};", hex.to_ascii_uppercase()));
+        }
+    }
+    if let Some(u) = attr(attrs, "text-underline-style") {
+        if u != "none" {
+            css.push_str("text-decoration:underline;");
+        }
+    }
+    // `style:text-line-through-style`/`-type` (≠ none) ⇒ strikethrough. ODF
+    // carries it as its own property, not a CSS `text-decoration`; emit a
+    // `line-through` token the model char-style parser recognises.
+    if odf_line_through_set(attrs) {
+        css.push_str("text-decoration:line-through;");
+    }
+    // `fo:background-color` on a text style ⇒ run highlight
+    // (`CharStyle.background`). `transparent`/`none` ⇒ none.
+    if let Some(bg) = attr(attrs, "background-color") {
+        let b = bg.trim();
+        if !matches!(b, "transparent" | "none" | "") {
+            let hex = b.trim_start_matches('#');
+            if is_hex6(hex) {
+                css.push_str(&format!("background-color:#{};", hex.to_ascii_uppercase()));
+            }
+        }
+    }
+    if let Some(sz) = attr(attrs, "font-size") {
+        if let Some(pt) = parse_odf_pt(sz) {
+            css.push_str(&format!("font-size:{pt}pt;"));
+        }
+    }
+    // `fo:font-name` (or `style:font-name`) → real family so the host embeds the
+    // matching face and uses its metrics.
+    if let Some(fam) = attr(attrs, "font-name") {
+        let family = css_font_family(fam);
+        if !family.is_empty() {
+            css.push_str(&format!("font-family:{family};"));
+        }
+    }
+    css
+}
+
 /// Build a `style-name → CSS` map from the automatic + named text styles in an
 /// ODF part (`content.xml` or `styles.xml`). Captures `fo:font-weight`,
 /// `fo:font-style`, `fo:color`, `fo:font-size` from each
@@ -9570,62 +9787,7 @@ fn odf_text_styles(xml: &str) -> BTreeMap<String, String> {
                 }
                 "text-properties" => {
                     if let Some(nm) = &cur_name {
-                        let mut css = String::new();
-                        if let Some(w) = attr(&attrs, "font-weight") {
-                            if w == "bold" {
-                                css.push_str("font-weight:bold;");
-                            }
-                        }
-                        if let Some(s) = attr(&attrs, "font-style") {
-                            if s == "italic" || s == "oblique" {
-                                css.push_str("font-style:italic;");
-                            }
-                        }
-                        if let Some(c) = attr(&attrs, "color") {
-                            let hex = c.trim_start_matches('#');
-                            if is_hex6(hex) {
-                                css.push_str(&format!("color:#{};", hex.to_ascii_uppercase()));
-                            }
-                        }
-                        if let Some(u) = attr(&attrs, "text-underline-style") {
-                            if u != "none" {
-                                css.push_str("text-decoration:underline;");
-                            }
-                        }
-                        // `style:text-line-through-style`/`-type` (≠ none) ⇒
-                        // strikethrough. ODF carries it as its own property, not a
-                        // CSS `text-decoration`; emit a `line-through` token the
-                        // model char-style parser recognises.
-                        if odf_line_through_set(&attrs) {
-                            css.push_str("text-decoration:line-through;");
-                        }
-                        // `fo:background-color` on a text style ⇒ run highlight
-                        // (`CharStyle.background`). `transparent`/`none` ⇒ none.
-                        if let Some(bg) = attr(&attrs, "background-color") {
-                            let b = bg.trim();
-                            if !matches!(b, "transparent" | "none" | "") {
-                                let hex = b.trim_start_matches('#');
-                                if is_hex6(hex) {
-                                    css.push_str(&format!(
-                                        "background-color:#{};",
-                                        hex.to_ascii_uppercase()
-                                    ));
-                                }
-                            }
-                        }
-                        if let Some(sz) = attr(&attrs, "font-size") {
-                            if let Some(pt) = parse_odf_pt(sz) {
-                                css.push_str(&format!("font-size:{pt}pt;"));
-                            }
-                        }
-                        // `fo:font-name` (or `style:font-name`) → real family so
-                        // the host embeds the matching face and uses its metrics.
-                        if let Some(fam) = attr(&attrs, "font-name") {
-                            let family = css_font_family(fam);
-                            if !family.is_empty() {
-                                css.push_str(&format!("font-family:{family};"));
-                            }
-                        }
+                        let css = odf_text_props_char_css(&attrs);
                         if !css.is_empty() {
                             map.insert(nm.clone(), css);
                         }
@@ -9922,6 +10084,97 @@ fn odf_para_styles(xml: &str) -> BTreeMap<String, OdfParaProps> {
         resolved.insert(name.clone(), acc);
     }
     resolved
+}
+
+/// Build the model's named-style **table** ([`StyleTable`]) from an ODF
+/// `styles.xml` (the `office:styles` part). Each `style:style` of family
+/// `paragraph` becomes a [`NamedStyle`] keyed by its `style:name`
+/// ([`StyleId`]): its `style:paragraph-properties` lower to the para defaults
+/// (the same `fo:*` mappings [`odf_para_styles`] uses, via [`OdfParaProps`]),
+/// its `style:text-properties` lower to the char defaults (the same mappings
+/// run styling uses, via [`odf_text_props_char_css`] → [`odf_css_char_style`]),
+/// and `style:parent-style-name` becomes [`NamedStyle::based_on`] — the
+/// inheritance **edge is kept, not flattened**, so the model resolves it itself
+/// (mirrors the DOCX [`DocxStyles::to_style_table`]).
+///
+/// Only `paragraph`-family styles are lowered: the model's named styles are
+/// paragraph+character defaults, so `text` (run), `table`, `graphic`, … styles
+/// have no paragraph identity to host and are skipped (a `text:span`'s run
+/// styling is still applied inline). `style:display-name` (the human label) has
+/// no model slot — the [`StyleId`] key carries the machine name — so it is not
+/// retained.
+fn odf_named_styles(xml: &str) -> model::StyleTable {
+    let mut named = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    // Per-style accumulation state.
+    let mut cur_name: Option<String> = None;
+    let mut is_para_family = false;
+    let mut parent: Option<String> = None;
+    let mut para = OdfParaProps::default();
+    let mut char_css = String::new();
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => {
+                    cur_name = attr(&attrs, "name").map(str::to_string);
+                    is_para_family = attr(&attrs, "family") == Some("paragraph");
+                    parent = attr(&attrs, "parent-style-name").map(str::to_string);
+                    para = OdfParaProps::default();
+                    char_css = String::new();
+                }
+                // Paragraph formatting (`fo:*`) — same fields as `odf_para_styles`.
+                "paragraph-properties" if is_para_family && cur_name.is_some() => {
+                    if let Some(a) = attr(&attrs, "text-align").and_then(odf_text_align) {
+                        para.align = Some(a);
+                    }
+                    if let Some(v) = attr(&attrs, "margin-top").and_then(parse_odf_pt) {
+                        para.space_before_pt = Some(v.max(0.0));
+                    }
+                    if let Some(v) = attr(&attrs, "margin-bottom").and_then(parse_odf_pt) {
+                        para.space_after_pt = Some(v.max(0.0));
+                    }
+                    if let Some(v) = attr(&attrs, "margin-left").and_then(parse_odf_pt) {
+                        para.indent_left_pt = Some(v);
+                    }
+                    if let Some(v) = attr(&attrs, "margin-right").and_then(parse_odf_pt) {
+                        para.indent_right_pt = Some(v);
+                    }
+                    if let Some(v) = attr(&attrs, "text-indent").and_then(parse_odf_pt) {
+                        para.first_line_pt = Some(v);
+                    }
+                    if let Some(lh) = attr(&attrs, "line-height").and_then(odf_line_height) {
+                        para.line_height = Some(lh);
+                    }
+                }
+                // Run defaults (`fo:*`/`style:*`) — same fields as run styling.
+                "text-properties" if is_para_family && cur_name.is_some() => {
+                    char_css = odf_text_props_char_css(&attrs);
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    if let (true, Some(nm)) = (is_para_family, cur_name.take()) {
+                        named.insert(
+                            model::StyleId(nm),
+                            model::NamedStyle {
+                                // No list context for a named style ⇒ no list indent.
+                                para: para.to_paragraph_style(None),
+                                char_: odf_css_char_style(&char_css),
+                                based_on: parent.take().map(model::StyleId),
+                            },
+                        );
+                    }
+                    is_para_family = false;
+                    parent = None;
+                    para = OdfParaProps::default();
+                    char_css = String::new();
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    model::StyleTable { named }
 }
 
 /// Build a `cell-style-name → background RGB` map from an ODF part: each
@@ -14751,6 +15004,112 @@ mod tests {
         assert!((s.first_line_pt - 12.0).abs() < 1e-6, "firstLine: {s:?}");
     }
 
+    /// Build a DOCX whose `word/styles.xml` is `styles_xml` (added verbatim via
+    /// `build_docx`'s media slot) alongside `document_xml`.
+    fn build_docx_with_styles(document_xml: &str, styles_xml: &str) -> Vec<u8> {
+        build_docx(
+            document_xml,
+            None,
+            &[("word/styles.xml", styles_xml.as_bytes().to_vec())],
+        )
+    }
+
+    #[test]
+    fn docx_model_named_style_table_lowered_and_style_ref_resolves() {
+        // `word/styles.xml` defines `Normal` and a `Heading1` (basedOn Normal,
+        // bold, centred, 16pt). Each `w:style w:type="paragraph"` must become a
+        // `NamedStyle` in `Document.styles`, with `w:basedOn` kept as `based_on`
+        // (not flattened). A paragraph `w:pStyle w:val="Heading1"` must carry a
+        // `style_ref` that resolves into the table.
+        let styles = r#"<?xml version="1.0"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
+  <w:style w:type="paragraph" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:jc w:val="center"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="32"/></w:rPr>
+  </w:style>
+  <w:style w:type="character" w:styleId="Emphasis">
+    <w:name w:val="Emphasis"/>
+    <w:rPr><w:i/></w:rPr>
+  </w:style>
+</w:styles>"#;
+        let doc = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Big Title</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx_with_styles(doc, styles);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        // The named-style table holds the two paragraph styles; the character
+        // style (`Emphasis`) is skipped (no paragraph identity to host).
+        let h1 = model
+            .styles
+            .named
+            .get(&model::StyleId("Heading1".to_string()))
+            .expect("Heading1 lowered into Document.styles");
+        assert_eq!(
+            h1.based_on,
+            Some(model::StyleId("Normal".to_string())),
+            "w:basedOn → based_on (kept, not flattened)"
+        );
+        assert!(h1.char_.bold, "w:b → bold");
+        assert!((h1.char_.size_pt - 16.0).abs() < 1e-6, "w:sz 32 → 16pt");
+        assert_eq!(h1.para.align, MAlign::Center, "w:jc center → Center");
+        assert!(
+            model
+                .styles
+                .named
+                .contains_key(&model::StyleId("Normal".to_string())),
+            "Normal lowered too"
+        );
+        assert!(
+            !model
+                .styles
+                .named
+                .contains_key(&model::StyleId("Emphasis".to_string())),
+            "character style not lowered into the paragraph style table"
+        );
+
+        // The paragraph's style_ref points at Heading1 and resolves in the table.
+        let para = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Heading(h) => Some(&h.para),
+                BlockKind::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("a heading/paragraph block");
+        let sref = para.style_ref.clone().expect("style_ref set from w:pStyle");
+        assert_eq!(sref, model::StyleId("Heading1".to_string()));
+        assert!(
+            model.styles.named.contains_key(&sref),
+            "style_ref must resolve into Document.styles (no dangling id)"
+        );
+    }
+
+    #[test]
+    fn docx_model_no_styles_xml_yields_empty_style_table() {
+        // A DOCX without `word/styles.xml` must lower to an empty style table
+        // (no panic, no spurious entries).
+        let doc = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Plain</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        assert!(
+            model.styles.named.is_empty(),
+            "no styles.xml ⇒ empty style table, got {:?}",
+            model.styles.named
+        );
+    }
+
     #[test]
     fn docx_model_table_borders_shading_height_and_span_lowered() {
         // `w:tblBorders` → the table-wide BorderStyle; `w:tcPr/w:shd@w:fill` →
@@ -15479,6 +15838,103 @@ mod tests {
             (style.indent_left_pt - 56.6929).abs() < 0.01,
             "2cm inherited from the parent (got {})",
             style.indent_left_pt
+        );
+    }
+
+    #[test]
+    fn odt_model_named_style_table_lowered_and_style_ref_resolves() {
+        // `styles.xml`'s `office:styles` declares a `Heading_20_1` paragraph
+        // style (parent `Standard`, bold, centred, 16pt). It must lower to a
+        // `NamedStyle` in `Document.styles` with `style:parent-style-name` kept
+        // as `based_on`. A `text:p text:style-name="Heading_20_1"` must carry a
+        // `style_ref` that resolves into the table. A `text` (run) family style
+        // is not lowered into the paragraph style table.
+        let styles_xml = r#"<?xml version="1.0"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+  xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0">
+  <office:styles>
+    <style:style style:name="Standard" style:family="paragraph">
+      <style:paragraph-properties fo:margin-left="1cm"/>
+    </style:style>
+    <style:style style:name="Heading_20_1" style:display-name="Heading 1"
+        style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:text-align="center"/>
+      <style:text-properties fo:font-weight="bold" fo:font-size="16pt"/>
+    </style:style>
+    <style:style style:name="Strong" style:family="text">
+      <style:text-properties fo:font-weight="bold"/>
+    </style:style>
+  </office:styles>
+</office:document-styles>"#;
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:h text:style-name="Heading_20_1" text:outline-level="1">Big Title</text:h>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[("styles.xml", styles_xml.as_bytes().to_vec())]);
+
+        let h1 = model
+            .styles
+            .named
+            .get(&model::StyleId("Heading_20_1".to_string()))
+            .expect("Heading_20_1 lowered into Document.styles");
+        assert_eq!(
+            h1.based_on,
+            Some(model::StyleId("Standard".to_string())),
+            "style:parent-style-name → based_on (kept, not flattened)"
+        );
+        assert!(h1.char_.bold, "fo:font-weight bold → bold");
+        assert!((h1.char_.size_pt - 16.0).abs() < 1e-6, "fo:font-size 16pt");
+        assert_eq!(h1.para.align, model::style::Align::Center, "fo:text-align");
+        assert!(
+            model
+                .styles
+                .named
+                .contains_key(&model::StyleId("Standard".to_string())),
+            "Standard lowered too"
+        );
+        assert!(
+            !model
+                .styles
+                .named
+                .contains_key(&model::StyleId("Strong".to_string())),
+            "text (run) family style not lowered into the paragraph style table"
+        );
+
+        // The heading paragraph's style_ref points at the named style and resolves.
+        let para = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Heading(h) => Some(&h.para),
+                BlockKind::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("a heading/paragraph block");
+        let sref = para
+            .style_ref
+            .clone()
+            .expect("style_ref set from text:style-name");
+        assert_eq!(sref, model::StyleId("Heading_20_1".to_string()));
+        assert!(
+            model.styles.named.contains_key(&sref),
+            "style_ref must resolve into Document.styles (no dangling id)"
+        );
+    }
+
+    #[test]
+    fn odt_model_no_styles_xml_yields_empty_style_table() {
+        // An ODT without a `styles.xml` part must lower to an empty style table
+        // (no panic, no spurious entries).
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text><text:p>Plain</text:p></office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        assert!(
+            model.styles.named.is_empty(),
+            "no styles.xml ⇒ empty style table, got {:?}",
+            model.styles.named
         );
     }
 
