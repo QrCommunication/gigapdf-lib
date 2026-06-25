@@ -29,18 +29,48 @@ PDF → X:  PDF ──► model ──► file  (pdf.toDocx() etc. — reconstru
 
 | Source | Status | What survives | Main drops |
 |--------|--------|---------------|------------|
-| **DOCX** | Rich | text & runs, bold/italic/underline/strike, font/size/colour/highlight, headings & named styles, alignment/indent/spacing, lists (marker + ordinal + nesting), tables (cells + shading), images (PNG/JPEG/WebP), external hyperlinks | **headers/footers**, footnotes/endnotes, comments, track-changes, embedded OLE; multi-row vMerge approximated; internal anchors → page 0 |
-| **ODT** | Rich | text & runs, char styling, headings, lists, tables (cells), images, hyperlinks | **headers/footers**, paragraph align/indent/spacing, numbered lists become bullets, table spans/borders/widths |
-| **XLSX** | Rich | cell values & types, **formulas** (kept as text), merged cells, multiple sheets, number formats, cell fills | per-cell **font/size/colour** (hardcoded default), column widths |
-| **ODS** | Good | cell values, formulas (text), multiple sheets | merges, number formats, fills, column widths |
-| **PPTX** | Good | slides, text boxes, shapes (geometry + rotation + groups), runs (bold/italic/colour), images, charts→table of cached data, SmartArt→bullet list | underline/strike/highlight, paragraph align/indent, lists-as-lists, run hyperlinks, **animations/transitions**, **speaker notes**, non-text autoshapes |
-| **ODP** | Good | slides, text boxes, shapes (pos + groups), runs (full char styling), images | shape rotation, charts/SmartArt, animations, speaker notes, paragraph props |
+| **DOCX** | Rich | text & runs, bold/italic/underline/strike, font/size/colour/highlight, headings & named styles, alignment/indent/spacing, lists (marker + ordinal + nesting), tables (cells + shading), images (PNG/JPEG/WebP), external hyperlinks, **full document metadata** (`docProps/core.xml` + `app.xml`, see *Document metadata* below) | **headers/footers**, footnotes/endnotes, comments, track-changes, embedded OLE; multi-row vMerge approximated; internal anchors → page 0 |
+| **ODT** | Rich | text & runs, char styling, headings, lists, tables (cells), images, hyperlinks, **full document metadata** (`meta.xml`) | **headers/footers**, paragraph align/indent/spacing, numbered lists become bullets, table spans/borders/widths |
+| **XLSX** | Rich | cell values & types, **formulas** (kept as text), merged cells, multiple sheets, number formats, cell fills, **document metadata** (`docProps/core.xml`) | per-cell **font/size/colour** (hardcoded default), column widths |
+| **ODS** | Good | cell values, formulas (text), multiple sheets, **document metadata** (`meta.xml`) | merges, number formats, fills, column widths |
+| **PPTX** | Good | slides, text boxes, shapes (geometry + rotation + groups), runs (bold/italic/colour), images, charts→table of cached data, SmartArt→bullet list, **document metadata** (`docProps/core.xml`) | underline/strike/highlight, paragraph align/indent, lists-as-lists, run hyperlinks, **animations/transitions**, **speaker notes**, non-text autoshapes |
+| **ODP** | Good | slides, text boxes, shapes (pos + groups), runs (full char styling), images, **document metadata** (`meta.xml`) | shape rotation, charts/SmartArt, animations, speaker notes, paragraph props |
 | **DOC / XLS / PPT** (legacy OLE2) | **Text only** | flat plain text (largest stream, UTF‑16/ASCII) | **everything else** — styling, tables, sheets, slides, images, structure. A real binary reader is needed (tracked) |
 | **Markdown** | Good | ATX headings, bold/italic/code, links, ordered/unordered nested lists, GFM tables, fenced code, blockquotes, HR | strikethrough `~~`, images `![]()`, task-lists, reference/footnote links, setext headings, inline HTML (pass through as text) |
 | **CSV** | Full | quoting/escaping (RFC 4180), embedded delimiters/newlines, BOM, delimiter auto-detect, ragged rows padded | type inference (all cells are text), multi-sheet (CSV has none) |
 | **RTF → PDF** | Rich | full char/para formatting, fonts, colours, tables, PNG/JPEG pictures | hyperlinks, WMF/EMF/BMP pictures, nested tables |
 | **RTF → model** | **Text only** | plain paragraphs (uses the text parser, not the rich one — tracked) | all styling/tables/images/links |
 | **HTML** | — | see [HTML-CSS.md](HTML-CSS.md) for the full HTML/CSS feature surface | — |
+
+### Document metadata
+
+Office import reads the container's metadata part **in full** into the model's
+`DocMeta`, closing the round-trip with the exporter (which already *writes* these
+parts from `DocMeta`). For OOXML both `docProps/core.xml` and `docProps/app.xml`
+are read; for ODF, `meta.xml`. The mapping:
+
+| `DocMeta` field | OOXML | ODF (`meta.xml`) |
+|-----------------|-------|------------------|
+| `title`            | `dc:title`     | `dc:title` |
+| `author`           | `dc:creator`   | `dc:creator` |
+| `subject`          | `dc:subject`   | `dc:subject` |
+| `keywords`         | `cp:keywords` (one string, split on `,`/`;`) | each `meta:keyword` element |
+| `lang`             | `dc:language`  | `dc:language` |
+| `description`      | `dc:description` | `dc:description` |
+| `created`          | `dcterms:created`  | `meta:creation-date` |
+| `modified`         | `dcterms:modified` | `dc:date` |
+| `last_modified_by` | `cp:lastModifiedBy` | — |
+| `revision`         | `cp:revision`  | — |
+| `application`      | `app.xml` `<Application>` | — |
+| `company`          | `app.xml` `<Company>` | — |
+| `generator`        | — | `meta:generator` |
+| `editing_cycles`   | — | `meta:editing-cycles` |
+
+Dates are stored as their raw ISO-8601 / W3CDTF source text (no date type is
+introduced); `revision` and `editing_cycles` are likewise kept verbatim as
+strings. A missing or empty metadata part yields a default (empty) `DocMeta` —
+never an error. All of this then flows through to any re-export and to the JSON
+model (`officeToModel` / `gp_model_from_office`).
 
 ---
 

@@ -6735,6 +6735,9 @@ impl Document {
                 .and_then(Object::as_string)
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .filter(|s| !s.is_empty()),
+            // Extended OOXML/ODF metadata fields have no PDF Info equivalent
+            // here; default them (the Office importer populates them instead).
+            ..DocMeta::default()
         };
 
         // Outline (bookmarks → chapter hierarchy). Prefer the PDF's own

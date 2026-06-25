@@ -6775,6 +6775,7 @@ mod tests {
                 subject: Some("Quarterly".to_string()),
                 keywords: vec!["alpha".to_string(), "beta".to_string()],
                 lang: Some("fr-FR".to_string()),
+                ..Default::default()
             },
             sections: vec![Section {
                 pages: vec![Page {

@@ -259,6 +259,23 @@ impl Writer {
         self.key("keywords");
         self.str_array(&m.keywords);
         self.k_opt_str("lang", &m.lang);
+        // Extended properties: emit each only when present (empty ⇒ absent), so
+        // a document with no extra metadata serializes exactly as before.
+        for (k, v) in [
+            ("description", &m.description),
+            ("created", &m.created),
+            ("modified", &m.modified),
+            ("lastModifiedBy", &m.last_modified_by),
+            ("revision", &m.revision),
+            ("application", &m.application),
+            ("company", &m.company),
+            ("generator", &m.generator),
+            ("editingCycles", &m.editing_cycles),
+        ] {
+            if !v.is_empty() {
+                self.k_str(k, v);
+            }
+        }
         self.obj_close();
     }
 
@@ -1330,6 +1347,15 @@ impl<'a> Reader<'a> {
                 "subject" => m.subject = r.opt_string()?,
                 "keywords" => m.keywords = r.array(Reader::string)?,
                 "lang" => m.lang = r.opt_string()?,
+                "description" => m.description = r.string()?,
+                "created" => m.created = r.string()?,
+                "modified" => m.modified = r.string()?,
+                "lastModifiedBy" => m.last_modified_by = r.string()?,
+                "revision" => m.revision = r.string()?,
+                "application" => m.application = r.string()?,
+                "company" => m.company = r.string()?,
+                "generator" => m.generator = r.string()?,
+                "editingCycles" => m.editing_cycles = r.string()?,
                 _ => return None,
             }
             Some(())
@@ -2689,6 +2715,16 @@ mod tests {
                 subject: Some("model/json".to_string()),
                 keywords: vec!["pdf".to_string(), "café".to_string(), "🎯".to_string()],
                 lang: Some("en".to_string()),
+                // Extended metadata must also survive the JSON round-trip.
+                description: "A round-trip fixture".to_string(),
+                created: "2020-01-01T00:00:00Z".to_string(),
+                modified: "2020-12-31T23:59:59Z".to_string(),
+                last_modified_by: "Tester".to_string(),
+                revision: "2".to_string(),
+                application: "GigaPDF".to_string(),
+                company: "ACME".to_string(),
+                generator: "model/json".to_string(),
+                editing_cycles: "5".to_string(),
             },
             styles: StyleTable { named },
             sections: vec![Section {

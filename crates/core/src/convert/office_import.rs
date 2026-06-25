@@ -210,8 +210,8 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
 
 use crate::model::style::{Align as MAlign, LineHeight as MLineHeight};
 use crate::model::{
-    self, Block, BlockKind, Cell, CharStyle, Document, Heading, Inline, InlineRun, List, ListItem,
-    ListMarker, PageGeometry, Paragraph, ParagraphStyle, Row, Section, Sheet, SheetBlock,
+    self, Block, BlockKind, Cell, CharStyle, DocMeta, Document, Heading, Inline, InlineRun, List,
+    ListItem, ListMarker, PageGeometry, Paragraph, ParagraphStyle, Row, Section, Sheet, SheetBlock,
     SheetCell, SheetRow, Slide, SlideBlock, Table,
 };
 
@@ -452,6 +452,174 @@ pub fn office_to_model(bytes: &[u8]) -> Option<Document> {
     }
 }
 
+// ───────────────────────────────── document metadata ─────────────────────────
+//
+// Both family of containers carry a document-metadata part that the importers
+// must surface into [`DocMeta`] (otherwise the metadata is silently dropped on
+// import — the inverse of the export side, which writes these very parts from
+// `doc.meta`, see `export_model::ooxml_core_props`/`odf_meta_xml`).
+//
+// The full property set is read. The core five (`title`/`author`/`subject`/
+// `keywords`/`lang`) are mapped, and the extended properties land in the
+// matching [`DocMeta`] string fields: OOXML `dc:description`,
+// `dcterms:created`/`dcterms:modified`, `cp:lastModifiedBy`, `cp:revision`
+// (from `core.xml`) and `<Application>`/`<Company>` (from `app.xml`); ODF
+// `dc:description`, `meta:creation-date`, `dc:date`, `meta:generator`,
+// `meta:editing-cycles` (plus the Dublin-Core fields ODF shares with OOXML).
+// Dates are kept as their raw ISO-8601 / W3CDTF source text.
+
+/// Read OOXML document metadata into a [`DocMeta`] from a package: Dublin-Core
+/// `docProps/core.xml` (ECMA-376 §15.2.12.1) plus `docProps/app.xml`
+/// (§15.2.12.2). Core part: `dc:title`→title, `dc:creator`→author,
+/// `dc:subject`→subject, `dc:language`→lang, `cp:keywords`→`keywords` (a single
+/// delimited string, split on `,`/`;`), `dc:description`→description,
+/// `dcterms:created`→created, `dcterms:modified`→modified,
+/// `cp:lastModifiedBy`→last_modified_by, `cp:revision`→revision. App part:
+/// `Application`→application, `Company`→company. Missing parts / fields ⇒ the
+/// corresponding values stay unset (empty).
+fn ooxml_doc_meta(zip: &BTreeMap<String, Vec<u8>>) -> DocMeta {
+    let mut meta = DocMeta::default();
+    if let Some(core) = zip.get("docProps/core.xml") {
+        let core = String::from_utf8_lossy(core);
+        let mut x = Xml::new(&core);
+        while let Some(tok) = x.next() {
+            if let Tok::Open(name, _, sc) = tok {
+                if sc {
+                    continue;
+                }
+                // The OOXML core part is flat: each property is a direct child of
+                // `cp:coreProperties`. Dispatch on the local name (namespace
+                // prefix ignored) and pull the element's text content; empty
+                // strings are treated as "unset".
+                let ln = local(&name).to_string();
+                match ln.as_str() {
+                    "title" => set_opt(&mut meta.title, xml_text_until(&mut x, &ln)),
+                    "creator" => set_opt(&mut meta.author, xml_text_until(&mut x, &ln)),
+                    "subject" => set_opt(&mut meta.subject, xml_text_until(&mut x, &ln)),
+                    "language" => set_opt(&mut meta.lang, xml_text_until(&mut x, &ln)),
+                    "description" => set_str(&mut meta.description, xml_text_until(&mut x, &ln)),
+                    "created" => set_str(&mut meta.created, xml_text_until(&mut x, &ln)),
+                    "modified" => set_str(&mut meta.modified, xml_text_until(&mut x, &ln)),
+                    "lastModifiedBy" => {
+                        set_str(&mut meta.last_modified_by, xml_text_until(&mut x, &ln))
+                    }
+                    "revision" => set_str(&mut meta.revision, xml_text_until(&mut x, &ln)),
+                    "keywords" => {
+                        let raw = xml_text_until(&mut x, &ln);
+                        if meta.keywords.is_empty() {
+                            meta.keywords = split_keywords(&raw);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Extended properties live in a separate part. `<Application>`/`<Company>`
+    // are unprefixed in the extended-properties namespace.
+    if let Some(app) = zip.get("docProps/app.xml") {
+        let app = String::from_utf8_lossy(app);
+        let mut x = Xml::new(&app);
+        while let Some(tok) = x.next() {
+            if let Tok::Open(name, _, sc) = tok {
+                if sc {
+                    continue;
+                }
+                let ln = local(&name).to_string();
+                match ln.as_str() {
+                    "Application" => set_str(&mut meta.application, xml_text_until(&mut x, &ln)),
+                    "Company" => set_str(&mut meta.company, xml_text_until(&mut x, &ln)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    meta
+}
+
+/// Read ODF document metadata into a [`DocMeta`] from `meta.xml`
+/// (`office:document-meta`→`office:meta`, ISO 26300 §3/§4). Maps `dc:title`→
+/// title, `dc:creator`→author, `dc:subject`→subject, `dc:language`→lang,
+/// `dc:description`→description, `meta:creation-date`→created, `dc:date`→
+/// modified, `meta:generator`→generator, `meta:editing-cycles`→editing_cycles,
+/// and each repeated `meta:keyword` element → one keyword. Dates keep their raw
+/// W3CDTF text. Missing part / fields ⇒ unset (empty).
+fn odf_doc_meta(zip: &BTreeMap<String, Vec<u8>>) -> DocMeta {
+    let mut meta = DocMeta::default();
+    let Some(part) = zip.get("meta.xml") else {
+        return meta;
+    };
+    let part = String::from_utf8_lossy(part);
+    let mut x = Xml::new(&part);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, _, sc) = tok {
+            if sc {
+                continue;
+            }
+            // `dc:date` (local `date`) is ODF's last-modified timestamp;
+            // `meta:creation-date` (local `creation-date`) is the created one.
+            let ln = local(&name).to_string();
+            match ln.as_str() {
+                "title" => set_opt(&mut meta.title, xml_text_until(&mut x, &ln)),
+                "creator" => set_opt(&mut meta.author, xml_text_until(&mut x, &ln)),
+                "subject" => set_opt(&mut meta.subject, xml_text_until(&mut x, &ln)),
+                "language" => set_opt(&mut meta.lang, xml_text_until(&mut x, &ln)),
+                "description" => set_str(&mut meta.description, xml_text_until(&mut x, &ln)),
+                "creation-date" => set_str(&mut meta.created, xml_text_until(&mut x, &ln)),
+                "date" => set_str(&mut meta.modified, xml_text_until(&mut x, &ln)),
+                "generator" => set_str(&mut meta.generator, xml_text_until(&mut x, &ln)),
+                "editing-cycles" => set_str(&mut meta.editing_cycles, xml_text_until(&mut x, &ln)),
+                // ODF stores each keyword as its own `meta:keyword` element.
+                "keyword" => {
+                    let kw = xml_text_until(&mut x, &ln).trim().to_string();
+                    if !kw.is_empty() && !meta.keywords.contains(&kw) {
+                        meta.keywords.push(kw);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    meta
+}
+
+/// Set an `Option<String>` `slot` to `value` only if `value` is non-empty (after
+/// trimming) and the slot is still unset — so the first non-empty occurrence
+/// wins and blank elements never clobber a real value.
+fn set_opt(slot: &mut Option<String>, value: String) {
+    if slot.is_some() {
+        return;
+    }
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        *slot = Some(trimmed.to_string());
+    }
+}
+
+/// Set a `String` `slot` (empty = absent) to `value` only if the slot is still
+/// empty and `value` is non-empty after trimming — first non-empty wins.
+fn set_str(slot: &mut String, value: String) {
+    if !slot.is_empty() {
+        return;
+    }
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        *slot = trimmed.to_string();
+    }
+}
+
+/// Split an OOXML `cp:keywords` string into individual keywords. The standard
+/// leaves the delimiter to the producer; the common ones are comma and
+/// semicolon (the engine's own exporter joins with `", "`). Whitespace-only
+/// fragments are dropped and surrounding whitespace trimmed.
+fn split_keywords(raw: &str) -> Vec<String> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Wrap a flat list of flow blocks in a one-section, one-page [`Document`] with
 /// the given page geometry (the common shape for prose: DOCX/ODT).
 fn flow_document(blocks: Vec<Block>, geom: PageGeometry) -> Document {
@@ -506,6 +674,7 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     );
     let mut document = flow_document(blocks, page_geometry(geom));
     document.resources.images = resources;
+    document.meta = ooxml_doc_meta(zip);
     document
 }
 
@@ -1187,7 +1356,9 @@ pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         kind: BlockKind::Sheet(SheetBlock { sheets }),
         ..Block::default()
     };
-    flow_document(vec![block], page_geometry(PageGeom::tabular_default()))
+    let mut doc = flow_document(vec![block], page_geometry(PageGeom::tabular_default()));
+    doc.meta = ooxml_doc_meta(zip);
+    doc
 }
 
 /// Build one model [`Sheet`] from a worksheet XML, reusing [`parse_merges`] and
@@ -1639,6 +1810,7 @@ pub fn pptx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     };
     let mut doc = flow_document(vec![block], page_geometry(geom));
     doc.resources.images = resources;
+    doc.meta = ooxml_doc_meta(zip);
     doc
 }
 
@@ -2998,6 +3170,7 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     );
     let mut doc = flow_document(blocks, page_geometry(geom));
     doc.resources.images = resources;
+    doc.meta = odf_doc_meta(zip);
     doc
 }
 
@@ -3594,7 +3767,9 @@ pub fn ods_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         kind: BlockKind::Sheet(SheetBlock { sheets }),
         ..Block::default()
     };
-    flow_document(vec![block], page_geometry(geom))
+    let mut doc = flow_document(vec![block], page_geometry(geom));
+    doc.meta = odf_doc_meta(zip);
+    doc
 }
 
 /// Build one model [`Sheet`] from a `table:table` (its open already consumed):
@@ -3830,6 +4005,7 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     };
     let mut doc = flow_document(vec![block], page_geometry(geom));
     doc.resources.images = resources;
+    doc.meta = odf_doc_meta(zip);
     doc
 }
 
@@ -11060,6 +11236,135 @@ mod tests {
     fn red_png() -> Vec<u8> {
         let rgba = [255u8, 0, 0, 255].repeat(16);
         crate::raster::png::encode_png(4, 4, &rgba)
+    }
+
+    // ── document metadata (issue #29) ──
+
+    fn zip_one(name: &str, body: &[u8]) -> BTreeMap<String, Vec<u8>> {
+        let mut z = ZipWriter::new();
+        z.add_stored(name, body);
+        read_zip(&z.finish())
+    }
+
+    /// `ooxml_doc_meta` maps the core fields, splits `cp:keywords` on commas,
+    /// and reads the extended core properties (description, created/modified,
+    /// last-modified-by, revision) plus `Application`/`Company` from `app.xml`;
+    /// namespace prefixes are ignored.
+    #[test]
+    fn ooxml_doc_meta_maps_core_fields() {
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "docProps/core.xml",
+            br#"<cp:coreProperties xmlns:cp="c" xmlns:dc="d" xmlns:dcterms="t">
+              <dc:title>Doc Title</dc:title>
+              <dc:creator>The Author</dc:creator>
+              <dc:subject>The Subject</dc:subject>
+              <dc:description>An abstract</dc:description>
+              <cp:keywords>one, two , three</cp:keywords>
+              <dc:language>de-DE</dc:language>
+              <cp:lastModifiedBy>Editor Name</cp:lastModifiedBy>
+              <cp:revision>12</cp:revision>
+              <dcterms:created>2021-02-03T04:05:06Z</dcterms:created>
+              <dcterms:modified>2021-07-08T09:10:11Z</dcterms:modified>
+            </cp:coreProperties>"#,
+        );
+        z.add_stored(
+            "docProps/app.xml",
+            br#"<Properties xmlns="e"><Application>GigaWord</Application><Company>ACME</Company></Properties>"#,
+        );
+        let zip = read_zip(&z.finish());
+        let m = ooxml_doc_meta(&zip);
+        assert_eq!(m.title.as_deref(), Some("Doc Title"));
+        assert_eq!(m.author.as_deref(), Some("The Author"));
+        assert_eq!(m.subject.as_deref(), Some("The Subject"));
+        assert_eq!(m.lang.as_deref(), Some("de-DE"));
+        assert_eq!(m.keywords, vec!["one", "two", "three"]);
+        assert_eq!(m.description, "An abstract");
+        assert_eq!(m.last_modified_by, "Editor Name");
+        assert_eq!(m.revision, "12");
+        assert_eq!(m.created, "2021-02-03T04:05:06Z");
+        assert_eq!(m.modified, "2021-07-08T09:10:11Z");
+        assert_eq!(m.application, "GigaWord");
+        assert_eq!(m.company, "ACME");
+    }
+
+    /// Semicolon is also accepted as a `cp:keywords` delimiter, and blank /
+    /// whitespace-only fields never produce a value.
+    #[test]
+    fn ooxml_doc_meta_semicolons_and_blanks() {
+        let zip = zip_one(
+            "docProps/core.xml",
+            br#"<cp:coreProperties xmlns:cp="c" xmlns:dc="d">
+              <dc:title>  </dc:title>
+              <cp:keywords>a; b ;; c</cp:keywords>
+            </cp:coreProperties>"#,
+        );
+        let m = ooxml_doc_meta(&zip);
+        assert_eq!(m.title, None, "whitespace-only title stays unset");
+        assert_eq!(m.keywords, vec!["a", "b", "c"]);
+        assert_eq!(m.author, None);
+    }
+
+    /// A missing `docProps/core.xml` ⇒ a default `DocMeta` (no panic).
+    #[test]
+    fn ooxml_doc_meta_absent_part_is_default() {
+        let zip = zip_one("word/document.xml", b"<w:document/>");
+        assert_eq!(ooxml_doc_meta(&zip), DocMeta::default());
+    }
+
+    /// `odf_doc_meta` maps the Dublin-Core fields, collects each repeated
+    /// `meta:keyword` element (de-duplicating and skipping blanks), and reads
+    /// the extended properties: `meta:generator`→generator,
+    /// `meta:creation-date`→created, `dc:date`→modified, `dc:description`→
+    /// description, `meta:editing-cycles`→editing_cycles.
+    #[test]
+    fn odf_doc_meta_maps_fields_and_keywords() {
+        let zip = zip_one(
+            "meta.xml",
+            br#"<office:document-meta xmlns:office="o" xmlns:meta="m" xmlns:dc="d">
+              <office:meta>
+                <meta:generator>Writer/1.0</meta:generator>
+                <dc:title>ODF Title</dc:title>
+                <dc:creator>ODF Author</dc:creator>
+                <dc:subject>ODF Subject</dc:subject>
+                <dc:description>ODF abstract</dc:description>
+                <dc:language>es</dc:language>
+                <meta:creation-date>2019-12-31T23:59:59</meta:creation-date>
+                <dc:date>2020-05-05T05:05:05</dc:date>
+                <meta:editing-cycles>3</meta:editing-cycles>
+                <meta:keyword>kw1</meta:keyword>
+                <meta:keyword> </meta:keyword>
+                <meta:keyword>kw2</meta:keyword>
+                <meta:keyword>kw1</meta:keyword>
+              </office:meta>
+            </office:document-meta>"#,
+        );
+        let m = odf_doc_meta(&zip);
+        assert_eq!(m.title.as_deref(), Some("ODF Title"));
+        assert_eq!(m.author.as_deref(), Some("ODF Author"));
+        assert_eq!(m.subject.as_deref(), Some("ODF Subject"));
+        assert_eq!(m.lang.as_deref(), Some("es"));
+        assert_eq!(m.keywords, vec!["kw1", "kw2"], "blanks skipped, deduped");
+        assert_eq!(m.description, "ODF abstract");
+        assert_eq!(m.generator, "Writer/1.0");
+        assert_eq!(m.created, "2019-12-31T23:59:59");
+        assert_eq!(m.modified, "2020-05-05T05:05:05");
+        assert_eq!(m.editing_cycles, "3");
+    }
+
+    /// A missing `meta.xml` ⇒ a default `DocMeta` (no panic).
+    #[test]
+    fn odf_doc_meta_absent_part_is_default() {
+        let zip = zip_one("content.xml", b"<office:document-content/>");
+        assert_eq!(odf_doc_meta(&zip), DocMeta::default());
+    }
+
+    #[test]
+    fn split_keywords_trims_and_drops_empties() {
+        assert_eq!(split_keywords("a, b;c"), vec!["a", "b", "c"]);
+        assert_eq!(split_keywords("  solo  "), vec!["solo"]);
+        assert!(split_keywords("  ,; ").is_empty());
+        assert!(split_keywords("").is_empty());
     }
 
     // ── streaming XML walker ──

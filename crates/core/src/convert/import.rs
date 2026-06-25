@@ -354,7 +354,7 @@ fn fnv1a(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use crate::convert::zip::ZipWriter;
-    use crate::model::{BlockKind, CellValue, PlaceholderRole};
+    use crate::model::{BlockKind, CellValue, DocMeta, PlaceholderRole};
 
     /// A tiny valid PNG (3×2 red) for the image-import fixture.
     fn red_png(w: u32, h: u32) -> Vec<u8> {
@@ -593,6 +593,146 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(joined.contains("Hello") && joined.contains("World"));
+    }
+
+    // ── document metadata → DocMeta (issue #29) ──
+
+    /// A DOCX `docProps/core.xml` + `app.xml` populate the full model `DocMeta`:
+    /// the core five (title/author/subject/keywords/lang) **and** the extended
+    /// properties (description, created/modified dates, last-modified-by,
+    /// revision, application, company).
+    #[test]
+    fn docx_model_reads_core_xml_metadata() {
+        let core = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>Quarterly Report</dc:title>
+  <dc:creator>Ada Lovelace</dc:creator>
+  <dc:subject>Finance</dc:subject>
+  <dc:description>Q3 financial summary</dc:description>
+  <cp:keywords>budget, q3, revenue</cp:keywords>
+  <dc:language>en-GB</dc:language>
+  <cp:lastModifiedBy>Charles Babbage</cp:lastModifiedBy>
+  <cp:revision>4</cp:revision>
+  <dcterms:created xsi:type="dcterms:W3CDTF">2020-01-01T09:00:00Z</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">2020-06-15T14:30:00Z</dcterms:modified>
+</cp:coreProperties>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "word/document.xml",
+            br#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>Body</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        z.add_stored("docProps/core.xml", core.as_bytes());
+        z.add_stored(
+            "docProps/app.xml",
+            br#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+              <Application>Acme Word</Application><Company>Analytical Engines Ltd</Company></Properties>"#,
+        );
+        let docx = z.finish();
+
+        let doc = office_to_model(&docx).expect("docx → model");
+        let m = &doc.meta;
+        assert_eq!(m.title.as_deref(), Some("Quarterly Report"));
+        assert_eq!(m.author.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(m.subject.as_deref(), Some("Finance"));
+        assert_eq!(m.lang.as_deref(), Some("en-GB"));
+        assert_eq!(m.keywords, vec!["budget", "q3", "revenue"]);
+        assert_eq!(m.description, "Q3 financial summary");
+        assert_eq!(m.created, "2020-01-01T09:00:00Z");
+        assert_eq!(m.modified, "2020-06-15T14:30:00Z");
+        assert_eq!(m.last_modified_by, "Charles Babbage");
+        assert_eq!(m.revision, "4");
+        assert_eq!(m.application, "Acme Word");
+        assert_eq!(m.company, "Analytical Engines Ltd");
+    }
+
+    /// An ODT `meta.xml` populates the full model `DocMeta`: the Dublin-Core
+    /// fields, each repeated `meta:keyword`, **and** the extended properties
+    /// (description, creation date → created, `dc:date` → modified, generator,
+    /// editing-cycles).
+    #[test]
+    fn odt_model_reads_meta_xml_metadata() {
+        let meta = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <office:meta>
+    <meta:generator>Acme Writer/1.0</meta:generator>
+    <dc:title>Field Notes</dc:title>
+    <dc:creator>Grace Hopper</dc:creator>
+    <dc:subject>Research</dc:subject>
+    <dc:description>Lab observations</dc:description>
+    <dc:language>fr-FR</dc:language>
+    <meta:keyword>alpha</meta:keyword>
+    <meta:keyword>beta</meta:keyword>
+    <meta:creation-date>2020-01-01T00:00:00</meta:creation-date>
+    <dc:date>2020-03-04T11:22:33</dc:date>
+    <meta:editing-cycles>7</meta:editing-cycles>
+  </office:meta>
+</office:document-meta>"#;
+        let mut z = ZipWriter::new();
+        // mimetype must be first/stored for ODF dispatch.
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
+        z.add_stored(
+            "content.xml",
+            br#"<office:document-content xmlns:office="o" xmlns:text="t">
+              <office:body><office:text><text:p>Body</text:p></office:text></office:body>
+            </office:document-content>"#,
+        );
+        z.add_stored("meta.xml", meta.as_bytes());
+        let odt = z.finish();
+
+        let doc = office_to_model(&odt).expect("odt → model");
+        let m = &doc.meta;
+        assert_eq!(m.title.as_deref(), Some("Field Notes"));
+        assert_eq!(m.author.as_deref(), Some("Grace Hopper"));
+        assert_eq!(m.subject.as_deref(), Some("Research"));
+        assert_eq!(m.lang.as_deref(), Some("fr-FR"));
+        assert_eq!(m.keywords, vec!["alpha", "beta"]);
+        assert_eq!(m.description, "Lab observations");
+        assert_eq!(m.created, "2020-01-01T00:00:00");
+        assert_eq!(m.modified, "2020-03-04T11:22:33");
+        assert_eq!(m.generator, "Acme Writer/1.0");
+        assert_eq!(m.editing_cycles, "7");
+    }
+
+    /// No metadata part (or an empty one) ⇒ a default `DocMeta`, no panic — for
+    /// both an OOXML and an ODF package.
+    #[test]
+    fn office_model_missing_metadata_yields_empty_docmeta() {
+        // DOCX with no docProps/core.xml at all.
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "word/document.xml",
+            br#"<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>Hi</w:t></w:r></w:p></w:body></w:document>"#,
+        );
+        let docx = z.finish();
+        let doc = office_to_model(&docx).expect("docx → model");
+        assert_eq!(doc.meta, DocMeta::default());
+
+        // ODT whose meta.xml carries no DocMeta-mapped field at all (only an
+        // unrelated statistic element) ⇒ default DocMeta.
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
+        z.add_stored(
+            "content.xml",
+            br#"<office:document-content xmlns:office="o" xmlns:text="t">
+              <office:body><office:text><text:p>Hi</text:p></office:text></office:body>
+            </office:document-content>"#,
+        );
+        z.add_stored(
+            "meta.xml",
+            br#"<office:document-meta xmlns:office="o" xmlns:meta="m">
+              <office:meta><meta:document-statistic meta:page-count="1"/></office:meta>
+            </office:document-meta>"#,
+        );
+        let odt = z.finish();
+        let doc = office_to_model(&odt).expect("odt → model");
+        assert_eq!(doc.meta, DocMeta::default());
     }
 
     // ── helpers ──

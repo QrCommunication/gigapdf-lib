@@ -56,6 +56,13 @@ pub struct Document {
 }
 
 /// Document-level metadata.
+///
+/// `title`/`author`/`subject`/`keywords`/`lang` are the core five. The remaining
+/// fields mirror the extra OOXML core/extended properties
+/// (`docProps/core.xml` + `app.xml`) and ODF `meta.xml` properties so an Office
+/// import round-trips them. They are stored as raw strings — empty (`""`) means
+/// absent, matching the project convention; dates keep their source ISO-8601 /
+/// W3CDTF text (no date type is introduced).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DocMeta {
     pub title: Option<String>,
@@ -64,6 +71,26 @@ pub struct DocMeta {
     pub keywords: Vec<String>,
     /// BCP-47 language tag (e.g. `"en"`, `"fr-FR"`).
     pub lang: Option<String>,
+    /// Free-text description / abstract (`dc:description`).
+    pub description: String,
+    /// Creation timestamp, raw ISO-8601 / W3CDTF text (`dcterms:created` /
+    /// `meta:creation-date`).
+    pub created: String,
+    /// Last-modification timestamp, raw ISO-8601 / W3CDTF text
+    /// (`dcterms:modified` / `dc:date`).
+    pub modified: String,
+    /// Name of the last person to modify the document (`cp:lastModifiedBy`).
+    pub last_modified_by: String,
+    /// Revision number, kept verbatim as text (`cp:revision`).
+    pub revision: String,
+    /// Generating application (OOXML `app.xml` `<Application>`).
+    pub application: String,
+    /// Company the document belongs to (OOXML `app.xml` `<Company>`).
+    pub company: String,
+    /// Producer / generator string (ODF `meta:generator`).
+    pub generator: String,
+    /// Editing-cycle count, kept verbatim as text (ODF `meta:editing-cycles`).
+    pub editing_cycles: String,
 }
 
 /// A document section: one page geometry, optional running header/footer
