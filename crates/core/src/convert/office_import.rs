@@ -2379,8 +2379,14 @@ fn docx_table_model(
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) -> Table {
     let mut col_widths: Vec<f64> = Vec::new();
-    let mut rows: Vec<Row> = Vec::new();
-    let mut cur_row: Option<Vec<Cell>> = None;
+    // Each parsed `w:tr` collects its `w:tc` cells with their merge metadata
+    // ([`CellSpan`]) and the row height. Vertical merges are resolved in a second
+    // pass ([`resolve_docx_vmerges`]) once every row is known, because counting a
+    // restart cell's continuation rows requires the rows below it and the running
+    // grid-column position (an earlier column mid-vertical-span shifts where a
+    // later `w:tc` sits).
+    let mut raw_rows: Vec<DocxRawRow> = Vec::new();
+    let mut cur_row: Option<Vec<DocxRawCell>> = None;
     // Height for the row currently being read, from `w:trPr/w:trHeight@w:val`
     // (twips → points). Reset at every `w:tr`.
     let mut cur_height: Option<f64> = None;
@@ -2436,8 +2442,11 @@ fn docx_table_model(
                         if border.is_none() {
                             border = out.border;
                         }
-                        if let (Some(row), Some(cell)) = (cur_row.as_mut(), out.cell) {
-                            row.push(cell);
+                        if let Some(row) = cur_row.as_mut() {
+                            row.push(DocxRawCell {
+                                span: out.span,
+                                cell: out.cell,
+                            });
                         }
                     }
                     _ => {}
@@ -2451,7 +2460,7 @@ fn docx_table_model(
                     "trPr" => in_trpr = false,
                     "tr" => {
                         if let Some(cells) = cur_row.take() {
-                            rows.push(Row {
+                            raw_rows.push(DocxRawRow {
                                 cells,
                                 height: cur_height.take(),
                             });
@@ -2466,26 +2475,146 @@ fn docx_table_model(
     }
 
     Table {
-        rows,
+        rows: resolve_docx_vmerges(raw_rows),
         col_widths,
         border: border.unwrap_or_default(),
     }
 }
 
-/// One lowered DOCX `w:tc`: the model [`Cell`] (`None` for a vertical-merge
-/// continuation, covered by the restart cell above) plus the border its
-/// `w:tcBorders` declared. The model holds a single table-wide [`BorderStyle`],
-/// so a cell edge is surfaced for the table to seed (mirrors [`PptxCellOut`]); a
-/// continuation cell still surfaces its border.
+/// One parsed `w:tr`: its `w:tc` cells (with merge metadata, pre vertical-merge
+/// resolution) and the row height (`w:trHeight`, points).
+struct DocxRawRow {
+    cells: Vec<DocxRawCell>,
+    height: Option<f64>,
+}
+
+/// One parsed `w:tc` awaiting vertical-merge resolution: the lowered [`Cell`]
+/// (with `col_span` already set from `w:gridSpan`, `row_span` a placeholder `1`)
+/// and its [`CellSpan`] merge flags.
+struct DocxRawCell {
+    span: CellSpan,
+    cell: Cell,
+}
+
+/// Resolve DOCX vertical merges (`w:vMerge`) into real [`Cell::row_span`] values,
+/// dropping the covered continuation cells.
+///
+/// `w:vMerge@w:val="restart"` opens a vertical span at the cell's grid column;
+/// each following row whose cell at that **same grid column** carries a
+/// continuation `w:vMerge` (`@w:val="continue"` or no `@w:val`) extends the span
+/// by one row and is itself dropped (it is covered). The restart cell's
+/// `row_span` becomes `1 + (continuation rows)`.
+///
+/// Grid-column tracking is essential. A `w:tc`'s grid column is the running
+/// position across the row, advanced by each cell's `col_span` — matching a
+/// continuation to its restart is by column, not by cell index, so it stays
+/// correct once `w:gridSpan` makes earlier cells wider than one column. A
+/// combined `w:gridSpan` + `w:vMerge` cell keeps both: it spans `col_span`
+/// columns horizontally and opens a vertical span over that whole column range.
+/// A span closes as soon as a row does not continue it (a normal `w:tc` reopens
+/// a fresh cell in that column, or the table ends), so independent merges that
+/// reuse a column across the table never bleed into one another.
+fn resolve_docx_vmerges(raw_rows: Vec<DocxRawRow>) -> Vec<Row> {
+    // Open vertical spans keyed by their starting grid column. `width` is the
+    // cell's `col_span` (columns it covers); `out_row`/`out_cell` index back into
+    // the emitted output so a matching continuation bumps its `row_span` in place.
+    struct OpenSpan {
+        width: u32,
+        out_row: usize,
+        out_cell: usize,
+    }
+    // Column → open span. Lets a row match a continuation to the cell it extends.
+    let mut open: BTreeMap<u32, OpenSpan> = BTreeMap::new();
+    let mut out: Vec<Row> = Vec::with_capacity(raw_rows.len());
+
+    for raw in raw_rows {
+        let out_row = out.len();
+        let mut cells: Vec<Cell> = Vec::with_capacity(raw.cells.len());
+        // Running grid column for the next `w:tc` in this row.
+        let mut col: u32 = 0;
+        // Columns whose open span was continued (or freshly opened) in this row;
+        // any other open span is stale and is closed once the row is done.
+        let mut alive: Vec<u32> = Vec::new();
+
+        for raw_cell in raw.cells {
+            let width = (raw_cell.cell.col_span as u32).max(1);
+            let start_col = col;
+
+            if raw_cell.span.v_merge_continue {
+                // A continuation `w:tc` is physically present at its column in Word
+                // output. If a restart span is open at this column, extend it and
+                // drop the covered cell; advance by the span's width to stay
+                // column-aligned with the rows above.
+                if let Some(span) = open.get(&start_col) {
+                    if let Some(cell) = out
+                        .get_mut(span.out_row)
+                        .and_then(|r| r.cells.get_mut(span.out_cell))
+                    {
+                        cell.row_span = cell.row_span.saturating_add(1);
+                    }
+                    alive.push(start_col);
+                    col += span.width.max(1);
+                    continue;
+                }
+                // Orphan continuation (no restart above): emit as a plain cell so
+                // its content is never silently lost.
+                cells.push(raw_cell.cell);
+                col += width;
+                continue;
+            }
+
+            // Restart or plain cell: always emitted. It occupies this column, so
+            // any vertical span previously open here has ended.
+            cells.push(raw_cell.cell);
+            if raw_cell.span.v_merge_restart {
+                // Open (or replace) a vertical span over this cell's whole column
+                // range and mark it alive for this row.
+                open.insert(
+                    start_col,
+                    OpenSpan {
+                        width,
+                        out_row,
+                        out_cell: cells.len() - 1,
+                    },
+                );
+                alive.push(start_col);
+            }
+            col += width;
+        }
+
+        // Close spans not continued (or reopened) this row: their merge ended at
+        // the row above. Keeps reused columns from chaining across distinct merges.
+        open.retain(|c, _| alive.contains(c));
+
+        out.push(Row {
+            cells,
+            height: raw.height,
+        });
+    }
+
+    out
+}
+
+/// One lowered DOCX `w:tc`: the model [`Cell`] plus the merge metadata
+/// ([`CellSpan`]) and the border its `w:tcBorders` declared. Vertical-merge
+/// resolution (counting real continuation rows, dropping covered cells) is done
+/// by [`docx_table_model`], which needs the running grid-column position — a
+/// per-cell view can't see how many rows below continue the span. The cell is
+/// always materialised (even a `w:vMerge` continuation) so the table builder can
+/// track which grid column it occupies; the model holds a single table-wide
+/// [`BorderStyle`], so a cell edge is surfaced for the table to seed (mirrors
+/// [`PptxCellOut`]).
 struct DocxCellOut {
-    cell: Option<Cell>,
+    cell: Cell,
+    span: CellSpan,
     border: Option<model::BorderStyle>,
 }
 
 /// Emit one `w:tc` cell (open already consumed) as a [`DocxCellOut`].
-/// `w:gridSpan`→`col_span`, `w:vMerge="restart"`→`row_span = 2`,
-/// `w:tcPr/w:shd@w:fill`→[`Cell::shading`], and the first `w:tcBorders` edge →
-/// the surfaced [`model::BorderStyle`]. Mirrors [`docx_cell`].
+/// `w:gridSpan`→`col_span`, `w:vMerge` metadata carried on [`CellSpan`] for the
+/// table builder to resolve into a real `row_span`, `w:tcPr/w:shd@w:fill`→
+/// [`Cell::shading`], and the first `w:tcBorders` edge → the surfaced
+/// [`model::BorderStyle`]. Mirrors [`docx_cell`].
 fn docx_cell_model(
     x: &mut Xml,
     ctx: &DocxCtx,
@@ -2581,20 +2710,22 @@ fn docx_cell_model(
         }
     }
 
-    if span.v_merge_continue {
-        return DocxCellOut { cell: None, border };
-    }
     // Collapse any intra-cell page breaks: concatenate the (degenerate) pages
-    // back into one block list — a table cell is a single flow.
+    // back into one block list — a table cell is a single flow. A vertical-merge
+    // continuation has no content of its own (it is covered by the restart cell
+    // above); the table builder drops it but reads its `span` to extend the
+    // restart cell's `row_span`, so a base `row_span = 1` is used here and
+    // overridden during grid-column resolution.
     let blocks: Vec<Block> = pages.finish().into_iter().flat_map(|p| p.blocks).collect();
     DocxCellOut {
-        cell: Some(Cell {
+        cell: Cell {
             blocks,
             col_span: span.grid_span.max(1).min(u16::MAX as usize) as u16,
-            row_span: if span.v_merge_restart { 2 } else { 1 },
+            row_span: 1,
             shading,
             vertical_align,
-        }),
+        },
+        span,
         border,
     }
 }
@@ -14973,6 +15104,139 @@ mod tests {
         for needle in ["Big Title", "BoldWord", "normal", "R1C1", "R2C2"] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    /// Parse a `word/document.xml` body fragment into the model and return its
+    /// first [`model::Table`]. Wraps the fragment in a minimal `w:document`,
+    /// builds a DOCX zip, runs [`docx_to_model`], and finds the table block.
+    fn first_docx_table(body_xml: &str) -> model::Table {
+        let doc = format!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>{body_xml}</w:body></w:document>"#
+        );
+        let zip = read_zip(&build_docx(&doc, None, &[]));
+        let document = docx_to_model(&zip);
+        document
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a table block in the document")
+    }
+
+    /// A 3-row column whose top cell is `w:vMerge="restart"` and the two rows
+    /// below are continuations collapses to one cell spanning all three rows; the
+    /// covered continuation cells are not emitted, while the other column stays
+    /// one cell per row.
+    #[test]
+    fn docx_vmerge_counts_three_continuation_rows() {
+        let t = first_docx_table(
+            r#"<w:tbl>
+  <w:tr>
+    <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr><w:p/></w:tc>
+    <w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+    <w:tc><w:p><w:r><w:t>A3</w:t></w:r></w:p></w:tc>
+  </w:tr>
+</w:tbl>"#,
+        );
+        assert_eq!(t.rows.len(), 3, "three physical rows");
+        // Row 0: the merged restart cell (row_span = 1 + 2 continuations = 3)
+        // plus the right column's A1.
+        assert_eq!(t.rows[0].cells.len(), 2);
+        assert_eq!(t.rows[0].cells[0].row_span, 3, "restart spans all 3 rows");
+        assert_eq!(t.rows[0].cells[0].col_span, 1);
+        // Rows 1 and 2: the continuation cell is dropped, leaving only A2 / A3.
+        assert_eq!(t.rows[1].cells.len(), 1, "continuation dropped in row 2");
+        assert_eq!(t.rows[2].cells.len(), 1, "continuation dropped in row 3");
+        assert_eq!(t.rows[1].cells[0].row_span, 1);
+        assert_eq!(t.rows[2].cells[0].row_span, 1);
+    }
+
+    /// A cell carrying both `w:gridSpan="2"` and a 2-row `w:vMerge` keeps both
+    /// spans: `col_span == 2 && row_span == 2`, and the second row's covered
+    /// continuation (also `gridSpan="2"`) is dropped.
+    #[test]
+    fn docx_combined_grid_and_vmerge_spans() {
+        let t = first_docx_table(
+            r#"<w:tbl>
+  <w:tr>
+    <w:tc>
+      <w:tcPr><w:gridSpan w:val="2"/><w:vMerge w:val="restart"/></w:tcPr>
+      <w:p><w:r><w:t>Wide</w:t></w:r></w:p>
+    </w:tc>
+    <w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc>
+      <w:tcPr><w:gridSpan w:val="2"/><w:vMerge/></w:tcPr>
+      <w:p/>
+    </w:tc>
+    <w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc>
+  </w:tr>
+</w:tbl>"#,
+        );
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells.len(), 2);
+        assert_eq!(t.rows[0].cells[0].col_span, 2, "gridSpan kept");
+        assert_eq!(t.rows[0].cells[0].row_span, 2, "vMerge kept");
+        // The right column (column 2) stays one cell per row.
+        assert_eq!(t.rows[0].cells[1].col_span, 1);
+        assert_eq!(t.rows[0].cells[1].row_span, 1);
+        // Row 1: only the right column's D remains; the wide continuation is gone.
+        assert_eq!(t.rows[1].cells.len(), 1, "wide continuation dropped");
+        assert_eq!(t.rows[1].cells[0].row_span, 1);
+    }
+
+    /// A plain 2×2 table with no `w:vMerge` is unchanged: every cell has
+    /// `row_span == 1` and `col_span == 1`, and no cell is dropped.
+    #[test]
+    fn docx_plain_table_all_row_spans_one() {
+        let t = first_docx_table(
+            r#"<w:tbl>
+  <w:tr><w:tc><w:p><w:r><w:t>R1C1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>R1C2</w:t></w:r></w:p></w:tc></w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>R2C1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>R2C2</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>"#,
+        );
+        assert_eq!(t.rows.len(), 2);
+        for row in &t.rows {
+            assert_eq!(row.cells.len(), 2, "no cell dropped in a plain table");
+            for cell in &row.cells {
+                assert_eq!(cell.row_span, 1);
+                assert_eq!(cell.col_span, 1);
+            }
+        }
+    }
+
+    /// A `w:vMerge` over exactly two rows yields `row_span == 2` (the historical
+    /// hardcode happened to be right only for this length).
+    #[test]
+    fn docx_vmerge_two_rows_spans_two() {
+        let t = first_docx_table(
+            r#"<w:tbl>
+  <w:tr>
+    <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Top</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+    <w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc>
+  </w:tr>
+</w:tbl>"#,
+        );
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells[0].row_span, 2, "restart spans 2 rows");
+        assert_eq!(t.rows[1].cells.len(), 1, "continuation dropped");
+        assert_eq!(t.rows[1].cells[0].row_span, 1);
     }
 
     #[test]
