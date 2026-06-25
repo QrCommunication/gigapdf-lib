@@ -34,6 +34,28 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | — | `gp_alloc(len)` / `gp_free(ptr,len)` | linear-memory management |
 | `doc.page_count() -> usize` | `gp_page_count(handle)` | |
 
+### Cross-reference resolution on open
+
+`open*` reads the file's cross-reference data as the authoritative source
+(ISO 32000-1 §7.5.4 table / §7.5.8 stream), so multi-revision and
+hybrid-reference PDFs resolve to their **current** state:
+
+- **`/Prev` incremental updates (§7.5.6).** The chain is walked from the last
+  `startxref` back through every section's `/Prev`; entries merge **newest-wins**,
+  and each object is re-parsed at the offset its newest section names — so an
+  object that was redefined resolves to its **latest** revision even when a stale
+  body appears later in the byte stream. A **free** (deleted) entry is honoured:
+  the object no longer resolves.
+- **`/XRefStm` hybrid-reference files (§7.5.8.4).** When a classic `xref` table's
+  trailer carries `/XRefStm`, the companion cross-reference **stream** is read too
+  and its type-2 entries merged, so objects packed into `/ObjStm` (compressed) and
+  named **only** by the stream are resolvable. The trailer dictionaries are merged
+  along the chain, so `/Root`, `/Info` and `/Encrypt` come from the newest section.
+- **Robustness.** Walking is bounded by a visited-offset set (and a hard step cap),
+  so a malformed `/Prev`/`/XRefStm` cycle terminates instead of looping. If no
+  cross-reference is parseable the loader falls back to a whole-file scan of
+  `n g obj` definitions (last-in-file wins) — damaged files still open.
+
 ## Content editing
 
 | Rust | WASM |

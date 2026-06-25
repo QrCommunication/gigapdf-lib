@@ -18389,6 +18389,16 @@ fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
 }
 
 /// Scan a whole PDF for `n g obj` definitions and `trailer` dictionaries.
+///
+/// The whole-file brute force ("last `n g obj` in file wins") is the robust
+/// baseline for damaged or non-conforming files. On top of it, when a parseable
+/// cross-reference chain exists, [`apply_xref_chain`] makes the **xref the
+/// authoritative source** (ISO 32000-1 §7.5.6/§7.5.8.4): it follows `/Prev`
+/// (incremental-update revisions) and `/XRefStm` (hybrid-reference files),
+/// merges entries newest-wins, re-parses each object at the offset its newest
+/// xref section names, honours free (deleted) entries, and merges the trailer
+/// dictionaries along the chain. If no xref is found the brute-force result is
+/// returned unchanged.
 fn scan(data: &[u8]) -> (BTreeMap<ObjectId, Object>, Dictionary) {
     let mut objects = BTreeMap::new();
     let mut trailer = Dictionary::new();
@@ -18427,6 +18437,10 @@ fn scan(data: &[u8]) -> (BTreeMap<ObjectId, Object>, Dictionary) {
             _ => {}
         }
     }
+
+    // Promote the cross-reference chain (table + stream, `/Prev` + `/XRefStm`)
+    // to the authoritative source when it parses; otherwise keep brute force.
+    apply_xref_chain(data, &mut objects, &mut trailer);
 
     (objects, trailer)
 }
@@ -18526,6 +18540,353 @@ fn extract_object_streams(objects: &mut BTreeMap<ObjectId, Object>) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-reference resolution (ISO 32000-1 §7.5.4 table / §7.5.8 stream)
+//
+// The brute-force `scan` already collects every `n g obj` body. These helpers
+// add the authoritative layer the spec mandates for multi-revision and
+// hybrid-reference files: walk the `/Prev` + `/XRefStm` chain, decide each
+// object's *current* location newest-section-wins, then reconcile the scanned
+// map with that verdict — re-parsing objects at their authoritative offset
+// (so an interleaved earlier revision can't win on file order) and dropping
+// objects a later section freed. Compressed (type-2) objects keep coming from
+// `extract_object_streams`; the chain only contributes which ObjStm holds them
+// and, decisively, the newest trailer (`/Root`, `/Info`, `/Encrypt`).
+// ---------------------------------------------------------------------------
+
+/// One object's verdict from a cross-reference section.
+#[derive(Clone, Copy)]
+enum XrefEntry {
+    /// Type 1: an uncompressed object at this byte offset in the file.
+    Offset(usize),
+    /// Type 2: a compressed object living inside an `/ObjStm` (we only need to
+    /// know it is present and current; its bytes come from the ObjStm pass).
+    InStream,
+    /// Type 0: a free (deleted) entry — the object must not resolve.
+    Free,
+}
+
+/// Follow the cross-reference chain from `startxref` and reconcile the scanned
+/// object map + trailer with it. A no-op when no chain parses (brute force stands).
+fn apply_xref_chain(
+    data: &[u8],
+    objects: &mut BTreeMap<ObjectId, Object>,
+    trailer: &mut Dictionary,
+) {
+    let start = match last_startxref_offset(data) {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Newest-wins map of object → location, plus the trailer dicts collected
+    // along the way (chain order: newest section first).
+    let mut entries: BTreeMap<u32, XrefEntry> = BTreeMap::new();
+    let mut chain_trailers: Vec<Dictionary> = Vec::new();
+    // Guard against `/Prev`/`/XRefStm` cycles or repeated offsets.
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut queue: Vec<usize> = vec![start];
+    let mut steps = 0usize;
+
+    while let Some(offset) = queue.pop() {
+        // Hard cap as a backstop even if the `seen` set is somehow defeated.
+        steps += 1;
+        if steps > 4096 || offset >= data.len() || !seen.insert(offset) {
+            continue;
+        }
+        let Some(section) = read_xref_section(data, offset) else {
+            continue;
+        };
+        // Earlier sections must NOT override later ones: only fill gaps.
+        for (num, entry) in section.entries {
+            entries.entry(num).or_insert(entry);
+        }
+        if !section.trailer.0.is_empty() {
+            chain_trailers.push(section.trailer);
+        }
+        // A hybrid classic table points at its companion xref STREAM first
+        // (it carries the compressed objects' entries), then the older revision.
+        if let Some(xrefstm) = section.xref_stm {
+            queue.push(xrefstm);
+        }
+        if let Some(prev) = section.prev {
+            queue.push(prev);
+        }
+    }
+
+    if entries.is_empty() {
+        return; // Nothing usable — leave brute force untouched.
+    }
+
+    // Merge trailers oldest→newest so the newest section's keys win, then fill
+    // (never clobber) the scanned trailer. `/Root`, `/Info`, `/Encrypt`, `/ID`.
+    for dict in chain_trailers.into_iter().rev() {
+        for (key, value) in dict.0 {
+            trailer.0.insert(key, value);
+        }
+    }
+
+    reconcile_objects(data, objects, &entries);
+}
+
+/// A single cross-reference section's contribution: its object→location entries
+/// plus the trailer keys it declares and the offsets it links to.
+struct XrefSection {
+    entries: Vec<(u32, XrefEntry)>,
+    trailer: Dictionary,
+    prev: Option<usize>,
+    xref_stm: Option<usize>,
+}
+
+/// Parse one cross-reference section at `offset`, dispatching on whether it is a
+/// classic `xref` table (+`trailer`) or a `/Type /XRef` cross-reference stream.
+fn read_xref_section(data: &[u8], offset: usize) -> Option<XrefSection> {
+    let mut probe = Lexer::at(data, offset);
+    match probe.next_token() {
+        Ok(Token::Keyword(k)) if k == b"xref" => read_xref_table(data, probe.position()),
+        // Otherwise it must be `n g obj << /Type /XRef … >> stream …`.
+        _ => read_xref_stream(data, offset),
+    }
+}
+
+/// Parse a classic cross-reference table beginning just after the `xref`
+/// keyword: a run of `start count` subsections of 20-byte `nnnnnnnnnn ggggg n`
+/// entries, then the `trailer` dictionary.
+fn read_xref_table(data: &[u8], mut pos: usize) -> Option<XrefSection> {
+    let mut entries: Vec<(u32, XrefEntry)> = Vec::new();
+
+    loop {
+        let mut lx = Lexer::at(data, pos);
+        // A subsection header is `start count`; anything else ends the table.
+        let start = match lx.next_token() {
+            Ok(Token::Integer(v)) if v >= 0 => v as u32,
+            _ => break,
+        };
+        let count = match lx.next_token() {
+            Ok(Token::Integer(v)) if v >= 0 => v as u32,
+            _ => break,
+        };
+        for i in 0..count {
+            let off = match lx.next_token() {
+                Ok(Token::Integer(v)) if v >= 0 => v as usize,
+                _ => return finish_table(data, lx.position(), entries),
+            };
+            let _gen = match lx.next_token() {
+                Ok(Token::Integer(v)) if v >= 0 => v,
+                _ => return finish_table(data, lx.position(), entries),
+            };
+            let kind = match lx.next_token() {
+                Ok(Token::Keyword(k)) if k == b"n" => XrefEntry::Offset(off),
+                Ok(Token::Keyword(k)) if k == b"f" => XrefEntry::Free,
+                _ => return finish_table(data, lx.position(), entries),
+            };
+            entries.push((start + i, kind));
+        }
+        pos = lx.position();
+    }
+
+    finish_table(data, pos, entries)
+}
+
+/// After a classic table's subsections, read its `trailer` dict (with `/Prev`
+/// and `/XRefStm`) and package the section.
+fn finish_table(data: &[u8], pos: usize, entries: Vec<(u32, XrefEntry)>) -> Option<XrefSection> {
+    // Find the `trailer` keyword that follows the subsections.
+    let kw = crate::parser::find_subslice(data, b"trailer", pos)?;
+    let mut parser = Parser::at(data, kw + b"trailer".len());
+    let trailer = match parser.parse_value() {
+        Ok(Object::Dictionary(d)) => d,
+        _ => Dictionary::new(),
+    };
+    let prev = trailer
+        .get(b"Prev")
+        .and_then(Object::as_i64)
+        .and_then(non_neg);
+    let xref_stm = trailer
+        .get(b"XRefStm")
+        .and_then(Object::as_i64)
+        .and_then(non_neg);
+    Some(XrefSection {
+        entries,
+        trailer,
+        prev,
+        xref_stm,
+    })
+}
+
+/// Parse a `/Type /XRef` cross-reference stream at `offset` (ISO 32000-1
+/// §7.5.8): `n g obj << … >> stream … endstream`. Decodes the binary entries by
+/// the `/W` field widths and `/Index` subsections; the stream dict doubles as
+/// the trailer (carrying `/Root`, `/Prev`, …).
+fn read_xref_stream(data: &[u8], offset: usize) -> Option<XrefSection> {
+    // Skip the `n g obj` header if present, then parse the dictionary/stream.
+    let mut lx = Lexer::at(data, offset);
+    let body = match lx.next_token() {
+        Ok(Token::Integer(n)) if n >= 0 => match try_object_header(&mut lx, n) {
+            Some(_) => lx.position(),
+            None => offset,
+        },
+        _ => offset,
+    };
+    let stream = match Parser::at(data, body).parse_value() {
+        Ok(Object::Stream(s)) => s,
+        _ => return None,
+    };
+    if stream.dict.get(b"Type").and_then(Object::as_name) != Some(b"XRef".as_slice()) {
+        return None;
+    }
+
+    let decoded = decode_stream(&stream).ok()?;
+    let w = stream.dict.get(b"W").and_then(Object::as_array)?;
+    if w.len() != 3 {
+        return None;
+    }
+    let w0 = w[0].as_i64().and_then(non_neg)?;
+    let w1 = w[1].as_i64().and_then(non_neg)?;
+    let w2 = w[2].as_i64().and_then(non_neg)?;
+    let row = w0 + w1 + w2;
+    if row == 0 {
+        return None;
+    }
+
+    // `/Index` is a list of `[start count]` pairs; default is `[0 Size]`.
+    let size = stream
+        .dict
+        .get(b"Size")
+        .and_then(Object::as_i64)
+        .and_then(non_neg);
+    let index: Vec<(u32, u32)> = match stream.dict.get(b"Index").and_then(Object::as_array) {
+        Some(arr) => arr
+            .chunks_exact(2)
+            .filter_map(|c| {
+                Some((
+                    non_neg(c[0].as_i64()?)? as u32,
+                    non_neg(c[1].as_i64()?)? as u32,
+                ))
+            })
+            .collect(),
+        None => vec![(0u32, size? as u32)],
+    };
+
+    let mut entries: Vec<(u32, XrefEntry)> = Vec::new();
+    let mut cursor = 0usize;
+    'outer: for (start, count) in index {
+        for i in 0..count {
+            if cursor + row > decoded.len() {
+                break 'outer; // truncated table — keep what we parsed.
+            }
+            let f0 = read_be(&decoded[cursor..cursor + w0]);
+            let f1 = read_be(&decoded[cursor + w0..cursor + w0 + w1]);
+            // f2 (the third field) is generation/index — not needed to locate.
+            cursor += row;
+            // Per spec a `/W` width of 0 for field 1 (type) defaults the type to 1.
+            let kind = if w0 == 0 { 1 } else { f0 };
+            let entry = match kind {
+                1 => XrefEntry::Offset(f1 as usize),
+                2 => XrefEntry::InStream,
+                _ => XrefEntry::Free, // type 0 (free) or unknown → not present.
+            };
+            entries.push((start + i, entry));
+        }
+    }
+
+    let prev = stream
+        .dict
+        .get(b"Prev")
+        .and_then(Object::as_i64)
+        .and_then(non_neg);
+    Some(XrefSection {
+        entries,
+        trailer: stream.dict.clone(),
+        prev,
+        xref_stm: None, // xref streams never carry `/XRefStm`.
+    })
+}
+
+/// Reconcile the brute-force object map with the authoritative xref verdict:
+/// re-parse each type-1 object at the offset its newest section names (so an
+/// interleaved earlier revision can't win merely by being last in the file),
+/// and drop every object the chain marks free. Objects the chain doesn't
+/// mention are left exactly as brute force found them.
+fn reconcile_objects(
+    data: &[u8],
+    objects: &mut BTreeMap<ObjectId, Object>,
+    entries: &BTreeMap<u32, XrefEntry>,
+) {
+    for (&num, entry) in entries {
+        match entry {
+            XrefEntry::Offset(off) => {
+                if let Some((id, object)) = parse_object_at(data, *off, num) {
+                    objects.insert(id, object);
+                }
+            }
+            XrefEntry::Free => {
+                // A free entry deletes the object for THIS revision. Remove any
+                // generation the brute force collected for this number.
+                let to_drop: Vec<ObjectId> = objects
+                    .range((num, 0)..=(num, u16::MAX))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in to_drop {
+                    objects.remove(&id);
+                }
+            }
+            // Compressed objects are materialised by `extract_object_streams`;
+            // the chain only confirms presence, nothing to re-parse here.
+            XrefEntry::InStream => {}
+        }
+    }
+}
+
+/// Parse the indirect object whose `n g obj` header sits at `offset`, verifying
+/// its object number matches `expected`. Returns `(id, body)` on success.
+fn parse_object_at(data: &[u8], offset: usize, expected: u32) -> Option<(ObjectId, Object)> {
+    if offset >= data.len() {
+        return None;
+    }
+    let mut lx = Lexer::at(data, offset);
+    let n = match lx.next_token() {
+        Ok(Token::Integer(v)) if v >= 0 => v,
+        _ => return None,
+    };
+    if n as u32 != expected {
+        return None; // offset doesn't point at the object the xref claims.
+    }
+    let id = try_object_header(&mut lx, n)?;
+    let mut parser = Parser::at(data, lx.position());
+    let object = parser.parse_value().ok()?;
+    Some((id, object))
+}
+
+/// The byte offset named by the file's last `startxref`, or `None`.
+fn last_startxref_offset(data: &[u8]) -> Option<usize> {
+    let pos = rposition_subslice(data, b"startxref")?;
+    let mut lx = Lexer::at(data, pos + b"startxref".len());
+    match lx.next_token() {
+        Ok(Token::Integer(v)) if v >= 0 => Some(v as usize),
+        _ => None,
+    }
+}
+
+/// Index of the last occurrence of `needle` in `hay` (there is no shared
+/// reverse-search helper; xref resolution needs the *final* `startxref`).
+fn rposition_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+/// Read up to 8 big-endian bytes as a `u64` (cross-reference-stream fields are
+/// at most a few bytes; width 0 yields the spec default 0).
+fn read_be(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64)
+}
+
+/// `Some(v as usize-ish)` only for non-negative integers (xref offsets, counts).
+fn non_neg(v: i64) -> Option<usize> {
+    usize::try_from(v).ok()
 }
 
 #[cfg(test)]
@@ -28484,6 +28845,305 @@ mod tests {
         assert!(
             c[0] > 200 && c[1] < 60 && c[2] < 60,
             "inline image painted red at the page centre, got {c:?}"
+        );
+    }
+
+    // --- Cross-reference resolution: /Prev chains & /XRefStm hybrids (#56) ---
+
+    /// Append `n g obj … endobj` to `out`, returning the byte offset of the `n`.
+    fn push_obj(out: &mut Vec<u8>, num: u32, body: &[u8]) -> usize {
+        let off = out.len();
+        out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+        off
+    }
+
+    /// A classic `xref` subsection table for `[(num, offset, in-use)]` entries
+    /// plus object 0's free-list head. Entries must be a single contiguous run
+    /// starting at the lowest number (sufficient for these hand-built files).
+    fn xref_table(entries: &[(u32, usize, bool)]) -> Vec<u8> {
+        let lo = entries.iter().map(|e| e.0).min().unwrap_or(1);
+        let hi = entries.iter().map(|e| e.0).max().unwrap_or(0);
+        let mut t = format!("xref\n0 1\n0000000000 65535 f \n{lo} {} \n", hi - lo + 1).into_bytes();
+        for num in lo..=hi {
+            match entries.iter().find(|e| e.0 == num) {
+                Some((_, off, true)) => {
+                    t.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes())
+                }
+                _ => t.extend_from_slice(b"0000000000 00000 f \n"),
+            }
+        }
+        t
+    }
+
+    /// An UNCOMPRESSED `/Type /XRef` cross-reference stream object (`/W [1 2 1]`,
+    /// no `/Filter` so it is trivially hand-buildable). `rows` are the binary
+    /// `(type, field2, field3)` triples covering object numbers `0..rows.len()`.
+    fn xref_stream_obj(num: u32, rows: &[(u8, u16, u8)], extra: &str) -> Vec<u8> {
+        let mut data = Vec::with_capacity(rows.len() * 4);
+        for (t, f2, f3) in rows {
+            data.push(*t);
+            data.extend_from_slice(&f2.to_be_bytes());
+            data.push(*f3);
+        }
+        let dict = format!(
+            "<< /Type /XRef /Size {} /W [1 2 1] /Length {} {extra} >>",
+            rows.len(),
+            data.len()
+        );
+        let mut body = dict.into_bytes();
+        body.extend_from_slice(b"\nstream\n");
+        body.extend_from_slice(&data);
+        body.extend_from_slice(b"\nendstream");
+        let mut obj = format!("{num} 0 obj\n").into_bytes();
+        obj.extend_from_slice(&body);
+        obj.extend_from_slice(b"\nendobj\n");
+        obj
+    }
+
+    /// A `/Type /ObjStm` carrying the single object `(num, body)` — uncompressed,
+    /// so the loader's ObjStm pass reads it without a codec.
+    fn objstm_obj(stm_num: u32, num: u32, body: &str) -> Vec<u8> {
+        let header = format!("{num} 0 ");
+        let payload = format!("{header}{body}");
+        let first = header.len();
+        let dict = format!(
+            "<< /Type /ObjStm /N 1 /First {first} /Length {} >>",
+            payload.len()
+        );
+        let mut obj = format!("{stm_num} 0 obj\n").into_bytes();
+        obj.extend_from_slice(dict.as_bytes());
+        obj.extend_from_slice(b"\nstream\n");
+        obj.extend_from_slice(payload.as_bytes());
+        obj.extend_from_slice(b"\nendstream\nendobj\n");
+        obj
+    }
+
+    /// `/Prev` chain: object 4 is defined in revision 1 then REDEFINED by an
+    /// incremental update. To prove the xref (not "last body in file") decides,
+    /// the *newest* revision's object 4 is written BEFORE the stale one in the
+    /// byte stream; only the newest xref section points at it. Brute force would
+    /// pick the physically-last (stale) body — the xref must override it.
+    #[test]
+    fn prev_chain_resolves_object_to_latest_revision() {
+        let mut pdf = Vec::from(&b"%PDF-1.7\n"[..]);
+        let o1 = push_obj(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        let o2 = push_obj(&mut pdf, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let o3 = push_obj(
+            &mut pdf,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        );
+        let o4_v1 = push_obj(&mut pdf, 4, b"<< /Revision 1 >>");
+
+        // Revision-1 xref (classic) + trailer.
+        let xref1 = pdf.len();
+        pdf.extend_from_slice(&xref_table(&[
+            (1, o1, true),
+            (2, o2, true),
+            (3, o3, true),
+            (4, o4_v1, true),
+        ]));
+        pdf.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R >>\n");
+        pdf.extend_from_slice(format!("startxref\n{xref1}\n%%EOF\n").as_bytes());
+
+        // Incremental update: object 4 v2 written HERE (earlier than the decoy
+        // below), and a decoy stale body of object 4 placed AFTER everything so
+        // that "last in file wins" would choose the wrong revision.
+        let o4_v2 = push_obj(&mut pdf, 4, b"<< /Revision 2 >>");
+        let xref2 = pdf.len();
+        pdf.extend_from_slice(&xref_table(&[(4, o4_v2, true)]));
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R /Prev {xref1} >>\n").as_bytes(),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref2}\n%%EOF\n").as_bytes());
+
+        // Decoy: a physically-last (stale) re-statement of object 4 that the
+        // current xref does NOT reference. It must be ignored.
+        push_obj(&mut pdf, 4, b"<< /Revision 99 >>");
+
+        let (objects, trailer) = scan(&pdf);
+        let rev = objects
+            .get(&(4, 0))
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"Revision"))
+            .and_then(Object::as_i64);
+        assert_eq!(
+            rev,
+            Some(2),
+            "xref must select revision 2, not the file-last decoy"
+        );
+        assert_eq!(
+            trailer.get(b"Root").and_then(Object::as_reference),
+            Some((1, 0)),
+            "merged trailer keeps /Root"
+        );
+    }
+
+    /// A free (type-0 / `f`) entry in a later revision deletes the object: even
+    /// though revision 1 defined object 4 and its body is still in the bytes,
+    /// the newest xref marks it free, so it must NOT resolve.
+    #[test]
+    fn prev_chain_honours_freed_object() {
+        let mut pdf = Vec::from(&b"%PDF-1.7\n"[..]);
+        let o1 = push_obj(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        let o2 = push_obj(&mut pdf, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let o3 = push_obj(
+            &mut pdf,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        );
+        let o4 = push_obj(&mut pdf, 4, b"<< /Doomed true >>");
+
+        let xref1 = pdf.len();
+        pdf.extend_from_slice(&xref_table(&[
+            (1, o1, true),
+            (2, o2, true),
+            (3, o3, true),
+            (4, o4, true),
+        ]));
+        pdf.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R >>\n");
+        pdf.extend_from_slice(format!("startxref\n{xref1}\n%%EOF\n").as_bytes());
+
+        // Incremental update frees object 4 (subsection `4 1` with an `f` entry).
+        let xref2 = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n4 1 \n0000000000 00001 f \n");
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R /Prev {xref1} >>\n").as_bytes(),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref2}\n%%EOF\n").as_bytes());
+
+        let (objects, _) = scan(&pdf);
+        assert!(
+            !objects.contains_key(&(4, 0)),
+            "a freed object must not resolve (was {:?})",
+            objects.get(&(4, 0))
+        );
+        // The live objects survive.
+        assert!(objects.contains_key(&(1, 0)) && objects.contains_key(&(3, 0)));
+    }
+
+    /// Hybrid-reference file (ISO 32000-1 §7.5.8.4): a classic `xref` table whose
+    /// trailer carries `/XRefStm <offset>`. Object 5 exists ONLY inside an
+    /// `/ObjStm` and is named ONLY by a type-2 entry in that companion xref
+    /// stream. The reader must follow `/XRefStm`, read the stream, and resolve 5.
+    #[test]
+    fn xrefstm_hybrid_resolves_compressed_only_object() {
+        let mut pdf = Vec::from(&b"%PDF-1.7\n"[..]);
+        let o1 = push_obj(
+            &mut pdf,
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Meta 5 0 R >>",
+        );
+        let o2 = push_obj(&mut pdf, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let o3 = push_obj(
+            &mut pdf,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        );
+        // Object 5 lives only inside object-stream 4 (compressed-only).
+        let objstm = objstm_obj(4, 5, "<< /HybridOnly true >>");
+        let o4 = pdf.len();
+        pdf.extend_from_slice(&objstm);
+
+        // The companion xref STREAM (object 6): rows for objects 0..=6.
+        //   0 free; 1,2,3 in-use at offsets; 4 the ObjStm; 5 in-stream(4); 6 self.
+        // We must place object 6 before computing its own offset, so reserve the
+        // offset by writing it after we know where it lands.
+        let xref_stm_off = pdf.len();
+        let rows = vec![
+            (0u8, 0u16, 0u8),            // 0: free head
+            (1, o1 as u16, 0),           // 1: at o1
+            (1, o2 as u16, 0),           // 2: at o2
+            (1, o3 as u16, 0),           // 3: at o3
+            (1, o4 as u16, 0),           // 4: the ObjStm itself
+            (2, 4u16, 0),                // 5: compressed, in ObjStm #4, idx 0
+            (1, xref_stm_off as u16, 0), // 6: this xref stream
+        ];
+        pdf.extend_from_slice(&xref_stream_obj(6, &rows, "/Root 1 0 R"));
+
+        // The classic table + trailer with /XRefStm pointing at the stream object.
+        let xref_off = pdf.len();
+        pdf.extend_from_slice(&xref_table(&[
+            (1, o1, true),
+            (2, o2, true),
+            (3, o3, true),
+            (4, o4, true),
+        ]));
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R /XRefStm {xref_stm_off} >>\n").as_bytes(),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF\n").as_bytes());
+
+        // End-to-end: open() runs scan() + extract_object_streams(); object 5
+        // (compressed, named only via /XRefStm) must resolve to its dict.
+        let doc = Document::open(&pdf).unwrap();
+        let meta = doc
+            .objects
+            .get(&(5, 0))
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"HybridOnly"))
+            .cloned();
+        assert_eq!(
+            meta,
+            Some(Object::Boolean(true)),
+            "compressed-only object 5 must resolve via /XRefStm"
+        );
+        // /Root from the merged trailer drives the catalog.
+        assert_eq!(
+            doc.trailer.get(b"Root").and_then(Object::as_reference),
+            Some((1, 0))
+        );
+    }
+
+    /// A `/Prev` cycle (rev2 → rev1 → rev2) must terminate, not hang. The chain
+    /// walker's `seen`-offset guard breaks the loop; the document still opens.
+    #[test]
+    fn prev_cycle_terminates() {
+        let mut pdf = Vec::from(&b"%PDF-1.7\n"[..]);
+        let o1 = push_obj(&mut pdf, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        let o2 = push_obj(&mut pdf, 2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let o3 = push_obj(
+            &mut pdf,
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        );
+
+        // Two xref sections whose /Prev values point at EACH OTHER. We don't know
+        // section B's offset until written, so write A first with a placeholder
+        // /Prev, then B, then patch A — but to keep bytes immutable-after-write we
+        // instead make A point at B and B point at A by computing both offsets
+        // up front: A is written first at `xref_a`, B second at `xref_b`.
+        let xref_a = pdf.len();
+        // Reserve A with a /Prev we backfill: write A pointing at a not-yet-known
+        // B. Use a fixed-width decimal so we can patch in place.
+        let a_template = format!(
+            "{}trailer\n<< /Size 4 /Root 1 0 R /Prev 0000000000 >>\nstartxref\n{xref_a}\n%%EOF\n",
+            String::from_utf8(xref_table(&[(1, o1, true), (2, o2, true), (3, o3, true)])).unwrap()
+        );
+        let a_prev_field = xref_a + a_template.find("/Prev ").unwrap() + "/Prev ".len();
+        pdf.extend_from_slice(a_template.as_bytes());
+
+        let xref_b = pdf.len();
+        pdf.extend_from_slice(&xref_table(&[(1, o1, true)]));
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R /Prev {xref_a} >>\n").as_bytes(),
+        );
+        pdf.extend_from_slice(format!("startxref\n{xref_b}\n%%EOF\n").as_bytes());
+
+        // Patch A's /Prev (10 fixed digits) to point back at B → cycle A↔B.
+        pdf[a_prev_field..a_prev_field + 10].copy_from_slice(format!("{xref_b:010}").as_bytes());
+
+        // The newest startxref is B; B→A→B is a cycle. Must return, not loop.
+        let (objects, trailer) = scan(&pdf);
+        assert!(
+            objects.contains_key(&(1, 0)),
+            "cycle must still yield objects"
+        );
+        assert_eq!(
+            trailer.get(b"Root").and_then(Object::as_reference),
+            Some((1, 0))
         );
     }
 }
