@@ -1148,6 +1148,216 @@ fn para_style_model(para: &ParaStyle) -> ParagraphStyle {
     }
 }
 
+/// Map a `<w:sym w:font=".." w:char="..">` symbol run to a Unicode string.
+///
+/// Word stores symbol glyphs as a font name plus a code point that indexes that
+/// font's (legacy) glyph table — usually in the `F0xx` Private-Use range. We map
+/// the frequent glyphs of the common symbol fonts (`Symbol`, the `Wingdings`
+/// family, `Webdings`) to their Unicode equivalents so the character survives as
+/// real text. Anything unmapped falls back to the raw code point: an `F0xx`
+/// Private-Use slot is folded to `U+00xx` (Word's PUA convention), and any other
+/// value is emitted as-is. Returns `None` only when `char_hex` is not a number.
+fn docx_symbol_char(font: &str, char_hex: &str) -> Option<String> {
+    let cp = u32::from_str_radix(char_hex.trim().trim_start_matches("0x"), 16).ok()?;
+    // Normalise the font name (case-insensitive, trimmed) for matching.
+    let f = font.trim().to_ascii_lowercase();
+    // Look up by the font's low byte (the legacy glyph slot), since Word may
+    // store the same glyph as `0x4A` or `0xF04A` depending on the producer.
+    let low = (cp & 0xFF) as u8;
+    let mapped: Option<char> = match f.as_str() {
+        "symbol" => symbol_font_char(low),
+        "wingdings" => wingdings_char(low),
+        "wingdings 2" => wingdings2_char(low),
+        "wingdings 3" => wingdings3_char(low),
+        "webdings" => webdings_char(low),
+        _ => None,
+    };
+    if let Some(c) = mapped {
+        return Some(c.to_string());
+    }
+    // Fallback: an `F0xx` PUA slot → `U+00xx`; otherwise the code point as-is.
+    let raw = if (0xF000..=0xF0FF).contains(&cp) {
+        cp - 0xF000
+    } else {
+        cp
+    };
+    char::from_u32(raw).map(|c| c.to_string())
+}
+
+/// Adobe Symbol font: the frequent Greek letters and math/arrow glyphs, keyed by
+/// the legacy 8-bit slot (`w:char & 0xFF`). Covers the everyday subset; rarer
+/// glyphs fall back to the PUA mapping in [`docx_symbol_char`].
+fn symbol_font_char(slot: u8) -> Option<char> {
+    let c = match slot {
+        // Uppercase Greek.
+        0x41 => 'Α', // A → Alpha
+        0x42 => 'Β',
+        0x47 => 'Γ',
+        0x44 => 'Δ',
+        0x45 => 'Ε',
+        0x5A => 'Ζ',
+        0x48 => 'Η',
+        0x51 => 'Θ',
+        0x49 => 'Ι',
+        0x4B => 'Κ',
+        0x4C => 'Λ',
+        0x4D => 'Μ',
+        0x4E => 'Ν',
+        0x58 => 'Ξ',
+        0x4F => 'Ο',
+        0x50 => 'Π',
+        0x52 => 'Ρ',
+        0x53 => 'Σ',
+        0x54 => 'Τ',
+        0x55 => 'Υ',
+        0x46 => 'Φ',
+        0x43 => 'Χ',
+        0x59 => 'Ψ',
+        0x57 => 'Ω',
+        // Lowercase Greek.
+        0x61 => 'α',
+        0x62 => 'β',
+        0x67 => 'γ',
+        0x64 => 'δ',
+        0x65 => 'ε',
+        0x7A => 'ζ',
+        0x68 => 'η',
+        0x71 => 'θ',
+        0x69 => 'ι',
+        0x6B => 'κ',
+        0x6C => 'λ',
+        0x6D => 'μ',
+        0x6E => 'ν',
+        0x78 => 'ξ',
+        0x6F => 'ο',
+        0x70 => 'π',
+        0x72 => 'ρ',
+        0x73 => 'σ',
+        0x74 => 'τ',
+        0x75 => 'υ',
+        0x66 => 'φ',
+        0x63 => 'χ',
+        0x79 => 'ψ',
+        0x77 => 'ω',
+        // Common math / arrows / bullets.
+        0xB7 => '•', // bullet
+        0xB1 => '±',
+        0xB3 => '≥',
+        0xA3 => '≤',
+        0xB9 => '≠',
+        0xBB => '≈',
+        0xA5 => '∞',
+        0xB4 => '×', // multiply sign
+        0xB8 => '÷',
+        0xAC => '←',
+        0xAD => '↑',
+        0xAE => '→',
+        0xAF => '↓',
+        0xAB => '↔',
+        0xD6 => '√',
+        0xB6 => '∂',
+        0xD2 => '®',
+        0xD3 => '©',
+        0xD4 => '™',
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Wingdings: the frequent dingbats keyed by the legacy 8-bit slot
+/// (`w:char & 0xFF`). Notably `0xFC`=check, `0xFB`=cross, `0xFE`=boxed-check.
+fn wingdings_char(slot: u8) -> Option<char> {
+    let c = match slot {
+        0x4A => '☺', // smiling face
+        0x4C => '☹', // frowning face
+        0x6C => '●', // black circle (bullet)
+        0x6D => '○', // white circle
+        0x71 => '■', // black square
+        0xA7 => '▪', // small black square
+        0xFB => '✗', // multiplication X (cross)
+        0xFC => '✓', // check mark
+        0xFD => '☒', // boxed cross
+        0xFE => '☑', // boxed check
+        0xE8 => '➔', // heavy round-tipped rightwards arrow
+        0xE0 => '⇦', // leftwards arrow
+        0xE1 => '⇨', // rightwards arrow
+        0xE2 => '⇧', // upwards arrow
+        0xE3 => '⇩', // downwards arrow
+        0x22 => '✂', // scissors
+        0x28 => '✆', // telephone
+        0x2A => '✉', // envelope
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Wingdings 2: a small frequent subset (the boxed-check/cross variants and the
+/// common check/cross glyphs), keyed by the legacy 8-bit slot.
+fn wingdings2_char(slot: u8) -> Option<char> {
+    let c = match slot {
+        0x50 => '✓', // check mark
+        0x51 => '✗', // cross
+        0x52 => '☑', // boxed check
+        0x53 => '☒', // boxed cross
+        0x4F => '☐', // empty ballot box
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Wingdings 3: the frequent directional arrows, keyed by the legacy 8-bit slot.
+fn wingdings3_char(slot: u8) -> Option<char> {
+    let c = match slot {
+        0x75 => '▲', // up triangle
+        0x74 => '▼', // down triangle
+        0x70 => '◄', // left triangle
+        0x71 => '►', // right triangle
+        0x41 => '←',
+        0x42 => '→',
+        0x43 => '↑',
+        0x44 => '↓',
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Webdings: a small frequent subset, keyed by the legacy 8-bit slot.
+fn webdings_char(slot: u8) -> Option<char> {
+    let c = match slot {
+        0x61 => '🔎', // magnifier
+        0x36 => '✉',  // envelope
+        0x35 => '☎',  // telephone
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Lower a `<w:txbxContent>` (DrawingML, or VML via `v:textbox`) — its open tag
+/// already consumed — into a flat [`Block`] list, walking its `w:p`/`w:tbl`
+/// children through the body model walker. A throwaway page accumulator + list
+/// counters + outline builder keep it self-contained, so a text box's headings
+/// never leak into the document outline and its list ordinals are independent of
+/// the body's (mirrors [`docx_header_footer_model`]).
+fn docx_textbox_blocks(
+    x: &mut Xml,
+    ctx: &DocxCtx,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Vec<Block> {
+    let mut pages = DocxPages::new();
+    let mut counters = ListCounters::default();
+    let mut outline = OutlineBuilder::default();
+    docx_walk_model(
+        x,
+        ctx,
+        &mut pages,
+        &mut counters,
+        resources,
+        &mut outline,
+        Some("txbxContent"),
+    );
+    pages.finish().into_iter().flat_map(|p| p.blocks).collect()
+}
+
 /// Emit one `w:p` (open already consumed) as a model block: a [`Heading`] when
 /// the paragraph carries a heading style, a list-item-wrapped paragraph (kept as
 /// a one-item [`List`] so the marker/ordinal is preserved) for `w:numPr`
@@ -1189,6 +1399,13 @@ fn docx_paragraph_model(
     // Open `<w:hyperlink>`: runs pushed while set are collected here and wrapped
     // in an `Inline::Link` on the matching close (DOCX hyperlinks don't nest).
     let mut link: Option<DocxLink> = None;
+    // Open DOCX fields (`w:fldSimple` and complex `w:fldChar` ranges). A stack so
+    // nested fields work; the top field's result receives runs while it is in its
+    // result phase, and is flushed into the surrounding flow on close.
+    let mut fields: Vec<DocxField> = Vec::new();
+    // `true` while inside a complex field's `<w:instrText>` (its text is the
+    // instruction, not display content — accumulated onto the open field).
+    let mut in_instr = false;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -1331,7 +1548,64 @@ fn docx_paragraph_model(
                             }
                         }
                     }
-                    "tab" => push_run(active_inlines(&mut runs, &mut link), &run, " "),
+                    "tab" => push_run(docx_sink(&mut runs, &mut link, &mut fields), &run, " "),
+                    // A symbol run: a glyph stored as a font + code point
+                    // (`<w:sym w:font=".." w:char="F0FC"/>`). Map it to Unicode so
+                    // the character survives as real text (e.g. a Wingdings `F0FC`
+                    // → `✓`); unmapped fonts/chars fall back to the raw code point
+                    // (an `F0xx` PUA slot folds to `U+00xx`). Emitted with the
+                    // current run style at the active sink.
+                    "sym" => {
+                        if let Some(ch) = attr(&attrs, "char") {
+                            let font = attr(&attrs, "font").unwrap_or("");
+                            if let Some(s) = docx_symbol_char(font, ch) {
+                                push_run(docx_sink(&mut runs, &mut link, &mut fields), &run, &s);
+                            }
+                        }
+                    }
+                    // A simple field (`<w:fldSimple w:instr="..">result runs</…>`):
+                    // open a field already in its result phase (its instruction is
+                    // the attribute), so the child runs become the cached result;
+                    // flushed on the matching close.
+                    "fldSimple" if !sc => {
+                        fields.push(DocxField {
+                            instr: attr(&attrs, "instr").unwrap_or("").to_string(),
+                            in_result: true,
+                            result: Vec::new(),
+                        });
+                    }
+                    // A complex-field marker. `begin` opens a field (instruction
+                    // phase); `separate` switches it to the cached-result phase;
+                    // `end` closes it (flush). The instruction arrives via
+                    // `<w:instrText>` between `begin` and `separate`.
+                    "fldChar" => match attr(&attrs, "fldCharType") {
+                        Some("begin") => {
+                            fields.push(DocxField {
+                                instr: String::new(),
+                                in_result: false,
+                                result: Vec::new(),
+                            });
+                            in_instr = false;
+                        }
+                        Some("separate") => {
+                            if let Some(f) = fields.last_mut() {
+                                f.in_result = true;
+                            }
+                            in_instr = false;
+                        }
+                        Some("end") => {
+                            in_instr = false;
+                            if let Some(f) = fields.pop() {
+                                let sink = docx_sink(&mut runs, &mut link, &mut fields);
+                                docx_emit_field(f, sink);
+                            }
+                        }
+                        _ => {}
+                    },
+                    // Field instruction text (`<w:instrText>`): its characters are
+                    // the instruction, not display content — routed onto the open
+                    // field while `in_instr` is set (see the `Text` arm).
+                    "instrText" => in_instr = true,
                     // A footnote/endnote reference marker (`<w:footnoteReference
                     // w:id="N"/>` / `<w:endnoteReference w:id="N"/>`): lower the
                     // referenced note's body inline at this point — a superscript
@@ -1344,7 +1618,7 @@ fn docx_paragraph_model(
                             attr(&attrs, "id").and_then(|id| ctx.footnotes.footnote_bodies.get(id))
                         {
                             for inline in docx_note_inline(ctx, n, resources) {
-                                active_inlines(&mut runs, &mut link).push(inline);
+                                docx_sink(&mut runs, &mut link, &mut fields).push(inline);
                             }
                         }
                     }
@@ -1353,7 +1627,7 @@ fn docx_paragraph_model(
                             attr(&attrs, "id").and_then(|id| ctx.footnotes.endnote_bodies.get(id))
                         {
                             for inline in docx_note_inline(ctx, n, resources) {
-                                active_inlines(&mut runs, &mut link).push(inline);
+                                docx_sink(&mut runs, &mut link, &mut fields).push(inline);
                             }
                         }
                     }
@@ -1362,10 +1636,12 @@ fn docx_paragraph_model(
                         // end the current line, then split onto a new page after
                         // this paragraph (the model splits at block boundaries, so
                         // the break lands between paragraphs — same as the HTML path).
-                        active_inlines(&mut runs, &mut link).push(Inline::LineBreak);
+                        docx_sink(&mut runs, &mut link, &mut fields).push(Inline::LineBreak);
                         page_break_after = true;
                     }
-                    "br" | "cr" => active_inlines(&mut runs, &mut link).push(Inline::LineBreak),
+                    "br" | "cr" => {
+                        docx_sink(&mut runs, &mut link, &mut fields).push(Inline::LineBreak)
+                    }
                     // A hyperlink wraps its runs and points at a relationship
                     // (external URL via `r:id`) or an in-document `w:anchor`.
                     "hyperlink" if !sc => {
@@ -1385,11 +1661,28 @@ fn docx_paragraph_model(
                         let tag = local(&name).to_string();
                         let DocxDrawingModel {
                             image,
+                            text_box,
                             anchored,
                             size,
                             off_x,
                             off_y,
                         } = docx_drawing_model(x, ctx, resources, &tag);
+                        // A text box is a block (paragraphs/tables), so it can't sit
+                        // mid-paragraph: lift it to a sibling `Block` after this one,
+                        // carrying its geometry as a `frame` when the drawing was
+                        // positioned/sized (anchored, or any `wp:extent`/`wp:posOffset`).
+                        if let Some(blocks) = text_box {
+                            let frame = if anchored || size.is_some() {
+                                docx_anchor_frame(size, off_x, off_y, ctx.page_h)
+                            } else {
+                                None
+                            };
+                            floating.push(Block {
+                                frame,
+                                kind: BlockKind::TextBox(model::TextBox { blocks }),
+                                ..Block::default()
+                            });
+                        }
                         if let Some(img) = image {
                             if anchored {
                                 let frame = docx_anchor_frame(size, off_x, off_y, ctx.page_h);
@@ -1399,14 +1692,15 @@ fn docx_paragraph_model(
                                     ..Block::default()
                                 });
                             } else {
-                                active_inlines(&mut runs, &mut link).push(Inline::Image(img));
+                                docx_sink(&mut runs, &mut link, &mut fields)
+                                    .push(Inline::Image(img));
                             }
                         }
                     }
                     // A bare `a:blip` outside a `<w:drawing>` (legacy/VML).
                     "blip" => {
                         if let Some(img) = blip_image_ref(ctx, &attrs, resources) {
-                            active_inlines(&mut runs, &mut link).push(Inline::Image(img));
+                            docx_sink(&mut runs, &mut link, &mut fields).push(Inline::Image(img));
                         }
                     }
                     _ => {}
@@ -1419,6 +1713,14 @@ fn docx_paragraph_model(
                     "pPr" => in_ppr = false,
                     "rPr" => in_rpr = false,
                     "r" => depth = (depth - 1).max(0),
+                    "instrText" => in_instr = false,
+                    // Close a simple field: flush its cached result into the flow.
+                    "fldSimple" => {
+                        if let Some(f) = fields.pop() {
+                            let sink = docx_sink(&mut runs, &mut link, &mut fields);
+                            docx_emit_field(f, sink);
+                        }
+                    }
                     "hyperlink" => {
                         // Close the link: fold its collected children into one
                         // `Inline::Link` appended to the top-level run flow.
@@ -1435,11 +1737,24 @@ fn docx_paragraph_model(
                 }
             }
             Tok::Text(t) => {
-                if depth > 0 && !t.is_empty() {
-                    push_run(active_inlines(&mut runs, &mut link), &run, &t);
+                if in_instr {
+                    // Field instruction characters: accumulate onto the open field
+                    // (never displayed as content).
+                    if let Some(f) = fields.last_mut() {
+                        f.instr.push_str(&t);
+                    }
+                } else if depth > 0 && !t.is_empty() {
+                    push_run(docx_sink(&mut runs, &mut link, &mut fields), &run, &t);
                 }
             }
         }
+    }
+    // Any fields still open at paragraph end (malformed input or a field with no
+    // `end` marker): flush their cached results so no display text is lost. Pop
+    // from the innermost outward so a nested field folds into its parent.
+    while let Some(f) = fields.pop() {
+        let sink = docx_sink(&mut runs, &mut link, &mut fields);
+        docx_emit_field(f, sink);
     }
     // A hyperlink left open at paragraph end (malformed input): flush its
     // children so no text is lost.
@@ -1552,6 +1867,99 @@ fn active_inlines<'a>(runs: &'a mut Vec<Inline>, link: &'a mut Option<DocxLink>)
     }
 }
 
+/// An in-progress DOCX field while it is being walked. A *simple* field
+/// (`w:fldSimple@w:instr`) is its instruction plus the result runs (its
+/// children). A *complex* field is built from `w:fldChar` markers: the
+/// instruction (`w:instrText` between `begin` and `separate`) then the cached
+/// result runs (between `separate` and `end`). `in_result` is `true` once the
+/// result phase has started so runs route into `result`.
+struct DocxField {
+    /// The field instruction (e.g. `HYPERLINK "https://x"`, `PAGE`, `REF _Ref1`).
+    instr: String,
+    /// `false` while the instruction is still being read (complex `begin`→`separate`);
+    /// `true` during the cached-result phase (`separate`→`end`, or a simple field).
+    in_result: bool,
+    /// The field's cached *result* inlines (what Word displays for the field).
+    result: Vec<Inline>,
+}
+
+/// The inline buffer currently receiving runs in [`docx_paragraph_model`]: the
+/// innermost open field's result (a field's result phase wins, so e.g. a
+/// `HYPERLINK` field's display text is captured), else the open hyperlink's
+/// children, else the paragraph's top-level run list. Mirrors [`active_inlines`]
+/// but also threads the field stack.
+fn docx_sink<'a>(
+    runs: &'a mut Vec<Inline>,
+    link: &'a mut Option<DocxLink>,
+    fields: &'a mut [DocxField],
+) -> &'a mut Vec<Inline> {
+    if let Some(f) = fields.last_mut() {
+        if f.in_result {
+            return &mut f.result;
+        }
+    }
+    active_inlines(runs, link)
+}
+
+/// Flush a finished field's cached result into the surrounding inline flow
+/// (`sink`). A `HYPERLINK "url"` instruction wraps the result runs in an
+/// [`Inline::Link`] (an in-document `HYPERLINK \l anchor` jumps to page 0, the
+/// model's page-addressed convention); every other field type
+/// (`REF`/`PAGEREF`/`TOC`/`SEQ`/`STYLEREF`/`PAGE`/`NUMPAGES`/`DATE`/`TIME`/…, and
+/// anything unrecognised) contributes its cached **result** text verbatim — the
+/// raw field code is never emitted. An empty result is dropped.
+fn docx_emit_field(field: DocxField, sink: &mut Vec<Inline>) {
+    let DocxField { instr, result, .. } = field;
+    if result.is_empty() {
+        return;
+    }
+    if let Some(target) = docx_field_hyperlink(&instr) {
+        sink.push(Inline::Link {
+            href: target,
+            children: result,
+        });
+    } else {
+        sink.extend(result);
+    }
+}
+
+/// If `instr` is a `HYPERLINK` field, resolve its [`model::LinkTarget`]: a
+/// quoted/bare URL argument → [`LinkTarget::Url`](model::LinkTarget::Url); a
+/// `\l` switch (in-document bookmark) → [`LinkTarget::Page`](model::LinkTarget::Page)`(0)`
+/// (the model jumps by page index, so an internal anchor targets the start rather
+/// than being dropped). Returns `None` for any non-`HYPERLINK` field.
+fn docx_field_hyperlink(instr: &str) -> Option<model::LinkTarget> {
+    let trimmed = instr.trim();
+    let mut parts = trimmed.split_whitespace();
+    if !parts
+        .next()
+        .is_some_and(|kw| kw.eq_ignore_ascii_case("HYPERLINK"))
+    {
+        return None;
+    }
+    // First quoted string is the URL; otherwise the first non-switch token.
+    if let Some(start) = trimmed.find('"') {
+        if let Some(end_rel) = trimmed[start + 1..].find('"') {
+            let url = &trimmed[start + 1..start + 1 + end_rel];
+            if !url.trim().is_empty() {
+                return Some(model::LinkTarget::Url(url.trim().to_string()));
+            }
+        }
+    }
+    for tok in trimmed.split_whitespace().skip(1) {
+        if tok == "\\l" {
+            // In-document bookmark jump: target the document start (page 0).
+            return Some(model::LinkTarget::Page(0));
+        }
+        if !tok.starts_with('\\') {
+            return Some(model::LinkTarget::Url(tok.to_string()));
+        }
+    }
+    // `HYPERLINK` with only switches (e.g. `\l` was the bookmark name token-less):
+    // fall back to a start-of-document jump so the display text stays linked.
+    Some(model::LinkTarget::Page(0))
+}
+
 /// Resolve a `<w:hyperlink>` to a model [`LinkTarget`]: an external URL via the
 /// relationship `r:id` (the same `word/_rels` table the HTML/image path uses), or
 /// an in-document jump for `w:anchor` (kept as page 0 — the model addresses pages,
@@ -1621,6 +2029,10 @@ fn blip_image_ref(
 struct DocxDrawingModel {
     /// The interned picture, if a resolvable `a:blip` was present.
     image: Option<model::ImageRef>,
+    /// Lowered `w:txbxContent` blocks, if the drawing wrapped a text box
+    /// (DrawingML `wps:txbx`/`a:txBody`, or VML `v:textbox`). A text box is a
+    /// block, not an inline, so the caller emits it as a sibling [`Block`].
+    text_box: Option<Vec<Block>>,
     /// `wp:anchor` seen ⇒ a floating object (vs an in-flow `wp:inline`).
     anchored: bool,
     /// `wp:extent@cx/@cy` in points (the drawing's on-page footprint).
@@ -1635,9 +2047,11 @@ struct DocxDrawingModel {
 /// seen) up to its matching close and resolve it for the model. Mirrors
 /// [`docx_drawing`] (the HTML path) but lowers into [`DocxDrawingModel`]: the
 /// first `a:blip` is interned, `wp:docPr@descr`/`@title` becomes the alt text,
-/// `wp:extent` the size, and a `wp:anchor`'s `wp:posOffset` the absolute offset.
+/// `wp:extent` the size, a `wp:anchor`'s `wp:posOffset` the absolute offset, and
+/// a `w:txbxContent` text box (DrawingML or VML) its lowered block list.
 /// `stop` is the local name of the enclosing element so the right close ends the
-/// scan. The caller decides inline (`Inline::Image`) vs floating (`Block.frame`).
+/// scan. The caller decides inline (`Inline::Image`) vs floating (`Block.frame`)
+/// for an image; a text box is always emitted as a sibling [`Block`].
 fn docx_drawing_model(
     x: &mut Xml,
     ctx: &DocxCtx,
@@ -1672,6 +2086,17 @@ fn docx_drawing_model(
                 "positionV" => cur_axis = Some(false),
                 "blip" if out.image.is_none() => {
                     out.image = blip_image_ref(ctx, &attrs, resources);
+                }
+                // A Word/VML text box: lower its paragraphs/tables into blocks.
+                // Reached through DrawingML (`mc:AlternateContent`/`wps:txbx`/
+                // `a:txBody` → `w:txbxContent`) or VML (`v:textbox` →
+                // `w:txbxContent`). Keep the first one seen (a drawing wraps one
+                // text box body).
+                "txbxContent" if out.text_box.is_none() => {
+                    let blocks = docx_textbox_blocks(x, ctx, resources);
+                    if !blocks.is_empty() {
+                        out.text_box = Some(blocks);
+                    }
                 }
                 _ => {}
             },
@@ -15898,6 +16323,227 @@ mod tests {
             })
             .collect();
         assert_eq!(link_text, "our site");
+    }
+
+    #[test]
+    fn docx_model_symbol_run_maps_to_unicode() {
+        // A `<w:sym w:font="Wingdings" w:char="F0FC"/>` symbol run must surface as
+        // the mapped Unicode glyph (`✓`) in the run flow — not be dropped.
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:r><w:t>Done </w:t></w:r>
+      <w:r><w:sym w:font="Wingdings" w:char="F0FC"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let text: String = model_first_section_inlines(&model)
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains('\u{2713}'),
+            "check mark glyph emitted: {text:?}"
+        );
+        assert!(text.contains("Done"), "surrounding text kept: {text:?}");
+    }
+
+    #[test]
+    fn docx_model_symbol_run_unmapped_falls_back_to_pua() {
+        // An unmapped symbol font/char must fall back to the raw code point with
+        // the `F0xx → U+00xx` PUA folding (here `F041` → `A`), never be dropped.
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p><w:r><w:sym w:font="MysteryDings" w:char="F041"/></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let text: String = model_first_section_inlines(&model)
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "A", "F041 PUA slot folds to U+0041 'A': {text:?}");
+    }
+
+    #[test]
+    fn docx_model_text_box_lowered_to_block() {
+        // A `<w:txbxContent>` (here in a DrawingML `wps:txbx`) carrying a styled
+        // paragraph must surface as a `BlockKind::TextBox` whose blocks hold that
+        // paragraph (with its bold run) — the variant is finally produced.
+        let doc = r#"<w:document xmlns:w="x" xmlns:wp="wp" xmlns:mc="mc" xmlns:wps="wps">
+  <w:body>
+    <w:p><w:r><w:drawing>
+      <wp:anchor>
+        <wp:extent cx="2540000" cy="635000"/>
+        <wp:positionH relativeFrom="margin"><wp:posOffset>635000</wp:posOffset></wp:positionH>
+        <wp:positionV relativeFrom="margin"><wp:posOffset>1270000</wp:posOffset></wp:positionV>
+        <mc:AlternateContent><mc:Choice><wps:wsp><wps:txbx><w:txbxContent>
+          <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Boxed note</w:t></w:r></w:p>
+        </w:txbxContent></wps:txbx></wps:wsp></mc:Choice></mc:AlternateContent>
+      </wp:anchor>
+    </w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let tb = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::TextBox(tb) => Some(tb.clone()),
+                _ => None,
+            })
+            .expect("a BlockKind::TextBox in the model");
+        // The text box carries the styled paragraph (bold run text preserved).
+        let para = tb
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("a paragraph inside the text box");
+        let run = para
+            .runs
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("a run in the text box paragraph");
+        assert_eq!(run.text, "Boxed note");
+        assert!(run.style.bold, "the run's bold style survives the lowering");
+    }
+
+    #[test]
+    fn docx_model_complex_hyperlink_field_becomes_link() {
+        // A complex `HYPERLINK "url"` field (begin/instrText/separate/result/end)
+        // must wrap its cached result runs in an `Inline::Link` to that URL.
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText> HYPERLINK "https://gigapdf.dev/" </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>click here</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let inlines = model_first_section_inlines(&model);
+        let (href, children) = inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Link { href, children } => Some((href.clone(), children.clone())),
+                _ => None,
+            })
+            .expect("a complex HYPERLINK field → Inline::Link");
+        assert_eq!(
+            href,
+            model::LinkTarget::Url("https://gigapdf.dev/".to_string())
+        );
+        let text: String = children
+            .iter()
+            .filter_map(|c| match c {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "click here",
+            "the field's cached result is the link text"
+        );
+        // The raw field code must never leak into the run flow.
+        let all: String = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !all.contains("HYPERLINK"),
+            "no raw field code emitted: {all:?}"
+        );
+    }
+
+    #[test]
+    fn docx_model_simple_field_page_yields_result_text() {
+        // A `<w:fldSimple w:instr=" PAGE ">` must contribute its cached result text
+        // (the child runs), never the raw `PAGE` instruction.
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:r><w:t>Page </w:t></w:r>
+      <w:fldSimple w:instr=" PAGE \* MERGEFORMAT "><w:r><w:t>7</w:t></w:r></w:fldSimple>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let text: String = model_first_section_inlines(&model)
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Page 7", "cached result text only: {text:?}");
+        assert!(
+            !text.contains("PAGE"),
+            "raw instruction suppressed: {text:?}"
+        );
+        // A simple field that is not a hyperlink stays plain text (no link node).
+        assert!(
+            !model_first_section_inlines(&model)
+                .iter()
+                .any(|i| matches!(i, Inline::Link { .. })),
+            "a PAGE field is not a hyperlink"
+        );
+    }
+
+    #[test]
+    fn docx_model_unknown_field_emits_result_not_code() {
+        // An unrecognised field instruction (here `REF _Ref1`) must still emit its
+        // cached result text and nothing of the raw code.
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText> REF _Ref123456 \h </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>Section 3</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let inlines = model_first_section_inlines(&model);
+        let text: String = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Section 3", "result text only: {text:?}");
+        assert!(!text.contains("REF"), "no raw field code: {text:?}");
+        assert!(
+            !inlines.iter().any(|i| matches!(i, Inline::Link { .. })),
+            "a REF field is not a hyperlink"
+        );
     }
 
     #[test]
