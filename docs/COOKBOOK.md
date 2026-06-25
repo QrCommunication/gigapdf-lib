@@ -42,6 +42,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
 - [A toggleable "Watermark" layer (optional content / OCG)](#a-toggleable-watermark-layer-optional-content--ocg)
 - [Merge multiple PDFs](#merge-multiple-pdfs)
+- [2-up booklet & contact sheet (N-up imposition)](#2-up-booklet--contact-sheet-n-up-imposition)
 - [Compact output (object streams + cross-reference stream)](#compact-output-object-streams--cross-reference-stream) — *v0.81.0*
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
 - [Fill and create form fields](#fill-and-create-form-fields)
@@ -741,6 +742,85 @@ doc.appendPages(third, [1, 4, 5]);   // only pages 1, 4 and 5 of `third`
 const merged = doc.saveCompressed();
 doc.close();
 ```
+
+---
+
+## 2-up booklet & contact sheet (N-up imposition)
+
+Imposition draws the **content** of one page, scaled and translated, onto another
+page (ISO 32000-1 §8.10, Form XObjects). The source page becomes a reusable Form
+XObject — its content stream **and** `/Resources` (so its fonts and images come
+along) — and is drawn on the target with a placement matrix. Each placement is a
+single `q <a 0 0 d e f> cm /Fmn Do Q` appended to the target, so it never disturbs
+what is already there.
+
+The low-level primitive is `placePage(target, source, x, y, scaleX, scaleY)`:
+`(x, y)` is where the source page's **visible lower-left corner** lands and
+`(scaleX, scaleY)` scale it **as a reader sees it** — the source's `/MediaBox`
+origin and `/Rotate` are baked into the matrix for you. It is *composable*: call
+it as many times as you like (different sources, different cells) to build a
+sheet. Source and target may be the same page.
+
+**One call for the common cases** — `nUp(cols, rows, opts?)` imposes **every**
+page of the document, `cols × rows` per sheet, onto freshly added sheets. Pages
+go left-to-right, top-to-bottom; each is scaled to fit its cell (aspect
+preserved) and centred; the originals are dropped, leaving only the imposed
+sheets:
+
+```ts
+// 2-up: two source pages side by side per A4-landscape sheet.
+const doc = giga.open(report);
+doc.nUp(2, 1, { sheetWidth: 841.89, sheetHeight: 595.28 }); // A4 landscape
+const twoUp = doc.saveCompressed();
+doc.close();
+
+// 4-up contact sheet (2×2) on A4 portrait with a wider gutter.
+const sheet = giga.open(report);
+const sheets = sheet.nUp(2, 2, { gutter: 24, margin: 28 }); // → number of sheets
+const contact = sheet.saveCompressed();
+sheet.close();
+```
+
+**Hand-rolled 2-up booklet** — when you need full control of placement (custom
+sheet size, booklet page order, crop marks…), build it from `placePage`. Here we
+fold an N-page document into a booklet: a wide sheet with two source pages per
+side, scaled to half width.
+
+```ts
+const src = giga.open(report);
+const n = src.pageCount();
+const { width: pw, height: ph } = src.pageInfo(1); // assume uniform page size
+
+const out = giga.open(report);            // start from the same pages…
+// Append blank landscape sheets, two source pages each.
+const sheetW = pw * 2;
+const sheetH = ph;
+const sheetCount = Math.ceil(n / 2);
+const sheetPages: number[] = [];
+let after = n;                            // append after the originals
+for (let i = 0; i < sheetCount; i++) {
+  out.addPage(sheetW, sheetH, after);
+  after += 1;
+  sheetPages.push(after);
+}
+// Place page 2k onto the left half, 2k+1 onto the right half.
+for (let p = 1; p <= n; p++) {
+  const sheet = sheetPages[Math.floor((p - 1) / 2)];
+  const leftHalf = (p - 1) % 2 === 0;
+  const x = leftHalf ? 0 : pw;
+  out.placePage(sheet, p, x, 0, 1, 1);    // 1:1 — each fills its half exactly
+}
+// Drop the originals, keep only the imposed sheets.
+for (let p = n; p >= 1; p--) out.deletePage(p);
+const booklet = out.saveCompressed();
+src.close();
+out.close();
+```
+
+For an explicit affine (shear, a non-right-angle rotation, a mirror), use
+`placePageMatrix(target, source, [a, b, c, d, e, f])` — it applies your matrix as
+the `cm` directly, with **no** origin/rotation normalisation, so an identity
+matrix draws the source 1:1 at the target origin.
 
 ---
 

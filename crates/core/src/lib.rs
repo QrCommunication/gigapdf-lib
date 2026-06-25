@@ -61,8 +61,9 @@ pub use content::{Bounds, ContentElement, ElementKind, Operation, TextLine, Text
 pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
     AfRelationship, Attachment, Bookmark, Color, Document, EmbeddedFontInfo, GradientKind,
-    GradientSpec, GradientStop, ImageElementInfo, ImageWatermarkOptions, InfoFields, PageBox,
-    PageBoxes, PageBoxesDeclared, PageLabelRange, PageLabelStyle, SearchMatch, SignatureInfo,
+    GradientSpec, GradientStop, ImageElementInfo, ImageWatermarkOptions, InfoFields, NupOptions,
+    PageBox, PageBoxes, PageBoxesDeclared, PageLabelRange, PageLabelStyle, SearchMatch,
+    SignatureInfo,
     SignatureReport, TextElementInfo, TextLayerRun, ViewerPreferences, WatermarkAnchor,
 };
 pub use error::{EngineError, Result};

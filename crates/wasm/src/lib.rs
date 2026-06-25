@@ -2766,6 +2766,85 @@ pub extern "C" fn gp_copy_page(handle: *mut Document, page: u32) -> u32 {
     }
 }
 
+/// N-up imposition: place the **content** of `source` (1-based) scaled and
+/// translated onto `target` (1-based) as a Form XObject (ISO 32000-1 §8.10).
+/// `(x, y)` is where the visible page's lower-left lands; `(scale_x, scale_y)`
+/// scale the page as displayed (the source `/MediaBox` origin and `/Rotate` are
+/// absorbed into the placement matrix). Composable — call repeatedly to build a
+/// 2-up/4-up sheet. 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_place_page(
+    handle: *mut Document,
+    target: u32,
+    source: u32,
+    x: f64,
+    y: f64,
+    scale_x: f64,
+    scale_y: f64,
+) -> i32 {
+    edit(handle, |doc| {
+        doc.place_page(target, source, x, y, scale_x, scale_y)
+    })
+}
+
+/// Place `source` (1-based) onto `target` (1-based) using an explicit
+/// content-stream matrix `[a b c d e f]` — the low-level primitive behind
+/// [`gp_place_page`] for full control of the affine (no origin/rotation
+/// normalization: identity draws the source 1:1 at the target origin). 0 on
+/// success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_place_page_matrix(
+    handle: *mut Document,
+    target: u32,
+    source: u32,
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+) -> i32 {
+    edit(handle, |doc| {
+        doc.place_page_matrix(target, source, [a, b, c, d, e, f])
+            .map(|_| ())
+    })
+}
+
+/// Impose **all** pages `cols × rows` per sheet onto freshly added sheets
+/// (2-up/4-up/booklet thumbnails/contact sheets). Each source is scaled to fit
+/// its cell (aspect preserved) and centred; `sheet_w`/`sheet_h`/`margin`/`gutter`
+/// are points. The originals are dropped, leaving only the imposed sheets.
+/// Returns the number of sheets produced, or a negative error code.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_n_up(
+    handle: *mut Document,
+    cols: u32,
+    rows: u32,
+    sheet_w: f64,
+    sheet_h: f64,
+    margin: f64,
+    gutter: f64,
+) -> i32 {
+    match unsafe { handle.as_mut() } {
+        Some(doc) => {
+            let opts = gigapdf_core::NupOptions {
+                sheet_width: sheet_w,
+                sheet_height: sheet_h,
+                margin,
+                gutter,
+            };
+            match doc.n_up(cols, rows, &opts) {
+                Ok(sheets) => sheets as i32,
+                Err(_) => -3,
+            }
+        }
+        None => -1,
+    }
+}
+
 /// A page's geometry as JSON `{"width":w,"height":h,"rotation":r}` (points,
 /// `/Rotate` normalized). Host frees the buffer.
 #[no_mangle]

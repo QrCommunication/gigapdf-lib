@@ -294,6 +294,53 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("imposition: placePage draws a source page as a scaled Form XObject", () => {
+    const doc = giga.open(giga.txtToPdf("Source page"));
+    doc.addPage(400, 400, 1); // page 2 = blank target sheet
+    expect(doc.pageCount()).toBe(2);
+
+    // Place page 1 onto page 2 at half scale, lower-left at the origin.
+    expect(doc.placePage(2, 1, 0, 0, 0.5, 0.5)).toBe(true);
+
+    const out = new TextDecoder("latin1").decode(doc.save());
+    // A Form XObject was registered and invoked with a `cm` + `Do`.
+    expect(out).toContain("/Subtype /Form");
+    expect(out).toContain("/GpForm0 Do");
+    expect(out).toContain("0.5 0 0 0.5 0 0 cm");
+
+    // Round-trips: reopening keeps both pages.
+    const reopened = giga.open(doc.save());
+    expect(reopened.pageCount()).toBe(2);
+    reopened.close();
+    doc.close();
+  });
+
+  it("imposition: placePageMatrix applies an explicit cm, nUp imposes all pages", () => {
+    // Explicit-matrix primitive.
+    const d1 = giga.open(giga.txtToPdf("Matrix"));
+    d1.addPage(300, 300, 1);
+    expect(d1.placePageMatrix(2, 1, [0.5, 0, 0, 0.5, 10, 10])).toBe(true);
+    expect(new TextDecoder("latin1").decode(d1.save())).toContain("0.5 0 0 0.5 10 10 cm");
+    d1.close();
+
+    // n-up: a 3-page doc, 2-up → 2 sheets, originals dropped.
+    const d2 = giga.open(giga.txtToPdf("Page 1"));
+    d2.addPage(612, 792, 1); // page 2
+    d2.addPage(612, 792, 2); // page 3
+    expect(d2.pageCount()).toBe(3);
+    const sheets = d2.nUp(2, 1, { sheetWidth: 841.89, sheetHeight: 595.28 });
+    expect(sheets).toBe(2);
+    expect(d2.pageCount()).toBe(2); // only the imposed sheets remain
+    const sheetOut = new TextDecoder("latin1").decode(d2.save());
+    expect(sheetOut).toContain("/GpForm0 Do");
+    expect(sheetOut).toContain("/GpForm1 Do");
+    // Reopens cleanly.
+    const reopened = giga.open(d2.save());
+    expect(reopened.pageCount()).toBe(2);
+    reopened.close();
+    d2.close();
+  });
+
   it("page boxes: read defaults, set trim/bleed, round-trip", () => {
     const doc = giga.open(giga.txtToPdf("Boxes"));
     doc.resizePage(1, 612, 792);

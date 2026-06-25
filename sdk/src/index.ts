@@ -3258,6 +3258,67 @@ export class GigaPdfDoc {
   copyPage(page: number): number {
     return this.ex().gp_copy_page(this.h, page);
   }
+  /**
+   * N-up imposition (ISO 32000-1 §8.10): draw the **content** of the 1-based
+   * `source` page, scaled and translated, onto the 1-based `target` page — the
+   * basis for 2-up/4-up, booklets, contact sheets and page-on-page stamping. The
+   * source page becomes a Form XObject (its content + `/Resources`, so its fonts
+   * and images come along) and is drawn with `q <cm> /Fmn Do Q` appended to the
+   * target. `(x, y)` is where the visible page's lower-left corner lands and
+   * `(scaleX, scaleY)` scale the page **as displayed** (its `/MediaBox` origin
+   * and `/Rotate` are absorbed into the matrix). Wrapped in `q`/`Q`, so it never
+   * disturbs existing target content and is **composable** — call it repeatedly
+   * (different sources and/or cells) to build an N-up sheet. `source` and
+   * `target` may be the same page. `false` on engine error (bad page number).
+   */
+  placePage(
+    target: number,
+    source: number,
+    x: number,
+    y: number,
+    scaleX: number,
+    scaleY: number
+  ): boolean {
+    return this.ex().gp_place_page(this.h, target, source, x, y, scaleX, scaleY) === 0;
+  }
+  /**
+   * Place `source` onto `target` (both 1-based) using an explicit content-stream
+   * matrix `[a, b, c, d, e, f]` — the low-level primitive behind
+   * {@link placePage} for full control of the affine (shear, arbitrary rotation,
+   * reflection). The matrix maps the source page's form space (its user space,
+   * including the `/MediaBox` origin) to the target; unlike {@link placePage} no
+   * origin/rotation normalisation is applied, so identity draws the source 1:1
+   * at the target origin. `false` on engine error.
+   */
+  placePageMatrix(target: number, source: number, matrix: [number, number, number, number, number, number]): boolean {
+    const [a, b, c, d, e, f] = matrix;
+    return this.ex().gp_place_page_matrix(this.h, target, source, a, b, c, d, e, f) === 0;
+  }
+  /**
+   * Impose **all** existing pages `cols × rows` per sheet onto freshly added
+   * sheets (2-up, 4-up, booklet thumbnails, contact sheets). Pages go
+   * left-to-right, top-to-bottom; each is scaled uniformly to fit its cell
+   * (aspect preserved) and centred. The new sheets are appended after the last
+   * original page and the **originals are removed**, leaving only the imposed
+   * sheets. Returns the number of sheets produced (negative on error: `cols`/
+   * `rows` 0, or an empty document). `sheetWidth`/`sheetHeight` default to A4
+   * portrait; `margin`/`gutter` to 14 pt.
+   */
+  nUp(
+    cols: number,
+    rows: number,
+    opts: { sheetWidth?: number; sheetHeight?: number; margin?: number; gutter?: number } = {}
+  ): number {
+    return this.ex().gp_n_up(
+      this.h,
+      cols,
+      rows,
+      opts.sheetWidth ?? 595.28,
+      opts.sheetHeight ?? 841.89,
+      opts.margin ?? 14,
+      opts.gutter ?? 14
+    );
+  }
   /** A page's size (points) and `/Rotate` (0/90/180/270). */
   pageInfo(page: number): PageInfo {
     return this.g._json((o) => this.ex().gp_page_info_json(this.h, page, o));

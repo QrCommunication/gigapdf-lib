@@ -1273,6 +1273,53 @@ impl ImageWatermarkOptions {
     }
 }
 
+/// Layout options for [`Document::n_up`] (N-up imposition).
+///
+/// Each output sheet is `sheet_width × sheet_height` points; an outer `margin`
+/// is kept on all four sides and a `gutter` separates adjacent cells. Source
+/// pages are scaled uniformly to fit their cell (aspect preserved) and centred.
+/// Defaults to A4 portrait with a 14 pt margin and 14 pt gutter.
+#[derive(Debug, Clone, Copy)]
+pub struct NupOptions {
+    /// Output sheet width in points.
+    pub sheet_width: f64,
+    /// Output sheet height in points.
+    pub sheet_height: f64,
+    /// Outer margin (all four sides) in points.
+    pub margin: f64,
+    /// Gap between adjacent cells, both horizontally and vertically, in points.
+    pub gutter: f64,
+}
+
+impl Default for NupOptions {
+    fn default() -> Self {
+        // A4 portrait (595.28 × 841.89 pt) with modest margin/gutter.
+        Self {
+            sheet_width: 595.28,
+            sheet_height: 841.89,
+            margin: 14.0,
+            gutter: 14.0,
+        }
+    }
+}
+
+impl NupOptions {
+    /// Default layout: A4 portrait, 14 pt margin and gutter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Options for a sheet of `width × height` points, keeping the default
+    /// margin and gutter.
+    pub fn with_sheet(width: f64, height: f64) -> Self {
+        Self {
+            sheet_width: width,
+            sheet_height: height,
+            ..Self::default()
+        }
+    }
+}
+
 /// Authoring options for the catalog `/ViewerPreferences` dictionary
 /// (ISO 32000-1 §12.2, Table 150) — hints a conforming reader honours when it
 /// first opens the document.
@@ -12379,6 +12426,245 @@ impl Document {
         }
         self.objects.insert(page_id, Object::Dictionary(page));
         Ok(forms.len())
+    }
+
+    // ─── N-up / imposition (place a page onto another page) ───────────────────
+
+    /// Turn the 1-based `source_page` into a reusable **Form XObject** (ISO
+    /// 32000-1 §8.10): its decoded content stream becomes the form body, its
+    /// `/MediaBox` becomes the form `/BBox`, and its (inherited) `/Resources` are
+    /// referenced so every font/image/`/Do` the page draws is reachable from the
+    /// form. The form's `/Matrix` is identity — page rotation and the MediaBox
+    /// origin are handled by the *placement* matrix in [`place_page`], not baked
+    /// into the form, so the same form can be drawn at any position/scale.
+    ///
+    /// Returns the new form object's id. This is same-document: the form shares
+    /// the source page's resource objects (no copy), so the source page can be
+    /// kept, removed, or itself placed elsewhere independently.
+    fn build_page_form_xobject(&mut self, source_page: u32) -> Result<ObjectId> {
+        // Form body = the source page's full, decoded content stream.
+        let body = self.page_content(source_page)?;
+        // /BBox = the source MediaBox (preserves origin); /Resources = inherited.
+        let media = self.page_media_box(source_page)?;
+        let resources = self.effective_resources(source_page);
+
+        let mut dict = Dictionary::new();
+        dict.set(b"Type".to_vec(), annot::name(b"XObject"));
+        dict.set(b"Subtype".to_vec(), annot::name(b"Form"));
+        dict.set(b"FormType".to_vec(), Object::Integer(1));
+        dict.set(b"BBox".to_vec(), annot::real_array(&media));
+        dict.set(b"Resources".to_vec(), Object::Dictionary(resources));
+        dict.set(b"Length".to_vec(), Object::Integer(body.len() as i64));
+
+        let form_id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(form_id, Object::Stream(Stream::new(dict, body)));
+        Ok(form_id)
+    }
+
+    /// Normalisation matrix mapping the source page's form space to an *upright*
+    /// box with its lower-left corner at the form-space origin, given the source
+    /// `/MediaBox` `[x0, y0, x1, y1]` and `/Rotate` (0/90/180/270, the viewer's
+    /// clockwise rotation). After this matrix, the visible page occupies
+    /// `[0, w] × [0, h]` where `(w, h)` are the *post-rotation* dimensions. The
+    /// caller's scale/translate is then composed on top so `(x, y, sx, sy)` act
+    /// on the page as a reader sees it (rotation and origin already absorbed).
+    ///
+    /// Each case is an affine `[a b c d e f]` (`x' = a·x + c·y + e`,
+    /// `y' = b·x + d·y + f`). Derivation: shift by `(-x0, -y0)` to page-local
+    /// coordinates, rotate clockwise by `/Rotate`, then translate the rotated
+    /// box back into the first quadrant.
+    fn imposition_normalize_matrix(media: [f64; 4], rotation: i32) -> [f64; 6] {
+        let [x0, y0, x1, y1] = media;
+        match rotation.rem_euclid(360) {
+            // No rotation: just remove the MediaBox origin.
+            90 => [0.0, -1.0, 1.0, 0.0, -y0, x1],
+            180 => [-1.0, 0.0, 0.0, -1.0, x1, y1],
+            270 => [0.0, 1.0, -1.0, 0.0, y1, -x0],
+            _ => [1.0, 0.0, 0.0, 1.0, -x0, -y0],
+        }
+    }
+
+    /// The post-rotation `(width, height)` of a page: the dimensions a reader
+    /// sees after `/Rotate` is applied. Swapped for 90°/270°.
+    fn imposition_display_size(media: [f64; 4], rotation: i32) -> (f64, f64) {
+        let w = (media[2] - media[0]).abs();
+        let h = (media[3] - media[1]).abs();
+        match rotation.rem_euclid(360) {
+            90 | 270 => (h, w),
+            _ => (w, h),
+        }
+    }
+
+    /// Place the **content** of the 1-based `source_page`, scaled and translated,
+    /// onto the 1-based `target_page` (ISO 32000-1 §8.10 imposition — the basis
+    /// for 2-up/4-up, booklets, contact sheets and page-on-page stamping).
+    ///
+    /// The source page is turned into a Form XObject ([`build_page_form_xobject`]),
+    /// registered on the target under `/Resources /XObject /GpForm<n>`, and drawn
+    /// with `q <a 0 0 d e f cm> /GpForm<n> Do Q` appended to the target content.
+    /// The source page's `/MediaBox` origin and `/Rotate` are absorbed into the
+    /// matrix, so `(x, y)` is where the visible page's lower-left corner lands and
+    /// `(scale_x, scale_y)` scale the page *as displayed* (e.g. `0.5, 0.5` for a
+    /// quadrant). Drawing is wrapped in `q`/`Q`, so it never disturbs content
+    /// already on the target and the call is **composable**: invoke it repeatedly
+    /// (different sources and/or cells) to build an N-up sheet.
+    ///
+    /// `source_page` and `target_page` may be the same document page (it is read
+    /// before being modified). `Err` if either page number is out of range.
+    pub fn place_page(
+        &mut self,
+        target_page: u32,
+        source_page: u32,
+        x: f64,
+        y: f64,
+        scale_x: f64,
+        scale_y: f64,
+    ) -> Result<()> {
+        let media = self.page_media_box(source_page)?;
+        let (_, _, rotation) = self.page_info(source_page)?;
+        let n = Self::imposition_normalize_matrix(media, rotation);
+        // cm = Translate(x, y) · Scale(sx, sy) · N. Pre-multiplying a scale +
+        // translate by N keeps a single affine: scale the linear part, scale the
+        // translation, then add (x, y). With a [0,0]-origin, unrotated source this
+        // collapses to `[sx 0 0 sy x y]`.
+        let matrix = [
+            scale_x * n[0],
+            scale_y * n[1],
+            scale_x * n[2],
+            scale_y * n[3],
+            scale_x * n[4] + x,
+            scale_y * n[5] + y,
+        ];
+        self.place_page_matrix(target_page, source_page, matrix)?;
+        Ok(())
+    }
+
+    /// Place the 1-based `source_page` onto the 1-based `target_page` using an
+    /// explicit content-stream matrix `[a b c d e f]` (the `cm` applied before
+    /// `/Do`) — the low-level primitive behind [`place_page`] for callers that
+    /// want full control of the affine (shear, arbitrary rotation, reflection).
+    ///
+    /// The matrix maps the source page's *form space* — which is the source user
+    /// space, including its `/MediaBox` origin — to the target. Unlike
+    /// [`place_page`], no origin/rotation normalisation is applied: an identity
+    /// matrix draws the source 1:1 at the target origin. Returns the resource
+    /// name (`GpForm<n>`) registered on the target page. `Err` if either page
+    /// number is out of range.
+    pub fn place_page_matrix(
+        &mut self,
+        target_page: u32,
+        source_page: u32,
+        matrix: [f64; 6],
+    ) -> Result<Vec<u8>> {
+        // Validate the target up front so a bad page number fails before any
+        // object is allocated.
+        let _ = self.page_object_id(target_page)?;
+        let form_id = self.build_page_form_xobject(source_page)?;
+        let name = self.register_page_resource(
+            target_page,
+            b"XObject",
+            "GpForm",
+            Object::Reference(form_id),
+        )?;
+        let draw = format!(
+            "q {} {} {} {} {} {} cm /{} Do Q\n",
+            content::num(matrix[0]),
+            content::num(matrix[1]),
+            content::num(matrix[2]),
+            content::num(matrix[3]),
+            content::num(matrix[4]),
+            content::num(matrix[5]),
+            String::from_utf8_lossy(&name),
+        );
+        self.append_page_content(target_page, draw.as_bytes())?;
+        Ok(name)
+    }
+
+    /// Impose **all** existing pages `cols × rows` per sheet onto freshly added
+    /// sheets (2-up, 4-up, 8-up, booklet thumbnails, contact sheets…). Pages are
+    /// placed left-to-right, top-to-bottom; each is scaled uniformly to fit its
+    /// cell (preserving aspect ratio, as displayed) and centred. The new sheets
+    /// are appended after the last original page and the **originals are removed**,
+    /// so the document is left holding only the imposed sheets. Returns the number
+    /// of sheets produced.
+    ///
+    /// `opts` controls the sheet size, outer margin and inter-cell gutter (see
+    /// [`NupOptions`]). Built entirely on [`place_page`], so it inherits correct
+    /// per-page rotation/origin handling. `Err` if `cols`/`rows` is 0 or the
+    /// document has no pages.
+    pub fn n_up(&mut self, cols: u32, rows: u32, opts: &NupOptions) -> Result<usize> {
+        if cols == 0 || rows == 0 {
+            return Err(EngineError::Unsupported(
+                "n_up requires cols ≥ 1 and rows ≥ 1".into(),
+            ));
+        }
+        let original = self.page_count();
+        if original == 0 {
+            return Err(EngineError::Missing("document has no pages".into()));
+        }
+        let per_sheet = (cols * rows) as usize;
+        let sheet_count = original.div_ceil(per_sheet);
+
+        let (sheet_w, sheet_h) = (opts.sheet_width, opts.sheet_height);
+        let cell_w = (sheet_w - 2.0 * opts.margin - opts.gutter * (cols.saturating_sub(1)) as f64)
+            / cols as f64;
+        let cell_h = (sheet_h - 2.0 * opts.margin - opts.gutter * (rows.saturating_sub(1)) as f64)
+            / rows as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return Err(EngineError::Unsupported(
+                "n_up: margins/gutter leave no room for cells".into(),
+            ));
+        }
+
+        // Add all sheets first (after the last original page), capturing the
+        // page number of each. Their numbers stay valid as we place sources,
+        // because placement never adds or removes pages.
+        let mut sheet_pages = Vec::with_capacity(sheet_count);
+        let mut after = original as u32;
+        for _ in 0..sheet_count {
+            self.add_page(sheet_w, sheet_h, after)?;
+            after += 1;
+            sheet_pages.push(after);
+        }
+
+        // Place each original page (1..=original) into its cell.
+        for src in 1..=original as u32 {
+            let slot = (src - 1) as usize;
+            let sheet_idx = slot / per_sheet;
+            let cell = slot % per_sheet;
+            let col = (cell as u32) % cols;
+            let row = (cell as u32) / cols;
+            let target = sheet_pages[sheet_idx];
+
+            let media = self.page_media_box(src)?;
+            let (_, _, rot) = self.page_info(src)?;
+            let (disp_w, disp_h) = Self::imposition_display_size(media, rot);
+            if disp_w <= 0.0 || disp_h <= 0.0 {
+                continue;
+            }
+            // Uniform fit-to-cell, preserving aspect ratio.
+            let scale = (cell_w / disp_w).min(cell_h / disp_h);
+            let placed_w = disp_w * scale;
+            let placed_h = disp_h * scale;
+
+            // Cell origin (lower-left) in target user space. Row 0 is the TOP row.
+            let cell_x = opts.margin + col as f64 * (cell_w + opts.gutter);
+            let cell_y =
+                sheet_h - opts.margin - (row as f64 + 1.0) * cell_h - row as f64 * opts.gutter;
+            // Centre the placed page within the cell.
+            let x = cell_x + (cell_w - placed_w) / 2.0;
+            let y = cell_y + (cell_h - placed_h) / 2.0;
+
+            self.place_page(target, src, x, y, scale, scale)?;
+        }
+
+        // Drop the originals (highest page number first so indices stay valid).
+        for src in (1..=original as u32).rev() {
+            self.delete_page(src)?;
+        }
+
+        Ok(sheet_count)
     }
 
     /// Flatten the interactive form: bake every field widget's appearance into
@@ -29145,5 +29431,355 @@ mod tests {
             trailer.get(b"Root").and_then(Object::as_reference),
             Some((1, 0))
         );
+    }
+
+    // ─── N-up / imposition (place_page / place_page_matrix / n_up) ────────────
+
+    /// A 2-page document. Page 1 is a 200×200 *blank* white sheet. Page 2 is a
+    /// 100×100 page whose content fills its whole box with solid **green**, and
+    /// whose `/Resources` carry an (unused-by-content but reachable) `/Font` and
+    /// an image `/XObject` — so a test can assert those resources survive into the
+    /// generated form. Returns the opened `Document`.
+    fn two_page_imposition_doc() -> Document {
+        // Page 2 paints a green rectangle over its full 100×100 box.
+        let p2 = b"0 1 0 rg 0 0 100 100 re f".to_vec();
+        let p2_stream = {
+            let mut s = format!("<< /Length {} >>\nstream\n", p2.len()).into_bytes();
+            s.extend_from_slice(&p2);
+            s.extend_from_slice(b"\nendstream");
+            s
+        };
+        // A trivial 1×1 image XObject referenced from page 2's resources.
+        let img = b"\xFF\x00\x00".to_vec();
+        let img_stream = {
+            let mut s = format!(
+                "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+                img.len()
+            )
+            .into_bytes();
+            s.extend_from_slice(&img);
+            s.extend_from_slice(b"\nendstream");
+            s
+        };
+        let objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            ),
+            // Page 1: blank 200×200.
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R \
+                  /Resources << >> >>"
+                    .to_vec(),
+            ),
+            // Page 2: 100×100 green, with /Font F1 and /XObject Im0 in resources.
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 6 0 R \
+                  /Resources << /Font << /F1 7 0 R >> /XObject << /Im0 8 0 R >> >> >>"
+                    .to_vec(),
+            ),
+            (5, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
+            (6, p2_stream),
+            (
+                7,
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            ),
+            (8, img_stream),
+        ];
+        Document::open(&raw_pdf_binary(&objects)).unwrap()
+    }
+
+    #[test]
+    fn place_page_registers_form_xobject_with_source_content_resources_and_matrix() {
+        let mut doc = two_page_imposition_doc();
+
+        // Place page 2 onto page 1 at half scale, lower-left at the origin.
+        doc.place_page(1, 2, 0.0, 0.0, 0.5, 0.5).unwrap();
+
+        // A `/GpForm0` XObject is now registered on page 1.
+        let form_id = doc
+            .xobject_id(1, b"GpForm0")
+            .expect("GpForm0 registered on page 1 /Resources /XObject");
+
+        // Its stream body IS the source page's content (the green fill).
+        let form = match doc.objects.get(&form_id) {
+            Some(Object::Stream(s)) => s,
+            _ => panic!("form XObject must be a stream"),
+        };
+        let src_content = doc.page_content(2).unwrap();
+        assert_eq!(
+            crate::filters::decode_stream(form).unwrap(),
+            src_content,
+            "form body == source page content stream"
+        );
+        // It is a Form XObject with the source MediaBox as its /BBox.
+        assert_eq!(
+            form.dict.get(b"Subtype").and_then(Object::as_name),
+            Some(b"Form".as_slice())
+        );
+        assert_eq!(
+            form.dict
+                .get(b"BBox")
+                .and_then(Object::as_array)
+                .map(|a| a.iter().filter_map(Object::as_f64).collect::<Vec<_>>()),
+            Some(vec![0.0, 0.0, 100.0, 100.0])
+        );
+
+        // The source page's /Resources (font + image) are reachable from the form:
+        // the form's /Resources points at the SAME font and image objects.
+        let res = form
+            .dict
+            .get(b"Resources")
+            .and_then(Object::as_dict)
+            .expect("form has /Resources");
+        let font_ref = res
+            .get(b"Font")
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"F1"))
+            .and_then(Object::as_reference)
+            .expect("form /Resources /Font /F1");
+        let img_ref = res
+            .get(b"XObject")
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get(b"Im0"))
+            .and_then(Object::as_reference)
+            .expect("form /Resources /XObject /Im0");
+        assert!(
+            doc.objects.contains_key(&font_ref),
+            "font object reachable from the form"
+        );
+        assert!(
+            matches!(doc.objects.get(&img_ref), Some(Object::Stream(_))),
+            "image object reachable from the form"
+        );
+
+        // Page 1's content now ends with `q 0.5 0 0 0.5 0 0 cm /GpForm0 Do Q`
+        // (origin-0, unrotated source ⇒ pure scale+translate).
+        let page1 = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert!(
+            page1.contains("q 0.5 0 0 0.5 0 0 cm /GpForm0 Do Q"),
+            "page 1 draws the form with the expected cm; got:\n{page1}"
+        );
+    }
+
+    #[test]
+    fn place_page_translates_and_scales_with_offset() {
+        let mut doc = two_page_imposition_doc();
+        // Quarter scale, lower-left at (120, 30).
+        doc.place_page(1, 2, 120.0, 30.0, 0.25, 0.25).unwrap();
+        let page1 = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert!(
+            page1.contains("q 0.25 0 0 0.25 120 30 cm /GpForm0 Do Q"),
+            "scale+translate baked into the cm; got:\n{page1}"
+        );
+    }
+
+    #[test]
+    fn place_two_pages_yields_two_forms_and_two_do_invocations() {
+        let mut doc = two_page_imposition_doc();
+
+        // Place page 2 twice onto page 1 (two cells of a 2-up sheet).
+        doc.place_page(1, 2, 0.0, 0.0, 0.5, 0.5).unwrap();
+        doc.place_page(1, 2, 100.0, 0.0, 0.5, 0.5).unwrap();
+
+        // Two distinct form XObjects registered.
+        let f0 = doc.xobject_id(1, b"GpForm0").expect("GpForm0");
+        let f1 = doc.xobject_id(1, b"GpForm1").expect("GpForm1");
+        assert_ne!(f0, f1, "each placement allocates its own form object");
+
+        // Two `Do` invocations in the page content.
+        let page1 = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert_eq!(
+            page1.matches(" Do Q").count(),
+            2,
+            "two form draws; got:\n{page1}"
+        );
+        assert!(page1.contains("/GpForm0 Do"));
+        assert!(page1.contains("/GpForm1 Do"));
+    }
+
+    #[test]
+    fn place_page_matrix_normalizes_source_rotation_and_origin() {
+        // Source rotation matrix is a pure function of MediaBox + /Rotate; verify
+        // every quadrant of the documented derivation directly.
+        // MediaBox with a non-zero origin to exercise origin handling.
+        let mb = [10.0, 20.0, 210.0, 120.0]; // W = 200, H = 100.
+
+        // 0°: just removes the origin.
+        assert_eq!(
+            Document::imposition_normalize_matrix(mb, 0),
+            [1.0, 0.0, 0.0, 1.0, -10.0, -20.0]
+        );
+        // 90°: [0 -1 1 0 -y0 x1] = [0 -1 1 0 -20 210].
+        assert_eq!(
+            Document::imposition_normalize_matrix(mb, 90),
+            [0.0, -1.0, 1.0, 0.0, -20.0, 210.0]
+        );
+        // 180°: [-1 0 0 -1 x1 y1] = [-1 0 0 -1 210 120].
+        assert_eq!(
+            Document::imposition_normalize_matrix(mb, 180),
+            [-1.0, 0.0, 0.0, -1.0, 210.0, 120.0]
+        );
+        // 270°: [0 1 -1 0 y1 -x0] = [0 1 -1 0 120 -10].
+        assert_eq!(
+            Document::imposition_normalize_matrix(mb, 270),
+            [0.0, 1.0, -1.0, 0.0, 120.0, -10.0]
+        );
+
+        // Post-rotation display size swaps W/H for 90°/270°.
+        assert_eq!(Document::imposition_display_size(mb, 0), (200.0, 100.0));
+        assert_eq!(Document::imposition_display_size(mb, 90), (100.0, 200.0));
+    }
+
+    #[test]
+    fn place_page_on_rotated_source_emits_normalized_cm() {
+        // Page 2 is /Rotate 90; placing it at scale 1 must bake the 90° normalize
+        // matrix into the cm (so the placed page is upright at the target origin).
+        let p2 = b"0 0 1 rg 0 0 100 60 re f".to_vec();
+        let p2_stream = {
+            let mut s = format!("<< /Length {} >>\nstream\n", p2.len()).into_bytes();
+            s.extend_from_slice(&p2);
+            s.extend_from_slice(b"\nendstream");
+            s
+        };
+        let objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            ),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R \
+                  /Resources << >> >>"
+                    .to_vec(),
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Rotate 90 \
+                  /Contents 6 0 R /Resources << >> >>"
+                    .to_vec(),
+            ),
+            (5, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
+            (6, p2_stream),
+        ];
+        let mut doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        doc.place_page(1, 2, 0.0, 0.0, 1.0, 1.0).unwrap();
+
+        // N(90) for MediaBox [0 0 100 60] = [0 -1 1 0 -0 100]; scale 1, offset 0
+        // ⇒ cm = [0 -1 1 0 0 100].
+        let page1 = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert!(
+            page1.contains("q 0 -1 1 0 0 100 cm /GpForm0 Do Q"),
+            "rotated source normalized into the cm; got:\n{page1}"
+        );
+    }
+
+    #[test]
+    fn placed_page_renders_after_save_and_reopen() {
+        let mut doc = two_page_imposition_doc();
+        // Place the green 100×100 page onto the lower-left quadrant of the
+        // 200×200 page at half scale (so it covers x,y ∈ [0,50]).
+        doc.place_page(1, 2, 0.0, 0.0, 0.5, 0.5).unwrap();
+
+        // Round-trip through serialization.
+        let bytes = doc.save();
+        let reopened = Document::open(&bytes).unwrap();
+
+        // Render page 1 at 1× (200×200 device pixels, origin top-left).
+        let canvas = reopened.render_page_canvas(1, 1.0, false).unwrap();
+        // The placed page occupies user-space [0,50]×[0,50] → device bottom-left.
+        // Device y is flipped: user y∈[0,50] ⇒ device y∈[150,200). Sample (25,175).
+        let inside = px(&canvas, 25, 175);
+        assert!(
+            inside[1] > 180 && inside[0] < 80 && inside[2] < 80,
+            "placed source paints green in its quadrant after round-trip, got {inside:?}"
+        );
+        // Outside the placed quadrant stays white (top area, user y high).
+        let outside = px(&canvas, 150, 25);
+        assert!(
+            outside[0] > 200 && outside[1] > 200 && outside[2] > 200,
+            "area outside the placed page stays blank, got {outside:?}"
+        );
+    }
+
+    #[test]
+    fn place_page_matrix_returns_resource_name_and_applies_raw_matrix() {
+        let mut doc = two_page_imposition_doc();
+        // Raw matrix primitive: identity-ish, no normalization applied.
+        let name = doc
+            .place_page_matrix(1, 2, [0.5, 0.0, 0.0, 0.5, 10.0, 10.0])
+            .unwrap();
+        assert_eq!(name, b"GpForm0");
+        let page1 = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert!(page1.contains("q 0.5 0 0 0.5 10 10 cm /GpForm0 Do Q"));
+    }
+
+    #[test]
+    fn n_up_two_up_imposes_all_pages_and_drops_originals() {
+        // A 3-page doc (each 100×100, distinct fill) → 2-up onto A4 sheets.
+        let mut objs: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_vec(),
+            ),
+        ];
+        for (i, page_id) in [3u32, 4, 5].into_iter().enumerate() {
+            let content_id = 6 + i as u32;
+            objs.push((
+                page_id,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                     /Contents {content_id} 0 R /Resources << >> >>"
+                )
+                .into_bytes(),
+            ));
+        }
+        for (i, content_id) in [6u32, 7, 8].into_iter().enumerate() {
+            let fill = format!("{} 0 0 rg 0 0 100 100 re f", i); // harmless coeff
+            let mut s = format!("<< /Length {} >>\nstream\n", fill.len()).into_bytes();
+            s.extend_from_slice(fill.as_bytes());
+            s.extend_from_slice(b"\nendstream");
+            objs.push((content_id, s));
+        }
+        let mut doc = Document::open(&raw_pdf_binary(&objs)).unwrap();
+        assert_eq!(doc.page_count(), 3);
+
+        // 2 columns × 1 row = 2 per sheet ⇒ ceil(3/2) = 2 sheets.
+        let opts = NupOptions::with_sheet(595.28, 841.89);
+        let sheets = doc.n_up(2, 1, &opts).unwrap();
+        assert_eq!(sheets, 2);
+
+        // Only the 2 sheets remain (originals dropped).
+        assert_eq!(doc.page_count(), 2);
+
+        // Sheet 1 carries two placed pages (two forms), sheet 2 carries one.
+        assert!(doc.xobject_id(1, b"GpForm0").is_some());
+        assert!(doc.xobject_id(1, b"GpForm1").is_some());
+        let s1 = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert_eq!(s1.matches(" Do Q").count(), 2, "sheet 1 has 2 cells");
+        let s2 = String::from_utf8(doc.page_content(2).unwrap()).unwrap();
+        assert_eq!(s2.matches(" Do Q").count(), 1, "sheet 2 has the 3rd page");
+
+        // Sheets are A4 sized.
+        let (w, h, _) = doc.page_info(1).unwrap();
+        assert!((w - 595.28).abs() < 0.01 && (h - 841.89).abs() < 0.01);
+
+        // Still renders after a round-trip.
+        let bytes = doc.save();
+        let reopened = Document::open(&bytes).unwrap();
+        assert!(reopened.render_page_canvas(1, 1.0, false).is_ok());
+    }
+
+    #[test]
+    fn n_up_rejects_zero_grid() {
+        let mut doc = two_page_imposition_doc();
+        assert!(doc.n_up(0, 2, &NupOptions::default()).is_err());
+        assert!(doc.n_up(2, 0, &NupOptions::default()).is_err());
     }
 }
