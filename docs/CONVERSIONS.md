@@ -117,8 +117,10 @@ headings/figures bridging the gutter — see the column note below) · **run-lev
 rotated / vertical in-page text**
 (the baseline angle from the text/CTM matrix is carried onto the reconstructed
 block's rotation — `90°/180°/270°` snap to the exact cardinal, any other angle is
-preserved free-form, and upright text stays unrotated) · ruled tables (with
-col/row spans) · images — both `Do` XObjects **and inline images**
+preserved free-form, and upright text stays unrotated) · ruled **and** borderless
+tables (with col/row spans, including borderless merged cells inferred from text
+geometry; large/sparse/long tables kept via a structural test; rotated tables
+projected onto their reading axes) · images — both `Do` XObjects **and inline images**
 (`BI`/`ID`/`EI`, ISO 32000-1 §8.9.7) — with lifted figure captions · vector
 shapes · underline/strike (from drawn rules) · external + internal hyperlinks ·
 outline/bookmarks · page geometry · **running headers/footers** (stripped from the
@@ -240,9 +242,19 @@ is never promoted.
 
 **Limits on arbitrary third-party PDFs (tracked in [#5](../../issues/5)):**
 
-- **Tables**: no header-row (`<th>`) concept; borderless merged cells forced 1×1;
-  very sparse / very wide (>14 cols) / very long (>160 cells) / rotated tables are
-  dropped.
+- **Tables**: detection now recovers **merged (spanning) cells in borderless
+  tables** (a run whose box reaches across otherwise-empty columns/rows becomes a
+  `col_span`/`row_span` cell, no phantom blank cell left behind — alongside the
+  ruled path's missing-rule span inference), keeps **large / sparse / long tables**
+  (the old flat caps of 14 cols / 160 cells / 28 % fill are replaced by a
+  structural test — a wide or sparse grid is kept when most of its rows
+  consistently span several columns, the signature of a real table; field-fence
+  *forms* and running prose still fall back to paragraphs), and detects **rotated
+  tables** (a table on a 90/180/270° page or region is projected onto its logical
+  reading axes, so its rows/columns are found along the rotated direction and the
+  cells emit in logical order with the table block oriented to match). Still
+  missing: a **header-row (`<th>`/`thead`) concept** — no cell is marked as a
+  header, so exports get `<td>` throughout.
 - **Lists**: list detection is **ordinal-validated** — a run of ordered markers
   is only taken as a list when it forms a coherent sequence (consecutive/monotonic
   in one `1.`/`a)`/`i.` format, small gaps tolerated, starting at a plausible first

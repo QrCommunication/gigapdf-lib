@@ -55,6 +55,31 @@ pub struct PlannedTable {
     /// [`ParagraphStyle::align`] so a right-aligned numeric column round-trips as
     /// right-aligned. Length is kept in lock-step with `cols` by construction.
     col_align: Vec<Align>,
+    /// Logical reading orientation of the table. `D0` for an ordinary upright
+    /// table; a cardinal rotation when the table sits on a rotated page (or its
+    /// region's text reads along a rotated axis). `cols`/`rows`/`*_segs` are then
+    /// expressed in the table's **logical** frame (reading-X ascending in `cols`,
+    /// reading-Y descending in `rows`), and [`build_table`] both honours this
+    /// orientation on the emitted [`Block::rotation`] and projects each run into
+    /// the logical frame before dropping it into a cell. `D0` ⇒ the logical frame
+    /// is the identity, so every upright table is byte-identical to before.
+    rotation: Rotation,
+    /// Optional explicit `(col_span, row_span)` per `(row, col)` slot, row-major
+    /// over the `rows.len()-1 × cols.len()-1` grid. **Borderless** tables fill
+    /// this from text geometry (a block whose extent covers several column/row
+    /// bands), since they carry no rules to infer merges from; **ruled** tables
+    /// leave it empty and let [`build_table`] infer spans from missing interior
+    /// rules instead. Empty ⇒ rule-inference (or plain 1×1) governs, so ruled and
+    /// upright tables are unchanged.
+    spans: Vec<(u16, u16)>,
+    /// For a **rotated** table only: the runs to materialise, already re-grouped
+    /// into reading-order lines in the table's own logical frame (the caller's
+    /// Y-banded `lines` mis-group rotated text, so a rotated table carries its own
+    /// projected lines). When non-empty, [`build_table`] iterates these instead of
+    /// the caller's `lines[covered_lines]`; their boxes are already in the logical
+    /// frame, matching `cols`/`rows`, so cell placement is unchanged. Empty for an
+    /// upright (`D0`) table ⇒ the caller's lines are used exactly as before.
+    own_lines: Vec<ReconLine>,
 }
 
 /// The set of tables planned for a page, with helpers `reconstruct_page` uses to
@@ -87,18 +112,134 @@ impl TablePlan {
     }
 }
 
+// ── rotated-table support: the logical reading frame ─────────────────────────
+//
+// PDF text on a rotated page is still reported with **axis-aligned** bounding
+// boxes (`x/y/w/h`), but its *reading* axes are rotated: a 90°-CCW table's
+// columns advance up the page (+Y) and its rows stack across it (+X). Every
+// heuristic here (cluster start-x into columns, band baselines into rows, drop a
+// run's centre into a cell) assumes the upright convention. Rather than
+// special-case each, we project all geometry into a **logical frame** whose
+// reading-X runs left→right and reading-Y runs bottom→top exactly as for an
+// upright page, run the unchanged planners there, then un-project the grid edges
+// back to PDF space so `build_table` (which places runs by centre, in PDF space)
+// works as before. For `Rotation::D0` the frame is the identity, so upright
+// tables are byte-for-byte unchanged.
+
+/// A rotation-aware mapping between PDF user space (axis-aligned boxes, origin
+/// bottom-left) and the table's **logical reading frame** (reading-X →, reading-Y
+/// ↑). Only the four cardinal rotations are modelled; any other orientation
+/// (free-form `Deg`) is treated as upright (`D0`) so an arbitrarily-skewed region
+/// never mis-projects — it simply falls back to the prior upright behaviour.
+#[derive(Clone, Copy)]
+struct LogicalFrame {
+    rotation: Rotation,
+}
+
+impl LogicalFrame {
+    fn new(rotation: Rotation) -> Self {
+        let rotation = match rotation {
+            Rotation::D90 | Rotation::D180 | Rotation::D270 => rotation,
+            _ => Rotation::D0,
+        };
+        LogicalFrame { rotation }
+    }
+
+    /// The logical reading-X span `[lo, hi]` of a PDF box `[x, x+w] × [y, y+h]`.
+    /// Reading-X is the direction successive glyphs of a line advance: +X (D0),
+    /// +Y (D90), −X (D180), −Y (D270).
+    fn lx(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
+        match self.rotation {
+            Rotation::D0 => (x, x + w),
+            Rotation::D90 => (y, y + h),
+            Rotation::D180 => (-(x + w), -x),
+            Rotation::D270 => (-(y + h), -y),
+            Rotation::Deg(_) => (x, x + w),
+        }
+    }
+
+    /// The logical reading-Y span `[lo, hi]` of a PDF box. Reading-Y is the
+    /// down-the-page direction (rows stack in **decreasing** reading-Y); the span
+    /// is returned `lo ≤ hi` and a higher logical-Y is "earlier" (top) — matching
+    /// the upright convention where the first row has the largest Y.
+    fn ly(&self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
+        match self.rotation {
+            Rotation::D0 => (y, y + h),
+            // D90 reads up the page, so the page's +X is "down the lines": a
+            // larger X is a later row ⇒ negate so the first row has the largest
+            // logical-Y.
+            Rotation::D90 => (-(x + w), -x),
+            Rotation::D180 => (-(y + h), -y),
+            Rotation::D270 => (x, x + w),
+            Rotation::Deg(_) => (y, y + h),
+        }
+    }
+
+    /// Map a single PDF point to its logical `(reading_x, reading_y)`.
+    fn point(&self, x: f64, y: f64) -> (f64, f64) {
+        match self.rotation {
+            Rotation::D0 => (x, y),
+            Rotation::D90 => (y, -x),
+            Rotation::D180 => (-x, -y),
+            Rotation::D270 => (-y, x),
+            Rotation::Deg(_) => (x, y),
+        }
+    }
+
+    /// Inverse of [`point`]: map a logical `(reading_x, reading_y)` back to a PDF
+    /// point. Used to un-project clustered grid edges into PDF space.
+    fn inv_point(&self, lx: f64, ly: f64) -> (f64, f64) {
+        match self.rotation {
+            Rotation::D0 => (lx, ly),
+            Rotation::D90 => (-ly, lx),
+            Rotation::D180 => (-lx, -ly),
+            Rotation::D270 => (ly, -lx),
+            Rotation::Deg(_) => (lx, ly),
+        }
+    }
+}
+
 /// Plan the page's tables from its lines and painted paths. Ruled tables take
 /// precedence; the borderless fallback runs over the lines no ruled table
 /// claimed.
+///
+/// The page's dominant text orientation is detected first: an **upright** page
+/// (the overwhelming common case) is planned directly on the caller's lines, so
+/// nothing changes. A **cardinally-rotated** page (its body text reads along a
+/// 90/180/270° axis — a rotated `/Rotate` page or a sideways insert) is planned
+/// in a *logical reading frame* so its columns/rows project along the rotated
+/// axes, and each table carries that rotation through to its emitted block.
 pub fn plan_tables(
     lines: &[ReconLine],
     vpaths: &[VectorPath],
     ignore_paths: &BTreeSet<usize>,
 ) -> TablePlan {
-    let mut plan = TablePlan::default();
     if lines.is_empty() {
-        return plan;
+        return TablePlan::default();
     }
+
+    // The orientation a table on this page should reconstruct with: the dominant
+    // baseline rotation of all the page's runs. `D0` ⇒ the ordinary upright path
+    // (byte-identical to before). A cardinal rotation routes through the logical
+    // frame; a free-form `Deg` falls back to upright (`LogicalFrame::new`).
+    let page_runs: Vec<ReconRun> = lines.iter().flat_map(|l| l.runs.iter().cloned()).collect();
+    let frame = LogicalFrame::new(runs_rotation(&page_runs));
+    if matches!(frame.rotation, Rotation::D0) {
+        return plan_upright(lines, vpaths, ignore_paths);
+    }
+    plan_rotated(lines, vpaths, ignore_paths, frame)
+}
+
+/// The upright planner: ruled tables first (gated against form layouts), then the
+/// borderless fallback over the still-free lines. This is the original
+/// `plan_tables` body verbatim; `plan_tables` now only dispatches to it for an
+/// upright page.
+fn plan_upright(
+    lines: &[ReconLine],
+    vpaths: &[VectorPath],
+    ignore_paths: &BTreeSet<usize>,
+) -> TablePlan {
+    let mut plan = TablePlan::default();
 
     // A ruled candidate is only accepted if it looks like a real *data* table
     // and not a **form** layout (dense rules that merely separate fields). When
@@ -130,6 +271,198 @@ pub fn plan_tables(
     plan
 }
 
+/// Plan tables on a **cardinally-rotated** page. Every run box and ruling segment
+/// is projected into the logical reading frame (where the table is upright), the
+/// unchanged upright planners run there, and each resulting grid is mapped back so
+/// it materialises against the **original** lines:
+///
+/// * `cols`/`rows`/`*_segs` stay in **logical** space and the table carries
+///   `frame.rotation`; the runs it materialises (`own_lines`) are *also* in the
+///   logical frame, so [`build_table`]'s centre-into-cell placement lines up and
+///   the emitted block is oriented with `frame.rotation`;
+/// * `covered_lines`/`start_line` are recomputed in **original**-line index space
+///   (by PDF-extent containment) so `reconstruct_page`'s skip/emit bookkeeping is
+///   unaffected;
+/// * the table keeps its own projected, reading-order `own_lines` (the caller's
+///   Y-banded `lines` mis-group rotated text), which is what gets materialised.
+fn plan_rotated(
+    lines: &[ReconLine],
+    vpaths: &[VectorPath],
+    ignore_paths: &BTreeSet<usize>,
+    frame: LogicalFrame,
+) -> TablePlan {
+    // Project every run into the logical frame, then regroup into reading-order
+    // lines there (banding by the now-correct logical centre-Y).
+    let proj_runs: Vec<ReconRun> = lines
+        .iter()
+        .flat_map(|l| l.runs.iter())
+        .map(|r| project_run(r, &frame))
+        .collect();
+    let proj_lines = super::lines::group_into_lines(&proj_runs);
+
+    // Project the ruling paths the same way: a horizontal rule stays horizontal in
+    // the logical frame for D0/D180 and becomes the *other* axis for D90/D270, so
+    // we rebuild VectorPaths whose bounds/segments are the projected box. The path
+    // index is preserved so `used_paths` still refers to the real page path.
+    let proj_paths: Vec<VectorPath> = vpaths.iter().map(|p| project_path(p, &frame)).collect();
+
+    // Plan in projected space exactly as upright. The returned tables index
+    // `proj_lines`; we keep those projected tables so we can both (a) compute the
+    // free set for the borderless pass and (b) finalise each into a rotated table.
+    let mut ruled: Vec<PlannedTable> = Vec::new();
+    for t in plan_ruled_all(&proj_lines, &proj_paths, ignore_paths) {
+        if passes_table_sanity(&t, &proj_lines) {
+            ruled.push(t);
+        }
+    }
+    let claimed: BTreeSet<usize> = ruled
+        .iter()
+        .flat_map(|t| t.covered_lines.iter().copied())
+        .collect();
+    let free: Vec<usize> = (0..proj_lines.len())
+        .filter(|i| !claimed.contains(i))
+        .collect();
+    let mut borderless: Vec<PlannedTable> = Vec::new();
+    for t in plan_borderless_all(&proj_lines, &free) {
+        if passes_table_sanity(&t, &proj_lines) {
+            borderless.push(t);
+        }
+    }
+
+    let mut plan = TablePlan::default();
+    for t in ruled.into_iter().chain(borderless) {
+        plan.tables
+            .push(finalize_rotated(t, lines, &proj_lines, frame));
+    }
+    plan
+}
+
+/// Clone a run with its bounding box rewritten into the logical frame: the
+/// projected reading-X/reading-Y spans become the new axis-aligned `x/y/w/h`, and
+/// the run's baseline `rotation` is zeroed (it is upright *in* the logical frame).
+/// Text, size, style and `source_index` are preserved so the materialised cell is
+/// unchanged but its geometry is now upright.
+fn project_run(run: &ReconRun, frame: &LogicalFrame) -> ReconRun {
+    let (lx0, lx1) = frame.lx(run.x, run.y, run.w, run.h);
+    let (ly0, ly1) = frame.ly(run.x, run.y, run.w, run.h);
+    ReconRun {
+        x: lx0,
+        y: ly0,
+        w: (lx1 - lx0).abs(),
+        h: (ly1 - ly0).abs(),
+        rotation: 0.0,
+        ..run.clone()
+    }
+}
+
+/// Clone a ruling path with its bounds and segment points projected into the
+/// logical frame, so [`ruling_orientation`] classifies it along the rotated axes.
+/// The path `index` is preserved (so `used_paths` still names the real page path);
+/// only the geometry is transformed. Fills/strokes are carried unchanged — only
+/// the bounds and segment coordinates matter to the ruling classifier.
+fn project_path(path: &VectorPath, frame: &LogicalFrame) -> VectorPath {
+    use crate::content::vector::PathSeg;
+    use crate::content::Bounds;
+    let mut out = path.clone();
+    if let Some(b) = path.bounds {
+        let (lx0, lx1) = frame.lx(b.x, b.y, b.width, b.height);
+        let (ly0, ly1) = frame.ly(b.x, b.y, b.width, b.height);
+        out.bounds = Some(Bounds {
+            x: lx0.min(lx1),
+            y: ly0.min(ly1),
+            width: (lx1 - lx0).abs(),
+            height: (ly1 - ly0).abs(),
+        });
+    }
+    out.segments = path
+        .segments
+        .iter()
+        .map(|seg| match *seg {
+            PathSeg::Move(x, y) => {
+                let (px, py) = frame.point(x, y);
+                PathSeg::Move(px, py)
+            }
+            PathSeg::Line(x, y) => {
+                let (px, py) = frame.point(x, y);
+                PathSeg::Line(px, py)
+            }
+            PathSeg::Cubic(x0, y0, x1, y1, x2, y2) => {
+                let (a, b) = frame.point(x0, y0);
+                let (c, d) = frame.point(x1, y1);
+                let (e, f) = frame.point(x2, y2);
+                PathSeg::Cubic(a, b, c, d, e, f)
+            }
+            PathSeg::Close => PathSeg::Close,
+        })
+        .collect();
+    out
+}
+
+/// Turn a table planned in the **logical** frame into a rotated table that
+/// materialises against the caller's original lines. `cols`/`rows`/`*_segs` stay
+/// logical (so [`build_table`]'s placement, run through the same frame, lines up);
+/// the table records `frame.rotation` and its own projected reading-order lines,
+/// and `covered_lines`/`start_line` are recomputed in **original**-line index
+/// space by PDF-extent containment so the page's skip/emit bookkeeping is correct.
+fn finalize_rotated(
+    mut table: PlannedTable,
+    orig_lines: &[ReconLine],
+    proj_lines: &[ReconLine],
+    frame: LogicalFrame,
+) -> PlannedTable {
+    table.rotation = frame.rotation;
+    // Keep the projected lines this table covers (reading-order, upright) — they
+    // are what `build_table` materialises, not the caller's Y-banded lines.
+    table.own_lines = table
+        .covered_lines
+        .iter()
+        .filter_map(|&i| proj_lines.get(i).cloned())
+        .collect();
+
+    // The table's PDF-space extent: un-project the four logical-grid corners.
+    let (lx0, lx1) = (
+        *table.cols.first().unwrap_or(&0.0),
+        *table.cols.last().unwrap_or(&0.0),
+    );
+    let (ly_top, ly_bot) = (
+        *table.rows.first().unwrap_or(&0.0),
+        *table.rows.last().unwrap_or(&0.0),
+    );
+    let corners = [
+        frame.inv_point(lx0, ly_top),
+        frame.inv_point(lx1, ly_top),
+        frame.inv_point(lx0, ly_bot),
+        frame.inv_point(lx1, ly_bot),
+    ];
+    let (mut px_lo, mut px_hi, mut py_lo, mut py_hi) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in &corners {
+        px_lo = px_lo.min(x);
+        px_hi = px_hi.max(x);
+        py_lo = py_lo.min(y);
+        py_hi = py_hi.max(y);
+    }
+
+    // Original lines whose centre lands inside that PDF box are the ones this table
+    // consumes (so they are skipped by the prose pass and the table is emitted at
+    // the first of them in reading order).
+    let covered: BTreeSet<usize> = (0..orig_lines.len())
+        .filter(|&i| {
+            let l = &orig_lines[i];
+            let cx = l.x + l.w / 2.0;
+            let cy = l.center_y();
+            cx >= px_lo - 1.0 && cx <= px_hi + 1.0 && cy >= py_lo - 1.0 && cy <= py_hi + 1.0
+        })
+        .collect();
+    table.start_line = covered.iter().copied().min().unwrap_or(table.start_line);
+    table.covered_lines = covered;
+    table
+}
+
 // ── form-vs-table guardrails ─────────────────────────────────────────────────
 //
 // A cerfa-style **form** is drawn with many short ruling segments that fence off
@@ -142,58 +475,125 @@ pub fn plan_tables(
 // forms: s3705 15×47 @14% / 6×16 @24%, s1106 17×16 @21% / 18×42 @7%), reject the
 // form layouts while preserving the data tables.
 
-/// Hard cap on columns: a real data table rarely exceeds a dozen; a form's
-/// field fences explode well past it. Forms here have 16/42/47 columns; the two
-/// genuine tables have 4 and 8. `14` leaves head-room for wide-but-real tables.
-const MAX_TABLE_COLS: usize = 14;
+// Discriminating a *data table* from a *form* is, for **small** grids, the proven
+// fill test (a small dense grid is a table; a small fence is a form), and for
+// **large** grids, **structural evidence** — a real table, however wide, long or
+// sparse (financial sheets, schedules, matrices), has *most of its rows
+// consistently spanning several columns*, whereas a form's field fences leave most
+// rows single-column. The previous flat caps dropped legitimate large/sparse
+// tables purely for size; here those caps only delimit the *small* regime, and a
+// grid past them is admitted when it is structurally table-like (not merely big).
+// Calibrated against the same fixtures — data tables: rib 16×4 @63%, permis 4×8
+// @31% (both in-cap, dense ⇒ kept by fill); forms: s3705 15×47 @14% / 6×16 @24%,
+// s1106 17×16 @21% / 18×42 @7% (in-cap small ones fail fill; out-of-cap wide ones
+// fail the structural test because their rows are overwhelmingly single-column).
 
-/// Hard cap on total cells (rows × cols): an A4 page does not hold a 100+-cell
-/// data table; that many cells is a form. Genuine tables here are 64 and 32
-/// cells; forms are 96 / 272 / 705 / 756. `160` sits clear of both, and catches
-/// a tall form that might sneak under the column cap.
-const MAX_TABLE_CELLS: usize = 160;
+/// Upper bound of the **small-grid** regime (columns). At or below this a grid is
+/// judged by the fill test alone (the original, fixture-calibrated behaviour). A
+/// wider grid must instead clear the structural test. Forms here have 15–47
+/// columns; the genuine tables have 4 and 16 — so `14` keeps every real small
+/// table in the fill regime while pushing form-width grids onto the structural
+/// test they cannot pass.
+const SMALL_TABLE_MAX_COLS: usize = 14;
 
-/// Minimum fraction of cells that must carry text. Form grids are mostly empty
-/// fences (forms here: 7–24 % filled); data tables are dense (31 % and 63 %).
-/// `0.28` sits in the gap, with margin on both sides.
+/// Upper bound of the small-grid regime (total cells). Mirrors `SMALL_TABLE_MAX_COLS`
+/// for tall-but-narrow grids: a grid larger than this is judged structurally even
+/// if its column count is modest, catching a tall form that stays under the column
+/// cap. Genuine small tables here are 64 and 32 cells.
+const SMALL_TABLE_MAX_CELLS: usize = 160;
+
+/// Generous *pathological-size* ceiling on columns — only to bound runaway grids,
+/// far above any real table. A grid past this is structural noise, never a table,
+/// regardless of how its (few) rows look.
+const MAX_TABLE_COLS: usize = 64;
+
+/// Generous pathological-size ceiling on total cells. Real large tables (a dense
+/// schedule/matrix flattened onto one page) can hold many hundreds of cells; only
+/// a runaway grid exceeds this.
+const MAX_TABLE_CELLS: usize = 4096;
+
+/// Minimum fraction of cells that must carry text for a **small** grid to be a
+/// table. Form grids are mostly empty fences (7–24 % filled in-fixture); data
+/// tables are dense (31 % and 63 %). `0.28` sits in the gap with margin — the
+/// original threshold, preserved for the small regime so small forms are still
+/// rejected.
 const MIN_FILL_RATIO: f64 = 0.28;
 
-/// Whether a planned grid looks like a real **data table** rather than a
-/// **form** layout. Rejects grids that are too wide, too large, or too sparse —
-/// any one failure is disqualifying (a form needs only one tell). The rejected
-/// grid's text returns to the prose pipeline.
+/// A row is **structured** when it populates at least this many distinct columns —
+/// the signature of a real table row (label + ≥ 1 value) versus a form's single
+/// field label. The structural test counts these.
+const STRUCTURED_ROW_MIN_COLS: usize = 2;
+
+/// Minimum fraction of a **large** grid's rows that must be structured for it to
+/// be admitted as a table. A real large table populates (nearly) every row across
+/// several columns (fraction ≈ 1.0); a large form leaves most rows single-column
+/// (fraction well below this). `0.5` sits in the gap with margin: a table tolerates
+/// some single-column rows (a section header, a totals line), a form cannot reach it.
+const MIN_STRUCTURED_ROW_RATIO: f64 = 0.5;
+
+/// Whether a planned grid looks like a real **data table** rather than a **form**
+/// layout. Two regimes: a **small** grid (within `SMALL_TABLE_MAX_*`) is kept iff
+/// it is reasonably filled (`MIN_FILL_RATIO`) — the original behaviour, so small
+/// dense tables are kept and small forms rejected. A **larger** grid is no longer
+/// dropped for size; instead it must show **structural** evidence — the majority
+/// of its rows consistently span several columns (`MIN_STRUCTURED_ROW_RATIO`),
+/// which a wide/long/sparse real table satisfies and a field-fence form does not.
+/// A pathological-size ceiling guards against runaway grids either way.
 fn passes_table_sanity(table: &PlannedTable, lines: &[ReconLine]) -> bool {
     let n_cols = table.cols.len().saturating_sub(1);
     let n_rows = table.rows.len().saturating_sub(1);
     if n_cols == 0 || n_rows == 0 {
         return false;
     }
-    if n_cols > MAX_TABLE_COLS {
+    if n_cols > MAX_TABLE_COLS || n_cols.saturating_mul(n_rows) > MAX_TABLE_CELLS {
+        return false; // pathological size — never a table.
+    }
+
+    let stats = grid_structure(table, lines);
+    if stats.total == 0 {
         return false;
     }
-    if n_cols.saturating_mul(n_rows) > MAX_TABLE_CELLS {
-        return false;
+
+    let is_small =
+        n_cols <= SMALL_TABLE_MAX_COLS && n_cols.saturating_mul(n_rows) <= SMALL_TABLE_MAX_CELLS;
+    if is_small {
+        // Small regime: the proven fill test. Small dense grid ⇒ table; small
+        // fence ⇒ form.
+        return (stats.filled as f64) / (stats.total as f64) >= MIN_FILL_RATIO;
     }
-    let (filled, total) = cell_fill(table, lines);
-    if total == 0 {
-        return false;
-    }
-    (filled as f64) / (total as f64) >= MIN_FILL_RATIO
+
+    // Large regime: admit only on structural evidence. The rows must consistently
+    // span several columns — at least two such rows, and a majority of all rows —
+    // which a real wide/sparse table has and a form does not. This is what lets a
+    // legitimate 20-column / 200-cell sheet through where the flat caps dropped it.
+    stats.structured_rows >= 2
+        && (stats.structured_rows as f64) / (n_rows as f64) >= MIN_STRUCTURED_ROW_RATIO
 }
 
-/// Count `(cells_with_text, total_cells)` for a planned grid by dropping every
-/// run's centre into its cell — the same placement [`build_table`] uses, so the
-/// fill ratio reflects exactly what the materialised table would contain.
-fn cell_fill(table: &PlannedTable, lines: &[ReconLine]) -> (usize, usize) {
+/// Structural summary of how a planned grid's text populates its cells: the count
+/// of cells carrying text (`filled`) over `total`, and how many rows are
+/// **structured** (populate ≥ [`STRUCTURED_ROW_MIN_COLS`] distinct columns). Runs
+/// are dropped by centre exactly as [`build_table`] places them, so the summary
+/// reflects the materialised table.
+struct GridStructure {
+    filled: usize,
+    total: usize,
+    structured_rows: usize,
+}
+
+fn grid_structure(table: &PlannedTable, lines: &[ReconLine]) -> GridStructure {
     let n_cols = table.cols.len().saturating_sub(1);
     let n_rows = table.rows.len().saturating_sub(1);
     let total = n_cols.saturating_mul(n_rows);
     if total == 0 {
-        return (0, 0);
+        return GridStructure {
+            filled: 0,
+            total: 0,
+            structured_rows: 0,
+        };
     }
     let mut occupied = vec![false; total];
-    for &li in &table.covered_lines {
-        let Some(line) = lines.get(li) else { continue };
+    for line in table_lines(table, lines) {
         for run in &line.runs {
             if run.text.trim().is_empty() {
                 continue;
@@ -205,7 +605,39 @@ fn cell_fill(table: &PlannedTable, lines: &[ReconLine]) -> (usize, usize) {
             }
         }
     }
-    (occupied.iter().filter(|&&o| o).count(), total)
+    let filled = occupied.iter().filter(|&&o| o).count();
+    let structured_rows = (0..n_rows)
+        .filter(|&r| {
+            (0..n_cols).filter(|&c| occupied[r * n_cols + c]).count() >= STRUCTURED_ROW_MIN_COLS
+        })
+        .count();
+    GridStructure {
+        filled,
+        total,
+        structured_rows,
+    }
+}
+
+/// The lines a planned table materialises, already in the same coordinate frame
+/// as its `cols`/`rows`. A **rotated** table carries its own reading-order lines
+/// in the *logical* frame (`own_lines`), matching its logical grid edges; an
+/// upright table iterates the caller's `lines` at its `covered_lines` indices.
+/// Either way the run boxes line up with `cols`/`rows`, so the placement code
+/// (centre → cell) is identical and the grid is consistent.
+fn table_lines<'a>(
+    table: &'a PlannedTable,
+    lines: &'a [ReconLine],
+) -> Box<dyn Iterator<Item = &'a ReconLine> + 'a> {
+    if !table.own_lines.is_empty() {
+        Box::new(table.own_lines.iter())
+    } else {
+        Box::new(
+            table
+                .covered_lines
+                .iter()
+                .filter_map(move |&li| lines.get(li)),
+        )
+    }
 }
 
 /// Build a [`Table`] block from a planned table. Runs are dropped into the cell
@@ -246,8 +678,7 @@ pub fn build_table(
     // predecessor even when the boxes butt (gap ≈ 0).
     let mut cell_prev: Vec<Vec<Option<(f64, f64, bool)>>> = vec![vec![None; n_cols]; n_rows];
 
-    for &li in &table.covered_lines {
-        let Some(line) = lines.get(li) else { continue };
+    for line in table_lines(table, lines) {
         for run in &line.runs {
             let cx = run.x + run.w / 2.0;
             let cy = run.y + run.h / 2.0;
@@ -336,30 +767,45 @@ pub fn build_table(
                     rspan += 1;
                 }
                 span[r][c] = (cspan, rspan);
-                // Mark the absorbed slots covered, and fold their text/style into
-                // the anchor so nothing a span swallows is lost.
-                for rr in r..r + rspan {
-                    for cc in c..c + cspan {
-                        if rr == r && cc == c {
-                            continue;
-                        }
-                        covered[rr][cc] = true;
-                        let absorbed = std::mem::take(&mut grid[rr][cc]);
-                        if !absorbed.is_empty() {
-                            let anchor = &mut grid[r][c];
-                            if !anchor.is_empty() {
-                                anchor.push(' ');
-                            }
-                            anchor.push_str(&absorbed);
-                        }
-                        if styles[r][c].is_none() {
-                            styles[r][c] = styles[rr][cc].take();
-                        }
-                        if src_grid[r][c].is_none() {
-                            src_grid[r][c] = src_grid[rr][cc].take();
-                        }
-                    }
+                absorb_span(
+                    r,
+                    c,
+                    cspan,
+                    rspan,
+                    &mut covered,
+                    &mut grid,
+                    &mut styles,
+                    &mut src_grid,
+                );
+            }
+        }
+    } else if table.spans.len() == n_rows * n_cols {
+        // Borderless tables carry no rules, so spans are inferred from text
+        // geometry up front (see [`borderless_spans`]). A slot's stored span is
+        // `(0, 0)` if it was absorbed by an anchor above/left, `(1, 1)` for an
+        // ordinary cell, or `(>1, …)`/`(…, >1)` for a merge anchor.
+        for r in 0..n_rows {
+            for c in 0..n_cols {
+                if covered[r][c] {
+                    continue;
                 }
+                let (cs, rs) = table.spans[r * n_cols + c];
+                if cs == 0 || rs == 0 {
+                    continue; // absorbed by a prior anchor — handled there.
+                }
+                let cspan = (cs as usize).min(n_cols - c);
+                let rspan = (rs as usize).min(n_rows - r);
+                span[r][c] = (cspan, rspan);
+                absorb_span(
+                    r,
+                    c,
+                    cspan,
+                    rspan,
+                    &mut covered,
+                    &mut grid,
+                    &mut styles,
+                    &mut src_grid,
+                );
             }
         }
     }
@@ -402,12 +848,16 @@ pub fn build_table(
         });
     }
 
-    // Frame = the grid extent.
-    let x0 = *table.cols.first()?;
-    let x1 = *table.cols.last()?;
+    // Frame = the grid extent. `cols`/`rows` are in the table's own frame, so a
+    // rotated table's extent is un-projected to PDF space first (the AABB of its
+    // four logical corners), then `to_frame` flips it top-down. An upright table's
+    // logical frame is the identity ⇒ the same PDF rect as before.
+    let x_lo = *table.cols.first()?;
+    let x_hi = *table.cols.last()?;
     let y_top = *table.rows.first()?;
     let y_bot = *table.rows.last()?;
-    let frame = to_frame(x0, y_bot, x1 - x0, y_top - y_bot);
+    let (px, py, pw, ph) = grid_extent_pdf(table, x_lo, x_hi, y_top, y_bot);
+    let frame = to_frame(px, py, pw, ph);
 
     let border = if table.ruled {
         BorderStyle {
@@ -418,17 +868,17 @@ pub fn build_table(
         BorderStyle::default()
     };
 
-    // A table whose text is drawn on a rotated baseline lowers with that
-    // rotation (the cells inherit the table's frame orientation); an ordinary
-    // upright table stays `Rotation::D0`. Judge from the runs the table actually
-    // covers, pooled across its lines.
-    let table_runs: Vec<ReconRun> = table
-        .covered_lines
-        .iter()
-        .filter_map(|&li| lines.get(li))
-        .flat_map(|line| line.runs.iter().cloned())
-        .collect();
-    let rotation = runs_rotation(&table_runs);
+    // A rotated table carries the cardinal rotation the planner detected; an
+    // upright table judges from its runs (a free-form per-table tilt on an
+    // otherwise-upright page stays catered for, byte-identical to before).
+    let rotation = if matches!(table.rotation, Rotation::D0) {
+        let table_runs: Vec<ReconRun> = table_lines(table, lines)
+            .flat_map(|line| line.runs.iter().cloned())
+            .collect();
+        runs_rotation(&table_runs)
+    } else {
+        table.rotation
+    };
 
     Some(Block {
         id: ids.mint(),
@@ -440,6 +890,80 @@ pub fn build_table(
             border,
         }),
     })
+}
+
+/// The table's PDF-space bounding rect `(x, y, w, h)` (origin bottom-left) from its
+/// grid extent in its own frame. For an upright (`D0`) table the frame is the
+/// identity, so this returns exactly `(x_lo, y_bot, x_hi - x_lo, y_top - y_bot)`
+/// as before. For a rotated table the four logical corners are un-projected and
+/// their axis-aligned bounding box is returned (a cardinal rotation maps an
+/// upright rect to an upright rect, so the AABB is exact).
+fn grid_extent_pdf(
+    table: &PlannedTable,
+    x_lo: f64,
+    x_hi: f64,
+    y_top: f64,
+    y_bot: f64,
+) -> (f64, f64, f64, f64) {
+    let frame = LogicalFrame::new(table.rotation);
+    let corners = [
+        frame.inv_point(x_lo, y_top),
+        frame.inv_point(x_hi, y_top),
+        frame.inv_point(x_lo, y_bot),
+        frame.inv_point(x_hi, y_bot),
+    ];
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in &corners {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    (min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// Absorb the slots of an `(r, c)`-anchored span: mark each non-anchor slot
+/// covered, and fold its accumulated text / first style / first source-index into
+/// the anchor so nothing a merge swallows is lost. Shared by the ruled
+/// (rule-inferred) and borderless (geometry-inferred) span passes.
+#[allow(clippy::too_many_arguments)]
+fn absorb_span(
+    r: usize,
+    c: usize,
+    cspan: usize,
+    rspan: usize,
+    covered: &mut [Vec<bool>],
+    grid: &mut [Vec<String>],
+    styles: &mut [Vec<Option<crate::model::CharStyle>>],
+    src_grid: &mut [Vec<Option<usize>>],
+) {
+    for rr in r..r + rspan {
+        for cc in c..c + cspan {
+            if rr == r && cc == c {
+                continue;
+            }
+            covered[rr][cc] = true;
+            let absorbed = std::mem::take(&mut grid[rr][cc]);
+            if !absorbed.is_empty() {
+                let anchor = &mut grid[r][c];
+                if !anchor.is_empty() {
+                    anchor.push(' ');
+                }
+                anchor.push_str(&absorbed);
+            }
+            if styles[r][c].is_none() {
+                styles[r][c] = styles[rr][cc].take();
+            }
+            if src_grid[r][c].is_none() {
+                src_grid[r][c] = src_grid[rr][cc].take();
+            }
+        }
+    }
 }
 
 /// Materialise one [`Cell`] holding `text` (one paragraph run) with the given
@@ -729,6 +1253,12 @@ fn build_ruled_band(lines: &[ReconLine], h_rules: &[HSeg], v_rules: &[VSeg]) -> 
         h_segs: h_rules.iter().map(|s| (s.y, s.x0, s.x1)).collect(),
         v_segs: v_rules.iter().map(|s| (s.x, s.y0, s.y1)).collect(),
         col_align,
+        // Upright by default; `finalize_rotated` stamps the real rotation when the
+        // grid was planned in a logical frame. Ruled tables infer spans from
+        // missing rules, so the explicit-span override stays empty.
+        rotation: Rotation::D0,
+        spans: Vec::new(),
+        own_lines: Vec::new(),
     })
 }
 
@@ -1411,6 +1941,10 @@ fn build_borderless_region(
 
     let covered: BTreeSet<usize> = row_lines.iter().copied().collect();
     let start_line = *covered.iter().min()?;
+    // Borderless tables carry no rules, so a span cannot be proven by a *missing*
+    // interior rule (as ruled tables do). Instead, infer spans directly from text
+    // geometry: a run whose box covers several column/row bands is a merged cell.
+    let spans = borderless_spans(lines, &row_lines, &cols, &rows);
     Some(PlannedTable {
         cols,
         rows,
@@ -1418,13 +1952,127 @@ fn build_borderless_region(
         covered_lines: covered,
         used_paths: BTreeSet::new(),
         start_line,
-        // Borderless tables have no rules, so cell-merge inference (which proves
-        // a span by a *missing* interior rule) cannot run — leave the segs empty
-        // and every cell stays 1×1.
+        // Borderless tables have no rules, so the rule-based merge inference cannot
+        // run — leave the segs empty and rely on `spans` (geometry-derived) above.
         h_segs: Vec::new(),
         v_segs: Vec::new(),
         col_align,
+        rotation: Rotation::D0,
+        spans,
+        own_lines: Vec::new(),
     })
+}
+
+/// Infer per-slot `(col_span, row_span)` for a borderless grid from text geometry.
+///
+/// A borderless table has no rules to read merges from, so a **merged** cell is
+/// detected as a run whose box reaches across one or more *otherwise-empty*
+/// columns: a header like `"Billing details"` typeset across two empty money
+/// columns is anchored in its centre column `c0` and stretches right to cover the
+/// empty columns `c0+1 … c1`, so its cell spans `c1 − c0 + 1` columns and the
+/// covered slots are dropped from the row (no phantom empty cell). Row spans are
+/// derived the same way from a run reaching into empty row bands below it.
+///
+/// The **empty-column** condition is what keeps this honest: a merely *wide label*
+/// whose right edge pokes into a *populated* neighbour (e.g. `"Materiel divers"`
+/// beside an amount) does **not** merge — its neighbour holds its own cell. The
+/// anchor column is the run's **centre** column, matching exactly where
+/// [`build_table`] drops the run, so the merged cell carries the run's text.
+///
+/// Returned row-major over the `(rows.len()-1) × (cols.len()-1)` grid; a slot
+/// absorbed by a span anchored above/left is `(0, 0)` so the builder skips it.
+/// Conservative: an ordinary aligned table (every populated column distinct) stays
+/// all-`(1, 1)` and is unchanged.
+fn borderless_spans(
+    lines: &[ReconLine],
+    row_lines: &[usize],
+    cols: &[f64],
+    rows: &[f64],
+) -> Vec<(u16, u16)> {
+    let n_cols = cols.len().saturating_sub(1);
+    let n_rows = rows.len().saturating_sub(1);
+    if n_cols == 0 || n_rows == 0 {
+        return Vec::new();
+    }
+    // Which (row, col) slots a run **centre** populates — the same placement
+    // `build_table` uses. A span may only swallow slots that are *empty* here.
+    let mut populated = vec![false; n_rows * n_cols];
+    for &li in row_lines {
+        let Some(line) = lines.get(li) else { continue };
+        for run in &line.runs {
+            if run.text.trim().is_empty() {
+                continue;
+            }
+            let cx = run.x + run.w / 2.0;
+            let cy = run.y + run.h / 2.0;
+            if let (Some(c), Some(r)) = (col_of(cols, cx), row_of(rows, cy)) {
+                populated[r * n_cols + c] = true;
+            }
+        }
+    }
+
+    let mut spans = vec![(1u16, 1u16); n_rows * n_cols];
+    let mut covered = vec![false; n_rows * n_cols];
+    for &li in row_lines {
+        let Some(line) = lines.get(li) else { continue };
+        for run in &line.runs {
+            if run.text.trim().is_empty() {
+                continue;
+            }
+            // Anchor at the run's centre cell (where its text lands).
+            let cx = run.x + run.w / 2.0;
+            let cy = run.y + run.h / 2.0;
+            let (Some(c0), Some(r0)) = (col_of(cols, cx), row_of(rows, cy)) else {
+                continue;
+            };
+            // Column span: extend right over consecutive *empty* columns the run's
+            // right edge actually reaches. Stop at the first populated or unreached
+            // column.
+            let mut c_hi = c0;
+            while c_hi + 1 < n_cols
+                && !populated[r0 * n_cols + (c_hi + 1)]
+                && run.right() >= cols[c_hi + 1] + 0.5
+            {
+                c_hi += 1;
+            }
+            // Row span: extend down over consecutive *empty* row bands the run's
+            // bottom edge reaches (rows descend in Y, so "down" = increasing index =
+            // smaller Y). Only meaningful when the run box is genuinely tall.
+            let mut r_hi = r0;
+            while r_hi + 1 < n_rows
+                && (c0..=c_hi).all(|cc| !populated[(r_hi + 1) * n_cols + cc])
+                && run.y <= rows[r_hi + 1] - 0.5
+            {
+                r_hi += 1;
+            }
+            let cspan = c_hi - c0 + 1;
+            let rspan = r_hi - r0 + 1;
+            if cspan == 1 && rspan == 1 {
+                continue; // ordinary 1×1 cell — nothing to merge.
+            }
+            // Keep spans disjoint: skip if any covered slot is already taken.
+            let clash = (r0..=r_hi).any(|rr| {
+                (c0..=c_hi).any(|cc| {
+                    let idx = rr * n_cols + cc;
+                    covered[idx] || (!(rr == r0 && cc == c0) && spans[idx] != (1, 1))
+                })
+            });
+            if clash {
+                continue;
+            }
+            spans[r0 * n_cols + c0] = (cspan as u16, rspan as u16);
+            for rr in r0..=r_hi {
+                for cc in c0..=c_hi {
+                    if rr == r0 && cc == c0 {
+                        continue;
+                    }
+                    covered[rr * n_cols + cc] = true;
+                    spans[rr * n_cols + cc] = (0, 0);
+                }
+            }
+        }
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -1738,6 +2386,9 @@ mod tests {
             h_segs: Vec::new(),
             v_segs: Vec::new(),
             col_align: vec![Align::Left, Align::Left],
+            rotation: Rotation::D0,
+            spans: Vec::new(),
+            own_lines: Vec::new(),
         };
         // 2×2 grid, 4 cells, all filled.
         let runs = vec![
@@ -2621,5 +3272,293 @@ mod tests {
             borderless_table(&lines).is_none(),
             "no table is built from prose with stray decimals"
         );
+    }
+
+    // ── #5(b): borderless merged (spanning) cells ────────────────────────────
+
+    #[test]
+    fn borderless_cell_spanning_two_columns_gets_col_span_2() {
+        // A borderless 3-column table whose header row spans the first two columns:
+        // "Contact details" is one wide run reaching across columns 0+1 (both empty
+        // beneath the header in that row), with "Notes" alone in column 2. The data
+        // rows populate all three columns. The header cell must get col_span 2, the
+        // grid must stay aligned (no phantom empty cell where the span sits), and the
+        // body rows must keep three 1×1 cells.
+        let runs = vec![
+            // Header: a wide run over columns 0+1 (x 72..250), then a column-2 run.
+            run("Contact details", 72.0, 700.0, 178.0), // right 250, centre ~161 → col 0
+            run("Notes", 380.0, 700.0, 50.0),           // col 2
+            // Row 1.
+            run("Alice", 72.0, 684.0, 50.0),     // col 0
+            run("Engineer", 230.0, 684.0, 70.0), // col 1
+            run("OK", 380.0, 684.0, 20.0),       // col 2
+            // Row 2.
+            run("Bob", 72.0, 668.0, 40.0),       // col 0
+            run("Designer", 230.0, 668.0, 70.0), // col 1
+            run("Hold", 380.0, 668.0, 35.0),     // col 2
+        ];
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines).expect("borderless spanning-header table");
+        assert_eq!(table.rows.len(), 3, "header + two data rows");
+
+        // Header row: a col_span-2 cell ("Contact details") then the col-2 cell
+        // ("Notes") ⇒ exactly 2 cells, and NO phantom empty cell under the span.
+        assert_eq!(
+            table.rows[0].cells.len(),
+            2,
+            "header row merges columns 0+1 → 2 cells, got {}",
+            table.rows[0].cells.len()
+        );
+        assert_eq!(
+            table.rows[0].cells[0].col_span, 2,
+            "header cell spans two columns"
+        );
+        assert_eq!(table.rows[0].cells[0].row_span, 1);
+        assert_eq!(cell_text(&table.rows[0].cells[0]), "Contact details");
+        assert_eq!(
+            table.rows[0].cells[1].col_span, 1,
+            "Notes column not merged"
+        );
+        assert_eq!(cell_text(&table.rows[0].cells[1]), "Notes");
+
+        // Body rows: three plain 1×1 cells each (every column populated → no merge).
+        for ri in 1..=2 {
+            assert_eq!(
+                table.rows[ri].cells.len(),
+                3,
+                "body row {ri} keeps three cells"
+            );
+            assert!(
+                table.rows[ri]
+                    .cells
+                    .iter()
+                    .all(|c| c.col_span == 1 && c.row_span == 1),
+                "body row {ri} has no spans"
+            );
+        }
+        assert_eq!(cell_text(&table.rows[1].cells[1]), "Engineer");
+    }
+
+    #[test]
+    fn borderless_wide_label_beside_a_populated_column_does_not_merge() {
+        // The guard for #5(b): a wide label whose right edge overlaps a *populated*
+        // neighbour column must NOT swallow it. "Materiel divers tres long" (a long
+        // label) sits beside an amount in every row; each row must stay two distinct
+        // cells (no col_span), because the amount column is populated.
+        let runs = vec![
+            run("Libelle", 72.0, 700.0, 40.0),
+            run("Montant", 320.0, 700.0, 50.0),
+            // A long label whose extent (≈ 72..250) stays clear of the amount column
+            // gutter, yet still clearly wider than the others. The amount column is
+            // populated, so no merge — each row keeps two distinct cells.
+            run("Materiel divers long", 72.0, 684.0, 178.0), // right 250
+            run("1250", 320.0, 684.0, 40.0),
+            run("Service", 72.0, 668.0, 56.0),
+            run("99", 320.0, 668.0, 20.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let table = borderless_table(&lines).expect("a two-column borderless table");
+        for (ri, row) in table.rows.iter().enumerate() {
+            assert_eq!(
+                row.cells.len(),
+                2,
+                "row {ri} stays two cells (wide label must not merge the amount)"
+            );
+            assert!(
+                row.cells.iter().all(|c| c.col_span == 1),
+                "row {ri} has no col_span"
+            );
+        }
+        assert_eq!(cell_text(&table.rows[1].cells[0]), "Materiel divers long");
+        assert_eq!(cell_text(&table.rows[1].cells[1]), "1250");
+    }
+
+    // ── #5(c): large / sparse tables are no longer dropped ───────────────────
+
+    #[test]
+    fn large_sparse_but_aligned_ruled_table_is_kept() {
+        // A legitimate 20-column financial sheet: 10 rows × 20 columns = 200 cells,
+        // well past the OLD flat caps (14 cols / 160 cells). Each row populates many
+        // columns *consistently* (a label + values across the whole width), so it is
+        // structurally a table and must NOT be dropped. The previous flat caps killed
+        // exactly this case.
+        let n_cols = 20usize;
+        let n_rows = 10usize;
+        // Columns at x = 40, 70, …; rows at y = 100, 120, … (top→bottom built below).
+        let xs: Vec<f64> = (0..=n_cols).map(|i| 40.0 + i as f64 * 28.0).collect();
+        let ys: Vec<f64> = (0..=n_rows).map(|i| 100.0 + i as f64 * 20.0).collect();
+        let mut paths: Vec<VectorPath> = Vec::new();
+        for &x in &xs {
+            paths.push(vrule(x, ys[0], *ys.last().unwrap()));
+        }
+        for &y in &ys {
+            paths.push(hrule(y, xs[0], *xs.last().unwrap()));
+        }
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        // Fill every cell of every row (a dense-but-wide real sheet): a short token in
+        // each of the 20 columns, on each of the 10 rows.
+        let mut runs: Vec<ReconRun> = Vec::new();
+        for r in 0..n_rows {
+            let y = 105.0 + r as f64 * 20.0;
+            for &x_edge in xs.iter().take(n_cols) {
+                runs.push(run("v", x_edge + 4.0, y, 10.0));
+            }
+        }
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan
+            .take_if_starts_at(*plan_first_line(&plan))
+            .expect("a wide aligned sheet must stay a table (not dropped by size caps)");
+        assert!(
+            passes_table_sanity(&tbl, &lines),
+            "a 20×200 consistently-aligned table passes the structural gate"
+        );
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        assert_eq!(t.rows.len(), n_rows, "all ten rows materialise");
+        assert_eq!(
+            t.rows[0].cells.len(),
+            n_cols,
+            "all twenty columns materialise"
+        );
+    }
+
+    #[test]
+    fn running_prose_block_is_still_not_a_table() {
+        // The prose guard for #5(c): a block of full-measure running prose (a long
+        // paragraph wrapped over many lines, every line one continuous run on the
+        // same left edge) must NOT become a giant one-column "table". Even with the
+        // relaxed size caps, single-column rows carry no structural evidence.
+        let runs: Vec<ReconRun> = (0..12)
+            .map(|i| {
+                run(
+                    "This is an ordinary sentence of body prose that wraps across the page",
+                    72.0,
+                    700.0 - i as f64 * 14.0,
+                    420.0,
+                )
+            })
+            .collect();
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+        assert!(
+            (0..lines.len()).all(|i| plan.take_if_starts_at(i).is_none()),
+            "running prose stays prose, never a table"
+        );
+        assert!(
+            borderless_table(&lines).is_none(),
+            "no borderless table is built from a prose block"
+        );
+    }
+
+    // ── #5(d): rotated tables ────────────────────────────────────────────────
+
+    /// A run rotated by `deg` degrees: same fields as [`run`] but with an explicit
+    /// baseline rotation and an explicit box height (rotated text's PDF box has its
+    /// long axis along Y, so the caller sets `w`/`h` to match).
+    fn run_rot(text: &str, x: f64, y: f64, w: f64, h: f64, deg: f64) -> ReconRun {
+        ReconRun {
+            text: text.to_string(),
+            x,
+            y,
+            w,
+            h,
+            size: 10.0,
+            style: TextStyle::default(),
+            rotation: deg,
+            source_index: None,
+            underline: false,
+            strike: false,
+        }
+    }
+
+    #[test]
+    fn rotated_90_borderless_table_is_detected_along_the_rotated_axis() {
+        // A borderless 2×2 table drawn on a 90°-CCW page. Logically:
+        //     Name | Age
+        //     Alice| 30
+        // For 90°-CCW text the reading axis is +Y (columns advance up the page) and
+        // rows stack across +X. So each run's PDF box is tall (long axis along Y),
+        // column 1 sits at a larger Y than column 0, and row 1 sits at a larger X
+        // than row 0. The planner must detect the table along these rotated axes,
+        // emit the cells in logical order, and tag the block `D90`.
+        let runs = vec![
+            // Row 0 strip (small X): Name @ Y≈100 (col 0), Age @ Y≈200 (col 1).
+            run_rot("Name", 100.0, 100.0, 10.0, 40.0, 90.0),
+            run_rot("Age", 100.0, 200.0, 10.0, 30.0, 90.0),
+            // Row 1 strip (a normal line-pitch further along +X): Alice @ Y≈100,
+            // 30 @ Y≈200. The 16 pt strip pitch projects to a 16 pt row gap, like an
+            // ordinary line spacing (so the two rows are one table, not two regions).
+            run_rot("Alice", 116.0, 100.0, 10.0, 40.0, 90.0),
+            run_rot("30", 116.0, 200.0, 10.0, 20.0, 90.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &[], &BTreeSet::new());
+
+        // The table must materialise (along the rotated axes) and be oriented D90.
+        let mut ids = IdGen::default();
+        let mut found: Option<(Table, Rotation)> = None;
+        for li in 0..lines.len() {
+            if let Some(tbl) = plan.take_if_starts_at(li) {
+                if let Some(block) = build_table(&tbl, &lines, &mut ids, Rect::new) {
+                    if let BlockKind::Table(t) = block.kind {
+                        found = Some((t, block.rotation));
+                        break;
+                    }
+                }
+            }
+        }
+        let (t, rotation) = found.expect("a rotated borderless table is detected");
+        assert_eq!(
+            rotation,
+            Rotation::D90,
+            "the table is oriented along +Y (D90)"
+        );
+        assert_eq!(t.rows.len(), 2, "two logical rows");
+        for row in &t.rows {
+            assert_eq!(row.cells.len(), 2, "two logical columns per row");
+        }
+        // Cells in logical reading order: row 0 = Name | Age, row 1 = Alice | 30.
+        assert_eq!(cell_text(&t.rows[0].cells[0]), "Name");
+        assert_eq!(cell_text(&t.rows[0].cells[1]), "Age");
+        assert_eq!(cell_text(&t.rows[1].cells[0]), "Alice");
+        assert_eq!(cell_text(&t.rows[1].cells[1]), "30");
+    }
+
+    #[test]
+    fn logical_frame_point_round_trips_for_every_cardinal() {
+        // The projector is an exact inverse for each cardinal rotation, so a grid
+        // un-projected back to PDF space lands where it started.
+        for rot in [Rotation::D0, Rotation::D90, Rotation::D180, Rotation::D270] {
+            let f = LogicalFrame::new(rot);
+            for &(x, y) in &[(12.0, 34.0), (-5.0, 7.0), (0.0, 0.0), (100.0, -50.0)] {
+                let (lx, ly) = f.point(x, y);
+                let (rx, ry) = f.inv_point(lx, ly);
+                assert!(
+                    (rx - x).abs() < 1e-9 && (ry - y).abs() < 1e-9,
+                    "{rot:?}: ({x},{y}) → ({lx},{ly}) → ({rx},{ry}) not a round-trip"
+                );
+            }
+        }
+        // A free-form angle degrades to the upright identity (never mis-projects).
+        let f = LogicalFrame::new(Rotation::Deg(33.0));
+        assert!(matches!(f.rotation, Rotation::D0));
+    }
+
+    /// The first line index any table in the plan starts at (test helper for grids
+    /// whose start line is not line 0).
+    fn plan_first_line(plan: &TablePlan) -> &usize {
+        plan.tables
+            .iter()
+            .map(|t| &t.start_line)
+            .min()
+            .expect("at least one planned table")
     }
 }
