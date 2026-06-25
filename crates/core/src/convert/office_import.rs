@@ -1170,6 +1170,57 @@ impl DocxPages {
     }
 }
 
+/// Buffer an Office-Math subtree (`m:oMath` / `m:oMathPara`) from the streaming
+/// tokenizer into an [`omml::OmmlNode`] tree, then lower it to linear Unicode-math
+/// text runs via [`super::omml::lower_omml`]. The opening tag (local name
+/// `root_tag`) has **already been consumed** by the caller; this reads up to and
+/// including its matching close. The flat tokenizer has no node tree, so this
+/// small buffering step is what lets the lowering be a clean recursive tree walk
+/// (see [`super::omml`]). Returns the equation's inline runs (empty for an empty
+/// equation).
+fn docx_omath_inline(x: &mut Xml, root_tag: &str) -> Vec<Inline> {
+    let root = parse_omml_subtree(x, root_tag);
+    super::omml::lower_omml(&root)
+}
+
+/// Consume the children of an already-open OMML element (its open tag eaten) up
+/// to its matching `</root_tag>`, building a [`super::omml::OmmlNode`] whose tag
+/// is `root_tag`. A self-closing child becomes a childless element node; text
+/// becomes a text pseudo-child. Recurses for nested elements; the matching close
+/// of an element ends that element. Tag names are stored **local**
+/// (namespace-stripped) so the lowering matches on `oMath`/`f`/`r`/`t`/….
+fn parse_omml_subtree(x: &mut Xml, root_tag: &str) -> super::omml::OmmlNode {
+    let mut node = super::omml::OmmlNode::element(root_tag);
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name).to_string();
+                let mut child = if sc {
+                    super::omml::OmmlNode::element(ln)
+                } else {
+                    parse_omml_subtree(x, &ln)
+                };
+                child.attrs = attrs
+                    .iter()
+                    .map(|(k, v)| (local(k).to_string(), v.clone()))
+                    .collect();
+                node.children.push(child);
+            }
+            Tok::Close(name) => {
+                if local(&name) == root_tag {
+                    break;
+                }
+            }
+            Tok::Text(t) => {
+                if !t.is_empty() {
+                    node.children.push(super::omml::OmmlNode::text_node(t));
+                }
+            }
+        }
+    }
+    node
+}
+
 /// Recursive DOCX model walker (mirrors [`docx_walk`]). Emits `w:p`→paragraph/
 /// heading/list-item blocks and `w:tbl`→[`Table`] blocks into `pages`, opening a
 /// new page at each hard page break a paragraph signals.
@@ -1194,6 +1245,24 @@ fn docx_walk_model(
                         kind: BlockKind::Table(table),
                         ..Block::default()
                     });
+                } else if (ln == "oMathPara" || ln == "oMath") && !sc {
+                    // A **display** equation sitting between paragraphs
+                    // (`m:oMathPara`, a body-level sibling of `w:p`; a bare
+                    // body-level `m:oMath` is tolerated too). Lower it to linear
+                    // Unicode-math text and emit it as its own paragraph block.
+                    // Previously the block walker had no arm for it and the maths
+                    // was dropped (issue #37).
+                    let runs = docx_omath_inline(x, ln);
+                    if !runs.is_empty() {
+                        pages.cur().push(Block {
+                            kind: BlockKind::Paragraph(Paragraph {
+                                style: ParagraphStyle::default(),
+                                style_ref: None,
+                                runs,
+                            }),
+                            ..Block::default()
+                        });
+                    }
                 } else if ln == "bookmarkStart" {
                     // A bookmark anchored between paragraphs (body-level): record
                     // it against the current page so an internal `#name` link
@@ -1799,6 +1868,22 @@ fn docx_paragraph_model(
                     "blip" => {
                         if let Some(img) = blip_image_ref(ctx, &attrs, resources) {
                             docx_sink(&mut runs, &mut link, &mut fields).push(Inline::Image(img));
+                        }
+                    }
+                    // Office Math (OMML) inline equation: an `m:oMath` (optionally
+                    // wrapped in a `m:oMathPara`) sitting mid-paragraph alongside
+                    // the `w:r` runs. Buffer its subtree and lower it to linear
+                    // Unicode-math text runs, joined into the flow at this point
+                    // (via `docx_sink` so an open field/hyperlink still captures
+                    // it). Previously this hit the `_ => {}` below and was dropped
+                    // (issue #37). A `w:r` enclosing the maths leaves `depth` set,
+                    // but the maths text comes from `m:t` (consumed by the buffer),
+                    // not the paragraph's `Tok::Text` arm, so it isn't double-counted.
+                    "oMath" | "oMathPara" if !sc => {
+                        let inlines = docx_omath_inline(x, local(&name));
+                        let sink = docx_sink(&mut runs, &mut link, &mut fields);
+                        for inline in inlines {
+                            sink.push(inline);
                         }
                     }
                     _ => {}
@@ -15474,6 +15559,95 @@ mod tests {
         assert!(t.rows[0].is_header, "w:tblHeader row → header");
         assert!(!t.rows[1].is_header, "w:tblHeader w:val=\"0\" cancels it");
         assert!(!t.rows[2].is_header, "plain row is a body row");
+    }
+
+    /// Parse a `word/document.xml` body fragment into the model and return the
+    /// plain text of every paragraph block, in order (one `String` per
+    /// paragraph). Mirrors [`first_docx_table`] but harvests paragraphs.
+    fn docx_paragraph_texts(body_xml: &str) -> Vec<String> {
+        let doc = format!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="x" xmlns:m="m"><w:body>{body_xml}</w:body></w:document>"#
+        );
+        let zip = read_zip(&build_docx(&doc, None, &[]));
+        let document = docx_to_model(&zip);
+        document
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(inlines_plain_text(&p.runs)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An **inline** `m:oMath` mixed with ordinary `w:r` runs in a `w:p` — with a
+    /// fraction, a superscript, a radical and an n-ary sum — lowers to readable
+    /// linear Unicode-math text *at its position* (issue #37: previously dropped).
+    #[test]
+    fn docx_inline_omath_linearized_to_unicode() {
+        let texts = docx_paragraph_texts(
+            r#"<w:p>
+  <w:r><w:t>E=</w:t></w:r>
+  <m:oMath>
+    <m:f><m:num><m:r><m:t>a</m:t></m:r></m:num><m:den><m:r><m:t>b</m:t></m:r></m:den></m:f>
+    <m:sSup><m:e><m:r><m:t>x</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup>
+    <m:rad><m:e><m:r><m:t>y</m:t></m:r></m:e></m:rad>
+    <m:nary><m:naryPr><m:chr m:val="∑"/></m:naryPr>
+      <m:sub><m:r><m:t>i=1</m:t></m:r></m:sub>
+      <m:sup><m:r><m:t>n</m:t></m:r></m:sup>
+      <m:e><m:r><m:t>k</m:t></m:r></m:e></m:nary>
+  </m:oMath>
+  <w:r><w:t> done</w:t></w:r>
+</w:p>"#,
+        );
+        assert_eq!(texts.len(), 1, "one paragraph, math joined inline");
+        let text = &texts[0];
+        // Surrounding runs are kept and the maths is between them.
+        assert!(text.starts_with("E="), "leading run kept: {text}");
+        assert!(text.contains("done"), "trailing run kept: {text}");
+        // Each construct's linear form is present.
+        assert!(text.contains("a/b"), "fraction a/b: {text}");
+        assert!(text.contains('√'), "radical √: {text}");
+        assert!(text.contains('²'), "superscript digit: {text}");
+        assert!(text.contains('/'), "fraction slash: {text}");
+        assert!(text.contains('∑'), "n-ary sum ∑: {text}");
+    }
+
+    /// A **display** equation `m:oMathPara` (a body-level sibling of `w:p`)
+    /// becomes its **own** paragraph block carrying the linearized maths.
+    #[test]
+    fn docx_display_omathpara_is_own_paragraph() {
+        let texts = docx_paragraph_texts(
+            r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p>
+<m:oMathPara><m:oMath>
+  <m:rad><m:e><m:r><m:t>2</m:t></m:r></m:e></m:rad>
+</m:oMath></m:oMathPara>
+<w:p><w:r><w:t>After</w:t></w:r></w:p>"#,
+        );
+        assert_eq!(texts.len(), 3, "Before / equation / After");
+        assert_eq!(texts[0], "Before");
+        assert_eq!(texts[2], "After");
+        assert!(
+            texts[1].contains('√'),
+            "display equation paragraph carries √: {:?}",
+            texts[1]
+        );
+    }
+
+    /// A plain DOCX with no maths is unchanged — paragraphs keep exactly their
+    /// run text and no spurious math markup leaks in.
+    #[test]
+    fn docx_without_math_is_unchanged() {
+        let texts = docx_paragraph_texts(
+            r#"<w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t> world</w:t></w:r></w:p>
+<w:p><w:r><w:t>Second line</w:t></w:r></w:p>"#,
+        );
+        assert_eq!(
+            texts,
+            vec!["Hello world".to_string(), "Second line".to_string()]
+        );
     }
 
     /// A 3-row column whose top cell is `w:vMerge="restart"` and the two rows

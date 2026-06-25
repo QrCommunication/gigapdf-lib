@@ -20,6 +20,7 @@ pub mod md_import;
 pub mod metafile;
 pub mod office;
 pub mod office_import;
+pub mod omml;
 pub mod pdfa;
 pub mod project;
 pub mod reverse;
