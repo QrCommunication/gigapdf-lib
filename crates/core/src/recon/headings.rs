@@ -16,6 +16,22 @@
 //! happens to use. Fixed ratio buckets are why heading levels used to skip (a
 //! 24/18/14-over-11pt document mapping to H1/H3/H4) and why a heading only
 //! ~1.1× the body always collapsed to H6.
+//!
+//! ## Document-wide leveling
+//!
+//! Clustering a *single page* in isolation makes the **same visual size** land
+//! on different levels across pages: a page whose largest heading is 14 pt maps
+//! 14 pt to `H1`, while a page that also has a 24 pt title maps the same 14 pt
+//! to `H2`. To give a multi-page document a *coherent* outline, the same
+//! clustering primitives are reused over the **whole document**: collect every
+//! already-promoted heading's representative size (see [`heading_size`]), build
+//! one [`HeadingLevels`] from that set ([`HeadingLevels::from_sizes`]), and
+//! re-stamp each heading's level from it ([`relevel`]). A 14 pt heading then
+//! resolves to the *same* level on every page. The per-page promotion gate
+//! ([`promote`]) is unchanged — it still decides *which* lines are headings,
+//! relative to each page's own body — only the level *assignment* becomes
+//! document-wide. A one-page document collects exactly the sizes its single
+//! page already clustered, so its levels are identical to the pre-pass result.
 
 use crate::model::{Block, BlockKind, Heading};
 use crate::recon::lines::ReconLine;
@@ -65,10 +81,16 @@ impl HeadingLevels {
         Self::from_sizes(sizes)
     }
 
-    /// Build the hierarchy from an iterator of candidate sizes (used by
-    /// [`from_lines`](Self::from_lines) and by the tests). Sizes are clustered
-    /// by relative proximity, then ranked largest-first.
-    fn from_sizes(sizes: impl IntoIterator<Item = f64>) -> Self {
+    /// Build the hierarchy from an iterator of candidate sizes. Sizes are
+    /// clustered by relative proximity, then ranked largest-first.
+    ///
+    /// This is the shared clustering primitive: [`from_lines`](Self::from_lines)
+    /// feeds it a single page's candidate sizes, while a document-wide pass feeds
+    /// it every page's already-promoted heading sizes (collected via
+    /// [`heading_size`]) so one hierarchy covers the whole document. Fed the same
+    /// set, it returns the same ranks — a one-page document therefore clusters
+    /// identically whether built per-page or document-wide.
+    pub fn from_sizes(sizes: impl IntoIterator<Item = f64>) -> Self {
         // Unique-ish, descending: collect, sort, then 1-D gap-split so that
         // sizes within `CLUSTER_TOLERANCE` of the open cluster's representative
         // collapse to one level and a clear drop starts the next, deeper level.
@@ -157,6 +179,29 @@ pub fn promote(block: Block, body: f64, levels: &HeadingLevels) -> Block {
         }),
         ..block
     }
+}
+
+/// The representative font size of an already-promoted [`Heading`] — the same
+/// "largest run size" rule [`promote`] used to pick the heading's level. Used by
+/// a document-wide pass to collect every heading's size into one
+/// [`HeadingLevels`] (so the same visual size maps to the same level on every
+/// page) and then re-stamp levels via [`relevel`].
+pub fn heading_size(heading: &Heading) -> f64 {
+    paragraph_size(&heading.para)
+}
+
+/// Re-stamp `heading`'s [`level`](Heading::level) from a **document-wide**
+/// `levels` map (typically built from [`heading_size`] over every page's
+/// headings). The heading's content is untouched; only its rank changes, so a
+/// heading of a given size resolves to the same level wherever it appears.
+///
+/// Pairs with [`heading_size`] to make heading levels consistent across pages
+/// without re-running promotion: the per-page [`promote`] gate already chose
+/// *which* blocks are headings; this only harmonizes their *levels*. With an
+/// empty `levels` (no headings collected) [`HeadingLevels::level_for`] yields
+/// `1`, so a lone heading still gets a valid level.
+pub fn relevel(heading: &mut Heading, levels: &HeadingLevels) {
+    heading.level = levels.level_for(heading_size(heading));
 }
 
 /// Number of visual lines in a paragraph = 1 + the count of explicit line breaks.
@@ -412,5 +457,78 @@ mod tests {
         assert_eq!(lv.level_for(24.0), 1, "the lone title is H1");
         // The body size never entered the hierarchy: there is exactly one cluster.
         assert_eq!(lv.clusters.len(), 1);
+    }
+
+    // ── document-wide leveling primitives (heading_size + relevel) ───────────
+
+    /// The `Heading` a promotion produced for a block of one font size.
+    fn heading_block(text: &str, size: f64) -> Heading {
+        match promote(para_block(text, size, false, 0), 12.0, &levels(&[size])).kind {
+            BlockKind::Heading(h) => h,
+            _ => panic!("expected the block to promote to a heading"),
+        }
+    }
+
+    #[test]
+    fn heading_size_is_the_dominant_run_size() {
+        // `heading_size` mirrors the promotion rule (largest run size), so the
+        // document-wide collector sees the same size promotion ranked on.
+        let h = heading_block("Title", 24.0);
+        assert_eq!(heading_size(&h), 24.0);
+    }
+
+    #[test]
+    fn relevel_restamps_from_the_document_wide_map() {
+        // A 14pt heading promoted on a page that knew only 14pt was H1 per-page.
+        let mut h = heading_block("Subhead", 14.0);
+        assert_eq!(h.level, 1, "per-page, the lone 14pt heading is H1");
+        // Document-wide a 24pt title also exists → the 14pt heading is H2.
+        let doc = levels(&[24.0, 14.0]);
+        relevel(&mut h, &doc);
+        assert_eq!(h.level, 2, "document-wide, 14pt sits below the 24pt title");
+    }
+
+    #[test]
+    fn relevel_is_consistent_across_pages_for_one_size() {
+        // The crux of the document-wide pass: the SAME visual size must resolve to
+        // the SAME level regardless of which page it came from. Page 1 had a 24pt
+        // title + a 14pt subhead (so 14pt was H2 there); page 2 had only a 14pt
+        // heading (H1 there). After re-leveling against the doc-wide set, both
+        // 14pt headings are H2 and below the 24pt title.
+        let doc = levels(&[24.0, 14.0, 14.0]);
+        let mut page1_sub = heading_block("Page 1 subhead", 14.0);
+        let mut page2_head = heading_block("Page 2 heading", 14.0);
+        let mut title = heading_block("Page 1 title", 24.0);
+        relevel(&mut page1_sub, &doc);
+        relevel(&mut page2_head, &doc);
+        relevel(&mut title, &doc);
+        assert_eq!(title.level, 1, "the 24pt title is H1");
+        assert_eq!(page1_sub.level, page2_head.level, "same size ⇒ same level");
+        assert_eq!(
+            page2_head.level, 2,
+            "14pt is H2 everywhere, below the title"
+        );
+    }
+
+    #[test]
+    fn relevel_with_empty_map_falls_back_to_level_one() {
+        // Degenerate: no sizes collected (e.g. no headings) ⇒ a valid level, not a
+        // panic. (The document-wide caller skips an empty set, but `relevel` is
+        // still defined.)
+        let mut h = heading_block("Lonely", 20.0);
+        relevel(&mut h, &levels(&[]));
+        assert_eq!(h.level, 1);
+    }
+
+    #[test]
+    fn document_wide_set_clusters_like_a_single_page_for_one_page() {
+        // No-regression invariant: a one-page document collects exactly the sizes
+        // its single page already clustered, so the document-wide hierarchy equals
+        // the per-page one — identical levels for every size.
+        let page = levels(&[24.0, 18.0, 14.0]);
+        let doc = levels(&[24.0, 18.0, 14.0]); // same set a 1-page collect yields
+        for size in [24.0, 18.0, 14.0] {
+            assert_eq!(page.level_for(size), doc.level_for(size));
+        }
     }
 }

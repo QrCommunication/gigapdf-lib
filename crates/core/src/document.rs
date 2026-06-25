@@ -7965,6 +7965,18 @@ impl Document {
         // not pollute the table of contents either.
         recon::headerfooter::strip_running_furniture(&mut sections);
 
+        // Harmonize heading levels **document-wide**. Per-page reconstruction
+        // clustered each page's heading sizes in isolation, so the same visual
+        // size could map to different levels on different pages. Re-cluster every
+        // promoted heading's size once across the whole document and re-stamp each
+        // level from that single map, so e.g. a 14 pt heading is the same level on
+        // page 1 and page 9 and the outline below reads as a coherent hierarchy.
+        // Skipped for tagged documents: their levels come from the author's
+        // `/StructTreeRoot`, which is already document-wide and authoritative.
+        if !is_tagged {
+            Self::relevel_headings_document_wide(&mut sections);
+        }
+
         let meta = DocMeta {
             title: self.get_metadata("Title").filter(|s| !s.is_empty()),
             author: self.get_metadata("Author").filter(|s| !s.is_empty()),
@@ -8101,6 +8113,61 @@ impl Document {
                     Self::rotate_blocks_for_display(&mut bq.blocks, rotation, page_w, page_h);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Re-stamp every reconstructed top-level `Heading` block's level from a
+    /// **single document-wide** size→level hierarchy, replacing the per-page
+    /// levels assigned during reconstruction.
+    ///
+    /// Per-page promotion ([`recon::headings::promote`]) clusters only one page's
+    /// heading sizes, so the same visual size lands on different levels across
+    /// pages (a 14 pt heading is `H1` on a page with no larger title but `H2` on a
+    /// page that also has a 24 pt title). Here every promoted heading's
+    /// representative size ([`recon::headings::heading_size`]) is collected across
+    /// all sections/pages, clustered **once** ([`recon::headings::HeadingLevels::from_sizes`]),
+    /// and each heading's level re-stamped from that map ([`recon::headings::relevel`]).
+    /// The result is consistent levels across pages and a coherent nested outline.
+    ///
+    /// Only **top-level** heading blocks are visited — the same set the outline
+    /// reflects ([`headings_outline`](Self::headings_outline)); headings nested in
+    /// tables/cells/text-boxes keep their per-page level. The promotion *gate*
+    /// (which lines become headings, relative to each page's own body) is never
+    /// revisited — only the level assignment is harmonized. A single-page document
+    /// collects exactly the sizes its one page already clustered, so its levels
+    /// are identical to the pre-pass per-page result.
+    fn relevel_headings_document_wide(sections: &mut [crate::model::Section]) {
+        use crate::model::BlockKind;
+
+        // 1. Collect every top-level heading's representative size across the doc.
+        let sizes: Vec<f64> = sections
+            .iter()
+            .flat_map(|section| &section.pages)
+            .flat_map(|page| &page.blocks)
+            .filter_map(|block| match &block.kind {
+                BlockKind::Heading(h) => Some(crate::recon::headings::heading_size(h)),
+                _ => None,
+            })
+            .collect();
+
+        // No headings anywhere → nothing to harmonize (and an empty hierarchy
+        // would re-stamp nothing useful). Leave the model untouched.
+        if sizes.is_empty() {
+            return;
+        }
+
+        // 2. Cluster the whole-document size set once into a stable size→level map.
+        let levels = crate::recon::headings::HeadingLevels::from_sizes(sizes);
+
+        // 3. Re-stamp each top-level heading's level from that single map.
+        for section in sections.iter_mut() {
+            for page in section.pages.iter_mut() {
+                for block in page.blocks.iter_mut() {
+                    if let BlockKind::Heading(h) = &mut block.kind {
+                        crate::recon::headings::relevel(h, &levels);
+                    }
+                }
             }
         }
     }
@@ -33985,6 +34052,148 @@ mod tests {
             text, "Chapter One\n\nFirst paragraph body.\n\nSecond paragraph body.\n",
             "headings + paragraphs as clean blank-line-separated lines: {text:?}"
         );
+    }
+
+    // ── document-wide heading-level harmonization (#5) ───────────────────────
+
+    /// A top-level `Heading` block of font `size`, level `level` (the level the
+    /// per-page pass assigned). `size` lives on the heading's run so
+    /// `recon::headings::heading_size` reads it back.
+    fn heading_block_sized(text: &str, size: f64, level: u8) -> crate::model::Block {
+        use crate::model::{Block, BlockKind, CharStyle, Heading, Inline, InlineRun, Paragraph};
+        Block {
+            kind: BlockKind::Heading(Heading {
+                level,
+                para: Paragraph {
+                    runs: vec![Inline::Run(InlineRun {
+                        text: text.to_string(),
+                        style: CharStyle {
+                            size_pt: size,
+                            ..CharStyle::default()
+                        },
+                        source_index: None,
+                    })],
+                    ..Paragraph::default()
+                },
+            }),
+            ..Block::default()
+        }
+    }
+
+    /// One `Section` (Letter geometry) holding the given pages of blocks.
+    fn section_with_pages(pages: Vec<Vec<crate::model::Block>>) -> crate::model::Section {
+        use crate::model::{geom::PageGeometry, Page, Section};
+        Section {
+            geometry: PageGeometry {
+                width: 612.0,
+                height: 792.0,
+                ..PageGeometry::default()
+            },
+            header: None,
+            footer: None,
+            pages: pages
+                .into_iter()
+                .map(|blocks| Page {
+                    blocks,
+                    absolute: false,
+                })
+                .collect(),
+        }
+    }
+
+    /// The level of the single heading in `page`'s top-level blocks (panics if it
+    /// is not a lone heading-bearing page in the expected slot).
+    fn heading_level(section: &crate::model::Section, page: usize, block: usize) -> u8 {
+        match &section.pages[page].blocks[block].kind {
+            crate::model::BlockKind::Heading(h) => h.level,
+            other => panic!("expected a heading block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relevel_headings_document_wide_same_size_is_same_level_across_pages() {
+        // Page 1: a 24pt title (per-page H1) + a 14pt subhead (per-page H2 since
+        // 24pt is also present). Page 2: only a 14pt heading — per-page that page
+        // clustered 14pt alone, so it was H1 there. After the document-wide pass,
+        // the 14pt heading must be the SAME level on both pages and BELOW the 24pt
+        // title.
+        let mut sections = vec![section_with_pages(vec![
+            vec![
+                heading_block_sized("Document Title", 24.0, 1),
+                heading_block_sized("Page 1 Subhead", 14.0, 2),
+            ],
+            vec![heading_block_sized("Page 2 Heading", 14.0, 1)],
+        ])];
+
+        Document::relevel_headings_document_wide(&mut sections);
+
+        let title = heading_level(&sections[0], 0, 0);
+        let p1_sub = heading_level(&sections[0], 0, 1);
+        let p2_head = heading_level(&sections[0], 1, 0);
+        assert_eq!(title, 1, "the 24pt title is H1");
+        assert_eq!(
+            p1_sub, p2_head,
+            "the 14pt heading is the same level on page 1 and page 2"
+        );
+        assert_eq!(p2_head, 2, "the 14pt heading is H2 (below the 24pt title)");
+        assert!(title < p2_head, "the title outranks the 14pt heading");
+    }
+
+    #[test]
+    fn relevel_headings_document_wide_uniform_body_has_no_spurious_headings() {
+        // A document of plain body paragraphs only — no `Heading` blocks at all.
+        // The pass collects an empty size set and must leave the model untouched
+        // (no heading is invented, no panic on the empty hierarchy).
+        let mut sections = vec![section_with_pages(vec![
+            vec![
+                para_block("First body paragraph."),
+                para_block("Still body."),
+            ],
+            vec![
+                para_block("Second page body."),
+                para_block("More body text."),
+            ],
+        ])];
+
+        Document::relevel_headings_document_wide(&mut sections);
+
+        for section in &sections {
+            for page in &section.pages {
+                for block in &page.blocks {
+                    assert!(
+                        matches!(block.kind, crate::model::BlockKind::Paragraph(_)),
+                        "uniform body text must stay paragraphs, never become headings"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relevel_headings_document_wide_single_page_matches_per_page() {
+        // No-regression: a one-page document's document-wide hierarchy is built
+        // from exactly the sizes that page's per-page pass clustered, so the
+        // re-stamped levels equal the per-page levels — three distinct sizes map
+        // to 1/2/3 unchanged.
+        use crate::recon::headings::HeadingLevels;
+
+        let per_page = HeadingLevels::from_sizes([24.0, 18.0, 14.0]);
+        let mut sections = vec![section_with_pages(vec![vec![
+            heading_block_sized("Title", 24.0, per_page.level_for(24.0)),
+            heading_block_sized("Section", 18.0, per_page.level_for(18.0)),
+            heading_block_sized("Subsection", 14.0, per_page.level_for(14.0)),
+        ]])];
+
+        // Snapshot the per-page levels before the doc-wide pass.
+        let before: Vec<u8> = (0..3).map(|i| heading_level(&sections[0], 0, i)).collect();
+        Document::relevel_headings_document_wide(&mut sections);
+        let after: Vec<u8> = (0..3).map(|i| heading_level(&sections[0], 0, i)).collect();
+
+        assert_eq!(
+            before, after,
+            "one-page levels are identical before/after the document-wide pass"
+        );
+        assert_eq!(after, vec![1, 2, 3], "three distinct sizes map to 1/2/3");
     }
 
     #[test]

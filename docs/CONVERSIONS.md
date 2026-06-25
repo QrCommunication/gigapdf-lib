@@ -309,19 +309,28 @@ content, is left untouched (header/footer `None`, body unchanged) — real
 first-page content is never stripped. The lift runs before the heading-outline
 fallback, so furniture never pollutes the table of contents either.
 
-**Heading levels (clustered, stable):** a paragraph that is short and visually
-prominent (font above the body size, or bold-and-short) is promoted to a heading,
-and its **level** (`h1`..`h6`) now comes from **clustering the distinct
-heading-candidate font sizes actually present** on the page — not fixed global
-size ratios. The distinct sizes are sorted descending and grouped within a small
-relative tolerance (sizes within ~6 % collapse to one level); the largest cluster
-maps to `h1`, the next to `h2`, and so on, **monotonically with no skipped
-levels** (a 24/18/14-over-11 pt document yields `h1/h2/h3`, never `h1/h3/h4`). A
-heading only ~1.15× the body is detected as a heading (not missed, not forced to
-`h6`); a bold run-in subhead at body size lands on the **deepest present** level
-rather than always `h6`; a document with a single heading size yields one
-consistent level for all. Body prose never enters the hierarchy, so ordinary text
-is never promoted.
+**Heading levels (clustered, document-wide, stable):** a paragraph that is short
+and visually prominent (font above the body size, or bold-and-short) is promoted
+to a heading, and its **level** (`h1`..`h6`) comes from **clustering the distinct
+heading-candidate font sizes actually present** — not fixed global size ratios.
+The distinct sizes are sorted descending and grouped within a small relative
+tolerance (sizes within ~6 % collapse to one level); the largest cluster maps to
+`h1`, the next to `h2`, and so on, **monotonically with no skipped levels** (a
+24/18/14-over-11 pt document yields `h1/h2/h3`, never `h1/h3/h4`). The clustering
+is now **document-wide**: every promoted heading's size across **all pages** is
+collected and clustered **once**, then each heading's level is stamped from that
+single map — so the same visual size resolves to the **same level on every page**
+(a 14 pt heading is `h2` on page 1 and on page 9, never `h1` on a page that
+happens to lack a larger title), and the document gets a **coherent nested
+outline** rather than a per-page-relative one. The *detection* gate stays
+per-page (a heading must be meaningfully larger/bolder than **its own page's**
+dominant body size), so only the level assignment is harmonized; a **one-page**
+document collects exactly the sizes its single page already clustered, so its
+levels are **unchanged**. A heading only ~1.15× the body is detected as a heading
+(not missed, not forced to `h6`); a bold run-in subhead at body size lands on the
+**deepest present** level rather than always `h6`; a document with a single
+heading size yields one consistent level for all. Body prose never enters the
+hierarchy, so ordinary text is never promoted.
 
 **Limits on arbitrary third-party PDFs (tracked in [#5](../../issues/5)):**
 
