@@ -8439,11 +8439,19 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                         }
                         // The typed counterpart: clone the referenced font /
                         // border (the `<alignment>` child fills in align/wrap).
+                        // `applyFont` gates the font (ECMA-376 `apply*` flags
+                        // default true): absent / `1` ⇒ apply the referenced
+                        // `fontId`; an explicit `0`/`false`/`off` ⇒ keep the
+                        // default `CharStyle` (the cell ignores the font record).
                         let mut cf = CellFmt {
-                            style: attr(&attrs, "fontId")
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .and_then(|i| font_struct.get(i))
-                                .cloned()
+                            style: xlsx_apply_flag(&attrs, "applyFont")
+                                .then(|| {
+                                    attr(&attrs, "fontId")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                        .and_then(|i| font_struct.get(i))
+                                        .cloned()
+                                })
+                                .flatten()
                                 .unwrap_or_default(),
                             ..CellFmt::default()
                         };
@@ -8794,6 +8802,13 @@ fn xlsx_alignment_css(attrs: &[(String, String)]) -> String {
 /// `val` says otherwise (`0`/`false`/`off` ⇒ off).
 fn xlsx_bool_attr(attrs: &[(String, String)]) -> bool {
     !matches!(attr(attrs, "val"), Some("0") | Some("false") | Some("off"))
+}
+
+/// An XLSX `xf` `apply*` flag (`applyFont`, `applyBorder`, …) by name. Per
+/// ECMA-376 these default to *true* when absent, so a missing flag means "apply
+/// the referenced format"; only an explicit `0`/`false`/`off` turns it off.
+fn xlsx_apply_flag(attrs: &[(String, String)], name: &str) -> bool {
+    !matches!(attr(attrs, name), Some("0") | Some("false") | Some("off"))
 }
 
 /// Resolve a colour element's `rgb` / `theme`+`tint` / `indexed` attributes to
@@ -17956,6 +17971,117 @@ mod tests {
             s.rows[0].cells[2].style.vertical_align,
             model::VAlign::Sub,
             "subscript → Sub"
+        );
+    }
+
+    #[test]
+    fn xlsx_model_reads_font_colour_indexed_and_theme() {
+        // Font colour reaches the cell `CharStyle` through every encoding, not
+        // just `rgb`: fontId 1 = indexed red (palette idx 2), fontId 2 = a theme
+        // colour (theme idx 4 = the first accent, here pure blue) lightened by a
+        // positive `tint`. The plain cell (fontId 0) keeps the default colour.
+        let theme = r##"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:themeElements><a:clrScheme name="Office">
+            <a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+            <a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+            <a:dk2><a:srgbClr val="000000"/></a:dk2>
+            <a:lt2><a:srgbClr val="FFFFFF"/></a:lt2>
+            <a:accent1><a:srgbClr val="0000FF"/></a:accent1>
+            <a:accent2><a:srgbClr val="00FF00"/></a:accent2>
+            <a:accent3><a:srgbClr val="FF0000"/></a:accent3>
+            <a:accent4><a:srgbClr val="FFFF00"/></a:accent4>
+            <a:accent5><a:srgbClr val="FF00FF"/></a:accent5>
+            <a:accent6><a:srgbClr val="00FFFF"/></a:accent6>
+            <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+            <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+          </a:clrScheme></a:themeElements>
+        </a:theme>"##;
+        let styles = r#"<styleSheet>
+          <fonts count="3">
+            <font><sz val="11"/><name val="Calibri"/></font>
+            <font><color indexed="2"/><name val="Calibri"/></font>
+            <font><color theme="4" tint="0.5"/><name val="Calibri"/></font>
+          </fonts>
+          <cellXfs count="3">
+            <xf fontId="0"/>
+            <xf fontId="1" applyFont="1"/>
+            <xf fontId="2" applyFont="1"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="0" t="inlineStr"><is><t>plain</t></is></c>
+            <c r="B1" s="1" t="inlineStr"><is><t>idx</t></is></c>
+            <c r="C1" s="2" t="inlineStr"><is><t>thm</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored(
+            "xl/workbook.xml",
+            br#"<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        );
+        z.add_stored("xl/theme/theme1.xml", theme.as_bytes());
+        z.add_stored("xl/styles.xml", styles.as_bytes());
+        z.add_stored("xl/worksheets/sheet1.xml", sheet.as_bytes());
+        let model = office_to_model(&z.finish()).expect("xlsx → model");
+        let s = match model.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Sheet(sb) => sb.sheets.into_iter().next().expect("one sheet"),
+            other => panic!("expected a Sheet block, got {other:?}"),
+        };
+        // Indexed palette idx 2 = pure red.
+        assert_eq!(
+            s.rows[0].cells[1].style.color,
+            Some([1.0, 0.0, 0.0]),
+            "indexed red font colour"
+        );
+        // Theme accent1 (idx 4) = 0000FF, lightened by tint 0.5 → blue stays at
+        // full (0/255 → 128), R & G rise to 128 (0 → 0*(1-0.5)+255*0.5).
+        let thm = s.rows[0].cells[2].style.color.expect("theme colour set");
+        assert!(
+            (thm[0] - 0.5).abs() < 0.02 && (thm[1] - 0.5).abs() < 0.02,
+            "tinted R,G ≈ .5: {thm:?}"
+        );
+        assert!(
+            (thm[2] - 1.0).abs() < 1e-6,
+            "tinted blue stays full: {thm:?}"
+        );
+        // The plain cell keeps the default (no explicit colour).
+        assert_eq!(s.rows[0].cells[0].style.color, None, "plain default colour");
+    }
+
+    #[test]
+    fn xlsx_model_applyfont_zero_drops_font_styling() {
+        // A cellXf can reference a styled `fontId` yet set `applyFont="0"`: the
+        // font formatting must NOT reach the cell (ECMA-376 `apply*` flags).
+        // fontId 1 is bold+14pt+red, but the xf opts out → default CharStyle.
+        let styles = r#"<styleSheet>
+          <fonts count="2">
+            <font><sz val="11"/><name val="Calibri"/></font>
+            <font><b/><sz val="14"/><color rgb="FFFF0000"/><name val="Arial"/></font>
+          </fonts>
+          <cellXfs count="2">
+            <xf fontId="1" applyFont="1"/>
+            <xf fontId="1" applyFont="0"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="0" t="inlineStr"><is><t>on</t></is></c>
+            <c r="B1" s="1" t="inlineStr"><is><t>off</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet(styles, sheet, None);
+        // applyFont="1": the styled font is applied.
+        let on = &s.rows[0].cells[0];
+        assert!(on.style.bold, "applyFont=1 keeps bold");
+        assert_eq!(on.style.family, "Arial", "applyFont=1 keeps family");
+        // applyFont="0": same fontId, but the font is suppressed → default.
+        let off = &s.rows[0].cells[1];
+        assert_eq!(
+            off.style,
+            CharStyle::default(),
+            "applyFont=0 drops the referenced font"
         );
     }
 
