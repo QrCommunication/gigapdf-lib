@@ -242,6 +242,28 @@ is never promoted.
 
 **Limits on arbitrary third-party PDFs (tracked in [#5](../../issues/5)):**
 
+- **Tagged-PDF path (`/StructTreeRoot`)**: when an authored Tagged PDF is present
+  the structure tree is trusted over the geometric heuristics, and the walk now
+  **lowers the structure-element attributes** (`/A`, ISO 32000-1 §14.8.5.2)
+  instead of dropping them. **Table cell spans** — a `/TD`/`/TH`'s `/ColSpan` /
+  `/RowSpan` (`/Table` owner) become the model `Cell.col_span` / `row_span`, and
+  the logical column count is the widest row's summed span, so tagged tables come
+  out as aligned grids (not the old ragged 0-width ones). **List numbering** — an
+  `/L`'s `/ListNumbering` (`/List` owner) drives `List.ordered` and the marker
+  format (`Decimal`/`UpperRoman`/`LowerRoman`/`UpperAlpha`/`LowerAlpha` → ordered
+  with the matching marker; `Disc`/`Circle`/`Square` → bullets; `None`/absent →
+  unordered default), so tagged lists are no longer always unordered. **Geometry**
+  — each block's `frame` is set from the element's `/Layout` `/BBox`
+  (`[llx lly urx ury]` → a normalized lower-left + width/height rect) when
+  present. **Page assignment** — each block now carries the 0-based page index
+  resolved from the producing element's `/Pg` (exposed by the paged tag-tree
+  entry point), so a block declared on page 2 is tagged page 2, not page 1.
+  Still pending: a **header-row concept** — `/THead`/`/TH` is read as a cell but
+  not flagged as a header (`Cell` has no `is_header` field yet; a separate task,
+  shared with the heuristic tables item below); and the model-reconstruction
+  driver still places the flat block list on the first page — *consuming* the
+  per-block `/Pg` page hint there to finish the per-page split is a follow-up
+  outside this module.
 - **Tables**: detection now recovers **merged (spanning) cells in borderless
   tables** (a run whose box reaches across otherwise-empty columns/rows becomes a
   `col_span`/`row_span` cell, no phantom blank cell left behind — alongside the
