@@ -44,6 +44,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [A toggleable "Watermark" layer (optional content / OCG)](#a-toggleable-watermark-layer-optional-content--ocg)
 - [Merge multiple PDFs](#merge-multiple-pdfs)
 - [2-up booklet & contact sheet (N-up imposition)](#2-up-booklet--contact-sheet-n-up-imposition)
+- [Scale page content & large-format pages (UserUnit)](#scale-page-content--large-format-pages-userunit)
 - [Compact output (object streams + cross-reference stream)](#compact-output-object-streams--cross-reference-stream) — *v0.81.0*
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
 - [Fill and create form fields](#fill-and-create-form-fields)
@@ -898,6 +899,60 @@ For an explicit affine (shear, a non-right-angle rotation, a mirror), use
 `placePageMatrix(target, source, [a, b, c, d, e, f])` — it applies your matrix as
 the `cm` directly, with **no** origin/rotation normalisation, so an identity
 matrix draws the source 1:1 at the target origin.
+
+---
+
+## Scale page content & large-format pages (UserUnit)
+
+`resizePage` changes the page box **only** — the drawn marks keep their
+coordinates, so they overflow or float in the new box. To resize a page *with*
+its content, scale the content for real.
+
+`scalePageContent(page, factor)` does a true zoom of the whole page (ISO 32000-1
+§8.3.4): it wraps the existing content in `q <factor 0 0 factor 0 0> cm … Q`,
+scales `/MediaBox` + `/CropBox` (and any declared Bleed/Trim/Art) about the
+origin, **and** scales every annotation `/Rect` so widget and stamp appearances —
+fit from their `/BBox` into the `/Rect` per §12.5.5 — follow automatically.
+
+```ts
+// Halve a page: content, box and annotations all shrink to 50 %.
+const doc = giga.open(pdfBytes);
+doc.scalePageContent(1, 0.5);            // 612×792 → 306×396, content scaled to match
+const half = doc.saveCompressed();
+doc.close();
+```
+
+Shrink-or-grow **to fit** a target box (aspect preserved) with
+`scalePageTo(page, width, height)`, which returns the uniform factor it applied:
+
+```ts
+// Fit an oversized page onto US-Letter (612×792), keeping its proportions.
+const fit = giga.open(pdfBytes);
+const factor = fit.scalePageTo(1, 612, 792); // e.g. 0.5 when the page was 1224×1584
+const lettered = fit.saveCompressed();
+fit.close();
+```
+
+`scalePageContentXY(page, sx, sy)` is the anisotropic variant (stretch a page to
+a non-proportional target — `sx ≠ sy`).
+
+**Large format without huge coordinates** — PDF user space tops out around 200
+inches. For a poster or CAD sheet, leave the coordinates as they are and raise the
+page's `/UserUnit` (ISO 32000-1 §14.11.2): one default unit becomes `unit`⁄72 inch,
+so the medium itself is enlarged. This is *separate* from `scalePageContent` — it
+rescales the coordinate system, it does not rewrite the content.
+
+```ts
+// A 24×36 in poster: author at 1728×2592 pt and double the unit (1 unit = 1⁄36″).
+const poster = giga.open(pdfBytes);
+poster.setUserUnit(1, 2.0);              // physical size doubles; coordinates unchanged
+poster.pageUserUnit(1);                  // → 2.0 (1.0 when absent)
+const big = poster.saveCompressed();
+poster.close();
+```
+
+Pass `1.0` to `setUserUnit` to remove the key (the default — keeps the file
+minimal).
 
 ---
 

@@ -2741,10 +2741,71 @@ pub extern "C" fn gp_add_text_layer(
     }
 }
 
-/// Resize a page's `/MediaBox` to `width`×`height` points. 0 on success.
+/// Resize a page's `/MediaBox` to `width`×`height` points (box geometry only —
+/// the content is not scaled; use [`gp_scale_page_content`] for that). 0 on
+/// success.
 #[no_mangle]
 pub extern "C" fn gp_resize_page(handle: *mut Document, page: u32, width: f64, height: f64) -> i32 {
     edit(handle, |doc| doc.resize_page(page, width, height))
+}
+
+/// Scale a page's **content** uniformly by `factor` about the page origin (ISO
+/// 32000-1 §8.3.4): the content stream is wrapped in `q <factor 0 0 factor 0 0>
+/// cm … Q`, the `/MediaBox`/`/CropBox` (+ any declared production boxes) are
+/// scaled, and every annotation `/Rect` is scaled so appearances stay aligned
+/// (§12.5.5). `factor` must be finite and positive. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_scale_page_content(handle: *mut Document, page: u32, factor: f64) -> i32 {
+    edit(handle, |doc| doc.scale_page_content(page, factor))
+}
+
+/// Anisotropic [`gp_scale_page_content`]: scale a page's content by `sx`
+/// horizontally and `sy` vertically about the origin, scaling the boxes and
+/// annotation `/Rect`s by the same factors. Both must be finite and positive.
+/// 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_scale_page_content_xy(
+    handle: *mut Document,
+    page: u32,
+    sx: f64,
+    sy: f64,
+) -> i32 {
+    edit(handle, |doc| doc.scale_page_content_xy(page, sx, sy))
+}
+
+/// Scale a page's content to **fit within** `width`×`height` points (shrink- or
+/// grow-to-fit), preserving aspect ratio. Returns the uniform factor applied
+/// (positive), or a negative value on error (bad page number, non-positive
+/// target, or zero-area page).
+#[no_mangle]
+pub extern "C" fn gp_scale_page_to(
+    handle: *mut Document,
+    page: u32,
+    width: f64,
+    height: f64,
+) -> f64 {
+    match unsafe { handle.as_mut() } {
+        Some(doc) => doc.scale_page_to(page, width, height).unwrap_or(-1.0),
+        None => -1.0,
+    }
+}
+
+/// Set a page's `/UserUnit` (ISO 32000-1 §14.11.2) — large-format authoring: one
+/// default user-space unit becomes `unit`⁄72 inch. `1.0` (the default) removes
+/// the key. `unit` must be finite and positive. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_set_user_unit(handle: *mut Document, page: u32, unit: f64) -> i32 {
+    edit(handle, |doc| doc.set_user_unit(page, unit))
+}
+
+/// A page's `/UserUnit` (default `1.0` when absent), or a negative value on error
+/// (bad page number).
+#[no_mangle]
+pub extern "C" fn gp_page_user_unit(handle: *mut Document, page: u32) -> f64 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => doc.page_user_unit(page).unwrap_or(-1.0),
+        None => -1.0,
+    }
 }
 
 /// Insert a blank `width`×`height` page after the 1-based `after` page

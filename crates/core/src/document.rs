@@ -16914,9 +16914,16 @@ impl Document {
         }
     }
 
-    // ─── page structure (resize / insert / duplicate) ────────────────────────
+    // ─── page structure (resize / scale / insert / duplicate) ────────────────
 
     /// Set a page's `/MediaBox` to `[0 0 width height]` (points).
+    ///
+    /// This changes the **box geometry only** — the drawn content keeps its own
+    /// coordinates, so it is *not* scaled to the new box (it may clip or float).
+    /// To scale the actual page content along with the box (and keep annotations
+    /// aligned), use [`scale_page_content`](Self::scale_page_content) or
+    /// [`scale_page_to`](Self::scale_page_to). For large-format authoring, see
+    /// [`set_user_unit`](Self::set_user_unit).
     pub fn resize_page(&mut self, page_no: u32, width: f64, height: f64) -> Result<()> {
         let id = self.page_object_id(page_no)?;
         let mut page = self
@@ -16926,6 +16933,225 @@ impl Document {
             .cloned()
             .ok_or(EngineError::PageNotFound(page_no))?;
         page.set(b"MediaBox".to_vec(), Self::media_box_array(width, height));
+        self.objects.insert(id, Object::Dictionary(page));
+        Ok(())
+    }
+
+    /// Scale a page's **content** uniformly by `factor` about the page origin —
+    /// the drawn marks shrink/grow with the page, not just the box (ISO 32000-1
+    /// §8.3.4, content-stream transforms).
+    ///
+    /// Three things move together so the result is a true, faithful zoom of the
+    /// whole page:
+    ///
+    /// 1. **Content** — the existing content stream is wrapped in
+    ///    `q <factor 0 0 factor 0 0> cm … Q`, so every operator is concatenated
+    ///    with a scale-about-origin matrix (the `q`/`Q` save/restore keeps the
+    ///    transform from leaking into anything appended later).
+    /// 2. **Boxes** — `/MediaBox` and `/CropBox` (resolved through inheritance and
+    ///    written onto the page so it is self-describing) plus any locally
+    ///    declared `/BleedBox`, `/TrimBox` and `/ArtBox` are each scaled about the
+    ///    origin, so the boundaries continue to bound the scaled content.
+    /// 3. **Annotations** — each annotation's `/Rect` is scaled about the origin.
+    ///    A widget/stamp's appearance stream is mapped from its (matrix-transformed)
+    ///    `/BBox` *into* its `/Rect` per ISO 32000-1 §12.5.5, so scaling the `/Rect`
+    ///    rescales the appearance to match — they stay aligned automatically
+    ///    (scaling `/BBox`/`/Matrix` as well would double-scale it).
+    ///
+    /// `factor` must be finite and strictly positive. A page without a `/Contents`
+    /// entry is still re-boxed and its annotations scaled (an empty page is valid).
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] if `factor` is not a finite positive
+    /// number; [`EngineError::PageNotFound`] for a non-existent page number.
+    pub fn scale_page_content(&mut self, page_no: u32, factor: f64) -> Result<()> {
+        self.scale_page_content_xy(page_no, factor, factor)
+    }
+
+    /// Anisotropic variant of [`scale_page_content`](Self::scale_page_content):
+    /// scale the page content by `sx` horizontally and `sy` vertically about the
+    /// page origin, scaling the boxes and annotation `/Rect`s by the same factors.
+    /// Both factors must be finite and strictly positive.
+    pub fn scale_page_content_xy(&mut self, page_no: u32, sx: f64, sy: f64) -> Result<()> {
+        if !sx.is_finite() || !sy.is_finite() || sx <= 0.0 || sy <= 0.0 {
+            return Err(EngineError::InvalidArgument(format!(
+                "scale factors must be finite and positive (got sx={sx}, sy={sy})"
+            )));
+        }
+
+        // 1. Wrap the existing content in `q <sx 0 0 sy 0 0> cm … Q`. A page may
+        //    legitimately have no /Contents — skip the wrap then, but still re-box.
+        if let Ok(body) = self.page_content(page_no) {
+            let mut wrapped =
+                format!("q {} 0 0 {} 0 0 cm\n", content::num(sx), content::num(sy)).into_bytes();
+            wrapped.extend_from_slice(&body);
+            wrapped.extend_from_slice(b"\nQ\n");
+            self.set_page_content(page_no, wrapped)?;
+        }
+
+        // 2. Scale the page boxes about the origin. MediaBox & CropBox are
+        //    resolved (inheritance applied) and written onto the page so it stays
+        //    self-describing; the production boxes are scaled only if declared
+        //    locally (they default to CropBox and are not inheritable).
+        let boxes = self.page_boxes(page_no)?;
+        let scale_box = |r: [f64; 4]| [r[0] * sx, r[1] * sy, r[2] * sx, r[3] * sy];
+        self.set_page_box(page_no, PageBox::Media, scale_box(boxes.media))?;
+        self.set_page_box(page_no, PageBox::Crop, scale_box(boxes.crop))?;
+        if boxes.declared.bleed {
+            self.set_page_box(page_no, PageBox::Bleed, scale_box(boxes.bleed))?;
+        }
+        if boxes.declared.trim {
+            self.set_page_box(page_no, PageBox::Trim, scale_box(boxes.trim))?;
+        }
+        if boxes.declared.art {
+            self.set_page_box(page_no, PageBox::Art, scale_box(boxes.art))?;
+        }
+
+        // 3. Scale every annotation /Rect about the origin (appearance streams
+        //    follow via the §12.5.5 BBox→Rect mapping).
+        self.scale_page_annotation_rects(page_no, sx, sy)?;
+        Ok(())
+    }
+
+    /// Scale a page's content to **fit within** `target_width` × `target_height`
+    /// points (shrink- or grow-to-fit), preserving aspect ratio, and return the
+    /// uniform factor applied. Equivalent to
+    /// [`scale_page_content`](Self::scale_page_content) with
+    /// `min(target_width / current_width, target_height / current_height)`, where
+    /// the current dimensions are the page's displayed size (`/MediaBox`, with
+    /// `/Rotate` taken into account).
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] if either target is not a finite positive
+    /// number or the current page has a zero-area box; [`EngineError::PageNotFound`]
+    /// for a non-existent page number.
+    pub fn scale_page_to(
+        &mut self,
+        page_no: u32,
+        target_width: f64,
+        target_height: f64,
+    ) -> Result<f64> {
+        if !target_width.is_finite()
+            || !target_height.is_finite()
+            || target_width <= 0.0
+            || target_height <= 0.0
+        {
+            return Err(EngineError::InvalidArgument(format!(
+                "target size must be finite and positive (got {target_width}×{target_height})"
+            )));
+        }
+        let (w, h, _) = self.page_info(page_no)?;
+        if w <= 0.0 || h <= 0.0 {
+            return Err(EngineError::InvalidArgument(format!(
+                "page {page_no} has a zero-area box; cannot compute a fit factor"
+            )));
+        }
+        let factor = (target_width / w).min(target_height / h);
+        self.scale_page_content(page_no, factor)?;
+        Ok(factor)
+    }
+
+    /// Multiply every annotation `/Rect` on the 1-based `page_no` by `(sx, sy)`
+    /// about the page origin. Handles both indirect annotations (mutated in the
+    /// object store) and inline annotation dictionaries (mutated in the page's
+    /// `/Annots` array). A missing or non-array `/Annots` is a no-op.
+    fn scale_page_annotation_rects(&mut self, page_no: u32, sx: f64, sy: f64) -> Result<()> {
+        let page_id = self.page_object_id(page_no)?;
+        let Some(page) = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .cloned()
+        else {
+            return Err(EngineError::PageNotFound(page_no));
+        };
+        let items: Vec<Object> = match page.get(b"Annots").map(|o| self.resolve(o)) {
+            Some(Object::Array(arr)) => arr.clone(),
+            _ => return Ok(()),
+        };
+        let scale_rect = |r: [f64; 4]| {
+            Object::Array(vec![
+                Object::Real(r[0] * sx),
+                Object::Real(r[1] * sy),
+                Object::Real(r[2] * sx),
+                Object::Real(r[3] * sy),
+            ])
+        };
+        let mut new_items = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                // Indirect annotation: rewrite its dictionary in the store.
+                Object::Reference(id) => {
+                    if let Some(mut d) = self.objects.get(&id).and_then(Object::as_dict).cloned() {
+                        if d.get(b"Rect").is_some() {
+                            let r = self.read_rect(&d);
+                            d.set(b"Rect".to_vec(), scale_rect(r));
+                            self.objects.insert(id, Object::Dictionary(d));
+                        }
+                    }
+                    new_items.push(Object::Reference(id));
+                }
+                // Inline annotation dictionary: rewrite it in place.
+                Object::Dictionary(mut d) => {
+                    if d.get(b"Rect").is_some() {
+                        let r = self.read_rect(&d);
+                        d.set(b"Rect".to_vec(), scale_rect(r));
+                    }
+                    new_items.push(Object::Dictionary(d));
+                }
+                other => new_items.push(other),
+            }
+        }
+        let mut page = page;
+        page.set(b"Annots".to_vec(), Object::Array(new_items));
+        self.objects.insert(page_id, Object::Dictionary(page));
+        Ok(())
+    }
+
+    /// Read a page's `/UserUnit` (ISO 32000-1 §14.11.2) — the number of default
+    /// user-space units (1⁄72 inch) per drawing unit. Defaults to `1.0` (1 unit =
+    /// 1⁄72″) when the key is absent. Larger values let a page exceed the
+    /// ~200-inch coordinate limit (e.g. `2.0` ⇒ each unit is 1⁄36″, doubling the
+    /// physical size for the same coordinates) — large-format / CAD output.
+    pub fn page_user_unit(&self, page_no: u32) -> Result<f64> {
+        let page = self.page_dict(page_no)?;
+        Ok(page
+            .get(b"UserUnit")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_f64)
+            .unwrap_or(1.0))
+    }
+
+    /// Set a page's `/UserUnit` (ISO 32000-1 §14.11.2), authoring a large-format
+    /// page: each default user-space unit becomes `unit`⁄72 inch, so the same
+    /// coordinates render larger (e.g. `unit = 2.0` doubles the physical size).
+    /// `1.0` is the default (1 unit = 1⁄72″); a value of exactly `1.0` removes the
+    /// key, keeping the file minimal. This is *separate* from
+    /// [`scale_page_content`](Self::scale_page_content): it rescales the whole
+    /// coordinate system (a viewer-level zoom of the medium), it does not rewrite
+    /// content or boxes.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] if `unit` is not a finite positive number;
+    /// [`EngineError::PageNotFound`] for a non-existent page number.
+    pub fn set_user_unit(&mut self, page_no: u32, unit: f64) -> Result<()> {
+        if !unit.is_finite() || unit <= 0.0 {
+            return Err(EngineError::InvalidArgument(format!(
+                "/UserUnit must be a finite positive number (got {unit})"
+            )));
+        }
+        let id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+        if (unit - 1.0).abs() < f64::EPSILON {
+            page.remove(b"UserUnit");
+        } else {
+            page.set(b"UserUnit".to_vec(), Object::Real(unit));
+        }
         self.objects.insert(id, Object::Dictionary(page));
         Ok(())
     }
@@ -20505,6 +20731,108 @@ mod tests {
 
         let reopened = Document::open(&doc.save()).unwrap();
         assert_eq!(reopened.page_ids().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn scale_page_content_wraps_cm_halves_box_and_annot_rect() {
+        let pdf = crate::convert::reverse::txt_to_pdf("scale me");
+        let mut doc = Document::open(&pdf).unwrap();
+        // A square annotation in the upper-left of the 612×792 page.
+        doc.add_square_annotation(1, [100.0, 400.0, 300.0, 600.0], None, None, 1.0)
+            .unwrap();
+
+        doc.scale_page_content(1, 0.5).unwrap();
+
+        // 1. Content is wrapped in `q 0.5 0 0 0.5 0 0 cm … Q`.
+        let content = doc.page_content(1).unwrap();
+        assert!(
+            has_op(&content, b"q 0.5 0 0 0.5 0 0 cm"),
+            "content must be wrapped in the half-scale cm: {}",
+            String::from_utf8_lossy(&content[..content.len().min(80)])
+        );
+        assert!(
+            content.trim_ascii_end().ends_with(b"Q"),
+            "wrapped content must end with the balancing Q"
+        );
+
+        // 2. The MediaBox is halved.
+        let boxes = doc.page_boxes(1).unwrap();
+        assert_eq!(boxes.media, [0.0, 0.0, 306.0, 396.0]);
+        let (w, h, _) = doc.page_info(1).unwrap();
+        assert_eq!((w, h), (306.0, 396.0));
+
+        // 3. The annotation /Rect is halved.
+        let annots = doc.page_annotations(1).unwrap();
+        assert_eq!(annots.len(), 1);
+        assert_eq!(annots[0].rect, [50.0, 200.0, 150.0, 300.0]);
+
+        // Round-trips: reopen preserves the scaled box and rect.
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert_eq!(
+            reopened.page_boxes(1).unwrap().media,
+            [0.0, 0.0, 306.0, 396.0]
+        );
+        assert_eq!(
+            reopened.page_annotations(1).unwrap()[0].rect,
+            [50.0, 200.0, 150.0, 300.0]
+        );
+    }
+
+    #[test]
+    fn scale_page_content_rejects_non_positive_factor() {
+        let pdf = crate::convert::reverse::txt_to_pdf("bad factor");
+        let mut doc = Document::open(&pdf).unwrap();
+        assert!(doc.scale_page_content(1, 0.0).is_err());
+        assert!(doc.scale_page_content(1, -1.0).is_err());
+        assert!(doc.scale_page_content(1, f64::NAN).is_err());
+        assert!(doc.scale_page_content(1, f64::INFINITY).is_err());
+        // The page is untouched after the rejected calls.
+        assert_eq!(doc.page_boxes(1).unwrap().media, [0.0, 0.0, 612.0, 792.0]);
+    }
+
+    #[test]
+    fn scale_page_to_computes_uniform_shrink_to_fit_factor() {
+        let pdf = crate::convert::reverse::txt_to_pdf("fit me");
+        let mut doc = Document::open(&pdf).unwrap();
+        // 612×792 into 306×792: width binds (306/612 = 0.5 < 792/792 = 1.0).
+        let factor = doc.scale_page_to(1, 306.0, 792.0).unwrap();
+        assert!(
+            (factor - 0.5).abs() < 1e-9,
+            "fit factor should be 0.5, got {factor}"
+        );
+        let (w, h, _) = doc.page_info(1).unwrap();
+        assert_eq!((w, h), (306.0, 396.0)); // aspect preserved (height not maxed)
+        assert!(has_op(
+            &doc.page_content(1).unwrap(),
+            b"q 0.5 0 0 0.5 0 0 cm"
+        ));
+    }
+
+    #[test]
+    fn set_user_unit_writes_key_and_round_trips() {
+        let pdf = crate::convert::reverse::txt_to_pdf("user unit");
+        let mut doc = Document::open(&pdf).unwrap();
+        assert_eq!(doc.page_user_unit(1).unwrap(), 1.0); // default when absent
+
+        doc.set_user_unit(1, 2.0).unwrap();
+        assert_eq!(doc.page_user_unit(1).unwrap(), 2.0);
+        let serialized = doc.save();
+        assert!(
+            has_op(&serialized, b"/UserUnit"),
+            "/UserUnit must be written to the page dictionary"
+        );
+        let reopened = Document::open(&serialized).unwrap();
+        assert_eq!(reopened.page_user_unit(1).unwrap(), 2.0);
+
+        // Resetting to 1.0 removes the key (keeps the file minimal).
+        doc.set_user_unit(1, 1.0).unwrap();
+        assert_eq!(doc.page_user_unit(1).unwrap(), 1.0);
+        assert!(doc.page_dict(1).unwrap().get(b"UserUnit").is_none());
+
+        // Invalid units are rejected.
+        assert!(doc.set_user_unit(1, 0.0).is_err());
+        assert!(doc.set_user_unit(1, -3.0).is_err());
+        assert!(doc.set_user_unit(1, f64::NAN).is_err());
     }
 
     #[test]

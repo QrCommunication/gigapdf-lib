@@ -3310,9 +3310,70 @@ export class GigaPdfDoc {
       this.g._buffer((o) => this.ex().gp_extract_pages(this.h, p, c, o))
     );
   }
-  /** Resize a page's MediaBox to `width`×`height` points. */
+  /**
+   * Resize a page's `/MediaBox` to `width`×`height` points — **box geometry
+   * only**. The drawn content keeps its own coordinates (it is *not* rescaled to
+   * the new box, so it may clip or float). To scale the page content along with
+   * the box (keeping annotations aligned) use {@link scalePageContent} or
+   * {@link scalePageTo}; for large-format authoring see {@link setUserUnit}.
+   */
   resizePage(page: number, width: number, height: number): boolean {
     return this.ex().gp_resize_page(this.h, page, width, height) === 0;
+  }
+  /**
+   * Scale a page's **content** uniformly by `factor` about the page origin (ISO
+   * 32000-1 §8.3.4) — a true zoom of the whole page, not just the box. Three
+   * things move together: (1) the content stream is wrapped in
+   * `q <factor 0 0 factor 0 0> cm … Q`; (2) `/MediaBox` and `/CropBox` (resolved
+   * through inheritance) plus any locally declared `/BleedBox`/`/TrimBox`/
+   * `/ArtBox` are scaled about the origin; (3) every annotation `/Rect` is scaled,
+   * so widget/stamp appearances — mapped from their `/BBox` into the `/Rect` per
+   * §12.5.5 — rescale to stay aligned automatically. `factor` must be finite and
+   * positive. `false` on engine error (bad page number / non-positive factor).
+   */
+  scalePageContent(page: number, factor: number): boolean {
+    return this.ex().gp_scale_page_content(this.h, page, factor) === 0;
+  }
+  /**
+   * Anisotropic {@link scalePageContent}: scale a page's content by `sx`
+   * horizontally and `sy` vertically about the origin, scaling the boxes and
+   * annotation `/Rect`s by the same factors. Both must be finite and positive.
+   * `false` on engine error.
+   */
+  scalePageContentXY(page: number, sx: number, sy: number): boolean {
+    return this.ex().gp_scale_page_content_xy(this.h, page, sx, sy) === 0;
+  }
+  /**
+   * Scale a page's content to **fit within** `width`×`height` points (shrink- or
+   * grow-to-fit), preserving aspect ratio — equivalent to {@link scalePageContent}
+   * with `min(width / currentWidth, height / currentHeight)` over the page's
+   * displayed size (`/MediaBox` with `/Rotate` applied). Returns the uniform
+   * factor applied, or `null` on engine error (bad page number, non-positive
+   * target, or zero-area page).
+   */
+  scalePageTo(page: number, width: number, height: number): number | null {
+    const factor = this.ex().gp_scale_page_to(this.h, page, width, height);
+    return factor < 0 ? null : factor;
+  }
+  /**
+   * Set a page's `/UserUnit` (ISO 32000-1 §14.11.2) for **large-format
+   * authoring**: one default user-space unit becomes `unit`⁄72 inch, so the same
+   * coordinates render larger (e.g. `2.0` doubles the physical size, lifting the
+   * ~200-inch coordinate ceiling). `1.0` is the default and removes the key. This
+   * is distinct from {@link scalePageContent}: it rescales the coordinate system
+   * (a viewer-level zoom of the medium), not the content or boxes. `unit` must be
+   * finite and positive. `false` on engine error.
+   */
+  setUserUnit(page: number, unit: number): boolean {
+    return this.ex().gp_set_user_unit(this.h, page, unit) === 0;
+  }
+  /**
+   * A page's `/UserUnit` (ISO 32000-1 §14.11.2), defaulting to `1.0` when absent.
+   * Returns `null` on engine error (bad page number).
+   */
+  pageUserUnit(page: number): number | null {
+    const unit = this.ex().gp_page_user_unit(this.h, page);
+    return unit < 0 ? null : unit;
   }
   /** Insert a blank page after the 1-based `after` page (0 = front); returns its id. */
   addPage(width: number, height: number, after = 0): number {
