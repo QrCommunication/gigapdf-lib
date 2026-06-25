@@ -637,6 +637,115 @@ fn flow_document(blocks: Vec<Block>, geom: PageGeometry) -> Document {
     }
 }
 
+// ───────────────────────── document outline / bookmarks ───────────────────────
+//
+// Both Office model importers feed a single [`OutlineBuilder`]: each heading
+// (DOCX `Heading*`/`Title` style or `w:outlineLvl`; ODF `text:h@outline-level`)
+// records a flat, pre-order, `level`-tagged entry pointing at the page it lands
+// on, and each *user-defined* bookmark (DOCX `w:bookmarkStart@w:name`, ODF
+// `text:bookmark`/`text:bookmark-start@text:name`) records a navigable anchor
+// nested under the enclosing heading. The flat list is then folded into the
+// model's nested [`OutlineNode`](crate::model::OutlineNode) tree by the shared
+// [`fold_outline`](crate::recon::fold_outline) assembler, which tolerates
+// non-monotonic level jumps (a stray deep level attaches under the deepest open
+// level rather than being dropped).
+
+use crate::recon::FlatOutline;
+
+/// Accumulates a document's outline entries (headings + bookmark anchors) in
+/// reading order, then folds them into the nested model tree. `level` is the
+/// 0-based outline depth (`0` = top-level heading); a bookmark nests one level
+/// under the most recent heading so an internal `#name` anchor resolves to a
+/// page within its section.
+#[derive(Default)]
+struct OutlineBuilder {
+    flat: Vec<FlatOutline>,
+    /// Depth of the most recently seen heading (`None` until the first heading),
+    /// so a following bookmark can nest under it.
+    last_heading_level: Option<usize>,
+}
+
+impl OutlineBuilder {
+    /// Record a heading at 0-based outline `level` landing on `page`. Blank
+    /// titles are skipped (an empty TOC entry is never useful).
+    fn push_heading(&mut self, title: String, level: usize, page: usize) {
+        let title = title.trim().to_string();
+        self.last_heading_level = Some(level);
+        if title.is_empty() {
+            return;
+        }
+        self.flat.push(FlatOutline { title, level, page });
+    }
+
+    /// Record a bookmark anchor named `name` at `page`, nested under the current
+    /// section (one level deeper than the last heading, or top-level if none).
+    /// Word-internal bookmarks (`_GoBack`, `_Toc…`, `_Ref…`, `_Hlk…`, any
+    /// `_`-prefixed name) are skipped — they are machinery, not navigation.
+    fn push_bookmark(&mut self, name: &str, page: usize) {
+        let name = name.trim();
+        if name.is_empty() || !is_user_bookmark(name) {
+            return;
+        }
+        let level = self.last_heading_level.map(|l| l + 1).unwrap_or(0);
+        self.flat.push(FlatOutline {
+            title: name.to_string(),
+            level,
+            page,
+        });
+    }
+
+    /// Fold the collected flat entries into the nested outline tree.
+    fn finish(self) -> Vec<crate::model::OutlineNode> {
+        crate::recon::fold_outline(&self.flat)
+    }
+}
+
+/// A bookmark is user-defined navigation (kept in the outline) unless it carries
+/// a leading underscore, which Word/​Writer reserve for generated bookmarks
+/// (`_GoBack`, `_Toc12345`, `_Ref…`, `_Hlk…`). Such machinery anchors are dropped
+/// so they don't pollute the outline tree.
+fn is_user_bookmark(name: &str) -> bool {
+    !name.starts_with('_')
+}
+
+/// Flatten a slice of model [`Inline`]s into plain text (run text + link-child
+/// text), rendering line breaks as spaces. Used to title an outline entry from
+/// the heading runs already built during the walk.
+fn inlines_plain_text(inlines: &[Inline]) -> String {
+    let mut s = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Run(run) => s.push_str(&run.text),
+            Inline::LineBreak => s.push(' '),
+            Inline::Link { children, .. } => {
+                for c in children {
+                    if let Inline::Run(run) = c {
+                        s.push_str(&run.text);
+                    }
+                }
+            }
+            Inline::Image(_) => {}
+        }
+    }
+    s.trim().to_string()
+}
+
+/// Map a DOCX heading signal to a 0-based outline depth. A `w:pStyle` heading
+/// level (`Heading1`/`Title`/… → 1-based, via [`heading_level`]) and an explicit
+/// `w:outlineLvl@w:val` (already 0-based, `0`=top) may both be present; the more
+/// prominent (smaller) depth wins. Returns `None` when the paragraph is not an
+/// outline entry.
+fn docx_outline_level(style_level: Option<u8>, outline_lvl: Option<u32>) -> Option<usize> {
+    let from_style = style_level.map(|l| (l.max(1) as usize) - 1);
+    let from_lvl = outline_lvl.map(|v| v as usize);
+    match (from_style, from_lvl) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 // ─────────────────────────────── DOCX → model ─────────────────────────────────
 
 /// DOCX → [`Document`]: headings/paragraphs/lists/tables as model blocks.
@@ -664,16 +773,19 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     let mut pages = DocxPages::new();
     let mut counters = ListCounters::default();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
+    let mut outline = OutlineBuilder::default();
     docx_walk_model(
         &mut Xml::new(&doc),
         &ctx,
         &mut pages,
         &mut counters,
         &mut resources,
+        &mut outline,
         None,
     );
     let mut document = flow_document_pages(pages.finish(), page_geometry(geom));
     document.resources.images = resources;
+    document.outline = outline.finish();
     document.meta = ooxml_doc_meta(zip);
     document
 }
@@ -726,6 +838,15 @@ impl DocxPages {
         self.pages.last_mut().expect("at least one open page")
     }
 
+    /// Zero-based index of the page currently being filled. Used to target
+    /// outline entries (a heading/bookmark lands on the open page). A trailing
+    /// empty page may be dropped by [`finish`](DocxPages::finish), but headings
+    /// never sit on such a page (they add content), so the index stays valid.
+    fn page_index(&self) -> usize {
+        // Invariant: `pages` is never empty, so `len() >= 1`.
+        self.pages.len().saturating_sub(1)
+    }
+
     /// Start a new page boundary — but only if the current page already has
     /// content, so a leading break (or two consecutive breaks) can't inject a
     /// spurious blank page.
@@ -764,20 +885,30 @@ fn docx_walk_model(
     pages: &mut DocxPages,
     counters: &mut ListCounters,
     resources: &mut BTreeMap<u64, model::ImageResource>,
+    outline: &mut OutlineBuilder,
     stop: Option<&str>,
 ) {
     while let Some(tok) = x.next() {
         match tok {
-            Tok::Open(name, _, sc) => {
+            Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
                 if ln == "p" && !sc {
-                    docx_paragraph_model(x, ctx, pages, counters, resources);
+                    docx_paragraph_model(x, ctx, pages, counters, resources, outline);
                 } else if ln == "tbl" && !sc {
                     let table = docx_table_model(x, ctx, resources);
                     pages.cur().push(Block {
                         kind: BlockKind::Table(table),
                         ..Block::default()
                     });
+                } else if ln == "bookmarkStart" {
+                    // A bookmark anchored between paragraphs (body-level): record
+                    // it against the current page so an internal `#name` link
+                    // resolves. Bookmarks inside a `w:p` are handled by
+                    // `docx_paragraph_model`.
+                    if let Some(name) = attr(&attrs, "name") {
+                        let page = pages.page_index();
+                        outline.push_bookmark(name, page);
+                    }
                 }
             }
             Tok::Close(name) => {
@@ -832,8 +963,16 @@ fn docx_paragraph_model(
     pages: &mut DocxPages,
     counters: &mut ListCounters,
     resources: &mut BTreeMap<u64, model::ImageResource>,
+    outline: &mut OutlineBuilder,
 ) {
     let mut heading: Option<u8> = None;
+    // `w:pPr/w:outlineLvl@w:val` (0-based, `0`=top): an outline level set
+    // independently of any heading style. Folded into the document outline even
+    // when the paragraph carries no heading `w:pStyle`.
+    let mut outline_lvl: Option<u32> = None;
+    // Bookmarks opened within this paragraph (`w:bookmarkStart@w:name`): recorded
+    // as outline anchors once the page this paragraph lands on is known.
+    let mut bookmarks: Vec<String> = Vec::new();
     let mut style_id: Option<String> = None;
     let mut runs: Vec<Inline> = Vec::new();
     let mut run = RunStyle::default();
@@ -876,6 +1015,21 @@ fn docx_paragraph_model(
                                 heading = heading_level(v);
                                 style_id = Some(v.to_string());
                             }
+                        }
+                    }
+                    "outlineLvl" if in_ppr => {
+                        // `w:val` is the 0-based outline level (0..8). A
+                        // `9` "body text" value (no outline) is dropped.
+                        outline_lvl = attr(&attrs, "val")
+                            .and_then(|v| v.trim().parse::<i32>().ok())
+                            .filter(|&v| (0..=8).contains(&v))
+                            .map(|v| v as u32);
+                    }
+                    // A bookmark start inside the paragraph: capture its name so an
+                    // internal `#name` link can resolve to this paragraph's page.
+                    "bookmarkStart" => {
+                        if let Some(name) = attr(&attrs, "name") {
+                            bookmarks.push(name.to_string());
                         }
                     }
                     "jc" if in_ppr => {
@@ -1063,6 +1217,12 @@ fn docx_paragraph_model(
     // Fold the resolved named style's run defaults under each run lacking them.
     apply_named_run_defaults(&mut paragraph.runs, &resolved);
 
+    // This paragraph's outline depth, if any (a `Heading*`/`Title` style and/or
+    // an explicit `w:outlineLvl`). Computed before the paragraph is moved into a
+    // block so the title can be taken from its runs.
+    let outline_entry = docx_outline_level(heading, outline_lvl)
+        .map(|lvl| (inlines_plain_text(&paragraph.runs), lvl));
+
     // Build this paragraph's block (a one-item List for a numbered/bulleted
     // paragraph, else a Heading or Paragraph).
     let block = if let Some(level) = para.list_level {
@@ -1106,6 +1266,16 @@ fn docx_paragraph_model(
         pages.break_page();
     }
     pages.cur().push(block);
+    // Record this paragraph's outline contributions against the page it now sits
+    // on: first the heading (so a following bookmark nests under it), then any
+    // bookmarks opened in the paragraph.
+    let page = pages.page_index();
+    if let Some((title, level)) = outline_entry {
+        outline.push_heading(title, level, page);
+    }
+    for name in &bookmarks {
+        outline.push_bookmark(name, page);
+    }
     // A run-level `<w:br w:type="page"/>` (or an intermediate `w:sectPr`) forces
     // the next page *after* this paragraph.
     if page_break_after {
@@ -1432,6 +1602,9 @@ fn docx_cell_model(
     // when these pages are flattened back into the cell's block list at the end.
     let mut pages = DocxPages::new();
     let mut counters = ListCounters::default();
+    // Cell paragraphs are not part of the document outline; their headings/
+    // bookmarks go to a discarded builder so the top-level outline stays clean.
+    let mut cell_outline = OutlineBuilder::default();
     // Cell background `w:tcPr/w:shd@w:fill` (6-hex), and the first `w:tcBorders`
     // edge that declares a real width (surfaced to seed the table-wide border).
     let mut shading: Option<[f64; 3]> = None;
@@ -1472,9 +1645,14 @@ fn docx_cell_model(
                             }
                         }
                     }
-                    "p" if !sc => {
-                        docx_paragraph_model(x, ctx, &mut pages, &mut counters, resources)
-                    }
+                    "p" if !sc => docx_paragraph_model(
+                        x,
+                        ctx,
+                        &mut pages,
+                        &mut counters,
+                        resources,
+                        &mut cell_outline,
+                    ),
                     "tbl" if !sc => {
                         let table = docx_table_model(x, ctx, resources);
                         pages.cur().push(Block {
@@ -3368,6 +3546,7 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     };
     let mut blocks = Vec::new();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
+    let mut outline = OutlineBuilder::default();
     odf_walk_model(
         &mut Xml::new(&content),
         &ctx,
@@ -3375,9 +3554,11 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         None,
         None,
         &mut resources,
+        &mut outline,
     );
     let mut doc = flow_document(blocks, page_geometry(geom));
     doc.resources.images = resources;
+    doc.outline = outline.finish();
     doc.meta = odf_doc_meta(zip);
     doc
 }
@@ -3394,6 +3575,7 @@ fn odf_walk_model(
     stop: Option<&str>,
     list_level: Option<u32>,
     resources: &mut BTreeMap<u64, model::ImageResource>,
+    outline: &mut OutlineBuilder,
 ) {
     while let Some(tok) = x.next() {
         match tok {
@@ -3402,14 +3584,22 @@ fn odf_walk_model(
                 match ln {
                     "h" if !sc => {
                         let style = odf_paragraph_style(&attrs, ctx.para_styles, list_level);
-                        let lvl = attr(&attrs, "outline-level")
-                            .and_then(|v| v.parse::<u8>().ok())
-                            .unwrap_or(1)
-                            .clamp(1, 6);
+                        // `text:outline-level` is 1-based (`1`=top); the model
+                        // heading level clamps to 1..6, but the *outline* keeps
+                        // the full 0-based depth (`level-1`).
+                        let raw_lvl = attr(&attrs, "outline-level")
+                            .and_then(|v| v.trim().parse::<u32>().ok())
+                            .filter(|&v| v >= 1)
+                            .unwrap_or(1);
+                        let lvl = raw_lvl.clamp(1, 6) as u8;
                         // Text boxes anchored in the heading flush as sibling
                         // blocks after it (mirrors the paragraph case).
                         let mut anchored: Vec<Block> = Vec::new();
-                        let runs = odf_inline_model(x, ctx, "h", resources, &mut anchored);
+                        let runs = odf_inline_model(x, ctx, "h", resources, &mut anchored, outline);
+                        // Record the outline entry. The whole document is one page,
+                        // so the target is page 0; an empty title is dropped by
+                        // `push_heading`.
+                        outline.push_heading(inlines_plain_text(&runs), (raw_lvl - 1) as usize, 0);
                         if !runs.is_empty() {
                             out.push(Block {
                                 kind: BlockKind::Heading(Heading {
@@ -3431,7 +3621,7 @@ fn odf_walk_model(
                         // `draw:text-box`) is captured here and emitted as a
                         // sibling block right after the paragraph.
                         let mut anchored: Vec<Block> = Vec::new();
-                        let runs = odf_inline_model(x, ctx, "p", resources, &mut anchored);
+                        let runs = odf_inline_model(x, ctx, "p", resources, &mut anchored, outline);
                         if runs.is_empty() && list_level.is_none() {
                             if anchored.is_empty() {
                                 out.push(Block::default()); // preserve blank line spacing
@@ -3482,7 +3672,7 @@ fn odf_walk_model(
                     },
                     "list" if !sc => {
                         let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
-                        odf_walk_model(x, ctx, out, Some("list"), next, resources);
+                        odf_walk_model(x, ctx, out, Some("list"), next, resources, outline);
                     }
                     "table" if !sc => {
                         let table = odf_table_model(x, ctx, resources);
@@ -3548,7 +3738,18 @@ fn odf_frame_content(
                 let ln = local(&name);
                 if ln == "text-box" && !sc {
                     found_box = true;
-                    odf_walk_model(x, ctx, &mut blocks, Some("text-box"), None, resources);
+                    // A floating text box is not part of the document outline; its
+                    // headings/bookmarks go to a discarded builder.
+                    let mut no_outline = OutlineBuilder::default();
+                    odf_walk_model(
+                        x,
+                        ctx,
+                        &mut blocks,
+                        Some("text-box"),
+                        None,
+                        resources,
+                        &mut no_outline,
+                    );
                 } else if ln == "image" && image.is_none() {
                     if let Some(href) = attr(&attrs, "href") {
                         let key = href.trim_start_matches('/').to_string();
@@ -3583,6 +3784,7 @@ fn odf_inline_model(
     block: &str,
     resources: &mut BTreeMap<u64, model::ImageResource>,
     out_blocks: &mut Vec<Block>,
+    outline: &mut OutlineBuilder,
 ) -> Vec<Inline> {
     let mut runs: Vec<Inline> = Vec::new();
     // Stack of span char-styles (closed in order).
@@ -3655,6 +3857,15 @@ fn odf_inline_model(
                             }
                         }
                     }
+                    // ODF bookmarks within the block flow: `text:bookmark` (a
+                    // point) and `text:bookmark-start` (a range start). Both carry
+                    // `text:name`; record it as a navigable outline anchor (the
+                    // whole document is one page → page 0).
+                    "bookmark" | "bookmark-start" => {
+                        if let Some(name) = attr(&attrs, "name") {
+                            outline.push_bookmark(name, 0);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3707,9 +3918,20 @@ fn odf_note_inline(x: &mut Xml, ctx: &OdfModelCtx) -> Vec<Inline> {
                     citation = odf_text_only(x, "note-citation");
                 } else if ln == "note-body" && !sc {
                     // Walk the body into throwaway blocks, then flatten to text.
+                    // The note body is not part of the document outline, so its
+                    // headings/bookmarks go to a discarded builder.
                     let mut blocks: Vec<Block> = Vec::new();
                     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
-                    odf_walk_model(x, ctx, &mut blocks, Some("note-body"), None, &mut resources);
+                    let mut no_outline = OutlineBuilder::default();
+                    odf_walk_model(
+                        x,
+                        ctx,
+                        &mut blocks,
+                        Some("note-body"),
+                        None,
+                        &mut resources,
+                        &mut no_outline,
+                    );
                     body = inline_blocks_text(&blocks);
                 }
             }
@@ -3898,7 +4120,18 @@ fn odf_table_model(
                         .and_then(|n| ctx.cell_bg.get(n))
                         .copied();
                     let mut blocks = Vec::new();
-                    odf_walk_model(x, ctx, &mut blocks, Some("table-cell"), None, resources);
+                    // Cell content is not part of the document outline; its
+                    // headings/bookmarks go to a discarded builder.
+                    let mut no_outline = OutlineBuilder::default();
+                    odf_walk_model(
+                        x,
+                        ctx,
+                        &mut blocks,
+                        Some("table-cell"),
+                        None,
+                        resources,
+                        &mut no_outline,
+                    );
                     if let Some(row) = cur_row.as_mut() {
                         for _ in 0..repeat {
                             row.push(Cell {
@@ -4276,7 +4509,17 @@ fn odp_page_model(
                             odp_placeholder_role(&attrs).unwrap_or(model::PlaceholderRole::Body);
                         let ctx = OdfModelCtx::styles_only(zip, styles);
                         let mut anchored: Vec<Block> = Vec::new();
-                        let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
+                        // ODP slides build no document outline; bookmark anchors
+                        // captured here are discarded with this throwaway builder.
+                        let mut no_outline = OutlineBuilder::default();
+                        let runs = odf_inline_model(
+                            x,
+                            &ctx,
+                            "p",
+                            resources,
+                            &mut anchored,
+                            &mut no_outline,
+                        );
                         if !runs.is_empty() {
                             placeholders.push(model::Placeholder {
                                 role,
@@ -4392,7 +4635,17 @@ fn odp_group_model(
                             odp_placeholder_role(&attrs).unwrap_or(model::PlaceholderRole::Body);
                         let ctx = OdfModelCtx::styles_only(zip, styles);
                         let mut anchored: Vec<Block> = Vec::new();
-                        let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
+                        // ODP slides build no document outline; bookmark anchors
+                        // captured here are discarded with this throwaway builder.
+                        let mut no_outline = OutlineBuilder::default();
+                        let runs = odf_inline_model(
+                            x,
+                            &ctx,
+                            "p",
+                            resources,
+                            &mut anchored,
+                            &mut no_outline,
+                        );
                         if !runs.is_empty() {
                             placeholders.push(model::Placeholder {
                                 role,
@@ -4467,7 +4720,17 @@ fn odp_frame_model(
                     "p" if !sc => {
                         let ctx = OdfModelCtx::styles_only(zip, styles);
                         let mut anchored: Vec<Block> = Vec::new();
-                        let runs = odf_inline_model(x, &ctx, "p", resources, &mut anchored);
+                        // ODP slides build no document outline; bookmark anchors
+                        // captured here are discarded with this throwaway builder.
+                        let mut no_outline = OutlineBuilder::default();
+                        let runs = odf_inline_model(
+                            x,
+                            &ctx,
+                            "p",
+                            resources,
+                            &mut anchored,
+                            &mut no_outline,
+                        );
                         if !runs.is_empty() {
                             blocks.push(Block {
                                 kind: BlockKind::Paragraph(Paragraph {
@@ -14822,6 +15085,173 @@ mod tests {
         );
     }
 
+    // ── DOCX / ODF → document outline (headings + bookmarks) (#31) ──
+
+    /// Pre-order flatten of an [`OutlineNode`] tree into `(depth, title, page)`
+    /// rows, where `depth` is the node's nesting depth (`0` = a root). Lets a
+    /// nested outline be asserted as a flat, readable expectation list.
+    fn flat_outline(nodes: &[crate::model::OutlineNode]) -> Vec<(usize, String, usize)> {
+        fn go(
+            nodes: &[crate::model::OutlineNode],
+            depth: usize,
+            out: &mut Vec<(usize, String, usize)>,
+        ) {
+            for n in nodes {
+                out.push((depth, n.title.clone(), n.page));
+                go(&n.children, depth + 1, out);
+            }
+        }
+        let mut out = Vec::new();
+        go(nodes, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn docx_outline_nests_headings_by_level() {
+        // H1 / H2 / H2 / H1 → two roots, the first carrying two H2 children.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Chapter 1</w:t></w:r></w:p>
+          <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Section 1.1</w:t></w:r></w:p>
+          <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Section 1.2</w:t></w:r></w:p>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Chapter 2</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        let tree = &model.outline;
+        assert_eq!(tree.len(), 2, "two top-level chapters: {tree:?}");
+        assert_eq!(tree[0].title, "Chapter 1");
+        assert_eq!(tree[0].children.len(), 2, "Chapter 1 has two sections");
+        assert_eq!(tree[0].children[0].title, "Section 1.1");
+        assert_eq!(tree[0].children[1].title, "Section 1.2");
+        assert_eq!(tree[1].title, "Chapter 2");
+        assert!(tree[1].children.is_empty());
+        // Single-page document: every entry targets page 0.
+        assert!(
+            flat_outline(tree).iter().all(|(_, _, page)| *page == 0),
+            "all entries on page 0 (no page breaks): {tree:?}"
+        );
+    }
+
+    #[test]
+    fn docx_outline_skipped_level_nests_sensibly() {
+        // H1 then H3 (no intervening H2): the H3 must still attach (under H1),
+        // never be dropped — the shared folder clamps the jump.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Top</w:t></w:r></w:p>
+          <w:p><w:pPr><w:pStyle w:val="Heading3"/></w:pPr><w:r><w:t>Deep</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        let tree = &model.outline;
+        assert_eq!(tree.len(), 1, "one root: {tree:?}");
+        assert_eq!(tree[0].title, "Top");
+        assert_eq!(tree[0].children.len(), 1, "the deep heading is not dropped");
+        assert_eq!(tree[0].children[0].title, "Deep");
+    }
+
+    #[test]
+    fn docx_outline_from_outline_lvl_without_heading_style() {
+        // A paragraph with only `w:outlineLvl` (no heading `w:pStyle`) is still an
+        // outline entry. `val=0`→top, `val=1`→nested. The block itself stays a
+        // plain paragraph (no Heading promotion), but the outline records it.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>Part A</w:t></w:r></w:p>
+          <w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>Part A.1</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(
+            flat_outline(&model.outline),
+            vec![(0, "Part A".to_string(), 0), (1, "Part A.1".to_string(), 0)],
+        );
+        // No heading style → the blocks remain paragraphs, not headings.
+        let has_heading = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .any(|b| matches!(b.kind, BlockKind::Heading(_)));
+        assert!(
+            !has_heading,
+            "outlineLvl alone must not promote to a Heading"
+        );
+    }
+
+    #[test]
+    fn docx_outline_style_and_outline_lvl_take_the_more_prominent() {
+        // A `Heading2` style (depth 1) that ALSO sets `w:outlineLvl=0` → the more
+        // prominent depth (0) wins.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Heading2"/><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>Promoted</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(
+            flat_outline(&model.outline),
+            vec![(0, "Promoted".to_string(), 0)],
+            "min(style depth 1, outlineLvl 0) = 0"
+        );
+    }
+
+    #[test]
+    fn docx_outline_tracks_page_across_hard_break() {
+        // A hard page break between two H1s: the second heading targets page 1.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>On Page One</w:t></w:r></w:p>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/><w:pageBreakBefore/></w:pPr><w:r><w:t>On Page Two</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(
+            flat_outline(&model.outline),
+            vec![
+                (0, "On Page One".to_string(), 0),
+                (0, "On Page Two".to_string(), 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn docx_outline_user_bookmark_nests_under_heading_internal_machinery_dropped() {
+        // A user bookmark (`Anchor1`) inside a section nests under the current
+        // H1; a Word-internal bookmark (`_Toc1`, `_GoBack`) is dropped.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:bookmarkStart w:id="0" w:name="_Toc1"/><w:r><w:t>Intro</w:t></w:r></w:p>
+          <w:p><w:bookmarkStart w:id="1" w:name="Anchor1"/><w:bookmarkStart w:id="2" w:name="_GoBack"/><w:r><w:t>body text</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(
+            flat_outline(&model.outline),
+            vec![(0, "Intro".to_string(), 0), (1, "Anchor1".to_string(), 0)],
+            "user bookmark nests under the heading; _Toc/_GoBack dropped"
+        );
+    }
+
+    #[test]
+    fn docx_outline_empty_when_no_headings() {
+        // A body with paragraphs but no headings/bookmarks → an empty outline
+        // (and no panic).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:r><w:t>just a paragraph</w:t></w:r></w:p>
+          <w:p><w:r><w:t>another one</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert!(model.outline.is_empty(), "no headings → empty outline");
+    }
+
+    #[test]
+    fn docx_outline_heading_title_flattens_runs_and_links() {
+        // A heading split across runs (and a hyperlink run) yields the joined
+        // text as its outline title.
+        let doc = r#"<w:document xmlns:w="x" xmlns:r="z"><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+            <w:r><w:t>Part </w:t></w:r>
+            <w:hyperlink r:id="rId1"><w:r><w:t>One</w:t></w:r></w:hyperlink>
+          </w:p>
+        </w:body></w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId1" Type="hyperlink" Target="https://e/" TargetMode="External"/>
+        </Relationships>"#;
+        let model = office_to_model(&build_docx(doc, Some(rels), &[])).expect("docx → model");
+        assert_eq!(
+            flat_outline(&model.outline),
+            vec![(0, "Part One".to_string(), 0)],
+        );
+    }
+
     // ── ODF → model (links / strike / highlight / inline images / formulas / groups) ──
 
     /// Build an ODT zip from a `content.xml` body and optional `(path, bytes)`
@@ -15158,6 +15588,84 @@ mod tests {
         let shaded = &table.rows[0].cells[0].shading;
         assert_eq!(*shaded, Some([1.0, 0.0, 0.0]), "first cell shaded red");
         assert_eq!(table.rows[0].cells[1].shading, None, "second cell unshaded");
+    }
+
+    // ── ODT → document outline (#31) ──
+
+    #[test]
+    fn odt_outline_nests_headings_by_level() {
+        // `text:outline-level` 1/2/2/1 → two roots, the first with two children.
+        // The whole ODT is one page, so every entry targets page 0.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:h text:outline-level="1">Chapter 1</text:h>
+    <text:h text:outline-level="2">Section 1.1</text:h>
+    <text:h text:outline-level="2">Section 1.2</text:h>
+    <text:h text:outline-level="1">Chapter 2</text:h>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        assert_eq!(
+            flat_outline(&model.outline),
+            vec![
+                (0, "Chapter 1".to_string(), 0),
+                (1, "Section 1.1".to_string(), 0),
+                (1, "Section 1.2".to_string(), 0),
+                (0, "Chapter 2".to_string(), 0),
+            ],
+        );
+        // Cross-check the nested shape (not just the pre-order flattening).
+        assert_eq!(model.outline.len(), 2);
+        assert_eq!(model.outline[0].children.len(), 2);
+    }
+
+    #[test]
+    fn odt_outline_skipped_level_nests_sensibly() {
+        // outline-level 1 then 3 (no 2): the deep heading attaches under the H1,
+        // never dropped.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:h text:outline-level="1">Top</text:h>
+    <text:h text:outline-level="3">Deep</text:h>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        assert_eq!(model.outline.len(), 1);
+        assert_eq!(model.outline[0].title, "Top");
+        assert_eq!(model.outline[0].children.len(), 1);
+        assert_eq!(model.outline[0].children[0].title, "Deep");
+    }
+
+    #[test]
+    fn odt_outline_bookmark_nests_under_heading() {
+        // A `text:bookmark-start`/`text:bookmark` named anchor inside a paragraph
+        // nests under the preceding heading; a `_`-prefixed name is dropped.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:h text:outline-level="1">Intro</text:h>
+    <text:p><text:bookmark-start text:name="Anchor1"/>see here<text:bookmark-end text:name="Anchor1"/></text:p>
+    <text:p><text:bookmark text:name="_Internal"/>machinery</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        assert_eq!(
+            flat_outline(&model.outline),
+            vec![(0, "Intro".to_string(), 0), (1, "Anchor1".to_string(), 0)],
+            "user bookmark nests under the heading; _Internal dropped"
+        );
+    }
+
+    #[test]
+    fn odt_outline_empty_when_no_headings() {
+        // Paragraphs only, no headings/bookmarks → empty outline, no panic.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:p>just text</text:p>
+    <text:p>more text</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        assert!(model.outline.is_empty(), "no headings → empty outline");
     }
 
     #[test]
