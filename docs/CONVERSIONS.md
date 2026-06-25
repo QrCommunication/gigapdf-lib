@@ -235,8 +235,14 @@ is never promoted.
 - **Tables**: no header-row (`<th>`) concept; borderless merged cells forced 1×1;
   very sparse / very wide (>14 cols) / very long (>160 cells) / rotated tables are
   dropped.
-- **Lists**: any `1.` / `a)` token is accepted (no ordinal-sequence check) →
-  numeric sentences can become phantom lists.
+- **Lists**: list detection is **ordinal-validated** — a run of ordered markers
+  is only taken as a list when it forms a coherent sequence (consecutive/monotonic
+  in one `1.`/`a)`/`i.` format, small gaps tolerated, starting at a plausible first
+  ordinal), so numeric sentences, citations (`12. Smith et al.`), prices (`$5.99`)
+  and stray section numbers fall back to prose instead of becoming phantom lists;
+  a lone ordered marker is prose (a single bullet stays a one-item list), mixed
+  formats don't merge, and nested ordinal sub-runs are validated on their own.
+  Unordered bullets remain lists with no ordinal requirement.
 - **Bold/italic** detected only from the `/BaseFont` *name* (no FontDescriptor
   flags, no faux-bold).
 - **Columns**: whitespace-gutter detection only — a single wide line can collapse
