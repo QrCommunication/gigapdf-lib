@@ -3721,6 +3721,20 @@ pub extern "C" fn gp_save_optimized(
     }
 }
 
+/// Serialize as a **linearized** ("Fast Web View") PDF per ISO 32000-1 Annex F:
+/// the first page and the objects needed to render it — plus a `/Linearized`
+/// parameter dictionary and a primary hint stream — are written at the front of
+/// the file so a web viewer can display page 1 before the rest downloads. Streams
+/// are Flate-compressed and embedded fonts subset, like `gp_save_compressed`.
+/// Falls back to the plain writer if the document cannot be linearized.
+#[no_mangle]
+pub extern "C" fn gp_to_linearized(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => unsafe { bytes_into_host(doc.to_linearized(), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Extract the document's text (UTF-8, form-feed between pages).
 #[no_mangle]
 pub extern "C" fn gp_to_text(handle: *const Document, out_len: *mut usize) -> *mut u8 {

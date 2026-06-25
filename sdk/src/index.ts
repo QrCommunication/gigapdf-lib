@@ -2591,6 +2591,29 @@ export class GigaPdfDoc {
     );
   }
 
+  /**
+   * Serialize as a **linearized** ("Fast Web View") PDF (ISO 32000-1 Annex F).
+   *
+   * The first page and only the objects needed to render it — together with a
+   * `/Linearized` parameter dictionary and a primary hint stream — are written at
+   * the **front** of the file, so a web viewer can display page 1 before the rest
+   * of the document has downloaded (progressive rendering / byte-range serving).
+   * The remaining pages follow, then a main cross-reference table; the first-page
+   * cross-reference section chains to it via `/Prev`. Streams are Flate-compressed
+   * first (like {@link saveCompressed}) and embedded fonts are subset.
+   *
+   * Falls back to the plain {@link save} output if the document cannot be
+   * linearized (no catalog / page tree / zero pages).
+   */
+  toLinearized(): Uint8Array {
+    return this.g._buffer((o) => this.ex().gp_to_linearized(this.h, o));
+  }
+
+  /** Alias of {@link toLinearized} — serialize as a linearized (Fast Web View) PDF. */
+  saveLinearized(): Uint8Array {
+    return this.toLinearized();
+  }
+
   // text intelligence
   textRuns(page: number): TextRunInfo[] {
     return this.g._json((o) => this.ex().gp_text_runs_json(this.h, page, o));

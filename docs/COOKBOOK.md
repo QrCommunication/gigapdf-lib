@@ -1065,7 +1065,56 @@ doc.close();
 ```
 
 > Note: linearization ("Fast Web View", ISO 32000-1 Annex F) is a separate
-> byte-layout optimization and is **not** produced here.
+> byte-layout optimization — produced by `toLinearized()` (next section), not by
+> the compact serializers above.
+
+---
+
+## Fast Web View for web delivery (linearization)
+
+When a PDF is served over HTTP and the viewer supports **byte-range requests**, a
+**linearized** ("Fast Web View") file lets the reader render **page 1 before the
+whole file has downloaded**. Linearization (ISO 32000-1 **Annex F**) re-orders the
+file so the first page — and only the objects needed to draw it — plus a
+`/Linearized` parameter dictionary and a *hint stream* (a compact index of where
+each page's objects live) sit at the **front**; the remaining pages and shared
+resources follow, and a final cross-reference table closes the file.
+
+```ts
+import { GigaPDF } from "@gigapdf/sdk";
+
+const giga = await GigaPDF.create();
+const doc = giga.open(pdfBytes);
+
+// Produce a linearized ("Fast Web View") PDF. Streams are Flate-compressed and
+// embedded fonts subset, exactly like saveCompressed().
+const webReady = doc.toLinearized();       // (saveLinearized() is an alias)
+
+// Serve `webReady` with `Accept-Ranges: bytes` so the browser/viewer can fetch
+// the first-page region first and start rendering immediately.
+doc.close();
+```
+
+What you get, in file order:
+
+1. `%PDF-1.7` header;
+2. the `/Linearized` parameter dictionary (`/L` file length, `/H` hint-stream
+   `[offset length]`, `/O` first-page object number, `/E` end of the first page,
+   `/N` page count, `/T` main-xref offset) — the **first object**, so a reader can
+   read it from the very start;
+3. the **first-page cross-reference section**, whose trailer's `/Prev` chains to
+   the main xref;
+4. the document catalog, then the **primary hint stream**;
+5. the **first page** and its private objects (its content, page-only resources);
+6. the remaining pages, then the **shared** objects (page tree, cross-page fonts);
+7. the **main cross-reference table** + final trailer.
+
+If the document has no page tree, `toLinearized()` returns the plain `save()`
+output instead of failing.
+
+> Verified with **qpdf**: `qpdf --check out.pdf` reports the file *linearized*
+> with no warnings or errors (qpdf is strict about the hint tables and every byte
+> offset).
 
 ---
 

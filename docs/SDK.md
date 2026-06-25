@@ -107,7 +107,9 @@ The unified-model lowering helpers (`officeToModel`, `htmlToModel`,
 | `pageCount()` | `number` | Number of pages. |
 | `save()` | `Uint8Array` | Serialize to PDF bytes (plain, uncompressed streams + classic xref table — easiest to grep/debug). |
 | `saveCompressed()` | `Uint8Array` | Serialize with every uncompressed stream Flate-compressed (still a classic xref table). |
-| `saveOptimized(opts?)` | `Uint8Array` | Serialize with PDF 1.5+ **object streams** (`/ObjStm`) + a **cross-reference stream** (`/XRef`) — the most compact output (ISO 32000-1 §7.5.7/§7.5.8). `opts = { objectStreams?, xrefStreams? }` (both default `true`; `objectStreams` implies `xrefStreams`). Streams are Flate-compressed first. Linearization (Fast Web View) is not performed. |
+| `saveOptimized(opts?)` | `Uint8Array` | Serialize with PDF 1.5+ **object streams** (`/ObjStm`) + a **cross-reference stream** (`/XRef`) — the most compact output (ISO 32000-1 §7.5.7/§7.5.8). `opts = { objectStreams?, xrefStreams? }` (both default `true`; `objectStreams` implies `xrefStreams`). Streams are Flate-compressed first. |
+| `toLinearized()` | `Uint8Array` | Serialize as a **linearized ("Fast Web View")** PDF (ISO 32000-1 **Annex F**): a `/Linearized` dictionary + a primary hint stream + the first page are written at the **front** so a web viewer renders page 1 before the rest downloads. Streams are Flate-compressed and embedded fonts subset. Falls back to `save()` if the document has no page tree. |
+| `saveLinearized()` | `Uint8Array` | Alias of `toLinearized()`. |
 | `pageInfo(page)` | `PageInfo` | `{ width, height, rotation, mediaBox }` — MediaBox size (unrotated), the `/Rotate` flag, and the raw `/MediaBox` `[x0,y0,x1,y1]` (preserves the box origin). |
 
 ### Pages

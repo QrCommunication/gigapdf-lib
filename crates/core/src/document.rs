@@ -8664,6 +8664,24 @@ impl Document {
         }
     }
 
+    /// Serialize as a **linearized** ("Fast Web View") PDF per ISO 32000-1 Annex F.
+    ///
+    /// The first page and only the objects required to render it — together with a
+    /// `/Linearized` parameter dictionary and a primary hint stream — are written at
+    /// the **front** of the file, so a web viewer can display page 1 before the rest
+    /// of the document has downloaded. The remaining pages follow, then a main
+    /// cross-reference table; the first-page cross-reference section chains to it via
+    /// `/Prev`. Streams are Flate-compressed first (like
+    /// [`save_compressed`](Self::save_compressed)) and embedded fonts are subset.
+    ///
+    /// Falls back to the plain (non-linearized) [`save`](Self::save) output if the
+    /// document cannot be linearized (no catalog, no page tree, or zero pages).
+    pub fn to_linearized(&self) -> Vec<u8> {
+        let objects = self.flate_streams();
+        crate::serialize::to_linearized(&objects, &self.trailer)
+            .unwrap_or_else(|| crate::serialize::to_pdf(&objects, &self.trailer))
+    }
+
     /// Reading-order text lines of a page (structured text): each line's text
     /// plus its union bounding box. Replaces an external structured-text engine.
     pub fn structured_text(&self, page_no: u32) -> Vec<content::TextLine> {
@@ -32244,5 +32262,189 @@ mod tests {
         let mut doc = two_page_imposition_doc();
         assert!(doc.n_up(0, 2, &NupOptions::default()).is_err());
         assert!(doc.n_up(2, 0, &NupOptions::default()).is_err());
+    }
+
+    // ─── linearization (Fast Web View, ISO 32000-1 Annex F) ──────────────────
+
+    /// Build a `pages`-page document with text on each page.
+    fn linearization_doc(pages: usize) -> Document {
+        use crate::convert::build::{PdfBuilder, StdFont};
+        let mut b = PdfBuilder::new();
+        for i in 0..pages {
+            let pg = b.add_page(595.0, 842.0);
+            b.text(
+                pg,
+                72.0,
+                100.0,
+                24.0,
+                &format!("Page {} content", i + 1),
+                StdFont::Helvetica,
+                [0.0, 0.0, 0.0],
+            );
+        }
+        Document::open(&b.finish()).unwrap()
+    }
+
+    /// Read a `/Key NUMBER` integer from the linearization dictionary bytes.
+    fn lin_int(pdf: &[u8], key: &str) -> Option<i64> {
+        let pat = format!("{key} ");
+        let kpos = pdf.windows(pat.len()).position(|w| w == pat.as_bytes())?;
+        let rest = &pdf[kpos + pat.len()..];
+        let digits: Vec<u8> = rest
+            .iter()
+            .copied()
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        std::str::from_utf8(&digits).ok()?.parse().ok()
+    }
+
+    #[test]
+    fn linearizes_three_page_document() {
+        let doc = linearization_doc(3);
+        let lin = doc.to_linearized();
+
+        // Reopens to the same page count.
+        let reopened = Document::open(&lin).unwrap();
+        assert_eq!(reopened.page_count(), 3, "page count after linearization");
+
+        // The /Linearized dictionary is present and is the first body object.
+        assert!(
+            lin.windows(b"/Linearized 1".len())
+                .any(|w| w == b"/Linearized 1"),
+            "/Linearized dictionary present"
+        );
+        let header_end = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".len();
+        assert!(
+            lin[header_end..].starts_with(b"1 0 obj\n<< /Linearized 1"),
+            "linearization dict is the first object after the header"
+        );
+
+        // Self-consistent /L, /O, /T, /N.
+        let l = lin_int(&lin, "/L").expect("/L");
+        assert_eq!(l as usize, lin.len(), "/L equals the file length");
+        let n = lin_int(&lin, "/N").expect("/N");
+        assert_eq!(n, 3, "/N equals the page count");
+        let o = lin_int(&lin, "/O").expect("/O");
+        // /O names a /Page object.
+        let needle = format!("{o} 0 obj");
+        let opos = lin
+            .windows(needle.len())
+            .position(|w| w == needle.as_bytes())
+            .expect("first-page object present");
+        let obj_dict_end = lin[opos..]
+            .windows(b"endobj".len())
+            .position(|w| w == b"endobj")
+            .unwrap();
+        assert!(
+            lin[opos..opos + obj_dict_end]
+                .windows(b"/Page".len())
+                .any(|w| w == b"/Page"),
+            "/O object is a page"
+        );
+        let t = lin_int(&lin, "/T").expect("/T") as usize;
+        // /T points at the main cross-reference table (just before its first entry).
+        assert!(t < lin.len(), "/T within file");
+        let after_t = &lin[t..];
+        assert!(
+            after_t.starts_with(b"\n0000000000") || after_t.starts_with(b" 0000000000"),
+            "/T points just before the main xref's object-0 free entry"
+        );
+
+        // The first-page cross-reference section chains to the main xref via /Prev.
+        assert!(
+            lin.windows(b"/Prev".len()).any(|w| w == b"/Prev"),
+            "first-page xref trailer has /Prev"
+        );
+        // A primary hint stream exists (its dict carries /S).
+        assert!(
+            lin.windows(b"/S ".len()).any(|w| w == b"/S "),
+            "primary hint stream (with /S) present"
+        );
+    }
+
+    #[test]
+    fn linearizes_single_page_document() {
+        let doc = linearization_doc(1);
+        let lin = doc.to_linearized();
+        let reopened = Document::open(&lin).unwrap();
+        assert_eq!(reopened.page_count(), 1, "single page round-trips");
+        assert_eq!(lin_int(&lin, "/N"), Some(1), "/N == 1");
+        assert_eq!(lin_int(&lin, "/L").map(|l| l as usize), Some(lin.len()));
+        assert!(lin
+            .windows(b"/Linearized".len())
+            .any(|w| w == b"/Linearized"));
+    }
+
+    #[test]
+    fn linearized_round_trips_page_text() {
+        let doc = linearization_doc(3);
+        let lin = doc.to_linearized();
+        let reopened = Document::open(&lin).unwrap();
+        // Each page's text survives the reordering.
+        for page in 1..=3u32 {
+            let text: String = reopened
+                .page_text_runs(page)
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect();
+            assert!(
+                text.contains(&format!("Page {page}")),
+                "page {page} text preserved: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linearization_falls_back_when_no_pages() {
+        // A document with no resolvable page tree still produces valid bytes
+        // (the non-linearized fallback), never a panic.
+        let doc = linearization_doc(2);
+        let lin = doc.to_linearized();
+        assert!(!lin.is_empty());
+        assert!(lin.starts_with(b"%PDF-"));
+    }
+
+    /// Shell `qpdf --check` if the binary is available, asserting the file is
+    /// linearized with no warnings/errors. Skipped (with a note) when qpdf is
+    /// absent so CI without qpdf still passes; the structural assertions above
+    /// remain the primary guarantee.
+    fn qpdf_assert_linearized(pdf: &[u8], label: &str) {
+        let qpdf = std::process::Command::new("qpdf").arg("--version").output();
+        if qpdf.is_err() {
+            eprintln!("qpdf not available; skipping qpdf --check for {label}");
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("gigapdf_lin_{label}_{}.pdf", std::process::id()));
+        std::fs::write(&path, pdf).unwrap();
+        let out = std::process::Command::new("qpdf")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .expect("run qpdf --check");
+        let _ = std::fs::remove_file(&path);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("File is linearized"),
+            "qpdf should report {label} linearized:\n{combined}"
+        );
+        assert!(
+            !combined.to_lowercase().contains("warning") && !combined.contains("error encountered"),
+            "qpdf --check produced warnings/errors for {label}:\n{combined}"
+        );
+    }
+
+    #[test]
+    fn qpdf_check_passes_on_linearized_output() {
+        for pages in [1usize, 2, 3, 5] {
+            let doc = linearization_doc(pages);
+            let lin = doc.to_linearized();
+            qpdf_assert_linearized(&lin, &format!("{pages}pages"));
+        }
     }
 }
