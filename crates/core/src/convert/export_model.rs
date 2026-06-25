@@ -5099,20 +5099,25 @@ pub fn epub_from_model(doc: &Document) -> Vec<u8> {
     // 4. Embedded images, sorted by key for deterministic output.
     let images = epub_images(doc);
 
-    // 5. Package document, navigation, NCX.
-    let opf = epub_opf(doc, &chapters, &images);
+    // 5. A unique, deterministic publication identifier (content hash; no clock
+    //    or RNG in the engine). The OPF `dc:identifier` and the NCX `dtb:uid`
+    //    MUST agree, so it is computed once and threaded into both.
+    let ident = epub_identifier(doc, &chapters);
+
+    // 6. Package document, navigation, NCX.
+    let opf = epub_opf(doc, &chapters, &images, &ident);
     let nav = epub_nav(doc, &chapters);
-    let ncx = epub_ncx(doc, &chapters);
+    let ncx = epub_ncx(doc, &chapters, &ident);
     zip.add_deflated("OEBPS/content.opf", opf.as_bytes());
     zip.add_deflated("OEBPS/nav.xhtml", nav.as_bytes());
     zip.add_deflated("OEBPS/toc.ncx", ncx.as_bytes());
 
-    // 6. Chapter XHTML files.
+    // 7. Chapter XHTML files.
     for ch in &chapters {
         zip.add_deflated(&format!("OEBPS/{}", ch.file), ch.xhtml.as_bytes());
     }
 
-    // 7. Image blobs (already-compressed formats → stored).
+    // 8. Image blobs (already-compressed formats → stored).
     for img in &images {
         zip.add_stored(&format!("OEBPS/{}", img.path), &img.bytes);
     }
@@ -5127,12 +5132,58 @@ const EPUB_CONTAINER_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 </rootfiles></container>";
 
 /// A built chapter: its OPF item id, its file name (relative to `OEBPS/`), the
-/// title used for the table of contents, and the rendered XHTML.
+/// title used for the table of contents, the rendered XHTML, and the in-document
+/// heading hierarchy (with stable anchor ids matching the `id` attributes
+/// emitted on the chapter's headings) used to build a *nested* TOC.
 struct EpubChapter {
     id: String,
     file: String,
     title: String,
     xhtml: String,
+    headings: Vec<TocHeading>,
+}
+
+/// A heading captured while rendering a chapter, for the nested table of
+/// contents. `level` is the heading level (1–6, clamped as emitted), `title` is
+/// its plain text, and `id` is the anchor id set on the heading element in the
+/// chapter XHTML (so `text-N.xhtml#id` resolves to the heading).
+struct TocHeading {
+    level: u8,
+    title: String,
+    id: String,
+}
+
+/// Per-chapter context for the nested TOC: which chapter is being rendered and
+/// the running heading ordinal, accumulating each heading (with its assigned
+/// anchor id) as the body is serialized. Built and consumed in a single pass so
+/// the anchor ids in the XHTML and in the TOC can never diverge.
+struct EpubToc {
+    chapter: usize,
+    seq: usize,
+    headings: Vec<TocHeading>,
+}
+
+impl EpubToc {
+    fn new(chapter: usize) -> Self {
+        EpubToc {
+            chapter,
+            seq: 0,
+            headings: Vec::new(),
+        }
+    }
+
+    /// Allocate the next anchor id for a heading in this chapter and record it.
+    /// Returns the id to set on the heading element.
+    fn record(&mut self, level: u8, title: String) -> String {
+        self.seq += 1;
+        let id = format!("sec{}-h{}", self.chapter, self.seq);
+        self.headings.push(TocHeading {
+            level,
+            title,
+            id: id.clone(),
+        });
+        id
+    }
 }
 
 /// A resolved image for embedding: OPF item id, path (relative to `OEBPS/`),
@@ -5173,6 +5224,32 @@ fn epub_images(doc: &Document) -> Vec<EpubImage> {
         .collect()
 }
 
+/// A unique, deterministic publication identifier of the form
+/// `urn:gigapdf:<16-hex>`, where `<16-hex>` is a 64-bit FNV-1a hash over the
+/// document's title, language and the (title + serialized XHTML) of every
+/// chapter — i.e. its text *and* structure. Two different documents therefore
+/// get different identifiers, while the same document always hashes identically
+/// (no clock or RNG, both of which are unavailable in this engine). `DocMeta`
+/// has no dedicated identifier field, so the content hash is the source.
+fn epub_identifier(doc: &Document, chapters: &[EpubChapter]) -> String {
+    // FNV-1a (64-bit) over a length-prefixed digest so distinct field
+    // boundaries can't collide (e.g. title "AB"+body "C" vs "A"+"BC").
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    };
+    feed(doc.meta.title.as_deref().unwrap_or("").as_bytes());
+    feed(epub_lang(doc).as_bytes());
+    for ch in chapters {
+        feed(ch.title.as_bytes());
+        feed(ch.xhtml.as_bytes());
+    }
+    format!("urn:gigapdf:{h:016x}")
+}
+
 /// One chapter per section. A chapter title is the first heading's text, else
 /// `"Section N"`. An empty document still yields a single empty chapter so the
 /// spine is never empty.
@@ -5181,12 +5258,13 @@ fn epub_chapters(doc: &Document) -> Vec<EpubChapter> {
     for (i, section) in doc.sections.iter().enumerate() {
         let n = i + 1;
         let title = section_title(section).unwrap_or_else(|| format!("Section {n}"));
-        let xhtml = epub_chapter_xhtml(doc, section, &title);
+        let (xhtml, headings) = epub_chapter_xhtml(doc, section, &title, n);
         chapters.push(EpubChapter {
             id: format!("chap-{n}"),
             file: format!("text-{n}.xhtml"),
             title,
             xhtml,
+            headings,
         });
     }
     if chapters.is_empty() {
@@ -5202,6 +5280,7 @@ fn epub_chapters(doc: &Document) -> Vec<EpubChapter> {
             file: "text-1.xhtml".to_string(),
             title,
             xhtml,
+            headings: Vec::new(),
         });
     }
     chapters
@@ -5261,20 +5340,26 @@ fn epub_empty_chapter_xhtml(doc: &Document, title: &str) -> String {
     epub_xhtml_doc(&lang, title, &body)
 }
 
-fn epub_chapter_xhtml(doc: &Document, section: &Section, title: &str) -> String {
+fn epub_chapter_xhtml(
+    doc: &Document,
+    section: &Section,
+    title: &str,
+    chapter: usize,
+) -> (String, Vec<TocHeading>) {
     let lang = epub_lang(doc);
     let mut body = String::new();
+    let mut toc = EpubToc::new(chapter);
     if let Some(header) = &section.header {
         body.push_str("<header>");
-        xhtml_blocks(header, doc, &mut body);
+        xhtml_blocks(header, doc, &mut body, &mut toc);
         body.push_str("</header>");
     }
     for page in &section.pages {
-        xhtml_blocks(&page.blocks, doc, &mut body);
+        xhtml_blocks(&page.blocks, doc, &mut body, &mut toc);
     }
     if let Some(footer) = &section.footer {
         body.push_str("<footer>");
-        xhtml_blocks(footer, doc, &mut body);
+        xhtml_blocks(footer, doc, &mut body, &mut toc);
         body.push_str("</footer>");
     }
     if body.is_empty() {
@@ -5282,18 +5367,18 @@ fn epub_chapter_xhtml(doc: &Document, section: &Section, title: &str) -> String 
         esc(title, &mut body);
         body.push_str("</h1>");
     }
-    epub_xhtml_doc(&lang, title, &body)
+    (epub_xhtml_doc(&lang, title, &body), toc.headings)
 }
 
 // ───────────────────────── model → strict XHTML (EPUB) ──────────────────────
 
-fn xhtml_blocks(blocks: &[Block], doc: &Document, out: &mut String) {
+fn xhtml_blocks(blocks: &[Block], doc: &Document, out: &mut String, toc: &mut EpubToc) {
     for b in blocks {
-        xhtml_block(b, doc, out);
+        xhtml_block(b, doc, out, toc);
     }
 }
 
-fn xhtml_block(block: &Block, doc: &Document, out: &mut String) {
+fn xhtml_block(block: &Block, doc: &Document, out: &mut String, toc: &mut EpubToc) {
     match &block.kind {
         BlockKind::Paragraph(p) => {
             out.push_str(&format!("<p{}>", xhtml_align_attr(p)));
@@ -5302,12 +5387,18 @@ fn xhtml_block(block: &Block, doc: &Document, out: &mut String) {
         }
         BlockKind::Heading(h) => {
             let lvl = h.level.clamp(1, 6);
-            out.push_str(&format!("<h{lvl}{}>", xhtml_align_attr(&h.para)));
+            // Allocate a stable anchor id and record the heading for the nested
+            // TOC; the same id is set here so `text-N.xhtml#id` resolves.
+            let id = toc.record(lvl, para_plain_text(&h.para));
+            out.push_str(&format!(
+                "<h{lvl} id=\"{id}\"{}>",
+                xhtml_align_attr(&h.para)
+            ));
             xhtml_inlines(&h.para.runs, doc, out);
             out.push_str(&format!("</h{lvl}>"));
         }
-        BlockKind::List(list) => xhtml_list(list, doc, out),
-        BlockKind::Table(table) => xhtml_table(table, doc, out),
+        BlockKind::List(list) => xhtml_list(list, doc, out, toc),
+        BlockKind::Table(table) => xhtml_table(table, doc, out, toc),
         BlockKind::Image(img) => {
             out.push_str("<p>");
             xhtml_image(img, doc, out);
@@ -5316,7 +5407,7 @@ fn xhtml_block(block: &Block, doc: &Document, out: &mut String) {
         BlockKind::Shape(shape) => xhtml_shape(shape, out),
         BlockKind::TextBox(tb) => {
             out.push_str("<div>");
-            xhtml_blocks(&tb.blocks, doc, out);
+            xhtml_blocks(&tb.blocks, doc, out, toc);
             out.push_str("</div>");
         }
         BlockKind::CodeBlock(cb) => {
@@ -5335,7 +5426,7 @@ fn xhtml_block(block: &Block, doc: &Document, out: &mut String) {
         }
         BlockKind::Blockquote(bq) => {
             out.push_str("<blockquote>");
-            xhtml_blocks(&bq.blocks, doc, out);
+            xhtml_blocks(&bq.blocks, doc, out, toc);
             out.push_str("</blockquote>");
         }
         BlockKind::HorizontalRule => out.push_str("<hr/>"),
@@ -5348,7 +5439,7 @@ fn xhtml_block(block: &Block, doc: &Document, out: &mut String) {
             for slide in &sb.slides {
                 out.push_str("<section>");
                 for ph in &slide.placeholders {
-                    xhtml_block(&ph.block, doc, out);
+                    xhtml_block(&ph.block, doc, out, toc);
                 }
                 out.push_str("</section>");
             }
@@ -5437,7 +5528,7 @@ fn xhtml_char_css(style: &CharStyle) -> String {
     css.trim_start_matches(';').to_string()
 }
 
-fn xhtml_list(list: &List, doc: &Document, out: &mut String) {
+fn xhtml_list(list: &List, doc: &Document, out: &mut String, toc: &mut EpubToc) {
     let tag = if list.ordered { "ol" } else { "ul" };
     let type_attr = if list.ordered {
         match list.marker {
@@ -5453,13 +5544,13 @@ fn xhtml_list(list: &List, doc: &Document, out: &mut String) {
     out.push_str(&format!("<{tag}{type_attr}>"));
     for item in &list.items {
         out.push_str("<li>");
-        xhtml_blocks(&item.blocks, doc, out);
+        xhtml_blocks(&item.blocks, doc, out, toc);
         out.push_str("</li>");
     }
     out.push_str(&format!("</{tag}>"));
 }
 
-fn xhtml_table(table: &Table, doc: &Document, out: &mut String) {
+fn xhtml_table(table: &Table, doc: &Document, out: &mut String, toc: &mut EpubToc) {
     out.push_str("<table>");
     for row in &table.rows {
         out.push_str("<tr>");
@@ -5475,7 +5566,7 @@ fn xhtml_table(table: &Table, doc: &Document, out: &mut String) {
                 attrs.push_str(&format!(" style=\"background-color:#{}\"", hex(rgb)));
             }
             out.push_str(&format!("<td{attrs}>"));
-            xhtml_blocks(&cell.blocks, doc, out);
+            xhtml_blocks(&cell.blocks, doc, out, toc);
             out.push_str("</td>");
         }
         out.push_str("</tr>");
@@ -5516,22 +5607,112 @@ fn xhtml_image(img: &ImageRef, doc: &Document, out: &mut String) {
 }
 
 fn xhtml_shape(shape: &Shape, out: &mut String) {
-    // A reflowable document can't position a vector path; emit a small box that
-    // carries the fill colour so the shape isn't silently lost.
-    let mut style =
-        String::from("display:inline-block;width:1em;height:1em;border:1px solid #888");
-    if let Some(rgb) = shape.fill {
-        style.push_str(&format!(";background:#{}", hex(rgb)));
+    // Preserve the vector geometry as a self-contained inline `<svg>` (mirrors
+    // the HTML exporter's `web::html_shape`): the path's bounds give a `viewBox`
+    // (and `width`/`height` in points so it scales in reflow), the segments
+    // become the `d` attribute, and the shape's paint maps to
+    // `fill`/`stroke`/`stroke-width`/`stroke-dasharray`. PDF geometry is in user
+    // space (origin bottom-left, Y up); SVG is top-left/Y down, so points are
+    // translated to the bounds origin and flipped vertically.
+    let Some((min_x, min_y, max_x, max_y)) = xhtml_shape_bounds(&shape.segments) else {
+        // No drawable geometry (empty path or a single point): fall back to a
+        // tiny bordered box carrying the fill colour so the shape isn't lost.
+        let mut style =
+            String::from("display:inline-block;width:1em;height:1em;border:1px solid #888");
+        if let Some(rgb) = shape.fill {
+            style.push_str(&format!(";background:#{}", hex(rgb)));
+        }
+        out.push_str(&format!("<span style=\"{style}\"></span>"));
+        return;
+    };
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+
+    let mut d = String::new();
+    // (x, y) in PDF user space → (x - min_x, max_y - y) in SVG space.
+    let pt = |x: f64, y: f64| format!("{} {}", num(x - min_x), num(max_y - y));
+    for seg in &shape.segments {
+        match *seg {
+            PathSeg::Move(x, y) => d.push_str(&format!("M{} ", pt(x, y))),
+            PathSeg::Line(x, y) => d.push_str(&format!("L{} ", pt(x, y))),
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                d.push_str(&format!("C{} {} {} ", pt(x1, y1), pt(x2, y2), pt(x3, y3)));
+            }
+            PathSeg::Close => d.push_str("Z "),
+        }
     }
-    out.push_str(&format!("<span style=\"{style}\"></span>"));
+    let d = d.trim_end();
+
+    let mut paint = format!(" fill=\"{}\"", xhtml_svg_fill(shape.fill));
+    if let Some(stroke) = shape.stroke {
+        paint.push_str(&format!(" stroke=\"#{}\"", hex(stroke)));
+        if shape.stroke_width > 0.0 {
+            paint.push_str(&format!(" stroke-width=\"{}\"", num(shape.stroke_width)));
+        }
+        if !shape.dash.is_empty() {
+            let dashes: Vec<String> = shape.dash.iter().map(|v| num(*v)).collect();
+            paint.push_str(&format!(" stroke-dasharray=\"{}\"", dashes.join(",")));
+        }
+    }
+
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" \
+viewBox=\"0 0 {vw} {vh}\" width=\"{vw}pt\" height=\"{vh}pt\" \
+style=\"display:inline-block\"><path d=\"{d}\"{paint}/></svg>",
+        vw = num(width.max(0.0)),
+        vh = num(height.max(0.0)),
+    ));
+}
+
+/// Axis-aligned bounding box `(min_x, min_y, max_x, max_y)` over every point of a
+/// path (Bézier control points included). `None` when the path has no points or
+/// is a single degenerate point (zero width *and* height) — neither yields a
+/// renderable `<svg>` viewBox, so the caller falls back to a placeholder. Mirrors
+/// `web::shape_bounds`.
+fn xhtml_shape_bounds(segments: &[PathSeg]) -> Option<(f64, f64, f64, f64)> {
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    let mut add = |x: f64, y: f64| match &mut bounds {
+        Some((min_x, min_y, max_x, max_y)) => {
+            *min_x = min_x.min(x);
+            *min_y = min_y.min(y);
+            *max_x = max_x.max(x);
+            *max_y = max_y.max(y);
+        }
+        None => bounds = Some((x, y, x, y)),
+    };
+    for seg in segments {
+        match *seg {
+            PathSeg::Move(x, y) | PathSeg::Line(x, y) => add(x, y),
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                add(x1, y1);
+                add(x2, y2);
+                add(x3, y3);
+            }
+            PathSeg::Close => {}
+        }
+    }
+    match bounds {
+        Some((min_x, min_y, max_x, max_y)) if max_x > min_x || max_y > min_y => {
+            Some((min_x, min_y, max_x, max_y))
+        }
+        _ => None,
+    }
+}
+
+/// The SVG `fill` attribute value: the shape's fill colour as `#RRGGBB`, or
+/// `none` for a stroke-only (unfilled) shape so the path isn't filled black by
+/// default. Mirrors `web::svg_fill`.
+fn xhtml_svg_fill(fill: Option<[f64; 3]>) -> String {
+    match fill {
+        Some(rgb) => format!("#{}", hex(rgb)),
+        None => "none".to_string(),
+    }
 }
 
 // ──────────────────────── OPF / nav / NCX (EPUB metadata) ────────────────────
 
-fn epub_opf(doc: &Document, chapters: &[EpubChapter], images: &[EpubImage]) -> String {
+fn epub_opf(doc: &Document, chapters: &[EpubChapter], images: &[EpubImage], ident: &str) -> String {
     let lang = epub_lang(doc);
-    // A stable, deterministic identifier (no clock/UUID source in the engine).
-    let ident = "urn:gigapdf:document";
 
     let mut meta = String::new();
     {
@@ -5614,20 +5795,127 @@ unique-identifier=\"pub-id\" xml:lang=\"{lang}\">\
 
 fn epub_nav(doc: &Document, chapters: &[EpubChapter]) -> String {
     let lang = epub_lang(doc);
+    // Each chapter is a top-level entry; its in-document headings nest beneath it
+    // (H1→H2→H3…) as nested `<ol>`/`<li>`, with anchors resolving to the heading
+    // ids emitted in the chapter XHTML.
     let mut list = String::new();
     for ch in chapters {
         list.push_str("<li><a href=\"");
         esc(&ch.file, &mut list);
         list.push_str("\">");
         esc(&ch.title, &mut list);
-        list.push_str("</a></li>");
+        list.push_str("</a>");
+        nav_heading_tree(&ch.headings, &ch.file, &mut list);
+        list.push_str("</li>");
     }
     let body =
         format!("<nav epub:type=\"toc\" id=\"toc\"><h1>Table of Contents</h1><ol>{list}</ol></nav>");
     epub_xhtml_doc(&lang, "Table of Contents", &body)
 }
 
-fn epub_ncx(doc: &Document, chapters: &[EpubChapter]) -> String {
+/// A node in a chapter's heading hierarchy: a heading plus the deeper headings
+/// nested under it. Built from the flat `(level, title, id)` list by
+/// [`build_toc_tree`] so both the nav `<ol>` and the NCX `navPoint`s share one
+/// unambiguous nesting.
+struct TocNode<'a> {
+    heading: &'a TocHeading,
+    children: Vec<TocNode<'a>>,
+}
+
+/// Turn a chapter's flat, document-ordered heading list into a forest, nesting
+/// by level: each heading becomes a child of the most recent heading with a
+/// strictly smaller level (else a root). Tolerates skipped levels (H1→H3) and a
+/// first heading that isn't the shallowest.
+fn build_toc_tree(headings: &[TocHeading]) -> Vec<TocNode<'_>> {
+    let mut roots: Vec<TocNode> = Vec::new();
+    // Stack of indices identifying the path to the last-inserted node, so the
+    // parent for the next heading can be found by popping levels >= its own.
+    let mut path: Vec<usize> = Vec::new();
+
+    for h in headings {
+        // Pop until the node at the top of the path is a strict ancestor.
+        while let Some(&idx) = path.last() {
+            let level = node_at(&roots, &path[..path.len() - 1], idx).heading.level;
+            if level >= h.level {
+                path.pop();
+            } else {
+                break;
+            }
+        }
+        let node = TocNode {
+            heading: h,
+            children: Vec::new(),
+        };
+        if let Some((&last, parents)) = path.split_last() {
+            let parent = node_at_mut(&mut roots, parents, last);
+            parent.children.push(node);
+            let child_idx = parent.children.len() - 1;
+            path.push(child_idx);
+        } else {
+            roots.push(node);
+            path.push(roots.len() - 1);
+        }
+    }
+    roots
+}
+
+/// Follow a path of child indices from the roots to a node (shared immutable
+/// lookup used while resolving the insertion point).
+fn node_at<'t, 'a>(roots: &'t [TocNode<'a>], path: &[usize], idx: usize) -> &'t TocNode<'a> {
+    let mut nodes = roots;
+    for &p in path {
+        nodes = &nodes[p].children;
+    }
+    &nodes[idx]
+}
+
+/// Mutable counterpart of [`node_at`]: resolve the parent node at `path` so a new
+/// child can be pushed.
+fn node_at_mut<'t, 'a>(
+    roots: &'t mut [TocNode<'a>],
+    path: &[usize],
+    idx: usize,
+) -> &'t mut TocNode<'a> {
+    let mut nodes = roots;
+    for &p in path {
+        nodes = &mut nodes[p].children;
+    }
+    &mut nodes[idx]
+}
+
+/// Emit a chapter's headings as a nested `<ol>` of `<li><a>` entries (nothing
+/// when the chapter has no headings). Each anchor links to `file#id`, where `id`
+/// is the anchor set on the heading in the XHTML.
+fn nav_heading_tree(headings: &[TocHeading], file: &str, out: &mut String) {
+    let tree = build_toc_tree(headings);
+    if tree.is_empty() {
+        return;
+    }
+    let mut file_esc = String::new();
+    esc(file, &mut file_esc);
+    nav_node_list(&tree, &file_esc, out);
+}
+
+/// Render a `<ol>` of the given heading nodes (recursing into children).
+fn nav_node_list(nodes: &[TocNode], file_esc: &str, out: &mut String) {
+    out.push_str("<ol>");
+    for node in nodes {
+        out.push_str("<li><a href=\"");
+        out.push_str(file_esc);
+        out.push('#');
+        esc(&node.heading.id, out);
+        out.push_str("\">");
+        esc(&node.heading.title, out);
+        out.push_str("</a>");
+        if !node.children.is_empty() {
+            nav_node_list(&node.children, file_esc, out);
+        }
+        out.push_str("</li>");
+    }
+    out.push_str("</ol>");
+}
+
+fn epub_ncx(doc: &Document, chapters: &[EpubChapter], ident: &str) -> String {
     let lang = epub_lang(doc);
     let title = doc
         .meta
@@ -5635,34 +5923,83 @@ fn epub_ncx(doc: &Document, chapters: &[EpubChapter]) -> String {
         .clone()
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "Document".to_string());
+
+    // Build nested navPoints: a navPoint per chapter (depth 1) with the chapter's
+    // headings nested beneath it (depth 2…). `play_order` is a single document-
+    // wide counter incremented in reading order; `depth` tracks the deepest
+    // nesting for the NCX `dtb:depth` head meta.
     let mut nav_points = String::new();
-    for (i, ch) in chapters.iter().enumerate() {
-        let order = i + 1;
+    let mut play_order = 0usize;
+    let mut depth = 0usize;
+    for ch in chapters {
+        let mut file_esc = String::new();
+        esc(&ch.file, &mut file_esc);
+        let tree = build_toc_tree(&ch.headings);
+        play_order += 1;
         nav_points.push_str(&format!(
-            "<navPoint id=\"nav-{order}\" playOrder=\"{order}\"><navLabel><text>"
+            "<navPoint id=\"navpt-{play_order}\" playOrder=\"{play_order}\"><navLabel><text>"
         ));
         esc(&ch.title, &mut nav_points);
         nav_points.push_str("</text></navLabel><content src=\"");
-        esc(&ch.file, &mut nav_points);
-        nav_points.push_str("\"/></navPoint>");
+        nav_points.push_str(&file_esc);
+        nav_points.push_str("\"/>");
+        // Chapter occupies depth 1; its heading subtree starts at depth 2.
+        let sub = ncx_node_points(&tree, &file_esc, &mut play_order, 2, &mut nav_points);
+        depth = depth.max(sub.max(1));
+        nav_points.push_str("</navPoint>");
     }
+
     let mut title_esc = String::new();
     esc(&title, &mut title_esc);
     let mut lang_esc = String::new();
     esc(&lang, &mut lang_esc);
+    let mut ident_esc = String::new();
+    esc(ident, &mut ident_esc);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\" xml:lang=\"{lang_esc}\">\
 <head>\
-<meta name=\"dtb:uid\" content=\"urn:gigapdf:document\"/>\
-<meta name=\"dtb:depth\" content=\"1\"/>\
+<meta name=\"dtb:uid\" content=\"{ident_esc}\"/>\
+<meta name=\"dtb:depth\" content=\"{depth}\"/>\
 <meta name=\"dtb:totalPageCount\" content=\"0\"/>\
 <meta name=\"dtb:maxPageNumber\" content=\"0\"/>\
 </head>\
 <docTitle><text>{title_esc}</text></docTitle>\
 <navMap>{nav_points}</navMap>\
-</ncx>"
+</ncx>",
+        depth = depth.max(1)
     )
+}
+
+/// Emit nested `<navPoint>`s for the given heading nodes into `out` (the NCX
+/// counterpart of [`nav_node_list`]). `play_order` is the shared running counter;
+/// `level` is the current NCX nesting depth. Returns the deepest depth reached
+/// (so the caller can compute `dtb:depth`); `0` when there are no nodes.
+fn ncx_node_points(
+    nodes: &[TocNode],
+    file_esc: &str,
+    play_order: &mut usize,
+    level: usize,
+    out: &mut String,
+) -> usize {
+    let mut deepest = 0usize;
+    for node in nodes {
+        *play_order += 1;
+        out.push_str(&format!(
+            "<navPoint id=\"navpt-{play_order}\" playOrder=\"{play_order}\"><navLabel><text>"
+        ));
+        esc(&node.heading.title, out);
+        out.push_str("</text></navLabel><content src=\"");
+        out.push_str(file_esc);
+        out.push('#');
+        esc(&node.heading.id, out);
+        out.push_str("\"/>");
+        let child_depth = ncx_node_points(&node.children, file_esc, play_order, level + 1, out);
+        out.push_str("</navPoint>");
+        // This node sits at `level`; its subtree may go deeper.
+        deepest = deepest.max(level.max(child_depth));
+    }
+    deepest
 }
 
 // ═══════════════════════════════════ tests ═══════════════════════════════════
@@ -7888,7 +8225,11 @@ style:family=\"paragraph\""
         let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
         assert!(chap.starts_with("<?xml version=\"1.0\""), "XML declaration");
         assert!(chap.contains("http://www.w3.org/1999/xhtml"), "XHTML ns");
-        assert!(chap.contains("<h1>Title</h1>"), "heading rendered");
+        // The heading carries a stable anchor id (target of the nested TOC).
+        assert!(
+            chap.contains("<h1 id=\"sec1-h1\">Title</h1>"),
+            "heading rendered with TOC anchor: {chap}"
+        );
         assert!(chap.contains("A paragraph."), "paragraph text");
         assert!(chap.contains("<td colspan=\"2\">"), "spanning table cell");
 
@@ -7955,6 +8296,178 @@ style:family=\"paragraph\""
             "non-empty spine even for an empty model"
         );
         assert!(entry(&bytes, "OEBPS/text-1.xhtml").is_some());
+    }
+
+    /// A block-level filled + stroked vector `Shape` must reach the EPUB chapter
+    /// XHTML as a self-contained inline `<svg><path d=…>` (geometry preserved,
+    /// Y-flipped), NOT the legacy 1em bordered placeholder box.
+    #[test]
+    fn epub_shape_is_inline_svg_not_placeholder_box() {
+        // A filled + stroked rectangle (10,20)-(110,70) in PDF user space.
+        let shape = Shape {
+            segments: vec![
+                PathSeg::Move(10.0, 20.0),
+                PathSeg::Line(110.0, 20.0),
+                PathSeg::Line(110.0, 70.0),
+                PathSeg::Line(10.0, 70.0),
+                PathSeg::Close,
+            ],
+            fill: Some([1.0, 0.0, 0.0]),
+            stroke: Some([0.0, 0.0, 1.0]),
+            stroke_width: 2.0,
+            dash: Vec::new(),
+        };
+        let doc = md_doc(vec![Block {
+            kind: BlockKind::Shape(shape),
+            ..Default::default()
+        }]);
+        let bytes = epub_from_model(&doc);
+        let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
+
+        assert!(chap.contains("<svg "), "inline svg emitted: {chap}");
+        assert!(
+            chap.contains("<path d=\"M0 50 L100 50 L100 0 L0 0 Z\""),
+            "path geometry preserved (Y flipped): {chap}"
+        );
+        assert!(
+            chap.contains("viewBox=\"0 0 100 50\"")
+                && chap.contains("width=\"100pt\"")
+                && chap.contains("height=\"50pt\""),
+            "viewBox + size from bounds: {chap}"
+        );
+        assert!(chap.contains("fill=\"#FF0000\""), "fill colour: {chap}");
+        assert!(
+            chap.contains("stroke=\"#0000FF\"") && chap.contains("stroke-width=\"2\""),
+            "stroke colour + width: {chap}"
+        );
+        assert!(
+            !chap.contains("width:1em") && !chap.contains("border:1px solid #888"),
+            "no longer a 1em bordered placeholder box: {chap}"
+        );
+    }
+
+    /// A geometry-less shape (a single point) has no renderable `<svg>` viewBox,
+    /// so it still falls back to the bordered-box placeholder.
+    #[test]
+    fn epub_shape_without_geometry_keeps_placeholder() {
+        let shape = Shape {
+            segments: vec![PathSeg::Move(5.0, 5.0)],
+            fill: Some([0.0, 0.5, 0.0]),
+            ..Default::default()
+        };
+        let doc = md_doc(vec![Block {
+            kind: BlockKind::Shape(shape),
+            ..Default::default()
+        }]);
+        let bytes = epub_from_model(&doc);
+        let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
+        assert!(
+            chap.contains("border:1px solid #888") && !chap.contains("<svg "),
+            "point-less shape keeps the box fallback: {chap}"
+        );
+    }
+
+    /// An H1/H2/H3 hierarchy must produce a *nested* TOC: nested `<ol>` in
+    /// nav.xhtml and nested `<navPoint>`s in the NCX, with anchors that resolve to
+    /// the heading ids emitted in the chapter XHTML.
+    #[test]
+    fn epub_nested_toc_from_heading_hierarchy() {
+        let doc = md_doc(vec![
+            md_heading(1, "Chapter One"),
+            md_heading(2, "Section A"),
+            md_heading(3, "Subsection A.1"),
+            md_heading(2, "Section B"),
+        ]);
+        let bytes = epub_from_model(&doc);
+
+        // Each heading carries a stable, document-ordered anchor id.
+        let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
+        assert!(chap.contains("<h1 id=\"sec1-h1\">Chapter One</h1>"), "{chap}");
+        assert!(chap.contains("<h2 id=\"sec1-h2\">Section A</h2>"), "{chap}");
+        assert!(
+            chap.contains("<h3 id=\"sec1-h3\">Subsection A.1</h3>"),
+            "{chap}"
+        );
+        assert!(chap.contains("<h2 id=\"sec1-h4\">Section B</h2>"), "{chap}");
+
+        // nav.xhtml: the chapter node nests its headings as nested <ol>, H3 below
+        // H2 below H1 — and the deep anchor resolves to the heading id.
+        let nav = String::from_utf8(entry(&bytes, "OEBPS/nav.xhtml").unwrap()).unwrap();
+        assert!(
+            nav.contains("href=\"text-1.xhtml#sec1-h3\">Subsection A.1</a>"),
+            "deep heading anchor resolvable: {nav}"
+        );
+        // H1 opens a child <ol> for the H2s; H2 (Section A) opens a child <ol>
+        // for its H3. The exact nested shape proves the hierarchy.
+        assert!(
+            nav.contains(
+                "<a href=\"text-1.xhtml#sec1-h1\">Chapter One</a>\
+<ol><li><a href=\"text-1.xhtml#sec1-h2\">Section A</a>\
+<ol><li><a href=\"text-1.xhtml#sec1-h3\">Subsection A.1</a></li></ol></li>\
+<li><a href=\"text-1.xhtml#sec1-h4\">Section B</a></li></ol>"
+            ),
+            "nested <ol> hierarchy in nav: {nav}"
+        );
+
+        // NCX: nested navPoints + a depth meta greater than 1 (the chapter is
+        // depth 1, H1 depth 2, H2 depth 3, H3 depth 4).
+        let ncx = String::from_utf8(entry(&bytes, "OEBPS/toc.ncx").unwrap()).unwrap();
+        assert!(
+            ncx.contains("content src=\"text-1.xhtml#sec1-h3\""),
+            "NCX deep heading anchor: {ncx}"
+        );
+        assert!(
+            ncx.contains("name=\"dtb:depth\" content=\"4\""),
+            "NCX nesting depth reflects the hierarchy: {ncx}"
+        );
+        // A navPoint nested inside another navPoint (not a flat <navMap>).
+        assert!(
+            ncx.contains("\"/><navPoint "),
+            "navPoints nest (a navPoint follows a content inside its parent): {ncx}"
+        );
+    }
+
+    /// The OPF `dc:identifier` is unique per document and deterministic: two
+    /// different documents differ; the same document is identical across runs; the
+    /// `unique-identifier` attribute, `dc:identifier`, and NCX `dtb:uid` all agree.
+    #[test]
+    fn epub_identifier_is_unique_and_deterministic() {
+        let extract_ident = |opf: &str| -> String {
+            let start = opf.find("<dc:identifier id=\"pub-id\">").unwrap()
+                + "<dc:identifier id=\"pub-id\">".len();
+            let end = opf[start..].find("</dc:identifier>").unwrap();
+            opf[start..start + end].to_string()
+        };
+        let opf_of = |doc: &Document| -> String {
+            let bytes = epub_from_model(doc);
+            String::from_utf8(entry(&bytes, "OEBPS/content.opf").unwrap()).unwrap()
+        };
+
+        let doc_a = md_doc(vec![md_heading(1, "Alpha"), md_para(vec![run("body A")])]);
+        let doc_b = md_doc(vec![md_heading(1, "Beta"), md_para(vec![run("body B")])]);
+
+        let opf_a = opf_of(&doc_a);
+        let opf_b = opf_of(&doc_b);
+        let id_a = extract_ident(&opf_a);
+        let id_b = extract_ident(&opf_b);
+
+        // Deterministic: same document hashes identically across builds.
+        assert_eq!(id_a, extract_ident(&opf_of(&doc_a)), "identifier is stable");
+        // Unique: two different documents get different identifiers.
+        assert_ne!(id_a, id_b, "different documents differ: {id_a} vs {id_b}");
+        // Shaped as a urn:gigapdf hash (not the old hardcoded value).
+        assert!(id_a.starts_with("urn:gigapdf:"), "urn form: {id_a}");
+        assert_ne!(id_a, "urn:gigapdf:document", "no longer hardcoded");
+
+        // The package `unique-identifier` points at pub-id, and the NCX dtb:uid
+        // carries the same identifier so OPF and NCX agree.
+        assert!(opf_a.contains("unique-identifier=\"pub-id\""), "{opf_a}");
+        let bytes = epub_from_model(&doc_a);
+        let ncx = String::from_utf8(entry(&bytes, "OEBPS/toc.ncx").unwrap()).unwrap();
+        assert!(
+            ncx.contains(&format!("name=\"dtb:uid\" content=\"{id_a}\"")),
+            "NCX dtb:uid agrees with OPF identifier: {ncx}"
+        );
     }
 
     /// A one-page document whose only block is a block-level image referencing a
@@ -8492,7 +9005,8 @@ style:family=\"paragraph\""
             quote_blk(vec![md_para(vec![run("epub quote")])]),
         ]);
         let mut out = String::new();
-        xhtml_blocks(&doc.sections[0].pages[0].blocks, &doc, &mut out);
+        let mut toc = EpubToc::new(1);
+        xhtml_blocks(&doc.sections[0].pages[0].blocks, &doc, &mut out, &mut toc);
         assert!(out.contains("<pre><code class=\"language-js\">"), "code: {out}");
         assert!(out.contains("console.log(1)"), "code text: {out}");
         assert!(out.contains("<hr/>"), "rule: {out}");
