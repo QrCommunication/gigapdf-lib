@@ -30,6 +30,7 @@ const EMR_SETMAPMODE: u32 = 17;
 const EMR_SETBKMODE: u32 = 18;
 const EMR_SETPOLYFILLMODE: u32 = 19;
 const EMR_SETROP2: u32 = 20;
+const EMR_SETSTRETCHBLTMODE: u32 = 21;
 const EMR_SETTEXTCOLOR: u32 = 24;
 const EMR_SETBKCOLOR: u32 = 25;
 const EMR_SETWORLDTRANSFORM: u32 = 35;
@@ -240,8 +241,15 @@ fn exec_record(gdi: &mut Gdi, itype: u32, b: &[u8]) {
         EMR_SETPOLYFILLMODE => {
             gdi.poly_fill_alternate = rd_u32(b, 0).unwrap_or(1) != 2;
         }
-        EMR_SETROP2 => {}
-        EMR_EXTSELECTCLIPRGN => {}
+        EMR_SETROP2 => {
+            // iMode(4): the binary raster op. Applies to vector paint.
+            gdi.canvas.rop2 = Rop2::from_u32(rd_u32(b, 0).unwrap_or(13));
+        }
+        EMR_SETSTRETCHBLTMODE => {
+            // iMode(4): nearest vs HALFTONE for DIB blits.
+            gdi.stretch_mode = StretchMode::from_u32(rd_u32(b, 0).unwrap_or(3));
+        }
+        EMR_EXTSELECTCLIPRGN => ext_select_clip_rgn(gdi, b),
 
         // ── Position / lines ───────────────────────────────────────────────
         EMR_MOVETOEX => {
@@ -549,6 +557,14 @@ fn emit_shape(gdi: &mut Gdi, pts: Vec<Pt>, shape: Shape) {
 
 /// Flatten a poly-Bézier (cubic segments) into a device polyline and stroke it.
 /// `relative_to` prepends the current position as the first anchor.
+///
+/// Each cubic is flattened **adaptively** (recursive de Casteljau): a segment
+/// subdivides only while its control points stray farther than a device-pixel
+/// chord tolerance from the chord, so gentle curves emit a handful of points
+/// while tight ones get many — sharper than the old fixed 24-step sampling, and
+/// cheaper on near-straight runs. The anchors are already in device pixels (the
+/// callers mapped them through the transform), so the tolerance is a true
+/// on-screen flatness bound.
 fn emit_bezier(gdi: &mut Gdi, ctrl: Vec<Pt>, relative_to: bool) {
     let mut anchors: Vec<Pt> = Vec::new();
     if relative_to {
@@ -558,6 +574,8 @@ fn emit_bezier(gdi: &mut Gdi, ctrl: Vec<Pt>, relative_to: bool) {
     if anchors.len() < 4 {
         return;
     }
+    // ~¼ device pixel: visually exact yet bounded in point count.
+    const TOL: f64 = 0.25;
     let mut flat: Vec<Pt> = vec![anchors[0]];
     let mut i = 1;
     while i + 2 < anchors.len() {
@@ -565,11 +583,7 @@ fn emit_bezier(gdi: &mut Gdi, ctrl: Vec<Pt>, relative_to: bool) {
         let p1 = anchors[i];
         let p2 = anchors[i + 1];
         let p3 = anchors[i + 2];
-        const STEPS: usize = 24;
-        for s in 1..=STEPS {
-            let t = s as f64 / STEPS as f64;
-            flat.push(cubic(p0, p1, p2, p3, t));
-        }
+        flatten_cubic(p0, p1, p2, p3, TOL, 0, &mut flat);
         i += 3;
     }
     gdi.stroke_open_device(&flat, false);
@@ -578,15 +592,52 @@ fn emit_bezier(gdi: &mut Gdi, ctrl: Vec<Pt>, relative_to: bool) {
     }
 }
 
-fn cubic(p0: Pt, p1: Pt, p2: Pt, p3: Pt, t: f64) -> Pt {
-    let u = 1.0 - t;
-    let a = u * u * u;
-    let b = 3.0 * u * u * t;
-    let c = 3.0 * u * t * t;
-    let d = t * t * t;
+/// Recursively flatten the cubic `p0..p3` (device pixels) into `out`, appending
+/// every point **after** `p0` (the caller already pushed `p0`). Subdivides while
+/// the curve's flatness (max control-point deviation from the `p0→p3` chord)
+/// exceeds `tol`, capped at `depth` 18 to bound the recursion on pathological
+/// control nets.
+fn flatten_cubic(p0: Pt, p1: Pt, p2: Pt, p3: Pt, tol: f64, depth: u32, out: &mut Vec<Pt>) {
+    const MAX_DEPTH: u32 = 18;
+    if depth >= MAX_DEPTH || cubic_is_flat(p0, p1, p2, p3, tol) {
+        out.push(p3);
+        return;
+    }
+    // de Casteljau split at t = 0.5.
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+    let mid = midpoint(p012, p123);
+    flatten_cubic(p0, p01, p012, mid, tol, depth + 1, out);
+    flatten_cubic(mid, p123, p23, p3, tol, depth + 1, out);
+}
+
+/// `true` when the cubic is within `tol` device pixels of its `p0→p3` chord —
+/// i.e. both inner control points lie close enough to the chord line. Uses the
+/// standard distance-of-control-point-to-chord flatness test.
+fn cubic_is_flat(p0: Pt, p1: Pt, p2: Pt, p3: Pt, tol: f64) -> bool {
+    let dx = p3.x - p0.x;
+    let dy = p3.y - p0.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= 1e-12 {
+        // Degenerate chord (p0 ≈ p3): fall back to the raw spread of controls.
+        let d1 = (p1.x - p0.x).hypot(p1.y - p0.y);
+        let d2 = (p2.x - p0.x).hypot(p2.y - p0.y);
+        return d1.max(d2) <= tol;
+    }
+    // Perpendicular distance of p1 and p2 to the chord line through p0,p3.
+    let d1 = ((p1.x - p0.x) * dy - (p1.y - p0.y) * dx).abs();
+    let d2 = ((p2.x - p0.x) * dy - (p2.y - p0.y) * dx).abs();
+    let inv_len = 1.0 / len2.sqrt();
+    (d1 * inv_len).max(d2 * inv_len) <= tol
+}
+
+fn midpoint(a: Pt, b: Pt) -> Pt {
     Pt {
-        x: a * p0.x + b * p1.x + c * p2.x + d * p3.x,
-        y: a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+        x: (a.x + b.x) * 0.5,
+        y: (a.y + b.y) * 0.5,
     }
 }
 
@@ -667,13 +718,14 @@ fn create_brush(gdi: &mut Gdi, b: &[u8]) {
     let handle = rd_u32(b, 0).unwrap_or(0);
     let style_raw = rd_u32(b, 4).unwrap_or(0);
     let color = Rgba::from_colorref(rd_u32(b, 8).unwrap_or(0));
-    let style = match style_raw {
-        0 => BrushStyle::Solid,   // BS_SOLID
-        1 => BrushStyle::Null,    // BS_NULL
-        2 => BrushStyle::Hatched, // BS_HATCHED
-        _ => BrushStyle::Solid,
+    let hatch_raw = rd_u32(b, 12).unwrap_or(0); // lbHatch (HS_* selector)
+    let brush = match style_raw {
+        0 => Brush::solid(color),                                   // BS_SOLID
+        1 => Brush::null(),                                         // BS_NULL
+        2 => Brush::hatched(color, HatchStyle::from_u32(hatch_raw)), // BS_HATCHED
+        _ => Brush::solid(color),
     };
-    put_handle(gdi, handle, GdiObject::Brush(Brush { style, color }));
+    put_handle(gdi, handle, GdiObject::Brush(brush));
 }
 
 /// EMR_EXTCREATEFONTINDIRECTW: ihFont(4), then LOGFONT(W) — height(4,i32),
@@ -714,30 +766,10 @@ fn select_object(gdi: &mut Gdi, b: &[u8]) {
 fn apply_stock_object(gdi: &mut Gdi, id: u32) {
     match id {
         0 => gdi.cur_brush = Brush::white(), // WHITE_BRUSH
-        1 => {
-            gdi.cur_brush = Brush {
-                style: BrushStyle::Solid,
-                color: Rgba::rgb(192, 192, 192),
-            }
-        } // LTGRAY_BRUSH
-        2 => {
-            gdi.cur_brush = Brush {
-                style: BrushStyle::Solid,
-                color: Rgba::rgb(128, 128, 128),
-            }
-        } // GRAY_BRUSH
-        3 => {
-            gdi.cur_brush = Brush {
-                style: BrushStyle::Solid,
-                color: Rgba::rgb(64, 64, 64),
-            }
-        } // DKGRAY_BRUSH
-        4 => {
-            gdi.cur_brush = Brush {
-                style: BrushStyle::Solid,
-                color: Rgba::rgb(0, 0, 0),
-            }
-        } // BLACK_BRUSH
+        1 => gdi.cur_brush = Brush::solid(Rgba::rgb(192, 192, 192)), // LTGRAY_BRUSH
+        2 => gdi.cur_brush = Brush::solid(Rgba::rgb(128, 128, 128)), // GRAY_BRUSH
+        3 => gdi.cur_brush = Brush::solid(Rgba::rgb(64, 64, 64)), // DKGRAY_BRUSH
+        4 => gdi.cur_brush = Brush::solid(Rgba::rgb(0, 0, 0)), // BLACK_BRUSH
         5 => gdi.cur_brush = Brush::null(),  // NULL_BRUSH
         6 => gdi.cur_pen = Pen::cosmetic_black(), // WHITE_PEN handled as black? no:
         7 => gdi.cur_pen = Pen::cosmetic_black(), // BLACK_PEN
@@ -772,15 +804,18 @@ fn fill_rgn(gdi: &mut Gdi, b: &[u8]) {
         (h, Some(GdiObject::Brush(br))) if h != 0 && br.style != BrushStyle::Null => br.color,
         _ => return,
     };
-    let (l, t, r, bo) = rgn_bounds(b);
-    let poly = rect_poly(gdi, l, t, r, bo);
-    fill_polygons(
-        &mut gdi.canvas,
-        &[poly],
-        color,
-        gdi.poly_fill_alternate,
-        gdi.clip.as_ref(),
-    );
+    // RGNDATA follows rclBounds(16) + cbRgnData(4) + ihBrush(4) = byte 24.
+    let rects = parse_emf_rgndata(b, 24);
+    let polys = region_polys(gdi, &rects, b);
+    if !polys.is_empty() {
+        fill_polygons(
+            &mut gdi.canvas,
+            &polys,
+            color,
+            gdi.poly_fill_alternate,
+            gdi.clip.as_ref(),
+        );
+    }
 }
 
 /// EMR_PAINTRGN: rclBounds(16), cbRgnData(4), RGNDATA… → current brush.
@@ -790,9 +825,74 @@ fn paint_rgn(gdi: &mut Gdi, b: &[u8]) {
     }
     let color = gdi.cur_brush.color;
     let alt = gdi.poly_fill_alternate;
-    let (l, t, r, bo) = rgn_bounds(b);
-    let poly = rect_poly(gdi, l, t, r, bo);
-    fill_polygons(&mut gdi.canvas, &[poly], color, alt, gdi.clip.as_ref());
+    // RGNDATA follows rclBounds(16) + cbRgnData(4) = byte 20.
+    let rects = parse_emf_rgndata(b, 20);
+    let polys = region_polys(gdi, &rects, b);
+    if !polys.is_empty() {
+        fill_polygons(&mut gdi.canvas, &polys, color, alt, gdi.clip.as_ref());
+    }
+}
+
+/// EMR_EXTSELECTCLIPRGN: cbRgnData(4), iMode(4), RGNDATA… — set the device clip
+/// to the **union** (bounding rect) of the region's rectangles. `RGN_COPY`
+/// (iMode 5) replaces the clip; an empty region clears it.
+fn ext_select_clip_rgn(gdi: &mut Gdi, b: &[u8]) {
+    // RGNDATA follows cbRgnData(4) + iMode(4) = byte 8.
+    let rects = parse_emf_rgndata(b, 8);
+    let bbox = region_bbox(&rects);
+    gdi.set_clip_logrect(bbox);
+}
+
+/// Build device polygons for region `rects`; falls back to the record's
+/// `rclBounds` rectangle when the RGNDATA carried no parsable rectangle (so a
+/// region we couldn't fully decode still paints its bounding box, not nothing).
+fn region_polys(gdi: &Gdi, rects: &[LogRect], b: &[u8]) -> Vec<Vec<Pt>> {
+    if rects.is_empty() {
+        let (l, t, r, bo) = rgn_bounds(b);
+        if (r - l).abs() < 1e-9 && (bo - t).abs() < 1e-9 {
+            return Vec::new();
+        }
+        return vec![rect_poly(gdi, l, t, r, bo)];
+    }
+    rects
+        .iter()
+        .map(|rc| rect_poly(gdi, rc.left, rc.top, rc.right, rc.bottom))
+        .collect()
+}
+
+/// Parse an EMF `RGNDATA` blob starting at body byte `off` into its rectangle
+/// list. The `RGNDATAHEADER` is `dwSize(4), iType(4), nCount(4), nRgnSize(4),
+/// rcBound(16)`; the `RDH_RECTANGLES` body that follows is `nCount` `RECTL`s
+/// (`left,top,right,bottom`, 4×i32). Bounds-checked; an out-of-range count is
+/// capped to the available bytes (never panics, never allocates unboundedly).
+fn parse_emf_rgndata(b: &[u8], off: usize) -> Vec<LogRect> {
+    // Need at least the 32-byte RGNDATAHEADER.
+    if off + 32 > b.len() {
+        return Vec::new();
+    }
+    let count = rd_u32(b, off + 8).unwrap_or(0) as usize;
+    let rects_off = off + 32; // header is 32 bytes
+    let avail = b.len().saturating_sub(rects_off) / 16; // 16 bytes per RECTL
+    let count = count.min(avail);
+    let mut rects = Vec::with_capacity(count.min(1 << 16));
+    for i in 0..count {
+        let o = rects_off + i * 16;
+        let (Some(l), Some(t), Some(r), Some(bo)) = (
+            rd_i32(b, o),
+            rd_i32(b, o + 4),
+            rd_i32(b, o + 8),
+            rd_i32(b, o + 12),
+        ) else {
+            break;
+        };
+        rects.push(LogRect {
+            left: l as f64,
+            top: t as f64,
+            right: r as f64,
+            bottom: bo as f64,
+        });
+    }
+    rects
 }
 
 /// The `rclBounds` rectangle at the start of a region record body.
@@ -948,6 +1048,7 @@ fn blit_emf_dib(
     let bottom_right = gdi.to_device(dx + dw, dy + dh);
     let ddw = bottom_right.x - top_left.x;
     let ddh = bottom_right.y - top_left.y;
+    let mode = gdi.stretch_mode;
     blit_dib(
         &mut gdi.canvas,
         &dib,
@@ -956,5 +1057,317 @@ fn blit_emf_dib(
         ddw,
         ddh,
         gdi.clip.as_ref(),
+        mode,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── tiny EMF builder ─────────────────────────────────────────────────────
+
+    fn pu16(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn pu32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn pi32(v: &mut Vec<u8>, x: i32) {
+        v.extend_from_slice(&(x as u32).to_le_bytes());
+    }
+
+    fn record(out: &mut Vec<u8>, itype: u32, body: &[u8]) {
+        let mut body = body.to_vec();
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        pu32(out, itype);
+        pu32(out, 8 + body.len() as u32);
+        out.extend_from_slice(&body);
+    }
+
+    fn emf_with(w: i32, h: i32, records: &[u8]) -> Vec<u8> {
+        let mut header = Vec::new();
+        pi32(&mut header, 0);
+        pi32(&mut header, 0);
+        pi32(&mut header, w - 1);
+        pi32(&mut header, h - 1);
+        pi32(&mut header, 0);
+        pi32(&mut header, 0);
+        pi32(&mut header, w * 26);
+        pi32(&mut header, h * 26);
+        pu32(&mut header, 0x464D_4520); // " EMF"
+        pu32(&mut header, 0x0001_0000);
+        pu32(&mut header, 0);
+        pu32(&mut header, 0);
+        pu16(&mut header, 0);
+        pu16(&mut header, 0);
+        pu32(&mut header, 0);
+        pu32(&mut header, 0);
+        pu32(&mut header, 0);
+        pi32(&mut header, w);
+        pi32(&mut header, h);
+        pi32(&mut header, w);
+        pi32(&mut header, h);
+
+        let mut v = Vec::new();
+        pu32(&mut v, 1);
+        pu32(&mut v, 8 + header.len() as u32);
+        v.extend_from_slice(&header);
+        v.extend_from_slice(records);
+        v
+    }
+
+    fn px(m: &MetafileRaster, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let i = ((y * m.width + x) * 4) as usize;
+        (m.rgba[i], m.rgba[i + 1], m.rgba[i + 2], m.rgba[i + 3])
+    }
+
+    /// Body for EMR_CREATEBRUSHINDIRECT (solid): ihBrush, style, colorref, hatch.
+    fn solid_brush(handle: u32, colorref: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        pu32(&mut b, handle);
+        pu32(&mut b, 0); // BS_SOLID
+        pu32(&mut b, colorref);
+        pu32(&mut b, 0);
+        b
+    }
+
+    fn select(handle: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        pu32(&mut b, handle);
+        b
+    }
+
+    /// An EMF RGNDATA blob of one rectangle list.
+    fn rgndata(rects: &[(i32, i32, i32, i32)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        // RGNDATAHEADER: dwSize(32), iType(1=RDH_RECTANGLES), nCount, nRgnSize, rcBound(16)
+        pu32(&mut b, 32);
+        pu32(&mut b, 1);
+        pu32(&mut b, rects.len() as u32);
+        pu32(&mut b, (rects.len() * 16) as u32);
+        // bounding rect (union)
+        let l = rects.iter().map(|r| r.0).min().unwrap_or(0);
+        let t = rects.iter().map(|r| r.1).min().unwrap_or(0);
+        let r = rects.iter().map(|r| r.2).max().unwrap_or(0);
+        let bo = rects.iter().map(|r| r.3).max().unwrap_or(0);
+        pi32(&mut b, l);
+        pi32(&mut b, t);
+        pi32(&mut b, r);
+        pi32(&mut b, bo);
+        for &(rl, rt, rr, rb) in rects {
+            pi32(&mut b, rl);
+            pi32(&mut b, rt);
+            pi32(&mut b, rr);
+            pi32(&mut b, rb);
+        }
+        b
+    }
+
+    // ── #179 EXTSELECTCLIPRGN ────────────────────────────────────────────────
+
+    #[test]
+    fn ext_select_clip_rgn_bounds_subsequent_fill() {
+        let (w, h) = (100i32, 100i32);
+        let mut recs = Vec::new();
+        // EXTSELECTCLIPRGN: cbRgnData(4), iMode(4=RGN_COPY), RGNDATA{ (0,0)-(40,40) }.
+        let rd = rgndata(&[(0, 0, 40, 40)]);
+        let mut body = Vec::new();
+        pu32(&mut body, rd.len() as u32); // cbRgnData
+        pu32(&mut body, 5); // RGN_COPY
+        body.extend_from_slice(&rd);
+        record(&mut recs, EMR_EXTSELECTCLIPRGN, &body);
+        // Null pen, solid blue brush, full-canvas rectangle.
+        record(&mut recs, EMR_CREATEBRUSHINDIRECT, &solid_brush(1, 0x00FF_0000));
+        record(&mut recs, EMR_SELECTOBJECT, &select(0x8000_0008)); // NULL_PEN stock
+        record(&mut recs, EMR_SELECTOBJECT, &select(1));
+        let mut rectb = Vec::new();
+        pi32(&mut rectb, 0);
+        pi32(&mut rectb, 0);
+        pi32(&mut rectb, 99);
+        pi32(&mut rectb, 99);
+        record(&mut recs, EMR_RECTANGLE, &rectb);
+        record(&mut recs, EMR_EOF, &[0, 0, 0, 0]);
+        let m = decode(&emf_with(w, h, &recs)).expect("decode");
+
+        let inside = px(&m, 15, 15);
+        let outside = px(&m, 80, 80);
+        assert!(inside.3 > 0, "inside clip painted, got {inside:?}");
+        assert_eq!(outside.3, 0, "outside clip empty, got {outside:?}");
+    }
+
+    // ── #182 FILLRGN union ───────────────────────────────────────────────────
+
+    #[test]
+    fn fill_rgn_paints_union_of_rectangles() {
+        let (w, h) = (100i32, 40i32);
+        let mut recs = Vec::new();
+        // Brush handle 1.
+        record(&mut recs, EMR_CREATEBRUSHINDIRECT, &solid_brush(1, 0x0000_0000));
+        // EMR_FILLRGN: rclBounds(16), cbRgnData(4), ihBrush(4), RGNDATA.
+        let rd = rgndata(&[(0, 0, 30, 40), (70, 0, 100, 40)]);
+        let mut body = Vec::new();
+        pi32(&mut body, 0); // rclBounds
+        pi32(&mut body, 0);
+        pi32(&mut body, 100);
+        pi32(&mut body, 40);
+        pu32(&mut body, rd.len() as u32); // cbRgnData
+        pu32(&mut body, 1); // ihBrush
+        body.extend_from_slice(&rd);
+        record(&mut recs, EMR_FILLRGN, &body);
+        record(&mut recs, EMR_EOF, &[0, 0, 0, 0]);
+        let m = decode(&emf_with(w, h, &recs)).expect("decode");
+
+        assert!(px(&m, 10, 20).3 > 0, "left rect painted");
+        assert!(px(&m, 90, 20).3 > 0, "right rect painted");
+        assert_eq!(px(&m, 50, 20).3, 0, "gap between rects empty (union, not bbox)");
+    }
+
+    // ── #176/#180 SETROP2 ────────────────────────────────────────────────────
+
+    #[test]
+    fn setrop2_white_forces_white_fill() {
+        let (w, h) = (60i32, 60i32);
+        let mut recs = Vec::new();
+        let mut rop = Vec::new();
+        pu32(&mut rop, 16); // R2_WHITE
+        record(&mut recs, EMR_SETROP2, &rop);
+        record(&mut recs, EMR_CREATEBRUSHINDIRECT, &solid_brush(1, 0x0000_00FF)); // red
+        record(&mut recs, EMR_SELECTOBJECT, &select(0x8000_0008)); // NULL_PEN
+        record(&mut recs, EMR_SELECTOBJECT, &select(1));
+        let mut rectb = Vec::new();
+        pi32(&mut rectb, 10);
+        pi32(&mut rectb, 10);
+        pi32(&mut rectb, 50);
+        pi32(&mut rectb, 50);
+        record(&mut recs, EMR_RECTANGLE, &rectb);
+        record(&mut recs, EMR_EOF, &[0, 0, 0, 0]);
+        let m = decode(&emf_with(w, h, &recs)).expect("decode");
+        let c = px(&m, 30, 30);
+        assert!(c.3 > 0, "centre painted");
+        assert!(c.0 > 220 && c.1 > 220 && c.2 > 220, "R2_WHITE → white, got {c:?}");
+    }
+
+    // ── #181 adaptive Bézier ─────────────────────────────────────────────────
+
+    #[test]
+    fn cubic_flatness_detects_straight_and_curved() {
+        // A perfectly straight cubic is flat at any sane tolerance.
+        let straight = (
+            Pt { x: 0.0, y: 0.0 },
+            Pt { x: 10.0, y: 0.0 },
+            Pt { x: 20.0, y: 0.0 },
+            Pt { x: 30.0, y: 0.0 },
+        );
+        assert!(cubic_is_flat(straight.0, straight.1, straight.2, straight.3, 0.25));
+        // A sharply bowed cubic is NOT flat.
+        let curved = (
+            Pt { x: 0.0, y: 0.0 },
+            Pt { x: 10.0, y: 40.0 },
+            Pt { x: 20.0, y: 40.0 },
+            Pt { x: 30.0, y: 0.0 },
+        );
+        assert!(!cubic_is_flat(curved.0, curved.1, curved.2, curved.3, 0.25));
+    }
+
+    #[test]
+    fn flatten_cubic_is_adaptive_curve_denser_than_line() {
+        // A straight cubic flattens to a single appended point …
+        let mut line = Vec::new();
+        flatten_cubic(
+            Pt { x: 0.0, y: 0.0 },
+            Pt { x: 30.0, y: 0.0 },
+            Pt { x: 60.0, y: 0.0 },
+            Pt { x: 90.0, y: 0.0 },
+            0.25,
+            0,
+            &mut line,
+        );
+        // … while a strongly curved one yields many more.
+        let mut curve = Vec::new();
+        flatten_cubic(
+            Pt { x: 0.0, y: 0.0 },
+            Pt { x: 30.0, y: 90.0 },
+            Pt { x: 60.0, y: 90.0 },
+            Pt { x: 90.0, y: 0.0 },
+            0.25,
+            0,
+            &mut curve,
+        );
+        assert_eq!(line.len(), 1, "straight cubic → 1 point");
+        assert!(
+            curve.len() > 8,
+            "curved cubic should subdivide many times, got {}",
+            curve.len()
+        );
+        // Endpoints are preserved.
+        assert_eq!(curve.last().unwrap().x, 90.0);
+    }
+
+    #[test]
+    fn polybezier16_paints_along_the_curve() {
+        let (w, h) = (120i32, 120i32);
+        let mut recs = Vec::new();
+        // Thick black pen so the curve leaves visible ink.
+        let mut pen = Vec::new();
+        pu32(&mut pen, 1); // ihPen
+        pu32(&mut pen, 0); // PS_SOLID
+        pi32(&mut pen, 3); // width.x
+        pi32(&mut pen, 0); // width.y
+        pu32(&mut pen, 0x0000_0000); // black
+        record(&mut recs, EMR_CREATEPEN, &pen);
+        record(&mut recs, EMR_SELECTOBJECT, &select(1));
+        // EMR_POLYBEZIER16: rclBounds(16), count(4), points(count × 2×i16).
+        let mut body = Vec::new();
+        pi32(&mut body, 0);
+        pi32(&mut body, 0);
+        pi32(&mut body, 119);
+        pi32(&mut body, 119);
+        pu32(&mut body, 4); // 4 control points = one cubic
+        for (x, y) in [(10i16, 100i16), (40, 10), (80, 10), (110, 100)] {
+            body.extend_from_slice(&x.to_le_bytes());
+            body.extend_from_slice(&y.to_le_bytes());
+        }
+        record(&mut recs, EMR_POLYBEZIER16, &body);
+        record(&mut recs, EMR_EOF, &[0, 0, 0, 0]);
+        let m = decode(&emf_with(w, h, &recs)).expect("decode");
+
+        // Some ink exists near the apex of the curve (around y≈25, x≈60).
+        let mut found = false;
+        'outer: for y in 18..34 {
+            for x in 50..72 {
+                if px(&m, x, y).3 > 0 {
+                    found = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(found, "the flattened Bézier should paint near its apex");
+    }
+
+    // ── RGNDATA parser unit ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_emf_rgndata_reads_rect_list() {
+        let rd = rgndata(&[(1, 2, 3, 4), (5, 6, 7, 8)]);
+        let rects = parse_emf_rgndata(&rd, 0);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            (rects[0].left, rects[0].top, rects[0].right, rects[0].bottom),
+            (1.0, 2.0, 3.0, 4.0)
+        );
+        assert_eq!(
+            (rects[1].left, rects[1].top, rects[1].right, rects[1].bottom),
+            (5.0, 6.0, 7.0, 8.0)
+        );
+        // Truncated/empty payloads never panic.
+        assert!(parse_emf_rgndata(&[0u8; 8], 0).is_empty());
+        assert!(parse_emf_rgndata(&rd, 9_999).is_empty());
+        // A bogus huge count is capped to the available bytes.
+        let mut bad = rd.clone();
+        bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_emf_rgndata(&bad, 0).len(), 2);
+    }
 }

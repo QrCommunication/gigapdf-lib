@@ -296,8 +296,14 @@ fn exec_record(gdi: &mut Gdi, func: u16, p: &[u8]) {
             // META_SETPOLYFILLMODE: 1 = ALTERNATE, 2 = WINDING
             gdi.poly_fill_alternate = u16w(p, 0) != 2;
         }
-        0x0104 => { /* META_SETROP2 — raster op; we always source-over */ }
-        0x0107 => { /* META_SETSTRETCHBLTMODE — interpolation hint; ignored */ }
+        0x0104 => {
+            // META_SETROP2: binary raster op (1 word). Applies to vector paint.
+            gdi.canvas.rop2 = Rop2::from_u32(u16w(p, 0) as u32);
+        }
+        0x0107 => {
+            // META_SETSTRETCHBLTMODE: nearest vs HALFTONE for DIB blits.
+            gdi.stretch_mode = StretchMode::from_u32(u16w(p, 0) as u32);
+        }
 
         // ── Path drawing ───────────────────────────────────────────────────
         0x0214 => {
@@ -374,14 +380,16 @@ fn exec_record(gdi: &mut Gdi, func: u16, p: &[u8]) {
         0x02FA => create_pen_indirect(gdi, p),
         0x02FC => create_brush_indirect(gdi, p),
         0x02FB => create_font_indirect(gdi, p),
+        0x06FF => {
+            // META_CREATEREGION: a scan-based region. Parse its rect list so the
+            // region's true union (not just its AABB) can be filled/clipped.
+            let rects = parse_wmf_region(p);
+            let _ = gdi.add_object(GdiObject::Region(rects));
+        }
         0x02FF => {
-            // META_CREATEBRUSHINDIRECT alias handled above; 0x02FF = META_CREATEREGION
-            let _ = gdi.add_object(GdiObject::Region(LogRect {
-                left: 0.0,
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-            }));
+            // 0x02FF is otherwise unmodelled here; keep an empty region slot so
+            // handle indices stay aligned (legacy behaviour).
+            let _ = gdi.add_object(GdiObject::Region(Vec::new()));
         }
         0x01F0 => {
             // META_DELETEOBJECT: index
@@ -393,8 +401,17 @@ fn exec_record(gdi: &mut Gdi, func: u16, p: &[u8]) {
             let idx = u16w(p, 0) as usize;
             gdi.select_object(idx);
         }
-        0x012C => { /* META_SELECTCLIPREGION — region bbox clip (best-effort: none) */ }
-        0x02FD => create_solid_brush_pattern(gdi),
+        0x012C => {
+            // META_SELECTCLIPREGION: clip to the selected region's union bbox.
+            let idx = u16w(p, 0) as usize;
+            let bbox = match gdi.objects.get(idx) {
+                Some(GdiObject::Region(rects)) => region_bbox(rects),
+                _ => None,
+            };
+            gdi.set_clip_logrect(bbox);
+        }
+        0x02FD => create_solid_brush_pattern(gdi), // META_CREATEPATTERNBRUSH
+        0x0142 => create_dib_pattern_brush(gdi, p), // META_DIBCREATEPATTERNBRUSH
 
         // ── DIB blits ──────────────────────────────────────────────────────
         0x0F43 => stretch_dibits(gdi, p),  // META_STRETCHDIB
@@ -450,22 +467,30 @@ fn create_brush_indirect(gdi: &mut Gdi, p: &[u8]) {
     // LOGBRUSH: style(2), COLORREF(4), hatch(2)
     let style_raw = u16w(p, 0);
     let color = Rgba::from_colorref(colorref(p, 1));
-    let style = match style_raw {
-        0 => BrushStyle::Solid,   // BS_SOLID
-        1 => BrushStyle::Null,    // BS_NULL/HOLLOW
-        2 => BrushStyle::Hatched, // BS_HATCHED
-        _ => BrushStyle::Solid,
+    let hatch_raw = u16w(p, 3) as u32; // lbHatch (the HS_* selector for BS_HATCHED)
+    let brush = match style_raw {
+        0 => Brush::solid(color),                                  // BS_SOLID
+        1 => Brush::null(),                                        // BS_NULL/HOLLOW
+        2 => Brush::hatched(color, HatchStyle::from_u32(hatch_raw)), // BS_HATCHED
+        _ => Brush::solid(color),
     };
-    gdi.add_object(GdiObject::Brush(Brush { style, color }));
+    gdi.add_object(GdiObject::Brush(brush));
 }
 
-/// META_CREATEPATTERNBRUSH / DIBPATTERNBRUSH — approximate as a mid-grey solid
-/// brush (we can't cheaply sample the pattern bits for fill).
+/// META_DIBCREATEPATTERNBRUSH (`0x0142`) — decode the packed DIB tile so the
+/// pattern brush tiles real pixels; an undecodable tile falls back to mid-grey.
+/// Layout: usage(2), then the packed DIB (BITMAPINFOHEADER + palette + bits).
+fn create_dib_pattern_brush(gdi: &mut Gdi, p: &[u8]) {
+    // The first param word is the colour-table usage; the DIB starts after it.
+    let tile = p.get(2..).and_then(decode_packed_dib);
+    gdi.add_object(GdiObject::Brush(Brush::pattern(tile)));
+}
+
+/// META_CREATEPATTERNBRUSH (`0x01F9`) — a monochrome pattern bitmap brush; we
+/// can't cheaply recover its bits here, so approximate with the mid-grey solid
+/// fallback (a `Pattern` brush carrying no tile).
 fn create_solid_brush_pattern(gdi: &mut Gdi) {
-    gdi.add_object(GdiObject::Brush(Brush {
-        style: BrushStyle::Pattern,
-        color: Rgba::rgb(128, 128, 128),
-    }));
+    gdi.add_object(GdiObject::Brush(Brush::pattern(None)));
 }
 
 fn create_font_indirect(gdi: &mut Gdi, p: &[u8]) {
@@ -586,20 +611,23 @@ fn arc_pie_chord(gdi: &mut Gdi, p: &[u8], kind: ArcKind) {
 // ── regions ─────────────────────────────────────────────────────────────────
 
 fn fill_region(gdi: &mut Gdi, p: &[u8], _with_brush: bool) {
-    // META_FILLREGION: regionIndex(2), brushIndex(2). We reduced regions to their
-    // bbox; fill that rect with the named brush's colour.
+    // META_FILLREGION: regionIndex(2), brushIndex(2). Fill the region's full
+    // rectangle union with the named brush's colour.
     let region_idx = u16w(p, 0) as usize;
     let brush_idx = u16w(p, 1) as usize;
-    let rect = region_rect(gdi, region_idx);
+    let rects = region_rects(gdi, region_idx);
     let color = match gdi.objects.get(brush_idx) {
         Some(GdiObject::Brush(b)) if b.style != BrushStyle::Null => b.color,
         _ => return,
     };
-    if let Some(rc) = rect {
-        let poly = rect_poly(gdi, rc.left, rc.top, rc.right, rc.bottom);
+    let polys: Vec<Vec<Pt>> = rects
+        .iter()
+        .map(|rc| rect_poly(gdi, rc.left, rc.top, rc.right, rc.bottom))
+        .collect();
+    if !polys.is_empty() {
         fill_polygons(
             &mut gdi.canvas,
-            &[poly],
+            &polys,
             color,
             gdi.poly_fill_alternate,
             gdi.clip.as_ref(),
@@ -608,24 +636,79 @@ fn fill_region(gdi: &mut Gdi, p: &[u8], _with_brush: bool) {
 }
 
 fn paint_region(gdi: &mut Gdi, p: &[u8]) {
-    // META_PAINTREGION: regionIndex(2) — paint with current brush.
+    // META_PAINTREGION: regionIndex(2) — paint the region's full union with the
+    // current brush.
     let region_idx = u16w(p, 0) as usize;
     if gdi.cur_brush.style == BrushStyle::Null {
         return;
     }
     let color = gdi.cur_brush.color;
     let alt = gdi.poly_fill_alternate;
-    if let Some(rc) = region_rect(gdi, region_idx) {
-        let poly = rect_poly(gdi, rc.left, rc.top, rc.right, rc.bottom);
-        fill_polygons(&mut gdi.canvas, &[poly], color, alt, gdi.clip.as_ref());
+    let rects = region_rects(gdi, region_idx);
+    let polys: Vec<Vec<Pt>> = rects
+        .iter()
+        .map(|rc| rect_poly(gdi, rc.left, rc.top, rc.right, rc.bottom))
+        .collect();
+    if !polys.is_empty() {
+        fill_polygons(&mut gdi.canvas, &polys, color, alt, gdi.clip.as_ref());
     }
 }
 
-fn region_rect(gdi: &Gdi, idx: usize) -> Option<LogRect> {
+/// The full rectangle list of region object `idx` (empty if it isn't a region).
+fn region_rects(gdi: &Gdi, idx: usize) -> Vec<LogRect> {
     match gdi.objects.get(idx) {
-        Some(GdiObject::Region(r)) => Some(*r),
-        _ => None,
+        Some(GdiObject::Region(rects)) => rects.clone(),
+        _ => Vec::new(),
     }
+}
+
+/// Parse a WMF `META_CREATEREGION` payload into its list of scan rectangles.
+///
+/// The record body holds a `Region` object: a small header (`nextInChain`(2),
+/// `objType`(2), `objCount`(4), `regionSize`(2), `scanCount`(2),
+/// `maxScan`(2)), the bounding rect (`left,top,right,bottom`, 4×i16), then
+/// `scanCount` `Scan` structures. Each scan is `count`(2), `top`(2),
+/// `bottom`(2), then `count` `(left,right)` x-extent pairs (2×i16 each) and a
+/// trailing `count`(2). We turn every x-extent into one `LogRect` so the
+/// region's true area (the union of its scan rectangles) is recoverable. Bounds
+/// are checked throughout; a malformed body yields whatever was parsed so far.
+fn parse_wmf_region(p: &[u8]) -> Vec<LogRect> {
+    // Region header is 16 bytes (8 × u16); the bounding rect follows (8 bytes).
+    if p.len() < 24 {
+        return Vec::new();
+    }
+    let scan_count = u16w(p, 5) as usize; // word index 5 = rgnScanCount
+    let mut rects = Vec::new();
+    // Scans begin after the 16-byte header + 8-byte bounding rect (12 words in).
+    let mut word = 12usize;
+    for _ in 0..scan_count {
+        // Scan: count(1w), top(1w), bottom(1w), then count×(left,right), count(1w).
+        if (word + 3) * 2 > p.len() {
+            break;
+        }
+        let count = u16w(p, word) as usize;
+        let top = i16w(p, word + 1);
+        let bottom = i16w(p, word + 2);
+        word += 3;
+        // Sanity-cap the pair count against the remaining payload.
+        let avail_pairs = p.len().saturating_sub(word * 2) / 4;
+        if count > avail_pairs {
+            break;
+        }
+        for _ in 0..count {
+            let left = i16w(p, word);
+            let right = i16w(p, word + 1);
+            word += 2;
+            rects.push(LogRect {
+                left,
+                top,
+                right,
+                bottom,
+            });
+        }
+        word += 1; // trailing duplicate count word
+    }
+    rects
 }
 
 // ── text (fallback box / advance) ──────────────────────────────────────────
@@ -739,6 +822,7 @@ fn blit_packed(gdi: &mut Gdi, p: &[u8], dib_off: usize, dx: f64, dy: f64, dw: f6
     let bottom_right = gdi.to_device(dx + dw, dy + dh);
     let ddw = bottom_right.x - top_left.x;
     let ddh = bottom_right.y - top_left.y;
+    let mode = gdi.stretch_mode;
     blit_dib(
         &mut gdi.canvas,
         &dib,
@@ -747,5 +831,230 @@ fn blit_packed(gdi: &mut Gdi, p: &[u8], dib_off: usize, dx: f64, dy: f64, dw: f6
         ddw,
         ddh,
         gdi.clip.as_ref(),
+        mode,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── tiny placeable-WMF builder ───────────────────────────────────────────
+
+    fn pu16(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn pi16(v: &mut Vec<u8>, x: i16) {
+        v.extend_from_slice(&(x as u16).to_le_bytes());
+    }
+    fn pu32(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    fn record(out: &mut Vec<u8>, func: u16, params: &[u16]) {
+        let size = 3 + params.len() as u32;
+        pu32(out, size);
+        pu16(out, func);
+        for p in params {
+            pu16(out, *p);
+        }
+    }
+
+    fn placeable(bbox: (i16, i16, i16, i16), inch: u16, records: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        pu32(&mut v, 0x9AC6_CDD7);
+        pu16(&mut v, 0);
+        pi16(&mut v, bbox.0);
+        pi16(&mut v, bbox.1);
+        pi16(&mut v, bbox.2);
+        pi16(&mut v, bbox.3);
+        pu16(&mut v, inch);
+        pu32(&mut v, 0);
+        pu16(&mut v, 0);
+        pu16(&mut v, 1); // mtType
+        pu16(&mut v, 9); // mtHeaderSize
+        pu16(&mut v, 0x0300);
+        pu32(&mut v, 0);
+        pu16(&mut v, 4);
+        pu32(&mut v, 0);
+        pu16(&mut v, 0);
+        v.extend_from_slice(records);
+        v
+    }
+
+    fn colorref(r: u8, g: u8, b: u8) -> [u16; 2] {
+        let c = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        [(c & 0xFFFF) as u16, (c >> 16) as u16]
+    }
+
+    fn px(m: &MetafileRaster, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let i = ((y * m.width + x) * 4) as usize;
+        (m.rgba[i], m.rgba[i + 1], m.rgba[i + 2], m.rgba[i + 3])
+    }
+
+    /// Window 0..100 with org 0; device ≈ 96px at 100 units/inch.
+    fn window_setup(recs: &mut Vec<u8>) {
+        record(recs, 0x020B, &[0, 0]); // SetWindowOrg y,x
+        record(recs, 0x020C, &[100, 100]); // SetWindowExt y,x
+    }
+
+    // ── #177 hatch brush rendering ───────────────────────────────────────────
+
+    #[test]
+    fn hatched_brush_rectangle_is_striped_not_solid() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        // Null pen (so only the brush shows), hatched black diagonal-cross brush.
+        record(&mut recs, 0x02FA, &[5, 0, 0, 0, 0]); // CreatePen NULL
+        let black = colorref(0, 0, 0);
+        // CreateBrushIndirect: style=2 (BS_HATCHED), COLORREF black, hatch=5 (DIAGCROSS)
+        record(&mut recs, 0x02FC, &[2, black[0], black[1], 5]);
+        record(&mut recs, 0x012D, &[0]); // select pen
+        record(&mut recs, 0x012D, &[1]); // select brush
+                                         // Rectangle covering most of the canvas.
+        record(&mut recs, 0x041B, &[95, 95, 5, 5]); // b,r,t,l
+        record(&mut recs, 0x0000, &[]); // EOF
+        let m = decode(&placeable((0, 0, 100, 100), 100, &recs)).expect("decode");
+
+        // Count painted vs total inside the rectangle interior — a hatch leaves
+        // most interior pixels transparent (unlike a solid fill).
+        let (mut painted, mut total) = (0u32, 0u32);
+        let x0 = m.width / 10;
+        let x1 = m.width * 9 / 10;
+        let y0 = m.height / 10;
+        let y1 = m.height * 9 / 10;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                total += 1;
+                if px(&m, x, y).3 > 0 {
+                    painted += 1;
+                }
+            }
+        }
+        assert!(painted > 0, "hatch must paint some ink");
+        assert!(
+            painted * 2 < total,
+            "hatch should leave most interior empty ({painted}/{total})"
+        );
+    }
+
+    // ── #176/#180 SETROP2 ────────────────────────────────────────────────────
+
+    #[test]
+    fn setrop2_black_forces_black_fill() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        // R2_BLACK (1) — any subsequent fill paints black.
+        record(&mut recs, 0x0104, &[1]); // SETROP2 R2_BLACK
+        record(&mut recs, 0x02FA, &[5, 0, 0, 0, 0]); // NULL pen
+        let red = colorref(255, 0, 0);
+        record(&mut recs, 0x02FC, &[0, red[0], red[1], 0]); // solid RED brush
+        record(&mut recs, 0x012D, &[0]);
+        record(&mut recs, 0x012D, &[1]);
+        record(&mut recs, 0x041B, &[90, 90, 10, 10]);
+        record(&mut recs, 0x0000, &[]);
+        let m = decode(&placeable((0, 0, 100, 100), 100, &recs)).expect("decode");
+        let c = px(&m, m.width / 2, m.height / 2);
+        // Despite a red brush, R2_BLACK forces black ink (not red).
+        assert!(c.3 > 0, "centre painted");
+        assert!(
+            c.0 < 40 && c.1 < 40 && c.2 < 40,
+            "R2_BLACK should paint black, got {c:?}"
+        );
+    }
+
+    // ── #175 SELECTCLIPREGION ────────────────────────────────────────────────
+
+    #[test]
+    fn select_clip_region_bounds_subsequent_fill() {
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        // CreateRegion (handle 0) covering logical (0,0)-(50,50): one scan rect.
+        // Region body: header(8 words) + bbox(4 words) + scan.
+        let mut rgn = Vec::<u16>::new();
+        // header: next(0), objType(6=region), objCount(2 words lo/hi)=0,
+        // regionSize(0), scanCount(1), maxScan(1)
+        rgn.extend_from_slice(&[0, 0x0006, 0, 0, 0, 1, 1, 0]); // 8 words
+        rgn.extend_from_slice(&[0, 0, 50, 50]); // bbox l,t,r,b
+                                                // scan: count(1), top(0), bottom(50), (left,right)=(0,50), count(1)
+        rgn.extend_from_slice(&[1, 0, 50, 0, 50, 1]);
+        record(&mut recs, 0x06FF, &rgn); // META_CREATEREGION
+        record(&mut recs, 0x012C, &[0]); // SELECTCLIPREGION handle 0
+
+        // Null pen + solid blue brush, then a full-canvas rectangle.
+        record(&mut recs, 0x02FA, &[5, 0, 0, 0, 0]);
+        let blue = colorref(0, 0, 255);
+        record(&mut recs, 0x02FC, &[0, blue[0], blue[1], 0]);
+        record(&mut recs, 0x012D, &[1]); // pen (handle 1)
+        record(&mut recs, 0x012D, &[2]); // brush (handle 2)
+        record(&mut recs, 0x041B, &[100, 100, 0, 0]); // full rect
+        record(&mut recs, 0x0000, &[]);
+        let m = decode(&placeable((0, 0, 100, 100), 100, &recs)).expect("decode");
+
+        // Inside the clip (logical ~25,25): painted. Outside (logical ~75,75):
+        // clipped away.
+        let inside = px(&m, m.width / 4, m.height / 4);
+        let outside = px(&m, m.width * 3 / 4, m.height * 3 / 4);
+        assert!(inside.3 > 0, "inside clip region painted, got {inside:?}");
+        assert_eq!(outside.3, 0, "outside clip region empty, got {outside:?}");
+    }
+
+    // ── #182 region union fill ───────────────────────────────────────────────
+
+    #[test]
+    fn fill_region_paints_union_of_scan_rects() {
+        // A region with two disjoint scan rectangles: a left band and a right
+        // band, leaving a transparent gap between them.
+        let mut recs = Vec::new();
+        window_setup(&mut recs);
+        let mut rgn = Vec::<u16>::new();
+        rgn.extend_from_slice(&[0, 0x0006, 0, 0, 0, 1, 2, 0]); // scanCount=1, maxScan=2
+        rgn.extend_from_slice(&[0, 0, 100, 100]); // bbox
+                                                  // One scan spanning y 0..100 with TWO x-extents: (0,30) and (70,100).
+        rgn.extend_from_slice(&[2, 0, 100, 0, 30, 70, 100, 2]);
+        record(&mut recs, 0x06FF, &rgn); // CREATEREGION → handle 0
+                                         // Solid black brush (handle 1).
+        let black = colorref(0, 0, 0);
+        record(&mut recs, 0x02FC, &[0, black[0], black[1], 0]);
+        // FillRegion(region=0, brush=1).
+        record(&mut recs, 0x0228, &[0, 1]);
+        record(&mut recs, 0x0000, &[]);
+        let m = decode(&placeable((0, 0, 100, 100), 100, &recs)).expect("decode");
+
+        let left = px(&m, m.width / 10, m.height / 2);
+        let gap = px(&m, m.width / 2, m.height / 2);
+        let right = px(&m, m.width * 9 / 10, m.height / 2);
+        assert!(left.3 > 0, "left band painted, got {left:?}");
+        assert!(right.3 > 0, "right band painted, got {right:?}");
+        assert_eq!(gap.3, 0, "gap between bands empty (union, not bbox)");
+    }
+
+    // ── region parser unit ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_wmf_region_extracts_scan_rects() {
+        // header(8w) + bbox(4w) + scan{count=2, top=3, bottom=9, (1,4),(6,8), 2}
+        let mut p = Vec::<u8>::new();
+        for w in [0u16, 0x0006, 0, 0, 0, 1, 2, 0] {
+            pu16(&mut p, w);
+        }
+        for w in [0u16, 3, 8, 9] {
+            pu16(&mut p, w);
+        }
+        for w in [2u16, 3, 9, 1, 4, 6, 8, 2] {
+            pu16(&mut p, w);
+        }
+        let rects = parse_wmf_region(&p);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            (rects[0].left, rects[0].top, rects[0].right, rects[0].bottom),
+            (1.0, 3.0, 4.0, 9.0)
+        );
+        assert_eq!(
+            (rects[1].left, rects[1].top, rects[1].right, rects[1].bottom),
+            (6.0, 3.0, 8.0, 9.0)
+        );
+        // Truncated payload never panics.
+        assert!(parse_wmf_region(&[0u8; 4]).is_empty());
+    }
 }

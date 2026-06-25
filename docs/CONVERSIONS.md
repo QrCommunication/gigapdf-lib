@@ -363,21 +363,35 @@ is painted). It covers both the **WMF** placeable header (`0x9AC6CDD7`, bbox +
 units) and the bare `METAHEADER` (16-bit records), and the **EMF** `ENHMETAHEADER`
 (`rclBounds`/`rclFrame`, 32-bit records): the GDI **object table** (pens —
 `CreatePenIndirect`/`ExtCreatePen` style·width·colour·dash; brushes —
-`CreateBrushIndirect`/`CreateSolidBrush`/pattern→solid; fonts —
-`CreateFontIndirect[W]`) with `SelectObject`/`DeleteObject` + EMF stock objects;
-the drawing records `MoveTo`/`LineTo`, `Polyline`/`Polygon`/`PolyPolygon` (+ EMF
-`*16`), `Rectangle`/`RoundRect`/`Ellipse`, `Arc`/`Pie`/`Chord`, `PolyBezier`
-(EMF), `SetPixel[V]`, `FillRgn`/`PaintRgn` (region→bbox), and the DIB blits
+`CreateBrushIndirect`/`CreateSolidBrush`, plus **real hatch brushes**
+(`BS_HATCHED` — the six `HS_*` patterns `HORIZONTAL`/`VERTICAL`/`FDIAGONAL`/
+`BDIAGONAL`/`CROSS`/`DIAGCROSS` drawn as a clipped scanline line-overlay) and
+**pattern brushes** (`META_DIBCREATEPATTERNBRUSH` — the packed DIB is decoded and
+**tiled** across the fill; a monochrome `META_CREATEPATTERNBRUSH` or an
+undecodable tile falls back to mid-grey); fonts — `CreateFontIndirect[W]`) with
+`SelectObject`/`DeleteObject` + EMF stock objects; the drawing records
+`MoveTo`/`LineTo`, `Polyline`/`Polygon`/`PolyPolygon` (+ EMF `*16`),
+`Rectangle`/`RoundRect`/`Ellipse`, `Arc`/`Pie`/`Chord`, `PolyBezier` (EMF —
+flattened by **adaptive de Casteljau** subdivision to a device-pixel chord
+tolerance, so gentle curves stay light while tight ones get the points they
+need), `SetPixel[V]`, `FillRgn`/`PaintRgn` and EMF `ExtSelectClipRgn` / WMF
+`SelectClipRgn` (**the region's full rectangle list** — WMF `META_CREATEREGION`
+scans, EMF `RGNDATA` — is kept, so a region **fills/clips its true union**, not
+just its bounding box), and the DIB blits
 `BitBlt`/`StretchBlt`/`StretchDIBits`/`SetDIBitsToDevice` (with a from-scratch
-DIB/BMP decoder for 1/4/8/24/32-bpp + RLE4/RLE8); the logical→device transform
-`SetWindowOrg`/`Ext` + `SetViewportOrg`/`Ext` + `SetMapMode` and the EMF world
-transform `SetWorldTransform`/`ModifyWorldTransform`, honouring the current
-pen/brush, the fill rule (`SetPolyFillMode`) and the paint state
-(`SetBkMode`/`SetBkColor`/`SetTextColor`/`SetROP2`). `ExtTextOut`/`TextOut`
-render as a reasonable advance/box strip (text is secondary; no font shaping
-here), and genuinely-rare records (palette management, escapes, EMF GDI+ comment
-blocks, ROP2 ops other than copy) are skipped safely. Public API:
-`decode_wmf`/`decode_emf`/`decode_metafile` (sniffing). **Wired into both the RTF
+DIB/BMP decoder for 1/4/8/24/32-bpp + RLE4/RLE8, resampled **nearest or
+bilinear** per `SetStretchBltMode` — `HALFTONE` → bilinear); the logical→device
+transform `SetWindowOrg`/`Ext` + `SetViewportOrg`/`Ext` + `SetMapMode` and the
+EMF world transform `SetWorldTransform`/`ModifyWorldTransform`, honouring the
+current pen/brush, the fill rule (`SetPolyFillMode`), the **binary raster op**
+(`SetROP2` — the 16 mix modes `R2_COPYPEN`/`R2_NOT`/`R2_XORPEN`/`R2_MASKPEN`/
+`R2_NOP`/`R2_BLACK`/`R2_WHITE`/… combine pen/brush colour with the destination
+per pixel, with edge anti-aliasing) and the rest of the paint state
+(`SetBkMode`/`SetBkColor`/`SetTextColor`). `ExtTextOut`/`TextOut` render as a
+reasonable advance/box strip (text is secondary; no font shaping here), and
+genuinely-rare records (palette management, escapes, EMF GDI+ comment blocks) are
+skipped safely. Public API: `decode_wmf`/`decode_emf`/`decode_metafile`
+(sniffing). **Wired into both the RTF
 importer** ([#4](../../issues/4)) — a `{\pict\wmetafile…}`/`{\pict\emfblip…}` is
 rasterized through `decode_wmf`/`decode_emf` and a `{\pict\dibitmap…}`/`{\pict\wbitmap…}`
 through an in-house packed-DIB decoder, each **re-encoded to PNG** via

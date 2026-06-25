@@ -46,32 +46,124 @@ impl Rgba {
     }
 }
 
+// ───────────────────────────── raster op (ROP2) ─────────────────────────────
+
+/// Binary raster operations (`SetROP2` mix modes). GDI combines the *pen/brush*
+/// colour `S` with the existing *destination* colour `D` per pixel; only the
+/// 16 binary ops apply to vector drawing (the ternary ROPs are for BitBlt).
+/// Channels are mixed independently as 8-bit values; `R2_COPYPEN` is the default
+/// "just paint the source" behaviour the rest of this module assumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rop2 {
+    Black,       // R2_BLACK (1): 0
+    NotMergePen, // R2_NOTMERGEPEN (2): !(S | D)
+    MaskNotPen,  // R2_MASKNOTPEN (3): D & !S
+    NotCopyPen,  // R2_NOTCOPYPEN (4): !S
+    MaskPenNot,  // R2_MASKPENNOT (5): S & !D
+    Not,         // R2_NOT (6): !D
+    XorPen,      // R2_XORPEN (7): S ^ D
+    NotMaskPen,  // R2_NOTMASKPEN (8): !(S & D)
+    MaskPen,     // R2_MASKPEN (9): S & D
+    NotXorPen,   // R2_NOTXORPEN (10): !(S ^ D)
+    Nop,         // R2_NOP (11): D
+    MergeNotPen, // R2_MERGENOTPEN (12): D | !S
+    CopyPen,     // R2_COPYPEN (13): S  (default)
+    MergePenNot, // R2_MERGEPENNOT (14): S | !D
+    MergePen,    // R2_MERGEPEN (15): S | D
+    White,       // R2_WHITE (16): 1
+}
+
+impl Rop2 {
+    /// Map a GDI `R2_*` constant (1..=16) to a [`Rop2`]; unknown ⇒ `CopyPen`.
+    pub fn from_u32(v: u32) -> Rop2 {
+        match v {
+            1 => Rop2::Black,
+            2 => Rop2::NotMergePen,
+            3 => Rop2::MaskNotPen,
+            4 => Rop2::NotCopyPen,
+            5 => Rop2::MaskPenNot,
+            6 => Rop2::Not,
+            7 => Rop2::XorPen,
+            8 => Rop2::NotMaskPen,
+            9 => Rop2::MaskPen,
+            10 => Rop2::NotXorPen,
+            11 => Rop2::Nop,
+            12 => Rop2::MergeNotPen,
+            14 => Rop2::MergePenNot,
+            15 => Rop2::MergePen,
+            16 => Rop2::White,
+            _ => Rop2::CopyPen, // 13 and anything unexpected
+        }
+    }
+
+    /// `true` when this op ignores the source entirely (`R2_NOP` leaves the
+    /// destination untouched). Such ops don't anti-alias meaningfully, so the
+    /// rasterizer can short-circuit a `R2_NOP` fill/stroke as a no-op.
+    pub fn is_nop(self) -> bool {
+        matches!(self, Rop2::Nop)
+    }
+
+    /// Combine one 8-bit source channel `s` with the destination channel `d`
+    /// per this binary op (bit-for-bit, as GDI mixes raster ops).
+    fn mix_channel(self, s: u8, d: u8) -> u8 {
+        match self {
+            Rop2::Black => 0,
+            Rop2::NotMergePen => !(s | d),
+            Rop2::MaskNotPen => d & !s,
+            Rop2::NotCopyPen => !s,
+            Rop2::MaskPenNot => s & !d,
+            Rop2::Not => !d,
+            Rop2::XorPen => s ^ d,
+            Rop2::NotMaskPen => !(s & d),
+            Rop2::MaskPen => s & d,
+            Rop2::NotXorPen => !(s ^ d),
+            Rop2::Nop => d,
+            Rop2::MergeNotPen => d | !s,
+            Rop2::CopyPen => s,
+            Rop2::MergePenNot => s | !d,
+            Rop2::MergePen => s | d,
+            Rop2::White => 0xFF,
+        }
+    }
+}
+
 // ───────────────────────────── canvas ─────────────────────────────
 
 /// A transparent RGBA8 framebuffer (row-major, top-to-bottom) with source-over
-/// compositing.
+/// compositing. The active binary raster op (`rop2`) governs how a painted
+/// source colour is mixed into the destination before alpha compositing.
 #[derive(Debug, Clone)]
 pub struct Canvas {
     pub width: u32,
     pub height: u32,
     /// `width*height*4` bytes, RGBA, premultiplied-free straight alpha.
     pub pixels: Vec<u8>,
+    /// The binary raster op applied to vector paint (`SetROP2`).
+    pub rop2: Rop2,
 }
 
 impl Canvas {
-    /// A fully transparent canvas of `width` × `height`.
+    /// A fully transparent canvas of `width` × `height` (default `R2_COPYPEN`).
     pub fn new(width: u32, height: u32) -> Canvas {
         Canvas {
             width,
             height,
             pixels: vec![0u8; (width as usize) * (height as usize) * 4],
+            rop2: Rop2::CopyPen,
         }
     }
 
     /// Composite straight-alpha `src` over pixel `(x, y)` scaled by coverage
-    /// `cov` (`0.0..=1.0`). Out-of-bounds and zero-coverage are no-ops.
+    /// `cov` (`0.0..=1.0`). Out-of-bounds and zero-coverage are no-ops. When the
+    /// active `rop2` is not the default `R2_COPYPEN`, the source RGB is first
+    /// mixed with the existing destination RGB through the raster op, and the
+    /// result is composited at the source's alpha·coverage (so `R2_NOT` /
+    /// `R2_XORPEN` / … draw their mixed colour with proper edge anti-aliasing).
     pub fn blend(&mut self, x: i32, y: i32, src: Rgba, cov: f64) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        if self.rop2.is_nop() {
             return;
         }
         let sa = (src.a as f64 / 255.0) * cov.clamp(0.0, 1.0);
@@ -79,6 +171,18 @@ impl Canvas {
             return;
         }
         let idx = ((y as usize) * (self.width as usize) + x as usize) * 4;
+        // Apply the binary raster op to the RGB channels against the current
+        // destination, yielding the effective source colour for this pixel.
+        let src = if self.rop2 == Rop2::CopyPen {
+            src
+        } else {
+            Rgba {
+                r: self.rop2.mix_channel(src.r, self.pixels[idx]),
+                g: self.rop2.mix_channel(src.g, self.pixels[idx + 1]),
+                b: self.rop2.mix_channel(src.b, self.pixels[idx + 2]),
+                a: src.a,
+            }
+        };
         let da = self.pixels[idx + 3] as f64 / 255.0;
         let out_a = sa + da * (1.0 - sa);
         if out_a <= 0.0 {
@@ -172,6 +276,172 @@ pub fn fill_polygons(
             canvas.blend(px, py, color, cov);
         },
     );
+}
+
+/// A polygon interior as a per-pixel coverage mask over its device bounding box.
+/// Used to clip hatch lines and pattern tiles to the exact shape outline.
+struct PolyMask {
+    x0: i32,
+    y0: i32,
+    w: usize,
+    h: usize,
+    cov: Vec<f64>,
+}
+
+impl PolyMask {
+    /// Coverage `0.0..=1.0` at device pixel `(px, py)`, `0.0` outside the box.
+    fn coverage(&self, px: i32, py: i32) -> f64 {
+        if px < self.x0 || py < self.y0 {
+            return 0.0;
+        }
+        let ix = (px - self.x0) as usize;
+        let iy = (py - self.y0) as usize;
+        if ix >= self.w || iy >= self.h {
+            return 0.0;
+        }
+        self.cov[iy * self.w + ix]
+    }
+}
+
+/// Build the interior coverage mask of `polys` (device pixels) under the GDI
+/// fill rule, bounded to `width`×`height`. Returns `None` when the polygons
+/// don't cover any pixel.
+fn build_poly_mask(polys: &[Vec<Pt>], width: u32, height: u32, alternate: bool) -> Option<PolyMask> {
+    let mut edges: Vec<Edge> = Vec::new();
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for poly in polys {
+        if poly.len() < 2 {
+            continue;
+        }
+        for i in 0..poly.len() {
+            let a = poly[i];
+            let b = poly[(i + 1) % poly.len()];
+            edges.push(Edge {
+                x0: a.x,
+                y0: a.y,
+                x1: b.x,
+                y1: b.y,
+            });
+            min_x = min_x.min(a.x);
+            min_y = min_y.min(a.y);
+            max_x = max_x.max(a.x);
+            max_y = max_y.max(a.y);
+        }
+    }
+    if edges.is_empty() || !min_x.is_finite() {
+        return None;
+    }
+    let x0 = (min_x.floor().max(0.0)) as i32;
+    let y0 = (min_y.floor().max(0.0)) as i32;
+    let x1 = (max_x.ceil().min(width as f64)) as i32;
+    let y1 = (max_y.ceil().min(height as f64)) as i32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let w = (x1 - x0) as usize;
+    let h = (y1 - y0) as usize;
+    let mut cov = vec![0.0f64; w * h];
+    rasterize_coverage(&edges, width, height, alternate, &mut |px, py, c| {
+        let ix = px - x0;
+        let iy = py - y0;
+        if ix >= 0 && iy >= 0 && (ix as usize) < w && (iy as usize) < h {
+            cov[(iy as usize) * w + ix as usize] = c;
+        }
+    });
+    Some(PolyMask { x0, y0, w, h, cov })
+}
+
+/// Fill `polys` with a GDI hatch brush: the shape interior stays transparent and
+/// the `HS_*` line pattern is painted in `color`, clipped to the shape's
+/// coverage mask (anti-aliased where the pattern meets the outline). The hatch
+/// pitch and line thickness are fixed device-pixel cosmetics matching GDI's look.
+fn fill_hatch(
+    canvas: &mut Canvas,
+    polys: &[Vec<Pt>],
+    color: Rgba,
+    hatch: HatchStyle,
+    alternate: bool,
+    clip: Option<&ClipRect>,
+) {
+    if color.a == 0 {
+        return;
+    }
+    let Some(mask) = build_poly_mask(polys, canvas.width, canvas.height, alternate) else {
+        return;
+    };
+    // Pitch: 8 device px between lines, ~1 px line — the classic GDI hatch.
+    const PITCH: i32 = 8;
+    let x0 = mask.x0;
+    let y0 = mask.y0;
+    let x1 = x0 + mask.w as i32;
+    let y1 = y0 + mask.h as i32;
+    let horiz = matches!(hatch, HatchStyle::Horizontal | HatchStyle::Cross);
+    let vert = matches!(hatch, HatchStyle::Vertical | HatchStyle::Cross);
+    let fdiag = matches!(hatch, HatchStyle::FDiagonal | HatchStyle::DiagCross);
+    let bdiag = matches!(hatch, HatchStyle::BDiagonal | HatchStyle::DiagCross);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            // A pixel lies on the hatch when it sits on any enabled line family.
+            let on_line = (horiz && py.rem_euclid(PITCH) == 0)
+                || (vert && px.rem_euclid(PITCH) == 0)
+                || (fdiag && (px - py).rem_euclid(PITCH) == 0) // "╲"
+                || (bdiag && (px + py).rem_euclid(PITCH) == 0); // "╱"
+            if !on_line {
+                continue;
+            }
+            let cov = mask.coverage(px, py);
+            if cov <= 0.0 {
+                continue;
+            }
+            if let Some(c) = clip {
+                if !c.contains(px, py) {
+                    continue;
+                }
+            }
+            canvas.blend(px, py, color, cov);
+        }
+    }
+}
+
+/// Fill `polys` with a GDI pattern brush: the decoded `tile` DIB is tiled across
+/// the shape interior (origin at the device 0,0 grid), clipped to the shape's
+/// coverage mask. Each source texel composites at the mask coverage so the
+/// pattern's edge follows the outline.
+fn fill_pattern(
+    canvas: &mut Canvas,
+    polys: &[Vec<Pt>],
+    tile: &Dib,
+    alternate: bool,
+    clip: Option<&ClipRect>,
+) {
+    if tile.width == 0 || tile.height == 0 {
+        return;
+    }
+    let Some(mask) = build_poly_mask(polys, canvas.width, canvas.height, alternate) else {
+        return;
+    };
+    let x0 = mask.x0;
+    let y0 = mask.y0;
+    let x1 = x0 + mask.w as i32;
+    let y1 = y0 + mask.h as i32;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let cov = mask.coverage(px, py);
+            if cov <= 0.0 {
+                continue;
+            }
+            if let Some(c) = clip {
+                if !c.contains(px, py) {
+                    continue;
+                }
+            }
+            // Tile the pattern against the device-pixel origin.
+            let sx = px.rem_euclid(tile.width as i32) as u32;
+            let sy = py.rem_euclid(tile.height as i32) as u32;
+            canvas.blend(px, py, tile.at(sx, sy), cov);
+        }
+    }
 }
 
 /// Scanline coverage of `edges` → `emit(px, py, coverage)` per touched pixel.
@@ -534,8 +804,10 @@ impl Pen {
     }
 }
 
-/// Brush fill styles (`BS_*` / `HS_*`). Pattern/hatch brushes are approximated by
-/// their solid colour (a faithful enough fill for import).
+/// Brush fill styles (`BS_*`). `Hatched` carries one of the six `HS_*` line
+/// patterns (painted as a real scanline overlay); `Pattern` carries an optional
+/// decoded DIB tiled across the fill (falling back to a mid-grey solid when the
+/// pattern bits couldn't be decoded).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrushStyle {
     Solid,
@@ -544,25 +816,88 @@ pub enum BrushStyle {
     Pattern,
 }
 
-/// A GDI brush: style + colour.
-#[derive(Debug, Clone, Copy)]
+/// The six GDI hatch line patterns (`HS_*`), drawn as a thin-line overlay in the
+/// brush colour over the (transparent) shape interior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HatchStyle {
+    Horizontal, // HS_HORIZONTAL (0): ─────
+    Vertical,   // HS_VERTICAL (1):   │││││
+    FDiagonal,  // HS_FDIAGONAL (2):  ╲╲╲╲╲ (top-left → bottom-right)
+    BDiagonal,  // HS_BDIAGONAL (3):  ╱╱╱╱╱ (bottom-left → top-right)
+    Cross,      // HS_CROSS (4):      ┼┼┼┼┼
+    DiagCross,  // HS_DIAGCROSS (5):  ╳╳╳╳╳
+}
+
+impl HatchStyle {
+    /// Map a GDI `HS_*` constant to a [`HatchStyle`]; unknown ⇒ `Horizontal`.
+    pub fn from_u32(v: u32) -> HatchStyle {
+        match v {
+            0 => HatchStyle::Horizontal,
+            1 => HatchStyle::Vertical,
+            2 => HatchStyle::FDiagonal,
+            3 => HatchStyle::BDiagonal,
+            4 => HatchStyle::Cross,
+            5 => HatchStyle::DiagCross,
+            _ => HatchStyle::Horizontal,
+        }
+    }
+}
+
+/// A GDI brush: style + colour, with the hatch pattern (for `Hatched`) and an
+/// optional decoded tile (for `Pattern`). Cloneable but not `Copy` because the
+/// pattern tile owns a pixel buffer.
+#[derive(Debug, Clone)]
 pub struct Brush {
     pub style: BrushStyle,
     pub color: Rgba,
+    /// The `HS_*` line pattern when `style == Hatched`.
+    pub hatch: HatchStyle,
+    /// The decoded pattern tile when `style == Pattern` and the DIB was readable.
+    pub pattern: Option<Dib>,
 }
 
 impl Brush {
-    pub fn white() -> Brush {
+    /// A solid brush of `color`.
+    pub fn solid(color: Rgba) -> Brush {
         Brush {
             style: BrushStyle::Solid,
-            color: Rgba::rgb(255, 255, 255),
+            color,
+            hatch: HatchStyle::Horizontal,
+            pattern: None,
         }
+    }
+
+    /// A hatched brush of `color` with line pattern `hatch`.
+    pub fn hatched(color: Rgba, hatch: HatchStyle) -> Brush {
+        Brush {
+            style: BrushStyle::Hatched,
+            color,
+            hatch,
+            pattern: None,
+        }
+    }
+
+    /// A pattern brush from a decoded tile (or a mid-grey solid fallback when
+    /// `tile` is `None`).
+    pub fn pattern(tile: Option<Dib>) -> Brush {
+        Brush {
+            style: BrushStyle::Pattern,
+            color: Rgba::rgb(128, 128, 128),
+            hatch: HatchStyle::Horizontal,
+            pattern: tile,
+        }
+    }
+
+    pub fn white() -> Brush {
+        Brush::solid(Rgba::rgb(255, 255, 255))
     }
 
     pub fn null() -> Brush {
         Brush {
             style: BrushStyle::Null,
             color: Rgba::TRANSPARENT,
+            hatch: HatchStyle::Horizontal,
+            pattern: None,
         }
     }
 }
@@ -598,8 +933,10 @@ pub enum GdiObject {
     Pen(Pen),
     Brush(Brush),
     Font(Font),
-    /// A region reduced to its bounding rectangle (logical units).
-    Region(LogRect),
+    /// A region as its full list of disjoint rectangles (logical units). A
+    /// simple region is one rectangle; a complex region keeps every scan
+    /// rectangle so its **union** (not just the bounding box) can be filled.
+    Region(Vec<LogRect>),
     /// An empty/placeholder slot (after delete, or a kind we don't model).
     Empty,
 }
@@ -611,6 +948,46 @@ pub struct LogRect {
     pub top: f64,
     pub right: f64,
     pub bottom: f64,
+}
+
+impl LogRect {
+    /// The smallest rectangle covering both `self` and `other`.
+    pub fn union(&self, other: &LogRect) -> LogRect {
+        LogRect {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+}
+
+/// The bounding rectangle of a list of region rectangles (logical units), or
+/// `None` for an empty region.
+pub fn region_bbox(rects: &[LogRect]) -> Option<LogRect> {
+    let mut it = rects.iter();
+    let first = *it.next()?;
+    Some(it.fold(first, |acc, r| acc.union(r)))
+}
+
+/// DIB stretch interpolation (`SetStretchBltMode`): `Nearest` for the COLORONCOLOR
+/// / "delete excess lines" modes, `Bilinear` for HALFTONE (smooth resampling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StretchMode {
+    Nearest,
+    Bilinear,
+}
+
+impl StretchMode {
+    /// Map a GDI `SetStretchBltMode` constant to a [`StretchMode`]:
+    /// `BLACKONWHITE`/`WHITEONBLACK`/`COLORONCOLOR` (1/2/3) → nearest;
+    /// `HALFTONE` (4) → bilinear; unknown ⇒ nearest.
+    pub fn from_u32(v: u32) -> StretchMode {
+        match v {
+            4 => StretchMode::Bilinear, // HALFTONE / STRETCH_HALFTONE
+            _ => StretchMode::Nearest,
+        }
+    }
 }
 
 // ───────────────────────────── transform ─────────────────────────────
@@ -697,6 +1074,8 @@ pub struct Gdi {
     pub bk_opaque: bool,
     pub poly_fill_alternate: bool,
     pub clip: Option<ClipRect>,
+    /// DIB stretch interpolation (`SetStretchBltMode`).
+    pub stretch_mode: StretchMode,
 }
 
 impl Gdi {
@@ -722,6 +1101,7 @@ impl Gdi {
             bk_opaque: true,
             poly_fill_alternate: true,
             clip: None,
+            stretch_mode: StretchMode::Nearest,
         }
     }
 
@@ -795,19 +1175,50 @@ impl Gdi {
         }
     }
 
+    /// Set the active clip rectangle to the device-space bounds of a **logical**
+    /// rectangle, mapped through the current transform. GDI `SelectClipRgn` /
+    /// `ExtSelectClipRgn` with `RGN_COPY`: the new clip *replaces* any prior clip.
+    /// All four logical corners are transformed so a rotated/flipped world
+    /// transform still yields a correct axis-aligned device clip. A `None`
+    /// rectangle clears the clip (no clipping).
+    pub fn set_clip_logrect(&mut self, rect: Option<LogRect>) {
+        self.clip = rect.map(|r| self.logrect_to_cliprect(r));
+    }
+
+    /// Map a logical rectangle to a device-pixel [`ClipRect`] (axis-aligned
+    /// bounds of its four transformed corners), clamped to the canvas.
+    pub fn logrect_to_cliprect(&self, r: LogRect) -> ClipRect {
+        let corners = [
+            self.to_device(r.left, r.top),
+            self.to_device(r.right, r.top),
+            self.to_device(r.right, r.bottom),
+            self.to_device(r.left, r.bottom),
+        ];
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for c in corners {
+            min_x = min_x.min(c.x);
+            min_y = min_y.min(c.y);
+            max_x = max_x.max(c.x);
+            max_y = max_y.max(c.y);
+        }
+        let cw = self.canvas.width as i32;
+        let ch = self.canvas.height as i32;
+        ClipRect {
+            left: (min_x.floor() as i32).clamp(0, cw),
+            top: (min_y.floor() as i32).clamp(0, ch),
+            right: (max_x.ceil() as i32).clamp(0, cw),
+            bottom: (max_y.ceil() as i32).clamp(0, ch),
+        }
+    }
+
     /// Fill `polys` (logical) with the current brush, then stroke their outline
     /// with the current pen — the shape primitive shared by Rectangle / Ellipse /
     /// Polygon / Pie / Chord.
     pub fn fill_and_stroke(&mut self, polys: &[Vec<Pt>]) {
-        if self.cur_brush.style != BrushStyle::Null {
-            fill_polygons(
-                &mut self.canvas,
-                polys,
-                self.cur_brush.color,
-                self.poly_fill_alternate,
-                self.clip.as_ref(),
-            );
-        }
+        self.fill_with_current_brush(polys);
         if self.cur_pen.style != PenStyle::Null {
             let w = self.pen_device_width();
             let dash = self.cur_pen.style.dash_pattern(w);
@@ -821,6 +1232,54 @@ impl Gdi {
                     true,
                     self.clip.as_ref(),
                 );
+            }
+        }
+    }
+
+    /// Fill `polys` (device pixels) with the current brush, honouring its style:
+    /// solid → flat colour; hatched → the `HS_*` line overlay; pattern → the
+    /// tiled DIB (mid-grey fallback). `Null` paints nothing.
+    pub fn fill_with_current_brush(&mut self, polys: &[Vec<Pt>]) {
+        match self.cur_brush.style {
+            BrushStyle::Null => {}
+            BrushStyle::Solid => fill_polygons(
+                &mut self.canvas,
+                polys,
+                self.cur_brush.color,
+                self.poly_fill_alternate,
+                self.clip.as_ref(),
+            ),
+            BrushStyle::Hatched => {
+                let color = self.cur_brush.color;
+                let hatch = self.cur_brush.hatch;
+                fill_hatch(
+                    &mut self.canvas,
+                    polys,
+                    color,
+                    hatch,
+                    self.poly_fill_alternate,
+                    self.clip.as_ref(),
+                );
+            }
+            BrushStyle::Pattern => {
+                if let Some(tile) = self.cur_brush.pattern.clone() {
+                    fill_pattern(
+                        &mut self.canvas,
+                        polys,
+                        &tile,
+                        self.poly_fill_alternate,
+                        self.clip.as_ref(),
+                    );
+                } else {
+                    // No decodable tile → mid-grey solid (legacy fallback).
+                    fill_polygons(
+                        &mut self.canvas,
+                        polys,
+                        self.cur_brush.color,
+                        self.poly_fill_alternate,
+                        self.clip.as_ref(),
+                    );
+                }
             }
         }
     }
@@ -1022,6 +1481,40 @@ impl Dib {
             g: self.rgba[i + 1],
             b: self.rgba[i + 2],
             a: self.rgba[i + 3],
+        }
+    }
+
+    /// Bilinearly sample the source at continuous coordinates `(u, v)` in texel
+    /// units (texel centres at `+0.5`), clamping to the edge. Used by the
+    /// HALFTONE stretch mode for smooth up/down-scaling.
+    pub fn sample_bilinear(&self, u: f64, v: f64) -> Rgba {
+        if self.width == 0 || self.height == 0 {
+            return Rgba::TRANSPARENT;
+        }
+        // Texel-centre convention: sample point (u,v) sits between integer texels.
+        let fx = (u - 0.5).clamp(0.0, (self.width - 1) as f64);
+        let fy = (v - 0.5).clamp(0.0, (self.height - 1) as f64);
+        let x0 = fx.floor() as u32;
+        let y0 = fy.floor() as u32;
+        let x1 = (x0 + 1).min(self.width - 1);
+        let y1 = (y0 + 1).min(self.height - 1);
+        let tx = fx - x0 as f64;
+        let ty = fy - y0 as f64;
+        let c00 = self.at(x0, y0);
+        let c10 = self.at(x1, y0);
+        let c01 = self.at(x0, y1);
+        let c11 = self.at(x1, y1);
+        let lerp = |a: u8, b: u8, t: f64| a as f64 * (1.0 - t) + b as f64 * t;
+        let mix = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+            let top = lerp(a, b, tx);
+            let bot = lerp(c, d, tx);
+            (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8
+        };
+        Rgba {
+            r: mix(c00.r, c10.r, c01.r, c11.r),
+            g: mix(c00.g, c10.g, c01.g, c11.g),
+            b: mix(c00.b, c10.b, c01.b, c11.b),
+            a: mix(c00.a, c10.a, c01.a, c11.a),
         }
     }
 }
@@ -1277,8 +1770,11 @@ fn decode_rle(
 }
 
 /// Blit a decoded `dib` into the device rectangle `(dx,dy)`–`(dx+dw,dy+dh)`
-/// (device pixels), nearest-neighbour scaled, clipped to the canvas and any
-/// active clip rectangle. Used by all the StretchDIBits/StretchBlt records.
+/// (device pixels), clipped to the canvas and any active clip rectangle. `mode`
+/// selects the resampling kernel — [`StretchMode::Nearest`] (the default
+/// COLORONCOLOR/“delete excess lines” behaviour) or [`StretchMode::Bilinear`]
+/// (HALFTONE smooth scaling, `SetStretchBltMode`). Used by all the
+/// StretchDIBits/StretchBlt records.
 #[allow(clippy::too_many_arguments)]
 pub fn blit_dib(
     canvas: &mut Canvas,
@@ -1288,6 +1784,7 @@ pub fn blit_dib(
     dw: f64,
     dh: f64,
     clip: Option<&ClipRect>,
+    mode: StretchMode,
 ) {
     if dib.width == 0 || dib.height == 0 || dw.abs() < 1e-6 || dh.abs() < 1e-6 {
         return;
@@ -1305,7 +1802,7 @@ pub fn blit_dib(
                     continue;
                 }
             }
-            // Map device pixel back to source texel.
+            // Map device pixel back to normalized source coordinate (0..1).
             let mut u = (px as f64 + 0.5 - dx.min(dx + dw)) / dw.abs();
             let mut v = (py as f64 + 0.5 - dy.min(dy + dh)) / dh.abs();
             if flip_x {
@@ -1317,9 +1814,17 @@ pub fn blit_dib(
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 continue;
             }
-            let sx = (u * dib.width as f64).floor() as u32;
-            let sy = (v * dib.height as f64).floor() as u32;
-            let texel = dib.at(sx.min(dib.width - 1), sy.min(dib.height - 1));
+            let texel = match mode {
+                StretchMode::Nearest => {
+                    let sx = (u * dib.width as f64).floor() as u32;
+                    let sy = (v * dib.height as f64).floor() as u32;
+                    dib.at(sx.min(dib.width - 1), sy.min(dib.height - 1))
+                }
+                StretchMode::Bilinear => {
+                    // Continuous texel coordinate (texel centres at +0.5).
+                    dib.sample_bilinear(u * dib.width as f64, v * dib.height as f64)
+                }
+            };
             canvas.put(px, py, texel);
         }
     }
@@ -1342,4 +1847,277 @@ pub fn rd_u32(b: &[u8], o: usize) -> Option<u32> {
 
 pub fn rd_i32(b: &[u8], o: usize) -> Option<i32> {
     rd_u32(b, o).map(|v| v as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device-space rectangle polygon (CW), for fills/masks in tests.
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<Pt> {
+        vec![
+            Pt { x: x0, y: y0 },
+            Pt { x: x1, y: y0 },
+            Pt { x: x1, y: y1 },
+            Pt { x: x0, y: y1 },
+        ]
+    }
+
+    fn px(c: &Canvas, x: i32, y: i32) -> Rgba {
+        let i = ((y as usize) * (c.width as usize) + x as usize) * 4;
+        Rgba {
+            r: c.pixels[i],
+            g: c.pixels[i + 1],
+            b: c.pixels[i + 2],
+            a: c.pixels[i + 3],
+        }
+    }
+
+    // ── ROP2 (#176/#180) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn rop2_from_u32_maps_known_modes() {
+        assert_eq!(Rop2::from_u32(1), Rop2::Black);
+        assert_eq!(Rop2::from_u32(6), Rop2::Not);
+        assert_eq!(Rop2::from_u32(7), Rop2::XorPen);
+        assert_eq!(Rop2::from_u32(9), Rop2::MaskPen);
+        assert_eq!(Rop2::from_u32(11), Rop2::Nop);
+        assert_eq!(Rop2::from_u32(13), Rop2::CopyPen);
+        assert_eq!(Rop2::from_u32(16), Rop2::White);
+        // Unknown → CopyPen.
+        assert_eq!(Rop2::from_u32(999), Rop2::CopyPen);
+    }
+
+    #[test]
+    fn rop2_black_white_force_constant_colour() {
+        // R2_BLACK paints black regardless of source.
+        let mut c = Canvas::new(4, 4);
+        c.rop2 = Rop2::Black;
+        c.blend(1, 1, Rgba::rgb(200, 100, 50), 1.0);
+        assert_eq!(px(&c, 1, 1), Rgba::rgb(0, 0, 0));
+        // R2_WHITE paints white regardless of source.
+        let mut c = Canvas::new(4, 4);
+        c.rop2 = Rop2::White;
+        c.blend(1, 1, Rgba::rgb(10, 20, 30), 1.0);
+        assert_eq!(px(&c, 1, 1), Rgba::rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn rop2_not_inverts_destination() {
+        // Start with a known opaque destination, then R2_NOT paints !D.
+        let mut c = Canvas::new(2, 2);
+        c.put(0, 0, Rgba::rgb(10, 20, 30));
+        c.rop2 = Rop2::Not;
+        c.blend(0, 0, Rgba::rgb(255, 255, 255), 1.0); // source ignored
+        let got = px(&c, 0, 0);
+        assert_eq!((got.r, got.g, got.b), (245, 235, 225)); // !10,!20,!30
+    }
+
+    #[test]
+    fn rop2_xor_combines_source_and_dest() {
+        let mut c = Canvas::new(2, 2);
+        c.put(0, 0, Rgba::rgb(0xF0, 0x0F, 0xAA));
+        c.rop2 = Rop2::XorPen;
+        c.blend(0, 0, Rgba::rgb(0x0F, 0xF0, 0x55), 1.0);
+        let got = px(&c, 0, 0);
+        assert_eq!((got.r, got.g, got.b), (0xFF, 0xFF, 0xFF));
+    }
+
+    #[test]
+    fn rop2_nop_leaves_pixel_untouched() {
+        let mut c = Canvas::new(2, 2);
+        c.put(0, 0, Rgba::rgb(7, 8, 9));
+        c.rop2 = Rop2::Nop;
+        c.blend(0, 0, Rgba::rgb(255, 0, 0), 1.0);
+        assert_eq!(px(&c, 0, 0), Rgba::rgb(7, 8, 9));
+    }
+
+    #[test]
+    fn rop2_maskpen_ands_channels() {
+        let mut c = Canvas::new(2, 2);
+        c.put(0, 0, Rgba::rgb(0xF0, 0xFF, 0x0F));
+        c.rop2 = Rop2::MaskPen; // S & D
+        c.blend(0, 0, Rgba::rgb(0x3C, 0x0F, 0xFF), 1.0);
+        let got = px(&c, 0, 0);
+        assert_eq!((got.r, got.g, got.b), (0x30, 0x0F, 0x0F));
+    }
+
+    // ── hatch brushes (#177) ─────────────────────────────────────────────────
+
+    #[test]
+    fn hatch_style_from_u32() {
+        assert_eq!(HatchStyle::from_u32(0), HatchStyle::Horizontal);
+        assert_eq!(HatchStyle::from_u32(3), HatchStyle::BDiagonal);
+        assert_eq!(HatchStyle::from_u32(5), HatchStyle::DiagCross);
+        assert_eq!(HatchStyle::from_u32(42), HatchStyle::Horizontal);
+    }
+
+    #[test]
+    fn horizontal_hatch_paints_lines_not_solid() {
+        // 32×32 fill; horizontal hatch should paint rows 0,8,16,24 only.
+        let mut c = Canvas::new(32, 32);
+        fill_hatch(
+            &mut c,
+            &[rect(0.0, 0.0, 32.0, 32.0)],
+            Rgba::rgb(0, 0, 0),
+            HatchStyle::Horizontal,
+            true,
+            None,
+        );
+        // A hatch row is painted.
+        assert!(px(&c, 10, 8).a > 0, "row 8 should carry a hatch line");
+        // A non-hatch row stays transparent (the interior is NOT solid-filled).
+        assert_eq!(px(&c, 10, 4).a, 0, "row 4 between lines must be empty");
+        assert_eq!(px(&c, 10, 12).a, 0, "row 12 between lines must be empty");
+    }
+
+    #[test]
+    fn cross_hatch_paints_both_axes() {
+        let mut c = Canvas::new(24, 24);
+        fill_hatch(
+            &mut c,
+            &[rect(0.0, 0.0, 24.0, 24.0)],
+            Rgba::rgb(0, 0, 0),
+            HatchStyle::Cross,
+            true,
+            None,
+        );
+        assert!(px(&c, 8, 0).a > 0, "vertical line at x=8");
+        assert!(px(&c, 0, 8).a > 0, "horizontal line at y=8");
+        assert_eq!(px(&c, 3, 3).a, 0, "interior between lines empty");
+    }
+
+    #[test]
+    fn hatch_is_clipped_to_polygon() {
+        // A small triangle: hatch must not paint outside it.
+        let mut c = Canvas::new(40, 40);
+        let tri = vec![
+            Pt { x: 0.0, y: 0.0 },
+            Pt { x: 16.0, y: 0.0 },
+            Pt { x: 0.0, y: 16.0 },
+        ];
+        fill_hatch(&mut c, &[tri], Rgba::rgb(0, 0, 0), HatchStyle::Horizontal, true, None);
+        // Far corner outside the triangle: never painted.
+        assert_eq!(px(&c, 39, 39).a, 0, "outside the triangle stays clear");
+    }
+
+    // ── pattern brushes (#177) ───────────────────────────────────────────────
+
+    #[test]
+    fn pattern_brush_tiles_decoded_dib() {
+        // 2×2 tile: TL red, TR green, BL blue, BR white (top-down RGBA).
+        let tile = Dib {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255, // (0,0) red
+                0, 255, 0, 255, // (1,0) green
+                0, 0, 255, 255, // (0,1) blue
+                255, 255, 255, 255, // (1,1) white
+            ],
+        };
+        let mut c = Canvas::new(4, 4);
+        fill_pattern(&mut c, &[rect(0.0, 0.0, 4.0, 4.0)], &tile, true, None);
+        // The pattern tiles against the device origin: (0,0)=red, (1,0)=green,
+        // (0,1)=blue, (2,2)=red again (period 2).
+        assert_eq!(px(&c, 0, 0), Rgba::rgb(255, 0, 0));
+        assert_eq!(px(&c, 1, 0), Rgba::rgb(0, 255, 0));
+        assert_eq!(px(&c, 0, 1), Rgba::rgb(0, 0, 255));
+        assert_eq!(px(&c, 2, 2), Rgba::rgb(255, 0, 0));
+        assert_eq!(px(&c, 3, 3), Rgba::rgb(255, 255, 255));
+    }
+
+    // ── stretch mode / bilinear (#178) ───────────────────────────────────────
+
+    #[test]
+    fn stretch_mode_from_u32() {
+        assert_eq!(StretchMode::from_u32(1), StretchMode::Nearest);
+        assert_eq!(StretchMode::from_u32(3), StretchMode::Nearest);
+        assert_eq!(StretchMode::from_u32(4), StretchMode::Bilinear);
+        assert_eq!(StretchMode::from_u32(7), StretchMode::Nearest);
+    }
+
+    #[test]
+    fn bilinear_blends_between_texels_nearest_does_not() {
+        // 2×1 source: black | white. Upscale 4× wide.
+        let src = Dib {
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+        };
+        // Nearest: a hard step (only 0 or 255 appear).
+        let mut near = Canvas::new(8, 1);
+        blit_dib(&mut near, &src, 0.0, 0.0, 8.0, 1.0, None, StretchMode::Nearest);
+        for x in 0..8 {
+            let v = px(&near, x, 0).r;
+            assert!(v == 0 || v == 255, "nearest must be hard-edged, got {v}");
+        }
+        // Bilinear: intermediate greys appear somewhere across the gradient.
+        let mut bil = Canvas::new(8, 1);
+        blit_dib(&mut bil, &src, 0.0, 0.0, 8.0, 1.0, None, StretchMode::Bilinear);
+        let mid_grey = (0..8).any(|x| {
+            let v = px(&bil, x, 0).r;
+            v > 0 && v < 255
+        });
+        assert!(mid_grey, "bilinear should produce intermediate values");
+    }
+
+    #[test]
+    fn sample_bilinear_clamps_to_edges() {
+        let d = Dib {
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+        };
+        // Far left → first texel (black); far right → last texel (white).
+        assert_eq!(d.sample_bilinear(0.0, 0.5).r, 0);
+        assert_eq!(d.sample_bilinear(2.0, 0.5).r, 255);
+        // Exactly between the two texel centres (x=1.0) → ~mid grey.
+        let mid = d.sample_bilinear(1.0, 0.5).r;
+        assert!((120..=135).contains(&mid), "midpoint grey ~127, got {mid}");
+    }
+
+    // ── region union (#179/#182) ─────────────────────────────────────────────
+
+    #[test]
+    fn logrect_union_and_region_bbox() {
+        let a = LogRect { left: 0.0, top: 0.0, right: 10.0, bottom: 10.0 };
+        let b = LogRect { left: 20.0, top: 5.0, right: 30.0, bottom: 25.0 };
+        let u = a.union(&b);
+        assert_eq!((u.left, u.top, u.right, u.bottom), (0.0, 0.0, 30.0, 25.0));
+        let bbox = region_bbox(&[a, b]).unwrap();
+        assert_eq!((bbox.left, bbox.right, bbox.bottom), (0.0, 30.0, 25.0));
+        assert!(region_bbox(&[]).is_none());
+    }
+
+    #[test]
+    fn region_union_fills_two_disjoint_rects_not_their_bbox() {
+        // Two separated rects: the GAP between them must stay empty (proving we
+        // fill the union, not the bounding box).
+        let mut c = Canvas::new(40, 12);
+        let polys = vec![rect(0.0, 0.0, 10.0, 10.0), rect(30.0, 0.0, 40.0, 10.0)];
+        fill_polygons(&mut c, &polys, Rgba::rgb(0, 0, 0), true, None);
+        assert!(px(&c, 5, 5).a > 0, "left rect filled");
+        assert!(px(&c, 35, 5).a > 0, "right rect filled");
+        assert_eq!(px(&c, 20, 5).a, 0, "gap between rects must be empty");
+    }
+
+    // ── clip rect from logical rect (#175) ───────────────────────────────────
+
+    #[test]
+    fn set_clip_logrect_bounds_paint() {
+        let mut g = Gdi::new(20, 20, Affine::identity());
+        // Clip to the logical rect (4,4)-(12,12); paint a full-canvas rect.
+        g.set_clip_logrect(Some(LogRect { left: 4.0, top: 4.0, right: 12.0, bottom: 12.0 }));
+        let poly = rect(0.0, 0.0, 20.0, 20.0);
+        let color = Rgba::rgb(0, 0, 0);
+        let clip = g.clip;
+        fill_polygons(&mut g.canvas, &[poly], color, true, clip.as_ref());
+        assert!(px(&g.canvas, 8, 8).a > 0, "inside the clip painted");
+        assert_eq!(px(&g.canvas, 1, 1).a, 0, "outside the clip clipped away");
+        assert_eq!(px(&g.canvas, 15, 15).a, 0, "outside the clip clipped away");
+        // Clearing the clip removes the bound.
+        g.set_clip_logrect(None);
+        assert!(g.clip.is_none());
+    }
 }
