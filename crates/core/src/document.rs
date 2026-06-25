@@ -501,6 +501,292 @@ fn count_image_blocks(block: &crate::model::Block) -> usize {
     }
 }
 
+/// Render a reconstructed/imported [`crate::model::Document`] tree to clean plain
+/// text, **preserving semantic structure** the flat PDF-layer extraction loses:
+/// headings/paragraphs become clean lines, lists keep their marker + nesting
+/// indentation, and tables render as aligned columns (see [`table_to_text`]) so a
+/// 2×N table reads as a grid rather than a jumble of reading-order runs.
+///
+/// Reading order is the model's own (sections → pages → blocks, header band then
+/// body then footer band). Top-level blocks are separated by a blank line. Drives
+/// [`Document::to_text`] when the document carries a real structure tree.
+fn text_from_model(model: &crate::model::Document) -> String {
+    let mut out = String::new();
+    for section in &model.sections {
+        if let Some(header) = &section.header {
+            push_blocks(header, 0, &mut out);
+        }
+        for page in &section.pages {
+            push_blocks(&page.blocks, 0, &mut out);
+        }
+        if let Some(footer) = &section.footer {
+            push_blocks(footer, 0, &mut out);
+        }
+    }
+    // One trailing newline, no leading/trailing blank runs.
+    let trimmed = out.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    }
+}
+
+/// Render a flow of top-level blocks, separating each with one blank line, at the
+/// given `indent` (in 2-space levels, for nested list/quote content).
+fn push_blocks(blocks: &[crate::model::Block], indent: usize, out: &mut String) {
+    for block in blocks {
+        let before = out.len();
+        push_block(block, indent, out);
+        // Blank line between non-empty top-level blocks (skip after empties so we
+        // never emit runs of blank lines).
+        if out.len() > before && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+}
+
+/// Render one block at `indent` (2-space levels). Empty-text blocks append
+/// nothing. Shapes/images collapse to a short placeholder so the reader sees a
+/// gap was intentional, not lost text.
+fn push_block(block: &crate::model::Block, indent: usize, out: &mut String) {
+    use crate::model::BlockKind;
+    let pad = "  ".repeat(indent);
+    match &block.kind {
+        BlockKind::Paragraph(p) => push_line(&pad, &inlines_to_text(&p.runs), out),
+        BlockKind::Heading(h) => push_line(&pad, &inlines_to_text(&h.para.runs), out),
+        BlockKind::List(list) => push_list(list, indent, out),
+        BlockKind::Table(table) => {
+            for line in table_to_text(table) {
+                push_line(&pad, &line, out);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            // `> ` prefix on every produced line, content rendered recursively.
+            let mut inner = String::new();
+            push_blocks(&bq.blocks, 0, &mut inner);
+            for line in inner.trim_end_matches('\n').split('\n') {
+                out.push_str(&pad);
+                out.push_str("> ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        BlockKind::CodeBlock(cb) => {
+            // Verbatim: literal newlines preserved, indented as a unit.
+            for line in cb.code.split('\n') {
+                out.push_str(&pad);
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        BlockKind::TextBox(tb) => push_blocks(&tb.blocks, indent, out),
+        BlockKind::Image(img) => {
+            let label = img.alt.as_deref().filter(|s| !s.is_empty());
+            push_line(
+                &pad,
+                &format!(
+                    "[image{}]",
+                    label.map_or(String::new(), |a| format!(": {a}"))
+                ),
+                out,
+            );
+        }
+        BlockKind::Shape(_) => push_line(&pad, "[shape]", out),
+        // Sheet/Slide blocks have their own dedicated exporters; a generic text
+        // dump skips them (they are not part of the prose flow this serves).
+        BlockKind::Sheet(_) | BlockKind::Slide(_) => {}
+        BlockKind::HorizontalRule => push_line(&pad, "---", out),
+    }
+}
+
+/// Append one logical line (`pad` + `text` + `\n`) when `text` is non-empty.
+fn push_line(pad: &str, text: &str, out: &mut String) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    out.push_str(pad);
+    out.push_str(text);
+    out.push('\n');
+}
+
+/// Render a [`crate::model::List`]: one line per item, prefixed by its marker
+/// (`- ` for an unordered list; the ordered marker — `1.`, `a.`, `i.`, … —
+/// numbered per the item's nesting `level`) and indented by depth. An item's own
+/// nested blocks (sub-lists, paragraphs) recurse one level deeper.
+fn push_list(list: &crate::model::List, indent: usize, out: &mut String) {
+    use crate::model::Block;
+    // Ordered lists count independently per nesting level (each new level restarts
+    // at 1, like a real outline). `counters[d]` is the running 1-based index at
+    // depth `d` relative to the list's base level.
+    let base = list.items.first().map_or(0u8, |it| it.level);
+    let mut counters: Vec<usize> = Vec::new();
+    for item in &list.items {
+        let depth = (item.level.saturating_sub(base)) as usize;
+        if counters.len() <= depth {
+            counters.resize(depth + 1, 0);
+        }
+        // Stepping back out to a shallower level restarts the deeper counters.
+        counters.truncate(depth + 1);
+        counters[depth] += 1;
+        let marker = if list.ordered {
+            ordered_marker(list.marker, counters[depth])
+        } else {
+            unordered_marker(list.marker)
+        };
+        let pad = "  ".repeat(indent + depth);
+        // The first paragraph/heading of the item sits on the marker line; any
+        // further blocks (continuation paragraphs, nested lists) flow under it,
+        // one indent level deeper.
+        let mut item_blocks = item.blocks.iter();
+        let lead: Option<&Block> = item_blocks.next();
+        let lead_text = lead.map(block_inline_text).unwrap_or_default();
+        out.push_str(&pad);
+        out.push_str(&marker);
+        out.push(' ');
+        out.push_str(lead_text.trim());
+        out.push('\n');
+        // Remaining blocks of this item, indented under the marker.
+        let rest: Vec<Block> = item_blocks.cloned().collect();
+        if !rest.is_empty() {
+            push_blocks(&rest, indent + depth + 1, out);
+        }
+    }
+}
+
+/// The bullet glyph for an unordered list: the marker's bullet char (defaulting
+/// to a hyphen so the output stays ASCII-portable for non-bullet markers).
+fn unordered_marker(marker: crate::model::ListMarker) -> String {
+    match marker {
+        crate::model::ListMarker::Bullet(c) => {
+            let mut s = String::new();
+            s.push(c);
+            s
+        }
+        _ => "-".to_string(),
+    }
+}
+
+/// The ordinal label (with trailing `.`) for the `n`-th (1-based) item of an
+/// ordered list with the given marker style: decimal, lower/upper alpha
+/// (`a`,`b`,…,`aa`,…) or lower/upper roman. Reuses the document's existing
+/// page-label formatters ([`alpha_label`], [`roman_numeral`]) so the letter/roman
+/// sequences match the rest of the engine.
+fn ordered_marker(marker: crate::model::ListMarker, n: usize) -> String {
+    use crate::model::ListMarker;
+    let v = n.max(1) as u32;
+    let body = match marker {
+        ListMarker::Decimal => v.to_string(),
+        ListMarker::LowerAlpha => alpha_label(v, false),
+        ListMarker::UpperAlpha => alpha_label(v, true),
+        ListMarker::LowerRoman => roman_numeral(v, false),
+        ListMarker::UpperRoman => roman_numeral(v, true),
+        // A bullet marker on an `ordered` list is contradictory; fall back to
+        // decimal so the item still carries a sequential label.
+        ListMarker::Bullet(_) => v.to_string(),
+    };
+    format!("{body}.")
+}
+
+/// Render a [`crate::model::Table`] as aligned columns: each cell becomes a
+/// single line (its block text, inner newlines folded to spaces), every column is
+/// padded to its widest cell, and cells are joined by a ` | ` gutter. The header
+/// row (the table's first row) is included as the first line; one line per row,
+/// in row order. Aligned (not TSV) is chosen for human readability — the columns
+/// line up so the grid is legible in a plain-text viewer.
+///
+/// `col_span`/`row_span` are not expanded into repeated cells (a spanned cell
+/// occupies its single declared slot); empty cells render as blank padding.
+fn table_to_text(table: &crate::model::Table) -> Vec<String> {
+    // Materialize the grid as single-line cell strings.
+    let grid: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .map(|row| row.cells.iter().map(cell_to_line).collect())
+        .collect();
+    let col_count = grid.iter().map(Vec::len).max().unwrap_or(0);
+    if col_count == 0 {
+        return Vec::new();
+    }
+    // Per-column display width = widest cell in that column (char count, so
+    // multibyte text aligns by glyph not by byte).
+    let mut widths = vec![0usize; col_count];
+    for row in &grid {
+        for (c, cell) in row.iter().enumerate() {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+    grid.iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (c, &width) in widths.iter().enumerate() {
+                if c > 0 {
+                    line.push_str(" | ");
+                }
+                let cell = row.get(c).map(String::as_str).unwrap_or("");
+                line.push_str(cell);
+                // Pad every column except the last so trailing cells don't carry
+                // dead whitespace.
+                if c + 1 < col_count {
+                    let gap = width.saturating_sub(cell.chars().count());
+                    line.extend(std::iter::repeat_n(' ', gap));
+                }
+            }
+            line.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// Flatten a table cell to a single line: its blocks' text joined by spaces, all
+/// inner newlines collapsed (cells are single-line in the aligned grid).
+fn cell_to_line(cell: &crate::model::Cell) -> String {
+    let mut s = String::new();
+    push_blocks(&cell.blocks, 0, &mut s);
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The inline text of a block when it is a paragraph/heading (the common
+/// list-item lead); other block kinds contribute their full rendered text folded
+/// to a single line.
+fn block_inline_text(block: &crate::model::Block) -> String {
+    use crate::model::BlockKind;
+    match &block.kind {
+        BlockKind::Paragraph(p) => inlines_to_text(&p.runs),
+        BlockKind::Heading(h) => inlines_to_text(&h.para.runs),
+        _ => {
+            let mut s = String::new();
+            push_block(block, 0, &mut s);
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+    }
+}
+
+/// Concatenate a paragraph's inline runs into plain text: run text verbatim, a
+/// [`crate::model::Inline::LineBreak`] becomes a space (lines are joined for a
+/// single logical paragraph line), an inline image a `[image]` placeholder, and a
+/// link its children's text.
+fn inlines_to_text(runs: &[crate::model::Inline]) -> String {
+    use crate::model::Inline;
+    let mut s = String::new();
+    for run in runs {
+        match run {
+            Inline::Run(r) => s.push_str(&r.text),
+            Inline::LineBreak => s.push(' '),
+            Inline::Image(img) => {
+                s.push_str("[image");
+                if let Some(alt) = img.alt.as_deref().filter(|a| !a.is_empty()) {
+                    s.push_str(": ");
+                    s.push_str(alt);
+                }
+                s.push(']');
+            }
+            Inline::Link { children, .. } => s.push_str(&inlines_to_text(children)),
+        }
+    }
+    s
+}
+
 /// A minimal XMP packet declaring **PDF/UA-1** conformance (ISO 14289-1):
 /// `pdfuaid:part = 1`. Used by [`Document::to_tagged`] when `pdf_ua` is set.
 fn pdf_ua_xmp() -> Vec<u8> {
@@ -8878,9 +9164,26 @@ impl Document {
         matches
     }
 
-    /// Extract the document's text, one run per line, pages separated by a form
-    /// feed (`\x0C`). Font-aware (zero tofu).
+    /// Extract the document's text as clean plain text.
+    ///
+    /// When the document carries a real **structure tree** (`/StructTreeRoot` with
+    /// text-bearing tags — an authored Tagged PDF, or one produced by the Office
+    /// importers / [`to_tagged_pdf`](Self::to_tagged_pdf)), the text is rendered
+    /// from the reconstructed unified model (see [`text_from_model`]) so the
+    /// **semantic structure survives**: paragraphs/headings become clean lines,
+    /// lists keep their marker (`- `, `1.`, `a.`, `i.`…) and nesting indentation,
+    /// tables render as **aligned columns** (one row per line, header included)
+    /// rather than a reading-order run jumble, blockquotes are `> `-prefixed and
+    /// code blocks verbatim. Top-level blocks are blank-line separated; reading
+    /// order is the model's own.
+    ///
+    /// For a **pure-PDF** document with no structure tree, the original PDF-layer
+    /// behaviour is kept: one text run per line, pages separated by a form feed
+    /// (`\x0C`). Both paths are font-aware (zero tofu).
     pub fn to_text(&self) -> String {
+        if self.has_semantic_structure() {
+            return text_from_model(&self.reconstruct_model());
+        }
         let mut out = String::new();
         for page in 1..=self.page_count() as u32 {
             if let Ok(runs) = self.page_text_runs(page) {
@@ -8892,6 +9195,18 @@ impl Document {
             out.push('\u{000C}');
         }
         out
+    }
+
+    /// Whether the document carries a **text-bearing structure tree**
+    /// (`/StructTreeRoot`) — the signal that a real, author-declared (or
+    /// importer-produced) model exists, so [`to_text`](Self::to_text) flattens the
+    /// model tree instead of the raw PDF layer. Mirrors exactly the gate
+    /// [`reconstruct_model`](Self::reconstruct_model) uses to trust the tag tree:
+    /// untagged PDFs (where the model would only be re-derived heuristics) keep the
+    /// PDF-layer fallback.
+    fn has_semantic_structure(&self) -> bool {
+        let mut ids = crate::recon::IdGen::default();
+        crate::recon::tag_tree::reconstruct_from_struct_tree(self, &mut ids).is_some()
     }
 
     /// Convert the document to standalone HTML with absolutely-positioned,
@@ -32747,5 +33062,252 @@ mod tests {
             let lin = doc.to_linearized();
             qpdf_assert_linearized(&lin, &format!("{pages}pages"));
         }
+    }
+
+    // ---- model-tree plain-text extraction (`text_from_model`, #4) -------------
+
+    /// A flow-layout single-page, single-section model wrapping `blocks`.
+    fn model_with_blocks(blocks: Vec<crate::model::Block>) -> crate::model::Document {
+        use crate::model::{geom::PageGeometry, Page, Section};
+        crate::model::Document {
+            sections: vec![Section {
+                geometry: PageGeometry {
+                    width: 612.0,
+                    height: 792.0,
+                    ..PageGeometry::default()
+                },
+                header: None,
+                footer: None,
+                pages: vec![Page {
+                    blocks,
+                    absolute: false,
+                }],
+            }],
+            ..crate::model::Document::default()
+        }
+    }
+
+    /// A paragraph block from one plain text run.
+    fn para_block(text: &str) -> crate::model::Block {
+        use crate::model::{Block, BlockKind, Inline, InlineRun, Paragraph};
+        Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: text.to_string(),
+                    ..InlineRun::default()
+                })],
+                ..Paragraph::default()
+            }),
+            ..Block::default()
+        }
+    }
+
+    /// A table cell holding one text paragraph.
+    fn text_cell(text: &str) -> crate::model::Cell {
+        crate::model::Cell {
+            blocks: vec![para_block(text)],
+            ..crate::model::Cell::default()
+        }
+    }
+
+    #[test]
+    fn text_from_model_table_columns_aligned() {
+        use crate::model::{Block, BlockKind, Row, Table};
+        // 2×2 table: a header row and a body row, with deliberately different
+        // cell widths so column alignment is observable.
+        let table = Table {
+            rows: vec![
+                Row {
+                    cells: vec![text_cell("Name"), text_cell("City")],
+                    height: None,
+                },
+                Row {
+                    cells: vec![text_cell("Alexandra"), text_cell("Lyon")],
+                    height: None,
+                },
+            ],
+            ..Table::default()
+        };
+        let model = model_with_blocks(vec![Block {
+            kind: BlockKind::Table(table),
+            ..Block::default()
+        }]);
+        let text = text_from_model(&model);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one line per row (header included): {text:?}"
+        );
+        // Columns align: the ` | ` gutter sits at the SAME byte offset on both
+        // rows because column 0 is padded to its widest cell ("Alexandra").
+        assert_eq!(
+            lines[0], "Name      | City",
+            "header row padded + gutter-joined: {text:?}"
+        );
+        assert_eq!(
+            lines[1], "Alexandra | Lyon",
+            "body row aligns under the header: {text:?}"
+        );
+        let g0 = lines[0].find('|').unwrap();
+        let g1 = lines[1].find('|').unwrap();
+        assert_eq!(
+            g0, g1,
+            "the column gutter lines up across rows (aligned, not a run jumble)"
+        );
+    }
+
+    #[test]
+    fn text_from_model_nested_ordered_unordered_lists() {
+        use crate::model::{Block, BlockKind, List, ListItem, ListMarker};
+        // An ordered list whose second item nests one deeper. The nested level
+        // restarts its own numbering and is indented under its parent.
+        let list = List {
+            ordered: true,
+            marker: ListMarker::Decimal,
+            items: vec![
+                ListItem {
+                    blocks: vec![para_block("First")],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![para_block("Second")],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![para_block("Nested under second")],
+                    level: 1,
+                },
+            ],
+        };
+        let ordered_text = text_from_model(&model_with_blocks(vec![Block {
+            kind: BlockKind::List(list),
+            ..Block::default()
+        }]));
+        let ol: Vec<&str> = ordered_text.lines().collect();
+        assert_eq!(
+            ol[0], "1. First",
+            "decimal marker, no indent: {ordered_text:?}"
+        );
+        assert_eq!(ol[1], "2. Second", "decimal increments at the same level");
+        assert_eq!(
+            ol[2], "  1. Nested under second",
+            "deeper level is indented 2 spaces AND restarts at 1: {ordered_text:?}"
+        );
+
+        // An unordered list uses its bullet glyph as the marker.
+        let bullets = List {
+            ordered: false,
+            marker: ListMarker::Bullet('•'),
+            items: vec![
+                ListItem {
+                    blocks: vec![para_block("Apple")],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![para_block("Sub")],
+                    level: 1,
+                },
+            ],
+        };
+        let bl_text = text_from_model(&model_with_blocks(vec![Block {
+            kind: BlockKind::List(bullets),
+            ..Block::default()
+        }]));
+        let bl: Vec<&str> = bl_text.lines().collect();
+        assert_eq!(bl[0], "• Apple", "bullet marker prefix: {bl_text:?}");
+        assert_eq!(bl[1], "  • Sub", "nested bullet indented one level");
+    }
+
+    #[test]
+    fn text_from_model_headings_and_paragraphs_clean_lines() {
+        use crate::model::{Block, BlockKind, Heading, Inline, InlineRun, Paragraph};
+        let heading = Block {
+            kind: BlockKind::Heading(Heading {
+                level: 1,
+                para: Paragraph {
+                    runs: vec![Inline::Run(InlineRun {
+                        text: "Chapter One".to_string(),
+                        ..InlineRun::default()
+                    })],
+                    ..Paragraph::default()
+                },
+            }),
+            ..Block::default()
+        };
+        let model = model_with_blocks(vec![
+            heading,
+            para_block("First paragraph body."),
+            para_block("Second paragraph body."),
+        ]);
+        let text = text_from_model(&model);
+        // Each top-level block is a clean line, separated by one blank line, in
+        // reading order.
+        assert_eq!(
+            text, "Chapter One\n\nFirst paragraph body.\n\nSecond paragraph body.\n",
+            "headings + paragraphs as clean blank-line-separated lines: {text:?}"
+        );
+    }
+
+    #[test]
+    fn text_from_model_blockquote_and_code() {
+        use crate::model::{Block, BlockKind, Blockquote, CodeBlock};
+        let quote = Block {
+            kind: BlockKind::Blockquote(Blockquote {
+                blocks: vec![para_block("Quoted wisdom.")],
+            }),
+            ..Block::default()
+        };
+        let code = Block {
+            kind: BlockKind::CodeBlock(CodeBlock {
+                lang: Some("rust".to_string()),
+                code: "let x = 1;\nlet y = 2;".to_string(),
+            }),
+            ..Block::default()
+        };
+        let text = text_from_model(&model_with_blocks(vec![quote, code]));
+        // Blockquote lines are `> `-prefixed; the code block is verbatim with its
+        // internal newline preserved.
+        assert_eq!(
+            text, "> Quoted wisdom.\n\nlet x = 1;\nlet y = 2;\n",
+            "blockquote prefixed + code verbatim: {text:?}"
+        );
+    }
+
+    #[test]
+    fn to_text_pure_pdf_uses_flat_layer() {
+        // A pure-PDF document (no `/StructTreeRoot`) must keep the original
+        // PDF-layer extraction: one run per line, pages closed by a form feed —
+        // the model-tree path must NOT engage when there is no structure tree.
+        let stream = "BT /F1 12 Tf 50 150 Td (HELLO) Tj ET";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{stream}\nendstream", stream.len()),
+            ),
+            (
+                5,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        assert!(!doc.has_semantic_structure(), "no struct tree → flat path");
+        let text = doc.to_text();
+        assert!(
+            text.contains("HELLO"),
+            "flat extraction returns the run: {text:?}"
+        );
+        assert!(
+            text.contains('\u{000C}'),
+            "the pure-PDF path still closes the page with a form feed: {text:?}"
+        );
     }
 }
