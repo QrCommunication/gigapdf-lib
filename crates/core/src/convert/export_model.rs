@@ -4319,7 +4319,13 @@ impl<'a> MdWriter<'a> {
                 out.push_str(&self.image_md(img));
                 out.push_str("\n\n");
             }
-            BlockKind::Shape(_) => {} // no Markdown representation for vector art
+            BlockKind::Shape(shape) => {
+                // GFM permits inline HTML, so the vector geometry is preserved as
+                // a self-contained inline `<svg>` (same mapping as the HTML/EPUB
+                // exporters' `web::html_shape` / `xhtml_shape`) rather than dropped.
+                xhtml_shape(shape, out);
+                out.push_str("\n\n");
+            }
             BlockKind::TextBox(tb) => self.blocks(&tb.blocks, out),
             BlockKind::CodeBlock(cb) => self.code_block(cb, out),
             BlockKind::Blockquote(bq) => self.blockquote(bq, out),
@@ -4778,8 +4784,6 @@ fn styled_run(text: &str, style: &CharStyle) -> String {
         md_escape(core)
     };
 
-    // Markdown has no portable colour; `style.color` is intentionally dropped.
-
     if style.bold && style.italic {
         body = format!("***{}***", body);
     } else if style.bold {
@@ -4793,6 +4797,12 @@ fn styled_run(text: &str, style: &CharStyle) -> String {
     if style.underline {
         // CommonMark has no underline; HTML <u> is the faithful representation.
         body = format!("<u>{}</u>", body);
+    }
+    // CommonMark has no portable colour syntax; GFM permits inline HTML, so a
+    // non-default (non-near-black) run colour is carried by an outer
+    // `<span style="color:#RRGGBB">…</span>` wrapping the emphasised body.
+    if let Some(c) = visible_color(style) {
+        body = format!("<span style=\"color:#{c}\">{body}</span>");
     }
     format!("{lead_ws}{body}{trail_ws}")
 }
@@ -4894,12 +4904,15 @@ fn md_tidy(s: String) -> String {
 /// document's flowing [`Table`]s are used instead, with each cell reduced to its
 /// plain text.
 ///
-/// Multiple sheets/tables are concatenated into a single CSV stream. Each one
-/// is preceded by an RFC-4180-quotable comment row naming it (`# Sheet: <name>`
-/// or `# Table N`) and separated from the previous block by a blank line, so a
-/// human reader can tell the boundaries apart while a lenient parser still sees
-/// well-formed records. A document with neither sheets nor tables yields an
-/// empty string.
+/// RFC 4180 has no multi-sheet concept, so the convention is kept
+/// standard-friendly. A **single** sheet/table emits pure RFC 4180 — just its
+/// records, with no preamble or separator. When there is **more than one**, each
+/// block is introduced by a plain (RFC-4180-quotable) **name row** carrying the
+/// sheet/table name — or `Sheet N` / `Table N` when unnamed — rather than a `#`
+/// comment row (which a strict parser would mis-read as data), and consecutive
+/// blocks are separated by a single blank line. A strict split on the blank line
+/// thus yields one well-formed RFC-4180 block per sheet/table. A document with
+/// neither sheets nor tables yields an empty string.
 pub fn csv_from_model(doc: &Document) -> String {
     let sheets = collect_sheets(doc);
     if !sheets.is_empty() {
@@ -4946,19 +4959,25 @@ fn csv_record(fields: &[String]) -> String {
 }
 
 fn csv_from_sheets(sheets: &[Sheet]) -> String {
+    // A single sheet is emitted as pure RFC 4180 (no name row, no separator);
+    // only with several sheets is a name row needed to tell them apart.
+    let labelled = sheets.len() > 1;
     let mut out = String::new();
     for (i, sheet) in sheets.iter().enumerate() {
         if i > 0 {
             // Blank record separating consecutive sheets.
             out.push_str("\r\n");
         }
-        // A naming comment row; the whole field is quoted if it contains a comma.
-        let label = if sheet.name.is_empty() {
-            format!("# Sheet {}", i + 1)
-        } else {
-            format!("# Sheet: {}", sheet.name)
-        };
-        out.push_str(&csv_record(&[label]));
+        if labelled {
+            // A plain name row (RFC 4180), quoted by `csv_record` if it contains
+            // a comma/quote/newline. Unnamed sheets fall back to `Sheet N`.
+            let name = if sheet.name.is_empty() {
+                format!("Sheet {}", i + 1)
+            } else {
+                sheet.name.clone()
+            };
+            out.push_str(&csv_record(&[name]));
+        }
         for row in &sheet.rows {
             let fields: Vec<String> = row.cells.iter().map(|c| cell_display(&c.value)).collect();
             out.push_str(&csv_record(&fields));
@@ -4968,12 +4987,16 @@ fn csv_from_sheets(sheets: &[Sheet]) -> String {
 }
 
 fn csv_from_tables(tables: &[Table]) -> String {
+    let labelled = tables.len() > 1;
     let mut out = String::new();
     for (i, table) in tables.iter().enumerate() {
         if i > 0 {
             out.push_str("\r\n");
         }
-        out.push_str(&csv_record(&[format!("# Table {}", i + 1)]));
+        if labelled {
+            // A plain name row (RFC 4180); flowing tables are unnamed, so `Table N`.
+            out.push_str(&csv_record(&[format!("Table {}", i + 1)]));
+        }
         for row in &table.rows {
             let fields: Vec<String> = row.cells.iter().map(cell_plain_text).collect();
             out.push_str(&csv_record(&fields));
@@ -8053,15 +8076,16 @@ style:family=\"paragraph\""
         // field stays raw.
         let doc = csv_sheet_doc("", &[&["plain", "a,b", "she said \"hi\"", "line1\nline2"]]);
         let csv = csv_from_model(&doc);
-        // Whole stream: header comment row (no name → "# Sheet 1"), then the one
-        // data record. The embedded LF stays *literal inside the quoted field*
+        // A single sheet emits pure RFC 4180 — no name row / preamble — just the
+        // one data record. The embedded LF stays *literal inside the quoted field*
         // (RFC 4180 §2.6) — it is NOT a record separator — so only the trailing
         // CRLF terminates the record.
         assert_eq!(
             csv,
-            "# Sheet 1\r\nplain,\"a,b\",\"she said \"\"hi\"\"\",\"line1\nline2\"\r\n"
+            "plain,\"a,b\",\"she said \"\"hi\"\"\",\"line1\nline2\"\r\n"
         );
-        // The record-terminating CRLF must be present.
+        // No `#` comment preamble leaked in, and the terminating CRLF is present.
+        assert!(!csv.contains('#'), "no comment row: {csv:?}");
         assert!(csv.ends_with("\r\n"));
     }
 
@@ -8115,9 +8139,11 @@ style:family=\"paragraph\""
             ..Default::default()
         };
         let csv = csv_from_model(&doc);
+        // A single named sheet still emits pure RFC 4180: the name is NOT written
+        // as a preamble (it only appears as a label when several sheets coexist).
         assert_eq!(
-            csv, "# Sheet: Data\r\nLabel,42.5\r\nTRUE,\r\n",
-            "named comment, typed values, trailing empty cell, CRLF"
+            csv, "Label,42.5\r\nTRUE,\r\n",
+            "no preamble, typed values, trailing empty cell, CRLF"
         );
     }
 
@@ -8143,21 +8169,87 @@ style:family=\"paragraph\""
             ..Default::default()
         });
         let csv = csv_from_model(&doc);
+        // Two sheets: each introduced by a *plain* (non-`#`) name row, separated
+        // by one blank line. No comment rows anywhere.
         assert_eq!(
-            csv, "# Sheet: First\r\na,b\r\n\r\n# Sheet: Second\r\nc\r\n",
-            "blank record between sheets, each with a naming comment"
+            csv, "First\r\na,b\r\n\r\nSecond\r\nc\r\n",
+            "plain name rows, blank record between sheets, no `#` comments"
         );
+        assert!(!csv.contains('#'), "no comment row: {csv:?}");
+        // A strict split on the blank line yields two well-formed RFC-4180 blocks
+        // (a name row + its data records each).
+        let blocks: Vec<&str> = csv.split("\r\n\r\n").collect();
+        assert_eq!(blocks.len(), 2, "two blank-line-separated blocks: {csv:?}");
+        assert_eq!(blocks[0], "First\r\na,b");
+        assert_eq!(blocks[1], "Second\r\nc\r\n");
     }
 
     #[test]
     fn csv_falls_back_to_tables_when_no_sheets() {
-        // sample_doc() has no Sheet but a 2×2 table (with a spanning cell).
+        // sample_doc() has no Sheet but a single 2×2 table (with a spanning cell).
+        // A single table → pure RFC 4180, no name row / preamble.
         let csv = csv_from_model(&sample_doc());
-        assert!(csv.starts_with("# Table 1\r\n"), "table-fallback header");
-        assert!(csv.contains("spanning\r\n"), "spanning cell row");
-        assert!(csv.contains("a,b\r\n"), "second table row");
-        // No spreadsheet present, so no sheet comment leaked in.
-        assert!(!csv.contains("# Sheet"));
+        assert_eq!(csv, "spanning\r\na,b\r\n", "single table, no preamble");
+        // No `#` comment row of any kind leaked in.
+        assert!(!csv.contains('#'), "no comment row: {csv:?}");
+    }
+
+    #[test]
+    fn csv_labels_multiple_tables_with_plain_name_rows() {
+        // Two flowing tables in the fallback path → each introduced by a plain
+        // `Table N` name row (no `#`), separated by a blank line.
+        let mk_table = |text: &str| Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![Row {
+                    cells: vec![Cell {
+                        blocks: vec![para(text)],
+                        ..Default::default()
+                    }],
+                    height: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![mk_table("x"), mk_table("y")],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let csv = csv_from_model(&doc);
+        assert_eq!(csv, "Table 1\r\nx\r\n\r\nTable 2\r\ny\r\n");
+        assert!(!csv.contains('#'), "no comment row: {csv:?}");
+    }
+
+    #[test]
+    fn csv_quotes_sheet_name_row_with_comma() {
+        // With several sheets the name row is emitted, and a name containing a
+        // comma is RFC-4180-quoted (still parser-safe, never a `#` comment).
+        let mut doc = csv_sheet_doc("a,b", &[&["1"]]);
+        let second = Sheet {
+            name: "plain".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("2".to_string()),
+                    ..Default::default()
+                }],
+                height: None,
+            }],
+            ..Default::default()
+        };
+        doc.sections[0].pages[0].blocks.push(Block {
+            kind: BlockKind::Sheet(SheetBlock {
+                sheets: vec![second],
+            }),
+            ..Default::default()
+        });
+        let csv = csv_from_model(&doc);
+        assert_eq!(csv, "\"a,b\"\r\n1\r\n\r\nplain\r\n2\r\n");
     }
 
     #[test]
@@ -8667,6 +8759,74 @@ style:family=\"paragraph\""
         assert!(md.contains("***bi***"), "bold+italic: {md}");
         assert!(md.contains("~~s~~"), "strikethrough: {md}");
         assert!(md.contains("`code`"), "monospace → code span: {md}");
+    }
+
+    #[test]
+    fn markdown_wraps_coloured_run_in_inline_html_span() {
+        // A non-default run colour has no portable Markdown form, so GFM inline
+        // HTML carries it: an outer `<span style="color:#RRGGBB">…</span>`
+        // wrapping the (still Markdown) emphasised body.
+        let red_bold = CharStyle {
+            bold: true,
+            color: Some([1.0, 0.0, 0.0]),
+            ..Default::default()
+        };
+        let md = markdown_from_model(&md_doc(vec![md_para(vec![styled("hi", red_bold)])]));
+        assert!(
+            md.contains("<span style=\"color:#FF0000\">**hi**</span>"),
+            "coloured run → span wrapping the bold body: {md}"
+        );
+    }
+
+    #[test]
+    fn markdown_default_black_run_emits_no_colour_span() {
+        // A default/near-black colour is treated as "unset" → plain Markdown, no
+        // inline-HTML span (matches the other model walkers' `visible_color`).
+        let black = CharStyle {
+            color: Some([0.0, 0.0, 0.0]),
+            ..Default::default()
+        };
+        let md = markdown_from_model(&md_doc(vec![md_para(vec![styled("plain", black)])]));
+        assert!(!md.contains("<span"), "no colour span for near-black: {md}");
+        assert!(md.contains("plain"), "text still present: {md}");
+    }
+
+    #[test]
+    fn markdown_emits_shape_as_inline_svg() {
+        // A block-level vector Shape is preserved as a self-contained inline
+        // `<svg>` (GFM inline HTML), not dropped. Geometry mirrors the HTML/EPUB
+        // exporters: viewBox from the path bounds, `<path d>` Y-flipped.
+        let shape = Shape {
+            segments: vec![
+                PathSeg::Move(10.0, 20.0),
+                PathSeg::Line(110.0, 20.0),
+                PathSeg::Line(110.0, 70.0),
+                PathSeg::Line(10.0, 70.0),
+                PathSeg::Close,
+            ],
+            fill: Some([1.0, 0.0, 0.0]),
+            stroke: Some([0.0, 0.0, 1.0]),
+            stroke_width: 2.0,
+            dash: Vec::new(),
+        };
+        let md = markdown_from_model(&md_doc(vec![Block {
+            kind: BlockKind::Shape(shape),
+            ..Default::default()
+        }]));
+        assert!(md.contains("<svg "), "inline svg emitted: {md}");
+        assert!(
+            md.contains("<path d=\"M0 50 L100 50 L100 0 L0 0 Z\""),
+            "path geometry preserved (Y flipped): {md}"
+        );
+        assert!(
+            md.contains("viewBox=\"0 0 100 50\""),
+            "viewBox from bounds: {md}"
+        );
+        assert!(md.contains("fill=\"#FF0000\""), "fill colour: {md}");
+        assert!(
+            md.contains("stroke=\"#0000FF\"") && md.contains("stroke-width=\"2\""),
+            "stroke colour + width: {md}"
+        );
     }
 
     #[test]
