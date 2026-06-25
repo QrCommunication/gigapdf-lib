@@ -835,6 +835,275 @@ fn table_block(table: Table) -> Block {
     }
 }
 
+// ───────────────────────── stroke-font (rotated text paths) ────────────────────
+//
+// `Paragraph` blocks carry a `frame` but the model has no per-paragraph text
+// rotation that the flow exporters honour, so a rotated axis title is drawn as a
+// **vector text path**: each glyph is a handful of polylines on a unit cell that
+// scale, advance along a baseline, and rotate by an arbitrary angle — rendering
+// identically everywhere a `Shape` does. The font is a minimal single-stroke set
+// (uppercase A–Z, 0–9, space, and a few separators) sufficient for axis titles
+// and ring labels; unknown characters advance as a blank cell.
+
+/// One glyph as a list of polylines (strokes). Each point is on the unit cell
+/// `0.0..=1.0` in X (advance) and Y (baseline at `0`, cap height at `1`).
+type Glyph = &'static [&'static [(f64, f64)]];
+
+/// The advance width of a glyph cell as a fraction of the cap height.
+const GLYPH_ADVANCE: f64 = 0.62;
+/// Extra gap between glyph cells, as a fraction of the cap height.
+const GLYPH_GAP: f64 = 0.16;
+
+/// Strokes for a character (uppercased). Unknown ⇒ an empty glyph (blank cell).
+fn glyph(c: char) -> Glyph {
+    match c.to_ascii_uppercase() {
+        'A' => &[
+            &[(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)],
+            &[(0.18, 0.36), (0.82, 0.36)],
+        ],
+        'B' => &[
+            &[
+                (0.0, 0.0),
+                (0.0, 1.0),
+                (0.7, 1.0),
+                (0.9, 0.82),
+                (0.7, 0.5),
+                (0.0, 0.5),
+            ],
+            &[(0.7, 0.5), (0.95, 0.28), (0.7, 0.0), (0.0, 0.0)],
+        ],
+        'C' => &[&[(1.0, 0.85), (0.5, 1.0), (0.0, 0.5), (0.5, 0.0), (1.0, 0.15)]],
+        'D' => &[&[
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (0.6, 1.0),
+            (1.0, 0.5),
+            (0.6, 0.0),
+            (0.0, 0.0),
+        ]],
+        'E' => &[
+            &[(1.0, 1.0), (0.0, 1.0), (0.0, 0.0), (1.0, 0.0)],
+            &[(0.0, 0.5), (0.75, 0.5)],
+        ],
+        'F' => &[
+            &[(1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+            &[(0.0, 0.5), (0.75, 0.5)],
+        ],
+        'G' => &[&[
+            (1.0, 0.85),
+            (0.5, 1.0),
+            (0.0, 0.5),
+            (0.5, 0.0),
+            (1.0, 0.15),
+            (1.0, 0.45),
+            (0.6, 0.45),
+        ]],
+        'H' => &[
+            &[(0.0, 1.0), (0.0, 0.0)],
+            &[(1.0, 1.0), (1.0, 0.0)],
+            &[(0.0, 0.5), (1.0, 0.5)],
+        ],
+        'I' => &[
+            &[(0.5, 0.0), (0.5, 1.0)],
+            &[(0.2, 1.0), (0.8, 1.0)],
+            &[(0.2, 0.0), (0.8, 0.0)],
+        ],
+        'J' => &[&[(1.0, 1.0), (1.0, 0.2), (0.7, 0.0), (0.3, 0.0), (0.05, 0.25)]],
+        'K' => &[
+            &[(0.0, 1.0), (0.0, 0.0)],
+            &[(1.0, 1.0), (0.0, 0.5), (1.0, 0.0)],
+        ],
+        'L' => &[&[(0.0, 1.0), (0.0, 0.0), (1.0, 0.0)]],
+        'M' => &[&[(0.0, 0.0), (0.0, 1.0), (0.5, 0.4), (1.0, 1.0), (1.0, 0.0)]],
+        'N' => &[&[(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)]],
+        'O' => &[&[(0.5, 1.0), (0.0, 0.5), (0.5, 0.0), (1.0, 0.5), (0.5, 1.0)]],
+        'P' => &[&[
+            (0.0, 0.0),
+            (0.0, 1.0),
+            (0.8, 1.0),
+            (1.0, 0.75),
+            (0.8, 0.5),
+            (0.0, 0.5),
+        ]],
+        'Q' => &[
+            &[(0.5, 1.0), (0.0, 0.5), (0.5, 0.0), (1.0, 0.5), (0.5, 1.0)],
+            &[(0.6, 0.3), (1.0, 0.0)],
+        ],
+        'R' => &[
+            &[
+                (0.0, 0.0),
+                (0.0, 1.0),
+                (0.8, 1.0),
+                (1.0, 0.75),
+                (0.8, 0.5),
+                (0.0, 0.5),
+            ],
+            &[(0.4, 0.5), (1.0, 0.0)],
+        ],
+        'S' => &[&[
+            (1.0, 0.85),
+            (0.5, 1.0),
+            (0.1, 0.78),
+            (0.9, 0.32),
+            (0.5, 0.0),
+            (0.0, 0.15),
+        ]],
+        'T' => &[&[(0.0, 1.0), (1.0, 1.0)], &[(0.5, 1.0), (0.5, 0.0)]],
+        'U' => &[&[(0.0, 1.0), (0.0, 0.2), (0.5, 0.0), (1.0, 0.2), (1.0, 1.0)]],
+        'V' => &[&[(0.0, 1.0), (0.5, 0.0), (1.0, 1.0)]],
+        'W' => &[&[(0.0, 1.0), (0.25, 0.0), (0.5, 0.6), (0.75, 0.0), (1.0, 1.0)]],
+        'X' => &[&[(0.0, 1.0), (1.0, 0.0)], &[(0.0, 0.0), (1.0, 1.0)]],
+        'Y' => &[
+            &[(0.0, 1.0), (0.5, 0.5), (1.0, 1.0)],
+            &[(0.5, 0.5), (0.5, 0.0)],
+        ],
+        'Z' => &[&[(0.0, 1.0), (1.0, 1.0), (0.0, 0.0), (1.0, 0.0)]],
+        '0' => &[
+            &[(0.5, 1.0), (0.0, 0.5), (0.5, 0.0), (1.0, 0.5), (0.5, 1.0)],
+            &[(0.2, 0.2), (0.8, 0.8)],
+        ],
+        '1' => &[
+            &[(0.25, 0.8), (0.5, 1.0), (0.5, 0.0)],
+            &[(0.2, 0.0), (0.8, 0.0)],
+        ],
+        '2' => &[&[(0.0, 0.8), (0.5, 1.0), (0.95, 0.7), (0.0, 0.0), (1.0, 0.0)]],
+        '3' => &[&[
+            (0.0, 0.85),
+            (0.5, 1.0),
+            (0.9, 0.75),
+            (0.5, 0.55),
+            (0.9, 0.25),
+            (0.5, 0.0),
+            (0.0, 0.15),
+        ]],
+        '4' => &[&[(0.75, 0.0), (0.75, 1.0), (0.0, 0.35), (1.0, 0.35)]],
+        '5' => &[&[
+            (1.0, 1.0),
+            (0.1, 1.0),
+            (0.1, 0.55),
+            (0.7, 0.6),
+            (0.95, 0.3),
+            (0.6, 0.0),
+            (0.0, 0.1),
+        ]],
+        '6' => &[&[
+            (0.85, 0.9),
+            (0.4, 1.0),
+            (0.1, 0.55),
+            (0.1, 0.2),
+            (0.5, 0.0),
+            (0.9, 0.2),
+            (0.6, 0.5),
+            (0.1, 0.45),
+        ]],
+        '7' => &[&[(0.0, 1.0), (1.0, 1.0), (0.35, 0.0)]],
+        '8' => &[
+            &[
+                (0.5, 0.55),
+                (0.1, 0.78),
+                (0.5, 1.0),
+                (0.9, 0.78),
+                (0.5, 0.55),
+            ],
+            &[
+                (0.5, 0.55),
+                (0.05, 0.28),
+                (0.5, 0.0),
+                (0.95, 0.28),
+                (0.5, 0.55),
+            ],
+        ],
+        '9' => &[&[
+            (0.9, 0.45),
+            (0.5, 0.55),
+            (0.15, 0.78),
+            (0.5, 1.0),
+            (0.9, 0.78),
+            (0.9, 0.1),
+            (0.4, 0.0),
+        ]],
+        '.' => &[&[
+            (0.4, 0.0),
+            (0.55, 0.0),
+            (0.55, 0.12),
+            (0.4, 0.12),
+            (0.4, 0.0),
+        ]],
+        ',' => &[&[(0.5, 0.12), (0.35, -0.12)]],
+        '-' => &[&[(0.15, 0.5), (0.85, 0.5)]],
+        '/' => &[&[(0.0, 0.0), (1.0, 1.0)]],
+        '(' => &[&[(0.7, 1.0), (0.3, 0.5), (0.7, 0.0)]],
+        ')' => &[&[(0.3, 1.0), (0.7, 0.5), (0.3, 0.0)]],
+        '%' => &[
+            &[(0.0, 0.0), (1.0, 1.0)],
+            &[
+                (0.1, 0.85),
+                (0.3, 0.85),
+                (0.3, 1.0),
+                (0.1, 1.0),
+                (0.1, 0.85),
+            ],
+            &[(0.7, 0.0), (0.9, 0.0), (0.9, 0.15), (0.7, 0.15), (0.7, 0.0)],
+        ],
+        _ => &[],
+    }
+}
+
+/// Render `text` as a baseline of glyph polylines, scaled to cap height `size`,
+/// starting at `(x, y)` (canvas Y-up) and rotated `angle_deg` degrees CCW about
+/// that anchor. Returns one stroked, fill-less [`Shape`] block holding all the
+/// strokes (a `Move` per stroke start, `Line`s along it). Empty when `text` has
+/// no drawable glyphs.
+fn text_path_shape(
+    text: &str,
+    x: f64,
+    y: f64,
+    size: f64,
+    angle_deg: f64,
+    color: [f64; 3],
+) -> Option<Block> {
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    // Map a unit-cell point at pen offset `pen` (along the baseline) to canvas.
+    let place = |pen: f64, gx: f64, gy: f64| -> (f64, f64) {
+        // Local baseline coords (before rotation): X along the text, Y up.
+        let lx = pen + gx * size;
+        let ly = gy * size;
+        (x + lx * cos - ly * sin, y + lx * sin + ly * cos)
+    };
+    let mut segs = Vec::new();
+    let mut pen = 0.0_f64;
+    let advance = GLYPH_ADVANCE * size;
+    let gap = GLYPH_GAP * size;
+    for ch in text.chars() {
+        for stroke in glyph(ch) {
+            for (i, &(gx, gy)) in stroke.iter().enumerate() {
+                let (px, py) = place(pen, gx, gy);
+                if i == 0 {
+                    segs.push(PathSeg::Move(px, py));
+                } else {
+                    segs.push(PathSeg::Line(px, py));
+                }
+            }
+        }
+        pen += advance + gap;
+    }
+    if segs.is_empty() {
+        return None;
+    }
+    Some(shape_block(segs, None, Some(color), (size * 0.09).max(0.4)))
+}
+
+/// The drawn width of `text` at cap height `size` in the stroke font (points).
+fn text_path_width(text: &str, size: f64) -> f64 {
+    let n = text.chars().count();
+    if n == 0 {
+        return 0.0;
+    }
+    let advance = GLYPH_ADVANCE * size;
+    let gap = GLYPH_GAP * size;
+    n as f64 * advance + (n - 1) as f64 * gap
+}
+
 // ──────────────────────────────── chart rendering ─────────────────────────────
 
 /// Render the whole chart into `out`: a title (if any), the axes + grid, the
@@ -912,16 +1181,27 @@ fn draw_value_axis(chart: &Chart, out: &mut Vec<Block>, lo: f64, hi: f64) -> f64
     // Axis lines: left (value) and bottom (category).
     out.push(line_shape(x0, y0, x0, y0 + h, AXIS_RGB, 1.0));
     out.push(line_shape(x0, y0, x0 + w, y0, AXIS_RGB, 1.0));
-    // Value-axis title (rotated text is out of scope; place it at the top-left).
+    // Value-axis title: a text path rotated −90° (reading bottom-to-top) along
+    // the left margin, vertically centred against the plot height.
     if !chart.val_axis_title.is_empty() {
-        out.push(label_block(
+        let size = 8.0;
+        // The rotated baseline runs upward; centre the title over the plot by
+        // starting it half its drawn width below the plot midpoint.
+        let drawn = text_path_width(&chart.val_axis_title, size);
+        let start_y = y0 + (h - drawn) / 2.0;
+        // Anchor near the left edge; the cells extend rightward (−90° ⇒ +X→−Y
+        // local maps to up the page), so place the baseline a touch in from x=0.
+        let anchor_x = 9.0;
+        if let Some(b) = text_path_shape(
             &chart.val_axis_title,
-            2.0,
-            MARGIN_TOP - 12.0,
-            MARGIN_LEFT + 40.0,
-            8.0,
-            Align::Left,
-        ));
+            anchor_x,
+            start_y,
+            size,
+            90.0,
+            AXIS_RGB,
+        ) {
+            out.push(b);
+        }
     }
     map_value_y(0.0_f64.clamp(lo, hi), lo, hi, y0, h)
 }
@@ -986,6 +1266,11 @@ fn render_bars(chart: &Chart, out: &mut Vec<Block>, horizontal: bool) {
         }
         out.push(line_shape(x0, y0, x0, y0 + h, AXIS_RGB, 1.0));
         out.push(line_shape(x0, y0, x0 + w, y0, AXIS_RGB, 1.0));
+        // Horizontal bars: the category axis is the vertical (left) one — its
+        // title is rotated along the left margin; the value axis is the bottom
+        // X axis — its title is centred below the value labels.
+        draw_cat_axis_title(chart, out, true);
+        draw_val_axis_title_below(chart, out);
 
         let slot = h / n_cat as f64;
         let baseline_x = map_value_x(0.0_f64.clamp(lo, hi), lo, hi, x0, w);
@@ -1059,7 +1344,7 @@ fn render_bars(chart: &Chart, out: &mut Vec<Block>, horizontal: bool) {
         // Vertical columns.
         let baseline = draw_value_axis(chart, out, lo, hi);
         draw_category_labels(&cats, out);
-        draw_cat_axis_title(chart, out);
+        draw_cat_axis_title(chart, out, false);
         let slot = w / n_cat as f64;
         for c in 0..n_cat {
             let cx = x0 + slot * c as f64;
@@ -1136,7 +1421,7 @@ fn render_line_or_area(chart: &Chart, out: &mut Vec<Block>, area: bool) {
     let (x0, y0, w, h) = plot_rect();
     let baseline = draw_value_axis(chart, out, lo, hi);
     draw_category_labels(&cats, out);
-    draw_cat_axis_title(chart, out);
+    draw_cat_axis_title(chart, out, false);
 
     let n_cat = chart.cat_count().max(1);
     // Point at the centre of each category slot.
@@ -1206,7 +1491,8 @@ fn render_scatter(chart: &Chart, out: &mut Vec<Block>) {
             yhi = yhi.max(y);
         }
     }
-    if !xlo.is_finite() || !xhi.is_finite() {
+    let has_x = xlo.is_finite() && xhi.is_finite();
+    if !has_x {
         // No explicit X — index the points 1..n.
         xlo = 1.0;
         xhi = chart.cat_count().max(1) as f64;
@@ -1220,37 +1506,58 @@ fn render_scatter(chart: &Chart, out: &mut Vec<Block>) {
 
     // Y grid + labels.
     let _ = draw_value_axis(chart, out, ylo, yhi);
-    // X grid + labels.
-    let xstep = nice_step(xhi - xlo, 5);
-    let start = (xlo / xstep).floor() * xstep;
-    let mut t = start;
-    while t <= xhi + xstep * 0.5 {
-        if t >= xlo - xstep * 0.5 {
-            let vx = map_value_x(t, xlo, xhi, x0, w);
-            out.push(line_shape(vx, y0, vx, y0 + h, GRID_RGB, 0.5));
-            out.push(label_block(
-                &fmt_num(t),
-                vx - 18.0,
-                CHART_H - MARGIN_BOTTOM + 3.0,
-                36.0,
-                8.0,
-                Align::Center,
-            ));
+
+    // X axis. With explicit X values it is a "nice"-stepped numeric value axis.
+    // Without X values but WITH categories, the points are evenly spaced and the
+    // axis shows the category text (not a bare integer index). With neither, fall
+    // back to numeric index ticks.
+    let cats = chart.categories();
+    let cats_no_x = !has_x && !cats.is_empty();
+    if cats_no_x {
+        // Evenly-spaced category labels under the plot (the same slot layout the
+        // markers use, since points without X are placed at indices 1..n which
+        // map across the plot width).
+        draw_category_labels(&cats, out);
+    } else {
+        let xstep = nice_step(xhi - xlo, 5);
+        let start = (xlo / xstep).floor() * xstep;
+        let mut t = start;
+        while t <= xhi + xstep * 0.5 {
+            if t >= xlo - xstep * 0.5 {
+                let vx = map_value_x(t, xlo, xhi, x0, w);
+                out.push(line_shape(vx, y0, vx, y0 + h, GRID_RGB, 0.5));
+                out.push(label_block(
+                    &fmt_num(t),
+                    vx - 18.0,
+                    CHART_H - MARGIN_BOTTOM + 3.0,
+                    36.0,
+                    8.0,
+                    Align::Center,
+                ));
+            }
+            t += xstep;
         }
-        t += xstep;
     }
 
+    // Number of category slots (used to centre points when X is index-based).
+    let n_slot = chart.cat_count().max(1);
+    let slot = w / n_slot as f64;
     for (si, s) in chart.series.iter().enumerate() {
         let color = series_color(si);
         for (i, &y) in s.values.iter().enumerate() {
-            let xv = s.x_values.get(i).copied().unwrap_or((i + 1) as f64);
-            let cx = map_value_x(xv, xlo, xhi, x0, w);
+            let cx = if cats_no_x {
+                // Place at the centre of category slot `i`, matching the labels.
+                x0 + slot * (i as f64 + 0.5)
+            } else {
+                let xv = s.x_values.get(i).copied().unwrap_or((i + 1) as f64);
+                map_value_x(xv, xlo, xhi, x0, w)
+            };
             let cy = map_value_y(y, ylo, yhi, y0, h);
             out.push(marker_shape(cx, cy, 2.5, color));
         }
     }
 
-    draw_legend(chart, out, &chart.categories());
+    draw_legend(chart, out, &cats);
 }
 
 /// Radar renderer: each category is an axis radiating from the centre; each
@@ -1289,9 +1596,16 @@ fn render_radar(chart: &Chart, out: &mut Vec<Block>) {
             ));
         }
     }
-    // Concentric grid rings (a couple of reference levels).
-    for ring in 1..=2 {
-        let rr = radius * ring as f64 / 2.0;
+    // Concentric grid rings at "nice"-stepped value levels (not a hardcoded
+    // 50%/100%). The number of rings follows the data range; the topmost spoke
+    // (index 0, pointing up) is labelled with each ring's value.
+    let step = nice_step(hi, 4);
+    let ring_max = (hi / step).ceil().max(1.0); // how many steps cover `hi`
+    let n_rings = (ring_max as usize).clamp(1, 6);
+    let a0_top = angle(0);
+    for ring in 1..=n_rings {
+        let level = step * ring as f64;
+        let rr = (level / hi).clamp(0.0, 1.0) * radius;
         let mut segs = Vec::with_capacity(n_cat + 1);
         for i in 0..n_cat {
             let a = angle(i);
@@ -1305,6 +1619,17 @@ fn render_radar(chart: &Chart, out: &mut Vec<Block>) {
         }
         segs.push(PathSeg::Close);
         out.push(shape_block(segs, None, Some(GRID_RGB), 0.5));
+        // Ring value label, nudged just to the left of the top spoke.
+        let lx = cx + rr * a0_top.cos();
+        let ly_up = cy + rr * a0_top.sin();
+        out.push(label_block(
+            &fmt_num(level),
+            lx - 30.0,
+            CHART_H - ly_up - 5.0,
+            26.0,
+            7.0,
+            Align::Right,
+        ));
     }
 
     for (si, s) in chart.series.iter().enumerate() {
@@ -1370,6 +1695,23 @@ fn render_pie(chart: &Chart, out: &mut Vec<Block>) {
             0.75,
         ));
         a0 = a1;
+    }
+
+    // Doughnut centre label: when a hole is cut and the chart carries a title,
+    // place it centred in the hole at `(cx, cy)` (the conventional doughnut KPI
+    // label). Solid pies have no hole, so nothing is drawn there.
+    if inner > 0.0 && !chart.title.is_empty() {
+        let size = 9.0;
+        // The hole's inner diameter caps the usable label width.
+        let box_w = (inner * 2.0 - 4.0).max(20.0);
+        out.push(label_block(
+            &chart.title,
+            cx - box_w / 2.0,
+            CHART_H - cy - size * 0.7,
+            box_w,
+            size,
+            Align::Center,
+        ));
     }
 
     // Pie legend lists the categories (each is a slice).
@@ -1445,13 +1787,44 @@ fn lighten(color: [f64; 3], t: f64) -> [f64; 3] {
     ]
 }
 
-/// Place the category-axis title centred below the category labels, if present.
-fn draw_cat_axis_title(chart: &Chart, out: &mut Vec<Block>) {
+/// Place the category-axis title, if present. `vertical` is `true` when the
+/// category axis runs down the **left** of the plot (horizontal-bar charts):
+/// the title is then a text path rotated −90° along the left margin. Otherwise
+/// the category axis is the bottom X axis and the title is centred below the
+/// category labels (column / line / area).
+fn draw_cat_axis_title(chart: &Chart, out: &mut Vec<Block>, vertical: bool) {
     if chart.cat_axis_title.is_empty() {
+        return;
+    }
+    if vertical {
+        let (_x0, y0, _w, h) = plot_rect();
+        let size = 8.0;
+        let drawn = text_path_width(&chart.cat_axis_title, size);
+        let start_y = y0 + (h - drawn) / 2.0;
+        if let Some(b) = text_path_shape(&chart.cat_axis_title, 9.0, start_y, size, 90.0, AXIS_RGB)
+        {
+            out.push(b);
+        }
         return;
     }
     out.push(label_block(
         &chart.cat_axis_title,
+        MARGIN_LEFT,
+        CHART_H - LEGEND_H - 9.0,
+        CHART_W - MARGIN_LEFT - MARGIN_RIGHT,
+        8.0,
+        Align::Center,
+    ));
+}
+
+/// Place the value-axis title centred below the value (X) axis labels — used by
+/// the horizontal-bar chart, whose value axis is the bottom X axis.
+fn draw_val_axis_title_below(chart: &Chart, out: &mut Vec<Block>) {
+    if chart.val_axis_title.is_empty() {
+        return;
+    }
+    out.push(label_block(
+        &chart.val_axis_title,
         MARGIN_LEFT,
         CHART_H - LEGEND_H - 9.0,
         CHART_W - MARGIN_LEFT - MARGIN_RIGHT,
@@ -1486,8 +1859,17 @@ fn draw_legend(chart: &Chart, out: &mut Vec<Block>, _cats: &[String]) {
     draw_legend_items(&labels, out, series_color);
 }
 
-/// Render legend entries (swatch + label) horizontally along the bottom strip.
-/// `color_of(i)` gives entry `i`'s swatch colour.
+/// The minimum width (points) a single legend entry cell may shrink to before
+/// the strip wraps onto another row.
+const LEGEND_MIN_CELL: f64 = 64.0;
+/// The vertical pitch (points) between wrapped legend rows.
+const LEGEND_ROW_PITCH: f64 = 12.0;
+
+/// Render legend entries (swatch + label) along the bottom strip. Entries flow
+/// left-to-right; when fitting them all on one row would shrink each cell below
+/// [`LEGEND_MIN_CELL`], the strip **wraps onto multiple rows** (the first row at
+/// the bottom, later rows stacked above it), growing the legend's height so the
+/// labels stay legible. `color_of(i)` gives entry `i`'s swatch colour.
 fn draw_legend_items(
     labels: &[String],
     out: &mut Vec<Block>,
@@ -1497,14 +1879,22 @@ fn draw_legend_items(
         return;
     }
     let n = labels.len();
-    let cell = (CHART_W - 8.0) / n as f64;
+    let avail = CHART_W - 8.0;
+    // Columns per row: as many as fit at the minimum cell width (≥ 1), capped at
+    // the entry count so a short legend still spreads across the full width.
+    let cols = ((avail / LEGEND_MIN_CELL).floor() as usize).clamp(1, n);
+    let cell = avail / cols as f64;
     let swatch = 8.0;
-    // Legend baseline near the very bottom (Y-up).
-    let y_up = LEGEND_H / 2.0;
-    let y_top = CHART_H - y_up - 5.0;
+    // First (bottom) row sits on the legend baseline; each further row is one
+    // pitch higher (Y-up), so the block stack grows upward into the plot margin.
+    let base_y_up = LEGEND_H / 2.0;
     for (i, label) in labels.iter().enumerate() {
-        let cx = 4.0 + cell * i as f64;
-        // Swatch (Y-up rect centred on the legend line).
+        let col = i % cols;
+        let row = i / cols;
+        let cx = 4.0 + cell * col as f64;
+        let y_up = base_y_up + row as f64 * LEGEND_ROW_PITCH;
+        let y_top = CHART_H - y_up - 5.0;
+        // Swatch (Y-up rect centred on this row's line).
         out.push(rect_shape(
             cx,
             y_up - swatch / 2.0,
@@ -2350,5 +2740,276 @@ mod tests {
         let table = first_table(&blocks).unwrap();
         assert_eq!(table.rows.len(), 3);
         assert_eq!(table.rows[0].cells.len(), 3);
+    }
+
+    /// All paragraph/label texts in document order.
+    fn label_texts(blocks: &[Block]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => {
+                    let mut s = String::new();
+                    for run in &p.runs {
+                        if let Inline::Run(r) = run {
+                            s.push_str(&r.text);
+                        }
+                    }
+                    Some(s)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Count fill-less stroked shapes carrying **≥2** `Move` segments: a glyph
+    /// text path (one `Move` per stroke) — distinct from axis/grid lines and data
+    /// polylines, which all start with exactly one `Move`.
+    fn text_path_shapes(blocks: &[Block]) -> usize {
+        shapes(blocks)
+            .iter()
+            .filter(|s| {
+                s.fill.is_none()
+                    && s.stroke.is_some()
+                    && s.segments
+                        .iter()
+                        .filter(|seg| matches!(seg, PathSeg::Move(..)))
+                        .count()
+                        >= 2
+            })
+            .count()
+    }
+
+    // #109 — the value-axis title is drawn as a rotated text path (a stroked,
+    // fill-less shape with one Move per glyph stroke), not a horizontal label.
+    #[test]
+    fn value_axis_title_renders_as_a_rotated_text_path() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart><c:plotArea>
+    <c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>
+      <c:ser>
+        <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="1"><c:v>B</c:v></c:pt></c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt><c:pt idx="1"><c:v>9</c:v></c:pt></c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:barChart>
+    <c:catAx><c:axId val="1"/></c:catAx>
+    <c:valAx><c:axId val="2"/><c:title><c:tx><c:rich><a:p><a:r><a:t>UNITS</a:t></a:r></a:p></c:rich></c:tx></c:title></c:valAx>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let blocks = parse_chart(xml);
+        assert!(
+            text_path_shapes(&blocks) >= 1,
+            "value-axis title should be a rotated text path, found {} glyph-path shapes",
+            text_path_shapes(&blocks),
+        );
+        // And it is NOT emitted as a plain horizontal "UNITS" paragraph.
+        assert!(
+            !label_texts(&blocks).iter().any(|t| t == "UNITS"),
+            "value-axis title must be a path, not a horizontal label",
+        );
+    }
+
+    // #110 — the category-axis title is placed in BOTH bar and column paths: a
+    // horizontal label below a column chart, a rotated text path beside a bar.
+    #[test]
+    fn category_axis_title_in_both_column_and_bar_paths() {
+        let column = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart><c:plotArea>
+    <c:barChart><c:barDir val="col"/>
+      <c:ser>
+        <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>A</c:v></c:pt><c:pt idx="1"><c:v>B</c:v></c:pt></c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt><c:pt idx="1"><c:v>9</c:v></c:pt></c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:barChart>
+    <c:catAx><c:axId val="1"/><c:title><c:tx><c:rich><a:p><a:r><a:t>Quarter</a:t></a:r></a:p></c:rich></c:tx></c:title></c:catAx>
+    <c:valAx><c:axId val="2"/></c:valAx>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let blocks = parse_chart(column);
+        assert!(
+            label_texts(&blocks).iter().any(|t| t == "Quarter"),
+            "column chart should render the category-axis title below the plot",
+        );
+
+        // The same title on a horizontal bar chart → a rotated text path (the
+        // category axis runs vertically there), so no horizontal "Quarter" label
+        // but a glyph-path shape is present.
+        let bar = column.replace(r#"<c:barDir val="col"/>"#, r#"<c:barDir val="bar"/>"#);
+        let bblocks = parse_chart(&bar);
+        assert!(
+            text_path_shapes(&bblocks) >= 1,
+            "horizontal bar chart should render the category-axis title as a rotated path",
+        );
+    }
+
+    // #111 — the radar grid rings follow `nice_step` (more than the old hardcoded
+    // two) and at least one ring carries a numeric value label.
+    #[test]
+    fn radar_rings_use_nice_step_and_are_labelled() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart><c:plotArea>
+    <c:radarChart>
+      <c:ser>
+        <c:cat><c:strRef><c:strCache>
+          <c:pt idx="0"><c:v>N</c:v></c:pt><c:pt idx="1"><c:v>E</c:v></c:pt>
+          <c:pt idx="2"><c:v>S</c:v></c:pt><c:pt idx="3"><c:v>W</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache>
+          <c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>40</c:v></c:pt>
+          <c:pt idx="2"><c:v>25</c:v></c:pt><c:pt idx="3"><c:v>50</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:radarChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let blocks = parse_chart(xml);
+        // Closed, fill-less, GRID-coloured polygons are the rings. With hi=50 and
+        // nice_step(50, 4) = 20, rings at 20/40/60 → 3 rings (> the old 2).
+        let rings = shapes(&blocks)
+            .iter()
+            .filter(|s| {
+                s.fill.is_none()
+                    && s.stroke == Some(GRID_RGB)
+                    && s.segments.iter().any(|seg| matches!(seg, PathSeg::Close))
+                    && s.segments
+                        .iter()
+                        .filter(|seg| matches!(seg, PathSeg::Line(..)))
+                        .count()
+                        >= 3
+            })
+            .count();
+        assert!(rings >= 3, "expected ≥3 nice-stepped rings, got {rings}");
+        // At least one ring value label (a multiple of the step, e.g. "20").
+        assert!(
+            label_texts(&blocks).iter().any(|t| t == "20"),
+            "a ring level should be labelled along the top spoke",
+        );
+    }
+
+    // #112 — a scatter with categories but no xVal labels the X axis with the
+    // evenly-spaced category text, not bare integer indices.
+    #[test]
+    fn scatter_without_x_values_labels_categories() {
+        let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart><c:plotArea>
+    <c:scatterChart>
+      <c:ser>
+        <c:cat><c:strRef><c:strCache>
+          <c:pt idx="0"><c:v>Alpha</c:v></c:pt>
+          <c:pt idx="1"><c:v>Beta</c:v></c:pt>
+          <c:pt idx="2"><c:v>Gamma</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:yVal><c:numRef><c:numCache>
+          <c:pt idx="0"><c:v>7</c:v></c:pt>
+          <c:pt idx="1"><c:v>3</c:v></c:pt>
+          <c:pt idx="2"><c:v>9</c:v></c:pt>
+        </c:numCache></c:numRef></c:yVal>
+      </c:ser>
+    </c:scatterChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let blocks = parse_chart(xml);
+        let texts = label_texts(&blocks);
+        for want in ["Alpha", "Beta", "Gamma"] {
+            assert!(
+                texts.iter().any(|t| t == want),
+                "scatter without xVal should show category label {want:?}",
+            );
+        }
+    }
+
+    // #113 — a doughnut (a hole + a title) draws a centred label in the hole, so
+    // the title text appears twice (top title + centre), while a solid pie with
+    // the same title draws it only once.
+    #[test]
+    fn doughnut_draws_a_centre_label_from_the_title() {
+        let doughnut = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title><c:tx><c:rich><a:p><a:r><a:t>Share</a:t></a:r></a:p></c:rich></c:tx></c:title>
+    <c:plotArea>
+      <c:doughnutChart>
+        <c:ser>
+          <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>X</c:v></c:pt><c:pt idx="1"><c:v>Y</c:v></c:pt></c:strCache></c:strRef></c:cat>
+          <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>6</c:v></c:pt><c:pt idx="1"><c:v>4</c:v></c:pt></c:numCache></c:numRef></c:val>
+        </c:ser>
+        <c:holeSize val="55"/>
+      </c:doughnutChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+        let dblocks = parse_chart(doughnut);
+        let dcount = label_texts(&dblocks)
+            .iter()
+            .filter(|t| *t == "Share")
+            .count();
+        assert!(
+            dcount >= 2,
+            "doughnut should add a centre label (title at top + centre), got {dcount}",
+        );
+
+        // A solid pie (no hole) draws the title only at the top.
+        let pie = doughnut
+            .replace(r#"<c:doughnutChart>"#, r#"<c:pieChart>"#)
+            .replace(r#"</c:doughnutChart>"#, r#"</c:pieChart>"#)
+            .replace(r#"<c:holeSize val="55"/>"#, "");
+        let pblocks = parse_chart(&pie);
+        let pcount = label_texts(&pblocks)
+            .iter()
+            .filter(|t| *t == "Share")
+            .count();
+        assert_eq!(pcount, 1, "a solid pie draws no centre label");
+    }
+
+    // #114 — a legend with many series wraps onto multiple rows: the swatches are
+    // placed at more than one distinct Y (the strip grew taller).
+    #[test]
+    fn legend_wraps_many_series_onto_multiple_rows() {
+        let mut xml = String::from(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart><c:plotArea><c:barChart><c:barDir val="col"/>"#,
+        );
+        // Twelve named series, each with a single category value.
+        for i in 0..12 {
+            xml.push_str(&format!(
+                r#"<c:ser>
+  <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>SeriesNumber{i}</c:v></c:pt></c:strCache></c:strRef></c:tx>
+  <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>K</c:v></c:pt></c:strCache></c:strRef></c:cat>
+  <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>{}</c:v></c:pt></c:numCache></c:numRef></c:val>
+</c:ser>"#,
+                i + 1
+            ));
+        }
+        xml.push_str(
+            r#"</c:barChart><c:catAx><c:axId val="1"/></c:catAx><c:valAx><c:axId val="2"/></c:valAx></c:plotArea><c:legend/></c:chart></c:chartSpace>"#,
+        );
+        let blocks = parse_chart(&xml);
+        // Legend swatches are the 8×8 filled rects sitting in the bottom strip
+        // (Y-up centre < LEGEND_H, i.e. their top in Y-down terms is large).
+        // Collect distinct frame tops of the small legend labels instead: legend
+        // labels are paragraphs named "SeriesNumberN"; rows differ in frame.y.
+        let mut rows: Vec<i64> = blocks
+            .iter()
+            .filter_map(|b| match (&b.kind, b.frame) {
+                (BlockKind::Paragraph(p), Some(f))
+                    if p.runs.iter().any(|r| {
+                        matches!(r, Inline::Run(ir)
+                        if ir.text.starts_with("SeriesNumber"))
+                    }) =>
+                {
+                    Some((f.y * 10.0).round() as i64)
+                }
+                _ => None,
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        assert!(
+            rows.len() >= 2,
+            "legend with 12 series should wrap onto ≥2 rows, got {} distinct row(s)",
+            rows.len(),
+        );
     }
 }

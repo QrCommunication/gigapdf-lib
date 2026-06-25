@@ -133,16 +133,25 @@ accessible. The renderer covers every type:
 | `c:lineChart` | a polyline path per series + point markers |
 | `c:areaChart` | a filled region per series (lightened fill + outline) |
 | `c:pieChart` / `c:doughnutChart` | arc wedges of the first series (Bézier-approx arcs; doughnut cuts an inner radius from `c:holeSize`) |
-| `c:scatterChart` | point marks at each `(c:xVal, c:yVal)`, both axes value-scaled |
-| `c:radarChart` | a closed polygon per series over per-category spokes + grid rings |
+| `c:scatterChart` | point marks at each `(c:xVal, c:yVal)`, both axes value-scaled; when categories exist but `c:xVal` is absent the points are evenly spaced and the X axis shows the **category labels** (not a bare integer index) |
+| `c:radarChart` | a closed polygon per series over per-category spokes + **"nice"-stepped grid rings** (the ring count/values follow the data range, one spoke labelled with the ring levels) |
 
 The figure also draws the **axes** (axis lines, "nice"-stepped grid lines and
 numeric tick labels derived from the data min/max, with a baseline forced
 through `0`), per-series colours from a default qualitative **palette**, the
 **category labels** under the plot, the chart/axis **titles**, and a **legend**
-strip (series name + colour swatch; a pie's legend lists its slices). Value
-scaling honours the grouping (stacked uses the per-category stack total;
-percent-stacked normalises each category to 100%).
+strip (series name + colour swatch; a pie's legend lists its slices). The
+**value-axis title** is rendered as a text path **rotated −90°** down the left
+margin (a tiny built-in stroke font, since the model carries no per-paragraph
+text rotation the flow exporters honour); the **category-axis title** is placed
+in both bar and column charts — centred below the plot when the category axis is
+the bottom X axis (column / line / area), or rotated along the left margin when
+it runs vertically (horizontal bars). A **doughnut** with a chart title draws a
+**centred label in the hole** (the conventional KPI label). The legend **wraps
+onto multiple rows** when one row would shrink each entry below a minimum cell
+width, growing the legend height. Value scaling honours the grouping (stacked
+uses the per-category stack total; percent-stacked normalises each category to
+100%).
 
 **SmartArt → a nested hierarchy list (+ the laid-out shapes).** The diagram
 **data model** (`dgm:ptLst` node points with their `dgm:t` text, and the
