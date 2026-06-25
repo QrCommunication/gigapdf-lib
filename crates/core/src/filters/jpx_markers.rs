@@ -145,6 +145,11 @@ pub struct Codestream<'a> {
     qcc: Vec<Option<Quantization>>,
     /// ROI shift per component from `RGN` (0 = none).
     rgn: Vec<u8>,
+    /// Concatenated `PPM` packed packet-header payloads from the main header
+    /// (Annex A.7.4): the `Ippm` bytes only, in stream order. Empty when no `PPM`.
+    /// Distributed to tile-parts (that lack their own `PPT`) by the `Nppm` lengths
+    /// embedded in this stream.
+    ppm: Vec<u8>,
     /// Byte offset of the first marker after the main header (`SOT`/`EOC`).
     body_start: usize,
 }
@@ -162,6 +167,7 @@ impl<'a> Codestream<'a> {
         let mut coc: Vec<Option<CodingStyle>> = Vec::new();
         let mut qcc: Vec<Option<Quantization>> = Vec::new();
         let mut rgn: Vec<u8> = Vec::new();
+        let mut ppm: Vec<u8> = Vec::new();
         loop {
             let marker = r.u16()?;
             match marker {
@@ -206,11 +212,13 @@ impl<'a> Codestream<'a> {
                         *slot = shift;
                     }
                 }
-                // Informational / length / packed-header markers in the main
-                // header: read their length and skip the segment. Packed packet
-                // headers (PPM) are not part of the baseline profile; skipping
-                // them falls back to in-bitstream packet headers.
-                POC | TLM | PLM | PPM | CRG | COM => skip_segment(&mut r)?,
+                // PPM (Annex A.7.4): packed packet headers for the whole image.
+                // Append the marker's payload (after the 1-byte `Zppm` index) to
+                // the running PPM stream; it is split per tile-part later.
+                PPM => parse_ppm(&mut r, &mut ppm)?,
+                // Other informational / length markers in the main header: read
+                // their length and skip the segment.
+                POC | TLM | PLM | CRG | COM => skip_segment(&mut r)?,
                 other if (0xFF30..=0xFF3F).contains(&other) => {
                     // Markers with no segment body (reserved/no-data).
                 }
@@ -233,6 +241,7 @@ impl<'a> Codestream<'a> {
             qcd,
             qcc,
             rgn,
+            ppm,
             body_start,
         })
     }
@@ -277,6 +286,9 @@ impl<'a> Codestream<'a> {
         let mut r = Reader::new(self.data);
         r.pos = self.body_start;
         let mut by_index: Vec<TilePart> = Vec::new();
+        // Cursor into the main-header `PPM` stream: each tile-part lacking its own
+        // `PPT` consumes the next `Nppm`-delimited chunk (Annex A.7.4).
+        let mut ppm_cursor = 0usize;
         loop {
             if r.remaining() < 2 {
                 break;
@@ -309,6 +321,8 @@ impl<'a> Codestream<'a> {
             let mut tile_qcd: Option<Quantization> = None;
             let mut tile_coc: Vec<(usize, CodingStyle)> = Vec::new();
             let mut tile_qcc: Vec<(usize, Quantization)> = Vec::new();
+            // Concatenated `PPT` `Ippt` bytes for this tile-part (Annex A.7.5).
+            let mut tile_ppt: Vec<u8> = Vec::new();
             // The SOT marker began 12 bytes back: SOT(2) Lsot(2) Isot(2) Psot(4)
             // TPsot(1) TNsot(1). `Psot` is measured from that marker.
             let sot_pos = r.pos - 12;
@@ -327,7 +341,10 @@ impl<'a> Codestream<'a> {
                         let (idx, q) = parse_qcc(&mut r, self.siz.components.len())?;
                         tile_qcc.push((idx, q));
                     }
-                    RGN | POC | PLT | PPT | COM => skip_segment(&mut r)?,
+                    // PPT (Annex A.7.5): append this segment's `Ippt` payload (after
+                    // the 1-byte `Zppt` index) to the tile-part's packed headers.
+                    PPT => parse_ppt(&mut r, &mut tile_ppt)?,
+                    RGN | POC | PLT | COM => skip_segment(&mut r)?,
                     other => {
                         return Err(EngineError::Filter(format!(
                             "jpx: unexpected tile-part marker 0x{other:04X}"
@@ -350,9 +367,18 @@ impl<'a> Codestream<'a> {
                 .to_vec();
             r.pos = data_end.max(data_start);
 
+            // Packed packet headers for this tile-part: its own `PPT` bytes take
+            // precedence; otherwise consume the next `PPM` chunk (if any).
+            let part_headers = if !tile_ppt.is_empty() {
+                tile_ppt
+            } else {
+                next_ppm_chunk(&self.ppm, &mut ppm_cursor)
+            };
+
             // Merge into the per-tile aggregate (multi-part tiles append bytes).
             if let Some(tp) = by_index.iter_mut().find(|t| t.index == isot) {
                 tp.packets.extend_from_slice(&body);
+                tp.packed_headers.extend_from_slice(&part_headers);
             } else {
                 by_index.push(TilePart {
                     index: isot,
@@ -361,6 +387,7 @@ impl<'a> Codestream<'a> {
                     coc: tile_coc,
                     qcc: tile_qcc,
                     packets: body,
+                    packed_headers: part_headers,
                 });
             }
         }
@@ -413,7 +440,8 @@ impl<'a> Codestream<'a> {
 
         // Tier-2: parse packets into code-block coded segments, then tier-1 +
         // dequant + inverse DWT to recover the spatial samples per component.
-        packet::decode_tile(&mut comps, &tp.packets)?;
+        // `packed_headers` (PPM/PPT), when present, supplies the packet headers.
+        packet::decode_tile(&mut comps, &tp.packets, &tp.packed_headers)?;
         let mut spatial: Vec<Vec<i32>> = Vec::with_capacity(ncomp);
         for tc in &comps {
             spatial.push(dwt::reconstruct(tc)?);
@@ -478,6 +506,9 @@ struct TilePart {
     coc: Vec<(usize, CodingStyle)>,
     qcc: Vec<(usize, Quantization)>,
     packets: Vec<u8>,
+    /// Packed packet headers for this tile (concatenated `PPT` `Ippt` bytes and/or
+    /// the `PPM` chunk(s) assigned to its tile-parts). Empty ⇒ inline headers.
+    packed_headers: Vec<u8>,
 }
 
 /// Resolve component `c`'s coding style for a tile: tile `COC` > tile `COD` >
@@ -765,6 +796,53 @@ fn skip_segment(r: &mut Reader) -> Result<()> {
     r.skip(len - 2)
 }
 
+/// Parse a `PPM` marker segment (Annex A.7.4): `Lppm`(2) `Zppm`(1) then the
+/// `Nppm`/`Ippm` packed-header data. The data (everything after `Zppm`) is
+/// appended verbatim to `ppm`; the `Nppm` lengths embedded in it split the stream
+/// per tile-part when it is later consumed by [`next_ppm_chunk`].
+fn parse_ppm(r: &mut Reader, ppm: &mut Vec<u8>) -> Result<()> {
+    let len = r.u16()? as usize;
+    if len < 3 {
+        return Err(EngineError::Filter("jpx: bad PPM segment length".into()));
+    }
+    let _zppm = r.u8()?; // segment index (ordering only; segments are contiguous)
+    let payload = r.bytes(len - 3)?;
+    ppm.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Parse a `PPT` marker segment (Annex A.7.5): `Lppt`(2) `Zppt`(1) `Ippt[…]`. The
+/// `Ippt` packet-header bytes (everything after `Zppt`) are appended to `out`.
+fn parse_ppt(r: &mut Reader, out: &mut Vec<u8>) -> Result<()> {
+    let len = r.u16()? as usize;
+    if len < 3 {
+        return Err(EngineError::Filter("jpx: bad PPT segment length".into()));
+    }
+    let _zppt = r.u8()?; // segment index within the tile-part
+    let payload = r.bytes(len - 3)?;
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Consume the next tile-part's packet-header chunk from a concatenated `PPM`
+/// stream (Annex A.7.4): a 4-byte `Nppm` length followed by `Nppm` bytes of
+/// `Ippm` packet headers. Advances `cursor`. Returns an empty buffer once the
+/// stream is exhausted or malformed (so tile-parts beyond the `PPM` data fall
+/// back to inline headers).
+fn next_ppm_chunk(ppm: &[u8], cursor: &mut usize) -> Vec<u8> {
+    let start = *cursor;
+    if start + 4 > ppm.len() {
+        *cursor = ppm.len();
+        return Vec::new();
+    }
+    let nppm =
+        u32::from_be_bytes([ppm[start], ppm[start + 1], ppm[start + 2], ppm[start + 3]]) as usize;
+    let data_start = start + 4;
+    let data_end = data_start.saturating_add(nppm).min(ppm.len());
+    *cursor = data_end;
+    ppm[data_start..data_end].to_vec()
+}
+
 fn progression(b: u8) -> Result<Progression> {
     Ok(match b {
         0 => Progression::Lrcp,
@@ -778,4 +856,59 @@ fn progression(b: u8) -> Result<Progression> {
             )))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ppt_appends_ippt_after_zppt() {
+        // PPT segment: Lppt(2)=7, Zppt(1)=0, Ippt(4)=AA BB CC DD. The reader is
+        // positioned just after the 0xFF61 marker (as in collect_tiles).
+        let seg = [0x00, 0x07, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+        let mut r = Reader::new(&seg);
+        let mut out = Vec::new();
+        parse_ppt(&mut r, &mut out).unwrap();
+        assert_eq!(out, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        // A second PPT segment concatenates.
+        let seg2 = [0x00, 0x05, 0x01, 0xEE, 0xFF];
+        let mut r2 = Reader::new(&seg2);
+        parse_ppt(&mut r2, &mut out).unwrap();
+        assert_eq!(out, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    #[test]
+    fn parse_ppm_appends_payload_after_zppm() {
+        // PPM segment: Lppm(2)=10, Zppm(1)=0, then Nppm(4)=3 + Ippm(3)=11 22 33.
+        // parse_ppm keeps the raw Nppm/Ippm payload verbatim for later splitting.
+        let seg = [0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x03, 0x11, 0x22, 0x33];
+        let mut r = Reader::new(&seg);
+        let mut ppm = Vec::new();
+        parse_ppm(&mut r, &mut ppm).unwrap();
+        assert_eq!(ppm, vec![0x00, 0x00, 0x00, 0x03, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn next_ppm_chunk_splits_by_nppm() {
+        // Two tile-part chunks: Nppm=2 [A1 A2], then Nppm=3 [B1 B2 B3].
+        let ppm = [
+            0x00, 0x00, 0x00, 0x02, 0xA1, 0xA2, // chunk 0
+            0x00, 0x00, 0x00, 0x03, 0xB1, 0xB2, 0xB3, // chunk 1
+        ];
+        let mut cursor = 0usize;
+        assert_eq!(next_ppm_chunk(&ppm, &mut cursor), vec![0xA1, 0xA2]);
+        assert_eq!(next_ppm_chunk(&ppm, &mut cursor), vec![0xB1, 0xB2, 0xB3]);
+        // Past the end → empty (tile-parts fall back to inline headers).
+        assert_eq!(next_ppm_chunk(&ppm, &mut cursor), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn next_ppm_chunk_clamps_truncated_nppm() {
+        // Nppm claims 8 bytes but only 2 are present → clamp to the available data.
+        let ppm = [0x00, 0x00, 0x00, 0x08, 0xC1, 0xC2];
+        let mut cursor = 0usize;
+        assert_eq!(next_ppm_chunk(&ppm, &mut cursor), vec![0xC1, 0xC2]);
+        assert_eq!(cursor, ppm.len());
+    }
 }

@@ -398,8 +398,10 @@ fn subband_quant_index(orient: Orientation, level: u32, nl: u32) -> usize {
 }
 
 /// Decode a whole tile: walk packets in progression order, filling code-blocks
-/// in `comps`.
-pub fn decode_tile(comps: &mut [TileComponent], body: &[u8]) -> Result<()> {
+/// in `comps`. `packed_headers`, when non-empty, holds the tile's `PPM`/`PPT`
+/// packed packet headers (Annex A.7.4/A.7.5): headers are read from it while
+/// `body` supplies only the packet bodies.
+pub fn decode_tile(comps: &mut [TileComponent], body: &[u8], packed_headers: &[u8]) -> Result<()> {
     if comps.is_empty() {
         return Ok(());
     }
@@ -416,7 +418,11 @@ pub fn decode_tile(comps: &mut [TileComponent], body: &[u8]) -> Result<()> {
         .unwrap_or(1)
         .max(1) as u32;
 
-    let mut rd = PacketReader::new(body);
+    let mut rd = if packed_headers.is_empty() {
+        PacketReader::new(body)
+    } else {
+        PacketReader::with_packed_headers(body, packed_headers)
+    };
     for step in ProgressionIter::new(
         progression,
         num_layers,
@@ -709,7 +715,9 @@ impl TagTree {
 // Bit-stuffed packet-header / packet-body reader (Annex B.10.1).
 // ---------------------------------------------------------------------------
 
-struct PacketReader<'a> {
+/// FF-stuffed bit cursor over one byte buffer (Annex B.10.1): after a `0xFF` byte
+/// the next byte yields only 7 data bits (its top bit is a stuffed 0).
+struct BitCursor<'a> {
     data: &'a [u8],
     pos: usize,
     cur: u8,
@@ -717,9 +725,9 @@ struct PacketReader<'a> {
     last_ff: bool,
 }
 
-impl<'a> PacketReader<'a> {
+impl<'a> BitCursor<'a> {
     fn new(data: &'a [u8]) -> Self {
-        PacketReader {
+        BitCursor {
             data,
             pos: 0,
             cur: 0,
@@ -728,20 +736,14 @@ impl<'a> PacketReader<'a> {
         }
     }
 
-    fn exhausted(&self) -> bool {
-        self.pos >= self.data.len()
-    }
-
-    /// Begin reading a packet header (resets the bit accumulator).
-    fn start_header(&mut self) {
+    /// Reset the bit accumulator to a byte boundary (start of a packet header).
+    fn align(&mut self) {
         self.cur = 0;
         self.bits_left = 0;
         self.last_ff = false;
     }
 
-    /// Read one header bit with the FF byte-stuffing rule: after a `0xFF` byte
-    /// the next byte yields only 7 data bits (its top bit is a stuffed 0).
-    fn bit(&mut self) -> Result<u32> {
+    fn bit(&mut self) -> u32 {
         if self.bits_left == 0 {
             let byte = self.data.get(self.pos).copied().unwrap_or(0xFF);
             self.pos += 1;
@@ -755,7 +757,69 @@ impl<'a> PacketReader<'a> {
             self.last_ff = byte == 0xFF;
         }
         self.bits_left -= 1;
-        Ok(((self.cur >> self.bits_left) & 1) as u32)
+        ((self.cur >> self.bits_left) & 1) as u32
+    }
+}
+
+/// Bit-stuffed packet reader. Packet headers and packet bodies normally share one
+/// in-bitstream buffer, but when `PPM`/`PPT` packed packet headers are present
+/// (Annex A.7.4/A.7.5) the headers live in a *separate* buffer while the bodies
+/// stay in the tile bitstream. `header` selects the source of header bits; `body`
+/// is always the tile bitstream and supplies code-block bytes + `SOP` markers.
+struct PacketReader<'a> {
+    /// Tile bitstream: packet bodies (and inline headers when not packed).
+    body: BitCursor<'a>,
+    /// Packed packet-header stream (`PPM`/`PPT`); `None` ⇒ headers are inline and
+    /// read from `body`.
+    packed: Option<BitCursor<'a>>,
+}
+
+impl<'a> PacketReader<'a> {
+    /// Reader with inline packet headers (no `PPM`/`PPT`).
+    fn new(data: &'a [u8]) -> Self {
+        PacketReader {
+            body: BitCursor::new(data),
+            packed: None,
+        }
+    }
+
+    /// Reader whose packet headers come from a separate packed-header buffer
+    /// (`PPM`/`PPT`), bodies still from `body`.
+    fn with_packed_headers(body: &'a [u8], headers: &'a [u8]) -> Self {
+        PacketReader {
+            body: BitCursor::new(body),
+            packed: Some(BitCursor::new(headers)),
+        }
+    }
+
+    /// Whether there is no more packet data to read (drives the packet loop's
+    /// early-out). With packed headers, packets may have empty bodies, so the
+    /// loop must keep going while header bits remain; we only stop once *both*
+    /// the header source and the body bitstream are exhausted.
+    fn exhausted(&self) -> bool {
+        let body_done = self.body.pos >= self.body.data.len();
+        match self.packed {
+            Some(ref p) => body_done && p.pos >= p.data.len(),
+            None => body_done,
+        }
+    }
+
+    /// The cursor that header bits are read from.
+    fn header_cursor(&mut self) -> &mut BitCursor<'a> {
+        match self.packed {
+            Some(ref mut p) => p,
+            None => &mut self.body,
+        }
+    }
+
+    /// Begin reading a packet header (aligns the header bit accumulator).
+    fn start_header(&mut self) {
+        self.header_cursor().align();
+    }
+
+    /// Read one header bit (Annex B.10.1 FF-stuffing) from the header source.
+    fn bit(&mut self) -> Result<u32> {
+        Ok(self.header_cursor().bit())
     }
 
     fn read_bits(&mut self, n: u32) -> Result<u32> {
@@ -786,35 +850,33 @@ impl<'a> PacketReader<'a> {
         Ok(37 + seven)
     }
 
-    /// Finish a packet header: drop to the next byte boundary and consume an
-    /// `EPH` marker (0xFF92) if present.
+    /// Finish a packet header: drop to the next byte boundary in the header
+    /// source and consume an `EPH` marker (0xFF92) if present. With packed headers
+    /// the `EPH`, if used, lives in the packed-header buffer (Annex A.7.4/A.7.5).
     fn finish_header(&mut self, use_eph: bool) {
-        self.bits_left = 0;
-        self.last_ff = false;
-        if use_eph
-            && self.pos + 1 < self.data.len()
-            && self.data[self.pos] == 0xFF
-            && self.data[self.pos + 1] == 0x92
+        let c = self.header_cursor();
+        c.bits_left = 0;
+        c.last_ff = false;
+        if use_eph && c.pos + 1 < c.data.len() && c.data[c.pos] == 0xFF && c.data[c.pos + 1] == 0x92
         {
-            self.pos += 2;
+            c.pos += 2;
         }
     }
 
-    /// Read `len` raw body bytes (a code-block contribution).
+    /// Read `len` raw body bytes (a code-block contribution) from the bitstream.
     fn read_body_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = (self.pos + len).min(self.data.len());
-        let s = &self.data[self.pos..end];
-        self.pos = end;
+        let end = (self.body.pos + len).min(self.body.data.len());
+        let s = &self.body.data[self.body.pos..end];
+        self.body.pos = end;
         Ok(s)
     }
 
-    /// Consume an `SOP` marker segment (0xFF91 + Lsop + Nsop) if present.
+    /// Consume an `SOP` marker segment (0xFF91 + Lsop + Nsop) from the bitstream
+    /// if present (`SOP` is never packed into `PPM`/`PPT`).
     fn consume_sop(&mut self) {
-        if self.pos + 1 < self.data.len()
-            && self.data[self.pos] == 0xFF
-            && self.data[self.pos + 1] == 0x91
-        {
-            self.pos = (self.pos + 6).min(self.data.len());
+        let b = &mut self.body;
+        if b.pos + 1 < b.data.len() && b.data[b.pos] == 0xFF && b.data[b.pos + 1] == 0x91 {
+            b.pos = (b.pos + 6).min(b.data.len());
         }
     }
 }
@@ -902,5 +964,57 @@ mod tests {
         for _ in 0..7 {
             assert_eq!(rd.bit().unwrap(), 1);
         }
+    }
+
+    #[test]
+    fn packet_reader_packed_headers_split_sources() {
+        // With PPM/PPT packed headers, header bits come from the packed buffer and
+        // body bytes from the bitstream. Header buffer = 0b1010_1100; body =
+        // distinct marker bytes. Reading 4 header bits then body bytes must draw
+        // from the two buffers independently.
+        let header = [0b1010_1100u8];
+        let body = [0xDE, 0xAD, 0xBE, 0xEF];
+        let mut rd = PacketReader::with_packed_headers(&body, &header);
+        rd.start_header();
+        assert_eq!(rd.read_bits(4).unwrap(), 0b1010);
+        // Body bytes are untouched by header reads.
+        rd.finish_header(false);
+        assert_eq!(rd.read_body_bytes(2).unwrap(), &[0xDE, 0xAD]);
+        assert_eq!(rd.read_body_bytes(2).unwrap(), &[0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn packet_reader_packed_headers_eph_in_header_stream() {
+        // `finish_header` must consume an EPH (0xFF92) from the *packed* header
+        // stream (Annex A.7.4/A.7.5), not from the bitstream. Header = 1 data byte
+        // + EPH; the next header read after finish_header starts past the EPH.
+        let header = [0b1000_0000u8, 0xFF, 0x92, 0b0100_0000];
+        let body = [0x01, 0x02];
+        let mut rd = PacketReader::with_packed_headers(&body, &header);
+        rd.start_header();
+        // First bit of byte 0.
+        assert_eq!(rd.bit().unwrap(), 1);
+        // finish_header aligns and consumes the EPH that follows in the packed
+        // stream; the next header read then comes from byte 3 (0b0100_0000).
+        rd.finish_header(true);
+        rd.start_header();
+        assert_eq!(rd.bit().unwrap(), 0);
+        assert_eq!(rd.bit().unwrap(), 1);
+        // Body remains fully available.
+        assert_eq!(rd.read_body_bytes(2).unwrap(), &[0x01, 0x02]);
+    }
+
+    #[test]
+    fn packet_reader_exhausted_considers_both_sources() {
+        // With packed headers, the reader is exhausted only when both the body and
+        // the header buffer are consumed (empty bodies are valid).
+        let header = [0xAAu8];
+        let body: [u8; 0] = [];
+        let mut rd = PacketReader::with_packed_headers(&body, &header);
+        // Body empty but header has bits to read → not exhausted yet.
+        assert!(!rd.exhausted());
+        rd.start_header();
+        let _ = rd.read_bits(8).unwrap();
+        assert!(rd.exhausted());
     }
 }

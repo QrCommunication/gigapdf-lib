@@ -270,12 +270,18 @@ fn process_segments(data: &[u8], state: &mut Jbig2State) -> Result<()> {
             None => break,
         };
         // Slice the segment's data area. A data length of 0xFFFFFFFF (unknown
-        // length) only occurs for some generic regions; we do not handle that
-        // rare case and stop cleanly.
-        if header.data_length == 0xFFFF_FFFF {
-            break;
-        }
-        let seg_data = match r.take(header.data_length as usize) {
+        // length, T.88 §7.2.7) only occurs for an immediate generic region: the
+        // extent is recovered by scanning for the row/terminator sequence so the
+        // remaining segments can still be parsed.
+        let seg_len = if header.data_length == 0xFFFF_FFFF {
+            match recover_unknown_generic_length(&r.data[r.pos..]) {
+                Some(n) => n,
+                None => break,
+            }
+        } else {
+            header.data_length as usize
+        };
+        let seg_data = match r.take(seg_len) {
             Some(s) => s,
             None => break,
         };
@@ -283,6 +289,54 @@ fn process_segments(data: &[u8], state: &mut Jbig2State) -> Result<()> {
         decode_segment(&header, seg_data, state);
     }
     Ok(())
+}
+
+/// Recover the data length of an immediate generic-region segment whose header
+/// declared an unknown length (`0xFFFFFFFF`, T.88 §7.2.7). The encoded data is
+/// terminated by a two-byte marker — `0xFF 0xAC` for arithmetic coding, `0x00
+/// 0x00` for MMR — immediately followed by a 4-byte row count. Returns the total
+/// segment-data length (header + coded bytes + 2-byte marker + 4-byte row count),
+/// or `None` if no terminator is found.
+///
+/// `data` is the slice starting at the generic-region segment's data area.
+fn recover_unknown_generic_length(data: &[u8]) -> Option<usize> {
+    // Region segment info (17 bytes) + generic-region flags (1 byte).
+    const REGION_INFO_LEN: usize = 17;
+    if data.len() < REGION_INFO_LEN + 1 {
+        return None;
+    }
+    let flags = data[REGION_INFO_LEN];
+    let mmr = (flags & 0x01) != 0;
+    let template = (flags >> 1) & 0x03;
+
+    // AT pixels follow the flags for arithmetic coding (2 bytes/pair: 4 pairs for
+    // template 0, else 1 pair). The coded data starts after them.
+    let at_bytes = if mmr {
+        0
+    } else if template == 0 {
+        8
+    } else {
+        2
+    };
+    let search_start = REGION_INFO_LEN + 1 + at_bytes;
+    if search_start > data.len() {
+        return None;
+    }
+
+    let marker: [u8; 2] = if mmr { [0x00, 0x00] } else { [0xFF, 0xAC] };
+    // Scan the coded data for the terminator; the 4-byte row count follows it.
+    let mut i = search_start;
+    while i + 2 <= data.len() {
+        if data[i] == marker[0] && data[i + 1] == marker[1] {
+            // Segment data = coded bytes + 2-byte marker + 4-byte row count.
+            // Clamp to the available bytes: a truncated tail still yields a usable
+            // slice (the row count may be absent at the very end of the stream).
+            let total = i + 2 + 4;
+            return Some(total.min(data.len()));
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Dispatch a single segment by its type (T.88 §7.3).
@@ -1154,6 +1208,13 @@ fn decode_symbol_dictionary(
         huff_agg_sel,
         num_new,
         num_ex,
+        // REFAGG aggregate (REFAGGNINST > 1) decodes the symbol via a text-region
+        // procedure whose reference corner and transposition are fixed by the
+        // spec (T.88 §6.5.8.2.1 / Table 17): REFCORNER = TOPLEFT, TRANSPOSED = 0.
+        // Carrying them here lets the placement honour `place_symbol` instead of
+        // hard-coding magic literals at the call sites.
+        agg_ref_corner: REF_CORNER_TOPLEFT,
+        agg_transposed: false,
     };
 
     if sdhuff {
@@ -1162,6 +1223,9 @@ fn decode_symbol_dictionary(
         decode_symbol_dictionary_arith(&r.data[r.pos..], input_symbols, &params)
     }
 }
+
+/// The JBIG2 reference-corner code for TOP-LEFT (T.88 Table 12 / §6.5.8.2.1).
+const REF_CORNER_TOPLEFT: u8 = 1;
 
 /// Parsed symbol-dictionary parameters shared by the arithmetic and Huffman
 /// decode paths.
@@ -1177,6 +1241,13 @@ struct SymbolDictParams {
     huff_agg_sel: u8,
     num_new: u32,
     num_ex: u32,
+    /// Reference corner used by the REFAGG aggregate text-region decode. Fixed to
+    /// [`REF_CORNER_TOPLEFT`] by the spec, but threaded so `place_symbol` honours
+    /// it rather than a hard-coded literal.
+    agg_ref_corner: u8,
+    /// Transposition used by the REFAGG aggregate text-region decode (spec-fixed
+    /// to `false`, threaded for the same reason).
+    agg_transposed: bool,
 }
 
 /// Apply the export-flag run list (§6.5.10) to select exported symbols from the
@@ -1371,14 +1442,16 @@ fn decode_refagg_symbol(
             gr_cx,
         )
     } else {
-        // Aggregate: a text region over the reference symbols (§6.5.8.2.1).
+        // Aggregate: a text region over the reference symbols (§6.5.8.2.1). The
+        // reference corner / transposition come from `params` (spec-fixed to
+        // TOPLEFT / non-transposed) so `place_symbol` honours them.
         let tparams = TextRegionParams {
             width,
             height,
             num_instances: ninst as u32,
             strips: 1,
-            ref_corner: 1, // TOPLEFT
-            transposed: false,
+            ref_corner: params.agg_ref_corner,
+            transposed: params.agg_transposed,
             comb_op: 0,
             ds_offset: 0,
             refine: true,
@@ -1479,8 +1552,8 @@ fn decode_refagg_symbol_huffman(
             height,
             num_instances: ninst as u32,
             strips: 1,
-            ref_corner: 1, // TOPLEFT
-            transposed: false,
+            ref_corner: params.agg_ref_corner,
+            transposed: params.agg_transposed,
             comb_op: 0,
             ds_offset: 0,
             refine: true,
@@ -2553,6 +2626,101 @@ mod tests {
         assert_eq!(out, vec![0xE7, 0xE7]);
     }
 
+    /// Unit-test the unknown-length (`0xFFFFFFFF`) generic-region extent recovery
+    /// (T.88 §7.2.7). An arithmetic region's coded data is terminated by `0xFF
+    /// 0xAC` + a 4-byte row count; `recover_unknown_generic_length` must return
+    /// the byte length up to and including the row count, ignoring trailing bytes.
+    #[test]
+    fn unknown_length_generic_extent_recovery_arith() {
+        let mut data = Vec::new();
+        // Region info (17): 8×2 at (0,0), comb OR.
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(&2u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.push(0x00);
+        // Generic flags: arithmetic (MMR=0), template 0 → 4 AT pairs (8 bytes).
+        data.push(0x00);
+        // AT pixels (8 bytes).
+        data.extend_from_slice(&[0x03, 0xFF, 0xFD, 0xFF, 0x02, 0xFE, 0xFE, 0xFE]);
+        // Coded data (arbitrary bytes containing no 0xFF 0xAC), then terminator.
+        let coded = [0x12u8, 0x34, 0x56, 0x78];
+        data.extend_from_slice(&coded);
+        let marker_at = data.len();
+        // Terminator marker + 4-byte row count.
+        data.extend_from_slice(&[0xFF, 0xAC]);
+        data.extend_from_slice(&7u32.to_be_bytes());
+        // Trailing bytes (start of the *next* segment) must be excluded.
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let len = recover_unknown_generic_length(&data).expect("extent recovered");
+        assert_eq!(len, marker_at + 2 + 4);
+    }
+
+    /// Unknown-length MMR generic region (terminator `0x00 0x00`) followed by a
+    /// second, known-length region. The extent must be recovered so the second
+    /// segment still parses and composites — the core of the §7.2.7 fix.
+    #[test]
+    fn unknown_length_generic_then_next_segment() {
+        let mut s: Vec<u8> = Vec::new();
+
+        // Segment 0: page info, 8×4 page.
+        push_segment(&mut s, 0, 48, &[], page_info_bytes(8, 4));
+
+        // Segment 1: immediate generic region (type 38), MMR, *unknown length*.
+        // Paints rows 0..2 = WWW BB WWW. The MMR payload for this pattern contains
+        // no 0x00 0x00 pair, so the terminator we append is the first match.
+        let mmr_payload = build_g4(&[
+            &[false, false, false, true, true, false, false, false],
+            &[false, false, false, true, true, false, false, false],
+        ]);
+        assert!(
+            !mmr_payload.windows(2).any(|w| w == [0x00, 0x00]),
+            "test fixture invariant: MMR payload must not contain the 0x00 0x00 terminator"
+        );
+        let mut seg1_data = Vec::new();
+        seg1_data.extend_from_slice(&8u32.to_be_bytes()); // width
+        seg1_data.extend_from_slice(&2u32.to_be_bytes()); // height
+        seg1_data.extend_from_slice(&0u32.to_be_bytes()); // x
+        seg1_data.extend_from_slice(&0u32.to_be_bytes()); // y
+        seg1_data.push(0x00); // comb OR
+        seg1_data.push(0x01); // generic flags: MMR=1
+        seg1_data.extend_from_slice(&mmr_payload);
+        seg1_data.extend_from_slice(&[0x00, 0x00]); // terminator
+        seg1_data.extend_from_slice(&2u32.to_be_bytes()); // row count
+
+        // Header with data_length = 0xFFFFFFFF.
+        s.extend_from_slice(&1u32.to_be_bytes()); // number
+        s.push(38); // type 38
+        s.push(0x00); // 0 refs
+        s.push(1); // page assoc
+        s.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // unknown length
+        s.extend_from_slice(&seg1_data);
+
+        // Segment 2: known-length MMR generic region painting rows 2..4 = the
+        // inverse pattern (BBB WW BBB) at y=2. If extent recovery failed, this
+        // segment would never be reached and rows 2..4 would stay white.
+        let mmr_payload2 = build_g4(&[
+            &[true, true, true, false, false, true, true, true],
+            &[true, true, true, false, false, true, true, true],
+        ]);
+        let mut seg2_data = Vec::new();
+        seg2_data.extend_from_slice(&8u32.to_be_bytes());
+        seg2_data.extend_from_slice(&2u32.to_be_bytes());
+        seg2_data.extend_from_slice(&0u32.to_be_bytes());
+        seg2_data.extend_from_slice(&2u32.to_be_bytes()); // y = 2
+        seg2_data.push(0x00);
+        seg2_data.push(0x01); // MMR
+        seg2_data.extend_from_slice(&mmr_payload2);
+        push_segment(&mut s, 2, 38, &[], seg2_data);
+
+        let out = jbig2_decode(&s, None, None).expect("jbig2 decode");
+        // Row bytes = 1. 0=black.
+        // Rows 0,1: WWW BB WWW → 1 1 1 0 0 1 1 1 = 0xE7.
+        // Rows 2,3: BBB WW BBB → 0 0 0 1 1 0 0 0 = 0x18.
+        assert_eq!(out, vec![0xE7, 0xE7, 0x18, 0x18]);
+    }
+
     /// Decode an arithmetic generic region built by the matching MQ *encoder*
     /// (round-trip): a tiny 8×4 bitmap encodes and decodes to the same pixels.
     #[test]
@@ -2911,6 +3079,49 @@ mod tests {
                 assert_eq!(got_black, black, "pixel ({x},{y}) mismatch");
             }
         }
+    }
+
+    /// The REFAGG aggregate (REFAGGNINST > 1) decode threads its reference corner
+    /// and transposition from `SymbolDictParams` (rather than hard-coded literals)
+    /// into the aggregate text region. They are spec-fixed (T.88 §6.5.8.2.1 /
+    /// Table 17) to TOPLEFT / non-transposed; this pins that wiring so a later
+    /// change to the placement path is caught.
+    #[test]
+    fn refagg_aggregate_uses_topleft_non_transposed() {
+        // The `agg_*` fields default to the spec constants at parse time.
+        let params = SymbolDictParams {
+            sdrefagg: true,
+            template: 0,
+            rtemplate: 0,
+            at: [(0, 0); 4],
+            rat: [(-1, -1); 2],
+            huff_dh_sel: 0,
+            huff_dw_sel: 0,
+            huff_bmsize_sel: 0,
+            huff_agg_sel: 0,
+            num_new: 1,
+            num_ex: 1,
+            agg_ref_corner: REF_CORNER_TOPLEFT,
+            agg_transposed: false,
+        };
+        // The aggregate path builds its TextRegionParams from these fields.
+        let tparams = TextRegionParams {
+            width: 4,
+            height: 4,
+            num_instances: 2,
+            strips: 1,
+            ref_corner: params.agg_ref_corner,
+            transposed: params.agg_transposed,
+            comb_op: 0,
+            ds_offset: 0,
+            refine: true,
+            rtemplate: params.rtemplate,
+            rat: params.rat,
+            log_strips: 0,
+        };
+        assert_eq!(tparams.ref_corner, REF_CORNER_TOPLEFT);
+        assert!(!tparams.transposed);
+        assert_eq!(REF_CORNER_TOPLEFT, 1);
     }
 
     /// REFAGG (refinement/aggregate) symbol-dictionary round-trip. An input

@@ -261,6 +261,13 @@ samples run through the engine's filters — `/AHx` (ASCIIHex), `/A85` (ASCII85)
 `/G`/`/RGB`/`/CMYK`/`/I` (plus Indexed). `/IM true` image masks paint the current
 fill colour through the stencil.
 
+The `/LZW`/`/Fl` **`/Predictor`** post-pass (ISO 32000-1 §7.4.4.4) reverses both
+the PNG predictors (None/Sub/Up/Average/Paeth) and **TIFF Predictor 2** horizontal
+differencing — now generalised beyond 8-bit to **16-bit big-endian** samples and
+the **sub-byte** packed depths (1/2/4 bits), honouring `/Colors`,
+`/BitsPerComponent` and `/Columns` (an unsupported depth is rejected, never
+silently mis-decoded).
+
 **Bilevel scanned-document images (ISO 32000-1 §7.4.6 / §7.4.7):** the two fax /
 bilevel filters used by N&B scans are now decoded from scratch (pure `std`, zero
 deps) and flow through the normal 1-bpp image path — both for **rasterizing** and
@@ -270,8 +277,11 @@ explicit `/Mask`, or a soft `/SMask`):
 - **`/CCITTFaxDecode`** — Group 3 1-D (`/K 0`), Group 3 2-D (`/K > 0`, per-line
   1-D/2-D tag bit) and Group 4 (`/K < 0`, pure 2-D). The full modified-Huffman
   white/black run-length tables (terminating + make-up + the shared >1728 make-up
-  codes), the 2-D modes (Pass, Horizontal, Vertical `V0`/`VR1‑3`/`VL1‑3`) via the
-  `a0`/`a1`/`b1`/`b2` changing-element algorithm, and `/Columns`, `/Rows`,
+  codes), the 2-D modes (Pass, Horizontal, Vertical `V0`/`VR1‑3`/`VL1‑3` **and the
+  2-D extension *uncompressed mode*** — the `0000001 111` extension code followed
+  by the T.4 §2.2.1 unary literal codewords `0^j 1` and the `0000001 T` exit that
+  sets the continuation run's colour, after which normal 2-D coding resumes) via
+  the `a0`/`a1`/`b1`/`b2` changing-element algorithm, and `/Columns`, `/Rows`,
   `/BlackIs1`, `/EncodedByteAlign`, `/EndOfLine`, `/EndOfBlock` (RTC/EOFB) are
   honoured.
 - **`/JBIG2Decode`** — the embedded-in-PDF profile, with **full ITU-T T.88 segment
@@ -280,12 +290,19 @@ explicit `/Mask`, or a soft `/SMask`):
   (`IADH`/`IADW`/`IAEX`/`IADT`/`IAFS`/`IADS`/`IAIT`/`IARI`/`IARDX`/`IARDY` + the
   `IAID` symbol-id coder), and every region/dictionary segment type:
   - **generic region** (§6.2) — GB templates 0-3 with `TPGDON` typical prediction,
-    plus an MMR mode that reuses the CCITT G4 core;
+    plus an MMR mode that reuses the CCITT G4 core; an **unknown-length**
+    (`0xFFFFFFFF`) immediate generic region (§7.2.7) has its extent **recovered by
+    scanning for the row/terminator sequence** (`0xFF 0xAC` arithmetic / `0x00
+    0x00` MMR, then the 4-byte row count), so the segments that follow it still
+    parse instead of being abandoned;
   - **generic refinement region** (§6.3) — GR templates 0 & 1 with `TPGRON`
     typical prediction, refining the page area in place;
   - **symbol dictionary** (§6.5) — arithmetic *and* Huffman coding, plain generic
     symbols *and* refinement/aggregate (`REFAGG`) symbols (single-symbol refinement
-    and the aggregate text-region case) — including the Huffman + `REFAGG`
+    and the aggregate text-region case — the latter driven through the shared
+    text-region placement so its reference corner / transposition, fixed by
+    §6.5.8.2.1 / Table 17 to TOPLEFT / non-transposed, flow through `place_symbol`
+    rather than a hard-coded literal) — including the Huffman + `REFAGG`
     combination (`SDHUFF=1` *and* `SDREFAGG=1`: the symbol-ID as a fixed
     `SBSYMCODELEN` code, the refinement deltas via the standard Annex B tables, the
     refinement bitmap arithmetic-coded);
@@ -322,11 +339,17 @@ pipeline:
     levels, code-block size, code-block style, 5/3-vs-9/7 transform, precincts),
     `QCD`/`QCC` (no-quantisation, scalar-derived and scalar-expounded), `RGN`
     (region-of-interest max-shift), `SOT`/`SOD`/`EOC` tile-parts, and `POC`/`TLM`/
-    `PLM`/`PLT`/`PPM`/`PPT`/`CRG`/`COM`/`SOP`/`EPH` handled or safely skipped;
+    `PLM`/`PLT`/`CRG`/`COM`/`SOP`/`EPH` handled or safely skipped, and **`PPM`/
+    `PPT` packed packet headers** (Annex A.7.4/A.7.5) now *consumed*: the
+    `Ippm`/`Ippt` bytes are gathered into a per-tile packet-header buffer that the
+    tier-2 decoder reads its headers from while the tile bitstream supplies only
+    the packet bodies (the main-header `PPM` stream is split per tile-part by its
+    `Nppm` lengths; a tile-part's own `PPT` takes precedence);
   - **tier-2 packet decoding** — the subband/precinct/code-block geometry, the
     inclusion and zero-bit-plane **tag-trees**, per-code-block new-pass counts and
     `Lblock` length signalling, layers, and **all five progression orders**
-    (LRCP/RLCP/RPCL/PCRL/CPRL), with the bit-stuffed packet headers;
+    (LRCP/RLCP/RPCL/PCRL/CPRL), with the bit-stuffed packet headers (read inline,
+    or from the `PPM`/`PPT` packed-header buffer when one is present);
   - **tier-1 EBCOT** — per-code-block bit-plane decoding (significance-propagation,
     magnitude-refinement and cleanup passes with the run-length mode) driven by the
     **same MQ arithmetic decoder** the JBIG2 path uses (ISO/IEC 15444-1 reuses the

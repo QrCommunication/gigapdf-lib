@@ -61,26 +61,87 @@ pub fn undo_predictor(data: &[u8], params: PredictorParams) -> Result<Vec<u8>> {
 }
 
 /// TIFF Predictor 2: each component is the horizontal difference from the
-/// component one pixel to its left. Only the 8-bit case is implemented (the only
-/// one seen in real PDFs); other bit depths are rejected rather than guessed.
+/// same-channel component one pixel to its left (TIFF 6.0 §14). Supported sample
+/// depths: 8-bit, 16-bit (big-endian, per ISO 32000-1 image-data byte order), and
+/// the sub-byte packed depths 1/2/4 bits. Other depths are rejected rather than
+/// guessed.
 fn undo_tiff_predictor2(data: &[u8], params: PredictorParams) -> Result<Vec<u8>> {
-    if params.bits_per_component != 8 {
-        return Err(filter_err(
-            "TIFF Predictor 2 with non-8-bit components is unsupported",
-        ));
-    }
-    let row_len = bytes_per_row(params.columns, params.colors, 8);
+    let row_len = bytes_per_row(params.columns, params.colors, params.bits_per_component);
     if row_len == 0 {
         return Ok(data.to_vec());
     }
     let colors = params.colors.max(1) as usize;
+    let columns = params.columns.max(0) as usize;
     let mut out = data.to_vec();
-    for row in out.chunks_mut(row_len) {
-        for i in colors..row.len() {
-            row[i] = row[i].wrapping_add(row[i - colors]);
+    match params.bits_per_component {
+        8 => {
+            for row in out.chunks_mut(row_len) {
+                for i in colors..row.len() {
+                    row[i] = row[i].wrapping_add(row[i - colors]);
+                }
+            }
+        }
+        16 => {
+            // Each component is a big-endian u16; difference is per-channel
+            // against the sample one pixel (colors*2 bytes) to the left.
+            let stride = colors * 2;
+            for row in out.chunks_mut(row_len) {
+                for i in (stride..row.len()).step_by(2) {
+                    if i + 1 >= row.len() {
+                        break;
+                    }
+                    let left = u16::from_be_bytes([row[i - stride], row[i - stride + 1]]);
+                    let cur = u16::from_be_bytes([row[i], row[i + 1]]);
+                    let val = cur.wrapping_add(left);
+                    let [hi, lo] = val.to_be_bytes();
+                    row[i] = hi;
+                    row[i + 1] = lo;
+                }
+            }
+        }
+        1 | 2 | 4 => {
+            let bits = params.bits_per_component as usize;
+            for row in out.chunks_mut(row_len) {
+                undo_tiff_predictor2_subbyte(row, columns, colors, bits);
+            }
+        }
+        other => {
+            return Err(filter_err(&format!(
+                "TIFF Predictor 2 with {other}-bit components is unsupported"
+            )));
         }
     }
     Ok(out)
+}
+
+/// TIFF Predictor 2 over sub-byte (1/2/4-bit) samples in one packed row.
+/// Samples are stored MSB-first, `colors` interleaved channels per pixel, rows
+/// padded to a byte boundary. Each sample is re-summed (modulo `1 << bits`) with
+/// the same-channel sample one pixel to its left.
+fn undo_tiff_predictor2_subbyte(row: &mut [u8], columns: usize, colors: usize, bits: usize) {
+    let mask = (1u16 << bits) - 1;
+    let total = columns.saturating_mul(colors);
+
+    let get = |row: &[u8], sample: usize| -> u16 {
+        let bit_pos = sample * bits;
+        let byte = bit_pos / 8;
+        let shift = 8 - bits - (bit_pos % 8);
+        ((row[byte] as u16) >> shift) & mask
+    };
+    let set = |row: &mut [u8], sample: usize, value: u16| {
+        let bit_pos = sample * bits;
+        let byte = bit_pos / 8;
+        let shift = 8 - bits - (bit_pos % 8);
+        let clear = !((mask as u8) << shift);
+        row[byte] = (row[byte] & clear) | (((value & mask) as u8) << shift);
+    };
+
+    // Walk samples left→right; for each, add the same channel one pixel back.
+    for sample in colors..total {
+        let cur = get(row, sample);
+        let left = get(row, sample - colors);
+        set(row, sample, cur.wrapping_add(left) & mask);
+    }
 }
 
 /// PNG predictors: every row starts with a filter-type byte, then `row_len`
@@ -231,8 +292,74 @@ mod tests {
     }
 
     #[test]
+    fn tiff_predictor2_16bit_big_endian() {
+        // 1 row, 3 columns, 1 colour, 16-bit BE. Original samples
+        // [0x0100, 0x0150, 0x0140] differenced per pixel → [0x0100, 0x0050, -0x0010].
+        // Encoded (BE): 0x0100, 0x0050, 0xFFF0; undoing restores the originals.
+        let encoded = [0x01, 0x00, 0x00, 0x50, 0xFF, 0xF0];
+        assert_eq!(
+            undo_predictor(&encoded, params(2, 1, 16, 3)).unwrap(),
+            [0x01, 0x00, 0x01, 0x50, 0x01, 0x40]
+        );
+    }
+
+    #[test]
+    fn tiff_predictor2_16bit_multi_component() {
+        // 2 columns, 2 colours, 16-bit BE. Original
+        // [c0=0x1000 c1=0x2000][c0=0x1010 c1=0x1FF0] → per-channel diff
+        // [0x1000 0x2000][0x0010 0xFFF0]; undoing restores it.
+        let encoded = [0x10, 0x00, 0x20, 0x00, 0x00, 0x10, 0xFF, 0xF0];
+        assert_eq!(
+            undo_predictor(&encoded, params(2, 2, 16, 2)).unwrap(),
+            [0x10, 0x00, 0x20, 0x00, 0x10, 0x10, 0x1F, 0xF0]
+        );
+    }
+
+    #[test]
+    fn tiff_predictor2_4bit_subbyte() {
+        // 1 row, 4 columns, 1 colour, 4-bit. Original nibbles [1,3,6,10]
+        // differenced → [1,2,3,4]; packed = 0x12, 0x34. Undoing restores
+        // [1,3,6,10] = packed 0x13, 0x6A.
+        let encoded = [0x12u8, 0x34];
+        assert_eq!(
+            undo_predictor(&encoded, params(2, 1, 4, 4)).unwrap(),
+            [0x13, 0x6A]
+        );
+    }
+
+    #[test]
+    fn tiff_predictor2_1bit_subbyte() {
+        // 1 row, 8 columns, 1 colour, 1-bit. Original bits 1,0,0,1,1,1,0,0.
+        // Predictor-2 over GF(2) is XOR with the left pixel: deltas
+        // 1,1,0,1,0,0,1,0 = 0b11010010 = 0xD2. Undoing restores 0b10011100 = 0x9C.
+        let encoded = [0xD2u8];
+        assert_eq!(
+            undo_predictor(&encoded, params(2, 1, 1, 8)).unwrap(),
+            [0x9C]
+        );
+    }
+
+    #[test]
+    fn tiff_predictor2_2bit_subbyte() {
+        // 1 row, 4 columns, 1 colour, 2-bit. Original 2-bit samples [1,3,2,0]
+        // differenced mod 4 → [1,2,3,2]; packed = 0b01_10_11_10 = 0x6E. Undoing
+        // restores [1,3,2,0] = 0b01_11_10_00 = 0x78.
+        let encoded = [0x6Eu8];
+        assert_eq!(
+            undo_predictor(&encoded, params(2, 1, 2, 4)).unwrap(),
+            [0x78]
+        );
+    }
+
+    #[test]
     fn rejects_unknown_predictor() {
         assert!(undo_predictor(&[0u8], params(99, 1, 8, 1)).is_err());
+    }
+
+    #[test]
+    fn tiff_predictor2_rejects_unsupported_depth() {
+        // 12-bit components are still rejected rather than silently mis-decoded.
+        assert!(undo_predictor(&[0u8, 0, 0], params(2, 1, 12, 2)).is_err());
     }
 
     #[test]

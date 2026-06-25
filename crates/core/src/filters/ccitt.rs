@@ -465,16 +465,106 @@ fn decode_2d_line(
                 a0 = a1 as i64;
                 color_white = !color_white;
             }
-            Some(Mode::Extension) | None => {
-                // Unsupported 2-D extension (uncompressed mode) or a corrupt
-                // code: bail. Returning what we have lets decode-until-EOFB keep
-                // earlier rows.
+            Some(Mode::Extension) => {
+                // 2-D extension (T.6 §4.2.1.3.3): the `0000001` prefix is followed
+                // by a 3-bit type selector. `111` = uncompressed mode; all other
+                // values are reserved/undefined and we bail (keeping earlier rows).
+                if reader.peek(3) != 0b111 {
+                    return None;
+                }
+                reader.advance(3);
+                match decode_uncompressed_mode(reader, a0, color_white, &mut changes, cols) {
+                    Some((next_a0, next_white)) => {
+                        a0 = next_a0;
+                        color_white = next_white;
+                    }
+                    None => return None,
+                }
+            }
+            None => {
+                // A corrupt mode code: bail. Returning what we have lets
+                // decode-until-EOFB keep earlier rows.
                 return None;
             }
         }
     }
     normalize_changes(&mut changes, cols);
     Some(changes)
+}
+
+/// Decode a run of T.6 *uncompressed mode* (ITU-T T.4 §2.2.1 / T.6 §4.2.1.3.3),
+/// entered after the `0000001 111` 2-D extension code. Literal pixels are coded
+/// as unary codewords `0^j 1` (j ∈ 0..=5): `j` white pixels then one black pixel.
+/// The terminator `0^6 1 T` (six zeros, a one, then a colour bit `T`) leaves
+/// uncompressed mode; `T` is the colour of the run that continues under normal
+/// 2-D coding (`0` = white, `1` = black).
+///
+/// `a0` is the absolute pixel cursor and `color_white` the colour of the run at
+/// `a0`; both are threaded back so normal coding resumes seamlessly. A changing
+/// element is recorded at every colour flip. Returns `(a0, color_white)` for the
+/// continuation, or `None` on a corrupt code / overflow past `cols`.
+fn decode_uncompressed_mode(
+    reader: &mut BitReader,
+    a0: i64,
+    color_white: bool,
+    changes: &mut Vec<usize>,
+    cols: usize,
+) -> Option<(i64, bool)> {
+    // Absolute cursor; clamp a0 (which may be -1 at line start) to 0.
+    let mut x = if a0 < 0 { 0usize } else { a0 as usize };
+    let mut cur_white = color_white; // colour of the pixel about to be written
+
+    // Emit one literal pixel of the given colour, recording a changing element on
+    // a flip. `white` is the pixel's colour.
+    let emit = |changes: &mut Vec<usize>, x: &mut usize, cur_white: &mut bool, white: bool| {
+        if white != *cur_white {
+            changes.push(*x);
+            *cur_white = white;
+        }
+        *x += 1;
+    };
+
+    loop {
+        if x >= cols {
+            // Past the line: the stream should terminate; report the position.
+            return Some((x as i64, cur_white));
+        }
+        // Count leading zeros (capped) then expect a 1.
+        let mut zeros = 0u32;
+        while zeros <= 6 && reader.peek(1) == 0 {
+            reader.advance(1);
+            zeros += 1;
+        }
+        // The bit after the zeros must be a 1 (the codeword/terminator delimiter).
+        if reader.read_bit()? != 1 {
+            return None;
+        }
+        if zeros <= 5 {
+            // Literal codeword `0^zeros 1`: `zeros` white pixels then a black one.
+            for _ in 0..zeros {
+                if x >= cols {
+                    break;
+                }
+                emit(changes, &mut x, &mut cur_white, true);
+            }
+            if x < cols {
+                emit(changes, &mut x, &mut cur_white, false);
+            }
+        } else {
+            // zeros == 6 → terminator `0000001`; read the colour bit T and exit.
+            let t = reader.read_bit()?;
+            let next_white = t == 0;
+            // If the continuation run's colour differs from the colour of the last
+            // literal pixel, the boundary at `x` is itself a changing element. The
+            // changing-element list drives colour purely by flip parity, so record
+            // it here (otherwise emit_row would paint `x..` in the wrong colour and
+            // `color_white` would disagree with the resumed coding).
+            if next_white != cur_white && x < cols {
+                changes.push(x);
+            }
+            return Some((x as i64, next_white));
+        }
+    }
 }
 
 /// The 2-D coding modes (T.6 Table 1 / T.4 Table 4).
@@ -889,6 +979,76 @@ mod tests {
         let out = ccitt_decode(&data, &params).unwrap();
         // Each row WWW BB WWW = 0xE7 (BlackIs1 false).
         assert_eq!(out, vec![0xE7, 0xE7]);
+    }
+
+    #[test]
+    fn two_d_g4_uncompressed_mode() {
+        // One G4 line, 8 columns, encoded entirely in T.6 uncompressed mode
+        // (T.4 §2.2.1). Reference line is all-white (first row).
+        //
+        // Pixels: W W B  W B  B  W W  (positions 0..8).
+        // Uncompressed codewords: 001 (WWB), 01 (WB), 1 (B); exit 0000001 + T=0
+        // (next run white); then a Pass extends the white run to column 8.
+        let mut w = BitWriter::default();
+        // 2-D extension entry: 0000001 prefix + 111 (uncompressed type).
+        w.put(0b0000001, 7);
+        w.put(0b111, 3);
+        // Literal codewords: 001 (W W B), 01 (W B), 1 (B).
+        w.put(0b001, 3);
+        w.put(0b01, 2);
+        w.put(0b1, 1);
+        // Exit: 0000001 + colour bit T=0 (next run white).
+        w.put(0b0000001, 7);
+        w.put(0b0, 1);
+        // Pass mode (0001): extend the white run from col 6 to col 8.
+        w.put(0b0001, 4);
+        let data = w.finish();
+
+        let params = CcittParams {
+            k: -1,
+            columns: 8,
+            rows: 1,
+            end_of_block: false,
+            ..Default::default()
+        };
+        let out = ccitt_decode(&data, &params).unwrap();
+        // BlackIs1=false → white=1, black=0. Pattern W W B W B B W W
+        // = 1 1 0 1 0 0 1 1 = 0b11010011 = 0xD3.
+        assert_eq!(out, vec![0xD3]);
+    }
+
+    #[test]
+    fn two_d_g4_uncompressed_exit_black_continuation() {
+        // Uncompressed mode whose exit selects a *black* continuation run (T=1),
+        // exercising the changing-element recorded at the exit boundary.
+        // Pixels: W W W W B B B B — a literal codeword 00001 (W W W W B) leaves the
+        // cursor at column 5, then exit T=1 makes the continuation run black, which
+        // a Pass extends to column 8. 8 columns, first row (all-white reference).
+        let mut w = BitWriter::default();
+        // 2-D extension entry: 0000001 prefix + 111 (uncompressed type).
+        w.put(0b0000001, 7);
+        w.put(0b111, 3);
+        // Literal codeword 00001 → W W W W B (cursor at column 5).
+        w.put(0b00001, 5);
+        // Exit: 0000001 + colour bit T=1 (continuation run black).
+        w.put(0b0000001, 7);
+        w.put(0b1, 1);
+        // Pass (0001): with colour black and an all-white reference, b1 = cols (8),
+        // so a0 advances to 8 and the run stays black through column 8.
+        w.put(0b0001, 4);
+        let data = w.finish();
+
+        let params = CcittParams {
+            k: -1,
+            columns: 8,
+            rows: 1,
+            end_of_block: false,
+            ..Default::default()
+        };
+        let out = ccitt_decode(&data, &params).unwrap();
+        // W W W W B B B B (the exit black run + Pass extends black to col 8).
+        // white=1, black=0 → 1 1 1 1 0 0 0 0 = 0xF0.
+        assert_eq!(out, vec![0xF0]);
     }
 
     #[test]
