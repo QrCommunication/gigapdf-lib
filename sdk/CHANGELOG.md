@@ -44,6 +44,38 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.94.0] - 2026-06-25
+
+Issue [#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) — the native
+HTML/CSS + inline-SVG renderer — is complete (inline `@font-face` with
+ttf/otf/woff/**woff2** via a from-scratch WOFF2/brotli decoder, full UAX#9 bidi,
+SVG filters, COLRv1, patterns, sticky/float/flex, …), plus 21 PDF/font/Office
+fixes. New SDK surface:
+
+### Added
+
+- **`addDocumentJavascript(name, script)` / `documentJavascripts()` /
+  `removeDocumentJavascript(name)`** — author document-level JavaScript actions in
+  the catalog `/Names /JavaScript` name tree (run by viewers on open).
+  ([#64](https://github.com/qrcommunication/gigapdf-lib/issues/64))
+- **`beginOptionalContent(page, ocg)` / `endOptionalContent(page)`** — assign drawn
+  page content to a toggleable optional-content (OCG) layer via marked content.
+  ([#59](https://github.com/qrcommunication/gigapdf-lib/issues/59))
+- **`placePage(target, source, x, y, sx, sy)` / `placePageMatrix(...)` /
+  `nUp(cols, rows, opts?)`** — N-up / imposition: place a source page as a scaled
+  Form XObject onto another page (2-up/4-up/contact sheets).
+  ([#60](https://github.com/qrcommunication/gigapdf-lib/issues/60))
+
+### Improved
+
+- The HTML→PDF renderer now honours inline `@font-face` web fonts, RTL/bidi text,
+  SVG `filter`, COLRv1 colour fonts, `<pattern>` fills, `position: sticky`, floats,
+  flex column sizing, conic gradients and more — issue #1 in full.
+- Office conversions gain: document metadata round-trip, DOCX paragraph/table
+  styling + page breaks + numbering, real slide tables, named styles, placeholder
+  roles, slide backgrounds; PDF reading gains inline images, hybrid `/XRefStm`,
+  type-1 shadings and Type1 glyph rasterisation.
+
 ## [0.93.0] - 2026-06-24
 
 ### Added

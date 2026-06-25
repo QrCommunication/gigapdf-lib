@@ -7,6 +7,96 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.94.0] - 2026-06-25
+
+The largest release so far. **Issue [#1](https://github.com/qrcommunication/gigapdf-lib/issues/1)
+— the HTML/CSS + inline-SVG rendering engine — is complete**, capped by inline
+`@font-face` backed by a from-scratch **WOFF2/brotli** font decoder, plus **21**
+independent PDF, font and Office fixes implemented in parallel.
+
+### Added — HTML/CSS + SVG engine ([#1](https://github.com/qrcommunication/gigapdf-lib/issues/1), complete)
+
+- **`@font-face` with inline `src`.** `data:` font URIs (`ttf`/`otf`/`woff`/
+  **`woff2`**) are decoded and registered as render fonts, matched by family /
+  weight / style. Backed by a **from-scratch brotli decompressor (RFC 7932)** and
+  a **WOFF/WOFF2 → sfnt reconstructor** (full `glyf`/`loca` transform reverse,
+  validated coordinate-exact against fontTools), both zero-dependency.
+- **Full UAX#9 bidirectional text** — explicit isolates/embeddings (X1–X10) +
+  bracket pairing (N0) for `direction: rtl` mixed runs.
+- **SVG `filter`** — a complete `fe*` pipeline (Gaussian blur, colour-matrix,
+  composite, blend, merge, turbulence, morphology, displacement, drop-shadow,
+  component-transfer) rasterised and emitted as a soft-masked image.
+- **COLRv1** colour-font glyphs (linear/radial/**sweep** gradients, composite
+  blend modes, variable deltas) + **CBDT/CBLC** bitmap strikes.
+- **`<pattern>` tiling** (contour clip, `patternTransform`, nested patterns).
+- **`position: sticky`** paged running headers/footers; **`float`** shrink-to-fit
+  + block wrap + cross-container context; **flexbox** column axis; **box-shadow**
+  true Gaussian blur + `inset`; **3-D border styles** (inset/outset/groove/ridge);
+  smoother **conic-gradient** (360° sectors); nearest-weight **`font-weight`**
+  matching + per-weight embedding; **`border-radius`** content clipping;
+  **`background-image`**; per-stop varying gradient alpha via a luminosity soft mask.
+
+### Added — PDF authoring
+
+- **Document-level JavaScript** (`/Names /JavaScript`) authoring API:
+  `addDocumentJavascript` / `documentJavascripts` / `removeDocumentJavascript`.
+  ([#64](https://github.com/qrcommunication/gigapdf-lib/issues/64))
+- **Optional-content (OCG) layers** — `beginOptionalContent` / `endOptionalContent`
+  assign page content to a toggleable layer via marked content.
+  ([#59](https://github.com/qrcommunication/gigapdf-lib/issues/59))
+- **N-up / imposition** — `placePage` / `placePageMatrix` / `nUp`: place a source
+  page as a scaled Form XObject onto another page.
+  ([#60](https://github.com/qrcommunication/gigapdf-lib/issues/60))
+- **In-place image XObject replacement.**
+  ([#62](https://github.com/qrcommunication/gigapdf-lib/issues/62))
+- **Default appearance streams** synthesised for FreeText/Stamp/Squiggly/Text/
+  Link/FileAttachment annotations.
+  ([#55](https://github.com/qrcommunication/gigapdf-lib/issues/55))
+- **Document properties + language** emitted to the catalog/metadata.
+  ([#21](https://github.com/qrcommunication/gigapdf-lib/issues/21))
+
+### Added — PDF reading
+
+- **Inline images** (`BI`/`ID`/`EI`) decoded through the shared filter pipeline.
+  ([#38](https://github.com/qrcommunication/gigapdf-lib/issues/38))
+- **Hybrid `/XRefStm` + `/Prev`** incremental-revision cross-reference resolution
+  (newest-wins, free entries, cycle-guarded).
+  ([#56](https://github.com/qrcommunication/gigapdf-lib/issues/56))
+- **Function-based (type 1) shadings.**
+  ([#50](https://github.com/qrcommunication/gigapdf-lib/issues/50))
+- **Embedded Type1 (`FontFile`) glyph** outline rasterisation.
+  ([#43](https://github.com/qrcommunication/gigapdf-lib/issues/43))
+- **In-page rotated/vertical text** preserved during PDF→model reconstruction.
+  ([#28](https://github.com/qrcommunication/gigapdf-lib/issues/28))
+
+### Added — Office import
+
+- **Document metadata** (`docProps/core+app`, ODF `meta.xml`) → `DocMeta`
+  (title/author/subject/keywords/lang + dates/description/revision/app/company).
+  ([#29](https://github.com/qrcommunication/gigapdf-lib/issues/29))
+- **DOCX paragraph & table styling** (alignment/spacing/indent/borders/shading/
+  spans) lowered to the model.
+  ([#36](https://github.com/qrcommunication/gigapdf-lib/issues/36))
+- **DOCX hard page breaks + multi-level numbering** (`numbering.xml`).
+  ([#39](https://github.com/qrcommunication/gigapdf-lib/issues/39))
+- **Slide/page background fill** (PPTX `p:bg`, ODP `draw:page`).
+  ([#51](https://github.com/qrcommunication/gigapdf-lib/issues/51))
+- **ODP frame rotation, placeholder role, image alt text.**
+  ([#48](https://github.com/qrcommunication/gigapdf-lib/issues/48))
+
+### Added — Office export
+
+- **PPTX `slideLayout`/`slideMaster` chain** wired to every slide.
+  ([#23](https://github.com/qrcommunication/gigapdf-lib/issues/23))
+- **Real tables on slides** (`a:tbl` / `table:table`) instead of flattened
+  paragraphs. ([#26](https://github.com/qrcommunication/gigapdf-lib/issues/26))
+- **PPTX run highlight/background** (`a:highlight`).
+  ([#24](https://github.com/qrcommunication/gigapdf-lib/issues/24))
+- **ODP placeholder role** (`presentation:class`).
+  ([#25](https://github.com/qrcommunication/gigapdf-lib/issues/25))
+- **Named style table** + paragraph style references (DOCX `styles.xml`, ODT
+  `style:style`). ([#22](https://github.com/qrcommunication/gigapdf-lib/issues/22))
+
 ## [0.93.0] - 2026-06-24
 
 PDF-read, Office-import and PDF-edit. Three independent fixes implemented in
