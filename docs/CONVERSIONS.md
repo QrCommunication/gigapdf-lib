@@ -99,10 +99,23 @@ genuinely structure-aware and strong on the engine's own output and clean
 single-column / ruled-table PDFs:
 
 **Recovered well (FULL):** text runs with font family/size/colour · paragraph
-grouping, alignment, super/sub · ruled tables (with col/row spans) · images (with
-lifted figure captions) · vector shapes · underline/strike (from drawn rules) ·
-external + internal hyperlinks · outline/bookmarks · page geometry · tagged-PDF
-`/StructTreeRoot` (consumed).
+grouping, alignment, super/sub · ruled tables (with col/row spans) · images —
+both `Do` XObjects **and inline images** (`BI`/`ID`/`EI`, ISO 32000-1 §8.9.7) —
+with lifted figure captions · vector shapes · underline/strike (from drawn
+rules) · external + internal hyperlinks · outline/bookmarks · page geometry ·
+tagged-PDF `/StructTreeRoot` (consumed).
+
+**Inline images** are decoded through the *same* pipeline as image XObjects: the
+abbreviated dictionary keys (`/W`, `/H`, `/BPC`, `/CS`, `/F`, `/IM`, `/D`, `/DP`,
+`/I`) are expanded to their long names, the `ID`/`EI` boundary is found by the
+exact sample length when unfiltered (so a literal `EI` inside the pixel bytes
+never truncates them) and by a whitespace-delimited `EI` scan otherwise, and the
+samples run through the engine's filters — `/AHx` (ASCIIHex), `/A85` (ASCII85),
+`/LZW`, `/Fl` (Flate), `/RL` (RunLength), `/DCT` (baseline JPEG) — and colour
+spaces `/G`/`/RGB`/`/CMYK`/`/I` (plus Indexed). `/IM true` image masks paint the
+current fill colour through the stencil. **Not yet decoded:** `/CCF`
+(CCITTFaxDecode) — no engine decoder exists, so such inline images are skipped
+(the same limitation applies to CCITT XObjects).
 
 **Limits on arbitrary third-party PDFs (tracked in [#5](../../issues/5)):**
 

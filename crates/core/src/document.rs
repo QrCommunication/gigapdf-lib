@@ -7276,136 +7276,148 @@ impl Document {
             let Some(stream) = self.resolve(value).as_stream() else {
                 continue;
             };
-            let dict = &stream.dict;
-            if dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Image".as_slice()) {
+            if stream.dict.get(b"Subtype").and_then(Object::as_name) != Some(b"Image".as_slice()) {
                 continue;
             }
-            let width = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
-            let height = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
-            if width <= 0 || height <= 0 {
-                continue;
+            if let Some(image) = self.decode_image_stream(stream) {
+                out.insert(name.clone(), image);
             }
-            let (w, h) = (width as usize, height as usize);
-            let filter = self.first_filter(dict);
-            // An `/ImageMask true` XObject is a 1-bit stencil: it has no colour
-            // space and paints the *current fill colour* through its unmasked
-            // pixels. Decode it into an alpha-only image (RGB is a placeholder)
-            // tagged `stencil`, so the rasterizer substitutes the fill colour at
-            // `Do` time.
-            if dict
-                .get(b"ImageMask")
-                .and_then(Object::as_bool)
-                .unwrap_or(false)
-            {
-                if let Some(alpha) = self.decode_stencil_alpha(stream, dict, w, h) {
-                    let mut rgba = Vec::with_capacity(w * h * 4);
-                    for a in alpha {
-                        rgba.extend_from_slice(&[0, 0, 0, a]);
-                    }
-                    out.insert(
-                        name.clone(),
-                        crate::raster::render::RenderImage {
-                            width: width as u32,
-                            height: height as u32,
-                            rgba,
-                            stencil: true,
-                        },
-                    );
-                }
-                continue;
-            }
-            // Decode the image's RGB samples (one `[r, g, b]` triple per pixel,
-            // row-major). A baseline JPEG (`/DCTDecode`) is decoded by the
-            // built-in JPEG decoder from the raw (still-DCT-coded) stream bytes;
-            // everything else is an uncompressed/Flate sample grid whose
-            // component layout the `/ColorSpace` describes.
-            // A colour-key `/Mask [min0 max0 …]` makes pixels whose *raw* samples
-            // all fall in the given per-component ranges transparent; it is keyed
-            // on the integer samples, so it is computed alongside the (non-JPEG)
-            // sample decode where they are available. `None` = no colour key.
-            let mut color_key: Option<Vec<bool>> = None;
-            let rgb: Vec<[u8; 3]> = if filter.as_deref() == Some(b"DCTDecode") {
-                let Some((jw, jh, jrgba)) = crate::raster::jpeg::decode_jpeg(&stream.raw) else {
-                    continue; // progressive/arithmetic/malformed — not yet decoded
-                };
-                if jw as usize != w || jh as usize != h || jrgba.len() < w * h * 4 {
-                    continue;
-                }
-                jrgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect()
-            } else {
-                let bpc = dict
-                    .get(b"BitsPerComponent")
-                    .and_then(Object::as_i64)
-                    .unwrap_or(8)
-                    .clamp(1, 16) as u32;
-                // JPXDecode (JPEG 2000) is not decoded yet; skip rather than
-                // misread its raw bytes as raster samples.
-                if filter.as_deref() == Some(b"JPXDecode") {
-                    continue;
-                }
-                // Resolve the image colour space (DeviceGray/RGB/CMYK, Indexed,
-                // ICCBased, Separation/DeviceN, Lab) into a converter, then map
-                // every packed sample group to RGB honouring `/BitsPerComponent`
-                // and `/Decode`. This is the non-RGB "blank/garbled image" fix.
-                let cs_obj = dict.get(b"ColorSpace").map(|o| self.resolve(o));
-                let Some(cs) = cs_obj.and_then(|o| self.resolve_color_space(o, 0)) else {
-                    continue; // unknown colour space — skip rather than misread
-                };
-                let Ok(samples) = decode_stream(stream) else {
-                    continue;
-                };
-                color_key = self.color_key_mask(dict, &samples, w, h, &cs, bpc);
-                match self.image_samples_to_rgb(&cs, &samples, w, h, bpc, dict) {
-                    Some(rgb) => rgb,
-                    None => continue,
-                }
-            };
-            // A `/SMask` (8-bit DeviceGray image) supplies per-pixel alpha — this
-            // is how PNG transparency (and a JPEG photo's soft cut-out) survives
-            // embedding. Sampled nearest-neighbour so a soft mask of a different
-            // size still maps (identity when the dimensions match, the common
-            // case). An explicit `/Mask` (a 1-bit `/ImageMask` stream) is the hard
-            // 1-bit counterpart: its set bits hide the base image.
-            let smask = self.decode_gray_smask(dict);
-            let explicit_mask = self.decode_explicit_mask(dict);
-            let mut rgba = Vec::with_capacity(w * h * 4);
-            for y in 0..h {
-                for x in 0..w {
-                    let [r, g, b] = rgb[y * w + x];
-                    let mut a = match &smask {
-                        Some((sw, sh, alpha)) => {
-                            let sx = if *sw == w { x } else { x * *sw / w };
-                            let sy = if *sh == h { y } else { y * *sh / h };
-                            alpha.get(sy * *sw + sx).copied().unwrap_or(255)
-                        }
-                        None => 255,
-                    };
-                    if let Some((mw, mh, hidden)) = &explicit_mask {
-                        let mx = if *mw == w { x } else { x * *mw / w };
-                        let my = if *mh == h { y } else { y * *mh / h };
-                        if hidden.get(my * *mw + mx).copied().unwrap_or(false) {
-                            a = 0;
-                        }
-                    }
-                    if let Some(key) = &color_key {
-                        if key.get(y * w + x).copied().unwrap_or(false) {
-                            a = 0;
-                        }
-                    }
-                    rgba.extend_from_slice(&[r, g, b, a]);
-                }
-            }
-            out.insert(
-                name.clone(),
-                crate::raster::render::RenderImage {
-                    width: width as u32,
-                    height: height as u32,
-                    rgba,
-                    stencil: false,
-                },
-            );
         }
         out
+    }
+
+    /// Decode an image stream (a `/Subtype /Image` XObject **or** a synthetic
+    /// stream built from an inline image, [`InlineImage::to_stream`]) into a
+    /// [`RenderImage`]. Shared by `Do`-reached XObjects and inline images
+    /// (`BI`/`ID`/`EI`) so both go through identical colour-space, filter, mask
+    /// and `/Decode` handling. `None` when the geometry is invalid, the colour
+    /// space/filter is one the engine does not decode (JPX, CCITT, progressive
+    /// JPEG …), or the data is too short.
+    fn decode_image_stream(&self, stream: &Stream) -> Option<crate::raster::render::RenderImage> {
+        let dict = &stream.dict;
+        let width = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
+        let height = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let (w, h) = (width as usize, height as usize);
+        let filter = self.first_filter(dict);
+        // An `/ImageMask true` XObject is a 1-bit stencil: it has no colour
+        // space and paints the *current fill colour* through its unmasked
+        // pixels. Decode it into an alpha-only image (RGB is a placeholder)
+        // tagged `stencil`, so the rasterizer substitutes the fill colour at
+        // `Do` time.
+        if dict
+            .get(b"ImageMask")
+            .and_then(Object::as_bool)
+            .unwrap_or(false)
+        {
+            let alpha = self.decode_stencil_alpha(stream, dict, w, h)?;
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for a in alpha {
+                rgba.extend_from_slice(&[0, 0, 0, a]);
+            }
+            return Some(crate::raster::render::RenderImage {
+                width: width as u32,
+                height: height as u32,
+                rgba,
+                stencil: true,
+            });
+        }
+        // Decode the image's RGB samples (one `[r, g, b]` triple per pixel,
+        // row-major). A baseline JPEG (`/DCTDecode`) is decoded by the
+        // built-in JPEG decoder from the raw (still-DCT-coded) stream bytes;
+        // everything else is an uncompressed/Flate sample grid whose
+        // component layout the `/ColorSpace` describes.
+        // A colour-key `/Mask [min0 max0 …]` makes pixels whose *raw* samples
+        // all fall in the given per-component ranges transparent; it is keyed
+        // on the integer samples, so it is computed alongside the (non-JPEG)
+        // sample decode where they are available. `None` = no colour key.
+        let mut color_key: Option<Vec<bool>> = None;
+        let rgb: Vec<[u8; 3]> = if filter.as_deref() == Some(b"DCTDecode") {
+            let (jw, jh, jrgba) = crate::raster::jpeg::decode_jpeg(&stream.raw)?;
+            if jw as usize != w || jh as usize != h || jrgba.len() < w * h * 4 {
+                return None; // progressive/arithmetic/malformed — not yet decoded
+            }
+            jrgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect()
+        } else {
+            let bpc = dict
+                .get(b"BitsPerComponent")
+                .and_then(Object::as_i64)
+                .unwrap_or(8)
+                .clamp(1, 16) as u32;
+            // JPXDecode (JPEG 2000) is not decoded yet; skip rather than
+            // misread its raw bytes as raster samples.
+            if filter.as_deref() == Some(b"JPXDecode") {
+                return None;
+            }
+            // Resolve the image colour space (DeviceGray/RGB/CMYK, Indexed,
+            // ICCBased, Separation/DeviceN, Lab) into a converter, then map
+            // every packed sample group to RGB honouring `/BitsPerComponent`
+            // and `/Decode`. This is the non-RGB "blank/garbled image" fix.
+            let cs_obj = dict.get(b"ColorSpace").map(|o| self.resolve(o));
+            let cs = cs_obj.and_then(|o| self.resolve_color_space(o, 0))?;
+            // An unsupported filter (e.g. CCITTFaxDecode) makes `decode_stream`
+            // error — skip rather than misread its bytes as raster samples.
+            let samples = decode_stream(stream).ok()?;
+            color_key = self.color_key_mask(dict, &samples, w, h, &cs, bpc);
+            self.image_samples_to_rgb(&cs, &samples, w, h, bpc, dict)?
+        };
+        // A `/SMask` (8-bit DeviceGray image) supplies per-pixel alpha — this
+        // is how PNG transparency (and a JPEG photo's soft cut-out) survives
+        // embedding. Sampled nearest-neighbour so a soft mask of a different
+        // size still maps (identity when the dimensions match, the common
+        // case). An explicit `/Mask` (a 1-bit `/ImageMask` stream) is the hard
+        // 1-bit counterpart: its set bits hide the base image.
+        let smask = self.decode_gray_smask(dict);
+        let explicit_mask = self.decode_explicit_mask(dict);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b] = rgb[y * w + x];
+                let mut a = match &smask {
+                    Some((sw, sh, alpha)) => {
+                        let sx = if *sw == w { x } else { x * *sw / w };
+                        let sy = if *sh == h { y } else { y * *sh / h };
+                        alpha.get(sy * *sw + sx).copied().unwrap_or(255)
+                    }
+                    None => 255,
+                };
+                if let Some((mw, mh, hidden)) = &explicit_mask {
+                    let mx = if *mw == w { x } else { x * *mw / w };
+                    let my = if *mh == h { y } else { y * *mh / h };
+                    if hidden.get(my * *mw + mx).copied().unwrap_or(false) {
+                        a = 0;
+                    }
+                }
+                if let Some(key) = &color_key {
+                    if key.get(y * w + x).copied().unwrap_or(false) {
+                        a = 0;
+                    }
+                }
+                rgba.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+        Some(crate::raster::render::RenderImage {
+            width: width as u32,
+            height: height as u32,
+            rgba,
+            stencil: false,
+        })
+    }
+
+    /// Decode an inline image (`BI`/`ID`/`EI`) captured verbatim in a content
+    /// stream's synthetic `BI` operation into a [`RenderImage`], reusing the same
+    /// pipeline as `/Image` XObjects. The `raw` bytes are everything after `BI` up
+    /// to and including `EI` (as produced by the content parser). `None` when the
+    /// dictionary can't be parsed or the engine doesn't decode its
+    /// colour-space/filter (e.g. `/CCF` CCITTFax, which has no decoder yet).
+    pub(crate) fn decode_inline_image(
+        &self,
+        raw: &[u8],
+    ) -> Option<crate::raster::render::RenderImage> {
+        let inline = crate::content::parse_inline_image(raw)?;
+        self.decode_image_stream(&inline.to_stream())
     }
 
     /// Convert a decoded sample grid (`samples`, packed MSB-first, each scanline
@@ -17090,6 +17102,10 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
             }
         };
         Some(cs.to_rgb(comps, self.doc))
+    }
+
+    fn inline_image(&self, raw: &[u8]) -> Option<crate::raster::render::RenderImage> {
+        self.doc.decode_inline_image(raw)
     }
 }
 
@@ -28109,5 +28125,120 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains("/PageLayout"));
         assert!(!text.contains("/PageMode"));
+    }
+
+    /// Lowercase ASCIIHex-encode `bytes` (for building inline-image `/AHx` data).
+    fn ascii_hex(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.extend_from_slice(format!("{b:02x}").as_bytes());
+        }
+        out
+    }
+
+    /// The captured `BI` body (after `BI`, up to and including `EI`) for the first
+    /// inline image in a content stream — what the rasterizer/decoder receive.
+    fn captured_inline_body(content: &[u8]) -> Vec<u8> {
+        let ops = crate::content::parse_content(content).unwrap();
+        let op = ops.iter().find(|o| o.operator == b"BI").expect("BI op");
+        match op.operands.first() {
+            Some(Object::String(raw, _)) => raw.clone(),
+            other => panic!("BI operand not a string: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_image_asciihex_flate_decodes_to_rgb_pixels() {
+        // 2×1 DeviceRGB image: red then green. Encode the 6 sample bytes through
+        // Flate, then ASCIIHex, and declare `/F [/AHx /Fl]` (abbreviations) — the
+        // exact reverse of the engine's filter chain.
+        let rgb: [u8; 6] = [255, 0, 0, 0, 255, 0];
+        let flated = crate::filters::deflate::flate_encode(&rgb);
+        let hex = ascii_hex(&flated);
+        let mut content = b"BI /W 2 /H 1 /CS /RGB /BPC 8 /F [/AHx /Fl] ID ".to_vec();
+        content.extend_from_slice(&hex);
+        content.extend_from_slice(b" EI");
+
+        let doc = blank_doc();
+        let raw = captured_inline_body(&content);
+        let img = doc.decode_inline_image(&raw).expect("inline image decoded");
+        assert_eq!((img.width, img.height), (2, 1), "declared dimensions");
+        assert!(!img.stencil, "RGB image is not a stencil");
+        assert_eq!(img.rgba.len(), 8, "RGBA buffer size (2×1×4)");
+        // Pixel 0 = opaque red, pixel 1 = opaque green.
+        assert_eq!(&img.rgba[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&img.rgba[4..8], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn inline_image_mask_decodes_as_stencil() {
+        // 8×1 `/IM true` 1-bpc image mask, one data byte 0b1010_0000 = 0xA0.
+        // Default `/Decode [0 1]`: a sample **0** paints the fill colour (alpha
+        // 255), a **1** is transparent (alpha 0). So bits → alpha:
+        //   1 0 1 0 0 0 0 0  ⇒  0 255 0 255 255 255 255 255
+        let content = b"BI /W 8 /H 1 /IM true ID \xA0 EI";
+        let doc = blank_doc();
+        let raw = captured_inline_body(content);
+        let img = doc.decode_inline_image(&raw).expect("mask decoded");
+        assert_eq!((img.width, img.height), (8, 1));
+        assert!(img.stencil, "image mask is a stencil");
+        let alpha: Vec<u8> = img.rgba.chunks_exact(4).map(|p| p[3]).collect();
+        assert_eq!(alpha, vec![0, 255, 0, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn inline_image_unfiltered_gray_with_ei_bytes_in_data() {
+        // 2×1 DeviceGray, 8 bpc, no filter: two sample bytes that spell "EI"
+        // (0x45, 0x49). The length-aware capture must keep both as data and not
+        // stop at the literal "EI" inside the samples.
+        let content = b"BI /W 2 /H 1 /CS /G /BPC 8 ID \x45\x49 EI";
+        let doc = blank_doc();
+        let raw = captured_inline_body(content);
+        let img = doc.decode_inline_image(&raw).expect("gray decoded");
+        assert_eq!((img.width, img.height), (2, 1));
+        assert!(!img.stencil);
+        // DeviceGray 0x45/0x49 → grey RGB (r==g==b==sample).
+        assert_eq!(&img.rgba[0..4], &[0x45, 0x45, 0x45, 255]);
+        assert_eq!(&img.rgba[4..8], &[0x49, 0x49, 0x49, 255]);
+    }
+
+    #[test]
+    fn inline_image_unsupported_ccitt_filter_is_skipped() {
+        // `/CCF` (CCITTFaxDecode) has no engine decoder yet — decoding returns
+        // `None` rather than misreading the bytes (honest, documented gap).
+        let content = b"BI /W 8 /H 1 /IM true /F /CCF ID \x00\x00\x00\x00 EI";
+        let doc = blank_doc();
+        let raw = captured_inline_body(content);
+        assert!(
+            doc.decode_inline_image(&raw).is_none(),
+            "CCITTFax inline image is not decoded (no engine decoder)"
+        );
+    }
+
+    #[test]
+    fn inline_image_renders_onto_the_page() {
+        // A page whose content stream draws a 1×1 DeviceRGB *red* inline image over
+        // the unit square scaled to fill the 100×100 page. The rasterizer must hit
+        // the `BI` arm, decode the pixel, and blit it — so the canvas centre is red.
+        let content = b"100 0 0 100 0 0 cm BI /W 1 /H 1 /CS /RGB /BPC 8 ID \xFF\x00\x00 EI";
+        let mut page_content = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        page_content.extend_from_slice(content);
+        page_content.extend_from_slice(b"\nendstream");
+        let objects: Vec<(u32, Vec<u8>)> = vec![
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>".to_vec(),
+            ),
+            (4, page_content),
+        ];
+        let doc = Document::open(&raw_pdf_binary(&objects)).unwrap();
+        let canvas = doc.render_page_canvas(1, 1.0, false).unwrap();
+        let c = px(&canvas, 50, 50);
+        assert!(
+            c[0] > 200 && c[1] < 60 && c[2] < 60,
+            "inline image painted red at the page centre, got {c:?}"
+        );
     }
 }

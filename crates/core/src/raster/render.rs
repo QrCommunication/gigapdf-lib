@@ -181,6 +181,14 @@ pub trait ResourceCtx {
     /// Device-space names (`DeviceGray`/`DeviceRGB`/`DeviceCMYK`) are resolved
     /// here too so a `cs /DeviceCMYK … scn` path is exact.
     fn resolve_color(&self, name: &[u8], comps: &[f64]) -> Option<[u8; 3]>;
+    /// Decode an inline image (the `raw` bytes the content parser captured for a
+    /// `BI`…`EI` operation: everything after `BI` up to and including `EI`) into a
+    /// ready-to-blit [`RenderImage`], reusing the document's image pipeline.
+    /// The default returns `None` (contexts that don't own the object graph can't
+    /// decode); the document-backed context overrides it. ISO 32000-1 §8.9.7.
+    fn inline_image(&self, _raw: &[u8]) -> Option<RenderImage> {
+        None
+    }
 }
 
 /// A resource context that resolves nothing — used by [`render_content_into`],
@@ -895,6 +903,29 @@ pub fn render_content_into_ctx(
                         if let Some(form) = ctx.form_xobject(name) {
                             draw_form(canvas, &form, &state, &base, global_alpha, depth, skip_text);
                         }
+                    }
+                }
+            }
+
+            // Inline image (`BI`…`ID`<data>`EI`, §8.9.7): the content parser stored
+            // the captured body as this op's single string operand. Decode it
+            // through the same pipeline as `/Image` XObjects and blit it over the
+            // unit square, exactly like a `Do` image. An `/IM true` stencil paints
+            // the current fill colour through its mask.
+            b"BI" if !skip_paint => {
+                if let Some(Object::String(raw, _)) = op.operands.first() {
+                    if let Some(image) = ctx.inline_image(raw) {
+                        let clip = state.paint_clip();
+                        blit_image_clipped(
+                            canvas,
+                            &image,
+                            &state.ctm,
+                            &base,
+                            global_alpha * state.fill_alpha,
+                            clip.as_ref(),
+                            state.blend,
+                            state.fill,
+                        );
                     }
                 }
             }

@@ -307,25 +307,283 @@ fn read_dict(lexer: &mut Lexer) -> Result<Dictionary> {
 }
 
 /// Capture an inline image's body (everything after `BI` up to and including the
-/// terminating `EI`) so it can be re-emitted verbatim.
+/// terminating `EI`) so it can be re-emitted verbatim **and** decoded.
+///
+/// The `ID`/`EI` boundary is binary (ISO 32000-1 §8.9.7): the data may contain a
+/// literal `0x45 0x49` (`"EI"`). To avoid cutting there, when the image declares
+/// **no `/Filter`** and a computable geometry, we skip exactly the sample bytes
+/// (`ceil(W·ncomp·BPC / 8) · H`, or `ceil(W / 8) · H` for a mask) before looking
+/// for `EI`. Otherwise (filtered data, or unknown geometry) we fall back to the
+/// whitespace-delimited `EI` scan.
 fn capture_inline_image(lexer: &mut Lexer) -> Vec<u8> {
     let data = lexer.data();
     let start = lexer.position();
-    let mut pos = start;
-    while pos + 1 < data.len() {
-        let at_word = data[pos] == b'E'
-            && data[pos + 1] == b'I'
-            && (pos == 0 || is_whitespace(data[pos - 1]))
-            && (pos + 2 >= data.len() || is_whitespace(data[pos + 2]));
+    let slice = &data[start..];
+
+    // Parse the dict and locate where the binary data begins (just after the
+    // single whitespace following `ID`). With no filter and known geometry, jump
+    // past the exact sample byte count so a raw "EI" inside the pixels is skipped.
+    let mut search_from = 0usize; // offset within `slice` to begin the EI scan
+    if let Some((dict, data_off)) = scan_inline_dict(slice) {
+        if !dict.contains(b"Filter") {
+            if let Some(len) = unfiltered_inline_len(&dict) {
+                search_from = (data_off + len).min(slice.len());
+            }
+        }
+    }
+
+    let mut pos = search_from;
+    while pos + 1 < slice.len() {
+        let at_word = slice[pos] == b'E'
+            && slice[pos + 1] == b'I'
+            && (pos == 0 || is_whitespace(slice[pos - 1]))
+            && (pos + 2 >= slice.len() || is_whitespace(slice[pos + 2]));
         if at_word {
             pos += 2;
             break;
         }
         pos += 1;
     }
-    let end = pos.min(data.len());
+    let end = (start + pos).min(data.len());
     lexer.set_position(end);
     data[start..end].to_vec()
+}
+
+/// Parse an inline image's dictionary from `slice` (the bytes right after `BI`),
+/// returning the dictionary with **long-name** keys (abbreviations of Table 92/93
+/// expanded) and the offset within `slice` where the binary data begins — just
+/// past the single whitespace byte that follows `ID` (§8.9.7). `None` if no `ID`
+/// keyword is found.
+fn scan_inline_dict(slice: &[u8]) -> Option<(Dictionary, usize)> {
+    let mut lexer = Lexer::new(slice);
+    let mut dict = Dictionary::new();
+    loop {
+        let before = lexer.position();
+        match lexer.next_token().ok()? {
+            Token::Keyword(k) if k.as_slice() == b"ID" => {
+                // The lexer stops right after `ID`; one whitespace byte separates
+                // it from the data (§8.9.7).
+                let data_off = (lexer.position() + 1).min(slice.len());
+                return Some((dict, data_off));
+            }
+            Token::Eof => return None,
+            Token::Name(key) => {
+                let value_token = lexer.next_token().ok()?;
+                let value = read_value(&mut lexer, value_token).ok()?;
+                let long = inline_key_long_name(&key).to_vec();
+                let value = match long.as_slice() {
+                    b"Filter" => normalize_inline_filter(value),
+                    b"ColorSpace" => normalize_inline_colorspace(value),
+                    _ => value,
+                };
+                dict.set(long, value);
+            }
+            // Tolerate stray tokens before a key; bail if the lexer didn't advance.
+            _ => {
+                if lexer.position() == before {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// A parsed inline image (`BI` … `ID` <data> `EI`, ISO 32000-1 §8.9.7).
+///
+/// The [`dict`](Self::dict) keys are normalised to their **long** names (the
+/// abbreviations of Table 92 — `/W`→`/Width`, `/CS`→`/ColorSpace`,
+/// `/F`→`/Filter`, …) so the very same image-XObject decode pipeline can consume
+/// it. [`data`](Self::data) is the raw (still-filter-coded) sample bytes between
+/// `ID` and `EI`.
+#[derive(Debug, Clone)]
+pub struct InlineImage {
+    /// Image dictionary with long-name keys (`/Width`, `/Height`,
+    /// `/BitsPerComponent`, `/ColorSpace`, `/Filter`, `/DecodeParms`,
+    /// `/ImageMask`, `/Decode`, `/Intent`, `/Interpolate`).
+    pub dict: Dictionary,
+    /// Raw image data (between `ID` and `EI`), still carrying any `/Filter`.
+    pub data: Vec<u8>,
+}
+
+impl InlineImage {
+    /// Build a synthetic image-XObject [`Stream`](crate::object::Stream) from this
+    /// inline image: the long-name dictionary as the stream dict and the raw bytes
+    /// as the stream body. This lets the inline image be decoded by the exact same
+    /// path used for `/Image` XObjects reached through `Do`.
+    pub fn to_stream(&self) -> crate::object::Stream {
+        crate::object::Stream::new(self.dict.clone(), self.data.clone())
+    }
+}
+
+/// Map an inline-image abbreviated dictionary key (ISO 32000-1 §8.9.7, Table 92)
+/// to its full XObject name, so the standard image decode path can read it.
+/// Keys that are already long (or unknown) pass through unchanged.
+fn inline_key_long_name(key: &[u8]) -> &[u8] {
+    match key {
+        b"BPC" => b"BitsPerComponent",
+        b"CS" => b"ColorSpace",
+        b"D" => b"Decode",
+        b"DP" => b"DecodeParms",
+        b"F" => b"Filter",
+        b"H" => b"Height",
+        b"IM" => b"ImageMask",
+        b"I" => b"Interpolate",
+        b"W" => b"Width",
+        other => other,
+    }
+}
+
+/// Map an inline-image abbreviated filter name (Table 93) to its full name, so the
+/// engine's filter pipeline (which already accepts most abbreviations) and the
+/// image decoder (which switches on the long `DCTDecode`/`CCITTFaxDecode` names)
+/// both recognise it. Long/unknown names pass through.
+fn inline_filter_long_name(name: &[u8]) -> &[u8] {
+    match name {
+        b"AHx" => b"ASCIIHexDecode",
+        b"A85" => b"ASCII85Decode",
+        b"LZW" => b"LZWDecode",
+        b"Fl" => b"FlateDecode",
+        b"RL" => b"RunLengthDecode",
+        b"CCF" => b"CCITTFaxDecode",
+        b"DCT" => b"DCTDecode",
+        other => other,
+    }
+}
+
+/// Rewrite a `/Filter` entry (single name or array) through
+/// [`inline_filter_long_name`], leaving non-name objects untouched.
+fn normalize_inline_filter(value: Object) -> Object {
+    match value {
+        Object::Name(n) => Object::Name(inline_filter_long_name(&n).to_vec()),
+        Object::Array(items) => Object::Array(
+            items
+                .into_iter()
+                .map(|o| match o {
+                    Object::Name(n) => Object::Name(inline_filter_long_name(&n).to_vec()),
+                    other => other,
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Normalise a colour-space operand. Inline images may name a device space by its
+/// abbreviation (`/G`, `/RGB`, `/CMYK`) or use `/I`/`/Indexed`; the device-space
+/// abbreviations are expanded to their long names here so resolvers that match on
+/// `DeviceGray`/`DeviceRGB`/`DeviceCMYK` work. `/I [...]` (indexed) and named
+/// colour-space resources are left for the colour-space resolver to interpret.
+fn normalize_inline_colorspace(value: Object) -> Object {
+    match value {
+        Object::Name(n) => {
+            let long: &[u8] = match n.as_slice() {
+                b"G" => b"DeviceGray",
+                b"RGB" => b"DeviceRGB",
+                b"CMYK" => b"DeviceCMYK",
+                _ => return Object::Name(n),
+            };
+            Object::Name(long.to_vec())
+        }
+        other => other,
+    }
+}
+
+/// Parse the body captured by [`capture_inline_image`] (the bytes after `BI` up to
+/// and including `EI`) into an [`InlineImage`]: its dictionary (abbreviations
+/// expanded to long names) and the raw image bytes between `ID` and `EI`.
+///
+/// The `ID`/data boundary follows ISO 32000-1 §8.9.7: a single whitespace byte
+/// after `ID` introduces the binary data. The data length is taken from the
+/// captured slice (which already trimmed the whitespace-delimited terminating
+/// `EI`); when **no `/Filter`** is present and the geometry is known, the data is
+/// clamped to the exact byte count the samples occupy
+/// (`ceil(W·ncomp·BPC / 8) · H`, or `ceil(W / 8) · H` for an image mask), so a raw
+/// `0x45 0x49` (`"EI"`) inside the samples never truncates it.
+pub fn parse_inline_image(raw: &[u8]) -> Option<InlineImage> {
+    // Parse the dict (abbreviations expanded) and find where the data begins.
+    let (dict, data_off) = scan_inline_dict(raw)?;
+    let avail = raw.len().saturating_sub(data_off);
+
+    // With no filter and a known geometry, the sample count is exact: take exactly
+    // that many bytes from `data_off`, so a literal `EI` inside the pixel bytes —
+    // even one that is itself whitespace-delimited — is part of the data, not a
+    // false terminator.
+    if !dict.contains(b"Filter") {
+        if let Some(len) = unfiltered_inline_len(&dict) {
+            if len <= avail {
+                let data = raw[data_off..data_off + len].to_vec();
+                return Some(InlineImage { dict, data });
+            }
+        }
+    }
+
+    // Otherwise (filtered data, or unknown geometry) the captured slice ends just
+    // past the whitespace-delimited terminating `EI`; drop it plus the single
+    // delimiter byte before it to recover the data's upper bound.
+    let mut data_end = raw.len();
+    if raw[..data_end].ends_with(b"EI") {
+        data_end -= 2;
+        if data_end > data_off && is_whitespace(raw[data_end - 1]) {
+            data_end -= 1;
+        }
+    }
+    if data_end < data_off {
+        data_end = data_off;
+    }
+    let data = raw[data_off..data_end].to_vec();
+
+    Some(InlineImage { dict, data })
+}
+
+/// Exact byte length of an **unfiltered** inline image's sample data:
+/// `ceil(Width · ncomp · BitsPerComponent / 8) · Height`, with one component and
+/// 1 bpc for an image mask. `None` when width/height are missing or non-positive.
+fn unfiltered_inline_len(dict: &Dictionary) -> Option<usize> {
+    let w = dict.get(b"Width").and_then(Object::as_i64).unwrap_or(0);
+    let h = dict.get(b"Height").and_then(Object::as_i64).unwrap_or(0);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (w, h) = (w as u64, h as u64);
+    let is_mask = dict
+        .get(b"ImageMask")
+        .and_then(Object::as_bool)
+        .unwrap_or(false);
+    let (ncomp, bpc) = if is_mask {
+        (1u64, 1u64)
+    } else {
+        let bpc = dict
+            .get(b"BitsPerComponent")
+            .and_then(Object::as_i64)
+            .unwrap_or(8)
+            .clamp(1, 16) as u64;
+        // Only compute a length when the component count is *known* from the
+        // colour space; a named/unresolvable space returns `None` so the caller
+        // falls back to the whitespace-delimited `EI` scan rather than guess.
+        (inline_color_components(dict)?, bpc)
+    };
+    let row_bytes = (w * ncomp * bpc).div_ceil(8);
+    usize::try_from(row_bytes * h).ok()
+}
+
+/// Component count implied by an inline image's `/ColorSpace`, for sizing the
+/// unfiltered sample data. `Some(1)` for DeviceGray / Indexed (one palette index
+/// per pixel), `Some(3)`/`Some(4)` for RGB/CMYK device spaces. `None` for a named
+/// colour-space resource or `[/I …]` form (whose base arity can't be known here)
+/// and for an absent colour space — signalling "length unknown".
+fn inline_color_components(dict: &Dictionary) -> Option<u64> {
+    match dict.get(b"ColorSpace") {
+        Some(Object::Name(n)) => match n.as_slice() {
+            b"DeviceGray" | b"CalGray" => Some(1),
+            b"DeviceRGB" | b"CalRGB" => Some(3),
+            b"DeviceCMYK" => Some(4),
+            // A name that isn't a recognised device space is a `/ColorSpace`
+            // resource reference — its arity isn't known without the doc.
+            _ => None,
+        },
+        // Absent or array (e.g. `[/Indexed …]`): not sizeable here.
+        _ => None,
+    }
 }
 
 // ─── encoding ───────────────────────────────────────────────────────────────
@@ -1592,6 +1850,28 @@ fn elements_from_ops_resolved(
                     nested,
                 });
             }
+            // Inline image (`BI`…`EI`): like a `Do` image it fills the unit square
+            // under the current CTM, so it surfaces as an `Image` element with the
+            // same bounds/rotation. The decoded pixels are produced on the render
+            // path; here we only need it addressable for extraction/reconstruction.
+            b"BI" => {
+                let m = ctm.0;
+                let img_rot = m[1].atan2(m[0]).to_degrees();
+                elements.push(ContentElement {
+                    index: 0,
+                    kind: ElementKind::Image,
+                    label: "inline image".to_string(),
+                    op_start: i,
+                    op_end: i,
+                    bounds: unit_square_bounds(&ctm),
+                    font: None,
+                    color: None,
+                    font_size: None,
+                    rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
+                    fill_alpha: Some(fill_alpha),
+                    nested,
+                });
+            }
             _ if is_path_construction(operator) => {
                 path_start.get_or_insert(i);
                 accumulate_path(operator, &nums(op), &ctm, &mut path_bb);
@@ -2744,6 +3024,88 @@ mod tests {
         let reencoded = encode_content(&ops);
         assert!(reencoded.windows(2).any(|w| w == b"BI"));
         assert!(reencoded.windows(2).any(|w| w == b"EI"));
+    }
+
+    /// The captured `BI` body (what `capture_inline_image` stores) for the raw of a
+    /// parsed `BI` op — the slice after `BI`, up to and including `EI`.
+    fn captured_bi_body(content: &[u8]) -> Vec<u8> {
+        let ops = parse_content(content).unwrap();
+        let op = ops.iter().find(|o| o.operator == b"BI").expect("BI op");
+        match op.operands.first() {
+            Some(Object::String(raw, _)) => raw.clone(),
+            other => panic!("BI operand not a string: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_inline_image_expands_abbreviations() {
+        // 2×1 RGB image, 8 bpc, 6 sample bytes, no filter.
+        let content = b"BI /W 2 /H 1 /BPC 8 /CS /RGB /IM false ID \x01\x02\x03\x04\x05\x06 EI";
+        let raw = captured_bi_body(content);
+        let img = parse_inline_image(&raw).expect("inline image parsed");
+        // Abbreviated keys mapped to their long names.
+        assert_eq!(img.dict.get(b"Width").and_then(Object::as_i64), Some(2));
+        assert_eq!(img.dict.get(b"Height").and_then(Object::as_i64), Some(1));
+        assert_eq!(
+            img.dict.get(b"BitsPerComponent").and_then(Object::as_i64),
+            Some(8)
+        );
+        // `/CS /RGB` device abbreviation expanded to the long name.
+        assert_eq!(
+            img.dict.get(b"ColorSpace").and_then(Object::as_name),
+            Some(b"DeviceRGB".as_slice())
+        );
+        // Data is exactly the six sample bytes (no `/Filter` → clamped to length).
+        assert_eq!(img.data, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn parse_inline_image_normalizes_filter_names() {
+        let content = b"BI /W 1 /H 1 /F [/AHx /Fl] ID 78 9c EI";
+        let raw = captured_bi_body(content);
+        let img = parse_inline_image(&raw).expect("inline image parsed");
+        // `/F` → `/Filter`, and each abbreviation expanded so the decode pipeline
+        // and the image decoder both recognise the long names.
+        let filter = img.dict.get(b"Filter").and_then(Object::as_array).unwrap();
+        let names: Vec<&[u8]> = filter.iter().filter_map(Object::as_name).collect();
+        assert_eq!(names, vec![b"ASCIIHexDecode".as_slice(), b"FlateDecode"]);
+    }
+
+    #[test]
+    fn parse_inline_image_finds_ei_past_raw_ei_bytes() {
+        // 8×1 image-mask (1 bpc) → ceil(8/8)*1 = 1 byte of data, here `0x45`
+        // ("E"). Followed by " EI". A naive "first EI" scan over the data + a
+        // literal "EI" later would mis-cut; the length clamp keeps just the byte.
+        // Build data whose single sample byte is 'E' (0x45) and ensure a literal
+        // 0x45 0x49 ("EI") sits *inside* a longer unfiltered grid is handled.
+        // Use a 16-wide mask: ceil(16/8)*1 = 2 bytes = exactly [0x45, 0x49].
+        let content = b"BI /W 16 /H 1 /IM true ID \x45\x49 EI";
+        let raw = captured_bi_body(content);
+        let img = parse_inline_image(&raw).expect("inline image parsed");
+        assert_eq!(img.dict.get(b"Width").and_then(Object::as_i64), Some(16));
+        assert_eq!(
+            img.dict.get(b"ImageMask").and_then(Object::as_bool),
+            Some(true)
+        );
+        // The data is the two real bytes 0x45 0x49 — the trailing ` EI` delimiter
+        // was correctly excluded even though the sample bytes spell "EI".
+        assert_eq!(img.data, vec![0x45, 0x49]);
+    }
+
+    #[test]
+    fn inline_image_surfaces_as_image_element() {
+        // A `cm` places the unit square, then a 1×1 inline image is drawn.
+        let content = b"q 20 0 0 10 5 5 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI Q";
+        let elements = extract_elements(content).unwrap();
+        let img = elements
+            .iter()
+            .find(|e| e.kind == ElementKind::Image)
+            .expect("inline image element");
+        assert_eq!(img.label, "inline image");
+        // Bounds come from the placement CTM's unit square: 20×10 at (5, 5).
+        let b = img.bounds.expect("bounds");
+        assert!((b.width - 20.0).abs() < 1e-6 && (b.height - 10.0).abs() < 1e-6);
+        assert!((b.x - 5.0).abs() < 1e-6 && (b.y - 5.0).abs() < 1e-6);
     }
 
     fn count(data: &[u8], needle: &[u8]) -> usize {
