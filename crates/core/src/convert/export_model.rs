@@ -1996,6 +1996,18 @@ fn pptx_rpr(style: &CharStyle) -> String {
             "<a:solidFill><a:srgbClr val=\"{c}\"/></a:solidFill>"
         ));
     }
+    // Run highlight / background → `a:highlight` (ECMA-376 §21.1.2.3.9), the
+    // PPTX analogue of DOCX `w:shd@fill` and ODF `fo:background-color`. In the
+    // `CT_TextCharacterProperties` child order, `a:highlight` follows the fill
+    // group (`a:solidFill`) and precedes `a:latin`, so it is emitted here. Any
+    // colour is kept (a deliberate highlight, unlike a near-black text colour);
+    // `None` ⇒ nothing, leaving plain runs unchanged.
+    if let Some(bg) = style.background {
+        inner.push_str(&format!(
+            "<a:highlight><a:srgbClr val=\"{}\"/></a:highlight>",
+            hex(bg)
+        ));
+    }
     if !style.family.is_empty() {
         let mut fam = String::new();
         esc(&style.family, &mut fam);
@@ -5313,6 +5325,120 @@ mod tests {
         assert!(
             !plain_content.contains("fo:background-color"),
             "plain run has no run background: {plain_content}"
+        );
+    }
+
+    /// A one-slide deck whose Title placeholder is `block` — the smallest
+    /// `Document` that exercises the PPTX/ODP slide run writers.
+    fn slide_doc_with(block: Block) -> Document {
+        use crate::model::{Placeholder, PlaceholderRole, Slide, SlideBlock};
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+            },
+            shapes: Vec::new(),
+            placeholders: vec![Placeholder {
+                role: PlaceholderRole::Title,
+                block,
+            }],
+            notes: None,
+            background: None,
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pptx_run_highlight_emits_a_highlight() {
+        // #24: a run carrying `CharStyle.background` exports `a:highlight` in its
+        // `a:rPr` (ECMA-376 §21.1.2.3.9) — the PPTX analogue of DOCX `w:shd` and
+        // ODF `fo:background-color`. A run with colour + family + highlight must
+        // emit them in the `CT_TextCharacterProperties` order
+        // `a:solidFill` → `a:highlight` → `a:latin`. A plain run emits no
+        // `a:highlight`.
+        let block = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "lit".to_string(),
+                    style: CharStyle {
+                        family: "Arial".to_string(),
+                        color: Some([1.0, 0.0, 0.0]),
+                        background: Some([1.0, 1.0, 0.0]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = pptx_from_model(&slide_doc_with(block));
+        let s = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+
+        assert!(
+            s.contains("<a:highlight><a:srgbClr val=\"FFFF00\"/></a:highlight>"),
+            "yellow highlight → a:highlight: {s}"
+        );
+        // The run text and its other rPr props survive alongside the highlight.
+        assert!(s.contains("<a:t>lit</a:t>"), "run text preserved: {s}");
+        assert!(
+            s.contains("<a:solidFill><a:srgbClr val=\"FF0000\"/></a:solidFill>"),
+            "run colour preserved: {s}"
+        );
+        assert!(
+            s.contains("<a:latin typeface=\"Arial\"/>"),
+            "run family preserved: {s}"
+        );
+        // Schema child order: fill, then highlight, then latin.
+        let fill = s.find("<a:solidFill>").expect("solidFill present");
+        let hi = s.find("<a:highlight>").expect("highlight present");
+        let latin = s.find("<a:latin").expect("latin present");
+        assert!(
+            fill < hi && hi < latin,
+            "rPr child order solidFill < highlight < latin: {s}"
+        );
+
+        // A plain run (no background) carries no highlight at all.
+        let plain = pptx_from_model(&slide_doc_with(para("plain")));
+        let plain_s = String::from_utf8(entry(&plain, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            !plain_s.contains("a:highlight"),
+            "plain run has no highlight: {plain_s}"
+        );
+    }
+
+    #[test]
+    fn odp_run_highlight_emits_fo_background_color() {
+        // #24 (ODP side): a slide run's `CharStyle.background` already exports
+        // `fo:background-color` on its text auto-style (shared `odf_span_style`
+        // with ODT). Locked here so the slide path cannot silently regress.
+        let bytes = odp_from_model(&slide_doc_with(highlighted_para("lit", [1.0, 1.0, 0.0])));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("fo:background-color=\"#FFFF00\""),
+            "yellow highlight → fo:background-color on slide run: {content}"
+        );
+
+        let plain = odp_from_model(&slide_doc_with(para("plain")));
+        let plain_content = String::from_utf8(entry(&plain, "content.xml").unwrap()).unwrap();
+        assert!(
+            !plain_content.contains("fo:background-color"),
+            "plain slide run has no run background: {plain_content}"
         );
     }
 
