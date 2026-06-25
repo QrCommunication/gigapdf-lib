@@ -137,11 +137,37 @@ abbreviated dictionary keys (`/W`, `/H`, `/BPC`, `/CS`, `/F`, `/IM`, `/D`, `/DP`
 exact sample length when unfiltered (so a literal `EI` inside the pixel bytes
 never truncates them) and by a whitespace-delimited `EI` scan otherwise, and the
 samples run through the engine's filters — `/AHx` (ASCIIHex), `/A85` (ASCII85),
-`/LZW`, `/Fl` (Flate), `/RL` (RunLength), `/DCT` (baseline JPEG) — and colour
-spaces `/G`/`/RGB`/`/CMYK`/`/I` (plus Indexed). `/IM true` image masks paint the
-current fill colour through the stencil. **Not yet decoded:** `/CCF`
-(CCITTFaxDecode) — no engine decoder exists, so such inline images are skipped
-(the same limitation applies to CCITT XObjects).
+`/LZW`, `/Fl` (Flate), `/RL` (RunLength), `/DCT` (baseline JPEG), `/CCF`
+(CCITTFax, see below) — and colour spaces `/G`/`/RGB`/`/CMYK`/`/I` (plus Indexed).
+`/IM true` image masks paint the current fill colour through the stencil. **Not
+yet decoded:** `/JPX` (JPEG 2000).
+
+**Bilevel scanned-document images (ISO 32000-1 §7.4.6 / §7.4.7):** the two fax /
+bilevel filters used by N&B scans are now decoded from scratch (pure `std`, zero
+deps) and flow through the normal 1-bpp image path — both for **rasterizing** and
+**image extraction** (an XObject or inline image, an `/ImageMask` stencil, an
+explicit `/Mask`, or a soft `/SMask`):
+
+- **`/CCITTFaxDecode`** — Group 3 1-D (`/K 0`), Group 3 2-D (`/K > 0`, per-line
+  1-D/2-D tag bit) and Group 4 (`/K < 0`, pure 2-D). The full modified-Huffman
+  white/black run-length tables (terminating + make-up + the shared >1728 make-up
+  codes), the 2-D modes (Pass, Horizontal, Vertical `V0`/`VR1‑3`/`VL1‑3`) via the
+  `a0`/`a1`/`b1`/`b2` changing-element algorithm, and `/Columns`, `/Rows`,
+  `/BlackIs1`, `/EncodedByteAlign`, `/EndOfLine`, `/EndOfBlock` (RTC/EOFB) are
+  honoured.
+- **`/JBIG2Decode`** — the embedded-in-PDF profile: the segment-header parser, the
+  MQ arithmetic decoder (Annex E `Qe` table + INITDEC/DECODE/RENORMD/BYTEIN), the
+  integer arithmetic decoders (`IADH`/`IADW`/`IAEX`/`IADT`/`IAFS`/`IADS`/`IAIT` +
+  the `IAID` symbol-id coder), and the **generic region** (GB templates 0-3 with
+  `TPGDON` typical prediction, plus an MMR mode that reuses the CCITT G4 core),
+  **symbol dictionary** and **text region** segments — composited onto the page
+  bitmap with the segment combination operator. An inline `/JBIG2Globals` stream
+  in `/DecodeParms` is honoured. **Precise gaps:** generic *refinement* regions
+  (§6.3), *halftone* regions / pattern dictionaries (§6.6), Huffman-coded (vs
+  arithmetic) symbol dictionaries/text regions, and a `/JBIG2Globals` supplied as
+  an *indirect reference* (the filter layer resolves only an inline globals
+  stream; page-stream segments still decode) — an unsupported segment is skipped
+  (its region left blank) rather than aborting the page.
 
 **Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
 (Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`

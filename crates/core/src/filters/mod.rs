@@ -5,12 +5,17 @@
 //! in order, with its matching `/DecodeParms` entry. The classic five filters
 //! are all implemented in-house: FlateDecode, LZWDecode, ASCII85Decode,
 //! ASCIIHexDecode and RunLengthDecode. `/Predictor` post-processing (for
-//! FlateDecode/LZWDecode) is reversed via the [`predictor`] pass.
+//! FlateDecode/LZWDecode) is reversed via the [`predictor`] pass. The two
+//! bilevel scanned-document filters are implemented from scratch as well:
+//! [`ccitt`] (CCITTFaxDecode, Group 3/4) and [`jbig2`] (JBIG2Decode); both yield
+//! MSB-first packed 1-bpp rows that the image sample path consumes directly.
 
 pub mod ascii85;
 pub mod asciihex;
+pub mod ccitt;
 pub mod deflate;
 pub mod inflate;
+pub mod jbig2;
 pub mod lzw;
 pub mod predictor;
 pub mod runlength;
@@ -84,6 +89,19 @@ fn apply_filter(name: &[u8], data: &[u8], parms: Option<&Dictionary>) -> Result<
         b"ASCII85Decode" | b"A85" => ascii85::ascii_85_decode(data),
         b"ASCIIHexDecode" | b"AHx" => asciihex::ascii_hex_decode(data),
         b"RunLengthDecode" | b"RL" => runlength::run_length_decode(data),
+        b"CCITTFaxDecode" | b"CCF" => {
+            let p = parms.map(ccitt::CcittParams::from_dict).unwrap_or_default();
+            ccitt::ccitt_decode(data, &p)
+        }
+        b"JBIG2Decode" => {
+            // The JBIG2 page-stream segments decode here. A `/JBIG2Globals`
+            // entry that is already an inline (resolved) stream object in the
+            // parms is honoured; an unresolved indirect reference cannot be
+            // followed at the filter layer (it has no document context), so only
+            // the page-stream segments are decoded in that case.
+            let globals = parms.and_then(jbig2_globals_bytes);
+            jbig2::jbig2_decode(data, globals.as_deref(), parms)
+        }
         other => Err(EngineError::Unsupported(format!(
             "stream filter /{}",
             String::from_utf8_lossy(other)
@@ -120,6 +138,21 @@ fn predictor_params(dict: &Dictionary) -> PredictorParams {
         params.columns = v;
     }
     params
+}
+
+/// The decoded bytes of an inline `/JBIG2Globals` stream carried in a JBIG2
+/// `/DecodeParms` dict, if present and already a (resolved) stream object.
+///
+/// `/JBIG2Globals` is normally an indirect reference, which cannot be resolved
+/// here (the filter layer has no document); in that common case this returns
+/// `None` and the page-stream segments decode on their own. When the globals are
+/// embedded inline (a literal stream object), their own filter chain is applied
+/// so the returned bytes are the raw JBIG2 globals segments.
+fn jbig2_globals_bytes(parms: &Dictionary) -> Option<Vec<u8>> {
+    match parms.get(b"JBIG2Globals") {
+        Some(Object::Stream(stream)) => decode_stream(stream).ok(),
+        _ => None,
+    }
 }
 
 /// The LZW `/EarlyChange` flag (default 1 = true, Adobe behaviour).
@@ -222,6 +255,72 @@ mod tests {
     fn unsupported_filter_errors() {
         let stream = stream_with(Object::Name(b"JPXDecode".to_vec()), b"data".to_vec());
         assert!(decode_stream(&stream).is_err());
+    }
+
+    #[test]
+    fn ccittfax_decode_through_dispatch() {
+        // A 1-D (K=0) CCITT row of 8 columns: white 2, black 4, white 2, coded
+        // with the modified-Huffman codes. Verify the `/CCITTFaxDecode` filter is
+        // dispatched and produces the expected packed 1-bpp byte.
+        // W2 = 0x07 (4 bits) = 0111; B4 = 0x03 (3 bits) = 011; W2 = 0111.
+        // 0111 011 0111 = 0111_0110_111 -> bytes 0x76 0xE0.
+        let coded = vec![0x76u8, 0xE0];
+        let mut dict = Dictionary::new();
+        dict.set(b"Filter".to_vec(), Object::Name(b"CCITTFaxDecode".to_vec()));
+        let mut parms = Dictionary::new();
+        parms.set(b"K".to_vec(), Object::Integer(0));
+        parms.set(b"Columns".to_vec(), Object::Integer(8));
+        parms.set(b"Rows".to_vec(), Object::Integer(1));
+        parms.set(b"EndOfBlock".to_vec(), Object::Boolean(false));
+        dict.set(b"DecodeParms".to_vec(), Object::Dictionary(parms));
+        let stream = Stream::new(dict, coded);
+        // WW BBBB WW with 0=black (BlackIs1 default false): 1 1 0 0 0 0 1 1 = 0xC3.
+        assert_eq!(decode_stream(&stream).unwrap(), vec![0xC3]);
+    }
+
+    #[test]
+    fn jbig2_decode_through_dispatch() {
+        // A minimal JBIG2 stream (page-info + MMR generic region) routed through
+        // the `/JBIG2Decode` filter dispatch. The bytes are the same fixture the
+        // jbig2 module test builds, inlined here.
+        // page info (8x2) + an MMR generic region painting WWW BB WWW per row.
+        let mut s: Vec<u8> = Vec::new();
+        // Segment 0: page info.
+        s.extend_from_slice(&0u32.to_be_bytes());
+        s.push(48);
+        s.push(0x00);
+        s.push(1);
+        s.extend_from_slice(&19u32.to_be_bytes());
+        s.extend_from_slice(&8u32.to_be_bytes());
+        s.extend_from_slice(&2u32.to_be_bytes());
+        s.extend_from_slice(&0u32.to_be_bytes());
+        s.extend_from_slice(&0u32.to_be_bytes());
+        s.push(0x00);
+        s.extend_from_slice(&0u16.to_be_bytes());
+        // Segment 1: immediate generic region (type 38), MMR. The MMR payload
+        // 0x31 0xF8 decodes (G4) to WWW BB WWW for both rows (validated in the
+        // jbig2 module's own round-trip test).
+        let mmr = [0x31u8, 0xF8];
+        let mut region = Vec::new();
+        region.extend_from_slice(&8u32.to_be_bytes());
+        region.extend_from_slice(&2u32.to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.push(0x00); // OR
+        region.push(0x01); // MMR generic flags
+        region.extend_from_slice(&mmr);
+        s.extend_from_slice(&1u32.to_be_bytes());
+        s.push(38);
+        s.push(0x00);
+        s.push(1);
+        s.extend_from_slice(&(region.len() as u32).to_be_bytes());
+        s.extend_from_slice(&region);
+
+        let mut dict = Dictionary::new();
+        dict.set(b"Filter".to_vec(), Object::Name(b"JBIG2Decode".to_vec()));
+        let stream = Stream::new(dict, s);
+        // 8x2, 0=black: WWW BB WWW = 0xE7 per row.
+        assert_eq!(decode_stream(&stream).unwrap(), vec![0xE7, 0xE7]);
     }
 
     #[test]
