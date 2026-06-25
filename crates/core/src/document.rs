@@ -9003,17 +9003,27 @@ impl Document {
         let stroke_scale = (sx * sy).sqrt();
 
         for prim in &img.prims {
-            // Build the path once (m/l/c/h) in PDF coordinates.
+            // Build the path once (m/l/c/h) in PDF coordinates, tracking its
+            // PDF-space bounding box (used as the gradient soft-mask group's BBox).
             let mut path: Vec<u8> = Vec::new();
             let mut drew = false;
+            let (mut bx0, mut by0, mut bx1, mut by1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            let mut grow = |u: f64, v: f64| {
+                bx0 = bx0.min(u);
+                by0 = by0.min(v);
+                bx1 = bx1.max(u);
+                by1 = by1.max(v);
+            };
             for seg in &prim.segs {
                 match *seg {
                     Seg::Move(px, py) => {
                         let (u, v) = map(px, py);
+                        grow(u, v);
                         path.extend_from_slice(format!("{} {} m\n", num(u), num(v)).as_bytes());
                     }
                     Seg::Line(px, py) => {
                         let (u, v) = map(px, py);
+                        grow(u, v);
                         path.extend_from_slice(format!("{} {} l\n", num(u), num(v)).as_bytes());
                         drew = true;
                     }
@@ -9021,6 +9031,9 @@ impl Document {
                         let (a, b) = map(x1, y1);
                         let (c, d) = map(x2, y2);
                         let (e, f) = map(x3, y3);
+                        grow(a, b);
+                        grow(c, d);
+                        grow(e, f);
                         path.extend_from_slice(
                             format!(
                                 "{} {} {} {} {} {} c\n",
@@ -9045,9 +9058,11 @@ impl Document {
             // Fill setup: a flat colour (`rg`) or a shading pattern (`/Pattern cs … scn`).
             let mut setup: Vec<u8> = Vec::new();
             let mut has_fill = false;
-            // A gradient's stop alpha isn't carried in the shading itself (that
-            // needs a soft-mask group); approximate it as a uniform fill alpha.
             let mut eff_fill_opacity = prim.fill_opacity;
+            // When a gradient's per-stop alpha varies, a luminosity soft mask
+            // (this gstate name) makes the fill fade spatially; otherwise the
+            // (uniform) stop alpha folds into `eff_fill_opacity` (cheap `ca`).
+            let mut grad_smask: Option<Vec<u8>> = None;
             match &prim.fill {
                 Some(Fill::Solid([r, g, b])) => {
                     setup.extend_from_slice(
@@ -9063,8 +9078,21 @@ impl Document {
                         setup.extend_from_slice(&name);
                         setup.extend_from_slice(b" scn\n");
                         has_fill = true;
-                        let n = grad.stops.len().max(1) as f64;
-                        eff_fill_opacity *= grad.stops.iter().map(|s| s.alpha).sum::<f64>() / n;
+                        if gradient_alpha_varies(&grad.stops) {
+                            // Spatially-varying alpha: emit a luminosity soft mask
+                            // with geometry identical to the colour shading.
+                            grad_smask = self.svg_gradient_alpha_smask(
+                                page_no,
+                                grad,
+                                map,
+                                stroke_scale,
+                                [bx0, by0, bx1, by1],
+                            )?;
+                        } else {
+                            // Constant alpha: keep the cheap uniform fill alpha.
+                            let a = grad.stops.first().map_or(1.0, |s| s.alpha);
+                            eff_fill_opacity *= a;
+                        }
                     }
                 }
                 None => {}
@@ -9090,6 +9118,17 @@ impl Document {
                 _ => b"S\n",
             });
             ops.extend_from_slice(b"Q\n");
+
+            // Spatially-varying gradient alpha: wrap the fill in the luminosity
+            // soft-mask gstate so the gradient fades exactly per its stop alphas.
+            if let Some(name) = &grad_smask {
+                let mut wrapped = b"q\n/".to_vec();
+                wrapped.extend_from_slice(name);
+                wrapped.extend_from_slice(b" gs\n");
+                wrapped.extend_from_slice(&ops);
+                wrapped.extend_from_slice(b"Q\n");
+                ops = wrapped;
+            }
 
             // Per-primitive alpha (distinct fill/stroke) via a transient ExtGState.
             if eff_fill_opacity < 1.0 || prim.stroke_opacity < 1.0 {
@@ -9144,10 +9183,106 @@ impl Document {
         Ok(())
     }
 
+    /// The axial/radial geometry of an SVG gradient as a PDF `/ShadingType` +
+    /// `/Coords`, with the gradient's points mapped to PDF space by `map` (radius
+    /// scaled by `rscale`). Returned as `(shading_type, coords)` so the colour
+    /// shading and its companion alpha (luminosity) shading line up exactly — both
+    /// are built from this one geometry.
+    fn svg_shading_geometry(
+        grad: &crate::svg::Gradient,
+        map: impl Fn(f64, f64) -> (f64, f64),
+        rscale: f64,
+    ) -> (i64, Vec<Object>) {
+        use crate::svg::GradKind;
+        match grad.kind {
+            GradKind::Linear { x1, y1, x2, y2 } => {
+                let (a, b) = map(x1, y1);
+                let (c, d) = map(x2, y2);
+                (
+                    2,
+                    vec![
+                        Object::Real(a),
+                        Object::Real(b),
+                        Object::Real(c),
+                        Object::Real(d),
+                    ],
+                )
+            }
+            GradKind::Radial { cx, cy, r, fx, fy } => {
+                let (pcx, pcy) = map(cx, cy);
+                let (pfx, pfy) = map(fx, fy);
+                (
+                    3,
+                    vec![
+                        Object::Real(pfx),
+                        Object::Real(pfy),
+                        Object::Real(0.0),
+                        Object::Real(pcx),
+                        Object::Real(pcy),
+                        Object::Real((r * rscale).max(0.0)),
+                    ],
+                )
+            }
+        }
+    }
+
+    /// Insert a type-0 (sampled) `/Function` of `n_components` outputs and 256
+    /// 8-bit samples (interleaved per input step), returning a `Reference` to it.
+    /// Shared by the colour shading (3 components, `/DeviceRGB`) and the alpha
+    /// luminosity shading (1 component, `/DeviceGray`) so they cannot drift apart.
+    fn svg_sampled_function(&mut self, samples: Vec<u8>, n_components: usize) -> Object {
+        let mut range = Vec::with_capacity(n_components * 2);
+        for _ in 0..n_components {
+            range.push(Object::Integer(0));
+            range.push(Object::Integer(1));
+        }
+        let mut fdict = Dictionary::new();
+        fdict.set(b"FunctionType".to_vec(), Object::Integer(0));
+        fdict.set(
+            b"Domain".to_vec(),
+            Object::Array(vec![Object::Integer(0), Object::Integer(1)]),
+        );
+        fdict.set(b"Range".to_vec(), Object::Array(range));
+        fdict.set(b"Size".to_vec(), Object::Array(vec![Object::Integer(256)]));
+        fdict.set(b"BitsPerSample".to_vec(), Object::Integer(8));
+        fdict.set(b"Length".to_vec(), Object::Integer(samples.len() as i64));
+        let fn_id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(fn_id, Object::Stream(Stream::new(fdict, samples)));
+        Object::Reference(fn_id)
+    }
+
+    /// A `/Shading` dictionary for the given `color_space`, sampled `function`,
+    /// `shading_type` (2 axial / 3 radial) and `coords`, with `/Extend [true true]`
+    /// so the gradient covers the whole filled region.
+    fn svg_shading_dict(
+        color_space: &[u8],
+        function: Object,
+        shading_type: i64,
+        coords: Vec<Object>,
+    ) -> Dictionary {
+        let mut sh = Dictionary::new();
+        sh.set(b"ShadingType".to_vec(), Object::Integer(shading_type));
+        sh.set(b"ColorSpace".to_vec(), Object::Name(color_space.to_vec()));
+        sh.set(b"Function".to_vec(), function);
+        sh.set(b"Coords".to_vec(), Object::Array(coords));
+        sh.set(
+            b"Extend".to_vec(),
+            Object::Array(vec![Object::Boolean(true), Object::Boolean(true)]),
+        );
+        sh
+    }
+
     /// Register a PDF shading pattern (axial/radial) for an SVG gradient and
     /// return its `/Pattern` resource name. The gradient's coordinates are mapped
     /// to PDF space by `map`; `rscale` scales a radial radius. `None` if there
     /// aren't enough stops to form a gradient.
+    ///
+    /// This builds only the **colour** pattern; per-stop alpha is handled
+    /// separately (a uniform `ca` for constant alpha, or a luminosity soft mask
+    /// via [`Self::svg_gradient_alpha_smask`] when it varies). The COLRv1 colour
+    /// glyph path calls this directly and supplies its own (uniform) alpha, so its
+    /// behaviour is unchanged.
     fn register_svg_shading(
         &mut self,
         page_no: u32,
@@ -9155,7 +9290,6 @@ impl Document {
         map: impl Fn(f64, f64) -> (f64, f64),
         rscale: f64,
     ) -> Result<Option<Vec<u8>>> {
-        use crate::svg::GradKind;
         if grad.stops.len() < 2 {
             return Ok(None);
         }
@@ -9165,70 +9299,11 @@ impl Document {
             let [r, g, b] = sample_svg_gradient(&grad.stops, i as f64 / 255.0);
             samples.extend_from_slice(&[r, g, b]);
         }
-        let mut fdict = Dictionary::new();
-        fdict.set(b"FunctionType".to_vec(), Object::Integer(0));
-        fdict.set(
-            b"Domain".to_vec(),
-            Object::Array(vec![Object::Integer(0), Object::Integer(1)]),
-        );
-        fdict.set(
-            b"Range".to_vec(),
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(1),
-                Object::Integer(0),
-                Object::Integer(1),
-                Object::Integer(0),
-                Object::Integer(1),
-            ]),
-        );
-        fdict.set(b"Size".to_vec(), Object::Array(vec![Object::Integer(256)]));
-        fdict.set(b"BitsPerSample".to_vec(), Object::Integer(8));
-        fdict.set(b"Length".to_vec(), Object::Integer(samples.len() as i64));
-        let fn_id = (self.next_object_number(), 0u16);
-        self.objects
-            .insert(fn_id, Object::Stream(Stream::new(fdict, samples)));
+        let function = self.svg_sampled_function(samples, 3);
 
         // 2. The shading dictionary (axial = type 2, radial = type 3).
-        let mut sh = Dictionary::new();
-        sh.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceRGB".to_vec()));
-        sh.set(b"Function".to_vec(), Object::Reference(fn_id));
-        sh.set(
-            b"Extend".to_vec(),
-            Object::Array(vec![Object::Boolean(true), Object::Boolean(true)]),
-        );
-        match grad.kind {
-            GradKind::Linear { x1, y1, x2, y2 } => {
-                let (a, b) = map(x1, y1);
-                let (c, d) = map(x2, y2);
-                sh.set(b"ShadingType".to_vec(), Object::Integer(2));
-                sh.set(
-                    b"Coords".to_vec(),
-                    Object::Array(vec![
-                        Object::Real(a),
-                        Object::Real(b),
-                        Object::Real(c),
-                        Object::Real(d),
-                    ]),
-                );
-            }
-            GradKind::Radial { cx, cy, r, fx, fy } => {
-                let (pcx, pcy) = map(cx, cy);
-                let (pfx, pfy) = map(fx, fy);
-                sh.set(b"ShadingType".to_vec(), Object::Integer(3));
-                sh.set(
-                    b"Coords".to_vec(),
-                    Object::Array(vec![
-                        Object::Real(pfx),
-                        Object::Real(pfy),
-                        Object::Real(0.0),
-                        Object::Real(pcx),
-                        Object::Real(pcy),
-                        Object::Real((r * rscale).max(0.0)),
-                    ]),
-                );
-            }
-        }
+        let (shading_type, coords) = Self::svg_shading_geometry(grad, map, rscale);
+        let sh = Self::svg_shading_dict(b"DeviceRGB", function, shading_type, coords);
 
         // 3. A shading pattern (PatternType 2) registered on the page.
         let mut pat = Dictionary::new();
@@ -9251,6 +9326,93 @@ impl Document {
             b"Pattern",
             "GpSh",
             Object::Dictionary(pat),
+        )?))
+    }
+
+    /// Build a **luminosity soft mask** that makes an SVG gradient's per-stop
+    /// alpha vary spatially, and register it as an `/ExtGState`; returns that
+    /// gstate's resource name (apply with `/<name> gs` *before* the colour fill).
+    ///
+    /// The mask is a second shading whose geometry is **identical** to the colour
+    /// shading (same `/ShadingType`, `/Coords`, `/Extend`, built from the shared
+    /// [`Self::svg_shading_geometry`]) but in `/DeviceGray`, its 256-sample
+    /// `/Function` outputting the interpolated per-stop alpha. That shading is
+    /// painted (`sh`) inside a transparency-group form XObject
+    /// (`/Group << /S /Transparency /CS /DeviceGray >>`) over `bbox`, and the form
+    /// is referenced from `/SMask << /S /Luminosity /G … >>`. Where the gradient
+    /// is opaque the luminosity is white (mask = 1, fully shown); where it is
+    /// transparent the luminosity is black (mask = 0, hidden) — so the fill fades
+    /// exactly like the gradient. `None` if there aren't enough stops.
+    fn svg_gradient_alpha_smask(
+        &mut self,
+        page_no: u32,
+        grad: &crate::svg::Gradient,
+        map: impl Fn(f64, f64) -> (f64, f64),
+        rscale: f64,
+        bbox: [f64; 4],
+    ) -> Result<Option<Vec<u8>>> {
+        if grad.stops.len() < 2 {
+            return Ok(None);
+        }
+        // 1. A type-0 sampled function: 256 grey samples = the interpolated
+        //    per-stop alpha (0 → black/hidden, 255 → white/shown).
+        let mut samples = Vec::with_capacity(256);
+        for i in 0..256u32 {
+            let a = sample_svg_gradient_alpha(&grad.stops, i as f64 / 255.0);
+            samples.push((a * 255.0).round().clamp(0.0, 255.0) as u8);
+        }
+        let function = self.svg_sampled_function(samples, 1);
+
+        // 2. A DeviceGray shading sharing the colour shading's exact geometry.
+        let (shading_type, coords) = Self::svg_shading_geometry(grad, map, rscale);
+        let sh = Self::svg_shading_dict(b"DeviceGray", function, shading_type, coords);
+
+        // 3. A transparency-group form XObject that paints that shading over the
+        //    fill bbox. Its `/Resources` carry the shading under `/Sh0`; the
+        //    content is `/Sh0 sh` clipped to the BBox (the `sh` operator fills the
+        //    current clip — here the form's BBox).
+        let mut shadings = Dictionary::new();
+        shadings.set(b"Sh0".to_vec(), Object::Dictionary(sh));
+        let mut resources = Dictionary::new();
+        resources.set(b"Shading".to_vec(), Object::Dictionary(shadings));
+        let mut group = Dictionary::new();
+        group.set(b"S".to_vec(), Object::Name(b"Transparency".to_vec()));
+        group.set(b"CS".to_vec(), Object::Name(b"DeviceGray".to_vec()));
+
+        let [x0, y0, x1, y1] = bbox;
+        let content = b"/Sh0 sh\n".to_vec();
+        let mut form = Dictionary::new();
+        form.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+        form.set(b"Subtype".to_vec(), Object::Name(b"Form".to_vec()));
+        form.set(b"FormType".to_vec(), Object::Integer(1));
+        form.set(
+            b"BBox".to_vec(),
+            Object::Array(vec![
+                Object::Real(x0),
+                Object::Real(y0),
+                Object::Real(x1),
+                Object::Real(y1),
+            ]),
+        );
+        form.set(b"Group".to_vec(), Object::Dictionary(group));
+        form.set(b"Resources".to_vec(), Object::Dictionary(resources));
+        form.set(b"Length".to_vec(), Object::Integer(content.len() as i64));
+        let form_id = (self.next_object_number(), 0u16);
+        self.objects
+            .insert(form_id, Object::Stream(Stream::new(form, content)));
+
+        // 4. An /ExtGState carrying the luminosity soft mask referencing the form.
+        let mut smask = Dictionary::new();
+        smask.set(b"S".to_vec(), Object::Name(b"Luminosity".to_vec()));
+        smask.set(b"G".to_vec(), Object::Reference(form_id));
+        let mut gs = Dictionary::new();
+        gs.set(b"Type".to_vec(), Object::Name(b"ExtGState".to_vec()));
+        gs.set(b"SMask".to_vec(), Object::Dictionary(smask));
+        Ok(Some(self.register_page_resource(
+            page_no,
+            b"ExtGState",
+            "GpSm",
+            Object::Dictionary(gs),
         )?))
     }
 
@@ -17411,6 +17573,42 @@ fn sample_svg_gradient(stops: &[crate::svg::GradStop], t: f64) -> [u8; 3] {
     to8(last.rgb)
 }
 
+/// Sample an SVG gradient's **alpha** at axis position `t` (`0.0..=1.0`),
+/// linearly interpolating each stop's `alpha`. Mirrors [`sample_svg_gradient`]
+/// (RGB) so the colour shading and the alpha luminosity shading sample the
+/// identical stop schedule. Empty stops → fully opaque.
+fn sample_svg_gradient_alpha(stops: &[crate::svg::GradStop], t: f64) -> f64 {
+    let Some(first) = stops.first() else {
+        return 1.0;
+    };
+    let last = stops[stops.len() - 1];
+    if t <= first.offset {
+        return first.alpha.clamp(0.0, 1.0);
+    }
+    if t >= last.offset {
+        return last.alpha.clamp(0.0, 1.0);
+    }
+    for w in stops.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if t >= a.offset && t <= b.offset {
+            let span = (b.offset - a.offset).max(1e-9);
+            let f = ((t - a.offset) / span).clamp(0.0, 1.0);
+            return (a.alpha + (b.alpha - a.alpha) * f).clamp(0.0, 1.0);
+        }
+    }
+    last.alpha.clamp(0.0, 1.0)
+}
+
+/// Whether an SVG gradient's stops carry **varying** alpha — i.e. at least one
+/// stop's alpha differs from the first. When `false`, the cheap uniform-`ca`
+/// fast path covers the gradient and no luminosity soft mask is needed.
+fn gradient_alpha_varies(stops: &[crate::svg::GradStop]) -> bool {
+    let Some(first) = stops.first() else {
+        return false;
+    };
+    stops.iter().any(|s| (s.alpha - first.alpha).abs() > 1e-6)
+}
+
 /// Convert a COLRv1 gradient [`PaintFill`] (font-unit coords) to an
 /// [`crate::svg::Gradient`] so the existing axial/radial shading machinery can
 /// render it. Foreground-indexed stops resolve to `fg`.
@@ -19105,6 +19303,366 @@ mod tests {
             !reopened.page_image_elements(1).is_empty(),
             "the filtered raster persists as an image element after round-trip"
         );
+    }
+
+    // ─── gradient per-stop varying alpha → luminosity soft mask ──────────────
+
+    /// A one-prim `SvgImage` whose single rectangle (`0,0 → 80,80` in viewBox
+    /// space) is filled with `grad`. Drives the gradient fill site of
+    /// `draw_svg_image` without depending on the SVG parser.
+    fn svg_image_with_gradient(grad: crate::svg::Gradient) -> crate::svg::SvgImage {
+        use crate::content::svg_path::Seg;
+        use crate::svg::{Fill, Prim, SvgImage};
+        let segs = vec![
+            Seg::Move(0.0, 0.0),
+            Seg::Line(80.0, 0.0),
+            Seg::Line(80.0, 80.0),
+            Seg::Line(0.0, 80.0),
+            Seg::Close,
+        ];
+        SvgImage {
+            width: 80.0,
+            height: 80.0,
+            view_box: [0.0, 0.0, 80.0, 80.0],
+            prims: vec![Prim {
+                segs,
+                fill: Some(Fill::Gradient(grad)),
+                stroke: None,
+                stroke_w: 0.0,
+                fill_opacity: 1.0,
+                stroke_opacity: 1.0,
+            }],
+            rasters: Vec::new(),
+        }
+    }
+
+    /// Find a luminosity `/SMask` `/ExtGState` in a page's `/Resources` and
+    /// return its `/G` form-group object id (the transparency-group form
+    /// XObject), if any was emitted. The gstate dicts are registered inline in
+    /// the page's `/ExtGState` sub-dictionary (not as top-level objects).
+    fn find_luminosity_smask_group(doc: &Document, page_no: u32) -> Option<ObjectId> {
+        let resources = doc.page_resources(page_no);
+        let gstates = doc.resolve(resources.get(b"ExtGState")?).as_dict()?.clone();
+        gstates.0.values().find_map(|o| {
+            let gs = doc.resolve(o).as_dict()?.clone();
+            let smask = doc.resolve(gs.get(b"SMask")?).as_dict()?.clone();
+            if smask.get(b"S").and_then(Object::as_name) != Some(b"Luminosity".as_slice()) {
+                return None;
+            }
+            smask.get(b"G").and_then(Object::as_reference)
+        })
+    }
+
+    /// Whether a page's `/Resources` carry a `/Pattern` shading whose `/Shading`
+    /// uses the given colour space (e.g. `DeviceRGB`).
+    fn page_has_pattern_colorspace(doc: &Document, page_no: u32, cs: &[u8]) -> bool {
+        let resources = doc.page_resources(page_no);
+        let Some(patterns) = resources
+            .get(b"Pattern")
+            .map(|o| doc.resolve(o))
+            .and_then(Object::as_dict)
+        else {
+            return false;
+        };
+        patterns.0.values().any(|o| {
+            doc.resolve(o)
+                .as_dict()
+                .and_then(|p| p.get(b"Shading"))
+                .map(|o| doc.resolve(o))
+                .and_then(|sh| sh.as_dict().and_then(|d| d.get(b"ColorSpace")).cloned())
+                .and_then(|o| o.as_name().map(<[u8]>::to_vec))
+                .as_deref()
+                == Some(cs)
+        })
+    }
+
+    /// The DeviceGray shading + its 256 raw function bytes from a soft-mask form
+    /// group: the form's `/Resources/Shading/Sh0` is the shading, its `/Function`
+    /// resolves to the sampled stream.
+    fn smask_gray_shading(doc: &Document, group_id: ObjectId) -> (Dictionary, Vec<u8>) {
+        let form = doc
+            .objects
+            .get(&group_id)
+            .and_then(Object::as_stream)
+            .expect("soft-mask group is a form stream");
+        // It is a transparency group in DeviceGray.
+        let group = form.dict.get(b"Group").and_then(Object::as_dict).unwrap();
+        assert_eq!(
+            group.get(b"S").and_then(Object::as_name),
+            Some(b"Transparency".as_slice()),
+            "the form is a transparency group"
+        );
+        assert_eq!(
+            group.get(b"CS").and_then(Object::as_name),
+            Some(b"DeviceGray".as_slice()),
+            "the transparency group colour space is DeviceGray"
+        );
+        let res = form
+            .dict
+            .get(b"Resources")
+            .and_then(Object::as_dict)
+            .unwrap();
+        let shadings = res.get(b"Shading").and_then(Object::as_dict).unwrap();
+        let sh = shadings
+            .get(b"Sh0")
+            .and_then(Object::as_dict)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            sh.get(b"ColorSpace").and_then(Object::as_name),
+            Some(b"DeviceGray".as_slice()),
+            "the mask shading is DeviceGray"
+        );
+        let fn_ref = sh.get(b"Function").and_then(Object::as_reference).unwrap();
+        let samples = doc
+            .objects
+            .get(&fn_ref)
+            .and_then(Object::as_stream)
+            .expect("the mask function is a sampled stream")
+            .raw
+            .clone();
+        (sh, samples)
+    }
+
+    #[test]
+    fn svg_axial_varying_alpha_emits_luminosity_devicegray_smask() {
+        use crate::svg::{GradKind, GradStop, Gradient};
+        // A 2-stop axial gradient fading opaque → transparent (alpha 1.0 → 0.0).
+        let grad = Gradient {
+            kind: GradKind::Linear {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 80.0,
+                y2: 0.0,
+            },
+            stops: vec![
+                GradStop {
+                    offset: 0.0,
+                    rgb: [1.0, 0.0, 0.0],
+                    alpha: 1.0,
+                },
+                GradStop {
+                    offset: 1.0,
+                    rgb: [0.0, 0.0, 1.0],
+                    alpha: 0.0,
+                },
+            ],
+        };
+        let img = svg_image_with_gradient(grad);
+
+        let pdf = crate::convert::reverse::txt_to_pdf("gradient alpha host");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.draw_svg_image(1, &img, 100.0, 100.0, 160.0, 160.0)
+            .unwrap();
+
+        // A luminosity soft-mask gstate (named GpSm*) was emitted and is applied
+        // in the page content via a `gs` op.
+        let group_id = find_luminosity_smask_group(&doc, 1)
+            .expect("a /Luminosity /SMask ExtGState is emitted for varying alpha");
+        let content = doc.page_content(1).unwrap();
+        let s = String::from_utf8_lossy(&content);
+        assert!(
+            s.contains("/GpSm"),
+            "the soft-mask gstate is applied (`/GpSm* gs`)"
+        );
+        // The colour shading pattern is still emitted (the fill itself).
+        assert!(
+            s.contains("/Pattern cs"),
+            "the colour shading pattern still fills"
+        );
+
+        // The mask is a DeviceGray ShadingType-2 (axial) shading; its 256-sample
+        // function spans 255 (first stop, opaque → shown) → 0 (last, hidden).
+        let (sh, samples) = smask_gray_shading(&doc, group_id);
+        assert_eq!(
+            sh.get(b"ShadingType").and_then(Object::as_i64),
+            Some(2),
+            "axial gradient → ShadingType 2 mask"
+        );
+        assert_eq!(samples.len(), 256, "256 grey alpha samples");
+        assert_eq!(
+            samples[0], 255,
+            "first stop alpha 1.0 → luminance 255 (shown)"
+        );
+        assert_eq!(
+            samples[255], 0,
+            "last stop alpha 0.0 → luminance 0 (fully masked)"
+        );
+        // Monotonically decreasing (a clean fade, not a uniform mean).
+        assert!(
+            samples.windows(2).all(|w| w[0] >= w[1]),
+            "the alpha ramp decreases monotonically across the axis"
+        );
+        assert!(
+            samples.iter().any(|&v| v > 0 && v < 255),
+            "intermediate alphas exist (this is NOT a single uniform `ca`)"
+        );
+    }
+
+    #[test]
+    fn svg_radial_varying_alpha_emits_devicegray_shadingtype3_mask() {
+        use crate::svg::{GradKind, GradStop, Gradient};
+        // A 3-stop radial gradient with varying alpha (1.0 → 0.5 → 0.0).
+        let grad = Gradient {
+            kind: GradKind::Radial {
+                cx: 40.0,
+                cy: 40.0,
+                r: 40.0,
+                fx: 40.0,
+                fy: 40.0,
+            },
+            stops: vec![
+                GradStop {
+                    offset: 0.0,
+                    rgb: [1.0, 1.0, 1.0],
+                    alpha: 1.0,
+                },
+                GradStop {
+                    offset: 0.5,
+                    rgb: [0.5, 0.5, 0.5],
+                    alpha: 0.5,
+                },
+                GradStop {
+                    offset: 1.0,
+                    rgb: [0.0, 0.0, 0.0],
+                    alpha: 0.0,
+                },
+            ],
+        };
+        let img = svg_image_with_gradient(grad);
+
+        let pdf = crate::convert::reverse::txt_to_pdf("radial alpha host");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.draw_svg_image(1, &img, 50.0, 50.0, 120.0, 120.0)
+            .unwrap();
+
+        let group_id = find_luminosity_smask_group(&doc, 1)
+            .expect("a /Luminosity /SMask ExtGState is emitted for the radial gradient");
+        let (sh, samples) = smask_gray_shading(&doc, group_id);
+        assert_eq!(
+            sh.get(b"ShadingType").and_then(Object::as_i64),
+            Some(3),
+            "radial gradient → ShadingType 3 mask"
+        );
+        assert_eq!(samples.len(), 256);
+        assert_eq!(samples[0], 255, "centre alpha 1.0 → 255");
+        assert_eq!(samples[255], 0, "rim alpha 0.0 → 0");
+        // The mid stop (offset 0.5, alpha 0.5) lands near 128.
+        assert!(
+            (samples[128] as i32 - 128).abs() <= 2,
+            "mid stop alpha 0.5 → ~128, got {}",
+            samples[128]
+        );
+    }
+
+    #[test]
+    fn svg_all_opaque_gradient_uses_simple_path_no_smask() {
+        use crate::svg::{GradKind, GradStop, Gradient};
+        // Both stops fully opaque → the cheap path (no luminosity soft mask).
+        let grad = Gradient {
+            kind: GradKind::Linear {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 80.0,
+                y2: 0.0,
+            },
+            stops: vec![
+                GradStop {
+                    offset: 0.0,
+                    rgb: [1.0, 0.0, 0.0],
+                    alpha: 1.0,
+                },
+                GradStop {
+                    offset: 1.0,
+                    rgb: [0.0, 0.0, 1.0],
+                    alpha: 1.0,
+                },
+            ],
+        };
+        let img = svg_image_with_gradient(grad);
+
+        let pdf = crate::convert::reverse::txt_to_pdf("opaque gradient host");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.draw_svg_image(1, &img, 100.0, 100.0, 160.0, 160.0)
+            .unwrap();
+
+        // The colour shading is emitted, but NO luminosity soft mask.
+        let content = doc.page_content(1).unwrap();
+        let s = String::from_utf8_lossy(&content);
+        assert!(
+            s.contains("/Pattern cs"),
+            "the gradient still fills via a pattern"
+        );
+        assert!(
+            find_luminosity_smask_group(&doc, 1).is_none(),
+            "an all-opaque gradient must NOT emit a /Luminosity /SMask"
+        );
+        assert!(
+            !s.contains("/GpSm"),
+            "no soft-mask gstate is applied for an all-opaque gradient"
+        );
+    }
+
+    #[test]
+    fn colrv1_shaped_uniform_alpha_gradient_emits_no_alpha_smask() {
+        use crate::svg::{GradKind, GradStop, Gradient};
+        // The COLRv1 colour path calls `register_svg_shading` directly with a
+        // gradient whose stops share one (uniform) alpha and handles opacity
+        // separately. Register that exact call shape and assert it produces only
+        // the colour /Pattern — never a luminosity soft mask.
+        let grad = Gradient {
+            kind: GradKind::Linear {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 100.0,
+                y2: 0.0,
+            },
+            stops: vec![
+                GradStop {
+                    offset: 0.0,
+                    rgb: [1.0, 0.0, 0.0],
+                    alpha: 0.7,
+                },
+                GradStop {
+                    offset: 1.0,
+                    rgb: [0.0, 0.0, 1.0],
+                    alpha: 0.7,
+                },
+            ],
+        };
+
+        let pdf = crate::convert::reverse::txt_to_pdf("colrv1 shape host");
+        let mut doc = Document::open(&pdf).unwrap();
+        let identity = |fx: f64, fy: f64| (fx, fy);
+        let name = doc
+            .register_svg_shading(1, &grad, identity, 1.0)
+            .unwrap()
+            .expect("the colour shading pattern registers");
+        assert!(name.starts_with(b"GpSh"), "colour pattern named GpSh*");
+
+        // The colour pattern is a DeviceRGB shading pattern (the COLRv1 path's
+        // only output here); no soft mask is emitted on this path.
+        assert!(
+            page_has_pattern_colorspace(&doc, 1, b"DeviceRGB"),
+            "the colour shading is DeviceRGB"
+        );
+        assert!(
+            find_luminosity_smask_group(&doc, 1).is_none(),
+            "the COLRv1 colour call must NOT emit a luminosity soft mask"
+        );
+        // And no DeviceGray shading leaked from this path.
+        let has_gray_shading = doc.objects.values().any(|o| {
+            if let Object::Stream(s) = o {
+                s.dict
+                    .get(b"Resources")
+                    .and_then(Object::as_dict)
+                    .and_then(|r| r.get(b"Shading"))
+                    .is_some()
+            } else {
+                false
+            }
+        });
+        assert!(!has_gray_shading, "no soft-mask form group emitted");
     }
 
     #[test]
