@@ -74,6 +74,15 @@ pub struct ArithContext {
     pub(crate) mps: u8,
 }
 
+impl ArithContext {
+    /// A context with an explicit initial `(index, mps)` — JPEG 2000 tier-1
+    /// seeds the UNIFORM, run-length and all-zero zero-coding contexts to
+    /// non-default states (ISO/IEC 15444-1 §D.3.2).
+    pub(crate) fn with(index: u8, mps: u8) -> Self {
+        ArithContext { index, mps }
+    }
+}
+
 /// The `(Qe, NMPS, NLPS, SWITCH)` row at `index`, exposed so the test-only MQ
 /// encoder in the JBIG2 module can mirror the decoder's state machine.
 #[cfg(test)]

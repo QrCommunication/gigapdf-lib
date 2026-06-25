@@ -145,9 +145,9 @@ exact sample length when unfiltered (so a literal `EI` inside the pixel bytes
 never truncates them) and by a whitespace-delimited `EI` scan otherwise, and the
 samples run through the engine's filters — `/AHx` (ASCIIHex), `/A85` (ASCII85),
 `/LZW`, `/Fl` (Flate), `/RL` (RunLength), `/DCT` (baseline JPEG), `/CCF`
-(CCITTFax, see below) — and colour spaces `/G`/`/RGB`/`/CMYK`/`/I` (plus Indexed).
-`/IM true` image masks paint the current fill colour through the stencil. **Not
-yet decoded:** `/JPX` (JPEG 2000).
+(CCITTFax, see below), `/JPXDecode` (JPEG 2000, see below) — and colour spaces
+`/G`/`/RGB`/`/CMYK`/`/I` (plus Indexed). `/IM true` image masks paint the current
+fill colour through the stencil.
 
 **Bilevel scanned-document images (ISO 32000-1 §7.4.6 / §7.4.7):** the two fax /
 bilevel filters used by N&B scans are now decoded from scratch (pure `std`, zero
@@ -197,6 +197,39 @@ explicit `/Mask`, or a soft `/SMask`):
   single-dictionary and array `/DecodeParms` forms are handled. A
   genuinely-unknown segment type is skipped (its region left blank) rather than
   aborting the page.
+
+**JPEG 2000 images (`/JPXDecode`, ISO 32000-1 §7.4.9 / ISO/IEC 15444-1):** now
+**decoded from scratch** (pure `std`, zero deps) — a complete J2K codestream
+decoder feeding the normal image-sample path. The decoder accepts both the raw
+codestream (`FF 4F` SOC …) and the **JP2 box** wrapper (`jP  `/`ftyp`/`jp2h`/
+`jp2c`), locating the contiguous codestream in either. It implements the full
+pipeline:
+
+  - **markers** — `SIZ` (image/tile geometry, per-component bit depth, signedness
+    and sub-sampling), `COD`/`COC` (progression order, layers, decomposition
+    levels, code-block size, code-block style, 5/3-vs-9/7 transform, precincts),
+    `QCD`/`QCC` (no-quantisation, scalar-derived and scalar-expounded), `RGN`
+    (region-of-interest max-shift), `SOT`/`SOD`/`EOC` tile-parts, and `POC`/`TLM`/
+    `PLM`/`PLT`/`PPM`/`PPT`/`CRG`/`COM`/`SOP`/`EPH` handled or safely skipped;
+  - **tier-2 packet decoding** — the subband/precinct/code-block geometry, the
+    inclusion and zero-bit-plane **tag-trees**, per-code-block new-pass counts and
+    `Lblock` length signalling, layers, and **all five progression orders**
+    (LRCP/RLCP/RPCL/PCRL/CPRL), with the bit-stuffed packet headers;
+  - **tier-1 EBCOT** — per-code-block bit-plane decoding (significance-propagation,
+    magnitude-refinement and cleanup passes with the run-length mode) driven by the
+    **same MQ arithmetic decoder** the JBIG2 path uses (ISO/IEC 15444-1 reuses the
+    ITU-T T.88 MQ coder), with the 9 zero-coding contexts, the sign-coding and
+    magnitude-refinement contexts and the standard context formation;
+  - **reconstruction** — scalar dequantisation (reversible and irreversible), the
+    **inverse DWT** (5/3 reversible integer lifting and 9/7 irreversible lifting)
+    per resolution level, the **inverse multi-component transform** (RCT for 5/3,
+    ICT for 9/7), DC level-shift and clamp to the component bit depth.
+
+  The decoded raster is emitted as packed, interleaved samples at the codestream's
+  native bit depth, so the image's `/ColorSpace` (or the JP2 `colr` box) drives the
+  final colour mapping through the same path as any other image. Multi-tile,
+  multi-resolution and multi-component (e.g. RGB-via-RCT) images are supported; ROI
+  and unsupported optional features are handled defensively rather than aborting.
 
 **Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
 (Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`

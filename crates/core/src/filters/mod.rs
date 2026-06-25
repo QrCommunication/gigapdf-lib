@@ -17,6 +17,11 @@ pub mod deflate;
 pub mod inflate;
 pub mod jbig2;
 mod jbig2_huffman;
+/// The shared MQ arithmetic coder (ITU-T T.88 Annex E). Used by both
+/// [`jbig2`] and [`jpx`]: JPEG2000 (ISO/IEC 15444-1 Annex C) reuses the
+/// identical MQ-coder state machine.
+mod jbig2_mq;
+pub mod jpx;
 pub mod lzw;
 pub mod predictor;
 pub mod runlength;
@@ -102,6 +107,13 @@ fn apply_filter(name: &[u8], data: &[u8], parms: Option<&Dictionary>) -> Result<
             // the page-stream segments are decoded in that case.
             let globals = parms.and_then(jbig2_globals_bytes);
             jbig2::jbig2_decode(data, globals.as_deref(), parms)
+        }
+        b"JPXDecode" => {
+            // JPEG 2000: decode the codestream (or JP2 box wrapper) to packed,
+            // interleaved image samples at the native bit depth. The image
+            // colour space (`/ColorSpace` on the dict, or the JP2 `colr` box)
+            // drives the final colour mapping downstream.
+            jpx::jpx_decode(data)
         }
         other => Err(EngineError::Unsupported(format!(
             "stream filter /{}",
@@ -254,8 +266,26 @@ mod tests {
 
     #[test]
     fn unsupported_filter_errors() {
-        let stream = stream_with(Object::Name(b"JPXDecode".to_vec()), b"data".to_vec());
+        // A genuinely unrecognised filter name hits the catch-all error arm.
+        let stream = stream_with(Object::Name(b"MadeUpDecode".to_vec()), b"data".to_vec());
         assert!(decode_stream(&stream).is_err());
+    }
+
+    #[test]
+    fn jpxdecode_is_dispatched() {
+        // The `/JPXDecode` arm routes to the JPEG 2000 decoder: malformed bytes
+        // (no SOC marker / JP2 signature) error there rather than hitting the
+        // unsupported-filter arm. (A full decode is covered by the jpx module's
+        // own end-to-end tests.)
+        let stream = stream_with(
+            Object::Name(b"JPXDecode".to_vec()),
+            b"not a codestream".to_vec(),
+        );
+        let err = decode_stream(&stream).unwrap_err();
+        assert!(
+            format!("{err}").contains("jpx"),
+            "JPXDecode should be handled by the jpx decoder, got: {err}"
+        );
     }
 
     #[test]

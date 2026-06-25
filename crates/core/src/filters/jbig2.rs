@@ -29,8 +29,7 @@
 use crate::error::{EngineError, Result};
 use crate::object::Dictionary;
 
-#[path = "jbig2_mq.rs"]
-mod mq;
+use super::jbig2_mq as mq;
 use mq::{ArithContext, IaidContext, IntContext, IntResult, MqDecoder};
 
 /// A bilevel bitmap, one `bool` per pixel (`true` = black / 1), row-major.
