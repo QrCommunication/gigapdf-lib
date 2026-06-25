@@ -2500,6 +2500,9 @@ fn docx_table_model(
     // Height for the row currently being read, from `w:trPr/w:trHeight@w:val`
     // (twips → points). Reset at every `w:tr`.
     let mut cur_height: Option<f64> = None;
+    // Whether the row currently being read is a header row (`w:trPr/w:tblHeader`,
+    // a CT_OnOff). Reset at every `w:tr`.
+    let mut cur_header = false;
     // The model carries one table-wide border. A `w:tblBorders` side seeds it
     // first; failing that, the first cell `w:tcBorders` edge does (mirrors the
     // PPTX path). The first declared width wins.
@@ -2539,6 +2542,7 @@ fn docx_table_model(
                     "tr" if !sc => {
                         cur_row = Some(Vec::new());
                         cur_height = None;
+                        cur_header = false;
                     }
                     "trPr" if !sc => in_trpr = true,
                     // Row height `w:trHeight@w:val` (twips → points). Word's
@@ -2546,6 +2550,11 @@ fn docx_table_model(
                     // model keeps a single height, so the value carries over.
                     "trHeight" if in_trpr => {
                         cur_height = attr(&attrs, "val").and_then(twips_to_pt).or(cur_height);
+                    }
+                    // `w:tblHeader` (CT_OnOff) marks this row as a table header
+                    // row repeated atop each page. `w:val="0"`/`"false"` cancels it.
+                    "tblHeader" if in_trpr => {
+                        cur_header = !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
                     }
                     "tc" if !sc => {
                         let out = docx_cell_model(x, ctx, resources);
@@ -2573,6 +2582,7 @@ fn docx_table_model(
                             raw_rows.push(DocxRawRow {
                                 cells,
                                 height: cur_height.take(),
+                                is_header: std::mem::take(&mut cur_header),
                             });
                         }
                     }
@@ -2592,10 +2602,12 @@ fn docx_table_model(
 }
 
 /// One parsed `w:tr`: its `w:tc` cells (with merge metadata, pre vertical-merge
-/// resolution) and the row height (`w:trHeight`, points).
+/// resolution), the row height (`w:trHeight`, points), and whether it is a header
+/// row (`w:tblHeader`).
 struct DocxRawRow {
     cells: Vec<DocxRawCell>,
     height: Option<f64>,
+    is_header: bool,
 }
 
 /// One parsed `w:tc` awaiting vertical-merge resolution: the lowered [`Cell`]
@@ -2699,6 +2711,7 @@ fn resolve_docx_vmerges(raw_rows: Vec<DocxRawRow>) -> Vec<Row> {
         out.push(Row {
             cells,
             height: raw.height,
+            is_header: raw.is_header,
         });
     }
 
@@ -4907,12 +4920,18 @@ fn pptx_table_model(x: &mut Xml, rels: &BTreeMap<String, String>, theme: &PptxTh
     let mut cur: Option<Vec<Cell>> = None;
     // The model has a single table-wide border; the first declared cell edge wins.
     let mut border: Option<model::BorderStyle> = None;
+    // `a:tblPr@firstRow="1"` marks the first row as a styled header row; honour it
+    // so the first emitted [`Row`] carries `is_header` (mirrors the exporter,
+    // which always writes `firstRow="1"`).
+    let mut first_row_header = false;
 
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "gridCol" {
+                if ln == "tblPr" {
+                    first_row_header = matches!(attr(&attrs, "firstRow"), Some("1") | Some("true"));
+                } else if ln == "gridCol" {
                     if let Some(w) = attr(&attrs, "w").and_then(emu_to_pt) {
                         if w > 0.0 {
                             col_widths.push(w);
@@ -4936,9 +4955,12 @@ fn pptx_table_model(x: &mut Xml, rels: &BTreeMap<String, String>, theme: &PptxTh
                 let ln = local(&name);
                 if ln == "tr" {
                     if let Some(cells) = cur.take() {
+                        // Only the first row is the header (PPTX `firstRow`).
+                        let is_header = first_row_header && rows.is_empty();
                         rows.push(Row {
                             cells,
                             height: None,
+                            is_header,
                         });
                     }
                 } else if ln == "tbl" {
@@ -5223,6 +5245,7 @@ fn pptx_chart_model(
             rows.push(Row {
                 cells: vec![chart_cell(title)],
                 height: None,
+                is_header: false,
             });
         }
     }
@@ -5250,6 +5273,8 @@ fn pptx_chart_model(
         rows.push(Row {
             cells: header,
             height: None,
+            // The category-axis row is the table's header.
+            is_header: true,
         });
     }
 
@@ -5262,6 +5287,7 @@ fn pptx_chart_model(
         rows.push(Row {
             cells,
             height: None,
+            is_header: false,
         });
     }
 
@@ -6200,12 +6226,17 @@ fn odf_table_model(
     let mut cur_row: Option<Vec<Cell>> = None;
     // Grid-column widths, expanded over `table:number-columns-repeated`.
     let mut col_widths: Vec<f64> = Vec::new();
+    // Whether the cursor is inside a `table:table-header-rows` wrapper; its child
+    // `table:table-row`s are header rows.
+    let mut in_header_rows = false;
 
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "table-column" {
+                if ln == "table-header-rows" && !sc {
+                    in_header_rows = true;
+                } else if ln == "table-column" {
                     let repeat = attr(&attrs, "number-columns-repeated")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
@@ -6280,8 +6311,11 @@ fn odf_table_model(
                         rows.push(Row {
                             cells,
                             height: None,
+                            is_header: in_header_rows,
                         });
                     }
+                } else if ln == "table-header-rows" {
+                    in_header_rows = false;
                 } else if ln == "table" {
                     break;
                 }
@@ -15415,6 +15449,33 @@ mod tests {
             .expect("a table block in the document")
     }
 
+    /// A `w:tr` carrying `w:trPr/w:tblHeader` lowers to a header [`Row`]
+    /// (`is_header == true`); a plain `w:tr` stays a body row. `w:val="0"` cancels
+    /// the flag.
+    #[test]
+    fn docx_tbl_header_marks_header_row() {
+        let t = first_docx_table(
+            r#"<w:tbl>
+  <w:tr><w:trPr><w:tblHeader/></w:trPr>
+    <w:tc><w:p><w:r><w:t>H1</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>H2</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr><w:trPr><w:tblHeader w:val="0"/></w:trPr>
+    <w:tc><w:p><w:r><w:t>D1</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>D2</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>D3</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>D4</w:t></w:r></w:p></w:tc>
+  </w:tr>
+</w:tbl>"#,
+        );
+        assert_eq!(t.rows.len(), 3);
+        assert!(t.rows[0].is_header, "w:tblHeader row → header");
+        assert!(!t.rows[1].is_header, "w:tblHeader w:val=\"0\" cancels it");
+        assert!(!t.rows[2].is_header, "plain row is a body row");
+    }
+
     /// A 3-row column whose top cell is `w:vMerge="restart"` and the two rows
     /// below are continuations collapses to one cell spanning all three rows; the
     /// covered continuation cells are not emitted, while the other column stays
@@ -20597,6 +20658,35 @@ mod tests {
                 _ => None,
             })
             .expect("a Table block")
+    }
+
+    /// Rows inside `table:table-header-rows` lower to header [`Row`]s
+    /// (`is_header == true`); rows after the wrapper are body rows.
+    #[test]
+    fn odt_model_table_header_rows_mark_header() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t">
+  <office:body><office:text>
+    <table:table>
+      <table:table-column/>
+      <table:table-column/>
+      <table:table-header-rows>
+        <table:table-row>
+          <table:table-cell><text:p>H1</text:p></table:table-cell>
+          <table:table-cell><text:p>H2</text:p></table:table-cell>
+        </table:table-row>
+      </table:table-header-rows>
+      <table:table-row>
+        <table:table-cell><text:p>D1</text:p></table:table-cell>
+        <table:table-cell><text:p>D2</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        let table = odt_first_table(&model);
+        assert_eq!(table.rows.len(), 2);
+        assert!(table.rows[0].is_header, "row inside header-rows → header");
+        assert!(!table.rows[1].is_header, "row after wrapper is a body row");
     }
 
     #[test]

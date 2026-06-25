@@ -459,56 +459,37 @@ impl Walker<'_> {
     }
 
     /// Build a [`Table`] from a `/Table` element: each `/TR` is a row, each
-    /// `/TD`/`/TH` a cell.
+    /// `/TD`/`/TH` a cell. `/THead`/`/TBody`/`/TFoot` row groups (ISO 32000-1
+    /// §14.8.4.3.4.2) are descended into; a `/TR` inside a `/THead` group — or a
+    /// `/TR` whose cells are all `/TH` header cells — yields a header
+    /// [`Row::is_header`].
     fn table_block(&mut self, elem: &Dictionary, page: Option<usize>) -> Option<Block> {
         let page = self.page_of(elem).or(page);
         let mut rows: Vec<Row> = Vec::new();
         let mut max_cols = 0usize;
-        for tr in kids_of(self.doc, elem) {
-            let Some(tr_dict) = tr.as_dict() else {
+        for child in kids_of(self.doc, elem) {
+            let Some(child_dict) = child.as_dict() else {
                 continue;
             };
-            if self.doc.resolve_name(tr_dict, b"S") != Some(b"TR".to_vec()) {
-                continue;
-            }
-            let mut cells: Vec<Cell> = Vec::new();
-            for td in kids_of(self.doc, tr_dict) {
-                let Some(td_dict) = td.as_dict() else {
-                    continue;
-                };
-                let tag = self.doc.resolve_name(td_dict, b"S");
-                if tag.as_deref() != Some(b"TD") && tag.as_deref() != Some(b"TH") {
-                    continue;
+            match self.doc.resolve_name(child_dict, b"S").as_deref() {
+                Some(b"TR") => {
+                    self.push_table_row(child_dict, page, false, &mut rows, &mut max_cols);
                 }
-                let text = self.collect_text(td_dict, page);
-                // `/ColSpan`/`/RowSpan` (`/Table` owner) — without them tagged
-                // tables come out as ragged 0-width grids.
-                let (col_span, row_span) = cell_spans(td_dict, &|o| self.doc.resolve(o));
-                let cell_frame = self.element_bbox(td_dict);
-                cells.push(Cell {
-                    blocks: vec![Block {
-                        id: self.ids.mint(),
-                        frame: cell_frame,
-                        rotation: Rotation::D0,
-                        kind: BlockKind::Paragraph(text_paragraph(&text)),
-                    }],
-                    col_span,
-                    row_span,
-                    shading: None,
-                    vertical_align: None,
-                });
+                // A row group: every `/TR` directly under a `/THead` is a header
+                // row; `/TBody`/`/TFoot` rows are body rows.
+                Some(group @ (b"THead" | b"TBody" | b"TFoot")) => {
+                    let in_thead = group == b"THead";
+                    for tr in kids_of(self.doc, child_dict) {
+                        let Some(tr_dict) = tr.as_dict() else {
+                            continue;
+                        };
+                        if self.doc.resolve_name(tr_dict, b"S").as_deref() == Some(b"TR") {
+                            self.push_table_row(tr_dict, page, in_thead, &mut rows, &mut max_cols);
+                        }
+                    }
+                }
+                _ => {}
             }
-            if cells.is_empty() {
-                continue;
-            }
-            // Logical column count honours horizontal spans (Σ col_span), so a
-            // row of two cells where one spans 2 columns is a 3-wide grid.
-            let row_cols: usize = cells.iter().map(|c| c.col_span.max(1) as usize).sum();
-            max_cols = max_cols.max(row_cols);
-            rows.push(Row {
-                cells,
-                height: None,
-            });
         }
         if rows.is_empty() {
             return None;
@@ -527,6 +508,67 @@ impl Walker<'_> {
                 },
             }),
         })
+    }
+
+    /// Lower one `/TR` dictionary into a model [`Row`], pushing it onto `rows` and
+    /// updating `max_cols`. `in_thead` forces the header flag (the `/TR` came from
+    /// a `/THead` group); otherwise the row is a header iff it has cells and every
+    /// cell is a `/TH`.
+    fn push_table_row(
+        &mut self,
+        tr_dict: &Dictionary,
+        page: Option<usize>,
+        in_thead: bool,
+        rows: &mut Vec<Row>,
+        max_cols: &mut usize,
+    ) {
+        let mut cells: Vec<Cell> = Vec::new();
+        // Tracks whether every emitted cell is a `/TH` (an all-`/TH` row is a
+        // header row even without a `/THead` wrapper). Stays `true` only while at
+        // least one cell exists and none is a `/TD`.
+        let mut all_th = true;
+        for td in kids_of(self.doc, tr_dict) {
+            let Some(td_dict) = td.as_dict() else {
+                continue;
+            };
+            let tag = self.doc.resolve_name(td_dict, b"S");
+            let is_th = tag.as_deref() == Some(b"TH");
+            if tag.as_deref() != Some(b"TD") && !is_th {
+                continue;
+            }
+            if !is_th {
+                all_th = false;
+            }
+            let text = self.collect_text(td_dict, page);
+            // `/ColSpan`/`/RowSpan` (`/Table` owner) — without them tagged
+            // tables come out as ragged 0-width grids.
+            let (col_span, row_span) = cell_spans(td_dict, &|o| self.doc.resolve(o));
+            let cell_frame = self.element_bbox(td_dict);
+            cells.push(Cell {
+                blocks: vec![Block {
+                    id: self.ids.mint(),
+                    frame: cell_frame,
+                    rotation: Rotation::D0,
+                    kind: BlockKind::Paragraph(text_paragraph(&text)),
+                }],
+                col_span,
+                row_span,
+                shading: None,
+                vertical_align: None,
+            });
+        }
+        if cells.is_empty() {
+            return;
+        }
+        // Logical column count honours horizontal spans (Σ col_span), so a row of
+        // two cells where one spans 2 columns is a 3-wide grid.
+        let row_cols: usize = cells.iter().map(|c| c.col_span.max(1) as usize).sum();
+        *max_cols = (*max_cols).max(row_cols);
+        rows.push(Row {
+            cells,
+            height: None,
+            is_header: in_thead || all_th,
+        });
     }
 }
 
@@ -995,6 +1037,65 @@ mod tests {
         assert_eq!(row.cells[1].col_span, 1, "second cell is single");
         // Logical grid width honours the span: 2 + 1 = 3 columns.
         assert_eq!(table.col_widths.len(), 3, "grid is 3 columns wide");
+    }
+
+    /// A `/Table` whose header row lives in a `/THead` group lowers to a header
+    /// [`Row`] (`is_header`); a `/TR` placed directly under the `/Table` (with
+    /// `/TD` cells) stays a body row.
+    #[test]
+    fn tagged_thead_group_marks_header_row() {
+        // MCID 0/1 = the two header cells, MCID 2/3 = the two body cells.
+        let c1 = "BT /F1 12 Tf \
+                  /TH <</MCID 0>> BDC (H1) Tj EMC \
+                  /TH <</MCID 1>> BDC (H2) Tj EMC \
+                  /TD <</MCID 2>> BDC (D1) Tj EMC \
+                  /TD <</MCID 3>> BDC (D2) Tj EMC ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{c1}\nendstream", c1.len()),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            // Table (12) → THead (13) → header TR (14) → TH (15)+TH (16);
+            //            → body TR (17) → TD (18)+TD (19).
+            (11, "<< /S /Document /K 12 0 R >>".into()),
+            (12, "<< /S /Table /Pg 8 0 R /K [13 0 R 17 0 R] >>".into()),
+            (13, "<< /S /THead /Pg 8 0 R /K 14 0 R >>".into()),
+            (14, "<< /S /TR /K [15 0 R 16 0 R] >>".into()),
+            (15, "<< /S /TH /Pg 8 0 R /K 0 >>".into()),
+            (16, "<< /S /TH /Pg 8 0 R /K 1 >>".into()),
+            (17, "<< /S /TR /K [21 0 R 22 0 R] >>".into()),
+            (21, "<< /S /TD /Pg 8 0 R /K 2 >>".into()),
+            (22, "<< /S /TD /Pg 8 0 R /K 3 >>".into()),
+        ]);
+        let doc = crate::Document::open(&pdf).expect("valid tagged PDF");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let table = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a table block");
+        assert_eq!(table.rows.len(), 2, "header row + body row");
+        assert!(table.rows[0].is_header, "/THead row → header");
+        assert!(!table.rows[1].is_header, "body /TR → not header");
     }
 
     #[test]

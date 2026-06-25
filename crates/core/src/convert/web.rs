@@ -335,17 +335,36 @@ fn html_table(table: &Table, doc: &Document, out: &mut String) {
         }
         out.push_str("</colgroup>");
     }
-    for row in &table.rows {
+    // Leading contiguous header rows go in a `<thead>` (with `<th>` cells); the
+    // remaining body rows go in a `<tbody>` (with `<td>` cells). A table with no
+    // header row emits a single `<tbody>` — bit-compatible cell markup as before,
+    // just wrapped. ODF/HTML round-trips this as a header-row group.
+    let head = table.rows.iter().take_while(|r| r.is_header).count();
+    if head > 0 {
+        out.push_str("<thead>");
+        for row in &table.rows[..head] {
+            out.push_str("<tr>");
+            for cell in &row.cells {
+                html_cell(cell, true, doc, out);
+            }
+            out.push_str("</tr>");
+        }
+        out.push_str("</thead>");
+    }
+    out.push_str("<tbody>");
+    for row in &table.rows[head..] {
         out.push_str("<tr>");
         for cell in &row.cells {
-            html_cell(cell, doc, out);
+            // A header row past the leading block (rare) still emits `<th>` cells.
+            html_cell(cell, row.is_header, doc, out);
         }
         out.push_str("</tr>");
     }
+    out.push_str("</tbody>");
     out.push_str("</table>");
 }
 
-fn html_cell(cell: &Cell, doc: &Document, out: &mut String) {
+fn html_cell(cell: &Cell, header: bool, doc: &Document, out: &mut String) {
     let mut attrs = String::new();
     if cell.col_span > 1 {
         attrs.push_str(&format!(" colspan=\"{}\"", cell.col_span));
@@ -376,9 +395,10 @@ fn html_cell(cell: &Cell, doc: &Document, out: &mut String) {
     if !style.is_empty() {
         attrs.push_str(&format!(" style=\"{style}\""));
     }
-    out.push_str(&format!("<td{attrs}>"));
+    let tag = if header { "th" } else { "td" };
+    out.push_str(&format!("<{tag}{attrs}>"));
     html_blocks(&cell.blocks, doc, out);
-    out.push_str("</td>");
+    out.push_str(&format!("</{tag}>"));
 }
 
 fn html_image(img: &ImageRef, doc: &Document, out: &mut String) {
@@ -630,6 +650,95 @@ mod tests {
             html.contains("data:image/png;base64,iVBORw=="),
             "image inlined as data URI"
         );
+    }
+
+    #[test]
+    fn html_table_renders_header_row_as_thead_th() {
+        use crate::model::{BlockKind as MK, Cell, Paragraph, Row, Table};
+        let cell = |t: &str| Cell {
+            blocks: vec![crate::model::Block {
+                kind: MK::Paragraph(Paragraph {
+                    runs: vec![crate::model::Inline::Run(crate::model::InlineRun {
+                        text: t.to_string(),
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Cell::default()
+        };
+        let table = Table {
+            rows: vec![
+                Row {
+                    cells: vec![cell("H1"), cell("H2")],
+                    height: None,
+                    is_header: true,
+                },
+                Row {
+                    cells: vec![cell("D1"), cell("D2")],
+                    height: None,
+                    is_header: false,
+                },
+            ],
+            col_widths: Vec::new(),
+            border: crate::model::BorderStyle::default(),
+        };
+        let doc = Document::default();
+        let mut out = String::new();
+        html_table(&table, &doc, &mut out);
+        assert!(
+            out.contains("<thead>"),
+            "header rows wrapped in <thead>: {out}"
+        );
+        assert!(out.contains("<th>"), "header cells are <th>: {out}");
+        assert!(
+            out.contains("<tbody>"),
+            "body rows wrapped in <tbody>: {out}"
+        );
+        // The header text is inside <th>, the body text inside <td>.
+        let thead_end = out.find("</thead>").expect("</thead>");
+        assert!(out[..thead_end].contains("H1"), "H1 in <thead>: {out}");
+        assert!(
+            out[thead_end..].contains("<td>"),
+            "body cell is <td>: {out}"
+        );
+        assert!(out[thead_end..].contains("D1"), "D1 after <thead>: {out}");
+        assert!(!out.contains("<th>D1"), "body cell is not <th>: {out}");
+    }
+
+    /// A table with no header row emits a single `<tbody>` and `<td>` cells only.
+    #[test]
+    fn html_table_without_header_uses_tbody_td_only() {
+        use crate::model::{BlockKind as MK, Cell, Paragraph, Row, Table};
+        let cell = |t: &str| Cell {
+            blocks: vec![crate::model::Block {
+                kind: MK::Paragraph(Paragraph {
+                    runs: vec![crate::model::Inline::Run(crate::model::InlineRun {
+                        text: t.to_string(),
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Cell::default()
+        };
+        let table = Table {
+            rows: vec![Row {
+                cells: vec![cell("A"), cell("B")],
+                height: None,
+                is_header: false,
+            }],
+            col_widths: Vec::new(),
+            border: crate::model::BorderStyle::default(),
+        };
+        let mut out = String::new();
+        html_table(&table, &Document::default(), &mut out);
+        assert!(!out.contains("<thead>"), "no header → no <thead>: {out}");
+        assert!(!out.contains("<th>"), "no header → no <th>: {out}");
+        assert!(out.contains("<tbody>"), "single <tbody>: {out}");
+        assert!(out.contains("<td>"), "body cells are <td>: {out}");
     }
 
     #[test]

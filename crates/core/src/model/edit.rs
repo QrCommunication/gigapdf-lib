@@ -913,6 +913,8 @@ fn insert_table_row(table: &mut Table, at: usize) -> bool {
     let row = Row {
         cells: vec![Cell::default(); cols],
         height: None,
+        // An inserted blank row is a body row.
+        is_header: false,
     };
     table.rows.insert(at, row);
     true
@@ -2133,6 +2135,7 @@ mod tests {
             rows: vec![Row {
                 cells: vec![Cell::default(), Cell::default()],
                 height: None,
+                is_header: false,
             }],
             col_widths: vec![100.0, 100.0],
             ..Table::default()
@@ -2166,6 +2169,7 @@ mod tests {
                 .map(|_| Row {
                     cells: vec![Cell::default(); cols],
                     height: None,
+                    is_header: false,
                 })
                 .collect(),
             col_widths: vec![100.0; cols],
@@ -3047,6 +3051,7 @@ mod tests {
             rows: vec![Row {
                 cells: vec![Cell::default(); 3],
                 height: None,
+                is_header: false,
             }],
             col_widths: Vec::new(),
             ..Table::default()

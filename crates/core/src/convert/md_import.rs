@@ -631,6 +631,8 @@ fn make_row(cells: &[String], ncols: usize, header: bool, defs: &Defs) -> Row {
     Row {
         cells: out,
         height: None,
+        // A GFM header row maps directly to the model header flag.
+        is_header: header,
     }
 }
 

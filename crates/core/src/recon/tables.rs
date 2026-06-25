@@ -811,10 +811,18 @@ pub fn build_table(
     }
 
     let mut rows: Vec<Row> = Vec::with_capacity(n_rows);
+    // Per-row header signal: whether the row has any non-empty cell and whether
+    // every non-empty cell is bold. Collected while building so the leading row's
+    // weight can be judged against the body once all rows exist.
+    let mut row_bold: Vec<(bool, bool)> = Vec::with_capacity(n_rows);
     for r in 0..n_rows {
         // Row edges are top→bottom (descending Y); height is the gap.
         let height = (table.rows[r] - table.rows[r + 1]).abs();
         let mut cells: Vec<Cell> = Vec::with_capacity(n_cols);
+        // Whether this row has any non-empty cell, and whether all its non-empty
+        // cells are bold (the header signal).
+        let mut any_text = false;
+        let mut all_bold = true;
         for c in 0..n_cols {
             // A slot absorbed by a span anchored above/left is not emitted: the
             // row supplies fewer cells, which is exactly how the model (and the
@@ -827,6 +835,14 @@ pub fn build_table(
             let text = std::mem::take(&mut grid[r][c]);
             let style = styles[r][c].take();
             let src = src_grid[r][c].take();
+            // A non-empty cell contributes to the bold tally; an empty cell carries
+            // no run style, so it neither sets nor clears the "all bold" signal.
+            if !text.trim().is_empty() {
+                any_text = true;
+                if !style.as_ref().map(|s| s.bold).unwrap_or(false) {
+                    all_bold = false;
+                }
+            }
             let (cspan, rspan) = span[r][c];
             // Per-column alignment (borderless detection sets `Right` for numeric
             // columns); absent ⇒ left. A spanning cell takes its anchor column's
@@ -842,10 +858,27 @@ pub fn build_table(
                 ids,
             ));
         }
+        row_bold.push((any_text, all_bold));
         rows.push(Row {
             cells,
             height: Some(height),
+            // Set conservatively below from `row_bold`.
+            is_header: false,
         });
+    }
+
+    // Conservative header detection: mark only the **leading** row, and only when
+    // it is entirely bold while the body is not — a real visual contrast. A
+    // uniform table (no bold, or everything bold) yields no header row, so there
+    // are no false positives on plain data tables.
+    if let Some(&(first_text, first_bold)) = row_bold.first() {
+        let leading_is_bold_header = first_text && first_bold;
+        let body_has_non_bold = row_bold.iter().skip(1).any(|&(text, bold)| text && !bold);
+        if leading_is_bold_header && body_has_non_bold {
+            if let Some(first) = rows.first_mut() {
+                first.is_header = true;
+            }
+        }
     }
 
     // Frame = the grid extent. `cols`/`rows` are in the table's own frame, so a
@@ -2107,6 +2140,17 @@ mod tests {
         }
     }
 
+    /// `run` rendered in a bold font (drives header-row detection).
+    fn run_bold(text: &str, x: f64, y: f64, w: f64) -> ReconRun {
+        ReconRun {
+            style: TextStyle {
+                bold: true,
+                ..TextStyle::default()
+            },
+            ..run(text, x, y, w)
+        }
+    }
+
     /// A horizontal ruling line as a thin filled rectangle path.
     fn hrule(y: f64, x0: f64, x1: f64) -> VectorPath {
         rect_path(x0, y - 0.25, x1 - x0, 0.5)
@@ -2536,6 +2580,57 @@ mod tests {
             .cells
             .iter()
             .all(|c| c.col_span == 1 && c.row_span == 1));
+    }
+
+    #[test]
+    fn bold_first_row_is_detected_as_header() {
+        // 2 rows × 2 cols, fully ruled. The top band [120,140] holds bold runs
+        // (a header), the bottom band [100,120] holds plain runs. The leading row
+        // is marked `is_header`; the body row is not.
+        let paths = vec![
+            hrule(140.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(100.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        let runs = vec![
+            run_bold("Name", 60.0, 126.0, 40.0),
+            run_bold("City", 160.0, 126.0, 40.0),
+            run("Ada", 60.0, 106.0, 30.0),
+            run("Lyon", 160.0, 106.0, 30.0),
+        ];
+        let rows = build_rows(&paths, &runs);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_header, "bold leading row → header");
+        assert!(!rows[1].is_header, "plain body row → not header");
+    }
+
+    #[test]
+    fn uniform_table_has_no_header_row() {
+        // The same grid with NO bold anywhere: a plain data table must not flag any
+        // header row (conservative — zero false positives).
+        let paths = vec![
+            hrule(140.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(100.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        let runs = vec![
+            run("Name", 60.0, 126.0, 40.0),
+            run("City", 160.0, 126.0, 40.0),
+            run("Ada", 60.0, 106.0, 30.0),
+            run("Lyon", 160.0, 106.0, 30.0),
+        ];
+        let rows = build_rows(&paths, &runs);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| !r.is_header),
+            "uniform table has no header row"
+        );
     }
 
     #[test]

@@ -872,11 +872,21 @@ fn docx_table(table: &Table, ctx: &mut DocxCtx) -> String {
     let mut rows = String::new();
     for row in &table.rows {
         rows.push_str("<w:tr>");
-        if let Some(h) = row.height {
-            rows.push_str(&format!(
-                "<w:trPr><w:trHeight w:val=\"{}\" w:hRule=\"atLeast\"/></w:trPr>",
-                twips(h)
-            ));
+        // `w:trPr` carries the row height and/or the header flag. Child order
+        // follows CT_TrPr: `w:trHeight` precedes `w:tblHeader`. Emit the wrapper
+        // only when at least one is present (a plain body row keeps no `w:trPr`).
+        if row.height.is_some() || row.is_header {
+            rows.push_str("<w:trPr>");
+            if let Some(h) = row.height {
+                rows.push_str(&format!(
+                    "<w:trHeight w:val=\"{}\" w:hRule=\"atLeast\"/>",
+                    twips(h)
+                ));
+            }
+            if row.is_header {
+                rows.push_str("<w:tblHeader/>");
+            }
+            rows.push_str("</w:trPr>");
         }
         let mut phys = 0usize; // current physical column
         let mut cells = row.cells.iter();
@@ -3915,7 +3925,20 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
     };
 
     let mut rows = String::new();
-    for row in &table.rows {
+    // Leading contiguous header rows are wrapped in `<table:table-header-rows>`
+    // (ODF requires the header rows to lead the table and live in that element).
+    // Open it before the first header row, close it at the first body row; a
+    // non-leading header row (rare) stays an ordinary row.
+    let header_rows = table.rows.iter().take_while(|r| r.is_header).count();
+    let mut header_open = false;
+    for (ri, row) in table.rows.iter().enumerate() {
+        if ri < header_rows && !header_open {
+            rows.push_str("<table:table-header-rows>");
+            header_open = true;
+        } else if ri == header_rows && header_open {
+            rows.push_str("</table:table-header-rows>");
+            header_open = false;
+        }
         // Row height → a row style carrying `style:row-height` (DOCX uses
         // `w:trHeight`; this is the ODF equivalent). `style:min-row-height` keeps
         // it a floor so taller content still fits, matching DOCX's `hRule="atLeast"`.
@@ -3983,6 +4006,10 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
         }
         let _ = phys;
         rows.push_str("</table:table-row>");
+    }
+    // A table that is all header rows leaves the wrapper open: close it.
+    if header_open {
+        rows.push_str("</table:table-header-rows>");
     }
 
     format!("<table:table table:style-name=\"{tname}\">{col_defs}{rows}</table:table>")
@@ -5080,6 +5107,8 @@ fn sheet_to_table(sheet: &Sheet) -> Table {
                 })
                 .collect(),
             height: None,
+            // A flattened spreadsheet carries no table-header-row semantics.
+            is_header: false,
         })
         .collect();
     Table {
@@ -6642,26 +6671,44 @@ fn xhtml_list(list: &List, doc: &Document, out: &mut String, toc: &mut EpubToc) 
 
 fn xhtml_table(table: &Table, doc: &Document, out: &mut String, toc: &mut EpubToc) {
     out.push_str("<table>");
-    for row in &table.rows {
-        out.push_str("<tr>");
-        for cell in &row.cells {
-            let mut attrs = String::new();
-            if cell.col_span > 1 {
-                attrs.push_str(&format!(" colspan=\"{}\"", cell.col_span));
-            }
-            if cell.row_span > 1 {
-                attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
-            }
-            if let Some(rgb) = cell.shading {
-                attrs.push_str(&format!(" style=\"background-color:#{}\"", hex(rgb)));
-            }
-            out.push_str(&format!("<td{attrs}>"));
-            xhtml_blocks(&cell.blocks, doc, out, toc);
-            out.push_str("</td>");
+    // Leading contiguous header rows → `<thead>` with `<th>` cells; the rest →
+    // `<tbody>` with `<td>` cells. No header row ⇒ a single `<tbody>`.
+    let head = table.rows.iter().take_while(|r| r.is_header).count();
+    if head > 0 {
+        out.push_str("<thead>");
+        for row in &table.rows[..head] {
+            xhtml_table_row(row, true, doc, out, toc);
         }
-        out.push_str("</tr>");
+        out.push_str("</thead>");
     }
+    out.push_str("<tbody>");
+    for row in &table.rows[head..] {
+        xhtml_table_row(row, row.is_header, doc, out, toc);
+    }
+    out.push_str("</tbody>");
     out.push_str("</table>");
+}
+
+/// Emit one `<tr>` of an EPUB table; `header` ⇒ `<th>` cells, else `<td>`.
+fn xhtml_table_row(row: &Row, header: bool, doc: &Document, out: &mut String, toc: &mut EpubToc) {
+    let tag = if header { "th" } else { "td" };
+    out.push_str("<tr>");
+    for cell in &row.cells {
+        let mut attrs = String::new();
+        if cell.col_span > 1 {
+            attrs.push_str(&format!(" colspan=\"{}\"", cell.col_span));
+        }
+        if cell.row_span > 1 {
+            attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
+        }
+        if let Some(rgb) = cell.shading {
+            attrs.push_str(&format!(" style=\"background-color:#{}\"", hex(rgb)));
+        }
+        out.push_str(&format!("<{tag}{attrs}>"));
+        xhtml_blocks(&cell.blocks, doc, out, toc);
+        out.push_str(&format!("</{tag}>"));
+    }
+    out.push_str("</tr>");
 }
 
 fn xhtml_sheet(sheet: &Sheet, out: &mut String) {
@@ -7163,6 +7210,7 @@ mod tests {
                     Row {
                         cells: vec![span_cell],
                         height: None,
+                        is_header: false,
                     },
                     Row {
                         cells: vec![
@@ -7176,6 +7224,7 @@ mod tests {
                             },
                         ],
                         height: None,
+                        is_header: false,
                     },
                 ],
                 col_widths: vec![100.0, 100.0],
@@ -7683,6 +7732,7 @@ mod tests {
                             },
                         ],
                         height: None,
+                        is_header: false,
                     },
                     Row {
                         // Only the right cell; the left is covered by the row span.
@@ -7691,6 +7741,7 @@ mod tests {
                             ..Default::default()
                         }],
                         height: None,
+                        is_header: false,
                     },
                 ],
                 col_widths: vec![100.0, 100.0],
@@ -7910,6 +7961,7 @@ mod tests {
                             rows: vec![crate::model::Row {
                                 cells: vec![cell],
                                 height: None,
+                                is_header: false,
                             }],
                             col_widths: Vec::new(),
                             border: BorderStyle::default(),
@@ -7929,6 +7981,103 @@ mod tests {
         );
     }
 
+    /// A one-table document whose first row is a header (`is_header == true`) and
+    /// whose second row is a body row, used by the header-row export tests.
+    fn header_table_doc() -> Document {
+        let cell = |t: &str| Cell {
+            blocks: vec![para(t)],
+            ..Cell::default()
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Table(Table {
+                            rows: vec![
+                                Row {
+                                    cells: vec![cell("H1"), cell("H2")],
+                                    height: None,
+                                    is_header: true,
+                                },
+                                Row {
+                                    cells: vec![cell("D1"), cell("D2")],
+                                    height: None,
+                                    is_header: false,
+                                },
+                            ],
+                            col_widths: vec![100.0, 100.0],
+                            border: BorderStyle::default(),
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A header row exports as DOCX `w:trPr/w:tblHeader`; the body row carries no
+    /// `w:tblHeader`.
+    #[test]
+    fn docx_from_model_emits_tbl_header_for_header_row() {
+        let xml = String::from_utf8(
+            entry(&docx_from_model(&header_table_doc()), "word/document.xml").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            xml.contains("<w:trPr><w:tblHeader/></w:trPr>"),
+            "header row → w:tblHeader: {xml}"
+        );
+        assert_eq!(
+            xml.matches("<w:tblHeader/>").count(),
+            1,
+            "only the header row carries w:tblHeader: {xml}"
+        );
+    }
+
+    /// Header rows export as an ODT `table:table-header-rows` wrapper around the
+    /// leading header row(s); the body row sits after it.
+    #[test]
+    fn odt_from_model_wraps_header_rows() {
+        let content =
+            String::from_utf8(entry(&odt_from_model(&header_table_doc()), "content.xml").unwrap())
+                .unwrap();
+        let open = content
+            .find("<table:table-header-rows>")
+            .expect("header-rows wrapper present");
+        let close = content
+            .find("</table:table-header-rows>")
+            .expect("header-rows wrapper closed");
+        assert!(open < close, "wrapper well-formed");
+        // The header cell falls inside the wrapper; the body cell after it.
+        let h1 = content.find("H1").expect("H1 present");
+        let d1 = content.find("D1").expect("D1 present");
+        assert!(open < h1 && h1 < close, "H1 inside header-rows: {content}");
+        assert!(d1 > close, "D1 after header-rows: {content}");
+    }
+
+    /// A header row exports as EPUB `<thead>` with `<th>` cells; the body row sits
+    /// in `<tbody>` with `<td>` cells.
+    #[test]
+    fn epub_from_model_emits_thead_and_th_for_header_row() {
+        let bytes = epub_from_model(&header_table_doc());
+        let chap = String::from_utf8(entry(&bytes, "OEBPS/text-1.xhtml").unwrap()).unwrap();
+        // Cell content is wrapped in a `<p>`; assert the cell tags, not bare text.
+        assert!(chap.contains("<thead>"), "header rows in <thead>: {chap}");
+        assert!(
+            chap.contains("<th><p>H1</p></th>"),
+            "header cell is <th>: {chap}"
+        );
+        assert!(chap.contains("<tbody>"), "body rows in <tbody>: {chap}");
+        assert!(
+            chap.contains("<td><p>D1</p></td>"),
+            "body cell is <td>: {chap}"
+        );
+        assert!(!chap.contains("<th><p>D1"), "body cell is not <th>: {chap}");
+    }
+
     #[test]
     fn pptx_from_model_emits_slide_table_cell_anchor() {
         // A slide-table `Cell.vertical_align` becomes `a:tcPr@anchor` (t/ctr/b); a
@@ -7944,6 +8093,7 @@ mod tests {
                 rows: vec![crate::model::Row {
                     cells: vec![mk("Mid", Some(CellVAlign::Middle)), mk("Def", None)],
                     height: None,
+                    is_header: false,
                 }],
                 col_widths: Vec::new(),
                 border: BorderStyle::default(),
@@ -8503,10 +8653,12 @@ style:family=\"paragraph\""
                     Row {
                         cells: vec![mk_cell("R1C1"), mk_cell("R1C2")],
                         height: None,
+                        is_header: false,
                     },
                     Row {
                         cells: vec![mk_cell("R2C1"), mk_cell("R2C2")],
                         height: None,
+                        is_header: false,
                     },
                 ],
                 col_widths: vec![220.0, 180.0],
@@ -8643,10 +8795,12 @@ style:family=\"paragraph\""
                     Row {
                         cells: vec![mk("H1"), mk("H2")],
                         height: None,
+                        is_header: false,
                     },
                     Row {
                         cells: vec![mk("D1"), mk("D2")],
                         height: None,
+                        is_header: false,
                     },
                 ],
                 col_widths: vec![120.0, 120.0],
@@ -9608,6 +9762,7 @@ style:print-orientation=\"landscape\""),
                         ..Default::default()
                     }],
                     height: None,
+                    is_header: false,
                 }],
                 ..Default::default()
             }),
@@ -10333,6 +10488,9 @@ style:print-orientation=\"landscape\""),
                     Row {
                         cells: vec![hdr("H1", Align::Center), hdr("H2", Align::Right)],
                         height: None,
+                        // The GFM header row; Markdown export keys the alignment
+                        // row off the first row regardless, so output is unchanged.
+                        is_header: true,
                     },
                     Row {
                         cells: vec![
@@ -10346,6 +10504,7 @@ style:print-orientation=\"landscape\""),
                             },
                         ],
                         height: None,
+                        is_header: false,
                     },
                 ],
                 col_widths: vec![],
@@ -11134,6 +11293,7 @@ style:print-orientation=\"landscape\""),
                         },
                     ],
                     height: Some(30.0),
+                    is_header: false,
                 }],
                 col_widths: vec![100.0, 100.0],
                 border: crate::model::BorderStyle {

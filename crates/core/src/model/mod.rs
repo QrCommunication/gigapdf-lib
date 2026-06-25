@@ -251,6 +251,14 @@ pub struct Table {
 pub struct Row {
     pub cells: Vec<Cell>,
     pub height: Option<f64>,
+    /// Whether this row is a table **header row** (column titles), as opposed to
+    /// a body row. Maps directly to DOCX `w:trPr/w:tblHeader`, the HTML
+    /// `<thead>`/`<th>` distinction, and ODF `table:table-header-rows`. `false`
+    /// (the default) ⇒ an ordinary body row. Recon marks a leading row when it is
+    /// visually a header (e.g. entirely bold). Per-cell column-header semantics
+    /// (`<th scope>` inside the body) are not modelled here — this is a per-**row**
+    /// flag covering the dominant case.
+    pub is_header: bool,
 }
 
 /// A table cell: block content plus span and optional background shading.

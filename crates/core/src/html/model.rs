@@ -216,7 +216,7 @@ fn list_item(
 /// computed background shading.
 fn emit_table(el: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Element]) -> Table {
     let mut rows = Vec::new();
-    collect_rows(el, sheet, style, ancestors, &mut rows);
+    collect_rows(el, sheet, style, ancestors, false, &mut rows);
     Table {
         rows,
         col_widths: Vec::new(),
@@ -225,12 +225,14 @@ fn emit_table(el: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Ele
 }
 
 /// Recursively find `tr` elements (through `thead`/`tbody`/`tfoot` wrappers) and
-/// turn each into a model [`Row`].
+/// turn each into a model [`Row`]. `in_thead` marks rows under a `<thead>` as
+/// header rows.
 fn collect_rows(
     el: &Element,
     sheet: &Stylesheet,
     parent: &Style,
     ancestors: &[&Element],
+    in_thead: bool,
     rows: &mut Vec<Row>,
 ) {
     let mut chain = ancestors.to_vec();
@@ -239,23 +241,39 @@ fn collect_rows(
         if let Node::Element(c) = child {
             let cs = sheet.computed(c, parent, &chain);
             if c.tag == "tr" || cs.display == Display::TableRow {
-                rows.push(table_row(c, sheet, &cs, &chain));
+                rows.push(table_row(c, sheet, &cs, &chain, in_thead));
             } else if matches!(c.tag.as_str(), "thead" | "tbody" | "tfoot") {
-                collect_rows(c, sheet, &cs, &chain, rows);
+                // Rows inside `<thead>` are header rows; `<tbody>`/`<tfoot>` aren't.
+                collect_rows(c, sheet, &cs, &chain, c.tag == "thead", rows);
             }
         }
     }
 }
 
-/// Build one [`Row`] from a `tr`: a [`Cell`] per `td`/`th` child.
-fn table_row(tr: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Element]) -> Row {
+/// Build one [`Row`] from a `tr`: a [`Cell`] per `td`/`th` child. The row is a
+/// header row when it is under a `<thead>` (`in_thead`) or every cell is a `<th>`.
+fn table_row(
+    tr: &Element,
+    sheet: &Stylesheet,
+    style: &Style,
+    ancestors: &[&Element],
+    in_thead: bool,
+) -> Row {
     let mut chain = ancestors.to_vec();
     chain.push(tr);
     let mut cells = Vec::new();
+    // Tracks whether every cell in the row is a `<th>` (an all-`<th>` row is a
+    // header row even outside `<thead>`).
+    let mut any_cell = false;
+    let mut all_th = true;
     for child in &tr.children {
         if let Node::Element(td) = child {
             let cs = sheet.computed(td, style, &chain);
             if matches!(td.tag.as_str(), "td" | "th") || cs.display == Display::TableCell {
+                any_cell = true;
+                if td.tag != "th" {
+                    all_th = false;
+                }
                 cells.push(table_cell(td, sheet, &cs, &chain));
             }
         }
@@ -263,6 +281,7 @@ fn table_row(tr: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Elem
     Row {
         cells,
         height: None,
+        is_header: in_thead || (any_cell && all_th),
     }
 }
 
@@ -599,6 +618,40 @@ mod tests {
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].cells.len(), 2);
         assert_eq!(t.rows[1].cells[0].col_span, 2);
+        // No header markup → no header rows.
+        assert!(
+            t.rows.iter().all(|r| !r.is_header),
+            "plain table has no header"
+        );
+    }
+
+    /// `<thead>` rows lower to header [`Row`]s; `<tbody>` rows are body rows.
+    #[test]
+    fn table_thead_marks_header_rows() {
+        let doc = model_of(
+            "<table><thead><tr><th>H1</th><th>H2</th></tr></thead>\
+             <tbody><tr><td>D1</td><td>D2</td></tr></tbody></table>",
+        );
+        let t = match &blocks(&doc)[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected table, got {other:?}"),
+        };
+        assert_eq!(t.rows.len(), 2);
+        assert!(t.rows[0].is_header, "<thead> row → header");
+        assert!(!t.rows[1].is_header, "<tbody> row → body");
+    }
+
+    /// A `<tr>` whose cells are all `<th>` is a header row even without `<thead>`.
+    #[test]
+    fn table_all_th_row_is_header() {
+        let doc =
+            model_of("<table><tr><th>A</th><th>B</th></tr><tr><td>c</td><td>d</td></tr></table>");
+        let t = match &blocks(&doc)[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected table, got {other:?}"),
+        };
+        assert!(t.rows[0].is_header, "all-<th> row → header");
+        assert!(!t.rows[1].is_header, "mixed/<td> row → body");
     }
 
     /// Concatenate a paragraph's plain run text (for assertions).

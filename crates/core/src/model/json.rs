@@ -706,6 +706,8 @@ impl Writer {
             Some(h) => self.f64(h),
             None => self.null(),
         }
+        self.key("is_header");
+        self.bool_val(r.is_header);
         self.obj_close();
     }
 
@@ -1860,6 +1862,7 @@ impl<'a> Reader<'a> {
                         Some(r.number()?)
                     };
                 }
+                "is_header" => row.is_header = r.bool()?,
                 _ => return None,
             }
             Some(())
@@ -2434,10 +2437,13 @@ mod tests {
                         mk_cell("r0c1", None, 1, None),
                     ],
                     height: Some(24.0),
+                    // Header row so the round-trip test exercises `is_header`.
+                    is_header: true,
                 },
                 Row {
                     cells: vec![mk_cell("r1c0", None, 2, Some(CellVAlign::Bottom))],
                     height: None,
+                    is_header: false,
                 },
             ],
             col_widths: vec![120.0, 80.5],

@@ -33925,10 +33925,12 @@ mod tests {
                 Row {
                     cells: vec![text_cell("Name"), text_cell("City")],
                     height: None,
+                    is_header: false,
                 },
                 Row {
                     cells: vec![text_cell("Alexandra"), text_cell("Lyon")],
                     height: None,
+                    is_header: false,
                 },
             ],
             ..Table::default()

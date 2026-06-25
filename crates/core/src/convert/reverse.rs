@@ -1445,10 +1445,12 @@ mod tests {
                 Row {
                     cells: vec![mk_cell("A1"), mk_cell("B1")],
                     height: None,
+                    is_header: false,
                 },
                 Row {
                     cells: vec![mk_cell("A2"), mk_cell("B2")],
                     height: None,
+                    is_header: false,
                 },
             ],
             col_widths: vec![100.0, 200.0],

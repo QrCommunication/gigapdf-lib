@@ -1537,6 +1537,8 @@ fn table_to_model(p: &Parser, rows: &[Vec<Vec<Para>>]) -> Table {
                     })
                     .collect(),
                 height: None,
+                // RTF has no table-header-row concept; rows import as body rows.
+                is_header: false,
             })
             .collect(),
         ..Table::default()
