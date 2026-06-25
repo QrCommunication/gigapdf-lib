@@ -2225,8 +2225,9 @@ fn docx_link_target(ctx: &DocxCtx, attrs: &[(String, String)]) -> model::LinkTar
     model::LinkTarget::Url(String::new())
 }
 
-/// The interned form of an embedded media part: either the original blob kept
-/// verbatim under its true format tag, or a metafile rasterized to PNG.
+/// The interned form of an embedded media part: the original blob kept verbatim
+/// under its true format tag, a metafile rasterized to PNG, or an AVIF decoded to
+/// PNG.
 enum MediaIntern {
     /// Keep the bytes as-is; the `&str` is the [`model::ImageResource::format`]
     /// tag (`"png"`, `"jpeg"`, `"webp"`, `"gif"`, `"bmp"`, `"tiff"`, `"svg"`).
@@ -2235,6 +2236,10 @@ enum MediaIntern {
     /// that (the model/render/export side carries no metafile rasterizer, so the
     /// picture only survives as a bitmap).
     MetafileToPng,
+    /// An AVIF (AV1) still image: decode it to RGBA via [`crate::raster::avif`]
+    /// and re-encode to PNG. The renderer/exporters decode PNG/JPEG natively but
+    /// not AVIF, so — like a metafile — the picture survives as a PNG bitmap.
+    AvifToPng,
 }
 
 /// Classify an embedded media blob from its **magic bytes** first (robust against
@@ -2267,6 +2272,12 @@ fn classify_media(name: &str, bytes: &[u8]) -> Option<MediaIntern> {
     {
         return Some(MediaIntern::Keep("tiff"));
     }
+    // AVIF (AV1 still image): an ISO-BMFF file whose `ftyp` box carries the `avif`
+    // (still) or `avis` (sequence) brand. Decoded to RGBA then re-encoded to PNG
+    // (the renderer has no native AVIF decode path — see `MediaIntern::AvifToPng`).
+    if is_avif_bytes(bytes) {
+        return Some(MediaIntern::AvifToPng);
+    }
     // WMF placeable key / EMF " EMF" signature: a metafile to rasterize. The
     // metafile decoder re-sniffs (incl. bare WMF headers) before committing.
     if bytes.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A])
@@ -2290,10 +2301,39 @@ fn classify_media(name: &str, bytes: &[u8]) -> Option<MediaIntern> {
         "gif" => Some(MediaIntern::Keep("gif")),
         "bmp" | "dib" => Some(MediaIntern::Keep("bmp")),
         "tif" | "tiff" => Some(MediaIntern::Keep("tiff")),
+        "avif" | "avifs" => Some(MediaIntern::AvifToPng),
         "svg" => Some(MediaIntern::Keep("svg")),
         "wmf" | "emf" | "emz" | "wmz" => Some(MediaIntern::MetafileToPng),
         _ => None,
     }
+}
+
+/// True when `bytes` is an ISO-BMFF AVIF still image (or `avis` sequence): a
+/// leading `ftyp` box (`bytes[4..8] == "ftyp"`) whose major brand (`bytes[8..12]`)
+/// or one of its compatible brands (the 4-byte tags after the minor version, up
+/// to the box size) is `avif`/`avis`. Bounds-checked; never panics on a short or
+/// malformed header.
+fn is_avif_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let is_av_brand = |b: &[u8]| b == b"avif" || b == b"avis";
+    // Major brand.
+    if is_av_brand(&bytes[8..12]) {
+        return true;
+    }
+    // Compatible brands follow the 4-byte minor-version field, each 4 bytes, up
+    // to the declared `ftyp` box size (clamped to the buffer).
+    let box_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let end = box_size.clamp(16, bytes.len());
+    let mut i = 16;
+    while i + 4 <= end {
+        if is_av_brand(&bytes[i..i + 4]) {
+            return true;
+        }
+        i += 4;
+    }
+    false
 }
 
 /// Heuristic SVG sniff: scan the first non-whitespace bytes for an opening `<svg`
@@ -2330,6 +2370,10 @@ fn intern_media(
                 crate::raster::png::encode_png(r.width, r.height, &r.rgba),
                 "png",
             )
+        }
+        MediaIntern::AvifToPng => {
+            let (w, h, rgba) = crate::raster::avif::decode_avif(raw)?;
+            (crate::raster::png::encode_png(w, h, &rgba), "png")
         }
     };
     let hash = fnv1a(&bytes);
@@ -4895,11 +4939,14 @@ fn pptx_pic_model(
 }
 
 /// Lower one `p:graphicFrame` (open consumed): read its `p:xfrm` for placement,
-/// then dispatch on the `a:graphicData` payload — a native table (`a:tbl`), a
-/// chart (`c:chart`, resolved via rels → title + series as a [`Table`]) or
-/// SmartArt (`dgm:relIds`, resolved → node text as a [`List`]). The resulting
-/// block lands in `acc.shapes` with its absolute frame. Consumes up to
-/// `</p:graphicFrame>`.
+/// then dispatch on the `a:graphicData` payload — a native table (`a:tbl` → one
+/// model [`Table`]), a chart (`c:chart`, resolved via rels →
+/// [`chart::parse_chart`](crate::convert::chart::parse_chart): a native vector
+/// rendering plus a data [`Table`]) or SmartArt (`dgm:relIds`, resolved →
+/// [`chart::parse_smartart`](crate::convert::chart::parse_smartart): the diagram's
+/// node hierarchy as a [`List`] plus, when the laid-out drawing part is present,
+/// its shapes). The resulting block(s) land in `acc.shapes`, anchored at the
+/// graphicFrame's frame. Consumes up to `</p:graphicFrame>`.
 #[allow(clippy::too_many_arguments)]
 fn pptx_graphic_frame_model(
     x: &mut Xml,
@@ -4912,7 +4959,11 @@ fn pptx_graphic_frame_model(
 ) {
     let mut xfrm = XfrmBox::default();
     let mut have_xfrm = false;
-    let mut block: Option<Block> = None;
+    // A single model block (table) OR a group of chart/SmartArt blocks. `placed`
+    // are already anchored (chart/SmartArt, laid out within the graphicFrame box);
+    // `single` still needs the frame applied from the graphicFrame's `p:xfrm`.
+    let mut single: Option<Block> = None;
+    let mut placed: Option<Vec<Block>> = None;
 
     while let Some(tok) = x.next() {
         match &tok {
@@ -4921,28 +4972,30 @@ fn pptx_graphic_frame_model(
                     xfrm = parse_xfrm(x, attrs);
                     have_xfrm = true;
                 }
-                "tbl" if !sc && block.is_none() => {
-                    block = Some(Block {
+                "tbl" if !sc && single.is_none() && placed.is_none() => {
+                    single = Some(Block {
                         kind: BlockKind::Table(pptx_table_model(x, rels, theme)),
                         ..Block::default()
                     });
                 }
-                // A chart reference: `<c:chart r:id="rIdN"/>`.
-                "chart" if block.is_none() => {
+                // A chart reference: `<c:chart r:id="rIdN"/>` → its part, rendered
+                // natively (vector figure + data table) by the chart module.
+                "chart" if single.is_none() && placed.is_none() => {
                     if let Some(rid) = attr(attrs, "id") {
-                        block = pptx_chart_model(zip, rels, rid).map(|t| Block {
-                            kind: BlockKind::Table(t),
-                            ..Block::default()
-                        });
+                        let blocks = pptx_chart_blocks(zip, rels, rid);
+                        if !blocks.is_empty() {
+                            placed = Some(blocks);
+                        }
                     }
                 }
-                // A SmartArt diagram: `<dgm:relIds r:dm="rIdN" …/>` → data part.
-                "relIds" if block.is_none() => {
+                // A SmartArt diagram: `<dgm:relIds r:dm="rIdN" …/>` → data part
+                // (node hierarchy) plus, when resolvable, its laid-out drawing.
+                "relIds" if single.is_none() && placed.is_none() => {
                     if let Some(rid) = attr(attrs, "dm") {
-                        block = pptx_smartart_model(zip, rels, rid).map(|list| Block {
-                            kind: BlockKind::List(list),
-                            ..Block::default()
-                        });
+                        let blocks = pptx_smartart_blocks(zip, rels, rid);
+                        if !blocks.is_empty() {
+                            placed = Some(blocks);
+                        }
                     }
                 }
                 _ => {}
@@ -4952,8 +5005,14 @@ fn pptx_graphic_frame_model(
         }
     }
 
-    if let Some(mut block) = block {
-        let (frame, rotation) = xfrm_to_frame(&xfrm, g, geom.h);
+    let (frame, rotation) = xfrm_to_frame(&xfrm, g, geom.h);
+    if let Some(blocks) = placed {
+        // Chart/SmartArt: anchor the whole block group at the graphicFrame's box
+        // (each block keeps the chart canvas's own internal layout).
+        for block in place_graphic_blocks(blocks, frame) {
+            acc.shapes.push(block);
+        }
+    } else if let Some(mut block) = single {
         block.frame = frame;
         block.rotation = rotation;
         acc.shapes.push(block);
@@ -4961,7 +5020,6 @@ fn pptx_graphic_frame_model(
         // Unknown/unsupported graphic payload (e.g. an OLE object or a chart whose
         // part is missing): surface a labelled placeholder paragraph rather than
         // dropping the frame silently.
-        let (frame, rotation) = xfrm_to_frame(&xfrm, g, geom.h);
         acc.shapes.push(Block {
             frame,
             rotation,
@@ -4971,6 +5029,109 @@ fn pptx_graphic_frame_model(
             ..Block::default()
         });
     }
+}
+
+/// Anchor a chart/SmartArt block group (from
+/// [`chart::parse_chart`](crate::convert::chart::parse_chart) /
+/// [`chart::parse_smartart`](crate::convert::chart::parse_smartart)) at the
+/// graphicFrame's model rect `frame`. The chart module authors every block in one
+/// shared canvas whose top-left is the origin; translating each block's frame by a
+/// single offset preserves that internal layout exactly while moving the figure to
+/// the graphicFrame's position (its top edge aligned with the frame's top). The
+/// chart renders at its native canvas size — no segment rescaling, so the
+/// vector/label geometry stays self-consistent. Blocks with no own frame (the data
+/// `Table`, which flows) are passed through untouched. When `frame` is `None` (the
+/// graphicFrame had no usable `p:xfrm`), the blocks keep their canvas coordinates.
+fn place_graphic_blocks(blocks: Vec<Block>, frame: Option<model::Rect>) -> Vec<Block> {
+    let Some(f) = frame else {
+        return blocks;
+    };
+    // The chart canvas's own height = the tallest framed block's bottom edge
+    // (frames are top-left / Y-down in the chart's canvas space). Derived from the
+    // blocks themselves so no chart-internal constant is needed.
+    let canvas_h = blocks
+        .iter()
+        .filter_map(|b| b.frame.map(|r| r.y + r.h))
+        .fold(0.0_f64, f64::max);
+    // The canvas's top edge aligns with the frame's top (model is lower-left, so
+    // that is `f.y + f.h`); the canvas height is anchored from there downward.
+    let dx = f.x;
+    let dy = f.y + f.h - canvas_h;
+    blocks
+        .into_iter()
+        .map(|mut b| {
+            if let Some(r) = b.frame {
+                b.frame = Some(model::Rect::new(r.x + dx, r.y + dy, r.w, r.h));
+            }
+            b
+        })
+        .collect()
+}
+
+/// Resolve and lower a chart part referenced by `rid` (slide rels →
+/// `ppt/charts/chartN.xml`) into model blocks via
+/// [`chart::parse_chart`](crate::convert::chart::parse_chart): a native vector
+/// rendering (axes, series, legend) followed by the chart's numbers as a
+/// [`Table`]. Empty when the part is missing or carries nothing parseable.
+fn pptx_chart_blocks(
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    rid: &str,
+) -> Vec<Block> {
+    let Some(target) = rels.get(rid) else {
+        return Vec::new();
+    };
+    let key = resolve_rel_part("ppt/slides", target);
+    let Some(bytes) = zip.get(&key) else {
+        return Vec::new();
+    };
+    crate::convert::chart::parse_chart(&String::from_utf8_lossy(bytes))
+}
+
+/// Resolve and lower a SmartArt diagram referenced by `rid` (the `dgm:relIds@r:dm`
+/// data-model relationship; slide rels → `ppt/diagrams/dataN.xml`) into model
+/// blocks via [`chart::parse_smartart`](crate::convert::chart::parse_smartart):
+/// the diagram's node hierarchy as a bullet [`List`] and, when the laid-out
+/// drawing part (`dsp:drawing`) is reachable through the data part's own rels, its
+/// shapes too. Empty when the data part is missing or carries no nodes.
+fn pptx_smartart_blocks(
+    zip: &BTreeMap<String, Vec<u8>>,
+    rels: &BTreeMap<String, String>,
+    rid: &str,
+) -> Vec<Block> {
+    let Some(target) = rels.get(rid) else {
+        return Vec::new();
+    };
+    let data_key = resolve_rel_part("ppt/slides", target);
+    let Some(data_bytes) = zip.get(&data_key) else {
+        return Vec::new();
+    };
+    let data_xml = String::from_utf8_lossy(data_bytes);
+    // The rendered drawing (`dsp:drawing`, e.g. `ppt/diagrams/drawingN.xml`) is
+    // referenced from the *data* part's own rels (the `diagramDrawing` extension
+    // relationship). Resolve it relative to the data part's directory.
+    let drawing = pptx_diagram_drawing_xml(zip, &data_key);
+    crate::convert::chart::parse_smartart(&data_xml, drawing.as_deref())
+}
+
+/// Locate a SmartArt data part's laid-out drawing (`dsp:drawing`) by reading the
+/// data part's sibling `_rels` and following the relationship whose target points
+/// at a `diagrams/*drawing*` part. Returns the drawing XML, or `None` when no
+/// such part is declared (the diagram then lowers to its node list alone).
+fn pptx_diagram_drawing_xml(zip: &BTreeMap<String, Vec<u8>>, data_key: &str) -> Option<String> {
+    // `ppt/diagrams/data1.xml` → dir `ppt/diagrams`, rels `…/_rels/data1.xml.rels`.
+    let (dir, file) = data_key.rsplit_once('/')?;
+    let rels_key = format!("{dir}/_rels/{file}.rels");
+    let rels = parse_rels(&String::from_utf8_lossy(zip.get(&rels_key)?));
+    for target in rels.values() {
+        let key = resolve_rel_part(dir, target);
+        if key.contains("drawing") {
+            if let Some(bytes) = zip.get(&key) {
+                return Some(String::from_utf8_lossy(bytes).into_owned());
+            }
+        }
+    }
+    None
 }
 
 /// A `p:ph` placeholder key: its semantic type and optional index (`@idx`), used
@@ -5420,278 +5581,6 @@ impl PptxCellPr {
         });
         (fill, border, self.anchor)
     }
-}
-
-/// Extract a chart referenced by `rid` (resolved via `rels` → `ppt/charts/chartN.xml`)
-/// into a model [`Table`]: header row = the category axis (blank corner + each
-/// category label); one row per series (series name + its values). `None` when
-/// the chart part is missing or carries no legible series. This keeps the chart's
-/// *data* editable instead of dropping it (a vector re-render is out of scope).
-fn pptx_chart_model(
-    zip: &BTreeMap<String, Vec<u8>>,
-    rels: &BTreeMap<String, String>,
-    rid: &str,
-) -> Option<Table> {
-    let key = resolve_rel_part("ppt/slides", rels.get(rid)?);
-    let xml = String::from_utf8_lossy(zip.get(&key)?);
-    let chart = parse_pptx_chart(&xml);
-    if chart.series.is_empty() && chart.title.is_none() {
-        return None;
-    }
-
-    let mut rows: Vec<Row> = Vec::new();
-
-    // Optional title as a single full-width-ish first row (one cell).
-    if let Some(title) = &chart.title {
-        if !title.is_empty() {
-            rows.push(Row {
-                cells: vec![chart_cell(title)],
-                height: None,
-                is_header: false,
-            });
-        }
-    }
-
-    // Header: blank corner + categories (use the longest series' category list).
-    let categories = chart
-        .series
-        .iter()
-        .map(|s| s.categories.len())
-        .max()
-        .unwrap_or(0);
-    if categories > 0 {
-        let mut header = vec![Cell::default()];
-        // Pick the first non-empty category list.
-        let cats = chart
-            .series
-            .iter()
-            .map(|s| &s.categories)
-            .find(|c| !c.is_empty());
-        if let Some(cats) = cats {
-            for c in cats {
-                header.push(chart_cell(c));
-            }
-        }
-        rows.push(Row {
-            cells: header,
-            height: None,
-            // The category-axis row is the table's header.
-            is_header: true,
-        });
-    }
-
-    // One row per series: name + values.
-    for s in &chart.series {
-        let mut cells = vec![chart_cell(&s.name)];
-        for v in &s.values {
-            cells.push(chart_cell(v));
-        }
-        rows.push(Row {
-            cells,
-            height: None,
-            is_header: false,
-        });
-    }
-
-    if rows.is_empty() {
-        return None;
-    }
-    Some(Table {
-        rows,
-        col_widths: Vec::new(),
-        border: model::BorderStyle::default(),
-    })
-}
-
-/// A plain text [`Cell`] holding one default-styled paragraph (chart/SmartArt
-/// extraction).
-fn chart_cell(text: &str) -> Cell {
-    Cell {
-        blocks: vec![text_paragraph_block(text.to_string())],
-        ..Cell::default()
-    }
-}
-
-/// One extracted chart series: its name plus its category labels and values.
-#[derive(Default)]
-struct PptxChartSeries {
-    name: String,
-    categories: Vec<String>,
-    values: Vec<String>,
-}
-
-/// The legible content of a chart part: an optional title and its series.
-#[derive(Default)]
-struct PptxChart {
-    title: Option<String>,
-    series: Vec<PptxChartSeries>,
-}
-
-/// Parse a chart part (`c:chartSpace`) for its title and series. Series names,
-/// categories and values are read from the cached string/number references
-/// (`c:strRef/c:strCache` and `c:numRef/c:numCache` → `c:pt/c:v`) that every
-/// saved chart embeds, so no spreadsheet evaluation is needed. The title is read
-/// from `c:title` rich text (`a:t`) or its string cache.
-fn parse_pptx_chart(xml: &str) -> PptxChart {
-    let mut chart = PptxChart::default();
-    let mut x = Xml::new(xml);
-
-    // Context flags for the streaming walk.
-    let mut in_title = false;
-    let mut in_ser = false;
-    let mut ser: PptxChartSeries = PptxChartSeries::default();
-    // Which part of the series the current cache belongs to.
-    #[derive(PartialEq)]
-    enum Field {
-        None,
-        SerTx,
-        Cat,
-        Val,
-    }
-    let mut field = Field::None;
-    let mut in_v = false;
-    let mut v_buf = String::new();
-    let mut title_buf = String::new();
-
-    while let Some(tok) = x.next() {
-        match tok {
-            Tok::Open(name, _attrs, sc) => match local(&name) {
-                "title" if !sc => in_title = true,
-                "ser" if !sc => {
-                    in_ser = true;
-                    ser = PptxChartSeries::default();
-                }
-                "tx" if in_ser => field = Field::SerTx,
-                "cat" if in_ser => field = Field::Cat,
-                "val" if in_ser => field = Field::Val,
-                "v" if !sc => {
-                    in_v = true;
-                    v_buf.clear();
-                }
-                _ => {}
-            },
-            Tok::Text(t) => {
-                if in_v {
-                    v_buf.push_str(&t);
-                } else if in_title {
-                    // Title rich text (a:t) lands here too.
-                    title_buf.push_str(&t);
-                }
-            }
-            Tok::Close(name) => match local(&name) {
-                "v" => {
-                    in_v = false;
-                    let val = v_buf.trim().to_string();
-                    if !val.is_empty() {
-                        match field {
-                            Field::SerTx => {
-                                if ser.name.is_empty() {
-                                    ser.name = val;
-                                }
-                            }
-                            Field::Cat => ser.categories.push(val),
-                            Field::Val => ser.values.push(val),
-                            Field::None => {}
-                        }
-                    }
-                }
-                "tx" | "cat" | "val" => field = Field::None,
-                "ser" => {
-                    in_ser = false;
-                    chart.series.push(std::mem::take(&mut ser));
-                }
-                "title" => {
-                    in_title = false;
-                    let t = title_buf.trim();
-                    if !t.is_empty() && chart.title.is_none() {
-                        chart.title = Some(t.to_string());
-                    }
-                    title_buf.clear();
-                }
-                _ => {}
-            },
-        }
-    }
-    chart
-}
-
-/// Extract a SmartArt diagram's node text into a model [`List`]. `rid` is the
-/// `dgm:relIds@r:dm` data-model relationship (resolved via `rels` →
-/// `ppt/diagrams/dataN.xml`); each diagram point's text (`dgm:t` → `a:t`) becomes
-/// a bullet item. `None` when the data part is missing or empty — keeping the
-/// diagram's *text* rather than dropping it (rendering the diagram is out of
-/// scope).
-fn pptx_smartart_model(
-    zip: &BTreeMap<String, Vec<u8>>,
-    rels: &BTreeMap<String, String>,
-    rid: &str,
-) -> Option<List> {
-    let key = resolve_rel_part("ppt/slides", rels.get(rid)?);
-    let xml = String::from_utf8_lossy(zip.get(&key)?);
-    let items = parse_pptx_diagram_text(&xml);
-    if items.is_empty() {
-        return None;
-    }
-    Some(List {
-        ordered: false,
-        marker: ListMarker::Bullet('\u{2022}'),
-        items: items
-            .into_iter()
-            .map(|text| ListItem {
-                blocks: vec![text_paragraph_block(text)],
-                level: 0,
-            })
-            .collect(),
-    })
-}
-
-/// Collect a SmartArt data model's node texts. Each `dgm:pt` text body
-/// (`dgm:t`, a Drawing-ML text body) contributes one entry, with its paragraphs
-/// joined by spaces. Empty texts are skipped.
-fn parse_pptx_diagram_text(xml: &str) -> Vec<String> {
-    let mut items: Vec<String> = Vec::new();
-    let mut x = Xml::new(xml);
-    let mut in_t = false; // inside a <dgm:t> text body
-    let mut in_text = false; // inside an <a:t>
-    let mut cur = String::new();
-
-    while let Some(tok) = x.next() {
-        match tok {
-            Tok::Open(name, _, sc) => match local(&name) {
-                "t" if !sc => {
-                    // `dgm:t` opens a text body; `a:t` (nested) carries the runs.
-                    // Distinguish by depth: the outer `t` starts the body, the
-                    // inner `t` is the run text.
-                    if !in_t {
-                        in_t = true;
-                        cur.clear();
-                    } else {
-                        in_text = true;
-                    }
-                }
-                _ => {}
-            },
-            Tok::Text(s) => {
-                if in_t && in_text {
-                    cur.push_str(&s);
-                }
-            }
-            Tok::Close(name) => {
-                if local(&name) == "t" {
-                    if in_text {
-                        in_text = false;
-                    } else if in_t {
-                        in_t = false;
-                        let trimmed = cur.trim();
-                        if !trimmed.is_empty() {
-                            items.push(trimmed.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    items
 }
 
 // ─────────────────────────────── ODF → model ──────────────────────────────────
@@ -7340,10 +7229,45 @@ fn odp_frame_model(
     }
 }
 
-/// Legacy `.doc/.xls/.ppt` (OLE2) → text-only model: best-effort runs as
-/// paragraphs. Reuses the CFB parser and [`extract_runs`]. `None` if nothing
-/// legible is found.
+/// Legacy `.doc/.xls/.ppt` (OLE2) → rich model. The Compound File's stream names
+/// pick the format-specific reader: `WordDocument` → [`ole_doc`](crate::convert::ole_doc)
+/// (piece-table text + CHPX/PAPX sprm formatting + tables), `Workbook`/`Book` →
+/// [`ole_xls`](crate::convert::ole_xls) (BIFF8 cells/SST/XF/merges/widths),
+/// `PowerPoint Document` → [`ole_ppt`](crate::convert::ole_ppt) (persist-directory
+/// slide text + notes + StyleTextProp formatting). If no reader matches or the
+/// matched reader yields nothing, fall back to the heuristic [`extract_runs`]
+/// text-scrape so a stream we can't structurally parse still produces paragraphs.
+/// `None` only when nothing legible is found at all.
 fn ole2_to_model(bytes: &[u8]) -> Option<Document> {
+    if let Some(doc) = ole2_reader_model(bytes) {
+        return Some(doc);
+    }
+    ole2_scrape_model(bytes)
+}
+
+/// Route an OLE2 Compound File to the matching from-scratch reader by inspecting
+/// its stream names. Returns the rich [`Document`] on success, or `None` if the
+/// container is not a CFB, no known main stream is present, or the reader can't
+/// build a model (caller then falls back to the text-scrape).
+fn ole2_reader_model(bytes: &[u8]) -> Option<Document> {
+    let cfb = crate::convert::cfb::Cfb::open(bytes)?;
+    let names = cfb.stream_names();
+    let has = |n: &str| names.iter().any(|s| s == n);
+    if has("WordDocument") {
+        crate::convert::ole_doc::doc_to_model(bytes)
+    } else if has("Workbook") || has("Book") {
+        crate::convert::ole_xls::xls_to_model(bytes)
+    } else if has("PowerPoint Document") {
+        crate::convert::ole_ppt::ppt_to_model(bytes)
+    } else {
+        None
+    }
+}
+
+/// Best-effort fallback: pull the main (or largest) stream from the legacy CFB
+/// parser and recover readable runs as plain paragraphs. Used when no structural
+/// reader applies. `None` if nothing legible is found.
+fn ole2_scrape_model(bytes: &[u8]) -> Option<Document> {
     let cfb = Cfb::parse(bytes)?;
     let candidates = [
         "WordDocument",
@@ -15138,15 +15062,28 @@ fn odp_frame(
 
 // ════════════════════════════════ legacy OLE2 ═════════════════════════════════
 
-/// Legacy `.doc/.xls/.ppt` (OLE2 Compound File) → best-effort **text-only** PDF.
+/// Legacy `.doc/.xls/.ppt` (OLE2 Compound File) → PDF.
 ///
-/// We parse the Compound File container (header → FAT → directory), locate the
-/// document's main stream (`WordDocument` / `Workbook`/`Book` / `PowerPoint
-/// Document`), and extract readable runs (UTF-16LE and ASCII), emitting `<p>`
-/// paragraphs. There is no formatting recovery — the binary record formats are
-/// out of scope for a zero-dependency engine. Returns `None` if nothing legible
-/// is found.
+/// First routes the Compound File to its format-specific reader (`WordDocument`
+/// → [`ole_doc`](crate::convert::ole_doc), `Workbook`/`Book` →
+/// [`ole_xls`](crate::convert::ole_xls), `PowerPoint Document` →
+/// [`ole_ppt`](crate::convert::ole_ppt)) and lowers the resulting rich
+/// [`Document`] to PDF via [`pdf_from_model`](crate::convert::project::pdf_from_model)
+/// — the same model→PDF path every reverse converter uses, so styling, tables and
+/// sheet/slide pagination survive. When no structural reader applies, falls back
+/// to the heuristic text-scrape, rendered as plain `<p>` paragraphs. Returns
+/// `None` if nothing legible is found.
 fn ole2_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
+    if let Some(doc) = ole2_reader_model(bytes) {
+        return Some(crate::convert::project::pdf_from_model(&doc));
+    }
+    ole2_scrape_pdf(bytes)
+}
+
+/// Text-scrape fallback for [`ole2_to_pdf`]: pull the main (or largest) CFB stream
+/// via the legacy parser, recover readable runs, and render them as `<p>`
+/// paragraphs (no formatting recovery). `None` if nothing legible is found.
+fn ole2_scrape_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     let cfb = Cfb::parse(bytes)?;
     // Preferred main streams, in order.
     let candidates = [
@@ -16873,6 +16810,7 @@ mod tests {
         const FREE: u32 = 0xFFFF_FFFF;
         const EOC: u32 = 0xFFFF_FFFE;
         const FATSECT: u32 = 0xFFFF_FFFD;
+        const NOSTREAM: u32 = 0xFFFF_FFFF; // red-black tree null pointer
 
         let data_secs = text_utf16.len().div_ceil(SEC).max(1);
         let total_secs = 2 + data_secs; // dir + fat + data
@@ -16938,16 +16876,20 @@ mod tests {
         };
         put_name(&mut out, dir_base, "Root Entry");
         out[dir_base + 66] = 5; // object type: root storage
-        put32(&mut out, dir_base + 116, EOC); // root has no mini stream here
-                                              // size 0 → mini stream empty (our WordDocument uses the FAT chain).
+        put32(&mut out, dir_base + 68, NOSTREAM); // left sibling
+        put32(&mut out, dir_base + 72, NOSTREAM); // right sibling
+        put32(&mut out, dir_base + 76, 1); // child → entry 1 (tree-walk readers need this)
+        put32(&mut out, dir_base + 116, EOC); // root has no mini stream here (size 0)
 
         // Entry 1: WordDocument stream (object type 2), starts at sector 2.
         let e1 = dir_base + 128;
         put_name(&mut out, e1, "WordDocument");
         out[e1 + 66] = 2; // object type: stream
+        put32(&mut out, e1 + 68, NOSTREAM); // left sibling (leaf)
+        put32(&mut out, e1 + 72, NOSTREAM); // right sibling (leaf)
+        put32(&mut out, e1 + 76, NOSTREAM); // no child (it is a stream)
         put32(&mut out, e1 + 116, 2); // start sector
-                                      // size (8 bytes at +120): the text length, ≥ cutoff guaranteed by caller.
-        let size = text_utf16.len() as u64;
+        let size = text_utf16.len() as u64; // size (≥ cutoff guaranteed by caller)
         out[e1 + 120..e1 + 128].copy_from_slice(&size.to_le_bytes());
 
         // ── Data (logical sector 2 onward) ──
@@ -16960,7 +16902,10 @@ mod tests {
     #[test]
     fn ole2_word_stream_text_extracts() {
         // A WordDocument stream of UTF-16LE text, padded above the 4096 mini
-        // cutoff so it is stored via the regular FAT chain.
+        // cutoff so it is stored via the regular FAT chain. Its first code unit
+        // is not the FIB `wIdent` (0xA5EC), so the structural `ole_doc` reader
+        // rejects it and `ole2_to_model` falls back to the text-scrape — which
+        // still recovers the runs (the fallback path stays intact).
         let phrase = "Legacy Word Document Body Text";
         let mut u16le: Vec<u8> = Vec::new();
         for ch in phrase.encode_utf16() {
@@ -16977,6 +16922,36 @@ mod tests {
         for needle in ["Legacy", "Word", "Document", "Body", "Text"] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    #[test]
+    fn ole2_word_stream_routes_to_doc_reader() {
+        // A CFB whose `WordDocument` stream opens with a valid FIB `wIdent`
+        // (0xA5EC) is routed to the structural `ole_doc` reader (issue #3), which
+        // yields a well-formed model even with no recoverable text. The heuristic
+        // text-scrape, by contrast, finds no readable runs in this (FIB header +
+        // NUL) buffer and returns `None` — so a `Some` model here proves the
+        // routing picked the reader, not the scrape.
+        // A WordDocument that is just a FIB header: `wIdent` (0xA5EC) + `nFib`
+        // (Word 97), then all-zero (lid/flags/count-prefixed arrays parse to an
+        // empty FIB → an empty one-page document). Padded above the mini cutoff.
+        let mut word: Vec<u8> = Vec::new();
+        word.extend_from_slice(&0xA5ECu16.to_le_bytes());
+        word.extend_from_slice(&0x00C1u16.to_le_bytes());
+        word.resize(5000, 0);
+
+        // The scrape alone finds nothing legible in this buffer…
+        assert!(
+            ole2_scrape_model(&build_cfb_word(&word)).is_none(),
+            "scrape should find no readable runs in a FIB+NUL buffer"
+        );
+        // …but routing to the `ole_doc` reader yields a model.
+        let cfb = build_cfb_word(&word);
+        let doc = ole2_to_model(&cfb).expect("routed to ole_doc reader → Some model");
+        assert!(
+            doc.sections.iter().any(|s| !s.pages.is_empty()),
+            "reader yields at least one page"
+        );
     }
 
     // ── page geometry & font-family ──
@@ -18914,6 +18889,20 @@ mod tests {
         crate::raster::jpeg::encode_jpeg(2, 2, &rgba, 80)
     }
 
+    /// A minimal ISO-BMFF `ftyp` box with the `avif` brand (24-byte box: size,
+    /// `ftyp`, major brand `avif`, minor version, one compatible brand `avif`).
+    /// Header-only — enough to exercise [`classify_media`]/[`is_avif_bytes`]; the
+    /// real decoder is exercised separately against a fixture.
+    fn avif_magic_min() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&24u32.to_be_bytes()); // box size
+        v.extend_from_slice(b"ftyp");
+        v.extend_from_slice(b"avif"); // major brand
+        v.extend_from_slice(&[0, 0, 0, 0]); // minor version
+        v.extend_from_slice(b"avif"); // compatible brand
+        v
+    }
+
     #[test]
     fn docx_model_embedded_wmf_is_rasterized_to_png() {
         // A WMF embedded picture must survive into the model — the engine has no
@@ -19064,6 +19053,24 @@ mod tests {
             classify_media("x.svg", svg),
             Some(MediaIntern::Keep("svg"))
         ));
+        // AVIF (ISO-BMFF `ftyp` with the `avif` brand) is recognized — routed to
+        // the decode-to-PNG path, NOT dropped (issue #3).
+        assert!(matches!(
+            classify_media("x.avif", &avif_magic_min()),
+            Some(MediaIntern::AvifToPng)
+        ));
+        // The brand may sit in the compatible-brands list (major brand = `mif1`).
+        let mut compat = avif_magic_min();
+        compat[8..12].copy_from_slice(b"mif1");
+        assert!(matches!(
+            classify_media("x.avif", &compat),
+            Some(MediaIntern::AvifToPng)
+        ));
+        // A non-AVIF ISO-BMFF (`ftyp isom`, no `avif`/`avis` brand) is NOT AVIF.
+        let mut not_avif = avif_magic_min();
+        not_avif[8..12].copy_from_slice(b"isom");
+        not_avif[16..20].copy_from_slice(b"isom");
+        assert!(classify_media("x.mp4", &not_avif).is_none());
         // WMF/EMF flagged for rasterization.
         assert!(matches!(
             classify_media("x.wmf", &placeable_wmf_min()),
@@ -19077,6 +19084,34 @@ mod tests {
         ));
         // Unknown blob ⇒ None (dropped, as before).
         assert!(classify_media("x.dat", b"\x00\x01\x02\x03random").is_none());
+    }
+
+    #[test]
+    fn media_intern_avif_decodes_to_png() {
+        // A real AVIF still image is recognized and interned: decoded to RGBA via
+        // `raster::avif` then re-encoded to PNG (the renderer/exporters have no
+        // native AVIF path), so the picture survives — not dropped (issue #3).
+        let avif = include_bytes!("../raster/fixtures/av1test.avif").to_vec();
+        // Magic recognition first.
+        assert!(
+            matches!(
+                classify_media("img.avif", &avif),
+                Some(MediaIntern::AvifToPng)
+            ),
+            "AVIF fixture must classify as AVIF"
+        );
+        // End-to-end intern → a PNG resource with real pixels.
+        let mut zip = BTreeMap::new();
+        zip.insert("media/pic.avif".to_string(), avif);
+        let mut resources = BTreeMap::new();
+        let key = intern_media(&zip, "media/pic.avif", &mut resources)
+            .expect("AVIF interned (decoded to PNG)");
+        let res = &resources[&key];
+        assert_eq!(res.format, "png", "AVIF decoded + re-encoded as PNG");
+        assert!(
+            res.bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+            "interned bytes are a PNG"
+        );
     }
 
     #[test]
@@ -23558,10 +23593,11 @@ mod tests {
     }
 
     #[test]
-    fn pptx_model_chart_becomes_table_of_series() {
-        // A graphicFrame referencing a chart part (via the slide rels) is lowered
-        // to a Table: title row, category header, then one row per series — the
-        // data stays editable instead of being dropped.
+    fn pptx_model_chart_becomes_native_render_plus_data_table() {
+        // A graphicFrame referencing a chart part (via the slide rels) is routed
+        // through `chart::parse_chart`: a native vector rendering (Shape blocks)
+        // plus the chart's numbers as a data Table — the figure AND the data
+        // survive, both anchored at the graphicFrame's box.
         let chart = r#"<c:chartSpace xmlns:c="c" xmlns:a="a">
           <c:chart>
             <c:title><c:tx><c:rich><a:p><a:r><a:t>Quarterly Sales</a:t></a:r></a:p></c:rich></c:tx></c:title>
@@ -23609,18 +23645,43 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(slide.shapes.len(), 1, "chart → one shape");
-        let table = match &slide.shapes[0].kind {
-            BlockKind::Table(t) => t,
-            other => panic!("expected a Table, got {other:?}"),
-        };
-        // Frame placed from p:xfrm: off (50pt,50pt), ext (300pt,200pt) → y = 540-250 = 290.
-        let f = slide.shapes[0].frame.expect("chart frame");
+        // The native rendering emits several blocks (axes, bars, labels) — far
+        // more than the single placeholder the old text-only path produced.
         assert!(
-            (f.x - 50.0).abs() < 1e-6 && (f.y - 290.0).abs() < 1e-6,
-            "frame: {f:?}"
+            slide.shapes.len() > 1,
+            "chart → native render block group, got {}",
+            slide.shapes.len()
         );
-        // Flatten all cell text and assert the data is present.
+        // At least one vector Shape (the figure) AND a data Table (the numbers).
+        assert!(
+            slide
+                .shapes
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Shape(_))),
+            "expected at least one vector Shape block"
+        );
+        let table = slide
+            .shapes
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a data Table block");
+        // The framed blocks are anchored at the graphicFrame box: off (50pt,50pt),
+        // ext (300pt,200pt) → model lower-left rect (50, 540-250=290, 300, 200).
+        // Every placed shape's frame sits within (a small slack for label boxes
+        // that extend a hair past the canvas edge) that box's horizontal span.
+        for b in &slide.shapes {
+            if let Some(fr) = b.frame {
+                assert!(
+                    fr.x >= 50.0 - 1.0 && fr.x <= 50.0 + 300.0 + 1.0,
+                    "block frame x {} outside graphicFrame span: {fr:?}",
+                    fr.x
+                );
+            }
+        }
+        // Flatten all cell text and assert the chart data is present in the table.
         let all: String = table
             .rows
             .iter()
@@ -23635,17 +23696,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("|");
-        for needle in [
-            "Quarterly Sales",
-            "Q1",
-            "Q2",
-            "Region A",
-            "Region B",
-            "10",
-            "20",
-            "30",
-            "40",
-        ] {
+        for needle in ["Q1", "Q2", "Region A", "Region B", "10", "20", "30", "40"] {
             assert!(
                 all.contains(needle),
                 "chart data missing {needle:?} in: {all}"
@@ -23769,6 +23820,94 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["First Node", "Second Node"]);
+    }
+
+    #[test]
+    fn pptx_model_smartart_drawing_part_lowers_shapes() {
+        // When the SmartArt's laid-out drawing part is reachable (via the data
+        // part's own rels → `diagrams/drawingN.xml`), its `dsp:sp` shapes + text
+        // are lowered too and anchored at the graphicFrame's box — not just the
+        // node-text List.
+        let data = r#"<dgm:dataModel xmlns:dgm="dgm" xmlns:a="a">
+          <dgm:ptLst>
+            <dgm:pt modelId="1" type="node"><dgm:t><a:p><a:r><a:t>Step 1</a:t></a:r></a:p></dgm:t></dgm:pt>
+          </dgm:ptLst>
+        </dgm:dataModel>"#;
+        let drawing = r#"<dsp:drawing xmlns:dsp="http://schemas.microsoft.com/office/drawing/2008/diagram" xmlns:a="a">
+          <dsp:spTree>
+            <dsp:sp>
+              <dsp:spPr>
+                <a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>
+                <a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>
+              </dsp:spPr>
+              <dsp:txBody><a:p><a:r><a:t>Step 1</a:t></a:r></a:p></dsp:txBody>
+            </dsp:sp>
+          </dsp:spTree>
+        </dsp:drawing>"#;
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree>
+                      <p:graphicFrame>
+                        <p:xfrm><a:off x="635000" y="635000"/><a:ext cx="3810000" cy="2540000"/></p:xfrm>
+                        <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+                          <dgm:relIds xmlns:dgm="dgm" r:dm="rId1"/>
+                        </a:graphicData></a:graphic>
+                      </p:graphicFrame>
+                    </p:spTree></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/>
+                    </Relationships>"#,
+                ),
+                ("ppt/diagrams/data1.xml", data),
+                // The data part's own rels point at its laid-out drawing.
+                (
+                    "ppt/diagrams/_rels/data1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rIdDr" Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing" Target="drawing1.xml"/>
+                    </Relationships>"#,
+                ),
+                ("ppt/diagrams/drawing1.xml", drawing),
+            ],
+            &[],
+        );
+        // The node List is present…
+        assert!(
+            slide
+                .shapes
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::List(_))),
+            "SmartArt node List present"
+        );
+        // …plus the drawing's box Shape (with its fill colour)…
+        assert!(
+            slide.shapes.iter().any(|b| matches!(&b.kind,
+            BlockKind::Shape(s) if s.fill == Some([
+                0x44 as f64 / 255.0, 0x72 as f64 / 255.0, 0xC4 as f64 / 255.0
+            ]))),
+            "drawing box Shape with fill lowered: {:?}",
+            slide.shapes.iter().map(|b| &b.kind).collect::<Vec<_>>()
+        );
+        // …and its text. The framed drawing blocks are anchored at the
+        // graphicFrame box (off 50pt → x ≥ 50).
+        assert!(
+            slide.shapes.iter().any(|b| matches!(&b.kind,
+                BlockKind::Paragraph(p)
+                if p.runs.iter().any(|r| matches!(r, Inline::Run(ir) if ir.text == "Step 1")))),
+            "drawing shape text lowered"
+        );
+        for b in &slide.shapes {
+            if let Some(fr) = b.frame {
+                assert!(
+                    fr.x >= 50.0 - 1.0,
+                    "drawing block anchored at frame: {fr:?}"
+                );
+            }
+        }
     }
 
     #[test]
