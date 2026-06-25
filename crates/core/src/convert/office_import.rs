@@ -3288,9 +3288,126 @@ fn pptx_slide_model(
         geometry: page_geometry(geom),
         shapes: acc.shapes,
         placeholders: acc.placeholders,
-        notes: None,
+        notes: pptx_slide_notes(zip, n),
         background,
     }
+}
+
+/// Lower a slide's speaker notes (ECMA-376 §13.3.5) into model blocks. `n` is the
+/// 1-based slide number; the slide's `ppt/slides/_rels/slideN.xml.rels` carries a
+/// `…/relationships/notesSlide` relationship pointing at
+/// `ppt/notesSlides/notesSlideM.xml`, whose `<p:ph type="body"/>` placeholder shape
+/// holds the speaker-notes text (`a:p`/`a:r`/`a:t`). Each notes paragraph (`a:p`)
+/// becomes one paragraph [`Block`] — the inverse of [`super::export_model`]'s
+/// `pptx_notes_from_model`, which writes each notes block back into that same body
+/// placeholder, so notes round-trip. Returns `None` (notes stay absent, never a
+/// spurious blank) when the slide has no `notesSlide` relationship, the part is
+/// missing, or the notes body holds no text.
+fn pptx_slide_notes(zip: &BTreeMap<String, Vec<u8>>, n: usize) -> Option<Vec<Block>> {
+    let rels_xml = zip.get(&format!("ppt/slides/_rels/slide{n}.xml.rels"))?;
+    let target = pptx_rel_target_by_type(
+        &String::from_utf8_lossy(rels_xml),
+        "/relationships/notesSlide",
+    )?;
+    // The rels live at `ppt/slides/_rels/slideN.xml.rels`, so the source part's
+    // directory is `ppt/slides` (a typical `../notesSlides/notesSlideM.xml` then
+    // resolves to `ppt/notesSlides/notesSlideM.xml`).
+    let key = resolve_rel_part("ppt/slides", &target);
+    let xml = String::from_utf8_lossy(zip.get(&key)?);
+    let blocks = pptx_notes_body_blocks(&xml);
+    (!blocks.is_empty()).then_some(blocks)
+}
+
+/// Scan an OOXML `_rels/*.rels` part for the first `Relationship` whose `Type`
+/// ends with `type_suffix` (e.g. `/relationships/notesSlide`) and return its
+/// `Target`. Unlike [`parse_rels`] (which drops the relationship type), this keeps
+/// the type so a part can be located by its semantic role. `None` when no matching
+/// relationship is present.
+fn pptx_rel_target_by_type(rels_xml: &str, type_suffix: &str) -> Option<String> {
+    let mut xml = Xml::new(rels_xml);
+    while let Some(tok) = xml.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == "Relationship" {
+                let ty = attr(&attrs, "Type").unwrap_or("");
+                if ty.ends_with(type_suffix) {
+                    if let Some(target) = attr(&attrs, "Target") {
+                        return Some(target.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract a `notesSlide` part's speaker-notes paragraphs as model blocks. The
+/// notes text lives in the placeholder shape (`p:sp`) whose `p:ph@type="body"`
+/// (ECMA-376 §13.3.5 — the notes body placeholder); other placeholders on the
+/// notes slide (slide-image, slide-number, header/footer/date) are ignored. Each
+/// `a:p` in that body's `p:txBody` becomes one paragraph [`Block`], its runs
+/// (`a:r`/`a:t`) concatenated and `a:br` rendered as a newline. Empty (whitespace-
+/// only) paragraphs are dropped. Returns an empty vector when the part has no
+/// body placeholder or no text.
+fn pptx_notes_body_blocks(xml: &str) -> Vec<Block> {
+    let mut x = Xml::new(xml);
+    let mut depth = 0usize; // <p:sp> nesting depth (0 = outside any shape)
+    let mut sp_start: Option<usize> = None; // depth at which the current shape opened
+    let mut in_body = false; // the open shape is the body placeholder
+    let mut in_txbody = false; // inside that body's <p:txBody>
+    let mut in_text = false; // inside an <a:t>
+    let mut cur = String::new(); // current paragraph text
+    let mut paras: Vec<String> = Vec::new();
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "sp" if !sc => {
+                    depth += 1;
+                    if sp_start.is_none() {
+                        sp_start = Some(depth);
+                        in_body = false;
+                    }
+                }
+                // The placeholder descriptor: `type="body"` marks the notes text
+                // placeholder (`idx` differs but the type is what matters here).
+                "ph" if sp_start.is_some() && !in_body => {
+                    if matches!(attr(&attrs, "type"), Some("body")) {
+                        in_body = true;
+                    }
+                }
+                "txBody" if in_body && !sc => in_txbody = true,
+                "p" if in_txbody && !sc => cur.clear(),
+                "br" if in_txbody => cur.push('\n'),
+                "t" if in_txbody && !sc => in_text = true,
+                _ => {}
+            },
+            Tok::Text(t) => {
+                if in_text {
+                    cur.push_str(&t);
+                }
+            }
+            Tok::Close(name) => match local(&name) {
+                "t" => in_text = false,
+                "p" if in_txbody => {
+                    if !cur.trim().is_empty() {
+                        paras.push(cur.clone());
+                    }
+                    cur.clear();
+                }
+                "txBody" if in_txbody => in_txbody = false,
+                "sp" if sp_start == Some(depth) => {
+                    sp_start = None;
+                    in_body = false;
+                    in_txbody = false;
+                    depth -= 1;
+                }
+                "sp" => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+        }
+    }
+
+    paras.into_iter().map(text_paragraph_block).collect()
 }
 
 /// Resolve a slide background `p:bg` (open consumed) to a single RGB fill colour
@@ -6403,11 +6520,24 @@ fn odp_page_model(
 ) -> Slide {
     let mut placeholders: Vec<model::Placeholder> = Vec::new();
     let mut shapes: Vec<Block> = Vec::new();
+    let mut notes: Option<Vec<Block>> = None;
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
                 match ln {
+                    // Speaker notes (`presentation:notes`, ISO 26300 §9.1.5): a
+                    // notes aside whose `presentation:class="notes"` text frame
+                    // holds the notes paragraphs. Captured here BEFORE the generic
+                    // `frame` branch so the inner notes frame is lowered into the
+                    // slide's `notes` rather than mistaken for a positioned shape.
+                    // Consumes the whole `presentation:notes` subtree.
+                    "notes" if !sc => {
+                        let blocks = odp_notes_blocks(x, ctx, resources);
+                        if !blocks.is_empty() {
+                            notes = Some(blocks);
+                        }
+                    }
                     // A positioned frame → an absolutely-placed shape (consumes its
                     // subtree). A frame without a usable box falls through to the
                     // flow branches below so its inner content is still captured.
@@ -6520,9 +6650,63 @@ fn odp_page_model(
         geometry: page_geometry(geom),
         shapes,
         placeholders,
-        notes: None,
+        notes,
         background,
     }
+}
+
+/// Collect a slide's `presentation:notes` paragraphs (open already consumed) into
+/// model blocks, stopping at the matching `</presentation:notes>`. The notes text
+/// lives in a `presentation:class="notes"` `draw:frame`/`draw:text-box` as
+/// `text:p` paragraphs; each non-empty paragraph becomes one paragraph [`Block`]
+/// — the inverse of [`super::export_model`]'s `odp_notes`, which writes each notes
+/// block back into that frame, so notes round-trip. Paragraph styling is dropped
+/// (notes are reduced to their text, matching the PPTX notes path). Bookmark
+/// anchors and any nested frames inside the notes are discarded. Returns an empty
+/// vector when the notes frame holds no text.
+fn odp_notes_blocks(
+    x: &mut Xml,
+    ctx: &OdfModelCtx<'_>,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut depth = 1usize; // we are inside <presentation:notes>
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, sc) => {
+                let ln = local(&name);
+                if ln == "notes" && !sc {
+                    depth += 1;
+                } else if ln == "p" && !sc {
+                    // Lower one notes paragraph to its plain runs (formatting is
+                    // intentionally dropped for notes); anchors are discarded.
+                    let mut anchored: Vec<Block> = Vec::new();
+                    let mut no_outline = OutlineBuilder::default();
+                    let runs =
+                        odf_inline_model(x, ctx, "p", resources, &mut anchored, &mut no_outline);
+                    if !runs.is_empty() {
+                        blocks.push(Block {
+                            kind: BlockKind::Paragraph(Paragraph {
+                                runs,
+                                ..Paragraph::default()
+                            }),
+                            ..Block::default()
+                        });
+                    }
+                }
+            }
+            Tok::Close(name) => {
+                if local(&name) == "notes" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    blocks
 }
 
 /// A `draw:g` group's own placement offset in points: `(svg:x, svg:y)` (each
@@ -23019,6 +23203,252 @@ mod tests {
             "",
         );
         assert!(slide.background.is_none(), "fill=none → no background");
+    }
+
+    // ───────────────── speaker notes import (issue #3) ─────────────────
+
+    /// The plain text of a single notes paragraph block (its run text concatenated).
+    fn notes_para_text(b: &Block) -> String {
+        match &b.kind {
+            BlockKind::Paragraph(p) => p
+                .runs
+                .iter()
+                .map(|r| match r {
+                    Inline::Run(run) => run.text.clone(),
+                    Inline::LineBreak => "\n".to_string(),
+                    _ => String::new(),
+                })
+                .collect(),
+            other => panic!("expected a Paragraph notes block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pptx_model_speaker_notes_body_placeholder_reaches_slide_notes() {
+        // A slide whose rels point at a notesSlide part lowers that part's
+        // `<p:ph type="body"/>` text into `Slide::notes`, one block per `a:p`.
+        let notes_part = r#"<p:notes xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:sp>
+              <p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr/>
+                <p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+              <p:spPr/>
+              <p:txBody>
+                <a:p><a:r><a:t>Remember the demo</a:t></a:r></a:p>
+                <a:p><a:r><a:t>Then the Q&amp;A</a:t></a:r></a:p>
+              </p:txBody>
+            </p:sp>
+          </p:spTree></p:cSld></p:notes>"#;
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree>
+                      <p:sp><p:txBody><a:p><a:r><a:t>Slide One</a:t></a:r></a:p></p:txBody></p:sp>
+                    </p:spTree></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>
+                    </Relationships>"#,
+                ),
+                ("ppt/notesSlides/notesSlide1.xml", notes_part),
+            ],
+            &[],
+        );
+        let notes = slide.notes.expect("slide carries notes");
+        let texts: Vec<String> = notes.iter().map(notes_para_text).collect();
+        assert_eq!(
+            texts,
+            vec!["Remember the demo", "Then the Q&A"],
+            "both notes paragraphs, entity-decoded, in order",
+        );
+    }
+
+    #[test]
+    fn pptx_model_slide_without_notes_part_has_no_notes() {
+        // A slide with no notesSlide relationship (no notes part) leaves
+        // `Slide::notes` absent — never a spurious blank.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree>
+              <p:sp><p:txBody><a:p><a:r><a:t>No notes here</a:t></a:r></a:p></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert!(slide.notes.is_none(), "no notesSlide rel → notes absent");
+    }
+
+    #[test]
+    fn pptx_model_empty_notes_body_yields_no_notes() {
+        // A notesSlide whose body placeholder holds only an empty paragraph
+        // contributes no notes (whitespace-only paragraphs are dropped).
+        let notes_part = r#"<p:notes xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:sp>
+              <p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+              <p:txBody><a:p><a:endParaRPr/></a:p></p:txBody>
+            </p:sp>
+          </p:spTree></p:cSld></p:notes>"#;
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree/></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>
+                    </Relationships>"#,
+                ),
+                ("ppt/notesSlides/notesSlide1.xml", notes_part),
+            ],
+            &[],
+        );
+        assert!(slide.notes.is_none(), "empty notes body → notes absent");
+    }
+
+    #[test]
+    fn pptx_model_notes_ignores_non_body_placeholders() {
+        // The notesSlide also carries the slide-image and slide-number
+        // placeholders; only the `type="body"` text becomes notes.
+        let notes_part = r#"<p:notes xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+            <p:sp>
+              <p:nvSpPr><p:nvPr><p:ph type="sldImg"/></p:nvPr></p:nvSpPr>
+              <p:txBody><a:p><a:r><a:t>NOT NOTES (slide image)</a:t></a:r></a:p></p:txBody>
+            </p:sp>
+            <p:sp>
+              <p:nvSpPr><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+              <p:txBody><a:p><a:r><a:t>Actual speaker note</a:t></a:r></a:p></p:txBody>
+            </p:sp>
+            <p:sp>
+              <p:nvSpPr><p:nvPr><p:ph type="sldNum" idx="10"/></p:nvPr></p:nvSpPr>
+              <p:txBody><a:p><a:r><a:t>7</a:t></a:r></a:p></p:txBody>
+            </p:sp>
+          </p:spTree></p:cSld></p:notes>"#;
+        let slide = pptx_model_slide_parts(
+            &[
+                (
+                    "ppt/slides/slide1.xml",
+                    r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:cSld><p:spTree/></p:cSld></p:sld>"#,
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>
+                    </Relationships>"#,
+                ),
+                ("ppt/notesSlides/notesSlide1.xml", notes_part),
+            ],
+            &[],
+        );
+        let notes = slide.notes.expect("slide carries notes");
+        let texts: Vec<String> = notes.iter().map(notes_para_text).collect();
+        assert_eq!(
+            texts,
+            vec!["Actual speaker note"],
+            "only the body placeholder text, image/number placeholders ignored",
+        );
+    }
+
+    #[test]
+    fn odp_model_presentation_notes_reaches_slide_notes() {
+        // A `draw:page` with a `presentation:notes` aside lowers its
+        // `presentation:class="notes"` text-box paragraphs into `Slide::notes`,
+        // one block per `text:p`, and does NOT add a spurious shape for the frame.
+        let slide = odp_model_slide(
+            r#"<draw:frame presentation:class="title" svg:x="1cm" svg:y="1cm" svg:width="20cm" svg:height="3cm">
+                 <draw:text-box><text:p>Slide title</text:p></draw:text-box>
+               </draw:frame>
+               <presentation:notes xmlns:presentation="pr" draw:style-name="dp1">
+                 <draw:frame presentation:class="notes" svg:x="2cm" svg:y="14cm" svg:width="17cm" svg:height="8cm">
+                   <draw:text-box>
+                     <text:p>First spoken line</text:p>
+                     <text:p>Second spoken line</text:p>
+                   </draw:text-box>
+                 </draw:frame>
+               </presentation:notes>"#,
+            &[],
+        );
+        let notes = slide.notes.expect("slide carries notes");
+        let texts: Vec<String> = notes.iter().map(notes_para_text).collect();
+        assert_eq!(
+            texts,
+            vec!["First spoken line", "Second spoken line"],
+            "both notes paragraphs in order",
+        );
+        // The notes frame must NOT leak into the slide's positioned shapes.
+        for sh in &slide.shapes {
+            assert!(
+                !block_text(sh).contains("spoken line"),
+                "notes text must not become a shape",
+            );
+        }
+    }
+
+    #[test]
+    fn odp_model_page_without_notes_has_no_notes() {
+        // A `draw:page` with no `presentation:notes` leaves `Slide::notes` absent.
+        let slide = odp_model_slide(r#"<text:p>Body only, no notes</text:p>"#, &[]);
+        assert!(
+            slide.notes.is_none(),
+            "no presentation:notes → notes absent"
+        );
+    }
+
+    #[test]
+    fn pptx_speaker_notes_round_trip_through_export() {
+        // A model slide whose `notes` were just built imports back to the same
+        // notes text after a PPTX export → import round-trip, proving the import
+        // is the inverse of the export side.
+        use crate::model::{Margins, Page, Placeholder, PlaceholderRole};
+        let para = |t: &str| Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: t.to_string(),
+                    style: CharStyle::default(),
+                    source_index: None,
+                })],
+                ..Paragraph::default()
+            }),
+            ..Block::default()
+        };
+        let slide = Slide {
+            geometry: PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: Margins::uniform(0.0),
+            },
+            shapes: Vec::new(),
+            placeholders: vec![Placeholder {
+                role: PlaceholderRole::Title,
+                block: para("Slide title"),
+            }],
+            notes: Some(vec![para("Carry me through the round-trip")]),
+            background: None,
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Block::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let pptx = crate::convert::export_model::pptx_from_model(&doc);
+        let reparsed = office_to_model(&pptx).expect("pptx → model");
+        let out_slide = match reparsed.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Slide(sb) => sb.slides.into_iter().next().expect("one slide"),
+            other => panic!("expected a Slide block, got {other:?}"),
+        };
+        let notes = out_slide.notes.expect("notes survive the round-trip");
+        let texts: Vec<String> = notes.iter().map(notes_para_text).collect();
+        assert_eq!(texts, vec!["Carry me through the round-trip"]);
     }
 
     // ── flat-XML ODF (.fodt/.fods/.fodp/.fodg) + .odg drawings (issue #53) ──
