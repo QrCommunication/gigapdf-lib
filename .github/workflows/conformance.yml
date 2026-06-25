@@ -60,12 +60,41 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q qpdf libxml2-utils default-jre unzip curl
 
+      # Cache the (large, immutable) official schema downloads so the 53 MB
+      # ECMA-376 archive + ODF RelaxNG are fetched once, not every run. The key is
+      # pinned to fetch-schemas.sh (which carries the URLs + checksums), so it
+      # invalidates automatically if a pin changes. The cache holds the raw
+      # downloads (.schema-cache) AND the extracted schema set (schemas/).
+      - name: Cache conformance schemas (ECMA-376 XSD / ODF RelaxNG)
+        uses: actions/cache@v4
+        with:
+          path: |
+            scripts/conformance/schemas
+            scripts/conformance/.schema-cache
+          key: conformance-schemas-${{ hashFiles('scripts/conformance/fetch-schemas.sh') }}
+
+      # STRONG schema validation needs the official ECMA-376 (Transitional) XSD set
+      # and the OASIS ODF RelaxNG. They are NOT vendored in git (license + size):
+      # fetch-schemas.sh downloads them from PINNED URLs and verifies SHA-256
+      # before use. This is a HARD-FAILING step — a missing/altered schema fails
+      # the build loudly instead of letting the gate silently fall back to the
+      # structural-only level.
+      - name: Provision official validation schemas (pinned + checksummed)
+        run: bash scripts/conformance/fetch-schemas.sh
+
       - name: Run conformance gate
-        # run.sh: generates fixtures from the SDK, then gates each via
-        # validate.py. Exit 0 only when ALL fixtures are conformant; exit 1 on a
-        # non-conformant fixture; exit 2 if a validator is missing (never passes
-        # vacuously). The vendored validators under scripts/conformance/validators
-        # make this self-contained even when the skill is not on the runner.
+        # run.sh: generates fixtures from the SDK, then gates each via validate.py.
+        # PDF → qpdf, PDF/A → veraPDF, Office → OPC + ECMA-376 XSD (xmllint
+        # --schema per part), ODF → ODF invariants + OASIS RelaxNG (xmllint
+        # --relaxng on content/styles/meta). Exit 0 only when ALL fixtures are
+        # conformant; exit 1 on a non-conformant fixture; exit 2 if a validator is
+        # missing (never passes vacuously). REQUIRE_SCHEMAS=1 makes a schema fetch
+        # failure fatal here too (defence in depth with the explicit step above).
+        # Pre-existing exporter schema violations are waived precisely via
+        # scripts/conformance/known-schema-issues.json — any NEW/regressed schema
+        # violation still fails the build.
+        env:
+          REQUIRE_SCHEMAS: "1"
         run: bash scripts/conformance/run.sh
 
       - name: Upload conformance reports

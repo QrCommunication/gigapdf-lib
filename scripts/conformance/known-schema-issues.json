@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Known, PRE-EXISTING schema violations the strong gate tolerates (xfail) so a",
+    "main-branch fix for issue #19 (the validation GATE) does not redden CI on",
+    "exporter bugs that belong to a separate follow-up. Each entry waives EXACTLY",
+    "one part+signature: a NEW violation (other part, other signature) still fails.",
+    "When the exporter is fixed, validate.py reports the entry as 'periphery'/stale",
+    "(non-fatal) so the entry can be removed. Discovered 2026-06-25 by wiring the",
+    "ECMA-376 XSD / OASIS RelaxNG validation against the engine's own fixtures.",
+    "These are exporter output bugs to fix under a follow-up to #2 (Office export",
+    "fidelity); #19 only owns the validation gate, not the exporter fixes."
+  ],
+  "sample.docx": [
+    {
+      "part": "word/document.xml",
+      "signature": "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}wsp': No matching global element declaration",
+      "issue": "followup-office-export",
+      "note": "DOCX export emits a raw MS-2010 'wps:wsp' (wordprocessingShape) extension element directly inside a:graphicData, NOT wrapped in mc:AlternateContent / mc:Choice+mc:Fallback. Word reads it, but it is not ECMA-376 Transitional schema-valid nor MCE-guarded. Fix: wrap the wps drawing in mc:AlternateContent with a strict-schema mc:Fallback (e.g. a picture/wp:inline), or drop the wps extension. Exporter: crates/core/src/convert/office.rs / export_model.rs."
+    }
+  ],
+  "sample.xlsx": [
+    {
+      "part": "xl/worksheets/sheet1.xml",
+      "signature": "attribute '{http://www.w3.org/XML/1998/namespace}space': The attribute '{http://www.w3.org/XML/1998/namespace}space' is not allowed",
+      "issue": "followup-office-export",
+      "note": "XLSX inline strings emit <is><t xml:space=\"preserve\">. In SpreadsheetML the t element (CT_Rst) is typed s:ST_Xstring, a simpleType with NO attributes, so xml:space is invalid on Excel's <t> (unlike Word's w:t / CT_Text). Excel preserves whitespace in inline/shared strings WITHOUT xml:space. Fix: stop emitting xml:space on SpreadsheetML <t>. Exporter: crates/core/src/convert/office.rs (XLSX inlineStr path)."
+    }
+  ],
+  "sample.ods": [
+    {
+      "part": "content.xml",
+      "signature": "Expecting element table-column-group, got table-row",
+      "issue": "followup-office-export",
+      "note": "ODS export writes <table:table-row> directly under <table:table> with NO preceding <table:table-column>. ODF requires the content model (table-column-group* , table-column*) BEFORE (table-row*). LibreOffice repairs it, but it is not ISO 26300 / OASIS RelaxNG valid. Fix: emit one <table:table-column table:number-columns-repeated=\"N\"/> (N = column count) before the rows. Exporter: crates/core/src/convert/office.rs (ODS table)."
+    }
+  ]
+}

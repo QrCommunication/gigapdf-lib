@@ -15,10 +15,13 @@
 # exit 2 (indeterminate — e.g. a validator missing) are BOTH hard failures, so a
 # missing veraPDF can never let a PDF/A check pass vacuously.
 #
-# Schema-level validation (XSD ECMA-376 / RelaxNG ODF) is OPT-IN: drop the
-# schemas under scripts/conformance/schemas/ (see README) and they get wired
-# automatically. Until then the gate is structural (the schemas are not freely
-# fetchable without manual vendoring — documented, not faked).
+# STRONG schema validation (XSD ECMA-376 Transitional / OASIS RelaxNG ODF) runs
+# on the Office/ODF fixtures: fetch-schemas.sh provisions the official schemas
+# from PINNED URLs (checksum-verified) under scripts/conformance/schemas/, then
+# validate.py runs `xmllint --schema`/`--relaxng` per part. Pre-existing exporter
+# violations are waived precisely via known-schema-issues.json (a NEW/regressed
+# violation still fails). Offline locally → graceful fallback to structural; CI
+# fetches as a hard-failing step (REQUIRE_SCHEMAS=1) so a missing schema is loud.
 #
 # Reusable locally: `bash scripts/conformance/run.sh`. Idempotent.
 set -euo pipefail
@@ -37,33 +40,37 @@ warn() { printf '\033[1;33m! %s\033[0m\n' "$*" >&2; }
 err()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; }
 
 # --------------------------------------------------------------------------- #
-# 1. Validators — prefer the live skill, else a self-contained vendored setup. #
+# 1. Validators — ALWAYS use the VENDORED validate.py (the committed, self-       #
+#    contained source of truth: it carries --xsd/--rng/--known-issues). The live  #
+#    skill is only borrowed for its heavy .venv + veraPDF installer if present.   #
 # --------------------------------------------------------------------------- #
 VALIDATE_PY=""
 VENV_PY=""
 
-setup_from_skill() {
-  [ -f "$SKILL_DIR/scripts/validate.py" ] || return 1
-  say "using skill validators: $SKILL_DIR"
-  if [ ! -x "$SKILL_DIR/.venv/bin/python" ]; then
-    bash "$SKILL_DIR/scripts/setup.sh" || warn "skill setup.sh reported issues — continuing with what is present"
-  fi
-  VALIDATE_PY="$SKILL_DIR/scripts/validate.py"
-  VENV_PY="$SKILL_DIR/.venv/bin/python"
-  [ -x "$VENV_PY" ] || VENV_PY="python3"
-  return 0
-}
-
-setup_vendored() {
+# Locate a usable .venv with the validator deps (pikepdf, lxml): prefer the local
+# vendored one, then the skill's, else build a fresh vendored venv. NOTE the
+# vendored validate.py re-execs into scripts/conformance/.venv (see _common.py),
+# so we symlink/borrow the skill venv into $HERE/.venv when reusing it.
+setup_validators() {
   say "using vendored validators: $HERE/validators"
-  local venv="$HERE/.venv"
-  if [ ! -x "$venv/bin/python" ]; then
-    python3 -m venv "$venv"
-  fi
-  "$venv/bin/pip" install -q -U pip
-  "$venv/bin/pip" install -q -r "$HERE/validators/requirements.txt"
   VALIDATE_PY="$HERE/validators/validate.py"
-  VENV_PY="$venv/bin/python"
+  local venv="$HERE/.venv"
+
+  if [ -x "$venv/bin/python" ] && "$venv/bin/python" -c "import pikepdf, lxml" 2>/dev/null; then
+    VENV_PY="$venv/bin/python"
+  elif [ -x "$SKILL_DIR/.venv/bin/python" ] && "$SKILL_DIR/.venv/bin/python" -c "import pikepdf, lxml" 2>/dev/null; then
+    # Reuse the skill's ready venv but expose it where _common.py expects it.
+    say "reusing skill .venv (pikepdf+lxml present): $SKILL_DIR/.venv"
+    [ -e "$venv" ] || ln -s "$SKILL_DIR/.venv" "$venv"
+    VENV_PY="$venv/bin/python"
+  else
+    say "creating vendored .venv (pikepdf + lxml)…"
+    [ -L "$venv" ] && rm -f "$venv"   # drop a stale skill symlink if any
+    [ -x "$venv/bin/python" ] || python3 -m venv "$venv"
+    "$venv/bin/pip" install -q -U pip
+    "$venv/bin/pip" install -q -r "$HERE/validators/requirements.txt"
+    VENV_PY="$venv/bin/python"
+  fi
 
   # qpdf + xmllint via apt when available (CLI tools, not pip).
   local need=()
@@ -158,7 +165,7 @@ gate() {
 
 # --------------------------------------------------------------------------- #
 main() {
-  setup_from_skill || setup_vendored
+  setup_validators
   [ -n "$VALIDATE_PY" ] || { err "no validate.py available"; exit 2; }
   export PATH="$LOCAL_BIN:$PATH"
 
@@ -174,20 +181,34 @@ main() {
   say "generating fixtures from the SDK…"
   node "$REPO/scripts/conformance/gen-fixtures.mjs" "$OUT_DIR"
 
-  # Optional schema validation (opt-in via vendored schemas).
+  # Strong schema validation (ECMA-376 XSD / OASIS RelaxNG). Provision the
+  # official schemas deterministically (pinned URL + checksum) when absent. Local
+  # runs fall back to the structural gate if the fetch is impossible (offline);
+  # CI runs fetch-schemas.sh as its own hard-failing step, so a missing schema in
+  # CI fails loudly rather than silently downgrading. Force with FETCH_SCHEMAS=1.
+  local need_fetch=0
+  { [ ! -f "$SCHEMA_DIR/ooxml/wml.xsd" ] || [ ! -f "$SCHEMA_DIR/odf/OpenDocument-schema.rng" ]; } && need_fetch=1
+  if [ "$need_fetch" = 1 ] || [ "${FETCH_SCHEMAS:-0}" = 1 ]; then
+    if [ "${REQUIRE_SCHEMAS:-0}" = 1 ]; then
+      bash "$HERE/fetch-schemas.sh"            # hard-fail on any fetch/checksum error
+    else
+      bash "$HERE/fetch-schemas.sh" || warn "schema fetch failed — strong validation disabled (structural only)"
+    fi
+  fi
+
   local xsd_arg=() rng_arg_odt=() rng_arg_ods=() rng_arg_odp=()
-  if [ -d "$SCHEMA_DIR/ooxml" ]; then
+  if [ -f "$SCHEMA_DIR/ooxml/wml.xsd" ]; then
     xsd_arg=(--xsd "$SCHEMA_DIR/ooxml")
-    ok "OOXML XSD schemas found → schema validation enabled"
+    ok "OOXML XSD schemas present → strong schema validation enabled"
   else
-    warn "no OOXML XSD schemas in $SCHEMA_DIR/ooxml — OOXML gate is structural (see README to vendor)"
+    warn "no OOXML XSD schemas in $SCHEMA_DIR/ooxml — OOXML gate is structural (run fetch-schemas.sh)"
   fi
   if [ -f "$SCHEMA_DIR/odf/OpenDocument-schema.rng" ]; then
     local rng="$SCHEMA_DIR/odf/OpenDocument-schema.rng"
     rng_arg_odt=(--rng "$rng"); rng_arg_ods=(--rng "$rng"); rng_arg_odp=(--rng "$rng")
-    ok "ODF RelaxNG schema found → schema validation enabled"
+    ok "ODF RelaxNG schema present → strong schema validation enabled"
   else
-    warn "no ODF RelaxNG schema in $SCHEMA_DIR/odf — ODF gate is structural (see README to vendor)"
+    warn "no ODF RelaxNG schema in $SCHEMA_DIR/odf — ODF gate is structural (run fetch-schemas.sh)"
   fi
 
   say "validating fixtures…"
@@ -200,14 +221,21 @@ main() {
   gate "sample.pdfa-2u.pdf"  "PDF/A-2u (veraPDF)" --pdfa 2u
   gate "sample.pdfa-2a.pdf"  "PDF/A-2a (veraPDF)" --pdfa 2a
   gate "sample.pdfa-3b.pdf"  "PDF/A-3b (veraPDF)" --pdfa 3b
-  # Office (OPC structural, + XSD if vendored)
-  gate "sample.docx"         "DOCX (OPC)"  "${xsd_arg[@]}"
-  gate "sample.xlsx"         "XLSX (OPC)"  "${xsd_arg[@]}"
-  gate "sample.pptx"         "PPTX (OPC)"  "${xsd_arg[@]}"
-  # ODF (structural, + RelaxNG if vendored)
-  gate "sample.odt"          "ODT (ODF)"   "${rng_arg_odt[@]}"
-  gate "sample.ods"          "ODS (ODF)"   "${rng_arg_ods[@]}"
-  gate "sample.odp"          "ODP (ODF)"   "${rng_arg_odp[@]}"
+  # known-issues baseline: waives EXACTLY the documented, pre-existing exporter
+  # schema violations (precise part+signature) so a main-branch fix to this gate
+  # doesn't redden CI on bugs tracked for a separate Office-export follow-up. Any
+  # NEW/regressed schema violation still fails. See known-schema-issues.json.
+  local ki=()
+  [ -f "$HERE/known-schema-issues.json" ] && ki=(--known-issues "$HERE/known-schema-issues.json")
+
+  # Office (OPC structural, + ECMA-376 XSD if vendored)
+  gate "sample.docx"         "DOCX (OPC$( [ ${#xsd_arg[@]} -gt 0 ] && echo +XSD ))"  "${xsd_arg[@]}" "${ki[@]}"
+  gate "sample.xlsx"         "XLSX (OPC$( [ ${#xsd_arg[@]} -gt 0 ] && echo +XSD ))"  "${xsd_arg[@]}" "${ki[@]}"
+  gate "sample.pptx"         "PPTX (OPC$( [ ${#xsd_arg[@]} -gt 0 ] && echo +XSD ))"  "${xsd_arg[@]}" "${ki[@]}"
+  # ODF (structural, + OASIS RelaxNG if vendored)
+  gate "sample.odt"          "ODT (ODF$( [ ${#rng_arg_odt[@]} -gt 0 ] && echo +RNG ))"   "${rng_arg_odt[@]}" "${ki[@]}"
+  gate "sample.ods"          "ODS (ODF$( [ ${#rng_arg_ods[@]} -gt 0 ] && echo +RNG ))"   "${rng_arg_ods[@]}" "${ki[@]}"
+  gate "sample.odp"          "ODP (ODF$( [ ${#rng_arg_odp[@]} -gt 0 ] && echo +RNG ))"   "${rng_arg_odp[@]}" "${ki[@]}"
 
   echo
   say "conformance summary: $PASS passed, $FAIL failed"

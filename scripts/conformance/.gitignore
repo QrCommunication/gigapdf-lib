@@ -6,9 +6,12 @@ fixtures/
 __pycache__/
 *.pyc
 
-# Vendored reference schemas are large and license-restricted — fetched manually
-# per README, never committed. Schema validation is opt-in once these exist.
+# Official reference schemas are large + license-restricted — provisioned by
+# fetch-schemas.sh from pinned, checksummed URLs at gate time, never committed.
 schemas/
+# Cached raw schema downloads (the 53 MB ECMA-376 archive, etc.).
+.schema-cache/
 
-# NOTE: validators/*.py and validators/requirements.txt ARE committed (the gate's
-# self-contained reference validators). They are intentionally not ignored.
+# NOTE: validators/*.py, validators/requirements.txt, fetch-schemas.sh and
+# known-schema-issues.json ARE committed (the gate's self-contained logic +
+# the documented violation baseline). They are intentionally not ignored.

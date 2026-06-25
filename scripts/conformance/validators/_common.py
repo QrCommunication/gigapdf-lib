@@ -176,9 +176,16 @@ def report(
     sys.exit(0 if conformant else (1 if conformant is False else 2))
 
 
-def check(name: str, ok: bool | None, detail: str = "", spec: str = "") -> dict:
-    """Fabrique une entrée de check : ok=True/False/None (non testé)."""
-    return {"check": name, "ok": ok, "detail": detail, "spec": spec}
+def check(name: str, ok: bool | None, detail: str = "", spec: str = "",
+          violations: list[dict] | None = None) -> dict:
+    """Fabrique une entrée de check : ok=True/False/None (non testé).
+
+    `violations` (optionnel) : liste structurée [{part, schema, message}] pour les
+    checks de schéma (XSD/RelaxNG), exploitée par le filtre known-issues."""
+    entry = {"check": name, "ok": ok, "detail": detail, "spec": spec}
+    if violations is not None:
+        entry["violations"] = violations
+    return entry
 
 
 def fail(msg: str, code: int = 2) -> "None":
