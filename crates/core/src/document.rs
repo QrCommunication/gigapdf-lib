@@ -4282,7 +4282,9 @@ impl Document {
     }
 
     /// Map each font resource name on a page to a recovered [`TextStyle`]
-    /// (family/weight/style) parsed from its `/BaseFont`. Used by the Office
+    /// (family/weight/style) parsed from its `/BaseFont`, then refined with the
+    /// font's `/FontDescriptor` so bold/italic survive when the name omits the
+    /// style tokens (subset-prefixed / renamed fonts). Used by the Office
     /// exporters to carry real fonts, not just sizes.
     fn page_base_fonts(&self, page_no: u32) -> BTreeMap<String, crate::convert::TextStyle> {
         let mut out = BTreeMap::new();
@@ -4304,11 +4306,52 @@ impl Document {
                 continue;
             };
             if let Some(base) = font.get(b"BaseFont").and_then(Object::as_name) {
-                let style = crate::convert::style::parse_base_font(&String::from_utf8_lossy(base));
+                let mut style =
+                    crate::convert::style::parse_base_font(&String::from_utf8_lossy(base));
+                style.refine_with_descriptor(&self.font_descriptor_style(font));
                 out.insert(String::from_utf8_lossy(name).into_owned(), style);
             }
         }
         out
+    }
+
+    /// Pull the bold/italic signals from a font's `/FontDescriptor`
+    /// (`/Flags`, `/FontWeight`, `/StemV`, `/ItalicAngle`) for
+    /// [`crate::convert::style::TextStyle::refine_with_descriptor`]. Handles both
+    /// simple fonts (descriptor on the font dict) and Type0 fonts (descriptor on
+    /// the first descendant CIDFont). Returns an all-`None`
+    /// [`crate::convert::style::FontDescriptorStyle`] when no descriptor is present.
+    fn font_descriptor_style(
+        &self,
+        font: &Dictionary,
+    ) -> crate::convert::style::FontDescriptorStyle {
+        // Simple fonts carry `/FontDescriptor` directly; Type0 fonts carry it on
+        // the descendant CIDFont. Try the direct one first, then the descendant.
+        let descriptor = font
+            .get(b"FontDescriptor")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .or_else(|| {
+                font.get(b"DescendantFonts")
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_array)
+                    .and_then(|a| a.first())
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+                    .and_then(|cid| cid.get(b"FontDescriptor"))
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_dict)
+            });
+        let Some(descriptor) = descriptor else {
+            return crate::convert::style::FontDescriptorStyle::default();
+        };
+        let field = |key: &[u8]| descriptor.get(key).map(|o| self.resolve(o));
+        crate::convert::style::FontDescriptorStyle {
+            flags: field(b"Flags").and_then(|o| o.as_i64()).map(|i| i as u32),
+            font_weight: field(b"FontWeight").and_then(|o| o.as_f64()),
+            stem_v: field(b"StemV").and_then(|o| o.as_f64()),
+            italic_angle: field(b"ItalicAngle").and_then(|o| o.as_f64()),
+        }
     }
 
     /// Replace a text run's text in place (keeps position and font).

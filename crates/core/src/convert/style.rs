@@ -5,6 +5,12 @@
 //! [`parse_base_font`] turns such a name into a [`TextStyle`] (display family,
 //! generic class, bold, italic); the fill colour is attached separately by the
 //! extractor.
+//!
+//! The name alone is unreliable: subset-prefixed or renamed fonts frequently
+//! drop the "Bold"/"Italic" tokens. [`FontDescriptorStyle`] carries the matching
+//! signals from the font's `/FontDescriptor` (ISO 32000-1 Table 121 `/Flags`,
+//! `/FontWeight`, `/StemV`, `/ItalicAngle`); [`TextStyle::refine_with_descriptor`]
+//! ORs them in so bold/italic survive even when the name is silent.
 
 /// Generic font class, used as a portable fallback when the exact family is not
 /// installed on the reader.
@@ -44,7 +50,64 @@ pub struct TextStyle {
     pub background: Option<[f64; 3]>,
 }
 
+/// Bold/italic signals read from a font's `/FontDescriptor`, used to refine a
+/// [`TextStyle`] whose `/BaseFont` name omitted the style tokens (very common for
+/// subset-prefixed or renamed fonts). All fields are optional — absent keys leave
+/// the corresponding signal silent. Populated by the document layer, which is the
+/// only place the descriptor dictionary is reachable.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FontDescriptorStyle {
+    /// `/Flags` bit field (ISO 32000-1 Table 121). Bit positions are 1-indexed in
+    /// the spec; here as a 0-indexed mask: ForceBold = bit 19 (`1 << 18`),
+    /// Italic = bit 7 (`1 << 6`).
+    pub flags: Option<u32>,
+    /// `/FontWeight` (CSS-style numeric weight, 100–900). `>= 600` ⇒ bold.
+    pub font_weight: Option<f64>,
+    /// `/StemV` — vertical stem thickness in glyph space (1000/em, so size-
+    /// independent). Used only as a last-resort bold heuristic.
+    pub stem_v: Option<f64>,
+    /// `/ItalicAngle` in degrees. A non-zero angle ⇒ italic/oblique.
+    pub italic_angle: Option<f64>,
+}
+
+/// `/Flags` bit 19 (1-indexed) — ForceBold. The glyphs are intended to be bold.
+const FLAG_FORCE_BOLD: u32 = 1 << 18;
+/// `/Flags` bit 7 (1-indexed) — Italic. The glyphs have dominant vertical strokes
+/// that are slanted.
+const FLAG_ITALIC: u32 = 1 << 6;
+/// `/FontWeight` at or above which a font counts as bold (CSS "semibold"+).
+const BOLD_WEIGHT_MIN: f64 = 600.0;
+/// `/StemV` at or above which a font is treated as bold *only* when every other
+/// signal (name token, ForceBold flag, `/FontWeight`) is silent. Normal-weight
+/// faces sit ~50–95; bold faces ~120+. Kept conservative to avoid false bold.
+const BOLD_STEMV_MIN: f64 = 120.0;
+
 impl TextStyle {
+    /// Fold a font's `/FontDescriptor` signals into this style: bold/italic are
+    /// only ever *added*, never cleared, so the name-based detection in
+    /// [`parse_base_font`] stays authoritative when it already fired.
+    ///
+    /// * `/Flags` ForceBold ⇒ bold, Italic ⇒ italic;
+    /// * `/FontWeight >= 600` ⇒ bold;
+    /// * `/ItalicAngle != 0` ⇒ italic;
+    /// * `/StemV >= 120` ⇒ bold, but **only** as a fallback when the name, the
+    ///   ForceBold flag and `/FontWeight` were all silent (a deliberately
+    ///   conservative last resort).
+    pub fn refine_with_descriptor(&mut self, desc: &FontDescriptorStyle) {
+        let flag_bold = desc.flags.is_some_and(|f| f & FLAG_FORCE_BOLD != 0);
+        let flag_italic = desc.flags.is_some_and(|f| f & FLAG_ITALIC != 0);
+        let weight_bold = desc.font_weight.is_some_and(|w| w >= BOLD_WEIGHT_MIN);
+        let angle_italic = desc.italic_angle.is_some_and(|a| a != 0.0);
+
+        // StemV is the weakest signal: only consult it when nothing stronger
+        // (name token / ForceBold flag / FontWeight) has already established bold.
+        let stem_bold = !(self.bold || flag_bold || weight_bold)
+            && desc.stem_v.is_some_and(|s| s >= BOLD_STEMV_MIN);
+
+        self.bold = self.bold || flag_bold || weight_bold || stem_bold;
+        self.italic = self.italic || flag_italic || angle_italic;
+    }
+
     /// The colour as a `RRGGBB` hex string, or `000000` when unset.
     pub fn hex_color(&self) -> String {
         let [r, g, b] = self.color.unwrap_or([0.0, 0.0, 0.0]);
@@ -163,5 +226,102 @@ mod tests {
         let s = parse_base_font("FancyFont-Regular");
         assert_eq!(s.family, "FancyFont");
         assert!(!s.bold && !s.italic);
+    }
+
+    #[test]
+    fn descriptor_force_bold_flag_makes_bold_without_name_token() {
+        // Subset-renamed font: name says nothing, ForceBold flag (bit 19) set.
+        let mut s = parse_base_font("ABCDEF+Subset123");
+        assert!(!s.bold, "name has no bold token");
+        s.refine_with_descriptor(&FontDescriptorStyle {
+            flags: Some(FLAG_FORCE_BOLD),
+            ..Default::default()
+        });
+        assert!(s.bold && !s.italic);
+    }
+
+    #[test]
+    fn descriptor_italic_flag_and_angle_make_italic() {
+        let mut s = parse_base_font("ABCDEF+Subset123");
+        assert!(!s.italic);
+        // Italic flag (bit 7).
+        s.refine_with_descriptor(&FontDescriptorStyle {
+            flags: Some(FLAG_ITALIC),
+            ..Default::default()
+        });
+        assert!(s.italic && !s.bold);
+
+        // A non-zero /ItalicAngle alone is also enough.
+        let mut t = parse_base_font("ABCDEF+Subset123");
+        t.refine_with_descriptor(&FontDescriptorStyle {
+            italic_angle: Some(-12.0),
+            ..Default::default()
+        });
+        assert!(t.italic && !t.bold);
+    }
+
+    #[test]
+    fn descriptor_font_weight_threshold_makes_bold() {
+        let mut s = parse_base_font("ABCDEF+Subset123");
+        s.refine_with_descriptor(&FontDescriptorStyle {
+            font_weight: Some(700.0),
+            ..Default::default()
+        });
+        assert!(s.bold);
+
+        // Just below the 600 threshold stays non-bold.
+        let mut t = parse_base_font("ABCDEF+Subset123");
+        t.refine_with_descriptor(&FontDescriptorStyle {
+            font_weight: Some(500.0),
+            ..Default::default()
+        });
+        assert!(!t.bold);
+    }
+
+    #[test]
+    fn descriptor_no_signals_leaves_style_untouched() {
+        let mut s = parse_base_font("ABCDEF+Subset123");
+        s.refine_with_descriptor(&FontDescriptorStyle::default());
+        assert!(!s.bold && !s.italic);
+
+        // A normal-weight descriptor (regular flags, mid StemV, zero angle) must
+        // not flip anything.
+        let mut t = parse_base_font("ABCDEF+Subset123");
+        t.refine_with_descriptor(&FontDescriptorStyle {
+            flags: Some(1 << 5), // Nonsymbolic (bit 6), neither bold nor italic
+            font_weight: Some(400.0),
+            stem_v: Some(80.0),
+            italic_angle: Some(0.0),
+        });
+        assert!(!t.bold && !t.italic);
+    }
+
+    #[test]
+    fn descriptor_high_stemv_is_a_conservative_fallback() {
+        // High StemV with no other signal ⇒ bold (last-resort heuristic).
+        let mut s = parse_base_font("ABCDEF+Subset123");
+        s.refine_with_descriptor(&FontDescriptorStyle {
+            stem_v: Some(140.0),
+            ..Default::default()
+        });
+        assert!(s.bold);
+
+        // A normal StemV (below the conservative threshold) must NOT make bold —
+        // this is the guard against false positives on regular-weight faces.
+        let mut t = parse_base_font("ABCDEF+Subset123");
+        t.refine_with_descriptor(&FontDescriptorStyle {
+            stem_v: Some(95.0),
+            ..Default::default()
+        });
+        assert!(!t.bold);
+    }
+
+    #[test]
+    fn descriptor_never_clears_name_based_bold_italic() {
+        // Name already established bold+italic; an empty descriptor must not undo it.
+        let mut s = parse_base_font("Helvetica-BoldOblique");
+        assert!(s.bold && s.italic);
+        s.refine_with_descriptor(&FontDescriptorStyle::default());
+        assert!(s.bold && s.italic);
     }
 }

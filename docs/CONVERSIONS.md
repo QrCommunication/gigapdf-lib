@@ -248,8 +248,16 @@ is never promoted.
   a lone ordered marker is prose (a single bullet stays a one-item list), mixed
   formats don't merge, and nested ordinal sub-runs are validated on their own.
   Unordered bullets remain lists with no ordinal requirement.
-- **Bold/italic** detected only from the `/BaseFont` *name* (no FontDescriptor
-  flags, no faux-bold).
+- **Bold/italic** detected from the `/BaseFont` *name* **and** the font's
+  `/FontDescriptor` (ISO 32000-1 Table 121), so the style survives when the name
+  omits the tokens (subset-prefixed / renamed fonts): `/Flags` ForceBold (bit 19)
+  ⇒ bold and Italic (bit 7) ⇒ italic, `/FontWeight ≥ 600` ⇒ bold, `/ItalicAngle
+  ≠ 0` ⇒ italic, and — only as a conservative last resort when name/ForceBold/
+  `/FontWeight` are all silent — `/StemV ≥ 120` ⇒ bold. Bold/italic are only ever
+  *added*, never cleared, so name detection stays authoritative. The descriptor is
+  read for both simple fonts and Type0 fonts (via the descendant CIDFont).
+  Content-stream **faux-bold** (render-mode 2 `Tr` fill+stroke / double-stroke) is
+  still not detected at this layer.
 - **Columns**: whitespace-gutter detection only — a single wide line can collapse
   two columns into one and scramble reading order.
 
