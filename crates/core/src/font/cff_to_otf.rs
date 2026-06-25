@@ -83,6 +83,37 @@ pub fn cff_gid_unicode_strings(cff: &CffFont) -> std::collections::BTreeMap<u16,
     map
 }
 
+/// Build a glyph-id → Unicode **string** map for a **CID-keyed or CFF2** CFF,
+/// whose charset holds CIDs (or nothing) instead of glyph-name SIDs, so neither
+/// [`cff_gid_unicode_strings`] nor [`cff_unicode_to_gid`] can name a glyph. The
+/// Unicode is instead driven by the **wrapping OpenType `cmap`** (`gid_unicode`,
+/// from [`crate::font::truetype::TrueTypeFont::gid_to_unicode_map`]): for each
+/// glyph id present in the CFF, the cmap's scalar becomes its `/ToUnicode` text
+/// (control characters dropped — a subset cmap that folds a glyph onto a C0/C1
+/// code carries no real text). Empty for a name-keyed CFF1 (use the name-charset
+/// resolvers there) or when the cmap maps nothing onto the font's glyphs.
+pub fn cff_cid_gid_unicode_strings(
+    cff: &CffFont,
+    gid_unicode: &std::collections::BTreeMap<u16, u32>,
+) -> std::collections::BTreeMap<u16, String> {
+    let mut map = std::collections::BTreeMap::new();
+    if !(cff.is_cid() || cff.is_cff2()) {
+        return map;
+    }
+    let num_glyphs = cff.num_glyphs();
+    for (&gid, &cp) in gid_unicode {
+        if gid == 0 || gid >= num_glyphs {
+            continue;
+        }
+        if let Some(c) = char::from_u32(cp) {
+            if !c.is_control() {
+                map.insert(gid, c.to_string());
+            }
+        }
+    }
+    map
+}
+
 /// Build a Unicode-scalar → glyph-id map from a CFF font's charset, the inverse
 /// direction needed to draw a simple CFF font through its PDF `/Encoding`
 /// (`code → Unicode → gid`). Resolves each glyph's charset SID through the same
@@ -736,5 +767,33 @@ mod tests {
     #[test]
     fn wrap_rejects_non_cff() {
         assert!(wrap(b"not a font").is_none());
+    }
+
+    #[test]
+    fn cid_cff_unicode_from_wrapping_cmap() {
+        // CID-keyed CFF: drive `/ToUnicode` from the wrapping OpenType cmap's
+        // gid → scalar map, since the CID charset names no glyph (issue #62).
+        let bytes = crate::font::cff::tiny_cid_cff(7);
+        let cff = CffFont::parse(&bytes).expect("CID CFF parses");
+        let mut gid_unicode = std::collections::BTreeMap::new();
+        gid_unicode.insert(1u16, 0x42u32); // gid 1 → 'B'
+        gid_unicode.insert(5u16, 0x43u32); // gid 5 is out of range → dropped
+        let map = cff_cid_gid_unicode_strings(&cff, &gid_unicode);
+        assert_eq!(map.get(&1).map(String::as_str), Some("B"));
+        assert!(!map.contains_key(&5), "out-of-range gid dropped");
+    }
+
+    #[test]
+    fn cid_unicode_helper_ignores_name_keyed_cff() {
+        // The CID/CFF2 helper must stay inert for a plain name-keyed CFF1 — that
+        // path uses the name-charset resolvers, not a supplied cmap.
+        let bytes = crate::font::cff::tiny_named_cff(34);
+        let cff = CffFont::parse(&bytes).expect("name-keyed CFF parses");
+        let mut gid_unicode = std::collections::BTreeMap::new();
+        gid_unicode.insert(1u16, 0x41u32);
+        assert!(
+            cff_cid_gid_unicode_strings(&cff, &gid_unicode).is_empty(),
+            "name-keyed CFF1 is not driven by the wrapping cmap"
+        );
     }
 }

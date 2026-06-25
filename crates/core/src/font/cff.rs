@@ -17,6 +17,12 @@ pub struct CffFont {
     fd_subrs: Vec<Vec<Vec<u8>>>,
     fd_select: Vec<u8>,
     is_cid: bool,
+    /// `true` for a **CFF2** program (major version 2). CFF2 charstrings carry no
+    /// per-glyph width and use the `blend`/`vsindex` variation operators; we
+    /// render the **default instance** (deltas dropped). CFF2 always groups
+    /// glyphs through an FDArray + FDSelect (like CID-keyed CFF1), so local-subr
+    /// selection follows the same per-glyph FD route.
+    cff2: bool,
     units_per_em: f64,
     /// String INDEX (custom strings; SID >= 391). Kept to resolve glyph names
     /// for charset → name → Unicode mapping when wrapping bare CFF in OpenType.
@@ -173,12 +179,72 @@ fn standard_string(sid: usize) -> Option<&'static str> {
     None
 }
 
+// Adobe StandardEncoding (TN #5176 Appendix B / TN #5004) as code → glyph name,
+// the encoding `seac` uses to name its `bchar`/`achar` components. Stored as
+// space-separated fragments, one per contiguous code block, with the start code
+// noted so a fragment stays small. Codes outside these blocks are unencoded.
+const SENC_20: (u8, &str) = (
+    0x20,
+    "space exclam quotedbl numbersign dollar percent ampersand quoteright parenleft parenright asterisk plus comma hyphen period slash zero one two three four five six seven eight nine colon semicolon less equal greater question at A B C D E F G H I J K L M N O P Q R S T U V W X Y Z bracketleft backslash bracketright asciicircum underscore quoteleft a b c d e f g h i j k l m n o p q r s t u v w x y z braceleft bar braceright asciitilde",
+);
+const SENC_A1: (u8, &str) = (
+    0xA1,
+    "exclamdown cent sterling fraction yen florin section currency quotesingle quotedblleft guillemotleft guilsinglleft guilsinglright fi fl",
+);
+const SENC_B1: (u8, &str) = (0xB1, "endash dagger daggerdbl periodcentered");
+const SENC_B6: (u8, &str) = (
+    0xB6,
+    "paragraph bullet quotesinglbase quotedblbase quotedblright guillemotright ellipsis perthousand",
+);
+const SENC_BF: (u8, &str) = (0xBF, "questiondown");
+const SENC_C1: (u8, &str) = (
+    0xC1,
+    "grave acute circumflex tilde macron breve dotaccent dieresis",
+);
+const SENC_CA: (u8, &str) = (0xCA, "ring cedilla");
+const SENC_CD: (u8, &str) = (0xCD, "hungarumlaut ogonek caron emdash");
+const SENC_E1: (u8, &str) = (0xE1, "AE");
+const SENC_E3: (u8, &str) = (0xE3, "ordfeminine");
+const SENC_E8: (u8, &str) = (0xE8, "Lslash Oslash OE ordmasculine");
+const SENC_F1: (u8, &str) = (0xF1, "ae");
+const SENC_F5: (u8, &str) = (0xF5, "dotlessi");
+const SENC_F8: (u8, &str) = (0xF8, "lslash oslash oe germandbls");
+
+const STD_ENCODING_BLOCKS: &[(u8, &str)] = &[
+    SENC_20, SENC_A1, SENC_B1, SENC_B6, SENC_BF, SENC_C1, SENC_CA, SENC_CD, SENC_E1, SENC_E3,
+    SENC_E8, SENC_F1, SENC_F5, SENC_F8,
+];
+
+/// StandardEncoding code → glyph name (`None` for an unencoded code), used to
+/// resolve the `bchar`/`achar` components of a `seac` accented composite.
+fn standard_encoding_name(code: u8) -> Option<&'static str> {
+    for &(start, names) in STD_ENCODING_BLOCKS {
+        let len = names.split(' ').count() as u8;
+        if code >= start && (code - start) < len {
+            return names.split(' ').nth((code - start) as usize);
+        }
+    }
+    None
+}
+
 impl CffFont {
     /// Parse a CFF font program. Returns `None` if it is not valid CFF.
+    /// Accepts both CFF (major version 1) and **CFF2** (major version 2); a CFF2
+    /// program renders its default instance (variation `blend`s collapsed).
     pub fn parse(data: &[u8]) -> Option<CffFont> {
-        if data.len() < 4 || data[0] != 1 {
-            return None; // major version 1
+        if data.len() < 4 {
+            return None;
         }
+        match data[0] {
+            1 => Self::parse_cff1(data),
+            2 => Self::parse_cff2(data),
+            _ => None,
+        }
+    }
+
+    /// Parse a classic CFF (TN #5176): Name INDEX, Top DICT INDEX, String INDEX,
+    /// Global Subr INDEX, then the structures the Top DICT points at.
+    fn parse_cff1(data: &[u8]) -> Option<CffFont> {
         let hdr_size = data[2] as usize;
         let (_names, p) = read_index(data, hdr_size);
         let (top_dicts, p) = read_index(data, p);
@@ -227,9 +293,70 @@ impl CffFont {
             fd_subrs,
             fd_select,
             is_cid,
+            cff2: false,
             units_per_em,
             strings,
             charset,
+        })
+    }
+
+    /// Parse a CFF2 program (OpenType `CFF2` table, MS spec). The header is a
+    /// fixed 5 bytes — `major(2) minor headerSize topDictSize(u16)` — and the Top
+    /// DICT is a **single DICT** (not an INDEX) of `topDictSize` bytes at offset
+    /// 5, followed by the mandatory Global Subr INDEX. CFF2 has no Name/String
+    /// INDEX, no charset and no encoding; glyphs are always grouped through an
+    /// FDArray (+ optional FDSelect). We render the **default instance**: the
+    /// `blend`/`vsindex` operators are collapsed by the interpreter (deltas
+    /// dropped), which needs no VariationStore.
+    fn parse_cff2(data: &[u8]) -> Option<CffFont> {
+        let hdr_size = *data.get(2)? as usize;
+        let top_dict_size = u16::from_be_bytes([*data.get(3)?, *data.get(4)?]) as usize;
+        let top_end = hdr_size.checked_add(top_dict_size)?;
+        let top = parse_dict(data.get(hdr_size..top_end)?);
+        // Global Subr INDEX immediately follows the Top DICT (count 0 if empty).
+        let (gsubrs, _) = read_index(data, top_end);
+
+        let cs_off = *top.get(&17)?.first()? as usize;
+        let (charstrings, _) = read_index(data, cs_off);
+        if charstrings.is_empty() {
+            return None;
+        }
+        let num_glyphs = charstrings.len();
+
+        let units_per_em = match top.get(&0x0c07) {
+            Some(m) if m.first().copied().unwrap_or(0.0).abs() > 1e-9 => 1.0 / m[0],
+            _ => 1000.0,
+        };
+
+        // FDArray (op 12 36) is required in CFF2 — each Font DICT carries a
+        // Private → local subrs. FDSelect (op 12 37) is present only when there
+        // is more than one Font DICT; otherwise FD 0 applies to every glyph.
+        let mut fd_subrs = Vec::new();
+        if let Some(fda) = top.get(&0x0c24).and_then(|v| v.first()) {
+            let (fd_dicts, _) = read_index(data, *fda as usize);
+            for fd in &fd_dicts {
+                fd_subrs.push(local_subrs(data, &parse_dict(fd)));
+            }
+        }
+        if fd_subrs.is_empty() {
+            fd_subrs.push(Vec::new());
+        }
+        let fd_select = parse_fd_select(data, &top, num_glyphs);
+
+        Some(CffFont {
+            charstrings,
+            gsubrs,
+            lsubrs: Vec::new(),
+            fd_subrs,
+            fd_select,
+            // Not ROS-CID: there is no charset to invert, so CID↔GID resolution is
+            // unavailable. CFF2 routes local subrs through the FDArray/FDSelect
+            // (see `local_for`), which keys on `cff2`, not `is_cid`.
+            is_cid: false,
+            cff2: true,
+            units_per_em,
+            strings: Vec::new(),
+            charset: Vec::new(),
         })
     }
 
@@ -259,6 +386,14 @@ impl CffFont {
     /// charset holds CIDs, not name SIDs, so glyph-name resolution is unavailable.
     pub fn is_cid(&self) -> bool {
         self.is_cid
+    }
+
+    /// `true` for a **CFF2** program (major version 2). CFF2 has no charset, so —
+    /// like CID-keyed CFF1 — it carries no glyph names; Unicode for a CFF2 font
+    /// is recovered from its wrapping OpenType `cmap`, not the CFF itself. The
+    /// rendered outlines are the font's **default instance**.
+    pub fn is_cff2(&self) -> bool {
+        self.cff2
     }
 
     /// Resolve a String ID to its name: a predefined Adobe Standard String for
@@ -319,7 +454,7 @@ impl CffFont {
     }
 
     fn local_for(&self, gid: u16) -> &[Vec<u8>] {
-        if self.is_cid {
+        if self.is_cid || self.cff2 {
             let fd = self.fd_select.get(gid as usize).copied().unwrap_or(0) as usize;
             self.fd_subrs.get(fd).map(|s| s.as_slice()).unwrap_or(&[])
         } else {
@@ -328,6 +463,12 @@ impl CffFont {
     }
 
     fn run(&self, gid: u16) -> Option<Glyph> {
+        self.run_depth(gid, 0)
+    }
+
+    /// Interpret glyph `gid`, recursing once per `seac` accent layer. `depth`
+    /// guards against a malformed font chaining `seac`s into a cycle.
+    fn run_depth(&self, gid: u16, depth: usize) -> Option<Glyph> {
         let charstring = self.charstrings.get(gid as usize)?;
         let mut interp = Interp {
             stack: Vec::new(),
@@ -338,16 +479,72 @@ impl CffFont {
             n_stems: 0,
             width: None,
             have_width: false,
+            seac: None,
+            cff2: self.cff2,
             gsubrs: &self.gsubrs,
             lsubrs: self.local_for(gid),
             default_width: self.units_per_em * 0.5,
         };
         interp.exec(charstring, 0);
         interp.finish_contour();
+
+        // `seac` (Type1 `12 6`, or `endchar` with 4 trailing args): a standard-
+        // encoding accented composite. Resolve the base + accent glyphs by name
+        // and overlay the accent translated by `(adx, ady)`. Depth-guarded so a
+        // base/accent that itself seacs cannot loop forever.
+        if let Some((adx, ady, bchar, achar)) = interp.seac {
+            if depth < 4 {
+                if let Some(composed) = self.compose_seac(adx, ady, bchar, achar, depth) {
+                    return Some(Glyph {
+                        contours: composed,
+                        width: interp.width.unwrap_or(interp.default_width),
+                    });
+                }
+            }
+        }
+
         Some(Glyph {
             contours: interp.contours,
             width: interp.width.unwrap_or(interp.default_width),
         })
+    }
+
+    /// Build the outline of a `seac` accented composite: draw the base glyph
+    /// (`bchar`) and the accent glyph (`achar`) — both StandardEncoding codes
+    /// resolved to glyphs via the font's charset names — then overlay the accent
+    /// translated by `(adx, ady)`. Returns `None` if neither component resolves.
+    fn compose_seac(
+        &self,
+        adx: f64,
+        ady: f64,
+        bchar: u8,
+        achar: u8,
+        depth: usize,
+    ) -> Option<Vec<Vec<(f64, f64)>>> {
+        let names = self.name_to_gid_map();
+        let resolve = |code: u8| -> Option<u16> {
+            standard_encoding_name(code).and_then(|name| names.get(name).copied())
+        };
+
+        let mut contours: Vec<Vec<(f64, f64)>> = Vec::new();
+        if let Some(base_gid) = resolve(bchar) {
+            if let Some(base) = self.run_depth(base_gid, depth + 1) {
+                contours.extend(base.contours);
+            }
+        }
+        if let Some(accent_gid) = resolve(achar) {
+            if let Some(accent) = self.run_depth(accent_gid, depth + 1) {
+                for contour in accent.contours {
+                    contours.push(
+                        contour
+                            .into_iter()
+                            .map(|(x, y)| (x + adx, y + ady))
+                            .collect(),
+                    );
+                }
+            }
+        }
+        (!contours.is_empty()).then_some(contours)
     }
 }
 
@@ -459,6 +656,14 @@ struct Interp<'a> {
     n_stems: usize,
     width: Option<f64>,
     have_width: bool,
+    /// Set when the charstring requests a `seac` accented composite — either via
+    /// the Type1 `12 6` operator or `endchar` with 4 trailing args. Holds
+    /// `(adx, ady, bchar, achar)` for [`CffFont::compose_seac`] to assemble.
+    seac: Option<(f64, f64, u8, u8)>,
+    /// `true` when interpreting a **CFF2** charstring: no per-glyph width is
+    /// present, and the `blend`/`vsindex` variation operators are collapsed to
+    /// the default instance.
+    cff2: bool,
     gsubrs: &'a [Vec<u8>],
     lsubrs: &'a [Vec<u8>],
     default_width: f64,
@@ -606,8 +811,9 @@ impl Interp<'_> {
             i += 1;
             match b0 {
                 1 | 3 | 18 | 23 => {
-                    // h/v stem(hm): width on first, then stem pairs.
-                    if !self.have_width && self.stack.len() % 2 == 1 {
+                    // h/v stem(hm): width on first, then stem pairs. CFF2
+                    // charstrings carry no width, so never strip one there.
+                    if !self.cff2 && !self.have_width && self.stack.len() % 2 == 1 {
                         self.width = Some(self.default_width + self.stack.remove(0));
                     }
                     self.have_width = true;
@@ -616,7 +822,7 @@ impl Interp<'_> {
                 }
                 19 | 20 => {
                     // hintmask/cntrmask: same as stem, then skip mask bytes.
-                    if !self.have_width && self.stack.len() % 2 == 1 {
+                    if !self.cff2 && !self.have_width && self.stack.len() % 2 == 1 {
                         self.width = Some(self.default_width + self.stack.remove(0));
                     }
                     self.have_width = true;
@@ -789,9 +995,45 @@ impl Interp<'_> {
                 }
                 11 => return false, // return
                 14 => {
-                    // endchar
+                    // endchar. The Type2 seac-equivalent passes `adx ady bchar
+                    // achar` here (TN #5177 §4.3), optionally preceded by a
+                    // leading width — so 4 args = seac, 5 args = width + seac.
+                    // Strip the width only in the 5-arg case (never consume a
+                    // seac operand as a width). Only valid for CFF1.
+                    if !self.cff2 && !self.have_width && self.stack.len() == 5 {
+                        self.width = Some(self.default_width + self.stack.remove(0));
+                        self.have_width = true;
+                    }
+                    if !self.cff2 && self.stack.len() == 4 {
+                        let achar = self.stack[3];
+                        let bchar = self.stack[2];
+                        let ady = self.stack[1];
+                        let adx = self.stack[0];
+                        if (0.0..=255.0).contains(&bchar) && (0.0..=255.0).contains(&achar) {
+                            self.seac = Some((adx, ady, bchar as u8, achar as u8));
+                        }
+                    }
                     self.take_width_n(0);
                     return true;
+                }
+                15 if self.cff2 => {
+                    // vsindex (CFF2): selects the variation-region set for the
+                    // following blends. We render the default instance, so this
+                    // is a no-op beyond consuming its single operand.
+                    self.stack.pop();
+                }
+                16 if self.cff2 => {
+                    // blend (CFF2): `v1..vN d(1,1)..d(N,K) N`. For the **default
+                    // instance** the result is just the N default values, so we
+                    // pop the count N and keep the bottom N items, dropping the
+                    // N*K deltas — no VariationStore (hence no region count K)
+                    // needed. This assumes the blend's operand group is the whole
+                    // current stack (the universal layout: a font blends the full
+                    // operand list for the operator that immediately follows).
+                    if let Some(n) = self.stack.pop() {
+                        let n = (n.max(0.0) as usize).min(self.stack.len());
+                        self.stack.truncate(n);
+                    }
                 }
                 28 => {
                     let v = i16::from_be_bytes([code[i], code[i + 1]]) as f64;
@@ -819,6 +1061,27 @@ impl Interp<'_> {
                     let b1 = *code.get(i).unwrap_or(&0);
                     i += 1;
                     match b1 {
+                        6 => {
+                            // seac (deprecated Type1 operator, `12 6`): standard-
+                            // encoding accented composite. Operands are `asb adx
+                            // ady bchar achar`; the base glyph sits at the origin
+                            // and the accent is offset by `(adx, ady)` (asb only
+                            // affects hinting). Record it and end the glyph — the
+                            // composite is assembled in `compose_seac`.
+                            let s = &self.stack;
+                            if s.len() >= 5 {
+                                let adx = s[1];
+                                let ady = s[2];
+                                let bchar = s[3];
+                                let achar = s[4];
+                                if (0.0..=255.0).contains(&bchar) && (0.0..=255.0).contains(&achar)
+                                {
+                                    self.seac = Some((adx, ady, bchar as u8, achar as u8));
+                                }
+                            }
+                            self.stack.clear();
+                            return true;
+                        }
                         34 => self.hflex(),
                         35 => self.flex(),
                         36 => self.hflex1(),
@@ -985,6 +1248,363 @@ pub(crate) fn tiny_named_cff(sid_a: u16) -> Vec<u8> {
     out
 }
 
+/// Type2 charstring number encoder shared by the test fixtures: single byte for
+/// `-107..=107`, else the 2-byte `28 hi lo` short-int form.
+#[cfg(test)]
+fn cs_num(v: i32, out: &mut Vec<u8>) {
+    if (-107..=107).contains(&v) {
+        out.push((v + 139) as u8);
+    } else {
+        out.push(28);
+        out.push((v >> 8) as u8);
+        out.push((v & 0xFF) as u8);
+    }
+}
+
+/// Top DICT / Private DICT integer operand encoder shared by the fixtures.
+#[cfg(test)]
+fn dict_int(v: i32) -> Vec<u8> {
+    if (-107..=107).contains(&v) {
+        vec![(v + 139) as u8]
+    } else if (108..=1131).contains(&v) {
+        let v = v - 108;
+        vec![247 + (v >> 8) as u8, (v & 0xFF) as u8]
+    } else {
+        vec![28, (v >> 8) as u8, (v & 0xFF) as u8]
+    }
+}
+
+/// Build a name-keyed CFF with three real glyphs — `.notdef`, "A" (a square),
+/// "grave" (a small square) — plus a fourth **`seac` composite** "Agrave" that
+/// references "A" and "grave" by their StandardEncoding codes (`0x41`, `0xC1`)
+/// with the accent offset by `(adx, ady)`. The composite uses the requested
+/// form: `endchar`-seac (4 trailing args) or the deprecated `12 6` operator.
+/// Returns `(cff_bytes, adx, ady)`. Test-only.
+#[cfg(test)]
+pub(crate) fn tiny_seac_cff(use_escape_operator: bool) -> (Vec<u8>, i32, i32) {
+    const ADX: i32 = 30;
+    const ADY: i32 = 250;
+
+    let notdef = vec![14u8];
+    // "A": a 200×200 square from (40,40).
+    let glyph_a = {
+        let mut g = Vec::new();
+        cs_num(40, &mut g);
+        cs_num(40, &mut g);
+        g.push(21); // rmoveto →(40,40)
+        cs_num(200, &mut g);
+        cs_num(0, &mut g);
+        g.push(5); // rlineto →(240,40)
+        cs_num(0, &mut g);
+        cs_num(200, &mut g);
+        g.push(5); // rlineto →(240,240)
+        cs_num(-200, &mut g);
+        cs_num(0, &mut g);
+        g.push(5); // rlineto →(40,240)
+        g.push(14); // endchar
+        g
+    };
+    // "grave": a small 40×40 square from (60,60) — distinct from A's geometry.
+    let glyph_grave = {
+        let mut g = Vec::new();
+        cs_num(60, &mut g);
+        cs_num(60, &mut g);
+        g.push(21); // rmoveto →(60,60)
+        cs_num(40, &mut g);
+        cs_num(0, &mut g);
+        g.push(5); // rlineto →(100,60)
+        cs_num(0, &mut g);
+        cs_num(40, &mut g);
+        g.push(5); // rlineto →(100,100)
+        cs_num(-40, &mut g);
+        cs_num(0, &mut g);
+        g.push(5); // rlineto →(60,100)
+        g.push(14); // endchar
+        g
+    };
+    // "Agrave": a seac composite. bchar=0x41 ('A'), achar=0xC1 ('grave').
+    let glyph_agrave = {
+        let mut g = Vec::new();
+        if use_escape_operator {
+            // seac: asb adx ady bchar achar  (12 6)
+            cs_num(0, &mut g); // asb (hinting only)
+            cs_num(ADX, &mut g);
+            cs_num(ADY, &mut g);
+            cs_num(0x41, &mut g);
+            cs_num(0xC1, &mut g);
+            g.push(12);
+            g.push(6);
+        } else {
+            // endchar seac form: adx ady bchar achar  endchar
+            cs_num(ADX, &mut g);
+            cs_num(ADY, &mut g);
+            cs_num(0x41, &mut g);
+            cs_num(0xC1, &mut g);
+            g.push(14);
+        }
+        g
+    };
+    let charstrings = test_index(&[notdef, glyph_a, glyph_grave, glyph_agrave]);
+
+    let header = vec![1u8, 0, 4, 1];
+    let names = test_index(&[b"F".to_vec()]);
+    let strings = test_index(&[]); // all names are Standard Strings
+    let gsubrs = test_index(&[]);
+    // charset format 0: SIDs for gid 1..=3 — A(34), grave(124), Agrave(174).
+    let charset = {
+        let mut c = vec![0u8];
+        for sid in [34u16, 124, 174] {
+            c.push((sid >> 8) as u8);
+            c.push(sid as u8);
+        }
+        c
+    };
+    let private = [dict_int(0), vec![20u8], dict_int(0), vec![21u8]].concat();
+
+    let build_top = |charset_off: i32, cs_off: i32, priv_off: i32| -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(dict_int(charset_off));
+        d.push(15);
+        d.extend(dict_int(cs_off));
+        d.push(17);
+        d.extend(dict_int(private.len() as i32));
+        d.extend(dict_int(priv_off));
+        d.push(18);
+        d
+    };
+
+    let mut top_index = test_index(&[build_top(0, 0, 0)]);
+    let mut prev_len = 0;
+    loop {
+        let base = header.len() + names.len() + top_index.len() + strings.len() + gsubrs.len();
+        let charset_off = base as i32;
+        let cs_off = (base + charset.len()) as i32;
+        let priv_off = (base + charset.len() + charstrings.len()) as i32;
+        top_index = test_index(&[build_top(charset_off, cs_off, priv_off)]);
+        if top_index.len() == prev_len {
+            break;
+        }
+        prev_len = top_index.len();
+    }
+
+    let mut out = Vec::new();
+    out.extend(header);
+    out.extend(names);
+    out.extend(top_index);
+    out.extend(strings);
+    out.extend(gsubrs);
+    out.extend(charset);
+    out.extend(charstrings);
+    out.extend(private);
+    (out, ADX, ADY)
+}
+
+/// Build a minimal **CFF2** program (major version 2): 5-byte header, a single
+/// Top DICT (CharStrings op 17 + FDArray op 12 36), the Global Subr INDEX, one
+/// Font DICT with an empty Private, and two charstrings — `.notdef` and a glyph
+/// that draws a unit square whose **first move uses `blend`**. Rendering the
+/// default instance must keep the `blend`'s default operands and discard the
+/// deltas. Returns the CFF2 bytes. Test-only.
+#[cfg(test)]
+pub(crate) fn tiny_cff2() -> Vec<u8> {
+    // glyph 0 (.notdef): empty (CFF2 has no endchar — the charstring just ends).
+    let notdef: Vec<u8> = Vec::new();
+    // glyph 1: the opening `rmoveto` takes its two coordinates from a single
+    // `blend` (N=2, one region K=1) — the realistic CFF2 layout where one blend
+    // feeds the operator that follows: `dx dy ddx ddy 2 blend rmoveto`. Default
+    // instance keeps the two defaults (100,100) and drops the two deltas + the
+    // count, so the square's geometry is the default instance's.
+    let square = {
+        let mut g = Vec::new();
+        cs_num(100, &mut g); // dx default
+        cs_num(100, &mut g); // dy default
+        cs_num(5, &mut g); // dx region-1 delta
+        cs_num(-7, &mut g); // dy region-1 delta
+        cs_num(2, &mut g); // N = 2 blended values
+        g.push(16); // blend → leaves (100, 100)
+        g.push(21); // rmoveto →(100,100)
+        cs_num(100, &mut g);
+        cs_num(0, &mut g);
+        g.push(5); // rlineto →(200,100)
+        cs_num(0, &mut g);
+        cs_num(100, &mut g);
+        g.push(5); // rlineto →(200,200)
+        cs_num(-100, &mut g);
+        cs_num(0, &mut g);
+        g.push(5); // rlineto →(100,200)
+                   // CFF2: no endchar — the charstring simply ends here.
+        g
+    };
+    let charstrings = test_index(&[notdef, square]);
+    let gsubrs = test_index(&[]);
+    // Font DICT: Private = [size offset]. nominalWidthX etc. irrelevant in CFF2.
+    let private = [dict_int(0), vec![20u8], dict_int(0), vec![21u8]].concat();
+
+    // Layout: header(5) | topDict | gsubrs | fdarray | charstrings | private.
+    // The Top DICT is a single DICT (not an INDEX); FDArray is an INDEX of one
+    // Font DICT. Offsets are absolute from the start of the data.
+    let build_top = |cs_off: i32, fda_off: i32| -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(dict_int(cs_off));
+        d.push(17); // CharStrings
+        d.extend(dict_int(fda_off));
+        d.push(12);
+        d.push(36); // FDArray
+        d
+    };
+    let build_fd = |priv_off: i32| -> Vec<u8> {
+        let fd = [
+            dict_int(private.len() as i32),
+            dict_int(priv_off),
+            vec![18u8],
+        ]
+        .concat();
+        test_index(&[fd])
+    };
+
+    // Iterate to a fixed point: the Top DICT size depends on the offsets, which
+    // depend on the Top DICT size.
+    let mut top = build_top(0, 0);
+    let mut fdarray = build_fd(0);
+    let mut prev = (0usize, 0usize);
+    loop {
+        let hdr_len = 5;
+        let top_dict_size = top.len();
+        let gsubr_off = hdr_len + top_dict_size;
+        let fda_off = gsubr_off + gsubrs.len();
+        let cs_off = fda_off + fdarray.len();
+        let priv_off = cs_off + charstrings.len();
+        top = build_top(cs_off as i32, fda_off as i32);
+        fdarray = build_fd(priv_off as i32);
+        if (top.len(), fdarray.len()) == prev {
+            break;
+        }
+        prev = (top.len(), fdarray.len());
+    }
+
+    let mut out = Vec::new();
+    // CFF2 header: major=2, minor=0, headerSize=5, topDictSize (u16).
+    out.push(2);
+    out.push(0);
+    out.push(5);
+    out.extend_from_slice(&(top.len() as u16).to_be_bytes());
+    out.extend(top);
+    out.extend(gsubrs);
+    out.extend(fdarray);
+    out.extend(charstrings);
+    out.extend(private);
+    out
+}
+
+/// Build a minimal **CID-keyed** CFF (ROS present): `.notdef` plus one glyph
+/// (a square) whose charset maps gid 1 → CID `cid1`. Has an FDArray + a format-0
+/// FDSelect. Returns the CFF bytes. Test-only — drives the CID-keyed Unicode
+/// path, which can name no glyph from its own (CID) charset.
+#[cfg(test)]
+pub(crate) fn tiny_cid_cff(cid1: u16) -> Vec<u8> {
+    let notdef = vec![14u8];
+    let square = {
+        let mut g = Vec::new();
+        cs_num(0, &mut g);
+        cs_num(0, &mut g);
+        g.push(21); // rmoveto →(0,0)
+        cs_num(100, &mut g);
+        cs_num(0, &mut g);
+        g.push(5);
+        cs_num(0, &mut g);
+        cs_num(100, &mut g);
+        g.push(5);
+        cs_num(-100, &mut g);
+        cs_num(0, &mut g);
+        g.push(5);
+        g.push(14);
+        g
+    };
+    let charstrings = test_index(&[notdef, square]);
+
+    let header = vec![1u8, 0, 4, 1];
+    let names = test_index(&[b"F".to_vec()]);
+    // String INDEX must hold the Registry + Ordering strings the ROS references.
+    let strings = test_index(&[b"Adobe".to_vec(), b"Identity".to_vec()]);
+    let gsubrs = test_index(&[]);
+    // charset format 0: gid 1 → CID `cid1`.
+    let charset = vec![0u8, (cid1 >> 8) as u8, cid1 as u8];
+    // FDSelect format 0: one FD byte per glyph (both → FD 0).
+    let fdselect = vec![0u8, 0, 0];
+    let private = [dict_int(0), vec![20u8], dict_int(0), vec![21u8]].concat();
+
+    // Lay out: header|names|topIndex|strings|gsubrs|charset|fdselect|fdarray|
+    //          charstrings|private. The FDArray is an INDEX of one Font DICT
+    //          (Private only). ROS = [reg_sid ord_sid supplement].
+    let reg_sid = N_STANDARD_STRINGS as i32; // first custom string → "Adobe"
+    let ord_sid = N_STANDARD_STRINGS as i32 + 1; // second → "Identity"
+    let build_fd = |priv_off: i32| -> Vec<u8> {
+        let fd = [
+            dict_int(private.len() as i32),
+            dict_int(priv_off),
+            vec![18u8],
+        ]
+        .concat();
+        test_index(&[fd])
+    };
+    let build_top = |charset_off: i32, fdselect_off: i32, fda_off: i32, cs_off: i32| -> Vec<u8> {
+        let mut d = Vec::new();
+        // ROS (op 12 30): Registry Ordering Supplement.
+        d.extend(dict_int(reg_sid));
+        d.extend(dict_int(ord_sid));
+        d.extend(dict_int(0));
+        d.push(12);
+        d.push(30);
+        d.extend(dict_int(charset_off));
+        d.push(15); // charset
+        d.extend(dict_int(fdselect_off));
+        d.push(12);
+        d.push(37); // FDSelect
+        d.extend(dict_int(fda_off));
+        d.push(12);
+        d.push(36); // FDArray
+        d.extend(dict_int(cs_off));
+        d.push(17); // CharStrings
+        d
+    };
+
+    let mut top_index = test_index(&[build_top(0, 0, 0, 0)]);
+    let mut fdarray = build_fd(0);
+    let mut prev = (0usize, 0usize);
+    loop {
+        let base = header.len() + names.len() + top_index.len() + strings.len() + gsubrs.len();
+        let charset_off = base;
+        let fdselect_off = charset_off + charset.len();
+        let fda_off = fdselect_off + fdselect.len();
+        let cs_off = fda_off + fdarray.len();
+        let priv_off = cs_off + charstrings.len();
+        top_index = test_index(&[build_top(
+            charset_off as i32,
+            fdselect_off as i32,
+            fda_off as i32,
+            cs_off as i32,
+        )]);
+        fdarray = build_fd(priv_off as i32);
+        if (top_index.len(), fdarray.len()) == prev {
+            break;
+        }
+        prev = (top_index.len(), fdarray.len());
+    }
+
+    let mut out = Vec::new();
+    out.extend(header);
+    out.extend(names);
+    out.extend(top_index);
+    out.extend(strings);
+    out.extend(gsubrs);
+    out.extend(charset);
+    out.extend(fdselect);
+    out.extend(fdarray);
+    out.extend(charstrings);
+    out.extend(private);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,6 +1637,8 @@ mod tests {
             n_stems: 0,
             width: None,
             have_width: false,
+            seac: None,
+            cff2: false,
             gsubrs: &[],
             lsubrs: &[],
             default_width: 500.0,
@@ -1042,6 +1664,8 @@ mod tests {
             n_stems: 0,
             width: None,
             have_width: true, // skip width-stripping in flex unit tests
+            seac: None,
+            cff2: false,
             gsubrs: &[],
             lsubrs: &[],
             default_width: 0.0,
@@ -1227,5 +1851,153 @@ mod tests {
             "glyph A produces contours"
         );
         assert!(cff.glyph_polygons(0).is_empty(), ".notdef is empty");
+    }
+
+    #[test]
+    fn standard_encoding_resolves_seac_component_names() {
+        // The codes a `seac` names its base/accent with (issue #61).
+        assert_eq!(standard_encoding_name(0x41), Some("A"));
+        assert_eq!(standard_encoding_name(0x61), Some("a"));
+        assert_eq!(standard_encoding_name(0x20), Some("space"));
+        assert_eq!(standard_encoding_name(0xC1), Some("grave"));
+        assert_eq!(standard_encoding_name(0xC2), Some("acute"));
+        assert_eq!(standard_encoding_name(0xE8), Some("Lslash"));
+        assert_eq!(standard_encoding_name(0xF8), Some("lslash"));
+        // Holes in StandardEncoding stay unmapped (no glyph there).
+        assert_eq!(standard_encoding_name(0x00), None);
+        assert_eq!(standard_encoding_name(0x80), None);
+        assert_eq!(standard_encoding_name(0xA0), None);
+        assert_eq!(standard_encoding_name(0xFF), None);
+    }
+
+    #[test]
+    fn endchar_seac_sets_composite_request() {
+        // `adx ady bchar achar endchar` (the Type2 seac-equivalent) records the
+        // composite instead of just ending the glyph. The codes (0x41, 0xC1)
+        // exceed the single-byte operand range, so encode via `cs_num`.
+        let mut cs = Vec::new();
+        cs_num(30, &mut cs);
+        cs_num(40, &mut cs);
+        cs_num(0x41, &mut cs);
+        cs_num(0xC1, &mut cs);
+        cs.push(14);
+        let mut it = interp();
+        it.exec(&cs, 0);
+        assert_eq!(it.seac, Some((30.0, 40.0, 0x41, 0xC1)));
+    }
+
+    #[test]
+    fn seac_operator_sets_composite_request() {
+        // Deprecated `12 6`: `asb adx ady bchar achar`. asb is ignored; adx/ady
+        // and the two codes drive the composite.
+        let mut cs = Vec::new();
+        cs_num(0, &mut cs);
+        cs_num(30, &mut cs);
+        cs_num(40, &mut cs);
+        cs_num(0x41, &mut cs);
+        cs_num(0xC1, &mut cs);
+        cs.push(12);
+        cs.push(6);
+        let mut it = interp();
+        it.exec(&cs, 0);
+        assert_eq!(it.seac, Some((30.0, 40.0, 0x41, 0xC1)));
+    }
+
+    #[test]
+    fn seac_composite_overlays_base_and_offset_accent() {
+        // Both seac forms must assemble "Agrave" = A's contours + grave's
+        // contours translated by (adx, ady).
+        for use_escape in [false, true] {
+            let (bytes, adx, ady) = tiny_seac_cff(use_escape);
+            let cff = CffFont::parse(&bytes).expect("seac CFF parses");
+            assert_eq!(cff.num_glyphs(), 4, ".notdef + A + grave + Agrave");
+
+            let base = cff.glyph_polygons(1); // A
+            let accent = cff.glyph_polygons(2); // grave
+            let composite = cff.glyph_polygons(3); // Agrave (seac)
+            assert!(!base.is_empty() && !accent.is_empty(), "components draw");
+            assert_eq!(
+                composite.len(),
+                base.len() + accent.len(),
+                "composite = base contours + accent contours (form escape={use_escape})"
+            );
+
+            // The base contours appear verbatim; the accent contours appear
+            // translated by (adx, ady).
+            for c in &base {
+                assert!(composite.contains(c), "base contour present untranslated");
+            }
+            for c in &accent {
+                let shifted: Vec<(f64, f64)> = c
+                    .iter()
+                    .map(|&(x, y)| (x + adx as f64, y + ady as f64))
+                    .collect();
+                assert!(
+                    composite.contains(&shifted),
+                    "accent contour present translated by (adx,ady)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cff2_default_instance_parses_and_renders() {
+        // CFF2 (major 2) must be accepted (issue #60); the `blend` operators in
+        // the charstring collapse to the default instance so the glyph renders.
+        let bytes = tiny_cff2();
+        let cff = CffFont::parse(&bytes).expect("CFF2 must parse");
+        assert!(cff.is_cff2(), "recognised as CFF2");
+        assert!(!cff.is_cid(), "CFF2 is not ROS-CID");
+        assert_eq!(cff.num_glyphs(), 2, ".notdef + square");
+
+        let square = cff.glyph_polygons(1);
+        assert_eq!(square.len(), 1, "one contour");
+        let pts = &square[0];
+        // blend kept the defaults (100,100) for the opening rmoveto, so the
+        // square's corners are exactly those of the default instance.
+        assert!(pts.contains(&(100.0, 100.0)), "rmoveto used blend defaults");
+        assert!(pts.contains(&(200.0, 100.0)));
+        assert!(pts.contains(&(200.0, 200.0)));
+        assert!(pts.contains(&(100.0, 200.0)));
+        // .notdef is empty (no endchar in CFF2 — charstring just ends).
+        assert!(cff.glyph_polygons(0).is_empty(), ".notdef empty");
+    }
+
+    #[test]
+    fn cff2_blend_collapses_to_default_operands() {
+        // Unit-level: `v1 v2 d(1,1) d(2,1) 2 blend` (N=2, K=1) keeps v1,v2 and
+        // drops both deltas + the count, leaving exactly the defaults.
+        let n = |v: i32| (v + 139) as u8;
+        let cs = vec![n(11), n(22), n(99), n(99), n(2), 16];
+        let mut it = interp();
+        it.cff2 = true;
+        it.exec(&cs, 0);
+        assert_eq!(it.stack, vec![11.0, 22.0], "blend leaves the N defaults");
+    }
+
+    #[test]
+    fn cid_keyed_cff_unicode_driven_by_wrapping_cmap() {
+        // A CID-keyed CFF names no glyph from its own (CID) charset, so the
+        // name-charset resolvers yield nothing (issue #62)…
+        let bytes = tiny_cid_cff(7);
+        let cff = CffFont::parse(&bytes).expect("CID CFF parses");
+        assert!(cff.is_cid(), "ROS present → CID-keyed");
+        assert_eq!(cff.gid_for_cid(7), Some(1), "charset maps CID 7 → gid 1");
+        assert!(
+            cff.name_to_gid_map().is_empty(),
+            "no glyph names for a CID charset"
+        );
+        assert!(
+            crate::font::cff_to_otf::cff_gid_unicode_strings(&cff).is_empty(),
+            "name-charset ToUnicode is empty for CID-keyed"
+        );
+
+        // …so Unicode is driven by the wrapping OpenType cmap (gid → scalar).
+        let mut gid_unicode = std::collections::BTreeMap::new();
+        gid_unicode.insert(1u16, 0x41u32); // gid 1 → 'A'
+        gid_unicode.insert(0u16, 0x2202u32); // gid 0 (.notdef) is dropped
+        let map = crate::font::cff_to_otf::cff_cid_gid_unicode_strings(&cff, &gid_unicode);
+        assert_eq!(map.get(&1).map(String::as_str), Some("A"));
+        assert!(!map.contains_key(&0), ".notdef carries no text");
     }
 }
