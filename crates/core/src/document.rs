@@ -7917,13 +7917,28 @@ impl Document {
                 page_tags,
             );
 
-            // Project the heuristic blocks' top-down frames into the displayed
-            // (post-`/Rotate`) frame so a rotated page reads upright. Tagged blocks
-            // are left untouched: they carry at most a `/Layout /BBox` hint in raw
-            // PDF user space (not the top-down model frame this projection assumes)
-            // and flow rather than position absolutely.
-            if rotation != 0 && !is_tagged {
-                Self::rotate_blocks_for_display(&mut blocks, rotation, page_w, page_h);
+            // Project the reconstructed blocks' frames into the displayed
+            // (post-`/Rotate`) frame so a rotated page reads upright. The two
+            // reconstruction paths frame their blocks in *different* coordinate
+            // conventions, so each gets its own projector:
+            //
+            // * Heuristic blocks carry a top-down frame (`recon::frame_top_down`,
+            //   origin top-left, `y` down) — `rotate_blocks_for_display` projects
+            //   it directly.
+            // * Tagged blocks carry at most a `/Layout /BBox` hint in raw PDF user
+            //   space (origin bottom-left, `y` up; see
+            //   `recon::tag_tree::layout_bbox`) —
+            //   `rotate_tagged_blocks_for_display` first flips it top-down, then
+            //   reuses the same cardinal projection. (#5)
+            //
+            // `rotation == 0` never reaches here, so a `/Rotate 0` document — tagged
+            // or not — keeps its frames byte-identical.
+            if rotation != 0 {
+                if is_tagged {
+                    Self::rotate_tagged_blocks_for_display(&mut blocks, rotation, page_w, page_h);
+                } else {
+                    Self::rotate_blocks_for_display(&mut blocks, rotation, page_w, page_h);
+                }
             }
 
             // Displayed page size: width/height swap for 90°/270° (mirrors
@@ -8111,6 +8126,87 @@ impl Document {
                 }
                 BlockKind::Blockquote(bq) => {
                     Self::rotate_blocks_for_display(&mut bq.blocks, rotation, page_w, page_h);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Project a **tagged** block tree's `/Layout /BBox` frames into the displayed
+    /// (post-`/Rotate`) frame, the tagged-path counterpart of
+    /// [`rotate_blocks_for_display`](Self::rotate_blocks_for_display). (#5)
+    ///
+    /// Tagged frames come from [`recon::tag_tree::layout_bbox`](crate::recon::tag_tree),
+    /// which keeps the raw `/BBox` in **default PDF user space** — origin
+    /// bottom-left, `y` growing **up**, in the unrotated `(page_w, page_h)` box.
+    /// That is the Y-flip of the top-down frame
+    /// [`rotate_rect_for_display`](Self::rotate_rect_for_display) expects, so each
+    /// frame is first flipped to top-down (`y_top = page_h - y_bottom - h`, the same
+    /// mapping [`recon::frame_top_down`](crate::recon::frame_top_down) applies) and
+    /// then handed to that single cardinal projector. The result lands in the same
+    /// top-down displayed space the heuristic path produces, so a tagged+rotated
+    /// page's blocks read upright at the right place.
+    ///
+    /// Recurses through the same nesting containers (table cells, list items, text
+    /// boxes, block quotes) a tagged tree can populate. The block **content** and
+    /// [`Block::rotation`] are untouched — the re-anchored frame already reads
+    /// upright, so the box stays axis-aligned (`Rotation::D0`). A `rotation` of 0
+    /// never reaches here (the caller guards it), keeping `/Rotate 0` tagged
+    /// documents byte-identical.
+    fn rotate_tagged_blocks_for_display(
+        blocks: &mut [crate::model::Block],
+        rotation: i32,
+        page_w: f64,
+        page_h: f64,
+    ) {
+        use crate::model::geom::Rect;
+        use crate::model::BlockKind;
+        for block in blocks {
+            if let Some(frame) = block.frame {
+                // Bottom-up `/BBox` → top-down, then the shared cardinal projector.
+                let top_down = Rect::new(frame.x, page_h - frame.y - frame.h, frame.w, frame.h);
+                block.frame = Some(Self::rotate_rect_for_display(
+                    top_down, rotation, page_w, page_h,
+                ));
+            }
+            match &mut block.kind {
+                BlockKind::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            Self::rotate_tagged_blocks_for_display(
+                                &mut cell.blocks,
+                                rotation,
+                                page_w,
+                                page_h,
+                            );
+                        }
+                    }
+                }
+                BlockKind::List(list) => {
+                    for item in &mut list.items {
+                        Self::rotate_tagged_blocks_for_display(
+                            &mut item.blocks,
+                            rotation,
+                            page_w,
+                            page_h,
+                        );
+                    }
+                }
+                BlockKind::TextBox(tb) => {
+                    Self::rotate_tagged_blocks_for_display(
+                        &mut tb.blocks,
+                        rotation,
+                        page_w,
+                        page_h,
+                    );
+                }
+                BlockKind::Blockquote(bq) => {
+                    Self::rotate_tagged_blocks_for_display(
+                        &mut bq.blocks,
+                        rotation,
+                        page_w,
+                        page_h,
+                    );
                 }
                 _ => {}
             }
@@ -28418,6 +28514,205 @@ mod tests {
         assert!(
             p2.contains("second page") && !p2.contains("first page"),
             "the /Pg-2 block lands on model page 2, not page 1, got {p2:?}"
+        );
+    }
+
+    /// A one-page tagged PDF: a single `/P` element carrying a `/Layout /BBox`
+    /// `[72 700 300 750]` on a 400×800 page, with the page's `/Rotate` set to
+    /// `rotate`. Used by the tagged-rotation #5 tests.
+    fn tagged_bbox_fixture(rotate: i32) -> Vec<u8> {
+        let content = "BT /F1 12 Tf /P <</MCID 0>> BDC (tagged line) Tj EMC ET";
+        let page_extra = if rotate != 0 {
+            format!(" /Rotate {rotate}")
+        } else {
+            String::new()
+        };
+        raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800]{page_extra} \
+                     /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                ),
+            ),
+            (
+                18,
+                format!(
+                    "<< /Length {} >> stream\n{content}\nendstream",
+                    content.len()
+                ),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (
+                11,
+                "<< /Type /StructElem /S /Document /K [12 0 R] >>".into(),
+            ),
+            // Paragraph with a `/Layout /BBox` placement hint (PDF user space,
+            // origin bottom-left): lower-left (72,700), upper-right (300,750).
+            (
+                12,
+                "<< /S /P /Pg 8 0 R /A << /O /Layout /BBox [72 700 300 750] >> /K 0 >>".into(),
+            ),
+        ])
+    }
+
+    /// The frame of the (single) tagged paragraph block in a reconstructed model.
+    fn only_tagged_frame(model: &crate::model::Document) -> crate::model::geom::Rect {
+        use crate::model::BlockKind;
+        model
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(_) => b.frame,
+                _ => None,
+            })
+            .expect("a framed tagged paragraph block")
+    }
+
+    /// #5 (tagged + `/Rotate`): a tagged page that is ALSO rotated projects its
+    /// `/Layout /BBox` block frames into the upright displayed frame — the gap this
+    /// item closes (tagged blocks used to keep their unrotated positions). The
+    /// paragraph's `/BBox [72 700 300 750]` on a 400×800 page, under `/Rotate 90`,
+    /// lands at the rect produced by flipping the bottom-up box top-down and
+    /// applying the same cardinal 90° projector the heuristic path uses.
+    #[test]
+    fn reconstruct_model_rotates_tagged_block_frame_90() {
+        use crate::model::geom::Rect;
+
+        let doc = Document::open(&tagged_bbox_fixture(90)).expect("valid tagged PDF");
+        assert!(doc.has_semantic_structure(), "fixture must be tagged");
+
+        let model = doc.reconstruct_model();
+
+        // The displayed page swaps to landscape (400×800 → 800×400).
+        let geo = model.sections[0].geometry;
+        assert!(
+            (geo.width - 800.0).abs() < 0.5 && (geo.height - 400.0).abs() < 0.5,
+            "rotated tagged page is 800×400, got {}×{}",
+            geo.width,
+            geo.height
+        );
+
+        // Expected = flip `/BBox` bottom-up→top-down then project 90° clockwise.
+        //   layout_bbox        → {x:72,  y:700, w:228, h:50}  (bottom-up)
+        //   top-down (h=800)   → {x:72,  y:50,  w:228, h:50}
+        //   rotate 90 (400×800)→ {x:700, y:72,  w:50,  h:228}
+        let frame = only_tagged_frame(&model);
+        let close = |a: f64, b: f64| (a - b).abs() < 0.01;
+        assert!(
+            close(frame.x, 700.0)
+                && close(frame.y, 72.0)
+                && close(frame.w, 50.0)
+                && close(frame.h, 228.0),
+            "tagged frame projected for /Rotate 90, got {frame:?}"
+        );
+        // It is NOT the raw unrotated `/BBox` rect (72,700,228,50): rotation applied.
+        let raw = Rect::new(72.0, 700.0, 228.0, 50.0);
+        assert_ne!(frame, raw, "frame must not keep its unrotated position");
+        // The box's width/height swapped (a wide paragraph becomes tall) and it
+        // stays inside the displayed page.
+        assert!(close(frame.w, raw.h) && close(frame.h, raw.w));
+        assert!(
+            frame.x >= -0.01
+                && frame.y >= -0.01
+                && frame.x + frame.w <= geo.width + 0.01
+                && frame.y + frame.h <= geo.height + 0.01,
+            "projected tagged frame lies within the displayed page"
+        );
+    }
+
+    /// #5 (tagged + `/Rotate 0`): an UNROTATED tagged document is byte-identical —
+    /// the tagged rotation projector is guarded off, so the block keeps its raw
+    /// `/Layout /BBox` rect (bottom-up PDF user space) and the page keeps its
+    /// MediaBox geometry.
+    #[test]
+    fn reconstruct_model_tagged_unrotated_frame_unchanged() {
+        use crate::model::geom::Rect;
+
+        let doc = Document::open(&tagged_bbox_fixture(0)).expect("valid tagged PDF");
+        assert!(doc.has_semantic_structure(), "fixture must be tagged");
+
+        let model = doc.reconstruct_model();
+        // No swap: the displayed page equals the MediaBox.
+        let geo = model.sections[0].geometry;
+        assert!(
+            (geo.width - 400.0).abs() < 0.5 && (geo.height - 800.0).abs() < 0.5,
+            "unrotated tagged page keeps 400×800, got {}×{}",
+            geo.width,
+            geo.height
+        );
+        // The frame is exactly the raw `/BBox` rect (72,700,228,50), untouched.
+        let frame = only_tagged_frame(&model);
+        assert_eq!(
+            frame,
+            Rect::new(72.0, 700.0, 228.0, 50.0),
+            "/Rotate 0 tagged frame stays the raw /Layout /BBox (byte-identical)"
+        );
+    }
+
+    /// #5 (untagged + `/Rotate 90`): the untagged rotation path is unaffected by
+    /// the new tagged branch — an untagged rotated page is reconstructed exactly as
+    /// before (its blocks come from the heuristic top-down projector, never the
+    /// tagged one). Pins the "untagged docs are unaffected" guarantee.
+    #[test]
+    fn reconstruct_model_untagged_rotation_unaffected_by_tagged_branch() {
+        use crate::model::BlockKind;
+
+        let content = b"BT /F0 24 Tf 72 740 Td (Untagged Title) Tj ET\n\
+                        BT /F0 12 Tf 72 600 Td (One body line of prose here.) Tj ET\n";
+
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("seed")).unwrap();
+        doc.set_page_content(1, content.to_vec()).unwrap();
+        doc.rotate_page(1, 90).unwrap();
+        assert!(!doc.has_semantic_structure(), "fixture is untagged");
+
+        let model = doc.reconstruct_model();
+        let frame = model
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Heading(_) => b.frame,
+                _ => None,
+            })
+            .expect("a framed heading block");
+
+        // The untagged heading frame equals the heuristic top-down projector applied
+        // to its unrotated frame — i.e. the same result as before this change. We
+        // reconstruct the unrotated frame and project it through the heuristic path.
+        let mut up = Document::open(&crate::convert::reverse::txt_to_pdf("seed")).unwrap();
+        up.set_page_content(1, content.to_vec()).unwrap();
+        let up_frame = up
+            .reconstruct_model()
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Heading(_) => b.frame,
+                _ => None,
+            })
+            .expect("a framed heading block (upright)");
+        let expected = Document::rotate_rect_for_display(up_frame, 90, 612.0, 792.0);
+        let close = |a: f64, b: f64| (a - b).abs() < 0.01;
+        assert!(
+            close(frame.x, expected.x)
+                && close(frame.y, expected.y)
+                && close(frame.w, expected.w)
+                && close(frame.h, expected.h),
+            "untagged rotated frame {frame:?} == heuristic projection {expected:?}"
         );
     }
 

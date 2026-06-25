@@ -141,8 +141,12 @@ shapes · underline/strike (from drawn rules) · external + internal hyperlinks 
 outline/bookmarks · page geometry — including **page-level `/Rotate` (90/180/270)**:
 the reconstructed page reflects the **displayed** orientation (its width/height swap
 for 90°/270°) and every reconstructed block frame is projected into that upright
-reading frame, so a landscape-rotated page reads correctly rather than sideways
-(`/Rotate 0` pages stay byte-identical) · **running headers/footers** (stripped from
+reading frame, so a landscape-rotated page reads correctly rather than sideways —
+this now covers **both** reconstruction paths: heuristic block frames (top-down) and
+**tagged-PDF block frames** (a `/Layout /BBox` hint in raw PDF user space is flipped
+top-down before the same cardinal projection), so a document that is *both* tagged
+*and* `/Rotate`d no longer leaves its tagged blocks at unrotated positions
+(`/Rotate 0` pages — tagged or not — stay byte-identical) · **running headers/footers** (stripped from
 the body flow and lifted to `Section.header`/`Section.footer`, see below) · tagged-PDF
 `/StructTreeRoot` (consumed; blocks distributed onto their real pages, see below) ·
 **optional-content (OCG/OCMD layer) visibility** (see below).
