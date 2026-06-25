@@ -878,6 +878,25 @@ pub(super) fn twips(points: f64) -> i64 {
     (points * 20.0).round() as i64
 }
 
+/// Map an [`ImageResource`](crate::model::ImageResource) format tag to the
+/// `(content-type, file extension)` used when embedding the blob in an OOXML or
+/// ODF package. The extension is the package-native spelling (`"jpeg"`, not
+/// `"jpg"`) so the OOXML `[Content_Types].xml` `Default Extension` matches the
+/// part name. Unknown tags fall back to PNG (the only format the engine ever
+/// re-encodes to internally), so a missing/garbled tag never yields an
+/// undeclared part. Mirrors `epub_image_mime` but with package-native spellings.
+pub(super) fn office_image_format(format: &str) -> (&'static str, &'static str) {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "jpeg" | "jpg" => ("image/jpeg", "jpeg"),
+        "gif" => ("image/gif", "gif"),
+        "bmp" => ("image/bmp", "bmp"),
+        "tiff" | "tif" => ("image/tiff", "tiff"),
+        "webp" => ("image/webp", "webp"),
+        "svg" | "svg+xml" => ("image/svg+xml", "svg"),
+        _ => ("image/png", "png"),
+    }
+}
+
 /// Export pages to an editable Word document (`.docx`). Text runs become
 /// absolutely-positioned `wps` text boxes, images become anchored pictures, and
 /// each page is its own section sized to the page.

@@ -17,7 +17,7 @@ use crate::content::num;
 use crate::content::vector::PathSeg;
 use crate::convert::office::{
     col_letter, dml_cust_geom, dml_fill, dml_line, docx_vml_shape, emu, esc, odf_path_d,
-    odf_shape_style, shape_is_rect, twips,
+    odf_shape_style, office_image_format, shape_is_rect, twips,
 };
 use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
@@ -129,6 +129,29 @@ Target=\"docProps/core.xml\"/>\
 <Relationship Id=\"rIdApp\" \
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" \
 Target=\"docProps/app.xml\"/>";
+
+/// `[Content_Types].xml` `<Default>` entries for the image extensions present in
+/// a package — one per *distinct* extension (a duplicate `Default Extension` is
+/// invalid OOXML, OPC §10.1.2.2.1). `exts` is the package-native extension of
+/// every embedded image (e.g. `["png", "jpeg", "png"]`); the result declares
+/// `png` and `jpeg` once each.
+fn ooxml_image_defaults(exts: &[&str]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = String::new();
+    for &ext in exts {
+        if seen.contains(&ext) {
+            continue;
+        }
+        seen.push(ext);
+        // `ext` is one of office_image_format's fixed spellings ⇒ its content
+        // type is the matching `image/<ext>` (with `svg` → `image/svg+xml`).
+        let mime = office_image_format(ext).0;
+        out.push_str(&format!(
+            "<Default Extension=\"{ext}\" ContentType=\"{mime}\"/>"
+        ));
+    }
+    out
+}
 
 /// ODF `meta.xml` (`office:document-meta` → `office:meta`, ISO 26300 §3/§4) from
 /// the model metadata. Absent fields are omitted. Mirrors the OOXML core part:
@@ -343,9 +366,10 @@ pub fn docx_from_model(doc: &Document) -> Vec<u8> {
     let has_footer = footer_inner.is_some();
     let has_num = !ctx.list_markers.is_empty();
 
+    let image_exts: Vec<&str> = ctx.images.iter().map(|(_, ext)| *ext).collect();
     zip.add_deflated(
         "[Content_Types].xml",
-        docx_content_types(ctx.images.len(), has_num, has_header, has_footer).as_bytes(),
+        docx_content_types(&image_exts, has_num, has_header, has_footer).as_bytes(),
     );
     zip.add_deflated(
         "_rels/.rels",
@@ -362,7 +386,7 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
     zip.add_deflated("word/document.xml", body.as_bytes());
     zip.add_deflated(
         "word/_rels/document.xml.rels",
-        docx_rels(ctx.images.len(), has_num, has_header, has_footer).as_bytes(),
+        docx_rels(&image_exts, has_num, has_header, has_footer).as_bytes(),
     );
     zip.add_deflated(
         "word/styles.xml",
@@ -386,17 +410,20 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
             docx_hdrftr_xml("ftr", inner).as_bytes(),
         );
     }
-    for (i, img) in ctx.images.iter().enumerate() {
-        zip.add_deflated(&format!("word/media/image{}.png", i + 1), img);
+    for (i, (bytes, ext)) in ctx.images.iter().enumerate() {
+        zip.add_deflated(&format!("word/media/image{}.{ext}", i + 1), bytes);
     }
     zip.finish()
 }
 
 /// Mutable state threaded through a DOCX build: a flat image list (global order →
-/// `media/imageN.png` + `rId`), a running list-instance counter (each [`List`]
+/// `media/imageN.<ext>` + `rId`), a running list-instance counter (each [`List`]
 /// gets a distinct `w:numId`), and the document's resource table for image blobs.
 struct DocxCtx<'a> {
-    images: Vec<Vec<u8>>,
+    /// Each image: raw bytes plus its package-native extension (e.g. `"png"`,
+    /// `"jpeg"`), so the media part, relationship target and `[Content_Types]`
+    /// `Default` all carry the resource's real format.
+    images: Vec<(Vec<u8>, &'static str)>,
     /// One marker per list *instance* emitted; its position + 1 is the list's
     /// `w:numId`, and the marker drives the generated `numbering.xml` format.
     list_markers: Vec<ListMarker>,
@@ -418,14 +445,19 @@ impl<'a> DocxCtx<'a> {
         self.obj_id += 1;
         self.obj_id
     }
-    /// Register image bytes, returning the relationship id (`rId{N}`, 100-based).
-    fn add_image(&mut self, png: Vec<u8>) -> usize {
-        self.images.push(png);
+    /// Register image bytes (+ extension), returning the relationship id
+    /// (`rId{N}`, 100-based).
+    fn add_image(&mut self, bytes: Vec<u8>, ext: &'static str) -> usize {
+        self.images.push((bytes, ext));
         100 + self.images.len() - 1
     }
-    /// Resolve an image blob by resource key.
-    fn resolve_image(&self, key: u64) -> Option<Vec<u8>> {
-        self.resources.images.get(&key).map(|r| r.bytes.clone())
+    /// Resolve an image blob by resource key, returning its bytes and the
+    /// package-native extension derived from the resource's format tag.
+    fn resolve_image(&self, key: u64) -> Option<(Vec<u8>, &'static str)> {
+        self.resources
+            .images
+            .get(&key)
+            .map(|r| (r.bytes.clone(), office_image_format(&r.format).1))
     }
 }
 
@@ -917,12 +949,12 @@ fn docx_image_para(img: &ImageRef, ctx: &mut DocxCtx) -> String {
 
 fn docx_inline_image(img: &ImageRef, ctx: &mut DocxCtx) -> String {
     // Resolve the blob via the (single) resource table threaded at the top.
-    let png = ctx.resolve_image(img.resource).unwrap_or_default();
-    if png.is_empty() {
-        return String::new();
-    }
+    let (bytes, ext) = match ctx.resolve_image(img.resource) {
+        Some(b) if !b.0.is_empty() => b,
+        _ => return String::new(),
+    };
     let id = ctx.next_obj();
-    let rid = ctx.add_image(png);
+    let rid = ctx.add_image(bytes, ext);
     // A 1"-square default extent; reflowable output sizes to the page anyway.
     let (cx, cy) = (emu(96.0), emu(96.0));
     let mut alt = String::new();
@@ -963,12 +995,8 @@ xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">{inner}</w:{ta
     )
 }
 
-fn docx_content_types(image_count: usize, num: bool, header: bool, footer: bool) -> String {
-    let png = if image_count > 0 {
-        "<Default Extension=\"png\" ContentType=\"image/png\"/>"
-    } else {
-        ""
-    };
+fn docx_content_types(image_exts: &[&str], num: bool, header: bool, footer: bool) -> String {
+    let png = ooxml_image_defaults(image_exts);
     let mut overrides = String::from(
         "<Override PartName=\"/word/document.xml\" \
 ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
@@ -1001,7 +1029,7 @@ ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.foo
     )
 }
 
-fn docx_rels(image_count: usize, num: bool, header: bool, footer: bool) -> String {
+fn docx_rels(image_exts: &[&str], num: bool, header: bool, footer: bool) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
@@ -1022,11 +1050,11 @@ fn docx_rels(image_count: usize, num: bool, header: bool, footer: bool) -> Strin
             "<Relationship Id=\"rIdFtr\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>",
         );
     }
-    for i in 0..image_count {
+    for (i, ext) in image_exts.iter().enumerate() {
         s.push_str(&format!(
             "<Relationship Id=\"rId{id}\" \
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" \
-Target=\"media/image{n}.png\"/>",
+Target=\"media/image{n}.{ext}\"/>",
             id = 100 + i,
             n = i + 1
         ));
@@ -1716,23 +1744,49 @@ fn xlsx_sheet_from_model(sheet: &Sheet, styler: &mut XlsxStyler) -> String {
                 String::new()
             };
             let r_ref = format!("{}{}", col_letter(c), r + 1);
-            match &cell.value {
-                CellValue::Empty => {
+            // The formula (`<f>`) precedes the cached `<v>` in the `<c>` (ECMA-376
+            // §18.3.1.4). The model strips the leading `=`, but tolerate a stray
+            // one. A formula forces an explicit `<v>` value cell (never the
+            // `inlineStr` shorthand, which cannot carry `<f>`); a text result uses
+            // `t="str"` per §18.18.11.
+            let formula = cell.formula.as_deref().map(|f| {
+                let mut e = String::new();
+                esc(f.strip_prefix('=').unwrap_or(f), &mut e);
+                format!("<f>{e}</f>")
+            });
+            match (&cell.value, formula) {
+                (CellValue::Empty, None) => {
                     if s_idx != 0 {
                         // Keep a styled-but-empty cell so its fill/format shows.
                         cells.push_str(&format!("<c r=\"{r_ref}\"{s_attr}/>"));
                     }
                 }
-                CellValue::Number(n) => {
-                    cells.push_str(&format!("<c r=\"{r_ref}\"{s_attr}><v>{}</v></c>", num(*n)));
+                (CellValue::Empty, Some(f)) => {
+                    cells.push_str(&format!("<c r=\"{r_ref}\"{s_attr}>{f}</c>"));
                 }
-                CellValue::Bool(b) => {
+                (CellValue::Number(n), f) => {
                     cells.push_str(&format!(
-                        "<c r=\"{r_ref}\"{s_attr} t=\"b\"><v>{}</v></c>",
+                        "<c r=\"{r_ref}\"{s_attr}>{}<v>{}</v></c>",
+                        f.unwrap_or_default(),
+                        num(*n)
+                    ));
+                }
+                (CellValue::Bool(b), f) => {
+                    cells.push_str(&format!(
+                        "<c r=\"{r_ref}\"{s_attr} t=\"b\">{}<v>{}</v></c>",
+                        f.unwrap_or_default(),
                         if *b { 1 } else { 0 }
                     ));
                 }
-                CellValue::Text(t) => {
+                (CellValue::Text(t), Some(f)) => {
+                    // A string-valued formula: `t="str"` with the cached result.
+                    let mut esc_t = String::new();
+                    esc(t, &mut esc_t);
+                    cells.push_str(&format!(
+                        "<c r=\"{r_ref}\"{s_attr} t=\"str\">{f}<v>{esc_t}</v></c>"
+                    ));
+                }
+                (CellValue::Text(t), None) => {
                     let mut esc_t = String::new();
                     esc(t, &mut esc_t);
                     cells.push_str(&format!(
@@ -1885,18 +1939,38 @@ pub fn pptx_from_model(doc: &Document) -> Vec<u8> {
         .unwrap_or((960.0, 540.0));
 
     let mut zip = ZipWriter::new();
-    let mut media: Vec<Vec<u8>> = Vec::new();
+    // Each embedded image: bytes + its package-native extension (`"png"`,
+    // `"jpeg"`, …), so the media part, `r:embed` relationship target and
+    // `[Content_Types]` `Default` all carry the resource's real format.
+    let mut media: Vec<(Vec<u8>, &'static str)> = Vec::new();
     let mut slide_xmls: Vec<String> = Vec::new();
     let mut slide_media: Vec<Vec<usize>> = Vec::new();
+    // Speaker notes per slide: the rendered `notesSlideN.xml` body, or `None`
+    // when the slide carries no notes (so no `notesSlide` part is emitted).
+    let mut notes_xmls: Vec<Option<String>> = Vec::new();
     for slide in &model_slides {
         let mut used = Vec::new();
         slide_xmls.push(pptx_slide_from_model(slide, doc, &mut media, &mut used));
         slide_media.push(used);
+        notes_xmls.push(
+            slide
+                .notes
+                .as_ref()
+                .filter(|n| !n.is_empty())
+                .map(|n| pptx_notes_from_model(n)),
+        );
     }
+    let media_exts: Vec<&str> = media.iter().map(|(_, ext)| *ext).collect();
+    // 1-based slide numbers that own a notesSlide part.
+    let notes_slides: Vec<usize> = notes_xmls
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| n.as_ref().map(|_| i + 1))
+        .collect();
 
     zip.add_deflated(
         "[Content_Types].xml",
-        pptx_model_content_types(slide_xmls.len(), !media.is_empty()).as_bytes(),
+        pptx_model_content_types(slide_xmls.len(), &media_exts, &notes_slides).as_bytes(),
     );
     zip.add_deflated(
         "_rels/.rels",
@@ -1939,13 +2013,29 @@ Target=\"../slideMasters/slideMaster1.xml\"/></Relationships>",
     );
     for (i, xml) in slide_xmls.iter().enumerate() {
         zip.add_deflated(&format!("ppt/slides/slide{}.xml", i + 1), xml.as_bytes());
+        let has_notes = notes_xmls[i].is_some();
         zip.add_deflated(
             &format!("ppt/slides/_rels/slide{}.xml.rels", i + 1),
-            pptx_model_slide_rels(&slide_media[i]).as_bytes(),
+            pptx_model_slide_rels(&slide_media[i], &media_exts, has_notes, i + 1).as_bytes(),
         );
     }
-    for (i, png) in media.iter().enumerate() {
-        zip.add_deflated(&format!("ppt/media/image{}.png", i + 1), png);
+    // Notes slides: one `notesSlideN.xml` (+ its rels) per slide that has notes,
+    // numbered by the owning slide's 1-based index.
+    for (i, notes) in notes_xmls.iter().enumerate() {
+        if let Some(xml) = notes {
+            let n = i + 1;
+            zip.add_deflated(
+                &format!("ppt/notesSlides/notesSlide{n}.xml"),
+                xml.as_bytes(),
+            );
+            zip.add_deflated(
+                &format!("ppt/notesSlides/_rels/notesSlide{n}.xml.rels"),
+                pptx_model_notes_rels(n).as_bytes(),
+            );
+        }
+    }
+    for (i, (bytes, ext)) in media.iter().enumerate() {
+        zip.add_deflated(&format!("ppt/media/image{}.{ext}", i + 1), bytes);
     }
     zip.finish()
 }
@@ -1953,7 +2043,7 @@ Target=\"../slideMasters/slideMaster1.xml\"/></Relationships>",
 fn pptx_slide_from_model(
     slide: &Slide,
     doc: &Document,
-    media: &mut Vec<Vec<u8>>,
+    media: &mut Vec<(Vec<u8>, &'static str)>,
     used: &mut Vec<usize>,
 ) -> String {
     let mut tree = String::new();
@@ -1981,8 +2071,8 @@ fn pptx_slide_from_model(
     for sh in &slide.shapes {
         match &sh.kind {
             BlockKind::Image(img) => {
-                if let Some(png) = doc_image(doc, img.resource) {
-                    media.push(png);
+                if let Some((bytes, ext)) = doc_image(doc, img.resource) {
+                    media.push((bytes, ext));
                     used.push(media.len() - 1);
                     let rid = used.len();
                     let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
@@ -2072,6 +2162,41 @@ fn pptx_text_body(paras: &[Paragraph]) -> String {
     }
     body.push_str("</p:txBody>");
     body
+}
+
+/// Build a `notesSlide` part (`p:notes`, ECMA-376 §13.3.5) carrying the slide's
+/// speaker notes in the `body` placeholder (`<p:ph type="body"/>`). The notes
+/// text is the slide's `notes` blocks flattened to paragraphs. The relationship
+/// to the owning slide is written separately by [`pptx_model_notes_rels`].
+fn pptx_notes_from_model(notes: &[Block]) -> String {
+    let body = pptx_text_body(&blocks_to_paras(notes));
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<p:notes xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">\
+<p:cSld><p:spTree>\
+<p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>\
+<p:grpSpPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/>\
+<a:chOff x=\"0\" y=\"0\"/><a:chExt cx=\"0\" cy=\"0\"/></a:xfrm></p:grpSpPr>\
+<p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"Notes Placeholder\"/><p:cNvSpPr/>\
+<p:nvPr><p:ph type=\"body\" idx=\"1\"/></p:nvPr></p:nvSpPr>\
+<p:spPr/>{body}</p:sp>\
+</p:spTree></p:cSld></p:notes>"
+    )
+}
+
+/// Relationships for a `notesSlide` part: the mandatory back-reference to its
+/// owning slide (ECMA-376 §13.3.5 — a notesSlide is associated with exactly one
+/// slide). `slide_number` is the 1-based slide index.
+fn pptx_model_notes_rels(slide_number: usize) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" \
+Target=\"../slides/slide{slide_number}.xml\"/></Relationships>"
+    )
 }
 
 /// A DrawingML `<a:txBody>` (the in-`a:tc` text body), as opposed to the
@@ -2293,12 +2418,12 @@ fn pptx_rpr(style: &CharStyle) -> String {
     }
 }
 
-fn pptx_model_content_types(slide_count: usize, has_media: bool) -> String {
-    let png = if has_media {
-        "<Default Extension=\"png\" ContentType=\"image/png\"/>"
-    } else {
-        ""
-    };
+fn pptx_model_content_types(
+    slide_count: usize,
+    image_exts: &[&str],
+    notes_slides: &[usize],
+) -> String {
+    let png = ooxml_image_defaults(image_exts);
     let mut s = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
@@ -2318,6 +2443,12 @@ ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/>"
             "<Override PartName=\"/ppt/slides/slide{}.xml\" \
 ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>",
             i + 1
+        ));
+    }
+    for &n in notes_slides {
+        s.push_str(&format!(
+            "<Override PartName=\"/ppt/notesSlides/notesSlide{n}.xml\" \
+ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml\"/>"
         ));
     }
     s.push_str(OOXML_DOCPROPS_OVERRIDES);
@@ -2369,21 +2500,30 @@ Target=\"slides/slide{}.xml\"/>",
 
 /// Per-slide relationships: the mandatory `slideLayout` relationship
 /// (ECMA-376 §13.3.8 — every slide MUST reference exactly one slide layout)
-/// followed by one `image` relationship per embedded picture. Image rIds are
+/// followed by one `image` relationship per embedded picture, and (when the
+/// slide has speaker notes) a `notesSlide` relationship. Image rIds are
 /// `rId1..rIdN` (matching the `r:embed` values written into the slide body by
-/// [`pptx_slide_from_model`]); the layout rId is the next free id so it never
-/// collides. The slide↔layout link is resolved by relationship *type*, not by
-/// any `r:id` in the slide XML, so its numeric id is free to be last.
-fn pptx_model_slide_rels(media_indices: &[usize]) -> String {
+/// [`pptx_slide_from_model`]); the layout rId is `rId{N+1}` and the optional
+/// notesSlide rId is `rId{N+2}`. The slide↔layout/notes links are resolved by
+/// relationship *type*, not by any `r:id` in the slide XML, so the numeric ids
+/// are free to be last. `slide_number` is the owning slide's 1-based index.
+fn pptx_model_slide_rels(
+    media_indices: &[usize],
+    media_exts: &[&str],
+    has_notes: bool,
+    slide_number: usize,
+) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
     );
     for (local, &global) in media_indices.iter().enumerate() {
+        // The target's extension is the global image's real format.
+        let ext = media_exts.get(global).copied().unwrap_or("png");
         s.push_str(&format!(
             "<Relationship Id=\"rId{}\" \
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" \
-Target=\"../media/image{}.png\"/>",
+Target=\"../media/image{}.{ext}\"/>",
             local + 1,
             global + 1
         ));
@@ -2394,6 +2534,14 @@ Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide
 Target=\"../slideLayouts/slideLayout1.xml\"/>",
         media_indices.len() + 1
     ));
+    if has_notes {
+        s.push_str(&format!(
+            "<Relationship Id=\"rId{}\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide\" \
+Target=\"../notesSlides/notesSlide{slide_number}.xml\"/>",
+            media_indices.len() + 2
+        ));
+    }
     s.push_str("</Relationships>");
     s
 }
@@ -2445,18 +2593,25 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
         .as_bytes(),
     );
     zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
-    let image_count = ctx.images.len() + hf_ctx.images.len();
+    // Image parts are numbered in document order: body images first, then the
+    // header/footer context's. The manifest declares each in the same order.
+    let image_exts: Vec<&str> = ctx
+        .images
+        .iter()
+        .chain(hf_ctx.images.iter())
+        .map(|(_, ext)| *ext)
+        .collect();
     zip.add_deflated(
         "META-INF/manifest.xml",
-        odf_manifest("text", image_count).as_bytes(),
+        odf_manifest("text", &image_exts).as_bytes(),
     );
-    for (i, png) in ctx.images.iter().enumerate() {
-        zip.add_deflated(&format!("Pictures/img{}.png", i + 1), png);
+    for (i, (bytes, ext)) in ctx.images.iter().enumerate() {
+        zip.add_deflated(&format!("Pictures/img{}.{ext}", i + 1), bytes);
     }
-    for (i, png) in hf_ctx.images.iter().enumerate() {
+    for (i, (bytes, ext)) in hf_ctx.images.iter().enumerate() {
         zip.add_deflated(
-            &format!("Pictures/img{}.png", ctx.images.len() + i + 1),
-            png,
+            &format!("Pictures/img{}.{ext}", ctx.images.len() + i + 1),
+            bytes,
         );
     }
     zip.finish()
@@ -2495,7 +2650,7 @@ pub fn ods_from_model(doc: &Document) -> Vec<u8> {
     zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
     zip.add_deflated(
         "META-INF/manifest.xml",
-        odf_manifest("spreadsheet", 0).as_bytes(),
+        odf_manifest("spreadsheet", &[]).as_bytes(),
     );
     zip.finish()
 }
@@ -2543,12 +2698,13 @@ pub fn odp_from_model(doc: &Document) -> Vec<u8> {
         odp_styles_xml_model(pw, ph, &odf_default_lang_styles(&doc.meta)).as_bytes(),
     );
     zip.add_deflated("meta.xml", odf_meta_xml(&doc.meta).as_bytes());
+    let image_exts: Vec<&str> = ctx.images.iter().map(|(_, ext)| *ext).collect();
     zip.add_deflated(
         "META-INF/manifest.xml",
-        odf_manifest("presentation", ctx.images.len()).as_bytes(),
+        odf_manifest("presentation", &image_exts).as_bytes(),
     );
-    for (i, png) in ctx.images.iter().enumerate() {
-        zip.add_deflated(&format!("Pictures/img{}.png", i + 1), png);
+    for (i, (bytes, ext)) in ctx.images.iter().enumerate() {
+        zip.add_deflated(&format!("Pictures/img{}.{ext}", i + 1), bytes);
     }
     zip.finish()
 }
@@ -2557,9 +2713,12 @@ pub fn odp_from_model(doc: &Document) -> Vec<u8> {
 /// the document's resource table for image-blob lookups.
 struct OdfCtx<'a> {
     auto: String,
-    images: Vec<Vec<u8>>,
+    /// Each image: raw bytes plus its package-native extension (`"png"`,
+    /// `"jpeg"`, …), so the `Pictures/imgN.<ext>` part, the `draw:image`
+    /// `xlink:href` and the `manifest.xml` media-type carry the real format.
+    images: Vec<(Vec<u8>, &'static str)>,
     /// Offset added to this context's local image indices when forming
-    /// `Pictures/imgN.png` names, so a secondary context (e.g. header/footer)
+    /// `Pictures/imgN.<ext>` names, so a secondary context (e.g. header/footer)
     /// does not collide with the body's images. Default `0`.
     image_base: usize,
     style_id: usize,
@@ -2581,8 +2740,13 @@ impl<'a> OdfCtx<'a> {
         self.style_id += 1;
         id
     }
-    fn resolve_image(&self, key: u64) -> Option<Vec<u8>> {
-        self.resources.images.get(&key).map(|r| r.bytes.clone())
+    /// Resolve an image blob by resource key, returning its bytes and the
+    /// package-native extension derived from the resource's format tag.
+    fn resolve_image(&self, key: u64) -> Option<(Vec<u8>, &'static str)> {
+        self.resources
+            .images
+            .get(&key)
+            .map(|r| (r.bytes.clone(), office_image_format(&r.format).1))
     }
 }
 
@@ -2868,17 +3032,17 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
 }
 
 fn odt_image_para(img: &ImageRef, ctx: &mut OdfCtx) -> String {
-    let png = ctx.resolve_image(img.resource).unwrap_or_default();
-    if png.is_empty() {
-        return "<text:p/>".to_string();
-    }
-    ctx.images.push(png);
+    let (bytes, ext) = match ctx.resolve_image(img.resource) {
+        Some(b) if !b.0.is_empty() => b,
+        _ => return "<text:p/>".to_string(),
+    };
+    ctx.images.push((bytes, ext));
     let n = ctx.image_base + ctx.images.len();
     // An inline image anchored as a character inside its own paragraph.
     format!(
         "<text:p><draw:frame draw:style-name=\"frInl\" text:anchor-type=\"as-char\" \
 svg:width=\"96pt\" svg:height=\"96pt\">\
-<draw:image xlink:href=\"Pictures/img{n}.png\" xlink:type=\"simple\" xlink:show=\"embed\" \
+<draw:image xlink:href=\"Pictures/img{n}.{ext}\" xlink:type=\"simple\" xlink:show=\"embed\" \
 xlink:actuate=\"onLoad\"/></draw:frame></text:p>"
     )
 }
@@ -3106,7 +3270,10 @@ fn odf_list_style(name: &str, list: &List) -> String {
     format!("<text:list-style style:name=\"{name}\">{levels}</text:list-style>")
 }
 
-fn odf_manifest(kind: &str, image_count: usize) -> String {
+/// ODF `META-INF/manifest.xml`. `image_exts[i]` is the package-native extension
+/// of `Pictures/img{i+1}.<ext>`; each picture is declared with that path and the
+/// matching `image/<ext>` media-type (ISO 26300 §2.2 / OpenDocument package).
+fn odf_manifest(kind: &str, image_exts: &[&str]) -> String {
     let media = match kind {
         "text" => "application/vnd.oasis.opendocument.text",
         "spreadsheet" => "application/vnd.oasis.opendocument.spreadsheet",
@@ -3121,9 +3288,10 @@ fn odf_manifest(kind: &str, image_count: usize) -> String {
 <manifest:file-entry manifest:full-path=\"styles.xml\" manifest:media-type=\"text/xml\"/>\
 <manifest:file-entry manifest:full-path=\"meta.xml\" manifest:media-type=\"text/xml\"/>"
     );
-    for i in 0..image_count {
+    for (i, ext) in image_exts.iter().enumerate() {
+        let mime = office_image_format(ext).0;
         s.push_str(&format!(
-            "<manifest:file-entry manifest:full-path=\"Pictures/img{}.png\" manifest:media-type=\"image/png\"/>",
+            "<manifest:file-entry manifest:full-path=\"Pictures/img{}.{ext}\" manifest:media-type=\"{mime}\"/>",
             i + 1
         ));
     }
@@ -3481,7 +3649,18 @@ fn ods_cell_from_model(
             span_attr.push_str(&format!(" table:number-rows-spanned=\"{rows}\""));
         }
     }
-    let attrs = format!("{style_attr}{span_attr}");
+    // The formula, in the ODF OpenFormula namespace (`of:=…`, ISO 26300 §9.1.6 /
+    // OpenFormula §3). The cached result stays in `office:value`/the `<text:p>`.
+    // The model strips the leading `=`; tolerate a stray one.
+    let formula_attr = match cell.formula.as_deref() {
+        Some(f) => {
+            let mut e = String::new();
+            esc(f.strip_prefix('=').unwrap_or(f), &mut e);
+            format!(" table:formula=\"of:={e}\"")
+        }
+        None => String::new(),
+    };
+    let attrs = format!("{style_attr}{span_attr}{formula_attr}");
     match &cell.value {
         CellValue::Empty => format!("<table:table-cell{attrs}/>"),
         CellValue::Number(n) => format!(
@@ -3533,9 +3712,40 @@ fn odp_body(slides: &[Slide], doc: &Document, ctx: &mut OdfCtx) -> String {
         for sh in &slide.shapes {
             odp_frame(sh, None, slide, doc, ctx, &mut body);
         }
+        // Speaker notes: a `presentation:notes` aside on the page (ISO 26300
+        // §9.1.5), carrying the notes text in a `presentation:class="notes"`
+        // frame. Emitted only when the slide has notes.
+        if let Some(notes) = &slide.notes {
+            odp_notes(notes, ctx, &mut body);
+        }
         body.push_str("</draw:page>");
     }
     body
+}
+
+/// Append a slide's `presentation:notes` block, rendering the notes blocks into
+/// a `presentation:class="notes"` text frame (ISO 26300 §9.1.5 / §9.6.1). The
+/// frame geometry uses the conventional ODF notes box on a portrait notes page.
+fn odp_notes(notes: &[Block], ctx: &mut OdfCtx, out: &mut String) {
+    let sid = ctx.next_style();
+    let sname = format!("Nt{sid}");
+    ctx.auto.push_str(&format!(
+        "<style:style style:name=\"{sname}\" style:family=\"graphic\">\
+<style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\" \
+draw:auto-grow-width=\"false\" draw:auto-grow-height=\"false\" fo:padding=\"0pt\" \
+draw:textarea-vertical-align=\"top\"/></style:style>"
+    ));
+    let mut content = String::new();
+    for p in blocks_to_paras(notes) {
+        content.push_str(&odt_paragraph(&p, "p", None, ctx));
+    }
+    out.push_str(&format!(
+        "<presentation:notes draw:style-name=\"dp1\">\
+<draw:frame draw:style-name=\"{sname}\" draw:layer=\"layout\" \
+presentation:class=\"notes\" \
+svg:x=\"68pt\" svg:y=\"390pt\" svg:width=\"480pt\" svg:height=\"230pt\">\
+<draw:text-box>{content}</draw:text-box></draw:frame></presentation:notes>"
+    ));
 }
 
 /// ODF `presentation:class` value for a placeholder [`PlaceholderRole`]
@@ -3584,16 +3794,16 @@ fn odp_frame(
     ));
     match &block.kind {
         BlockKind::Image(img) => {
-            let png = doc_image(doc, img.resource).unwrap_or_default();
-            if png.is_empty() {
-                return;
-            }
-            ctx.images.push(png);
+            let (bytes, ext) = match doc_image(doc, img.resource) {
+                Some(b) if !b.0.is_empty() => b,
+                _ => return,
+            };
+            ctx.images.push((bytes, ext));
             let n = ctx.images.len();
             out.push_str(&format!(
                 "<draw:frame draw:style-name=\"frI\" draw:layer=\"layout\"{pres} \
 svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">\
-<draw:image xlink:href=\"Pictures/img{n}.png\" xlink:type=\"simple\" xlink:show=\"embed\" \
+<draw:image xlink:href=\"Pictures/img{n}.{ext}\" xlink:type=\"simple\" xlink:show=\"embed\" \
 xlink:actuate=\"onLoad\"/></draw:frame>",
                 x = num(r.x),
                 y = num(r.y),
@@ -4019,9 +4229,13 @@ fn shape_to_placed(shape: &Shape) -> PlacedShape {
     }
 }
 
-/// Resolve an image blob by resource key from the document's resource table.
-fn doc_image(doc: &Document, key: u64) -> Option<Vec<u8>> {
-    doc.resources.images.get(&key).map(|r| r.bytes.clone())
+/// Resolve an image blob by resource key from the document's resource table,
+/// returning its bytes and the package-native extension for its format tag.
+fn doc_image(doc: &Document, key: u64) -> Option<(Vec<u8>, &'static str)> {
+    doc.resources
+        .images
+        .get(&key)
+        .map(|r| (r.bytes.clone(), office_image_format(&r.format).1))
 }
 
 // ════════════════════════════════ MARKDOWN ════════════════════════════════════
@@ -6644,6 +6858,126 @@ style:family=\"paragraph\""
         assert!(content.contains("Body text"));
     }
 
+    /// A one-slide deck carrying a title placeholder and speaker notes.
+    fn slide_doc_with_notes(notes_text: &str) -> Document {
+        use crate::model::{Placeholder, PlaceholderRole, Slide, SlideBlock};
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+            },
+            shapes: Vec::new(),
+            placeholders: vec![Placeholder {
+                role: PlaceholderRole::Title,
+                block: para("Slide title"),
+            }],
+            notes: Some(vec![para(notes_text)]),
+            background: None,
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pptx_from_model_emits_speaker_notes() {
+        let bytes = pptx_from_model(&slide_doc_with_notes("Remember to smile"));
+        let files = read_zip(&bytes);
+        // The notesSlide part exists and carries the notes text in a p:notes body.
+        let notes = String::from_utf8(
+            files
+                .get("ppt/notesSlides/notesSlide1.xml")
+                .expect("notesSlide part present")
+                .clone(),
+        )
+        .unwrap();
+        assert!(notes.contains("<p:notes"), "p:notes root: {notes}");
+        assert!(
+            notes.contains("<p:ph type=\"body\""),
+            "notes body placeholder: {notes}"
+        );
+        assert!(
+            notes.contains("Remember to smile"),
+            "notes text preserved: {notes}"
+        );
+        // Declared in [Content_Types].
+        let ct = String::from_utf8(files.get("[Content_Types].xml").unwrap().clone()).unwrap();
+        assert!(
+            ct.contains("/ppt/notesSlides/notesSlide1.xml")
+                && ct.contains("presentationml.notesSlide+xml"),
+            "notesSlide content-type override: {ct}"
+        );
+        // The slide → notesSlide relationship is wired, and the notesSlide back-
+        // references its slide.
+        let slide_rels = String::from_utf8(
+            files
+                .get("ppt/slides/_rels/slide1.xml.rels")
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            slide_rels.contains("relationships/notesSlide")
+                && slide_rels.contains("Target=\"../notesSlides/notesSlide1.xml\""),
+            "slide → notesSlide relationship: {slide_rels}"
+        );
+        let notes_rels = String::from_utf8(
+            files
+                .get("ppt/notesSlides/_rels/notesSlide1.xml.rels")
+                .expect("notesSlide rels present")
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            notes_rels.contains("Target=\"../slides/slide1.xml\""),
+            "notesSlide → slide back-reference: {notes_rels}"
+        );
+    }
+
+    #[test]
+    fn pptx_from_model_omits_notes_part_when_absent() {
+        // A slide without notes must not produce a notesSlide part or relationship.
+        let bytes = pptx_from_model(&slide_table_doc());
+        let files = read_zip(&bytes);
+        assert!(
+            !files.keys().any(|k| k.contains("notesSlide")),
+            "no notesSlide part for a note-less slide"
+        );
+        let ct = String::from_utf8(files.get("[Content_Types].xml").unwrap().clone()).unwrap();
+        assert!(!ct.contains("notesSlide"), "no notesSlide override: {ct}");
+    }
+
+    #[test]
+    fn odp_from_model_emits_speaker_notes() {
+        let bytes = odp_from_model(&slide_doc_with_notes("Speak slowly"));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<presentation:notes"),
+            "draw:page carries a presentation:notes aside: {content}"
+        );
+        assert!(
+            content.contains("presentation:class=\"notes\""),
+            "notes frame tagged with the notes class: {content}"
+        );
+        assert!(
+            content.contains("Speak slowly"),
+            "notes text preserved: {content}"
+        );
+    }
+
     /// A one-slide deck whose single shape is a 2×2 table (cells "R1C1".."R2C2").
     fn slide_table_doc() -> Document {
         use crate::model::{Slide, SlideBlock};
@@ -7108,6 +7442,85 @@ style:family=\"paragraph\""
         assert!(content.contains("<table:covered-table-cell/>"), "covered cell");
     }
 
+    /// A one-cell sheet carrying a formula and its cached numeric result.
+    fn formula_sheet(formula: &str) -> Sheet {
+        Sheet {
+            name: "F".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Number(30.0),
+                    formula: Some(formula.to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn xlsx_from_model_emits_cell_formula() {
+        // A formula cell must carry both `<f>` (the expression) and `<v>` (the
+        // cached result), and a stray leading `=` is stripped.
+        let xlsx = xlsx_from_model(&sheet_doc(formula_sheet("=SUM(A1:A2)")));
+        let sheet = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(
+            sheet.contains("<f>SUM(A1:A2)</f>"),
+            "formula emitted without the leading '=': {sheet}"
+        );
+        assert!(
+            sheet.contains("<f>SUM(A1:A2)</f><v>30</v>"),
+            "cached value follows the formula: {sheet}"
+        );
+        // The `<` in a comparison formula must be XML-escaped.
+        let cmp = xlsx_from_model(&sheet_doc(formula_sheet("IF(A1<2,1,0)")));
+        let cmp_sheet =
+            String::from_utf8(entry(&cmp, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(
+            cmp_sheet.contains("<f>IF(A1&lt;2,1,0)</f>"),
+            "formula metacharacters escaped: {cmp_sheet}"
+        );
+    }
+
+    #[test]
+    fn ods_from_model_emits_cell_formula() {
+        // The ODS cell must carry the formula in the OpenFormula namespace while
+        // keeping the cached `office:value`.
+        let ods = ods_from_model(&sheet_doc(formula_sheet("=SUM(A1:A2)")));
+        let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("table:formula=\"of:=SUM(A1:A2)\""),
+            "ODS formula in the of: namespace, '=' stripped/re-added: {content}"
+        );
+        assert!(
+            content.contains("office:value=\"30\""),
+            "cached value kept alongside the formula: {content}"
+        );
+    }
+
+    #[test]
+    fn round_trip_formula_survives_xlsx_and_ods() {
+        // Export a formula cell, re-import, and re-export both ways — the formula
+        // must survive every hop (the importer strips/normalises the `=`).
+        let xlsx = xlsx_from_model(&sheet_doc(formula_sheet("=SUM(A1:A2)")));
+        let model = crate::convert::office_import::xlsx_to_model(&read_zip(&xlsx));
+        let cell = &collect_sheets(&model)[0].rows[0].cells[0];
+        assert_eq!(
+            cell.formula.as_deref(),
+            Some("SUM(A1:A2)"),
+            "formula imported from XLSX"
+        );
+        // Re-export to ODS and back: still present.
+        let ods = ods_from_model(&model);
+        let back = crate::convert::office_import::ods_to_model(&read_zip(&ods));
+        assert_eq!(
+            collect_sheets(&back)[0].rows[0].cells[0].formula.as_deref(),
+            Some("SUM(A1:A2)"),
+            "formula survived XLSX → model → ODS → model"
+        );
+    }
+
     /// Build a one-page doc whose only block is the given list.
     fn list_doc(list: List) -> Document {
         Document {
@@ -7542,6 +7955,97 @@ style:family=\"paragraph\""
             "non-empty spine even for an empty model"
         );
         assert!(entry(&bytes, "OEBPS/text-1.xhtml").is_some());
+    }
+
+    /// A one-page document whose only block is a block-level image referencing a
+    /// resource of the given format tag (the bytes are opaque placeholders).
+    fn image_doc(format: &str) -> Document {
+        let mut resources = crate::model::ResourceTable::default();
+        resources.images.insert(
+            9,
+            crate::model::ImageResource {
+                bytes: vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3],
+                format: format.to_string(),
+            },
+        );
+        let img = Block {
+            kind: BlockKind::Image(ImageRef {
+                resource: 9,
+                alt: Some("photo".to_string()),
+            }),
+            ..Default::default()
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![img],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            resources,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn docx_export_honours_jpeg_image_format() {
+        // A JPEG resource must land in a `.jpeg` part with the matching
+        // content-type and relationship target — never a `.png` part.
+        let bytes = docx_from_model(&image_doc("jpeg"));
+        let files = read_zip(&bytes);
+        assert!(
+            files.contains_key("word/media/image1.jpeg"),
+            "JPEG embedded as a .jpeg part"
+        );
+        assert!(
+            !files.contains_key("word/media/image1.png"),
+            "no spurious .png part for a JPEG resource"
+        );
+        let ct = String::from_utf8(files.get("[Content_Types].xml").unwrap().clone()).unwrap();
+        assert!(
+            ct.contains("<Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>"),
+            "jpeg content-type declared: {ct}"
+        );
+        assert!(
+            !ct.contains("Extension=\"png\""),
+            "no png default when only a jpeg is present: {ct}"
+        );
+        let rels =
+            String::from_utf8(files.get("word/_rels/document.xml.rels").unwrap().clone()).unwrap();
+        assert!(
+            rels.contains("Target=\"media/image1.jpeg\""),
+            "relationship targets the .jpeg part: {rels}"
+        );
+    }
+
+    #[test]
+    fn odt_export_honours_jpeg_image_format() {
+        // The ODF path must mirror the format in the Pictures/ part name, the
+        // manifest media-type and the draw:image href.
+        let bytes = odt_from_model(&image_doc("jpeg"));
+        let files = read_zip(&bytes);
+        assert!(
+            files.contains_key("Pictures/img1.jpeg"),
+            "JPEG embedded as a .jpeg picture"
+        );
+        assert!(
+            !files.contains_key("Pictures/img1.png"),
+            "no spurious .png picture for a JPEG resource"
+        );
+        let manifest =
+            String::from_utf8(files.get("META-INF/manifest.xml").unwrap().clone()).unwrap();
+        assert!(
+            manifest.contains(
+                "manifest:full-path=\"Pictures/img1.jpeg\" manifest:media-type=\"image/jpeg\""
+            ),
+            "manifest declares the jpeg with its media-type: {manifest}"
+        );
+        let content = String::from_utf8(files.get("content.xml").unwrap().clone()).unwrap();
+        assert!(
+            content.contains("xlink:href=\"Pictures/img1.jpeg\""),
+            "draw:image references the .jpeg part: {content}"
+        );
     }
 
     // ───────────────────────────── Markdown ─────────────────────────────
