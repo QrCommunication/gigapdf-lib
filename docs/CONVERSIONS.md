@@ -111,7 +111,10 @@ genuinely structure-aware and strong on the engine's own output and clean
 single-column / ruled-table PDFs:
 
 **Recovered well (FULL):** text runs with font family/size/colour · paragraph
-grouping, alignment, super/sub · **run-level rotated / vertical in-page text**
+grouping, alignment, super/sub · **multi-column reading order** (2- and 3-column
+pages read column-by-column, not interleaved; robust to full-width
+headings/figures bridging the gutter — see the column note below) · **run-level
+rotated / vertical in-page text**
 (the baseline angle from the text/CTM matrix is carried onto the reconstructed
 block's rotation — `90°/180°/270°` snap to the exact cardinal, any other angle is
 preserved free-form, and upright text stays unrotated) · ruled tables (with
@@ -258,8 +261,19 @@ is never promoted.
   read for both simple fonts and Type0 fonts (via the descendant CIDFont).
   Content-stream **faux-bold** (render-mode 2 `Tr` fill+stroke / double-stroke) is
   still not detected at this layer.
-- **Columns**: whitespace-gutter detection only — a single wide line can collapse
-  two columns into one and scramble reading order.
+- **Columns**: multi-column detection is **robust to full-width lines**. Gutters
+  are projected from a *robust majority* of the lines, not a unanimous vote: a body
+  line far wider than the typical column line (and covering a real share of the
+  measure) — a cross-column heading, pull-quote, wide figure caption or stray run —
+  is set aside before the whitespace projection, so a *single* gutter-spanning line
+  no longer welds two columns into one and scrambles the reading order. Such
+  spanning lines (and explicit full-width banners) are folded back in **at their
+  Y** as region breaks: a heading above two columns reads first, then the left
+  column top→bottom, then the right; a mid-page spanning figure splits the column
+  flow around it — reading order is `[full-width pre] [col1] [col2] [full-width
+  post] …`, never interleaved. A genuinely sparse column (ordinary-width lines)
+  survives the split, and a true single-column page is never falsely split by
+  coincidental whitespace. Generalises to 2 and 3 columns.
 
 ---
 

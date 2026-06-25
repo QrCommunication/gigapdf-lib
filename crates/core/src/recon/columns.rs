@@ -1,26 +1,38 @@
 //! Stage 2 — **column detection & reading order**. A multi-column page (news,
 //! academic two-up) must be read column-by-column, not row-by-row, or the text
 //! interleaves into nonsense. We project the lines' horizontal extents onto the
-//! X axis, find the *vertical gutters* — bands of X with no body line covering
-//! them that split the content into columns — and order each column's lines
-//! top→bottom, left band first.
+//! X axis, find the *vertical gutters* — bands of X that almost no body line
+//! covers — and order each column's lines top→bottom, left band first.
 //!
-//! Two refinements over a naïve projection (epic #74, wave R7):
+//! Three refinements over a naïve projection (epic #74 wave R7, hardened for #5):
 //!
-//! 1. **Full-width lines are excluded from gutter detection.** A title, banner
-//!    or wide figure caption that spans both columns would otherwise bridge the
-//!    gutter in the merged X projection and collapse the page to a single
-//!    column — interleaving the two columns' body text. Such lines (covering
-//!    ≥ [`FULL_WIDTH_FRAC`] of the content width) are set aside, the gutters are
-//!    found from the *body* lines only, then the full-width lines are folded
-//!    back in **at their Y** as region separators: everything above a full-width
-//!    line is read (column-major) before the line, everything below after it. A
-//!    cross-column title is therefore read first, then the left column, then the
-//!    right.
-//! 2. **N columns, uneven fills.** The split generalises to any number of
-//!    gutters, and a column that holds only a line or two no longer collapses
-//!    the whole layout — the split stands as long as ≥ 2 bands are clearly
-//!    populated (see [`column_bands`]).
+//! 1. **Gutter detection tolerates gutter-spanning lines.** The fatal failure of
+//!    a plain whitespace projection is that *one* wide line crossing the gutter —
+//!    a heading, a pull-quote, a figure caption, a stray run — bridges the two
+//!    columns' X spans and collapses the page to a single column, interleaving
+//!    the bodies into garbage. So the gutter is taken from a **robust majority**
+//!    of the lines, not a unanimous vote: a body line far wider than the typical
+//!    column line (≥ `SPAN_WIDTH_MULT`× the median body width, and a real share of
+//!    the measure — `SPAN_MIN_WIDTH_FRAC`) is set aside as a probable spanner
+//!    *before* projecting, so a handful of wide lines no longer veto an otherwise
+//!    empty corridor. The gutter is then the empty band in a coverage
+//!    step-function over the *narrow* lines, located directly rather than by
+//!    merging intervals where a single bridge would weld two columns into one. A
+//!    genuinely sparse column keeps its ordinary-width lines, so it is never
+//!    mistaken for a gutter (see `column_bands`).
+//! 2. **Full-width and gutter-spanning lines become region breaks, not column
+//!    members.** A title/banner covering ≥ [`FULL_WIDTH_FRAC`] of the measure —
+//!    *and* any narrower body line that still straddles a detected gutter — is
+//!    folded back in **at its Y** as a separator: everything above it is read
+//!    (column-major) before it, everything below after it, and the line itself is
+//!    ranked **after every column of its region** (deterministically, not by the
+//!    accident of which band its centre lands in). A cross-column heading is
+//!    therefore read first, then the left column, then the right; a mid-page
+//!    spanning figure splits the column flow around it.
+//! 3. **N columns, uneven fills.** The split generalises to any number of
+//!    gutters, and a column that holds only a line or two no longer collapses the
+//!    whole layout — the split stands as long as ≥ 2 bands are clearly populated
+//!    (see [`column_bands`]).
 //!
 //! A gutter-free page (the overwhelmingly common case) yields a single column:
 //! the lines are returned in their existing top→bottom order, unchanged.
@@ -30,6 +42,28 @@ use super::lines::ReconLine;
 /// A line counts as **full width** (a title/banner spanning the measure, not a
 /// column body line) when it covers at least this fraction of the content width.
 const FULL_WIDTH_FRAC: f64 = 0.80;
+
+/// A body line is set aside as a probable **gutter spanner** (a heading,
+/// pull-quote, wide caption or stray run too narrow to be caught by
+/// [`FULL_WIDTH_FRAC`] yet still crossing the corridor) when it is at least this
+/// multiple of the *median body-line width* — and meaningfully wide in absolute
+/// terms (see [`SPAN_MIN_WIDTH_FRAC`]). Removing these before the gutter
+/// projection is what makes detection robust to the classic "one wide line
+/// bridges the gutter and collapses two columns into one" failure, **without**
+/// eroding a genuinely sparse column (whose lines are of ordinary width and so
+/// are kept). The spanners are folded back in as region separators afterwards.
+const SPAN_WIDTH_MULT: f64 = 1.8;
+
+/// Floor on a gutter spanner's width as a fraction of the content measure: a line
+/// barely wider than its neighbours on a narrow-bodied page is not a spanner. A
+/// spanner must cover a real share of the page to plausibly cross a gutter.
+const SPAN_MIN_WIDTH_FRAC: f64 = 0.45;
+
+/// A line is treated as **spanning** a gutter (hence a region break, not a column
+/// member) when it overlaps two or more bands by at least this many points each —
+/// a margin that ignores a glyph that merely grazes a boundary but catches any
+/// line genuinely straddling the corridor.
+const SPAN_MARGIN: f64 = 4.0;
 
 /// Produce the reading order of `lines` as a list of indices into `lines`.
 /// Single column ⇒ identity-ish (top→bottom). Multiple columns ⇒ region by
@@ -85,6 +119,40 @@ impl ColumnLayout {
         self.separators.iter().filter(|&&s| s > top_y).count()
     }
 
+    /// How many column bands the X interval `[x0, x1]` substantially overlaps
+    /// (each by ≥ [`SPAN_MARGIN`] points). A normal column line overlaps exactly
+    /// one band; a gutter-spanning line (a heading, a wide figure caption) two or
+    /// more — that is how a sub-full-width line is still recognised as a region
+    /// break rather than wrongly folded into one column.
+    fn bands_overlapped(&self, x0: f64, x1: f64) -> usize {
+        if self.bands.len() < 2 {
+            return 1;
+        }
+        let mut n = 0;
+        for w in self.bands.windows(2) {
+            let lo = x0.max(w[0]);
+            let hi = x1.min(w[1]);
+            if hi - lo >= SPAN_MARGIN {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Whether `line` acts as a **region separator**: a full-width title/banner
+    /// (≥ [`FULL_WIDTH_FRAC`] of the band span) *or* a narrower line that still
+    /// straddles a gutter (overlaps ≥ 2 bands). Only meaningful on a multi-column
+    /// page; on a single column nothing separates regions.
+    fn line_is_separator(&self, line: &ReconLine) -> bool {
+        if !self.is_multi_column() {
+            return false;
+        }
+        let span = (self.bands.last().copied().unwrap_or(0.0)
+            - self.bands.first().copied().unwrap_or(0.0))
+        .max(1.0);
+        line.w >= span * FULL_WIDTH_FRAC || self.bands_overlapped(line.x, line.x + line.w) >= 2
+    }
+
     /// A monotonic reading-order key for a placeable at `(center_x, top_y)`
     /// (PDF user space). Ordering is region-major, then band (column) left→right,
     /// then top→bottom within a column. A single-column page degenerates to pure
@@ -104,8 +172,26 @@ impl ColumnLayout {
         (region, band, OrderedF64(self.page_top - top_y))
     }
 
-    /// Order `lines` by [`rank`](ColumnLayout::rank). A stable sort over the
-    /// input indices: ties (same region, band and Y) keep input order.
+    /// The reading-order key for a whole **line**. Identical to
+    /// [`rank`](ColumnLayout::rank) for an ordinary column line, but a region
+    /// **separator** (a full-width or gutter-spanning line) is forced into a
+    /// sentinel band past every real column so it sorts *after* all columns of
+    /// its region — deterministically, instead of relying on the accident of
+    /// which band its centre happens to fall in.
+    fn line_rank(&self, line: &ReconLine) -> (usize, usize, OrderedF64) {
+        let (region, band, ydist) = self.rank(line.center_x(), line.top());
+        if self.line_is_separator(line) {
+            // `bands.len()` is one past the largest real band index, so a
+            // separator outranks every column of its region while keeping the
+            // region- and Y-ordering intact.
+            (region, self.bands.len(), ydist)
+        } else {
+            (region, band, ydist)
+        }
+    }
+
+    /// Order `lines` by [`line_rank`](ColumnLayout::line_rank). A stable sort over
+    /// the input indices: ties (same region, band and Y) keep input order.
     pub fn order_lines(&self, lines: &[ReconLine]) -> Vec<usize> {
         // Fast path: a gutter-free, separator-free page keeps the stage-1 order
         // (already top→bottom) with no work.
@@ -113,10 +199,7 @@ impl ColumnLayout {
             return (0..lines.len()).collect();
         }
         let mut idxs: Vec<usize> = (0..lines.len()).collect();
-        idxs.sort_by(|&a, &b| {
-            self.rank(lines[a].center_x(), lines[a].top())
-                .cmp(&self.rank(lines[b].center_x(), lines[b].top()))
-        });
+        idxs.sort_by(|&a, &b| self.line_rank(&lines[a]).cmp(&self.line_rank(&lines[b])));
         idxs
     }
 }
@@ -144,38 +227,48 @@ pub fn column_layout(lines: &[ReconLine]) -> ColumnLayout {
         .map(|l| l.top())
         .fold(f64::NEG_INFINITY, f64::max);
 
-    // Full-width lines (titles/banners) are set aside: they must neither bridge
-    // the gutter in the body projection nor be assigned to one column. The rest
-    // are the body lines the gutters are found from.
+    // Full-width lines (titles/banners) are set aside up front: they must neither
+    // dominate the gutter projection nor be assigned to one column. The remaining
+    // *body* lines are what the gutters are found from — but, crucially, body
+    // lines that still straddle the gutter are now **tolerated** by the detector
+    // (a robust majority, not a unanimous vote) rather than collapsing it.
     let is_full_width = |l: &ReconLine| l.w >= content_w * FULL_WIDTH_FRAC;
     let body: Vec<&ReconLine> = lines.iter().filter(|l| !is_full_width(l)).collect();
 
     let bands = column_bands(&body, content_lo, content_hi);
 
-    // Separators are the full-width lines' top edges — but only meaningful when
-    // the body actually splits into columns. On a single-column page a wide line
-    // is just a wide paragraph line; introducing a region break there would be a
-    // no-op for ordering anyway (band is forced to 0), so we still record them
-    // for rank stability, costing nothing.
+    // Build the provisional layout so separator classification can use the final
+    // band edges (a separator is a full-width *or* a gutter-spanning line, and the
+    // latter can only be known once the bands exist).
+    let mut layout = ColumnLayout {
+        bands,
+        separators: Vec::new(),
+        page_top,
+    };
+
+    // Region separators: every line that acts as a full-width banner or that
+    // straddles a detected gutter, recorded at its top edge. Only meaningful when
+    // the body actually split into columns — `line_is_separator` returns `false`
+    // for a single-column page, so a wide paragraph line on a one-column page is
+    // not turned into a spurious region break.
     let mut separators: Vec<f64> = lines
         .iter()
-        .filter(|l| is_full_width(l))
+        .filter(|l| layout.line_is_separator(l))
         .map(|l| l.top())
         .collect();
     separators.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
+    separators.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+    layout.separators = separators;
 
-    ColumnLayout {
-        bands,
-        separators,
-        page_top,
-    }
+    layout
 }
 
-/// Split the body's X span into column bands by finding gutters: gaps in the
-/// union of the body lines' X intervals wide enough to be real column
-/// separators rather than inter-word spacing. `content_lo`/`content_hi` bound
-/// the page measure so the outer bands reach the page edges even when the body
-/// stops short.
+/// Split the body's X span into column bands by finding gutters: vertical bands
+/// that **almost no** body line covers — wide enough to be real column
+/// separators rather than inter-word spacing — using a robust-majority test so a
+/// few gutter-spanning lines do not weld two columns into one.
+/// `content_lo`/`content_hi` bound the page measure so the outer bands reach the
+/// page edges even when the body stops short.
 ///
 /// Returns the column **edges** (ascending): `[lo, b1, b2, …, hi]` with
 /// `edges.len() - 1` columns. A single column yields `[lo, hi]`.
@@ -192,33 +285,74 @@ fn column_bands(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f6
     let h_med = super::median(&mut heights, 10.0);
     let min_gutter = (h_med * 2.0).max(18.0);
 
-    // Merge the body lines' X intervals; gaps between merged blocks are
-    // candidate gutters.
-    let mut intervals: Vec<(f64, f64)> = body.iter().map(|l| (l.x, l.x + l.w)).collect();
-    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
-    let mut merged: Vec<(f64, f64)> = Vec::new();
-    for (s, e) in intervals {
-        if let Some(last) = merged.last_mut() {
-            if s <= last.1 {
-                last.1 = last.1.max(e);
-                continue;
+    // Robustness to gutter-spanning lines: a body line far wider than the typical
+    // column line (and a real share of the measure) is a probable spanner — a
+    // heading or pull-quote too narrow for [`FULL_WIDTH_FRAC`] yet still crossing
+    // the corridor. Project gutters from the *narrow* lines only, so one such line
+    // can no longer weld two columns into one. A genuinely sparse column keeps its
+    // ordinary-width lines and therefore still registers as ink between gutters.
+    let content_w = (content_hi - content_lo).max(1.0);
+    let mut widths: Vec<f64> = body.iter().map(|l| l.w.max(1.0)).collect();
+    let w_med = super::median(&mut widths, content_w);
+    let span_w = (w_med * SPAN_WIDTH_MULT).max(content_w * SPAN_MIN_WIDTH_FRAC);
+    let narrow: Vec<&&ReconLine> = body.iter().filter(|l| l.w < span_w).collect();
+    // If filtering would leave too little to judge a gutter, fall back to the full
+    // body (the page is probably all wide lines = single column anyway).
+    let proj: &[&&ReconLine] = if narrow.len() >= 2 { &narrow } else { &[] };
+    let proj_lines: Vec<&ReconLine> = if proj.is_empty() {
+        body.to_vec()
+    } else {
+        proj.iter().map(|l| **l).collect()
+    };
+
+    // Coverage step-function over X: +1 at each projection line's left edge, −1 at
+    // its right edge. Sweeping the sorted events yields, for every X segment
+    // between consecutive event positions, how many lines cover it. A gutter is a
+    // maximal **empty** run (coverage 0) interior to the ink span; spanners having
+    // been removed, an empty corridor is no longer bridged by a single wide line.
+    let mut events: Vec<(f64, i32)> = Vec::with_capacity(proj_lines.len() * 2);
+    for l in &proj_lines {
+        events.push((l.x, 1));
+        events.push((l.x + l.w, -1));
+    }
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
+
+    let ink_lo = proj_lines.iter().map(|l| l.x).fold(f64::INFINITY, f64::min);
+    let ink_hi = proj_lines
+        .iter()
+        .map(|l| l.x + l.w)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let page_lo = ink_lo.min(content_lo);
+    let page_hi = ink_hi.max(content_hi);
+
+    // Walk the segments, accumulating coverage, and grow a maximal empty run
+    // (coverage 0) until ink resumes. An empty run strictly *interior* to the ink
+    // span (content on both sides) and at least `min_gutter` wide is a gutter; its
+    // midpoint is the column boundary. The leading/trailing empty runs (page
+    // margins) are not interior, so they never become gutters.
+    let mut boundaries: Vec<f64> = Vec::new();
+    let mut coverage: i32 = 0;
+    let mut gutter_start: Option<f64> = None;
+    for w in events.windows(2) {
+        coverage += w[0].1;
+        let seg_lo = w[0].0;
+        if coverage == 0 {
+            // Start (or continue) an empty run at the first empty segment that is
+            // interior — i.e. begins at or after the first ink position.
+            if gutter_start.is_none() && seg_lo >= ink_lo {
+                gutter_start = Some(seg_lo);
+            }
+        } else if let Some(start) = gutter_start.take() {
+            // Ink resumed: close the run at this segment's start. Interior by
+            // construction (ink follows), so test only its width.
+            if seg_lo - start >= min_gutter {
+                boundaries.push((start + seg_lo) / 2.0);
             }
         }
-        merged.push((s, e));
+        // A run still open at the final event runs into the trailing margin (no
+        // ink to the right) and is therefore not a gutter.
     }
 
-    let page_lo = merged.first().map(|m| m.0).unwrap_or(content_lo).min(content_lo);
-    let page_hi = merged.last().map(|m| m.1).unwrap_or(content_hi).max(content_hi);
-
-    // Each gap between merged blocks wider than `min_gutter` is a column
-    // boundary; bands are the spans between consecutive boundaries.
-    let mut boundaries: Vec<f64> = Vec::new();
-    for w in merged.windows(2) {
-        let gap = w[1].0 - w[0].1;
-        if gap >= min_gutter {
-            boundaries.push((w[0].1 + w[1].0) / 2.0);
-        }
-    }
     if boundaries.is_empty() {
         return vec![page_lo, page_hi];
     }
@@ -228,9 +362,12 @@ fn column_bands(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f6
     edges.push(page_hi);
 
     // A reliable multi-column layout needs at least two **clearly populated**
-    // columns (≥ 2 body lines each). A single straggler band must not fabricate
-    // a column, but a genuine N-column page with one sparse column must survive,
-    // so we gate on the *count* of well-populated bands, not on every band.
+    // columns (≥ 2 body lines centred in them). A single straggler band must not
+    // fabricate a column, but a genuine N-column page with one sparse column must
+    // survive, so we gate on the *count* of well-populated bands, not on every
+    // band. Gutter-spanning lines are centred near a boundary; whichever band
+    // their centre lands in, the gate still needs two *other* lines per surviving
+    // column, so an outlier cannot prop up a column on its own.
     let populated = |lo: f64, hi: f64| {
         body.iter()
             .filter(|l| {
@@ -487,5 +624,104 @@ mod tests {
         let title = lines.iter().find(|l| l.text() == "TITLE").unwrap();
         let title_rank = layout.rank(title.center_x(), title.top());
         assert!(title_rank < shape_rank, "the title is read before the shape");
+    }
+
+    #[test]
+    fn sub_full_width_heading_bridging_gutter_keeps_two_columns() {
+        // The regression this issue targets: a heading that bridges the gutter but
+        // is **not** wide enough to trip `FULL_WIDTH_FRAC` (here 290 pt over a
+        // 408 pt measure ≈ 0.71 < 0.80). A naïve projection merges the left and
+        // right column X spans through it and collapses the page to one column,
+        // interleaving the bodies. Robust detection sets the wide bridge aside,
+        // keeps the gutter, reads the heading first, then the whole left column
+        // top→bottom, then the whole right column — never interleaved.
+        let runs = vec![
+            // Heading bridges columns (x 72 → 362, width 290) above everything.
+            run_w("HEADING", 72.0, 740.0, 290.0),
+            // Left column x=72 w=120 ([72,192]); right column x=360 w=120
+            // ([360,480]); staggered baselines so each run stays its own line.
+            run_w("left one", 72.0, 700.0, 120.0),
+            run_w("right one", 360.0, 690.0, 120.0),
+            run_w("left two", 72.0, 680.0, 120.0),
+            run_w("right two", 360.0, 670.0, 120.0),
+            run_w("left three", 72.0, 660.0, 120.0),
+            run_w("right three", 360.0, 650.0, 120.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let layout = column_layout(&lines);
+        assert!(
+            layout.is_multi_column(),
+            "the sub-full-width bridge must not collapse the two columns"
+        );
+        let order = reading_order(&lines);
+        let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
+        assert_eq!(
+            ordered,
+            vec![
+                "HEADING",
+                "left one",
+                "left two",
+                "left three",
+                "right one",
+                "right two",
+                "right three",
+            ],
+        );
+    }
+
+    #[test]
+    fn genuine_single_column_with_one_wide_line_stays_single() {
+        // A one-column page whose lines vary in width (a wide line among narrower
+        // ones — a long paragraph line, a sub-heading). There is no gutter at all,
+        // so the page must stay single column and keep its top→bottom order; the
+        // wide line must not be mistaken for a column separator that reorders the
+        // flow.
+        let runs = vec![
+            run_w("a normal body line", 72.0, 700.0, 300.0),
+            run_w("a much wider full paragraph line here", 72.0, 680.0, 430.0),
+            run_w("another body line", 72.0, 660.0, 280.0),
+            run_w("short", 72.0, 640.0, 90.0),
+            run_w("final body line", 72.0, 620.0, 260.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let layout = column_layout(&lines);
+        assert!(
+            !layout.is_multi_column(),
+            "no gutter exists, so the page must stay single column"
+        );
+        let order = reading_order(&lines);
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn mid_page_spanning_figure_splits_the_column_flow() {
+        // Two-column body interrupted by a wide figure caption that straddles the
+        // gutter halfway down (again sub-`FULL_WIDTH_FRAC`: 290 pt of a 408 pt
+        // measure). The flow must split around it: top block's left then right
+        // column, then the figure, then the bottom block's left then right column —
+        // not one interleaved stream.
+        let runs = vec![
+            // Top region, two columns.
+            run_w("topL1", 72.0, 760.0, 120.0),
+            run_w("topR1", 360.0, 745.0, 120.0),
+            run_w("topL2", 72.0, 730.0, 120.0),
+            run_w("topR2", 360.0, 715.0, 120.0),
+            // Wide figure caption bridging the gutter mid-page (x 72 → 362).
+            run_w("FIGURE", 72.0, 690.0, 290.0),
+            // Bottom region, two columns.
+            run_w("botL1", 72.0, 660.0, 120.0),
+            run_w("botR1", 360.0, 645.0, 120.0),
+            run_w("botL2", 72.0, 630.0, 120.0),
+            run_w("botR2", 360.0, 615.0, 120.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let layout = column_layout(&lines);
+        assert!(layout.is_multi_column(), "the body splits into two columns");
+        let order = reading_order(&lines);
+        let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
+        assert_eq!(
+            ordered,
+            vec!["topL1", "topL2", "topR1", "topR2", "FIGURE", "botL1", "botL2", "botR1", "botR2",],
+        );
     }
 }
