@@ -938,7 +938,9 @@ fn decode_halftone_region_segment(header: &SegmentHeader, data: &[u8], state: &m
 
 /// Decode the grayscale image of a halftone region (§C.5): `bitplanes` planes,
 /// each a `width × height` generic region, combined as a Gray code into per-cell
-/// integer values. Plane `bitplanes-1` (the MSB) is decoded first.
+/// integer values. Plane `bitplanes-1` (the MSB) is decoded first. Both the
+/// arithmetic (one shared MQ decoder) and MMR (one shared, bit-continuous G4
+/// bitstream) variants decode all `HBPP` planes.
 fn decode_grayscale_image(
     data: &[u8],
     width: usize,
@@ -958,19 +960,27 @@ fn decode_grayscale_image(
     let mut planes: Vec<Bitmap> = Vec::with_capacity(bitplanes as usize);
     if mmr {
         // MMR grayscale: the bitplanes form one continuous MMR bitstream shared
-        // across planes (§C.5). The shared CCITT MMR core is byte-granular here
-        // and does not expose continuation across planes, so the single-bitplane
-        // case (HBPP == 1, the common 2-pattern halftone) is decoded exactly from
-        // the stream; for the rarer multi-plane MMR case only the first plane is
-        // recovered (the remaining planes default to 0) rather than misdecoding.
-        let rows = crate::filters::ccitt::mmr_decode_bitmap(data, width, height);
-        let first = bitmap_from_rows(&rows, width, height);
-        for i in 0..bitplanes as usize {
-            if i == bitplanes as usize - 1 {
-                planes.push(first.clone());
-            } else {
-                planes.push(Bitmap::new(width, height));
+        // across planes (§C.5) — the MSB plane first, each subsequent plane
+        // resuming from the **same** bit position (there is no byte realignment
+        // between planes). The resumable CCITT MMR core decodes one plane and
+        // returns the continuing bit offset, so all `HBPP` planes are recovered
+        // (not just the first); `skip` cells are masked to 0 after decode.
+        let mut bit_pos = 0usize;
+        for _ in 0..bitplanes {
+            let (rows, next) =
+                crate::filters::ccitt::mmr_decode_bitmap_resumable(data, width, height, bit_pos);
+            bit_pos = next;
+            let mut plane = bitmap_from_rows(&rows, width, height);
+            if let Some(s) = skip {
+                for y in 0..height {
+                    for x in 0..width {
+                        if s.get(x as i64, y as i64) {
+                            plane.set(x, y, false);
+                        }
+                    }
+                }
             }
+            planes.push(plane);
         }
         planes.reverse(); // decoded MSB first → reverse so plane[0] is LSB
     } else {
@@ -1383,6 +1393,278 @@ fn decode_refagg_symbol(
     }
 }
 
+/// Decode one refinement/aggregate-coded symbol of a **Huffman** symbol
+/// dictionary (§6.5.8.2 with SDHUFF = 1) — the Huffman counterpart of
+/// [`decode_refagg_symbol`]. `r` is the shared Huffman bitstream; `agg_table` is
+/// SDHUFFAGGINST (REFAGGNINST); `rdx`/`rdy`/`rsize` are the standard refinement
+/// tables (B.15/B.15/B.1). The refinement bitmap itself is MQ-arithmetic-coded,
+/// byte-aligned within the stream (RSIZE/BMSIZE bytes), exactly as in the Huffman
+/// text-region refinement path.
+#[allow(clippy::too_many_arguments)]
+fn decode_refagg_symbol_huffman(
+    r: &mut BitReader,
+    width: usize,
+    height: usize,
+    input_symbols: &[Bitmap],
+    new_symbols: &[Bitmap],
+    params: &SymbolDictParams,
+    sym_code_len: u32,
+    agg_table: &HuffTableRef,
+    rdx_table: &HuffTable,
+    rdy_table: &HuffTable,
+    rsize_table: &HuffTable,
+    gr_cx: &mut [ArithContext],
+) -> Option<Bitmap> {
+    let ninst = match agg_table.decode(r)? {
+        HuffResult::Value(v) if v > 0 => v as usize,
+        _ => 1,
+    };
+    // The reference symbol set is input ++ new-so-far.
+    let refs: Vec<&Bitmap> = input_symbols.iter().chain(new_symbols.iter()).collect();
+
+    if ninst == 1 {
+        // Single-symbol refinement (§6.5.8.2.2, Huffman variant): the symbol-ID is
+        // a fixed-length code (SBSYMCODELEN bits), then RDX/RDY (B.15) and BMSIZE
+        // (B.1); the refinement region is MQ-coded and byte-aligned.
+        let id = r.bits(sym_code_len)? as usize;
+        let rdx = match rdx_table.decode(r)? {
+            HuffResult::Value(v) => v as i64,
+            HuffResult::Oob => 0,
+        };
+        let rdy = match rdy_table.decode(r)? {
+            HuffResult::Value(v) => v as i64,
+            HuffResult::Oob => 0,
+        };
+        let bmsize = match rsize_table.decode(r)? {
+            HuffResult::Value(v) if v >= 0 => v as usize,
+            _ => 0,
+        };
+        r.byte_align();
+        let blank = Bitmap::new(width, height);
+        let reference = refs.get(id).copied().unwrap_or(&blank);
+        let start = r.byte_pos();
+        let mut mqd = MqDecoder::new(&r.data()[start..]);
+        let refined = decode_refinement_bitmap(
+            &mut mqd,
+            width,
+            height,
+            reference,
+            rdx,
+            rdy,
+            params.rtemplate,
+            false,
+            &params.rat,
+            gr_cx,
+        );
+        // Skip the consumed refinement bytes (BMSIZE) when provided so the next
+        // symbol's Huffman codes start at the right place.
+        if bmsize > 0 {
+            for _ in 0..(bmsize * 8) {
+                let _ = r.bit();
+            }
+        }
+        Some(refined)
+    } else {
+        // Aggregate (§6.5.8.2.1, Huffman variant): a Huffman text region over the
+        // reference symbols renders the new symbol. Standard tables: FS=B.6,
+        // DS=B.8, DT=B.11, RDW/RDH/RDX/RDY=B.15, RSIZE=B.1; the symbol-ID table is
+        // the run-code-built table read from the shared stream.
+        let fs_table = huff::standard_table(6)?;
+        let ds_table = huff::standard_table(8)?;
+        let dt_table = huff::standard_table(11)?;
+        let rdw_table = huff::standard_table(15)?;
+        let rdh_table = huff::standard_table(15)?;
+        let id_table = huff::build_symbol_id_table(r, refs.len())?;
+        let tparams = TextRegionParams {
+            width,
+            height,
+            num_instances: ninst as u32,
+            strips: 1,
+            ref_corner: 1, // TOPLEFT
+            transposed: false,
+            comb_op: 0,
+            ds_offset: 0,
+            refine: true,
+            rtemplate: params.rtemplate,
+            rat: params.rat,
+            log_strips: 0,
+        };
+        Some(decode_aggregate_text_region_huffman(
+            r,
+            &refs,
+            &tparams,
+            &id_table,
+            &fs_table,
+            &ds_table,
+            &dt_table,
+            &rdw_table,
+            &rdh_table,
+            rdx_table,
+            rdy_table,
+            rsize_table,
+            gr_cx,
+        ))
+    }
+}
+
+/// Render an aggregate text region (§6.4 / §6.5.8.2.1) from a **Huffman**
+/// bitstream `r` already positioned at the strip data, using the supplied
+/// standard tables. Mirrors the placement loop of [`decode_text_region_huffman`]
+/// but operates on the shared symbol-dictionary reader (no per-segment table
+/// selection). Per-symbol refinement is always honoured (REFINE = 1 in the
+/// aggregate case).
+#[allow(clippy::too_many_arguments)]
+fn decode_aggregate_text_region_huffman(
+    r: &mut BitReader,
+    symbols: &[&Bitmap],
+    params: &TextRegionParams,
+    id_table: &HuffTable,
+    fs_table: &HuffTable,
+    ds_table: &HuffTable,
+    dt_table: &HuffTable,
+    rdw_table: &HuffTable,
+    rdh_table: &HuffTable,
+    rdx_table: &HuffTable,
+    rdy_table: &HuffTable,
+    rsize_table: &HuffTable,
+    gr_cx: &mut [ArithContext],
+) -> Bitmap {
+    let strips = params.strips.max(1) as i64;
+    let mut region = Bitmap::new(params.width, params.height);
+    let num_instances = params.num_instances;
+
+    let dec = |t: &HuffTable, r: &mut BitReader| -> Option<i64> {
+        match t.decode(r)? {
+            HuffResult::Value(v) => Some(v as i64),
+            HuffResult::Oob => None,
+        }
+    };
+
+    // Initial STRIPT.
+    let mut stript: i64 = dec(dt_table, r).map(|v| -v * strips).unwrap_or(0);
+    let mut first_s: i64 = 0;
+    let mut inst: u32 = 0;
+    let mut guard = 0usize;
+    let guard_max = (num_instances as usize + 64) * 4 + 1024;
+
+    while inst < num_instances {
+        guard += 1;
+        if guard > guard_max {
+            break;
+        }
+        let Some(dt) = dec(dt_table, r) else { break };
+        stript += dt * strips;
+        let Some(dfs) = dec(fs_table, r) else { break };
+        first_s += dfs;
+        let mut cur_s = first_s;
+        let mut first_in_strip = true;
+
+        loop {
+            if inst >= num_instances {
+                break;
+            }
+            if !first_in_strip {
+                match ds_table.decode(r) {
+                    Some(HuffResult::Value(ids)) => {
+                        cur_s += ids as i64 + params.ds_offset as i64;
+                    }
+                    _ => break, // OOB / underflow ends the strip
+                }
+            }
+            first_in_strip = false;
+
+            let curt = if strips == 1 {
+                0
+            } else {
+                match r.bits(params.log_strips) {
+                    Some(v) => v as i64,
+                    None => break,
+                }
+            };
+            let t = stript + curt;
+
+            let id = match id_table.decode(r) {
+                Some(HuffResult::Value(v)) if v >= 0 => v as usize,
+                _ => break,
+            };
+            guard += 1;
+            if guard > guard_max {
+                break;
+            }
+            let Some(&sym) = symbols.get(id) else {
+                inst += 1;
+                continue;
+            };
+
+            // Per-symbol refinement (§6.4.11) — Huffman variant.
+            let refined_owned: Option<Bitmap> = if params.refine {
+                let ri = match r.bit() {
+                    Some(b) => b as i32,
+                    None => break,
+                };
+                if ri != 0 {
+                    let rdw = dec(rdw_table, r).unwrap_or(0);
+                    let rdh = dec(rdh_table, r).unwrap_or(0);
+                    let rdx = dec(rdx_table, r).unwrap_or(0);
+                    let rdy = dec(rdy_table, r).unwrap_or(0);
+                    let rsize = match rsize_table.decode(r) {
+                        Some(HuffResult::Value(v)) if v >= 0 => v as usize,
+                        _ => 0,
+                    };
+                    r.byte_align();
+                    let nw = (sym.width as i64 + rdw).max(1) as usize;
+                    let nh = (sym.height as i64 + rdh).max(1) as usize;
+                    let gdx = (rdw >> 1) + rdx;
+                    let gdy = (rdh >> 1) + rdy;
+                    let start = r.byte_pos();
+                    let mut mqd = MqDecoder::new(&r.data()[start..]);
+                    let refined = decode_refinement_bitmap(
+                        &mut mqd,
+                        nw,
+                        nh,
+                        sym,
+                        gdx,
+                        gdy,
+                        params.rtemplate,
+                        false,
+                        &params.rat,
+                        gr_cx,
+                    );
+                    if rsize > 0 {
+                        for _ in 0..(rsize * 8) {
+                            let _ = r.bit();
+                        }
+                    }
+                    Some(refined)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let place = refined_owned.as_ref().unwrap_or(sym);
+            place_symbol(
+                &mut region,
+                place,
+                cur_s,
+                t,
+                params.ref_corner,
+                params.transposed,
+                params.comb_op,
+            );
+            let adv = if params.transposed {
+                place.height as i64
+            } else {
+                place.width as i64
+            };
+            cur_s += adv.saturating_sub(1);
+            inst += 1;
+        }
+    }
+    region
+}
+
 /// `ceil(log2(n))` for `n >= 1` (the JBIG2 symbol-ID / gray code length helper).
 fn ceil_log2(n: usize) -> u32 {
     let mut bits = 0u32;
@@ -1450,7 +1732,9 @@ impl HuffTableRef<'_> {
 
 /// The Huffman symbol-dictionary decode path (§6.5.8.1 / §6.5.9). Height-class
 /// symbols are read as a collective bitmap (uncompressed or MMR), split by their
-/// Huffman-decoded widths; export flags use the standard table B.1.
+/// Huffman-decoded widths; export flags use the standard table B.1. When SDREFAGG
+/// is set each symbol is instead refinement/aggregate-coded individually
+/// (§6.5.8.2) via [`decode_refagg_symbol_huffman`].
 fn decode_symbol_dictionary_huffman(
     header: &SegmentHeader,
     data: &[u8],
@@ -1458,25 +1742,31 @@ fn decode_symbol_dictionary_huffman(
     input_symbols: Vec<Bitmap>,
     params: &SymbolDictParams,
 ) -> Option<Vec<Bitmap>> {
-    // REFAGG combined with Huffman is exceedingly rare and needs Huffman-coded
-    // refinement deltas; the common Huffman SD is non-REFAGG. Skip the REFAGG
-    // Huffman case rather than misdecode.
-    if params.sdrefagg {
-        return None;
-    }
     let customs = referred_custom_tables(header, state);
     let mut cidx = 0usize;
     let dh_table = select_table(params.huff_dh_sel, 4, 5, &customs, &mut cidx)?;
     let dw_table = select_table(params.huff_dw_sel, 2, 3, &customs, &mut cidx)?;
     let bmsize_table = select_table(params.huff_bmsize_sel, 1, 1, &customs, &mut cidx)?;
-    // SDHUFFAGGINST table is consumed only for REFAGG (skipped above); still
+    // SDHUFFAGGINST selects the REFAGGNINST table (used only when SDREFAGG); still
     // advance the custom index if it selects a custom table to keep alignment.
-    let _agg_table = select_table(params.huff_agg_sel, 1, 1, &customs, &mut cidx);
+    let agg_table = select_table(params.huff_agg_sel, 1, 1, &customs, &mut cidx)?;
+
+    // For the SDREFAGG single-symbol refinement / aggregate decode (§6.5.8.2 with
+    // SDHUFF), the refinement deltas and bitmap size use the *standard* tables
+    // (B.15 for RDX/RDY, B.1 for RSIZE) — the SD flags carry no selectors for
+    // them — and the symbol-ID code length is fixed at ceil(log2(total syms)).
+    let total_syms = input_symbols.len() + params.num_new as usize;
+    let sym_code_len = ceil_log2(total_syms.max(1)).max(1);
+    let rdx_table = huff::standard_table(15)?;
+    let rdy_table = huff::standard_table(15)?;
+    let rsize_table = huff::standard_table(1)?;
 
     let num_new = params.num_new;
     let num_ex = params.num_ex;
     let mut r = BitReader::new(data);
     let mut new_symbols: Vec<Bitmap> = Vec::with_capacity(num_new as usize);
+    // Refinement contexts persist across all REFAGG symbols (§6.5.8.2.2).
+    let mut gr_cx = vec![ArithContext::default(); 1 << 13];
     let mut hc_height: i64 = 0;
 
     while (new_symbols.len() as u32) < num_new {
@@ -1488,6 +1778,44 @@ fn decode_symbol_dictionary_huffman(
         if hc_height <= 0 || hc_height > (1 << 20) {
             return None;
         }
+
+        if params.sdrefagg {
+            // REFAGG height class (§6.5.8.2): each symbol is refinement/aggregate
+            // coded individually. Read its DW (OOB ends the class), then decode
+            // its bitmap directly (no collective bitmap, no BMSIZE-per-class).
+            let mut sym_width: i64 = 0;
+            loop {
+                match dw_table.decode(&mut r)? {
+                    HuffResult::Oob => break,
+                    HuffResult::Value(dw) => {
+                        sym_width += dw as i64;
+                        if sym_width <= 0 || sym_width > (1 << 20) {
+                            return None;
+                        }
+                        if (new_symbols.len() as u32) >= num_new {
+                            break;
+                        }
+                        let bm = decode_refagg_symbol_huffman(
+                            &mut r,
+                            sym_width as usize,
+                            hc_height as usize,
+                            &input_symbols,
+                            &new_symbols,
+                            params,
+                            sym_code_len,
+                            &agg_table,
+                            &rdx_table,
+                            &rdy_table,
+                            &rsize_table,
+                            &mut gr_cx,
+                        )?;
+                        new_symbols.push(bm);
+                    }
+                }
+            }
+            continue;
+        }
+
         // Collect this height class's symbol widths.
         let mut widths: Vec<usize> = Vec::new();
         let mut sym_width: i64 = 0;
@@ -2521,6 +2849,71 @@ mod tests {
         }
     }
 
+    /// MMR (HMMR = 1) halftone region with **two** grayscale bitplanes (HBPP = 2).
+    /// The §C.5 grayscale image is encoded as two Gray-code planes packed into one
+    /// continuous Group-4 MMR bitstream (no byte realignment between planes); the
+    /// decoder must resume the second plane from the bit position the first left
+    /// off (the resumable MMR core) and recover BOTH planes, not just the first.
+    /// A 4×4 cell grid selecting all four patterns 0..=3 round-trips pixel-exact —
+    /// proof that the multi-bitplane MMR path (previously only first-plane) works.
+    #[test]
+    fn mmr_multibitplane_halftone_region_roundtrip() {
+        // Four distinct 2×2 patterns (gray values 0..=3 → HBPP = 2).
+        let patterns: Vec<Vec<Vec<bool>>> = vec![
+            vec![vec![false, false], vec![false, false]], // 0
+            vec![vec![true, false], vec![false, true]],   // 1
+            vec![vec![false, true], vec![true, false]],   // 2
+            vec![vec![true, true], vec![true, true]],     // 3
+        ];
+        // A 4×4 grid mixing all four gray values so BOTH Gray-code bitplanes carry
+        // non-trivial content (the MSB plane = value bit 1, the LSB-derived plane
+        // = value bit 0 XOR bit 1). If only the first (MSB) plane were recovered
+        // the low bit would be lost and cells 1↔2 / 0↔3 would be confused.
+        let gray = vec![
+            vec![0u32, 1, 2, 3],
+            vec![3, 2, 1, 0],
+            vec![1, 3, 0, 2],
+            vec![2, 0, 3, 1],
+        ];
+        let hbpp = 2u32;
+
+        let pd_data = build_pattern_dict(&patterns, 2, 2);
+        // Grid origin (0,0); HRX=512 (=2px per column), HRY=0 (y = m*2). Region is
+        // 8×8 so the 4×4 grid of 2×2 cells tiles it exactly.
+        let ht_data = build_halftone_region_mmr(8, 8, &gray, hbpp, 0, 0, 512, 0);
+
+        let mut s: Vec<u8> = Vec::new();
+        push_segment(&mut s, 0, 48, &[], page_info_bytes(8, 8));
+        push_segment(&mut s, 1, 16, &[], pd_data); // pattern dictionary
+        push_segment(&mut s, 2, 22, &[1], ht_data); // immediate halftone region (MMR)
+
+        let out = jbig2_decode(&s, None, None).expect("jbig2 MMR halftone decode");
+
+        // Expected 8×8 page: pattern at cell (m,n) placed at (2n, 2m).
+        let mut expected = vec![vec![false; 8]; 8];
+        for (m, grow) in gray.iter().enumerate() {
+            for (n, &gv) in grow.iter().enumerate() {
+                let pat = &patterns[gv as usize];
+                for (py, prow) in pat.iter().enumerate() {
+                    for (px, &b) in prow.iter().enumerate() {
+                        if b {
+                            expected[2 * m + py][2 * n + px] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let row_bytes = 8usize.div_ceil(8);
+        for (y, row) in expected.iter().enumerate() {
+            for (x, &black) in row.iter().enumerate() {
+                let byte = out[y * row_bytes + x / 8];
+                let bit = (byte >> (7 - (x % 8))) & 1;
+                let got_black = bit == 0;
+                assert_eq!(got_black, black, "pixel ({x},{y}) mismatch");
+            }
+        }
+    }
+
     /// REFAGG (refinement/aggregate) symbol-dictionary round-trip. An input
     /// dictionary supplies one symbol; a second, REFAGG-coded dictionary defines
     /// a new symbol as a refinement of that input symbol (REFAGGNINST = 1). A
@@ -2670,6 +3063,65 @@ mod tests {
         blit(&mut expected, &sym1, 6, 0);
         let row_bytes = 12usize.div_ceil(8);
         for (y, row) in expected.iter().enumerate() {
+            for (x, &black) in row.iter().enumerate() {
+                let byte = out[y * row_bytes + x / 8];
+                let bit = (byte >> (7 - (x % 8))) & 1;
+                let got_black = bit == 0;
+                assert_eq!(got_black, black, "pixel ({x},{y}) mismatch");
+            }
+        }
+    }
+
+    /// Huffman **+ REFAGG** symbol-dictionary round-trip (SDHUFF = 1 AND
+    /// SDREFAGG = 1) — previously skipped. An input dictionary supplies one
+    /// generic symbol; a second, Huffman REFAGG-coded dictionary defines a new
+    /// symbol as a single-instance refinement (REFAGGNINST = 1) of that input
+    /// symbol, with the refinement deltas Huffman-coded (ID as fixed
+    /// SBSYMCODELEN bits, RDX/RDY via B.15, BMSIZE via B.1) and the refinement
+    /// bitmap MQ-arithmetic-coded byte-aligned in the Huffman stream. A Huffman
+    /// text region then places the refined symbol; the decoded page must match
+    /// the refined target pixel-exact — exercising `decode_refagg_symbol_huffman`.
+    #[test]
+    fn huffman_refagg_symbol_dict_roundtrip() {
+        // Reference (input) symbol and the refined target (same 4×4 size).
+        let input_sym: Vec<Vec<bool>> = vec![
+            vec![true, true, false, false],
+            vec![true, false, false, true],
+            vec![false, false, true, true],
+            vec![false, true, true, false],
+        ];
+        let refined: Vec<Vec<bool>> = vec![
+            vec![true, true, false, true],
+            vec![true, false, true, true],
+            vec![false, false, true, true],
+            vec![false, true, true, false],
+        ];
+        let mut reference = Bitmap::new(4, 4);
+        for (y, row) in input_sym.iter().enumerate() {
+            for (x, &b) in row.iter().enumerate() {
+                reference.set(x, y, b);
+            }
+        }
+
+        // Input dict (segment 1, Huffman) = one generic symbol. Huffman REFAGG
+        // dict (segment 2) refers to it and defines the refined symbol
+        // (total_syms = 2 → SBSYMCODELEN = 1; input id 0 references input_sym).
+        let input_dict = build_huffman_symbol_dict(&[&input_sym]);
+        let refagg_dict = build_huffman_refagg_symbol_dict(&refined, 0, 0, 0, &reference, 2);
+        // Huffman text region (segment 3) refers to the REFAGG dict and places its
+        // one symbol (id 0) at S=0.
+        let tr_data = build_huffman_text_region(4, 4, &[(0usize, 0i64)], 1, 4);
+
+        let mut s: Vec<u8> = Vec::new();
+        push_segment(&mut s, 0, 48, &[], page_info_bytes(4, 4));
+        push_segment(&mut s, 1, 0, &[], input_dict);
+        push_segment(&mut s, 2, 0, &[1], refagg_dict);
+        push_segment(&mut s, 3, 6, &[2], tr_data);
+
+        let out = jbig2_decode(&s, None, None).expect("jbig2 huffman refagg decode");
+
+        let row_bytes = 4usize.div_ceil(8);
+        for (y, row) in refined.iter().enumerate() {
             for (x, &black) in row.iter().enumerate() {
                 let byte = out[y * row_bytes + x / 8];
                 let bit = (byte >> (7 - (x % 8))) & 1;
@@ -2994,6 +3446,66 @@ mod tests {
         out
     }
 
+    /// Build an **MMR** (HMMR = 1) halftone-region segment: the `hbpp` Gray-code
+    /// grayscale bitplanes are packed into ONE continuous Group-4 MMR bitstream
+    /// (MSB plane first, each plane an independent G4 bitmap whose READ reference
+    /// resets to all-white, with **no** byte realignment between planes). This is
+    /// the encoder side of the resumable-MMR multi-bitplane path.
+    #[allow(clippy::too_many_arguments)]
+    fn build_halftone_region_mmr(
+        width: u32,
+        height: u32,
+        gray: &[Vec<u32>],
+        hbpp: u32,
+        hgx: i32,
+        hgy: i32,
+        hrx: u16,
+        hry: u16,
+    ) -> Vec<u8> {
+        let hgh = gray.len();
+        let hgw = gray[0].len();
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&0u32.to_be_bytes()); // x
+        header.extend_from_slice(&0u32.to_be_bytes()); // y
+        header.push(0x00); // region comb op = OR
+        header.push(0x01); // halftone flags: HMMR=1, HTEMPLATE=0, no skip, HCOMBOP=OR
+        header.extend_from_slice(&(hgw as u32).to_be_bytes());
+        header.extend_from_slice(&(hgh as u32).to_be_bytes());
+        header.extend_from_slice(&(hgx as u32).to_be_bytes());
+        header.extend_from_slice(&(hgy as u32).to_be_bytes());
+        header.extend_from_slice(&hrx.to_be_bytes());
+        header.extend_from_slice(&hry.to_be_bytes());
+
+        // Gray-code the value bits: planes_gray[j] (j = value-bit index, 0 = LSB).
+        let mut planes_gray = vec![vec![vec![false; hgw]; hgh]; hbpp as usize];
+        for m in 0..hgh {
+            for n in 0..hgw {
+                let v = gray[m][n];
+                let mut prev = 0u32;
+                for j in (0..hbpp as usize).rev() {
+                    let vb = (v >> j) & 1;
+                    planes_gray[j][m][n] = (vb ^ prev) == 1;
+                    prev = vb;
+                }
+            }
+        }
+        // One shared MMR bit-writer; encode MSB plane first, no realignment.
+        let mut bw = BitW::default();
+        for j in (0..hbpp as usize).rev() {
+            let mut reference: Vec<usize> = changing_elements(&vec![false; hgw], hgw);
+            for row in &planes_gray[j] {
+                encode_g4_line(&mut bw, &reference, row, hgw);
+                reference = changing_elements(row, hgw);
+            }
+        }
+        let body = bw.finish();
+        let mut out = header;
+        out.extend_from_slice(&body);
+        out
+    }
+
     /// Build a text-region segment's data placing `placements` (symbol id, S, T)
     /// in a single strip. `num_symbols` sizes the symbol-id code length.
     fn build_text_region(
@@ -3222,6 +3734,97 @@ mod tests {
         ex.encode(&mut w, symbols.len() as i32);
 
         let body = w.finish();
+        let mut out = header;
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a Huffman **+ REFAGG** symbol-dictionary segment with a single new
+    /// symbol coded as a single-instance refinement (REFAGGNINST = 1) of input
+    /// symbol `ref_id`, with delta `(rdx, rdy)`. Mirrors
+    /// `decode_refagg_symbol_huffman`: DH via B.4, DW via B.2, REFAGGNINST via
+    /// B.1, the ID as fixed SBSYMCODELEN bits, RDX/RDY via B.15, BMSIZE via B.1,
+    /// then the byte-aligned MQ-coded refinement bitmap (BMSIZE bytes), then the
+    /// height-class DW OOB and the B.1 export flags. `total_syms` sizes the
+    /// symbol-ID code length (input + new).
+    fn build_huffman_refagg_symbol_dict(
+        target: &[Vec<bool>],
+        ref_id: u32,
+        rdx: i32,
+        rdy: i32,
+        reference: &Bitmap,
+        total_syms: usize,
+    ) -> Vec<u8> {
+        use huff::{standard_table, BitWriter};
+        // Flags: SDHUFF=1 (bit0), SDREFAGG=1 (bit1). Selectors all 0
+        // (DH=B.4, DW=B.2, BMSIZE=B.1, AGGINST=B.1); SDRTEMPLATE=0.
+        let flags: u16 = 0x0001 | (1 << 1);
+        let rat: [(i8, i8); 2] = [(-1, -1), (-1, -1)];
+        let h = target.len() as i64;
+        let w = target[0].len() as i64;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&flags.to_be_bytes());
+        // No generic AT pixels (SDHUFF=1). Refinement AT pixels (rtemplate 0 → 2).
+        for (ax, ay) in rat {
+            header.push(ax as u8);
+            header.push(ay as u8);
+        }
+        header.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS = 1
+        header.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS = 1
+
+        let sym_code_len = {
+            let mut bits = 0u32;
+            while (1usize << bits) < total_syms {
+                bits += 1;
+            }
+            bits.max(1)
+        };
+
+        // Encode the refinement bitmap into a standalone MQ stream so its exact
+        // byte length can be carried as BMSIZE (the decoder skips BMSIZE bytes to
+        // resume the Huffman codes afterwards).
+        let mut renc = MqEncoder::new();
+        let mut gr_cx = vec![ArithContext::default(); 1 << 13];
+        encode_refinement_into(
+            &mut renc, target, w as usize, h as usize, reference, rdx as i64, rdy as i64, 0, &rat,
+            &mut gr_cx,
+        );
+        let refine_bytes = renc.finish();
+
+        let dh = standard_table(4).unwrap();
+        let dw = standard_table(2).unwrap();
+        let agg = standard_table(1).unwrap(); // SDHUFFAGGINST (REFAGGNINST)
+        let rdx_t = standard_table(15).unwrap();
+        let rdy_t = standard_table(15).unwrap();
+        let rsize = standard_table(1).unwrap(); // BMSIZE
+        let ex = standard_table(1).unwrap();
+
+        let mut bw = BitWriter::new();
+        // One height class of height h.
+        dh.encode(&mut bw, h as i32);
+        // One symbol of width w (delta from 0).
+        dw.encode(&mut bw, w as i32);
+        // REFAGGNINST = 1.
+        agg.encode(&mut bw, 1);
+        // Symbol ID: fixed SBSYMCODELEN bits.
+        bw.put(ref_id, sym_code_len);
+        // RDX, RDY (B.15), BMSIZE (B.1).
+        rdx_t.encode(&mut bw, rdx);
+        rdy_t.encode(&mut bw, rdy);
+        rsize.encode(&mut bw, refine_bytes.len() as i32);
+        // Byte-align, then the MQ-coded refinement bitmap bytes verbatim.
+        bw.byte_align();
+        for &b in &refine_bytes {
+            bw.put(b as u32, 8);
+        }
+        // OOB ends the height-class width list.
+        dw.encode_oob(&mut bw);
+        // Export: skip the 1 input symbol, then export the 1 new symbol.
+        ex.encode(&mut bw, 1);
+        ex.encode(&mut bw, 1);
+
+        let body = bw.finish();
         let mut out = header;
         out.extend_from_slice(&body);
         out

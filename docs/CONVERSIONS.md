@@ -168,13 +168,18 @@ explicit `/Mask`, or a soft `/SMask`):
     typical prediction, refining the page area in place;
   - **symbol dictionary** (§6.5) — arithmetic *and* Huffman coding, plain generic
     symbols *and* refinement/aggregate (`REFAGG`) symbols (single-symbol refinement
-    and the aggregate text-region case);
+    and the aggregate text-region case) — including the Huffman + `REFAGG`
+    combination (`SDHUFF=1` *and* `SDREFAGG=1`: the symbol-ID as a fixed
+    `SBSYMCODELEN` code, the refinement deltas via the standard Annex B tables, the
+    refinement bitmap arithmetic-coded);
   - **text region** (§6.4) — arithmetic *and* Huffman coding (the run-code-built
     symbol-ID table + the standard Annex B tables), with per-symbol refinement
     (`SBREFINE`/`IARI`), reference-corner and transposition handling;
   - **pattern dictionary** (§6.7) + **halftone region** (§6.6) — the collective
     pattern bitmap, the grayscale image decoded as Gray-coded generic-region
-    bitplanes (§C.5), and grid placement with the combination operator;
+    bitplanes (§C.5) in **both** the arithmetic and the MMR mode (`HMMR=1`, all
+    `HBPP` bitplanes recovered from the one bit-continuous G4 stream — not just the
+    first plane), and grid placement with the combination operator;
   - the standard Huffman tables **B.1–B.15** and **custom table segments**
     (§7.4.13, run-code-built) — all composited onto the page bitmap with the
     segment combination operator (OR/AND/XOR/XNOR/REPLACE).

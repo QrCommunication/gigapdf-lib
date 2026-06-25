@@ -647,7 +647,31 @@ fn emit_row(out: &mut Vec<u8>, changes: &[usize], cols: usize, row_bytes: usize,
 /// EOL/RTC handling (JBIG2 MMR has none). A short/corrupt stream yields whatever
 /// rows decoded, padded with all-white rows to `height`.
 pub fn mmr_decode_bitmap(data: &[u8], width: usize, height: usize) -> Vec<Vec<bool>> {
+    mmr_decode_bitmap_resumable(data, width, height, 0).0
+}
+
+/// Resumable MMR (Group 4 / T.6) bitplane decode (T.88 §C.5). Decodes `height`
+/// rows of a `width`-wide bilevel bitmap starting at **bit** offset `start_bit`
+/// into `data`, returning the decoded rows **and the continuing bit position**.
+///
+/// This is the per-plane continuation primitive the JBIG2 halftone grayscale
+/// path needs: §C.5 codes all `HBPP` bitplanes as **one** MMR bitstream with no
+/// byte realignment between planes, so each plane must resume from exactly where
+/// the previous one stopped (the bit position is *not* byte-granular). Plain
+/// callers use [`mmr_decode_bitmap`] (`start_bit = 0`), which keeps the original
+/// one-shot, byte-identical behaviour as a strict subset of this routine.
+///
+/// On a short/corrupt stream the returned rows are padded with all-white rows to
+/// `height`; the returned bit position is wherever decoding stopped (the start of
+/// any next plane should still use it, the padded rows having consumed no bits).
+pub fn mmr_decode_bitmap_resumable(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    start_bit: usize,
+) -> (Vec<Vec<bool>>, usize) {
     let mut reader = BitReader::new(data);
+    reader.pos = start_bit;
     let mut rows: Vec<Vec<bool>> = Vec::with_capacity(height);
     let mut ref_changes: Vec<usize> = Vec::new();
     for _ in 0..height {
@@ -661,7 +685,7 @@ pub fn mmr_decode_bitmap(data: &[u8], width: usize, height: usize) -> Vec<Vec<bo
     while rows.len() < height {
         rows.push(vec![false; width]);
     }
-    rows
+    (rows, reader.pos)
 }
 
 /// Expand a changing-element list into a row of booleans (`true` = black). The
