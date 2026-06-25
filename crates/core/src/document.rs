@@ -7853,12 +7853,27 @@ impl Document {
         use crate::recon::{self, IdGen};
 
         let mut ids = IdGen::default();
-        // A tagged document is reconstructed once, from the struct tree, then its
-        // blocks are split back onto pages by the page each block was bound to.
-        // For simplicity here the heuristic path is per-page; the tag-tree path
-        // produces a single flat block list which we place on the first page (it
-        // is already in logical reading order across the document).
-        let tag_blocks = recon::tag_tree::reconstruct_from_struct_tree(self, &mut ids);
+        // A tagged document is reconstructed once, from the `/StructTreeRoot`, then
+        // its blocks are split back onto pages by the page each block was bound to
+        // (its `/Pg`, resolved to a 0-based page index by the paged walker). Blocks
+        // whose page is unknown (`None` — grouping elements often omit `/Pg`) land
+        // on the first page. A tagged document is reconstructed *only* from the tag
+        // tree: every page draws from this distribution (an empty list for a page
+        // the structure never references), so the heuristic path never double-emits
+        // the same prose. The heuristic per-page path is used only when the
+        // document carries no usable tag tree (`tag_pages` is `None`).
+        let mut tag_pages: Option<std::collections::BTreeMap<usize, Vec<crate::model::Block>>> =
+            recon::tag_tree::reconstruct_from_struct_tree_paged(self, &mut ids).map(|paged| {
+                let mut by_page: std::collections::BTreeMap<usize, Vec<crate::model::Block>> =
+                    std::collections::BTreeMap::new();
+                for (page, block) in paged {
+                    // Unknown page (`None`) → page index 0 (the first page), the
+                    // same conservative placement the flat path used.
+                    by_page.entry(page.unwrap_or(0)).or_default().push(block);
+                }
+                by_page
+            });
+        let is_tagged = tag_pages.is_some();
 
         let page_count = self.page_count() as u32;
         let mut sections: Vec<Section> = Vec::new();
@@ -7872,18 +7887,29 @@ impl Document {
             let (x0, y0) = (media[0], media[1]);
             let page_w = (media[2] - media[0]).abs();
             let page_h = (media[3] - media[1]).abs();
+            // `/Rotate` (0/90/180/270, the viewer's clockwise rotation), normalized
+            // exactly as [`page_info`](Self::page_info). The reconstructed model
+            // reflects the *displayed* page: its dimensions swap for 90°/270° and
+            // every heuristic block frame is projected into that upright frame
+            // (see `rotate_blocks_for_display`). `0` ⇒ no change (byte-identical).
+            let rotate = page.get(b"Rotate").and_then(Object::as_i64).unwrap_or(0);
+            let rotation = (((rotate % 360) + 360) % 360) as i32;
 
-            // The tag-tree blocks (if any) only attach to the first page.
-            let page_tags = if page_no == 1 {
-                tag_blocks.clone()
-            } else {
-                None
-            };
+            // The tagged blocks bound to this page (0-based index). For a tagged
+            // document every page is driven from the tag tree — a page the
+            // structure never references yields `Some(vec![])` so the heuristic
+            // path is skipped there too. An untagged document passes `None` so the
+            // heuristic pipeline reconstructs the page.
+            let page_tags = tag_pages.as_mut().map(|by_page| {
+                by_page
+                    .remove(&((page_no - 1) as usize))
+                    .unwrap_or_default()
+            });
             // Single source of truth for per-page block assembly (shared with
             // [`page_blocks`](Self::page_blocks)): extract runs/paths/images and
             // run the reconstruction pipeline, recording image blobs into the
             // document-wide `resources` table.
-            let blocks = self.reconstruct_page_blocks(
+            let mut blocks = self.reconstruct_page_blocks(
                 page_no,
                 (x0, y0, page_w, page_h),
                 &mut ids,
@@ -7891,9 +7917,25 @@ impl Document {
                 page_tags,
             );
 
+            // Project the heuristic blocks' top-down frames into the displayed
+            // (post-`/Rotate`) frame so a rotated page reads upright. Tagged blocks
+            // are left untouched: they carry at most a `/Layout /BBox` hint in raw
+            // PDF user space (not the top-down model frame this projection assumes)
+            // and flow rather than position absolutely.
+            if rotation != 0 && !is_tagged {
+                Self::rotate_blocks_for_display(&mut blocks, rotation, page_w, page_h);
+            }
+
+            // Displayed page size: width/height swap for 90°/270° (mirrors
+            // `imposition_display_size`).
+            let (disp_w, disp_h) = if matches!(rotation, 90 | 270) {
+                (page_h, page_w)
+            } else {
+                (page_w, page_h)
+            };
             let geometry = PageGeometry {
-                width: page_w,
-                height: page_h,
+                width: disp_w,
+                height: disp_h,
                 ..PageGeometry::default()
             };
             let page_model = Page {
@@ -7981,6 +8023,85 @@ impl Document {
             resources,
             outline,
             ..crate::model::Document::default()
+        }
+    }
+
+    /// Project a reconstructed block's **top-down model frame** from the page's
+    /// unrotated `/MediaBox` frame into the **displayed** (post-`/Rotate`) frame.
+    ///
+    /// Reconstructed frames come from `recon::frame_top_down` — origin top-left,
+    /// `y` grows downward, in unrotated MediaBox-local coordinates of size
+    /// `(page_w, page_h)`. A viewer rotates the page **clockwise** by `/Rotate`;
+    /// the visible page is then `(page_w, page_h)` for 0°/180° and `(page_h,
+    /// page_w)` for 90°/270°. These four cases are the top-down equivalent of
+    /// [`imposition_normalize_matrix`](Self::imposition_normalize_matrix)
+    /// (the same convention the renderer/imposition use), composed with the
+    /// top-down flip on each end, and verified to map page corners as a clockwise
+    /// turn does (e.g. for 90° the unrotated top-left corner lands top-right).
+    /// `rotation` is the normalized degrees (0/90/180/270); any other value is a
+    /// no-op (the frame is returned unchanged).
+    fn rotate_rect_for_display(
+        r: crate::model::geom::Rect,
+        rotation: i32,
+        page_w: f64,
+        page_h: f64,
+    ) -> crate::model::geom::Rect {
+        use crate::model::geom::Rect;
+        let (mx, my, w, h) = (r.x, r.y, r.w, r.h);
+        match rotation {
+            90 => Rect::new(page_h - my - h, mx, h, w),
+            180 => Rect::new(page_w - mx - w, page_h - my - h, w, h),
+            270 => Rect::new(my, page_w - mx - w, h, w),
+            _ => r,
+        }
+    }
+
+    /// Apply [`rotate_rect_for_display`](Self::rotate_rect_for_display) to every
+    /// `frame` in a heuristic block tree, recursing through the containers that
+    /// nest blocks (table cells, list items, text boxes, block quotes). The block
+    /// **content** and [`Block::rotation`] are untouched: after the frames are
+    /// re-anchored into the displayed frame the text already reads upright, so the
+    /// boxes stay axis-aligned (`Rotation::D0`). A `rotation` of 0 never reaches
+    /// here (the caller guards it), keeping `/Rotate 0` pages byte-identical.
+    fn rotate_blocks_for_display(
+        blocks: &mut [crate::model::Block],
+        rotation: i32,
+        page_w: f64,
+        page_h: f64,
+    ) {
+        use crate::model::BlockKind;
+        for block in blocks {
+            if let Some(frame) = block.frame {
+                block.frame = Some(Self::rotate_rect_for_display(
+                    frame, rotation, page_w, page_h,
+                ));
+            }
+            match &mut block.kind {
+                BlockKind::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            Self::rotate_blocks_for_display(
+                                &mut cell.blocks,
+                                rotation,
+                                page_w,
+                                page_h,
+                            );
+                        }
+                    }
+                }
+                BlockKind::List(list) => {
+                    for item in &mut list.items {
+                        Self::rotate_blocks_for_display(&mut item.blocks, rotation, page_w, page_h);
+                    }
+                }
+                BlockKind::TextBox(tb) => {
+                    Self::rotate_blocks_for_display(&mut tb.blocks, rotation, page_w, page_h);
+                }
+                BlockKind::Blockquote(bq) => {
+                    Self::rotate_blocks_for_display(&mut bq.blocks, rotation, page_w, page_h);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -28030,6 +28151,252 @@ mod tests {
             !caption_is_standalone,
             "the caption is lifted into the image, not left as a loose paragraph"
         );
+    }
+
+    /// #5 (`/Rotate`): a page rotated 90° for display reconstructs into the
+    /// *displayed* frame — its model page dimensions swap and every heuristic
+    /// block frame is projected so the content reads upright (not sideways). The
+    /// projection is validated against the un-rotated reconstruction of the same
+    /// content, so it can't drift from the actual `frame_top_down` output.
+    #[test]
+    fn reconstruct_model_applies_page_rotate_90() {
+        use crate::model::BlockKind;
+
+        // Same content on two identical US-Letter (612×792) pages; one is left
+        // upright, the other carries `/Rotate 90`.
+        let content = "BT /F0 24 Tf 72 740 Td (Chapter One) Tj ET\n\
+                       BT /F0 12 Tf 72 600 Td (Body text that stays a paragraph.) Tj ET\n\
+                       BT /F0 12 Tf 72 584 Td (A second body line follows it.) Tj ET\n";
+
+        let mut upright = Document::open(&crate::convert::reverse::txt_to_pdf("seed")).unwrap();
+        upright
+            .set_page_content(1, content.as_bytes().to_vec())
+            .unwrap();
+        let upright_model = upright.reconstruct_model();
+
+        let mut rotated = Document::open(&crate::convert::reverse::txt_to_pdf("seed")).unwrap();
+        rotated
+            .set_page_content(1, content.as_bytes().to_vec())
+            .unwrap();
+        rotated.rotate_page(1, 90).unwrap();
+        let rotated_model = rotated.reconstruct_model();
+
+        // The first heading block on each model's single page.
+        let heading_frame = |model: &crate::model::Document| -> crate::model::geom::Rect {
+            model
+                .sections
+                .iter()
+                .flat_map(|s| s.pages.iter())
+                .flat_map(|p| p.blocks.iter())
+                .find_map(|b| match &b.kind {
+                    BlockKind::Heading(_) => b.frame,
+                    _ => None,
+                })
+                .expect("a framed heading block")
+        };
+        let up_frame = heading_frame(&upright_model);
+        let rot_frame = heading_frame(&rotated_model);
+
+        // 1. The displayed page swaps width/height (612×792 → 792×612).
+        let geo = rotated_model.sections[0].geometry;
+        assert!(
+            (geo.width - 792.0).abs() < 0.5 && (geo.height - 612.0).abs() < 0.5,
+            "rotated model page is landscape 792×612, got {}×{}",
+            geo.width,
+            geo.height
+        );
+        // The upright page keeps its portrait geometry (sanity baseline).
+        let up_geo = upright_model.sections[0].geometry;
+        assert!((up_geo.width - 612.0).abs() < 0.5 && (up_geo.height - 792.0).abs() < 0.5);
+
+        // 2. The rotated heading frame is exactly the upright frame projected into
+        //    the displayed frame by the cardinal 90° map.
+        let expected = Document::rotate_rect_for_display(up_frame, 90, 612.0, 792.0);
+        let close = |a: f64, b: f64| (a - b).abs() < 0.01;
+        assert!(
+            close(rot_frame.x, expected.x)
+                && close(rot_frame.y, expected.y)
+                && close(rot_frame.w, expected.w)
+                && close(rot_frame.h, expected.h),
+            "rotated heading frame {rot_frame:?} == projected {expected:?}"
+        );
+        // 3. Width/height swap on the box itself (a wide title becomes tall) and it
+        //    stays inside the displayed page.
+        assert!(close(rot_frame.w, up_frame.h) && close(rot_frame.h, up_frame.w));
+        assert!(
+            rot_frame.x >= -0.01
+                && rot_frame.y >= -0.01
+                && rot_frame.x + rot_frame.w <= geo.width + 0.01
+                && rot_frame.y + rot_frame.h <= geo.height + 0.01,
+            "projected frame lies within the displayed page"
+        );
+    }
+
+    /// #5 (`/Rotate`): the cardinal-rotation frame projector maps the displayed
+    /// page corners as a clockwise viewer rotation does. A pure unit-level check
+    /// of [`Document::rotate_rect_for_display`] for 90/180/270/0.
+    #[test]
+    fn rotate_rect_for_display_maps_corners_clockwise() {
+        use crate::model::geom::Rect;
+        // A 10×20 box at the top-left of a 612×792 (portrait) top-down page.
+        let r = Rect::new(0.0, 0.0, 10.0, 20.0);
+
+        // 90° clockwise → the displayed page is 792 wide; the top-left corner
+        // moves to the top-right, the box rotates to 20 wide × 10 tall.
+        let r90 = Document::rotate_rect_for_display(r, 90, 612.0, 792.0);
+        assert_eq!(
+            (r90.x, r90.y, r90.w, r90.h),
+            (792.0 - 20.0, 0.0, 20.0, 10.0)
+        );
+        // 180° → point reflection; box keeps its size, lands at the bottom-right.
+        let r180 = Document::rotate_rect_for_display(r, 180, 612.0, 792.0);
+        assert_eq!(
+            (r180.x, r180.y, r180.w, r180.h),
+            (612.0 - 10.0, 792.0 - 20.0, 10.0, 20.0)
+        );
+        // 270° clockwise → top-left moves to the bottom-left, box becomes 20×10.
+        let r270 = Document::rotate_rect_for_display(r, 270, 612.0, 792.0);
+        assert_eq!(
+            (r270.x, r270.y, r270.w, r270.h),
+            (0.0, 612.0 - 10.0, 20.0, 10.0)
+        );
+        // 0° / any non-cardinal → identity (byte-identical pages).
+        assert_eq!(Document::rotate_rect_for_display(r, 0, 612.0, 792.0), r);
+    }
+
+    /// #5 (tagged page distribution): a tagged document whose `/Pg` puts a block
+    /// on the second page reconstructs that block onto **model page 2**, not all
+    /// of the structure dumped on page 1. Page 1 keeps its own tagged block; an
+    /// untouched second page stays valid (empty or its own content).
+    #[test]
+    fn reconstruct_model_distributes_tagged_blocks_per_pg() {
+        use crate::model::BlockKind;
+
+        // Page 1 (obj 8) carries a `/P` whose text is "first page". Page 2 (obj 9)
+        // carries a `/P` whose `/Pg` points at it with text "second page". The
+        // struct tree groups both under one `/Document` element.
+        let c1 = "BT /F1 12 Tf /P <</MCID 0>> BDC (first page) Tj EMC ET";
+        let c2 = "BT /F1 12 Tf /P <</MCID 0>> BDC (second page) Tj EMC ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R 9 0 R] /Count 2 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                9,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 19 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{c1}\nendstream", c1.len()),
+            ),
+            (
+                19,
+                format!("<< /Length {} >> stream\n{c2}\nendstream", c2.len()),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (
+                11,
+                "<< /Type /StructElem /S /Document /K [12 0 R 13 0 R] >>".into(),
+            ),
+            // Paragraph on page 1 (/Pg 8) and page 2 (/Pg 9).
+            (12, "<< /S /P /Pg 8 0 R /K 0 >>".into()),
+            (13, "<< /S /P /Pg 9 0 R /K 0 >>".into()),
+        ]);
+        let doc = Document::open(&pdf).expect("valid tagged PDF");
+        assert!(doc.has_semantic_structure(), "fixture must be tagged");
+
+        let model = doc.reconstruct_model();
+        let pages: Vec<&crate::model::Page> =
+            model.sections.iter().flat_map(|s| s.pages.iter()).collect();
+        assert_eq!(pages.len(), 2, "two model pages");
+
+        let page_text = |page: &crate::model::Page| -> String {
+            page.blocks
+                .iter()
+                .filter_map(|b| match &b.kind {
+                    BlockKind::Paragraph(p) => Some(
+                        p.runs
+                            .iter()
+                            .filter_map(|r| match r {
+                                crate::model::Inline::Run(run) => Some(run.text.clone()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let p1 = page_text(pages[0]);
+        let p2 = page_text(pages[1]);
+        assert!(
+            p1.contains("first page") && !p1.contains("second page"),
+            "model page 1 holds only its own tagged block, got {p1:?}"
+        );
+        assert!(
+            p2.contains("second page") && !p2.contains("first page"),
+            "the /Pg-2 block lands on model page 2, not page 1, got {p2:?}"
+        );
+    }
+
+    /// #5: an untagged, unrotated document is unchanged by the reconstruction
+    /// path — its model page dimensions equal the `/MediaBox` and its blocks are
+    /// byte-identical to the per-page `page_blocks` (which never rotates or
+    /// consults the tag tree). Guards the "`/Rotate 0` stays byte-identical".
+    #[test]
+    fn reconstruct_model_unchanged_for_upright_untagged() {
+        let mut doc = Document::open(&crate::convert::reverse::txt_to_pdf("seed")).unwrap();
+        doc.set_page_content(
+            1,
+            b"BT /F0 24 Tf 72 740 Td (A Plain Title) Tj ET\n\
+              BT /F0 12 Tf 72 600 Td (One body line of prose here.) Tj ET\n"
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!doc.has_semantic_structure(), "fixture is not tagged");
+
+        let model = doc.reconstruct_model();
+        // Geometry is the raw MediaBox (612×792, no swap).
+        let geo = model.sections[0].geometry;
+        assert!(
+            (geo.width - 612.0).abs() < 0.5 && (geo.height - 792.0).abs() < 0.5,
+            "upright page keeps MediaBox dimensions 612×792"
+        );
+        // The whole-document page matches the per-page entry point block-for-block
+        // (modulo ids) — the rotation/tag path didn't perturb the upright result.
+        let model_blocks = &model.sections[0].pages[0].blocks;
+        let per_page = doc.page_blocks(1);
+        assert_eq!(model_blocks.len(), per_page.len(), "same block count");
+        for (a, b) in model_blocks.iter().zip(per_page.iter()) {
+            assert_eq!(
+                a.frame, b.frame,
+                "frames identical (no rotation projection)"
+            );
+            assert_eq!(
+                a.rotation, b.rotation,
+                "block rotation unchanged (D0 stays D0)"
+            );
+            assert_eq!(
+                std::mem::discriminant(&a.kind),
+                std::mem::discriminant(&b.kind),
+                "same block kinds in order"
+            );
+        }
     }
 
     #[test]

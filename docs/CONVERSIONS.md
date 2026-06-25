@@ -123,10 +123,14 @@ geometry; large/sparse/long tables kept via a structural test; rotated tables
 projected onto their reading axes) · images — both `Do` XObjects **and inline images**
 (`BI`/`ID`/`EI`, ISO 32000-1 §8.9.7) — with lifted figure captions · vector
 shapes · underline/strike (from drawn rules) · external + internal hyperlinks ·
-outline/bookmarks · page geometry · **running headers/footers** (stripped from the
-body flow and lifted to `Section.header`/`Section.footer`, see below) · tagged-PDF
-`/StructTreeRoot` (consumed) · **optional-content (OCG/OCMD layer) visibility**
-(see below).
+outline/bookmarks · page geometry — including **page-level `/Rotate` (90/180/270)**:
+the reconstructed page reflects the **displayed** orientation (its width/height swap
+for 90°/270°) and every reconstructed block frame is projected into that upright
+reading frame, so a landscape-rotated page reads correctly rather than sideways
+(`/Rotate 0` pages stay byte-identical) · **running headers/footers** (stripped from
+the body flow and lifted to `Section.header`/`Section.footer`, see below) · tagged-PDF
+`/StructTreeRoot` (consumed; blocks distributed onto their real pages, see below) ·
+**optional-content (OCG/OCMD layer) visibility** (see below).
 
 **Optional content (layers, ISO 32000-1 §8.11):** when rendering an existing
 PDF, content on a layer that is **OFF in the default configuration**
@@ -297,15 +301,17 @@ is never promoted.
   unordered default), so tagged lists are no longer always unordered. **Geometry**
   — each block's `frame` is set from the element's `/Layout` `/BBox`
   (`[llx lly urx ury]` → a normalized lower-left + width/height rect) when
-  present. **Page assignment** — each block now carries the 0-based page index
-  resolved from the producing element's `/Pg` (exposed by the paged tag-tree
-  entry point), so a block declared on page 2 is tagged page 2, not page 1.
-  Still pending: a **header-row concept** — `/THead`/`/TH` is read as a cell but
-  not flagged as a header (`Cell` has no `is_header` field yet; a separate task,
-  shared with the heuristic tables item below); and the model-reconstruction
-  driver still places the flat block list on the first page — *consuming* the
-  per-block `/Pg` page hint there to finish the per-page split is a follow-up
-  outside this module.
+  present. **Page assignment** — the reconstruction driver now **distributes the
+  tagged blocks onto their real model pages**, each placed on the 0-based page
+  index resolved from its producing element's `/Pg` (via the paged tag-tree entry
+  point): a block declared on page 2 lands on model page 2, not page 1. A block
+  whose page can't be resolved (`None` — grouping elements often omit `/Pg`) keeps
+  the conservative first-page placement; a page the structure never references
+  stays a valid (empty) page, and the heuristic path is not mixed in (so the same
+  prose is never double-emitted). Still pending: a **header-row concept** —
+  `/THead`/`/TH` is read as a cell but not flagged as a header (`Cell` has no
+  `is_header` field yet; a separate task, shared with the heuristic tables item
+  below).
 - **Tables**: detection now recovers **merged (spanning) cells in borderless
   tables** (a run whose box reaches across otherwise-empty columns/rows becomes a
   `col_span`/`row_span` cell, no phantom blank cell left behind — alongside the
