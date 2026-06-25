@@ -938,7 +938,10 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         .unwrap_or_default();
     let styles = parse_docx_styles(&part(zip, "word/styles.xml"));
     let numbering = parse_docx_numbering(&part(zip, "word/numbering.xml"));
-    let footnotes = parse_docx_footnotes(&part(zip, "word/footnotes.xml"));
+    let mut footnotes = parse_docx_footnotes(&part(zip, "word/footnotes.xml"));
+    // Endnotes (`word/endnotes.xml`) are lowered inline at their references too;
+    // carried on the same struct so the body walker can resolve both note kinds.
+    footnotes.endnote_bodies = parse_docx_endnotes(&part(zip, "word/endnotes.xml"));
     let geom = docx_page_geom(&doc);
     let ctx = DocxCtx {
         zip,
@@ -1329,6 +1332,31 @@ fn docx_paragraph_model(
                         }
                     }
                     "tab" => push_run(active_inlines(&mut runs, &mut link), &run, " "),
+                    // A footnote/endnote reference marker (`<w:footnoteReference
+                    // w:id="N"/>` / `<w:endnoteReference w:id="N"/>`): lower the
+                    // referenced note's body inline at this point — a superscript
+                    // citation marker followed by the note body text — so neither is
+                    // lost. Mirrors the ODT `text:note` lowering. The body XML lives
+                    // in a separate part (`footnotes.xml`/`endnotes.xml`), so it is
+                    // re-walked through the body grammar here (styling survives).
+                    "footnoteReference" => {
+                        if let Some(n) =
+                            attr(&attrs, "id").and_then(|id| ctx.footnotes.footnote_bodies.get(id))
+                        {
+                            for inline in docx_note_inline(ctx, n, resources) {
+                                active_inlines(&mut runs, &mut link).push(inline);
+                            }
+                        }
+                    }
+                    "endnoteReference" => {
+                        if let Some(n) =
+                            attr(&attrs, "id").and_then(|id| ctx.footnotes.endnote_bodies.get(id))
+                        {
+                            for inline in docx_note_inline(ctx, n, resources) {
+                                active_inlines(&mut runs, &mut link).push(inline);
+                            }
+                        }
+                    }
                     "br" if matches!(attr(&attrs, "type"), Some("page")) => {
                         // An explicit run-level page break (`<w:br w:type="page"/>`):
                         // end the current line, then split onto a new page after
@@ -4367,6 +4395,53 @@ fn odf_note_inline(x: &mut Xml, ctx: &OdfModelCtx) -> Vec<Inline> {
     out
 }
 
+/// Lower a DOCX foot-/endnote ([`DocxNote`]) to inline runs at its reference
+/// point, mirroring the ODT [`odf_note_inline`] lowering: a superscript citation
+/// marker (the note's display ordinal) followed by the note body text. The body
+/// lives in a separate part as raw `w:p`/`w:r` XML, so it is re-walked here with
+/// the body model walker ([`docx_walk_model`]) — through a throwaway page/outline
+/// accumulator (a note body is not part of the document outline) — then flattened
+/// to text. Any images in the body intern into the shared `resources` table.
+fn docx_note_inline(
+    ctx: &DocxCtx,
+    note: &DocxNote,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Vec<Inline> {
+    let mut pages = DocxPages::new();
+    let mut counters = ListCounters::default();
+    let mut no_outline = OutlineBuilder::default();
+    docx_walk_model(
+        &mut Xml::new(&note.body_xml),
+        ctx,
+        &mut pages,
+        &mut counters,
+        resources,
+        &mut no_outline,
+        None,
+    );
+    let blocks: Vec<Block> = pages.finish().into_iter().flat_map(|p| p.blocks).collect();
+    let body = inline_blocks_text(&blocks);
+
+    let mut out: Vec<Inline> = Vec::new();
+    // The citation marker is surfaced as a superscript run (same shape as ODT).
+    out.push(Inline::Run(InlineRun {
+        text: note.number.to_string(),
+        style: CharStyle {
+            vertical_align: model::style::VAlign::Super,
+            ..CharStyle::default()
+        },
+        source_index: None,
+    }));
+    if !body.is_empty() {
+        // A leading space separates the body from the citation marker / host text.
+        out.push(Inline::Run(InlineRun {
+            text: format!(" {body}"),
+            ..InlineRun::default()
+        }));
+    }
+    out
+}
+
 /// The concatenated plain text of a block list (paragraph/heading runs joined,
 /// paragraphs separated by a single space), trimmed. Used to flatten a footnote
 /// body to inline text.
@@ -5348,6 +5423,9 @@ struct Xml<'a> {
     s: &'a [u8],
     src: &'a str,
     i: usize,
+    /// Byte offset where the token most recently returned by [`next`](Xml::next)
+    /// actually began (after any skipped comments/PIs). Read by [`next_span`](Xml::next_span).
+    tok_start: usize,
 }
 
 impl<'a> Xml<'a> {
@@ -5356,13 +5434,25 @@ impl<'a> Xml<'a> {
             s: src.as_bytes(),
             src,
             i: 0,
+            tok_start: 0,
         }
+    }
+
+    /// Like [`next`](Xml::next) but also reports the byte offset of the returned
+    /// token's start (the `<` of a tag, or the first text byte — after any skipped
+    /// comments/PIs) and its end (the cursor just past the token). Used to capture
+    /// a sub-element's raw inner XML by range (e.g. a footnote/endnote body) without
+    /// a second parse.
+    fn next_span(&mut self) -> Option<(usize, usize, Tok)> {
+        let tok = self.next()?;
+        Some((self.tok_start, self.i, tok))
     }
 
     fn next(&mut self) -> Option<Tok> {
         if self.i >= self.s.len() {
             return None;
         }
+        self.tok_start = self.i;
         if self.s[self.i] == b'<' {
             // Comment / declaration / PI / CDATA.
             if self.src[self.i..].starts_with("<!--") {
@@ -7935,60 +8025,139 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
 
 // ───────────────────────── DOCX footnotes (footnotes.xml) ──────────────────────
 
-/// Footnote bodies from `word/footnotes.xml`, in reference order. The synthetic
-/// `separator`/`continuationSeparator` notes (ids `0`/`-1`) are dropped; the rest
-/// keep their document order so the trailing section numbers them 1, 2, 3, ….
-#[derive(Default)]
-struct DocxFootnotes {
-    /// Pre-escaped HTML text of each real footnote, in id order.
-    ordered: Vec<String>,
+/// One real note (foot- or endnote): its display ordinal (1-based, in the order
+/// real notes appear in their part — Word numbers them in reference order, which
+/// normally matches part order) and its **raw inner body XML** (everything between
+/// `<w:footnote …>`/`<w:endnote …>` and its close). Keeping the body as XML lets
+/// the model path re-walk it through the body grammar so its paragraphs/runs keep
+/// their styling, mirroring how the ODT path lowers `text:note-body`.
+#[derive(Clone, Default)]
+struct DocxNote {
+    /// 1-based display number used as the inlined citation marker.
+    number: usize,
+    /// Inner XML of the `w:footnote`/`w:endnote` element (its `w:p`/`w:r` grammar).
+    body_xml: String,
 }
 
-/// Parse `word/footnotes.xml`, extracting the plain text of each real
-/// `w:footnote` (skipping the `separator`/`continuationSeparator` placeholders).
+/// Notes parsed from `word/footnotes.xml` and `word/endnotes.xml`. The synthetic
+/// `separator`/`continuationSeparator` placeholders are dropped; the rest are kept
+/// twice: as plain HTML text in document order (`ordered`, for the trailing render
+/// section, footnotes only) and keyed by `w:id` (`footnote_bodies`/`endnote_bodies`,
+/// for inline lowering at each `w:footnoteReference`/`w:endnoteReference`).
+#[derive(Default)]
+struct DocxFootnotes {
+    /// Pre-escaped HTML text of each real footnote, in id order (render path).
+    ordered: Vec<String>,
+    /// Real footnotes keyed by `w:id` → ordinal + body XML (model inline path).
+    footnote_bodies: BTreeMap<String, DocxNote>,
+    /// Real endnotes keyed by `w:id` → ordinal + body XML (model inline path).
+    endnote_bodies: BTreeMap<String, DocxNote>,
+}
+
+/// Parse `word/footnotes.xml`: the plain text of each real footnote (in document
+/// order, for the render section) **and** each real footnote's body XML keyed by
+/// `w:id` (for inline lowering). The `separator`/`continuationSeparator`
+/// placeholders are skipped in both.
 fn parse_docx_footnotes(xml: &str) -> DocxFootnotes {
-    let mut ordered: Vec<String> = Vec::new();
+    let mut fns = DocxFootnotes::default();
     if xml.trim().is_empty() {
-        return DocxFootnotes { ordered };
+        return fns;
     }
+    fns.footnote_bodies = parse_docx_notes(xml, "footnote", Some(&mut fns.ordered));
+    fns
+}
+
+/// Parse `word/endnotes.xml` into endnote bodies keyed by `w:id` (ordinal + body
+/// XML), skipping the `separator`/`continuationSeparator` placeholders. Endnotes
+/// have no trailing render section, so no plain-text list is collected.
+fn parse_docx_endnotes(xml: &str) -> BTreeMap<String, DocxNote> {
+    if xml.trim().is_empty() {
+        return BTreeMap::new();
+    }
+    parse_docx_notes(xml, "endnote", None)
+}
+
+/// Shared parser for `word/footnotes.xml` (`tag = "footnote"`) and
+/// `word/endnotes.xml` (`tag = "endnote"`). For each real note (a `w:<tag>` that is
+/// not a `separator`/`continuationSeparator`), records its inner body XML keyed by
+/// `w:id` together with a 1-based display ordinal. When `ordered` is supplied, the
+/// note's flattened plain HTML text is also appended there in document order (used
+/// by the footnote render section). The body XML is captured by byte range from the
+/// pull tokenizer's cursor, so the model path can re-walk it with full styling.
+fn parse_docx_notes(
+    xml: &str,
+    tag: &str,
+    mut ordered: Option<&mut Vec<String>>,
+) -> BTreeMap<String, DocxNote> {
+    let mut bodies: BTreeMap<String, DocxNote> = BTreeMap::new();
+    let mut next_number = 1usize;
     let mut x = Xml::new(xml);
-    let mut in_note = false;
-    let mut skip = false; // separator / continuationSeparator
-    let mut in_text = false; // inside <w:t>
-    let mut cur = String::new();
-    while let Some(tok) = x.next() {
+    // State for the note currently being scanned.
+    let mut depth = 0i32; // nesting depth inside the open note (0 = its direct children)
+    let mut id: Option<String> = None;
+    let mut skip = false; // separator / continuationSeparator placeholder
+    let mut body_start = 0usize; // byte offset just after the note's open tag
+    let mut in_text = false; // inside a <w:t> (for the plain-text flatten)
+    let mut cur = String::new(); // flattened HTML text of the note
+    while let Some((start, end, tok)) = x.next_span() {
         match tok {
-            Tok::Open(name, attrs, _) => match local(&name) {
-                "footnote" => {
-                    in_note = true;
-                    cur.clear();
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == tag && id.is_none() && !sc {
+                    // Open a note. Its body XML begins right after this start tag.
+                    id = Some(attr(&attrs, "id").unwrap_or("").to_string());
                     skip = matches!(
                         attr(&attrs, "type"),
                         Some("separator") | Some("continuationSeparator")
                     );
+                    body_start = end;
+                    depth = 0;
+                    in_text = false;
+                    cur.clear();
+                } else if id.is_some() {
+                    if !sc {
+                        depth += 1;
+                    }
+                    if ln == "t" {
+                        in_text = true;
+                    } else if ln == "tab" {
+                        cur.push(' ');
+                    }
                 }
-                "t" if in_note => in_text = true,
-                "tab" if in_note => cur.push(' '),
-                _ => {}
-            },
+            }
             Tok::Text(t) => {
-                if in_note && in_text && !skip {
+                if id.is_some() && in_text && !skip {
                     esc(&t, &mut cur);
                 }
             }
-            Tok::Close(name) => match local(&name) {
-                "t" => in_text = false,
-                "footnote" => {
-                    if in_note && !skip && !cur.trim().is_empty() {
-                        ordered.push(cur.trim().to_string());
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if id.is_some() {
+                    if ln == "t" {
+                        in_text = false;
                     }
-                    in_note = false;
+                    if ln == tag && depth == 0 {
+                        // Close the note: `start` is the byte offset of its `</…>`.
+                        let key = id.take().unwrap_or_default();
+                        if !skip {
+                            let number = next_number;
+                            next_number += 1;
+                            let body_xml = xml.get(body_start..start).unwrap_or("").to_string();
+                            bodies.insert(key, DocxNote { number, body_xml });
+                            if let Some(list) = ordered.as_deref_mut() {
+                                if !cur.trim().is_empty() {
+                                    list.push(cur.trim().to_string());
+                                }
+                            }
+                        }
+                    } else {
+                        depth -= 1;
+                    }
                 }
-                _ => {}
-            },
+            }
         }
     }
-    DocxFootnotes { ordered }
+    bodies
 }
 
 // ════════════════════════════════════ XLSX ════════════════════════════════════
@@ -15900,6 +16069,175 @@ mod tests {
             })
             .expect("the 'shaded' run");
         assert_eq!(run.style.background, Some([0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn docx_model_footnote_lowered_at_reference_with_styled_body() {
+        // A `<w:footnoteReference w:id="1"/>` lowers the matching `footnotes.xml`
+        // body inline at the reference point: a superscript citation marker (the
+        // note's display ordinal) followed by the note body text — even when the
+        // body run is styled (bold), the text survives via the body walker, just
+        // like the ODT `text:note` lowering.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+  <w:p>
+    <w:r><w:t>Claim</w:t></w:r>
+    <w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:footnoteReference w:id="1"/></w:r>
+    <w:r><w:t> stands.</w:t></w:r>
+  </w:p>
+</w:body></w:document>"#;
+        let footnotes = r#"<w:footnotes xmlns:w="x">
+  <w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:t>SEP</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:id="1"><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>The source.</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let bytes = build_docx(
+            doc,
+            None,
+            &[("word/footnotes.xml", footnotes.as_bytes().to_vec())],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let inlines = model_first_section_inlines(&model);
+        let text: String = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("Claim"), "host text kept: {text:?}");
+        assert!(text.contains('1'), "citation marker kept: {text:?}");
+        assert!(text.contains("The source."), "note body kept: {text:?}");
+        assert!(
+            text.contains("stands."),
+            "trailing host text kept: {text:?}"
+        );
+        // The citation marker is surfaced as a superscript run (ODT-consistent).
+        let super_run = inlines.iter().any(|i| {
+            matches!(i, Inline::Run(r)
+                if r.text == "1" && r.style.vertical_align == model::style::VAlign::Super)
+        });
+        assert!(
+            super_run,
+            "citation rendered as a superscript run: {inlines:?}"
+        );
+        // The synthetic separator note is never emitted.
+        assert!(
+            !text.contains("SEP"),
+            "separator placeholder dropped: {text:?}"
+        );
+    }
+
+    #[test]
+    fn docx_model_endnote_lowered_at_reference() {
+        // `<w:endnoteReference w:id="2"/>` lowers the matching `endnotes.xml` body
+        // inline the same way as a footnote.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+  <w:p>
+    <w:r><w:t>See</w:t></w:r>
+    <w:r><w:endnoteReference w:id="2"/></w:r>
+    <w:r><w:t> appendix.</w:t></w:r>
+  </w:p>
+</w:body></w:document>"#;
+        let endnotes = r#"<w:endnotes xmlns:w="x">
+  <w:endnote w:type="separator" w:id="-1"><w:p><w:r><w:t>SEP</w:t></w:r></w:p></w:endnote>
+  <w:endnote w:id="2"><w:p><w:r><w:t>An endnote body.</w:t></w:r></w:p></w:endnote>
+</w:endnotes>"#;
+        let bytes = build_docx(
+            doc,
+            None,
+            &[("word/endnotes.xml", endnotes.as_bytes().to_vec())],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let inlines = model_first_section_inlines(&model);
+        let text: String = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("See"), "host text kept: {text:?}");
+        assert!(
+            text.contains("An endnote body."),
+            "endnote body kept: {text:?}"
+        );
+        assert!(
+            text.contains("appendix."),
+            "trailing host text kept: {text:?}"
+        );
+        // The first real endnote is numbered 1 and surfaced as a superscript run.
+        let super_run = inlines.iter().any(|i| {
+            matches!(i, Inline::Run(r)
+                if r.text == "1" && r.style.vertical_align == model::style::VAlign::Super)
+        });
+        assert!(
+            super_run,
+            "endnote citation is a superscript run: {inlines:?}"
+        );
+        assert!(
+            !text.contains("SEP"),
+            "separator placeholder dropped: {text:?}"
+        );
+    }
+
+    #[test]
+    fn docx_model_no_notes_leaves_paragraph_unchanged() {
+        // A document with no foot-/endnotes (and no notes parts) lowers its body
+        // verbatim — no spurious citation marker is injected.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+  <w:p><w:r><w:t>Plain paragraph.</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let inlines = model_first_section_inlines(&model);
+        let text: String = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Plain paragraph.", "body lowered verbatim: {text:?}");
+        // No superscript citation runs exist.
+        let has_super = inlines.iter().any(|i| {
+            matches!(i, Inline::Run(r) if r.style.vertical_align == model::style::VAlign::Super)
+        });
+        assert!(!has_super, "no citation marker injected: {inlines:?}");
+    }
+
+    #[test]
+    fn docx_model_separator_notes_not_emitted() {
+        // A reference to a non-existent id, and the synthetic separator notes,
+        // produce no inline content (only the host text survives).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+  <w:p><w:r><w:t>Body</w:t></w:r><w:r><w:footnoteReference w:id="0"/></w:r></w:p>
+</w:body></w:document>"#;
+        let footnotes = r#"<w:footnotes xmlns:w="x">
+  <w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:t>SEPLINE</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:t>CONT</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let bytes = build_docx(
+            doc,
+            None,
+            &[("word/footnotes.xml", footnotes.as_bytes().to_vec())],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let inlines = model_first_section_inlines(&model);
+        let text: String = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Body", "only host text survives: {text:?}");
+        assert!(
+            !text.contains("SEPLINE"),
+            "separator text dropped: {text:?}"
+        );
+        assert!(
+            !text.contains("CONT"),
+            "continuation text dropped: {text:?}"
+        );
     }
 
     #[test]
