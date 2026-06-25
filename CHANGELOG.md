@@ -7,6 +7,70 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.104.0] - 2026-06-25
+
+Fidelity and capability across four subsystems — PDF→model reconstruction, annotation
+appearances, serialization (linearization + PDF 2.0), and RTF export — closing the
+issue lists [#75], [#76], [#77], [#78] — plus the previously-unreleased PDF/A archival
+conformance (veraPDF-validated, ISO 19005; full detail in
+[`sdk/CHANGELOG.md`](sdk/CHANGELOG.md)).
+
+### Added — serialization ([#77])
+
+- `serialize::PdfVersion { V1_7, V2_0 }` (+ `header()`) and version-parameterised
+  writers `to_pdf_compressed_with_header` / `to_linearized_with_header`,
+  `Document::save_optimized_with_version` / `to_linearized_with_version`. The wasm ABI
+  gains a `pdf_version` argument on `gp_save_optimized` / `gp_to_linearized`
+  (0 = 1.7, 1 = 2.0); the SDK exposes `saveOptimized({ version })`,
+  `toLinearized(version)`, `saveLinearized(version)` with `PdfVersion = "1.7" | "2.0"`.
+
+### Improved — serialization ([#77])
+
+- Linearization (Fast Web View) hint stream now records the true per-page
+  content-stream length delta (dcl) and adds the document-outline (`/O`) and
+  thread-information (`/A`) hint tables (ISO 32000-1 Annex F.3.3); qpdf re-derives and
+  validates the outline table.
+- Incremental updates match the base's cross-reference form — an xref **stream** when
+  the base uses one (PDF ≥ 1.5), a classic table otherwise; PAdES DSS /
+  document-timestamp appends inherit this. `Document::save_optimized` now emits a
+  `%PDF-1.7` banner (was 1.5); the bare `serialize::to_pdf_compressed` keeps 1.5 for
+  backward compatibility.
+
+### Improved — annotations ([#76])
+
+- Rubber-stamp `/Name` is derived from the label (21 ISO standard stamp names
+  recognised, else a clean custom name) instead of a hardcoded `Draft`.
+- FreeText centre/right quadding uses the real Core-14 AFM advance widths of the `/DA`
+  font (new `font::afm` metrics) and declares a matching `/BaseFont`; ink strokes are
+  smoothed (Catmull-Rom → cubic Bézier); Squiggly markup renders as a true sinusoid.
+- `regenerate_appearance` now synthesizes the appearance for FreeText, Stamp, Text,
+  Link, Squiggly and FileAttachment, plus new Redaction and placeholder 3D / RichMedia /
+  Movie / Sound annotations.
+
+### Improved — RTF export ([#78])
+
+- Model → RTF export emits a real per-run font table (`\fonttbl` with
+  `\froman` / `\fswiss` / `\fmodern` classes; each run selects its `\fN`) instead of a
+  single hardcoded font, and transcodes GIF / WebP / AVIF images to PNG
+  (`\pict\pngblip`) instead of dropping them (PNG / JPEG still embed verbatim).
+
+### Improved — PDF → model reconstruction ([#75])
+
+- Multi-paragraph table cells (`Cell.blocks`); header rows detected by font size /
+  shading (and footers), with `Cell.shading` / `Row.is_header` populated for ruled
+  tables; borderless decimal columns aligned on real per-glyph advances; single-gutter
+  fallback; 3-line heading promotion with a bold-subhead isolation guard; list nesting
+  on marker-format change and ordered lists starting ≠ 1; document-wide leading
+  fallback; image-only running blocks (logos) lifted as header/footer furniture; and a
+  page-number digit-fold guard so long numbers aren't mistaken for page numbers.
+
+### Added — PDF/A archival conformance
+
+- Selectable PDF/A level — `to_pdfa_level(level)` / `toPdfA(level?)` for
+  `pdfa-1b · 1a · 2b · 2u · 2a · 3b` (`PdfaLevel` enum), all veraPDF-validated
+  (`isCompliant = true`); levels 1a / 2a additionally emit the inferred Tagged-PDF
+  structure tree.
+
 ## [0.100.0] - 2026-06-25
 
 The last in-scope Office-import ([#3](https://github.com/qrcommunication/gigapdf-lib/issues/3))

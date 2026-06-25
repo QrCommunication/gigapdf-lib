@@ -107,9 +107,9 @@ The unified-model lowering helpers (`officeToModel`, `htmlToModel`,
 | `pageCount()` | `number` | Number of pages. |
 | `save()` | `Uint8Array` | Serialize to PDF bytes (plain, uncompressed streams + classic xref table — easiest to grep/debug). |
 | `saveCompressed()` | `Uint8Array` | Serialize with every uncompressed stream Flate-compressed (still a classic xref table). |
-| `saveOptimized(opts?)` | `Uint8Array` | Serialize with PDF 1.5+ **object streams** (`/ObjStm`) + a **cross-reference stream** (`/XRef`) — the most compact output (ISO 32000-1 §7.5.7/§7.5.8). `opts = { objectStreams?, xrefStreams? }` (both default `true`; `objectStreams` implies `xrefStreams`). Streams are Flate-compressed first. |
-| `toLinearized()` | `Uint8Array` | Serialize as a **linearized ("Fast Web View")** PDF (ISO 32000-1 **Annex F**): a `/Linearized` dictionary + a primary hint stream + the first page are written at the **front** so a web viewer renders page 1 before the rest downloads. Streams are Flate-compressed and embedded fonts subset. Falls back to `save()` if the document has no page tree. |
-| `saveLinearized()` | `Uint8Array` | Alias of `toLinearized()`. |
+| `saveOptimized(opts?)` | `Uint8Array` | Serialize with PDF 1.5+ **object streams** (`/ObjStm`) + a **cross-reference stream** (`/XRef`) — the most compact output (ISO 32000-1 §7.5.7/§7.5.8). `opts = { objectStreams?, xrefStreams?, version? }` (`objectStreams`/`xrefStreams` default `true`, `objectStreams` implies `xrefStreams`; `version` is `"1.7"` (default) or `"2.0"` for a **PDF 2.0** header). Streams are Flate-compressed first. |
+| `toLinearized(version?)` | `Uint8Array` | Serialize as a **linearized ("Fast Web View")** PDF (ISO 32000-1 **Annex F**): a `/Linearized` dictionary + a primary hint stream + the first page are written at the **front** so a web viewer renders page 1 before the rest downloads. The hint stream records the true per-page content-length delta and the **document-outline (`/O`)** + **thread-information (`/A`)** hint tables (Annex F.3.3). Streams are Flate-compressed and embedded fonts subset. `version` is `"1.7"` (default) or `"2.0"`. Falls back to `save()` if the document has no page tree. |
+| `saveLinearized(version?)` | `Uint8Array` | Alias of `toLinearized(version?)`. |
 | `pageInfo(page)` | `PageInfo` | `{ width, height, rotation, mediaBox }` — MediaBox size (unrotated), the `/Rotate` flag, and the raw `/MediaBox` `[x0,y0,x1,y1]` (preserves the box origin). |
 
 ### Pages
@@ -226,6 +226,7 @@ count), substituted per page. Text is drawn in standard Helvetica inside the top
 | `vectorPaths(page)` | `VectorPathInfo[]` | Every painted path for a shape layer: `{ segments (M/L/C/Z), bounds, fill, stroke, strokeWidth, fillAlpha, strokeAlpha, dash }`. Geometry in user space; `fill`/`stroke` are RGB `0..=1` or `null`; clip-only paths are omitted. The read-side counterpart of the SVG→PDF drawing helpers. |
 | `elementAt(page, x, y)` | `number` | Hit-test: index of the element under a point, or `-1`. |
 | `search(query, caseInsensitive?)` | `SearchHit[]` | Full-text search with per-hit bounding boxes. |
+| `documentLanguage()` | `DocumentLanguage` | Detect the document's dominant **script** and writing **direction** from its text — `{ direction: "ltr" \| "rtl" \| "neutral", script, lang? }` — to drive RTL handling and language tagging. |
 
 ### Editing existing content
 
@@ -320,7 +321,7 @@ Three ways to draw real, selectable text — **no host font files required**:
 | `addPolylineAnnotation(page, points, rgb?, lineWidth?)` | `boolean` | Open `/PolyLine` through a flat vertex list. |
 | `addCaretAnnotation(page, x0, y0, x1, y1, rgb?)` | `boolean` | `/Caret` insertion mark (a small upward wedge). |
 | `addMarkupAnnotation(…)` | `boolean` | Generic markup with shared reviewer metadata. |
-| `regenerateAppearance(page, index)` | `boolean` | Rebuild the 0-based annotation's `/AP` appearance from its geometry after editing its colour/border/geometry. `false` for subtypes that can't be reconstructed (FreeText/Stamp/Text/Link). |
+| `regenerateAppearance(page, index)` | `boolean` | Rebuild the 0-based annotation's `/AP` appearance from its geometry/contents after editing its colour/border/geometry. Covers Square/Circle/Line/Polygon/PolyLine/Highlight/Underline/StrikeOut/Caret/Ink (Catmull-Rom→Bézier smoothed)/Squiggly (true sinusoid)/**FreeText** (`/DA` font + `/Q` quadding via Core-14 AFM advances)/**Stamp** (`/Name` from label)/Text/Link/FileAttachment/Redact + placeholder 3D/RichMedia/Movie/Sound. `false` only when the annotation index is out of range. |
 | `removeAnnotation(page, index)` | `boolean` | Delete an annotation. |
 | `flattenAnnotations(page)` | `number` | Bake annotation appearances into page content (non-interactive). |
 
@@ -476,6 +477,10 @@ whose weights are far heavier than the lean ~540 KB WASM core. Run it host-side 
 and expose it as an endpoint; this WASM SDK provides the **text-layer** side (`addTextLayer`) so a
 host can stamp recognized words back onto the PDF to make a scan searchable. For PDFs that already
 carry text, prefer the SDK's `toText` / `structuredText` / `search` (exact, no OCR needed).
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `addTextLayer(page, runs)` | `number` | Stamp an **invisible, selectable text layer** onto `page` so a scanned/raster PDF becomes searchable. `runs` is `{ x, y, size, text, rotation? }[]` (positions in PDF user space, bottom-left) — typically the `OcrWord`s returned by the host-side `gigapdf-ocr-rten` engine. Returns the number of runs stamped. |
 
 **Engine:** shared **DBNet** detector + per-language **SVTR/CRNN + CTC** recognizers, with automatic
 per-line **script selection** (each line routed to the highest-confidence printed recognizer — no
@@ -637,6 +642,7 @@ import type {
   LinkInfo, LayerInfo, OutlineEntry, ViewerPreferences, PageLayout, PageMode,
   NamedDest, Action, Destination, Bookmark,
   SignatureInfo, SignatureReport, GradientSpec, GradientStop, Color, Attachment, XlsxSheet, DecodedImage,
+  PdfVersion,
   CollectionConfig, CollectionField, CollectionItem, CollectionView, CollectionFieldSubtype,
   MergePart,
   HtmlFontRequest, HtmlFont, HtmlResource, HtmlResourceNeed, HtmlRenderOptions,

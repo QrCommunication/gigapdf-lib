@@ -23,8 +23,8 @@ frees both; string/byte arguments are passed as `(ptr, len)`; `rgb` is packed
 | `Document::open_with_password(&[u8],&[u8])` | `gp_open_encrypted(ptr,len,pw,pwlen)` | decrypts |
 | `doc.save() -> Vec<u8>` | `gp_save(handle,outlen)` | renumbering serializer (classic xref table) |
 | `doc.save_compressed()` | `gp_save_compressed(handle,outlen)` | Flate uncompressed streams (classic xref table) |
-| `doc.save_optimized(object_streams,xref_streams)` | `gp_save_optimized(handle,object_streams,xref_streams,outlen)` | PDF 1.5+ **object streams** (`/ObjStm`) + **cross-reference stream** (`/XRef`), ISO 32000-1 §7.5.7/§7.5.8 — the most compact output; `object_streams` implies `xref_streams` |
-| `doc.to_linearized() -> Vec<u8>` | `gp_to_linearized(handle,outlen)` | **Linearized ("Fast Web View")** PDF per ISO 32000-1 **Annex F**: a `/Linearized` parameter dictionary + a primary hint stream + the first page (and only the objects needed to render it) are written at the **front**, so a web viewer renders page 1 before the whole file downloads. The remaining pages follow, then the main xref; the first-page xref chains to it via `/Prev`. Streams are Flate-compressed and embedded fonts subset. Falls back to `save` if the document has no page tree. Validated with `qpdf --check` (reports *linearized*, no warnings) |
+| `doc.save_optimized(object_streams,xref_streams)` · `doc.save_optimized_with_version(object_streams,xref_streams,version)` | `gp_save_optimized(handle,object_streams,xref_streams,pdf_version,outlen)` | PDF 1.5+ **object streams** (`/ObjStm`) + **cross-reference stream** (`/XRef`), ISO 32000-1 §7.5.7/§7.5.8 — the most compact output; `object_streams` implies `xref_streams`. The header is **`%PDF-1.7`** by default; pass a `PdfVersion` (`pdf_version`: `0` = 1.7, `1` = 2.0) to emit a **PDF 2.0** header. (The bare `serialize::to_pdf_compressed`/`…_with_header` keep a 1.5 header.) |
+| `doc.to_linearized() -> Vec<u8>` · `doc.to_linearized_with_version(version)` | `gp_to_linearized(handle,pdf_version,outlen)` | **Linearized ("Fast Web View")** PDF per ISO 32000-1 **Annex F**: a `/Linearized` parameter dictionary + a primary hint stream + the first page (and only the objects needed to render it) are written at the **front**, so a web viewer renders page 1 before the whole file downloads. The remaining pages follow, then the main xref; the first-page xref chains to it via `/Prev`. Streams are Flate-compressed and embedded fonts subset. Falls back to `save` if the document has no page tree. Validated with `qpdf --check` (reports *linearized*, no warnings). The primary hint stream records the true per-page **content-length delta (dcl)** and adds **document-outline (`/O`)** and **thread-information (`/A`)** hint tables (Annex F.3.3; qpdf re-derives and validates the outline table). Incremental updates (e.g. PAdES DSS / document-timestamp appends) match the base's cross-reference form — an xref **stream** when the base uses one. `pdf_version` (`0` = 1.7, `1` = 2.0) selects the header |
 | `doc.save_encrypted(pw,owner,id0,key,algo,perms)` | `gp_save_encrypted(handle,pw,pwlen,owner,ownerlen,id,idlen,key,keylen,algo,perms,outlen)` | algo 0=RC4-128, 1=AES-128, 2=AES-256; `key`=secret host randomness (AES-256) |
 | `doc.save_encrypted_ex(pw,owner,id0,key,algo,perms,encrypt_metadata)` | (via `gp_change_passwords`) | as `save_encrypted` but also controls `/EncryptMetadata` (ISO 32000-1 §7.6.3.2) |
 | `doc.change_passwords(user,owner,id0,key,algo,perms,encrypt_metadata)` | `gp_change_passwords(handle,user,userlen,owner,ownerlen,id,idlen,key,keylen,algo,perms,encrypt_metadata,outlen)` | re-encrypt an opened doc with new passwords (discards the prior `/Encrypt`) |
@@ -106,6 +106,7 @@ hybrid-reference PDFs resolve to their **current** state:
 | `embedded_fonts() -> Vec<EmbeddedFontInfo>` | `gp_embedded_fonts_json(handle,outlen)` |
 | `extract_font_program(name) -> Option<(Vec<u8>,fmt)>` | `gp_extract_font(handle,nameptr,namelen,outlen)` |
 | `needed_fonts() -> Vec<String>` | `gp_needed_fonts(handle,outlen)` (JSON) |
+| `Document::helvetica_width(text,size) -> f64` (advance width of `text` set in Helvetica at `size`, from the Core-14 AFM metrics — for host-side text measurement/layout) | `gp_helvetica_width(text*,size) -> f64` |
 | `font::catalog::lookup(name)` / `CATALOG` | `gp_font_catalog_json(outlen)` |
 | `font::google::css_url(family,weight,italic)` | `gp_font_request_url(famptr,famlen,weight,italic,outlen)` |
 | `font::google::parse_css_font_url(css)` | `gp_parse_css_font_url(cssptr,csslen,outlen)` |
@@ -140,7 +141,10 @@ Three complementary ways to draw real, selectable text — no host font files ne
 | `add_circle_annotation(page,rect,stroke?,fill?,lw)` / `add_caret_annotation(page,rect,rgb)` | `gp_add_circle_annot / gp_add_caret_annot` |
 | `add_polygon_annotation(page,verts,stroke?,fill?,lw)` / `add_polyline_annotation(page,verts,rgb,lw)` (closed / open path through `(x,y)` vertices) | `gp_add_polygon_annot / gp_add_polyline_annot` (flat `f64` coords) |
 | `add_ink(page,paths,rgb,lw)` / `add_stamp` | `gp_add_ink / gp_add_stamp` |
-| `regenerate_appearance(page,index)` (rebuild an existing annotation's `/AP /N` from its geometry — Square/Circle/Line/Polygon/PolyLine/Highlight/Underline/StrikeOut/Ink/Caret) | `gp_regenerate_appearance(handle,page,index)` |
+| `add_text_note(page,rect,rgb,meta?,icon?,open)` (a `/Text` sticky note — contents/author/subject/date metadata + a named icon + initial open state) | `gp_add_text_note(handle,page,x0,y0,x1,y1,…)` · SDK `addTextNote` |
+| `add_markup_annotation(page,&meta)` (generic markup carrying shared reviewer metadata — author/subject/contents/colour) | `gp_add_markup_annotation(handle,page,meta*)` · SDK `addMarkupAnnotation` |
+| `add_watermark(page,text,…)` (a positioned **text watermark** drawn into the page content; the image-watermark recipe stamps via `add_image`) | `gp_add_watermark(handle,page,…)` · SDK `addWatermark` |
+| `regenerate_appearance(page,index)` (rebuild an existing annotation's `/AP /N` from its geometry/contents — Square/Circle/Line/Polygon/PolyLine/Highlight/Underline/StrikeOut/Caret/Ink (Catmull-Rom→Bézier smoothed)/Squiggly (true sinusoid)/FreeText (`/DA` font + `/Q` quadding via Core-14 AFM advances)/Stamp (`/Name` from label)/Text/Link/FileAttachment/Redact + placeholder 3D/RichMedia/Movie/Sound) | `gp_regenerate_appearance(handle,page,index)` |
 | `page_annotations(page)` (rich: author/subject/dates/colour/opacity/quadPoints/inkList/stamp name/link target) | `gp_annotations_json(handle,page,outlen)` |
 | `remove_annotation(page,i)` | `gp_remove_annotation(handle,page,i)` |
 | `flatten_annotations(page) -> usize` | `gp_flatten_annotations(handle,page)` |
@@ -154,6 +158,7 @@ Three complementary ways to draw real, selectable text — no host font files ne
 | `add_signature_field(page,name,rect,&style)` (visible `/FT /Sig` widget for the signing pipeline; sets `/SigFlags`) | `gp_add_signature_field(handle,page,name*,rect…,style…)` |
 | `set_field_action(name,FieldTrigger,js)` (field-level JS in `/AA`: `Keystroke`=K / `Format`=F / `Validate`=V / `Calculate`=C) | `gp_set_field_script(handle,name*,trigger*,js*)` (`1`/`0`/`-2`) |
 | `set_calculation_order(&[name])` (AcroForm `/CO`) / `remove_field(name) -> bool` / `regenerate_field_appearance(name) -> bool` (rebuild `/AP` for text/choice/checkbox) | `gp_set_calculation_order(handle,names*)` / `gp_remove_field(handle,name*)` / `gp_regenerate_field_appearance(handle,name*)` |
+| `flatten_form() -> usize` (bake **every AcroForm field** appearance into the page content and drop the interactive fields — returns the count flattened; distinct from `flatten_form_xobjects`, which only de-shares form XObjects) | `gp_flatten_form(handle)` · SDK `flattenForm` |
 
 `FieldStyle { font_size, color, border, background, border_width }` controls the
 new field's appearance. In the WASM ABI it is passed as the 7 trailing scalars
@@ -162,6 +167,15 @@ border_width`; `exports`/`options` are newline-separated, `rects` is a
 comma-separated flat list of `4 × N` numbers (one rect per radio option). Every
 created widget gets a real `/AP` appearance stream and the form is flagged
 `NeedAppearances` so values display immediately and survive later edits.
+
+**Synthesised appearances.** `regenerate_appearance` (and the no-`/AP` render
+fallback) rebuild a faithful `/AP /N` for every supported subtype: FreeText honours
+its `/DA` font and `/Q` quadding using Core-14 AFM advance widths (the new
+`font::afm` metrics) and declares a matching `/BaseFont`; a Stamp's `/Name` follows
+its label (the 21 ISO standard stamp names recognised, else a clean custom name); Ink
+paths are smoothed with a Catmull-Rom→Bézier spline; Squiggly markup is drawn as a
+true sinusoid; and Redaction plus placeholder 3D / RichMedia / Movie / Sound
+annotations get a minimal visible frame.
 
 ## Pages, links, outline, metadata
 
@@ -214,6 +228,7 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `redact_pii(page,&[rect], …)` *(v0.52.4)* — **irreversible**: remove text **+ erase image pixels** (safe on scans/OCR) under an opaque mark | `gp_redact_pii(handle,page,rects_ptr,rects_count,cover_rgb,has_cover)` · SDK `redactPii(page, rects)` |
 | `save_encrypted(...)` (default **AES-256 R6**) | `gp_save_encrypted(...)` |
 | `permissions_to_p(8 flags) -> i32` / `permissions_from_p(p) -> 8 flags` (ISO 32000-1 Table 22) | `gp_permissions_to_p(…)` / `gp_permissions_from_p(p,outlen)` · SDK `permissionsToP`/`decodePermissions`/`getPermissions` |
+| `encryption_info(&[u8])` (inspect a PDF's encryption **without opening it** — whether it is encrypted, the handler/algorithm, and the decoded permission flags) | `gp_encryption_info(ptr,len,outlen)` (JSON `{encrypted, permissions, …}`) · SDK `encryptionInfo` |
 
 ### Digital signatures
 
@@ -311,6 +326,7 @@ residual Z1/Z3 edge-filter gap remains), and the lossless WHT path at `q ≤ 20`
 | `structured_text(page) -> Vec<TextLine>` | `gp_structured_text_json(handle,page,outlen)` | reading-order lines + bounds |
 | `page_blocks(page) -> Vec<Block>` | `gp_page_blocks_json(handle,page,outlen)` | **per-page** structural reconstruction (paragraphs/headings/lists/tables/shapes/images) in reading order; each text run keeps its `source_index` back to the editable operator. The streaming counterpart of `from_pdf`/`toModel` for a virtualized editor · SDK `pageBlocks` |
 | `search(query,case_insensitive) -> Vec<SearchMatch>` | `gp_search_json(handle,ptr,len,ci,outlen)` | match lines + highlight boxes |
+| `add_text_layer(page,&[TextRun]) -> usize` | `gp_add_text_layer(handle,page,data*)` · SDK `addTextLayer` | stamp an **invisible, selectable text layer** (each run `{x,y,size,text,rotation}` in PDF user space) so a scanned/raster page becomes searchable — typically the `OcrWord`s from the host-side `gigapdf-ocr-rten` engine |
 | _(OCR removed from core/WASM)_ | — | OCR is host-side: **`gigapdf-ocr-rten`** crate (PaddleOCR PP-OCR on pure-Rust RTen, 13 langs + auto script selection). See [`crates/ocr-rten/README.md`](../crates/ocr-rten/README.md) |
 
 OCR is **not** in the pure-`std` core/WASM. It runs host-side in the **`gigapdf-ocr-rten`**
@@ -400,6 +416,8 @@ Google fonts**, so the host fetches fonts in two phases.
 | `render(html, &[ProvidedFont], page_w, page_h, margin) -> Vec<u8>` | `gp_html_render` · `htmlRender` | phase 2: HTML+CSS → PDF (uniform margin) |
 | `render_with(html, &[ProvidedFont], &RenderOptions) -> Vec<u8>` | `gp_html_render_opts` · `htmlRenderWith` | phase 2 with size, per-side margins, header/footer, numbering |
 | `page_size(name) -> Option<(f64,f64)>` | `gp_page_size` · `pageSize` | resolve `"A4"`/`"a3-landscape"`/`"letter"`… → points |
+| `js::run_inline_scripts(html) -> String` | `gp_run_inline_scripts(ptr,len,outlen)` · `runInlineScripts` | run a document's inline `<script>`s on the embedded **Boa** engine and return the mutated HTML (the render paths call it automatically) |
+| `js::eval(src) -> String` | `gp_js_eval(ptr,len,outlen)` · `evalJs` | evaluate a standalone JavaScript snippet (ES2021+), returning the result stringified |
 
 - **Page setup** (`render_with` / `RenderOptions`): named or explicit size,
   per-side margins, and a **running header/footer** painted in the page margins
@@ -451,6 +469,7 @@ Google fonts**, so the host fetches fonts in two phases.
 - `Attachment { name, filename, mime, description, creation_date, mod_date, data }` (read) and `AfRelationship` (enum `Source|Data|Alternative|Supplement|Unspecified`, the filespec `/AFRelationship` for `/AF` associated files) — write via `add_attachment`/`add_associated_file`/`remove_attachment`/`add_file_attachment_annot`
 - `CollectionConfig { view: CollectionView, schema: Vec<CollectionField>, sort: Option<(String, bool)>, default_file: Option<String>, items: Vec<CollectionItem> }` — the `/Collection` **portfolio** config for `set_collection`/`collection` (`CollectionConfig::from_json`/`to_json` parse/emit the SDK object). `CollectionView` (`Details|Tile|Hidden` → `/View` `D`/`T`/`H`), `CollectionField { key, name, subtype: CollectionFieldSubtype, order, visible: Option<bool> }` (one `/CollectionField` column), `CollectionFieldSubtype` (`Text|Date|Number` user `S`/`D`/`N` + `Filename|Desc|Size|CreationDate|ModDate` synthetic), `CollectionItem { file, values: Vec<(String,String)> }` (one file's `/CI` column values)
 - `InfoFields { title, author, subject, keywords, creator, producer, creation_date, mod_date: Option<String> }` — the standard `/Info` fields shared with the XMP packet (`dc:`/`xmp:`/`pdf:`); `set_info` regenerates XMP from them (PDF dates → ISO 8601), `InfoFields::from_json` parses the SDK object
+- `serialize::PdfVersion` (enum `V1_7 | V2_0`, default `V1_7`; `header()` → the `%PDF-x.y` banner bytes) — the output PDF version for `save_optimized_with_version` / `to_linearized_with_version` and the `serialize::*_with_header` writers; across the ABI it is `pdf_version` on `gp_save_optimized`/`gp_to_linearized` (`0` = 1.7, `1` = 2.0)
 - `model::{Document, Section, Page, Block, Inline, CharStyle, CellValue, ModelOp, BlockAddr, StylePatch}`
 - `convert::{ConvPage, PlacedText, PlacedImage, PlacedShape, TextStyle, Generic}`
 

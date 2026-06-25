@@ -531,14 +531,17 @@ describe("@qrcommunication/gigapdf-lib", () => {
     expect(subtypes).toContain("PolyLine");
     expect(subtypes).toContain("Caret");
 
-    // Regenerate the first (Circle) annotation's appearance; FreeText is unsupported.
+    // Regenerate the first (Circle) annotation's appearance.
     expect(doc.regenerateAppearance(1, 0)).toBe(true);
+    // FreeText now synthesizes an appearance from its /Contents + /DA + /Q quadding (#76).
     doc.addFreeText(1, 10, 10, 100, 30, "note");
     const ftIndex = doc.annotations(1).length - 1;
-    expect(doc.regenerateAppearance(1, ftIndex)).toBe(false);
+    expect(doc.regenerateAppearance(1, ftIndex)).toBe(true);
 
     const reopened = giga.open(doc.save());
-    expect(reopened.annotations(1).map((a) => a.subtype)).toContain("Circle");
+    const reopenedSubtypes = reopened.annotations(1).map((a) => a.subtype);
+    expect(reopenedSubtypes).toContain("Circle");
+    expect(reopenedSubtypes).toContain("FreeText");
     reopened.close();
     doc.close();
   });

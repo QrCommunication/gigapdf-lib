@@ -4,14 +4,20 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.104.0] - 2026-06-25
 
-PDF/A conformance — the engine's archival export is now validated against
-[veraPDF](https://verapdf.org/) (ISO 19005). A selectable conformance level plus
-two fixes that close the gaps the validator surfaced.
+Four issue lists closed — [#75], [#76], [#77], [#78]: PDF→model reconstruction,
+annotation appearances, serialization (linearization + PDF 2.0), and RTF-export
+fidelity — plus the previously-unreleased PDF/A archival conformance
+([veraPDF](https://verapdf.org/)-validated, ISO 19005).
 
 ### Added
 
+- **PDF version selector for compact / linearized output ([#77]).** `saveOptimized`
+  accepts `{ version?: "1.7" | "2.0" }`, and `toLinearized(version)` /
+  `saveLinearized(version)` take the same; new exported type
+  `PdfVersion = "1.7" | "2.0"` (default `"1.7"`). The compact and Fast-Web-View
+  writers can now declare a PDF 2.0 header.
 - **Selectable PDF/A conformance level.** `toPdfA(level?)` accepts `"pdfa-1b"` ·
   `"pdfa-1a"` · `"pdfa-2b"` (default, backward-compatible) · `"pdfa-2u"` ·
   `"pdfa-2a"` · `"pdfa-3b"`; core `to_pdfa_level(level)` + `PdfaLevel` enum.
@@ -43,6 +49,34 @@ two fixes that close the gaps the validator surfaced.
   appearance dictionaries are reduced to `/N` only (cl. 6.3.3), the `/TR`
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
+
+### Improved
+
+- **Serialization — linearization, incremental updates & versioned output ([#77]).**
+  The Fast-Web-View (linearized) hint stream now carries the true per-page
+  content-stream length and adds the document-outline (`/O`) and thread-information
+  (`/A`) hint tables (ISO 32000-1 Annex F.3.3); incremental updates (used by signing's
+  DSS / document-timestamp appends) now match the base file's cross-reference form — an
+  xref **stream** when the base uses one. `saveOptimized()` now emits a `%PDF-1.7`
+  banner by default (was 1.5).
+- **Annotations — appearance fidelity ([#76]).** `regenerateAppearance()` now rebuilds
+  the appearance for FreeText, Stamp, Text, Link, Squiggly and FileAttachment, plus
+  Redaction and placeholder 3D / RichMedia / Movie / Sound annotations (several
+  previously returned “unsupported”; FreeText now succeeds). Rubber-stamp `/Name`
+  follows the label (ISO standard stamps recognised); FreeText centre/right alignment
+  uses the real Core-14 AFM advances of the `/DA` font; ink strokes are smoothed
+  (Catmull-Rom → Bézier) and squiggly markup renders as a true sinusoid.
+- **RTF export — fonts & images ([#78]).** `modelToRtf` / `toRtf` emit a real per-run
+  font table (`\fonttbl` with `\froman` / `\fswiss` / `\fmodern` classes; each run
+  selects its `\fN`) instead of a single hardcoded font, and transcode GIF / WebP /
+  AVIF pictures to PNG (`\pict\pngblip`) instead of dropping them.
+- **PDF → model reconstruction ([#75]).** Multi-paragraph table cells, header-row
+  detection by font size / shading (and footers), `Cell.shading` / `Row.is_header`
+  populated for ruled tables, decimal-column alignment on real glyph advances,
+  single-gutter fallback, 3-line heading promotion with a bold-subhead guard,
+  marker-format list nesting, ordered lists starting ≠ 1, document-wide leading
+  fallback, image-only header/footer (logo) detection, and a page-number digit-fold
+  guard — all flow through every PDF → Office/HTML/RTF/text conversion.
 
 ## [0.100.0] - 2026-06-25
 

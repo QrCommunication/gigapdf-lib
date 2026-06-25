@@ -1061,6 +1061,9 @@ const compact = doc.saveOptimized();   // object streams + xref stream (smallest
 // Fine-grained: an xref stream but classic object bodies (no /ObjStm).
 const xrefOnly = doc.saveOptimized({ objectStreams: false });
 
+// Declare a PDF 2.0 header instead of the 1.7 default (*v0.104.0*).
+const pdf20 = doc.saveOptimized({ version: "2.0" });
+
 doc.close();
 ```
 
@@ -1090,6 +1093,9 @@ const doc = giga.open(pdfBytes);
 // embedded fonts subset, exactly like saveCompressed().
 const webReady = doc.toLinearized();       // (saveLinearized() is an alias)
 
+// Target a PDF 2.0 header instead of the 1.7 default (*v0.104.0*):
+const webReady20 = doc.toLinearized("2.0");
+
 // Serve `webReady` with `Accept-Ranges: bytes` so the browser/viewer can fetch
 // the first-page region first and start rendering immediately.
 doc.close();
@@ -1104,7 +1110,10 @@ What you get, in file order:
    read it from the very start;
 3. the **first-page cross-reference section**, whose trailer's `/Prev` chains to
    the main xref;
-4. the document catalog, then the **primary hint stream**;
+4. the document catalog, then the **primary hint stream** — the per-page
+   offset/length table plus **document-outline (`/O`)** and **thread-information
+   (`/A`)** hint tables (Annex F.3.3), each carrying the true per-page content-length
+   delta (*v0.104.0*);
 5. the **first page** and its private objects (its content, page-only resources);
 6. the remaining pages, then the **shared** objects (page tree, cross-page fonts);
 7. the **main cross-reference table** + final trailer.
