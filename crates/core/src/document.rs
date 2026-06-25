@@ -809,7 +809,7 @@ fn pdf_ua_xmp() -> Vec<u8> {
 /// XMP/ISO-8601 timestamp (`YYYY-MM-DDThh:mm:ss±hh:mm`). Returns `None` if the
 /// year is missing or non-numeric; all parts after the year are optional and
 /// default to the start of the period (`01`/`00`).
-fn pdf_date_to_iso8601(s: &str) -> Option<String> {
+pub(crate) fn pdf_date_to_iso8601(s: &str) -> Option<String> {
     let s = s.strip_prefix("D:").unwrap_or(s);
     let b = s.as_bytes();
     let part = |start: usize, len: usize, default: &'static str| -> String {
@@ -8256,14 +8256,26 @@ impl Document {
     ///   synthesise missing `/ToUnicode` maps, so a 2u claim is only validator-
     ///   clean when the source fonts already carry them; otherwise prefer 2b.
     ///
-    /// **Note:** full PDF/A conformance also requires *every* font to be embedded
-    /// (§6.2.11.4.1). This method does **not** embed missing fonts — there is no
-    /// safe way to embed a font whose program is absent without altering the
-    /// glyphs shown (e.g. a CID-keyed font with an `Identity` `CIDToGIDMap`). For
-    /// a validator-clean result on a document with non-embedded fonts, embed them
-    /// first via [`needed_fonts`](Self::needed_fonts) +
-    /// [`embed_truetype_font`](Self::embed_truetype_font) with the correct font
-    /// bytes.
+    /// **Font embedding & forbidden constructs.** PDF/A forbids non-embedded fonts
+    /// (§6.2.11.4.1), encryption and document-level JavaScript at every level; this
+    /// method enforces all three. Every font the output references that is not
+    /// already embedded gets a program: when the original face's bytes are present
+    /// they are kept; when they are genuinely absent (the source only references a
+    /// standard/base-14 face by name) the engine **substitutes a bundled,
+    /// metric-compatible standard face** (Liberation Sans) and embeds *that* —
+    /// `crate::convert::pdfa::embed_or_substitute_fonts`. Layout is preserved because
+    /// the visible advances come from the font dictionary's own `/Widths`/`/W`
+    /// (kept verbatim, or measured from the substitute for a base-14 font that
+    /// declared none), and a `/ToUnicode` is synthesised so text stays searchable.
+    /// Any document encryption is stripped (the in-memory objects are already
+    /// decrypted) and every JavaScript trigger (`/Names /JavaScript`, a JS
+    /// `/OpenAction`, the catalog `/AA`) is removed.
+    ///
+    /// **Metadata** is taken from the document's own information fields
+    /// ([`info_fields`](Self::info_fields)): `/Title`, `/Author`, `/Subject`,
+    /// `/Keywords`, `/Creator`, `/Producer` and the creation/modification dates
+    /// populate both the `/Info` dictionary and the XMP packet (which agree), with
+    /// a sensible `/Producer`/`/Creator` default only when the field is absent.
     pub fn to_pdfa_level(&self, level: crate::convert::pdfa::PdfaLevel) -> Vec<u8> {
         use crate::object::StringKind::{Hex, Literal};
         let Ok(catalog_id) = self.catalog_id() else {
@@ -8272,11 +8284,32 @@ impl Document {
         let mut objects = self.objects.clone();
         let mut trailer = self.trailer.clone();
 
-        let meta_id = (self.next_object_number(), 0u16);
+        // PDF/A must be unencrypted (§6.1.1). The in-memory objects are already
+        // decrypted (decryption happens on open), so dropping the trailer
+        // `/Encrypt` reference and its dictionary yields a plaintext file.
+        if let Some(id) = trailer.get(b"Encrypt").and_then(Object::as_reference) {
+            objects.remove(&id);
+        }
+        trailer.remove(b"Encrypt");
+
+        // Document metadata, taken from the real /Info fields (not hard-coded), with
+        // defaults only where a field is absent. Written to both /Info and XMP so
+        // the two never drift (ISO 19005 §6.7.3).
+        let mut meta = self.info_fields();
+        if meta.producer.is_none() {
+            meta.producer = Some("GigaPDF Engine".to_string());
+        }
+        if meta.creator.is_none() {
+            meta.creator = Some("GigaPDF Engine".to_string());
+        }
+        Self::write_pdfa_info(&mut objects, &mut trailer, &meta);
+
+        let meta_id = (objects.keys().map(|(n, _)| *n).max().unwrap_or(0) + 1, 0u16);
         let icc_id = (meta_id.0 + 1, 0u16);
 
-        // XMP metadata stream (must stay uncompressed for PDF/A).
-        let xmp = crate::convert::pdfa::xmp_metadata(level, "GigaPDF Document", "GigaPDF Engine");
+        // XMP metadata stream (must stay uncompressed for PDF/A), built from the
+        // document's real metadata so it matches the /Info dictionary.
+        let xmp = crate::convert::pdfa::xmp_metadata(level, &meta);
         let mut mdict = Dictionary::new();
         mdict.set(b"Type", annot::name(b"Metadata"));
         mdict.set(b"Subtype", annot::name(b"XML"));
@@ -8357,6 +8390,16 @@ impl Document {
 
         objects.insert(catalog_id, Object::Dictionary(catalog));
 
+        // Strip document-level JavaScript (a JS /OpenAction, /Names /JavaScript,
+        // the catalog /AA) — forbidden at every PDF/A level.
+        crate::convert::pdfa::strip_javascript(&mut objects, catalog_id);
+
+        // Embed a program for every non-embedded font (substituting a bundled
+        // metric-compatible face when the original is absent) so the output never
+        // advertises a conformance a validator would reject for an unembedded font.
+        let next_free = objects.keys().map(|(n, _)| *n).max().unwrap_or(0) + 1;
+        crate::convert::pdfa::embed_or_substitute_fonts(&mut objects, next_free);
+
         // PDF/A requires a trailer /ID. Derive one deterministically.
         if !trailer.contains(b"ID") {
             let seed = format!("gigapdf:{}", objects.len());
@@ -8373,6 +8416,45 @@ impl Document {
         // Emit with the file header the level requires (1.4 for PDF/A-1, 1.7
         // otherwise) — classic xref, no object streams, for every level.
         crate::serialize::to_pdf_with_header(&objects, &trailer, level.header())
+    }
+
+    /// Write the standard `/Info` fields from `meta` into the working
+    /// `objects`/`trailer` of a PDF/A export, reusing the document's `/Info`
+    /// dictionary (or creating one + a trailer `/Info` reference). A static helper
+    /// because [`to_pdfa_level`](Self::to_pdfa_level) is `&self` and operates on a
+    /// clone; only `Some` fields are written (a `None` leaves any existing entry).
+    fn write_pdfa_info(
+        objects: &mut BTreeMap<ObjectId, Object>,
+        trailer: &mut Dictionary,
+        meta: &InfoFields,
+    ) {
+        let id = match trailer.get(b"Info").and_then(Object::as_reference) {
+            Some(id) => id,
+            None => {
+                let id = (objects.keys().map(|(n, _)| *n).max().unwrap_or(0) + 1, 0u16);
+                trailer.set(b"Info".to_vec(), Object::Reference(id));
+                id
+            }
+        };
+        let mut info = objects
+            .get(&id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        let put = |info: &mut Dictionary, key: &[u8], value: &Option<String>| {
+            if let Some(v) = value {
+                info.set(key.to_vec(), pdf_text(v));
+            }
+        };
+        put(&mut info, b"Title", &meta.title);
+        put(&mut info, b"Author", &meta.author);
+        put(&mut info, b"Subject", &meta.subject);
+        put(&mut info, b"Keywords", &meta.keywords);
+        put(&mut info, b"Creator", &meta.creator);
+        put(&mut info, b"Producer", &meta.producer);
+        put(&mut info, b"CreationDate", &meta.creation_date);
+        put(&mut info, b"ModDate", &meta.mod_date);
+        objects.insert(id, Object::Dictionary(info));
     }
 
     /// Attach **author-supplied alternate text** (`/Alt`) to a figure for the
@@ -21500,6 +21582,171 @@ mod tests {
                 "{level:?} reopen"
             );
         }
+    }
+
+    /// A document whose font is **not** embedded (the synthetic text PDFs use a
+    /// base-14 Helvetica with no `FontFile`) must, after `to_pdfa`, have *every*
+    /// font embedded: the substitute `/FontFile2` is written and the reopened
+    /// document reports no non-embedded fonts (`needed_fonts()` is empty).
+    #[test]
+    fn to_pdfa_embeds_every_non_embedded_font() {
+        let pdf = crate::convert::reverse::txt_to_pdf("font embedding required");
+        let doc = Document::open(&pdf).unwrap();
+        // Pre-condition: the source genuinely has a non-embedded font.
+        assert!(
+            !doc.needed_fonts().is_empty(),
+            "fixture must reference a non-embedded font"
+        );
+
+        let out = doc.to_pdfa();
+        assert!(
+            has_op(&out, b"/FontFile2"),
+            "PDF/A output must embed a FontFile2 for the substituted font"
+        );
+        let reopened = Document::open(&out).unwrap();
+        assert!(
+            reopened.needed_fonts().is_empty(),
+            "no font may remain non-embedded after PDF/A export, got {:?}",
+            reopened.needed_fonts()
+        );
+        // Every /Font in the reopened document carries a FontDescriptor with an
+        // embedded program (cross-check via the document's own helper).
+        for page_no in 1..=reopened.page_count() as u32 {
+            let resources = reopened.effective_resources(page_no);
+            if let Some(fonts) = resources
+                .get(b"Font")
+                .map(|o| reopened.resolve(o))
+                .and_then(Object::as_dict)
+            {
+                for value in fonts.0.values() {
+                    if let Some(font) = reopened.resolve(value).as_dict() {
+                        assert!(
+                            reopened.font_is_embedded(font),
+                            "font dict {:?} not embedded after PDF/A",
+                            font.get(b"BaseFont")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Document-level JavaScript (a `/Names /JavaScript` script) must be stripped
+    /// from the PDF/A output (ISO 19005 forbids it), and the result still reopens.
+    #[test]
+    fn to_pdfa_strips_document_javascript() {
+        let pdf = crate::convert::reverse::txt_to_pdf("js strip");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.add_document_javascript("Boot", "app.alert('hi');")
+            .unwrap();
+        // Pre-condition: the JS is really present before export.
+        assert!(
+            !doc.document_javascripts().is_empty(),
+            "fixture must carry document JavaScript"
+        );
+
+        let out = doc.to_pdfa();
+        assert!(
+            !has_op(&out, b"/JavaScript"),
+            "PDF/A output must not contain a /JavaScript name tree"
+        );
+        let reopened = Document::open(&out).unwrap();
+        assert!(
+            reopened.document_javascripts().is_empty(),
+            "no document JavaScript may survive PDF/A export"
+        );
+    }
+
+    /// A JavaScript `/OpenAction` is removed, while a plain go-to `/OpenAction`
+    /// (a destination) is permitted and must survive PDF/A export.
+    #[test]
+    fn to_pdfa_strips_js_open_action_keeps_goto() {
+        // JS OpenAction → removed.
+        let pdf = crate::convert::reverse::txt_to_pdf("open action js");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_open_action(&Action::JavaScript("doStuff();".to_string()))
+            .unwrap();
+        let out = doc.to_pdfa();
+        let reopened = Document::open(&out).unwrap();
+        assert!(
+            reopened.catalog().unwrap().get(b"OpenAction").is_none(),
+            "a JavaScript /OpenAction must be stripped"
+        );
+
+        // Go-to OpenAction → kept (it is a legal PDF/A construct).
+        let pdf2 = crate::convert::reverse::txt_to_pdf("open action goto");
+        let mut doc2 = Document::open(&pdf2).unwrap();
+        doc2.set_open_action(&Action::GoTo(crate::action::Destination::Fit { page: 1 }))
+            .unwrap();
+        let out2 = doc2.to_pdfa();
+        let reopened2 = Document::open(&out2).unwrap();
+        assert!(
+            reopened2.catalog().unwrap().get(b"OpenAction").is_some(),
+            "a go-to /OpenAction must survive PDF/A export"
+        );
+    }
+
+    /// PDF/A metadata is taken from `doc`'s real `/Info` fields, not a hard-coded
+    /// string: a title set on the document appears in both the XMP `dc:title` and
+    /// the `/Info /Title`, and the two agree.
+    #[test]
+    fn to_pdfa_metadata_reflects_document_info() {
+        let pdf = crate::convert::reverse::txt_to_pdf("metadata test");
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_metadata("Title", "Annual Filing 2026").unwrap();
+        doc.set_metadata("Author", "Régis Müller").unwrap();
+
+        let out = doc.to_pdfa();
+        // XMP dc:title carries the real title.
+        assert!(
+            has_op(
+                &out,
+                b"<rdf:li xml:lang=\"x-default\">Annual Filing 2026</rdf:li>"
+            ),
+            "XMP dc:title must reflect the document title"
+        );
+        // /Info /Title agrees.
+        let reopened = Document::open(&out).unwrap();
+        assert_eq!(
+            reopened.get_metadata("Title").as_deref(),
+            Some("Annual Filing 2026"),
+            "/Info /Title must reflect the document title"
+        );
+        assert_eq!(
+            reopened.get_metadata("Author").as_deref(),
+            Some("Régis Müller"),
+            "/Info /Author preserved"
+        );
+        // The XMP packet reflects the same title (round-tripped through reopen).
+        let xmp = String::from_utf8(reopened.xmp().unwrap()).unwrap();
+        assert!(xmp.contains("Annual Filing 2026"), "XMP retains the title");
+    }
+
+    /// PDF/A output must be unencrypted: exporting an encrypted (but opened)
+    /// document strips `/Encrypt` from both the trailer and the object map.
+    #[test]
+    fn to_pdfa_strips_encryption() {
+        let pdf = crate::convert::reverse::txt_to_pdf("encrypted source");
+        let doc = Document::open(&pdf).unwrap();
+        // Produce an RC4-encrypted PDF (algorithm 0), reopen it with the user
+        // password (objects decrypt in memory), then export to PDF/A.
+        let encrypted = doc.save_encrypted(b"user", b"owner", b"pdfa-id-0000", b"", 0, -4);
+        assert!(
+            crate::Document::encryption_info(&encrypted).encrypted,
+            "fixture must really be encrypted"
+        );
+        let reopened = Document::open_with_password(&encrypted, b"user").unwrap();
+        let out = reopened.to_pdfa();
+        assert!(
+            !has_op(&out, b"/Encrypt"),
+            "PDF/A output must not reference /Encrypt"
+        );
+        let reopened_pdfa = Document::open(&out).unwrap();
+        assert!(reopened_pdfa.page_count() >= 1);
+        assert!(
+            !crate::Document::encryption_info(&out).encrypted,
+            "PDF/A output must not be encrypted"
+        );
     }
 
     #[test]
