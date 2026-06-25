@@ -3883,6 +3883,19 @@ struct OdfModelCtx<'a> {
     /// Cell style name → `style:vertical-align`, for table-cell vertical
     /// alignment.
     cell_valign: &'a BTreeMap<String, model::CellVAlign>,
+    /// `text:list-style` name → per-level [`ListMarker`] (`Some` ⇒ ordered level,
+    /// `None`/gap ⇒ unordered bullet). Indexed by `text:level - 1`.
+    list_styles: &'a BTreeMap<String, Vec<Option<ListMarker>>>,
+}
+
+/// The list context an [`odf_walk_model`] frame inherits when it sits inside a
+/// `text:list`: the 0-based nesting `level` and the enclosing list's
+/// `text:style-name` (used to resolve ordered-vs-unordered / number format at
+/// that level). `None` (the argument) ⇒ not inside a list (plain paragraphs).
+#[derive(Clone, Copy)]
+struct OdfListCtx<'a> {
+    level: u32,
+    style: Option<&'a str>,
 }
 
 impl OdfModelCtx<'_> {
@@ -3901,6 +3914,8 @@ impl OdfModelCtx<'_> {
             std::sync::OnceLock::new();
         static EMPTY_VA: std::sync::OnceLock<BTreeMap<String, model::CellVAlign>> =
             std::sync::OnceLock::new();
+        static EMPTY_LS: std::sync::OnceLock<BTreeMap<String, Vec<Option<ListMarker>>>> =
+            std::sync::OnceLock::new();
         OdfModelCtx {
             zip,
             styles,
@@ -3908,6 +3923,7 @@ impl OdfModelCtx<'_> {
             cols: EMPTY_COLS.get_or_init(BTreeMap::new),
             cell_bg: EMPTY_BG.get_or_init(BTreeMap::new),
             cell_valign: EMPTY_VA.get_or_init(BTreeMap::new),
+            list_styles: EMPTY_LS.get_or_init(BTreeMap::new),
         }
     }
 }
@@ -3934,6 +3950,11 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // Table-cell vertical alignment, same name-keyed precedence as `cell_bg`.
     let mut cell_valign = odf_cell_valigns(&styles_xml);
     cell_valign.extend(odf_cell_valigns(&content));
+    // `text:list-style` per-level number/bullet definitions, so a `text:list`'s
+    // `text:style-name` resolves ordered-vs-unordered (and the number format) at
+    // each nesting level. Automatic styles (content.xml) win on a name clash.
+    let mut list_styles = odf_list_styles(&styles_xml);
+    list_styles.extend(odf_list_styles(&content));
     let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
     let ctx = OdfModelCtx {
         zip,
@@ -3942,6 +3963,7 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         cols: &cols,
         cell_bg: &cell_bg,
         cell_valign: &cell_valign,
+        list_styles: &list_styles,
     };
     let mut blocks = Vec::new();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
@@ -3981,15 +4003,24 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 /// body-anchored `draw:frame`/`draw:text-box` (→ [`BlockKind::TextBox`]). The
 /// context's paragraph-style map (resolved from `text:style-name`) lowers `fo:*`
 /// paragraph formatting onto each paragraph/heading.
+///
+/// `list` bundles the current list nesting level and the enclosing `text:list`'s
+/// `text:style-name` (so each list paragraph resolves ordered-vs-unordered from
+/// [`OdfModelCtx::list_styles`] at its level); `None` ⇒ plain (non-list) flow. A
+/// nested `text:list` that omits its own `text:style-name` keeps the outer one.
 fn odf_walk_model(
     x: &mut Xml,
     ctx: &OdfModelCtx,
     out: &mut Vec<Block>,
     stop: Option<&str>,
-    list_level: Option<u32>,
+    list: Option<OdfListCtx>,
     resources: &mut BTreeMap<u64, model::ImageResource>,
     outline: &mut OutlineBuilder,
 ) {
+    // Split the bundled list context into the level (paragraph indent / List
+    // item level) and the style name (ordered/marker resolution).
+    let list_level = list.map(|l| l.level);
+    let list_style = list.and_then(|l| l.style);
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
@@ -4055,20 +4086,27 @@ fn odf_walk_model(
                             runs,
                         };
                         match list_level {
-                            Some(level) => out.push(Block {
-                                kind: BlockKind::List(List {
-                                    ordered: false,
-                                    marker: ListMarker::Bullet('\u{2022}'),
-                                    items: vec![ListItem {
-                                        blocks: vec![Block {
-                                            kind: BlockKind::Paragraph(paragraph),
-                                            ..Block::default()
+                            Some(level) => {
+                                // Resolve ordered-vs-unordered (and the number
+                                // format) from the enclosing list style at this
+                                // nesting level; default to an unordered bullet
+                                // when no number style is found.
+                                let (ordered, marker) = odf_list_marker(ctx, list_style, level);
+                                out.push(Block {
+                                    kind: BlockKind::List(List {
+                                        ordered,
+                                        marker,
+                                        items: vec![ListItem {
+                                            blocks: vec![Block {
+                                                kind: BlockKind::Paragraph(paragraph),
+                                                ..Block::default()
+                                            }],
+                                            level: level.min(u8::MAX as u32) as u8,
                                         }],
-                                        level: level.min(u8::MAX as u32) as u8,
-                                    }],
-                                }),
-                                ..Block::default()
-                            }),
+                                    }),
+                                    ..Block::default()
+                                });
+                            }
                             None => out.push(Block {
                                 kind: BlockKind::Paragraph(paragraph),
                                 ..Block::default()
@@ -4090,8 +4128,15 @@ fn odf_walk_model(
                         OdfFrameContent::Empty => {}
                     },
                     "list" if !sc => {
-                        let next = Some(list_level.map(|l| l + 1).unwrap_or(0));
-                        odf_walk_model(x, ctx, out, Some("list"), next, resources, outline);
+                        let level = list_level.map(|l| l + 1).unwrap_or(0);
+                        // A nested `text:list` may restate its own
+                        // `text:style-name`; if it omits one, keep the outer
+                        // list's style so the level still resolves.
+                        let style = attr(&attrs, "style-name")
+                            .filter(|n| !n.is_empty())
+                            .or(list_style);
+                        let inner = Some(OdfListCtx { level, style });
+                        odf_walk_model(x, ctx, out, Some("list"), inner, resources, outline);
                     }
                     "table" if !sc => {
                         let table = odf_table_model(x, ctx, resources);
@@ -4602,6 +4647,17 @@ fn odf_table_model(
                     let style_name = attr(&attrs, "style-name");
                     let shading = style_name.and_then(|n| ctx.cell_bg.get(n)).copied();
                     let vertical_align = style_name.and_then(|n| ctx.cell_valign.get(n)).copied();
+                    // `table:number-{columns,rows}-spanned` define a merge anchor;
+                    // lower them onto `Cell::col_span`/`row_span` (the covered
+                    // slots that follow are dropped below). Clamp to `u16`.
+                    let col_span = attr(&attrs, "number-columns-spanned")
+                        .and_then(|v| v.trim().parse::<u16>().ok())
+                        .filter(|n| *n > 1)
+                        .unwrap_or(1);
+                    let row_span = attr(&attrs, "number-rows-spanned")
+                        .and_then(|v| v.trim().parse::<u16>().ok())
+                        .filter(|n| *n > 1)
+                        .unwrap_or(1);
                     let mut blocks = Vec::new();
                     // Cell content is not part of the document outline; its
                     // headings/bookmarks go to a discarded builder.
@@ -4619,15 +4675,21 @@ fn odf_table_model(
                         for _ in 0..repeat {
                             row.push(Cell {
                                 blocks: blocks.clone(),
+                                col_span,
+                                row_span,
                                 shading,
                                 vertical_align,
-                                ..Cell::default()
                             });
                         }
                     }
-                } else if ln == "covered-table-cell" && sc {
-                    if let Some(row) = cur_row.as_mut() {
-                        row.push(Cell::default());
+                } else if ln == "covered-table-cell" {
+                    // Merge fillers covered by a spanning anchor: the span lives on
+                    // the anchor's `col_span`/`row_span`, so these become no cells
+                    // (matching the DOCX/XLSX merge model). Drain an open form's
+                    // subtree to keep the cursor aligned; a self-closing one needs
+                    // nothing.
+                    if !sc {
+                        let _ = xml_text_until(x, "covered-table-cell");
                     }
                 }
             }
@@ -11146,6 +11208,97 @@ fn odf_column_widths(xml: &str) -> BTreeMap<String, f64> {
     map
 }
 
+/// Map an ODF `style:num-format` value to the ordered [`ListMarker`] it denotes.
+/// `1`→Decimal, `a`/`A`→lower/upper alpha, `i`/`I`→lower/upper roman. Anything
+/// else (empty, `native`, locale word formats, …) has no model slot ⇒ `None`,
+/// which downgrades the level to an unordered bullet.
+fn odf_num_format_marker(fmt: &str) -> Option<ListMarker> {
+    match fmt.trim() {
+        "1" => Some(ListMarker::Decimal),
+        "a" => Some(ListMarker::LowerAlpha),
+        "A" => Some(ListMarker::UpperAlpha),
+        "i" => Some(ListMarker::LowerRoman),
+        "I" => Some(ListMarker::UpperRoman),
+        _ => None,
+    }
+}
+
+/// Build a `list-style-name → per-level marker` map from an ODF part. Each
+/// `text:list-style` declares one entry per nesting depth: a
+/// `text:list-level-style-number` (carrying `style:num-format`) marks that level
+/// **ordered** (its [`ListMarker`] from [`odf_num_format_marker`], falling back to
+/// `Decimal` for an unrecognised but numeric style); a
+/// `text:list-level-style-bullet`/`-image` marks it **unordered** (`None`).
+///
+/// The returned `Vec` is indexed by `text:level - 1` (so a list walked at level
+/// `n` reads index `n`); a gap or out-of-range level resolves to `None`
+/// (unordered), the safe default when no number style is found. Automatic styles
+/// (content.xml) override same-named entries from styles.xml, as elsewhere.
+fn odf_list_styles(xml: &str) -> BTreeMap<String, Vec<Option<ListMarker>>> {
+    let mut map: BTreeMap<String, Vec<Option<ListMarker>>> = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "list-style" => cur_name = attr(&attrs, "name").map(|s| s.to_string()),
+                "list-level-style-number"
+                | "list-level-style-bullet"
+                | "list-level-style-image" => {
+                    if let Some(nm) = &cur_name {
+                        // `text:level` is 1-based; store at `level - 1`.
+                        let level = attr(&attrs, "level")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .filter(|&l| l >= 1)
+                            .unwrap_or(1);
+                        let marker = if local(&name) == "list-level-style-number" {
+                            // An unrecognised numeric style still reads as ordered
+                            // (Decimal) — only bullet/image levels are unordered.
+                            Some(
+                                attr(&attrs, "num-format")
+                                    .and_then(odf_num_format_marker)
+                                    .unwrap_or(ListMarker::Decimal),
+                            )
+                        } else {
+                            None
+                        };
+                        let levels = map.entry(nm.clone()).or_default();
+                        let idx = level - 1;
+                        if levels.len() <= idx {
+                            levels.resize(idx + 1, None);
+                        }
+                        levels[idx] = marker;
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "list-style" {
+                    cur_name = None;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
+/// Resolve an ODF list paragraph's `(ordered, marker)` for the model from the
+/// enclosing `text:list`'s `style_name` at nesting `level` (0-based, mapped to
+/// the style's `text:level - 1` index). A `text:list-level-style-number` level
+/// is ordered with its number-format [`ListMarker`]; a bullet/image level, an
+/// out-of-range level, or an unknown style → an unordered bullet. Mirrors
+/// [`docx_list_marker`].
+fn odf_list_marker(ctx: &OdfModelCtx, style_name: Option<&str>, level: u32) -> (bool, ListMarker) {
+    let marker = style_name
+        .and_then(|n| ctx.list_styles.get(n))
+        .and_then(|levels| levels.get(level as usize).copied().flatten());
+    match marker {
+        Some(m) => (true, m),
+        None => (false, ListMarker::Bullet('\u{2022}')),
+    }
+}
+
 /// Build a `cell-style-name → CSS` map from an ODF part, for the WYSIWYG render
 /// of spreadsheet cells. Each `style:style` (any family) contributes its
 /// `style:text-properties` (font weight/style/underline/colour/size/family) and
@@ -17513,6 +17666,202 @@ mod tests {
         let shaded = &table.rows[0].cells[0].shading;
         assert_eq!(*shaded, Some([1.0, 0.0, 0.0]), "first cell shaded red");
         assert_eq!(table.rows[0].cells[1].shading, None, "second cell unshaded");
+    }
+
+    // ── #3: ODT ordered lists + table cell column/row spans ──
+
+    /// The first `Table` block on the first page of the first section.
+    fn odt_first_table(doc: &Document) -> &Table {
+        doc.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a Table block")
+    }
+
+    #[test]
+    fn odt_model_numbered_list_is_ordered_with_decimal_marker() {
+        // A `text:list` whose style's level 1 is `text:list-level-style-number`
+        // (`style:num-format="1"`) lowers to an ordered List with the Decimal
+        // marker — not the legacy hardcoded bullet.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s">
+  <office:automatic-styles>
+    <text:list-style style:name="L1">
+      <text:list-level-style-number text:level="1" style:num-format="1"/>
+    </text:list-style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:list text:style-name="L1">
+      <text:list-item><text:p>One</text:p></text:list-item>
+      <text:list-item><text:p>Two</text:p></text:list-item>
+    </text:list>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let lists = docx_model_list_paragraphs(&model);
+        assert_eq!(lists.len(), 2, "two list paragraphs: {lists:?}");
+        assert_eq!(lists[0], (true, ListMarker::Decimal, 0, "One".to_string()));
+        assert_eq!(lists[1], (true, ListMarker::Decimal, 0, "Two".to_string()));
+    }
+
+    #[test]
+    fn odt_model_numbered_list_carries_alpha_format() {
+        // `style:num-format="a"` → the LowerAlpha marker (the number format is
+        // carried, not just the ordered flag).
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s">
+  <office:automatic-styles>
+    <text:list-style style:name="La">
+      <text:list-level-style-number text:level="1" style:num-format="a"/>
+    </text:list-style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:list text:style-name="La">
+      <text:list-item><text:p>Alpha</text:p></text:list-item>
+    </text:list>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let lists = docx_model_list_paragraphs(&model);
+        assert_eq!(
+            lists,
+            vec![(true, ListMarker::LowerAlpha, 0, "Alpha".to_string())]
+        );
+    }
+
+    #[test]
+    fn odt_model_bullet_list_stays_unordered() {
+        // A `text:list-level-style-bullet` style (and, by default, any list with
+        // no number style) stays an unordered bullet.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s">
+  <office:automatic-styles>
+    <text:list-style style:name="Lb">
+      <text:list-level-style-bullet text:level="1" text:bullet-char="•"/>
+    </text:list-style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:list text:style-name="Lb">
+      <text:list-item><text:p>Dot</text:p></text:list-item>
+    </text:list>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let lists = docx_model_list_paragraphs(&model);
+        assert_eq!(lists.len(), 1, "one list paragraph: {lists:?}");
+        assert!(!lists[0].0, "bullet list is unordered: {:?}", lists[0]);
+        assert!(
+            matches!(lists[0].1, ListMarker::Bullet(_)),
+            "bullet marker: {:?}",
+            lists[0]
+        );
+    }
+
+    #[test]
+    fn odt_model_nested_inner_numbered_level_is_ordered() {
+        // The list style declares level 1 bullet, level 2 number: the outer items
+        // stay unordered, the nested item is ordered (per-level resolution).
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s">
+  <office:automatic-styles>
+    <text:list-style style:name="Ln">
+      <text:list-level-style-bullet text:level="1" text:bullet-char="•"/>
+      <text:list-level-style-number text:level="2" style:num-format="1"/>
+    </text:list-style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:list text:style-name="Ln">
+      <text:list-item><text:p>Outer</text:p></text:list-item>
+      <text:list-item>
+        <text:list>
+          <text:list-item><text:p>Inner</text:p></text:list-item>
+        </text:list>
+      </text:list-item>
+    </text:list>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let lists = docx_model_list_paragraphs(&model);
+        // Level 0 (outer) unordered bullet; level 1 (inner, nested list inherits
+        // the outer `text:style-name`) ordered Decimal.
+        let outer = lists
+            .iter()
+            .find(|(_, _, lvl, t)| *lvl == 0 && t == "Outer")
+            .unwrap_or_else(|| panic!("outer item: {lists:?}"));
+        assert!(!outer.0, "outer level unordered: {outer:?}");
+        let inner = lists
+            .iter()
+            .find(|(_, _, lvl, t)| *lvl == 1 && t == "Inner")
+            .unwrap_or_else(|| panic!("inner item: {lists:?}"));
+        assert_eq!(
+            (inner.0, inner.1),
+            (true, ListMarker::Decimal),
+            "inner numbered level ordered Decimal: {inner:?}"
+        );
+    }
+
+    #[test]
+    fn odt_model_cell_column_span_lowered_and_covered_cell_dropped() {
+        // `table:number-columns-spanned="2"` → `Cell::col_span == 2`; the trailing
+        // `table:covered-table-cell` filler is NOT emitted (no phantom cell).
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:table="tb">
+  <office:body><office:text>
+    <table:table>
+      <table:table-row>
+        <table:table-cell table:number-columns-spanned="2"><text:p>Wide</text:p></table:table-cell>
+        <table:covered-table-cell/>
+      </table:table-row>
+      <table:table-row>
+        <table:table-cell><text:p>L</text:p></table:table-cell>
+        <table:table-cell><text:p>R</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let table = odt_first_table(&model);
+        assert_eq!(
+            table.rows[0].cells.len(),
+            1,
+            "covered filler dropped: one cell"
+        );
+        assert_eq!(table.rows[0].cells[0].col_span, 2, "col_span=2 from anchor");
+        assert_eq!(table.rows[0].cells[0].row_span, 1, "no row span");
+        assert_eq!(table.rows[1].cells.len(), 2, "plain row keeps two cells");
+    }
+
+    #[test]
+    fn odt_model_cell_row_span_lowered_and_covered_cells_dropped() {
+        // A 2×1 vertical merge: the anchor carries `row_span == 2`; the covered
+        // filler in the next row is dropped.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:table="tb">
+  <office:body><office:text>
+    <table:table>
+      <table:table-row>
+        <table:table-cell table:number-rows-spanned="2"><text:p>Tall</text:p></table:table-cell>
+        <table:table-cell><text:p>b</text:p></table:table-cell>
+      </table:table-row>
+      <table:table-row>
+        <table:covered-table-cell/>
+        <table:table-cell><text:p>c</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let table = odt_first_table(&model);
+        assert_eq!(table.rows[0].cells[0].row_span, 2, "row_span=2 from anchor");
+        assert_eq!(table.rows[0].cells[0].col_span, 1, "no col span");
+        assert_eq!(
+            table.rows[0].cells.len(),
+            2,
+            "anchor row: anchor + plain cell"
+        );
+        assert_eq!(
+            table.rows[1].cells.len(),
+            1,
+            "next row: covered filler dropped, only the plain cell remains"
+        );
     }
 
     // ── ODT → document outline (#31) ──
