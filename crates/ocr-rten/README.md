@@ -16,9 +16,11 @@ recognizers from `deepghs/paddleocr` (Hugging Face) and convert each ONNX → `.
 - **Hebrew** (`hebrew/`) — our trained CRNN; PaddleOCR ships none. Pre-trained weights on Hugging Face:
   **[`ronylicha/gigapdf-ocr-hebrew`](https://huggingface.co/ronylicha/gigapdf-ocr-hebrew)** (`model.rten`
   + `dict.txt`), or retrain with `tools/train_hebrew.py` → ONNX → `rten-convert`.
-- **Handwriting** (`latin_hw/`) — our trained CRNN (`tools/train_handwriting.py`, real IAM/RIMES/…
-  via `hw_datasets` + synthetic; standard `nn.LSTM` → **dynamic-width** ONNX → `rten-convert`).
-  Grayscale H32 `Gray32` profile, **opt-in** via `recognize_page_handwriting` / `..._with(img, "latin_hw")`.
+- **Handwriting** (`latin_hw/`) — our trained CRNN (real IAM/RIMES/… via `hw_datasets` + synthetic;
+  standard `nn.LSTM` → **dynamic-width** ONNX). Pre-trained weights on Hugging Face:
+  **[`ronylicha/gigapdf-ocr-handwriting`](https://huggingface.co/ronylicha/gigapdf-ocr-handwriting)**
+  (`model.rten` + `dict.txt`), or retrain with `tools/train_handwriting.py`. Grayscale H32 `Gray32`
+  profile, **opt-in** via `recognize_page_handwriting` / `..._with(img, "latin_hw")`.
 
 PaddleOCR PP-OCRv4/v5 covers 100+ scripts — add one by dropping `<subdir>/{model.rten,dict.txt}` in
 the models dir + an entry in `REC_MODELS` (`src/lib.rs`).

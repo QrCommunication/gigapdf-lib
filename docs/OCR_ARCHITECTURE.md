@@ -134,9 +134,10 @@ Models are **not committed** (kept out of the lean package, like fonts). At depl
 2. **Hebrew** — pull the pre-trained weights from Hugging Face
    (**`ronylicha/gigapdf-ocr-hebrew`**: `model.rten` + `dict.txt`) into `<out_dir>/hebrew/`, or retrain
    with `crates/ocr-rten/tools/train_hebrew.py` (→ ONNX → `rten-convert`).
-3. **Handwriting** (`latin_hw`) — `crates/ocr-rten/tools/train_handwriting.py` trains the CRNN on
-   real handwriting (IAM/RIMES/NorHand/… via `hw_datasets`) + synthetic lines, exports a
-   dynamic-width ONNX → `rten-convert` → `<out_dir>/latin_hw/{model.rten,dict.txt}`.
+3. **Handwriting** (`latin_hw`) — pull the pre-trained weights from Hugging Face
+   (**`ronylicha/gigapdf-ocr-handwriting`**: `model.rten` + `dict.txt`) into `<out_dir>/latin_hw/`,
+   or retrain with `crates/ocr-rten/tools/train_handwriting.py` (real IAM/RIMES/NorHand/… via
+   `hw_datasets` + synthetic → dynamic-width ONNX → `rten-convert`).
 
 Layout consumed by `load_models_dir`:
 
