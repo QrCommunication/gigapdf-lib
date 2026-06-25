@@ -27,7 +27,9 @@ use crate::model::{
     ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Section, Shape,
     Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
 };
-use crate::model::{CellValue, NamedStyle, ParagraphStyle, PlaceholderRole, StyleId, StyleTable};
+use crate::model::{
+    CellValue, NamedStyle, PageGeometry, ParagraphStyle, PlaceholderRole, StyleId, StyleTable,
+};
 
 // ───────────────────────────── shared model walkers ─────────────────────────────
 
@@ -37,12 +39,16 @@ fn hex(rgb: [f64; 3]) -> String {
     format!("{:02X}{:02X}{:02X}", q(rgb[0]), q(rgb[1]), q(rgb[2]))
 }
 
-/// A char-style's colour as hex, only when set and not (near-)black.
+/// A char-style's colour as hex when **explicitly set**, else `None`.
+///
+/// The model distinguishes an explicitly-chosen colour (`CharStyle.color =
+/// Some(_)`, even pure/near-black `Some([0,0,0])`) from an unset/default run
+/// (`None`). A document that deliberately paints a run black must round-trip
+/// that intent, so any `Some` colour emits its tag; only `None` is omitted (the
+/// format's own default — black — then applies). Applied uniformly across every
+/// exporter that colours runs (DOCX/ODT/PPTX/XLSX/ODS/Markdown/EPUB).
 fn visible_color(style: &CharStyle) -> Option<String> {
-    match style.color {
-        Some([r, g, b]) if r > 0.02 || g > 0.02 || b > 0.02 => Some(hex([r, g, b])),
-        _ => None,
-    }
+    style.color.map(hex)
 }
 
 /// Default body font size in points when a run carries none (`size_pt == 0`).
@@ -358,28 +364,44 @@ pub fn docx_from_model(doc: &Document) -> Vec<u8> {
     let mut zip = ZipWriter::new();
     let mut ctx = DocxCtx::new(&doc.resources);
 
-    let body = docx_body(doc, &mut ctx);
+    // Per-section header/footer parts. Each [`Section`] with a header/footer gets
+    // its own `headerN.xml`/`footerN.xml` (1-based by section index) referenced
+    // from that section's `w:sectPr`. Rendered up front so any lists *inside* a
+    // header/footer register their markers before `numbering.xml` is generated
+    // (their `w:numId` must resolve), matching the body render order.
+    let sect_hf: Vec<SectionHf> = doc
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let n = i + 1;
+            SectionHf {
+                header: s.header.as_ref().map(|h| docx_blocks(h, &mut ctx)),
+                footer: s.footer.as_ref().map(|f| docx_blocks(f, &mut ctx)),
+                number: n,
+            }
+        })
+        .collect();
 
-    // Render header/footer up front so any lists *inside* them register their
-    // markers before `numbering.xml` is generated (their `w:numId` must resolve).
-    let header_inner = doc
-        .sections
-        .first()
-        .and_then(|s| s.header.as_ref())
-        .map(|h| docx_blocks(h, &mut ctx));
-    let footer_inner = doc
-        .sections
-        .first()
-        .and_then(|s| s.footer.as_ref())
-        .map(|f| docx_blocks(f, &mut ctx));
-    let has_header = header_inner.is_some();
-    let has_footer = footer_inner.is_some();
+    let body = docx_body(doc, &sect_hf, &mut ctx);
+
+    // Indices (matching `sect_hf`) that actually own a header / footer part.
+    let header_nums: Vec<usize> = sect_hf
+        .iter()
+        .filter(|h| h.header.is_some())
+        .map(|h| h.number)
+        .collect();
+    let footer_nums: Vec<usize> = sect_hf
+        .iter()
+        .filter(|h| h.footer.is_some())
+        .map(|h| h.number)
+        .collect();
     let has_num = !ctx.list_markers.is_empty();
 
     let image_exts: Vec<&str> = ctx.images.iter().map(|(_, ext)| *ext).collect();
     zip.add_deflated(
         "[Content_Types].xml",
-        docx_content_types(&image_exts, has_num, has_header, has_footer).as_bytes(),
+        docx_content_types(&image_exts, has_num, &header_nums, &footer_nums).as_bytes(),
     );
     zip.add_deflated(
         "_rels/.rels",
@@ -396,7 +418,7 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
     zip.add_deflated("word/document.xml", body.as_bytes());
     zip.add_deflated(
         "word/_rels/document.xml.rels",
-        docx_rels(&image_exts, has_num, has_header, has_footer).as_bytes(),
+        docx_rels(&image_exts, has_num, &header_nums, &footer_nums).as_bytes(),
     );
     zip.add_deflated(
         "word/styles.xml",
@@ -408,22 +430,33 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
             docx_numbering_xml(&ctx.list_markers).as_bytes(),
         );
     }
-    if let Some(inner) = &header_inner {
-        zip.add_deflated(
-            "word/header1.xml",
-            docx_hdrftr_xml("hdr", inner).as_bytes(),
-        );
-    }
-    if let Some(inner) = &footer_inner {
-        zip.add_deflated(
-            "word/footer1.xml",
-            docx_hdrftr_xml("ftr", inner).as_bytes(),
-        );
+    for hf in &sect_hf {
+        if let Some(inner) = &hf.header {
+            zip.add_deflated(
+                &format!("word/header{}.xml", hf.number),
+                docx_hdrftr_xml("hdr", inner).as_bytes(),
+            );
+        }
+        if let Some(inner) = &hf.footer {
+            zip.add_deflated(
+                &format!("word/footer{}.xml", hf.number),
+                docx_hdrftr_xml("ftr", inner).as_bytes(),
+            );
+        }
     }
     for (i, (bytes, ext)) in ctx.images.iter().enumerate() {
         zip.add_deflated(&format!("word/media/image{}.{ext}", i + 1), bytes);
     }
     zip.finish()
+}
+
+/// A section's rendered running header/footer inner XML (`None` when the section
+/// carries none), plus its 1-based `number` driving the `header{n}.xml` /
+/// `footer{n}.xml` part name and the `rIdHdr{n}` / `rIdFtr{n}` relationship id.
+struct SectionHf {
+    header: Option<String>,
+    footer: Option<String>,
+    number: usize,
 }
 
 /// Mutable state threaded through a DOCX build: a flat image list (global order →
@@ -471,15 +504,24 @@ impl<'a> DocxCtx<'a> {
     }
 }
 
-fn docx_body(doc: &Document, ctx: &mut DocxCtx) -> String {
+fn docx_body(doc: &Document, sect_hf: &[SectionHf], ctx: &mut DocxCtx) -> String {
     let mut blocks = String::new();
     // A `w:bookmarkStart`/`End` pair named `page{N}` at each page boundary, the
     // jump target for an internal `LinkTarget::Page` (`HYPERLINK \l "page{N}"`).
     // `w:bookmark*` are run-level elements valid as direct `w:body` children, so
     // no extra paragraph is introduced. The `w:id` is the 1-based page number, so
     // each id is unique across the document.
+    //
+    // Per-section page setup (#2): each section carries its own geometry +
+    // running header/footer. WordprocessingML attaches a non-final section's
+    // `w:sectPr` to the `w:pPr` of the *last paragraph of that section*, and the
+    // *final* section's `w:sectPr` is a direct `w:body` child. So every section
+    // but the last is terminated by an (otherwise empty) section-break paragraph
+    // carrying its `w:sectPr`; the last section's `w:sectPr` is appended after
+    // the body content.
     let mut page_no = 0usize;
-    for section in &doc.sections {
+    let last_idx = doc.sections.len().saturating_sub(1);
+    for (si, section) in doc.sections.iter().enumerate() {
         for page in &section.pages {
             page_no += 1;
             blocks.push_str(&format!(
@@ -488,41 +530,21 @@ fn docx_body(doc: &Document, ctx: &mut DocxCtx) -> String {
             ));
             blocks.push_str(&docx_blocks(&page.blocks, ctx));
         }
+        if si != last_idx {
+            // Section break: an empty paragraph whose `w:pPr` holds this section's
+            // `w:sectPr` (geometry + its own header/footer refs).
+            blocks.push_str(&format!(
+                "<w:p><w:pPr>{}</w:pPr></w:p>",
+                docx_sect_pr(section, sect_hf.get(si))
+            ));
+        }
     }
-    // A trailing empty paragraph keeps Word happy when the body would otherwise
-    // end on a table (a `w:tbl` cannot be the last body child).
-    let geom = doc.sections.first().map(|s| s.geometry).unwrap_or_default();
-    let header_ref = if doc
-        .sections
-        .first()
-        .and_then(|s| s.header.as_ref())
-        .is_some()
-    {
-        "<w:headerReference w:type=\"default\" r:id=\"rIdHdr\"/>"
-    } else {
-        ""
+    // The final section's `w:sectPr` is a direct `w:body` child. When the document
+    // has no sections at all, fall back to the default geometry (no header/footer).
+    let final_sect = match doc.sections.last() {
+        Some(section) => docx_sect_pr(section, sect_hf.last()),
+        None => docx_sect_pr(&Section::default(), None),
     };
-    let footer_ref = if doc
-        .sections
-        .first()
-        .and_then(|s| s.footer.as_ref())
-        .is_some()
-    {
-        "<w:footerReference w:type=\"default\" r:id=\"rIdFtr\"/>"
-    } else {
-        ""
-    };
-    let sect = format!(
-        "<w:sectPr>{header_ref}{footer_ref}<w:pgSz w:w=\"{w}\" w:h=\"{h}\" w:orient=\"{o}\"/>\
-<w:pgMar w:top=\"{mt}\" w:right=\"{mr}\" w:bottom=\"{mb}\" w:left=\"{ml}\" w:header=\"{mt}\" w:footer=\"{mb}\" w:gutter=\"0\"/></w:sectPr>",
-        w = twips(geom.width),
-        h = twips(geom.height),
-        o = if geom.height >= geom.width { "portrait" } else { "landscape" },
-        mt = twips(geom.margins.top),
-        mr = twips(geom.margins.right),
-        mb = twips(geom.margins.bottom),
-        ml = twips(geom.margins.left),
-    );
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
@@ -532,7 +554,38 @@ xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
 xmlns:v=\"urn:schemas-microsoft-com:vml\" \
 xmlns:o=\"urn:schemas-microsoft-com:office:office\" \
 xmlns:w10=\"urn:schemas-microsoft-com:office:word\">\
-<w:body>{blocks}{sect}</w:body></w:document>"
+<w:body>{blocks}{final_sect}</w:body></w:document>"
+    )
+}
+
+/// One `<w:sectPr>` for a [`Section`]: its page size (`w:pgSz` with orientation),
+/// margins (`w:pgMar`), and — when the matching [`SectionHf`] carries them — its
+/// own header/footer references (`rIdHdr{n}` / `rIdFtr{n}`). `hf` is `None` only
+/// for the synthetic empty-document fallback (no header/footer then).
+fn docx_sect_pr(section: &Section, hf: Option<&SectionHf>) -> String {
+    let geom = section.geometry;
+    let header_ref = match hf {
+        Some(h) if h.header.is_some() => {
+            format!("<w:headerReference w:type=\"default\" r:id=\"rIdHdr{}\"/>", h.number)
+        }
+        _ => String::new(),
+    };
+    let footer_ref = match hf {
+        Some(h) if h.footer.is_some() => {
+            format!("<w:footerReference w:type=\"default\" r:id=\"rIdFtr{}\"/>", h.number)
+        }
+        _ => String::new(),
+    };
+    format!(
+        "<w:sectPr>{header_ref}{footer_ref}<w:pgSz w:w=\"{w}\" w:h=\"{h}\" w:orient=\"{o}\"/>\
+<w:pgMar w:top=\"{mt}\" w:right=\"{mr}\" w:bottom=\"{mb}\" w:left=\"{ml}\" w:header=\"{mt}\" w:footer=\"{mb}\" w:gutter=\"0\"/></w:sectPr>",
+        w = twips(geom.width),
+        h = twips(geom.height),
+        o = if geom.height >= geom.width { "portrait" } else { "landscape" },
+        mt = twips(geom.margins.top),
+        mr = twips(geom.margins.right),
+        mb = twips(geom.margins.bottom),
+        ml = twips(geom.margins.left),
     )
 }
 
@@ -1027,7 +1080,12 @@ xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">{inner}</w:{ta
     )
 }
 
-fn docx_content_types(image_exts: &[&str], num: bool, header: bool, footer: bool) -> String {
+fn docx_content_types(
+    image_exts: &[&str],
+    num: bool,
+    header_nums: &[usize],
+    footer_nums: &[usize],
+) -> String {
     let png = ooxml_image_defaults(image_exts);
     let mut overrides = String::from(
         "<Override PartName=\"/word/document.xml\" \
@@ -1041,17 +1099,17 @@ ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.sty
 ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>",
         );
     }
-    if header {
-        overrides.push_str(
-            "<Override PartName=\"/word/header1.xml\" \
+    for n in header_nums {
+        overrides.push_str(&format!(
+            "<Override PartName=\"/word/header{n}.xml\" \
 ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml\"/>",
-        );
+        ));
     }
-    if footer {
-        overrides.push_str(
-            "<Override PartName=\"/word/footer1.xml\" \
+    for n in footer_nums {
+        overrides.push_str(&format!(
+            "<Override PartName=\"/word/footer{n}.xml\" \
 ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml\"/>",
-        );
+        ));
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -1061,7 +1119,12 @@ ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.foo
     )
 }
 
-fn docx_rels(image_exts: &[&str], num: bool, header: bool, footer: bool) -> String {
+fn docx_rels(
+    image_exts: &[&str],
+    num: bool,
+    header_nums: &[usize],
+    footer_nums: &[usize],
+) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
@@ -1072,15 +1135,17 @@ fn docx_rels(image_exts: &[&str], num: bool, header: bool, footer: bool) -> Stri
             "<Relationship Id=\"rIdNum\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>",
         );
     }
-    if header {
-        s.push_str(
-            "<Relationship Id=\"rIdHdr\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header1.xml\"/>",
-        );
+    // One relationship per section header/footer part, ids `rIdHdr{n}`/`rIdFtr{n}`
+    // matching the `w:headerReference`/`w:footerReference` in each `w:sectPr`.
+    for n in header_nums {
+        s.push_str(&format!(
+            "<Relationship Id=\"rIdHdr{n}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/header\" Target=\"header{n}.xml\"/>",
+        ));
     }
-    if footer {
-        s.push_str(
-            "<Relationship Id=\"rIdFtr\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer1.xml\"/>",
-        );
+    for n in footer_nums {
+        s.push_str(&format!(
+            "<Relationship Id=\"rIdFtr{n}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer\" Target=\"footer{n}.xml\"/>",
+        ));
     }
     for (i, ext) in image_exts.iter().enumerate() {
         s.push_str(&format!(
@@ -2200,6 +2265,10 @@ fn pptx_slide_from_model(
     // standalone `p:pic` shapes appended after the text shapes (DrawingML runs
     // cannot embed a picture). Collected across all run contexts on this slide.
     let mut hoisted: Vec<RunPic> = Vec::new();
+    // Tables reached via a placeholder/text-box body (e.g. the page-fallback)
+    // cannot live inside a DrawingML text body, so they are hoisted to sibling
+    // `p:graphicFrame`s emitted after the text shapes (#2).
+    let mut hoisted_tables: Vec<Table> = Vec::new();
 
     // Placeholders first (title/body), positioned by their frame when present.
     for ph in &slide.placeholders {
@@ -2211,8 +2280,13 @@ fn pptx_slide_from_model(
         };
         let frame = pptx_xfrm(ph.block.frame, slide.geometry.width, slide.geometry.height);
         let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
-        let body = pptx_text_body(&block_to_paras(&ph.block), &mut rctx);
+        // Preserve real list/heading structure (and hoist tables) instead of
+        // flattening the body to plain paragraphs (#2). `pptx_collect_body`
+        // unwraps a TextBox (the page-fallback body) into its child blocks.
+        let mut built = pptx_struct_body(std::slice::from_ref(&ph.block), &mut rctx);
         hoisted.append(&mut rctx.pending_pics);
+        hoisted_tables.append(&mut built.tables);
+        let body = built.into_txbody();
         tree.push_str(&format!(
             "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"ph{id}\"/><p:cNvSpPr/>\
 <p:nvPr><p:ph type=\"{ph_type}\"{ph_idx}/></p:nvPr></p:nvSpPr>\
@@ -2271,8 +2345,12 @@ fn pptx_slide_from_model(
             _ => {
                 let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
                 let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
-                let body = pptx_text_body(&block_to_paras(sh), &mut rctx);
+                // Preserve list/heading structure (and hoist any nested table)
+                // for a free text box too (#2).
+                let mut built = pptx_struct_body(std::slice::from_ref(sh), &mut rctx);
                 hoisted.append(&mut rctx.pending_pics);
+                hoisted_tables.append(&mut built.tables);
+                let body = built.into_txbody();
                 tree.push_str(&format!(
                     "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"t{id}\"/><p:cNvSpPr txBox=\"1\"/><p:nvPr/></p:nvSpPr>\
 <p:spPr>{frame}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>{body}</p:sp>"
@@ -2280,6 +2358,23 @@ fn pptx_slide_from_model(
                 id += 1;
             }
         }
+    }
+
+    // Emit the hoisted body tables as real `a:tbl` graphicFrames (#2). They have
+    // no model frame (they came from a flowing body), so stack them down the
+    // slide with a sensible default box spanning the slide width. Done before the
+    // run-image hoists so any pictures inside a table cell are still collected.
+    for (i, table) in hoisted_tables.iter().enumerate() {
+        let r = crate::model::Rect::new(
+            0.0,
+            8.0 + 220.0 * i as f64,
+            slide.geometry.width.max(1.0),
+            200.0,
+        );
+        let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
+        tree.push_str(&pptx_table_frame(table, r, id, &mut rctx));
+        hoisted.append(&mut rctx.pending_pics);
+        id += 1;
     }
 
     // Emit the hoisted run images as standalone pictures (DrawingML run images
@@ -2338,6 +2433,144 @@ fn pptx_text_body(paras: &[Paragraph], ctx: &mut PptxRunCtx) -> String {
     }
     body.push_str("</p:txBody>");
     body
+}
+
+/// Point size for a heading at `level` (1..=6) when its runs carry no explicit
+/// size, mirroring the DOCX built-in heading scale (H1=16pt … H6=9pt). Used so a
+/// [`Heading`] reaching a slide stays visibly a heading (#2).
+const HEADING_SIZES_PT: [f64; 6] = [20.0, 17.0, 15.0, 13.0, 12.0, 11.0];
+
+/// Style a heading's paragraph for slide rendering: bold every run and bump runs
+/// that carry no explicit size to the level's heading size, so a [`Heading`]
+/// surfaced on a slide keeps its emphasis instead of degrading to body text.
+fn pptx_heading_para(h: &Heading) -> Paragraph {
+    let size = HEADING_SIZES_PT[(h.level.clamp(1, 6) - 1) as usize];
+    let mut para = h.para.clone();
+    for inline in &mut para.runs {
+        if let Inline::Run(r) = inline {
+            r.style.bold = true;
+            if r.style.size_pt <= 0.0 {
+                r.style.size_pt = size;
+            }
+        }
+    }
+    para
+}
+
+/// A slide text-body built from a structured block list, preserving real list
+/// bullets and heading emphasis. Tables — which a DrawingML text body cannot
+/// contain — are collected for hoisting into sibling `p:graphicFrame`s (#2).
+struct PptxBody {
+    /// Accumulated `<a:p>` markup (no `<p:txBody>` wrapper).
+    paras: String,
+    /// Tables encountered in the block list, to emit as graphicFrames.
+    tables: Vec<Table>,
+    /// Whether any paragraph was emitted (an empty body needs a stub `<a:p/>`).
+    any: bool,
+}
+
+impl PptxBody {
+    fn new() -> Self {
+        PptxBody {
+            paras: String::new(),
+            tables: Vec::new(),
+            any: false,
+        }
+    }
+
+    /// Wrap the accumulated paragraphs in a `<p:txBody>` (with the empty-body
+    /// stub when nothing structural was produced).
+    fn into_txbody(self) -> String {
+        let inner = if self.any {
+            self.paras
+        } else {
+            "<a:p/>".to_string()
+        };
+        format!("<p:txBody><a:bodyPr/><a:lstStyle/>{inner}</p:txBody>")
+    }
+}
+
+/// Build a slide text body from a block list, keeping lists (`a:buChar`/
+/// `a:buAutoNum` + `lvl`), headings (styled), and ordinary paragraphs as real
+/// structure; collect any tables for hoisting. Genuinely unrepresentable blocks
+/// (images, shapes, sheets, code, rules) degrade to plain paragraphs via the
+/// existing flatten — never silently dropped.
+fn pptx_struct_body(blocks: &[Block], ctx: &mut PptxRunCtx) -> PptxBody {
+    let mut body = PptxBody::new();
+    for b in blocks {
+        pptx_collect_body(b, &mut body, ctx);
+    }
+    body
+}
+
+fn pptx_collect_body(block: &Block, body: &mut PptxBody, ctx: &mut PptxRunCtx) {
+    match &block.kind {
+        BlockKind::Paragraph(p) => {
+            body.paras.push_str(&pptx_paragraph(p, ctx));
+            body.any = true;
+        }
+        BlockKind::Heading(h) => {
+            body.paras
+                .push_str(&pptx_paragraph(&pptx_heading_para(h), ctx));
+            body.any = true;
+        }
+        BlockKind::List(list) => {
+            for item in &list.items {
+                let mut first = true;
+                for ib in &item.blocks {
+                    match &ib.kind {
+                        // The item's first paragraph/heading carries the bullet.
+                        BlockKind::Paragraph(p) if first => {
+                            body.paras.push_str(&pptx_paragraph_opt(
+                                p,
+                                Some((list.marker, item.level)),
+                                ctx,
+                            ));
+                            body.any = true;
+                        }
+                        BlockKind::Heading(h) if first => {
+                            body.paras.push_str(&pptx_paragraph_opt(
+                                &pptx_heading_para(h),
+                                Some((list.marker, item.level)),
+                                ctx,
+                            ));
+                            body.any = true;
+                        }
+                        _ => pptx_collect_body(ib, body, ctx),
+                    }
+                    first = false;
+                }
+                if item.blocks.is_empty() {
+                    // An empty item still shows its bullet.
+                    body.paras.push_str(&pptx_paragraph_opt(
+                        &Paragraph::default(),
+                        Some((list.marker, item.level)),
+                        ctx,
+                    ));
+                    body.any = true;
+                }
+            }
+        }
+        BlockKind::Table(table) => body.tables.push(table.clone()),
+        BlockKind::TextBox(tb) => {
+            for ib in &tb.blocks {
+                pptx_collect_body(ib, body, ctx);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            for ib in &bq.blocks {
+                pptx_collect_body(ib, body, ctx);
+            }
+        }
+        // Genuinely unrepresentable as slide-body structure: keep the historical
+        // text-only flatten so the content still survives.
+        _ => {
+            for p in block_to_paras(block) {
+                body.paras.push_str(&pptx_paragraph(&p, ctx));
+                body.any = true;
+            }
+        }
+    }
 }
 
 /// Build a `notesSlide` part (`p:notes`, ECMA-376 §13.3.5) carrying the slide's
@@ -2532,19 +2765,46 @@ fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize, ctx: &mut PptxRunCtx)
 /// and `a:spcPts`/`a:spcPct` children for the spacing, mirroring the model→ODF
 /// mapping in [`odf_para_prop_attrs`].
 fn pptx_paragraph(para: &Paragraph, ctx: &mut PptxRunCtx) -> String {
+    pptx_paragraph_opt(para, None, ctx)
+}
+
+/// A model paragraph → `<a:p>`, optionally carrying a list bullet. When `bullet`
+/// is `Some((marker, level))` the paragraph becomes a list item: `<a:pPr>` gains
+/// the 0-based `lvl`, an indent for that depth, and a `a:buChar` (unordered) or
+/// `a:buAutoNum` (ordered) child — so a model [`List`] reaching a slide keeps its
+/// real bullet structure instead of being flattened to plain text (#2).
+fn pptx_paragraph_opt(
+    para: &Paragraph,
+    bullet: Option<(ListMarker, u8)>,
+    ctx: &mut PptxRunCtx,
+) -> String {
     let ps = &para.style;
     let mut attrs = String::new();
+    if let Some((_, level)) = bullet {
+        attrs.push_str(&format!(" lvl=\"{}\"", level.min(8)));
+    }
     // `marL` = left indent, `marR` = right indent, `indent` = first-line/hanging
     // (signed) — all in EMU (ECMA-376 §21.1.2.2.7). `algn` is the horizontal
     // alignment. Left/zero default ⇒ omit so untouched paragraphs are unchanged.
-    if ps.indent_left_pt > 0.0 {
-        attrs.push_str(&format!(" marL=\"{}\"", emu(ps.indent_left_pt)));
+    // A list item with no explicit indent gets a per-level hanging indent so its
+    // bullet/number sits in the margin (PowerPoint's usual list geometry).
+    let list_indent_pt = bullet.map(|(_, lvl)| 18.0 * (lvl as f64 + 1.0));
+    let mar_l = if ps.indent_left_pt > 0.0 {
+        Some(ps.indent_left_pt)
+    } else {
+        list_indent_pt
+    };
+    if let Some(m) = mar_l {
+        attrs.push_str(&format!(" marL=\"{}\"", emu(m)));
     }
     if ps.indent_right_pt > 0.0 {
         attrs.push_str(&format!(" marR=\"{}\"", emu(ps.indent_right_pt)));
     }
     if ps.first_line_pt != 0.0 {
         attrs.push_str(&format!(" indent=\"{}\"", emu(ps.first_line_pt)));
+    } else if list_indent_pt.is_some() {
+        // Hang the marker back to the level's left edge.
+        attrs.push_str(&format!(" indent=\"{}\"", emu(-18.0)));
     }
     attrs.push_str(match ps.align {
         Align::Left => "",
@@ -2553,9 +2813,10 @@ fn pptx_paragraph(para: &Paragraph, ctx: &mut PptxRunCtx) -> String {
         Align::Justify => " algn=\"just\"",
     });
 
-    // `CT_TextParagraphProperties` child order: lnSpc, spcBef, spcAft. Line
-    // height: a multiple → `a:spcPct` (1/1000th %, 100% = 100000); a fixed
-    // leading → `a:spcPts` (centipoints). Before/after spacing → `a:spcPts`.
+    // `CT_TextParagraphProperties` child order: lnSpc, spcBef, spcAft, then the
+    // bullet group (buFont, buChar|buAutoNum). Line height: a multiple →
+    // `a:spcPct` (1/1000th %, 100% = 100000); a fixed leading → `a:spcPts`
+    // (centipoints). Before/after spacing → `a:spcPts`.
     let mut children = String::new();
     match ps.line_height {
         LineHeight::Multiple(m) => children.push_str(&format!(
@@ -2580,6 +2841,9 @@ fn pptx_paragraph(para: &Paragraph, ctx: &mut PptxRunCtx) -> String {
             (ps.space_after_pt * 100.0).round() as i64
         ));
     }
+    if let Some((marker, _)) = bullet {
+        children.push_str(&pptx_bullet(marker));
+    }
 
     let ppr = if children.is_empty() {
         format!("<a:pPr{attrs}/>")
@@ -2590,6 +2854,26 @@ fn pptx_paragraph(para: &Paragraph, ctx: &mut PptxRunCtx) -> String {
     let mut runs = String::new();
     pptx_runs(&para.runs, ctx, &mut runs);
     format!("<a:p>{ppr}{runs}</a:p>")
+}
+
+/// The DrawingML bullet child for a [`ListMarker`]: `a:buChar` for an unordered
+/// bullet, `a:buAutoNum` (with the matching `type`) for an ordered list. The
+/// bullet font is forced to a symbol-bearing face so the glyph renders.
+fn pptx_bullet(marker: ListMarker) -> String {
+    match marker {
+        ListMarker::Bullet(c) => {
+            let mut b = String::new();
+            esc(&c.to_string(), &mut b);
+            format!(
+                "<a:buFont typeface=\"Arial\"/><a:buChar char=\"{b}\"/>"
+            )
+        }
+        ListMarker::Decimal => "<a:buAutoNum type=\"arabicPeriod\"/>".to_string(),
+        ListMarker::LowerAlpha => "<a:buAutoNum type=\"alphaLcPeriod\"/>".to_string(),
+        ListMarker::UpperAlpha => "<a:buAutoNum type=\"alphaUcPeriod\"/>".to_string(),
+        ListMarker::LowerRoman => "<a:buAutoNum type=\"romanLcPeriod\"/>".to_string(),
+        ListMarker::UpperRoman => "<a:buAutoNum type=\"romanUcPeriod\"/>".to_string(),
+    }
 }
 
 fn pptx_runs(runs: &[Inline], ctx: &mut PptxRunCtx, out: &mut String) {
@@ -2733,9 +3017,9 @@ fn pptx_rpr(style: &CharStyle, link: Option<PptxHlink>) -> String {
     // Run highlight / background → `a:highlight` (ECMA-376 §21.1.2.3.9), the
     // PPTX analogue of DOCX `w:shd@fill` and ODF `fo:background-color`. In the
     // `CT_TextCharacterProperties` child order, `a:highlight` follows the fill
-    // group (`a:solidFill`) and precedes `a:latin`, so it is emitted here. Any
-    // colour is kept (a deliberate highlight, unlike a near-black text colour);
-    // `None` ⇒ nothing, leaving plain runs unchanged.
+    // group (`a:solidFill`) and precedes `a:latin`, so it is emitted here. Like
+    // the text fill above, any explicitly-set colour is kept; `None` ⇒ nothing,
+    // leaving plain runs unchanged.
     if let Some(bg) = style.background {
         inner.push_str(&format!(
             "<a:highlight><a:srgbClr val=\"{}\"/></a:highlight>",
@@ -2924,32 +3208,206 @@ Target=\"../notesSlides/notesSlide{slide_number}.xml\"/>",
 
 // ════════════════════════════════════ ODF ════════════════════════════════════
 
+/// The ODT page-master assignment for a document's sections (#2).
+///
+/// `section_master[i]` is the index, into a de-duplicated master-page list, of
+/// section `i`'s page master — sections sharing identical geometry + running
+/// header/footer collapse onto one master. `section_switch[i]` is `Some(style)`
+/// when section `i` must begin on a *new* page master (its master differs from
+/// the previous section's): the body prepends an empty paragraph using that
+/// `style:master-page-name`-bearing style to effect the ODF page change. Section
+/// 0 is always the canonical `Standard` master and never switches.
+struct OdtSectionPlan {
+    /// Per-section index into the unique master list (`0` = `Standard`).
+    section_master: Vec<usize>,
+    /// Per-section master-switch paragraph style name, or `None` (no switch).
+    section_switch: Vec<Option<String>>,
+    /// Number of distinct masters (`>= 1`; `1` ⇒ classic single-master document).
+    master_count: usize,
+}
+
+/// The switch paragraph-style name for master index `m` (`m >= 1`; index 0 is
+/// `Standard`, which never switches). Lives as an automatic paragraph style in
+/// content.xml and carries `style:master-page-name="Master{m+1}"`.
+fn odt_switch_style_name(m: usize) -> String {
+    format!("SectMP{}", m + 1)
+}
+
+/// The `<style:master-page>` / `<style:page-layout>` names for master index `m`.
+/// Index 0 keeps the historical `Standard`/`pm1` so a single-section document is
+/// byte-identical to before; later masters are `Master{m+1}`/`pm{m+1}`.
+fn odt_master_names(m: usize) -> (String, String) {
+    if m == 0 {
+        ("Standard".to_string(), "pm1".to_string())
+    } else {
+        (format!("Master{}", m + 1), format!("pm{}", m + 1))
+    }
+}
+
+/// Decide each section's page master purely from its geometry + running
+/// header/footer (no rendering). Adjacent sections that resolve to a *different*
+/// master get a switch paragraph; identical-geometry/header/footer sections share
+/// a master and flow on (no spurious page break).
+fn odt_section_plan(doc: &Document) -> OdtSectionPlan {
+    // De-duplicate masters by (geometry, header, footer). `Section` is `PartialEq`
+    // so the triple comparison is exact; we keep one representative per unique key.
+    type MasterKey<'a> = (PageGeometry, &'a Option<Vec<Block>>, &'a Option<Vec<Block>>);
+    let mut keys: Vec<MasterKey> = Vec::new();
+    let mut section_master = Vec::with_capacity(doc.sections.len());
+    for s in &doc.sections {
+        let key = (s.geometry, &s.header, &s.footer);
+        let idx = keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+            keys.push(key);
+            keys.len() - 1
+        });
+        section_master.push(idx);
+    }
+    let master_count = keys.len().max(1);
+
+    let mut section_switch = Vec::with_capacity(section_master.len());
+    for (i, &m) in section_master.iter().enumerate() {
+        // Switch only when this section starts a different master than the one
+        // before it. Section 0 (and any section continuing the same master) does
+        // not — `Standard` (master 0) is the document's initial page master.
+        let switches = i > 0 && m != section_master[i - 1];
+        section_switch.push(switches.then(|| odt_switch_style_name(m)));
+    }
+
+    OdtSectionPlan {
+        section_master,
+        section_switch,
+        master_count,
+    }
+}
+
+/// Render the per-section page masters into styles.xml and the master-switch
+/// paragraph styles into `ctx.auto` (content.xml). Returns
+/// `(page_layouts, master_styles)`: the `<style:page-layout>` block for
+/// styles.xml's `office:automatic-styles` and the `<style:master-page>` block
+/// for its `office:master-styles`. Header/footer markup and any header/footer
+/// images/styles are rendered into `hf_ctx`.
+///
+/// One master is emitted per unique geometry/header/footer; the first is the
+/// canonical `Standard`/`pm1`. A switch style `SectMP{n}` (automatic paragraph
+/// style) carries `style:master-page-name` so the body's empty switch paragraph
+/// changes page master at the section boundary.
+///
+/// **Best-effort note:** ODF expresses a page change only via this
+/// master-page-name mechanism, so section *content* keeps flowing — there is no
+/// per-section column count, line-numbering restart, or "continuous" (no
+/// page-break) section type as in OOXML; those section features cannot map and
+/// are not represented.
+fn odt_section_styles(
+    doc: &Document,
+    plan: &OdtSectionPlan,
+    ctx: &mut OdfCtx,
+    hf_ctx: &mut OdfCtx,
+) -> (String, String) {
+    let mut page_layouts = String::new();
+    let mut master_styles = String::new();
+
+    // The representative section for each master index (first section using it).
+    for m in 0..plan.master_count {
+        let section = plan
+            .section_master
+            .iter()
+            .position(|&idx| idx == m)
+            .and_then(|si| doc.sections.get(si));
+        let geom = section.map(|s| s.geometry).unwrap_or_default();
+        let (master_name, layout_name) = odt_master_names(m);
+
+        page_layouts.push_str(&odf_page_layout(&layout_name, geom));
+
+        // Running header/footer for this master (rendered into hf_ctx so their
+        // styles/images land in styles.xml).
+        let header_xml = section
+            .and_then(|s| s.header.as_ref())
+            .map(|h| odt_blocks(h, hf_ctx));
+        let footer_xml = section
+            .and_then(|s| s.footer.as_ref())
+            .map(|f| odt_blocks(f, hf_ctx));
+        let header = match &header_xml {
+            Some(h) => format!("<style:header>{h}</style:header>"),
+            None => String::new(),
+        };
+        let footer = match &footer_xml {
+            Some(f) => format!("<style:footer>{f}</style:footer>"),
+            None => String::new(),
+        };
+        master_styles.push_str(&format!(
+            "<style:master-page style:name=\"{master_name}\" style:page-layout-name=\"{layout_name}\">{header}{footer}</style:master-page>"
+        ));
+
+        // A master-switch paragraph style for every master *after* the first.
+        if m > 0 {
+            let switch = odt_switch_style_name(m);
+            ctx.auto.push_str(&format!(
+                "<style:style style:name=\"{switch}\" style:family=\"paragraph\" \
+style:master-page-name=\"{master_name}\"/>"
+            ));
+        }
+    }
+
+    (page_layouts, master_styles)
+}
+
+/// One `<style:page-layout>` (ODF page geometry + margins) for a master page.
+/// Zero margin edges are omitted so a default geometry stays clean.
+fn odf_page_layout(name: &str, geom: PageGeometry) -> String {
+    let orient = if geom.height >= geom.width {
+        "portrait"
+    } else {
+        "landscape"
+    };
+    let m = geom.margins;
+    let mut margin_attrs = String::new();
+    if m.top > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-top=\"{}pt\"", num(m.top)));
+    }
+    if m.bottom > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-bottom=\"{}pt\"", num(m.bottom)));
+    }
+    if m.left > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-left=\"{}pt\"", num(m.left)));
+    }
+    if m.right > 0.0 {
+        margin_attrs.push_str(&format!(" fo:margin-right=\"{}pt\"", num(m.right)));
+    }
+    format!(
+        "<style:page-layout style:name=\"{name}\">\
+<style:page-layout-properties fo:page-width=\"{w}pt\" fo:page-height=\"{h}pt\" \
+style:print-orientation=\"{orient}\"{margin_attrs}/></style:page-layout>",
+        w = num(geom.width),
+        h = num(geom.height),
+    )
+}
+
 /// Serialize a [`Document`] to a **flowing** OpenDocument Text (`.odt`): real
 /// `<text:h>`/`<text:p>`, `<text:list>` for lists, `<table:table>` for tables.
 pub fn odt_from_model(doc: &Document) -> Vec<u8> {
-    let geom = doc.sections.first().map(|s| s.geometry).unwrap_or_default();
     let mut zip = ZipWriter::new();
     zip.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
 
     let mut ctx = OdfCtx::new(&doc.resources);
-    let body = odt_body(doc, &mut ctx);
 
-    // Render the first section's header/footer into their own auto-style buffer
-    // so the markup AND its styles land in styles.xml's master page (ODF keeps
-    // running header/footer styling separate from content.xml). Image counters
-    // continue from the body's so any header/footer pictures get unique names.
+    // Per-section page setup (#2): ODF has no `w:sectPr`; a page (geometry +
+    // running header/footer) change is driven by a paragraph style carrying
+    // `style:master-page-name`. `odt_section_plan` decides — purely from the
+    // section geometry/header/footer — which sections start a *new* page master
+    // (and so prepend a master-switch paragraph in the body); section 0 is the
+    // canonical `Standard`/`pm1`, kept for round-trip stability.
+    let plan = odt_section_plan(doc);
+
+    // Body first so body image indices are fixed before the header/footer images
+    // continue from them (the original numbering: body images, then h/f images).
+    let body = odt_body(doc, &plan.section_switch, &mut ctx);
+
+    // Now render the master pages: their header/footer markup + styles/images go
+    // into `hf_ctx` (styles.xml), and the master-switch paragraph styles into
+    // `ctx.auto` (content.xml). Header/footer pictures continue the body's count.
     let mut hf_ctx = OdfCtx::new(&doc.resources);
     hf_ctx.image_base = ctx.images.len();
-    let header_xml = doc
-        .sections
-        .first()
-        .and_then(|s| s.header.as_ref())
-        .map(|h| odt_blocks(h, &mut hf_ctx));
-    let footer_xml = doc
-        .sections
-        .first()
-        .and_then(|s| s.footer.as_ref())
-        .map(|f| odt_blocks(f, &mut hf_ctx));
+    let (page_layouts, master_styles) = odt_section_styles(doc, &plan, &mut ctx, &mut hf_ctx);
 
     zip.add_deflated(
         "content.xml",
@@ -2958,12 +3416,9 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
     zip.add_deflated(
         "styles.xml",
         odf_text_styles_xml(
-            geom.width,
-            geom.height,
-            geom.margins,
             &hf_ctx.auto,
-            header_xml.as_deref(),
-            footer_xml.as_deref(),
+            &page_layouts,
+            &master_styles,
             &odf_text_named_styles(&doc.styles, &doc.meta),
         )
         .as_bytes(),
@@ -3126,20 +3581,31 @@ impl<'a> OdfCtx<'a> {
     }
 }
 
-fn odt_body(doc: &Document, ctx: &mut OdfCtx) -> String {
-    // The first section's running header/footer become real `<style:header>`/
-    // `<style:footer>` in the master page (styles.xml), not inlined body text.
+fn odt_body(doc: &Document, section_switch: &[Option<String>], ctx: &mut OdfCtx) -> String {
+    // Each section's running header/footer become real `<style:header>`/
+    // `<style:footer>` in its master page (styles.xml), not inlined body text.
     let mut body = String::new();
     // A `text:bookmark` named `page{N}` at each page boundary, the jump target for
     // an internal `LinkTarget::Page` (`text:a xlink:href="#page{N}"`). ODF requires
     // a bookmark to live inside a paragraph, so it rides an empty `text:p` (as the
     // block-image/shape export wraps its drawing).
     let mut page_no = 0usize;
-    for section in &doc.sections {
-        for page in &section.pages {
+    for (si, section) in doc.sections.iter().enumerate() {
+        // Per-section page setup (#2): a section that begins a new page master
+        // carries a `style:master-page-name` switch style on its first paragraph,
+        // which forces the ODF page change + new geometry/header/footer. The
+        // switch rides the section's first page-bookmark paragraph (no extra
+        // empty paragraph). Section 0 (and same-master sections) carries none.
+        let switch_attr = section_switch
+            .get(si)
+            .and_then(|s| s.as_deref())
+            .map(|name| format!(" text:style-name=\"{name}\""))
+            .unwrap_or_default();
+        for (pi, page) in section.pages.iter().enumerate() {
             page_no += 1;
+            let attr = if pi == 0 { switch_attr.as_str() } else { "" };
             body.push_str(&format!(
-                "<text:p><text:bookmark text:name=\"page{page_no}\"/></text:p>"
+                "<text:p{attr}><text:bookmark text:name=\"page{page_no}\"/></text:p>"
             ));
             body.push_str(&odt_blocks(&page.blocks, ctx));
         }
@@ -3611,34 +4077,18 @@ xmlns:xlink=\"http://www.w3.org/1999/xlink\" office:version=\"1.3\">\
     )
 }
 
-/// The ODT `styles.xml`: a page layout (size + margins), the header/footer
-/// automatic styles, and a master page that carries any `<style:header>`/
-/// `<style:footer>`. `hf_auto` is the automatic-style markup the header/footer
-/// paragraphs reference; `header`/`footer` are their rendered block XML.
+/// The ODT `styles.xml`: the per-section page layouts + master pages (each
+/// carrying its own `<style:header>`/`<style:footer>`), the header/footer
+/// automatic styles, and the document's named styles. `page_layouts` /
+/// `master_styles` are the `<style:page-layout>` / `<style:master-page>` blocks
+/// built by [`odt_section_styles`]; `hf_auto` is the automatic-style markup the
+/// header/footer paragraphs reference.
 fn odf_text_styles_xml(
-    pw: f64,
-    ph: f64,
-    margins: crate::model::Margins,
     hf_auto: &str,
-    header: Option<&str>,
-    footer: Option<&str>,
+    page_layouts: &str,
+    master_styles: &str,
     default_styles: &str,
 ) -> String {
-    let orient = if ph >= pw { "portrait" } else { "landscape" };
-    // Page margins (omit zero edges so a default geometry stays clean).
-    let mut margin_attrs = String::new();
-    if margins.top > 0.0 {
-        margin_attrs.push_str(&format!(" fo:margin-top=\"{}pt\"", num(margins.top)));
-    }
-    if margins.bottom > 0.0 {
-        margin_attrs.push_str(&format!(" fo:margin-bottom=\"{}pt\"", num(margins.bottom)));
-    }
-    if margins.left > 0.0 {
-        margin_attrs.push_str(&format!(" fo:margin-left=\"{}pt\"", num(margins.left)));
-    }
-    if margins.right > 0.0 {
-        margin_attrs.push_str(&format!(" fo:margin-right=\"{}pt\"", num(margins.right)));
-    }
     // Header/footer images (rendered via the hf context) reference `frInl`, so
     // it must exist in this document's automatic styles too.
     let frame_style = if hf_auto.contains("frInl") {
@@ -3647,14 +4097,6 @@ fn odf_text_styles_xml(
 style:vertical-rel=\"text\"/></style:style>"
     } else {
         ""
-    };
-    let header_xml = match header {
-        Some(h) => format!("<style:header>{h}</style:header>"),
-        None => String::new(),
-    };
-    let footer_xml = match footer {
-        Some(f) => format!("<style:footer>{f}</style:footer>"),
-        None => String::new(),
     };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -3666,16 +4108,8 @@ xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
 xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\" \
 xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
 xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" office:version=\"1.3\">\
-<office:automatic-styles>{frame_style}{hf_auto}\
-<style:page-layout style:name=\"pm1\">\
-<style:page-layout-properties fo:page-width=\"{w}pt\" fo:page-height=\"{h}pt\" \
-style:print-orientation=\"{o}\"{margin_attrs}/></style:page-layout></office:automatic-styles>{default_styles}\
-<office:master-styles>\
-<style:master-page style:name=\"Standard\" style:page-layout-name=\"pm1\">{header_xml}{footer_xml}</style:master-page>\
-</office:master-styles></office:document-styles>",
-        w = num(pw),
-        h = num(ph),
-        o = orient
+<office:automatic-styles>{frame_style}{hf_auto}{page_layouts}</office:automatic-styles>{default_styles}\
+<office:master-styles>{master_styles}</office:master-styles></office:document-styles>"
     )
 }
 
@@ -4442,28 +4876,75 @@ svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">{table_
             ));
         }
         _ => {
-            // Text frame: render the block's paragraphs into a text box.
-            let sid = ctx.next_style();
-            let sname = format!("Tx{sid}");
-            ctx.auto.push_str(&format!(
-                "<style:style style:name=\"{sname}\" style:family=\"graphic\">\
+            // Text frame: render the block's content into a text box, keeping
+            // real `text:list`/`text:h` structure (via `odt_block`) instead of a
+            // paragraph flatten, and hoisting any table out to its own
+            // `draw:frame` (a `table:table` does not belong in a `draw:text-box`)
+            // (#2).
+            let mut content = String::new();
+            let mut tables: Vec<Table> = Vec::new();
+            odp_collect_frame(block, &mut content, &mut tables, ctx);
+
+            if !content.is_empty() {
+                let sid = ctx.next_style();
+                let sname = format!("Tx{sid}");
+                ctx.auto.push_str(&format!(
+                    "<style:style style:name=\"{sname}\" style:family=\"graphic\">\
 <style:graphic-properties draw:fill=\"none\" draw:stroke=\"none\" \
 draw:auto-grow-width=\"false\" draw:auto-grow-height=\"false\" fo:padding=\"0pt\" \
 draw:textarea-vertical-align=\"top\"/></style:style>"
-            ));
-            let mut content = String::new();
-            for p in block_to_paras(block) {
-                content.push_str(&odt_paragraph(&p, "p", None, ctx));
-            }
-            out.push_str(&format!(
-                "<draw:frame draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
+                ));
+                out.push_str(&format!(
+                    "<draw:frame draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
 svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"><draw:text-box>{content}</draw:text-box></draw:frame>",
-                x = num(r.x),
-                y = num(r.y),
-                w = num(r.w.max(1.0)),
-                h = num(r.h.max(1.0)),
-            ));
+                    x = num(r.x),
+                    y = num(r.y),
+                    w = num(r.w.max(1.0)),
+                    h = num(r.h.max(1.0)),
+                ));
+            }
+
+            // Hoisted tables: each a real `table:table` in its own positioned
+            // `draw:frame`, stacked down the slide with a default box.
+            for (i, table) in tables.iter().enumerate() {
+                let ty = r.y + 8.0 + 220.0 * i as f64;
+                let table_xml = odt_table(table, ctx);
+                out.push_str(&format!(
+                    "<draw:frame draw:layer=\"layout\"{pres} \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"200pt\">{table_xml}</draw:frame>",
+                    x = num(r.x),
+                    y = num(ty),
+                    w = num(r.w.max(1.0)),
+                ));
+            }
         }
+    }
+}
+
+/// Split a slide text-frame block into its text-box content (rendered with the
+/// structure-preserving [`odt_block`], so lists/headings survive) and the tables
+/// to hoist into their own `draw:frame`s. Recurses through the page-fallback's
+/// `TextBox`/`Blockquote` wrappers; everything else renders in place. A genuinely
+/// unrepresentable leaf still renders via `odt_block` (never dropped).
+fn odp_collect_frame(
+    block: &Block,
+    content: &mut String,
+    tables: &mut Vec<Table>,
+    ctx: &mut OdfCtx,
+) {
+    match &block.kind {
+        BlockKind::Table(table) => tables.push(table.clone()),
+        BlockKind::TextBox(tb) => {
+            for b in &tb.blocks {
+                odp_collect_frame(b, content, tables, ctx);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            for b in &bq.blocks {
+                odp_collect_frame(&indent_block_left(b, 24.0), content, tables, ctx);
+            }
+        }
+        _ => odt_block(block, ctx, content),
     }
 }
 
@@ -5384,8 +5865,8 @@ fn styled_run(text: &str, style: &CharStyle) -> String {
         // CommonMark has no underline; HTML <u> is the faithful representation.
         body = format!("<u>{}</u>", body);
     }
-    // CommonMark has no portable colour syntax; GFM permits inline HTML, so a
-    // non-default (non-near-black) run colour is carried by an outer
+    // CommonMark has no portable colour syntax; GFM permits inline HTML, so an
+    // explicitly-set run colour is carried by an outer
     // `<span style="color:#RRGGBB">…</span>` wrapping the emphasised body.
     if let Some(c) = visible_color(style) {
         body = format!("<span style=\"color:#{c}\">{body}</span>");
@@ -6884,6 +7365,90 @@ mod tests {
         assert!(doc.contains("<w:footerReference"));
     }
 
+    #[test]
+    fn docx_two_sections_emit_two_sectpr_with_own_geometry_and_hf() {
+        use crate::model::{Margins, PageGeometry};
+        // Section 1: A4 portrait (595.276 × 841.89 pt → 11906 × 16838 twips) with a
+        // running header. Section 2: US-Letter landscape (792 × 612 pt → 15840 ×
+        // 12240 twips) with a running footer. Each must produce its own `w:sectPr`:
+        // section 1's lives in the section-break paragraph's `w:pPr`, section 2's
+        // is the final direct `w:body` child.
+        let sec1 = Section {
+            geometry: PageGeometry {
+                width: 595.276,
+                height: 841.89,
+                margins: Margins::uniform(72.0),
+            },
+            header: Some(vec![para("SEC1 HEADER")]),
+            footer: None,
+            pages: vec![Page {
+                blocks: vec![para("section one body")],
+                absolute: false,
+            }],
+        };
+        let sec2 = Section {
+            geometry: PageGeometry {
+                width: 792.0,
+                height: 612.0,
+                margins: Margins::uniform(36.0),
+            },
+            header: None,
+            footer: Some(vec![para("SEC2 FOOTER")]),
+            pages: vec![Page {
+                blocks: vec![para("section two body")],
+                absolute: false,
+            }],
+        };
+        let doc = Document {
+            sections: vec![sec1, sec2],
+            ..Default::default()
+        };
+        let bytes = docx_from_model(&doc);
+        let xml = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+
+        // Exactly two section properties total.
+        assert_eq!(xml.matches("<w:sectPr>").count(), 2, "one w:sectPr per section: {xml}");
+        // Section 1's sectPr rides a section-break paragraph's pPr; section 2's is
+        // the trailing body-level sectPr.
+        assert!(
+            xml.contains("<w:p><w:pPr><w:sectPr>"),
+            "first section terminated by a sectPr paragraph: {xml}"
+        );
+        // Each section keeps its own page size + orientation.
+        assert!(
+            xml.contains("<w:pgSz w:w=\"11906\" w:h=\"16838\" w:orient=\"portrait\"/>"),
+            "section 1 A4 portrait pgSz: {xml}"
+        );
+        assert!(
+            xml.contains("<w:pgSz w:w=\"15840\" w:h=\"12240\" w:orient=\"landscape\"/>"),
+            "section 2 US-Letter landscape pgSz: {xml}"
+        );
+        // Per-section running header/footer references.
+        assert!(
+            xml.contains("<w:headerReference w:type=\"default\" r:id=\"rIdHdr1\"/>"),
+            "section 1 references its own header part: {xml}"
+        );
+        assert!(
+            xml.contains("<w:footerReference w:type=\"default\" r:id=\"rIdFtr2\"/>"),
+            "section 2 references its own footer part: {xml}"
+        );
+        // Distinct header/footer parts exist, one per owning section.
+        let hdr = String::from_utf8(entry(&bytes, "word/header1.xml").unwrap()).unwrap();
+        assert!(hdr.contains("SEC1 HEADER"), "section 1 header part: {hdr}");
+        let ftr = String::from_utf8(entry(&bytes, "word/footer2.xml").unwrap()).unwrap();
+        assert!(ftr.contains("SEC2 FOOTER"), "section 2 footer part: {ftr}");
+        assert!(entry(&bytes, "word/footer1.xml").is_none(), "no spurious footer1 part");
+        assert!(entry(&bytes, "word/header2.xml").is_none(), "no spurious header2 part");
+        // Content-types + rels declare the right parts.
+        let ct = String::from_utf8(entry(&bytes, "[Content_Types].xml").unwrap()).unwrap();
+        assert!(ct.contains("/word/header1.xml"), "header1 content-type override");
+        assert!(ct.contains("/word/footer2.xml"), "footer2 content-type override");
+        let rels =
+            String::from_utf8(entry(&bytes, "word/_rels/document.xml.rels").unwrap()).unwrap();
+        assert!(rels.contains("Id=\"rIdHdr1\""), "rIdHdr1 relationship: {rels}");
+        assert!(rels.contains("Id=\"rIdFtr2\""), "rIdFtr2 relationship: {rels}");
+    }
+
     /// A paragraph whose single run carries a yellow highlight.
     fn highlighted_para(text: &str, bg: [f64; 3]) -> Block {
         Block {
@@ -8037,6 +8602,116 @@ style:family=\"paragraph\""
         }
     }
 
+    /// A document with NO slide blocks whose single page carries a heading, an
+    /// (unordered) list, and a 2×2 table — so the PPTX/ODP page-fallback builds a
+    /// slide from flowing content. Used to exercise #2.
+    fn fallback_page_doc() -> Document {
+        let heading = Block {
+            kind: BlockKind::Heading(Heading {
+                level: 2,
+                para: Paragraph {
+                    runs: vec![run("Agenda")],
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        let list = Block {
+            kind: BlockKind::List(List {
+                ordered: false,
+                marker: ListMarker::Bullet('•'),
+                items: vec![
+                    ListItem {
+                        blocks: vec![para("alpha")],
+                        level: 0,
+                    },
+                    ListItem {
+                        blocks: vec![para("beta")],
+                        level: 1,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let mk = |t: &str| Cell {
+            blocks: vec![para(t)],
+            ..Default::default()
+        };
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![
+                    Row {
+                        cells: vec![mk("H1"), mk("H2")],
+                        height: None,
+                    },
+                    Row {
+                        cells: vec![mk("D1"), mk("D2")],
+                        height: None,
+                    },
+                ],
+                col_widths: vec![120.0, 120.0],
+                border: BorderStyle::default(),
+            }),
+            ..Default::default()
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![heading, list, table],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pptx_page_fallback_keeps_list_and_table_structure() {
+        // #2: a list/table/heading reaching a slide via the page-fallback must
+        // export as real structure — bulleted `a:p` (a:buChar) + an `a:tbl`
+        // graphicFrame — not a flat run of plain paragraphs.
+        let bytes = pptx_from_model(&fallback_page_doc());
+        let s = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+
+        // List items keep their bullet + nesting level.
+        assert!(s.contains("<a:buChar char=\"•\"/>"), "list bullet preserved: {s}");
+        assert!(s.contains("lvl=\"1\""), "nested list item carries its level: {s}");
+        // The table is a real DrawingML table, hoisted to a graphicFrame.
+        assert!(s.contains("<p:graphicFrame>"), "table → graphicFrame: {s}");
+        assert!(s.contains("<a:tbl>"), "real DrawingML table (not flattened): {s}");
+        assert_eq!(s.matches("<a:gridCol").count(), 2, "two grid columns");
+        // The heading text survives as a (bold) paragraph, list/cell text too.
+        for t in ["Agenda", "alpha", "beta", "H1", "D2"] {
+            assert!(s.contains(t), "text {t} preserved: {s}");
+        }
+        assert!(s.contains("<a:rPr") && s.contains(" b=\"1\""), "heading run is bold: {s}");
+    }
+
+    #[test]
+    fn odp_page_fallback_keeps_list_and_table_structure() {
+        // #2: the same fallback to ODP yields a real `text:list` (with a bullet
+        // list style) plus a hoisted `table:table` in its own draw:frame, not a
+        // paragraph flatten.
+        let bytes = odp_from_model(&fallback_page_doc());
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        assert!(content.contains("<text:list "), "real ODF list: {content}");
+        assert!(
+            content.contains("<text:h ") && content.contains("Agenda"),
+            "heading kept as text:h: {content}"
+        );
+        assert!(content.contains("<table:table"), "real ODF table (not flattened): {content}");
+        assert_eq!(
+            content.matches("<table:table-row>").count(),
+            2,
+            "two table rows: {content}"
+        );
+        for t in ["alpha", "beta", "H1", "D2"] {
+            assert!(content.contains(t), "text {t} preserved: {content}");
+        }
+    }
+
     #[test]
     fn odp_placeholder_role_emits_presentation_class() {
         // #25: a slide placeholder carries its ODF `presentation:class`
@@ -8548,6 +9223,40 @@ style:family=\"paragraph\""
     }
 
     #[test]
+    fn docx_explicit_black_run_emits_colour_tag_but_unset_omits_it() {
+        // #2: `visible_color` keys off explicit-vs-unset. A run whose colour is
+        // genuinely unset (`None`) carries no `w:color` (the DOCX default black
+        // applies); an *explicitly* black run (`Some([0,0,0])`) round-trips its
+        // deliberate choice with `<w:color w:val="000000"/>`.
+        let mut explicit = sample_doc();
+        if let BlockKind::Paragraph(p) = &mut explicit.sections[0].pages[0].blocks[1].kind {
+            p.runs = vec![Inline::Run(InlineRun {
+                text: "ink".to_string(),
+                style: CharStyle {
+                    color: Some([0.0, 0.0, 0.0]),
+                    ..Default::default()
+                },
+                source_index: None,
+            })];
+        }
+        let bytes = docx_from_model(&explicit);
+        let doc = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            doc.contains("<w:color w:val=\"000000\"/>"),
+            "explicit black run carries a colour tag: {doc}"
+        );
+
+        // A document built only from unset-colour runs must carry no `w:color` at
+        // all (the default `sample_doc` runs all leave `color: None`).
+        let plain = docx_from_model(&sample_doc());
+        let plain_doc = String::from_utf8(entry(&plain, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            !plain_doc.contains("<w:color"),
+            "unset runs carry no colour tag: {plain_doc}"
+        );
+    }
+
+    #[test]
     fn odt_export_emits_page_margins_and_running_header_footer() {
         let mut d = sample_doc();
         d.sections[0].geometry.margins = crate::model::Margins {
@@ -8577,6 +9286,113 @@ style:family=\"paragraph\""
         assert!(
             !content.contains("PAGE HEADER"),
             "header is not duplicated in the body: {content}"
+        );
+    }
+
+    #[test]
+    fn odt_two_sections_emit_distinct_master_page_per_geometry() {
+        use crate::model::{Margins, PageGeometry};
+        // Section 1: A4 portrait. Section 2: A4 landscape (geometry differs), so
+        // ODF must mint a second master page + page-layout and switch to it via a
+        // `style:master-page-name`-bearing paragraph at the boundary (#2). The
+        // first section keeps the canonical `Standard`/`pm1`.
+        let sec1 = Section {
+            geometry: PageGeometry {
+                width: 595.0,
+                height: 842.0,
+                margins: Margins::uniform(72.0),
+            },
+            header: None,
+            footer: None,
+            pages: vec![Page {
+                blocks: vec![para("portrait one")],
+                absolute: false,
+            }],
+        };
+        let sec2 = Section {
+            geometry: PageGeometry {
+                width: 842.0,
+                height: 595.0,
+                margins: Margins::uniform(36.0),
+            },
+            header: None,
+            footer: None,
+            pages: vec![Page {
+                blocks: vec![para("landscape two")],
+                absolute: false,
+            }],
+        };
+        let doc = Document {
+            sections: vec![sec1, sec2],
+            ..Default::default()
+        };
+        let bytes = odt_from_model(&doc);
+        let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+
+        // Two page layouts (pm1 + pm2) and two master pages (Standard + Master2).
+        assert!(styles.contains("style:name=\"pm1\""), "first page layout: {styles}");
+        assert!(styles.contains("style:name=\"pm2\""), "second page layout: {styles}");
+        assert!(
+            styles.contains("<style:master-page style:name=\"Standard\""),
+            "canonical Standard master: {styles}"
+        );
+        assert!(
+            styles.contains("<style:master-page style:name=\"Master2\""),
+            "second master page: {styles}"
+        );
+        // The two layouts carry their own geometry + orientation.
+        assert!(
+            styles.contains("fo:page-width=\"595pt\" fo:page-height=\"842pt\" \
+style:print-orientation=\"portrait\""),
+            "section 1 A4 portrait layout: {styles}"
+        );
+        assert!(
+            styles.contains("fo:page-width=\"842pt\" fo:page-height=\"595pt\" \
+style:print-orientation=\"landscape\""),
+            "section 2 A4 landscape layout: {styles}"
+        );
+
+        // A switch paragraph style references Master2, and the body uses it.
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:master-page-name=\"Master2\""),
+            "switch style binds to Master2: {content}"
+        );
+        assert!(
+            content.contains("text:style-name=\"SectMP2\"><text:bookmark"),
+            "section 2's first paragraph carries the master switch: {content}"
+        );
+        // Section 1 is the initial page master — no switch on its first paragraph.
+        assert!(
+            !content.contains("SectMP1"),
+            "section 1 does not switch (it is the initial Standard master): {content}"
+        );
+    }
+
+    #[test]
+    fn odt_single_section_keeps_one_master_page() {
+        // Guard: a one-section doc still mints exactly one page layout + the
+        // canonical `Standard` master, and never emits a section-switch style.
+        let bytes = odt_from_model(&sample_doc());
+        let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+        assert_eq!(
+            styles.matches("<style:page-layout ").count(),
+            1,
+            "exactly one page layout: {styles}"
+        );
+        assert_eq!(
+            styles.matches("<style:master-page ").count(),
+            1,
+            "exactly one master page: {styles}"
+        );
+        assert!(
+            styles.contains("style:name=\"Standard\""),
+            "the single master is Standard: {styles}"
+        );
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            !content.contains("master-page-name"),
+            "no master switch for a single section: {content}"
         );
     }
 
@@ -9365,16 +10181,26 @@ style:family=\"paragraph\""
     }
 
     #[test]
-    fn markdown_default_black_run_emits_no_colour_span() {
-        // A default/near-black colour is treated as "unset" → plain Markdown, no
-        // inline-HTML span (matches the other model walkers' `visible_color`).
-        let black = CharStyle {
+    fn markdown_unset_run_emits_no_colour_span_but_explicit_black_does() {
+        // `visible_color` keys off explicit-vs-unset, not the colour value: a run
+        // whose colour is genuinely unset (`None`) emits no inline-HTML span (the
+        // format default — black — applies); an *explicitly* black run
+        // (`Some([0,0,0])`) round-trips its deliberate choice with a span (#2).
+        let unset = CharStyle::default(); // color: None
+        let md = markdown_from_model(&md_doc(vec![md_para(vec![styled("plain", unset)])]));
+        assert!(!md.contains("<span"), "no colour span for unset run: {md}");
+        assert!(md.contains("plain"), "text still present: {md}");
+
+        let explicit_black = CharStyle {
             color: Some([0.0, 0.0, 0.0]),
             ..Default::default()
         };
-        let md = markdown_from_model(&md_doc(vec![md_para(vec![styled("plain", black)])]));
-        assert!(!md.contains("<span"), "no colour span for near-black: {md}");
-        assert!(md.contains("plain"), "text still present: {md}");
+        let md_black =
+            markdown_from_model(&md_doc(vec![md_para(vec![styled("ink", explicit_black)])]));
+        assert!(
+            md_black.contains("<span style=\"color:#000000\">ink</span>"),
+            "explicit black → colour span emitted: {md_black}"
+        );
     }
 
     #[test]
