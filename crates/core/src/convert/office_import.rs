@@ -3722,6 +3722,237 @@ fn pptx_custom_segments(
     out
 }
 
+/// The bullet declaration on a DrawingML `a:pPr`: a literal bullet character
+/// (`a:buChar`), an auto-numbered marker (`a:buAutoNum`, mapped to its
+/// [`ListMarker`]), or an explicit "no bullet" (`a:buNone`). `None` (absent) ⇒ the
+/// paragraph inherits its bullet from the placeholder/layout — treated as a plain
+/// paragraph here, since that inheritance is out of scope.
+#[derive(Clone, Copy, PartialEq)]
+enum PptxBullet {
+    /// `a:buNone` — explicitly unbulleted (a plain paragraph).
+    None,
+    /// `a:buChar@char` — an unordered bullet with this marker glyph.
+    Char(char),
+    /// `a:buAutoNum@type` — an ordered list with this numbering style.
+    AutoNum(ListMarker),
+}
+
+/// Streaming accumulator for one DrawingML `a:pPr` paragraph-properties subtree
+/// (the `a:pPr` open tag's attributes seed it; nested `a:spcBef`/`a:spcAft`/
+/// `a:lnSpc`/`a:buChar`/`a:buAutoNum`/`a:buNone` refine it). Folded into a model
+/// [`ParagraphStyle`] (+ a level and an optional [`PptxBullet`]) on close.
+///
+/// Distances are EMU (`@marL`/`@indent`) or hundredths-of-a-point (`a:spcPts@val`,
+/// → points); `a:spcPct@val` is thousandths of a percent (`100000` = 100%).
+#[derive(Default)]
+struct PptxParaPr {
+    /// `a:pPr@algn`: `l`/`ctr`/`r`/`just`(/`dist`/`justLow`) → model alignment.
+    align: Option<MAlign>,
+    /// `a:pPr@marL` (EMU → points): the paragraph's left indent.
+    indent_left: Option<f64>,
+    /// `a:pPr@indent` (EMU → points): the first-line indent (negative = hanging).
+    first_line: Option<f64>,
+    /// `a:pPr@lvl` (0-based nesting level; default 0).
+    level: u8,
+    /// Space before, from `a:spcBef/a:spcPts@val` (points). `a:spcPct` (relative)
+    /// has no absolute value without the font size, so it is not lowered.
+    space_before: Option<f64>,
+    /// Space after, from `a:spcAft/a:spcPts@val` (points).
+    space_after: Option<f64>,
+    /// Line height, from `a:lnSpc`: `a:spcPct@val` → a multiple, `a:spcPts@val` →
+    /// fixed points.
+    line_height: Option<MLineHeight>,
+    /// The bullet declaration (`a:buChar`/`a:buAutoNum`/`a:buNone`), if any.
+    bullet: Option<PptxBullet>,
+    /// Which spacing element is currently open, so a nested `a:spcPts`/`a:spcPct`
+    /// updates the right field. `0` = none, `1` = `a:spcBef`, `2` = `a:spcAft`,
+    /// `3` = `a:lnSpc`.
+    spc_ctx: u8,
+}
+
+impl PptxParaPr {
+    /// Seed from the `a:pPr` open-tag attributes (`@algn`/`@marL`/`@indent`/`@lvl`).
+    fn from_attrs(attrs: &[(String, String)]) -> Self {
+        PptxParaPr {
+            align: attr(attrs, "algn").and_then(pptx_align),
+            indent_left: attr(attrs, "marL").and_then(emu_to_pt),
+            first_line: attr(attrs, "indent").and_then(emu_to_pt),
+            level: attr(attrs, "lvl")
+                .and_then(|v| v.trim().parse::<u8>().ok())
+                .unwrap_or(0),
+            ..PptxParaPr::default()
+        }
+    }
+
+    /// Handle an open tag inside the `a:pPr`: enters a spacing element, reads a
+    /// nested `a:spcPts`/`a:spcPct` into the active spacing field, and records a
+    /// bullet declaration.
+    fn on_open(&mut self, ln: &str, attrs: &[(String, String)]) {
+        match ln {
+            "spcBef" => self.spc_ctx = 1,
+            "spcAft" => self.spc_ctx = 2,
+            "lnSpc" => self.spc_ctx = 3,
+            "spcPts" => {
+                // Hundredths of a point.
+                let pts = attr(attrs, "val")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .map(|v| v / 100.0);
+                match self.spc_ctx {
+                    1 => self.space_before = pts,
+                    2 => self.space_after = pts,
+                    3 => self.line_height = pts.map(MLineHeight::Points),
+                    _ => {}
+                }
+            }
+            "spcPct" => {
+                // Thousandths of a percent (100000 = 100%).
+                let pct = attr(attrs, "val").and_then(|v| v.trim().parse::<f64>().ok());
+                // Only the line spacing has a meaningful relative form here.
+                if self.spc_ctx == 3 {
+                    self.line_height = pct.map(|p| MLineHeight::Multiple(p / 100_000.0));
+                }
+            }
+            "buNone" => self.bullet = Some(PptxBullet::None),
+            "buChar" => {
+                let ch = attr(attrs, "char")
+                    .and_then(|c| c.chars().next())
+                    .unwrap_or('\u{2022}');
+                self.bullet = Some(PptxBullet::Char(ch));
+            }
+            "buAutoNum" => {
+                let marker = pptx_buautonum_marker(attr(attrs, "type"));
+                self.bullet = Some(PptxBullet::AutoNum(marker));
+            }
+            _ => {}
+        }
+    }
+
+    /// Close a spacing element (`a:spcBef`/`a:spcAft`/`a:lnSpc`), clearing the
+    /// active-spacing context so a later sibling colour/value is not misrouted.
+    fn on_close(&mut self, ln: &str) {
+        if matches!(ln, "spcBef" | "spcAft" | "lnSpc") {
+            self.spc_ctx = 0;
+        }
+    }
+
+    /// Lower the collected properties into a model [`ParagraphStyle`].
+    fn to_style(&self) -> ParagraphStyle {
+        ParagraphStyle {
+            align: self.align.unwrap_or_default(),
+            space_before_pt: self.space_before.unwrap_or(0.0),
+            space_after_pt: self.space_after.unwrap_or(0.0),
+            indent_left_pt: self.indent_left.unwrap_or(0.0),
+            indent_right_pt: 0.0,
+            first_line_pt: self.first_line.unwrap_or(0.0),
+            line_height: self.line_height.unwrap_or_default(),
+        }
+    }
+}
+
+/// Map a DrawingML `a:pPr@algn` token to the model [`Align`](MAlign):
+/// `l`→Left, `ctr`→Center, `r`→Right, `just`/`justLow`/`dist`→Justify. An
+/// unknown/absent value ⇒ `None` (the model default, Left).
+fn pptx_align(algn: &str) -> Option<MAlign> {
+    Some(match algn.trim() {
+        "l" => MAlign::Left,
+        "ctr" => MAlign::Center,
+        "r" => MAlign::Right,
+        "just" | "justLow" | "dist" | "thaiDist" => MAlign::Justify,
+        _ => return None,
+    })
+}
+
+/// Map a DrawingML `a:buAutoNum@type` to a [`ListMarker`]. The frequent
+/// arabic/roman/alpha variants map to the matching decimal/roman/alpha marker;
+/// any unrecognised (or absent) type falls back to [`ListMarker::Decimal`].
+fn pptx_buautonum_marker(ty: Option<&str>) -> ListMarker {
+    match ty.map(str::trim).unwrap_or("") {
+        t if t.starts_with("romanUc") => ListMarker::UpperRoman,
+        t if t.starts_with("romanLc") => ListMarker::LowerRoman,
+        t if t.starts_with("alphaUc") => ListMarker::UpperAlpha,
+        t if t.starts_with("alphaLc") => ListMarker::LowerAlpha,
+        // arabicPeriod / arabicParenR / arabicParenBoth / arabicPlain / … and any
+        // unknown numbering → a decimal list.
+        _ => ListMarker::Decimal,
+    }
+}
+
+/// One lowered DrawingML paragraph plus the bullet/level it carried, before list
+/// grouping: a paragraph [`Block`], its [`PptxBullet`] (`None` ⇒ plain), and its
+/// nesting `level`.
+struct PptxPara {
+    block: Block,
+    bullet: Option<PptxBullet>,
+    level: u8,
+}
+
+/// Group a slide text body's lowered paragraphs into model blocks, folding
+/// **consecutive** bulleted/numbered paragraphs into [`List`] blocks and leaving
+/// plain paragraphs (no bullet, or an explicit `a:buNone`) as standalone
+/// paragraph blocks. A run of adjacent list paragraphs whose ordered-ness matches
+/// becomes one [`List`]; its `ordered`/`marker` come from the run's first item,
+/// and each item keeps its own nesting `level`. A change of ordered-ness (or a
+/// plain paragraph) starts a fresh group, so a bullet list followed by a numbered
+/// list yields two lists.
+fn pptx_group_paras_to_blocks(paras: Vec<PptxPara>) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    // The list currently being accumulated: its (ordered, marker) and items.
+    let mut cur: Option<(bool, ListMarker, Vec<ListItem>)> = None;
+
+    // Flush the in-progress list (if any) into `out`.
+    fn flush(out: &mut Vec<Block>, cur: &mut Option<(bool, ListMarker, Vec<ListItem>)>) {
+        if let Some((ordered, marker, items)) = cur.take() {
+            if !items.is_empty() {
+                out.push(Block {
+                    kind: BlockKind::List(List {
+                        ordered,
+                        marker,
+                        items,
+                    }),
+                    ..Block::default()
+                });
+            }
+        }
+    }
+
+    for p in paras {
+        // Resolve this paragraph's list shape: a real bullet/number → an item;
+        // a plain paragraph (or `a:buNone`) → a standalone paragraph.
+        let item = match p.bullet {
+            Some(PptxBullet::Char(c)) => Some((false, ListMarker::Bullet(c))),
+            Some(PptxBullet::AutoNum(marker)) => Some((true, marker)),
+            Some(PptxBullet::None) | None => None,
+        };
+        match item {
+            Some((ordered, marker)) => {
+                let item = ListItem {
+                    blocks: vec![p.block],
+                    level: p.level,
+                };
+                match &mut cur {
+                    // Extend the open list when the ordered-ness still matches; the
+                    // first item's marker wins for the whole list.
+                    Some((cur_ordered, _, items)) if *cur_ordered == ordered => {
+                        items.push(item);
+                    }
+                    // A different ordered-ness ends the previous list and opens a new
+                    // one (a bullet list then a numbered list → two lists).
+                    _ => {
+                        flush(&mut out, &mut cur);
+                        cur = Some((ordered, marker, vec![item]));
+                    }
+                }
+            }
+            None => {
+                flush(&mut out, &mut cur);
+                out.push(p.block);
+            }
+        }
+    }
+    flush(&mut out, &mut cur);
+    out
+}
+
 /// Lower one `p:sp` shape (open consumed): its placeholder role (`p:ph@type`),
 /// its own `a:xfrm` (→ absolute frame) and its `p:txBody` paragraphs (→ a
 /// [`TextBox`]). A placeholder with no own `a:xfrm` inherits geometry from the
@@ -3780,7 +4011,7 @@ fn pptx_shape_or_textbox(
     let mut xfrm = XfrmBox::default();
     let mut have_xfrm = false;
     let mut style = PptxShapeStyle::default();
-    let mut paras: Vec<Block> = Vec::new();
+    let mut paras: Vec<PptxPara> = Vec::new();
 
     // Per-paragraph scratch.
     let mut para_runs: Vec<Inline> = Vec::new();
@@ -3788,6 +4019,10 @@ fn pptx_shape_or_textbox(
     let mut run = RunStyle::default();
     let mut rpr = PptxRunPr::default();
     let mut in_text = false;
+    // The current paragraph's `a:pPr` (alignment / indent / spacing / bullet),
+    // collected while `in_ppr`. Reset at every `a:p`.
+    let mut ppr = PptxParaPr::default();
+    let mut in_ppr = false;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -3809,6 +4044,14 @@ fn pptx_shape_or_textbox(
                 "p" if !sc => {
                     in_para = true;
                     para_runs = Vec::new();
+                    ppr = PptxParaPr::default();
+                }
+                // The paragraph properties: alignment/indent/spacing on the open
+                // tag, bullet/spacing in nested children (routed while `in_ppr`).
+                "pPr" => {
+                    ppr = PptxParaPr::from_attrs(&attrs);
+                    // A non-self-closing `a:pPr` keeps collecting its children.
+                    in_ppr = !sc;
                 }
                 "t" if !sc => in_text = true,
                 "br" => para_runs.push(Inline::LineBreak),
@@ -3822,6 +4065,8 @@ fn pptx_shape_or_textbox(
                 }
                 // Any other tag inside an open `a:rPr` (colour / latin / hlink).
                 ln if rpr.active => rpr.on_open(ln, &attrs),
+                // A child of the paragraph properties (bullet / spacing).
+                ln if in_ppr => ppr.on_open(ln, &attrs),
                 _ => {}
             },
             Tok::Text(t) => {
@@ -3831,16 +4076,24 @@ fn pptx_shape_or_textbox(
             }
             Tok::Close(name) => match local(&name) {
                 "t" => in_text = false,
+                "pPr" => in_ppr = false,
                 // Inside an open `a:rPr`: update fill nesting; fold on `</a:rPr>`.
                 ln if rpr.active && rpr.on_close(ln) => rpr.close(&mut run, theme, rels),
+                // Inside the paragraph properties: close a spacing element.
+                ln if in_ppr => ppr.on_close(ln),
                 "p" => {
                     if in_para && !para_runs.is_empty() {
-                        paras.push(Block {
-                            kind: BlockKind::Paragraph(Paragraph {
-                                runs: std::mem::take(&mut para_runs),
-                                ..Paragraph::default()
-                            }),
-                            ..Block::default()
+                        paras.push(PptxPara {
+                            block: Block {
+                                kind: BlockKind::Paragraph(Paragraph {
+                                    style: ppr.to_style(),
+                                    runs: std::mem::take(&mut para_runs),
+                                    ..Paragraph::default()
+                                }),
+                                ..Block::default()
+                            },
+                            bullet: ppr.bullet,
+                            level: ppr.level,
                         });
                     }
                     in_para = false;
@@ -3850,6 +4103,10 @@ fn pptx_shape_or_textbox(
             },
         }
     }
+
+    // Fold consecutive bulleted/numbered paragraphs into model `List` blocks; plain
+    // paragraphs stay standalone.
+    let paras = pptx_group_paras_to_blocks(paras);
 
     // Geometry: the shape's own xfrm wins; otherwise a placeholder inherits from
     // the layout/master chain by matching its `p:ph` key.
@@ -4770,36 +5027,6 @@ struct OdfModelCtx<'a> {
 struct OdfListCtx<'a> {
     level: u32,
     style: Option<&'a str>,
-}
-
-impl OdfModelCtx<'_> {
-    /// A context with only the run-style map populated (the others empty) — used
-    /// by the ODP slide path, which needs inline run styling but not paragraph
-    /// formatting, table widths, or cell shading.
-    fn styles_only<'a>(
-        zip: &'a BTreeMap<String, Vec<u8>>,
-        styles: &'a BTreeMap<String, String>,
-    ) -> OdfModelCtx<'a> {
-        // Borrow process-wide empty maps so the context carries real references.
-        static EMPTY_PARA: std::sync::OnceLock<BTreeMap<String, OdfParaProps>> =
-            std::sync::OnceLock::new();
-        static EMPTY_COLS: std::sync::OnceLock<BTreeMap<String, f64>> = std::sync::OnceLock::new();
-        static EMPTY_BG: std::sync::OnceLock<BTreeMap<String, [f64; 3]>> =
-            std::sync::OnceLock::new();
-        static EMPTY_VA: std::sync::OnceLock<BTreeMap<String, model::CellVAlign>> =
-            std::sync::OnceLock::new();
-        static EMPTY_LS: std::sync::OnceLock<BTreeMap<String, Vec<Option<ListMarker>>>> =
-            std::sync::OnceLock::new();
-        OdfModelCtx {
-            zip,
-            styles,
-            para_styles: EMPTY_PARA.get_or_init(BTreeMap::new),
-            cols: EMPTY_COLS.get_or_init(BTreeMap::new),
-            cell_bg: EMPTY_BG.get_or_init(BTreeMap::new),
-            cell_valign: EMPTY_VA.get_or_init(BTreeMap::new),
-            list_styles: EMPTY_LS.get_or_init(BTreeMap::new),
-        }
-    }
 }
 
 /// ODT → [`Document`]: `text:h`→heading, `text:p`→paragraph, `text:list`→list,
@@ -5835,6 +6062,16 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     styles.extend(odf_text_styles(&content));
     let geom = odf_geom(&styles_xml, &content, PageGeom::slide_default());
 
+    // Paragraph-level formatting (`fo:*` align/indent/spacing) and `text:list-style`
+    // per-level number/bullet definitions, keyed by style name (parent chains
+    // resolved; automatic styles in `content.xml` win on a clash) — so a slide's
+    // frame `text:p`/`text:list` lowers its alignment/indent/spacing and resolves
+    // ordered-vs-unordered, exactly like the ODT body path.
+    let mut para_styles = odf_para_styles(&styles_xml);
+    para_styles.extend(odf_para_styles(&content));
+    let mut list_styles = odf_list_styles(&styles_xml);
+    list_styles.extend(odf_list_styles(&content));
+
     // Drawing-page fill colours (`styles.xml` + `content.xml`) and master-page →
     // drawing-page-style links, so each `draw:page` can resolve its background
     // from its own `draw:style-name`, falling back to its master page.
@@ -5848,6 +6085,23 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     let mut gstyles = odf_graphic_styles(&styles_xml);
     gstyles.extend(odf_graphic_styles(&content));
 
+    // Only the run-style and paragraph/list maps matter for the slide text bodies;
+    // the table/cell maps stay empty (slide text frames carry the formatting that
+    // the frame walker lowers).
+    static EMPTY_COLS: std::sync::OnceLock<BTreeMap<String, f64>> = std::sync::OnceLock::new();
+    static EMPTY_BG: std::sync::OnceLock<BTreeMap<String, [f64; 3]>> = std::sync::OnceLock::new();
+    static EMPTY_VA: std::sync::OnceLock<BTreeMap<String, model::CellVAlign>> =
+        std::sync::OnceLock::new();
+    let ctx = OdfModelCtx {
+        zip,
+        styles: &styles,
+        para_styles: &para_styles,
+        cols: EMPTY_COLS.get_or_init(BTreeMap::new),
+        cell_bg: EMPTY_BG.get_or_init(BTreeMap::new),
+        cell_valign: EMPTY_VA.get_or_init(BTreeMap::new),
+        list_styles: &list_styles,
+    };
+
     let mut slides: Vec<Slide> = Vec::new();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
     let mut x = Xml::new(&content);
@@ -5857,8 +6111,7 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
                 let background = odp_page_background(attrs, &page_fills, &master_styles);
                 slides.push(odp_page_model(
                     &mut x,
-                    zip,
-                    &styles,
+                    &ctx,
                     &gstyles,
                     geom,
                     background,
@@ -5890,8 +6143,7 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 /// [`odp_page`].
 fn odp_page_model(
     x: &mut Xml,
-    zip: &BTreeMap<String, Vec<u8>>,
-    styles: &BTreeMap<String, String>,
+    ctx: &OdfModelCtx<'_>,
     gstyles: &BTreeMap<String, OdfGraphicStyle>,
     geom: PageGeom,
     background: Option<[f64; 3]>,
@@ -5911,8 +6163,7 @@ fn odp_page_model(
                         let bx = odp_frame_box_xf(&attrs).unwrap();
                         odp_frame_model(
                             x,
-                            zip,
-                            styles,
+                            ctx,
                             geom,
                             (0.0, 0.0),
                             bx,
@@ -5927,8 +6178,7 @@ fn odp_page_model(
                     _ if odf_is_draw_shape(ln) => {
                         odp_shape_model(
                             x,
-                            zip,
-                            styles,
+                            ctx,
                             gstyles,
                             geom,
                             (0.0, 0.0),
@@ -5945,8 +6195,7 @@ fn odp_page_model(
                         let (gx, gy) = odp_group_offset(&attrs);
                         odp_group_model(
                             x,
-                            zip,
-                            styles,
+                            ctx,
                             gstyles,
                             geom,
                             (gx, gy),
@@ -5958,14 +6207,17 @@ fn odp_page_model(
                     "p" if !sc => {
                         let role =
                             odp_placeholder_role(&attrs).unwrap_or(model::PlaceholderRole::Body);
-                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        // Lower the paragraph's `fo:*` formatting (align/indent/
+                        // spacing) from its `text:style-name`, like the ODT body path.
+                        let style = odf_paragraph_style(&attrs, ctx.para_styles, None);
+                        let style_ref = odf_style_ref(&attrs);
                         let mut anchored: Vec<Block> = Vec::new();
                         // ODP slides build no document outline; bookmark anchors
                         // captured here are discarded with this throwaway builder.
                         let mut no_outline = OutlineBuilder::default();
                         let runs = odf_inline_model(
                             x,
-                            &ctx,
+                            ctx,
                             "p",
                             resources,
                             &mut anchored,
@@ -5976,8 +6228,9 @@ fn odp_page_model(
                                 role,
                                 block: Block {
                                     kind: BlockKind::Paragraph(Paragraph {
+                                        style,
+                                        style_ref,
                                         runs,
-                                        ..Paragraph::default()
                                     }),
                                     ..Block::default()
                                 },
@@ -5987,7 +6240,7 @@ fn odp_page_model(
                     "image" if sc => {
                         if let Some(href) = attr(&attrs, "href") {
                             let key = href.trim_start_matches('/').to_string();
-                            if let Some(mut img) = image_block(zip, &key, resources) {
+                            if let Some(mut img) = image_block(ctx.zip, &key, resources) {
                                 if let BlockKind::Image(ir) = &mut img.kind {
                                     ir.alt = odp_frame_alt(None, None, &attrs);
                                 }
@@ -6040,8 +6293,7 @@ fn odp_group_offset(attrs: &[(String, String)]) -> (f64, f64) {
 #[allow(clippy::too_many_arguments)]
 fn odp_group_model(
     x: &mut Xml,
-    zip: &BTreeMap<String, Vec<u8>>,
-    styles: &BTreeMap<String, String>,
+    ctx: &OdfModelCtx<'_>,
     gstyles: &BTreeMap<String, OdfGraphicStyle>,
     geom: PageGeom,
     off: (f64, f64),
@@ -6058,8 +6310,7 @@ fn odp_group_model(
                         let bx = odp_frame_box_xf(&attrs).unwrap();
                         odp_frame_model(
                             x,
-                            zip,
-                            styles,
+                            ctx,
                             geom,
                             off,
                             bx,
@@ -6074,8 +6325,7 @@ fn odp_group_model(
                     _ if odf_is_draw_shape(ln) => {
                         odp_shape_model(
                             x,
-                            zip,
-                            styles,
+                            ctx,
                             gstyles,
                             geom,
                             off,
@@ -6091,8 +6341,7 @@ fn odp_group_model(
                         let (gx, gy) = odp_group_offset(&attrs);
                         odp_group_model(
                             x,
-                            zip,
-                            styles,
+                            ctx,
                             gstyles,
                             geom,
                             (off.0 + gx, off.1 + gy),
@@ -6104,14 +6353,16 @@ fn odp_group_model(
                     "p" if !sc => {
                         let role =
                             odp_placeholder_role(&attrs).unwrap_or(model::PlaceholderRole::Body);
-                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        // Lower the paragraph's `fo:*` formatting from its style name.
+                        let style = odf_paragraph_style(&attrs, ctx.para_styles, None);
+                        let style_ref = odf_style_ref(&attrs);
                         let mut anchored: Vec<Block> = Vec::new();
                         // ODP slides build no document outline; bookmark anchors
                         // captured here are discarded with this throwaway builder.
                         let mut no_outline = OutlineBuilder::default();
                         let runs = odf_inline_model(
                             x,
-                            &ctx,
+                            ctx,
                             "p",
                             resources,
                             &mut anchored,
@@ -6122,8 +6373,9 @@ fn odp_group_model(
                                 role,
                                 block: Block {
                                     kind: BlockKind::Paragraph(Paragraph {
+                                        style,
+                                        style_ref,
                                         runs,
-                                        ..Paragraph::default()
                                     }),
                                     ..Block::default()
                                 },
@@ -6133,7 +6385,7 @@ fn odp_group_model(
                     "image" if sc => {
                         if let Some(href) = attr(&attrs, "href") {
                             let key = href.trim_start_matches('/').to_string();
-                            if let Some(mut img) = image_block(zip, &key, resources) {
+                            if let Some(mut img) = image_block(ctx.zip, &key, resources) {
                                 if let BlockKind::Image(ir) = &mut img.kind {
                                     ir.alt = odp_frame_alt(None, None, &attrs);
                                 }
@@ -6159,18 +6411,19 @@ fn odp_group_model(
 /// page box in points, `off` = the enclosing group offset). The block carries a
 /// lower-left-origin [`Rect`] frame and the CCW rotation parsed from the frame's
 /// [`draw:transform`](odp_transform_rotation). The frame body — a `draw:text-box`
-/// of paragraphs, or a `draw:image` — chooses the block kind: a single image ⇒
-/// [`BlockKind::Image`] (its `alt` taken from the frame's
-/// `svg:title`/`svg:desc`/`draw:name`); otherwise a [`BlockKind::TextBox`]. A
-/// **text** frame tagged with `presentation:class` is emitted as a semantic
-/// [`model::Placeholder`] (mirroring the PPTX `p:ph` path); everything else lands
-/// in `shapes` (a picture is not a placeholder). An empty frame is dropped.
-/// Consumes up to `</draw:frame>`.
+/// of paragraphs/lists, or a `draw:image` — chooses the block kind: a single image
+/// ⇒ [`BlockKind::Image`] (its `alt` taken from the frame's
+/// `svg:title`/`svg:desc`/`draw:name`); otherwise a [`BlockKind::TextBox`]. Each
+/// `text:p` keeps its `fo:*` paragraph formatting (alignment/indent/spacing) from
+/// its `text:style-name`, and a `text:list` is lowered as a model [`List`] (via
+/// [`odf_walk_model`]). A **text** frame tagged with `presentation:class` is
+/// emitted as a semantic [`model::Placeholder`] (mirroring the PPTX `p:ph` path);
+/// everything else lands in `shapes` (a picture is not a placeholder). An empty
+/// frame is dropped. Consumes up to `</draw:frame>`.
 #[allow(clippy::too_many_arguments)]
 fn odp_frame_model(
     x: &mut Xml,
-    zip: &BTreeMap<String, Vec<u8>>,
-    styles: &BTreeMap<String, String>,
+    ctx: &OdfModelCtx<'_>,
     geom: PageGeom,
     off: (f64, f64),
     bx: (f64, f64, f64, f64),
@@ -6183,20 +6436,23 @@ fn odp_frame_model(
     let mut image: Option<model::ImageRef> = None;
     let mut title: Option<String> = None;
     let mut desc: Option<String> = None;
+    // ODP slides build no document outline; bookmark anchors captured during the
+    // frame walk are discarded with this throwaway builder.
+    let mut no_outline = OutlineBuilder::default();
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
                 match ln {
                     "p" if !sc => {
-                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        // Lower the paragraph's `fo:*` formatting (align/indent/
+                        // spacing) from its `text:style-name`, like the ODT body path.
+                        let style = odf_paragraph_style(&attrs, ctx.para_styles, None);
+                        let style_ref = odf_style_ref(&attrs);
                         let mut anchored: Vec<Block> = Vec::new();
-                        // ODP slides build no document outline; bookmark anchors
-                        // captured here are discarded with this throwaway builder.
-                        let mut no_outline = OutlineBuilder::default();
                         let runs = odf_inline_model(
                             x,
-                            &ctx,
+                            ctx,
                             "p",
                             resources,
                             &mut anchored,
@@ -6205,12 +6461,29 @@ fn odp_frame_model(
                         if !runs.is_empty() {
                             blocks.push(Block {
                                 kind: BlockKind::Paragraph(Paragraph {
+                                    style,
+                                    style_ref,
                                     runs,
-                                    ..Paragraph::default()
                                 }),
                                 ..Block::default()
                             });
                         }
+                    }
+                    // A `text:list` inside the text box → a model `List` (bulleted or
+                    // numbered, resolved from its `text:list-style`). Delegates to the
+                    // shared ODF walker, which handles nesting and item paragraphs.
+                    "list" if !sc => {
+                        let style = attr(&attrs, "style-name").filter(|n| !n.is_empty());
+                        let inner = Some(OdfListCtx { level: 0, style });
+                        odf_walk_model(
+                            x,
+                            ctx,
+                            &mut blocks,
+                            Some("list"),
+                            inner,
+                            resources,
+                            &mut no_outline,
+                        );
                     }
                     // Accessible alt text: `svg:title`/`svg:desc` carry their text
                     // as a single child node; capture it for `ImageRef::alt`.
@@ -6219,7 +6492,7 @@ fn odp_frame_model(
                     "image" if image.is_none() => {
                         if let Some(href) = attr(&attrs, "href") {
                             let key = href.trim_start_matches('/').to_string();
-                            image = image_ref(zip, &key, resources);
+                            image = image_ref(ctx.zip, &key, resources);
                         }
                     }
                     _ => {}
@@ -11093,10 +11366,11 @@ fn pptx_content_paragraph(x: &mut Xml, theme: &PptxTheme, out: &mut String) {
 
 /// Streaming state for one PPTX `a:rPr` run-properties subtree: the run's fill
 /// colour (the `a:solidFill`, or — as a graceful fallback — the FIRST stop of an
-/// `a:gradFill`), its `a:latin` typeface, and its `a:hlinkClick` target. A child
-/// `a:srgbClr`/`a:schemeClr` is only taken when it belongs to a text *fill*
-/// (`active_fill`), so a text outline's colour (`a:ln`) is never mistaken for the
-/// run colour. The folded result lands in the caller's [`RunStyle`] on close.
+/// `a:gradFill`), its `a:highlight` colour, its `a:latin` typeface, and its
+/// `a:hlinkClick` target. A child `a:srgbClr`/`a:schemeClr` is only taken when it
+/// belongs to a text *fill* (`in_fill`) or the text highlight (`in_highlight`), so
+/// a text outline's colour (`a:ln`) is never mistaken for the run colour. The
+/// folded result lands in the caller's [`RunStyle`] on close.
 #[derive(Default)]
 struct PptxRunPr {
     /// True while inside an `a:rPr` (the caller routes child tokens to us).
@@ -11107,6 +11381,12 @@ struct PptxRunPr {
     /// are ignored — only the first becomes the solid fallback).
     grad_stop_done: bool,
     fill: PptxFillColor,
+    /// True while inside the run's `a:highlight` (its child colour is the text
+    /// highlight, distinct from the run fill).
+    in_highlight: bool,
+    /// Text-highlight colour from `a:highlight` (resolved → 6-hex on close, set on
+    /// the model run's [`CharStyle::background`]).
+    highlight: PptxFillColor,
     /// Typeface from `a:latin@typeface` (resolved through the theme on close).
     latin: Option<String>,
     /// Hyperlink relationship id from `a:hlinkClick@r:id` (resolved on close).
@@ -11123,15 +11403,24 @@ impl PptxRunPr {
     }
 
     /// Handle an open tag inside the `a:rPr`. Enters a text `a:solidFill` or the
-    /// first `a:gradFill` stop, records colour bases/modifiers while in a fill,
-    /// and captures `a:latin` / `a:hlinkClick` at the run level.
+    /// first `a:gradFill` stop (fill) or the `a:highlight` (text background),
+    /// records colour bases/modifiers for whichever is active, and captures
+    /// `a:latin` / `a:hlinkClick` at the run level.
     fn on_open(&mut self, ln: &str, attrs: &[(String, String)]) {
         match ln {
             "solidFill" => self.in_fill = true,
             // A gradient: capture the first stop's colour as a solid fallback.
             "gs" if !self.grad_stop_done => self.in_fill = true,
+            // The run's text highlight: its direct child colour is the background.
+            "highlight" => self.in_highlight = true,
+            "srgbClr" | "schemeClr" | "hslClr" | "sysClr" if self.in_highlight => {
+                self.highlight.set_base(ln, attrs);
+            }
             "srgbClr" | "schemeClr" | "hslClr" | "sysClr" if self.in_fill => {
                 self.fill.set_base(ln, attrs);
+            }
+            "lumMod" | "lumOff" | "shade" | "tint" if self.in_highlight => {
+                self.highlight.set_mod(ln, attrs)
             }
             "lumMod" | "lumOff" | "shade" | "tint" if self.in_fill => self.fill.set_mod(ln, attrs),
             "latin" => {
@@ -11154,6 +11443,10 @@ impl PptxRunPr {
                 self.in_fill = false;
                 false
             }
+            "highlight" => {
+                self.in_highlight = false;
+                false
+            }
             "gs" => {
                 if self.in_fill {
                     self.grad_stop_done = true;
@@ -11166,11 +11459,15 @@ impl PptxRunPr {
         }
     }
 
-    /// Fold the collected colour / typeface / hyperlink into `run` and reset.
+    /// Fold the collected colour / highlight / typeface / hyperlink into `run` and
+    /// reset.
     fn close(&mut self, run: &mut RunStyle, theme: &PptxTheme, rels: &BTreeMap<String, String>) {
         let collected = std::mem::take(self);
         if let Some(color) = collected.fill.finish_with(theme) {
             run.color = Some(color);
+        }
+        if let Some(hl) = collected.highlight.finish_with(theme) {
+            run.highlight = Some(hl);
         }
         if let Some(t) = collected.latin {
             run.font_family = theme.resolve(&t);
@@ -11183,14 +11480,20 @@ impl PptxRunPr {
     }
 }
 
-/// Read a PPTX `a:rPr` open-tag's run attributes (`b`/`i`/`sz`/`baseline`) into a
-/// [`RunStyle`]. Colour and typeface arrive as child elements, set by the caller.
-/// `a:rPr@baseline` is a per-mille integer: `>0` ⇒ superscript, `<0` ⇒ subscript,
-/// `0`/absent/unparsable ⇒ baseline.
+/// Read a PPTX `a:rPr` open-tag's run attributes (`b`/`i`/`u`/`strike`/`sz`/
+/// `baseline`) into a [`RunStyle`]. Colour, typeface and `a:highlight` arrive as
+/// child elements, set by the caller. `a:rPr@baseline` is a per-mille integer:
+/// `>0` ⇒ superscript, `<0` ⇒ subscript, `0`/absent/unparsable ⇒ baseline.
+///
+/// `a:rPr@u` is `ST_TextUnderlineType` (`sng`/`dbl`/`heavy`/`dotted`/`wavy`/…) —
+/// any value other than `none` underlines; `a:rPr@strike` is `ST_TextStrikeType`
+/// (`sngStrike`/`dblStrike`), both folding to the model's single strike flag.
 fn pptx_run_props(attrs: &[(String, String)]) -> RunStyle {
     RunStyle {
         bold: matches!(attr(attrs, "b"), Some("1")),
         italic: matches!(attr(attrs, "i"), Some("1")),
+        underline: matches!(attr(attrs, "u"), Some(u) if !u.eq_ignore_ascii_case("none")),
+        strike: matches!(attr(attrs, "strike"), Some("sngStrike" | "dblStrike")),
         size_half_pt: attr(attrs, "sz")
             .and_then(|v| v.parse::<f64>().ok())
             .map(|sz| sz / 50.0), // hundredths-pt → half-pt
@@ -11689,8 +11992,7 @@ fn odf_is_draw_shape(ln: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn odp_shape_model(
     x: &mut Xml,
-    zip: &BTreeMap<String, Vec<u8>>,
-    styles: &BTreeMap<String, String>,
+    ctx: &OdfModelCtx<'_>,
     gstyles: &BTreeMap<String, OdfGraphicStyle>,
     geom: PageGeom,
     off: (f64, f64),
@@ -11706,17 +12008,19 @@ fn odp_shape_model(
     // A self-closing `<draw:rect/>` has no body to walk (and no close token to
     // consume); only a shape with children can carry text.
     if !self_closing {
+        let mut no_outline = OutlineBuilder::default();
         while let Some(tok) = x.next() {
             match tok {
-                Tok::Open(name, _attrs, sc) => {
+                Tok::Open(name, p_attrs, sc) => {
                     let cln = local(&name);
                     if cln == "p" && !sc {
-                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        // Lower the paragraph's `fo:*` formatting from its style name.
+                        let style = odf_paragraph_style(&p_attrs, ctx.para_styles, None);
+                        let style_ref = odf_style_ref(&p_attrs);
                         let mut anchored: Vec<Block> = Vec::new();
-                        let mut no_outline = OutlineBuilder::default();
                         let runs = odf_inline_model(
                             x,
-                            &ctx,
+                            ctx,
                             "p",
                             resources,
                             &mut anchored,
@@ -11725,8 +12029,9 @@ fn odp_shape_model(
                         if !runs.is_empty() {
                             blocks.push(Block {
                                 kind: BlockKind::Paragraph(Paragraph {
+                                    style,
+                                    style_ref,
                                     runs,
-                                    ..Paragraph::default()
                                 }),
                                 ..Block::default()
                             });
@@ -19937,6 +20242,91 @@ mod tests {
     }
 
     #[test]
+    fn odp_model_frame_paragraph_keeps_alignment_and_indent() {
+        // A slide text frame's `text:p` keeps its `fo:*` formatting from its
+        // `text:style-name` (centered + 1cm left indent) — no longer the default.
+        let slide = odp_model_slide_with_styles(
+            r#"<style:style style:name="P1" style:family="paragraph">
+                 <style:paragraph-properties fo:text-align="center" fo:margin-left="1cm"/>
+               </style:style>"#,
+            r#"<draw:frame svg:x="2cm" svg:y="1cm" svg:width="8cm" svg:height="3cm">
+                 <draw:text-box><text:p text:style-name="P1">Centered</text:p></draw:text-box>
+               </draw:frame>"#,
+        );
+        let tb = match &slide.shapes[0].kind {
+            BlockKind::TextBox(tb) => tb,
+            other => panic!("expected a TextBox, got {other:?}"),
+        };
+        let para = match &tb.blocks[0].kind {
+            BlockKind::Paragraph(p) => p,
+            other => panic!("expected a Paragraph, got {other:?}"),
+        };
+        assert_ne!(
+            para.style,
+            ParagraphStyle::default(),
+            "the slide-frame paragraph carries real formatting"
+        );
+        assert_eq!(para.style.align, MAlign::Center, "fo:text-align center");
+        assert!(
+            (para.style.indent_left_pt - 28.3465).abs() < 0.01,
+            "1cm → ~28.35pt, got {}",
+            para.style.indent_left_pt
+        );
+    }
+
+    #[test]
+    fn odp_model_frame_text_list_becomes_ordered_list() {
+        // A `text:list` inside a slide text frame whose `text:list-style` level 1 is
+        // a number style → a model ordered `List` (Decimal), not flat paragraphs.
+        let slide = odp_model_slide_with_styles(
+            r#"<text:list-style style:name="L1">
+                 <text:list-level-style-number text:level="1" style:num-format="1"/>
+               </text:list-style>"#,
+            r#"<draw:frame svg:x="2cm" svg:y="1cm" svg:width="8cm" svg:height="3cm">
+                 <draw:text-box>
+                   <text:list text:style-name="L1">
+                     <text:list-item><text:p>One</text:p></text:list-item>
+                     <text:list-item><text:p>Two</text:p></text:list-item>
+                   </text:list>
+                 </draw:text-box>
+               </draw:frame>"#,
+        );
+        let tb = match &slide.shapes[0].kind {
+            BlockKind::TextBox(tb) => tb,
+            other => panic!("expected a TextBox, got {other:?}"),
+        };
+        // Each list item lowers to its own single-item `List` (mirrors the ODT body
+        // walker); both are ordered Decimal and carry the right text.
+        let lists: Vec<&List> = tb
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::List(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert!(!lists.is_empty(), "the text:list lowered to List block(s)");
+        assert!(lists.iter().all(|l| l.ordered), "number style → ordered");
+        assert!(
+            lists.iter().all(|l| l.marker == ListMarker::Decimal),
+            "num-format 1 → Decimal"
+        );
+        let texts: Vec<String> = lists
+            .iter()
+            .flat_map(|l| &l.items)
+            .map(|it| {
+                block_text(&Block {
+                    kind: BlockKind::TextBox(model::TextBox {
+                        blocks: it.blocks.clone(),
+                    }),
+                    ..Block::default()
+                })
+            })
+            .collect();
+        assert_eq!(texts, vec!["One", "Two"], "both items kept, in order");
+    }
+
+    #[test]
     fn odp_model_frame_image_becomes_image_shape() {
         // A positioned frame wrapping a `draw:image` → an image shape, the bytes
         // interned in the document resources.
@@ -21399,6 +21789,204 @@ mod tests {
             model::VAlign::Baseline,
             "baseline 0 + no baseline → Baseline"
         );
+    }
+
+    /// The first text-box block as a [`Paragraph`] (panics otherwise) — for the
+    /// run-styling and paragraph-formatting model tests.
+    fn first_textbox_paragraph(b: &Block) -> &Paragraph {
+        let tb = match &b.kind {
+            BlockKind::TextBox(tb) => tb,
+            other => panic!("expected a TextBox, got {other:?}"),
+        };
+        match &tb.blocks[0].kind {
+            BlockKind::Paragraph(p) => p,
+            other => panic!("expected a Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pptx_model_run_underline_strike_highlight_reach_char_style() {
+        // `a:rPr@u="sng"`/`@strike="sngStrike"` and a child `a:highlight` colour
+        // surface on the model run's `CharStyle` (underline + strike + background),
+        // rather than being dropped. A plain run keeps all three off.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                <p:txBody><a:p>
+                  <a:r><a:rPr u="sng" strike="sngStrike"><a:highlight><a:srgbClr val="FFFF00"/></a:highlight></a:rPr><a:t>marked</a:t></a:r>
+                  <a:r><a:rPr/><a:t> plain</a:t></a:r>
+                </a:p></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let runs = first_textbox_runs(&slide.shapes[0]);
+        let style = |text: &str| {
+            runs.iter()
+                .find_map(|i| match i {
+                    Inline::Run(r) if r.text == text => Some(r.style.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {text:?} run"))
+        };
+        let marked = style("marked");
+        assert!(marked.underline, "u=\"sng\" → underline");
+        assert!(marked.strike, "strike=\"sngStrike\" → strike");
+        assert_eq!(
+            marked.background,
+            Some([1.0, 1.0, 0.0]),
+            "a:highlight FFFF00 → yellow background"
+        );
+        let plain = style(" plain");
+        assert!(!plain.underline && !plain.strike && plain.background.is_none());
+    }
+
+    #[test]
+    fn pptx_model_run_underline_none_and_no_strike_stay_off() {
+        // `@u="none"` is *not* underline and `@strike="noStrike"` is *not* strike
+        // (only `sngStrike`/`dblStrike` count) — both stay off.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                <p:txBody><a:p>
+                  <a:r><a:rPr u="none" strike="noStrike"/><a:t>off</a:t></a:r>
+                </a:p></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let runs = first_textbox_runs(&slide.shapes[0]);
+        let off = runs
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text == "off" => Some(r.style.clone()),
+                _ => None,
+            })
+            .expect("the off run");
+        assert!(!off.underline, "u=\"none\" is not underline");
+        assert!(!off.strike, "strike=\"noStrike\" is not strike");
+    }
+
+    #[test]
+    fn pptx_model_paragraph_align_indent_spacing_reach_style() {
+        // `a:pPr@algn="ctr"`/`@marL`/`@indent` and `a:spcBef`/`a:spcAft`/`a:lnSpc`
+        // lower onto the paragraph's `ParagraphStyle` — it is no longer the default.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm></p:spPr>
+                <p:txBody><a:p>
+                  <a:pPr algn="ctr" marL="457200" indent="-228600">
+                    <a:lnSpc><a:spcPct val="150000"/></a:lnSpc>
+                    <a:spcBef><a:spcPts val="600"/></a:spcBef>
+                    <a:spcAft><a:spcPts val="1200"/></a:spcAft>
+                  </a:pPr>
+                  <a:r><a:rPr/><a:t>Centered</a:t></a:r>
+                </a:p></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let para = first_textbox_paragraph(&slide.shapes[0]);
+        assert_ne!(
+            para.style,
+            ParagraphStyle::default(),
+            "the paragraph carries real formatting, not the default"
+        );
+        assert_eq!(para.style.align, MAlign::Center, "algn=\"ctr\" → Center");
+        // 457200 EMU = 36pt left indent; -228600 EMU = -18pt first-line (hanging).
+        assert!(
+            (para.style.indent_left_pt - 36.0).abs() < 1e-6,
+            "marL 457200 EMU → 36pt, got {}",
+            para.style.indent_left_pt
+        );
+        assert!(
+            (para.style.first_line_pt + 18.0).abs() < 1e-6,
+            "indent -228600 EMU → -18pt, got {}",
+            para.style.first_line_pt
+        );
+        // a:spcPts is hundredths-of-a-point: 600 → 6pt, 1200 → 12pt.
+        assert!(
+            (para.style.space_before_pt - 6.0).abs() < 1e-6,
+            "spcBef 600 → 6pt, got {}",
+            para.style.space_before_pt
+        );
+        assert!(
+            (para.style.space_after_pt - 12.0).abs() < 1e-6,
+            "spcAft 1200 → 12pt, got {}",
+            para.style.space_after_pt
+        );
+        assert_eq!(
+            para.style.line_height,
+            MLineHeight::Multiple(1.5),
+            "lnSpc 150000 (150%) → 1.5× line height"
+        );
+    }
+
+    #[test]
+    fn pptx_model_consecutive_autonum_paragraphs_become_one_ordered_list() {
+        // Two consecutive `a:buAutoNum` paragraphs fold into a single ordered list
+        // (decimal), each text a list item — not two standalone paragraphs.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></a:xfrm></p:spPr>
+                <p:txBody>
+                  <a:p><a:pPr><a:buAutoNum type="arabicPeriod"/></a:pPr><a:r><a:rPr/><a:t>First</a:t></a:r></a:p>
+                  <a:p><a:pPr><a:buAutoNum type="arabicPeriod"/></a:pPr><a:r><a:rPr/><a:t>Second</a:t></a:r></a:p>
+                </p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let blocks = match &slide.shapes[0].kind {
+            BlockKind::TextBox(tb) => &tb.blocks,
+            other => panic!("expected a TextBox, got {other:?}"),
+        };
+        assert_eq!(blocks.len(), 1, "two bullets → one List block");
+        let list = match &blocks[0].kind {
+            BlockKind::List(l) => l,
+            other => panic!("expected a List, got {other:?}"),
+        };
+        assert!(list.ordered, "a:buAutoNum → ordered");
+        assert_eq!(list.marker, ListMarker::Decimal, "arabicPeriod → Decimal");
+        assert_eq!(list.items.len(), 2, "two items");
+        let texts: Vec<String> = list
+            .items
+            .iter()
+            .map(|it| {
+                block_text(&Block {
+                    kind: BlockKind::TextBox(model::TextBox {
+                        blocks: it.blocks.clone(),
+                    }),
+                    ..Block::default()
+                })
+            })
+            .collect();
+        assert_eq!(texts, vec!["First", "Second"]);
+    }
+
+    #[test]
+    fn pptx_model_bullet_char_then_plain_paragraph_split() {
+        // A `a:buChar` paragraph becomes an unordered list; a following paragraph
+        // with no bullet (`a:buNone`) stays a standalone paragraph (two blocks).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></a:xfrm></p:spPr>
+                <p:txBody>
+                  <a:p><a:pPr><a:buChar char="•"/></a:pPr><a:r><a:rPr/><a:t>Bullet</a:t></a:r></a:p>
+                  <a:p><a:pPr><a:buNone/></a:pPr><a:r><a:rPr/><a:t>Plain</a:t></a:r></a:p>
+                </p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let blocks = match &slide.shapes[0].kind {
+            BlockKind::TextBox(tb) => &tb.blocks,
+            other => panic!("expected a TextBox, got {other:?}"),
+        };
+        assert_eq!(blocks.len(), 2, "a list then a plain paragraph");
+        let list = match &blocks[0].kind {
+            BlockKind::List(l) => l,
+            other => panic!("expected a List first, got {other:?}"),
+        };
+        assert!(!list.ordered, "a:buChar → unordered");
+        assert_eq!(list.marker, ListMarker::Bullet('•'));
+        assert_eq!(list.items.len(), 1, "one bulleted item");
+        assert!(
+            matches!(blocks[1].kind, BlockKind::Paragraph(_)),
+            "the a:buNone paragraph stays a standalone Paragraph, got {:?}",
+            blocks[1].kind
+        );
+        assert_eq!(block_text(&blocks[1]), "Plain");
     }
 
     #[test]
