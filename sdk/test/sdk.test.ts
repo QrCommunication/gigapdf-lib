@@ -671,6 +671,34 @@ describe("@qrcommunication/gigapdf-lib", () => {
     }
   });
 
+  it("saveOptimized / toLinearized: PDF version banner selectable (1.7 / 2.0)", () => {
+    const doc = giga.open(giga.txtToPdf("Version banner selection (#77)."));
+    const banner = (b: Uint8Array) => new TextDecoder("latin1").decode(b.slice(0, 8));
+
+    // saveOptimized defaults to 1.7; "2.0" is selectable.
+    const opt17 = doc.saveOptimized();
+    const opt20 = doc.saveOptimized({ version: "2.0" });
+    expect(banner(opt17)).toBe("%PDF-1.7");
+    expect(banner(opt20)).toBe("%PDF-2.0");
+
+    // toLinearized + its saveLinearized alias honour the version (default 1.7).
+    const lin17 = doc.toLinearized();
+    const lin20 = doc.toLinearized("2.0");
+    const linSave20 = doc.saveLinearized("2.0");
+    expect(banner(lin17)).toBe("%PDF-1.7");
+    expect(banner(lin20)).toBe("%PDF-2.0");
+    expect(banner(linSave20)).toBe("%PDF-2.0");
+    expect(new TextDecoder("latin1").decode(lin20)).toContain("/Linearized");
+    doc.close();
+
+    // Every variant reopens with the page intact.
+    for (const bytes of [opt17, opt20, lin17, lin20, linSave20]) {
+      const r = giga.open(bytes);
+      expect(r.pageCount()).toBe(1);
+      r.close();
+    }
+  });
+
   it("addGradient: linear + radial shading patterns round-trip", () => {
     const doc = giga.open(giga.txtToPdf("Gradient"));
 

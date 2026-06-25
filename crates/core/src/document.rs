@@ -9503,13 +9503,31 @@ impl Document {
     /// [`save_compressed`](Self::save_compressed)); both flags `false` is exactly
     /// `save_compressed`. Linearization (Annex F / Fast Web View) is not done.
     pub fn save_optimized(&self, object_streams: bool, xref_streams: bool) -> Vec<u8> {
+        self.save_optimized_with_version(
+            object_streams,
+            xref_streams,
+            crate::serialize::PdfVersion::V1_7,
+        )
+    }
+
+    /// Like [`save_optimized`](Self::save_optimized) but with a caller-chosen file
+    /// version banner (`%PDF-1.7` or `%PDF-2.0`). Object/cross-reference streams
+    /// require ≥ 1.5, so both choices are valid; the `version` only changes the
+    /// header line.
+    pub fn save_optimized_with_version(
+        &self,
+        object_streams: bool,
+        xref_streams: bool,
+        version: crate::serialize::PdfVersion,
+    ) -> Vec<u8> {
         let objects = self.flate_streams();
+        let header = version.header();
         if object_streams {
-            crate::serialize::to_pdf_compressed(&objects, &self.trailer, true)
+            crate::serialize::to_pdf_compressed_with_header(&objects, &self.trailer, true, header)
         } else if xref_streams {
-            crate::serialize::to_pdf_compressed(&objects, &self.trailer, false)
+            crate::serialize::to_pdf_compressed_with_header(&objects, &self.trailer, false, header)
         } else {
-            crate::serialize::to_pdf(&objects, &self.trailer)
+            crate::serialize::to_pdf_with_header(&objects, &self.trailer, header)
         }
     }
 
@@ -9526,9 +9544,17 @@ impl Document {
     /// Falls back to the plain (non-linearized) [`save`](Self::save) output if the
     /// document cannot be linearized (no catalog, no page tree, or zero pages).
     pub fn to_linearized(&self) -> Vec<u8> {
+        self.to_linearized_with_version(crate::serialize::PdfVersion::V1_7)
+    }
+
+    /// Like [`to_linearized`](Self::to_linearized) but with a caller-chosen file
+    /// version banner (`%PDF-1.7` or `%PDF-2.0`). The non-linearized fallback uses
+    /// the same banner.
+    pub fn to_linearized_with_version(&self, version: crate::serialize::PdfVersion) -> Vec<u8> {
         let objects = self.flate_streams();
-        crate::serialize::to_linearized(&objects, &self.trailer)
-            .unwrap_or_else(|| crate::serialize::to_pdf(&objects, &self.trailer))
+        let header = version.header();
+        crate::serialize::to_linearized_with_header(&objects, &self.trailer, header)
+            .unwrap_or_else(|| crate::serialize::to_pdf_with_header(&objects, &self.trailer, header))
     }
 
     /// Reading-order text lines of a page (structured text): each line's text

@@ -30,6 +30,19 @@ export type Exports = {
   [k: string]: any;
 };
 
+/**
+ * PDF file-version banner for the compact ({@link GigaPdfDoc.saveOptimized}) and
+ * linearized ({@link GigaPdfDoc.toLinearized}) writers. Object streams,
+ * cross-reference streams and linearization are valid in both, so the choice only
+ * changes the `%PDF-x.y` header line. Defaults to `"1.7"`.
+ */
+export type PdfVersion = "1.7" | "2.0";
+
+/** Map a {@link PdfVersion} to the wasm selector (`0` = 1.7, `1` = 2.0). */
+function pdfVersionCode(v: PdfVersion | undefined): number {
+  return v === "2.0" ? 1 : 0;
+}
+
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
@@ -2580,14 +2593,18 @@ export class GigaPdfDoc {
    * (ISO 32000-1 §7.5.7 / §7.5.8) — the most compact output. `objectStreams`
    * (default `true`) packs non-stream objects into compressed `/ObjStm`s (needs
    * the xref stream); `xrefStreams` (default `true`) writes a `/XRef` stream.
+   * `version` selects the `%PDF-x.y` header banner (default `"1.7"`).
    * Uncompressed streams are Flate-compressed first, like {@link saveCompressed}.
    * Linearization (Fast Web View) is not performed.
    */
-  saveOptimized(opts: { objectStreams?: boolean; xrefStreams?: boolean } = {}): Uint8Array {
+  saveOptimized(
+    opts: { objectStreams?: boolean; xrefStreams?: boolean; version?: PdfVersion } = {}
+  ): Uint8Array {
     const obj = opts.objectStreams ?? true;
     const xref = opts.xrefStreams ?? true;
+    const ver = pdfVersionCode(opts.version);
     return this.g._buffer((o) =>
-      this.ex().gp_save_optimized(this.h, obj ? 1 : 0, xref ? 1 : 0, o)
+      this.ex().gp_save_optimized(this.h, obj ? 1 : 0, xref ? 1 : 0, ver, o)
     );
   }
 
@@ -2603,15 +2620,18 @@ export class GigaPdfDoc {
    * first (like {@link saveCompressed}) and embedded fonts are subset.
    *
    * Falls back to the plain {@link save} output if the document cannot be
-   * linearized (no catalog / page tree / zero pages).
+   * linearized (no catalog / page tree / zero pages). `version` selects the
+   * `%PDF-x.y` header banner (default `"1.7"`).
    */
-  toLinearized(): Uint8Array {
-    return this.g._buffer((o) => this.ex().gp_to_linearized(this.h, o));
+  toLinearized(version: PdfVersion = "1.7"): Uint8Array {
+    return this.g._buffer((o) =>
+      this.ex().gp_to_linearized(this.h, pdfVersionCode(version), o)
+    );
   }
 
   /** Alias of {@link toLinearized} — serialize as a linearized (Fast Web View) PDF. */
-  saveLinearized(): Uint8Array {
-    return this.toLinearized();
+  saveLinearized(version: PdfVersion = "1.7"): Uint8Array {
+    return this.toLinearized(version);
   }
 
   // text intelligence

@@ -3698,22 +3698,37 @@ pub extern "C" fn gp_save_compressed(handle: *const Document, out_len: *mut usiz
     }
 }
 
+/// Map a `pdf_version` selector to a [`gigapdf_core::serialize::PdfVersion`]:
+/// `0` = PDF 1.7 (default), `1` = PDF 2.0; any other value falls back to 1.7.
+fn pdf_version_from(code: i32) -> gigapdf_core::serialize::PdfVersion {
+    match code {
+        1 => gigapdf_core::serialize::PdfVersion::V2_0,
+        _ => gigapdf_core::serialize::PdfVersion::V1_7,
+    }
+}
+
 /// Serialize with PDF 1.5+ object streams + a cross-reference stream (ISO 32000-1
 /// §7.5.7/§7.5.8) — the most compact output. `object_streams != 0` packs
 /// non-stream objects into `/ObjStm`s (implies a cross-reference stream);
 /// `xref_streams != 0` alone writes a `/XRef` stream with classic object bodies.
-/// Both `0` ⇒ `gp_save_compressed`. Linearization is not performed.
+/// Both `0` ⇒ `gp_save_compressed`. `pdf_version` selects the header banner
+/// (`0` = 1.7, `1` = 2.0). Linearization is not performed.
 #[no_mangle]
 pub extern "C" fn gp_save_optimized(
     handle: *const Document,
     object_streams: i32,
     xref_streams: i32,
+    pdf_version: i32,
     out_len: *mut usize,
 ) -> *mut u8 {
     match unsafe { handle.as_ref() } {
         Some(doc) => unsafe {
             bytes_into_host(
-                doc.save_optimized(object_streams != 0, xref_streams != 0),
+                doc.save_optimized_with_version(
+                    object_streams != 0,
+                    xref_streams != 0,
+                    pdf_version_from(pdf_version),
+                ),
                 out_len,
             )
         },
@@ -3726,11 +3741,21 @@ pub extern "C" fn gp_save_optimized(
 /// parameter dictionary and a primary hint stream — are written at the front of
 /// the file so a web viewer can display page 1 before the rest downloads. Streams
 /// are Flate-compressed and embedded fonts subset, like `gp_save_compressed`.
-/// Falls back to the plain writer if the document cannot be linearized.
+/// `pdf_version` selects the header banner (`0` = 1.7, `1` = 2.0). Falls back to
+/// the plain writer if the document cannot be linearized.
 #[no_mangle]
-pub extern "C" fn gp_to_linearized(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+pub extern "C" fn gp_to_linearized(
+    handle: *const Document,
+    pdf_version: i32,
+    out_len: *mut usize,
+) -> *mut u8 {
     match unsafe { handle.as_ref() } {
-        Some(doc) => unsafe { bytes_into_host(doc.to_linearized(), out_len) },
+        Some(doc) => unsafe {
+            bytes_into_host(
+                doc.to_linearized_with_version(pdf_version_from(pdf_version)),
+                out_len,
+            )
+        },
         None => std::ptr::null_mut(),
     }
 }

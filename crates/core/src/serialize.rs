@@ -37,6 +37,32 @@ fn is_obsolete(object: &Object) -> bool {
     matches!(object_type(object), Some(t) if t == b"ObjStm".as_slice() || t == b"XRef".as_slice())
 }
 
+/// A PDF file-version banner offered by the compact / linearized writers.
+///
+/// Object streams and cross-reference streams require PDF ≥ 1.5; both 1.7
+/// (ISO 32000-1) and 2.0 (ISO 32000-2) support them, so these are the two
+/// choices a caller may select. The classic writer keeps using
+/// [`to_pdf_with_header`] for its own (e.g. PDF/A) header needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PdfVersion {
+    /// PDF 1.7 (ISO 32000-1) — the default.
+    #[default]
+    V1_7,
+    /// PDF 2.0 (ISO 32000-2).
+    V2_0,
+}
+
+impl PdfVersion {
+    /// The full file-header line for this version, including the mandatory
+    /// binary-comment second line (ISO 32000 §7.5.2) that flags the file binary.
+    pub fn header(self) -> &'static [u8] {
+        match self {
+            PdfVersion::V1_7 => b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n",
+            PdfVersion::V2_0 => b"%PDF-2.0\n%\xE2\xE3\xCF\xD3\n",
+        }
+    }
+}
+
 /// Serialize the object map + trailer into a complete PDF byte stream.
 pub fn to_pdf(objects: &BTreeMap<ObjectId, Object>, trailer: &Dictionary) -> Vec<u8> {
     to_pdf_with_header(objects, trailer, b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n")
@@ -120,16 +146,38 @@ fn push_field(out: &mut Vec<u8>, value: u64, width: usize) {
 }
 
 /// Serialize with PDF 1.5+ **object streams** + a **cross-reference stream**
-/// (ISO 32000-1 §7.5.7 / §7.5.8) for a more compact file. When
-/// `use_object_streams` is set, every non-stream object is packed into a
-/// Flate-compressed `/Type /ObjStm` (type-2 xref entries); otherwise only the
-/// cross-reference is written as a stream (all objects stay type-1). Stream
-/// objects can never live in an object stream and are always written directly.
-/// Linearization (Annex F / Fast Web View) is **not** performed here.
+/// (ISO 32000-1 §7.5.7 / §7.5.8) for a more compact file, using the historical
+/// `%PDF-1.5` header. See [`to_pdf_compressed_with_header`] for the full
+/// description; this is the thin default wrapper (mirrors [`to_pdf`] /
+/// [`to_pdf_with_header`]).
 pub fn to_pdf_compressed(
     objects: &BTreeMap<ObjectId, Object>,
     trailer: &Dictionary,
     use_object_streams: bool,
+) -> Vec<u8> {
+    to_pdf_compressed_with_header(
+        objects,
+        trailer,
+        use_object_streams,
+        b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n",
+    )
+}
+
+/// Compact serializer with a caller-chosen file-header line — identical to
+/// [`to_pdf_compressed`] in every other respect. When `use_object_streams` is
+/// set, every non-stream object is packed into a Flate-compressed `/Type
+/// /ObjStm` (type-2 xref entries); otherwise only the cross-reference is written
+/// as a stream (all objects stay type-1). Stream objects can never live in an
+/// object stream and are always written directly. Linearization (Annex F / Fast
+/// Web View) is **not** performed here.
+///
+/// `header` must be ≥ `%PDF-1.5` (object/xref streams require it) and include the
+/// binary-comment second line; pass [`PdfVersion::header`] for a 1.7 / 2.0 banner.
+pub fn to_pdf_compressed_with_header(
+    objects: &BTreeMap<ObjectId, Object>,
+    trailer: &Dictionary,
+    use_object_streams: bool,
+    header: &[u8],
 ) -> Vec<u8> {
     use crate::filters::deflate::flate_encode;
 
@@ -175,7 +223,7 @@ pub fn to_pdf_compressed(
 
     // 4. Header + the directly-written (stream) objects.
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n");
+    out.extend_from_slice(header);
     for &num in &top_level {
         let id = ids[(num - 1) as usize];
         let remapped = remap_refs(&objects[&id], &remap);
@@ -293,9 +341,17 @@ pub fn to_pdf_compressed(
 
 /// Append a PDF **incremental update** to an already-serialized `base` document
 /// (ISO 32000-1 §7.5.6): keep `base` byte-for-byte intact and write, after it, a
-/// fresh body of `new_objects` (each `(number, generation, object)`), a classic
-/// xref section listing only those objects, and a trailer whose `/Prev` chains to
-/// the document's previous `startxref`.
+/// fresh body of `new_objects` (each `(number, generation, object)`), a
+/// cross-reference section listing only those objects, and a trailer whose
+/// `/Prev` chains to the document's previous `startxref`.
+///
+/// The cross-reference form **matches the base**: if the base's most recent
+/// cross-reference is a classic `xref` table, the update writes a classic table +
+/// `trailer`; if it is a cross-reference **stream** (PDF ≥ 1.5, ISO 32000-1
+/// §7.5.8), the update is itself written as a cross-reference stream (so the file
+/// stays single-form and readers that only follow `/XRefStm`-free chains aren't
+/// confused). In the stream form the xref stream is an indirect object and
+/// consumes the next free number (`size`), so the new `/Size` is `size + 1`.
 ///
 /// This is the mechanism PAdES-LTV needs: a `/DSS` (validation material) or a
 /// document timestamp can be added **without disturbing the bytes an existing
@@ -303,10 +359,11 @@ pub fn to_pdf_compressed(
 ///
 /// `prev_startxref` is the byte offset of the most recent xref in `base` (its
 /// `startxref` value); `size` is the new `/Size` (one past the highest object
-/// number in the whole file). `root`/`info` carry the (updated) `/Root` and
-/// `/Info` references for the trailer. The objects are written verbatim — callers
-/// pass fully-formed `Object`s (references already point at final numbers), so no
-/// renumbering happens here.
+/// number in the whole file *before* any xref-stream object is added).
+/// `root`/`info` carry the (updated) `/Root` and `/Info` references for the
+/// trailer. The objects are written verbatim — callers pass fully-formed
+/// `Object`s (references already point at final numbers), so no renumbering
+/// happens here.
 pub fn append_incremental_update(
     base: &[u8],
     new_objects: &[(u32, u16, Object)],
@@ -331,12 +388,87 @@ pub fn append_incremental_update(
         out.extend_from_slice(b"\nendobj\n");
     }
 
-    // 2. Classic xref with one subsection per contiguous run of object numbers
-    //    (an incremental update need not start at object 0).
-    let xref_offset = out.len();
-    out.extend_from_slice(b"xref\n");
+    // 2. Cross-reference section + trailer, matching the base's form.
     let mut sorted = offsets.clone();
     sorted.sort_by_key(|(n, _, _)| *n);
+
+    if base_uses_xref_stream(base, prev_startxref) {
+        // ── cross-reference STREAM update (ISO 32000-1 §7.5.8) ──
+        // The xref stream is itself an indirect object: it takes the next free
+        // number and bumps `/Size` by one.
+        let xref_num = size;
+        let xref_offset = out.len();
+        let new_size = size + 1;
+
+        // Entries: every new object (type 1) plus the xref stream itself (type 1),
+        // sorted by object number.
+        let mut entries: Vec<(u32, u64, u64)> = sorted
+            .iter()
+            .map(|(n, g, off)| (*n, *off as u64, *g as u64))
+            .collect();
+        entries.push((xref_num, xref_offset as u64, 0));
+        entries.sort_by_key(|e| e.0);
+
+        // Field widths: type = 1 byte; offset/object-number wide enough for the
+        // largest offset; generation/index = 2 bytes (as the compact writer).
+        let w1 = 1usize;
+        let w2 = byte_width(xref_offset as u64).max(2);
+        let w3 = 2usize;
+
+        // `/Index` subsections (contiguous runs) + the packed binary field data.
+        let mut index: Vec<Object> = Vec::new();
+        let mut data: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i < entries.len() {
+            let start = entries[i].0;
+            let mut j = i;
+            while j + 1 < entries.len() && entries[j + 1].0 == entries[j].0 + 1 {
+                j += 1;
+            }
+            index.push(Object::Integer(start as i64));
+            index.push(Object::Integer((j - i + 1) as i64));
+            for (_, off, gen) in &entries[i..=j] {
+                push_field(&mut data, 1, w1); // type 1 = uncompressed object
+                push_field(&mut data, *off, w2);
+                push_field(&mut data, *gen, w3);
+            }
+            i = j + 1;
+        }
+        let compressed = crate::filters::deflate::flate_encode(&data);
+
+        let mut xdict = Dictionary::new();
+        xdict.set(b"Type".to_vec(), Object::Name(b"XRef".to_vec()));
+        xdict.set(b"Size".to_vec(), Object::Integer(new_size as i64));
+        xdict.set(b"Root".to_vec(), root);
+        if let Some(info) = info {
+            xdict.set(b"Info".to_vec(), info);
+        }
+        xdict.set(b"Prev".to_vec(), Object::Integer(prev_startxref as i64));
+        xdict.set(b"Index".to_vec(), Object::Array(index));
+        xdict.set(
+            b"W".to_vec(),
+            Object::Array(vec![
+                Object::Integer(w1 as i64),
+                Object::Integer(w2 as i64),
+                Object::Integer(w3 as i64),
+            ]),
+        );
+        xdict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+        xdict.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
+
+        out.extend_from_slice(format!("{xref_num} 0 obj\n").as_bytes());
+        write_dict(&mut out, &xdict);
+        out.extend_from_slice(b"\nstream\n");
+        out.extend_from_slice(&compressed);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+        out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        return out;
+    }
+
+    // ── classic xref table (one subsection per contiguous run of numbers; an
+    //    incremental update need not start at object 0) + trailer ──
+    let xref_offset = out.len();
+    out.extend_from_slice(b"xref\n");
     let mut i = 0;
     while i < sorted.len() {
         let start = sorted[i].0;
@@ -366,6 +498,34 @@ pub fn append_incremental_update(
     out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
 
     out
+}
+
+/// Whether the base's most recent cross-reference (at byte offset
+/// `prev_startxref`) is a cross-reference **stream** (PDF ≥ 1.5) rather than a
+/// classic `xref` table. A classic section begins with the literal `xref`
+/// keyword; a cross-reference stream begins with an indirect-object header
+/// (`<num> <gen> obj`). Out-of-range / unrecognized ⇒ treated as classic (safe
+/// default — the historical behaviour).
+fn base_uses_xref_stream(base: &[u8], prev_startxref: usize) -> bool {
+    let Some(rest) = base.get(prev_startxref..) else {
+        return false;
+    };
+    let mut i = 0;
+    while i < rest.len() && is_whitespace(rest[i]) {
+        i += 1;
+    }
+    !rest[i..].starts_with(b"xref")
+}
+
+/// Number of big-endian bytes needed to represent `value` (minimum 1).
+fn byte_width(value: u64) -> usize {
+    let mut width = 1usize;
+    let mut v = value >> 8;
+    while v > 0 {
+        width += 1;
+        v >>= 8;
+    }
+    width
 }
 
 // ─── linearization (Fast Web View, ISO 32000-1 Annex F) ─────────────────────
@@ -479,8 +639,17 @@ struct Partition {
     page_groups: Vec<Vec<ObjectId>>,
     /// Part 8 — objects shared between pages 2..N (not used by the first page).
     part8: Vec<ObjectId>,
-    /// Part 9 — the page tree, then everything else.
+    /// Part 9 — the page tree, then everything else. The `outline_group` and
+    /// `thread_group` runs are kept contiguous within it.
     part9: Vec<ObjectId>,
+    /// Document-outline objects (the `/Outlines` dictionary first, then its
+    /// items), as a single contiguous run inside `part9` — input to the outline
+    /// hint table (ISO 32000-1 §F.3, `/O`). Empty when there is no outline.
+    outline_group: Vec<ObjectId>,
+    /// Article-thread objects (`/Threads` dictionaries + info dicts), as a single
+    /// contiguous run inside `part9` — input to the thread-information hint table
+    /// (`/A`). Empty when there are no threads.
+    thread_group: Vec<ObjectId>,
     /// First page's page object (for `/O`).
     page1: ObjectId,
     /// Number of pages.
@@ -673,11 +842,13 @@ fn partition_by_page(
         );
     }
 
-    // Classify each object (qpdf's category switch).
+    // Classify each object (qpdf's category switch). `/Threads` is intentionally
+    // omitted here (qpdf keeps it as an open-document key): ISO 32000-1 recommends
+    // thread information dictionaries live in part 9, and placing them there lets
+    // them form the contiguous run the thread-information hint table (`/A`) needs.
     const OPEN_DOC_KEYS: &[&[u8]] = &[
         b"ViewerPreferences",
         b"PageMode",
-        b"Threads",
         b"OpenAction",
         b"AcroForm",
     ];
@@ -768,7 +939,10 @@ fn partition_by_page(
     // Part 8: other pages' shared objects (order unimportant).
     let part8: Vec<ObjectId> = lc_other_page_shared.iter().copied().collect();
 
-    // Part 9: the page tree first, then everything remaining in lc_other.
+    // Part 9: the page tree first, then the remaining lc_other objects — but keep
+    // the outline and thread object groups as contiguous runs so their generic
+    // hint tables (ISO 32000-1 §F.3) are single byte spans (qpdf validates the
+    // outline run's offset + length).
     let mut part9: Vec<ObjectId> = Vec::new();
     let mut remaining = lc_other.clone();
     // Page-tree nodes that landed in lc_other, in tree order.
@@ -777,7 +951,53 @@ fn partition_by_page(
             part9.push(id);
         }
     }
+
+    // Outline group: the `/Outlines` dictionary first (it must own the lowest
+    // offset — the outline hint table's `first_object`), then its items still in
+    // part 9 (objects reached from the `/Outlines` root key). Built only when the
+    // `/Outlines` dictionary itself is a part-9 object.
+    let outlines_root_id = objects
+        .get(&catalog_id)
+        .and_then(Object::as_dict)
+        .and_then(|d| d.get(b"Outlines"))
+        .and_then(Object::as_reference);
+    let mut outline_group: Vec<ObjectId> = Vec::new();
+    if let Some(out_id) = outlines_root_id {
+        if remaining.remove(&out_id) {
+            outline_group.push(out_id);
+            let key = ObjUser::RootKey(b"Outlines".to_vec());
+            let items: Vec<ObjectId> = remaining
+                .iter()
+                .copied()
+                .filter(|id| users.get(id).is_some_and(|u| u.contains(&key)))
+                .collect();
+            for id in items {
+                remaining.remove(&id);
+                outline_group.push(id);
+            }
+        }
+    }
+
+    // Thread group: thread + info objects reached from the `/Threads` root key
+    // that remain in part 9 (page-shared beads stay with their pages). qpdf
+    // ignores the `/A` table, so this is a best-effort, self-consistent run.
+    let mut thread_group: Vec<ObjectId> = Vec::new();
+    {
+        let key = ObjUser::RootKey(b"Threads".to_vec());
+        let items: Vec<ObjectId> = remaining
+            .iter()
+            .copied()
+            .filter(|id| users.get(id).is_some_and(|u| u.contains(&key)))
+            .collect();
+        for id in items {
+            remaining.remove(&id);
+            thread_group.push(id);
+        }
+    }
+
     part9.extend(remaining.iter().copied());
+    part9.extend(outline_group.iter().copied());
+    part9.extend(thread_group.iter().copied());
 
     Some(Partition {
         part4,
@@ -785,6 +1005,8 @@ fn partition_by_page(
         page_groups,
         part8,
         part9,
+        outline_group,
+        thread_group,
         page1,
         npages,
         users,
@@ -852,9 +1074,23 @@ fn page_tree_node_order(objects: &BTreeMap<ObjectId, Object>, root: ObjectId) ->
 ///
 /// Returns `None` when the document cannot be linearized (no catalog / no page
 /// tree / zero pages); callers fall back to a non-linearized writer.
+///
+/// Uses the default `%PDF-1.7` header; see [`to_linearized_with_header`] to pick
+/// the version banner (e.g. via [`PdfVersion::header`]).
 pub fn to_linearized(
     objects: &BTreeMap<ObjectId, Object>,
     trailer: &Dictionary,
+) -> Option<Vec<u8>> {
+    to_linearized_with_header(objects, trailer, b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n")
+}
+
+/// Linearized serializer with a caller-chosen file-header line — identical to
+/// [`to_linearized`] otherwise. `header` must include the binary-comment second
+/// line; pass [`PdfVersion::header`] for a 1.7 / 2.0 banner.
+pub fn to_linearized_with_header(
+    objects: &BTreeMap<ObjectId, Object>,
+    trailer: &Dictionary,
+    header: &[u8],
 ) -> Option<Vec<u8>> {
     use crate::filters::deflate::flate_encode;
 
@@ -1028,7 +1264,6 @@ pub fn to_linearized(
     }
 
     // ── 5. Geometry independent of the hint length. ──
-    let header: &[u8] = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
     let id_obj = trailer_id_pair(trailer);
     let first_trailer_len = first_page_trailer_len(&id_obj);
 
@@ -1067,6 +1302,50 @@ pub fn to_linearized(
         .iter()
         .map(|(num, b)| (*num, obj_span(*num, b)))
         .collect();
+
+    // Byte offset of every object relative to the start of part 6 (= `off_part6`),
+    // in the fixed physical-after-hint order. This is invariant to the hint-stream
+    // length, so the generic (outline/thread) hint offsets resolve *before* the
+    // hint fixed-point loop: a group's stored `first_object_offset` (absolute
+    // offset minus the hint length) equals `off_hint + rel_off[first]`, exactly as
+    // the first-page offset equals `off_hint`.
+    let rel_off: BTreeMap<u32, usize> = {
+        let mut cur = 0usize;
+        let mut m: BTreeMap<u32, usize> = BTreeMap::new();
+        let place = |num: u32, cur: &mut usize, m: &mut BTreeMap<u32, usize>| {
+            if let std::collections::btree_map::Entry::Vacant(e) = m.entry(num) {
+                e.insert(*cur);
+                *cur += span_of[&num];
+            }
+        };
+        for group in &part.page_groups {
+            for &id in group {
+                place(remap[&id], &mut cur, &mut m);
+            }
+        }
+        for &id in part.part8.iter().chain(part.part9.iter()) {
+            place(remap[&id], &mut cur, &mut m);
+        }
+        for &id in &ordered {
+            place(remap[&id], &mut cur, &mut m);
+        }
+        m
+    };
+
+    // Generic hint tables for the contiguous outline / thread runs (part 9). The
+    // first object owns the lowest offset in its run, so it is `first_object`.
+    let generic_hint = |group: &[ObjectId]| -> Option<GenericHint> {
+        let first_num = remap[group.first()?];
+        let group_length: usize = group.iter().map(|id| span_of[&remap[id]]).sum();
+        Some(GenericHint {
+            first_object: first_num,
+            first_object_offset: (off_hint + rel_off[&first_num]) as u32,
+            nobjects: group.len() as u32,
+            group_length: group_length as u32,
+        })
+    };
+    let outline_hint = generic_hint(&part.outline_group);
+    let thread_hint = generic_hint(&part.thread_group);
 
     // ── 6. Resolve the hint stream length (fixed-point on its own size). ──
     // Page lengths/content lengths derive from the part6/part7 layout, which starts
@@ -1111,11 +1390,10 @@ pub fn to_linearized(
 
     let mut hint_total_len = 0usize;
     let mut hint_obj_bytes: Vec<u8> = Vec::new();
-    let mut shared_off_final = 0usize;
     for _ in 0..8 {
         // Offset of the first page's first object (start of part6).
         let off_part6 = off_hint + hint_total_len;
-        let (payload, s_off) = build_hint_payload(HintInput {
+        let (payload, offs) = build_hint_payload(HintInput {
             first_page_obj_off: off_part6,
             hint_total_len,
             page_len: &page_len,
@@ -1125,8 +1403,9 @@ pub fn to_linearized(
             nshared_first_page,
             shared_group_len: &shared_group_len,
             first_shared_obj_num: shared_obj_nums.first().copied().unwrap_or(0),
+            outline: outline_hint,
+            thread: thread_hint,
         });
-        shared_off_final = s_off;
         let compressed = flate_encode(&payload);
         let mut hdict = Dictionary::new();
         // The hint data is Flate-compressed; the reader must inflate it before
@@ -1134,7 +1413,13 @@ pub fn to_linearized(
         // bytes as hint fields → bit-stream overflow).
         hdict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
         hdict.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
-        hdict.set(b"S".to_vec(), Object::Integer(s_off as i64));
+        hdict.set(b"S".to_vec(), Object::Integer(offs.shared as i64));
+        if let Some(o) = offs.outline {
+            hdict.set(b"O".to_vec(), Object::Integer(o as i64));
+        }
+        if let Some(a) = offs.thread {
+            hdict.set(b"A".to_vec(), Object::Integer(a as i64));
+        }
         let mut hbytes = Vec::new();
         hbytes.extend_from_slice(format!("{hint_num} 0 obj\n").as_bytes());
         write_dict(&mut hbytes, &hdict);
@@ -1148,7 +1433,6 @@ pub fn to_linearized(
         }
         hint_total_len = new_len;
     }
-    let _ = shared_off_final;
 
     // ── 7. Final absolute geometry + offsets. ──
     let off_part6 = off_hint + hint_total_len;
@@ -1447,6 +1731,33 @@ fn build_main_xref_all(
     out
 }
 
+/// A generic hint table (ISO 32000-1 §F.3): one contiguous group of objects
+/// described by four 32-bit fields. Used for the document-outline (`/O`) and
+/// thread-information (`/A`) hint tables.
+#[derive(Clone, Copy)]
+struct GenericHint {
+    /// Object number of the first object in the group.
+    first_object: u32,
+    /// Byte offset of that object, minus the hint-stream length (the hint tables
+    /// disregard the hint stream's own bytes, like every other stored offset).
+    first_object_offset: u32,
+    /// Number of objects in the group.
+    nobjects: u32,
+    /// Total byte length of the contiguous group.
+    group_length: u32,
+}
+
+/// Byte offsets (within the decoded hint payload) of the hint tables, for the
+/// hint-stream dictionary's `/S`, `/O` and `/A` entries.
+struct HintOffsets {
+    /// Shared-object hint table offset (`/S`, always present).
+    shared: usize,
+    /// Document-outline hint table offset (`/O`), if written.
+    outline: Option<usize>,
+    /// Thread-information hint table offset (`/A`), if written.
+    thread: Option<usize>,
+}
+
 /// Inputs to [`build_hint_payload`], one entry per page / shared object.
 struct HintInput<'a> {
     /// Absolute byte offset of the first page's first object (= start of part 6).
@@ -1470,13 +1781,17 @@ struct HintInput<'a> {
     /// Object number of the first shared object in `part8` region — only used (and
     /// only meaningful) when `nshared_total > nshared_first_page`.
     first_shared_obj_num: u32,
+    /// Document-outline generic hint table (`/O`), if the document has one.
+    outline: Option<GenericHint>,
+    /// Thread-information generic hint table (`/A`), if the document has threads.
+    thread: Option<GenericHint>,
 }
 
 /// Build the primary hint stream payload (decoded bytes): the **page-offset hint
-/// table** (ISO 32000-1 §F.3.1) followed by the **shared-object hint table**
-/// (§F.3.2). Returns `(payload, shared_table_offset)` — the second value is the
-/// byte offset of the shared table within the decoded payload (the hint stream's
-/// `/S`).
+/// table** (ISO 32000-1 §F.3.1), the **shared-object hint table** (§F.3.2), and —
+/// when present — the **document-outline** and **thread-information** generic hint
+/// tables (§F.3). Returns `(payload, offsets)` where `offsets` gives each table's
+/// byte offset within the decoded payload (the hint stream's `/S`, `/O`, `/A`).
 ///
 /// The byte/bit layout reproduces exactly what qpdf writes (and re-validates):
 ///
@@ -1497,7 +1812,10 @@ struct HintInput<'a> {
 ///   `nbits_delta_content_length = nbits_delta_page_length`, content offset 0.
 /// * Shared header (7 fields), then columns: `delta_group_length`,
 ///   `signature_present` (1 bit each, all 0), `nobjects_minus_one` (0 bits).
-fn build_hint_payload(input: HintInput) -> (Vec<u8>, usize) {
+/// * Each generic hint table (outline, thread) is four big-endian 32-bit fields
+///   (`first_object`, `first_object_offset`, `nobjects`, `group_length`), written
+///   on byte boundaries.
+fn build_hint_payload(input: HintInput) -> (Vec<u8>, HintOffsets) {
     let n_pages = input.page_len.len();
     let nshared_total = input.shared_group_len.len();
 
@@ -1519,9 +1837,15 @@ fn build_hint_payload(input: HintInput) -> (Vec<u8>, usize) {
     let nbits_shared_identifier = bit_width(nshared_total as u64);
     let nbits_shared_numerator = 0u32;
     let nbits_delta_content_offset = 0u32;
-    let nbits_delta_content_length = nbits_delta_page_length;
     let min_content_offset = 0u32;
-    let min_content_length = min_length; // = min_page_length (impl. note 127)
+    // Page-offset hint table content-stream fields (header items 8/9, ISO 32000-1
+    // Table 132): the *real* least content-stream length and the bit width of
+    // (greatest − least) content length — a column independent of page length, not
+    // a copy of it. Acrobat/qpdf ignore these on read, but they now reflect the
+    // actual content streams so a strict viewer can locate them.
+    let min_content_length = input.page_content_len.iter().copied().min().unwrap_or(0);
+    let max_content_length = input.page_content_len.iter().copied().max().unwrap_or(0);
+    let nbits_delta_content_length = bit_width((max_content_length - min_content_length) as u64);
     let shared_denominator = 4u32;
 
     // Header field 2: first page's first-object offset, minus the hint length.
@@ -1580,14 +1904,11 @@ fn build_hint_payload(input: HintInput) -> (Vec<u8>, usize) {
     bw.pad();
     // delta_content_offset (0 bits)
     bw.pad();
-    // delta_content_length (= delta_page_length per impl. note 127)
+    // delta_content_length: the page's real content-stream length minus the least
+    // content length (header item 8) — its own column, not the page-length delta.
     for i in 0..n_pages {
         let dcl = input.page_content_len[i].saturating_sub(min_content_length);
-        // qpdf sets content_length delta == page_length delta; mirror that so the
-        // computed/hint comparison agrees (it ignores the value on read anyway).
-        let dpl = input.page_len[i] - min_length;
-        let _ = dcl;
-        bw.put(dpl as u64, nbits_delta_content_length);
+        bw.put(dcl as u64, nbits_delta_content_length);
     }
     bw.pad();
     let page_records = bw.into_bytes();
@@ -1646,7 +1967,35 @@ fn build_hint_payload(input: HintInput) -> (Vec<u8>, usize) {
 
     payload.extend_from_slice(&sheader);
     payload.extend_from_slice(&shared_records);
-    (payload, shared_off)
+
+    // ── generic hint tables (outline `/O`, thread `/A`) ──
+    // Each is four big-endian 32-bit fields on a byte boundary (the shared records
+    // end byte-aligned). Their decoded-payload offsets feed the hint-stream dict.
+    let put_generic = |payload: &mut Vec<u8>, g: &GenericHint| {
+        payload.extend_from_slice(&g.first_object.to_be_bytes());
+        payload.extend_from_slice(&g.first_object_offset.to_be_bytes());
+        payload.extend_from_slice(&g.nobjects.to_be_bytes());
+        payload.extend_from_slice(&g.group_length.to_be_bytes());
+    };
+    let outline_off = input.outline.as_ref().map(|g| {
+        let off = payload.len();
+        put_generic(&mut payload, g);
+        off
+    });
+    let thread_off = input.thread.as_ref().map(|g| {
+        let off = payload.len();
+        put_generic(&mut payload, g);
+        off
+    });
+
+    (
+        payload,
+        HintOffsets {
+            shared: shared_off,
+            outline: outline_off,
+            thread: thread_off,
+        },
+    )
 }
 
 /// Read the byte offset in the most recent `startxref` of a serialized PDF — the
@@ -1950,5 +2299,409 @@ mod tests {
         let mut out = Vec::new();
         write_literal_string(&mut out, b"a(b)c\\");
         assert_eq!(out, b"(a\\(b\\)c\\\\)");
+    }
+
+    // ── issue #77: linearization (dcl + outline/thread hints), version header,
+    //    incremental xref-stream updates ──────────────────────────────────────
+
+    use crate::object::{Stream, StringKind};
+    use crate::Document;
+
+    fn mkdict(pairs: Vec<(&str, Object)>) -> Dictionary {
+        let mut d = Dictionary::new();
+        for (k, v) in pairs {
+            d.set(k.as_bytes().to_vec(), v);
+        }
+        d
+    }
+    fn tref(n: u32) -> Object {
+        Object::Reference((n, 0))
+    }
+    fn tname(s: &[u8]) -> Object {
+        Object::Name(s.to_vec())
+    }
+    fn tint(n: i64) -> Object {
+        Object::Integer(n)
+    }
+    fn tstr(s: &[u8]) -> Object {
+        Object::String(s.to_vec(), StringKind::Literal)
+    }
+    fn mediabox() -> Object {
+        Object::Array(vec![tint(0), tint(0), tint(200), tint(200)])
+    }
+    fn content(body: &[u8]) -> Object {
+        Object::Stream(Stream {
+            dict: Dictionary::new(),
+            raw: body.to_vec(),
+        })
+    }
+
+    /// A small but valid 2-page document object map (+ trailer), with optional
+    /// `/Outlines` (a 2-item outline) and `/Threads` (one article: thread + info +
+    /// bead). Object numbers: 1 catalog, 2 pages, 3/5 page objects, 4/6 contents,
+    /// 7 outlines + 8/9 items, 10 thread + 11 info + 12 bead.
+    fn lin_objects(with_outline: bool, with_threads: bool) -> (BTreeMap<ObjectId, Object>, Dictionary) {
+        let mut objects: BTreeMap<ObjectId, Object> = BTreeMap::new();
+        let mut catalog = vec![("Type", tname(b"Catalog")), ("Pages", tref(2))];
+        if with_outline {
+            catalog.push(("Outlines", tref(7)));
+        }
+        if with_threads {
+            catalog.push(("Threads", Object::Array(vec![tref(10)])));
+        }
+        objects.insert((1, 0), Object::Dictionary(mkdict(catalog)));
+        objects.insert(
+            (2, 0),
+            Object::Dictionary(mkdict(vec![
+                ("Type", tname(b"Pages")),
+                ("Kids", Object::Array(vec![tref(3), tref(5)])),
+                ("Count", tint(2)),
+            ])),
+        );
+        objects.insert(
+            (3, 0),
+            Object::Dictionary(mkdict(vec![
+                ("Type", tname(b"Page")),
+                ("Parent", tref(2)),
+                ("MediaBox", mediabox()),
+                ("Contents", tref(4)),
+                ("Resources", Object::Dictionary(Dictionary::new())),
+            ])),
+        );
+        // Distinct, non-trivial content lengths so the content-length column is
+        // visibly the real value (and clearly < the page length).
+        objects.insert(
+            (4, 0),
+            content(b"0 0 200 200 re f 10 10 50 50 re f 80 80 40 40 re f 5 5 3 3 re f"),
+        );
+        objects.insert(
+            (5, 0),
+            Object::Dictionary(mkdict(vec![
+                ("Type", tname(b"Page")),
+                ("Parent", tref(2)),
+                ("MediaBox", mediabox()),
+                ("Contents", tref(6)),
+                ("Resources", Object::Dictionary(Dictionary::new())),
+            ])),
+        );
+        objects.insert((6, 0), content(b"20 20 30 30 re f"));
+        if with_outline {
+            objects.insert(
+                (7, 0),
+                Object::Dictionary(mkdict(vec![
+                    ("Type", tname(b"Outlines")),
+                    ("First", tref(8)),
+                    ("Last", tref(9)),
+                    ("Count", tint(2)),
+                ])),
+            );
+            objects.insert(
+                (8, 0),
+                Object::Dictionary(mkdict(vec![
+                    ("Title", tstr(b"Chapter 1")),
+                    ("Parent", tref(7)),
+                    ("Next", tref(9)),
+                    ("Dest", Object::Array(vec![tref(3), tname(b"Fit")])),
+                ])),
+            );
+            objects.insert(
+                (9, 0),
+                Object::Dictionary(mkdict(vec![
+                    ("Title", tstr(b"Chapter 2")),
+                    ("Parent", tref(7)),
+                    ("Prev", tref(8)),
+                    ("Dest", Object::Array(vec![tref(5), tname(b"Fit")])),
+                ])),
+            );
+        }
+        if with_threads {
+            objects.insert(
+                (10, 0),
+                Object::Dictionary(mkdict(vec![
+                    ("Type", tname(b"Thread")),
+                    ("I", tref(11)),
+                    ("F", tref(12)),
+                ])),
+            );
+            objects.insert(
+                (11, 0),
+                Object::Dictionary(mkdict(vec![("Title", tstr(b"Article 1"))])),
+            );
+            objects.insert(
+                (12, 0),
+                Object::Dictionary(mkdict(vec![
+                    ("Type", tname(b"Bead")),
+                    ("T", tref(10)),
+                    ("N", tref(12)),
+                    ("V", tref(12)),
+                    ("P", tref(3)),
+                    ("R", Object::Array(vec![tint(0), tint(0), tint(100), tint(100)])),
+                ])),
+            );
+        }
+        let trailer = mkdict(vec![("Root", tref(1)), ("Size", tint(13))]);
+        (objects, trailer)
+    }
+
+    fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Find `needle` and parse the (space-prefixed) ASCII integer right after it.
+    fn int_after(hay: &[u8], needle: &[u8]) -> Option<u64> {
+        let p = find_sub(hay, needle)? + needle.len();
+        let digits: Vec<u8> = hay[p..]
+            .iter()
+            .copied()
+            .skip_while(|b| *b == b' ')
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        std::str::from_utf8(&digits).ok()?.parse().ok()
+    }
+
+    fn be_u32(b: &[u8], off: usize) -> u32 {
+        u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+
+    /// Extract `(decoded_hint_payload, hint_object_dict_bytes)` from a linearized
+    /// PDF by following the `/H` offset, reading `/Length`, and inflating the stream.
+    fn extract_hint(pdf: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let hoff = int_after(pdf, b"/H [ ").expect("/H offset") as usize;
+        let obj = &pdf[hoff..];
+        let stream_at = find_sub(obj, b"stream\n").expect("hint stream keyword");
+        let dict = obj[..stream_at].to_vec();
+        let len = int_after(&dict, b"/Length ").expect("hint /Length") as usize;
+        let start = stream_at + b"stream\n".len();
+        let compressed = &obj[start..start + len];
+        let decoded = crate::filters::inflate::flate_decode(compressed).expect("inflate hint");
+        (decoded, dict)
+    }
+
+    fn qpdf_available() -> bool {
+        std::process::Command::new("qpdf")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    fn qpdf_combined(pdf: &[u8], label: &str) -> Option<String> {
+        if !qpdf_available() {
+            eprintln!("qpdf not available; skipping --check for {label}");
+            return None;
+        }
+        let path = std::env::temp_dir().join(format!("gp77_{label}_{}.pdf", std::process::id()));
+        std::fs::write(&path, pdf).unwrap();
+        let out = std::process::Command::new("qpdf")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .expect("run qpdf --check");
+        let _ = std::fs::remove_file(&path);
+        Some(format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+
+    /// Assert qpdf reports the file linearized with no warnings/errors (skipped if
+    /// qpdf is absent). qpdf re-derives the hint tables and compares, so this is the
+    /// real validation of the page/shared/outline hint tables.
+    fn qpdf_check_linearized(pdf: &[u8], label: &str) {
+        let Some(combined) = qpdf_combined(pdf, label) else {
+            return;
+        };
+        assert!(
+            combined.contains("File is linearized"),
+            "qpdf should report {label} linearized:\n{combined}"
+        );
+        assert!(
+            !combined.to_lowercase().contains("warning") && !combined.contains("error encountered"),
+            "qpdf --check warnings/errors for {label}:\n{combined}"
+        );
+    }
+
+    /// Assert qpdf reports no warnings/errors (the file need not be linearized).
+    fn qpdf_check_ok(pdf: &[u8], label: &str) {
+        let Some(combined) = qpdf_combined(pdf, label) else {
+            return;
+        };
+        assert!(
+            !combined.to_lowercase().contains("warning") && !combined.contains("error encountered"),
+            "qpdf --check warnings/errors for {label}:\n{combined}"
+        );
+    }
+
+    // ── sub-item 1: the content-length hint column carries the real value ──
+    #[test]
+    fn linearized_hint_carries_real_content_length() {
+        let (objects, trailer) = lin_objects(false, false);
+        let lin = to_linearized(&objects, &trailer).expect("linearize");
+        assert_eq!(Document::open(&lin).unwrap().page_count(), 2);
+
+        let (decoded, _) = extract_hint(&lin);
+        // Page-offset header: item 4 (min_page_length) @10, item 8 (min_content_length) @22.
+        let min_page_length = be_u32(&decoded, 10);
+        let min_content_length = be_u32(&decoded, 22);
+        assert!(min_content_length > 0, "a real content length is recorded");
+        assert!(
+            min_content_length < min_page_length,
+            "content length ({min_content_length}) is the real content-stream length, \
+             strictly below the page length ({min_page_length}) — not a copy of it"
+        );
+        qpdf_check_linearized(&lin, "dcl");
+    }
+
+    // ── sub-item 2: outline hint table (qpdf-validated) ──
+    #[test]
+    fn linearized_outline_hint_table_emitted_and_valid() {
+        let (objects, trailer) = lin_objects(true, false);
+        let lin = to_linearized(&objects, &trailer).expect("linearize");
+        let doc = Document::open(&lin).expect("reopen");
+        assert_eq!(doc.page_count(), 2);
+        assert_eq!(doc.outline_items().len(), 2, "outline survives linearization");
+
+        let (decoded, dict) = extract_hint(&lin);
+        let o = int_after(&dict, b"/O ").expect("hint dict has /O") as usize;
+        // Generic table fields: first_object @o, offset @o+4, nobjects @o+8, group_length @o+12.
+        assert_eq!(be_u32(&decoded, o + 8), 3, "/Outlines + 2 items");
+        assert!(be_u32(&decoded, o + 12) > 0, "non-zero group length");
+        // qpdf recomputes the outline group and compares to our /O table.
+        qpdf_check_linearized(&lin, "outline");
+    }
+
+    // ── sub-item 2: thread-information hint table ──
+    #[test]
+    fn linearized_thread_hint_table_emitted() {
+        let (objects, trailer) = lin_objects(false, true);
+        let lin = to_linearized(&objects, &trailer).expect("linearize");
+        assert_eq!(Document::open(&lin).unwrap().page_count(), 2);
+
+        let (decoded, dict) = extract_hint(&lin);
+        let a = int_after(&dict, b"/A ").expect("hint dict has /A") as usize;
+        assert_eq!(be_u32(&decoded, a + 8), 3, "thread + info + bead");
+        assert!(be_u32(&decoded, a + 12) > 0, "non-zero group length");
+        // qpdf ignores /A — the file must stay warning-free.
+        qpdf_check_linearized(&lin, "thread");
+    }
+
+    #[test]
+    fn linearized_outline_and_thread_coexist() {
+        let (objects, trailer) = lin_objects(true, true);
+        let lin = to_linearized(&objects, &trailer).expect("linearize");
+        assert_eq!(Document::open(&lin).unwrap().page_count(), 2);
+        let (_, dict) = extract_hint(&lin);
+        assert!(int_after(&dict, b"/O ").is_some(), "/O present");
+        assert!(int_after(&dict, b"/A ").is_some(), "/A present");
+        qpdf_check_linearized(&lin, "outline+thread");
+    }
+
+    #[test]
+    fn linearized_without_outline_or_threads_omits_o_and_a() {
+        let (objects, trailer) = lin_objects(false, false);
+        let lin = to_linearized(&objects, &trailer).expect("linearize");
+        let (_, dict) = extract_hint(&lin);
+        assert!(int_after(&dict, b"/O ").is_none(), "no /O without outline");
+        assert!(int_after(&dict, b"/A ").is_none(), "no /A without threads");
+        assert!(int_after(&dict, b"/S ").is_some(), "/S always present");
+    }
+
+    // ── sub-item 3: incremental update matches the base's xref form ──
+
+    /// Append (as an incremental update) a new page wired into a re-emitted page
+    /// tree, so the added page is only reachable through the new xref. Returns the
+    /// updated bytes and the base `/Size`.
+    fn add_page_update(base: &[u8]) -> (Vec<u8>, u32) {
+        let prev = last_startxref(base).unwrap();
+        let prev_size = last_size(base).unwrap();
+        let new_page = prev_size; // next free number
+        let page = Object::Dictionary(mkdict(vec![
+            ("Type", tname(b"Page")),
+            ("Parent", tref(2)),
+            ("MediaBox", mediabox()),
+        ]));
+        let pages = Object::Dictionary(mkdict(vec![
+            ("Type", tname(b"Pages")),
+            ("Kids", Object::Array(vec![tref(3), tref(5), tref(new_page)])),
+            ("Count", tint(3)),
+        ]));
+        let new = vec![(new_page, 0u16, page), (2u32, 0u16, pages)];
+        let size = new_page + 1; // one past the new object
+        let bytes = append_incremental_update(base, &new, prev, size, tref(1), None);
+        (bytes, prev_size)
+    }
+
+    #[test]
+    fn incremental_xref_stream_update_round_trips() {
+        let (objects, trailer) = lin_objects(false, false);
+        let base = to_pdf_compressed(&objects, &trailer, false); // xref-stream base
+        assert!(find_sub(&base, b"/Type /XRef").is_some(), "base uses an xref stream");
+
+        let (updated, prev_size) = add_page_update(&base);
+        let appended = &updated[base.len()..];
+        assert!(
+            find_sub(appended, b"/Type /XRef").is_some(),
+            "the incremental update is itself an xref stream"
+        );
+        assert!(
+            find_sub(appended, b"\nxref\n").is_none(),
+            "no classic xref table in the update"
+        );
+        let doc = Document::open(&updated).expect("reopen");
+        assert_eq!(
+            doc.page_count(),
+            3,
+            "added page is visible through the xref-stream update"
+        );
+        assert_eq!(
+            last_size(&updated),
+            Some(prev_size + 2),
+            "the xref stream object consumed the next free number"
+        );
+        qpdf_check_ok(&updated, "incr_xrefstream");
+    }
+
+    #[test]
+    fn incremental_classic_update_round_trips() {
+        let (objects, trailer) = lin_objects(false, false);
+        let base = to_pdf(&objects, &trailer); // classic xref base
+        let (updated, prev_size) = add_page_update(&base);
+        let appended = &updated[base.len()..];
+        assert!(find_sub(appended, b"xref\n").is_some(), "classic xref table");
+        assert!(find_sub(appended, b"trailer").is_some(), "classic trailer");
+        assert!(
+            find_sub(appended, b"/Type /XRef").is_none(),
+            "classic base keeps a classic update"
+        );
+        let doc = Document::open(&updated).expect("reopen");
+        assert_eq!(doc.page_count(), 3);
+        assert_eq!(
+            last_size(&updated),
+            Some(prev_size + 1),
+            "classic /Size = one past the new object"
+        );
+        qpdf_check_ok(&updated, "incr_classic");
+    }
+
+    // ── sub-item 4: version-selectable header ──
+    #[test]
+    fn version_header_selects_banner() {
+        assert_eq!(PdfVersion::default(), PdfVersion::V1_7);
+        let (objects, trailer) = lin_objects(false, false);
+
+        let v17 = to_pdf_compressed_with_header(&objects, &trailer, true, PdfVersion::V1_7.header());
+        assert!(v17.starts_with(b"%PDF-1.7"));
+        let v20 = to_pdf_compressed_with_header(&objects, &trailer, true, PdfVersion::V2_0.header());
+        assert!(v20.starts_with(b"%PDF-2.0"));
+        // The bare wrapper keeps the historical 1.5 banner.
+        assert!(to_pdf_compressed(&objects, &trailer, true).starts_with(b"%PDF-1.5"));
+        // The linearized writer honours the header too.
+        let lin20 =
+            to_linearized_with_header(&objects, &trailer, PdfVersion::V2_0.header()).unwrap();
+        assert!(lin20.starts_with(b"%PDF-2.0"));
+
+        for pdf in [&v17, &v20, &lin20] {
+            assert_eq!(Document::open(pdf).unwrap().page_count(), 2, "round-trips");
+        }
     }
 }
