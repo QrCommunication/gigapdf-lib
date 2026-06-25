@@ -447,13 +447,26 @@ pub fn to_rtf(paragraphs: &[String]) -> Vec<u8> {
 // ─────────────────────────────── model → RTF ───────────────────────────────
 
 use crate::model::{
-    Block, BlockKind, CharStyle, Document, Heading, Inline, List, Paragraph, Table,
+    Block, BlockKind, CharStyle, Document, Heading, ImageRef, Inline, LinkTarget, List, ListMarker,
+    Paragraph, ResourceTable, Table,
 };
 
-/// Serialize a unified [`Document`] to RTF with real paragraph breaks and
-/// character styling (bold/italic/underline/strike/size/colour). Headings,
-/// lists and tables are flattened to styled paragraphs (an RTF reader gets the
-/// full text with formatting; a true `\trowd` table grid is out of scope here).
+/// Serialize a unified [`Document`] to *rich* RTF with real paragraph breaks and
+/// character styling (bold/italic/underline/strike/size/colour), plus structural
+/// fidelity:
+///
+/// * **Tables** become real `\trowd … \cellxN … \cell … \row` grids (column
+///   right-edges derived from [`Table::col_widths`] in twips), not tab lines.
+/// * **Lists** emit ordered vs unordered markers with per-level indentation and
+///   running counters (`1.`, `a.`, `i.`, `•`), honouring [`List::ordered`] /
+///   [`List::marker`] and each item's nesting [`ListItem::level`].
+/// * **Images** ([`BlockKind::Image`]) interned in [`Document::resources`] emit a
+///   `{\pict …}` group — `\pngblip` for PNG, `\jpegblip` for JPEG, with
+///   `\picwgoal`/`\pichgoal` from the pixel size and a hex payload. Formats RTF
+///   cannot carry (GIF/WebP/AVIF/…) are skipped.
+/// * **Hyperlinks** ([`Inline::Link`]) emit
+///   `{\field{\*\fldinst HYPERLINK "url"}{\fldrslt <styled children>}}`, the form
+///   the RTF importer ([`super::rtf::rtf_to_model`]) reads back.
 pub fn rtf_from_model(doc: &Document) -> Vec<u8> {
     // Collect the distinct run colours into the RTF colour table; runs reference
     // a colour by 1-based index (`\cfN`).
@@ -468,7 +481,13 @@ pub fn rtf_from_model(doc: &Document) -> Vec<u8> {
 
     let mut s = format!("{{\\rtf1\\ansi\\deff0{{\\fonttbl{{\\f0 Helvetica;}}}}{color_tbl}\\fs22\n");
     let mut first = true;
-    rtf_blocks_from_model(&collect_blocks(doc), &colors, &mut first, &mut s);
+    rtf_blocks_from_model(
+        &collect_blocks(doc),
+        &colors,
+        &doc.resources,
+        &mut first,
+        &mut s,
+    );
     s.push_str("}\n");
     s.into_bytes()
 }
@@ -582,19 +601,31 @@ fn rtf_run_highlight(style: &CharStyle) -> Option<[u8; 3]> {
     })
 }
 
-fn rtf_blocks_from_model(blocks: &[Block], colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+fn rtf_blocks_from_model(
+    blocks: &[Block],
+    colors: &[[u8; 3]],
+    res: &ResourceTable,
+    first: &mut bool,
+    out: &mut String,
+) {
     for b in blocks {
-        rtf_block_from_model(b, colors, first, out);
+        rtf_block_from_model(b, colors, res, first, out);
     }
 }
 
-fn rtf_block_from_model(block: &Block, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+fn rtf_block_from_model(
+    block: &Block,
+    colors: &[[u8; 3]],
+    res: &ResourceTable,
+    first: &mut bool,
+    out: &mut String,
+) {
     match &block.kind {
-        BlockKind::Paragraph(p) => rtf_para_from_model(p, colors, false, first, out),
+        BlockKind::Paragraph(p) => rtf_para_from_model(p, colors, res, false, first, out),
         BlockKind::Heading(h) => rtf_heading_from_model(h, colors, first, out),
-        BlockKind::List(list) => rtf_list_from_model(list, colors, first, out),
-        BlockKind::Table(table) => rtf_table_from_model(table, colors, first, out),
-        BlockKind::TextBox(tb) => rtf_blocks_from_model(&tb.blocks, colors, first, out),
+        BlockKind::List(list) => rtf_list_from_model(list, colors, res, first, out),
+        BlockKind::Table(table) => rtf_table_from_model(table, colors, res, first, out),
+        BlockKind::TextBox(tb) => rtf_blocks_from_model(&tb.blocks, colors, res, first, out),
         BlockKind::Sheet(sb) => {
             for sheet in &sb.sheets {
                 for row in &sheet.rows {
@@ -618,7 +649,7 @@ fn rtf_block_from_model(block: &Block, colors: &[[u8; 3]], first: &mut bool, out
         BlockKind::Slide(sb) => {
             for slide in &sb.slides {
                 for ph in &slide.placeholders {
-                    rtf_block_from_model(&ph.block, colors, first, out);
+                    rtf_block_from_model(&ph.block, colors, res, first, out);
                 }
             }
         }
@@ -633,7 +664,7 @@ fn rtf_block_from_model(block: &Block, colors: &[[u8; 3]], first: &mut bool, out
             rtf_par_sep(first, out);
             out.push_str("{\\li360 ");
             let mut inner_first = true;
-            rtf_blocks_from_model(&bq.blocks, colors, &mut inner_first, out);
+            rtf_blocks_from_model(&bq.blocks, colors, res, &mut inner_first, out);
             out.push('}');
         }
         BlockKind::HorizontalRule => {
@@ -641,7 +672,10 @@ fn rtf_block_from_model(block: &Block, colors: &[[u8; 3]], first: &mut bool, out
             rtf_par_sep(first, out);
             out.push_str("{\\pard\\brdrb\\brdrs\\brdrw10\\par}");
         }
-        BlockKind::Image(_) | BlockKind::Shape(_) => {}
+        // A block-level image emits a `\pict` group (PNG/JPEG only); a Shape's
+        // vector geometry has no portable RTF mapping and is dropped.
+        BlockKind::Image(img) => rtf_image_from_model(img, res, first, out),
+        BlockKind::Shape(_) => {}
     }
 }
 
@@ -661,6 +695,7 @@ fn rtf_plain_line(text: &str, first: &mut bool, out: &mut String) {
 fn rtf_para_from_model(
     para: &Paragraph,
     colors: &[[u8; 3]],
+    res: &ResourceTable,
     force_bold: bool,
     first: &mut bool,
     out: &mut String,
@@ -674,11 +709,17 @@ fn rtf_para_from_model(
         crate::model::Align::Justify => out.push_str("\\qj "),
     }
     for r in &para.runs {
-        rtf_inline_from_model(r, colors, force_bold, out);
+        rtf_inline_from_model(r, colors, res, force_bold, out);
     }
 }
 
-fn rtf_inline_from_model(inline: &Inline, colors: &[[u8; 3]], force_bold: bool, out: &mut String) {
+fn rtf_inline_from_model(
+    inline: &Inline,
+    colors: &[[u8; 3]],
+    res: &ResourceTable,
+    force_bold: bool,
+    out: &mut String,
+) {
     match inline {
         Inline::Run(run) => {
             if run.text.is_empty() {
@@ -690,11 +731,28 @@ fn rtf_inline_from_model(inline: &Inline, colors: &[[u8; 3]], force_bold: bool, 
             out.push('}');
         }
         Inline::LineBreak => out.push_str("\\line "),
-        Inline::Image(_) => {}
-        Inline::Link { children, .. } => {
+        // An inline image emits its own `\pict` group inline (PNG/JPEG only).
+        Inline::Image(img) => {
+            let mut sink = true; // a `\pict` carries no paragraph separator
+            rtf_image_from_model(img, res, &mut sink, out);
+        }
+        // A hyperlink lowers to an RTF field whose `\fldinst` carries the
+        // `HYPERLINK "url"` target and whose `\fldrslt` holds the styled visible
+        // children — mirroring the form the RTF importer reads back.
+        Inline::Link { href, children } => {
+            let url = match href {
+                LinkTarget::Url(u) => u.clone(),
+                // No portable RTF for an internal page jump → emit a fragment
+                // anchor so the link is at least preserved as a field target.
+                LinkTarget::Page(p) => format!("#page{}", p + 1),
+            };
+            out.push_str("{\\field{\\*\\fldinst HYPERLINK \"");
+            rtf_escape(&url, out);
+            out.push_str("\"}{\\fldrslt ");
             for c in children {
-                rtf_inline_from_model(c, colors, force_bold, out);
+                rtf_inline_from_model(c, colors, res, force_bold, out);
             }
+            out.push_str("}}");
         }
     }
 }
@@ -738,46 +796,336 @@ fn rtf_char_controls(style: &CharStyle, colors: &[[u8; 3]], force_bold: bool, ou
 
 fn rtf_heading_from_model(h: &Heading, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
     // Headings render bold; the level is conveyed by the bold styling + text.
-    rtf_para_from_model(&h.para, colors, true, first, out);
+    // A heading never contains images, so an empty resource table suffices.
+    rtf_para_from_model(&h.para, colors, &ResourceTable::default(), true, first, out);
 }
 
-fn rtf_list_from_model(list: &List, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+/// Width (in twips) of one nesting level's left indent. 360 twips = 0.25 inch,
+/// the customary RTF list indent step.
+const RTF_LIST_INDENT: i64 = 360;
+
+/// Emit a list as ordered/unordered items with per-level indentation and running
+/// counters. Each item is its own `\pard` paragraph: the marker (a bullet for an
+/// unordered list, the running ordinal for an ordered one) is followed by the
+/// item's first-paragraph runs; any further blocks of the item render nested.
+fn rtf_list_from_model(
+    list: &List,
+    colors: &[[u8; 3]],
+    res: &ResourceTable,
+    first: &mut bool,
+    out: &mut String,
+) {
+    // Per-level 1-based counters for ordered lists; reset when a deeper level is
+    // re-entered (so a sub-list restarts at 1 / a / i …).
+    let mut counters: Vec<u64> = Vec::new();
     for item in &list.items {
+        let level = item.level as usize;
+        if counters.len() <= level {
+            counters.resize(level + 1, 0);
+        } else {
+            // Re-entering this level: drop any deeper counters so nested lists
+            // restart on their next descent.
+            counters.truncate(level + 1);
+        }
+        counters[level] += 1;
+
+        // The marker text: a bullet for unordered, else the formatted ordinal.
+        let marker = if list.ordered {
+            format!(
+                "{}.\\tab ",
+                ordered_marker(list.marker, level, counters[level])
+            )
+        } else {
+            // `\bullet` is the RTF bullet glyph control word; a tab follows it so
+            // the text aligns past the marker.
+            "\\bullet\\tab ".to_string()
+        };
+
+        let indent = RTF_LIST_INDENT * (level as i64 + 1);
         for (i, b) in item.blocks.iter().enumerate() {
             if i == 0 {
                 if let BlockKind::Paragraph(p) = &b.kind {
                     rtf_par_sep(first, out);
-                    out.push_str("\\bullet  ");
+                    // `\fi-NNN` pulls the marker into the hanging indent so wrapped
+                    // lines align under the text, not the marker.
+                    out.push_str(&format!(
+                        "\\pard\\li{indent}\\fi-{RTF_LIST_INDENT} {marker}"
+                    ));
                     for r in &p.runs {
-                        rtf_inline_from_model(r, colors, false, out);
+                        rtf_inline_from_model(r, colors, res, false, out);
                     }
                     continue;
                 }
             }
-            rtf_block_from_model(b, colors, first, out);
+            // Non-paragraph leading block, or trailing blocks of the item.
+            rtf_block_from_model(b, colors, res, first, out);
+        }
+    }
+    // Reset paragraph defaults after the list so following blocks are not
+    // indented by the trailing `\li`/`\fi`.
+    out.push_str("\\pard ");
+}
+
+/// The marker glyph for an ordered list at a given depth: cycle decimal →
+/// lower-alpha → lower-roman by nesting level (matching common word-processor
+/// defaults), unless [`ListMarker`] pins an explicit style.
+fn ordered_marker(marker: ListMarker, level: usize, n: u64) -> String {
+    let style = match marker {
+        ListMarker::Decimal => OrderedStyle::Decimal,
+        ListMarker::LowerAlpha => OrderedStyle::LowerAlpha,
+        ListMarker::UpperAlpha => OrderedStyle::UpperAlpha,
+        ListMarker::LowerRoman => OrderedStyle::LowerRoman,
+        ListMarker::UpperRoman => OrderedStyle::UpperRoman,
+        // A bullet marker on an `ordered` list is contradictory; fall back to the
+        // by-depth cycle so the running number is still meaningful.
+        ListMarker::Bullet(_) => match level % 3 {
+            0 => OrderedStyle::Decimal,
+            1 => OrderedStyle::LowerAlpha,
+            _ => OrderedStyle::LowerRoman,
+        },
+    };
+    style.format(n)
+}
+
+#[derive(Clone, Copy)]
+enum OrderedStyle {
+    Decimal,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+}
+
+impl OrderedStyle {
+    fn format(self, n: u64) -> String {
+        match self {
+            OrderedStyle::Decimal => n.to_string(),
+            OrderedStyle::LowerAlpha => alpha(n, false),
+            OrderedStyle::UpperAlpha => alpha(n, true),
+            OrderedStyle::LowerRoman => roman(n, false),
+            OrderedStyle::UpperRoman => roman(n, true),
         }
     }
 }
 
-fn rtf_table_from_model(table: &Table, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
-    // Flatten each row to a tab-separated styled line.
+/// Spreadsheet-style base-26 letters: 1→a, 26→z, 27→aa, …
+fn alpha(mut n: u64, upper: bool) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let base = if upper { b'A' } else { b'a' };
+    let mut buf = Vec::new();
+    while n > 0 {
+        let rem = ((n - 1) % 26) as u8;
+        buf.push(base + rem);
+        n = (n - 1) / 26;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Roman numerals for 1..=3999; outside that range falls back to decimal.
+fn roman(n: u64, upper: bool) -> String {
+    if n == 0 || n > 3999 {
+        return n.to_string();
+    }
+    const VALS: [(u64, &str); 13] = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut n = n;
+    let mut s = String::new();
+    for (v, sym) in VALS {
+        while n >= v {
+            s.push_str(sym);
+            n -= v;
+        }
+    }
+    if upper {
+        s.to_ascii_uppercase()
+    } else {
+        s
+    }
+}
+
+/// Emit a table as a real RTF row grid: each row is a `\trowd` definition listing
+/// the cumulative right edges (`\cellxN`, twips), then each cell's paragraphs
+/// terminated by `\cell`, closed by `\row`.
+fn rtf_table_from_model(
+    table: &Table,
+    colors: &[[u8; 3]],
+    res: &ResourceTable,
+    first: &mut bool,
+    out: &mut String,
+) {
+    rtf_par_sep(first, out);
     for row in &table.rows {
-        rtf_par_sep(first, out);
-        let mut firstcell = true;
+        let n = row.cells.len();
+        if n == 0 {
+            continue;
+        }
+        // Cumulative right-edge boundaries (twips) for `\cellxN`. Use the model
+        // column widths (points → twips) when present, else a uniform fallback so
+        // the grid is still well-formed for readers that need the boundaries.
+        let edges = cell_edges(&table.col_widths, n);
+
+        out.push_str("\\trowd\\trgaph108");
+        for e in &edges {
+            out.push_str(&format!("\\cellx{e}"));
+        }
+        out.push('\n');
+
         for cell in &row.cells {
-            if firstcell {
-                firstcell = false;
-            } else {
-                out.push_str("\\tab ");
-            }
+            // Each cell's block content, then the `\cell` terminator. Cells flow
+            // their paragraphs; a `\par` between them keeps multi-paragraph cells
+            // readable (RTF readers treat intra-cell `\par` as a line break).
+            let mut cell_first = true;
             for b in &cell.blocks {
-                if let BlockKind::Paragraph(p) = &b.kind {
-                    for r in &p.runs {
-                        rtf_inline_from_model(r, colors, false, out);
-                    }
-                }
+                rtf_cell_block(b, colors, res, &mut cell_first, out);
+            }
+            out.push_str("\\cell ");
+        }
+        out.push_str("\\row\n");
+    }
+    // Close the table context for following blocks.
+    out.push_str("\\pard ");
+}
+
+/// Render one block inside a table cell. Paragraphs/headings emit their runs
+/// inline (no leading `\pard` so the cell's text flows); richer blocks recurse.
+fn rtf_cell_block(
+    block: &Block,
+    colors: &[[u8; 3]],
+    res: &ResourceTable,
+    cell_first: &mut bool,
+    out: &mut String,
+) {
+    match &block.kind {
+        BlockKind::Paragraph(p) => {
+            if *cell_first {
+                *cell_first = false;
+            } else {
+                out.push_str("\\par ");
+            }
+            for r in &p.runs {
+                rtf_inline_from_model(r, colors, res, false, out);
             }
         }
+        BlockKind::Heading(h) => {
+            if *cell_first {
+                *cell_first = false;
+            } else {
+                out.push_str("\\par ");
+            }
+            for r in &h.para.runs {
+                rtf_inline_from_model(r, colors, res, true, out);
+            }
+        }
+        // Any other block kind (nested list/table/image…) renders via the general
+        // emitter; its own separators apply within the cell.
+        other => {
+            let mut inner_first = !*cell_first;
+            rtf_block_from_model(
+                &Block {
+                    kind: other.clone(),
+                    ..Block::default()
+                },
+                colors,
+                res,
+                &mut inner_first,
+                out,
+            );
+            *cell_first = false;
+        }
+    }
+}
+
+/// Cumulative right-edge boundaries (twips) for `n` cells. Maps each
+/// [`Table::col_widths`] entry (points) to twips and accumulates; when widths are
+/// missing/short, the remaining columns split a default 9360-twip (6.5") content
+/// width evenly so the grid stays well-formed.
+fn cell_edges(col_widths: &[f64], n: usize) -> Vec<i64> {
+    // 6.5 inch (9360-twip) usable content width, split across unspecified columns.
+    const DEFAULT_CONTENT_TWIPS: i64 = 9360;
+    // Known widths in twips (clamped non-negative).
+    let known: Vec<i64> = col_widths
+        .iter()
+        .take(n)
+        .map(|w| (w.max(0.0) * 20.0).round() as i64)
+        .collect();
+    let known_sum: i64 = known.iter().sum();
+    let missing = n.saturating_sub(known.len());
+    // Each unspecified column gets an even share of whatever default width is
+    // left after the known columns (never below a small minimum).
+    let fill = if missing > 0 {
+        ((DEFAULT_CONTENT_TWIPS - known_sum).max((missing as i64) * 200)) / missing as i64
+    } else {
+        0
+    };
+
+    let mut edges = Vec::with_capacity(n);
+    let mut acc = 0i64;
+    for i in 0..n {
+        let w = known.get(i).copied().unwrap_or(fill).max(200);
+        acc += w;
+        edges.push(acc);
+    }
+    edges
+}
+
+/// Emit a `{\pict …}` group for an image resource, when it is a PNG or JPEG
+/// (the formats RTF can carry). The display size comes from the pixel
+/// dimensions (96 dpi → twips). Other formats (GIF/WebP/AVIF/…) are skipped.
+fn rtf_image_from_model(img: &ImageRef, res: &ResourceTable, first: &mut bool, out: &mut String) {
+    let Some(resource) = res.images.get(&img.resource) else {
+        return;
+    };
+    let bytes = &resource.bytes;
+    // Detect the real format from the header bytes (authoritative over the tag),
+    // and the pixel dimensions for the `\picwgoal`/`\pichgoal` display size.
+    let blip = match crate::convert::import::image_dimensions(bytes) {
+        Some((w, h, "png")) => Some(("pngblip", w, h)),
+        Some((w, h, "jpeg")) => Some(("jpegblip", w, h)),
+        // GIF/WebP/AVIF have no RTF picture encoding → skip.
+        _ => None,
+    };
+    let Some((blip, w, h)) = blip else {
+        return;
+    };
+
+    rtf_par_sep(first, out);
+    // 96 dpi: px → pt = px * 72/96 = px * 0.75; pt → twips = pt * 20. So
+    // twips = px * 15. Guard against a zero goal (some readers ignore a 0 goal).
+    let goalw = (w as i64 * 15).max(15);
+    let goalh = (h as i64 * 15).max(15);
+    out.push_str(&format!(
+        "{{\\pict\\{blip}\\picwgoal{goalw}\\pichgoal{goalh} "
+    ));
+    push_hex(bytes, out);
+    out.push('}');
+}
+
+/// Append `bytes` as lowercase hex digit pairs (RTF's default `\pict` payload
+/// encoding), wrapping lines to keep the output readable.
+fn push_hex(bytes: &[u8], out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && i % 40 == 0 {
+            out.push('\n');
+        }
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
     }
 }
 
@@ -1047,6 +1395,349 @@ mod tests {
         assert!(
             !plain.contains("\\highlight"),
             "a plain run carries no highlight: {plain}"
+        );
+    }
+
+    // ── rich model → RTF: tables, lists, images, links (#4) ──
+
+    /// Build a one-block document (no resources) for the structural tests.
+    fn doc_with_block(kind: BlockKind) -> Document {
+        use crate::model::{Page, Section};
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind,
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        }
+    }
+
+    /// A plain styled run wrapped in a paragraph block.
+    fn para_block(text: &str) -> Block {
+        use crate::model::InlineRun;
+        Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: text.to_string(),
+                    ..Default::default()
+                })],
+                ..Paragraph::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn model_table_emits_real_rtf_row_grid() {
+        use crate::model::{Cell, Row};
+        let mk_cell = |t: &str| Cell {
+            blocks: vec![para_block(t)],
+            ..Cell::default()
+        };
+        let table = Table {
+            rows: vec![
+                Row {
+                    cells: vec![mk_cell("A1"), mk_cell("B1")],
+                    height: None,
+                },
+                Row {
+                    cells: vec![mk_cell("A2"), mk_cell("B2")],
+                    height: None,
+                },
+            ],
+            col_widths: vec![100.0, 200.0],
+            ..Table::default()
+        };
+        let rtf =
+            String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::Table(table)))).unwrap();
+
+        // A true grid, not tab-separated lines.
+        assert!(rtf.contains("\\trowd"), "row definition present: {rtf}");
+        assert!(rtf.contains("\\cellx"), "cell boundaries present: {rtf}");
+        assert!(rtf.contains("\\cell "), "cell terminators present: {rtf}");
+        assert!(rtf.contains("\\row"), "row terminators present: {rtf}");
+        assert_eq!(rtf.matches("\\row").count(), 2, "two rows emitted: {rtf}");
+        assert_eq!(
+            rtf.matches("\\cell ").count(),
+            4,
+            "four cells emitted: {rtf}"
+        );
+        // 100pt → 2000 twips; cumulative 100+200pt → 6000 twips.
+        assert!(rtf.contains("\\cellx2000"), "first column edge: {rtf}");
+        assert!(rtf.contains("\\cellx6000"), "second column edge: {rtf}");
+        assert!(!rtf.contains("\\tab "), "no flattened tab lines: {rtf}");
+
+        // Round-trips through the rich importer as a 2×2 table.
+        let doc = crate::convert::rtf::rtf_to_model(&rtf);
+        let t = doc.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a BlockKind::Table on re-import");
+        assert_eq!(t.rows.len(), 2, "two rows round-trip");
+        assert_eq!(t.rows[0].cells.len(), 2, "two cells per row round-trip");
+    }
+
+    #[test]
+    fn model_ordered_nested_list_emits_numbers_and_indents() {
+        use crate::model::ListItem;
+        let item = |text: &str, level: u8| ListItem {
+            blocks: vec![para_block(text)],
+            level,
+        };
+        // 1. top-A / 2. top-B / (nested) 1. child / 3. top-C — an explicit
+        // decimal marker is honoured at every depth; the nested counter restarts.
+        let list = List {
+            ordered: true,
+            marker: ListMarker::Decimal,
+            items: vec![
+                item("top-A", 0),
+                item("top-B", 0),
+                item("child", 1),
+                item("top-C", 0),
+            ],
+        };
+        let rtf =
+            String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(list)))).unwrap();
+
+        // Ordered: running decimal at the top level (not `\bullet`).
+        assert!(
+            rtf.contains("\\li360\\fi-360 1.\\tab "),
+            "first ordinal: {rtf}"
+        );
+        assert!(
+            rtf.contains("\\li360\\fi-360 2.\\tab "),
+            "second ordinal: {rtf}"
+        );
+        assert!(
+            !rtf.contains("\\bullet"),
+            "ordered list has no bullet: {rtf}"
+        );
+        // Nested item: deeper indent (2 × 360) + a restarted counter ("1.").
+        assert!(
+            rtf.contains("\\li720\\fi-360 1.\\tab "),
+            "nested item indents deeper and restarts at 1: {rtf}"
+        );
+        // After the nested item, the top level resumes at 3.
+        assert!(
+            rtf.contains("\\li360\\fi-360 3.\\tab "),
+            "top counter resumes after nesting: {rtf}"
+        );
+
+        // When the marker is *not* pinned (a bullet glyph on an ordered list),
+        // the depth-cycle kicks in: level-0 decimal, level-1 lower-alpha.
+        let cycle = List {
+            ordered: true,
+            marker: ListMarker::default(), // Bullet('•')
+            items: vec![item("a", 0), item("b", 1)],
+        };
+        let rtf2 =
+            String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(cycle)))).unwrap();
+        assert!(
+            rtf2.contains("\\li360\\fi-360 1.\\tab "),
+            "depth-0 decimal: {rtf2}"
+        );
+        assert!(
+            rtf2.contains("\\li720\\fi-360 a.\\tab "),
+            "depth-1 lower-alpha by cycle: {rtf2}"
+        );
+    }
+
+    #[test]
+    fn model_unordered_list_emits_bullets() {
+        use crate::model::ListItem;
+        let list = List {
+            ordered: false,
+            marker: ListMarker::Bullet('•'),
+            items: vec![
+                ListItem {
+                    blocks: vec![para_block("one")],
+                    level: 0,
+                },
+                ListItem {
+                    blocks: vec![para_block("two")],
+                    level: 0,
+                },
+            ],
+        };
+        let rtf =
+            String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(list)))).unwrap();
+        assert_eq!(
+            rtf.matches("\\bullet").count(),
+            2,
+            "a bullet per item: {rtf}"
+        );
+        assert!(
+            !rtf.contains("1.\\tab"),
+            "unordered list has no numbers: {rtf}"
+        );
+    }
+
+    #[test]
+    fn model_png_image_emits_pict_pngblip() {
+        use crate::model::{ImageResource, Page, Section};
+        // A real 2×2 PNG interned in the resource table.
+        let rgba = vec![
+            0u8, 0, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255,
+        ];
+        let png = crate::raster::encode_png(2, 2, &rgba);
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            7u64,
+            ImageResource {
+                bytes: png.clone(),
+                format: "png".to_string(),
+            },
+        );
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Image(ImageRef {
+                            resource: 7,
+                            alt: None,
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            resources: ResourceTable { images },
+            ..Document::default()
+        };
+        let rtf = String::from_utf8(rtf_from_model(&doc)).unwrap();
+
+        assert!(rtf.contains("{\\pict\\pngblip"), "PNG picture group: {rtf}");
+        assert!(
+            rtf.contains("\\picwgoal"),
+            "display width goal present: {rtf}"
+        );
+        assert!(
+            rtf.contains("\\pichgoal"),
+            "display height goal present: {rtf}"
+        );
+        // The payload is the hex of the PNG bytes (96 dpi: 2px → 30 twips).
+        assert!(rtf.contains("\\picwgoal30"), "2px → 30 twips width: {rtf}");
+
+        // Round-trips: the importer re-interns the same PNG bytes.
+        let back = crate::convert::rtf::rtf_to_model(&rtf);
+        let img = back.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("a BlockKind::Image on re-import");
+        let res = back
+            .resources
+            .images
+            .get(&img.resource)
+            .expect("image bytes re-interned");
+        assert_eq!(res.bytes, png, "PNG bytes survive the round-trip");
+        assert_eq!(res.format, "png");
+    }
+
+    #[test]
+    fn model_non_raster_image_is_skipped() {
+        use crate::model::{ImageResource, Page, Section};
+        // A GIF has no RTF picture encoding → no `\pict`, no leaked hex.
+        let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            3u64,
+            ImageResource {
+                bytes: gif,
+                format: "gif".to_string(),
+            },
+        );
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![
+                        para_block("before"),
+                        Block {
+                            kind: BlockKind::Image(ImageRef {
+                                resource: 3,
+                                alt: None,
+                            }),
+                            ..Default::default()
+                        },
+                        para_block("after"),
+                    ],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            resources: ResourceTable { images },
+            ..Document::default()
+        };
+        let rtf = String::from_utf8(rtf_from_model(&doc)).unwrap();
+        assert!(!rtf.contains("\\pict"), "GIF emits no picture: {rtf}");
+        assert!(
+            rtf.contains("before") && rtf.contains("after"),
+            "surrounding text kept: {rtf}"
+        );
+    }
+
+    #[test]
+    fn model_link_emits_hyperlink_field() {
+        use crate::model::InlineRun;
+        // A paragraph whose run is a hyperlink wrapping styled text.
+        let para = Paragraph {
+            runs: vec![Inline::Link {
+                href: LinkTarget::Url("https://example.com".to_string()),
+                children: vec![Inline::Run(InlineRun {
+                    text: "click".to_string(),
+                    style: CharStyle {
+                        underline: true,
+                        ..CharStyle::default()
+                    },
+                    source_index: None,
+                })],
+            }],
+            ..Paragraph::default()
+        };
+        let rtf =
+            String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::Paragraph(para)))).unwrap();
+
+        assert!(
+            rtf.contains("{\\field{\\*\\fldinst HYPERLINK \"https://example.com\"}"),
+            "HYPERLINK field instruction: {rtf}"
+        );
+        assert!(
+            rtf.contains("\\fldrslt"),
+            "field result group present: {rtf}"
+        );
+        assert!(rtf.contains("click"), "visible link text present: {rtf}");
+
+        // Round-trips: the importer recovers an Inline::Link to the same URL.
+        let doc = crate::convert::rtf::rtf_to_model(&rtf);
+        let link = doc.sections[0].pages[0].blocks.iter().find_map(|b| {
+            if let BlockKind::Paragraph(p) = &b.kind {
+                p.runs.iter().find_map(|i| match i {
+                    Inline::Link { href, children } => Some((href.clone(), children.clone())),
+                    _ => None,
+                })
+            } else {
+                None
+            }
+        });
+        let (href, _children) = link.expect("an Inline::Link on re-import");
+        assert_eq!(
+            href,
+            LinkTarget::Url("https://example.com".to_string()),
+            "link target round-trips"
         );
     }
 
