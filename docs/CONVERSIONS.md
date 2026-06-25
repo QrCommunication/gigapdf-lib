@@ -231,6 +231,15 @@ pipeline:
   multi-resolution and multi-component (e.g. RGB-via-RCT) images are supported; ROI
   and unsupported optional features are handled defensively rather than aborting.
 
+  This decoder is wired into the **render and image-extraction pipeline**, not just
+  the filter layer: a `/JPXDecode` image XObject or inline image flows through the
+  same image-decode path as `/DCTDecode`/`/CCITTFaxDecode`/`/JBIG2Decode` images
+  (colour space, `/BitsPerComponent`, `/Decode`, colour-key `/Mask` and `/SMask`
+  handling all apply), and a `/JPXDecode` **soft mask** (`/SMask`) — or a JPX-coded
+  `/ImageMask` stencil / explicit `/Mask` — decodes through that path too. So JPEG
+  2000 images are actually decoded when a page is rasterized or its images are
+  extracted, not merely decodable in isolation.
+
 **Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
 (Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`
 name (`Identity-V`, `UniJIS-UCS2-V`, …) **or** an embedded CMap stream declaring

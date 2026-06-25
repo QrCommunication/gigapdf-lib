@@ -8612,8 +8612,9 @@ impl Document {
         (grids, shapes)
     }
 
-    /// Decode the page's image XObjects (`DeviceRGB`/`DeviceGray`, 8 bpc, Flate
-    /// or raw — JPEG/JPX are skipped) into RGBA buffers for the rasterizer.
+    /// Decode the page's image XObjects (Flate/raw sample grids, baseline JPEG
+    /// via `/DCTDecode`, and JPEG 2000 via `/JPXDecode`) into RGBA buffers for
+    /// the rasterizer.
     fn page_images(&self, page_no: u32) -> crate::raster::render::RenderImages {
         match self.page_dict(page_no).ok().and_then(|page| {
             page.get(b"Resources")
@@ -8658,7 +8659,7 @@ impl Document {
     /// [`RenderImage`]. Shared by `Do`-reached XObjects and inline images
     /// (`BI`/`ID`/`EI`) so both go through identical colour-space, filter, mask
     /// and `/Decode` handling. `None` when the geometry is invalid, the colour
-    /// space/filter is one the engine does not decode (JPX, CCITT, progressive
+    /// space/filter is one the engine does not decode (CCITT, progressive
     /// JPEG …), or the data is too short.
     fn decode_image_stream(&self, stream: &Stream) -> Option<crate::raster::render::RenderImage> {
         let dict = &stream.dict;
@@ -8713,11 +8714,11 @@ impl Document {
                 .and_then(Object::as_i64)
                 .unwrap_or(8)
                 .clamp(1, 16) as u32;
-            // JPXDecode (JPEG 2000) is not decoded yet; skip rather than
-            // misread its raw bytes as raster samples.
-            if filter.as_deref() == Some(b"JPXDecode") {
-                return None;
-            }
+            // `/JPXDecode` (JPEG 2000) decodes through `decode_stream` like any
+            // other sample filter: the JPX decoder emits packed, MSB-first,
+            // byte-row-aligned samples interleaved at the codestream's native
+            // bit depth (the dict's `/BitsPerComponent`), so the `/ColorSpace`
+            // mapping below applies unchanged (ISO 32000-1 §7.4.9).
             // Resolve the image colour space (DeviceGray/RGB/CMYK, Indexed,
             // ICCBased, Separation/DeviceN, Lab) into a converter, then map
             // every packed sample group to RGB honouring `/BitsPerComponent`
@@ -8986,8 +8987,10 @@ impl Document {
 
     /// Decode an image's `/SMask` (an 8-bit `/DeviceGray` image XObject) into its
     /// `(width, height, gray samples)` so the rasterizer can use it as per-pixel
-    /// alpha. Returns `None` when absent or in a form we don't decode (e.g. a
-    /// JPEG-coded mask), in which case the image is treated as opaque.
+    /// alpha. A `/JPXDecode` soft mask decodes through `decode_stream` (the JPX
+    /// decoder yields the single 8-bit gray plane this path expects); only a
+    /// `/DCTDecode` mask, which has no `decode_stream` path, is skipped (treated
+    /// as opaque). Also `None` when `/SMask` is absent or not 8-bit gray.
     fn decode_gray_smask(&self, dict: &Dictionary) -> Option<(usize, usize, Vec<u8>)> {
         let stream = dict.get(b"SMask").map(|o| self.resolve(o))?.as_stream()?;
         let sd = &stream.dict;
@@ -9000,10 +9003,7 @@ impl Document {
         if sw <= 0 || sh <= 0 || bpc != 8 {
             return None;
         }
-        if matches!(
-            self.first_filter(sd).as_deref(),
-            Some(b"DCTDecode") | Some(b"JPXDecode")
-        ) {
+        if self.first_filter(sd).as_deref() == Some(b"DCTDecode") {
             return None;
         }
         let samples =
@@ -9020,7 +9020,9 @@ impl Document {
     /// is masked out. Per PDF §8.9.6.2 the default `/Decode [0 1]` paints the
     /// fill colour where the 1-bit sample is **0**; `/Decode [1 0]` inverts that.
     /// Scanlines are padded to a byte boundary. `None` on a short or undecodable
-    /// stream (e.g. a JPEG-coded mask).
+    /// stream (e.g. a `/DCTDecode` mask, which has no `decode_stream` path). A
+    /// `/JPXDecode` stencil decodes through `decode_stream` like the other
+    /// sample filters (its 1-bit, byte-row-aligned output matches this packing).
     fn decode_stencil_alpha(
         &self,
         stream: &Stream,
@@ -9028,10 +9030,7 @@ impl Document {
         w: usize,
         h: usize,
     ) -> Option<Vec<u8>> {
-        if matches!(
-            self.first_filter(dict).as_deref(),
-            Some(b"DCTDecode") | Some(b"JPXDecode")
-        ) {
+        if self.first_filter(dict).as_deref() == Some(b"DCTDecode") {
             return None;
         }
         // A JBIG2-coded stencil with an indirect `/JBIG2Globals` needs those
@@ -9079,10 +9078,10 @@ impl Document {
         if mw <= 0 || mh <= 0 {
             return None;
         }
-        if matches!(
-            self.first_filter(md).as_deref(),
-            Some(b"DCTDecode") | Some(b"JPXDecode")
-        ) {
+        // A `/DCTDecode` mask has no `decode_stream` path, so it is skipped; a
+        // `/JPXDecode` mask decodes through `decode_stream` like the other
+        // sample filters (its 1-bit, byte-row-aligned output matches here).
+        if self.first_filter(md).as_deref() == Some(b"DCTDecode") {
             return None;
         }
         let samples =
@@ -23272,6 +23271,114 @@ mod tests {
             .expect("2x2 image XObject present after round-trip");
         // PNG → Flate /DeviceRGB embed is lossless: the samples must match.
         assert_eq!(embedded.rgba, rgba, "round-tripped pixels match the source");
+    }
+
+    #[test]
+    fn jpxdecode_image_decodes_through_the_render_pipeline_with_jpx_smask() {
+        // A `/JPXDecode` (JPEG 2000) image must decode for rendering/extraction —
+        // not just inside `filters::decode_stream`, but through the very
+        // `document.rs` image path (`page_images` → `images_for` →
+        // `decode_image_stream`) that used to early-return for `/JPXDecode`. This
+        // also covers a `/JPXDecode` `/SMask`: its decoded gray plane must drive
+        // per-pixel alpha (the soft-mask path was guarded the same way).
+
+        // A 4×4, 8-bit, single-component (DeviceGray), NL=0 reversible JPEG 2000
+        // *codestream* (SOC/SIZ/COD/QCD/SOT/SOD/…/EOC). Produced by the in-crate
+        // J2K encoder in `filters/jpx` (the `Encoded` test builder) for the
+        // gradient pixels 0,16,32,…,240; embedded here as a fixed fixture because
+        // that encoder is a `#[cfg(test)]` submodule of `filters::jpx`, not
+        // reachable from this module. `jpx_decode` round-trips it to those exact
+        // bytes (asserted by `e2e_jp2_box_wrapper`/`e2e_single_component_*`).
+        const J2K_GRADIENT_4X4_GRAY: &[u8] = &[
+            0xff, 0x4f, 0xff, 0x51, 0x00, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x07, 0x01, 0x01, 0xff, 0x52, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04,
+            0x04, 0x00, 0x01, 0xff, 0x5c, 0x00, 0x04, 0x40, 0x40, 0xff, 0x90, 0x00, 0x0a, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x01, 0xff, 0x93, 0xdf, 0x80, 0x68, 0x12, 0x0f,
+            0x84, 0x96, 0x42, 0xe1, 0xba, 0x6d, 0xf1, 0xcf, 0xbd, 0x07, 0xff, 0xff, 0xd9,
+        ];
+        // The gradient the codestream encodes (DeviceGray sample per pixel).
+        let gray: Vec<u8> = (0..16u32).map(|i| (i * 16) as u8).collect();
+
+        // Host document so the image XObject can be a real, referenced object.
+        let pdf = crate::convert::reverse::txt_to_pdf("jpx host page");
+        let mut doc = Document::open(&pdf).unwrap();
+
+        // A 4×4 DeviceGray `/JPXDecode` soft mask (reuse the same codestream — its
+        // gray gradient becomes the per-pixel alpha), registered as its own object.
+        let mut smask_dict = Dictionary::new();
+        smask_dict.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+        smask_dict.set(b"Subtype".to_vec(), Object::Name(b"Image".to_vec()));
+        smask_dict.set(b"Width".to_vec(), Object::Integer(4));
+        smask_dict.set(b"Height".to_vec(), Object::Integer(4));
+        smask_dict.set(b"BitsPerComponent".to_vec(), Object::Integer(8));
+        smask_dict.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec()));
+        smask_dict.set(b"Filter".to_vec(), Object::Name(b"JPXDecode".to_vec()));
+        smask_dict.set(
+            b"Length".to_vec(),
+            Object::Integer(J2K_GRADIENT_4X4_GRAY.len() as i64),
+        );
+        let smask_id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(
+            smask_id,
+            Object::Stream(Stream::new(smask_dict, J2K_GRADIENT_4X4_GRAY.to_vec())),
+        );
+
+        // The base 4×4 DeviceGray `/JPXDecode` image, carrying the JPX `/SMask`.
+        let mut img_dict = Dictionary::new();
+        img_dict.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+        img_dict.set(b"Subtype".to_vec(), Object::Name(b"Image".to_vec()));
+        img_dict.set(b"Width".to_vec(), Object::Integer(4));
+        img_dict.set(b"Height".to_vec(), Object::Integer(4));
+        img_dict.set(b"BitsPerComponent".to_vec(), Object::Integer(8));
+        img_dict.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec()));
+        img_dict.set(b"Filter".to_vec(), Object::Name(b"JPXDecode".to_vec()));
+        img_dict.set(b"SMask".to_vec(), Object::Reference(smask_id));
+        img_dict.set(
+            b"Length".to_vec(),
+            Object::Integer(J2K_GRADIENT_4X4_GRAY.len() as i64),
+        );
+        let img_id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(
+            img_id,
+            Object::Stream(Stream::new(img_dict, J2K_GRADIENT_4X4_GRAY.to_vec())),
+        );
+
+        // Wire the image into page 1's /Resources /XObject so the public render
+        // entry (`page_images`) reaches it exactly like any drawn image.
+        doc.register_page_resource(1, b"XObject", "GpJpx", Object::Reference(img_id))
+            .unwrap();
+
+        // Drive the real render/extract path. The `/JPXDecode` image must now be
+        // present and decoded (pre-fix: skipped → absent).
+        let images = doc.page_images(1);
+        let decoded = images
+            .values()
+            .find(|im| im.width == 4 && im.height == 4)
+            .expect("/JPXDecode 4x4 image decodes through page_images (was skipped pre-fix)");
+
+        // DeviceGray sample `v` → RGB `[v, v, v]`; the JPX `/SMask` gray gradient
+        // supplies alpha. So pixel i is `[16i, 16i, 16i, 16i]` (capped at 240).
+        assert_eq!(
+            decoded.rgba.len(),
+            4 * 4 * 4,
+            "decoded RGBA buffer is 4×4 pixels"
+        );
+        for (i, &g) in gray.iter().enumerate() {
+            let px = &decoded.rgba[i * 4..i * 4 + 4];
+            assert_eq!(
+                px,
+                &[g, g, g, g],
+                "pixel {i}: JPX gray → RGB and JPX /SMask → alpha must both decode"
+            );
+        }
+        // The alpha truly came from the JPX soft mask, not the opaque fallback.
+        assert_eq!(decoded.rgba[3], 0, "SMask makes pixel 0 fully transparent");
+        assert_ne!(
+            decoded.rgba[3], 255,
+            "a decoded JPX /SMask, not the opaque (255) fallback, drives alpha"
+        );
     }
 
     #[test]
