@@ -15,7 +15,7 @@ pub mod vector;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{EngineError, Result};
-use crate::font::cmap::TextDecoder;
+use crate::font::cmap::{TextDecoder, VerticalMetrics};
 use crate::lexer::{Lexer, Token};
 use crate::object::{Dictionary, Object, StringKind};
 use crate::serialize::encode_value;
@@ -1510,6 +1510,114 @@ fn text_run_advance(operands: &[Object], decoder: &TextDecoder, font_size: f64) 
     measured.then_some(total.max(0.0))
 }
 
+/// Bounding box of a **vertical** writing-mode run (ISO 32000-1 §9.4.4): glyphs
+/// stack top-to-bottom from the pen, each centred on the vertical baseline by its
+/// position vector. `tm` is the text matrix at the run start, `col_w` the glyph
+/// column width (the first glyph's `w0`), `vx` the position-vector x (so the
+/// column spans `[-vx, col_w - vx]` in text space), and `v_adv` the run's total
+/// vertical displacement (<= 0, the pen moving down). The box covers the column
+/// from the first glyph's top (`vy`) down past the last glyph.
+fn vtext_bounds(
+    tm: &Matrix,
+    ctm: &Matrix,
+    font_size: f64,
+    col_w: f64,
+    vx: f64,
+    vy: f64,
+    v_adv: f64,
+) -> Option<Bounds> {
+    if font_size == 0.0 {
+        return None;
+    }
+    let m = tm.then(ctm);
+    // Horizontal extent: the glyph column, centred on the baseline by `vx`.
+    let (x0, x1) = (-vx, col_w - vx);
+    // Vertical extent: from the first glyph's top (origin1 sits `vy` above the
+    // pen) down through every glyph (`v_adv` <= 0) plus a glyph body's descent.
+    let (y_top, y_bot) = (vy, v_adv - (font_size - vy).max(0.0));
+    let mut bb = BoundsBuilder::new();
+    bb.add_through(&m, x0, y_top);
+    bb.add_through(&m, x1, y_top);
+    bb.add_through(&m, x1, y_bot);
+    bb.add_through(&m, x0, y_bot);
+    bb.build()
+}
+
+/// The total **vertical** advance of a text-show operand in user-space points
+/// (<= 0, the pen moving down): each 2-byte code's vertical displacement `w1y`,
+/// with `TJ` numeric adjustments applied along the vertical axis (positive moves
+/// the pen *up*, i.e. adds to the advance, mirroring the horizontal `TJ` sign).
+/// Composite fonts only; `0.0` otherwise.
+fn text_run_vadvance(operands: &[Object], decoder: &TextDecoder, font_size: f64) -> f64 {
+    let mut total = 0.0;
+    for operand in operands {
+        match operand {
+            Object::String(bytes, _) => {
+                total += decoder.string_vertical_advance(bytes, font_size);
+            }
+            Object::Array(items) => {
+                for item in items {
+                    match item {
+                        Object::String(bytes, _) => {
+                            total += decoder.string_vertical_advance(bytes, font_size);
+                        }
+                        // TJ number in vertical mode: a 1000-em adjustment along
+                        // the vertical axis. Positive moves the text up (toward the
+                        // start), so it adds to the (negative) downward advance.
+                        Object::Integer(_) | Object::Real(_) => {
+                            total += item.as_f64().unwrap_or(0.0) * font_size / 1000.0;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// The first 2-byte glyph's position vector `(vx, vy)` and horizontal column
+/// width `w0` (user-space points) for a vertical run, used to place and size the
+/// column. Falls back to the `/DW2` default centring (`vx = w0/2`, `vy = 880‰`)
+/// when the operand carries no glyph. `w0` here is the column width the position
+/// vector centres in (twice `vx` for the default), so the bbox spans the glyph.
+fn vertical_run_lead(
+    operands: &[Object],
+    decoder: &TextDecoder,
+    font_size: f64,
+) -> (f64, f64, f64) {
+    let first_code = operands.iter().find_map(|operand| match operand {
+        Object::String(bytes, _) if bytes.len() >= 2 => {
+            Some(((bytes[0] as u16) << 8) | bytes[1] as u16)
+        }
+        Object::Array(items) => items.iter().find_map(|it| match it {
+            Object::String(bytes, _) if bytes.len() >= 2 => {
+                Some(((bytes[0] as u16) << 8) | bytes[1] as u16)
+            }
+            _ => None,
+        }),
+        _ => None,
+    });
+    match first_code {
+        Some(code) => {
+            let (_w1y, vx, vy) = decoder.vertical_metric(code, font_size);
+            // The column width: the glyph's own horizontal advance, recovered from
+            // the (font-size-scaled) width table; the default position vector sets
+            // `vx = w0/2`, so `2·vx` is the symmetric fallback when no width table.
+            let col_w = decoder
+                .string_advance(&[(code >> 8) as u8, (code & 0xFF) as u8], font_size)
+                .unwrap_or(2.0 * vx);
+            (col_w, vx, vy)
+        }
+        None => {
+            // No glyph: a symmetric default column of one em around the baseline.
+            let vy = VerticalMetrics::DEFAULT_DW2_VY * font_size / 1000.0;
+            (font_size, font_size / 2.0, vy)
+        }
+    }
+}
+
 /// Bounding box of an XObject draw (`Do`): the unit square through the CTM.
 fn unit_square_bounds(ctm: &Matrix) -> Option<Bounds> {
     let mut bb = BoundsBuilder::new();
@@ -1749,12 +1857,29 @@ fn elements_from_ops_resolved(
                 // correctly. No-op for LTR runs and for already-logical RTL runs.
                 let text = reorder_visual_rtl(&decoded).unwrap_or(decoded);
                 let char_count = text.chars().count();
-                // Real glyph advances when the font carries widths; otherwise a
-                // 0.5-em estimate. Drives both the run's width and the pen
-                // advance for the following run on the line.
-                let width = text_run_advance(&op.operands, text_decoder, font_size)
-                    .unwrap_or(char_count as f64 * 0.5 * font_size);
-                let bounds = text_bounds(&tm, &ctm, font_size, width);
+                // Vertical writing mode (ISO 32000-1 §9.4.4): a composite font whose
+                // `/Encoding` CMap is `*-V`/`Identity-V`/`/WMode 1`. The pen steps
+                // top-to-bottom by each glyph's `/W2`/`/DW2` displacement `w1y`
+                // (<= 0) instead of rightward by `w0`, and each glyph is offset by
+                // its position vector so it centres on the vertical baseline.
+                // Horizontal runs keep the unchanged path (byte-identical).
+                let vertical = text_decoder.wmode() == 1;
+                // The run's user-space advance: vertical displacement (<= 0) in
+                // vertical mode, the horizontal width otherwise. Real glyph metrics
+                // when the font carries widths; a 0.5-em estimate otherwise. Drives
+                // both the run's bounds and the pen advance for the next run.
+                let advance = if vertical {
+                    text_run_vadvance(&op.operands, text_decoder, font_size)
+                } else {
+                    text_run_advance(&op.operands, text_decoder, font_size)
+                        .unwrap_or(char_count as f64 * 0.5 * font_size)
+                };
+                let bounds = if vertical {
+                    let (col_w, vx, vy) = vertical_run_lead(&op.operands, text_decoder, font_size);
+                    vtext_bounds(&tm, &ctm, font_size, col_w, vx, vy, advance)
+                } else {
+                    text_bounds(&tm, &ctm, font_size, advance)
+                };
                 // Combined text→device matrix: the `Tf` size scaled by its
                 // vertical scale gives the on-page glyph size; its x-axis angle
                 // gives the baseline rotation.
@@ -1780,7 +1905,14 @@ fn elements_from_ops_resolved(
                     fill_alpha: Some(fill_alpha),
                     nested,
                 });
-                tm = Matrix::translate(width, 0.0).then(&tm);
+                // Advance the pen for the next run: down the page in vertical mode
+                // (along the text-space y-axis by the run's vertical displacement),
+                // rightward otherwise.
+                tm = if vertical {
+                    Matrix::translate(0.0, advance).then(&tm)
+                } else {
+                    Matrix::translate(advance, 0.0).then(&tm)
+                };
             }
             b"Do" => {
                 let name = op.operands.iter().find_map(|o| o.as_name());
@@ -3831,5 +3963,155 @@ BT /F 12 Tf (BODY) Tj ET";
             Some([0.0, 0.5, 1.0]),
             "3-comp scn → RGB by arity"
         );
+    }
+
+    // ── vertical writing mode (WMode 1 / Identity-V) layout — issue #49 ─────────
+
+    use crate::font::cmap::{Cmap, CodeWidths, VMetric, VerticalMetrics};
+
+    /// A composite (2-byte) Type0 decoder in a given writing mode, with a uniform
+    /// horizontal width `w0` (so the `/DW2` position vector `vx = w0/2` is known)
+    /// and optional `/W2` overrides.
+    fn vmode_decoder(vertical: bool, w0: f64, vmetrics: Option<VerticalMetrics>) -> TextDecoder {
+        let code_to_cid = if vertical {
+            // Identity-V: a vertical identity CMap (code == CID, wmode 1).
+            Cmap::predefined(b"Identity-V")
+        } else {
+            // Identity-H is the horizontal no-op (None ⇒ raw-code path).
+            None
+        };
+        let widths = CodeWidths::new(std::collections::BTreeMap::new(), w0);
+        TextDecoder {
+            two_byte: true,
+            to_unicode: None,
+            widths: Some(widths),
+            cid_to_unicode: None,
+            code_to_cid,
+            cid_to_gid: None,
+            simple_encoding: None,
+            vmetrics,
+        }
+    }
+
+    /// One vertical run of two CIDs lays glyphs out top-to-bottom: each glyph's
+    /// box descends by the `/DW2` default vertical displacement (−1000 ‰ · size),
+    /// and the column is centred on the baseline by the position vector `vx = w0/2`.
+    #[test]
+    fn vertical_run_descends_in_y_with_centring_offset() {
+        // Two 2-byte glyphs (CIDs 1 then 2), Identity-V, no `/W2` (DW2 defaults).
+        // Font size 10, w0 = 1000 ‰ ⇒ vx = 500 ‰ = 5 pt; w1y = −1000 ‰ = −10 pt.
+        let mut fonts = FontDecoders::new();
+        fonts.insert(b"F1".to_vec(), vmode_decoder(true, 1000.0, None));
+        // Pen starts at (100, 700). Two glyphs in one Tj.
+        let content = b"BT /F1 10 Tf 100 700 Td <00010002> Tj ET";
+        let els = extract_elements_with(content, &fonts, &BTreeMap::new()).unwrap();
+        let texts: Vec<_> = els.iter().filter(|e| e.kind == ElementKind::Text).collect();
+        assert_eq!(texts.len(), 1, "one run element");
+        let b = texts[0].bounds.expect("vertical run has bounds");
+        // The column is centred on x=100 by vx=5 pt: spans [95, 105].
+        assert!((b.x - 95.0).abs() < 1e-6, "left edge centred: {}", b.x);
+        assert!((b.width - 10.0).abs() < 1e-6, "column width: {}", b.width);
+        // Two glyphs at −10 pt each ⇒ the box reaches from the first glyph's top
+        // (vy = 880 ‰ = 8.8 pt above the pen) down past the second glyph.
+        let top = b.y + b.height;
+        assert!(top <= 709.0, "top near pen+vy: {top}");
+        assert!(b.y < 700.0, "box descends below the pen: {}", b.y);
+        // The whole column spans at least the two-glyph downward advance (20 pt).
+        assert!(b.height >= 20.0, "height covers both glyphs: {}", b.height);
+    }
+
+    /// Consecutive vertical runs stack downward: the second run's baseline sits
+    /// one glyph-advance below the first (descending Y), proving the pen advances
+    /// along −y by the vertical displacement (≈ −DW2 w1y · size/1000).
+    #[test]
+    fn vertical_consecutive_runs_advance_downward() {
+        let mut fonts = FontDecoders::new();
+        fonts.insert(b"F1".to_vec(), vmode_decoder(true, 1000.0, None));
+        // Two separate single-glyph Tj on the same line (no Td between them): the
+        // pen carries from the first to the second within the BT block.
+        let content = b"BT /F1 10 Tf 100 700 Td <0001> Tj <0002> Tj ET";
+        let els = extract_elements_with(content, &fonts, &BTreeMap::new()).unwrap();
+        let ys: Vec<f64> = els
+            .iter()
+            .filter(|e| e.kind == ElementKind::Text)
+            .map(|e| e.bounds.unwrap().y)
+            .collect();
+        assert_eq!(ys.len(), 2, "two run elements");
+        // Second run is one full glyph-advance (10 pt) lower than the first.
+        assert!(ys[1] < ys[0], "second run descends: {} < {}", ys[1], ys[0]);
+        assert!(
+            ((ys[0] - ys[1]) - 10.0).abs() < 1e-6,
+            "advance = -w1y·size/1000 = 10 pt, got {}",
+            ys[0] - ys[1]
+        );
+    }
+
+    /// A `/W2` entry overrides the per-CID vertical displacement and position
+    /// vector. The override's `vx` re-centres the glyph column; the override's
+    /// `w1y` changes the downward step so the next glyph sits lower than the DW2
+    /// default would place it (descending Y from a custom advance). CID 2 (no
+    /// `/W2`) reverts to the DW2 default centring.
+    #[test]
+    fn vertical_w2_entry_overrides_per_cid() {
+        let mut map = std::collections::BTreeMap::new();
+        // CID 1 → w1y = −1200 ‰ (12 pt step at size 10), vx = 300 ‰, vy = 880 ‰
+        // (same vy as DW2 so the two box tops differ only by the pen advance).
+        map.insert(
+            1u32,
+            VMetric {
+                w1y: -1200.0,
+                vx: 300.0,
+                vy: 880.0,
+            },
+        );
+        let vmetrics = VerticalMetrics::new(None, map);
+        let mut fonts = FontDecoders::new();
+        fonts.insert(b"F1".to_vec(), vmode_decoder(true, 1000.0, Some(vmetrics)));
+        // CID 1 (overridden) then CID 2 (DW2 default).
+        let content = b"BT /F1 10 Tf 100 700 Td <0001> Tj <0002> Tj ET";
+        let els = extract_elements_with(content, &fonts, &BTreeMap::new()).unwrap();
+        let texts: Vec<_> = els.iter().filter(|e| e.kind == ElementKind::Text).collect();
+        assert_eq!(texts.len(), 2);
+        // First glyph centred at vx = 3 pt ⇒ left edge 100 − 3 = 97.
+        let b0 = texts[0].bounds.unwrap();
+        assert!((b0.x - 97.0).abs() < 1e-6, "W2 vx centring: {}", b0.x);
+        // Second glyph reverts to the DW2 default centring (vx = w0/2 = 5 pt).
+        let b1 = texts[1].bounds.unwrap();
+        assert!((b1.x - 95.0).abs() < 1e-6, "DW2 centring CID 2: {}", b1.x);
+        // Pen advanced by the W2 step (12 pt). With both glyphs sharing vy = 880‰,
+        // each box top sits `vy` above its pen, so the box tops differ by exactly
+        // the pen advance: top0 − top1 = 12 pt (descending Y from the W2 override,
+        // vs the 10 pt the DW2 default would give).
+        let (top0, top1) = (b0.y + b0.height, b1.y + b1.height);
+        assert!(
+            ((top0 - top1) - 12.0).abs() < 1e-6,
+            "W2 advance = 12 pt (descending), got {}",
+            top0 - top1
+        );
+    }
+
+    /// A horizontal (`Identity-H`) run is byte-identical to the pre-feature layout:
+    /// the same content with a horizontal decoder lays out rightward, bounds and
+    /// all. This guards the unchanged path.
+    #[test]
+    fn horizontal_run_byte_identical_to_baseline() {
+        let mut fonts = FontDecoders::new();
+        fonts.insert(b"F1".to_vec(), vmode_decoder(false, 1000.0, None));
+        let content = b"BT /F1 10 Tf 100 700 Td <00010002> Tj ET";
+        let els = extract_elements_with(content, &fonts, &BTreeMap::new()).unwrap();
+        let texts: Vec<_> = els.iter().filter(|e| e.kind == ElementKind::Text).collect();
+        assert_eq!(texts.len(), 1);
+        let b = texts[0].bounds.unwrap();
+        // Horizontal: the baseline stays at y = 700, the box starts at the pen x
+        // and extends rightward by the two-glyph width (2 × 10 pt). No centring
+        // offset, no descent.
+        assert!((b.x - 100.0).abs() < 1e-6, "starts at pen x: {}", b.x);
+        assert!((b.width - 20.0).abs() < 1e-6, "width: {}", b.width);
+        // Baseline at the pen y; the ascender/descender box straddles it.
+        let straddles = b.y < 700.0 && b.y + b.height > 700.0;
+        assert!(straddles, "box straddles baseline y=700");
+        // The element's rotation is 0 and its font size is the text size.
+        assert_eq!(texts[0].rotation_deg, Some(0.0));
+        assert_eq!(texts[0].font_size, Some(10.0));
     }
 }

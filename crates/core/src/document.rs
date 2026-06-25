@@ -3211,6 +3211,18 @@ impl Document {
                 let program = self.font_program(font);
                 self.simple_font_encoding(font, program.as_ref())
             };
+            // For a composite font in **vertical** writing mode (its `/Encoding`
+            // CMap is `*-V`/`Identity-V`/`/WMode 1`), read the descendant CIDFont's
+            // `/W2`+`/DW2` vertical metrics so glyphs lay out top-to-bottom
+            // (ISO 32000-1 §9.7.4.3). `None` for horizontal fonts (the common case)
+            // and when no vertical metrics are needed.
+            let vmetrics = if two_byte
+                && code_to_cid.as_ref().map(crate::font::cmap::Cmap::wmode) == Some(1)
+            {
+                Some(self.cid_font_vmetrics(font))
+            } else {
+                None
+            };
             decoders.insert(
                 name.clone(),
                 crate::font::cmap::TextDecoder {
@@ -3221,6 +3233,7 @@ impl Document {
                     code_to_cid,
                     cid_to_gid,
                     simple_encoding,
+                    vmetrics,
                 },
             );
         }
@@ -3753,6 +3766,101 @@ impl Document {
             }
         }
         Some(crate::font::cmap::CodeWidths::new(map, dw))
+    }
+
+    /// A Type0 font's per-CID **vertical** metrics from its descendant font's
+    /// `/W2` array and `/DW2` default (ISO 32000-1 §9.7.4.3), for vertical writing
+    /// mode. `/DW2` is `[vy w1y]` (defaults `[880 −1000]`). `/W2` honours both
+    /// forms: `c [w1y_1 vx_1 vy_1 …]` (three numbers per consecutive CID) and
+    /// `cFirst cLast w1y vx vy` (one triple for a CID range). The position
+    /// vector's default x is *not* stored — it is `w0 / 2` from the horizontal
+    /// `/W`, resolved at lookup time. Called only when the `/Encoding` CMap is
+    /// vertical, so it never runs for the horizontal common case.
+    fn cid_font_vmetrics(&self, font: &Dictionary) -> crate::font::cmap::VerticalMetrics {
+        use crate::font::cmap::{VMetric, VerticalMetrics};
+        let descendant = font
+            .get(b"DescendantFonts")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .and_then(|a| a.first())
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict);
+        let Some(descendant) = descendant else {
+            return VerticalMetrics::new(None, BTreeMap::new());
+        };
+        // `/DW2 [vy w1y]` — a 2-element array; missing ⇒ spec defaults.
+        let dw2 = descendant
+            .get(b"DW2")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+            .and_then(|a| {
+                let vy = a
+                    .first()
+                    .map(|o| self.resolve(o))
+                    .and_then(|o| o.as_f64())?;
+                let w1y = a.get(1).map(|o| self.resolve(o)).and_then(|o| o.as_f64())?;
+                Some((vy, w1y))
+            });
+        let mut map: BTreeMap<u32, VMetric> = BTreeMap::new();
+        if let Some(w2) = descendant
+            .get(b"W2")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_array)
+        {
+            let mut i = 0;
+            while i < w2.len() {
+                let Some(c) = self.resolve(&w2[i]).as_i64() else {
+                    break;
+                };
+                if let Some(list) = w2
+                    .get(i + 1)
+                    .map(|o| self.resolve(o))
+                    .and_then(Object::as_array)
+                {
+                    // Form: c [w1y vx vy  w1y vx vy …] — three numbers per CID,
+                    // assigned to consecutive CIDs c, c+1, …
+                    let mut j = 0;
+                    let mut cid = c.max(0) as u32;
+                    while j + 2 < list.len() {
+                        if let (Some(w1y), Some(vx), Some(vy)) = (
+                            self.resolve(&list[j]).as_f64(),
+                            self.resolve(&list[j + 1]).as_f64(),
+                            self.resolve(&list[j + 2]).as_f64(),
+                        ) {
+                            map.insert(cid, VMetric { w1y, vx, vy });
+                        }
+                        cid = cid.wrapping_add(1);
+                        j += 3;
+                    }
+                    i += 2;
+                } else if let (Some(c2), Some(w1y), Some(vx), Some(vy)) = (
+                    w2.get(i + 1)
+                        .map(|o| self.resolve(o))
+                        .and_then(|o| o.as_i64()),
+                    w2.get(i + 2)
+                        .map(|o| self.resolve(o))
+                        .and_then(|o| o.as_f64()),
+                    w2.get(i + 3)
+                        .map(|o| self.resolve(o))
+                        .and_then(|o| o.as_f64()),
+                    w2.get(i + 4)
+                        .map(|o| self.resolve(o))
+                        .and_then(|o| o.as_f64()),
+                ) {
+                    // Form: cFirst cLast w1y vx vy — one triple for the whole range.
+                    let (lo, hi) = (c.max(0) as u32, c2.max(0) as u32);
+                    if hi >= lo && hi - lo < 70_000 {
+                        for cid in lo..=hi {
+                            map.insert(cid, VMetric { w1y, vx, vy });
+                        }
+                    }
+                    i += 5;
+                } else {
+                    break;
+                }
+            }
+        }
+        VerticalMetrics::new(dw2, map)
     }
 
     /// Map each font resource name on a page to a recovered [`TextStyle`]
@@ -8259,6 +8367,16 @@ impl Document {
             } else {
                 self.simple_font_widths(font)
             };
+            // Vertical writing mode (`*-V`/`Identity-V`/`/WMode 1`): the `/W2`+
+            // `/DW2` metrics so the rasterizer steps the pen top-to-bottom and
+            // centres each glyph on the vertical baseline (ISO 32000-1 §9.7.4.3).
+            let vmetrics = if two_byte
+                && code_to_cid.as_ref().map(crate::font::cmap::Cmap::wmode) == Some(1)
+            {
+                Some(self.cid_font_vmetrics(font))
+            } else {
+                None
+            };
             out.insert(
                 name.clone(),
                 crate::raster::render::RenderFont {
@@ -8278,6 +8396,8 @@ impl Document {
                         code_to_cid: code_to_cid.clone(),
                         cid_to_gid: cid_to_gid.clone(),
                         simple_encoding,
+                        // `/W2`+`/DW2` so vertical-mode runs advance down-page.
+                        vmetrics,
                     },
                     two_byte,
                     code_to_cid,
@@ -8355,10 +8475,12 @@ impl Document {
                 widths,
                 cid_to_unicode: None,
                 // Type3 is a simple font (content-stream glyph procs keyed by
-                // code): no composite `/Encoding` CMap, no `/CIDToGIDMap`.
+                // code): no composite `/Encoding` CMap, no `/CIDToGIDMap`, and
+                // — being non-composite — never vertical writing mode.
                 code_to_cid: None,
                 cid_to_gid: None,
                 simple_encoding: None,
+                vmetrics: None,
             },
             two_byte: false,
             code_to_cid: None,

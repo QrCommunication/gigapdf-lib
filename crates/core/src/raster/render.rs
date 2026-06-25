@@ -1237,6 +1237,12 @@ fn show_text(
         );
         return;
     }
+    // Vertical writing mode (ISO 32000-1 §9.4.4): a composite font whose
+    // `/Encoding` CMap is `*-V`/`Identity-V`/`/WMode 1`. Each glyph is offset from
+    // the pen by its `/W2`/`/DW2` position vector (so it centres on the vertical
+    // baseline) and the pen steps top-to-bottom by the vertical displacement `w1y`
+    // (≤ 0) rather than rightward by `w0`. Horizontal fonts keep the unchanged path.
+    let vertical = font.decoder.wmode() == 1;
     let mut i = 0;
     while i < bytes.len() {
         let (code, consumed): (u32, usize) = if font.two_byte && i + 1 < bytes.len() {
@@ -1254,6 +1260,18 @@ fn show_text(
         let cid = match &font.code_to_cid {
             Some(cmap) => cmap.cid(code as u16).unwrap_or(code as u16) as u32,
             None => code,
+        };
+
+        // Vertical mode: place the glyph so its **vertical** origin (origin 1) sits
+        // at the pen — shift the outline by `-v` (the position vector from origin 0
+        // to origin 1) — and step the pen by `w1y` afterwards. `(w1y, vx, vy)` come
+        // back in user-space points (already font-size scaled). Both offsets are 0
+        // for a horizontal font, leaving the path below unchanged.
+        let (v_w1y, off_x, off_y) = if vertical {
+            let (w1y, vx, vy) = font.decoder.vertical_metric(code as u16, size);
+            (w1y, -vx * h_scale, -vy)
+        } else {
+            (0.0, 0.0, 0.0)
         };
 
         // Authoritative pen advance from the PDF width table (`/Widths` keyed by
@@ -1319,7 +1337,9 @@ fn show_text(
                 let dev: Vec<(f64, f64)> = poly
                     .iter()
                     .map(|&(gx, gy)| {
-                        let (ux, uy) = tm.apply(gx * s * h_scale, gy * s);
+                        // `off_x`/`off_y` are 0 horizontally; in vertical mode they
+                        // shift the glyph by `-v` so origin 1 lands at the pen.
+                        let (ux, uy) = tm.apply(gx * s * h_scale + off_x, gy * s + off_y);
                         device(ctm, base, ux, uy)
                     })
                     .collect();
@@ -1340,11 +1360,23 @@ fn show_text(
             }
         }
 
-        let mut step = advance + char_spacing;
-        if consumed == 1 && code == 32 {
-            step += word_spacing;
+        if vertical {
+            // Vertical pen step: the glyph's vertical displacement `w1y` (≤ 0)
+            // plus `Tc`/`Tw` applied along the text-space y-axis. `Tw` only acts on
+            // the single-byte code 32 (never produced by a 2-byte composite font,
+            // so it is inert here, matching the spec).
+            let mut step = v_w1y - char_spacing;
+            if consumed == 1 && code == 32 {
+                step -= word_spacing;
+            }
+            *tm = Matrix::translate(0.0, step).then(tm);
+        } else {
+            let mut step = advance + char_spacing;
+            if consumed == 1 && code == 32 {
+                step += word_spacing;
+            }
+            *tm = Matrix::translate(step * h_scale, 0.0).then(tm);
         }
-        *tm = Matrix::translate(step * h_scale, 0.0).then(tm);
     }
 }
 

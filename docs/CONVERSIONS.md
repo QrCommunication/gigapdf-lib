@@ -131,6 +131,18 @@ current fill colour through the stencil. **Not yet decoded:** `/CCF`
 (CCITTFaxDecode) — no engine decoder exists, so such inline images are skipped
 (the same limitation applies to CCITT XObjects).
 
+**Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
+(Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`
+name (`Identity-V`, `UniJIS-UCS2-V`, …) **or** an embedded CMap stream declaring
+`/WMode 1` — is now **laid out vertically**, both for text extraction (element
+positions / hit-testing) and for rasterizing. The pen advances **top-to-bottom**
+by each glyph's vertical displacement `w1y` (from the descendant CIDFont's `/W2`,
+else `/DW2`, default −1000 ‰) instead of rightward by `w0`, and every glyph is
+offset by its **position vector** `v` (`/W2` per-CID `[vx vy]`, else the `/DW2`
+default `[w0/2, 880]` ‰) so it centres on the vertical baseline; `TJ` numeric
+adjustments move along the vertical axis. Horizontal (`Identity-H` / `-H`) runs
+are unchanged.
+
 **Limits on arbitrary third-party PDFs (tracked in [#5](../../issues/5)):**
 
 - **Running headers/footers are not stripped** → page numbers / running titles
