@@ -768,6 +768,7 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         styles: &styles,
         numbering: &numbering,
         footnotes: &footnotes,
+        page_h: geom.h,
     };
 
     let mut pages = DocxPages::new();
@@ -969,6 +970,10 @@ fn docx_paragraph_model(
     outline: &mut OutlineBuilder,
 ) {
     let mut heading: Option<u8> = None;
+    // Floating drawings (`wp:anchor`) lifted out of the run flow: each becomes a
+    // sibling `Block { kind: Image, frame: Some(Rect) }` flushed after this
+    // paragraph's own block (a float can't sit mid-paragraph in the model).
+    let mut floating: Vec<Block> = Vec::new();
     // `w:pPr/w:outlineLvl@w:val` (0-based, `0`=top): an outline level set
     // independently of any heading style. Folded into the document outline even
     // when the paragraph carries no heading `w:pStyle`.
@@ -1148,15 +1153,33 @@ fn docx_paragraph_model(
                             children: Vec::new(),
                         });
                     }
-                    // A drawing/picture → an inline image. Reuse the same blip
-                    // resolution + resource interning as the HTML path; the image
-                    // joins the current run flow (inside the link when one is open).
+                    // A drawing/picture. Reuse the same blip resolution + resource
+                    // interning as the HTML path, now carrying the alt text and
+                    // geometry. A `wp:inline` drawing joins the current run flow as
+                    // an `Inline::Image` (alt set; an inline has no size slot — a
+                    // model limitation). A floating `wp:anchor` is lifted to a
+                    // sibling `Block` whose `frame` carries the size and (when a
+                    // `wp:posOffset` is given) the absolute position.
                     "drawing" | "pict" | "object" if !sc => {
                         let tag = local(&name).to_string();
-                        if let Some(img) =
-                            docx_drawing_model(x, ctx, resources, &tag)
-                        {
-                            active_inlines(&mut runs, &mut link).push(img);
+                        let DocxDrawingModel {
+                            image,
+                            anchored,
+                            size,
+                            off_x,
+                            off_y,
+                        } = docx_drawing_model(x, ctx, resources, &tag);
+                        if let Some(img) = image {
+                            if anchored {
+                                let frame = docx_anchor_frame(size, off_x, off_y, ctx.page_h);
+                                floating.push(Block {
+                                    frame,
+                                    kind: BlockKind::Image(img),
+                                    ..Block::default()
+                                });
+                            } else {
+                                active_inlines(&mut runs, &mut link).push(Inline::Image(img));
+                            }
                         }
                     }
                     // A bare `a:blip` outside a `<w:drawing>` (legacy/VML).
@@ -1269,6 +1292,11 @@ fn docx_paragraph_model(
         pages.break_page();
     }
     pages.cur().push(block);
+    // Flush any floating drawings anchored in this paragraph as sibling blocks on
+    // the same page (they were lifted out of the run flow above).
+    for fb in floating {
+        pages.cur().push(fb);
+    }
     // Record this paragraph's outline contributions against the page it now sits
     // on: first the heading (so a following bookmark nests under it), then any
     // bookmarks opened in the paragraph.
@@ -1354,35 +1382,140 @@ fn blip_image_ref(
     image_ref(ctx.zip, &key, resources)
 }
 
+/// A `<w:drawing>`/`<w:pict>`/`<w:object>` lowered for the model path. Carries the
+/// interned picture plus the geometry/accessibility the model can represent.
+///
+/// What is lowered: the image (`a:blip`), the alt text (`wp:docPr@descr`, then
+/// `@title` → [`model::ImageRef::alt`]), the on-page size (`wp:extent@cx/@cy`,
+/// EMU→pt), and — for a floating `wp:anchor` — the absolute offset
+/// (`wp:positionH/V/wp:posOffset`, EMU→pt, top-left origin).
+///
+/// What is **not** lowered (no model slot, out of scope to add): the wrap type
+/// (`wp:wrapSquare`/`wrapTight`/`wrapTopAndBottom`/`wrapNone`/`wrapThrough`),
+/// the z-order flag (`@behindDoc`), and the `@relativeFrom` anchor reference —
+/// [`model::Block::frame`] is a single absolute [`model::Rect`] with no wrap,
+/// z-order, or anchor-reference field. A `wp:align` keyword (no `wp:posOffset`)
+/// also has no absolute coordinate at this layer, so only the size is taken then.
+#[derive(Default)]
+struct DocxDrawingModel {
+    /// The interned picture, if a resolvable `a:blip` was present.
+    image: Option<model::ImageRef>,
+    /// `wp:anchor` seen ⇒ a floating object (vs an in-flow `wp:inline`).
+    anchored: bool,
+    /// `wp:extent@cx/@cy` in points (the drawing's on-page footprint).
+    size: Option<(f64, f64)>,
+    /// `wp:positionH/wp:posOffset` in points (top-left origin); `None` for `wp:align`.
+    off_x: Option<f64>,
+    /// `wp:positionV/wp:posOffset` in points (top-left origin); `None` for `wp:align`.
+    off_y: Option<f64>,
+}
+
 /// Consume a `<w:drawing>`/`<w:pict>`/`<w:object>` subtree (its open tag already
-/// seen) up to its matching close and resolve it to an inline image. Mirrors
-/// [`docx_drawing`] but lowers to a model [`Inline::Image`]: only the first
-/// `a:blip` (the picture itself) is interned; floating/anchored geometry is not
-/// modelled inline (the image still joins the run flow). `stop` is the local name
-/// of the enclosing element so the right close ends the scan.
+/// seen) up to its matching close and resolve it for the model. Mirrors
+/// [`docx_drawing`] (the HTML path) but lowers into [`DocxDrawingModel`]: the
+/// first `a:blip` is interned, `wp:docPr@descr`/`@title` becomes the alt text,
+/// `wp:extent` the size, and a `wp:anchor`'s `wp:posOffset` the absolute offset.
+/// `stop` is the local name of the enclosing element so the right close ends the
+/// scan. The caller decides inline (`Inline::Image`) vs floating (`Block.frame`).
 fn docx_drawing_model(
     x: &mut Xml,
     ctx: &DocxCtx,
     resources: &mut BTreeMap<u64, model::ImageResource>,
     stop: &str,
-) -> Option<Inline> {
-    let mut image: Option<model::ImageRef> = None;
+) -> DocxDrawingModel {
+    let mut out = DocxDrawingModel::default();
+    let mut alt: Option<String> = None;
+    let mut size_w: Option<f64> = None;
+    let mut size_h: Option<f64> = None;
+    // Which axis a following `wp:posOffset` text node belongs to (set by the
+    // enclosing `wp:positionH`/`wp:positionV`). `wp:align` has no offset value.
+    let mut cur_axis: Option<bool> = None; // Some(true)=H, Some(false)=V
     while let Some(tok) = x.next() {
         match tok {
-            Tok::Open(name, attrs, _) => {
-                if local(&name) == "blip" && image.is_none() {
-                    image = blip_image_ref(ctx, &attrs, resources);
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "anchor" => out.anchored = true,
+                "extent" => {
+                    // `wp:extent@cx/@cy` is the drawing's overall footprint (EMU).
+                    size_w = attr(&attrs, "cx").and_then(emu_to_pt).or(size_w);
+                    size_h = attr(&attrs, "cy").and_then(emu_to_pt).or(size_h);
                 }
-            }
+                // `wp:docPr@descr` is the accessibility alt text; `@title` is the
+                // fallback. Mirrors the ODP/PPTX `ImageRef.alt` precedence.
+                "docPr" => {
+                    if alt.is_none() {
+                        alt = pick_nonblank(attr(&attrs, "descr"))
+                            .or_else(|| pick_nonblank(attr(&attrs, "title")));
+                    }
+                }
+                "positionH" => cur_axis = Some(true),
+                "positionV" => cur_axis = Some(false),
+                "blip" if out.image.is_none() => {
+                    out.image = blip_image_ref(ctx, &attrs, resources);
+                }
+                _ => {}
+            },
             Tok::Close(name) => {
                 if local(&name) == stop {
                     break;
                 }
             }
-            Tok::Text(_) => {}
+            Tok::Text(t) => {
+                // `wp:posOffset` carries its EMU value as a text node; route it to
+                // the axis set by the enclosing `wp:positionH`/`V`. A `wp:align`
+                // keyword (left/center/right/top/bottom) has no absolute offset, so
+                // it is ignored here (only the size is representable then).
+                if let Some(axis) = cur_axis {
+                    if let Some(pts) = emu_to_pt(&t) {
+                        match axis {
+                            true => out.off_x = Some(pts),
+                            false => out.off_y = Some(pts),
+                        }
+                    }
+                }
+            }
         }
     }
-    image.map(Inline::Image)
+    out.size = match (size_w, size_h) {
+        (Some(w), Some(h)) => Some((w, h)),
+        _ => None,
+    };
+    if let Some(img) = out.image.as_mut() {
+        img.alt = alt;
+    }
+    out
+}
+
+/// Trim an attribute value, returning `None` when absent or blank. Used to pick
+/// the first non-empty alt-text candidate (`wp:docPr@descr`/`@title`).
+fn pick_nonblank(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Build the placement [`model::Rect`] for a floating DOCX drawing from its
+/// `wp:extent` `size` (points) and `wp:posOffset` `off_x`/`off_y` (points,
+/// top-left origin). The offset is treated as page-absolute (matching the HTML
+/// path's `relativeFrom="page"/"margin"` simplification) and the Y axis is
+/// flipped about `page_h` into the model's lower-left convention — the same
+/// mapping the PPTX/form-field frames use. A missing offset defaults to `0`
+/// (a `wp:align`-only anchor has no absolute coordinate at this layer), but the
+/// size is still carried so the box reserves its real footprint. Returns `None`
+/// only when neither a size nor an offset is known (nothing to place).
+fn docx_anchor_frame(
+    size: Option<(f64, f64)>,
+    off_x: Option<f64>,
+    off_y: Option<f64>,
+    page_h: f64,
+) -> Option<model::Rect> {
+    if size.is_none() && off_x.is_none() && off_y.is_none() {
+        return None;
+    }
+    let (w, h) = size.unwrap_or((0.0, 0.0));
+    let x = off_x.unwrap_or(0.0);
+    let y_top = off_y.unwrap_or(0.0);
+    // Top-left (OOXML) → lower-left (model): flip Y about the page height.
+    Some(model::Rect::new(x, page_h - (y_top + h), w, h))
 }
 
 /// Fill each run's unset character attributes from the resolved named style
@@ -5707,6 +5840,7 @@ fn docx_body_geom(zip: &BTreeMap<String, Vec<u8>>) -> (String, PageGeom) {
         styles: &styles,
         numbering: &numbering,
         footnotes: &footnotes,
+        page_h: geom.h,
     };
 
     let mut body = String::new();
@@ -5731,6 +5865,9 @@ struct DocxCtx<'a> {
     styles: &'a DocxStyles,
     numbering: &'a DocxNumbering,
     footnotes: &'a DocxFootnotes,
+    /// Page height (points). Used to flip a floating drawing's top-left
+    /// `wp:posOffset` into the model's lower-left [`model::Block::frame`].
+    page_h: f64,
 }
 
 /// Render every `word/header*.xml` (or `footer*.xml`, per `kind`) as plain
@@ -13021,6 +13158,7 @@ mod tests {
             styles: &styles,
             numbering: &numbering,
             footnotes: &footnotes,
+            page_h: A4_H,
         };
         let mut body = String::new();
         docx_body(document_xml, &ctx, &mut body);
@@ -14502,6 +14640,7 @@ mod tests {
             styles: &styles,
             numbering: &numbering,
             footnotes: &footnotes,
+            page_h: A4_H,
         };
         let mut body = String::new();
         docx_body(
@@ -14538,6 +14677,7 @@ mod tests {
             styles: &styles,
             numbering: &numbering,
             footnotes: &footnotes,
+            page_h: A4_H,
         };
         let mut body = String::new();
         docx_body(document_xml, &ctx, &mut body);
@@ -14905,6 +15045,143 @@ mod tests {
             })
             .collect();
         assert_eq!(link_text, "our site");
+    }
+
+    #[test]
+    fn docx_model_floating_anchor_image_block_with_frame_and_alt() {
+        // A floating `wp:anchor` drawing (posOffset + wrapSquare + descr="logo")
+        // lifts out of the run flow into a sibling `Block { kind: Image, frame }`:
+        // the alt text is carried, the `wp:extent` size and the `wp:posOffset`
+        // position land on the frame (Y flipped about the A4 page height).
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z" xmlns:wp="wp">
+  <w:body>
+    <w:p><w:r><w:t>Before the logo</w:t></w:r>
+      <w:r><w:drawing>
+        <wp:anchor behindDoc="0">
+          <wp:extent cx="1828800" cy="914400"/>
+          <wp:positionH relativeFrom="page"><wp:posOffset>914400</wp:posOffset></wp:positionH>
+          <wp:positionV relativeFrom="page"><wp:posOffset>457200</wp:posOffset></wp:positionV>
+          <wp:wrapSquare wrapText="bothSides"/>
+          <wp:docPr id="1" name="Picture 1" descr="logo"/>
+          <a:blip r:embed="rId7"/>
+        </wp:anchor>
+      </w:drawing></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId7" Type="image" Target="media/pic.png"/>
+</Relationships>"#;
+        let bytes = build_docx(doc, Some(rels), &[("word/media/pic.png", red_png())]);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        // The float is a sibling Image block (not an inline of the paragraph).
+        let blocks = &model.sections[0].pages[0].blocks;
+        let (img, frame) = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(ir) => Some((ir.clone(), b.frame)),
+                _ => None,
+            })
+            .expect("a floating Image block");
+
+        // Alt text from `wp:docPr@descr`.
+        assert_eq!(img.alt.as_deref(), Some("logo"));
+        // The picture bytes are interned in the resource table.
+        assert!(model.resources.images.contains_key(&img.resource));
+
+        // Size from `wp:extent` (1828800 EMU = 144pt, 914400 = 72pt).
+        let rect = frame.expect("floating block carries a frame");
+        assert!((rect.w - 144.0).abs() < 1e-6, "width 144pt, got {}", rect.w);
+        assert!((rect.h - 72.0).abs() < 1e-6, "height 72pt, got {}", rect.h);
+        // Position from `wp:posOffset` (X 914400 EMU = 72pt). Y is flipped about
+        // the A4 page height (841.89pt): y_top=36pt, h=72pt → 841.89-(36+72).
+        assert!((rect.x - 72.0).abs() < 1e-6, "x 72pt, got {}", rect.x);
+        let expect_y = A4_H - (36.0 + 72.0);
+        assert!(
+            (rect.y - expect_y).abs() < 1e-3,
+            "y flipped to {expect_y}, got {}",
+            rect.y
+        );
+
+        // It did NOT also leak into the paragraph's inline run flow.
+        let inline_imgs = model_first_section_inlines(&model)
+            .iter()
+            .filter(|i| matches!(i, Inline::Image(_)))
+            .count();
+        assert_eq!(inline_imgs, 0, "floating image stays out of the run flow");
+    }
+
+    #[test]
+    fn docx_model_inline_drawing_stays_inline_with_alt() {
+        // A `wp:inline` drawing (no `wp:anchor`) stays an `Inline::Image` in the
+        // run flow; its `wp:docPr@descr` still rides along as the alt text. An
+        // inline image has no size slot in the model, so the extent isn't lowered.
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z" xmlns:wp="wp">
+  <w:body>
+    <w:p><w:r><w:drawing>
+      <wp:inline>
+        <wp:extent cx="914400" cy="914400"/>
+        <wp:docPr id="2" name="Inline 1" descr="inline pic"/>
+        <a:blip r:embed="rId3"/>
+      </wp:inline>
+    </w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId3" Type="image" Target="media/pic.png"/>
+</Relationships>"#;
+        let bytes = build_docx(doc, Some(rels), &[("word/media/pic.png", red_png())]);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        // Exactly one inline image, with the alt text set; no floating block.
+        let inlines = model_first_section_inlines(&model);
+        let img = inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("an Inline::Image in the run flow");
+        assert_eq!(img.alt.as_deref(), Some("inline pic"));
+        assert!(model.resources.images.contains_key(&img.resource));
+
+        let float_blocks = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.kind, BlockKind::Image(_)))
+            .count();
+        assert_eq!(
+            float_blocks, 0,
+            "an inline drawing is not lifted to a block"
+        );
+    }
+
+    #[test]
+    fn docx_model_drawing_without_descr_has_no_alt() {
+        // A drawing with no `wp:docPr@descr`/`@title` → `ImageRef.alt` stays None
+        // (no panic, no empty-string alt).
+        let doc = r#"<w:document xmlns:w="x" xmlns:a="y" xmlns:r="z" xmlns:wp="wp">
+  <w:body>
+    <w:p><w:r><w:drawing>
+      <wp:inline><wp:extent cx="914400" cy="914400"/><a:blip r:embed="rId5"/></wp:inline>
+    </w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+  <Relationship Id="rId5" Type="image" Target="media/pic.png"/>
+</Relationships>"#;
+        let bytes = build_docx(doc, Some(rels), &[("word/media/pic.png", red_png())]);
+        let model = office_to_model(&bytes).expect("docx → model");
+
+        let img = model_first_section_inlines(&model)
+            .iter()
+            .find_map(|i| match i {
+                Inline::Image(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("an Inline::Image");
+        assert_eq!(img.alt, None, "no descr/title ⇒ no alt text");
     }
 
     #[test]
