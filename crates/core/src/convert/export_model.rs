@@ -324,6 +324,16 @@ fn odf_named_text_attrs(style: &CharStyle) -> String {
     if style.strike {
         p.push_str(" style:text-line-through-style=\"solid\"");
     }
+    // Run superscript/subscript → `style:text-position` (ODF §20.371), the ODT
+    // analogue of DOCX `w:vertAlign` and PPTX `a:rPr@baseline`. The value is a
+    // vertical position plus an optional font-size scale; `super`/`sub` raise or
+    // lower by the default amount and `58%` shrinks the glyph, mirroring the ODF
+    // importer's `super`/`sub` → `VAlign::Super`/`Sub` so it round-trips.
+    match style.vertical_align {
+        VAlign::Super => p.push_str(" style:text-position=\"super 58%\""),
+        VAlign::Sub => p.push_str(" style:text-position=\"sub 58%\""),
+        VAlign::Baseline => {}
+    }
     if let Some(c) = visible_color(style) {
         p.push_str(&format!(" fo:color=\"#{c}\""));
     }
@@ -463,8 +473,19 @@ impl<'a> DocxCtx<'a> {
 
 fn docx_body(doc: &Document, ctx: &mut DocxCtx) -> String {
     let mut blocks = String::new();
+    // A `w:bookmarkStart`/`End` pair named `page{N}` at each page boundary, the
+    // jump target for an internal `LinkTarget::Page` (`HYPERLINK \l "page{N}"`).
+    // `w:bookmark*` are run-level elements valid as direct `w:body` children, so
+    // no extra paragraph is introduced. The `w:id` is the 1-based page number, so
+    // each id is unique across the document.
+    let mut page_no = 0usize;
     for section in &doc.sections {
         for page in &section.pages {
+            page_no += 1;
+            blocks.push_str(&format!(
+                "<w:bookmarkStart w:id=\"{page_no}\" w:name=\"page{page_no}\"/>\
+<w:bookmarkEnd w:id=\"{page_no}\"/>"
+            ));
             blocks.push_str(&docx_blocks(&page.blocks, ctx));
         }
     }
@@ -664,9 +685,10 @@ fn docx_runs(runs: &[Inline], ctx: &mut DocxCtx, out: &mut String) {
             Inline::LineBreak => out.push_str("<w:r><w:br/></w:r>"),
             Inline::Image(img) => out.push_str(&docx_inline_image(img, ctx)),
             Inline::Link { href, children } => {
-                // Render link children as runs; an external URL gets a real
-                // hyperlink field (`HYPERLINK "url"`), an internal page jump is
-                // emitted as plain runs (the target anchor is not tracked here).
+                // Render link children as runs wrapped in a hyperlink field. An
+                // external URL → `HYPERLINK "url"`; an internal page jump →
+                // `HYPERLINK \l "page{N}"`, resolving to the `w:bookmarkStart`
+                // named `page{N}` that `docx_body` drops at each page boundary.
                 match href {
                     LinkTarget::Url(url) if !url.is_empty() => {
                         let mut esc_url = String::new();
@@ -675,6 +697,16 @@ fn docx_runs(runs: &[Inline], ctx: &mut DocxCtx, out: &mut String) {
                             "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
 <w:r><w:instrText xml:space=\"preserve\"> HYPERLINK \"{esc_url}\" </w:instrText></w:r>\
 <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>"
+                        ));
+                        docx_runs(children, ctx, out);
+                        out.push_str("<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>");
+                    }
+                    LinkTarget::Page(p) => {
+                        out.push_str(&format!(
+                            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+<w:r><w:instrText xml:space=\"preserve\"> HYPERLINK \\l \"page{}\" </w:instrText></w:r>\
+<w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>",
+                            p + 1
                         ));
                         docx_runs(children, ctx, out);
                         out.push_str("<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>");
@@ -1361,6 +1393,8 @@ struct XlsxFont {
     size_centi: u32,
     bold: bool,
     italic: bool,
+    underline: bool,
+    strike: bool,
     /// `RRGGBB` hex, or empty for the default (automatic/black).
     color: String,
 }
@@ -1418,6 +1452,8 @@ impl XlsxStyler {
                 size_centi: 1100,
                 bold: false,
                 italic: false,
+                underline: false,
+                strike: false,
                 color: String::new(),
             }],
             borders: vec![BorderStyle::default()],
@@ -1480,6 +1516,8 @@ impl XlsxStyler {
             size_centi: (run_size(style) * 100.0).round() as u32,
             bold: style.bold,
             italic: style.italic,
+            underline: style.underline,
+            strike: style.strike,
             color: visible_color(style).unwrap_or_default(),
         };
         if want == self.fonts[0] {
@@ -1563,6 +1601,16 @@ impl XlsxStyler {
             }
             if f.italic {
                 s.push_str("<i/>");
+            }
+            // CT_Font child order (ECMA-376 §18.8.22): `strike` then `u` precede
+            // `sz`. A single underline (`<u/>` defaults to `val="single"`) and a
+            // single strike-through, the spreadsheet analogue of the run flags
+            // emitted for word-processing/presentation text.
+            if f.strike {
+                s.push_str("<strike/>");
+            }
+            if f.underline {
+                s.push_str("<u/>");
             }
             s.push_str(&format!("<sz val=\"{}\"/>", num(f.size_centi as f64 / 100.0)));
             if !f.color.is_empty() {
@@ -1951,9 +1999,16 @@ pub fn pptx_from_model(doc: &Document) -> Vec<u8> {
     // Speaker notes per slide: the rendered `notesSlideN.xml` body, or `None`
     // when the slide carries no notes (so no `notesSlide` part is emitted).
     let mut notes_xmls: Vec<Option<String>> = Vec::new();
+    let slide_count = model_slides.len();
     for slide in &model_slides {
         let mut rels = PptxSlideRels::default();
-        slide_xmls.push(pptx_slide_from_model(slide, doc, &mut media, &mut rels));
+        slide_xmls.push(pptx_slide_from_model(
+            slide,
+            doc,
+            &mut media,
+            &mut rels,
+            slide_count,
+        ));
         slide_rels.push(rels);
         notes_xmls.push(
             slide
@@ -2052,6 +2107,10 @@ enum SlideRel {
     Image(usize),
     /// An external hyperlink target (`TargetMode="External"`).
     Hyperlink(String),
+    /// An internal slide jump: the 0-based index of the target slide (the part is
+    /// `ppt/slides/slide{target+1}.xml`). Drives an `a:hlinkClick` with
+    /// `action="ppaction://hlinksldjump"` (a `LinkTarget::Page`).
+    SlideJump(usize),
 }
 
 /// A slide's relationship accumulator. Images and hyperlinks share one ID space
@@ -2072,6 +2131,11 @@ impl PptxSlideRels {
     /// Register an external hyperlink target; returns its `rId`.
     fn add_hyperlink(&mut self, url: &str) -> usize {
         self.rels.push(SlideRel::Hyperlink(url.to_string()));
+        self.rels.len()
+    }
+    /// Register an internal slide jump to a 0-based target slide; returns its `rId`.
+    fn add_slide_jump(&mut self, target: usize) -> usize {
+        self.rels.push(SlideRel::SlideJump(target));
         self.rels.len()
     }
 }
@@ -2098,6 +2162,10 @@ struct PptxRunCtx<'a> {
     rels: &'a mut PptxSlideRels,
     pending_pics: Vec<RunPic>,
     inline_links: bool,
+    /// Total slide count in the deck, so an internal page jump
+    /// (`LinkTarget::Page`) only emits a relationship to a slide that exists; an
+    /// out-of-range target degrades to plain runs (no dangling rId).
+    slide_count: usize,
 }
 
 impl<'a> PptxRunCtx<'a> {
@@ -2105,6 +2173,7 @@ impl<'a> PptxRunCtx<'a> {
         doc: &'a Document,
         media: &'a mut Vec<(Vec<u8>, &'static str)>,
         rels: &'a mut PptxSlideRels,
+        slide_count: usize,
     ) -> Self {
         PptxRunCtx {
             doc,
@@ -2112,6 +2181,7 @@ impl<'a> PptxRunCtx<'a> {
             rels,
             pending_pics: Vec::new(),
             inline_links: true,
+            slide_count,
         }
     }
 }
@@ -2121,6 +2191,7 @@ fn pptx_slide_from_model(
     doc: &Document,
     media: &mut Vec<(Vec<u8>, &'static str)>,
     rels: &mut PptxSlideRels,
+    slide_count: usize,
 ) -> String {
     let mut tree = String::new();
     let mut id = 2usize;
@@ -2139,7 +2210,7 @@ fn pptx_slide_from_model(
             PlaceholderRole::Other(_) => ("body", " idx=\"1\"".to_string()),
         };
         let frame = pptx_xfrm(ph.block.frame, slide.geometry.width, slide.geometry.height);
-        let mut rctx = PptxRunCtx::new(doc, media, rels);
+        let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
         let body = pptx_text_body(&block_to_paras(&ph.block), &mut rctx);
         hoisted.append(&mut rctx.pending_pics);
         tree.push_str(&format!(
@@ -2192,14 +2263,14 @@ fn pptx_slide_from_model(
                     slide.geometry.width,
                     slide.geometry.height,
                 ));
-                let mut rctx = PptxRunCtx::new(doc, media, rels);
+                let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
                 tree.push_str(&pptx_table_frame(table, r, id, &mut rctx));
                 hoisted.append(&mut rctx.pending_pics);
                 id += 1;
             }
             _ => {
                 let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
-                let mut rctx = PptxRunCtx::new(doc, media, rels);
+                let mut rctx = PptxRunCtx::new(doc, media, rels, slide_count);
                 let body = pptx_text_body(&block_to_paras(sh), &mut rctx);
                 hoisted.append(&mut rctx.pending_pics);
                 tree.push_str(&format!(
@@ -2279,7 +2350,7 @@ fn pptx_notes_from_model(notes: &[Block], doc: &Document) -> String {
     // throwaway media/rels backs the run ctx; nothing it allocates is serialized.
     let mut sink_media: Vec<(Vec<u8>, &'static str)> = Vec::new();
     let mut sink_rels = PptxSlideRels::default();
-    let mut rctx = PptxRunCtx::new(doc, &mut sink_media, &mut sink_rels);
+    let mut rctx = PptxRunCtx::new(doc, &mut sink_media, &mut sink_rels, 0);
     rctx.inline_links = false;
     let body = pptx_text_body(&blocks_to_paras(notes), &mut rctx);
     format!(
@@ -2554,13 +2625,36 @@ fn pptx_runs(runs: &[Inline], ctx: &mut PptxRunCtx, out: &mut String) {
                     }
                 }
             }
-            // An external hyperlink → an `a:hlinkClick r:id` carried on each child
-            // run's `a:rPr` (#2), with a slide-rels relationship to the URL. An
-            // internal page jump (or a link-less context) degrades to plain runs.
+            // A hyperlink → an `a:hlinkClick r:id` carried on each child run's
+            // `a:rPr` (#2). An external URL adds a `TargetMode="External"`
+            // relationship; an internal `LinkTarget::Page` adds a `slide`
+            // relationship + `action="…hlinksldjump"` (only when the target slide
+            // exists). A link-less context (notes) or an out-of-range page degrades
+            // to plain runs.
             Inline::Link { href, children } => match href {
                 LinkTarget::Url(url) if ctx.inline_links && !url.is_empty() => {
                     let rid = ctx.rels.add_hyperlink(url);
-                    pptx_link_runs(children, ctx, rid, out);
+                    pptx_link_runs(
+                        children,
+                        ctx,
+                        PptxHlink {
+                            rid,
+                            slide_jump: false,
+                        },
+                        out,
+                    );
+                }
+                LinkTarget::Page(p) if ctx.inline_links && *p < ctx.slide_count => {
+                    let rid = ctx.rels.add_slide_jump(*p);
+                    pptx_link_runs(
+                        children,
+                        ctx,
+                        PptxHlink {
+                            rid,
+                            slide_jump: true,
+                        },
+                        out,
+                    );
                 }
                 _ => pptx_runs(children, ctx, out),
             },
@@ -2568,10 +2662,19 @@ fn pptx_runs(runs: &[Inline], ctx: &mut PptxRunCtx, out: &mut String) {
     }
 }
 
-/// Render a hyperlink's child runs, threading the link relationship id onto each
+/// A run-level hyperlink reference: the slide-rels relationship id plus whether
+/// it is an internal slide jump (which needs `action="ppaction://hlinksldjump"`
+/// on the `a:hlinkClick`) or a plain external URL.
+#[derive(Clone, Copy)]
+struct PptxHlink {
+    rid: usize,
+    slide_jump: bool,
+}
+
+/// Render a hyperlink's child runs, threading the link relationship onto each
 /// regular run's `a:rPr` as `<a:hlinkClick r:id="rId…"/>`. Nested non-run inlines
 /// (line breaks, images, nested links) fall back to the ordinary run path.
-fn pptx_link_runs(runs: &[Inline], ctx: &mut PptxRunCtx, link_rid: usize, out: &mut String) {
+fn pptx_link_runs(runs: &[Inline], ctx: &mut PptxRunCtx, link: PptxHlink, out: &mut String) {
     for r in runs {
         match r {
             Inline::Run(run) => {
@@ -2582,7 +2685,7 @@ fn pptx_link_runs(runs: &[Inline], ctx: &mut PptxRunCtx, link_rid: usize, out: &
                 esc(&run.text, &mut t);
                 out.push_str(&format!(
                     "<a:r>{rpr}<a:t>{t}</a:t></a:r>",
-                    rpr = pptx_rpr(&run.style, Some(link_rid))
+                    rpr = pptx_rpr(&run.style, Some(link))
                 ));
             }
             Inline::LineBreak => out.push_str("<a:br/>"),
@@ -2591,9 +2694,10 @@ fn pptx_link_runs(runs: &[Inline], ctx: &mut PptxRunCtx, link_rid: usize, out: &
     }
 }
 
-/// `<a:rPr>` from a [`CharStyle`]. `link_rid`, when set, adds an
-/// `<a:hlinkClick r:id="rId…"/>` (the run is part of an external hyperlink).
-fn pptx_rpr(style: &CharStyle, link_rid: Option<usize>) -> String {
+/// `<a:rPr>` from a [`CharStyle`]. `link`, when set, adds an
+/// `<a:hlinkClick r:id="rId…"/>` — an external URL, or an internal slide jump
+/// carrying `action="ppaction://hlinksldjump"` when `slide_jump` is set.
+fn pptx_rpr(style: &CharStyle, link: Option<PptxHlink>) -> String {
     let mut attrs = format!(
         "lang=\"en-US\" sz=\"{}\"",
         (run_size(style) * 100.0).round().max(100.0) as i64
@@ -2609,6 +2713,16 @@ fn pptx_rpr(style: &CharStyle, link_rid: Option<usize>) -> String {
     }
     if style.strike {
         attrs.push_str(" strike=\"sngStrike\"");
+    }
+    // Run superscript/subscript → `a:rPr@baseline` (ECMA-376 §21.1.2.3.9), the
+    // PPTX analogue of DOCX `w:vertAlign` and ODF `style:text-position`. The value
+    // is a percentage of the line in 1000ths; PowerPoint's defaults are +30% for
+    // superscript and -25% for subscript, so 30000 / -25000 mirror the importer's
+    // `baseline > 0` / `< 0` → `VAlign::Super` / `Sub`.
+    match style.vertical_align {
+        VAlign::Super => attrs.push_str(" baseline=\"30000\""),
+        VAlign::Sub => attrs.push_str(" baseline=\"-25000\""),
+        VAlign::Baseline => {}
     }
     let mut inner = String::new();
     if let Some(c) = visible_color(style) {
@@ -2633,11 +2747,20 @@ fn pptx_rpr(style: &CharStyle, link_rid: Option<usize>) -> String {
         esc(&style.family, &mut fam);
         inner.push_str(&format!("<a:latin typeface=\"{fam}\"/>"));
     }
-    // `a:hlinkClick` (the run's external hyperlink) follows the `a:latin` group in
+    // `a:hlinkClick` (the run's hyperlink) follows the `a:latin` group in
     // `CT_TextCharacterProperties`'s child order; the `r:id` resolves to the
-    // slide-rels relationship registered for the link's URL.
-    if let Some(rid) = link_rid {
-        inner.push_str(&format!("<a:hlinkClick r:id=\"rId{rid}\"/>"));
+    // slide-rels relationship registered for the link. An internal page jump adds
+    // `action="ppaction://hlinksldjump"` so PowerPoint navigates to the slide
+    // rather than opening it as an external target.
+    if let Some(link) = link {
+        if link.slide_jump {
+            inner.push_str(&format!(
+                "<a:hlinkClick r:id=\"rId{}\" action=\"ppaction://hlinksldjump\"/>",
+                link.rid
+            ));
+        } else {
+            inner.push_str(&format!("<a:hlinkClick r:id=\"rId{}\"/>", link.rid));
+        }
     }
     if inner.is_empty() {
         format!("<a:rPr {attrs}/>")
@@ -2766,6 +2889,17 @@ Target=\"../media/image{}.{ext}\"/>",
                     "<Relationship Id=\"rId{rid}\" \
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" \
 Target=\"{u}\" TargetMode=\"External\"/>"
+                ));
+            }
+            SlideRel::SlideJump(target) => {
+                // An internal slide reference (no `TargetMode` ⇒ Internal). Slides
+                // are siblings in `ppt/slides/`, so the target is a bare
+                // `slide{N}.xml`. Paired with `a:hlinkClick action="…hlinksldjump"`.
+                s.push_str(&format!(
+                    "<Relationship Id=\"rId{rid}\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" \
+Target=\"slide{}.xml\"/>",
+                    target + 1
                 ));
             }
         }
@@ -2996,8 +3130,17 @@ fn odt_body(doc: &Document, ctx: &mut OdfCtx) -> String {
     // The first section's running header/footer become real `<style:header>`/
     // `<style:footer>` in the master page (styles.xml), not inlined body text.
     let mut body = String::new();
+    // A `text:bookmark` named `page{N}` at each page boundary, the jump target for
+    // an internal `LinkTarget::Page` (`text:a xlink:href="#page{N}"`). ODF requires
+    // a bookmark to live inside a paragraph, so it rides an empty `text:p` (as the
+    // block-image/shape export wraps its drawing).
+    let mut page_no = 0usize;
     for section in &doc.sections {
         for page in &section.pages {
+            page_no += 1;
+            body.push_str(&format!(
+                "<text:p><text:bookmark text:name=\"page{page_no}\"/></text:p>"
+            ));
             body.push_str(&odt_blocks(&page.blocks, ctx));
         }
     }
@@ -3023,7 +3166,7 @@ fn odt_block(block: &Block, ctx: &mut OdfCtx, out: &mut String) {
         BlockKind::List(list) => out.push_str(&odt_list(list, ctx)),
         BlockKind::Table(table) => out.push_str(&odt_table(table, ctx)),
         BlockKind::Image(img) => out.push_str(&odt_image_para(img, ctx)),
-        BlockKind::Shape(_) => {} // block shapes have no flow position in ODT text
+        BlockKind::Shape(shape) => out.push_str(&odt_shape_para(block, shape, ctx)),
         BlockKind::TextBox(tb) => out.push_str(&odt_blocks(&tb.blocks, ctx)),
         BlockKind::CodeBlock(cb) => out.push_str(&odt_code(cb, ctx)),
         BlockKind::Blockquote(bq) => {
@@ -3161,19 +3304,28 @@ fn odt_runs(runs: &[Inline], ctx: &mut OdfCtx, out: &mut String) {
                 }
             }
             Inline::Link { href, children } => {
-                if let LinkTarget::Url(url) = href {
-                    if !url.is_empty() {
+                // External URL → `text:a xlink:href="url"`; internal page jump →
+                // `text:a xlink:href="#page{N}"`, resolving to the `text:bookmark`
+                // (ODT) or `draw:page draw:name` (ODP, the shared `odp_body`) that
+                // marks each page target.
+                let target = match href {
+                    LinkTarget::Url(url) if !url.is_empty() => {
                         let mut u = String::new();
                         esc(url, &mut u);
-                        out.push_str(&format!(
-                            "<text:a xlink:type=\"simple\" xlink:href=\"{u}\">"
-                        ));
-                        odt_runs(children, ctx, out);
-                        out.push_str("</text:a>");
-                        continue;
+                        Some(u)
                     }
+                    LinkTarget::Page(p) => Some(format!("#page{}", p + 1)),
+                    LinkTarget::Url(_) => None,
+                };
+                if let Some(href) = target {
+                    out.push_str(&format!(
+                        "<text:a xlink:type=\"simple\" xlink:href=\"{href}\">"
+                    ));
+                    odt_runs(children, ctx, out);
+                    out.push_str("</text:a>");
+                } else {
+                    odt_runs(children, ctx, out);
                 }
-                odt_runs(children, ctx, out);
             }
         }
     }
@@ -3396,6 +3548,49 @@ fn odt_image_para(img: &ImageRef, ctx: &mut OdfCtx) -> String {
     }
 }
 
+/// A block-level [`Shape`] → a `<text:p>` carrying an anchored `draw:rect` /
+/// `draw:path` (ODF §10.3.2 / §10.3.8), the ODT analogue of the DOCX/PPTX/ODP
+/// shape export. ODF requires a drawing in the text body to live inside a
+/// paragraph (as the inline-image export does), so the shape is wrapped in a
+/// `text:p` and `text:anchor-type="paragraph"`. A flowing body has no slot for a
+/// shape that carries no placement box, so an unframed shape yields nothing —
+/// the previous behaviour. Geometry + fill/stroke come from the same
+/// `shape_to_placed` / `odf_shape_style` / `odf_path_d` helpers the ODP/PPTX
+/// exporters use, so a shape renders identically across them.
+fn odt_shape_para(block: &Block, shape: &Shape, ctx: &mut OdfCtx) -> String {
+    let Some(r) = block.frame else {
+        return String::new();
+    };
+    let placed = shape_to_placed(shape);
+    let sid = ctx.next_style();
+    let sname = format!("Sh{sid}");
+    ctx.auto.push_str(&odf_shape_style(&sname, &placed));
+    let draw = if shape_is_rect(&placed) {
+        format!(
+            "<draw:rect draw:style-name=\"{sname}\" text:anchor-type=\"paragraph\" \
+draw:layer=\"layout\" svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>",
+            x = num(r.x),
+            y = num(r.y),
+            w = num(r.w.max(1.0)),
+            h = num(r.h.max(1.0)),
+        )
+    } else {
+        format!(
+            "<draw:path draw:style-name=\"{sname}\" text:anchor-type=\"paragraph\" \
+draw:layer=\"layout\" svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
+svg:viewBox=\"0 0 {vw} {vh}\" svg:d=\"{d}\"/>",
+            x = num(r.x),
+            y = num(r.y),
+            w = num(r.w.max(1.0)),
+            h = num(r.h.max(1.0)),
+            vw = num(r.w.max(1.0)),
+            vh = num(r.h.max(1.0)),
+            d = odf_path_d(&placed.segments),
+        )
+    };
+    format!("<text:p>{draw}</text:p>")
+}
+
 fn odt_model_content(auto: &str, body: &str) -> String {
     // The inline-image graphic style lives in automatic-styles.
     let frame_style = "<style:style style:name=\"frInl\" style:family=\"graphic\">\
@@ -3569,6 +3764,16 @@ fn odf_span_style(name: &str, style: &CharStyle) -> String {
     if style.strike {
         p.push_str(" style:text-line-through-style=\"solid\"");
     }
+    // Run superscript/subscript → `style:text-position` (ODF §20.371), the ODT
+    // analogue of DOCX `w:vertAlign` and PPTX `a:rPr@baseline`. The value is a
+    // vertical position plus an optional font-size scale; `super`/`sub` raise or
+    // lower by the default amount and `58%` shrinks the glyph, mirroring the ODF
+    // importer's `super`/`sub` → `VAlign::Super`/`Sub` so it round-trips.
+    match style.vertical_align {
+        VAlign::Super => p.push_str(" style:text-position=\"super 58%\""),
+        VAlign::Sub => p.push_str(" style:text-position=\"sub 58%\""),
+        VAlign::Baseline => {}
+    }
     if let Some(c) = visible_color(style) {
         p.push_str(&format!(" fo:color=\"#{c}\""));
     }
@@ -3660,7 +3865,8 @@ fn odf_manifest(kind: &str, image_exts: &[&str]) -> String {
 struct CellStyleKey {
     fill: Option<String>,
     data_style: Option<String>,
-    font: Option<(String, bool, bool, u32, String)>,
+    /// `(family, bold, italic, underline, strike, size_centi, color_hex)`.
+    font: Option<(String, bool, bool, bool, bool, u32, String)>,
     border: Option<(u32, String)>,
     align: Option<Align>,
     valign: Option<CellVAlign>,
@@ -3772,11 +3978,18 @@ impl OdsStyler {
             None => String::new(),
         };
 
-        // text-properties: font family / weight / style / size / colour.
+        // text-properties: font family / weight / style / underline / strike /
+        // size / colour.
         let text_props = match &key.font {
-            Some((family, bold, italic, size_centi, color)) => {
-                ods_text_props(family, *bold, *italic, *size_centi, color)
-            }
+            Some((family, bold, italic, underline, strike, size_centi, color)) => ods_text_props(
+                family,
+                *bold,
+                *italic,
+                *underline,
+                *strike,
+                *size_centi,
+                color,
+            ),
             None => String::new(),
         };
 
@@ -3820,12 +4033,14 @@ impl OdsStyler {
 
 /// The font cache-key tuple for a char style, or `None` when it carries no
 /// distinguishing trait (empty family, default size, no bold/italic/colour).
-fn ods_font_key(style: &CharStyle) -> Option<(String, bool, bool, u32, String)> {
+fn ods_font_key(style: &CharStyle) -> Option<(String, bool, bool, bool, bool, u32, String)> {
     let color = visible_color(style).unwrap_or_default();
     let has_size = style.size_pt > 0.0;
     if style.family.is_empty()
         && !style.bold
         && !style.italic
+        && !style.underline
+        && !style.strike
         && !has_size
         && color.is_empty()
     {
@@ -3835,16 +4050,21 @@ fn ods_font_key(style: &CharStyle) -> Option<(String, bool, bool, u32, String)> 
         style.family.clone(),
         style.bold,
         style.italic,
+        style.underline,
+        style.strike,
         (run_size(style) * 100.0).round() as u32,
         color,
     ))
 }
 
-/// `<style:text-properties>` for a cell font (family/weight/style/size/colour).
+/// `<style:text-properties>` for a cell font
+/// (family/weight/style/underline/strike/size/colour).
 fn ods_text_props(
     family: &str,
     bold: bool,
     italic: bool,
+    underline: bool,
+    strike: bool,
     size_centi: u32,
     color: &str,
 ) -> String {
@@ -3859,6 +4079,15 @@ fn ods_text_props(
     }
     if italic {
         p.push_str(" fo:font-style=\"italic\"");
+    }
+    // Underline / strike-through → `style:text-underline-style` /
+    // `style:text-line-through-style` (ODF §20.367 / §20.358), the ODS analogue
+    // of the run flags carried on word-processing/presentation text styles.
+    if underline {
+        p.push_str(" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\"");
+    }
+    if strike {
+        p.push_str(" style:text-line-through-style=\"solid\"");
     }
     p.push_str(&format!(
         " fo:font-size=\"{}pt\"",
@@ -4053,8 +4282,16 @@ fn odp_body(slides: &[Slide], doc: &Document, ctx: &mut OdfCtx) -> String {
     if slides.is_empty() {
         body.push_str("<draw:page draw:master-page-name=\"Default\"/>");
     }
-    for slide in slides {
-        body.push_str("<draw:page draw:style-name=\"dp1\" draw:master-page-name=\"Default\">");
+    for (i, slide) in slides.iter().enumerate() {
+        // `draw:name="page{N}"` is the jump target for an internal
+        // `LinkTarget::Page` (`text:a xlink:href="#page{N}"`, emitted by the shared
+        // `odt_runs`). The 1-based slide index matches the `#page{N}` anchor the
+        // ODT export uses, so the same model link resolves in both ODF presentations
+        // and text documents.
+        body.push_str(&format!(
+            "<draw:page draw:name=\"page{}\" draw:style-name=\"dp1\" draw:master-page-name=\"Default\">",
+            i + 1
+        ));
         for ph in &slide.placeholders {
             odp_frame(&ph.block, Some(&ph.role), slide, doc, ctx, &mut body);
         }
@@ -10107,6 +10344,218 @@ style:family=\"paragraph\""
         assert!(
             content.contains("<table:table-row table:style-name="),
             "row references its height style: {content}"
+        );
+    }
+
+    /// #2 — super/subscript runs reach ODT (`style:text-position`) and PPTX
+    /// (`a:rPr@baseline`), not only DOCX. A `VAlign::Super` run → `super 58%` /
+    /// `baseline="30000"`; a `VAlign::Sub` run → `sub 58%` / `baseline="-25000"`.
+    #[test]
+    fn odt_and_pptx_emit_super_and_subscript() {
+        let sup = |text: &str, va: VAlign| {
+            Inline::Run(InlineRun {
+                text: text.to_string(),
+                style: CharStyle {
+                    vertical_align: va,
+                    ..Default::default()
+                },
+                source_index: None,
+            })
+        };
+        let para = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![sup("up", VAlign::Super), sup("down", VAlign::Sub)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // ODT: a `style:text-position` on each span's automatic text style.
+        let odt = odt_from_model(&doc_with(para.clone()));
+        let content = String::from_utf8(entry(&odt, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:text-position=\"super 58%\""),
+            "ODT superscript text-position: {content}"
+        );
+        assert!(
+            content.contains("style:text-position=\"sub 58%\""),
+            "ODT subscript text-position: {content}"
+        );
+
+        // PPTX: a `baseline` attribute on each run's `a:rPr`.
+        let pptx = pptx_from_model(&one_slide_doc(para));
+        let slide = String::from_utf8(entry(&pptx, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(
+            slide.contains("baseline=\"30000\""),
+            "PPTX superscript baseline: {slide}"
+        );
+        assert!(
+            slide.contains("baseline=\"-25000\""),
+            "PPTX subscript baseline: {slide}"
+        );
+    }
+
+    /// #2 — underline + strike on a spreadsheet cell reach the per-cell font:
+    /// XLSX `<u/>` + `<strike/>`, ODS `style:text-underline-style` +
+    /// `style:text-line-through-style`.
+    #[test]
+    fn spreadsheet_cell_font_emits_underline_and_strike() {
+        let sheet = Sheet {
+            name: "S".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("ul".to_string()),
+                    style: CharStyle {
+                        underline: true,
+                        strike: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+                height: None,
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        };
+
+        // XLSX: `<u/>` and `<strike/>` in the cell's `<font>` record.
+        let xlsx = xlsx_from_model(&sheet_doc(sheet.clone()));
+        let styles = String::from_utf8(entry(&xlsx, "xl/styles.xml").unwrap()).unwrap();
+        assert!(styles.contains("<u/>"), "XLSX underline font: {styles}");
+        assert!(styles.contains("<strike/>"), "XLSX strike font: {styles}");
+
+        // ODS: the cell's text style carries underline + line-through.
+        let ods = ods_from_model(&sheet_doc(sheet));
+        let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:text-underline-style=\"solid\""),
+            "ODS underline style: {content}"
+        );
+        assert!(
+            content.contains("style:text-line-through-style=\"solid\""),
+            "ODS strike style: {content}"
+        );
+    }
+
+    /// #2 — a block-level `Shape` reaches ODT (it was silently dropped). A framed
+    /// filled rectangle → a `draw:rect` carrying its geometry and a graphic style
+    /// with the fill, wrapped in a `text:p` as ODF requires for a body drawing.
+    #[test]
+    fn odt_block_shape_emits_draw_shape_with_geometry_and_fill() {
+        let shape = Shape {
+            segments: vec![
+                PathSeg::Move(0.0, 0.0),
+                PathSeg::Line(100.0, 0.0),
+                PathSeg::Line(100.0, 50.0),
+                PathSeg::Line(0.0, 50.0),
+                PathSeg::Close,
+            ],
+            fill: Some([1.0, 0.0, 0.0]),
+            stroke: None,
+            stroke_width: 0.0,
+            dash: Vec::new(),
+        };
+        let block = Block {
+            frame: Some(crate::model::Rect::new(72.0, 144.0, 100.0, 50.0)),
+            kind: BlockKind::Shape(shape),
+            ..Default::default()
+        };
+        let bytes = odt_from_model(&doc_with(block));
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        // A `draw:rect` placed at the frame, anchored inside a paragraph.
+        assert!(
+            content.contains("<text:p><draw:rect "),
+            "shape wrapped in a paragraph: {content}"
+        );
+        assert!(
+            content.contains("svg:x=\"72pt\"")
+                && content.contains("svg:y=\"144pt\"")
+                && content.contains("svg:width=\"100pt\"")
+                && content.contains("svg:height=\"50pt\""),
+            "shape geometry from the block frame: {content}"
+        );
+        // A graphic style carrying the red fill is referenced by the shape.
+        assert!(
+            content.contains("draw:fill=\"solid\"")
+                && content.contains("draw:fill-color=\"#FF0000\""),
+            "shape fill style: {content}"
+        );
+    }
+
+    /// #2 — an internal `LinkTarget::Page` jump is emitted (it was dropped). DOCX:
+    /// a `HYPERLINK \l "page{N}"` field + the matching `w:bookmarkStart`; ODT: a
+    /// `text:a xlink:href="#page{N}"` + the page `text:bookmark`; PPTX: an
+    /// `a:hlinkClick action="…hlinksldjump"` + a `slide` relationship.
+    #[test]
+    fn internal_page_link_emits_anchor_and_jump() {
+        // Two pages so a jump to page 2 (`LinkTarget::Page(1)`) has a real target.
+        let linked_para = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Link {
+                    href: LinkTarget::Page(1),
+                    children: vec![run("go to page 2")],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let two_page_doc = || Document {
+            sections: vec![Section {
+                pages: vec![
+                    Page {
+                        blocks: vec![linked_para.clone()],
+                        absolute: false,
+                    },
+                    Page {
+                        blocks: vec![para("page two")],
+                        absolute: false,
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // DOCX: the field jumps to the bookmark, and the bookmark exists at page 2.
+        let docx = docx_from_model(&two_page_doc());
+        let doc = String::from_utf8(entry(&docx, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            doc.contains("HYPERLINK \\l \"page2\""),
+            "DOCX internal hyperlink field: {doc}"
+        );
+        assert!(
+            doc.contains("<w:bookmarkStart w:id=\"2\" w:name=\"page2\"/>"),
+            "DOCX page-2 bookmark target: {doc}"
+        );
+
+        // ODT: the anchor href + the page bookmark.
+        let odt = odt_from_model(&two_page_doc());
+        let content = String::from_utf8(entry(&odt, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<text:a xlink:type=\"simple\" xlink:href=\"#page2\">"),
+            "ODT internal link href: {content}"
+        );
+        assert!(
+            content.contains("<text:bookmark text:name=\"page2\"/>"),
+            "ODT page-2 bookmark target: {content}"
+        );
+
+        // PPTX: each page becomes a slide; the jump targets slide 2 via a slide
+        // relationship + `ppaction://hlinksldjump`.
+        let pptx = pptx_from_model(&two_page_doc());
+        let slide1 = String::from_utf8(entry(&pptx, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        let rels =
+            String::from_utf8(entry(&pptx, "ppt/slides/_rels/slide1.xml.rels").unwrap()).unwrap();
+        assert!(
+            slide1.contains("action=\"ppaction://hlinksldjump\""),
+            "PPTX slide-jump action: {slide1}"
+        );
+        assert!(
+            rels.contains(
+                "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\""
+            ) && rels.contains("Target=\"slide2.xml\""),
+            "PPTX slide-2 relationship: {rels}"
         );
     }
 }
