@@ -7,6 +7,71 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.95.0] - 2026-06-25
+
+Thirteen roadmap issues across PDF authoring, PDF reading, Office round-trip
+fidelity and CI conformance — the post-[#1](https://github.com/qrcommunication/gigapdf-lib/issues/1)
+cleanup, implemented in parallel.
+
+### Added — PDF authoring
+
+- **Page transitions.** `setPageTransition` / `getPageTransition` /
+  `clearPageTransition` — the full ISO 32000-1 §12.4.4 `/Trans` set (12 styles +
+  `/Dm`/`/M`/`/Di`/`/SS`/`/B`) plus per-page `/Dur` auto-advance, for
+  kiosk/presentation PDFs. ([#65](https://github.com/qrcommunication/gigapdf-lib/issues/65))
+- **Scale page content.** `scalePageContent` / `scalePageContentXy` / `scalePageTo`
+  — a true `cm`-wrap of the content stream **plus** boxes and annotation rects (not
+  just a box resize), and `/UserUnit` authoring for large-format pages.
+  ([#68](https://github.com/qrcommunication/gigapdf-lib/issues/68))
+- **Embedded-file portfolio `/Collection`.** `setCollection` / `collection` — view
+  (details/tiles/hidden), `/Schema` columns, `/Sort`, default file, and per-file
+  `/CI` metadata, built on the existing embedded-files plumbing.
+  ([#66](https://github.com/qrcommunication/gigapdf-lib/issues/66))
+- **Per-figure alternate text.** `setFigureAlt` / `figureCount` — real `/Alt` on
+  `Figure` structure elements, flowing into **both** PDF/UA (`toTagged`) and PDF/A
+  level-A exports (which previously emitted none).
+  ([#20](https://github.com/qrcommunication/gigapdf-lib/issues/20))
+
+### Added — PDF reading
+
+- **Optional-content visibility** is enforced during render: content in OCGs that
+  are OFF by default (`/OCProperties /D`) is hidden, OCMD `/P` membership policies
+  (`AnyOn`/`AllOn`/`AnyOff`/`AllOff`) resolved, and `/OC` on marked content +
+  XObjects honored (nested-correct).
+  ([#54](https://github.com/qrcommunication/gigapdf-lib/issues/54))
+- **Vertical writing mode** (`Identity-V` / CMap `/WMode 1`): text lays out
+  top-to-bottom using `/W2`+`/DW2` vertical metrics and the glyph position vector,
+  in both extraction and rendering.
+  ([#49](https://github.com/qrcommunication/gigapdf-lib/issues/49))
+
+### Added / improved — Office round-trip
+
+- **Document outline / TOC** built from DOCX/ODT headings + bookmarks into
+  `Document.outline` (internal `_Toc`/`_GoBack` bookmarks dropped).
+  ([#31](https://github.com/qrcommunication/gigapdf-lib/issues/31))
+- **Named styles** (DOCX `styles.xml`, ODT `office:styles`) lowered to
+  `Document.styles` so `style_ref` resolves.
+  ([#30](https://github.com/qrcommunication/gigapdf-lib/issues/30))
+- **DOCX floating/inline drawings** keep size, anchored position, and image alt
+  text. ([#40](https://github.com/qrcommunication/gigapdf-lib/issues/40))
+- **Super/subscript** run position round-trips across DOCX/XLSX/PPTX/ODF →
+  `CharStyle.vertical_align`.
+  ([#32](https://github.com/qrcommunication/gigapdf-lib/issues/32))
+- **Flat-XML ODF** (`.fodt`/`.fods`/`.fodp`/`.fodg`) and **`.odg`** drawings are now
+  importable, reusing the existing ODF lowering.
+  ([#53](https://github.com/qrcommunication/gigapdf-lib/issues/53))
+- **Table/cell vertical alignment** modeled and round-tripped (import + export +
+  render) across DOCX/XLSX/PPTX/ODF tables and spreadsheet cells.
+  ([#27](https://github.com/qrcommunication/gigapdf-lib/issues/27))
+
+### Tooling
+
+- **Strong schema validation** in CI — exported Office files are validated against
+  the official ECMA-376 XSD and ODF RelaxNG schemas (`xmllint`), not just OPC
+  well-formedness; the gate also surfaced three pre-existing exporter conformance
+  bugs (baselined for a follow-up).
+  ([#19](https://github.com/qrcommunication/gigapdf-lib/issues/19))
+
 ## [0.94.0] - 2026-06-25
 
 The largest release so far. **Issue [#1](https://github.com/qrcommunication/gigapdf-lib/issues/1)

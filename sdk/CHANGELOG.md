@@ -44,6 +44,39 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.95.0] - 2026-06-25
+
+Thirteen roadmap issues (PDF authoring, PDF reading, Office round-trip, CI
+conformance). New SDK surface:
+
+### Added
+
+- **`setPageTransition(page, opts)` / `getPageTransition(page)` /
+  `clearPageTransition(page)`** — presentation page transitions (`/Trans`: 12
+  styles + direction/dimension/motion/scale) and per-page `/Dur` auto-advance.
+  ([#65](https://github.com/qrcommunication/gigapdf-lib/issues/65))
+- **`scalePageContent(page, factor)` / `scalePageContentXy(page, sx, sy)` /
+  `scalePageTo(page, w, h)` / `setUserUnit(page, unit)`** — true content scaling
+  (stream + boxes + annotation rects) and `/UserUnit` for large-format pages.
+  ([#68](https://github.com/qrcommunication/gigapdf-lib/issues/68))
+- **`setCollection(config)` / `collection()`** — embedded-file portfolio
+  `/Collection` (view, `/Schema` columns, sort, default file, per-file `/CI`).
+  ([#66](https://github.com/qrcommunication/gigapdf-lib/issues/66))
+- **`setFigureAlt(index, alt)` / `figureCount()`** — per-figure `/Alt` accessible
+  alternate text for Tagged PDF / PDF/UA + PDF/A level-A exports.
+  ([#20](https://github.com/qrcommunication/gigapdf-lib/issues/20))
+
+### Improved (engine, via existing SDK conversion/render methods)
+
+- PDF reading honors **optional-content (OCG/OCMD) visibility** during render
+  ([#54](https://github.com/qrcommunication/gigapdf-lib/issues/54)) and **vertical
+  writing mode** (`Identity-V`, `/W2`/`/DW2`)
+  ([#49](https://github.com/qrcommunication/gigapdf-lib/issues/49)).
+- Office conversions gain document **outline/TOC** (#31), **named-style** lowering
+  (#30), **DOCX drawing** geometry + alt (#40), **super/subscript** (#32),
+  **flat-XML ODF + `.odg`** import (#53) and **table/cell vertical alignment** (#27).
+- CI now validates exports against **ECMA-376 XSD + ODF RelaxNG** schemas (#19).
+
 ## [0.94.0] - 2026-06-25
 
 Issue [#1](https://github.com/qrcommunication/gigapdf-lib/issues/1) — the native
