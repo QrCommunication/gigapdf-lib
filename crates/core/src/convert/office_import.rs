@@ -1200,37 +1200,84 @@ fn docx_table_model(
     let mut col_widths: Vec<f64> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut cur_row: Option<Vec<Cell>> = None;
+    // Height for the row currently being read, from `w:trPr/w:trHeight@w:val`
+    // (twips → points). Reset at every `w:tr`.
+    let mut cur_height: Option<f64> = None;
+    // The model carries one table-wide border. A `w:tblBorders` side seeds it
+    // first; failing that, the first cell `w:tcBorders` edge does (mirrors the
+    // PPTX path). The first declared width wins.
+    let mut border: Option<model::BorderStyle> = None;
+    // Track the relevant `w:tblPr` subtrees so a `w:tblBorders` side is not
+    // confused with an identically-named child elsewhere (e.g. `w:tcBorders`).
+    let mut in_tblpr = false;
+    let mut in_tblborders = false;
+    let mut in_trpr = false;
 
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => {
                 let ln = local(&name);
-                if ln == "gridCol" {
-                    if let Some(w) = attr(&attrs, "w").and_then(twips_to_pt) {
-                        if w > 0.0 {
-                            col_widths.push(w);
+                match ln {
+                    "tblPr" if !sc => in_tblpr = true,
+                    "tblBorders" if in_tblpr && !sc => in_tblborders = true,
+                    // Table border sides (`w:top/left/bottom/right/insideH/
+                    // insideV`). The first side that declares a real width seeds
+                    // the model's single table-wide border.
+                    "top" | "left" | "bottom" | "right" | "insideH" | "insideV"
+                        if in_tblborders =>
+                    {
+                        if border.is_none() {
+                            if let Some(side) = parse_border_side(&attrs) {
+                                border = Some(border_side_to_model(&side));
+                            }
                         }
                     }
-                } else if ln == "tr" && !sc {
-                    cur_row = Some(Vec::new());
-                } else if ln == "tc" && !sc {
-                    let cell = docx_cell_model(x, ctx, resources);
-                    if let (Some(row), Some(cell)) = (cur_row.as_mut(), cell) {
-                        row.push(cell);
+                    "gridCol" => {
+                        if let Some(w) = attr(&attrs, "w").and_then(twips_to_pt) {
+                            if w > 0.0 {
+                                col_widths.push(w);
+                            }
+                        }
                     }
+                    "tr" if !sc => {
+                        cur_row = Some(Vec::new());
+                        cur_height = None;
+                    }
+                    "trPr" if !sc => in_trpr = true,
+                    // Row height `w:trHeight@w:val` (twips → points). Word's
+                    // `hRule` ("atLeast"/"exact") only affects min-vs-fixed; the
+                    // model keeps a single height, so the value carries over.
+                    "trHeight" if in_trpr => {
+                        cur_height = attr(&attrs, "val").and_then(twips_to_pt).or(cur_height);
+                    }
+                    "tc" if !sc => {
+                        let out = docx_cell_model(x, ctx, resources);
+                        if border.is_none() {
+                            border = out.border;
+                        }
+                        if let (Some(row), Some(cell)) = (cur_row.as_mut(), out.cell) {
+                            row.push(cell);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Tok::Close(name) => {
                 let ln = local(&name);
-                if ln == "tr" {
-                    if let Some(cells) = cur_row.take() {
-                        rows.push(Row {
-                            cells,
-                            height: None,
-                        });
+                match ln {
+                    "tblBorders" => in_tblborders = false,
+                    "tblPr" => in_tblpr = false,
+                    "trPr" => in_trpr = false,
+                    "tr" => {
+                        if let Some(cells) = cur_row.take() {
+                            rows.push(Row {
+                                cells,
+                                height: cur_height.take(),
+                            });
+                        }
                     }
-                } else if ln == "tbl" {
-                    break;
+                    "tbl" => break,
+                    _ => {}
                 }
             }
             Tok::Text(_) => {}
@@ -1240,22 +1287,38 @@ fn docx_table_model(
     Table {
         rows,
         col_widths,
-        border: model::BorderStyle::default(),
+        border: border.unwrap_or_default(),
     }
 }
 
-/// Emit one `w:tc` cell (open already consumed) as a model [`Cell`], or `None`
-/// for a vertical-merge continuation (covered by the restart cell above).
-/// `w:gridSpan`→`col_span`, `w:vMerge="restart"`→`row_span = 2`.
+/// One lowered DOCX `w:tc`: the model [`Cell`] (`None` for a vertical-merge
+/// continuation, covered by the restart cell above) plus the border its
+/// `w:tcBorders` declared. The model holds a single table-wide [`BorderStyle`],
+/// so a cell edge is surfaced for the table to seed (mirrors [`PptxCellOut`]); a
+/// continuation cell still surfaces its border.
+struct DocxCellOut {
+    cell: Option<Cell>,
+    border: Option<model::BorderStyle>,
+}
+
+/// Emit one `w:tc` cell (open already consumed) as a [`DocxCellOut`].
+/// `w:gridSpan`→`col_span`, `w:vMerge="restart"`→`row_span = 2`,
+/// `w:tcPr/w:shd@w:fill`→[`Cell::shading`], and the first `w:tcBorders` edge →
+/// the surfaced [`model::BorderStyle`]. Mirrors [`docx_cell`].
 fn docx_cell_model(
     x: &mut Xml,
     ctx: &DocxCtx,
     resources: &mut BTreeMap<u64, model::ImageResource>,
-) -> Option<Cell> {
+) -> DocxCellOut {
     let mut span = CellSpan::default();
     let mut in_tcpr = false;
+    let mut in_tcborders = false;
     let mut blocks: Vec<Block> = Vec::new();
     let mut counters = ListCounters::default();
+    // Cell background `w:tcPr/w:shd@w:fill` (6-hex), and the first `w:tcBorders`
+    // edge that declares a real width (surfaced to seed the table-wide border).
+    let mut shading: Option<[f64; 3]> = None;
+    let mut border: Option<model::BorderStyle> = None;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -1263,6 +1326,16 @@ fn docx_cell_model(
                 let ln = local(&name);
                 match ln {
                     "tcPr" if !sc => in_tcpr = true,
+                    "tcBorders" if in_tcpr && !sc => in_tcborders = true,
+                    // Cell border sides — the first real width seeds the surfaced
+                    // border (the model has no per-cell border slot).
+                    "top" | "left" | "bottom" | "right" | "insideH" | "insideV" if in_tcborders => {
+                        if border.is_none() {
+                            if let Some(side) = parse_border_side(&attrs) {
+                                border = Some(border_side_to_model(&side));
+                            }
+                        }
+                    }
                     "gridSpan" if in_tcpr => {
                         span.grid_span = attr(&attrs, "val")
                             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1272,6 +1345,16 @@ fn docx_cell_model(
                         Some("restart") => span.v_merge_restart = true,
                         _ => span.v_merge_continue = true,
                     },
+                    // Cell shading `w:tcPr/w:shd@w:fill` → background. `auto`/
+                    // missing leaves it unset. Guarded to the cell's own `w:tcPr`
+                    // so a run/paragraph `w:shd` inside the cell never leaks here.
+                    "shd" if in_tcpr => {
+                        if let Some(v) = attr(&attrs, "fill") {
+                            if v != "auto" && is_hex6(v) {
+                                shading = hex_to_rgb_f64(v);
+                            }
+                        }
+                    }
                     "p" if !sc => {
                         docx_paragraph_model(x, ctx, &mut blocks, &mut counters, resources)
                     }
@@ -1287,7 +1370,9 @@ fn docx_cell_model(
             }
             Tok::Close(name) => {
                 let ln = local(&name);
-                if ln == "tcPr" {
+                if ln == "tcBorders" {
+                    in_tcborders = false;
+                } else if ln == "tcPr" {
                     in_tcpr = false;
                 } else if ln == "tc" {
                     break;
@@ -1298,14 +1383,17 @@ fn docx_cell_model(
     }
 
     if span.v_merge_continue {
-        return None;
+        return DocxCellOut { cell: None, border };
     }
-    Some(Cell {
-        blocks,
-        col_span: span.grid_span.max(1).min(u16::MAX as usize) as u16,
-        row_span: if span.v_merge_restart { 2 } else { 1 },
-        shading: None,
-    })
+    DocxCellOut {
+        cell: Some(Cell {
+            blocks,
+            col_span: span.grid_span.max(1).min(u16::MAX as usize) as u16,
+            row_span: if span.v_merge_restart { 2 } else { 1 },
+            shading,
+        }),
+        border,
+    }
 }
 
 // ─────────────────────────────── XLSX → model ─────────────────────────────────
@@ -5460,6 +5548,24 @@ fn parse_border_side(attrs: &[(String, String)]) -> Option<BorderSide> {
         style: border_val_to_css(val),
         color,
     })
+}
+
+/// Reduce a parsed [`BorderSide`] to the model's single [`model::BorderStyle`]
+/// (`width` in points + RGB `color`). The model carries one table-wide border —
+/// no per-side, no line-style — so only the width and colour survive; an unset
+/// or `auto` colour defaults to black, mirroring the export side
+/// (`export_model::docx_tbl_borders`, which writes `w:sz = width*8` eighths and
+/// `hex(color)`).
+fn border_side_to_model(side: &BorderSide) -> model::BorderStyle {
+    let color = side
+        .color
+        .as_deref()
+        .and_then(hex_to_rgb_f64)
+        .unwrap_or([0.0, 0.0, 0.0]);
+    model::BorderStyle {
+        width: side.width_pt,
+        color,
+    }
 }
 
 /// Map a `w:pBdr` side's `w:val` line style to the nearest CSS border-style
@@ -14170,6 +14276,138 @@ mod tests {
             })
             .expect("the 'shaded' run");
         assert_eq!(run.style.background, Some([0.0, 1.0, 0.0]));
+    }
+
+    /// The first `BlockKind::Table` block of a lowered model document.
+    fn docx_model_first_table(doc: &Document) -> &Table {
+        doc.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a Table block in the model")
+    }
+
+    #[test]
+    fn docx_model_paragraph_alignment_indent_spacing_lowered() {
+        // `w:pPr` alignment (`w:jc`), spacing (`w:spacing`) and indentation
+        // (`w:ind`) lower to the model's `ParagraphStyle` (twips → points).
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:jc w:val="center"/>
+        <w:spacing w:before="240" w:after="120"/>
+        <w:ind w:left="720" w:right="360" w:firstLine="240"/>
+      </w:pPr>
+      <w:r><w:t>Centered</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let para = model.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("a Paragraph block");
+        let s = &para.style;
+        assert_eq!(s.align, MAlign::Center, "w:jc center → Align::Center");
+        // 240 twips = 12pt, 120 = 6pt, 720 = 36pt, 360 = 18pt.
+        assert!((s.space_before_pt - 12.0).abs() < 1e-6, "before: {s:?}");
+        assert!((s.space_after_pt - 6.0).abs() < 1e-6, "after: {s:?}");
+        assert!((s.indent_left_pt - 36.0).abs() < 1e-6, "left: {s:?}");
+        assert!((s.indent_right_pt - 18.0).abs() < 1e-6, "right: {s:?}");
+        assert!((s.first_line_pt - 12.0).abs() < 1e-6, "firstLine: {s:?}");
+    }
+
+    #[test]
+    fn docx_model_table_borders_shading_height_and_span_lowered() {
+        // `w:tblBorders` → the table-wide BorderStyle; `w:tcPr/w:shd@w:fill` →
+        // Cell.shading; `w:trPr/w:trHeight` → Row.height; `w:gridSpan` →
+        // Cell.col_span. (`w:vAlign` has no model slot — see the issue note.)
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="8" w:color="FF0000"/>
+          <w:left w:val="single" w:sz="8" w:color="FF0000"/>
+          <w:bottom w:val="single" w:sz="8" w:color="FF0000"/>
+          <w:right w:val="single" w:sz="8" w:color="FF0000"/>
+        </w:tblBorders>
+      </w:tblPr>
+      <w:tblGrid><w:gridCol w:w="2880"/><w:gridCol w:w="2880"/></w:tblGrid>
+      <w:tr>
+        <w:trPr><w:trHeight w:val="480"/></w:trPr>
+        <w:tc>
+          <w:tcPr>
+            <w:gridSpan w:val="2"/>
+            <w:shd w:val="clear" w:color="auto" w:fill="00FF00"/>
+            <w:vAlign w:val="center"/>
+          </w:tcPr>
+          <w:p><w:r><w:t>Wide</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let table = docx_model_first_table(&model);
+
+        // Border: w:sz="8" eighths = 1pt, colour red.
+        assert!((table.border.width - 1.0).abs() < 1e-6, "border 1pt");
+        assert_eq!(table.border.color, [1.0, 0.0, 0.0], "border red");
+
+        // Row height: 480 twips = 24pt.
+        let row = &table.rows[0];
+        let h = row.height.expect("row height set");
+        assert!((h - 24.0).abs() < 1e-6, "row height 24pt, got {h}");
+
+        // Cell shading 00FF00 (green) and a 2-column grid span.
+        let cell = &row.cells[0];
+        assert_eq!(cell.shading, Some([0.0, 1.0, 0.0]), "cell shading green");
+        assert_eq!(cell.col_span, 2, "gridSpan=2 → col_span");
+    }
+
+    #[test]
+    fn docx_model_cell_borders_seed_table_border() {
+        // With no `w:tblBorders`, the first `w:tcBorders` edge seeds the model's
+        // single table-wide BorderStyle (mirrors the PPTX cell-edge path).
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:tbl>
+      <w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid>
+      <w:tr><w:tc>
+        <w:tcPr>
+          <w:tcBorders>
+            <w:top w:val="single" w:sz="16" w:color="0000FF"/>
+          </w:tcBorders>
+        </w:tcPr>
+        <w:p><w:r><w:t>Boxed</w:t></w:r></w:p>
+      </w:tc></w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let table = docx_model_first_table(&model);
+        // w:sz="16" eighths = 2pt, colour blue, taken from the cell edge.
+        assert!(
+            (table.border.width - 2.0).abs() < 1e-6,
+            "border 2pt from tcBorders"
+        );
+        assert_eq!(
+            table.border.color,
+            [0.0, 0.0, 1.0],
+            "border blue from tcBorders"
+        );
     }
 
     // ── ODF → model (links / strike / highlight / inline images / formulas / groups) ──
