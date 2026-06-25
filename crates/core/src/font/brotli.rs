@@ -1215,6 +1215,7 @@ static TRANSFORMS: [Transform; 121] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::font::brotli_test_vectors as test_vectors;
 
     fn dec(v: &[u8]) -> Vec<u8> {
         decompress(v).expect("brotli decode")
@@ -1230,24 +1231,24 @@ mod tests {
     #[test]
     fn empty_stream() {
         // brotli of b"" — a single last-empty meta-block.
-        assert_eq!(dec(&super::test_vectors::BR_EMPTY), b"");
+        assert_eq!(dec(&test_vectors::BR_EMPTY), b"");
     }
 
     #[test]
     fn hello() {
-        assert_eq!(dec(&super::test_vectors::BR_HELLO), b"Hello");
+        assert_eq!(dec(&test_vectors::BR_HELLO), b"Hello");
     }
 
     #[test]
     fn long_with_backrefs() {
         let expected = b"The quick brown brown brown fox jumps over the lazy dog. ".repeat(4);
-        assert_eq!(dec(&super::test_vectors::BR_LONG), expected);
+        assert_eq!(dec(&test_vectors::BR_LONG), expected);
     }
 
     #[test]
     fn dictionary_reference() {
         assert_eq!(
-            dec(&super::test_vectors::BR_DICT),
+            dec(&test_vectors::BR_DICT),
             b"the time of day and the information about the world"
         );
     }
@@ -1264,7 +1265,7 @@ mod tests {
     /// literal-context tables.
     #[test]
     fn roundtrip_oracle_vectors() {
-        for (i, (compressed, expected)) in super::test_vectors::ROUNDTRIP.iter().enumerate() {
+        for (i, (compressed, expected)) in test_vectors::ROUNDTRIP.iter().enumerate() {
             let out = decompress(compressed).unwrap_or_else(|| panic!("vector #{i}: decode error"));
             assert_eq!(out.as_slice(), *expected, "vector #{i} mismatch");
         }
@@ -1280,11 +1281,4 @@ mod tests {
         // Ferment-first + space
         assert_eq!(apply_transform(4, b"word").unwrap(), b"Word ");
     }
-}
-
-/// Test-only fixtures (real brotli streams produced by the reference encoder),
-/// kept in a child module so they are compiled only under `cfg(test)`.
-#[cfg(test)]
-mod test_vectors {
-    include!("brotli_test_vectors.rs");
 }

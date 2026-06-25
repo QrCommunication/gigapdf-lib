@@ -23,6 +23,7 @@ mod brotli_dict;
 mod brotli_tables;
 #[cfg(test)]
 mod brotli_test_vectors;
+pub mod webfont;
 
 /// A glyph outline source: an embedded TrueType (`/FontFile2`) or CFF
 /// (`/FontFile3`) program. Both expose the same outline interface so the
