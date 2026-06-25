@@ -35,12 +35,24 @@ PDF → X:  PDF ──► model ──► file  (pdf.toDocx() etc. — reconstru
 | **ODS** | Good | cell values, formulas (text), multiple sheets, per-cell **superscript/subscript** (`style:text-position` → `CharStyle.vertical_align`), **document metadata** (`meta.xml`) | merges, number formats, fills, column widths |
 | **PPTX** | Good | slides, text boxes, shapes (geometry + rotation + groups), runs (bold/italic/colour), **superscript/subscript** (`a:rPr@baseline` per-mille: `>0` super, `<0` sub → `CharStyle.vertical_align`), images, charts→table of cached data, SmartArt→bullet list, **document metadata** (`docProps/core.xml`) | underline/strike/highlight, paragraph align/indent, lists-as-lists, run hyperlinks, **animations/transitions**, **speaker notes**, non-text autoshapes |
 | **ODP** | Good | slides, text boxes, shapes (pos + groups), runs (full char styling), images, **document metadata** (`meta.xml`) | shape rotation, charts/SmartArt, animations, speaker notes, paragraph props |
+| **ODG** | Good | OpenDocument **Graphics** (mimetype `…opendocument.graphics`); each `draw:page` of shapes is lowered through the **same slide/drawing path as ODP** — one model slide per drawing page, positioned `draw:frame`s → shapes (geometry from `svg:x/y/width/height`), text boxes → placeholders, images, page/master fill → slide background | same drops as ODP (shape rotation beyond the ODP set, charts, animations, layered connector/curve geometry) |
 | **DOC / XLS / PPT** (legacy OLE2) | **Text only** | flat plain text (largest stream, UTF‑16/ASCII) | **everything else** — styling, tables, sheets, slides, images, structure. A real binary reader is needed (tracked) |
 | **Markdown** | Good | ATX headings, bold/italic/code, links, ordered/unordered nested lists, GFM tables, fenced code, blockquotes, HR | strikethrough `~~`, images `![]()`, task-lists, reference/footnote links, setext headings, inline HTML (pass through as text) |
 | **CSV** | Full | quoting/escaping (RFC 4180), embedded delimiters/newlines, BOM, delimiter auto-detect, ragged rows padded | type inference (all cells are text), multi-sheet (CSV has none) |
 | **RTF → PDF** | Rich | full char/para formatting, fonts, colours, tables, PNG/JPEG pictures | hyperlinks, WMF/EMF/BMP pictures, nested tables |
 | **RTF → model** | **Text only** | plain paragraphs (uses the text parser, not the rich one — tracked) | all styling/tables/images/links |
 | **HTML** | — | see [HTML-CSS.md](HTML-CSS.md) for the full HTML/CSS feature surface | — |
+
+> **Flat (single-file) ODF** — `.fodt` / `.fods` / `.fodp` / `.fodg` are also
+> importable. These are one **uncompressed** `<office:document>` XML (inline
+> `office:meta` + `office:styles` + `office:automatic-styles` + `office:body`)
+> rather than a ZIP of parts. They are detected by the XML root element (and the
+> `office:mimetype` attribute, falling back to the `office:body` child:
+> `office:text` / `office:spreadsheet` / `office:presentation` / `office:drawing`)
+> and routed through the **same** ODT/ODS/ODP/ODG lowering — fidelity is identical
+> to the zipped form. Likewise `.odg` (zipped graphics) reuses the ODP path. No new
+> API: the existing `office_to_model` / `office_to_pdf` / `office_needed_fonts`
+> entry points accept these inputs unchanged.
 
 ### Document metadata
 

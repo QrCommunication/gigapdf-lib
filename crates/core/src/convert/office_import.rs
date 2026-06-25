@@ -141,17 +141,24 @@ pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
         Some(pptx_to_pdf(&zip))
     } else if zip.contains_key("xl/workbook.xml") {
         Some(xlsx_to_pdf(&zip))
-    } else if let Some(mimetype) = zip.get("mimetype") {
-        let mt = String::from_utf8_lossy(mimetype);
-        if mt.contains("opendocument.text") {
-            Some(odt_to_pdf(&zip))
-        } else if mt.contains("opendocument.spreadsheet") {
-            Some(ods_to_pdf(&zip))
-        } else if mt.contains("opendocument.presentation") {
-            Some(odp_to_pdf(&zip))
-        } else {
-            None
-        }
+    } else if let Some(kind) = zip
+        .get("mimetype")
+        .and_then(|m| odf_kind(&String::from_utf8_lossy(m)))
+    {
+        Some(match kind {
+            OdfKind::Text => odt_to_pdf(&zip),
+            OdfKind::Spreadsheet => ods_to_pdf(&zip),
+            // `.odg` drawing pages render through the `.odp` slide path.
+            OdfKind::Presentation | OdfKind::Drawing => odp_to_pdf(&zip),
+        })
+    } else if let Some((kind, parts)) = flat_odf_parts(bytes) {
+        // Flat single-file ODF (`.fodt`/`.fods`/`.fodp`/`.fodg`): part map aliases
+        // the one document, then the existing exporters run unchanged.
+        Some(match kind {
+            OdfKind::Text => odt_to_pdf(&parts),
+            OdfKind::Spreadsheet => ods_to_pdf(&parts),
+            OdfKind::Presentation | OdfKind::Drawing => odp_to_pdf(&parts),
+        })
     } else {
         None
     }
@@ -182,17 +189,21 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
         Some(pptx_to_pdf_with(&zip, host))
     } else if zip.contains_key("xl/workbook.xml") {
         Some(xlsx_to_pdf_with(&zip, host))
-    } else if let Some(mimetype) = zip.get("mimetype") {
-        let mt = String::from_utf8_lossy(mimetype);
-        if mt.contains("opendocument.text") {
-            Some(odt_to_pdf_with(&zip, host))
-        } else if mt.contains("opendocument.spreadsheet") {
-            Some(ods_to_pdf_with(&zip, host))
-        } else if mt.contains("opendocument.presentation") {
-            Some(odp_to_pdf_with(&zip, host))
-        } else {
-            None
-        }
+    } else if let Some(kind) = zip
+        .get("mimetype")
+        .and_then(|m| odf_kind(&String::from_utf8_lossy(m)))
+    {
+        Some(match kind {
+            OdfKind::Text => odt_to_pdf_with(&zip, host),
+            OdfKind::Spreadsheet => ods_to_pdf_with(&zip, host),
+            OdfKind::Presentation | OdfKind::Drawing => odp_to_pdf_with(&zip, host),
+        })
+    } else if let Some((kind, parts)) = flat_odf_parts(bytes) {
+        Some(match kind {
+            OdfKind::Text => odt_to_pdf_with(&parts, host),
+            OdfKind::Spreadsheet => ods_to_pdf_with(&parts, host),
+            OdfKind::Presentation | OdfKind::Drawing => odp_to_pdf_with(&parts, host),
+        })
     } else {
         None
     }
@@ -448,20 +459,134 @@ pub fn office_to_model(bytes: &[u8]) -> Option<Document> {
         Some(pptx_to_model(&zip))
     } else if zip.contains_key("xl/workbook.xml") {
         Some(xlsx_to_model(&zip))
-    } else if let Some(mimetype) = zip.get("mimetype") {
-        let mt = String::from_utf8_lossy(mimetype);
-        if mt.contains("opendocument.text") {
-            Some(odt_to_model(&zip))
-        } else if mt.contains("opendocument.spreadsheet") {
-            Some(ods_to_model(&zip))
-        } else if mt.contains("opendocument.presentation") {
-            Some(odp_to_model(&zip))
-        } else {
-            None
-        }
+    } else if let Some(kind) = zip
+        .get("mimetype")
+        .and_then(|m| odf_kind(&String::from_utf8_lossy(m)))
+    {
+        Some(match kind {
+            OdfKind::Text => odt_to_model(&zip),
+            OdfKind::Spreadsheet => ods_to_model(&zip),
+            // `.odp` and `.odg` share the slide/drawing lowering: a drawing's
+            // `draw:page`s are walked by `odp_to_model` exactly like presentation
+            // pages (it dispatches on `draw:page`, not the body element).
+            OdfKind::Presentation | OdfKind::Drawing => odp_to_model(&zip),
+        })
+    } else if let Some((kind, parts)) = flat_odf_parts(bytes) {
+        // Flat single-file ODF (`.fodt`/`.fods`/`.fodp`/`.fodg`): the body, styles
+        // and metadata all live in the one `<office:document>` document. Synthesize
+        // a part map pointing each ODF part name at that document so the EXISTING
+        // builders read their subtrees unchanged.
+        Some(match kind {
+            OdfKind::Text => odt_to_model(&parts),
+            OdfKind::Spreadsheet => ods_to_model(&parts),
+            OdfKind::Presentation | OdfKind::Drawing => odp_to_model(&parts),
+        })
     } else {
         None
     }
+}
+
+/// The four ODF document classes the importer lowers. `Drawing` (`.odg`) reuses
+/// the presentation (`.odp`) slide/shape lowering — its `draw:page`s map to
+/// slides — so it never needs its own walker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OdfKind {
+    Text,
+    Spreadsheet,
+    Presentation,
+    Drawing,
+}
+
+/// Classify an ODF `mimetype` marker (zip member, or the flat root's
+/// `office:mimetype` attribute) into an [`OdfKind`]. Substring match so the full
+/// `application/vnd.oasis.opendocument.*` (and its `-template` variants) all map.
+fn odf_kind(mimetype: &str) -> Option<OdfKind> {
+    if mimetype.contains("opendocument.text") {
+        Some(OdfKind::Text)
+    } else if mimetype.contains("opendocument.spreadsheet") {
+        Some(OdfKind::Spreadsheet)
+    } else if mimetype.contains("opendocument.presentation") {
+        Some(OdfKind::Presentation)
+    } else if mimetype.contains("opendocument.graphics") {
+        Some(OdfKind::Drawing)
+    } else {
+        None
+    }
+}
+
+/// Detect a **flat** (single-file, uncompressed) ODF document — `.fodt`/`.fods`/
+/// `.fodp`/`.fodg`, whose whole content is one `<office:document …>` XML with
+/// inline `office:meta` + `office:styles` + `office:automatic-styles` +
+/// `office:body` instead of a ZIP of parts — and return its [`OdfKind`] plus a
+/// part map that feeds the *existing* zipped-ODF builders.
+///
+/// `read_zip` yields an empty map for a non-ZIP input, so a flat doc only reaches
+/// here after the OOXML/ODF-zip dispatch misses. The kind is taken from the root
+/// `office:mimetype` attribute when present, else inferred from the first
+/// `office:body` child (`office:text`/`office:spreadsheet`/`office:presentation`/
+/// `office:drawing`). The returned map points `content.xml`, `styles.xml` and
+/// `meta.xml` all at the single document: each builder parses `content.xml` for
+/// the body + automatic styles, `styles.xml` for the named/master styles and
+/// `meta.xml` for `office:meta` — every subtree resolves against the one source,
+/// so the lowering logic is reused verbatim (no flat-specific parser). Returns
+/// `None` (no panic) when the bytes are not a flat ODF root or the class is
+/// unknown.
+fn flat_odf_parts(bytes: &[u8]) -> Option<(OdfKind, BTreeMap<String, Vec<u8>>)> {
+    let src = String::from_utf8_lossy(bytes);
+    let mut x = Xml::new(&src);
+    // Find the root `<office:document …>` open tag (local name `document`). Skip
+    // any leading non-element tokens; bail as soon as a different element opens
+    // first (this is not a flat ODF file).
+    let root_attrs = loop {
+        match x.next()? {
+            Tok::Open(name, attrs, _) if local(&name) == "document" => break attrs,
+            Tok::Open(..) | Tok::Close(_) => return None,
+            Tok::Text(_) => {}
+        }
+    };
+
+    // Prefer the explicit `office:mimetype` attribute on the root.
+    if let Some(kind) = attr(&root_attrs, "mimetype").and_then(odf_kind) {
+        return Some((kind, flat_parts(kind, bytes)));
+    }
+
+    // Otherwise infer from the first body child element. The `office:body`
+    // wrapper (local `body`) is descended into; its child names the class.
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, _, _) = tok {
+            let kind = match local(&name) {
+                "text" => OdfKind::Text,
+                "spreadsheet" => OdfKind::Spreadsheet,
+                "presentation" => OdfKind::Presentation,
+                "drawing" => OdfKind::Drawing,
+                // `office:body` is just the container; keep scanning for its child.
+                "body" => continue,
+                _ => continue,
+            };
+            return Some((kind, flat_parts(kind, bytes)));
+        }
+    }
+    None
+}
+
+/// Build the part map for a flat ODF document: `content.xml`, `styles.xml` and
+/// `meta.xml` all alias the single document's bytes (see [`flat_odf_parts`]). A
+/// synthetic `mimetype` member is added so the mimetype-keyed dispatch
+/// ([`office_body_html`]) classifies the parts exactly like a zipped ODF; the
+/// builders themselves never read `mimetype`.
+fn flat_parts(kind: OdfKind, bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let mimetype = match kind {
+        OdfKind::Text => "application/vnd.oasis.opendocument.text",
+        OdfKind::Spreadsheet => "application/vnd.oasis.opendocument.spreadsheet",
+        OdfKind::Presentation => "application/vnd.oasis.opendocument.presentation",
+        OdfKind::Drawing => "application/vnd.oasis.opendocument.graphics",
+    };
+    let mut parts = BTreeMap::new();
+    parts.insert("content.xml".to_string(), bytes.to_vec());
+    parts.insert("styles.xml".to_string(), bytes.to_vec());
+    parts.insert("meta.xml".to_string(), bytes.to_vec());
+    parts.insert("mimetype".to_string(), mimetype.as_bytes().to_vec());
+    parts
 }
 
 // ───────────────────────────────── document metadata ─────────────────────────
@@ -5732,11 +5857,18 @@ pub fn office_needed_fonts(bytes: &[u8]) -> Option<Vec<FontRequest>> {
     if bytes.len() >= 8 && bytes[..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
         return Some(Vec::new());
     }
+    // A flat single-file ODF isn't a ZIP; alias its parts so the same body/font
+    // scan applies. Real archives use the read parts directly.
     let zip = read_zip(bytes);
+    let parts = if office_body_html(&zip).is_some() {
+        zip
+    } else {
+        flat_odf_parts(bytes).map(|(_, parts)| parts)?
+    };
     // Render to HTML once (per format) and ask the HTML engine which families it
     // references; then drop the ones the container already embeds.
-    let body = office_body_html(&zip)?;
-    let embedded: Vec<String> = extract_embedded_fonts(&zip)
+    let body = office_body_html(&parts)?;
+    let embedded: Vec<String> = extract_embedded_fonts(&parts)
         .iter()
         .map(|f| f.family.to_ascii_lowercase())
         .collect();
@@ -5749,7 +5881,8 @@ pub fn office_needed_fonts(bytes: &[u8]) -> Option<Vec<FontRequest>> {
 
 /// Build just the HTML `<body>` content for a recognized container (no render),
 /// reusing each format's mapper. Shared by [`office_needed_fonts`] so the font
-/// scan sees exactly the families the real render would.
+/// scan sees exactly the families the real render would. Accepts a real read
+/// archive or the aliased part map of a flat ODF document.
 fn office_body_html(zip: &BTreeMap<String, Vec<u8>>) -> Option<String> {
     if zip.contains_key("word/document.xml") {
         Some(docx_body_html(zip))
@@ -5757,19 +5890,15 @@ fn office_body_html(zip: &BTreeMap<String, Vec<u8>>) -> Option<String> {
         Some(pptx_body_html(zip))
     } else if zip.contains_key("xl/workbook.xml") {
         Some(xlsx_body_html(zip))
-    } else if let Some(mimetype) = zip.get("mimetype") {
-        let mt = String::from_utf8_lossy(mimetype);
-        if mt.contains("opendocument.text") {
-            Some(odt_body_html(zip))
-        } else if mt.contains("opendocument.spreadsheet") {
-            Some(ods_body_html(zip))
-        } else if mt.contains("opendocument.presentation") {
-            Some(odp_body_html(zip))
-        } else {
-            None
-        }
     } else {
-        None
+        zip.get("mimetype")
+            .and_then(|m| odf_kind(&String::from_utf8_lossy(m)))
+            .map(|kind| match kind {
+                OdfKind::Text => odt_body_html(zip),
+                OdfKind::Spreadsheet => ods_body_html(zip),
+                // `.odg` drawing pages share the `.odp` slide HTML body.
+                OdfKind::Presentation | OdfKind::Drawing => odp_body_html(zip),
+            })
     }
 }
 
@@ -18188,5 +18317,251 @@ mod tests {
             "",
         );
         assert!(slide.background.is_none(), "fill=none → no background");
+    }
+
+    // ── flat-XML ODF (.fodt/.fods/.fodp/.fodg) + .odg drawings (issue #53) ──
+
+    /// Wrap an `office:body` + optional automatic styles in a flat
+    /// `<office:document>` root carrying `office:mimetype`. This is the single
+    /// uncompressed XML file that `.fodt`/`.fods`/`.fodp`/`.fodg` actually are.
+    fn flat_odf_doc(mimetype: &str, automatic_styles: &str, body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document
+  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+  xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+  xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+  office:version="1.3" office:mimetype="{mimetype}">
+  <office:automatic-styles>{automatic_styles}</office:automatic-styles>
+  <office:body>{body}</office:body>
+</office:document>"#
+        )
+    }
+
+    /// A flat ODF document lowers to **the same model** the zipped form does: the
+    /// flat path only aliases `content.xml`/`styles.xml`/`meta.xml` at the one
+    /// document and runs the existing `odt_to_model` unchanged. Proven by feeding
+    /// the *identical* flat bytes through a real ODT zip and asserting equality.
+    #[test]
+    fn flat_fodt_imports_same_model_as_zipped_odt() {
+        let body = r#"<office:text>
+            <text:p>Hello <text:span text:style-name="Strong">flat ODF</text:span></text:p>
+          </office:text>"#;
+        let styles = r#"<style:style style:name="Strong" style:family="text">
+            <style:text-properties fo:font-weight="bold"/>
+          </style:style>"#;
+        let flat = flat_odf_doc("application/vnd.oasis.opendocument.text", styles, body);
+
+        // Flat single-file import.
+        let from_flat = office_to_model(flat.as_bytes()).expect("flat .fodt → model");
+
+        // Same bytes packed as a zipped ODT (content.xml + styles.xml alias the
+        // one document, exactly like the flat part map).
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.text");
+        z.add_stored("content.xml", flat.as_bytes());
+        z.add_stored("styles.xml", flat.as_bytes());
+        z.add_stored("meta.xml", flat.as_bytes());
+        let from_zip = office_to_model(&z.finish()).expect("zipped .odt → model");
+
+        assert_eq!(from_flat, from_zip, "flat ODF reuses the zipped lowering");
+
+        // And it actually carried the paragraph (not an empty doc): full text
+        // present, and the spanned run picked up `bold` from the inline
+        // `office:styles` — proving styles.xml resolves against the one document.
+        let runs: Vec<&InlineRun> = match &from_flat.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Paragraph(p) => p
+                .runs
+                .iter()
+                .filter_map(|i| match i {
+                    Inline::Run(r) => Some(r),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected a Paragraph, got {other:?}"),
+        };
+        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "Hello flat ODF");
+        assert!(
+            runs.iter()
+                .any(|r| r.text.contains("flat ODF") && r.style.bold),
+            "spanned run is bold from the inline office:styles"
+        );
+    }
+
+    /// A flat `.fods` spreadsheet imports to a `BlockKind::Sheet` with typed cells.
+    #[test]
+    fn flat_fods_imports_spreadsheet() {
+        let body = r#"<office:spreadsheet>
+            <table:table table:name="Flat">
+              <table:table-row>
+                <table:table-cell office:value-type="float" office:value="42"><text:p>42</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+          </office:spreadsheet>"#;
+        let flat = flat_odf_doc("application/vnd.oasis.opendocument.spreadsheet", "", body);
+        let model = office_to_model(flat.as_bytes()).expect("flat .fods → model");
+        let sheet = match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Sheet(sb) => &sb.sheets[0],
+            other => panic!("expected a Sheet block, got {other:?}"),
+        };
+        assert_eq!(sheet.name, "Flat");
+        assert_eq!(sheet.rows[0].cells[0].value, model::CellValue::Number(42.0));
+    }
+
+    /// A flat `.fodp` presentation imports to a `BlockKind::Slide`, one slide per
+    /// `draw:page`, with its paragraph text captured as a placeholder.
+    #[test]
+    fn flat_fodp_imports_presentation() {
+        let body = r#"<office:presentation>
+            <draw:page draw:name="p1">
+              <draw:frame><draw:text-box><text:p>Flat slide one</text:p></draw:text-box></draw:frame>
+            </draw:page>
+          </office:presentation>"#;
+        let flat = flat_odf_doc("application/vnd.oasis.opendocument.presentation", "", body);
+        let model = office_to_model(flat.as_bytes()).expect("flat .fodp → model");
+        let slides = match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Slide(sb) => &sb.slides,
+            other => panic!("expected a Slide block, got {other:?}"),
+        };
+        assert_eq!(slides.len(), 1, "one slide per draw:page");
+        let text: String = slides[0]
+            .placeholders
+            .iter()
+            .filter_map(|ph| match &ph.block.kind {
+                BlockKind::Paragraph(p) => Some(
+                    p.runs
+                        .iter()
+                        .filter_map(|i| match i {
+                            Inline::Run(r) => Some(r.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(norm(&text), "Flat slide one");
+    }
+
+    /// When the flat root omits `office:mimetype`, the class is inferred from the
+    /// `office:body` child element (here `office:spreadsheet`).
+    #[test]
+    fn flat_odf_class_inferred_from_body_child_without_mimetype() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document
+  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  office:version="1.3">
+  <office:body><office:spreadsheet>
+    <table:table table:name="NoMime">
+      <table:table-row>
+        <table:table-cell office:value-type="float" office:value="7"><text:p>7</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document>"#;
+        let model = office_to_model(xml.as_bytes()).expect("flat ODF inferred by body child");
+        match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Sheet(sb) => {
+                assert_eq!(
+                    sb.sheets[0].rows[0].cells[0].value,
+                    model::CellValue::Number(7.0)
+                )
+            }
+            other => panic!("expected a Sheet block, got {other:?}"),
+        }
+    }
+
+    /// An `.odg` drawing (a normal ODF ZIP, `…graphics` mimetype) imports through
+    /// the slide/drawing lowering: each `draw:page` → a slide, its positioned
+    /// `draw:frame` → a shape with geometry.
+    #[test]
+    fn odg_drawing_imports_as_slide_with_shape() {
+        let content = r#"<office:document-content
+  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0">
+  <office:body><office:drawing>
+    <draw:page draw:name="page1">
+      <draw:frame svg:x="2cm" svg:y="3cm" svg:width="5cm" svg:height="4cm">
+        <draw:text-box><text:p>Shape on a drawing page</text:p></draw:text-box>
+      </draw:frame>
+    </draw:page>
+  </office:drawing></office:body>
+</office:document-content>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.graphics");
+        z.add_stored("content.xml", content.as_bytes());
+        let model = office_to_model(&z.finish()).expect(".odg → model");
+        let slides = match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Slide(sb) => &sb.slides,
+            other => panic!("expected a Slide block, got {other:?}"),
+        };
+        assert_eq!(slides.len(), 1, "one slide per draw:page");
+        assert!(
+            !slides[0].shapes.is_empty(),
+            "the positioned draw:frame became a shape"
+        );
+        // `.odg` also renders to a PDF (drawing pages reuse the .odp path).
+        assert!(
+            office_to_pdf(&{
+                let mut z = ZipWriter::new();
+                z.add_stored("mimetype", b"application/vnd.oasis.opendocument.graphics");
+                z.add_stored("content.xml", content.as_bytes());
+                z.finish()
+            })
+            .is_some(),
+            ".odg renders to a PDF"
+        );
+    }
+
+    /// A flat `.fodg` graphics document (single XML) imports through the same
+    /// drawing→slide path once flat detection is in place.
+    #[test]
+    fn flat_fodg_imports_drawing() {
+        let body = r#"<office:drawing>
+            <draw:page draw:name="g1">
+              <draw:frame svg:x="1cm" svg:y="1cm" svg:width="3cm" svg:height="2cm">
+                <draw:text-box><text:p>Flat drawing</text:p></draw:text-box>
+              </draw:frame>
+            </draw:page>
+          </office:drawing>"#;
+        let flat = flat_odf_doc("application/vnd.oasis.opendocument.graphics", "", body);
+        let model = office_to_model(flat.as_bytes()).expect("flat .fodg → model");
+        match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Slide(sb) => assert_eq!(sb.slides.len(), 1, "one slide per draw:page"),
+            other => panic!("expected a Slide block, got {other:?}"),
+        }
+    }
+
+    /// A malformed / non-ODF input degrades to `None` without panicking: bytes
+    /// whose first element is not the `office:document` root, an empty input, and
+    /// a truncated flat root are all rejected gracefully.
+    #[test]
+    fn malformed_flat_odf_returns_none_without_panic() {
+        // Not a flat ODF root (different first element).
+        assert!(office_to_model(b"<html><body>nope</body></html>").is_none());
+        // Plain text / random bytes.
+        assert!(office_to_model(b"not xml at all").is_none());
+        assert!(office_to_model(b"").is_none());
+        // A flat root whose class is unknown (no mimetype, unrecognised body).
+        let unknown = r#"<office:document
+  xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0">
+  <office:body><office:chart/></office:body>
+</office:document>"#;
+        assert!(office_to_model(unknown.as_bytes()).is_none());
+        // A truncated flat document (root open tag, no body) — must not panic.
+        let truncated =
+            r#"<office:document office:mimetype="application/vnd.oasis.opendocument.text""#;
+        let _ = office_to_model(truncated.as_bytes());
+        // The font-scan entry point is equally graceful on the same inputs.
+        assert!(office_needed_fonts(b"<html></html>").is_none());
     }
 }
