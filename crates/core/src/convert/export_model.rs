@@ -1742,6 +1742,19 @@ fn pptx_slide_from_model(
                 ));
                 id += 1;
             }
+            BlockKind::Table(table) => {
+                // A real DrawingML table (`a:tbl`) inside a `p:graphicFrame`,
+                // not a paragraph flatten (#26). Default the frame to the slide
+                // box when the block is unplaced.
+                let r = sh.frame.unwrap_or(crate::model::Rect::new(
+                    0.0,
+                    0.0,
+                    slide.geometry.width,
+                    slide.geometry.height,
+                ));
+                tree.push_str(&pptx_table_frame(table, r, id));
+                id += 1;
+            }
             _ => {
                 let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
                 let body = pptx_text_body(&block_to_paras(sh));
@@ -1791,6 +1804,136 @@ fn pptx_text_body(paras: &[Paragraph]) -> String {
     }
     body.push_str("</p:txBody>");
     body
+}
+
+/// A DrawingML `<a:txBody>` (the in-`a:tc` text body), as opposed to the
+/// presentationml `<p:txBody>` used for shapes. Reuses [`pptx_paragraph`]
+/// (which already emits `a:p`/`a:r`); only the wrapper element namespace differs.
+fn dml_text_body(paras: &[Paragraph]) -> String {
+    let mut body = String::from("<a:txBody><a:bodyPr/><a:lstStyle/>");
+    if paras.is_empty() {
+        body.push_str("<a:p/>");
+    }
+    for p in paras {
+        body.push_str(&pptx_paragraph(p));
+    }
+    body.push_str("</a:txBody>");
+    body
+}
+
+/// URI identifying the DrawingML table payload of an `<a:graphicData>`
+/// (ECMA-376 §21.1.3 — `a:tbl` lives under this `uri`).
+const DML_TABLE_URI: &str = "http://schemas.openxmlformats.org/drawingml/2006/table";
+
+/// Emit a slide table as a `<p:graphicFrame>` containing a DrawingML `<a:tbl>`
+/// (ECMA-376 §21.1.3), placed by `frame` like the other slide shapes.
+///
+/// Reuses the shared table lowering ([`table_col_count`] / [`docx_col_widths`])
+/// and the DrawingML run formatting ([`dml_text_body`] → [`pptx_paragraph`]),
+/// so the cell text and styling match the DOCX/ODT path rather than duplicating
+/// it. Spans are expressed the DrawingML way: a spanning `<a:tc>` carries
+/// `gridSpan`/`rowSpan`, and every covered grid position still emits an
+/// `<a:tc>` flagged `hMerge="1"` (horizontal) or `vMerge="1"` (vertical) so the
+/// grid stays rectangular (PowerPoint requires a cell at every position).
+fn pptx_table_frame(table: &Table, frame: crate::model::Rect, id: usize) -> String {
+    let cols = table_col_count(table).max(1);
+    let widths = docx_col_widths(table, cols);
+
+    // Column grid (widths in EMU).
+    let mut grid = String::from("<a:tblGrid>");
+    for w in &widths {
+        grid.push_str(&format!("<a:gridCol w=\"{}\"/>", emu(*w)));
+    }
+    grid.push_str("</a:tblGrid>");
+
+    // Vertical-merge bookkeeping: while >1, that physical column is covered by a
+    // `rowSpan` cell from a row above and needs a `vMerge="1"` continuation here.
+    let mut vmerge_left = vec![0usize; cols];
+
+    let mut rows = String::new();
+    for row in &table.rows {
+        let h_attr = row
+            .height
+            .map(|h| format!(" h=\"{}\"", emu(h)))
+            .unwrap_or_default();
+        rows.push_str(&format!("<a:tr{h_attr}>"));
+
+        let mut phys = 0usize;
+        let mut cells = row.cells.iter();
+        while phys < cols {
+            if vmerge_left[phys] > 1 {
+                // Covered by a vertical merge from above.
+                rows.push_str("<a:tc vMerge=\"1\"><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>");
+                vmerge_left[phys] -= 1;
+                phys += 1;
+                continue;
+            }
+            match cells.next() {
+                Some(cell) => {
+                    let span = (cell.col_span.max(1) as usize).min(cols - phys).max(1);
+                    let rspan = cell.row_span.max(1) as usize;
+                    rows.push_str(&pptx_table_cell(cell, span, rspan));
+                    // Horizontal-merge continuations for the spanned columns.
+                    for _ in 1..span {
+                        rows.push_str("<a:tc hMerge=\"1\"><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>");
+                    }
+                    if rspan > 1 {
+                        let end = (phys + span).min(cols);
+                        for slot in &mut vmerge_left[phys..end] {
+                            *slot = rspan;
+                        }
+                    }
+                    phys += span;
+                }
+                None => break, // fewer authored cells than columns
+            }
+        }
+        // Trailing authored cells beyond the grid (ragged row): emit as-is.
+        for cell in cells {
+            let span = cell.col_span.max(1) as usize;
+            rows.push_str(&pptx_table_cell(cell, span, cell.row_span.max(1) as usize));
+            for _ in 1..span {
+                rows.push_str("<a:tc hMerge=\"1\"><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>");
+            }
+        }
+        rows.push_str("</a:tr>");
+    }
+
+    format!(
+        "<p:graphicFrame><p:nvGraphicFramePr>\
+<p:cNvPr id=\"{id}\" name=\"tbl{id}\"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>\
+<p:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></p:xfrm>\
+<a:graphic><a:graphicData uri=\"{uri}\">\
+<a:tbl><a:tblPr firstRow=\"1\" bandRow=\"1\"/>{grid}{rows}</a:tbl>\
+</a:graphicData></a:graphic></p:graphicFrame>",
+        x = emu(frame.x),
+        y = emu(frame.y),
+        cx = emu(widths.iter().sum::<f64>().max(frame.w).max(1.0)),
+        cy = emu(frame.h.max(1.0)),
+        uri = DML_TABLE_URI,
+    )
+}
+
+/// A single DrawingML `<a:tc>`: text body first, then `<a:tcPr>` (the schema
+/// order). `span`/`rspan` map to `gridSpan`/`rowSpan`; cell shading becomes a
+/// `<a:solidFill>` in `tcPr`.
+fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize) -> String {
+    let mut attrs = String::new();
+    if span > 1 {
+        attrs.push_str(&format!(" gridSpan=\"{span}\""));
+    }
+    if rspan > 1 {
+        attrs.push_str(&format!(" rowSpan=\"{rspan}\""));
+    }
+    let body = dml_text_body(&blocks_to_paras(&cell.blocks));
+    let tcpr = match cell.shading {
+        Some(shade) => format!(
+            "<a:tcPr><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill></a:tcPr>",
+            hex(shade)
+        ),
+        None => String::from("<a:tcPr/>"),
+    };
+    format!("<a:tc{attrs}>{body}{tcpr}</a:tc>")
 }
 
 fn pptx_paragraph(para: &Paragraph) -> String {
@@ -3100,6 +3243,21 @@ svg:viewBox=\"0 0 {vw} {vh}\" svg:d=\"{d}\"/>",
                 ));
             }
         }
+        BlockKind::Table(table) => {
+            // A real `table:table` (ISO 26300 §9.1.2) inside the slide's
+            // `draw:frame`, not a paragraph flatten (#26). `odt_table` builds
+            // the `table:table` (and registers its table/column/cell styles into
+            // `ctx.auto`); we only wrap it in the positioned frame here.
+            let table_xml = odt_table(table, ctx);
+            out.push_str(&format!(
+                "<draw:frame draw:layer=\"layout\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">{table_xml}</draw:frame>",
+                x = num(r.x),
+                y = num(r.y),
+                w = num(r.w.max(1.0)),
+                h = num(r.h.max(1.0)),
+            ));
+        }
         _ => {
             // Text frame: render the block's paragraphs into a text box.
             let sid = ctx.next_style();
@@ -3135,6 +3293,7 @@ fn odp_model_content(auto: &str, body: &str) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
 xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" \
+xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
 xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" \
 xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" \
 xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\" \
@@ -3341,6 +3500,15 @@ fn text_block(text: &str) -> Block {
 fn block_to_paras(block: &Block) -> Vec<Paragraph> {
     let mut out = Vec::new();
     collect_paras(block, &mut out);
+    out
+}
+
+/// Flatten a list of blocks (e.g. a table cell's content) into paragraphs.
+fn blocks_to_paras(blocks: &[Block]) -> Vec<Paragraph> {
+    let mut out = Vec::new();
+    for b in blocks {
+        collect_paras(b, &mut out);
+    }
     out
 }
 
@@ -5613,6 +5781,119 @@ mod tests {
         let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
         assert!(content.contains("<draw:page"), "slide → draw:page");
         assert!(content.contains("Body text"));
+    }
+
+    /// A one-slide deck whose single shape is a 2×2 table (cells "R1C1".."R2C2").
+    fn slide_table_doc() -> Document {
+        use crate::model::{Slide, SlideBlock};
+        let mk_cell = |t: &str| Cell {
+            blocks: vec![para(t)],
+            ..Default::default()
+        };
+        let table = Block {
+            frame: Some(crate::model::Rect::new(100.0, 80.0, 400.0, 200.0)),
+            kind: BlockKind::Table(Table {
+                rows: vec![
+                    Row {
+                        cells: vec![mk_cell("R1C1"), mk_cell("R1C2")],
+                        height: None,
+                    },
+                    Row {
+                        cells: vec![mk_cell("R2C1"), mk_cell("R2C2")],
+                        height: None,
+                    },
+                ],
+                col_widths: vec![220.0, 180.0],
+                border: BorderStyle::default(),
+            }),
+            ..Default::default()
+        };
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+            },
+            shapes: vec![table],
+            placeholders: Vec::new(),
+            notes: None,
+            background: None,
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pptx_slide_table_emits_real_drawingml_table_not_paragraphs() {
+        // #26: a Table block on a slide must export as a real `a:tbl` in a
+        // `p:graphicFrame`, not a paragraph flatten.
+        let bytes = pptx_from_model(&slide_table_doc());
+        let s = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+
+        assert!(s.contains("<p:graphicFrame>"), "table → graphicFrame");
+        assert!(
+            s.contains("uri=\"http://schemas.openxmlformats.org/drawingml/2006/table\""),
+            "graphicData table uri",
+        );
+        assert!(s.contains("<a:tbl>"), "real DrawingML table");
+        assert_eq!(s.matches("<a:gridCol").count(), 2, "two grid columns");
+        assert_eq!(s.matches("<a:tr").count(), 2, "two rows");
+        assert_eq!(s.matches("<a:tc>").count(), 4, "four (unspanned) cells");
+        // Cell text survives, inside DrawingML cell text bodies.
+        assert!(s.contains("<a:txBody>"), "cells carry a:txBody");
+        for t in ["R1C1", "R1C2", "R2C1", "R2C2"] {
+            assert!(s.contains(t), "cell text {t} preserved");
+        }
+        // Placed like the other slide shapes (graphicFrame xfrm), not flowed.
+        assert!(s.contains("<p:xfrm>"), "table positioned with p:xfrm");
+        assert!(
+            s.contains("<a:gridCol w=\"2794000\"/>"),
+            "220pt col width in EMU"
+        );
+    }
+
+    #[test]
+    fn odp_slide_table_emits_real_table_not_paragraphs() {
+        // #26: the same deck to ODP yields a real `table:table` in a draw:frame.
+        let bytes = odp_from_model(&slide_table_doc());
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        assert!(
+            content.contains("xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\""),
+            "table namespace declared",
+        );
+        assert!(
+            content.contains("<draw:frame"),
+            "table wrapped in draw:frame"
+        );
+        assert!(content.contains("<table:table"), "real ODF table");
+        assert_eq!(
+            content.matches("<table:table-column").count(),
+            2,
+            "two columns",
+        );
+        assert_eq!(content.matches("<table:table-row>").count(), 2, "two rows");
+        assert_eq!(
+            content.matches("<table:table-cell").count(),
+            4,
+            "four cells",
+        );
+        for t in ["R1C1", "R1C2", "R2C1", "R2C2"] {
+            assert!(content.contains(t), "cell text {t} preserved");
+        }
     }
 
     #[test]
