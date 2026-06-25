@@ -3,15 +3,20 @@
 //! logical structure; we trust it over the geometric heuristics. We walk the
 //! structure tree, map each standard structure type to a model construct
 //! (`/P`→Paragraph, `/H1..6`→Heading, `/L /LI`→List, `/Table /TR /TH /TD`→Table,
-//! `/Figure`→Image placeholder) and bind the marked-content each leaf owns
-//! (`/K` → MCID) back to the page's decoded glyph runs.
+//! `/Figure`→Image with its child text as alt text) and bind the marked-content
+//! each leaf owns (`/K` → MCID) back to the page's decoded glyph runs. A
+//! non-standard tag (`/ChapterTitle`, `/TOCItem`, …) is first resolved through
+//! the tree's `/RoleMap` (ISO 32000-1 §14.7.4) to its standard type.
 //!
 //! Binding is done by a self-contained marked-content scan of each page's
 //! content stream: `BDC … EMC` ranges tagged with an `/MCID` accumulate their
-//! `Tj`/`TJ` text, keyed by `(page, mcid)`. A structure element's `/K` MCID
-//! references then pull that text. When the document has **no** struct tree —
-//! or the tree yields no bound text — this returns `None` and the caller falls
-//! back to the heuristic pipeline.
+//! `Tj`/`TJ` text, keyed by `(page, mcid)`; a range whose `BDC` property dict
+//! carries `/ActualText` (§14.9.4) uses that text verbatim instead of the
+//! decoded glyphs, and an image XObject `Do`'d inside the range is recorded so a
+//! `/Figure` leaf can recover its raster. A structure element's `/K` MCID
+//! references then pull that text/image. When the document has **no** struct
+//! tree — or the tree yields no bound content — this returns `None` and the
+//! caller falls back to the heuristic pipeline.
 
 use std::collections::BTreeMap;
 
@@ -21,8 +26,8 @@ use crate::convert::style::TextStyle;
 use crate::font::cmap::TextDecoder;
 use crate::model::{
     geom::{Rect, Rotation},
-    Block, BlockKind, Cell, Heading, Inline, InlineRun, List, ListItem, ListMarker, Paragraph,
-    ParagraphStyle, Row, Table,
+    Block, BlockKind, Cell, Heading, ImageRef, Inline, InlineRun, List, ListItem, ListMarker,
+    Paragraph, ParagraphStyle, Row, Table,
 };
 use crate::object::{Dictionary, Object};
 
@@ -201,6 +206,11 @@ fn pg_page_index(elem: &Dictionary, page_ids: &[crate::object::ObjectId]) -> Opt
 /// Per-`(page index, MCID)` accumulated text from a page's marked content.
 type MarkedText = BTreeMap<(usize, i64), String>;
 
+/// Per-`(page index, MCID)` the resource name of the **first** image XObject
+/// `Do`'d inside that marked-content range — used to recover a `/Figure` leaf's
+/// raster (the image bytes are decoded lazily, on demand, at Figure time).
+type MarkedImages = BTreeMap<(usize, i64), Vec<u8>>;
+
 /// Walk the document's `/StructTreeRoot` into model blocks. `None` when the
 /// document is not tagged, or the tree produced no text-bearing blocks (so the
 /// caller uses the heuristic reconstruction instead).
@@ -221,24 +231,29 @@ pub fn reconstruct_from_struct_tree(doc: &crate::Document, ids: &mut IdGen) -> O
 /// elements, so a `None` here means "page unknown from the structure", not page
 /// 0. Callers distribute the blocks onto model pages from this hint.
 ///
-/// NOTE: the actual placement of these blocks onto their `Page`s happens in the
-/// model-reconstruction driver (`Document::reconstruct_model` in `document.rs`),
-/// which currently dumps the flat list on page 1; consuming this page hint there
-/// (out of scope for this module) is what finishes the per-page assignment.
+/// The model-reconstruction driver (`Document::reconstruct_model` in
+/// `document.rs`) **consumes** this hint: it groups the blocks by page index and
+/// places each one on its real model page (a `None` page falls back to the first
+/// page). This entry point is the one that path uses.
 pub fn reconstruct_from_struct_tree_paged(
     doc: &crate::Document,
     ids: &mut IdGen,
 ) -> Option<Vec<(Option<usize>, Block)>> {
     let root = struct_tree_root(doc)?;
-    // Collect marked-content text for every page once.
-    let marked = collect_all_marked_text(doc);
-    if marked.is_empty() {
+    // Collect marked-content text + image bindings for every page once.
+    let (marked, images) = collect_all_marked_content(doc);
+    if marked.is_empty() && images.is_empty() {
         return None;
     }
+    // The author may tag with non-standard roles mapped to standard ones by the
+    // tree's `/RoleMap` (ISO 32000-1 §14.7.4); resolve `/S` through it.
+    let role_map = struct_role_map(doc, root);
 
     let mut walker = Walker {
         doc,
         marked: &marked,
+        images: &images,
+        role_map: &role_map,
         ids,
     };
     // The root's `/K` are the top-level structure elements. `visit` tags every
@@ -249,9 +264,10 @@ pub fn reconstruct_from_struct_tree_paged(
     for kid in kids_of(doc, root) {
         walker.visit(&kid, &mut paged, None);
     }
-    // If nothing text-bearing came out, the tree was unhelpful — fall back.
-    let has_text = paged.iter().any(|(_, b)| block_has_text(b));
-    has_text.then_some(paged)
+    // If nothing fruitful came out (no text- or image-bearing block), the tree
+    // was unhelpful — fall back to the heuristic pipeline.
+    let fruitful = paged.iter().any(|(_, b)| block_is_fruitful(b));
+    fruitful.then_some(paged)
 }
 
 /// The `/StructTreeRoot` dictionary, if the catalog references one.
@@ -259,6 +275,29 @@ fn struct_tree_root(doc: &crate::Document) -> Option<&Dictionary> {
     let catalog = doc.catalog().ok()?;
     let root = catalog.get(b"StructTreeRoot")?;
     doc.resolve(root).as_dict()
+}
+
+/// The structure tree's `/RoleMap` (ISO 32000-1 §14.7.4) as `custom → standard`
+/// tag-name pairs. The map lets a producer use a non-standard structure type
+/// (`/ChapterTitle`) by declaring how it maps onto a standard one (`/H1`).
+/// Returns an owned copy (a flat `Vec` is plenty — role maps are tiny); empty
+/// when the tree has no `/RoleMap`.
+fn struct_role_map(doc: &crate::Document, root: &Dictionary) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let Some(map) = root
+        .get(b"RoleMap")
+        .map(|o| doc.resolve(o))
+        .and_then(Object::as_dict)
+    else {
+        return Vec::new();
+    };
+    map.0
+        .iter()
+        .filter_map(|(custom, mapped)| {
+            doc.resolve(mapped)
+                .as_name()
+                .map(|std| (custom.clone(), std.to_vec()))
+        })
+        .collect()
 }
 
 /// The `/K` children of a structure element as a flat list of resolved objects
@@ -274,6 +313,11 @@ fn kids_of(doc: &crate::Document, elem: &Dictionary) -> Vec<Object> {
 struct Walker<'a> {
     doc: &'a crate::Document,
     marked: &'a MarkedText,
+    /// `(page, MCID) → image XObject name` bound to each marked-content range,
+    /// used to recover a `/Figure` leaf's raster.
+    images: &'a MarkedImages,
+    /// `/RoleMap` (`custom → standard` tag-name pairs); empty when none.
+    role_map: &'a [(Vec<u8>, Vec<u8>)],
     ids: &'a mut IdGen,
 }
 
@@ -299,7 +343,12 @@ impl Walker<'_> {
             .get(b"S")
             .and_then(|o| self.doc.resolve(o).as_name())
             .map(|n| n.to_vec());
-        let role = tag.as_deref().and_then(structure_role);
+        // Resolve `/S` to a standard type through the tree's `/RoleMap` first, so
+        // a custom tag (`/ChapterTitle` → `/H1`) takes its mapped role.
+        let role = tag
+            .as_deref()
+            .map(|t| self.resolve_role_tag(t))
+            .and_then(|t| structure_role(&t));
 
         match role {
             Some(StructRole::Heading(level)) => {
@@ -327,9 +376,18 @@ impl Walker<'_> {
                 }
             }
             Some(StructRole::Figure) => {
-                // No raster binding here; recurse for any caption text.
-                for kid in kids_of(self.doc, dict) {
-                    self.visit(&kid, out, page);
+                // A `/Figure` binds (via its `/K` MCID) the image XObject `Do`'d
+                // in that marked-content range; emit it as an `Image` block whose
+                // child text (`/Alt` or the figure's marked text) becomes alt
+                // text. When no raster is bound (a vector-only figure) we keep the
+                // old behaviour and recurse for caption text.
+                let alt = self.figure_alt(dict, page);
+                if let Some(block) = self.figure_image_block(dict, page, alt.as_deref()) {
+                    out.push((page, block));
+                } else {
+                    for kid in kids_of(self.doc, dict) {
+                        self.visit(&kid, out, page);
+                    }
                 }
             }
             // Grouping element (Document/Sect/Div/…) or a stray cell/row/item
@@ -346,6 +404,30 @@ impl Walker<'_> {
     fn page_of(&self, elem: &Dictionary) -> Option<usize> {
         let page_ids = self.doc.page_ids().ok()?;
         pg_page_index(elem, &page_ids)
+    }
+
+    /// Map a structure-type tag to its standard equivalent through the tree's
+    /// `/RoleMap`, following the chain (`/ChapterTitle → /Subtitle → /H2`) until a
+    /// standard type is reached or a fixed point / cycle is hit. A tag that is
+    /// already standard, or unmapped, is returned unchanged. Bounded to the map
+    /// length so a self-referential `/RoleMap` can't loop forever.
+    fn resolve_role_tag(&self, tag: &[u8]) -> Vec<u8> {
+        let mut current = tag.to_vec();
+        for _ in 0..=self.role_map.len() {
+            // Stop as soon as the current tag is a standard, recognised type.
+            if structure_role(&current).is_some() {
+                return current;
+            }
+            match self
+                .role_map
+                .iter()
+                .find(|(custom, _)| custom.as_slice() == current.as_slice())
+            {
+                Some((_, mapped)) if mapped != &current => current = mapped.clone(),
+                _ => break, // unmapped or self-referential: stop
+            }
+        }
+        current
     }
 
     /// Gather all text bound to a leaf element (and its descendants) by walking
@@ -386,6 +468,96 @@ impl Walker<'_> {
             }
             out.push_str(t);
         }
+    }
+
+    /// Collect every `(page, MCID)` an element binds (its `/K` ints, recursively
+    /// through descendant elements), each paired with the page it sits on. Used to
+    /// find a `/Figure`'s bound image XObject.
+    fn gather_mcids(&self, elem: &Dictionary, page: Option<usize>, out: &mut Vec<(usize, i64)>) {
+        let page = self.page_of(elem).or(page);
+        match elem.get(b"K").map(|k| self.doc.resolve(k)) {
+            Some(Object::Integer(mcid)) => {
+                if let Some(p) = page {
+                    out.push((p, *mcid));
+                }
+            }
+            Some(Object::Array(items)) => {
+                for item in items {
+                    match self.doc.resolve(item) {
+                        Object::Integer(mcid) => {
+                            if let Some(p) = page {
+                                out.push((p, *mcid));
+                            }
+                        }
+                        Object::Dictionary(d) => self.gather_mcids(d, page, out),
+                        _ => {}
+                    }
+                }
+            }
+            Some(Object::Dictionary(d)) => self.gather_mcids(d, page, out),
+            _ => {}
+        }
+    }
+
+    /// The alt text for a `/Figure`: its `/Alt` (a PDF text string, ISO 32000-1
+    /// §14.9.3) when present, else the marked text bound to its descendants (the
+    /// caption a producer wraps in the figure). Empty → `None`.
+    fn figure_alt(&self, elem: &Dictionary, page: Option<usize>) -> Option<String> {
+        if let Some(alt) = elem
+            .get(b"Alt")
+            .map(|o| self.doc.resolve(o))
+            .and_then(|o| match o {
+                Object::String(bytes, _) => Some(crate::font::decode_pdf_text(bytes)),
+                _ => None,
+            })
+        {
+            let alt = alt.trim();
+            if !alt.is_empty() {
+                return Some(alt.to_string());
+            }
+        }
+        let text = self.collect_text(elem, page);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Build an [`Image`](BlockKind::Image) block for a `/Figure` from the raster
+    /// XObject bound to one of its MCIDs. The image bytes are re-encoded to PNG and
+    /// content-hashed (FNV-1a) into the same `resource` key the per-page
+    /// reconstruction interns the blob under, so the model's `ResourceTable` (built
+    /// by `reconstruct_model`'s per-page pass) resolves it. `None` when no raster is
+    /// bound (a vector-only / empty figure) — the caller then recurses for caption
+    /// text instead.
+    fn figure_image_block(
+        &mut self,
+        elem: &Dictionary,
+        page: Option<usize>,
+        alt: Option<&str>,
+    ) -> Option<Block> {
+        let mut mcids = Vec::new();
+        self.gather_mcids(elem, page, &mut mcids);
+        // The first MCID that names an image XObject we can decode wins.
+        for (page, mcid) in mcids {
+            let Some(name) = self.images.get(&(page, mcid)) else {
+                continue;
+            };
+            let page_images = self.doc.page_images((page + 1) as u32);
+            let Some(img) = page_images.get(name) else {
+                continue;
+            };
+            let png = crate::raster::png::encode_png(img.width, img.height, &img.rgba);
+            let resource = fnv1a(&png);
+            let frame = self.element_bbox(elem);
+            return Some(Block {
+                id: self.ids.mint(),
+                frame,
+                rotation: Rotation::D0,
+                kind: BlockKind::Image(ImageRef {
+                    resource,
+                    alt: alt.map(str::to_string),
+                }),
+            });
+        }
+        None
     }
 
     /// The element's placement box from its `/Layout` `/BBox` attribute, if any.
@@ -618,6 +790,13 @@ fn block_has_text(block: &Block) -> bool {
     }
 }
 
+/// Whether a block makes the struct-tree walk worth trusting: any text **or** a
+/// recovered `/Figure` image. A figure-only tagged document (an image with no
+/// prose) is still reconstructed from its tag tree, not the heuristics.
+fn block_is_fruitful(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Image(_)) || block_has_text(block)
+}
+
 fn paragraph_has_text(p: &Paragraph) -> bool {
     p.runs.iter().any(|r| match r {
         Inline::Run(run) => !run.text.trim().is_empty(),
@@ -629,38 +808,62 @@ fn paragraph_has_text(p: &Paragraph) -> bool {
 
 /// Collect `(page_index, MCID) → text` for every page by scanning each page's
 /// content stream for `BDC … EMC` ranges that carry an `/MCID`.
-fn collect_all_marked_text(doc: &crate::Document) -> MarkedText {
-    let mut out = MarkedText::new();
+fn collect_all_marked_content(doc: &crate::Document) -> (MarkedText, MarkedImages) {
+    let mut text = MarkedText::new();
+    let mut images = MarkedImages::new();
     for page_no in 1..=doc.page_count() as u32 {
         let Ok(content) = doc.page_content(page_no) else {
             continue;
         };
         let decoders = doc.page_font_decoders(page_no);
-        collect_page_marked_text((page_no - 1) as usize, &content, &decoders, &mut out);
+        collect_page_marked_content(
+            (page_no - 1) as usize,
+            &content,
+            &decoders,
+            &mut text,
+            &mut images,
+        );
     }
-    out
+    (text, images)
 }
 
-/// Scan one page's content stream, accumulating text per active `/MCID`. The
-/// `BDC`/`BMC` … `EMC` nesting is tracked on a stack; `Tj`/`TJ` text is added to
-/// the innermost MCID range in effect (the standard "current marked-content
-/// sequence"). `Tf` selects the active font decoder.
-fn collect_page_marked_text(
+/// Scan one page's content stream, accumulating per active `/MCID`: the shown
+/// text, and the resource name of any image XObject drawn (`Do`) inside the
+/// range. The `BDC`/`BMC` … `EMC` nesting is tracked on a stack; `Tj`/`TJ`/`'`/`"`
+/// text and `Do` images are bound to the innermost MCID range in effect (the
+/// standard "current marked-content sequence"). `Tf` selects the active font
+/// decoder. A range whose `BDC` property dict carries `/ActualText` (ISO 32000-1
+/// §14.9.4) takes that text **verbatim** and its glyph shows are suppressed.
+fn collect_page_marked_content(
     page: usize,
     content: &[u8],
     decoders: &FontDecoders,
-    out: &mut MarkedText,
+    text_out: &mut MarkedText,
+    image_out: &mut MarkedImages,
 ) {
     let Ok(ops) = parse_content(content) else {
         return;
     };
     let mut mc_stack: Vec<Option<i64>> = Vec::new();
+    // MCIDs whose text was fixed by `/ActualText`; their glyph shows are skipped.
+    let mut frozen: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     let mut font: Option<&TextDecoder> = None;
     let default = TextDecoder::winansi();
 
     for op in &ops {
         match op.operator.as_slice() {
-            b"BDC" => mc_stack.push(mcid_of(op)),
+            b"BDC" => {
+                let mcid = mcid_of(op);
+                // `/ActualText` on the same BDC as the MCID stands in for the
+                // decoded glyphs of the whole sequence.
+                if let Some(mcid) = mcid {
+                    if let Some(actual) = actual_text_of(op) {
+                        text_out.insert((page, mcid), actual);
+                        frozen.insert(mcid);
+                    }
+                }
+                mc_stack.push(mcid);
+            }
             b"BMC" => mc_stack.push(None),
             b"EMC" => {
                 mc_stack.pop();
@@ -676,12 +879,27 @@ fn collect_page_marked_text(
                 let Some(mcid) = mc_stack.iter().rev().find_map(|m| *m) else {
                     continue;
                 };
+                if frozen.contains(&mcid) {
+                    continue; // text fixed by /ActualText — ignore the glyphs
+                }
                 let decoder = font.unwrap_or(&default);
                 let text = decode_show(&op.operands, decoder);
                 if text.is_empty() {
                     continue;
                 }
-                out.entry((page, mcid)).or_default().push_str(&text);
+                text_out.entry((page, mcid)).or_default().push_str(&text);
+            }
+            b"Do" => {
+                let Some(mcid) = mc_stack.iter().rev().find_map(|m| *m) else {
+                    continue;
+                };
+                if let Some(Object::Name(name)) = op.operands.first() {
+                    // Keep the first image bound to this range (a `/Figure` draws
+                    // one raster); later `Do`s in the same range don't overwrite.
+                    image_out
+                        .entry((page, mcid))
+                        .or_insert_with(|| name.clone());
+                }
             }
             _ => {}
         }
@@ -697,6 +915,33 @@ fn mcid_of(op: &crate::content::Operation) -> Option<i64> {
         Object::Dictionary(d) => d.get(b"MCID").and_then(Object::as_i64),
         _ => None,
     })
+}
+
+/// The `/ActualText` of a `BDC` operation's inline property dict (ISO 32000-1
+/// §14.9.4), decoded as a PDF text string (UTF-16BE BOM or PDFDocEncoding).
+/// `None` when the operand is a named property dict (not inline) or carries no
+/// `/ActualText`.
+fn actual_text_of(op: &crate::content::Operation) -> Option<String> {
+    op.operands.iter().find_map(|o| match o {
+        Object::Dictionary(d) => d.get(b"ActualText").and_then(|v| match v {
+            Object::String(bytes, _) => Some(crate::font::decode_pdf_text(bytes)),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// FNV-1a 64-bit hash — the codebase's zero-dependency content key for image
+/// blobs (matches `Document::fnv1a`, so a `/Figure`'s `ImageRef.resource` lines
+/// up with the blob the per-page reconstruction interns into the model's
+/// `ResourceTable`).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Decode the text operands of a show operator with the active font decoder.
@@ -746,14 +991,21 @@ mod tests {
         assert_eq!(structure_role(b"Bogus"), None);
     }
 
+    /// Scan a page's marked content for text only (discarding image bindings),
+    /// the common shape the text tests assert against.
+    fn marked_text(page: usize, content: &[u8], decoders: &FontDecoders) -> MarkedText {
+        let mut text = MarkedText::new();
+        let mut images = MarkedImages::new();
+        collect_page_marked_content(page, content, decoders, &mut text, &mut images);
+        text
+    }
+
     #[test]
     fn mcid_text_accumulates_per_marked_range() {
         // `/P <</MCID 0>> BDC (Hello) Tj EMC  /P <</MCID 1>> BDC (World) Tj EMC`
         let content =
             b"/P <</MCID 0>> BDC BT (Hello) Tj ET EMC /P <</MCID 1>> BDC BT (World) Tj ET EMC";
-        let mut out = MarkedText::new();
-        let decoders = FontDecoders::new();
-        collect_page_marked_text(0, content, &decoders, &mut out);
+        let out = marked_text(0, content, &FontDecoders::new());
         assert_eq!(out.get(&(0, 0)).map(String::as_str), Some("Hello"));
         assert_eq!(out.get(&(0, 1)).map(String::as_str), Some("World"));
     }
@@ -761,9 +1013,77 @@ mod tests {
     #[test]
     fn text_outside_any_mcid_is_ignored() {
         let content = b"BT (loose) Tj ET";
-        let mut out = MarkedText::new();
-        collect_page_marked_text(0, content, &FontDecoders::new(), &mut out);
+        let out = marked_text(0, content, &FontDecoders::new());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn actual_text_overrides_decoded_glyphs() {
+        // A `/Span <</MCID 0 /ActualText (ligature: fi)>> BDC (xY) Tj EMC`: the
+        // shown glyphs `xY` are replaced by the `/ActualText`. MCID 1 has no
+        // ActualText, so its glyphs come through unchanged.
+        let content = b"/Span <</MCID 0 /ActualText (real text)>> BDC BT (xY) Tj ET EMC \
+                        /Span <</MCID 1>> BDC BT (plain) Tj ET EMC";
+        let out = marked_text(0, content, &FontDecoders::new());
+        assert_eq!(
+            out.get(&(0, 0)).map(String::as_str),
+            Some("real text"),
+            "/ActualText stands in for the decoded glyphs"
+        );
+        assert_eq!(
+            out.get(&(0, 1)).map(String::as_str),
+            Some("plain"),
+            "an MCID without /ActualText keeps its glyphs"
+        );
+    }
+
+    #[test]
+    fn actual_text_decodes_utf16be_bom() {
+        // `/ActualText <FEFF0041>` (UTF-16BE 'A') decodes to "A".
+        let content = b"/Span <</MCID 0 /ActualText <FEFF0041>>> BDC BT (z) Tj ET EMC";
+        let out = marked_text(0, content, &FontDecoders::new());
+        assert_eq!(out.get(&(0, 0)).map(String::as_str), Some("A"));
+    }
+
+    #[test]
+    fn image_do_binds_to_enclosing_mcid() {
+        // `/Figure <</MCID 0>> BDC /Im0 Do EMC` records the image XObject name.
+        let content = b"/Figure <</MCID 0>> BDC /Im0 Do EMC";
+        let mut text = MarkedText::new();
+        let mut images = MarkedImages::new();
+        collect_page_marked_content(0, content, &FontDecoders::new(), &mut text, &mut images);
+        assert_eq!(
+            images.get(&(0, 0)).map(Vec::as_slice),
+            Some(b"Im0".as_slice())
+        );
+        // First `Do` wins: a second image in the same range doesn't overwrite.
+        let content2 = b"/Figure <</MCID 0>> BDC /Im0 Do /Im1 Do EMC";
+        let mut images2 = MarkedImages::new();
+        collect_page_marked_content(
+            0,
+            content2,
+            &FontDecoders::new(),
+            &mut MarkedText::new(),
+            &mut images2,
+        );
+        assert_eq!(
+            images2.get(&(0, 0)).map(Vec::as_slice),
+            Some(b"Im0".as_slice())
+        );
+    }
+
+    #[test]
+    fn image_do_outside_any_mcid_is_ignored() {
+        let content = b"/Im0 Do";
+        let mut images = MarkedImages::new();
+        collect_page_marked_content(
+            0,
+            content,
+            &FontDecoders::new(),
+            &mut MarkedText::new(),
+            &mut images,
+        );
+        assert!(images.is_empty());
     }
 
     #[test]
@@ -1154,6 +1474,310 @@ mod tests {
             .map(|(p, _)| *p)
             .expect("a table entry");
         assert_eq!(table_page, Some(0), "table is on the 1st page");
+    }
+
+    /// A one-page tagged PDF whose single `/Figure` (element obj 12) binds, via
+    /// MCID 0, an image XObject `/Im0` (obj 7) drawn in the content. The figure's
+    /// child marked text "Chart caption" (MCID 1) is its caption. A `roles` extra
+    /// string lets a test inject a `/StructTreeRoot /RoleMap` and use a custom
+    /// `/S` on the figure.
+    fn tagged_figure_pdf(figure_tag: &str, roles: &str) -> Vec<u8> {
+        // `/Im0 Do` draws the 1×1 image inside the figure's MCID range; MCID 1 is
+        // the caption text. "ABC" = the 3 RGB sample bytes of the 1×1 image
+        // (valid UTF-8, so the whole PDF stays a plain string).
+        let content = "q /Figure <</MCID 0>> BDC /Im0 Do EMC Q \
+                       BT /F1 12 Tf /Caption <</MCID 1>> BDC (Chart caption) Tj EMC ET";
+        let img = "ABC";
+        raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                7,
+                format!(
+                    "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >> stream\n{img}\nendstream",
+                    img.len()
+                ),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Im0 7 0 R >> >> \
+                 /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{content}\nendstream", content.len()),
+            ),
+            (10, format!("<< /Type /StructTreeRoot /K 11 0 R{roles} >>")),
+            (
+                11,
+                "<< /S /Document /K 12 0 R >>".into(),
+            ),
+            // The figure binds the image (MCID 0) and the caption (MCID 1).
+            (
+                12,
+                format!("<< /S {figure_tag} /Pg 8 0 R /K [0 1] >>"),
+            ),
+        ])
+    }
+
+    /// #169: a `/Figure` whose marked content draws a raster XObject lowers to an
+    /// `Image` block carrying the figure's caption as alt text — not dropped, and
+    /// not just the caption left as a paragraph.
+    #[test]
+    fn tagged_figure_emits_image_with_alt() {
+        let doc = crate::Document::open(&tagged_figure_pdf("/Figure", "")).expect("valid PDF");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let img = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("a /Figure image block");
+        assert_ne!(img.resource, 0, "the image carries a content-hash resource");
+        assert_eq!(
+            img.alt.as_deref(),
+            Some("Chart caption"),
+            "the figure's child text becomes the image alt text"
+        );
+        // No standalone caption paragraph is left behind.
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(&b.kind, BlockKind::Paragraph(_))),
+            "the caption is the image's alt text, not a loose paragraph"
+        );
+    }
+
+    /// A `/Figure` whose `/Alt` entry is set uses that (an explicit alt string)
+    /// over the child marked text.
+    #[test]
+    fn tagged_figure_prefers_explicit_alt_entry() {
+        // Add an `/Alt` to the figure element (obj 12).
+        let content = "q /Figure <</MCID 0>> BDC /Im0 Do EMC Q";
+        let img = "ABC";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                7,
+                format!(
+                    "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >> stream\n{img}\nendstream",
+                    img.len()
+                ),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /XObject << /Im0 7 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{content}\nendstream", content.len()),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (11, "<< /S /Document /K 12 0 R >>".into()),
+            (
+                12,
+                "<< /S /Figure /Pg 8 0 R /Alt (a bar chart) /K 0 >>".into(),
+            ),
+        ]);
+        let doc = crate::Document::open(&pdf).expect("valid PDF");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let img = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("a /Figure image block");
+        assert_eq!(img.alt.as_deref(), Some("a bar chart"));
+    }
+
+    /// #170: a custom `/S /ChapterTitle` declared in the `/StructTreeRoot`
+    /// `/RoleMap` as mapping to `/H1` lowers to a level-1 heading.
+    #[test]
+    fn tagged_rolemap_resolves_custom_tag_to_heading() {
+        // A one-page doc whose only element is `/S /ChapterTitle` → `/H1` via the
+        // role map, with its text bound by MCID 0.
+        let content = "BT /F1 12 Tf /ChapterTitle <</MCID 0>> BDC (Intro) Tj EMC ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!(
+                    "<< /Length {} >> stream\n{content}\nendstream",
+                    content.len()
+                ),
+            ),
+            // RoleMap maps the custom tag to the standard `/H1`.
+            (
+                10,
+                "<< /Type /StructTreeRoot /K 11 0 R /RoleMap << /ChapterTitle /H1 >> >>".into(),
+            ),
+            (11, "<< /S /Document /K 12 0 R >>".into()),
+            (12, "<< /S /ChapterTitle /Pg 8 0 R /K 0 >>".into()),
+        ]);
+        let doc = crate::Document::open(&pdf).expect("valid PDF");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let heading = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Heading(h) => Some(h),
+                _ => None,
+            })
+            .expect("the custom tag lowered to a heading via /RoleMap");
+        assert_eq!(heading.level, 1, "/ChapterTitle → /H1 → level-1 heading");
+        let text: String = heading
+            .para
+            .runs
+            .iter()
+            .filter_map(|r| match r {
+                Inline::Run(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Intro");
+    }
+
+    /// #170: a `/RoleMap` chain (`/ChapterTitle → /Subtitle → /H2`) resolves
+    /// transitively to the standard type at the end of the chain.
+    #[test]
+    fn tagged_rolemap_resolves_chain() {
+        let content = "BT /F1 12 Tf /ChapterTitle <</MCID 0>> BDC (Deep) Tj EMC ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!(
+                    "<< /Length {} >> stream\n{content}\nendstream",
+                    content.len()
+                ),
+            ),
+            (
+                10,
+                "<< /Type /StructTreeRoot /K 11 0 R \
+                 /RoleMap << /ChapterTitle /Subtitle /Subtitle /H2 >> >>"
+                    .into(),
+            ),
+            (11, "<< /S /Document /K 12 0 R >>".into()),
+            (12, "<< /S /ChapterTitle /Pg 8 0 R /K 0 >>".into()),
+        ]);
+        let doc = crate::Document::open(&pdf).expect("valid PDF");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let heading = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Heading(h) => Some(h),
+                _ => None,
+            })
+            .expect("chain resolves to a heading");
+        assert_eq!(
+            heading.level, 2,
+            "/ChapterTitle → /Subtitle → /H2 → level 2"
+        );
+    }
+
+    /// #171: a paragraph whose marked content carries `/ActualText` reconstructs
+    /// with that text (not the decoded glyphs) end-to-end through the walker.
+    #[test]
+    fn tagged_actualtext_used_through_walker() {
+        // The shown glyphs are "fi" (a ligature stand-in); `/ActualText (fish)`
+        // is the real text the paragraph should carry.
+        let content = "BT /F1 12 Tf /P <</MCID 0 /ActualText (fish)>> BDC (fi) Tj EMC ET";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!(
+                    "<< /Length {} >> stream\n{content}\nendstream",
+                    content.len()
+                ),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (11, "<< /S /Document /K 12 0 R >>".into()),
+            (12, "<< /S /P /Pg 8 0 R /K 0 >>".into()),
+        ]);
+        let doc = crate::Document::open(&pdf).expect("valid PDF");
+        let mut ids = IdGen::default();
+        let blocks = reconstruct_from_struct_tree(&doc, &mut ids).expect("tag tree blocks");
+        let para = blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("a paragraph block");
+        let text: String = para
+            .runs
+            .iter()
+            .filter_map(|r| match r {
+                Inline::Run(run) => Some(run.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "fish", "/ActualText replaces the decoded glyphs");
     }
 
     #[test]

@@ -8901,7 +8901,7 @@ impl Document {
     /// Decode the page's image XObjects (Flate/raw sample grids, baseline JPEG
     /// via `/DCTDecode`, and JPEG 2000 via `/JPXDecode`) into RGBA buffers for
     /// the rasterizer.
-    fn page_images(&self, page_no: u32) -> crate::raster::render::RenderImages {
+    pub(crate) fn page_images(&self, page_no: u32) -> crate::raster::render::RenderImages {
         match self.page_dict(page_no).ok().and_then(|page| {
             page.get(b"Resources")
                 .map(|o| self.resolve(o))
@@ -28315,6 +28315,78 @@ mod tests {
         assert!(
             !caption_is_standalone,
             "the caption is lifted into the image, not left as a loose paragraph"
+        );
+    }
+
+    /// #169 (tagged `/Figure` → image): a Tagged PDF whose `/Figure` binds a
+    /// raster XObject reconstructs that figure as an `Image` block — alt text from
+    /// the figure's child marked content — AND the image's `resource` hash
+    /// resolves in the model's `ResourceTable` (the same blob the per-page pass
+    /// interns), so the picture survives reconstruction rather than being dropped.
+    #[test]
+    fn reconstruct_model_emits_tagged_figure_image() {
+        use crate::model::BlockKind;
+
+        // `/Im0 Do` draws a 1×1 image inside the figure's MCID range; MCID 1 is
+        // the caption. "ABC" = the 1×1 image's 3 RGB sample bytes (valid UTF-8).
+        let content = "q /Figure <</MCID 0>> BDC /Im0 Do EMC Q \
+                       BT /F1 12 Tf /Caption <</MCID 1>> BDC (the chart) Tj EMC ET";
+        let img = "ABC";
+        let pdf = raw_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".into(),
+            ),
+            (2, "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".into()),
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            (
+                7,
+                format!(
+                    "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >> stream\n{img}\nendstream",
+                    img.len()
+                ),
+            ),
+            (
+                8,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Im0 7 0 R >> >> \
+                 /Contents 18 0 R >>"
+                    .into(),
+            ),
+            (
+                18,
+                format!("<< /Length {} >> stream\n{content}\nendstream", content.len()),
+            ),
+            (10, "<< /Type /StructTreeRoot /K 11 0 R >>".into()),
+            (11, "<< /S /Document /K 12 0 R >>".into()),
+            (12, "<< /S /Figure /Pg 8 0 R /K [0 1] >>".into()),
+        ]);
+        let doc = Document::open(&pdf).expect("valid tagged PDF");
+        assert!(doc.has_semantic_structure(), "fixture must be tagged");
+
+        let model = doc.reconstruct_model();
+        let image = model
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("the /Figure reconstructs as an Image block");
+        assert_eq!(
+            image.alt.as_deref(),
+            Some("the chart"),
+            "the figure's child text is the image's alt text"
+        );
+        assert!(
+            model.resources.images.contains_key(&image.resource),
+            "the image's resource hash resolves to an interned blob"
         );
     }
 

@@ -235,7 +235,9 @@ top-down before the same cardinal projection), so a document that is *both* tagg
 *and* `/Rotate`d no longer leaves its tagged blocks at unrotated positions
 (`/Rotate 0` pages — tagged or not — stay byte-identical) · **running headers/footers** (stripped from
 the body flow and lifted to `Section.header`/`Section.footer`, see below) · tagged-PDF
-`/StructTreeRoot` (consumed; blocks distributed onto their real pages, see below) ·
+`/StructTreeRoot` (consumed; blocks distributed onto their real pages; a `/Figure`'s
+bound raster lowered to an `Image`; custom `/S` resolved through `/RoleMap`; a range's
+`/ActualText` used over its glyphs — see below) ·
 **optional-content (OCG/OCMD layer) visibility** (see below).
 
 **Optional content (layers, ISO 32000-1 §8.11):** when rendering an existing
@@ -460,10 +462,25 @@ hierarchy, so ordinary text is never promoted.
   whose page can't be resolved (`None` — grouping elements often omit `/Pg`) keeps
   the conservative first-page placement; a page the structure never references
   stays a valid (empty) page, and the heuristic path is not mixed in (so the same
-  prose is never double-emitted). Still pending: a **header-row concept** —
-  `/THead`/`/TH` is read as a cell but not flagged as a header (`Cell` has no
-  `is_header` field yet; a separate task, shared with the heuristic tables item
-  below).
+  prose is never double-emitted). **Figure images** — a `/Figure` whose marked
+  content draws a raster XObject (the image `Do`'d inside the figure's `/MCID`
+  range) now lowers to a real `BlockKind::Image` (its child text — or an explicit
+  `/Alt` string — becomes the image alt text), interned into the model's
+  `ResourceTable` under the same content hash the per-page pass uses, so the
+  picture survives reconstruction instead of being dropped (a vector-only figure
+  with no raster still falls back to its caption text). **Custom roles** — a
+  non-standard structure type is resolved through the tree's `/RoleMap` (ISO
+  32000-1 §14.7.4) to its standard equivalent **before** mapping to a model
+  construct, following the map chain (`/ChapterTitle → /Subtitle → /H1`, bounded
+  against a self-referential map), so author-defined tags lower to the right
+  block. **ActualText** — a marked-content range whose `BDC` property dict carries
+  `/ActualText` (§14.9.4, a PDF text string decoded as UTF-16BE/PDFDocEncoding)
+  uses that text **verbatim** as the MCID's content, suppressing the decoded
+  glyphs, so ligature/soft-hyphen/replacement substitutions read as their intended
+  text. Still pending: a **header-row concept** at the **cell** level —
+  `/THead`-grouped or all-`/TH` rows already set `Row.is_header`, but an
+  individual `/TH` is not flagged on the `Cell` (`Cell` has no `is_header` field
+  yet; a separate task, shared with the heuristic tables item below).
 - **Tables**: detection now recovers **merged (spanning) cells in borderless
   tables** (a run whose box reaches across otherwise-empty columns/rows becomes a
   `col_span`/`row_span` cell, no phantom blank cell left behind — alongside the
