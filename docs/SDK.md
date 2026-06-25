@@ -426,8 +426,8 @@ for a universal editor that edits every format the same way. See the
 | `doc.toModel()` | `GigaPdfDoc` | `GigaDocument` | Lower this PDF into the unified model. |
 | `officeToModel(office)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower an Office/ODF file (auto-detected); `null` if not a recognised container. |
 | `htmlToModel(html)` | `GigaPdfEngine` | `GigaDocument` | Lower an HTML string into the model. |
-| `mdToModel(md)` | `GigaPdfEngine` | `GigaDocument` | Lower a Markdown string (CommonMark-ish: headings, lists, GFM tables, fenced code, emphasis/links) into the model. |
-| `csvToModel(csv)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower a CSV file (UTF-8 bytes, RFC 4180, auto `,`/`;`/tab/`\|` delimiter) into the model as a single editable table; `null` if no parseable fields. |
+| `mdToModel(md)` | `GigaPdfEngine` | `GigaDocument` | Lower a Markdown string (GFM: headings, lists + task-lists, tables, fenced code, emphasis/strikethrough, links + reference/footnote links, images, setext, inline HTML) into the model. |
+| `csvToModel(csv)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower a CSV file (UTF-8 bytes, RFC 4180, auto `,`/`;`/tab/`\|` delimiter) into the model as a typed sheet (cells inferred as number/bool/date; ambiguous tokens like ZIP/phone stay text); `null` if no parseable fields. |
 | `applyModelOps(model, ops)` | `GigaPdfEngine` | `GigaDocument` | Apply a batch of [`ModelOp`](#types) edits (run in order; out-of-range addresses are no-ops, so a partial batch never throws). |
 | `modelToDocx / modelToXlsx / modelToPptx / modelToOdt / modelToOds / modelToOdp / modelToPdf / modelToEpub(model)` | `GigaPdfEngine` | `Uint8Array` | Raise the model to each binary target (`modelToEpub` emits an `.epub` e-book). |
 | `modelToHtml / modelToRtf / modelToMarkdown / modelToCsv(model)` | `GigaPdfEngine` | `string` | Raise the model to HTML / RTF / Markdown / CSV text. |

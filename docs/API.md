@@ -368,8 +368,8 @@ format into it, edit with `ModelOp`s, raise to any format — see
 | `Document::from_pdf(&doc) -> model::Document` | `gp_model_from_pdf(handle,outlen)` | `doc.toModel()` |
 | `model::from_office(&[u8]) -> Option<Document>` | `gp_model_from_office(ptr,len,outlen)` | `officeToModel` |
 | `model::from_html(&str) -> Document` | `gp_model_from_html(ptr,len,outlen)` | `htmlToModel` |
-| `model::from_md(&str) -> Document` (CommonMark-ish: headings, lists, GFM tables, fenced code) | `gp_model_from_md(ptr,len,outlen)` | `mdToModel` |
-| `model::from_csv(&[u8]) -> Option<Document>` (RFC 4180; auto `,`/`;`/tab/`|` delimiter → one editable table) | `gp_model_from_csv(ptr,len,outlen)` | `csvToModel` |
+| `model::from_md(&str) -> Document` (GFM: headings, lists + task-lists, tables, fenced code, strikethrough, images, reference/footnote links, setext, inline HTML) | `gp_model_from_md(ptr,len,outlen)` | `mdToModel` |
+| `model::from_csv(&[u8]) -> Option<Document>` (RFC 4180; auto `,`/`;`/tab/`|` delimiter → a typed sheet — cells inferred as number/bool/date, ambiguous tokens like ZIP/phone stay text) | `gp_model_from_csv(ptr,len,outlen)` | `csvToModel` |
 | `model.apply_ops(&[ModelOp]) -> Document` | `gp_model_apply_ops(modelptr,modellen,opsptr,opslen,outlen)` | `applyModelOps` |
 | `model.to_{docx,xlsx,pptx,odt,ods,odp,pdf,epub}() -> Vec<u8>` | `gp_model_to_{docx,xlsx,pptx,odt,ods,odp,pdf,epub}(ptr,len,outlen)` | `modelTo{Docx,…,Epub}` |
 | `model.to_{html,rtf,md,csv}() -> String` | `gp_model_to_{html,rtf,md,csv}(ptr,len,outlen)` | `modelToHtml` / `modelToRtf` / `modelToMarkdown` / `modelToCsv` |
