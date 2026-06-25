@@ -7585,6 +7585,15 @@ impl Document {
             }
         }
 
+        // Lift running page furniture (header band / footer band) out of the
+        // body flow: blocks whose normalized signature repeats across a majority
+        // of a section's pages are removed from every page and stored once on
+        // `Section::header` / `Section::footer`. Conservative — a single-page or
+        // furniture-free section is untouched, so real content is never stripped.
+        // Done before the heading outline so the page numbers/running titles do
+        // not pollute the table of contents either.
+        recon::headerfooter::strip_running_furniture(&mut sections);
+
         let meta = DocMeta {
             title: self.get_metadata("Title").filter(|s| !s.is_empty()),
             author: self.get_metadata("Author").filter(|s| !s.is_empty()),

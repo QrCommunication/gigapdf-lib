@@ -118,8 +118,10 @@ preserved free-form, and upright text stays unrotated) · ruled tables (with
 col/row spans) · images — both `Do` XObjects **and inline images**
 (`BI`/`ID`/`EI`, ISO 32000-1 §8.9.7) — with lifted figure captions · vector
 shapes · underline/strike (from drawn rules) · external + internal hyperlinks ·
-outline/bookmarks · page geometry · tagged-PDF `/StructTreeRoot` (consumed) ·
-**optional-content (OCG/OCMD layer) visibility** (see below).
+outline/bookmarks · page geometry · **running headers/footers** (stripped from the
+body flow and lifted to `Section.header`/`Section.footer`, see below) · tagged-PDF
+`/StructTreeRoot` (consumed) · **optional-content (OCG/OCMD layer) visibility**
+(see below).
 
 **Optional content (layers, ISO 32000-1 §8.11):** when rendering an existing
 PDF, content on a layer that is **OFF in the default configuration**
@@ -181,10 +183,24 @@ default `[w0/2, 880]` ‰) so it centres on the vertical baseline; `TJ` numeric
 adjustments move along the vertical axis. Horizontal (`Identity-H` / `-H`) runs
 are unchanged.
 
+**Running headers & footers:** page furniture a PDF repeats on every page — a
+running title in the top margin, a page number / rule in the bottom margin — is
+**stripped from the body flow** so it no longer leaks into the prose (and thus
+into every `toDocx()`/`toMarkdown()`/… export) once per page. After the per-page
+blocks are reconstructed, each section's **top band** and **bottom band** (the
+outer 12 % of the page) are scanned: a block whose normalized signature recurs
+across a **strict majority** of the section's pages is treated as furniture,
+removed from every page, and a single representative copy is lifted onto
+`Section.header` / `Section.footer` (structure preserved, not just deleted). Page
+numbers are folded to a common signature (`Page 1`/`Page 2` cluster) while
+distinct numbered headings (`Chapter 1 Title`) stay separate, so the detector is
+conservative: a single-page document, or one whose margins carry no repeated
+content, is left untouched (header/footer `None`, body unchanged) — real
+first-page content is never stripped. The lift runs before the heading-outline
+fallback, so furniture never pollutes the table of contents either.
+
 **Limits on arbitrary third-party PDFs (tracked in [#5](../../issues/5)):**
 
-- **Running headers/footers are not stripped** → page numbers / running titles
-  leak into the body on every page.
 - **Heading levels** use fixed size buckets → can be non-monotonic / skip levels.
 - **Tables**: no header-row (`<th>`) concept; borderless merged cells forced 1×1;
   very sparse / very wide (>14 cols) / very long (>160 cells) / rotated tables are

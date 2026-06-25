@@ -30,6 +30,7 @@
 //! host keeps exact placement for fidelity while the block tree stays editable.
 
 pub mod columns;
+pub mod headerfooter;
 pub mod headings;
 pub mod lines;
 pub mod lists;
