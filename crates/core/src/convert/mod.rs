@@ -24,6 +24,7 @@ pub mod office;
 pub mod office_import;
 pub mod ole_doc;
 pub mod ole_ppt;
+pub mod ole_xls;
 pub mod omml;
 pub mod pdfa;
 pub mod project;
