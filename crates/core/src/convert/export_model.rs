@@ -21,6 +21,7 @@ use crate::convert::office::{
 };
 use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
+use crate::model::CellVAlign;
 use crate::model::{
     Align, Block, BlockKind, Blockquote, BorderStyle, Cell, CharStyle, CodeBlock, Document, Heading,
     ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Section, Shape,
@@ -832,6 +833,12 @@ fn docx_cell(cell: &Cell, span: usize, vmerge_restart: bool, ctx: &mut DocxCtx) 
             hex(shade)
         ));
     }
+    if let Some(va) = cell.vertical_align {
+        tcpr.push_str(&format!(
+            "<w:vAlign w:val=\"{}\"/>",
+            docx_cell_valign_attr(va)
+        ));
+    }
     tcpr.push_str("</w:tcPr>");
 
     let mut inner = docx_blocks(&cell.blocks, ctx);
@@ -1347,17 +1354,19 @@ struct XlsxFont {
     color: String,
 }
 
-/// A horizontal alignment + wrap pairing for an `<alignment>` child.
+/// A horizontal + vertical alignment + wrap pairing for an `<alignment>` child.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct XlsxAlign {
     /// `None` ⇒ general (no horizontal attribute emitted).
     horizontal: Option<Align>,
+    /// `None` ⇒ the OOXML default (bottom; no vertical attribute emitted).
+    vertical: Option<CellVAlign>,
     wrap: bool,
 }
 
 impl XlsxAlign {
     fn is_default(self) -> bool {
-        self.horizontal.is_none() && !self.wrap
+        self.horizontal.is_none() && self.vertical.is_none() && !self.wrap
     }
 }
 
@@ -1495,6 +1504,7 @@ impl XlsxStyler {
         let border_idx = self.border_id(cell.border);
         let align = XlsxAlign {
             horizontal: cell.align,
+            vertical: cell.vertical_align,
             wrap: cell.wrap,
         };
         if num_fmt_id == 0
@@ -1614,6 +1624,9 @@ impl XlsxStyler {
                 if let Some(h) = xf.align.horizontal {
                     a.push_str(&format!(" horizontal=\"{}\"", xlsx_align_attr(h)));
                 }
+                if let Some(v) = xf.align.vertical {
+                    a.push_str(&format!(" vertical=\"{}\"", xlsx_cell_valign_attr(v)));
+                }
                 if xf.align.wrap {
                     a.push_str(" wrapText=\"1\"");
                 }
@@ -1654,6 +1667,46 @@ fn xlsx_align_attr(a: Align) -> &'static str {
         Align::Center => "center",
         Align::Right => "right",
         Align::Justify => "justify",
+    }
+}
+
+/// The DOCX `w:vAlign@w:val` value for a cell vertical alignment (`CT_VerticalJc`):
+/// `top`/`center`/`bottom`. `Middle` uses OOXML's American `center` spelling.
+fn docx_cell_valign_attr(v: CellVAlign) -> &'static str {
+    match v {
+        CellVAlign::Top => "top",
+        CellVAlign::Middle => "center",
+        CellVAlign::Bottom => "bottom",
+    }
+}
+
+/// The XLSX `<alignment vertical=...>` value for a cell vertical alignment:
+/// `top`/`center`/`bottom` (same `center` spelling as DOCX).
+fn xlsx_cell_valign_attr(v: CellVAlign) -> &'static str {
+    match v {
+        CellVAlign::Top => "top",
+        CellVAlign::Middle => "center",
+        CellVAlign::Bottom => "bottom",
+    }
+}
+
+/// The ODF `style:vertical-align` value for a cell vertical alignment:
+/// `top`/`middle`/`bottom` (ODF spells the centre value `middle`).
+fn odf_cell_valign_attr(v: CellVAlign) -> &'static str {
+    match v {
+        CellVAlign::Top => "top",
+        CellVAlign::Middle => "middle",
+        CellVAlign::Bottom => "bottom",
+    }
+}
+
+/// The DrawingML `a:tcPr@anchor` value for a slide-table cell vertical alignment:
+/// `t`/`ctr`/`b`.
+fn pptx_cell_anchor(v: CellVAlign) -> &'static str {
+    match v {
+        CellVAlign::Top => "t",
+        CellVAlign::Middle => "ctr",
+        CellVAlign::Bottom => "b",
     }
 }
 
@@ -2158,12 +2211,17 @@ fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize) -> String {
         attrs.push_str(&format!(" rowSpan=\"{rspan}\""));
     }
     let body = dml_text_body(&blocks_to_paras(&cell.blocks));
+    // `a:tcPr@anchor` carries the cell's vertical alignment (`t`/`ctr`/`b`).
+    let anchor = match cell.vertical_align {
+        Some(va) => format!(" anchor=\"{}\"", pptx_cell_anchor(va)),
+        None => String::new(),
+    };
     let tcpr = match cell.shading {
         Some(shade) => format!(
-            "<a:tcPr><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill></a:tcPr>",
+            "<a:tcPr{anchor}><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill></a:tcPr>",
             hex(shade)
         ),
-        None => String::from("<a:tcPr/>"),
+        None => format!("<a:tcPr{anchor}/>"),
     };
     format!("<a:tc{attrs}>{body}{tcpr}</a:tc>")
 }
@@ -2783,17 +2841,28 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
             if rspan > 1 {
                 attrs.push_str(&format!(" table:number-rows-spanned=\"{rspan}\""));
             }
-            let cell_style = if let Some(shade) = cell.shading {
+            // Compose the cell's table-cell-properties from shading and/or
+            // vertical alignment; emit an auto-style only when at least one is set.
+            let mut tc_props = String::new();
+            if let Some(shade) = cell.shading {
+                tc_props.push_str(&format!(" fo:background-color=\"#{}\"", hex(shade)));
+            }
+            if let Some(va) = cell.vertical_align {
+                tc_props.push_str(&format!(
+                    " style:vertical-align=\"{}\"",
+                    odf_cell_valign_attr(va)
+                ));
+            }
+            let cell_style = if tc_props.is_empty() {
+                String::new()
+            } else {
                 let csid = ctx.next_style();
                 let csn = format!("Tc{csid}");
                 ctx.auto.push_str(&format!(
                     "<style:style style:name=\"{csn}\" style:family=\"table-cell\">\
-<style:table-cell-properties fo:background-color=\"#{c}\"/></style:style>",
-                    c = hex(shade),
+<style:table-cell-properties{tc_props}/></style:style>"
                 ));
                 format!(" table:style-name=\"{csn}\"")
-            } else {
-                String::new()
             };
             let mut inner = odt_blocks(&cell.blocks, ctx);
             if inner.is_empty() {
@@ -3094,6 +3163,7 @@ struct CellStyleKey {
     font: Option<(String, bool, bool, u32, String)>,
     border: Option<(u32, String)>,
     align: Option<Align>,
+    valign: Option<CellVAlign>,
     wrap: bool,
 }
 
@@ -3145,6 +3215,7 @@ impl OdsStyler {
             font,
             border,
             align: cell.align,
+            valign: cell.vertical_align,
             wrap: cell.wrap,
         };
         if key.fill.is_none()
@@ -3152,6 +3223,7 @@ impl OdsStyler {
             && key.font.is_none()
             && key.border.is_none()
             && key.align.is_none()
+            && key.valign.is_none()
             && !key.wrap
         {
             return String::new();
@@ -3165,7 +3237,7 @@ impl OdsStyler {
             None => String::new(),
         };
 
-        // table-cell-properties: fill, border, wrap.
+        // table-cell-properties: fill, border, wrap, vertical alignment.
         let mut cell_props = String::new();
         if let Some(c) = &key.fill {
             cell_props.push_str(&format!(" fo:background-color=\"#{c}\""));
@@ -3178,6 +3250,12 @@ impl OdsStyler {
         }
         if key.wrap {
             cell_props.push_str(" fo:wrap-option=\"wrap\"");
+        }
+        if let Some(v) = key.valign {
+            cell_props.push_str(&format!(
+                " style:vertical-align=\"{}\"",
+                odf_cell_valign_attr(v)
+            ));
         }
         let cell_props_xml = if cell_props.is_empty() {
             String::new()
@@ -5453,6 +5531,7 @@ mod tests {
             col_span: 2,
             row_span: 1,
             shading: None,
+            ..Cell::default()
         };
         let table = Block {
             kind: BlockKind::Table(Table {
@@ -6019,6 +6098,187 @@ mod tests {
         assert!(sheet.contains(" s=\""), "styled fill cell");
         let styles = String::from_utf8(entry(&bytes, "xl/styles.xml").unwrap()).unwrap();
         assert!(styles.contains("patternType=\"solid\""), "fill defined");
+    }
+
+    /// A one-row spreadsheet `Document` whose cells carry the given values and
+    /// vertical alignments, for the export-side alignment tests.
+    fn sheet_doc_with_valigns(cells: Vec<(CellValue, Option<CellVAlign>)>) -> Document {
+        let row = SheetRow {
+            cells: cells
+                .into_iter()
+                .map(|(value, va)| SheetCell {
+                    value,
+                    vertical_align: va,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Sheet(SheetBlock {
+                            sheets: vec![Sheet {
+                                name: "S".to_string(),
+                                rows: vec![row],
+                                merges: Vec::new(),
+                                col_widths: Vec::new(),
+                            }],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn xlsx_from_model_emits_cell_vertical_align() {
+        // `SheetCell.vertical_align` becomes `<alignment vertical="...">` in the
+        // cell xf (top/center/bottom); a cell with `None` emits no vertical
+        // attribute (the OOXML default — bottom).
+        let doc = sheet_doc_with_valigns(vec![
+            (CellValue::Text("def".to_string()), None),
+            (CellValue::Text("top".to_string()), Some(CellVAlign::Top)),
+            (CellValue::Text("mid".to_string()), Some(CellVAlign::Middle)),
+            (CellValue::Text("bot".to_string()), Some(CellVAlign::Bottom)),
+        ]);
+        let bytes = xlsx_from_model(&doc);
+        let styles = String::from_utf8(entry(&bytes, "xl/styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("vertical=\"top\""),
+            "Top → vertical=top: {styles}"
+        );
+        assert!(
+            styles.contains("vertical=\"center\""),
+            "Middle → vertical=center: {styles}"
+        );
+        assert!(
+            styles.contains("vertical=\"bottom\""),
+            "Bottom → vertical=bottom: {styles}"
+        );
+        // The first (default) cell carries no styled xf for vertical alignment:
+        // exactly the three explicit anchors appear in the stylesheet.
+        assert_eq!(
+            styles.matches("vertical=\"").count(),
+            3,
+            "absent vertical_align emits no attribute: {styles}"
+        );
+    }
+
+    #[test]
+    fn ods_from_model_emits_cell_vertical_align() {
+        // `SheetCell.vertical_align` → `style:table-cell-properties
+        // @style:vertical-align="middle"` (ODF spells the centre value `middle`).
+        let doc = sheet_doc_with_valigns(vec![(
+            CellValue::Text("mid".to_string()),
+            Some(CellVAlign::Middle),
+        )]);
+        let content = String::from_utf8(entry(&ods_from_model(&doc), "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:vertical-align=\"middle\""),
+            "Middle → style:vertical-align=middle: {content}"
+        );
+    }
+
+    #[test]
+    fn odt_from_model_emits_table_cell_vertical_align() {
+        // A model table `Cell.vertical_align` becomes an ODT cell auto-style with
+        // `style:table-cell-properties@style:vertical-align`.
+        let cell = Cell {
+            blocks: vec![para("Bot")],
+            vertical_align: Some(CellVAlign::Bottom),
+            ..Cell::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Table(Table {
+                            rows: vec![crate::model::Row {
+                                cells: vec![cell],
+                                height: None,
+                            }],
+                            col_widths: Vec::new(),
+                            border: BorderStyle::default(),
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let content = String::from_utf8(entry(&odt_from_model(&doc), "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:vertical-align=\"bottom\""),
+            "Bottom → style:vertical-align=bottom: {content}"
+        );
+    }
+
+    #[test]
+    fn pptx_from_model_emits_slide_table_cell_anchor() {
+        // A slide-table `Cell.vertical_align` becomes `a:tcPr@anchor` (t/ctr/b); a
+        // `None` cell emits a bare `<a:tcPr/>` (no anchor).
+        use crate::model::{Slide, SlideBlock};
+        let mk = |text: &str, va: Option<CellVAlign>| Cell {
+            blocks: vec![para(text)],
+            vertical_align: va,
+            ..Cell::default()
+        };
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![crate::model::Row {
+                    cells: vec![mk("Mid", Some(CellVAlign::Middle)), mk("Def", None)],
+                    height: None,
+                }],
+                col_widths: Vec::new(),
+                border: BorderStyle::default(),
+            }),
+            ..Default::default()
+        };
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+            },
+            shapes: vec![table],
+            placeholders: Vec::new(),
+            notes: None,
+            background: None,
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let s = String::from_utf8(entry(&pptx_from_model(&doc), "ppt/slides/slide1.xml").unwrap())
+            .unwrap();
+        // The "Mid" cell has no shading, so its tcPr is self-closing with anchor.
+        assert!(
+            s.contains("<a:tcPr anchor=\"ctr\"/>"),
+            "Middle → a:tcPr anchor=ctr: {s}"
+        );
+        assert!(
+            s.contains("<a:tcPr/>"),
+            "absent vertical_align → bare a:tcPr (no anchor): {s}"
+        );
     }
 
     #[test]

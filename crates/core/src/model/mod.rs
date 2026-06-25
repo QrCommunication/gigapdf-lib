@@ -40,7 +40,8 @@ pub use geom::{Margins, PageGeometry, Rect, Rotation};
 pub use sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
 pub use slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 pub use style::{
-    Align, CharStyle, LineHeight, NamedStyle, ParagraphStyle, StyleId, StyleTable, VAlign,
+    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParagraphStyle, StyleId, StyleTable,
+    VAlign,
 };
 
 use crate::content::vector::PathSeg;
@@ -260,6 +261,11 @@ pub struct Cell {
     pub row_span: u16,
     /// RGB background, components `0.0..=1.0`. `None` = no shading.
     pub shading: Option<[f64; 3]>,
+    /// Vertical alignment of the cell's content within its box. `None` ⇒ the
+    /// format default (`Top` for word-processing/ODF table cells). Round-trips
+    /// DOCX `w:tcPr/w:vAlign`, ODF `style:table-cell-properties@style:vertical-align`,
+    /// and the PPTX/ODP slide-table cell anchor.
+    pub vertical_align: Option<CellVAlign>,
 }
 
 impl Default for Cell {
@@ -269,6 +275,7 @@ impl Default for Cell {
             col_span: 1,
             row_span: 1,
             shading: None,
+            vertical_align: None,
         }
     }
 }

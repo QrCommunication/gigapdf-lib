@@ -418,6 +418,47 @@ fn ooxml_vert_align(val: Option<&str>) -> model::VAlign {
     }
 }
 
+/// Map a DOCX `w:tcPr/w:vAlign@w:val` token (table cells, `CT_VerticalJc`) to the
+/// model [`CellVAlign`](model::CellVAlign): `top`/`center`/`bottom`. `center`
+/// (American spelling, per OOXML) ⇒ `Middle`; an unknown/`both`/missing value ⇒
+/// `None` (let the format default apply). Shares its vocabulary with XLSX
+/// `xf/alignment@vertical` ([`xlsx_cell_valign`]).
+fn docx_cell_valign(val: &str) -> Option<model::CellVAlign> {
+    match val.trim() {
+        "top" => Some(model::CellVAlign::Top),
+        "center" => Some(model::CellVAlign::Middle),
+        "bottom" => Some(model::CellVAlign::Bottom),
+        _ => None,
+    }
+}
+
+/// Map an XLSX `xf/alignment@vertical` token to the model
+/// [`CellVAlign`](model::CellVAlign): `top`/`center`/`bottom` (same `center`
+/// spelling as DOCX). `justify`/`distributed` (justified text, no single
+/// anchor) and any unknown/missing value ⇒ `None` (the OOXML default — bottom —
+/// is then represented by the absent field).
+fn xlsx_cell_valign(val: &str) -> Option<model::CellVAlign> {
+    match val.trim() {
+        "top" => Some(model::CellVAlign::Top),
+        "center" => Some(model::CellVAlign::Middle),
+        "bottom" => Some(model::CellVAlign::Bottom),
+        _ => None,
+    }
+}
+
+/// Map an ODF `style:table-cell-properties@style:vertical-align` token to the
+/// model [`CellVAlign`](model::CellVAlign): `top`/`middle`/`bottom`. `automatic`
+/// (suite-chosen) and any unknown/missing value ⇒ `None` (let the format default
+/// apply). Note ODF spells the centre value `middle`, unlike OOXML's `center`.
+fn odf_cell_valign(val: &str) -> Option<model::CellVAlign> {
+    match val.trim() {
+        "top" => Some(model::CellVAlign::Top),
+        "middle" => Some(model::CellVAlign::Middle),
+        "bottom" => Some(model::CellVAlign::Bottom),
+        _ => None,
+    }
+}
+
 /// Derive a [`CharStyle`] from a recovered [`RunStyle`]. The display family name
 /// is kept verbatim; the portable generic class is inferred by reusing
 /// [`super::style::parse_base_font`] (which classifies serif/sans/mono from a
@@ -1886,6 +1927,8 @@ fn docx_cell_model(
     // edge that declares a real width (surfaced to seed the table-wide border).
     let mut shading: Option<[f64; 3]> = None;
     let mut border: Option<model::BorderStyle> = None;
+    // Cell vertical alignment `w:tcPr/w:vAlign@w:val` (top/center/bottom).
+    let mut vertical_align: Option<model::CellVAlign> = None;
 
     while let Some(tok) = x.next() {
         match tok {
@@ -1921,6 +1964,12 @@ fn docx_cell_model(
                                 shading = hex_to_rgb_f64(v);
                             }
                         }
+                    }
+                    // Cell vertical alignment `w:vAlign@w:val`. Guarded to the
+                    // cell's own `w:tcPr` (a `w:vAlign` can also appear under
+                    // `w:tblPr`/section properties, which must not leak here).
+                    "vAlign" if in_tcpr => {
+                        vertical_align = attr(&attrs, "val").and_then(docx_cell_valign);
                     }
                     "p" if !sc => docx_paragraph_model(
                         x,
@@ -1966,6 +2015,7 @@ fn docx_cell_model(
             col_span: span.grid_span.max(1).min(u16::MAX as usize) as u16,
             row_span: if span.v_merge_restart { 2 } else { 1 },
             shading,
+            vertical_align,
         }),
         border,
     }
@@ -2162,6 +2212,7 @@ fn xlsx_sheet_model(
                                 style: cell_style.style.clone(),
                                 border: cell_style.border,
                                 align: cell_style.align,
+                                vertical_align: cell_style.valign,
                                 wrap: cell_style.wrap,
                                 ..Default::default()
                             },
@@ -3361,7 +3412,7 @@ fn pptx_table_cell_model(
         }
     }
 
-    let (fill, border) = tc_pr.finish(theme);
+    let (fill, border, vertical_align) = tc_pr.finish(theme);
 
     // Horizontal-merge continuation: covered by the cell spanning it — drop.
     if h_merge {
@@ -3383,6 +3434,7 @@ fn pptx_table_cell_model(
         col_span: grid_span,
         row_span,
         shading: fill,
+        vertical_align,
     }];
     // Pad to `grid_span` physical columns (empty continuation cells).
     for _ in 1..grid_span {
@@ -3412,6 +3464,9 @@ struct PptxCellPr {
     in_cell_fill: bool,
     /// The cell fill colour accumulator.
     cell_fill: PptxFillColor,
+    /// Cell vertical anchor from `a:tcPr@anchor` (`t`/`ctr`/`b`), lowered to the
+    /// model [`CellVAlign`](model::CellVAlign). `None` ⇒ absent/unknown.
+    anchor: Option<model::CellVAlign>,
 }
 
 impl PptxCellPr {
@@ -3420,6 +3475,17 @@ impl PptxCellPr {
     /// active (a border line's fill shadows the cell fill while open).
     fn on_open(&mut self, ln: &str, attrs: &[(String, String)]) {
         match ln {
+            // The cell-properties element itself carries the vertical anchor
+            // (`a:tcPr@anchor`: `t`/`ctr`/`b`; default `t`). DrawingML also allows
+            // `just`/`dist`, which have no single anchor ⇒ left as `None`.
+            "tcPr" => {
+                self.anchor = match attr(attrs, "anchor").map(str::trim) {
+                    Some("t") => Some(model::CellVAlign::Top),
+                    Some("ctr") => Some(model::CellVAlign::Middle),
+                    Some("b") => Some(model::CellVAlign::Bottom),
+                    _ => None,
+                };
+            }
             "lnL" | "lnR" | "lnT" | "lnB" => {
                 self.in_line = true;
                 self.line_w = attr(attrs, "w").and_then(emu_to_pt);
@@ -3464,9 +3530,16 @@ impl PptxCellPr {
     }
 
     /// Resolve the cell fill and border colours through `theme`, returning
-    /// `(cell fill RGB, table border)`. A border with no resolvable colour falls
-    /// back to black.
-    fn finish(self, theme: &PptxTheme) -> (Option<[f64; 3]>, Option<model::BorderStyle>) {
+    /// `(cell fill RGB, table border, vertical anchor)`. A border with no
+    /// resolvable colour falls back to black.
+    fn finish(
+        self,
+        theme: &PptxTheme,
+    ) -> (
+        Option<[f64; 3]>,
+        Option<model::BorderStyle>,
+        Option<model::CellVAlign>,
+    ) {
         let fill = self
             .cell_fill
             .finish_with(theme)
@@ -3480,7 +3553,7 @@ impl PptxCellPr {
                 .unwrap_or([0.0, 0.0, 0.0]);
             model::BorderStyle { width, color }
         });
-        (fill, border)
+        (fill, border, self.anchor)
     }
 }
 
@@ -3768,6 +3841,9 @@ struct OdfModelCtx<'a> {
     cols: &'a BTreeMap<String, f64>,
     /// Cell style name → `fo:background-color` RGB, for cell shading.
     cell_bg: &'a BTreeMap<String, [f64; 3]>,
+    /// Cell style name → `style:vertical-align`, for table-cell vertical
+    /// alignment.
+    cell_valign: &'a BTreeMap<String, model::CellVAlign>,
 }
 
 impl OdfModelCtx<'_> {
@@ -3784,12 +3860,15 @@ impl OdfModelCtx<'_> {
         static EMPTY_COLS: std::sync::OnceLock<BTreeMap<String, f64>> = std::sync::OnceLock::new();
         static EMPTY_BG: std::sync::OnceLock<BTreeMap<String, [f64; 3]>> =
             std::sync::OnceLock::new();
+        static EMPTY_VA: std::sync::OnceLock<BTreeMap<String, model::CellVAlign>> =
+            std::sync::OnceLock::new();
         OdfModelCtx {
             zip,
             styles,
             para_styles: EMPTY_PARA.get_or_init(BTreeMap::new),
             cols: EMPTY_COLS.get_or_init(BTreeMap::new),
             cell_bg: EMPTY_BG.get_or_init(BTreeMap::new),
+            cell_valign: EMPTY_VA.get_or_init(BTreeMap::new),
         }
     }
 }
@@ -3813,6 +3892,9 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     cols.extend(odf_column_widths(&content));
     let mut cell_bg = odf_cell_backgrounds(&styles_xml);
     cell_bg.extend(odf_cell_backgrounds(&content));
+    // Table-cell vertical alignment, same name-keyed precedence as `cell_bg`.
+    let mut cell_valign = odf_cell_valigns(&styles_xml);
+    cell_valign.extend(odf_cell_valigns(&content));
     let geom = odf_geom(&styles_xml, &content, PageGeom::prose_default());
     let ctx = OdfModelCtx {
         zip,
@@ -3820,6 +3902,7 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         para_styles: &para_styles,
         cols: &cols,
         cell_bg: &cell_bg,
+        cell_valign: &cell_valign,
     };
     let mut blocks = Vec::new();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
@@ -4420,9 +4503,9 @@ fn odf_table_model(
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(1)
                         .min(64);
-                    let shading = attr(&attrs, "style-name")
-                        .and_then(|n| ctx.cell_bg.get(n))
-                        .copied();
+                    let style_name = attr(&attrs, "style-name");
+                    let shading = style_name.and_then(|n| ctx.cell_bg.get(n)).copied();
+                    let vertical_align = style_name.and_then(|n| ctx.cell_valign.get(n)).copied();
                     let mut blocks = Vec::new();
                     // Cell content is not part of the document outline; its
                     // headings/bookmarks go to a discarded builder.
@@ -4441,6 +4524,7 @@ fn odf_table_model(
                             row.push(Cell {
                                 blocks: blocks.clone(),
                                 shading,
+                                vertical_align,
                                 ..Cell::default()
                             });
                         }
@@ -4659,6 +4743,7 @@ fn ods_row_model(
                         cell.fill = p.fill;
                         cell.border = p.border;
                         cell.align = p.align;
+                        cell.vertical_align = p.valign;
                         cell.wrap = p.wrap;
                         cell.number_format = p.number_format.clone();
                     }
@@ -8104,6 +8189,7 @@ struct CellFmt {
     style: CharStyle,
     border: Option<model::BorderStyle>,
     align: Option<MAlign>,
+    valign: Option<model::CellVAlign>,
     wrap: bool,
 }
 
@@ -8268,8 +8354,9 @@ fn parse_xlsx_styles(xml: &str, theme: &XlsxTheme) -> XlsxStyles {
                             c.push_str(&xlsx_alignment_css(&attrs));
                         }
                         if let Some(cf) = cur_fmt.as_mut() {
-                            let (align, wrap) = xlsx_alignment_struct(&attrs);
+                            let (align, valign, wrap) = xlsx_alignment_struct(&attrs);
                             cf.align = align;
+                            cf.valign = valign;
                             cf.wrap = wrap;
                         }
                     }
@@ -8527,11 +8614,15 @@ fn parse_xlsx_borders_struct(xml: &str, theme: &XlsxTheme) -> Vec<Option<model::
     out
 }
 
-/// Resolve an `xf`'s `<alignment>` to `(Option<Align>, wrap)` for the typed
-/// model path: `@horizontal` → [`MAlign`] (`center`/`centerContinuous`→Center,
-/// `right`→Right, `justify`/`distributed`/`fill`→Justify, `left`→Left; unknown
-/// ⇒ `None`), and `@wrapText` → bool.
-fn xlsx_alignment_struct(attrs: &[(String, String)]) -> (Option<MAlign>, bool) {
+/// Resolve an `xf`'s `<alignment>` to `(Option<Align>, Option<CellVAlign>, wrap)`
+/// for the typed model path: `@horizontal` → [`MAlign`]
+/// (`center`/`centerContinuous`→Center, `right`→Right,
+/// `justify`/`distributed`/`fill`→Justify, `left`→Left; unknown ⇒ `None`),
+/// `@vertical` → [`CellVAlign`](model::CellVAlign) via [`xlsx_cell_valign`]
+/// (`top`/`center`/`bottom`; unknown ⇒ `None`), and `@wrapText` → bool.
+fn xlsx_alignment_struct(
+    attrs: &[(String, String)],
+) -> (Option<MAlign>, Option<model::CellVAlign>, bool) {
     let align = match attr(attrs, "horizontal") {
         Some("left") => Some(MAlign::Left),
         Some("center") | Some("centerContinuous") => Some(MAlign::Center),
@@ -8539,8 +8630,9 @@ fn xlsx_alignment_struct(attrs: &[(String, String)]) -> (Option<MAlign>, bool) {
         Some("justify") | Some("distributed") | Some("fill") => Some(MAlign::Justify),
         _ => None,
     };
+    let valign = attr(attrs, "vertical").and_then(xlsx_cell_valign);
     let wrap = matches!(attr(attrs, "wrapText"), Some("1") | Some("true"));
-    (align, wrap)
+    (align, valign, wrap)
 }
 
 /// Width in CSS px for an XLSX border line `style` (`thin`/`medium`/`thick`/
@@ -10553,6 +10645,39 @@ fn odf_cell_backgrounds(xml: &str) -> BTreeMap<String, [f64; 3]> {
     map
 }
 
+/// Build a `cell-style-name → `[`CellVAlign`](model::CellVAlign) map from an ODF
+/// part: each `style:style` (table-cell style) whose `style:table-cell-properties`
+/// carries a `style:vertical-align` (`top`/`middle`/`bottom`; `automatic` and
+/// unknown ignored). Used to lower ODT/ODP table-cell vertical alignment onto the
+/// model. Mirrors [`odf_cell_backgrounds`].
+fn odf_cell_valigns(xml: &str) -> BTreeMap<String, model::CellVAlign> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => cur_name = attr(&attrs, "name").map(|s| s.to_string()),
+                "table-cell-properties" => {
+                    if let Some(nm) = &cur_name {
+                        if let Some(v) = attr(&attrs, "vertical-align").and_then(odf_cell_valign) {
+                            map.insert(nm.clone(), v);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                if local(&name) == "style" {
+                    cur_name = None;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    map
+}
+
 /// Read the first `style:page-layout-properties` from an ODF part —
 /// `fo:page-width`/`fo:page-height` and `fo:margin-*` (with `fo:margin`
 /// shorthand) — into a [`PageGeom`], using `fallback` for anything absent. ODF
@@ -10825,6 +10950,7 @@ struct OdsCellProps {
     fill: Option<[f64; 3]>,
     border: Option<model::BorderStyle>,
     align: Option<model::Align>,
+    valign: Option<model::CellVAlign>,
     wrap: bool,
     number_format: Option<String>,
 }
@@ -10925,6 +11051,10 @@ fn odf_cell_props(
                         }
                         if odf_cell_wrap(&attrs) {
                             props.wrap = true;
+                            *any = true;
+                        }
+                        if let Some(v) = attr(&attrs, "vertical-align").and_then(odf_cell_valign) {
+                            props.valign = Some(v);
                             *any = true;
                         }
                     }
@@ -17411,6 +17541,212 @@ mod tests {
             s.rows[0].cells[2].style.vertical_align,
             model::VAlign::Sub,
             "subscript → Sub"
+        );
+    }
+
+    #[test]
+    fn docx_model_cell_vertical_align_imports_and_reexports() {
+        // `w:tcPr/w:vAlign w:val="center"` lowers to `CellVAlign::Middle`; a cell
+        // with no `w:vAlign` stays `None` (format default). The model then
+        // re-exports `w:vAlign w:val="center"` for the middle cell only.
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:tcPr><w:vAlign w:val="center"/></w:tcPr><w:p><w:r><w:t>Mid</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Def</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let table = docx_model_first_table(&model);
+        assert_eq!(
+            table.rows[0].cells[0].vertical_align,
+            Some(model::CellVAlign::Middle),
+            "w:vAlign=center → Middle"
+        );
+        assert_eq!(
+            table.rows[0].cells[1].vertical_align, None,
+            "absent w:vAlign → None (format default)"
+        );
+
+        // Re-export the lowered model to DOCX and confirm the round-trip.
+        let out = crate::convert::export_model::docx_from_model(&model);
+        let xml = String::from_utf8(
+            read_zip(&out)
+                .remove("word/document.xml")
+                .expect("document.xml"),
+        )
+        .unwrap();
+        assert!(
+            xml.contains("<w:vAlign w:val=\"center\"/>"),
+            "re-exports w:vAlign=center: {xml}"
+        );
+    }
+
+    #[test]
+    fn xlsx_model_reads_cell_vertical_align() {
+        // `xf/alignment@vertical` (top/center/bottom) lowers to the model
+        // `SheetCell.vertical_align`; a cell whose xf has no vertical attribute
+        // stays `None` (the OOXML default — bottom — is the absent field).
+        let styles = r#"<styleSheet>
+          <cellXfs count="4">
+            <xf/>
+            <xf applyAlignment="1"><alignment vertical="top"/></xf>
+            <xf applyAlignment="1"><alignment vertical="center"/></xf>
+            <xf applyAlignment="1"><alignment vertical="bottom"/></xf>
+          </cellXfs>
+        </styleSheet>"#;
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="0" t="inlineStr"><is><t>def</t></is></c>
+            <c r="B1" s="1" t="inlineStr"><is><t>top</t></is></c>
+            <c r="C1" s="2" t="inlineStr"><is><t>mid</t></is></c>
+            <c r="D1" s="3" t="inlineStr"><is><t>bot</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet(styles, sheet, None);
+        assert_eq!(
+            s.rows[0].cells[0].vertical_align, None,
+            "no vertical → None (default bottom)"
+        );
+        assert_eq!(
+            s.rows[0].cells[1].vertical_align,
+            Some(model::CellVAlign::Top),
+            "vertical=top → Top"
+        );
+        assert_eq!(
+            s.rows[0].cells[2].vertical_align,
+            Some(model::CellVAlign::Middle),
+            "vertical=center → Middle"
+        );
+        assert_eq!(
+            s.rows[0].cells[3].vertical_align,
+            Some(model::CellVAlign::Bottom),
+            "vertical=bottom → Bottom"
+        );
+    }
+
+    #[test]
+    fn ods_model_reads_cell_vertical_align() {
+        // ODS `style:table-cell-properties@style:vertical-align="middle"` lowers to
+        // the spreadsheet cell's `vertical_align`; a cell with no such style is
+        // `None`.
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+            xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+          <office:automatic-styles>
+            <style:style style:name="ceMid" style:family="table-cell">
+              <style:table-cell-properties style:vertical-align="middle"/>
+            </style:style>
+          </office:automatic-styles>
+          <office:body><office:spreadsheet>
+            <table:table table:name="S">
+              <table:table-row>
+                <table:table-cell table:style-name="ceMid"><text:p>Mid</text:p></table:table-cell>
+                <table:table-cell><text:p>Def</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+          </office:spreadsheet></office:body>
+        </office:document-content>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("mimetype", b"application/vnd.oasis.opendocument.spreadsheet");
+        z.add_stored("content.xml", content.as_bytes());
+        let model = office_to_model(&z.finish()).expect("ods → model");
+        let sheet = match &model.sections[0].pages[0].blocks[0].kind {
+            BlockKind::Sheet(sb) => &sb.sheets[0],
+            other => panic!("expected a Sheet block, got {other:?}"),
+        };
+        assert_eq!(
+            sheet.rows[0].cells[0].vertical_align,
+            Some(model::CellVAlign::Middle),
+            "style:vertical-align=middle → Middle"
+        );
+        assert_eq!(
+            sheet.rows[0].cells[1].vertical_align, None,
+            "no cell style → None"
+        );
+    }
+
+    #[test]
+    fn odt_model_table_cell_vertical_align() {
+        // ODT table cell `style:table-cell-properties@style:vertical-align="bottom"`
+        // lowers to the model table `Cell.vertical_align`; an unstyled cell is
+        // `None`.
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+            xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+          <office:automatic-styles>
+            <style:style style:name="ceBot" style:family="table-cell">
+              <style:table-cell-properties style:vertical-align="bottom"/>
+            </style:style>
+          </office:automatic-styles>
+          <office:body><office:text>
+            <table:table table:name="T">
+              <table:table-row>
+                <table:table-cell table:style-name="ceBot"><text:p>Bot</text:p></table:table-cell>
+                <table:table-cell><text:p>Def</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+          </office:text></office:body>
+        </office:document-content>"#;
+        let model = odt_model(content, &[]);
+        let table = docx_model_first_table(&model);
+        assert_eq!(
+            table.rows[0].cells[0].vertical_align,
+            Some(model::CellVAlign::Bottom),
+            "style:vertical-align=bottom → Bottom"
+        );
+        assert_eq!(
+            table.rows[0].cells[1].vertical_align, None,
+            "unstyled cell → None"
+        );
+    }
+
+    #[test]
+    fn pptx_model_table_cell_anchor_imports_vertical_align() {
+        // A slide-table cell with `a:tcPr@anchor="ctr"` lowers to the model
+        // `Cell.vertical_align = Middle`; `b` → Bottom; a cell with no anchor is
+        // `None`.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:graphicFrame>
+                <p:xfrm><a:off x="0" y="0"/><a:ext cx="2540000" cy="1270000"/></p:xfrm>
+                <a:graphic><a:graphicData>
+                  <a:tbl><a:tblGrid><a:gridCol w="1270000"/><a:gridCol w="1270000"/><a:gridCol w="1270000"/></a:tblGrid>
+                    <a:tr>
+                      <a:tc><a:txBody><a:p><a:r><a:t>Mid</a:t></a:r></a:p></a:txBody><a:tcPr anchor="ctr"/></a:tc>
+                      <a:tc><a:txBody><a:p><a:r><a:t>Bot</a:t></a:r></a:p></a:txBody><a:tcPr anchor="b"/></a:tc>
+                      <a:tc><a:txBody><a:p><a:r><a:t>Def</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>
+                    </a:tr>
+                  </a:tbl>
+                </a:graphicData></a:graphic>
+              </p:graphicFrame>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let table = match &slide.shapes[0].kind {
+            BlockKind::Table(t) => t,
+            other => panic!("expected a Table, got {other:?}"),
+        };
+        assert_eq!(
+            table.rows[0].cells[0].vertical_align,
+            Some(model::CellVAlign::Middle),
+            "anchor=ctr → Middle"
+        );
+        assert_eq!(
+            table.rows[0].cells[1].vertical_align,
+            Some(model::CellVAlign::Bottom),
+            "anchor=b → Bottom"
+        );
+        assert_eq!(
+            table.rows[0].cells[2].vertical_align, None,
+            "no anchor → None"
         );
     }
 

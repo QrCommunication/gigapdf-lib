@@ -99,8 +99,8 @@ img{position:absolute}</style></head><body>",
 
 use crate::model::CellValue;
 use crate::model::{
-    Align, Block, BlockKind, Cell, CharStyle, CodeBlock, Document, ImageRef, Inline, LinkTarget,
-    List, ListMarker, Paragraph, Shape, Sheet, SheetBlock, Slide, SlideBlock, Table,
+    Align, Block, BlockKind, Cell, CellVAlign, CharStyle, CodeBlock, Document, ImageRef, Inline,
+    LinkTarget, List, ListMarker, Paragraph, Shape, Sheet, SheetBlock, Slide, SlideBlock, Table,
 };
 
 /// Convert a unified [`Document`] to **semantic, reflowable** HTML: headings
@@ -352,14 +352,28 @@ fn html_cell(cell: &Cell, doc: &Document, out: &mut String) {
     if cell.row_span > 1 {
         attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
     }
+    // Accumulate inline-style declarations (shading, vertical alignment) into one
+    // `style` attribute; the HTML layout engine honours `vertical-align` on cells.
+    let mut style = String::new();
     if let Some([r, g, b]) = cell.shading {
         let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-        attrs.push_str(&format!(
-            " style=\"background-color:#{:02X}{:02X}{:02X}\"",
+        style.push_str(&format!(
+            "background-color:#{:02X}{:02X}{:02X};",
             q(r),
             q(g),
             q(b)
         ));
+    }
+    if let Some(va) = cell.vertical_align {
+        let v = match va {
+            CellVAlign::Top => "top",
+            CellVAlign::Middle => "middle",
+            CellVAlign::Bottom => "bottom",
+        };
+        style.push_str(&format!("vertical-align:{v};"));
+    }
+    if !style.is_empty() {
+        attrs.push_str(&format!(" style=\"{style}\""));
     }
     out.push_str(&format!("<td{attrs}>"));
     html_blocks(&cell.blocks, doc, out);

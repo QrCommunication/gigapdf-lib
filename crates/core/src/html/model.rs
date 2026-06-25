@@ -303,6 +303,9 @@ fn table_cell(td: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Ele
         col_span,
         row_span,
         shading: style.background,
+        // HTML→model: cell vertical alignment is not lowered here (a future
+        // enhancement could map `style.vertical_align`); `None` ⇒ format default.
+        vertical_align: None,
     }
 }
 

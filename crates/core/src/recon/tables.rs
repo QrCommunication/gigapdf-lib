@@ -485,6 +485,7 @@ fn make_cell_spanned(
         col_span: col_span.max(1),
         row_span: row_span.max(1),
         shading: None,
+        vertical_align: None,
     }
 }
 

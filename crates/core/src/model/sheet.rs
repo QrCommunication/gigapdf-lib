@@ -5,7 +5,7 @@
 //! editable counterpart of the XLSX/ODS reconstruction path — typed values, not
 //! a rasterised table.
 
-use crate::model::style::{Align, CharStyle};
+use crate::model::style::{Align, CellVAlign, CharStyle};
 use crate::model::BorderStyle;
 
 /// A block of spreadsheet content: one or more named sheets.
@@ -49,6 +49,11 @@ pub struct SheetCell {
     pub border: Option<BorderStyle>,
     /// Horizontal text alignment. `None` ⇒ the suite's default (general).
     pub align: Option<Align>,
+    /// Vertical text alignment within the cell. `None` ⇒ the suite's default
+    /// (`Bottom` for spreadsheet cells, per the OOXML `CT_CellAlignment@vertical`
+    /// default). Round-trips XLSX `xf/alignment@vertical` and ODS
+    /// `style:table-cell-properties@style:vertical-align`.
+    pub vertical_align: Option<CellVAlign>,
     /// Wrap text within the cell. `false` ⇒ no wrapping (default).
     pub wrap: bool,
     /// Cell hyperlink target (an external URL, or an in-workbook `#Sheet!A1`

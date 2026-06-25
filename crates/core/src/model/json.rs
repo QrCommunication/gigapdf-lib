@@ -37,7 +37,8 @@ use crate::model::geom::{Margins, PageGeometry, Rect, Rotation};
 use crate::model::sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
 use crate::model::slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 use crate::model::style::{
-    Align, CharStyle, LineHeight, NamedStyle, ParagraphStyle, StyleId, StyleTable, VAlign,
+    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParagraphStyle, StyleId, StyleTable,
+    VAlign,
 };
 use crate::model::{
     Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, DocMeta, Document, Heading,
@@ -715,6 +716,11 @@ impl Writer {
         self.k_u64("col_span", c.col_span as u64);
         self.k_u64("row_span", c.row_span as u64);
         self.k_opt_rgb("shading", &c.shading);
+        self.key("vertical_align");
+        match c.vertical_align {
+            Some(v) => self.str_val(cell_valign_tag(v)),
+            None => self.null(),
+        }
         self.obj_close();
     }
 
@@ -868,6 +874,11 @@ impl Writer {
             Some(a) => self.str_val(align_tag(a)),
             None => self.null(),
         }
+        self.key("vertical_align");
+        match c.vertical_align {
+            Some(v) => self.str_val(cell_valign_tag(v)),
+            None => self.null(),
+        }
         self.k_bool("wrap", c.wrap);
         self.key("hyperlink");
         match &c.hyperlink {
@@ -1013,6 +1024,14 @@ fn valign_tag(v: VAlign) -> &'static str {
         VAlign::Baseline => "baseline",
         VAlign::Super => "super",
         VAlign::Sub => "sub",
+    }
+}
+
+fn cell_valign_tag(v: CellVAlign) -> &'static str {
+    match v {
+        CellVAlign::Top => "top",
+        CellVAlign::Middle => "middle",
+        CellVAlign::Bottom => "bottom",
     }
 }
 fn generic_tag(g: Generic) -> &'static str {
@@ -1856,6 +1875,12 @@ impl<'a> Reader<'a> {
                 "col_span" => c.col_span = r.u16()?,
                 "row_span" => c.row_span = r.u16()?,
                 "shading" => c.shading = r.opt_rgb()?,
+                "vertical_align" => {
+                    c.vertical_align = match r.opt_string()? {
+                        Some(s) => Some(parse_cell_valign(&s)?),
+                        None => None,
+                    };
+                }
                 _ => return None,
             }
             Some(())
@@ -2013,6 +2038,12 @@ impl<'a> Reader<'a> {
                 "align" => {
                     c.align = match r.opt_string()? {
                         Some(s) => Some(parse_align(&s)?),
+                        None => None,
+                    };
+                }
+                "vertical_align" => {
+                    c.vertical_align = match r.opt_string()? {
+                        Some(s) => Some(parse_cell_valign(&s)?),
                         None => None,
                     };
                 }
@@ -2198,6 +2229,15 @@ fn parse_valign(s: &str) -> Option<VAlign> {
         _ => None,
     }
 }
+
+fn parse_cell_valign(s: &str) -> Option<CellVAlign> {
+    match s {
+        "top" => Some(CellVAlign::Top),
+        "middle" => Some(CellVAlign::Middle),
+        "bottom" => Some(CellVAlign::Bottom),
+        _ => None,
+    }
+}
 fn parse_generic(s: &str) -> Option<Generic> {
     match s {
         "sans" => Some(Generic::Sans),
@@ -2366,35 +2406,37 @@ mod tests {
         };
 
         // 2×2 table; cells carry nested paragraphs, spans, and an optional shade.
-        let mk_cell = |text: &str, shade: Option<[f64; 3]>, span: u16| Cell {
-            blocks: vec![Block {
-                id: BlockId(100),
-                frame: None,
-                rotation: Rotation::D0,
-                kind: BlockKind::Paragraph(Paragraph {
-                    runs: vec![Inline::Run(InlineRun {
-                        text: text.to_string(),
-                        style: CharStyle::default(),
-                        source_index: None,
-                    })],
-                    ..Default::default()
-                }),
-            }],
-            col_span: span,
-            row_span: 1,
-            shading: shade,
-        };
+        let mk_cell =
+            |text: &str, shade: Option<[f64; 3]>, span: u16, va: Option<CellVAlign>| Cell {
+                blocks: vec![Block {
+                    id: BlockId(100),
+                    frame: None,
+                    rotation: Rotation::D0,
+                    kind: BlockKind::Paragraph(Paragraph {
+                        runs: vec![Inline::Run(InlineRun {
+                            text: text.to_string(),
+                            style: CharStyle::default(),
+                            source_index: None,
+                        })],
+                        ..Default::default()
+                    }),
+                }],
+                col_span: span,
+                row_span: 1,
+                shading: shade,
+                vertical_align: va,
+            };
         let table = Table {
             rows: vec![
                 Row {
                     cells: vec![
-                        mk_cell("r0c0", Some([0.9, 0.9, 0.9]), 1),
-                        mk_cell("r0c1", None, 1),
+                        mk_cell("r0c0", Some([0.9, 0.9, 0.9]), 1, Some(CellVAlign::Middle)),
+                        mk_cell("r0c1", None, 1, None),
                     ],
                     height: Some(24.0),
                 },
                 Row {
-                    cells: vec![mk_cell("r1c0", None, 2)],
+                    cells: vec![mk_cell("r1c0", None, 2, Some(CellVAlign::Bottom))],
                     height: None,
                 },
             ],
@@ -2458,6 +2500,7 @@ mod tests {
                                     color: [0.2, 0.2, 0.2],
                                 }),
                                 align: Some(Align::Center),
+                                vertical_align: Some(CellVAlign::Middle),
                                 wrap: true,
                                 hyperlink: Some("https://example.com/".to_string()),
                             },

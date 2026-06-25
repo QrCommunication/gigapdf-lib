@@ -319,6 +319,7 @@ impl Walker<'_> {
                     col_span: 1,
                     row_span: 1,
                     shading: None,
+                    vertical_align: None,
                 });
             }
             if cells.is_empty() {

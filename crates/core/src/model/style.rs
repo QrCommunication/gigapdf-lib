@@ -28,6 +28,24 @@ pub enum VAlign {
     Sub,
 }
 
+/// Vertical alignment of a cell's content within its box, for table cells
+/// ([`Cell`](crate::model::Cell)) and spreadsheet cells
+/// ([`SheetCell`](crate::model::SheetCell)). Distinct from [`VAlign`], which is
+/// run-level superscript/subscript.
+///
+/// Used as `Option<CellVAlign>`: `None` ⇒ the format's default — `Top` for
+/// word-processing/ODF table cells (DOCX `w:vAlign` default, ODF
+/// `style:vertical-align` default), `Bottom` for spreadsheet cells (the OOXML
+/// `CT_CellAlignment@vertical` default). [`Default`] is [`Top`](CellVAlign::Top),
+/// matching the table-cell convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellVAlign {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
 /// Line height (leading) policy for a paragraph.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum LineHeight {
