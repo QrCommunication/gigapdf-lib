@@ -26,7 +26,7 @@ use crate::model::{
     ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Section, Shape,
     Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
 };
-use crate::model::{CellValue, PlaceholderRole};
+use crate::model::{CellValue, NamedStyle, ParagraphStyle, PlaceholderRole, StyleId, StyleTable};
 
 // ───────────────────────────── shared model walkers ─────────────────────────────
 
@@ -171,11 +171,11 @@ xmlns:dc=\"http://purl.org/dc/elements/1.1/\" office:version=\"1.3\">\
     )
 }
 
-/// ODF `<style:default-style>` carrying the document default language, for
-/// `styles.xml`'s `office:styles` block (ISO 26300 §16.2). Splits a BCP-47 tag
-/// into `fo:language` + `fo:country` (`fr-FR` → `fr` / `FR`). Empty when no
-/// language is set, so a language-less document emits nothing.
-fn odf_default_lang_styles(meta: &crate::model::DocMeta) -> String {
+/// The `<style:default-style>` inner markup carrying the document default
+/// language (ISO 26300 §16.2), *without* the enclosing `office:styles` block.
+/// Splits a BCP-47 tag into `fo:language` + `fo:country` (`fr-FR` → `fr` / `FR`).
+/// Empty when no language is set.
+fn odf_default_lang_inner(meta: &crate::model::DocMeta) -> String {
     let Some(tag) = meta.lang.as_deref().filter(|s| !s.is_empty()) else {
         return String::new();
     };
@@ -196,9 +196,117 @@ fn odf_default_lang_styles(meta: &crate::model::DocMeta) -> String {
         return String::new();
     }
     format!(
-        "<office:styles><style:default-style style:family=\"paragraph\">\
-<style:text-properties{attrs}/></style:default-style></office:styles>"
+        "<style:default-style style:family=\"paragraph\">\
+<style:text-properties{attrs}/></style:default-style>"
     )
+}
+
+/// ODF `<office:styles>` carrying the document default language (ISO 26300
+/// §16.2), or empty when no language is set. Used by the ODS/ODP exporters,
+/// which have no named-style table.
+fn odf_default_lang_styles(meta: &crate::model::DocMeta) -> String {
+    let inner = odf_default_lang_inner(meta);
+    if inner.is_empty() {
+        return String::new();
+    }
+    format!("<office:styles>{inner}</office:styles>")
+}
+
+/// ODF `<office:styles>` for a text document: the document's named paragraph
+/// styles (ISO 26300 §16) followed by the optional default-language style. Each
+/// named style is a `<style:style style:family="paragraph" style:name="…"
+/// style:display-name="…">` carrying `style:parent-style-name` (from `based_on`)
+/// and paragraph/text properties. A paragraph's `style_ref` references the
+/// matching `style:name`. Empty (no block) only when there are no named styles
+/// and no language.
+fn odf_text_named_styles(styles: &StyleTable, meta: &crate::model::DocMeta) -> String {
+    let mut inner = String::new();
+    for (id, style) in &styles.named {
+        if id.0.is_empty() {
+            continue;
+        }
+        inner.push_str(&odf_named_para_style(id, style));
+    }
+    inner.push_str(&odf_default_lang_inner(meta));
+    if inner.is_empty() {
+        return String::new();
+    }
+    format!("<office:styles>{inner}</office:styles>")
+}
+
+/// One named `<style:style style:family="paragraph">` for a modeled
+/// [`NamedStyle`]: `style:name` + `style:display-name` (both the style id),
+/// `style:parent-style-name` from `based_on` (when set and not self), and the
+/// paragraph/text properties. Only modeled deltas are emitted (no synthetic
+/// default size) so an inherited style stays inherited.
+fn odf_named_para_style(id: &StyleId, style: &NamedStyle) -> String {
+    let mut name = String::new();
+    esc(&id.0, &mut name);
+    let mut out = format!(
+        "<style:style style:name=\"{name}\" style:display-name=\"{name}\" style:family=\"paragraph\""
+    );
+    if let Some(parent) = style
+        .based_on
+        .as_ref()
+        .filter(|p| !p.0.is_empty() && **p != *id)
+    {
+        let mut p = String::new();
+        esc(&parent.0, &mut p);
+        out.push_str(&format!(" style:parent-style-name=\"{p}\""));
+    }
+    out.push('>');
+    let pattrs = odf_para_prop_attrs(&style.para);
+    if !pattrs.is_empty() {
+        out.push_str(&format!("<style:paragraph-properties{pattrs}/>"));
+    }
+    let tattrs = odf_named_text_attrs(&style.char_);
+    if !tattrs.is_empty() {
+        out.push_str(&format!("<style:text-properties{tattrs}/>"));
+    }
+    out.push_str("</style:style>");
+    out
+}
+
+/// The `fo:`/`style:` attributes of a named style's `<style:text-properties>`,
+/// emitting **only** modeled deltas (no synthesised default `fo:font-size`), so
+/// a style that merely sets, e.g., bold does not pin the font size. Empty when
+/// fully default.
+fn odf_named_text_attrs(style: &CharStyle) -> String {
+    let generic = match style.generic {
+        crate::convert::style::Generic::Sans => "swiss",
+        crate::convert::style::Generic::Serif => "roman",
+        crate::convert::style::Generic::Mono => "modern",
+    };
+    let mut p = String::new();
+    if style.size_pt > 0.0 {
+        p.push_str(&format!(" fo:font-size=\"{}pt\"", num(style.size_pt)));
+    }
+    if !style.family.is_empty() {
+        let mut fam = String::new();
+        esc(&style.family, &mut fam);
+        p.push_str(&format!(
+            " fo:font-family=\"{fam}\" style:font-family-generic=\"{generic}\""
+        ));
+    }
+    if style.bold {
+        p.push_str(" fo:font-weight=\"bold\"");
+    }
+    if style.italic {
+        p.push_str(" fo:font-style=\"italic\"");
+    }
+    if style.underline {
+        p.push_str(" style:text-underline-style=\"solid\" style:text-underline-width=\"auto\"");
+    }
+    if style.strike {
+        p.push_str(" style:text-line-through-style=\"solid\"");
+    }
+    if let Some(c) = visible_color(style) {
+        p.push_str(&format!(" fo:color=\"#{c}\""));
+    }
+    if let Some(bg) = style.background {
+        p.push_str(&format!(" fo:background-color=\"#{}\"", hex(bg)));
+    }
+    p
 }
 
 // ════════════════════════════════════ DOCX ════════════════════════════════════
@@ -257,7 +365,7 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
     );
     zip.add_deflated(
         "word/styles.xml",
-        docx_styles_xml(doc.meta.lang.as_deref()).as_bytes(),
+        docx_styles_xml(doc.meta.lang.as_deref(), &doc.styles).as_bytes(),
     );
     if has_num {
         zip.add_deflated(
@@ -382,7 +490,9 @@ fn docx_blocks(blocks: &[Block], ctx: &mut DocxCtx) -> String {
 
 fn docx_block(block: &Block, ctx: &mut DocxCtx, out: &mut String) {
     match &block.kind {
-        BlockKind::Paragraph(p) => out.push_str(&docx_para(p, None, 0, ctx)),
+        BlockKind::Paragraph(p) => {
+            out.push_str(&docx_para(p, style_ref_id(p.style_ref.as_ref()), 0, ctx))
+        }
         BlockKind::Heading(h) => out.push_str(&docx_heading(h, ctx)),
         BlockKind::List(list) => docx_list(list, ctx, out),
         BlockKind::Table(table) => out.push_str(&docx_table(table, ctx)),
@@ -436,6 +546,14 @@ fn docx_hr() -> &'static str {
 w:color=\"999999\"/></w:pBdr></w:pPr></w:p>"
 }
 
+/// A paragraph's named-style reference as a borrowed style id, or `None` when
+/// the paragraph carries no (non-empty) `style_ref`. The id flows verbatim into
+/// a DOCX `w:pStyle w:val` / ODF `text:style-name`, matching the `w:styleId` /
+/// `style:name` emitted into the styles part.
+fn style_ref_id(style_ref: Option<&StyleId>) -> Option<&str> {
+    style_ref.map(|id| id.0.as_str()).filter(|s| !s.is_empty())
+}
+
 /// One paragraph. `style_id` (e.g. `Some("Heading1")`) emits a `w:pStyle`;
 /// `num_id` > 0 wires the paragraph into list numbering at `level`.
 fn docx_para(para: &Paragraph, style_id: Option<&str>, num_level: u8, ctx: &mut DocxCtx) -> String {
@@ -451,50 +569,18 @@ fn docx_para_numbered(
 ) -> String {
     let mut ppr = String::from("<w:pPr>");
     if let Some(id) = style_id {
-        ppr.push_str(&format!("<w:pStyle w:val=\"{id}\"/>"));
+        let mut v = String::new();
+        esc(id, &mut v);
+        ppr.push_str(&format!("<w:pStyle w:val=\"{v}\"/>"));
     }
     if num_id > 0 {
         ppr.push_str(&format!(
             "<w:numPr><w:ilvl w:val=\"{num_level}\"/><w:numId w:val=\"{num_id}\"/></w:numPr>"
         ));
     }
-    let ps = &para.style;
-    let mut spacing = String::new();
-    if ps.space_before_pt > 0.0 {
-        spacing.push_str(&format!(" w:before=\"{}\"", twips(ps.space_before_pt)));
-    }
-    if ps.space_after_pt > 0.0 {
-        spacing.push_str(&format!(" w:after=\"{}\"", twips(ps.space_after_pt)));
-    }
-    if let LineHeight::Multiple(m) = ps.line_height {
-        spacing.push_str(&format!(
-            " w:line=\"{}\" w:lineRule=\"auto\"",
-            (m * 240.0).round() as i64
-        ));
-    } else if let LineHeight::Points(p) = ps.line_height {
-        spacing.push_str(&format!(" w:line=\"{}\" w:lineRule=\"exact\"", twips(p)));
-    }
-    if !spacing.is_empty() {
-        ppr.push_str(&format!("<w:spacing{spacing}/>"));
-    }
-    if ps.indent_left_pt != 0.0 || ps.indent_right_pt != 0.0 || ps.first_line_pt != 0.0 {
-        let mut ind = String::new();
-        if ps.indent_left_pt != 0.0 {
-            ind.push_str(&format!(" w:left=\"{}\"", twips(ps.indent_left_pt)));
-        }
-        if ps.indent_right_pt != 0.0 {
-            ind.push_str(&format!(" w:right=\"{}\"", twips(ps.indent_right_pt)));
-        }
-        if ps.first_line_pt > 0.0 {
-            ind.push_str(&format!(" w:firstLine=\"{}\"", twips(ps.first_line_pt)));
-        } else if ps.first_line_pt < 0.0 {
-            ind.push_str(&format!(" w:hanging=\"{}\"", twips(-ps.first_line_pt)));
-        }
-        ppr.push_str(&format!("<w:ind{ind}/>"));
-    }
-    if let Some(jc) = docx_jc(ps.align) {
-        ppr.push_str(&format!("<w:jc w:val=\"{jc}\"/>"));
-    }
+    // Direct paragraph formatting (overrides any referenced named style). Shares
+    // the named-style property writer so direct and named formatting agree.
+    ppr.push_str(&docx_style_ppr_props(&para.style));
     ppr.push_str("</w:pPr>");
 
     let mut runs = String::new();
@@ -513,9 +599,14 @@ fn docx_jc(align: Align) -> Option<&'static str> {
 
 fn docx_heading(h: &Heading, ctx: &mut DocxCtx) -> String {
     let level = h.level.clamp(1, 6);
-    let style = format!("Heading{level}");
     // A heading paragraph carries the style id; the outline level is implied by
-    // the named style (defined in styles.xml).
+    // the named style (defined in styles.xml). An explicit `style_ref` on the
+    // paragraph wins over the level-derived `HeadingN` so a modeled named style
+    // is honoured.
+    let style = match h.para.style_ref.as_ref() {
+        Some(id) => id.0.clone(),
+        None => format!("Heading{level}"),
+    };
     docx_para(&h.para, Some(&style), 0, ctx)
 }
 
@@ -954,11 +1045,23 @@ Target=\"media/image{n}.png\"/>",
     s
 }
 
-/// Minimal styles.xml defining `Normal` + `Heading1`..`Heading6` with outline
-/// levels, so heading paragraphs are recognised as such. When the document
-/// carries a language tag, a `w:docDefaults` default-run language is emitted
-/// (ECMA-376 §17.7.5.7) so spell-check / hyphenation pick the right language.
-fn docx_styles_xml(lang: Option<&str>) -> String {
+/// Style ids reserved by the built-in `Normal` + `Heading1`..`Heading6` styles
+/// (ECMA-376 §17.7.4). A modeled [`NamedStyle`] reusing one of these is *not*
+/// re-emitted (a duplicate `w:styleId` is invalid OOXML); the built-in keeps
+/// its sensible defaults, and a paragraph referencing the id still resolves.
+const DOCX_RESERVED_STYLE_IDS: [&str; 7] = [
+    "Normal", "Heading1", "Heading2", "Heading3", "Heading4", "Heading5", "Heading6",
+];
+
+/// `styles.xml` defining the built-in `Normal` + `Heading1`..`Heading6` (with
+/// outline levels) plus every modeled [`NamedStyle`] from the document's
+/// [`StyleTable`] (ECMA-376 §17.7.4): each emits a `w:style w:type="paragraph"`
+/// with a `w:name`, an optional `w:basedOn`, and `w:pPr`/`w:rPr` from the
+/// style's paragraph/character formatting. A paragraph's `style_ref` resolves to
+/// the matching `w:styleId`. When the document carries a language tag a
+/// `w:docDefaults` default-run language is emitted (ECMA-376 §17.7.5.7) so
+/// spell-check / hyphenation pick the right language.
+fn docx_styles_xml(lang: Option<&str>, styles: &StyleTable) -> String {
     let defaults = match lang.filter(|s| !s.is_empty()) {
         Some(tag) => {
             let mut v = String::new();
@@ -985,8 +1088,137 @@ fn docx_styles_xml(lang: Option<&str>) -> String {
             ol = i,
         ));
     }
+    for (id, style) in &styles.named {
+        if id.0.is_empty() || DOCX_RESERVED_STYLE_IDS.contains(&id.0.as_str()) {
+            continue;
+        }
+        s.push_str(&docx_named_style(id, style));
+    }
     s.push_str("</w:styles>");
     s
+}
+
+/// One `<w:style w:type="paragraph">` for a modeled [`NamedStyle`] (ECMA-376
+/// §17.7.4): `w:name` (display name = the style id), `w:basedOn` when the style
+/// derives from another (and that parent is not the style itself), and
+/// `w:pPr`/`w:rPr` carrying the paragraph/character formatting.
+fn docx_named_style(id: &StyleId, style: &NamedStyle) -> String {
+    let mut sid = String::new();
+    esc(&id.0, &mut sid);
+    let mut out =
+        format!("<w:style w:type=\"paragraph\" w:styleId=\"{sid}\"><w:name w:val=\"{sid}\"/>");
+    if let Some(parent) = style
+        .based_on
+        .as_ref()
+        .filter(|p| !p.0.is_empty() && **p != *id)
+    {
+        let mut p = String::new();
+        esc(&parent.0, &mut p);
+        out.push_str(&format!("<w:basedOn w:val=\"{p}\"/>"));
+    }
+    let ppr = docx_style_ppr_props(&style.para);
+    if !ppr.is_empty() {
+        out.push_str(&format!("<w:pPr>{ppr}</w:pPr>"));
+    }
+    let rpr = docx_named_rpr(&style.char_);
+    if !rpr.is_empty() {
+        out.push_str(&format!("<w:rPr>{rpr}</w:rPr>"));
+    }
+    out.push_str("</w:style>");
+    out
+}
+
+/// The inner `<w:pPr>` children (spacing / indent / justification) for a
+/// [`ParagraphStyle`], without the enclosing `<w:pPr>` tag. Empty when the style
+/// is fully default. Shared by the named-style writer and direct paragraph
+/// formatting so the two stay in lock-step.
+fn docx_style_ppr_props(ps: &ParagraphStyle) -> String {
+    let mut out = String::new();
+    let mut spacing = String::new();
+    if ps.space_before_pt > 0.0 {
+        spacing.push_str(&format!(" w:before=\"{}\"", twips(ps.space_before_pt)));
+    }
+    if ps.space_after_pt > 0.0 {
+        spacing.push_str(&format!(" w:after=\"{}\"", twips(ps.space_after_pt)));
+    }
+    if let LineHeight::Multiple(m) = ps.line_height {
+        spacing.push_str(&format!(
+            " w:line=\"{}\" w:lineRule=\"auto\"",
+            (m * 240.0).round() as i64
+        ));
+    } else if let LineHeight::Points(p) = ps.line_height {
+        spacing.push_str(&format!(" w:line=\"{}\" w:lineRule=\"exact\"", twips(p)));
+    }
+    if !spacing.is_empty() {
+        out.push_str(&format!("<w:spacing{spacing}/>"));
+    }
+    if ps.indent_left_pt != 0.0 || ps.indent_right_pt != 0.0 || ps.first_line_pt != 0.0 {
+        let mut ind = String::new();
+        if ps.indent_left_pt != 0.0 {
+            ind.push_str(&format!(" w:left=\"{}\"", twips(ps.indent_left_pt)));
+        }
+        if ps.indent_right_pt != 0.0 {
+            ind.push_str(&format!(" w:right=\"{}\"", twips(ps.indent_right_pt)));
+        }
+        if ps.first_line_pt > 0.0 {
+            ind.push_str(&format!(" w:firstLine=\"{}\"", twips(ps.first_line_pt)));
+        } else if ps.first_line_pt < 0.0 {
+            ind.push_str(&format!(" w:hanging=\"{}\"", twips(-ps.first_line_pt)));
+        }
+        out.push_str(&format!("<w:ind{ind}/>"));
+    }
+    if let Some(jc) = docx_jc(ps.align) {
+        out.push_str(&format!("<w:jc w:val=\"{jc}\"/>"));
+    }
+    out
+}
+
+/// The inner `<w:rPr>` children for a named style's [`CharStyle`], without the
+/// enclosing `<w:rPr>` tag and **without** synthesising a default size/colour —
+/// only modeled deltas are emitted so a style that merely sets, e.g., `bold`
+/// does not override the inherited font size. Empty when fully default.
+fn docx_named_rpr(style: &CharStyle) -> String {
+    let mut p = String::new();
+    if !style.family.is_empty() {
+        let mut fam = String::new();
+        esc(&style.family, &mut fam);
+        p.push_str(&format!(
+            "<w:rFonts w:ascii=\"{fam}\" w:hAnsi=\"{fam}\" w:cs=\"{fam}\"/>"
+        ));
+    }
+    if style.bold {
+        p.push_str("<w:b/>");
+    }
+    if style.italic {
+        p.push_str("<w:i/>");
+    }
+    if style.underline {
+        p.push_str("<w:u w:val=\"single\"/>");
+    }
+    if style.strike {
+        p.push_str("<w:strike/>");
+    }
+    match style.vertical_align {
+        VAlign::Super => p.push_str("<w:vertAlign w:val=\"superscript\"/>"),
+        VAlign::Sub => p.push_str("<w:vertAlign w:val=\"subscript\"/>"),
+        VAlign::Baseline => {}
+    }
+    if let Some(c) = visible_color(style) {
+        p.push_str(&format!("<w:color w:val=\"{c}\"/>"));
+    }
+    if let Some(bg) = style.background {
+        p.push_str(&format!(
+            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{}\"/>",
+            hex(bg)
+        ));
+    }
+    if style.size_pt > 0.0 {
+        p.push_str(&format!(
+            "<w:sz w:val=\"{}\"/>",
+            (style.size_pt * 2.0).round().max(1.0) as i64
+        ));
+    }
+    p
 }
 
 /// numbering.xml with one abstract+concrete numbering per list instance. The
@@ -2167,7 +2399,7 @@ pub fn odt_from_model(doc: &Document) -> Vec<u8> {
             &hf_ctx.auto,
             header_xml.as_deref(),
             footer_xml.as_deref(),
-            &odf_default_lang_styles(&doc.meta),
+            &odf_text_named_styles(&doc.styles, &doc.meta),
         )
         .as_bytes(),
     );
@@ -2414,13 +2646,46 @@ fo:margin-top=\"6pt\" fo:margin-bottom=\"6pt\"/></style:style>"
 
 /// One paragraph or heading. `tag` is `"p"` or `"h"`; `extra` adds attributes
 /// (e.g. the outline level for a heading).
+///
+/// When the paragraph carries a non-empty `style_ref`, it references the matching
+/// named `style:style` (emitted in `styles.xml`'s `office:styles`): if there is
+/// no direct paragraph formatting, the named style is referenced *directly*
+/// (`text:style-name="…"`); otherwise an automatic style inheriting it
+/// (`style:parent-style-name="…"`) carries the overrides. Without a `style_ref`,
+/// an anonymous automatic style is used as before.
 fn odt_paragraph(para: &Paragraph, tag: &str, extra: Option<&str>, ctx: &mut OdfCtx) -> String {
-    let pid = ctx.next_style();
-    let style_name = format!("P{pid}");
-    ctx.auto.push_str(&odf_para_style(&style_name, para));
     let extra = extra.unwrap_or("");
     let mut runs = String::new();
     odt_runs(&para.runs, ctx, &mut runs);
+
+    let style_name = match style_ref_id(para.style_ref.as_ref()) {
+        Some(named) => {
+            let direct = odf_para_prop_attrs(&para.style);
+            if direct.is_empty() {
+                // Reference the named style directly — no automatic style needed.
+                let mut n = String::new();
+                esc(named, &mut n);
+                n
+            } else {
+                // Automatic style inheriting the named style, carrying overrides.
+                let pid = ctx.next_style();
+                let auto_name = format!("P{pid}");
+                let mut parent = String::new();
+                esc(named, &mut parent);
+                ctx.auto.push_str(&format!(
+                    "<style:style style:name=\"{auto_name}\" style:family=\"paragraph\" \
+style:parent-style-name=\"{parent}\"><style:paragraph-properties{direct}/></style:style>"
+                ));
+                auto_name
+            }
+        }
+        None => {
+            let pid = ctx.next_style();
+            let auto_name = format!("P{pid}");
+            ctx.auto.push_str(&odf_para_style(&auto_name, para));
+            auto_name
+        }
+    };
     format!("<text:{tag} text:style-name=\"{style_name}\"{extra}>{runs}</text:{tag}>")
 }
 
@@ -2654,10 +2919,12 @@ style:print-orientation=\"{o}\"{margin_attrs}/></style:page-layout></office:auto
     )
 }
 
-/// ODF `<style:style family="paragraph">` from a model paragraph style.
-fn odf_para_style(name: &str, para: &Paragraph) -> String {
-    let ps = &para.style;
-    let mut props = String::from("<style:paragraph-properties");
+/// The `fo:`/`style:` attributes of a paragraph style's
+/// `<style:paragraph-properties>` (alignment, spacing, indents, leading), or an
+/// empty string when the style is fully default. Shared by the automatic-style
+/// writer, the named-style writer, and the override-detection in `odt_paragraph`.
+fn odf_para_prop_attrs(ps: &ParagraphStyle) -> String {
+    let mut props = String::new();
     match ps.align {
         Align::Left => {}
         Align::Center => props.push_str(" fo:text-align=\"center\""),
@@ -2693,8 +2960,18 @@ fn odf_para_style(name: &str, para: &Paragraph) -> String {
     } else if let LineHeight::Points(p) = ps.line_height {
         props.push_str(&format!(" fo:line-height=\"{}pt\"", num(p)));
     }
-    props.push_str("/>");
-    format!("<style:style style:name=\"{name}\" style:family=\"paragraph\">{props}</style:style>")
+    props
+}
+
+/// ODF automatic `<style:style family="paragraph">` from a model paragraph
+/// style. The `<style:paragraph-properties>` shell is always emitted (matching
+/// the historical output) even when fully default.
+fn odf_para_style(name: &str, para: &Paragraph) -> String {
+    let attrs = odf_para_prop_attrs(&para.style);
+    format!(
+        "<style:style style:name=\"{name}\" style:family=\"paragraph\">\
+<style:paragraph-properties{attrs}/></style:style>"
+    )
 }
 
 /// ODF `<style:style family="text">` from a model char style.
@@ -5250,6 +5527,126 @@ mod tests {
         assert!(styles.contains("w:styleId=\"Heading1\""));
     }
 
+    /// A document carrying a named style table (`"Body"` derived from `"Normal"`,
+    /// with centred alignment + bold + an explicit size) and a single paragraph
+    /// referencing it via `style_ref`.
+    fn styled_doc() -> Document {
+        let mut styles = StyleTable::default();
+        styles.named.insert(
+            StyleId("Body".to_string()),
+            NamedStyle {
+                para: ParagraphStyle {
+                    align: Align::Center,
+                    ..Default::default()
+                },
+                char_: CharStyle {
+                    bold: true,
+                    size_pt: 13.0,
+                    ..Default::default()
+                },
+                based_on: Some(StyleId("Normal".to_string())),
+            },
+        );
+        let p = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style_ref: Some(StyleId("Body".to_string())),
+                runs: vec![run("styled body text")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Document {
+            styles,
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![p],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn docx_named_style_table_emitted_and_referenced() {
+        let bytes = docx_from_model(&styled_doc());
+
+        // styles.xml defines the named style, based on Normal, with pPr/rPr.
+        let styles = String::from_utf8(entry(&bytes, "word/styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("<w:style w:type=\"paragraph\" w:styleId=\"Body\">"),
+            "named style declared: {styles}"
+        );
+        assert!(
+            styles.contains("<w:name w:val=\"Body\"/>"),
+            "style has a name"
+        );
+        assert!(
+            styles.contains("<w:basedOn w:val=\"Normal\"/>"),
+            "based_on → w:basedOn"
+        );
+        assert!(
+            styles.contains("<w:jc w:val=\"center\"/>"),
+            "paragraph formatting in pPr"
+        );
+        assert!(styles.contains("<w:b/>"), "char formatting in rPr");
+        assert!(
+            styles.contains("<w:sz w:val=\"26\"/>"),
+            "explicit 13pt → 26 half-points in rPr"
+        );
+        // The built-in Normal/Heading styles are still present (no duplicate id).
+        assert!(styles.contains("w:styleId=\"Normal\""));
+        assert_eq!(
+            styles.matches("w:styleId=\"Body\"").count(),
+            1,
+            "no duplicate styleId"
+        );
+
+        // The paragraph references the named style.
+        let doc = String::from_utf8(entry(&bytes, "word/document.xml").unwrap()).unwrap();
+        assert!(
+            doc.contains("<w:pStyle w:val=\"Body\"/>"),
+            "paragraph references the named style: {doc}"
+        );
+
+        // OPC invariants: styles.xml declared in Content_Types + the doc rels.
+        let ct = String::from_utf8(entry(&bytes, "[Content_Types].xml").unwrap()).unwrap();
+        assert!(
+            ct.contains("PartName=\"/word/styles.xml\""),
+            "styles.xml in [Content_Types].xml"
+        );
+        let rels =
+            String::from_utf8(entry(&bytes, "word/_rels/document.xml.rels").unwrap()).unwrap();
+        assert!(
+            rels.contains("Target=\"styles.xml\""),
+            "styles.xml relationship present"
+        );
+    }
+
+    #[test]
+    fn docx_named_style_does_not_duplicate_builtin_id() {
+        // A model style reusing a reserved id (`Heading1`) must not be re-emitted.
+        let mut d = styled_doc();
+        d.styles.named.insert(
+            StyleId("Heading1".to_string()),
+            NamedStyle {
+                char_: CharStyle {
+                    italic: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let bytes = docx_from_model(&d);
+        let styles = String::from_utf8(entry(&bytes, "word/styles.xml").unwrap()).unwrap();
+        assert_eq!(
+            styles.matches("w:styleId=\"Heading1\"").count(),
+            1,
+            "the built-in Heading1 is kept; the model duplicate is skipped"
+        );
+    }
+
     #[test]
     fn docx_header_footer_parts_emitted() {
         let mut d = sample_doc();
@@ -5859,6 +6256,64 @@ mod tests {
         assert!(
             content.contains("table:number-columns-spanned=\"2\""),
             "spanned cell"
+        );
+    }
+
+    #[test]
+    fn odt_named_style_emitted_and_referenced() {
+        let bytes = odt_from_model(&styled_doc());
+
+        // styles.xml's office:styles defines the named paragraph style.
+        let styles = String::from_utf8(entry(&bytes, "styles.xml").unwrap()).unwrap();
+        assert!(
+            styles.contains("<office:styles>"),
+            "office:styles block present"
+        );
+        assert!(
+            styles.contains(
+                "<style:style style:name=\"Body\" style:display-name=\"Body\" \
+style:family=\"paragraph\""
+            ),
+            "named style declared: {styles}"
+        );
+        assert!(
+            styles.contains("style:parent-style-name=\"Normal\""),
+            "based_on → style:parent-style-name"
+        );
+        assert!(
+            styles.contains("fo:text-align=\"center\""),
+            "paragraph props on the named style"
+        );
+        assert!(
+            styles.contains("fo:font-weight=\"bold\"") && styles.contains("fo:font-size=\"13pt\""),
+            "text props on the named style"
+        );
+
+        // The paragraph (no direct override) references the named style directly.
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<text:p text:style-name=\"Body\">"),
+            "paragraph references the named style: {content}"
+        );
+    }
+
+    #[test]
+    fn odt_named_style_override_inherits_via_parent() {
+        // A paragraph with BOTH a style_ref and direct formatting gets an
+        // automatic style that inherits the named style and carries the override.
+        let mut d = styled_doc();
+        if let BlockKind::Paragraph(p) = &mut d.sections[0].pages[0].blocks[0].kind {
+            p.style.indent_left_pt = 18.0;
+        }
+        let bytes = odt_from_model(&d);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("style:parent-style-name=\"Body\""),
+            "override inherits the named style via parent: {content}"
+        );
+        assert!(
+            content.contains("fo:margin-left=\"18pt\""),
+            "direct override is present on the automatic style"
         );
     }
 
