@@ -3190,17 +3190,54 @@ fn odp_body(slides: &[Slide], doc: &Document, ctx: &mut OdfCtx) -> String {
     for slide in slides {
         body.push_str("<draw:page draw:style-name=\"dp1\" draw:master-page-name=\"Default\">");
         for ph in &slide.placeholders {
-            odp_frame(&ph.block, slide, doc, ctx, &mut body);
+            odp_frame(&ph.block, Some(&ph.role), slide, doc, ctx, &mut body);
         }
         for sh in &slide.shapes {
-            odp_frame(sh, slide, doc, ctx, &mut body);
+            odp_frame(sh, None, slide, doc, ctx, &mut body);
         }
         body.push_str("</draw:page>");
     }
     body
 }
 
-fn odp_frame(block: &Block, slide: &Slide, doc: &Document, ctx: &mut OdfCtx, out: &mut String) {
+/// ODF `presentation:class` value for a placeholder [`PlaceholderRole`]
+/// (ISO 26300 §9.6.1 / §19.x). The inverse of [`office_import`'s
+/// `odp_placeholder_role`]: `Title`/`Subtitle` map to `title`/`subtitle`,
+/// `Body` to the canonical body class `outline`, and `Other(token)` emits the
+/// preserved token verbatim (ODF supports e.g. `footer`, `page-number`,
+/// `date-time`, `notes` natively), so the role round-trips losslessly.
+fn odp_presentation_class(role: &PlaceholderRole) -> String {
+    match role {
+        PlaceholderRole::Title => "title".to_string(),
+        PlaceholderRole::Subtitle => "subtitle".to_string(),
+        PlaceholderRole::Body => "outline".to_string(),
+        PlaceholderRole::Other(token) => {
+            let mut s = String::new();
+            esc(token.trim(), &mut s);
+            s
+        }
+    }
+}
+
+fn odp_frame(
+    block: &Block,
+    role: Option<&PlaceholderRole>,
+    slide: &Slide,
+    doc: &Document,
+    ctx: &mut OdfCtx,
+    out: &mut String,
+) {
+    // For a semantic placeholder, carry its ODF `presentation:class` (+
+    // `presentation:placeholder="true"`) on the emitted draw element so viewers
+    // treat it as title/subtitle/body. Free shapes (role = None) get nothing.
+    let pres = role
+        .map(|r| {
+            format!(
+                " presentation:class=\"{}\" presentation:placeholder=\"true\"",
+                odp_presentation_class(r)
+            )
+        })
+        .unwrap_or_default();
     let r = block.frame.unwrap_or(crate::model::Rect::new(
         0.0,
         0.0,
@@ -3216,7 +3253,7 @@ fn odp_frame(block: &Block, slide: &Slide, doc: &Document, ctx: &mut OdfCtx, out
             ctx.images.push(png);
             let n = ctx.images.len();
             out.push_str(&format!(
-                "<draw:frame draw:style-name=\"frI\" draw:layer=\"layout\" \
+                "<draw:frame draw:style-name=\"frI\" draw:layer=\"layout\"{pres} \
 svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">\
 <draw:image xlink:href=\"Pictures/img{n}.png\" xlink:type=\"simple\" xlink:show=\"embed\" \
 xlink:actuate=\"onLoad\"/></draw:frame>",
@@ -3233,7 +3270,7 @@ xlink:actuate=\"onLoad\"/></draw:frame>",
             ctx.auto.push_str(&odf_shape_style(&sname, &placed));
             if shape_is_rect(&placed) {
                 out.push_str(&format!(
-                    "<draw:rect draw:style-name=\"{sname}\" draw:layer=\"layout\" \
+                    "<draw:rect draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
 svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>",
                     x = num(r.x),
                     y = num(r.y),
@@ -3242,7 +3279,7 @@ svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>",
                 ));
             } else {
                 out.push_str(&format!(
-                    "<draw:path draw:style-name=\"{sname}\" draw:layer=\"layout\" \
+                    "<draw:path draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
 svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
 svg:viewBox=\"0 0 {vw} {vh}\" svg:d=\"{d}\"/>",
                     x = num(r.x),
@@ -3262,7 +3299,7 @@ svg:viewBox=\"0 0 {vw} {vh}\" svg:d=\"{d}\"/>",
             // `ctx.auto`); we only wrap it in the positioned frame here.
             let table_xml = odt_table(table, ctx);
             out.push_str(&format!(
-                "<draw:frame draw:layer=\"layout\" \
+                "<draw:frame draw:layer=\"layout\"{pres} \
 svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\">{table_xml}</draw:frame>",
                 x = num(r.x),
                 y = num(r.y),
@@ -3285,7 +3322,7 @@ draw:textarea-vertical-align=\"top\"/></style:style>"
                 content.push_str(&odt_paragraph(&p, "p", None, ctx));
             }
             out.push_str(&format!(
-                "<draw:frame draw:style-name=\"{sname}\" draw:layer=\"layout\" \
+                "<draw:frame draw:style-name=\"{sname}\" draw:layer=\"layout\"{pres} \
 svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"><draw:text-box>{content}</draw:text-box></draw:frame>",
                 x = num(r.x),
                 y = num(r.y),
@@ -6020,6 +6057,115 @@ mod tests {
         for t in ["R1C1", "R1C2", "R2C1", "R2C2"] {
             assert!(content.contains(t), "cell text {t} preserved");
         }
+    }
+
+    #[test]
+    fn odp_placeholder_role_emits_presentation_class() {
+        // #25: a slide placeholder carries its ODF `presentation:class`
+        // (+ `presentation:placeholder="true"`) on the emitted `draw:frame`
+        // (ISO 26300 §9.6.1), mirroring the PPTX `p:ph type=` mapping. A free
+        // (non-placeholder) shape gets neither attribute.
+        use crate::model::{Placeholder, PlaceholderRole, Slide, SlideBlock};
+
+        let ph = |text: &str, role: PlaceholderRole, y: f64| Placeholder {
+            role,
+            block: Block {
+                frame: Some(crate::model::Rect::new(40.0, y, 880.0, 80.0)),
+                ..para(text)
+            },
+        };
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+            },
+            // A free text-box shape (not a placeholder) must stay role-less.
+            shapes: vec![Block {
+                frame: Some(crate::model::Rect::new(40.0, 460.0, 880.0, 40.0)),
+                ..para("free shape")
+            }],
+            placeholders: vec![
+                ph("The Title", PlaceholderRole::Title, 20.0),
+                ph("A subtitle", PlaceholderRole::Subtitle, 120.0),
+                ph("Body bullet", PlaceholderRole::Body, 220.0),
+                // An unmapped role keeps its original ODF class token verbatim.
+                ph(
+                    "Confidential",
+                    PlaceholderRole::Other("footer".to_string()),
+                    420.0,
+                ),
+            ],
+            notes: None,
+            background: None,
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let bytes = odp_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        // Each placeholder frame carries its presentation:class + the marker.
+        for class in ["title", "subtitle", "outline", "footer"] {
+            assert!(
+                content.contains(&format!("presentation:class=\"{class}\"")),
+                "placeholder class {class} emitted: {content}"
+            );
+        }
+        assert_eq!(
+            content.matches("presentation:placeholder=\"true\"").count(),
+            4,
+            "one placeholder marker per placeholder (and none on the free shape)",
+        );
+        // The four placeholder texts survive in their frames.
+        for t in ["The Title", "A subtitle", "Body bullet", "Confidential"] {
+            assert!(content.contains(t), "placeholder text {t} preserved");
+        }
+        // The free shape's text frame must NOT carry a presentation:class. It is
+        // the only frame holding "free shape", so the class count stays at 4.
+        assert!(content.contains("free shape"), "free shape text preserved");
+        assert_eq!(
+            content.matches("presentation:class=").count(),
+            4,
+            "no presentation:class on the free (non-placeholder) shape: {content}",
+        );
+
+        // Round-trip: re-import the exported ODP and confirm each emitted class
+        // restores the original PlaceholderRole (`outline` → Body, `footer` kept
+        // as Other("footer")), and the free shape stays a non-placeholder shape.
+        let back =
+            crate::convert::office_import::odp_to_model(&crate::convert::zip::read_zip(&bytes));
+        let slides_back = collect_slides(&back);
+        let s0 = slides_back.first().expect("one slide round-trips");
+        let roles: Vec<PlaceholderRole> = s0.placeholders.iter().map(|p| p.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec![
+                PlaceholderRole::Title,
+                PlaceholderRole::Subtitle,
+                PlaceholderRole::Body,
+                PlaceholderRole::Other("footer".to_string()),
+            ],
+            "placeholder roles round-trip losslessly",
+        );
+        assert_eq!(
+            s0.shapes.len(),
+            1,
+            "the free shape stays a non-placeholder shape on re-import",
+        );
     }
 
     #[test]
