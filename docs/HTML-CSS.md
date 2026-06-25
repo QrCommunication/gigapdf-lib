@@ -405,6 +405,35 @@ Generic families resolve to a bundled face:
 | `monospace`, `Courier*`, `*mono*`, `Consol*` | a monospace face |
 | anything else | the named family (downloaded), else the default sans |
 
+### Inline `@font-face`
+
+A document can **embed its own web font** with an inline data-URI source:
+
+```html
+<style>
+  @font-face {
+    font-family: "Brand";
+    font-weight: 700;          /* normal/bold or a number (1–1000) */
+    font-style: italic;        /* normal / italic / oblique */
+    src: url(data:font/woff2;base64,d09GMgAB…) format("woff2");
+  }
+</style>
+<p style="font-family: Brand; font-weight: 700; font-style: italic">Hello</p>
+```
+
+The font bytes are decoded straight from the `data:` URI (base64 or raw/percent)
+and registered as a render face — **no download, no host round-trip**. Supported
+font formats: **TTF/OTF, WOFF (1) and WOFF2** (WOFF2 is decompressed and its
+`glyf` transform reversed in-engine). The rule's `font-weight` / `font-style` are
+honoured by the CSS font-matching algorithm, so distinct inline weights/styles of
+one family are individually selectable, exactly like host-provided fonts.
+
+A `src` may list several alternatives (`url(a.woff2) format("woff2"),
+url(b.woff)`); they are tried in order and the first that decodes wins. An
+**external** `src: url(https://… )` / `url(/path…)` is **skipped** — the engine
+never touches the network or disk; to use such a font, fetch it yourself and pass
+it through the normal font input (phase 2) instead.
+
 ### Colour emoji
 
 If the resolved font carries **COLR v0 + CPAL** colour tables (e.g.
@@ -453,7 +482,9 @@ subset.
   glyphs offset in the shadow colour, with blur approximated; `background-image`
   fills the box (no repeat/position/size). See [transforms](#transforms),
   [backgrounds](#backgrounds) and [shadows](#shadows).)
-- **Typography**: `@font-face` (fonts come from the Google-fonts pipeline),
+- **Typography**: `@font-face` with an **external** `src: url(…)` (a path/URL is
+  never fetched — host the font yourself; an **inline** `src: url(data:…)` font
+  **is** decoded and rendered, see [inline `@font-face`](#inline-font-face)),
   full bidirectional/mixed-script reordering (only line-level `direction: rtl`).
 - **Selectors**: pseudo-elements (`::before`/`::after`, not generated) in
   stylesheets. (Structural pseudo-classes `:first-child`/`:last-child`/

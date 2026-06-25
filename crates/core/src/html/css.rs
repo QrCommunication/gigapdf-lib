@@ -1389,6 +1389,85 @@ fn collect_font_faces(css: &str) -> Vec<String> {
     names
 }
 
+/// A parsed `@font-face` rule carrying the data needed to register an inline web
+/// font as a renderable face: the family name, the ordered list of `src` URLs
+/// (each `url(...)` content — a `data:` URI is decodable, an external URL is
+/// skipped by the renderer), and the declared `font-weight`/`font-style`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FontFaceRule {
+    /// `font-family`, lower-cased and de-quoted (matches [`Style::font_family`]).
+    pub family: String,
+    /// Every `url(...)` listed in `src`, in source order (alternatives to try).
+    pub srcs: Vec<String>,
+    /// `font-weight` mapped to a numeric CSS weight (1–1000); `400` when absent.
+    pub weight: u16,
+    /// `true` when `font-style` is `italic` or `oblique`; `false` otherwise.
+    pub italic: bool,
+}
+
+/// Scan `@font-face { … }` blocks and return one [`FontFaceRule`] per block,
+/// capturing the family **and** the `src` URLs + `font-weight`/`font-style` so
+/// an inline web font (`src: url(data:font/woff2;base64,…)`) can be decoded and
+/// registered as a render face. Mirrors [`collect_font_faces`]'s walk; rules
+/// without any `src` URL are still returned (with an empty `srcs`) so callers see
+/// the declared family, but they contribute no face.
+pub(crate) fn collect_font_face_rules(css: &str) -> Vec<FontFaceRule> {
+    let css = strip_comments(css);
+    let mut rules = Vec::new();
+    let mut rest = css.as_str();
+    while let Some(at) = rest.find("@font-face") {
+        rest = &rest[at + "@font-face".len()..];
+        let Some(open) = rest.find('{') else { break };
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else { break };
+        let body = &after[..close];
+
+        let mut family = String::new();
+        let mut srcs: Vec<String> = Vec::new();
+        let mut weight: u16 = 400;
+        let mut italic = false;
+        for (k, val) in parse_decls(body) {
+            match k.as_str() {
+                "font-family" => {
+                    family = val.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+                }
+                "src" => srcs.extend(collect_all_css_urls(&val)),
+                "font-weight" => weight = parse_font_face_weight(&val),
+                "font-style" => {
+                    let s = val.trim().to_ascii_lowercase();
+                    italic = s.starts_with("italic") || s.starts_with("oblique");
+                }
+                _ => {}
+            }
+        }
+        if !family.is_empty() {
+            rules.push(FontFaceRule {
+                family,
+                srcs,
+                weight,
+                italic,
+            });
+        }
+        rest = &after[close + 1..];
+    }
+    rules
+}
+
+/// Map a `@font-face` `font-weight` value to a numeric CSS weight (1–1000):
+/// `normal`→400, `bold`→700, a number as-is (clamped to 1..=1000). A
+/// range/list (`400 700`) takes the first token. Falls back to 400.
+fn parse_font_face_weight(v: &str) -> u16 {
+    let tok = v.split_whitespace().next().unwrap_or("");
+    match tok.to_ascii_lowercase().as_str() {
+        "" | "normal" | "lighter" => 400,
+        "bold" | "bolder" => 700,
+        other => other
+            .parse::<u32>()
+            .map(|n| n.clamp(1, 1000) as u16)
+            .unwrap_or(400),
+    }
+}
+
 fn strip_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
     let mut rest = css;
@@ -1612,6 +1691,9 @@ pub struct Stylesheet {
     /// Family names declared by `@font-face` rules (lower-cased), so callers
     /// can tell which families the document defines locally.
     font_faces: Vec<String>,
+    /// Full `@font-face` rules (family + `src` URLs + weight/style), so the
+    /// renderer can decode inline `data:` font sources and register them.
+    font_face_rules: Vec<FontFaceRule>,
 }
 
 impl Stylesheet {
@@ -1631,12 +1713,20 @@ impl Stylesheet {
         Stylesheet {
             rules,
             font_faces: collect_font_faces(author_css),
+            font_face_rules: collect_font_face_rules(author_css),
         }
     }
 
     /// Family names registered via `@font-face` (lower-cased).
     pub fn font_faces(&self) -> &[String] {
         &self.font_faces
+    }
+
+    /// Full `@font-face` rules (family + `src` URLs + weight/style). The renderer
+    /// decodes inline `data:` font sources from these and registers them as
+    /// render faces; external `url(...)` sources are left to the host.
+    pub(crate) fn font_face_rules(&self) -> &[FontFaceRule] {
+        &self.font_face_rules
     }
 
     /// Compute the style of `el` given its inherited (parent) style and its
@@ -2033,6 +2123,32 @@ pub(crate) fn extract_css_url(v: &str) -> Option<String> {
     let close = v[open..].find(')')? + open;
     let inner = v[open..close].trim().trim_matches(['"', '\'']).trim();
     (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// Collect **every** `url(...)` source in a value, in order. A CSS `src:`
+/// declaration may list several alternatives — e.g.
+/// `url(a.woff2) format('woff2'), url(b.woff) format('woff')` — so unlike
+/// [`extract_css_url`] (which returns only the first) this returns all of them,
+/// skipping the `format(...)`/`local(...)` tokens between them. base64 `data:`
+/// URIs and plain URLs contain no `)`, so the first `)` always closes each
+/// function — paren-matching stays safe.
+pub(crate) fn collect_all_css_urls(v: &str) -> Vec<String> {
+    let lower = v.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("url(") {
+        let open = from + rel + 4;
+        let Some(rel_close) = v[open..].find(')') else {
+            break;
+        };
+        let close = open + rel_close;
+        let inner = v[open..close].trim().trim_matches(['"', '\'']).trim();
+        if !inner.is_empty() {
+            out.push(inner.to_string());
+        }
+        from = close + 1;
+    }
+    out
 }
 
 /// Parse the inside of a `radial-gradient(...)` into a [`RadialGradient`].
@@ -5569,5 +5685,83 @@ mod tests {
             approx(bc.border_color_alpha, 0.7),
             "border-alpha (border-color)"
         );
+    }
+
+    #[test]
+    fn collect_all_css_urls_captures_every_url_in_order() {
+        // A `src` with two alternatives + a data: URI whose `)`-free body keeps
+        // paren-matching safe; `format(...)` tokens between them are skipped.
+        let v = "url(a.woff2) format('woff2'), url('b.woff') format('woff'), \
+                 url(data:font/ttf;base64,AAAB) format('truetype')";
+        assert_eq!(
+            collect_all_css_urls(v),
+            vec![
+                "a.woff2".to_string(),
+                "b.woff".to_string(),
+                "data:font/ttf;base64,AAAB".to_string(),
+            ]
+        );
+        // The single-url helper still returns just the first.
+        assert_eq!(extract_css_url(v).as_deref(), Some("a.woff2"));
+        assert!(collect_all_css_urls("none").is_empty());
+    }
+
+    #[test]
+    fn collect_font_face_rules_parses_family_srcs_weight_style() {
+        let css = "@font-face { font-family: 'My Font'; font-weight: bold; \
+                   font-style: italic; src: url(data:font/woff2;base64,ZZ) format('woff2'), \
+                   url(/fonts/my.woff); } \
+                   @font-face { font-family: Plain; src: url(p.ttf); }";
+        let rules = collect_font_face_rules(css);
+        assert_eq!(rules.len(), 2, "two @font-face blocks");
+
+        let a = &rules[0];
+        assert_eq!(a.family, "my font", "family de-quoted + lower-cased");
+        assert_eq!(a.weight, 700, "bold → 700");
+        assert!(a.italic, "italic style");
+        assert_eq!(
+            a.srcs,
+            vec![
+                "data:font/woff2;base64,ZZ".to_string(),
+                "/fonts/my.woff".to_string(),
+            ],
+            "both src url()s captured in order (data: `;` not split)"
+        );
+
+        let b = &rules[1];
+        assert_eq!(b.family, "plain");
+        assert_eq!(b.weight, 400, "absent font-weight defaults to 400");
+        assert!(!b.italic, "absent font-style is upright");
+        assert_eq!(b.srcs, vec!["p.ttf".to_string()]);
+    }
+
+    #[test]
+    fn font_face_weight_mapping() {
+        let rule = |decl: &str| {
+            collect_font_face_rules(&format!(
+                "@font-face {{ font-family: F; {decl} src: url(x.ttf); }}"
+            ))
+            .remove(0)
+        };
+        assert_eq!(rule("font-weight: normal;").weight, 400);
+        assert_eq!(rule("font-weight: bold;").weight, 700);
+        assert_eq!(rule("font-weight: 300;").weight, 300);
+        assert_eq!(rule("font-weight: 5000;").weight, 1000, "clamped to 1000");
+        assert_eq!(rule("font-weight: 400 700;").weight, 400, "range → first");
+        assert_eq!(rule("").weight, 400, "absent → 400");
+        assert!(rule("font-style: oblique;").italic, "oblique → italic");
+    }
+
+    #[test]
+    fn stylesheet_exposes_font_face_rules() {
+        let sheet = Stylesheet::new(
+            "@font-face { font-family: Embedded; src: url(data:font/ttf;base64,QQ); }",
+        );
+        // Both the legacy name list and the full-rule accessor see the family.
+        assert_eq!(sheet.font_faces(), &["embedded".to_string()]);
+        let rules = sheet.font_face_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].family, "embedded");
+        assert_eq!(rules[0].srcs, vec!["data:font/ttf;base64,QQ".to_string()]);
     }
 }

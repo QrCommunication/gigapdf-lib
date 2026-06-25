@@ -420,6 +420,54 @@ pub fn render(
     render_with(html, fonts, &opts)
 }
 
+/// Decode the inline `@font-face` rules in the document's author CSS into render
+/// faces and prepend them to the caller-supplied `fonts`.
+///
+/// For each `@font-face` rule, its `src` URLs are tried in order: a `data:` URI
+/// (base64 or raw/percent) is decoded to bytes and fed to
+/// [`crate::font::webfont::sfnt_from_web_font`], which accepts raw ttf/otf, WOFF1
+/// and WOFF2 (decompressing + reversing the WOFF2 glyf transform). The first src
+/// that yields a parseable sfnt becomes a [`ProvidedFont`] for that family /
+/// weight / style. Non-`data:` srcs (external path/URL) are skipped — the engine
+/// never touches the network or disk.
+///
+/// The inline faces are placed **before** the caller's `fonts` so they are
+/// available to the CSS family/weight/style matcher. The measurer and the painter
+/// both pick a face with `min_by_key` over this same-ordered list, which returns
+/// the *first* among equal-best candidates — so on an exact `(family, weight,
+/// italic)` collision the inline `@font-face` face is the one used, and crucially
+/// the painted glyphs always match the measured advances (the two never diverge).
+fn fonts_with_inline_faces(nodes: &[Node], fonts: &[ProvidedFont]) -> Vec<ProvidedFont> {
+    let css = collect_style_css(nodes);
+    let sheet = Stylesheet::new(&css);
+    let rules = sheet.font_face_rules();
+    if rules.is_empty() {
+        return fonts.to_vec();
+    }
+    let mut combined: Vec<ProvidedFont> = Vec::with_capacity(rules.len() + fonts.len());
+    for rule in rules {
+        for src in &rule.srcs {
+            if !src.starts_with("data:") {
+                continue; // external src — not fetched (engine is zero-network)
+            }
+            let Some(bytes) = decode_data_uri(src) else {
+                continue;
+            };
+            if let Some(ttf) = crate::font::webfont::sfnt_from_web_font(&bytes) {
+                combined.push(ProvidedFont {
+                    family: rule.family.clone(),
+                    weight: rule.weight,
+                    italic: rule.italic,
+                    ttf,
+                });
+                break; // first usable src wins for this @font-face rule
+            }
+        }
+    }
+    combined.extend_from_slice(fonts);
+    combined
+}
+
 /// Render `html` to a PDF with full page control: named/explicit size, per-side
 /// margins, and a running header/footer (with `{{page}}` / `{{pages}}`
 /// substitution) painted in the top/bottom margins of every page.
@@ -427,6 +475,10 @@ pub fn render_with(html: &str, fonts: &[ProvidedFont], opts: &RenderOptions) -> 
     // Run inline <script>s first so script-driven DOM mutations are rendered.
     let body_html = crate::js::run_inline_scripts(html);
     let nodes = dom::parse(&body_html);
+    // Decode inline `@font-face { src: url(data:…) }` web fonts and register them
+    // alongside the caller's fonts, so a document-embedded face actually renders.
+    let fonts = fonts_with_inline_faces(&nodes, fonts);
+    let fonts = fonts.as_slice();
     let sheet = Stylesheet::with_viewport(&collect_style_css(&nodes), Some(opts.page_w / 0.75));
     let book = MeasureBook::new(fonts);
     let frame = Frame {
@@ -3646,5 +3698,220 @@ mod tests {
         );
         // 500 falls to the 400 face (the regular), not the 700 one.
         assert_eq!(resolve(&objs, &st(500)), Some(id_400), "500 → 400 object");
+    }
+
+    // ─── @font-face with inline `src` (#1) ─────────────────────────────────────
+
+    /// A real fontTools-produced WOFF2 of a 2-glyph subset (.notdef + 'A') of
+    /// JetBrains Mono (monospace, units-per-em 1000) — base64 of the same bytes
+    /// `crate::font::webfont`'s tests reconstruct. Used here as the payload of a
+    /// `data:font/woff2;base64,…` `@font-face` src, and (after reconstruction) of
+    /// a `data:font/ttf;base64,…` one.
+    const TINY_WOFF2_B64: &str = "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";
+
+    /// Decode the shared WOFF2 fixture once.
+    fn tiny_woff2_bytes() -> Vec<u8> {
+        base64_decode(TINY_WOFF2_B64).expect("decode TINY_WOFF2 base64")
+    }
+
+    /// Minimal standard-alphabet base64 encoder (no line wrapping) — used to turn
+    /// the reconstructed sfnt into a `data:font/ttf;base64,…` URI for the test.
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                T[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                T[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// `MeasureBook::width` for one run with an explicit family.
+    fn width_with(book: &MeasureBook, family: &str, text: &str) -> f64 {
+        let style = Style {
+            font_family: family.into(),
+            font_size: 16.0,
+            font_weight: 400,
+            ..Style::default()
+        };
+        book.width(text, &style)
+    }
+
+    #[test]
+    fn font_face_inline_ttf_data_uri_registers_and_renders_from_inline_face() {
+        // Reconstruct a real sfnt (JetBrains Mono subset) and serve it as a
+        // `data:font/ttf;base64,…` @font-face. An element using that family must
+        // render from the inline face, not the bundled fallback.
+        let sfnt = crate::font::webfont::sfnt_from_web_font(&tiny_woff2_bytes())
+            .expect("reconstruct sfnt from the WOFF2 fixture");
+        let uri = format!("data:font/ttf;base64,{}", b64(&sfnt));
+        let html = format!(
+            "<style>@font-face {{ font-family: Inline; src: url({uri}); }}</style>\
+             <p style=\"font-family:Inline\">A</p>"
+        );
+        let nodes = dom::parse(&html);
+
+        // One inline face is produced, for the declared family.
+        let combined = fonts_with_inline_faces(&nodes, &[]);
+        assert_eq!(
+            combined.len(),
+            1,
+            "exactly one inline @font-face registered"
+        );
+        assert_eq!(combined[0].family, "inline", "family lower-cased");
+        assert_eq!(combined[0].weight, 400, "default weight");
+        assert!(!combined[0].italic, "default upright");
+        // The registered bytes are a parseable sfnt with the 'A' glyph.
+        let face = TrueTypeFont::parse(&combined[0].ttf).expect("inline face parses");
+        assert_eq!(face.gid_for_unicode('A' as u32), Some(1), "'A' is glyph 1");
+
+        // The 'A' advance from the inline (monospace) face differs from the
+        // bundled fallback's — proof the run actually measures with the inline
+        // face, not the fallback.
+        let book_inline = MeasureBook::new(&combined);
+        let book_fallback = MeasureBook::new(&[]);
+        let w_inline = width_with(&book_inline, "Inline", "A");
+        let w_fallback = width_with(&book_fallback, "Inline", "A");
+        assert!(w_inline > 0.0, "inline face yields a real advance");
+        assert!(
+            (w_inline - w_fallback).abs() > 0.1,
+            "inline-face advance ({w_inline}) differs from the bundled fallback ({w_fallback})"
+        );
+
+        // And the full render path produces a valid PDF with the inline face.
+        let pdf = render(&html, &[], 612.0, 792.0, 36.0);
+        assert!(pdf.starts_with(b"%PDF-"), "valid PDF header");
+    }
+
+    #[test]
+    fn font_face_inline_woff2_data_uri_resolves_via_sfnt_from_web_font() {
+        // A WOFF2 src is decompressed + glyf-detransformed by
+        // `sfnt_from_web_font` before registration.
+        let uri = format!("data:font/woff2;base64,{TINY_WOFF2_B64}");
+        let html = format!(
+            "<style>@font-face {{ font-family: Inline; src: url({uri}) format('woff2'); }}</style>\
+             <p style=\"font-family:Inline\">A</p>"
+        );
+        let nodes = dom::parse(&html);
+
+        let combined = fonts_with_inline_faces(&nodes, &[]);
+        assert_eq!(combined.len(), 1, "WOFF2 @font-face registered");
+        let face = TrueTypeFont::parse(&combined[0].ttf).expect("reconstructed sfnt parses");
+        assert_eq!(face.num_glyphs(), 2, "2-glyph subset reconstructed");
+        assert_eq!(face.gid_for_unicode('A' as u32), Some(1), "'A' present");
+
+        // Renders from the inline face (advance differs from the fallback).
+        let book_inline = MeasureBook::new(&combined);
+        let w_inline = width_with(&book_inline, "Inline", "A");
+        let w_fallback = width_with(&MeasureBook::new(&[]), "Inline", "A");
+        assert!(
+            (w_inline - w_fallback).abs() > 0.1,
+            "WOFF2 inline-face advance differs from the fallback"
+        );
+    }
+
+    #[test]
+    fn font_face_inline_weight_and_style_pick_the_right_face() {
+        // `font-weight: bold` + `font-style: italic` on the rule must carry onto
+        // the registered face so the CSS weight/style matcher selects it.
+        let uri = format!("data:font/woff2;base64,{TINY_WOFF2_B64}");
+        let html = format!(
+            "<style>@font-face {{ font-family: Inline; font-weight: bold; \
+             font-style: italic; src: url({uri}); }}</style>\
+             <p style=\"font-family:Inline\">A</p>"
+        );
+        let nodes = dom::parse(&html);
+        let combined = fonts_with_inline_faces(&nodes, &[]);
+        assert_eq!(combined.len(), 1, "one face");
+        assert_eq!(combined[0].weight, 700, "bold → 700");
+        assert!(combined[0].italic, "italic captured");
+
+        // A bold+italic run for the family resolves to this provided face.
+        let book = MeasureBook::new(&combined);
+        let style = Style {
+            font_family: "Inline".into(),
+            font_size: 16.0,
+            font_weight: 700,
+            italic: true,
+            bold: true,
+            ..Style::default()
+        };
+        let (_face, matched) = book
+            .provided_match(&style)
+            .expect("the bold-italic inline face matches");
+        assert_eq!(matched, 700, "matched the 700 inline face");
+    }
+
+    #[test]
+    fn font_face_numeric_weight_is_parsed() {
+        // A numeric `font-weight` (here 300) is registered as-is.
+        let uri = format!("data:font/woff2;base64,{TINY_WOFF2_B64}");
+        let html = format!(
+            "<style>@font-face {{ font-family: Inline; font-weight: 300; \
+             src: url({uri}); }}</style><p style=\"font-family:Inline\">A</p>"
+        );
+        let nodes = dom::parse(&html);
+        let combined = fonts_with_inline_faces(&nodes, &[]);
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].weight, 300, "numeric weight 300 preserved");
+    }
+
+    #[test]
+    fn font_face_external_url_src_is_ignored() {
+        // A non-`data:` src is never fetched, so no face is registered — the
+        // engine stays zero-network.
+        let html = "<style>@font-face { font-family: Inline; \
+                    src: url(https://example.com/Inline.woff2) format('woff2'); }</style>\
+                    <p style=\"font-family:Inline\">A</p>";
+        let nodes = dom::parse(html);
+        let combined = fonts_with_inline_faces(&nodes, &[]);
+        assert!(
+            combined.is_empty(),
+            "external url() src yields no inline face: {combined:?}"
+        );
+        // Still renders (text falls back to the bundled face).
+        let pdf = render(html, &[], 612.0, 792.0, 36.0);
+        assert!(
+            pdf.starts_with(b"%PDF-"),
+            "valid PDF even with no usable face"
+        );
+    }
+
+    #[test]
+    fn font_face_first_usable_src_wins_and_caller_fonts_follow() {
+        // `src` lists an unfetchable external URL first, then a usable `data:`
+        // URI: the data: one is the registered face. Caller fonts follow it.
+        let uri = format!("data:font/woff2;base64,{TINY_WOFF2_B64}");
+        let html = format!(
+            "<style>@font-face {{ font-family: Inline; \
+             src: url(https://example.com/x.woff2) format('woff2'), url({uri}) format('woff2'); }}\
+             </style><p style=\"font-family:Inline\">A</p>"
+        );
+        let nodes = dom::parse(&html);
+        let host = ProvidedFont {
+            family: "Host".into(),
+            weight: 400,
+            italic: false,
+            ttf: bundled::FALLBACK_TTF.to_vec(),
+        };
+        let combined = fonts_with_inline_faces(&nodes, std::slice::from_ref(&host));
+        // Inline face first (Inline), caller font after (Host).
+        assert_eq!(combined.len(), 2, "inline + caller face");
+        assert_eq!(combined[0].family, "inline", "inline @font-face first");
+        assert_eq!(combined[1].family, "Host", "caller font follows");
     }
 }
