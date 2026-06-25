@@ -87,6 +87,25 @@ impl ReconLine {
     pub fn is_bold(&self) -> bool {
         self.runs.iter().any(|r| r.style.bold)
     }
+
+    /// The line's dominant baseline [`Rotation`] — the orientation a block built
+    /// from this line should carry. Upright lines report
+    /// [`Rotation::D0`](crate::model::geom::Rotation::D0); a vertical/rotated run
+    /// drives the cardinal/free-form variant. See
+    /// [`runs_rotation`](super::runs_rotation).
+    pub fn rotation(&self) -> crate::model::geom::Rotation {
+        super::runs_rotation(&self.runs)
+    }
+}
+
+/// The dominant baseline [`Rotation`] across a group of lines (e.g. the lines of
+/// one paragraph or list). Pools every line's runs so a multi-line rotated block
+/// is judged as a whole. Upright groups report
+/// [`Rotation::D0`](crate::model::geom::Rotation::D0). See
+/// [`runs_rotation`](super::runs_rotation).
+pub(crate) fn lines_rotation(lines: &[&ReconLine]) -> crate::model::geom::Rotation {
+    let runs: Vec<ReconRun> = lines.iter().flat_map(|l| l.runs.iter().cloned()).collect();
+    super::runs_rotation(&runs)
 }
 
 /// Group runs into [`ReconLine`]s. Runs are first ordered top→bottom then

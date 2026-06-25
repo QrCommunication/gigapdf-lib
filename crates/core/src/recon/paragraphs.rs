@@ -14,8 +14,7 @@
 use super::lines::ReconLine;
 use super::{median, run_char_style, IdGen, ParaLink, ReconRun};
 use crate::model::{
-    geom::Rotation, Align, Block, BlockKind, Inline, InlineRun, LineHeight, Paragraph,
-    ParagraphStyle, Rect, VAlign,
+    Align, Block, BlockKind, Inline, InlineRun, LineHeight, Paragraph, ParagraphStyle, Rect, VAlign,
 };
 
 /// Geometry + decoration context a paragraph needs to recover its
@@ -182,7 +181,11 @@ pub(crate) fn build_paragraph_styled(
     Block {
         id: ids.mint(),
         frame: Some(to_frame(x, y, w, h)),
-        rotation: Rotation::D0,
+        // Honour a rotated/vertical baseline: an in-page rotated run (its
+        // text/CTM matrix angled even on an un-rotated page) lowers to a block
+        // carrying that rotation, instead of being flattened upright. Upright
+        // prose stays `Rotation::D0` — byte-identical to before.
+        rotation: super::lines::lines_rotation(para),
         kind: BlockKind::Paragraph(paragraph),
     }
 }
@@ -512,6 +515,87 @@ mod tests {
 
     fn lines_of(runs: &[ReconRun]) -> Vec<ReconLine> {
         group_into_lines(runs)
+    }
+
+    /// A run carrying a baseline `rotation` (degrees CCW), used to exercise the
+    /// run-level rotation lowering (#28).
+    fn run_rot(text: &str, x: f64, y: f64, w: f64, rotation: f64) -> ReconRun {
+        ReconRun {
+            rotation,
+            ..run(text, x, y, w)
+        }
+    }
+
+    /// Lower a single line of runs to one paragraph block (the path the page
+    /// reconstructor takes for an isolated rotated label).
+    fn paragraph_of(runs: &[ReconRun]) -> Block {
+        let lines = lines_of(runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let mut ids = IdGen::default();
+        build_paragraph_styled(&refs, &ParaContext::default(), &mut ids, Rect::new)
+    }
+
+    #[test]
+    fn upright_paragraph_stays_d0() {
+        use crate::model::geom::Rotation;
+        // A plain horizontal line must remain `Rotation::D0` — the rotation
+        // stage is a no-op for upright text (byte-identical to before #28).
+        let block = paragraph_of(&[run("upright text", 72.0, 700.0, 110.0)]);
+        assert_eq!(block.rotation, Rotation::D0);
+    }
+
+    #[test]
+    fn rotated_90_run_lowers_to_a_d90_block() {
+        use crate::model::geom::Rotation;
+        // A 90° CCW baseline (a vertical label drawn on an un-rotated page)
+        // lowers to a paragraph carrying `Rotation::D90`, not flattened upright.
+        let block = paragraph_of(&[run_rot("Vertical", 72.0, 700.0, 80.0, 90.0)]);
+        assert_eq!(block.rotation, Rotation::D90);
+        // The text content is preserved.
+        match &block.kind {
+            BlockKind::Paragraph(p) => assert!(p.runs.iter().any(|r| matches!(
+                r,
+                Inline::Run(InlineRun { text, .. }) if text == "Vertical"
+            ))),
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotated_180_run_lowers_to_a_d180_block() {
+        use crate::model::geom::Rotation;
+        let block = paragraph_of(&[run_rot("Upside down", 72.0, 700.0, 110.0, 180.0)]);
+        assert_eq!(block.rotation, Rotation::D180);
+    }
+
+    #[test]
+    fn rotated_270_run_lowers_to_a_d270_block() {
+        use crate::model::geom::Rotation;
+        // A 270° CCW baseline arrives from the matrix `atan2` as -90°; the
+        // lowering reports it as the cardinal `D270`.
+        let block = paragraph_of(&[run_rot("Sideways", 72.0, 700.0, 80.0, -90.0)]);
+        assert_eq!(block.rotation, Rotation::D270);
+    }
+
+    #[test]
+    fn arbitrary_angle_run_lowers_to_a_free_form_rotation() {
+        use crate::model::geom::Rotation;
+        // A non-cardinal baseline (a diagonal stamp) carries through as the
+        // free-form `Deg` variant with its angle.
+        let block = paragraph_of(&[run_rot("Diagonal", 72.0, 700.0, 90.0, 30.0)]);
+        match block.rotation {
+            Rotation::Deg(d) => assert!((d - 30.0).abs() < 1e-9, "got {d}"),
+            other => panic!("expected Deg(30), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn near_cardinal_angle_snaps_to_the_exact_variant() {
+        use crate::model::geom::Rotation;
+        // A scaled/skewed CTM yields an angle a hair off 90°; it must still snap
+        // to the exact `D90` (so cardinal cases stay first-class).
+        let block = paragraph_of(&[run_rot("Almost 90", 72.0, 700.0, 80.0, 90.2)]);
+        assert_eq!(block.rotation, Rotation::D90);
     }
 
     #[test]

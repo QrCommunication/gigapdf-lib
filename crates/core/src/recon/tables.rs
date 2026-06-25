@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 
 use super::lines::ReconLine;
-use super::{median, ruling_orientation, run_char_style, IdGen, Ruling};
+use super::{median, ruling_orientation, run_char_style, runs_rotation, IdGen, ReconRun, Ruling};
 use crate::content::vector::VectorPath;
 use crate::model::{
     geom::Rotation, Align, Block, BlockKind, BorderStyle, Cell, Paragraph, ParagraphStyle, Rect,
@@ -418,10 +418,22 @@ pub fn build_table(
         BorderStyle::default()
     };
 
+    // A table whose text is drawn on a rotated baseline lowers with that
+    // rotation (the cells inherit the table's frame orientation); an ordinary
+    // upright table stays `Rotation::D0`. Judge from the runs the table actually
+    // covers, pooled across its lines.
+    let table_runs: Vec<ReconRun> = table
+        .covered_lines
+        .iter()
+        .filter_map(|&li| lines.get(li))
+        .flat_map(|line| line.runs.iter().cloned())
+        .collect();
+    let rotation = runs_rotation(&table_runs);
+
     Some(Block {
         id: ids.mint(),
         frame: Some(frame),
-        rotation: Rotation::D0,
+        rotation,
         kind: BlockKind::Table(Table {
             rows,
             col_widths,

@@ -256,7 +256,7 @@ pub fn build_list(
                 // No item yet to attach to (defensive): treat as its own item.
                 let runs = line_runs(line, &line.text());
                 list.items.push(ListItem {
-                    blocks: vec![paragraph_block(runs, ids)],
+                    blocks: vec![paragraph_block(runs, line.rotation(), ids)],
                     level: 0,
                 });
             }
@@ -274,7 +274,7 @@ pub fn build_list(
                     }));
                 }
                 list.items.push(ListItem {
-                    blocks: vec![paragraph_block(runs, ids)],
+                    blocks: vec![paragraph_block(runs, line.rotation(), ids)],
                     level: *level,
                 });
             }
@@ -284,17 +284,21 @@ pub fn build_list(
     Some(Block {
         id: ids.mint(),
         frame: Some(to_frame(x0, y0, x1 - x0, y1 - y0)),
-        rotation: Rotation::D0,
+        // A rotated list (every item drawn on an angled baseline) lowers with
+        // that rotation; an ordinary upright list stays `Rotation::D0`.
+        rotation: super::lines::lines_rotation(items),
         kind: BlockKind::List(list),
     })
 }
 
-/// Wrap a run of [`Inline`]s into a default-styled paragraph [`Block`].
-fn paragraph_block(runs: Vec<Inline>, ids: &mut IdGen) -> Block {
+/// Wrap a run of [`Inline`]s into a default-styled paragraph [`Block`] carrying
+/// `rotation` (the orientation of the list item's source line, so a rotated
+/// list item lowers rotated rather than flattened upright).
+fn paragraph_block(runs: Vec<Inline>, rotation: Rotation, ids: &mut IdGen) -> Block {
     Block {
         id: ids.mint(),
         frame: None,
-        rotation: Rotation::D0,
+        rotation,
         kind: BlockKind::Paragraph(Paragraph {
             style: ParagraphStyle::default(),
             style_ref: None,

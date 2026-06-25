@@ -99,11 +99,14 @@ genuinely structure-aware and strong on the engine's own output and clean
 single-column / ruled-table PDFs:
 
 **Recovered well (FULL):** text runs with font family/size/colour · paragraph
-grouping, alignment, super/sub · ruled tables (with col/row spans) · images —
-both `Do` XObjects **and inline images** (`BI`/`ID`/`EI`, ISO 32000-1 §8.9.7) —
-with lifted figure captions · vector shapes · underline/strike (from drawn
-rules) · external + internal hyperlinks · outline/bookmarks · page geometry ·
-tagged-PDF `/StructTreeRoot` (consumed).
+grouping, alignment, super/sub · **run-level rotated / vertical in-page text**
+(the baseline angle from the text/CTM matrix is carried onto the reconstructed
+block's rotation — `90°/180°/270°` snap to the exact cardinal, any other angle is
+preserved free-form, and upright text stays unrotated) · ruled tables (with
+col/row spans) · images — both `Do` XObjects **and inline images**
+(`BI`/`ID`/`EI`, ISO 32000-1 §8.9.7) — with lifted figure captions · vector
+shapes · underline/strike (from drawn rules) · external + internal hyperlinks ·
+outline/bookmarks · page geometry · tagged-PDF `/StructTreeRoot` (consumed).
 
 **Inline images** are decoded through the *same* pipeline as image XObjects: the
 abbreviated dictionary keys (`/W`, `/H`, `/BPC`, `/CS`, `/F`, `/IM`, `/D`, `/DP`,

@@ -237,6 +237,71 @@ pub(crate) fn run_char_style(run: &ReconRun) -> CharStyle {
     }
 }
 
+/// Snap a baseline angle (degrees, counter-clockwise — the convention
+/// [`ReconRun::rotation`] carries from the text/CTM matrix) to a model
+/// [`Rotation`]. The angle is normalised to `(-180, 180]`; values within
+/// [`ROT_SNAP_EPS`] of a cardinal direction collapse to the exact first-class
+/// variant (so a clean `/Rotate`-style matrix stays exact), and `270°` is
+/// reported as the `-90°` the matrix actually yields. Everything else becomes
+/// [`Rotation::Deg`] with the normalised angle.
+///
+/// Near-upright text (within the epsilon of `0°`) maps to [`Rotation::D0`], so a
+/// block of ordinary horizontal runs is byte-identical to before this stage
+/// existed.
+pub(crate) fn rotation_from_baseline_deg(deg: f64) -> Rotation {
+    if !deg.is_finite() {
+        return Rotation::D0;
+    }
+    // Normalise to (-180, 180].
+    let mut a = deg % 360.0;
+    if a > 180.0 {
+        a -= 360.0;
+    } else if a <= -180.0 {
+        a += 360.0;
+    }
+    let near = |target: f64| (a - target).abs() <= ROT_SNAP_EPS;
+    if near(0.0) {
+        Rotation::D0
+    } else if near(90.0) {
+        Rotation::D90
+    } else if near(180.0) || near(-180.0) {
+        Rotation::D180
+    } else if near(-90.0) {
+        // A 270° CCW baseline arrives from `atan2` as -90°; both name the same
+        // direction. Report the cardinal variant the exporters understand.
+        Rotation::D270
+    } else {
+        Rotation::Deg(a)
+    }
+}
+
+/// Tolerance (degrees) for snapping a baseline angle to a cardinal direction in
+/// [`rotation_from_baseline_deg`]. A clean rotation matrix yields exactly
+/// `0/90/180/-90`; this small band also catches the tiny float error a scaled or
+/// skewed CTM introduces, without swallowing a genuine free-form angle.
+const ROT_SNAP_EPS: f64 = 0.5;
+
+/// The dominant [`Rotation`] of a slice of runs — the orientation a block built
+/// from them should carry. Blank runs (no glyphs, no meaningful orientation) are
+/// ignored; the **median** baseline angle of the rest is snapped via
+/// [`rotation_from_baseline_deg`].
+///
+/// The median makes the decision robust to a stray differently-oriented run, and
+/// the snap means a block whose runs are all (near-)upright reports
+/// [`Rotation::D0`] — keeping the overwhelmingly common horizontal case
+/// byte-identical. An empty / all-blank slice is upright.
+pub(crate) fn runs_rotation(runs: &[ReconRun]) -> Rotation {
+    let mut angles: Vec<f64> = runs
+        .iter()
+        .filter(|r| !r.text.trim().is_empty())
+        .map(|r| r.rotation)
+        .collect();
+    if angles.is_empty() {
+        return Rotation::D0;
+    }
+    rotation_from_baseline_deg(median(&mut angles, 0.0))
+}
+
 /// Helper on [`TextStyle`]: the run colour as the model's `Option<[f64;3]>`
 /// (black / unset stays `None`). Kept here so the model layer needn't depend on
 /// the conversion style helpers.
@@ -927,6 +992,69 @@ mod tests {
         assert_eq!(median(&mut v, 0.0), 10.0);
         let mut empty: Vec<f64> = Vec::new();
         assert_eq!(median(&mut empty, 7.0), 7.0);
+    }
+
+    /// `run` carrying a baseline rotation (degrees CCW), for the #28 helpers.
+    fn run_rot(text: &str, rotation: f64) -> ReconRun {
+        ReconRun {
+            rotation,
+            ..run(text, 0.0, 0.0, 12.0)
+        }
+    }
+
+    #[test]
+    fn baseline_deg_snaps_cardinals_and_keeps_free_form() {
+        assert_eq!(rotation_from_baseline_deg(0.0), Rotation::D0);
+        assert_eq!(rotation_from_baseline_deg(90.0), Rotation::D90);
+        assert_eq!(rotation_from_baseline_deg(180.0), Rotation::D180);
+        // 270° CCW == -90° from `atan2`; both name `D270`.
+        assert_eq!(rotation_from_baseline_deg(-90.0), Rotation::D270);
+        assert_eq!(rotation_from_baseline_deg(270.0), Rotation::D270);
+        // Near-cardinal (scaled/skewed CTM float error) still snaps exact.
+        assert_eq!(rotation_from_baseline_deg(90.3), Rotation::D90);
+        assert_eq!(rotation_from_baseline_deg(-179.8), Rotation::D180);
+        // Free-form angle survives, normalised into (-180, 180].
+        assert_eq!(rotation_from_baseline_deg(30.0), Rotation::Deg(30.0));
+        assert_eq!(rotation_from_baseline_deg(450.0), Rotation::D90);
+        match rotation_from_baseline_deg(200.0) {
+            Rotation::Deg(d) => assert!((d - -160.0).abs() < 1e-9, "got {d}"),
+            other => panic!("expected Deg(-160), got {other:?}"),
+        }
+        // Non-finite is treated as upright (defensive).
+        assert_eq!(rotation_from_baseline_deg(f64::NAN), Rotation::D0);
+    }
+
+    #[test]
+    fn runs_rotation_is_d0_for_upright_or_empty() {
+        assert_eq!(runs_rotation(&[]), Rotation::D0);
+        let runs = vec![run_rot("a", 0.0), run_rot("b", 0.0)];
+        assert_eq!(runs_rotation(&runs), Rotation::D0);
+    }
+
+    #[test]
+    fn runs_rotation_takes_the_dominant_angle_ignoring_blanks() {
+        // Blank runs carry no orientation and must not sway the result: three
+        // 90° glyph runs + a blank → `D90`.
+        let runs = vec![
+            run_rot("X", 90.0),
+            run_rot("   ", 0.0),
+            run_rot("Y", 90.0),
+            run_rot("Z", 90.0),
+        ];
+        assert_eq!(runs_rotation(&runs), Rotation::D90);
+    }
+
+    #[test]
+    fn runs_rotation_median_resists_a_stray_run() {
+        // Four rotated runs + one upright stray → median stays 90° → `D90`.
+        let runs = vec![
+            run_rot("a", 90.0),
+            run_rot("b", 90.0),
+            run_rot("c", 90.0),
+            run_rot("d", 90.0),
+            run_rot("stray", 0.0),
+        ];
+        assert_eq!(runs_rotation(&runs), Rotation::D90);
     }
 
     #[test]
