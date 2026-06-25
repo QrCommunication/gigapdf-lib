@@ -782,6 +782,8 @@ fn inlines_to_text(runs: &[crate::model::Inline]) -> String {
                 s.push(']');
             }
             Inline::Link { children, .. } => s.push_str(&inlines_to_text(children)),
+            // A comment anchor contributes no body text to the flattened output.
+            Inline::CommentRef { .. } => {}
         }
     }
     s

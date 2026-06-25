@@ -41,9 +41,9 @@ use crate::model::style::{
     VAlign,
 };
 use crate::model::{
-    Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, DocMeta, Document, Heading,
-    ImageRef, ImageResource, Inline, InlineRun, LinkTarget, List, ListItem, ListMarker, OutlineNode,
-    Page, Paragraph, ResourceTable, Row, Section, Shape, Table, TextBox,
+    Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, Comment, DocMeta, Document,
+    Heading, ImageRef, ImageResource, Inline, InlineRun, LinkTarget, List, ListItem, ListMarker,
+    OutlineNode, Page, Paragraph, ResourceTable, Row, Section, Shape, Table, TextBox,
 };
 
 /// Current envelope version. Bump on any incompatible layout change.
@@ -249,6 +249,22 @@ impl Writer {
         self.arr_close();
         self.key("resources");
         self.resources(&d.resources);
+        self.key("comments");
+        self.arr_open();
+        for c in &d.comments {
+            self.elem();
+            self.comment(c);
+        }
+        self.arr_close();
+        self.obj_close();
+    }
+
+    fn comment(&mut self, c: &Comment) {
+        self.obj_open();
+        self.k_str("id", &c.id);
+        self.k_str("author", &c.author);
+        self.k_str("date", &c.date);
+        self.k_str("text", &c.text);
         self.obj_close();
     }
 
@@ -594,6 +610,10 @@ impl Writer {
                 self.link_target(href);
                 self.key("children");
                 self.inline_array(children);
+            }
+            Inline::CommentRef { id } => {
+                self.k_str("t", "commentRef");
+                self.k_str("id", id);
             }
         }
         self.obj_close();
@@ -1348,6 +1368,9 @@ impl<'a> Reader<'a> {
                 "sections" => d.sections = r.array(Reader::section)?,
                 "outline" => d.outline = r.array(Reader::outline_node)?,
                 "resources" => d.resources = r.resources()?,
+                // Optional (added after v1 shipped without comments): a document
+                // serialized before this field simply omits it ⇒ empty.
+                "comments" => d.comments = r.array(Reader::comment)?,
                 _ => return None,
             }
             Some(())
@@ -1705,6 +1728,7 @@ impl<'a> Reader<'a> {
         let mut img: Option<ImageRef> = None;
         let mut href: Option<LinkTarget> = None;
         let mut children: Option<Vec<Inline>> = None;
+        let mut comment_id: Option<String> = None;
         self.object(|r, k| {
             match k {
                 "t" => tag = Some(r.string()?),
@@ -1715,6 +1739,7 @@ impl<'a> Reader<'a> {
                 },
                 "href" => href = Some(r.link_target()?),
                 "children" => children = Some(r.array(Reader::inline)?),
+                "id" => comment_id = Some(r.string()?),
                 _ => return None,
             }
             Some(())
@@ -1727,8 +1752,24 @@ impl<'a> Reader<'a> {
                 href: href?,
                 children: children?,
             }),
+            "commentRef" => Some(Inline::CommentRef { id: comment_id? }),
             _ => None,
         }
+    }
+
+    fn comment(&mut self) -> Option<Comment> {
+        let mut c = Comment::default();
+        self.object(|r, k| {
+            match k {
+                "id" => c.id = r.string()?,
+                "author" => c.author = r.string()?,
+                "date" => c.date = r.string()?,
+                "text" => c.text = r.string()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(c)
     }
 
     fn inline_run(&mut self) -> Option<InlineRun> {
@@ -2787,11 +2828,17 @@ mod tests {
                     frame: None,
                     rotation: Rotation::D0,
                     kind: BlockKind::Paragraph(Paragraph {
-                        runs: vec![Inline::Run(InlineRun {
-                            text: "Header".to_string(),
-                            style: CharStyle::default(),
-                            source_index: None,
-                        })],
+                        runs: vec![
+                            Inline::Run(InlineRun {
+                                text: "Header".to_string(),
+                                style: CharStyle::default(),
+                                source_index: None,
+                            }),
+                            // A comment anchor must survive the JSON round trip.
+                            Inline::CommentRef {
+                                id: "c1".to_string(),
+                            },
+                        ],
                         ..Default::default()
                     }),
                 }]),
@@ -2815,6 +2862,14 @@ mod tests {
                 ],
             }],
             resources: ResourceTable { images },
+            // A review comment matching the header's `Inline::CommentRef` anchor;
+            // exercises the comments round trip alongside the structural fields.
+            comments: vec![Comment {
+                id: "c1".to_string(),
+                author: "Reviewer".to_string(),
+                date: "2026-06-24T10:00:00Z".to_string(),
+                text: "Round-trip me — café 🎯".to_string(),
+            }],
         }
     }
 

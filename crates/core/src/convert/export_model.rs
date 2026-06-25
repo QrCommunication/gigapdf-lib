@@ -767,6 +767,10 @@ fn docx_runs(runs: &[Inline], ctx: &mut DocxCtx, out: &mut String) {
                     _ => docx_runs(children, ctx, out),
                 }
             }
+            // A comment anchor carries no body and is not re-emitted: the DOCX
+            // writer produces no `word/comments.xml`, so a `w:commentReference`
+            // would dangle. Comments degrade gracefully (dropped on export).
+            Inline::CommentRef { .. } => {}
         }
     }
 }
@@ -2952,6 +2956,8 @@ fn pptx_runs(runs: &[Inline], ctx: &mut PptxRunCtx, out: &mut String) {
                 }
                 _ => pptx_runs(children, ctx, out),
             },
+            // A comment anchor has no DrawingML representation; dropped on export.
+            Inline::CommentRef { .. } => {}
         }
     }
 }
@@ -3803,6 +3809,9 @@ fn odt_runs(runs: &[Inline], ctx: &mut OdfCtx, out: &mut String) {
                     odt_runs(children, ctx, out);
                 }
             }
+            // A comment anchor is not re-emitted (no `office:annotation` body is
+            // written on export); comments degrade gracefully.
+            Inline::CommentRef { .. } => {}
         }
     }
 }
@@ -5706,6 +5715,8 @@ impl<'a> MdWriter<'a> {
                     LinkTarget::Url(_) => out.push_str(&label),
                 }
             }
+            // Markdown has no comment syntax; a comment anchor emits nothing.
+            Inline::CommentRef { .. } => {}
         }
     }
 
@@ -6132,6 +6143,7 @@ fn inlines_plain_text(runs: &[Inline], out: &mut String) {
             Inline::Link { children, .. } => inlines_plain_text(children, out),
             Inline::LineBreak => out.push(' '),
             Inline::Image(_) => {}
+            Inline::CommentRef { .. } => {}
         }
     }
 }
@@ -6608,6 +6620,8 @@ fn xhtml_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
                 xhtml_inlines(children, doc, out);
                 out.push_str("</a>");
             }
+            // A comment anchor with no body emits nothing in this XHTML path.
+            Inline::CommentRef { .. } => {}
         }
     }
 }

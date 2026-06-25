@@ -976,6 +976,7 @@ mod tests {
                     Inline::LineBreak => out.push(' '),
                     Inline::Link { children, .. } => walk(children, out),
                     Inline::Image(_) => {}
+                    Inline::CommentRef { .. } => {}
                 }
             }
         }

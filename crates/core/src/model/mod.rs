@@ -54,6 +54,24 @@ pub struct Document {
     pub sections: Vec<Section>,
     pub outline: Vec<OutlineNode>,
     pub resources: ResourceTable,
+    /// Review comments / annotations imported from the source document (DOCX
+    /// `word/comments.xml`, ODT `office:annotation`). Each is anchored in the
+    /// body by a matching [`Inline::CommentRef`] (by [`Comment::id`]); HTML
+    /// renders them as an endnote-style list. Empty ⇒ none.
+    pub comments: Vec<Comment>,
+}
+
+/// A review comment / annotation: its document-unique `id` (matched by an
+/// [`Inline::CommentRef`] anchor in the body), `author`, raw `date` text (kept
+/// verbatim — ISO-8601 / W3CDTF as the source wrote it, `""` ⇒ absent), and the
+/// flattened plain-text body. Maps DOCX `w:comment` (`w:id`/`w:author`/`w:date`)
+/// and ODF `office:annotation` (`office:name`/`dc:creator`/`dc:date`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Comment {
+    pub id: String,
+    pub author: String,
+    pub date: String,
+    pub text: String,
 }
 
 /// Document-level metadata.
@@ -193,6 +211,13 @@ pub enum Inline {
     Link {
         href: LinkTarget,
         children: Vec<Inline>,
+    },
+    /// An anchor marking where a review [`Comment`] (matched by `id`) attaches in
+    /// the run flow. Carries no text of its own: HTML renders it as a small
+    /// superscript reference marker linking to the comment body; exporters with
+    /// no comment syntax (Markdown/RTF) and plain-text emit nothing for it.
+    CommentRef {
+        id: String,
     },
 }
 

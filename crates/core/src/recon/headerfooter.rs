@@ -300,6 +300,7 @@ fn append_runs(runs: &[Inline], out: &mut String) {
             Inline::LineBreak => out.push(' '),
             Inline::Link { children, .. } => append_runs(children, out),
             Inline::Image(_) => {}
+            Inline::CommentRef { .. } => {}
         }
     }
 }

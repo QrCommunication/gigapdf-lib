@@ -754,6 +754,9 @@ fn rtf_inline_from_model(
             }
             out.push_str("}}");
         }
+        // A comment anchor carries no body and has no plain-RTF representation;
+        // it emits nothing (comments degrade gracefully on RTF export).
+        Inline::CommentRef { .. } => {}
     }
 }
 

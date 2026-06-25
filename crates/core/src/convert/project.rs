@@ -77,6 +77,7 @@ fn collect_inline_text(runs: &[Inline], out: &mut String) {
             Inline::LineBreak => out.push(' '),
             Inline::Image(_) => {}
             Inline::Link { children, .. } => collect_inline_text(children, out),
+            Inline::CommentRef { .. } => {}
         }
     }
 }

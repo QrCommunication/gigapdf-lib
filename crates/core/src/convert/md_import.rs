@@ -1185,6 +1185,7 @@ mod tests {
                 Inline::Link { children, .. } => collect(children, out),
                 Inline::LineBreak => out.push('\n'),
                 Inline::Image(_) => {}
+                Inline::CommentRef { .. } => {}
             }
         }
     }

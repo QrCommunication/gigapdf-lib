@@ -127,7 +127,11 @@ table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.25em .5em}\
 img{max-width:100%}\
 pre{font-family:monospace;background:#f2f2f2;border:1px solid #ccc;padding:.5em;white-space:pre;overflow:auto}\
 blockquote{margin:0 0 0 1em;padding-left:.75em;border-left:3px solid #ccc;color:#555}\
-hr{border:0;border-top:1px solid #999}</style></head><body>",
+hr{border:0;border-top:1px solid #999}\
+sup.cmt-ref{font-size:.7em;line-height:0}\
+aside.comments{margin-top:2em;border-top:1px solid #999;font-size:.9em;color:#333}\
+aside.comments h2{font-size:1em}\
+aside.comments .cmt-meta{color:#777;font-size:.85em}</style></head><body>",
     );
     for section in &doc.sections {
         if let Some(header) = &section.header {
@@ -144,8 +148,57 @@ hr{border:0;border-top:1px solid #999}</style></head><body>",
             html.push_str("</footer>");
         }
     }
+    html_comments(doc, &mut html);
     html.push_str("</body></html>");
     html
+}
+
+/// Append the document's review comments as an endnote-style `<aside>`: each
+/// comment lists its author/date and body text under an anchor (`id="cmt-<id>"`)
+/// that the inline [`Inline::CommentRef`] markers link to. Emits nothing when the
+/// document has no comments.
+fn html_comments(doc: &Document, out: &mut String) {
+    if doc.comments.is_empty() {
+        return;
+    }
+    out.push_str("<aside class=\"comments\"><h2>Comments</h2><ol>");
+    for c in &doc.comments {
+        let anchor = comment_anchor(&c.id);
+        out.push_str(&format!("<li id=\"{anchor}\">"));
+        // Author / date line (omit each part when blank).
+        let author = c.author.trim();
+        let date = c.date.trim();
+        if !author.is_empty() || !date.is_empty() {
+            out.push_str("<span class=\"cmt-meta\">");
+            if !author.is_empty() {
+                esc(author, out);
+            }
+            if !author.is_empty() && !date.is_empty() {
+                out.push_str(" — ");
+            }
+            if !date.is_empty() {
+                esc(date, out);
+            }
+            out.push_str("</span> ");
+        }
+        esc(&c.text, out);
+        // Back-link to the in-flow marker, when one exists.
+        out.push_str(&format!(" <a href=\"#{anchor}-ref\">\u{21a9}</a>"));
+        out.push_str("</li>");
+    }
+    out.push_str("</ol></aside>");
+}
+
+/// The HTML element id for a comment: `cmt-<id>` with the id attribute-escaped.
+/// Used by both the inline marker and the comments section so they link up.
+fn comment_anchor(id: &str) -> String {
+    format!("cmt-{}", attr_esc(id))
+}
+
+/// The 1-based display number of the comment with `id` (its position in
+/// `doc.comments`), or `None` if no comment carries that id.
+fn comment_number(doc: &Document, id: &str) -> Option<usize> {
+    doc.comments.iter().position(|c| c.id == id).map(|p| p + 1)
 }
 
 /// Escape a string for use inside a double-quoted HTML attribute.
@@ -244,6 +297,18 @@ fn html_inlines(runs: &[Inline], doc: &Document, out: &mut String) {
                 out.push_str(&format!("<a href=\"{target}\">"));
                 html_inlines(children, doc, out);
                 out.push_str("</a>");
+            }
+            // A review-comment anchor → a small superscript reference marker
+            // linking to its body in the trailing comments section. The marker
+            // number is the comment's 1-based position in `doc.comments`; an
+            // anchor whose id matches no comment (degenerate input) emits nothing.
+            Inline::CommentRef { id } => {
+                if let Some(n) = comment_number(doc, id) {
+                    let anchor = comment_anchor(id);
+                    out.push_str(&format!(
+                        "<sup class=\"cmt-ref\" id=\"{anchor}-ref\"><a href=\"#{anchor}\">[{n}]</a></sup>"
+                    ));
+                }
             }
         }
     }

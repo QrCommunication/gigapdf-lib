@@ -852,6 +852,13 @@ struct OutlineBuilder {
     /// `bookmark name → 0-based landing page`, for resolving internal anchors.
     /// First definition wins (a name is unique in well-formed documents).
     bookmark_pages: BTreeMap<String, usize>,
+    /// Review comments collected during the ODT body walk (each `office:annotation`
+    /// is parsed at its anchor point, where the walker also emits the matching
+    /// `Inline::CommentRef`). Rides this already-threaded builder so the recursive
+    /// inline walker need not thread a separate accumulator; drained into
+    /// `Document.comments` once the walk finishes. Unused by the DOCX path (whose
+    /// comment bodies come from a separate `word/comments.xml` part).
+    comments: Vec<model::Comment>,
 }
 
 impl OutlineBuilder {
@@ -995,6 +1002,7 @@ fn inlines_plain_text(inlines: &[Inline]) -> String {
                 }
             }
             Inline::Image(_) => {}
+            Inline::CommentRef { .. } => {}
         }
     }
     s.trim().to_string()
@@ -1081,6 +1089,9 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // table so each paragraph's `style_ref` (set from `w:pStyle`) resolves.
     document.styles = styles.to_style_table();
     document.meta = ooxml_doc_meta(zip);
+    // Review comments (`word/comments.xml`): their bodies, anchored in the flow by
+    // the `Inline::CommentRef`s the body walk emitted at each `w:commentReference`.
+    document.comments = parse_docx_comments(&part(zip, "word/comments.xml"));
     document
 }
 
@@ -1909,10 +1920,20 @@ fn docx_paragraph_model(
                     // deleted paragraph mark in `w:rPr`, also lands here: it has no
                     // body and carries no display text, so nothing leaks.)
                     "ins" | "moveTo" => {}
-                    // Comment range/anchor markers carry no body text (the comment
-                    // bodies live in `word/comments.xml` and are not imported). Drop
-                    // the markers cleanly so they don't disturb run/paragraph parsing.
-                    "commentRangeStart" | "commentRangeEnd" | "commentReference" => {}
+                    // Comment range delimiters carry no body text and no anchor of
+                    // their own; drop them cleanly so they don't disturb parsing.
+                    "commentRangeStart" | "commentRangeEnd" => {}
+                    // The comment reference (`w:commentReference w:id`) marks where a
+                    // comment attaches: emit a model `Inline::CommentRef` anchor at
+                    // this point. The comment *body* is parsed separately from
+                    // `word/comments.xml` and joined to it by id. Emitted via the
+                    // active sink so an open hyperlink/field still captures it.
+                    "commentReference" => {
+                        if let Some(id) = attr(&attrs, "id") {
+                            docx_sink(&mut runs, &mut link, &mut fields)
+                                .push(Inline::CommentRef { id: id.to_string() });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -5772,6 +5793,10 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     // single flowed page, so a matched bookmark resolves to page 0; an unmatched
     // anchor — e.g. a `#frame` — keeps its placeholder rather than faking page 0).
     let bookmark_pages = std::mem::take(&mut outline.bookmark_pages);
+    // Review comments collected at each `office:annotation` during the body walk
+    // (anchored by the `Inline::CommentRef`s emitted alongside). Taken before the
+    // builder is consumed by `finish`.
+    doc.comments = std::mem::take(&mut outline.comments);
     doc.outline = outline.finish();
     resolve_internal_links(&mut doc, &bookmark_pages);
     // Lower `styles.xml`'s `office:styles` paragraph styles into the model's
@@ -6083,6 +6108,22 @@ fn odf_inline_model(
                             active_inlines(&mut runs, &mut link).push(inline);
                         }
                     }
+                    // A review comment: `office:annotation` holds its own body
+                    // (`dc:creator`/`dc:date` + `text:p`). Parse it into a
+                    // `model::Comment` (collected on the outline builder, which is
+                    // already threaded here) and emit a matching `Inline::CommentRef`
+                    // anchor at this point. The ordinal (1-based count so far) is the
+                    // id fallback for an unnamed annotation, so the anchor resolves.
+                    "annotation" if !sc => {
+                        let ordinal = outline.comments.len() + 1;
+                        let comment = odf_annotation_inline(x, attr(&attrs, "name"), ordinal);
+                        active_inlines(&mut runs, &mut link)
+                            .push(Inline::CommentRef { id: comment.id.clone() });
+                        outline.comments.push(comment);
+                    }
+                    // The paired range terminator carries no body and no anchor of
+                    // its own; ignore it (it must not break the paragraph walk).
+                    "annotation-end" => {}
                     "tab" => odf_push(active_inlines(&mut runs, &mut link), &span_stack, " "),
                     "line-break" => active_inlines(&mut runs, &mut link).push(Inline::LineBreak),
                     "s" => {
@@ -10134,6 +10175,133 @@ fn parse_docx_endnotes(xml: &str) -> BTreeMap<String, DocxNote> {
         return BTreeMap::new();
     }
     parse_docx_notes(xml, "endnote", None)
+}
+
+/// Parse `word/comments.xml` into a list of [`model::Comment`] in document order.
+/// Each `w:comment` carries `w:id` (matched by an [`Inline::CommentRef`] anchor in
+/// the body), `w:author`, `w:date` (kept verbatim), and a body of `w:p`/`w:r`/`w:t`
+/// flattened to plain text (tabs → a space, paragraphs joined by a single space).
+/// An empty / absent part yields an empty list.
+fn parse_docx_comments(xml: &str) -> Vec<model::Comment> {
+    if xml.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut comments: Vec<model::Comment> = Vec::new();
+    let mut x = Xml::new(xml);
+    // The comment currently being scanned (`None` between comments).
+    let mut cur: Option<model::Comment> = None;
+    let mut depth = 0i32; // nesting depth inside the open `w:comment`
+    let mut in_text = false; // inside a `w:t`
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => {
+                let ln = local(&name);
+                if ln == "comment" && cur.is_none() {
+                    cur = Some(model::Comment {
+                        id: attr(&attrs, "id").unwrap_or("").to_string(),
+                        author: attr(&attrs, "author").unwrap_or("").to_string(),
+                        date: attr(&attrs, "date").unwrap_or("").to_string(),
+                        text: String::new(),
+                    });
+                    depth = 0;
+                    in_text = false;
+                    // A self-closing `w:comment` (no body) is complete at once.
+                    if sc {
+                        if let Some(c) = cur.take() {
+                            comments.push(c);
+                        }
+                    }
+                } else if let Some(c) = cur.as_mut() {
+                    if !sc {
+                        depth += 1;
+                    }
+                    if ln == "t" {
+                        in_text = true;
+                    } else if ln == "tab" {
+                        c.text.push(' ');
+                    } else if ln == "p" && !c.text.is_empty() && !c.text.ends_with(' ') {
+                        // Separate successive paragraphs with a single space.
+                        c.text.push(' ');
+                    }
+                }
+            }
+            Tok::Text(t) => {
+                if let Some(c) = cur.as_mut() {
+                    if in_text {
+                        c.text.push_str(&t);
+                    }
+                }
+            }
+            Tok::Close(name) => {
+                let ln = local(&name);
+                if cur.is_some() {
+                    if ln == "t" {
+                        in_text = false;
+                    }
+                    if ln == "comment" && depth == 0 {
+                        if let Some(mut c) = cur.take() {
+                            c.text = c.text.trim().to_string();
+                            comments.push(c);
+                        }
+                    } else {
+                        depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+    comments
+}
+
+/// Parse one ODF `office:annotation` (its open tag already consumed) into a
+/// [`model::Comment`], consuming up to its matching `</office:annotation>`. The
+/// author is `dc:creator`, the date `dc:date` (verbatim), and the body the
+/// `text:p` paragraphs flattened to plain text (joined by a single space). The
+/// `id` is the supplied `office:name` when present, else `c{ordinal}` (a 1-based
+/// document-order fallback so the matching `Inline::CommentRef` resolves).
+fn odf_annotation_inline(x: &mut Xml, name: Option<&str>, ordinal: usize) -> model::Comment {
+    let id = match name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => format!("c{ordinal}"),
+    };
+    let mut c = model::Comment {
+        id,
+        ..model::Comment::default()
+    };
+    let mut field: Option<&'static str> = None; // "creator" | "date" while inside one
+    let mut in_text = false; // inside a body `text:p`/`text:span` text node
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, _) => match local(&name) {
+                "creator" => field = Some("creator"),
+                "date" => field = Some("date"),
+                "p" => {
+                    in_text = true;
+                    if !c.text.is_empty() && !c.text.ends_with(' ') {
+                        c.text.push(' ');
+                    }
+                }
+                "tab" | "line-break" => c.text.push(' '),
+                _ => {}
+            },
+            Tok::Text(t) => match field {
+                Some("creator") => c.author.push_str(&t),
+                Some("date") => c.date.push_str(&t),
+                _ if in_text => c.text.push_str(&t),
+                _ => {}
+            },
+            Tok::Close(name) => match local(&name) {
+                "creator" | "date" => field = None,
+                "p" => in_text = false,
+                "annotation" => break,
+                _ => {}
+            },
+        }
+    }
+    c.author = c.author.trim().to_string();
+    c.date = c.date.trim().to_string();
+    c.text = c.text.trim().to_string();
+    c
 }
 
 /// Shared parser for `word/footnotes.xml` (`tag = "footnote"`) and
@@ -15837,6 +16005,74 @@ mod tests {
         assert_eq!(texts, vec!["commented text".to_string()]);
     }
 
+    /// A DOCX `w:comment` body is imported into `Document.comments` (author +
+    /// flattened text), and the `w:commentReference` in the run flow becomes an
+    /// `Inline::CommentRef` anchor carrying the same id. The semantic HTML render
+    /// then contains both the in-flow marker (a `<sup>` linking to `#cmt-1`) and
+    /// the comment body text in the trailing comments `<aside>`.
+    #[test]
+    fn docx_comment_body_imported_and_anchored_and_rendered() {
+        let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
+  <w:p>
+    <w:r><w:t>before </w:t></w:r>
+    <w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="1"/></w:r>
+    <w:r><w:t> after</w:t></w:r>
+  </w:p>
+</w:body></w:document>"#;
+        let comments_xml = r#"<?xml version="1.0"?><w:comments xmlns:w="x">
+  <w:comment w:id="1" w:author="Reviewer" w:date="2026-06-24T10:00:00Z">
+    <w:p><w:r><w:t>Please clarify</w:t></w:r></w:p>
+  </w:comment>
+</w:comments>"#;
+        let mut z = ZipWriter::new();
+        z.add_stored("[Content_Types].xml", b"<Types/>");
+        z.add_stored("word/document.xml", document_xml.as_bytes());
+        z.add_stored("word/comments.xml", comments_xml.as_bytes());
+        let document = docx_to_model(&read_zip(&z.finish()));
+
+        // Body imported into Document.comments.
+        assert_eq!(document.comments.len(), 1, "one comment imported");
+        let c = &document.comments[0];
+        assert_eq!(c.id, "1");
+        assert_eq!(c.author, "Reviewer");
+        assert_eq!(c.date, "2026-06-24T10:00:00Z");
+        assert_eq!(c.text, "Please clarify");
+
+        // An Inline::CommentRef anchor with the matching id sits in the run flow.
+        let has_anchor = document
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .any(|b| match &b.kind {
+                BlockKind::Paragraph(p) => p
+                    .runs
+                    .iter()
+                    .any(|r| matches!(r, Inline::CommentRef { id } if id == "1")),
+                _ => false,
+            });
+        assert!(has_anchor, "an Inline::CommentRef{{id:\"1\"}} anchor is present");
+
+        // Semantic HTML render: in-flow marker + comment body in the aside.
+        let html = crate::convert::web::html_from_model(&document);
+        assert!(
+            html.contains("href=\"#cmt-1\""),
+            "HTML has a marker linking to the comment: {html}"
+        );
+        assert!(
+            html.contains("id=\"cmt-1\""),
+            "HTML has the comment anchor in the comments section"
+        );
+        assert!(
+            html.contains("Please clarify"),
+            "HTML renders the comment body text"
+        );
+        assert!(
+            html.contains("Reviewer"),
+            "HTML renders the comment author"
+        );
+    }
+
     /// A formatting-change record (`w:rPrChange`, embedding the *old* `w:rPr`) is
     /// ignored entirely: the run keeps its *current* style and its text — the old
     /// `w:rPr` must not leak into the run nor emit any text.
@@ -20473,6 +20709,98 @@ mod tests {
             })
             .collect();
         assert_eq!(link_text, "our site");
+    }
+
+    /// An ODF `office:annotation` is imported into `Document.comments` (its
+    /// `dc:creator` author, `dc:date`, and `text:p` body), and a matching
+    /// `Inline::CommentRef` anchor is emitted at its point in the run flow.
+    #[test]
+    fn odt_model_annotation_becomes_comment_and_anchor() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:dc="d">
+  <office:body><office:text>
+    <text:p>see <office:annotation office:name="cmt1"><dc:creator>Alice</dc:creator><dc:date>2026-06-24T09:00:00</dc:date><text:p>Needs a source</text:p></office:annotation>here</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+
+        assert_eq!(model.comments.len(), 1, "one comment imported");
+        let c = &model.comments[0];
+        assert_eq!(c.id, "cmt1");
+        assert_eq!(c.author, "Alice");
+        assert_eq!(c.date, "2026-06-24T09:00:00");
+        assert_eq!(c.text, "Needs a source");
+
+        // The anchor sits in the paragraph's run flow with the same id.
+        let has_anchor = model_first_section_inlines(&model)
+            .iter()
+            .any(|i| matches!(i, Inline::CommentRef { id } if id == "cmt1"));
+        assert!(has_anchor, "an Inline::CommentRef{{id:\"cmt1\"}} anchor is present");
+
+        // The surrounding text is intact (the annotation body did not leak in).
+        let text: String = model_first_section_inlines(&model)
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("see "), "leading text kept: {text:?}");
+        assert!(text.contains("here"), "trailing text kept: {text:?}");
+        assert!(
+            !text.contains("Needs a source"),
+            "annotation body must not leak into the flow: {text:?}"
+        );
+    }
+
+    /// An unnamed `office:annotation` still imports a comment, with a synthesized
+    /// positional id (`c1`) that the emitted anchor matches.
+    #[test]
+    fn odt_model_unnamed_annotation_gets_positional_id() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:dc="d">
+  <office:body><office:text>
+    <text:p>x<office:annotation><dc:creator>Bob</dc:creator><text:p>note</text:p></office:annotation></text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        assert_eq!(model.comments.len(), 1);
+        assert_eq!(model.comments[0].id, "c1");
+        assert_eq!(model.comments[0].text, "note");
+        assert!(model_first_section_inlines(&model)
+            .iter()
+            .any(|i| matches!(i, Inline::CommentRef { id } if id == "c1")));
+    }
+
+    /// A document with no comments: `Document.comments` is empty, no
+    /// `Inline::CommentRef` is emitted, and the HTML render has neither a marker
+    /// nor a comments section (output is unchanged by the comment feature).
+    #[test]
+    fn no_comments_leaves_document_and_html_unchanged() {
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:p>plain paragraph</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let model = odt_model(content, &[]);
+        assert!(model.comments.is_empty(), "no comments");
+        assert!(
+            !model_first_section_inlines(&model)
+                .iter()
+                .any(|i| matches!(i, Inline::CommentRef { .. })),
+            "no CommentRef anchor emitted"
+        );
+        let html = crate::convert::web::html_from_model(&model);
+        // No in-flow marker (a `<sup>` linking to a `#cmt-…` anchor) and no
+        // comments `<aside>`. (The static `<style>` block always names the CSS
+        // classes, so assert on the emitted markup, not the class names.)
+        assert!(
+            !html.contains("href=\"#cmt-"),
+            "no inline comment marker emitted"
+        );
+        assert!(
+            !html.contains("<aside class=\"comments\""),
+            "no comments section emitted"
+        );
+        assert!(html.contains("plain paragraph"), "body still rendered");
     }
 
     #[test]

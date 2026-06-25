@@ -774,6 +774,7 @@ fn paragraph_text(para: &crate::model::Paragraph) -> String {
                 }
             }
             Inline::Image(_) => {}
+            Inline::CommentRef { .. } => {}
         }
     }
     s.trim().to_string()
