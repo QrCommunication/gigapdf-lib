@@ -1131,6 +1131,13 @@ Target=\"slides/slide{}.xml\"/>",
     s
 }
 
+/// Per-slide relationships: the mandatory `slideLayout` relationship
+/// (ECMA-376 §13.3.8 — every slide MUST reference exactly one slide layout)
+/// followed by one `image` relationship per embedded picture. Image rIds are
+/// `rId1..rIdN` (matching the `r:embed` values written into the slide body by
+/// [`pptx_slide_xml`]); the layout rId is the next free id so it never collides.
+/// The slide↔layout link is resolved by relationship *type*, not by any `r:id`
+/// in the slide XML, so its numeric id is free to be last.
 fn pptx_slide_rels(media_indices: &[usize]) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -1145,6 +1152,12 @@ Target=\"../media/image{}.png\"/>",
             global + 1
         ));
     }
+    s.push_str(&format!(
+        "<Relationship Id=\"rId{}\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\" \
+Target=\"../slideLayouts/slideLayout1.xml\"/>",
+        media_indices.len() + 1
+    ));
     s.push_str("</Relationships>");
     s
 }
@@ -2118,6 +2131,173 @@ mod tests {
         let pres = String::from_utf8(entry(&zip, "ppt/presentation.xml").unwrap()).unwrap();
         assert!(pres.contains("p:sldSz"), "slide size set from page");
         assert_eq!(pres.matches("<p:sldId ").count(), 1, "one slide per page");
+        // The slide must reference its layout (ECMA-376 §13.3.8).
+        let slide_rels =
+            String::from_utf8(entry(&zip, "ppt/slides/_rels/slide1.xml.rels").unwrap()).unwrap();
+        assert!(
+            slide_rels.contains(
+                "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\""
+            ) && slide_rels.contains("Target=\"../slideLayouts/slideLayout1.xml\""),
+            "slide1.xml.rels missing slideLayout relationship"
+        );
+    }
+
+    /// Resolve an OPC relationship `Target` (relative to the source part's
+    /// directory) into an absolute package part name, collapsing `..`/`.`.
+    fn opc_resolve(rels_part: &str, target: &str) -> String {
+        let base = rels_part
+            .rsplit_once("_rels/")
+            .map(|(dir, _)| dir.trim_end_matches('/'))
+            .unwrap_or("");
+        let mut stack: Vec<&str> = if base.is_empty() {
+            Vec::new()
+        } else {
+            base.split('/').collect()
+        };
+        for seg in target.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                s => stack.push(s),
+            }
+        }
+        stack.join("/")
+    }
+
+    /// Collect every `Target="…"` attribute value from a `.rels` part body.
+    fn opc_targets(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(p) = rest.find("Target=\"") {
+            rest = &rest[p + 8..];
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Assert that every relationship target in the package resolves to an
+    /// existing part declared in `[Content_Types].xml`.
+    fn assert_pptx_opc_invariants(bytes: &[u8]) {
+        let parts = crate::convert::zip::read_zip(bytes);
+        let ct = String::from_utf8(parts.get("[Content_Types].xml").unwrap().clone()).unwrap();
+        let declared = |part: &str| -> bool {
+            if ct.contains(&format!("PartName=\"/{part}\"")) {
+                return true;
+            }
+            match part.rsplit_once('.') {
+                Some((_, ext)) => ct.contains(&format!("Extension=\"{ext}\"")),
+                None => false,
+            }
+        };
+        for (name, data) in &parts {
+            if !name.ends_with(".rels") {
+                assert!(
+                    declared(name),
+                    "part {name} not declared in [Content_Types].xml"
+                );
+                continue;
+            }
+            let body = String::from_utf8(data.clone()).unwrap();
+            for target in opc_targets(&body) {
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    continue;
+                }
+                let resolved = opc_resolve(name, &target);
+                assert!(
+                    parts.contains_key(&resolved),
+                    "rels {name}: target {target} → {resolved} has no part"
+                );
+                assert!(
+                    declared(&resolved),
+                    "rels {name}: target {resolved} not in [Content_Types].xml"
+                );
+            }
+        }
+    }
+
+    /// A 1×1 PNG (8-byte signature is all `read_zip`/`to_pptx` care about here).
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ]
+    }
+
+    #[test]
+    fn to_pptx_full_opc_chain_with_image() {
+        // Two pages, the first carrying an embedded image, to verify the
+        // slide→layout relationship coexists with image relationships without
+        // an rId collision and that the whole package is OPC-consistent.
+        let mut pages = sample_pages();
+        pages[0].images = vec![PlacedImage {
+            png: tiny_png(),
+            x: 10.0,
+            y: 10.0,
+            width: 50.0,
+            height: 50.0,
+        }];
+        pages.push(ConvPage {
+            width: 612.0,
+            height: 792.0,
+            texts: vec![PlacedText {
+                text: "second".to_string(),
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 12.0,
+                style: TextStyle {
+                    family: "Helvetica".to_string(),
+                    generic: Generic::Sans,
+                    bold: false,
+                    italic: false,
+                    color: None,
+                    background: None,
+                },
+            }],
+            images: Vec::new(),
+            shapes: Vec::new(),
+        });
+
+        let zip = to_pptx(&pages);
+        assert_pptx_opc_invariants(&zip);
+
+        // Slide 1 has both an image rel (rId1) and the layout rel (next free id).
+        let r1 =
+            String::from_utf8(entry(&zip, "ppt/slides/_rels/slide1.xml.rels").unwrap()).unwrap();
+        assert!(
+            r1.contains("/relationships/image\" Target=\"../media/image1.png\""),
+            "image relationship missing/renumbered"
+        );
+        assert!(
+            r1.contains("/relationships/slideLayout\" Target=\"../slideLayouts/slideLayout1.xml\""),
+            "slide1 layout relationship missing"
+        );
+        // The image rId referenced in the slide body still resolves in the rels.
+        let s1 = String::from_utf8(entry(&zip, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        assert!(s1.contains("r:embed=\"rId1\""), "image embed uses rId1");
+        assert!(
+            r1.contains("Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\""),
+            "rId1 must remain the image relationship"
+        );
+
+        // Slide 2 (no image) still gets exactly its layout relationship.
+        let r2 =
+            String::from_utf8(entry(&zip, "ppt/slides/_rels/slide2.xml.rels").unwrap()).unwrap();
+        assert!(
+            r2.contains("/relationships/slideLayout\" Target=\"../slideLayouts/slideLayout1.xml\""),
+            "slide2 layout relationship missing"
+        );
+        assert!(
+            !r2.contains("/relationships/image\""),
+            "slide2 has no image relationship"
+        );
     }
 
     #[test]

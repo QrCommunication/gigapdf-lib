@@ -1939,6 +1939,13 @@ Target=\"slides/slide{}.xml\"/>",
     s
 }
 
+/// Per-slide relationships: the mandatory `slideLayout` relationship
+/// (ECMA-376 §13.3.8 — every slide MUST reference exactly one slide layout)
+/// followed by one `image` relationship per embedded picture. Image rIds are
+/// `rId1..rIdN` (matching the `r:embed` values written into the slide body by
+/// [`pptx_slide_from_model`]); the layout rId is the next free id so it never
+/// collides. The slide↔layout link is resolved by relationship *type*, not by
+/// any `r:id` in the slide XML, so its numeric id is free to be last.
 fn pptx_model_slide_rels(media_indices: &[usize]) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -1953,6 +1960,12 @@ Target=\"../media/image{}.png\"/>",
             global + 1
         ));
     }
+    s.push_str(&format!(
+        "<Relationship Id=\"rId{}\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\" \
+Target=\"../slideLayouts/slideLayout1.xml\"/>",
+        media_indices.len() + 1
+    ));
     s.push_str("</Relationships>");
     s
 }
@@ -5319,6 +5332,190 @@ mod tests {
         assert!(s.contains("Slide title"));
     }
 
+    /// Build a `Document` carrying a single `SlideBlock` with `n` blank slides.
+    fn slide_deck_doc(n: usize) -> Document {
+        use crate::model::{Slide, SlideBlock};
+        let slides = (0..n)
+            .map(|i| Slide {
+                geometry: crate::model::PageGeometry {
+                    width: 960.0,
+                    height: 540.0,
+                    margins: crate::model::Margins::uniform(0.0),
+                },
+                shapes: Vec::new(),
+                placeholders: vec![crate::model::Placeholder {
+                    role: crate::model::PlaceholderRole::Title,
+                    block: para(&format!("Slide {}", i + 1)),
+                }],
+                notes: None,
+                background: None,
+            })
+            .collect();
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock { slides }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Resolve an OPC relationship `Target` (relative to the source part's
+    /// directory) into an absolute package part name, collapsing `..`/`.`.
+    fn opc_resolve(rels_part: &str, target: &str) -> String {
+        // The base directory is the source part's directory, i.e. the `.rels`
+        // path with the trailing `_rels/<name>.rels` removed.
+        let base = rels_part
+            .rsplit_once("_rels/")
+            .map(|(dir, _)| dir.trim_end_matches('/'))
+            .unwrap_or("");
+        let mut stack: Vec<&str> = if base.is_empty() {
+            Vec::new()
+        } else {
+            base.split('/').collect()
+        };
+        for seg in target.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                s => stack.push(s),
+            }
+        }
+        stack.join("/")
+    }
+
+    /// Collect every `Target="…"` attribute value from a `.rels` part body.
+    fn opc_targets(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(p) = rest.find("Target=\"") {
+            rest = &rest[p + 8..];
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Assert the structural OPC invariants of a presentation package: every
+    /// relationship `Target` resolves to a part that exists *and* is declared in
+    /// `[Content_Types].xml` (by `<Override>` part name or `<Default>`
+    /// extension). Internal (non-`External`) targets only.
+    fn assert_pptx_opc_invariants(bytes: &[u8]) {
+        let parts = read_zip(bytes);
+        let ct = String::from_utf8(parts.get("[Content_Types].xml").unwrap().clone()).unwrap();
+        let declared = |part: &str| -> bool {
+            if ct.contains(&format!("PartName=\"/{part}\"")) {
+                return true;
+            }
+            match part.rsplit_once('.') {
+                Some((_, ext)) => ct.contains(&format!("Extension=\"{ext}\"")),
+                None => false,
+            }
+        };
+        for (name, data) in &parts {
+            if !name.ends_with(".rels") {
+                assert!(
+                    declared(name),
+                    "part {name} not declared in [Content_Types].xml"
+                );
+                continue;
+            }
+            let body = String::from_utf8(data.clone()).unwrap();
+            for target in opc_targets(&body) {
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    continue; // external relationship
+                }
+                let resolved = opc_resolve(name, &target);
+                assert!(
+                    parts.contains_key(&resolved),
+                    "rels {name}: target {target} → {resolved} has no part"
+                );
+                assert!(
+                    declared(&resolved),
+                    "rels {name}: target {resolved} not in [Content_Types].xml"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pptx_from_model_wires_full_layout_master_chain() {
+        let bytes = pptx_from_model(&slide_deck_doc(2));
+        assert_eq!(&bytes[..2], b"PK");
+
+        // Generic OPC structural validation over the whole package.
+        assert_pptx_opc_invariants(&bytes);
+
+        // Every slide's .rels references the (existing) slide layout.
+        for i in 1..=2 {
+            let rels = String::from_utf8(
+                entry(&bytes, &format!("ppt/slides/_rels/slide{i}.xml.rels")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                rels.contains(
+                    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\""
+                ),
+                "slide{i}.xml.rels missing slideLayout relationship"
+            );
+            assert!(
+                rels.contains("Target=\"../slideLayouts/slideLayout1.xml\""),
+                "slide{i}.xml.rels layout target wrong"
+            );
+            assert!(
+                entry(&bytes, "ppt/slideLayouts/slideLayout1.xml").is_some(),
+                "referenced slideLayout1.xml does not exist"
+            );
+        }
+
+        // The layout points at the master, which exists and lists the layout.
+        let layout_rels = String::from_utf8(
+            entry(&bytes, "ppt/slideLayouts/_rels/slideLayout1.xml.rels").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            layout_rels.contains("Target=\"../slideMasters/slideMaster1.xml\""),
+            "layout does not reference the master"
+        );
+        let master =
+            String::from_utf8(entry(&bytes, "ppt/slideMasters/slideMaster1.xml").unwrap()).unwrap();
+        assert!(
+            master.contains("<p:sldLayoutIdLst>"),
+            "master missing p:sldLayoutIdLst"
+        );
+
+        // presentation.xml references the master both structurally and by rels.
+        let pres = String::from_utf8(entry(&bytes, "ppt/presentation.xml").unwrap()).unwrap();
+        assert!(
+            pres.contains("<p:sldMasterIdLst>"),
+            "presentation missing p:sldMasterIdLst"
+        );
+        let pres_rels =
+            String::from_utf8(entry(&bytes, "ppt/_rels/presentation.xml.rels").unwrap()).unwrap();
+        assert!(
+            pres_rels.contains("Target=\"slideMasters/slideMaster1.xml\""),
+            "presentation.rels missing master relationship"
+        );
+
+        // Content_Types declares the layout + master + theme parts.
+        let ct = String::from_utf8(entry(&bytes, "[Content_Types].xml").unwrap()).unwrap();
+        assert!(ct.contains("/ppt/slideLayouts/slideLayout1.xml"));
+        assert!(ct.contains("/ppt/slideMasters/slideMaster1.xml"));
+        assert!(ct.contains("/ppt/theme/theme1.xml"));
+    }
+
     #[test]
     fn odt_from_model_is_flowing_odf() {
         let bytes = odt_from_model(&sample_doc());
@@ -6823,3 +7020,4 @@ mod tests {
         );
     }
 }
+
