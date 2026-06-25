@@ -7,6 +7,23 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.100.0] - 2026-06-25
+
+The last in-scope Office-import ([#3](https://github.com/qrcommunication/gigapdf-lib/issues/3))
+fidelity items. The remaining #3 gaps — legacy OLE2 binary readers (`.doc`/`.xls`/`.ppt`),
+chart/SmartArt diagram models, AVIF decoding, and comment-body import — are deferred
+as large future work.
+
+### Improved — Office import ([#3])
+
+- **Spreadsheet column widths** — XLSX `<cols>` and ODS `table:table-column` widths
+  are imported and re-exported (round-trip stable; stored in points internally).
+- **DOCX track-changes accepted to the final version** — inserted / moved-to content
+  is kept, while deleted / moved-from content and `*PrChange` formatting-revision
+  records are dropped (previously the deleted `w:delText` leaked into the output);
+  comment markers (`w:commentRangeStart/End`, `w:commentReference`) no longer corrupt
+  run/paragraph parsing. (Comment *bodies* remain a deferred niche feature.)
+
 ## [0.99.0] - 2026-06-25
 
 Closes the **DOCX content-class** roadmap ([#37](https://github.com/qrcommunication/gigapdf-lib/issues/37))

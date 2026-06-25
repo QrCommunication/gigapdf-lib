@@ -44,6 +44,18 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.100.0] - 2026-06-25
+
+Engine improvements only — no new SDK methods. The last in-scope Office-import
+([#3](https://github.com/qrcommunication/gigapdf-lib/issues/3)) fidelity items.
+
+### Improved
+
+- **`officeToModel`** — XLSX/ODS sheet **column widths** are imported (and round-trip
+  through export); **DOCX track-changes** are accepted to the final version (insertions
+  kept, deletions dropped — deleted text no longer leaks), and comment markers no longer
+  corrupt parsing.
+
 ## [0.99.0] - 2026-06-25
 
 Engine improvements only — no new SDK methods; `officeToModel` and the PDF→model
