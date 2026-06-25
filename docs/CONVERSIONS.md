@@ -244,6 +244,37 @@ pipeline:
   2000 images are actually decoded when a page is rasterized or its images are
   extracted, not merely decodable in isolation.
 
+**In-house WMF/EMF metafile decoder (GDI records → RGBA):** Office documents and
+RTF embed **vector** clip-art, logos and diagrams as Windows Metafiles (`.wmf`)
+and Enhanced Metafiles (`.emf`) — a list of GDI drawing commands, not a pixel
+grid — so no image codec can decode them. `convert::metafile` adds a from-scratch
+**GDI rasterizer** (zero new deps) that interprets those records onto an in-house
+transparent RGBA canvas and returns a tight `MetafileRaster { width, height, rgba }`
+at the metafile's natural pixel size (capped to ~4096², transparent where nothing
+is painted). It covers both the **WMF** placeable header (`0x9AC6CDD7`, bbox +
+units) and the bare `METAHEADER` (16-bit records), and the **EMF** `ENHMETAHEADER`
+(`rclBounds`/`rclFrame`, 32-bit records): the GDI **object table** (pens —
+`CreatePenIndirect`/`ExtCreatePen` style·width·colour·dash; brushes —
+`CreateBrushIndirect`/`CreateSolidBrush`/pattern→solid; fonts —
+`CreateFontIndirect[W]`) with `SelectObject`/`DeleteObject` + EMF stock objects;
+the drawing records `MoveTo`/`LineTo`, `Polyline`/`Polygon`/`PolyPolygon` (+ EMF
+`*16`), `Rectangle`/`RoundRect`/`Ellipse`, `Arc`/`Pie`/`Chord`, `PolyBezier`
+(EMF), `SetPixel[V]`, `FillRgn`/`PaintRgn` (region→bbox), and the DIB blits
+`BitBlt`/`StretchBlt`/`StretchDIBits`/`SetDIBitsToDevice` (with a from-scratch
+DIB/BMP decoder for 1/4/8/24/32-bpp + RLE4/RLE8); the logical→device transform
+`SetWindowOrg`/`Ext` + `SetViewportOrg`/`Ext` + `SetMapMode` and the EMF world
+transform `SetWorldTransform`/`ModifyWorldTransform`, honouring the current
+pen/brush, the fill rule (`SetPolyFillMode`) and the paint state
+(`SetBkMode`/`SetBkColor`/`SetTextColor`/`SetROP2`). `ExtTextOut`/`TextOut`
+render as a reasonable advance/box strip (text is secondary; no font shaping
+here), and genuinely-rare records (palette management, escapes, EMF GDI+ comment
+blocks, ROP2 ops other than copy) are skipped safely. Public API:
+`decode_wmf`/`decode_emf`/`decode_metafile` (sniffing). **Wiring into
+`office_import` (Office EMF/WMF embedded images, [#3](../../issues/3)) and `rtf`
+(RTF WMF/EMF pictures, [#4](../../issues/4)) is a separate follow-up** — this is
+the decoder + its public API only; the RTF/Office "WMF/EMF … (no decoder)"
+limitations above still hold until that wiring lands.
+
 **Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
 (Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`
 name (`Identity-V`, `UniJIS-UCS2-V`, …) **or** an embedded CMap stream declaring

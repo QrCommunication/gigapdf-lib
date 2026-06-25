@@ -17,6 +17,7 @@ pub mod export_model;
 pub mod grids;
 pub mod import;
 pub mod md_import;
+pub mod metafile;
 pub mod office;
 pub mod office_import;
 pub mod pdfa;
