@@ -7,6 +7,52 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.98.0] - 2026-06-25
+
+Closes the **Office-export** ([#2](https://github.com/qrcommunication/gigapdf-lib/issues/2))
+and **other-format conversion** ([#4](https://github.com/qrcommunication/gigapdf-lib/issues/4))
+fidelity roadmaps, adds a from-scratch **WMF/EMF metafile decoder**, and advances
+the Office-import ([#3](https://github.com/qrcommunication/gigapdf-lib/issues/3))
+and PDF→model ([#5](https://github.com/qrcommunication/gigapdf-lib/issues/5)) roadmaps.
+
+### Added
+
+- **WMF + EMF metafile decoder, from scratch** (no third-party codec): a GDI
+  rasterizer — placeable/standard WMF + EMF `ENHMETAHEADER`, pen/brush/font objects,
+  poly/rect/ellipse/arc/bezier records, EMF affine world transforms, DIB blit
+  (1/4/8/24/32-bpp + RLE) → RGBA. Wired into **RTF import** (`{\pict\wmetafile/\emfblip/\dibitmap}`
+  + the `\bin` binary form) and **Office import** (embedded `.wmf`/`.emf` media → PNG).
+
+### Completed — Office export ([#2], now closed)
+
+- Multi-section page setup (DOCX per-section `w:sectPr` + headers/footers; ODT
+  master-pages); PPTX/ODP **non-slide content** keeps real lists/tables/headings
+  (no longer flattened to paragraphs); super/subscript (ODT+PPTX); spreadsheet
+  underline/strike (XLSX+ODS); ODT block shapes; internal page links (all four
+  exporters); explicit-vs-unset run colour. (With the formulas/image-format/speaker-
+  notes/inline-images/hyperlinks/list-nesting/borders shipped across 0.94–0.98.)
+
+### Completed — other-format conversions ([#4], now closed)
+
+- RTF import decodes WMF/EMF/DIB pictures + the `\bin` binary form — completing #4
+  alongside the earlier rich RTF↔model, model-aware `to_text`/`to_rtf`, CSV
+  typed-cell import + standard multi-sheet export, Markdown colour/shapes, nested
+  EPUB TOC + unique identifier, and veraPDF-conformant PDF/A.
+
+### Improved — Office import ([#3], roadmap)
+
+- PPTX/ODP run styling (underline/strike/highlight) + paragraph formatting + bullet/
+  number lists; ODS cell merges, number formats (incl. date/time) + fills at XLSX
+  parity; internal hyperlink anchors resolve to their bookmark page; DOCX `w:vMerge`
+  real row spans via grid-column tracking; PPTX/ODP speaker notes → `Slide.notes`;
+  embedded WMF/EMF images decoded to PNG + magic-byte format detection for
+  GIF/BMP/TIFF/SVG media.
+
+### Improved — PDF → model ([#5], roadmap)
+
+- Page `/Rotate` (90/180/270) applied to reconstructed blocks (dimensions swap,
+  text reads upright); tagged-PDF blocks distributed onto their real `/Pg` pages.
+
 ## [0.97.0] - 2026-06-25
 
 The third from-scratch image codec — **JPEG 2000** — lands and is wired into the

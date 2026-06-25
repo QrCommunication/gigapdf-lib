@@ -44,6 +44,27 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.98.0] - 2026-06-25
+
+Engine improvements only — no new SDK methods; existing conversion methods reach
+markedly higher fidelity, and two conversion roadmaps close.
+
+### Improved
+
+- **Office export ([#2]) complete** — `modelTo{Docx,Xlsx,Pptx,Odt,Ods,Odp}` now
+  preserve multi-section page setup, super/subscript, spreadsheet underline/strike,
+  ODT block shapes, internal page links, real PPTX/ODP non-slide structures, and
+  explicit run colour. ([#2](https://github.com/qrcommunication/gigapdf-lib/issues/2))
+- **Other-format conversions ([#4]) complete** — RTF import decodes WMF/EMF/DIB
+  pictures (`\bin` + hex), finishing the rich RTF↔model / `toText` / `toRtf` / CSV /
+  Markdown / EPUB / PDF-A roadmap. ([#4](https://github.com/qrcommunication/gigapdf-lib/issues/4))
+- **In-house WMF/EMF metafile decoder** — embedded Windows metafiles in `.rtf` and
+  Office packages now rasterize (previously dropped).
+- **Office import ([#3])** — PPTX/ODP run styling + paragraph + lists, ODS
+  merges/number-formats/fills, DOCX `w:vMerge` row spans, internal hyperlink-anchor
+  resolution, speaker notes, and embedded-image format detection.
+- **PDF→model ([#5])** — page `/Rotate` honored, tagged blocks land on their real pages.
+
 ## [0.97.0] - 2026-06-25
 
 Engine improvements only — no new SDK methods; existing conversion/render/read
