@@ -7,6 +7,35 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.99.0] - 2026-06-25
+
+Closes the **DOCX content-class** roadmap ([#37](https://github.com/qrcommunication/gigapdf-lib/issues/37))
+by linearizing Office Math, and advances the Office-import
+([#3](https://github.com/qrcommunication/gigapdf-lib/issues/3)) and PDF→model
+([#5](https://github.com/qrcommunication/gigapdf-lib/issues/5)) roadmaps with table
+header-row semantics and reconstruction-geometry fixes.
+
+### Completed — DOCX content classes ([#37], now closed)
+
+- **OMML (Office Math) equations linearized to Unicode math** — a new in-house OMML
+  lowerer handles fractions, radicals (√/∛), super/subscripts (Unicode), n-ary
+  operators (∑/∫/∏ with limits), delimiters, functions, accents, limits and matrices,
+  inline and display — so equations survive as readable text instead of being dropped.
+  (With the symbol runs, text boxes and field codes shipped earlier.) Full 2D visual
+  math layout is noted as a deferred future enhancement.
+
+### Improved — tables & reconstruction ([#3] / [#5])
+
+- **Table header-row semantics** end-to-end: a new `Row.is_header` is detected in
+  reconstruction (bold leading row), read from tagged `/THead`, DOCX `w:tblHeader`,
+  ODF `table:table-header-rows` and HTML `<thead>/<th>`, and emitted back to all of
+  those + EPUB + JSON. (Per-cell column headers noted as a follow-up.)
+- **Document-wide heading levels** — heading sizes are clustered once across the whole
+  document, so the same visual heading is the same level on every page and the
+  multi-page outline is coherent.
+- **Page `/Rotate` now applies to tagged-PDF block geometry** too (the `/Layout /BBox`
+  frames are Y-flipped then projected), so tagged + rotated pages reconstruct upright.
+
 ## [0.98.0] - 2026-06-25
 
 Closes the **Office-export** ([#2](https://github.com/qrcommunication/gigapdf-lib/issues/2))

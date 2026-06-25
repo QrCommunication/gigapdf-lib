@@ -44,6 +44,21 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.99.0] - 2026-06-25
+
+Engine improvements only — no new SDK methods; `officeToModel` and the PDF→model
+reconstruction get higher fidelity, and one roadmap closes.
+
+### Improved
+
+- **DOCX Office Math ([#37]) complete** — `officeToModel` now linearizes OMML
+  equations to readable Unicode math (fractions, radicals, sub/superscripts, ∑/∫,
+  matrices…) instead of dropping them. ([#37](https://github.com/qrcommunication/gigapdf-lib/issues/37))
+- **Table header rows** — `Row.is_header` is detected in PDF→model reconstruction and
+  round-trips through DOCX/ODF/HTML/EPUB import+export+render (+ JSON).
+- **PDF→model** — heading levels are clustered document-wide (consistent across pages),
+  and page `/Rotate` now applies to tagged-PDF block geometry.
+
 ## [0.98.0] - 2026-06-25
 
 Engine improvements only — no new SDK methods; existing conversion methods reach
