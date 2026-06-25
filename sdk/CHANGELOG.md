@@ -44,6 +44,30 @@ two fixes that close the gaps the validator surfaced.
   transfer-function key is removed from ExtGState (cl. 6.2.5), and incomplete
   `/CIDSet` entries are dropped (cl. 6.2.11.4.2) — all render-neutral.
 
+## [0.96.0] - 2026-06-25
+
+PDF linearization + from-scratch bilevel codecs, plus a broad conversion-fidelity
+pass. New SDK surface:
+
+### Added
+
+- **`toLinearized()` / `saveLinearized()`** — produce a linearized ("Fast Web
+  View") PDF: ISO 32000-1 Annex F layout with `/Linearized` dict + page-offset
+  and shared-object hint streams, byte-exact and **qpdf-clean**.
+  ([#67](https://github.com/qrcommunication/gigapdf-lib/issues/67))
+
+### Improved (engine, via existing SDK conversion/render/read methods)
+
+- **Scanned-document PDFs** now render and extract: `CCITTFaxDecode` (G3/G4) and
+  `JBIG2Decode` (full ITU-T T.88) are implemented from scratch — no third-party
+  codec. ([#34](https://github.com/qrcommunication/gigapdf-lib/issues/34))
+- **Conversion fidelity** advanced across the board (open roadmaps #2/#3/#4/#5):
+  XLSX/ODS cell formulas, real image formats and PPTX/ODP speaker notes on export;
+  DOCX/ODT headers/footers, XLSX cell styling and DOCX footnotes on import; rich
+  RTF↔model and GFM Markdown→model; EPUB nested TOC + unique id + inline-SVG
+  shapes; and PDF→model gains header/footer stripping, stable heading levels and
+  list false-positive rejection.
+
 ## [0.95.0] - 2026-06-25
 
 Thirteen roadmap issues (PDF authoring, PDF reading, Office round-trip, CI

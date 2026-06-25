@@ -7,6 +7,57 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [0.96.0] - 2026-06-25
+
+Two headline features close — **PDF linearization** and **from-scratch bilevel
+image codecs** — alongside a broad first pass over the four conversion-fidelity
+roadmaps ([#2](https://github.com/qrcommunication/gigapdf-lib/issues/2)/[#3](https://github.com/qrcommunication/gigapdf-lib/issues/3)/[#4](https://github.com/qrcommunication/gigapdf-lib/issues/4)/[#5](https://github.com/qrcommunication/gigapdf-lib/issues/5),
+which remain open for their longer tails).
+
+### Added — PDF
+
+- **Linearization / Fast Web View.** `toLinearized()` / `saveLinearized()` —
+  a byte-exact ISO 32000-1 Annex F implementation (the `/Linearized` parameter
+  dict, first-page + main cross-reference sections, and bit-packed page-offset +
+  shared-object **hint streams**, with a multi-pass offset solver), **validated
+  clean by qpdf** (`qpdf --check` reports the file linearized, zero warnings).
+  ([#67](https://github.com/qrcommunication/gigapdf-lib/issues/67))
+- **CCITTFax + JBIG2 bilevel image decoders, from scratch** (no third-party
+  codec). `CCITTFaxDecode` (G3/G4: modified-Huffman tables, 1-D + 2-D READ,
+  `/K`/`/Columns`/`/BlackIs1`/byte-align/EOL/RTC). `JBIG2Decode` (full ITU-T
+  T.88: MQ arithmetic + integer decoders, generic/refinement/halftone +
+  pattern-dictionary/symbol-dictionary/text regions, arithmetic **and** Huffman
+  coding incl. REFAGG, indirect `/JBIG2Globals`) — scanned-document PDFs now
+  render and extract. ([#34](https://github.com/qrcommunication/gigapdf-lib/issues/34))
+
+### Improved — conversion fidelity (roadmap first pass)
+
+- **Office export** ([#2](https://github.com/qrcommunication/gigapdf-lib/issues/2)):
+  XLSX/ODS **cell formulas** emitted (`<f>` / `table:formula`); media parts now
+  carry their **real image format** (a JPEG no longer ships as a corrupt `.png`)
+  across all exporters; **PPTX/ODP speaker notes**; EPUB gains a **nested TOC**,
+  a **unique deterministic identifier**, and **inline-SVG shapes**.
+- **Office import** ([#3](https://github.com/qrcommunication/gigapdf-lib/issues/3)):
+  DOCX/ODT **running headers & footers** lowered to `Section.header/footer`;
+  XLSX **per-cell character styling** (`applyFont` gate); DOCX **footnotes &
+  endnotes** inlined at their reference points.
+- **Other formats** ([#4](https://github.com/qrcommunication/gigapdf-lib/issues/4)):
+  **RTF ↔ model** is now rich both ways (styling, tables, images, hyperlinks);
+  **Markdown → model** handles GFM (strikethrough, images, task-lists,
+  reference/footnote links, setext, inline HTML); vector **Shapes render as
+  inline `<svg>`** in HTML/EPUB.
+- **PDF → model reconstruction** ([#5](https://github.com/qrcommunication/gigapdf-lib/issues/5)):
+  running **headers/footers stripped** from body prose (and preserved in
+  `Section`); **heading levels** clustered into stable monotonic ranks; **list
+  false positives** rejected via ordinal-sequence validation.
+
+### Fixed
+
+- Three exporter schema-conformance bugs the new XSD/RelaxNG CI gate surfaced —
+  DOCX text-box shapes now MCE-valid (VML), XLSX inline `<t>` drops the illegal
+  `xml:space`, ODS emits `table:table-column` before rows — so the gate passes
+  with **zero waivers**. ([#19](https://github.com/qrcommunication/gigapdf-lib/issues/19) follow-up)
+
 ## [0.95.0] - 2026-06-25
 
 Thirteen roadmap issues across PDF authoring, PDF reading, Office round-trip
