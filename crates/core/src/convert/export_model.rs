@@ -1944,20 +1944,23 @@ pub fn pptx_from_model(doc: &Document) -> Vec<u8> {
     // `[Content_Types]` `Default` all carry the resource's real format.
     let mut media: Vec<(Vec<u8>, &'static str)> = Vec::new();
     let mut slide_xmls: Vec<String> = Vec::new();
-    let mut slide_media: Vec<Vec<usize>> = Vec::new();
+    // Per-slide relationship accumulator (images + external hyperlinks, in
+    // allocation order ⇒ `rId1..`). Drives both the slide XML's `r:embed`/`r:id`
+    // and the slide's `.rels`.
+    let mut slide_rels: Vec<PptxSlideRels> = Vec::new();
     // Speaker notes per slide: the rendered `notesSlideN.xml` body, or `None`
     // when the slide carries no notes (so no `notesSlide` part is emitted).
     let mut notes_xmls: Vec<Option<String>> = Vec::new();
     for slide in &model_slides {
-        let mut used = Vec::new();
-        slide_xmls.push(pptx_slide_from_model(slide, doc, &mut media, &mut used));
-        slide_media.push(used);
+        let mut rels = PptxSlideRels::default();
+        slide_xmls.push(pptx_slide_from_model(slide, doc, &mut media, &mut rels));
+        slide_rels.push(rels);
         notes_xmls.push(
             slide
                 .notes
                 .as_ref()
                 .filter(|n| !n.is_empty())
-                .map(|n| pptx_notes_from_model(n)),
+                .map(|n| pptx_notes_from_model(n, doc)),
         );
     }
     let media_exts: Vec<&str> = media.iter().map(|(_, ext)| *ext).collect();
@@ -2016,7 +2019,7 @@ Target=\"../slideMasters/slideMaster1.xml\"/></Relationships>",
         let has_notes = notes_xmls[i].is_some();
         zip.add_deflated(
             &format!("ppt/slides/_rels/slide{}.xml.rels", i + 1),
-            pptx_model_slide_rels(&slide_media[i], &media_exts, has_notes, i + 1).as_bytes(),
+            pptx_model_slide_rels(&slide_rels[i], &media_exts, has_notes, i + 1).as_bytes(),
         );
     }
     // Notes slides: one `notesSlideN.xml` (+ its rels) per slide that has notes,
@@ -2040,14 +2043,92 @@ Target=\"../slideMasters/slideMaster1.xml\"/></Relationships>",
     zip.finish()
 }
 
+/// One relationship a slide owns, in allocation order. Both variants become a
+/// `Relationship` in the slide's `.rels` and are referenced from the slide XML by
+/// their 1-based position (`rId1`, `rId2`, …) — see [`pptx_model_slide_rels`].
+enum SlideRel {
+    /// An embedded picture: the global index into the presentation's `media`
+    /// vector (the part is `ppt/media/image{global+1}.<ext>`).
+    Image(usize),
+    /// An external hyperlink target (`TargetMode="External"`).
+    Hyperlink(String),
+}
+
+/// A slide's relationship accumulator. Images and hyperlinks share one ID space
+/// allocated in build order, so the `r:embed`/`r:id` emitted inline always
+/// matches the `.rels`. The free-floating image path, the run-image hoist and the
+/// run-hyperlink path all allocate through here.
+#[derive(Default)]
+struct PptxSlideRels {
+    rels: Vec<SlideRel>,
+}
+
+impl PptxSlideRels {
+    /// Register an embedded image (by global media index); returns its `rId`.
+    fn add_image(&mut self, global: usize) -> usize {
+        self.rels.push(SlideRel::Image(global));
+        self.rels.len()
+    }
+    /// Register an external hyperlink target; returns its `rId`.
+    fn add_hyperlink(&mut self, url: &str) -> usize {
+        self.rels.push(SlideRel::Hyperlink(url.to_string()));
+        self.rels.len()
+    }
+}
+
+/// A run-level image to hoist onto the slide as a standalone `p:pic` (DrawingML
+/// has no picture-in-text-run: `CT_RegularTextRun` carries only `a:rPr`/`a:t`).
+/// The `rid` is its image relationship; `alt` becomes the picture's `descr`.
+struct RunPic {
+    rid: usize,
+    alt: String,
+}
+
+/// Threaded through the slide run path so runs can allocate image/hyperlink
+/// relationships. `doc`/`media`/`rels` are the presentation-wide blob store and
+/// the slide's rel accumulator; `pending_pics` collects run images for hoisting
+/// onto the slide's shape tree after the text shapes are emitted.
+///
+/// `inline_links` is `false` for contexts that have no `.rels` to record a
+/// hyperlink in (speaker notes): there, links degrade to their plain children and
+/// run images are dropped — exactly the historical behaviour for those parts.
+struct PptxRunCtx<'a> {
+    doc: &'a Document,
+    media: &'a mut Vec<(Vec<u8>, &'static str)>,
+    rels: &'a mut PptxSlideRels,
+    pending_pics: Vec<RunPic>,
+    inline_links: bool,
+}
+
+impl<'a> PptxRunCtx<'a> {
+    fn new(
+        doc: &'a Document,
+        media: &'a mut Vec<(Vec<u8>, &'static str)>,
+        rels: &'a mut PptxSlideRels,
+    ) -> Self {
+        PptxRunCtx {
+            doc,
+            media,
+            rels,
+            pending_pics: Vec::new(),
+            inline_links: true,
+        }
+    }
+}
+
 fn pptx_slide_from_model(
     slide: &Slide,
     doc: &Document,
     media: &mut Vec<(Vec<u8>, &'static str)>,
-    used: &mut Vec<usize>,
+    rels: &mut PptxSlideRels,
 ) -> String {
     let mut tree = String::new();
     let mut id = 2usize;
+
+    // Run images encountered inside placeholder/shape/table text are hoisted to
+    // standalone `p:pic` shapes appended after the text shapes (DrawingML runs
+    // cannot embed a picture). Collected across all run contexts on this slide.
+    let mut hoisted: Vec<RunPic> = Vec::new();
 
     // Placeholders first (title/body), positioned by their frame when present.
     for ph in &slide.placeholders {
@@ -2058,7 +2139,9 @@ fn pptx_slide_from_model(
             PlaceholderRole::Other(_) => ("body", " idx=\"1\"".to_string()),
         };
         let frame = pptx_xfrm(ph.block.frame, slide.geometry.width, slide.geometry.height);
-        let body = pptx_text_body(&block_to_paras(&ph.block));
+        let mut rctx = PptxRunCtx::new(doc, media, rels);
+        let body = pptx_text_body(&block_to_paras(&ph.block), &mut rctx);
+        hoisted.append(&mut rctx.pending_pics);
         tree.push_str(&format!(
             "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"ph{id}\"/><p:cNvSpPr/>\
 <p:nvPr><p:ph type=\"{ph_type}\"{ph_idx}/></p:nvPr></p:nvSpPr>\
@@ -2073,8 +2156,7 @@ fn pptx_slide_from_model(
             BlockKind::Image(img) => {
                 if let Some((bytes, ext)) = doc_image(doc, img.resource) {
                     media.push((bytes, ext));
-                    used.push(media.len() - 1);
-                    let rid = used.len();
+                    let rid = rels.add_image(media.len() - 1);
                     let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
                     tree.push_str(&format!(
                         "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"img{id}\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>\
@@ -2110,12 +2192,16 @@ fn pptx_slide_from_model(
                     slide.geometry.width,
                     slide.geometry.height,
                 ));
-                tree.push_str(&pptx_table_frame(table, r, id));
+                let mut rctx = PptxRunCtx::new(doc, media, rels);
+                tree.push_str(&pptx_table_frame(table, r, id, &mut rctx));
+                hoisted.append(&mut rctx.pending_pics);
                 id += 1;
             }
             _ => {
                 let frame = pptx_xfrm(sh.frame, slide.geometry.width, slide.geometry.height);
-                let body = pptx_text_body(&block_to_paras(sh));
+                let mut rctx = PptxRunCtx::new(doc, media, rels);
+                let body = pptx_text_body(&block_to_paras(sh), &mut rctx);
+                hoisted.append(&mut rctx.pending_pics);
                 tree.push_str(&format!(
                     "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"t{id}\"/><p:cNvSpPr txBox=\"1\"/><p:nvPr/></p:nvSpPr>\
 <p:spPr>{frame}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>{body}</p:sp>"
@@ -2123,6 +2209,25 @@ fn pptx_slide_from_model(
                 id += 1;
             }
         }
+    }
+
+    // Emit the hoisted run images as standalone pictures (DrawingML run images
+    // are not expressible; they become real `p:pic` shapes referencing the same
+    // media + relationship). Stacked at a default 96pt box near the top-left.
+    for (i, pic) in hoisted.iter().enumerate() {
+        let x = emu(8.0 + 8.0 * i as f64);
+        let y = emu(8.0 + 8.0 * i as f64);
+        let side = emu(96.0);
+        let mut alt = String::new();
+        esc(&pic.alt, &mut alt);
+        tree.push_str(&format!(
+            "<p:pic><p:nvPicPr><p:cNvPr id=\"{id}\" name=\"img{id}\" descr=\"{alt}\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>\
+<p:blipFill><a:blip r:embed=\"rId{rid}\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>\
+<p:spPr><a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{side}\" cy=\"{side}\"/></a:xfrm>\
+<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr></p:pic>",
+            rid = pic.rid,
+        ));
+        id += 1;
     }
 
     format!(
@@ -2152,13 +2257,13 @@ fn pptx_xfrm(frame: Option<crate::model::Rect>, _w: f64, _h: f64) -> String {
 }
 
 /// A `<p:txBody>` rendering a paragraph list as DrawingML paragraphs.
-fn pptx_text_body(paras: &[Paragraph]) -> String {
+fn pptx_text_body(paras: &[Paragraph], ctx: &mut PptxRunCtx) -> String {
     let mut body = String::from("<p:txBody><a:bodyPr/><a:lstStyle/>");
     if paras.is_empty() {
         body.push_str("<a:p/>");
     }
     for p in paras {
-        body.push_str(&pptx_paragraph(p));
+        body.push_str(&pptx_paragraph(p, ctx));
     }
     body.push_str("</p:txBody>");
     body
@@ -2168,8 +2273,15 @@ fn pptx_text_body(paras: &[Paragraph]) -> String {
 /// speaker notes in the `body` placeholder (`<p:ph type="body"/>`). The notes
 /// text is the slide's `notes` blocks flattened to paragraphs. The relationship
 /// to the owning slide is written separately by [`pptx_model_notes_rels`].
-fn pptx_notes_from_model(notes: &[Block]) -> String {
-    let body = pptx_text_body(&blocks_to_paras(notes));
+fn pptx_notes_from_model(notes: &[Block], doc: &Document) -> String {
+    // Notes own only a back-reference relationship (no image/hyperlink rels), so
+    // links degrade to their plain children and run images are dropped here. A
+    // throwaway media/rels backs the run ctx; nothing it allocates is serialized.
+    let mut sink_media: Vec<(Vec<u8>, &'static str)> = Vec::new();
+    let mut sink_rels = PptxSlideRels::default();
+    let mut rctx = PptxRunCtx::new(doc, &mut sink_media, &mut sink_rels);
+    rctx.inline_links = false;
+    let body = pptx_text_body(&blocks_to_paras(notes), &mut rctx);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <p:notes xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
@@ -2202,13 +2314,13 @@ Target=\"../slides/slide{slide_number}.xml\"/></Relationships>"
 /// A DrawingML `<a:txBody>` (the in-`a:tc` text body), as opposed to the
 /// presentationml `<p:txBody>` used for shapes. Reuses [`pptx_paragraph`]
 /// (which already emits `a:p`/`a:r`); only the wrapper element namespace differs.
-fn dml_text_body(paras: &[Paragraph]) -> String {
+fn dml_text_body(paras: &[Paragraph], ctx: &mut PptxRunCtx) -> String {
     let mut body = String::from("<a:txBody><a:bodyPr/><a:lstStyle/>");
     if paras.is_empty() {
         body.push_str("<a:p/>");
     }
     for p in paras {
-        body.push_str(&pptx_paragraph(p));
+        body.push_str(&pptx_paragraph(p, ctx));
     }
     body.push_str("</a:txBody>");
     body
@@ -2228,7 +2340,12 @@ const DML_TABLE_URI: &str = "http://schemas.openxmlformats.org/drawingml/2006/ta
 /// `gridSpan`/`rowSpan`, and every covered grid position still emits an
 /// `<a:tc>` flagged `hMerge="1"` (horizontal) or `vMerge="1"` (vertical) so the
 /// grid stays rectangular (PowerPoint requires a cell at every position).
-fn pptx_table_frame(table: &Table, frame: crate::model::Rect, id: usize) -> String {
+fn pptx_table_frame(
+    table: &Table,
+    frame: crate::model::Rect,
+    id: usize,
+    ctx: &mut PptxRunCtx,
+) -> String {
     let cols = table_col_count(table).max(1);
     let widths = docx_col_widths(table, cols);
 
@@ -2265,7 +2382,7 @@ fn pptx_table_frame(table: &Table, frame: crate::model::Rect, id: usize) -> Stri
                 Some(cell) => {
                     let span = (cell.col_span.max(1) as usize).min(cols - phys).max(1);
                     let rspan = cell.row_span.max(1) as usize;
-                    rows.push_str(&pptx_table_cell(cell, span, rspan));
+                    rows.push_str(&pptx_table_cell(cell, span, rspan, ctx));
                     // Horizontal-merge continuations for the spanned columns.
                     for _ in 1..span {
                         rows.push_str("<a:tc hMerge=\"1\"><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>");
@@ -2284,7 +2401,12 @@ fn pptx_table_frame(table: &Table, frame: crate::model::Rect, id: usize) -> Stri
         // Trailing authored cells beyond the grid (ragged row): emit as-is.
         for cell in cells {
             let span = cell.col_span.max(1) as usize;
-            rows.push_str(&pptx_table_cell(cell, span, cell.row_span.max(1) as usize));
+            rows.push_str(&pptx_table_cell(
+                cell,
+                span,
+                cell.row_span.max(1) as usize,
+                ctx,
+            ));
             for _ in 1..span {
                 rows.push_str("<a:tc hMerge=\"1\"><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>");
             }
@@ -2310,7 +2432,7 @@ fn pptx_table_frame(table: &Table, frame: crate::model::Rect, id: usize) -> Stri
 /// A single DrawingML `<a:tc>`: text body first, then `<a:tcPr>` (the schema
 /// order). `span`/`rspan` map to `gridSpan`/`rowSpan`; cell shading becomes a
 /// `<a:solidFill>` in `tcPr`.
-fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize) -> String {
+fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize, ctx: &mut PptxRunCtx) -> String {
     let mut attrs = String::new();
     if span > 1 {
         attrs.push_str(&format!(" gridSpan=\"{span}\""));
@@ -2318,7 +2440,7 @@ fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize) -> String {
     if rspan > 1 {
         attrs.push_str(&format!(" rowSpan=\"{rspan}\""));
     }
-    let body = dml_text_body(&blocks_to_paras(&cell.blocks));
+    let body = dml_text_body(&blocks_to_paras(&cell.blocks), ctx);
     // `a:tcPr@anchor` carries the cell's vertical alignment (`t`/`ctr`/`b`).
     let anchor = match cell.vertical_align {
         Some(va) => format!(" anchor=\"{}\"", pptx_cell_anchor(va)),
@@ -2334,23 +2456,72 @@ fn pptx_table_cell(cell: &Cell, span: usize, rspan: usize) -> String {
     format!("<a:tc{attrs}>{body}{tcpr}</a:tc>")
 }
 
-fn pptx_paragraph(para: &Paragraph) -> String {
-    let algn = match para.style.align {
+/// A model paragraph → a DrawingML `<a:p>` with a `<a:pPr>` carrying alignment
+/// **and** spacing/indent/line-height (#2). DrawingML uses EMU for `marL`/`indent`
+/// and `a:spcPts`/`a:spcPct` children for the spacing, mirroring the model→ODF
+/// mapping in [`odf_para_prop_attrs`].
+fn pptx_paragraph(para: &Paragraph, ctx: &mut PptxRunCtx) -> String {
+    let ps = &para.style;
+    let mut attrs = String::new();
+    // `marL` = left indent, `marR` = right indent, `indent` = first-line/hanging
+    // (signed) — all in EMU (ECMA-376 §21.1.2.2.7). `algn` is the horizontal
+    // alignment. Left/zero default ⇒ omit so untouched paragraphs are unchanged.
+    if ps.indent_left_pt > 0.0 {
+        attrs.push_str(&format!(" marL=\"{}\"", emu(ps.indent_left_pt)));
+    }
+    if ps.indent_right_pt > 0.0 {
+        attrs.push_str(&format!(" marR=\"{}\"", emu(ps.indent_right_pt)));
+    }
+    if ps.first_line_pt != 0.0 {
+        attrs.push_str(&format!(" indent=\"{}\"", emu(ps.first_line_pt)));
+    }
+    attrs.push_str(match ps.align {
         Align::Left => "",
         Align::Center => " algn=\"ctr\"",
         Align::Right => " algn=\"r\"",
         Align::Justify => " algn=\"just\"",
-    };
-    let mut runs = String::new();
-    pptx_runs(&para.runs, &mut runs);
-    if runs.is_empty() {
-        format!("<a:p><a:pPr{algn}/></a:p>")
-    } else {
-        format!("<a:p><a:pPr{algn}/>{runs}</a:p>")
+    });
+
+    // `CT_TextParagraphProperties` child order: lnSpc, spcBef, spcAft. Line
+    // height: a multiple → `a:spcPct` (1/1000th %, 100% = 100000); a fixed
+    // leading → `a:spcPts` (centipoints). Before/after spacing → `a:spcPts`.
+    let mut children = String::new();
+    match ps.line_height {
+        LineHeight::Multiple(m) => children.push_str(&format!(
+            "<a:lnSpc><a:spcPct val=\"{}\"/></a:lnSpc>",
+            (m * 100_000.0).round() as i64
+        )),
+        LineHeight::Points(p) => children.push_str(&format!(
+            "<a:lnSpc><a:spcPts val=\"{}\"/></a:lnSpc>",
+            (p * 100.0).round().max(0.0) as i64
+        )),
+        LineHeight::Normal => {}
     }
+    if ps.space_before_pt > 0.0 {
+        children.push_str(&format!(
+            "<a:spcBef><a:spcPts val=\"{}\"/></a:spcBef>",
+            (ps.space_before_pt * 100.0).round() as i64
+        ));
+    }
+    if ps.space_after_pt > 0.0 {
+        children.push_str(&format!(
+            "<a:spcAft><a:spcPts val=\"{}\"/></a:spcAft>",
+            (ps.space_after_pt * 100.0).round() as i64
+        ));
+    }
+
+    let ppr = if children.is_empty() {
+        format!("<a:pPr{attrs}/>")
+    } else {
+        format!("<a:pPr{attrs}>{children}</a:pPr>")
+    };
+
+    let mut runs = String::new();
+    pptx_runs(&para.runs, ctx, &mut runs);
+    format!("<a:p>{ppr}{runs}</a:p>")
 }
 
-fn pptx_runs(runs: &[Inline], out: &mut String) {
+fn pptx_runs(runs: &[Inline], ctx: &mut PptxRunCtx, out: &mut String) {
     for r in runs {
         match r {
             Inline::Run(run) => {
@@ -2361,17 +2532,68 @@ fn pptx_runs(runs: &[Inline], out: &mut String) {
                 esc(&run.text, &mut t);
                 out.push_str(&format!(
                     "<a:r>{rpr}<a:t>{t}</a:t></a:r>",
-                    rpr = pptx_rpr(&run.style)
+                    rpr = pptx_rpr(&run.style, None)
                 ));
             }
             Inline::LineBreak => out.push_str("<a:br/>"),
-            Inline::Image(_) => {}
-            Inline::Link { children, .. } => pptx_runs(children, out),
+            // A run-level image is hoisted to a standalone `p:pic` on the slide
+            // (DrawingML text runs cannot embed a picture — #2). Resolve the blob,
+            // register the media + image relationship, and queue the picture.
+            // Dropped in link-less contexts (notes), as before.
+            Inline::Image(img) => {
+                if ctx.inline_links {
+                    if let Some((bytes, ext)) = doc_image(ctx.doc, img.resource) {
+                        if !bytes.is_empty() {
+                            ctx.media.push((bytes, ext));
+                            let rid = ctx.rels.add_image(ctx.media.len() - 1);
+                            ctx.pending_pics.push(RunPic {
+                                rid,
+                                alt: img.alt.clone().unwrap_or_default(),
+                            });
+                        }
+                    }
+                }
+            }
+            // An external hyperlink → an `a:hlinkClick r:id` carried on each child
+            // run's `a:rPr` (#2), with a slide-rels relationship to the URL. An
+            // internal page jump (or a link-less context) degrades to plain runs.
+            Inline::Link { href, children } => match href {
+                LinkTarget::Url(url) if ctx.inline_links && !url.is_empty() => {
+                    let rid = ctx.rels.add_hyperlink(url);
+                    pptx_link_runs(children, ctx, rid, out);
+                }
+                _ => pptx_runs(children, ctx, out),
+            },
         }
     }
 }
 
-fn pptx_rpr(style: &CharStyle) -> String {
+/// Render a hyperlink's child runs, threading the link relationship id onto each
+/// regular run's `a:rPr` as `<a:hlinkClick r:id="rId…"/>`. Nested non-run inlines
+/// (line breaks, images, nested links) fall back to the ordinary run path.
+fn pptx_link_runs(runs: &[Inline], ctx: &mut PptxRunCtx, link_rid: usize, out: &mut String) {
+    for r in runs {
+        match r {
+            Inline::Run(run) => {
+                if run.text.is_empty() {
+                    continue;
+                }
+                let mut t = String::new();
+                esc(&run.text, &mut t);
+                out.push_str(&format!(
+                    "<a:r>{rpr}<a:t>{t}</a:t></a:r>",
+                    rpr = pptx_rpr(&run.style, Some(link_rid))
+                ));
+            }
+            Inline::LineBreak => out.push_str("<a:br/>"),
+            other => pptx_runs(std::slice::from_ref(other), ctx, out),
+        }
+    }
+}
+
+/// `<a:rPr>` from a [`CharStyle`]. `link_rid`, when set, adds an
+/// `<a:hlinkClick r:id="rId…"/>` (the run is part of an external hyperlink).
+fn pptx_rpr(style: &CharStyle, link_rid: Option<usize>) -> String {
     let mut attrs = format!(
         "lang=\"en-US\" sz=\"{}\"",
         (run_size(style) * 100.0).round().max(100.0) as i64
@@ -2410,6 +2632,12 @@ fn pptx_rpr(style: &CharStyle) -> String {
         let mut fam = String::new();
         esc(&style.family, &mut fam);
         inner.push_str(&format!("<a:latin typeface=\"{fam}\"/>"));
+    }
+    // `a:hlinkClick` (the run's external hyperlink) follows the `a:latin` group in
+    // `CT_TextCharacterProperties`'s child order; the `r:id` resolves to the
+    // slide-rels relationship registered for the link's URL.
+    if let Some(rid) = link_rid {
+        inner.push_str(&format!("<a:hlinkClick r:id=\"rId{rid}\"/>"));
     }
     if inner.is_empty() {
         format!("<a:rPr {attrs}/>")
@@ -2498,17 +2726,18 @@ Target=\"slides/slide{}.xml\"/>",
     s
 }
 
-/// Per-slide relationships: the mandatory `slideLayout` relationship
-/// (ECMA-376 §13.3.8 — every slide MUST reference exactly one slide layout)
-/// followed by one `image` relationship per embedded picture, and (when the
-/// slide has speaker notes) a `notesSlide` relationship. Image rIds are
-/// `rId1..rIdN` (matching the `r:embed` values written into the slide body by
+/// Per-slide relationships, in allocation order: one relationship per entry the
+/// slide accumulated — an `image` (embedded picture) or an `hyperlink`
+/// (`TargetMode="External"`) — followed by the mandatory `slideLayout`
+/// (ECMA-376 §13.3.8 — every slide MUST reference exactly one layout) and, when
+/// the slide has speaker notes, a `notesSlide`. The accumulated rIds are
+/// `rId1..rIdN` (matching the `r:embed`/`r:id` written into the slide body by
 /// [`pptx_slide_from_model`]); the layout rId is `rId{N+1}` and the optional
-/// notesSlide rId is `rId{N+2}`. The slide↔layout/notes links are resolved by
+/// notesSlide rId is `rId{N+2}`. The slide↔layout/notes links resolve by
 /// relationship *type*, not by any `r:id` in the slide XML, so the numeric ids
 /// are free to be last. `slide_number` is the owning slide's 1-based index.
 fn pptx_model_slide_rels(
-    media_indices: &[usize],
+    rels: &PptxSlideRels,
     media_exts: &[&str],
     has_notes: bool,
     slide_number: usize,
@@ -2517,29 +2746,42 @@ fn pptx_model_slide_rels(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
     );
-    for (local, &global) in media_indices.iter().enumerate() {
-        // The target's extension is the global image's real format.
-        let ext = media_exts.get(global).copied().unwrap_or("png");
-        s.push_str(&format!(
-            "<Relationship Id=\"rId{}\" \
+    for (i, rel) in rels.rels.iter().enumerate() {
+        let rid = i + 1;
+        match rel {
+            SlideRel::Image(global) => {
+                // The target's extension is the global image's real format.
+                let ext = media_exts.get(*global).copied().unwrap_or("png");
+                s.push_str(&format!(
+                    "<Relationship Id=\"rId{rid}\" \
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" \
 Target=\"../media/image{}.{ext}\"/>",
-            local + 1,
-            global + 1
-        ));
+                    global + 1
+                ));
+            }
+            SlideRel::Hyperlink(url) => {
+                let mut u = String::new();
+                esc(url, &mut u);
+                s.push_str(&format!(
+                    "<Relationship Id=\"rId{rid}\" \
+Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" \
+Target=\"{u}\" TargetMode=\"External\"/>"
+                ));
+            }
+        }
     }
+    let next = rels.rels.len() + 1;
     s.push_str(&format!(
-        "<Relationship Id=\"rId{}\" \
+        "<Relationship Id=\"rId{next}\" \
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout\" \
-Target=\"../slideLayouts/slideLayout1.xml\"/>",
-        media_indices.len() + 1
+Target=\"../slideLayouts/slideLayout1.xml\"/>"
     ));
     if has_notes {
         s.push_str(&format!(
             "<Relationship Id=\"rId{}\" \
 Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide\" \
 Target=\"../notesSlides/notesSlide{slide_number}.xml\"/>",
-            media_indices.len() + 2
+            rels.rels.len() + 2
         ));
     }
     s.push_str("</Relationships>");
@@ -2910,7 +3152,14 @@ fn odt_runs(runs: &[Inline], ctx: &mut OdfCtx, out: &mut String) {
                 out.push_str("</text:span>");
             }
             Inline::LineBreak => out.push_str("<text:line-break/>"),
-            Inline::Image(_) => {}
+            // A run-level inline image → a `draw:frame`/`draw:image` anchored
+            // as a character inside the paragraph (the same `frInl` graphic style
+            // and `Pictures/`+manifest plumbing as the block-level image path).
+            Inline::Image(img) => {
+                if let Some(frame) = odt_inline_image_frame(img, ctx) {
+                    out.push_str(&frame);
+                }
+            }
             Inline::Link { href, children } => {
                 if let LinkTarget::Url(url) = href {
                     if !url.is_empty() {
@@ -2934,9 +3183,67 @@ fn odt_list(list: &List, ctx: &mut OdfCtx) -> String {
     let sid = ctx.next_style();
     let sname = format!("L{sid}");
     ctx.auto.push_str(&odf_list_style(&sname, list));
-    let mut out = format!("<text:list text:style-name=\"{sname}\">");
+
+    // Honour `ListItem.level` (0-based) by nesting `<text:list>`s. ODF nests an
+    // inner list *inside* the parent's still-open `<text:list-item>` (ISO 26300
+    // §5.3.3 — `text:list` is valid list-item content), e.g. a level-2 item lives
+    // in a `text:list` inside the level-1 item's `text:list-item`. The named list
+    // style's per-level definitions drive the bullet/number + indent at each
+    // depth. We keep each list-item open until we know the next item's depth:
+    // `pending_item_close[d]` is true while the list-item that hosts depth `d+1`
+    // awaits its `</text:list-item>`.
+    let mut out = String::new();
+    // For each currently-open `<text:list>` level (index 0 = outermost), whether
+    // its current `<text:list-item>` is still open (awaiting close).
+    let mut open_item: Vec<bool> = Vec::new();
+
+    // Close the deepest open levels back to (but not below) `target` open lists.
+    // Closing a nested list also closes the deepest item if open; the *parent*
+    // list-item stays open (it hosts the closed child list and may host more).
+    let close_to = |open_item: &mut Vec<bool>, out: &mut String, target: usize| {
+        while open_item.len() > target {
+            if open_item.pop() == Some(true) {
+                out.push_str("</text:list-item>");
+            }
+            out.push_str("</text:list>");
+        }
+    };
+
     for item in &list.items {
+        let want = item.level as usize + 1; // open-list depth this item lives at
+
+        if want <= open_item.len() {
+            close_to(&mut open_item, &mut out, want);
+            // Close the sibling list-item still open at this level, if any, so the
+            // new same-level item starts its own `<text:list-item>`.
+            if let Some(last) = open_item.last_mut() {
+                if *last {
+                    out.push_str("</text:list-item>");
+                    *last = false;
+                }
+            }
+        } else {
+            // Open nested lists down to `want`. The first new list is hosted by
+            // the parent level's currently-open list-item; deeper ones get an
+            // empty hosting list-item.
+            while open_item.len() < want {
+                if open_item.is_empty() {
+                    out.push_str(&format!("<text:list text:style-name=\"{sname}\">"));
+                } else {
+                    // Need an open hosting list-item at the parent level.
+                    if !*open_item.last().unwrap() {
+                        out.push_str("<text:list-item>");
+                        *open_item.last_mut().unwrap() = true;
+                    }
+                    out.push_str("<text:list>");
+                }
+                open_item.push(false);
+            }
+        }
+
+        // Emit this item's `<text:list-item>` at the deepest level.
         out.push_str("<text:list-item>");
+        *open_item.last_mut().unwrap() = true;
         if item.blocks.is_empty() {
             out.push_str("<text:p/>");
         } else {
@@ -2944,9 +3251,10 @@ fn odt_list(list: &List, ctx: &mut OdfCtx) -> String {
                 odt_block(b, ctx, &mut out);
             }
         }
-        out.push_str("</text:list-item>");
     }
-    out.push_str("</text:list>");
+
+    // Close every still-open level.
+    close_to(&mut open_item, &mut out, 0);
     out
 }
 
@@ -2974,9 +3282,39 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
         let _ = &mut col_styles;
     }
 
+    // The table's border applies to each cell as an ODF `fo:border` (ODF puts
+    // borders on table-cell-properties, not on the table; DOCX's table-level
+    // `w:tblBorders` is the equivalent — match its presence/width/colour). Empty
+    // when the model carries no border (`width <= 0`).
+    let cell_border = if table.border.width > 0.0 {
+        format!(
+            " fo:border=\"{w}pt solid #{c}\"",
+            w = num(table.border.width),
+            c = hex(table.border.color),
+        )
+    } else {
+        String::new()
+    };
+
     let mut rows = String::new();
     for row in &table.rows {
-        rows.push_str("<table:table-row>");
+        // Row height → a row style carrying `style:row-height` (DOCX uses
+        // `w:trHeight`; this is the ODF equivalent). `style:min-row-height` keeps
+        // it a floor so taller content still fits, matching DOCX's `hRule="atLeast"`.
+        let row_style = match row.height {
+            Some(h) if h > 0.0 => {
+                let rsid = ctx.next_style();
+                let rsn = format!("Tr{rsid}");
+                ctx.auto.push_str(&format!(
+                    "<style:style style:name=\"{rsn}\" style:family=\"table-row\">\
+<style:table-row-properties style:row-height=\"{hh}pt\" style:min-row-height=\"{hh}pt\"/></style:style>",
+                    hh = num(h),
+                ));
+                format!(" table:style-name=\"{rsn}\"")
+            }
+            _ => String::new(),
+        };
+        rows.push_str(&format!("<table:table-row{row_style}>"));
         let mut phys = 0usize;
         for cell in &row.cells {
             let span = cell.col_span.max(1) as usize;
@@ -2988,9 +3326,10 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
             if rspan > 1 {
                 attrs.push_str(&format!(" table:number-rows-spanned=\"{rspan}\""));
             }
-            // Compose the cell's table-cell-properties from shading and/or
+            // Compose the cell's table-cell-properties from border, shading and/or
             // vertical alignment; emit an auto-style only when at least one is set.
             let mut tc_props = String::new();
+            tc_props.push_str(&cell_border);
             if let Some(shade) = cell.shading {
                 tc_props.push_str(&format!(" fo:background-color=\"#{}\"", hex(shade)));
             }
@@ -3031,20 +3370,30 @@ fn odt_table(table: &Table, ctx: &mut OdfCtx) -> String {
     format!("<table:table table:style-name=\"{tname}\">{col_defs}{rows}</table:table>")
 }
 
-fn odt_image_para(img: &ImageRef, ctx: &mut OdfCtx) -> String {
+/// Build a `draw:frame`/`draw:image` for an inline image anchored as a character
+/// (the `frInl` graphic style), interning the blob into `Pictures/` + the
+/// manifest. `None` when the resource is missing/empty (the caller omits it).
+/// Shared by the block-level image paragraph and run-level inline images.
+fn odt_inline_image_frame(img: &ImageRef, ctx: &mut OdfCtx) -> Option<String> {
     let (bytes, ext) = match ctx.resolve_image(img.resource) {
         Some(b) if !b.0.is_empty() => b,
-        _ => return "<text:p/>".to_string(),
+        _ => return None,
     };
     ctx.images.push((bytes, ext));
     let n = ctx.image_base + ctx.images.len();
-    // An inline image anchored as a character inside its own paragraph.
-    format!(
-        "<text:p><draw:frame draw:style-name=\"frInl\" text:anchor-type=\"as-char\" \
+    Some(format!(
+        "<draw:frame draw:style-name=\"frInl\" text:anchor-type=\"as-char\" \
 svg:width=\"96pt\" svg:height=\"96pt\">\
 <draw:image xlink:href=\"Pictures/img{n}.{ext}\" xlink:type=\"simple\" xlink:show=\"embed\" \
-xlink:actuate=\"onLoad\"/></draw:frame></text:p>"
-    )
+xlink:actuate=\"onLoad\"/></draw:frame>"
+    ))
+}
+
+fn odt_image_para(img: &ImageRef, ctx: &mut OdfCtx) -> String {
+    match odt_inline_image_frame(img, ctx) {
+        Some(frame) => format!("<text:p>{frame}</text:p>"),
+        None => "<text:p/>".to_string(),
+    }
 }
 
 fn odt_model_content(auto: &str, body: &str) -> String {
@@ -9447,6 +9796,317 @@ style:family=\"paragraph\""
         assert!(
             !odt_styles.contains("<style:default-style"),
             "ODF no default-style when language absent: {odt_styles}"
+        );
+    }
+
+    // ───────────────────── #2 Medium: office-export fidelity ─────────────────────
+
+    /// Build a one-slide deck whose single body placeholder holds `block`.
+    fn one_slide_doc(block: Block) -> Document {
+        use crate::model::{Placeholder, PlaceholderRole, Slide, SlideBlock};
+        let slide = Slide {
+            geometry: crate::model::PageGeometry {
+                width: 960.0,
+                height: 540.0,
+                margins: crate::model::Margins::uniform(0.0),
+            },
+            shapes: Vec::new(),
+            placeholders: vec![Placeholder {
+                role: PlaceholderRole::Body,
+                block: Block {
+                    frame: Some(crate::model::Rect::new(40.0, 40.0, 880.0, 400.0)),
+                    ..block
+                },
+            }],
+            notes: None,
+            background: None,
+        };
+        Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Slide(SlideBlock {
+                            slides: vec![slide],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: true,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// #2 — a PPTX slide paragraph carries spacing/indent/line-height, not just
+    /// alignment: `a:pPr@marL/@indent` (EMU) + `a:spcBef`/`a:spcAft` + `a:lnSpc`.
+    #[test]
+    fn pptx_paragraph_emits_spacing_indent_line_height() {
+        let para = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                style: ParagraphStyle {
+                    align: Align::Center,
+                    space_before_pt: 6.0,
+                    space_after_pt: 12.0,
+                    indent_left_pt: 18.0,
+                    indent_right_pt: 9.0,
+                    first_line_pt: 24.0,
+                    line_height: LineHeight::Multiple(1.5),
+                },
+                runs: vec![run("spaced")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = pptx_from_model(&one_slide_doc(para));
+        let slide = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+
+        // Indent attributes in EMU (18pt = 228600 EMU; 24pt = 304800; 9pt = 114300).
+        assert!(slide.contains("marL=\"228600\""), "left indent: {slide}");
+        assert!(slide.contains("marR=\"114300\""), "right indent: {slide}");
+        assert!(
+            slide.contains("indent=\"304800\""),
+            "first-line indent: {slide}"
+        );
+        assert!(slide.contains("algn=\"ctr\""), "alignment kept");
+        // Spacing children (points×100) and a 150% line height (×1000th-percent).
+        assert!(
+            slide.contains("<a:spcBef><a:spcPts val=\"600\"/></a:spcBef>"),
+            "space-before: {slide}"
+        );
+        assert!(
+            slide.contains("<a:spcAft><a:spcPts val=\"1200\"/></a:spcAft>"),
+            "space-after: {slide}"
+        );
+        assert!(
+            slide.contains("<a:lnSpc><a:spcPct val=\"150000\"/></a:lnSpc>"),
+            "line height 150%: {slide}"
+        );
+        assert!(slide.contains("spaced"), "run text preserved");
+    }
+
+    /// #2 — an ODT run-level inline image becomes a `draw:image` anchored as a
+    /// character (not dropped) and is interned into a `Pictures/` part + manifest.
+    #[test]
+    fn odt_run_image_emits_draw_image_and_picture_part() {
+        let mut resources = crate::model::ResourceTable::default();
+        let png = vec![0x89, b'P', b'N', b'G', 9, 8, 7];
+        resources.images.insert(
+            42,
+            crate::model::ImageResource {
+                bytes: png.clone(),
+                format: "png".to_string(),
+            },
+        );
+        // A paragraph mixing text and an inline image in the *same* run list.
+        let p = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![
+                    run("before "),
+                    Inline::Image(ImageRef {
+                        resource: 42,
+                        alt: Some("logo".to_string()),
+                    }),
+                    run(" after"),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![p],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            resources,
+            ..Default::default()
+        };
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        // The image is an as-char draw:frame/draw:image *inside* the paragraph,
+        // alongside its sibling text spans (so it is not a standalone paragraph).
+        assert!(
+            content.contains("text:anchor-type=\"as-char\""),
+            "inline anchor: {content}"
+        );
+        assert!(
+            content.contains("<draw:image xlink:href=\"Pictures/img1.png\""),
+            "draw:image referencing the picture part: {content}"
+        );
+        assert!(
+            content.contains("before") && content.contains("after"),
+            "text kept"
+        );
+        // The blob is embedded and declared in the manifest.
+        assert_eq!(
+            entry(&bytes, "Pictures/img1.png").as_deref(),
+            Some(png.as_slice()),
+            "picture part embedded"
+        );
+        let manifest =
+            String::from_utf8(entry(&bytes, "META-INF/manifest.xml").unwrap()).unwrap();
+        assert!(
+            manifest.contains("full-path=\"Pictures/img1.png\"")
+                && manifest.contains("media-type=\"image/png\""),
+            "picture declared in manifest: {manifest}"
+        );
+    }
+
+    /// #2 — a PPTX run-level external hyperlink becomes an `a:hlinkClick r:id` on
+    /// the run, with a matching `hyperlink` relationship (External) in the slide
+    /// rels.
+    #[test]
+    fn pptx_run_link_emits_hlinkclick_and_rels_entry() {
+        let p = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![
+                    run("see "),
+                    Inline::Link {
+                        href: LinkTarget::Url("https://example.com/".to_string()),
+                        children: vec![run("the site")],
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = pptx_from_model(&one_slide_doc(p));
+        let slide = String::from_utf8(entry(&bytes, "ppt/slides/slide1.xml").unwrap()).unwrap();
+        let rels =
+            String::from_utf8(entry(&bytes, "ppt/slides/_rels/slide1.xml.rels").unwrap()).unwrap();
+
+        // The link run carries an a:hlinkClick referencing rId1 (first rel).
+        assert!(
+            slide.contains("<a:hlinkClick r:id=\"rId1\"/>"),
+            "hlinkClick on the run: {slide}"
+        );
+        assert!(slide.contains("the site"), "link text preserved");
+        // The rels file declares an External hyperlink relationship to the URL.
+        assert!(
+            rels.contains("Id=\"rId1\"")
+                && rels.contains(
+                    "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\""
+                )
+                && rels.contains("Target=\"https://example.com/\"")
+                && rels.contains("TargetMode=\"External\""),
+            "hyperlink relationship: {rels}"
+        );
+    }
+
+    /// #2 — an ODT list whose items carry a level-2 (`level == 1`) item nests a
+    /// `text:list` inside the level-1 item's `text:list-item`.
+    #[test]
+    fn odt_list_nesting_emits_nested_text_list() {
+        let item = |text: &str, level: u8| ListItem {
+            blocks: vec![para(text)],
+            level,
+        };
+        let list = Block {
+            kind: BlockKind::List(List {
+                ordered: false,
+                marker: ListMarker::Bullet('•'),
+                items: vec![item("top", 0), item("nested", 1), item("back", 0)],
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![list],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        // Two `<text:list>` opens: the outer list + the nested one (level-2 item).
+        assert_eq!(
+            content.matches("<text:list ").count() + content.matches("<text:list>").count(),
+            2,
+            "outer + one nested list: {content}"
+        );
+        // The nested list lives inside the level-1 item: its paragraph is followed
+        // by a `<text:list><text:list-item>` *before* that item closes — the
+        // canonical ODF nesting shape (the level-1 `</text:list-item>` comes after
+        // the nested list, not before it).
+        assert!(
+            content.contains("</text:p><text:list><text:list-item>"),
+            "nested list inside the level-1 item: {content}"
+        );
+        // The nested item's `</text:list-item>` is immediately followed by the
+        // nested list's close, then the parent item's close (proper unwinding).
+        assert!(
+            content.contains(
+                "nested</text:span></text:p></text:list-item></text:list></text:list-item>"
+            ),
+            "nested item unwinds back to the parent item: {content}"
+        );
+        for t in ["top", "nested", "back"] {
+            assert!(content.contains(t), "item text {t} preserved");
+        }
+    }
+
+    /// #2 — an ODT table emits a cell `fo:border` (from the table border) and a
+    /// `style:row-height` on the row carrying an explicit height.
+    #[test]
+    fn odt_table_emits_cell_border_and_row_height() {
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![Row {
+                    cells: vec![
+                        Cell {
+                            blocks: vec![para("a")],
+                            ..Default::default()
+                        },
+                        Cell {
+                            blocks: vec![para("b")],
+                            ..Default::default()
+                        },
+                    ],
+                    height: Some(30.0),
+                }],
+                col_widths: vec![100.0, 100.0],
+                border: crate::model::BorderStyle {
+                    width: 1.5,
+                    color: [0.0, 0.0, 0.0],
+                },
+            }),
+            ..Default::default()
+        };
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![table],
+                    absolute: false,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = odt_from_model(&doc);
+        let content = String::from_utf8(entry(&bytes, "content.xml").unwrap()).unwrap();
+
+        // Cell border (1.5pt solid black) on a table-cell style.
+        assert!(
+            content.contains("fo:border=\"1.5pt solid #000000\""),
+            "cell border: {content}"
+        );
+        // Row height on a table-row style, referenced by the row.
+        assert!(
+            content.contains("style:family=\"table-row\"")
+                && content.contains("style:row-height=\"30pt\""),
+            "row height style: {content}"
+        );
+        assert!(
+            content.contains("<table:table-row table:style-name="),
+            "row references its height style: {content}"
         );
     }
 }
