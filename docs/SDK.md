@@ -162,6 +162,30 @@ ranges; `pageLabel(n)` resolves the actual displayed string for a page.
 (`none` = the prefix alone, no number), `prefix` is prepended to every page in the
 range, and `startNumber` (≥ 1, default 1) is the value the range's first page gets.
 
+### Page transitions (presentations · `/Trans` + `/Dur`)
+
+Author slideshow behaviour onto pages (ISO 32000-1 §12.4.4): a visual `/Trans`
+transition when the viewer moves to the page, plus a `/Dur` *display duration*
+that makes a full-screen presentation **auto-advance** (kiosk mode). Only the
+transition sub-keys that apply to the chosen `style` are written.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `setPageTransition(page, trans)` | `boolean` | Author a [`PageTransition`](#pagetransition) on the 1-based `page`. Inapplicable fields are dropped (`dimension`/`motion` apply to `split`/`box`; `direction`/`scale`/`flyAreaOpaque` to `fly`; …). `displayDuration` → page `/Dur` (omit it to remove). Re-calling replaces the prior transition in full. `false` on unknown `style`, negative/non-finite `duration`/`scale`/`displayDuration`, or bad page. |
+| `getPageTransition(page)` | [`PageTransition`](#pagetransition)` \| null` | The page's transition, or `null` when it has no `/Trans`. |
+| `clearPageTransition(page)` | `boolean` | Drop the page's `/Trans` and `/Dur`. No-op if absent. |
+
+<a id="pagetransition"></a>`PageTransition = { style, duration?, dimension?, motion?, direction?, scale?, flyAreaOpaque?, displayDuration? }`:
+
+- `style` — `"split" | "blinds" | "box" | "wipe" | "dissolve" | "glitter" | "fly" | "push" | "cover" | "uncover" | "fade" | "replace"` (`/S`).
+- `duration` — `/D`, the transition effect time in **seconds** (viewer default 1).
+- `dimension` — `"horizontal" | "vertical"` (`/Dm`; `split`/`blinds`).
+- `motion` — `"inward" | "outward"` (`/M`; `split`/`box`).
+- `direction` — `0 | 90 | 180 | 270 | 315 | "none"` (`/Di`; `wipe`/`glitter`/`fly`/`cover`/`uncover`/`push`).
+- `scale` — `/SS`, the `fly` start/end scale (default 1.0).
+- `flyAreaOpaque` — `/B`, whether the `fly` area is rectangular + opaque (default `false`).
+- `displayDuration` — `/Dur`, the page's auto-advance time in **seconds**.
+
 ### Margins & running header/footer
 
 Page margins and a baked running header/footer on an **existing** PDF (for an

@@ -35,6 +35,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Read & write running headers and footers](#headers-and-footers)
 - [Set print boxes (TrimBox / BleedBox) for prepress](#print-boxes) — *v0.73.0*
 - [Number pages with labels (roman front matter, prefixes)](#page-labels) — *v0.74.0*
+- [Kiosk slideshow: page transitions & auto-advance (`/Trans` + `/Dur`)](#page-transitions) — *v0.95.0*
 - [Embed file attachments (+ Factur-X / ZUGFeRD `/AF`)](#attachments) — *v0.75.0*
 - [Set document metadata (Info + XMP, kept in sync)](#metadata) — *v0.76.0*
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
@@ -410,6 +411,82 @@ number for any page before the first range, or when the document has no labels a
 > Pass an **empty array** to `setPageLabels([])` to strip all page labels (the page
 > navigator reverts to `1, 2, 3…`). Setting labels replaces the whole `/PageLabels`
 > tree, so include every range you want each time — it is not a merge.
+
+---
+
+<a id="page-transitions"></a>
+
+## Kiosk slideshow: page transitions & auto-advance (`/Trans` + `/Dur`)
+
+> **Available in v0.95.0.**
+
+When a PDF is opened **full-screen** (a presentation, a trade-show kiosk), each
+page can carry a visual *transition* (`/Trans`) that plays as the viewer arrives,
+and a *display duration* (`/Dur`) that makes the viewer **auto-advance** to the
+next page after that many seconds — ISO 32000-1 §12.4.4. The engine produces
+`.pptx`/`.odp`, but this authors the PDF-native effect so a plain PDF viewer in
+presentation mode runs the slideshow unattended.
+
+Here we turn every page of a deck into a self-running slideshow: a **wipe** from
+left to right, half-a-second long, auto-advancing after **5 seconds**:
+
+```ts
+const doc = giga.open(deckBytes);
+
+for (let p = 1; p <= doc.pageCount(); p++) {
+  doc.setPageTransition(p, {
+    style: "wipe",
+    duration: 0.5, // /D — the wipe lasts 0.5 s
+    direction: 0, // /Di — sweep left → right (0°)
+    displayDuration: 5, // /Dur — auto-advance after 5 s on screen
+  });
+}
+// Each page now has /Trans << /S /Wipe /D 0.5 /Di 0 >> and /Dur 5.
+
+const out = doc.save(); // open full-screen → it plays itself
+doc.close();
+```
+
+Only the sub-keys that apply to the chosen `style` are written, so you cannot
+emit a meaningless combination. A few common variants:
+
+```ts
+// Vertical split, opening outward from the centre (no /Di — Split ignores it):
+doc.setPageTransition(1, { style: "split", dimension: "vertical", motion: "outward" });
+
+// "Fly" the new page straight toward the viewer, 1.5× scale, opaque box:
+doc.setPageTransition(2, { style: "fly", direction: "none", scale: 1.5, flyAreaOpaque: true });
+
+// Simple cross-fade, 0.8 s:
+doc.setPageTransition(3, { style: "fade", duration: 0.8 });
+
+// Title page that lingers 8 s with no visible effect (just auto-advance):
+doc.setPageTransition(4, { style: "replace", displayDuration: 8 });
+```
+
+Read a transition back, or remove it entirely:
+
+```ts
+doc.getPageTransition(1);
+//   → { style: "wipe", duration: 0.5, direction: 0, displayDuration: 5,
+//       dimension: null, motion: null, scale: null, flyAreaOpaque: null }
+
+doc.clearPageTransition(1); // drops both /Trans and /Dur from the page
+doc.getPageTransition(1); // → null
+```
+
+`style` is one of `split`, `blinds`, `box`, `wipe`, `dissolve`, `glitter`,
+`fly`, `push`, `cover`, `uncover`, `fade`, `replace`. `dimension` (`split`/
+`blinds`) is `horizontal`/`vertical`; `motion` (`split`/`box`) is `inward`/
+`outward`; `direction` (`wipe`/`glitter`/`fly`/`cover`/`uncover`/`push`) is one
+of `0 90 180 270 315` degrees or `"none"`; `scale`/`flyAreaOpaque` apply to
+`fly`. `displayDuration` is the page's auto-advance time and is independent of
+the visual effect — set it alone (with `style: "replace"`) for a timed slideshow
+with no animation.
+
+> Re-calling `setPageTransition` replaces the page's transition **in full**; omit
+> `displayDuration` to remove the `/Dur` auto-advance while keeping (or changing)
+> the visual effect.
 
 ---
 

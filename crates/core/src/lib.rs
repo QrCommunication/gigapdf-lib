@@ -62,9 +62,10 @@ pub use convert::{ConvPage, PlacedImage, PlacedShape, PlacedText};
 pub use document::{
     AfRelationship, Attachment, Bookmark, Color, Document, EmbeddedFontInfo, GradientKind,
     GradientSpec, GradientStop, ImageElementInfo, ImageWatermarkOptions, InfoFields, NupOptions,
-    PageBox, PageBoxes, PageBoxesDeclared, PageLabelRange, PageLabelStyle, SearchMatch,
-    SignatureInfo,
-    SignatureReport, TextElementInfo, TextLayerRun, ViewerPreferences, WatermarkAnchor,
+    PageBox, PageBoxes, PageBoxesDeclared, PageLabelRange, PageLabelStyle, PageTransition,
+    SearchMatch, SignatureInfo, SignatureReport, TextElementInfo, TextLayerRun,
+    TransitionDimension, TransitionDirection, TransitionMotion, TransitionStyle, ViewerPreferences,
+    WatermarkAnchor,
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FieldTrigger, FormField};

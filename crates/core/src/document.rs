@@ -1047,6 +1047,305 @@ impl PageBox {
     }
 }
 
+// ─── page transitions (/Trans, ISO 32000-1 §12.4.4) ──────────────────────────
+
+/// The visual style of a page transition (the `/S` entry of a transition
+/// dictionary, ISO 32000-1 §12.4.4, Table 164). Selecting a style determines
+/// which of the optional sub-keys ([`dimension`](PageTransition::dimension),
+/// [`motion`](PageTransition::motion), [`direction`](PageTransition::direction),
+/// [`scale`](PageTransition::scale), [`fly_area_opaque`](PageTransition::fly_area_opaque))
+/// are meaningful — keys that do not apply are never written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TransitionStyle {
+    /// `/Split` — two lines sweep across the screen, revealing the new page.
+    /// Honours [`dimension`](PageTransition::dimension) and
+    /// [`motion`](PageTransition::motion).
+    Split,
+    /// `/Blinds` — multiple lines, evenly spaced, sweep in the same direction.
+    /// Honours [`dimension`](PageTransition::dimension).
+    Blinds,
+    /// `/Box` — a rectangular box sweeps inward or outward. Honours
+    /// [`motion`](PageTransition::motion).
+    Box,
+    /// `/Wipe` — a single line sweeps across in one direction. Honours
+    /// [`direction`](PageTransition::direction).
+    #[default]
+    Wipe,
+    /// `/Dissolve` — the old page dissolves gradually into the new one.
+    Dissolve,
+    /// `/Glitter` — like `Dissolve`, but with a sweep. Honours
+    /// [`direction`](PageTransition::direction).
+    Glitter,
+    /// `/Fly` — the new page (or its changes) flies in. Honours
+    /// [`direction`](PageTransition::direction), [`scale`](PageTransition::scale)
+    /// and [`fly_area_opaque`](PageTransition::fly_area_opaque) (PDF 1.5).
+    Fly,
+    /// `/Push` — the old page pushes off-screen while the new one enters.
+    /// Honours [`direction`](PageTransition::direction) (PDF 1.5).
+    Push,
+    /// `/Cover` — the new page slides on top of the old one. Honours
+    /// [`direction`](PageTransition::direction) (PDF 1.5).
+    Cover,
+    /// `/Uncover` — the old page slides off to reveal the new one. Honours
+    /// [`direction`](PageTransition::direction) (PDF 1.5).
+    Uncover,
+    /// `/Fade` — the new page fades in over the old one (PDF 1.5).
+    Fade,
+    /// `/R` — no visible transition; the new page simply replaces the old one.
+    Replace,
+}
+
+impl TransitionStyle {
+    /// The PDF `/S` name for this style (`Split`, `Wipe`, `R`, …).
+    pub fn pdf_name(self) -> &'static [u8] {
+        match self {
+            TransitionStyle::Split => b"Split",
+            TransitionStyle::Blinds => b"Blinds",
+            TransitionStyle::Box => b"Box",
+            TransitionStyle::Wipe => b"Wipe",
+            TransitionStyle::Dissolve => b"Dissolve",
+            TransitionStyle::Glitter => b"Glitter",
+            TransitionStyle::Fly => b"Fly",
+            TransitionStyle::Push => b"Push",
+            TransitionStyle::Cover => b"Cover",
+            TransitionStyle::Uncover => b"Uncover",
+            TransitionStyle::Fade => b"Fade",
+            TransitionStyle::Replace => b"R",
+        }
+    }
+
+    /// Parse a PDF `/S` name into a style. An unknown / absent name defaults to
+    /// `/R` (Replace), matching the ISO 32000-1 default for the `/S` entry.
+    pub fn from_pdf_name(name: Option<&[u8]>) -> Self {
+        match name {
+            Some(b"Split") => TransitionStyle::Split,
+            Some(b"Blinds") => TransitionStyle::Blinds,
+            Some(b"Box") => TransitionStyle::Box,
+            Some(b"Wipe") => TransitionStyle::Wipe,
+            Some(b"Dissolve") => TransitionStyle::Dissolve,
+            Some(b"Glitter") => TransitionStyle::Glitter,
+            Some(b"Fly") => TransitionStyle::Fly,
+            Some(b"Push") => TransitionStyle::Push,
+            Some(b"Cover") => TransitionStyle::Cover,
+            Some(b"Uncover") => TransitionStyle::Uncover,
+            Some(b"Fade") => TransitionStyle::Fade,
+            _ => TransitionStyle::Replace,
+        }
+    }
+
+    /// Whether the `/Dm` (dimension) key applies to this style (`Split`,
+    /// `Blinds`).
+    fn uses_dimension(self) -> bool {
+        matches!(self, TransitionStyle::Split | TransitionStyle::Blinds)
+    }
+
+    /// Whether the `/M` (motion) key applies to this style (`Split`, `Box`).
+    fn uses_motion(self) -> bool {
+        matches!(self, TransitionStyle::Split | TransitionStyle::Box)
+    }
+
+    /// Whether the `/Di` (direction) key applies to this style (`Wipe`,
+    /// `Glitter`, `Fly`, `Cover`, `Uncover`, `Push`).
+    fn uses_direction(self) -> bool {
+        matches!(
+            self,
+            TransitionStyle::Wipe
+                | TransitionStyle::Glitter
+                | TransitionStyle::Fly
+                | TransitionStyle::Cover
+                | TransitionStyle::Uncover
+                | TransitionStyle::Push
+        )
+    }
+
+    /// Whether the `/SS` and `/B` keys apply to this style (`Fly` only).
+    fn uses_fly(self) -> bool {
+        matches!(self, TransitionStyle::Fly)
+    }
+}
+
+/// The orientation of a `/Split` or `/Blinds` transition (the `/Dm` entry,
+/// ISO 32000-1 §12.4.4, Table 164).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TransitionDimension {
+    /// `/H` — horizontal.
+    #[default]
+    Horizontal,
+    /// `/V` — vertical.
+    Vertical,
+}
+
+impl TransitionDimension {
+    /// The PDF `/Dm` name (`H` or `V`).
+    pub fn pdf_name(self) -> &'static [u8] {
+        match self {
+            TransitionDimension::Horizontal => b"H",
+            TransitionDimension::Vertical => b"V",
+        }
+    }
+
+    /// Parse a PDF `/Dm` name (`V` → vertical; anything else → horizontal).
+    pub fn from_pdf_name(name: Option<&[u8]>) -> Self {
+        match name {
+            Some(b"V") => TransitionDimension::Vertical,
+            _ => TransitionDimension::Horizontal,
+        }
+    }
+}
+
+/// The direction of motion for a `/Split` or `/Box` transition (the `/M` entry,
+/// ISO 32000-1 §12.4.4, Table 164).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TransitionMotion {
+    /// `/I` — inward, from the edges toward the centre.
+    #[default]
+    Inward,
+    /// `/O` — outward, from the centre toward the edges.
+    Outward,
+}
+
+impl TransitionMotion {
+    /// The PDF `/M` name (`I` or `O`).
+    pub fn pdf_name(self) -> &'static [u8] {
+        match self {
+            TransitionMotion::Inward => b"I",
+            TransitionMotion::Outward => b"O",
+        }
+    }
+
+    /// Parse a PDF `/M` name (`O` → outward; anything else → inward).
+    pub fn from_pdf_name(name: Option<&[u8]>) -> Self {
+        match name {
+            Some(b"O") => TransitionMotion::Outward,
+            _ => TransitionMotion::Inward,
+        }
+    }
+}
+
+/// The sweep direction (in degrees) of a directional transition — the `/Di`
+/// entry (ISO 32000-1 §12.4.4, Table 164). Only the discrete angles enumerated
+/// by the standard are representable; [`None`](TransitionDirection::None) writes
+/// the `/Di /None` name (used by `Fly` to mean "no direction — fly straight
+/// toward the viewer").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TransitionDirection {
+    /// `/Di 0` — left to right.
+    #[default]
+    LeftToRight,
+    /// `/Di 90` — bottom to top (also "down to up").
+    BottomToTop,
+    /// `/Di 180` — right to left.
+    RightToLeft,
+    /// `/Di 270` — top to bottom.
+    TopToBottom,
+    /// `/Di 315` — top-left to bottom-right (diagonal; `Glitter` only).
+    TopLeftToBottomRight,
+    /// `/Di /None` — no direction (`Fly` flies toward the viewer).
+    None,
+}
+
+impl TransitionDirection {
+    /// Build a direction from a degree value, accepting only the discrete angles
+    /// permitted by ISO 32000-1 (`0`, `90`, `180`, `270`, `315`). Any other
+    /// value yields `None`.
+    pub fn from_degrees(degrees: i64) -> Option<Self> {
+        match degrees {
+            0 => Some(TransitionDirection::LeftToRight),
+            90 => Some(TransitionDirection::BottomToTop),
+            180 => Some(TransitionDirection::RightToLeft),
+            270 => Some(TransitionDirection::TopToBottom),
+            315 => Some(TransitionDirection::TopLeftToBottomRight),
+            _ => None,
+        }
+    }
+
+    /// The degree value for this direction, or `None` for the `/Di /None` case.
+    pub fn degrees(self) -> Option<i64> {
+        match self {
+            TransitionDirection::LeftToRight => Some(0),
+            TransitionDirection::BottomToTop => Some(90),
+            TransitionDirection::RightToLeft => Some(180),
+            TransitionDirection::TopToBottom => Some(270),
+            TransitionDirection::TopLeftToBottomRight => Some(315),
+            TransitionDirection::None => Option::None,
+        }
+    }
+
+    /// The PDF `/Di` value: a number for an angle, or the `/None` name.
+    fn pdf_value(self) -> Object {
+        match self.degrees() {
+            Some(deg) => Object::Integer(deg),
+            Option::None => Object::Name(b"None".to_vec()),
+        }
+    }
+
+    /// Parse a PDF `/Di` value (number → nearest valid angle; the `/None` name →
+    /// `None`; absent / unknown → `None`).
+    fn from_pdf_value(value: Option<&Object>) -> Self {
+        match value {
+            Some(Object::Name(n)) if n.as_slice() == b"None" => TransitionDirection::None,
+            Some(o) => o
+                .as_i64()
+                .and_then(Self::from_degrees)
+                .unwrap_or(TransitionDirection::None),
+            Option::None => TransitionDirection::None,
+        }
+    }
+}
+
+/// A page transition + auto-advance specification (ISO 32000-1 §12.4.4),
+/// authored onto a page by [`Document::set_page_transition`].
+///
+/// [`style`](Self::style) picks the visual effect; the remaining fields are all
+/// optional and only the ones that apply to the chosen style are written to the
+/// `/Trans` dictionary (e.g. `/Dm`/`/M` for `Split`, `/Di`/`/SS`/`/B` for
+/// `Fly`). [`display_duration`](Self::display_duration) is the page's `/Dur`
+/// (auto-advance) entry and is independent of the transition dictionary; set it
+/// to drive a self-running kiosk slideshow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageTransition {
+    /// The transition style (`/S`).
+    pub style: TransitionStyle,
+    /// `/D` — the transition effect's duration, in **seconds** (default `1`).
+    /// `None` omits the key (the viewer applies its `1` s default). Negative or
+    /// non-finite values are rejected by [`Document::set_page_transition`].
+    pub duration: Option<f64>,
+    /// `/Dm` — orientation, applies to `Split`/`Blinds` only.
+    pub dimension: Option<TransitionDimension>,
+    /// `/M` — motion direction, applies to `Split`/`Box` only.
+    pub motion: Option<TransitionMotion>,
+    /// `/Di` — sweep direction, applies to `Wipe`/`Glitter`/`Fly`/`Cover`/
+    /// `Uncover`/`Push`.
+    pub direction: Option<TransitionDirection>,
+    /// `/SS` — starting/ending scale for `Fly` (PDF 1.5; default `1.0`). Applies
+    /// to `Fly` only. Non-finite values are rejected.
+    pub scale: Option<f64>,
+    /// `/B` — for `Fly` (PDF 1.5): whether the area to be flown in is rectangular
+    /// and opaque (default `false`). Applies to `Fly` only.
+    pub fly_area_opaque: Option<bool>,
+    /// `/Dur` — the page's display duration in **seconds** before the viewer
+    /// auto-advances (ISO 32000-1 §12.4.4). `None` omits `/Dur` (the page only
+    /// advances on user action). Negative or non-finite values are rejected.
+    pub display_duration: Option<f64>,
+}
+
+impl PageTransition {
+    /// A transition of `style` with every optional field unset (no `/D`, `/Dm`,
+    /// `/M`, `/Di`, `/SS`, `/B`, and no `/Dur` auto-advance).
+    pub fn new(style: TransitionStyle) -> Self {
+        Self {
+            style,
+            duration: None,
+            dimension: None,
+            motion: None,
+            direction: None,
+            scale: None,
+            fly_area_opaque: None,
+            display_duration: None,
+        }
+    }
+}
+
 /// A page's five boundary boxes, each as `[x0, y0, x1, y1]` in user-space points.
 ///
 /// Returned by [`Document::page_boxes`]. Every field is the **effective** box —
@@ -12977,6 +13276,180 @@ impl Document {
         Ok(())
     }
 
+    // ─── page transitions (/Trans + /Dur, ISO 32000-1 §12.4.4) ───────────────
+
+    /// Author a presentation transition + auto-advance onto `page_no` (1-based),
+    /// ISO 32000-1 §12.4.4. Writes the page's `/Trans` transition dictionary
+    /// from [`PageTransition::style`] and only the optional sub-keys that apply
+    /// to that style (`/Dm`, `/M` for `Split`; `/Di`/`/SS`/`/B` for `Fly`; …) —
+    /// inapplicable keys are silently dropped. [`PageTransition::display_duration`]
+    /// is written as the page's `/Dur` (auto-advance display time); `None`
+    /// removes any existing `/Dur`. Re-calling replaces the prior `/Trans`/`/Dur`
+    /// in full (idempotent). The transition dictionary is written inline on the
+    /// page; sibling page keys are preserved.
+    ///
+    /// Returns [`EngineError::InvalidArgument`] if `duration`, `scale` or
+    /// `display_duration` is negative or non-finite, and
+    /// [`EngineError::PageNotFound`] for a bad page number.
+    pub fn set_page_transition(&mut self, page_no: u32, trans: &PageTransition) -> Result<()> {
+        if let Some(d) = trans.duration {
+            if !d.is_finite() || d < 0.0 {
+                return Err(EngineError::InvalidArgument(format!(
+                    "transition /D duration {d} must be finite and non-negative"
+                )));
+            }
+        }
+        if let Some(s) = trans.scale {
+            if !s.is_finite() || s < 0.0 {
+                return Err(EngineError::InvalidArgument(format!(
+                    "transition /SS scale {s} must be finite and non-negative"
+                )));
+            }
+        }
+        if let Some(dur) = trans.display_duration {
+            if !dur.is_finite() || dur < 0.0 {
+                return Err(EngineError::InvalidArgument(format!(
+                    "page /Dur display duration {dur} must be finite and non-negative"
+                )));
+            }
+        }
+
+        let page_id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+
+        // Build the /Trans dictionary, emitting only the keys that apply.
+        let mut td = Dictionary::new();
+        td.set(b"Type".to_vec(), Object::Name(b"Trans".to_vec()));
+        td.set(b"S".to_vec(), Object::Name(trans.style.pdf_name().to_vec()));
+        if let Some(d) = trans.duration {
+            td.set(b"D".to_vec(), Object::Real(d));
+        }
+        if trans.style.uses_dimension() {
+            if let Some(dm) = trans.dimension {
+                td.set(b"Dm".to_vec(), Object::Name(dm.pdf_name().to_vec()));
+            }
+        }
+        if trans.style.uses_motion() {
+            if let Some(m) = trans.motion {
+                td.set(b"M".to_vec(), Object::Name(m.pdf_name().to_vec()));
+            }
+        }
+        if trans.style.uses_direction() {
+            if let Some(di) = trans.direction {
+                td.set(b"Di".to_vec(), di.pdf_value());
+            }
+        }
+        if trans.style.uses_fly() {
+            if let Some(ss) = trans.scale {
+                td.set(b"SS".to_vec(), Object::Real(ss));
+            }
+            if let Some(b) = trans.fly_area_opaque {
+                td.set(b"B".to_vec(), Object::Boolean(b));
+            }
+        }
+        page.set(b"Trans".to_vec(), Object::Dictionary(td));
+
+        // /Dur lives on the page itself (not in /Trans).
+        match trans.display_duration {
+            Some(dur) => page.set(b"Dur".to_vec(), Object::Real(dur)),
+            None => {
+                page.remove(b"Dur");
+            }
+        }
+
+        self.objects.insert(page_id, Object::Dictionary(page));
+        Ok(())
+    }
+
+    /// The presentation transition declared on `page_no` (1-based), if any —
+    /// the page's `/Trans` dictionary and `/Dur` (ISO 32000-1 §12.4.4), decoded
+    /// into a [`PageTransition`]. Returns `None` when the page declares **no**
+    /// `/Trans` (even if it has a bare `/Dur`, since `/Dur` alone is not a
+    /// transition). Sub-keys that do not apply to the recovered style are
+    /// reported as `None`. Returns [`EngineError::PageNotFound`] for a bad page
+    /// number.
+    pub fn page_transition(&self, page_no: u32) -> Result<Option<PageTransition>> {
+        let page_id = self.page_object_id(page_no)?;
+        let page = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .ok_or(EngineError::PageNotFound(page_no))?;
+
+        let Some(td) = page
+            .get(b"Trans")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        else {
+            return Ok(None);
+        };
+
+        let style = TransitionStyle::from_pdf_name(td.get(b"S").and_then(Object::as_name));
+        let duration = td.get(b"D").and_then(Object::as_f64);
+        let dimension = if style.uses_dimension() {
+            td.get(b"Dm")
+                .map(|o| TransitionDimension::from_pdf_name(o.as_name()))
+        } else {
+            None
+        };
+        let motion = if style.uses_motion() {
+            td.get(b"M")
+                .map(|o| TransitionMotion::from_pdf_name(o.as_name()))
+        } else {
+            None
+        };
+        let direction = if style.uses_direction() && td.contains(b"Di") {
+            Some(TransitionDirection::from_pdf_value(td.get(b"Di")))
+        } else {
+            None
+        };
+        let scale = if style.uses_fly() {
+            td.get(b"SS").and_then(Object::as_f64)
+        } else {
+            None
+        };
+        let fly_area_opaque = if style.uses_fly() {
+            td.get(b"B").and_then(Object::as_bool)
+        } else {
+            None
+        };
+        let display_duration = page.get(b"Dur").and_then(Object::as_f64);
+
+        Ok(Some(PageTransition {
+            style,
+            duration,
+            dimension,
+            motion,
+            direction,
+            scale,
+            fly_area_opaque,
+            display_duration,
+        }))
+    }
+
+    /// Remove any presentation transition from `page_no` (1-based) — drops the
+    /// page's `/Trans` dictionary and its `/Dur` auto-advance entry (ISO 32000-1
+    /// §12.4.4). A no-op if neither is present. Returns
+    /// [`EngineError::PageNotFound`] for a bad page number.
+    pub fn clear_page_transition(&mut self, page_no: u32) -> Result<()> {
+        let page_id = self.page_object_id(page_no)?;
+        let mut page = self
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or(EngineError::PageNotFound(page_no))?;
+        page.remove(b"Trans");
+        page.remove(b"Dur");
+        self.objects.insert(page_id, Object::Dictionary(page));
+        Ok(())
+    }
+
     /// The /Pages tree node whose /Kids contains `child`, if any.
     fn find_kids_parent(&self, child: ObjectId) -> Option<ObjectId> {
         for (id, object) in &self.objects {
@@ -19354,6 +19827,199 @@ mod tests {
         assert!(doc.layers()[0].visible);
         doc.remove_layer(id).unwrap();
         assert!(doc.layers().is_empty());
+    }
+
+    // ─── page transitions (/Trans + /Dur) ────────────────────────────────────
+
+    /// Read the live `/Trans` dictionary written onto page 1 (resolving an
+    /// indirect reference if any).
+    fn page1_trans(doc: &Document) -> Dictionary {
+        let id = doc.page_object_id(1).unwrap();
+        let page = doc.objects.get(&id).and_then(Object::as_dict).unwrap();
+        doc.resolve(page.get(b"Trans").unwrap())
+            .as_dict()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn page_transition_wipe_writes_trans_and_dur() {
+        // The headline case from the issue: a Wipe, /Di 90, 0.5 s effect, 5 s
+        // auto-advance → /Trans << /S /Wipe /D 0.5 /Di 90 >> + /Dur 5.
+        let pdf = crate::convert::reverse::txt_to_pdf("wipe slide");
+        let mut doc = Document::open(&pdf).unwrap();
+        assert!(doc.page_transition(1).unwrap().is_none());
+
+        let mut t = PageTransition::new(TransitionStyle::Wipe);
+        t.duration = Some(0.5);
+        t.direction = Some(TransitionDirection::BottomToTop); // /Di 90
+        t.display_duration = Some(5.0);
+        doc.set_page_transition(1, &t).unwrap();
+
+        // Structured page dict: exact keys/values on /Trans + /Dur on the page.
+        let td = page1_trans(&doc);
+        assert_eq!(
+            td.get(b"Type").and_then(Object::as_name),
+            Some(&b"Trans"[..])
+        );
+        assert_eq!(td.get(b"S").and_then(Object::as_name), Some(&b"Wipe"[..]));
+        assert_eq!(td.get(b"D").and_then(Object::as_f64), Some(0.5));
+        assert_eq!(td.get(b"Di").and_then(Object::as_i64), Some(90));
+        // Inapplicable keys are never written.
+        assert!(!td.contains(b"Dm") && !td.contains(b"M") && !td.contains(b"SS"));
+        let page_id = doc.page_object_id(1).unwrap();
+        let page = doc.objects.get(&page_id).and_then(Object::as_dict).unwrap();
+        assert_eq!(page.get(b"Dur").and_then(Object::as_f64), Some(5.0));
+
+        // Serialized output carries the expected tokens verbatim.
+        let bytes = doc.save();
+        assert!(has_op(&bytes, b"/S /Wipe"), "serialized /S /Wipe");
+        assert!(has_op(&bytes, b"/D 0.5"), "serialized /D 0.5");
+        assert!(has_op(&bytes, b"/Di 90"), "serialized /Di 90");
+        assert!(has_op(&bytes, b"/Dur 5"), "serialized /Dur 5");
+
+        // Round-trips: reopen and read it back.
+        let reopened = Document::open(&bytes).unwrap();
+        let got = reopened.page_transition(1).unwrap().unwrap();
+        assert_eq!(got.style, TransitionStyle::Wipe);
+        assert_eq!(got.duration, Some(0.5));
+        assert_eq!(got.direction, Some(TransitionDirection::BottomToTop));
+        assert_eq!(got.display_duration, Some(5.0));
+    }
+
+    #[test]
+    fn page_transition_split_honors_dm_and_m() {
+        // Split is the one style honouring BOTH /Dm and /M.
+        let pdf = crate::convert::reverse::txt_to_pdf("split slide");
+        let mut doc = Document::open(&pdf).unwrap();
+        let mut t = PageTransition::new(TransitionStyle::Split);
+        t.dimension = Some(TransitionDimension::Vertical); // /Dm /V
+        t.motion = Some(TransitionMotion::Outward); // /M /O
+        t.direction = Some(TransitionDirection::RightToLeft); // not used by Split → dropped
+        doc.set_page_transition(1, &t).unwrap();
+
+        let td = page1_trans(&doc);
+        assert_eq!(td.get(b"S").and_then(Object::as_name), Some(&b"Split"[..]));
+        assert_eq!(td.get(b"Dm").and_then(Object::as_name), Some(&b"V"[..]));
+        assert_eq!(td.get(b"M").and_then(Object::as_name), Some(&b"O"[..]));
+        // /Di does not apply to Split and must not be emitted.
+        assert!(!td.contains(b"Di"));
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let got = reopened.page_transition(1).unwrap().unwrap();
+        assert_eq!(got.style, TransitionStyle::Split);
+        assert_eq!(got.dimension, Some(TransitionDimension::Vertical));
+        assert_eq!(got.motion, Some(TransitionMotion::Outward));
+        assert_eq!(got.direction, None); // never read back for Split
+    }
+
+    #[test]
+    fn page_transition_fly_honors_ss_b_and_di_none() {
+        // Fly is the only style with /SS and /B, and the only sensible user of
+        // /Di /None (fly straight at the viewer).
+        let pdf = crate::convert::reverse::txt_to_pdf("fly slide");
+        let mut doc = Document::open(&pdf).unwrap();
+        let mut t = PageTransition::new(TransitionStyle::Fly);
+        t.scale = Some(1.5); // /SS 1.5
+        t.fly_area_opaque = Some(true); // /B true
+        t.direction = Some(TransitionDirection::None); // /Di /None
+        doc.set_page_transition(1, &t).unwrap();
+
+        let td = page1_trans(&doc);
+        assert_eq!(td.get(b"S").and_then(Object::as_name), Some(&b"Fly"[..]));
+        assert_eq!(td.get(b"SS").and_then(Object::as_f64), Some(1.5));
+        assert_eq!(td.get(b"B").and_then(Object::as_bool), Some(true));
+        assert_eq!(td.get(b"Di").and_then(Object::as_name), Some(&b"None"[..]));
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let got = reopened.page_transition(1).unwrap().unwrap();
+        assert_eq!(got.scale, Some(1.5));
+        assert_eq!(got.fly_area_opaque, Some(true));
+        assert_eq!(got.direction, Some(TransitionDirection::None));
+    }
+
+    #[test]
+    fn page_transition_replace_minimal_and_clear() {
+        // Replace (/R) with no sub-keys, then clearing removes /Trans AND /Dur.
+        let pdf = crate::convert::reverse::txt_to_pdf("replace slide");
+        let mut doc = Document::open(&pdf).unwrap();
+        let mut t = PageTransition::new(TransitionStyle::Replace);
+        t.display_duration = Some(3.0);
+        doc.set_page_transition(1, &t).unwrap();
+
+        let td = page1_trans(&doc);
+        assert_eq!(td.get(b"S").and_then(Object::as_name), Some(&b"R"[..]));
+        assert!(!td.contains(b"D") && !td.contains(b"Di")); // nothing optional set
+        let page_id = doc.page_object_id(1).unwrap();
+        let page = doc.objects.get(&page_id).and_then(Object::as_dict).unwrap();
+        assert_eq!(page.get(b"Dur").and_then(Object::as_f64), Some(3.0));
+
+        // Clear removes both keys; the getter then reports None.
+        doc.clear_page_transition(1).unwrap();
+        let page = doc.objects.get(&page_id).and_then(Object::as_dict).unwrap();
+        assert!(!page.contains(b"Trans") && !page.contains(b"Dur"));
+        assert!(doc.page_transition(1).unwrap().is_none());
+
+        // Clearing again is a no-op (idempotent).
+        doc.clear_page_transition(1).unwrap();
+    }
+
+    #[test]
+    fn page_transition_dur_only_then_replace_resets() {
+        // Re-setting replaces the prior /Trans/Dur in full: switching from a
+        // Wipe+Dur to a plain Wipe (no display_duration) must drop /Dur.
+        let pdf = crate::convert::reverse::txt_to_pdf("reset slide");
+        let mut doc = Document::open(&pdf).unwrap();
+        let mut t = PageTransition::new(TransitionStyle::Wipe);
+        t.display_duration = Some(4.0);
+        doc.set_page_transition(1, &t).unwrap();
+        let page_id = doc.page_object_id(1).unwrap();
+        assert!(doc
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .contains(b"Dur"));
+
+        // Re-set with display_duration = None → /Dur is removed.
+        doc.set_page_transition(1, &PageTransition::new(TransitionStyle::Wipe))
+            .unwrap();
+        assert!(!doc
+            .objects
+            .get(&page_id)
+            .and_then(Object::as_dict)
+            .unwrap()
+            .contains(b"Dur"));
+        // A bare /Dur is not a transition: the getter reports the live /Trans.
+        let got = doc.page_transition(1).unwrap().unwrap();
+        assert_eq!(got.display_duration, None);
+    }
+
+    #[test]
+    fn page_transition_rejects_bad_values_and_bad_page() {
+        let pdf = crate::convert::reverse::txt_to_pdf("validate slide");
+        let mut doc = Document::open(&pdf).unwrap();
+
+        let mut bad_d = PageTransition::new(TransitionStyle::Wipe);
+        bad_d.duration = Some(-1.0);
+        assert!(doc.set_page_transition(1, &bad_d).is_err());
+
+        let mut bad_dur = PageTransition::new(TransitionStyle::Wipe);
+        bad_dur.display_duration = Some(f64::NAN);
+        assert!(doc.set_page_transition(1, &bad_dur).is_err());
+
+        let mut bad_ss = PageTransition::new(TransitionStyle::Fly);
+        bad_ss.scale = Some(-0.5);
+        assert!(doc.set_page_transition(1, &bad_ss).is_err());
+
+        // Out-of-range page numbers fail on every entry point.
+        let ok = PageTransition::new(TransitionStyle::Wipe);
+        assert!(doc.set_page_transition(99, &ok).is_err());
+        assert!(doc.page_transition(99).is_err());
+        assert!(doc.clear_page_transition(99).is_err());
+
+        // A rejected set leaves the page untouched (no partial /Trans).
+        assert!(doc.page_transition(1).unwrap().is_none());
     }
 
     /// The `/Properties` entry named `res_name` on `page_no` must resolve to an

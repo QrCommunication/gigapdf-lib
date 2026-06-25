@@ -24,7 +24,8 @@ use gigapdf_core::{
     Action, AfRelationship, Annotation, Bookmark, Color, ContentElement, Document, ElementKind,
     EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec, GradientStop,
     HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem, PageBox,
-    PageLabelRange, PageLabelStyle, Permissions, SearchMatch, TextLayerRun, TextLine, TextRun,
+    PageLabelRange, PageLabelStyle, PageTransition, Permissions, SearchMatch, TextLayerRun,
+    TextLine, TextRun, TransitionDimension, TransitionDirection, TransitionMotion, TransitionStyle,
     ViewerPreferences,
 };
 
@@ -2986,6 +2987,189 @@ pub extern "C" fn gp_set_page_box(
         };
         doc.set_page_box(page, kind, [x0, y0, x1, y1])
     })
+}
+
+// ─── page transitions (/Trans + /Dur, ISO 32000-1 §12.4.4) ───────────────────
+
+/// Map the `style` index used across the C ABI to a [`TransitionStyle`]
+/// (matches the SDK `PAGE_TRANSITION_STYLES` order).
+fn transition_style_from_index(style: u32) -> Option<TransitionStyle> {
+    Some(match style {
+        0 => TransitionStyle::Split,
+        1 => TransitionStyle::Blinds,
+        2 => TransitionStyle::Box,
+        3 => TransitionStyle::Wipe,
+        4 => TransitionStyle::Dissolve,
+        5 => TransitionStyle::Glitter,
+        6 => TransitionStyle::Fly,
+        7 => TransitionStyle::Push,
+        8 => TransitionStyle::Cover,
+        9 => TransitionStyle::Uncover,
+        10 => TransitionStyle::Fade,
+        11 => TransitionStyle::Replace,
+        _ => return None,
+    })
+}
+
+/// The SDK style token for a [`TransitionStyle`] (matches `PAGE_TRANSITION_STYLES`).
+fn transition_style_str(style: TransitionStyle) -> &'static str {
+    match style {
+        TransitionStyle::Split => "split",
+        TransitionStyle::Blinds => "blinds",
+        TransitionStyle::Box => "box",
+        TransitionStyle::Wipe => "wipe",
+        TransitionStyle::Dissolve => "dissolve",
+        TransitionStyle::Glitter => "glitter",
+        TransitionStyle::Fly => "fly",
+        TransitionStyle::Push => "push",
+        TransitionStyle::Cover => "cover",
+        TransitionStyle::Uncover => "uncover",
+        TransitionStyle::Fade => "fade",
+        TransitionStyle::Replace => "replace",
+    }
+}
+
+/// Author a presentation transition + auto-advance on `page` (1-based),
+/// ISO 32000-1 §12.4.4. Scalar params encode the optional `/Trans` sub-keys and
+/// the page's `/Dur`; only keys that apply to the chosen `style` are written.
+///
+/// - `style`: `0`=split `1`=blinds `2`=box `3`=wipe `4`=dissolve `5`=glitter
+///   `6`=fly `7`=push `8`=cover `9`=uncover `10`=fade `11`=replace.
+/// - `duration`: `/D` effect seconds; pass **NaN** to omit.
+/// - `dimension`: `/Dm` — `-1` omit, `0`=H, `1`=V (Split/Blinds).
+/// - `motion`: `/M` — `-1` omit, `0`=I, `1`=O (Split/Box).
+/// - `direction`: `/Di` — `-2` omit, `-1`=`/None`, else degrees (0/90/180/270/315).
+/// - `scale`: `/SS` Fly scale; pass **NaN** to omit.
+/// - `fly_b`: `/B` — `-1` omit, `0`=false, `1`=true (Fly).
+/// - `display_duration`: `/Dur` auto-advance seconds; pass **NaN** to omit/remove.
+///
+/// Returns `0` on success, `-1` null handle, `-2` unknown style, `-3` bad
+/// value / bad page.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gp_set_page_transition(
+    handle: *mut Document,
+    page: u32,
+    style: u32,
+    duration: f64,
+    dimension: i32,
+    motion: i32,
+    direction: i32,
+    scale: f64,
+    fly_b: i32,
+    display_duration: f64,
+) -> i32 {
+    let Some(style) = transition_style_from_index(style) else {
+        return -2;
+    };
+    let trans = PageTransition {
+        style,
+        duration: if duration.is_nan() {
+            None
+        } else {
+            Some(duration)
+        },
+        dimension: match dimension {
+            0 => Some(TransitionDimension::Horizontal),
+            1 => Some(TransitionDimension::Vertical),
+            _ => None,
+        },
+        motion: match motion {
+            0 => Some(TransitionMotion::Inward),
+            1 => Some(TransitionMotion::Outward),
+            _ => None,
+        },
+        direction: match direction {
+            -2 => None,
+            -1 => Some(TransitionDirection::None),
+            deg => Some(
+                TransitionDirection::from_degrees(deg as i64).unwrap_or(TransitionDirection::None),
+            ),
+        },
+        scale: if scale.is_nan() { None } else { Some(scale) },
+        fly_area_opaque: match fly_b {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        display_duration: if display_duration.is_nan() {
+            None
+        } else {
+            Some(display_duration)
+        },
+    };
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return -1,
+    };
+    match doc.set_page_transition(page, &trans) {
+        Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
+/// Remove any presentation transition (`/Trans` + `/Dur`) from `page` (1-based).
+/// Returns `0` on success, `<0` on error.
+#[no_mangle]
+pub extern "C" fn gp_clear_page_transition(handle: *mut Document, page: u32) -> i32 {
+    edit(handle, |doc| doc.clear_page_transition(page))
+}
+
+/// The presentation transition on `page` (1-based) as JSON, or `null` when the
+/// page declares no `/Trans`. Shape:
+/// `{"style":"wipe","duration":0.5,"dimension":null,"motion":null,
+/// "direction":90,"scale":null,"flyAreaOpaque":null,"displayDuration":5}`
+/// (omitted optional keys are `null`; `direction` is a number, `"none"`, or
+/// `null`). Host frees the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_page_transition_json(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => match doc.page_transition(page) {
+            Ok(Some(t)) => {
+                let num = |v: Option<f64>| v.map_or("null".to_string(), |n| format!("{n}"));
+                let dimension = match t.dimension {
+                    Some(TransitionDimension::Horizontal) => "\"horizontal\"",
+                    Some(TransitionDimension::Vertical) => "\"vertical\"",
+                    None => "null",
+                };
+                let motion = match t.motion {
+                    Some(TransitionMotion::Inward) => "\"inward\"",
+                    Some(TransitionMotion::Outward) => "\"outward\"",
+                    None => "null",
+                };
+                let direction = match t.direction {
+                    Some(TransitionDirection::None) => "\"none\"".to_string(),
+                    Some(d) => d
+                        .degrees()
+                        .map_or("null".to_string(), |deg| deg.to_string()),
+                    None => "null".to_string(),
+                };
+                let fly = match t.fly_area_opaque {
+                    Some(b) => b.to_string(),
+                    None => "null".to_string(),
+                };
+                format!(
+                    "{{\"style\":\"{}\",\"duration\":{},\"dimension\":{},\"motion\":{},\
+                     \"direction\":{},\"scale\":{},\"flyAreaOpaque\":{},\"displayDuration\":{}}}",
+                    transition_style_str(t.style),
+                    num(t.duration),
+                    dimension,
+                    motion,
+                    direction,
+                    num(t.scale),
+                    fly,
+                    num(t.display_duration),
+                )
+            }
+            _ => "null".to_string(),
+        },
+        None => "null".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
 /// The friendly JSON style token for a page-label style (matches the SDK enum).

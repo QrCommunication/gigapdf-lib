@@ -2294,6 +2294,70 @@ export interface PageLabelRange {
   startNumber: number;
 }
 
+/**
+ * The visual style of a page transition (ISO 32000-1 §12.4.4, the `/S` entry).
+ * Index order matches the engine's enum and selects which optional fields of
+ * {@link PageTransition} apply.
+ */
+export const PAGE_TRANSITION_STYLES = [
+  "split",
+  "blinds",
+  "box",
+  "wipe",
+  "dissolve",
+  "glitter",
+  "fly",
+  "push",
+  "cover",
+  "uncover",
+  "fade",
+  "replace",
+] as const;
+
+/** A page transition style — see {@link PAGE_TRANSITION_STYLES}. */
+export type PageTransitionStyle = (typeof PAGE_TRANSITION_STYLES)[number];
+
+/** Orientation of a `split`/`blinds` transition (the `/Dm` entry). */
+export type PageTransitionDimension = "horizontal" | "vertical";
+
+/** Motion direction of a `split`/`box` transition (the `/M` entry). */
+export type PageTransitionMotion = "inward" | "outward";
+
+/**
+ * The sweep direction of a directional transition (the `/Di` entry). A number
+ * of degrees — only the discrete angles `0`, `90`, `180`, `270`, `315` are
+ * valid — or `"none"` (the `/Di /None` name, used by `fly` to mean "fly toward
+ * the viewer").
+ */
+export type PageTransitionDirection = 0 | 90 | 180 | 270 | 315 | "none";
+
+/**
+ * A presentation transition + auto-advance for a page (ISO 32000-1 §12.4.4),
+ * passed to {@link GigaPdfDoc.setPageTransition}. {@link style} picks the
+ * effect; the remaining fields are optional and only the ones that apply to the
+ * chosen style are written (`dimension`/`motion` for `split`, `direction`/
+ * `scale`/`flyAreaOpaque` for `fly`, …). {@link displayDuration} is the page's
+ * `/Dur` auto-advance time and is independent of the transition itself.
+ */
+export interface PageTransition {
+  /** The transition style (`/S`). */
+  style: PageTransitionStyle;
+  /** `/D` — the transition effect duration in **seconds** (viewer default: 1). */
+  duration?: number;
+  /** `/Dm` — orientation; `split`/`blinds` only. */
+  dimension?: PageTransitionDimension;
+  /** `/M` — motion direction; `split`/`box` only. */
+  motion?: PageTransitionMotion;
+  /** `/Di` — sweep direction; `wipe`/`glitter`/`fly`/`cover`/`uncover`/`push`. */
+  direction?: PageTransitionDirection;
+  /** `/SS` — starting/ending scale for `fly` (PDF 1.5; default 1.0). */
+  scale?: number;
+  /** `/B` — whether the `fly` area is rectangular + opaque (PDF 1.5; default false). */
+  flyAreaOpaque?: boolean;
+  /** `/Dur` — the page's display time in **seconds** before auto-advancing. */
+  displayDuration?: number;
+}
+
 /** Horizontal alignment of header/footer text within the printable width. */
 export type HeaderFooterAlign = "left" | "center" | "right";
 
@@ -3410,6 +3474,67 @@ export class GigaPdfDoc {
    */
   pageLabel(page: number): string {
     return this.g._str((o) => this.ex().gp_page_label(this.h, page, o));
+  }
+
+  /**
+   * Author a presentation transition + auto-advance on `page` (1-based),
+   * ISO 32000-1 §12.4.4. Writes the page's `/Trans` dictionary from
+   * {@link PageTransition.style} plus only the optional sub-keys that apply to
+   * that style (`dimension`/`motion` for `split`, `direction`/`scale`/
+   * `flyAreaOpaque` for `fly`, …) — inapplicable fields are dropped.
+   * {@link PageTransition.displayDuration} becomes the page's `/Dur`
+   * (auto-advance); omitting it removes any existing `/Dur`. Re-calling replaces
+   * the prior transition in full (idempotent). Returns `true` on success,
+   * `false` for an unknown style, a negative/non-finite `duration`/`scale`/
+   * `displayDuration`, or a bad page number.
+   *
+   * @example
+   * // Kiosk slideshow: every page wipes in over 0.5 s, auto-advancing after 5 s.
+   * for (let p = 1; p <= doc.pageCount(); p++) {
+   *   doc.setPageTransition(p, { style: "wipe", duration: 0.5, displayDuration: 5 });
+   * }
+   */
+  setPageTransition(page: number, trans: PageTransition): boolean {
+    const style = PAGE_TRANSITION_STYLES.indexOf(trans.style);
+    if (style < 0) return false;
+    const dimension =
+      trans.dimension === "horizontal" ? 0 : trans.dimension === "vertical" ? 1 : -1;
+    const motion = trans.motion === "inward" ? 0 : trans.motion === "outward" ? 1 : -1;
+    const direction =
+      trans.direction === undefined ? -2 : trans.direction === "none" ? -1 : trans.direction;
+    const flyB = trans.flyAreaOpaque === undefined ? -1 : trans.flyAreaOpaque ? 1 : 0;
+    return (
+      this.ex().gp_set_page_transition(
+        this.h,
+        page,
+        style,
+        trans.duration ?? Number.NaN,
+        dimension,
+        motion,
+        direction,
+        trans.scale ?? Number.NaN,
+        flyB,
+        trans.displayDuration ?? Number.NaN
+      ) === 0
+    );
+  }
+
+  /**
+   * The presentation transition declared on `page` (1-based), or `null` when the
+   * page has no `/Trans` (ISO 32000-1 §12.4.4). Optional fields that do not apply
+   * to the recovered style are omitted from the result.
+   */
+  getPageTransition(page: number): PageTransition | null {
+    return this.g._jsonOrNull<PageTransition>((o) => this.ex().gp_page_transition_json(this.h, page, o));
+  }
+
+  /**
+   * Remove any presentation transition from `page` (1-based) — drops the page's
+   * `/Trans` dictionary and its `/Dur` auto-advance entry. A no-op if neither is
+   * present. Returns `true` on success.
+   */
+  clearPageTransition(page: number): boolean {
+    return this.ex().gp_clear_page_transition(this.h, page) === 0;
   }
 
   /**
