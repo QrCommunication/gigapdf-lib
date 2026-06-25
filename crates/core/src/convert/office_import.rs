@@ -13218,31 +13218,86 @@ enum DataStyleKind {
     Number,
     Percentage,
     Currency,
+    /// A `number:date-style` or `number:time-style`: its code is assembled
+    /// token-by-token from the date/time field children, so no finishing step is
+    /// needed (unlike the numeric kinds).
+    DateTime,
+}
+
+/// Map one ODF date/time field child element (`number:day`, `number:month`, …)
+/// to its spreadsheet number-format token, honouring `@number:style` (`long` ⇒
+/// padded, e.g. `dd`/`mm`/`yyyy`; otherwise short, e.g. `d`/`m`/`yy`) and
+/// `@number:textual` (a textual month/weekday ⇒ `mmm`/`mmmm` or `ddd`/`dddd`).
+/// Returns `None` for non-field children (`number:text` is handled separately as
+/// literal separators). Minute vs. month both lower to `m`/`mm` per the
+/// spreadsheet convention — the ODF element type already disambiguates them, and
+/// the resulting code reads correctly in context (`hh:mm:ss`).
+fn odf_datetime_token(field: &str, attrs: &[(String, String)]) -> Option<String> {
+    let long = attr(attrs, "style") == Some("long");
+    let textual = attr(attrs, "textual") == Some("true");
+    Some(match field {
+        "day" => if long { "dd" } else { "d" }.to_string(),
+        "month" => match (textual, long) {
+            (true, true) => "mmmm".to_string(),
+            (true, false) => "mmm".to_string(),
+            (false, true) => "mm".to_string(),
+            (false, false) => "m".to_string(),
+        },
+        "year" => if long { "yyyy" } else { "yy" }.to_string(),
+        "day-of-week" => if long { "dddd" } else { "ddd" }.to_string(),
+        "hours" => if long { "hh" } else { "h" }.to_string(),
+        "minutes" => if long { "mm" } else { "m" }.to_string(),
+        "seconds" => if long { "ss" } else { "s" }.to_string(),
+        "am-pm" => "AM/PM".to_string(),
+        _ => return None,
+    })
 }
 
 /// Build a `data-style-name → spreadsheet-format-code` map from one ODF part.
 /// Reconstructs a `0.00` / `#,##0` / `0%` / `$#,##0.00` style code from the
 /// `number:number` / `number:currency-symbol` / `number:percentage` children of
-/// each numeric `number:*-style`. Best-effort: only the common numeric, percent
-/// and currency forms are reconstructed; date/time styles (whose field pattern we
-/// don't rebuild) are omitted, leaving such cells unformatted.
+/// each numeric `number:*-style`, and a `yyyy-mm-dd` / `hh:mm:ss` style code from
+/// the field children (`number:day`/`month`/`year`/`hours`/`minutes`/`seconds`/…)
+/// and literal `number:text` separators of each `number:date-style` /
+/// `number:time-style`. Best-effort: only the common numeric, percent, currency,
+/// date and time forms are reconstructed.
 fn odf_data_styles(xml: &str) -> BTreeMap<String, String> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     let mut x = Xml::new(xml);
+    // True while inside a `<number:text>` literal of a date/time style, so its
+    // text body (date separators such as `-`, `/`, `:`, spaces) is appended.
+    let mut in_text = false;
     let mut cur: Option<(String, DataStyleKind, String)> = None; // (name, kind, code)
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, _) => {
                 let ln = local(&name);
                 match ln {
-                    "number-style" | "percentage-style" | "currency-style" => {
+                    "number-style" | "percentage-style" | "currency-style" | "date-style"
+                    | "time-style" => {
                         let nm = attr(&attrs, "name").map(str::to_string);
                         let kind = match ln {
                             "percentage-style" => DataStyleKind::Percentage,
                             "currency-style" => DataStyleKind::Currency,
+                            "date-style" | "time-style" => DataStyleKind::DateTime,
                             _ => DataStyleKind::Number,
                         };
                         cur = nm.map(|n| (n, kind, String::new()));
+                    }
+                    // Date/time field children: append their spreadsheet token. A
+                    // `number:text` separator is captured via its text body below.
+                    "day" | "month" | "year" | "day-of-week" | "hours" | "minutes" | "seconds"
+                    | "am-pm" => {
+                        if let Some((_, DataStyleKind::DateTime, code)) = cur.as_mut() {
+                            if let Some(tok) = odf_datetime_token(ln, &attrs) {
+                                code.push_str(&tok);
+                            }
+                        }
+                    }
+                    "text" => {
+                        if matches!(cur, Some((_, DataStyleKind::DateTime, _))) {
+                            in_text = true;
+                        }
                     }
                     "number" => {
                         if let Some((_, _, code)) = cur.as_mut() {
@@ -13273,9 +13328,16 @@ fn odf_data_styles(xml: &str) -> BTreeMap<String, String> {
                 }
             }
             Tok::Close(name) => {
-                if matches!(
-                    local(&name),
-                    "number-style" | "percentage-style" | "currency-style"
+                let ln = local(&name);
+                if ln == "text" {
+                    in_text = false;
+                } else if matches!(
+                    ln,
+                    "number-style"
+                        | "percentage-style"
+                        | "currency-style"
+                        | "date-style"
+                        | "time-style"
                 ) {
                     if let Some((nm, kind, mut code)) = cur.take() {
                         match kind {
@@ -13293,15 +13355,26 @@ fn odf_data_styles(xml: &str) -> BTreeMap<String, String> {
                                     code.push_str("#,##0.00");
                                 }
                             }
-                            DataStyleKind::Number => {}
+                            // Date/time codes are assembled from the field children
+                            // and `number:text` separators — nothing to finish.
+                            DataStyleKind::Number | DataStyleKind::DateTime => {}
                         }
                         if !code.is_empty() {
                             map.insert(nm, code);
                         }
                     }
+                    in_text = false;
                 }
             }
-            Tok::Text(_) => {}
+            // Literal date/time separators (`-`, `/`, `:`, spaces) live in
+            // `<number:text>` bodies; append them verbatim to the format code.
+            Tok::Text(t) => {
+                if in_text {
+                    if let Some((_, DataStyleKind::DateTime, code)) = cur.as_mut() {
+                        code.push_str(&t);
+                    }
+                }
+            }
         }
     }
     map
@@ -19940,6 +20013,110 @@ mod tests {
         assert_eq!(
             sheet.rows[2].cells[0].value,
             model::CellValue::Text("After".into())
+        );
+    }
+
+    #[test]
+    fn ods_model_colspan_anchor_skips_covered_cell() {
+        // A single-row `number-columns-spanned="2"` anchor followed by one
+        // `covered-table-cell` placeholder, then a third real cell. The model
+        // records exactly one horizontal MergeRange (0,0)..=(0,1); the covered
+        // slot is present-but-empty (advancing the column cursor) — NOT a phantom
+        // extra cell — so the trailing "C3" lands at physical column 2.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t">
+  <office:body><office:spreadsheet>
+    <table:table table:name="CS">
+      <table:table-row>
+        <table:table-cell table:number-columns-spanned="2"><text:p>Wide</text:p></table:table-cell>
+        <table:covered-table-cell/>
+        <table:table-cell><text:p>C3</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+        let sheet = ods_sheet(content, None);
+        assert_eq!(sheet.merges.len(), 1, "one merge: {:?}", sheet.merges);
+        assert_eq!(
+            sheet.merges[0],
+            model::MergeRange {
+                r0: 0,
+                c0: 0,
+                r1: 0,
+                c1: 1
+            }
+        );
+        // Exactly three cells: anchor, the covered (empty) filler, then C3.
+        // No phantom cell was emitted for the span beyond the filler slot.
+        assert_eq!(
+            sheet.rows[0].cells.len(),
+            3,
+            "cells: {:?}",
+            sheet.rows[0].cells
+        );
+        assert_eq!(
+            sheet.rows[0].cells[0].value,
+            model::CellValue::Text("Wide".into())
+        );
+        assert_eq!(sheet.rows[0].cells[1].value, model::CellValue::Empty);
+        assert_eq!(
+            sheet.rows[0].cells[2].value,
+            model::CellValue::Text("C3".into())
+        );
+    }
+
+    #[test]
+    fn ods_model_date_number_format_lowered() {
+        // A `number:date-style` (`yyyy-mm-dd` from year/month/day fields + `-`
+        // separators) and a `number:time-style` (`hh:mm:ss` from hours/minutes/
+        // seconds + `:` separators) resolve through `@style:data-style-name` into
+        // each cell's `number_format`; a plain cell stays unformatted.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st" xmlns:number="nb">
+  <office:automatic-styles>
+    <number:date-style style:name="D1">
+      <number:year number:style="long"/>
+      <number:text>-</number:text>
+      <number:month number:style="long"/>
+      <number:text>-</number:text>
+      <number:day number:style="long"/>
+    </number:date-style>
+    <number:time-style style:name="T1">
+      <number:hours number:style="long"/>
+      <number:text>:</number:text>
+      <number:minutes number:style="long"/>
+      <number:text>:</number:text>
+      <number:seconds number:style="long"/>
+    </number:time-style>
+    <style:style style:name="cD" style:family="table-cell" style:data-style-name="D1"/>
+    <style:style style:name="cT" style:family="table-cell" style:data-style-name="T1"/>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="DT">
+      <table:table-row>
+        <table:table-cell table:style-name="cD" office:value-type="date" office:date-value="2026-06-25"><text:p>2026-06-25</text:p></table:table-cell>
+        <table:table-cell table:style-name="cT" office:value-type="time" office:time-value="PT13H05M09S"><text:p>13:05:09</text:p></table:table-cell>
+        <table:table-cell><text:p>Plain</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"##;
+        let sheet = ods_sheet(content, None);
+        assert_eq!(
+            sheet.rows[0].cells[0].number_format.as_deref(),
+            Some("yyyy-mm-dd"),
+            "date format: {:?}",
+            sheet.rows[0].cells[0].number_format
+        );
+        assert_eq!(
+            sheet.rows[0].cells[1].number_format.as_deref(),
+            Some("hh:mm:ss"),
+            "time format: {:?}",
+            sheet.rows[0].cells[1].number_format
+        );
+        // Plain cell: no number format lowered (regression guard).
+        assert!(
+            sheet.rows[0].cells[2].number_format.is_none(),
+            "plain stays unformatted: {:?}",
+            sheet.rows[0].cells[2].number_format
         );
     }
 
