@@ -661,29 +661,107 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         footnotes: &footnotes,
     };
 
-    let mut blocks = Vec::new();
+    let mut pages = DocxPages::new();
     let mut counters = ListCounters::default();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
     docx_walk_model(
         &mut Xml::new(&doc),
         &ctx,
-        &mut blocks,
+        &mut pages,
         &mut counters,
         &mut resources,
         None,
     );
-    let mut document = flow_document(blocks, page_geometry(geom));
+    let mut document = flow_document_pages(pages.finish(), page_geometry(geom));
     document.resources.images = resources;
     document.meta = ooxml_doc_meta(zip);
     document
 }
 
+/// Wrap pre-split flow [`Page`]s in a one-section [`Document`] with the given
+/// page geometry. Like [`flow_document`] but for a body that carried hard page
+/// breaks (so it lowered to several pages). An empty list yields a single empty
+/// page so the document always has at least one page.
+fn flow_document_pages(pages: Vec<model::Page>, geom: PageGeometry) -> Document {
+    let pages = if pages.is_empty() {
+        vec![model::Page {
+            blocks: Vec::new(),
+            absolute: false,
+        }]
+    } else {
+        pages
+    };
+    Document {
+        sections: vec![Section {
+            geometry: geom,
+            header: None,
+            footer: None,
+            pages,
+        }],
+        ..Document::default()
+    }
+}
+
+/// Accumulates the model blocks of a flowing DOCX body, split into [`Page`]s at
+/// hard page breaks (`w:br w:type="page"`, `w:pPr/w:pageBreakBefore`, an
+/// intermediate `w:pPr/w:sectPr`). The model represents a forced page break as a
+/// section with several `Page`s, so each break opens a fresh page here; the
+/// rasteriser then starts a new physical page per [`Page`]. There is always at
+/// least one (possibly empty) open page.
+#[derive(Default)]
+struct DocxPages {
+    pages: Vec<Vec<Block>>,
+}
+
+impl DocxPages {
+    fn new() -> Self {
+        DocxPages {
+            pages: vec![Vec::new()],
+        }
+    }
+
+    /// Blocks of the page currently being filled.
+    fn cur(&mut self) -> &mut Vec<Block> {
+        // Invariant: `pages` is never empty (seeded by `new`, restored by `break_page`).
+        self.pages.last_mut().expect("at least one open page")
+    }
+
+    /// Start a new page boundary — but only if the current page already has
+    /// content, so a leading break (or two consecutive breaks) can't inject a
+    /// spurious blank page.
+    fn break_page(&mut self) {
+        if !self.cur().is_empty() {
+            self.pages.push(Vec::new());
+        }
+    }
+
+    /// Finalise into model [`Page`]s, dropping a trailing empty page left by a
+    /// break at the very end of the body.
+    fn finish(mut self) -> Vec<model::Page> {
+        if self.pages.len() > 1 {
+            if let Some(last) = self.pages.last() {
+                if last.is_empty() {
+                    self.pages.pop();
+                }
+            }
+        }
+        self.pages
+            .into_iter()
+            .map(|blocks| model::Page {
+                blocks,
+                absolute: false,
+            })
+            .collect()
+    }
+}
+
 /// Recursive DOCX model walker (mirrors [`docx_walk`]). Emits `w:p`→paragraph/
-/// heading/list-item blocks and `w:tbl`→[`Table`] blocks into `out`.
+/// heading/list-item blocks and `w:tbl`→[`Table`] blocks into `pages`, opening a
+/// new page at each hard page break a paragraph signals.
 fn docx_walk_model(
     x: &mut Xml,
     ctx: &DocxCtx,
-    out: &mut Vec<Block>,
+    pages: &mut DocxPages,
     counters: &mut ListCounters,
     resources: &mut BTreeMap<u64, model::ImageResource>,
     stop: Option<&str>,
@@ -693,10 +771,10 @@ fn docx_walk_model(
             Tok::Open(name, _, sc) => {
                 let ln = local(&name);
                 if ln == "p" && !sc {
-                    docx_paragraph_model(x, ctx, out, counters, resources);
+                    docx_paragraph_model(x, ctx, pages, counters, resources);
                 } else if ln == "tbl" && !sc {
                     let table = docx_table_model(x, ctx, resources);
-                    out.push(Block {
+                    pages.cur().push(Block {
                         kind: BlockKind::Table(table),
                         ..Block::default()
                     });
@@ -751,7 +829,7 @@ fn para_style_model(para: &ParaStyle) -> ParagraphStyle {
 fn docx_paragraph_model(
     x: &mut Xml,
     ctx: &DocxCtx,
-    out: &mut Vec<Block>,
+    pages: &mut DocxPages,
     counters: &mut ListCounters,
     resources: &mut BTreeMap<u64, model::ImageResource>,
 ) {
@@ -764,6 +842,11 @@ fn docx_paragraph_model(
     let mut in_rpr = false;
     let mut in_ppr = false;
     let mut depth = 0i32;
+    // `w:pPr/w:pageBreakBefore` → this paragraph opens a fresh page.
+    let mut page_break_before = false;
+    // A run-level `<w:br w:type="page"/>` or an intermediate `w:pPr/w:sectPr` →
+    // a fresh page *after* this paragraph (mirrors the HTML render path).
+    let mut page_break_after = false;
     // Open `<w:hyperlink>`: runs pushed while set are collected here and wrapped
     // in an `Inline::Link` on the matching close (DOCX hyperlinks don't nest).
     let mut link: Option<DocxLink> = None;
@@ -774,6 +857,18 @@ fn docx_paragraph_model(
                 let ln = local(&name);
                 match ln {
                     "pPr" if !sc => in_ppr = true,
+                    "pageBreakBefore" if in_ppr => {
+                        // `w:val="0"`/`"false"` cancels an inherited page break.
+                        page_break_before =
+                            !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                    }
+                    "sectPr" if in_ppr => {
+                        // A section break carried on a paragraph (`w:pPr/w:sectPr`)
+                        // ends a section: the following content starts a new page.
+                        // The document's final `w:sectPr` is a direct `w:body`
+                        // child (not here), so this never adds a trailing page.
+                        page_break_after = true;
+                    }
                     "rPr" if !sc => in_rpr = true,
                     "pStyle" => {
                         if in_ppr {
@@ -879,6 +974,14 @@ fn docx_paragraph_model(
                         }
                     }
                     "tab" => push_run(active_inlines(&mut runs, &mut link), &run, " "),
+                    "br" if matches!(attr(&attrs, "type"), Some("page")) => {
+                        // An explicit run-level page break (`<w:br w:type="page"/>`):
+                        // end the current line, then split onto a new page after
+                        // this paragraph (the model splits at block boundaries, so
+                        // the break lands between paragraphs — same as the HTML path).
+                        active_inlines(&mut runs, &mut link).push(Inline::LineBreak);
+                        page_break_after = true;
+                    }
                     "br" | "cr" => active_inlines(&mut runs, &mut link).push(Inline::LineBreak),
                     // A hyperlink wraps its runs and points at a relationship
                     // (external URL via `r:id`) or an in-document `w:anchor`.
@@ -960,7 +1063,9 @@ fn docx_paragraph_model(
     // Fold the resolved named style's run defaults under each run lacking them.
     apply_named_run_defaults(&mut paragraph.runs, &resolved);
 
-    if let Some(level) = para.list_level {
+    // Build this paragraph's block (a one-item List for a numbered/bulleted
+    // paragraph, else a Heading or Paragraph).
+    let block = if let Some(level) = para.list_level {
         // A list paragraph: wrap as a one-item List so the marker/ordinal is
         // recorded (reusing the numbering resolution as in the HTML path).
         let (ordered, marker) = docx_list_marker(ctx, num_ref.num_id, level);
@@ -968,7 +1073,7 @@ fn docx_paragraph_model(
             // Advance the running counter so ordinals are stable across the list.
             let _ = counters.next(num_ref.num_id.unwrap_or(0), level);
         }
-        out.push(Block {
+        Block {
             kind: BlockKind::List(List {
                 ordered,
                 marker,
@@ -981,21 +1086,31 @@ fn docx_paragraph_model(
                 }],
             }),
             ..Block::default()
-        });
-        return;
-    }
-
-    let kind = match heading {
-        Some(level) => BlockKind::Heading(Heading {
-            level,
-            para: paragraph,
-        }),
-        None => BlockKind::Paragraph(paragraph),
+        }
+    } else {
+        let kind = match heading {
+            Some(level) => BlockKind::Heading(Heading {
+                level,
+                para: paragraph,
+            }),
+            None => BlockKind::Paragraph(paragraph),
+        };
+        Block {
+            kind,
+            ..Block::default()
+        }
     };
-    out.push(Block {
-        kind,
-        ..Block::default()
-    });
+
+    // A `w:pageBreakBefore` paragraph opens a new page *before* its content.
+    if page_break_before {
+        pages.break_page();
+    }
+    pages.cur().push(block);
+    // A run-level `<w:br w:type="page"/>` (or an intermediate `w:sectPr`) forces
+    // the next page *after* this paragraph.
+    if page_break_after {
+        pages.break_page();
+    }
 }
 
 /// An in-progress DOCX `<w:hyperlink>` while its runs are being collected: the
@@ -1313,7 +1428,9 @@ fn docx_cell_model(
     let mut span = CellSpan::default();
     let mut in_tcpr = false;
     let mut in_tcborders = false;
-    let mut blocks: Vec<Block> = Vec::new();
+    // A cell can't span pages, so any page break a paragraph signals collapses
+    // when these pages are flattened back into the cell's block list at the end.
+    let mut pages = DocxPages::new();
     let mut counters = ListCounters::default();
     // Cell background `w:tcPr/w:shd@w:fill` (6-hex), and the first `w:tcBorders`
     // edge that declares a real width (surfaced to seed the table-wide border).
@@ -1356,11 +1473,11 @@ fn docx_cell_model(
                         }
                     }
                     "p" if !sc => {
-                        docx_paragraph_model(x, ctx, &mut blocks, &mut counters, resources)
+                        docx_paragraph_model(x, ctx, &mut pages, &mut counters, resources)
                     }
                     "tbl" if !sc => {
                         let table = docx_table_model(x, ctx, resources);
-                        blocks.push(Block {
+                        pages.cur().push(Block {
                             kind: BlockKind::Table(table),
                             ..Block::default()
                         });
@@ -1385,6 +1502,9 @@ fn docx_cell_model(
     if span.v_merge_continue {
         return DocxCellOut { cell: None, border };
     }
+    // Collapse any intra-cell page breaks: concatenate the (degenerate) pages
+    // back into one block list — a table cell is a single flow.
+    let blocks: Vec<Block> = pages.finish().into_iter().flat_map(|p| p.blocks).collect();
     DocxCellOut {
         cell: Some(Cell {
             blocks,
@@ -6792,10 +6912,21 @@ fn roman(n: u32, upper: bool) -> String {
 }
 
 /// Resolved DOCX numbering: each `w:numId` maps to a per-level number format.
-/// Built from `word/numbering.xml`'s `w:num → w:abstractNumId → w:lvl@w:numFmt`.
+/// Built from `word/numbering.xml`'s `w:num → w:abstractNumId → w:lvl@w:numFmt`,
+/// with each `w:num`'s `w:lvlOverride/w:lvl/w:numFmt` applied on top of its
+/// abstract definition so a list-instance that re-formats a level resolves to
+/// the overriding format.
+///
+/// Only the per-level *format* is retained, because that is all the model's
+/// [`List`]/[`ListMarker`] can express. The level's `w:start` /
+/// `w:lvlOverride/w:startOverride` (restart-at-N) and `w:lvlText` (custom
+/// prefix template such as `%1)` or legal `%1.%2`) are **not** carried: the
+/// model derives ordinals positionally (no start field) and renders ordered
+/// markers with a fixed `.` suffix (no template field). See `docs/CONVERSIONS.md`.
 #[derive(Default)]
 struct DocxNumbering {
-    /// numId → (level → format). Levels are 0-based.
+    /// numId → (level → format). Levels are 0-based; `w:lvlOverride` formats are
+    /// already folded in.
     by_num: BTreeMap<u32, BTreeMap<u32, NumFmt>>,
 }
 
@@ -6807,19 +6938,27 @@ impl DocxNumbering {
 }
 
 /// Parse `word/numbering.xml`: collect `w:abstractNum` level formats, then map
-/// each `w:num@w:numId` to its `w:abstractNumId`. Returns numId → level → format.
+/// each `w:num@w:numId` to its `w:abstractNumId`, folding in any per-instance
+/// `w:lvlOverride/w:lvl/w:numFmt`. Returns numId → level → format.
 fn parse_docx_numbering(xml: &str) -> DocxNumbering {
     // abstractNumId → (level → format).
     let mut abstracts: BTreeMap<u32, BTreeMap<u32, NumFmt>> = BTreeMap::new();
     // numId → abstractNumId.
     let mut num_to_abstract: BTreeMap<u32, u32> = BTreeMap::new();
+    // numId → (level → overriding format) from `w:lvlOverride/w:lvl/w:numFmt`.
+    let mut num_overrides: BTreeMap<u32, BTreeMap<u32, NumFmt>> = BTreeMap::new();
 
     let mut x = Xml::new(xml);
     let mut cur_abstract: Option<u32> = None;
+    // Current `w:lvl@w:ilvl` while inside a `w:abstractNum` body.
     let mut cur_level: Option<u32> = None;
     // num mapping context.
     let mut cur_num: Option<u32> = None;
-    let mut in_num = false; // inside <w:num> (vs <w:abstractNum>)
+    // Inside a `<w:num>` body (vs a `<w:abstractNum>`).
+    let mut in_num = false;
+    // Current `w:lvlOverride@w:ilvl` while inside a `w:num` body (the level a
+    // nested `w:lvl/w:numFmt` overrides).
+    let mut cur_override_level: Option<u32> = None;
 
     while let Some(tok) = x.next() {
         if let Tok::Open(name, attrs, _) = tok {
@@ -6831,20 +6970,37 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
                         abstracts.entry(a).or_default();
                     }
                     in_num = false;
+                    cur_override_level = None;
                 }
-                "lvl" => {
+                // `w:ilvl` selects the level inside an abstract's `w:lvl`, or the
+                // overridden level inside a `w:num`'s `w:lvlOverride`.
+                "lvl" if !in_num => {
                     cur_level = attr(&attrs, "ilvl").and_then(|v| v.trim().parse::<u32>().ok());
                 }
+                // A `w:lvlOverride@w:ilvl` re-defines that level for this list
+                // instance only; a nested `w:lvl/w:numFmt` carries the new format
+                // (its own `w:ilvl` mirrors the override and is not re-read).
+                "lvlOverride" if in_num => {
+                    cur_override_level =
+                        attr(&attrs, "ilvl").and_then(|v| v.trim().parse::<u32>().ok());
+                }
                 "numFmt" => {
-                    if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
-                        if let Some(v) = attr(&attrs, "val") {
-                            abstracts.entry(a).or_default().insert(l, NumFmt::parse(v));
+                    if let Some(v) = attr(&attrs, "val") {
+                        let fmt = NumFmt::parse(v);
+                        if in_num {
+                            // Inside `w:lvlOverride/w:lvl`: a per-instance override.
+                            if let (Some(n), Some(l)) = (cur_num, cur_override_level) {
+                                num_overrides.entry(n).or_default().insert(l, fmt);
+                            }
+                        } else if let (Some(a), Some(l)) = (cur_abstract, cur_level) {
+                            abstracts.entry(a).or_default().insert(l, fmt);
                         }
                     }
                 }
                 "num" => {
                     in_num = true;
                     cur_num = attr(&attrs, "numId").and_then(|v| v.trim().parse::<u32>().ok());
+                    cur_override_level = None;
                 }
                 "abstractNumId" if in_num => {
                     if let (Some(n), Some(a)) = (
@@ -6859,11 +7015,17 @@ fn parse_docx_numbering(xml: &str) -> DocxNumbering {
         }
     }
 
-    let mut by_num = BTreeMap::new();
-    for (num_id, abstract_id) in num_to_abstract {
-        if let Some(levels) = abstracts.get(&abstract_id) {
-            by_num.insert(num_id, levels.clone());
+    let mut by_num: BTreeMap<u32, BTreeMap<u32, NumFmt>> = BTreeMap::new();
+    // Each `w:num` mapped to an abstract: its abstract's level formats.
+    for (num_id, abstract_id) in &num_to_abstract {
+        if let Some(levels) = abstracts.get(abstract_id) {
+            by_num.insert(*num_id, levels.clone());
         }
+    }
+    // Apply each `w:num`'s `w:lvlOverride` formats on top (also seeds entries for
+    // an override-only `w:num` whose abstract is absent — partial numbering.xml).
+    for (num_id, over) in num_overrides {
+        by_num.entry(num_id).or_default().extend(over);
     }
     DocxNumbering { by_num }
 }
@@ -14407,6 +14569,256 @@ mod tests {
             table.border.color,
             [0.0, 0.0, 1.0],
             "border blue from tcBorders"
+        );
+    }
+
+    // ── #39: DOCX hard page breaks + numbering (model path) ──
+
+    /// Concatenated plain text of all `Inline::Run`s on one model [`Page`]
+    /// (paragraphs, headings, and list-item paragraphs), for asserting which
+    /// page a paragraph lands on.
+    fn page_text(page: &model::Page) -> String {
+        fn para_text(p: &Paragraph, out: &mut String) {
+            for r in &p.runs {
+                if let Inline::Run(run) = r {
+                    out.push_str(&run.text);
+                }
+            }
+        }
+        let mut out = String::new();
+        for block in &page.blocks {
+            match &block.kind {
+                BlockKind::Paragraph(p) => para_text(p, &mut out),
+                BlockKind::Heading(h) => para_text(&h.para, &mut out),
+                BlockKind::List(l) => {
+                    for item in &l.items {
+                        for b in &item.blocks {
+                            if let BlockKind::Paragraph(p) = &b.kind {
+                                para_text(p, &mut out);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Every `(ordered, marker, level, text)` of the single-item `List` blocks
+    /// across all pages of the first section, in document order.
+    fn docx_model_list_paragraphs(doc: &Document) -> Vec<(bool, ListMarker, u8, String)> {
+        let mut out = Vec::new();
+        for page in &doc.sections[0].pages {
+            for block in &page.blocks {
+                if let BlockKind::List(l) = &block.kind {
+                    for item in &l.items {
+                        let mut text = String::new();
+                        for b in &item.blocks {
+                            if let BlockKind::Paragraph(p) = &b.kind {
+                                for r in &p.runs {
+                                    if let Inline::Run(run) = r {
+                                        text.push_str(&run.text);
+                                    }
+                                }
+                            }
+                        }
+                        out.push((l.ordered, l.marker, item.level, text));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn docx_model_run_page_break_splits_into_two_pages() {
+        // `<w:br w:type="page"/>` ends page one; the next paragraph lands on a
+        // fresh model `Page` (the model represents a hard break as several pages
+        // in one section).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>Page one</w:t></w:r><w:r><w:br w:type="page"/></w:r></w:p>
+            <w:p><w:r><w:t>Page two</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let pages = &model.sections[0].pages;
+        assert_eq!(pages.len(), 2, "hard page break → two model pages");
+        assert!(
+            page_text(&pages[0]).contains("Page one"),
+            "p0: {:?}",
+            page_text(&pages[0])
+        );
+        assert!(
+            page_text(&pages[1]).contains("Page two"),
+            "p1: {:?}",
+            page_text(&pages[1])
+        );
+        assert!(
+            !page_text(&pages[0]).contains("Page two"),
+            "second paragraph not on page one"
+        );
+    }
+
+    #[test]
+    fn docx_model_soft_break_stays_on_one_page() {
+        // A plain `<w:br/>` (no `w:type="page"`) is an in-paragraph line break:
+        // it stays an `Inline::LineBreak` and does NOT split pages.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>a</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>b</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        assert_eq!(
+            model.sections[0].pages.len(),
+            1,
+            "soft break keeps one page"
+        );
+        let inlines = model_first_section_inlines(&model);
+        assert!(
+            inlines.iter().any(|i| matches!(i, Inline::LineBreak)),
+            "soft break stays an Inline::LineBreak: {inlines:?}"
+        );
+    }
+
+    #[test]
+    fn docx_model_page_break_before_starts_new_page() {
+        // `w:pPr/w:pageBreakBefore` opens a new model page *before* the paragraph.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>Section A</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>Section B</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let pages = &model.sections[0].pages;
+        assert_eq!(pages.len(), 2, "pageBreakBefore → two model pages");
+        assert!(
+            page_text(&pages[0]).contains("Section A"),
+            "p0: {:?}",
+            page_text(&pages[0])
+        );
+        assert!(
+            page_text(&pages[1]).contains("Section B"),
+            "p1: {:?}",
+            page_text(&pages[1])
+        );
+    }
+
+    #[test]
+    fn docx_model_page_break_before_false_does_not_split() {
+        // `w:pageBreakBefore w:val="0"` cancels the break: one page.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+            <w:p><w:r><w:t>One</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pageBreakBefore w:val="0"/></w:pPr><w:r><w:t>Two</w:t></w:r></w:p>
+          </w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        assert_eq!(
+            model.sections[0].pages.len(),
+            1,
+            "w:val=\"0\" cancels the page break"
+        );
+    }
+
+    #[test]
+    fn docx_model_two_level_numbering_lowers_per_level_format() {
+        // numbering.xml: numId 5 → abstract 0; level 0 decimal ("%1."), level 1
+        // lowerLetter ("%2)"). The *format* lowers per level (each list paragraph
+        // is its own one-item List): level 0 → Decimal, level 1 → LowerAlpha.
+        // (The `%1.` / `%2)` lvlText templates and the per-level start are not
+        // carried — the model has no such slot; see docs/CONVERSIONS.md.)
+        let numbering = r#"<w:numbering xmlns:w="x">
+          <w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+            <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num>
+        </w:numbering>"#;
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr></w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="5"/></w:numPr></w:pPr><w:r><w:t>Sub a</w:t></w:r></w:p>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="5"/></w:numPr></w:pPr><w:r><w:t>Sub b</w:t></w:r></w:p>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="5"/></w:numPr></w:pPr><w:r><w:t>Two</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let bytes = build_docx(
+            doc,
+            None,
+            &[("word/numbering.xml", numbering.as_bytes().to_vec())],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let lists = docx_model_list_paragraphs(&model);
+        assert_eq!(lists.len(), 4, "four list paragraphs: {lists:?}");
+        // Level-0 paragraphs → ordered Decimal.
+        assert_eq!(lists[0], (true, ListMarker::Decimal, 0, "One".to_string()));
+        assert_eq!(lists[3], (true, ListMarker::Decimal, 0, "Two".to_string()));
+        // Level-1 paragraphs → ordered LowerAlpha at nesting level 1.
+        assert_eq!(
+            lists[1],
+            (true, ListMarker::LowerAlpha, 1, "Sub a".to_string())
+        );
+        assert_eq!(
+            lists[2],
+            (true, ListMarker::LowerAlpha, 1, "Sub b".to_string())
+        );
+    }
+
+    #[test]
+    fn docx_model_lvl_override_changes_level_format() {
+        // `w:num` 7 maps to abstract 0 (decimal at level 0) but carries a
+        // `w:lvlOverride w:ilvl="0"` whose nested `w:lvl/w:numFmt` re-defines the
+        // level as upperRoman, plus a `w:startOverride` (restart, not lowered).
+        // The instance's overriding *format* must win → UpperRoman marker.
+        let numbering = r#"<w:numbering xmlns:w="x">
+          <w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="7">
+            <w:abstractNumId w:val="0"/>
+            <w:lvlOverride w:ilvl="0">
+              <w:startOverride w:val="5"/>
+              <w:lvl w:ilvl="0"><w:start w:val="5"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1)"/></w:lvl>
+            </w:lvlOverride>
+          </w:num>
+        </w:numbering>"#;
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>Item</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let bytes = build_docx(
+            doc,
+            None,
+            &[("word/numbering.xml", numbering.as_bytes().to_vec())],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let lists = docx_model_list_paragraphs(&model);
+        assert_eq!(lists.len(), 1, "one list paragraph: {lists:?}");
+        assert_eq!(
+            lists[0],
+            (true, ListMarker::UpperRoman, 0, "Item".to_string()),
+            "w:lvlOverride numFmt (upperRoman) wins over the abstract's decimal"
+        );
+    }
+
+    #[test]
+    fn parse_numbering_folds_lvl_override_format() {
+        // Direct unit check of the parser: the resolved per-level format reflects
+        // the `w:lvlOverride` (lowerRoman), not the abstract's decimal.
+        let numbering = r#"<w:numbering xmlns:w="x">
+          <w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl>
+            <w:lvl w:ilvl="1"><w:numFmt w:val="lowerLetter"/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="3">
+            <w:abstractNumId w:val="0"/>
+            <w:lvlOverride w:ilvl="1"><w:lvl w:ilvl="1"><w:numFmt w:val="lowerRoman"/></w:lvl></w:lvlOverride>
+          </w:num>
+        </w:numbering>"#;
+        let n = parse_docx_numbering(numbering);
+        // Level 0 unchanged (decimal); level 1 overridden (lowerRoman).
+        assert_eq!(n.fmt(3, 0), Some(NumFmt::Decimal), "level 0 stays decimal");
+        assert_eq!(
+            n.fmt(3, 1),
+            Some(NumFmt::LowerRoman),
+            "level 1 overridden to lowerRoman"
         );
     }
 
