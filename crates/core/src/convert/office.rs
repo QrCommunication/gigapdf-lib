@@ -374,6 +374,146 @@ pub(super) fn dml_line(shape: &PlacedShape) -> String {
     }
 }
 
+// ───────────────────────── VML drawing helpers (Transitional) ─────────────────────────
+//
+// The DOCX exporter places floating text boxes and vector shapes as VML
+// (`w:pict` → `v:shape`/`v:rect`), NOT as the MS-2010 DrawingML
+// `wps:wsp` (wordprocessingShape) extension. Rationale: `wps:wsp` lives in a
+// Microsoft extension namespace that the ECMA-376 **Transitional** schema set
+// has NO schema for, so it sits inside `a:graphicData`'s `processContents=
+// "strict"` wildcard and is rejected ("No matching global element declaration").
+// Wrapping it in `mc:AlternateContent` does not help: MCE (ISO/IEC 29500-3) is a
+// separate layer that the Transitional XSDs likewise do not declare, so the
+// `mc:` elements are rejected by the very same strict wildcard. VML, by contrast,
+// is the Transitional-native floating-object mechanism: `w:pict` (`CT_Picture`)
+// admits the `urn:schemas-microsoft-com:vml` namespace through a
+// `processContents="lax"` wildcard, so the whole VML subtree is schema-valid and
+// every reader (Word, LibreOffice, Google Docs) lays it out correctly.
+
+/// VML coordinate scale: VML path coordinates are integers, so points are
+/// expressed in centipoints (×100) for sub-point precision.
+const VML_SCALE: f64 = 100.0;
+
+fn vml_i(v: f64) -> i64 {
+    (v * VML_SCALE).round() as i64
+}
+
+/// A VML `path`/`coordsize` for a shape's geometry, expressed in the shape's own
+/// centipoint coordinate space (origin at the shape's top-left). Mirrors
+/// [`dml_cust_geom`] but in VML's compact path syntax (`m`/`l`/`c`/`x`/`e`).
+fn vml_path(shape: &PlacedShape) -> String {
+    let mut d = String::new();
+    let px = |x: f64| vml_i(x - shape.x);
+    let py = |y: f64| vml_i(y - shape.y);
+    for seg in &shape.segments {
+        match *seg {
+            PathSeg::Move(x, y) => d.push_str(&format!("m{},{}", px(x), py(y))),
+            PathSeg::Line(x, y) => d.push_str(&format!("l{},{}", px(x), py(y))),
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => d.push_str(&format!(
+                "c{},{},{},{},{},{}",
+                px(x1),
+                py(y1),
+                px(x2),
+                py(y2),
+                px(x3),
+                py(y3)
+            )),
+            PathSeg::Close => d.push('x'),
+        }
+    }
+    d.push('e'); // VML path terminator
+    d
+}
+
+/// VML fill/stroke attributes + child elements for a shape's paint state, shared
+/// by [`docx_vml_shape`] and the rectangle path. Returns `(attrs, children)`.
+fn vml_paint(shape: &PlacedShape) -> (String, String) {
+    let mut attrs = String::new();
+    let mut children = String::new();
+    match shape.fill {
+        Some(rgb) => {
+            attrs.push_str(&format!(" fillcolor=\"#{}\"", shape_hex(rgb)));
+            if shape.fill_alpha < 1.0 {
+                children.push_str(&format!(
+                    "<v:fill type=\"solid\" opacity=\"{}\"/>",
+                    num(shape.fill_alpha.clamp(0.0, 1.0))
+                ));
+            }
+        }
+        None => attrs.push_str(" filled=\"f\""),
+    }
+    match shape.stroke {
+        Some(rgb) => {
+            attrs.push_str(&format!(
+                " stroked=\"t\" strokecolor=\"#{}\" strokeweight=\"{}pt\"",
+                shape_hex(rgb),
+                num(shape.stroke_width.max(0.0))
+            ));
+            if !shape.dash.is_empty() {
+                children.push_str("<v:stroke dashstyle=\"dash\"/>");
+            }
+        }
+        None => attrs.push_str(" stroked=\"f\""),
+    }
+    (attrs, children)
+}
+
+/// A floating, absolutely-positioned VML text box carrying one run of text — the
+/// Transitional-schema-valid replacement for the `wps:wsp` text box. Positioned
+/// in points relative to the page (the section uses zero margins).
+fn docx_vml_textbox(id: usize, x: f64, y: f64, w: f64, h: f64, rpr: &str, text: &str) -> String {
+    format!(
+        "<w:r><w:pict>\
+<v:shape id=\"obj{id}\" type=\"#_x0000_t202\" \
+style=\"position:absolute;left:{x}pt;top:{y}pt;width:{w}pt;height:{h}pt\" \
+filled=\"f\" stroked=\"f\">\
+<v:textbox inset=\"0,0,0,0\"><w:txbxContent>\
+<w:p><w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
+<w:r>{rpr}<w:t xml:space=\"preserve\">{text}</w:t></w:r></w:p>\
+</w:txbxContent></v:textbox></v:shape></w:pict></w:r>",
+        x = num(x),
+        y = num(y),
+        w = num(w.max(1.0)),
+        h = num(h.max(1.0)),
+    )
+}
+
+/// A VML vector shape (rectangle or custom path) with its real fill/stroke — the
+/// Transitional-schema-valid replacement for the `wps:wsp` shape. `pos` is the
+/// CSS-style position prefix (`"position:absolute;left:…;top:…;"` for a floating
+/// shape, or `""` for an inline-flow shape); the size is always appended.
+pub(super) fn docx_vml_shape(id: usize, shape: &PlacedShape, pos: &str) -> String {
+    let (paint_attrs, paint_children) = vml_paint(shape);
+    let style = format!(
+        "{pos}width:{w}pt;height:{h}pt",
+        w = num(shape.width.max(1.0)),
+        h = num(shape.height.max(1.0)),
+    );
+    if shape_is_rect(shape) {
+        format!(
+            "<w:r><w:pict>\
+<v:rect id=\"obj{id}\" style=\"{style}\"{paint_attrs}>{paint_children}</v:rect>\
+</w:pict></w:r>"
+        )
+    } else {
+        let cw = vml_i(shape.width.max(1.0)).max(1);
+        let ch = vml_i(shape.height.max(1.0)).max(1);
+        format!(
+            "<w:r><w:pict>\
+<v:shape id=\"obj{id}\" style=\"{style}\" coordsize=\"{cw},{ch}\" \
+path=\"{path}\"{paint_attrs}>{paint_children}</v:shape>\
+</w:pict></w:r>",
+            path = vml_path(shape),
+        )
+    }
+}
+
+/// The `position:absolute` style prefix placing a floating shape at `(x, y)` in
+/// points relative to the page.
+pub(super) fn vml_abs_pos(x: f64, y: f64) -> String {
+    format!("position:absolute;left:{}pt;top:{}pt;", num(x), num(y))
+}
+
 // ─────────────────────────────── ODT (ODF text) ───────────────────────────────
 
 /// Export pages to an OpenDocument Text (`.odt`) document.
@@ -850,20 +990,17 @@ fn docx_document_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage
             let half_pt = (t.height.max(1.0) * 2.0).round().max(1.0) as i64;
             let mut run_text = String::new();
             esc(&t.text, &mut run_text);
-            let inner = format!(
-                "<a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
-<wps:wsp xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
-<wps:cNvSpPr txBox=\"1\"/><wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/>\
-<a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:noFill/></wps:spPr>\
-<wps:txbx><w:txbxContent><w:p><w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
-<w:r>{rpr}<w:t xml:space=\"preserve\">{text}</w:t></w:r></w:p></w:txbxContent></wps:txbx>\
-<wps:bodyPr rot=\"0\" wrap=\"none\" lIns=\"0\" tIns=\"0\" rIns=\"0\" bIns=\"0\"><a:noAutofit/></wps:bodyPr></wps:wsp></a:graphicData>",
-                w = emu(t.width.max(1.0)),
-                h = emu(t.height.max(1.0)),
-                rpr = docx_run_props(&t.style, half_pt),
-                text = run_text,
-            );
-            para.push_str(&docx_anchor(id, t.x, t.y, t.width, t.height, &inner));
+            // A floating VML text box (Transitional-native; see the VML drawing
+            // helpers above for why this replaces the `wps:wsp` extension).
+            para.push_str(&docx_vml_textbox(
+                id,
+                t.x,
+                t.y,
+                t.width,
+                t.height,
+                &docx_run_props(&t.style, half_pt),
+                &run_text,
+            ));
             id += 1;
         }
         for img in &page.images {
@@ -888,24 +1025,9 @@ fn docx_document_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage
             id += 1;
         }
         for s in &page.shapes {
-            let geom = if shape_is_rect(s) {
-                "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>".to_string()
-            } else {
-                dml_cust_geom(s, s.width, s.height)
-            };
-            let sp_pr = format!(
-                "<wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>{geom}{fill}{ln}</wps:spPr>",
-                w = emu(s.width.max(1.0)),
-                h = emu(s.height.max(1.0)),
-                fill = dml_fill(s),
-                ln = dml_line(s),
-            );
-            let inner = format!(
-                "<a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
-<wps:wsp xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
-<wps:cNvSpPr/>{sp_pr}<wps:bodyPr/></wps:wsp></a:graphicData>"
-            );
-            para.push_str(&docx_anchor(id, s.x, s.y, s.width, s.height, &inner));
+            // A floating VML vector shape (Transitional-native; see the VML
+            // drawing helpers above for why this replaces the `wps:wsp` extension).
+            para.push_str(&docx_vml_shape(id, s, &vml_abs_pos(s.x, s.y)));
             id += 1;
         }
 
@@ -931,7 +1053,10 @@ fn docx_document_xml<'a>(pages: &'a [ConvPage], images: &mut Vec<&'a PlacedImage
 <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
 xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
-xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+xmlns:v=\"urn:schemas-microsoft-com:vml\" \
+xmlns:o=\"urn:schemas-microsoft-com:office:office\" \
+xmlns:w10=\"urn:schemas-microsoft-com:office:word\">\
 <w:body>{body}{final_sect}</w:body></w:document>"
     )
 }
@@ -1436,8 +1561,12 @@ fn xlsx_sheet_xml(grid: &[Vec<String>], has_drawing: bool) -> String {
             }
             let mut text = String::new();
             esc(value, &mut text);
+            // SpreadsheetML's inline-string <t> (CT_Rst, typed s:ST_Xstring) is a
+            // simpleType that allows NO attributes — unlike WordprocessingML's
+            // w:t / CT_Text. xml:space is therefore invalid here, and Excel
+            // preserves leading/trailing whitespace in inline strings WITHOUT it.
             cells.push_str(&format!(
-                "<c r=\"{col}{row}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{text}</t></is></c>",
+                "<c r=\"{col}{row}\" t=\"inlineStr\"><is><t>{text}</t></is></c>",
                 col = col_letter(c),
                 row = r + 1,
             ));
@@ -1558,6 +1687,49 @@ pub fn to_ods_with_shapes(
         esc(&sheet_name(names, s), &mut nm);
         body.push_str(&format!("<table:table table:name=\"{nm}\">"));
         let grid = grids.get(s).map(Vec::as_slice).unwrap_or(&[]);
+
+        // Floating shapes are sheet-level drawing objects. ODF's <table:table>
+        // content model places <table:shapes> BEFORE the columns and rows (ISO
+        // 26300 / OASIS), and draw:* are only valid wrapped in <table:shapes> —
+        // never as bare children of <table:table>. Build the shapes first.
+        let mut shapes_xml = String::new();
+        for shape in shapes_per_sheet.get(s).map(Vec::as_slice).unwrap_or(&[]) {
+            let style = format!("S{style_id}");
+            auto.push_str(&odf_shape_style(&style, shape));
+            let (x, y) = (num(shape.x), num(shape.y));
+            let (w, h) = (num(shape.width.max(1.0)), num(shape.height.max(1.0)));
+            if shape_is_rect(shape) {
+                shapes_xml.push_str(&format!(
+                    "<draw:rect draw:style-name=\"{style}\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>"
+                ));
+            } else {
+                // `svg:d` is absolute top-down points; the viewBox is offset by the
+                // box origin so those coordinates map straight onto the frame.
+                shapes_xml.push_str(&format!(
+                    "<draw:path draw:style-name=\"{style}\" \
+svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
+svg:viewBox=\"{vbx} {vby} {vbw} {vbh}\" svg:d=\"{d}\"/>",
+                    vbx = num(shape.x),
+                    vby = num(shape.y),
+                    vbw = num(shape.width.max(1.0)),
+                    vbh = num(shape.height.max(1.0)),
+                    d = odf_path_d(&shape.segments),
+                ));
+            }
+            style_id += 1;
+        }
+        if !shapes_xml.is_empty() {
+            body.push_str(&format!("<table:shapes>{shapes_xml}</table:shapes>"));
+        }
+
+        // ODF requires the column definitions (table:table-column*) BEFORE the
+        // rows (content model of <table:table>). Emit one <table:table-column>
+        // repeated for the widest row's column count.
+        let cols = grid.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        body.push_str(&format!(
+            "<table:table-column table:number-columns-repeated=\"{cols}\"/>"
+        ));
         if grid.is_empty() {
             body.push_str("<table:table-row><table:table-cell/></table:table-row>");
         }
@@ -1575,34 +1747,6 @@ pub fn to_ods_with_shapes(
                 }
             }
             body.push_str("</table:table-row>");
-        }
-        // Floating shapes are sheet-level drawing objects: emitted after the rows
-        // but still inside the `table:table` (ODF §9.2.5 allows `draw:*` there).
-        for shape in shapes_per_sheet.get(s).map(Vec::as_slice).unwrap_or(&[]) {
-            let style = format!("S{style_id}");
-            auto.push_str(&odf_shape_style(&style, shape));
-            let (x, y) = (num(shape.x), num(shape.y));
-            let (w, h) = (num(shape.width.max(1.0)), num(shape.height.max(1.0)));
-            if shape_is_rect(shape) {
-                body.push_str(&format!(
-                    "<draw:rect draw:style-name=\"{style}\" \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\"/>"
-                ));
-            } else {
-                // `svg:d` is absolute top-down points; the viewBox is offset by the
-                // box origin so those coordinates map straight onto the frame.
-                body.push_str(&format!(
-                    "<draw:path draw:style-name=\"{style}\" \
-svg:x=\"{x}pt\" svg:y=\"{y}pt\" svg:width=\"{w}pt\" svg:height=\"{h}pt\" \
-svg:viewBox=\"{vbx} {vby} {vbw} {vbh}\" svg:d=\"{d}\"/>",
-                    vbx = num(shape.x),
-                    vby = num(shape.y),
-                    vbw = num(shape.width.max(1.0)),
-                    vbh = num(shape.height.max(1.0)),
-                    d = odf_path_d(&shape.segments),
-                ));
-            }
-            style_id += 1;
         }
         body.push_str("</table:table>");
     }
@@ -1940,7 +2084,23 @@ mod tests {
     fn docx_has_real_text_box_and_section() {
         let zip = to_docx(&sample_pages());
         let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
-        assert!(doc.contains("wps:txbx"), "text is a real Word text box");
+        // The text box is a Transitional-native VML text box (`w:pict` →
+        // `v:shape`/`v:textbox`), NOT the MS-2010 `wps:wsp` DrawingML extension
+        // (which the ECMA-376 Transitional schema rejects).
+        assert!(
+            doc.contains("<w:pict>") && doc.contains("<v:textbox "),
+            "text is a real VML text box"
+        );
+        assert!(!doc.contains("wps:wsp"), "no MS-2010 wps extension");
+        assert!(
+            !doc.contains("mc:AlternateContent"),
+            "no MCE (unschema'd here)"
+        );
+        // The VML namespace must be declared on the document root.
+        assert!(
+            doc.contains("xmlns:v=\"urn:schemas-microsoft-com:vml\""),
+            "VML namespace declared"
+        );
         assert!(
             doc.contains("Hello &lt;World&gt; &amp; co"),
             "escaped run text present"
@@ -1997,6 +2157,13 @@ mod tests {
         assert!(s1.contains("t=\"inlineStr\""), "cells carry text inline");
         assert!(s1.contains("<c r=\"B2\""), "B2 addressed");
         assert!(s1.contains("Alice &amp; Bob"), "escaped cell text");
+        // SpreadsheetML's <t> (CT_Rst, ST_Xstring) allows NO attributes — unlike
+        // WordprocessingML's w:t — so the inline string must NOT carry xml:space.
+        assert!(s1.contains("<is><t>"), "inline string uses a bare <t>");
+        assert!(
+            !s1.contains("xml:space"),
+            "SpreadsheetML <t> carries no xml:space: {s1}"
+        );
         let wb = String::from_utf8(entry(&zip, "xl/workbook.xml").unwrap()).unwrap();
         assert_eq!(wb.matches("<sheet ").count(), 2, "one sheet per page");
         assert!(entry(&zip, "xl/worksheets/sheet2.xml").is_some());
@@ -2098,6 +2265,15 @@ mod tests {
         let content = String::from_utf8(entry(&zip, "content.xml").unwrap()).unwrap();
         assert!(content.contains("table:table table:name=\"Page 1\""));
         assert!(content.contains("office:value-type=\"string\"><text:p>1</text:p>"));
+        // ODF requires <table:table-column> BEFORE any <table:table-row>; the grid
+        // has two columns so a single column def repeated twice precedes the rows.
+        assert!(
+            content.contains("<table:table-column table:number-columns-repeated=\"2\"/>"),
+            "column def emitted for the 2-column grid: {content}"
+        );
+        let col = content.find("<table:table-column").expect("a column def");
+        let row = content.find("<table:table-row").expect("a row");
+        assert!(col < row, "column definitions precede the rows");
     }
 
     #[test]
@@ -2405,35 +2581,34 @@ mod tests {
     }
 
     #[test]
-    fn docx_rect_shape_uses_prstgeom_with_colours() {
+    fn docx_rect_shape_uses_vml_rect_with_colours() {
+        // The DOCX exporter emits floating shapes as Transitional-native VML
+        // (`v:rect`), NOT the `wps:wsp` DrawingML extension (which is unschema'd
+        // in ECMA-376 Transitional). Colours land on VML fill/stroke attributes.
         let zip = to_docx(&rect_shape_pages());
         let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
+        assert!(doc.contains("<v:rect "), "rect → VML v:rect");
+        assert!(!doc.contains("wps:wsp"), "no MS-2010 wps extension");
+        assert!(doc.contains("fillcolor=\"#FF0000\""), "red fill");
         assert!(
-            doc.contains("<a:prstGeom prst=\"rect\">"),
-            "rect preset geom"
-        );
-        assert!(
-            doc.contains("<a:solidFill><a:srgbClr val=\"FF0000\">"),
-            "red fill"
-        );
-        assert!(
-            doc.contains("<a:srgbClr val=\"0000FF\">"),
+            doc.contains("strokecolor=\"#0000FF\""),
             "blue stroke colour"
         );
         assert!(!doc.contains("808080"), "no hardcoded grey");
     }
 
     #[test]
-    fn docx_non_rect_shape_emits_custom_geometry() {
+    fn docx_non_rect_shape_emits_vml_custom_path() {
         let zip = to_docx(&path_shape_pages());
         let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
-        assert!(doc.contains("<a:custGeom>"), "non-rect → custGeom");
-        assert!(doc.contains("<a:cubicBezTo>"), "cubic segment emitted");
-        assert!(doc.contains("<a:moveTo>") && doc.contains("<a:lnTo>"));
+        assert!(doc.contains("<v:shape "), "non-rect → VML v:shape");
+        assert!(!doc.contains("wps:wsp"), "no MS-2010 wps extension");
+        assert!(doc.contains("path=\"m"), "VML path with a moveto");
         assert!(
-            doc.contains("<a:srgbClr val=\"FF0000\">"),
-            "fill colour carried"
+            doc.contains('c') && doc.contains("path="),
+            "cubic segment emitted in the VML path"
         );
+        assert!(doc.contains("fillcolor=\"#FF0000\""), "fill colour carried");
     }
 
     #[test]
@@ -2556,15 +2731,16 @@ mod tests {
     }
 
     #[test]
-    fn docx_dashed_shape_uses_custom_dash() {
+    fn docx_dashed_shape_uses_vml_stroke_dash() {
         let zip = to_docx(&dashed_shape_pages());
         let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
-        // dash [6,3] at width 4 → on=150000, off=75000.
-        assert!(doc.contains("<a:custDash>"), "DOCX exact dash");
+        // A dashed VML shape carries <v:stroke dashstyle="dash"/> (DrawingML
+        // custDash belongs to the PPTX/ODF paths, not VML).
         assert!(
-            doc.contains("<a:ds d=\"150000\" sp=\"75000\"/>"),
-            "DOCX dash stops scaled: {doc}"
+            doc.contains("<v:stroke dashstyle=\"dash\"/>"),
+            "DOCX dashed VML stroke: {doc}"
         );
+        assert!(!doc.contains("wps:wsp"), "no MS-2010 wps extension");
     }
 
     #[test]
@@ -2776,6 +2952,15 @@ mod tests {
             "non-rect shape → draw:path"
         );
         assert!(content.contains("svg:d=\""), "path data present");
+        // ODF only allows draw:* inside a <table:shapes> wrapper, which the
+        // content model places BEFORE the columns and rows of <table:table>.
+        assert!(
+            content.contains("<table:shapes>"),
+            "shapes wrapped in table:shapes"
+        );
+        let shapes_at = content.find("<table:shapes>").expect("table:shapes");
+        let rows_at = content.find("<table:table-row").expect("a row");
+        assert!(shapes_at < rows_at, "table:shapes precedes the rows");
         assert!(
             content.contains("draw:fill=\"solid\" draw:fill-color=\"#FF0000\""),
             "red fill carried: {content}"
@@ -3030,31 +3215,36 @@ mod tests {
     }
 
     #[test]
-    fn docx_anchors_two_boxes_and_a_rect_at_exact_emu() {
+    fn docx_positions_two_vml_boxes_and_a_rect_at_exact_points() {
         let zip = to_docx(&two_boxes_and_rect_page());
         let doc = String::from_utf8(entry(&zip, "word/document.xml").unwrap()).unwrap();
         assert!(xml_is_balanced(&doc), "document XML is well-formed");
 
-        // Word anchors carry the page-relative offset in EMU on posOffset.
+        // Floating VML objects are placed via a CSS-style absolute position in
+        // points relative to the page (left/top), NOT a DrawingML EMU anchor.
+        assert!(!doc.contains("wps:wsp"), "no MS-2010 wps extension");
+        // Box A at (72pt, 100pt).
         assert!(
-            doc.contains("<wp:posOffset>914400</wp:posOffset>")
-                && doc.contains("<wp:posOffset>1270000</wp:posOffset>"),
-            "Box A anchored at exact EMU (72pt,100pt): {doc}"
+            doc.contains("position:absolute;left:72pt;top:100pt;"),
+            "Box A positioned at exact points: {doc}"
+        );
+        // Box B at (300pt, 400pt).
+        assert!(
+            doc.contains("position:absolute;left:300pt;top:400pt;"),
+            "Box B positioned at exact points"
+        );
+        // Both runs are real, editable text-box content (not images).
+        assert!(
+            doc.contains("Box A") && doc.contains("Box B") && doc.contains("<v:textbox "),
+            "both runs present as VML text boxes"
+        );
+        // The framed rectangle at (130pt, 560pt) with its colours.
+        assert!(
+            doc.contains("position:absolute;left:130pt;top:560pt;") && doc.contains("<v:rect "),
+            "rectangle positioned at exact points"
         );
         assert!(
-            doc.contains("<wp:posOffset>3810000</wp:posOffset>")
-                && doc.contains("<wp:posOffset>5080000</wp:posOffset>"),
-            "Box B anchored at exact EMU (300pt,400pt)"
-        );
-        // The framed rectangle anchored at (130,560) pt with its colours.
-        assert!(
-            doc.contains("<wp:posOffset>1651000</wp:posOffset>")
-                && doc.contains("<wp:posOffset>7112000</wp:posOffset>"),
-            "rectangle anchored at exact EMU (130pt,560pt)"
-        );
-        assert!(
-            doc.contains("<a:srgbClr val=\"FF0000\">")
-                && doc.contains("<a:srgbClr val=\"0000FF\">"),
+            doc.contains("fillcolor=\"#FF0000\"") && doc.contains("strokecolor=\"#0000FF\""),
             "rectangle keeps red fill + blue stroke"
         );
     }

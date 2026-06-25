@@ -16,8 +16,8 @@
 use crate::content::num;
 use crate::content::vector::PathSeg;
 use crate::convert::office::{
-    col_letter, dml_cust_geom, dml_fill, dml_line, emu, esc, odf_path_d, odf_shape_style,
-    shape_is_rect, twips,
+    col_letter, dml_cust_geom, dml_fill, dml_line, docx_vml_shape, emu, esc, odf_path_d,
+    odf_shape_style, shape_is_rect, twips,
 };
 use crate::convert::zip::ZipWriter;
 use crate::convert::PlacedShape;
@@ -475,7 +475,10 @@ fn docx_body(doc: &Document, ctx: &mut DocxCtx) -> String {
 <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
 xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
 xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
-xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+xmlns:v=\"urn:schemas-microsoft-com:vml\" \
+xmlns:o=\"urn:schemas-microsoft-com:office:office\" \
+xmlns:w10=\"urn:schemas-microsoft-com:office:word\">\
 <w:body>{blocks}{sect}</w:body></w:document>"
     )
 }
@@ -943,30 +946,10 @@ fn docx_inline_image(img: &ImageRef, ctx: &mut DocxCtx) -> String {
 fn docx_shape_para(shape: &Shape, ctx: &mut DocxCtx) -> String {
     let placed = shape_to_placed(shape);
     let id = ctx.next_obj();
-    let geom = if shape_is_rect(&placed) {
-        "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>".to_string()
-    } else {
-        dml_cust_geom(&placed, placed.width, placed.height)
-    };
-    let sp_pr = format!(
-        "<wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>{geom}{fill}{ln}</wps:spPr>",
-        w = emu(placed.width.max(1.0)),
-        h = emu(placed.height.max(1.0)),
-        fill = dml_fill(&placed),
-        ln = dml_line(&placed),
-    );
-    format!(
-        "<w:p><w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">\
-<wp:extent cx=\"{w}\" cy=\"{h}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
-<wp:docPr id=\"{id}\" name=\"shape{id}\"/><wp:cNvGraphicFramePr/>\
-<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
-<a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
-<wps:wsp xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">\
-<wps:cNvSpPr/>{sp_pr}<wps:bodyPr/></wps:wsp></a:graphicData></a:graphic>\
-</wp:inline></w:drawing></w:r></w:p>",
-        w = emu(placed.width.max(1.0)),
-        h = emu(placed.height.max(1.0)),
-    )
+    // An inline-flow VML shape (Transitional-native; the `wps:wsp` DrawingML
+    // extension has no schema in the ECMA-376 Transitional set and is rejected
+    // by `a:graphicData`'s strict wildcard — see docx_vml_shape in office.rs).
+    format!("<w:p>{}</w:p>", docx_vml_shape(id, &placed, ""))
 }
 
 fn docx_hdrftr_xml(tag: &str, inner: &str) -> String {

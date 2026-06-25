@@ -1,37 +1,20 @@
 {
   "_comment": [
-    "Known, PRE-EXISTING schema violations the strong gate tolerates (xfail) so a",
-    "main-branch fix for issue #19 (the validation GATE) does not redden CI on",
-    "exporter bugs that belong to a separate follow-up. Each entry waives EXACTLY",
-    "one part+signature: a NEW violation (other part, other signature) still fails.",
-    "When the exporter is fixed, validate.py reports the entry as 'periphery'/stale",
-    "(non-fatal) so the entry can be removed. Discovered 2026-06-25 by wiring the",
-    "ECMA-376 XSD / OASIS RelaxNG validation against the engine's own fixtures.",
-    "These are exporter output bugs to fix under a follow-up to #2 (Office export",
-    "fidelity); #19 only owns the validation gate, not the exporter fixes."
-  ],
-  "sample.docx": [
-    {
-      "part": "word/document.xml",
-      "signature": "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}wsp': No matching global element declaration",
-      "issue": "followup-office-export",
-      "note": "DOCX export emits a raw MS-2010 'wps:wsp' (wordprocessingShape) extension element directly inside a:graphicData, NOT wrapped in mc:AlternateContent / mc:Choice+mc:Fallback. Word reads it, but it is not ECMA-376 Transitional schema-valid nor MCE-guarded. Fix: wrap the wps drawing in mc:AlternateContent with a strict-schema mc:Fallback (e.g. a picture/wp:inline), or drop the wps extension. Exporter: crates/core/src/convert/office.rs / export_model.rs."
-    }
-  ],
-  "sample.xlsx": [
-    {
-      "part": "xl/worksheets/sheet1.xml",
-      "signature": "attribute '{http://www.w3.org/XML/1998/namespace}space': The attribute '{http://www.w3.org/XML/1998/namespace}space' is not allowed",
-      "issue": "followup-office-export",
-      "note": "XLSX inline strings emit <is><t xml:space=\"preserve\">. In SpreadsheetML the t element (CT_Rst) is typed s:ST_Xstring, a simpleType with NO attributes, so xml:space is invalid on Excel's <t> (unlike Word's w:t / CT_Text). Excel preserves whitespace in inline/shared strings WITHOUT xml:space. Fix: stop emitting xml:space on SpreadsheetML <t>. Exporter: crates/core/src/convert/office.rs (XLSX inlineStr path)."
-    }
-  ],
-  "sample.ods": [
-    {
-      "part": "content.xml",
-      "signature": "Expecting element table-column-group, got table-row",
-      "issue": "followup-office-export",
-      "note": "ODS export writes <table:table-row> directly under <table:table> with NO preceding <table:table-column>. ODF requires the content model (table-column-group* , table-column*) BEFORE (table-row*). LibreOffice repairs it, but it is not ISO 26300 / OASIS RelaxNG valid. Fix: emit one <table:table-column table:number-columns-repeated=\"N\"/> (N = column count) before the rows. Exporter: crates/core/src/convert/office.rs (ODS table)."
-    }
+    "Baseline of KNOWN, PRE-EXISTING schema violations the strong gate tolerates",
+    "(xfail) so a main-branch fix to the validation GATE (issue #19) never reddens",
+    "CI on an exporter bug tracked separately. Each entry waives EXACTLY one",
+    "part+signature: a NEW violation (other part, other signature) still fails;",
+    "once the exporter is fixed, validate.py reports the entry as stale (non-fatal)",
+    "so it can be removed and the part is then validated genuinely.",
+    "",
+    "The three original entries (DOCX raw wps:wsp text box/shape, XLSX inline <t>",
+    "xml:space, ODS table-row before table-column) were FIXED in the Office",
+    "exporter (2026-06-25, #19 follow-up): the DOCX exporter now emits",
+    "Transitional-native VML (w:pict / v:shape — wps:wsp and mc:AlternateContent",
+    "are both unschema'd in the ECMA-376 Transitional set and rejected by",
+    "a:graphicData's strict wildcard), the XLSX inline string emits a bare <t>",
+    "(CT_Rst/ST_Xstring allows no attributes), and the ODS table emits",
+    "<table:table-column> before its rows. All three parts now validate against",
+    "the official ECMA-376 XSD / OASIS RelaxNG schemas, so no waiver remains."
   ]
 }
