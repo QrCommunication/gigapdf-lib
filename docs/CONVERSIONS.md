@@ -39,8 +39,8 @@ PDF → X:  PDF ──► model ──► file  (pdf.toDocx() etc. — reconstru
 | **DOC / XLS / PPT** (legacy OLE2) | **Text only** | flat plain text (largest stream, UTF‑16/ASCII) | **everything else** — styling, tables, sheets, slides, images, structure. A real binary reader is needed (tracked) |
 | **Markdown** | Good | ATX headings, bold/italic/code, links, ordered/unordered nested lists, GFM tables, fenced code, blockquotes, HR | strikethrough `~~`, images `![]()`, task-lists, reference/footnote links, setext headings, inline HTML (pass through as text) |
 | **CSV** | Full | quoting/escaping (RFC 4180), embedded delimiters/newlines, BOM, delimiter auto-detect, ragged rows padded | type inference (all cells are text), multi-sheet (CSV has none) |
-| **RTF → PDF** | Rich | full char/para formatting, fonts, colours, tables, PNG/JPEG pictures | hyperlinks, WMF/EMF/BMP pictures, nested tables |
-| **RTF → model** | **Text only** | plain paragraphs (uses the text parser, not the rich one — tracked) | all styling/tables/images/links |
+| **RTF → PDF** | Rich | full char/para formatting, fonts, colours, tables, PNG/JPEG pictures, `\field` hyperlinks (`HYPERLINK "url"` → `<a href>`) | WMF/EMF/BMP pictures, nested tables |
+| **RTF → model** | Rich | run-level char styling (bold/italic/underline/strike, `\cf` colour, `\fs` size, `\f` font family + serif/sans/mono generic, super/sub), paragraph alignment/indents, tables (`\trowd`/`\cell`/`\row` → `BlockKind::Table`), PNG/JPEG `\pict` images (**bytes interned** into `Document.resources.images`), `\field` hyperlinks (`HYPERLINK "url"` → `Inline::Link`) — routed through the **same rich parser** as RTF→PDF (no text-only fallback) | WMF/EMF/BMP & `\bin` pictures (no decoder), nested tables, list ordering/nesting (lowered as plain paragraphs) |
 | **HTML** | — | see [HTML-CSS.md](HTML-CSS.md) for the full HTML/CSS feature surface | — |
 
 > **Flat (single-file) ODF** — `.fodt` / `.fods` / `.fodp` / `.fodg` are also

@@ -59,6 +59,10 @@ enum Align {
 struct Run {
     text: String,
     style: CharState,
+    /// Hyperlink target if this run is the (visible) result of a
+    /// `{\field{\*\fldinst{HYPERLINK "url"}}{\fldrslt …}}`. `None` for ordinary
+    /// runs. Consecutive runs sharing the same `Some(url)` form one link.
+    link: Option<String>,
 }
 
 /// A recovered paragraph: alignment + indents + its styled runs.
@@ -141,6 +145,8 @@ struct Group {
     chr: CharState,
     /// Destination this group is skipped as (text discarded), e.g. `\fonttbl`.
     skip: bool,
+    /// Active hyperlink target, restored when the `\fldrslt` group closes.
+    link: Option<String>,
 }
 
 struct Parser<'a> {
@@ -172,6 +178,21 @@ struct Parser<'a> {
     in_row: bool,
     row_cells: Vec<Vec<Para>>,
     cell_paras: Vec<Para>,
+
+    // Hyperlink (`\field`) assembly.
+    /// While inside a `\fldinst` instruction, decoded text is collected here so
+    /// we can extract the `HYPERLINK "url"` target (instead of dropping it like
+    /// an ordinary ignorable destination). `Some` iff capture is active.
+    fldinst_capture: Option<String>,
+    /// Open-group depth ([`Self::stack`] length) at which the active `\fldinst`
+    /// capture began; capture ends — and the URL is mined — once a `}` brings
+    /// the stack back below it. Survives inner `{…}` groups in the instruction.
+    fldinst_depth: Option<usize>,
+    /// The URL of the hyperlink whose `\fldrslt` result is currently being
+    /// emitted, tagged onto every run produced inside it.
+    cur_link: Option<String>,
+    /// URL mined from a just-closed `\fldinst`, awaiting its sibling `\fldrslt`.
+    pending_link: Option<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -193,12 +214,22 @@ impl<'a> Parser<'a> {
             in_row: false,
             row_cells: Vec::new(),
             cell_paras: Vec::new(),
+            fldinst_capture: None,
+            fldinst_depth: None,
+            cur_link: None,
+            pending_link: None,
         }
     }
 
     /// Append a decoded character to the active run (creating/extending one with
     /// the current style), unless the current group is a skipped destination.
     fn push_char(&mut self, ch: char) {
+        // Inside a `\fldinst` instruction, collect text to mine the hyperlink
+        // target rather than emitting it as visible body content.
+        if let Some(buf) = self.fldinst_capture.as_mut() {
+            buf.push(ch);
+            return;
+        }
         if self.skip {
             return;
         }
@@ -209,10 +240,11 @@ impl<'a> Parser<'a> {
             self.cur_started = true;
         }
         match self.cur.runs.last_mut() {
-            Some(r) if r.style == self.chr => r.text.push(ch),
+            Some(r) if r.style == self.chr && r.link == self.cur_link => r.text.push(ch),
             _ => self.cur.runs.push(Run {
                 text: ch.to_string(),
                 style: self.chr.clone(),
+                link: self.cur_link.clone(),
             }),
         }
     }
@@ -284,13 +316,29 @@ impl<'a> Parser<'a> {
                     self.stack.push(Group {
                         chr: self.chr.clone(),
                         skip: self.skip,
+                        link: self.cur_link.clone(),
                     });
                     self.i += 1;
                 }
                 b'}' => {
                     if let Some(g) = self.stack.pop() {
+                        // Leaving the group that opened a `\fldinst` capture
+                        // (back below its start depth): mine the collected text
+                        // for the `HYPERLINK "url"` target, then end capture.
+                        if let Some(depth) = self.fldinst_depth {
+                            if self.stack.len() < depth {
+                                if let Some(url) =
+                                    extract_hyperlink(self.fldinst_capture.as_deref())
+                                {
+                                    self.pending_link = Some(url);
+                                }
+                                self.fldinst_capture = None;
+                                self.fldinst_depth = None;
+                            }
+                        }
                         self.chr = g.chr;
                         self.skip = g.skip;
+                        self.cur_link = g.link;
                     }
                     self.i += 1;
                 }
@@ -518,10 +566,28 @@ impl<'a> Parser<'a> {
                 self.skip = true;
                 self.read_pict();
             }
-            "stylesheet" | "info" | "object" | "header" | "footer" | "footnote"
-            | "annotation" | "fldinst" | "xmlns" | "themedata" | "colorschememapping"
-            | "datastore" | "latentstyles" | "listtable" | "listoverridetable" | "generator"
-            | "revtbl" | "rsidtbl" => {
+            // ── hyperlinks (`\field`) ──
+            "field" => {} // container; its \fldinst / \fldrslt sub-groups carry the data
+            "fldinst" => {
+                // Capture the instruction text (e.g. `HYPERLINK "https://…"`)
+                // instead of dropping it, so the target can be recovered. The
+                // capture buffer suppresses it from visible body output, and
+                // accumulates across any inner `{…}` groups until the group that
+                // holds `\fldinst` closes.
+                self.fldinst_capture.get_or_insert_with(String::new);
+                self.fldinst_depth.get_or_insert(self.stack.len());
+            }
+            "fldrslt" => {
+                // The visible result of the field: tag its runs with the URL
+                // mined from the preceding `\fldinst`.
+                if let Some(url) = self.pending_link.take() {
+                    self.cur_link = Some(url);
+                }
+            }
+
+            "stylesheet" | "info" | "object" | "header" | "footer" | "footnote" | "annotation"
+            | "xmlns" | "themedata" | "colorschememapping" | "datastore" | "latentstyles"
+            | "listtable" | "listoverridetable" | "generator" | "revtbl" | "rsidtbl" => {
                 self.skip = true;
             }
 
@@ -832,6 +898,40 @@ impl<'a> Parser<'a> {
             .get(idx)
             .map(|[r, g, b]| format!("#{r:02x}{g:02x}{b:02x}"))
     }
+
+    /// Resolve a `\cf` index to normalized RGB (`0.0..=1.0`) for the model
+    /// [`CharStyle`](crate::model::CharStyle). Index 0 is "auto" → `None`.
+    fn color_rgb(&self, idx: usize) -> Option<[f64; 3]> {
+        if idx == 0 {
+            return None;
+        }
+        self.colors
+            .get(idx)
+            .map(|[r, g, b]| [*r as f64 / 255.0, *g as f64 / 255.0, *b as f64 / 255.0])
+    }
+}
+
+/// Mine a `\fldinst` instruction string for a `HYPERLINK "target"` field and
+/// return the target URL. Word/RTF emit the canonical quoted form
+/// (`HYPERLINK "https://example.com"`); the unquoted form is treated as having
+/// no recoverable target (returns `None`). Switches such as `\l` (bookmark) are
+/// ignored — only the first quoted argument is taken.
+fn extract_hyperlink(instr: Option<&str>) -> Option<String> {
+    let instr = instr?;
+    // Find the HYPERLINK keyword (case-insensitive), then the first
+    // double-quoted argument that follows it.
+    let upper = instr.to_ascii_uppercase();
+    let kw = upper.find("HYPERLINK")?;
+    let rest = &instr[kw + "HYPERLINK".len()..];
+    let open = rest.find('"')?;
+    let after = &rest[open + 1..];
+    let close = after.find('"')?;
+    let url = after[..close].trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    }
 }
 
 // ──────────────────────────── HTML serialization ───────────────────────────
@@ -958,6 +1058,13 @@ fn para_html(p: &Parser, para: &Para, out: &mut String) {
         if run.text.is_empty() {
             continue;
         }
+        // A hyperlink run is wrapped in an `<a href>` so the link survives into
+        // HTML (and, via `html_to_model`, into the model as an `Inline::Link`).
+        if let Some(url) = &run.link {
+            out.push_str("<a href=\"");
+            esc_attr(url, out);
+            out.push_str("\">");
+        }
         let css = run_style(p, &run.style);
         if css.is_empty() {
             esc_html(&run.text, out);
@@ -966,8 +1073,24 @@ fn para_html(p: &Parser, para: &Para, out: &mut String) {
             esc_html(&run.text, out);
             out.push_str("</span>");
         }
+        if run.link.is_some() {
+            out.push_str("</a>");
+        }
     }
     out.push_str("</p>");
+}
+
+/// Escape a string for use inside a double-quoted HTML attribute value.
+fn esc_attr(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
 }
 
 fn table_html(p: &Parser, rows: &[Vec<Vec<Para>>], out: &mut String) {
@@ -1018,6 +1141,218 @@ pub fn rtf_to_html(rtf: &str) -> String {
     }
     html.push_str("</body></html>");
     html
+}
+
+// ─────────────────────── unified Document model lowering ────────────────────
+
+use crate::convert::style::Generic;
+use crate::model::{
+    Block, BlockKind, Cell, CharStyle, Document, ImageRef, ImageResource, Inline, InlineRun,
+    LinkTarget, Page, Paragraph, ParagraphStyle, Row, Section, Table,
+};
+use std::collections::BTreeMap;
+
+/// Parse RTF and lower it **directly** into the unified editable
+/// [`Document`](crate::model::Document) model — the rich counterpart of the
+/// plain-text path. This reuses the same stateful parser as [`rtf_to_html`]
+/// (no second RTF tokenizer): the recovered [`RtfBlock`]s are lowered to model
+/// blocks with run-level [`CharStyle`] (bold/italic/underline/strike, colour,
+/// size, font family), tables ([`BlockKind::Table`]), `\pict` images
+/// (bytes **interned** into [`Document::resources`]), and `\field` hyperlinks
+/// ([`Inline::Link`]).
+///
+/// One section / one page of *flow* blocks (A4 default geometry), mirroring
+/// [`crate::html::to_model`].
+pub fn rtf_to_model(rtf: &str) -> Document {
+    let mut parser = Parser::new(rtf);
+    let rtf_blocks = parser.drive();
+
+    let mut images: BTreeMap<u64, ImageResource> = BTreeMap::new();
+    let mut blocks: Vec<Block> = Vec::new();
+    for rb in &rtf_blocks {
+        match rb {
+            RtfBlock::Para(para) => {
+                blocks.push(model_block(BlockKind::Paragraph(para_to_model(
+                    &parser, para,
+                ))));
+            }
+            RtfBlock::Table(rows) => {
+                blocks.push(model_block(BlockKind::Table(table_to_model(&parser, rows))));
+            }
+            RtfBlock::Image(pic) => {
+                let key = fnv1a(&pic.data);
+                images.entry(key).or_insert_with(|| ImageResource {
+                    bytes: pic.data.clone(),
+                    format: pic.subtype.to_string(),
+                });
+                blocks.push(model_block(BlockKind::Image(ImageRef {
+                    resource: key,
+                    alt: None,
+                })));
+            }
+        }
+    }
+
+    let mut doc = Document {
+        sections: vec![Section {
+            geometry: crate::model::PageGeometry::default(),
+            header: None,
+            footer: None,
+            pages: vec![Page {
+                blocks,
+                absolute: false,
+            }],
+        }],
+        ..Document::default()
+    };
+    doc.resources.images = images;
+    doc
+}
+
+/// A default-framed (flow) [`Block`] carrying `kind`.
+fn model_block(kind: BlockKind) -> Block {
+    Block {
+        kind,
+        ..Block::default()
+    }
+}
+
+/// Lower a recovered [`Para`] to a model [`Paragraph`]: paragraph alignment +
+/// indents, and inline content where consecutive runs sharing one hyperlink
+/// target collapse into a single [`Inline::Link`].
+fn para_to_model(p: &Parser, para: &Para) -> Paragraph {
+    let mut runs: Vec<Inline> = Vec::new();
+    let mut i = 0;
+    while i < para.runs.len() {
+        let run = &para.runs[i];
+        match &run.link {
+            Some(url) => {
+                // Coalesce the contiguous run of identically-linked spans.
+                let mut children: Vec<Inline> = Vec::new();
+                while i < para.runs.len() && para.runs[i].link.as_deref() == Some(url.as_str()) {
+                    children.push(Inline::Run(run_to_model(p, &para.runs[i])));
+                    i += 1;
+                }
+                runs.push(Inline::Link {
+                    href: LinkTarget::Url(url.clone()),
+                    children,
+                });
+            }
+            None => {
+                runs.push(Inline::Run(run_to_model(p, run)));
+                i += 1;
+            }
+        }
+    }
+
+    Paragraph {
+        style: ParagraphStyle {
+            align: align_model(para.align),
+            indent_left_pt: if para.indent_left > 0 {
+                twips_to_pt(para.indent_left)
+            } else {
+                0.0
+            },
+            first_line_pt: twips_to_pt(para.first_line),
+            ..ParagraphStyle::default()
+        },
+        runs,
+        ..Paragraph::default()
+    }
+}
+
+/// Lower a single styled [`Run`] to a model [`InlineRun`].
+fn run_to_model(p: &Parser, run: &Run) -> InlineRun {
+    InlineRun {
+        text: run.text.clone(),
+        style: char_state_to_model(p, &run.style),
+        source_index: None,
+    }
+}
+
+/// Lower a parser [`CharState`] to a model [`CharStyle`].
+fn char_state_to_model(p: &Parser, s: &CharState) -> CharStyle {
+    let (family, generic) = match p.fonts.get(s.font_idx) {
+        Some(f) if !f.name.is_empty() => (f.name.clone(), generic_class(f.generic)),
+        Some(f) => (String::new(), generic_class(f.generic)),
+        None => (String::new(), Generic::default()),
+    };
+    CharStyle {
+        family,
+        generic,
+        size_pt: if s.half_points > 0 {
+            s.half_points as f64 / 2.0
+        } else {
+            0.0
+        },
+        bold: s.bold,
+        italic: s.italic,
+        underline: s.underline,
+        strike: s.strike,
+        color: p.color_rgb(s.color_idx),
+        background: None,
+        vertical_align: if s.superscript {
+            crate::model::VAlign::Super
+        } else if s.subscript {
+            crate::model::VAlign::Sub
+        } else {
+            crate::model::VAlign::Baseline
+        },
+    }
+}
+
+/// Lower the table model `Vec<rows of cells of paragraphs>` to a [`Table`].
+fn table_to_model(p: &Parser, rows: &[Vec<Vec<Para>>]) -> Table {
+    Table {
+        rows: rows
+            .iter()
+            .map(|cells| Row {
+                cells: cells
+                    .iter()
+                    .map(|cell| Cell {
+                        blocks: cell
+                            .iter()
+                            .map(|para| model_block(BlockKind::Paragraph(para_to_model(p, para))))
+                            .collect(),
+                        ..Cell::default()
+                    })
+                    .collect(),
+                height: None,
+            })
+            .collect(),
+        ..Table::default()
+    }
+}
+
+/// Map the parser's CSS-keyword generic bucket to the model [`Generic`] class.
+fn generic_class(g: &str) -> Generic {
+    match g {
+        "serif" => Generic::Serif,
+        "monospace" => Generic::Mono,
+        // "sans-serif", "cursive" (no cursive bucket), or empty → sans default.
+        _ => Generic::Sans,
+    }
+}
+
+/// Map the parser's [`Align`] to the model [`Align`](crate::model::Align).
+fn align_model(a: Align) -> crate::model::Align {
+    match a {
+        Align::Left => crate::model::Align::Left,
+        Align::Center => crate::model::Align::Center,
+        Align::Right => crate::model::Align::Right,
+        Align::Justify => crate::model::Align::Justify,
+    }
+}
+
+/// 64-bit FNV-1a content hash — a stable, dependency-free resource key (matches
+/// the convention used by the image / HTML importers).
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
 }
 
 #[cfg(test)]
@@ -1284,5 +1619,154 @@ mod tests {
         let rtf = r"{\rtf1\ansi {\pict\pngblip\picwgoal100\pichgoal100 0011223344}\par}";
         let html = rtf_to_html(rtf);
         assert!(!html.contains("<img"), "magic-less payload dropped: {html}");
+    }
+
+    // ──────────────────────── rich RTF → model (#4) ─────────────────────────
+
+    use crate::model::{BlockKind, Document, Inline, LinkTarget};
+
+    /// Flatten a paragraph's inline content (runs + link children) to a string.
+    fn para_text(p: &crate::model::Paragraph) -> String {
+        fn walk(inlines: &[Inline], out: &mut String) {
+            for i in inlines {
+                match i {
+                    Inline::Run(r) => out.push_str(&r.text),
+                    Inline::Link { children, .. } => walk(children, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut s = String::new();
+        walk(&p.runs, &mut s);
+        s.trim().to_string()
+    }
+
+    fn blocks(doc: &Document) -> &[crate::model::Block] {
+        &doc.sections[0].pages[0].blocks
+    }
+
+    /// The headline test: an RTF with a bold run, a coloured run, a 2-cell table
+    /// and a hyperlink lowers to a model that carries the bold `CharStyle`, the
+    /// colour, the `BlockKind::Table`, and the `Inline::Link` — never flat text.
+    #[test]
+    fn rtf_model_carries_bold_colour_table_and_link() {
+        let rtf = concat!(
+            r"{\rtf1\ansi{\colortbl ;\red255\green0\blue0;}",
+            r"{\b gras}{\cf1 rouge} plain\par",
+            r#"{\field{\*\fldinst{HYPERLINK "https://example.com"}}"#,
+            r"{\fldrslt{\ul cliquez}}}\par",
+            r"\trowd \cell A1\cell A2\row}",
+        );
+        let doc = rtf_to_model(rtf);
+        let b = blocks(&doc);
+
+        // First paragraph: a bold run carrying "gras" + a red run "rouge".
+        let p0 = match &b[0].kind {
+            BlockKind::Paragraph(p) => p,
+            other => panic!("block 0 not a paragraph: {other:?}"),
+        };
+        assert!(
+            p0.runs.iter().any(|i| matches!(
+                i, Inline::Run(r) if r.style.bold && r.text.contains("gras"))),
+            "bold CharStyle preserved: {:?}",
+            p0.runs
+        );
+        assert!(
+            p0.runs.iter().any(|i| matches!(
+                i, Inline::Run(r) if r.style.color == Some([1.0, 0.0, 0.0]) && r.text.contains("rouge"))),
+            "run colour (red) preserved: {:?}",
+            p0.runs
+        );
+
+        // Second paragraph: the hyperlink lowered to an Inline::Link (not text).
+        let p1 = match &b[1].kind {
+            BlockKind::Paragraph(p) => p,
+            other => panic!("block 1 not a paragraph: {other:?}"),
+        };
+        let link = p1
+            .runs
+            .iter()
+            .find_map(|i| match i {
+                Inline::Link { href, children } => Some((href, children)),
+                _ => None,
+            })
+            .expect("an Inline::Link in the second paragraph");
+        assert_eq!(
+            link.0,
+            &LinkTarget::Url("https://example.com".to_string()),
+            "link target recovered"
+        );
+        assert_eq!(para_text(p1), "cliquez", "link wraps the visible text");
+
+        // Third block: a 2-cell table row.
+        let table = b
+            .iter()
+            .find_map(|blk| match &blk.kind {
+                BlockKind::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a BlockKind::Table");
+        assert_eq!(table.rows.len(), 1, "one row");
+        assert_eq!(table.rows[0].cells.len(), 2, "two cells");
+    }
+
+    /// A `\pict` PNG lowers to a `BlockKind::Image` whose **bytes** are interned
+    /// into the document resource table (the HTML→model path would only keep a
+    /// reference — this is why RTF→model goes through the rich parser directly).
+    #[test]
+    fn rtf_model_interns_picture_bytes() {
+        let rgba = vec![
+            0u8, 0, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 255,
+        ];
+        let png = crate::raster::encode_png(2, 2, &rgba);
+        let rtf = format!(
+            r"{{\rtf1\ansi {{\pict\pngblip\picwgoal1440\pichgoal720 {}}}\par}}",
+            hex_encode(&png)
+        );
+        let doc = rtf_to_model(&rtf);
+        let img = blocks(&doc)
+            .iter()
+            .find_map(|blk| match &blk.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("a BlockKind::Image");
+        let res = doc
+            .resources
+            .images
+            .get(&img.resource)
+            .expect("image bytes interned in the resource table");
+        assert_eq!(res.bytes, png, "stored bytes match the source PNG");
+        assert_eq!(res.format, "png");
+    }
+
+    /// A plain RTF (no styling) still imports as paragraphs of text.
+    #[test]
+    fn rtf_model_plain_text_still_imports() {
+        let doc = rtf_to_model(r"{\rtf1\ansi Hello\par World\par}");
+        let texts: Vec<String> = blocks(&doc)
+            .iter()
+            .filter_map(|blk| match &blk.kind {
+                BlockKind::Paragraph(p) => Some(para_text(p)),
+                _ => None,
+            })
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert_eq!(texts, vec!["Hello".to_string(), "World".to_string()]);
+    }
+
+    /// Malformed / truncated RTF must not panic — it lowers to *something*.
+    #[test]
+    fn rtf_model_malformed_does_not_panic() {
+        for bad in [
+            r"{\rtf1\ansi unclosed {\b bold",         // unbalanced braces
+            r"}}}{{{\\\\",                            // brace/escape garbage
+            r"{\rtf1{\field{\*\fldinst{HYPERLINK ",   // truncated hyperlink field
+            r"{\rtf1\ansi {\pict\pngblip ZZZZ}\par}", // non-hex pict payload
+            "",                                       // empty input
+            r"{\rtf1\ansi\trowd \cell",               // open table row, no \row
+        ] {
+            let _ = rtf_to_model(bad); // must return, not panic
+        }
     }
 }

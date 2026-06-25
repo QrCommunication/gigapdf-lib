@@ -783,7 +783,10 @@ fn rtf_table_from_model(table: &Table, colors: &[[u8; 3]], first: &mut bool, out
 
 /// Extract plain text paragraphs from an RTF document (minimal control-word
 /// parser: handles groups, `\par`, `\'xx` hex bytes, `\uN` unicode, skips other
-/// control words and the font/color tables). Shared with the model importer.
+/// control words and the font/color tables). The RTF→model importer now routes
+/// through the rich parser ([`super::rtf::rtf_to_model`]); this text-only
+/// extractor is retained for the round-trip test below.
+#[cfg(test)]
 pub(crate) fn rtf_to_paragraphs(rtf: &str) -> Vec<String> {
     let bytes = rtf.as_bytes();
     let mut paras = Vec::new();
@@ -928,8 +931,8 @@ pub(crate) fn rtf_to_paragraphs(rtf: &str) -> Vec<String> {
 /// Routed through the stateful RTF parser ([`super::rtf::rtf_to_html`]), which
 /// recovers character formatting (bold/italic/underline/strike, colour, font,
 /// size), paragraph alignment/indents and tables, then renders the styled HTML
-/// with the in-house [`crate::html`] engine. (The text-only [`rtf_to_paragraphs`]
-/// remains for the editor model path, which is plain-text by design.)
+/// with the in-house [`crate::html`] engine. (The RTF→model importer is the rich
+/// [`super::rtf::rtf_to_model`].)
 pub fn rtf_to_pdf(rtf: &str) -> Vec<u8> {
     let html = super::rtf::rtf_to_html(rtf);
     crate::html::render(&html, &[], 612.0, 792.0, 36.0)

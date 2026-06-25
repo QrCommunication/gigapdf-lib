@@ -98,14 +98,13 @@ pub fn txt_to_model(text: &str) -> Document {
     flow_document(blocks)
 }
 
-/// RTF → [`Document`]: paragraphs recovered by the shared RTF text parser
-/// ([`super::reverse::rtf_to_paragraphs`]), one [`Paragraph`] each.
+/// RTF → [`Document`]: routed through the **rich** RTF parser
+/// ([`super::rtf::rtf_to_model`]), which recovers run-level character styling
+/// (bold/italic/underline/strike, colour, size, font family), tables, `\pict`
+/// images (bytes interned into the resource table) and `\field` hyperlinks —
+/// not just flat text.
 pub fn rtf_to_model(rtf: &str) -> Document {
-    let blocks = super::reverse::rtf_to_paragraphs(rtf)
-        .into_iter()
-        .map(|p| paragraph_block(&p))
-        .collect();
-    flow_document(blocks)
+    super::rtf::rtf_to_model(rtf)
 }
 
 /// Markdown → [`Document`]: a CommonMark-ish parse producing real structure —
