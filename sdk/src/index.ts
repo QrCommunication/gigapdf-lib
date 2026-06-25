@@ -2096,6 +2096,16 @@ export interface NamedDest {
   page: number;
 }
 /**
+ * One document-level JavaScript read back by {@link GigaPdfDoc.documentJavascripts}:
+ * the `/Names /JavaScript` name-tree key and the script source.
+ */
+export interface DocumentJavascript {
+  /** The name-tree key the script is registered under. */
+  name: string;
+  /** The JavaScript source. */
+  script: string;
+}
+/**
  * One embedded file attachment read back by {@link GigaPdfDoc.attachments}.
  * `data` is the decoded file bytes; `mime`/`description`/dates are `null` when
  * the PDF didn't record them.
@@ -4664,6 +4674,46 @@ export class GigaPdfDoc {
    */
   removeAttachment(name: string): boolean {
     return this.g._withStr(name, (p, l) => this.ex().gp_remove_attachment(this.h, p, l)) === 1;
+  }
+
+  /**
+   * Install a **document-level JavaScript** under the catalog `/Names /JavaScript`
+   * name tree (ISO 32000-1 §7.7.3.4 + §12.6.4.16): a named JavaScript action
+   * (`<< /S /JavaScript /JS … >>`) keyed by `name`. On open, a conforming viewer
+   * runs every document-level script in **name (lexical) order** — this is where
+   * form-calculation / validation helper libraries live (e.g. `AFNumber_Format`).
+   * Re-using a `name` **replaces** that script; long sources are stored as a
+   * FlateDecode stream, and sibling `/Names` subtrees (`/EmbeddedFiles`,
+   * `/Dests`, …) are preserved. Returns `true` on success (`false` e.g. for an
+   * empty name).
+   */
+  addDocumentJavascript(name: string, script: string): boolean {
+    return (
+      this.g._withStr(name, (np, nl) =>
+        this.g._withStr(script, (sp, sl) =>
+          this.ex().gp_add_document_javascript(this.h, np, nl, sp, sl)
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * Every document-level JavaScript as `{ name, script }` pairs, in name
+   * (lexical) order — the read side of {@link addDocumentJavascript} (decodes
+   * both a literal `/JS` string and a `/JS` stream).
+   */
+  documentJavascripts(): DocumentJavascript[] {
+    return this.g._json((o) => this.ex().gp_document_javascripts_json(this.h, o));
+  }
+
+  /**
+   * Remove the document-level JavaScript named `name` from `/Names /JavaScript`.
+   * Returns `true` if one was removed, `false` if none had that name.
+   */
+  removeDocumentJavascript(name: string): boolean {
+    return (
+      this.g._withStr(name, (p, l) => this.ex().gp_remove_document_javascript(this.h, p, l)) === 1
+    );
   }
 
   /**

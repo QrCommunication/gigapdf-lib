@@ -5310,6 +5310,74 @@ pub extern "C" fn gp_remove_attachment(
     }
 }
 
+/// Install a **document-level JavaScript** under the catalog `/Names /JavaScript`
+/// name tree (ISO 32000-1 §7.7.3.4). `name` keys a `<< /S /JavaScript /JS … >>`
+/// action; viewers run document-level scripts in name (lexical) order on open.
+/// Re-using a `name` replaces that script; long sources are stored as a
+/// FlateDecode stream. Returns `0` on success, `-1` null handle, `-3` on error
+/// (e.g. empty name).
+#[no_mangle]
+pub extern "C" fn gp_add_document_javascript(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+    script_ptr: *const u8,
+    script_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    let script = unsafe { str_arg(script_ptr, script_len) };
+    edit(handle, |doc| doc.add_document_javascript(name, script))
+}
+
+/// Remove the document-level JavaScript named `name` from `/Names /JavaScript`.
+/// Returns `1` if one was removed, `0` if none had that name, `-1` null handle,
+/// `-3` on error.
+#[no_mangle]
+pub extern "C" fn gp_remove_document_javascript(
+    handle: *mut Document,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let name = unsafe { str_arg(name_ptr, name_len) };
+    match unsafe { handle.as_mut() } {
+        Some(doc) => match doc.remove_document_javascript(name) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -3,
+        },
+        None => -1,
+    }
+}
+
+/// Every document-level JavaScript as a JSON array `[{name,script}]`, in name
+/// (lexical) order — the read side of `gp_add_document_javascript`. Host frees
+/// the returned buffer.
+#[no_mangle]
+pub extern "C" fn gp_document_javascripts_json(
+    handle: *const Document,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let json = match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            let mut s = String::from("[");
+            for (i, (name, script)) in doc.document_javascripts().iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str("{\"name\":");
+                json_escape(name, &mut s);
+                s.push_str(",\"script\":");
+                json_escape(script, &mut s);
+                s.push('}');
+            }
+            s.push(']');
+            s
+        }
+        None => "[]".to_string(),
+    };
+    unsafe { bytes_into_host(json.into_bytes(), out_len) }
+}
+
 /// Add a page-anchored **FileAttachment** annotation over `[x0,y0,x1,y1]` on the
 /// 1-based `page`, pointing at the already-embedded attachment `name`. `icon` is
 /// optional (`PushPin` default; `Paperclip`/`Graph`/`Tag`). Returns `0`/`-1`/`-3`

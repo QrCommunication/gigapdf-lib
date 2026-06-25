@@ -15111,6 +15111,184 @@ impl Document {
         self.append_annotation_dict(page_no, dict)
     }
 
+    /// The `/Names` dict (cloned, creating an empty one if absent), where it
+    /// lives (`Some(id)` if indirect, else inline in the catalog), and the
+    /// flattened `/JavaScript` name-tree entries `(key, raw action value)` — the
+    /// read step shared by every document-level JavaScript mutation. Mirrors
+    /// [`embedded_files_state`](Self::embedded_files_state).
+    fn javascript_state(&self) -> Result<EmbeddedFilesState> {
+        let catalog_id = self.catalog_id()?;
+        let catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let names_ref = catalog.get(b"Names").and_then(Object::as_reference);
+        let names_dict = match names_ref {
+            Some(id) => self
+                .objects
+                .get(&id)
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_default(),
+            None => catalog
+                .get(b"Names")
+                .map(|o| self.resolve(o))
+                .and_then(Object::as_dict)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let mut entries = Vec::new();
+        if let Some(js) = names_dict
+            .get(b"JavaScript")
+            .map(|o| self.resolve(o).clone())
+        {
+            self.collect_name_tree_raw(&js, 0, &mut entries);
+        }
+        Ok((names_ref, names_dict, entries))
+    }
+
+    /// Write `entries` back as a single flat, key-sorted `/JavaScript` leaf in
+    /// `names_dict`, then store `names_dict` where it belongs (its indirect
+    /// object if `names_ref`, else inline in the catalog). Sibling `/Names`
+    /// subtrees (`/EmbeddedFiles`, `/Dests`, …) are preserved. Mirrors
+    /// [`write_embedded_files`](Self::write_embedded_files).
+    fn write_document_javascript(
+        &mut self,
+        names_ref: Option<ObjectId>,
+        mut names_dict: Dictionary,
+        mut entries: Vec<(Vec<u8>, Object)>,
+    ) -> Result<()> {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut arr = Vec::with_capacity(entries.len() * 2);
+        for (key, value) in entries {
+            arr.push(Object::String(key, StringKind::Literal));
+            arr.push(value);
+        }
+        let mut tree = Dictionary::new();
+        tree.set(b"Names".to_vec(), Object::Array(arr));
+        names_dict.set(b"JavaScript".to_vec(), Object::Dictionary(tree));
+        match names_ref {
+            Some(id) => {
+                self.objects.insert(id, Object::Dictionary(names_dict));
+            }
+            None => {
+                let catalog_id = self.catalog_id()?;
+                let mut catalog = self
+                    .objects
+                    .get(&catalog_id)
+                    .and_then(Object::as_dict)
+                    .cloned()
+                    .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+                catalog.set(b"Names".to_vec(), Object::Dictionary(names_dict));
+                self.objects.insert(catalog_id, Object::Dictionary(catalog));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the `<< /S /JavaScript /JS … >>` action value for `script`. `/JS` is
+    /// a literal text string for short scripts, or — when the source exceeds
+    /// [`Self::JS_STREAM_THRESHOLD`] — a FlateDecode-compressed **stream** (the
+    /// spec's "text string or stream", ISO 32000-1 §7.7.3.4), matching how the
+    /// engine flate-compresses its other streams. Returns the value an indirect
+    /// reference points at; a stream is stored as a fresh object and referenced.
+    fn build_javascript_action(&mut self, script: &str) -> Object {
+        let mut action = Dictionary::new();
+        action.set(b"Type".to_vec(), Object::Name(b"Action".to_vec()));
+        action.set(b"S".to_vec(), Object::Name(b"JavaScript".to_vec()));
+        // A PDF text string: WinAnsi when representable, else UTF-16BE. The
+        // serializer escapes `(`, `)` and `\` in the literal form.
+        let body = crate::font::encode_pdf_text(script);
+        if body.len() > Self::JS_STREAM_THRESHOLD {
+            let compressed = crate::filters::deflate::flate_encode(&body);
+            let mut sdict = Dictionary::new();
+            sdict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+            sdict.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
+            let stream_id = (self.next_object_number(), 0u16);
+            self.objects
+                .insert(stream_id, Object::Stream(Stream::new(sdict, compressed)));
+            action.set(b"JS".to_vec(), Object::Reference(stream_id));
+        } else {
+            action.set(b"JS".to_vec(), Object::String(body, StringKind::Literal));
+        }
+        Object::Dictionary(action)
+    }
+
+    /// Source length (encoded text-string bytes) at/above which `/JS` is emitted
+    /// as a compressed stream rather than a literal string.
+    const JS_STREAM_THRESHOLD: usize = 2048;
+
+    /// Install a **document-level JavaScript** under the catalog
+    /// `/Names /JavaScript` name tree (ISO 32000-1 §7.7.3.4 + §12.6.4.16): a named
+    /// JavaScript action `<< /S /JavaScript /JS … >>` keyed by `name`. On open, a
+    /// conforming viewer runs every document-level script in **name (lexical)
+    /// order**, so these are where form-calculation/validation helper libraries
+    /// live. Re-using a `name` **replaces** that script. `/JS` is a literal string
+    /// for short sources and a FlateDecode stream for large ones; sibling
+    /// `/Names` subtrees (`/EmbeddedFiles`, `/Dests`, …) are preserved.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidArgument`] if `name` is empty.
+    pub fn add_document_javascript(&mut self, name: &str, script: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "document JavaScript name must not be empty".into(),
+            ));
+        }
+        let value = self.build_javascript_action(script);
+        let (names_ref, names_dict, mut entries) = self.javascript_state()?;
+        entries.retain(|(k, _)| k.as_slice() != name.as_bytes());
+        entries.push((name.as_bytes().to_vec(), value));
+        self.write_document_javascript(names_ref, names_dict, entries)
+    }
+
+    /// Remove the document-level JavaScript named `name` from
+    /// `/Names /JavaScript`. Returns `true` if one was removed, `false` if none
+    /// had that name. Any stream the entry referenced becomes unreferenced and is
+    /// dropped on the next rewrite.
+    pub fn remove_document_javascript(&mut self, name: &str) -> Result<bool> {
+        let (names_ref, names_dict, mut entries) = self.javascript_state()?;
+        let before = entries.len();
+        entries.retain(|(k, _)| k.as_slice() != name.as_bytes());
+        if entries.len() == before {
+            return Ok(false);
+        }
+        self.write_document_javascript(names_ref, names_dict, entries)?;
+        Ok(true)
+    }
+
+    /// Every document-level JavaScript as `(name, source)` pairs in name (lexical)
+    /// order — the read side of [`add_document_javascript`](Self::add_document_javascript),
+    /// reading both a literal `/JS` string and a `/JS` stream. Entries whose
+    /// action has no readable `/JS` are skipped.
+    pub fn document_javascripts(&self) -> Vec<(String, String)> {
+        let Ok((_, _, mut entries)) = self.javascript_state() else {
+            return Vec::new();
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let action = self.resolve(&value);
+            let Some(js) = action.as_dict().and_then(|d| d.get(b"JS")) else {
+                continue;
+            };
+            let bytes = match self.resolve(js) {
+                Object::String(b, _) => b.clone(),
+                Object::Stream(s) => match decode_stream(s) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            out.push((
+                String::from_utf8_lossy(&key).into_owned(),
+                crate::font::decode_pdf_text(&bytes),
+            ));
+        }
+        out
+    }
+
     /// Add an internal hyperlink over `rect` that jumps to the **named
     /// destination** `dest_name` (define it with [`add_named_dest`]). Unlike
     /// [`add_goto_link`](Self::add_goto_link) (an explicit page reference), this
@@ -24180,6 +24358,139 @@ mod tests {
         let atts = doc.attachments();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "b.txt");
+    }
+
+    #[test]
+    fn add_document_javascript_builds_name_tree_in_lexical_order() {
+        let mut doc = blank_doc();
+        // Insert out of order; the name tree must end up key-sorted.
+        doc.add_document_javascript("zeta", "var z = 1;").unwrap();
+        doc.add_document_javascript("alpha", "app.alert('hi');")
+            .unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        // /Names /JavaScript /Names is a flat [ (name) action … ] array, lexical.
+        let catalog = reopened.catalog().unwrap();
+        let names = catalog
+            .get(b"Names")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Names dict");
+        let js_tree = names
+            .get(b"JavaScript")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Names /JavaScript subtree");
+        let arr = js_tree
+            .get(b"Names")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_array)
+            .expect("/Names array");
+        assert_eq!(arr.len(), 4, "two (name, action) pairs");
+        assert_eq!(arr[0].as_string(), Some(b"alpha".as_slice()));
+        assert_eq!(arr[2].as_string(), Some(b"zeta".as_slice()));
+        // Each value is a JavaScript action.
+        let a0 = reopened.resolve(&arr[1]).as_dict().expect("action dict");
+        assert_eq!(
+            a0.get(b"S").and_then(Object::as_name),
+            Some(b"JavaScript".as_slice())
+        );
+        assert!(a0.get(b"JS").is_some());
+
+        // The high-level getter returns the scripts, lexically.
+        let scripts = reopened.document_javascripts();
+        assert_eq!(
+            scripts,
+            vec![
+                ("alpha".to_string(), "app.alert('hi');".to_string()),
+                ("zeta".to_string(), "var z = 1;".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_document_javascript_preserves_other_names_subtrees() {
+        // A pre-existing /EmbeddedFiles sibling must survive a /JavaScript write.
+        let mut doc = blank_doc();
+        doc.add_attachment("notes.txt", b"hello", Some("text/plain"), None)
+            .unwrap();
+        doc.add_document_javascript("init", "console.println('x');")
+            .unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        // Both subtrees readable.
+        let atts = reopened.attachments();
+        assert_eq!(atts.len(), 1, "/EmbeddedFiles preserved");
+        assert_eq!(atts[0].name, "notes.txt");
+        let scripts = reopened.document_javascripts();
+        assert_eq!(scripts.len(), 1, "/JavaScript present");
+        assert_eq!(scripts[0].0, "init");
+        // And the catalog /Names dict carries BOTH keys.
+        let catalog = reopened.catalog().unwrap();
+        let names = catalog
+            .get(b"Names")
+            .map(|o| reopened.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("/Names dict");
+        assert!(names.get(b"EmbeddedFiles").is_some());
+        assert!(names.get(b"JavaScript").is_some());
+    }
+
+    #[test]
+    fn add_document_javascript_escapes_string_specials() {
+        // A script with the literal-string specials () and backslash must
+        // round-trip exactly (the serializer escapes them; the parser unescapes).
+        let mut doc = blank_doc();
+        let src = r#"if (a < b) { f("\\path", (x)); }"#;
+        doc.add_document_javascript("esc", src).unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let scripts = reopened.document_javascripts();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].1, src, "() and \\ round-trip safely");
+    }
+
+    #[test]
+    fn add_document_javascript_large_source_uses_a_stream() {
+        // A long script is stored as a FlateDecode /JS stream, not a literal.
+        let mut doc = blank_doc();
+        let big = format!("var data = '{}';", "x".repeat(4096));
+        doc.add_document_javascript("big", &big).unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        // The /JS value resolves to a stream.
+        let (_, _, entries) = reopened.javascript_state().unwrap();
+        assert_eq!(entries.len(), 1);
+        let action = reopened.resolve(&entries[0].1);
+        let js = action.as_dict().and_then(|d| d.get(b"JS")).unwrap();
+        assert!(
+            matches!(reopened.resolve(js), Object::Stream(_)),
+            "large /JS is a stream"
+        );
+        // …and the getter still decodes it back to the source.
+        assert_eq!(reopened.document_javascripts()[0].1, big);
+    }
+
+    #[test]
+    fn add_document_javascript_replaces_removes_and_validates() {
+        let mut doc = blank_doc();
+        doc.add_document_javascript("lib", "v1").unwrap();
+        doc.add_document_javascript("other", "o").unwrap();
+        doc.add_document_javascript("lib", "v2").unwrap(); // replace, not duplicate
+        let scripts = doc.document_javascripts();
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts.iter().find(|(n, _)| n == "lib").unwrap().1, "v2");
+
+        assert!(doc.remove_document_javascript("lib").unwrap());
+        assert!(
+            !doc.remove_document_javascript("lib").unwrap(),
+            "second remove is a no-op"
+        );
+        assert_eq!(doc.document_javascripts().len(), 1);
+
+        // An empty name is rejected.
+        assert!(matches!(
+            doc.add_document_javascript("", "x"),
+            Err(EngineError::InvalidArgument(_))
+        ));
     }
 
     #[test]

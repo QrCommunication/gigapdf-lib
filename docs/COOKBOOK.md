@@ -931,6 +931,39 @@ const out = doc.save();
 doc.close();
 ```
 
+### Document-level JavaScript (`/Names /JavaScript`)
+
+Beyond per-link / open-action scripts, a document can install **document-level
+JavaScript** in the catalog `/Names /JavaScript` name tree (ISO 32000-1
+§7.7.3.4 + §12.6.4.16). A conforming viewer runs every entry **in name (lexical)
+order** when the file opens — so this is where form-calculation and validation
+helper libraries belong, and where a one-shot "on open" action lives. `/JS` is
+stored as a literal string (or a FlateDecode stream past ~2 KB), and adding a
+script preserves any sibling `/Names` subtrees (e.g. `/EmbeddedFiles`).
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// Runs first (name "00_init" sorts before "10_greet"): set a text field's value.
+doc.addDocumentJavascript("00_init", `this.getField("orderRef").value = "INV-2026-0042";`);
+
+// Runs next: greet the reader on open.
+doc.addDocumentJavascript("10_greet", `app.alert("Welcome — review the form before signing.");`);
+
+// Read them back, in the order viewers execute them.
+for (const js of doc.documentJavascripts()) {
+  console.log(js.name, "→", js.script);
+}
+// 00_init → this.getField("orderRef").value = "INV-2026-0042";
+// 10_greet → app.alert("Welcome — review the form before signing.");
+
+// Re-using a name replaces it; removeDocumentJavascript drops one entry.
+doc.removeDocumentJavascript("10_greet");
+
+const out = doc.save();
+doc.close();
+```
+
 ---
 
 ## Sign a PDF (B · B-T · LTV)
