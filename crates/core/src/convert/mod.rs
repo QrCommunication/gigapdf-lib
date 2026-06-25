@@ -12,6 +12,7 @@
 //! same already-normalized geometry.
 
 pub mod build;
+pub mod cfb;
 pub mod csv_import;
 pub mod export_model;
 pub mod grids;
