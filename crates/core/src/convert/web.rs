@@ -2,8 +2,8 @@
 //!
 //! Each page becomes a sized `<div>`; text runs are absolutely-positioned
 //! `<span>`s carrying the recovered font/weight/style/colour, images are
-//! inlined as `data:` URIs, and shapes are bordered boxes. Real, selectable
-//! content — not a page raster.
+//! inlined as `data:` URIs, and shapes keep their vector geometry as inline
+//! `<svg>`. Real, selectable content — not a page raster.
 
 use super::{base64, ConvPage};
 
@@ -97,6 +97,7 @@ img{position:absolute}</style></head><body>",
 
 // ───────────────────────────── model → semantic HTML ─────────────────────────────
 
+use crate::content::vector::PathSeg;
 use crate::model::CellValue;
 use crate::model::{
     Align, Block, BlockKind, Cell, CellVAlign, CharStyle, CodeBlock, Document, ImageRef, Inline,
@@ -404,19 +405,118 @@ fn html_image_inline(img: &ImageRef, doc: &Document, out: &mut String) {
 }
 
 fn html_shape(shape: &Shape, out: &mut String) {
-    // A reflowable document can't position a vector path meaningfully; render a
-    // small bordered box carrying the fill colour so the shape is not lost.
-    let mut style = String::from("display:inline-block;width:1em;height:1em;border:1px solid #888");
-    if let Some([r, g, b]) = shape.fill {
-        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-        style.push_str(&format!(
-            ";background:#{:02X}{:02X}{:02X}",
-            q(r),
-            q(g),
-            q(b)
-        ));
+    // Preserve the vector geometry as a self-contained inline `<svg>`: the path's
+    // bounds give a `viewBox` (and `width`/`height` in points so it scales in
+    // reflow), the segments become the `d` attribute, and the shape's paint maps
+    // to `fill`/`stroke`/`stroke-width`/`stroke-dasharray`. PDF geometry is in
+    // user space (origin bottom-left, Y up); SVG is top-left/Y down, so points
+    // are translated to the bounds origin and flipped vertically.
+    let Some((min_x, min_y, max_x, max_y)) = shape_bounds(&shape.segments) else {
+        // No drawable geometry (empty path or a single point): fall back to a
+        // tiny bordered box so the shape is acknowledged rather than dropped.
+        out.push_str(&shape_placeholder(shape));
+        return;
+    };
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+
+    let mut d = String::new();
+    // (x, y) in PDF user space → (x - min_x, max_y - y) in SVG space.
+    let pt = |x: f64, y: f64| format!("{} {}", n(x - min_x), n(max_y - y));
+    for seg in &shape.segments {
+        match *seg {
+            PathSeg::Move(x, y) => {
+                d.push_str(&format!("M{} ", pt(x, y)));
+            }
+            PathSeg::Line(x, y) => {
+                d.push_str(&format!("L{} ", pt(x, y)));
+            }
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                d.push_str(&format!("C{} {} {} ", pt(x1, y1), pt(x2, y2), pt(x3, y3)));
+            }
+            PathSeg::Close => d.push_str("Z "),
+        }
     }
-    out.push_str(&format!("<span style=\"{style}\"></span>"));
+    let d = d.trim_end();
+
+    let mut paint = format!(" fill=\"{}\"", svg_fill(shape.fill));
+    if let Some(stroke) = shape.stroke {
+        paint.push_str(&format!(" stroke=\"{}\"", rgb_hex(stroke)));
+        if shape.stroke_width > 0.0 {
+            paint.push_str(&format!(" stroke-width=\"{}\"", n(shape.stroke_width)));
+        }
+        if !shape.dash.is_empty() {
+            let dashes: Vec<String> = shape.dash.iter().map(|v| n(*v)).collect();
+            paint.push_str(&format!(" stroke-dasharray=\"{}\"", dashes.join(",")));
+        }
+    }
+
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" \
+viewBox=\"0 0 {vw} {vh}\" width=\"{vw}pt\" height=\"{vh}pt\" \
+style=\"display:inline-block\"><path d=\"{d}\"{paint}/></svg>",
+        vw = n(width.max(0.0)),
+        vh = n(height.max(0.0)),
+    ));
+}
+
+/// Axis-aligned bounding box `(min_x, min_y, max_x, max_y)` over every point of a
+/// path (Bézier control points included). `None` when the path has no points or
+/// is a single degenerate point (zero width *and* height) — neither yields a
+/// renderable `<svg>` viewBox, so the caller falls back to a placeholder.
+fn shape_bounds(segments: &[PathSeg]) -> Option<(f64, f64, f64, f64)> {
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    let mut add = |x: f64, y: f64| match &mut bounds {
+        Some((min_x, min_y, max_x, max_y)) => {
+            *min_x = min_x.min(x);
+            *min_y = min_y.min(y);
+            *max_x = max_x.max(x);
+            *max_y = max_y.max(y);
+        }
+        None => bounds = Some((x, y, x, y)),
+    };
+    for seg in segments {
+        match *seg {
+            PathSeg::Move(x, y) | PathSeg::Line(x, y) => add(x, y),
+            PathSeg::Cubic(x1, y1, x2, y2, x3, y3) => {
+                add(x1, y1);
+                add(x2, y2);
+                add(x3, y3);
+            }
+            PathSeg::Close => {}
+        }
+    }
+    match bounds {
+        Some((min_x, min_y, max_x, max_y)) if max_x > min_x || max_y > min_y => {
+            Some((min_x, min_y, max_x, max_y))
+        }
+        _ => None,
+    }
+}
+
+/// The `fill` attribute value: the shape's fill colour as `#RRGGBB`, or `none`
+/// for a stroke-only (unfilled) shape so the path isn't filled black by default.
+fn svg_fill(fill: Option<[f64; 3]>) -> String {
+    match fill {
+        Some(rgb) => rgb_hex(rgb),
+        None => "none".to_string(),
+    }
+}
+
+/// Format an RGB colour (components `0.0..=1.0`) as a `#RRGGBB` hex string.
+fn rgb_hex([r, g, b]: [f64; 3]) -> String {
+    let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02X}{:02X}{:02X}", q(r), q(g), q(b))
+}
+
+/// Fallback for a shape with no drawable geometry: a tiny bordered box carrying
+/// the fill colour, so the shape is acknowledged rather than silently dropped.
+fn shape_placeholder(shape: &Shape) -> String {
+    let mut style = String::from("display:inline-block;width:1em;height:1em;border:1px solid #888");
+    if let Some(rgb) = shape.fill {
+        style.push_str(&format!(";background:{}", rgb_hex(rgb)));
+    }
+    format!("<span style=\"{style}\"></span>")
 }
 
 fn html_sheet(sheet: &SheetBlock, out: &mut String) {
@@ -631,6 +731,186 @@ mod tests {
         assert!(
             html.contains("background:#204E79"),
             "fill colour painted: {html}"
+        );
+    }
+
+    /// Wrap a single [`Shape`] in a one-page document and render to HTML.
+    fn html_for_shape(shape: Shape) -> String {
+        use crate::model::{Page, Section};
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Shape(shape),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        html_from_model(&doc)
+    }
+
+    #[test]
+    fn html_shape_renders_filled_stroked_path_as_inline_svg() {
+        // A filled + stroked rectangle (10,20)-(110,70) in PDF user space → an
+        // inline <svg> with a real viewBox + geometry, NOT a 1em bordered box.
+        let shape = Shape {
+            segments: vec![
+                PathSeg::Move(10.0, 20.0),
+                PathSeg::Line(110.0, 20.0),
+                PathSeg::Line(110.0, 70.0),
+                PathSeg::Line(10.0, 70.0),
+                PathSeg::Close,
+            ],
+            fill: Some([1.0, 0.0, 0.0]),
+            stroke: Some([0.0, 0.0, 1.0]),
+            stroke_width: 2.0,
+            dash: Vec::new(),
+        };
+        let html = html_for_shape(shape);
+        assert!(html.contains("<svg "), "inline svg emitted: {html}");
+        // 100pt wide × 50pt tall, scalable.
+        assert!(
+            html.contains("viewBox=\"0 0 100 50\"")
+                && html.contains("width=\"100pt\"")
+                && html.contains("height=\"50pt\""),
+            "viewBox + size from bounds: {html}"
+        );
+        // Geometry preserved (Y flipped: top of box at y=70 → SVG y=0).
+        assert!(
+            html.contains("<path d=\"M0 50 L100 50 L100 0 L0 0 Z\""),
+            "path geometry preserved: {html}"
+        );
+        assert!(html.contains("fill=\"#FF0000\""), "fill colour: {html}");
+        assert!(
+            html.contains("stroke=\"#0000FF\"") && html.contains("stroke-width=\"2\""),
+            "stroke colour + width: {html}"
+        );
+        assert!(
+            !html.contains("width:1em") && !html.contains("border:1px solid #888"),
+            "no longer a 1em bordered placeholder box: {html}"
+        );
+    }
+
+    #[test]
+    fn html_shape_stroke_only_path_has_fill_none() {
+        // A stroke-only path (no fill) must render `fill="none"`, else the path
+        // would be filled black by the SVG default.
+        let shape = Shape {
+            segments: vec![PathSeg::Move(0.0, 0.0), PathSeg::Line(50.0, 30.0)],
+            fill: None,
+            stroke: Some([0.0, 0.0, 0.0]),
+            stroke_width: 1.0,
+            dash: Vec::new(),
+        };
+        let html = html_for_shape(shape);
+        assert!(html.contains("<svg "), "inline svg emitted: {html}");
+        assert!(
+            html.contains("fill=\"none\""),
+            "unfilled → fill=none: {html}"
+        );
+        assert!(html.contains("stroke=\"#000000\""), "stroke kept: {html}");
+    }
+
+    #[test]
+    fn html_shape_emits_dash_pattern() {
+        // A dashed stroke surfaces as `stroke-dasharray`.
+        let shape = Shape {
+            segments: vec![PathSeg::Move(0.0, 0.0), PathSeg::Line(40.0, 0.0)],
+            fill: None,
+            stroke: Some([0.2, 0.2, 0.2]),
+            stroke_width: 1.0,
+            dash: vec![3.0, 2.0],
+        };
+        let html = html_for_shape(shape);
+        assert!(
+            html.contains("stroke-dasharray=\"3,2\""),
+            "dash pattern surfaced: {html}"
+        );
+    }
+
+    #[test]
+    fn html_shape_freeform_bezier_geometry_is_preserved() {
+        // A free-form path with a cubic Bézier emits a `C` command (geometry not
+        // reduced to a primitive box). Bounds span (0,0)-(30,40).
+        let shape = Shape {
+            segments: vec![
+                PathSeg::Move(0.0, 0.0),
+                PathSeg::Cubic(10.0, 40.0, 20.0, 40.0, 30.0, 0.0),
+            ],
+            fill: Some([0.0, 0.5, 0.0]),
+            stroke: None,
+            stroke_width: 0.0,
+            dash: Vec::new(),
+        };
+        let html = html_for_shape(shape);
+        assert!(
+            html.contains("viewBox=\"0 0 30 40\""),
+            "viewBox from curve extent: {html}"
+        );
+        assert!(
+            html.contains("<path d=\"M0 40 C10 0 20 0 30 40\""),
+            "cubic geometry preserved (Y flipped): {html}"
+        );
+        assert!(
+            html.contains("fill=\"#008000\"") && !html.contains("stroke="),
+            "filled, no stroke attrs: {html}"
+        );
+    }
+
+    #[test]
+    fn html_shape_without_geometry_falls_back_to_placeholder() {
+        // An empty (point-less) shape can't form a viewBox; keep the small box so
+        // the shape isn't silently dropped.
+        let shape = Shape {
+            fill: Some([1.0, 0.0, 0.0]),
+            ..Shape::default()
+        };
+        let html = html_for_shape(shape);
+        assert!(!html.contains("<svg "), "no svg for empty geometry: {html}");
+        assert!(
+            html.contains("width:1em") && html.contains("background:#FF0000"),
+            "fallback placeholder retains fill: {html}"
+        );
+    }
+
+    #[test]
+    fn html_textbox_block_keeps_its_text() {
+        // A textbox carries flowing text (not vector geometry); its text must
+        // survive into the HTML alongside any shapes.
+        use crate::model::{InlineRun, Page, Section, TextBox};
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::TextBox(TextBox {
+                            blocks: vec![Block {
+                                kind: BlockKind::Paragraph(Paragraph {
+                                    runs: vec![Inline::Run(InlineRun {
+                                        text: "Caption text".to_string(),
+                                        style: CharStyle::default(),
+                                        source_index: None,
+                                    })],
+                                    ..Paragraph::default()
+                                }),
+                                ..Default::default()
+                            }],
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let html = html_from_model(&doc);
+        assert!(
+            html.contains("Caption text"),
+            "textbox text preserved: {html}"
         );
     }
 }
