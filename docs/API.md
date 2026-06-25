@@ -339,7 +339,9 @@ PDF user space) / `recognize_page(&img)`. For pages that already carry a text la
 | `convert::office::xlsx_to_grids(&bytes) -> Vec<(String,Vec<Vec<String>>)>` (inverse; inline + shared strings) | `gp_xlsx_to_grids(ptr,len,outlen)` (JSON `[{name,rows}]`) · SDK `xlsxToGrids` | read an `.xlsx` back into per-sheet name + rows grids |
 | `to_rtf() -> Vec<u8>` | `gp_to_rtf(handle,outlen)` | RTF |
 | `to_pdfa() -> Vec<u8>` | `gp_to_pdfa(handle,outlen)` | PDF/A-2b metadata |
-| `to_tagged(pdf_ua) -> Vec<u8>` | `gp_to_tagged(handle,pdf_ua,outlen)` | **tagged (accessible) PDF** — `/StructTreeRoot` + marked content + `/MarkInfo` + `/Lang` + `/RoleMap` + `/Alt` on figures, **without** PDF/A (ISO 32000-1 §14.7/§14.8). `pdf_ua` stamps the PDF/UA-1 identifier (ISO 14289) |
+| `to_tagged(pdf_ua) -> Vec<u8>` | `gp_to_tagged(handle,pdf_ua,outlen)` | **tagged (accessible) PDF** — `/StructTreeRoot` + marked content + `/MarkInfo` + `/Lang` + `/RoleMap` + `/Alt` on figures, **without** PDF/A (ISO 32000-1 §14.7/§14.8). `pdf_ua` stamps the PDF/UA-1 identifier (ISO 14289). Each `/Figure` carries the author `/Alt` from `set_figure_alt` when set, else a non-empty placeholder |
+| `set_figure_alt(index,&str) -> Result<()>` | `gp_set_figure_alt(handle,index,ptr,len)` · SDK `setFigureAlt` | author **alternate text** (`/Alt`, ISO 32000-1 §14.9.3) for the figure at the **document-global** `index` (0-based, page-then-content order). Surfaces on the matching `/Figure` structure element in a level-A (`to_pdfa_level` `Pdfa1a`/`Pdfa2a`) or `to_tagged` export, replacing the placeholder; figures without author text keep it. Errors on empty `alt` |
+| `figure_alt(index) -> Option<&str>` / `figure_count() -> usize` | `gp_figure_count(handle)` · SDK `figureCount` | read back a figure's author `/Alt`; count the taggable figures the engine reconstructs (the valid range `0..figure_count()` for `set_figure_alt`'s `index`) |
 
 ### X → PDF (reverse, stateless)
 

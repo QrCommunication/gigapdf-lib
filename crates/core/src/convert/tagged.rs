@@ -95,6 +95,12 @@ struct StructNode {
     /// The MCIDs this leaf owns on `page`, in content order (filled from the
     /// rewrite result). One per show operator the leaf covers.
     mcids: Vec<i64>,
+    /// Alternate text (`/Alt`) to emit for a [`Role::Figure`] leaf (ISO 32000-1
+    /// §14.9.3): the author-supplied string from
+    /// [`crate::Document::set_figure_alt`] when one was set for this figure's
+    /// document-global index, else a generic placeholder so the figure stays
+    /// PDF/UA-valid. `None` for non-figure nodes (they emit no `/Alt`).
+    alt: Option<Vec<u8>>,
     /// Child structure elements (containers only).
     kids: Vec<StructNode>,
 }
@@ -107,6 +113,7 @@ impl StructNode {
             leaf_id: None,
             page: None,
             mcids: Vec::new(),
+            alt: None,
             kids: Vec::new(),
         }
     }
@@ -118,8 +125,16 @@ impl StructNode {
             leaf_id: Some(leaf_id),
             page: None,
             mcids: Vec::new(),
+            alt: None,
             kids: Vec::new(),
         }
+    }
+
+    /// A [`Role::Figure`] leaf carrying its resolved `/Alt` bytes.
+    fn figure(leaf_id: LeafId, alt: Vec<u8>) -> Self {
+        let mut node = Self::leaf(Role::Figure, leaf_id);
+        node.alt = Some(alt);
+        node
     }
 }
 
@@ -180,6 +195,10 @@ pub(crate) fn build_struct_tree(
     // The single top-level /Document element and a monotonic leaf-id source.
     let mut document = StructNode::container(Role::Document);
     let mut leaf_seq: LeafId = 0;
+    // Document-global figure counter (0-based, increments across pages in the same
+    // page→content order the figures are minted). Keys `doc.figure_alt(index)` so
+    // the Nth figure of the whole document gets the Nth author `/Alt`.
+    let mut global_fig: usize = 0;
 
     // Accumulate, per leaf id, the `(page, mcids)` it owns (a leaf lives on one
     // page). Filled from each page's rewrite.
@@ -198,9 +217,14 @@ pub(crate) fn build_struct_tree(
         let mut plan = PagePlan::default();
         let mut page_nodes: Vec<StructNode> = Vec::new();
         for block in &blocks {
-            if let Some(node) =
-                node_from_block(block, &mut leaf_seq, &mut fig_ordinal, &mut plan)
-            {
+            if let Some(node) = node_from_block(
+                doc,
+                block,
+                &mut leaf_seq,
+                &mut fig_ordinal,
+                &mut global_fig,
+                &mut plan,
+            ) {
                 page_nodes.push(node);
             }
         }
@@ -285,10 +309,19 @@ pub(crate) fn build_struct_tree(
 /// Build a structure node (and its descendants) from a model [`Block`], minting
 /// leaf ids and recording the `source_index`/image-ordinal → leaf bindings in
 /// `plan`. Returns `None` for blocks with no taggable content (a shape, a rule).
+///
+/// `fig_ordinal` is the **per-page** image ordinal (for the positional
+/// `by_image_ordinal` binding); `global_fig` is the **document-global** figure
+/// index, used to look up the author's `/Alt` (`doc.figure_alt(index)`). Both
+/// advance only on `BlockKind::Image`, in lock-step, exactly where a `/Figure`
+/// is minted — including images nested in list items and table cells, so the
+/// document-global index matches [`crate::Document::figure_count`].
 fn node_from_block(
+    doc: &crate::Document,
     block: &Block,
     leaf_seq: &mut LeafId,
     fig_ordinal: &mut usize,
+    global_fig: &mut usize,
     plan: &mut PagePlan,
 ) -> Option<StructNode> {
     match &block.kind {
@@ -302,7 +335,9 @@ fn node_from_block(
                 let mut li = StructNode::container(Role::LI);
                 let mut body = StructNode::container(Role::LBody);
                 for b in &item.blocks {
-                    if let Some(child) = node_from_block(b, leaf_seq, fig_ordinal, plan) {
+                    if let Some(child) =
+                        node_from_block(doc, b, leaf_seq, fig_ordinal, global_fig, plan)
+                    {
                         body.kids.push(child);
                     }
                 }
@@ -322,7 +357,9 @@ fn node_from_block(
                     let role = if r == 0 { Role::TH } else { Role::TD };
                     let mut cell_node = StructNode::container(role);
                     for b in &cell.blocks {
-                        if let Some(child) = node_from_block(b, leaf_seq, fig_ordinal, plan) {
+                        if let Some(child) =
+                            node_from_block(doc, b, leaf_seq, fig_ordinal, global_fig, plan)
+                        {
                             cell_node.kids.push(child);
                         }
                     }
@@ -347,11 +384,28 @@ fn node_from_block(
             *leaf_seq += 1;
             let ordinal = *fig_ordinal;
             *fig_ordinal += 1;
+            // Resolve this figure's `/Alt`: the author's text for this
+            // document-global figure index when set, else a non-empty placeholder
+            // (so the figure stays PDF/UA-valid). Advance the global index in
+            // lock-step with the per-page ordinal.
+            let alt = figure_alt_bytes(doc.figure_alt(*global_fig));
+            *global_fig += 1;
             plan.by_image_ordinal
                 .insert(ordinal, (leaf_id, Role::Figure.tag()));
-            Some(StructNode::leaf(Role::Figure, leaf_id))
+            Some(StructNode::figure(leaf_id, alt))
         }
         _ => None,
+    }
+}
+
+/// Encode a figure's `/Alt` string value: the author's alternate text when
+/// supplied (UTF-16BE for non-ASCII, exactly as the editor encodes text), else a
+/// generic non-empty placeholder so every `/Figure` carries an `/Alt` and the
+/// output stays structurally PDF/UA-valid (ISO 32000-1 §14.9.3).
+fn figure_alt_bytes(author_alt: Option<&str>) -> Vec<u8> {
+    match author_alt {
+        Some(text) if !text.is_empty() => crate::font::encode_pdf_text(text),
+        _ => crate::font::encode_pdf_text("Figure"),
     }
 }
 
@@ -574,6 +628,16 @@ fn emit_node(node: &StructNode, parent: ObjectId, objects: &mut BTreeMap<ObjectI
     dict.set(b"Type", crate::annot::name(b"StructElem"));
     dict.set(b"S", Object::Name(node.role.tag()));
     dict.set(b"P", Object::Reference(parent));
+
+    // A `/Figure` (level-A / PDF-UA) requires non-empty alternate text describing
+    // the image (ISO 32000-1 §14.9.3): emit the resolved `/Alt` (author-supplied
+    // when set via `Document::set_figure_alt`, else the generic placeholder).
+    if let Some(alt) = &node.alt {
+        dict.set(
+            b"Alt",
+            Object::String(alt.clone(), crate::object::StringKind::Literal),
+        );
+    }
 
     if node.leaf_id.is_some() {
         // A content leaf: `/Pg` + `/K` MCID(s).
@@ -843,5 +907,174 @@ mod tests {
                 "{level:?}: no MarkInfo on a non-A level"
             );
         }
+    }
+
+    /// A real 1×1 PNG (valid, decodable) so [`crate::Document::add_image`] embeds
+    /// an image XObject the geometric reconstruction surfaces as a `BlockKind::Image`
+    /// → a `/Figure` structure element when tagged.
+    fn tiny_png() -> [u8; 70] {
+        [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xDA, 0x63, 0xFC, 0xCF, 0xC0, 0x50, 0x0F, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xA9,
+            0x8C, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    /// A one-page document carrying `count` real images (so the reconstruction
+    /// yields `count` `/Figure`s when tagged).
+    fn doc_with_images(count: usize) -> crate::Document {
+        let src = crate::convert::reverse::txt_to_pdf("Body text page for figures.");
+        let mut doc = crate::Document::open(&src).expect("open base pdf");
+        let png = tiny_png();
+        for i in 0..count {
+            let x = 30.0 + (i as f64) * 90.0;
+            doc.add_image(1, &png, x, 30.0, 80.0, 80.0, 1.0)
+                .expect("embed image");
+        }
+        doc
+    }
+
+    /// Author-supplied alternate text set on figure 0 lands on that `/Figure`
+    /// structure element's `/Alt` (ISO 32000-1 §14.9.3) in a level-A export,
+    /// instead of the generic placeholder — exercised through both the
+    /// PDF/A-2a/1a path and `to_tagged`.
+    #[test]
+    fn figure_alt_author_text_reaches_struct_elem() {
+        let alt = "A bar chart of quarterly revenue";
+        for tagged in tagged_outputs(|doc| {
+            doc.set_figure_alt(0, alt).expect("set alt");
+        }) {
+            let s = String::from_utf8_lossy(&tagged.bytes);
+            assert!(
+                s.contains(alt),
+                "{}: author /Alt present; got:\n{s}",
+                tagged.label
+            );
+            // One figure ⇒ exactly one `/Alt`, and it is the author's (not the
+            // placeholder). `/Alt` is emitted only on the `/Figure` StructElem, so
+            // its count equals the figure count (unlike `/Figure`, which also
+            // appears as the marked-content `BDC` tag in the page stream).
+            assert!(s.contains("/Figure"), "{}: a figure element", tagged.label);
+            assert_eq!(s.matches("/Alt").count(), 1, "{}: one /Alt", tagged.label);
+            assert!(
+                !s.contains("(Figure)"),
+                "{}: author /Alt replaced the placeholder",
+                tagged.label
+            );
+            // Reopens cleanly (tagging stays additive).
+            assert!(
+                crate::Document::open(&tagged.bytes).is_ok(),
+                "{}: reopens",
+                tagged.label
+            );
+        }
+    }
+
+    /// A figure with **no** author-supplied alt keeps the non-empty placeholder
+    /// (`(Figure)`) so the output stays structurally PDF/UA-valid — existing
+    /// callers are unaffected (no regression).
+    #[test]
+    fn figure_without_author_alt_keeps_placeholder() {
+        for tagged in tagged_outputs(|_doc| {}) {
+            let s = String::from_utf8_lossy(&tagged.bytes);
+            assert!(
+                s.contains("/Figure") && s.contains("/Alt"),
+                "{}: figure still carries an /Alt",
+                tagged.label
+            );
+            assert!(
+                s.contains("(Figure)"),
+                "{}: placeholder /Alt present",
+                tagged.label
+            );
+        }
+    }
+
+    /// A second figure gets its **own** alt: each `/Figure` carries the alt set
+    /// for its document-global index (0 → first, 1 → second), independently.
+    #[test]
+    fn second_figure_gets_its_own_alt() {
+        let alt0 = "Company logo, a red square";
+        let alt1 = "Signature of the director";
+        let mut doc = doc_with_images(2);
+        assert_eq!(doc.figure_count(), 2, "two figures reconstructed");
+        doc.set_figure_alt(0, alt0).unwrap();
+        doc.set_figure_alt(1, alt1).unwrap();
+        // Both export paths must carry both author alts and exactly two `/Alt`s.
+        let outputs = [
+            ("to_tagged", doc.to_tagged(true)),
+            (
+                "pdfa-2a",
+                doc.to_pdfa_level(crate::convert::pdfa::PdfaLevel::Pdfa2a),
+            ),
+        ];
+        for (label, bytes) in outputs {
+            let s = String::from_utf8_lossy(&bytes);
+            assert!(s.contains(alt0), "{label}: figure 0 alt");
+            assert!(s.contains(alt1), "{label}: figure 1 alt");
+            // Two figures ⇒ two `/Alt` (one per `/Figure` StructElem), both authored.
+            assert_eq!(s.matches("/Alt").count(), 2, "{label}: two /Alt");
+            assert!(!s.contains("(Figure)"), "{label}: no placeholder left");
+        }
+    }
+
+    /// Setting alt on only the second figure labels that one and leaves the first
+    /// on the placeholder — the registry is keyed per figure, not all-or-nothing.
+    #[test]
+    fn partial_alt_labels_only_the_named_figure() {
+        let alt1 = "Detail photo of the seal";
+        let mut doc = doc_with_images(2);
+        doc.set_figure_alt(1, alt1).unwrap();
+        let out = doc.to_tagged(false);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(alt1), "named figure carries its alt");
+        assert!(s.contains("(Figure)"), "unnamed figure keeps placeholder");
+        assert_eq!(s.matches("/Alt").count(), 2, "still one /Alt per figure");
+    }
+
+    /// `figure_alt` round-trips through the registry, and an empty alt is rejected
+    /// (the placeholder is the "no alt" state — clearing is not via empty string).
+    #[test]
+    fn set_figure_alt_stores_and_validates() {
+        let mut doc = doc_with_images(1);
+        assert_eq!(doc.figure_alt(0), None, "no author alt initially");
+        doc.set_figure_alt(0, "A photo of a bridge").unwrap();
+        assert_eq!(doc.figure_alt(0), Some("A photo of a bridge"));
+        // Replacing keeps the latest value.
+        doc.set_figure_alt(0, "An updated caption").unwrap();
+        assert_eq!(doc.figure_alt(0), Some("An updated caption"));
+        // Empty alt is an invalid argument (no `/Alt` may be empty).
+        assert!(doc.set_figure_alt(0, "").is_err(), "empty alt rejected");
+        // The rejected call left the prior value intact.
+        assert_eq!(doc.figure_alt(0), Some("An updated caption"));
+    }
+
+    /// A tagged output and the label naming which export path produced it.
+    struct TaggedOut {
+        label: &'static str,
+        bytes: Vec<u8>,
+    }
+
+    /// Build the three level-A / tagged outputs (`pdfa-2a`, `pdfa-1a`, `to_tagged`)
+    /// for a one-image document after applying `author` (which sets figure alts).
+    fn tagged_outputs(author: impl Fn(&mut crate::Document)) -> Vec<TaggedOut> {
+        let mut doc = doc_with_images(1);
+        author(&mut doc);
+        vec![
+            TaggedOut {
+                label: "pdfa-2a",
+                bytes: doc.to_pdfa_level(crate::convert::pdfa::PdfaLevel::Pdfa2a),
+            },
+            TaggedOut {
+                label: "pdfa-1a",
+                bytes: doc.to_pdfa_level(crate::convert::pdfa::PdfaLevel::Pdfa1a),
+            },
+            TaggedOut {
+                label: "to_tagged",
+                bytes: doc.to_tagged(true),
+            },
+        ]
     }
 }

@@ -4003,6 +4003,39 @@ export class GigaPdfDoc {
     return this.g._buffer((o) => this.ex().gp_to_tagged(this.h, opts.pdfUa ? 1 : 0, o));
   }
 
+  /**
+   * The number of taggable **figures** the engine reconstructs across the whole
+   * document — the valid range `0..figureCount()` for {@link setFigureAlt}'s
+   * `index`. Each figure is an image the geometric reconstruction surfaces; the
+   * Tagged-PDF / PDF-A-level-A export emits one `/Figure` structure element per
+   * figure, in this same order.
+   */
+  figureCount(): number {
+    return this.ex().gp_figure_count(this.h);
+  }
+
+  /**
+   * Attach **author-supplied alternate text** (`/Alt`) to a figure so assistive
+   * technology can describe the image (WCAG / PDF/UA, ISO 32000-1 §14.9.3).
+   *
+   * `index` is the **document-global figure index** — figures are numbered
+   * `0, 1, 2, …` in page order, then in page-content order within each page (the
+   * Nth image of the whole document is figure `N`; {@link figureCount} bounds the
+   * range). The text lands on the matching `/Figure` structure element's `/Alt`
+   * when an accessible export is produced — {@link toTagged} or {@link toPdfA}
+   * with `"pdfa-1a"`/`"pdfa-2a"`. Figures with no author-supplied text keep a
+   * generic non-empty placeholder, so the output stays structurally valid even
+   * for unlabeled figures.
+   *
+   * Returns `true` on success; `false` if `alt` is empty (a `/Alt` must be
+   * non-empty) or the call otherwise fails.
+   */
+  setFigureAlt(index: number, alt: string): boolean {
+    return (
+      this.g._withStr(alt, (p, l) => this.ex().gp_set_figure_alt(this.h, index, p, l)) === 0
+    );
+  }
+
   // security
   /**
    * Serialize the document encrypted with the PDF Standard Security Handler.

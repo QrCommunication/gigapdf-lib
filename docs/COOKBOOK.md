@@ -1512,10 +1512,45 @@ The structure is derived from the engine's reconstruction (the same model behind
 pipelines tag well. If a document has no reconstructable structure, the plain
 (untagged) PDF is returned unchanged.
 
-> Figures receive a non-empty `/Alt` placeholder so the output is structurally
-> PDF/UA-valid; **meaningful** alternate text still requires author input (a
-> per-figure alt-text API is future work). For full archival + accessibility,
-> `toPdfA("pdfa-2a")` produces a PDF/A-2a (level A) file with the same tree.
+> Figures without author-supplied alternate text receive a non-empty `/Alt`
+> placeholder so the output stays structurally PDF/UA-valid. **Meaningful** alt
+> text — what the figure actually conveys — requires author input: set it with
+> `setFigureAlt` (next section). For full archival **and** accessibility,
+> `toPdfA("pdfa-2a")` produces a PDF/A-2a (level A) file with the same tree (and
+> the same author `/Alt`).
+
+### Meaningful alternate text per figure (`/Alt`)
+
+Real accessibility (WCAG, PDF/UA, ISO 32000-1 §14.9.3) needs each figure to carry
+**alternate text** describing the image — only the author knows what a figure
+conveys. `setFigureAlt(index, alt)` attaches that text to the figure's `/Figure`
+structure element so it lands in the tagged output instead of the placeholder.
+
+`index` is the **document-global figure index**: figures are numbered `0, 1, 2, …`
+in page order, then in page-content order within each page (the Nth image of the
+whole document is figure `N`). `figureCount()` returns how many figures the engine
+reconstructs (the valid range `0..figureCount()`).
+
+```ts
+const doc = giga.open(pdfBytes);
+
+console.log(doc.figureCount()); // e.g. 2
+
+// Describe each figure for assistive technology.
+doc.setFigureAlt(0, "Bar chart: quarterly revenue grew 18% YoY");
+doc.setFigureAlt(1, "Photo of the signed contract, page 3");
+
+// The text lands on each `/Figure` `/Alt` in any accessible export:
+const tagged = doc.toTagged({ pdfUa: true });   // tagged + PDF/UA-1
+const archival = doc.toPdfA("pdfa-2a");          // PDF/A-2a (level A)
+
+doc.close();
+```
+
+Figures you don't label keep the generic placeholder, so a partly-labelled
+document still validates (no figure is ever left without an `/Alt`). `setFigureAlt`
+returns `false` if `alt` is empty — a `/Alt` must be non-empty to be useful, and
+the placeholder is the "no alt" state.
 
 ---
 

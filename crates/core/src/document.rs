@@ -56,6 +56,15 @@ pub struct Document {
     /// [`finish_doc_timestamp`](Document::finish_doc_timestamp) embeds the token.
     /// `None` outside that window (cleared on finish).
     pending_doc_timestamp: Option<PendingDocTimestamp>,
+    /// Author-supplied alternate text (`/Alt`) for figures, keyed by the
+    /// **document-global figure index** (0-based, enumerated page-by-page then in
+    /// page-content order — the very order the Tagged-PDF builder mints `/Figure`
+    /// structure elements). Set via [`set_figure_alt`](Document::set_figure_alt)
+    /// and consumed by [`crate::convert::tagged::build_struct_tree`] when a
+    /// level-A / PDF-UA export is produced: a figure with an entry here emits that
+    /// string as its `/Alt`; a figure without one keeps the generic placeholder so
+    /// existing callers stay structurally PDF/UA-valid (ISO 32000-1 §14.9.3).
+    figure_alt: BTreeMap<usize, String>,
 }
 
 /// The frozen state of a PAdES-B-LTA document timestamp between Phase 1 (append
@@ -463,6 +472,33 @@ fn merge_cid_maps(
 /// Build a literal PDF text string object (PDFDocEncoding / UTF-16BE as needed).
 fn pdf_text(s: &str) -> Object {
     Object::String(crate::font::encode_pdf_text(s), StringKind::Literal)
+}
+
+/// Count the taggable **figures** (image blocks) a model [`crate::model::Block`]
+/// yields, mirroring `crate::convert::tagged::node_from_block` *exactly*: a
+/// top-level [`crate::model::BlockKind::Image`] is one figure, and the builder
+/// descends only into **list items** and **table cells** (every other block kind
+/// yields no `/Figure`). Drives [`Document::figure_count`] so its 0-based figure
+/// index matches the order the Tagged-PDF builder mints `/Figure` elements.
+fn count_image_blocks(block: &crate::model::Block) -> usize {
+    use crate::model::BlockKind;
+    match &block.kind {
+        BlockKind::Image(_) => 1,
+        BlockKind::List(list) => list
+            .items
+            .iter()
+            .flat_map(|item| item.blocks.iter())
+            .map(count_image_blocks)
+            .sum(),
+        BlockKind::Table(table) => table
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .flat_map(|cell| cell.blocks.iter())
+            .map(count_image_blocks)
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// A minimal XMP packet declaring **PDF/UA-1** conformance (ISO 14289-1):
@@ -2421,6 +2457,7 @@ impl Document {
             base14_refs: BTreeMap::new(),
             pending_timestamp: None,
             pending_doc_timestamp: None,
+            figure_alt: BTreeMap::new(),
         })
     }
 
@@ -2445,6 +2482,7 @@ impl Document {
             base14_refs: BTreeMap::new(),
             pending_timestamp: None,
             pending_doc_timestamp: None,
+            figure_alt: BTreeMap::new(),
         })
     }
 
@@ -7982,14 +8020,72 @@ impl Document {
         crate::serialize::to_pdf_with_header(&objects, &trailer, level.header())
     }
 
+    /// Attach **author-supplied alternate text** (`/Alt`) to a figure for the
+    /// accessible (Tagged-PDF / PDF-UA) export, so assistive technology can
+    /// describe the image (WCAG, PDF/UA, ISO 32000-1 §14.9.3).
+    ///
+    /// `index` is the **document-global figure index** — figures are numbered
+    /// `0, 1, 2, …` in page order, then in page-content order within each page,
+    /// exactly as the Tagged-PDF builder mints their `/Figure` structure elements
+    /// (the Nth taggable image across the whole document is figure `N`). The same
+    /// index is what [`figure_count`](Self::figure_count) bounds.
+    ///
+    /// The text lands on the corresponding `Figure` `/StructElem`'s `/Alt` when a
+    /// **level-A** flavour ([`to_pdfa_level`](Self::to_pdfa_level) with
+    /// `Pdfa1a`/`Pdfa2a`) or a [`to_tagged`](Self::to_tagged) export is produced.
+    /// Figures with no author-supplied text keep a generic non-empty placeholder
+    /// so existing callers stay structurally valid (no regression). Setting a new
+    /// value for the same `index` replaces the previous one.
+    ///
+    /// Returns [`EngineError::InvalidArgument`] when `alt` is empty (a `/Alt` must
+    /// be non-empty to be useful; clearing is not supported — the placeholder is
+    /// the "no alt" state).
+    pub fn set_figure_alt(&mut self, index: usize, alt: &str) -> Result<()> {
+        if alt.is_empty() {
+            return Err(EngineError::InvalidArgument(
+                "figure alt text must not be empty".into(),
+            ));
+        }
+        self.figure_alt.insert(index, alt.to_string());
+        Ok(())
+    }
+
+    /// The author-supplied alternate text previously set for the figure at
+    /// `index` via [`set_figure_alt`](Self::set_figure_alt), or `None` if that
+    /// figure has no author `/Alt` (it will use the placeholder when tagged).
+    pub fn figure_alt(&self, index: usize) -> Option<&str> {
+        self.figure_alt.get(&index).map(String::as_str)
+    }
+
+    /// The number of taggable figures the engine reconstructs across the whole
+    /// document — the count of distinct `index` values
+    /// [`set_figure_alt`](Self::set_figure_alt) accepts (`0..figure_count`). Each
+    /// is an image block the geometric reconstruction surfaces on some page; the
+    /// Tagged-PDF builder emits one `/Figure` per figure in this same order.
+    pub fn figure_count(&self) -> usize {
+        let Ok(page_ids) = self.page_ids() else {
+            return 0;
+        };
+        (1..=page_ids.len() as u32)
+            .map(|page_no| {
+                self.page_blocks(page_no)
+                    .iter()
+                    .map(count_image_blocks)
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Author a **tagged (accessible) PDF** — a logical-structure tree the way
     /// PDF/A level A does, but **without** forcing PDF/A (no OutputIntent / ICC /
     /// `pdfaid` metadata). Builds a `/StructTreeRoot` (`P`/`H1`–`H6`/`Table`/`L`/
     /// `Figure` …) with marked content (`/MCID`), `/MarkInfo /Marked true`, a
-    /// `/Lang`, an (empty) `/RoleMap`, and `/Alt` on every `Figure`. When `pdf_ua`
-    /// is set it also stamps the **PDF/UA-1** identifier (ISO 14289) in XMP. If the
-    /// document has no reconstructable structure the plain (untagged) PDF is
-    /// returned. ISO 32000-1 §14.7/§14.8.
+    /// `/Lang`, an (empty) `/RoleMap`, and `/Alt` on every `Figure` (the
+    /// author-supplied text from [`set_figure_alt`](Self::set_figure_alt) when
+    /// given, else a generic placeholder). When `pdf_ua` is set it also stamps the
+    /// **PDF/UA-1** identifier (ISO 14289) in XMP. If the document has no
+    /// reconstructable structure the plain (untagged) PDF is returned. ISO
+    /// 32000-1 §14.7/§14.8.
     pub fn to_tagged(&self, pdf_ua: bool) -> Vec<u8> {
         let mut objects = self.objects.clone();
         let trailer = self.trailer.clone();

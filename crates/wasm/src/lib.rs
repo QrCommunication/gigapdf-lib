@@ -932,6 +932,33 @@ pub extern "C" fn gp_to_tagged(
     }
 }
 
+/// Attach author-supplied alternate text (`/Alt`, ISO 32000-1 §14.9.3) to the
+/// figure at the **document-global** `index` (0-based, page-then-content order),
+/// so it appears on the figure's structure element when a level-A / PDF-UA
+/// export is produced (instead of the generic placeholder). `alt` is UTF-8.
+/// Returns `0` on success, `-1` null handle, `-3` on error (e.g. empty `alt`).
+#[no_mangle]
+pub extern "C" fn gp_set_figure_alt(
+    handle: *mut Document,
+    index: usize,
+    alt_ptr: *const u8,
+    alt_len: usize,
+) -> i32 {
+    let alt = unsafe { str_arg(alt_ptr, alt_len) };
+    edit(handle, |doc| doc.set_figure_alt(index, alt))
+}
+
+/// The number of taggable figures the engine reconstructs across the document
+/// (the valid range `0..N` for [`gp_set_figure_alt`]'s `index`). `-1` on a null
+/// handle.
+#[no_mangle]
+pub extern "C" fn gp_figure_count(handle: *const Document) -> i32 {
+    match unsafe { handle.as_ref() } {
+        Some(doc) => doc.figure_count() as i32,
+        None => -1,
+    }
+}
+
 // ─── content queries (JSON) ──────────────────────────────────────────────────
 
 /// Text runs of a page as a JSON array. Host frees the returned buffer.
