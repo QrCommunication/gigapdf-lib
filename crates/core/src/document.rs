@@ -8198,9 +8198,26 @@ impl Document {
         crate::convert::office::to_ods_with_shapes(&grids, &[], &shapes)
     }
 
-    /// Convert the document's text to an RTF document (one paragraph per text
-    /// line). Pairs with [`reverse::rtf_to_pdf`](crate::convert::reverse::rtf_to_pdf).
+    /// Convert the document to an RTF document. Pairs with
+    /// [`reverse::rtf_to_pdf`](crate::convert::reverse::rtf_to_pdf).
+    ///
+    /// When the document carries a **text-bearing structure tree** (tagged,
+    /// Office-imported or otherwise authored — see
+    /// [`has_semantic_structure`](Self::has_semantic_structure)) the model tree is
+    /// reconstructed and exported through
+    /// [`reverse::rtf_from_model`](crate::convert::reverse::rtf_from_model), which
+    /// preserves styled runs (bold/italic/underline/size/colour), real
+    /// `\trowd … \row` table grids, ordered/nested list markers, `{\pict}` images
+    /// and `{\field HYPERLINK}` links. Mirrors exactly the model-aware gating of
+    /// [`to_text`](Self::to_text).
+    ///
+    /// A pure-PDF document with no structure tree keeps the plain fallback: its
+    /// text lines are wrapped one paragraph each (no styling), via
+    /// [`reverse::to_rtf`](crate::convert::reverse::to_rtf).
     pub fn to_rtf(&self) -> Vec<u8> {
+        if self.has_semantic_structure() {
+            return crate::convert::reverse::rtf_from_model(&self.reconstruct_model());
+        }
         let text = self.to_text();
         let paragraphs: Vec<String> = text
             .split(['\n', '\u{000C}'])
@@ -33308,6 +33325,159 @@ mod tests {
         assert!(
             text.contains('\u{000C}'),
             "the pure-PDF path still closes the page with a form feed: {text:?}"
+        );
+    }
+
+    // ---- to_rtf: model-aware gating mirrors to_text (#4) ----------------------
+
+    #[test]
+    fn to_rtf_structured_doc_emits_styled_table_grid() {
+        // A tagged (structured) document routes `to_rtf` through the rich
+        // `rtf_from_model` exporter: a table becomes a real `\trowd … \cellxN …
+        // \row` grid — content the plain text→RTF fallback can never produce (it
+        // would flatten the cells onto tab-free lines). The HTML carries a 2×2
+        // table; `to_tagged` adds the `/StructTreeRoot` so `has_semantic_structure`
+        // engages, exactly as `to_text` gates.
+        let html = "<p>Heading paragraph.</p>\
+            <table><tr><td>A1</td><td>B1</td></tr><tr><td>A2</td><td>B2</td></tr></table>";
+        let src = crate::convert::reverse::html_to_pdf(html);
+        let tagged = Document::open(&src).unwrap().to_tagged(false);
+        let doc = Document::open(&tagged).unwrap();
+        assert!(
+            doc.has_semantic_structure(),
+            "tagged doc carries a struct tree → model-aware RTF path"
+        );
+
+        let rtf = String::from_utf8(doc.to_rtf()).unwrap();
+        assert!(
+            rtf.contains("\\trowd") && rtf.contains("\\cellx"),
+            "structured RTF emits a real table grid, not flat text: {rtf}"
+        );
+        assert!(
+            rtf.contains("\\cell") && rtf.contains("\\row"),
+            "table cells/row terminators present: {rtf}"
+        );
+
+        // It is genuinely the model exporter, not the plain wrapper: the flat
+        // text→RTF fallback (no `\trowd`) would differ.
+        let flat = String::from_utf8(crate::convert::reverse::to_rtf(
+            &doc.to_text()
+                .split(['\n', '\u{000C}'])
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        assert!(
+            !flat.contains("\\trowd"),
+            "sanity: the flat fallback carries no table grid: {flat}"
+        );
+        assert_ne!(rtf, flat, "structured path diverges from the flat fallback");
+    }
+
+    #[test]
+    fn to_rtf_pure_pdf_keeps_flat_fallback() {
+        // A pure-PDF document (no `/StructTreeRoot`) keeps the plain text→RTF
+        // fallback: one paragraph per text line (`\par`-separated), with no styled
+        // model constructs (no `\trowd` table grid). Mirrors
+        // `to_text_pure_pdf_uses_flat_layer`'s gate on the negative side.
+        let stream = "BT /F1 12 Tf 50 150 Td (HELLO) Tj ET";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{stream}\nendstream", stream.len()),
+            ),
+            (
+                5,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        assert!(
+            !doc.has_semantic_structure(),
+            "no struct tree → flat text→RTF fallback"
+        );
+
+        let rtf = String::from_utf8(doc.to_rtf()).unwrap();
+        assert!(
+            rtf.contains("HELLO"),
+            "fallback carries the text run: {rtf}"
+        );
+        assert!(
+            rtf.starts_with("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Helvetica;}}\\fs22"),
+            "fallback uses the plain RTF preamble (no colour table): {rtf}"
+        );
+        assert!(
+            !rtf.contains("\\trowd"),
+            "the pure-PDF fallback emits no model table grid: {rtf}"
+        );
+    }
+
+    #[test]
+    fn to_rtf_styled_run_and_table_route_through_model_exporter() {
+        // `to_rtf` delegates a model-bearing document to
+        // `convert::reverse::rtf_from_model` (see its body). Geometric
+        // reconstruction cannot resurrect run boldness from rendered glyphs, so
+        // the styling contract `to_rtf` relies on is pinned here on the exact
+        // exporter it calls: a bold run emits `\b`, and a table emits a `\trowd`
+        // grid — together, the styled output the issue requires (vs the old
+        // text-only RTF).
+        use crate::model::{
+            Block, BlockKind, Cell, CharStyle, Inline, InlineRun, Paragraph, Row, Table,
+        };
+        let bold = Block {
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "STRONG".into(),
+                    style: CharStyle {
+                        bold: true,
+                        ..CharStyle::default()
+                    },
+                    source_index: None,
+                })],
+                ..Paragraph::default()
+            }),
+            ..Block::default()
+        };
+        let table = Block {
+            kind: BlockKind::Table(Table {
+                rows: vec![Row {
+                    cells: vec![
+                        Cell {
+                            blocks: vec![para_block("A1")],
+                            ..Cell::default()
+                        },
+                        Cell {
+                            blocks: vec![para_block("B1")],
+                            ..Cell::default()
+                        },
+                    ],
+                    ..Row::default()
+                }],
+                col_widths: vec![100.0, 100.0],
+                ..Table::default()
+            }),
+            ..Block::default()
+        };
+        let rtf = String::from_utf8(crate::convert::reverse::rtf_from_model(&model_with_blocks(
+            vec![bold, table],
+        )))
+        .unwrap();
+        assert!(
+            rtf.contains("\\b STRONG") || rtf.contains("\\b "),
+            "bold run carries the \\b control word: {rtf}"
+        );
+        assert!(
+            rtf.contains("\\trowd") && rtf.contains("\\cellx"),
+            "table emits a real grid: {rtf}"
         );
     }
 }
