@@ -189,6 +189,26 @@ pub trait ResourceCtx {
     fn inline_image(&self, _raw: &[u8]) -> Option<RenderImage> {
         None
     }
+
+    /// Whether the optional-content (layer) referenced by a `/OC … BDC` marked
+    /// sequence is **visible** in the default configuration (ISO 32000-1 §8.11).
+    /// `prop` is the second operand of `/OC <prop> BDC`: a `/Name` keyed in the
+    /// current `/Resources /Properties` (resolving to an OCG or OCMD), or an
+    /// inline OCG/OCMD dictionary. A `false` return makes the rasterizer skip
+    /// every painting operator up to the matching `EMC`.
+    ///
+    /// The default returns `true` (contexts without an object graph can't tell
+    /// what's hidden, so they show everything) — the prior behaviour.
+    fn oc_marked_visible(&self, _prop: &Object) -> bool {
+        true
+    }
+
+    /// Whether an XObject named `name` (in the current `/Resources /XObject`) is
+    /// **visible** given its own `/OC` entry (ISO 32000-1 §8.11.3.3). A `Do`
+    /// targeting a hidden XObject paints nothing. The default returns `true`.
+    fn oc_xobject_visible(&self, _name: &[u8]) -> bool {
+        true
+    }
 }
 
 /// A resource context that resolves nothing — used by [`render_content_into`],
@@ -670,13 +690,23 @@ pub fn render_content_into_ctx(
     let mut word_spacing = 0.0f64;
     let mut h_scale = 1.0f64;
 
+    // Optional-content (layer) visibility stack (ISO 32000-1 §8.11.3.2). Each
+    // open marked-content sequence (`BDC`/`BMC`) pushes whether it is *visible*:
+    // a `/OC` sequence whose group is OFF pushes `false`, every other marked
+    // sequence pushes `true`. `oc_hidden` counts the currently-open hidden
+    // frames, so painting is suppressed whenever **any** enclosing `/OC` is off
+    // (nested layers: an inner ON inside an outer OFF stays hidden).
+    let mut oc_stack: Vec<bool> = Vec::new();
+    let mut oc_hidden: usize = 0usize;
+
     for (op_index, op) in operations.iter().enumerate() {
         let n = nums(op);
         // When this op falls inside an excluded element's range, suppress its
         // painting (like `skip_text`, but for arbitrary op ranges) while still
-        // running all graphics/text-state bookkeeping below.
+        // running all graphics/text-state bookkeeping below. An enclosing hidden
+        // optional-content layer suppresses painting just the same.
         let op_excluded = excluded.get(op_index).copied().unwrap_or(false);
-        let skip_paint = op_excluded;
+        let skip_paint = op_excluded || oc_hidden > 0;
         match op.operator.as_slice() {
             b"q" => stack.push(state.clone()),
             b"Q" => {
@@ -885,7 +915,17 @@ pub fn render_content_into_ctx(
                 }
             }
 
-            b"Do" if !skip_paint => {
+            // A `Do` whose XObject carries an `/OC` that is OFF (ISO 32000-1
+            // §8.11.3.3) paints nothing, exactly like an enclosing hidden `/OC`
+            // marked sequence — applies to both image and form XObjects.
+            b"Do"
+                if !skip_paint
+                    && op
+                        .operands
+                        .first()
+                        .and_then(Object::as_name)
+                        .is_none_or(|name| ctx.oc_xobject_visible(name)) =>
+            {
                 if let Some(Object::Name(name)) = op.operands.first() {
                     if let Some(image) = images.get(name) {
                         let clip = state.paint_clip();
@@ -1026,6 +1066,36 @@ pub fn render_content_into_ctx(
                             let dx = -adj / 1000.0 * font_size * h_scale;
                             tm = Matrix::translate(dx, 0.0).then(&tm);
                         }
+                    }
+                }
+            }
+
+            // ── marked content (optional-content visibility, §8.11.3.2) ──
+            // `BDC`/`BMC` open a sequence; `EMC` closes the innermost one. A
+            // `/OC <prop> BDC` gates the enclosed operators on the referenced
+            // group's visibility — push `false` (hidden) when the group is OFF.
+            // Every other marked sequence (`/Span … BDC`, `BMC`) pushes `true`,
+            // so the stack stays balanced and a hidden ancestor keeps its
+            // descendants hidden regardless of their own tag.
+            b"BDC" | b"BMC" => {
+                let visible = if op.operator.as_slice() == b"BDC"
+                    && op.operands.first().and_then(Object::as_name) == Some(b"OC".as_slice())
+                {
+                    op.operands
+                        .get(1)
+                        .is_none_or(|prop| ctx.oc_marked_visible(prop))
+                } else {
+                    true
+                };
+                oc_stack.push(visible);
+                if !visible {
+                    oc_hidden += 1;
+                }
+            }
+            b"EMC" => {
+                if let Some(visible) = oc_stack.pop() {
+                    if !visible {
+                        oc_hidden = oc_hidden.saturating_sub(1);
                     }
                 }
             }
@@ -1922,5 +1992,265 @@ mod tests {
         assert_eq!(&canvas.pixels[cyan..cyan + 3], &[0, 255, 255]);
         let g = ((200 - 120) * 200 + 120) * 4;
         assert_eq!(canvas.pixels[g], 128);
+    }
+
+    // ── optional-content (layer) visibility enforcement (issue #54) ──
+
+    /// A `ResourceCtx` that answers only the optional-content questions, from a
+    /// fixed name→visible table (everything else resolves to nothing). Names
+    /// absent from the table default to **visible** — matching a stream that
+    /// references no layer.
+    struct OcStub {
+        /// `/OC <name> BDC` property names that are visible.
+        props: std::collections::BTreeMap<Vec<u8>, bool>,
+        /// `Do` XObject names whose `/OC` is visible.
+        xobjects: std::collections::BTreeMap<Vec<u8>, bool>,
+    }
+
+    impl ResourceCtx for OcStub {
+        fn form_xobject(&self, _name: &[u8]) -> Option<FormXObject<'_>> {
+            None
+        }
+        fn shading(&self, _name: &[u8]) -> Option<Shading> {
+            None
+        }
+        fn pattern_shading(&self, _name: &[u8]) -> Option<Shading> {
+            None
+        }
+        fn tiling_pattern(&self, _name: &[u8]) -> Option<FormXObject<'_>> {
+            None
+        }
+        fn ext_gstate(&self, _name: &[u8]) -> Option<ExtGStateParams> {
+            None
+        }
+        fn resolve_color(&self, _name: &[u8], _comps: &[f64]) -> Option<[u8; 3]> {
+            None
+        }
+        fn oc_marked_visible(&self, prop: &Object) -> bool {
+            match prop.as_name() {
+                Some(name) => self.props.get(name).copied().unwrap_or(true),
+                None => true,
+            }
+        }
+        fn oc_xobject_visible(&self, name: &[u8]) -> bool {
+            self.xobjects.get(name).copied().unwrap_or(true)
+        }
+    }
+
+    fn px(canvas: &Canvas, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * canvas.width as usize + x) * 4;
+        [canvas.pixels[i], canvas.pixels[i + 1], canvas.pixels[i + 2]]
+    }
+
+    #[test]
+    fn off_layer_marked_content_is_not_painted() {
+        // Two OCGs: `oc0` ON (red box, left), `oc1` OFF (blue box, right).
+        // Only the ON layer's box must be painted; the OFF layer's box is gone.
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(b"oc0".to_vec(), true);
+        props.insert(b"oc1".to_vec(), false);
+        let ctx = OcStub {
+            props,
+            xobjects: std::collections::BTreeMap::new(),
+        };
+        let content = b"/OC /oc0 BDC 1 0 0 rg 10 100 40 40 re f EMC\n\
+                        /OC /oc1 BDC 0 0 1 rg 150 100 40 40 re f EMC\n";
+        let mut canvas = Canvas::new(200, 200);
+        render_content_into_ctx(
+            &mut canvas,
+            content,
+            base(),
+            &RenderFonts::new(),
+            &RenderImages::new(),
+            1.0,
+            &ctx,
+            0,
+            None,
+            false,
+            &[],
+        );
+        // Left box (ON) is red; right box (OFF) stayed white paper.
+        assert_eq!(px(&canvas, 30, 80), [255, 0, 0], "ON layer box is painted");
+        assert_eq!(
+            px(&canvas, 170, 80),
+            [255, 255, 255],
+            "OFF layer box is hidden (not rasterized)"
+        );
+    }
+
+    #[test]
+    fn no_optional_content_paints_everything() {
+        // The same two boxes but with NO `/OC` brackets: both must paint, proving
+        // the enforcement is inert for ordinary (non-layered) content.
+        let ctx = OcStub {
+            props: std::collections::BTreeMap::new(),
+            xobjects: std::collections::BTreeMap::new(),
+        };
+        let content = b"1 0 0 rg 10 100 40 40 re f\n0 0 1 rg 150 100 40 40 re f\n";
+        let mut canvas = Canvas::new(200, 200);
+        render_content_into_ctx(
+            &mut canvas,
+            content,
+            base(),
+            &RenderFonts::new(),
+            &RenderImages::new(),
+            1.0,
+            &ctx,
+            0,
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(px(&canvas, 30, 80), [255, 0, 0], "first box paints");
+        assert_eq!(px(&canvas, 170, 80), [0, 0, 255], "second box paints");
+    }
+
+    #[test]
+    fn nested_oc_hidden_when_outer_is_off() {
+        // Outer layer OFF, inner layer ON: the inner content is still hidden
+        // because an enclosing layer is off (visibility stack, not just the
+        // innermost frame).
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(b"outer".to_vec(), false);
+        props.insert(b"inner".to_vec(), true);
+        let ctx = OcStub {
+            props,
+            xobjects: std::collections::BTreeMap::new(),
+        };
+        let content = b"/OC /outer BDC\n\
+                          1 0 0 rg 10 100 40 40 re f\n\
+                          /OC /inner BDC 0 0 1 rg 60 100 40 40 re f EMC\n\
+                        EMC\n";
+        let mut canvas = Canvas::new(200, 200);
+        render_content_into_ctx(
+            &mut canvas,
+            content,
+            base(),
+            &RenderFonts::new(),
+            &RenderImages::new(),
+            1.0,
+            &ctx,
+            0,
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(px(&canvas, 30, 80), [255, 255, 255], "outer-OFF box hidden");
+        assert_eq!(
+            px(&canvas, 80, 80),
+            [255, 255, 255],
+            "inner-ON box still hidden under an OFF ancestor"
+        );
+    }
+
+    #[test]
+    fn inner_on_paints_after_off_sibling_closes() {
+        // `/OC /off BDC … EMC` (hidden) followed by `/OC /on BDC … EMC` (visible):
+        // the `EMC` must pop the OFF frame so the next, ON layer paints. Guards
+        // the stack balance (a mismatched pop would leave the page hidden).
+        let mut props = std::collections::BTreeMap::new();
+        props.insert(b"off".to_vec(), false);
+        props.insert(b"on".to_vec(), true);
+        let ctx = OcStub {
+            props,
+            xobjects: std::collections::BTreeMap::new(),
+        };
+        let content = b"/OC /off BDC 1 0 0 rg 10 100 40 40 re f EMC\n\
+                        /OC /on BDC 0 0 1 rg 150 100 40 40 re f EMC\n";
+        let mut canvas = Canvas::new(200, 200);
+        render_content_into_ctx(
+            &mut canvas,
+            content,
+            base(),
+            &RenderFonts::new(),
+            &RenderImages::new(),
+            1.0,
+            &ctx,
+            0,
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(px(&canvas, 30, 80), [255, 255, 255], "OFF layer hidden");
+        assert_eq!(
+            px(&canvas, 170, 80),
+            [0, 0, 255],
+            "ON layer paints after the OFF sibling's EMC"
+        );
+    }
+
+    #[test]
+    fn off_xobject_do_paints_nothing() {
+        // A `Do` whose XObject's `/OC` is OFF must paint nothing, even though the
+        // image is present in the page image map (image-XObject branch of `Do`).
+        let image = RenderImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+            stencil: false,
+        };
+        let mut images = RenderImages::new();
+        images.insert(b"Im0".to_vec(), image);
+        let mut xobjects = std::collections::BTreeMap::new();
+        xobjects.insert(b"Im0".to_vec(), false); // its /OC is OFF
+        let ctx = OcStub {
+            props: std::collections::BTreeMap::new(),
+            xobjects,
+        };
+        let content = b"100 0 0 100 0 0 cm /Im0 Do";
+        let mut canvas = Canvas::new(100, 100);
+        render_content_into_ctx(
+            &mut canvas,
+            content,
+            Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 100.0),
+            &RenderFonts::new(),
+            &images,
+            1.0,
+            &ctx,
+            0,
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(
+            px(&canvas, 50, 50),
+            [255, 255, 255],
+            "OFF XObject image is not blitted"
+        );
+
+        // …and with its `/OC` ON, the same content blits the red image.
+        let mut xobjects = std::collections::BTreeMap::new();
+        xobjects.insert(b"Im0".to_vec(), true);
+        let ctx_on = OcStub {
+            props: std::collections::BTreeMap::new(),
+            xobjects,
+        };
+        let image_on = RenderImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+            stencil: false,
+        };
+        let mut images_on = RenderImages::new();
+        images_on.insert(b"Im0".to_vec(), image_on);
+        let mut canvas_on = Canvas::new(100, 100);
+        render_content_into_ctx(
+            &mut canvas_on,
+            content,
+            Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 100.0),
+            &RenderFonts::new(),
+            &images_on,
+            1.0,
+            &ctx_on,
+            0,
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(
+            px(&canvas_on, 50, 50),
+            [255, 0, 0],
+            "ON XObject image blits"
+        );
     }
 }

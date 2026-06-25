@@ -16736,6 +16736,125 @@ impl Document {
         }
     }
 
+    // ─── render-time visibility (issue #54) ──────────────────────────────────
+    //
+    // The default configuration `/OCProperties /D` (§8.11.4.3) decides each
+    // OCG's visibility; an `/OCMD` (§8.11.2.2) combines several OCGs under a
+    // `/P` policy. The rasterizer asks these readers (through the `ResourceCtx`
+    // trait) whether a `/OC … BDC` sequence or an XObject's `/OC` is visible, so
+    // content on a layer that is OFF by default is not painted.
+
+    /// Default visibility of the OCG with object number `ocg_id` per the default
+    /// configuration `/OCProperties /D` (ISO 32000-1 §8.11.4.3): start from
+    /// `/BaseState` (default `/ON`), then apply the `/OFF` and `/ON` override
+    /// arrays. A document with no `/OCProperties` (or no `/D`) reports every
+    /// group visible — nothing is hidden, the prior render behaviour.
+    fn oc_group_visible(&self, ocg_id: u32) -> bool {
+        let Some(cfg) = self
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"OCProperties"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|ocp| ocp.get(b"D"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        else {
+            return true;
+        };
+        let base = crate::ocg::base_state_visible(
+            cfg.get(b"BaseState")
+                .map(|o| self.resolve(o))
+                .as_ref()
+                .and_then(|o| o.as_name()),
+        );
+        // `/OFF` then `/ON` are explicit overrides; `/OFF` wins if (defensively)
+        // a group appears in both.
+        if self.oc_ref_ids(cfg.get(b"OFF")).contains(&ocg_id) {
+            false
+        } else if self.oc_ref_ids(cfg.get(b"ON")).contains(&ocg_id) {
+            true
+        } else {
+            base
+        }
+    }
+
+    /// Whether the optional-content object `oc` (the value of a `/OC` entry, or
+    /// the `/OC <prop>` operand of a `BDC`) is visible. Resolves an OCG to its
+    /// own default visibility ([`oc_group_visible`](Self::oc_group_visible)) and
+    /// an OCMD by combining its `/OCGs` members under its `/P` policy
+    /// ([`crate::ocg::ocmd_visible`]). Cycles in `/OCGs` are bounded by `depth`.
+    /// Unresolvable or empty membership ⇒ visible (no constraint).
+    fn oc_object_visible(&self, oc: &Object, depth: u8) -> bool {
+        // An OCG is referenced indirectly; its own default visibility is keyed
+        // by object number. Capture the id *before* resolving the dictionary.
+        let ocg_id = oc.as_reference().map(|r| r.0);
+        let resolved = self.resolve(oc);
+        let Some(dict) = resolved.as_dict() else {
+            return true; // not a dictionary we can read ⇒ impose no constraint
+        };
+        match dict.get(b"Type").and_then(Object::as_name) {
+            // Membership dictionary: combine member OCGs under the `/P` policy.
+            Some(b"OCMD") => {
+                if depth >= 8 {
+                    return true; // pathological nesting guard
+                }
+                let policy = crate::ocg::OcPolicy::from_name(
+                    dict.get(b"P")
+                        .map(|o| self.resolve(o))
+                        .as_ref()
+                        .and_then(|o| o.as_name()),
+                );
+                // `/OCGs` may be a single OCG reference or an array of them.
+                // Pass the *raw* entry (not the resolved value) to keep an
+                // indirect reference's object id, which keys `/OFF` membership.
+                let members: Vec<bool> = match dict.get(b"OCGs") {
+                    Some(raw) => match self.resolve(raw) {
+                        Object::Array(arr) => arr
+                            .iter()
+                            .map(|m| self.oc_object_visible(m, depth + 1))
+                            .collect(),
+                        _ => vec![self.oc_object_visible(raw, depth + 1)],
+                    },
+                    None => Vec::new(),
+                };
+                crate::ocg::ocmd_visible(&members, policy)
+            }
+            // An OCG (or any other dict treated as one): use its own state.
+            _ => ocg_id.is_none_or(|id| self.oc_group_visible(id)),
+        }
+    }
+
+    /// Resolve a `BDC` `/OC` operand — a `/Name` keyed in `resources`'
+    /// `/Properties` (→ OCG or OCMD), or an inline OCG/OCMD dictionary — to a
+    /// visible verdict. Used by [`PageResourceCtx::oc_marked_visible`].
+    fn oc_property_visible(&self, resources: &Dictionary, prop: &Object) -> bool {
+        match prop {
+            // Name in `/Resources /Properties`: resolve to the OCG/OCMD object.
+            Object::Name(name) => match self.resource_entry(resources, b"Properties", name) {
+                Some((Some(id), _)) => self.oc_object_visible(&Object::Reference(id), 0),
+                Some((None, obj)) => self.oc_object_visible(obj, 0),
+                None => true, // unknown property ⇒ no constraint
+            },
+            // Inline OCG/OCMD dictionary written straight into the operand.
+            Object::Dictionary(_) => self.oc_object_visible(prop, 0),
+            _ => true,
+        }
+    }
+
+    /// Whether the XObject named `name` in `resources`' `/XObject` is visible
+    /// given its own `/OC` entry. No `/OC` ⇒ always visible. Used by
+    /// [`PageResourceCtx::oc_xobject_visible`].
+    fn oc_xobject_visible(&self, resources: &Dictionary, name: &[u8]) -> bool {
+        let Some((_, obj)) = self.resource_entry(resources, b"XObject", name) else {
+            return true;
+        };
+        let Some(oc) = obj.as_stream().and_then(|s| s.dict.get(b"OC")) else {
+            return true; // no optional-content entry ⇒ always painted
+        };
+        self.oc_object_visible(oc, 0)
+    }
+
     /// Get-or-create the default OC configuration (`/OCProperties /D`), apply
     /// `f`, and write it back through the catalog.
     fn with_oc_default_config<F: FnOnce(&mut Dictionary)>(&mut self, f: F) -> Result<()> {
@@ -17929,6 +18048,17 @@ impl crate::raster::render::ResourceCtx for PageResourceCtx<'_> {
 
     fn inline_image(&self, raw: &[u8]) -> Option<crate::raster::render::RenderImage> {
         self.doc.decode_inline_image(raw)
+    }
+
+    fn oc_marked_visible(&self, prop: &Object) -> bool {
+        // `/OC <prop> BDC`: a `/Name` is keyed in *this* scope's `/Properties`;
+        // an inline dict is the OCG/OCMD itself.
+        self.doc.oc_property_visible(&self.resources, prop)
+    }
+
+    fn oc_xobject_visible(&self, name: &[u8]) -> bool {
+        // The XObject's own `/OC` entry, resolved in this scope's `/XObject`.
+        self.doc.oc_xobject_visible(&self.resources, name)
     }
 }
 
@@ -20201,6 +20331,152 @@ mod tests {
         let mut doc = Document::open(&pdf).unwrap();
         // 999999 is not a registered OCG object number.
         assert!(doc.begin_optional_content(1, 999_999).is_err());
+    }
+
+    /// Non-white pixel count of a freshly rendered page (issue #54 helpers).
+    fn rendered_nonwhite(doc: &Document) -> usize {
+        crate::raster::decode_png(&doc.render_page(1, 1.0).unwrap())
+            .expect("valid PNG")
+            .rgba
+            .chunks_exact(4)
+            .filter(|px| px[0] != 255 || px[1] != 255 || px[2] != 255)
+            .count()
+    }
+
+    #[test]
+    fn render_honors_default_oc_configuration_visibility() {
+        // Two filled boxes, each on its own OCG layer. With the second layer in
+        // `/OCProperties /D /OFF`, its box must not be rasterized; turning it back
+        // on must paint it again. Proves the default-config visibility map drives
+        // the render (issue #54), through the real `/Properties` → OCG resolution.
+        let pdf = crate::convert::reverse::txt_to_pdf("oc render");
+        let mut doc = Document::open(&pdf).unwrap();
+        let a = doc.add_layer("A").unwrap();
+        let b = doc.add_layer("B").unwrap();
+
+        // Layer A: a red box.
+        doc.begin_optional_content(1, a).unwrap();
+        doc.add_rectangle(
+            1,
+            60.0,
+            600.0,
+            90.0,
+            90.0,
+            None,
+            Some([1.0, 0.0, 0.0]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        doc.end_optional_content(1).unwrap();
+        // Layer B: a blue box, well clear of A.
+        doc.begin_optional_content(1, b).unwrap();
+        doc.add_rectangle(
+            1,
+            300.0,
+            600.0,
+            90.0,
+            90.0,
+            None,
+            Some([0.0, 0.0, 1.0]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        doc.end_optional_content(1).unwrap();
+
+        // Both layers visible (default): both boxes paint.
+        let both = rendered_nonwhite(&doc);
+
+        // Hide layer B: its box disappears, strictly fewer painted pixels.
+        doc.set_layer_visibility(b, false).unwrap();
+        let only_a = rendered_nonwhite(&doc);
+        assert!(
+            only_a < both,
+            "hiding layer B removes its box ({only_a} px < {both} px)"
+        );
+        assert!(only_a > 0, "layer A still paints its box ({only_a} px)");
+
+        // Also hide layer A: now nothing from either layer remains painted.
+        doc.set_layer_visibility(a, false).unwrap();
+        let neither = rendered_nonwhite(&doc);
+        assert!(
+            neither < only_a,
+            "hiding layer A too removes its box ({neither} px < {only_a} px)"
+        );
+
+        // Re-show layer B: it paints again (survives the OFF→ON toggle).
+        doc.set_layer_visibility(b, true).unwrap();
+        let only_b = rendered_nonwhite(&doc);
+        assert!(only_b > neither, "re-shown layer B paints again");
+    }
+
+    /// Build an `/OCMD` (`/OCGs [on off]`, the given `/P` policy), register it
+    /// under a fresh page `/Properties` name, and bracket a blue box in it.
+    fn add_ocmd_box(doc: &mut Document, on_id: ObjectId, off_id: ObjectId, policy: &[u8]) {
+        let mut ocmd = Dictionary::new();
+        ocmd.set(b"Type".to_vec(), annot::name(b"OCMD"));
+        ocmd.set(
+            b"OCGs".to_vec(),
+            Object::Array(vec![Object::Reference(on_id), Object::Reference(off_id)]),
+        );
+        ocmd.set(b"P".to_vec(), annot::name(policy));
+        let id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(id, Object::Dictionary(ocmd));
+        let name = doc
+            .register_page_resource(1, b"Properties", "OC", Object::Reference(id))
+            .unwrap();
+        doc.append_page_content(1, &crate::ocg::begin_ops(&name))
+            .unwrap();
+        doc.add_rectangle(
+            1,
+            300.0,
+            600.0,
+            90.0,
+            90.0,
+            None,
+            Some([0.0, 0.0, 1.0]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        doc.append_page_content(1, &crate::ocg::end_ops()).unwrap();
+    }
+
+    #[test]
+    fn render_honors_ocmd_allon_policy() {
+        // An `/OCMD` with `/P /AllOn` over [layer-on, layer-off] is HIDDEN (not
+        // all members ON). Bracketing a box in that OCMD must drop it from the
+        // raster; flipping the membership to `/P /AnyOn` makes it visible (one
+        // member ON). Exercises the OCMD `/OCGs` + `/P` resolution path.
+        let pdf = crate::convert::reverse::txt_to_pdf("ocmd render");
+        let mut doc = Document::open(&pdf).unwrap();
+        let on = doc.add_layer("On").unwrap();
+        let off = doc.add_layer("Off").unwrap();
+        doc.set_layer_visibility(off, false).unwrap();
+        let on_id = doc.oc_object_id(on).unwrap();
+        let off_id = doc.oc_object_id(off).unwrap();
+
+        // Baseline: the seed page before any OCMD-bracketed box is added.
+        let baseline = rendered_nonwhite(&doc);
+
+        // /AllOn over [on, off] ⇒ hidden (off breaks "all on") ⇒ box adds
+        // nothing: the render is unchanged from the baseline.
+        add_ocmd_box(&mut doc, on_id, off_id, b"AllOn");
+        let all_on = rendered_nonwhite(&doc);
+        assert_eq!(
+            all_on, baseline,
+            "OCMD /AllOn with an OFF member hides its box (no new pixels)"
+        );
+
+        // /AnyOn over the same members ⇒ visible (on is ON) ⇒ box paints,
+        // strictly more pixels than the baseline.
+        add_ocmd_box(&mut doc, on_id, off_id, b"AnyOn");
+        let any_on = rendered_nonwhite(&doc);
+        assert!(
+            any_on > baseline,
+            "OCMD /AnyOn with an ON member shows its box ({any_on} > {baseline} px)"
+        );
     }
 
     #[test]

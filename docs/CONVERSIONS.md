@@ -106,7 +106,18 @@ preserved free-form, and upright text stays unrotated) · ruled tables (with
 col/row spans) · images — both `Do` XObjects **and inline images**
 (`BI`/`ID`/`EI`, ISO 32000-1 §8.9.7) — with lifted figure captions · vector
 shapes · underline/strike (from drawn rules) · external + internal hyperlinks ·
-outline/bookmarks · page geometry · tagged-PDF `/StructTreeRoot` (consumed).
+outline/bookmarks · page geometry · tagged-PDF `/StructTreeRoot` (consumed) ·
+**optional-content (OCG/OCMD layer) visibility** (see below).
+
+**Optional content (layers, ISO 32000-1 §8.11):** when rendering an existing
+PDF, content on a layer that is **OFF in the default configuration**
+(`/OCProperties /D`, honouring `/BaseState` + the `/ON`/`/OFF` overrides) is
+**not** rasterized. A `/OC … BDC … EMC` marked sequence whose group (an OCG, or
+an `/OCMD` resolved through its `/P` policy — `AnyOn`/`AllOn`/`AnyOff`/`AllOff`)
+is hidden has its drawing operators skipped, with nested `BDC`/`EMC` tracked on a
+visibility stack (an inner ON layer stays hidden under an OFF ancestor); a `Do`
+XObject carrying a hidden `/OC` is likewise omitted. A PDF without
+`/OCProperties` renders everything, unchanged.
 
 **Inline images** are decoded through the *same* pipeline as image XObjects: the
 abbreviated dictionary keys (`/W`, `/H`, `/BPC`, `/CS`, `/F`, `/IM`, `/D`, `/DP`,
