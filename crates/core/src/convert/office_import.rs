@@ -962,8 +962,19 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         &mut outline,
         None,
     );
+    // Running header/footer: lower the section's default `headerReference`/
+    // `footerReference` part into a flat block list (reuses the body walker, so
+    // paragraphs/tables/styling/images carry their real formatting). Any images
+    // intern into the same `resources` table as the body. Built before
+    // `document.resources.images` is moved out of `resources`.
+    let header = docx_header_footer_model(zip, &doc, &rels, &ctx, "header", &mut resources);
+    let footer = docx_header_footer_model(zip, &doc, &rels, &ctx, "footer", &mut resources);
     let mut document = flow_document_pages(pages.finish(), page_geometry(geom));
     document.resources.images = resources;
+    if let Some(section) = document.sections.first_mut() {
+        section.header = header;
+        section.footer = footer;
+    }
     document.outline = outline.finish();
     // Lower `word/styles.xml`'s named paragraph styles into the model's style
     // table so each paragraph's `style_ref` (set from `w:pStyle`) resolves.
@@ -3916,8 +3927,18 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         &mut resources,
         &mut outline,
     );
+    // Running header/footer: lower the master page's `style:header`/`style:footer`
+    // (in `styles.xml`'s `office:master-styles`) into flat block lists, reusing
+    // the body walker so their paragraphs/tables/styling/images keep their real
+    // formatting. Any images intern into the same `resources` table as the body.
+    let header = odf_master_header_footer_model(&styles_xml, &ctx, "header", &mut resources);
+    let footer = odf_master_header_footer_model(&styles_xml, &ctx, "footer", &mut resources);
     let mut doc = flow_document(blocks, page_geometry(geom));
     doc.resources.images = resources;
+    if let Some(section) = doc.sections.first_mut() {
+        section.header = header;
+        section.footer = footer;
+    }
     doc.outline = outline.finish();
     // Lower `styles.xml`'s `office:styles` paragraph styles into the model's
     // style table so each paragraph's `style_ref` (set from `text:style-name`)
@@ -6127,6 +6148,96 @@ fn docx_header_footer(
         if !frag.trim().is_empty() {
             out.push_str(&frag);
         }
+    }
+}
+
+/// Resolve the relationship id (`r:id`) of the section's default
+/// `w:headerReference`/`w:footerReference` (`kind` = `"header"`/`"footer"`) from
+/// `word/document.xml`. References live in a `w:sectPr`; the body-level section
+/// is the document's last `w:sectPr`, so the **last** reference of the requested
+/// kind wins. A `@w:type="default"` reference is preferred over `first`/`even`
+/// (which the single-`Section.header`/`footer` model has no slot for); when no
+/// `default` is present the last reference of any type is used so a document
+/// that only declares e.g. a first-page header still surfaces one.
+///
+/// Returns the resolved `r:id`, or `None` when the section declares no reference
+/// of that kind.
+fn docx_section_ref_id(document_xml: &str, kind: &str) -> Option<String> {
+    let want = format!("{kind}Reference"); // headerReference / footerReference
+    let mut default_id: Option<String> = None;
+    let mut any_id: Option<String> = None;
+    let mut x = Xml::new(document_xml);
+    while let Some(tok) = x.next() {
+        if let Tok::Open(name, attrs, _) = tok {
+            if local(&name) == want {
+                if let Some(id) = attr(&attrs, "id") {
+                    let id = id.to_string();
+                    // Last reference of any type wins (body section is last).
+                    any_id = Some(id.clone());
+                    if matches!(attr(&attrs, "type"), Some("default")) {
+                        default_id = Some(id);
+                    }
+                }
+            }
+        }
+    }
+    default_id.or(any_id)
+}
+
+/// Lower the section's default header (`kind="header"`) or footer
+/// (`kind="footer"`) into a flat list of model [`Block`]s, reusing the body
+/// model walker ([`docx_walk_model`]) so the header/footer paragraphs, tables,
+/// run styling and inline images come through with their real formatting (not
+/// plain text). The part is located via [`docx_section_ref_id`] → the document
+/// relationships → `word/<target>`; any images intern into the shared
+/// `resources` table. A header/footer body carries no real page breaks, so the
+/// walker's pages are concatenated into one block list.
+///
+/// Returns `None` when the section declares no reference of that kind, the
+/// relationship is unresolvable, or the part lowers to no blocks.
+///
+/// Note: only the **default**-type header/footer is lowered; `first`/`even`
+/// variants collapse onto it because [`model::Section`] holds a single
+/// `header`/`footer` slot (no per-page-type variants in the model).
+fn docx_header_footer_model(
+    zip: &BTreeMap<String, Vec<u8>>,
+    document_xml: &str,
+    rels: &BTreeMap<String, String>,
+    ctx: &DocxCtx,
+    kind: &str,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<Vec<Block>> {
+    let id = docx_section_ref_id(document_xml, kind)?;
+    // Relationship targets are relative to `word/` (the rels part is
+    // `word/_rels/document.xml.rels`).
+    let target = rels.get(&id)?;
+    let part_key = format!("word/{target}");
+    let xml = part(zip, &part_key);
+    if xml.trim().is_empty() {
+        return None;
+    }
+
+    // Walk the `w:hdr`/`w:ftr` body with the body model walker. A throwaway page
+    // accumulator + outline/list counters keep it self-contained: header/footer
+    // headings must not leak into the document outline, and their list ordinals
+    // are independent of the body's.
+    let mut pages = DocxPages::new();
+    let mut counters = ListCounters::default();
+    let mut outline = OutlineBuilder::default();
+    docx_walk_model(
+        &mut Xml::new(&xml),
+        ctx,
+        &mut pages,
+        &mut counters,
+        resources,
+        &mut outline,
+        None,
+    );
+    let blocks: Vec<Block> = pages.finish().into_iter().flat_map(|p| p.blocks).collect();
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks)
     }
 }
 
@@ -10294,6 +10405,71 @@ fn odf_solid_fill_rgb(attrs: &[(String, String)]) -> Option<[f64; 3]> {
     } else {
         None
     }
+}
+
+/// Lower the master page's running header (`kind="header"`) or footer
+/// (`kind="footer"`) into a flat list of model [`Block`]s. The element lives in
+/// `styles.xml`'s `office:master-styles` as `style:header`/`style:footer` inside
+/// a `style:master-page`; its body is the same `text:p`/`text:h`/`text:list`/
+/// `table:table` grammar as the document body, so it is lowered with the body
+/// model walker ([`odf_walk_model`]) — paragraphs, tables, run styling and
+/// inline images keep their real formatting (not plain text). Any images intern
+/// into the shared `resources` table.
+///
+/// The first master page's header/footer wins ([`model::Section`] holds a single
+/// `header`/`footer` slot for the document's one section). Only the *primary*
+/// running element is taken; ODF's left/first variants (`style:header-left`,
+/// `style:header-first`, …) are distinct element names and are not collapsed in
+/// here because the model has no per-page-type slot for them.
+///
+/// Returns `None` when no such element is present (or it lowers to no blocks).
+fn odf_master_header_footer_model(
+    styles_xml: &str,
+    ctx: &OdfModelCtx,
+    kind: &str,
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+) -> Option<Vec<Block>> {
+    let mut x = Xml::new(styles_xml);
+    // Track nesting into `office:master-styles` so a same-named element outside
+    // it (defensive) can't be mistaken for a running header/footer.
+    let mut in_master = 0i32;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _attrs, sc) => {
+                let ln = local(&name);
+                if ln == "master-styles" {
+                    if !sc {
+                        in_master += 1;
+                    }
+                } else if in_master > 0 && !sc && ln == kind {
+                    // Hand the live cursor to the body walker; it consumes the
+                    // subtree up to the matching `</…:header>`/`</…:footer>`.
+                    let mut blocks: Vec<Block> = Vec::new();
+                    let mut outline = OutlineBuilder::default();
+                    odf_walk_model(
+                        &mut x,
+                        ctx,
+                        &mut blocks,
+                        Some(kind),
+                        None,
+                        resources,
+                        &mut outline,
+                    );
+                    if !blocks.is_empty() {
+                        return Some(blocks);
+                    }
+                    // Empty element: keep scanning for another master page's.
+                }
+            }
+            Tok::Close(name) => {
+                if local(&name) == "master-styles" && in_master > 0 {
+                    in_master -= 1;
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+    None
 }
 
 /// Build a `master-page-name → drawing-page-style-name` map from an ODF part
@@ -15553,6 +15729,144 @@ mod tests {
         );
     }
 
+    // ── #3: DOCX/ODT running header & footer lowered to Section.header/footer ──
+
+    /// Collect every [`InlineRun`] reachable from a block list (recursing into
+    /// list items and table cells), used to inspect lowered header/footer text +
+    /// styling.
+    fn collect_block_runs(blocks: &[Block]) -> Vec<InlineRun> {
+        fn walk(blocks: &[Block], out: &mut Vec<InlineRun>) {
+            for block in blocks {
+                match &block.kind {
+                    BlockKind::Paragraph(p) => push_para(p, out),
+                    BlockKind::Heading(h) => push_para(&h.para, out),
+                    BlockKind::List(l) => {
+                        for item in &l.items {
+                            walk(&item.blocks, out);
+                        }
+                    }
+                    BlockKind::Table(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                walk(&cell.blocks, out);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn push_para(p: &Paragraph, out: &mut Vec<InlineRun>) {
+            for inline in &p.runs {
+                if let Inline::Run(r) = inline {
+                    out.push(r.clone());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(blocks, &mut out);
+        out
+    }
+
+    #[test]
+    fn docx_model_header_and_footer_lowered_with_text_and_style() {
+        // The body section's `w:sectPr` references a default header and footer;
+        // each part is lowered into `Section.header`/`footer` with its real text
+        // and run styling (the header run is bold) — not plain text, not dropped.
+        let doc = r#"<w:document xmlns:w="x" xmlns:r="z"><w:body>
+          <w:p><w:r><w:t>Main body line</w:t></w:r></w:p>
+          <w:sectPr>
+            <w:headerReference w:type="default" r:id="rId10"/>
+            <w:footerReference w:type="default" r:id="rId11"/>
+          </w:sectPr>
+        </w:body></w:document>"#;
+        let header = r#"<w:hdr xmlns:w="x"><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Top Header</w:t></w:r></w:p></w:hdr>"#;
+        let footer = r#"<w:ftr xmlns:w="x"><w:p><w:r><w:t>Bottom Footer</w:t></w:r></w:p></w:ftr>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId10" Type="header" Target="header1.xml"/>
+          <Relationship Id="rId11" Type="footer" Target="footer1.xml"/>
+        </Relationships>"#;
+        let bytes = build_docx(
+            doc,
+            Some(rels),
+            &[
+                ("word/header1.xml", header.as_bytes().to_vec()),
+                ("word/footer1.xml", footer.as_bytes().to_vec()),
+            ],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let section = &model.sections[0];
+
+        let head = section.header.as_ref().expect("Section.header populated");
+        let head_runs = collect_block_runs(head);
+        let head_run = head_runs
+            .iter()
+            .find(|r| r.text == "Top Header")
+            .expect("header text lowered");
+        assert!(head_run.style.bold, "header run keeps its bold styling");
+
+        let foot = section.footer.as_ref().expect("Section.footer populated");
+        assert!(
+            collect_block_runs(foot)
+                .iter()
+                .any(|r| r.text == "Bottom Footer"),
+            "footer text lowered"
+        );
+    }
+
+    #[test]
+    fn docx_model_header_prefers_default_over_first_and_even() {
+        // When several `headerReference`s are present, the `default` one wins
+        // (the single `Section.header` slot has no per-page-type variant).
+        let doc = r#"<w:document xmlns:w="x" xmlns:r="z"><w:body>
+          <w:p><w:r><w:t>Body</w:t></w:r></w:p>
+          <w:sectPr>
+            <w:headerReference w:type="first" r:id="rIdFirst"/>
+            <w:headerReference w:type="even" r:id="rIdEven"/>
+            <w:headerReference w:type="default" r:id="rIdDef"/>
+          </w:sectPr>
+        </w:body></w:document>"#;
+        let mk =
+            |s: &str| format!(r#"<w:hdr xmlns:w="x"><w:p><w:r><w:t>{s}</w:t></w:r></w:p></w:hdr>"#);
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rIdFirst" Type="header" Target="header1.xml"/>
+          <Relationship Id="rIdEven" Type="header" Target="header2.xml"/>
+          <Relationship Id="rIdDef" Type="header" Target="header3.xml"/>
+        </Relationships>"#;
+        let bytes = build_docx(
+            doc,
+            Some(rels),
+            &[
+                ("word/header1.xml", mk("First Page Header").into_bytes()),
+                ("word/header2.xml", mk("Even Header").into_bytes()),
+                ("word/header3.xml", mk("Default Header").into_bytes()),
+            ],
+        );
+        let model = office_to_model(&bytes).expect("docx → model");
+        let runs = collect_block_runs(model.sections[0].header.as_ref().expect("header"));
+        let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["Default Header"], "default-type header wins");
+    }
+
+    #[test]
+    fn docx_model_no_header_footer_yields_none() {
+        // A document with no header/footer references → both slots stay `None`
+        // (no panic, no spurious empty blocks).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:r><w:t>Just a body</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        assert!(
+            model.sections[0].header.is_none(),
+            "no header reference → None"
+        );
+        assert!(
+            model.sections[0].footer.is_none(),
+            "no footer reference → None"
+        );
+    }
+
     #[test]
     fn docx_model_run_shading_sets_background() {
         // `<w:shd w:fill>` run shading also populates the model background.
@@ -16327,6 +16641,107 @@ mod tests {
             })
             .expect("an Inline::Link");
         assert_eq!(href, model::LinkTarget::Page(0));
+    }
+
+    // ── #3: ODT master-page header/footer lowered to Section.header/footer ──
+
+    #[test]
+    fn odt_model_master_header_and_footer_lowered_with_text_and_style() {
+        // `styles.xml`'s `office:master-styles` carries a `style:master-page`
+        // with `style:header`/`style:footer`; each lowers into `Section.header`/
+        // `footer` with its real text. The header paragraph references a centered
+        // style → the lowered block keeps that alignment (real formatting, not
+        // plain text).
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:p>Body paragraph</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        let styles = r#"<office:document-styles xmlns:office="o" xmlns:style="s" xmlns:fo="f" xmlns:text="t">
+  <office:styles>
+    <style:style style:name="HdrCentered" style:family="paragraph">
+      <style:paragraph-properties fo:text-align="center"/>
+    </style:style>
+  </office:styles>
+  <office:master-styles>
+    <style:master-page style:name="Standard" style:page-layout-name="PL1">
+      <style:header>
+        <text:p text:style-name="HdrCentered">Doc Header</text:p>
+      </style:header>
+      <style:footer>
+        <text:p>Doc Footer</text:p>
+      </style:footer>
+    </style:master-page>
+  </office:master-styles>
+</office:document-styles>"#;
+        let model = odt_model(content, &[("styles.xml", styles.as_bytes().to_vec())]);
+        let section = &model.sections[0];
+
+        let head = section.header.as_ref().expect("Section.header populated");
+        let head_para = head
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("a header paragraph block");
+        assert_eq!(
+            head_para.style.align,
+            model::style::Align::Center,
+            "header paragraph keeps its centered style"
+        );
+        assert!(
+            collect_block_runs(head)
+                .iter()
+                .any(|r| r.text == "Doc Header"),
+            "header text lowered"
+        );
+
+        let foot = section.footer.as_ref().expect("Section.footer populated");
+        assert!(
+            collect_block_runs(foot)
+                .iter()
+                .any(|r| r.text == "Doc Footer"),
+            "footer text lowered"
+        );
+    }
+
+    #[test]
+    fn odt_model_no_master_header_footer_yields_none() {
+        // A `styles.xml` whose `office:master-styles` declares no header/footer
+        // (and the common case of no `styles.xml` at all) → both slots `None`,
+        // no panic.
+        let content = r#"<office:document-content xmlns:office="o" xmlns:text="t">
+  <office:body><office:text>
+    <text:p>Body only</text:p>
+  </office:text></office:body>
+</office:document-content>"#;
+        // No styles.xml part at all.
+        let model = odt_model(content, &[]);
+        assert!(
+            model.sections[0].header.is_none(),
+            "no master header → None"
+        );
+        assert!(
+            model.sections[0].footer.is_none(),
+            "no master footer → None"
+        );
+
+        // Empty master-styles present but with no header/footer → still None.
+        let styles = r#"<office:document-styles xmlns:office="o" xmlns:style="s">
+  <office:master-styles>
+    <style:master-page style:name="Standard"/>
+  </office:master-styles>
+</office:document-styles>"#;
+        let model = odt_model(content, &[("styles.xml", styles.as_bytes().to_vec())]);
+        assert!(
+            model.sections[0].header.is_none(),
+            "master page without header → None"
+        );
+        assert!(
+            model.sections[0].footer.is_none(),
+            "master page without footer → None"
+        );
     }
 
     #[test]
