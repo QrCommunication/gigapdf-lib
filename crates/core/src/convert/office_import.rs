@@ -836,12 +836,22 @@ use crate::recon::FlatOutline;
 /// 0-based outline depth (`0` = top-level heading); a bookmark nests one level
 /// under the most recent heading so an internal `#name` anchor resolves to a
 /// page within its section.
+///
+/// The builder also keeps a `name → page` map of *every* bookmark seen (machinery
+/// anchors included, unlike the outline tree), so an internal hyperlink
+/// (`w:hyperlink@w:anchor` / `HYPERLINK \l` / ODF `text:a` `#name`) can be
+/// resolved to its target page in a second pass — see [`resolve_internal_links`].
+/// Word cross-references point at generated `_Ref…`/`_Toc…` anchors, so the map
+/// cannot apply the `is_user_bookmark` filter the *outline* uses.
 #[derive(Default)]
 struct OutlineBuilder {
     flat: Vec<FlatOutline>,
     /// Depth of the most recently seen heading (`None` until the first heading),
     /// so a following bookmark can nest under it.
     last_heading_level: Option<usize>,
+    /// `bookmark name → 0-based landing page`, for resolving internal anchors.
+    /// First definition wins (a name is unique in well-formed documents).
+    bookmark_pages: BTreeMap<String, usize>,
 }
 
 impl OutlineBuilder {
@@ -856,13 +866,22 @@ impl OutlineBuilder {
         self.flat.push(FlatOutline { title, level, page });
     }
 
-    /// Record a bookmark anchor named `name` at `page`, nested under the current
-    /// section (one level deeper than the last heading, or top-level if none).
-    /// Word-internal bookmarks (`_GoBack`, `_Toc…`, `_Ref…`, `_Hlk…`, any
-    /// `_`-prefixed name) are skipped — they are machinery, not navigation.
+    /// Record a bookmark anchored named `name` at `page`. The `name → page`
+    /// mapping is always kept (so an internal `#name` link — including a Word
+    /// cross-reference to a generated `_Ref…` anchor — can be resolved later).
+    /// The *outline* entry, however, is only added for user-defined bookmarks:
+    /// Word-internal anchors (`_GoBack`, `_Toc…`, `_Ref…`, `_Hlk…`, any
+    /// `_`-prefixed name) are machinery, not navigation, so they don't pollute
+    /// the tree. The entry nests one level deeper than the last heading (or
+    /// top-level if none).
     fn push_bookmark(&mut self, name: &str, page: usize) {
         let name = name.trim();
-        if name.is_empty() || !is_user_bookmark(name) {
+        if name.is_empty() {
+            return;
+        }
+        // Map every bookmark (first definition wins) for internal-link resolution.
+        self.bookmark_pages.entry(name.to_string()).or_insert(page);
+        if !is_user_bookmark(name) {
             return;
         }
         let level = self.last_heading_level.map(|l| l + 1).unwrap_or(0);
@@ -876,6 +895,78 @@ impl OutlineBuilder {
     /// Fold the collected flat entries into the nested outline tree.
     fn finish(self) -> Vec<crate::model::OutlineNode> {
         crate::recon::fold_outline(&self.flat)
+    }
+}
+
+/// Second pass over a freshly built DOCX/ODT [`Document`]: rewrite every internal
+/// hyperlink whose target was deferred during the walk (encoded as a
+/// `LinkTarget::Url("#name")` placeholder) to the page its bookmark landed on.
+///
+/// Internal anchors are deferred because a bookmark may be defined *after* the
+/// link that points at it (a forward reference); resolving in a final pass — once
+/// `bookmark_pages` holds every anchor — covers both directions. An anchor that
+/// matches no bookmark keeps its `#name` placeholder (it is **not** turned into a
+/// false page-0 jump); external links (`LinkTarget::Url` without a leading `#`,
+/// or an already-resolved `LinkTarget::Page`) are left untouched.
+fn resolve_internal_links(doc: &mut Document, bookmark_pages: &BTreeMap<String, usize>) {
+    for section in &mut doc.sections {
+        for blocks in [section.header.as_mut(), section.footer.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            resolve_links_in_blocks(blocks, bookmark_pages);
+        }
+        for page in &mut section.pages {
+            resolve_links_in_blocks(&mut page.blocks, bookmark_pages);
+        }
+    }
+}
+
+/// Recurse through `blocks` (and the block lists nested in list items, table
+/// cells, text boxes and block quotes) resolving each internal link via
+/// [`resolve_links_in_inlines`].
+fn resolve_links_in_blocks(blocks: &mut [Block], bookmarks: &BTreeMap<String, usize>) {
+    for block in blocks {
+        match &mut block.kind {
+            BlockKind::Paragraph(p) => resolve_links_in_inlines(&mut p.runs, bookmarks),
+            BlockKind::Heading(h) => resolve_links_in_inlines(&mut h.para.runs, bookmarks),
+            BlockKind::List(l) => {
+                for item in &mut l.items {
+                    resolve_links_in_blocks(&mut item.blocks, bookmarks);
+                }
+            }
+            BlockKind::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        resolve_links_in_blocks(&mut cell.blocks, bookmarks);
+                    }
+                }
+            }
+            BlockKind::TextBox(tb) => resolve_links_in_blocks(&mut tb.blocks, bookmarks),
+            BlockKind::Blockquote(bq) => resolve_links_in_blocks(&mut bq.blocks, bookmarks),
+            // No other block kind carries an `Inline::Link` from the DOCX/ODT
+            // model path (Image/Shape/CodeBlock/HorizontalRule/Sheet/Slide).
+            _ => {}
+        }
+    }
+}
+
+/// Resolve the `#name` placeholders of every [`Inline::Link`] in `inlines`
+/// (recursing into link children, which the walker never nests but the model
+/// permits). A placeholder whose anchor matches `bookmarks` becomes
+/// `LinkTarget::Page`; one that does not is left as-is.
+fn resolve_links_in_inlines(inlines: &mut [Inline], bookmarks: &BTreeMap<String, usize>) {
+    for inline in inlines {
+        if let Inline::Link { href, children } = inline {
+            if let model::LinkTarget::Url(u) = href {
+                if let Some(anchor) = u.strip_prefix('#') {
+                    if let Some(&page) = bookmarks.get(anchor) {
+                        *href = model::LinkTarget::Page(page);
+                    }
+                }
+            }
+            resolve_links_in_inlines(children, bookmarks);
+        }
     }
 }
 
@@ -979,7 +1070,13 @@ pub fn docx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         section.header = header;
         section.footer = footer;
     }
+    // Resolve internal hyperlink anchors (`w:hyperlink@w:anchor` / `HYPERLINK \l`)
+    // to their bookmark's page now that every bookmark has been seen (a link may
+    // reference a bookmark defined later). Take the map before the builder is
+    // consumed by `finish`.
+    let bookmark_pages = std::mem::take(&mut outline.bookmark_pages);
     document.outline = outline.finish();
+    resolve_internal_links(&mut document, &bookmark_pages);
     // Lower `word/styles.xml`'s named paragraph styles into the model's style
     // table so each paragraph's `style_ref` (set from `w:pStyle`) resolves.
     document.styles = styles.to_style_table();
@@ -1904,8 +2001,9 @@ fn docx_sink<'a>(
 
 /// Flush a finished field's cached result into the surrounding inline flow
 /// (`sink`). A `HYPERLINK "url"` instruction wraps the result runs in an
-/// [`Inline::Link`] (an in-document `HYPERLINK \l anchor` jumps to page 0, the
-/// model's page-addressed convention); every other field type
+/// [`Inline::Link`] (an in-document `HYPERLINK \l anchor` is deferred and later
+/// resolved to its bookmark's page by [`resolve_internal_links`]); every other
+/// field type
 /// (`REF`/`PAGEREF`/`TOC`/`SEQ`/`STYLEREF`/`PAGE`/`NUMPAGES`/`DATE`/`TIME`/…, and
 /// anything unrecognised) contributes its cached **result** text verbatim — the
 /// raw field code is never emitted. An empty result is dropped.
@@ -1924,11 +2022,13 @@ fn docx_emit_field(field: DocxField, sink: &mut Vec<Inline>) {
     }
 }
 
-/// If `instr` is a `HYPERLINK` field, resolve its [`model::LinkTarget`]: a
-/// quoted/bare URL argument → [`LinkTarget::Url`](model::LinkTarget::Url); a
-/// `\l` switch (in-document bookmark) → [`LinkTarget::Page`](model::LinkTarget::Page)`(0)`
-/// (the model jumps by page index, so an internal anchor targets the start rather
-/// than being dropped). Returns `None` for any non-`HYPERLINK` field.
+/// If `instr` is a `HYPERLINK` field, resolve its [`model::LinkTarget`]. A
+/// `\l` switch (in-document bookmark) wins — its operand names the target
+/// bookmark, deferred as a `LinkTarget::Url("#name")` placeholder that
+/// [`resolve_internal_links`] rewrites to the bookmark's page (so a forward
+/// reference resolves). Otherwise the first quoted/bare argument is an external
+/// URL ([`LinkTarget::Url`](model::LinkTarget::Url)). Returns `None` for any
+/// non-`HYPERLINK` field.
 fn docx_field_hyperlink(instr: &str) -> Option<model::LinkTarget> {
     let trimmed = instr.trim();
     let mut parts = trimmed.split_whitespace();
@@ -1938,7 +2038,21 @@ fn docx_field_hyperlink(instr: &str) -> Option<model::LinkTarget> {
     {
         return None;
     }
-    // First quoted string is the URL; otherwise the first non-switch token.
+    // A `\l "name"` switch makes this an in-document jump. Its operand is the next
+    // token (quoted or bare) after `\l`; defer it as a `#name` placeholder.
+    let tokens: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+    if let Some(pos) = tokens.iter().position(|t| *t == "\\l") {
+        if let Some(anchor) = tokens.get(pos + 1).map(|t| t.trim_matches('"').trim()) {
+            if !anchor.is_empty() {
+                return Some(model::LinkTarget::Url(format!("#{anchor}")));
+            }
+        }
+        // `\l` with no operand: an in-document jump to an unknown anchor; keep an
+        // empty `#` placeholder (resolves to nothing → stays linked but unmoved).
+        return Some(model::LinkTarget::Url("#".to_string()));
+    }
+    // No `\l`: an external link. First quoted string is the URL; otherwise the
+    // first non-switch token.
     if let Some(start) = trimmed.find('"') {
         if let Some(end_rel) = trimmed[start + 1..].find('"') {
             let url = &trimmed[start + 1..start + 1 + end_rel];
@@ -1947,34 +2061,33 @@ fn docx_field_hyperlink(instr: &str) -> Option<model::LinkTarget> {
             }
         }
     }
-    for tok in trimmed.split_whitespace().skip(1) {
-        if tok == "\\l" {
-            // In-document bookmark jump: target the document start (page 0).
-            return Some(model::LinkTarget::Page(0));
-        }
+    for tok in &tokens {
         if !tok.starts_with('\\') {
             return Some(model::LinkTarget::Url(tok.to_string()));
         }
     }
-    // `HYPERLINK` with only switches (e.g. `\l` was the bookmark name token-less):
-    // fall back to a start-of-document jump so the display text stays linked.
-    Some(model::LinkTarget::Page(0))
+    // `HYPERLINK` with only switches and no operand: nothing to link to.
+    Some(model::LinkTarget::Url(String::new()))
 }
 
 /// Resolve a `<w:hyperlink>` to a model [`LinkTarget`]: an external URL via the
 /// relationship `r:id` (the same `word/_rels` table the HTML/image path uses), or
-/// an in-document jump for `w:anchor` (kept as page 0 — the model addresses pages,
-/// not named bookmarks, so an internal anchor lands on the document start rather
-/// than being dropped). Missing/blank ⇒ an empty URL.
+/// an in-document jump for `w:anchor`. The anchor names a bookmark that may be
+/// defined *after* this link, so it is deferred as a `LinkTarget::Url("#name")`
+/// placeholder and rewritten to the bookmark's page by [`resolve_internal_links`]
+/// once the whole document has been walked. Missing/blank ⇒ an empty URL.
 fn docx_link_target(ctx: &DocxCtx, attrs: &[(String, String)]) -> model::LinkTarget {
     if let Some(rid) = attr(attrs, "id").filter(|v| !v.trim().is_empty()) {
         if let Some(target) = ctx.rels.get(rid) {
             return model::LinkTarget::Url(target.clone());
         }
     }
-    if attr(attrs, "anchor").is_some_and(|a| !a.trim().is_empty()) {
-        // In-document anchor: the model jumps by page index, so target the start.
-        return model::LinkTarget::Page(0);
+    if let Some(anchor) = attr(attrs, "anchor")
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        // In-document anchor: defer until the bookmark→page map is complete.
+        return model::LinkTarget::Url(format!("#{anchor}"));
     }
     model::LinkTarget::Url(String::new())
 }
@@ -5090,7 +5203,12 @@ pub fn odt_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
         section.header = header;
         section.footer = footer;
     }
+    // Resolve internal `text:a` `#name` anchors to their bookmark's page (ODT is a
+    // single flowed page, so a matched bookmark resolves to page 0; an unmatched
+    // anchor — e.g. a `#frame` — keeps its placeholder rather than faking page 0).
+    let bookmark_pages = std::mem::take(&mut outline.bookmark_pages);
     doc.outline = outline.finish();
+    resolve_internal_links(&mut doc, &bookmark_pages);
     // Lower `styles.xml`'s `office:styles` paragraph styles into the model's
     // style table so each paragraph's `style_ref` (set from `text:style-name`)
     // resolves to a present `NamedStyle`.
@@ -5634,12 +5752,15 @@ fn odf_text_only(x: &mut Xml, stop: &str) -> String {
 }
 
 /// Resolve an ODF `text:a` to a model [`LinkTarget`]: an external URL from
-/// `xlink:href`. A purely in-document reference (`#bookmark`/`#frame`) has no page
-/// the model can address by index, so it lands on the document start (page 0),
-/// matching the DOCX anchor behaviour; a blank href ⇒ an empty URL.
+/// `xlink:href`. A purely in-document reference (`#bookmark`/`#frame`) is deferred
+/// as a `LinkTarget::Url("#name")` placeholder that [`resolve_internal_links`]
+/// rewrites to the target bookmark's page once the document has been walked (so a
+/// reference to a bookmark defined later still resolves; an anchor matching no
+/// bookmark — e.g. a `#frame` — keeps its placeholder). A blank href ⇒ an empty URL.
 fn odf_link_target(attrs: &[(String, String)]) -> model::LinkTarget {
     match attr(attrs, "href").map(str::trim) {
-        Some(h) if h.starts_with('#') => model::LinkTarget::Page(0),
+        // Keep the `#name` fragment (decoded) as the deferred placeholder.
+        Some(h) if h.starts_with('#') => model::LinkTarget::Url(decode(h)),
         Some(h) if !h.is_empty() => model::LinkTarget::Url(decode(h)),
         _ => model::LinkTarget::Url(String::new()),
     }
@@ -18933,6 +19054,151 @@ mod tests {
         );
     }
 
+    // ── #3: internal hyperlink anchors resolve to their bookmark's page ──
+
+    /// All `Inline::Link` hrefs across every page of a model's first section, in
+    /// reading order (the body may have split into several pages on hard breaks).
+    fn model_all_link_targets(doc: &Document) -> Vec<model::LinkTarget> {
+        fn from_inlines(inlines: &[Inline], out: &mut Vec<model::LinkTarget>) {
+            for i in inlines {
+                if let Inline::Link { href, children } = i {
+                    out.push(href.clone());
+                    from_inlines(children, out);
+                }
+            }
+        }
+        fn from_blocks(blocks: &[Block], out: &mut Vec<model::LinkTarget>) {
+            for b in blocks {
+                match &b.kind {
+                    BlockKind::Paragraph(p) => from_inlines(&p.runs, out),
+                    BlockKind::Heading(h) => from_inlines(&h.para.runs, out),
+                    BlockKind::List(l) => {
+                        for it in &l.items {
+                            from_blocks(&it.blocks, out);
+                        }
+                    }
+                    BlockKind::Table(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                from_blocks(&cell.blocks, out);
+                            }
+                        }
+                    }
+                    BlockKind::TextBox(tb) => from_blocks(&tb.blocks, out),
+                    BlockKind::Blockquote(bq) => from_blocks(&bq.blocks, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for page in &doc.sections[0].pages {
+            from_blocks(&page.blocks, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn docx_model_internal_anchor_resolves_to_bookmark_page() {
+        // `<w:hyperlink w:anchor="Target">` points at a `<w:bookmarkStart>` that a
+        // `w:pageBreakBefore` paragraph put on the second page → the link resolves
+        // to that page (index 1), NOT a fabricated page 0.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p>
+            <w:hyperlink w:anchor="Target"><w:r><w:t>go</w:t></w:r></w:hyperlink>
+          </w:p>
+          <w:p><w:pPr><w:pageBreakBefore/></w:pPr>
+            <w:bookmarkStart w:id="0" w:name="Target"/><w:r><w:t>landing</w:t></w:r>
+          </w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(model.sections[0].pages.len(), 2, "page break splits pages");
+        assert_eq!(
+            model_all_link_targets(&model),
+            vec![model::LinkTarget::Page(1)],
+            "forward `w:anchor` resolves to the bookmark's page, not page 0",
+        );
+    }
+
+    #[test]
+    fn docx_model_internal_anchor_resolves_within_first_page() {
+        // A `w:anchor` and its bookmark both on page 0 → the link resolves to page
+        // 0 (a real resolution: there *is* a matching bookmark there).
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p><w:bookmarkStart w:id="0" w:name="Top"/><w:r><w:t>here</w:t></w:r></w:p>
+          <w:p>
+            <w:hyperlink w:anchor="Top"><w:r><w:t>back to top</w:t></w:r></w:hyperlink>
+          </w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(
+            model_all_link_targets(&model),
+            vec![model::LinkTarget::Page(0)],
+        );
+    }
+
+    #[test]
+    fn docx_model_internal_anchor_unmatched_is_not_page_zero() {
+        // A `w:anchor` naming a bookmark that does not exist must NOT become a
+        // false page-0 jump — it keeps its `#name` placeholder.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p>
+            <w:hyperlink w:anchor="Missing"><w:r><w:t>dangling</w:t></w:r></w:hyperlink>
+          </w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(
+            model_all_link_targets(&model),
+            vec![model::LinkTarget::Url("#Missing".to_string())],
+            "an unmatched anchor stays as-is, never page 0",
+        );
+    }
+
+    #[test]
+    fn docx_model_hyperlink_field_anchor_resolves_to_bookmark_page() {
+        // A complex-field `HYPERLINK \l "Target"` (in-document jump) on page 0
+        // resolves to the bookmark's page (1, opened after a hard page break) — a
+        // forward reference, deferred and resolved once the whole body is walked.
+        let doc = r#"<w:document xmlns:w="x"><w:body>
+          <w:p>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+            <w:r><w:instrText> HYPERLINK \l "Target" </w:instrText></w:r>
+            <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+            <w:r><w:t>see landing</w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="end"/></w:r>
+          </w:p>
+          <w:p><w:pPr><w:pageBreakBefore/></w:pPr>
+            <w:bookmarkStart w:id="0" w:name="Target"/><w:r><w:t>landing</w:t></w:r>
+          </w:p>
+        </w:body></w:document>"#;
+        let model = office_to_model(&build_docx(doc, None, &[])).expect("docx → model");
+        assert_eq!(model.sections[0].pages.len(), 2, "page break splits pages");
+        assert_eq!(
+            model_all_link_targets(&model),
+            vec![model::LinkTarget::Page(1)],
+            "`HYPERLINK \\l` resolves to the bookmark page (forward reference)",
+        );
+    }
+
+    #[test]
+    fn docx_model_external_link_unchanged_by_anchor_resolution() {
+        // An external `<w:hyperlink r:id>` (a real URL) is never touched by the
+        // internal-anchor resolution pass, even alongside a bookmark.
+        let doc = r#"<w:document xmlns:w="x" xmlns:r="z"><w:body>
+          <w:p><w:bookmarkStart w:id="0" w:name="Target"/>
+            <w:hyperlink r:id="rId1"><w:r><w:t>site</w:t></w:r></w:hyperlink>
+          </w:p>
+        </w:body></w:document>"#;
+        let rels = r#"<Relationships xmlns="x">
+          <Relationship Id="rId1" Type="hyperlink" Target="https://example.com/" TargetMode="External"/>
+        </Relationships>"#;
+        let model = office_to_model(&build_docx(doc, Some(rels), &[])).expect("docx → model");
+        assert_eq!(
+            model_all_link_targets(&model),
+            vec![model::LinkTarget::Url("https://example.com/".to_string())],
+            "external links survive the resolution pass untouched",
+        );
+    }
+
     // ── ODF → model (links / strike / highlight / inline images / formulas / groups) ──
 
     /// Build an ODT zip from a `content.xml` body and optional `(path, bytes)`
@@ -18978,12 +19244,16 @@ mod tests {
     }
 
     #[test]
-    fn odt_model_internal_anchor_link_targets_document_start() {
-        // A `#bookmark` reference has no model-addressable page → page 0 (matches
-        // the DOCX `w:anchor` behaviour), and never drops the link.
+    fn odt_model_internal_anchor_resolves_to_bookmark_page() {
+        // A `text:a` `#name` that matches a `text:bookmark` resolves to that
+        // bookmark's page. ODT lowers to a single flowed page, so the target is
+        // page 0 — a *real* resolution (there is a matching bookmark), and the link
+        // is never dropped. A forward reference (link before the bookmark) works
+        // because resolution runs after the whole document is walked.
         let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:xlink="xl">
   <office:body><office:text>
     <text:p><text:a xlink:href="#Section2">jump</text:a></text:p>
+    <text:p><text:bookmark text:name="Section2"/>target paragraph</text:p>
   </office:text></office:body>
 </office:document-content>"##;
         let model = odt_model(content, &[]);
@@ -18995,6 +19265,27 @@ mod tests {
             })
             .expect("an Inline::Link");
         assert_eq!(href, model::LinkTarget::Page(0));
+    }
+
+    #[test]
+    fn odt_model_internal_anchor_unmatched_is_not_page_zero() {
+        // A `text:a` `#name` that matches no bookmark (e.g. a stray `#frame`
+        // reference) must NOT collapse to a false page-0 jump — it keeps its
+        // `#name` placeholder, and the link is still emitted.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:xlink="xl">
+  <office:body><office:text>
+    <text:p><text:a xlink:href="#NoSuchAnchor">jump</text:a></text:p>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let href = model_first_section_inlines(&model)
+            .into_iter()
+            .find_map(|i| match i {
+                Inline::Link { href, .. } => Some(href),
+                _ => None,
+            })
+            .expect("an Inline::Link");
+        assert_eq!(href, model::LinkTarget::Url("#NoSuchAnchor".to_string()));
     }
 
     // ── #3: ODT master-page header/footer lowered to Section.header/footer ──
