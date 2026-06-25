@@ -450,10 +450,11 @@ use crate::model::{
     Block, BlockKind, CharStyle, Document, Heading, ImageRef, Inline, LinkTarget, List, ListMarker,
     Paragraph, ResourceTable, Table,
 };
+use super::style::Generic;
 
 /// Serialize a unified [`Document`] to *rich* RTF with real paragraph breaks and
-/// character styling (bold/italic/underline/strike/size/colour), plus structural
-/// fidelity:
+/// character styling (bold/italic/underline/strike/size/colour/font), plus
+/// structural fidelity:
 ///
 /// * **Tables** become real `\trowd … \cellxN … \cell … \row` grids (column
 ///   right-edges derived from [`Table::col_widths`] in twips), not tab lines.
@@ -462,8 +463,8 @@ use crate::model::{
 ///   [`List::marker`] and each item's nesting [`ListItem::level`].
 /// * **Images** ([`BlockKind::Image`]) interned in [`Document::resources`] emit a
 ///   `{\pict …}` group — `\pngblip` for PNG, `\jpegblip` for JPEG, with
-///   `\picwgoal`/`\pichgoal` from the pixel size and a hex payload. Formats RTF
-///   cannot carry (GIF/WebP/AVIF/…) are skipped.
+///   `\picwgoal`/`\pichgoal` from the pixel size and a hex payload. GIF / WebP /
+///   AVIF are transcoded to PNG first, then emitted as `\pngblip`.
 /// * **Hyperlinks** ([`Inline::Link`]) emit
 ///   `{\field{\*\fldinst HYPERLINK "url"}{\fldrslt <styled children>}}`, the form
 ///   the RTF importer ([`super::rtf::rtf_to_model`]) reads back.
@@ -479,11 +480,26 @@ pub fn rtf_from_model(doc: &Document) -> Vec<u8> {
     }
     color_tbl.push('}');
 
-    let mut s = format!("{{\\rtf1\\ansi\\deff0{{\\fonttbl{{\\f0 Helvetica;}}}}{color_tbl}\\fs22\n");
+    // Collect the distinct run font families into the RTF font table. Slot `\f0`
+    // is the default (Helvetica); each named family gets a 1-based `\fN` slot
+    // (following the default) that runs select via `\fN` in `rtf_char_controls`.
+    let mut fonts: Vec<(String, Generic)> = Vec::new();
+    collect_fonts(doc, &mut fonts);
+
+    let mut font_tbl = String::from("{\\fonttbl{\\f0 Helvetica;}");
+    for (i, (name, generic)) in fonts.iter().enumerate() {
+        let mut esc = String::new();
+        rtf_escape(name, &mut esc);
+        font_tbl.push_str(&format!("{{\\f{}{} {esc};}}", i + 1, rtf_font_class(*generic)));
+    }
+    font_tbl.push('}');
+
+    let mut s = format!("{{\\rtf1\\ansi\\deff0{font_tbl}{color_tbl}\\fs22\n");
     let mut first = true;
     rtf_blocks_from_model(
         &collect_blocks(doc),
         &colors,
+        &fonts,
         &doc.resources,
         &mut first,
         &mut s,
@@ -580,6 +596,76 @@ fn collect_inline_colors(inline: &Inline, colors: &mut Vec<[u8; 3]>) {
     }
 }
 
+/// Collect the distinct run font families across the document, mirroring
+/// [`collect_colors`]. Each family is recorded once — keyed by its display name,
+/// with the first-seen [`Generic`] class — so the font table lists every
+/// referenced family exactly once. Runs with an empty family stay on the default
+/// (`\f0`) and contribute nothing here.
+fn collect_fonts(doc: &Document, fonts: &mut Vec<(String, Generic)>) {
+    for b in collect_blocks(doc) {
+        collect_block_fonts(&b, fonts);
+    }
+}
+
+fn collect_block_fonts(block: &Block, fonts: &mut Vec<(String, Generic)>) {
+    match &block.kind {
+        BlockKind::Paragraph(p) => collect_para_fonts(p, fonts),
+        BlockKind::Heading(h) => collect_para_fonts(&h.para, fonts),
+        BlockKind::List(list) => {
+            for item in &list.items {
+                for b in &item.blocks {
+                    collect_block_fonts(b, fonts);
+                }
+            }
+        }
+        BlockKind::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for b in &cell.blocks {
+                        collect_block_fonts(b, fonts);
+                    }
+                }
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            for b in &tb.blocks {
+                collect_block_fonts(b, fonts);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            for b in &bq.blocks {
+                collect_block_fonts(b, fonts);
+            }
+        }
+        // Sheets/code blocks render as plain (font-less) lines; rules and images
+        // carry no run styling — matching `collect_block_colors`' coverage.
+        _ => {}
+    }
+}
+
+fn collect_para_fonts(para: &Paragraph, fonts: &mut Vec<(String, Generic)>) {
+    for r in &para.runs {
+        collect_inline_fonts(r, fonts);
+    }
+}
+
+fn collect_inline_fonts(inline: &Inline, fonts: &mut Vec<(String, Generic)>) {
+    match inline {
+        Inline::Run(run) => {
+            let family = &run.style.family;
+            if !family.is_empty() && !fonts.iter().any(|(name, _)| name == family) {
+                fonts.push((family.clone(), run.style.generic));
+            }
+        }
+        Inline::Link { children, .. } => {
+            for c in children {
+                collect_inline_fonts(c, fonts);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A run's colour as an RGB byte triple, when set and not (near-)black.
 fn rtf_run_color(style: &CharStyle) -> Option<[u8; 3]> {
     match style.color {
@@ -601,31 +687,45 @@ fn rtf_run_highlight(style: &CharStyle) -> Option<[u8; 3]> {
     })
 }
 
+/// The RTF font-family class control word for a generic class: `\froman` (serif),
+/// `\fswiss` (sans-serif), `\fmodern` (monospace). [`Generic`] is total (always
+/// one of these three), so the importer's other classes (`\fnil`, `\fscript`…)
+/// are never needed on export.
+fn rtf_font_class(generic: Generic) -> &'static str {
+    match generic {
+        Generic::Serif => "\\froman",
+        Generic::Sans => "\\fswiss",
+        Generic::Mono => "\\fmodern",
+    }
+}
+
 fn rtf_blocks_from_model(
     blocks: &[Block],
     colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
     res: &ResourceTable,
     first: &mut bool,
     out: &mut String,
 ) {
     for b in blocks {
-        rtf_block_from_model(b, colors, res, first, out);
+        rtf_block_from_model(b, colors, fonts, res, first, out);
     }
 }
 
 fn rtf_block_from_model(
     block: &Block,
     colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
     res: &ResourceTable,
     first: &mut bool,
     out: &mut String,
 ) {
     match &block.kind {
-        BlockKind::Paragraph(p) => rtf_para_from_model(p, colors, res, false, first, out),
-        BlockKind::Heading(h) => rtf_heading_from_model(h, colors, first, out),
-        BlockKind::List(list) => rtf_list_from_model(list, colors, res, first, out),
-        BlockKind::Table(table) => rtf_table_from_model(table, colors, res, first, out),
-        BlockKind::TextBox(tb) => rtf_blocks_from_model(&tb.blocks, colors, res, first, out),
+        BlockKind::Paragraph(p) => rtf_para_from_model(p, colors, fonts, res, false, first, out),
+        BlockKind::Heading(h) => rtf_heading_from_model(h, colors, fonts, first, out),
+        BlockKind::List(list) => rtf_list_from_model(list, colors, fonts, res, first, out),
+        BlockKind::Table(table) => rtf_table_from_model(table, colors, fonts, res, first, out),
+        BlockKind::TextBox(tb) => rtf_blocks_from_model(&tb.blocks, colors, fonts, res, first, out),
         BlockKind::Sheet(sb) => {
             for sheet in &sb.sheets {
                 for row in &sheet.rows {
@@ -649,7 +749,7 @@ fn rtf_block_from_model(
         BlockKind::Slide(sb) => {
             for slide in &sb.slides {
                 for ph in &slide.placeholders {
-                    rtf_block_from_model(&ph.block, colors, res, first, out);
+                    rtf_block_from_model(&ph.block, colors, fonts, res, first, out);
                 }
             }
         }
@@ -664,7 +764,7 @@ fn rtf_block_from_model(
             rtf_par_sep(first, out);
             out.push_str("{\\li360 ");
             let mut inner_first = true;
-            rtf_blocks_from_model(&bq.blocks, colors, res, &mut inner_first, out);
+            rtf_blocks_from_model(&bq.blocks, colors, fonts, res, &mut inner_first, out);
             out.push('}');
         }
         BlockKind::HorizontalRule => {
@@ -695,6 +795,7 @@ fn rtf_plain_line(text: &str, first: &mut bool, out: &mut String) {
 fn rtf_para_from_model(
     para: &Paragraph,
     colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
     res: &ResourceTable,
     force_bold: bool,
     first: &mut bool,
@@ -709,13 +810,14 @@ fn rtf_para_from_model(
         crate::model::Align::Justify => out.push_str("\\qj "),
     }
     for r in &para.runs {
-        rtf_inline_from_model(r, colors, res, force_bold, out);
+        rtf_inline_from_model(r, colors, fonts, res, force_bold, out);
     }
 }
 
 fn rtf_inline_from_model(
     inline: &Inline,
     colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
     res: &ResourceTable,
     force_bold: bool,
     out: &mut String,
@@ -726,7 +828,7 @@ fn rtf_inline_from_model(
                 return;
             }
             out.push('{');
-            rtf_char_controls(&run.style, colors, force_bold, out);
+            rtf_char_controls(&run.style, colors, fonts, force_bold, out);
             rtf_escape(&run.text, out);
             out.push('}');
         }
@@ -750,7 +852,7 @@ fn rtf_inline_from_model(
             rtf_escape(&url, out);
             out.push_str("\"}{\\fldrslt ");
             for c in children {
-                rtf_inline_from_model(c, colors, res, force_bold, out);
+                rtf_inline_from_model(c, colors, fonts, res, force_bold, out);
             }
             out.push_str("}}");
         }
@@ -761,7 +863,21 @@ fn rtf_inline_from_model(
 }
 
 /// RTF character control words for a run, opening a styled group.
-fn rtf_char_controls(style: &CharStyle, colors: &[[u8; 3]], force_bold: bool, out: &mut String) {
+fn rtf_char_controls(
+    style: &CharStyle,
+    colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
+    force_bold: bool,
+    out: &mut String,
+) {
+    // Font selection: a named family selects its `\fN` table slot (slot 0 is the
+    // default Helvetica, so an empty family — or one absent from the table —
+    // emits no `\f` and inherits the default), mirroring the `\cf` guard below.
+    if !style.family.is_empty() {
+        if let Some(idx) = fonts.iter().position(|(name, _)| name == &style.family) {
+            out.push_str(&format!("\\f{}", idx + 1)); // 1-based (0 = default)
+        }
+    }
     if style.bold || force_bold {
         out.push_str("\\b");
     }
@@ -797,10 +913,16 @@ fn rtf_char_controls(style: &CharStyle, colors: &[[u8; 3]], force_bold: bool, ou
     out.push(' ');
 }
 
-fn rtf_heading_from_model(h: &Heading, colors: &[[u8; 3]], first: &mut bool, out: &mut String) {
+fn rtf_heading_from_model(
+    h: &Heading,
+    colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
+    first: &mut bool,
+    out: &mut String,
+) {
     // Headings render bold; the level is conveyed by the bold styling + text.
     // A heading never contains images, so an empty resource table suffices.
-    rtf_para_from_model(&h.para, colors, &ResourceTable::default(), true, first, out);
+    rtf_para_from_model(&h.para, colors, fonts, &ResourceTable::default(), true, first, out);
 }
 
 /// Width (in twips) of one nesting level's left indent. 360 twips = 0.25 inch,
@@ -814,6 +936,7 @@ const RTF_LIST_INDENT: i64 = 360;
 fn rtf_list_from_model(
     list: &List,
     colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
     res: &ResourceTable,
     first: &mut bool,
     out: &mut String,
@@ -855,13 +978,13 @@ fn rtf_list_from_model(
                         "\\pard\\li{indent}\\fi-{RTF_LIST_INDENT} {marker}"
                     ));
                     for r in &p.runs {
-                        rtf_inline_from_model(r, colors, res, false, out);
+                        rtf_inline_from_model(r, colors, fonts, res, false, out);
                     }
                     continue;
                 }
             }
             // Non-paragraph leading block, or trailing blocks of the item.
-            rtf_block_from_model(b, colors, res, first, out);
+            rtf_block_from_model(b, colors, fonts, res, first, out);
         }
     }
     // Reset paragraph defaults after the list so following blocks are not
@@ -968,6 +1091,7 @@ fn roman(n: u64, upper: bool) -> String {
 fn rtf_table_from_model(
     table: &Table,
     colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
     res: &ResourceTable,
     first: &mut bool,
     out: &mut String,
@@ -995,7 +1119,7 @@ fn rtf_table_from_model(
             // readable (RTF readers treat intra-cell `\par` as a line break).
             let mut cell_first = true;
             for b in &cell.blocks {
-                rtf_cell_block(b, colors, res, &mut cell_first, out);
+                rtf_cell_block(b, colors, fonts, res, &mut cell_first, out);
             }
             out.push_str("\\cell ");
         }
@@ -1010,6 +1134,7 @@ fn rtf_table_from_model(
 fn rtf_cell_block(
     block: &Block,
     colors: &[[u8; 3]],
+    fonts: &[(String, Generic)],
     res: &ResourceTable,
     cell_first: &mut bool,
     out: &mut String,
@@ -1022,7 +1147,7 @@ fn rtf_cell_block(
                 out.push_str("\\par ");
             }
             for r in &p.runs {
-                rtf_inline_from_model(r, colors, res, false, out);
+                rtf_inline_from_model(r, colors, fonts, res, false, out);
             }
         }
         BlockKind::Heading(h) => {
@@ -1032,7 +1157,7 @@ fn rtf_cell_block(
                 out.push_str("\\par ");
             }
             for r in &h.para.runs {
-                rtf_inline_from_model(r, colors, res, true, out);
+                rtf_inline_from_model(r, colors, fonts, res, true, out);
             }
         }
         // Any other block kind (nested list/table/image…) renders via the general
@@ -1045,6 +1170,7 @@ fn rtf_cell_block(
                     ..Block::default()
                 },
                 colors,
+                fonts,
                 res,
                 &mut inner_first,
                 out,
@@ -1087,23 +1213,28 @@ fn cell_edges(col_widths: &[f64], n: usize) -> Vec<i64> {
     edges
 }
 
-/// Emit a `{\pict …}` group for an image resource, when it is a PNG or JPEG
-/// (the formats RTF can carry). The display size comes from the pixel
-/// dimensions (96 dpi → twips). Other formats (GIF/WebP/AVIF/…) are skipped.
+/// Emit a `{\pict …}` group for an image resource. PNG and JPEG embed verbatim
+/// (`\pngblip` / `\jpegblip`); GIF / WebP / AVIF are transcoded to PNG first
+/// (via [`embeddable_image`], the same coercion the image→PDF embedder uses) and
+/// emitted as `\pngblip`. The display size comes from the pixel dimensions
+/// (96 dpi → twips). Unrecognized bytes are skipped.
 fn rtf_image_from_model(img: &ImageRef, res: &ResourceTable, first: &mut bool, out: &mut String) {
     let Some(resource) = res.images.get(&img.resource) else {
         return;
     };
-    let bytes = &resource.bytes;
-    // Detect the real format from the header bytes (authoritative over the tag),
-    // and the pixel dimensions for the `\picwgoal`/`\pichgoal` display size.
-    let blip = match crate::convert::import::image_dimensions(bytes) {
-        Some((w, h, "png")) => Some(("pngblip", w, h)),
-        Some((w, h, "jpeg")) => Some(("jpegblip", w, h)),
-        // GIF/WebP/AVIF have no RTF picture encoding → skip.
-        _ => None,
+    // Coerce to bytes RTF can carry: PNG/JPEG pass through untouched, while
+    // GIF / WebP / AVIF are decoded and re-encoded as PNG. `embeddable_image`
+    // also reports the pixel dimensions for the `\picwgoal`/`\pichgoal` goals.
+    let Some((data, w, h)) = embeddable_image(&resource.bytes) else {
+        return;
     };
-    let Some((blip, w, h)) = blip else {
+    // The blip keyword follows the coerced format — `embeddable_image` only ever
+    // yields PNG or JPEG bytes; anything else is defensively skipped.
+    let blip = if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "pngblip"
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpegblip"
+    } else {
         return;
     };
 
@@ -1115,7 +1246,7 @@ fn rtf_image_from_model(img: &ImageRef, res: &ResourceTable, first: &mut bool, o
     out.push_str(&format!(
         "{{\\pict\\{blip}\\picwgoal{goalw}\\pichgoal{goalh} "
     ));
-    push_hex(bytes, out);
+    push_hex(&data, out);
     out.push('}');
 }
 
@@ -1653,16 +1784,82 @@ mod tests {
         assert_eq!(res.format, "png");
     }
 
-    #[test]
-    fn model_non_raster_image_is_skipped() {
+    /// A minimal but spec-valid 2×2 GIF89a (mirrors `raster::gif`'s own fixture)
+    /// so the transcode path has real bytes to decode.
+    fn sample_gif() -> Vec<u8> {
+        let mut g = Vec::new();
+        g.extend_from_slice(b"GIF89a");
+        g.extend_from_slice(&[2, 0, 2, 0]); // 2×2
+        g.push(0x80 | 0x01); // GCT flag, size 2 → 4 colours
+        g.extend_from_slice(&[0, 0]); // bg, aspect
+        g.extend_from_slice(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]); // GCT
+        g.push(0x2C); // image descriptor
+        g.extend_from_slice(&[0, 0, 0, 0, 2, 0, 2, 0, 0x00]); // 0,0 size 2×2, no LCT
+                                                              // LZW min size 2: clear(4)@3b, 0,1,2,3, EOI(5).
+        let codes: [(u16, u8); 6] = [(4, 3), (0, 3), (1, 3), (2, 3), (3, 4), (5, 4)];
+        let (mut bits, mut acc, mut nb) = (Vec::new(), 0u32, 0u32);
+        for (c, sz) in codes {
+            acc |= (c as u32) << nb;
+            nb += sz as u32;
+            while nb >= 8 {
+                bits.push((acc & 0xFF) as u8);
+                acc >>= 8;
+                nb -= 8;
+            }
+        }
+        if nb > 0 {
+            bits.push((acc & 0xFF) as u8);
+        }
+        g.push(2); // LZW min code size
+        g.push(bits.len() as u8);
+        g.extend_from_slice(&bits);
+        g.push(0x00); // block terminator
+        g.push(0x3B); // trailer
+        g
+    }
+
+    /// Wrap raw image `bytes` (declared `format`) in a one-image document and
+    /// return the emitted RTF.
+    fn rtf_for_image(bytes: Vec<u8>, format: &str) -> String {
         use crate::model::{ImageResource, Page, Section};
-        // A GIF has no RTF picture encoding → no `\pict`, no leaked hex.
-        let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec();
+        let mut images = std::collections::BTreeMap::new();
+        images.insert(
+            1u64,
+            ImageResource {
+                bytes,
+                format: format.to_string(),
+            },
+        );
+        let doc = Document {
+            sections: vec![Section {
+                pages: vec![Page {
+                    blocks: vec![Block {
+                        kind: BlockKind::Image(ImageRef {
+                            resource: 1,
+                            alt: None,
+                        }),
+                        ..Default::default()
+                    }],
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            resources: ResourceTable { images },
+            ..Document::default()
+        };
+        String::from_utf8(rtf_from_model(&doc)).unwrap()
+    }
+
+    #[test]
+    fn model_gif_image_transcodes_to_pict_pngblip() {
+        use crate::model::{ImageResource, Page, Section};
+        // GIF has no native RTF picture encoding, so it is transcoded to PNG and
+        // emitted as `\pngblip` (no longer dropped), with surrounding text kept.
         let mut images = std::collections::BTreeMap::new();
         images.insert(
             3u64,
             ImageResource {
-                bytes: gif,
+                bytes: sample_gif(),
                 format: "gif".to_string(),
             },
         );
@@ -1688,10 +1885,147 @@ mod tests {
             ..Document::default()
         };
         let rtf = String::from_utf8(rtf_from_model(&doc)).unwrap();
-        assert!(!rtf.contains("\\pict"), "GIF emits no picture: {rtf}");
+        assert!(
+            rtf.contains("{\\pict\\pngblip"),
+            "GIF transcoded to a PNG picture group: {rtf}"
+        );
+        // 2px → 30 twips display goal (the decoded GIF is 2×2).
+        assert!(rtf.contains("\\picwgoal30"), "2px → 30 twips width: {rtf}");
         assert!(
             rtf.contains("before") && rtf.contains("after"),
             "surrounding text kept: {rtf}"
+        );
+
+        // Round-trips: the importer re-interns valid PNG bytes for the picture.
+        let back = crate::convert::rtf::rtf_to_model(&rtf);
+        let img = back.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("a BlockKind::Image on re-import");
+        let res = back
+            .resources
+            .images
+            .get(&img.resource)
+            .expect("image bytes re-interned");
+        assert_eq!(res.format, "png", "transcoded picture re-imports as PNG");
+        assert!(
+            res.bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+            "re-interned bytes are a valid PNG"
+        );
+    }
+
+    #[test]
+    fn model_webp_and_avif_images_transcode_to_pict_pngblip() {
+        // WebP (4×4) → decoded and re-encoded as PNG → `\pngblip`.
+        let rgba = [9u8, 5, 3, 255].repeat(4 * 4);
+        let webp = crate::raster::webp::encode_webp(4, 4, &rgba);
+        let webp_rtf = rtf_for_image(webp, "webp");
+        assert!(
+            webp_rtf.contains("{\\pict\\pngblip"),
+            "WebP transcoded to a PNG picture group: {webp_rtf}"
+        );
+
+        // AVIF (32×32 fixture shared with the raster::avif tests) → `\pngblip`.
+        let avif = include_bytes!("../raster/fixtures/av1test.avif").to_vec();
+        let avif_rtf = rtf_for_image(avif, "avif");
+        assert!(
+            avif_rtf.contains("{\\pict\\pngblip"),
+            "AVIF transcoded to a PNG picture group: {avif_rtf}"
+        );
+    }
+
+    #[test]
+    fn model_distinct_run_fonts_build_fonttbl_and_select_fn() {
+        use crate::convert::style::Generic;
+        use crate::model::InlineRun;
+        // Three runs in distinct families (serif, mono, sans) → three font-table
+        // entries (after the default `\f0`), each carrying the matching RTF class.
+        let run = |text: &str, family: &str, generic: Generic| {
+            Inline::Run(InlineRun {
+                text: text.to_string(),
+                style: CharStyle {
+                    family: family.to_string(),
+                    generic,
+                    ..CharStyle::default()
+                },
+                source_index: None,
+            })
+        };
+        let doc = doc_with_block(BlockKind::Paragraph(Paragraph {
+            runs: vec![
+                run("serif", "Times New Roman", Generic::Serif),
+                run("mono", "Courier New", Generic::Mono),
+                run("sans", "Arial", Generic::Sans),
+            ],
+            ..Paragraph::default()
+        }));
+        let rtf = String::from_utf8(rtf_from_model(&doc)).unwrap();
+
+        // The font table lists the default plus one entry per distinct family, in
+        // first-seen order (→ f1, f2, f3), each with the right generic class.
+        assert!(rtf.contains("{\\f0 Helvetica;}"), "default font slot: {rtf}");
+        assert!(
+            rtf.contains("{\\f1\\froman Times New Roman;}"),
+            "serif entry: {rtf}"
+        );
+        assert!(
+            rtf.contains("{\\f2\\fmodern Courier New;}"),
+            "mono entry: {rtf}"
+        );
+        assert!(rtf.contains("{\\f3\\fswiss Arial;}"), "sans entry: {rtf}");
+        // …and each run selects its `\fN` slot.
+        assert!(rtf.contains("\\f1"), "first run selects f1: {rtf}");
+        assert!(rtf.contains("\\f2"), "second run selects f2: {rtf}");
+        assert!(rtf.contains("\\f3"), "third run selects f3: {rtf}");
+
+        // Round-trips: the importer recovers the families from the fonttbl + `\fN`.
+        let back = crate::convert::rtf::rtf_to_model(&rtf);
+        let families: Vec<String> = back.sections[0].pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => Some(
+                    p.runs
+                        .iter()
+                        .filter_map(|i| match i {
+                            Inline::Run(r) => Some(r.style.family.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("a paragraph on re-import");
+        for fam in ["Times New Roman", "Courier New", "Arial"] {
+            assert!(
+                families.contains(&fam.to_string()),
+                "family {fam:?} round-trips: {families:?}"
+            );
+        }
+
+        // A run with no family stays on the default: only `\f0` in the table and
+        // no named-family selection.
+        let plain = String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::Paragraph(
+            Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "plain".to_string(),
+                    ..Default::default()
+                })],
+                ..Paragraph::default()
+            },
+        ))))
+        .unwrap();
+        assert!(
+            plain.contains("{\\fonttbl{\\f0 Helvetica;}}"),
+            "only the default font slot: {plain}"
+        );
+        assert!(
+            !plain.contains("\\f1"),
+            "no named-family selection for a default run: {plain}"
         );
     }
 
