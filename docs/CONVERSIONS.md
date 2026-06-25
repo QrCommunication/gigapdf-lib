@@ -179,9 +179,12 @@ explicit `/Mask`, or a soft `/SMask`):
     (§7.4.13, run-code-built) — all composited onto the page bitmap with the
     segment combination operator (OR/AND/XOR/XNOR/REPLACE).
 
-  An inline `/JBIG2Globals` stream in `/DecodeParms` is honoured. **Precise gap:**
-  a `/JBIG2Globals` supplied as an *indirect reference* (the filter layer resolves
-  only an inline globals stream; page-stream segments still decode). A
+  A `/JBIG2Globals` stream in `/DecodeParms` (the shared symbol dictionary of a
+  scanned document) is **fully resolved** — whether embedded inline *or* supplied
+  as an *indirect reference*. The image-decode call site (which holds the object
+  resolver) follows the reference, decodes that globals stream through its own
+  filter chain, and feeds the resulting segments into the JBIG2 decoder; both the
+  single-dictionary and array `/DecodeParms` forms are handled. A
   genuinely-unknown segment type is skipped (its region left blank) rather than
   aborting the page.
 

@@ -8297,8 +8297,11 @@ impl Document {
             let cs_obj = dict.get(b"ColorSpace").map(|o| self.resolve(o));
             let cs = cs_obj.and_then(|o| self.resolve_color_space(o, 0))?;
             // An unsupported filter (e.g. CCITTFaxDecode) makes `decode_stream`
-            // error — skip rather than misread its bytes as raster samples.
-            let samples = decode_stream(stream).ok()?;
+            // error — skip rather than misread its bytes as raster samples. A
+            // `/JBIG2Decode` image whose `/JBIG2Globals` is an indirect ref has
+            // those globals resolved here first (the filter layer cannot).
+            let samples =
+                decode_stream(self.image_stream_with_resolved_globals(stream).as_ref()).ok()?;
             color_key = self.color_key_mask(dict, &samples, w, h, &cs, bpc);
             self.image_samples_to_rgb(&cs, &samples, w, h, bpc, dict)?
         };
@@ -8357,6 +8360,104 @@ impl Document {
     ) -> Option<crate::raster::render::RenderImage> {
         let inline = crate::content::parse_inline_image(raw)?;
         self.decode_image_stream(&inline.to_stream())
+    }
+
+    /// Wrap an image stream so a `/JBIG2Decode` filter whose `/DecodeParms`
+    /// `/JBIG2Globals` is an **indirect reference** (the common scanned-document
+    /// case, where the shared symbol dictionary lives in a separate stream) can
+    /// be decoded. The [`crate::filters`] layer is document-free and cannot
+    /// dereference that `n g R`, so the resolution happens here — the one image
+    /// call site that holds the object resolver: we follow the reference, inline
+    /// the resolved globals stream into a cloned `/DecodeParms`, and hand that to
+    /// [`decode_stream`]. The globals stream keeps its own `/Filter` chain (often
+    /// `/FlateDecode`), which `decode_stream` applies in turn before the bytes
+    /// reach the JBIG2 decoder.
+    ///
+    /// Returns the stream untouched (borrowed, no clone) when it is not JBIG2,
+    /// carries no `/DecodeParms`, or its `/JBIG2Globals` is missing or already an
+    /// inline stream — so the already-direct and absent cases behave exactly as
+    /// before. Both the single-dictionary and array-of-dictionaries
+    /// `/DecodeParms` forms are handled.
+    fn image_stream_with_resolved_globals<'a>(
+        &self,
+        stream: &'a Stream,
+    ) -> std::borrow::Cow<'a, Stream> {
+        if !self.filter_chain_has_jbig2(&stream.dict) {
+            return std::borrow::Cow::Borrowed(stream);
+        }
+        let Some(parms) = self.resolve_jbig2_decode_parms(&stream.dict) else {
+            return std::borrow::Cow::Borrowed(stream);
+        };
+        let mut dict = stream.dict.clone();
+        // Mirror the key the stream actually used (`/DecodeParms`, or its `/DP`
+        // inline-image abbreviation) so `decode_stream` reads back the rewrite.
+        let key: &[u8] = if dict.contains(b"DecodeParms") {
+            b"DecodeParms"
+        } else {
+            b"DP"
+        };
+        dict.set(key.to_vec(), parms);
+        std::borrow::Cow::Owned(Stream::new(dict, stream.raw.clone()))
+    }
+
+    /// Whether `dict`'s `/Filter` (or its `/F` inline-image abbreviation) chain
+    /// names `/JBIG2Decode`, resolving an indirect `/Filter` entry first.
+    fn filter_chain_has_jbig2(&self, dict: &Dictionary) -> bool {
+        let entry = dict.get(b"Filter").or_else(|| dict.get(b"F"));
+        match entry.map(|o| self.resolve(o)) {
+            Some(Object::Name(n)) => n.as_slice() == b"JBIG2Decode",
+            Some(Object::Array(items)) => items
+                .iter()
+                .filter_map(|o| self.resolve(o).as_name())
+                .any(|n| n == b"JBIG2Decode"),
+            _ => false,
+        }
+    }
+
+    /// Build a `/DecodeParms` value with any indirect `/JBIG2Globals` reference
+    /// resolved into an inline stream object, preserving the original shape
+    /// (single dict or array). `None` when there is no `/DecodeParms`/`/DP`, or
+    /// no indirect `/JBIG2Globals` to inline — so the caller leaves the stream
+    /// as-is and the existing inline/absent handling is unchanged.
+    fn resolve_jbig2_decode_parms(&self, dict: &Dictionary) -> Option<Object> {
+        let entry = dict.get(b"DecodeParms").or_else(|| dict.get(b"DP"))?;
+        match self.resolve(entry) {
+            Object::Dictionary(d) => self.inline_jbig2_globals(d).map(Object::Dictionary),
+            Object::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                let mut changed = false;
+                for item in items {
+                    match self.resolve(item) {
+                        Object::Dictionary(d) => match self.inline_jbig2_globals(d) {
+                            Some(rewritten) => {
+                                changed = true;
+                                out.push(Object::Dictionary(rewritten));
+                            }
+                            None => out.push(Object::Dictionary(d.clone())),
+                        },
+                        other => out.push(other.clone()),
+                    }
+                }
+                changed.then_some(Object::Array(out))
+            }
+            _ => None,
+        }
+    }
+
+    /// Rewrite one `/DecodeParms` dict so an indirect `/JBIG2Globals` becomes an
+    /// inline (resolved) stream object. `None` when its `/JBIG2Globals` is
+    /// absent, already an inline stream, or does not resolve to a stream — i.e.
+    /// nothing to inline.
+    fn inline_jbig2_globals(&self, parms: &Dictionary) -> Option<Dictionary> {
+        let globals = parms.get(b"JBIG2Globals")?;
+        // Already an inline stream → the filter layer handles it directly.
+        if matches!(globals, Object::Stream(_)) {
+            return None;
+        }
+        let resolved = self.resolve(globals).as_stream()?;
+        let mut out = parms.clone();
+        out.set(b"JBIG2Globals".to_vec(), Object::Stream(resolved.clone()));
+        Some(out)
     }
 
     /// Convert a decoded sample grid (`samples`, packed MSB-first, each scanline
@@ -8477,7 +8578,8 @@ impl Document {
         ) {
             return None;
         }
-        let samples = decode_stream(stream).ok()?;
+        let samples =
+            decode_stream(self.image_stream_with_resolved_globals(stream).as_ref()).ok()?;
         let (sw, sh) = (sw as usize, sh as usize);
         if samples.len() < sw * sh {
             return None;
@@ -8504,7 +8606,10 @@ impl Document {
         ) {
             return None;
         }
-        let samples = decode_stream(stream).ok()?;
+        // A JBIG2-coded stencil with an indirect `/JBIG2Globals` needs those
+        // globals resolved before the filter layer (which cannot follow the ref).
+        let samples =
+            decode_stream(self.image_stream_with_resolved_globals(stream).as_ref()).ok()?;
         let row_bytes = (w as u64).div_ceil(8);
         if row_bytes * h as u64 > samples.len() as u64 {
             return None;
@@ -8552,7 +8657,8 @@ impl Document {
         ) {
             return None;
         }
-        let samples = decode_stream(stream).ok()?;
+        let samples =
+            decode_stream(self.image_stream_with_resolved_globals(stream).as_ref()).ok()?;
         let (mw, mh) = (mw as usize, mh as usize);
         let row_bytes = (mw as u64).div_ceil(8);
         if row_bytes * mh as u64 > samples.len() as u64 {
@@ -22544,6 +22650,149 @@ mod tests {
             .expect("2x2 image XObject present after round-trip");
         // PNG → Flate /DeviceRGB embed is lossless: the samples must match.
         assert_eq!(embedded.rgba, rgba, "round-tripped pixels match the source");
+    }
+
+    #[test]
+    fn jbig2_image_resolves_indirect_globals_same_as_inline() {
+        // A JBIG2 image whose shared content (here the page-info segment plus a
+        // generic region) lives in a SEPARATE globals stream referenced by
+        // `/DecodeParms << /JBIG2Globals N 0 R >>` — the common scanned-document
+        // shape. The filter layer is document-free and cannot follow that `N 0 R`;
+        // `decode_image_stream` resolves it. This asserts the indirect-globals
+        // form decodes the SAME bitmap as the equivalent inline-globals form, and
+        // that without the globals the page cannot decode at all (proving the
+        // globals are genuinely fed into the JBIG2 decoder).
+
+        // --- Minimal JBIG2 segment builders (mirroring the wire format) ---
+        fn push_segment(out: &mut Vec<u8>, number: u32, seg_type: u8, data: &[u8]) {
+            out.extend_from_slice(&number.to_be_bytes());
+            out.push(seg_type); // flags: type, 1-byte page association
+            out.push(0x00); // referred-to count 0 + retention flags
+            out.push(1); // page association
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(data);
+        }
+        // Page-information segment (type 48) for a `w x h` page, no default pixel.
+        fn page_info(w: u32, h: u32) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&w.to_be_bytes());
+            v.extend_from_slice(&h.to_be_bytes());
+            v.extend_from_slice(&0u32.to_be_bytes()); // xres
+            v.extend_from_slice(&0u32.to_be_bytes()); // yres
+            v.push(0x00); // flags
+            v.extend_from_slice(&0u16.to_be_bytes()); // striping
+            v
+        }
+        // Immediate generic-region segment (type 38), MMR-coded. The payload
+        // `0x31 0xF8` decodes (G4) to `WWW BB WWW` over its 8x2 region; placed at
+        // `(0, y)` with comb-op OR onto the page.
+        fn generic_region_mmr(y: u32) -> Vec<u8> {
+            let mut region = Vec::new();
+            region.extend_from_slice(&8u32.to_be_bytes()); // width
+            region.extend_from_slice(&2u32.to_be_bytes()); // height
+            region.extend_from_slice(&0u32.to_be_bytes()); // x
+            region.extend_from_slice(&y.to_be_bytes()); // y
+            region.push(0x00); // comb-op OR
+            region.push(0x01); // generic flags: MMR
+            region.extend_from_slice(&[0x31u8, 0xF8]); // MMR data → WWW BB WWW rows
+            region
+        }
+
+        // Globals stream: page-info(8x4) + a generic region painting rows 0..2.
+        let mut globals_segments: Vec<u8> = Vec::new();
+        push_segment(&mut globals_segments, 0, 48, &page_info(8, 4));
+        push_segment(&mut globals_segments, 1, 38, &generic_region_mmr(0));
+        // Page stream: a second generic region painting rows 2..4.
+        let mut page_segments: Vec<u8> = Vec::new();
+        push_segment(&mut page_segments, 2, 38, &generic_region_mmr(2));
+
+        // Build a host document so indirect references can be resolved.
+        let pdf = crate::convert::reverse::txt_to_pdf("jbig2 host");
+        let mut doc = Document::open(&pdf).unwrap();
+
+        // Register the globals as a standalone (Flate-compressed) stream object so
+        // its `/JBIG2Globals` reference exercises BOTH indirect resolution AND the
+        // globals' own filter chain inside `decode_stream`.
+        let globals_raw = crate::filters::deflate::flate_encode(&globals_segments);
+        let mut globals_dict = Dictionary::new();
+        globals_dict.set(b"Filter".to_vec(), Object::Name(b"FlateDecode".to_vec()));
+        globals_dict.set(
+            b"Length".to_vec(),
+            Object::Integer(globals_raw.len() as i64),
+        );
+        let globals_id = (doc.next_object_number(), 0u16);
+        doc.objects.insert(
+            globals_id,
+            Object::Stream(Stream::new(globals_dict.clone(), globals_raw.clone())),
+        );
+
+        // Helper: a JBIG2 image XObject (8x4, 1-bit DeviceGray) carrying the given
+        // `/DecodeParms` object.
+        let image_stream = |decode_parms: Object| -> Stream {
+            let mut dict = Dictionary::new();
+            dict.set(b"Type".to_vec(), Object::Name(b"XObject".to_vec()));
+            dict.set(b"Subtype".to_vec(), Object::Name(b"Image".to_vec()));
+            dict.set(b"Width".to_vec(), Object::Integer(8));
+            dict.set(b"Height".to_vec(), Object::Integer(4));
+            dict.set(b"BitsPerComponent".to_vec(), Object::Integer(1));
+            dict.set(b"ColorSpace".to_vec(), Object::Name(b"DeviceGray".to_vec()));
+            dict.set(b"Filter".to_vec(), Object::Name(b"JBIG2Decode".to_vec()));
+            dict.set(b"DecodeParms".to_vec(), decode_parms);
+            Stream::new(dict, page_segments.clone())
+        };
+
+        // (a) Indirect: `/JBIG2Globals` is `globals_id 0 R`.
+        let mut indirect_parms = Dictionary::new();
+        indirect_parms.set(b"JBIG2Globals".to_vec(), Object::Reference(globals_id));
+        let indirect_img = doc
+            .decode_image_stream(&image_stream(Object::Dictionary(indirect_parms)))
+            .expect("indirect-globals JBIG2 image decodes");
+
+        // (b) Inline: `/JBIG2Globals` is the resolved stream object itself.
+        let mut inline_parms = Dictionary::new();
+        inline_parms.set(
+            b"JBIG2Globals".to_vec(),
+            Object::Stream(Stream::new(globals_dict, globals_raw)),
+        );
+        let inline_img = doc
+            .decode_image_stream(&image_stream(Object::Dictionary(inline_parms)))
+            .expect("inline-globals JBIG2 image decodes");
+
+        // The core assertion: the two forms decode to the identical bitmap.
+        assert_eq!(
+            (indirect_img.width, indirect_img.height),
+            (inline_img.width, inline_img.height),
+            "indirect and inline globals must yield the same geometry"
+        );
+        assert_eq!(
+            indirect_img.rgba, inline_img.rgba,
+            "indirect /JBIG2Globals must decode the SAME pixels as the inline form"
+        );
+
+        // Sanity: the decoded image must show the `WWW BB WWW` pattern (black at
+        // x=3,4 on every row), which can only come from the globals' page-info +
+        // region plus the page region — i.e. the globals really were fed in. The
+        // image is 8x4 RGBA; gray 0 = black, gray 255 = white.
+        let px = |x: usize, y: usize| -> u8 { indirect_img.rgba[(y * 8 + x) * 4] };
+        for y in 0..4 {
+            for x in 0..8 {
+                let expect_black = x == 3 || x == 4; // BB columns of WWW BB WWW
+                assert_eq!(
+                    px(x, y) == 0,
+                    expect_black,
+                    "pixel ({x},{y}) colour mismatch (the globals region must paint)"
+                );
+            }
+        }
+
+        // Without the globals, the page stream alone has no page-info segment, so
+        // the JBIG2 decode fails and the image cannot be produced. This is exactly
+        // the pre-fix behaviour for an unresolved indirect `/JBIG2Globals`.
+        let no_globals = image_stream(Object::Null);
+        assert!(
+            doc.decode_image_stream(&no_globals).is_none(),
+            "without globals the JBIG2 page cannot decode (proves globals drive the result)"
+        );
     }
 
     #[test]
