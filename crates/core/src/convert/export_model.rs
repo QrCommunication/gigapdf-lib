@@ -9588,6 +9588,116 @@ style:print-orientation=\"landscape\""),
         assert!(!content.contains("style:row-height"), "no row height by default");
     }
 
+    #[test]
+    fn xlsx_export_emits_cols_for_column_widths() {
+        // A sheet carrying explicit per-column widths (points) re-emits the XLSX
+        // `<cols><col>` block; points convert back to Excel character units
+        // (140pt / 7 = 20), closing the import round-trip (`<col width="20"/>` →
+        // 140pt → `<col width="20"/>`). A zero-width slot is skipped.
+        let sheet = Sheet {
+            name: "W".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("x".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: vec![140.0, 0.0, 70.0],
+        };
+        let xlsx = xlsx_from_model(&sheet_doc(sheet));
+        let ws = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(ws.contains("<cols>"), "cols block emitted: {ws}");
+        assert!(
+            ws.contains("<col min=\"1\" max=\"1\" width=\"20\" customWidth=\"1\"/>"),
+            "col1 140pt → 20ch: {ws}"
+        );
+        // Zero-width middle column is skipped (no `min="2"`); col 3 → 10ch.
+        assert!(!ws.contains("min=\"2\""), "default column not emitted: {ws}");
+        assert!(
+            ws.contains("<col min=\"3\" max=\"3\" width=\"10\" customWidth=\"1\"/>"),
+            "col3 70pt → 10ch: {ws}"
+        );
+    }
+
+    #[test]
+    fn xlsx_export_no_cols_when_widths_empty() {
+        // No explicit widths ⇒ no `<cols>` block (default-width sheets stay clean).
+        let sheet = Sheet {
+            name: "Z".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("x".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        };
+        let xlsx = xlsx_from_model(&sheet_doc(sheet));
+        let ws = String::from_utf8(entry(&xlsx, "xl/worksheets/sheet1.xml").unwrap()).unwrap();
+        assert!(!ws.contains("<cols>"), "no cols block for default widths: {ws}");
+    }
+
+    #[test]
+    fn ods_export_emits_table_columns_for_widths() {
+        // The ODS path emits a `table:table-column` per sized column plus a
+        // column-width style (points). An empty `col_widths` emits neither.
+        let sheet = Sheet {
+            name: "W".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("x".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: vec![85.0394, 141.7323],
+        };
+        let ods = ods_from_model(&sheet_doc(sheet));
+        let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
+        assert!(
+            content.contains("<table:table-column "),
+            "table-column emitted: {content}"
+        );
+        assert!(
+            content.contains("style:column-width=\"85.039pt\"")
+                && content.contains("style:column-width=\"141.732pt\""),
+            "both column widths in points: {content}"
+        );
+
+        let plain = Sheet {
+            col_widths: Vec::new(),
+            ..ods_from_model_plain_sheet()
+        };
+        let ods = ods_from_model(&sheet_doc(plain));
+        let content = String::from_utf8(entry(&ods, "content.xml").unwrap()).unwrap();
+        assert!(
+            !content.contains("style:family=\"table-column\""),
+            "no column style for default widths: {content}"
+        );
+    }
+
+    /// A minimal one-cell sheet used to assert default (empty `col_widths`) ODS
+    /// export emits no column styles.
+    fn ods_from_model_plain_sheet() -> Sheet {
+        Sheet {
+            name: "Z".to_string(),
+            rows: vec![SheetRow {
+                cells: vec![SheetCell {
+                    value: CellValue::Text("x".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            merges: Vec::new(),
+            col_widths: Vec::new(),
+        }
+    }
+
     // ─────────────────────────────── CSV ───────────────────────────────
 
     /// Build a one-sheet document from rows of `&str` cells (text values).

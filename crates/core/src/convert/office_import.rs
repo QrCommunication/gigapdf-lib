@@ -2995,7 +2995,8 @@ pub fn xlsx_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 /// the cell type/format/fill resolution from [`xlsx_sheet_table`] — but storing
 /// typed [`CellValue`]s (`Number`/`Text`/`Bool`/`Empty`), per-cell
 /// `number_format`, fill, font/border/alignment (from `styles`), expanded
-/// shared formulas, cell hyperlinks (resolved via `rels`), plus the merge ranges.
+/// shared formulas, cell hyperlinks (resolved via `rels`), the merge ranges, and
+/// per-column widths from `<cols><col>` (Excel character units → points).
 fn xlsx_sheet_model(
     name: String,
     xml: &str,
@@ -3012,6 +3013,16 @@ fn xlsx_sheet_model(
     let mut rows: Vec<SheetRow> = Vec::new();
     let mut x = Xml::new(xml);
     let mut in_sheet_data = false;
+
+    // `<cols><col min=.. max=.. width=.. [customWidth=..]/>` precede `<sheetData>`.
+    // Excel's `width` is in "characters" (≈ 7 px of the default font); the model
+    // stores points, so convert via the XLSX export's reciprocal (`× 7.0`, the
+    // inverse of `xlsx_cols_xml`'s `/ 7.0`). Each `<col>` spans `min..=max`
+    // (1-based, inclusive); record per 0-based column so sparse/overlapping
+    // declarations resolve cleanly. A bare `width` with no `customWidth` still
+    // carries an authored width, so honour it.
+    let mut col_w: BTreeMap<usize, f64> = BTreeMap::new();
+    let mut in_cols = false;
 
     let mut row_idx = 0usize;
     let mut next_auto_row = 0usize;
@@ -3041,7 +3052,31 @@ fn xlsx_sheet_model(
     while let Some(tok) = x.next() {
         match tok {
             Tok::Open(name, attrs, sc) => match local(&name) {
-                "sheetData" => in_sheet_data = true,
+                "cols" if !in_sheet_data => in_cols = true,
+                // `<col>` spans columns `min..=max` (1-based). Expand the range to
+                // per-column points so a single `<col min=1 max=3 width=20/>` fills
+                // three slots. Ignore non-positive/absent widths.
+                "col" if in_cols => {
+                    let min = attr(&attrs, "min").and_then(|v| v.trim().parse::<usize>().ok());
+                    let max = attr(&attrs, "max").and_then(|v| v.trim().parse::<usize>().ok());
+                    let width = attr(&attrs, "width").and_then(|v| v.trim().parse::<f64>().ok());
+                    if let (Some(min), Some(max), Some(w)) = (min, max, width) {
+                        if min >= 1 && max >= min && w > 0.0 {
+                            let pts = w * 7.0;
+                            // Cap the span so a stray `max` (Excel may emit a huge
+                            // `max` for a trailing default `<col>`) cannot allocate
+                            // an unbounded number of slots.
+                            let last = max.min(min + 16_383);
+                            for c in min..=last {
+                                col_w.insert(c - 1, pts);
+                            }
+                        }
+                    }
+                }
+                "sheetData" => {
+                    in_cols = false;
+                    in_sheet_data = true;
+                }
                 "row" if in_sheet_data && !sc => {
                     row_open = true;
                     row_cells.clear();
@@ -3185,11 +3220,29 @@ fn xlsx_sheet_model(
         cells[c].hyperlink = Some(target);
     }
 
+    // Materialise per-column widths (points) from the `<cols>` ranges: dense
+    // `0..=highest` with gaps left at the default `0.0`, then trailing defaults
+    // trimmed so a sheet with no authored widths keeps an empty vec (matching the
+    // ODS path and what the exporter expects to skip the `<cols>` block).
+    let mut col_widths: Vec<f64> = match col_w.keys().last().copied() {
+        Some(highest) => {
+            let mut v = vec![0.0; highest + 1];
+            for (c, w) in &col_w {
+                v[*c] = *w;
+            }
+            v
+        }
+        None => Vec::new(),
+    };
+    while matches!(col_widths.last(), Some(w) if *w == 0.0) {
+        col_widths.pop();
+    }
+
     Sheet {
         name,
         rows,
         merges,
-        col_widths: Vec::new(),
+        col_widths,
     }
 }
 
@@ -22157,6 +22210,62 @@ mod tests {
         assert!(border.width > 0.0, "border width: {}", border.width);
         assert_eq!(fancy.align, Some(MAlign::Center), "centered");
         assert!(fancy.wrap, "wrapped");
+    }
+
+    #[test]
+    fn xlsx_model_reads_cols_column_widths() {
+        // A single `<col min="1" max="3" width="20"/>` seeds three columns; the
+        // Excel character width (20) becomes points (× 7.0 = 140.0). A later
+        // `<col>` for a single column (col 5, 0-based 4) leaves a default gap at
+        // col 4 (0-based 3).
+        let sheet = r#"<worksheet>
+          <cols>
+            <col min="1" max="3" width="20" customWidth="1"/>
+            <col min="5" max="5" width="12" customWidth="1"/>
+          </cols>
+          <sheetData>
+            <row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>
+          </sheetData>
+        </worksheet>"#;
+        let s = xlsx_model_sheet("", sheet, None);
+        // Columns 0..=4: [140, 140, 140, default(0), 84].
+        assert_eq!(s.col_widths.len(), 5, "five columns sized (incl. default gap)");
+        for (i, w) in [140.0, 140.0, 140.0].iter().enumerate() {
+            assert!(
+                (s.col_widths[i] - w).abs() < 1e-9,
+                "col {i} width {} ≠ {w}",
+                s.col_widths[i]
+            );
+        }
+        assert_eq!(s.col_widths[3], 0.0, "unsized middle column ⇒ default");
+        assert!((s.col_widths[4] - 84.0).abs() < 1e-9, "col5 12ch → 84pt");
+    }
+
+    #[test]
+    fn xlsx_model_no_cols_keeps_widths_empty() {
+        // A worksheet without a `<cols>` block leaves `col_widths` empty so the
+        // exporter emits no `<cols>` (default-width sheets stay clean).
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1"><c r="A1" t="inlineStr"><is><t>only</t></is></c></row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet("", sheet, None);
+        assert!(s.col_widths.is_empty(), "no <cols> ⇒ empty col_widths");
+    }
+
+    #[test]
+    fn xlsx_model_cols_trims_trailing_default_widths() {
+        // `<col>` for cols 2..=2 only (0-based 1) ⇒ col 0 defaults, col 1 sized;
+        // nothing trails the sized column, so the vec is exactly two long.
+        let sheet = r#"<worksheet>
+          <cols><col min="2" max="2" width="10" customWidth="1"/></cols>
+          <sheetData>
+            <row r="1"><c r="B1" t="inlineStr"><is><t>x</t></is></c></row>
+          </sheetData>
+        </worksheet>"#;
+        let s = xlsx_model_sheet("", sheet, None);
+        assert_eq!(s.col_widths.len(), 2, "leading default + one sized column");
+        assert_eq!(s.col_widths[0], 0.0, "col0 default");
+        assert!((s.col_widths[1] - 70.0).abs() < 1e-9, "col1 10ch → 70pt");
     }
 
     #[test]
