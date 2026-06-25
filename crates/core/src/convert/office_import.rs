@@ -1272,6 +1272,14 @@ fn docx_walk_model(
                         let page = pages.page_index();
                         outline.push_bookmark(name, page);
                     }
+                } else if docx_is_dropped_revision(ln) && !sc {
+                    // A paragraph-level deletion/move-source wrapping whole `w:p`/
+                    // `w:tbl` blocks (`w:del`/`w:moveFrom`): drop the subtree so the
+                    // deleted blocks never reach the model (accept-all). A body-level
+                    // `w:ins`/`w:moveTo` is transparent — it has no branch here, so
+                    // its enclosed `w:p`/`w:tbl` are walked on the next iterations and
+                    // the inserted/moved blocks are kept.
+                    xml_skip_subtree(x, ln);
                 }
             }
             Tok::Close(name) => {
@@ -1886,6 +1894,25 @@ fn docx_paragraph_model(
                             sink.push(inline);
                         }
                     }
+                    // Track-changes, accepted to the final version. A deletion
+                    // (`w:del`, incl. its `w:delText`), a move source (`w:moveFrom`),
+                    // or a formatting-change record (`w:rPrChange`/`w:pPrChange`,
+                    // each embedding the *old* `w:rPr`/`w:pPr` that would otherwise
+                    // overwrite the run/paragraph style) is dropped whole. Insertions
+                    // (`w:ins`) and the move destination (`w:moveTo`) are transparent
+                    // wrappers handled below.
+                    _ if docx_is_dropped_revision(ln) && !sc => xml_skip_subtree(x, ln),
+                    // `w:ins` / `w:moveTo`: kept. They are transparent group wrappers
+                    // around `w:r` runs (run-level) — fall through so the enclosed
+                    // runs are walked exactly as if unwrapped, so the inserted/moved
+                    // text survives. (A self-closing `w:del`/`w:rPrChange`, e.g. a
+                    // deleted paragraph mark in `w:rPr`, also lands here: it has no
+                    // body and carries no display text, so nothing leaks.)
+                    "ins" | "moveTo" => {}
+                    // Comment range/anchor markers carry no body text (the comment
+                    // bodies live in `word/comments.xml` and are not imported). Drop
+                    // the markers cleanly so they don't disturb run/paragraph parsing.
+                    "commentRangeStart" | "commentRangeEnd" | "commentReference" => {}
                     _ => {}
                 }
             }
@@ -2653,6 +2680,14 @@ fn docx_table_model(
                             });
                         }
                     }
+                    // Track-changes, accepted to the final version. A deleted/move-
+                    // source row (`w:del`/`w:moveFrom` wrapping `w:tr`) is dropped, as
+                    // is a table/row formatting-change record (`w:tblPrChange`/
+                    // `w:trPrChange`) — each embeds the *old* `w:tblPr`/`w:trPr` whose
+                    // nested `w:tblBorders`/`w:trHeight`/`w:tblHeader` would otherwise
+                    // overwrite the current geometry. `w:ins`/`w:moveTo` wrapping rows
+                    // fall through (transparent) so the inserted/moved `w:tr` is kept.
+                    _ if docx_is_dropped_revision(ln) && !sc => xml_skip_subtree(x, ln),
                     _ => {}
                 }
             }
@@ -2901,6 +2936,14 @@ fn docx_cell_model(
                             ..Block::default()
                         });
                     }
+                    // Track-changes, accepted to the final version. A cell
+                    // formatting-change record (`w:tcPrChange`) embeds the *old*
+                    // `w:tcPr` whose nested `w:shd`/`w:vAlign`/`w:tcBorders` would
+                    // otherwise overwrite this cell's current formatting; deletions/
+                    // move-sources (`w:del`/`w:moveFrom`) are dropped. `w:ins`/
+                    // `w:moveTo` fall through (transparent) so inserted/moved cell
+                    // content is kept.
+                    _ if docx_is_dropped_revision(ln) && !sc => xml_skip_subtree(x, ln),
                     _ => {}
                 }
             }
@@ -7588,6 +7631,51 @@ fn xml_text_until(x: &mut Xml, tag: &str) -> String {
         }
     }
     out
+}
+
+/// Consume and discard the rest of the currently-open element (its open tag
+/// already consumed) up to its matching close `</…>` (local name `tag`), tracking
+/// nested same-name opens so the right close ends it. Unlike [`xml_text_until`]
+/// nothing is collected — used to drop a whole subtree (e.g. a DOCX track-changes
+/// `w:del`/`w:moveFrom` deletion, or a `w:rPrChange`/`w:tcPrChange` formatting
+/// record carrying the *old* `*Pr` that would otherwise corrupt the current run /
+/// cell). A self-closing element has no body, so callers must not invoke this for
+/// one (there is nothing to skip).
+fn xml_skip_subtree(x: &mut Xml, tag: &str) {
+    let mut depth = 1usize;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, _, sc) if !sc && local(&name) == tag => depth += 1,
+            Tok::Close(name) if local(&name) == tag => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Local names of the DOCX revision (track-changes) wrappers whose **entire
+/// subtree is dropped** to produce the accepted/final document: `w:del` (deleted
+/// run content, incl. `w:delText`), `w:moveFrom` (move source), and the
+/// `*PrChange` formatting-change records (`w:rPrChange`/`w:pPrChange`/
+/// `w:tblPrChange`/`w:trPrChange`/`w:tcPrChange`), which embed the *old* `*Pr` and
+/// would otherwise overwrite the current formatting. Their counterparts `w:ins`
+/// and `w:moveTo` are **not** here: they are transparent group wrappers, so their
+/// `w:r`/`w:p`/`w:tr` children are walked normally and the insertion is kept.
+fn docx_is_dropped_revision(local_name: &str) -> bool {
+    matches!(
+        local_name,
+        "del"
+            | "moveFrom"
+            | "rPrChange"
+            | "pPrChange"
+            | "tblPrChange"
+            | "trPrChange"
+            | "tcPrChange"
+    )
 }
 
 /// Decode XML entities — delegates to the shared decoder in [`super::reverse`].
@@ -15701,6 +15789,84 @@ mod tests {
             texts,
             vec!["Hello world".to_string(), "Second line".to_string()]
         );
+    }
+
+    /// Track-changes accepted to the final version (#3): a run-level insertion
+    /// (`w:ins`) is kept, a deletion (`w:del`, incl. its `w:delText`) is dropped,
+    /// so `Hello <ins>new </ins><del>old </del>world` lowers to `Hello new world`.
+    #[test]
+    fn docx_track_changes_accept_all_keeps_insertion_drops_deletion() {
+        let texts = docx_paragraph_texts(
+            r#"<w:p>
+  <w:r><w:t xml:space="preserve">Hello </w:t></w:r>
+  <w:ins w:id="1" w:author="A"><w:r><w:t xml:space="preserve">new </w:t></w:r></w:ins>
+  <w:del w:id="2" w:author="A"><w:r><w:delText xml:space="preserve">old </w:delText></w:r></w:del>
+  <w:r><w:t>world</w:t></w:r>
+</w:p>"#,
+        );
+        assert_eq!(texts, vec!["Hello new world".to_string()]);
+    }
+
+    /// A move pair: the move source (`w:moveFrom`) is dropped and the destination
+    /// (`w:moveTo`) is kept, so only the moved text survives at its new position.
+    #[test]
+    fn docx_track_changes_move_keeps_only_destination() {
+        let texts = docx_paragraph_texts(
+            r#"<w:p>
+  <w:moveFrom w:id="1"><w:r><w:t xml:space="preserve">gone </w:t></w:r></w:moveFrom>
+  <w:r><w:t xml:space="preserve">stay </w:t></w:r>
+  <w:moveTo w:id="2"><w:r><w:t>moved</w:t></w:r></w:moveTo>
+</w:p>"#,
+        );
+        assert_eq!(texts, vec!["stay moved".to_string()]);
+    }
+
+    /// Comment range/anchor markers carry no body text (the bodies in
+    /// `word/comments.xml` are not imported) — they are dropped cleanly, leaving
+    /// the surrounding run text intact with no marker artifact.
+    #[test]
+    fn docx_comment_markers_dropped_text_intact() {
+        let texts = docx_paragraph_texts(
+            r#"<w:p>
+  <w:commentRangeStart w:id="0"/>
+  <w:r><w:t>commented text</w:t></w:r>
+  <w:commentRangeEnd w:id="0"/>
+  <w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="0"/></w:r>
+</w:p>"#,
+        );
+        assert_eq!(texts, vec!["commented text".to_string()]);
+    }
+
+    /// A formatting-change record (`w:rPrChange`, embedding the *old* `w:rPr`) is
+    /// ignored entirely: the run keeps its *current* style and its text — the old
+    /// `w:rPr` must not leak into the run nor emit any text.
+    #[test]
+    fn docx_track_changes_rprchange_ignored_keeps_current_style() {
+        // No stray whitespace inside `w:r` (it would become its own default-styled
+        // run); the `w:rPrChange` embeds an *old* `w:i` that must be ignored.
+        let body = r#"<w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="1" w:author="A"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr><w:t>styled</w:t></w:r></w:p>"#;
+        // Text is intact (the old w:rPr emitted nothing).
+        assert_eq!(docx_paragraph_texts(body), vec!["styled".to_string()]);
+        // The "styled" run keeps the current bold; the old italic is dropped.
+        let doc = format!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>{body}</w:body></w:document>"#
+        );
+        let document = docx_to_model(&read_zip(&build_docx(&doc, None, &[])));
+        let run = document
+            .sections
+            .iter()
+            .flat_map(|s| s.pages.iter())
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match &b.kind {
+                BlockKind::Paragraph(p) => p.runs.iter().find_map(|r| match r {
+                    Inline::Run(run) if run.text == "styled" => Some(run.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("the styled run");
+        assert!(run.style.bold, "current w:b kept");
+        assert!(!run.style.italic, "old w:i from w:rPrChange must not leak");
     }
 
     /// A 3-row column whose top cell is `w:vMerge="restart"` and the two rows
