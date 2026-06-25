@@ -219,6 +219,7 @@ pub fn office_to_pdf_with_fonts(bytes: &[u8], host: &[ProvidedFont]) -> Option<V
 // `parse_shared_strings`/`parse_merges`/the PPTX/ODF helpers); only the
 // *emit* step differs. The HTML path is retained as the rendering fallback.
 
+use crate::content::vector::PathSeg;
 use crate::model::style::{Align as MAlign, LineHeight as MLineHeight};
 use crate::model::{
     self, Block, BlockKind, Cell, CharStyle, DocMeta, Document, Heading, Inline, InlineRun, List,
@@ -3230,6 +3231,7 @@ fn pptx_walk_sptree(
         match &tok {
             Tok::Open(name, attrs, sc) if !sc => match local(name) {
                 "sp" => pptx_sp_model(x, rels, theme, geom, inherit, &g, acc),
+                "cxnSp" => pptx_cxn_sp_model(x, rels, theme, geom, inherit, &g, acc),
                 "pic" => pptx_pic_model(x, zip, rels, geom, resources, &g, acc),
                 "graphicFrame" => pptx_graphic_frame_model(x, zip, rels, theme, geom, &g, acc),
                 "grpSp" => {
@@ -3271,6 +3273,7 @@ fn pptx_grp_sp_model(
                 }
                 // Child shapes — same dispatch as the top-level tree.
                 "sp" if !sc => pptx_sp_model(x, rels, theme, geom, inherit, &composed, acc),
+                "cxnSp" if !sc => pptx_cxn_sp_model(x, rels, theme, geom, inherit, &composed, acc),
                 "pic" if !sc => pptx_pic_model(x, zip, rels, geom, resources, &composed, acc),
                 "graphicFrame" if !sc => {
                     pptx_graphic_frame_model(x, zip, rels, theme, geom, &composed, acc)
@@ -3339,11 +3342,393 @@ fn parse_group_xfrm(
     (b, ch_off, ch_ext)
 }
 
+/// The geometry of a `p:sp`/`p:cxnSp` lowered to model [`Shape`] segments. Either
+/// a DrawingML **preset** (`a:prstGeom@prst`, the named auto-shape) or a parsed
+/// **custom** outline (`a:custGeom/a:pathLst`, raw path segments in the path's
+/// guide space + that space's extent). `None` slot ⇒ no `a:*Geom` (the box is
+/// taken as a plain rectangle).
+#[derive(Default)]
+enum PptxGeom {
+    /// No explicit geometry — treated as the bounding rectangle.
+    #[default]
+    None,
+    /// A preset auto-shape name (`rect`, `roundRect`, `ellipse`, `line`,
+    /// `straightConnector1`, …); lowered by [`pptx_preset_segments`].
+    Preset(String),
+    /// A custom outline: the parsed path commands plus the path's `@w`/`@h` guide
+    /// extent (`a:pt` coordinates are in `[0..w]×[0..h]`, top-left origin).
+    Custom {
+        cmds: Vec<PptxPathCmd>,
+        guide_w: f64,
+        guide_h: f64,
+    },
+}
+
+/// One parsed `a:custGeom` path command (coordinates in the path's guide space,
+/// top-left origin / Y-down — mapped to the box and Y-flipped in
+/// [`pptx_custom_segments`]).
+enum PptxPathCmd {
+    Move(f64, f64),
+    Line(f64, f64),
+    /// `a:cubicBezTo`: two control points + the end point.
+    Cubic(f64, f64, f64, f64, f64, f64),
+    /// `a:quadBezTo`: one control point + the end point (degree-elevated to a
+    /// cubic when lowered, since the model has cubics only).
+    Quad(f64, f64, f64, f64),
+    Close,
+}
+
+/// The resolved paint of a `p:sp`/`p:cxnSp`: geometry plus fill/stroke styling,
+/// ready to fold into a model [`Shape`]. Built by [`pptx_parse_sp_pr`].
+#[derive(Default)]
+struct PptxShapeStyle {
+    geom: PptxGeom,
+    /// RGB fill (`a:solidFill` or first `a:gradFill` stop); `None` for `a:noFill`
+    /// or an unresolved/absent fill.
+    fill: Option<[f64; 3]>,
+    /// RGB stroke from `a:ln/a:solidFill`; `None` when the line has no colour
+    /// (`a:ln/a:noFill`) or no `a:ln` at all.
+    stroke: Option<[f64; 3]>,
+    /// Stroke width in points (`a:ln@w`, EMU→pt); `0.0` when absent.
+    stroke_width: f64,
+    /// Dash pattern in points (`a:ln/a:custDash` stops scaled by the line width);
+    /// empty for a solid line or a `a:prstDash`.
+    dash: Vec<f64>,
+}
+
+/// True when a `p:sp`/`p:cxnSp` actually carries any drawable paint — a fill, a
+/// stroke, or a non-degenerate custom outline. A text-less shape with none of
+/// these (e.g. an invisible placeholder spacer) is not worth emitting as a
+/// [`Shape`].
+fn pptx_shape_style_has_paint(s: &PptxShapeStyle) -> bool {
+    s.fill.is_some()
+        || s.stroke.is_some()
+        || matches!(&s.geom, PptxGeom::Custom { cmds, .. } if !cmds.is_empty())
+}
+
+/// Parse a `p:spPr` / `p:cxnSpPr` subtree (the open tag already consumed),
+/// returning the shape's transform (`a:xfrm`), its geometry, and its fill/line
+/// paint. Consumes up to the matching `</…spPr>`. Fill vs. line colours are
+/// disambiguated by nesting: a `a:solidFill`/`a:gradFill` directly under the
+/// `spPr` is the shape **fill**; the same elements inside an `a:ln` are the
+/// **stroke**. Reuses [`parse_xfrm`] for the transform and [`PptxFillColor`] for
+/// theme-aware colour resolution.
+fn pptx_parse_sp_pr(
+    x: &mut Xml,
+    close_tag: &str,
+    theme: &PptxTheme,
+) -> (XfrmBox, bool, PptxShapeStyle) {
+    let mut xfrm = XfrmBox::default();
+    let mut have_xfrm = false;
+    let mut style = PptxShapeStyle::default();
+
+    // Fill accumulators (shape-level, i.e. NOT inside an `a:ln`).
+    let mut fill = PptxFillColor::default();
+    let mut in_fill = false;
+    let mut fill_grad_done = false;
+    // Line state.
+    let mut in_ln = false;
+    let mut ln_fill = PptxFillColor::default();
+    let mut ln_in_fill = false;
+    let mut ln_grad_done = false;
+    let mut ln_no_fill = false;
+    // Custom-geometry path accumulation.
+    let mut in_cust = false;
+    let mut path_w = 0.0;
+    let mut path_h = 0.0;
+    let mut cmds: Vec<PptxPathCmd> = Vec::new();
+    // Pending `a:pt` coordinates for the path command currently being read.
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    let mut cur_cmd: Option<&'static str> = None;
+    // Custom-dash stops (each `a:ds@d` is a per-mille of the line width).
+    let mut dash_perm: Vec<f64> = Vec::new();
+    let mut in_cust_dash = false;
+
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, sc) => match local(&name) {
+                "xfrm" if !sc && !have_xfrm => {
+                    xfrm = parse_xfrm(x, &attrs);
+                    have_xfrm = true;
+                }
+                "prstGeom" => {
+                    if let Some(p) = attr(&attrs, "prst") {
+                        style.geom = PptxGeom::Preset(p.to_string());
+                    }
+                }
+                "custGeom" if !sc => in_cust = true,
+                "path" if in_cust => {
+                    // `a:path@w/@h` are abstract path-guide units (NOT EMU): the
+                    // coordinate space `a:pt` values live in. Parse them raw.
+                    path_w = attr(&attrs, "w")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    path_h = attr(&attrs, "h")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                }
+                "moveTo" | "lnTo" | "cubicBezTo" | "quadBezTo" if in_cust => {
+                    cur_cmd = Some(match local(&name) {
+                        "moveTo" => "m",
+                        "lnTo" => "l",
+                        "cubicBezTo" => "c",
+                        _ => "q",
+                    });
+                    pts.clear();
+                }
+                "close" if in_cust => cmds.push(PptxPathCmd::Close),
+                "pt" if in_cust && cur_cmd.is_some() => {
+                    let px = attr(&attrs, "x").and_then(|v| v.trim().parse::<f64>().ok());
+                    let py = attr(&attrs, "y").and_then(|v| v.trim().parse::<f64>().ok());
+                    if let (Some(px), Some(py)) = (px, py) {
+                        pts.push((px, py));
+                    }
+                }
+                "ln" if !sc => {
+                    in_ln = true;
+                    if let Some(w) = attr(&attrs, "w").and_then(emu_to_pt) {
+                        style.stroke_width = w;
+                    }
+                }
+                "noFill" if in_ln => ln_no_fill = true,
+                "custDash" if in_ln => in_cust_dash = true,
+                "ds" if in_cust_dash => {
+                    if let Some(d) = attr(&attrs, "d").and_then(|v| v.trim().parse::<f64>().ok()) {
+                        dash_perm.push(d / 100_000.0);
+                    }
+                }
+                // Fill containers: shape-level vs. inside `a:ln`.
+                "solidFill" => {
+                    if in_ln {
+                        ln_in_fill = true;
+                    } else if !in_cust {
+                        in_fill = true;
+                    }
+                }
+                "gs" => {
+                    if in_ln && !ln_grad_done {
+                        ln_in_fill = true;
+                    } else if !in_cust && !fill_grad_done {
+                        in_fill = true;
+                    }
+                }
+                // Colour bases / modifiers, routed to the active fill accumulator.
+                "srgbClr" | "schemeClr" | "hslClr" | "sysClr" => {
+                    if ln_in_fill {
+                        ln_fill.set_base(local(&name), &attrs);
+                    } else if in_fill {
+                        fill.set_base(local(&name), &attrs);
+                    }
+                }
+                "lumMod" | "lumOff" | "shade" | "tint" => {
+                    if ln_in_fill {
+                        ln_fill.set_mod(local(&name), &attrs);
+                    } else if in_fill {
+                        fill.set_mod(local(&name), &attrs);
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) => {
+                let ln = local(&name);
+                match ln {
+                    "moveTo" | "lnTo" | "cubicBezTo" | "quadBezTo" if in_cust => {
+                        match (cur_cmd, pts.as_slice()) {
+                            (Some("m"), [(x0, y0)]) => cmds.push(PptxPathCmd::Move(*x0, *y0)),
+                            (Some("l"), [(x0, y0)]) => cmds.push(PptxPathCmd::Line(*x0, *y0)),
+                            (Some("c"), [(x1, y1), (x2, y2), (x3, y3)]) => {
+                                cmds.push(PptxPathCmd::Cubic(*x1, *y1, *x2, *y2, *x3, *y3))
+                            }
+                            (Some("q"), [(x1, y1), (x2, y2)]) => {
+                                cmds.push(PptxPathCmd::Quad(*x1, *y1, *x2, *y2))
+                            }
+                            _ => {}
+                        }
+                        cur_cmd = None;
+                        pts.clear();
+                    }
+                    "custDash" if in_cust_dash => in_cust_dash = false,
+                    "solidFill" => {
+                        if ln_in_fill {
+                            ln_in_fill = false;
+                        } else {
+                            in_fill = false;
+                        }
+                    }
+                    "gs" => {
+                        if ln_in_fill {
+                            ln_grad_done = true;
+                            ln_in_fill = false;
+                        } else if in_fill {
+                            fill_grad_done = true;
+                            in_fill = false;
+                        }
+                    }
+                    "ln" => in_ln = false,
+                    "custGeom" => {
+                        in_cust = false;
+                        style.geom = PptxGeom::Custom {
+                            cmds: std::mem::take(&mut cmds),
+                            guide_w: path_w,
+                            guide_h: path_h,
+                        };
+                    }
+                    _ if ln == close_tag => break,
+                    _ => {}
+                }
+            }
+            Tok::Text(_) => {}
+        }
+    }
+
+    style.fill = fill.finish_with(theme).as_deref().and_then(hex_to_rgb_f64);
+    // A line with an explicit `a:noFill` is stroke-less; otherwise resolve its
+    // colour (a bare `a:ln` with a width but no fill leaves `stroke = None`).
+    if !ln_no_fill {
+        style.stroke = ln_fill
+            .finish_with(theme)
+            .as_deref()
+            .and_then(hex_to_rgb_f64);
+    }
+    // Custom dash stops are per-mille of the line width → absolute points.
+    if !dash_perm.is_empty() && style.stroke_width > 0.0 {
+        style.dash = dash_perm.iter().map(|f| f * style.stroke_width).collect();
+    }
+    (xfrm, have_xfrm, style)
+}
+
+/// Lower a shape's geometry to model [`Shape`] segments in **frame-local, Y-up**
+/// coordinates: `(0,0)` is the frame's lower-left corner and `(w,h)` its
+/// upper-right (the convention [`place_shape`](crate::convert::project) and the
+/// HTML/SVG exporters expect — segments are translated by the frame origin and
+/// Y-flipped at paint time). `w_pt`/`h_pt` are the shape box size in points.
+fn pptx_geom_segments(geom: &PptxGeom, w_pt: f64, h_pt: f64) -> Vec<PathSeg> {
+    match geom {
+        PptxGeom::Custom {
+            cmds,
+            guide_w,
+            guide_h,
+        } if !cmds.is_empty() => pptx_custom_segments(cmds, *guide_w, *guide_h, w_pt, h_pt),
+        PptxGeom::Preset(p) => pptx_preset_segments(p, w_pt, h_pt),
+        // No geometry (or an empty custom path): the bounding rectangle.
+        _ => pptx_rect_segments(w_pt, h_pt),
+    }
+}
+
+/// The box outline as a closed rectangle (frame-local, Y-up).
+fn pptx_rect_segments(w: f64, h: f64) -> Vec<PathSeg> {
+    vec![
+        PathSeg::Move(0.0, 0.0),
+        PathSeg::Line(w, 0.0),
+        PathSeg::Line(w, h),
+        PathSeg::Line(0.0, h),
+        PathSeg::Close,
+    ]
+}
+
+/// Lower a DrawingML preset auto-shape to segments. Exact for the geometric
+/// primitives that map cleanly onto the model's line/cubic path vocabulary:
+/// rectangles (incl. rounded/snipped, approximated as plain rectangles), ellipses
+/// (a 4-cubic Bézier circle inscribed in the box) and straight lines/connectors
+/// (the box diagonal). Every other preset (`triangle`, `star*`, `arrow*`, callout
+/// shapes, bent/curved connectors…) falls back to the bounding rectangle so the
+/// shape's placement, fill and stroke are still imported — its decorative outline
+/// is the only thing approximated (the model has no preset-shape library).
+fn pptx_preset_segments(prst: &str, w: f64, h: f64) -> Vec<PathSeg> {
+    match prst {
+        // Round shapes → an inscribed ellipse.
+        "ellipse" | "circle" | "oval" | "chord" | "pie" | "donut" | "blockArc" => {
+            ellipse_segments(w, h)
+        }
+        // Straight lines & straight connectors → the box diagonal (bottom-left to
+        // top-right, honouring the shape's flips via its frame rotation upstream).
+        "line" | "straightConnector1" => {
+            vec![PathSeg::Move(0.0, 0.0), PathSeg::Line(w, h)]
+        }
+        // Rectangles and everything else: the bounding box rectangle.
+        _ => pptx_rect_segments(w, h),
+    }
+}
+
+/// A circle/ellipse inscribed in the `w`×`h` box as four cubic Béziers (the
+/// standard `k = 0.5522847498` control-point ratio), in frame-local Y-up
+/// coordinates.
+fn ellipse_segments(w: f64, h: f64) -> Vec<PathSeg> {
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let (rx, ry) = (w / 2.0, h / 2.0);
+    const K: f64 = 0.552_284_749_830_793_4;
+    let (ox, oy) = (rx * K, ry * K);
+    vec![
+        PathSeg::Move(cx + rx, cy),
+        PathSeg::Cubic(cx + rx, cy + oy, cx + ox, cy + ry, cx, cy + ry),
+        PathSeg::Cubic(cx - ox, cy + ry, cx - rx, cy + oy, cx - rx, cy),
+        PathSeg::Cubic(cx - rx, cy - oy, cx - ox, cy - ry, cx, cy - ry),
+        PathSeg::Cubic(cx + ox, cy - ry, cx + rx, cy - oy, cx + rx, cy),
+        PathSeg::Close,
+    ]
+}
+
+/// Map parsed custom-geometry commands (path guide space, top-left origin) to
+/// frame-local Y-up segments: scale `[0..guide]→[0..box]`, then flip Y
+/// (`y_local = h_pt - y_top`). A zero/absent guide extent falls back to the box
+/// size (treat coordinates as already in points). `a:quadBezTo` is degree-elevated
+/// to a cubic about the running point.
+fn pptx_custom_segments(
+    cmds: &[PptxPathCmd],
+    guide_w: f64,
+    guide_h: f64,
+    w_pt: f64,
+    h_pt: f64,
+) -> Vec<PathSeg> {
+    let sx = if guide_w > 0.0 { w_pt / guide_w } else { 1.0 };
+    let sy = if guide_h > 0.0 { h_pt / guide_h } else { 1.0 };
+    // (gx, gy) guide → frame-local Y-up point.
+    let map = |gx: f64, gy: f64| (gx * sx, h_pt - gy * sy);
+    let mut out: Vec<PathSeg> = Vec::new();
+    // Running point (frame-local) for quad→cubic elevation.
+    let mut cur = (0.0_f64, 0.0_f64);
+    for cmd in cmds {
+        match *cmd {
+            PptxPathCmd::Move(x, y) => {
+                cur = map(x, y);
+                out.push(PathSeg::Move(cur.0, cur.1));
+            }
+            PptxPathCmd::Line(x, y) => {
+                cur = map(x, y);
+                out.push(PathSeg::Line(cur.0, cur.1));
+            }
+            PptxPathCmd::Cubic(x1, y1, x2, y2, x3, y3) => {
+                let (c1x, c1y) = map(x1, y1);
+                let (c2x, c2y) = map(x2, y2);
+                let (ex, ey) = map(x3, y3);
+                out.push(PathSeg::Cubic(c1x, c1y, c2x, c2y, ex, ey));
+                cur = (ex, ey);
+            }
+            PptxPathCmd::Quad(x1, y1, x2, y2) => {
+                let (qx, qy) = map(x1, y1);
+                let (ex, ey) = map(x2, y2);
+                // Quadratic → cubic: c1 = p0 + 2/3(q-p0), c2 = p2 + 2/3(q-p2).
+                let c1 = (
+                    cur.0 + 2.0 / 3.0 * (qx - cur.0),
+                    cur.1 + 2.0 / 3.0 * (qy - cur.1),
+                );
+                let c2 = (ex + 2.0 / 3.0 * (qx - ex), ey + 2.0 / 3.0 * (qy - ey));
+                out.push(PathSeg::Cubic(c1.0, c1.1, c2.0, c2.1, ex, ey));
+                cur = (ex, ey);
+            }
+            PptxPathCmd::Close => out.push(PathSeg::Close),
+        }
+    }
+    out
+}
+
 /// Lower one `p:sp` shape (open consumed): its placeholder role (`p:ph@type`),
 /// its own `a:xfrm` (→ absolute frame) and its `p:txBody` paragraphs (→ a
 /// [`TextBox`]). A placeholder with no own `a:xfrm` inherits geometry from the
-/// layout/master chain (`inherit`). Empty text boxes are dropped. Consumes the
-/// subtree up to `</p:sp>`.
+/// layout/master chain (`inherit`). A text-less shape that carries a fill, stroke
+/// or custom outline becomes a [`Shape`] block instead (so rectangles, ovals,
+/// lines, freeforms… are not dropped); a truly empty shape is dropped. Consumes
+/// the subtree up to `</p:sp>`.
 fn pptx_sp_model(
     x: &mut Xml,
     rels: &BTreeMap<String, String>,
@@ -3353,10 +3738,48 @@ fn pptx_sp_model(
     g: &GroupXfrm,
     acc: &mut PptxSlideAcc,
 ) {
+    pptx_shape_or_textbox(x, rels, theme, geom, inherit, g, acc, "sp")
+}
+
+/// Lower one `p:cxnSp` connector (open consumed). A connector is a line shape with
+/// the same `p:spPr` (geometry/fill/`a:ln`) and never any text, so it shares
+/// [`pptx_shape_or_textbox`] and always lands as a [`Shape`] (the connector
+/// geometry — usually a straight or bent line — comes from its `a:prstGeom`).
+/// Consumes the subtree up to `</p:cxnSp>`.
+fn pptx_cxn_sp_model(
+    x: &mut Xml,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    geom: PageGeom,
+    inherit: &PptxPlaceholderGeom,
+    g: &GroupXfrm,
+    acc: &mut PptxSlideAcc,
+) {
+    pptx_shape_or_textbox(x, rels, theme, geom, inherit, g, acc, "cxnSp")
+}
+
+/// Shared body for `p:sp` and `p:cxnSp` (`outer` = the wrapper's local name,
+/// `"sp"`/`"cxnSp"`). Walks the shape: its `p:nvSpPr/p:ph` role, `p:spPr`
+/// (transform + geometry + fill/line, via [`pptx_parse_sp_pr`]) and `p:txBody`
+/// paragraphs. With text ⇒ a [`TextBox`] (placeholder when it has a `p:ph`,
+/// matching the old behaviour). Text-less but painted ⇒ a [`Shape`] carrying the
+/// lowered geometry + fill/stroke. Empty + unpainted ⇒ dropped.
+#[allow(clippy::too_many_arguments)]
+fn pptx_shape_or_textbox(
+    x: &mut Xml,
+    rels: &BTreeMap<String, String>,
+    theme: &PptxTheme,
+    geom: PageGeom,
+    inherit: &PptxPlaceholderGeom,
+    g: &GroupXfrm,
+    acc: &mut PptxSlideAcc,
+    outer: &str,
+) {
     let mut ph: Option<PhKey> = None;
     let mut have_ph = false;
     let mut xfrm = XfrmBox::default();
     let mut have_xfrm = false;
+    let mut style = PptxShapeStyle::default();
     let mut paras: Vec<Block> = Vec::new();
 
     // Per-paragraph scratch.
@@ -3373,9 +3796,15 @@ fn pptx_sp_model(
                     have_ph = true;
                     ph = Some(PhKey::from_attrs(&attrs));
                 }
-                "xfrm" if !sc && !have_xfrm => {
-                    xfrm = parse_xfrm(x, &attrs);
-                    have_xfrm = true;
+                // The `p:spPr` carries the transform, geometry and fill/line; a
+                // dedicated parser consumes its whole subtree (incl. `a:xfrm`).
+                "spPr" if !sc => {
+                    let (b, hx, st) = pptx_parse_sp_pr(x, "spPr", theme);
+                    if hx {
+                        xfrm = b;
+                        have_xfrm = true;
+                    }
+                    style = st;
                 }
                 "p" if !sc => {
                     in_para = true;
@@ -3416,14 +3845,10 @@ fn pptx_sp_model(
                     }
                     in_para = false;
                 }
-                "sp" => break,
+                n if n == outer => break,
                 _ => {}
             },
         }
-    }
-
-    if paras.is_empty() {
-        return;
     }
 
     // Geometry: the shape's own xfrm wins; otherwise a placeholder inherits from
@@ -3438,6 +3863,30 @@ fn pptx_sp_model(
     } else {
         (None, crate::model::Rotation::D0)
     };
+
+    if paras.is_empty() {
+        // A text-less shape: emit a vector [`Shape`] when it has any drawable
+        // paint (fill / stroke / freeform). Its frame-local geometry is derived
+        // from the shape box, so it needs a placed `a:xfrm`.
+        if pptx_shape_style_has_paint(&style) {
+            if let Some(rect) = frame {
+                let segments = pptx_geom_segments(&style.geom, rect.w, rect.h);
+                acc.shapes.push(Block {
+                    frame: Some(rect),
+                    rotation,
+                    kind: BlockKind::Shape(model::Shape {
+                        segments,
+                        fill: style.fill,
+                        stroke: style.stroke,
+                        stroke_width: style.stroke_width,
+                        dash: style.dash,
+                    }),
+                    ..Block::default()
+                });
+            }
+        }
+        return;
+    }
 
     let block = Block {
         frame,
@@ -5393,6 +5842,12 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
     page_fills.extend(odf_drawing_page_fills(&content));
     let master_styles = odf_master_page_styles(&styles_xml);
 
+    // Graphic styles (shape fill/stroke), referenced by draw shapes through
+    // `draw:style-name`. Automatic styles in `content.xml` override the named
+    // ones in `styles.xml`.
+    let mut gstyles = odf_graphic_styles(&styles_xml);
+    gstyles.extend(odf_graphic_styles(&content));
+
     let mut slides: Vec<Slide> = Vec::new();
     let mut resources: BTreeMap<u64, model::ImageResource> = BTreeMap::new();
     let mut x = Xml::new(&content);
@@ -5404,6 +5859,7 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
                     &mut x,
                     zip,
                     &styles,
+                    &gstyles,
                     geom,
                     background,
                     &mut resources,
@@ -5426,13 +5882,17 @@ pub fn odp_to_model(zip: &BTreeMap<String, Vec<u8>>) -> Document {
 /// children become body placeholders and bare `draw:image` become picture
 /// placeholders (the legacy flow layout). Positioned `draw:frame`s become
 /// absolutely-placed shapes in [`Slide::shapes`] (geometry from `svg:x/y/
-/// width/height`), and `draw:g` groups are descended recursively, the group's
-/// own `svg:x/y` composed onto the children's positions. `background` is the
-/// resolved page/master fill (computed by the caller). Mirrors [`odp_page`].
+/// width/height`); non-text draw shapes (`draw:rect`/`draw:ellipse`/`draw:line`/
+/// `draw:custom-shape`/…) become vector [`Shape`]s (via [`odp_shape_model`]); and
+/// `draw:g` groups are descended recursively, the group's own `svg:x/y` composed
+/// onto the children's positions. `background` is the resolved page/master fill
+/// (computed by the caller). `gstyles` resolves shape fill/stroke. Mirrors
+/// [`odp_page`].
 fn odp_page_model(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
+    gstyles: &BTreeMap<String, OdfGraphicStyle>,
     geom: PageGeom,
     background: Option<[f64; 3]>,
     resources: &mut BTreeMap<u64, model::ImageResource>,
@@ -5462,6 +5922,24 @@ fn odp_page_model(
                             &mut placeholders,
                         );
                     }
+                    // A non-text draw shape → a vector Shape (or a text box when it
+                    // carries text). Consumes its subtree (or nothing if self-closing).
+                    _ if odf_is_draw_shape(ln) => {
+                        odp_shape_model(
+                            x,
+                            zip,
+                            styles,
+                            gstyles,
+                            geom,
+                            (0.0, 0.0),
+                            ln,
+                            sc,
+                            &attrs,
+                            resources,
+                            &mut shapes,
+                            &mut placeholders,
+                        );
+                    }
                     // A group: descend, composing the group's own offset.
                     "g" if !sc => {
                         let (gx, gy) = odp_group_offset(&attrs);
@@ -5469,6 +5947,7 @@ fn odp_page_model(
                             x,
                             zip,
                             styles,
+                            gstyles,
                             geom,
                             (gx, gy),
                             resources,
@@ -5563,6 +6042,7 @@ fn odp_group_model(
     x: &mut Xml,
     zip: &BTreeMap<String, Vec<u8>>,
     styles: &BTreeMap<String, String>,
+    gstyles: &BTreeMap<String, OdfGraphicStyle>,
     geom: PageGeom,
     off: (f64, f64),
     resources: &mut BTreeMap<u64, model::ImageResource>,
@@ -5589,12 +6069,31 @@ fn odp_group_model(
                             placeholders,
                         );
                     }
+                    // A non-text draw shape inside the group → a vector Shape, its
+                    // origin shifted by the accumulated group offset.
+                    _ if odf_is_draw_shape(ln) => {
+                        odp_shape_model(
+                            x,
+                            zip,
+                            styles,
+                            gstyles,
+                            geom,
+                            off,
+                            ln,
+                            sc,
+                            &attrs,
+                            resources,
+                            shapes,
+                            placeholders,
+                        );
+                    }
                     "g" if !sc => {
                         let (gx, gy) = odp_group_offset(&attrs);
                         odp_group_model(
                             x,
                             zip,
                             styles,
+                            gstyles,
                             geom,
                             (off.0 + gx, off.1 + gy),
                             resources,
@@ -11076,6 +11575,331 @@ fn odf_solid_fill_rgb(attrs: &[(String, String)]) -> Option<[f64; 3]> {
     } else {
         None
     }
+}
+
+/// The resolved paint of an ODF `style:style[@family=graphic]`: the shape's solid
+/// fill and stroke (a [`draw:rect`]/[`draw:custom-shape`]/… references it through
+/// `draw:style-name`). Built by [`odf_graphic_styles`] and applied in
+/// [`odp_shape_model`].
+#[derive(Default, Clone)]
+struct OdfGraphicStyle {
+    /// RGB solid fill (`draw:fill="solid"` + `draw:fill-color`); `None` for
+    /// `draw:fill="none"`/gradient/bitmap/hatch or an absent colour.
+    fill: Option<[f64; 3]>,
+    /// RGB stroke (`draw:stroke="solid"`/`"dash"` + `svg:stroke-color`); `None`
+    /// for `draw:stroke="none"`.
+    stroke: Option<[f64; 3]>,
+    /// Stroke width in points (`svg:stroke-width`); `0.0` when absent.
+    stroke_width: f64,
+}
+
+/// Build a `graphic-style-name → resolved paint` map from an ODF part
+/// (`styles.xml` or `content.xml`). Reads each `style:style` of family `graphic`
+/// whose `style:graphic-properties` declares a solid fill and/or stroke
+/// (`draw:fill`/`draw:fill-color`, `draw:stroke`/`svg:stroke-color`/
+/// `svg:stroke-width`). Styles with neither are still recorded (empty paint) so a
+/// shape that references one is not mistaken for unstyled. `style:parent-style-name`
+/// inheritance is not resolved (LibreOffice writes the effective properties onto
+/// the leaf automatic style for shapes, the pragmatic zero-dependency choice).
+fn odf_graphic_styles(xml: &str) -> BTreeMap<String, OdfGraphicStyle> {
+    let mut map = BTreeMap::new();
+    let mut x = Xml::new(xml);
+    let mut cur_name: Option<String> = None;
+    let mut is_graphic = false;
+    while let Some(tok) = x.next() {
+        match tok {
+            Tok::Open(name, attrs, _) => match local(&name) {
+                "style" => {
+                    cur_name = attr(&attrs, "name").map(str::to_string);
+                    is_graphic = attr(&attrs, "family") == Some("graphic");
+                }
+                "graphic-properties" => {
+                    if let (Some(nm), true) = (cur_name.clone(), is_graphic) {
+                        map.insert(nm, odf_graphic_props(&attrs));
+                    }
+                }
+                _ => {}
+            },
+            Tok::Close(name) if local(&name) == "style" => {
+                cur_name = None;
+                is_graphic = false;
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+/// Resolve a `style:graphic-properties` open-tag to an [`OdfGraphicStyle`]: solid
+/// fill (via [`odf_solid_fill_rgb`]) plus stroke colour/width. A `draw:stroke` of
+/// `none` (or absent) leaves the stroke unset; `solid`/`dash` takes the
+/// `svg:stroke-color` (6-hex) and `svg:stroke-width` (ODF length → points).
+fn odf_graphic_props(attrs: &[(String, String)]) -> OdfGraphicStyle {
+    let fill = odf_solid_fill_rgb(attrs);
+    let (stroke, stroke_width) = match attr(attrs, "stroke") {
+        Some("solid") | Some("dash") => {
+            let col = attr(attrs, "stroke-color")
+                .map(|v| v.trim().trim_start_matches('#'))
+                .filter(|v| is_hex6(v))
+                .and_then(hex_to_rgb_f64);
+            let w = attr(attrs, "stroke-width")
+                .and_then(parse_odf_pt)
+                .filter(|w| *w > 0.0)
+                .unwrap_or(0.0);
+            (col, w)
+        }
+        _ => (None, 0.0),
+    };
+    OdfGraphicStyle {
+        fill,
+        stroke,
+        stroke_width,
+    }
+}
+
+/// True when the ODF local name is a draw shape that carries vector geometry
+/// (rectangle, ellipse, line, freeform…) rather than a frame/group/text element.
+/// These become model [`Shape`]s when text-less (see [`odp_shape_model`]).
+fn odf_is_draw_shape(ln: &str) -> bool {
+    matches!(
+        ln,
+        "rect"
+            | "ellipse"
+            | "circle"
+            | "line"
+            | "polyline"
+            | "polygon"
+            | "path"
+            | "custom-shape"
+            | "connector"
+            | "regular-polygon"
+    )
+}
+
+/// Lower one ODF draw shape (`draw:rect`/`draw:ellipse`/`draw:line`/
+/// `draw:custom-shape`/`draw:connector`/…; open consumed, `ln` = its local name,
+/// `self_closing` = whether the open tag was `<…/>`, `off` = the enclosing group
+/// offset). A shape with text (`<text:p>`) keeps its text-box behaviour — emitted
+/// as a [`TextBox`] (a [`Placeholder`] when tagged `presentation:class`), exactly
+/// like a `draw:frame`. A text-less shape becomes a vector [`Shape`]: its geometry
+/// from the element kind (rectangle / inscribed ellipse / explicit `draw:line`
+/// endpoints / `draw:points` polyline), its fill/stroke resolved from
+/// `draw:style-name` through `gstyles`. An empty, unstyled, unsized shape is
+/// dropped. Consumes up to the matching close tag (nothing when self-closing).
+#[allow(clippy::too_many_arguments)]
+fn odp_shape_model(
+    x: &mut Xml,
+    zip: &BTreeMap<String, Vec<u8>>,
+    styles: &BTreeMap<String, String>,
+    gstyles: &BTreeMap<String, OdfGraphicStyle>,
+    geom: PageGeom,
+    off: (f64, f64),
+    ln: &str,
+    self_closing: bool,
+    attrs: &[(String, String)],
+    resources: &mut BTreeMap<u64, model::ImageResource>,
+    shapes: &mut Vec<Block>,
+    placeholders: &mut Vec<model::Placeholder>,
+) {
+    let close = ln.to_string();
+    let mut blocks: Vec<Block> = Vec::new();
+    // A self-closing `<draw:rect/>` has no body to walk (and no close token to
+    // consume); only a shape with children can carry text.
+    if !self_closing {
+        while let Some(tok) = x.next() {
+            match tok {
+                Tok::Open(name, _attrs, sc) => {
+                    let cln = local(&name);
+                    if cln == "p" && !sc {
+                        let ctx = OdfModelCtx::styles_only(zip, styles);
+                        let mut anchored: Vec<Block> = Vec::new();
+                        let mut no_outline = OutlineBuilder::default();
+                        let runs = odf_inline_model(
+                            x,
+                            &ctx,
+                            "p",
+                            resources,
+                            &mut anchored,
+                            &mut no_outline,
+                        );
+                        if !runs.is_empty() {
+                            blocks.push(Block {
+                                kind: BlockKind::Paragraph(Paragraph {
+                                    runs,
+                                    ..Paragraph::default()
+                                }),
+                                ..Block::default()
+                            });
+                        }
+                    }
+                }
+                Tok::Close(name) if local(&name) == close => break,
+                _ => {}
+            }
+        }
+    }
+
+    // Box from svg:x/y/width/height (or a transform-only origin), shifted by the
+    // enclosing group offset. A `draw:line`/`draw:connector` has no width/height —
+    // its extent comes from the endpoints instead.
+    let endpoints = odf_line_endpoints(ln, attrs);
+    let bx = odp_frame_box_xf(attrs).or_else(|| {
+        endpoints.map(|(x1, y1, x2, y2)| {
+            let (lx, ux) = (x1.min(x2), x1.max(x2));
+            let (ly, uy) = (y1.min(y2), y1.max(y2));
+            (lx, ly, (ux - lx).max(0.0), (uy - ly).max(0.0))
+        })
+    });
+    let Some((fx, fy, fw, fh)) = bx else {
+        return; // No usable geometry → nothing to place.
+    };
+    let top_x = fx + off.0;
+    let top_y = fy + off.1;
+    let rect = model::Rect::new(top_x, (geom.h - (top_y + fh)).max(0.0), fw, fh);
+    let rotation = odp_transform_rotation(attrs);
+
+    if !blocks.is_empty() {
+        // A shape carrying text → a text box (placeholder when tagged), matching
+        // the `draw:frame` behaviour so text-bearing autoshapes don't regress.
+        let block = Block {
+            frame: Some(rect),
+            rotation,
+            kind: BlockKind::TextBox(model::TextBox { blocks }),
+            ..Block::default()
+        };
+        match odp_placeholder_role(attrs) {
+            Some(role) => placeholders.push(model::Placeholder { role, block }),
+            None => shapes.push(block),
+        }
+        return;
+    }
+
+    // Text-less: a vector shape. Resolve fill/stroke from the graphic style.
+    let gs = attr(attrs, "style-name")
+        .and_then(|n| gstyles.get(n))
+        .cloned()
+        .unwrap_or_default();
+    let segments = odf_shape_segments(ln, attrs, fw, fh, endpoints);
+    let has_paint = gs.fill.is_some() || gs.stroke.is_some();
+    // Drop a shape that is neither filled, stroked, nor a real freeform outline.
+    if !has_paint && matches!(ln, "rect" | "ellipse" | "circle" | "custom-shape") {
+        return;
+    }
+    shapes.push(Block {
+        frame: Some(rect),
+        rotation,
+        kind: BlockKind::Shape(model::Shape {
+            segments,
+            fill: gs.fill,
+            stroke: gs.stroke,
+            stroke_width: gs.stroke_width,
+            dash: Vec::new(),
+        }),
+        ..Block::default()
+    });
+}
+
+/// The endpoints of a `draw:line`/`draw:connector` as `(x1, y1, x2, y2)` in
+/// points (top-left origin, Y-down — the ODF document space). `None` for any
+/// other shape, or when the four `svg:x1`/`y1`/`x2`/`y2` are not all present.
+fn odf_line_endpoints(ln: &str, attrs: &[(String, String)]) -> Option<(f64, f64, f64, f64)> {
+    if ln != "line" && ln != "connector" {
+        return None;
+    }
+    let x1 = attr(attrs, "x1").and_then(parse_odf_pt)?;
+    let y1 = attr(attrs, "y1").and_then(parse_odf_pt)?;
+    let x2 = attr(attrs, "x2").and_then(parse_odf_pt)?;
+    let y2 = attr(attrs, "y2").and_then(parse_odf_pt)?;
+    Some((x1, y1, x2, y2))
+}
+
+/// Lower an ODF draw shape's geometry to model [`Shape`] segments (frame-local,
+/// Y-up — the convention [`place_shape`](crate::convert::project) expects). Exact
+/// for the primitives whose geometry maps cleanly: rectangles, inscribed ellipses
+/// (`draw:ellipse`/`draw:circle`), explicit `draw:line`/`draw:connector` endpoints
+/// and `draw:polyline`/`draw:polygon`/`draw:regular-polygon` point lists
+/// (`svg:viewBox` + `draw:points`). `draw:custom-shape` (its
+/// `draw:enhanced-geometry` path mini-language) and `draw:path` fall back to the
+/// bounding rectangle — placement, fill and stroke are still imported, only the
+/// decorative outline is approximated.
+fn odf_shape_segments(
+    ln: &str,
+    attrs: &[(String, String)],
+    w: f64,
+    h: f64,
+    endpoints: Option<(f64, f64, f64, f64)>,
+) -> Vec<PathSeg> {
+    match ln {
+        "ellipse" | "circle" => ellipse_segments(w, h),
+        "line" | "connector" => {
+            if let Some((x1, y1, x2, y2)) = endpoints {
+                // Endpoints are in ODF top-left/Y-down doc space; the box origin is
+                // their min corner, so subtract it and flip Y into frame-local.
+                let ox = x1.min(x2);
+                let oy_top = y1.min(y2);
+                vec![
+                    PathSeg::Move(x1 - ox, h - (y1 - oy_top)),
+                    PathSeg::Line(x2 - ox, h - (y2 - oy_top)),
+                ]
+            } else {
+                // A connector with no explicit endpoints → the box diagonal.
+                vec![PathSeg::Move(0.0, 0.0), PathSeg::Line(w, h)]
+            }
+        }
+        "polyline" | "polygon" | "regular-polygon" => {
+            odf_points_segments(attrs, w, h, ln == "polygon" || ln == "regular-polygon")
+                .unwrap_or_else(|| pptx_rect_segments(w, h))
+        }
+        // rect, custom-shape, path, regular-polygon-without-points: the box.
+        _ => pptx_rect_segments(w, h),
+    }
+}
+
+/// Lower an ODF `draw:points` list (with its `svg:viewBox`) to frame-local Y-up
+/// segments scaled into the `w`×`h` box. `closed` appends a `Close` (for
+/// `draw:polygon`/`draw:regular-polygon`). `None` when `draw:points`/`svg:viewBox`
+/// are absent or unparseable (caller falls back to the box rectangle).
+fn odf_points_segments(
+    attrs: &[(String, String)],
+    w: f64,
+    h: f64,
+    closed: bool,
+) -> Option<Vec<PathSeg>> {
+    let points = attr(attrs, "points")?;
+    // `svg:viewBox` = "minX minY width height" in the points' coordinate space.
+    let vb: Vec<f64> = attr(attrs, "viewBox")?
+        .split_whitespace()
+        .filter_map(|t| t.parse::<f64>().ok())
+        .collect();
+    let (vb_min_x, vb_min_y, vb_w, vb_h) = match vb.as_slice() {
+        [a, b, c, d] if *c > 0.0 && *d > 0.0 => (*a, *b, *c, *d),
+        _ => return None,
+    };
+    let mut out: Vec<PathSeg> = Vec::new();
+    for (i, pair) in points.split_whitespace().enumerate() {
+        let mut it = pair.split(',');
+        let px = it.next().and_then(|v| v.trim().parse::<f64>().ok());
+        let py = it.next().and_then(|v| v.trim().parse::<f64>().ok());
+        let (Some(px), Some(py)) = (px, py) else {
+            continue;
+        };
+        // viewBox space → box, then flip Y to frame-local (Y-up).
+        let fx = (px - vb_min_x) / vb_w * w;
+        let fy_top = (py - vb_min_y) / vb_h * h;
+        let fy = h - fy_top;
+        if i == 0 {
+            out.push(PathSeg::Move(fx, fy));
+        } else {
+            out.push(PathSeg::Line(fx, fy));
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if closed {
+        out.push(PathSeg::Close);
+    }
+    Some(out)
 }
 
 /// Lower the master page's running header (`kind="header"`) or footer
@@ -18918,6 +19742,176 @@ mod tests {
         }
     }
 
+    /// Like [`odp_model_slide`] but lets a test inject extra `office:automatic-styles`
+    /// children (e.g. graphic `style:style` definitions a draw shape references via
+    /// `draw:style-name`).
+    fn odp_model_slide_with_styles(extra_styles: &str, page_body: &str) -> Slide {
+        let content = format!(
+            r#"<office:document-content xmlns:office="o" xmlns:draw="d" xmlns:text="t" xmlns:svg="sv" xmlns:xlink="xl" xmlns:style="s" xmlns:fo="f">
+  <office:automatic-styles>
+    <style:page-layout style:name="PL"><style:page-layout-properties fo:page-width="25.4cm" fo:page-height="19.05cm" fo:margin="0cm"/></style:page-layout>
+    {extra_styles}
+  </office:automatic-styles>
+  <office:body><office:presentation>
+    <draw:page draw:name="p1">{page_body}</draw:page>
+  </office:presentation></office:body>
+</office:document-content>"#
+        );
+        let mut z = ZipWriter::new();
+        z.add_stored(
+            "mimetype",
+            b"application/vnd.oasis.opendocument.presentation",
+        );
+        z.add_stored("content.xml", content.as_bytes());
+        let model = office_to_model(&z.finish()).expect("odp → model");
+        match model.sections[0].pages[0].blocks[0].kind.clone() {
+            BlockKind::Slide(sb) => sb.slides.into_iter().next().expect("one slide"),
+            other => panic!("expected a Slide block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn odp_model_textless_rect_becomes_shape_with_fill_and_stroke() {
+        // A text-less `draw:rect` referencing a graphic style with a solid fill +
+        // stroke → a Shape carrying the box rectangle outline, the fill RGB and the
+        // stroke RGB/width (8cm×3cm box → 4 lines + close, frame-local Y-up).
+        let slide = odp_model_slide_with_styles(
+            r##"<style:style style:name="gr1" style:family="graphic">
+                 <style:graphic-properties draw:fill="solid" draw:fill-color="#FF0000"
+                   draw:stroke="solid" svg:stroke-color="#0000FF" svg:stroke-width="0.05cm"/>
+               </style:style>"##,
+            r#"<draw:rect draw:style-name="gr1" svg:x="2cm" svg:y="1cm" svg:width="8cm" svg:height="3cm"/>"#,
+        );
+        assert_eq!(
+            slide.shapes.len(),
+            1,
+            "text-less rect → a Shape (not dropped)"
+        );
+        let s = &slide.shapes[0];
+        let f = s.frame.expect("frame from svg geometry");
+        let cm = 28.3464567;
+        assert!((f.w - 8.0 * cm).abs() < 1e-3, "w: {}", f.w);
+        assert!((f.h - 3.0 * cm).abs() < 1e-3, "h: {}", f.h);
+        let BlockKind::Shape(shape) = &s.kind else {
+            panic!("expected a Shape, got {:?}", s.kind);
+        };
+        assert_eq!(shape.fill, Some([1.0, 0.0, 0.0]), "draw:fill-color red");
+        assert_eq!(shape.stroke, Some([0.0, 0.0, 1.0]), "svg:stroke-color blue");
+        assert!(
+            (shape.stroke_width - 0.05 * cm).abs() < 1e-3,
+            "0.05cm stroke"
+        );
+        let w = 8.0 * cm;
+        let h = 3.0 * cm;
+        assert_eq!(
+            shape.segments,
+            vec![
+                PathSeg::Move(0.0, 0.0),
+                PathSeg::Line(w, 0.0),
+                PathSeg::Line(w, h),
+                PathSeg::Line(0.0, h),
+                PathSeg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn odp_model_custom_shape_without_text_becomes_shape() {
+        // A text-less `draw:custom-shape` (its enhanced-geometry path mini-language
+        // is deferred → the bounding rectangle) still imports as a Shape with its
+        // resolved fill — it is NOT dropped.
+        let slide = odp_model_slide_with_styles(
+            r##"<style:style style:name="gr2" style:family="graphic">
+                 <style:graphic-properties draw:fill="solid" draw:fill-color="#00AA00" draw:stroke="none"/>
+               </style:style>"##,
+            r#"<draw:custom-shape draw:style-name="gr2" svg:x="1cm" svg:y="1cm" svg:width="4cm" svg:height="2cm">
+                 <draw:enhanced-geometry draw:type="ellipse"/>
+               </draw:custom-shape>"#,
+        );
+        assert_eq!(
+            slide.shapes.len(),
+            1,
+            "custom-shape → a Shape (not dropped)"
+        );
+        let BlockKind::Shape(shape) = &slide.shapes[0].kind else {
+            panic!("expected a Shape, got {:?}", slide.shapes[0].kind);
+        };
+        assert_eq!(shape.fill, Some([0.0, 0xAA as f64 / 255.0, 0.0]));
+        assert!(shape.stroke.is_none(), "draw:stroke=none → no stroke");
+        // Bounding rectangle (5 segments) for the deferred enhanced path.
+        assert_eq!(
+            shape.segments.len(),
+            5,
+            "custom-shape lowers to the box rect"
+        );
+        assert!(matches!(shape.segments[0], PathSeg::Move(..)));
+    }
+
+    #[test]
+    fn odp_model_line_becomes_shape_with_endpoints() {
+        // A `draw:line` with explicit `svg:x1/y1/x2/y2` → a Shape whose outline is
+        // those two endpoints (frame-local, Y-up), stroked. A line has no
+        // width/height; its box comes from the endpoint bounds.
+        let slide = odp_model_slide_with_styles(
+            r##"<style:style style:name="gl" style:family="graphic">
+                 <style:graphic-properties draw:stroke="solid" svg:stroke-color="#123456" svg:stroke-width="0.1cm"/>
+               </style:style>"##,
+            r#"<draw:line draw:style-name="gl" svg:x1="2cm" svg:y1="2cm" svg:x2="6cm" svg:y2="5cm"/>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1, "draw:line → a Shape (not dropped)");
+        let s = &slide.shapes[0];
+        let f = s.frame.expect("box from endpoint bounds");
+        let cm = 28.3464567;
+        // Box = bounding rect of (2,2)–(6,5)cm → x=2cm, w=4cm, h=3cm.
+        assert!((f.w - 4.0 * cm).abs() < 1e-3, "w: {}", f.w);
+        assert!((f.h - 3.0 * cm).abs() < 1e-3, "h: {}", f.h);
+        let BlockKind::Shape(shape) = &s.kind else {
+            panic!("expected a Shape, got {:?}", s.kind);
+        };
+        let c = |v: u8| f64::from(v) / 255.0;
+        assert_eq!(shape.stroke, Some([c(0x12), c(0x34), c(0x56)]));
+        // (x1,y1)=(2,2)cm is the box top-left → frame-local (0, h); (x2,y2)=(6,5)cm
+        // is bottom-right → (w, 0). Y is flipped into the model's Y-up space.
+        let w = 4.0 * cm;
+        let h = 3.0 * cm;
+        assert_eq!(shape.segments.len(), 2, "a line = Move + Line");
+        let PathSeg::Move(mx, my) = shape.segments[0] else {
+            panic!("first seg is Move");
+        };
+        let PathSeg::Line(lx, ly) = shape.segments[1] else {
+            panic!("second seg is Line");
+        };
+        assert!(
+            (mx - 0.0).abs() < 1e-3 && (my - h).abs() < 1e-3,
+            "start ({mx},{my})"
+        );
+        assert!(
+            (lx - w).abs() < 1e-3 && (ly - 0.0).abs() < 1e-3,
+            "end ({lx},{ly})"
+        );
+    }
+
+    #[test]
+    fn odp_model_shape_with_text_still_becomes_textbox_no_regression() {
+        // A `draw:rect` that HAS text keeps its text-box behaviour (no regression
+        // to a Shape) — the text path wins.
+        let slide = odp_model_slide_with_styles(
+            r##"<style:style style:name="grt" style:family="graphic">
+                 <style:graphic-properties draw:fill="solid" draw:fill-color="#FF0000"/>
+               </style:style>"##,
+            r#"<draw:rect draw:style-name="grt" svg:x="1cm" svg:y="1cm" svg:width="6cm" svg:height="2cm">
+                 <text:p>Captioned</text:p>
+               </draw:rect>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        assert!(
+            matches!(slide.shapes[0].kind, BlockKind::TextBox(_)),
+            "a text-bearing draw shape stays a TextBox, got {:?}",
+            slide.shapes[0].kind
+        );
+        assert_eq!(block_text(&slide.shapes[0]), "Captioned");
+    }
+
     #[test]
     fn odp_model_positioned_frame_becomes_shape_with_geometry() {
         // A positioned `draw:frame` (svg:x=2cm, y=1cm, w=8cm, h=3cm) holding a
@@ -19822,6 +20816,184 @@ mod tests {
         // 90° clockwise (OOXML) → 270° CCW (model).
         assert_eq!(s.rotation, crate::model::Rotation::D270);
         assert_eq!(block_text(s), "Free Box");
+    }
+
+    #[test]
+    fn pptx_model_textless_rect_becomes_shape_with_fill_and_stroke() {
+        // A `p:sp` with a `a:prstGeom prst="rect"`, a `a:solidFill` and an `a:ln`
+        // but NO text → a Shape block carrying the rectangle outline (frame-local,
+        // Y-up), the fill RGB and the stroke RGB/width. It must NOT be dropped.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp>
+                <p:nvSpPr><p:cNvPr id="2" name="R"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+                <p:spPr>
+                  <a:xfrm><a:off x="914400" y="457200"/><a:ext cx="1828800" cy="914400"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                  <a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>
+                  <a:ln w="12700"><a:solidFill><a:srgbClr val="0000FF"/></a:solidFill></a:ln>
+                </p:spPr>
+                <p:txBody><a:bodyPr/><a:p/></p:txBody>
+              </p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(
+            slide.shapes.len(),
+            1,
+            "text-less rect → a Shape (not dropped)"
+        );
+        assert!(slide.placeholders.is_empty());
+        let s = &slide.shapes[0];
+        let f = s.frame.expect("frame from a:xfrm");
+        assert!((f.w - 144.0).abs() < 1e-6, "w: {}", f.w);
+        assert!((f.h - 72.0).abs() < 1e-6, "h: {}", f.h);
+        let BlockKind::Shape(shape) = &s.kind else {
+            panic!("expected a Shape, got {:?}", s.kind);
+        };
+        assert_eq!(shape.fill, Some([1.0, 0.0, 0.0]), "solidFill red");
+        assert_eq!(shape.stroke, Some([0.0, 0.0, 1.0]), "a:ln blue");
+        assert!((shape.stroke_width - 1.0).abs() < 1e-6, "w=12700 EMU = 1pt");
+        // The rectangle outline is the box: 4 lines + close, frame-local Y-up.
+        assert_eq!(
+            shape.segments,
+            vec![
+                PathSeg::Move(0.0, 0.0),
+                PathSeg::Line(144.0, 0.0),
+                PathSeg::Line(144.0, 72.0),
+                PathSeg::Line(0.0, 72.0),
+                PathSeg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn pptx_model_textless_ellipse_lowers_to_bezier_outline() {
+        // A text-less `a:prstGeom prst="ellipse"` → a Shape whose outline is the
+        // 4-cubic inscribed ellipse (not the rectangle), filled.
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp>
+                <p:spPr>
+                  <a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>
+                  <a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>
+                  <a:solidFill><a:srgbClr val="00FF00"/></a:solidFill>
+                </p:spPr>
+                <p:txBody><a:p/></p:txBody>
+              </p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        let BlockKind::Shape(shape) = &slide.shapes[0].kind else {
+            panic!("expected Shape");
+        };
+        assert_eq!(shape.fill, Some([0.0, 1.0, 0.0]));
+        // 1 Move + 4 Cubic + Close = an ellipse, never a 5-segment rectangle.
+        assert_eq!(shape.segments.len(), 6, "ellipse = Move+4×Cubic+Close");
+        assert!(matches!(shape.segments[0], PathSeg::Move(..)));
+        assert!(
+            shape.segments[1..5]
+                .iter()
+                .all(|s| matches!(s, PathSeg::Cubic(..))),
+            "four cubic Béziers"
+        );
+    }
+
+    #[test]
+    fn pptx_model_cxn_sp_connector_becomes_line_shape() {
+        // A `p:cxnSp` straight connector (no text, `a:ln` only) → a Shape with the
+        // box-diagonal line and the stroke colour/width. Connectors were dropped
+        // entirely before (no `cxnSp` dispatch).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:cxnSp>
+                <p:nvCxnSpPr><p:cNvPr id="3" name="C"/><p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr>
+                <p:spPr>
+                  <a:xfrm><a:off x="914400" y="914400"/><a:ext cx="1828800" cy="914400"/></a:xfrm>
+                  <a:prstGeom prst="straightConnector1"><a:avLst/></a:prstGeom>
+                  <a:ln w="19050"><a:solidFill><a:srgbClr val="112233"/></a:solidFill></a:ln>
+                </p:spPr>
+              </p:cxnSp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1, "connector → a Shape (not dropped)");
+        let s = &slide.shapes[0];
+        let f = s.frame.expect("connector frame from a:xfrm");
+        assert!((f.w - 144.0).abs() < 1e-6, "w: {}", f.w);
+        let BlockKind::Shape(shape) = &s.kind else {
+            panic!("expected Shape, got {:?}", s.kind);
+        };
+        assert!(shape.fill.is_none(), "a connector is unfilled");
+        let c = |v: u8| f64::from(v) / 255.0;
+        assert_eq!(shape.stroke, Some([c(0x11), c(0x22), c(0x33)]));
+        assert!((shape.stroke_width - 1.5).abs() < 1e-6, "19050 EMU = 1.5pt");
+        // The line shape is the box diagonal (bottom-left → top-right).
+        assert_eq!(
+            shape.segments,
+            vec![PathSeg::Move(0.0, 0.0), PathSeg::Line(144.0, 72.0)]
+        );
+    }
+
+    #[test]
+    fn pptx_model_custom_geom_freeform_outline_is_preserved() {
+        // A text-less `a:custGeom` triangle → a Shape whose outline is the parsed
+        // path (guide space mapped into the box, Y-flipped to frame-local).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp>
+                <p:spPr>
+                  <a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="1270000"/></a:xfrm>
+                  <a:custGeom><a:pathLst><a:path w="100" h="100">
+                    <a:moveTo><a:pt x="0" y="100"/></a:moveTo>
+                    <a:lnTo><a:pt x="100" y="100"/></a:lnTo>
+                    <a:lnTo><a:pt x="50" y="0"/></a:lnTo>
+                    <a:close/>
+                  </a:path></a:pathLst></a:custGeom>
+                  <a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill>
+                </p:spPr>
+                <p:txBody><a:p/></p:txBody>
+              </p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        let BlockKind::Shape(shape) = &slide.shapes[0].kind else {
+            panic!("expected Shape");
+        };
+        // 1270000 EMU = 100pt box; guide 100×100 → scale 1:1; Y flipped
+        // (guide top-left/Y-down → frame-local Y-up): (x, 100 - y).
+        assert_eq!(
+            shape.segments,
+            vec![
+                PathSeg::Move(0.0, 0.0),
+                PathSeg::Line(100.0, 0.0),
+                PathSeg::Line(50.0, 100.0),
+                PathSeg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn pptx_model_shape_with_text_still_becomes_textbox_no_regression() {
+        // A `p:sp` that HAS text keeps its text-box behaviour even when it also
+        // carries a fill — the text path wins (no regression to a Shape).
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp>
+                <p:spPr>
+                  <a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                  <a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>
+                </p:spPr>
+                <p:txBody><a:p><a:r><a:t>Labelled</a:t></a:r></a:p></p:txBody>
+              </p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        assert_eq!(slide.shapes.len(), 1);
+        assert!(
+            matches!(slide.shapes[0].kind, BlockKind::TextBox(_)),
+            "a text-bearing shape stays a TextBox, got {:?}",
+            slide.shapes[0].kind
+        );
+        assert_eq!(block_text(&slide.shapes[0]), "Labelled");
     }
 
     #[test]
