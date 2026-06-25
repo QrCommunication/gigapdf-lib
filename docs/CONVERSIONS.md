@@ -101,6 +101,57 @@ strings. A missing or empty metadata part yields a default (empty) `DocMeta` —
 never an error. All of this then flows through to any re-export and to the JSON
 model (`officeToModel` / `gp_model_from_office`).
 
+### Charts & SmartArt (DrawingML)
+
+OOXML **charts** (`c:chartSpace`) and **SmartArt** diagrams (`dgm:dataModel`)
+are lowered by a from-scratch mini charting engine (`convert::chart`) — no
+third-party plotting library.
+
+**Charts → native vector rendering + a data table.** A `c:chart/c:plotArea` is
+read for its plot type, series (`c:ser`: `c:tx` name, `c:cat` categories and
+`c:val`/`c:xVal`/`c:yVal` values via the `c:strCache`/`c:numCache` `c:pt@idx`/`c:v`
+caches), `c:grouping`, axes (`c:catAx`/`c:valAx` + their titles) and `c:legend`,
+then **rendered into model `Shape`s and text labels** at a 480×300 pt figure
+size, producing **two** blocks: (1) the figure and (2) a `Table` of the numbers
+(header row = the series names, one body row per category) so the data stays
+accessible. The renderer covers every type:
+
+| Chart type (`c:…`) | Rendered as |
+|--------------------|-------------|
+| `c:barChart` `barDir=col` | vertical column rects per category/series (clustered, or stacked / percentStacked per `c:grouping`) |
+| `c:barChart` `barDir=bar` | horizontal bar rects (clustered/stacked) |
+| `c:lineChart` | a polyline path per series + point markers |
+| `c:areaChart` | a filled region per series (lightened fill + outline) |
+| `c:pieChart` / `c:doughnutChart` | arc wedges of the first series (Bézier-approx arcs; doughnut cuts an inner radius from `c:holeSize`) |
+| `c:scatterChart` | point marks at each `(c:xVal, c:yVal)`, both axes value-scaled |
+| `c:radarChart` | a closed polygon per series over per-category spokes + grid rings |
+
+The figure also draws the **axes** (axis lines, "nice"-stepped grid lines and
+numeric tick labels derived from the data min/max, with a baseline forced
+through `0`), per-series colours from a default qualitative **palette**, the
+**category labels** under the plot, the chart/axis **titles**, and a **legend**
+strip (series name + colour swatch; a pie's legend lists its slices). Value
+scaling honours the grouping (stacked uses the per-category stack total;
+percent-stacked normalises each category to 100%).
+
+**SmartArt → a nested hierarchy list (+ the laid-out shapes).** The diagram
+**data model** (`dgm:ptLst` node points with their `dgm:t` text, and the
+`dgm:cxnLst` `parOf` connections giving parent→child links) is lowered to a
+**nested bullet `List`** whose item nesting `level` is each point's depth in the
+connection tree (cyclic links guarded; unrooted models fall back to a flat list
+in document order). When the **drawing part** (`dsp:drawing` with laid-out
+`dsp:sp` shapes) is available it is **also** lowered — each shape's `a:xfrm`
+box (EMU→pt) becomes a positioned `Shape` block with its `a:solidFill`/`a:ln`
+fill/stroke, and its `txBody` text a centred paragraph over it — so the visual
+survives alongside the outline.
+
+Both lowerings are **robust**: malformed XML or a missing/empty part yields no
+block (or only what parsed) rather than an error. Coordinates follow the model
+convention — a block `frame` is top-left/Y-down in points while a `Shape`'s
+`segments` are box-local Y-up, exactly as the rest of the shape lowering emits,
+so the figure renders identically through every exporter (HTML/SVG, DOCX, ODT,
+EPUB, Markdown) and the PDF rasteriser.
+
 ---
 
 ## 2. Export — editable model → file

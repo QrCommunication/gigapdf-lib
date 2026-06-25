@@ -13,6 +13,7 @@
 
 pub mod build;
 pub mod cfb;
+pub mod chart;
 pub mod csv_import;
 pub mod export_model;
 pub mod grids;
