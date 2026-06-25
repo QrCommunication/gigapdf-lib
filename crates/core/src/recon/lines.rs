@@ -1,7 +1,21 @@
 //! Stage 1 — **line grouping**. Cluster a page's text runs into reading-order
 //! lines: sort top→bottom (PDF *Y up*, so descending `y`) then left→right, and
-//! start a new line whenever the vertical centre jumps by more than
-//! `0.6 × median font size` (a baseline-band tolerance).
+//! start a new line whenever a run's vertical centre departs the line's running
+//! **centroid** by more than a baseline-band tolerance.
+//!
+//! Two refinements keep mixed-size lines intact (issue #5):
+//!
+//!  - **Centroid anchor (not first-run).** A line's vertical position tracks the
+//!    width-weighted centroid of its runs' centres, recomputed as runs join — not
+//!    whichever run happened to be sorted first. So a line that *opens* with a
+//!    superscript or a small-cap run is anchored on the dominant body text, not on
+//!    that outlier, and the next body run still falls inside the band.
+//!  - **Second-pass overlap merge.** After the initial banding, fragments whose
+//!    vertical extent is *engulfed* by an adjacent line (a superscript/subscript
+//!    footnote marker, an inline formula, a mixed-size run that got split into its
+//!    own pseudo-line) are merged back into the line they belong to — while two
+//!    genuinely separate body lines stay apart, gated on a vertical-overlap ratio
+//!    *and* the fragment being small/partial relative to the main line.
 //!
 //! A [`ReconLine`] keeps its constituent runs (so later stages can read first-run
 //! indent, font size, list markers, per-cell text) plus the union bounding box.
@@ -109,8 +123,12 @@ pub(crate) fn lines_rotation(lines: &[&ReconLine]) -> crate::model::geom::Rotati
 }
 
 /// Group runs into [`ReconLine`]s. Runs are first ordered top→bottom then
-/// left→right; a new line begins when the centre-to-centre gap exceeds the
-/// baseline tolerance (`0.6 ×` the larger of the run / current-line height).
+/// left→right; a new line begins when a run's vertical centre departs the line's
+/// running **width-weighted centroid** by more than the baseline tolerance
+/// (`0.6 ×` the larger of the run / current-line height). A second pass then
+/// merges fragments (superscripts, inline formulae, split mixed-size runs) whose
+/// vertical extent is engulfed by an adjacent line back into that line, without
+/// fusing two genuinely separate body lines (see [`merge_overlapping_fragments`]).
 pub fn group_into_lines(runs: &[ReconRun]) -> Vec<ReconLine> {
     let mut items: Vec<&ReconRun> = runs.iter().filter(|r| !r.text.trim().is_empty()).collect();
     if items.is_empty() {
@@ -125,13 +143,19 @@ pub fn group_into_lines(runs: &[ReconRun]) -> Vec<ReconLine> {
     });
 
     let mut lines: Vec<ReconLine> = Vec::new();
-    let mut row_center = f64::INFINITY;
+    // Running width-weighted centroid of the open line's run centres, plus the
+    // total weight, so each added run *re-centres* the band. Anchoring on the
+    // centroid (not the first run) keeps a line that opens with a superscript /
+    // small-cap run banded on its dominant body text — the next body run still
+    // falls inside the tolerance instead of starting a spurious new line.
+    let mut centroid = f64::INFINITY;
+    let mut weight_sum = 0.0f64;
     let mut row_height = 0.0f64;
 
     for run in items {
         let c = run.center_y();
         let tol = run.h.max(row_height).max(1.0) * 0.6;
-        if lines.is_empty() || (row_center - c).abs() > tol {
+        if lines.is_empty() || (centroid - c).abs() > tol {
             lines.push(ReconLine {
                 x: run.x,
                 y: run.y,
@@ -139,7 +163,11 @@ pub fn group_into_lines(runs: &[ReconRun]) -> Vec<ReconLine> {
                 h: run.h,
                 runs: vec![run.clone()],
             });
-            row_center = c;
+            // Weight by width so a wide body run dominates a hair-thin marker;
+            // never zero (a width-0 run still anchors a fresh line).
+            let wt = run.w.max(0.01);
+            centroid = c;
+            weight_sum = wt;
             row_height = run.h;
         } else {
             let line = lines.last_mut().unwrap();
@@ -153,18 +181,124 @@ pub fn group_into_lines(runs: &[ReconRun]) -> Vec<ReconLine> {
             line.y = y0;
             line.w = x1 - x0;
             line.h = y1 - y0;
+            // Fold the run into the running centroid (incremental weighted mean).
+            let wt = run.w.max(0.01);
+            weight_sum += wt;
+            centroid += (c - centroid) * (wt / weight_sum);
             row_height = row_height.max(run.h);
         }
     }
 
+    // Second pass: rejoin engulfed fragments to the line they belong to.
+    merge_overlapping_fragments(&mut lines);
+
     // Within each line keep the runs left→right (they were inserted in that
-    // order already by the global sort, but a later-added run from a band can
-    // arrive out of order — re-sort defensively).
+    // order already by the global sort, but a later-added run from a band — or a
+    // merged fragment — can arrive out of order, so re-sort defensively).
     for line in &mut lines {
         line.runs
             .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(core::cmp::Ordering::Equal));
     }
     lines
+}
+
+/// Second banding pass: merge **fragment** lines whose vertical extent is engulfed
+/// by an adjacent line back into that line. The first pass anchors on the
+/// centroid, but a superscript/subscript footnote marker, an inline formula run,
+/// or a mixed-size glyph can still land far enough from the body centroid to open
+/// its own pseudo-line. Such a fragment belongs to the body line it overlaps.
+///
+/// The merge is gated so two genuinely separate body lines never fuse: a candidate
+/// pair must (a) overlap vertically by at least [`MERGE_OVERLAP_RATIO`] of the
+/// **shorter** line's extent — measured on the runs' real top/bottom, not a centre
+/// point — *and* (b) the shorter line must be a *partial* band, meaningfully
+/// smaller than the taller one (height ≤ [`FRAGMENT_HEIGHT_RATIO`] ×). Two adjacent
+/// full-height body lines (equal heights, extents merely touching) satisfy neither
+/// and stay apart.
+///
+/// Lines are processed top→bottom and a fragment is folded into its taller
+/// neighbour (above or below, whichever overlaps more), so the surviving lines stay
+/// in top→bottom order. The merged line's runs are concatenated; the caller
+/// re-sorts each line left→right afterwards to preserve horizontal reading order.
+fn merge_overlapping_fragments(lines: &mut Vec<ReconLine>) {
+    if lines.len() < 2 {
+        return;
+    }
+    // Top→bottom by the line's vertical centre (the first pass already emits in
+    // this order, but a band can finish with a lower centroid than the next; sort
+    // so "adjacent" is well defined and the output stays top→bottom).
+    lines.sort_by(|a, b| {
+        b.center_y()
+            .partial_cmp(&a.center_y())
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+
+    let mut merged: Vec<ReconLine> = Vec::with_capacity(lines.len());
+    for line in lines.drain(..) {
+        // Try to fold `line` into the most-overlapping already-kept line. Only the
+        // neighbours whose extent still overlaps are eligible; the strongest
+        // overlap wins so a fragment between two lines joins the closer one.
+        let mut best: Option<(usize, f64)> = None;
+        for (i, kept) in merged.iter().enumerate() {
+            if let Some(ratio) = fragment_overlap_ratio(kept, &line) {
+                if best.map(|(_, r)| ratio > r).unwrap_or(true) {
+                    best = Some((i, ratio));
+                }
+            }
+        }
+        if let Some((i, _)) = best {
+            union_line(&mut merged[i], &line);
+        } else {
+            merged.push(line);
+        }
+    }
+    *lines = merged;
+}
+
+/// Minimum fraction of the **shorter** line's vertical extent that must be covered
+/// by the overlap for the pair to be a fragment-of-a-line (vs two separate lines).
+const MERGE_OVERLAP_RATIO: f64 = 0.55;
+
+/// A fragment must be at most this tall *relative to* the line it joins. A
+/// superscript / subscript / inline marker covers only part of the body band; two
+/// equal-height body lines fail this and never merge.
+const FRAGMENT_HEIGHT_RATIO: f64 = 0.8;
+
+/// If `cand` is a *fragment* engulfed by `main` (or vice-versa), return the
+/// vertical-overlap ratio over the shorter extent; else `None`. Uses the runs'
+/// real top/bottom (`y .. y+h`), not a centre point, so a superscript sitting in
+/// the **top** portion of a body line is recognised even though their centres are
+/// far apart. Symmetric in the pair: whichever line is shorter is the fragment.
+fn fragment_overlap_ratio(main: &ReconLine, cand: &ReconLine) -> Option<f64> {
+    let (a_bot, a_top) = (main.y, main.y + main.h);
+    let (b_bot, b_top) = (cand.y, cand.y + cand.h);
+    let overlap = a_top.min(b_top) - a_bot.max(b_bot);
+    if overlap <= 0.0 {
+        return None; // extents disjoint (or merely touching) → distinct lines.
+    }
+    let h_short = main.h.min(cand.h).max(1e-6);
+    let h_tall = main.h.max(cand.h).max(1e-6);
+    // The shorter line must be a genuine partial band, not a near-equal-height
+    // neighbour, and the overlap must cover most of that short band.
+    if h_short > h_tall * FRAGMENT_HEIGHT_RATIO {
+        return None;
+    }
+    let ratio = overlap / h_short;
+    (ratio >= MERGE_OVERLAP_RATIO).then_some(ratio)
+}
+
+/// Fold `src`'s runs and bounding box into `dst` (union box; runs appended — the
+/// caller re-sorts left→right).
+fn union_line(dst: &mut ReconLine, src: &ReconLine) {
+    let x0 = dst.x.min(src.x);
+    let y0 = dst.y.min(src.y);
+    let x1 = (dst.x + dst.w).max(src.x + src.w);
+    let y1 = (dst.y + dst.h).max(src.y + src.h);
+    dst.x = x0;
+    dst.y = y0;
+    dst.w = x1 - x0;
+    dst.h = y1 - y0;
+    dst.runs.extend(src.runs.iter().cloned());
 }
 
 #[cfg(test)]
@@ -273,5 +407,156 @@ mod tests {
         let lines = group_into_lines(&[des, enfants]);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "DES ENFANTS");
+    }
+
+    // ── centroid anchoring + overlap-merge: superscripts / mixed sizes (#5) ──────
+
+    /// A run with explicit y/size (so vertical extents can be controlled). `w` is
+    /// proportional to text length & size, matching `at`.
+    fn yat(text: &str, x: f64, y: f64, size: f64) -> ReconRun {
+        let mut r = run(text, x, y, size);
+        r.w = text.chars().count() as f64 * size * 0.5;
+        r
+    }
+
+    #[test]
+    fn line_opening_with_a_superscript_anchors_on_the_body_centroid() {
+        // A footnote reference opens the line: a tiny "12" superscript sits raised
+        // and in a smaller font, *before* (sorted above, by higher centre) the wide
+        // body text. The band must anchor on the dominant body run — not the
+        // superscript outlier — and the superscript must remain part of that line.
+        //
+        // Body "Theorem" at y=700 h=12 → centre 706, extent [700,712], wide run.
+        // Superscript "12" at y=707 size=7 → centre 710.5, raised, narrow.
+        let body = yat("Theorem", 90.0, 700.0, 12.0); // x 90..132, centre 706
+        let sup = yat("12", 72.0, 707.0, 7.0); // x 72..79, centre 710.5 (sorted first)
+        let lines = group_into_lines(&[body, sup]);
+
+        assert_eq!(lines.len(), 1, "superscript opener must not split the line");
+        assert_eq!(lines[0].runs.len(), 2);
+        // Anchored on the body, not the superscript: the line centre is far closer
+        // to the body's 706 than to the superscript's 710.5.
+        let c = lines[0].center_y();
+        assert!(
+            (c - 706.0).abs() < (c - 710.5).abs(),
+            "line centre {c} should sit near the body (706), not the superscript (710.5)"
+        );
+        // Horizontal order preserved: the superscript (x=72) precedes the body.
+        assert_eq!(lines[0].runs[0].text, "12");
+        assert_eq!(lines[0].runs[1].text, "Theorem");
+    }
+
+    #[test]
+    fn a_mid_line_inline_superscript_stays_on_one_line_in_reading_order() {
+        // "x" then a raised exponent "2" then "+ y" on the same body line: one line,
+        // runs left→right ("x", "2", "+ y"). The raised "2" must not split off.
+        let x = yat("x", 72.0, 700.0, 12.0); // centre 706
+        let exp = yat("2", 80.0, 706.0, 7.0); // raised small exponent, centre 709.5
+        let rest = yat("+ y", 88.0, 700.0, 12.0); // centre 706
+        let lines = group_into_lines(&[x, exp, rest]);
+
+        assert_eq!(lines.len(), 1, "inline exponent must stay on the body line");
+        let order: Vec<&str> = lines[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(order, vec!["x", "2", "+ y"], "runs kept left→right");
+    }
+
+    #[test]
+    fn two_distinct_body_lines_are_not_over_merged() {
+        // Two full-height body lines one leading apart: equal heights, vertical
+        // extents disjoint → the overlap-merge guard must keep them separate.
+        // Line A y=700 h=12 → [700,712]; line B y=684 h=12 → [684,696].
+        let a = yat("first line", 72.0, 700.0, 12.0);
+        let b = yat("second line", 72.0, 684.0, 12.0);
+        let lines = group_into_lines(&[a, b]);
+
+        assert_eq!(lines.len(), 2, "adjacent body lines must not merge");
+        assert_eq!(lines[0].text(), "first line");
+        assert_eq!(lines[1].text(), "second line");
+    }
+
+    #[test]
+    fn a_normal_single_size_line_is_unchanged() {
+        // A plain uniform line: three same-size runs on one baseline → one line,
+        // text joined, runs left→right. (Regression guard for the no-op path.)
+        let runs = vec![
+            yat("the", 72.0, 700.0, 12.0),
+            yat("quick", 96.0, 700.0, 12.0),
+            yat("fox", 140.0, 700.0, 12.0),
+        ];
+        let lines = group_into_lines(&runs);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].runs.len(), 3);
+        assert_eq!(lines[0].text(), "the quick fox");
+    }
+
+    #[test]
+    fn the_overlap_merge_pass_rejoins_an_engulfed_fragment_keeping_runs_ordered() {
+        // Direct exercise of the second pass: two lines where the shorter is a
+        // partial band engulfed by the taller — a superscript run that landed in
+        // its own pseudo-line. `merge_overlapping_fragments` must fold it back and
+        // the surviving line must keep its runs left→right.
+        //
+        // Main line "body" extent [700,712] (h=12); fragment "12" extent [706,713]
+        // (h=7) sits in the upper portion → engulfed. Centres differ (706 vs 709.5)
+        // but the extents overlap by 6 of the fragment's 7 → ratio ≈ 0.86 ≥ 0.55,
+        // and 7 ≤ 12·0.8 → the fragment is small enough to be a fragment.
+        let main = ReconLine {
+            x: 90.0,
+            y: 700.0,
+            w: 48.0,
+            h: 12.0,
+            runs: vec![yat("body", 90.0, 700.0, 12.0)],
+        };
+        let frag = ReconLine {
+            x: 72.0,
+            y: 706.0,
+            w: 7.0,
+            h: 7.0,
+            runs: vec![yat("12", 72.0, 706.0, 7.0)],
+        };
+        assert!(
+            fragment_overlap_ratio(&main, &frag).is_some(),
+            "an engulfed partial fragment must be recognised"
+        );
+        let mut lines = vec![main, frag];
+        merge_overlapping_fragments(&mut lines);
+        // After the merge: re-sort left→right as group_into_lines does.
+        for l in &mut lines {
+            l.runs
+                .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(core::cmp::Ordering::Equal));
+        }
+        assert_eq!(lines.len(), 1, "the fragment must be merged into the line");
+        let order: Vec<&str> = lines[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(order, vec!["12", "body"], "merged runs kept left→right");
+    }
+
+    #[test]
+    fn the_overlap_merge_pass_never_fuses_two_equal_height_body_lines() {
+        // The no-over-merge guard, exercised on the second pass directly: two
+        // full-height body lines, equal heights, even if their extents *touch* —
+        // the "fragment must be small relative to the main line" gate (height ratio)
+        // forbids the merge regardless of overlap.
+        let upper = ReconLine {
+            x: 72.0,
+            y: 700.0,
+            w: 60.0,
+            h: 12.0, // extent [700,712]
+            runs: vec![yat("upper line", 72.0, 700.0, 12.0)],
+        };
+        // Touching extent [688,700] (shares the 700 edge → zero-area overlap):
+        let lower = ReconLine {
+            x: 72.0,
+            y: 688.0,
+            w: 60.0,
+            h: 12.0,
+            runs: vec![yat("lower line", 72.0, 688.0, 12.0)],
+        };
+        assert!(
+            fragment_overlap_ratio(&upper, &lower).is_none(),
+            "equal-height neighbours are not fragments of each other"
+        );
+        let mut lines = vec![upper, lower];
+        merge_overlapping_fragments(&mut lines);
+        assert_eq!(lines.len(), 2, "two body lines must stay separate");
     }
 }

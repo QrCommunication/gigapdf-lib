@@ -274,6 +274,19 @@ is never promoted.
   post] …`, never interleaved. A genuinely sparse column (ordinary-width lines)
   survives the split, and a true single-column page is never falsely split by
   coincidental whitespace. Generalises to 2 and 3 columns.
+- **Lines**: runs are grouped into baseline lines on a **width-weighted centroid**,
+  not the first run that happened to be sorted. The band tracks the line's dominant
+  body text, so a line that *opens* with a superscript / small-cap / footnote-marker
+  run is no longer anchored on that outlier — the following body run still falls in
+  the band instead of starting a spurious new line. A **second overlap-merge pass**
+  then rejoins any fragment that still split off (an inline superscript/subscript, a
+  formula run, a mixed-size glyph) to the line it belongs to, judged on the runs'
+  real vertical extents (top/bottom from font size), not a centre point. The merge
+  is conservative: it fires only when a fragment is **small/partial** relative to the
+  line it joins *and* their extents overlap past a threshold, so two adjacent
+  full-height body lines never fuse. Horizontal reading order (left→right) is
+  preserved within the merged line. Net effect: superscripts and mixed font sizes
+  are no longer mis-split or mis-merged.
 
 ---
 
