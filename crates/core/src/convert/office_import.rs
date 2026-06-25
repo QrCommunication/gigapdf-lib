@@ -395,6 +395,18 @@ fn highlight_color(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Map an OOXML run vertical-align token to the model [`VAlign`](model::VAlign):
+/// `superscript` ⇒ `Super`, `subscript` ⇒ `Sub`, anything else (incl. an
+/// explicit `baseline` or a missing/unknown value) ⇒ `Baseline`. Shared by the
+/// DOCX `w:vertAlign@val` and the XLSX font `vertAlign@val` (same vocabulary).
+fn ooxml_vert_align(val: Option<&str>) -> model::VAlign {
+    match val.map(str::trim) {
+        Some("superscript") => model::VAlign::Super,
+        Some("subscript") => model::VAlign::Sub,
+        _ => model::VAlign::Baseline,
+    }
+}
+
 /// Derive a [`CharStyle`] from a recovered [`RunStyle`]. The display family name
 /// is kept verbatim; the portable generic class is inferred by reusing
 /// [`super::style::parse_base_font`] (which classifies serif/sans/mono from a
@@ -416,7 +428,7 @@ fn run_char_style(run: &RunStyle) -> CharStyle {
         strike: run.strike,
         color: run.color.as_deref().and_then(hex_to_rgb_f64),
         background: run.highlight.as_deref().and_then(hex_to_rgb_f64),
-        vertical_align: model::VAlign::Baseline,
+        vertical_align: run.vertical_align,
     }
 }
 
@@ -1106,6 +1118,10 @@ fn docx_paragraph_model(
                     }
                     "strike" | "dstrike" if in_rpr => {
                         run.strike = !matches!(attr(&attrs, "val"), Some("0") | Some("false"))
+                    }
+                    "vertAlign" if in_rpr => {
+                        // `w:vertAlign@val`: superscript / subscript / baseline.
+                        run.vertical_align = ooxml_vert_align(attr(&attrs, "val"));
                     }
                     "highlight" if in_rpr => {
                         // `w:highlight@val` is a named colour (yellow/green/…);
@@ -4216,6 +4232,10 @@ fn odf_css_char_style(css: &str) -> CharStyle {
             "text-decoration" if v.contains("line-through") => style.strike = true,
             "color" => style.color = hex_to_rgb_f64(v.trim_start_matches('#')),
             "background-color" => style.background = hex_to_rgb_f64(v.trim_start_matches('#')),
+            // Run vertical position, emitted by `odf_text_props_char_css` from
+            // `style:text-position` (super/sub). `baseline` is the default.
+            "vertical-align" if v == "super" => style.vertical_align = model::VAlign::Super,
+            "vertical-align" if v == "sub" => style.vertical_align = model::VAlign::Sub,
             "font-size" => {
                 if let Some(pt) = v
                     .strip_suffix("pt")
@@ -5990,6 +6010,12 @@ struct RunStyle {
     /// the slide rels). `None` ⇒ a plain run; `Some` ⇒ wrapped in an
     /// [`Inline::Link`] when pushed. Only consulted by the PPTX model path.
     hyperlink: Option<String>,
+    /// Run vertical position relative to the baseline: DOCX `w:vertAlign@val`
+    /// (`superscript`/`subscript`) or PPTX `a:rPr@baseline` (per-mille: `>0` ⇒
+    /// super, `<0` ⇒ sub). Surfaced as the model run's
+    /// [`CharStyle::vertical_align`] so footnote refs / `x²` / formulae keep
+    /// their position. Defaults to [`model::VAlign::Baseline`].
+    vertical_align: model::VAlign,
 }
 
 impl RunStyle {
@@ -8284,6 +8310,8 @@ fn parse_xlsx_fonts_struct(xml: &str, theme: &XlsxTheme) -> Vec<CharStyle> {
                     "b" if xlsx_bool_attr(&attrs) => cur.bold = true,
                     "i" if xlsx_bool_attr(&attrs) => cur.italic = true,
                     "u" if attr(&attrs, "val") != Some("none") => cur.underline = true,
+                    // `<vertAlign val="superscript"|"subscript"/>` → run position.
+                    "vertAlign" => cur.vertical_align = ooxml_vert_align(attr(&attrs, "val")),
                     "sz" => {
                         if let Some(pt) =
                             attr(&attrs, "val").and_then(|v| v.trim().parse::<f64>().ok())
@@ -9653,8 +9681,10 @@ impl PptxRunPr {
     }
 }
 
-/// Read a PPTX `a:rPr` open-tag's run attributes (`b`/`i`/`sz`) into a
+/// Read a PPTX `a:rPr` open-tag's run attributes (`b`/`i`/`sz`/`baseline`) into a
 /// [`RunStyle`]. Colour and typeface arrive as child elements, set by the caller.
+/// `a:rPr@baseline` is a per-mille integer: `>0` ⇒ superscript, `<0` ⇒ subscript,
+/// `0`/absent/unparsable ⇒ baseline.
 fn pptx_run_props(attrs: &[(String, String)]) -> RunStyle {
     RunStyle {
         bold: matches!(attr(attrs, "b"), Some("1")),
@@ -9662,7 +9692,19 @@ fn pptx_run_props(attrs: &[(String, String)]) -> RunStyle {
         size_half_pt: attr(attrs, "sz")
             .and_then(|v| v.parse::<f64>().ok())
             .map(|sz| sz / 50.0), // hundredths-pt → half-pt
+        vertical_align: pptx_vert_align(attr(attrs, "baseline")),
         ..RunStyle::default()
+    }
+}
+
+/// Map a PPTX `a:rPr@baseline` (per-mille integer) to the model
+/// [`VAlign`](model::VAlign): a positive value ⇒ `Super`, a negative value ⇒
+/// `Sub`, and `0` / a missing / an unparsable value ⇒ `Baseline`.
+fn pptx_vert_align(val: Option<&str>) -> model::VAlign {
+    match val.and_then(|v| v.trim().parse::<i64>().ok()) {
+        Some(b) if b > 0 => model::VAlign::Super,
+        Some(b) if b < 0 => model::VAlign::Sub,
+        _ => model::VAlign::Baseline,
     }
 }
 
@@ -9896,6 +9938,13 @@ fn odf_text_props_char_css(attrs: &[(String, String)]) -> String {
             css.push_str(&format!("font-size:{pt}pt;"));
         }
     }
+    // `style:text-position` (super/sub run position) ⇒ a `vertical-align` token
+    // the model char-style parser recognises. `Baseline` emits nothing.
+    match odf_vert_align(attr(attrs, "text-position")) {
+        model::VAlign::Super => css.push_str("vertical-align:super;"),
+        model::VAlign::Sub => css.push_str("vertical-align:sub;"),
+        model::VAlign::Baseline => {}
+    }
     // `fo:font-name` (or `style:font-name`) → real family so the host embeds the
     // matching face and uses its metrics.
     if let Some(fam) = attr(attrs, "font-name") {
@@ -9905,6 +9954,31 @@ fn odf_text_props_char_css(attrs: &[(String, String)]) -> String {
         }
     }
     css
+}
+
+/// Map an ODF `style:text-position` value to the model [`VAlign`](model::VAlign).
+/// The attribute is `<position> [<height>]`; only the first token sets the run's
+/// vertical alignment: the keyword `super` ⇒ `Super`, `sub` ⇒ `Sub`, or a signed
+/// percentage where a positive value ⇒ `Super`, a negative ⇒ `Sub`, and `0%` (or
+/// a missing / unparsable value) ⇒ `Baseline`.
+fn odf_vert_align(val: Option<&str>) -> model::VAlign {
+    let Some(tok) = val.and_then(|v| v.split_whitespace().next()) else {
+        return model::VAlign::Baseline;
+    };
+    match tok {
+        "super" => model::VAlign::Super,
+        "sub" => model::VAlign::Sub,
+        pct => {
+            let percent = pct
+                .strip_suffix('%')
+                .and_then(|n| n.trim().parse::<f64>().ok());
+            match percent {
+                Some(p) if p > 0.0 => model::VAlign::Super,
+                Some(p) if p < 0.0 => model::VAlign::Sub,
+                _ => model::VAlign::Baseline,
+            }
+        }
+    }
 }
 
 /// Build a `style-name → CSS` map from the automatic + named text styles in an
@@ -10522,6 +10596,13 @@ fn odf_text_props_css(attrs: &[(String, String)]) -> String {
     }
     if let Some(pt) = attr(attrs, "font-size").and_then(parse_odf_pt) {
         css.push_str(&format!("font-size:{}pt;", fmt_pt(pt)));
+    }
+    // `style:text-position` (super/sub) ⇒ a `vertical-align` token the model
+    // char-style parser recognises; `Baseline` emits nothing.
+    match odf_vert_align(attr(attrs, "text-position")) {
+        model::VAlign::Super => css.push_str("vertical-align:super;"),
+        model::VAlign::Sub => css.push_str("vertical-align:sub;"),
+        model::VAlign::Baseline => {}
     }
     if let Some(fam) = attr(attrs, "font-name") {
         let family = css_font_family(fam);
@@ -15233,6 +15314,43 @@ mod tests {
         assert_eq!(run.style.background, Some([0.0, 1.0, 0.0]));
     }
 
+    #[test]
+    fn docx_model_vert_align_super_sub_and_baseline() {
+        // `w:vertAlign@val`: superscript → Super, subscript → Sub, an explicit
+        // `baseline` → Baseline, and a run with no `w:vertAlign` stays Baseline.
+        // The trailing explicit-baseline and plain runs share the default style,
+        // so the engine coalesces them into one Baseline run ("flatplain").
+        let doc = r#"<w:document xmlns:w="x">
+  <w:body>
+    <w:p>
+      <w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>up</w:t></w:r>
+      <w:r><w:rPr><w:vertAlign w:val="subscript"/></w:rPr><w:t>down</w:t></w:r>
+      <w:r><w:rPr><w:vertAlign w:val="baseline"/></w:rPr><w:t>flat</w:t></w:r>
+      <w:r><w:t>plain</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let bytes = build_docx(doc, None, &[]);
+        let model = office_to_model(&bytes).expect("docx → model");
+        let va = |text: &str| {
+            model_first_section_inlines(&model)
+                .into_iter()
+                .find_map(|i| match i {
+                    Inline::Run(r) if r.text == text => Some(r.style.vertical_align),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {text:?} run"))
+        };
+        assert_eq!(va("up"), model::VAlign::Super, "superscript → Super");
+        assert_eq!(va("down"), model::VAlign::Sub, "subscript → Sub");
+        // Explicit `baseline` and the plain run both default → one coalesced run.
+        assert_eq!(
+            va("flatplain"),
+            model::VAlign::Baseline,
+            "explicit baseline + plain → Baseline"
+        );
+    }
+
     /// The first `BlockKind::Table` block of a lowered model document.
     fn docx_model_first_table(doc: &Document) -> &Table {
         doc.sections[0].pages[0]
@@ -15992,6 +16110,53 @@ mod tests {
     }
 
     #[test]
+    fn odt_model_text_position_super_sub_from_span_style() {
+        // `style:text-position="super 58%"` → CharStyle.vertical_align Super,
+        // `"sub 25%"` → Sub; a run outside any positioned span stays Baseline.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:text="t" xmlns:style="s">
+  <office:automatic-styles>
+    <style:style style:name="Sup" style:family="text">
+      <style:text-properties style:text-position="super 58%"/>
+    </style:style>
+    <style:style style:name="Sub" style:family="text">
+      <style:text-properties style:text-position="sub 25%"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:text>
+    <text:p>E=mc<text:span text:style-name="Sup">2</text:span> and H<text:span text:style-name="Sub">2</text:span>O</text:p>
+  </office:text></office:body>
+</office:document-content>"##;
+        let model = odt_model(content, &[]);
+        let inlines = model_first_section_inlines(&model);
+        // The two superscript/subscript marker runs both carry the text "2"; pick
+        // them by their resolved vertical alignment.
+        let aligns: Vec<model::VAlign> = inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) if r.text == "2" => Some(r.style.vertical_align),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            aligns.contains(&model::VAlign::Super),
+            "super 58% → Super: {aligns:?}"
+        );
+        assert!(
+            aligns.contains(&model::VAlign::Sub),
+            "sub 25% → Sub: {aligns:?}"
+        );
+        // The body text outside the positioned spans keeps the default baseline.
+        let plain = inlines
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text.contains("E=mc") => Some(r.style.vertical_align),
+                _ => None,
+            })
+            .expect("the leading run");
+        assert_eq!(plain, model::VAlign::Baseline, "host text stays Baseline");
+    }
+
+    #[test]
     fn odt_model_inline_image_lands_in_resources() {
         // `<draw:frame><draw:image xlink:href>` inside a paragraph → an
         // `Inline::Image` whose bytes are interned in `Document.resources`.
@@ -16504,6 +16669,47 @@ mod tests {
         assert!(plain.number_format.is_none() && plain.fill.is_none());
         assert!(plain.border.is_none() && plain.align.is_none());
         assert_eq!(plain.style, CharStyle::default());
+    }
+
+    #[test]
+    fn ods_model_cell_text_position_super_sub() {
+        // `style:text-position="super 58%"` → CharStyle.vertical_align Super,
+        // `"sub 33%"` → Sub; an unstyled cell stays Baseline.
+        let content = r##"<office:document-content xmlns:office="o" xmlns:table="tb" xmlns:text="t" xmlns:style="st">
+  <office:automatic-styles>
+    <style:style style:name="Sup" style:family="table-cell">
+      <style:text-properties style:text-position="super 58%"/>
+    </style:style>
+    <style:style style:name="Sub" style:family="table-cell">
+      <style:text-properties style:text-position="sub 33%"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:body><office:spreadsheet>
+    <table:table table:name="Sheet1">
+      <table:table-row>
+        <table:table-cell table:style-name="Sup"><text:p>up</text:p></table:table-cell>
+        <table:table-cell table:style-name="Sub"><text:p>down</text:p></table:table-cell>
+        <table:table-cell><text:p>flat</text:p></table:table-cell>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"##;
+        let sheet = ods_sheet(content, None);
+        assert_eq!(
+            sheet.rows[0].cells[0].style.vertical_align,
+            model::VAlign::Super,
+            "super 58% → Super"
+        );
+        assert_eq!(
+            sheet.rows[0].cells[1].style.vertical_align,
+            model::VAlign::Sub,
+            "sub 33% → Sub"
+        );
+        assert_eq!(
+            sheet.rows[0].cells[2].style.vertical_align,
+            model::VAlign::Baseline,
+            "unstyled cell → Baseline"
+        );
     }
 
     #[test]
@@ -17035,6 +17241,48 @@ mod tests {
         assert!(border.width > 0.0, "border width: {}", border.width);
         assert_eq!(fancy.align, Some(MAlign::Center), "centered");
         assert!(fancy.wrap, "wrapped");
+    }
+
+    #[test]
+    fn xlsx_model_reads_font_vert_align() {
+        // fontId 1 carries `<vertAlign val="superscript"/>`, fontId 2 subscript;
+        // fontId 0 has none. The lowered cells carry the matching
+        // CharStyle.vertical_align (Super/Sub), and the plain cell stays Baseline.
+        let styles = r#"<styleSheet>
+          <fonts count="3">
+            <font><sz val="11"/><name val="Calibri"/></font>
+            <font><vertAlign val="superscript"/><sz val="11"/><name val="Calibri"/></font>
+            <font><vertAlign val="subscript"/><sz val="11"/><name val="Calibri"/></font>
+          </fonts>
+          <cellXfs count="3">
+            <xf fontId="0"/>
+            <xf fontId="1" applyFont="1"/>
+            <xf fontId="2" applyFont="1"/>
+          </cellXfs>
+        </styleSheet>"#;
+        let sheet = r#"<worksheet><sheetData>
+          <row r="1">
+            <c r="A1" s="0" t="inlineStr"><is><t>flat</t></is></c>
+            <c r="B1" s="1" t="inlineStr"><is><t>up</t></is></c>
+            <c r="C1" s="2" t="inlineStr"><is><t>down</t></is></c>
+          </row>
+        </sheetData></worksheet>"#;
+        let s = xlsx_model_sheet(styles, sheet, None);
+        assert_eq!(
+            s.rows[0].cells[0].style.vertical_align,
+            model::VAlign::Baseline,
+            "no vertAlign → Baseline"
+        );
+        assert_eq!(
+            s.rows[0].cells[1].style.vertical_align,
+            model::VAlign::Super,
+            "superscript → Super"
+        );
+        assert_eq!(
+            s.rows[0].cells[2].style.vertical_align,
+            model::VAlign::Sub,
+            "subscript → Sub"
+        );
     }
 
     #[test]
@@ -17603,6 +17851,42 @@ mod tests {
             runs.iter()
                 .any(|i| matches!(i, Inline::Run(r) if r.text == " plain")),
             "plain run stays bare: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn pptx_model_run_baseline_super_sub_and_zero() {
+        // `a:rPr@baseline` (per-mille): 30000 → Super, -25000 → Sub, 0 → Baseline,
+        // and a run with no `@baseline` stays Baseline. The trailing `baseline="0"`
+        // and plain runs share the default style and coalesce into one Baseline
+        // run ("flatplain").
+        let slide = pptx_model_slide(
+            r#"<p:sld xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree>
+              <p:sp><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="635000" cy="635000"/></a:xfrm></p:spPr>
+                <p:txBody><a:p>
+                  <a:r><a:rPr baseline="30000"/><a:t>up</a:t></a:r>
+                  <a:r><a:rPr baseline="-25000"/><a:t>down</a:t></a:r>
+                  <a:r><a:rPr baseline="0"/><a:t>flat</a:t></a:r>
+                  <a:r><a:rPr/><a:t>plain</a:t></a:r>
+                </a:p></p:txBody></p:sp>
+            </p:spTree></p:cSld></p:sld>"#,
+        );
+        let runs = first_textbox_runs(&slide.shapes[0]);
+        let va = |text: &str| {
+            runs.iter()
+                .find_map(|i| match i {
+                    Inline::Run(r) if r.text == text => Some(r.style.vertical_align),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {text:?} run"))
+        };
+        assert_eq!(va("up"), model::VAlign::Super, "baseline 30000 → Super");
+        assert_eq!(va("down"), model::VAlign::Sub, "baseline -25000 → Sub");
+        // `baseline="0"` and the plain run both default → one coalesced run.
+        assert_eq!(
+            va("flatplain"),
+            model::VAlign::Baseline,
+            "baseline 0 + no baseline → Baseline"
         );
     }
 
