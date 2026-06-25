@@ -170,6 +170,14 @@ created widget gets a real `/AP` appearance stream and the form is flagged
 | `add_attachment(name,bytes,mime?,desc?)` / `add_associated_file(name,bytes,mime?,desc?,rel)` (`/AF` PDF/A-3 — Factur-X/ZUGFeRD) / `remove_attachment(name) -> bool` / `add_file_attachment_annot(page,rect,name,icon?)` | `gp_add_attachment(handle,nameptr,namelen,bytesptr,byteslen,mimeptr,mimelen,descptr,desclen)` / `gp_add_associated_file(…,rel)` (`rel` 0=source 1=data 2=alternative 3=supplement 4=unspecified) / `gp_remove_attachment(handle,nameptr,namelen)` (1=removed 0=absent) / `gp_add_file_attachment_annot(handle,page,x0,y0,x1,y1,nameptr,namelen,iconptr,iconlen)` |
 | `add_document_javascript(name,script)` (install a named document-level JavaScript in the catalog `/Names /JavaScript` name tree, ISO 32000-1 §7.7.3.4 + §12.6.4.16 — viewers run them in name/lexical order on open; re-using a `name` replaces it; `/JS` is a literal string, or a FlateDecode stream past 2 KB; sibling `/Names` subtrees preserved) / `document_javascripts() -> Vec<(String,String)>` (the scripts as `(name, source)`, lexical order) / `remove_document_javascript(name) -> bool` | `gp_add_document_javascript(handle,nameptr,namelen,scriptptr,scriptlen)` (`0`/`-1`/`-3`, `-3` on empty name) / `gp_document_javascripts_json(handle,outlen)` → `[{name,script}]` / `gp_remove_document_javascript(handle,nameptr,namelen)` (1=removed 0=absent) |
 
+### Optional content (layers / OCG, ISO 32000-1 §8.11)
+
+| Rust | WASM |
+|------|------|
+| `layers() -> Vec<Layer>` (`/OCProperties /OCGs`, ordered by `/D /Order`) / `add_layer(name) -> u32` (new visible, unlocked OCG; returns its object number = the id) | `gp_layers_json(handle,outlen)` → `[{id,name,visible,locked,order}]` / `gp_add_layer(handle,nameptr,namelen)` (`0` on error) |
+| `set_layer_visibility(id,visible)` / `set_layer_locked(id,locked)` / `remove_layer(id)` (toggle `/D /OFF` & `/D /Locked`; remove drops the OCG from the config — content still renders) | `gp_set_layer_visibility(handle,id,visible)` / `gp_set_layer_locked(handle,id,locked)` / `gp_remove_layer(handle,id)` (`0` ok) |
+| `begin_optional_content(page,ocg) -> Vec<u8>` (assign drawn content to layer `ocg`: register it under the page `/Resources /Properties /OCn` as an **indirect** ref, append `/OC /OCn BDC` to the content stream; every later `add_text`/`add_rectangle`/`add_image`/… is gated on the layer until `end_optional_content`; calls **nest**, a re-opened layer reuses its property; returns the `OCn` name) / `end_optional_content(page)` (append `EMC`, closing the innermost span; caller balances begin/end) | `gp_begin_optional_content(handle,page,ocg,outlen)` → `OCn` name (empty on error, e.g. unknown `ocg`) / `gp_end_optional_content(handle,page)` (`0` ok) |
+
 ## Security
 
 | Rust | WASM |

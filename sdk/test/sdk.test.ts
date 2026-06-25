@@ -219,6 +219,29 @@ describe("@qrcommunication/gigapdf-lib", () => {
     doc.close();
   });
 
+  it("assigns drawn content to an optional-content layer", () => {
+    const doc = giga.open(giga.txtToPdf("OC"));
+    const layer = doc.addLayer("Watermark");
+    // Begin returns the /Properties resource name (e.g. "OC0").
+    const name = doc.beginOptionalContent(1, layer);
+    expect(name).toMatch(/^OC\d+$/);
+    expect(doc.addStandardText(1, 100, 100, 48, "DRAFT", "Helvetica-Bold", 0xd81a1a, 0.2, 45)).toBe(
+      true
+    );
+    expect(doc.endOptionalContent(1)).toBe(true);
+    // Re-opening the same layer reuses its property name; nesting stays balanced.
+    expect(doc.beginOptionalContent(1, layer)).toBe(name);
+    expect(doc.endOptionalContent(1)).toBe(true);
+    // An unknown group is rejected (empty name).
+    expect(doc.beginOptionalContent(1, 999_999)).toBe("");
+    // The layer survives a save/reopen.
+    const reopened = giga.open(doc.save());
+    expect(reopened.layers()).toHaveLength(1);
+    expect(reopened.layers()[0]).toMatchObject({ name: "Watermark" });
+    reopened.close();
+    doc.close();
+  });
+
   it("authors catalog UX hints (ViewerPreferences, PageLayout, PageMode)", () => {
     const doc = giga.open(giga.txtToPdf("Catalog hints"));
     expect(

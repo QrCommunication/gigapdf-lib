@@ -5661,6 +5661,33 @@ pub extern "C" fn gp_remove_layer(handle: *mut Document, layer_id: u32) -> i32 {
     edit(handle, |doc| doc.remove_layer(layer_id))
 }
 
+/// Begin an optional-content marked-content sequence on `page` for the layer
+/// `ocg` (its object number): registers the OCG under the page's
+/// `/Resources /Properties` and appends `/OC /OCn BDC` to the content stream.
+/// Subsequent drawing (text/rect/image) on that page is gated on the layer
+/// until [`gp_end_optional_content`] appends `EMC`. Returns the chosen `OCn`
+/// property name as a host buffer (free it); empty on error. Calls nest.
+#[no_mangle]
+pub extern "C" fn gp_begin_optional_content(
+    handle: *mut Document,
+    page: u32,
+    ocg: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let name = match unsafe { handle.as_mut() } {
+        Some(doc) => doc.begin_optional_content(page, ocg).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    unsafe { bytes_into_host(name, out_len) }
+}
+
+/// End the innermost optional-content marked-content sequence on `page` (`EMC`).
+/// Pairs one-for-one with [`gp_begin_optional_content`]. 0 on success.
+#[no_mangle]
+pub extern "C" fn gp_end_optional_content(handle: *mut Document, page: u32) -> i32 {
+    edit(handle, |doc| doc.end_optional_content(page))
+}
+
 // ─── minimal JSON (zero-dep) ─────────────────────────────────────────────────
 
 fn json_escape(text: &str, out: &mut String) {

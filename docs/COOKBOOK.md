@@ -40,6 +40,7 @@ Conventions (full table in [`SDK.md` § Conventions](SDK.md#conventions)):
 - [Convert PDF ↔ Office / HTML / RTF](#convert-pdf--office--html--rtf)
 - [Image → PDF (single & batch)](#image--pdf)
 - [Stamp an image watermark](#stamp-an-image-watermark) — *v0.69.0*
+- [A toggleable "Watermark" layer (optional content / OCG)](#a-toggleable-watermark-layer-optional-content--ocg)
 - [Merge multiple PDFs](#merge-multiple-pdfs)
 - [Compact output (object streams + cross-reference stream)](#compact-output-object-streams--cross-reference-stream) — *v0.81.0*
 - [OCR a scanned page + full-text search](#ocr-a-scanned-page--full-text-search)
@@ -644,6 +645,60 @@ doc.addImageWatermark(draftPng, {
 
 const stamped = doc.save();
 doc.close();
+```
+
+---
+
+## A toggleable "Watermark" layer (optional content / OCG)
+
+A plain watermark is baked into the page — a reader can't switch it off. An
+**optional-content group** (OCG, a PDF *layer*; ISO 32000-1 §8.11) wraps the
+drawn content in a marked-content sequence the viewer lists in its Layers panel,
+so it can be shown or hidden (and ships hidden or visible by default).
+
+`addLayer(name)` creates the OCG and returns its id. `beginOptionalContent(page,
+id)` then assigns whatever you draw next to that layer — it registers the OCG
+under the page's `/Resources /Properties` and emits `/OC /OCn BDC`; every drawing
+call until `endOptionalContent(page)` (`EMC`) belongs to the layer. The calls
+**nest**, so layers can be stacked.
+
+```ts
+const doc = giga.open(pdfBytes);
+
+// 1. Create the layer (visible & unlocked by default).
+const layer = doc.addLayer("Watermark");
+
+// 2. Draw a faded "DRAFT" badge on page 1 *inside* the layer.
+//    addStandardText(page, x, y, size, text, fontName, rgb=0xRRGGBB, opacity, rotationDeg)
+doc.beginOptionalContent(1, layer);              // → "OC0" (its /Properties name)
+doc.addStandardText(1, 160, 380, 64, "DRAFT", "Helvetica-Bold", 0xd81a1a, 0.18, 45);
+doc.endOptionalContent(1);                        // EMC — close the sequence
+
+// 3. (optional) Ship it hidden — the reader toggles it on from the Layers panel.
+doc.setLayerVisibility(layer, false);
+
+const out = doc.save();
+doc.close();
+```
+
+The marked content is balanced (each `beginOptionalContent` has its
+`endOptionalContent`) and survives a save/reopen: `layers()` still lists the OCG
+and the page content keeps its `/OC … BDC … EMC` span. To gate several pieces on
+one layer, call `beginOptionalContent` with the **same** id again — it reuses the
+page's existing property entry. To nest, open a second layer before closing the
+first:
+
+```ts
+const base = doc.addLayer("Annotations");
+const detail = doc.addLayer("Annotations · detail");
+
+doc.beginOptionalContent(1, base);                // outer
+//   addRectangle(page, x, y, w, h, stroke=0xRRGGBB|null, fill=0xRRGGBB|null, lineWidth, opacity)
+doc.addRectangle(1, 40, 40, 200, 120, 0x0000cc, null, 1, 1);
+doc.beginOptionalContent(1, detail);              //   inner
+doc.addStandardText(1, 48, 150, 10, "see note", "Helvetica", 0x000000, 1, 0);
+doc.endOptionalContent(1);                        //   close detail
+doc.endOptionalContent(1);                        // close base
 ```
 
 ---

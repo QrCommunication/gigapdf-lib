@@ -20,7 +20,7 @@ use crate::headerfooter::{Align, HeaderFooter, HeaderFooterSpec, Margins};
 use crate::lexer::{Lexer, Token};
 use crate::link::{Link, LinkTarget};
 use crate::object::{Dictionary, Object, ObjectId, Stream, StringKind};
-use crate::ocg::Layer;
+use crate::ocg::{self, Layer};
 use crate::outline::OutlineItem;
 use crate::parser::Parser;
 
@@ -15870,6 +15870,70 @@ impl Document {
         Ok(())
     }
 
+    /// Begin an optional-content marked-content sequence on `page_no` for the
+    /// layer `ocg` (its object number, as returned by [`add_layer`](Self::add_layer)).
+    ///
+    /// Registers the OCG as an **indirect** reference under the page's
+    /// `/Resources /Properties /OC{n}` (cloning inherited resources onto the page
+    /// so the addition is local) and appends `/OC /OC{n} BDC` to the page content
+    /// stream (ISO 32000-1 §8.11.3.2). Every subsequent drawing operator —
+    /// [`add_text`](Self::add_text), [`add_rectangle`](Self::add_rectangle),
+    /// [`add_image`](Self::add_image), … — is gated on that group's visibility in
+    /// a viewer, until the matching [`end_optional_content`](Self::end_optional_content)
+    /// emits `EMC`. Calls **nest**: each `begin` pushes a `BDC` that the next
+    /// `end` closes (innermost first), so layers can be stacked and combined per
+    /// page. Returns the chosen `/Properties` resource name (`OC{n}`).
+    ///
+    /// The same `ocg` may be opened many times on the same page; each call
+    /// reuses (does not duplicate) the page's `/Properties` entry for that group.
+    ///
+    /// # Errors
+    /// [`EngineError::Missing`] if `ocg` is not a registered optional-content
+    /// group (`/OCProperties /OCGs`); [`EngineError::PageNotFound`] if `page_no`
+    /// is out of range.
+    pub fn begin_optional_content(&mut self, page_no: u32, ocg: u32) -> Result<Vec<u8>> {
+        let oid = self
+            .oc_object_id(ocg)
+            .ok_or_else(|| EngineError::Missing("optional content group".into()))?;
+        let name = self.ensure_oc_property(page_no, oid)?;
+        self.append_page_content(page_no, &ocg::begin_ops(&name))?;
+        Ok(name)
+    }
+
+    /// End the innermost optional-content marked-content sequence on `page_no`
+    /// by appending `EMC` (ISO 32000-1 §8.11.3.2). Pairs one-for-one with
+    /// [`begin_optional_content`](Self::begin_optional_content); the engine does
+    /// not track the open depth, so the caller must balance the `begin`/`end`
+    /// calls (each `end` closes the most recently opened layer on the page).
+    pub fn end_optional_content(&mut self, page_no: u32) -> Result<()> {
+        self.append_page_content(page_no, &ocg::end_ops())
+    }
+
+    /// Get-or-create the page `/Resources /Properties` entry mapping a fresh
+    /// `OC{n}` name to the OCG indirect reference `oid`, returning that name. If
+    /// the group is already registered on the page (same object number), the
+    /// existing name is reused so repeated `begin` calls don't duplicate it.
+    fn ensure_oc_property(&mut self, page_no: u32, oid: ObjectId) -> Result<Vec<u8>> {
+        if let Some(existing) = self.page_oc_property_name(page_no, oid) {
+            return Ok(existing);
+        }
+        self.register_page_resource(page_no, b"Properties", "OC", Object::Reference(oid))
+    }
+
+    /// The `/Resources /Properties` name already mapped to the OCG `oid` on
+    /// `page_no`, if any (so a layer opened twice reuses one property entry).
+    fn page_oc_property_name(&self, page_no: u32, oid: ObjectId) -> Option<Vec<u8>> {
+        let props = self.page_resources(page_no);
+        let props = props
+            .get(b"Properties")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        props
+            .0
+            .iter()
+            .find_map(|(name, value)| (value.as_reference() == Some(oid)).then(|| name.clone()))
+    }
+
     /// Resolve a layer's object number to its full `ObjectId` (preserving the
     /// generation) by locating it in `/OCProperties /OCGs`.
     fn oc_object_id(&self, layer_id: u32) -> Option<ObjectId> {
@@ -18643,6 +18707,187 @@ mod tests {
         assert!(doc.layers()[0].visible);
         doc.remove_layer(id).unwrap();
         assert!(doc.layers().is_empty());
+    }
+
+    /// The `/Properties` entry named `res_name` on `page_no` must resolve to an
+    /// OCG object number that is also listed in `/OCProperties /OCGs`.
+    fn assert_oc_property_resolves(doc: &Document, page_no: u32, res_name: &[u8]) -> u32 {
+        let props = doc.page_resources(page_no);
+        let props = props
+            .get(b"Properties")
+            .map(|o| doc.resolve(o))
+            .and_then(Object::as_dict)
+            .expect("page has /Resources /Properties");
+        let oid = props
+            .get(res_name)
+            .and_then(Object::as_reference)
+            .expect("property name maps to an indirect OCG reference");
+        // The referenced object is an OCG dictionary…
+        let dict = doc
+            .objects
+            .get(&oid)
+            .and_then(Object::as_dict)
+            .expect("OCG object exists");
+        assert_eq!(
+            dict.get(b"Type").and_then(Object::as_name),
+            Some(&b"OCG"[..])
+        );
+        // …and it is registered in the catalog's /OCProperties /OCGs.
+        assert!(
+            doc.layers().iter().any(|l| l.id == oid.0),
+            "OCG {} is listed in /OCProperties /OCGs",
+            oid.0
+        );
+        oid.0
+    }
+
+    #[test]
+    fn begin_optional_content_emits_oc_bdc_and_registers_property() {
+        let pdf = crate::convert::reverse::txt_to_pdf("oc content");
+        let mut doc = Document::open(&pdf).unwrap();
+
+        let layer = doc.add_layer("Watermark").unwrap();
+        // Wrap a drawn rectangle in the optional-content sequence.
+        let name = doc.begin_optional_content(1, layer).unwrap();
+        doc.add_rectangle(
+            1,
+            50.0,
+            50.0,
+            100.0,
+            40.0,
+            None,
+            Some([1.0, 0.0, 0.0]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        doc.end_optional_content(1).unwrap();
+
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        let res = String::from_utf8_lossy(&name).into_owned();
+        // The marked-content sequence is present and references the resource name.
+        let bdc = format!("/OC /{res} BDC");
+        let bdc_at = content.find(&bdc).expect("/OC /OCn BDC present");
+        let emc_at = content.rfind("EMC").expect("EMC present");
+        assert!(bdc_at < emc_at, "EMC closes after BDC");
+        // The rectangle's fill operator sits inside the BDC…EMC span.
+        let f_at = content[bdc_at..emc_at]
+            .find(" re")
+            .map(|p| bdc_at + p)
+            .expect("rectangle drawn inside the layer");
+        assert!(bdc_at < f_at && f_at < emc_at);
+
+        // The /OCn name resolves to an OCG that is in /OCProperties /OCGs.
+        let id = assert_oc_property_resolves(&doc, 1, &name);
+        assert_eq!(id, layer);
+    }
+
+    #[test]
+    fn optional_content_nesting_stays_balanced_and_reuses_property() {
+        let pdf = crate::convert::reverse::txt_to_pdf("oc nest");
+        let mut doc = Document::open(&pdf).unwrap();
+
+        let base = doc.add_layer("Base").unwrap();
+        let detail = doc.add_layer("Detail").unwrap();
+
+        // Nest: Base { Detail { ... } } and a second Base-only span afterwards.
+        let base_name = doc.begin_optional_content(1, base).unwrap();
+        doc.add_rectangle(
+            1,
+            10.0,
+            10.0,
+            20.0,
+            20.0,
+            None,
+            Some([0.0, 0.0, 1.0]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        let detail_name = doc.begin_optional_content(1, detail).unwrap();
+        doc.add_rectangle(
+            1,
+            12.0,
+            12.0,
+            5.0,
+            5.0,
+            None,
+            Some([0.0, 1.0, 0.0]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        doc.end_optional_content(1).unwrap(); // closes Detail
+        doc.end_optional_content(1).unwrap(); // closes Base
+
+        // Re-open the same Base layer: must reuse its existing /Properties name.
+        let base_name2 = doc.begin_optional_content(1, base).unwrap();
+        doc.end_optional_content(1).unwrap();
+        assert_eq!(
+            base_name, base_name2,
+            "second open of a layer reuses its property"
+        );
+        assert_ne!(base_name, detail_name, "distinct layers get distinct names");
+
+        let content = String::from_utf8_lossy(&doc.page_content(1).unwrap()).into_owned();
+        // Every BDC has a matching EMC (balanced): equal counts.
+        let bdc_count = content.matches(" BDC").count();
+        let emc_count = content.matches("EMC").count();
+        assert_eq!(bdc_count, 3, "two nested + one reopened = three BDC");
+        assert_eq!(emc_count, 3, "three EMC, balanced");
+
+        // Both layers resolve through /Properties to OCGs in /OCProperties /OCGs.
+        assert_eq!(assert_oc_property_resolves(&doc, 1, &base_name), base);
+        assert_eq!(assert_oc_property_resolves(&doc, 1, &detail_name), detail);
+        // The page registered exactly two OC property entries (no duplicate).
+        let props = doc.page_resources(1);
+        let props = props
+            .get(b"Properties")
+            .map(|o| doc.resolve(o))
+            .and_then(Object::as_dict)
+            .unwrap();
+        assert_eq!(props.0.len(), 2, "Base + Detail, base not duplicated");
+    }
+
+    #[test]
+    fn optional_content_survives_save_open_roundtrip() {
+        let pdf = crate::convert::reverse::txt_to_pdf("oc roundtrip");
+        let mut doc = Document::open(&pdf).unwrap();
+        let layer = doc.add_layer("Stamp").unwrap();
+        let name = doc.begin_optional_content(1, layer).unwrap();
+        doc.add_rectangle(
+            1,
+            5.0,
+            5.0,
+            30.0,
+            10.0,
+            None,
+            Some([0.5, 0.5, 0.5]),
+            0.0,
+            1.0,
+        )
+        .unwrap();
+        doc.end_optional_content(1).unwrap();
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        // The OCG is still present after a full save/reparse…
+        assert_eq!(reopened.layers().len(), 1);
+        assert_eq!(reopened.layers()[0].name, "Stamp");
+        // …the page content still carries the /OC BDC…EMC span…
+        let content = String::from_utf8_lossy(&reopened.page_content(1).unwrap()).into_owned();
+        let res = String::from_utf8_lossy(&name).into_owned();
+        assert!(content.contains(&format!("/OC /{res} BDC")));
+        assert!(content.contains("EMC"));
+        // …and the /Properties name still resolves to that OCG.
+        assert_oc_property_resolves(&reopened, 1, &name);
+    }
+
+    #[test]
+    fn begin_optional_content_rejects_unknown_group() {
+        let pdf = crate::convert::reverse::txt_to_pdf("oc bad");
+        let mut doc = Document::open(&pdf).unwrap();
+        // 999999 is not a registered OCG object number.
+        assert!(doc.begin_optional_content(1, 999_999).is_err());
     }
 
     #[test]

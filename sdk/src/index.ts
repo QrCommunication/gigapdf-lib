@@ -4786,6 +4786,24 @@ export class GigaPdfDoc {
   removeLayer(id: number): boolean {
     return this.ex().gp_remove_layer(this.h, id) === 0;
   }
+  /**
+   * Begin an optional-content marked-content sequence on `page` for the layer
+   * `ocg` (its id, from {@link addLayer}). Registers the OCG under the page's
+   * `/Resources /Properties` and appends `/OC /OCn BDC` to the content stream;
+   * every drawing call after it ({@link addText}, {@link addRectangle},
+   * {@link addImage}, …) is gated on that layer's visibility until the matching
+   * {@link endOptionalContent} appends `EMC`. Calls nest. Returns the `OCn`
+   * property name (empty string on error).
+   */
+  beginOptionalContent(page: number, ocg: number): string {
+    return this.g._str((o) =>
+      this.ex().gp_begin_optional_content(this.h, page, ocg, o)
+    );
+  }
+  /** End the innermost optional-content sequence on `page` (`EMC`). */
+  endOptionalContent(page: number): boolean {
+    return this.ex().gp_end_optional_content(this.h, page) === 0;
+  }
 
   // outline (bookmarks)
   outline(): OutlineEntry[] {

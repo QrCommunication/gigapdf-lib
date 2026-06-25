@@ -330,6 +330,8 @@ Every created widget gets a real `/AP` appearance stream and the form is flagged
 | `addLayer(name)` | `number` | Create a layer; returns its id (`0` on error). |
 | `setLayerVisibility(id, visible)` / `setLayerLocked(id, locked)` | `boolean` | Toggle a layer. |
 | `removeLayer(id)` | `boolean` | Delete a layer. |
+| `beginOptionalContent(page, ocg)` | `string` | Assign drawn content to a layer: registers the OCG under the page's `/Resources /Properties` and appends `/OC /OCn BDC`. Every drawing call after it (`addText`, `addRectangle`, `addImage`, …) is gated on that layer's visibility until `endOptionalContent`. Calls **nest**; reopening a layer reuses its property. Returns the `OCn` name (`""` on error, e.g. unknown `ocg`). |
+| `endOptionalContent(page)` | `boolean` | Close the innermost optional-content sequence on the page (`EMC`). Pairs one-for-one with `beginOptionalContent`. |
 | `outline()` | `OutlineEntry[]` | The flattened bookmark list: `{ title, level, page?, bold?, italic?, color?, destKind?, x?, y?, zoom? }` — nesting depth, destination page + `/XYZ` position/zoom, and `/F`+`/C` label style. Rebuild the tree from `level`. |
 | `setOutline(entries)` | `boolean` | Replace the bookmark tree (`{level, page?, title}` per entry — a `/Fit` page jump). |
 | `setBookmarks(bookmarks)` | `boolean` | Replace the bookmark tree with `Bookmark[]` (`{title, level, action?}`) — bookmarks can carry **any** `Action` (a `goto` becomes a `/Dest`, anything else an `/A`). Empty array clears the outline. |
