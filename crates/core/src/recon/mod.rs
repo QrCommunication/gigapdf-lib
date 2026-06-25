@@ -908,6 +908,12 @@ fn resolve_text_blocks(
     let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
     let mut pending: Vec<usize> = Vec::new();
 
+    // Document/page leading: the robust median step across all the page's lines,
+    // used as the per-group fallback when a group is too short to measure its own
+    // (a single-line group). See [`paragraphs::document_leading`] (gap #75 #9).
+    let all_lines: Vec<&lines::ReconLine> = lines.iter().collect();
+    let doc_leading = paragraphs::document_leading(&all_lines, body);
+
     let flush = |pending: &mut Vec<usize>, out: &mut Vec<Block>, ids: &mut IdGen| {
         if pending.is_empty() {
             return;
@@ -919,6 +925,7 @@ fn resolve_text_blocks(
             heading_levels,
             page_left,
             links,
+            doc_leading,
             ids,
             to_frame,
         );
@@ -948,6 +955,7 @@ fn lower_text_group(
     heading_levels: &headings::HeadingLevels,
     page_left: f64,
     links: &[ParaLink],
+    doc_leading: f64,
     ids: &mut IdGen,
     to_frame: impl Fn(f64, f64, f64, f64) -> Rect + Copy,
 ) -> Vec<Block> {
@@ -965,7 +973,7 @@ fn lower_text_group(
             lists::Segment::Prose(lines) => {
                 // Group-wide geometry calibrates each paragraph's recovered
                 // spacing: one leading and one body-left for the whole prose run.
-                let leading = paragraphs::group_leading(&lines, body);
+                let leading = paragraphs::group_leading(&lines, body, doc_leading);
                 let group_left = paragraphs::group_left(&lines);
                 let mut prev_bottom: Option<f64> = None;
                 for para_lines in paragraphs::split_paragraphs(&lines, body) {

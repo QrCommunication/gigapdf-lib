@@ -52,6 +52,11 @@ const CLUSTER_TOLERANCE: f64 = 0.06;
 /// The maximum heading level the model expresses (HTML `h1..h6`).
 const MAX_LEVEL: u8 = 6;
 
+/// The most visual lines a heading may span (gap #75, sub-item 5). A title set in
+/// a large font commonly wraps to two or three lines, so the `big`-path promotion
+/// must tolerate up to three; a block longer than this is prose, never a heading.
+const MAX_HEADING_LINES: usize = 3;
+
 /// A page's heading-size hierarchy: the distinct font sizes used by heading
 /// candidates, clustered and ranked so each maps to a stable level `1..=6`.
 ///
@@ -159,7 +164,7 @@ pub fn promote(block: Block, body: f64, levels: &HeadingLevels) -> Block {
         return block;
     };
     let lines = line_count(para);
-    if lines == 0 || lines > 2 {
+    if lines == 0 || lines > MAX_HEADING_LINES {
         return block;
     }
     let size = paragraph_size(para);
@@ -168,7 +173,15 @@ pub fn promote(block: Block, body: f64, levels: &HeadingLevels) -> Block {
     // Bold + short qualifies even at body size (common for run-in subheadings),
     // but a single ordinary-weight body-size line must NOT become a heading.
     let bold_subhead = bold && size >= body * BOLD_SUBHEAD_RATIO;
-    if !(big || bold_subhead) {
+    // Promotion gate (gap #75, sub-items 5 & 6):
+    //  - the `big` (clearly larger-font) path may span up to `MAX_HEADING_LINES`:
+    //    a genuine title wraps to two or three lines at heading size and must
+    //    still be recognised, not collapsed back to a paragraph (sub-item 5);
+    //  - the weaker bold-at-body-size path is gated to a **single isolated line**
+    //    (sub-item 6, the bold-subhead isolation guard): a multi-line all-bold
+    //    block is emphasized body text (a bold lead paragraph), not a heading.
+    let qualifies = big || (bold_subhead && lines == 1);
+    if !qualifies {
         return block;
     }
     let level = levels.level_for(size);
@@ -321,10 +334,41 @@ mod tests {
 
     #[test]
     fn long_large_paragraph_is_not_a_heading() {
-        // Large font but 3 lines (2 breaks) → too long to be a heading.
+        // Large font but 4 lines (3 breaks) → past `MAX_HEADING_LINES`, so it is
+        // prose, not a heading, however large the font.
         let lv = levels(&[20.0]);
-        let block = promote(para_block("big but long", 20.0, false, 2), 12.0, &lv);
+        let block = promote(para_block("big but long", 20.0, false, 3), 12.0, &lv);
         assert!(matches!(block.kind, BlockKind::Paragraph(_)));
+    }
+
+    #[test]
+    fn three_line_large_title_is_promoted() {
+        // A title set in a clearly larger font (20pt over a 12pt body) wraps to
+        // three lines (2 breaks) — still a heading (gap #75 #5), not collapsed back
+        // to a paragraph by the old 2-line cap.
+        let lv = levels(&[20.0]);
+        let block = promote(para_block("A rather long chapter title", 20.0, false, 2), 12.0, &lv);
+        match block.kind {
+            BlockKind::Heading(h) => assert_eq!(h.level, 1),
+            _ => panic!("a 3-line large title should be a heading"),
+        }
+    }
+
+    #[test]
+    fn multiline_bold_body_is_not_a_heading() {
+        // A two-line all-bold block at body size is emphasized body text, not a
+        // heading: the bold-subhead path is gated to a single isolated line
+        // (gap #75 #6, the bold-subhead isolation guard).
+        let lv = levels(&[]);
+        let block = promote(para_block("bold lead spanning", 12.0, true, 1), 12.0, &lv);
+        assert!(
+            matches!(block.kind, BlockKind::Paragraph(_)),
+            "multi-line bold body is not a heading"
+        );
+        // The single-line bold subhead still promotes (the run-in subheading case).
+        let lv1 = levels(&[12.0]);
+        let one = promote(para_block("Bold subhead", 12.0, true, 0), 12.0, &lv1);
+        assert!(matches!(one.kind, BlockKind::Heading(_)), "one-line bold subhead promotes");
     }
 
     // ── clustering of the distinct heading sizes present ─────────────────────

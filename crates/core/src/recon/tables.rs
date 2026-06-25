@@ -80,6 +80,47 @@ pub struct PlannedTable {
     /// frame, matching `cols`/`rows`, so cell placement is unchanged. Empty for an
     /// upright (`D0`) table ⇒ the caller's lines are used exactly as before.
     own_lines: Vec<ReconLine>,
+    /// Filled background rectangles that back the grid (a shaded header row, a
+    /// zebra-striped body, a tint behind a totals cell), in the **same frame** as
+    /// `cols`/`rows` (the planner captures them from the page's painted paths,
+    /// which `plan_rotated` has already projected into the logical frame). Used by
+    /// [`build_table`] to (a) set a cell's [`Cell::shading`] and (b) detect a
+    /// **shaded header row** (gap #75, sub-item 2). Empty for the borderless
+    /// fallback (no painted-path access) ⇒ those tables are unchanged.
+    shadings: Vec<Shade>,
+}
+
+/// A captured filled background rectangle plus its RGB colour and source painted-
+/// path index. Coordinates are in the owning [`PlannedTable`]'s frame (PDF user
+/// space for an upright table; the logical frame for a planned-rotated one), so
+/// they compare directly against `cols`/`rows`. `path` lets [`build_table`] claim
+/// the fill as consumed so the page does not also emit it as a standalone shape.
+#[derive(Debug, Clone, Copy)]
+struct Shade {
+    /// Left/right X edges (ascending) of the filled rect.
+    x0: f64,
+    x1: f64,
+    /// Bottom/top Y edges (ascending) of the filled rect.
+    y0: f64,
+    y1: f64,
+    /// Fill colour, RGB `0.0..=1.0`.
+    color: [f64; 3],
+    /// Originating painted-path index (added to the table's `used_paths`).
+    path: usize,
+}
+
+impl Shade {
+    /// Fraction of the cell rect `[cx0,cx1] × [cy0,cy1]` (Y ascending) this shade
+    /// covers, `0.0..=1.0`. Used to decide whether the shade backs the cell.
+    fn coverage(&self, cx0: f64, cx1: f64, cy0: f64, cy1: f64) -> f64 {
+        let ix = (self.x1.min(cx1) - self.x0.max(cx0)).max(0.0);
+        let iy = (self.y1.min(cy1) - self.y0.max(cy0)).max(0.0);
+        let cell_area = (cx1 - cx0).max(0.0) * (cy1 - cy0).max(0.0);
+        if cell_area <= 0.0 {
+            return 0.0;
+        }
+        (ix * iy) / cell_area
+    }
 }
 
 /// The set of tables planned for a page, with helpers `reconstruct_page` uses to
@@ -654,31 +695,29 @@ pub fn build_table(
         return None;
     }
 
-    // Cell text accumulators.
-    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); n_cols]; n_rows];
-    // Remember a representative char style per (row,col) for the first run seen.
-    let mut styles: Vec<Vec<Option<crate::model::CharStyle>>> = vec![vec![None; n_cols]; n_rows];
-    // Remember the FIRST run's `source_index` per (row,col). A cell concatenates
-    // several content-stream runs into one cell run, so only one index can be
-    // carried — the first non-nested run's index makes the cell addressable by
-    // the editor's flat `source_index` space (cell → table block, and cell →
-    // (row,col) by reverse lookup), without which a host can only address tables
-    // positionally. Nested-XObject runs (`source_index = None`) never overwrite a
-    // real index.
-    let mut src_grid: Vec<Vec<Option<usize>>> = vec![vec![None; n_cols]; n_rows];
-    // Per cell: the last run's right edge, height, and whether its raw text ended
-    // with whitespace — so the space between successive runs is synthesized
-    // **gap-aware**. A dense form draws one word across embedded fonts
-    // (`"ENFANT"`+`"S"` butting, gap ≈ 0) and must read `"ENFANTS"`, not
-    // `"ENFANT S"`. A real inter-word gap — or a wrap to the next line within the
-    // cell (a large negative gap) — still inserts a space. Because each run's text
-    // is trimmed before it is appended (cells join on geometry, not raw glyphs),
-    // the run's **own** leading/trailing space is honoured explicitly so a run
-    // that carried its space (e.g. `" L. 16"`) still separates from its
-    // predecessor even when the boxes butt (gap ≈ 0).
-    let mut cell_prev: Vec<Vec<Option<(f64, f64, bool)>>> = vec![vec![None; n_cols]; n_rows];
+    // Cell content accumulators. Each cell keeps its physical **text lines** (gap
+    // #75, sub-item 1): the legacy single-`String` per cell flattened a multi-line
+    // / multi-paragraph cell (a wrapped description, two stacked paragraphs) into
+    // one run, losing the paragraph structure the model's `Cell::blocks: Vec<Block>`
+    // can carry. We now group a cell's lines into one or more paragraph blocks at
+    // emit time. A cell that holds a single line (the overwhelmingly common case)
+    // still yields exactly one paragraph, byte-identical to before.
+    let mut grid: Vec<Vec<Vec<CellLine>>> = (0..n_rows)
+        .map(|_| (0..n_cols).map(|_| Vec::new()).collect())
+        .collect();
 
     for line in table_lines(table, lines) {
+        // Accumulate THIS source line's contribution per cell, then flush each as a
+        // single `CellLine`. A source line shares one baseline, so the gap-aware
+        // run join (multi-font split words like `"ENFANT"`+`"S"` → `"ENFANTS"`)
+        // happens within the line; the wrap to the next line always opens a new
+        // `CellLine` (and, downstream, a paragraph split when the gap is large).
+        let mut per_cell: std::collections::BTreeMap<(usize, usize), CellLine> =
+            std::collections::BTreeMap::new();
+        // Per (row,col): the previous run's right edge, height, and trailing-ws
+        // flag — drives the gap-aware space synthesis within this source line.
+        let mut prev: std::collections::BTreeMap<(usize, usize), (f64, f64, bool)> =
+            std::collections::BTreeMap::new();
         for run in &line.runs {
             let cx = run.x + run.w / 2.0;
             let cy = run.y + run.h / 2.0;
@@ -689,10 +728,18 @@ pub fn build_table(
             if t.is_empty() {
                 continue;
             }
-            let cell = &mut grid[r][c];
-            if !cell.is_empty() {
-                let space = match cell_prev[r][c] {
-                    Some((prev_right, prev_h, prev_trailing_ws)) => {
+            let key = (r, c);
+            let cl = per_cell.entry(key).or_insert_with(|| CellLine {
+                top: run.top(),
+                bottom: run.y,
+                h: run.h.max(1.0),
+                text: String::new(),
+                style: None,
+                src: None,
+            });
+            if !cl.text.is_empty() {
+                let space = match prev.get(&key) {
+                    Some(&(prev_right, prev_h, prev_trailing_ws)) => {
                         // The trim dropped the original whitespace; a space is due
                         // when either side carried one, or the gap is a real
                         // inter-word gap (not a multi-font split-word butt).
@@ -703,21 +750,31 @@ pub fn build_table(
                     None => true,
                 };
                 if space {
-                    cell.push(' ');
+                    cl.text.push(' ');
                 }
             }
-            cell.push_str(t);
-            cell_prev[r][c] = Some((
-                run.right(),
-                run.h,
-                run.text.ends_with(char::is_whitespace),
-            ));
-            if styles[r][c].is_none() {
-                styles[r][c] = Some(run_char_style(run));
+            cl.text.push_str(t);
+            cl.top = cl.top.max(run.top());
+            cl.bottom = cl.bottom.min(run.y);
+            cl.h = cl.h.max(run.h);
+            // The cell line's representative style / source index is its FIRST run
+            // (paragraph blocks are addressable by their first content-stream run).
+            if cl.style.is_none() {
+                cl.style = Some(run_char_style(run));
             }
-            if src_grid[r][c].is_none() {
-                src_grid[r][c] = run.source_index;
+            if cl.src.is_none() {
+                cl.src = run.source_index;
             }
+            prev.insert(
+                key,
+                (run.right(), run.h, run.text.ends_with(char::is_whitespace)),
+            );
+        }
+        for (key, cl) in per_cell {
+            if cl.text.is_empty() {
+                continue;
+            }
+            grid[key.0][key.1].push(cl);
         }
     }
 
@@ -767,16 +824,7 @@ pub fn build_table(
                     rspan += 1;
                 }
                 span[r][c] = (cspan, rspan);
-                absorb_span(
-                    r,
-                    c,
-                    cspan,
-                    rspan,
-                    &mut covered,
-                    &mut grid,
-                    &mut styles,
-                    &mut src_grid,
-                );
+                absorb_span(r, c, cspan, rspan, &mut covered, &mut grid);
             }
         }
     } else if table.spans.len() == n_rows * n_cols {
@@ -796,33 +844,24 @@ pub fn build_table(
                 let cspan = (cs as usize).min(n_cols - c);
                 let rspan = (rs as usize).min(n_rows - r);
                 span[r][c] = (cspan, rspan);
-                absorb_span(
-                    r,
-                    c,
-                    cspan,
-                    rspan,
-                    &mut covered,
-                    &mut grid,
-                    &mut styles,
-                    &mut src_grid,
-                );
+                absorb_span(r, c, cspan, rspan, &mut covered, &mut grid);
             }
         }
     }
 
     let mut rows: Vec<Row> = Vec::with_capacity(n_rows);
-    // Per-row header signal: whether the row has any non-empty cell and whether
-    // every non-empty cell is bold. Collected while building so the leading row's
-    // weight can be judged against the body once all rows exist.
-    let mut row_bold: Vec<(bool, bool)> = Vec::with_capacity(n_rows);
+    // Per-row header signals, collected while building so the leading row can be
+    // judged against the body once all rows exist:
+    //   `any_text`   — the row has at least one non-empty cell,
+    //   `all_bold`   — every non-empty cell is bold,
+    //   `max_size`   — the largest cell font size (pt) in the row,
+    //   `all_shaded` — every non-empty cell carries a background shading.
+    let mut row_sig: Vec<RowSig> = Vec::with_capacity(n_rows);
     for r in 0..n_rows {
         // Row edges are top→bottom (descending Y); height is the gap.
         let height = (table.rows[r] - table.rows[r + 1]).abs();
         let mut cells: Vec<Cell> = Vec::with_capacity(n_cols);
-        // Whether this row has any non-empty cell, and whether all its non-empty
-        // cells are bold (the header signal).
-        let mut any_text = false;
-        let mut all_bold = true;
+        let mut sig = RowSig::default();
         for c in 0..n_cols {
             // A slot absorbed by a span anchored above/left is not emitted: the
             // row supplies fewer cells, which is exactly how the model (and the
@@ -832,51 +871,75 @@ pub fn build_table(
             }
             // Empty interior cells stay empty cells (an unfilled span renders as
             // blank), so the grid shape is preserved rather than collapsed.
-            let text = std::mem::take(&mut grid[r][c]);
-            let style = styles[r][c].take();
-            let src = src_grid[r][c].take();
-            // A non-empty cell contributes to the bold tally; an empty cell carries
-            // no run style, so it neither sets nor clears the "all bold" signal.
-            if !text.trim().is_empty() {
-                any_text = true;
-                if !style.as_ref().map(|s| s.bold).unwrap_or(false) {
-                    all_bold = false;
-                }
-            }
+            let cell_lines = std::mem::take(&mut grid[r][c]);
             let (cspan, rspan) = span[r][c];
+            // The cell's PDF/logical rect (Y ascending) drives shading lookup; the
+            // span widens it to the merged extent.
+            let cx0 = table.cols[c];
+            let cx1 = *table.cols.get(c + cspan).unwrap_or(&table.cols[n_cols]);
+            let cy_top = table.rows[r];
+            let cy_bot = *table.rows.get(r + rspan).unwrap_or(&table.rows[n_rows]);
+            let (cy0, cy1) = (cy_bot.min(cy_top), cy_bot.max(cy_top));
+            let shading = cell_shading(&table.shadings, cx0.min(cx1), cx0.max(cx1), cy0, cy1);
+            // A non-empty cell contributes to the row signals; an empty cell carries
+            // no style, so it neither sets nor clears the bold/size/shading tallies.
+            let has_text = cell_lines.iter().any(|l| !l.text.trim().is_empty());
+            if has_text {
+                sig.any_text = true;
+                let bold = cell_lines
+                    .first()
+                    .and_then(|l| l.style.as_ref())
+                    .map(|s| s.bold)
+                    .unwrap_or(false);
+                if !bold {
+                    sig.all_bold = false;
+                }
+                if shading.is_none() {
+                    sig.all_shaded = false;
+                }
+                let size = cell_lines
+                    .iter()
+                    .filter_map(|l| l.style.as_ref().map(|s| s.size_pt))
+                    .fold(0.0_f64, f64::max);
+                sig.max_size = sig.max_size.max(size);
+            }
             // Per-column alignment (borderless detection sets `Right` for numeric
             // columns); absent ⇒ left. A spanning cell takes its anchor column's
             // alignment.
             let align = table.col_align.get(c).copied().unwrap_or(Align::Left);
-            cells.push(make_cell_spanned(
-                text,
-                style,
-                src,
-                cspan as u16,
-                rspan as u16,
-                align,
-                ids,
-            ));
+            let blocks = cell_paragraphs(cell_lines, align, ids);
+            cells.push(make_cell(blocks, cspan as u16, rspan as u16, shading));
         }
-        row_bold.push((any_text, all_bold));
+        row_sig.push(sig);
         rows.push(Row {
             cells,
             height: Some(height),
-            // Set conservatively below from `row_bold`.
+            // Set conservatively below from `row_sig`.
             is_header: false,
         });
     }
 
-    // Conservative header detection: mark only the **leading** row, and only when
-    // it is entirely bold while the body is not — a real visual contrast. A
-    // uniform table (no bold, or everything bold) yields no header row, so there
-    // are no false positives on plain data tables.
-    if let Some(&(first_text, first_bold)) = row_bold.first() {
-        let leading_is_bold_header = first_text && first_bold;
-        let body_has_non_bold = row_bold.iter().skip(1).any(|&(text, bold)| text && !bold);
-        if leading_is_bold_header && body_has_non_bold {
-            if let Some(first) = rows.first_mut() {
-                first.is_header = true;
+    // Conservative header detection: mark only the **leading** row, and only on a
+    // real visual contrast against the body. Three independent signals qualify
+    // (gap #75, sub-item 2): the leading row is (a) entirely **bold** while a body
+    // row is not, or (b) set in a clearly **larger font** than the body, or (c)
+    // entirely **shaded** while a body row is not. A uniform plain data table
+    // matches none, so there are still zero false positives.
+    if let Some(first) = row_sig.first().copied() {
+        let body = &row_sig[1..];
+        let body_has_text = body.iter().any(|s| s.any_text);
+        let bold_header = first.all_bold && body.iter().any(|s| s.any_text && !s.all_bold);
+        let body_max_size = body
+            .iter()
+            .filter(|s| s.any_text)
+            .map(|s| s.max_size)
+            .fold(0.0_f64, f64::max);
+        let size_header =
+            body_has_text && body_max_size > 0.0 && first.max_size >= body_max_size * HEADER_FONT_RATIO;
+        let shaded_header = first.all_shaded && body.iter().any(|s| s.any_text && !s.all_shaded);
+        if first.any_text && (bold_header || size_header || shaded_header) {
+            if let Some(first_row) = rows.first_mut() {
+                first_row.is_header = true;
             }
         }
     }
@@ -960,20 +1023,94 @@ fn grid_extent_pdf(
     (min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
+/// One physical text line accumulated inside a table cell, with the geometry
+/// [`cell_paragraphs`] needs to group lines into one or more paragraph blocks.
+struct CellLine {
+    /// Top edge (PDF/logical user space, larger Y = higher).
+    top: f64,
+    /// Bottom edge.
+    bottom: f64,
+    /// Representative line height (points).
+    h: f64,
+    /// The line's text (runs already joined gap-aware on its own baseline).
+    text: String,
+    /// The line's first run style (the paragraph block's representative style).
+    style: Option<crate::model::CharStyle>,
+    /// The line's first run `source_index` (paragraph block addressability).
+    src: Option<usize>,
+}
+
+/// Per-row header signals tallied while building a table's rows.
+#[derive(Debug, Clone, Copy)]
+struct RowSig {
+    /// The row has at least one non-empty cell.
+    any_text: bool,
+    /// Every non-empty cell is bold.
+    all_bold: bool,
+    /// The largest cell font size (points) in the row.
+    max_size: f64,
+    /// Every non-empty cell carries a background shading.
+    all_shaded: bool,
+}
+
+impl Default for RowSig {
+    fn default() -> Self {
+        // `all_bold`/`all_shaded` start `true` (vacuously) and are cleared by the
+        // first non-bold / non-shaded text cell; an all-empty row stays `false` on
+        // `any_text`, so it never qualifies as a header.
+        Self {
+            any_text: false,
+            all_bold: true,
+            max_size: 0.0,
+            all_shaded: true,
+        }
+    }
+}
+
+/// The font-size multiple over the body rows at which a table's leading row reads
+/// as a **header** even without bold or shading (gap #75, sub-item 2). `1.1` ⇒
+/// 10 % larger; a uniform-size data table (every row identical) never trips it.
+const HEADER_FONT_RATIO: f64 = 1.1;
+
+/// Minimum fraction of a cell a filled rectangle must cover to count as the
+/// cell's background shading. High enough that a tint deliberately filling the
+/// cell qualifies while a fill that merely clips a corner (a logo, a rule cap)
+/// does not.
+const SHADE_COVER: f64 = 0.6;
+
+/// The colour of the shading backing the cell rect `[cx0,cx1] × [cy0,cy1]`
+/// (Y ascending), or `None` when no captured fill covers at least [`SHADE_COVER`]
+/// of it. The best (highest-coverage) shade wins so a full-cell tint beats a
+/// grazing one.
+fn cell_shading(
+    shadings: &[Shade],
+    cx0: f64,
+    cx1: f64,
+    cy0: f64,
+    cy1: f64,
+) -> Option<[f64; 3]> {
+    let mut best: Option<(f64, [f64; 3])> = None;
+    for s in shadings {
+        let cov = s.coverage(cx0, cx1, cy0, cy1);
+        if cov >= SHADE_COVER && best.is_none_or(|(b, _)| cov > b) {
+            best = Some((cov, s.color));
+        }
+    }
+    best.map(|(_, color)| color)
+}
+
 /// Absorb the slots of an `(r, c)`-anchored span: mark each non-anchor slot
-/// covered, and fold its accumulated text / first style / first source-index into
-/// the anchor so nothing a merge swallows is lost. Shared by the ruled
-/// (rule-inferred) and borderless (geometry-inferred) span passes.
-#[allow(clippy::too_many_arguments)]
+/// covered and fold its accumulated **lines** into the anchor so nothing a merge
+/// swallows is lost (the anchor's lines come first, preserving reading order).
+/// Shared by the ruled (rule-inferred) and borderless (geometry-inferred) span
+/// passes. Style/source-index ride along on each line, so they survive the merge.
 fn absorb_span(
     r: usize,
     c: usize,
     cspan: usize,
     rspan: usize,
     covered: &mut [Vec<bool>],
-    grid: &mut [Vec<String>],
-    styles: &mut [Vec<Option<crate::model::CharStyle>>],
-    src_grid: &mut [Vec<Option<usize>>],
+    grid: &mut [Vec<Vec<CellLine>>],
 ) {
     for rr in r..r + rspan {
         for cc in c..c + cspan {
@@ -982,38 +1119,83 @@ fn absorb_span(
             }
             covered[rr][cc] = true;
             let absorbed = std::mem::take(&mut grid[rr][cc]);
-            if !absorbed.is_empty() {
-                let anchor = &mut grid[r][c];
-                if !anchor.is_empty() {
-                    anchor.push(' ');
-                }
-                anchor.push_str(&absorbed);
-            }
-            if styles[r][c].is_none() {
-                styles[r][c] = styles[rr][cc].take();
-            }
-            if src_grid[r][c].is_none() {
-                src_grid[r][c] = src_grid[rr][cc].take();
-            }
+            grid[r][c].extend(absorbed);
         }
     }
 }
 
-/// Materialise one [`Cell`] holding `text` (one paragraph run) with the given
-/// spans. A 1×1 cell is the common case; `col_span`/`row_span` > 1 mark a merged
-/// region whose absorbed slots were dropped from their rows (the merge encoding
-/// the model and exporters expect). `source_index` is the first content-stream
-/// run index seen in the cell (or `None` for an empty / nested-only cell), which
-/// makes the cell addressable by a host's flat `source_index` space.
-fn make_cell_spanned(
+/// Group a cell's accumulated [`CellLine`]s into paragraph [`Block`]s and wrap
+/// them in a [`Cell`] body (gap #75, sub-item 1).
+///
+/// Lines are read top→bottom; a new paragraph opens where the **blank space**
+/// between two lines exceeds [`CELL_PARA_GAP_RATIO`] of the line height (a clear
+/// inter-paragraph void, not ordinary wrap leading). Within one paragraph the
+/// lines are joined with a single space — exactly the legacy behaviour for a
+/// wrapped cell, so a single-paragraph cell is byte-identical to before. An empty
+/// cell yields **one** empty paragraph so its `blocks[0]` stays a paragraph (the
+/// shape every exporter and the editor expect).
+fn cell_paragraphs(mut lines: Vec<CellLine>, align: Align, ids: &mut IdGen) -> Vec<Block> {
+    if lines.is_empty() {
+        return vec![cell_paragraph_block(String::new(), None, None, align, ids)];
+    }
+    // Top→bottom (descending top edge) for deterministic reading order.
+    lines.sort_by(|a, b| b.top.partial_cmp(&a.top).unwrap_or(core::cmp::Ordering::Equal));
+
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut text = String::new();
+    let mut style: Option<crate::model::CharStyle> = None;
+    let mut src: Option<usize> = None;
+    let mut prev: Option<&CellLine> = None;
+    for line in &lines {
+        let new_para = match prev {
+            Some(p) => {
+                let ref_h = p.h.max(line.h).max(1.0);
+                // Blank space between the boxes (positive = a real void).
+                (p.bottom - line.top) > ref_h * CELL_PARA_GAP_RATIO
+            }
+            None => false,
+        };
+        if new_para && !text.is_empty() {
+            blocks.push(cell_paragraph_block(
+                std::mem::take(&mut text),
+                style.take(),
+                src.take(),
+                align,
+                ids,
+            ));
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&line.text);
+        if style.is_none() {
+            style = line.style.clone();
+        }
+        if src.is_none() {
+            src = line.src;
+        }
+        prev = Some(line);
+    }
+    blocks.push(cell_paragraph_block(text, style, src, align, ids));
+    blocks
+}
+
+/// New-paragraph gap threshold inside a cell, as a multiple of the line height:
+/// the blank space between two stacked lines must exceed this to start a new
+/// paragraph. Ordinary wrap leading leaves a far smaller gap, so a wrapped cell
+/// stays one paragraph; a real blank-line break (≈ a full line of space) splits.
+const CELL_PARA_GAP_RATIO: f64 = 0.6;
+
+/// One paragraph [`Block`] for a cell: `text` as a single run (empty ⇒ no runs,
+/// so an empty cell's paragraph has empty runs), carrying the paragraph's
+/// representative `style`/`source_index` and the column `align`.
+fn cell_paragraph_block(
     text: String,
     style: Option<crate::model::CharStyle>,
     source_index: Option<usize>,
-    col_span: u16,
-    row_span: u16,
     align: Align,
     ids: &mut IdGen,
-) -> Cell {
+) -> Block {
     use crate::model::{Inline, InlineRun};
     let runs = if text.is_empty() {
         Vec::new()
@@ -1024,7 +1206,7 @@ fn make_cell_spanned(
             source_index,
         })]
     };
-    let para = Block {
+    Block {
         id: ids.mint(),
         frame: None,
         rotation: Rotation::D0,
@@ -1036,12 +1218,19 @@ fn make_cell_spanned(
             style_ref: None,
             runs,
         }),
-    };
+    }
+}
+
+/// Materialise one [`Cell`] from its paragraph `blocks` with the given spans and
+/// optional background `shading`. A 1×1 cell is the common case; `col_span`/
+/// `row_span` > 1 mark a merged region whose absorbed slots were dropped from
+/// their rows (the merge encoding the model and exporters expect).
+fn make_cell(blocks: Vec<Block>, col_span: u16, row_span: u16, shading: Option<[f64; 3]>) -> Cell {
     Cell {
-        blocks: vec![para],
+        blocks,
         col_span: col_span.max(1),
         row_span: row_span.max(1),
-        shading: None,
+        shading,
         vertical_align: None,
     }
 }
@@ -1179,6 +1368,11 @@ fn plan_ruled_all(
 ) -> Vec<PlannedTable> {
     let mut h_rules: Vec<HSeg> = Vec::new();
     let mut v_rules: Vec<VSeg> = Vec::new();
+    // Filled background rectangles (header tints, zebra rows) captured alongside
+    // the rules so [`build_ruled_band`] can shade cells and flag a shaded header
+    // (gap #75, sub-item 2). In `plan_rotated` the paths are already projected into
+    // the logical frame, so these line up with the (also-logical) grid edges.
+    let mut fills: Vec<Shade> = Vec::new();
 
     for vp in vpaths {
         // Skip rules already claimed as text underlines — they must not be read
@@ -1200,7 +1394,12 @@ fn plan_ruled_all(
                 y1,
                 path: vp.index,
             }),
-            None => {}
+            // Not a thin rule — it may still be a filled background rectangle.
+            None => {
+                if let Some(shade) = filled_rect_shade(vp) {
+                    fills.push(shade);
+                }
+            }
         }
     }
     if h_rules.len() < 2 || v_rules.len() < 2 {
@@ -1226,16 +1425,61 @@ fn plan_ruled_all(
             .copied()
             .filter(|s| s.y0.min(s.y1) <= hi && s.y0.max(s.y1) >= lo)
             .collect();
-        if let Some(t) = build_ruled_band(lines, &band_h, &band_v) {
+        // Fills overlapping this band's Y-range are candidate cell backgrounds.
+        let band_fills: Vec<Shade> = fills
+            .iter()
+            .copied()
+            .filter(|s| s.y0 <= hi && s.y1 >= lo)
+            .collect();
+        if let Some(t) = build_ruled_band(lines, &band_h, &band_v, &band_fills) {
             out.push(t);
         }
     }
     out
 }
 
+/// A painted path read as a **filled background rectangle** (a shaded header row,
+/// a zebra body stripe, a tint behind a totals cell), or `None` when it is not a
+/// solid axis-aligned fill big enough to back a table cell. Curved paths (logos,
+/// rounded badges) and hairline marks are rejected so only real cell tints are
+/// captured. Only reached for paths [`ruling_orientation`] already declined (i.e.
+/// not thin rules).
+fn filled_rect_shade(vp: &VectorPath) -> Option<Shade> {
+    let color = vp.fill?;
+    if vp.fill_alpha <= 0.0 {
+        return None;
+    }
+    let b = vp.bounds?;
+    if vp
+        .segments
+        .iter()
+        .any(|s| matches!(s, crate::content::vector::PathSeg::Cubic(..)))
+    {
+        return None;
+    }
+    // Big enough to be a cell background, not a stray glyph fill or rule cap.
+    if b.width < 8.0 || b.height < 4.0 {
+        return None;
+    }
+    Some(Shade {
+        x0: b.x,
+        x1: b.x + b.width,
+        y0: b.y,
+        y1: b.y + b.height,
+        color,
+        path: vp.index,
+    })
+}
+
 /// Materialise one ruled table from the rules of a single band. Mirror of the old
-/// `plan_ruled` body, but over a pre-segmented slice of rules.
-fn build_ruled_band(lines: &[ReconLine], h_rules: &[HSeg], v_rules: &[VSeg]) -> Option<PlannedTable> {
+/// `plan_ruled` body, but over a pre-segmented slice of rules. `fills` are the
+/// candidate background rectangles overlapping the band (gap #75, sub-item 2).
+fn build_ruled_band(
+    lines: &[ReconLine],
+    h_rules: &[HSeg],
+    v_rules: &[VSeg],
+    fills: &[Shade],
+) -> Option<PlannedTable> {
     if h_rules.len() < 2 || v_rules.len() < 2 {
         return None;
     }
@@ -1264,11 +1508,21 @@ fn build_ruled_band(lines: &[ReconLine], h_rules: &[HSeg], v_rules: &[VSeg]) -> 
         })
         .collect();
 
-    // Each table owns only the paths whose rules lie in its band.
+    // Background fills whose rect overlaps the grid extent are this table's
+    // shadings; the rest belong to the page (or another table) and are left alone.
+    let shadings: Vec<Shade> = fills
+        .iter()
+        .copied()
+        .filter(|s| s.x1 >= x_lo - 1.0 && s.x0 <= x_hi + 1.0 && s.y1 >= y_bot - 1.0 && s.y0 <= y_top + 1.0)
+        .collect();
+
+    // Each table owns only the paths whose rules lie in its band — plus the fills
+    // it consumes as cell shadings, so the page does not also emit them as shapes.
     let used_paths: BTreeSet<usize> = h_rules
         .iter()
         .map(|s| s.path)
         .chain(v_rules.iter().map(|s| s.path))
+        .chain(shadings.iter().map(|s| s.path))
         .collect();
 
     let start_line = *covered.iter().min()?;
@@ -1292,6 +1546,7 @@ fn build_ruled_band(lines: &[ReconLine], h_rules: &[HSeg], v_rules: &[VSeg]) -> 
         rotation: Rotation::D0,
         spans: Vec::new(),
         own_lines: Vec::new(),
+        shadings,
     })
 }
 
@@ -1451,13 +1706,40 @@ fn decimal_sep_x(text: &str, x: f64, w: f64) -> Option<f64> {
         }
     }
     let sep_idx = sep_idx?;
-    // The separator occupies offset `sep_idx`; place X at its *centre* (offset +
-    // 0.5) over the trimmed span, mapped onto the original box. Leading trimmed
-    // chars shift the trimmed text right within the box, but proportionally over
-    // the *trimmed* length the centre estimate stays stable, so we map the ratio
-    // straight onto `[x, x + w]`.
-    let ratio = (sep_idx as f64 + 0.5) / n as f64;
+    // Place X at the *centre of the separator's own advance* over the run's total
+    // advance, weighting every glyph by [`char_advance`] (per-glyph advances, gap
+    // #75 sub-item 3). A uniform `(sep_idx + 0.5) / n` split assumes monospaced
+    // glyphs and drifts on a proportional face (the narrow `,`/`.` counts the same
+    // as a wide digit); summing real advances tracks the ink. Mapped onto the
+    // original box `[x, x + w]` over the trimmed advances (leading trimmed chars
+    // shift the text right but the proportional centre stays stable).
+    let total: f64 = chars.iter().map(|&c| char_advance(c)).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let before: f64 = chars[..sep_idx].iter().map(|&c| char_advance(c)).sum();
+    let ratio = (before + char_advance(chars[sep_idx]) / 2.0) / total;
     Some(x + w * ratio)
+}
+
+/// Approximate per-glyph advance width in Helvetica-style 1000-unit em metrics,
+/// used by [`decimal_sep_x`] to locate a decimal separator inside a run box far
+/// more accurately than a uniform `1 / n` split. Digits are wide (556) while the
+/// decimal/thousands separators and spaces are narrow (278); the absolute scale
+/// cancels in the ratio, so only the *relative* widths matter. An unknown glyph
+/// falls back to a digit-like advance so a stray currency/sign glyph never skews
+/// the estimate toward zero.
+fn char_advance(c: char) -> f64 {
+    match c {
+        '0'..='9' => 556.0,
+        ',' | '.' | '\'' | ' ' | '\u{00A0}' => 278.0,
+        '-' => 333.0,
+        '+' | '=' => 584.0,
+        '%' => 889.0,
+        // € $ £ — currency marks sit roughly at a digit's advance.
+        '\u{20AC}' | '$' | '\u{00A3}' => 556.0,
+        _ => 556.0,
+    }
 }
 
 /// One detected borderless column: the abscissa its cells align on (`anchor`) and
@@ -1993,6 +2275,8 @@ fn build_borderless_region(
         rotation: Rotation::D0,
         spans,
         own_lines: Vec::new(),
+        // Borderless planning has no painted-path access, so no captured shadings.
+        shadings: Vec::new(),
     })
 }
 
@@ -2433,6 +2717,7 @@ mod tests {
             rotation: Rotation::D0,
             spans: Vec::new(),
             own_lines: Vec::new(),
+            shadings: Vec::new(),
         };
         // 2×2 grid, 4 cells, all filled.
         let runs = vec![
@@ -2506,6 +2791,191 @@ mod tests {
             },
             _ => String::new(),
         }
+    }
+
+    /// The text of the `n`th paragraph block of a cell (for multi-paragraph cells).
+    fn cell_para_text(c: &Cell, n: usize) -> String {
+        match c.blocks.get(n).map(|b| &b.kind) {
+            Some(BlockKind::Paragraph(p)) => match p.runs.first() {
+                Some(crate::model::Inline::Run(r)) => r.text.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    }
+
+    /// A solid filled rectangle painted-path (a cell background tint) — the input
+    /// [`build_table`] reads as cell shading / a shaded header signal.
+    fn fill_rect(x: f64, y: f64, w: f64, h: f64, color: [f64; 3]) -> VectorPath {
+        use crate::content::Bounds;
+        VectorPath {
+            index: 0,
+            bounds: Some(Bounds { x, y, width: w, height: h }),
+            segments: vec![
+                PathSeg::Move(x, y),
+                PathSeg::Line(x + w, y),
+                PathSeg::Line(x + w, y + h),
+                PathSeg::Line(x, y + h),
+                PathSeg::Close,
+            ],
+            fill: Some(color),
+            stroke: None,
+            stroke_width: 0.0,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            dash: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn multiline_cell_with_blank_gap_splits_into_two_paragraphs() {
+        // A single 1×1 ruled cell (cols x=50..350, one row y=100..170) holds two
+        // text lines separated by a blank-line gap (y=150 then y=110, ~30 pt of
+        // void). The cell must materialise TWO paragraph blocks (gap #75 #1), not
+        // one flattened run.
+        let runs = vec![
+            run("First paragraph", 60.0, 150.0, 80.0),
+            run("Second paragraph", 60.0, 110.0, 80.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let mut paths = vec![
+            hrule(170.0, 50.0, 350.0),
+            hrule(100.0, 50.0, 350.0),
+            vrule(50.0, 100.0, 170.0),
+            vrule(350.0, 100.0, 170.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("table at line 0");
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        let cell = &t.rows[0].cells[0];
+        assert_eq!(cell.blocks.len(), 2, "blank-gap cell splits into two paragraphs");
+        assert_eq!(cell_para_text(cell, 0), "First paragraph");
+        assert_eq!(cell_para_text(cell, 1), "Second paragraph");
+    }
+
+    #[test]
+    fn wrapped_cell_lines_stay_one_paragraph() {
+        // Two lines at an ordinary wrap leading (14 pt step, no blank line) inside
+        // one cell join into a SINGLE paragraph, text joined by a space — identical
+        // to the legacy flattening for a wrapped cell.
+        let runs = vec![
+            run("alpha", 60.0, 140.0, 80.0),
+            run("beta", 60.0, 126.0, 80.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let mut paths = vec![
+            hrule(160.0, 50.0, 350.0),
+            hrule(110.0, 50.0, 350.0),
+            vrule(50.0, 110.0, 160.0),
+            vrule(350.0, 110.0, 160.0),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("table at line 0");
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        let cell = &t.rows[0].cells[0];
+        assert_eq!(cell.blocks.len(), 1, "wrapped lines stay one paragraph");
+        assert_eq!(cell_text(cell), "alpha beta");
+    }
+
+    #[test]
+    fn larger_font_leading_row_is_detected_as_header() {
+        // 2 rows × 2 cols, no bold, no shading: the leading row is set in a larger
+        // font (14 pt) than the body (10 pt). The size signal alone flags it as a
+        // header (gap #75 #2); the body row is not.
+        let big = |text: &str, x: f64, y: f64, w: f64| ReconRun {
+            h: 14.0,
+            size: 14.0,
+            ..run(text, x, y, w)
+        };
+        let paths = vec![
+            hrule(140.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(100.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+        ];
+        let runs = vec![
+            big("Name", 60.0, 126.0, 40.0),
+            big("City", 160.0, 126.0, 40.0),
+            run("Ada", 60.0, 106.0, 30.0),
+            run("Lyon", 160.0, 106.0, 30.0),
+        ];
+        let rows = build_rows(&paths, &runs);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_header, "larger-font leading row → header");
+        assert!(!rows[1].is_header, "body row → not header");
+    }
+
+    #[test]
+    fn shaded_leading_row_is_detected_as_header_and_cells_carry_shading() {
+        // 2 rows × 2 cols, no bold, uniform size. A filled tint backs the top row
+        // [y 120..140]. The shading flags the leading row as a header (gap #75 #2)
+        // and each shaded cell carries the fill colour.
+        let tint = [0.85, 0.90, 0.95];
+        let mut paths = vec![
+            hrule(140.0, 50.0, 250.0),
+            hrule(120.0, 50.0, 250.0),
+            hrule(100.0, 50.0, 250.0),
+            vrule(50.0, 100.0, 140.0),
+            vrule(150.0, 100.0, 140.0),
+            vrule(250.0, 100.0, 140.0),
+            // Header-row background tint covering the whole top band.
+            fill_rect(50.0, 120.0, 200.0, 20.0, tint),
+        ];
+        for (i, p) in paths.iter_mut().enumerate() {
+            p.index = i;
+        }
+        let runs = vec![
+            run("Name", 60.0, 126.0, 40.0),
+            run("City", 160.0, 126.0, 40.0),
+            run("Ada", 60.0, 106.0, 30.0),
+            run("Lyon", 160.0, 106.0, 30.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let plan = plan_tables(&lines, &paths, &BTreeSet::new());
+        let tbl = plan.take_if_starts_at(0).expect("table at line 0");
+        let mut ids = IdGen::default();
+        let BlockKind::Table(t) = build_table(&tbl, &lines, &mut ids, Rect::new)
+            .expect("table block")
+            .kind
+        else {
+            panic!("expected table");
+        };
+        assert!(t.rows[0].is_header, "shaded leading row → header");
+        assert!(!t.rows[1].is_header, "unshaded body row → not header");
+        assert_eq!(t.rows[0].cells[0].shading, Some(tint), "header cell carries shading");
+        assert_eq!(t.rows[1].cells[0].shading, None, "body cell has no shading");
+    }
+
+    #[test]
+    fn decimal_sep_x_weights_glyph_advances() {
+        // A digit-heavy prefix: a uniform `k / n` split places "1234,5"'s comma at
+        // 0.75 of the box; weighting per-glyph advances (the wide digits, the narrow
+        // comma) shifts it right, to ≈ 0.773. Proof the per-glyph model (gap #75 #3)
+        // is in effect rather than a uniform division.
+        let x = decimal_sep_x("1234,5", 0.0, 1000.0).expect("comma is a decimal sep");
+        assert!(x > 760.0 && x < 785.0, "advance-weighted sep ≈ 773, got {x}");
+        // A wide glyph advances more than a narrow separator.
+        assert!(char_advance('5') > char_advance(','));
     }
 
     #[test]

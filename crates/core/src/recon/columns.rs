@@ -381,10 +381,60 @@ fn column_bands(body: &[&ReconLine], content_lo: f64, content_hi: f64) -> Vec<f6
         .filter(|w| populated(w[0], w[1]) >= 2)
         .count();
     if well_populated < 2 {
+        // Single-gutter fallback (gap #75, sub-item 4). A two-column page whose
+        // second column is *short* (a sidebar, a stub, a one-line note) has only
+        // one well-populated band, so the symmetric ≥2/≥2 gate would wrongly
+        // collapse it to one column. When there is exactly one clear gutter, accept
+        // the split if one side is well-populated (≥ 2 lines) and the sparse side's
+        // line(s) sit **beside** it — their baselines fall within the dominant
+        // column's Y span. That vertical coexistence is what tells a genuine
+        // adjacent column from the lone straggler the ≥2 gate rightly rejects (a
+        // stray run that merely lands above or below the body, not beside it).
+        if boundaries.len() == 1 {
+            if let Some(edges) = single_gutter_split(body, &edges, h_med) {
+                return edges;
+            }
+        }
         return vec![page_lo, page_hi];
     }
 
     edges
+}
+
+/// The robust single-gutter two-column fallback (see [`column_bands`]). `edges`
+/// is the candidate `[lo, mid, hi]`; returns it unchanged when the split is
+/// trustworthy on sparse evidence (one well-populated column plus a sparse column
+/// sitting beside it), else `None` to fall back to a single column. `tol` is one
+/// line height of vertical slack.
+fn single_gutter_split(body: &[&ReconLine], edges: &[f64], tol: f64) -> Option<Vec<f64>> {
+    let (lo, mid, hi) = (edges[0], edges[1], *edges.last()?);
+    let band_ys = |a: f64, b: f64| -> Vec<f64> {
+        body.iter()
+            .filter(|l| {
+                let cx = l.center_x();
+                cx >= a && cx < b
+            })
+            .map(|l| l.center_y())
+            .collect::<Vec<_>>()
+    };
+    let left = band_ys(lo, mid);
+    let right = band_ys(mid, hi);
+    // The dominant (more populated) band anchors the column; the other is the
+    // candidate sparse column.
+    let (dom, sparse) = if left.len() >= right.len() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    if dom.len() < 2 || sparse.is_empty() {
+        return None;
+    }
+    let dom_lo = dom.iter().cloned().fold(f64::INFINITY, f64::min);
+    let dom_hi = dom.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let beside = sparse
+        .iter()
+        .all(|&y| y >= dom_lo - tol && y <= dom_hi + tol);
+    beside.then(|| edges.to_vec())
 }
 
 impl ReconLine {
@@ -563,6 +613,29 @@ mod tests {
         let order = reading_order(&lines);
         let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
         assert_eq!(ordered, vec!["a1", "a2", "b1", "c1", "c2"]);
+    }
+
+    #[test]
+    fn two_columns_with_a_short_right_column_still_splits() {
+        // A real two-column page whose right column is a single line that sits
+        // *beside* the left column (its baseline within the left column's Y span).
+        // The symmetric ≥2/≥2 gate alone would collapse this; the single-gutter
+        // fallback (gap #75 #4) keeps the split — distinct from the straggler case
+        // (a lone run *below* the body), which still stays single column.
+        let runs = vec![
+            run("left one", 72.0, 700.0),
+            run("right note", 360.0, 690.0), // lone right line, beside the left column
+            run("left two", 72.0, 680.0),
+            run("left three", 72.0, 660.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let order = reading_order(&lines);
+        let ordered: Vec<String> = order.iter().map(|&i| lines[i].text()).collect();
+        assert_eq!(
+            ordered,
+            vec!["left one", "left two", "left three", "right note"],
+            "short right column still splits and is read after the left",
+        );
     }
 
     #[test]

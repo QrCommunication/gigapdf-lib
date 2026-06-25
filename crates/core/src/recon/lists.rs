@@ -1088,6 +1088,30 @@ mod tests {
         assert_eq!(list.items.len(), 3);
     }
 
+    /// An ordered list that does NOT start at 1 (`3. 4. 5.`) is still a coherent
+    /// list — a continuation from an earlier column/page — because ≥ 3 items step
+    /// by exactly 1 (gap #75, sub-item 8). The single-item / uncorroborated cases
+    /// that must stay prose are covered by the lone-marker tests above.
+    #[test]
+    fn ordered_list_starting_above_one_is_a_continuation() {
+        let runs = vec![
+            run("3. third", 72.0, 700.0),
+            run("4. fourth", 72.0, 686.0),
+            run("5. fifth", 72.0, 672.0),
+        ];
+        let lines = group_into_lines(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let segs = split_lists(&refs);
+        assert_eq!(list_segments(&segs), 1, "3 4 5 is a continuation list");
+        let mut ids = IdGen::default();
+        let block = build_list(&refs, 12.0, &mut ids, Rect::new).unwrap();
+        let BlockKind::List(list) = block.kind else {
+            panic!("expected list");
+        };
+        assert!(list.ordered);
+        assert_eq!(list.items.len(), 3, "all three items kept");
+    }
+
     /// `1. 2. 4.` (a single missed item) is still a coherent ordered list, but
     /// `5. 1. 9.` (non-monotonic) is rejected as prose — the ordinal-sequence
     /// guard tolerates a small gap, not arbitrary jumps.

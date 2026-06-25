@@ -55,8 +55,10 @@ pub fn split_paragraphs<'a>(lines: &[&'a ReconLine], body: f64) -> Vec<Vec<&'a R
     if lines.is_empty() {
         return Vec::new();
     }
-    // Estimate the body leading from the median line-to-line vertical step.
-    let leading = estimate_leading(lines, body);
+    // Estimate the body leading from the median line-to-line vertical step (a
+    // paragraph split is judged on the group's own leading; a single-line group
+    // never splits, so the document fallback is irrelevant here → `0.0`).
+    let leading = estimate_leading(lines, body, 0.0);
     let body_left = block_left(lines);
 
     let mut paras: Vec<Vec<&ReconLine>> = vec![vec![lines[0]]];
@@ -355,8 +357,35 @@ fn round2(v: f64) -> f64 {
 /// The leading (line-to-line step) of a whole prose group — exposed so the
 /// caller can build a [`ParaContext`] whose `leading` reflects the group, not a
 /// single paragraph (a one-line paragraph has no internal step to measure).
-pub(crate) fn group_leading(lines: &[&ReconLine], body: f64) -> f64 {
-    estimate_leading(lines, body)
+///
+/// When the group is too short to measure its own leading (a single-line group),
+/// it falls back to `doc_leading` — the **document/page** median leading (gap #75,
+/// sub-item 9) — instead of a fixed `1.2 × body`, so an isolated heading/caption
+/// inherits the spacing the rest of the page actually uses. Pass `0.0` for
+/// `doc_leading` to keep the legacy `1.2 × body` fallback.
+pub(crate) fn group_leading(lines: &[&ReconLine], body: f64, doc_leading: f64) -> f64 {
+    estimate_leading(lines, body, doc_leading)
+}
+
+/// The **document/page** body leading: the median baseline step across *all* the
+/// page's lines. Robust by construction — the large cross-group / cross-column
+/// gaps are a minority and the median ignores them, leaving the ordinary
+/// line-to-line step. Used as the per-group fallback (see [`group_leading`]) so a
+/// single-line group inherits the real document leading. Falls back to
+/// `1.2 × body` only when the page itself has no measurable step.
+pub(crate) fn document_leading(lines: &[&ReconLine], body: f64) -> f64 {
+    // Order by vertical position so consecutive steps reflect real adjacency.
+    let mut ys: Vec<f64> = lines.iter().map(|l| l.center_y()).collect();
+    ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
+    let mut steps: Vec<f64> = ys
+        .windows(2)
+        .map(|w| (w[0] - w[1]).abs())
+        .filter(|s| *s > 0.0)
+        .collect();
+    if steps.is_empty() {
+        return body * 1.2;
+    }
+    median(&mut steps, body * 1.2).max(body).max(1.0)
 }
 
 /// The group's left margin (min line-left) — exposed for [`ParaContext::group_left`]
@@ -373,14 +402,21 @@ pub(crate) fn paragraph_bottom(para: &[&ReconLine]) -> f64 {
     y
 }
 
-/// Estimate body leading from consecutive line steps; fall back to `1.2 × body`.
-fn estimate_leading(lines: &[&ReconLine], body: f64) -> f64 {
+/// Estimate body leading from consecutive line steps. When the group has no
+/// measurable step (a single line), fall back to `doc_leading` (the document
+/// leading) if positive, else to `1.2 × body`. Floored at the body size.
+fn estimate_leading(lines: &[&ReconLine], body: f64, doc_leading: f64) -> f64 {
     let mut steps: Vec<f64> = lines
         .windows(2)
         .map(|w| (w[0].center_y() - w[1].center_y()).abs())
         .filter(|s| *s > 0.0)
         .collect();
-    let med = median(&mut steps, body * 1.2);
+    let fallback = if doc_leading > 0.0 {
+        doc_leading
+    } else {
+        body * 1.2
+    };
+    let med = median(&mut steps, fallback);
     med.max(body).max(1.0)
 }
 
@@ -533,6 +569,45 @@ mod tests {
         let refs: Vec<&ReconLine> = lines.iter().collect();
         let mut ids = IdGen::default();
         build_paragraph_styled(&refs, &ParaContext::default(), &mut ids, Rect::new)
+    }
+
+    #[test]
+    fn document_leading_is_robust_to_group_gaps() {
+        // Mostly 16-pt steps with two large between-group voids; the median ignores
+        // the outliers and recovers the real document leading (gap #75 #9).
+        let runs = vec![
+            run("a", 72.0, 700.0, 20.0),
+            run("b", 72.0, 684.0, 20.0),
+            run("c", 72.0, 668.0, 20.0),
+            // big void (new block)
+            run("d", 72.0, 560.0, 20.0),
+            run("e", 72.0, 544.0, 20.0),
+            // another void
+            run("f", 72.0, 420.0, 20.0),
+        ];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let lead = document_leading(&refs, 12.0);
+        assert!((lead - 16.0).abs() < 1.0, "document leading ≈ 16, got {lead}");
+    }
+
+    #[test]
+    fn single_line_group_inherits_document_leading() {
+        // A one-line group cannot measure its own leading. With a positive
+        // `doc_leading` it inherits it (gap #75 #9); with `0.0` it keeps the legacy
+        // `1.2 × body` fallback.
+        let runs = vec![run("lonely heading", 72.0, 700.0, 90.0)];
+        let lines = lines_of(&runs);
+        let refs: Vec<&ReconLine> = lines.iter().collect();
+        let body = 12.0;
+        assert_eq!(group_leading(&refs, body, 18.0), 18.0, "inherits document leading");
+        let legacy = group_leading(&refs, body, 0.0);
+        assert!(
+            (legacy - body * 1.2).abs() < 1e-9,
+            "no document leading → 1.2×body, got {legacy}"
+        );
+        // The fallback is still floored at the body size.
+        assert_eq!(group_leading(&refs, body, 5.0), body, "floored at body size");
     }
 
     #[test]
@@ -831,7 +906,7 @@ mod tests {
         let lines = lines_of(&runs);
         let refs: Vec<&ReconLine> = lines.iter().collect();
         let body = 12.0;
-        let leading = group_leading(&refs, body); // ≈ 24
+        let leading = group_leading(&refs, body, 0.0); // ≈ 24
         let group_left = group_left(&refs); // = 100
         let ctx = ParaContext {
             body,
@@ -912,7 +987,7 @@ mod tests {
         let body = 12.0;
         let ctx = ParaContext {
             body,
-            leading: group_leading(&refs, body),
+            leading: group_leading(&refs, body, 0.0),
             group_left: group_left(&refs),
             page_left: 72.0,
             prev_bottom: None,

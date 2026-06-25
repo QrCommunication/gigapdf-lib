@@ -165,6 +165,12 @@ fn in_band(block: &Block, edge: Edge, band_h: f64, page_h: f64) -> bool {
     };
     let top = frame.y;
     let bottom = frame.y + frame.h;
+    // The inner edge (toward the body) is a tight hairline on purpose: widening it
+    // pulls genuine body content (a page title sitting just inside the margin) into
+    // the band and wrongly strips it as furniture. The band-boundary *tolerance*
+    // the recon polish calls for (gap #75, sub-item 11) lives where it is safe —
+    // the table rule bands, where `segment_rule_bands` already merges near-miss
+    // rule intervals within an adaptive `split_gap` (`recon::tables`).
     match edge {
         // Header: the whole block lives in the top band.
         Edge::Top => top >= -0.5 && bottom <= band_h + 0.5,
@@ -183,7 +189,11 @@ fn in_band(block: &Block, edge: Edge, band_h: f64, page_h: f64) -> bool {
 /// * A [`Shape`](crate::model::Shape) (e.g. the rule under a running head) →
 ///   a kind-tagged, position-bucketed signature so the same rule clusters but a
 ///   stray graphic does not collapse onto unrelated text.
-/// * Images and other non-text blocks ⇒ `None` (never treated as furniture).
+/// * An **image-only** block — a running logo, with no prose — → an image
+///   signature keyed by its resource hash and bucketed vertical centre (gap #75,
+///   sub-item 10), so a logo repeated on every page is lifted as furniture
+///   instead of leaking into the body of every page.
+/// * Other non-text blocks ⇒ `None` (never treated as furniture).
 fn block_signature(block: &Block) -> Option<String> {
     match &block.kind {
         BlockKind::Shape(_) => {
@@ -193,9 +203,90 @@ fn block_signature(block: &Block) -> Option<String> {
             let cy = ((frame.y + frame.h / 2.0) / 2.0).round() as i64;
             Some(format!("shape@{cy}"))
         }
+        BlockKind::Image(img) => image_signature(block, &[img.resource]),
         _ => {
             let text = normalize_text(&block_text(block));
-            (!text.is_empty()).then_some(text)
+            if !text.is_empty() {
+                return Some(text);
+            }
+            // No prose: a header/footer laid out as a logo (an image inside a
+            // paragraph/text box) still clusters by its image resource(s).
+            let resources = block_image_resources(block);
+            if resources.is_empty() {
+                None
+            } else {
+                image_signature(block, &resources)
+            }
+        }
+    }
+}
+
+/// An image furniture signature: the (sorted) image resource hashes plus the
+/// block's vertical centre bucketed to ~2 pt (matching the shape signature), so
+/// the same logo at the same height clusters across pages while a one-off graphic
+/// does not collapse onto it. Returns `None` for a frameless block.
+fn image_signature(block: &Block, resources: &[u64]) -> Option<String> {
+    let frame = block.frame?;
+    let cy = ((frame.y + frame.h / 2.0) / 2.0).round() as i64;
+    let mut rs = resources.to_vec();
+    rs.sort_unstable();
+    rs.dedup();
+    let list: Vec<String> = rs.iter().map(|r| r.to_string()).collect();
+    Some(format!("image:{}@{cy}", list.join(",")))
+}
+
+/// Collect the image resource hashes a block carries (recursing through inline
+/// runs and nested block containers), for the image-only furniture signature.
+fn block_image_resources(block: &Block) -> Vec<u64> {
+    let mut out = Vec::new();
+    collect_block_images(block, &mut out);
+    out
+}
+
+/// Append `block`'s image resource hashes to `out` (recursing into nested
+/// containers and inline content).
+fn collect_block_images(block: &Block, out: &mut Vec<u64>) {
+    match &block.kind {
+        BlockKind::Image(img) => out.push(img.resource),
+        BlockKind::Paragraph(p) => collect_inline_images(&p.runs, out),
+        BlockKind::Heading(h) => collect_inline_images(&h.para.runs, out),
+        BlockKind::List(list) => {
+            for item in &list.items {
+                for b in &item.blocks {
+                    collect_block_images(b, out);
+                }
+            }
+        }
+        BlockKind::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for b in &cell.blocks {
+                        collect_block_images(b, out);
+                    }
+                }
+            }
+        }
+        BlockKind::TextBox(tb) => {
+            for b in &tb.blocks {
+                collect_block_images(b, out);
+            }
+        }
+        BlockKind::Blockquote(bq) => {
+            for b in &bq.blocks {
+                collect_block_images(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Append the image resource hashes inside a run of [`Inline`]s to `out`.
+fn collect_inline_images(runs: &[Inline], out: &mut Vec<u64>) {
+    for inline in runs {
+        match inline {
+            Inline::Image(img) => out.push(img.resource),
+            Inline::Link { children, .. } => collect_inline_images(children, out),
+            _ => {}
         }
     }
 }
@@ -207,27 +298,45 @@ fn block_signature(block: &Block) -> Option<String> {
 /// chapter headings does not collapse to one false-positive signature.
 const PAGE_NUMBER_MAX_LETTERS: usize = 6;
 
+/// The longest digit run that may be folded as a page number (gap #75, sub-item
+/// 12). Page numbers are short; a longer run is a year-range, an account/ISBN, a
+/// reference id — folding *those* would let two distinct numeric strings collapse
+/// onto one `#` signature and be wrongly clustered as furniture, so they are kept
+/// verbatim.
+const PAGE_NUMBER_MAX_DIGITS: usize = 4;
+
 /// Collapse `raw` to a signature that clusters the *same* furniture across pages:
 /// ASCII-lowercased with whitespace collapsed to single spaces, and — *only when
 /// the block is dominated by the number* (≤ [`PAGE_NUMBER_MAX_LETTERS`] letters,
-/// the page-number case) — every digit run folded to `#`. A running title that
-/// merely repeats verbatim already matches without folding; this keeps it from
-/// also swallowing distinct numbered headings.
+/// the page-number case) — every **short** digit run (≤ [`PAGE_NUMBER_MAX_DIGITS`])
+/// folded to `#`. A running title that merely repeats verbatim already matches
+/// without folding; the letter guard keeps it from swallowing distinct numbered
+/// headings, and the digit-length guard keeps a long number (year-range, id) from
+/// folding into a page-number-shaped signature.
 fn normalize_text(raw: &str) -> String {
     let fold_digits = raw.chars().filter(|c| c.is_alphabetic()).count() <= PAGE_NUMBER_MAX_LETTERS;
+    let chars: Vec<char> = raw.chars().collect();
     let mut out = String::with_capacity(raw.len());
     let mut last_was_space = true; // trims leading whitespace
-    let mut in_digits = false;
-    for ch in raw.chars() {
-        if fold_digits && ch.is_ascii_digit() {
-            if !in_digits {
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_ascii_digit() {
+            // Consume the whole digit run, then decide whether to fold it.
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let run_len = i - start;
+            if fold_digits && run_len <= PAGE_NUMBER_MAX_DIGITS {
                 out.push('#');
-                in_digits = true;
+            } else {
+                // A long run (or a digit-rich title) keeps its digits verbatim.
+                out.extend(chars[start..i].iter());
             }
             last_was_space = false;
             continue;
         }
-        in_digits = false;
         if ch.is_whitespace() {
             if !last_was_space {
                 out.push(' ');
@@ -237,6 +346,7 @@ fn normalize_text(raw: &str) -> String {
             out.extend(ch.to_lowercase());
             last_was_space = false;
         }
+        i += 1;
     }
     while out.ends_with(' ') {
         out.pop();
@@ -561,5 +671,68 @@ mod tests {
         assert_eq!(normalize_text("  3 "), "#");
         // Distinct prose does NOT collapse.
         assert_ne!(normalize_text("Chapter 1 Title"), normalize_text("Summary"));
+    }
+
+    #[test]
+    fn digit_fold_guard_keeps_long_numbers_verbatim() {
+        // Short page-number runs (≤ 4 digits) fold and cluster…
+        assert_eq!(normalize_text("Page 4567"), "page #");
+        assert_eq!(normalize_text("Page 4567"), normalize_text("Page 12"));
+        // …but a LONG digit run is kept verbatim (a year-range, an id, an ISBN),
+        // so two distinct long-number footers do NOT collapse to one signature
+        // (gap #75 #12).
+        assert_eq!(normalize_text("Ref 12345678"), "ref 12345678");
+        assert_ne!(normalize_text("Ref 12345678"), normalize_text("Ref 87654321"));
+    }
+
+    #[test]
+    fn strips_running_logo_image() {
+        // A logo image repeated at the top of every page is running furniture even
+        // though it carries no text (gap #75 #10): it is lifted to the section
+        // header and removed from every body.
+        let logo = |id: u64| Block {
+            id: BlockId(id),
+            frame: Some(Rect::new(60.0, 20.0, 120.0, 40.0)),
+            rotation: Default::default(),
+            kind: BlockKind::Image(crate::model::ImageRef {
+                resource: 0xABCD,
+                alt: None,
+            }),
+        };
+        let mut pages = Vec::new();
+        for n in 1..=3u64 {
+            pages.push(Page {
+                blocks: vec![
+                    logo(n * 10),
+                    para_block(
+                        n * 10 + 1,
+                        &format!("Unique body prose on page {n}."),
+                        60.0,
+                        400.0,
+                        470.0,
+                        14.0,
+                    ),
+                ],
+                absolute: false,
+            });
+        }
+        let mut section = Section {
+            geometry: geom(),
+            header: None,
+            footer: None,
+            pages,
+        };
+        strip_running_furniture(std::slice::from_mut(&mut section));
+
+        let header = section.header.expect("logo header detected");
+        assert_eq!(header.len(), 1, "one representative logo lifted");
+        assert!(
+            matches!(header[0].kind, BlockKind::Image(_)),
+            "the lifted header is the logo image"
+        );
+        for (i, page) in section.pages.iter().enumerate() {
+            assert_eq!(page.blocks.len(), 1, "page {i} keeps only its body block");
+            assert!(block_text(&page.blocks[0]).contains("Unique body prose"));
+        }
     }
 }
