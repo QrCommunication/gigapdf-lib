@@ -213,9 +213,22 @@ content, is left untouched (header/footer `None`, body unchanged) — real
 first-page content is never stripped. The lift runs before the heading-outline
 fallback, so furniture never pollutes the table of contents either.
 
+**Heading levels (clustered, stable):** a paragraph that is short and visually
+prominent (font above the body size, or bold-and-short) is promoted to a heading,
+and its **level** (`h1`..`h6`) now comes from **clustering the distinct
+heading-candidate font sizes actually present** on the page — not fixed global
+size ratios. The distinct sizes are sorted descending and grouped within a small
+relative tolerance (sizes within ~6 % collapse to one level); the largest cluster
+maps to `h1`, the next to `h2`, and so on, **monotonically with no skipped
+levels** (a 24/18/14-over-11 pt document yields `h1/h2/h3`, never `h1/h3/h4`). A
+heading only ~1.15× the body is detected as a heading (not missed, not forced to
+`h6`); a bold run-in subhead at body size lands on the **deepest present** level
+rather than always `h6`; a document with a single heading size yields one
+consistent level for all. Body prose never enters the hierarchy, so ordinary text
+is never promoted.
+
 **Limits on arbitrary third-party PDFs (tracked in [#5](../../issues/5)):**
 
-- **Heading levels** use fixed size buckets → can be non-monotonic / skip levels.
 - **Tables**: no header-row (`<th>`) concept; borderless merged cells forced 1×1;
   very sparse / very wide (>14 cols) / very long (>160 cells) / rotated tables are
   dropped.

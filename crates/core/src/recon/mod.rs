@@ -515,6 +515,10 @@ pub fn reconstruct_page(
     //    the reading order by region/column/Y instead of trailing all the text.
     let lines = lines::group_into_lines(&text_runs);
     let body = body_font_size(&text_runs, 12.0);
+    // Cluster the distinct heading-candidate sizes present on the page once, so
+    // heading promotion maps the document's real size hierarchy to stable,
+    // monotonic levels (H1, H2, …) instead of fixed global ratio buckets.
+    let heading_levels = headings::HeadingLevels::from_lines(&lines, body);
     let layout = columns::column_layout(&lines);
     let order = layout.order_lines(&lines);
 
@@ -546,9 +550,16 @@ pub fn reconstruct_page(
     // Resolve the pending text-line placeholders into paragraphs/headings/lists.
     // The page's MediaBox left (`x0`) anchors recovered left-indents; `links`
     // flow down so covered prose runs become `Inline::Link`.
-    let blocks = resolve_text_blocks(blocks, &lines, body, x0, links, ids, |x, y, w, h| {
-        frame_top_down(x, y, w, h, x0, y0, page_h)
-    });
+    let blocks = resolve_text_blocks(
+        blocks,
+        &lines,
+        body,
+        &heading_levels,
+        x0,
+        links,
+        ids,
+        |x, y, w, h| frame_top_down(x, y, w, h, x0, y0, page_h),
+    );
 
     let mut out = blocks;
 
@@ -887,6 +898,7 @@ fn resolve_text_blocks(
     blocks: Vec<Block>,
     lines: &[lines::ReconLine],
     body: f64,
+    heading_levels: &headings::HeadingLevels,
     page_left: f64,
     links: &[ParaLink],
     ids: &mut IdGen,
@@ -900,7 +912,15 @@ fn resolve_text_blocks(
             return;
         }
         let group: Vec<&lines::ReconLine> = pending.iter().map(|&i| &lines[i]).collect();
-        let text_blocks = lower_text_group(&group, body, page_left, links, ids, to_frame);
+        let text_blocks = lower_text_group(
+            &group,
+            body,
+            heading_levels,
+            page_left,
+            links,
+            ids,
+            to_frame,
+        );
         out.extend(text_blocks);
         pending.clear();
     };
@@ -924,6 +944,7 @@ fn resolve_text_blocks(
 fn lower_text_group(
     group: &[&lines::ReconLine],
     body: f64,
+    heading_levels: &headings::HeadingLevels,
     page_left: f64,
     links: &[ParaLink],
     ids: &mut IdGen,
@@ -959,7 +980,7 @@ fn lower_text_group(
                         paragraphs::build_paragraph_styled(&para_lines, &ctx, ids, to_frame);
                     // Remember this paragraph's bottom for the next one's gap.
                     prev_bottom = Some(paragraphs::paragraph_bottom(&para_lines));
-                    out.push(headings::promote(block, body));
+                    out.push(headings::promote(block, body, heading_levels));
                 }
             }
         }
