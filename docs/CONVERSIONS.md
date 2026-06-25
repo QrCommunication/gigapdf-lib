@@ -426,6 +426,41 @@ re-encoded to PNG (the model/render/export carry no metafile rasterizer), while
 GIF/BMP/TIFF/SVG are kept verbatim with their true format tag instead of being
 dropped or mis-tagged.
 
+**Raster image embedding (`content::image::prepare_image`, the `add_image` /
+`replace_image` path):** a raster placed into a PDF as an `/Image` XObject is
+sniffed by **magic bytes** and lowered with zero new dependencies
+([#74](../../issues/74)):
+
+- **JPEG** is embedded **verbatim** under `/DCTDecode` — viewers decode
+  baseline/progressive JPEG natively, so only the SOF marker is parsed for size +
+  component count (1→`/DeviceGray`, 3→`/DeviceRGB`, 4→`/DeviceCMYK`; an Adobe
+  APP14 marker on a 4-component frame flags inverted ink → `/Decode [1 0 …]`).
+  Since JPEG carries no alpha, an **optional companion soft mask** may be supplied
+  (`prepare_jpeg_with_smask`): any supported raster is decoded to an **8-bit
+  `/DeviceGray` `/SMask`** (its alpha channel, or its Rec. 601 luma when the mask
+  has none) and attached; an undecodable mask is ignored rather than failing the
+  embed.
+- **PNG** is decoded in-house ([`raster::png_decode`](../crates/core/src/raster/png_decode.rs))
+  to RGBA, then split into a `/DeviceRGB` `/FlateDecode` colour stream plus a
+  `/DeviceGray` `/SMask` when any pixel is non-opaque. **Every spec-conformant
+  variant** is accepted — colour types 0/2/3/4/6, bit depths **1/2/4/8 and 16**
+  (16-bit samples scaled to 8-bit per channel), **non-interlaced and
+  Adam7-interlaced** layouts, and `tRNS` colour-key / palette transparency — so
+  16-bit and interlaced PNGs that were previously rejected now embed. Each chunk's
+  stored **CRC-32 is verified** (`crc32(type ++ data)`); a mismatch rejects the
+  file. **APNG** animation chunks are understood: `decode_png` returns the
+  spec-mandated **default image** (the IDAT still), and `decode_apng_frames`
+  returns the **full composited sequence** honouring each frame's region, dispose
+  op (none / background / previous) and blend op (source / over) plus its delay.
+- **WebP** ([`raster::webp`](../crates/core/src/raster/webp.rs), lossy VP8 +
+  lossless VP8L), **GIF** ([`raster::gif`](../crates/core/src/raster/gif.rs), the
+  first composited frame) and **TIFF** (an in-house baseline strip reader:
+  little-/big-endian, 8-bit samples, grayscale / RGB / RGBA-with-`ExtraSamples` /
+  palette, **Uncompressed / LZW / Deflate** strips, the horizontal-differencing
+  **Predictor 2**) are each decoded to RGBA and lowered through the **same**
+  `/DeviceRGB` + optional `/SMask` path as PNG. Tiled / JPEG-in-TIFF / CMYK /
+  >8-bit TIFFs remain out of scope.
+
 **Vertical writing mode (CJK, ISO 32000-1 §9.4.4 / §9.7.4.3):** a composite
 (Type0) font whose `/Encoding` CMap selects vertical writing — a predefined `-V`
 name (`Identity-V`, `UniJIS-UCS2-V`, …) **or** an embedded CMap stream declaring

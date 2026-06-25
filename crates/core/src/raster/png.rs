@@ -7,7 +7,10 @@
 //! later without changing the interface.
 
 /// CRC-32 (IEEE, polynomial `0xEDB88320`) over `data`, as PNG chunks require.
-fn crc32(data: &[u8]) -> u32 {
+///
+/// Shared with the decoder ([`crate::raster::png_decode`]), which verifies each
+/// chunk's stored CRC against `crc32(type ++ data)`.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
         crc ^= byte as u32;

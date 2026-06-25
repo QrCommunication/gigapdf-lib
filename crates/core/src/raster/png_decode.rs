@@ -8,11 +8,20 @@
 //! * bit depths 1, 2, 4, 8 and 16 (16-bit samples are scaled down to 8-bit);
 //! * both non-interlaced and Adam7-interlaced layouts;
 //! * `tRNS` transparency for palette (3) and the single transparent colour key
-//!   of greyscale (0) and truecolour (2) images.
+//!   of greyscale (0) and truecolour (2) images;
+//! * **APNG** animation chunks (`acTL`/`fcTL`/`fdAT`, the PNG animation
+//!   extension): [`decode_png`] returns the fully-composited default image
+//!   (the static fallback the spec defines), while [`decode_apng_frames`]
+//!   returns the whole composited frame sequence honouring each frame's
+//!   region, dispose op and blend op.
+//!
+//! Every chunk's stored CRC-32 is verified against `crc32(type ++ data)`; a
+//! mismatch rejects the file.
 //!
 //! Returns `None` on any malformed or out-of-spec input — never panics.
 
 use crate::filters::inflate::flate_decode;
+use crate::raster::png::crc32;
 
 // ─── Public API ────────────────────────────────────────────────────────────
 
@@ -27,11 +36,155 @@ pub struct DecodedImage {
     pub rgba: Vec<u8>,
 }
 
+/// One composited frame of an APNG animation: the full logical canvas as it
+/// appears while this frame is shown, plus the authored display duration.
+#[derive(Debug, Clone)]
+pub struct ApngFrame {
+    /// Canvas width (the IHDR width — same for every frame).
+    pub width: u32,
+    /// Canvas height (the IHDR height — same for every frame).
+    pub height: u32,
+    /// Composited RGBA pixels (`width * height * 4`).
+    pub rgba: Vec<u8>,
+    /// Display duration in milliseconds, from the `fcTL` `delay_num/delay_den`
+    /// fraction of seconds (a `delay_den` of 0 means 1/100 s per the spec).
+    pub delay_ms: u32,
+}
+
+/// A decoded APNG animation: the canvas size and every composited frame in
+/// display order. A plain (non-animated) PNG is *not* one of these — use
+/// [`decode_png`] for the static image.
+#[derive(Debug, Clone)]
+pub struct ApngAnimation {
+    pub width: u32,
+    pub height: u32,
+    pub frames: Vec<ApngFrame>,
+}
+
 /// Decode a PNG byte slice into an RGBA8 image.
 ///
+/// For an APNG, this returns the **default image** — the frames the IDAT carries
+/// — which the spec mandates be a valid standalone still (whether or not it is
+/// part of the animation). Use [`decode_apng_frames`] for the moving sequence.
+///
 /// Returns `None` if the input is not a valid PNG, uses an unsupported
-/// colour-type/bit-depth combination, or is malformed in any way.
+/// colour-type/bit-depth combination, fails CRC verification, or is malformed
+/// in any way.
 pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
+    let parsed = parse_chunks(bytes)?;
+    // The IDAT default image always spans the full canvas at the origin.
+    let rgba = decode_grid(&parsed, &parsed.idat_raw, parsed.width, parsed.height)?;
+    Some(DecodedImage {
+        width: parsed.width,
+        height: parsed.height,
+        rgba,
+    })
+}
+
+/// Decode the **full APNG animation** (every `fcTL`/`fdAT` frame composited onto
+/// the logical canvas in display order, honouring each frame's region, dispose
+/// op and blend op). Returns `None` when `bytes` is not an APNG (no `acTL`), or
+/// is malformed.
+///
+/// Per the APNG spec, the IDAT may or may not be the animation's first frame:
+/// when an `fcTL` precedes the IDAT, the IDAT *is* frame 0; otherwise the IDAT
+/// is a non-displayed default image and the animation starts at the first
+/// `fdAT`-backed frame. Both cases are handled.
+pub fn decode_apng_frames(bytes: &[u8]) -> Option<ApngAnimation> {
+    let parsed = parse_chunks(bytes)?;
+    if !parsed.is_apng || parsed.frames.is_empty() {
+        return None;
+    }
+
+    let w = parsed.width as usize;
+    let h = parsed.height as usize;
+    // Persistent logical-screen canvas, composited frame after frame.
+    let mut canvas = vec![0u8; w * h * 4];
+    let mut out: Vec<ApngFrame> = Vec::with_capacity(parsed.frames.len());
+
+    for fr in &parsed.frames {
+        // Decode this frame's own sub-image grid (`fr.width × fr.height`).
+        let sub = decode_grid(&parsed, &fr.data, fr.width, fr.height)?;
+
+        // Snapshot for a "restore previous" dispose op (taken before painting).
+        let prev = (fr.dispose == DISPOSE_PREVIOUS).then(|| canvas.clone());
+
+        // Composite the sub-image into the canvas at (x_offset, y_offset).
+        blit_frame(&mut canvas, parsed.width, parsed.height, &sub, fr);
+
+        out.push(ApngFrame {
+            width: parsed.width,
+            height: parsed.height,
+            rgba: canvas.clone(),
+            delay_ms: frame_delay_ms(fr.delay_num, fr.delay_den),
+        });
+
+        // Apply the dispose op to prepare the canvas for the next frame.
+        match fr.dispose {
+            DISPOSE_BACKGROUND => clear_region(&mut canvas, parsed.width, fr),
+            DISPOSE_PREVIOUS => {
+                if let Some(p) = prev {
+                    canvas = p;
+                }
+            }
+            _ => {} // DISPOSE_NONE: leave the frame in place.
+        }
+    }
+
+    Some(ApngAnimation {
+        width: parsed.width,
+        height: parsed.height,
+        frames: out,
+    })
+}
+
+// ─── Internals ───────────────────────────────────────────────────────────────
+
+// APNG `fcTL` dispose ops (byte at offset 24). Op 0 (DISPOSE_NONE — leave the
+// frame in place) is the implicit default and needs no named constant.
+const DISPOSE_BACKGROUND: u8 = 1; // clear the frame's rect to transparent
+const DISPOSE_PREVIOUS: u8 = 2; // revert the rect to the pre-frame canvas
+                                // APNG `fcTL` blend op (byte at offset 25). Op 0 (BLEND_SOURCE — overwrite,
+                                // alpha included) is the `else` default; only OVER needs a named constant.
+const BLEND_OVER: u8 = 1; // source-over alpha composite
+
+/// One APNG frame's control (`fcTL`) fields plus its concatenated image data
+/// (the IDAT bytes for an IDAT-backed first frame, or the `fdAT` payloads with
+/// their 4-byte sequence numbers already stripped).
+struct ApngRawFrame {
+    width: u32,
+    height: u32,
+    x_offset: u32,
+    y_offset: u32,
+    delay_num: u16,
+    delay_den: u16,
+    dispose: u8,
+    blend: u8,
+    /// zlib-compressed scanline data for this frame's own `width × height` grid.
+    data: Vec<u8>,
+}
+
+/// Everything `decode_png`/`decode_apng_frames` need after one walk of the
+/// chunk stream: the IHDR geometry, palette/transparency, the default-image
+/// IDAT bytes, and (for an APNG) the per-frame control + data.
+struct ParsedPng {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+    interlace: u8,
+    palette: Vec<[u8; 3]>,
+    trns: Vec<u8>,
+    trns_grey: Option<u16>,
+    trns_rgb: Option<[u16; 3]>,
+    idat_raw: Vec<u8>,
+    is_apng: bool,
+    frames: Vec<ApngRawFrame>,
+}
+
+/// Walk every chunk once: verify each CRC, validate the IHDR, and gather the
+/// palette, transparency, default-image IDAT and APNG animation chunks.
+fn parse_chunks(bytes: &[u8]) -> Option<ParsedPng> {
     // ── 1. Signature ────────────────────────────────────────────────────
     let sig = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     if bytes.get(..8)? != sig {
@@ -50,6 +203,13 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
     let mut idat_raw: Vec<u8> = Vec::new();
     let mut ihdr_seen = false;
 
+    // APNG state. `is_apng` is set by `acTL`; frames accrue from `fcTL`/`fdAT`.
+    // An `fcTL` *before* the first IDAT means the IDAT is frame 0 — we route the
+    // IDAT bytes into that frame's `data` once IEND is reached.
+    let mut is_apng = false;
+    let mut frames: Vec<ApngRawFrame> = Vec::new();
+    let mut idat_is_frame0 = false;
+
     loop {
         // Each chunk: 4-byte length + 4-byte type + data + 4-byte CRC.
         let len = u32::from_be_bytes(*bytes.get(pos..pos + 4)?.first_chunk::<4>()?) as usize;
@@ -58,8 +218,16 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
         pos += 4;
         let data = bytes.get(pos..pos + len)?;
         pos += len;
-        let _crc = bytes.get(pos..pos + 4)?; // skip CRC verification
+        let crc = u32::from_be_bytes(*bytes.get(pos..pos + 4)?.first_chunk::<4>()?);
         pos += 4;
+
+        // CRC-32 covers the chunk *type* followed by its *data* (not the length).
+        let mut crc_input = Vec::with_capacity(4 + len);
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        if crc32(&crc_input) != crc {
+            return None;
+        }
 
         match kind {
             b"IHDR" => {
@@ -83,6 +251,34 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
             }
             b"tRNS" => {
                 trns = data.to_vec();
+            }
+            b"acTL" => {
+                // Animation control: presence marks the file as an APNG.
+                is_apng = true;
+            }
+            b"fcTL" => {
+                // Frame control (26 bytes): seq(4) w(4) h(4) x(4) y(4)
+                // delay_num(2) delay_den(2) dispose(1) blend(1).
+                let f = parse_fctl(data)?;
+                // If this fcTL appears before any IDAT, the upcoming IDAT is
+                // this (first) frame's data — record that and push the frame now
+                // so its `data` gets filled at IEND.
+                if !ihdr_seen {
+                    return None;
+                }
+                if idat_raw.is_empty() && !idat_is_frame0 && frames.is_empty() {
+                    idat_is_frame0 = true;
+                }
+                frames.push(f);
+            }
+            b"fdAT" => {
+                // Frame data: a 4-byte sequence number then raw IDAT-style bytes.
+                let payload = data.get(4..)?;
+                if let Some(last) = frames.last_mut() {
+                    last.data.extend_from_slice(payload);
+                } else {
+                    return None; // fdAT with no preceding fcTL is malformed
+                }
             }
             b"IDAT" => {
                 idat_raw.extend_from_slice(data);
@@ -120,10 +316,24 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
         return None;
     }
 
-    // ── 4. Decompress IDAT ──────────────────────────────────────────────
-    let raw = flate_decode(&idat_raw).ok()?;
+    // The IDAT must decode as a still (the spec requires it), so it can't be
+    // empty for a valid file.
+    if idat_raw.is_empty() {
+        return None;
+    }
 
-    // ── 5. Transparency colour key (greyscale / truecolour) ─────────────
+    // If the first fcTL precedes the IDAT, frame 0 *is* the IDAT image — clone
+    // the IDAT bytes into that frame's data so the animation walker can decode
+    // it like any other frame.
+    if is_apng && idat_is_frame0 {
+        if let Some(first) = frames.first_mut() {
+            if first.data.is_empty() {
+                first.data = idat_raw.clone();
+            }
+        }
+    }
+
+    // ── 4. Transparency colour key (greyscale / truecolour) ─────────────
     // tRNS for type 0 holds one 16-bit grey sample; for type 2, three 16-bit
     // R/G/B samples. We compare against the *pre-scale* sample values.
     let trns_grey: Option<u16> = if color_type == 0 && trns.len() >= 2 {
@@ -141,59 +351,181 @@ pub fn decode_png(bytes: &[u8]) -> Option<DecodedImage> {
         None
     };
 
-    let ctx = ImageCtx {
-        color_type,
-        bit_depth,
-        palette: &palette,
-        trns: &trns,
-        trns_grey,
-        trns_rgb,
-    };
-
-    // ── 6. Decode passes into the RGBA grid ─────────────────────────────
-    let mut rgba = vec![0u8; pixel_count * 4];
-    let mut offset = 0usize; // consumed bytes of `raw`
-
-    if interlace == 0 {
-        decode_pass(
-            &raw,
-            &mut offset,
-            &ctx,
-            width,
-            height,
-            &mut rgba,
-            width,
-            |x, y| (x, y),
-        )?;
-    } else {
-        // Adam7: 7 passes, each a sparse sub-image mapped onto the full grid.
-        for &(x0, y0, dx, dy) in &ADAM7 {
-            let pw = pass_count(width, x0, dx);
-            let ph = pass_count(height, y0, dy);
-            if pw == 0 || ph == 0 {
-                continue;
-            }
-            decode_pass(
-                &raw,
-                &mut offset,
-                &ctx,
-                pw,
-                ph,
-                &mut rgba,
-                width,
-                |px, py| (x0 + px * dx, y0 + py * dy),
-            )?;
-        }
-    }
-
-    Some(DecodedImage {
+    Some(ParsedPng {
         width,
         height,
-        rgba,
+        bit_depth,
+        color_type,
+        interlace,
+        palette,
+        trns,
+        trns_grey,
+        trns_rgb,
+        idat_raw,
+        is_apng,
+        frames,
     })
 }
 
-// ─── Internals ───────────────────────────────────────────────────────────────
+/// Parse a 26-byte `fcTL` chunk into an [`ApngRawFrame`] (with empty `data`).
+fn parse_fctl(data: &[u8]) -> Option<ApngRawFrame> {
+    if data.len() < 26 {
+        return None;
+    }
+    let w = u32::from_be_bytes(*data.get(4..8)?.first_chunk::<4>()?);
+    let h = u32::from_be_bytes(*data.get(8..12)?.first_chunk::<4>()?);
+    let x = u32::from_be_bytes(*data.get(12..16)?.first_chunk::<4>()?);
+    let y = u32::from_be_bytes(*data.get(16..20)?.first_chunk::<4>()?);
+    let delay_num = u16::from_be_bytes([*data.get(20)?, *data.get(21)?]);
+    let delay_den = u16::from_be_bytes([*data.get(22)?, *data.get(23)?]);
+    let dispose = *data.get(24)?;
+    let blend = *data.get(25)?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(ApngRawFrame {
+        width: w,
+        height: h,
+        x_offset: x,
+        y_offset: y,
+        delay_num,
+        delay_den,
+        dispose,
+        blend,
+        data: Vec::new(),
+    })
+}
+
+/// Convert an APNG `delay_num/delay_den` fraction of seconds to milliseconds.
+/// Per spec, `delay_den == 0` is treated as 100 (i.e. the unit is 1/100 s).
+fn frame_delay_ms(num: u16, den: u16) -> u32 {
+    let den = if den == 0 { 100 } else { den as u32 };
+    (num as u32 * 1000) / den
+}
+
+/// Composite a decoded sub-image (`fr.width × fr.height` RGBA) onto `canvas`
+/// (the full `cw × ch` logical screen) at `(fr.x_offset, fr.y_offset)`, using
+/// the frame's blend op (source = overwrite, over = alpha composite). Pixels
+/// that fall outside the canvas are clipped.
+fn blit_frame(canvas: &mut [u8], cw: u32, ch: u32, sub: &[u8], fr: &ApngRawFrame) {
+    let (cw, ch) = (cw as usize, ch as usize);
+    let (fw, fh) = (fr.width as usize, fr.height as usize);
+    let (ox, oy) = (fr.x_offset as usize, fr.y_offset as usize);
+    for sy in 0..fh {
+        let dy = oy + sy;
+        if dy >= ch {
+            break;
+        }
+        for sx in 0..fw {
+            let dx = ox + sx;
+            if dx >= cw {
+                break;
+            }
+            let s = (sy * fw + sx) * 4;
+            let d = (dy * cw + dx) * 4;
+            let src = [sub[s], sub[s + 1], sub[s + 2], sub[s + 3]];
+            if fr.blend == BLEND_OVER {
+                composite_over(&mut canvas[d..d + 4], src);
+            } else {
+                // BLEND_SOURCE (0) and any unknown value: overwrite outright.
+                canvas[d..d + 4].copy_from_slice(&src);
+            }
+        }
+    }
+}
+
+/// Source-over alpha composite of `src` (straight-alpha RGBA) onto `dst`.
+fn composite_over(dst: &mut [u8], src: [u8; 4]) {
+    let sa = src[3] as u32;
+    if sa == 255 {
+        dst.copy_from_slice(&src);
+        return;
+    }
+    if sa == 0 {
+        return;
+    }
+    let da = dst[3] as u32;
+    // out_a = sa + da*(1-sa); out_c = (sc*sa + dc*da*(1-sa)) / out_a   (0..255).
+    let inv = 255 - sa;
+    let out_a = sa + da * inv / 255;
+    if out_a == 0 {
+        for b in dst.iter_mut() {
+            *b = 0;
+        }
+        return;
+    }
+    for c in 0..3 {
+        let sc = src[c] as u32;
+        let dc = dst[c] as u32;
+        dst[c] = ((sc * sa + dc * da * inv / 255) / out_a) as u8;
+    }
+    dst[3] = out_a as u8;
+}
+
+/// Clear the frame's own rectangle in `canvas` back to fully transparent (the
+/// "restore to background" dispose op).
+fn clear_region(canvas: &mut [u8], cw: u32, fr: &ApngRawFrame) {
+    let cw = cw as usize;
+    let (fw, fh) = (fr.width as usize, fr.height as usize);
+    let (ox, oy) = (fr.x_offset as usize, fr.y_offset as usize);
+    let ch = canvas.len() / (cw.max(1) * 4);
+    for sy in 0..fh {
+        let dy = oy + sy;
+        if dy >= ch {
+            break;
+        }
+        for sx in 0..fw {
+            let dx = ox + sx;
+            if dx >= cw {
+                break;
+            }
+            let d = (dy * cw + dx) * 4;
+            canvas[d..d + 4].copy_from_slice(&[0, 0, 0, 0]);
+        }
+    }
+}
+
+/// Decompress and decode one image grid (`gw × gh`) from `compressed` zlib bytes
+/// using the parsed colour/depth/interlace context. Used for both the IDAT
+/// default image and each APNG frame's own sub-image.
+fn decode_grid(p: &ParsedPng, compressed: &[u8], gw: u32, gh: u32) -> Option<Vec<u8>> {
+    let pixel_count = (gw as usize).checked_mul(gh as usize)?;
+    if pixel_count == 0 || pixel_count > 64 * 1024 * 1024 {
+        return None;
+    }
+    let raw = flate_decode(compressed).ok()?;
+
+    let ctx = ImageCtx {
+        color_type: p.color_type,
+        bit_depth: p.bit_depth,
+        palette: &p.palette,
+        trns: &p.trns,
+        trns_grey: p.trns_grey,
+        trns_rgb: p.trns_rgb,
+    };
+
+    let mut rgba = vec![0u8; pixel_count * 4];
+    let mut offset = 0usize; // consumed bytes of `raw`
+
+    if p.interlace == 0 {
+        decode_pass(&raw, &mut offset, &ctx, gw, gh, &mut rgba, gw, |x, y| {
+            (x, y)
+        })?;
+    } else {
+        // Adam7: 7 passes, each a sparse sub-image mapped onto the full grid.
+        for &(x0, y0, dx, dy) in &ADAM7 {
+            let pw = pass_count(gw, x0, dx);
+            let ph = pass_count(gh, y0, dy);
+            if pw == 0 || ph == 0 {
+                continue;
+            }
+            decode_pass(&raw, &mut offset, &ctx, pw, ph, &mut rgba, gw, |px, py| {
+                (x0 + px * dx, y0 + py * dy)
+            })?;
+        }
+    }
+    Some(rgba)
+}
 
 /// Colour information shared across interlace passes.
 struct ImageCtx<'a> {
@@ -700,6 +1032,302 @@ mod tests {
         assert!(
             decode_png(&png).is_none(),
             "palette@16-bit must be rejected"
+        );
+    }
+
+    // ── #47: CRC-32 chunk verification ─────────────────────────────────────
+
+    #[test]
+    fn rejects_corrupt_chunk_crc() {
+        // A valid PNG, then a single byte flipped inside the IDAT *data* (not the
+        // CRC field), so the stored CRC no longer matches `crc32(type ++ data)`.
+        let rgba = [10u8, 20, 30, 255, 40, 50, 60, 255];
+        let mut png = encode_png(2, 1, &rgba);
+        assert!(decode_png(&png).is_some(), "baseline must decode");
+
+        // Locate the IDAT chunk and corrupt its first data byte.
+        let idat = png.windows(4).position(|w| w == b"IDAT").unwrap();
+        let data_start = idat + 4; // first byte of the IDAT data
+        png[data_start] ^= 0xFF;
+        assert!(
+            decode_png(&png).is_none(),
+            "a CRC mismatch must reject the file"
+        );
+    }
+
+    #[test]
+    fn accepts_correct_crc_roundtrip() {
+        // The engine's own encoder writes correct CRCs → must verify and decode.
+        let rgba = [1u8, 2, 3, 255, 4, 5, 6, 128, 7, 8, 9, 255, 10, 11, 12, 0];
+        let png = encode_png(2, 2, &rgba);
+        let img = decode_png(&png).expect("correct-CRC PNG must decode");
+        assert_eq!(img.rgba, rgba);
+    }
+
+    // ── #48: APNG (acTL / fcTL / fdAT) ─────────────────────────────────────
+
+    /// Build the `acTL` animation-control chunk (frame count + play count).
+    fn actl(num_frames: u32, num_plays: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut d = Vec::new();
+        d.extend_from_slice(&num_frames.to_be_bytes());
+        d.extend_from_slice(&num_plays.to_be_bytes());
+        chunk(&mut out, b"acTL", &d);
+        out
+    }
+
+    /// Build an `fcTL` frame-control chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn fctl(
+        seq: u32,
+        w: u32,
+        h: u32,
+        x: u32,
+        y: u32,
+        delay_num: u16,
+        delay_den: u16,
+        dispose: u8,
+        blend: u8,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut d = Vec::new();
+        d.extend_from_slice(&seq.to_be_bytes());
+        d.extend_from_slice(&w.to_be_bytes());
+        d.extend_from_slice(&h.to_be_bytes());
+        d.extend_from_slice(&x.to_be_bytes());
+        d.extend_from_slice(&y.to_be_bytes());
+        d.extend_from_slice(&delay_num.to_be_bytes());
+        d.extend_from_slice(&delay_den.to_be_bytes());
+        d.push(dispose);
+        d.push(blend);
+        chunk(&mut out, b"fcTL", &d);
+        out
+    }
+
+    /// Build an `fdAT` frame-data chunk: 4-byte seq + zlib-stored scanlines.
+    fn fdat(seq: u32, idat_uncompressed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut d = Vec::new();
+        d.extend_from_slice(&seq.to_be_bytes());
+        d.extend_from_slice(&zlib_store(idat_uncompressed));
+        chunk(&mut out, b"fdAT", &d);
+        out
+    }
+
+    /// One filter-0 scanline buffer for an 8-bit RGBA `w×h` solid colour.
+    fn solid_rgba_scanlines(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+        // Build a single row (filter byte 0 + `w` copies of `px`) then repeat it.
+        let mut row = vec![0u8]; // filter None
+        for _ in 0..w {
+            row.extend_from_slice(&px);
+        }
+        row.repeat(h as usize)
+    }
+
+    /// Assemble an APNG: IHDR (8-bit RGBA) + acTL + (fcTL/IDAT for frame 0) +
+    /// (fcTL/fdAT for each extra frame) + IEND.
+    fn make_apng(canvas_w: u32, canvas_h: u32, frames: &[ApngTestFrame]) -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&canvas_w.to_be_bytes());
+        ihdr.extend_from_slice(&canvas_h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, no interlace
+        chunk(&mut out, b"IHDR", &ihdr);
+        out.extend_from_slice(&actl(frames.len() as u32, 0));
+
+        let mut seq = 0u32;
+        for (i, f) in frames.iter().enumerate() {
+            out.extend_from_slice(&fctl(
+                seq, f.w, f.h, f.x, f.y, f.dnum, f.dden, f.dispose, f.blend,
+            ));
+            seq += 1;
+            let scan = solid_rgba_scanlines(f.w, f.h, f.px);
+            if i == 0 {
+                // Frame 0 lives in IDAT (an fcTL precedes the IDAT).
+                chunk(&mut out, b"IDAT", &zlib_store(&scan));
+            } else {
+                out.extend_from_slice(&fdat(seq, &scan));
+                seq += 1;
+            }
+        }
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    struct ApngTestFrame {
+        w: u32,
+        h: u32,
+        x: u32,
+        y: u32,
+        dnum: u16,
+        dden: u16,
+        dispose: u8,
+        blend: u8,
+        px: [u8; 4],
+    }
+
+    #[test]
+    fn apng_default_image_is_idat_via_decode_png() {
+        // The IDAT default image (frame 0) is a 2×2 red field. `decode_png` must
+        // return exactly that still, ignoring the later animation frame.
+        let frames = [
+            ApngTestFrame {
+                w: 2,
+                h: 2,
+                x: 0,
+                y: 0,
+                dnum: 1,
+                dden: 10,
+                dispose: 0,
+                blend: 0,
+                px: [255, 0, 0, 255],
+            },
+            ApngTestFrame {
+                w: 2,
+                h: 2,
+                x: 0,
+                y: 0,
+                dnum: 1,
+                dden: 10,
+                dispose: 0,
+                blend: 0,
+                px: [0, 0, 255, 255],
+            },
+        ];
+        let apng = make_apng(2, 2, &frames);
+        let img = decode_png(&apng).expect("APNG default image must decode via decode_png");
+        assert_eq!((img.width, img.height), (2, 2));
+        // Every pixel red (the IDAT frame), NOT blue (the second frame).
+        for px in img.rgba.chunks_exact(4) {
+            assert_eq!(px, &[255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn apng_two_full_frames_composited() {
+        // Two full-canvas frames (red then blue), each non-blended (source).
+        let frames = [
+            ApngTestFrame {
+                w: 2,
+                h: 2,
+                x: 0,
+                y: 0,
+                dnum: 1,
+                dden: 20,
+                dispose: 0,
+                blend: 0,
+                px: [255, 0, 0, 255],
+            },
+            ApngTestFrame {
+                w: 2,
+                h: 2,
+                x: 0,
+                y: 0,
+                dnum: 3,
+                dden: 20,
+                dispose: 0,
+                blend: 0,
+                px: [0, 0, 255, 255],
+            },
+        ];
+        let apng = make_apng(2, 2, &frames);
+        let anim = decode_apng_frames(&apng).expect("APNG must decode to frames");
+        assert_eq!((anim.width, anim.height), (2, 2));
+        assert_eq!(anim.frames.len(), 2);
+        // delay_ms = num*1000/den.
+        assert_eq!(anim.frames[0].delay_ms, 50); // 1/20 s
+        assert_eq!(anim.frames[1].delay_ms, 150); // 3/20 s
+        for px in anim.frames[0].rgba.chunks_exact(4) {
+            assert_eq!(px, &[255, 0, 0, 255], "frame 0 = red");
+        }
+        for px in anim.frames[1].rgba.chunks_exact(4) {
+            assert_eq!(px, &[0, 0, 255, 255], "frame 1 = blue overwrites red");
+        }
+    }
+
+    #[test]
+    fn apng_subregion_frame_composites_over_base() {
+        // 2×2 canvas. Frame 0: full red. Frame 1: a single opaque green pixel at
+        // (1,0) with BLEND_OVER, DISPOSE_NONE → only that pixel changes.
+        let frames = [
+            ApngTestFrame {
+                w: 2,
+                h: 2,
+                x: 0,
+                y: 0,
+                dnum: 1,
+                dden: 10,
+                dispose: 0,
+                blend: 0,
+                px: [255, 0, 0, 255],
+            },
+            ApngTestFrame {
+                w: 1,
+                h: 1,
+                x: 1,
+                y: 0,
+                dnum: 1,
+                dden: 10,
+                dispose: 0,
+                blend: 1,
+                px: [0, 255, 0, 255],
+            },
+        ];
+        let apng = make_apng(2, 2, &frames);
+        let anim = decode_apng_frames(&apng).expect("APNG frames");
+        let f1 = &anim.frames[1].rgba;
+        assert_eq!(&f1[0..4], &[255, 0, 0, 255], "(0,0) stays red");
+        assert_eq!(&f1[4..8], &[0, 255, 0, 255], "(1,0) painted green");
+        assert_eq!(&f1[8..12], &[255, 0, 0, 255], "(0,1) stays red");
+        assert_eq!(&f1[12..16], &[255, 0, 0, 255], "(1,1) stays red");
+    }
+
+    #[test]
+    fn apng_dispose_background_clears_region() {
+        // Frame 0: full red, DISPOSE_BACKGROUND (its rect cleared after). Frame 1:
+        // a 1×1 blue pixel at (0,0). After frame 0 disposes to background, the
+        // whole canvas is transparent, then frame 1 paints (0,0) blue → the rest
+        // is transparent.
+        let frames = [
+            ApngTestFrame {
+                w: 2,
+                h: 2,
+                x: 0,
+                y: 0,
+                dnum: 1,
+                dden: 10,
+                dispose: 1,
+                blend: 0,
+                px: [255, 0, 0, 255],
+            },
+            ApngTestFrame {
+                w: 1,
+                h: 1,
+                x: 0,
+                y: 0,
+                dnum: 1,
+                dden: 10,
+                dispose: 0,
+                blend: 0,
+                px: [0, 0, 255, 255],
+            },
+        ];
+        let apng = make_apng(2, 2, &frames);
+        let anim = decode_apng_frames(&apng).expect("APNG frames");
+        let f1 = &anim.frames[1].rgba;
+        assert_eq!(&f1[0..4], &[0, 0, 255, 255], "(0,0) blue");
+        assert_eq!(&f1[4..8], &[0, 0, 0, 0], "(1,0) cleared transparent");
+        assert_eq!(&f1[8..12], &[0, 0, 0, 0], "(0,1) cleared transparent");
+        assert_eq!(&f1[12..16], &[0, 0, 0, 0], "(1,1) cleared transparent");
+    }
+
+    #[test]
+    fn decode_apng_frames_rejects_plain_png() {
+        // A normal PNG has no acTL → not an animation.
+        let png = encode_png(1, 1, &[1, 2, 3, 255]);
+        assert!(
+            decode_apng_frames(&png).is_none(),
+            "a non-APNG must yield None"
         );
     }
 }
