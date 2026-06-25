@@ -22,6 +22,7 @@ pub mod md_import;
 pub mod metafile;
 pub mod office;
 pub mod office_import;
+pub mod ole_doc;
 pub mod ole_ppt;
 pub mod omml;
 pub mod pdfa;
