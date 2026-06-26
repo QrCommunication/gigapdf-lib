@@ -268,6 +268,17 @@ const ix = u32Arg([2, 5]); // hide unified elements #2 and #5 on page 1
 const minus = callBuffer((lp) =>
   ex.gp_render_page_excluding(handle, 1, ix.ptr, ix.count, 2.0, lp));
 freeArg(ix);
+
+// Background that ALSO drops a baked marked-content band in the same pass —
+// "GPHF" = the running header/footer baked by gp_set_header/gp_set_footer.
+// skip_text=1 → text-free; the band is shown only by rendering, so it never
+// doubles against the editable text overlay (the band is already excluded from
+// gp_page_elements/gp_page_text_runs by the /GPHF gate). SDK:
+// doc.renderPageExcludingMarkedContent(page, scale, skipText=true, marker="GPHF").
+const mk = strArg("GPHF");
+const noBand = callBuffer((lp) =>
+  ex.gp_render_page_excluding_marked_content(handle, 1, 2.0, 1, mk.ptr, mk.len, lp));
+freeArg(mk);
 ```
 
 ## 6. Convert PDF → anything
@@ -552,6 +563,85 @@ const hf = JSON.parse(dec.decode(callBuffer((lp) => ex.gp_header_footer(handle, 
 
 // Remove: ex.gp_remove_headers(handle) / ex.gp_remove_footers(handle)
 // Margins: ex.gp_page_margins(handle, page, lp) / ex.gp_set_page_margins(handle, page, t, r, b, l)
+```
+
+A baked header/footer lives in a `/GPHF` marked-content span, which the engine
+**excludes from every editable view** — `gp_page_elements`, `gp_page_text_runs`
+and `gp_page_blocks` never return it, so re-opening a header-baked PDF in the
+editor does not turn the header into editable body content (and run/element
+indices stay aligned for `replaceText` / `transformElement` / `removeElement` /
+`reorderElement`). The band is still drawn when you render the page; pair it with
+`gp_render_page_excluding_marked_content(handle, page, scale, skip_text, "GPHF")`
+(see §5) when overlaying editable text, so the header is shown by the raster but
+never doubled. `gp_header_footer` remains the reader that recovers the text.
+
+### Rich, Word-like running header/footer
+
+`setRunningHeaderFooter(def, opts?)` bakes a richer header/footer: per-page-class
+**zones** (`default` / `firstPage` / `evenPage` / `oddPage`), each a list of
+`HFItem`s (`type: "text"` or `type: "image"`) anchored `left`/`center`/`right`
+and nudged `(dx, dy)`. The **definition** is the source of truth — it is stored in
+the editor-meta sidecar (under `headerFooter`) and its visible representation is
+regenerated into the same `/GPHF` band, so it inherits the gate and the render
+mask above. Text is drawn in an **embedded** font (the item's `fontRef`, else the
+engine's bundled OFL face — never base-14); images via the `addImage` path. Tokens
+`{{page}}`, `{{pages}}`, `{{date}}` (the engine is clockless — pass `opts.date`)
+and `{{title}}` are substituted at bake time. Re-baking is idempotent.
+
+```js
+// A logo on the (different) first page, page numbers on even/odd pages, a
+// title+date footer everywhere else. Image pixels are keyed by `imageId`.
+const ok = doc.setRunningHeaderFooter(
+  {
+    default: {
+      header: [],
+      footer: [
+        { type: "text", text: "{{title}} — {{date}}", anchor: "left", size: 9 },
+        { type: "text", text: "{{page}}/{{pages}}", anchor: "right", size: 9 },
+      ],
+    },
+    firstPage: {                                   // the cover: just the logo
+      header: [{ type: "image", imageId: 1, w: 120, h: 32, anchor: "center" }],
+      footer: [],
+    },
+    evenPage: { header: [{ type: "text", text: "{{page}}", anchor: "left" }], footer: [] },
+    oddPage:  { header: [{ type: "text", text: "{{page}}", anchor: "right" }], footer: [] },
+    differentFirstPage: true,
+    differentOddEven: true,
+    headerBand: 32,
+    footerBand: 36,
+  },
+  { date: new Date().toISOString().slice(0, 10), images: new Map([[1, logoPng]]) }
+);
+
+// Read the definition back (the source of truth in the sidecar):
+const def = doc.runningHeaderFooter();          // RunningHeaderFooter | null
+```
+
+The flat `setHeader` / `setFooter` API still works and `HeaderFooterSpec::to_running`
+lowers a flat spec into a single-text `RunningHeaderFooter` for migration. WASM:
+`gp_set_running_header_footer(handle, defPtr, defLen, datePtr, dateLen, imagesPtr,
+imagesLen)` (images = a `[u32 count]{u32 id, u32 len, bytes}` little-endian blob)
+and `gp_running_header_footer(handle, outLen)`.
+
+### Editor-only state: metadata sidecar + display margins
+
+Editor state that has no place in the PDF page model travels in a private
+**sidecar** (a compressed catalog `/GigaPDF /EditorMeta` stream, ignored by every
+standard reader, surviving save/open):
+
+```js
+// Opaque host JSON blob (returned byte-for-byte; null pointer = none):
+const meta = strArg(JSON.stringify({ theme: "dark", zoom: 1.25 }));
+ex.gp_set_editor_meta(handle, meta.ptr, meta.len); freeArg(meta);
+const back = callBuffer((lp) => ex.gp_editor_meta(handle, lp)); // → bytes or null
+
+// Editor *display* margins (points) — stored in the sidecar under `margins`,
+// NEVER in /CropBox (that's gp_set_page_margins, a real recrop):
+ex.gp_set_editor_margins(handle, 1, 36, 36, 36, 36);          // t, r, b, l
+const m = callBuffer((lp) => ex.gp_editor_margins(handle, 1, lp)); // JSON or null
+// SDK: doc.setEditorMeta(json) / doc.editorMeta() ;
+//      doc.setEditorMargins(page, {top,right,bottom,left}) / doc.editorMargins(page)
 ```
 
 ## 9c. The unified editable model

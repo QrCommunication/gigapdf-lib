@@ -16,7 +16,9 @@ use crate::content::{self, ContentElement, TextRun};
 use crate::error::{EngineError, Result};
 use crate::filters::decode_stream;
 use crate::form::{self, FormField};
-use crate::headerfooter::{Align, HeaderFooter, HeaderFooterSpec, Margins};
+use crate::headerfooter::{
+    Align, HFItem, HeaderFooter, HeaderFooterSpec, Margins, RunningHeaderFooter,
+};
 use crate::lexer::{Lexer, Token};
 use crate::link::{Link, LinkTarget};
 use crate::object::{Dictionary, Object, ObjectId, Stream, StringKind};
@@ -3847,6 +3849,31 @@ impl Document {
             };
             let two_byte =
                 font.get(b"Subtype").and_then(Object::as_name) == Some(b"Type0".as_slice());
+            // For a simple (single-byte) font, resolve its base `/Encoding` +
+            // `/Differences` to a code → Unicode map (via the Adobe Glyph List),
+            // the spec route for simple fonts without `/ToUnicode`. Correct for
+            // MacRoman/Standard-encoded and custom-`/Differences` fonts, where the
+            // bare WinAnsi fallback would corrupt accents and punctuation.
+            //
+            // Computed **before** the `/ToUnicode` recovery below so its codes can
+            // be reserved: a `/Differences` glyph repacked onto an ASCII slot
+            // (e.g. `n`@0x25, `p`@0x26) is authoritative, and the gap-filler must
+            // not synthesize a `code → chr(code)` entry that would mask it.
+            let simple_encoding = if two_byte {
+                None
+            } else {
+                // Pass the embedded program so a simple CFF (Type1C) font can fall
+                // back to its own charset for codes the `/Encoding`+`/Differences`
+                // path leaves opaque/unresolved (subset designer-named glyphs).
+                let program = self.font_program(font);
+                self.simple_font_encoding(font, program.as_ref())
+            };
+            // Codes the `/Encoding`+`/Differences` owns authoritatively — the
+            // gap-filler must skip them (empty for composite fonts ⇒ no-op there).
+            let reserved: BTreeSet<u32> = simple_encoding
+                .as_ref()
+                .map(|m| m.keys().map(|&c| c as u32).collect())
+                .unwrap_or_default();
             let to_unicode = font
                 .get(b"ToUnicode")
                 .map(|o| self.resolve(o))
@@ -3859,8 +3886,9 @@ impl Document {
                     // font assigns glyph codes by a single affine ASCII offset and
                     // ships no embedded `cmap`/`post` (the only remaining mapping
                     // is this incomplete CMap). Self-calibrating + conservative;
-                    // a no-op for well-formed CMaps.
-                    cmap.infer_ascii_gaps(doc_delta);
+                    // a no-op for well-formed CMaps. `reserved` keeps it from
+                    // overwriting `/Differences`-owned ASCII slots.
+                    cmap.infer_ascii_gaps(doc_delta, &reserved);
                     cmap
                 });
             let widths = if two_byte {
@@ -3902,20 +3930,6 @@ impl Document {
                 )
             } else {
                 (None, None)
-            };
-            // For a simple (single-byte) font, resolve its base `/Encoding` +
-            // `/Differences` to a code → Unicode map (via the Adobe Glyph List),
-            // the spec route for simple fonts without `/ToUnicode`. Correct for
-            // MacRoman/Standard-encoded and custom-`/Differences` fonts, where the
-            // bare WinAnsi fallback would corrupt accents and punctuation.
-            let simple_encoding = if two_byte {
-                None
-            } else {
-                // Pass the embedded program so a simple CFF (Type1C) font can fall
-                // back to its own charset for codes the `/Encoding`+`/Differences`
-                // path leaves opaque/unresolved (subset designer-named glyphs).
-                let program = self.font_program(font);
-                self.simple_font_encoding(font, program.as_ref())
             };
             // For a composite font in **vertical** writing mode (its `/Encoding`
             // CMap is `*-V`/`Identity-V`/`/WMode 1`), read the descendant CIDFont's
@@ -5928,6 +5942,121 @@ impl Document {
         Ok(())
     }
 
+    // ─── editor-metadata sidecar (GigaPDF-private) ───────────────────────────
+
+    /// Store an opaque JSON string as the document's **GigaPDF editor-metadata
+    /// sidecar**: a private, host-defined blob that travels with the PDF
+    /// (catalog `/GigaPDF << /EditorMeta <ref> >>`, a `FlateDecode`-compressed
+    /// stream — a stream, not a catalog string, so it stays PDF/A-friendly). It is
+    /// ignored by every standard PDF reader; the round-trip survives `save`/`open`.
+    /// Replacing it overwrites the previous blob in place (the same object id).
+    ///
+    /// This is the persistence layer behind editor-only state that has no place in
+    /// the PDF page model — e.g. the per-page editor margins of
+    /// [`set_editor_margins`](Self::set_editor_margins), which live under the
+    /// sidecar's `margins` key. Pass a JSON **object** if you intend to also use
+    /// `set_editor_margins` (it read-modify-writes that object).
+    pub fn set_editor_meta(&mut self, json: &str) -> Result<()> {
+        let catalog_id = self.catalog_id()?;
+        // Re-use the existing EditorMeta stream id when present so re-saving keeps
+        // a single object; else allocate a fresh one.
+        let meta_id = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .and_then(|c| c.get(b"GigaPDF"))
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .and_then(|g| g.get(b"EditorMeta"))
+            .and_then(Object::as_reference)
+            .unwrap_or_else(|| (self.next_object_number(), 0u16));
+
+        let compressed = crate::filters::deflate::flate_encode(json.as_bytes());
+        let mut sdict = Dictionary::new();
+        sdict.set(b"Type".to_vec(), annot::name(b"GigaPDFEditorMeta"));
+        sdict.set(b"Filter".to_vec(), annot::name(b"FlateDecode"));
+        sdict.set(b"Length".to_vec(), Object::Integer(compressed.len() as i64));
+        self.objects
+            .insert(meta_id, Object::Stream(Stream::new(sdict, compressed)));
+
+        // Link from catalog `/GigaPDF /EditorMeta` (an inline private dict).
+        let mut catalog = self
+            .objects
+            .get(&catalog_id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .ok_or_else(|| EngineError::Missing("document catalog".into()))?;
+        let mut giga = catalog
+            .get(b"GigaPDF")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
+        giga.set(b"EditorMeta".to_vec(), Object::Reference(meta_id));
+        catalog.set(b"GigaPDF".to_vec(), Object::Dictionary(giga));
+        self.objects.insert(catalog_id, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// The document's GigaPDF editor-metadata sidecar string (set by
+    /// [`set_editor_meta`](Self::set_editor_meta)), or `None` when the document
+    /// carries none.
+    pub fn editor_meta(&self) -> Option<String> {
+        let catalog = self.catalog().ok()?;
+        let giga = catalog
+            .get(b"GigaPDF")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)?;
+        let stream = giga
+            .get(b"EditorMeta")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_stream)?;
+        String::from_utf8(decode_stream(stream).ok()?).ok()
+    }
+
+    /// Record the editor's per-page margins (points) in the editor-metadata
+    /// sidecar — under `margins` keyed by the 1-based page number — **without
+    /// touching `/CropBox` or `/MediaBox`**. These are the editor's *display*
+    /// margins (rulers, text-frame guides), distinct from
+    /// [`set_page_margins`](Self::set_page_margins), which performs a real visible
+    /// recrop by insetting the `/CropBox`. Read-modify-writes the sidecar JSON, so
+    /// any other keys a host stored via [`set_editor_meta`](Self::set_editor_meta)
+    /// are preserved.
+    pub fn set_editor_margins(&mut self, page_no: u32, m: Margins) -> Result<()> {
+        let mut root: Vec<(String, EditorJson)> =
+            match self.editor_meta().and_then(|s| EditorJson::parse(&s)) {
+                Some(EditorJson::Obj(o)) => o,
+                _ => Vec::new(),
+            };
+        let mut margins = match json_obj_take(&mut root, "margins") {
+            Some(EditorJson::Obj(o)) => o,
+            _ => Vec::new(),
+        };
+        let entry = EditorJson::Obj(vec![
+            ("top".into(), EditorJson::Num(m.top)),
+            ("right".into(), EditorJson::Num(m.right)),
+            ("bottom".into(), EditorJson::Num(m.bottom)),
+            ("left".into(), EditorJson::Num(m.left)),
+        ]);
+        json_obj_upsert(&mut margins, &page_no.to_string(), entry);
+        json_obj_upsert(&mut root, "margins", EditorJson::Obj(margins));
+        self.set_editor_meta(&EditorJson::Obj(root).to_json())
+    }
+
+    /// The editor's per-page display margins (points) recorded for the 1-based
+    /// `page_no` by [`set_editor_margins`](Self::set_editor_margins), or `None`
+    /// when none were stored. Reads only the sidecar — never `/CropBox`.
+    pub fn editor_margins(&self, page_no: u32) -> Option<Margins> {
+        let root = EditorJson::parse(&self.editor_meta()?)?;
+        let entry = root.get("margins")?.get(&page_no.to_string())?;
+        Some(Margins {
+            top: entry.get("top")?.as_num()?,
+            right: entry.get("right")?.as_num()?,
+            bottom: entry.get("bottom")?.as_num()?,
+            left: entry.get("left")?.as_num()?,
+        })
+    }
+
     // ─── running header / footer ─────────────────────────────────────────────
 
     /// Bake a running **header** onto every in-range page: `spec.text` (with
@@ -6135,6 +6264,334 @@ impl Document {
         Ok(ops)
     }
 
+    // ─── rich running header / footer (Word-like, sidecar-backed) ─────────────
+
+    /// Bake a rich, Word-like running header/footer from a
+    /// [`RunningHeaderFooter`] definition. The **definition** is the source of
+    /// truth: it is stored in the GigaPDF editor-metadata sidecar (under
+    /// `headerFooter`, merged so any other host keys such as `margins` survive),
+    /// and its **visible** representation is regenerated into the `/GPHF`
+    /// marked-content band on every page.
+    ///
+    /// Per 1-based page the effective zone is selected with
+    /// [`RunningHeaderFooter::zone_for`] (first page / even / odd / default); each
+    /// [`HFItem`] in the zone is drawn into the page's top (header) or bottom
+    /// (footer) band, anchored left/center/right within the printable width and
+    /// nudged by `(dx, dy)`. **Text** is set in an embedded font — the item's
+    /// `font_ref` when drawable, else the engine's bundled OFL face (a real
+    /// embedded font, **never** base-14) — via [`add_text`](Self::add_text), so it
+    /// is wrapped in the `/GPHF` span and therefore excluded from extraction
+    /// ([`page_elements`](Self::page_elements)/[`page_text_runs`](Self::page_text_runs))
+    /// and maskable at render time
+    /// ([`render_page_excluding_marked_content`](Self::render_page_excluding_marked_content)),
+    /// so it can never double against an editable overlay. **Images** are drawn
+    /// via [`add_image`](Self::add_image); each `HFItem::Image` references its
+    /// pixels by `image_id` in `images` (the definition itself stores only the
+    /// id) — an item whose id is absent from `images` is skipped.
+    ///
+    /// The bake substitutes `{{page}}`, `{{pages}}`, `{{date}}` and `{{title}}`.
+    /// `date` is the bake date for `{{date}}`; the core engine is **clockless**,
+    /// so the host (SDK) passes the wall-clock date — when `None`, the document's
+    /// `/Info` mod/creation date (reduced to `YYYY-MM-DD`) is used, else empty.
+    /// `{{title}}` is the `/Info /Title`.
+    ///
+    /// Re-baking is idempotent: any previously-baked `/GPHF` header **and** footer
+    /// spans are stripped from every page first, so the result is a single band.
+    pub fn set_running_header_footer(
+        &mut self,
+        def: &RunningHeaderFooter,
+        date: Option<&str>,
+        images: &[(u32, &[u8])],
+    ) -> Result<()> {
+        // 1) Persist the definition (source of truth), preserving other sidecar keys.
+        self.store_running_header_footer(def)?;
+
+        let total = self.page_count();
+        if total == 0 {
+            return Ok(());
+        }
+
+        // 2) Idempotency: drop any prior /GPHF header AND footer spans everywhere.
+        self.strip_header_footer(true)?;
+        self.strip_header_footer(false)?;
+
+        // Tokens fixed for this bake.
+        let date_str = self.bake_date_string(date);
+        let title = self.info_fields().title.unwrap_or_default();
+
+        // Bundled OFL face, embedded at most once, reused for `font_ref == None`.
+        let mut default_font: Option<u32> = None;
+
+        for page_1 in 1..=total {
+            let page_no = page_1 as u32;
+            let zone = def.zone_for(page_1);
+            if !zone.header.is_empty() {
+                self.bake_hf_band(
+                    page_no,
+                    page_1,
+                    total,
+                    &date_str,
+                    &title,
+                    &zone.header,
+                    true,
+                    def.header_band as f64,
+                    def.footer_band as f64,
+                    images,
+                    &mut default_font,
+                )?;
+            }
+            if !zone.footer.is_empty() {
+                self.bake_hf_band(
+                    page_no,
+                    page_1,
+                    total,
+                    &date_str,
+                    &title,
+                    &zone.footer,
+                    false,
+                    def.header_band as f64,
+                    def.footer_band as f64,
+                    images,
+                    &mut default_font,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The rich running header/footer definition recorded by
+    /// [`set_running_header_footer`](Self::set_running_header_footer), read back
+    /// from the editor-metadata sidecar's `headerFooter` key (the source of
+    /// truth). When the sidecar carries none, falls back to reconstructing a
+    /// minimal definition from the legacy flat
+    /// [`header_footer`](Self::header_footer) text (a single text item per side in
+    /// the `default` zone). `None` only when neither is present.
+    pub fn running_header_footer(&self) -> Option<RunningHeaderFooter> {
+        if let Some(root) = self.editor_meta().and_then(|s| EditorJson::parse(&s)) {
+            if let Some(hf) = root.get("headerFooter") {
+                if let Some(def) = RunningHeaderFooter::from_json(&hf.to_json()) {
+                    return Some(def);
+                }
+            }
+        }
+        // Fallback: lift the legacy flat baked text into a single-item default zone.
+        let legacy = self.header_footer();
+        if legacy.header.is_none() && legacy.footer.is_none() {
+            return None;
+        }
+        let mut def = RunningHeaderFooter::default();
+        if let Some(h) = legacy.header {
+            def.default.header.extend(h.to_running(true).default.header);
+        }
+        if let Some(f) = legacy.footer {
+            def.default.footer.extend(f.to_running(false).default.footer);
+        }
+        Some(def)
+    }
+
+    /// Persist `def` as the source-of-truth running-H/F definition in the
+    /// editor-metadata sidecar under `headerFooter`, read-modify-writing so any
+    /// other host keys (e.g. `margins`) are preserved.
+    fn store_running_header_footer(&mut self, def: &RunningHeaderFooter) -> Result<()> {
+        let mut root: Vec<(String, EditorJson)> =
+            match self.editor_meta().and_then(|s| EditorJson::parse(&s)) {
+                Some(EditorJson::Obj(o)) => o,
+                _ => Vec::new(),
+            };
+        let value = EditorJson::parse(&def.to_json()).unwrap_or(EditorJson::Null);
+        json_obj_upsert(&mut root, "headerFooter", value);
+        self.set_editor_meta(&EditorJson::Obj(root).to_json())
+    }
+
+    /// Resolve the `{{date}}` value: the host-supplied bake `date` when given,
+    /// else the document's `/Info /ModDate` (or `/CreationDate`) reduced to a
+    /// `YYYY-MM-DD` calendar date, else empty. The core engine has no clock, so
+    /// the host/SDK supplies the wall-clock date.
+    fn bake_date_string(&self, date: Option<&str>) -> String {
+        if let Some(d) = date {
+            return d.to_string();
+        }
+        let info = self.info_fields();
+        if let Some(pdf) = info.mod_date.or(info.creation_date) {
+            if let Some(iso) = pdf_date_to_iso8601(&pdf) {
+                return iso.chars().take(10).collect();
+            }
+        }
+        String::new()
+    }
+
+    /// Substitute the bake tokens (`{{page}}`, `{{pages}}`, `{{date}}`,
+    /// `{{title}}`) into a header/footer text template.
+    fn substitute_hf_tokens(
+        text: &str,
+        page_1: usize,
+        total: usize,
+        date: &str,
+        title: &str,
+    ) -> String {
+        text.replace("{{page}}", &page_1.to_string())
+            .replace("{{pages}}", &total.to_string())
+            .replace("{{date}}", date)
+            .replace("{{title}}", title)
+    }
+
+    /// The embedded-font object id to draw an item's text with: the caller's
+    /// `font_ref` when it is a drawable embedded/base-14 handle, else the engine's
+    /// bundled OFL face (embedded at most once via `default_font`). The fallback
+    /// is a **real embedded font**, never a base-14 reference.
+    fn resolve_hf_font(
+        &mut self,
+        font_ref: Option<u32>,
+        default_font: &mut Option<u32>,
+    ) -> Result<u32> {
+        if let Some(id) = font_ref {
+            if self.base14_refs.contains_key(&id) || self.embedded_truetype(id).is_some() {
+                return Ok(id);
+            }
+        }
+        if let Some(id) = *default_font {
+            return Ok(id);
+        }
+        let id = self.embed_font(
+            crate::font::bundled::FALLBACK_FAMILY,
+            crate::font::bundled::FALLBACK_TTF,
+        )?;
+        *default_font = Some(id);
+        Ok(id)
+    }
+
+    /// A header/footer text run's advance width (points) in `font_obj`: the
+    /// embedded face's own glyph metrics, or Helvetica AFM widths for a base-14
+    /// reference handle. Used to place center/right-anchored items.
+    fn hf_text_width(&self, font_obj: u32, text: &str, size: f64) -> f64 {
+        if self.base14_refs.contains_key(&font_obj) {
+            return Self::helvetica_width(text, size);
+        }
+        if let Some(ttf) = self.embedded_truetype(font_obj) {
+            let upm = ttf.units_per_em().max(1.0);
+            let units: f64 = text
+                .chars()
+                .map(|c| ttf.advance_width(ttf.gid_for_unicode(c as u32).unwrap_or(0)))
+                .sum();
+            return units * size / upm;
+        }
+        Self::helvetica_width(text, size)
+    }
+
+    /// Horizontal placement of an item of width `width` for `anchor`, within the
+    /// printable width `[mx0 + side, mx1 - side]`, nudged by `dx`.
+    fn hf_anchor_x(anchor: Align, mx0: f64, mx1: f64, side: f64, width: f64, dx: f64) -> f64 {
+        let x = match anchor {
+            Align::Left => mx0 + side,
+            Align::Center => (mx0 + mx1) / 2.0 - width / 2.0,
+            Align::Right => mx1 - side - width,
+        };
+        x + dx
+    }
+
+    /// Draw one header (`header == true`) or footer band's items inside a fresh
+    /// `/GPHF <</T (h|f)>> BDC … EMC` span on `page_no`. The text/image draws
+    /// (via [`add_text`](Self::add_text)/[`add_image`](Self::add_image)) append
+    /// after the `BDC` and before the `EMC`, so the whole band lives in the one
+    /// marked-content span the gate excludes and the renderer can mask.
+    #[allow(clippy::too_many_arguments)]
+    fn bake_hf_band(
+        &mut self,
+        page_no: u32,
+        page_1: usize,
+        total: usize,
+        date: &str,
+        title: &str,
+        items: &[HFItem],
+        header: bool,
+        header_band: f64,
+        footer_band: f64,
+        images: &[(u32, &[u8])],
+        default_font: &mut Option<u32>,
+    ) -> Result<()> {
+        let subtype = Self::hf_subtype(header);
+        // Open the /GPHF span (the gate + raster exclusion key on this exact tag).
+        let mut open = b"/GPHF <</T (".to_vec();
+        open.extend_from_slice(subtype);
+        open.extend_from_slice(b")>> BDC\n");
+        self.append_page_content(page_no, &open)?;
+
+        // Page geometry + band reference baseline.
+        let mb = self.read_media_box(self.page_dict(page_no)?);
+        let (mx0, my0, mx1, my1) = (
+            mb[0].min(mb[2]),
+            mb[1].min(mb[3]),
+            mb[0].max(mb[2]),
+            mb[1].max(mb[3]),
+        );
+        let band = if header { header_band } else { footer_band }.max(0.0);
+        let base_y = if header { my1 - band } else { my0 + band };
+        // Side gutter for left/right anchoring (1", clamped on narrow pages).
+        let side = (72.0_f64).min((mx1 - mx0) / 3.0).max(0.0);
+
+        for item in items {
+            match item {
+                HFItem::Text {
+                    anchor,
+                    dx,
+                    dy,
+                    text,
+                    font_ref,
+                    size,
+                    color,
+                    ..
+                } => {
+                    let rendered = Self::substitute_hf_tokens(text, page_1, total, date, title);
+                    if rendered.is_empty() {
+                        continue;
+                    }
+                    let font_obj = self.resolve_hf_font(*font_ref, default_font)?;
+                    let sz = (*size as f64).max(0.01);
+                    let width = self.hf_text_width(font_obj, &rendered, sz);
+                    let x = Self::hf_anchor_x(*anchor, mx0, mx1, side, width, *dx as f64);
+                    let y = base_y + *dy as f64;
+                    let col = [
+                        color[0] as f64 / 255.0,
+                        color[1] as f64 / 255.0,
+                        color[2] as f64 / 255.0,
+                    ];
+                    self.add_text(page_no, x, y, sz, &rendered, font_obj, col, 1.0, 0.0)?;
+                }
+                HFItem::Image {
+                    anchor,
+                    dx,
+                    dy,
+                    w,
+                    h,
+                    image_id,
+                    opacity,
+                } => {
+                    let Some(entry) = images.iter().find(|(id, _)| id == image_id) else {
+                        continue; // bytes not supplied for this id → skip gracefully
+                    };
+                    let (ww, hh) = (*w as f64, *h as f64);
+                    if ww <= 0.0 || hh <= 0.0 {
+                        continue;
+                    }
+                    let x = Self::hf_anchor_x(*anchor, mx0, mx1, side, ww, *dx as f64);
+                    let y = base_y + *dy as f64;
+                    self.add_image(
+                        page_no,
+                        entry.1,
+                        x,
+                        y,
+                        ww,
+                        hh,
+                        (*opacity as f64).clamp(0.0, 1.0),
+                    )?;
+                }
+            }
+        }
+
+        // Close the span.
+        self.append_page_content(page_no, b"EMC\n")
+    }
+
     /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using
     /// the built-in zero-dependency renderer (vector graphics; text glyphs and
     /// images are added by later renderer slices).
@@ -6156,7 +6613,36 @@ impl Document {
     /// widget appearances are removed.
     pub fn render_page_no_text(&self, page_no: u32, scale: f64) -> Result<Vec<u8>> {
         Ok(self
-            .render_page_canvas_ex(page_no, scale, true, &[], false)?
+            .render_page_canvas_ex(page_no, scale, true, &[], false, None)?
+            .to_png())
+    }
+
+    /// Rasterize a page to a PNG at `scale`, **excluding the ops inside a baked
+    /// marked-content span** named `marker` — and, when `skip_text` is true, the
+    /// page's content-stream text too — in a **single** raster pass.
+    ///
+    /// For `marker == "GPHF"` this drops the baked running header/footer band: the
+    /// extraction layer ([`page_elements`](Self::page_elements),
+    /// [`page_text_runs`](Self::page_text_runs)) already omits that band (so it is
+    /// never editable body content), and this render omits it from the picture too,
+    /// so the header/footer can never double against an editable overlay. With
+    /// `skip_text = true` it generalises [`render_page_no_text`](Self::render_page_no_text)
+    /// (a text-free background minus the masked band) for the editor's display
+    /// raster; with `skip_text = false` it is the full page minus the band.
+    ///
+    /// Like [`render_page_no_text`](Self::render_page_no_text), form-field
+    /// **widget** appearances are omitted (the editor re-shows them as an editable
+    /// overlay); non-widget annotation appearances are painted in full. An unknown
+    /// `marker` (no matching span) renders the page normally.
+    pub fn render_page_excluding_marked_content(
+        &self,
+        page_no: u32,
+        scale: f64,
+        skip_text: bool,
+        marker: &str,
+    ) -> Result<Vec<u8>> {
+        Ok(self
+            .render_page_canvas_ex(page_no, scale, skip_text, &[], false, Some(marker.as_bytes()))?
             .to_png())
     }
 
@@ -6182,7 +6668,7 @@ impl Document {
         scale: f64,
     ) -> Result<Vec<u8>> {
         Ok(self
-            .render_page_canvas_ex(page_no, scale, false, indices, false)?
+            .render_page_canvas_ex(page_no, scale, false, indices, false, None)?
             .to_png())
     }
 
@@ -6216,7 +6702,7 @@ impl Document {
         scale: f64,
         skip_text: bool,
     ) -> Result<crate::raster::Canvas> {
-        self.render_page_canvas_ex(page_no, scale, skip_text, &[], true)
+        self.render_page_canvas_ex(page_no, scale, skip_text, &[], true, None)
     }
 
     /// Like [`render_page_canvas`](Self::render_page_canvas) but also suppresses
@@ -6232,6 +6718,7 @@ impl Document {
     /// editor-background path uses this so filled field values aren't baked into
     /// the raster (they would double up with the editable overlay). Non-widget
     /// annotations are always painted regardless.
+    #[allow(clippy::too_many_arguments)]
     fn render_page_canvas_ex(
         &self,
         page_no: u32,
@@ -6239,6 +6726,7 @@ impl Document {
         skip_text: bool,
         excluded_indices: &[usize],
         widget_appearances: bool,
+        exclude_marker: Option<&[u8]>,
     ) -> Result<crate::raster::Canvas> {
         let media_box = self.read_media_box(self.page_dict(page_no)?);
         let [x0, y0, x1, y1] = media_box;
@@ -6256,11 +6744,26 @@ impl Document {
         // Build the per-operation exclusion mask from the requested element
         // indices (each element occupies `op_start..=op_end` of the top-level
         // op stream). Empty when nothing is excluded — zero overhead.
-        let excluded_ops: Vec<bool> = if excluded_indices.is_empty() {
+        let mut excluded_ops: Vec<bool> = if excluded_indices.is_empty() {
             Vec::new()
         } else {
             self.element_op_mask(page_no, excluded_indices)?
         };
+        // Also suppress a marked-content span (e.g. the baked `/GPHF` running
+        // header/footer band) in the SAME raster pass. Both masks index the same
+        // parsed op stream, so OR them together; the marked-content mask spans the
+        // whole stream, so grow the element mask to match before merging. This is
+        // what lets the editor paint the page without the header band that the
+        // extraction layer drops from `page_elements` — one pass, no double-draw.
+        if let Some(marker) = exclude_marker {
+            let mc_mask = content::marked_content_op_mask(&content, marker)?;
+            if excluded_ops.len() < mc_mask.len() {
+                excluded_ops.resize(mc_mask.len(), false);
+            }
+            for (slot, masked) in excluded_ops.iter_mut().zip(mc_mask) {
+                *slot |= masked;
+            }
+        }
         let ctx = PageResourceCtx::new(self, resources, width, height, base);
         let mut canvas = crate::raster::Canvas::new(width, height);
         crate::raster::render_content_into_ctx(
@@ -21842,6 +22345,318 @@ fn non_neg(v: i64) -> Option<usize> {
     usize::try_from(v).ok()
 }
 
+// ─── editor-metadata sidecar JSON (zero-dependency) ──────────────────────────
+
+/// A minimal JSON value, just enough to read-modify-write the GigaPDF editor
+/// metadata sidecar ([`Document::set_editor_meta`] / [`Document::set_editor_margins`]).
+/// Objects keep **insertion order** (a `Vec` of pairs) so a round-trip preserves
+/// the host's key order; merging the engine's `margins` key never disturbs the
+/// host's other keys. Numbers are `f64` (margins are points).
+#[derive(Debug, Clone, PartialEq)]
+enum EditorJson {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Arr(Vec<EditorJson>),
+    Obj(Vec<(String, EditorJson)>),
+}
+
+impl EditorJson {
+    /// Parse one JSON document, or `None` on malformed input / trailing junk.
+    fn parse(s: &str) -> Option<EditorJson> {
+        let b = s.as_bytes();
+        let mut i = 0usize;
+        let v = json_parse_value(b, &mut i, 0)?;
+        json_skip_ws(b, &mut i);
+        (i == b.len()).then_some(v)
+    }
+
+    /// Serialize to a compact JSON string (the exact inverse of [`parse`](Self::parse)
+    /// for the subset the engine writes).
+    fn to_json(&self) -> String {
+        let mut out = String::new();
+        json_write(self, &mut out);
+        out
+    }
+
+    /// The member named `key`, when this is an object.
+    fn get(&self, key: &str) -> Option<&EditorJson> {
+        match self {
+            EditorJson::Obj(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// The value as a finite number, when this is a number.
+    fn as_num(&self) -> Option<f64> {
+        match self {
+            EditorJson::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// Insert or replace `key` in an order-preserving object (`Vec` of pairs).
+fn json_obj_upsert(obj: &mut Vec<(String, EditorJson)>, key: &str, val: EditorJson) {
+    if let Some(slot) = obj.iter_mut().find(|(k, _)| k == key) {
+        slot.1 = val;
+    } else {
+        obj.push((key.to_string(), val));
+    }
+}
+
+/// Remove and return the value of `key` from an order-preserving object.
+fn json_obj_take(obj: &mut Vec<(String, EditorJson)>, key: &str) -> Option<EditorJson> {
+    obj.iter().position(|(k, _)| k == key).map(|p| obj.remove(p).1)
+}
+
+fn json_skip_ws(b: &[u8], i: &mut usize) {
+    while matches!(b.get(*i), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        *i += 1;
+    }
+}
+
+/// Parse a JSON value at `b[*i]`, advancing `*i`. `depth` bounds nesting.
+fn json_parse_value(b: &[u8], i: &mut usize, depth: usize) -> Option<EditorJson> {
+    if depth > 64 {
+        return None;
+    }
+    json_skip_ws(b, i);
+    match *b.get(*i)? {
+        b'{' => json_parse_object(b, i, depth),
+        b'[' => json_parse_array(b, i, depth),
+        b'"' => json_parse_string(b, i).map(EditorJson::Str),
+        b't' => json_parse_lit(b, i, b"true", EditorJson::Bool(true)),
+        b'f' => json_parse_lit(b, i, b"false", EditorJson::Bool(false)),
+        b'n' => json_parse_lit(b, i, b"null", EditorJson::Null),
+        b'-' | b'0'..=b'9' => json_parse_number(b, i),
+        _ => None,
+    }
+}
+
+fn json_parse_lit(b: &[u8], i: &mut usize, lit: &[u8], val: EditorJson) -> Option<EditorJson> {
+    if b.len() >= *i + lit.len() && &b[*i..*i + lit.len()] == lit {
+        *i += lit.len();
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn json_parse_number(b: &[u8], i: &mut usize) -> Option<EditorJson> {
+    let start = *i;
+    if b.get(*i) == Some(&b'-') {
+        *i += 1;
+    }
+    while b.get(*i).is_some_and(u8::is_ascii_digit) {
+        *i += 1;
+    }
+    if b.get(*i) == Some(&b'.') {
+        *i += 1;
+        while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+    }
+    if matches!(b.get(*i), Some(b'e' | b'E')) {
+        *i += 1;
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            *i += 1;
+        }
+    }
+    let n = std::str::from_utf8(&b[start..*i]).ok()?.parse::<f64>().ok()?;
+    n.is_finite().then_some(EditorJson::Num(n))
+}
+
+/// Parse a JSON string at `b[*i] == '"'`, advancing `*i` past the closing quote.
+fn json_parse_string(b: &[u8], i: &mut usize) -> Option<String> {
+    *i += 1; // opening quote
+    let start = *i;
+    let mut j = start;
+    // Find the closing quote, skipping `\<char>` escapes (the char after a
+    // backslash is always ASCII, so this never lands mid-UTF-8).
+    while j < b.len() {
+        match b[j] {
+            b'"' => {
+                let raw = &b[start..j];
+                *i = j + 1;
+                return json_unescape(raw);
+            }
+            b'\\' => j += 2,
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Decode the (valid-UTF-8) bytes between a JSON string's quotes, resolving
+/// escapes (`\" \\ \/ \b \f \n \r \t \uXXXX`, including surrogate pairs).
+fn json_unescape(raw: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000C}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let hi = json_take_hex4(&mut chars)?;
+                let scalar = if (0xD800..=0xDBFF).contains(&hi) {
+                    // High surrogate → require a `\uXXXX` low surrogate.
+                    if chars.next()? != '\\' || chars.next()? != 'u' {
+                        return None;
+                    }
+                    let lo = json_take_hex4(&mut chars)?;
+                    if !(0xDC00..=0xDFFF).contains(&lo) {
+                        return None;
+                    }
+                    0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                } else if (0xDC00..=0xDFFF).contains(&hi) {
+                    return None; // lone low surrogate
+                } else {
+                    hi
+                };
+                out.push(char::from_u32(scalar)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn json_take_hex4(chars: &mut std::str::Chars) -> Option<u32> {
+    let mut v = 0u32;
+    for _ in 0..4 {
+        v = v * 16 + chars.next()?.to_digit(16)?;
+    }
+    Some(v)
+}
+
+fn json_parse_array(b: &[u8], i: &mut usize, depth: usize) -> Option<EditorJson> {
+    *i += 1; // '['
+    let mut items = Vec::new();
+    json_skip_ws(b, i);
+    if b.get(*i) == Some(&b']') {
+        *i += 1;
+        return Some(EditorJson::Arr(items));
+    }
+    loop {
+        items.push(json_parse_value(b, i, depth + 1)?);
+        json_skip_ws(b, i);
+        match b.get(*i) {
+            Some(b',') => {
+                *i += 1;
+            }
+            Some(b']') => {
+                *i += 1;
+                return Some(EditorJson::Arr(items));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn json_parse_object(b: &[u8], i: &mut usize, depth: usize) -> Option<EditorJson> {
+    *i += 1; // '{'
+    let mut members: Vec<(String, EditorJson)> = Vec::new();
+    json_skip_ws(b, i);
+    if b.get(*i) == Some(&b'}') {
+        *i += 1;
+        return Some(EditorJson::Obj(members));
+    }
+    loop {
+        json_skip_ws(b, i);
+        if b.get(*i)? != &b'"' {
+            return None;
+        }
+        let key = json_parse_string(b, i)?;
+        json_skip_ws(b, i);
+        if b.get(*i)? != &b':' {
+            return None;
+        }
+        *i += 1;
+        let value = json_parse_value(b, i, depth + 1)?;
+        // Last key wins on duplicates (preserve first position).
+        json_obj_upsert(&mut members, &key, value);
+        json_skip_ws(b, i);
+        match b.get(*i) {
+            Some(b',') => {
+                *i += 1;
+            }
+            Some(b'}') => {
+                *i += 1;
+                return Some(EditorJson::Obj(members));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn json_write(v: &EditorJson, out: &mut String) {
+    match v {
+        EditorJson::Null => out.push_str("null"),
+        EditorJson::Bool(true) => out.push_str("true"),
+        EditorJson::Bool(false) => out.push_str("false"),
+        // Rust's shortest round-tripping form ("36" for 36.0, "36.5" for 36.5).
+        EditorJson::Num(n) if n.is_finite() => out.push_str(&format!("{n}")),
+        EditorJson::Num(_) => out.push('0'),
+        EditorJson::Str(s) => json_write_string(s, out),
+        EditorJson::Arr(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                json_write(item, out);
+            }
+            out.push(']');
+        }
+        EditorJson::Obj(members) => {
+            out.push('{');
+            for (idx, (k, val)) in members.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                json_write_string(k, out);
+                out.push(':');
+                json_write(val, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn json_write_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32081,12 +32896,26 @@ mod tests {
         Document::open(&b.finish()).unwrap()
     }
 
-    /// `true` when any text element on `page_no` contains `needle` and its
-    /// baseline `y` is within the page's **top band** (above `h - band`).
-    fn header_present(doc: &Document, page_no: u32, needle: &str, h: f64, band: f64) -> bool {
-        doc.page_text_elements(page_no)
-            .iter()
-            .any(|e| e.text.contains(needle) && e.y >= h - band)
+    /// `true` when the baked **header** (`/GPHF <</T (h)>>` span) on `page_no`
+    /// contains `needle`. A baked header is deliberately *not* surfaced as an
+    /// editable body element (the `/GPHF` gate), so it is verified through the
+    /// marked-content reader (`content::extract_marked_content_text`), the same
+    /// path `header_footer()` uses — never via `page_text_elements`. The `_h` /
+    /// `_band` arguments are kept for call-site compatibility.
+    fn header_present(doc: &Document, page_no: u32, needle: &str, _h: f64, _band: f64) -> bool {
+        doc.page_content(page_no)
+            .ok()
+            .and_then(|c| content::extract_marked_content_text(&c, b"h"))
+            .is_some_and(|t| t.contains(needle))
+    }
+
+    /// `true` when the baked **footer** (`/GPHF <</T (f)>>` span) on `page_no`
+    /// contains `needle` (the footer twin of [`header_present`]).
+    fn footer_present(doc: &Document, page_no: u32, needle: &str) -> bool {
+        doc.page_content(page_no)
+            .ok()
+            .and_then(|c| content::extract_marked_content_text(&c, b"f"))
+            .is_some_and(|t| t.contains(needle))
     }
 
     #[test]
@@ -32151,12 +32980,19 @@ mod tests {
         doc.remove_headers().unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
         for page in 1..=2u32 {
+            // The /GPHF header span is physically gone from the stream (not merely
+            // hidden), so the marked-content reader recovers nothing.
             assert!(
-                reopened
-                    .page_text_elements(page)
-                    .iter()
-                    .all(|e| !e.text.contains("HDR")),
-                "page {page} should have no header text after remove_headers"
+                !header_present(&reopened, page, "HDR", h, 36.0),
+                "page {page} should have no baked header after remove_headers"
+            );
+            assert!(
+                content::extract_marked_content_text(
+                    &reopened.page_content(page).unwrap(),
+                    b"h"
+                )
+                .is_none(),
+                "page {page} /GPHF header span must be stripped"
             );
         }
     }
@@ -32173,10 +33009,7 @@ mod tests {
         .unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
         assert!(
-            reopened
-                .page_text_elements(1)
-                .iter()
-                .all(|e| !e.text.contains("P 1")),
+            !header_present(&reopened, 1, "P 1", h, 36.0),
             "page 1 header must be skipped when show_on_first_page = false"
         );
         assert!(
@@ -32202,10 +33035,13 @@ mod tests {
         doc.set_header(&spec).unwrap();
         doc.set_header(&spec).unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
-        let count = reopened
-            .page_text_elements(1)
-            .iter()
-            .filter(|e| e.text.contains("Once 1"))
+        // The baked text appears literally once in the stream (the prior /GPHF
+        // span is stripped before each re-bake); the gate keeps it out of
+        // page_text_elements, so count occurrences in the raw content instead.
+        let content = reopened.page_content(1).unwrap();
+        let count = content
+            .windows(b"Once 1".len())
+            .filter(|w| *w == b"Once 1")
             .count();
         assert_eq!(count, 1, "re-baking a header must not duplicate it");
     }
@@ -32221,31 +33057,27 @@ mod tests {
         })
         .unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
-        // Footer text sits in the bottom band (baseline y below `band`), not the top.
-        let hit = reopened
-            .page_text_elements(1)
-            .into_iter()
-            .find(|e| e.text.contains("Foot 1"))
-            .expect("footer text present on page 1");
+        // The footer is baked under the /GPHF footer subtype (`f`), distinct from a
+        // header (`h`) — recovered via the marked-content reader, not as an
+        // editable body element (the /GPHF gate keeps it out of page_text_elements).
         assert!(
-            hit.y < 36.0,
-            "footer baseline y should be in the bottom band, got {}",
-            hit.y
+            footer_present(&reopened, 1, "Foot 1"),
+            "footer text present on page 1"
+        );
+        assert!(
+            !header_present(&reopened, 1, "Foot 1", h, 36.0),
+            "the footer must NOT be tagged as a header"
         );
         // remove_footers clears it; remove_headers must NOT touch the footer.
         let mut doc2 = reopened;
         doc2.remove_headers().unwrap();
         assert!(
-            doc2.page_text_elements(1)
-                .iter()
-                .any(|e| e.text.contains("Foot 1")),
+            footer_present(&doc2, 1, "Foot 1"),
             "remove_headers must leave footers intact"
         );
         doc2.remove_footers().unwrap();
         assert!(
-            doc2.page_text_elements(1)
-                .iter()
-                .all(|e| !e.text.contains("Foot 1")),
+            !footer_present(&doc2, 1, "Foot 1"),
             "remove_footers must strip the footer"
         );
     }
@@ -32261,16 +33093,184 @@ mod tests {
         })
         .unwrap();
         let reopened = Document::open(&doc.save()).unwrap();
-        assert!(reopened
-            .page_text_elements(1)
-            .iter()
-            .all(|e| !e.text.contains("R 1")));
+        assert!(!header_present(&reopened, 1, "R 1", h, 36.0));
         assert!(header_present(&reopened, 2, "R 2", h, 36.0));
         assert!(header_present(&reopened, 3, "R 3", h, 36.0));
-        assert!(reopened
-            .page_text_elements(4)
-            .iter()
-            .all(|e| !e.text.contains("R 4")));
+        assert!(!header_present(&reopened, 4, "R 4", h, 36.0));
+    }
+
+    #[test]
+    fn baked_header_stays_out_of_every_editable_view() {
+        // A body run + a baked header; after re-opening, the header must surface in
+        // NONE of the editable/extraction views (page_text_runs, page_elements,
+        // page_blocks) — re-opening a header-baked doc never turns the header into
+        // editable body content. Only header_footer() (the marked-content reader)
+        // recovers it.
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(1, w, h);
+        doc.set_page_content(1, b"BT /F0 12 Tf 50 400 Td (BODYWORD) Tj ET\n".to_vec())
+            .unwrap();
+        doc.set_header(&HeaderFooterSpec {
+            text: "HEADERWORD".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+
+        let runs = reopened.page_text_runs(1).unwrap();
+        assert!(
+            runs.iter().any(|r| r.text.contains("BODYWORD")),
+            "body run present in page_text_runs"
+        );
+        assert!(
+            runs.iter().all(|r| !r.text.contains("HEADERWORD")),
+            "header run is gated out of page_text_runs"
+        );
+
+        let elements = reopened.page_elements(1).unwrap();
+        assert!(
+            elements.iter().all(|e| !e.label.contains("HEADERWORD")),
+            "header out of page_elements"
+        );
+
+        let blocks_dbg = format!("{:?}", reopened.page_blocks(1));
+        assert!(
+            !blocks_dbg.contains("HEADERWORD"),
+            "header out of page_blocks"
+        );
+
+        // The proper reader still recovers it.
+        assert_eq!(
+            reopened.header_footer().header.map(|s| s.text).as_deref(),
+            Some("HEADERWORD"),
+            "header_footer() still recovers the baked header"
+        );
+    }
+
+    #[test]
+    fn render_page_excluding_marked_content_omits_the_header_band() {
+        // A body box low on the page and a /GPHF header band high on the page (a
+        // filled box, the "image"). Rendering with the /GPHF exclusion drops the
+        // band; the body stays pixel-for-pixel identical to a body-only render.
+        let pdf = crate::convert::reverse::txt_to_pdf("seed");
+        let body = b"1 0 0 rg 50 50 100 100 re f\n".to_vec();
+        let with_header = b"1 0 0 rg 50 50 100 100 re f\n\
+/GPHF <</T (h)>> BDC\nq 0 0 1 rg 50 700 200 40 re f Q\nEMC\n"
+            .to_vec();
+
+        let mut doc = Document::open(&pdf).unwrap();
+        doc.set_page_content(1, with_header).unwrap();
+        let full = doc.render_page(1, 1.0).unwrap();
+        let no_header = doc
+            .render_page_excluding_marked_content(1, 1.0, false, "GPHF")
+            .unwrap();
+        assert_ne!(full, no_header, "excluding the /GPHF band changes the raster");
+
+        // The header-excluded render equals a body-only render of the same page →
+        // the band is fully gone AND the body is unchanged.
+        let mut body_only = Document::open(&pdf).unwrap();
+        body_only.set_page_content(1, body).unwrap();
+        let body_render = body_only.render_page(1, 1.0).unwrap();
+        assert_eq!(
+            no_header, body_render,
+            "header-excluded render == body-only render"
+        );
+
+        let nonwhite = |png: &[u8]| -> usize {
+            crate::raster::decode_png(png)
+                .expect("valid PNG")
+                .rgba
+                .chunks_exact(4)
+                .filter(|px| px[0] != 255 || px[1] != 255 || px[2] != 255)
+                .count()
+        };
+        assert!(
+            nonwhite(&full) > nonwhite(&no_header),
+            "removing the header band paints strictly fewer pixels"
+        );
+        assert!(nonwhite(&no_header) > 0, "the body box is still painted");
+    }
+
+    #[test]
+    fn editor_meta_round_trips_through_save_open() {
+        let mut doc = blank_pages(1, 612.0, 792.0);
+        assert!(doc.editor_meta().is_none(), "a fresh doc has no sidecar");
+        // Opaque blob: stored and returned byte-for-byte (no parse on read).
+        let json = r#"{"theme":"dark","zoom":1.5,"notes":"héllo \"world\""}"#;
+        doc.set_editor_meta(json).unwrap();
+        assert_eq!(doc.editor_meta().as_deref(), Some(json));
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert_eq!(
+            reopened.editor_meta().as_deref(),
+            Some(json),
+            "the compressed /GigaPDF /EditorMeta stream survives save/open"
+        );
+    }
+
+    #[test]
+    fn set_editor_margins_does_not_touch_cropbox_or_mediabox() {
+        let (w, h) = (612.0, 792.0);
+        let mut doc = blank_pages(2, w, h);
+        // A blank page has a /MediaBox but no /CropBox.
+        let media_before = doc.page_dict(1).unwrap().get(b"MediaBox").cloned();
+        assert!(
+            doc.page_dict(1).unwrap().get(b"CropBox").is_none(),
+            "no CropBox initially"
+        );
+
+        doc.set_editor_margins(
+            1,
+            Margins {
+                top: 10.0,
+                right: 20.0,
+                bottom: 30.0,
+                left: 40.0,
+            },
+        )
+        .unwrap();
+
+        // No real recrop: CropBox still absent, MediaBox unchanged.
+        assert!(
+            doc.page_dict(1).unwrap().get(b"CropBox").is_none(),
+            "set_editor_margins must NOT create a CropBox"
+        );
+        assert_eq!(
+            doc.page_dict(1).unwrap().get(b"MediaBox").cloned(),
+            media_before,
+            "MediaBox unchanged"
+        );
+
+        let m = doc.editor_margins(1).expect("editor margins recorded");
+        assert!(
+            (m.top - 10.0).abs() < 1e-9
+                && (m.right - 20.0).abs() < 1e-9
+                && (m.bottom - 30.0).abs() < 1e-9
+                && (m.left - 40.0).abs() < 1e-9,
+            "margins read back: {m:?}"
+        );
+        assert!(
+            doc.editor_margins(2).is_none(),
+            "untouched pages have no editor margins"
+        );
+
+        let reopened = Document::open(&doc.save()).unwrap();
+        let m2 = reopened.editor_margins(1).expect("margins survive save/open");
+        assert!((m2.left - 40.0).abs() < 1e-9, "left margin round-trips");
+    }
+
+    #[test]
+    fn set_editor_margins_preserves_host_editor_meta_keys() {
+        // The read-modify-write must keep any host keys already in the sidecar.
+        let mut doc = blank_pages(1, 612.0, 792.0);
+        doc.set_editor_meta(r#"{"theme":"dark"}"#).unwrap();
+        doc.set_editor_margins(1, Margins::uniform(12.0)).unwrap();
+        let meta = doc.editor_meta().unwrap();
+        assert!(
+            meta.contains("\"theme\":\"dark\""),
+            "host key preserved: {meta}"
+        );
+        assert!(meta.contains("\"margins\""), "margins merged in: {meta}");
+        assert!((doc.editor_margins(1).unwrap().top - 12.0).abs() < 1e-9);
     }
 
     #[test]
@@ -32347,6 +33347,284 @@ mod tests {
         .unwrap();
         let hf = doc.header_footer();
         assert_eq!(hf.header.map(|s| s.text), Some("P 2".to_string()));
+    }
+
+    // ─── rich running header/footer (set_running_header_footer) ───────────────
+
+    use crate::headerfooter::{HFItem, HFZone, RunningHeaderFooter};
+
+    /// A 2×2 opaque PNG (four distinct colours) for image-item tests.
+    fn hf_test_png() -> Vec<u8> {
+        let rgba = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
+        crate::raster::png::encode_png(2, 2, &rgba)
+    }
+
+    /// A text item drawn in the **default** (bundled OFL, embedded) font.
+    fn hf_text(anchor: Align, text: &str) -> HFItem {
+        HFItem::Text {
+            anchor,
+            dx: 0.0,
+            dy: 0.0,
+            text: text.into(),
+            font_ref: None,
+            size: 10.0,
+            color: [0, 0, 0],
+            bold: false,
+            italic: false,
+        }
+    }
+
+    /// `true` when `content` contains the byte slice `needle`.
+    fn contains_bytes(content: &[u8], needle: &[u8]) -> bool {
+        content.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn running_header_footer_bakes_embedded_font_text_not_helvetica() {
+        let mut doc = blank_pages(1, 612.0, 792.0);
+        let mut def = RunningHeaderFooter::default();
+        def.default.header.push(hf_text(Align::Center, "EMBEDDED"));
+
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let content = reopened.page_content(1).unwrap();
+
+        assert!(
+            contains_bytes(&content, b"/GPHF <</T (h)>> BDC"),
+            "header band is wrapped in a /GPHF (h) marked-content span"
+        );
+        // The default item draws in a *real embedded* Type0 font (resource `/GF…`,
+        // 2-byte Identity-H glyphs), NOT a base-14 reference (`/GpStd…`).
+        assert!(
+            contains_bytes(&content, b"/GF"),
+            "header text uses an embedded /GF font resource"
+        );
+        assert!(
+            !contains_bytes(&content, b"/GpStd"),
+            "header text must NOT fall back to a base-14 (/GpStd) font"
+        );
+    }
+
+    #[test]
+    fn running_header_footer_bakes_image_into_gphf_footer_span() {
+        let mut doc = blank_pages(1, 612.0, 792.0);
+        let png = hf_test_png();
+        let mut def = RunningHeaderFooter::default();
+        def.default.footer.push(HFItem::Image {
+            anchor: Align::Right,
+            dx: 0.0,
+            dy: 0.0,
+            w: 40.0,
+            h: 20.0,
+            image_id: 1,
+            opacity: 1.0,
+        });
+
+        doc.set_running_header_footer(&def, None, &[(1, png.as_slice())])
+            .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let content = reopened.page_content(1).unwrap();
+        assert!(
+            contains_bytes(&content, b"/GPHF <</T (f)>> BDC"),
+            "footer image is wrapped in a /GPHF (f) span"
+        );
+        assert!(
+            contains_bytes(&content, b" Do"),
+            "an image XObject is invoked (`Do`) in the footer band"
+        );
+        // The baked image is gated out of the editable image view.
+        assert!(
+            reopened.page_image_elements(1).is_empty(),
+            "the baked /GPHF image is excluded from page_image_elements"
+        );
+    }
+
+    #[test]
+    fn running_header_footer_is_idempotent() {
+        let mut doc = blank_pages(1, 612.0, 792.0);
+        let mut def = RunningHeaderFooter::default();
+        def.default.header.push(hf_text(Align::Left, "ONCE"));
+
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        let content = doc.page_content(1).unwrap();
+        let count = content
+            .windows(b"/GPHF <</T (h)>> BDC".len())
+            .filter(|w| *w == b"/GPHF <</T (h)>> BDC")
+            .count();
+        assert_eq!(count, 1, "re-baking must leave exactly one header span");
+    }
+
+    #[test]
+    fn running_header_footer_substitutes_all_tokens() {
+        // A base-14 reference handle draws WinAnsi-literal text, so the baked
+        // (substituted) string is recoverable through the marked-content reader.
+        let mut doc = blank_pages(3, 612.0, 792.0);
+        doc.set_info(&InfoFields {
+            title: Some("MyDoc".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let helv = doc.embed_font("Helvetica", &[]).unwrap();
+        let mut def = RunningHeaderFooter::default();
+        def.default.header.push(HFItem::Text {
+            anchor: Align::Left,
+            dx: 0.0,
+            dy: 0.0,
+            text: "{{title}} {{page}}/{{pages}} {{date}}".into(),
+            font_ref: Some(helv),
+            size: 10.0,
+            color: [0, 0, 0],
+            bold: false,
+            italic: false,
+        });
+
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        for (page, expect) in [(1u32, "MyDoc 1/3 2026-06-26"), (2, "MyDoc 2/3 2026-06-26")] {
+            let text = content::extract_marked_content_text(
+                &reopened.page_content(page).unwrap(),
+                b"h",
+            )
+            .unwrap_or_default();
+            assert!(
+                text.contains(expect),
+                "page {page} header should read '{expect}', got '{text}'"
+            );
+        }
+    }
+
+    #[test]
+    fn running_header_footer_selects_first_even_odd_zones() {
+        // Distinct per-zone header text (base-14 ref → recoverable), with first /
+        // even / odd flags both on; odd_page is None so odd pages fall to default.
+        let mut doc = blank_pages(4, 612.0, 792.0);
+        let helv = doc.embed_font("Helvetica", &[]).unwrap();
+        let text_item = |s: &str| HFItem::Text {
+            anchor: Align::Left,
+            dx: 0.0,
+            dy: 0.0,
+            text: s.into(),
+            font_ref: Some(helv),
+            size: 10.0,
+            color: [0, 0, 0],
+            bold: false,
+            italic: false,
+        };
+        let mut def = RunningHeaderFooter {
+            different_first_page: true,
+            different_odd_even: true,
+            ..RunningHeaderFooter::default()
+        };
+        def.default.header.push(text_item("DEFAULT"));
+        def.first_page = Some(HFZone {
+            header: vec![text_item("COVER")],
+            footer: vec![],
+        });
+        def.even_page = Some(HFZone {
+            header: vec![text_item("EVEN")],
+            footer: vec![],
+        });
+        // odd_page stays None → odd pages (>1) use the default zone.
+
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        let header_at = |p: u32| {
+            content::extract_marked_content_text(&reopened.page_content(p).unwrap(), b"h")
+                .unwrap_or_default()
+        };
+        assert!(header_at(1).contains("COVER"), "page 1 → first_page zone");
+        assert!(header_at(2).contains("EVEN"), "page 2 → even_page zone");
+        assert!(header_at(3).contains("DEFAULT"), "page 3 (odd) → default zone");
+        assert!(header_at(4).contains("EVEN"), "page 4 → even_page zone");
+    }
+
+    #[test]
+    fn running_header_footer_round_trips_through_sidecar() {
+        let mut doc = blank_pages(2, 612.0, 792.0);
+        let mut def = RunningHeaderFooter {
+            header_band: 30.0,
+            footer_band: 24.0,
+            different_first_page: true,
+            ..RunningHeaderFooter::default()
+        };
+        def.default.header.push(HFItem::Text {
+            anchor: Align::Center,
+            dx: 1.5,
+            dy: -2.0,
+            text: "Doc {{page}}".into(),
+            font_ref: Some(7),
+            size: 11.0,
+            color: [10, 20, 30],
+            bold: true,
+            italic: false,
+        });
+        def.first_page = Some(HFZone::default());
+
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+        assert_eq!(
+            reopened.running_header_footer(),
+            Some(def),
+            "the definition round-trips through the editor-meta sidecar"
+        );
+    }
+
+    #[test]
+    fn running_header_footer_preserves_other_sidecar_keys() {
+        let mut doc = blank_pages(1, 612.0, 792.0);
+        doc.set_editor_meta(r#"{"theme":"dark"}"#).unwrap();
+        let mut def = RunningHeaderFooter::default();
+        def.default.header.push(hf_text(Align::Left, "X"));
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        let meta = doc.editor_meta().unwrap();
+        assert!(meta.contains("\"theme\":\"dark\""), "host key kept: {meta}");
+        assert!(meta.contains("\"headerFooter\""), "def merged: {meta}");
+    }
+
+    #[test]
+    fn running_header_footer_band_is_excluded_from_extraction_and_maskable() {
+        let mut doc = blank_pages(1, 612.0, 792.0);
+        let mut def = RunningHeaderFooter::default();
+        def.default.header.push(hf_text(Align::Center, "BANDONLY"));
+        doc.set_running_header_footer(&def, Some("2026-06-26"), &[])
+            .unwrap();
+        let reopened = Document::open(&doc.save()).unwrap();
+
+        // Gate: the baked band never surfaces as editable body text.
+        let runs = reopened.page_text_runs(1).unwrap();
+        assert!(
+            runs.iter().all(|r| !r.text.contains("BANDONLY")),
+            "the running header is gated out of page_text_runs"
+        );
+
+        // Render: excluding the /GPHF span drops the band's painted pixels.
+        let full = reopened.render_page(1, 1.0).unwrap();
+        let masked = reopened
+            .render_page_excluding_marked_content(1, 1.0, false, "GPHF")
+            .unwrap();
+        assert_ne!(full, masked, "masking the /GPHF band changes the raster");
+        let nonwhite = |png: &[u8]| -> usize {
+            crate::raster::decode_png(png)
+                .expect("valid PNG")
+                .rgba
+                .chunks_exact(4)
+                .filter(|px| px[0] != 255 || px[1] != 255 || px[2] != 255)
+                .count()
+        };
+        assert!(
+            nonwhite(&full) > nonwhite(&masked),
+            "the masked render paints strictly fewer pixels"
+        );
     }
 
     /// Build a one-page PDF whose page stream is `stream` and whose `/Resources`
@@ -32643,6 +33921,80 @@ mod tests {
         assert!(
             runs.iter().any(|r| r.text == "àB"),
             "/Differences must remap 0x41→agrave, keep 0x42→B: {runs:?}"
+        );
+    }
+
+    /// The s3705 corruption: a subset font repacks real glyphs onto ASCII slots
+    /// via `/Encoding`+`/Differences` (`gNN` names), while a broken, identity-
+    /// aligned `/ToUnicode` OMITS those very codes. The gap-filler used to invent
+    /// `code → chr(code)` for them, and since `/ToUnicode` is consulted *before*
+    /// `/Encoding`+`/Differences`, that synthetic entry masked the real glyph —
+    /// `'parents'` extracted as `'&are%ts'`. The fix reserves the `/Differences`
+    /// codes so the filler skips them and the decoder resolves them authoritatively.
+    #[test]
+    fn extraction_skips_gap_fill_for_differences_repacked_codes() {
+        // Content draws "parents" with the repacked codes 0x26 (p) and 0x25 (n)
+        // and the genuine ASCII letters a,r,e,t,s (0x61,0x72,0x65,0x74,0x73).
+        // Bytes: 26 61 72 65 25 74 73.
+        let stream = "BT /F1 12 Tf 20 100 Td <26617265257473> Tj ET";
+        // `/ToUnicode`: identity (delta 0) over a..u — ≥8 samples so it self-
+        // calibrates to 0 — but deliberately OMITS 0x25 and 0x26 (the repacked
+        // slots). Without the reservation, the filler would inject 0x25→'%',
+        // 0x26→'&', exactly the bug.
+        let tounicode = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap \
+            1 begincodespacerange <00> <FF> endcodespacerange \
+            1 beginbfrange <61> <75> <0061> endbfrange \
+            endcmap end end";
+        let pdf = raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!("<< /Length {} >> stream\n{stream}\nendstream", stream.len()),
+            ),
+            // Simple Type1 subset: `/Differences` repacks g81=n onto 0x25 and
+            // g83=p onto 0x26 (Standard Macintosh Glyph Ordering indices). No
+            // FontFile — the `gNN` names resolve via MAC_GLYPH_ORDER alone, as
+            // Acrobat resolves them.
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /AAAAAA+Times \
+                 /Encoding << /Type /Encoding \
+                 /Differences [37 /g81 38 /g83] >> /ToUnicode 7 0 R >>"
+                    .into(),
+            ),
+            (
+                7,
+                format!(
+                    "<< /Length {} >> stream\n{tounicode}\nendstream",
+                    tounicode.len()
+                ),
+            ),
+        ]);
+        let doc = Document::open(&pdf).unwrap();
+        let runs = doc.page_text_runs(1).unwrap();
+        let all: String = runs.iter().map(|r| r.text.as_str()).collect();
+
+        // The corrupted form must never appear, and the punctuation the broken
+        // gap-fill would have invented ('&'/'%') must be absent.
+        assert!(
+            !all.contains('&') && !all.contains('%'),
+            "gap-fill must not invent punctuation over /Differences slots: {all:?}"
+        );
+        assert!(
+            !all.contains("&are%ts"),
+            "must not reproduce the s3705 corruption: {all:?}"
+        );
+        // The /Differences resolution recovers the real word.
+        assert!(
+            runs.iter().any(|r| r.text == "parents"),
+            "extraction must yield the real glyphs via /Differences: {runs:?}"
         );
     }
 

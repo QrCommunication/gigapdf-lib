@@ -24,6 +24,7 @@ use gigapdf_core::{
     Action, AfRelationship, Annotation, Bookmark, CollectionConfig, Color, ContentElement,
     Document, ElementKind, EmbeddedFontInfo, FieldKind, FormField, GradientKind, GradientSpec,
     GradientStop, HeaderFooterSpec, InfoFields, Layer, Link, LinkTarget, Margins, OutlineItem,
+    RunningHeaderFooter,
     PageBox, PageLabelRange, PageLabelStyle, PageTransition, Permissions, SearchMatch,
     TextLayerRun, TextLine, TextRun, TransitionDimension, TransitionDirection, TransitionMotion,
     TransitionStyle, ViewerPreferences,
@@ -3002,6 +3003,50 @@ pub extern "C" fn gp_set_page_margins(
     edit(handle, |doc| doc.set_page_margins(page, m))
 }
 
+/// Record the editor's per-page display margins (points) in the GigaPDF
+/// editor-metadata sidecar (catalog `/GigaPDF /EditorMeta`), **without touching
+/// `/CropBox` or `/MediaBox`** — the editor-only twin of `gp_set_page_margins`
+/// (which performs a real recrop). Returns `0` on success, `<0` on error.
+#[no_mangle]
+pub extern "C" fn gp_set_editor_margins(
+    handle: *mut Document,
+    page: u32,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    left: f64,
+) -> i32 {
+    let m = Margins {
+        top,
+        right,
+        bottom,
+        left,
+    };
+    edit(handle, |doc| doc.set_editor_margins(page, m))
+}
+
+/// The editor's per-page display margins for `page` as JSON
+/// `{"top":…,"right":…,"bottom":…,"left":…}` (points), read from the sidecar — or
+/// a **null** pointer when none were recorded for the page. Buffer-returning
+/// (host frees).
+#[no_mangle]
+pub extern "C" fn gp_editor_margins(
+    handle: *const Document,
+    page: u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    match unsafe { handle.as_ref() }.and_then(|doc| doc.editor_margins(page)) {
+        Some(m) => {
+            let json = format!(
+                "{{\"top\":{},\"right\":{},\"bottom\":{},\"left\":{}}}",
+                m.top, m.right, m.bottom, m.left
+            );
+            unsafe { bytes_into_host(json.into_bytes(), out_len) }
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// A page's five boundary boxes (ISO 32000-1 §14.11.2) as JSON. Each box is the
 /// effective rectangle `[x0,y0,x1,y1]` in points (inheritance + the per-box
 /// default chain applied), and `declared` flags which boxes are explicitly
@@ -3439,6 +3484,84 @@ pub extern "C" fn gp_header_footer(handle: *const Document, out_len: *mut usize)
     unsafe { bytes_into_host(json.into_bytes(), out_len) }
 }
 
+/// Bake a **rich** running header/footer from a [`RunningHeaderFooter`] JSON
+/// `definition` onto every page (the Word-like API; the def is the source of
+/// truth, stored in the editor-meta sidecar). `date` (`date_ptr`/`date_len`,
+/// empty → none) is the bake date for `{{date}}`. `images`
+/// (`images_ptr`/`images_len`) is a little-endian blob of image bytes keyed by
+/// the def's `imageId`s: `[u32 count]` then, per entry, `[u32 imageId][u32
+/// byteLen][bytes…]`; pass `len == 0` for none. Returns `0`, `-1` null handle,
+/// `-2` bad def JSON, `-3` on bake error.
+#[no_mangle]
+pub extern "C" fn gp_set_running_header_footer(
+    handle: *mut Document,
+    def_ptr: *const u8,
+    def_len: usize,
+    date_ptr: *const u8,
+    date_len: usize,
+    images_ptr: *const u8,
+    images_len: usize,
+) -> i32 {
+    let doc = match unsafe { handle.as_mut() } {
+        Some(doc) => doc,
+        None => return -1,
+    };
+    let def = match RunningHeaderFooter::from_json(unsafe { str_arg(def_ptr, def_len) }) {
+        Some(d) => d,
+        None => return -2,
+    };
+    let date = if date_len == 0 || date_ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { str_arg(date_ptr, date_len) })
+    };
+    // Decode the images blob into (imageId, bytes) slices borrowing the host
+    // buffer (valid for this synchronous call only).
+    let mut images: Vec<(u32, &[u8])> = Vec::new();
+    if !images_ptr.is_null() && images_len >= 4 {
+        let blob = unsafe { std::slice::from_raw_parts(images_ptr, images_len) };
+        let read_u32 = |b: &[u8], i: usize| {
+            b.get(i..i + 4)
+                .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        };
+        let mut i = 0usize;
+        if let Some(count) = read_u32(blob, i) {
+            i += 4;
+            for _ in 0..count {
+                let (Some(id), Some(blen)) = (read_u32(blob, i), read_u32(blob, i + 4)) else {
+                    break;
+                };
+                i += 8;
+                let blen = blen as usize;
+                let Some(bytes) = blob.get(i..i + blen) else {
+                    break;
+                };
+                i += blen;
+                images.push((id, bytes));
+            }
+        }
+    }
+    match doc.set_running_header_footer(&def, date, &images) {
+        Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
+/// The rich running header/footer definition as [`RunningHeaderFooter`] JSON
+/// (the reader counterpart of [`gp_set_running_header_footer`]), read from the
+/// editor-meta sidecar (or reconstructed from a legacy flat header/footer). A
+/// **null** pointer when the document carries none. Buffer-returning (host frees).
+#[no_mangle]
+pub extern "C" fn gp_running_header_footer(
+    handle: *const Document,
+    out_len: *mut usize,
+) -> *mut u8 {
+    match unsafe { handle.as_ref() }.and_then(Document::running_header_footer) {
+        Some(def) => unsafe { bytes_into_host(def.to_json().into_bytes(), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Rasterize a page to a PNG at `scale` device pixels per PDF point, using the
 /// built-in zero-dependency renderer. Buffer-returning (host frees); null on
 /// error.
@@ -3511,6 +3634,35 @@ pub extern "C" fn gp_render_page_excluding(
             Ok(png) => unsafe { bytes_into_host(png, out_len) },
             Err(_) => std::ptr::null_mut(),
         },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Rasterize `page` to a PNG at `scale`, **excluding the ops inside a baked
+/// marked-content span** named `marker` (UTF-8 at `marker_ptr`/`marker_len`; e.g.
+/// `"GPHF"` = the baked running header/footer band). When `skip_text` is non-zero
+/// the page's content-stream text is suppressed too — the editor's display
+/// background minus the masked band. One single raster pass; like
+/// `gp_render_page_no_text`, form-field widget appearances are omitted. An unknown
+/// marker renders the page normally. Buffer-returning (host frees); null on error.
+#[no_mangle]
+pub extern "C" fn gp_render_page_excluding_marked_content(
+    handle: *const Document,
+    page: u32,
+    scale: f64,
+    skip_text: i32,
+    marker_ptr: *const u8,
+    marker_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let marker = unsafe { str_arg(marker_ptr, marker_len) };
+    match unsafe { handle.as_ref() } {
+        Some(doc) => {
+            match doc.render_page_excluding_marked_content(page, scale, skip_text != 0, marker) {
+                Ok(png) => unsafe { bytes_into_host(png, out_len) },
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
         None => std::ptr::null_mut(),
     }
 }
@@ -5481,6 +5633,26 @@ pub extern "C" fn gp_get_xmp(handle: *const Document, out_len: *mut usize) -> *m
 pub extern "C" fn gp_set_xmp(handle: *mut Document, ptr: *const u8, len: usize) -> i32 {
     let bytes = unsafe { opt_slice(ptr, len) };
     edit(handle, |doc| doc.set_xmp(bytes))
+}
+
+/// Store an opaque JSON string as the GigaPDF editor-metadata sidecar (catalog
+/// `/GigaPDF /EditorMeta`, a FlateDecode-compressed stream; ignored by standard
+/// readers, survives save/open). Returns `0` on success, `-1` null handle, `-3`
+/// on error.
+#[no_mangle]
+pub extern "C" fn gp_set_editor_meta(handle: *mut Document, ptr: *const u8, len: usize) -> i32 {
+    let json = unsafe { str_arg(ptr, len) };
+    edit(handle, |doc| doc.set_editor_meta(json))
+}
+
+/// The GigaPDF editor-metadata sidecar string, or a **null** pointer when the
+/// document carries none. Buffer-returning (host frees).
+#[no_mangle]
+pub extern "C" fn gp_editor_meta(handle: *const Document, out_len: *mut usize) -> *mut u8 {
+    match unsafe { handle.as_ref() }.and_then(Document::editor_meta) {
+        Some(json) => unsafe { bytes_into_host(json.into_bytes(), out_len) },
+        None => std::ptr::null_mut(),
+    }
 }
 
 /// Set the standard document-information fields from a JSON object

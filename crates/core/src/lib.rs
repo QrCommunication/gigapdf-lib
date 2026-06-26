@@ -70,7 +70,9 @@ pub use document::{
 };
 pub use error::{EngineError, Result};
 pub use form::{FieldKind, FieldTrigger, FormField};
-pub use headerfooter::{Align, HeaderFooter, HeaderFooterSpec, Margins};
+pub use headerfooter::{
+    Align, HFAlign, HFItem, HFZone, HeaderFooter, HeaderFooterSpec, Margins, RunningHeaderFooter,
+};
 pub use lexer::{Lexer, Token};
 pub use link::{Link, LinkTarget};
 pub use object::{Dictionary, Object, ObjectId, Stream, StringKind};

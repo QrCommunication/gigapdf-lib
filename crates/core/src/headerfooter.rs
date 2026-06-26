@@ -197,6 +197,409 @@ impl HeaderFooterSpec {
         out.push_str(&format!(",\"bandHeight\":{}}}", self.band_height));
         out
     }
+
+    /// Lower this flat one-sided spec into a rich [`RunningHeaderFooter`] carrying
+    /// a single [`HFItem::Text`] in the `default` zone — on the **header** side
+    /// when `header == true`, else the footer. `text`/`align`/`font_size`/`color`
+    /// map across (colour 0..=1 → 0..=255); `band_height` becomes the matching
+    /// `header_band`/`footer_band`. `show_on_first_page == false` sets
+    /// `different_first_page` with an **empty** `first_page` zone, so the cover
+    /// shows nothing — the rich equivalent of the flat "no header on the cover".
+    /// `page_range` has no rich counterpart and is dropped (the flat
+    /// [`Document::set_header`](crate::document::Document::set_header) path still
+    /// honours it). This is the bridge that lets a host migrate the flat API onto
+    /// the rich [`Document::set_running_header_footer`](crate::document::Document::set_running_header_footer).
+    pub fn to_running(&self, header: bool) -> RunningHeaderFooter {
+        let to_u8 = |c: f64| (c * 255.0).round().clamp(0.0, 255.0) as u8;
+        let item = HFItem::Text {
+            anchor: self.align,
+            dx: 0.0,
+            dy: 0.0,
+            text: self.text.clone(),
+            font_ref: None,
+            size: self.font_size as f32,
+            color: [to_u8(self.color[0]), to_u8(self.color[1]), to_u8(self.color[2])],
+            bold: false,
+            italic: false,
+        };
+        let mut zone = HFZone::default();
+        if header {
+            zone.header.push(item);
+        } else {
+            zone.footer.push(item);
+        }
+        let band = self.band_height as f32;
+        RunningHeaderFooter {
+            default: zone,
+            // A blank cover zone when the flat spec hid the first page.
+            first_page: (!self.show_on_first_page).then(HFZone::default),
+            even_page: None,
+            odd_page: None,
+            different_first_page: !self.show_on_first_page,
+            different_odd_even: false,
+            header_band: band,
+            footer_band: band,
+        }
+    }
+}
+
+/// Horizontal anchor of a header/footer item within the printable width. An
+/// alias of [`Align`] so the rich [`HFItem`] and the flat [`HeaderFooterSpec`]
+/// share a single spelling of left/center/right (they never drift).
+pub type HFAlign = Align;
+
+/// One drawable element of a running header or footer band: a line of **text**
+/// or an **image**. Each item is anchored (`anchor`) within the printable width
+/// then nudged by `(dx, dy)` points in PDF axes (`+dx` → right, `+dy` → up).
+/// All distances are `f32` points (`1pt = 1/72in`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum HFItem {
+    /// A line of text. May contain the bake tokens `{{page}}`, `{{pages}}`,
+    /// `{{date}}` and `{{title}}` (substituted at bake time). `font_ref` is an
+    /// embedded-font object id (from
+    /// [`Document::embed_font`](crate::document::Document::embed_font)); `None`
+    /// uses the engine's bundled OFL face (a real embedded font, never base-14).
+    /// `color` is RGB `0..=255`.
+    Text {
+        anchor: HFAlign,
+        dx: f32,
+        dy: f32,
+        text: String,
+        font_ref: Option<u32>,
+        size: f32,
+        color: [u8; 3],
+        bold: bool,
+        italic: bool,
+    },
+    /// A raster image, `w`×`h` points. `image_id` keys the image bytes supplied
+    /// to the bake (the def itself stores only the id, not the pixels). `opacity`
+    /// is `0..=1`.
+    Image {
+        anchor: HFAlign,
+        dx: f32,
+        dy: f32,
+        w: f32,
+        h: f32,
+        image_id: u32,
+        opacity: f32,
+    },
+}
+
+impl HFItem {
+    /// Append this item as a JSON object to `out` (the shape [`parse`](Self::parse)
+    /// reads): `{"type":"text"|"image", "anchor":…, "dx":…, …}`.
+    fn write_json(&self, out: &mut String) {
+        let anchor_str = |a: HFAlign| match a {
+            Align::Left => "left",
+            Align::Center => "center",
+            Align::Right => "right",
+        };
+        match self {
+            HFItem::Text {
+                anchor,
+                dx,
+                dy,
+                text,
+                font_ref,
+                size,
+                color,
+                bold,
+                italic,
+            } => {
+                out.push_str("{\"type\":\"text\",\"anchor\":");
+                json_escape(anchor_str(*anchor), out);
+                out.push_str(&format!(",\"dx\":{dx},\"dy\":{dy},\"text\":"));
+                json_escape(text, out);
+                match font_ref {
+                    Some(r) => out.push_str(&format!(",\"fontRef\":{r}")),
+                    None => out.push_str(",\"fontRef\":null"),
+                }
+                out.push_str(&format!(
+                    ",\"size\":{size},\"color\":[{},{},{}],\"bold\":{bold},\"italic\":{italic}}}",
+                    color[0], color[1], color[2]
+                ));
+            }
+            HFItem::Image {
+                anchor,
+                dx,
+                dy,
+                w,
+                h,
+                image_id,
+                opacity,
+            } => {
+                out.push_str("{\"type\":\"image\",\"anchor\":");
+                json_escape(anchor_str(*anchor), out);
+                out.push_str(&format!(
+                    ",\"dx\":{dx},\"dy\":{dy},\"w\":{w},\"h\":{h},\"imageId\":{image_id},\"opacity\":{opacity}}}"
+                ));
+            }
+        }
+    }
+
+    /// Read one item object at the cursor. The `"type"` key (`"image"` vs
+    /// anything else → text) selects the variant; absent fields take sensible
+    /// defaults. `None` only on malformed JSON.
+    fn parse(p: &mut ObjReader) -> Option<HFItem> {
+        let mut kind = String::new();
+        let mut anchor = Align::Left;
+        let (mut dx, mut dy) = (0.0f32, 0.0f32);
+        let mut text = String::new();
+        let mut font_ref: Option<u32> = None;
+        let mut size = 10.0f32;
+        let mut color = [0u8; 3];
+        let (mut bold, mut italic) = (false, false);
+        let (mut w, mut h) = (0.0f32, 0.0f32);
+        let mut image_id = 0u32;
+        let mut opacity = 1.0f32;
+        p.object(|p, key| {
+            match key {
+                "type" => kind = p.string()?,
+                "anchor" => anchor = Align::from_str_lossy(&p.string()?),
+                "dx" => dx = p.number()? as f32,
+                "dy" => dy = p.number()? as f32,
+                "text" => text = p.string()?,
+                "fontRef" | "font_ref" => {
+                    if p.peek()? == b'n' {
+                        p.null()?;
+                        font_ref = None;
+                    } else {
+                        font_ref = Some(p.number()? as u32);
+                    }
+                }
+                "size" => size = p.number()? as f32,
+                "color" => {
+                    let nums = p.number_array()?;
+                    if nums.len() >= 3 {
+                        color = [clamp_u8(nums[0]), clamp_u8(nums[1]), clamp_u8(nums[2])];
+                    }
+                }
+                "bold" => bold = p.boolean()?,
+                "italic" => italic = p.boolean()?,
+                "w" => w = p.number()? as f32,
+                "h" => h = p.number()? as f32,
+                "imageId" | "image_id" => image_id = p.number()? as u32,
+                "opacity" => opacity = p.number()? as f32,
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        Some(if kind == "image" {
+            HFItem::Image {
+                anchor,
+                dx,
+                dy,
+                w,
+                h,
+                image_id,
+                opacity,
+            }
+        } else {
+            HFItem::Text {
+                anchor,
+                dx,
+                dy,
+                text,
+                font_ref,
+                size,
+                color,
+                bold,
+                italic,
+            }
+        })
+    }
+}
+
+/// Clamp/round a JSON number to a `u8` colour channel (`0..=255`).
+fn clamp_u8(n: f64) -> u8 {
+    n.round().clamp(0.0, 255.0) as u8
+}
+
+/// The header and footer item lists of one running-H/F **zone** (a page class:
+/// the default, the first page, even pages, or odd pages). Either list may be
+/// empty (that band is not drawn for the zone).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HFZone {
+    /// Items drawn in the top (header) band.
+    pub header: Vec<HFItem>,
+    /// Items drawn in the bottom (footer) band.
+    pub footer: Vec<HFItem>,
+}
+
+impl HFZone {
+    /// Append this zone as a JSON object `{"header":[…],"footer":[…]}` to `out`.
+    fn write_json(&self, out: &mut String) {
+        out.push_str("{\"header\":[");
+        for (i, it) in self.header.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            it.write_json(out);
+        }
+        out.push_str("],\"footer\":[");
+        for (i, it) in self.footer.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            it.write_json(out);
+        }
+        out.push_str("]}");
+    }
+
+    /// Read a zone object at the cursor (`{"header":[…],"footer":[…]}`); absent
+    /// lists default to empty. `None` only on malformed JSON.
+    fn parse(p: &mut ObjReader) -> Option<HFZone> {
+        let mut zone = HFZone::default();
+        p.object(|p, key| {
+            match key {
+                "header" => p.array(|p| {
+                    zone.header.push(HFItem::parse(p)?);
+                    Some(())
+                })?,
+                "footer" => p.array(|p| {
+                    zone.footer.push(HFItem::parse(p)?);
+                    Some(())
+                })?,
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        Some(zone)
+    }
+
+    /// Read an optional zone (`null` → `None`).
+    fn parse_opt(p: &mut ObjReader) -> Option<Option<HFZone>> {
+        if p.peek()? == b'n' {
+            p.null()?;
+            Some(None)
+        } else {
+            Some(Some(HFZone::parse(p)?))
+        }
+    }
+}
+
+/// A rich, Word-like running header/footer **definition**: per-page-class zones
+/// of [`HFItem`]s plus the band geometry. This is the **source of truth** stored
+/// in the GigaPDF editor-metadata sidecar; the bake
+/// ([`Document::set_running_header_footer`](crate::document::Document::set_running_header_footer))
+/// regenerates the *visible* `/GPHF` marked-content band from it.
+///
+/// Zone selection per 1-based page: page 1 → `first_page` when
+/// `different_first_page` (else `default`); otherwise, when `different_odd_even`,
+/// even pages → `even_page` and odd pages → `odd_page` (each falling back to
+/// `default` when its zone is `None`); otherwise `default` everywhere.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningHeaderFooter {
+    /// The zone used by every page not overridden by a more specific zone.
+    pub default: HFZone,
+    /// First-page override (used when [`different_first_page`](Self::different_first_page)).
+    pub first_page: Option<HFZone>,
+    /// Even-page override (used when [`different_odd_even`](Self::different_odd_even)).
+    pub even_page: Option<HFZone>,
+    /// Odd-page override (used when [`different_odd_even`](Self::different_odd_even)).
+    pub odd_page: Option<HFZone>,
+    /// Give page 1 its own [`first_page`](Self::first_page) zone.
+    pub different_first_page: bool,
+    /// Give even/odd pages their own [`even_page`](Self::even_page) /
+    /// [`odd_page`](Self::odd_page) zones.
+    pub different_odd_even: bool,
+    /// Header band height (points): the distance from the top edge that the
+    /// header baseline sits at.
+    pub header_band: f32,
+    /// Footer band height (points): the distance from the bottom edge that the
+    /// footer baseline sits at.
+    pub footer_band: f32,
+}
+
+impl Default for RunningHeaderFooter {
+    /// Empty zones, no per-page overrides, 36pt (0.5") bands.
+    fn default() -> Self {
+        Self {
+            default: HFZone::default(),
+            first_page: None,
+            even_page: None,
+            odd_page: None,
+            different_first_page: false,
+            different_odd_even: false,
+            header_band: 36.0,
+            footer_band: 36.0,
+        }
+    }
+}
+
+impl RunningHeaderFooter {
+    /// The zone effective for the 1-based `page` (see the type docs for the
+    /// selection rule). Borrows from `self`.
+    pub fn zone_for(&self, page: usize) -> &HFZone {
+        if self.different_first_page && page == 1 {
+            return self.first_page.as_ref().unwrap_or(&self.default);
+        }
+        if self.different_odd_even {
+            return if page.is_multiple_of(2) {
+                self.even_page.as_ref().unwrap_or(&self.default)
+            } else {
+                self.odd_page.as_ref().unwrap_or(&self.default)
+            };
+        }
+        &self.default
+    }
+
+    /// Serialise to a compact JSON object (the inverse of [`from_json`](Self::from_json)).
+    /// Hand-rolled, zero-dependency — the shape the SDK/WASM layer exchanges and
+    /// the sidecar stores under its `headerFooter` key.
+    pub fn to_json(&self) -> String {
+        let mut out = String::from("{\"default\":");
+        self.default.write_json(&mut out);
+        let opt = |k: &str, z: &Option<HFZone>, out: &mut String| {
+            out.push_str(k);
+            match z {
+                Some(zone) => zone.write_json(out),
+                None => out.push_str("null"),
+            }
+        };
+        opt(",\"firstPage\":", &self.first_page, &mut out);
+        opt(",\"evenPage\":", &self.even_page, &mut out);
+        opt(",\"oddPage\":", &self.odd_page, &mut out);
+        out.push_str(&format!(
+            ",\"differentFirstPage\":{},\"differentOddEven\":{},\"headerBand\":{},\"footerBand\":{}}}",
+            self.different_first_page, self.different_odd_even, self.header_band, self.footer_band
+        ));
+        out
+    }
+
+    /// Parse a JSON object into a definition, filling absent fields from
+    /// [`Default`]. Recognised keys: `default`, `firstPage`/`first_page`,
+    /// `evenPage`/`even_page`, `oddPage`/`odd_page` (each a zone or `null`),
+    /// `differentFirstPage`/`different_first_page`,
+    /// `differentOddEven`/`different_odd_even` (bools), `headerBand`/`header_band`,
+    /// `footerBand`/`footer_band` (numbers). `None` only on malformed JSON or
+    /// trailing junk (so a host gets a clear error, never a silently-wrong def).
+    pub fn from_json(s: &str) -> Option<Self> {
+        let mut def = RunningHeaderFooter::default();
+        let mut p = ObjReader::new(s);
+        p.object(|p, key| {
+            match key {
+                "default" => def.default = HFZone::parse(p)?,
+                "firstPage" | "first_page" => def.first_page = HFZone::parse_opt(p)?,
+                "evenPage" | "even_page" => def.even_page = HFZone::parse_opt(p)?,
+                "oddPage" | "odd_page" => def.odd_page = HFZone::parse_opt(p)?,
+                "differentFirstPage" | "different_first_page" => {
+                    def.different_first_page = p.boolean()?
+                }
+                "differentOddEven" | "different_odd_even" => def.different_odd_even = p.boolean()?,
+                "headerBand" | "header_band" => def.header_band = p.number()? as f32,
+                "footerBand" | "footer_band" => def.footer_band = p.number()? as f32,
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.ws();
+        if p.done() {
+            Some(def)
+        } else {
+            None
+        }
+    }
 }
 
 /// Append a JSON-escaped string literal (`"…"`) to `out`. Same escaping as the
@@ -615,5 +1018,143 @@ mod tests {
 
         let empty = HeaderFooter::default().to_json();
         assert_eq!(empty, "{\"header\":null,\"footer\":null}");
+    }
+
+    fn sample_def() -> RunningHeaderFooter {
+        RunningHeaderFooter {
+            default: HFZone {
+                header: vec![HFItem::Text {
+                    anchor: Align::Center,
+                    dx: 1.5,
+                    dy: -2.0,
+                    text: "Doc {{page}}/{{pages}}".into(),
+                    font_ref: Some(7),
+                    size: 11.0,
+                    color: [10, 20, 30],
+                    bold: true,
+                    italic: false,
+                }],
+                footer: vec![HFItem::Image {
+                    anchor: Align::Right,
+                    dx: 0.0,
+                    dy: 0.0,
+                    w: 40.0,
+                    h: 20.0,
+                    image_id: 3,
+                    opacity: 0.8,
+                }],
+            },
+            first_page: Some(HFZone::default()),
+            even_page: Some(HFZone {
+                header: vec![HFItem::Text {
+                    anchor: Align::Left,
+                    dx: 0.0,
+                    dy: 0.0,
+                    text: "even".into(),
+                    font_ref: None,
+                    size: 9.0,
+                    color: [0, 0, 0],
+                    bold: false,
+                    italic: true,
+                }],
+                footer: vec![],
+            }),
+            odd_page: None,
+            different_first_page: true,
+            different_odd_even: true,
+            header_band: 30.0,
+            footer_band: 24.0,
+        }
+    }
+
+    #[test]
+    fn running_header_footer_round_trips_through_json() {
+        let def = sample_def();
+        let back = RunningHeaderFooter::from_json(&def.to_json()).unwrap();
+        assert_eq!(back, def);
+    }
+
+    #[test]
+    fn running_header_footer_defaults_and_null_zones() {
+        let def =
+            RunningHeaderFooter::from_json(r#"{"default":{"header":[],"footer":[]}}"#).unwrap();
+        assert!(def.first_page.is_none());
+        assert!(!def.different_first_page);
+        assert_eq!(def.header_band, 36.0);
+        assert_eq!(def.footer_band, 36.0);
+    }
+
+    #[test]
+    fn running_header_footer_rejects_trailing_junk() {
+        assert!(RunningHeaderFooter::from_json("not json").is_none());
+        assert!(RunningHeaderFooter::from_json(r#"{"default":{}} extra"#).is_none());
+    }
+
+    #[test]
+    fn zone_for_selects_first_even_odd_and_default() {
+        let def = sample_def(); // different_first_page + different_odd_even both on
+        assert_eq!(def.zone_for(1), def.first_page.as_ref().unwrap(), "page 1 → first");
+        assert_eq!(def.zone_for(2), def.even_page.as_ref().unwrap(), "page 2 → even");
+        // odd_page is None → fall back to default for odd pages > 1.
+        assert_eq!(def.zone_for(3), &def.default, "page 3 → default (odd fallback)");
+
+        // With both flags off, every page is the default zone.
+        let plain = RunningHeaderFooter {
+            different_first_page: false,
+            different_odd_even: false,
+            ..sample_def()
+        };
+        assert_eq!(plain.zone_for(1), &plain.default);
+        assert_eq!(plain.zone_for(2), &plain.default);
+    }
+
+    #[test]
+    fn hf_item_image_round_trips() {
+        let item = HFItem::Image {
+            anchor: Align::Center,
+            dx: -3.0,
+            dy: 4.0,
+            w: 50.0,
+            h: 25.0,
+            image_id: 9,
+            opacity: 0.5,
+        };
+        let mut json = String::new();
+        item.write_json(&mut json);
+        let mut p = ObjReader::new(&json);
+        assert_eq!(HFItem::parse(&mut p).unwrap(), item);
+    }
+
+    #[test]
+    fn header_footer_spec_lowers_to_running() {
+        let spec = HeaderFooterSpec {
+            text: "P {{page}}".into(),
+            align: Align::Right,
+            font_size: 12.0,
+            color: [1.0, 0.0, 0.0],
+            page_range: Some((2, 4)),
+            show_on_first_page: false,
+            band_height: 40.0,
+        };
+        let def = spec.to_running(true);
+        assert!(def.different_first_page, "hidden cover → different first page");
+        assert!(def.first_page.as_ref().unwrap().header.is_empty(), "cover is blank");
+        assert_eq!(def.header_band, 40.0);
+        assert_eq!(def.default.footer.len(), 0);
+        match &def.default.header[..] {
+            [HFItem::Text { anchor, text, color, size, font_ref, .. }] => {
+                assert_eq!(*anchor, Align::Right);
+                assert_eq!(text, "P {{page}}");
+                assert_eq!(*color, [255, 0, 0]);
+                assert_eq!(*size, 12.0);
+                assert_eq!(*font_ref, None);
+            }
+            other => panic!("expected one text item, got {other:?}"),
+        }
+
+        // The footer side lowers symmetrically.
+        let footer_def = spec.to_running(false);
+        assert_eq!(footer_def.default.header.len(), 0);
+        assert_eq!(footer_def.default.footer.len(), 1);
     }
 }

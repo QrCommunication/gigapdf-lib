@@ -8,7 +8,7 @@
 //! `beginbfchar`/`beginbfrange` blocks. The CMap is lexed with our own
 //! [`Lexer`], so no new tokenizer and zero dependencies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::lexer::{Lexer, Token};
 
@@ -92,9 +92,17 @@ impl ToUnicode {
     /// **only when its own handful of entries is consistent with it** (none
     /// contradicts), so a genuinely different font is never mis-filled.
     ///
+    /// `reserved` lists character codes that the font's `/Encoding`+`/Differences`
+    /// resolves **authoritatively** (a glyph repacked onto an ASCII slot, e.g.
+    /// `n`@0x25, `p`@0x26). The gap-filler must never invent a `code → chr(code)`
+    /// mapping for such a code: that synthetic `/ToUnicode` entry would be consulted
+    /// *before* `/Encoding`+`/Differences` (see [`Self`]'s decoder) and mask the
+    /// correct glyph, corrupting extraction (`'parents'` → `'&are%ts'`). These codes
+    /// are therefore skipped, leaving the decoder to resolve them via `/Differences`.
+    ///
     /// No-op for well-formed CMaps: a complete `/ToUnicode` has no gaps among the
     /// codes it covers, so nothing is added.
-    pub fn infer_ascii_gaps(&mut self, doc_delta: Option<i64>) {
+    pub fn infer_ascii_gaps(&mut self, doc_delta: Option<i64>, reserved: &BTreeSet<u32>) {
         // Tally the delta of every single-scalar, ASCII-printable entry.
         let mut deltas: BTreeMap<i64, u32> = BTreeMap::new();
         let mut min_code = u32::MAX;
@@ -154,7 +162,11 @@ impl ToUnicode {
             Err(_) => return,
         };
         for code in lo..=hi {
-            if self.map.contains_key(&code) {
+            // Skip codes already mapped, and codes the font's `/Encoding`+
+            // `/Differences` owns authoritatively (a glyph repacked onto an ASCII
+            // slot): inventing `code → chr(code)` for them would mask the real
+            // glyph at decode time, since `/ToUnicode` is consulted first.
+            if self.map.contains_key(&code) || reserved.contains(&code) {
                 continue;
             }
             let scalar = code as i64 + delta;
@@ -933,6 +945,7 @@ impl TextDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn parses_bfchar_pairs() {
@@ -1019,7 +1032,7 @@ mod tests {
               endbfrange",
         ); // A, a..i, l..v
         assert_eq!(cmap.decode(0x2d), None); // J unmapped before
-        cmap.infer_ascii_gaps(None);
+        cmap.infer_ascii_gaps(None, &BTreeSet::new());
         assert_eq!(cmap.decode(0x2d), Some("J")); // 0x2d + 0x1D = 0x4A
         assert_eq!(cmap.decode(0x0a), Some("'")); // quote slot recovered
         assert_eq!(cmap.decode(0x03), Some(" ")); // space recovered
@@ -1034,7 +1047,7 @@ mod tests {
         // document-wide delta because its two entries are consistent with it.
         let mut cmap =
             ToUnicode::parse(b"beginbfrange <0032> <0032> <004f> <0036> <0036> <0053> endbfrange");
-        cmap.infer_ascii_gaps(Some(0x1D));
+        cmap.infer_ascii_gaps(Some(0x1D), &BTreeSet::new());
         assert_eq!(cmap.decode(0x44), Some("a")); // recovered via doc delta
         assert_eq!(cmap.decode(0x2d), Some("J"));
         assert_eq!(cmap.decode(0x32), Some("O")); // own entry kept
@@ -1045,7 +1058,7 @@ mod tests {
         // A sparse CMap whose own entry contradicts the document delta must NOT
         // borrow it (different font / encoding) — no gaps filled.
         let mut cmap = ToUnicode::parse(b"beginbfchar <0041> <0041> <0042> <0042> endbfchar"); // identity: A,B
-        cmap.infer_ascii_gaps(Some(0x1D)); // doc delta would map 0x41→0x5E (^)
+        cmap.infer_ascii_gaps(Some(0x1D), &BTreeSet::new()); // doc delta would map 0x41→0x5E (^)
         assert_eq!(cmap.decode(0x41), Some("A")); // unchanged
         assert_eq!(cmap.decode(0x2d), None); // not filled — delta contradicted
     }
@@ -1054,9 +1067,41 @@ mod tests {
     fn infer_ascii_gaps_noop_on_complete_cmap() {
         // A well-formed CMap with no contiguous-run gaps gains nothing spurious.
         let mut cmap = ToUnicode::parse(b"beginbfchar <0041> <0041> endbfchar");
-        cmap.infer_ascii_gaps(Some(0x00));
+        cmap.infer_ascii_gaps(Some(0x00), &BTreeSet::new());
         // Only the inert range fills around the single entry; the entry stands.
         assert_eq!(cmap.decode(0x41), Some("A"));
+    }
+
+    #[test]
+    fn infer_ascii_gaps_skips_reserved_codes() {
+        // The s3705 bug class: an identity-aligned (delta 0) `/ToUnicode` whose
+        // producer OMITS codes that the font's `/Encoding`+`/Differences` actually
+        // repacks onto ASCII-punctuation slots (e.g. `p`@0x26). The gap-filler must
+        // not invent `0x26 → chr(0x26)` ('&'), which would mask the real glyph at
+        // decode time (`/ToUnicode` is consulted before `/Differences`).
+        //
+        // Source: a..u (0x61..0x75) at delta 0 — ≥8 samples, self-calibrates to 0.
+        const CMAP: &[u8] = b"beginbfrange <61> <75> <0061> endbfrange";
+
+        // WITHOUT a reservation the filler injects the bug ('&' at 0x26).
+        let mut unguarded = ToUnicode::parse(CMAP);
+        unguarded.infer_ascii_gaps(None, &BTreeSet::new());
+        assert_eq!(
+            unguarded.decode(0x26),
+            Some("&"),
+            "baseline: gap-filler invents chr(0x26) when nothing is reserved"
+        );
+
+        // WITH 0x26 reserved (it is `/Differences`-owned) the filler leaves it
+        // unmapped, so the decoder will fall through to `/Encoding`+`/Differences`.
+        let mut reserved = BTreeSet::new();
+        reserved.insert(0x26u32);
+        let mut guarded = ToUnicode::parse(CMAP);
+        guarded.infer_ascii_gaps(None, &reserved);
+        assert_eq!(guarded.decode(0x26), None, "reserved code must stay unmapped");
+        // Real entries (and non-reserved gaps) are unaffected.
+        assert_eq!(guarded.decode(0x62), Some("b")); // real entry, untouched
+        assert_eq!(guarded.decode(0x25), Some("%")); // non-reserved gap still fills
     }
 
     // ── simple-font fallbacks (MacRoman base + `/Differences`) ─────────────────

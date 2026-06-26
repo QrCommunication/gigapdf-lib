@@ -7,6 +7,78 @@ to [Semantic Versioning](https://semver.org/).
 
 The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
+## [Unreleased]
+
+## [0.105.0] - 2026-06-26
+
+### Fixed — text extraction
+
+- **Broken-`/ToUnicode` gap-filler no longer overwrites `/Encoding`+`/Differences`
+  slots.** A subset simple font may repack real glyphs onto ASCII-punctuation codes
+  via `/Differences` (`gNN` names, e.g. `n`@0x25, `p`@0x26) while shipping a broken,
+  identity-aligned `/ToUnicode` that omits those codes. The ASCII gap-filler
+  (`ToUnicode::infer_ascii_gaps`) used to synthesize `code → chr(code)` for them, and
+  because `/ToUnicode` is consulted *before* `/Encoding`+`/Differences`, that bogus
+  entry masked the real glyph — e.g. CERFA s3705 extracted `'parents'` as `'&are%ts'`
+  and `'2016'` as `'2!!'`. The gap-filler now receives the set of codes the font's
+  `/Encoding`+`/Differences` resolves authoritatively and skips them, leaving the
+  decoder to resolve them through `/Differences` (which routes `gNN` → Standard
+  Macintosh Glyph Ordering → Unicode). Rendering was already correct (the rasterizer
+  draws by glyph name); only extraction was affected. Composite (Type0) fonts are
+  unaffected (empty reservation ⇒ no behaviour change).
+
+### Added — editor: baked header/footer gate, render mask, editor sidecar
+
+- **Baked running header/footer (`/GPHF`) excluded from every editable view.** A
+  header/footer baked with `setHeader`/`setFooter` wraps its draw in a `/GPHF …
+  BDC … EMC` marked-content span. Re-opening such a document used to surface that
+  text/image as editable *body* content, doubling the visible header and
+  desynchronising the run/element indices (`source_index`↔`replaceText`, and the
+  unified `transformElement`/`removeElement`/`reorderElement` index). The shared
+  content walk now tracks marked-content state and drops **all** element kinds
+  (text, image, path) inside a `/GPHF` span, with the **identical** gate applied to
+  every index-based run counter (`nth_text_run`, `text_run_tf`,
+  `text_run_font_name`) so extraction and editing stay index-aligned. Invariant:
+  `page_elements` / `page_text_runs` / `page_blocks` never include `/GPHF` content;
+  `header_footer()` still recovers it (the marked-content reader is unchanged).
+- **Single-pass render that masks a marked-content band —
+  `render_page_excluding_marked_content(page, scale, skip_text, marker)`** (SDK
+  `renderPageExcludingMarkedContent`). Suppresses the ops inside a baked span
+  (e.g. `"GPHF"`) — and, with `skip_text`, the page text — in one raster pass, so
+  the header/footer band is shown by rendering but never doubles against the
+  editable overlay. `marked_content_op_mask` builds the op-mask that OR-s into the
+  existing element-exclusion mask.
+- **Editor-metadata sidecar — `set_editor_meta(json)` / `editor_meta()`** (SDK
+  `setEditorMeta` / `editorMeta`). Stores an opaque host JSON blob in a
+  FlateDecode-compressed catalog `/GigaPDF /EditorMeta` stream (ignored by standard
+  readers, PDF/A-friendly, survives save/open).
+- **Editor display margins — `set_editor_margins(page, m)` /
+  `editor_margins(page)`** (SDK `setEditorMargins` / `editorMargins`). Per-page
+  editor margins persisted **inside** the `editor_meta` sidecar (under `margins`),
+  **never** via `/CropBox` — `set_page_margins` remains the distinct "real recrop"
+  API.
+- **Rich, Word-like running header/footer — `set_running_header_footer(def,
+  date, images)` / `running_header_footer()`** (SDK `setRunningHeaderFooter` /
+  `runningHeaderFooter`; new types `RunningHeaderFooter`, `HFZone`, `HFItem`,
+  `HFAlign` in `crate::headerfooter`). The **definition** is the source of truth,
+  stored in the `editor_meta` sidecar under `headerFooter` (merged so other keys
+  like `margins` survive); its **visible** representation is regenerated into the
+  `/GPHF` marked-content band on every page, so it inherits the existing gate
+  (excluded from `page_elements`/`page_text_runs`) and render mask
+  (`render_page_excluding_marked_content`). A zone (`default` / `first_page` /
+  `even_page` / `odd_page`, selected per page by `RunningHeaderFooter::zone_for`)
+  holds a list of `HFItem::Text { anchor, dx, dy, font_ref, size, color, … }` /
+  `HFItem::Image { anchor, dx, dy, w, h, image_id, opacity }`. Text draws in an
+  **embedded** font — the item's `font_ref`, else the engine's bundled OFL face
+  (a real embedded font, **never** base-14) — via `add_text`; images via
+  `add_image`. Tokens `{{page}}`, `{{pages}}`, `{{date}}` and `{{title}}` are
+  substituted at bake time (the engine is clockless — the host passes the bake
+  `date`, falling back to `/Info` mod/creation date). Re-baking is idempotent.
+  The flat `HeaderFooterSpec` is kept (back-compat) and lowers to a single-text
+  `RunningHeaderFooter` via `HeaderFooterSpec::to_running(header)`. WASM:
+  `gp_set_running_header_footer` / `gp_running_header_footer` (images crossed as a
+  `[u32 count]{u32 id, u32 len, bytes}` blob).
+
 ## [0.104.0] - 2026-06-25
 
 Fidelity and capability across four subsystems — PDF→model reconstruction, annotation

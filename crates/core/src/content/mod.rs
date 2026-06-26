@@ -836,8 +836,17 @@ fn text_runs_inner(
     let mut ctm = initial_ctm;
     let mut ctm_stack: Vec<Matrix> = Vec::new();
     let nested = depth > 0;
+    // Drop everything inside a baked `/GPHF` running header/footer span: its text
+    // is shown only by rendering the band (lot B), never surfaced as an editable
+    // body run. The span is self-balanced (`q … Q` inside), so skipping it whole
+    // leaves the CTM stack untouched. The skip must match `nth_text_run` exactly
+    // so extraction and the index-based editing APIs stay aligned.
+    let mut gphf = MarkedContentScope::new(GPHF_MARKER);
 
     for (op_position, operation) in operations.iter().enumerate() {
+        if gphf.observe(operation) {
+            continue;
+        }
         match operation.operator.as_slice() {
             b"q" => ctm_stack.push(ctm),
             b"Q" => {
@@ -923,7 +932,14 @@ pub fn extract_text_runs(content: &[u8]) -> Result<Vec<TextRun>> {
 
 fn nth_text_run(operations: &[Operation], index: usize) -> Result<usize> {
     let mut seen = 0usize;
+    // Skip baked `/GPHF` header/footer runs so the ordinal matches extraction
+    // (`text_runs_inner`) exactly — editing run *N* must hit the same body run the
+    // host saw, never a header/footer run that no longer appears in the list.
+    let mut gphf = MarkedContentScope::new(GPHF_MARKER);
     for (pos, op) in operations.iter().enumerate() {
+        if gphf.observe(op) {
+            continue;
+        }
         if is_text_show(&op.operator) {
             if seen == index {
                 return Ok(pos);
@@ -1160,7 +1176,14 @@ fn text_run_tf(operations: &[Operation], index: usize) -> (Option<Vec<u8>>, Opti
     let mut name: Option<Vec<u8>> = None;
     let mut size: Option<f64> = None;
     let mut seen = 0usize;
+    // Ignore a baked `/GPHF` header/footer span entirely: its `Tf` is inside a
+    // `q … Q` that restores the prior font, so it is never in force for a body
+    // run; counting and font tracking must both skip it to match `nth_text_run`.
+    let mut gphf = MarkedContentScope::new(GPHF_MARKER);
     for op in operations {
+        if gphf.observe(op) {
+            continue;
+        }
         if op.operator == b"Tf" {
             if let Some(Object::Name(n)) = op.operands.first() {
                 name = Some(n.clone());
@@ -1420,7 +1443,14 @@ pub fn text_run_font_name(content: &[u8], index: usize) -> Result<Option<Vec<u8>
     let operations = parse_content(content)?;
     let mut current: Option<Vec<u8>> = None;
     let mut seen = 0usize;
+    // Skip a baked `/GPHF` header/footer span (its `Tf` is restored by the span's
+    // `q … Q` and never applies to a body run), keeping the ordinal aligned with
+    // `nth_text_run` so the right font is resolved for the run being edited.
+    let mut gphf = MarkedContentScope::new(GPHF_MARKER);
     for op in &operations {
+        if gphf.observe(op) {
+            continue;
+        }
         if op.operator == b"Tf" {
             if let Some(Object::Name(name)) = op.operands.first() {
                 current = Some(name.clone());
@@ -1719,9 +1749,22 @@ fn elements_from_ops_resolved(
     let mut path_bb = BoundsBuilder::new();
     // Elements built at depth > 0 come from inside a form XObject.
     let nested = depth > 0;
+    // Drop every element (text, image, path) inside a baked `/GPHF` running
+    // header/footer span: re-opening a header-baked doc must NOT surface the
+    // header as editable body content, and dropping it whole keeps the unified
+    // element index aligned with `page_elements`, `element_op_mask`, and the
+    // remove/transform/move/reorder APIs. INVARIANT: `page_elements` never
+    // includes `/GPHF` content; the band is shown only at render time, where the
+    // renderer masks the same op range (see `marked_content_op_mask`). The span is
+    // self-balanced (`q … Q` inside), so skipping it whole leaves the graphics
+    // state untouched; element `op_start`/`op_end` keep their absolute indices.
+    let mut gphf = MarkedContentScope::new(GPHF_MARKER);
 
     for (i, op) in operations.iter().enumerate() {
         let operator = op.operator.as_slice();
+        if gphf.observe(op) {
+            continue;
+        }
         match operator {
             b"q" => ctm_stack.push((ctm, fill_alpha, fill_space.clone())),
             b"Q" => {
@@ -2181,6 +2224,96 @@ fn bdc_is_gphf(operands: &[Object], subtype: &[u8]) -> bool {
         Some(Object::Name(name)) => name.as_slice() == subtype,
         _ => false,
     }
+}
+
+/// The marked-content tag wrapping every baked running header/footer
+/// (`/GPHF <</T (h|f)>> BDC … EMC`). The [`MarkedContentScope`] gate matches this
+/// tag regardless of `/T`, so **both** the header and the footer band are dropped
+/// from extraction, run counting and the editable element view.
+pub(crate) const GPHF_MARKER: &[u8] = b"GPHF";
+
+/// Tracks, op by op in stream order, whether a content-stream walk is currently
+/// inside a marked-content span opened by `<marker> [props] BDC` — the boundary
+/// `BDC`/`EMC` ops included. Drive it once per operation, in order, with
+/// [`observe`](Self::observe); it returns `true` while inside the span. Nesting is
+/// tracked like [`strip_marked_content`] so the matching `EMC` closes the span at
+/// the depth its `BDC` opened (inner marked content of any other tag is counted
+/// for nesting but never opens a span).
+///
+/// This is the **single source of truth** behind excluding the baked `/GPHF`
+/// running header/footer band from: extraction ([`text_runs_inner`],
+/// [`elements_from_ops_resolved`]), every index-based run counter
+/// ([`nth_text_run`], [`text_run_tf`], [`text_run_font_name`]), and the render
+/// op-mask ([`marked_content_op_mask`]) — so all of them drop *exactly* the same
+/// ops, keeping run/element indices aligned. The header/footer is never extracted
+/// as editable body content; it is shown only by rendering the band (the renderer
+/// masks it out so it cannot double with an editable overlay).
+struct MarkedContentScope<'a> {
+    /// The marked-content tag name to match (e.g. [`GPHF_MARKER`]).
+    marker: &'a [u8],
+    /// Depth at which the active span opened; `None` when outside one.
+    open_depth: Option<usize>,
+    /// Global `BDC`/`BMC` nesting depth (so the right `EMC` closes the span).
+    depth: usize,
+}
+
+impl<'a> MarkedContentScope<'a> {
+    /// A fresh tracker for spans tagged `marker`, starting outside any span.
+    fn new(marker: &'a [u8]) -> Self {
+        Self {
+            marker,
+            open_depth: None,
+            depth: 0,
+        }
+    }
+
+    /// Observe the next operation in stream order. Returns `true` when this op
+    /// lies inside — or is the boundary `BDC`/`EMC` of — a `<marker> … BDC … EMC`
+    /// span (so the caller drops it). Must be called for **every** op exactly once
+    /// to keep the nesting depth correct.
+    fn observe(&mut self, op: &Operation) -> bool {
+        let is_open = op.operator == b"BDC" || op.operator == b"BMC";
+        let is_close = op.operator == b"EMC";
+        if self.open_depth.is_some() {
+            // Inside the dropped span: track depth to find the matching `EMC`.
+            if is_open {
+                self.depth += 1;
+            } else if is_close {
+                self.depth -= 1;
+                if Some(self.depth) == self.open_depth {
+                    self.open_depth = None;
+                }
+            }
+            return true;
+        }
+        if is_open {
+            if op.operator == b"BDC"
+                && op.operands.first().and_then(Object::as_name) == Some(self.marker)
+            {
+                self.open_depth = Some(self.depth);
+                self.depth += 1;
+                return true;
+            }
+            self.depth += 1;
+        } else if is_close {
+            self.depth = self.depth.saturating_sub(1);
+        }
+        false
+    }
+}
+
+/// A per-operation mask (indexed by this stream's parsed op position) flagging
+/// every op inside a marked-content span tagged `marker` — the `BDC`/`EMC`
+/// boundaries included. For [`GPHF_MARKER`] this is the baked running
+/// header/footer band, so the renderer can suppress it in the **same single
+/// raster pass** that drops text / excluded elements (it never doubles against
+/// the editable overlay). The mask indexes the same [`parse_content`] op stream
+/// the element op-mask and the rasterizer use, so it OR-s straight into the
+/// render exclusion mask.
+pub fn marked_content_op_mask(content: &[u8], marker: &[u8]) -> Result<Vec<bool>> {
+    let operations = parse_content(content)?;
+    let mut scope = MarkedContentScope::new(marker);
+    Ok(operations.iter().map(|op| scope.observe(op)).collect())
 }
 
 /// Recover the text shown inside the **first** `/GPHF <</T (subtype)>> BDC … EMC`
@@ -3378,6 +3511,102 @@ BT /F 12 Tf (BODY) Tj ET";
         let content = b"BT /F 12 Tf (plain) Tj ET";
         assert_eq!(extract_marked_content_text(content, b"h"), None);
         assert_eq!(extract_marked_content_text(content, b"f"), None);
+    }
+
+    // ─── /GPHF gate: header/footer excluded from extraction + counting ───────
+
+    /// A `/GPHF` header span placed **before** two body runs — proving the gate
+    /// is not an artefact of headers being appended last.
+    const GPHF_PREFIXED: &[u8] = b"/GPHF <</T (h)>> BDC\n\
+q BT /F 12 Tf 50 760 Td (HEADER) Tj ET Q\nEMC\n\
+BT /F 12 Tf 50 100 Td (BODY0) Tj ET\n\
+BT /F 12 Tf 50 80 Td (BODY1) Tj ET";
+
+    #[test]
+    fn gphf_gate_excludes_prefixed_header_run_from_extraction() {
+        let runs = extract_text_runs(GPHF_PREFIXED).unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["BODY0", "BODY1"],
+            "the /GPHF header run is dropped; only body runs are extracted"
+        );
+    }
+
+    #[test]
+    fn gphf_gate_keeps_run_index_aligned_for_replace() {
+        // Replacing body run #0 must edit BODY0 (not the prefixed HEADER): the
+        // counter (nth_text_run) skips the /GPHF run exactly like extraction.
+        let edited = replace_text_run(GPHF_PREFIXED, 0, "EDITED0").unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("(EDITED0)"), "body run #0 replaced");
+        assert!(s.contains("(HEADER)"), "header run untouched");
+        assert!(s.contains("(BODY1)"), "other body run untouched");
+        assert!(!s.contains("(BODY0)"), "the original body #0 text is gone");
+        // After the edit the body runs re-extract as [EDITED0, BODY1] (still gated).
+        let runs = extract_text_runs(&edited).unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["EDITED0", "BODY1"]
+        );
+    }
+
+    #[test]
+    fn gphf_gate_handles_header_and_footer_spans() {
+        // Header AND footer /GPHF spans, both before the body run.
+        let content = b"/GPHF <</T (h)>> BDC\nq BT /F 12 Tf 50 760 Td (HEAD) Tj ET Q\nEMC\n\
+/GPHF <</T (f)>> BDC\nq BT /F 12 Tf 50 20 Td (FOOT) Tj ET Q\nEMC\n\
+BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
+        let runs = extract_text_runs(content).unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            vec!["ONLYBODY"],
+            "both header and footer bands excluded"
+        );
+        let edited = replace_text_run(content, 0, "NEWBODY").unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("(NEWBODY)") && s.contains("(HEAD)") && s.contains("(FOOT)"));
+        assert!(!s.contains("(ONLYBODY)"));
+    }
+
+    #[test]
+    fn gphf_gate_excludes_header_image_from_elements() {
+        // A header IMAGE (a `Do`) inside /GPHF, then a body shape: the element view
+        // must exclude the image entirely, leaving only the body path at index 0.
+        let content = b"/GPHF <</T (h)>> BDC\nq 100 0 0 50 50 700 cm /Im0 Do Q\nEMC\n\
+1 0 0 rg 10 10 30 30 re f";
+        let elements = extract_elements(content).unwrap();
+        assert!(
+            elements.iter().all(|e| e.kind != ElementKind::Image),
+            "the header image is dropped from the element view"
+        );
+        assert_eq!(elements.len(), 1, "only the body shape remains");
+        assert_eq!(elements[0].kind, ElementKind::Path);
+        assert_eq!(elements[0].index, 0, "body element re-indexed from 0");
+        // remove_element(0) targets the body shape; the header image's `Do` stays.
+        let edited = remove_element(content, 0).unwrap();
+        let s = String::from_utf8_lossy(&edited);
+        assert!(s.contains("/Im0 Do"), "the header image Do is preserved");
+        let after = extract_elements(&edited).unwrap();
+        assert!(
+            after.is_empty(),
+            "the body shape was removed; the image stays gated"
+        );
+    }
+
+    #[test]
+    fn marked_content_op_mask_flags_only_the_gphf_span() {
+        let content = b"BT /F 12 Tf 50 100 Td (BODY) Tj ET\n\
+/GPHF <</T (h)>> BDC\nq (H) Tj Q\nEMC\n\
+(AFTER) Tj";
+        let mask = marked_content_op_mask(content, GPHF_MARKER).unwrap();
+        let ops = parse_content(content).unwrap();
+        assert_eq!(mask.len(), ops.len());
+        let bdc = ops.iter().position(|o| o.operator == b"BDC").unwrap();
+        let emc = ops.iter().position(|o| o.operator == b"EMC").unwrap();
+        for (i, masked) in mask.iter().enumerate() {
+            let inside = i >= bdc && i <= emc;
+            assert_eq!(*masked, inside, "op #{i} mask should be {inside}");
+        }
     }
 
     #[test]

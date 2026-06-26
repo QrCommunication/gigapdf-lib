@@ -216,6 +216,24 @@ export class GigaPdfEngine {
     return (s ? JSON.parse(s) : []) as T;
   }
   /**
+   * Like {@link _str} but distinguishes a **null** result (the export returned a
+   * null pointer — e.g. an `Option::None`) from a present-but-empty string.
+   * Returns `null` only for the null pointer; otherwise the decoded string.
+   */
+  _strOrNull(call: (outLenPtr: number) => number): string | null {
+    const lenPtr = this.ex.gp_alloc(4);
+    const dataPtr = call(lenPtr);
+    if (dataPtr === 0) {
+      this.ex.gp_free(lenPtr, 4);
+      return null;
+    }
+    const len = this.dv().getUint32(lenPtr, true);
+    const s = dec.decode(this.u8().slice(dataPtr, dataPtr + len));
+    this.ex.gp_free(dataPtr, len);
+    this.ex.gp_free(lenPtr, 4);
+    return s;
+  }
+  /**
    * Decode standard Base64 (RFC 4648) to bytes. Pure-JS table decode, so it
    * works identically in Node and the browser with no dependency (used to turn
    * the JSON `dataBase64` of {@link GigaPdfDoc.attachments} back into bytes).
@@ -2468,6 +2486,99 @@ export interface HeaderFooterSpec {
   bandHeight?: number;
 }
 
+/** Horizontal anchor of a rich {@link HFItem} within the printable width. */
+export type HFAlign = HeaderFooterAlign;
+
+/**
+ * One drawable element of a rich running header/footer band: a line of **text**
+ * or a raster **image** (a discriminated union on `type`). Anchored within the
+ * printable width by `anchor`, then nudged `(dx, dy)` points in PDF axes
+ * (`+dx` → right, `+dy` → up).
+ */
+export type HFItem =
+  | {
+      type: "text";
+      /** Horizontal anchor (default `"left"`). */
+      anchor?: HFAlign;
+      /** Horizontal nudge, points (default `0`). */
+      dx?: number;
+      /** Vertical nudge, points (default `0`). */
+      dy?: number;
+      /**
+       * Template text — may contain `{{page}}`, `{{pages}}`, `{{date}}` and
+       * `{{title}}`, substituted at bake time.
+       */
+      text: string;
+      /**
+       * An embedded-font object id (from {@link GigaPdfDoc.embedFont}); omit/`null`
+       * to use the engine's bundled OFL face (a real embedded font, never base-14).
+       */
+      fontRef?: number | null;
+      /** Font size, points (default `10`). */
+      size?: number;
+      /** RGB fill colour, `0..255` per channel (default black `[0,0,0]`). */
+      color?: [number, number, number];
+      /** Bold hint (carried with the def; honoured only by a bold `fontRef`). */
+      bold?: boolean;
+      /** Italic hint (carried with the def; honoured only by an italic `fontRef`). */
+      italic?: boolean;
+    }
+  | {
+      type: "image";
+      /** Horizontal anchor (default `"left"`). */
+      anchor?: HFAlign;
+      /** Horizontal nudge, points (default `0`). */
+      dx?: number;
+      /** Vertical nudge, points (default `0`). */
+      dy?: number;
+      /** Drawn width, points. */
+      w: number;
+      /** Drawn height, points. */
+      h: number;
+      /** Key into the `images` map passed to {@link GigaPdfDoc.setRunningHeaderFooter}. */
+      imageId: number;
+      /** Fill opacity `0..1` (default `1`). */
+      opacity?: number;
+    };
+
+/** The header and footer item lists of one running-H/F {@link RunningHeaderFooter} zone. */
+export interface HFZone {
+  /** Items drawn in the top (header) band. */
+  header: HFItem[];
+  /** Items drawn in the bottom (footer) band. */
+  footer: HFItem[];
+}
+
+/**
+ * A rich, Word-like running header/footer **definition** (see
+ * {@link GigaPdfDoc.setRunningHeaderFooter}). The definition is the source of
+ * truth (stored in the editor-meta sidecar); the bake regenerates the visible
+ * `/GPHF` band from it.
+ *
+ * Zone selection per 1-based page: page 1 → `firstPage` when `differentFirstPage`
+ * (else `default`); otherwise, when `differentOddEven`, even pages → `evenPage`
+ * and odd pages → `oddPage` (each falling back to `default` when omitted);
+ * otherwise `default` everywhere.
+ */
+export interface RunningHeaderFooter {
+  /** The zone every page not overridden by a more specific zone uses. */
+  default: HFZone;
+  /** First-page override (used when `differentFirstPage`). */
+  firstPage?: HFZone | null;
+  /** Even-page override (used when `differentOddEven`). */
+  evenPage?: HFZone | null;
+  /** Odd-page override (used when `differentOddEven`). */
+  oddPage?: HFZone | null;
+  /** Give page 1 its own `firstPage` zone (default `false`). */
+  differentFirstPage?: boolean;
+  /** Give even/odd pages their own `evenPage`/`oddPage` zones (default `false`). */
+  differentOddEven?: boolean;
+  /** Header band height (distance from the top edge to the baseline), points (default `36`). */
+  headerBand?: number;
+  /** Footer band height (distance from the bottom edge to the baseline), points (default `36`). */
+  footerBand?: number;
+}
+
 const RGB = (rgb: number) => rgb & 0xffffff;
 
 /** `n` bytes of Web Crypto randomness (for encryption seeds; the engine has none). */
@@ -3582,6 +3693,46 @@ export class GigaPdfDoc {
   }
 
   /**
+   * Store an **opaque** JSON string as the document's GigaPDF editor-metadata
+   * sidecar — private editor state that travels with the PDF (catalog
+   * `/GigaPDF /EditorMeta`, a FlateDecode-compressed stream). It is ignored by
+   * every standard PDF reader and the round-trip survives save/open. Pass a JSON
+   * **object** if you also use {@link setEditorMargins} (which read-modify-writes
+   * that object's `margins` key). Returns `true` on success.
+   */
+  setEditorMeta(json: string): boolean {
+    return this.g._withStr(json, (p, l) => this.ex().gp_set_editor_meta(this.h, p, l)) === 0;
+  }
+
+  /**
+   * The document's GigaPDF editor-metadata sidecar string (set by
+   * {@link setEditorMeta}), or `null` when the document carries none.
+   */
+  editorMeta(): string | null {
+    return this.g._strOrNull((o) => this.ex().gp_editor_meta(this.h, o));
+  }
+
+  /**
+   * Record the editor's per-page **display** margins (points) in the
+   * editor-metadata sidecar (under `margins`, keyed by page) **without touching
+   * `/CropBox` or `/MediaBox`** — distinct from {@link setPageMargins}, which
+   * performs a real visible recrop. Any other host keys in the sidecar are
+   * preserved. Returns `true` on success.
+   */
+  setEditorMargins(page: number, m: PageMargins): boolean {
+    return this.ex().gp_set_editor_margins(this.h, page, m.top, m.right, m.bottom, m.left) === 0;
+  }
+
+  /**
+   * The editor's per-page display margins (points) recorded for `page` by
+   * {@link setEditorMargins}, or `null` when none were stored. Reads only the
+   * sidecar — never `/CropBox`.
+   */
+  editorMargins(page: number): PageMargins | null {
+    return this.g._jsonOrNull<PageMargins>((o) => this.ex().gp_editor_margins(this.h, page, o));
+  }
+
+  /**
    * All five page boundary boxes (`media`/`crop`/`bleed`/`trim`/`art`) for the
    * 1-based `page`, each as `[x0, y0, x1, y1]` in points, with ISO 32000-1
    * inheritance and defaults applied. See {@link PageBoxes} for the exact
@@ -3755,6 +3906,83 @@ export class GigaPdfDoc {
     );
   }
 
+  /**
+   * Bake a **rich**, Word-like running header/footer from a {@link RunningHeaderFooter}
+   * `def` (the source of truth — stored in the editor-meta sidecar, its visible
+   * `/GPHF` band regenerated on every page). Text is set in an embedded font
+   * (each item's `fontRef`, else the bundled OFL face — never base-14) and images
+   * via the same path as {@link addImage}; both live inside the `/GPHF` span, so
+   * they are excluded from {@link elements}/{@link textRuns} and masked by
+   * {@link renderPageExcludingMarkedContent}. Idempotent (re-baking replaces the
+   * prior band).
+   *
+   * `opts.date` is the bake date for `{{date}}` (the engine is clockless — pass
+   * e.g. `new Date().toISOString().slice(0, 10)`); omit to fall back to the
+   * document's `/Info` date. `opts.images` supplies the pixels each
+   * `HFItem` of `type: "image"` references by `imageId` — an iterable of
+   * `[imageId, bytes]` (a `Map<number, Uint8Array>` works directly); an image
+   * whose id is absent is skipped. Returns `true` on success.
+   *
+   * @example
+   * doc.setRunningHeaderFooter(
+   *   {
+   *     default: {
+   *       header: [{ type: "image", imageId: 1, w: 80, h: 24, anchor: "left" }],
+   *       footer: [{ type: "text", text: "{{title}} — {{page}}/{{pages}}", anchor: "center" }],
+   *     },
+   *     firstPage: { header: [], footer: [] }, // blank cover
+   *     differentFirstPage: true,
+   *     differentOddEven: true,
+   *     evenPage: { header: [{ type: "text", text: "{{page}}", anchor: "left" }], footer: [] },
+   *     oddPage: { header: [{ type: "text", text: "{{page}}", anchor: "right" }], footer: [] },
+   *   },
+   *   { date: new Date().toISOString().slice(0, 10), images: new Map([[1, logoPng]]) }
+   * );
+   */
+  setRunningHeaderFooter(
+    def: RunningHeaderFooter,
+    opts?: { date?: string; images?: Iterable<[number, Uint8Array]> }
+  ): boolean {
+    const entries = opts?.images ? Array.from(opts.images) : [];
+    // Image blob: [u32 count] then, per entry, [u32 imageId][u32 byteLen][bytes].
+    let total = 4;
+    for (const [, bytes] of entries) total += 8 + bytes.length;
+    const blob = new Uint8Array(total);
+    const dv = new DataView(blob.buffer);
+    let off = 0;
+    dv.setUint32(off, entries.length >>> 0, true);
+    off += 4;
+    for (const [id, bytes] of entries) {
+      dv.setUint32(off, id >>> 0, true);
+      off += 4;
+      dv.setUint32(off, bytes.length >>> 0, true);
+      off += 4;
+      blob.set(bytes, off);
+      off += bytes.length;
+    }
+    return (
+      this.g._withStr(JSON.stringify(def), (dp, dl) =>
+        this.g._withOptStr(opts?.date, (tp, tl) =>
+          this.g._withBytes(blob, (ip, il) =>
+            this.ex().gp_set_running_header_footer(this.h, dp, dl, tp, tl, ip, il)
+          )
+        )
+      ) === 0
+    );
+  }
+
+  /**
+   * The rich {@link RunningHeaderFooter} definition recorded by
+   * {@link setRunningHeaderFooter} (read from the editor-meta sidecar — the
+   * source of truth), or a minimal one reconstructed from a legacy flat
+   * {@link setHeader}/{@link setFooter} bake, or `null` when neither is present.
+   */
+  runningHeaderFooter(): RunningHeaderFooter | null {
+    return this.g._jsonOrNull<RunningHeaderFooter>((o) =>
+      this.ex().gp_running_header_footer(this.h, o)
+    );
+  }
+
   // render
   renderPage(page: number, scale = 1): Uint8Array {
     return this.g._buffer((o) => this.ex().gp_render_page(this.h, page, scale, o));
@@ -3789,6 +4017,38 @@ export class GigaPdfDoc {
     return this.g._buffer((o) =>
       this.g._withU32(indices, (p, c) =>
         this.ex().gp_render_page_excluding(this.h, page, p, c, scale, o)
+      )
+    );
+  }
+
+  /**
+   * Rasterize a page to a PNG **excluding the ops inside a baked marked-content
+   * span** named `marker` — and, when `skipText` is true, the page's text too — in
+   * a **single** raster pass. For `marker = "GPHF"` (the default) this drops the
+   * baked running header/footer band: the extraction views ({@link elements},
+   * {@link textRuns}) already omit that band (it is never editable body content),
+   * and this render omits it from the picture so it cannot double against an
+   * editable overlay. With `skipText = true` it is the editor's text-free display
+   * background minus the band; with `skipText = false`, the full page minus the
+   * band. Like {@link renderPageNoText}, form-field widget appearances are omitted.
+   */
+  renderPageExcludingMarkedContent(
+    page: number,
+    scale = 1,
+    skipText = true,
+    marker = "GPHF"
+  ): Uint8Array {
+    return this.g._buffer((o) =>
+      this.g._withStr(marker, (p, l) =>
+        this.ex().gp_render_page_excluding_marked_content(
+          this.h,
+          page,
+          scale,
+          skipText ? 1 : 0,
+          p,
+          l,
+          o
+        )
       )
     );
   }

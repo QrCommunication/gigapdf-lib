@@ -4,6 +4,53 @@ All notable changes to `@qrcommunication/gigapdf-lib` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.105.0] - 2026-06-26
+
+### Fixed
+
+- **Text extraction no longer corrupts subset fonts with repacked `/Differences`
+  glyphs.** When a simple font assigns real glyphs to ASCII-punctuation codes via
+  `/Encoding`+`/Differences` (`gNN` names) and ships a broken identity-aligned
+  `/ToUnicode` omitting those codes, the ASCII gap-filler used to invent a
+  `code → chr(code)` mapping that masked the real glyph (consulted first) — e.g.
+  `extractText` returned `'&are%ts'` for `'parents'`. The filler now defers to the
+  font's `/Encoding`+`/Differences` for those codes. Extraction-only fix; rendering
+  was already correct, and composite (Type0) fonts are unaffected.
+
+### Added
+
+- **Baked running header/footer excluded from the editable views.** A header/footer
+  baked with `setHeader`/`setFooter` (tagged `/GPHF`) is no longer returned by
+  `elements`, `textRuns` or `blocks` — re-opening a header-baked document never
+  turns the header into editable body content nor desyncs `replaceText` /
+  `transformElement` / `removeElement` / `reorderElement` indices. `headerFooter()`
+  still recovers it.
+- **`renderPageExcludingMarkedContent(page, scale?, skipText?, marker?)`** — render
+  a page in one pass with a baked marked-content band (default `"GPHF"` = the
+  running header/footer) omitted, so the band shows in the raster but never doubles
+  against an editable overlay; with `skipText` it is the editor's text-free
+  background minus the band.
+- **`setEditorMeta(json)` / `editorMeta()`** — store/read an opaque JSON
+  editor-metadata sidecar (catalog `/GigaPDF /EditorMeta`, compressed; ignored by
+  standard readers; survives save/open).
+- **`setEditorMargins(page, m)` / `editorMargins(page)`** — per-page editor display
+  margins persisted in the sidecar (under `margins`), **without** touching
+  `/CropBox` (distinct from `setPageMargins`, the real recrop).
+- **`setRunningHeaderFooter(def, opts?)` / `runningHeaderFooter()`** — a rich,
+  Word-like running header/footer (types `RunningHeaderFooter`, `HFZone`, `HFItem`,
+  `HFAlign`). The `def` is the source of truth (stored in the editor-meta sidecar
+  under `headerFooter`); its visible `/GPHF` band is regenerated per page, so it is
+  excluded from `elements`/`textRuns` and masked by
+  `renderPageExcludingMarkedContent`. A zone (`default`/`firstPage`/`evenPage`/`oddPage`)
+  holds `HFItem`s of `type: "text"` (drawn in an **embedded** font — the item's
+  `fontRef`, else the bundled OFL face, never base-14) or `type: "image"` (pixels
+  supplied via `opts.images`, an iterable of `[imageId, bytes]` — a `Map` works).
+  Tokens `{{page}}`, `{{pages}}`, `{{date}}` (pass `opts.date`) and `{{title}}` are
+  substituted at bake time; re-baking is idempotent. The flat
+  `setHeader`/`setFooter` API is unchanged.
+
 ## [0.104.0] - 2026-06-25
 
 Four issue lists closed — [#75], [#76], [#77], [#78]: PDF→model reconstruction,
