@@ -49,15 +49,20 @@ pub struct PageGeometry {
     pub width: f64,
     pub height: f64,
     pub margins: Margins,
+    /// Number of text columns on the page (1 = single-column body text, the
+    /// default). Detected from the reconstructed block layout so the DOCX/ODT
+    /// exporters can emit matching column sections.
+    pub column_count: u8,
 }
 
 impl PageGeometry {
-    /// A4 portrait (595.27 × 841.89 pt) with default (0.5") margins.
+    /// A4 portrait (595.27 × 841.89 pt) with default (0.5″) margins.
     pub fn a4() -> Self {
         Self {
             width: 210.0 * (72.0 / 25.4),
             height: 297.0 * (72.0 / 25.4),
             margins: Margins::default(),
+            column_count: 1,
         }
     }
 }

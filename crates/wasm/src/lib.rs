@@ -3925,7 +3925,7 @@ pub extern "C" fn gp_to_text(handle: *const Document, out_len: *mut usize) -> *m
     }
 }
 
-/// Convert to standalone HTML with positioned text.
+/// Convert to standalone semantic HTML (flowing structure from the model).
 #[no_mangle]
 pub extern "C" fn gp_to_html(handle: *const Document, out_len: *mut usize) -> *mut u8 {
     match unsafe { handle.as_ref() } {

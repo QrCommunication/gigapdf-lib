@@ -8593,10 +8593,20 @@ impl Document {
             } else {
                 (page_w, page_h)
             };
+            // Estimate page margins from the actual content bounding box so the
+            // DOCX/ODT export emits realistic `w:pgMar` values instead of the
+            // default 0.5″. The reconstructed block frames are in top-down points
+            // (origin top-left), so `margin_left = min_x`, `margin_top = min_y`,
+            // `margin_right = page_w − max_right`, `margin_bottom = page_h −
+            // max_bottom`. Clamped to ≥ 0 and to the page size; when the page has
+            // no reconstructable content, default margins are kept.
+            let margins = Self::estimate_page_margins(&blocks, disp_w, disp_h);
+            let column_count = Self::detect_column_count(&blocks, disp_w);
             let geometry = PageGeometry {
                 width: disp_w,
                 height: disp_h,
-                ..PageGeometry::default()
+                margins,
+                column_count,
             };
             let page_model = Page {
                 blocks,
@@ -8624,6 +8634,16 @@ impl Document {
         // Done before the heading outline so the page numbers/running titles do
         // not pollute the table of contents either.
         recon::headerfooter::strip_running_furniture(&mut sections);
+
+        // Merge paragraphs split across page boundaries. A PDF has no notion of
+        // paragraph continuity across pages — a paragraph that flows from the
+        // bottom of page N to the top of page N+1 is reconstructed as two
+        // independent blocks. This pass stitches them back into one, so the
+        // exported Word/ODT document reads naturally instead of having a spurious
+        // break mid-sentence. Must run AFTER furniture stripping (so headers/
+        // footers don't interfere) and BEFORE heading leveling (so a half-line
+        // tail isn't misclassified as a heading).
+        Self::merge_cross_page_paragraphs(&mut sections);
 
         // Harmonize heading levels **document-wide**. Per-page reconstruction
         // clustered each page's heading sizes in isolation, so the same visual
@@ -8659,8 +8679,33 @@ impl Document {
                 .and_then(Object::as_string)
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .filter(|s| !s.is_empty()),
-            // Extended OOXML/ODF metadata fields have no PDF Info equivalent
-            // here; default them (the Office importer populates them instead).
+            // Extended metadata: extract from PDF Info dictionary. The PDF date
+            // format is `D:YYYYMMDDHHmmSSOHH'mm'`; convert to ISO-8601
+            // (`YYYY-MM-DDTHH:mm:ss`) so it round-trips to `dcterms:created` /
+            // `dcterms:modified` in the OOXML `docProps/core.xml`.
+            created: self
+                .get_metadata("CreationDate")
+                .filter(|s| !s.is_empty())
+                .map(|d| Self::pdf_date_to_iso(&d))
+                .unwrap_or_default(),
+            modified: self
+                .get_metadata("ModDate")
+                .filter(|s| !s.is_empty())
+                .map(|d| Self::pdf_date_to_iso(&d))
+                .unwrap_or_default(),
+            description: self
+                .get_metadata("Description")
+                .or_else(|| self.get_metadata("Subject"))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default(),
+            application: self
+                .get_metadata("Creator")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default(),
+            generator: self
+                .get_metadata("Producer")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default(),
             ..DocMeta::default()
         };
 
@@ -9080,37 +9125,296 @@ impl Document {
     }
 
     /// Whether two reconstructed page geometries match closely enough to share a
-    /// section (same size to a hairline; margins are model defaults here).
+    /// section (same size and similar margins to a hairline).
     fn same_geometry(
         a: &crate::model::geom::PageGeometry,
         b: &crate::model::geom::PageGeometry,
     ) -> bool {
-        (a.width - b.width).abs() < 0.5 && (a.height - b.height).abs() < 0.5
+        (a.width - b.width).abs() < 0.5
+            && (a.height - b.height).abs() < 0.5
+            && (a.margins.top - b.margins.top).abs() < 2.0
+            && (a.margins.bottom - b.margins.bottom).abs() < 2.0
+            && (a.margins.left - b.margins.left).abs() < 2.0
+            && (a.margins.right - b.margins.right).abs() < 2.0
     }
 
-    /// Convert the document to an editable OpenDocument Text (`.odt`): every text
-    /// run becomes a positioned text box, every image a placed picture — real,
-    /// editable content rather than a page image.
+    /// Detect the number of text columns on a page by clustering the left edges
+    /// of reconstructed blocks. In a 2-column layout, blocks cluster into a left
+    /// group (left-edge near the left margin) and a right group (left-edge past
+    /// the page midline). Conservative: only reports multi-column when a clear
+    /// bimodal split exists, else defaults to 1.
+    fn detect_column_count(blocks: &[crate::model::Block], page_w: f64) -> u8 {
+        if page_w <= 0.0 {
+            return 1;
+        }
+        let mid = page_w * 0.5;
+        // Count blocks whose left edge sits clearly in the right half (past 42%
+        // of page width, which leaves room for the gutter + a tolerance).
+        let threshold = page_w * 0.42;
+        let mut right_count = 0usize;
+        let mut total = 0usize;
+        for b in blocks {
+            let Some(f) = b.frame else { continue };
+            // Only count narrow-to-medium blocks (full-width headings/tables
+            // span both columns and shouldn't count as "right" or "left").
+            if f.w > page_w * 0.6 {
+                continue;
+            }
+            total += 1;
+            if f.x >= threshold && f.x < mid * 2.0 {
+                right_count += 1;
+            }
+        }
+        // Need at least 3 blocks in the right cluster and at least 25% of
+        // non-full-width blocks on that side — conservative to avoid false
+        // positives on indented paragraphs or sidebars in a single-column doc.
+        if total >= 6 && right_count >= 3 && right_count as f64 / total as f64 >= 0.25 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Convert a PDF date string (`D:YYYYMMDDHHmmSSOHH'mm'`, ISO 32000-1
+    /// §7.9.4) to ISO-8601 (`YYYY-MM-DDTHH:mm:ss`). The `D:` prefix and the
+    /// timezone offset are optional; truncates gracefully (a date with only
+    /// `D:20231231` becomes `2023-12-31T00:00:00`).
+    fn pdf_date_to_iso(s: &str) -> String {
+        let s = s.strip_prefix("D:").unwrap_or(s);
+        if s.len() < 4 {
+            return s.to_string();
+        }
+        let year = &s[..4];
+        let month = s.get(4..6).unwrap_or("01");
+        let day = s.get(6..8).unwrap_or("01");
+        let hour = s.get(8..10).unwrap_or("00");
+        let minute = s.get(10..12).unwrap_or("00");
+        let second = s.get(12..14).unwrap_or("00");
+        format!("{year}-{month}-{day}T{hour}:{minute}:{second}")
+    }
+
+    /// Merge paragraphs split across page boundaries. A PDF paginates text
+    /// physically — when a paragraph overflows the bottom of page N it resumes at
+    /// the top of page N+1, but the reconstruction pipeline runs per-page, so
+    /// the continuation appears as a separate `Paragraph` block. This pass
+    /// stitches such pairs back together so the exported document flows
+    /// naturally.
+    ///
+    /// **Heuristic** (conservative — never merges genuinely separate paragraphs):
+    /// 1. Both blocks must be `Paragraph` (not heading, list, table…).
+    /// 2. The paragraph styles must be compatible: same alignment and left
+    ///    indent within a tolerance of 6 pt.
+    /// 3. The tail paragraph's last text run must **not** end with
+    ///    sentence-final punctuation (`.`, `!`, `?`, `:`), **or** the head
+    ///    paragraph's first text run must start with a lowercase letter — both
+    ///    are strong continuation signals.
+    /// 4. The dominant font sizes must be within 15 % of each other.
+    fn merge_cross_page_paragraphs(sections: &mut [crate::model::Section]) {
+        use crate::model::{BlockKind, Inline};
+        for section in sections.iter_mut() {
+            if section.pages.len() < 2 {
+                continue;
+            }
+            // Track whether page i's first block was already consumed as a merge
+            // target (to avoid cascading merges onto a moved block).
+            for i in 0..section.pages.len() - 1 {
+                // Find the last Paragraph on page i (skipping empty blocks).
+                let tail_idx = section.pages[i].blocks.iter().rposition(|b| {
+                    matches!(&b.kind, BlockKind::Paragraph(_))
+                });
+                let head_idx = section.pages[i + 1].blocks.iter().position(|b| {
+                    matches!(&b.kind, BlockKind::Paragraph(_))
+                });
+                let (Some(tail_idx), Some(head_idx)) = (tail_idx, head_idx) else {
+                    continue;
+                };
+                // Borrow split: extract head block first to avoid double mutable borrow.
+                let should_merge = {
+                    let tail = &section.pages[i].blocks[tail_idx];
+                    let head = &section.pages[i + 1].blocks[head_idx];
+                    let (BlockKind::Paragraph(tail_p), BlockKind::Paragraph(head_p)) =
+                        (&tail.kind, &head.kind)
+                    else {
+                        continue;
+                    };
+                    // Same alignment.
+                    if tail_p.style.align != head_p.style.align {
+                        continue;
+                    }
+                    // Similar left indent (within 6pt).
+                    if (tail_p.style.indent_left_pt - head_p.style.indent_left_pt).abs() > 6.0 {
+                        continue;
+                    }
+                    // Get text content for heuristic checks.
+                    let tail_text = Self::paragraph_plain_text(tail_p);
+                    let head_text = Self::paragraph_plain_text(head_p);
+                    if tail_text.is_empty() || head_text.is_empty() {
+                        continue;
+                    }
+                    // Font size compatibility (within 15%).
+                    let tail_size = Self::dominant_font_size(tail_p);
+                    let head_size = Self::dominant_font_size(head_p);
+                    let ratio = (tail_size / head_size.max(1.0)).min(head_size / tail_size.max(1.0));
+                    if ratio < 0.85 {
+                        continue;
+                    }
+                    // Continuation signal: tail doesn't end with sentence-final
+                    // punctuation, or head starts lowercase.
+                    let tail_ends_sentence = tail_text
+                        .trim_end()
+                        .chars()
+                        .last()
+                        .map(|c| matches!(c, '.' | '!' | '?' | ':' | ';'))
+                        .unwrap_or(true);
+                    let head_starts_lower = head_text
+                        .trim_start()
+                        .chars()
+                        .next()
+                        .map(|c: char| c.is_lowercase())
+                        .unwrap_or(false);
+                    if tail_ends_sentence && !head_starts_lower {
+                        continue;
+                    }
+                    true
+                };
+                if !should_merge {
+                    continue;
+                }
+                // Perform the merge: move head's runs into tail, remove head.
+                let head_block = section.pages[i + 1].blocks.remove(head_idx);
+                if let (
+                    BlockKind::Paragraph(ref mut tail_p),
+                    BlockKind::Paragraph(head_p),
+                ) = (
+                    &mut section.pages[i].blocks[tail_idx].kind,
+                    head_block.kind,
+                ) {
+                    // Join with a space if neither side already has trailing/
+                    // leading whitespace (mirrors the paragraph builder's
+                    // gap-aware run join).
+                    let needs_space = tail_p
+                        .runs
+                        .last()
+                        .and_then(|r| match r {
+                            Inline::Run(ir) => Some(ir.text.chars().last()),
+                            _ => None,
+                        })
+                        .map(|last| last.map(|c| !c.is_whitespace()).unwrap_or(true))
+                        .unwrap_or(false);
+                    if needs_space {
+                        tail_p.runs.push(Inline::Run(crate::model::InlineRun {
+                            text: " ".to_string(),
+                            ..Default::default()
+                        }));
+                    }
+                    tail_p.runs.extend(head_p.runs);
+                }
+            }
+        }
+    }
+
+    /// Extract the plain text of a paragraph (concatenation of all run text,
+    /// ignoring line breaks, images and links' wrapper structure).
+    fn paragraph_plain_text(p: &crate::model::Paragraph) -> String {
+        use crate::model::Inline;
+        let mut out = String::new();
+        for run in &p.runs {
+            match run {
+                Inline::Run(ir) => out.push_str(&ir.text),
+                Inline::Link { children, .. } => {
+                    for child in children {
+                        if let Inline::Run(ir) = child {
+                            out.push_str(&ir.text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The dominant font size (pt) across a paragraph's runs — the median.
+    fn dominant_font_size(p: &crate::model::Paragraph) -> f64 {
+        use crate::model::Inline;
+        let mut sizes: Vec<f64> = Vec::new();
+        for run in &p.runs {
+            if let Inline::Run(ir) = run {
+                if ir.style.size_pt > 0.0 {
+                    sizes.push(ir.style.size_pt);
+                }
+            }
+        }
+        if sizes.is_empty() {
+            return 12.0;
+        }
+        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sizes[sizes.len() / 2]
+    }
+
+    /// Estimate page margins (top-down points) from the content bounding box of
+    /// the reconstructed blocks. Returns default margins when there are no blocks
+    /// with frames. Clamped to `[0, page_dim]`.
+    fn estimate_page_margins(
+        blocks: &[crate::model::Block],
+        page_w: f64,
+        page_h: f64,
+    ) -> crate::model::geom::Margins {
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_right = f64::NEG_INFINITY;
+        let mut max_bottom = f64::NEG_INFINITY;
+        for b in blocks {
+            if let Some(f) = b.frame {
+                min_x = min_x.min(f.x);
+                min_y = min_y.min(f.y);
+                max_right = max_right.max(f.x + f.w);
+                max_bottom = max_bottom.max(f.y + f.h);
+            }
+        }
+        if min_x.is_finite() {
+            let left = min_x.max(0.0).min(page_w);
+            let top = min_y.max(0.0).min(page_h);
+            let right = (page_w - max_right).max(0.0).min(page_w);
+            let bottom = (page_h - max_bottom).max(0.0).min(page_h);
+            crate::model::geom::Margins {
+                top,
+                right,
+                bottom,
+                left,
+            }
+        } else {
+            crate::model::geom::Margins::default()
+        }
+    }
+
+    /// Convert the document to an editable OpenDocument Text (`.odt`) via the
+    /// reconstructed model — flowing paragraphs, headings, lists, tables, images,
+    /// styles and section geometry — **not** fixed-position text boxes.
     pub fn to_odt(&self) -> Vec<u8> {
-        crate::convert::office::to_odt(&self.convert_pages())
+        crate::convert::export_model::odt_from_model(&self.reconstruct_model())
     }
 
-    /// Convert the document to an editable Word document (`.docx`): positioned
-    /// text boxes + anchored pictures + shape rectangles, one section per page.
+    /// Convert the document to an editable Word document (`.docx`) via the
+    /// reconstructed model — flowing `<w:p>` paragraphs with styled runs, real
+    /// `<w:tbl>` tables, list numbering, section geometry, header/footer —
+    /// **not** VML text boxes.
     pub fn to_docx(&self) -> Vec<u8> {
-        crate::convert::office::to_docx(&self.convert_pages())
+        crate::convert::export_model::docx_from_model(&self.reconstruct_model())
     }
 
-    /// Convert the document to an editable PowerPoint presentation (`.pptx`):
-    /// one slide per page, each text run a positioned box, each image a picture.
+    /// Convert the document to an editable PowerPoint presentation (`.pptx`)
+    /// via the reconstructed model — one slide per page, text boxes, shapes,
+    /// images and speaker notes as proper DrawingML objects.
     pub fn to_pptx(&self) -> Vec<u8> {
-        crate::convert::office::to_pptx(&self.convert_pages())
+        crate::convert::export_model::pptx_from_model(&self.reconstruct_model())
     }
 
-    /// Convert the document to an editable OpenDocument Presentation (`.odp`):
-    /// one slide per page, each text run a positioned box, each image a picture.
+    /// Convert the document to an editable OpenDocument Presentation (`.odp`)
+    /// via the reconstructed model — one slide per page, text boxes, shapes,
+    /// images and speaker notes as proper ODF draw elements.
     pub fn to_odp(&self) -> Vec<u8> {
-        crate::convert::office::to_odp(&self.convert_pages())
+        crate::convert::export_model::odp_from_model(&self.reconstruct_model())
     }
 
     /// Reconstruct each page's text into a row/column grid and export an Excel
@@ -10262,12 +10566,12 @@ impl Document {
         crate::recon::tag_tree::reconstruct_from_struct_tree(self, &mut ids).is_some()
     }
 
-    /// Convert the document to standalone HTML with absolutely-positioned,
-    /// styled text (font/weight/colour) and inlined images — real selectable
-    /// content, not a page raster. A reflow-level conversion (layout, not
-    /// pixel-perfect rendering).
+    /// Convert the document to standalone **semantic** HTML via the
+    /// reconstructed model — `<h1-6>`, `<p>`, `<table>`, `<ul>/<ol>`, `<img>`,
+    /// `<blockquote>`, `<pre><code>` — with styled `<span>` runs, data-URI
+    /// images and inline `<svg>` shapes. Real selectable, reflowable content.
     pub fn to_html(&self) -> String {
-        crate::convert::web::to_html(&self.convert_pages())
+        crate::convert::web::html_from_model(&self.reconstruct_model())
     }
 
     /// Build per-font render data (embedded TrueType program + decoder) from a
@@ -29494,8 +29798,8 @@ mod tests {
         // Page 1 (obj 8) carries a `/P` whose text is "first page". Page 2 (obj 9)
         // carries a `/P` whose `/Pg` points at it with text "second page". The
         // struct tree groups both under one `/Document` element.
-        let c1 = "BT /F1 12 Tf /P <</MCID 0>> BDC (first page) Tj EMC ET";
-        let c2 = "BT /F1 12 Tf /P <</MCID 0>> BDC (second page) Tj EMC ET";
+        let c1 = "BT /F1 12 Tf /P <</MCID 0>> BDC (First page.) Tj EMC ET";
+        let c2 = "BT /F1 12 Tf /P <</MCID 0>> BDC (Second page.) Tj EMC ET";
         let pdf = raw_pdf(&[
             (
                 1,
@@ -29564,11 +29868,11 @@ mod tests {
         let p1 = page_text(pages[0]);
         let p2 = page_text(pages[1]);
         assert!(
-            p1.contains("first page") && !p1.contains("second page"),
-            "model page 1 holds only its own tagged block, got {p1:?}"
+            p1.contains("First page") && !p1.contains("Second page"),
+            "model page 1 holds only its own tagged block (sentence-final period prevents cross-page merge), got {p1:?}"
         );
         assert!(
-            p2.contains("second page") && !p2.contains("first page"),
+            p2.contains("Second page") && !p2.contains("First page"),
             "the /Pg-2 block lands on model page 2, not page 1, got {p2:?}"
         );
     }

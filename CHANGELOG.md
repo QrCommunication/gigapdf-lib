@@ -9,6 +9,57 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+### Changed — PDF → Office conversions: flowing documents + reconstruction fidelity
+
+- **`to_docx()`, `to_odt()`, `to_pptx()`, `to_odp()`, `to_html()` now route
+  through the reconstructed semantic model** (`reconstruct_model()` →
+  `*_from_model()`) instead of the old `convert_pages()` VML-textbox path. A PDF
+  → Word export now produces real flowing `<w:p>` paragraphs with styled runs,
+  `<w:tbl>` tables, list numbering, section geometry and header/footer — **not**
+  fixed-position VML text boxes whose text gets clipped mid-sentence.
+
+- **Run coalescing** — adjacent `Inline::Run` entries with the same character
+  style (family, size within 0.5pt, bold/italic/underline/strike, color,
+  background, vertical-align) are merged into a single run during paragraph
+  reconstruction. PDF often splits a single sentence into dozens of glyph
+  fragments (one per embedded-font subset); without coalescing each becomes its
+  own `<w:r>` in DOCX, making editing impossible. Now the exported document has
+  clean contiguous styled spans.
+
+- **Cross-page paragraph merging** — a paragraph that overflows from the bottom
+  of page N to the top of page N+1 is stitched back into one block, so the
+  exported document reads naturally instead of having a spurious break
+  mid-sentence. Conservative heuristic: same alignment, similar indent, font
+  size within 15%, and a continuation signal (no sentence-final punctuation on
+  the tail, or the head starts lowercase).
+
+- **Page margins estimated from content** — the exported Word/ODT section
+  geometry reflects the original PDF's real margins instead of the default 0.5″.
+
+- **Hard page breaks** between pages within the same section in DOCX.
+
+- **Multi-column detection** — a 2-column PDF layout is detected from block
+  positions and emitted as `<w:cols w:num="2">` in the DOCX section properties.
+
+- **Margin-aware section coalescing** — `same_geometry` now compares margins
+  (±2pt) in addition to page size, so pages with different margins stay in
+  separate sections.
+
+### Added — metadata
+
+- **Extended PDF metadata extraction** — `CreationDate` → `dcterms:created`,
+  `ModDate` → `dcterms:modified`, `Creator` → `Application`, `Producer` →
+  generator, `Subject` → `dc:description`. PDF dates (`D:YYYYMMDD…`) are
+  converted to ISO-8601. All flow to `docProps/core.xml` and `docProps/app.xml`.
+
+### Removed — dead VML export path
+
+- The old `office::to_docx()`, `office::to_odt()`, `office::to_pptx()`,
+  `office::to_odp()` and `web::to_html()` functions (and their private
+  VML/ODF/DrawingML helpers) have been deleted. These produced fixed-position
+  text boxes from `convert_pages()` and are superseded by the model-based
+  exporters. Shared utility functions are kept.
+
 ## [0.106.0] - 2026-06-27
 
 ### Fixed — font fidelity (form XObjects)

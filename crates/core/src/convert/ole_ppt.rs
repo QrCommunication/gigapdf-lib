@@ -1132,6 +1132,7 @@ fn slide_geometry() -> PageGeometry {
     PageGeometry {
         width: 960.0,
         height: 540.0,
+        column_count: 1,
         ..PageGeometry::default()
     }
 }

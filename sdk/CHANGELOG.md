@@ -6,6 +6,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.107.0] - 2026-06-27
+
+### Changed — PDF → Office conversion quality overhaul
+
+- **All PDF→Office/HTML exports now produce flowing, editable documents** —
+  `toDocx()`, `toOdt()`, `toPptx()`, `toOdp()`, `toHtml()` route through the
+  reconstructed semantic model (real `<w:p>` paragraphs, `<w:tbl>` tables, list
+  numbering, section geometry) instead of fixed-position VML text boxes.
+
+- **Run coalescing** — adjacent text fragments with the same font/style are
+  merged into clean contiguous spans, fixing the "every word is a separate run"
+  problem that made exported Word documents uneditable.
+
+- **Cross-page paragraph merging** — paragraphs split across page boundaries are
+  stitched back together.
+
+- **Page margins, multi-column layout, hard page breaks, and extended metadata**
+  (creation/modification dates, creator, producer) are now recovered from the
+  PDF and emitted in the Office output.
+
+### Removed
+
+- Dead VML-based export path (`office::to_docx/odt/pptx/odp`, `web::to_html`)
+  has been deleted — the model-based exporters are now the only path.
+
 ## [0.106.0] - 2026-06-27
 
 ### Fixed

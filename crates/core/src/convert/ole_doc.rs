@@ -1107,6 +1107,7 @@ fn default_geometry() -> PageGeometry {
     PageGeometry {
         width: 612.0,
         height: 792.0,
+        column_count: 1,
         ..PageGeometry::default()
     }
 }

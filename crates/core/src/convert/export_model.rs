@@ -99,6 +99,23 @@ fn ooxml_core_props(meta: &crate::model::DocMeta) -> String {
         esc(lang, &mut v);
         body.push_str(&format!("<dc:language>{v}</dc:language>"));
     }
+    if !meta.description.is_empty() {
+        let mut v = String::new();
+        esc(&meta.description, &mut v);
+        body.push_str(&format!("<dc:description>{v}</dc:description>"));
+    }
+    if !meta.created.is_empty() {
+        body.push_str(&format!(
+            "<dcterms:created xsi:type=\"dcterms:W3CDTF\">{}</dcterms:created>",
+            meta.created
+        ));
+    }
+    if !meta.modified.is_empty() {
+        body.push_str(&format!(
+            "<dcterms:modified xsi:type=\"dcterms:W3CDTF\">{}</dcterms:modified>",
+            meta.modified
+        ));
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
@@ -110,13 +127,28 @@ xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">{body}</cp:corePropertie
 }
 
 /// OOXML `docProps/app.xml` (extended properties, ECMA-376 Part 1 §15.2.12.2):
-/// just the generating application — there is no per-document data to fabricate.
-fn ooxml_app_props() -> String {
+/// the generating application (from the source document when available), plus
+/// the company when known.
+fn ooxml_app_props(meta: &crate::model::DocMeta) -> String {
+    let app = if !meta.application.is_empty() {
+        let mut v = String::new();
+        esc(&meta.application, &mut v);
+        v
+    } else {
+        META_GENERATOR.to_string()
+    };
+    let company = if !meta.company.is_empty() {
+        let mut v = String::new();
+        esc(&meta.company, &mut v);
+        format!("<Company>{v}</Company>")
+    } else {
+        String::new()
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
 <Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" \
 xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">\
-<Application>{META_GENERATOR}</Application></Properties>"
+<Application>{app}</Application>{company}</Properties>"
     )
 }
 
@@ -414,7 +446,7 @@ Target=\"word/document.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
         .as_bytes(),
     );
     zip.add_deflated("docProps/core.xml", ooxml_core_props(&doc.meta).as_bytes());
-    zip.add_deflated("docProps/app.xml", ooxml_app_props().as_bytes());
+    zip.add_deflated("docProps/app.xml", ooxml_app_props(&doc.meta).as_bytes());
     zip.add_deflated("word/document.xml", body.as_bytes());
     zip.add_deflated(
         "word/_rels/document.xml.rels",
@@ -522,8 +554,15 @@ fn docx_body(doc: &Document, sect_hf: &[SectionHf], ctx: &mut DocxCtx) -> String
     let mut page_no = 0usize;
     let last_idx = doc.sections.len().saturating_sub(1);
     for (si, section) in doc.sections.iter().enumerate() {
-        for page in &section.pages {
+        for (pi, page) in section.pages.iter().enumerate() {
             page_no += 1;
+            // Insert a hard page break before each page boundary (except the very
+            // first page of a section) so content from adjacent PDF pages does
+            // not flow together as one continuous stream. This mirrors how the
+            // user expects a multi-page PDF to map to a multi-page Word document.
+            if pi > 0 {
+                blocks.push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
+            }
             blocks.push_str(&format!(
                 "<w:bookmarkStart w:id=\"{page_no}\" w:name=\"page{page_no}\"/>\
 <w:bookmarkEnd w:id=\"{page_no}\"/>"
@@ -576,8 +615,19 @@ fn docx_sect_pr(section: &Section, hf: Option<&SectionHf>) -> String {
         }
         _ => String::new(),
     };
+    // Multi-column layout: emit `<w:cols>` when the source page has more than
+    // one text column. A `space` of 720 twips (0.5″) approximates the standard
+    // gutter between columns when the source PDF's gutter can't be measured.
+    let cols = if geom.column_count > 1 {
+        format!(
+            "<w:cols w:num=\"{}\" w:space=\"720\"/>",
+            geom.column_count
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "<w:sectPr>{header_ref}{footer_ref}<w:pgSz w:w=\"{w}\" w:h=\"{h}\" w:orient=\"{o}\"/>\
+        "<w:sectPr>{header_ref}{footer_ref}{cols}<w:pgSz w:w=\"{w}\" w:h=\"{h}\" w:orient=\"{o}\"/>\
 <w:pgMar w:top=\"{mt}\" w:right=\"{mr}\" w:bottom=\"{mb}\" w:left=\"{ml}\" w:header=\"{mt}\" w:footer=\"{mb}\" w:gutter=\"0\"/></w:sectPr>",
         w = twips(geom.width),
         h = twips(geom.height),
@@ -1443,7 +1493,7 @@ Target=\"xl/workbook.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
         .as_bytes(),
     );
     zip.add_deflated("docProps/core.xml", ooxml_core_props(&doc.meta).as_bytes());
-    zip.add_deflated("docProps/app.xml", ooxml_app_props().as_bytes());
+    zip.add_deflated("docProps/app.xml", ooxml_app_props(&doc.meta).as_bytes());
     zip.add_deflated(
         "xl/workbook.xml",
         xlsx_model_workbook(count, &names).as_bytes(),
@@ -2120,7 +2170,7 @@ Target=\"ppt/presentation.xml\"/>{OOXML_DOCPROPS_RELS}</Relationships>"
         .as_bytes(),
     );
     zip.add_deflated("docProps/core.xml", ooxml_core_props(&doc.meta).as_bytes());
-    zip.add_deflated("docProps/app.xml", ooxml_app_props().as_bytes());
+    zip.add_deflated("docProps/app.xml", ooxml_app_props(&doc.meta).as_bytes());
     zip.add_deflated(
         "ppt/presentation.xml",
         pptx_model_presentation(slide_xmls.len(), sw, sh).as_bytes(),
@@ -7441,7 +7491,9 @@ mod tests {
                 width: 595.276,
                 height: 841.89,
                 margins: Margins::uniform(72.0),
-            },
+            
+            ..Default::default()
+},
             header: Some(vec![para("SEC1 HEADER")]),
             footer: None,
             pages: vec![Page {
@@ -7454,7 +7506,9 @@ mod tests {
                 width: 792.0,
                 height: 612.0,
                 margins: Margins::uniform(36.0),
-            },
+            
+            ..Default::default()
+},
             header: None,
             footer: Some(vec![para("SEC2 FOOTER")]),
             pages: vec![Page {
@@ -7621,7 +7675,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -8119,7 +8175,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: vec![table],
             placeholders: Vec::new(),
             notes: None,
@@ -8161,7 +8219,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -8201,7 +8261,9 @@ mod tests {
                     width: 960.0,
                     height: 540.0,
                     margins: crate::model::Margins::uniform(0.0),
-                },
+                
+                ..Default::default()
+},
                 shapes: Vec::new(),
                 placeholders: vec![crate::model::Placeholder {
                     role: crate::model::PlaceholderRole::Title,
@@ -8503,7 +8565,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Body,
@@ -8541,7 +8605,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -8685,7 +8751,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: vec![table],
             placeholders: Vec::new(),
             notes: None,
@@ -8900,7 +8968,9 @@ style:family=\"paragraph\""
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             // A free text-box shape (not a placeholder) must stay role-less.
             shapes: vec![Block {
                 frame: Some(crate::model::Rect::new(40.0, 460.0, 880.0, 40.0)),
@@ -9469,7 +9539,9 @@ style:family=\"paragraph\""
                 width: 595.0,
                 height: 842.0,
                 margins: Margins::uniform(72.0),
-            },
+            
+            ..Default::default()
+},
             header: None,
             footer: None,
             pages: vec![Page {
@@ -9482,7 +9554,9 @@ style:family=\"paragraph\""
                 width: 842.0,
                 height: 595.0,
                 margins: Margins::uniform(36.0),
-            },
+            
+            ..Default::default()
+},
             header: None,
             footer: None,
             pages: vec![Page {
@@ -10938,7 +11012,9 @@ style:print-orientation=\"landscape\""),
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,
@@ -11155,7 +11231,9 @@ style:print-orientation=\"landscape\""),
                 width: 960.0,
                 height: 540.0,
                 margins: crate::model::Margins::uniform(0.0),
-            },
+            
+            ..Default::default()
+},
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Body,

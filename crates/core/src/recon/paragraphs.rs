@@ -175,6 +175,14 @@ pub(crate) fn build_paragraph_styled(
 
     let align = paragraph_align(para, left, right);
     let style = paragraph_style(para, ctx, align, left, right, y, h);
+    // Coalesce adjacent `Inline::Run`s that share the same character style
+    // (family, size, bold/italic/underline/strike, color, background) into a
+    // single run. PDF often splits a single logical sentence into dozens of
+    // runs — one per glyph cluster or per embedded-font fragment — and without
+    // this pass each becomes its own `<w:r>` in the DOCX, making the document
+    // impossible to edit (every word/letter a separate run). Merging them here
+    // means the exported Word/ODT/HTML has clean, contiguous styled spans.
+    let runs = coalesce_runs(runs);
     let paragraph = Paragraph {
         style,
         style_ref: None,
@@ -346,6 +354,55 @@ fn link_for_run(run: &ReconRun, links: &[ParaLink]) -> Option<crate::model::Link
         }
     }
     None
+}
+
+/// Coalesce adjacent `Inline::Run` entries that share the same `CharStyle` into
+/// a single run, so the exported document has clean contiguous spans instead of
+/// one run per PDF glyph fragment. `LineBreak`, `Image` and `Link` entries act
+/// as hard boundaries — runs are never merged across them.
+///
+/// Two styles are "the same" when family, size, bold, italic, underline, strike,
+/// color and background all match. `vertical_align` (super/sub) is also compared
+/// so a superscript span stays separate from the baseline body.
+pub(crate) fn coalesce_runs(runs: Vec<Inline>) -> Vec<Inline> {
+    let mut out: Vec<Inline> = Vec::with_capacity(runs.len());
+    for r in runs {
+        match r {
+            Inline::Run(run) => {
+                // Try to merge into the previous run if it's a plain Run with a
+                // compatible style. Two styles are "compatible" when family,
+                // bold/italic/underline/strike, color, background and
+                // vertical_align all match, AND the font sizes are within 0.5pt
+                // (PDF float precision jitter). The merged run keeps the first
+                // run's exact style so the span stays stable downstream.
+                let merge = out.last_mut().and_then(|last| {
+                    if let Inline::Run(prev) = last {
+                        let same = prev.style.family == run.style.family
+                            && prev.style.generic == run.style.generic
+                            && prev.style.bold == run.style.bold
+                            && prev.style.italic == run.style.italic
+                            && prev.style.underline == run.style.underline
+                            && prev.style.strike == run.style.strike
+                            && prev.style.color == run.style.color
+                            && prev.style.background == run.style.background
+                            && prev.style.vertical_align == run.style.vertical_align
+                            && (prev.style.size_pt - run.style.size_pt).abs() < 0.5;
+                        (same
+                            && prev.source_index.is_none() == run.source_index.is_none())
+                            .then_some(prev)
+                    } else {
+                        None
+                    }
+                });
+                match merge {
+                    Some(prev) => prev.text.push_str(&run.text),
+                    None => out.push(Inline::Run(run)),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Round to 2 decimals — keeps recovered spacing/indents tidy (and JSON stable)
@@ -883,12 +940,17 @@ mod tests {
         let BlockKind::Paragraph(p) = block.kind else {
             panic!("expected paragraph");
         };
-        assert_eq!(nth_run_valign(&p, 0), Some(crate::model::VAlign::Baseline));
+        // After coalescing, two same-style runs merge into one — verify the
+        // merged run is baseline (not super/sub) and carries both texts.
         assert_eq!(
-            nth_run_valign(&p, 1),
+            nth_run_valign(&p, 0),
             Some(crate::model::VAlign::Baseline),
-            "same-size off-baseline run is not a super/subscript"
+            "merged same-size run is not a super/subscript"
         );
+        assert!(p.runs.iter().any(|r| match r {
+            crate::model::Inline::Run(ir) => ir.text.contains("normal") && ir.text.contains("text"),
+            _ => false,
+        }), "coalesced run carries both texts");
     }
 
     // ── #2 paragraph spacing / indents ───────────────────────────────────────

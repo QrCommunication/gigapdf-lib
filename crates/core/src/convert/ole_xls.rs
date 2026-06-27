@@ -1103,6 +1103,7 @@ fn build_document(sheets: Vec<Sheet>) -> Document {
         width: A4_H,
         height: A4_W,
         margins: Margins { top: MARGIN, right: MARGIN, bottom: MARGIN, left: MARGIN },
+        column_count: 1,
     };
     let block = Block {
         kind: BlockKind::Sheet(SheetBlock { sheets }),

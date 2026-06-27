@@ -239,6 +239,7 @@ fn page_geometry(g: PageGeom) -> PageGeometry {
             bottom: g.margins.bottom,
             left: g.margins.left,
         },
+        column_count: 1,
     }
 }
 
@@ -24752,7 +24753,9 @@ mod tests {
                 width: 960.0,
                 height: 540.0,
                 margins: Margins::uniform(0.0),
-            },
+            
+        column_count: 1,
+    },
             shapes: Vec::new(),
             placeholders: vec![Placeholder {
                 role: PlaceholderRole::Title,

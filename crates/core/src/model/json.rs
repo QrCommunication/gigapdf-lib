@@ -419,6 +419,7 @@ impl Writer {
         self.k_f64("height", g.height);
         self.key("margins");
         self.margins(&g.margins);
+        self.k_f64("column_count", g.column_count as f64);
         self.obj_close();
     }
 
@@ -1528,6 +1529,7 @@ impl<'a> Reader<'a> {
                 "width" => g.width = r.number()?,
                 "height" => g.height = r.number()?,
                 "margins" => g.margins = r.margins()?,
+                "column_count" => g.column_count = r.number().unwrap_or(1.0).max(1.0).min(8.0) as u8,
                 _ => return None,
             }
             Some(())
@@ -2599,7 +2601,9 @@ mod tests {
                     width: 960.0,
                     height: 540.0,
                     margins: Margins::uniform(36.0),
-                },
+                
+                ..Default::default()
+},
                 shapes: vec![Block {
                     id: BlockId(300),
                     frame: Some(Rect::new(50.0, 50.0, 400.0, 100.0)),
@@ -2822,7 +2826,9 @@ mod tests {
                     width: 595.27,
                     height: 841.89,
                     margins: Margins::symmetric(72.0, 54.0),
-                },
+                
+                ..Default::default()
+},
                 header: Some(vec![Block {
                     id: BlockId(900),
                     frame: None,
@@ -2911,7 +2917,9 @@ mod tests {
                     bottom: 1234567.89,
                     left: 0.0,
                 },
-            },
+            
+            ..Default::default()
+},
             header: None,
             footer: None,
             pages: vec![],
