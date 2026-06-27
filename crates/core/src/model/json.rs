@@ -1529,7 +1529,7 @@ impl<'a> Reader<'a> {
                 "width" => g.width = r.number()?,
                 "height" => g.height = r.number()?,
                 "margins" => g.margins = r.margins()?,
-                "column_count" => g.column_count = r.number().unwrap_or(1.0).max(1.0).min(8.0) as u8,
+                "column_count" => g.column_count = r.number().unwrap_or(1.0).clamp(1.0, 8.0) as u8,
                 _ => return None,
             }
             Some(())
