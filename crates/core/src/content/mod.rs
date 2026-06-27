@@ -77,6 +77,17 @@ pub struct ContentElement {
     /// For text: the font resource name in effect (`Tf` operand), used to look
     /// up the `/BaseFont` for family/weight/style. `None` for image/path.
     pub font: Option<String>,
+    /// For **text**: the run's style resolved at extraction against the font table
+    /// of *its own scope* — the page, or the form XObject it is nested in — as
+    /// family, bold/italic and the raw `/BaseFont` (subset prefix kept). This is
+    /// the scope-correct source for a host editor's font: resolving the [`font`]
+    /// resource name against the page's `/Font` alone mis-styles text drawn inside
+    /// a form XObject (whose `/Font` table differs). `None` for non-text, or when
+    /// the active scope had no style entry for the run's font (callers fall back to
+    /// a page-scope lookup, then a default).
+    ///
+    /// [`font`]: ContentElement::font
+    pub font_style: Option<FontStyle>,
     /// For text: the RGB fill colour in effect (`rg`/`g`/`k`), `0..=1` per
     /// channel. `None` means default (black) or non-text.
     pub color: Option<[f64; 3]>,
@@ -616,6 +627,33 @@ pub fn encode_content(operations: &[Operation]) -> Vec<u8> {
 /// name used by the `Tf` operator, without the leading `/`).
 pub type FontDecoders = BTreeMap<Vec<u8>, TextDecoder>;
 
+/// A text run's recovered font style within ONE resource scope (a page or a
+/// single form XObject): the display family, bold/italic, and the **raw**
+/// `/BaseFont` (subset prefix kept). Built by the document layer — the only place
+/// a `/FontDescriptor` is reachable — and threaded into element extraction so each
+/// run is styled against the font table of *its own* scope. Sibling of
+/// [`TextDecoder`] (decoding) for style.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FontStyle {
+    /// Display family ("Times New Roman", "Helvetica"…), from the `/BaseFont`
+    /// refined by the font's `/FontDescriptor`.
+    pub family: String,
+    /// Bold weight (name token, `/Flags` ForceBold, `/FontWeight >= 600`, `/StemV`).
+    pub bold: bool,
+    /// Italic/oblique (name token, `/Flags` Italic, or a non-zero `/ItalicAngle`).
+    pub italic: bool,
+    /// The raw `/BaseFont` name, **subset prefix kept** (e.g.
+    /// `ABCDEF+TimesNewRomanPSMT`), so a host editor can target the exact embedded
+    /// subset rather than only a collapsed family name.
+    pub base_font: String,
+}
+
+/// Per-font-resource styles for one resource scope (page or form XObject), keyed
+/// by font resource name. The style sibling of [`FontDecoders`]: the document
+/// layer builds one per scope so form-XObject text is styled against the form's
+/// `/Font` table, not the page's.
+pub type FontStyles = BTreeMap<Vec<u8>, FontStyle>;
+
 fn decode_operand_text(operands: &[Object], decoder: &TextDecoder) -> String {
     let mut text = String::new();
     for operand in operands {
@@ -760,6 +798,11 @@ pub struct FormXObject {
     /// Per-font decoders for the form's content (its `/Resources /Font`, with the
     /// page's as a fallback per the inheritance rule).
     pub fns: FontDecoders,
+    /// Per-font styles for the form's content (family/bold/italic + raw
+    /// `/BaseFont`), built from the form's own `/Resources /Font` over the page's,
+    /// exactly like [`fns`](FormXObject::fns). Resolving against this keeps form
+    /// text styled with the form's fonts, not the page's.
+    pub styles: FontStyles,
     /// The form's `/Matrix` (default identity).
     pub matrix: Matrix,
     /// The form XObject's object id `(number, generation)`, when it is an
@@ -1693,6 +1736,7 @@ fn elements_from_ops(
     elements_from_ops_resolved(
         operations,
         fonts,
+        &FontStyles::new(),
         gstate_alpha,
         &vector::NoNamedColors,
         Matrix::IDENTITY,
@@ -1715,6 +1759,7 @@ fn elements_from_ops(
 fn elements_from_ops_resolved(
     operations: &[Operation],
     fonts: &FontDecoders,
+    styles: &FontStyles,
     gstate_alpha: &BTreeMap<String, f64>,
     color_resolver: &dyn vector::NamedColorResolver,
     initial_ctm: Matrix,
@@ -1934,6 +1979,13 @@ fn elements_from_ops_resolved(
                     font_size
                 };
                 let rot = m[1].atan2(m[0]).to_degrees();
+                // Resolve the run's style against the CURRENT scope's font table
+                // (`styles` is the page's at depth 0, the form's when recursing),
+                // so form-XObject text is styled with the form's fonts rather than
+                // the page's — and carry the raw `/BaseFont` for subset targeting.
+                let font_style = current_font
+                    .as_deref()
+                    .and_then(|name| styles.get(name.as_bytes()).cloned());
                 elements.push(ContentElement {
                     index: 0,
                     kind: ElementKind::Text,
@@ -1942,6 +1994,7 @@ fn elements_from_ops_resolved(
                     op_end: i,
                     bounds,
                     font: current_font.clone(),
+                    font_style,
                     color: fill_color,
                     font_size: Some(eff_size),
                     rotation_deg: Some(if rot.abs() < 1e-6 { 0.0 } else { rot }),
@@ -1979,6 +2032,7 @@ fn elements_from_ops_resolved(
                     let mut child = elements_from_ops_resolved(
                         &parse_content(&form.content).unwrap_or_default(),
                         &form.fns,
+                        &form.styles,
                         gstate_alpha,
                         color_resolver,
                         child_ctm,
@@ -2018,6 +2072,7 @@ fn elements_from_ops_resolved(
                     op_end: i,
                     bounds: unit_square_bounds(&ctm),
                     font: None,
+                    font_style: None,
                     color: None,
                     font_size: None,
                     rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
@@ -2040,6 +2095,7 @@ fn elements_from_ops_resolved(
                     op_end: i,
                     bounds: unit_square_bounds(&ctm),
                     font: None,
+                    font_style: None,
                     color: None,
                     font_size: None,
                     rotation_deg: Some(if img_rot.abs() < 1e-6 { 0.0 } else { img_rot }),
@@ -2061,6 +2117,7 @@ fn elements_from_ops_resolved(
                         op_end: i,
                         bounds: path_bb.build(),
                         font: None,
+                        font_style: None,
                         color: None,
                         font_size: None,
                         rotation_deg: None,
@@ -2105,12 +2162,14 @@ pub fn extract_elements_with(
 pub fn extract_elements_resolved(
     content: &[u8],
     fonts: &FontDecoders,
+    styles: &FontStyles,
     gstate_alpha: &BTreeMap<String, f64>,
     resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
 ) -> Result<Vec<ContentElement>> {
     extract_elements_resolved_with_colors(
         content,
         fonts,
+        styles,
         gstate_alpha,
         &vector::NoNamedColors,
         resolve_form,
@@ -2126,6 +2185,7 @@ pub fn extract_elements_resolved(
 pub fn extract_elements_resolved_with_colors(
     content: &[u8],
     fonts: &FontDecoders,
+    styles: &FontStyles,
     gstate_alpha: &BTreeMap<String, f64>,
     color_resolver: &dyn vector::NamedColorResolver,
     resolve_form: &dyn Fn(&[u8]) -> Option<FormXObject>,
@@ -2135,6 +2195,7 @@ pub fn extract_elements_resolved_with_colors(
     Ok(elements_from_ops_resolved(
         &operations,
         fonts,
+        styles,
         gstate_alpha,
         color_resolver,
         Matrix::IDENTITY,
@@ -3121,6 +3182,7 @@ mod tests {
                 height: 10.0,
             }),
             font: None,
+            font_style: None,
             color: None,
             font_size: Some(10.0),
             rotation_deg: None,
@@ -3159,6 +3221,7 @@ mod tests {
                 height: 10.0,
             }),
             font: None,
+            font_style: None,
             color: None,
             font_size: Some(10.0),
             rotation_deg: None,
@@ -4137,6 +4200,7 @@ BT /F 12 Tf 50 100 Td (ONLYBODY) Tj ET";
         let els = extract_elements_resolved_with_colors(
             content,
             &FontDecoders::new(),
+            &FontStyles::new(),
             &BTreeMap::new(),
             &Sep,
             &|_| None,

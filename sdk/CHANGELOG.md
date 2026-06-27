@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.106.0] - 2026-06-27
+
+### Fixed
+
+- **`textElements` now reports the scope-correct font for text inside form
+  XObjects.** A run drawn through a reusable form XObject (CERFA / invoice /
+  letterhead templates) was styled against the page's `/Font` table instead of the
+  form's own, so its `fontFamily`/`bold`/`italic` collapsed to "Helvetica" regular
+  — losing the embedded face and weight, and misplacing the editor overlay (wrong
+  metrics). Each run is now styled against the font table of its own scope.
+
+### Added
+
+- **`TextElementInfo.baseFont`** — the run's raw `/BaseFont` with the subset prefix
+  kept (e.g. `"ABCDEF+TimesNewRomanPSMT"`), resolved against the run's own scope, so
+  a host editor can target the exact embedded subset rather than only the collapsed
+  `fontFamily`. Empty when the font carried no `/BaseFont` (e.g. a Type3 font).
+
 ## [0.105.0] - 2026-06-26
 
 ### Fixed

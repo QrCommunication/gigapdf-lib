@@ -1065,11 +1065,13 @@ pub extern "C" fn gp_elements_json(
 }
 
 /// Every text element on a page as JSON, enriched for a host editor:
-/// `[{index,text,x,y,width,height,fontFamily,bold,italic,fontSize,color:[r,g,b],
-/// rotation,direction}]`. Bounds are in user space (origin bottom-left); `index`
-/// is the text-run index accepted by `gp_replace_text`; `direction` is
-/// `"ltr"`|`"rtl"`|`"neutral"` for the run's strong characters. Host frees the
-/// returned buffer.
+/// `[{index,text,x,y,width,height,fontFamily,baseFont,bold,italic,fontSize,
+/// color:[r,g,b],rotation,direction}]`. Bounds are in user space (origin
+/// bottom-left); `index` is the text-run index accepted by `gp_replace_text`;
+/// `fontFamily` is the collapsed display family and `baseFont` the raw
+/// `/BaseFont` (subset prefix kept) resolved against the run's own scope (page or
+/// form XObject); `direction` is `"ltr"`|`"rtl"`|`"neutral"` for the run's strong
+/// characters. Host frees the returned buffer.
 #[no_mangle]
 pub extern "C" fn gp_text_elements_json(
     handle: *const Document,
@@ -1094,6 +1096,8 @@ pub extern "C" fn gp_text_elements_json(
                     fnum(e.height)
                 ));
                 json_escape(&e.font_family, &mut s);
+                s.push_str(",\"baseFont\":");
+                json_escape(&e.base_font, &mut s);
                 s.push_str(&format!(
                     ",\"bold\":{},\"italic\":{},\"fontSize\":{},\"color\":[{},{},{}],\"rotation\":{},\"direction\":\"{}\"}}",
                     e.bold,

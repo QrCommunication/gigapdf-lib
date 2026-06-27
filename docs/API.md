@@ -63,7 +63,7 @@ hybrid-reference PDFs resolve to their **current** state:
 |------|------|
 | `page_text_runs(page) -> Vec<TextRun>` | `gp_text_runs_json(handle,page,outlen)` |
 | `page_elements(page) -> Vec<ContentElement>` | `gp_elements_json(handle,page,outlen)` |
-| `page_text_elements(page) -> Vec<TextElementInfo>` (rich per-run text: bounds + family/bold/italic + size + colour + rotation + direction) | `gp_text_elements_json(handle,page,outlen)` |
+| `page_text_elements(page) -> Vec<TextElementInfo>` (rich per-run text: bounds + family/**baseFont** (raw `/BaseFont`, subset prefix kept) + bold/italic + size + colour + rotation + direction; family/weight/style resolved against the run's **own scope** — the page, or the form XObject it is drawn inside) | `gp_text_elements_json(handle,page,outlen)` |
 | `document_language() -> DocumentLanguage` (dominant direction + script + ISO-639-1) | `gp_document_language(handle,outlen)` → `{direction,script,lang?}` · SDK `documentLanguage` |
 | `page_image_elements(page) -> Vec<ImageElementInfo>` (placement bounds + format + embeddable bytes + pixel dims + rotation + opacity) | `gp_image_elements_json(handle,page,outlen)` → `[{…,format,pixelWidth,pixelHeight,dataBase64,rotation,opacity}]` |
 | `page_vector_paths(page) -> Vec<VectorPath>` (painted paths: segments + bounds + fill/stroke RGB + line width + alpha + dash; **the returned RGB resolves the page's colour spaces — Device & CIE families *and* **named** `/Separation` · `/ICCBased` · `/Indexed` · `/DeviceN` (resolved against `/Resources/ColorSpace`, applying the `/Separation` tint transform, `/ICCBased` `/N`, and the `/Indexed` palette) — so spot/ICC fills come back as their true RGB instead of a grey approximation; **v0.58.2**) | `gp_vector_paths_json(handle,page,outlen)` → `[{…,segments,fill,stroke,strokeWidth,fillAlpha,strokeAlpha,dash}]` |
@@ -470,7 +470,7 @@ Google fonts**, so the host fetches fonts in two phases.
 
 - `ContentElement { index, kind: Text|Image|Path, label, bounds, font, color }`
 - `TextRun { index, operator, text, op_position }`
-- `TextElementInfo { index, text, bounds, font_family, bold, italic, size, color, rotation, direction }`
+- `TextElementInfo { index, text, bounds, font_family, base_font, bold, italic, size, color, rotation, direction }` — `font_family`/`bold`/`italic` and `base_font` (raw `/BaseFont`, subset prefix kept, e.g. `ABCDEF+TimesNewRomanPSMT`) are resolved against the run's **own scope**: the page, or the form XObject the run is drawn inside (form `/Font` tables can rebind the same resource name). SDK field: `baseFont`.
 - `FormField { name, field_type, value, flags, options, max_len }`, `FieldKind` (enum `Text|Checkbox|Radio|PushButton|ComboBox|ListBox|Signature|Unknown`), and `FieldTrigger` (enum `Keystroke|Format|Validate|Calculate` — the `/AA` JavaScript event; `FieldTrigger::from_name` parses the SDK's lowercase name)
 - `SignatureInfo { field_name, signer_name, reason, location, date, sub_filter, byte_range: [i64;4] }` (listing) and `SignatureReport { field_name, byte_range_ok, digest_ok, signature_ok, covers_whole_document, signer_common_name, cert_count, algorithm }` (verification verdict, ISO 32000-1 §12.8.1)
 - `GradientSpec { kind: GradientKind, stops: Vec<GradientStop>, rect: [f64;4], extend: (bool,bool), opacity }` with `GradientKind` (enum `Linear { x0,y0,x1,y1 }` | `Radial { x0,y0,r0,x1,y1,r1 }`) and `GradientStop { offset (0..1), color: [f64;3] }` — authored gradients (ISO 32000-1 §8.7.4 shadings)

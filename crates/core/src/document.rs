@@ -2647,6 +2647,14 @@ pub struct TextElementInfo {
     pub width: f64,
     pub height: f64,
     pub font_family: String,
+    /// The run's raw `/BaseFont` name with the subset prefix kept (e.g.
+    /// `ABCDEF+TimesNewRomanPSMT`), resolved against the run's own scope (the page,
+    /// or the form XObject it is drawn inside). Lets a host editor target the exact
+    /// embedded subset rather than only the collapsed [`font_family`]. Empty when
+    /// the run's font carried no `/BaseFont` (e.g. a Type3 font).
+    ///
+    /// [`font_family`]: TextElementInfo::font_family
+    pub base_font: String,
     pub bold: bool,
     pub italic: bool,
     pub font_size: f64,
@@ -3826,6 +3834,26 @@ impl Document {
         }
     }
 
+    /// Per-font *styles* for a page, keyed by font resource name (the `Tf`
+    /// operand): the family/bold/italic recovered from each `/BaseFont` refined by
+    /// its `/FontDescriptor`, plus the raw `/BaseFont` for subset targeting. The
+    /// style sibling of [`page_font_decoders`](Self::page_font_decoders): threaded
+    /// into deep element extraction so a page's top-level text carries its
+    /// scope-correct style alongside form-XObject text.
+    pub(crate) fn page_font_styles(&self, page_no: u32) -> content::FontStyles {
+        let Ok(page) = self.page_dict(page_no) else {
+            return content::FontStyles::new();
+        };
+        match page
+            .get(b"Resources")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        {
+            Some(res) => self.font_styles_for(res),
+            None => content::FontStyles::new(),
+        }
+    }
+
     /// Build per-font text decoders from a `/Resources` dictionary's `/Font`
     /// sub-dictionary, reading each font's `/Subtype` (Type0 ⇒ 2-byte codes) and
     /// `/ToUnicode` CMap. Works for a page's resources *and* a form XObject's own
@@ -3958,6 +3986,64 @@ impl Document {
             );
         }
         decoders
+    }
+
+    /// Build per-font *styles* from a `/Resources /Font` sub-dictionary: each
+    /// font's display family + bold/italic (its `/BaseFont` parsed by
+    /// [`parse_base_font`](crate::convert::style::parse_base_font) then refined by
+    /// the `/FontDescriptor`), keyed by font resource name, with the raw
+    /// `/BaseFont` carried through for subset targeting. The style sibling of
+    /// [`font_decoders_for`](Self::font_decoders_for); works for a page's resources
+    /// *and* a form XObject's own resources, so form-XObject text is styled against
+    /// the form's font table — not the page's. Fonts without a `/BaseFont` (e.g.
+    /// Type3) are skipped (callers fall back).
+    fn font_styles_for(&self, resources: &Dictionary) -> content::FontStyles {
+        let mut out = content::FontStyles::new();
+        let Some(font_dict) = resources
+            .get(b"Font")
+            .map(|o| self.resolve(o))
+            .and_then(Object::as_dict)
+        else {
+            return out;
+        };
+        for (name, value) in &font_dict.0 {
+            let Some(font) = self.resolve(value).as_dict() else {
+                continue;
+            };
+            if let Some(base) = font.get(b"BaseFont").and_then(Object::as_name) {
+                let base_font = String::from_utf8_lossy(base).into_owned();
+                let mut style = crate::convert::style::parse_base_font(&base_font);
+                style.refine_with_descriptor(&self.font_descriptor_style(font));
+                out.insert(
+                    name.clone(),
+                    content::FontStyle {
+                        family: style.family,
+                        bold: style.bold,
+                        italic: style.italic,
+                        base_font,
+                    },
+                );
+            }
+        }
+        out
+    }
+
+    /// Per-font styles for a form XObject: its own `/Resources /Font` overlaid on
+    /// the page's (form definitions win), honouring resource inheritance so a form
+    /// that omits a font still styles via the page's. The style sibling of
+    /// [`form_font_decoders`](Self::form_font_decoders).
+    fn form_font_styles(
+        &self,
+        own_res: Option<&Dictionary>,
+        page_res: &Dictionary,
+    ) -> content::FontStyles {
+        let mut styles = self.font_styles_for(page_res);
+        if let Some(res) = own_res {
+            for (name, style) in self.font_styles_for(res) {
+                styles.insert(name, style);
+            }
+        }
+        styles
     }
 
     /// Build a simple font's character-code → Unicode map from its base
@@ -4310,6 +4396,7 @@ impl Document {
                 .map(|o| self.resolve(o))
                 .and_then(Object::as_dict);
             let fns = self.form_font_decoders(own_res, page_res);
+            let styles = self.form_font_styles(own_res, page_res);
             let matrix = self.form_matrix(&stream.dict);
             // Insert-if-absent: an outer scope's definition of `name` wins.
             forms
@@ -4317,6 +4404,7 @@ impl Document {
                 .or_insert_with(|| content::FormXObject {
                     content,
                     fns,
+                    styles,
                     matrix,
                     ref_id: oid,
                 });
@@ -4784,6 +4872,10 @@ impl Document {
     pub fn page_elements_deep(&self, page_no: u32) -> Result<Vec<ContentElement>> {
         let content = self.page_content(page_no)?;
         let fonts = self.page_font_decoders(page_no);
+        // Page-scope font styles (family/bold/italic + raw `/BaseFont`) so each
+        // top-level text run is styled against the page's `/Font`; form-XObject
+        // runs are styled against the form's own table, carried on the form.
+        let styles = self.page_font_styles(page_no);
         let gstate_alpha = self.page_gstate_alpha(page_no);
         let forms = self.page_form_xobjects(page_no);
         // Resolve `cs`/`scn` named fill spaces (Separation/DeviceN tints,
@@ -4799,6 +4891,7 @@ impl Document {
         content::extract_elements_resolved_with_colors(
             &content,
             &fonts,
+            &styles,
             &gstate_alpha,
             &resolver,
             &|name| forms.get(name).cloned(),
@@ -4935,7 +5028,12 @@ impl Document {
                     top_run += 1;
                     idx
                 };
-                let style = e.font.as_ref().and_then(|name| styles.get(name));
+                // Prefer the style resolved at extraction against the run's OWN
+                // scope (page or form XObject) — the scope-correct source. Fall
+                // back to the page-scope `/Font` table only when the run carried no
+                // resolved style (the historical behaviour), then to Helvetica.
+                let scoped = e.font_style.as_ref();
+                let fallback = e.font.as_ref().and_then(|name| styles.get(name));
                 let b = e.bounds.unwrap_or(content::Bounds {
                     x: 0.0,
                     y: 0.0,
@@ -4950,11 +5048,19 @@ impl Document {
                     y: b.y,
                     width: b.width,
                     height: b.height,
-                    font_family: style
+                    font_family: scoped
                         .map(|s| s.family.clone())
+                        .or_else(|| fallback.map(|s| s.family.clone()))
                         .unwrap_or_else(|| "Helvetica".to_string()),
-                    bold: style.map(|s| s.bold).unwrap_or(false),
-                    italic: style.map(|s| s.italic).unwrap_or(false),
+                    base_font: scoped.map(|s| s.base_font.clone()).unwrap_or_default(),
+                    bold: scoped
+                        .map(|s| s.bold)
+                        .or_else(|| fallback.map(|s| s.bold))
+                        .unwrap_or(false),
+                    italic: scoped
+                        .map(|s| s.italic)
+                        .or_else(|| fallback.map(|s| s.italic))
+                        .unwrap_or(false),
                     font_size: e.font_size.filter(|s| *s > 0.0).unwrap_or(b.height),
                     color: e.color.unwrap_or([0.0, 0.0, 0.0]),
                     rotation_deg: e.rotation_deg.unwrap_or(0.0),
@@ -8270,13 +8376,26 @@ impl Document {
                         if element.label.trim().is_empty() {
                             continue;
                         }
-                        // Recover the run's style from its font resource, then
-                        // overlay the fill colour the interpreter captured.
+                        // Recover the run's style, preferring the one resolved at
+                        // extraction against the run's OWN scope (page or form
+                        // XObject) — rebuilt from the raw `/BaseFont` (generic
+                        // class) plus the resolved family + refined bold/italic.
+                        // Fall back to the page-scope `/Font` table, then overlay
+                        // the fill colour the interpreter captured.
                         let mut style = element
-                            .font
-                            .as_deref()
-                            .and_then(|f| font_styles.get(f))
-                            .cloned()
+                            .font_style
+                            .as_ref()
+                            .map(|fs| {
+                                let mut ts =
+                                    crate::convert::style::parse_base_font(&fs.base_font);
+                                ts.family = fs.family.clone();
+                                ts.bold = fs.bold;
+                                ts.italic = fs.italic;
+                                ts
+                            })
+                            .or_else(|| {
+                                element.font.as_deref().and_then(|f| font_styles.get(f)).cloned()
+                            })
                             .unwrap_or_default();
                         style.color = element.color;
                         conv.texts.push(PlacedText {
@@ -31267,6 +31386,98 @@ mod tests {
         assert!(
             doc.clone().replace_text_run(1, form.index, "x").is_err(),
             "editing a form-XObject run is a safe no-op error, not a wrong-run edit"
+        );
+    }
+
+    /// A page whose `/Font /F1` is Helvetica (regular) but whose form XObject
+    /// `/Fm0` **rebinds the same resource name `/F1`** to a subset-prefixed Times
+    /// Bold-Italic face (its own `/Resources /Font`). The run drawn inside the form
+    /// must resolve its style against the FORM's font table — Times, bold+italic —
+    /// not the page's (Helvetica, regular), and expose the raw subset `/BaseFont`.
+    fn form_scoped_font_fixture() -> Vec<u8> {
+        // Top-level "PAGE" via the page's /F1 (Helvetica); then draw the form.
+        let page_stream = "BT /F1 12 Tf 50 150 Td (PAGE) Tj ET\nq 1 0 0 1 30 40 cm /Fm0 Do Q";
+        // Form "FORM" via the form's OWN /F1 (Times Bold-Italic subset).
+        let form_stream = "BT /F1 12 Tf 5 5 Td (FORM) Tj ET";
+        raw_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F1 6 0 R >> /XObject << /Fm0 5 0 R >> >> \
+                 /Contents 4 0 R >>"
+                    .into(),
+            ),
+            (
+                4,
+                format!(
+                    "<< /Length {} >> stream\n{page_stream}\nendstream",
+                    page_stream.len()
+                ),
+            ),
+            // Form: its OWN /Font /F1 → object 7 (the Times Bold-Italic subset),
+            // shadowing the page's /F1.
+            (
+                5,
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /Font << /F1 7 0 R >> >> \
+                     /Length {} >> stream\n{form_stream}\nendstream",
+                    form_stream.len()
+                ),
+            ),
+            // Page /F1 = Helvetica regular (a base-14 standard font, no descriptor).
+            (
+                6,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+            ),
+            // Form /F1 = embedded subset Times Bold-Italic, with a matching
+            // /FontDescriptor (italic flag + bold weight + italic angle).
+            (
+                7,
+                "<< /Type /Font /Subtype /Type1 \
+                 /BaseFont /ABCDEF+TimesNewRomanPS-BoldItalicMT \
+                 /FontDescriptor 8 0 R >>"
+                    .into(),
+            ),
+            (
+                8,
+                "<< /Type /FontDescriptor /FontName /ABCDEF+TimesNewRomanPS-BoldItalicMT \
+                 /Flags 70 /FontWeight 700 /ItalicAngle -12 >>"
+                    .into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn form_xobject_text_resolves_style_against_form_font_scope() {
+        let doc = Document::open(&form_scoped_font_fixture()).unwrap();
+        let els = doc.page_text_elements(1);
+
+        // Non-regression: the top-level run keeps the page's /F1 (Helvetica,
+        // regular) and reports its own /BaseFont.
+        let page = els.iter().find(|e| e.text == "PAGE").expect("PAGE run");
+        assert_eq!(page.font_family, "Helvetica", "page run keeps page /F1");
+        assert!(!page.bold && !page.italic, "page run is regular");
+        assert_eq!(page.base_font, "Helvetica", "page run base_font is its /BaseFont");
+
+        // The fix: the form run resolves against the FORM's /F1 (Times Bold-Italic),
+        // NOT the page's Helvetica — and exposes the raw subset /BaseFont.
+        let form = els.iter().find(|e| e.text == "FORM").expect("FORM run");
+        assert_eq!(
+            form.font_family, "Times New Roman",
+            "form run is styled against the form's font table, not Helvetica"
+        );
+        assert!(
+            form.bold && form.italic,
+            "form run is bold + italic (form scope), got bold={} italic={}",
+            form.bold,
+            form.italic
+        );
+        assert_eq!(
+            form.base_font, "ABCDEF+TimesNewRomanPS-BoldItalicMT",
+            "form run exposes the raw subset /BaseFont for targeting the embedded font"
         );
     }
 

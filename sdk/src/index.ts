@@ -1163,6 +1163,14 @@ export interface TextElementInfo {
   height: number;
   /** Resolved `/BaseFont` family (e.g. "Helvetica", "Times New Roman"). */
   fontFamily: string;
+  /**
+   * The raw `/BaseFont` name with the subset prefix kept (e.g.
+   * `"ABCDEF+TimesNewRomanPSMT"`), resolved against the run's own scope — the
+   * page, or the form XObject the run is drawn inside. Lets a host target the
+   * exact embedded subset rather than only the collapsed {@link fontFamily}.
+   * Empty when the run's font carried no `/BaseFont` (e.g. a Type3 font).
+   */
+  baseFont: string;
   bold: boolean;
   italic: boolean;
   /** Effective glyph size in points. */

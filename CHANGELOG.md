@@ -9,6 +9,34 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.106.0] - 2026-06-27
+
+### Fixed — font fidelity (form XObjects)
+
+- **Text drawn inside a form XObject is now styled against the form's own `/Font`
+  table, not the page's.** Each text run's family/weight/style was resolved by
+  looking the `Tf` resource name up in the **page's** `/Font` only, so a run inside
+  a form XObject whose `/Resources /Font` rebinds that name (very common in CERFA /
+  invoice / letterhead templates) fell back to "Helvetica" regular — losing the
+  embedded face, bold and italic, which broke font coherence within a single
+  sentence and caused overlap in the editor overlay (wrong metrics). The element
+  walker now resolves each run's style against the **scope in effect** (the form
+  XObject when nested, the page otherwise) and carries the resolved family/bold/
+  italic directly on the element, so `page_text_elements`, the Office /
+  reconstruction exporters (`runs_from_elements`, `convert_pages`) and
+  `reconstruct_model` all see the scope-correct style. Advances (`/Widths`) were
+  already correct; only the resolved *style* changes.
+
+### Added
+
+- **Per-run raw `/BaseFont` exposed (`base_font` / SDK `baseFont`).** Each text
+  element now carries its raw `/BaseFont` with the subset prefix kept (e.g.
+  `ABCDEF+TimesNewRomanPSMT`), resolved against the run's own scope, so a host
+  editor can target the exact embedded subset rather than only the collapsed
+  display family. Surfaced on `TextElementInfo` (Rust + SDK) and in the
+  `gp_text_elements_json` ABI as `"baseFont"`. Empty when the font has no
+  `/BaseFont` (e.g. a Type3 font).
+
 ## [0.105.0] - 2026-06-26
 
 ### Fixed — text extraction

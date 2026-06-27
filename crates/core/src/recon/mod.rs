@@ -166,11 +166,23 @@ pub fn runs_from_elements(
             if e.label.trim().is_empty() {
                 return None;
             }
+            // Prefer the style resolved at extraction against the run's OWN scope
+            // (page or form XObject): form-XObject text must be styled with the
+            // form's fonts, not the page's. Rebuild the full `TextStyle` from the
+            // raw `/BaseFont` (for the generic class) overlaid with the resolved
+            // family + refined bold/italic. Fall back to the page-scope table only
+            // when the run carried no resolved style.
             let mut style = e
-                .font
-                .as_deref()
-                .and_then(|f| font_styles.get(f))
-                .cloned()
+                .font_style
+                .as_ref()
+                .map(|fs| {
+                    let mut ts = crate::convert::style::parse_base_font(&fs.base_font);
+                    ts.family = fs.family.clone();
+                    ts.bold = fs.bold;
+                    ts.italic = fs.italic;
+                    ts
+                })
+                .or_else(|| e.font.as_deref().and_then(|f| font_styles.get(f)).cloned())
                 .unwrap_or_default();
             style.color = e.color;
             Some(ReconRun {
