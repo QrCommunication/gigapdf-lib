@@ -58,34 +58,6 @@ pub(crate) fn unescape(s: &str) -> String {
     out
 }
 
-/// Recover paragraphs from XML: each `boundary` tag becomes a paragraph break,
-/// each `cell_sep` tag a space; all other tags are stripped and entities
-/// decoded. Robust for OOXML/ODF/HTML alike.
-fn paragraphs_from_xml(xml: &str, boundaries: &[&str], cell_sep: &[&str]) -> Vec<String> {
-    let mut s = xml.to_string();
-    for tag in cell_sep {
-        s = s.replace(tag, " \u{0}"); // keep a space but not a break
-    }
-    for tag in boundaries {
-        s = s.replace(tag, "\n");
-    }
-    let mut text = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            c if !in_tag => text.push(c),
-            _ => {}
-        }
-    }
-    let text = unescape(&text).replace('\u{0}', "");
-    text.split('\n')
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
 /// Greedy word-wrap to at most `max_chars` per line (rough, char-count based).
 fn wrap(text: &str, max_chars: usize) -> Vec<String> {
     if text.chars().count() <= max_chars {
@@ -188,114 +160,11 @@ pub fn html_to_pdf(html: &str) -> Vec<u8> {
     crate::html::render(html, &[], 612.0, 792.0, 36.0)
 }
 
-/// DOCX → PDF.
-pub fn docx_to_pdf(bytes: &[u8]) -> Vec<u8> {
-    let zip = super::zip::read_zip(bytes);
-    let xml = zip
-        .get("word/document.xml")
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
-    flow_to_pdf(&[paragraphs_from_xml(&xml, &["</w:p>"], &[])])
-}
-
-/// ODT → PDF.
-pub fn odt_to_pdf(bytes: &[u8]) -> Vec<u8> {
-    let zip = super::zip::read_zip(bytes);
-    let xml = zip
-        .get("content.xml")
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
-    flow_to_pdf(&[paragraphs_from_xml(&xml, &["</text:p>", "</text:h>"], &[])])
-}
-
-/// PPTX → PDF (one page per slide).
-pub fn pptx_to_pdf(bytes: &[u8]) -> Vec<u8> {
-    let zip = super::zip::read_zip(bytes);
-    // Slides in numeric order: slide1.xml, slide2.xml, …
-    let mut slides: Vec<(usize, String)> = zip
-        .iter()
-        .filter(|(k, _)| k.starts_with("ppt/slides/slide") && k.ends_with(".xml"))
-        .filter_map(|(k, v)| {
-            let n: usize = k["ppt/slides/slide".len()..k.len() - 4].parse().ok()?;
-            Some((n, String::from_utf8_lossy(v).into_owned()))
-        })
-        .collect();
-    slides.sort_by_key(|(n, _)| *n);
-    let mut sections: Vec<Vec<String>> = slides
-        .iter()
-        .map(|(_, xml)| paragraphs_from_xml(xml, &["</a:p>"], &[]))
-        .collect();
-    if sections.is_empty() {
-        sections.push(Vec::new());
-    }
-    flow_to_pdf(&sections)
-}
-
-/// XLSX → PDF (one page per sheet; cells space-separated per row).
-pub fn xlsx_to_pdf(bytes: &[u8]) -> Vec<u8> {
-    let zip = super::zip::read_zip(bytes);
-    let mut sheets: Vec<(usize, String)> = zip
-        .iter()
-        .filter(|(k, _)| k.starts_with("xl/worksheets/sheet") && k.ends_with(".xml"))
-        .filter_map(|(k, v)| {
-            let n: usize = k["xl/worksheets/sheet".len()..k.len() - 4].parse().ok()?;
-            Some((n, String::from_utf8_lossy(v).into_owned()))
-        })
-        .collect();
-    sheets.sort_by_key(|(n, _)| *n);
-    let mut sections: Vec<Vec<String>> = sheets
-        .iter()
-        .map(|(_, xml)| paragraphs_from_xml(xml, &["</row>"], &["</c>"]))
-        .collect();
-    if sections.is_empty() {
-        sections.push(Vec::new());
-    }
-    flow_to_pdf(&sections)
-}
-
-/// ODS → PDF (rows as paragraphs, cells space-separated).
-pub fn ods_to_pdf(bytes: &[u8]) -> Vec<u8> {
-    let zip = super::zip::read_zip(bytes);
-    let xml = zip
-        .get("content.xml")
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
-    flow_to_pdf(&[paragraphs_from_xml(
-        &xml,
-        &["</table:table-row>"],
-        &["</table:table-cell>"],
-    )])
-}
-
-/// ODP → PDF (one page per slide; text runs from `draw:text-box`).
-pub fn odp_to_pdf(bytes: &[u8]) -> Vec<u8> {
-    let zip = super::zip::read_zip(bytes);
-    let xml = zip
-        .get("content.xml")
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
-    // Slides are `<draw:page>`; their text lives in `<text:p>` runs.
-    let sections: Vec<Vec<String>> = xml
-        .split("<draw:page")
-        .skip(1)
-        .map(|slide| paragraphs_from_xml(slide, &["</text:p>"], &[]))
-        .collect();
-    let sections = if sections.is_empty() {
-        vec![Vec::new()]
-    } else {
-        sections
-    };
-    flow_to_pdf(&sections)
-}
-
-/// Auto-detect an Office container and convert to PDF. Returns `None` if the
-/// bytes are not a recognized OOXML/ODF archive.
-///
+/// Office (DOCX/ODT/PPTX/XLSX/ODS/ODP/DOC/XLS/PPT) → PDF — auto-detected.
 /// Delegates to [`super::office_import::office_to_pdf`], which maps the document
-/// to styled HTML (headings, bold/italic, colour, tables, lists, images) and
-/// renders it through the native HTML→PDF engine for rich fidelity — and adds a
-/// best-effort text path for legacy OLE2 `.doc/.xls/.ppt`. The per-format
-/// text-only helpers below remain available for callers that want the flat flow.
+/// container through the rich model-based HTML/CSS renderer (styled fonts,
+/// tables, images, proper layout) — **not** a text-only scrape.
+/// Returns `None` for an unrecognized container.
 pub fn office_to_pdf(bytes: &[u8]) -> Option<Vec<u8>> {
     super::office_import::office_to_pdf(bytes)
 }
@@ -1434,13 +1303,6 @@ mod tests {
             unescape("a &amp; b &lt;c&gt; &#65; &#x42;"),
             "a & b <c> A B"
         );
-    }
-
-    #[test]
-    fn xml_paragraphs_strip_tags_and_split() {
-        let xml = "<w:p><w:r><w:t>Hello</w:t></w:r></w:p><w:p><w:t>World &amp; co</w:t></w:p>";
-        let paras = paragraphs_from_xml(xml, &["</w:p>"], &[]);
-        assert_eq!(paras, vec!["Hello".to_string(), "World & co".to_string()]);
     }
 
     #[test]
