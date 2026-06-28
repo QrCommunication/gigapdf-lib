@@ -37,8 +37,8 @@ use crate::model::geom::{Margins, PageGeometry, Rect, Rotation};
 use crate::model::sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
 use crate::model::slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 use crate::model::style::{
-    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParagraphStyle, StyleId, StyleTable,
-    VAlign,
+    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParaBorder, ParagraphStyle, StyleId,
+    StyleTable, VAlign,
 };
 use crate::model::{
     Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, Comment, DocMeta, Document,
@@ -343,6 +343,34 @@ impl Writer {
         self.k_f64("first_line_pt", p.first_line_pt);
         self.key("line_height");
         self.line_height(p.line_height);
+        self.k_opt_rgb("background", &p.background);
+        self.key("borders");
+        self.para_borders(&p.borders);
+        self.k_bool("keep_with_next", p.keep_with_next);
+        self.k_bool("keep_together", p.keep_together);
+        self.obj_close();
+    }
+
+    /// The four-element `[top, right, bottom, left]` border array: each side is
+    /// either `null` or `{width_pt, style, color}`. Matches [`Reader::para_borders`].
+    fn para_borders(&mut self, borders: &[Option<ParaBorder>; 4]) {
+        self.arr_open();
+        for b in borders {
+            self.elem();
+            match b {
+                Some(b) => self.para_border(b),
+                None => self.null(),
+            }
+        }
+        self.arr_close();
+    }
+
+    fn para_border(&mut self, b: &ParaBorder) {
+        self.obj_open();
+        self.k_f64("width_pt", b.width_pt);
+        self.k_str("style", &b.style);
+        self.key("color");
+        self.rgb(&b.color);
         self.obj_close();
     }
 
@@ -1451,11 +1479,53 @@ impl<'a> Reader<'a> {
                 "indent_right_pt" => p.indent_right_pt = r.number()?,
                 "first_line_pt" => p.first_line_pt = r.number()?,
                 "line_height" => p.line_height = r.line_height()?,
+                "background" => p.background = r.opt_rgb()?,
+                "borders" => p.borders = r.para_borders()?,
+                "keep_with_next" => p.keep_with_next = r.bool()?,
+                "keep_together" => p.keep_together = r.bool()?,
                 _ => return None,
             }
             Some(())
         })?;
         Some(p)
+    }
+
+    /// The four-element `[top, right, bottom, left]` border array. Each element
+    /// is `null` (no border) or a `{width_pt, style, color}` object.
+    fn para_borders(&mut self) -> Option<[Option<ParaBorder>; 4]> {
+        let v: Vec<Option<ParaBorder>> = self.array(Reader::opt_para_border)?;
+        if v.len() != 4 {
+            return None;
+        }
+        let mut arr = <[Option<ParaBorder>; 4]>::default();
+        for (i, b) in v.into_iter().enumerate() {
+            arr[i] = b;
+        }
+        Some(arr)
+    }
+
+    /// `null` → `None`, else a full [`ParaBorder`] object.
+    fn opt_para_border(&mut self) -> Option<Option<ParaBorder>> {
+        if self.peek()? == b'n' {
+            self.null()?;
+            Some(None)
+        } else {
+            Some(Some(self.para_border()?))
+        }
+    }
+
+    fn para_border(&mut self) -> Option<ParaBorder> {
+        let mut b = ParaBorder::default();
+        self.object(|r, k| {
+            match k {
+                "width_pt" => b.width_pt = r.number()?,
+                "style" => b.style = r.string()?,
+                "color" => b.color = r.rgb()?,
+                _ => return None,
+            }
+            Some(())
+        })?;
+        Some(b)
     }
 
     fn line_height(&mut self) -> Option<LineHeight> {
@@ -2417,6 +2487,7 @@ mod tests {
                 indent_right_pt: 0.0,
                 first_line_pt: -9.0,
                 line_height: LineHeight::Multiple(1.5),
+                ..Default::default()
             },
             style_ref: Some(StyleId("Body".to_string())),
             runs: vec![

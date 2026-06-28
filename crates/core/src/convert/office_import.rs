@@ -1332,6 +1332,15 @@ fn para_style_model(para: &ParaStyle) -> ParagraphStyle {
         indent_right_pt: para.indent_right_pt.unwrap_or(0.0),
         first_line_pt: para.first_line_pt.unwrap_or(0.0),
         line_height,
+        background: para.shading.as_deref().and_then(hex_to_rgb_f64),
+        borders: [
+            para.borders[0].as_ref().map(border_side_to_para_border),
+            para.borders[1].as_ref().map(border_side_to_para_border),
+            para.borders[2].as_ref().map(border_side_to_para_border),
+            para.borders[3].as_ref().map(border_side_to_para_border),
+        ],
+        keep_with_next: para.keep_with_next,
+        keep_together: para.keep_together,
     }
 }
 
@@ -1577,6 +1586,7 @@ fn docx_paragraph_model(
     let mut num_ref = NumRef::default();
     let mut in_rpr = false;
     let mut in_ppr = false;
+    let mut in_pbdr = false; // inside <w:pPr>/<w:pBdr> (paragraph borders)
     let mut depth = 0i32;
     // `w:pPr/w:pageBreakBefore` → this paragraph opens a fresh page.
     let mut page_break_before = false;
@@ -1678,6 +1688,39 @@ fn docx_paragraph_model(
                         para.first_line_pt = attr(&attrs, "firstLine")
                             .and_then(twips_to_pt)
                             .or(para.first_line_pt);
+                    }
+                    // `w:pPr/w:contextualSpacing`: suppress space-before between
+                    // consecutive list paragraphs. No model field — accepted and
+                    // ignored (the model has no such toggle).
+                    "contextualSpacing" if in_ppr => {}
+                    // `w:pPr/w:keepNext`: keep this paragraph with the next one
+                    // (avoid a page break between them). `w:val="0"`/`"false"`
+                    // cancels an inherited setting.
+                    "keepNext" if in_ppr => {
+                        para.keep_with_next =
+                            !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                    }
+                    // `w:pPr/w:keepLines`: keep all lines of this paragraph on one
+                    // page (don't split it across a page boundary).
+                    "keepLines" if in_ppr => {
+                        para.keep_together =
+                            !matches!(attr(&attrs, "val"), Some("0") | Some("false"));
+                    }
+                    // `w:pPr/w:pBdr` opens the per-side paragraph border group;
+                    // its `w:top`/`w:left`/`w:bottom`/`w:right` children carry the
+                    // width/style/colour of each side (the "encadré" frame).
+                    "pBdr" if in_ppr && !sc => in_pbdr = true,
+                    "top" if in_pbdr => para.borders[0] = parse_border_side(&attrs),
+                    "right" if in_pbdr => para.borders[1] = parse_border_side(&attrs),
+                    "bottom" if in_pbdr => para.borders[2] = parse_border_side(&attrs),
+                    "left" if in_pbdr => para.borders[3] = parse_border_side(&attrs),
+                    // `w:pPr/w:shd@w:fill` shades the paragraph background. Guard
+                    // against the run-mark `w:pPr/w:rPr/w:shd` (run shading) so only
+                    // the paragraph-level fill is taken.
+                    "shd" if in_ppr && !in_rpr => {
+                        para.shading = attr(&attrs, "fill")
+                            .filter(|v| *v != "auto" && is_hex6(v))
+                            .map(|v| v.to_ascii_uppercase());
                     }
                     "r" if !sc => {
                         depth += 1;
@@ -4577,6 +4620,7 @@ impl PptxParaPr {
             indent_right_pt: 0.0,
             first_line_pt: self.first_line.unwrap_or(0.0),
             line_height: self.line_height.unwrap_or_default(),
+            ..Default::default()
         }
     }
 }
@@ -8520,6 +8564,11 @@ struct ParaStyle {
     /// Paragraph shading colour from `w:pPr/w:shd@w:fill` (6-hex, no `#`) →
     /// `background-color`. `auto`/missing leaves it `None`.
     shading: Option<String>,
+    /// `w:pPr/w:keepNext`: keep this paragraph on the same page as the next.
+    keep_with_next: bool,
+    /// `w:pPr/w:keepLines`: keep all lines of this paragraph together (no
+    /// page-split mid-paragraph).
+    keep_together: bool,
 }
 
 /// One side of a paragraph border (`w:pBdr/w:{top,left,bottom,right}`), reduced
@@ -8578,6 +8627,24 @@ fn border_side_to_model(side: &BorderSide) -> model::BorderStyle {
         .unwrap_or([0.0, 0.0, 0.0]);
     model::BorderStyle {
         width: side.width_pt,
+        color,
+    }
+}
+
+/// Convert a parsed [`BorderSide`] (from a `w:pBdr` side) to the model's
+/// [`model::ParaBorder`] for the paragraph `ParagraphStyle::borders` array.
+/// Mirrors [`border_side_to_model`] but keeps the per-side line style and emits
+/// the model's `ParaBorder` shape (`width_pt`, `style`, RGB `color`); an unset
+/// or `auto` colour defaults to black.
+fn border_side_to_para_border(side: &BorderSide) -> model::ParaBorder {
+    let color = side
+        .color
+        .as_deref()
+        .and_then(hex_to_rgb_f64)
+        .unwrap_or([0.0, 0.0, 0.0]);
+    model::ParaBorder {
+        width_pt: side.width_pt,
+        style: side.style.to_string(),
         color,
     }
 }
@@ -9639,6 +9706,7 @@ fn docx_style_to_paragraph(s: &DocxStyle) -> ParagraphStyle {
             Some(LineHeight::Points(p)) => MLineHeight::Points(p),
             None => MLineHeight::Normal,
         },
+        ..Default::default()
     }
 }
 
@@ -13267,6 +13335,7 @@ impl OdfParaProps {
             indent_right_pt: self.indent_right_pt.unwrap_or(0.0),
             first_line_pt: self.first_line_pt.unwrap_or(0.0),
             line_height: self.line_height.unwrap_or(MLineHeight::Normal),
+            ..Default::default()
         }
     }
 }

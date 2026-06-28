@@ -24,8 +24,8 @@ use crate::convert::PlacedShape;
 use crate::model::CellVAlign;
 use crate::model::{
     Align, Block, BlockKind, Blockquote, BorderStyle, Cell, CharStyle, CodeBlock, Document, Heading,
-    ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, Paragraph, Row, Section, Shape,
-    Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
+    ImageRef, Inline, LineHeight, LinkTarget, List, ListMarker, ParaBorder, Paragraph, Row, Section,
+    Shape, Sheet, SheetBlock, SheetCell, Slide, SlideBlock, Table, TextBox, VAlign,
 };
 use crate::model::{
     CellValue, NamedStyle, PageGeometry, ParagraphStyle, PlaceholderRole, StyleId, StyleTable,
@@ -1349,7 +1349,53 @@ fn docx_style_ppr_props(ps: &ParagraphStyle) -> String {
     if let Some(jc) = docx_jc(ps.align) {
         out.push_str(&format!("<w:jc w:val=\"{jc}\"/>"));
     }
+    if let Some(bg) = ps.background {
+        out.push_str(&format!(
+            "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{}\"/>",
+            hex(bg)
+        ));
+    }
+    let pbdr = docx_p_bdr(&ps.borders);
+    if !pbdr.is_empty() {
+        out.push_str(&format!("<w:pBdr>{pbdr}</w:pBdr>"));
+    }
+    if ps.keep_with_next {
+        out.push_str("<w:keepNext/>");
+    }
+    if ps.keep_together {
+        out.push_str("<w:keepLines/>");
+    }
     out
+}
+
+/// The four `<w:top>`/`<w:left>`/`<w:bottom>`/`<w:right>` children of a
+/// paragraph `<w:pBdr>`, or an empty string when no side carries a border.
+/// `w:sz` is the border width in eighths of a point (ECMA-376 §17.3.2.18),
+/// matching the table-border convention.
+fn docx_p_bdr(borders: &[Option<ParaBorder>; 4]) -> String {
+    let mut out = String::new();
+    for (i, side) in ["top", "left", "bottom", "right"].iter().enumerate() {
+        if let Some(b) = &borders[i] {
+            let sz = (b.width_pt * 8.0).round().max(2.0) as i64;
+            out.push_str(&format!(
+                "<w:{side} w:val=\"{}\" w:sz=\"{sz}\" w:space=\"0\" w:color=\"{}\"/>",
+                docx_border_val(&b.style),
+                hex(b.color)
+            ));
+        }
+    }
+    out
+}
+
+/// Maps a model border-style string to the ECMA-376 `w:val` token: `solid` →
+/// `single`, `none` → `nil`, and the rest pass through unchanged.
+fn docx_border_val(style: &str) -> &str {
+    match style {
+        "solid" => "single",
+        "none" => "nil",
+        "dashed" | "dotted" | "double" => style,
+        _ => "single",
+    }
 }
 
 /// The inner `<w:rPr>` children for a named style's [`CharStyle`], without the
@@ -4240,7 +4286,41 @@ fn odf_para_prop_attrs(ps: &ParagraphStyle) -> String {
     } else if let LineHeight::Points(p) = ps.line_height {
         props.push_str(&format!(" fo:line-height=\"{}pt\"", num(p)));
     }
+    if let Some(bg) = ps.background {
+        props.push_str(&format!(" fo:background-color=\"#{}\"", hex(bg)));
+    }
+    // Per-side paragraph borders: `fo:border-<side>="{w}pt {style} #{color}"`.
+    // The model array is ordered `[top, right, bottom, left]`.
+    for (side, border) in ["top", "right", "bottom", "left"]
+        .iter()
+        .zip(ps.borders.iter())
+    {
+        if let Some(b) = border {
+            props.push_str(&format!(
+                " fo:border-{side}=\"{}pt {} #{}\"",
+                num(b.width_pt),
+                odf_border_style(&b.style),
+                hex(b.color)
+            ));
+        }
+    }
+    if ps.keep_with_next {
+        props.push_str(" fo:keep-with-next=\"always\"");
+    }
+    if ps.keep_together {
+        props.push_str(" fo:keep-together=\"always\"");
+    }
     props
+}
+
+/// Normalises a model border-style string to the CSS/XSL-FO token an ODF
+/// `fo:border` accepts: `solid`/`dashed`/`dotted`/`double` pass through, `none`
+/// stays `none`, and anything unknown falls back to `solid`.
+fn odf_border_style(style: &str) -> &str {
+    match style {
+        "solid" | "dashed" | "dotted" | "double" | "none" => style,
+        _ => "solid",
+    }
 }
 
 /// ODF automatic `<style:style family="paragraph">` from a model paragraph
@@ -11276,7 +11356,9 @@ style:print-orientation=\"landscape\""),
                     indent_right_pt: 9.0,
                     first_line_pt: 24.0,
                     line_height: LineHeight::Multiple(1.5),
-                },
+                
+                ..Default::default()
+},
                 runs: vec![run("spaced")],
                 ..Default::default()
             }),

@@ -40,8 +40,8 @@ pub use geom::{Margins, PageGeometry, Rect, Rotation};
 pub use sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
 pub use slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 pub use style::{
-    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParagraphStyle, StyleId, StyleTable,
-    VAlign,
+    Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParaBorder, ParagraphStyle, StyleId,
+    StyleTable, VAlign,
 };
 
 use crate::content::vector::PathSeg;

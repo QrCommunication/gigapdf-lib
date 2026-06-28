@@ -16,8 +16,8 @@ use super::css::{Display, ListStyle, Style, Stylesheet};
 use super::dom::{Element, Node};
 use crate::convert::style::Generic;
 use crate::model::{
-    Block, BlockKind, Cell, CharStyle, Document, Heading, Inline, InlineRun, LinkTarget, List,
-    ListItem, ListMarker, Page, Paragraph, Row, Section, Table,
+    Block, BlockKind, Cell, CharStyle, CodeBlock, Document, Heading, Inline, InlineRun, LineHeight,
+    LinkTarget, List, ListItem, ListMarker, Page, Paragraph, ParagraphStyle, Row, Section, Table,
 };
 
 /// Lower a parsed HTML node forest (with its cascaded `sheet`) into a
@@ -28,7 +28,7 @@ pub fn to_model(nodes: &[Node], sheet: &Stylesheet) -> Document {
     let mut blocks = Vec::new();
     let mut pending: Vec<Inline> = Vec::new();
     walk_blocks(nodes, sheet, &root, &[], &mut blocks, &mut pending);
-    flush_paragraph(&mut pending, &mut blocks);
+    flush_paragraph(&mut pending, &root, &mut blocks);
 
     Document {
         sections: vec![Section {
@@ -68,7 +68,7 @@ fn walk_blocks(
                     _ => {
                         // Block-level: flush any pending inline run as a paragraph,
                         // then emit this element's block(s).
-                        flush_paragraph(pending, out);
+                        flush_paragraph(pending, parent, out);
                         emit_block(el, sheet, &style, ancestors, out);
                     }
                 }
@@ -115,6 +115,24 @@ fn emit_block(
         "table" => out.push(block(BlockKind::Table(emit_table(
             el, sheet, style, &chain,
         )))),
+        "pre" => {
+            // `<pre>` → a CodeBlock carrying the verbatim text content. The
+            // language hint comes from a child `<code class="language-xxx">` if
+            // present.
+            let text = el_text(el);
+            let lang = el.children.iter().find_map(|c| {
+                if let Node::Element(code) = c {
+                    if code.tag == "code" {
+                        return code.attr("class").and_then(|cls| {
+                            cls.split_whitespace()
+                                .find_map(|t| t.strip_prefix("language-").map(|s| s.to_string()))
+                        });
+                    }
+                }
+                None
+            });
+            out.push(block(BlockKind::CodeBlock(CodeBlock { lang, code: text })));
+        }
         _ => {
             // A bare list-item outside a `ul`/`ol`, or any other block: if it is
             // a list-item, wrap it; otherwise recurse into a flow of blocks +
@@ -146,7 +164,7 @@ fn emit_block(
                 &mut child_blocks,
                 &mut pending,
             );
-            flush_paragraph(&mut pending, &mut child_blocks);
+            flush_paragraph(&mut pending, style, &mut child_blocks);
             // A generic block (`div`/`section`/`p`/…) contributes its blocks
             // directly to the parent flow.
             out.extend(child_blocks);
@@ -322,9 +340,11 @@ fn table_cell(td: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Ele
         col_span,
         row_span,
         shading: style.background,
-        // HTML→model: cell vertical alignment is not lowered here (a future
-        // enhancement could map `style.vertical_align`); `None` ⇒ format default.
-        vertical_align: None,
+        vertical_align: match style.vertical_align {
+            crate::html::css::VAlign::Top => Some(crate::model::CellVAlign::Top),
+            crate::html::css::VAlign::Middle => Some(crate::model::CellVAlign::Middle),
+            crate::html::css::VAlign::Bottom => Some(crate::model::CellVAlign::Bottom),
+        },
     }
 }
 
@@ -475,13 +495,19 @@ fn char_style(style: &Style) -> CharStyle {
         underline: style.underline,
         strike: style.strike,
         color: Some(style.color),
-        background: None,
-        vertical_align: crate::model::VAlign::Baseline,
+        background: style.background,
+        vertical_align: match style.vertical_align {
+            crate::html::css::VAlign::Top => crate::model::VAlign::Baseline,
+            crate::html::css::VAlign::Middle => crate::model::VAlign::Baseline,
+            crate::html::css::VAlign::Bottom => crate::model::VAlign::Baseline,
+        },
     }
 }
 
 /// Flush accumulated inline runs as a [`Paragraph`] block (no-op when empty).
-fn flush_paragraph(pending: &mut Vec<Inline>, out: &mut Vec<Block>) {
+/// Paragraph-level CSS (`text-align`, `line-height`) is carried into the model's
+/// `ParagraphStyle` so the imported document preserves alignment and leading.
+fn flush_paragraph(pending: &mut Vec<Inline>, style: &Style, out: &mut Vec<Block>) {
     if pending.is_empty() {
         return;
     }
@@ -494,10 +520,31 @@ fn flush_paragraph(pending: &mut Vec<Inline>, out: &mut Vec<Block>) {
         pending.clear();
         return;
     }
+    let ps = ParagraphStyle {
+        align: css_align_to_model(style.align),
+        line_height: if style.line_height > 0.0 && (style.line_height - 1.0).abs() > 0.03 {
+            LineHeight::Multiple(style.line_height)
+        } else {
+            LineHeight::Normal
+        },
+        ..ParagraphStyle::default()
+    };
     out.push(block(BlockKind::Paragraph(Paragraph {
+        style: ps,
         runs: std::mem::take(pending),
         ..Paragraph::default()
     })));
+}
+
+/// Map a CSS `text-align` value to the model's [`Align`](crate::model::Align).
+fn css_align_to_model(a: super::css::Align) -> crate::model::Align {
+    match a {
+        super::css::Align::Center => crate::model::Align::Center,
+        super::css::Align::Right | super::css::Align::End => crate::model::Align::Right,
+        super::css::Align::Justify => crate::model::Align::Justify,
+        // `Left` and `Start` (which is Left in LTR) map to the model default.
+        super::css::Align::Left | super::css::Align::Start => crate::model::Align::Left,
+    }
 }
 
 /// A default-framed flow [`Block`] wrapping `kind`.
@@ -506,6 +553,19 @@ fn block(kind: BlockKind) -> Block {
         kind,
         ..Block::default()
     }
+}
+
+/// Recursively collect the raw text content of an element (for `<pre>` verbatim
+/// extraction).
+fn el_text(el: &Element) -> String {
+    let mut out = String::new();
+    for child in &el.children {
+        match child {
+            Node::Text(t) => out.push_str(t),
+            Node::Element(e) => out.push_str(&el_text(e)),
+        }
+    }
+    out
 }
 
 /// `h1`..`h6` → heading level 1..=6.

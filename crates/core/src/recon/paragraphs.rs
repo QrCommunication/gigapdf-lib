@@ -280,6 +280,7 @@ fn paragraph_style(
         indent_right_pt: 0.0,
         first_line_pt,
         line_height,
+        ..Default::default()
     }
 }
 

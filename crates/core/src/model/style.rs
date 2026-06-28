@@ -109,6 +109,18 @@ impl CharStyle {
     }
 }
 
+/// One side of a paragraph border (points + colour + style), mirroring the
+/// table `BorderSide` but owned by the model so exporters can emit it directly.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ParaBorder {
+    /// Border width in points.
+    pub width_pt: f64,
+    /// Border style: `solid`, `dashed`, `dotted`, `double`, `none`.
+    pub style: String,
+    /// RGB colour, components `0.0..=1.0`.
+    pub color: [f64; 3],
+}
+
 /// Paragraph-level formatting: alignment, spacing, indentation, and leading.
 /// Spacing and indents are in points.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -121,6 +133,15 @@ pub struct ParagraphStyle {
     /// First-line indent (positive) or hanging indent (negative), in points.
     pub first_line_pt: f64,
     pub line_height: LineHeight,
+    /// Paragraph background shading (RGB `0..=1`). `None` = no shading.
+    pub background: Option<[f64; 3]>,
+    /// Per-side paragraph borders `[top, right, bottom, left]`. `width_pt == 0`
+    /// means no border on that side.
+    pub borders: [Option<ParaBorder>; 4],
+    /// `keep-with-next`: keep this paragraph on the same page as the next.
+    pub keep_with_next: bool,
+    /// `keep-together`: prevent splitting this paragraph across pages.
+    pub keep_together: bool,
 }
 
 /// A named style (paragraph + character defaults), optionally derived from

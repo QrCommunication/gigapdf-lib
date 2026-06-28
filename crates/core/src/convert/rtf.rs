@@ -25,9 +25,12 @@ struct CharState {
     strike: bool,
     superscript: bool,
     subscript: bool,
-    /// `\cf` colour-table index (0 = auto / inherit).
+    /// `\\cf` colour-table index (0 = auto / inherit).
     color_idx: usize,
-    /// `\f` font-table index.
+    /// `\\cb` / `\\highlight` colour-table index for the run background
+    /// (0 = auto / inherit → no highlight).
+    highlight_idx: usize,
+    /// `\\f` font-table index.
     font_idx: usize,
     /// `\fs` value in half-points (0 = unset → engine default).
     half_points: u32,
@@ -43,6 +46,14 @@ struct ParaState {
     indent_right: i32,
     /// `\fi` first-line indent (twips, may be negative for hanging indents).
     first_line: i32,
+    /// `\sb` space before (twips).
+    space_before: i32,
+    /// `\sa` space after (twips).
+    space_after: i32,
+    /// `\sl` line spacing (twips when `\slmult` is 0/absent, 240ths of a line when `\slmult` is 1).
+    line_spacing: i32,
+    /// `\slmult` — 1 = multiple, 0/absent = exact (twips).
+    line_spacing_mult: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -65,12 +76,17 @@ struct Run {
     link: Option<String>,
 }
 
-/// A recovered paragraph: alignment + indents + its styled runs.
+/// A recovered paragraph: alignment + indents + spacing + its styled runs.
 #[derive(Debug, Clone, Default)]
 struct Para {
     align: Align,
     indent_left: i32,
+    indent_right: i32,
     first_line: i32,
+    space_before: i32,
+    space_after: i32,
+    line_spacing: i32,
+    line_spacing_mult: bool,
     runs: Vec<Run>,
 }
 
@@ -261,7 +277,12 @@ impl<'a> Parser<'a> {
         if !self.cur_started {
             self.cur.align = self.par.align;
             self.cur.indent_left = self.par.indent_left;
+            self.cur.indent_right = self.par.indent_right;
             self.cur.first_line = self.par.first_line;
+            self.cur.space_before = self.par.space_before;
+            self.cur.space_after = self.par.space_after;
+            self.cur.line_spacing = self.par.line_spacing;
+            self.cur.line_spacing_mult = self.par.line_spacing_mult;
             self.cur_started = true;
         }
         match self.cur.runs.last_mut() {
@@ -287,7 +308,12 @@ impl<'a> Parser<'a> {
                 self.blocks.push(RtfBlock::Para(Para {
                     align: self.par.align,
                     indent_left: self.par.indent_left,
+                    indent_right: self.par.indent_right,
                     first_line: self.par.first_line,
+                    space_before: self.par.space_before,
+                    space_after: self.par.space_after,
+                    line_spacing: self.par.line_spacing,
+                    line_spacing_mult: self.par.line_spacing_mult,
                     runs: Vec::new(),
                 }));
             }
@@ -518,6 +544,7 @@ impl<'a> Parser<'a> {
                 };
             }
             "cf" => self.chr.color_idx = param.unwrap_or(0).max(0) as usize,
+            "cb" | "highlight" => self.chr.highlight_idx = param.unwrap_or(0).max(0) as usize,
             "fs" => self.chr.half_points = param.unwrap_or(0).max(0) as u32,
             "f" => {
                 // `\f` inside `\fonttbl` selects the entry being defined; in body
@@ -538,6 +565,10 @@ impl<'a> Parser<'a> {
             "li" => self.par.indent_left = param.unwrap_or(0) as i32,
             "ri" => self.par.indent_right = param.unwrap_or(0) as i32,
             "fi" => self.par.first_line = param.unwrap_or(0) as i32,
+            "sb" => self.par.space_before = param.unwrap_or(0) as i32,
+            "sa" => self.par.space_after = param.unwrap_or(0) as i32,
+            "sl" => self.par.line_spacing = param.unwrap_or(0) as i32,
+            "slmult" => self.par.line_spacing_mult = param.unwrap_or(0) != 0,
 
             // ── breaks ──
             "par" | "sect" => self.flush_para(),
@@ -1367,7 +1398,7 @@ pub fn rtf_to_html(rtf: &str) -> String {
 use crate::convert::style::Generic;
 use crate::model::{
     Block, BlockKind, Cell, CharStyle, Document, ImageRef, ImageResource, Inline, InlineRun,
-    LinkTarget, Page, Paragraph, ParagraphStyle, Row, Section, Table,
+    LineHeight, LinkTarget, Page, Paragraph, ParagraphStyle, Row, Section, Table,
 };
 use std::collections::BTreeMap;
 
@@ -1472,7 +1503,29 @@ fn para_to_model(p: &Parser, para: &Para) -> Paragraph {
             } else {
                 0.0
             },
+            indent_right_pt: if para.indent_right > 0 {
+                twips_to_pt(para.indent_right)
+            } else {
+                0.0
+            },
             first_line_pt: twips_to_pt(para.first_line),
+            space_before_pt: if para.space_before > 0 {
+                twips_to_pt(para.space_before)
+            } else {
+                0.0
+            },
+            space_after_pt: if para.space_after > 0 {
+                twips_to_pt(para.space_after)
+            } else {
+                0.0
+            },
+            line_height: if para.line_spacing_mult {
+                LineHeight::Multiple(para.line_spacing as f64 / 240.0)
+            } else if para.line_spacing > 0 {
+                LineHeight::Points(twips_to_pt(para.line_spacing))
+            } else {
+                LineHeight::Normal
+            },
             ..ParagraphStyle::default()
         },
         runs,
@@ -1509,7 +1562,7 @@ fn char_state_to_model(p: &Parser, s: &CharState) -> CharStyle {
         underline: s.underline,
         strike: s.strike,
         color: p.color_rgb(s.color_idx),
-        background: None,
+        background: p.color_rgb(s.highlight_idx),
         vertical_align: if s.superscript {
             crate::model::VAlign::Super
         } else if s.subscript {

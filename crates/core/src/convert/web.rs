@@ -191,11 +191,42 @@ fn html_code(cb: &CodeBlock, out: &mut String) {
 /// A `style="…"` attribute for a paragraph's alignment (only when not the
 /// default left), else empty.
 fn para_style_attr(p: &Paragraph) -> String {
+    let mut css = String::new();
     match p.style.align {
-        Align::Left => String::new(),
-        Align::Center => " style=\"text-align:center\"".to_string(),
-        Align::Right => " style=\"text-align:right\"".to_string(),
-        Align::Justify => " style=\"text-align:justify\"".to_string(),
+        Align::Left => {}
+        Align::Center => css.push_str("text-align:center;"),
+        Align::Right => css.push_str("text-align:right;"),
+        Align::Justify => css.push_str("text-align:justify;"),
+    }
+    if let Some([r, g, b]) = p.style.background {
+        css.push_str(&format!(
+            "background-color:rgb({},{},{});",
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8
+        ));
+    }
+    if let crate::model::LineHeight::Multiple(m) = p.style.line_height {
+        css.push_str(&format!("line-height:{:.2};", m));
+    } else if let crate::model::LineHeight::Points(pt) = p.style.line_height {
+        css.push_str(&format!("line-height:{:.1}pt;", pt));
+    }
+    if p.style.indent_left_pt > 0.0 {
+        css.push_str(&format!("margin-left:{:.1}pt;", p.style.indent_left_pt));
+    }
+    if p.style.indent_right_pt > 0.0 {
+        css.push_str(&format!("margin-right:{:.1}pt;", p.style.indent_right_pt));
+    }
+    if p.style.space_before_pt > 0.0 {
+        css.push_str(&format!("margin-top:{:.1}pt;", p.style.space_before_pt));
+    }
+    if p.style.space_after_pt > 0.0 {
+        css.push_str(&format!("margin-bottom:{:.1}pt;", p.style.space_after_pt));
+    }
+    if css.is_empty() {
+        String::new()
+    } else {
+        format!(" style=\"{}\"", css.trim_end_matches(';'))
     }
 }
 
