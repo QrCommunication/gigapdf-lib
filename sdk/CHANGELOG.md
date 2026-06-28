@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.107.1] - 2026-06-27
+
+### Fixed
+
+- **ODT/DOCX import run coalescing** — adjacent runs with visually-identical
+  styles now merge in both the DOCX and ODT importers, fixing the "every word is
+  a separate run" problem in imported Office documents.
+
 ## [0.107.0] - 2026-06-27
 
 ### Changed — PDF → Office conversion quality overhaul

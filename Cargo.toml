@@ -6,7 +6,7 @@ members = ["crates/core", "crates/wasm", "crates/ocr-rten"]
 # Single source of truth for the whole workspace — the core + wasm crates
 # inherit this via `version.workspace = true`, kept in lock-step with the npm
 # SDK (`sdk/package.json`) so the lib, the WASM blob and the SDK never drift.
-version = "0.107.0"
+version = "0.107.1"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = ["Rony Licha / QR Communication"]

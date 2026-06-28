@@ -6292,14 +6292,15 @@ fn odf_link_target(attrs: &[(String, String)]) -> model::LinkTarget {
 }
 
 /// Append `text` as an [`InlineRun`] carrying the innermost open span style
-/// (default when no span is open), coalescing with an identical previous run.
+/// (default when no span is open), coalescing with a compatible previous run
+/// (lenient: size within 0.5pt, unset-size matches any).
 fn odf_push(runs: &mut Vec<Inline>, span_stack: &[CharStyle], text: &str) {
     if text.is_empty() {
         return;
     }
     let style = span_stack.last().cloned().unwrap_or_default();
     if let Some(Inline::Run(last)) = runs.last_mut() {
-        if last.style == style {
+        if styles_compatible(&last.style, &style) {
             last.text.push_str(text);
             return;
         }

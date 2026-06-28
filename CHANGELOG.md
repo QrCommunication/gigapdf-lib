@@ -9,6 +9,18 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.107.1] - 2026-06-27
+
+### Fixed
+
+- **ODT/DOCX import run coalescing** — adjacent text runs with visually-identical
+  but byte-different styles now coalesce into single runs in both the DOCX
+  (`push_run`) and ODT (`odf_push`) importers. Fixes the "every word is a separate
+  run" problem that made imported Office documents hard to edit and caused
+  apparent font inconsistencies.
+
+## [0.107.0] - 2026-06-27
+
 ### Changed — PDF → Office conversions: flowing documents + reconstruction fidelity
 
 - **`to_docx()`, `to_odt()`, `to_pptx()`, `to_odp()`, `to_html()` now route
