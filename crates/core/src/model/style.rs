@@ -80,6 +80,12 @@ pub struct CharStyle {
     /// `w:shd` in DOCX, `fo:background-color` in ODF).
     pub background: Option<[f64; 3]>,
     pub vertical_align: VAlign,
+    /// Letter (character) spacing in points — `w:spacing w:val` in DOCX (twips÷20),
+    /// `letter-spacing` in CSS. `0.0` = default (no extra spacing).
+    pub letter_spacing_pt: f64,
+    /// Hidden text (`w:vanish` in DOCX, `display:none` in HTML). Hidden runs
+    /// survive in the model but exporters may omit them or mark them hidden.
+    pub hidden: bool,
 }
 
 impl CharStyle {
@@ -121,6 +127,27 @@ pub struct ParaBorder {
     pub color: [f64; 3],
 }
 
+/// A tab stop: its position (points from the left margin) and alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TabStop {
+    /// Position in points from the left margin.
+    pub pos_pt: f64,
+    /// Tab alignment: left (default), center, right, or decimal.
+    pub align: TabAlign,
+    /// Optional leader character (dots, underscores, etc.); `'\0'` = none.
+    pub leader: char,
+}
+
+/// Tab stop alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Decimal,
+}
+
 /// Paragraph-level formatting: alignment, spacing, indentation, and leading.
 /// Spacing and indents are in points.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -142,6 +169,9 @@ pub struct ParagraphStyle {
     pub keep_with_next: bool,
     /// `keep-together`: prevent splitting this paragraph across pages.
     pub keep_together: bool,
+    /// Tab stops (sorted by position). Empty = default tab stops (typically
+    /// every 36pt / 0.5″).
+    pub tab_stops: Vec<TabStop>,
 }
 
 /// A named style (paragraph + character defaults), optionally derived from

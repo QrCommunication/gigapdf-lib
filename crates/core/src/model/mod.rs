@@ -41,7 +41,7 @@ pub use sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, SheetRow};
 pub use slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 pub use style::{
     Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParaBorder, ParagraphStyle, StyleId,
-    StyleTable, VAlign,
+    StyleTable, TabAlign, TabStop, VAlign,
 };
 
 use crate::content::vector::PathSeg;
@@ -237,6 +237,9 @@ pub struct List {
     pub ordered: bool,
     pub marker: ListMarker,
     pub items: Vec<ListItem>,
+    /// Start number for ordered lists (HTML `<ol start="N">`, DOCX `w:lvlOverride`
+    /// `w:startOverride`, Markdown implicit). `1` = default (first item).
+    pub start: u32,
 }
 
 /// One list item: a list of blocks at a given nesting `level`.

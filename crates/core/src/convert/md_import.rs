@@ -509,7 +509,9 @@ fn parse_list(lines: &[&str], defs: &Defs) -> (Block, usize) {
             ordered,
             marker,
             items,
-        }),
+        
+        ..Default::default()
+}),
         ..Block::default()
     };
     (block, i)

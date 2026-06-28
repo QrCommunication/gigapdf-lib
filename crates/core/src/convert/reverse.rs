@@ -1503,7 +1503,9 @@ mod tests {
                 item("child", 1),
                 item("top-C", 0),
             ],
-        };
+        
+        ..Default::default()
+};
         let rtf =
             String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(list)))).unwrap();
 
@@ -1537,7 +1539,9 @@ mod tests {
             ordered: true,
             marker: ListMarker::default(), // Bullet('•')
             items: vec![item("a", 0), item("b", 1)],
-        };
+        
+        ..Default::default()
+};
         let rtf2 =
             String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(cycle)))).unwrap();
         assert!(
@@ -1566,7 +1570,9 @@ mod tests {
                     level: 0,
                 },
             ],
-        };
+        
+        ..Default::default()
+};
         let rtf =
             String::from_utf8(rtf_from_model(&doc_with_block(BlockKind::List(list)))).unwrap();
         assert_eq!(

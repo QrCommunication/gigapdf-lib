@@ -2858,7 +2858,9 @@ mod tests {
                         level,
                     })
                     .collect(),
-            }),
+            
+            ..Default::default()
+}),
             ..Block::default()
         }
     }

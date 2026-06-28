@@ -1034,6 +1034,7 @@ fn char_style_from_font(font: &FontRec, palette: &[[f64; 3]]) -> CharStyle {
         color: resolve_color(font.color_idx, palette),
         background: None,
         vertical_align: crate::model::VAlign::Baseline,
+        ..Default::default()
     }
 }
 

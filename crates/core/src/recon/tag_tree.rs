@@ -626,7 +626,9 @@ impl Walker<'_> {
                 ordered,
                 marker,
                 items,
-            }),
+            
+            ..Default::default()
+}),
         })
     }
 

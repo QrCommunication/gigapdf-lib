@@ -2052,7 +2052,9 @@ fn smartart_list(data_xml: &str) -> Option<List> {
         ordered: false,
         marker: ListMarker::Bullet('\u{2022}'),
         items,
-    })
+    
+    ..Default::default()
+})
 }
 
 /// Recursive depth-first emit of a SmartArt node and its children as list items.

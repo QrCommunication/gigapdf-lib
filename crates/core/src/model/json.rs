@@ -2447,7 +2447,9 @@ mod tests {
                 color: None,
                 background: None,
                 vertical_align: VAlign::Baseline,
-            },
+            
+            ..Default::default()
+},
             source_index: Some(0),
         });
         let run_b = Inline::Run(InlineRun {
@@ -2463,7 +2465,9 @@ mod tests {
                 color: blue,
                 background: Some([1.0, 1.0, 0.0]),
                 vertical_align: VAlign::Super,
-            },
+            
+            ..Default::default()
+},
             source_index: None,
         });
         let link = Inline::Link {
@@ -2585,7 +2589,9 @@ mod tests {
                     level: 1,
                 },
             ],
-        };
+        
+        ..Default::default()
+};
 
         let shape = Shape {
             segments: vec![

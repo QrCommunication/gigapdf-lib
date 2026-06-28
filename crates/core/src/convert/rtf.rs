@@ -1570,6 +1570,7 @@ fn char_state_to_model(p: &Parser, s: &CharState) -> CharStyle {
         } else {
             crate::model::VAlign::Baseline
         },
+        ..Default::default()
     }
 }
 

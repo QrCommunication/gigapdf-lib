@@ -36284,7 +36284,9 @@ mod tests {
                     level: 1,
                 },
             ],
-        };
+        
+        ..Default::default()
+};
         let ordered_text = text_from_model(&model_with_blocks(vec![Block {
             kind: BlockKind::List(list),
             ..Block::default()
@@ -36314,7 +36316,9 @@ mod tests {
                     level: 1,
                 },
             ],
-        };
+        
+        ..Default::default()
+};
         let bl_text = text_from_model(&model_with_blocks(vec![Block {
             kind: BlockKind::List(bullets),
             ..Block::default()

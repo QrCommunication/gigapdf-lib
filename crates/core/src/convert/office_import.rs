@@ -483,6 +483,7 @@ fn run_char_style(run: &RunStyle) -> CharStyle {
         color: run.color.as_deref().and_then(hex_to_rgb_f64),
         background: run.highlight.as_deref().and_then(hex_to_rgb_f64),
         vertical_align: run.vertical_align,
+        ..Default::default()
     }
 }
 
@@ -1341,6 +1342,7 @@ fn para_style_model(para: &ParaStyle) -> ParagraphStyle {
         ],
         keep_with_next: para.keep_with_next,
         keep_together: para.keep_together,
+        ..Default::default()
     }
 }
 
@@ -2081,7 +2083,9 @@ fn docx_paragraph_model(
                     }],
                     level: level.min(u8::MAX as u32) as u8,
                 }],
-            }),
+            
+            ..Default::default()
+}),
             ..Block::default()
         }
     } else {
@@ -4684,7 +4688,9 @@ fn pptx_group_paras_to_blocks(paras: Vec<PptxPara>) -> Vec<Block> {
                         ordered,
                         marker,
                         items,
-                    }),
+                    
+                    ..Default::default()
+}),
                     ..Block::default()
                 });
             }
@@ -5847,7 +5853,9 @@ fn odf_walk_model(
                                             }],
                                             level: level.min(u8::MAX as u32) as u8,
                                         }],
-                                    }),
+                                    
+                                    ..Default::default()
+}),
                                     ..Block::default()
                                 });
                             }

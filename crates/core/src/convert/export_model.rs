@@ -7338,7 +7338,9 @@ mod tests {
                         level: 0,
                     },
                 ],
-            }),
+            
+            ..Default::default()
+}),
             ..Default::default()
         };
         let span_cell = Cell {
@@ -8944,7 +8946,9 @@ style:family=\"paragraph\""
                         level: 1,
                     },
                 ],
-            }),
+            
+            ..Default::default()
+}),
             ..Default::default()
         };
         let mk = |t: &str| Cell {
@@ -9485,6 +9489,7 @@ style:family=\"paragraph\""
                 blocks: vec![para("item")],
                 level: 0,
             }],
+            ..Default::default()
         }
     }
 
@@ -10716,7 +10721,9 @@ style:print-orientation=\"landscape\""),
                     blocks: vec![para("sub")],
                     level: 1,
                 }],
-            }),
+            
+            ..Default::default()
+}),
             ..Default::default()
         };
         let outer = Block {
@@ -10733,7 +10740,9 @@ style:print-orientation=\"landscape\""),
                         level: 0,
                     },
                 ],
-            }),
+            
+            ..Default::default()
+}),
             ..Default::default()
         };
         let md = markdown_from_model(&md_doc(vec![outer]));
@@ -11516,7 +11525,9 @@ style:print-orientation=\"landscape\""),
                 ordered: false,
                 marker: ListMarker::Bullet('•'),
                 items: vec![item("top", 0), item("nested", 1), item("back", 0)],
-            }),
+            
+            ..Default::default()
+}),
             ..Default::default()
         };
         let doc = Document {

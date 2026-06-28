@@ -133,6 +133,24 @@ fn emit_block(
             });
             out.push(block(BlockKind::CodeBlock(CodeBlock { lang, code: text })));
         }
+        "hr" => out.push(block(BlockKind::HorizontalRule)),
+        "blockquote" => {
+            // `<blockquote>` → a Blockquote wrapping its child blocks.
+            let mut child_blocks = Vec::new();
+            let mut pending = Vec::new();
+            walk_blocks(
+                &el.children,
+                sheet,
+                style,
+                &chain,
+                &mut child_blocks,
+                &mut pending,
+            );
+            flush_paragraph(&mut pending, style, &mut child_blocks);
+            out.push(block(BlockKind::Blockquote(crate::model::Blockquote {
+                blocks: child_blocks,
+            })));
+        }
         _ => {
             // A bare list-item outside a `ul`/`ol`, or any other block: if it is
             // a list-item, wrap it; otherwise recurse into a flow of blocks +
@@ -151,7 +169,9 @@ fn emit_block(
                     ordered,
                     marker: synthetic_marker,
                     items: vec![list_item(el, sheet, style, &chain, 0)],
-                })));
+                
+                ..Default::default()
+})));
                 return;
             }
             let mut child_blocks = Vec::new();
@@ -177,10 +197,21 @@ fn emit_block(
 fn emit_list(el: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Element]) -> Block {
     let ordered = el.tag == "ol";
     let marker = if ordered {
-        ListMarker::Decimal
+        match style.list_style {
+            ListStyle::Decimal | ListStyle::None => ListMarker::Decimal,
+            ListStyle::LowerAlpha => ListMarker::LowerAlpha,
+            ListStyle::UpperAlpha => ListMarker::UpperAlpha,
+            ListStyle::LowerRoman => ListMarker::LowerRoman,
+            ListStyle::UpperRoman => ListMarker::UpperRoman,
+            _ => ListMarker::Decimal,
+        }
     } else {
         ListMarker::Bullet(marker_char(style.list_style))
     };
+    let start = el
+        .attr("start")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1);
     let mut items = Vec::new();
     for child in &el.children {
         if let Node::Element(li) = child {
@@ -194,6 +225,8 @@ fn emit_list(el: &Element, sheet: &Stylesheet, style: &Style, ancestors: &[&Elem
         ordered,
         marker,
         items,
+        start,
+        ..Default::default()
     }))
 }
 
@@ -501,6 +534,7 @@ fn char_style(style: &Style) -> CharStyle {
             crate::html::css::VAlign::Middle => crate::model::VAlign::Baseline,
             crate::html::css::VAlign::Bottom => crate::model::VAlign::Baseline,
         },
+        ..Default::default()
     }
 }
 
