@@ -82,6 +82,33 @@ pub struct CharStyle {
     pub vertical_align: VAlign,
 }
 
+impl CharStyle {
+    /// Whether two styles are close enough to coalesce adjacent runs into one:
+    /// same family/generic, bold/italic/underline/strike, color, background,
+    /// vertical-align, and font size within 0.5pt. A `size_pt` of 0 (unset /
+    /// inherited) matches any size so an inherited-style run coalesces with an
+    /// explicit one. This prevents the "every word is a separate run" problem
+    /// that plagues imports from formats with per-run style inheritance.
+    pub fn is_compatible_with(&self, other: &CharStyle) -> bool {
+        let same_text_style = self.family == other.family
+            && self.generic == other.generic
+            && self.bold == other.bold
+            && self.italic == other.italic
+            && self.underline == other.underline
+            && self.strike == other.strike
+            && self.color == other.color
+            && self.background == other.background
+            && self.vertical_align == other.vertical_align;
+        if !same_text_style {
+            return false;
+        }
+        if self.size_pt == 0.0 || other.size_pt == 0.0 {
+            return true;
+        }
+        (self.size_pt - other.size_pt).abs() < 0.5
+    }
+}
+
 /// Paragraph-level formatting: alignment, spacing, indentation, and leading.
 /// Spacing and indents are in points.
 #[derive(Debug, Clone, PartialEq, Default)]

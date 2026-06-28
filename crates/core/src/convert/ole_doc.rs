@@ -996,7 +996,7 @@ fn build_runs(rp: &RawPara, chp: &[ChpRun], base: &CharStyle) -> Vec<model::Inli
         let fc = rp.fc.get(i).copied().unwrap_or(0);
         let style = style_at(chp, fc, base);
         match &cur_style {
-            Some(s) if *s == style => cur_text.push(ch),
+            Some(s) if s.is_compatible_with(&style) => cur_text.push(ch),
             _ => {
                 if let Some(s) = cur_style.take() {
                     if !cur_text.is_empty() {

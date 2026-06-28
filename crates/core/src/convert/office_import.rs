@@ -2601,15 +2601,11 @@ fn apply_named_run_defaults(runs: &mut [Inline], style: &DocxStyle) {
 
 /// Append `text` to `runs` as a styled [`InlineRun`], coalescing with the
 /// previous run when it carries a compatible style (keeps the run list compact).
-/// Compatibility is lenient: two styles coalesce when family, bold/italic/
-/// underline/strike, color, background and vertical_align all match, AND the
-/// font sizes are within 0.5pt. This prevents the "every word is a separate
-/// run" problem that occurs when DOCX runs inherit slightly different styles
-/// from named styles but are visually identical.
+/// See [`CharStyle::is_compatible_with`] for the compatibility rule.
 fn push_run(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
     let style = run_char_style(run);
     if let Some(Inline::Run(last)) = runs.last_mut() {
-        if styles_compatible(&last.style, &style) {
+        if last.style.is_compatible_with(&style) {
             last.text.push_str(text);
             return;
         }
@@ -2619,30 +2615,6 @@ fn push_run(runs: &mut Vec<Inline>, run: &RunStyle, text: &str) {
         style,
         source_index: None,
     }));
-}
-
-/// Whether two `CharStyle`s are close enough to coalesce into one run: same
-/// family, bold/italic/underline/strike, color, background, vertical-align and
-/// font size within 0.5pt. A `size_pt` of 0 (unset) matches any size so an
-/// inherited-style run coalesces with an explicit one.
-fn styles_compatible(a: &CharStyle, b: &CharStyle) -> bool {
-    let same_text_style = a.family == b.family
-        && a.generic == b.generic
-        && a.bold == b.bold
-        && a.italic == b.italic
-        && a.underline == b.underline
-        && a.strike == b.strike
-        && a.color == b.color
-        && a.background == b.background
-        && a.vertical_align == b.vertical_align;
-    if !same_text_style {
-        return false;
-    }
-    // A size of 0 means "inherit" — coalesces with any size.
-    if a.size_pt == 0.0 || b.size_pt == 0.0 {
-        return true;
-    }
-    (a.size_pt - b.size_pt).abs() < 0.5
 }
 
 /// Append `text` to `runs`, honouring the run's optional [`hyperlink`](RunStyle::hyperlink):
@@ -6293,14 +6265,14 @@ fn odf_link_target(attrs: &[(String, String)]) -> model::LinkTarget {
 
 /// Append `text` as an [`InlineRun`] carrying the innermost open span style
 /// (default when no span is open), coalescing with a compatible previous run
-/// (lenient: size within 0.5pt, unset-size matches any).
+/// (lenient: size within 0.5pt, unset-size matches any — see [`CharStyle::is_compatible_with`]).
 fn odf_push(runs: &mut Vec<Inline>, span_stack: &[CharStyle], text: &str) {
     if text.is_empty() {
         return;
     }
     let style = span_stack.last().cloned().unwrap_or_default();
     if let Some(Inline::Run(last)) = runs.last_mut() {
-        if styles_compatible(&last.style, &style) {
+        if last.style.is_compatible_with(&style) {
             last.text.push_str(text);
             return;
         }

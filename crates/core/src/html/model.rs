@@ -420,7 +420,7 @@ fn push_text(out: &mut Vec<Inline>, text: &str, style: &Style) {
     }
     let cs = char_style(style);
     if let Some(Inline::Run(last)) = out.last_mut() {
-        if last.style == cs {
+        if last.style.is_compatible_with(&cs) {
             last.text.push_str(&normalized);
             return;
         }
