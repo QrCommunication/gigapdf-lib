@@ -204,6 +204,7 @@ impl ParaPatch {
 
 /// A single editing command against a [`Document`] model.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ModelOp {
     /// Set the text of the `run`-th [`InlineRun`] of the addressed block.
     SetRunText {
