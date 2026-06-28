@@ -38,7 +38,7 @@ use crate::model::sheet::{CellValue, MergeRange, Sheet, SheetBlock, SheetCell, S
 use crate::model::slide::{Placeholder, PlaceholderRole, Slide, SlideBlock};
 use crate::model::style::{
     Align, CellVAlign, CharStyle, LineHeight, NamedStyle, ParaBorder, ParagraphStyle, StyleId,
-    StyleTable, VAlign,
+    StyleTable, TabStop, VAlign,
 };
 use crate::model::{
     Block, BlockId, BlockKind, Blockquote, BorderStyle, Cell, CodeBlock, Comment, DocMeta, Document,
@@ -348,6 +348,10 @@ impl Writer {
         self.para_borders(&p.borders);
         self.k_bool("keep_with_next", p.keep_with_next);
         self.k_bool("keep_together", p.keep_together);
+        if !p.tab_stops.is_empty() {
+            self.key("tab_stops");
+            self.tab_stops(&p.tab_stops);
+        }
         self.obj_close();
     }
 
@@ -372,6 +376,28 @@ impl Writer {
         self.key("color");
         self.rgb(&b.color);
         self.obj_close();
+    }
+
+    /// Serialize tab stops as an array of `{pos_pt, align, leader}`.
+    fn tab_stops(&mut self, stops: &[TabStop]) {
+        self.arr_open();
+        for ts in stops {
+            self.elem();
+            self.obj_open();
+            self.k_f64("pos_pt", ts.pos_pt);
+            let align = match ts.align {
+                crate::model::TabAlign::Left => "left",
+                crate::model::TabAlign::Center => "center",
+                crate::model::TabAlign::Right => "right",
+                crate::model::TabAlign::Decimal => "decimal",
+            };
+            self.k_str("align", align);
+            if ts.leader != '\0' {
+                self.k_str("leader", &ts.leader.to_string());
+            }
+            self.obj_close();
+        }
+        self.arr_close();
     }
 
     fn line_height(&mut self, lh: LineHeight) {
@@ -402,6 +428,12 @@ impl Writer {
         self.k_opt_rgb("color", &c.color);
         self.k_opt_rgb("background", &c.background);
         self.k_str("valign", valign_tag(c.vertical_align));
+        if c.letter_spacing_pt != 0.0 {
+            self.k_f64("letter_spacing_pt", c.letter_spacing_pt);
+        }
+        if c.hidden {
+            self.k_bool("hidden", true);
+        }
         self.obj_close();
     }
 
@@ -688,6 +720,9 @@ impl Writer {
             self.list_item(it);
         }
         self.arr_close();
+        if l.start != 1 {
+            self.k_f64("start", l.start as f64);
+        }
         self.obj_close();
     }
 
@@ -1483,6 +1518,7 @@ impl<'a> Reader<'a> {
                 "borders" => p.borders = r.para_borders()?,
                 "keep_with_next" => p.keep_with_next = r.bool()?,
                 "keep_together" => p.keep_together = r.bool()?,
+                "tab_stops" => p.tab_stops = r.tab_stops()?,
                 _ => return None,
             }
             Some(())
@@ -1528,6 +1564,31 @@ impl<'a> Reader<'a> {
         Some(b)
     }
 
+    /// Deserialize tab stops: an array of `{pos_pt, align, leader}`.
+    fn tab_stops(&mut self) -> Option<Vec<TabStop>> {
+        self.array(|r| {
+            let mut ts = TabStop::default();
+            r.object(|r2, k| {
+                match k {
+                    "pos_pt" => ts.pos_pt = r2.number()?,
+                    "align" => {
+                        ts.align = match r2.string()?.as_str() {
+                            "left" => crate::model::TabAlign::Left,
+                            "center" => crate::model::TabAlign::Center,
+                            "right" => crate::model::TabAlign::Right,
+                            "decimal" => crate::model::TabAlign::Decimal,
+                            _ => return None,
+                        };
+                    }
+                    "leader" => ts.leader = r2.string()?.chars().next().unwrap_or('\0'),
+                    _ => return None,
+                }
+                Some(())
+            })?;
+            Some(ts)
+        })
+    }
+
     fn line_height(&mut self) -> Option<LineHeight> {
         let mut tag: Option<String> = None;
         let mut v: Option<f64> = None;
@@ -1561,6 +1622,8 @@ impl<'a> Reader<'a> {
                 "color" => c.color = r.opt_rgb()?,
                 "background" => c.background = r.opt_rgb()?,
                 "valign" => c.vertical_align = parse_valign(&r.string()?)?,
+                "letter_spacing_pt" => c.letter_spacing_pt = r.number()?,
+                "hidden" => c.hidden = r.bool()?,
                 _ => return None,
             }
             Some(())
@@ -1898,6 +1961,7 @@ impl<'a> Reader<'a> {
                 "ordered" => l.ordered = r.bool()?,
                 "marker" => l.marker = r.list_marker()?,
                 "items" => l.items = r.array(Reader::list_item)?,
+                "start" => l.start = r.number()? as u32,
                 _ => return None,
             }
             Some(())

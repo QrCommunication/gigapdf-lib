@@ -321,6 +321,9 @@ fn char_style_css(style: &CharStyle) -> String {
             q(b)
         ));
     }
+    if style.letter_spacing_pt != 0.0 {
+        css.push_str(&format!(";letter-spacing:{}pt", n(style.letter_spacing_pt)));
+    }
     css.trim_start_matches(';').to_string()
 }
 
@@ -337,7 +340,12 @@ fn html_list(list: &List, doc: &Document, out: &mut String) {
     } else {
         ""
     };
-    out.push_str(&format!("<{tag}{type_attr}>"));
+    let start_attr = if list.ordered && list.start > 1 {
+        format!(" start=\"{}\"", list.start)
+    } else {
+        String::new()
+    };
+    out.push_str(&format!("<{tag}{type_attr}{start_attr}>"));
     for item in &list.items {
         out.push_str("<li>");
         html_blocks(&item.blocks, doc, out);

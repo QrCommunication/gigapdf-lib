@@ -865,6 +865,17 @@ fn docx_rpr(style: &CharStyle) -> String {
             hex(bg)
         ));
     }
+    // Letter spacing (`w:spacing w:val` in twips) — round-trips CSS/DOCX.
+    if style.letter_spacing_pt != 0.0 {
+        p.push_str(&format!(
+            "<w:spacing w:val=\"{}\"/>",
+            (style.letter_spacing_pt * 20.0).round() as i64
+        ));
+    }
+    // Hidden text (`w:vanish`).
+    if style.hidden {
+        p.push_str("<w:vanish/>");
+    }
     p.push_str(&format!(
         "<w:sz w:val=\"{}\"/>",
         (run_size(style) * 2.0).round().max(1.0) as i64
@@ -1364,6 +1375,23 @@ fn docx_style_ppr_props(ps: &ParagraphStyle) -> String {
     }
     if ps.keep_together {
         out.push_str("<w:keepLines/>");
+    }
+    // Tab stops → `<w:tabs>` with one `<w:tab>` per TabStop.
+    if !ps.tab_stops.is_empty() {
+        let mut tabs = String::new();
+        for ts in &ps.tab_stops {
+            let val = match ts.align {
+                crate::model::TabAlign::Left => "left",
+                crate::model::TabAlign::Center => "center",
+                crate::model::TabAlign::Right => "right",
+                crate::model::TabAlign::Decimal => "decimal",
+            };
+            tabs.push_str(&format!(
+                "<w:tab w:val=\"{val}\" w:pos=\"{}\"/>",
+                twips(ts.pos_pt)
+            ));
+        }
+        out.push_str(&format!("<w:tabs>{tabs}</w:tabs>"));
     }
     out
 }

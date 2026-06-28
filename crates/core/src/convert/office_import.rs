@@ -1342,7 +1342,7 @@ fn para_style_model(para: &ParaStyle) -> ParagraphStyle {
         ],
         keep_with_next: para.keep_with_next,
         keep_together: para.keep_together,
-        ..Default::default()
+        tab_stops: para.tab_stops.clone(),
     }
 }
 
@@ -1589,6 +1589,7 @@ fn docx_paragraph_model(
     let mut in_rpr = false;
     let mut in_ppr = false;
     let mut in_pbdr = false; // inside <w:pPr>/<w:pBdr> (paragraph borders)
+    let mut in_tabs = false; // inside <w:pPr>/<w:tabs> (paragraph tab stops)
     let mut depth = 0i32;
     // `w:pPr/w:pageBreakBefore` → this paragraph opens a fresh page.
     let mut page_break_before = false;
@@ -1666,6 +1667,35 @@ fn docx_paragraph_model(
                             if let Some(lh) = line_spacing(line, attr(&attrs, "lineRule")) {
                                 para.line_height = Some(lh);
                             }
+                        }
+                    }
+                    // `w:pPr/w:tabs` opens the explicit tab-stop group; its
+                    // `w:tab` children carry the alignment (`w:val`) and position
+                    // in twips (`w:pos`), with an optional leader character
+                    // (`w:leader`: `dot`/`hyphen`/`underscore`/`middleDot`).
+                    "tabs" if in_ppr => in_tabs = true,
+                    "tab" if in_tabs => {
+                        // Only the four alignment kinds lower to a real tab stop;
+                        // `clear`/`bar`/`num` are dropped (Word's structural ones).
+                        if let Some(pos) = attr(&attrs, "pos").and_then(twips_to_pt) {
+                            let align = match attr(&attrs, "val").unwrap_or("left") {
+                                "center" => model::TabAlign::Center,
+                                "right" => model::TabAlign::Right,
+                                "decimal" => model::TabAlign::Decimal,
+                                _ => model::TabAlign::Left,
+                            };
+                            let leader = match attr(&attrs, "leader").unwrap_or("none") {
+                                "dot" => '.',
+                                "hyphen" | "heavy" => '-',
+                                "underscore" => '_',
+                                "middleDot" => '·',
+                                _ => '\0',
+                            };
+                            para.tab_stops.push(model::TabStop {
+                                pos_pt: pos,
+                                align,
+                                leader,
+                            });
                         }
                     }
                     "numPr" if in_ppr => {
@@ -1989,6 +2019,7 @@ fn docx_paragraph_model(
                     "p" => break,
                     "pPr" => in_ppr = false,
                     "rPr" => in_rpr = false,
+                    "tabs" => in_tabs = false,
                     "r" => depth = (depth - 1).max(0),
                     "instrText" => in_instr = false,
                     // Close a simple field: flush its cached result into the flow.
@@ -8572,6 +8603,9 @@ struct ParaStyle {
     /// Paragraph shading colour from `w:pPr/w:shd@w:fill` (6-hex, no `#`) →
     /// `background-color`. `auto`/missing leaves it `None`.
     shading: Option<String>,
+    /// Explicit tab stops from `w:pPr/w:tabs/w:tab` (left/center/right/decimal
+    /// at a position in twips). Empty ⇒ Word's default tab stops (every 36pt).
+    tab_stops: Vec<model::TabStop>,
     /// `w:pPr/w:keepNext`: keep this paragraph on the same page as the next.
     keep_with_next: bool,
     /// `w:pPr/w:keepLines`: keep all lines of this paragraph together (no
