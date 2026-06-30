@@ -207,4 +207,53 @@ mod tests {
         assert!(from_json(r#"[[["x"]]] junk"#).is_none(), "trailing junk");
         assert!(from_json(r#"[["x"]]"#).is_none(), "only two levels");
     }
+
+    #[test]
+    fn all_simple_escapes_decoded() {
+        // \/ \b \f in addition to the ones already covered.
+        let g = from_json(r#"[[["a\/b\bc\fd"]]]"#).unwrap();
+        assert_eq!(g[0][0][0], "a/b\u{08}c\u{0C}d");
+    }
+
+    #[test]
+    fn bad_escape_is_rejected() {
+        // \x is not a valid JSON escape.
+        assert!(from_json(r#"[[["a\xb"]]]"#).is_none());
+    }
+
+    #[test]
+    fn surrogate_pair_and_bmp_unicode_escapes() {
+        // BMP escape (é = U+00E9).
+        let g = from_json(r#"[[["caf\u00e9"]]]"#).unwrap();
+        assert_eq!(g[0][0][0], "café");
+        // Surrogate pair for 😀 (U+1F600) = \uD83D\uDE00.
+        let g = from_json(r#"[[["\uD83D\uDE00"]]]"#).unwrap();
+        assert_eq!(g[0][0][0], "😀");
+    }
+
+    #[test]
+    fn malformed_unicode_escapes_rejected() {
+        // High surrogate not followed by a low surrogate.
+        assert!(from_json(r#"[[["\uD83D"]]]"#).is_none());
+        assert!(from_json(r#"[[["\uD83Dx"]]]"#).is_none());
+        // High surrogate followed by a non-low-surrogate \u escape.
+        assert!(from_json(r#"[[["\uD83D\u0041"]]]"#).is_none());
+        // Truncated hex (fewer than 4 digits before the closing quote).
+        assert!(from_json(r#"[[["\u00"]]]"#).is_none());
+        // Non-hex digits.
+        assert!(from_json(r#"[[["\uZZZZ"]]]"#).is_none());
+    }
+
+    #[test]
+    fn array_bad_separator_rejected() {
+        // A non-`,`/`]` byte after an item is rejected (hits the `_ => None` arm).
+        assert!(from_json(r#"[[["a" "b"]]]"#).is_none());
+    }
+
+    #[test]
+    fn strings_from_json_rejects_trailing_junk_and_unterminated() {
+        assert!(strings_from_json(r#"["a"] junk"#).is_none());
+        assert!(strings_from_json(r#"["unterminated"#).is_none());
+        assert!(strings_from_json("not-an-array").is_none());
+    }
 }

@@ -324,4 +324,67 @@ mod tests {
         s.refine_with_descriptor(&FontDescriptorStyle::default());
         assert!(s.bold && s.italic);
     }
+
+    #[test]
+    fn generic_css_keywords() {
+        assert_eq!(Generic::Sans.css(), "sans-serif");
+        assert_eq!(Generic::Serif.css(), "serif");
+        assert_eq!(Generic::Mono.css(), "monospace");
+    }
+
+    #[test]
+    fn has_visible_color_thresholds() {
+        let mut s = TextStyle::default();
+        assert!(!s.has_visible_color(), "None ⇒ not visible");
+        s.color = Some([0.0, 0.0, 0.0]);
+        assert!(!s.has_visible_color(), "black ⇒ not visible");
+        s.color = Some([0.01, 0.0, 0.01]);
+        assert!(!s.has_visible_color(), "near-black ⇒ not visible");
+        s.color = Some([0.0, 0.5, 0.0]);
+        assert!(s.has_visible_color(), "green ⇒ visible");
+    }
+
+    #[test]
+    fn maps_all_known_serif_families() {
+        assert_eq!(parse_base_font("Georgia-Bold").family, "Georgia");
+        assert_eq!(parse_base_font("Georgia-Bold").generic, Generic::Serif);
+        assert_eq!(parse_base_font("AGaramondPro").family, "Garamond");
+        assert_eq!(parse_base_font("AGaramondPro").generic, Generic::Serif);
+    }
+
+    #[test]
+    fn maps_all_known_mono_and_sans_families() {
+        assert_eq!(parse_base_font("Consolas").family, "Consolas");
+        assert_eq!(parse_base_font("Consolas").generic, Generic::Mono);
+        assert_eq!(parse_base_font("Calibri-Light").family, "Calibri");
+        assert_eq!(parse_base_font("Calibri-Light").generic, Generic::Sans);
+        assert_eq!(parse_base_font("Verdana").family, "Verdana");
+        assert_eq!(parse_base_font("Verdana").generic, Generic::Sans);
+    }
+
+    #[test]
+    fn unknown_serif_named_font_gets_serif_generic() {
+        // No known-family match, but the name contains "serif" (not "sans").
+        let s = parse_base_font("MyCustomSerif-Regular");
+        assert_eq!(s.family, "MyCustomSerif");
+        assert_eq!(s.generic, Generic::Serif);
+        // "sans" in the name keeps it Sans even with "serif" present.
+        let t = parse_base_font("MyFontSansSerif");
+        assert_eq!(t.generic, Generic::Sans);
+    }
+
+    #[test]
+    fn empty_family_stem_falls_back_to_helvetica() {
+        // A name starting with the style separator yields an empty stem → Helvetica.
+        let s = parse_base_font("-Italic");
+        assert_eq!(s.family, "Helvetica");
+        assert!(s.italic);
+    }
+
+    #[test]
+    fn weight_keyword_variants_make_bold() {
+        assert!(parse_base_font("Roboto-Black").bold);
+        assert!(parse_base_font("Roboto-Heavy").bold);
+        assert!(parse_base_font("Roboto-Semibold").bold);
+    }
 }
