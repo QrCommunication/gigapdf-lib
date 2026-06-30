@@ -12532,7 +12532,7 @@ impl Document {
         Ok(true)
     }
 
-    /// Embed a raster image (PNG or JPEG) on a page and draw it at `(x, y)` with
+    /// Embed a raster image (PNG, JPEG, WebP, GIF, TIFF or AVIF) on a page and draw it at `(x, y)` with
     /// size `(width, height)` in PDF user space (origin bottom-left). `opacity`
     /// in `0.0..=1.0` sets fill alpha via a transient `/ExtGState`. PNG alpha is
     /// honoured through a soft mask; JPEG embeds losslessly via `/DCTDecode`.
@@ -12548,7 +12548,11 @@ impl Document {
         opacity: f64,
     ) -> Result<()> {
         let prep = content::image::prepare_image(data)
-            .ok_or_else(|| EngineError::Missing("unsupported image (need PNG or JPEG)".into()))?;
+            .ok_or_else(|| {
+                EngineError::Missing(
+                    "unsupported image (need PNG, JPEG, WebP, GIF, TIFF or AVIF)".into(),
+                )
+            })?;
         let img_id = self.embed_image_xobject(&prep);
 
         // Register the image in the page's /Resources /XObject and get its name.
@@ -12566,7 +12570,8 @@ impl Document {
     /// reported by [`page_image_elements`](Self::page_image_elements) (and accepted
     /// by [`remove_element`](Self::remove_element)/[`transform_element`](Self::transform_element)).
     ///
-    /// `data` is a fresh raster (PNG or JPEG); it is re-encoded through the same
+    /// `data` is a fresh raster (any format the embedder decodes — PNG, JPEG,
+    /// WebP, GIF, TIFF or AVIF); it is re-encoded through the same
     /// embedding path as [`add_image`](Self::add_image) (PNG → `/FlateDecode`
     /// DeviceRGB/DeviceGray with alpha carried in a fresh `/SMask`; JPEG →
     /// `/DCTDecode` passthrough, Adobe-CMYK `/Decode` flip), and the result is
@@ -12579,7 +12584,7 @@ impl Document {
     /// stretched to fit (transform the element first if you need to re-fit it).
     ///
     /// `Err` if `page_no`/`index` doesn't resolve to a **top-level** image element,
-    /// or if `data` isn't a decodable PNG/JPEG.
+    /// or if `data` isn't a decodable raster.
     pub fn replace_image(&mut self, page_no: u32, index: usize, data: &[u8]) -> Result<()> {
         // Resolve the element index to the image's XObject resource name, using the
         // SAME top-level element list the index addresses (skip nested form-XObject
@@ -12597,7 +12602,11 @@ impl Document {
             EngineError::Missing("image XObject is not an indirect object".into())
         })?;
         let prep = content::image::prepare_image(data)
-            .ok_or_else(|| EngineError::Missing("unsupported image (need PNG or JPEG)".into()))?;
+            .ok_or_else(|| {
+                EngineError::Missing(
+                    "unsupported image (need PNG, JPEG, WebP, GIF, TIFF or AVIF)".into(),
+                )
+            })?;
         // Re-encode and overwrite the stream at the existing id: same object number,
         // new image dict + bytes. The old `/SMask`/palette is dropped — the
         // re-encoded stream is self-describing (a fresh `/SMask` is wired when the
@@ -14388,10 +14397,12 @@ impl Document {
         opts: &ImageWatermarkOptions,
     ) -> Result<usize> {
         // Reuse the conversion path's decoder/transcoder: any of PNG/JPEG/WebP/
-        // GIF/AVIF → bytes the image embedder accepts (PNG or JPEG) + pixel size.
+        // GIF/TIFF/AVIF → bytes the image embedder accepts + pixel size.
         let (embed, px_w, px_h) = crate::convert::reverse::embeddable_image(image_bytes)
             .ok_or_else(|| {
-                EngineError::Missing("unsupported image (need PNG, JPEG, WebP, GIF or AVIF)".into())
+                EngineError::Missing(
+                    "unsupported image (need PNG, JPEG, WebP, GIF, TIFF or AVIF)".into(),
+                )
             })?;
         let prep = content::image::prepare_image(&embed)
             .ok_or_else(|| EngineError::Missing("could not prepare image for embedding".into()))?;
@@ -24381,6 +24392,44 @@ mod tests {
         // And the document is unchanged: the targeted image still reads as 20×20.
         let imgs = doc.page_image_elements(1);
         assert_eq!((imgs[1].pixel_width, imgs[1].pixel_height), (20, 20));
+    }
+
+    #[test]
+    fn replace_image_accepts_every_raster_format_not_just_png_jpeg() {
+        // `replace_image` lowers the replacement through the SAME `prepare_image`
+        // dispatch as `add_image`, so EVERY raster the engine decodes — PNG, JPEG,
+        // WebP, GIF, TIFF and AVIF — is a valid replacement, not only PNG/JPEG.
+        // WebP here stands in for the shared decode-to-RGBA path that GIF/TIFF/AVIF
+        // also take (PNG/JPEG are already covered by the swap test above).
+        let (mut doc, _im0, im1) = page_with_text_image_path_image();
+        let target = doc.page_image_elements(1)[1].index; // the 20×20 JPEG, index 3
+        let id_before = doc.xobject_id(1, &im1).expect("indirect XObject");
+        let do_op = format!("/{} Do", String::from_utf8_lossy(&im1));
+        let content_before = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert!(content_before.contains(&do_op));
+
+        // A fresh 8×8 WebP — a format the old docs claimed `replace_image` rejected.
+        let rgba = vec![0x40u8; 8 * 8 * 4];
+        let webp = crate::raster::webp::encode_webp(8, 8, &rgba);
+        doc.replace_image(1, target, &webp)
+            .expect("a WebP replacement must succeed (parity with add_image)");
+
+        // Object id preserved → every `/Do` reference + placement matrix intact.
+        let id_after = doc.xobject_id(1, &im1).expect("indirect XObject");
+        assert_eq!(id_before, id_after, "object number (and /Do refs) preserved");
+        let content_after = String::from_utf8(doc.page_content(1).unwrap()).unwrap();
+        assert_eq!(
+            content_before, content_after,
+            "content stream untouched by replace_image"
+        );
+        // The XObject now describes the 8×8 replacement.
+        let after = doc.page_image_elements(1);
+        assert_eq!(after.len(), 2, "still two images");
+        assert_eq!(
+            (after[1].pixel_width, after[1].pixel_height),
+            (8, 8),
+            "dimensions updated to the WebP replacement"
+        );
     }
 
     #[test]

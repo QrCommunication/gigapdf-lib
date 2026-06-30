@@ -2052,8 +2052,9 @@ pub extern "C" fn gp_add_path(
     })
 }
 
-/// Embed a raster image (PNG or JPEG bytes at `data_ptr`, `data_len`) on a page
-/// at `(x, y)` sized `(width, height)`, with `opacity` in `0..=1`. 0 on success.
+/// Embed a raster image (PNG, JPEG, WebP, GIF, TIFF or AVIF bytes at `data_ptr`,
+/// `data_len`) on a page at `(x, y)` sized `(width, height)`, with `opacity` in
+/// `0..=1`. 0 on success.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn gp_add_image(
@@ -2077,11 +2078,12 @@ pub extern "C" fn gp_add_image(
 }
 
 /// Replace the pixels of the existing image element `index` on `page` **in place**
-/// with a fresh raster (PNG or JPEG bytes at `data_ptr`, `data_len`). `index` is
+/// with a fresh raster (PNG, JPEG, WebP, GIF, TIFF or AVIF bytes at `data_ptr`,
+/// `data_len`). `index` is
 /// the unified element index from [`gp_image_elements_json`]; the image's object
 /// number, every `/Do` reference and its placement matrix are preserved — only the
 /// stream bytes and image dictionary change. 0 on success; `-3` when `index` isn't
-/// a top-level image or the bytes aren't decodable PNG/JPEG.
+/// a top-level image or the bytes aren't a decodable raster.
 #[no_mangle]
 pub extern "C" fn gp_replace_image(
     handle: *mut Document,

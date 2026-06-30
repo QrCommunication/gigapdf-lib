@@ -3342,7 +3342,8 @@ export class GigaPdfDoc {
    * photo while every reference to it stays intact (ISO 32000-1 §8.9). `index` is
    * the **unified element index** of an image on `page`, exactly the `index`
    * reported by {@link imageElements} (and accepted by {@link removeElement} /
-   * {@link transformElement}); `data` is a fresh PNG or JPEG.
+   * {@link transformElement}); `data` is any raster the engine decodes — PNG,
+   * JPEG, WebP, GIF, TIFF or AVIF (the same set {@link addImage} accepts).
    *
    * Unlike a delete-then-re-add, the image keeps its object number, **every `/Do`
    * placement, and its position / scale / rotation / clip matrix** — only the
@@ -3353,7 +3354,7 @@ export class GigaPdfDoc {
    * drawn into the same box (transform the element first to re-fit it).
    *
    * Returns `false` if `page`/`index` doesn't resolve to a top-level image, or the
-   * bytes aren't a decodable PNG/JPEG.
+   * bytes aren't a decodable raster.
    */
   replaceImage(page: number, index: number, data: Uint8Array): boolean {
     return (

@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.109.1] - 2026-06-30
+
+### Fixed — image-format documentation accuracy
+
+- `addImage`, `replaceImage` and the image **watermark** path already accept the
+  full raster set — **PNG, JPEG, WebP, GIF, TIFF and AVIF** — since 0.109 (every
+  one routes through the shared `prepare_image` / `embeddable_image` decoders).
+  But the core and WASM docstrings, the SDK `replaceImage` docs, and the
+  `unsupported image` error messages still claimed **PNG/JPEG only** (or omitted
+  TIFF). Corrected every stale claim so the documented capability matches the
+  implementation. **No behaviour change** — purely documentation and error-text.
+
+### Added
+
+- Regression test `replace_image_accepts_every_raster_format_not_just_png_jpeg`:
+  proves `replaceImage` swaps a non-PNG/JPEG raster (WebP) in place while keeping
+  the image's object number and every `/Do` reference intact.
+
 ## [0.109.0] - 2026-06-30
 
 ### Added — image conversion completeness
