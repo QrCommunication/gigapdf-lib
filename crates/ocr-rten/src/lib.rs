@@ -208,6 +208,12 @@ impl OcrEngine {
         self.recs.len()
     }
 
+    /// Names of the loaded recognition models (e.g. `["latin","cyrillic","ar",…]`) — for a
+    /// host availability/language probe (the persistent `ocr_serve` `/health` endpoint).
+    pub fn rec_names(&self) -> Vec<String> {
+        self.recs.iter().map(|m| m.name.clone()).collect()
+    }
+
     /// Convenience: detector + a single LTR recognition model (back-compat with the probes).
     pub fn load(
         det: impl AsRef<Path>,

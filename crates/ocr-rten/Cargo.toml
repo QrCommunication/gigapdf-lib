@@ -32,3 +32,9 @@ path = "src/bin/ocr_probe.rs"
 [[bin]]
 name = "ocr_auto"
 path = "src/bin/ocr_auto.rs"
+
+# Persistent OCR microservice — loads models once, serves recognition over a minimal local
+# HTTP endpoint (the host-side endpoint the lean wasm client calls).
+[[bin]]
+name = "ocr_serve"
+path = "src/bin/ocr_serve.rs"

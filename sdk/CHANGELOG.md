@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.110.2] - 2026-06-30
+
+### Added — `ocr_serve`: persistent host-side OCR microservice
+
+- New `gigapdf-ocr-rten` binary **`ocr_serve`** + `OcrEngine::rec_names()`. It loads the
+  PaddleOCR-on-RTen models **once** at boot and serves recognition over a minimal local
+  HTTP/1.1 endpoint (zero web-framework dependency — `std::net` only): `GET /health`
+  (`{ok,recCount,languages}`) and `POST /ocr` (PNG body, optional `X-Ocr-Model` header for a
+  forced recognizer; auto per-line script selection otherwise) → NDJSON words in image pixel
+  space (`{text,x,y,w,h,confidence,model}`). This is the "host-side endpoint" the lean wasm
+  client calls — amortizing the multi-hundred-MB model load across requests instead of per call.
+  The `ocr_serve` binary and the assembled `.rten` model set are distributed as GitHub
+  **release assets** for host deployment (not part of the npm package).
+
+### Fixed — npm package no longer bundles the legacy `.gpocr` models
+
+- `0.110.1` accidentally bundled the 22 legacy `.gpocr` OCR weights into the npm tarball. Those
+  belong to the **removed** client-side recognizer (≤0.63.x); `0.110.x` does OCR **host-side**
+  via `gigapdf-ocr-rten` (RTen `.rten` models), so the `.gpocr` files are dead weight in the
+  package. The release pipeline no longer fetches/bundles them — the npm package is lean again.
+
 ## [0.110.1] - 2026-06-30
 
 ### Fixed — releases now ship the OCR `.gpocr` models again

@@ -21,17 +21,6 @@ jobs:
       - name: Test engine (core)
         run: cargo test -p gigapdf-core --release
 
-      - name: Fetch OCR models (runtime .gpocr weights, kept out of git)
-        run: |
-          set -euo pipefail
-          base="https://github.com/QrCommunication/gigapdf-lib/releases/download/ocr-models-v1"
-          mkdir -p models
-          curl -fsSL -o /tmp/gpocr-models.tar.gz  "$base/gpocr-models.tar.gz"
-          curl -fsSL -o /tmp/gpocr-models.sha256  "$base/gpocr-models.sha256"
-          ( cd /tmp && sha256sum -c gpocr-models.sha256 )
-          tar xzf /tmp/gpocr-models.tar.gz -C models/
-          echo "✓ fetched $(ls models/*.gpocr | wc -l) OCR models → models/"
-
       - name: Build WASM
         run: bash sdk/scripts/build-wasm.sh
 
@@ -81,17 +70,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-
-      - name: Fetch OCR models (runtime .gpocr weights, kept out of git)
-        run: |
-          set -euo pipefail
-          base="https://github.com/QrCommunication/gigapdf-lib/releases/download/ocr-models-v1"
-          mkdir -p models
-          curl -fsSL -o /tmp/gpocr-models.tar.gz  "$base/gpocr-models.tar.gz"
-          curl -fsSL -o /tmp/gpocr-models.sha256  "$base/gpocr-models.sha256"
-          ( cd /tmp && sha256sum -c gpocr-models.sha256 )
-          tar xzf /tmp/gpocr-models.tar.gz -C models/
-          echo "✓ fetched $(ls models/*.gpocr | wc -l) OCR models → models/"
 
       - name: Build WASM
         run: bash sdk/scripts/build-wasm.sh
