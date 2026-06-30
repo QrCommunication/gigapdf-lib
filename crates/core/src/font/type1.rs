@@ -2529,4 +2529,239 @@ mod tests {
             );
         }
     }
+
+    // ── charstring interpreter: every operator path ───────────────────────────
+
+    /// hmoveto/vmoveto, hlineto/vlineto, closepath and the two compact integer
+    /// encodings (28 = i16, 255 = i32) all reach the contour correctly.
+    #[test]
+    fn outline_covers_h_v_moves_lines_and_int_encodings() {
+        let mut cs = Vec::new();
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 500);
+        cs.push(13); // hsbw 0 500 → x=0
+                     // vmoveto 0 +50 (opcode 4): start first contour at (0,50)
+        t1_num(&mut cs, 50);
+        cs.push(4);
+        // rlineto 5 0 so the first contour has ≥2 vertices and survives.
+        t1_num(&mut cs, 5);
+        t1_num(&mut cs, 0);
+        cs.push(5); // → (5,50)
+                    // hmoveto +10 (opcode 22): opens a SECOND contour at (15,50)
+        t1_num(&mut cs, 10);
+        cs.push(22);
+        // hlineto +100 (opcode 6): (115,50)
+        t1_num(&mut cs, 100);
+        cs.push(6);
+        // vlineto +60 (opcode 7): (115,110)
+        t1_num(&mut cs, 60);
+        cs.push(7);
+        // 16-bit int push (28) of 0, plus another 0, rlineto (5)
+        cs.push(28);
+        cs.extend_from_slice(&0i16.to_be_bytes());
+        cs.push(28);
+        cs.extend_from_slice(&40i16.to_be_bytes());
+        cs.push(5); // rlineto 0 40 → (115,150)
+                    // 32-bit int push (255) of -10, 0, rlineto
+        cs.push(255);
+        cs.extend_from_slice(&(-10i32).to_be_bytes());
+        cs.push(255);
+        cs.extend_from_slice(&0i32.to_be_bytes());
+        cs.push(5); // rlineto -10 0 → (105,150)
+        cs.push(9); // closepath (no-op for geometry)
+        cs.push(14); // endchar
+
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        let none = |_code: u8| None;
+        let (contours, width) = outline_charstring(&cs, &no_subrs, &none, 0);
+        assert_eq!(width, 500.0);
+        // Two surviving contours: the first (vmoveto + a line), the second (hmoveto …).
+        assert_eq!(contours.len(), 2, "vmoveto + hmoveto each open a contour");
+        let last = contours.last().unwrap();
+        assert_eq!(last[0], (15.0, 50.0), "second contour start (hmoveto)");
+        assert_eq!(*last.last().unwrap(), (105.0, 150.0), "after i16/i32 lines");
+    }
+
+    /// vhcurveto (30) and hvcurveto (31) expand to the right rrcurveto deltas.
+    #[test]
+    fn outline_covers_vh_and_hv_curves() {
+        let mut cs = Vec::new();
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 1000);
+        cs.push(13); // hsbw
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 0);
+        cs.push(21); // rmoveto 0 0
+                     // vhcurveto dy1 dx2 dy2 dx3 = 50 60 70 80 → curve (0,50)(60,70)(80,0)
+        for d in [50, 60, 70, 80] {
+            t1_num(&mut cs, d);
+        }
+        cs.push(30);
+        // hvcurveto dx1 dx2 dy2 dy3 = 20 30 40 50 → curve (20,0)(30,40)(0,50)
+        for d in [20, 30, 40, 50] {
+            t1_num(&mut cs, d);
+        }
+        cs.push(31);
+        cs.push(14);
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        let none = |_code: u8| None;
+        let (contours, _) = outline_charstring(&cs, &no_subrs, &none, 0);
+        assert_eq!(contours.len(), 1);
+        // The contour must have flattened curve points beyond the single start.
+        assert!(contours[0].len() > 8, "two flattened curves appended");
+    }
+
+    /// callsubr (10) dispatches into the Subrs array; div (escape 12) and
+    /// setcurrentpoint (escape 33) are exercised inside the subr.
+    #[test]
+    fn outline_covers_callsubr_div_and_setcurrentpoint() {
+        // Subr 0: `200 2 div` → 100 on the stack, used as an rlineto dx with dy 0.
+        let mut subr0 = Vec::new();
+        t1_num(&mut subr0, 200);
+        t1_num(&mut subr0, 2);
+        subr0.push(12);
+        subr0.push(12); // div → 100
+        t1_num(&mut subr0, 0);
+        subr0.push(5); // rlineto 100 0
+        subr0.push(11); // return
+        let subrs = vec![subr0];
+
+        let mut cs = Vec::new();
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 600);
+        cs.push(13); // hsbw → x=0
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 0);
+        cs.push(21); // rmoveto 0 0
+        t1_num(&mut cs, 0);
+        cs.push(10); // callsubr 0 → rlineto 100 0 → (100,0)
+                     // setcurrentpoint 250 0 re-anchors x to 250
+        t1_num(&mut cs, 250);
+        t1_num(&mut cs, 0);
+        cs.push(12);
+        cs.push(33);
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 30);
+        cs.push(5); // rlineto 0 30 → (250,30) proving the re-anchor
+        cs.push(14);
+
+        let none = |_code: u8| None;
+        let (contours, _) = outline_charstring(&cs, &subrs, &none, 0);
+        assert_eq!(contours.len(), 1);
+        let pts = &contours[0];
+        assert!(pts.contains(&(100.0, 0.0)), "callsubr+div produced (100,0)");
+        assert_eq!(
+            *pts.last().unwrap(),
+            (250.0, 30.0),
+            "setcurrentpoint re-anchored x to 250"
+        );
+    }
+
+    /// sbw (escape 7) sets side bearing + width on both axes.
+    #[test]
+    fn outline_covers_sbw_width_and_origin() {
+        let mut cs = Vec::new();
+        // sbw: sbx sby wx wy
+        for d in [30, 10, 800, 0] {
+            t1_num(&mut cs, d);
+        }
+        cs.push(12);
+        cs.push(7); // sbw
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 0);
+        cs.push(21); // rmoveto 0 0 → start at (sbx, sby) = (30,10)
+        t1_num(&mut cs, 20);
+        t1_num(&mut cs, 0);
+        cs.push(5); // rlineto 20 0 so the contour has ≥2 vertices and survives
+        cs.push(14);
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        let none = |_code: u8| None;
+        let (contours, width) = outline_charstring(&cs, &no_subrs, &none, 0);
+        assert_eq!(width, 800.0, "wx from sbw");
+        assert_eq!(contours[0][0], (30.0, 10.0), "origin from sbx/sby");
+    }
+
+    /// Flex via OtherSubrs 1 (start) / 2 (point) / 0 (end) emits two curves.
+    #[test]
+    fn outline_covers_flex_othersubrs() {
+        // The standard flex idiom: subr1 starts, seven rmovetos feed flex points
+        // (each wrapped as `0 1 callothersubr` per the protocol — but our
+        // interpreter captures rmovetos directly while `in_flex`), subr0 ends.
+        let mut cs = Vec::new();
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 1000);
+        cs.push(13); // hsbw
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 0);
+        cs.push(21); // rmoveto 0 0
+                     // 0 1 callothersubr  (start flex)
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 1);
+        cs.push(12);
+        cs.push(16);
+        // seven rmovetos: reference point + 2 curves' 6 control/end points
+        let flex_pts = [
+            (0, 0),
+            (0, 50),
+            (50, 100),
+            (100, 100),
+            (150, 100),
+            (200, 50),
+            (200, 0),
+        ];
+        for (dx, dy) in flex_pts {
+            t1_num(&mut cs, dx);
+            t1_num(&mut cs, dy);
+            cs.push(21); // rmoveto (captured, not drawn, while in flex)
+        }
+        // 0 0 callothersubr (end flex) then the two trailing pops + setcurrentpoint
+        t1_num(&mut cs, 0);
+        t1_num(&mut cs, 0);
+        cs.push(12);
+        cs.push(16);
+        cs.push(12);
+        cs.push(17); // pop
+        cs.push(12);
+        cs.push(17); // pop
+        cs.push(12);
+        cs.push(33); // setcurrentpoint
+        cs.push(14);
+
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        let none = |_code: u8| None;
+        let (contours, _) = outline_charstring(&cs, &no_subrs, &none, 0);
+        assert_eq!(contours.len(), 1, "flex stays on one contour");
+        assert!(
+            contours[0].len() > 8,
+            "flex emitted two flattened cubic curves"
+        );
+    }
+
+    #[test]
+    fn charstring_width_and_most_common() {
+        // charstring_width reads the wx operand of hsbw.
+        let cs = cs_letter(); // hsbw 50 600
+        let no_subrs: Vec<Vec<u8>> = Vec::new();
+        assert_eq!(charstring_width(&cs, &no_subrs), Some(600.0));
+        // A charstring with no hsbw yields None.
+        assert_eq!(charstring_width(&[14], &no_subrs), None);
+
+        // most_common returns the modal value; ties resolve to a present value.
+        assert_eq!(most_common(&[5.0, 5.0, 9.0]), Some(5.0));
+        assert_eq!(most_common(&[]), None);
+    }
+
+    #[test]
+    fn unwrap_pfb_unwraps_segmented_container() {
+        // A PFB wrapper: 0x80 0x01 <len LE> <ascii> then 0x80 0x03 EOF marker.
+        let payload = b"%!FontType1 ascii part";
+        let mut pfb = vec![0x80, 0x01];
+        pfb.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        pfb.extend_from_slice(payload);
+        pfb.extend_from_slice(&[0x80, 0x03]); // EOF segment
+        let out = unwrap_pfb(&pfb).expect("valid PFB unwraps");
+        assert_eq!(&out, payload);
+        // A non-PFB (no 0x80 magic) returns None.
+        assert!(unwrap_pfb(b"plain text, no magic").is_none());
+    }
 }
