@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.110.1] - 2026-06-30
+
+### Fixed — releases now ship the OCR `.gpocr` models again
+
+- The 22 per-script line-OCR model weights (`models/ocr_*.gpocr`, 9.6 MB) are
+  **git-ignored** (`sdk/.gitignore: models/`), so a clean CI checkout had none —
+  every CI-published version since the ignore (e.g. `0.109.1`, `0.110.0`) shipped
+  **zero** OCR models, silently degrading runtime OCR to the mono-glyph
+  classifier (`0.63.0` still had them because it predates the gap). The release
+  workflow now **fetches the models from a durable GitHub Release asset
+  (`ocr-models-v1`), verifies their SHA-256, and stages them** before
+  `build-wasm.sh`, so every published package carries the full model set again —
+  without committing 9.6 MB of weights to the repo. No engine/API change.
+
 ## [0.110.0] - 2026-06-30
 
 ### Added — `extractWebFont`: serve a document's own embedded fonts to a browser
