@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.110.3] - 2026-06-30
+
+### Fixed — CFF advance widths (`extractWebFont` no longer jams text in the browser)
+
+- `CffFont::advance_width` — and therefore the OpenType `hmtx` that `cff_to_otf`
+  builds for `extractWebFont` — now reads the CFF Private DICT **`nominalWidthX`**
+  (op 21) and **`defaultWidthX`** (op 20) instead of using `units_per_em * 0.5`
+  as a one-size base for every glyph. A CFF/Type1 subset of a standard base font
+  (e.g. **`Times-Bold`**) previously got a near-zero space advance
+  (`500 + (250 − 718) = 32`) and wrong letter advances, so a host rendering the
+  extracted web font in a browser **jammed every word together** (the CERFA
+  "DEMANDEDERATTACHEMENT…" garbling). PDF rasterisation (which uses the PDF
+  `/Widths` array) was unaffected — only the browser-loadable web font's metrics
+  were wrong; `extractWebFont` (0.110.0) was the first consumer of `advance_width`
+  for actual rendering, which is why the latent bug only surfaced then.
+- `advance = nominalWidthX + operand` when a charstring carries a width operand,
+  `defaultWidthX` otherwise; per-FD for CID-keyed / CFF2 fonts (keyed by FDSelect).
+  Regression test: `cff_width_distinguishes_nominal_from_default_width_x`.
+
 ## [0.110.2] - 2026-06-30
 
 ### Added — `ocr_serve`: persistent host-side OCR microservice

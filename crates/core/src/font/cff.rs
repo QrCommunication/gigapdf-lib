@@ -30,6 +30,18 @@ pub struct CffFont {
     /// `charset[gid] = sid` (the glyph name SID, or CID when CID-keyed). GID 0 is
     /// always `.notdef` (SID 0). Empty falls back to the identity charset.
     charset: Vec<u16>,
+    /// Private DICT `defaultWidthX` (op 20) — the advance of a glyph whose
+    /// charstring carries NO width operand. Falls back to `units_per_em * 0.5`
+    /// when the Private DICT omits it. Per-font (non-CID); CID fonts use
+    /// [`CffFont::fd_widths`] keyed by FDSelect.
+    default_width_x: f64,
+    /// Private DICT `nominalWidthX` (op 21) — the base added to a charstring's
+    /// width operand to get the advance (`advance = nominalWidthX + operand`).
+    /// `0.0` when omitted (CFF spec default). Per-font (non-CID).
+    nominal_width_x: f64,
+    /// Per-FD `(defaultWidthX, nominalWidthX)` for CID-keyed / CFF2 fonts, keyed
+    /// by FDSelect (parallel to [`CffFont::fd_subrs`]).
+    fd_widths: Vec<(f64, f64)>,
 }
 
 fn read_index(data: &[u8], pos: usize) -> (Vec<Vec<u8>>, usize) {
@@ -272,18 +284,24 @@ impl CffFont {
         let mut lsubrs = Vec::new();
         let mut fd_subrs = Vec::new();
         let mut fd_select = Vec::new();
+        let mut fd_widths = Vec::new();
+        let mut default_width_x = units_per_em * 0.5;
+        let mut nominal_width_x = 0.0;
 
         if is_cid {
-            // FDArray: each font DICT carries its own Private → local subrs.
+            // FDArray: each font DICT carries its own Private → local subrs + widths.
             if let Some(fda) = top.get(&0x0c24).and_then(|v| v.first()) {
                 let (fd_dicts, _) = read_index(data, *fda as usize);
                 for fd in &fd_dicts {
-                    fd_subrs.push(local_subrs(data, &parse_dict(fd)));
+                    let fd_dict = parse_dict(fd);
+                    fd_subrs.push(local_subrs(data, &fd_dict));
+                    fd_widths.push(private_widths(data, &fd_dict, units_per_em));
                 }
             }
             fd_select = parse_fd_select(data, &top, num_glyphs);
         } else {
             lsubrs = local_subrs(data, &top);
+            (default_width_x, nominal_width_x) = private_widths(data, &top, units_per_em);
         }
 
         Some(CffFont {
@@ -297,6 +315,9 @@ impl CffFont {
             units_per_em,
             strings,
             charset,
+            default_width_x,
+            nominal_width_x,
+            fd_widths,
         })
     }
 
@@ -332,14 +353,18 @@ impl CffFont {
         // Private → local subrs. FDSelect (op 12 37) is present only when there
         // is more than one Font DICT; otherwise FD 0 applies to every glyph.
         let mut fd_subrs = Vec::new();
+        let mut fd_widths = Vec::new();
         if let Some(fda) = top.get(&0x0c24).and_then(|v| v.first()) {
             let (fd_dicts, _) = read_index(data, *fda as usize);
             for fd in &fd_dicts {
-                fd_subrs.push(local_subrs(data, &parse_dict(fd)));
+                let fd_dict = parse_dict(fd);
+                fd_subrs.push(local_subrs(data, &fd_dict));
+                fd_widths.push(private_widths(data, &fd_dict, units_per_em));
             }
         }
         if fd_subrs.is_empty() {
             fd_subrs.push(Vec::new());
+            fd_widths.push((units_per_em * 0.5, 0.0));
         }
         let fd_select = parse_fd_select(data, &top, num_glyphs);
 
@@ -357,6 +382,11 @@ impl CffFont {
             units_per_em,
             strings: Vec::new(),
             charset: Vec::new(),
+            // CFF2 charstrings carry no per-glyph width (the `cff2` flag prevents
+            // any width stripping), so these are inert; populated for struct parity.
+            default_width_x: units_per_em * 0.5,
+            nominal_width_x: 0.0,
+            fd_widths,
         })
     }
 
@@ -462,6 +492,20 @@ impl CffFont {
         }
     }
 
+    /// `(defaultWidthX, nominalWidthX)` for glyph `gid` — per-FD for CID/CFF2
+    /// (keyed by FDSelect, parallel to `local_for`), else the font-wide values.
+    fn widths_for(&self, gid: u16) -> (f64, f64) {
+        if self.is_cid || self.cff2 {
+            let fd = self.fd_select.get(gid as usize).copied().unwrap_or(0) as usize;
+            self.fd_widths
+                .get(fd)
+                .copied()
+                .unwrap_or((self.units_per_em * 0.5, 0.0))
+        } else {
+            (self.default_width_x, self.nominal_width_x)
+        }
+    }
+
     fn run(&self, gid: u16) -> Option<Glyph> {
         self.run_depth(gid, 0)
     }
@@ -470,6 +514,7 @@ impl CffFont {
     /// guards against a malformed font chaining `seac`s into a cycle.
     fn run_depth(&self, gid: u16, depth: usize) -> Option<Glyph> {
         let charstring = self.charstrings.get(gid as usize)?;
+        let (default_width, nominal_width) = self.widths_for(gid);
         let mut interp = Interp {
             stack: Vec::new(),
             x: 0.0,
@@ -483,7 +528,8 @@ impl CffFont {
             cff2: self.cff2,
             gsubrs: &self.gsubrs,
             lsubrs: self.local_for(gid),
-            default_width: self.units_per_em * 0.5,
+            default_width,
+            nominal_width,
         };
         interp.exec(charstring, 0);
         interp.finish_contour();
@@ -567,6 +613,40 @@ fn local_subrs(data: &[u8], dict: &BTreeMap<u16, Vec<f64>>) -> Vec<Vec<u8>> {
         Some(&subrs_off) => read_index(data, offset + subrs_off as usize).0,
         None => Vec::new(),
     }
+}
+
+/// Parse a (Top or Font) DICT's Private DICT for the per-glyph advance widths:
+/// `defaultWidthX` (op 20, advance when a charstring carries no width operand)
+/// and `nominalWidthX` (op 21, base added to a charstring's width operand).
+/// Returns `(defaultWidthX, nominalWidthX)`; `defaultWidthX` falls back to
+/// `units_per_em * 0.5` when absent (avoids a 0-width fallback on a malformed
+/// font) and `nominalWidthX` to `0.0` (the CFF spec default). Critical for the
+/// OpenType `hmtx` built by `cff_to_otf` — without it every advance was computed
+/// as `units_per_em*0.5 + operand`, so a font with a real `nominalWidthX` (e.g.
+/// the standard "Times-Bold" base font) rendered its space ~0-wide and jammed
+/// every word together in the browser overlay.
+fn private_widths(data: &[u8], dict: &BTreeMap<u16, Vec<f64>>, upm: f64) -> (f64, f64) {
+    let private = match dict.get(&18) {
+        Some(v) if v.len() == 2 => v,
+        _ => return (upm * 0.5, 0.0),
+    };
+    let size = private[0] as usize;
+    let offset = private[1] as usize;
+    let Some(priv_data) = data.get(offset..offset.saturating_add(size)) else {
+        return (upm * 0.5, 0.0);
+    };
+    let priv_dict = parse_dict(priv_data);
+    let default_w = priv_dict
+        .get(&20)
+        .and_then(|v| v.first())
+        .copied()
+        .unwrap_or(upm * 0.5);
+    let nominal_w = priv_dict
+        .get(&21)
+        .and_then(|v| v.first())
+        .copied()
+        .unwrap_or(0.0);
+    (default_w, nominal_w)
 }
 
 fn parse_fd_select(data: &[u8], top: &BTreeMap<u16, Vec<f64>>, num_glyphs: usize) -> Vec<u8> {
@@ -666,7 +746,11 @@ struct Interp<'a> {
     cff2: bool,
     gsubrs: &'a [Vec<u8>],
     lsubrs: &'a [Vec<u8>],
+    /// Advance for a glyph with NO width operand (CFF Private `defaultWidthX`).
     default_width: f64,
+    /// Base added to a charstring's width operand (CFF Private `nominalWidthX`):
+    /// `advance = nominal_width + operand`.
+    nominal_width: f64,
 }
 
 impl Interp<'_> {
@@ -814,7 +898,7 @@ impl Interp<'_> {
                     // h/v stem(hm): width on first, then stem pairs. CFF2
                     // charstrings carry no width, so never strip one there.
                     if !self.cff2 && !self.have_width && self.stack.len() % 2 == 1 {
-                        self.width = Some(self.default_width + self.stack.remove(0));
+                        self.width = Some(self.nominal_width + self.stack.remove(0));
                     }
                     self.have_width = true;
                     self.n_stems += self.stack.len() / 2;
@@ -823,7 +907,7 @@ impl Interp<'_> {
                 19 | 20 => {
                     // hintmask/cntrmask: same as stem, then skip mask bytes.
                     if !self.cff2 && !self.have_width && self.stack.len() % 2 == 1 {
-                        self.width = Some(self.default_width + self.stack.remove(0));
+                        self.width = Some(self.nominal_width + self.stack.remove(0));
                     }
                     self.have_width = true;
                     self.n_stems += self.stack.len() / 2;
@@ -1001,7 +1085,7 @@ impl Interp<'_> {
                     // Strip the width only in the 5-arg case (never consume a
                     // seac operand as a width). Only valid for CFF1.
                     if !self.cff2 && !self.have_width && self.stack.len() == 5 {
-                        self.width = Some(self.default_width + self.stack.remove(0));
+                        self.width = Some(self.nominal_width + self.stack.remove(0));
                         self.have_width = true;
                     }
                     if !self.cff2 && self.stack.len() == 4 {
@@ -1105,7 +1189,7 @@ impl Interp<'_> {
         self.have_width = true;
         if self.stack.len() > expected {
             let w = self.stack.remove(0);
-            self.width = Some(self.default_width + w);
+            self.width = Some(self.nominal_width + w);
         }
     }
 }
@@ -1642,15 +1726,62 @@ mod tests {
             gsubrs: &[],
             lsubrs: &[],
             default_width: 500.0,
+            // A width-bearing charstring strips the leading operand and adds it to
+            // nominalWidthX (NOT defaultWidthX): advance = nominalWidthX + operand.
+            nominal_width: 500.0,
         };
         interp.exec(&cs, 0);
         interp.finish_contour();
-        assert_eq!(interp.width, Some(510.0), "width = default + 10");
+        assert_eq!(interp.width, Some(510.0), "width = nominalWidthX + 10");
         assert_eq!(interp.contours.len(), 1);
         let c = &interp.contours[0];
         assert_eq!(c[0], (100.0, 100.0), "moveto");
         assert_eq!(c[1], (150.0, 100.0), "rlineto +50x");
         assert_eq!(c[2], (150.0, 150.0), "rlineto +50y");
+    }
+
+    /// Regression: a glyph's advance must use the Private DICT `nominalWidthX`
+    /// (for a width-bearing charstring) and `defaultWidthX` (for one without) —
+    /// NOT `units_per_em * 0.5` as a one-size base. Conflating them computed e.g.
+    /// the standard "Times-Bold" space as `500 + (250-718) = 32` instead of 250,
+    /// so `cff_to_otf`'s `hmtx` made the browser overlay jam every word together
+    /// (CERFA "DEMANDEDERATTACHEMENT…").
+    #[test]
+    fn cff_width_distinguishes_nominal_from_default_width_x() {
+        // Single-byte CFF operand encoder (value in -107..=107).
+        let n = |v: i32| (v + 139) as u8;
+        let mk = |dwx: f64, nwx: f64| Interp {
+            stack: Vec::new(),
+            x: 0.0,
+            y: 0.0,
+            contours: Vec::new(),
+            current: Vec::new(),
+            n_stems: 0,
+            width: None,
+            have_width: false,
+            seac: None,
+            cff2: false,
+            gsubrs: &[],
+            lsubrs: &[],
+            default_width: dwx,
+            nominal_width: nwx,
+        };
+        // hstem (op 1) with an odd operand count strips the leading one as the
+        // width → advance = nominalWidthX + operand (NOT defaultWidthX + operand).
+        let with_width = vec![n(50), n(0), n(20), 1u8, 14u8];
+        let mut it = mk(100.0, 200.0);
+        it.exec(&with_width, 0);
+        it.finish_contour();
+        assert_eq!(it.width, Some(250.0), "advance = nominalWidthX(200) + 50");
+        // No width operand anywhere → advance is defaultWidthX, not nominalWidthX.
+        let no_width = vec![14u8];
+        let mut it2 = mk(100.0, 200.0);
+        it2.exec(&no_width, 0);
+        assert_eq!(
+            it2.width.unwrap_or(it2.default_width),
+            100.0,
+            "no width operand → defaultWidthX"
+        );
     }
 
     /// Build a fresh interpreter for charstring-level unit tests.
@@ -1669,6 +1800,7 @@ mod tests {
             gsubrs: &[],
             lsubrs: &[],
             default_width: 0.0,
+            nominal_width: 0.0,
         }
     }
 
