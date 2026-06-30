@@ -361,7 +361,59 @@ mod tests {
         assert_eq!(direction_str(Direction::Rtl), "rtl");
         assert_eq!(direction_str(Direction::Neutral), "neutral");
         assert_eq!(script_str(Script::Arabic), "arabic");
+        assert_eq!(script_str(Script::Hebrew), "hebrew");
+        assert_eq!(script_str(Script::Latin), "latin");
+        assert_eq!(script_str(Script::Greek), "greek");
+        assert_eq!(script_str(Script::Cyrillic), "cyrillic");
         assert_eq!(script_str(Script::Cjk), "cjk");
         assert_eq!(script_str(Script::Other), "other");
+    }
+
+    #[test]
+    fn latin1_supplement_letters_classify_as_latin() {
+        // Accented Latin letters (é ñ ü ç) live in 0x00C0..=0x024F, not ASCII.
+        let dl = document_language(["café señor über"].iter().copied());
+        assert_eq!(dl.script, Script::Latin);
+        assert_eq!(run_direction("résumé"), Direction::Ltr);
+    }
+
+    #[test]
+    fn arabic_supplement_and_presentation_forms_are_rtl() {
+        // Arabic Supplement (0x0750), Extended-A (0x08A0), Presentation Forms-A
+        // (0xFB50) and -B (0xFE70) all count as strong RTL Arabic.
+        for ch in ['\u{0750}', '\u{08A0}', '\u{FB50}', '\u{FE70}'] {
+            let s: String = std::iter::repeat_n(ch, 3).collect();
+            assert_eq!(run_direction(&s), Direction::Rtl, "char {:#x}", ch as u32);
+            let dl = document_language(std::iter::once(s.as_str()));
+            assert_eq!(dl.script, Script::Arabic);
+        }
+    }
+
+    #[test]
+    fn hebrew_presentation_forms_classify_as_hebrew() {
+        // Hebrew Alphabetic Presentation Forms (0xFB1D..=0xFB4F).
+        let s = "\u{FB2A}\u{FB2B}\u{FB2C}";
+        let dl = document_language(std::iter::once(s));
+        assert_eq!(dl.script, Script::Hebrew);
+        assert_eq!(dl.direction, Direction::Rtl);
+    }
+
+    #[test]
+    fn hangul_and_cjk_compatibility_classify_as_cjk() {
+        // Hangul Syllables (0xAC00) and CJK Compatibility Ideographs (0xF900).
+        let dl = document_language(["\u{AC00}\u{AC01} \u{F900}\u{F901}"].iter().copied());
+        assert_eq!(dl.script, Script::Cjk);
+        assert_eq!(run_direction("\u{AC00}"), Direction::Ltr);
+        assert_eq!(run_direction("\u{F900}"), Direction::Ltr);
+    }
+
+    #[test]
+    fn greek_and_cyrillic_dominant_documents() {
+        let g = document_language(["Ελληνικά κείμενο"].iter().copied());
+        assert_eq!(g.script, Script::Greek);
+        assert_eq!(g.lang, None);
+        let c = document_language(["Привет мир"].iter().copied());
+        assert_eq!(c.script, Script::Cyrillic);
+        assert_eq!(c.lang, None);
     }
 }

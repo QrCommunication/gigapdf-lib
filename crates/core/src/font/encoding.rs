@@ -898,4 +898,31 @@ mod tests {
         assert_eq!(symbol_to_char(0xA3), Some('\u{2264}')); // ≤
         assert_eq!(BaseEncoding::Symbol.to_char(0x61), Some('\u{03B1}'));
     }
+
+    #[test]
+    fn base_encoding_to_char_routes_every_variant() {
+        // WinAnsi / MacRoman / Standard all reachable through to_char().
+        assert_eq!(BaseEncoding::WinAnsi.to_char(b'A'), Some('A'));
+        assert_eq!(BaseEncoding::MacRoman.to_char(0x88), Some('à'));
+        assert_eq!(BaseEncoding::Standard.to_char(b'A'), Some('A'));
+        assert_eq!(BaseEncoding::Standard.to_char(0x27), Some('\u{2019}'));
+    }
+
+    #[test]
+    fn standard_encoding_undefined_code_is_none() {
+        // A control code that is neither a STANDARD_PAIR nor printable ASCII.
+        assert_eq!(standard_encoding_to_char(0x01), None);
+        assert_eq!(standard_encoding_to_char(0x80), None);
+    }
+
+    #[test]
+    fn glyph_index_name_resolves_to_real_agl_then_unicode() {
+        // `gNN` maps to a Mac-glyph-order name that differs from the input, so
+        // glyph_name_to_unicode recurses into the resolved real name (the
+        // `real != name` branch).
+        assert_eq!(glyph_index_name("g106"), Some("agrave"));
+        assert_eq!(glyph_name_to_unicode("g106").as_deref(), Some("à"));
+        // A direct (non-gNN) name returns None from glyph_index_name.
+        assert_eq!(glyph_index_name("agrave"), None);
+    }
 }

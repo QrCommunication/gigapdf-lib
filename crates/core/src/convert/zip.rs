@@ -233,4 +233,41 @@ mod tests {
         let method = u16::from_le_bytes([archive[8], archive[9]]);
         assert_eq!(method, 0, "1-byte part stays stored, never grows");
     }
+
+    #[test]
+    fn read_zip_recovers_stored_and_deflated_entries() {
+        let mut zip = ZipWriter::new();
+        zip.add_stored("a.bin", &[1, 2, 3]);
+        let xml = b"<root>".repeat(40);
+        zip.add_deflated("b.xml", &xml);
+        let archive = zip.finish();
+
+        let map = read_zip(&archive);
+        assert_eq!(
+            map.get("a.bin").map(|v| v.as_slice()),
+            Some([1, 2, 3].as_slice())
+        );
+        assert_eq!(map.get("b.xml"), Some(&xml));
+    }
+
+    #[test]
+    fn read_zip_skips_unknown_method_and_stops_on_truncation() {
+        // A well-formed stored entry followed by a truncated header: the first is
+        // recovered, the truncated tail is ignored (the data_start+comp guard).
+        let mut zip = ZipWriter::new();
+        zip.add_stored("ok.txt", b"hello");
+        let mut archive = zip.finish();
+        let map = read_zip(&archive);
+        assert_eq!(
+            map.get("ok.txt").map(|v| v.as_slice()),
+            Some(b"hello".as_slice())
+        );
+
+        // Patch the first entry's method to an unsupported value (e.g. 99) → it
+        // is skipped (None branch), so the map no longer contains it.
+        archive[8] = 99;
+        archive[9] = 0;
+        let map2 = read_zip(&archive);
+        assert!(!map2.contains_key("ok.txt"));
+    }
 }

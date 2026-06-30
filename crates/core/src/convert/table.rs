@@ -159,4 +159,23 @@ mod tests {
     fn empty_input_yields_empty_grid() {
         assert!(reconstruct(&[]).is_empty());
     }
+
+    #[test]
+    fn median_empty_returns_fallback() {
+        // The fallback arm is only reachable directly (reconstruct never calls
+        // median with an empty slice on a non-empty page).
+        assert_eq!(median(&mut [], 42.0), 42.0);
+        // Odd and even counts pick the middle / average-of-two.
+        assert_eq!(median(&mut [3.0, 1.0, 2.0], 0.0), 2.0);
+        assert_eq!(median(&mut [4.0, 2.0], 0.0), 3.0);
+    }
+
+    #[test]
+    fn multiple_runs_in_one_cell_join_with_space() {
+        // Two runs at the same position land in the same cell → joined by space.
+        let texts = vec![cell("Hello", 50.0, 100.0), cell("World", 50.0, 100.0)];
+        let grid = reconstruct(&texts);
+        assert_eq!(grid.len(), 1);
+        assert_eq!(grid[0][0], "Hello World");
+    }
 }
