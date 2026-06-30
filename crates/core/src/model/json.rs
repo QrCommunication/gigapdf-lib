@@ -3103,4 +3103,140 @@ mod tests {
         assert!(base64_decode("====").is_none(), "too much padding");
         assert!(base64_decode("a@==").is_none(), "illegal char");
     }
+
+    #[test]
+    fn tag_converters_round_trip_and_reject_unknown() {
+        // align
+        for a in [Align::Left, Align::Center, Align::Right, Align::Justify] {
+            assert_eq!(parse_align(align_tag(a)), Some(a));
+        }
+        assert!(parse_align("diagonal").is_none());
+        // valign
+        for v in [VAlign::Baseline, VAlign::Super, VAlign::Sub] {
+            assert_eq!(parse_valign(valign_tag(v)), Some(v));
+        }
+        assert!(parse_valign("middle").is_none());
+        // cell valign
+        for v in [CellVAlign::Top, CellVAlign::Middle, CellVAlign::Bottom] {
+            assert_eq!(parse_cell_valign(cell_valign_tag(v)), Some(v));
+        }
+        assert!(parse_cell_valign("baseline").is_none());
+        // generic
+        for g in [Generic::Sans, Generic::Serif, Generic::Mono] {
+            assert_eq!(parse_generic(generic_tag(g)), Some(g));
+        }
+        assert!(parse_generic("cursive").is_none());
+    }
+
+    #[test]
+    fn json_str_escapes_control_and_specials() {
+        let mut out = String::new();
+        json_str("a\"b\\c\n\t\r\u{0008}\u{000C}\u{0001}", &mut out);
+        // Quotes, backslash, and the named/short escapes appear.
+        assert!(out.contains("\\\""));
+        assert!(out.contains("\\\\"));
+        assert!(out.contains("\\n"));
+        assert!(out.contains("\\t"));
+        assert!(out.contains("\\u0001"), "control char as \\u escape");
+    }
+
+    #[test]
+    fn round_trip_covers_extra_block_and_inline_variants() {
+        let mk_run = |t: &str| {
+            Inline::Run(InlineRun {
+                text: t.to_string(),
+                style: CharStyle {
+                    generic: Generic::Mono,
+                    vertical_align: VAlign::Sub,
+                    ..CharStyle::default()
+                },
+                source_index: None,
+            })
+        };
+        let blocks = vec![
+            Block {
+                id: BlockId(0),
+                frame: None,
+                rotation: crate::model::Rotation::D0,
+                kind: BlockKind::CodeBlock(crate::model::CodeBlock {
+                    lang: Some("rust".to_string()),
+                    code: "let x = 1;\n".to_string(),
+                }),
+            },
+            Block {
+                id: BlockId(1),
+                frame: None,
+                rotation: crate::model::Rotation::D0,
+                kind: BlockKind::Blockquote(crate::model::Blockquote {
+                    blocks: vec![Block {
+                        id: BlockId(2),
+                        frame: None,
+                        rotation: crate::model::Rotation::D0,
+                        kind: BlockKind::Paragraph(Paragraph {
+                            runs: vec![mk_run("quoted")],
+                            ..Paragraph::default()
+                        }),
+                    }],
+                }),
+            },
+            Block {
+                id: BlockId(3),
+                frame: None,
+                rotation: crate::model::Rotation::D0,
+                kind: BlockKind::HorizontalRule,
+            },
+            Block {
+                id: BlockId(4),
+                frame: None,
+                rotation: crate::model::Rotation::D0,
+                kind: BlockKind::Paragraph(Paragraph {
+                    style: ParagraphStyle {
+                        align: Align::Justify,
+                        ..ParagraphStyle::default()
+                    },
+                    runs: vec![Inline::Link {
+                        href: LinkTarget::Url("https://example.com".to_string()),
+                        children: vec![mk_run("link")],
+                    }],
+                    ..Paragraph::default()
+                }),
+            },
+        ];
+        let doc = Document {
+            sections: vec![Section {
+                geometry: PageGeometry::a4(),
+                pages: vec![Page {
+                    blocks,
+                    absolute: false,
+                }],
+                ..Section::default()
+            }],
+            ..Document::default()
+        };
+        let back = Document::from_json(&doc.to_json()).expect("round-trips");
+        assert_eq!(doc, back);
+    }
+
+    #[test]
+    fn block_json_round_trips_single_block() {
+        let block = Block {
+            id: BlockId(7),
+            frame: Some(Rect::new(10.0, 20.0, 100.0, 40.0)),
+            rotation: crate::model::Rotation::D90,
+            kind: BlockKind::Paragraph(Paragraph {
+                runs: vec![Inline::Run(InlineRun {
+                    text: "solo".to_string(),
+                    style: CharStyle::default(),
+                    source_index: None,
+                })],
+                ..Paragraph::default()
+            }),
+        };
+        let json = block_to_json(&block);
+        let back = block_from_json(&json).expect("block round-trips");
+        assert_eq!(block, back);
+        // Malformed block JSON is rejected.
+        assert!(block_from_json("{}").is_none());
+        assert!(block_from_json(&format!("{json} junk")).is_none());
+    }
 }
