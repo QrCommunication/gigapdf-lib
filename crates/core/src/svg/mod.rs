@@ -2870,4 +2870,168 @@ mod tests {
             _ => panic!("rect keeps its solid red fill"),
         }
     }
+
+    // ── individual shape geometry ─────────────────────────────────────────────
+
+    #[test]
+    fn ellipse_line_polyline_polygon_each_parse() {
+        let svg = r##"<svg viewBox="0 0 200 200">
+            <ellipse cx="50" cy="50" rx="30" ry="20" fill="#ff0000"/>
+            <line x1="0" y1="0" x2="100" y2="100" stroke="#000000" stroke-width="2" fill="none"/>
+            <polyline points="10,10 20,20 30,10" stroke="#0000ff" fill="none"/>
+            <polygon points="40,40 80,40 60,80" fill="#00ff00"/>
+        </svg>"##;
+        let img = parse_svg(svg).expect("shapes parse");
+        assert_eq!(img.prims.len(), 4, "ellipse + line + polyline + polygon");
+        // The polygon (last) is closed and filled green.
+        match img.prims[3].fill {
+            Some(Fill::Solid(c)) => assert_eq!(c, [0.0, 1.0, 0.0]),
+            _ => panic!("polygon filled green"),
+        }
+        // The line has a stroke but no fill.
+        assert!(img.prims[1].stroke.is_some() && img.prims[1].fill.is_none());
+    }
+
+    #[test]
+    fn rounded_rect_emits_corner_cubics() {
+        let svg = r##"<svg viewBox="0 0 100 100">
+            <rect x="10" y="10" width="60" height="40" rx="8" ry="6" fill="#123456"/>
+        </svg>"##;
+        let img = parse_svg(svg).expect("rounded rect parses");
+        let segs = &img.prims[0].segs;
+        // A rounded rect has four corner cubics (vs a plain rect's zero).
+        let cubics = segs.iter().filter(|s| matches!(s, Seg::Cubic(..))).count();
+        assert_eq!(cubics, 4, "four rounded corners");
+    }
+
+    #[test]
+    fn degenerate_shapes_emit_nothing() {
+        // Zero-size rect, zero-radius ellipse, and a 1-point polyline draw nothing.
+        let svg = r##"<svg viewBox="0 0 50 50">
+            <rect x="0" y="0" width="0" height="20" fill="#ff0000"/>
+            <ellipse cx="10" cy="10" rx="0" ry="5" fill="#ff0000"/>
+            <polyline points="5,5" fill="none" stroke="#000000"/>
+        </svg>"##;
+        assert!(
+            parse_svg(svg).is_none(),
+            "all-degenerate svg yields no drawable prims"
+        );
+    }
+
+    // ── radial gradient + href inheritance ────────────────────────────────────
+
+    #[test]
+    fn radial_gradient_resolves_on_fill() {
+        let svg = r##"<svg viewBox="0 0 100 100"><defs>
+            <radialGradient id="r" cx="0.5" cy="0.5" r="0.5">
+                <stop offset="0" stop-color="#ffffff"/>
+                <stop offset="1" stop-color="#000000"/>
+            </radialGradient>
+            </defs><rect x="0" y="0" width="100" height="100" fill="url(#r)"/></svg>"##;
+        let img = parse_svg(svg).expect("parsed");
+        match &img.prims[0].fill {
+            Some(Fill::Gradient(g)) => {
+                assert_eq!(g.stops.len(), 2);
+                assert!(
+                    matches!(g.kind, GradKind::Radial { .. }),
+                    "radial gradient kind"
+                );
+            }
+            _ => panic!("rect should have a radial gradient fill"),
+        }
+    }
+
+    #[test]
+    fn gradient_href_inherits_stops_from_parent() {
+        // The child references the parent's stops via href; geometry on the child.
+        let svg = r##"<svg viewBox="0 0 100 100"><defs>
+            <linearGradient id="base"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient>
+            <linearGradient id="child" href="#base" x1="0" y1="0" x2="1" y2="0"/>
+            </defs><rect x="0" y="0" width="100" height="50" fill="url(#child)"/></svg>"##;
+        let img = parse_svg(svg).expect("parsed");
+        match &img.prims[0].fill {
+            Some(Fill::Gradient(g)) => assert_eq!(g.stops.len(), 2, "stops inherited via href"),
+            _ => panic!("child gradient inherits parent's stops"),
+        }
+    }
+
+    // ── presentation styling: opacity + inline style ──────────────────────────
+
+    #[test]
+    fn inline_style_overrides_and_opacity_multiplies() {
+        let svg = r##"<svg viewBox="0 0 50 50">
+            <rect x="0" y="0" width="40" height="40" style="fill:#00ff00;fill-opacity:0.5"/>
+        </svg>"##;
+        let img = parse_svg(svg).expect("styled rect parses");
+        match img.prims[0].fill {
+            Some(Fill::Solid(c)) => assert_eq!(c, [0.0, 1.0, 0.0], "inline style sets fill green"),
+            _ => panic!("inline style fill applied"),
+        }
+        assert!(
+            (img.prims[0].fill_opacity - 0.5).abs() < 1e-6,
+            "fill-opacity from inline style"
+        );
+    }
+
+    // ── pure helper units ─────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_text_collapses_whitespace() {
+        assert_eq!(normalize_text("  a \t b\n c  "), " a b c ");
+        assert_eq!(normalize_text("solid"), "solid");
+        assert_eq!(normalize_text(""), "");
+    }
+
+    #[test]
+    fn parse_grad_coord_percent_and_length() {
+        assert_eq!(parse_grad_coord("50%"), Some(0.5));
+        assert_eq!(parse_grad_coord("  100% "), Some(1.0));
+        assert_eq!(parse_grad_coord("0.25"), Some(0.25));
+        assert_eq!(parse_grad_coord("nonsense"), None);
+    }
+
+    #[test]
+    fn units_is_obb_keyword_resolution() {
+        assert!(units_is_obb(Some("objectBoundingBox"), false));
+        assert!(!units_is_obb(Some("userSpaceOnUse"), true));
+        assert!(units_is_obb(Some("OBJECTBOUNDINGBOX"), false)); // case-insensitive
+        assert!(units_is_obb(None, true)); // default kept
+        assert!(!units_is_obb(Some("weird"), false)); // default kept
+    }
+
+    #[test]
+    fn is_convex_distinguishes_convex_from_concave() {
+        // A square is convex.
+        let square = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        assert!(is_convex(&square));
+        // An arrow/chevron (one reflex vertex) is concave.
+        let chevron = [(0.0, 0.0), (2.0, 1.0), (0.0, 2.0), (1.0, 1.0)];
+        assert!(!is_convex(&chevron));
+        // Fewer than 3 points is never convex.
+        assert!(!is_convex(&[(0.0, 0.0), (1.0, 1.0)]));
+    }
+
+    #[test]
+    fn text_anchor_and_font_size_from_attr_and_style() {
+        let nodes = crate::html::dom::parse(
+            r##"<svg><text text-anchor="middle" font-size="24">x</text>
+                <text style="text-anchor:end;font-size:10">y</text>
+                <text>z</text></svg>"##,
+        );
+        let svg = find_svg(&nodes).expect("svg root");
+        let texts: Vec<&Element> = svg
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                Node::Element(e) if e.tag == "text" => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(anchor_of(texts[0]), Anchor::Middle));
+        assert_eq!(font_size_of(texts[0], 12.0), 24.0);
+        assert!(matches!(anchor_of(texts[1]), Anchor::End));
+        assert_eq!(font_size_of(texts[1], 12.0), 10.0);
+        assert!(matches!(anchor_of(texts[2]), Anchor::Start));
+        assert_eq!(font_size_of(texts[2], 12.0), 12.0, "inherited fallback");
+    }
 }
