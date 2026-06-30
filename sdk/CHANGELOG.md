@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — bidirectional conversion symmetry: model importers for RTF, TXT and images
+
+- New engine methods `rtfToModel(rtf)`, `txtToModel(text)` and
+  `imageToModel(image)` complete the **lower-any-format-into-the-model** matrix.
+  The core already exposed `rtf_to_model` / `txt_to_model` / `image_to_model`,
+  but they had **no WASM/SDK binding** — so `modelToRtf` could write RTF yet
+  nothing could read RTF *into* the model, and likewise for plain text and raster
+  images. The three new FFI entry points (`gp_model_from_rtf` /
+  `gp_model_from_txt` / `gp_model_from_image`) and their TypeScript wrappers close
+  that asymmetry, matching the existing `officeToModel` / `htmlToModel` /
+  `mdToModel` / `csvToModel`. `imageToModel` returns `null` on non-image bytes;
+  `rtfToModel` routes through the rich RTF parser (run styling, tables, `\pict`
+  images, `\field` links).
+- Tests: `test/model_import.test.ts` — 7 round-trip cases through the production
+  WASM (`txtToModel`→`modelToPdf`, `rtfToModel`→`modelToRtf`,
+  `imageToModel`→`modelToPdf`, plus the non-image `null` guard).
+
 ## [0.109.1] - 2026-06-30
 
 ### Fixed — image-format documentation accuracy

@@ -889,6 +889,40 @@ export class GigaPdfEngine {
   }
 
   /**
+   * Lower an RTF string into the unified {@link GigaDocument} model. Routed
+   * through the rich RTF parser, so run-level styling (bold/italic/underline/
+   * strike, colour, size, family), tables, `\pict` images and `\field`
+   * hyperlinks are recovered — the inverse of {@link modelToRtf}.
+   */
+  rtfToModel(rtf: string): GigaDocument {
+    return this._withStr(rtf, (p, l) =>
+      JSON.parse(this._str((o) => this.ex.gp_model_from_rtf(p, l, o)))
+    ) as GigaDocument;
+  }
+
+  /**
+   * Lower a plain-text string into the unified {@link GigaDocument} model: one
+   * paragraph per line (blank lines kept as empty paragraphs).
+   */
+  txtToModel(text: string): GigaDocument {
+    return this._withStr(text, (p, l) =>
+      JSON.parse(this._str((o) => this.ex.gp_model_from_txt(p, l, o)))
+    ) as GigaDocument;
+  }
+
+  /**
+   * Lower a raster image (PNG/JPEG/GIF/WebP, auto-detected) into the unified
+   * {@link GigaDocument} model — a single full-page picture block sized to the
+   * image's own aspect ratio, with the bytes interned in the model's resource
+   * table. Returns `null` if the bytes aren't a recognized image.
+   */
+  imageToModel(image: Uint8Array): GigaDocument | null {
+    return this._withBytes(image, (p, l) =>
+      this._modelOrNull((o) => this.ex.gp_model_from_image(p, l, o))
+    );
+  }
+
+  /**
    * Apply a batch of {@link ModelOp} edits to a model and return the edited
    * model. Ops run in order; out-of-range addresses (and any op that can't be
    * parsed) are silently skipped, so a partially-valid batch never throws.

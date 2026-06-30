@@ -13,7 +13,7 @@ Everything routes through one **unified editable model** (`Giga*` block types �
 headings, paragraphs/runs, lists, tables, sheets, slides, shapes, images, links):
 
 ```
-import:   file ──►  model        (officeToModel, htmlToModel, csv/md/rtf)
+import:   file ──►  model        (officeToModel, htmlToModel, mdToModel, csvToModel, rtfToModel, txtToModel, imageToModel)
 export:   model ──► file         (modelToDocx / …Xlsx / …Pptx / …Odt / …Html / …Md / …Csv / …Epub / …Rtf)
 PDF → X:  PDF ──► model ──► file  (pdf.toDocx() etc. — reconstruct, then export)
 ```

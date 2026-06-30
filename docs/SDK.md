@@ -91,8 +91,9 @@ try {
 | `runInlineScripts(html)` | `string` | Execute the `<script>`s in an HTML string against a native DOM and return the mutated HTML (the render paths do this automatically). |
 | `pageSize(name)` | `{ w, h } \| null` | Look up a named page size (`"A4"`, `"a3-landscape"`, `"letter"`, …) in points; `null` if unknown. |
 
-The unified-model lowering helpers (`officeToModel`, `htmlToModel`,
-`applyModelOps`, `modelTo*`) also live on `GigaPdfEngine` — see
+The unified-model lowering helpers (`officeToModel`, `htmlToModel`, `mdToModel`,
+`csvToModel`, `rtfToModel`, `txtToModel`, `imageToModel`, `applyModelOps`,
+`modelTo*`) also live on `GigaPdfEngine` — see
 [The unified editable model](#the-unified-editable-model).
 
 ---
@@ -429,6 +430,9 @@ for a universal editor that edits every format the same way. See the
 | `htmlToModel(html)` | `GigaPdfEngine` | `GigaDocument` | Lower an HTML string into the model. |
 | `mdToModel(md)` | `GigaPdfEngine` | `GigaDocument` | Lower a Markdown string (GFM: headings, lists + task-lists, tables, fenced code, emphasis/strikethrough, links + reference/footnote links, images, setext, inline HTML) into the model. |
 | `csvToModel(csv)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower a CSV file (UTF-8 bytes, RFC 4180, auto `,`/`;`/tab/`\|` delimiter) into the model as a typed sheet (cells inferred as number/bool/date; ambiguous tokens like ZIP/phone stay text); `null` if no parseable fields. |
+| `rtfToModel(rtf)` | `GigaPdfEngine` | `GigaDocument` | Lower an RTF string into the model via the rich parser (run styling, tables, `\pict` images, `\field` links) — the inverse of `modelToRtf`. |
+| `txtToModel(text)` | `GigaPdfEngine` | `GigaDocument` | Lower a plain-text string into the model: one paragraph per line (blank lines kept). |
+| `imageToModel(image)` | `GigaPdfEngine` | `GigaDocument \| null` | Lower a raster image (PNG/JPEG/GIF/WebP, auto-detected) into the model as a single full-page picture block, bytes interned in the resource table; `null` if not a recognised image. |
 | `applyModelOps(model, ops)` | `GigaPdfEngine` | `GigaDocument` | Apply a batch of [`ModelOp`](#types) edits (run in order; out-of-range addresses are no-ops, so a partial batch never throws). |
 | `modelToDocx / modelToXlsx / modelToPptx / modelToOdt / modelToOds / modelToOdp / modelToPdf / modelToEpub(model)` | `GigaPdfEngine` | `Uint8Array` | Raise the model to each binary target (`modelToEpub` emits an `.epub` e-book). |
 | `modelToHtml / modelToRtf / modelToMarkdown / modelToCsv(model)` | `GigaPdfEngine` | `string` | Raise the model to HTML / RTF / Markdown / CSV text. |

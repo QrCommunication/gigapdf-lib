@@ -1872,7 +1872,8 @@ doc.close();
 
 The **unified model** ([`GigaDocument`](SDK.md#the-unified-editable-model)) is a
 format-neutral tree (sections → pages → blocks → runs). Lower *any* format into
-it (`toModel` / `officeToModel` / `htmlToModel`), edit it with structured ops
+it (`toModel` / `officeToModel` / `htmlToModel` / `mdToModel` / `csvToModel` /
+`rtfToModel` / `txtToModel` / `imageToModel`), edit it with structured ops
 (`applyModelOps`), then raise it to *any* format (`modelTo{Docx,Xlsx,Pptx,Odt,Ods,Odp,Pdf,Html,Rtf}`).
 This is the substrate for editing every format the same way.
 
@@ -1906,6 +1907,11 @@ Lower from other sources too:
 ```ts
 const fromOffice = giga.officeToModel(officeBytes); // null if not an Office container
 const fromHtml   = giga.htmlToModel("<h1>Hi</h1><p>Body</p>");
+const fromMd     = giga.mdToModel("# Hi\n\nBody");
+const fromCsv    = giga.csvToModel(csvBytes);        // null if no parseable fields
+const fromRtf    = giga.rtfToModel("{\\rtf1\\ansi Hi.\\par}");
+const fromTxt    = giga.txtToModel("line 1\nline 2");
+const fromImage  = giga.imageToModel(pngBytes);      // null if not a recognised image
 // …then applyModelOps + modelTo* exactly as above.
 ```
 

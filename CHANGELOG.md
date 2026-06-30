@@ -9,6 +9,18 @@ The per-release SDK detail also lives in [`sdk/CHANGELOG.md`](sdk/CHANGELOG.md).
 
 ## [Unreleased]
 
+### Added — bidirectional conversion symmetry: model importers for RTF, TXT and images
+
+- WASM FFI: `gp_model_from_rtf`, `gp_model_from_txt`, `gp_model_from_image` —
+  exposing the already-existing core importers `convert::{rtf_to_model,
+  txt_to_model, image_to_model}` to hosts. Previously only
+  `office`/`html`/`md`/`csv` had a `gp_model_from_*` binding, so the model could
+  be *raised* to RTF (`modelToRtf`) but never *lowered* from RTF, TXT or a raster
+  image — an asymmetry in the "lower any format into the unified model" matrix.
+  SDK methods `rtfToModel` / `txtToModel` / `imageToModel` wrap them. No core
+  behaviour change (the importers were already present and tested); this is the
+  missing binding + SDK surface.
+
 ## [0.109.0] - 2026-06-30
 
 This release closes the remaining **1:1 import/export fidelity gaps** across the

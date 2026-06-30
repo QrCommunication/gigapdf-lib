@@ -4241,6 +4241,43 @@ pub extern "C" fn gp_model_from_csv(ptr: *const u8, len: usize, out_len: *mut us
     }
 }
 
+/// Lower an RTF string at `(ptr, len)` into the unified model, returned as JSON.
+/// Routed through the rich RTF parser, so run-level styling (bold/italic/
+/// underline/strike, colour, size, family), tables, `\pict` images and `\field`
+/// hyperlinks are recovered — the model-producing counterpart of
+/// [`gp_model_to_rtf`].
+#[no_mangle]
+pub extern "C" fn gp_model_from_rtf(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let rtf = unsafe { str_arg(ptr, len) };
+    let model = gigapdf_core::convert::rtf_to_model(rtf);
+    unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) }
+}
+
+/// Lower a plain-text string at `(ptr, len)` into the unified model, returned as
+/// JSON: one paragraph per line (blank lines kept as empty paragraphs).
+#[no_mangle]
+pub extern "C" fn gp_model_from_txt(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    let text = unsafe { str_arg(ptr, len) };
+    let model = gigapdf_core::convert::txt_to_model(text);
+    unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) }
+}
+
+/// Lower a raster image buffer at `(ptr, len)` (PNG/JPEG/GIF/WebP, auto-detected)
+/// into the unified model, returned as JSON — a single full-page picture block
+/// sized to the image's own aspect ratio, with the bytes interned in the model's
+/// resource table. Null on input that is not a recognized image.
+#[no_mangle]
+pub extern "C" fn gp_model_from_image(ptr: *const u8, len: usize, out_len: *mut usize) -> *mut u8 {
+    if ptr.is_null() || len == 0 {
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    match gigapdf_core::convert::image_to_model(bytes) {
+        Some(model) => unsafe { bytes_into_host(model.to_json().into_bytes(), out_len) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Apply a batch of edit ops to a model. `(model_ptr, model_len)` is the model
 /// JSON, `(ops_ptr, ops_len)` is a JSON array of ops (see `model::edit`).
 /// Returns the edited model as JSON. Null when the model JSON is malformed.
