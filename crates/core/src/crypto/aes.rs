@@ -100,4 +100,14 @@ mod tests {
         ];
         assert_eq!(ct, expected);
     }
+
+    #[test]
+    fn invalid_key_length_yields_empty() {
+        // 24-byte (AES-192) key is unsupported here → the `_ => false` arm runs
+        // and both directions return an empty Vec.
+        let iv = [0u8; 16];
+        let data = [0u8; 16];
+        assert!(aes_cbc_encrypt(&[0u8; 24], &iv, &data).is_empty());
+        assert!(aes_cbc_decrypt(&[0u8; 24], &iv, &data).is_empty());
+    }
 }

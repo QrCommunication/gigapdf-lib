@@ -154,4 +154,12 @@ mod tests {
         // Inconsistent components fail gracefully.
         assert!(RsaPrivateKey::from_components(&[0], &[0], &[0]).is_none());
     }
+
+    #[test]
+    fn generate_with_unusable_bit_size_returns_none() {
+        // 0-bit modulus is impossible → RustCrypto keygen errors and the
+        // `.ok()?` short-circuits to None (the `Err` path of `generate`).
+        let rand: Vec<u8> = (0..64).map(|i| (i * 7 + 1) as u8).collect();
+        assert!(RsaPrivateKey::generate(0, &rand).is_none());
+    }
 }

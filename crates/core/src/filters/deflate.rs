@@ -297,4 +297,14 @@ mod tests {
         let data: Vec<u8> = (0..2000).map(|i| (i * 31 + 7) as u8).collect();
         assert_eq!(flate_decode(&flate_encode(&data)).unwrap(), data);
     }
+
+    #[test]
+    fn write_bits_full_word_mask() {
+        // count == 32 takes the `u32::MAX` mask branch (the `count >= 32` guard);
+        // writing 32 bits then flushing yields exactly the 4 little-endian bytes.
+        let mut bw = BitWriter::new();
+        bw.write_bits(0xDEAD_BEEF, 32);
+        let out = bw.finish();
+        assert_eq!(out, vec![0xEF, 0xBE, 0xAD, 0xDE]);
+    }
 }

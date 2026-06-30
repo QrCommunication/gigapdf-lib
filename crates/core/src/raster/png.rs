@@ -131,4 +131,18 @@ mod tests {
         assert_eq!(raw[9], 0);
         assert_eq!(&raw[10..18], &rgba[8..16]);
     }
+
+    #[test]
+    fn encode_empty_image_emits_valid_png() {
+        // A zero-height image produces empty filtered scanlines, so `zlib_stored`
+        // takes its `data.is_empty()` branch (one empty final stored block).
+        let png = encode_png(0, 0, &[]);
+        // Still a spec-valid PNG: signature + IDAT chunk present.
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        assert!(png.windows(4).any(|w| w == b"IDAT"));
+        assert!(png.windows(4).any(|w| w == b"IEND"));
+    }
 }

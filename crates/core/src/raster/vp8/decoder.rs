@@ -1006,4 +1006,303 @@ mod tests {
         // deblocking loop filter §15).
         assert_eq!(maxdiff, 0, "VP8 decode must match ffmpeg YUV bit-exact");
     }
+
+    // ── direct intra-predictor unit tests ──────────────────────────────────────
+    // These exercise every 4×4 sub-block predictor and the whole-block predictor
+    // in isolation, with a hand-built border region, checking the produced pixels
+    // against the RFC 6386 reference formulas. The end-to-end ffmpeg test above
+    // only happens to hit a subset of modes for its particular frame.
+
+    // Reference implementations of the averaging filters (mirror predict.rs).
+    fn r_avg3(a: i32, b: i32, c: i32) -> u8 {
+        ((a + 2 * b + c + 2) >> 2) as u8
+    }
+    fn r_avg2(a: i32, b: i32) -> u8 {
+        ((a + b + 1) >> 1) as u8
+    }
+
+    // Build a plane large enough for one 4×4 block at index `p` with a full
+    // border: stride S=24, block at row 4, col 4 → p = 4*S + 4.
+    const TS: usize = 24;
+    const TP: usize = 4 * TS + 4;
+
+    // Seed deterministic, distinct border values so wrong indexing is caught.
+    // above[-1..7] live at p - s + (-1..7); left[0..3] at p + k*s - 1;
+    // corner at p - s - 1.
+    fn seeded_plane() -> Vec<u8> {
+        let mut buf = vec![0u8; TS * TS];
+        // corner
+        buf[TP - TS - 1] = 100;
+        // above row indices -1..=7 (note -1 == corner, set again for clarity)
+        let above = [100, 10, 20, 30, 40, 50, 60, 70, 80]; // k = -1,0,1,2,3,4,5,6,7
+        for (idx, &v) in above.iter().enumerate() {
+            // idx 0 → k=-1 → p-s-1 ; idx 1 → k=0 → p-s ; etc.
+            buf[TP - TS - 1 + idx] = v;
+        }
+        // left column rows 0..3 at p + k*s - 1
+        let left = [200, 190, 180, 170];
+        for (k, &v) in left.iter().enumerate() {
+            buf[TP + k * TS - 1] = v;
+        }
+        buf
+    }
+
+    fn block4(buf: &[u8]) -> [[u8; 4]; 4] {
+        let mut g = [[0u8; 4]; 4];
+        for (r, row) in g.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell = buf[TP + r * TS + c];
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn pred4_ve_matches_reference() {
+        let mut buf = seeded_plane();
+        pred4_ve(&mut buf, TP, TS);
+        // a(k) = above[k], k=-1..4 → 100,10,20,30,40,50
+        let expect_row = [
+            r_avg3(100, 10, 20),
+            r_avg3(10, 20, 30),
+            r_avg3(20, 30, 40),
+            r_avg3(30, 40, 50),
+        ];
+        let g = block4(&buf);
+        for (r, row) in g.iter().enumerate() {
+            assert_eq!(
+                *row, expect_row,
+                "VE row {r} must be vertical-filtered above"
+            );
+        }
+    }
+
+    #[test]
+    fn pred4_he_matches_reference() {
+        let mut buf = seeded_plane();
+        pred4_he(&mut buf, TP, TS);
+        // corner=100, left=200,190,180,170
+        let rows = [
+            r_avg3(100, 200, 190),
+            r_avg3(200, 190, 180),
+            r_avg3(190, 180, 170),
+            r_avg3(180, 170, 170),
+        ];
+        let g = block4(&buf);
+        for r in 0..4 {
+            assert_eq!(g[r], [rows[r]; 4], "HE row {r} constant = filtered left");
+        }
+    }
+
+    #[test]
+    fn pred4_ld_matches_reference() {
+        let mut buf = seeded_plane();
+        pred4_ld(&mut buf, TP, TS);
+        // a(0..7) = 10,20,30,40,50,60,70,80
+        let pr = [
+            r_avg3(10, 20, 30),
+            r_avg3(20, 30, 40),
+            r_avg3(30, 40, 50),
+            r_avg3(40, 50, 60),
+            r_avg3(50, 60, 70),
+            r_avg3(60, 70, 80),
+            r_avg3(70, 80, 80),
+        ];
+        let g = block4(&buf);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(g[r][c], pr[r + c], "LD[{r}][{c}] diagonal");
+            }
+        }
+    }
+
+    #[test]
+    fn pred4_rd_matches_reference() {
+        let mut buf = seeded_plane();
+        pred4_rd(&mut buf, TP, TS);
+        // l(3..0)=170,180,190,200 ; a(-1..3)=100,10,20,30
+        let d = [
+            r_avg3(170, 180, 190),
+            r_avg3(180, 190, 200),
+            r_avg3(190, 200, 100),
+            r_avg3(200, 100, 10),
+            r_avg3(100, 10, 20),
+            r_avg3(10, 20, 30),
+            r_avg3(20, 30, 40),
+        ];
+        let g = block4(&buf);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(g[r][c], d[3 - r + c], "RD[{r}][{c}]");
+            }
+        }
+    }
+
+    #[test]
+    fn pred4_vr_vl_hd_hu_are_deterministic_and_in_range() {
+        // These four write via write4; verify they run, mutate the block, and
+        // stay within the writable region (no panic ⇒ indices valid).
+        for f in [
+            pred4_vr as fn(&mut [u8], usize, usize),
+            pred4_vl,
+            pred4_hd,
+            pred4_hu,
+        ] {
+            let mut buf = seeded_plane();
+            f(&mut buf, TP, TS);
+            // at least one cell must be non-zero (border was non-zero)
+            let g = block4(&buf);
+            assert!(g.iter().flatten().any(|&v| v != 0));
+            // pixels outside the 4×4 block must remain untouched at a far cell
+            assert_eq!(buf[TP + 6 * TS + 6], 0);
+        }
+    }
+
+    #[test]
+    fn pred4_vr_first_row_matches_reference() {
+        let mut buf = seeded_plane();
+        pred4_vr(&mut buf, TP, TS);
+        let g = block4(&buf);
+        // row 0 = avg2(a(-1),a(0)), avg2(a(0),a(1)), avg2(a(1),a(2)), avg2(a(2),a(3))
+        assert_eq!(
+            g[0],
+            [
+                r_avg2(100, 10),
+                r_avg2(10, 20),
+                r_avg2(20, 30),
+                r_avg2(30, 40)
+            ]
+        );
+    }
+
+    #[test]
+    fn pred4_vl_first_row_matches_reference() {
+        let mut buf = seeded_plane();
+        pred4_vl(&mut buf, TP, TS);
+        let g = block4(&buf);
+        assert_eq!(
+            g[0],
+            [
+                r_avg2(10, 20),
+                r_avg2(20, 30),
+                r_avg2(30, 40),
+                r_avg2(40, 50)
+            ]
+        );
+    }
+
+    #[test]
+    fn pred4_hu_last_row_is_l3() {
+        let mut buf = seeded_plane();
+        pred4_hu(&mut buf, TP, TS);
+        let g = block4(&buf);
+        // bottom row is all l(3) = 170
+        assert_eq!(g[3], [170u8; 4]);
+    }
+
+    #[test]
+    fn pred4_hd_first_cell_matches_reference() {
+        let mut buf = seeded_plane();
+        pred4_hd(&mut buf, TP, TS);
+        let g = block4(&buf);
+        // p0 = avg2(l(0), a(-1)) = avg2(200,100)
+        assert_eq!(g[0][0], r_avg2(200, 100));
+    }
+
+    #[test]
+    fn predict_block_v_h_tm_dc() {
+        // V_PRED copies the above row across all rows.
+        let mut buf = seeded_plane();
+        predict_block(&mut buf, TP, TS, 4, V_PRED);
+        let g = block4(&buf);
+        for (r, row) in g.iter().enumerate() {
+            assert_eq!(*row, [10, 20, 30, 40], "V_PRED row {r}");
+        }
+        // H_PRED replicates each left pixel across its row.
+        let mut buf = seeded_plane();
+        predict_block(&mut buf, TP, TS, 4, H_PRED);
+        let g = block4(&buf);
+        assert_eq!(g[0], [200; 4]);
+        assert_eq!(g[1], [190; 4]);
+        assert_eq!(g[2], [180; 4]);
+        assert_eq!(g[3], [170; 4]);
+        // TM_PRED = clamp(left + above - corner).
+        let mut buf = seeded_plane();
+        predict_block(&mut buf, TP, TS, 4, TM_PRED);
+        let g = block4(&buf);
+        // row0 col0 = clamp(200 + 10 - 100) = 110
+        assert_eq!(g[0][0], 110);
+        // DC_PRED 4×4: dc = sum(left)+sum(above[0..3]) then (dc+4)>>3.
+        let mut buf = seeded_plane();
+        predict_block(&mut buf, TP, TS, 4, DC_PRED);
+        let g = block4(&buf);
+        let dc = 200 + 190 + 180 + 170 + 10 + 20 + 30 + 40;
+        let dcv = ((dc + 4) >> 3) as u8;
+        for (r, row) in g.iter().enumerate() {
+            assert_eq!(*row, [dcv; 4], "DC row {r}");
+        }
+    }
+
+    #[test]
+    fn predict_block_dc_shift_for_8_and_16() {
+        // shift = 4 for n=8, 5 for n=16. Build a wider border.
+        const S: usize = 40;
+        const P: usize = 4 * S + 4;
+        let mut buf = vec![5u8; S * S];
+        // above row n entries + left col n entries all = 5
+        predict_block(&mut buf, P, S, 8, DC_PRED);
+        // dc = 8*5 (left) + 8*5 (above) = 80 ; (80 + 8) >> 4 = 5
+        assert_eq!(buf[P], 5);
+        let mut buf = vec![5u8; S * S];
+        predict_block(&mut buf, P, S, 16, DC_PRED);
+        // dc = 16*5 + 16*5 = 160 ; (160 + 16) >> 5 = 5
+        assert_eq!(buf[P], 5);
+    }
+
+    #[test]
+    fn fixup_left_dc_and_other() {
+        const S: usize = 24;
+        const P: usize = 4 * S + 4;
+        // DC_PRED with row>0 copies above row into left column.
+        let mut buf = vec![0u8; S * S];
+        for i in 0..4 {
+            buf[P - S + i] = (i as u8 + 1) * 11;
+        }
+        fixup_left(&mut buf, P, S, 4, 1, DC_PRED);
+        for i in 0..4 {
+            assert_eq!(buf[P + i * S - 1], (i as u8 + 1) * 11);
+        }
+        // Non-DC (or row 0): left column incl. corner filled with 129.
+        let mut buf = vec![0u8; S * S];
+        fixup_left(&mut buf, P, S, 4, 0, V_PRED);
+        let start = P - 1 - S;
+        for i in 0..=4 {
+            assert_eq!(buf[start + i * S], 129);
+        }
+    }
+
+    #[test]
+    fn fixup_above_dc_and_other() {
+        const S: usize = 24;
+        const P: usize = 4 * S + 4;
+        // DC_PRED with col>0 copies left column into above row.
+        let mut buf = vec![0u8; S * S];
+        for i in 0..4 {
+            buf[P - 1 + i * S] = (i as u8 + 1) * 7;
+        }
+        fixup_above(&mut buf, P, S, 4, 1, DC_PRED);
+        for i in 0..4 {
+            assert_eq!(buf[P - S + i], (i as u8 + 1) * 7);
+        }
+        // above-right 4px always 127
+        for i in 0..4 {
+            assert_eq!(buf[P - S + 4 + i], 127);
+        }
+        // Non-DC (or col 0): above row incl. corner = 127.
+        let mut buf = vec![0u8; S * S];
+        fixup_above(&mut buf, P, S, 4, 0, V_PRED);
+        for i in 0..=4 {
+            assert_eq!(buf[P - S - 1 + i], 127);
+        }
+    }
 }

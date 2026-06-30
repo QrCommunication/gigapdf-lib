@@ -559,4 +559,72 @@ mod tests {
         merge_overlapping_fragments(&mut lines);
         assert_eq!(lines.len(), 2, "two body lines must stay separate");
     }
+
+    #[test]
+    fn text_skips_an_interleaved_blank_run() {
+        // A line whose runs include a whitespace-only run between two words: the
+        // `t.is_empty()` guard in `text()` must drop it (no double space, no panic).
+        let line = ReconLine {
+            x: 72.0,
+            y: 700.0,
+            w: 120.0,
+            h: 12.0,
+            runs: vec![
+                yat("alpha", 72.0, 700.0, 12.0),
+                yat("   ", 110.0, 700.0, 12.0), // blank → continue
+                yat("beta", 150.0, 700.0, 12.0),
+            ],
+        };
+        // The blank vanishes; the real inter-word gap still yields one space.
+        assert_eq!(line.text(), "alpha beta");
+    }
+
+    #[test]
+    fn fragment_prefers_the_more_overlapping_of_two_kept_lines() {
+        // Two tall, equal-height body lines that do NOT fuse with each other (the
+        // height gate forbids it) both survive into `merged`. A short fragment then
+        // overlaps BOTH — exercising the `best` update branch where a later, higher
+        // ratio replaces the first match. It must fold into the stronger-overlap
+        // line (the lower one here, ratio 1.0 > 0.75).
+        let main_hi = ReconLine {
+            x: 90.0,
+            y: 702.0,
+            w: 48.0,
+            h: 12.0, // extent [702,714], centre 708 (processed first)
+            runs: vec![yat("upper", 90.0, 702.0, 12.0)],
+        };
+        let main_lo = ReconLine {
+            x: 90.0,
+            y: 697.0,
+            w: 48.0,
+            h: 12.0, // extent [697,709], centre 703
+            runs: vec![yat("lower", 90.0, 697.0, 12.0)],
+        };
+        let frag = ReconLine {
+            x: 72.0,
+            y: 701.0,
+            w: 7.0,
+            h: 4.0, // extent [701,705]
+            runs: vec![yat("xx", 72.0, 701.0, 4.0)],
+        };
+        // Sanity: the two body lines are not fragments of each other.
+        assert!(fragment_overlap_ratio(&main_hi, &main_lo).is_none());
+        // Fragment overlaps the upper at 3/4 and the lower at 4/4.
+        let r_hi = fragment_overlap_ratio(&main_hi, &frag).unwrap();
+        let r_lo = fragment_overlap_ratio(&main_lo, &frag).unwrap();
+        assert!(r_lo > r_hi, "lower line must be the stronger match");
+        let mut lines = vec![main_hi, main_lo, frag];
+        merge_overlapping_fragments(&mut lines);
+        // Two survivors: the upper body line and the lower body line with the
+        // fragment folded in.
+        assert_eq!(lines.len(), 2);
+        let with_frag = lines
+            .iter()
+            .find(|l| l.runs.iter().any(|r| r.text == "xx"))
+            .expect("fragment merged into a line");
+        assert!(
+            with_frag.runs.iter().any(|r| r.text == "lower"),
+            "fragment must join the more-overlapping (lower) line"
+        );
+    }
 }
