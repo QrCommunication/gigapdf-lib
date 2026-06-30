@@ -1187,5 +1187,364 @@ mod tests {
             read_uint_base128(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00], 0),
             None
         );
+        // Truncated (fewer bytes than the continuation flags demand).
+        assert_eq!(read_uint_base128(&[0x82], 0), None);
+        // Overflow guard: five continuation bytes whose accumulated value
+        // would exceed 32 bits is rejected.
+        assert_eq!(read_uint_base128(&[0xff, 0xff, 0xff, 0xff, 0x7f], 0), None);
+        // Offset into the slice is honoured.
+        assert_eq!(read_uint_base128(&[0xaa, 0x82, 0x2c], 1), Some((300, 2)));
+    }
+
+    // -- Big-endian readers --------------------------------------------------
+
+    #[test]
+    fn be_readers_bounds() {
+        let b = [0x12, 0x34, 0x56, 0x78];
+        assert_eq!(be16(&b, 0), Some(0x1234));
+        assert_eq!(be16(&b, 2), Some(0x5678));
+        assert_eq!(be16(&b, 3), None); // would read past the end
+        assert_eq!(be32(&b, 0), Some(0x1234_5678));
+        assert_eq!(be32(&b, 1), None);
+        assert_eq!(be16(&[], 0), None);
+        assert_eq!(be32(&[0, 0, 0], 0), None);
+    }
+
+    // -- tag / known-tag constant -------------------------------------------
+
+    #[test]
+    fn tag_packs_four_ascii_bytes() {
+        assert_eq!(tag(b"head"), HEAD_TAG);
+        assert_eq!(tag(b"glyf"), GLYF_TAG);
+        assert_eq!(tag(b"loca"), LOCA_TAG);
+        assert_eq!(tag(b"cmap"), KNOWN_TAGS[0]);
+        // The known-tags table starts with cmap/head/hhea/hmtx.
+        assert_eq!(KNOWN_TAGS[1], HEAD_TAG);
+        assert_eq!(KNOWN_TAGS[3], HMTX_TAG);
+    }
+
+    // -- table_checksum ------------------------------------------------------
+
+    #[test]
+    fn table_checksum_sums_be_words_with_wrap() {
+        // Two aligned big-endian words.
+        let data = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02];
+        assert_eq!(table_checksum(&data), 3);
+        // Empty input → 0.
+        assert_eq!(table_checksum(&[]), 0);
+        // Trailing bytes (unaligned tail) are zero-extended into a final word.
+        // [0xAB] → 0xAB00_0000.
+        assert_eq!(table_checksum(&[0xAB]), 0xAB00_0000);
+        assert_eq!(
+            table_checksum(&[0x00, 0x00, 0x00, 0x01, 0xFF]),
+            1 + 0xFF00_0000
+        );
+        // Wrapping addition overflows cleanly.
+        let big = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x02];
+        assert_eq!(table_checksum(&big), 1); // 0xFFFFFFFF + 2 wraps to 1
+    }
+
+    // -- build_sfnt ----------------------------------------------------------
+
+    #[test]
+    fn build_sfnt_lays_out_sorted_tables_with_head_adjustment() {
+        // A 'head' table (>= 12 bytes so the checkSumAdjustment path runs) and a
+        // 'maxp' table; pass them out of tag order to exercise the sort.
+        let head = vec![0u8; 16];
+        let maxp = vec![1u8, 2, 3, 4, 5]; // 5 bytes → padded to 8
+        let out = build_sfnt(SFNT_TRUETYPE, vec![(MAXP_TAG, maxp), (HEAD_TAG, head)]);
+
+        // Header.
+        assert_eq!(&out[0..4], &SFNT_TRUETYPE.to_be_bytes());
+        assert_eq!(u16::from_be_bytes([out[4], out[5]]), 2, "numTables");
+        // searchRange = max_pow2(2)*16 = 32; entrySelector = log2(2) = 1.
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 32);
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 1);
+        // rangeShift = 2*16 - 32 = 0.
+        assert_eq!(u16::from_be_bytes([out[10], out[11]]), 0);
+
+        // Directory is tag-sorted: head (0x68..) < maxp (0x6D..).
+        assert_eq!(&out[12..16], &HEAD_TAG.to_be_bytes());
+        assert_eq!(&out[28..32], &MAXP_TAG.to_be_bytes());
+
+        // head's checkSumAdjustment was written (offset 8 within the head table).
+        let head_off = u32::from_be_bytes([out[20], out[21], out[22], out[23]]) as usize;
+        let csa = u32::from_be_bytes([
+            out[head_off + 8],
+            out[head_off + 9],
+            out[head_off + 10],
+            out[head_off + 11],
+        ]);
+        // The file checksum with the field zeroed plus the adjustment must equal
+        // the magic 0xB1B0AFBA.
+        let mut zeroed = out.clone();
+        zeroed[head_off + 8..head_off + 12].copy_from_slice(&[0, 0, 0, 0]);
+        let file_sum = table_checksum(&zeroed);
+        assert_eq!(file_sum.wrapping_add(csa), 0xB1B0_AFBA);
+    }
+
+    #[test]
+    fn build_sfnt_single_table_search_params() {
+        let out = build_sfnt(SFNT_TRUETYPE, vec![(MAXP_TAG, vec![0u8; 4])]);
+        assert_eq!(u16::from_be_bytes([out[4], out[5]]), 1, "numTables");
+        // max_pow2 = 1 → searchRange 16, entrySelector 0, rangeShift 0.
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 16);
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 0);
+        assert_eq!(u16::from_be_bytes([out[10], out[11]]), 0);
+    }
+
+    #[test]
+    fn build_sfnt_short_head_skips_adjustment() {
+        // A 'head' table shorter than 12 bytes must not trigger the
+        // checkSumAdjustment write (no panic / out-of-bounds).
+        let out = build_sfnt(SFNT_TRUETYPE, vec![(HEAD_TAG, vec![0u8; 4])]);
+        assert_eq!(u16::from_be_bytes([out[4], out[5]]), 1);
+    }
+
+    // -- 255UInt16 (Stream::read_255_u16) -----------------------------------
+
+    #[test]
+    fn read_255_u16_all_branches() {
+        // Direct one-byte value (< 253).
+        let mut s = Stream::new(&[100]);
+        assert_eq!(s.read_255_u16(), Some(100));
+        // code 253 → next big-endian u16 verbatim.
+        let mut s = Stream::new(&[253, 0x01, 0x02]);
+        assert_eq!(s.read_255_u16(), Some(0x0102));
+        // code 254 → next byte + 506.
+        let mut s = Stream::new(&[254, 10]);
+        assert_eq!(s.read_255_u16(), Some(516));
+        // code 255 → next byte + 253.
+        let mut s = Stream::new(&[255, 10]);
+        assert_eq!(s.read_255_u16(), Some(263));
+        // Truncated: code present but the trailing data is missing.
+        let mut s = Stream::new(&[255]);
+        assert_eq!(s.read_255_u16(), None);
+    }
+
+    #[test]
+    fn stream_primitive_readers() {
+        let mut s = Stream::new(&[0x01, 0x02, 0x03, 0xFF, 0xFE, 0xAA, 0xBB]);
+        assert_eq!(s.u8(), Some(0x01));
+        assert_eq!(s.u16(), Some(0x0203));
+        assert_eq!(s.i16(), Some(-2)); // 0xFFFE
+        assert_eq!(s.bytes(2), Some(&[0xAA, 0xBB][..]));
+        // Exhausted.
+        assert_eq!(s.u8(), None);
+        assert_eq!(s.u16(), None);
+        assert_eq!(s.bytes(1), None);
+        // Overflow on the length arithmetic is handled.
+        let mut s = Stream::new(&[0; 4]);
+        assert_eq!(s.bytes(usize::MAX), None);
+    }
+
+    // -- with_sign -----------------------------------------------------------
+
+    #[test]
+    fn with_sign_uses_low_bit_of_flag() {
+        assert_eq!(with_sign(1, 5), 5); // odd flag → positive
+        assert_eq!(with_sign(3, 5), 5);
+        assert_eq!(with_sign(0, 5), -5); // even flag → negative
+        assert_eq!(with_sign(2, 5), -5);
+        assert_eq!(with_sign(0, 0), 0);
+    }
+
+    // -- compute_bbox / clamp_i16 -------------------------------------------
+
+    #[test]
+    fn compute_bbox_empty_is_zero() {
+        assert_eq!(compute_bbox(&[]), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn compute_bbox_min_max_and_clamp() {
+        let pts = [
+            Point {
+                x: -3,
+                y: 10,
+                on_curve: true,
+            },
+            Point {
+                x: 40,
+                y: -7,
+                on_curve: false,
+            },
+            Point {
+                x: 5,
+                y: 5,
+                on_curve: true,
+            },
+        ];
+        assert_eq!(compute_bbox(&pts), (-3, -7, 40, 10));
+        // Values beyond i16 range are clamped.
+        let huge = [Point {
+            x: 100_000,
+            y: -100_000,
+            on_curve: true,
+        }];
+        assert_eq!(compute_bbox(&huge), (32767, -32768, 32767, -32768));
+    }
+
+    #[test]
+    fn clamp_i16_saturates() {
+        assert_eq!(clamp_i16(0), 0);
+        assert_eq!(clamp_i16(40_000), i16::MAX);
+        assert_eq!(clamp_i16(-40_000), i16::MIN);
+        assert_eq!(clamp_i16(123), 123);
+    }
+
+    // -- bbox bitmap (MSB-first) --------------------------------------------
+
+    #[test]
+    fn bit_set_msb_first_and_bbox_bit_set() {
+        // 0b1000_0001 → bits 0 and 7 set (MSB-first indexing).
+        let bm = [0b1000_0001u8];
+        assert!(bit_set_msb_first(&bm, 0));
+        assert!(!bit_set_msb_first(&bm, 1));
+        assert!(bit_set_msb_first(&bm, 7));
+        // Second byte: 0b0100_0000 → index 9 set.
+        let bm2 = [0x00, 0b0100_0000];
+        assert!(bit_set_msb_first(&bm2, 9));
+        assert!(!bit_set_msb_first(&bm2, 8));
+        // Out-of-range index returns false rather than panicking.
+        assert!(!bit_set_msb_first(&bm, 99));
+        // bbox_bit_set delegates to the same logic.
+        assert!(bbox_bit_set(&bm, 0));
+        assert!(!bbox_bit_set(&bm, 99));
+    }
+
+    // -- build_loca ----------------------------------------------------------
+
+    #[test]
+    fn build_loca_short_and_long_formats() {
+        let offsets = [0u32, 4, 12, 20];
+        // Short format (index_format 0): each offset / 2 as u16.
+        let short = build_loca(&offsets, 0);
+        assert_eq!(short.len(), offsets.len() * 2);
+        assert_eq!(u16::from_be_bytes([short[0], short[1]]), 0);
+        assert_eq!(u16::from_be_bytes([short[2], short[3]]), 2); // 4/2
+        assert_eq!(u16::from_be_bytes([short[4], short[5]]), 6); // 12/2
+        assert_eq!(u16::from_be_bytes([short[6], short[7]]), 10); // 20/2
+                                                                  // Long format (index_format 1): each offset as u32.
+        let long = build_loca(&offsets, 1);
+        assert_eq!(long.len(), offsets.len() * 4);
+        assert_eq!(u32::from_be_bytes([long[4], long[5], long[6], long[7]]), 4);
+    }
+
+    // -- WOFF1 round-trip (stored + zlib) -----------------------------------
+
+    /// Build a minimal but valid WOFF1 file from `(tag, data, compress)` table
+    /// specs and return the bytes.
+    fn make_woff1(flavor: u32, tables: &[(u32, Vec<u8>, bool)]) -> Vec<u8> {
+        use crate::filters::deflate::deflate;
+        let num = tables.len();
+        let dir_start = 44usize;
+        let mut body_off = dir_start + num * 20;
+        // Build directory + body.
+        let mut dir = Vec::new();
+        let mut body = Vec::new();
+        for (tag, data, compress) in tables {
+            let orig_len = data.len();
+            let stored: Vec<u8> = if *compress {
+                // zlib wrapper: 2-byte header + raw DEFLATE + 4-byte adler
+                // (the reader skips the 2-byte header and ignores the adler).
+                let mut z = vec![0x78, 0x9c];
+                z.extend_from_slice(&deflate(data));
+                z.extend_from_slice(&[0, 0, 0, 0]);
+                z
+            } else {
+                data.clone()
+            };
+            let comp_len = stored.len();
+            dir.extend_from_slice(&tag.to_be_bytes());
+            dir.extend_from_slice(&(body_off as u32).to_be_bytes());
+            dir.extend_from_slice(&(comp_len as u32).to_be_bytes());
+            dir.extend_from_slice(&(orig_len as u32).to_be_bytes());
+            dir.extend_from_slice(&0u32.to_be_bytes()); // origChecksum (unused by reader)
+            body.extend_from_slice(&stored);
+            body_off += comp_len;
+        }
+        let mut out = vec![0u8; 44];
+        out[0..4].copy_from_slice(&WOFF1_SIG.to_be_bytes());
+        out[4..8].copy_from_slice(&flavor.to_be_bytes());
+        out[12..14].copy_from_slice(&(num as u16).to_be_bytes());
+        out.extend_from_slice(&dir);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn woff1_stored_table_passthrough() {
+        // A single uncompressed 'maxp'-like table (comp_len == orig_len).
+        let data = vec![0x00, 0x05, 0x00, 0x00, 0x00, 0x02]; // version + numGlyphs
+        let woff = make_woff1(SFNT_TRUETYPE, &[(MAXP_TAG, data.clone(), false)]);
+        let sfnt = sfnt_from_web_font(&woff).expect("woff1 stored reconstructs");
+        assert_eq!(&sfnt[0..4], &SFNT_TRUETYPE.to_be_bytes());
+        assert_eq!(u16::from_be_bytes([sfnt[4], sfnt[5]]), 1, "numTables");
+        // The reconstructed table data matches the original.
+        let off = u32::from_be_bytes([sfnt[20], sfnt[21], sfnt[22], sfnt[23]]) as usize;
+        let len = u32::from_be_bytes([sfnt[24], sfnt[25], sfnt[26], sfnt[27]]) as usize;
+        assert_eq!(&sfnt[off..off + len], &data[..]);
+    }
+
+    #[test]
+    fn woff1_zlib_table_inflates() {
+        // A compressible table (repeated bytes) stored zlib-compressed.
+        let data = vec![0x41u8; 64];
+        let woff = make_woff1(SFNT_OTTO, &[(MAXP_TAG, data.clone(), true)]);
+        let sfnt = sfnt_from_web_font(&woff).expect("woff1 zlib reconstructs");
+        assert_eq!(&sfnt[0..4], &SFNT_OTTO.to_be_bytes());
+        let off = u32::from_be_bytes([sfnt[20], sfnt[21], sfnt[22], sfnt[23]]) as usize;
+        let len = u32::from_be_bytes([sfnt[24], sfnt[25], sfnt[26], sfnt[27]]) as usize;
+        assert_eq!(len, data.len());
+        assert_eq!(&sfnt[off..off + len], &data[..]);
+    }
+
+    #[test]
+    fn woff1_truncated_directory_fails() {
+        // Claims one table but the directory entry runs past the buffer end.
+        let mut woff = vec![0u8; 44];
+        woff[0..4].copy_from_slice(&WOFF1_SIG.to_be_bytes());
+        woff[4..8].copy_from_slice(&SFNT_TRUETYPE.to_be_bytes());
+        woff[12..14].copy_from_slice(&1u16.to_be_bytes());
+        // No 20-byte directory entry appended.
+        assert_eq!(sfnt_from_web_font(&woff), None);
+    }
+
+    #[test]
+    fn woff1_table_offset_out_of_bounds_fails() {
+        // A directory entry whose data offset/length points past the buffer.
+        let mut woff = vec![0u8; 44 + 20];
+        woff[0..4].copy_from_slice(&WOFF1_SIG.to_be_bytes());
+        woff[4..8].copy_from_slice(&SFNT_TRUETYPE.to_be_bytes());
+        woff[12..14].copy_from_slice(&1u16.to_be_bytes());
+        let de = 44;
+        woff[de..de + 4].copy_from_slice(&MAXP_TAG.to_be_bytes());
+        woff[de + 4..de + 8].copy_from_slice(&9999u32.to_be_bytes()); // bad offset
+        woff[de + 8..de + 12].copy_from_slice(&4u32.to_be_bytes());
+        woff[de + 12..de + 16].copy_from_slice(&4u32.to_be_bytes());
+        assert_eq!(sfnt_from_web_font(&woff), None);
+    }
+
+    #[test]
+    fn woff1_zlib_wrong_orig_len_fails() {
+        use crate::filters::deflate::deflate;
+        // Build a zlib table but lie about orig_len so the length check trips.
+        let data = vec![0x42u8; 32];
+        let mut z = vec![0x78, 0x9c];
+        z.extend_from_slice(&deflate(&data));
+        z.extend_from_slice(&[0, 0, 0, 0]);
+        let mut woff = vec![0u8; 44];
+        woff[0..4].copy_from_slice(&WOFF1_SIG.to_be_bytes());
+        woff[4..8].copy_from_slice(&SFNT_TRUETYPE.to_be_bytes());
+        woff[12..14].copy_from_slice(&1u16.to_be_bytes());
+        let body_off = 44 + 20;
+        woff.extend_from_slice(&MAXP_TAG.to_be_bytes());
+        woff.extend_from_slice(&(body_off as u32).to_be_bytes());
+        woff.extend_from_slice(&(z.len() as u32).to_be_bytes());
+        woff.extend_from_slice(&999u32.to_be_bytes()); // wrong orig_len
+        woff.extend_from_slice(&0u32.to_be_bytes()); // origChecksum
+        woff.extend_from_slice(&z);
+        assert_eq!(sfnt_from_web_font(&woff), None);
     }
 }
