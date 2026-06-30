@@ -710,4 +710,77 @@ mod tests {
         let f = el("f", vec![num, den]);
         assert_eq!(lower_text(&f), "(a+b)/c");
     }
+
+    // ── sup/sub char tables (exhaustive) ─────────────────────────────────────
+
+    #[test]
+    fn superscript_maps_full_table() {
+        // Digits, sign/relation/parens, and every supported letter map to Unicode.
+        assert_eq!(superscript("0123456789"), "⁰¹²³⁴⁵⁶⁷⁸⁹");
+        assert_eq!(superscript("+-=()"), "⁺⁻⁼⁽⁾");
+        assert_eq!(superscript("\u{2212}"), "⁻"); // minus sign maps too
+        assert_eq!(
+            superscript("niabcdefghjklmoprstuvwxyz"),
+            "ⁿⁱᵃᵇᶜᵈᵉᶠᵍʰʲᵏˡᵐᵒᵖʳˢᵗᵘᵛʷˣʸᶻ"
+        );
+        assert_eq!(superscript(" "), " ");
+        // Any non-mappable char ⇒ whole string falls back to linear form.
+        assert_eq!(superscript("q"), "^(q)"); // 'q' has no superscript codepoint
+        assert_eq!(superscript(""), "");
+    }
+
+    #[test]
+    fn subscript_maps_full_table() {
+        assert_eq!(subscript("0123456789"), "₀₁₂₃₄₅₆₇₈₉");
+        assert_eq!(subscript("+-=()"), "₊₋₌₍₎");
+        assert_eq!(subscript("\u{2212}"), "₋");
+        assert_eq!(subscript("aehijklmnoprstuvx"), "ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ");
+        assert_eq!(subscript(" "), " ");
+        assert_eq!(subscript("b"), "_(b)"); // 'b' has no subscript codepoint
+        assert_eq!(subscript(""), "");
+    }
+
+    // ── is_atomic / is_wrapped ───────────────────────────────────────────────
+
+    #[test]
+    fn radical_body_grouping_via_is_atomic() {
+        // A single token is left bare; an operator-bearing body is grouped.
+        // (paren() is exercised through `f`, atomic-ness through these shapes.)
+        let f_atomic = el("f", vec![slot("num", "x"), slot("den", "y")]);
+        assert_eq!(lower_text(&f_atomic), "x/y");
+        // Already-bracketed group is treated as atomic (no double-wrap).
+        let f_wrapped = el("f", vec![slot("num", "(a+b)"), slot("den", "c")]);
+        assert_eq!(lower_text(&f_wrapped), "(a+b)/c");
+        // A bracket group that does NOT span the whole string is not atomic.
+        let f_partial = el("f", vec![slot("num", "(a+b)+c"), slot("den", "d")]);
+        assert_eq!(lower_text(&f_partial), "((a+b)+c)/d");
+        // Square and curly brackets also count as wrapped.
+        let f_sq = el("f", vec![slot("num", "[a; b]"), slot("den", "c")]);
+        assert_eq!(lower_text(&f_sq), "[a; b]/c");
+    }
+
+    // ── bare sup / sub (script in m:e) ───────────────────────────────────────
+
+    #[test]
+    fn bare_sup_and_sub_put_script_in_e() {
+        // `m:sup` with only an `m:e` slot: the e content is the script itself.
+        let sup = el("sup", vec![slot("e", "2")]);
+        assert_eq!(lower_text(&sup), "²");
+        let sub = el("sub", vec![slot("e", "0")]);
+        assert_eq!(lower_text(&sub), "₀");
+        // With both base (e) and a sup slot, base precedes the script.
+        let sup2 = el("sup", vec![slot("e", "x"), slot("sup", "2")]);
+        assert_eq!(lower_text(&sup2), "x²");
+    }
+
+    // ── equation array ───────────────────────────────────────────────────────
+
+    #[test]
+    fn eq_array_joins_rows_with_semicolons() {
+        let arr = el(
+            "eqArr",
+            vec![slot("e", "x=1"), slot("e", "y=2"), slot("e", "z=3")],
+        );
+        assert_eq!(lower_text(&arr), "x=1; y=2; z=3");
+    }
 }
