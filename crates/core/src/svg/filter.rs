@@ -1973,4 +1973,316 @@ mod tests {
             p[3]
         );
     }
+
+    // ── blend modes, composite operators, morphology erode, more transfers ─────
+
+    fn one_rect(rgb: [f64; 3]) -> Vec<Prim> {
+        vec![rect_prim(8.0, 8.0, 30.0, 30.0, rgb)]
+    }
+
+    /// Each feBlend mode runs end-to-end and yields an opaque blended centre.
+    #[test]
+    fn blend_modes_all_run() {
+        for mode in [
+            "multiply",
+            "screen",
+            "darken",
+            "lighten",
+            "overlay",
+            "hard-light",
+            "color-dodge",
+            "color-burn",
+            "soft-light",
+            "difference",
+            "exclusion",
+        ] {
+            let svg = format!(
+                r##"<svg><filter id="b">
+                    <feFlood flood-color="#3366cc" result="bg"/>
+                    <feBlend in="SourceGraphic" in2="bg" mode="{mode}"/>
+                </filter></svg>"##
+            );
+            let filters = filters_from(&svg);
+            let (raster, _) = render_filter("b", &one_rect([0.8, 0.4, 0.2]), &filters, 1.0)
+                .unwrap_or_else(|| panic!("blend {mode} renders"));
+            let c = raster.get((raster.w / 2) as i64, (raster.h / 2) as i64);
+            assert!(c[3] > 0.5, "blend {mode}: centre is covered (a={})", c[3]);
+        }
+    }
+
+    /// blend_channel + hard_light reference values for the tricky branches.
+    #[test]
+    fn blend_channel_reference_values() {
+        // Multiply/Screen/Darken/Lighten/Difference/Exclusion are exact.
+        assert!((blend_channel(BlendMode::Multiply, 0.5, 0.4) - 0.2).abs() < 1e-6);
+        assert!((blend_channel(BlendMode::Screen, 0.5, 0.4) - 0.7).abs() < 1e-6);
+        assert!((blend_channel(BlendMode::Darken, 0.5, 0.4) - 0.4).abs() < 1e-6);
+        assert!((blend_channel(BlendMode::Lighten, 0.5, 0.4) - 0.5).abs() < 1e-6);
+        assert!((blend_channel(BlendMode::Difference, 0.5, 0.4) - 0.1).abs() < 1e-6);
+        // ColorDodge: cs>=1 → 1.0 ; else cb/(1-cs) clamped.
+        assert_eq!(blend_channel(BlendMode::ColorDodge, 1.0, 0.4), 1.0);
+        assert!((blend_channel(BlendMode::ColorDodge, 0.5, 0.4) - 0.8).abs() < 1e-6);
+        // ColorBurn: cs<=0 → 0.0 ; else 1-((1-cb)/cs) clamped.
+        assert_eq!(blend_channel(BlendMode::ColorBurn, 0.0, 0.4), 0.0);
+        // hard_light both branches (cs<=0.5 and cs>0.5).
+        assert!((hard_light(0.25, 0.6) - (2.0 * 0.25 * 0.6)).abs() < 1e-6);
+        assert!((hard_light(0.75, 0.6) - (1.0 - 2.0 * 0.25 * 0.4)).abs() < 1e-6);
+        // SoftLight exercises both sub-branches.
+        let _ = blend_channel(BlendMode::SoftLight, 0.3, 0.1);
+        let _ = blend_channel(BlendMode::SoftLight, 0.8, 0.5);
+    }
+
+    /// Composite operators (out / atop / xor / arithmetic) each run.
+    #[test]
+    fn composite_operators_all_run() {
+        for op in ["out", "atop", "xor", "over"] {
+            let svg = format!(
+                r##"<svg><filter id="c">
+                    <feFlood flood-color="#00ff00" result="g"/>
+                    <feComposite in="g" in2="SourceGraphic" operator="{op}"/>
+                </filter></svg>"##
+            );
+            let filters = filters_from(&svg);
+            assert!(
+                render_filter("c", &one_rect([1.0, 0.0, 0.0]), &filters, 1.0).is_some(),
+                "composite {op} renders"
+            );
+        }
+        // Arithmetic with explicit k coefficients.
+        let filters = filters_from(
+            r##"<svg><filter id="a">
+                <feFlood flood-color="#0000ff" result="b"/>
+                <feComposite in="b" in2="SourceGraphic" operator="arithmetic"
+                    k1="0" k2="0.5" k3="0.5" k4="0"/>
+            </filter></svg>"##,
+        );
+        let (raster, _) =
+            render_filter("a", &one_rect([1.0, 0.0, 0.0]), &filters, 1.0).expect("arithmetic");
+        let c = raster.get((raster.w / 2) as i64, (raster.h / 2) as i64);
+        assert!(c[3] > 0.0, "arithmetic produced output (a={})", c[3]);
+    }
+
+    /// feMorphology erode shrinks coverage (the opposite of the dilate test).
+    #[test]
+    fn morphology_erode_shrinks_coverage() {
+        let erode = filters_from(
+            r##"<svg><filter id="e"><feMorphology operator="erode" radius="2"/></filter></svg>"##,
+        );
+        let prims = vec![rect_prim(15.0, 15.0, 12.0, 12.0, [1.0, 0.0, 0.0])];
+        let (plain, _) = render_filter(
+            "id",
+            &prims,
+            &filters_from(r##"<svg><filter id="id"><feOffset dx="0" dy="0"/></filter></svg>"##),
+            1.0,
+        )
+        .expect("plain");
+        let (shrunk, _) = render_filter("e", &prims, &erode, 1.0).expect("eroded");
+        let covered = |r: &Raster| (0..r.w * r.h).filter(|&p| r.px[p * 4 + 3] > 0.5).count();
+        assert!(
+            covered(&shrunk) < covered(&plain),
+            "erosion reduces covered pixels ({} < {})",
+            covered(&shrunk),
+            covered(&plain)
+        );
+    }
+
+    /// feColorMatrix hueRotate, luminanceToAlpha, and a full 20-value matrix.
+    #[test]
+    fn color_matrix_hue_luminance_and_full_matrix() {
+        // hueRotate(180) on red → not still pure red.
+        let hue = filters_from(
+            r##"<svg><filter id="h"><feColorMatrix type="hueRotate" values="180"/></filter></svg>"##,
+        );
+        let (r, _) = render_filter("h", &one_rect([1.0, 0.0, 0.0]), &hue, 1.0).expect("hue");
+        let c = r.get((r.w / 2) as i64, (r.h / 2) as i64);
+        assert!(c[3] > 0.5, "hueRotate keeps the shape opaque");
+
+        // luminanceToAlpha: alpha becomes the luminance; rgb zeroed.
+        let lum = filters_from(
+            r##"<svg><filter id="l"><feColorMatrix type="luminanceToAlpha"/></filter></svg>"##,
+        );
+        let (r, _) = render_filter("l", &one_rect([1.0, 1.0, 1.0]), &lum, 1.0).expect("lum");
+        let c = r.get((r.w / 2) as i64, (r.h / 2) as i64);
+        assert!(
+            c[3] > 0.5,
+            "white maps to high luminance alpha (a={})",
+            c[3]
+        );
+
+        // Full matrix: identity-ish that swaps to blue via the constant column.
+        let m = filters_from(
+            r##"<svg><filter id="m"><feColorMatrix type="matrix"
+                values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 1  0 0 0 1 0"/></filter></svg>"##,
+        );
+        let (r, _) = render_filter("m", &one_rect([1.0, 0.0, 0.0]), &m, 1.0).expect("matrix");
+        let c = r.get((r.w / 2) as i64, (r.h / 2) as i64);
+        assert!(c[2] > 0.8 && c[0] < 0.2, "matrix forced blue (rgba={c:?})");
+    }
+
+    /// feComponentTransfer table / discrete / gamma / identity branches.
+    #[test]
+    fn component_transfer_table_discrete_gamma_identity() {
+        for func in [
+            r#"<feFuncA type="table" tableValues="0 1"/>"#,
+            r#"<feFuncA type="discrete" tableValues="0 0.5 1"/>"#,
+            r#"<feFuncA type="gamma" amplitude="1" exponent="2" offset="0"/>"#,
+            r#"<feFuncR type="identity"/>"#,
+        ] {
+            let svg = format!(
+                r##"<svg><filter id="c"><feComponentTransfer>{func}</feComponentTransfer></filter></svg>"##
+            );
+            let filters = filters_from(&svg);
+            assert!(
+                render_filter("c", &one_rect([0.6, 0.6, 0.6]), &filters, 1.0).is_some(),
+                "transfer {func} renders"
+            );
+        }
+    }
+
+    /// apply_transfer reference values for each transfer kind.
+    #[test]
+    fn apply_transfer_reference_values() {
+        assert_eq!(apply_transfer(&Transfer::Identity, 0.4), 0.4);
+        // Empty table / single value.
+        assert_eq!(apply_transfer(&Transfer::Table(vec![]), 0.4), 0.4);
+        assert_eq!(apply_transfer(&Transfer::Table(vec![0.7]), 0.4), 0.7);
+        // Two-entry table interpolates linearly (c=0.5 → 0.5).
+        assert!((apply_transfer(&Transfer::Table(vec![0.0, 1.0]), 0.5) - 0.5).abs() < 1e-5);
+        // Discrete picks the bucket.
+        assert_eq!(
+            apply_transfer(&Transfer::Discrete(vec![0.0, 0.5, 1.0]), 0.5),
+            0.5
+        );
+        assert_eq!(apply_transfer(&Transfer::Discrete(vec![]), 0.3), 0.3);
+        // Linear & gamma.
+        assert!(
+            (apply_transfer(
+                &Transfer::Linear {
+                    slope: 0.5,
+                    intercept: 0.25
+                },
+                1.0
+            ) - 0.75)
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            (apply_transfer(
+                &Transfer::Gamma {
+                    amplitude: 1.0,
+                    exponent: 2.0,
+                    offset: 0.0
+                },
+                0.5
+            ) - 0.25)
+                .abs()
+                < 1e-5
+        );
+    }
+
+    /// feTurbulence type="turbulence" (the non-fractal branch).
+    #[test]
+    fn turbulence_plain_type_runs() {
+        let filters = filters_from(
+            r##"<svg><filter id="n">
+                <feTurbulence type="turbulence" baseFrequency="0.15" numOctaves="2" seed="3"/>
+            </filter></svg>"##,
+        );
+        let prims = vec![rect_prim(0.0, 0.0, 32.0, 32.0, [0.0, 0.0, 0.0])];
+        let (raster, _) = render_filter("n", &prims, &filters, 1.0).expect("turbulence");
+        let any_ink = (0..raster.w * raster.h).any(|p| raster.px[p * 4 + 3] > 0.01);
+        assert!(any_ink, "plain turbulence produced some output");
+    }
+
+    /// feDisplacementMap perturbs the source using a second input's channels.
+    #[test]
+    fn displacement_map_runs() {
+        let filters = filters_from(
+            r##"<svg><filter id="dm">
+                <feTurbulence type="turbulence" baseFrequency="0.2" numOctaves="2" result="noise"/>
+                <feDisplacementMap in="SourceGraphic" in2="noise" scale="10"
+                    xChannelSelector="R" yChannelSelector="G"/>
+            </filter></svg>"##,
+        );
+        let prims = vec![rect_prim(10.0, 10.0, 30.0, 30.0, [1.0, 0.0, 0.0])];
+        assert!(
+            render_filter("dm", &prims, &filters, 1.0).is_some(),
+            "displacement map renders"
+        );
+    }
+
+    // ── pure parser/helper units ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_num_and_lists() {
+        assert_eq!(parse_num("12.5px"), Some(12.5));
+        assert_eq!(parse_num("  -3e2 "), Some(-300.0));
+        assert_eq!(parse_num("abc"), None);
+        assert_eq!(parse_num_list("1, 2  3,,4"), vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(parse_num_list("").is_empty());
+    }
+
+    #[test]
+    fn parse_xy_one_and_two_values() {
+        assert_eq!(parse_xy(Some("5"), 1.0), (5.0, 5.0));
+        assert_eq!(parse_xy(Some("3 7"), 1.0), (3.0, 7.0));
+        assert_eq!(parse_xy(None, 2.0), (2.0, 2.0));
+    }
+
+    #[test]
+    fn channel_sel_maps_letters_and_default() {
+        assert_eq!(channel_sel(Some("R"), 9), 0);
+        assert_eq!(channel_sel(Some("G"), 9), 1);
+        assert_eq!(channel_sel(Some("B"), 9), 2);
+        assert_eq!(channel_sel(Some("A"), 9), 3);
+        assert_eq!(channel_sel(Some("Z"), 7), 7); // unknown → default
+        assert_eq!(channel_sel(None, 5), 5);
+    }
+
+    #[test]
+    fn parse_blend_mode_known_and_unknown() {
+        assert!(matches!(
+            parse_blend_mode(Some("multiply")),
+            BlendMode::Multiply
+        ));
+        assert!(matches!(
+            parse_blend_mode(Some("screen")),
+            BlendMode::Screen
+        ));
+        // Unknown / missing → Normal.
+        assert!(matches!(parse_blend_mode(Some("bogus")), BlendMode::Normal));
+        assert!(matches!(parse_blend_mode(None), BlendMode::Normal));
+    }
+
+    #[test]
+    fn saturate_and_hue_matrices_have_expected_shape() {
+        // saturate(1) is (close to) the identity for the diagonal-ish luma terms.
+        let s = saturate_matrix(1.0);
+        assert_eq!(s.len(), 20);
+        // hue_rotate(0) ≈ identity on the RGB block diagonal.
+        let h = hue_rotate_matrix(0.0);
+        assert_eq!(h.len(), 20);
+        assert!((h[0] - 1.0).abs() < 1e-3, "hueRotate(0)[0,0] ≈ 1");
+    }
+
+    #[test]
+    fn box_sizes_and_over_straight() {
+        // box_sizes_for_sigma returns three radii summing to a blur of ~sigma.
+        let sizes = box_sizes_for_sigma(3.0);
+        assert_eq!(sizes.len(), 3);
+        assert!(
+            sizes.iter().all(|&s| s > 0),
+            "non-zero box radii: {sizes:?}"
+        );
+        // over_straight: opaque src over anything → src.
+        let src = [0.2, 0.4, 0.6, 1.0];
+        let dst = [0.9, 0.9, 0.9, 1.0];
+        assert_eq!(over_straight(src, dst), src);
+        // Transparent src over dst → dst unchanged.
+        let clear = [0.0, 0.0, 0.0, 0.0];
+        let out = over_straight(clear, dst);
+        for c in 0..4 {
+            assert!((out[c] - dst[c]).abs() < 1e-6, "clear over dst = dst");
+        }
+    }
 }
