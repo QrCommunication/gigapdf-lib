@@ -2111,4 +2111,136 @@ mod tests {
         assert_eq!(alpha(0, 1), 0, "bottom-left clear");
         assert_eq!(alpha(1, 1), 255, "bottom-right set");
     }
+
+    // ── pure helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn integer_readers_big_endian() {
+        let d = [0x12u8, 0x34, 0x56, 0x78];
+        assert_eq!(be16(&d, 0), 0x1234);
+        assert_eq!(be24(&d, 0), 0x0012_3456);
+        assert_eq!(be32(&d, 0), 0x1234_5678);
+        assert_eq!(bei16(&[0xFF, 0xFF], 0), -1);
+        // Out-of-range reads return 0 (defensive).
+        assert_eq!(be16(&d, 99), 0);
+        assert_eq!(be24(&d, 99), 0);
+        assert_eq!(be32(&d, 99), 0);
+    }
+
+    #[test]
+    fn f2dot14_and_f16dot16() {
+        // F2Dot14: 0x4000 = 1.0, 0xC000 = -1.0
+        assert_eq!(f2dot14(&[0x40, 0x00], 0), 1.0);
+        assert_eq!(f2dot14(&[0xC0, 0x00], 0), -1.0);
+        // read_affine: six 16.16 fixed. 0x0001_0000 = 1.0.
+        let mut d = Vec::new();
+        for v in [1.0f64, 0.0, 0.0, 1.0, 2.0, 3.0] {
+            d.extend_from_slice(&((v * 65536.0) as i32).to_be_bytes());
+        }
+        let a = read_affine(&d, 0);
+        assert_eq!((a.a, a.d, a.e, a.f), (1.0, 1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn affine_identity_then_compose() {
+        let id = Affine::identity();
+        let t = Affine {
+            a: 2.0,
+            b: 0.0,
+            c: 0.0,
+            d: 2.0,
+            e: 1.0,
+            f: 1.0,
+        };
+        // identity ∘ t == t
+        let r = id.then(t);
+        assert_eq!((r.a, r.d, r.e, r.f), (2.0, 2.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn scale_and_rotate_around_centre() {
+        // Scale 2× about (10,10): the centre maps to itself.
+        let s = scale_around(2.0, 2.0, 10.0, 10.0);
+        let map = |t: &Affine, x: f64, y: f64| (t.a * x + t.c * y + t.e, t.b * x + t.d * y + t.f);
+        let (cx, cy) = map(&s, 10.0, 10.0);
+        assert!((cx - 10.0).abs() < 1e-9 && (cy - 10.0).abs() < 1e-9);
+        // A point at +1 in x maps to +2 from centre.
+        let (px, _) = map(&s, 11.0, 10.0);
+        assert!((px - 12.0).abs() < 1e-9);
+        // Rotate by π about origin: (1,0) → (≈ -1? depends on sign); centre fixed.
+        let rot = rotate_around(std::f64::consts::PI, 5.0, 5.0);
+        let (rx, ry) = map(&rot, 5.0, 5.0);
+        assert!((rx - 5.0).abs() < 1e-9 && (ry - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blend_name_pdf_tokens_and_composite_modes() {
+        assert_eq!(BlendName::Normal.pdf_name(), b"Normal");
+        assert_eq!(BlendName::Multiply.pdf_name(), b"Multiply");
+        assert_eq!(BlendName::SoftLight.pdf_name(), b"SoftLight");
+        assert_eq!(BlendName::Exclusion.pdf_name(), b"Exclusion");
+        // Composite-mode mapping: Porter-Duff (0..=8) → Normal; separable modes.
+        assert!(matches!(
+            BlendName::from_composite_mode(3),
+            BlendName::Normal
+        ));
+        assert!(matches!(
+            BlendName::from_composite_mode(9),
+            BlendName::Screen
+        ));
+        assert!(matches!(
+            BlendName::from_composite_mode(19),
+            BlendName::Multiply
+        ));
+        assert!(matches!(
+            BlendName::from_composite_mode(200),
+            BlendName::Normal
+        ));
+    }
+
+    #[test]
+    fn region_scalar_triangular_support() {
+        let region = [AxisRegion {
+            start: -1.0,
+            peak: 0.0,
+            end: 1.0,
+        }];
+        // peak == 0 → axis does not participate → full factor.
+        assert_eq!(region_scalar(&region, &[0.5]), 1.0);
+        let region = [AxisRegion {
+            start: 0.0,
+            peak: 0.5,
+            end: 1.0,
+        }];
+        assert_eq!(region_scalar(&region, &[0.5]), 1.0); // at peak
+        assert!((region_scalar(&region, &[0.25]) - 0.5).abs() < 1e-9); // rising
+        assert!((region_scalar(&region, &[0.75]) - 0.5).abs() < 1e-9); // falling
+        assert_eq!(region_scalar(&region, &[2.0]), 0.0); // outside support
+    }
+
+    #[test]
+    fn read_bits_msb_first() {
+        let data = [0b1010_1100u8, 0b0011_0000];
+        assert_eq!(read_bits(&data, 0, 4), Some(0b1010));
+        assert_eq!(read_bits(&data, 4, 4), Some(0b1100));
+        assert_eq!(read_bits(&data, 8, 4), Some(0b0011));
+        // Past the end → None.
+        assert_eq!(read_bits(&data, 8, 100), None);
+    }
+
+    #[test]
+    fn parse_cpal_palette_reads_bgra_records() {
+        let (_, cpal) = fixture();
+        let pal = parse_cpal_palette(&cpal);
+        assert_eq!(pal.len(), 2);
+        // record 0 = red (BGRA 0,0,255,255) → RGBA [1,0,0,1]
+        assert_eq!(pal[0], [1.0, 0.0, 0.0, 1.0]);
+        // record 1 = blue (BGRA 255,0,0,255) → RGBA [0,0,1,1]
+        assert_eq!(pal[1], [0.0, 0.0, 1.0, 1.0]);
+        // numPalettes == 0 → empty.
+        let mut empty = cpal.clone();
+        empty[4] = 0;
+        empty[5] = 0;
+        assert!(parse_cpal_palette(&empty).is_empty());
+    }
 }
