@@ -483,7 +483,8 @@ fn run_char_style(run: &RunStyle) -> CharStyle {
         color: run.color.as_deref().and_then(hex_to_rgb_f64),
         background: run.highlight.as_deref().and_then(hex_to_rgb_f64),
         vertical_align: run.vertical_align,
-        ..Default::default()
+        letter_spacing_pt: run.letter_spacing.unwrap_or(0.0),
+        hidden: run.hidden,
     }
 }
 
@@ -1803,6 +1804,16 @@ fn docx_paragraph_model(
                     "sz" if in_rpr => {
                         run.size_half_pt = attr(&attrs, "val").and_then(|v| v.parse().ok());
                     }
+                    "spacing" if in_rpr => {
+                        if let Some(v) = attr(&attrs, "val") {
+                            if let Ok(tw) = v.parse::<f64>() {
+                                run.letter_spacing = Some(tw / 20.0);
+                            }
+                        }
+                    }
+                    "vanish" if in_rpr => {
+                        run.hidden = true;
+                    }
                     "color" if in_rpr => {
                         if let Some(v) = attr(&attrs, "val") {
                             if v != "auto" && is_hex6(v) {
@@ -1810,7 +1821,7 @@ fn docx_paragraph_model(
                             }
                         }
                     }
-                    "tab" => push_run(docx_sink(&mut runs, &mut link, &mut fields), &run, " "),
+                    "tab" => push_run(docx_sink(&mut runs, &mut link, &mut fields), &run, "\t"),
                     // A symbol run: a glyph stored as a font + code point
                     // (`<w:sym w:font=".." w:char="F0FC"/>`). Map it to Unicode so
                     // the character survives as real text (e.g. a Wingdings `F0FC`
@@ -8541,6 +8552,10 @@ struct RunStyle {
     /// [`CharStyle::vertical_align`] so footnote refs / `x²` / formulae keep
     /// their position. Defaults to [`model::VAlign::Baseline`].
     vertical_align: model::VAlign,
+    /// Letter spacing in points from DOCX `w:rPr/w:spacing w:val` (twips ÷ 20).
+    letter_spacing: Option<f64>,
+    /// Hidden text from DOCX `w:vanish`. Surfaced as `CharStyle::hidden`.
+    hidden: bool,
 }
 
 impl RunStyle {
